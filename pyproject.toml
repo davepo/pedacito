@@ -1,12 +1,25 @@
+[project]
+name = "pedacito-local"
+version = "0.1.0"
+description = "Index-and-lookup intermediary for coding with a local LLM"
+requires-python = ">=3.11"   # tomllib
+license = {file = "LICENSE"}
+classifiers = [
+    "License :: OSI Approved :: MIT License",
+]
+dependencies = [
+    "requests>=2.31",
+    "tree-sitter>=0.23",
+    "tree-sitter-language-pack>=1.0",
+]
+
+[project.scripts]
+pedacito = "pedacito.cli:main"
+pdc = "pedacito.cli:main"
+
 [build-system]
-requires = ["setuptools>=45", "wheel"]
+requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
-[project]
-name = "pedacito"
-version = "0.0.1a1"  # Alpha version, signals WIP
-description = "A Python coding assistant for working with large codebases"
-readme = "README.md"
-license = {text = "MIT"}
-authors = [{name = "Dave Posocco", email = "davepo@gmail.com"}]
-requires-python = ">=3.9"
+[tool.setuptools]
+packages = ["pedacito"]
