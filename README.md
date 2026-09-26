@@ -68,6 +68,12 @@ internet access to a hosted API, a preference for keeping code entirely
 on your own hardware, or just wanting to see what a 9B–27B model can do
 on a real project when it's not fighting its context window.
 
+Pedacito can point at a hosted OpenAI-compatible API too (`json_mode =
+"object"`), but its whole design — rationed summaries, tiny maps,
+search/replace over diffs — is tuned for a 9B–27B model at local inference
+speeds, so a tool built for frontier models will still be the better fit
+there.
+
 ---
 
 ## Install
@@ -154,6 +160,16 @@ listens on `127.0.0.1` and a remote machine is refused. Default port `1234`.
 `127.0.0.1` by default; for a remote setup, set `OLLAMA_HOST=0.0.0.0` (or
 the host's address) in Ollama's environment before starting it. Default
 port `11434`.
+
+**Hosted OpenAI-compatible APIs.** DeepSeek, OpenAI, Groq, Mistral and
+similar services work too. Set `base_url`, `api_key`, and `model`, and add
+`json_mode = "object"` under `[server]`. Those services accept
+`response_format: {"type": "json_object"}` but reject the stricter
+`json_schema` Pedacito sends by default, so without `json_mode = "object"`
+the gather loop fails on its first step. Reasoning models that return a
+separate `reasoning_content` field (DeepSeek-R1, and most other R1
+distills) are handled the same as local `<think>` blocks — stripped
+before JSON parsing and before edit extraction.
 
 Pedacito's tool-selection loop depends on the server enforcing
 `response_format: {"type": "json_schema", ...}` — grammar-constrained JSON
@@ -613,11 +629,12 @@ project lives under that project's root:
     reviews/<stamp>.html saved copies of review pages
 ```
 
-On first run in a project, Pedacito also creates a commented `.pedacitoignore`
-and adds `.pedacito/` to that project's `.gitignore` — but only if it's
-already a git checkout, never inventing a `.gitignore` where one wasn't
-there. Both behaviors are switchable (`create_ignore_file`,
-`manage_gitignore`).
+On first run in a project, Pedacito also creates a commented
+`.pedacitoignore` and adds its workspace entries — `.pedacito/`,
+`.pedacitoignore`, `.pedacito.toml`, `pedacito.toml` — to that project's
+`.gitignore`, creating the file if it's a git checkout that doesn't already
+have one. It never invents a `.gitignore` where there's no repo. Both
+behaviors are switchable (`create_ignore_file`, `manage_gitignore`).
 
 ### The project root is inferred
 
@@ -669,6 +686,7 @@ current value and where it came from.
 | `timeout` | 600.0 | Seconds per request; raise for very large files. |
 | `load_wait_seconds` | 240 | How long to wait for a model to load. |
 | `max_consecutive_failures` | 3 | Aborts an indexing batch after this many failures in a row. |
+| `json_mode` | `"schema"` | `"schema"` for local llama.cpp/LM Studio, `"object"` for hosted OpenAI-compatible APIs (DeepSeek, OpenAI, …). |
 | `temperature` | 0.2 | Higher makes tool selection noticeably worse. |
 | `max_tokens_step` | 700 | Budget for one tool call; raise for models that narrate at length. |
 | `max_tokens_answer` | 3000 | Budget for the final answer/edit reply. |
@@ -686,7 +704,7 @@ current value and where it came from.
 | `log_sessions` | True | Write a session record per task. |
 | `review` | False | Always open the side-by-side reviewer. |
 | `open_browser` | True | Off prints the review URL instead of launching a browser. |
-| `manage_gitignore` | True | Add `.pedacito/` to the project's `.gitignore`. |
+| `manage_gitignore` | True | Add Pedacito's workspace entries to `.gitignore` (creating it in a git checkout if absent). |
 | `create_ignore_file` | True | Create a starter `.pedacitoignore` on first run. |
 | `default_profile` | `""` | Profile applied when `--profile` isn't given. |
 

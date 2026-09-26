@@ -30,9 +30,20 @@ from datetime import datetime
 from pathlib import Path
 
 from . import fileio
-from .index import BACKUP_DIR, INDEX_DIR, SESSION_DIR, state_dir
+from .index import BACKUP_DIR, SESSION_DIR, state_dir
 
 IGNORE_FILE = ".pedacitoignore"
+
+# Paths Pedacito writes into a project that should never be committed.
+# `.pedacito/` covers the whole workspace tree (index, backups, sessions,
+# reviews, cached summaries); the other three are the ignore file and the
+# two project-config filenames find_project_config() looks for.
+GITIGNORE_ENTRIES = (
+    ".pedacito/",
+    ".pedacitoignore",
+    ".pedacito.toml",
+    "pedacito.toml",
+)
 
 IGNORE_TEMPLATE = """\
 # Files and folders Pedacito should not index. Gitignore syntax.
@@ -92,24 +103,48 @@ def ensure(root: Path, manage_gitignore: bool = True,
 
 
 def _add_to_gitignore(root: Path, verbose: bool) -> None:
-    """Add a `.pedacito/` entry to the project's .gitignore, keeping the index
-    and backups out of commits. Only touches a repo that already has a
-    .gitignore, or one that is clearly a git checkout (has a .git/ dir)."""
+    """Add Pedacito's workspace entries to the project's .gitignore, keeping
+    the index, backups, sessions, and per-project config out of commits.
+
+    Creates the file in a git checkout that doesn't already have one;
+    otherwise appends only the entries that aren't already present. Never
+    invents a .gitignore in a directory that isn't a repo -- that would be
+    presumptuous, and the README's contract says so.
+    """
     gi = root / ".gitignore"
     if not gi.exists():
         if not (root / ".git").exists():
             return          # not a repo; leave the directory alone
-        gi.write_text(f"{INDEX_DIR}/\n")
+        gi.write_text("# Pedacito\n" + "\n".join(GITIGNORE_ENTRIES) + "\n")
         if verbose:
-            print(f"  created {gi} with {INDEX_DIR}/", file=sys.stderr)
+            print(f"  created {gi} with Pedacito entries", file=sys.stderr)
         return
+
     text = gi.read_text()
-    if any(line.strip().rstrip("/") == INDEX_DIR for line in text.splitlines()):
+    # Strip trailing slashes on both sides so ".pedacito" and ".pedacito/"
+    # count as the same entry (gitignore treats them identically for a
+    # directory), and ignore comment lines when checking for presence.
+    existing = {
+        ln.strip().rstrip("/")
+        for ln in text.splitlines()
+        if ln.strip() and not ln.strip().startswith("#")
+    }
+    to_add = [e for e in GITIGNORE_ENTRIES if e.rstrip("/") not in existing]
+    if not to_add:
         return
+
     with gi.open("a") as fh:
-        fh.write(("" if text.endswith("\n") else "\n") + f"{INDEX_DIR}/\n")
+        if text and not text.endswith("\n"):
+            fh.write("\n")
+        if text:
+            fh.write("\n")           # blank separator
+        fh.write("# Pedacito\n")
+        for e in to_add:
+            fh.write(f"{e}\n")
     if verbose:
-        print(f"  added {INDEX_DIR}/ to {gi}", file=sys.stderr)
+        n = len(to_add)
+        print(f"  updated {gi} ({n} Pedacito entr"
+              f"{'y' if n == 1 else 'ies'} added)", file=sys.stderr)
 
 
 # --------------------------------------------------------------------------

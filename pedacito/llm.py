@@ -357,25 +357,40 @@ class LMStudio:
                    schema: dict | None = None, stream: bool = False) -> str:
         """Send exactly one HTTP request (no retry logic) and return the
         response text, either buffered or streamed to stdout."""
-        if self.cfg.thinking_suffix and messages:
-            messages = [dict(m) for m in messages]
-            messages[-1]["content"] += "\n\n" + self.cfg.thinking_suffix
+        msgs = [dict(m) for m in messages]
+        if self.cfg.thinking_suffix and msgs:
+            msgs[-1]["content"] += "\n\n" + self.cfg.thinking_suffix
+        if schema is not None and self.cfg.json_mode == "object" and msgs:
+            # Hosted OpenAI-compatible APIs require the word "json" to appear
+            # in the prompt before they'll honour json_object mode, and naming
+            # the expected fields in that same sentence measurably improves
+            # compliance on the schema-required keys.
+            fields = ", ".join(schema.get("properties", {}).keys())
+            msgs[-1]["content"] += (
+                f"\n\nReply with one JSON object only, no prose. "
+                f"Fields: {fields}.")
+
         payload = {
             "model": self.cfg.model,
-            "messages": messages,
+            "messages": msgs,
             "temperature": self.cfg.temperature,
             "max_tokens": max_tokens,
             "stream": stream,
         }
-        if self.cfg.disable_thinking:
-            # llama.cpp/LM Studio forward this into the chat template. Harmless
-            # on templates that ignore it.
+        # chat_template_kwargs is a llama.cpp/LM Studio convention. Hosted
+        # APIs don't understand it, and a strict one could 400 on it, so it's
+        # only sent when we're clearly talking to a local server (i.e. not
+        # json_mode = "object").
+        if self.cfg.disable_thinking and self.cfg.json_mode == "schema":
             payload["chat_template_kwargs"] = {"enable_thinking": False}
         if schema is not None:
-            payload["response_format"] = {
-                "type": "json_schema",
-                "json_schema": {"name": "step", "strict": True, "schema": schema},
-            }
+            if self.cfg.json_mode == "object":
+                payload["response_format"] = {"type": "json_object"}
+            else:
+                payload["response_format"] = {
+                    "type": "json_schema",
+                    "json_schema": {"name": "step", "strict": True, "schema": schema},
+                }
 
         t0 = time.time()
         self.stats["calls"] += 1
@@ -493,8 +508,13 @@ class LMStudio:
                 f"  Last partial reply: {last[-160:]}")
         raise LLMError(
             f"Model would not produce valid JSON after {retries + 1} tries.\n"
-            "  If this persists, the runtime may be ignoring the JSON schema "
-            "(common with MLX\n  builds; llama.cpp/GGUF supports it).\n"
+            "  If this is a hosted OpenAI-compatible API (DeepSeek, OpenAI, "
+            "...), set\n"
+            "  json_mode = \"object\" under [server] -- hosted APIs reject "
+            "json_schema.\n"
+            "  If it's a local server, the runtime may be ignoring the JSON "
+            "schema\n"
+            "  (common with MLX builds; llama.cpp/GGUF supports it).\n"
             f"  Last reply: {last[:300]}")
 
     def loaded_models(self) -> dict[str, str] | None:

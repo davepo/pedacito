@@ -73,6 +73,15 @@ class Config:
     # Stop a batch after this many failures in a row rather than failing 55
     # times identically and writing an index full of blank summaries.
     max_consecutive_failures: int = 3
+    # How the tool loop's JSON response is requested.
+    #   "schema" -- send the full json_schema. Grammar-constrained on
+    #     llama.cpp / LM Studio, so the model literally cannot emit
+    #     unparseable JSON. This is the local-model default.
+    #   "object" -- send {"type": "json_object"} instead. Required for
+    #     DeepSeek and most other hosted OpenAI-compatible APIs, which
+    #     reject json_schema outright. Slightly less reliable in principle,
+    #     in practice fine on a frontier hosted model.
+    json_mode: str = "schema"
 
     # --- Generation -----------------------------------------------------------
     # Low temp for tool selection; a 27B at 0.2 is fine for prose and code too.
@@ -254,6 +263,11 @@ def _coerce(name: str, value, path: Path | None = None):
         target = {"str": str, "float": float, "int": int, "bool": bool}.get(
             target, target)
     where = f"{path}: " if path else ""
+    if name == "json_mode":
+        if value not in ("schema", "object"):
+            raise ConfigError(
+                f"{where}{name} must be 'schema' or 'object', got {value!r}")
+        return value
     if name == "extra_extensions":
         if not isinstance(value, (list, tuple)):
             raise ConfigError(f"{where}{name} must be a list, "
@@ -364,6 +378,11 @@ def _parse_env(name: str, raw: str):
     target = _FIELDS[name].type
     if isinstance(target, str):
         target = {"str": str, "float": float, "int": int, "bool": bool}.get(target, str)
+    if name == "json_mode":
+        if raw not in ("schema", "object"):
+            raise ConfigError(
+                f"PEDACITO_JSON_MODE={raw!r} must be 'schema' or 'object'")
+        return raw
     if name == "extra_extensions":
         return tuple(x.strip() for x in raw.split(",") if x.strip())
     if target is bool:
@@ -389,22 +408,36 @@ TEMPLATE = '''\
 
 [server]
 # Any server exposing an OpenAI-compatible /v1 API: LM Studio, Ollama, and
-# others all work. The default port differs (LM Studio 1234, Ollama 11434).
-# Over Tailscale, use the tailnet name or IP instead of localhost.
+# hosted services (DeepSeek, OpenAI, Groq, Mistral, ...) all work.
 #
-# LM Studio: enable "Serve on Local Network" in the Developer tab, or it only
-# listens on 127.0.0.1.
-# Ollama: listens on 0.0.0.0 by default; set OLLAMA_HOST to change that.
+# Local server (LM Studio / Ollama) -- grammar-constrained JSON, no API key:
+#   base_url = "http://localhost:1234/v1"
+#   model    = "google/gemma-3-27b"
+#
+# Hosted OpenAI-compatible API -- no json_schema support, needs an API key:
+#   base_url  = "https://api.deepseek.com/v1"
+#   api_key   = "sk-..."
+#   model     = "deepseek-chat"
+#   json_mode = "object"
 base_url = "http://localhost:1234/v1"
 
 # Must match the id the server reports exactly. `pedacito config --check` shows
 # what's available:
 #   LM Studio: the id shown by /v1/models
 #   Ollama:    the name shown by `ollama list`, e.g. "qwen2.5-coder:14b"
+#   Hosted APIs: the model id from that provider's docs, e.g. "deepseek-chat"
 model = "google/gemma-3-27b"
 
-# api_key = "lm-studio"      # ignored by both servers; any string works
+# api_key = "lm-studio"      # ignored by local servers; any string works
 # timeout = 600.0            # seconds; raise it if you index very large files
+
+# json_mode:
+#   "schema" (default) -- sends the full JSON Schema. Grammar-constrained on
+#                         llama.cpp/LM Studio, so a tool call always parses.
+#                         Hosted APIs reject this and the first step fails.
+#   "object"           -- sends {"type": "json_object"} only. Required for
+#                         DeepSeek and most other hosted APIs.
+# json_mode = "schema"
 
 [review]
 # review = true              # always open the side-by-side reviewer
