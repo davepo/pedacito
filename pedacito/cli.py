@@ -124,7 +124,7 @@ def _refresh(idx, args, cfg, root: Path, verbose: bool = True):
     for rel in missing:
         idx.forget(rel)
     for rel in changed:
-        idx = index_mod.reindex_file(idx, rel, cfg)
+        idx = index_mod.reindex_file(idx, rel, cfg, save=False)
 
     # Files added since the last index will not be in it at all.
     exts = set(CODE_EXTS)
@@ -148,14 +148,18 @@ def _refresh(idx, args, cfg, root: Path, verbose: bool = True):
         if added:
             bits.append(f"{len(added)} new")
         print(f"  index refreshed ({', '.join(bits)})", file=sys.stderr)
-    if added:
-        idx = index_mod.build(args.paths, cfg, client=None, root=root,
-                              summarise=False, verbose=False,
-                              matcher=_matcher(args, root))
-        if verbose:
-            print(f"  new files need summaries: run `pedacito index` when convenient",
-                  file=sys.stderr)
-    if changed or missing:
+
+    # Splice new files into the existing index one at a time rather than
+    # rebuilding from scratch: a rebuild discards every cached summary (see
+    # the cache handling in index.build), and re-chunking the entire project
+    # to pick up one added file is a needless amount of work besides.
+    for rel in added:
+        idx = index_mod.reindex_file(idx, rel, cfg, save=False)
+    if verbose and added:
+        print("  new files need summaries: run `pedacito index` when convenient",
+              file=sys.stderr)
+
+    if changed or missing or added:
         idx.save()
     return idx
 
@@ -236,7 +240,8 @@ def _cmd_config(args, cfg) -> int:
         return 1
     print(f"  reachable. Models available: {loaded}")
     if cfg.model not in loaded.split(", "):
-        print(f"  configured model '{cfg.model}': NOT IN THE LIST above.")
+        print(f"  configured model '{cfg.model}': NOT IN THE LIST above.",
+              file=sys.stderr)
         print("  Copy the id exactly as shown.", file=sys.stderr)
         return 1
     # Listing a model does not prove it can load. Generate one token and find
@@ -320,12 +325,18 @@ def _chat_command(line: str, args, cfg, ref) -> bool:
 
     if cmd == "steps":
         try:
-            ref["cfg"].max_steps = max(1, int(arg))
+            n = max(1, int(arg))
         except ValueError:
             print("  Usage: /steps 8", file=sys.stderr)
             return True
+        # Update the parsed-args namespace too, not just the live cfg: a
+        # later `/profile` re-resolves config through `_config(args)`, which
+        # applies args.steps on top. Without this, the original --steps value
+        # (or None) would silently clobber the /steps override.
+        args.steps = n
+        ref["cfg"].max_steps = n
         ref["agent"].cfg = ref["cfg"]
-        print(f"  max_steps = {ref['cfg'].max_steps}", file=sys.stderr)
+        print(f"  max_steps = {n}", file=sys.stderr)
         return True
 
     if cmd in ("profile", "model"):

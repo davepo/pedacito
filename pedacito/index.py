@@ -646,14 +646,31 @@ def build(paths: list[str], cfg, client=None, root: Path | None = None,
         except ValueError:
             rel = f.name
         idx.file_hashes[rel] = file_hash(f)
-    if not (summarise and client is not None):
-        idx.save()
-        return idx
 
+    # Apply whatever the cache already holds *before* the early return for
+    # summarise=False. Callers that skip LLM work (map, files, cost, and
+    # cli._refresh when it reindexes) must still see the summaries that were
+    # already paid for -- otherwise they'd write an index.json whose
+    # summaries are all blank even though the cache holds every one of them.
     cache = {} if resummarise else _load_cache(root)
     for c in chunks:
         if c.sha in cache:
             c.summary = _entry(cache[c.sha])[0]
+    for rel in idx.files:
+        # Match the summarise loop's skip condition: reference files with
+        # summarise_references off don't get their cached file summary
+        # reapplied, since they wouldn't have been generated in the first
+        # place on a current run.
+        if idx.is_reference(rel) and not cfg.summarise_references:
+            continue
+        skel = _skeleton(idx, rel)
+        key = "file:" + hashlib.sha256(skel.encode()).hexdigest()[:16]
+        if key in cache:
+            idx.file_summaries[rel] = _entry(cache[key])[0]
+
+    if not (summarise and client is not None):
+        idx.save()
+        return idx
 
     if verbose and cache:
         counts = cache_models(cache)
@@ -678,11 +695,10 @@ def build(paths: list[str], cfg, client=None, root: Path | None = None,
     for rel in idx.files:
         if idx.is_reference(rel) and not cfg.summarise_references:
             continue
+        if rel in idx.file_summaries:
+            continue   # already loaded from the cache above
         skel = _skeleton(idx, rel)
         key = "file:" + hashlib.sha256(skel.encode()).hexdigest()[:16]
-        if key in cache:
-            idx.file_summaries[rel] = _entry(cache[key])[0]
-            continue
         if verbose:
             print(f"  [file] {rel}", file=sys.stderr)
         s = _ask(client, cfg, FILE_SUMMARY_SYSTEM, skel, rel, breaker)
@@ -723,11 +739,16 @@ def build(paths: list[str], cfg, client=None, root: Path | None = None,
     return idx
 
 
-def reindex_file(index: Index, rel: str, cfg) -> Index:
+def reindex_file(index: Index, rel: str, cfg, save: bool = True) -> Index:
     """Re-chunk a single file after it has changed (either by Pedacito's own
     edit or externally) and return an updated Index. Summaries carry over by
     content hash, so untouched functions keep theirs and only genuinely
-    changed ones lose theirs."""
+    changed ones lose theirs.
+
+    Pass save=False when the caller is batching several reindexes and will
+    save once at the end -- the per-call save is one full write of index.json
+    for the whole project, which adds up.
+    """
     root = index.root
     kept = [c for c in index.chunks if c.file != rel]
     try:
@@ -742,5 +763,6 @@ def reindex_file(index: Index, rel: str, cfg) -> Index:
     merged = Index(root, kept + new, dict(index.file_summaries),
                    dict(index.file_hashes))
     merged.file_hashes[rel] = file_hash(root / rel)
-    merged.save()
+    if save:
+        merged.save()
     return merged

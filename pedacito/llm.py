@@ -248,7 +248,14 @@ def estimate_tokens(text: str) -> int:
 # --------------------------------------------------------------------------
 class LMStudio:
     """A thin client for one LM Studio server + model combination, handling
-    retries, template quirks, and reasoning-model output transparently."""
+    retries, template quirks, and reasoning-model output transparently.
+
+    Sampler parameters supplied via `cfg.sampler` are merged into every
+    request body verbatim, so a profile targeting LM Studio can pass top_k,
+    min_p, repeat_penalty, seed, and anything else llama.cpp understands --
+    none of which have a first-class config field, because the accepted set
+    differs per server.
+    """
 
     def __init__(self, cfg):
         """Initialise the client from a Config: connection details and the
@@ -377,6 +384,16 @@ class LMStudio:
             "max_tokens": max_tokens,
             "stream": stream,
         }
+        # User-supplied sampler parameters, merged verbatim. Anything the
+        # server accepts can go here (top_p, top_k, min_p, repeat_penalty,
+        # seed, stop, ...); anything it doesn't will 400 the request, so
+        # this belongs in the profile for the specific server it targets.
+        # The structural keys below are skipped: overriding them would
+        # produce a request Pedacito's own parsing cannot handle.
+        for k, v in (self.cfg.sampler or {}).items():
+            if k in ("model", "messages", "stream"):
+                continue
+            payload[k] = v
         # chat_template_kwargs is a llama.cpp/LM Studio convention. Hosted
         # APIs don't understand it, and a strict one could 400 on it, so it's
         # only sent when we're clearly talking to a local server (i.e. not
@@ -439,8 +456,12 @@ class LMStudio:
                 sys.stdout.flush()
         sys.stdout.write("\n")
         self.stats["seconds"] += time.time() - t0
-        # A reasoning model streams its thinking inline; drop it from the value
-        # we return so edit parsing never sees it, even though it was displayed.
+        # Reasoning models vary in where the thinking block lands. Some put
+        # it inline in `content` (so it's in `out` and needs stripping);
+        # others route it to a separate `reasoning_content` field (which the
+        # streaming loop above skips, since it only appends `content`).
+        # Either way, the returned value never contains a <think> block, so
+        # it's safe to hand straight to edit parsing.
         return strip_reasoning("".join(out))
 
     # --------------------------------------------------------------- helpers

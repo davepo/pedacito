@@ -30,6 +30,16 @@ GET /state for progress instead of hanging on a slow local-model call.
 Detailed step-by-step progress still goes to the terminal `pedacito gui`
 was launched from (the same prints `gather()`/`answer()` already produce) --
 piping that into the browser is a reasonable fast-follow, not done here.
+
+Thread safety: the `busy` flag plus every read or write of the shared
+`STATE` object goes through `STATE.lock` (an RLock). The rule that keeps
+the lock cheap is: hold it only around STATE mutations and the reads that
+feed them, never around a long-running call. In practice that means each
+worker snapshots what it needs under the lock, does all its model and
+filesystem work unlocked, and swaps the new STATE back in under the lock at
+the end. `status()` takes the lock so the poller always sees a coherent
+snapshot; `_spawn` takes it for the check-and-set of `busy` so two
+simultaneous POSTs can't both start a worker.
 """
 
 from __future__ import annotations
@@ -98,9 +108,16 @@ def _remember_recent(root: str) -> None:
 # --------------------------------------------------------------------------
 class State:
     """Everything held between HTTP requests. One instance, one active
-    project -- see the module docstring for why."""
+    project -- see the module docstring for why.
+
+    Every read and write of this object goes through `self.lock` unless
+    noted otherwise. The lock is an RLock so that methods like
+    `clear_review()` can be called from inside a block that already holds
+    it (see `_run_task`, `_open_project`).
+    """
 
     def __init__(self):
+        self.lock = threading.RLock()
         self.root: Path | None = None
         self.args: SimpleNamespace | None = None
         self.cfg = None
@@ -131,35 +148,38 @@ class State:
     def clear_review(self) -> None:
         """Discard whatever review is currently staged, without touching
         disk. Called both on /cancel and whenever a new project or task
-        makes the old review meaningless."""
-        self.review_page = ""
-        self.review_nonce = ""
-        self.review_diffs = []
-        self.review_outcome = ""
-        self.review_detail = ""
+        makes the old review meaningless. Callers must already hold (or
+        acquire) `self.lock`; the RLock makes that safe either way."""
+        with self.lock:
+            self.review_page = ""
+            self.review_nonce = ""
+            self.review_diffs = []
+            self.review_outcome = ""
+            self.review_detail = ""
 
     def status(self) -> dict:
         """The JSON payload the page polls to update itself."""
-        return {
-            "root": str(self.root) if self.root else "",
-            "profile": self.cfg.active_profile if self.cfg else "",
-            "profiles": sorted(self.cfg.profiles) if self.cfg else [],
-            "model": self.cfg.model if self.cfg else "",
-            "apply_default": bool(self.cfg and not self.cfg.review),
-            "has_index": self.idx is not None,
-            "index_files": len(self.idx.files) if self.idx else 0,
-            "files": sorted(self.idx.files) if self.idx else [],
-            "busy": self.busy,
-            "busy_what": self.busy_what,
-            "error": self.error,
-            "model_checked": self.model_checked,
-            "model_status": self.model_status,
-            "has_review": bool(self.review_diffs),
-            "review_outcome": self.review_outcome,
-            "review_detail": self.review_detail,
-            "last_task": self.last_task,
-            "recent": _load_recent(),
-        }
+        with self.lock:
+            return {
+                "root": str(self.root) if self.root else "",
+                "profile": self.cfg.active_profile if self.cfg else "",
+                "profiles": sorted(self.cfg.profiles) if self.cfg else [],
+                "model": self.cfg.model if self.cfg else "",
+                "apply_default": bool(self.cfg and not self.cfg.review),
+                "has_index": self.idx is not None,
+                "index_files": len(self.idx.files) if self.idx else 0,
+                "files": sorted(self.idx.files) if self.idx else [],
+                "busy": self.busy,
+                "busy_what": self.busy_what,
+                "error": self.error,
+                "model_checked": self.model_checked,
+                "model_status": self.model_status,
+                "has_review": bool(self.review_diffs),
+                "review_outcome": self.review_outcome,
+                "review_detail": self.review_detail,
+                "last_task": self.last_task,
+                "recent": _load_recent(),
+            }
 
 
 STATE = State()
@@ -170,19 +190,23 @@ def _spawn(fn, what: str) -> bool:
     while the model, the index, or the agent are already busy -- they are
     single-user resources and running two tasks against them at once would
     corrupt whichever finishes first."""
-    if STATE.busy:
-        return False
-    STATE.busy, STATE.busy_what, STATE.error = True, what, ""
+    with STATE.lock:
+        if STATE.busy:
+            return False
+        STATE.busy, STATE.busy_what, STATE.error = True, what, ""
 
     def worker():
         try:
             fn()
         except (ConfigError, LLMError) as e:
-            STATE.error = str(e)
+            with STATE.lock:
+                STATE.error = str(e)
         except Exception as e:  # surface it rather than hang the UI forever
-            STATE.error = f"{type(e).__name__}: {e}"
+            with STATE.lock:
+                STATE.error = f"{type(e).__name__}: {e}"
         finally:
-            STATE.busy, STATE.busy_what = False, ""
+            with STATE.lock:
+                STATE.busy, STATE.busy_what = False, ""
 
     threading.Thread(target=worker, daemon=True).start()
     return True
@@ -195,7 +219,11 @@ def _open_project(path: str, profile: str) -> None:
     """Resolve a directory as the active project: load its config (which is
     what makes the profile dropdown meaningful -- profiles live in a config
     resolved relative to root), ensure workspace scaffolding, and load
-    (never silently build) its index."""
+    (never silently build) its index.
+
+    The slow parts (config resolution, workspace setup, index loading and
+    refresh) run unlocked; only the final state swap holds the lock.
+    """
     p = Path(path).expanduser()
     if not p.is_dir():
         raise ConfigError(f"not a directory: {p}")
@@ -208,12 +236,16 @@ def _open_project(path: str, profile: str) -> None:
     if idx is not None:
         idx = cli_mod._refresh(idx, args, cfg, root, verbose=False)
 
-    STATE.root, STATE.args, STATE.cfg = root, args, cfg
-    STATE.client = LMStudio(cfg)
-    STATE.idx = idx
-    STATE.agent = Agent(idx, STATE.client, cfg) if idx is not None else None
-    STATE.model_checked, STATE.model_status = False, ""
-    STATE.clear_review()
+    client = LMStudio(cfg)
+    agent = Agent(idx, client, cfg) if idx is not None else None
+
+    with STATE.lock:
+        STATE.root, STATE.args, STATE.cfg = root, args, cfg
+        STATE.client = client
+        STATE.idx = idx
+        STATE.agent = agent
+        STATE.model_checked, STATE.model_status = False, ""
+        STATE.clear_review()
     _remember_recent(str(root))
 
 
@@ -235,25 +267,39 @@ def _build_index() -> None:
     """Build (or rebuild) the index with summaries -- the same work
     `pedacito index` does from the CLI. Kept as an explicit, visible action
     rather than something that fires silently on first Run, since it makes
-    one LLM call per summarised unit and is not free."""
-    if STATE.root is None:
-        raise ConfigError("no project selected")
+    one LLM call per summarised unit and is not free.
+    """
+    with STATE.lock:
+        if STATE.root is None:
+            raise ConfigError("no project selected")
+        args = STATE.args
+        cfg = STATE.cfg
+        client = STATE.client
+        root = STATE.root
+
     idx = index_mod.build(
-        STATE.args.paths, STATE.cfg, client=STATE.client, root=STATE.root,
-        summarise=True, matcher=cli_mod._matcher(STATE.args, STATE.root))
-    STATE.idx = idx
-    STATE.agent = Agent(idx, STATE.client, STATE.cfg)
+        args.paths, cfg, client=client, root=root,
+        summarise=True, matcher=cli_mod._matcher(args, root))
+
+    with STATE.lock:
+        STATE.idx = idx
+        STATE.agent = Agent(idx, client, cfg)
 
 
 def _check_model() -> None:
     """Verify the server is reachable and the configured model actually
     generates -- the same two checks as `pedacito config --check`."""
-    if STATE.client is None:
-        raise ConfigError("no project selected")
-    loaded = STATE.client.check(warn=False)
-    STATE.client.warmup()
-    STATE.model_checked = True
-    STATE.model_status = f"reachable \u2014 models available: {loaded}"
+    with STATE.lock:
+        if STATE.client is None:
+            raise ConfigError("no project selected")
+        client = STATE.client
+
+    loaded = client.check(warn=False)
+    client.warmup()
+
+    with STATE.lock:
+        STATE.model_checked = True
+        STATE.model_status = f"reachable \u2014 models available: {loaded}"
 
 
 def _run_task(task: str, apply_now: bool) -> None:
@@ -264,9 +310,14 @@ def _run_task(task: str, apply_now: bool) -> None:
     streaming mode writes tokens straight to this process's stdout, which
     is meaningless in an HTTP handler with no terminal on the other end.
     """
-    if STATE.agent is None:
-        raise ConfigError("no index yet -- build the index first")
-    agent, cfg, root = STATE.agent, STATE.cfg, STATE.root
+    with STATE.lock:
+        if STATE.agent is None:
+            raise ConfigError("no index yet -- build the index first")
+        agent = STATE.agent
+        cfg = STATE.cfg
+        root = STATE.root
+        idx = STATE.idx
+
     when = workspace.stamp()
     reviewing = not apply_now
     backup_dir = workspace.new_backup_dir(root, when) if cfg.backup else None
@@ -277,30 +328,39 @@ def _run_task(task: str, apply_now: bool) -> None:
         reply, dry_run=reviewing, task=task, gathered=gathered,
         backup_dir=None if reviewing else backup_dir)
 
-    STATE.last_task, STATE.last_reply = task, reply
-    STATE.last_results, STATE.last_backup_dir, STATE.last_stamp = (
-        results, backup_dir, when)
+    new_diffs: list = []
+    new_page = ""
+    new_nonce = ""
     applied = False
 
-    STATE.clear_review()
     if reviewing:
-        diffs = review_mod.diffs_from_results(results)
-        STATE.review_diffs = diffs
-        if diffs:
-            STATE.review_nonce = review_mod.new_nonce()
-            STATE.review_page = review_mod.build_page(
-                diffs, task, cfg.model, cfg.active_profile,
-                STATE.review_nonce, interactive=True, stamp=when)
-            review_mod.save(root, STATE.review_page, when)
+        new_diffs = review_mod.diffs_from_results(results)
+        if new_diffs:
+            new_nonce = review_mod.new_nonce()
+            new_page = review_mod.build_page(
+                new_diffs, task, cfg.model, cfg.active_profile,
+                new_nonce, interactive=True, stamp=when)
+            review_mod.save(root, new_page, when)
     else:
         applied = any(r.ok for r in results)
+        if applied:
+            for r in results:
+                if r.ok:
+                    idx = index_mod.reindex_file(idx, r.file, cfg)
 
-    if applied:
-        idx = STATE.idx
-        for r in results:
-            if r.ok:
-                idx = index_mod.reindex_file(idx, r.file, cfg)
-        STATE.idx, agent.index = idx, idx
+    with STATE.lock:
+        STATE.last_task, STATE.last_reply = task, reply
+        STATE.last_results, STATE.last_backup_dir, STATE.last_stamp = (
+            results, backup_dir, when)
+        STATE.clear_review()
+        if new_diffs:
+            STATE.review_diffs = new_diffs
+            STATE.review_nonce = new_nonce
+            STATE.review_page = new_page
+        if applied:
+            STATE.idx = idx
+            if STATE.agent is not None:
+                STATE.agent.index = idx
 
     if cfg.log_sessions:
         workspace.write_session(root, task, getattr(agent, "steps_log", []),
@@ -310,16 +370,30 @@ def _run_task(task: str, apply_now: bool) -> None:
 def _apply_review() -> tuple[bool, str]:
     """Write the currently staged review's files to disk (the review
     page's Sign off button, handled on this server rather than a second
-    one -- see the module docstring)."""
-    if not STATE.review_diffs:
-        return False, "No review is staged."
-    ok, detail = review_mod.write_files(STATE.root, STATE.review_diffs,
-                                        STATE.last_backup_dir)
-    if ok:
-        STATE.review_outcome, STATE.review_detail = "applied", detail
+    one -- see the module docstring).
+
+    Snapshots the review state under the lock, does the actual write
+    unlocked (it's a synchronous filesystem operation, not slow, but it
+    has no business blocking the poller), then swaps the updated index
+    back in under the lock.
+    """
+    with STATE.lock:
+        if not STATE.review_diffs:
+            return False, "No review is staged."
+        diffs = STATE.review_diffs
+        root = STATE.root
+        backup_dir = STATE.last_backup_dir
+        cfg = STATE.cfg
         idx = STATE.idx
-        for fd in STATE.review_diffs:
-            idx = index_mod.reindex_file(idx, fd.rel, STATE.cfg)
+
+    ok, detail = review_mod.write_files(root, diffs, backup_dir)
+    if not ok:
+        return ok, detail
+
+    with STATE.lock:
+        STATE.review_outcome, STATE.review_detail = "applied", detail
+        for fd in diffs:
+            idx = index_mod.reindex_file(idx, fd.rel, cfg)
         STATE.idx = idx
         if STATE.agent is not None:
             STATE.agent.index = idx
@@ -689,7 +763,8 @@ class _Handler(BaseHTTPRequestHandler):
         elif path == "/state":
             self._json(200, STATE.status())
         elif path == "/review":
-            page = STATE.review_page or _NO_REVIEW_HTML
+            with STATE.lock:
+                page = STATE.review_page or _NO_REVIEW_HTML
             self._send(200, page.encode("utf-8"), "text/html; charset=utf-8")
         else:
             self._send(404, b'{"ok":false}', "application/json")
@@ -724,15 +799,19 @@ class _Handler(BaseHTTPRequestHandler):
                        "running task")
             self._json(202 if ok else 409, {"ok": ok})
         elif path == "/apply":
-            if body.get("nonce") != STATE.review_nonce:
+            with STATE.lock:
+                current_nonce = STATE.review_nonce
+            if body.get("nonce") != current_nonce:
                 self._json(403, {"ok": False,
                                  "detail": "This review is no longer valid."})
                 return
             ok, detail = _apply_review()
             self._json(200, {"ok": ok, "detail": detail})
         elif path == "/cancel":
-            STATE.review_outcome, STATE.review_detail = "cancelled", "No files were changed."
-            STATE.clear_review()
+            with STATE.lock:
+                STATE.review_outcome, STATE.review_detail = (
+                    "cancelled", "No files were changed.")
+                STATE.clear_review()
             self._json(200, {"ok": True})
         elif path == "/shutdown":
             self._json(200, {"ok": True})

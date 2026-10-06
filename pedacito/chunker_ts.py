@@ -139,12 +139,6 @@ def _leading_comment_doc(node) -> str:
     parent = node.parent
     if parent is None:
         return ""
-    # Walk the parent's children to find node's own preceding sibling,
-    # unwrapping through export_statement since the comment sits above the
-    # `export`, not above the declaration it wraps.
-    target = node
-    while target.parent is not None and target.parent.type != parent.type:
-        break
     siblings = list(parent.children)
     try:
         idx = siblings.index(node)

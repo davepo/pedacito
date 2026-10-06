@@ -31,7 +31,7 @@ from __future__ import annotations
 import os
 import tomllib
 import difflib
-from dataclasses import dataclass, fields
+from dataclasses import dataclass, fields, field
 from pathlib import Path
 
 
@@ -86,6 +86,23 @@ class Config:
     # --- Generation -----------------------------------------------------------
     # Low temp for tool selection; a 27B at 0.2 is fine for prose and code too.
     temperature: float = 0.2
+    # Passthrough for sampler parameters that OpenAI's request schema does
+    # not name: top_k, min_p, repeat_penalty, presence_penalty, seed, stop,
+    # and anything else a given server accepts. Merged verbatim into every
+    # /chat/completions request body, so what you can put here is whatever
+    # your server actually reads. Pedacito's own structural keys -- model,
+    # messages, stream -- are protected and cannot be overridden.
+    #
+    # The right place for this is a profile-scoped table, because the fields
+    # that local runtimes accept (top_k, min_p, repeat_penalty) are exactly
+    # the ones hosted APIs reject with a 400:
+    #
+    #   [profiles.lmstudio.sampler]
+    #   top_p = 0.95
+    #   top_k = 40
+    #   min_p = 0.05
+    #   repeat_penalty = 1.1
+    sampler: dict = field(default_factory=dict)
     max_tokens_summary: int = 220
     # One tool call plus a short note. Models that narrate a plan in the
     # `reasoning` field need more; the schema puts the action first so a
@@ -194,7 +211,7 @@ class Config:
 # talks to any server exposing an OpenAI-compatible /v1 surface (LM Studio,
 # Ollama, and others), so "server" describes it without implying one product.
 _SECTIONS = ("server", "lmstudio", "generation", "map", "indexing", "files",
-             "agent", "editing", "reasoning", "review")
+             "agent", "editing", "reasoning", "review", "workspace")
 PROFILE_SECTION = "profiles"
 
 _FIELDS = {f.name: f for f in fields(Config)
@@ -273,6 +290,15 @@ def _coerce(name: str, value, path: Path | None = None):
             raise ConfigError(f"{where}{name} must be a list, "
                               f'e.g. [".jinja", ".proto"]')
         return tuple(str(v) for v in value)
+    if name == "sampler":
+        # A plain dict passthrough, however TOML spelled it: an inline table
+        # (`sampler = { top_k = 40 }`) and a nested table
+        # (`[profiles.x.sampler]` with keys beneath) both land here as dict.
+        if not isinstance(value, dict):
+            raise ConfigError(
+                f"{where}{name} must be a table, e.g. "
+                f"[profiles.NAME.sampler] with keys underneath")
+        return dict(value)
     if target is float and isinstance(value, int) and not isinstance(value, bool):
         return float(value)
     if target in (str, int, float, bool) and not isinstance(value, target):
@@ -360,10 +386,13 @@ def load(root: Path | None = None, explicit: Path | None = None,
         cfg.active_profile = profile
 
     # Env vars still work, mostly for scripting and one-off overrides.
+    # default_profile is deliberately excluded: profile selection has
+    # already happened above, so setting it now would have no effect on
+    # which profile is active and would only add a misleading source line.
     if use_env:
         for key in _FIELDS:
             if key == "default_profile":
-                continue   # handled above, before profiles were applied
+                continue
             raw = os.environ.get("PEDACITO_" + key.upper())
             if raw is None:
                 continue
@@ -385,6 +414,22 @@ def _parse_env(name: str, raw: str):
         return raw
     if name == "extra_extensions":
         return tuple(x.strip() for x in raw.split(",") if x.strip())
+    if name == "sampler":
+        # Not a natural environment-variable target; a JSON object is the
+        # only sane spelling. Importing json here keeps the module's import
+        # surface unchanged for the (much more common) case where nobody
+        # sets this variable.
+        import json as _json
+        try:
+            obj = _json.loads(raw)
+        except ValueError as e:
+            raise ConfigError(
+                f"PEDACITO_SAMPLER={raw!r} is not valid JSON: {e}") from e
+        if not isinstance(obj, dict):
+            raise ConfigError(
+                f"PEDACITO_SAMPLER={raw!r} must be a JSON object, "
+                f'e.g. \'{{"top_k": 40}}\'')
+        return obj
     if target is bool:
         return raw.strip().lower() in ("1", "true", "yes", "on")
     try:
@@ -398,85 +443,180 @@ def _parse_env(name: str, raw: str):
 # --------------------------------------------------------------------------
 TEMPLATE = '''\
 # Pedacito configuration.
+#
 # Lives at ~/.config/pedacito/config.toml (Linux/macOS) or
-# %APPDATA%\\pedacito\\config.toml (Windows). A .pedacito.toml in a project root
-# overrides these for that project, and command-line flags override both.
+# %APPDATA%\\pedacito\\config.toml (Windows). A .pedacito.toml in a project
+# root overrides these for that project; command-line flags override both.
+#
+# Every setting below is optional -- the value shown in each commented line
+# is the built-in default. Pedacito runs with no config file at all, on
+# http://localhost:1234/v1 with google/gemma-3-27b.
+#
+# Precedence, lowest to highest:
+#   defaults -> this file -> <project>/.pedacito.toml -> --config FILE ->
+#   --profile NAME -> command-line flags
+#
+# Run `pedacito config` to see every resolved value and which layer set it.
 
-# Uncomment to make one profile the default for every command.
-# Override for a single shell with:  $env:PEDACITO_PROFILE = "qwen"
-# default_profile = "devstral"
+# ===========================================================================
+# QUICK START -- one local server, one hosted server, switch with --profile
+# ===========================================================================
+#
+# [server] holds the defaults for when no profile is selected. Every field
+# in it, including base_url / api_key / model / json_mode, can be overridden
+# by a profile -- so "switch servers" is just "switch profile":
+#
+#   pedacito ask proj -t "..." --profile deepseek
+#   pedacito chat proj            # then /profile deepseek mid-session
+#
+# A fully worked two-server example is at the bottom of this file. The
+# [server] section here is what that example falls back to.
 
 [server]
-# Any server exposing an OpenAI-compatible /v1 API: LM Studio, Ollama, and
-# hosted services (DeepSeek, OpenAI, Groq, Mistral, ...) all work.
-#
-# Local server (LM Studio / Ollama) -- grammar-constrained JSON, no API key:
-#   base_url = "http://localhost:1234/v1"
-#   model    = "google/gemma-3-27b"
-#
-# Hosted OpenAI-compatible API -- no json_schema support, needs an API key:
-#   base_url  = "https://api.deepseek.com/v1"
-#   api_key   = "sk-..."
-#   model     = "deepseek-chat"
-#   json_mode = "object"
 base_url = "http://localhost:1234/v1"
+model    = "google/gemma-3-27b"
 
-# Must match the id the server reports exactly. `pedacito config --check` shows
-# what's available:
-#   LM Studio: the id shown by /v1/models
-#   Ollama:    the name shown by `ollama list`, e.g. "qwen2.5-coder:14b"
-#   Hosted APIs: the model id from that provider's docs, e.g. "deepseek-chat"
-model = "google/gemma-3-27b"
+# api_key = "lm-studio"        # ignored by local servers; any string works
+# json_mode = "schema"         # "schema" for local llama.cpp/LM Studio;
+#                              # "object" for hosted OpenAI-compatible APIs
+#                              # (DeepSeek, OpenAI, ...), which reject schema
+# timeout = 600.0              # seconds per request
+# load_wait_seconds = 240      # how long to wait for a model to load
+# max_consecutive_failures = 3 # abort an indexing batch after N fails in a row
 
-# api_key = "lm-studio"      # ignored by local servers; any string works
-# timeout = 600.0            # seconds; raise it if you index very large files
-
-# json_mode:
-#   "schema" (default) -- sends the full JSON Schema. Grammar-constrained on
-#                         llama.cpp/LM Studio, so a tool call always parses.
-#                         Hosted APIs reject this and the first step fails.
-#   "object"           -- sends {"type": "json_object"} only. Required for
-#                         DeepSeek and most other hosted APIs.
-# json_mode = "schema"
-
-[review]
-# review = true              # always open the side-by-side reviewer
-# open_browser = false       # print the URL instead of launching a browser
-
-[agent]
-# max_steps = 6              # lookups before the model must answer
-# max_gathered_chars = 24000 # ceiling on accumulated source per task
-
-[map]
-# flat_map_token_budget = 4000   # above this, the map switches to file cards
-
-[indexing]
-# summarise_methods = false      # true if your methods lack docstrings
-# summarise_documented = false   # true if your docstrings are stale
-
-[files]
-# extra_extensions = [".jinja", ".proto"]
-# include_references = true      # false indexes Python only
-
-# Named presets. Select one with --profile NAME. Anything not listed in a
-# profile falls back to the settings above.
+# ===========================================================================
+# EVERY SETTING, with its default
+# ===========================================================================
 #
-#   pedacito ask myproj -t "..." --profile qwen
+# Nothing below the QUICK START block is required. It's a reference: the
+# section names are organizational only (any valid field is accepted under
+# any section), and every line is commented out. Uncomment what you want to
+# change.
+
+# --- Generation -------------------------------------------------------------
+# [generation]
+# temperature = 0.2            # raise toward 0.7 for prose; leave low for
+#                              # tool calls -- higher makes them worse
+# max_tokens_summary = 220     # budget for one summary sentence
+# max_tokens_step = 700        # budget for one tool call in the gather loop
+# max_tokens_answer = 3000     # budget for the final answer / edit reply
+
+# Sampler parameters, merged verbatim into every /chat/completions request.
+# This is where top_k, min_p, repeat_penalty, seed, stop, and anything else
+# your local runtime accepts go -- the config has no first-class field for
+# them because the accepted set differs per server. Hosted APIs (DeepSeek,
+# OpenAI) 400 on unknown fields like top_k and min_p, so put this inside a
+# profile targeted at a specific server, not here.
 #
-# [profiles.gemma]
-# model = "google/gemma-3-27b"
+# [profiles.lmstudio.sampler]
+# top_p          = 0.95
+# top_k          = 40
+# min_p          = 0.05
+# repeat_penalty = 1.1
+# seed           = -1
+
+# --- Map tiering ------------------------------------------------------------
+# [map]
+# flat_map_token_budget = 4000     # above this, switch from flat map to cards
+# file_card_line_ranges = true     # attach L11-21 to names on file cards;
+#                                  # costs a bit more, saves an outline round trip
+
+# --- Indexing ---------------------------------------------------------------
+# [indexing]
+# class_split_lines = 60           # classes shorter than this stay one chunk
+# max_chunk_chars = 6000           # source truncated to this before summarising
+# min_lines_to_summarise = 4       # skip summarising trivially short units
+# summarise_methods = false        # true if your methods lack docstrings
+# summarise_documented = false     # true if your existing docstrings are stale
+
+# --- File selection ---------------------------------------------------------
+# [files]
+# include_references = true        # index .md/.json/.toml/... as reference files
+# extra_extensions = [".jinja", ".proto"]   # treat these as reference too
+# max_reference_bytes = 2000000    # above this, a reference file is header-only
+# summarise_references = false     # LLM summary on reference files; rarely worth it
+
+# --- Agent loop -------------------------------------------------------------
+# [agent]
+# max_steps = 6                    # lookups before the model must answer
+# max_gathered_chars = 24000       # ceiling on accumulated source per task
+# max_read_lines = 200             # cap on one `read` call's line count
+
+# --- Reasoning models -------------------------------------------------------
+# Qwen3 and friends emit a <think> block by default. Pedacito strips it
+# either way, but generating it still costs tokens and time. Both switches
+# are provided because which one a given model honours varies; setting both
+# is harmless.
 #
-# [profiles.devstral]
-# model = "mistralai/devstral-small-2-24b-instruct-2512"
+# [reasoning]
+# disable_thinking = false         # sends chat_template_kwargs {"enable_thinking": false}
+# thinking_suffix = ""             # appends a token like "/no_think" to the prompt
+
+# --- Editing ----------------------------------------------------------------
+# [editing]
+# backup = true                    # snapshot originals before writing;
+#                                  # `pedacito restore` puts them back
+# log_sessions = true              # write a session record per task
+
+# --- Review page ------------------------------------------------------------
+# [review]
+# review = false                   # always open the side-by-side reviewer
+# review_port = 0                  # 0 lets the OS pick a free port
+# open_browser = true              # false prints the URL instead of launching
+# review_timeout = 1800            # seconds before an unanswered review expires
+
+# --- Workspace --------------------------------------------------------------
+# [workspace]
+# manage_gitignore = true          # add .pedacito/ to .gitignore on first run
+# create_ignore_file = true        # create a starter .pedacitoignore
+
+# ===========================================================================
+# PROFILES -- one per server, or one per model
+# ===========================================================================
 #
-# [profiles.qwen]
-# model = "qwen/qwen3-32b"
-# disable_thinking = true          # skip the <think> block: faster, cheaper
-# thinking_suffix = "/no_think"    # belt and braces; some builds need this one
+# A profile overrides any setting in this file, not just model. Select with
+# --profile NAME, /profile inside chat, PEDACITO_PROFILE in the shell, or
+# default_profile below.
+#
+# default_profile = "local"
+
+# Local LM Studio. json_mode stays "schema" (the default): llama.cpp and
+# LM Studio enforce it, so a tool call always parses.
+#
+# [profiles.local]
+# base_url = "http://localhost:1234/v1"
+# model    = "qwen3.5-9b"
+# api_key  = "lm-studio"
+#
+# [profiles.local.sampler]
+# top_p          = 0.95
+# top_k          = 40
+# repeat_penalty = 1.1
+
+# Hosted DeepSeek. json_mode must be "object": hosted APIs reject the
+# json_schema Pedacito sends by default, and the gather loop fails on its
+# first step without this.
+#
+# [profiles.deepseek]
+# base_url  = "https://api.deepseek.com/v1"
+# model     = "deepseek-chat"
+# api_key   = "sk-..."
+# json_mode = "object"
+# timeout   = 120.0
+#
+# [profiles.deepseek.sampler]
+# top_p            = 0.95
+# presence_penalty = 0.0
+# Note: no top_k or min_p here. DeepSeek 400s on those.
+
+# Reasoning model. Thinking off is faster and cheaper at ~25 tok/s, and the
+# two ways to ask cover models that honour only one of them.
 #
 # [profiles.qwen-thinking]
 # model = "qwen/qwen3-32b"
-# max_tokens_answer = 6000         # thinking needs headroom
+# disable_thinking = true
+# thinking_suffix = "/no_think"
+# max_tokens_answer = 6000     # thinking needs headroom
 '''
 
 
