@@ -70,6 +70,7 @@ CODE_EXTS = PY_EXTS | JS_TS_EXTS | RUBY_EXTS
 REFERENCE_EXTS = {
     ".md", ".rst", ".txt", ".csv", ".tsv", ".json", ".toml",
     ".yaml", ".yml", ".ini", ".cfg", ".conf", ".env", ".sql", ".sh",
+    ".html", ".htm", ".xhtml",
 }
 
 
