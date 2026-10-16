@@ -212,9 +212,15 @@ class Agent:
         return "\n\n".join(gathered)
 
     # ------------------------------------------------------------------ phase 2
-    def answer(self, task: str, gathered: str, stream: bool = True) -> str:
+    def answer(self, task: str, gathered: str, stream: bool = True,
+               system: str | None = None, max_tokens: int | None = None) -> str:
         """Ask the model to answer the task, or produce search/replace edits,
-        given the project map and whatever source `gather()` collected."""
+        given the project map and whatever source `gather()` collected.
+
+        `system` and `max_tokens` override the defaults for special flows that
+        need a different brief than "edit this existing code" -- e.g. resuming
+        an unfinished scaffold (`Agent.resume_task`) or writing one whole file
+        of a new project (see scaffold.py)."""
         repo_map, _ = self.index.map_for_prompt(self.cfg)
         user = (
             f"PROJECT MAP\n\n{repo_map}\n\n"
@@ -223,21 +229,25 @@ class Agent:
         )
         print(f"[answer context ~{estimate_tokens(user)} tokens]", file=sys.stderr)
         return self.client.chat(
-            [{"role": "system", "content": ANSWER_SYSTEM}, {"role": "user", "content": user}],
-            max_tokens=self.cfg.max_tokens_answer,
+            [{"role": "system", "content": system or ANSWER_SYSTEM},
+             {"role": "user", "content": user}],
+            max_tokens=max_tokens or self.cfg.max_tokens_answer,
             stream=stream,
         )
 
     # ------------------------------------------------------------------- edits
-    def apply(self, reply: str, dry_run: bool, repair_rounds: int = 2,
+    def apply(self, reply: str, dry_run: bool, repair_rounds: int | None = None,
               task: str = "", gathered: str = "",
               backup_dir=None) -> tuple[list, str]:
         """Parse and apply the edits in `reply`, feeding any failures back to
         the model (up to `repair_rounds` times) so it can re-anchor its
-        search text. Returns (results, final_reply_text)."""
-        results = apply_edits(self.index.root, parse_edits(reply),
-                              backup=self.cfg.backup, dry_run=dry_run,
-                              backup_dir=backup_dir)
+        search text. Returns (results, final_reply_text).
+
+        A brand-new file is created from its block as soon as the block parses;
+        only a block that must match existing text needs the repair loop."""
+        if repair_rounds is None:
+            repair_rounds = self.cfg.repair_rounds
+        results = self._apply_once(reply, dry_run, backup_dir)
 
         for _ in range(repair_rounds):
             failures = [r for r in results if not r.ok]
@@ -259,10 +269,34 @@ class Agent:
                 stream=True,
             )
             good = [r for r in results if r.ok]
-            results = good + apply_edits(self.index.root, parse_edits(reply),
-                                         backup=self.cfg.backup, dry_run=dry_run,
-                                         backup_dir=backup_dir)
+            results = good + self._apply_once(reply, dry_run, backup_dir)
         return results, reply
+
+    def _apply_once(self, reply: str, dry_run: bool, backup_dir=None) -> list:
+        """One parse-and-apply pass, with no repair round-trip."""
+        return apply_edits(self.index.root, parse_edits(reply),
+                           backup=self.cfg.backup, dry_run=dry_run,
+                           backup_dir=backup_dir, cfg=self.cfg)
+
+    # ------------------------------------------------------------------ resume
+    def resume_task(self, task: str, stream: bool = True, dry_run: bool = False,
+                    backup_dir=None) -> tuple[list, str]:
+        """Finish a scaffolded project whose files are still stubs.
+
+        `new --plan-only` leaves a real tree of one-line headers and a saved
+        index, so the ordinary gather loop can navigate it -- every file has an
+        outline and readable line numbers. The only thing missing is a brief that
+        says "implement these stubs" instead of "answer about this code", which
+        is what the `system` override below supplies. Everything else is the
+        normal path: gather, answer, edit blocks, repair rounds, backups, review.
+
+        Returns (results, reply)."""
+        from .scaffold import RESUME_SYSTEM
+
+        gathered = self.gather(task, verbose=True)
+        reply = self.answer(task, gathered, stream=stream, system=RESUME_SYSTEM)
+        return self.apply(reply, dry_run=dry_run, task=task, gathered=gathered,
+                          backup_dir=backup_dir)
 
 
 def _compact(step: dict) -> str:

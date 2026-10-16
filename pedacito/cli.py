@@ -10,6 +10,7 @@ Usage
     pedacito cost   src/                     # what indexing would cost
     pedacito config --init                   # write a starter config file
     pedacito restore src/                    # undo the last --apply
+    pedacito new  my-app -t "todo CLI"       # start a project from scratch
 
 Run as `pedacito <command> ...` (after `pip install -e .`) or
 `python -m pedacito <command> ...`. `main()` is the single entry point invoked
@@ -499,6 +500,32 @@ def main(argv=None) -> int:
                        help="never open the reviewer, even if config enables it")
     p_ask.add_argument("--reindex", action="store_true", help="force a fresh index first")
 
+    p_new = sub.add_parser(
+        "new", help="start a project from scratch: plan, scaffold, build")
+    p_new.add_argument("project", help="directory for the new project "
+                                       "(created if missing; must be empty)")
+    p_new.add_argument("-t", "--task", default=None,
+                       help="one-line project description")
+    p_new.add_argument("--spec", metavar="FILE", default=None,
+                       help="a larger spec document (.md/.txt); may be combined "
+                            "with -t, or piped in via stdin")
+    p_new.add_argument("--plan-only", dest="plan_only", action="store_true",
+                       help="stop after the plan + header skeleton; implement "
+                           "later with ordinary `ask --apply` runs")
+    p_new.add_argument("--apply", action="store_true",
+                       help="write the generated files to disk (default: dry run)")
+    p_new.add_argument("--review", action="store_true",
+                       help="build, then sign off on everything in the "
+                            "side-by-side reviewer")
+    p_new.add_argument("--force", action="store_true",
+                       help="allow scaffolding into a non-empty directory")
+    p_new.add_argument("--url", help="server base url override")
+    p_new.add_argument("--model", help="model id/name override")
+    p_new.add_argument("--config", metavar="FILE", help="use this config file as well")
+    p_new.add_argument("--profile", metavar="NAME",
+                       help="apply a [profiles.NAME] block from your config")
+    p_new.add_argument("--no-review", dest="no_review", action="store_true")
+
     p_chat = sub.add_parser("chat", help="interactive session")
     _add_common(p_chat)
     p_chat.add_argument("--apply", action="store_true")
@@ -632,6 +659,25 @@ def main(argv=None) -> int:
 
         client = LMStudio(cfg)
         client.check()
+
+        # --- new: start a project from scratch (plan -> skeleton -> build) ---
+        # Handled before indexing: the project directory usually does not exist
+        # yet, and the skeleton gets its own in-memory index.
+        if args.cmd == "new":
+            from . import scaffold
+            root = Path(args.project).expanduser().resolve()
+            spec = scaffold.load_spec(
+                prompt=args.task, spec_file=args.spec,
+                max_chars=getattr(cfg, "max_spec_chars", scaffold.MAX_SPEC_CHARS))
+            code = scaffold.run_new(
+                root, cfg, client, spec,
+                apply=args.apply, review=args.review,
+                plan_only=args.plan_only, force=args.force,
+                verbose=True)
+            s = client.stats
+            print(f"\n[{s['calls']} calls, {s['completion_tokens']} tokens out, "
+                  f"{s['seconds']:.0f}s]", file=sys.stderr)
+            return code
 
         if args.cmd == "index":
             root = _root(args)

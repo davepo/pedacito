@@ -310,6 +310,28 @@ terminal; the GUI doesn't cover those yet.
 
 ---
 
+## Starting a project from scratch
+
+Everything above edits an existing codebase. `pedacito new` builds one from
+a description — a one-liner with `-t`, or a bigger spec document with
+`--spec` (a `.md`/`.txt` file, stdin, or both):
+
+```bash
+pedacito new ~/code/my-app -t "a CLI todo manager with a sqlite backend"          # dry run: plan + preview only
+pedacito new ~/code/my-app -t "..." --apply                                       # write it all
+pedacito new ~/code/my-api --spec docs/spec.md --review                           # sign off in the browser first
+pedacito new ~/code/my-app -t "..." --plan-only --apply                           # skeleton only; finish with ordinary ask runs
+```
+
+Three stages: the model plans a file tree (JSON, capped at
+`max_new_files`), the skeleton is written (each file just a header comment
+stating its purpose), then one build pass per file fills in the
+implementation with the neighbouring files visible. Dry run by default,
+backed up like any `--apply` (`pedacito restore` undoes a whole run), and
+the target directory must not exist or be empty unless you pass `--force`.
+
+---
+
 ## Working continuously
 
 ```bash
@@ -448,6 +470,8 @@ costs a re-index. Or pass `--reindex` to `ask`/`chat`.
 | `pedacito ask PROJ -t "..." --review` | Same, with a side-by-side sign-off page. |
 | `pedacito ask PROJ -t "..." --apply` | Same, writes immediately. |
 | `pedacito chat PROJ` | Interactive; index stays warm between tasks. |
+| `pedacito new DIR -t "..."` | Start a project from scratch: plan, scaffold, build. |
+| `pedacito new DIR --spec FILE` | Same, from a larger spec document. |
 | `pedacito restore PROJ` | Undo the last write. |
 | `pedacito gui` | Browser control panel: pick a project, check the model, ask, review inline. |
 

@@ -154,6 +154,24 @@ class Config:
     # usable reasoning window is well under its advertised context.
     max_gathered_chars: int = 24000
     max_read_lines: int = 200
+    # Let the gather loop create/overwrite whole files via the `write` tool.
+    # Off by default: a mid-gather write skips the edit path's backup, syntax
+    # check and review page, so prefer search/replace blocks unless a model
+    # genuinely cannot emit them.
+    allow_write: bool = False
+    # Ceiling on one `write` call's contents, in characters.
+    max_write_chars: int = 200_000
+
+    # --- Project scaffolding (`pedacito new`) ---------------------------------
+    # Cap on how many files a plan may propose; longer plans are truncated and
+    # the excess reported. Small models love to enumerate 40 tiny stubs.
+    max_new_files: int = 24
+    # Spec documents longer than this are truncated, with a loud warning.
+    max_spec_chars: int = 60_000
+    # Token budgets for the two scaffold calls that do not reuse an existing
+    # answer budget.
+    max_tokens_plan: int = 1200
+    max_tokens_build: int = 4000
 
     # --- Reasoning models -----------------------------------------------------
     # Qwen3 and friends emit a <think> block by default. Pedacito strips it either
@@ -541,6 +559,16 @@ model    = "google/gemma-3-27b"
 # max_steps = 6                    # lookups before the model must answer
 # max_gathered_chars = 24000       # ceiling on accumulated source per task
 # max_read_lines = 200             # cap on one `read` call's line count
+# allow_write = false              # let the gather loop overwrite whole files
+#                                  # (skips backup/review; prefer edit blocks)
+# max_write_chars = 200000         # ceiling on one `write` call
+
+# --- Project scaffolding (`pedacito new`) -----------------------------------
+# [scaffold]
+# max_new_files = 24               # cap on how many files a plan may propose
+# max_spec_chars = 60000           # spec documents longer than this are cut
+# max_tokens_plan = 1200           # budget for the planning call
+# max_tokens_build = 4000          # budget for each per-file build pass
 
 # --- Reasoning models -------------------------------------------------------
 # Qwen3 and friends emit a <think> block by default. Pedacito strips it
