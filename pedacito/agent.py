@@ -201,11 +201,46 @@ class Agent:
                         print("  (no source read yet; asking it to read before "
                               "answering)", file=sys.stderr)
                     continue
+                if not gathered and step < self.cfg.max_steps:
+                    # A `done` whose every lookup failed to produce anything
+                    # usable (bad line range, unresolvable file, ...) would end
+                    # the loop with an empty SOURCE section, and the answer
+                    # phase can only refuse -- which surfaces as a blank review
+                    # page ("the model answered without proposing any edits").
+                    # Tell it what went wrong so it can pick a real range.
+                    # Only fires when nothing succeeded at all; a mix of one
+                    # good read and some failures is normal navigation noise.
+                    nudged = True
+                    last_err = next((g for g in gathered if " failed: " in g), None)
+                    detail = (f"Your last result said: {last_err}\n" if last_err else "")
+                    messages.append({"role": "assistant", "content": _compact(stepjson)})
+                    messages.append({"role": "user", "content":
+                        "None of your lookups returned any source, so you still "
+                        "cannot see the code you want to change. " + detail +
+                        "`read` the exact lines you need (ranges come from the "
+                        "map or an outline), then say done."})
+                    if verbose:
+                        print("  (all lookups failed; asking it to read real "
+                              "lines before answering)", file=sys.stderr)
+                    continue
                 break
 
             obs = dispatch(self.index, self.cfg, stepjson)
             if action == "read" and not obs.startswith("ERROR"):
                 did_read = True
+            # An ERROR observation is navigation feedback ("that range does
+            # not exist"), not source. Carrying it into the answer prompt as
+            # gathered text makes the SOURCE section look populated while it
+            # contains no code at all -- the model then answers from the map
+            # alone and proposes nothing, which surfaces in the GUI as a
+            # blank review page. Record failures compactly instead.
+            if obs.startswith("ERROR"):
+                arg = stepjson.get("file") or stepjson.get("pattern") or stepjson.get("symbol") or ""
+                gathered.append(f"--- {action} {arg} failed: {obs[:160]}")
+                messages.append({"role": "assistant", "content": _compact(stepjson)})
+                messages.append({"role": "user",
+                                 "content": f"{obs}\n\n{nudge(step + 1)}"})
+                continue
             if len(obs) > budget:
                 obs = obs[:budget] + "\n[truncated: context budget reached]"
             budget -= len(obs)
