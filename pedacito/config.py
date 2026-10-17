@@ -32,6 +32,7 @@ import os
 import re
 import tomllib
 import difflib
+import sys
 from dataclasses import dataclass, fields, field
 from pathlib import Path
 
@@ -162,6 +163,25 @@ class Config:
     allow_write: bool = False
     # Ceiling on one `write` call's contents, in characters.
     max_write_chars: int = 200_000
+    # When a search/replace block fails to match, the model is fed the failure
+    # and asked to re-anchor it. This caps those repair round-trips per apply.
+    # Hosted models re-anchor reliably and merit more rounds; small local
+    # models mostly repeat the same bad copy, so fewer rounds wastes less time.
+    repair_rounds: int = 2
+
+    # --- Context window -------------------------------------------------------
+    # The server-side context length you configured for the model (LM Studio's
+    # "Context length", Ollama's num_ctx, an API's advertised window). Used by
+    # `pedacito config` to sanity-check the token budgets below against it --
+    # profiles set this per tier (8k for a small local model, 128k for hosted).
+    # The default matches the default budgets: flat map (4000) + gathered
+    # source (~6000 tok) + one step fits inside 16384 - 2048 with room left.
+    context_tokens: int = 16384
+    # Tokens held back from `context_tokens` for the reply itself. A gather
+    # plan that fills the window to the last token leaves nothing to answer
+    # with, which is how truncation errors like "ran past max_tokens_step"
+    # usually start.
+    reserve_tokens: int = 2048
 
     # --- Project scaffolding (`pedacito new`) ---------------------------------
     # Cap on how many files a plan may propose; longer plans are truncated and
@@ -421,7 +441,45 @@ def load(root: Path | None = None, explicit: Path | None = None,
                 continue
             setattr(cfg, key, _parse_env(key, raw))
             cfg.sources[key] = f"env PEDACITO_{key.upper()}"
+
+    # Loud-but-not-fatal: budgets that cannot fit the declared context window
+    # are how truncation errors reach the user, so surface them at load time.
+    for warning in budget_warnings(cfg):
+        print(f"[config warning] {warning}", file=sys.stderr)
     return cfg
+
+
+def budget_warnings(cfg: Config) -> list[str]:
+    """Check every token/character budget against `context_tokens`. Returns
+    human-readable warnings; empty means the configuration fits. Never raises
+    -- a conservative guess about someone's server should not block a run."""
+    w: list[str] = []
+    usable = cfg.context_tokens - cfg.reserve_tokens
+    if usable <= 0:
+        w.append(f"reserve_tokens ({cfg.reserve_tokens}) leaves nothing of "
+                 f"context_tokens ({cfg.context_tokens}) for prompts; lower "
+                 f"reserve_tokens or raise context_tokens")
+        return w
+    if cfg.max_tokens_answer > cfg.context_tokens:
+        w.append(f"max_tokens_answer ({cfg.max_tokens_answer}) exceeds "
+                 f"context_tokens ({cfg.context_tokens}); the answer will be "
+                 f"cut off by the server no matter what pedacito asks for")
+    if cfg.max_tokens_step > usable:
+        w.append(f"max_tokens_step ({cfg.max_tokens_step}) exceeds the usable "
+                 f"window (context_tokens - reserve_tokens = {usable}); a "
+                 f"gather step can never finish before the window runs out")
+    # ~4 chars/token is a generous estimate for code-heavy content.
+    gathered_tok = cfg.max_gathered_chars // 4
+    map_tok = cfg.flat_map_token_budget
+    step_headroom = max(cfg.max_tokens_step, cfg.max_tokens_summary)
+    if map_tok + gathered_tok + step_headroom > usable:
+        w.append(f"flat_map_token_budget ({map_tok}) + gathered source "
+                 f"(~{gathered_tok} tok from max_gathered_chars="
+                 f"{cfg.max_gathered_chars}) + one step (~{step_headroom} tok) "
+                 f"overflows the usable window ({usable} tok). Lower "
+                 f"max_gathered_chars or flat_map_token_budget, or raise "
+                 f"context_tokens if your server really has more room.")
+    return w
 
 
 def _parse_env(name: str, raw: str):
@@ -482,6 +540,7 @@ PRESETS: dict[str, dict] = {
         # Tight enough that nothing overflows an 8k window at 25 tok/s.
         "max_tokens_summary": 160,
         "max_tokens_step": 500,
+        "repair_rounds": 1,
         "max_tokens_answer": 1500,
         "max_tokens_plan": 800,
         "max_tokens_build": 2000,
@@ -490,12 +549,16 @@ PRESETS: dict[str, dict] = {
         "max_read_lines": 120,
         "max_spec_chars": 20000,
         "max_new_files": 12,
+        "repair_rounds": 1,
+        "context_tokens": 8192,
+        "reserve_tokens": 2048,
     },
     "medium": {
         # The built-in defaults, spelled out so a profile can inherit them
         # explicitly and users see the ladder.
         "max_tokens_summary": 220,
         "max_tokens_step": 700,
+        "repair_rounds": 2,
         "max_tokens_answer": 3000,
         "max_tokens_plan": 1200,
         "max_tokens_build": 4000,
@@ -504,10 +567,14 @@ PRESETS: dict[str, dict] = {
         "max_read_lines": 200,
         "max_spec_chars": 60000,
         "max_new_files": 24,
+        "repair_rounds": 2,
+        "context_tokens": 32768,
+        "reserve_tokens": 4096,
     },
     "large": {
         "max_tokens_summary": 300,
         "max_tokens_step": 1000,
+        "repair_rounds": 2,
         "max_tokens_answer": 8000,
         "max_tokens_plan": 2500,
         "max_tokens_build": 8000,
@@ -516,12 +583,16 @@ PRESETS: dict[str, dict] = {
         "max_read_lines": 300,
         "max_spec_chars": 120000,
         "max_new_files": 40,
+        "repair_rounds": 2,
+        "context_tokens": 65536,
+        "reserve_tokens": 8192,
     },
     "hosted": {
         # API pricing tolerates generous windows; answers and build passes
         # get real headroom instead of truncation retries.
         "max_tokens_summary": 300,
         "max_tokens_step": 1200,
+        "repair_rounds": 3,
         "max_tokens_answer": 16000,
         "max_tokens_plan": 3000,
         "max_tokens_build": 12000,
@@ -530,6 +601,9 @@ PRESETS: dict[str, dict] = {
         "max_read_lines": 400,
         "max_spec_chars": 200000,
         "max_new_files": 60,
+        "repair_rounds": 3,
+        "context_tokens": 128000,
+        "reserve_tokens": 16384,
     },
 }
 
@@ -662,6 +736,14 @@ model    = "google/gemma-3-27b"
 # max_tokens_summary = 220     # budget for one summary sentence
 # max_tokens_step = 700        # budget for one tool call in the gather loop
 # max_tokens_answer = 3000     # budget for the final answer / edit reply
+#
+# Context window: what your server actually gives the model. Pedacito checks
+# every budget below against these two numbers at load time and prints a
+# warning if they cannot fit -- the usual root cause of "ran past the token
+# limit" errors. Set context_tokens to the context length configured in LM
+# Studio / Ollama / your API; profiles override both per model.
+# context_tokens = 16384       # server-side context length for this model
+# reserve_tokens = 2048        # tokens held back from the window for replies
 
 # Sampler parameters, merged verbatim into every /chat/completions request.
 # This is where top_k, min_p, repeat_penalty, seed, stop, and anything else
@@ -706,6 +788,7 @@ model    = "google/gemma-3-27b"
 # allow_write = false              # let the gather loop overwrite whole files
 #                                  # (skips backup/review; prefer edit blocks)
 # max_write_chars = 200000         # ceiling on one `write` call
+# repair_rounds = 2                # re-anchor attempts per failed edit block
 
 # --- Project scaffolding (`pedacito new`) -----------------------------------
 # [scaffold]
@@ -766,6 +849,7 @@ model    = "google/gemma-3-27b"
 # api_key  = "lm-studio"
 # max_tokens_summary = 160
 # max_tokens_step    = 500
+# repair_rounds      = 1
 # max_tokens_answer  = 1500
 # max_tokens_plan    = 800
 # max_tokens_build   = 2000
@@ -774,6 +858,8 @@ model    = "google/gemma-3-27b"
 # max_read_lines     = 120
 # max_spec_chars     = 20000
 # max_new_files      = 12
+# context_tokens     = 8192
+# reserve_tokens     = 2048
 # disable_thinking   = true
 # thinking_suffix    = "/no_think"
 #
@@ -790,6 +876,7 @@ model    = "google/gemma-3-27b"
 # model    = "google/gemma-3-27b"
 # max_tokens_summary = 220
 # max_tokens_step    = 700
+# repair_rounds      = 2
 # max_tokens_answer  = 3000
 # max_tokens_plan    = 1200
 # max_tokens_build   = 4000
@@ -798,6 +885,8 @@ model    = "google/gemma-3-27b"
 # max_read_lines     = 200
 # max_spec_chars     = 60000
 # max_new_files      = 24
+# context_tokens     = 32768
+# reserve_tokens     = 4096
 
 # Big local rig (35B+ with roomy context). The "large" preset.
 #
@@ -807,6 +896,7 @@ model    = "google/gemma-3-27b"
 # model    = "qwen3-32b"        # or a 70B on a multi-GPU rig
 # max_tokens_summary = 300
 # max_tokens_step    = 1000
+# repair_rounds      = 2
 # max_tokens_answer  = 8000
 # max_tokens_plan    = 2500
 # max_tokens_build   = 8000
@@ -815,6 +905,8 @@ model    = "google/gemma-3-27b"
 # max_read_lines     = 300
 # max_spec_chars     = 120000
 # max_new_files      = 40
+# context_tokens     = 65536
+# reserve_tokens     = 8192
 
 # Hosted DeepSeek. json_mode must be "object": hosted APIs reject the
 # json_schema Pedacito sends by default, and the gather loop fails on its
@@ -830,6 +922,7 @@ model    = "google/gemma-3-27b"
 # timeout   = 120.0
 # max_tokens_summary = 300
 # max_tokens_step    = 1200
+# repair_rounds      = 3
 # max_tokens_answer  = 16000
 # max_tokens_plan    = 3000
 # max_tokens_build   = 12000
@@ -838,6 +931,8 @@ model    = "google/gemma-3-27b"
 # max_read_lines     = 400
 # max_spec_chars     = 200000
 # max_new_files      = 60
+# context_tokens     = 128000
+# reserve_tokens     = 16384
 #
 # [profiles.deepseek.sampler]
 # top_p            = 0.95
