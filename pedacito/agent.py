@@ -154,6 +154,10 @@ class Agent:
         self.steps_log: list[str] = []
         did_read = False
         nudged = False
+        read_nudged = False
+        # Files the task text names but no `read` has covered yet; refreshed
+        # after every successful read so the `done` nudge can act on it.
+        self._unread_files: list[str] = self._compute_unread(task, gathered)
         budget = self.cfg.max_gathered_chars
 
         def nudge(step: int) -> str:
@@ -201,6 +205,32 @@ class Agent:
                         print("  (no source read yet; asking it to read before "
                               "answering)", file=sys.stderr)
                     continue
+                if (self._unread_files or self._unvisited_files(gathered)) \
+                        and not read_nudged and step < self.cfg.max_steps:
+                    # The model gathered on some files but wants to change
+                    # others it never `read`. Its answer rules forbid quoting
+                    # unread code, so it answers with zero blocks -- which
+                    # surfaces as "No review: the model answered without
+                    # proposing any edits" while the terminal looks healthy.
+                    # Hand it the exact ranges to fetch before it commits.
+                    read_nudged = True
+                    targets = list(self._unread_files)
+                    for f in self._unvisited_files(gathered):
+                        if f.lower() not in [t.split(" ")[0].lower() for t in targets]:
+                            targets.append(f)
+                    listing = "\n".join(f"- {f}" for f in targets[:6])
+                    messages.append({"role": "assistant", "content": _compact(stepjson)})
+                    messages.append({"role": "user", "content":
+                        "Your task will change these files, but you have not "
+                        "`read` them yet:\n" + listing + "\n"
+                        "Edits must quote a file's text exactly, so you cannot "
+                        "write them blind. `read` each one above (start at line "
+                        "1; the reply tells you how many lines it has), then "
+                        "say done."})
+                    if verbose:
+                        print("  (files the task needs were never read; asking "
+                              "it to read them before answering)", file=sys.stderr)
+                    continue
                 if not gathered and step < self.cfg.max_steps:
                     # A `done` whose every lookup failed to produce anything
                     # usable (bad line range, unresolvable file, ...) would end
@@ -228,6 +258,9 @@ class Agent:
             obs = dispatch(self.index, self.cfg, stepjson)
             if action == "read" and not obs.startswith("ERROR"):
                 did_read = True
+                # Re-check which task-named files are still unseen, so the
+                # `done` nudge below has current coverage data.
+                self._unread_files = self._compute_unread(task, gathered)
             # An ERROR observation is navigation feedback ("that range does
             # not exist"), not source. Carrying it into the answer prompt as
             # gathered text makes the SOURCE section look populated while it
@@ -267,6 +300,102 @@ class Agent:
 
         self.read_any = did_read
         return "\n\n".join(gathered)
+
+    # ------------------------------------------------------ coverage bookkeeping
+    def _task_file_targets(self, task: str) -> set[str]:
+        """Paths that look like files mentioned in the task text.
+
+        A bare word like `index` inside a sentence is not a path; only tokens
+        containing a slash or a dot-extension count, so this never nags about
+        prose. Matched against the index case-insensitively by the caller.
+        """
+        import re as _re
+        toks = _re.findall(r"[A-Za-z0-9_][A-Za-z0-9_./\-]*", task or "")
+        out = set()
+        for t in toks:
+            if "/" in t or _re.search(r"\.[A-Za-z][A-Za-z0-9]{0,7}$", t):
+                out.add(t.lower().lstrip("./"))
+        return out
+
+    def _compute_unread(self, task: str, gathered: list[str]) -> list[str]:
+        """Files the task names but no successful `read` covered.
+
+        Returns entries like "prep/sentences.js (not yet read -- it has ~120
+        lines, use start=1 end=120)" so the nudge can carry exact ranges.
+        Files already fully covered by a read are excluded; a partial read is
+        treated as coverage (the model saw real text and knows what remains).
+        """
+        wanted = self._task_file_targets(task)
+        if not wanted:
+            return []
+        matched: dict[str, str] = {}          # lower rel -> canonical rel
+        for rel in self.index.files:
+            r = rel.lower()
+            for w in wanted:
+                if r == w or r.endswith("/" + w) or w.endswith("/" + r) or w == r:
+                    matched[rel.lower()] = rel
+        if not matched:
+            return []
+        read_ranges: dict[str, list[tuple[int, int]]] = {}
+        for g in gathered:
+            head = g.split("\n", 1)[0]
+            if not head.startswith("--- read "):
+                continue
+            rest = head[len("--- read "):].strip()
+            parts = rest.rsplit(" L", 1)
+            f = parts[0].strip().lower()
+            if len(parts) > 1 and "-" in parts[1]:
+                try:
+                    a, b = parts[1].split("-", 1)
+                    rng = (int(a), int(b))
+                except ValueError:
+                    rng = (1, 10 ** 9)
+            else:
+                rng = (1, 10 ** 9)
+            read_ranges.setdefault(f, []).append(rng)
+        missing = []
+        for low, rel in sorted(matched.items()):
+            spans = read_ranges.get(low)
+            if spans:
+                continue
+            from . import fileio
+            try:
+                lines = fileio.read_lines(self.index.root / rel)
+                if lines and lines[-1] == "" and len(lines) > 1:
+                    lines = lines[:-1]   # same convention as tool_read
+                n = max(1, len(lines))
+            except OSError:
+                n = 0
+            hint = f"it has {n} lines, use start=1 end={n}" if n else \
+                   "it does not exist on disk yet"
+            missing.append(f"{rel} (not yet read -- {hint})")
+        return missing
+
+    def _unvisited_files(self, gathered: list[str]) -> list[str]:
+        """Files the model has only located (grep/outline/failure) but never
+        successfully `read`. A rename task that greps two game files and then
+        says done lands here -- the answer rules forbid quoting unread code,
+        so it proposes nothing."""
+        seen = set()
+        located = set()
+        for g in gathered:
+            head = g.split("\n", 1)[0]
+            if head.startswith("--- read "):
+                rest = head[len("--- read "):].strip()
+                seen.add(rest.rsplit(" L", 1)[0].strip().lower())
+            elif head.startswith("--- grep ") or head.startswith("--- outline "):
+                arg = head.split(" ", 2)[2].strip().lower() if len(head.split(" ", 2)) > 2 else ""
+                if arg:
+                    located.add(arg)
+            elif head.startswith("--- ") and " failed: " in head:
+                parts = head.split(" ")
+                if len(parts) >= 3:
+                    located.add(parts[2].lower())
+        out = []
+        for low in sorted(located - seen):
+            rel = self.index.resolve_file(low) or low
+            out.append(rel)
+        return out
 
     # ------------------------------------------------------------------ phase 2
     def answer(self, task: str, gathered: str, stream: bool = True,

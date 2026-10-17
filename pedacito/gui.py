@@ -379,8 +379,24 @@ def _run_task(task: str, apply_now: bool) -> None:
                 note = (f"No review: the model's edits did not match the "
                         f"files ({len(fails)} block(s) failed). {detail}")
             else:
-                note = ("No review: the model answered without proposing "
-                        "any edits.")
+                # Say *why* it proposed nothing. A gather that never read a
+                # file the task names is the usual cause -- without this the
+                # user sees a blank review and no way to tell whether the
+                # agent lacked ability or lacked evidence.
+                unread = list(getattr(agent, "_unread_files", []) or [])
+                for f in getattr(agent, "_unvisited_files", lambda g: [])(
+                        gathered.split("\n\n") if gathered else []):
+                    if f.lower() not in [u.split(" ")[0].lower() for u in unread]:
+                        unread.append(f)
+                if unread:
+                    note = ("No review: the model answered without proposing any "
+                            "edits -- it never `read` the files it would need to "
+                            "change: " + ", ".join(unread[:5]) +
+                            ". Raise max_steps so gathering has room to cover "
+                            "them.")
+                else:
+                    note = ("No review: the model answered without proposing "
+                            "any edits.")
     else:
         applied = any(r.ok for r in results)
         if applied:
