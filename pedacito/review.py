@@ -78,6 +78,13 @@ class FileDiff:
     sha: str            # file contents when the preview was built
     after_text: str     # what gets written on sign-off
     message: str
+    # For a creation detected as a rename: the old path(s) whose real bytes
+    # were moved into this file. Sign-off uses this structured data to
+    # complete the move; parsing them back out of `message` (the old
+    # behaviour) broke whenever wording or punctuation varied by locale or
+    # model, silently leaving the source file in place next to its renamed
+    # copy.
+    renames_from: tuple[str, ...] = ()
 
 
 # --------------------------------------------------------------------------
@@ -193,7 +200,8 @@ def diffs_from_results(results, root=None) -> list[FileDiff]:
         if not r.ok or not r.sha:
             continue
         rows, added, removed = build_rows(r.before, r.after)
-        out.append(FileDiff(r.file, rows, added, removed, r.sha, r.after, r.message))
+        out.append(FileDiff(r.file, rows, added, removed, r.sha, r.after,
+                            r.message, renames_from=tuple(getattr(r, "renames_from", ()))))
         srcs = getattr(r, "renames_from", ())
         if srcs and root is not None:
             # The creation group above carries the "renamed from" note; here
@@ -814,39 +822,62 @@ def write_files(root: Path, diffs: list[FileDiff], backup_dir: Path | None):
         fileio.write(p, fd.after_text, style)
         written.append(fd.rel)
 
-    # Rename sources: the creation diff's note says "renamed from X". At
-    # preview time X still held its content (the clearing block was folded
-    # into the move), so its recorded sha is X's pre-rename digest. If X is
-    # still on disk with exactly those bytes, complete the move by removing
-    # it; if anything else changed it meanwhile, leave it alone and say so.
-    import re as _re
+    # Rename sources: prefer the structured FileDiff.renames_from recorded at
+    # preview time. The old path parsed "renamed from X" out of the message
+    # string, which broke whenever wording varied -- and a missed removal
+    # leaves the original sitting next to its renamed copy while the review
+    # claims success. At preview time X still held its content (the clearing
+    # block was folded into the move), so its recorded sha is X's pre-rename
+    # digest. If X is still on disk with exactly those bytes, complete the
+    # move by removing it; if anything else changed it meanwhile, leave it
+    # alone and say so.
     removed = []
     rename_notes = []
+
+    def _remove_rename_source(old: str, expect_sha: str) -> None:
+        op = root / old
+        if not op.is_file():
+            return
+        try:
+            cur = hashlib.sha256(Path(op).read_bytes()).hexdigest()
+        except OSError:
+            return
+        if expect_sha and cur != expect_sha:
+            rename_notes.append(f"{old} changed since preview; left in place")
+            return
+        if backup_dir is not None:
+            dest = backup_dir / old
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                otext, ostyle = fileio.read(op, errors="replace")
+                fileio.write(dest, otext, ostyle)
+            except OSError:
+                pass
+        try:
+            op.unlink()
+            removed.append(old)
+        except OSError:
+            rename_notes.append(f"{old} could not be removed")
+
+    import re as _re
     for fd in diffs:
+        srcs = tuple(getattr(fd, "renames_from", ()) or ())
+        if srcs:
+            for old in srcs:
+                # The matching deletion row (when the page rendered one) pins
+                # the source's pre-rename bytes; fall back to no sha check
+                # only when it is absent.
+                pin = next((d.sha for d in diffs
+                            if d.rel == old and "renamed to" in (d.message or "")), "")
+                _remove_rename_source(old.strip(), pin)
+            continue
+        # Legacy fallback: older staged pages carry no renames_from field, so
+        # they still get parsed from the message text.
         m = _re.search(r"renamed from ([^()]+?)(?: \(|$)", fd.message or "")
         if "renamed from" not in (fd.message or "") or not m:
             continue
         for old in (s.strip() for s in m.group(1).split(",")):
-            op = root / old
-            if not op.is_file():
-                continue
-            try:
-                cur = hashlib.sha256(Path(op).read_bytes()).hexdigest()
-            except OSError:
-                continue
-            if backup_dir is not None:
-                dest = backup_dir / old
-                dest.parent.mkdir(parents=True, exist_ok=True)
-                try:
-                    otext, ostyle = fileio.read(op, errors="replace")
-                    fileio.write(dest, otext, ostyle)
-                except OSError:
-                    pass
-            try:
-                op.unlink()
-                removed.append(old)
-            except OSError:
-                rename_notes.append(f"{old} could not be removed")
+            _remove_rename_source(old, "")
 
     msg = f"{len(written)} file(s) written: " + ", ".join(written)
     if removed:

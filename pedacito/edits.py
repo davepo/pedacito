@@ -220,9 +220,18 @@ class Span:
     fuzzy: bool = False
 
 
-def locate(haystack: str, needle: str, cfg=None) -> "Span | None":
+def locate(haystack: str, needle: str, cfg=None,
+           replacement: str | None = None) -> "Span | None":
     """Locate one search block in a file's text and return a Span, or None if
     it cannot be applied.
+
+    `replacement` is the text to splice in -- normally the block's REPLACE
+    body. It defaults to the needle itself ONLY as a safe no-op for callers
+    that just want to find a span; apply_edits must pass the real replacement,
+    because writing the matched text back over itself silently reports
+    "applied 1 block(s)" while changing nothing on disk (this was the worst
+    instance of the GUI's "nothing to review" bug: every plain edit parsed,
+    matched, validated, and rewrote the file byte-for-byte unchanged).
 
     Tries, in order: an exact unique match; a whitespace-tolerant unique match
     (trailing whitespace and blank lines ignored), used only when
@@ -232,20 +241,26 @@ def locate(haystack: str, needle: str, cfg=None) -> "Span | None":
     An ambiguous exact match is always a failure: editing the wrong occurrence
     silently is worse than asking the model for more context.
     """
+    repl = needle if replacement is None else replacement
     span = _locate(haystack, needle)
     if span is not None:
-        return Span(*span, needle)
+        return Span(*span, repl)
     fuzzy_on = bool(cfg is not None and getattr(cfg, "fuzzy_match", True))
     if not fuzzy_on:
         return None
     min_ratio = float(getattr(cfg, "fuzzy_min_ratio", 0.85))
     max_len = int(getattr(cfg, "max_read_lines", 200)) * 200
-    return _locate_fuzzy(haystack, needle, min_ratio, max_len)
+    return _locate_fuzzy(haystack, needle, min_ratio, max_len, repl)
 
 
 def _locate_fuzzy(haystack: str, needle: str, min_ratio: float,
-                  max_needle: int) -> Span | None:
+                  max_needle: int, replacement: str | None = None) -> Span | None:
     """Best-effort anchor for a search block that does not match exactly.
+
+    `replacement` is what the caller wants spliced in at the located span
+    (see `locate`); it defaults to the needle, which makes the splice a
+    no-op -- correct for pure "find the span" callers like rename
+    classification, never for apply_edits, which passes the real REPLACE.
 
     Compares the needle against every window of haystack with the same number
     of lines, using difflib.SequenceMatcher (no external dependency). A match
@@ -281,7 +296,8 @@ def _locate_fuzzy(haystack: str, needle: str, min_ratio: float,
     start = sum(len(x) + 1 for x in hlines[:best_i])
     seg = hlines[best_i:best_i + len(nlines)]
     stop = start + sum(len(x) for x in seg) + (len(seg) - 1)
-    return Span(start, stop, needle, fuzzy=True)
+    repl = needle if replacement is None else replacement
+    return Span(start, stop, repl, fuzzy=True)
 
 
 def _locate(haystack: str, needle: str) -> tuple[int, int] | None:
@@ -393,6 +409,28 @@ def apply_edits(root: Path, edits: list[Edit], backup: bool = True,
         path = root_resolved / rel
         if path.is_file():
             original, _style = fileio.read(path, errors="replace")
+
+            def _reaches_eof(search: str, span) -> bool:
+                """True when the matched span extends to end-of-file.
+
+                `locate()` deliberately excludes a trailing newline from its
+                span (exact-match semantics: needles carry no final "\\n"), so
+                a whole-file clear block whose REPLACE is empty would leave
+                exactly one "\\n" in `original[span.stop:]` -- and a strict
+                `.strip()` check used to reject it whenever the file ended
+                WITH a newline while accepting it when it didn't. Rename
+                pairing then silently dropped, which surfaced as the GUI's
+                "nothing to review" on tasks as simple as renaming a file.
+                Tolerate that one optional terminator instead of requiring
+                byte-exact EOF.
+                """
+                tail = original[span.stop:]
+                if not tail.strip():
+                    return True
+                if tail in ("\n", "\r\n") and search.strip():
+                    return True
+                return False
+
             for e in g:
                 if e.replace.strip():
                     continue
@@ -400,7 +438,7 @@ def apply_edits(root: Path, edits: list[Edit], backup: bool = True,
                     can_clear = True         # explicit wipe of an existing file
                     continue
                 span = locate(original, e.search, cfg)
-                if span is not None and not original[span.stop:].strip():
+                if span is not None and _reaches_eof(e.search, span):
                     can_clear = True         # search reaches end-of-file
         return can_create, can_clear
 
@@ -669,6 +707,13 @@ def apply_edits(root: Path, edits: list[Edit], backup: bool = True,
                     "whose REPLACE is empty -- Pedacito will move the real "
                     "contents and remove the old file." + hint))
                 continue
+            # One block per created file: a model that re-emits the same
+            # header for several create blocks was writing successive parts
+            # of ONE file, so concatenate their bodies in reply order (the
+            # same rule merge_duplicate_files applies everywhere else).
+            # Joining with "\n" never invents a blank line: parse_edits drops
+            # exactly one trailing newline from every body, so a complete
+            # block's terminator survives as the join character.
             text = "\n".join(e.replace for e in creators)
             if text and not text.endswith("\n"):
                 text += "\n"
@@ -698,7 +743,7 @@ def apply_edits(root: Path, edits: list[Edit], backup: bool = True,
         any_fuzzy = False
         fuzzy_blocks: list[int] = []
         for k, e in enumerate(group, 1):
-            span = locate(text, e.search, cfg)
+            span = locate(text, e.search, cfg, replacement=e.replace)
             if span is None:
                 n = text.count(e.search)
                 why = ("search block not found -- it must match the file exactly"
