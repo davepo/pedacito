@@ -334,7 +334,7 @@ def _run_task(task: str, apply_now: bool) -> None:
     applied = False
 
     if reviewing:
-        new_diffs = review_mod.diffs_from_results(results)
+        new_diffs = review_mod.diffs_from_results(results, root)
         if new_diffs:
             new_nonce = review_mod.new_nonce()
             new_page = review_mod.build_page(

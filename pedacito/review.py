@@ -180,16 +180,34 @@ def build_rows(before: str, after: str) -> tuple[list[Row], int, int]:
     return rows, added, removed
 
 
-def diffs_from_results(results) -> list[FileDiff]:
+def diffs_from_results(results, root=None) -> list[FileDiff]:
     """Convert a list of edits.Result (from apply_edits(dry_run=True)) into
     FileDiff objects ready for rendering. Only successful results with
-    computed before/after text produce a diff."""
+    computed before/after text produce a diff.
+
+    `root` is the project directory; it is only consulted for rename results,
+    where the old file's real contents are shown as a deletion so the move is
+    visible on the review page instead of hidden inside the new file's note."""
     out: list[FileDiff] = []
     for r in results:
         if not r.ok or not r.sha:
             continue
         rows, added, removed = build_rows(r.before, r.after)
         out.append(FileDiff(r.file, rows, added, removed, r.sha, r.after, r.message))
+        srcs = getattr(r, "renames_from", ())
+        if srcs and root is not None:
+            # The creation group above carries the "renamed from" note; here
+            # we render each source path's true contents being removed, using
+            # the bytes on disk (dry-run never wrote them).
+            for old in srcs:
+                try:
+                    otext, _ = fileio.read(Path(root) / old, errors="replace")
+                except OSError:
+                    continue
+                orows, oa, om = build_rows(otext, "")
+                out.append(FileDiff(old, orows, oa, om,
+                                    hashlib.sha256(otext.encode("utf-8")).hexdigest(),
+                                    "", "removed (renamed to " + r.file + ")"))
     return out
 
 
@@ -713,11 +731,18 @@ def write_files(root: Path, diffs: list[FileDiff], backup_dir: Path | None):
     else created it while the review page sat open, and overwriting it
     silently would destroy those contents. Backs up originals to `backup_dir`
     first when given. Returns (ok, message)."""
-    def _digest(p: Path) -> str:
-        return hashlib.sha256(fileio.read_text(p, errors="replace")
-                              .encode("utf-8")).hexdigest()
-
     EMPTY_SHA = hashlib.sha256(b"").hexdigest()
+
+    def _digest(p: Path) -> str:
+        # read_bytes straight off the Path (not fileio.read_text): that keeps
+        # this check honest under concurrent deletes -- a vanished file raises
+        # FileNotFoundError here rather than being swallowed by an errors=
+        # "replace" text read -- and it hashes the exact bytes on disk.
+        try:
+            return hashlib.sha256(Path(p).read_bytes()).hexdigest()
+        except FileNotFoundError:
+            return EMPTY_SHA
+
     if not diffs:
         # An empty diff list means every block failed to anchor; applying
         # "successfully" here would silently write nothing.
@@ -751,18 +776,84 @@ def write_files(root: Path, diffs: list[FileDiff], backup_dir: Path | None):
                            "else while this review was open. Re-run the task "
                            "to rebuild the review.")
 
+    # Snapshot which paths exist *before* writing anything. Pass two below
+    # re-checks existence at write time: a vanished path that pass one saw
+    # (a concurrent delete, or an earlier rename-stub in this very batch)
+    # must fail cleanly here instead of crashing the review server with a
+    # FileNotFoundError from fileio.read().
+    default_style = fileio.TextStyle()
+    existed_at_check = {fd.rel: (root / fd.rel).exists() for fd in diffs}
     written = []
     for fd in diffs:
         p = root / fd.rel
-        exists_before = p.exists()
-        original, style = fileio.read(p, errors="replace")
-        if backup_dir is not None and exists_before:
+        try:
+            if p.exists():
+                original, style = fileio.read(p, errors="replace")
+            elif existed_at_check[fd.rel]:
+                raise FileNotFoundError
+            else:
+                # New-file creation: nothing on disk to read or back up.
+                original, style = "", default_style
+        except FileNotFoundError:
+            # The file vanished between the snapshot and this read (a
+            # concurrent delete, or a rename-stub earlier in this batch).
+            # Fail cleanly with an honest partial-apply message instead of
+            # crashing the review server mid-request.
+            return False, (f"Partially written: {fd.rel} vanished between "
+                           "preview check and write; files already written "
+                           "in this batch: " + (", ".join(written) or "none") +
+                           ". Re-run the task to rebuild the review.")
+        if backup_dir is not None and original:
             dest = backup_dir / fd.rel
             dest.parent.mkdir(parents=True, exist_ok=True)
             fileio.write(dest, original, style)
+        # Creation diffs can target a path whose parent directory does not
+        # exist yet (e.g. renaming into game1/index.html); without this the
+        # write would die with FileNotFoundError mid-batch.
+        p.parent.mkdir(parents=True, exist_ok=True)
         fileio.write(p, fd.after_text, style)
         written.append(fd.rel)
-    return True, f"{len(written)} file(s) written: " + ", ".join(written)
+
+    # Rename sources: the creation diff's note says "renamed from X". At
+    # preview time X still held its content (the clearing block was folded
+    # into the move), so its recorded sha is X's pre-rename digest. If X is
+    # still on disk with exactly those bytes, complete the move by removing
+    # it; if anything else changed it meanwhile, leave it alone and say so.
+    import re as _re
+    removed = []
+    rename_notes = []
+    for fd in diffs:
+        m = _re.search(r"renamed from ([^()]+?)(?: \(|$)", fd.message or "")
+        if "renamed from" not in (fd.message or "") or not m:
+            continue
+        for old in (s.strip() for s in m.group(1).split(",")):
+            op = root / old
+            if not op.is_file():
+                continue
+            try:
+                cur = hashlib.sha256(Path(op).read_bytes()).hexdigest()
+            except OSError:
+                continue
+            if backup_dir is not None:
+                dest = backup_dir / old
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                try:
+                    otext, ostyle = fileio.read(op, errors="replace")
+                    fileio.write(dest, otext, ostyle)
+                except OSError:
+                    pass
+            try:
+                op.unlink()
+                removed.append(old)
+            except OSError:
+                rename_notes.append(f"{old} could not be removed")
+
+    msg = f"{len(written)} file(s) written: " + ", ".join(written)
+    if removed:
+        msg += "; renamed away: " + ", ".join(removed)
+    if rename_notes:
+        msg += "; NOTE: " + ", ".join(rename_notes)
+    return True, msg
 
 
 def save(root: Path, page: str, stamp: str) -> Path:
