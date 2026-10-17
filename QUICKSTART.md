@@ -116,6 +116,17 @@ base_url = "http://localhost:1234/v1"   # or :11434/v1 for Ollama
 model = "qwen3.5-9b"            # exact id/name the server reports
 ```
 
+The generated file also contains four ready-made profile skeletons —
+`small9b`, `local27`, `local35`, and `deepseek` — each with its **complete
+set of token limits spelled out** (answer/step/summary/plan/build budgets,
+gather ceiling, map budget). A 9B local model and a DeepSeek API call can't
+share one budget: the small tier keeps answers under 1500 tokens so nothing
+overflows an 8k context window, while the hosted tier allows 16000-token
+answers and 100k-char gathers. Uncomment whichever matches your hardware,
+fix the model name, and switch with `--profile NAME`. Add
+`tier = "small"|"medium"|"large"|"hosted"` to any profile to inherit those
+limits as a preset instead of spelling them out — keys you write still win.
+
 Then:
 
 ```bash
@@ -310,6 +321,28 @@ terminal; the GUI doesn't cover those yet.
 
 ---
 
+## Starting a project from scratch
+
+Everything above edits an existing codebase. `pedacito new` builds one from
+a description — a one-liner with `-t`, or a bigger spec document with
+`--spec` (a `.md`/`.txt` file, stdin, or both):
+
+```bash
+pedacito new ~/code/my-app -t "a CLI todo manager with a sqlite backend"          # dry run: plan + preview only
+pedacito new ~/code/my-app -t "..." --apply                                       # write it all
+pedacito new ~/code/my-api --spec docs/spec.md --review                           # sign off in the browser first
+pedacito new ~/code/my-app -t "..." --plan-only --apply                           # skeleton only; finish with ordinary ask runs
+```
+
+Three stages: the model plans a file tree (JSON, capped at
+`max_new_files`), the skeleton is written (each file just a header comment
+stating its purpose), then one build pass per file fills in the
+implementation with the neighbouring files visible. Dry run by default,
+backed up like any `--apply` (`pedacito restore` undoes a whole run), and
+the target directory must not exist or be empty unless you pass `--force`.
+
+---
+
 ## Working continuously
 
 ```bash
@@ -346,16 +379,34 @@ editing `model =` by hand each time:
 ```toml
 [profiles.small]
 model = "qwen2.5-coder:7b"        # example Ollama name
+tier = "small"                     # tight token limits: 1500-token answers,
+                                   # 12k-char gathers — fits an 8k context window
 
 [profiles.big]
 model = "devstral-small-2-24b-instruct-2512"   # example LM Studio id
-max_steps = 8
+tier = "large"                     # roomy budgets for a big local model
+max_steps = 8                      # your keys always override the tier preset
+
+[profiles.api]
+base_url = "https://api.deepseek.com/v1"
+model = "deepseek-chat"
+json_mode = "object"               # hosted APIs reject json_schema
+# no tier line needed: ".../api.deepseek.com" + "deepseek-chat" infer "hosted"
+# -> 16000-token answers, 100k-char gathers, 12000-token map budget
 
 [profiles.reasoning]
 model = "qwen3:32b"
 disable_thinking = true          # skip the <think> block: faster, cheaper
 thinking_suffix = "/no_think"    # a second, more universal way to ask; harmless to set both
 ```
+
+Every profile carries its own **token limits** — summaries, tool steps,
+final answers, scaffold plan/build passes, gather ceiling, map budget.
+`tier = "small"|"medium"|"large"|"hosted"` sets all of them at once from a
+preset matched to the model class (or pedacito infers the tier from the
+model/server name); individual keys written in the profile win over the
+preset. That's what lets one config serve a 9B on laptop hardware and a
+DeepSeek API call without hand-tuning seven knobs per model.
 
 ```bash
 pedacito ask anki -t "..." --profile big
@@ -448,6 +499,8 @@ costs a re-index. Or pass `--reindex` to `ask`/`chat`.
 | `pedacito ask PROJ -t "..." --review` | Same, with a side-by-side sign-off page. |
 | `pedacito ask PROJ -t "..." --apply` | Same, writes immediately. |
 | `pedacito chat PROJ` | Interactive; index stays warm between tasks. |
+| `pedacito new DIR -t "..."` | Start a project from scratch: plan, scaffold, build. |
+| `pedacito new DIR --spec FILE` | Same, from a larger spec document. |
 | `pedacito restore PROJ` | Undo the last write. |
 | `pedacito gui` | Browser control panel: pick a project, check the model, ask, review inline. |
 

@@ -29,6 +29,7 @@ in a config file is a miserable thing to debug.
 from __future__ import annotations
 
 import os
+import re
 import tomllib
 import difflib
 from dataclasses import dataclass, fields, field
@@ -154,6 +155,24 @@ class Config:
     # usable reasoning window is well under its advertised context.
     max_gathered_chars: int = 24000
     max_read_lines: int = 200
+    # Let the gather loop create/overwrite whole files via the `write` tool.
+    # Off by default: a mid-gather write skips the edit path's backup, syntax
+    # check and review page, so prefer search/replace blocks unless a model
+    # genuinely cannot emit them.
+    allow_write: bool = False
+    # Ceiling on one `write` call's contents, in characters.
+    max_write_chars: int = 200_000
+
+    # --- Project scaffolding (`pedacito new`) ---------------------------------
+    # Cap on how many files a plan may propose; longer plans are truncated and
+    # the excess reported. Small models love to enumerate 40 tiny stubs.
+    max_new_files: int = 24
+    # Spec documents longer than this are truncated, with a loud warning.
+    max_spec_chars: int = 60_000
+    # Token budgets for the two scaffold calls that do not reuse an existing
+    # answer budget.
+    max_tokens_plan: int = 1200
+    max_tokens_build: int = 4000
 
     # --- Reasoning models -----------------------------------------------------
     # Qwen3 and friends emit a <think> block by default. Pedacito strips it either
@@ -194,6 +213,7 @@ class Config:
     sources: dict = None
     profiles: dict = None
     active_profile: str = ""
+    active_tier: str = ""   # preset tier applied to the active profile, if any
 
     def __post_init__(self):
         """Initialise the mutable bookkeeping dicts (dataclasses cannot use
@@ -211,7 +231,7 @@ class Config:
 # talks to any server exposing an OpenAI-compatible /v1 surface (LM Studio,
 # Ollama, and others), so "server" describes it without implying one product.
 _SECTIONS = ("server", "lmstudio", "generation", "map", "indexing", "files",
-             "agent", "editing", "reasoning", "review", "workspace")
+             "agent", "scaffold", "editing", "reasoning", "review", "workspace")
 PROFILE_SECTION = "profiles"
 
 _FIELDS = {f.name: f for f in fields(Config)
@@ -242,7 +262,8 @@ def _flatten(data: dict, path: Path) -> tuple[dict, dict]:
     for name, body in (data.pop(PROFILE_SECTION, None) or {}).items():
         if not isinstance(body, dict):
             raise ConfigError(f"{path}: [profiles.{name}] must be a table")
-        bad = [k for k in body if k not in _FIELDS]
+        # `tier` is a preset selector consumed by _apply_preset, not a setting.
+        bad = [k for k in body if k not in _FIELDS and k != "tier"]
         if bad:
             raise ConfigError(f"{path}: [profiles.{name}] unknown setting(s): "
                               f"{', '.join(bad)}")
@@ -380,10 +401,12 @@ def load(root: Path | None = None, explicit: Path | None = None,
                 f"Defined profiles: {known}\n"
                 "Add one to your config:\n\n"
                 f"  [profiles.{profile}]\n  model = \"...\"")
-        for key, value in profiles[profile].items():
+        body, tier = _apply_preset(profile, profiles[profile], origin)
+        for key, value in body.items():
             setattr(cfg, key, _coerce(key, value))
             cfg.sources[key] = f"profile '{profile}' (via {origin})"
         cfg.active_profile = profile
+        cfg.active_tier = tier
 
     # Env vars still work, mostly for scripting and one-off overrides.
     # default_profile is deliberately excluded: profile selection has
@@ -439,6 +462,125 @@ def _parse_env(name: str, raw: str):
 
 
 # --------------------------------------------------------------------------
+# Profile presets -- token limits per class of model/server
+# --------------------------------------------------------------------------
+# A 9B running locally on 8k context and deepseek-chat over an API are the
+# same code path with wildly different budgets. Rather than make every user
+# hand-tune six or seven token knobs, profiles that name a recognised tier
+# start from the preset below; keys written in [profiles.NAME] override it.
+# Presets never touch the top-level defaults: no-profile runs keep the
+# conservative built-in values.
+#
+#   small   ~9B local models (qwen3-8b, gemma-3-12b, llama-3.1-8b)
+#   medium  ~14B/32B local models (qwen3-14b, qwen3-32b, gemma-3-27b)
+#   large   big local models (27B+ at full context, 70B rigs)
+#   hosted  capable APIs: DeepSeek, OpenAI, Anthropic, xAI, ...
+PRESET_TIERS = ("small", "medium", "large", "hosted")
+
+PRESETS: dict[str, dict] = {
+    "small": {
+        # Tight enough that nothing overflows an 8k window at 25 tok/s.
+        "max_tokens_summary": 160,
+        "max_tokens_step": 500,
+        "max_tokens_answer": 1500,
+        "max_tokens_plan": 800,
+        "max_tokens_build": 2000,
+        "flat_map_token_budget": 1500,
+        "max_gathered_chars": 12000,
+        "max_read_lines": 120,
+        "max_spec_chars": 20000,
+        "max_new_files": 12,
+    },
+    "medium": {
+        # The built-in defaults, spelled out so a profile can inherit them
+        # explicitly and users see the ladder.
+        "max_tokens_summary": 220,
+        "max_tokens_step": 700,
+        "max_tokens_answer": 3000,
+        "max_tokens_plan": 1200,
+        "max_tokens_build": 4000,
+        "flat_map_token_budget": 4000,
+        "max_gathered_chars": 24000,
+        "max_read_lines": 200,
+        "max_spec_chars": 60000,
+        "max_new_files": 24,
+    },
+    "large": {
+        "max_tokens_summary": 300,
+        "max_tokens_step": 1000,
+        "max_tokens_answer": 8000,
+        "max_tokens_plan": 2500,
+        "max_tokens_build": 8000,
+        "flat_map_token_budget": 8000,
+        "max_gathered_chars": 60000,
+        "max_read_lines": 300,
+        "max_spec_chars": 120000,
+        "max_new_files": 40,
+    },
+    "hosted": {
+        # API pricing tolerates generous windows; answers and build passes
+        # get real headroom instead of truncation retries.
+        "max_tokens_summary": 300,
+        "max_tokens_step": 1200,
+        "max_tokens_answer": 16000,
+        "max_tokens_plan": 3000,
+        "max_tokens_build": 12000,
+        "flat_map_token_budget": 12000,
+        "max_gathered_chars": 100000,
+        "max_read_lines": 400,
+        "max_spec_chars": 200000,
+        "max_new_files": 60,
+    },
+}
+
+
+def _guess_tier(name: str, body: dict) -> str | None:
+    """Infer which PRESETS tier a profile is for, from its model/base_url."""
+    hay = " ".join([name.lower(),
+                    str(body.get("model", "")).lower(),
+                    str(body.get("base_url", "")).lower()])
+    if any(h in hay for h in ("deepseek", "openai", "anthropic", "api.",
+                              "moonshot", "x.ai", "groq", "together",
+                              "mistral.ai", "hosted")):
+        return "hosted"
+    m = re.search(r"(?<![\d.])(\d{1,3})\s*b(?![\d.])", hay)
+    if m:
+        size = int(m.group(1))
+        if size <= 10:
+            return "small"
+        if size <= 20:
+            return "medium"
+        return "large"
+    return None
+
+
+def _apply_preset(name: str, body: dict, origin: str) -> tuple[dict, str]:
+    """Return (settings, tier) for a profile, with its tier preset underneath.
+
+    Tier source, first match wins:
+      1. explicit `tier = "small|medium|large|hosted"` in the profile
+         (the key is consumed here and never reaches Config);
+      2. a heuristic on the profile/model/server name;
+      3. none ("") -- the profile only carries what you wrote.
+    Keys written in the profile always beat the preset.
+    """
+    body = dict(body)
+    tier = body.pop("tier", None)
+    if tier is not None:
+        if tier not in PRESETS:
+            raise ConfigError(
+                f"profile '{name}' ({origin}): tier must be one of "
+                f"{', '.join(PRESET_TIERS)}, got {tier!r}")
+    else:
+        tier = _guess_tier(name, body) or ""
+    if not tier:
+        return body, ""
+    merged = dict(PRESETS[tier])
+    merged.update(body)
+    return merged, tier
+
+
+# --------------------------------------------------------------------------
 # `pedacito config --init` starter file
 # --------------------------------------------------------------------------
 TEMPLATE = '''\
@@ -454,9 +596,29 @@ TEMPLATE = '''\
 #
 # Precedence, lowest to highest:
 #   defaults -> this file -> <project>/.pedacito.toml -> --config FILE ->
-#   --profile NAME -> command-line flags
+#   --profile NAME (tier preset underneath, your keys on top) -> CLI flags
 #
 # Run `pedacito config` to see every resolved value and which layer set it.
+#
+# TOKEN LIMITS ARE PROFILE-SCOPED ON PURPOSE. A 9B running locally on an 8k
+# context window and deepseek-chat over an API are the same code path with
+# wildly different budgets, so you do not hand-tune seven token knobs per
+# model -- each profile below carries its own complete set, generated from a
+# tier preset:
+#
+#   tier = "small"    ~9B local models (qwen3-8b, llama-3.1-8b)
+#   tier = "medium"   ~14B/27B local models (gemma-3-27b, qwen3-14b)
+#   tier = "large"    big local rigs (35B+, 70B)
+#   tier = "hosted"   capable APIs (DeepSeek, OpenAI, Anthropic, ...)
+#
+# The tier line in each profile below is commented out because the limits
+# spelled out under it ARE that tier's preset values, written out so you can
+# edit any of them individually. Keys you write always win over the preset;
+# uncommenting `tier =` just re-syncs the ones you left alone. Without a
+# tier key, pedacito also infers one from the model name ("...9b" -> small,
+# "...27b" -> large, deepseek/openai URLs -> hosted); `tier = ""` disables
+# inference entirely. Running with no profile keeps the conservative built-in
+# defaults shown in the reference sections below.
 
 # ===========================================================================
 # QUICK START -- one local server, one hosted server, switch with --profile
@@ -541,6 +703,16 @@ model    = "google/gemma-3-27b"
 # max_steps = 6                    # lookups before the model must answer
 # max_gathered_chars = 24000       # ceiling on accumulated source per task
 # max_read_lines = 200             # cap on one `read` call's line count
+# allow_write = false              # let the gather loop overwrite whole files
+#                                  # (skips backup/review; prefer edit blocks)
+# max_write_chars = 200000         # ceiling on one `write` call
+
+# --- Project scaffolding (`pedacito new`) -----------------------------------
+# [scaffold]
+# max_new_files = 24               # cap on how many files a plan may propose
+# max_spec_chars = 60000           # spec documents longer than this are cut
+# max_tokens_plan = 1200           # budget for the planning call
+# max_tokens_build = 4000          # budget for each per-file build pass
 
 # --- Reasoning models -------------------------------------------------------
 # Qwen3 and friends emit a <think> block by default. Pedacito strips it
@@ -571,38 +743,101 @@ model    = "google/gemma-3-27b"
 # create_ignore_file = true        # create a starter .pedacitoignore
 
 # ===========================================================================
-# PROFILES -- one per server, or one per model
+# PROFILES -- one per server, or one per model, each with its own token limits
 # ===========================================================================
 #
 # A profile overrides any setting in this file, not just model. Select with
 # --profile NAME, /profile inside chat, PEDACITO_PROFILE in the shell, or
-# default_profile below.
+# default_profile below. The token budgets below are generated from the four
+# tier presets (see the top of this file); edit any line to deviate from
+# your tier, or uncomment `tier =` to inherit the preset instead of spelling
+# it out.
 #
-# default_profile = "local"
+# default_profile = "local27"
 
-# Local LM Studio. json_mode stays "schema" (the default): llama.cpp and
-# LM Studio enforce it, so a tool call always parses.
+# Small local model (~9B): everything stays inside an 8k context window at
+# ~25 tok/s. json_mode "schema" (the default) is grammar-enforced by
+# llama.cpp / LM Studio, so a tool call always parses.
 #
-# [profiles.local]
+# [profiles.small9b]
+# # tier = "small"
 # base_url = "http://localhost:1234/v1"
-# model    = "qwen3.5-9b"
+# model    = "qwen3-8b"
 # api_key  = "lm-studio"
+# max_tokens_summary = 160
+# max_tokens_step    = 500
+# max_tokens_answer  = 1500
+# max_tokens_plan    = 800
+# max_tokens_build   = 2000
+# flat_map_token_budget = 1500
+# max_gathered_chars = 12000
+# max_read_lines     = 120
+# max_spec_chars     = 20000
+# max_new_files      = 12
+# disable_thinking   = true
+# thinking_suffix    = "/no_think"
 #
-# [profiles.local.sampler]
+# [profiles.small9b.sampler]
 # top_p          = 0.95
 # top_k          = 40
 # repeat_penalty = 1.1
 
+# Mid local model (~14B/27B). The spelled-out values are the "medium" preset.
+#
+# [profiles.local27]
+# # tier = "medium"
+# base_url = "http://localhost:1234/v1"
+# model    = "google/gemma-3-27b"
+# max_tokens_summary = 220
+# max_tokens_step    = 700
+# max_tokens_answer  = 3000
+# max_tokens_plan    = 1200
+# max_tokens_build   = 4000
+# flat_map_token_budget = 4000
+# max_gathered_chars = 24000
+# max_read_lines     = 200
+# max_spec_chars     = 60000
+# max_new_files      = 24
+
+# Big local rig (35B+ with roomy context). The "large" preset.
+#
+# [profiles.local35]
+# # tier = "large"
+# base_url = "http://localhost:1234/v1"
+# model    = "qwen3-32b"        # or a 70B on a multi-GPU rig
+# max_tokens_summary = 300
+# max_tokens_step    = 1000
+# max_tokens_answer  = 8000
+# max_tokens_plan    = 2500
+# max_tokens_build   = 8000
+# flat_map_token_budget = 8000
+# max_gathered_chars = 60000
+# max_read_lines     = 300
+# max_spec_chars     = 120000
+# max_new_files      = 40
+
 # Hosted DeepSeek. json_mode must be "object": hosted APIs reject the
 # json_schema Pedacito sends by default, and the gather loop fails on its
-# first step without this.
+# first step without this. An API affords far higher limits than a small
+# local model -- these are the "hosted" preset values.
 #
 # [profiles.deepseek]
+# # tier = "hosted"
 # base_url  = "https://api.deepseek.com/v1"
 # model     = "deepseek-chat"
 # api_key   = "sk-..."
 # json_mode = "object"
 # timeout   = 120.0
+# max_tokens_summary = 300
+# max_tokens_step    = 1200
+# max_tokens_answer  = 16000
+# max_tokens_plan    = 3000
+# max_tokens_build   = 12000
+# flat_map_token_budget = 12000
+# max_gathered_chars = 100000
+# max_read_lines     = 400
+# max_spec_chars     = 200000
+# max_new_files      = 60
 #
 # [profiles.deepseek.sampler]
 # top_p            = 0.95
@@ -610,13 +845,16 @@ model    = "google/gemma-3-27b"
 # Note: no top_k or min_p here. DeepSeek 400s on those.
 
 # Reasoning model. Thinking off is faster and cheaper at ~25 tok/s, and the
-# two ways to ask cover models that honour only one of them.
+# two ways to ask cover models that honour only one of them. The "large"
+# tier preset underneath gives thinking output room; max_tokens_answer is
+# then raised further because reasoning burns budget on the <think> block.
 #
 # [profiles.qwen-thinking]
+# tier = "large"
 # model = "qwen/qwen3-32b"
 # disable_thinking = true
 # thinking_suffix = "/no_think"
-# max_tokens_answer = 6000     # thinking needs headroom
+# max_tokens_answer = 10000    # thinking needs headroom beyond the preset
 '''
 
 

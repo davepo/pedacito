@@ -27,6 +27,10 @@ Expected format in a model's reply:
     =======
     replacement lines
     >>>>>>> REPLACE
+
+An empty SEARCH section against a file that does not exist yet creates the
+file with the REPLACE content -- the agent's "write a new file" move, so it
+can add modules without a separate action vocabulary.
 """
 
 from __future__ import annotations
@@ -45,7 +49,7 @@ BLOCK_RE = re.compile(
     r"---\s*FILE:\s*(?P<file>[^\n]+?)\s*\n"
     r"[^\n]*<{5,}\s*SEARCH[^\n]*\n"
     r"(?P<search>.*?)"
-    r"\n={5,}[^\n]*\n"
+    r"={5,}[^\n]*\n"
     r"(?P<replace>.*?)"
     r"\n>{5,}\s*REPLACE",
     re.DOTALL,
@@ -78,19 +82,76 @@ class Result:
     before: str = ""
     after: str = ""
     sha: str = ""
+    # True when at least one block in this file anchored approximately rather
+    # than matching exactly. Reviewers use it to flag the risky ones.
+    fuzzy: bool = False
 
 
 # --------------------------------------------------------------------------
 # Parsing
 # --------------------------------------------------------------------------
+# A bare ``` line at column zero toggles fenced-code state while scanning a
+# reply; anything inside a fence is content and must never be rewritten.
+_FENCE_RE = re.compile(r"^\s{0,3}```.*$")
+
+
+def _strip_wrapping_fences(text: str) -> str:
+    """Blank out only the markdown fences that *wrap* the edit blocks -- an
+    opening ``` before the first `--- FILE:` header and a closing ``` after
+    the last `>>>>>>> REPLACE`.
+
+    The naive version of this (delete every line that looks like a fence)
+    corrupted real edits: replacement code that opens or closes a docstring
+    containing a fenced example lands exactly such a line inside the REPLACE
+    section, and deleting it silently wrote broken code to disk. Fences
+    between two `--- FILE:` headers are therefore left untouched; a model
+    that fences each block individually is handled by the outermost pair,
+    which also blanks any stray inter-block fences sitting outside every
+    search/replace block."""
+    lines = text.split("\n")
+    first = text.find("--- FILE:")
+    if first == -1:
+        return text
+    # Opening fence: the last bare ``` line before the first header. The scan
+    # stops as soon as it reaches the line that actually holds the header --
+    # comparing whole-line lengths to a character offset was wrong and could
+    # stop early on a short preamble, leaving the real opening fence in place.
+    open_idx = -1
+    fenced = False
+    consumed = 0
+    for i, ln in enumerate(lines):
+        if _FENCE_RE.match(ln):
+            open_idx = -1 if fenced else i
+            fenced = not fenced
+        if consumed <= first < consumed + len(ln) + 1:
+            break                        # this line contains the header
+        consumed += len(ln) + 1          # +1 for the newline we split on
+    # Closing fence: the first bare ``` line after the final REPLACE marker.
+    close_idx = -1
+    if "REPLACE" in text:
+        tail_from = max(i for i in range(len(lines)) if "REPLACE" in lines[i])
+        for j in range(tail_from + 1, len(lines)):
+            if _FENCE_RE.match(lines[j]):
+                close_idx = j
+                break
+    for k in (open_idx, close_idx):
+        if k != -1:
+            lines[k] = ""
+    return "\n".join(lines)
+
+
 def parse_edits(text: str) -> list[Edit]:
     """Extract every search/replace block from a model's reply text.
 
-    Normalises the model's own line endings first, then strips markdown
-    fences so a model that wraps its blocks in ``` still parses.
+    Normalises the model's own line endings first, then strips the markdown
+    fences wrapping the blocks so a model that answers inside a ``` still
+    parses -- without touching fence lines that belong to the code itself.
     """
     text = text.replace("\r\n", "\n").replace("\r", "\n")
-    cleaned = re.sub(r"^\s*```[a-zA-Z]*\s*$", "", text, flags=re.MULTILINE)
+    cleaned = _strip_wrapping_fences(text)
+    # A fence line blanked by the stripper can leave the header glued to the
+    # line above it; make sure every header starts its own line.
+    cleaned = re.sub(r"(?<!\n)(---\s*FILE:)", r"\n\1", cleaned)
     return [
         Edit(fileio.normalise_rel(m.group("file")), m.group("search"), m.group("replace"))
         for m in BLOCK_RE.finditer(cleaned)
@@ -100,6 +161,81 @@ def parse_edits(text: str) -> list[Edit]:
 # --------------------------------------------------------------------------
 # Matching
 # --------------------------------------------------------------------------
+@dataclass
+class Span:
+    """One located search block: the half-open [start, stop) character span in
+    the file text, what to write in its place, and how it matched."""
+
+    start: int
+    stop: int
+    replacement: str
+    fuzzy: bool = False
+
+
+def locate(haystack: str, needle: str, cfg=None) -> "Span | None":
+    """Locate one search block in a file's text and return a Span, or None if
+    it cannot be applied.
+
+    Tries, in order: an exact unique match; a whitespace-tolerant unique match
+    (trailing whitespace and blank lines ignored), used only when
+    `cfg.fuzzy_match` allows it; and finally a similarity match against every
+    same-length window in the file, accepted only when the best window is both
+    close enough (`cfg.fuzzy_min_ratio`) and clearly better than the runner-up.
+    An ambiguous exact match is always a failure: editing the wrong occurrence
+    silently is worse than asking the model for more context.
+    """
+    span = _locate(haystack, needle)
+    if span is not None:
+        return Span(*span, needle)
+    fuzzy_on = bool(cfg is not None and getattr(cfg, "fuzzy_match", True))
+    if not fuzzy_on:
+        return None
+    min_ratio = float(getattr(cfg, "fuzzy_min_ratio", 0.85))
+    max_len = int(getattr(cfg, "max_read_lines", 200)) * 200
+    return _locate_fuzzy(haystack, needle, min_ratio, max_len)
+
+
+def _locate_fuzzy(haystack: str, needle: str, min_ratio: float,
+                  max_needle: int) -> Span | None:
+    """Best-effort anchor for a search block that does not match exactly.
+
+    Compares the needle against every window of haystack with the same number
+    of lines, using difflib.SequenceMatcher (no external dependency). A match
+    is accepted only if the best window clears `min_ratio` and beats the second
+    best by a clear margin, so a genuinely near-miss anchors while an ambiguous
+    one still fails loudly. Refuses to run on very large needles: the scan is
+    O(lines x length) and a runaway whole-file block should fail, not stall."""
+    if not needle.strip() or "\x00" in haystack or len(needle) > max_needle:
+        return None
+    hlines = haystack.split("\n")
+    nlines = needle.split("\n")
+    if len(nlines) > len(hlines):
+        return None
+    target = "\n".join(nlines)
+    sm = difflib.SequenceMatcher(None, nlines, [""])
+    best_ratio, second_ratio, best_i = 0.0, 0.0, -1
+    for i in range(len(hlines) - len(nlines) + 1):
+        window = "\n".join(hlines[i:i + len(nlines)])
+        if window == target:
+            continue                     # an exact match would have been found
+        sm.a = nlines
+        sm.b = hlines[i:i + len(nlines)]
+        r = sm.ratio()
+        if r > best_ratio:
+            second_ratio = best_ratio
+            best_ratio, best_i = r, i
+        elif r > second_ratio:
+            second_ratio = r
+    if best_i < 0 or best_ratio < min_ratio:
+        return None
+    if second_ratio >= best_ratio - 0.03:
+        return None                      # two plausible anchors: too risky
+    start = sum(len(x) + 1 for x in hlines[:best_i])
+    seg = hlines[best_i:best_i + len(nlines)]
+    stop = start + sum(len(x) for x in seg) + (len(seg) - 1)
+    return Span(start, stop, needle, fuzzy=True)
+
+
 def _locate(haystack: str, needle: str) -> tuple[int, int] | None:
     """Find the unique span of `needle` inside `haystack`: exact match first,
     then a whitespace-tolerant retry (ignoring trailing whitespace per line).
@@ -142,13 +278,20 @@ def _locate(haystack: str, needle: str) -> tuple[int, int] | None:
 # Public API
 # --------------------------------------------------------------------------
 def apply_edits(root: Path, edits: list[Edit], backup: bool = True,
-                dry_run: bool = False, backup_dir: Path | None = None) -> list[Result]:
+                dry_run: bool = False, backup_dir: Path | None = None,
+                cfg=None) -> list[Result]:
     """Apply a list of Edits, grouped by file.
 
     For each file: locate and apply every search/replace block, validate the
-    result parses as Python (if a .py file), and either write it (with a
-    backup of the original) or, in dry-run mode, just compute the diff and
-    before/after text without touching disk.
+    result still parses (Python via ast, tree-sitter languages via
+    chunker_ts), and either write it (with a backup of the original) or, in
+    dry-run mode, just compute the diff and before/after text without
+    touching disk. A block with an empty SEARCH against a file that does not
+    exist creates that file instead of failing.
+
+    Pass `cfg` (a Config) to enable approximate anchoring (`fuzzy_match`) and
+    to control the repair loop's token budgets; without it, matching stays
+    exact-only and defaults are used elsewhere.
 
     Backups go into a timestamped snapshot directory under .pedacito/backups/
     rather than dropping .bak files beside the source, so a whole editing
@@ -160,15 +303,79 @@ def apply_edits(root: Path, edits: list[Edit], backup: bool = True,
     for e in edits:
         by_file.setdefault(e.file, []).append(e)
 
+    root_resolved = Path(root).resolve()
+
+    def _validate(path: Path, text: str) -> str | None:
+        """Return an error message if `text` does not parse as source of
+        `path`'s language, else None. A new file that fails to parse is not
+        created at all; an edit that breaks an existing file leaves it
+        untouched."""
+        if path.suffix == ".py":
+            try:
+                ast.parse(text)
+            except SyntaxError as e:
+                return f"a syntax error at line {e.lineno}: {e.msg}"
+        elif path.suffix.lower() in LANG_BY_EXT and TS_AVAILABLE:
+            bad, lineno = has_syntax_error(text, LANG_BY_EXT[path.suffix.lower()])
+            if bad:
+                return f"a syntax error near line {lineno}"
+        return None
+
+    def _finish(rel: str, path: Path, original: str | None, text: str, style,
+                note: str, fuzzy: bool = False) -> Result:
+        """Validate, diff, back up, and write one finished file's content."""
+        err = _validate(path, text)
+        if err:
+            verb = "creation aborted" if original is None else "not written"
+            return Result(False, rel, f"edit produced {err}; {verb}",
+                          fuzzy=fuzzy)
+
+        diff = "".join(difflib.unified_diff(
+            (original or "").splitlines(keepends=True), text.splitlines(keepends=True),
+            fromfile=f"a/{rel}", tofile=f"b/{rel}",
+        ))
+        sha = hashlib.sha256((original or "").encode("utf-8")).hexdigest()
+        if dry_run:
+            return Result(True, rel, note + " (dry run)", diff, original or "",
+                          text, sha, fuzzy=fuzzy)
+
+        if backup and original is not None:
+            if backup_dir is not None:
+                dest = backup_dir / rel
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                fileio.write(dest, original, style)
+            else:
+                fileio.write(path.with_suffix(path.suffix + ".bak"), original, style)
+        fileio.write(path, text, style)
+        return Result(True, rel, note, diff, original or "", text, sha,
+                      fuzzy=fuzzy)
+
     for rel, group in by_file.items():
-        path = (root / rel).resolve()
-        if not path.exists():
-            results.append(Result(False, rel, "file not found"))
-            continue
+        path = (Path(root) / rel).resolve()
         try:
-            path.relative_to(root.resolve())
+            path.relative_to(root_resolved)
         except ValueError:
             results.append(Result(False, rel, "refusing to edit outside project root"))
+            continue
+
+        exists = path.exists()
+        if not exists:
+            # New-file creation: only an empty-SEARCH block can do it, and a
+            # single one per file -- several blocks would have no anchor to
+            # build on. Everything else keeps the old clean error so the
+            # repair loop can feed it back to the model. Fuzzy matching does
+            # not apply: with no existing content there is nothing to be
+            # similar to.
+            first = group[0]
+            if len(group) != 1 or first.search.strip():
+                results.append(Result(False, rel, "file not found"))
+                continue
+            text = first.replace
+            if text and not text.endswith("\n"):
+                text += "\n"
+            path.parent.mkdir(parents=True, exist_ok=True)
+            results.append(_finish(rel, path, None, text, None,
+                                   f"created with {len(text.splitlines())} line(s)"))
             continue
 
         # LF-normalised for matching; style remembered so the file is written
@@ -176,8 +383,10 @@ def apply_edits(root: Path, edits: list[Edit], backup: bool = True,
         original, style = fileio.read(path, errors="strict")
         text = original
         failed = False
+        any_fuzzy = False
+        fuzzy_blocks: list[int] = []
         for k, e in enumerate(group, 1):
-            span = _locate(text, e.search)
+            span = locate(text, e.search, cfg)
             if span is None:
                 n = text.count(e.search)
                 why = ("search block not found -- it must match the file exactly"
@@ -186,45 +395,22 @@ def apply_edits(root: Path, edits: list[Edit], backup: bool = True,
                 results.append(Result(False, rel, f"block {k}: {why}"))
                 failed = True
                 break
-            text = text[: span[0]] + e.replace + text[span[1] :]
+            start, stop, replacement, fuzzy = span.start, span.stop, span.replacement, span.fuzzy
+            text = text[:start] + replacement + text[stop:]
+            if fuzzy:
+                any_fuzzy = True
+                fuzzy_blocks.append(k)
 
         if failed:
             continue
 
-        if path.suffix == ".py":
-            try:
-                ast.parse(text)
-            except SyntaxError as e:
-                results.append(Result(False, rel,
-                                      f"edit produced a syntax error at line {e.lineno}: {e.msg}; not written"))
-                continue
-        elif path.suffix.lower() in LANG_BY_EXT and TS_AVAILABLE:
-            bad, lineno = has_syntax_error(text, LANG_BY_EXT[path.suffix.lower()])
-            if bad:
-                results.append(Result(False, rel,
-                                      f"edit produced a syntax error near line {lineno}; not written"))
-                continue
-
-        diff = "".join(difflib.unified_diff(
-            original.splitlines(keepends=True), text.splitlines(keepends=True),
-            fromfile=f"a/{rel}", tofile=f"b/{rel}",
-        ))
-
-        sha = hashlib.sha256(original.encode("utf-8")).hexdigest()
-        if dry_run:
-            results.append(Result(True, rel, f"{len(group)} block(s) would apply",
-                                  diff, original, text, sha))
-            continue
-
-        if backup:
-            if backup_dir is not None:
-                dest = backup_dir / rel
-                dest.parent.mkdir(parents=True, exist_ok=True)
-                fileio.write(dest, original, style)
-            else:
-                fileio.write(path.with_suffix(path.suffix + ".bak"), original, style)
-        fileio.write(path, text, style)
-        results.append(Result(True, rel, f"applied {len(group)} block(s)",
-                              diff, original, text, sha))
+        note = f"applied {len(group)} block(s)"
+        if any_fuzzy:
+            note += (" [matched approximately on block"
+                     + ("s " if len(fuzzy_blocks) > 1 else " ")
+                     + ", ".join(str(b) for b in fuzzy_blocks)
+                     + "; review the diff carefully]")
+        results.append(_finish(rel, path, original, text, style, note,
+                               fuzzy=any_fuzzy))
 
     return results

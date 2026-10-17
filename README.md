@@ -18,7 +18,9 @@ in this document is specific to one server or one OS unless it says so.
 Chunking is AST-based for Python and tree-sitter-based for JavaScript,
 TypeScript, and Ruby — parser output, not line-based guessing, for most of
 the index — and edits come back as search/replace blocks rather than whole
-files.
+files. It can also start a project from scratch: hand it a one-line prompt
+or a spec document and it plans the file tree, scaffolds it, then fills in
+each file (`pedacito new`).
 
 ### What this is (and isn't)
 
@@ -279,6 +281,31 @@ pedacito config --profile big        # confirm exactly what it resolves to
 A profile can override any setting, not just the model — useful when a
 larger or slower model needs more lookups per task than a smaller one.
 
+**Token limits ride with the profile.** A 9B on an 8k local window and
+deepseek-chat over an API are the same code path with wildly different
+budgets, so each profile carries its own complete set of limits. Add
+`tier = "small" | "medium" | "large" | "hosted"` and pedacito fills in all
+ten budget knobs (`max_tokens_summary/step/answer/plan/build`,
+`flat_map_token_budget`, `max_gathered_chars`, `max_read_lines`,
+`max_spec_chars`, `max_new_files`) from a preset; any limit you write
+explicitly wins over the preset:
+
+```toml
+[profiles.ds]
+tier = "hosted"                  # answer budget 16000, gathered 100k chars, ...
+base_url = "https://api.deepseek.com/v1"
+model = "deepseek-chat"
+json_mode = "object"
+max_tokens_answer = 20000        # your key beats the preset
+```
+
+Even without a `tier` line, pedacito infers one from the model/server name
+(`...8b` → small, `...14b` → medium, `...27b/32b+` → large, deepseek/openai
+APIs → hosted); `tier = ""` turns inference off and keeps the built-in
+defaults. Running with no profile at all always uses the conservative
+defaults. `pedacito config` shows which tier is active and marks every
+limit that came from a profile.
+
 Model names are server-specific: LM Studio wants the id from `/v1/models`
 (shown by `pedacito config --check`); Ollama wants the name from `ollama
 list`. Copy it exactly — a mismatched name is the most common setup
@@ -532,6 +559,46 @@ silent corruption. Every edit is validated before anything is written —
 rejected, nothing written. A failed block's error is fed back to the model
 (up to two rounds) so it can re-anchor with more context.
 
+## Starting a project from scratch
+
+`ask` and `chat` edit an existing codebase. `pedacito new` builds one: give
+it a one-line description with `-t`, a larger spec document with `--spec`
+(a Markdown/text file, or piped in via stdin — the two can be combined),
+and it runs three stages against the same index machinery the rest of the
+tool uses:
+
+1. **Plan** — one model call turns the spec into a file tree: every file
+   with its path and purpose, as structured JSON (not prose). Plans longer
+   than `max_new_files` are truncated with the excess reported; small
+   models love to enumerate 40 tiny stubs.
+2. **Skeleton** — the plan is applied for real: directories created, each
+   source file written with only a header comment stating its purpose.
+   The skeleton gets its own in-memory index, so the next stage can see
+   the whole project without any of it being huge.
+3. **Build** — one pass per file fills in its implementation, given the
+   spec, the plan, and the current contents of its neighbouring files.
+
+```bash
+pedacito new my-app -t "a CLI todo manager with a sqlite backend" --apply
+pedacito new my-api --spec docs/spec.md --review      # sign off in the browser
+pedacito new my-app -t "..." --plan-only --apply      # stop after the skeleton
+```
+
+Like everything else, it's a dry run by default: without `--apply` you get
+the plan and a preview of the skeleton, nothing on disk. `--plan-only`
+stops after stages 1–2 so you can adjust the plan yourself and finish the
+job with ordinary `ask --apply` runs. The target directory must not exist
+or be empty; `--force` allows scaffolding over a non-empty one. Build
+passes write complete files directly (there's nothing to anchor a
+search/replace block against yet) but still land inside a normal backup
+snapshot — `pedacito restore <project>` undoes a whole `new` run exactly
+like any other apply.
+
+Spec documents longer than `max_spec_chars` are truncated with a loud
+warning rather than silently dropped. A finished run leaves a session
+record under `.pedacito/sessions/` like any task, so you can see what was
+asked, planned, and written days later.
+
 ## Review page
 
 `--review` opens a side-by-side page instead of writing directly: current
@@ -679,6 +746,15 @@ Set any of these under the matching section in your config, or as
 `[profiles.NAME]` overrides. `pedacito config` lists every field with its
 current value and where it came from.
 
+**Token limits are profile-scoped.** Every budget knob below can be set per
+profile, and a profile's `tier = "small"|"medium"|"large"|"hosted"` line
+fills all ten limit fields (`max_tokens_summary/step/answer/plan/build`,
+`flat_map_token_budget`, `max_gathered_chars`, `max_read_lines`,
+`max_spec_chars`, `max_new_files`) from a preset tuned to that class of
+model — tight for a 9B on 8k local context, generous for DeepSeek-class
+APIs. Keys you write explicitly override the preset; with no tier and no
+profile you get the defaults in this table. See "Running multiple models".
+
 | Setting | Default | |
 |---|---|---|
 | `base_url` | `http://localhost:1234/v1` | Server address. |
@@ -692,6 +768,12 @@ current value and where it came from.
 | `max_tokens_answer` | 3000 | Budget for the final answer/edit reply. |
 | `max_steps` | 6 | Lookups allowed before the model must answer. |
 | `max_gathered_chars` | 24000 | Ceiling on accumulated source per task. |
+| `allow_write` | False | Let the gather loop write whole files via the `write` action (skips the edit path's backup/syntax-check/review — prefer search/replace blocks). |
+| `max_write_chars` | 200000 | Ceiling on one `write` call's contents. |
+| `max_new_files` | 24 | Cap on how many files a `pedacito new` plan may propose; excess is truncated and reported. |
+| `max_spec_chars` | 60000 | Spec documents longer than this are cut, with a warning. |
+| `max_tokens_plan` | 1200 | Token budget for the planning call. |
+| `max_tokens_build` | 4000 | Token budget for each per-file build pass. |
 | `flat_map_token_budget` | 4000 | Above this, the map switches from a full listing to per-file cards. |
 | `summarise_methods` | False | On if your methods lack useful docstrings. |
 | `summarise_documented` | False | On if your existing docstrings are stale or wrong. |

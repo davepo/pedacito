@@ -193,6 +193,39 @@ def diffs_from_results(results) -> list[FileDiff]:
     return out
 
 
+def diffs_from_backup(root: Path, backup_dir: Path) -> list[FileDiff]:
+    """Reconstruct review diffs after files have already been written, by
+    pairing each file in a backup snapshot with its current content on disk.
+
+    Used by `pedacito new --review`: the build passes write directly (they
+    have no dry-run mode of their own), so the sign-off page is built from
+    the pre-build snapshots rather than from apply_edits results. The sha
+    pins the post-write bytes, so Discard can restore the originals safely.
+    Files that vanished from the working tree since the snapshot are skipped.
+    """
+    import hashlib
+    out: list[FileDiff] = []
+    root = Path(root).resolve()
+    if backup_dir is None or not Path(backup_dir).is_dir():
+        return out
+    for src in sorted(Path(backup_dir).rglob("*")):
+        if not src.is_file():
+            continue
+        rel = src.relative_to(backup_dir).as_posix()
+        cur = root / rel
+        if not cur.is_file():
+            continue
+        before, _ = fileio.read(src, errors="replace")
+        after, _ = fileio.read(cur, errors="replace")
+        if before == after:
+            continue
+        rows, added, removed = build_rows(before, after)
+        sha = hashlib.sha256(after.encode("utf-8")).hexdigest()
+        out.append(FileDiff(rel, rows, added, removed, sha, after,
+                            f"built ({added}+ / {removed}-)"))
+    return out
+
+
 # --------------------------------------------------------------------------
 # HTML rendering
 # --------------------------------------------------------------------------
@@ -639,6 +672,12 @@ class _Handler(BaseHTTPRequestHandler):
 
         if path == "/cancel":
             self.server.outcome = ("cancelled", "No files were changed.")
+            on_discard = getattr(self.server, "on_discard", None)
+            if on_discard is not None:
+                try:
+                    on_discard()
+                except Exception as e:          # never hang the review loop
+                    self.server.outcome = ("cancelled", f"Discard failed: {e}")
             self._send(200, b'{"ok":true}', "application/json")
             self.server.done.set()
             return
@@ -705,16 +744,20 @@ def save(root: Path, page: str, stamp: str) -> Path:
 
 
 def run(page: str, nonce: str, writer, port: int = 0, open_browser: bool = True,
-        timeout: float = 1800.0, on_url=None):
+        timeout: float = 1800.0, on_url=None, on_discard=None):
     """Start a local review server bound to 127.0.0.1, optionally open it in
     a browser, and block until the person clicks Apply/Discard or `timeout`
     seconds pass. `writer` is called on Apply to actually write files (e.g.
-    `write_files`). Returns (outcome, detail) where outcome is one of
-    "applied", "cancelled", or "timeout"."""
+    `write_files`). `on_discard`, if given, is called when the reviewer is
+    cancelled -- used by flows whose files are already on disk (see
+    scaffold's `new --review`) to undo the build from the snapshot. Returns
+    (outcome, detail) where outcome is one of "applied", "cancelled", or
+    "timeout"."""
     srv = ThreadingHTTPServer(("127.0.0.1", port), _Handler)
     srv.page = page
     srv.nonce = nonce
     srv.writer = writer
+    srv.on_discard = on_discard
     srv.done = threading.Event()
     srv.outcome = ("timeout", "Review window timed out; nothing was written.")
     url = f"http://127.0.0.1:{srv.server_address[1]}/"

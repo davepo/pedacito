@@ -143,65 +143,117 @@ def extract_content(message: dict) -> str:
 # Truncated-JSON repair
 # --------------------------------------------------------------------------
 def repair_truncated_json(text: str) -> str | None:
-    """Close a JSON object that was cut off mid-flight, dropping any
-    partially-written string value (which could be a truncated file path or
-    similar, unsafe to guess at) and any dangling key with no value.
+    """Salvage the complete top-level keys of a JSON object that was cut off
+    mid-generation.
+
+    Everything from the first incomplete token onward -- an unterminated
+    string, a bare key, a dangling colon or comma, even a number typed only
+    halfway -- is dropped, and the surviving pairs are closed into an object.
+    Nothing partial is ever completed or guessed at: `"search_lib"` could grow
+    into any of several file names, and acting on the fragment would silently
+    do the wrong thing, so the whole key goes instead.
 
     Returns the repaired JSON text, or None if `text` was not actually
     truncated or nothing salvageable survived.
 
     This is why the step schema (see tools.py) puts `action` and its
     arguments before `reasoning`: a reply truncated inside the trailing
-    explanation still has everything the agent needs, so closing the quote
-    and the brace recovers a usable step instead of costing another round
-    trip.
+    explanation still has everything the agent needs, so recovering the
+    prefix yields a usable step instead of costing another round trip.
     """
     start = text.find("{")
     if start == -1:
         return None
     buf = text[start:]
-    depth = 0
-    in_str = False
-    esc = False
-    str_start = -1
-    for i, ch in enumerate(buf):
-        if esc:
-            esc = False
-            continue
-        if ch == "\\" and in_str:
-            esc = True
-            continue
-        if ch == '"':
-            if in_str:
-                in_str = False
-            else:
-                in_str = True
-                str_start = i
-            continue
-        if in_str:
-            continue
-        if ch in "{[":
-            depth += 1
-        elif ch in "}]":
-            depth -= 1
-    if depth <= 0 and not in_str:
-        return None            # not actually truncated
+    n = len(buf)
 
-    if in_str:
-        # The value was cut mid-string, so it is a fragment: "search_lib" could
-        # be any of several files. Keeping it would silently act on the wrong
-        # one, so drop the whole key rather than guess.
-        buf = buf[:str_start]
-    # Remove a dangling key, with or without its colon:
-    #   {"action":"read","file":     ->  {"action":"read"
-    #   {"action":"done","reasoning" ->  {"action":"done"
-    buf = re.sub(r'[,{]\s*"[^"]*"\s*:?\s*$',
-                 lambda m: "{" if m.group(0)[0] == "{" else "", buf)
-    buf = re.sub(r',\s*$', "", buf)
-    buf = re.sub(r'\{\s*$', "{", buf)
-    if buf.rstrip().endswith("{"):
-        return None            # nothing survived worth trusting
-    return buf + "}" * max(depth, 0)
+    def _complete_value_end(i: int) -> int | None:
+        """If a value begins at index i and is fully present, return the
+        index just after it; None if it is missing or cut off."""
+        while i < n and buf[i] in " \t\r\n":
+            i += 1
+        if i >= n:
+            return None
+        ch = buf[i]
+        if ch == '"':
+            j = i + 1
+            while j < n:
+                if buf[j] == "\\":
+                    j += 2
+                    continue
+                if buf[j] == '"':
+                    return j + 1
+                j += 1
+            return None                      # string never closed
+        if ch in "{[":
+            depth, k, instr, esc = 0, i, False, False
+            while k < n:
+                c = buf[k]
+                if esc:
+                    esc = False
+                elif instr:
+                    if c == "\\":
+                        esc = True
+                    elif c == '"':
+                        instr = False
+                elif c == '"':
+                    instr = True
+                elif c in "{[":
+                    depth += 1
+                elif c in "}]":
+                    depth -= 1
+                    if depth == 0:
+                        return k + 1         # nested structure survived whole
+                    if depth < 0:
+                        return None
+                k += 1
+            return None                      # container left open
+        m = re.match(r"-?(?:0|[1-9]\d*)(?:\.\d+)?(?:[eE][+-]?\d+)?", buf[i:])
+        if m:
+            tok = m.group(0)
+            j = i + len(tok)
+            # A digit followed straight by '.', 'e', or an exponent sign was
+            # cut mid-token ("1.5" truncated to "1", "1e3" to "1"). A trailing
+            # '.' or '-' can never legally follow a complete number.
+            if j < n and (buf[j] == "." or (tok[-1].isdigit() and buf[j] in "eE+-")):
+                return None
+            # At the very end of the buffer a bare integer could still be
+            # unfinished; anything terminated by a delimiter is fine.
+            if j == n and tok[-1].isdigit():
+                return None
+            return j
+        if buf.startswith(("true", "false", "null"), i):
+            return i + 4
+        return None
+
+    # Walk the object's members, keeping only key:value pairs that arrived
+    # complete. Stops at the first fragment, at the object's own close, or at
+    # the end of the buffer.
+    kept: list[str] = []
+    i = 1                                      # past the opening brace
+    while True:
+        while i < n and buf[i] in " \t\r\n,":
+            i += 1
+        if i >= n or buf[i] == "}":
+            break
+        if buf[i] != '"':
+            break                              # malformed; salvage what we have
+        kend = _complete_value_end(i)
+        if kend is None:
+            break                              # dangling key
+        j = kend
+        while j < n and buf[j] in " \t\r\n":
+            j += 1
+        if j >= n or buf[j] != ":":
+            break                              # key with no colon yet
+        vend = _complete_value_end(j + 1)
+        if vend is None:
+            break                              # value missing or cut off
+        kept.append(buf[i:vend])
+        i = vend
+    if not kept:
+        return None
+    return "{" + ",".join(kept) + "}"
 
 
 # --------------------------------------------------------------------------
