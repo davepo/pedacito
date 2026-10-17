@@ -129,6 +129,15 @@ class State:
         self.busy_what = ""
         self.error = ""
 
+        # Live progress + end-of-task report for the currently running
+        # worker. `_run_task` appends to steps as the agent gathers, and
+        # sets note/applied when it finishes; `_spawn` resets all of them
+        # before every new job. The page polls /state and renders these so
+        # a task can never end "blank" without saying why.
+        self.steps: list[str] = []
+        self.note = ""
+        self.applied = False
+
         self.model_checked = False
         self.model_status = ""
 
@@ -172,6 +181,9 @@ class State:
                 "busy": self.busy,
                 "busy_what": self.busy_what,
                 "error": self.error,
+                "steps": list(self.steps),
+                "note": self.note,
+                "applied": self.applied,
                 "model_checked": self.model_checked,
                 "model_status": self.model_status,
                 "has_review": bool(self.review_diffs),
@@ -194,6 +206,7 @@ def _spawn(fn, what: str) -> bool:
         if STATE.busy:
             return False
         STATE.busy, STATE.busy_what, STATE.error = True, what, ""
+        STATE.steps, STATE.note, STATE.applied = [], "", False
 
     def worker():
         try:
@@ -322,7 +335,16 @@ def _run_task(task: str, apply_now: bool) -> None:
     reviewing = not apply_now
     backup_dir = workspace.new_backup_dir(root, when) if cfg.backup else None
 
-    gathered = agent.gather(task, verbose=True)
+    def _note(text: str) -> None:
+        """Publish a line of live progress to the page's poller. The agent's
+        own verbose output still goes to the terminal; this mirrors just the
+        step count so the browser knows the task is alive."""
+        with STATE.lock:
+            STATE.steps.append(text)
+
+    gathered = agent.gather(task, verbose=True,
+                            on_step=lambda n: _note(f"step {n}"))
+    _note("composing answer")
     reply = agent.answer(task, gathered, stream=False)
     results, reply = agent.apply(
         reply, dry_run=reviewing, task=task, gathered=gathered,
@@ -332,6 +354,7 @@ def _run_task(task: str, apply_now: bool) -> None:
     new_page = ""
     new_nonce = ""
     applied = False
+    note = ""
 
     if reviewing:
         new_diffs = review_mod.diffs_from_results(results, root)
@@ -341,12 +364,32 @@ def _run_task(task: str, apply_now: bool) -> None:
                 new_diffs, task, cfg.model, cfg.active_profile,
                 new_nonce, interactive=True, stamp=when)
             review_mod.save(root, new_page, when)
+        elif any(r.ok for r in results):
+            # Edits parsed and matched, but none actually changed a file
+            # (every replacement equalled the original). Not an error --
+            # but it must be visible, or the review pane looks broken.
+            note = ("The model proposed edits, but they leave every file "
+                    "unchanged, so there is nothing to review.")
+        else:
+            fails = [r for r in results if not r.ok]
+            if fails:
+                detail = "; ".join(
+                    f"{getattr(r, 'file', '?')}: {getattr(r, 'message', '')}"
+                    for r in fails[:3])
+                note = (f"No review: the model's edits did not match the "
+                        f"files ({len(fails)} block(s) failed). {detail}")
+            else:
+                note = ("No review: the model answered without proposing "
+                        "any edits.")
     else:
         applied = any(r.ok for r in results)
         if applied:
             for r in results:
                 if r.ok:
                     idx = index_mod.reindex_file(idx, r.file, cfg)
+        else:
+            note = ("Nothing was written: no edit blocks were found or "
+                    "matched. See the terminal output for details.")
 
     with STATE.lock:
         STATE.last_task, STATE.last_reply = task, reply
@@ -357,6 +400,8 @@ def _run_task(task: str, apply_now: bool) -> None:
             STATE.review_diffs = new_diffs
             STATE.review_nonce = new_nonce
             STATE.review_page = new_page
+        STATE.note = note
+        STATE.applied = applied
         if applied:
             STATE.idx = idx
             if STATE.agent is not None:
@@ -503,6 +548,7 @@ function post(path, body) {
 var lastReviewKey = '';
 var lastFilesKey = '';
 var lastState = {};
+var taskActive = false;   // set by the Run click, cleared when a poll shows idle
 
 function fillProfiles(list, wanted) {
   var sel = $('profile');
@@ -559,15 +605,27 @@ function render(s) {
   var busy = s.busy;
   ['openBtn', 'buildBtn', 'checkBtn', 'runBtn'].forEach(function (id) { $(id).disabled = busy || !s.root && id !== 'openBtn'; });
   $('runBtn').disabled = busy || !s.has_index;
-  $('busyLbl').textContent = busy ? s.busy_what + '\\u2026' : '';
+  var steps = (s.steps || []);
+  var prog = busy ? (steps.length ? steps[steps.length - 1] + '\\u2026' : '') : '';
+  $('busyLbl').textContent = busy ? (s.busy_what + '\\u2026 ' + prog) : '';
   $('busyLbl').className = busy ? 'busy' : '';
   $('errLbl').textContent = s.error || '';
+
+  // A task ended without staging a review, applying edits, or raising an
+  // error. Show why instead of leaving the pane blank -- silent "success"
+  // is what made renames look like they had vanished.
+  if (!busy && taskActive) {
+    taskActive = false;
+    if (s.note) { $('errLbl').textContent = s.note; }
+  }
 
   var key = s.last_task + '|' + s.has_review + '|' + s.review_outcome;
   if (s.has_review && key !== lastReviewKey) {
     $('reviewWrap').innerHTML = '<iframe id="reviewFrame" src="/review?t=' + Date.now() + '"></iframe>';
   } else if (!s.has_review && key !== lastReviewKey) {
-    $('reviewWrap').innerHTML = '<p class="placeholder">Run a task to see a review here.</p>';
+    var ph = 'Run a task to see a review here.';
+    if (!busy && s.note) { ph = s.note; }
+    $('reviewWrap').innerHTML = '<p class="placeholder">' + ph + '</p>';
   }
   lastReviewKey = key;
 }
@@ -620,6 +678,8 @@ $('checkBtn').addEventListener('click', function () { post('/check_model', {}); 
 $('runBtn').addEventListener('click', function () {
   var task = $('task').value.trim();
   if (!task) return;
+  taskActive = true;
+  $('errLbl').textContent = '';
   post('/run', { task: task, apply: $('applyNow').checked });
 });
 

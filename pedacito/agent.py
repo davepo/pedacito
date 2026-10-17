@@ -124,7 +124,8 @@ class Agent:
         self.cfg = cfg
 
     # ------------------------------------------------------------------ phase 1
-    def gather(self, task: str, verbose: bool = True) -> str:
+    def gather(self, task: str, verbose: bool = True,
+               on_step=None) -> str:
         """Run the tool-calling loop: repeatedly ask the model to choose an
         action (read/grep/callers/outline/done) until it says `done` or
         cfg.max_steps is reached, accumulating the source it read.
@@ -133,6 +134,11 @@ class Agent:
         `answer()`. Also sets `self.read_any` (whether any `read` succeeded)
         and `self.steps_log` (a human-readable record of each step, used for
         the session log).
+
+        `on_step`, when given, is called with the step number after every
+        completed step (including the final `done`). The GUI passes a
+        callback here so the browser can show live progress; CLI callers
+        leave it None and see no difference.
         """
         repo_map, tier = self.index.map_for_prompt(self.cfg)
         system = GATHER_BASE + (FLAT_HINT if tier == "flat" else CARDS_HINT)
@@ -173,6 +179,11 @@ class Agent:
             if action == "read":
                 detail = f"{stepjson.get('file')} L{stepjson.get('start')}-{stepjson.get('end')}"
             self.steps_log.append(f"{step}. {action} {detail}  ({why})")
+            if on_step is not None:
+                try:
+                    on_step(step)
+                except Exception:
+                    pass   # progress reporting must never break the loop
             if verbose:
                 print(f"  step {step}: {action} {detail}  ({why[:80]})", file=sys.stderr)
 
