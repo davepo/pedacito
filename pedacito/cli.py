@@ -214,8 +214,15 @@ def _cmd_config(args, cfg) -> int:
         print(f"\nProfiles defined: {', '.join(sorted(cfg.profiles))}")
         print(f"  use with: pedacito ask PROJ -t \"...\" --profile "
               f"{sorted(cfg.profiles)[0]}")
+        from .config import _apply_preset
+        for name in sorted(cfg.profiles):
+            _, tier = _apply_preset(name, cfg.profiles[name], "config file")
+            if tier:
+                print(f"  {name:<20} tier '{tier}' preset applied "
+                      "(token limits)")
     if cfg.active_profile:
-        print(f"  active: {cfg.active_profile}")
+        tier = f", tier {cfg.active_tier}" if cfg.active_tier else ""
+        print(f"  active: {cfg.active_profile}{tier}")
 
     print("\nResolved settings (non-default marked):")
     width = max(len(k) for k in cfg.sources)
@@ -297,13 +304,16 @@ def _chat_command(line: str, args, cfg, ref) -> bool:
         return True
 
     if cmd == "profiles":
+        from .config import _apply_preset
         if not cfg.profiles:
             print("  No profiles defined. Add [profiles.NAME] to your config.",
                   file=sys.stderr)
         for name, body in sorted(cfg.profiles.items()):
             mark = "*" if name == cfg.active_profile else " "
-            print(f"  {mark} {name}: {body.get('model', '(inherits model)')}",
-                  file=sys.stderr)
+            _, tier = _apply_preset(name, body, "config")
+            limits = f"  [tier {tier}]" if tier else ""
+            print(f"  {mark} {name}: {body.get('model', '(inherits model)')}"
+                  f"{limits}", file=sys.stderr)
         return True
 
     if cmd == "status":
@@ -366,7 +376,7 @@ def _chat_command(line: str, args, cfg, ref) -> bool:
             return True
         ref["cfg"], ref["client"] = new_cfg, new_client
         ref["agent"] = Agent(ref["idx"], new_client, new_cfg)
-        label = f"profile {new_cfg.active_profile}, " if new_cfg.active_profile else ""
+        label = f"profile {new_cfg.active_profile}" + (f" [{new_cfg.active_tier} limits]" if new_cfg.active_tier else "") + ", " if new_cfg.active_profile else ""
         print(f"  now using {label}model {new_cfg.model}", file=sys.stderr)
         return True
 

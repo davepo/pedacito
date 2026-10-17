@@ -281,6 +281,31 @@ pedacito config --profile big        # confirm exactly what it resolves to
 A profile can override any setting, not just the model — useful when a
 larger or slower model needs more lookups per task than a smaller one.
 
+**Token limits ride with the profile.** A 9B on an 8k local window and
+deepseek-chat over an API are the same code path with wildly different
+budgets, so each profile carries its own complete set of limits. Add
+`tier = "small" | "medium" | "large" | "hosted"` and pedacito fills in all
+ten budget knobs (`max_tokens_summary/step/answer/plan/build`,
+`flat_map_token_budget`, `max_gathered_chars`, `max_read_lines`,
+`max_spec_chars`, `max_new_files`) from a preset; any limit you write
+explicitly wins over the preset:
+
+```toml
+[profiles.ds]
+tier = "hosted"                  # answer budget 16000, gathered 100k chars, ...
+base_url = "https://api.deepseek.com/v1"
+model = "deepseek-chat"
+json_mode = "object"
+max_tokens_answer = 20000        # your key beats the preset
+```
+
+Even without a `tier` line, pedacito infers one from the model/server name
+(`...8b` → small, `...14b` → medium, `...27b/32b+` → large, deepseek/openai
+APIs → hosted); `tier = ""` turns inference off and keeps the built-in
+defaults. Running with no profile at all always uses the conservative
+defaults. `pedacito config` shows which tier is active and marks every
+limit that came from a profile.
+
 Model names are server-specific: LM Studio wants the id from `/v1/models`
 (shown by `pedacito config --check`); Ollama wants the name from `ollama
 list`. Copy it exactly — a mismatched name is the most common setup
@@ -720,6 +745,15 @@ Windows, since naive text I/O will silently corrupt files there:
 Set any of these under the matching section in your config, or as
 `[profiles.NAME]` overrides. `pedacito config` lists every field with its
 current value and where it came from.
+
+**Token limits are profile-scoped.** Every budget knob below can be set per
+profile, and a profile's `tier = "small"|"medium"|"large"|"hosted"` line
+fills all ten limit fields (`max_tokens_summary/step/answer/plan/build`,
+`flat_map_token_budget`, `max_gathered_chars`, `max_read_lines`,
+`max_spec_chars`, `max_new_files`) from a preset tuned to that class of
+model — tight for a 9B on 8k local context, generous for DeepSeek-class
+APIs. Keys you write explicitly override the preset; with no tier and no
+profile you get the defaults in this table. See "Running multiple models".
 
 | Setting | Default | |
 |---|---|---|
