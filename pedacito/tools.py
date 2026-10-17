@@ -195,6 +195,7 @@ def tool_grep(index, pattern: str, scope: str = "", max_hits: int = 40) -> str:
     except re.error as e:
         return f"ERROR: bad regex ({e})."
     files = index.files
+    scope_note = ""
     if scope:
         one = index.resolve_file(scope)
         if one:
@@ -209,8 +210,6 @@ def tool_grep(index, pattern: str, scope: str = "", max_hits: int = 40) -> str:
             # No usable pattern *and* no real file: the step was malformed.
             return (f"ERROR: '{scope}' is not in the index, and grep needs a "
                     "`pattern`. To look inside one file, use `outline`, or `read` it.")
-    else:
-        scope_note = ""
     hits: list[str] = []
     per_file_cap = max(5, max_hits // 4)
     for rel in files:
