@@ -168,7 +168,13 @@ def list_backups(root: Path) -> list[Path]:
 def restore(root: Path, snapshot: Path, dry_run: bool = False) -> list[str]:
     """Copy every file in a backup snapshot back over the working tree
     byte-for-byte, restoring it to its pre-edit state. Returns the list of
-    relative paths restored (or that would be restored, if `dry_run`)."""
+    relative paths restored (or that would be restored, if `dry_run`).
+
+    Files created by the edit have no copy in the snapshot -- there was
+    nothing to back up. They are reported as `rel (+)` and left on disk;
+    deleting files automatically is too dangerous for a tool whose whole
+    safety story is "nothing is ever removed". Remove them by hand, or undo
+    with git."""
     root = Path(root).resolve()
     restored: list[str] = []
     for src in sorted(snapshot.rglob("*")):
@@ -180,6 +186,15 @@ def restore(root: Path, snapshot: Path, dry_run: bool = False) -> list[str]:
         if not dry_run:
             dest.parent.mkdir(parents=True, exist_ok=True)
             dest.write_bytes(src.read_bytes())   # byte-exact restore
+    # Note created files so `restore --list` output explains why they stay.
+    cur = {p.relative_to(root).as_posix() for p in root.rglob("*")
+           if p.is_file()}
+    snap = {p.relative_to(snapshot).as_posix() for p in snapshot.rglob("*")
+            if p.is_file()}
+    for rel in sorted(cur - snap):
+        if rel.startswith(".pedacito/"):
+            continue
+        restored.append(f"{rel} (+ new file, left in place)")
     return restored
 
 
