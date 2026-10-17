@@ -237,7 +237,15 @@ class Config:
 
     # Profile applied when --profile is not given. Set it in your user config
     # for a lasting default, or export PEDACITO_PROFILE for one shell session.
+    # It may also be set at the TOP level of the file (`default_profile = ...`),
+    # which `--setup` writes; a profile named here must exist in [profiles.*].
     default_profile: str = ""
+    # Optional preset tier for the NO-PROFILE run: "small", "medium", "large"
+    # or "hosted". Lets a simple two-line config (`tier = "hosted"` plus your
+    # server details) get sane token budgets without defining any profiles.
+    # Profiles carry their own `tier` key; this one only covers runs where no
+    # profile is selected.
+    tier: str = ""
 
     # Bookkeeping for `pedacito config`. Not settings.
     sources: dict = None
@@ -414,6 +422,23 @@ def load(root: Path | None = None, explicit: Path | None = None,
             cfg.sources[key] = f"{label} ({path})"
 
     cfg.profiles = profiles
+
+    # Top-level `tier` (no-profile preset). Validated before profile
+    # selection so a typo fails loudly here rather than silently doing
+    # nothing later.
+    top_tier = cfg.tier
+    if top_tier:
+        if top_tier not in PRESETS:
+            raise ConfigError(
+                f"tier must be one of {', '.join(PRESET_TIERS)}, "
+                f"got {top_tier!r}"
+                + (f" ({cfg.sources.get('tier')})" if cfg.sources.get("tier") else ""))
+        for key, value in PRESETS[top_tier].items():
+            if cfg.sources.get(key) == "default":
+                setattr(cfg, key, _coerce(key, value))
+                cfg.sources[key] = f"tier '{top_tier}' preset"
+        cfg.active_tier = top_tier
+
     # Which profile: explicit flag, then the shell environment, then a lasting
     # default from the config file.
     origin = "--profile"
@@ -426,9 +451,13 @@ def load(root: Path | None = None, explicit: Path | None = None,
     if profile:
         if profile not in profiles:
             known = ", ".join(sorted(profiles)) or "(none defined)"
+            hint = ("Define it in your config, or clear `default_profile`. "
+                    "Run `pedacito config --setup` to build both interactively."
+                    if origin == "default_profile" and not profiles else "")
             raise ConfigError(
                 f"No profile named '{profile}' (from {origin}). "
                 f"Defined profiles: {known}\n"
+                + (hint + "\n" if hint else "") +
                 "Add one to your config:\n\n"
                 f"  [profiles.{profile}]\n  model = \"...\"")
         body, tier = _apply_preset(profile, profiles[profile], origin)
@@ -668,6 +697,48 @@ def _apply_preset(name: str, body: dict, origin: str) -> tuple[dict, str]:
 # `pedacito config --init` starter file
 # --------------------------------------------------------------------------
 TEMPLATE = '''\
+# Pedacito configuration.  Run `pedacito config --setup` to build this file
+# interactively (it finds LM Studio / Ollama on this machine for you), or
+# edit the two lines below.  Everything else is optional.
+#
+# MANDATORY (only if your server/model differ from these defaults):
+#   base_url  where the model lives. Default: http://localhost:1234/v1
+#   model     the exact name your server reports. Default: google/gemma-3-27b
+#
+base_url = "http://localhost:1234/v1"
+model    = "google/gemma-3-27b"
+
+# Optional: pick sane token budgets without defining any profiles.
+# One of "small" (~9B local), "medium" (~14-27B local), "large" (35B+),
+# or "hosted" (DeepSeek/OpenAI-style APIs).  Delete it to use built-ins.
+tier = "medium"
+
+# Profiles let one file hold several models/tiers; select with --profile NAME
+# (or default_profile below).  A hosted API profile looks like this:
+# [profiles.deepseek]
+# base_url = "https://api.deepseek.com/v1"
+# api_key  = "sk-..."
+# model    = "deepseek-chat"
+# tier     = "hosted"
+# json_mode = "object"      # hosted APIs usually lack structured-output schemas
+
+# default_profile = "deepseek"
+
+# Every other knob (max_steps, context_tokens, temperature, thinking control,
+# chunking, review...) has a working built-in default.  See them all with:
+#   pedacito config --reference        (annotated full template)
+#   pedacito config                    (current resolved values + who set them)
+# Precedence: defaults < this file < ./.pedacito.toml < --config FILE <
+# --profile NAME < CLI flags.
+'''
+
+
+# --------------------------------------------------------------------------
+# Full annotated reference. `--init` writes the short TEMPLATE above;
+# `pedacito config --reference` prints this one so every knob stays
+# documented without overwhelming first-time users.
+# --------------------------------------------------------------------------
+REFERENCE_TEMPLATE = '''\
 # Pedacito configuration.
 #
 # Lives at ~/.config/pedacito/config.toml (Linux/macOS) or
@@ -974,6 +1045,159 @@ model    = "google/gemma-3-27b"
 # thinking_suffix = "/no_think"
 # max_tokens_answer = 10000    # thinking needs headroom beyond the preset
 '''
+
+
+
+
+# --------------------------------------------------------------------------
+# `pedacito config --setup`  interactive first-run configuration
+# --------------------------------------------------------------------------
+_KNOWN_SERVERS = (
+    ("LM Studio", "http://localhost:1234/v1"),
+    ("Ollama",    "http://localhost:11434/v1"),
+)
+
+
+def discover_servers(timeout: float = 2.0) -> list[tuple[str, str, list[str]]]:
+    """Probe the known local OpenAI-compatible servers on this machine.
+
+    Returns [(label, base_url, [model ids]), ...] for every server that
+    answers GET <base_url>/models within `timeout`. A server that is up but
+    lists no models still appears, with an empty list. Shared by
+    interactive_setup() and the GUI's setup hint."""
+    import requests
+    found = []
+    for label, url in _KNOWN_SERVERS:
+        try:
+            r = requests.get(url.rstrip("/") + "/models", timeout=timeout)
+            r.raise_for_status()
+            ids = sorted({m.get("id", "?") for m in r.json().get("data", [])})
+        except Exception:
+            continue
+        found.append((label, url, ids))
+    return found
+
+
+def _ask(prompt: str, default: str = "") -> str:
+    suffix = f" [{default}]" if default else ""
+    try:
+        raw = input(f"{prompt}{suffix}: ").strip()
+    except EOFError:
+        raw = ""
+    return raw or default
+
+
+def interactive_setup(path: Path | None = None, force: bool = False,
+                      stdin=input, stdout=None) -> Path:
+    """Build a working config file step by step, then validate it.
+
+    Asks three questions at most (where is your model, which model, hosted
+    API?) and writes a minimal file: base_url, model, and a tier -- the only
+    settings that are genuinely mandatory. Existing files are backed up to
+    <path>.bak rather than silently overwritten. Raises ConfigError on bad
+    answers; the written file is load()-checked before returning."""
+    import sys
+    out = stdout or sys.stdout
+    def say(s=""):
+        print(s, file=out)
+
+    p = path or USER_CONFIG
+    if p.exists() and not force:
+        ans = _ask(f"{p} already exists. Overwrite it? [y/N]")
+        if ans.lower() not in ("y", "yes"):
+            raise ConfigError("setup cancelled; existing config left untouched")
+
+    say("Pedacito setup -- only two settings are mandatory: where your model")
+    say("lives (base_url) and its exact name (model). Everything else has a")
+    say("working default. Press Enter to accept any suggestion in [brackets].")
+    say()
+
+    servers = discover_servers()
+    base_url = model = ""
+    hosted = False
+    api_key = ""
+    if servers:
+        say("Found running model servers on this machine:")
+        for i, (label, url, ids) in enumerate(servers, 1):
+            say(f"  {i}) {label}  {url}  ({len(ids)} model(s) listed)")
+        say("  0) none of these -- use a hosted API (DeepSeek, OpenAI, ...)")
+        choice = _ask("Choose a server", str(len(servers)) if len(servers) == 1 else "1")
+        if choice == "0":
+            hosted = True
+        else:
+            try:
+                label, base_url, ids = servers[int(choice) - 1]
+            except (ValueError, IndexError):
+                raise ConfigError(f"not a valid server choice: {choice!r}")
+            if ids:
+                say("Models that server reports:")
+                for i, m in enumerate(ids, 1):
+                    say(f"  {i}) {m}")
+                pick = _ask("Which model should Pedacito use?", ids[0])
+                try:
+                    model = ids[int(pick) - 1]
+                except (ValueError, IndexError):
+                    model = pick          # allow typing an id not currently listed
+            else:
+                model = _ask("Model name (exactly as the server reports it)")
+    else:
+        say("No LM Studio or Ollama server answered on localhost.")
+        hosted = _ask("Is this a hosted API (DeepSeek/OpenAI-style)? [Y/n]"
+                      ).lower() != "n"
+
+    if hosted:
+        base_url = _ask("API base URL", "https://api.deepseek.com/v1")
+        api_key = _ask("API key (sent over HTTPS; stored in this file)")
+        model = _ask("Model name", "deepseek-chat")
+
+    if not base_url or not model:
+        raise ConfigError("base_url and model are mandatory -- setup needs both")
+
+    tier = "hosted" if hosted else _ask(
+        "Model size tier -- small (~9B), medium (~14-27B), large (35B+)",
+        "medium")
+    if tier not in PRESETS:
+        raise ConfigError(f"tier must be one of {', '.join(PRESET_TIERS)}, got {tier!r}")
+
+    lines = [
+        "# Written by `pedacito config --setup`.",
+        "# The only mandatory settings are base_url and model. See",
+        "# `pedacito config --reference` for every other knob.",
+        f'base_url = "{base_url}"',
+        f'model    = "{model}"',
+        f'tier     = "{tier}"',
+    ]
+    if api_key:
+        lines.insert(4, f'api_key  = "{api_key}"')
+        lines.insert(5, 'json_mode = "object"   # hosted APIs lack llama.cpp schemas')
+    body = "\n".join(lines) + "\n"
+
+    # Validate BEFORE touching the user's file: parse exactly as load() will.
+    probe = p.with_suffix(".toml.setup-probe") if p.parent.exists() else \
+        Path("pedacito-setup-probe.toml")
+    try:
+        probe.parent.mkdir(parents=True, exist_ok=True)
+        probe.write_text(body)
+        load(explicit=probe)
+    finally:
+        try:
+            probe.unlink()
+        except OSError:
+            pass
+
+    if p.exists():
+        backup = p.with_name(p.name + ".bak")
+        backup.write_bytes(p.read_bytes())
+        say(f"(previous config saved to {backup})")
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(body)
+    say()
+    say(f"Wrote {p}")
+    say(f"  base_url = {base_url}")
+    say(f"  model    = {model}")
+    say(f"  tier     = {tier}" + ("  (api_key set, json_mode=object)" if api_key else ""))
+    say("Test it any time with:  pedacito config --check")
+    return p
 
 
 def write_template(path: Path | None = None, force: bool = False) -> Path:

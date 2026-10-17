@@ -675,3 +675,18 @@ class LMStudio:
             print(f"[warn] model '{self.cfg.model}' not in loaded list: {ids}",
                   file=sys.stderr)
         return ", ".join(ids)
+
+
+def probe_server(base_url: str, timeout: float = 2.0) -> list[str] | None:
+    """Ask an arbitrary OpenAI-compatible endpoint which models it has.
+
+    Returns the sorted list of model ids, or None when nothing answers at
+    `<base_url>/models` within `timeout`. Unlike LMStudio.check() this never
+    raises -- callers (the interactive setup wizard, the GUI's server hint)
+    treat "no answer" as a normal outcome, not an error."""
+    try:
+        r = requests.get(base_url.rstrip("/") + "/models", timeout=timeout)
+        r.raise_for_status()
+        return sorted({m.get("id", "?") for m in r.json().get("data", [])})
+    except Exception:
+        return None
