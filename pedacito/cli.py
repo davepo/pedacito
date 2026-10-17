@@ -399,7 +399,7 @@ def _review(root: Path, results, task: str, cfg, backup_dir, stamp: str) -> list
     """Build and serve the review page for a set of edit results, block
     until the person applies or discards, and return the results as they
     finally stand (so the session log records what actually happened)."""
-    diffs = review_mod.diffs_from_results(results)
+    diffs = review_mod.diffs_from_results(results, root)
     if not diffs:
         # Nothing anchored, so there is nothing to review. Say why rather than
         # silently doing nothing.

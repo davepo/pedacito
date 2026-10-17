@@ -94,6 +94,10 @@ class Result:
     # True when at least one block in this file anchored approximately rather
     # than matching exactly. Reviewers use it to flag the risky ones.
     fuzzy: bool = False
+    # For a creation that was detected as a rename: the old path(s) whose real
+    # contents were moved into this file (and which apply then removed). The
+    # reviewer renders them as deleted so nothing about the move is hidden.
+    renames_from: tuple[str, ...] = ()
 
 
 # --------------------------------------------------------------------------
@@ -353,6 +357,34 @@ def apply_edits(root: Path, edits: list[Edit], backup: bool = True,
 
     root_resolved = Path(root).resolve()
 
+    # ---- rename detection ---------------------------------------------------
+    # A "rename" arrives as three blocks: create the new path (empty SEARCH),
+    # and empty out the old ones (full-content SEARCH, empty REPLACE). The
+    # content match is exact, so we know which groups are clearing old files.
+    # Pairing them with creations of the same extension lets us move the real
+    # bytes instead of leaving emptied stubs behind -- but only when every
+    # piece checks out; otherwise the plain create + clear semantics below run
+    # exactly as before, and nothing is renamed silently.
+    renames: dict[str, str] = {}          # cleared rel -> created rel
+    if cfg is None or getattr(cfg, "allow_rename", True):
+        creators = [rel for rel, g in by_file.items()
+                    if not (root_resolved / rel).exists()
+                    and all(not e.search.strip() for e in g)]
+        removers = [rel for rel, g in by_file.items()
+                    if (root_resolved / rel).is_file()
+                    and any(e.search.strip() and not e.replace.strip() for e in g)]
+        used: set[str] = set()
+        for old in removers:
+            suffix = Path(old).suffix.lower()
+            for new in creators:
+                if new in used or Path(new).suffix.lower() != suffix:
+                    continue
+                renames[old] = new
+                used.add(new)
+                break
+    for old in renames:
+        del by_file[old]
+
     def _validate(path: Path, text: str) -> str | None:
         """Return an error message if `text` does not parse as source of
         `path`'s language, else None. A new file that fails to parse is not
@@ -370,7 +402,8 @@ def apply_edits(root: Path, edits: list[Edit], backup: bool = True,
         return None
 
     def _finish(rel: str, path: Path, original: str | None, text: str, style,
-                note: str, fuzzy: bool = False) -> Result:
+                note: str, fuzzy: bool = False,
+                renames_from: tuple[str, ...] = ()) -> Result:
         """Validate, diff, back up, and write one finished file's content."""
         err = _validate(path, text)
         if err:
@@ -394,9 +427,33 @@ def apply_edits(root: Path, edits: list[Edit], backup: bool = True,
                 fileio.write(dest, original, style)
             else:
                 fileio.write(path.with_suffix(path.suffix + ".bak"), original, style)
+
+        # Renamed-in sources were backed up under their OLD path (below), so
+        # the snapshot dir can restore a rename by moving files back. A new
+        # file created from scratch has no bytes to preserve.
+        if renames_from:
+            for old in renames_from:
+                opath = root_resolved / old
+                try:
+                    otext, ostyle = fileio.read(opath, errors="strict")
+                except OSError:
+                    continue
+                if backup:
+                    if backup_dir is not None:
+                        bdest = backup_dir / old
+                        bdest.parent.mkdir(parents=True, exist_ok=True)
+                        fileio.write(bdest, otext, ostyle)
+                    else:
+                        fileio.write(opath.with_suffix(
+                            opath.suffix + ".bak"), otext, ostyle)
+                try:
+                    opath.unlink()
+                except FileNotFoundError:
+                    pass
+
         fileio.write(path, text, style)
         return Result(True, rel, note, diff, original or "", text, sha,
-                      fuzzy=fuzzy)
+                      fuzzy=fuzzy, renames_from=tuple(renames_from))
 
     for rel, group in by_file.items():
         path = (Path(root) / rel).resolve()
@@ -433,16 +490,23 @@ def apply_edits(root: Path, edits: list[Edit], backup: bool = True,
                     "no edit matched: this path does not exist yet. To CREATE "
                     "the file, emit exactly one block for it with an EMPTY "
                     "SEARCH section (between <<<<<<< SEARCH and =======). "
-                    "Pedacito cannot rename or move files -- to 'rename', "
-                    "create the new path with an empty-SEARCH block and delete "
-                    "the old file's contents yourself." + hint))
+                    "To RENAME a file into this path, also emit a block for "
+                    "the old path whose SEARCH is its entire content and "
+                    "whose REPLACE is empty -- Pedacito will move the real "
+                    "contents and remove the old file." + hint))
                 continue
             text = "\n".join(e.replace for e in group)
             if text and not text.endswith("\n"):
                 text += "\n"
             path.parent.mkdir(parents=True, exist_ok=True)
-            results.append(_finish(rel, path, None, text, None,
-                                   f"created with {len(text.splitlines())} line(s)"))
+            srcs = tuple(o for o, n in renames.items() if n == rel)
+            note = f"created with {len(text.splitlines())} line(s)"
+            if srcs:
+                note += (" -- renamed from " + ", ".join(srcs) +
+                        " (the new file gets its current contents; the old "
+                        "path is removed)")
+            results.append(_finish(rel, path, None, text, None, note,
+                                   renames_from=srcs))
             continue
 
         # LF-normalised for matching; style remembered so the file is written

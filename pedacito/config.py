@@ -163,6 +163,12 @@ class Config:
     allow_write: bool = False
     # Ceiling on one `write` call's contents, in characters.
     max_write_chars: int = 200_000
+    # Recognise rename/move intent in edit blocks: a creation of a new path
+    # paired with a block that empties an existing same-extension file is
+    # applied as a real move (contents relocated, old file deleted) instead of
+    # leaving emptied stubs behind. Set false to keep strict create+clear
+    # semantics and never delete a file automatically.
+    allow_rename: bool = True
     # When a search/replace block fails to match, the model is fed the failure
     # and asked to re-anchor it. This caps those repair round-trips per apply.
     # Hosted models re-anchor reliably and merit more rounds; small local
@@ -788,6 +794,9 @@ model    = "google/gemma-3-27b"
 # allow_write = false              # let the gather loop overwrite whole files
 #                                  # (skips backup/review; prefer edit blocks)
 # max_write_chars = 200000         # ceiling on one `write` call
+# allow_rename = true              # treat "create new path + empty old path"
+#                                  # block pairs as real renames (old file is
+#                                  # deleted); set false to never auto-delete
 # repair_rounds = 2                # re-anchor attempts per failed edit block
 
 # --- Project scaffolding (`pedacito new`) -----------------------------------

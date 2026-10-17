@@ -97,6 +97,17 @@ Rules for edits:
 - Keep each block small and local. Use several blocks rather than one large one.
 - Do not output the whole file. Do not output a diff or patch format.
 - If you are adding a new function, anchor the SEARCH on an existing nearby line.
+- To CREATE a brand-new file: emit exactly one block for it with an EMPTY
+  SEARCH section (nothing between <<<<<<< SEARCH and =======) and the full
+  file contents in REPLACE.
+- To RENAME or MOVE a file: emit three blocks -- (1) an empty-SEARCH creation
+  block for the NEW path whose REPLACE is just a short placeholder comment;
+  (2) for the OLD path, a block whose SEARCH is its entire current content
+  and whose REPLACE is empty; (3) optionally a block that edits the new path's
+  placeholder. When the creation and the clearing of the old path are both
+  present, Pedacito moves the old file's real contents to the new path and
+  removes the old file -- never type the old file's contents into REPLACE,
+  as that would double them.
 
 Before the blocks, write a short plain explanation of what you changed and why.
 If the task is a question rather than a change, just answer it and output no blocks."""

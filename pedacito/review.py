@@ -180,16 +180,34 @@ def build_rows(before: str, after: str) -> tuple[list[Row], int, int]:
     return rows, added, removed
 
 
-def diffs_from_results(results) -> list[FileDiff]:
+def diffs_from_results(results, root=None) -> list[FileDiff]:
     """Convert a list of edits.Result (from apply_edits(dry_run=True)) into
     FileDiff objects ready for rendering. Only successful results with
-    computed before/after text produce a diff."""
+    computed before/after text produce a diff.
+
+    `root` is the project directory; it is only consulted for rename results,
+    where the old file's real contents are shown as a deletion so the move is
+    visible on the review page instead of hidden inside the new file's note."""
     out: list[FileDiff] = []
     for r in results:
         if not r.ok or not r.sha:
             continue
         rows, added, removed = build_rows(r.before, r.after)
         out.append(FileDiff(r.file, rows, added, removed, r.sha, r.after, r.message))
+        srcs = getattr(r, "renames_from", ())
+        if srcs and root is not None:
+            # The creation group above carries the "renamed from" note; here
+            # we render each source path's true contents being removed, using
+            # the bytes on disk (dry-run never wrote them).
+            for old in srcs:
+                try:
+                    otext, _ = fileio.read(Path(root) / old, errors="replace")
+                except OSError:
+                    continue
+                orows, oa, om = build_rows(otext, "")
+                out.append(FileDiff(old, orows, oa, om,
+                                    hashlib.sha256(otext.encode("utf-8")).hexdigest(),
+                                    "", "removed (renamed to " + r.file + ")"))
     return out
 
 
@@ -795,7 +813,47 @@ def write_files(root: Path, diffs: list[FileDiff], backup_dir: Path | None):
         p.parent.mkdir(parents=True, exist_ok=True)
         fileio.write(p, fd.after_text, style)
         written.append(fd.rel)
-    return True, f"{len(written)} file(s) written: " + ", ".join(written)
+
+    # Rename sources: the creation diff's note says "renamed from X". At
+    # preview time X still held its content (the clearing block was folded
+    # into the move), so its recorded sha is X's pre-rename digest. If X is
+    # still on disk with exactly those bytes, complete the move by removing
+    # it; if anything else changed it meanwhile, leave it alone and say so.
+    import re as _re
+    removed = []
+    rename_notes = []
+    for fd in diffs:
+        m = _re.search(r"renamed from ([^()]+?)(?: \(|$)", fd.message or "")
+        if "renamed from" not in (fd.message or "") or not m:
+            continue
+        for old in (s.strip() for s in m.group(1).split(",")):
+            op = root / old
+            if not op.is_file():
+                continue
+            try:
+                cur = hashlib.sha256(Path(op).read_bytes()).hexdigest()
+            except OSError:
+                continue
+            if backup_dir is not None:
+                dest = backup_dir / old
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                try:
+                    otext, ostyle = fileio.read(op, errors="replace")
+                    fileio.write(dest, otext, ostyle)
+                except OSError:
+                    pass
+            try:
+                op.unlink()
+                removed.append(old)
+            except OSError:
+                rename_notes.append(f"{old} could not be removed")
+
+    msg = f"{len(written)} file(s) written: " + ", ".join(written)
+    if removed:
+        msg += "; renamed away: " + ", ".join(removed)
+    if rename_notes:
+        msg += "; NOTE: " + ", ".join(rename_notes)
+    return True, msg
 
 
 def save(root: Path, page: str, stamp: str) -> Path:
