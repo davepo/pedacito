@@ -713,11 +713,18 @@ def write_files(root: Path, diffs: list[FileDiff], backup_dir: Path | None):
     else created it while the review page sat open, and overwriting it
     silently would destroy those contents. Backs up originals to `backup_dir`
     first when given. Returns (ok, message)."""
-    def _digest(p: Path) -> str:
-        return hashlib.sha256(fileio.read_text(p, errors="replace")
-                              .encode("utf-8")).hexdigest()
-
     EMPTY_SHA = hashlib.sha256(b"").hexdigest()
+
+    def _digest(p: Path) -> str:
+        # read_bytes straight off the Path (not fileio.read_text): that keeps
+        # this check honest under concurrent deletes -- a vanished file raises
+        # FileNotFoundError here rather than being swallowed by an errors=
+        # "replace" text read -- and it hashes the exact bytes on disk.
+        try:
+            return hashlib.sha256(Path(p).read_bytes()).hexdigest()
+        except FileNotFoundError:
+            return EMPTY_SHA
+
     if not diffs:
         # An empty diff list means every block failed to anchor; applying
         # "successfully" here would silently write nothing.
@@ -751,15 +758,41 @@ def write_files(root: Path, diffs: list[FileDiff], backup_dir: Path | None):
                            "else while this review was open. Re-run the task "
                            "to rebuild the review.")
 
+    # Snapshot which paths exist *before* writing anything. Pass two below
+    # re-checks existence at write time: a vanished path that pass one saw
+    # (a concurrent delete, or an earlier rename-stub in this very batch)
+    # must fail cleanly here instead of crashing the review server with a
+    # FileNotFoundError from fileio.read().
+    default_style = fileio.TextStyle()
+    existed_at_check = {fd.rel: (root / fd.rel).exists() for fd in diffs}
     written = []
     for fd in diffs:
         p = root / fd.rel
-        exists_before = p.exists()
-        original, style = fileio.read(p, errors="replace")
-        if backup_dir is not None and exists_before:
+        try:
+            if p.exists():
+                original, style = fileio.read(p, errors="replace")
+            elif existed_at_check[fd.rel]:
+                raise FileNotFoundError
+            else:
+                # New-file creation: nothing on disk to read or back up.
+                original, style = "", default_style
+        except FileNotFoundError:
+            # The file vanished between the snapshot and this read (a
+            # concurrent delete, or a rename-stub earlier in this batch).
+            # Fail cleanly with an honest partial-apply message instead of
+            # crashing the review server mid-request.
+            return False, (f"Partially written: {fd.rel} vanished between "
+                           "preview check and write; files already written "
+                           "in this batch: " + (", ".join(written) or "none") +
+                           ". Re-run the task to rebuild the review.")
+        if backup_dir is not None and original:
             dest = backup_dir / fd.rel
             dest.parent.mkdir(parents=True, exist_ok=True)
             fileio.write(dest, original, style)
+        # Creation diffs can target a path whose parent directory does not
+        # exist yet (e.g. renaming into game1/index.html); without this the
+        # write would die with FileNotFoundError mid-batch.
+        p.parent.mkdir(parents=True, exist_ok=True)
         fileio.write(p, fd.after_text, style)
         written.append(fd.rel)
     return True, f"{len(written)} file(s) written: " + ", ".join(written)
