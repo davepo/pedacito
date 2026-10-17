@@ -347,43 +347,97 @@ def apply_edits(root: Path, edits: list[Edit], backup: bool = True,
     the working tree unexpectedly.
     """
     results: list[Result] = []
-    # Fold repeated FILE headers into one group per path before anything
-    # else: two independent passes over one file each diff against the
-    # original text (breaking the review flow) and, live, a creation block
-    # can clobber -- or be clobbered by -- an edit block for the same path.
-    by_file: dict[str, list[Edit]] = {}
-    for e in merge_duplicate_files(edits):
-        by_file.setdefault(e.file, []).append(e)
+    # Group blocks by path *before* merging, so rename detection sees each
+    # SEARCH/REPLACE block on its own. merge_duplicate_files concatenates
+    # bodies; when a model emits "create index.html" and "empty out
+    # index.html" under the same header (the rename idiom), the merged
+    # group's search is non-empty while its replace keeps the new content --
+    # which previously made the whole path look like neither a creator nor a
+    # remover, silently dropping the rename pair and leaving the old files
+    # to fail as unmatched edits.
+    groups: dict[str, list[Edit]] = {}
+    for e in edits:
+        groups.setdefault(e.file, []).append(e)
 
     root_resolved = Path(root).resolve()
 
     # ---- rename detection ---------------------------------------------------
-    # A "rename" arrives as three blocks: create the new path (empty SEARCH),
-    # and empty out the old ones (full-content SEARCH, empty REPLACE). The
-    # content match is exact, so we know which groups are clearing old files.
-    # Pairing them with creations of the same extension lets us move the real
-    # bytes instead of leaving emptied stubs behind -- but only when every
-    # piece checks out; otherwise the plain create + clear semantics below run
-    # exactly as before, and nothing is renamed silently.
-    renames: dict[str, str] = {}          # cleared rel -> created rel
+    # The documented rename protocol is: an empty-SEARCH creation block for
+    # the NEW path (a placeholder), plus a full-content SEARCH / empty REPLACE
+    # "clear" block for each OLD path. Pedacito then moves the old file's real
+    # bytes to the new path and removes it.
+    #
+    # Two structural facts make this tricky, and both were sources of silent
+    # failures ("the review page stays blank, nothing gets renamed"):
+    #
+    #   1. Small models re-emit the same `--- FILE:` header per block --
+    #      including when the target of a rename shares its name with a source
+    #      (replace index.html with a new one, move the old ones aside). If
+    #      duplicate headers are concatenated *before* classification, such a
+    #      path looks like neither creator nor remover and the pair vanishes.
+    #      Classification therefore happens per raw block below.
+    #   2. A creation target exists on disk in the very common "overwrite +
+    #      archive" pattern, so creators must NOT be required to be absent --
+    #      they are identified by shape alone (empty SEARCH, non-empty
+    #      REPLACE). Removers are identified by a clear block whose search
+    #      actually reaches end-of-file.
+    #
+    # When a path is BOTH creator and remover (its own content archived
+    # elsewhere), it is treated as pure overwrite-and-rename: its clear blocks
+    # are dropped, because executing them would delete the freshly created
+    # file. Pairing only ever links distinct paths, so no data can be lost.
+    def _classify(rel: str, g: list[Edit]) -> tuple[bool, bool]:
+        """Return (can_create, can_clear) for one path's raw blocks."""
+        can_create = any(not e.search.strip() and e.replace.strip() for e in g)
+        can_clear = False
+        path = root_resolved / rel
+        if path.is_file():
+            original, _style = fileio.read(path, errors="replace")
+            for e in g:
+                if e.replace.strip():
+                    continue
+                if not e.search.strip():
+                    can_clear = True         # explicit wipe of an existing file
+                    continue
+                span = locate(original, e.search, cfg)
+                if span is not None and not original[span.stop:].strip():
+                    can_clear = True         # search reaches end-of-file
+        return can_create, can_clear
+
+    classified = {rel: _classify(rel, g) for rel, g in groups.items()}
+    creators = {rel for rel, (c, _cl) in classified.items() if c}
+    removers = {rel for rel, (_c, cl) in classified.items() if cl}
+
+    renames: dict[str, str] = {}             # cleared rel -> created rel
     if cfg is None or getattr(cfg, "allow_rename", True):
-        creators = [rel for rel, g in by_file.items()
-                    if not (root_resolved / rel).exists()
-                    and all(not e.search.strip() for e in g)]
-        removers = [rel for rel, g in by_file.items()
-                    if (root_resolved / rel).is_file()
-                    and any(e.search.strip() and not e.replace.strip() for e in g)]
         used: set[str] = set()
-        for old in removers:
+        for old in sorted(removers):
             suffix = Path(old).suffix.lower()
-            for new in creators:
-                if new in used or Path(new).suffix.lower() != suffix:
+            for new in sorted(creators):
+                if new == old or new in used:
+                    continue
+                if Path(new).suffix.lower() != suffix:
                     continue
                 renames[old] = new
                 used.add(new)
                 break
-    for old in renames:
-        del by_file[old]
+
+    # Now fold repeated headers into one group per path for application.
+    # Rename sources lose their clear blocks: live, they would fail to match
+    # after the move removed the file; in dry-run they would preview as an
+    # empty stub next to the rename. A path that is also a creator keeps its
+    # create blocks (see fact 3 above); a pure source drops out entirely.
+    by_file: dict[str, list[Edit]] = {}
+    for rel, g in groups.items():
+        if rel in renames:
+            keep = [e for e in g
+                    if not (not e.replace.strip()
+                            and (e.search.strip() or rel in creators))]
+            if not keep:
+                continue
+            by_file[rel] = merge_duplicate_files(keep)
+            continue
+        by_file[rel] = merge_duplicate_files(g)
 
     def _validate(path: Path, text: str) -> str | None:
         """Return an error message if `text` does not parse as source of
@@ -411,13 +465,55 @@ def apply_edits(root: Path, edits: list[Edit], backup: bool = True,
             return Result(False, rel, f"edit produced {err}; {verb}",
                           fuzzy=fuzzy)
 
+        # Rename sources move their REAL bytes into the new path: the model's
+        # creation REPLACE was only a placeholder (the system prompt says so --
+        # retyping whole files wastes tokens and drops functions), so the
+        # moved content wins. The placeholder survives as an HTML comment at
+        # the top when it carries information the user should see.
+        # `moved_original` is what the review page diffs against and pins by
+        # sha for pure creations; for renames it is the first source's bytes.
+        moved_original = original or ""
+        if renames_from:
+            texts = []
+            for old in renames_from:
+                try:
+                    otext, _ = fileio.read(root_resolved / old, errors="replace")
+                except OSError:
+                    continue
+                texts.append(otext)
+            if texts:
+                moved_original = texts[0]
+                if len(texts) > 1:
+                    note += (" [multiple rename sources; the first's contents "
+                             "were moved -- the others are backed up and "
+                             "removed, merge them manually]")
+                if original is not None:      # existing target: append, never clobber
+                    base = original.rstrip("\n")
+                    add = "\n".join(t.rstrip("\n") for t in texts)
+                    text = base + "\n" + add + "\n"
+                else:                         # pure creation: placeholder + moved bytes
+                    ph = text.strip()
+                    body = texts[0].rstrip("\n")
+                    suffix = path.suffix.lower()
+                    if ph and suffix in (".html", ".htm"):
+                        text = f"{ph}\n{body}\n"
+                    elif ph and suffix in (".py",):
+                        text = "".join(f"# {ln}\n" for ln in ph.splitlines()) \
+                               + body + "\n"
+                    elif ph and suffix in (".css", ".js", ".ts", ".scss"):
+                        text = "".join(f"/* {ln} */\n" for ln in ph.splitlines()) \
+                               + body + "\n"
+                    else:
+                        text = body + "\n"
+                    moved_original = ""       # nothing existed at the target
+
         diff = "".join(difflib.unified_diff(
-            (original or "").splitlines(keepends=True), text.splitlines(keepends=True),
+            moved_original.splitlines(keepends=True), text.splitlines(keepends=True),
             fromfile=f"a/{rel}", tofile=f"b/{rel}",
         ))
-        sha = hashlib.sha256((original or "").encode("utf-8")).hexdigest()
+        sha = hashlib.sha256(moved_original.encode("utf-8")).hexdigest()
         if dry_run:
-            return Result(True, rel, note + " (dry run)", diff, original or "",
+            return Result(True, rel, note + " (dry run)", diff, moved_original,
                           text, sha, fuzzy=fuzzy)
 
         if backup and original is not None:
@@ -452,7 +548,7 @@ def apply_edits(root: Path, edits: list[Edit], backup: bool = True,
                     pass
 
         fileio.write(path, text, style)
-        return Result(True, rel, note, diff, original or "", text, sha,
+        return Result(True, rel, note, diff, moved_original, text, sha,
                       fuzzy=fuzzy, renames_from=tuple(renames_from))
 
     for rel, group in by_file.items():
@@ -463,19 +559,49 @@ def apply_edits(root: Path, edits: list[Edit], backup: bool = True,
             results.append(Result(False, rel, "refusing to edit outside project root"))
             continue
 
+        srcs = tuple(o for o, n in renames.items() if n == rel)
+        # A path can be BOTH a rename source and a creation target ("replace
+        # index.html with a new page, archive the old ones"). Its clear blocks
+        # were dropped above; only empty-SEARCH create blocks remain -- treat
+        # that as an overwrite creation rather than falling into the match
+        # loop below, which would fail against text the model never quoted.
+        leftover_creators = [e for e in group if not e.search.strip()]
+        if leftover_creators and len(leftover_creators) == len(group):
+            original = None
+            if path.is_file():
+                original, _sty = fileio.read(path, errors="replace")
+            text = "\n".join(e.replace for e in leftover_creators)
+            if text and not text.endswith("\n"):
+                text += "\n"
+            path.parent.mkdir(parents=True, exist_ok=True)
+            note = f"created with {len(text.splitlines())} line(s)"
+            if original is not None:
+                note = f"replaced contents ({len(original.splitlines())} -> {len(text.splitlines())} line(s))"
+            if srcs:
+                note += (" -- renamed from " + ", ".join(srcs) +
+                        " (the moved contents are appended after the new "
+                        "text; the old paths are removed)")
+            results.append(_finish(rel, path, original, text, None, note,
+                                   renames_from=srcs))
+            continue
+
         exists = path.exists()
         if not exists:
-            # New-file creation: only empty-SEARCH blocks can do it. After
-            # merge_duplicate_files every path is one group, so a multi-block
-            # group here means the model wrote several non-empty searches
-            # against a file that isn't in the tree -- a failed edit, not a
-            # creation. Fuzzy matching does not apply: with no existing
-            # content there is nothing to be similar to. The message must say
-            # which case it is, because "file not found" alone invites the
-            # model to answer by *renaming* files -- and Pedacito has no
-            # rename operation (see the note below).
-            creators = [e for e in group if not e.search.strip()]
-            if not creators or len(creators) != len(group):
+            # New-file creation works on the *raw* blocks, before duplicate
+            # headers were concatenated: a model that re-emits the same
+            # `--- FILE:` header for each block leaves merged bodies glued
+            # together ("\n" + new content), which would otherwise be written
+            # with a stray leading blank line. Only empty-SEARCH blocks can
+            # create; a group mixing them with real searches is a failed edit
+            # against a file that isn't in the tree. Fuzzy matching does not
+            # apply here: with no existing content there is nothing to be
+            # similar to. The message must say which case it is, because
+            # "file not found" alone invites the model to answer by renaming
+            # files -- and Pedacito only honours that intent when the clear
+            # blocks match (see rename detection above).
+            raw = groups.get(rel, group)
+            creators = [e for e in raw if not e.search.strip()]
+            if not creators or len(creators) != len(raw):
                 hint = ""
                 if path.parent.is_dir():
                     try:
@@ -495,16 +621,15 @@ def apply_edits(root: Path, edits: list[Edit], backup: bool = True,
                     "whose REPLACE is empty -- Pedacito will move the real "
                     "contents and remove the old file." + hint))
                 continue
-            text = "\n".join(e.replace for e in group)
+            text = "\n".join(e.replace for e in creators)
             if text and not text.endswith("\n"):
                 text += "\n"
             path.parent.mkdir(parents=True, exist_ok=True)
-            srcs = tuple(o for o, n in renames.items() if n == rel)
             note = f"created with {len(text.splitlines())} line(s)"
             if srcs:
                 note += (" -- renamed from " + ", ".join(srcs) +
-                        " (the new file gets its current contents; the old "
-                        "path is removed)")
+                        " (the new file gets their current contents; the old "
+                        "paths are removed)")
             results.append(_finish(rel, path, None, text, None, note,
                                    renames_from=srcs))
             continue
