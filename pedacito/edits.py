@@ -411,16 +411,54 @@ def apply_edits(root: Path, edits: list[Edit], backup: bool = True,
     renames: dict[str, str] = {}             # cleared rel -> created rel
     if cfg is None or getattr(cfg, "allow_rename", True):
         used: set[str] = set()
-        for old in sorted(removers):
+        def _stem(rel: str) -> str:
+            """Path without the final extension, for same-basename pairing."""
+            return str(Path(rel).with_suffix("")).lower()
+
+        def _pair_score(old: str, new: str) -> int:
+            """Rank candidate pairings; -1 rejects a pair. Same directory is
+            the strongest signal (a rename almost always stays in place),
+            then same basename stem (sentences.js -> palabras.js scores 0 but
+            prep/index.html -> conversaciones/index.html must not win just by
+            alphabetical order of the target path)."""
+            if Path(old).parent == Path(new).parent:
+                return 2
+            if _stem(old) == _stem(new):
+                return 1
+            return 0
+
+        def _pair(old: str, cands: list[str]):
+            scored = [(s, n) for n in cands if (s := _pair_score(old, n)) >= 0]
+            if not scored:
+                return None
+            scored.sort(key=lambda t: (-t[0], t[1]))
+            return scored[0][1]
+
+        # Pass 1: same-directory pairs first -- they are unambiguous.
+        rem_list, cre_list = sorted(removers), sorted(creators)
+        for old in rem_list:
             suffix = Path(old).suffix.lower()
-            for new in sorted(creators):
-                if new == old or new in used:
-                    continue
-                if Path(new).suffix.lower() != suffix:
-                    continue
+            cand = [n for n in cre_list if n != old and n not in used
+                    and Path(n).suffix.lower() == suffix
+                    and Path(n).parent == Path(old).parent]
+            if cand:
+                new = min(cand)
                 renames[old] = new
                 used.add(new)
-                break
+        # Pass 2: remaining sources pair with remaining targets by stem, then
+        # nearest common parent, then plain name order.
+        for old in rem_list:
+            if old in renames:
+                continue
+            suffix = Path(old).suffix.lower()
+            cand = [n for n in cre_list if n != old and n not in used
+                    and Path(n).suffix.lower() == suffix]
+            if not cand:
+                continue
+            new = _pair(old, cand)
+            if new:
+                renames[old] = new
+                used.add(new)
 
     # Now fold repeated headers into one group per path for application.
     # Rename sources lose their clear blocks: live, they would fail to match
@@ -514,7 +552,7 @@ def apply_edits(root: Path, edits: list[Edit], backup: bool = True,
         sha = hashlib.sha256(moved_original.encode("utf-8")).hexdigest()
         if dry_run:
             return Result(True, rel, note + " (dry run)", diff, moved_original,
-                          text, sha, fuzzy=fuzzy)
+                          text, sha, fuzzy=fuzzy, renames_from=tuple(renames_from))
 
         if backup and original is not None:
             if backup_dir is not None:
@@ -577,12 +615,22 @@ def apply_edits(root: Path, edits: list[Edit], backup: bool = True,
             note = f"created with {len(text.splitlines())} line(s)"
             if original is not None:
                 note = f"replaced contents ({len(original.splitlines())} -> {len(text.splitlines())} line(s))"
+            srcs_now = ()
             if srcs:
-                note += (" -- renamed from " + ", ".join(srcs) +
-                        " (the moved contents are appended after the new "
-                        "text; the old paths are removed)")
+                # Only claim a rename if the source still exists at apply
+                # time; otherwise _finish's read fails silently and the note
+                # would promise a move that never happens.
+                srcs_now = tuple(o for o in srcs if (root_resolved / o).is_file())
+                gone = [o for o in srcs if o not in srcs_now]
+                if srcs_now:
+                    note += (" -- renamed from " + ", ".join(srcs_now) +
+                            " (the moved contents are appended after the new "
+                            "text; the old paths are removed)")
+                if gone:
+                    note += (" [already absent, nothing to move: " +
+                             ", ".join(gone) + "]")
             results.append(_finish(rel, path, original, text, None, note,
-                                   renames_from=srcs))
+                                   renames_from=srcs_now))
             continue
 
         exists = path.exists()
@@ -626,12 +674,20 @@ def apply_edits(root: Path, edits: list[Edit], backup: bool = True,
                 text += "\n"
             path.parent.mkdir(parents=True, exist_ok=True)
             note = f"created with {len(text.splitlines())} line(s)"
+            srcs_now = ()
             if srcs:
-                note += (" -- renamed from " + ", ".join(srcs) +
-                        " (the new file gets their current contents; the old "
-                        "paths are removed)")
+                # Same existence guard as the overwrite branch above.
+                srcs_now = tuple(o for o in srcs if (root_resolved / o).is_file())
+                gone = [o for o in srcs if o not in srcs_now]
+                if srcs_now:
+                    note += (" -- renamed from " + ", ".join(srcs_now) +
+                            " (the new file gets their current contents; the "
+                            "old paths are removed)")
+                if gone:
+                    note += (" [already absent, nothing to move: " +
+                             ", ".join(gone) + "]")
             results.append(_finish(rel, path, None, text, None, note,
-                                   renames_from=srcs))
+                                   renames_from=srcs_now))
             continue
 
         # LF-normalised for matching; style remembered so the file is written
