@@ -518,7 +518,7 @@ class LMStudio:
 
     # --------------------------------------------------------------- helpers
     def chat_json(self, messages: list[dict], schema: dict, max_tokens: int,
-                  retries: int = 2) -> dict:
+                  retries: int = 2, cap: int | None = None) -> dict:
         """Send a grammar-constrained chat request and return the parsed
         JSON object.
 
@@ -529,6 +529,14 @@ class LMStudio:
         """
         last = ""
         budget = max_tokens
+        # Ceiling for truncation-retry escalation. Default is NOT a hard
+        # 2000 -- it is derived from the caller's own config (reserve /
+        # answer budgets), so raising max_tokens_step or reserve_tokens in
+        # the profile actually raises this limit too.
+        if cap is None:
+            cap = max(2048, self.cfg.reserve_tokens, self.cfg.max_tokens_answer,
+                      max_tokens * 4)
+        cap = max(cap, max_tokens)
         for attempt in range(retries + 1):
             raw = self.chat(messages, max_tokens=budget, schema=schema)
             last = raw
@@ -560,9 +568,16 @@ class LMStudio:
                                   "the partial reply]", file=sys.stderr)
                             return obj
                 if truncated:
-                    budget = min(budget * 2, 2000)
-                    print(f"[reply was cut off at the token limit; retrying with "
-                          f"max_tokens={budget}]", file=sys.stderr)
+                    nxt = min(budget * 2, cap)
+                    if nxt > budget:
+                        budget = nxt
+                        print(f"[reply was cut off at the token limit; retrying "
+                              f"with max_tokens={budget}] ", file=sys.stderr)
+                    else:
+                        print(f"[reply was cut off at the token limit and "
+                              f"max_tokens is already at the ceiling "
+                              f"({budget}); raising it further in your config]",
+                              file=sys.stderr)
                     continue
                 messages = messages + [
                     {"role": "assistant", "content": raw},
@@ -573,11 +588,11 @@ class LMStudio:
         if self.last_finish_reason == "length":
             raise LLMError(
                 f"The model kept running past the token limit before finishing its "
-                f"JSON (tried up to max_tokens={budget}).\n"
-                "  It is writing an essay in the 'reasoning' field. Raise "
-                "max_tokens_step in your\n"
-                "  config, or use a model that follows the 'under 15 words' "
-                "instruction better.\n"
+                f"JSON (tried up to max_tokens={budget}, ceiling {cap}).\n"
+                "  Either it is writing an essay in the 'reasoning' field, or a\n"
+                "  'content'/'replacement' block is longer than one step budget.\n"
+                "  Raise max_tokens_step (and/or reserve_tokens) in your active\n"
+                "  profile -- the ceiling follows those settings, it is not fixed.\n"
                 f"  Last partial reply: {last[-160:]}")
         raise LLMError(
             f"Model would not produce valid JSON after {retries + 1} tries.\n"
