@@ -384,16 +384,17 @@ def _run_task(task: str, apply_now: bool) -> None:
                 # user sees a blank review and no way to tell whether the
                 # agent lacked ability or lacked evidence.
                 unread = list(getattr(agent, "_unread_files", []) or [])
-                for f in getattr(agent, "_unvisited_files", lambda g: [])(
-                        gathered.split("\n\n") if gathered else []):
-                    if f.lower() not in [u.split(" ")[0].lower() for u in unread]:
-                        unread.append(f)
                 if unread:
                     note = ("No review: the model answered without proposing any "
                             "edits -- it never `read` the files it would need to "
                             "change: " + ", ".join(unread[:5]) +
                             ". Raise max_steps so gathering has room to cover "
                             "them.")
+                elif not getattr(agent, "read_any", True):
+                    note = ("No review: the model answered without proposing any "
+                            "edits -- every lookup during gathering failed, so "
+                            "it never saw any source text. Check the step log "
+                            "for bad paths or line ranges.")
                 else:
                     note = ("No review: the model answered without proposing "
                             "any edits.")
