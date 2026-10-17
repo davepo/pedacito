@@ -702,29 +702,61 @@ class _Handler(BaseHTTPRequestHandler):
 
 
 def write_files(root: Path, diffs: list[FileDiff], backup_dir: Path | None):
-    """Write the reviewed text for every FileDiff to disk, refusing the
-    whole operation if any file has changed (or been deleted) since the
-    preview's sha was recorded. Backs up originals to `backup_dir` first if
-    given. Returns (ok, message)."""
+    """Write the reviewed text for every FileDiff to disk.
+
+    Two passes for safety. Pass one refuses the whole operation if any file
+    that already exists has changed (or vanished) since the preview's sha was
+    recorded -- but a diff whose target is *absent* with an empty pinned sha
+    is a new-file creation (apply_edits records sha256 of ""), so its absence
+    is expected and not stale. Pass two writes, refusing again on a collision:
+    if a path from a creation diff now exists with different bytes, something
+    else created it while the review page sat open, and overwriting it
+    silently would destroy those contents. Backs up originals to `backup_dir`
+    first when given. Returns (ok, message)."""
+    def _digest(p: Path) -> str:
+        return hashlib.sha256(fileio.read_text(p, errors="replace")
+                              .encode("utf-8")).hexdigest()
+
+    EMPTY_SHA = hashlib.sha256(b"").hexdigest()
+    if not diffs:
+        # An empty diff list means every block failed to anchor; applying
+        # "successfully" here would silently write nothing.
+        return False, ("Not written: this review contains no applicable "
+                       "changes. Re-run the task to rebuild the review.")
     stale = []
     for fd in diffs:
         p = root / fd.rel
         if not p.exists():
-            stale.append(f"{fd.rel} (deleted)")
+            if fd.sha and fd.sha != EMPTY_SHA:
+                stale.append(f"{fd.rel} (deleted)")
             continue
-        current = hashlib.sha256(fileio.read_text(p, errors="replace")
-                                 .encode("utf-8")).hexdigest()
-        if current != fd.sha:
+        current = _digest(p)
+        # A creation diff pins the empty string's digest; anything else pins
+        # real pre-edit bytes. If the bytes on disk now equal what the preview
+        # intends to write, the edit is already applied -- not stale.
+        if current != fd.sha and current != hashlib.sha256(
+                fd.after_text.encode("utf-8")).hexdigest():
             stale.append(f"{fd.rel} (changed on disk)")
     if stale:
         return False, ("Not written: " + ", ".join(stale) +
                        ". Re-run the task to rebuild the review.")
 
+    # Collision check before touching disk: a creation whose path appeared in
+    # the meantime must not be clobbered.
+    for fd in diffs:
+        p = root / fd.rel
+        if not fd.sha and p.exists() and _digest(p) != hashlib.sha256(
+                fd.after_text.encode("utf-8")).hexdigest():
+            return False, (f"Not written: {fd.rel} was created by something "
+                           "else while this review was open. Re-run the task "
+                           "to rebuild the review.")
+
     written = []
     for fd in diffs:
         p = root / fd.rel
+        exists_before = p.exists()
         original, style = fileio.read(p, errors="replace")
-        if backup_dir is not None:
+        if backup_dir is not None and exists_before:
             dest = backup_dir / fd.rel
             dest.parent.mkdir(parents=True, exist_ok=True)
             fileio.write(dest, original, style)

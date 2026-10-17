@@ -49,9 +49,18 @@ BLOCK_RE = re.compile(
     r"---\s*FILE:\s*(?P<file>[^\n]+?)\s*\n"
     r"[^\n]*<{5,}\s*SEARCH[^\n]*\n"
     r"(?P<search>.*?)"
-    r"={5,}[^\n]*\n"
-    r"(?P<replace>.*?)"
-    r"\n>{5,}\s*REPLACE",
+    # The separator is `=======` at the end of what it consumed: optionally
+    # one newline plus trailing spaces/tabs. `[^\n]*` here used to let the
+    # REPLACE body leak into the separator line when a model wrote `=======`
+    # directly above `>>>>>>> REPLACE` (an empty replacement), silently
+    # dropping whole edit blocks.
+    r"={5,}[ \t]*(?:\n[ \t]*)?"
+    # The replace body may be empty too: with no newline after the separator
+    # the closer sits on the very next line (`>{5,}` after `\n?`). A negative
+    # look-ahead keeps the group from swallowing the next block's header when
+    # two blocks sit adjacent.
+    r"(?P<replace>(?:(?!-{3}\s*FILE:).)*?)"
+    r"\n?>{5,}\s*REPLACE",
     re.DOTALL,
 )
 
@@ -152,10 +161,45 @@ def parse_edits(text: str) -> list[Edit]:
     # A fence line blanked by the stripper can leave the header glued to the
     # line above it; make sure every header starts its own line.
     cleaned = re.sub(r"(?<!\n)(---\s*FILE:)", r"\n\1", cleaned)
-    return [
-        Edit(fileio.normalise_rel(m.group("file")), m.group("search"), m.group("replace"))
-        for m in BLOCK_RE.finditer(cleaned)
-    ]
+    edits = []
+    for m in BLOCK_RE.finditer(cleaned):
+        search, replace = m.group("search"), m.group("replace")
+        # The separator/closer may sit on the same line as the last body line
+        # (an empty replacement writes `=======` straight onto
+        # `>>>>>>> REPLACE`). Drop exactly one trailing newline so a normal
+        # block keeps its historical "no trailing newline" semantics while an
+        # empty replacement stays empty instead of becoming "\n".
+        if search.endswith("\n"):
+            search = search[:-1]
+        if replace.endswith("\n"):
+            replace = replace[:-1]
+        edits.append(Edit(fileio.normalise_rel(m.group("file")), search, replace))
+    return edits
+
+
+def merge_duplicate_files(edits: list[Edit]) -> list[Edit]:
+    """Fold blocks that repeat the same `--- FILE:` header into one group.
+
+    Small models habitually re-emit a file's header instead of appending a
+    second block under it, and separate passes over one path are unsafe in
+    both directions: in dry-run (review) mode each pass computes its diff
+    from the *original* text, so the review page shows only the last version
+    and `write_files` refuses with a misleading "(deleted)" or "(changed on
+    disk)"; live, a creation block can run before an edit block for the same
+    path and clobber what was just created. Concatenating the bodies keeps
+    every intent in reply order -- empty SEARCH sections included.
+    """
+    seen: dict[str, int] = {}
+    merged: list[Edit] = []
+    for e in edits:
+        if e.file in seen:
+            prev = merged[seen[e.file]]
+            prev.search += "\n" + e.search
+            prev.replace += "\n" + e.replace
+        else:
+            seen[e.file] = len(merged)
+            merged.append(e)
+    return merged
 
 
 # --------------------------------------------------------------------------
@@ -299,8 +343,12 @@ def apply_edits(root: Path, edits: list[Edit], backup: bool = True,
     the working tree unexpectedly.
     """
     results: list[Result] = []
+    # Fold repeated FILE headers into one group per path before anything
+    # else: two independent passes over one file each diff against the
+    # original text (breaking the review flow) and, live, a creation block
+    # can clobber -- or be clobbered by -- an edit block for the same path.
     by_file: dict[str, list[Edit]] = {}
-    for e in edits:
+    for e in merge_duplicate_files(edits):
         by_file.setdefault(e.file, []).append(e)
 
     root_resolved = Path(root).resolve()
@@ -360,17 +408,36 @@ def apply_edits(root: Path, edits: list[Edit], backup: bool = True,
 
         exists = path.exists()
         if not exists:
-            # New-file creation: only an empty-SEARCH block can do it, and a
-            # single one per file -- several blocks would have no anchor to
-            # build on. Everything else keeps the old clean error so the
-            # repair loop can feed it back to the model. Fuzzy matching does
-            # not apply: with no existing content there is nothing to be
-            # similar to.
-            first = group[0]
-            if len(group) != 1 or first.search.strip():
-                results.append(Result(False, rel, "file not found"))
+            # New-file creation: only empty-SEARCH blocks can do it. After
+            # merge_duplicate_files every path is one group, so a multi-block
+            # group here means the model wrote several non-empty searches
+            # against a file that isn't in the tree -- a failed edit, not a
+            # creation. Fuzzy matching does not apply: with no existing
+            # content there is nothing to be similar to. The message must say
+            # which case it is, because "file not found" alone invites the
+            # model to answer by *renaming* files -- and Pedacito has no
+            # rename operation (see the note below).
+            creators = [e for e in group if not e.search.strip()]
+            if not creators or len(creators) != len(group):
+                hint = ""
+                if path.parent.is_dir():
+                    try:
+                        near = sorted(p.name for p in path.parent.iterdir()
+                                      if p.is_file())[:8]
+                    except OSError:
+                        near = []
+                    if near:
+                        hint = f" Files here: {', '.join(near)}."
+                results.append(Result(
+                    False, rel,
+                    "no edit matched: this path does not exist yet. To CREATE "
+                    "the file, emit exactly one block for it with an EMPTY "
+                    "SEARCH section (between <<<<<<< SEARCH and =======). "
+                    "Pedacito cannot rename or move files -- to 'rename', "
+                    "create the new path with an empty-SEARCH block and delete "
+                    "the old file's contents yourself." + hint))
                 continue
-            text = first.replace
+            text = "\n".join(e.replace for e in group)
             if text and not text.endswith("\n"):
                 text += "\n"
             path.parent.mkdir(parents=True, exist_ok=True)

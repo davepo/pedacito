@@ -273,8 +273,29 @@ class Agent:
         return results, reply
 
     def _apply_once(self, reply: str, dry_run: bool, backup_dir=None) -> list:
-        """One parse-and-apply pass, with no repair round-trip."""
-        return apply_edits(self.index.root, parse_edits(reply),
+        """One parse-and-apply pass, with no repair round-trip.
+
+        Duplicate FILE headers for the same path are merged into a single
+        group before applying. Without this, two blocks naming one file run as
+        independent passes: in dry-run (review) mode each computes its diff
+        from the *original* text, so the review page shows only the last
+        version and `write_files` -- which refuses when any target's bytes on
+        disk differ from the sha recorded at preview time -- fails the earlier
+        ones with a misleading "(deleted)" or "(changed on disk)". Merging is
+        also correct live: the second block then anchors against the first's
+        replacement instead of failing to match text that was already changed.
+        """
+        edits = parse_edits(reply)
+        seen: dict[str, int] = {}
+        merged: list = []
+        for e in edits:
+            if e.file in seen:
+                merged[seen[e.file]].search += "\n" + e.search
+                merged[seen[e.file]].replace += "\n" + e.replace
+            else:
+                seen[e.file] = len(merged)
+                merged.append(e)
+        return apply_edits(self.index.root, merged,
                            backup=self.cfg.backup, dry_run=dry_run,
                            backup_dir=backup_dir, cfg=self.cfg)
 
