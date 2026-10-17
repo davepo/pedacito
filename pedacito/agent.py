@@ -42,6 +42,187 @@ from .tools import STEP_SCHEMA, TOOL_HELP, dispatch
 # exactly one more lookup and only while real coverage gaps remain.
 _MAX_STEPS_CEIL = 40
 
+# Matches the first line of a successful tool_read observation:
+#   "prep/index.html lines 315-325:"
+# Used for the read-span ledger and the eviction pass below. The path may
+# contain spaces; the numbers never do, so the regex is unambiguous.
+import re as _re_mod
+
+_READ_HEAD_RX = _re_mod.compile(r"^(.+?) lines (\d+)-(\d+):")
+
+
+def _first_seen_spans(spans_by_file: dict[str, list[tuple[int, int]]]
+                      ) -> dict[str, list[tuple[int, int]]]:
+    """Replay each file's read spans in step order and return, per file, the
+    set of (start, end) sub-spans that were NEW when they were first shown."""
+    out: dict[str, list[tuple[int, int]]] = {}
+    for key, seq in spans_by_file.items():
+        seen: list[tuple[int, int]] = []
+        deltas: list[tuple[int, int]] = []
+        for s, e in seq:
+            # Lines already covered by earlier reads of this file.
+            uncovered = [(s, e)]
+            for a, b in seen:
+                nxt = []
+                for cs, ce in uncovered:
+                    if b < cs or a > ce:          # no overlap
+                        nxt.append((cs, ce))
+                        continue
+                    if cs < a:
+                        nxt.append((cs, a - 1))
+                    if ce > b:
+                        nxt.append((b + 1, ce))
+                uncovered = nxt
+            for cs, ce in uncovered:
+                deltas.append((cs, ce))
+            merged = sorted(seen + [(s, e)])
+            folded: list[tuple[int, int]] = []
+            for a, b in merged:
+                if folded and a <= folded[-1][1] + 1:
+                    folded[-1] = (folded[-1][0], max(folded[-1][1], b))
+                else:
+                    folded.append((a, b))
+            seen = folded
+        if deltas:
+            out[key] = deltas
+    return out
+
+
+def _slice_numbered(obs: str, keep: list[tuple[int, int]]) -> str:
+    """Given a tool_read observation ("rel lines a-b:\\nNNN | text..."),
+    return the same observation narrowed to the numbered lines whose numbers
+    fall inside `keep` spans. Falls back to the original text if anything
+    about the format is unexpected -- correctness of the header matters more
+    than savings here."""
+    m = _READ_HEAD_RX.match(obs)
+    if not m:
+        return obs
+    head_end = obs.index("\n") if "\n" in obs else len(obs)
+    head, body = obs[:head_end], obs[head_end + 1:]
+    kept: list[str] = []
+    for ln in body.split("\n"):
+        pm = _re_mod.match(r"\s*(\d+) \|", ln)
+        if not pm:
+            kept.append(ln)     # trailing note lines ([truncated...] etc.)
+            continue
+        n = int(pm.group(1))
+        if any(a <= n <= b for a, b in keep):
+            kept.append(ln)
+    if not kept:
+        return f"{m.group(1).strip()} lines {m.group(2)}-{m.group(3)}: [all of these lines were duplicates of an earlier read]"
+    return head + "\n" + "\n".join(kept)
+
+
+def _delta_len(obs: str, prior_spans: list[tuple[int, int]]) -> int:
+    """Length of the NEW part of a read observation: the numbered lines not
+    already covered by `prior_spans`. Used to charge max_gathered_chars per
+    new byte, so re-reads of the same region cost nothing."""
+    m = _READ_HEAD_RX.match(obs)
+    if not m:
+        return len(obs)
+    head_end = obs.index("\n") if "\n" in obs else len(obs)
+    body = obs[head_end + 1:]
+    total = 0
+    for ln in body.split("\n"):
+        pm = _re_mod.match(r"\s*(\d+) \|", ln)
+        if not pm or not any(a <= int(pm.group(1)) <= b for a, b in prior_spans):
+            total += len(ln) + 1
+    return total
+
+
+def _evict_duplicate_reads(messages: list[dict], gathered: list[str],
+                           spans: dict[str, list[tuple[int, int]]]) -> list[str]:
+    """Rewrite duplicate source out of the conversation and the SOURCE block.
+
+    A small model covering a big file re-reads it in overlapping chunks
+    (L1-685 then L401-685), and every RESULT turn carried its full text. By
+    the time gathering ends the live conversation holds several copies of
+    the same lines -- which blows the *server's* context window even when
+    our own budget math says there is room, and makes the answer phase
+    process the same code two or three times.
+
+    Each read's RESULT turn is rewritten down to the lines it was the FIRST
+    to show (earlier turns keep theirs; later turns lose the overlap). The
+    gathered SOURCE items are rebuilt from the same deltas so the answer
+    prompt sees every line exactly once. Returns the new item list.
+    """
+    if not spans or not any(len(seq) > 1 for seq in spans.values()):
+        return gathered
+    deltas = _first_seen_spans(spans)
+
+    # Rebuild the SOURCE items: reads keep only their first-seen lines.
+    new_items: list[str] = []
+    for g in gathered:
+        head = g.split("\n", 1)[0]
+        if head.startswith("--- read ") and "\n" in g:
+            rest = head[len("--- read "):].strip()
+            key = rest.rsplit(" L", 1)[0].strip().lower()
+            body = g.split("\n", 1)[1]
+            keep = deltas.get(key)
+            if keep is None:
+                new_items.append(g)
+            else:
+                new_items.append(head + "\n" + _slice_numbered(body, keep))
+        else:
+            new_items.append(g)
+
+    # Rewrite RESULT turns in the live conversation, oldest -> newest, so
+    # each turn keeps only the lines no earlier turn had already shown.
+    for i, msg in enumerate(messages):
+        if msg["role"] != "user" or not msg["content"].startswith("RESULT:\n"):
+            continue
+        content = msg["content"]
+        body = content[len("RESULT:\n"):]
+        m = _READ_HEAD_RX.match(body)
+        if not m:
+            continue
+        key = m.group(1).strip().lower()
+        s_, e_ = int(m.group(2)), int(m.group(3))
+        # Spans of this same file shown by EARLIER turns only.
+        prior = _fold_spans(_turn_spans(messages[:i], key))
+        uncovered = [(s_, e_)]
+        for a, b in prior:
+            nxt = []
+            for cs, ce in uncovered:
+                if b < cs or a > ce:
+                    nxt.append((cs, ce))
+                    continue
+                if cs < a:
+                    nxt.append((cs, a - 1))
+                if ce > b:
+                    nxt.append((b + 1, ce))
+            uncovered = nxt
+        if uncovered == [(s_, e_)]:
+            continue          # this turn showed nothing that came before it
+        trimmed = _slice_numbered(body, uncovered) if uncovered else \
+            f"{m.group(1).strip()} lines {s_}-{e_}: [duplicate of an earlier read; nothing new]"
+        messages[i] = {"role": "user", "content": "RESULT:\n" + trimmed}
+    return new_items
+
+
+def _turn_spans(messages: list[dict], key: str) -> list[tuple[int, int]]:
+    """All (start, end) spans for `key` shown by RESULT turns so far."""
+    out = []
+    for msg in messages:
+        if msg["role"] != "user" or not msg["content"].startswith("RESULT:\n"):
+            continue
+        m = _READ_HEAD_RX.match(msg["content"][len("RESULT:\n"):])
+        if m and m.group(1).strip().lower() == key:
+            out.append((int(m.group(2)), int(m.group(3))))
+    return out
+
+
+def _fold_spans(spans: list[tuple[int, int]]) -> list[tuple[int, int]]:
+    """Merge a list of possibly-overlapping (start, end) spans."""
+    folded: list[tuple[int, int]] = []
+    for a, b in sorted(spans):
+        if folded and a <= folded[-1][1] + 1:
+            folded[-1] = (folded[-1][0], max(folded[-1][1], b))
+        else:
+            folded.append((a, b))
+    return folded
+
+
 GATHER_BASE = f"""\
 You are a code assistant working through a lookup index of a Python project.
 You cannot see the full source. You see a map of it, and you request the exact
@@ -163,6 +344,11 @@ class Agent:
         did_read = False
         nudged = False
         read_nudged = False
+        # Successful reads only, as (rel_lower, start, end). Coverage checks
+        # must count ONLY real source the model saw -- a grep hit or an ERROR
+        # line does not let it quote the file, and counting those as coverage
+        # is how a task ends with "answered without proposing any edits".
+        self._read_spans: dict[str, list[tuple[int, int]]] = {}
         # max_steps is a wall-clock guardrail against loops, not a coverage
         # budget. When the model says `done` but files the task names were
         # never read, one more lookup is cheaper than a guaranteed-failed
@@ -171,8 +357,19 @@ class Agent:
         step_cap = self.cfg.max_steps
         # Files the task text names but no `read` has covered yet; refreshed
         # after every successful read so the `done` nudge can act on it.
-        self._unread_files: list[str] = self._compute_unread(task, gathered)
+        self._unread_files: list[str] = self._compute_unread(task)
+        # The gathered-source ceiling is charged per NEW byte, not per echoed
+        # byte: a re-read of lines already in context costs nothing, so a
+        # small model bouncing over the same big file cannot exhaust the
+        # budget before it reaches the code it must edit.
         budget = self.cfg.max_gathered_chars
+        # Per-file line ledger: every read appends its (start, end) span here
+        # in step order. The eviction pass at the end of the loop replays the
+        # same sequence to work out which lines each RESULT turn was the first
+        # to show -- so the bookkeeping during the loop stays dead simple and
+        # a re-read costs nothing against max_gathered_chars.
+        spans: dict[str, list[tuple[int, int]]] = {}
+        self._read_spans = spans   # coverage truth for _compute_unread
 
         def nudge(step: int) -> str:
             """Text appended to a turn reminding the model how many lookups
@@ -209,11 +406,7 @@ class Agent:
 
             if action == "done":
                 missing = list(self._unread_files)
-                for f in self._unvisited_files(gathered):
-                    if f.lower() not in [t.split(" ")[0].lower() for t in missing]:
-                        missing.append(f)
-                can_extend = (step_cap < _MAX_STEPS_CEIL and len(gathered) > 1
-                              and budget > 0)
+                can_extend = (step_cap < _MAX_STEPS_CEIL and budget > 0)
                 if missing and (step < self.cfg.max_steps or can_extend):
                     # The model gathered on some files but wants to change
                     # others it never `read`. Its answer rules forbid quoting
@@ -263,36 +456,23 @@ class Agent:
                         print("  (no source read yet; asking it to read before "
                               "answering)", file=sys.stderr)
                     continue
-                if not gathered and step < step_cap:
-                    # A `done` whose every lookup failed to produce anything
-                    # usable (bad line range, unresolvable file, ...) would end
-                    # the loop with an empty SOURCE section, and the answer
-                    # phase can only refuse -- which surfaces as a blank review
-                    # page ("the model answered without proposing any edits").
-                    # Tell it what went wrong so it can pick a real range.
-                    # Only fires when nothing succeeded at all; a mix of one
-                    # good read and some failures is normal navigation noise.
-                    nudged = True
-                    last_err = next((g for g in gathered if " failed: " in g), None)
-                    detail = (f"Your last result said: {last_err}\n" if last_err else "")
-                    messages.append({"role": "assistant", "content": _compact(stepjson)})
-                    messages.append({"role": "user", "content":
-                        "None of your lookups returned any source, so you still "
-                        "cannot see the code you want to change. " + detail +
-                        "`read` the exact lines you need (ranges come from the "
-                        "map or an outline), then say done."})
-                    if verbose:
-                        print("  (all lookups failed; asking it to read real "
-                              "lines before answering)", file=sys.stderr)
-                    continue
                 break
 
             obs = dispatch(self.index, self.cfg, stepjson)
             if action == "read" and not obs.startswith("ERROR"):
                 did_read = True
-                # Re-check which task-named files are still unseen, so the
-                # `done` nudge below has current coverage data.
-                self._unread_files = self._compute_unread(task, gathered)
+                # Append-only span ledger. The eviction pass at the end of
+                # the loop replays these spans in order to work out which
+                # lines each RESULT turn was the first to show -- so a
+                # re-read costs nothing against max_gathered_chars and the
+                # conversation cannot fill itself with duplicate copies of
+                # the same file.
+                m = _READ_HEAD_RX.match(obs)
+                if m:
+                    key = m.group(1).strip().lower()
+                    spans.setdefault(key, []).append(
+                        (int(m.group(2)), int(m.group(3))))
+                self._unread_files = self._compute_unread(task)
             # An ERROR observation is navigation feedback ("that range does
             # not exist"), not source. Carrying it into the answer prompt as
             # gathered text makes the SOURCE section look populated while it
@@ -301,14 +481,31 @@ class Agent:
             # blank review page. Record failures compactly instead.
             if obs.startswith("ERROR"):
                 arg = stepjson.get("file") or stepjson.get("pattern") or stepjson.get("symbol") or ""
-                gathered.append(f"--- {action} {arg} failed: {obs[:160]}")
+                item = f"--- {action} {arg} failed: {obs[:160]}"
+                gathered.append(item)
                 messages.append({"role": "assistant", "content": _compact(stepjson)})
                 messages.append({"role": "user",
                                  "content": f"{obs}\n\n{nudge(step + 1)}"})
                 continue
-            if len(obs) > budget:
-                obs = obs[:budget] + "\n[truncated: context budget reached]"
-            budget -= len(obs)
+            # Charge the gather budget by NEW LINES ONLY. A re-read of lines
+            # already in context costs nothing here -- otherwise a small model
+            # bouncing over one big file exhausts max_gathered_chars before it
+            # reaches the code it must edit, and the loop cuts to the answer
+            # phase mid-gather. The RESULT turn still shows the full read (the
+            # eviction pass at the end of the loop dedups the conversation).
+            if action == "read" and _READ_HEAD_RX.match(obs):
+                k0 = _READ_HEAD_RX.match(obs).group(1).strip().lower()
+                prior = [sp for sp in spans.get(k0, [])[:-1]]
+                delta = _delta_len(obs, prior)
+                if delta > budget:
+                    obs = obs[:budget] + "\n[truncated: context budget reached]"
+                    budget = 0
+                else:
+                    budget -= delta
+            else:
+                if len(obs) > budget:
+                    obs = obs[:budget] + "\n[truncated: context budget reached]"
+                budget -= len(obs)
 
             arg = stepjson.get("file") or stepjson.get("pattern") or stepjson.get("symbol")
             if action == "outline":
@@ -316,10 +513,11 @@ class Agent:
                 # decide what to read; the answer phase needs the code it read.
                 # Carrying a 2,400-token outline into the answer prompt is pure
                 # waste, so record only that it happened.
-                gathered.append(f"--- outline {arg} (used for navigation; "
-                                f"{len(self.index.in_file(self.index.resolve_file(arg) or ''))} units)")
+                item = (f"--- outline {arg} (used for navigation; "
+                        f"{len(self.index.in_file(self.index.resolve_file(arg) or ''))} units)")
             else:
-                gathered.append(f"--- {action} {arg}\n{obs}")
+                item = f"--- {action} {arg}\n{obs}"
+            gathered.append(item)
 
             messages.append({"role": "assistant", "content": _compact(stepjson)})
             messages.append({"role": "user",
@@ -331,7 +529,18 @@ class Agent:
                 break
 
         self.read_any = did_read
-        return "\n\n".join(gathered)
+        # Eviction pass. The dedup rule above charges the gather budget by
+        # NEW bytes only -- but until this pass every RESULT turn still
+        # carried its full text, so a model that re-reads a big file in
+        # overlapping chunks leaves multiple copies sitting in the live
+        # conversation. On a 9B/14B with an 8k-32k window that is how the
+        # *server* runs out of context mid-task even though our own budget
+        # says there is room. Rewrite each read's RESULT turn down to the
+        # lines it was the first to show, and rebuild the SOURCE section
+        # from those same deltas so the answer phase sees each line exactly
+        # once.
+        new_items = _evict_duplicate_reads(messages, gathered, spans)
+        return "\n\n".join(new_items)
 
     # ------------------------------------------------------ coverage bookkeeping
     def _task_file_targets(self, task: str) -> set[str]:
@@ -349,13 +558,19 @@ class Agent:
                 out.add(t.lower().lstrip("./"))
         return out
 
-    def _compute_unread(self, task: str, gathered: list[str]) -> list[str]:
+    def _compute_unread(self, task: str) -> list[str]:
         """Files the task names but no successful `read` covered.
 
-        Returns entries like "prep/sentences.js (not yet read -- it has ~120
-        lines, use start=1 end=120)" so the nudge can carry exact ranges.
-        Files already fully covered by a read are excluded; a partial read is
-        treated as coverage (the model saw real text and knows what remains).
+        Coverage comes from `self._read_spans` -- recorded only when a read
+        actually returned source text. A grep hit or an ERROR line is
+        navigation, not evidence; counting those as coverage is how a task
+        ends with "the model answered without proposing any edits" while the
+        terminal looks healthy.
+
+        Returns entries like "prep/sentences.js (not yet read -- it has 222
+        lines, use start=1 end=222)" so the nudge can carry exact ranges.
+        Any successful read of a file counts as coverage for it (a partial
+        read means the model saw real text and knows what remains).
         """
         wanted = self._task_file_targets(task)
         if not wanted:
@@ -368,27 +583,9 @@ class Agent:
                     matched[rel.lower()] = rel
         if not matched:
             return []
-        read_ranges: dict[str, list[tuple[int, int]]] = {}
-        for g in gathered:
-            head = g.split("\n", 1)[0]
-            if not head.startswith("--- read "):
-                continue
-            rest = head[len("--- read "):].strip()
-            parts = rest.rsplit(" L", 1)
-            f = parts[0].strip().lower()
-            if len(parts) > 1 and "-" in parts[1]:
-                try:
-                    a, b = parts[1].split("-", 1)
-                    rng = (int(a), int(b))
-                except ValueError:
-                    rng = (1, 10 ** 9)
-            else:
-                rng = (1, 10 ** 9)
-            read_ranges.setdefault(f, []).append(rng)
         missing = []
         for low, rel in sorted(matched.items()):
-            spans = read_ranges.get(low)
-            if spans:
+            if self._read_spans.get(low):
                 continue
             from . import fileio
             try:
@@ -402,32 +599,6 @@ class Agent:
                    "it does not exist on disk yet"
             missing.append(f"{rel} (not yet read -- {hint})")
         return missing
-
-    def _unvisited_files(self, gathered: list[str]) -> list[str]:
-        """Files the model has only located (grep/outline/failure) but never
-        successfully `read`. A rename task that greps two game files and then
-        says done lands here -- the answer rules forbid quoting unread code,
-        so it proposes nothing."""
-        seen = set()
-        located = set()
-        for g in gathered:
-            head = g.split("\n", 1)[0]
-            if head.startswith("--- read "):
-                rest = head[len("--- read "):].strip()
-                seen.add(rest.rsplit(" L", 1)[0].strip().lower())
-            elif head.startswith("--- grep ") or head.startswith("--- outline "):
-                arg = head.split(" ", 2)[2].strip().lower() if len(head.split(" ", 2)) > 2 else ""
-                if arg:
-                    located.add(arg)
-            elif head.startswith("--- ") and " failed: " in head:
-                parts = head.split(" ")
-                if len(parts) >= 3:
-                    located.add(parts[2].lower())
-        out = []
-        for low in sorted(located - seen):
-            rel = self.index.resolve_file(low) or low
-            out.append(rel)
-        return out
 
     # ------------------------------------------------------------------ phase 2
     def answer(self, task: str, gathered: str, stream: bool = True,
