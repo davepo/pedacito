@@ -162,6 +162,11 @@ def tool_read(index, cfg, file: str, start: int, end: int) -> str:
     if not path.exists():
         return f"ERROR: {rel} missing on disk."
     lines = fileio.read_lines(path)
+    # A trailing newline leaves an empty phantom "last line" after split.
+    # Reporting it is how a model gets told a file has 685 lines, asks for
+    # L320-685, and watches the read clamp or fail right at the boundary.
+    if lines and lines[-1] == "" and len(lines) > 1:
+        lines = lines[:-1]
 
     start = max(1, int(start or 1))
     end = int(end or 0) or len(lines)
