@@ -151,6 +151,10 @@ class Config:
     summarise_references: bool = False
 
     # --- Agent loop -----------------------------------------------------------
+    # Nominal lookup budget for the gather phase. It is a guardrail against
+    # looping, not a hard coverage limit: if the model says `done` while files
+    # the task names are still unread, the loop extends step-by-step (up to an
+    # internal ceiling of 40) rather than failing the answer phase outright.
     max_steps: int = 6
     # Hard cap on how much source the gather phase may accumulate. A 27B's
     # usable reasoning window is well under its advertised context.
@@ -546,7 +550,7 @@ PRESETS: dict[str, dict] = {
         # Tight enough that nothing overflows an 8k window at 25 tok/s.
         "max_tokens_summary": 160,
         "max_tokens_step": 500,
-        "repair_rounds": 1,
+        "max_steps": 8,
         "max_tokens_answer": 1500,
         "max_tokens_plan": 800,
         "max_tokens_build": 2000,
@@ -564,7 +568,7 @@ PRESETS: dict[str, dict] = {
         # explicitly and users see the ladder.
         "max_tokens_summary": 220,
         "max_tokens_step": 700,
-        "repair_rounds": 2,
+        "max_steps": 12,
         "max_tokens_answer": 3000,
         "max_tokens_plan": 1200,
         "max_tokens_build": 4000,
@@ -580,7 +584,7 @@ PRESETS: dict[str, dict] = {
     "large": {
         "max_tokens_summary": 300,
         "max_tokens_step": 1000,
-        "repair_rounds": 2,
+        "max_steps": 16,
         "max_tokens_answer": 8000,
         "max_tokens_plan": 2500,
         "max_tokens_build": 8000,
@@ -598,7 +602,7 @@ PRESETS: dict[str, dict] = {
         # get real headroom instead of truncation retries.
         "max_tokens_summary": 300,
         "max_tokens_step": 1200,
-        "repair_rounds": 3,
+        "max_steps": 24,
         "max_tokens_answer": 16000,
         "max_tokens_plan": 3000,
         "max_tokens_build": 12000,
@@ -788,7 +792,13 @@ model    = "google/gemma-3-27b"
 
 # --- Agent loop -------------------------------------------------------------
 # [agent]
-# max_steps = 6                    # lookups before the model must answer
+# max_steps = 6                    # nominal lookup budget per task. Not a
+#                                  # hard wall: if the model says `done` while
+#                                  # files the task names are still unread,
+#                                  # the loop grants extra steps one at a time
+#                                  # (internal ceiling 40) until coverage is
+#                                  # complete or the gathered-char budget runs
+#                                  # out. Raise it for API models on big tasks.
 # max_gathered_chars = 24000       # ceiling on accumulated source per task
 # max_read_lines = 200             # cap on one `read` call's line count
 # allow_write = false              # let the gather loop overwrite whole files
@@ -858,6 +868,7 @@ model    = "google/gemma-3-27b"
 # api_key  = "lm-studio"
 # max_tokens_summary = 160
 # max_tokens_step    = 500
+# max_steps          = 8
 # repair_rounds      = 1
 # max_tokens_answer  = 1500
 # max_tokens_plan    = 800
@@ -885,6 +896,7 @@ model    = "google/gemma-3-27b"
 # model    = "google/gemma-3-27b"
 # max_tokens_summary = 220
 # max_tokens_step    = 700
+# max_steps          = 12
 # repair_rounds      = 2
 # max_tokens_answer  = 3000
 # max_tokens_plan    = 1200
@@ -905,6 +917,7 @@ model    = "google/gemma-3-27b"
 # model    = "qwen3-32b"        # or a 70B on a multi-GPU rig
 # max_tokens_summary = 300
 # max_tokens_step    = 1000
+# max_steps          = 16
 # repair_rounds      = 2
 # max_tokens_answer  = 8000
 # max_tokens_plan    = 2500
@@ -931,6 +944,7 @@ model    = "google/gemma-3-27b"
 # timeout   = 120.0
 # max_tokens_summary = 300
 # max_tokens_step    = 1200
+# max_steps          = 24
 # repair_rounds      = 3
 # max_tokens_answer  = 16000
 # max_tokens_plan    = 3000

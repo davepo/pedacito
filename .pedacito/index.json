@@ -1,0 +1,58 @@
+{
+ "root": "/workspace",
+ "file_summaries": {},
+ "file_hashes": {
+  "a.js": "17eda2f1e53febfb",
+  "index.html": "da8868ebc0633908"
+ },
+ "chunks": [
+  {
+   "file": "a.js",
+   "qualname": "module",
+   "kind": "module",
+   "start": 1,
+   "end": 10,
+   "scope_end": 0,
+   "signature": "",
+   "decorators": [],
+   "docline": "",
+   "calls": [],
+   "imports": [],
+   "members": [],
+   "sha": "17eda2f1e53febfb",
+   "summary": ""
+  },
+  {
+   "file": "index.html",
+   "qualname": "lines_1",
+   "kind": "reference",
+   "start": 1,
+   "end": 10,
+   "scope_end": 0,
+   "signature": "html block",
+   "decorators": [],
+   "docline": "x",
+   "calls": [],
+   "imports": [],
+   "members": [],
+   "sha": "f8fd26e568877580",
+   "summary": ""
+  },
+  {
+   "file": "index.html",
+   "qualname": "lines_1",
+   "kind": "reference",
+   "start": 1,
+   "end": 10,
+   "scope_end": 0,
+   "signature": "html block",
+   "decorators": [],
+   "docline": "y",
+   "calls": [],
+   "imports": [],
+   "members": [],
+   "sha": "3ba290ac3343ab41",
+   "summary": ""
+  }
+ ]
+}
