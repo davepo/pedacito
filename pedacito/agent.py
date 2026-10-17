@@ -11,9 +11,10 @@ Usage
 
 Phase 1 (gather): the model picks tools under a JSON grammar (see tools.py).
 Constrained decoding here means tool calls never need freeform-text parsing.
-Hard-capped at cfg.max_steps -- when it runs out, the agent moves on to
-answering with whatever it has rather than looping forever, which is the
-usual small-model failure mode.
+cfg.max_steps is a wall-clock guardrail, not a coverage budget: when the
+model says `done` but files the task names were never read, the loop extends
+the budget step by step (bounded by _MAX_STEPS_CEIL) rather than entering an
+answer phase that can only fail -- reading real source is always progress.
 
 Phase 2 (answer): free text, no grammar. Code must NOT be forced through a
 JSON string field, since escaping newlines and quotes measurably degrades
@@ -33,6 +34,13 @@ import sys
 from .edits import apply_edits, parse_edits
 from .llm import estimate_tokens
 from .tools import STEP_SCHEMA, TOOL_HELP, dispatch
+
+# Absolute ceiling on gather-loop steps regardless of cfg.max_steps. The
+# budget-extension logic exists so a small model can finish covering the
+# files a task names even when max_steps is tight; this keeps a confused
+# model from ping-ponging `done` <-> nudge forever. Each extension grants
+# exactly one more lookup and only while real coverage gaps remain.
+_MAX_STEPS_CEIL = 40
 
 GATHER_BASE = f"""\
 You are a code assistant working through a lookup index of a Python project.
@@ -155,6 +163,12 @@ class Agent:
         did_read = False
         nudged = False
         read_nudged = False
+        # max_steps is a wall-clock guardrail against loops, not a coverage
+        # budget. When the model says `done` but files the task names were
+        # never read, one more lookup is cheaper than a guaranteed-failed
+        # answer phase -- so allow it to run past the nominal limit while it
+        # is making real progress (bounded by _MAX_STEPS_CEIL).
+        step_cap = self.cfg.max_steps
         # Files the task text names but no `read` has covered yet; refreshed
         # after every successful read so the `done` nudge can act on it.
         self._unread_files: list[str] = self._compute_unread(task, gathered)
@@ -163,7 +177,7 @@ class Agent:
         def nudge(step: int) -> str:
             """Text appended to a turn reminding the model how many lookups
             remain, or that this is its last one."""
-            remaining = self.cfg.max_steps - step
+            remaining = step_cap - step
             return (f"[{remaining} lookups left after this one] Next action?"
                     if remaining else
                     "This is your LAST lookup. Choose 'done' unless you truly need one more.")
@@ -174,7 +188,9 @@ class Agent:
         # system, user, assistant, user, assistant, ...
         messages[-1]["content"] += "\n\n" + nudge(1)
 
-        for step in range(1, self.cfg.max_steps + 1):
+        step = 0
+        while step < step_cap:
+            step += 1
             stepjson = self.client.chat_json(messages, STEP_SCHEMA, self.cfg.max_tokens_step)
             action = (stepjson.get("action") or "").strip()
             why = (stepjson.get("reasoning") or "").strip()
@@ -192,33 +208,36 @@ class Agent:
                 print(f"  step {step}: {action} {detail}  ({why[:80]})", file=sys.stderr)
 
             if action == "done":
-                if not did_read and step < self.cfg.max_steps:
-                    # Answering from grep snippets produces edits that cannot
-                    # anchor, because grep output is trimmed. Send it back once.
-                    nudged = True
-                    messages.append({"role": "assistant", "content": _compact(stepjson)})
-                    messages.append({"role": "user", "content":
-                        "You have not read any source yet, only located it. Edits "
-                        "must quote the file exactly, and grep output is trimmed. "
-                        "`read` the lines you intend to change, then say done."})
-                    if verbose:
-                        print("  (no source read yet; asking it to read before "
-                              "answering)", file=sys.stderr)
-                    continue
-                if (self._unread_files or self._unvisited_files(gathered)) \
-                        and not read_nudged and step < self.cfg.max_steps:
+                missing = list(self._unread_files)
+                for f in self._unvisited_files(gathered):
+                    if f.lower() not in [t.split(" ")[0].lower() for t in missing]:
+                        missing.append(f)
+                can_extend = (step_cap < _MAX_STEPS_CEIL and len(gathered) > 1
+                              and budget > 0)
+                if missing and (step < self.cfg.max_steps or can_extend):
                     # The model gathered on some files but wants to change
                     # others it never `read`. Its answer rules forbid quoting
                     # unread code, so it answers with zero blocks -- which
                     # surfaces as "No review: the model answered without
                     # proposing any edits" while the terminal looks healthy.
-                    # Hand it the exact ranges to fetch before it commits.
-                    read_nudged = True
-                    targets = list(self._unread_files)
-                    for f in self._unvisited_files(gathered):
-                        if f.lower() not in [t.split(" ")[0].lower() for t in targets]:
-                            targets.append(f)
-                    listing = "\n".join(f"- {f}" for f in targets[:6])
+                    # Hand it the exact ranges to fetch before it commits,
+                    # extending the step budget past max_steps when needed:
+                    # reading a file the task names is always progress, and
+                    # a guaranteed-failed answer phase costs more than one
+                    # extra lookup.
+                    listing = "\n".join(f"- {f}" for f in missing[:6])
+                    if step >= self.cfg.max_steps:
+                        step_cap += 1
+                        if verbose:
+                            print(f"  (extending budget: {len(missing)} file(s) "
+                                  f"the task names were never read; now up to "
+                                  f"{step_cap} steps)", file=sys.stderr)
+                    elif read_nudged:
+                        # Already nudged once inside the nominal budget and it
+                        # still says done with gaps -- extend instead of nagging.
+                        step_cap += 1
+                    else:
+                        read_nudged = True
                     messages.append({"role": "assistant", "content": _compact(stepjson)})
                     messages.append({"role": "user", "content":
                         "Your task will change these files, but you have not "
@@ -231,7 +250,20 @@ class Agent:
                         print("  (files the task needs were never read; asking "
                               "it to read them before answering)", file=sys.stderr)
                     continue
-                if not gathered and step < self.cfg.max_steps:
+                if not did_read and step < step_cap:
+                    # Answering from grep snippets produces edits that cannot
+                    # anchor, because grep output is trimmed. Send it back once.
+                    nudged = True
+                    messages.append({"role": "assistant", "content": _compact(stepjson)})
+                    messages.append({"role": "user", "content":
+                        "You have not read any source yet, only located it. Edits "
+                        "must quote the file exactly, and grep output is trimmed. "
+                        "`read` the lines you intend to change, then say done."})
+                    if verbose:
+                        print("  (no source read yet; asking it to read before "
+                              "answering)", file=sys.stderr)
+                    continue
+                if not gathered and step < step_cap:
                     # A `done` whose every lookup failed to produce anything
                     # usable (bad line range, unresolvable file, ...) would end
                     # the loop with an empty SOURCE section, and the answer
