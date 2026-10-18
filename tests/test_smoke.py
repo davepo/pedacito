@@ -425,3 +425,135 @@ def test_hosted_configs_are_never_clamped_or_warned():
     assert budget_warnings(cfg3)
     auto_fit(cfg3, verbose=False)
     assert cfg3.max_tokens_answer <= cfg3.context_tokens - 512
+
+
+def test_write_step_budget_and_chunking():
+    """DeepSeek regression: one write step must fit the provider's real
+    per-message output limit, and oversized writes are refused with chunking
+    instructions instead of silently storing a truncated file.
+
+    Covers max_write_lines (config + hosted preset), tools.dispatch's
+    pre-flight guard, tool_write's post-write chunk note, and llm.repair_truncated_json
+    salvaging an action from a mid-string-truncated reply.
+    """
+    import pathlib, tempfile
+    from pedacito.config import load, PRESETS
+    from pedacito import tools
+    from pedacito.llm import repair_truncated_json
+
+    def mk(text):
+        p = pathlib.Path(tempfile.mkdtemp()) / "c.toml"
+        p.write_text(text)
+        return load(explicit=p)
+
+    cfg = mk('tier = "hosted"\nbase_url = "https://api.deepseek.com/v1"'
+             '\nmodel = "deepseek-chat"\njson_mode = "object"\nallow_write = true\n')
+    assert cfg.allow_write is True
+    assert cfg.max_write_lines == PRESETS["hosted"]["max_write_lines"] == 120
+    # A step budget that fits under deepseek's ~8k-token message ceiling.
+    assert cfg.max_tokens_step <= 8000
+
+    class FakeIndex:
+        root = pathlib.Path(tempfile.mkdtemp())
+        files = []
+        def resolve_file(self, f):
+            return None
+
+    big = "\n".join(f"line {i}" for i in range(300))
+    obs = tools.dispatch(FakeIndex(), cfg, {"action": "write",
+                                            "file": "a.txt", "content": big})
+    assert obs.startswith("ERROR") and "300 lines" in obs and "chunks" in obs
+
+    small = "\n".join(f"line {i}" for i in range(5))
+    obs2 = tools.dispatch(FakeIndex(), cfg, {"action": "write",
+                                             "file": "b.txt", "content": small})
+    assert obs2.startswith("CREATED b.txt (5 lines)")
+
+    # Post-write note when a written file still exceeds the step budget.
+    cfgw = mk('tier = "hosted"\nbase_url = "https://api.deepseek.com/v1"'
+              '\nmodel = "m"\njson_mode = "object"\nallow_write = true\n')
+    idx = FakeIndex()
+    idx.root.mkdir(parents=True, exist_ok=True)
+    obs3 = tools.tool_write(idx, cfgw, "c.txt", big)
+    assert "WROTE c.txt (300 lines)" in obs3 or "CREATED c.txt (300 lines)" in obs3
+    assert "Chunking is ON" in obs3
+
+    # Truncated-reply salvage: action + args survive a cut-off reasoning tail.
+    text = ('{"action": "read", "file": "a.txt", "start": 1, "end": 10, '
+            '"reasoning": "I will now read the whole file and then explain')
+    fixed = repair_truncated_json(text)
+    assert fixed is not None
+    import json as _json
+    obj = _json.loads(fixed)
+    assert obj["action"] == "read" and obj["file"] == "a.txt"
+
+
+def test_json_mode_aliases_and_deepseek_autodetect(tmp_path, monkeypatch):
+    """DeepSeek's docs say response_format {"type": "json_object"}, so users
+    reasonably write json_mode = "json_object" in their config -- every
+    spelling must land on the internal "object" mode, and a DeepSeek target
+    must never be left running with json_schema (which it rejects)."""
+    for raw, want in (("json_object", "object"), ("JSON_OBJECT", "object"),
+                      ("json", "object"), ("  object ", "object"),
+                      ("schema", "schema"), ("json_schema", "schema")):
+        assert config_mod._coerce("json_mode", raw) == want
+    with pytest.raises(config_mod.ConfigError):
+        config_mod._coerce("json_mode", "json-object")
+
+    def load(text):
+        p = tmp_path / f"c{abs(hash(text))}.toml"
+        p.write_text(text, encoding="utf-8")
+        for k in [k for k in os.environ if k.startswith("PEDACITO_")]:
+            monkeypatch.delenv(k, raising=False)
+        return config_mod.load(explicit=p, use_env=True)
+
+    # remote host, no json_mode written -> auto-switch to object
+    cfg = load('[server]\nbase_url = "https://api.deepseek.com/v1"\n'
+               'model = "deepseek-chat"\napi_key = "sk-x"\n')
+    assert cfg.json_mode == "object"
+    assert "auto-detected" in cfg.sources["json_mode"]
+    assert config_mod.is_hosted(cfg)
+    assert config_mod.budget_warnings(cfg) == []
+
+    # deepseek model served LOCALLY (localhost) -> still object mode
+    cfg = load('[server]\nbase_url = "http://localhost:1234/v1"\n'
+               'model = "deepseek-r1-distill-27b"\n')
+    assert cfg.json_mode == "object"
+
+    # explicit schema + deepseek -> loud switch, never silent failure
+    cfg = load('[server]\nbase_url = "https://api.deepseek.com/v1"\n'
+               'model = "deepseek-chat"\njson_mode = "schema"\n')
+    assert cfg.json_mode == "object"
+
+    # plain local model untouched
+    cfg = load('[server]\nbase_url = "http://localhost:1234/v1"\n'
+               'model = "qwen3-27b"\n')
+    assert cfg.json_mode == "schema"
+    assert not config_mod.is_hosted(cfg)
+
+
+def test_single_quoted_dict_reply_salvage():
+    """Some hosted models in json_object mode emit Python-style dicts with
+    single quotes. chat_json must convert them instead of burning all three
+    retries and dying with 'would not produce valid JSON'."""
+    reply = ("{'action': 'read', 'file': 'subj-imp/index.html', "
+             "'start': 405, 'end': 445, "
+             "'reasoning': 'See subj-imp script tag'}")
+    client = LMStudio.__new__(LMStudio)          # no network needed
+    client.cfg = config_mod.Config(base_url="http://x.invalid/v1", model="m",
+                        json_mode="object")
+    client.stats = {"calls": 0, "prompt_tokens": 0,
+                    "completion_tokens": 0, "seconds": 0}
+    client.last_finish_reason = "stop"
+    schema = {"properties": {"action": {}, "file": {}}}
+    seen = {"n": 0}
+
+    def fake_chat(messages, max_tokens, schema=None):
+        seen["n"] += 1
+        return reply
+    client.chat = fake_chat
+    obj = client.chat_json([{"role": "user", "content": "hi"}],
+                           schema=schema, max_tokens=100)
+    assert obj["action"] == "read"
+    assert obj["file"] == "subj-imp/index.html"
+    assert seen["n"] == 1                     # salvaged on the first try

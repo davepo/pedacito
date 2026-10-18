@@ -288,6 +288,11 @@ Rules for edits:
   rather than guessing at an edit.
 - Include enough surrounding lines that the SEARCH text appears only once.
 - Keep each block small and local. Use several blocks rather than one large one.
+- A single reply must stay short enough to finish: emit at most a few blocks
+  per reply, never a whole large file in one REPLACE/SEARCH section. If the
+  task needs changes to several files, edit ONE file (or a few small blocks)
+  this turn and say what remains; the next turn continues where you left off.
+  Long replies get cut off mid-block at the token limit and are discarded.
 - Do not output the whole file. Do not output a diff or patch format.
 - If you are adding a new function, anchor the SEARCH on an existing nearby line.
 - To CREATE a brand-new file: emit exactly one block for it with an EMPTY
