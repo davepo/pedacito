@@ -557,3 +557,67 @@ def test_single_quoted_dict_reply_salvage():
     assert obj["action"] == "read"
     assert obj["file"] == "subj-imp/index.html"
     assert seen["n"] == 1                     # salvaged on the first try
+
+
+def test_step_truncation_salvage_no_escalation():
+    """A gather-step reply cut off inside 'reasoning' must be accepted on the
+    FIRST salvage attempt (schema steps have no large fields to grow into),
+    set client.step_truncated so gather() can warn the model, and never burn
+    the old 7000->14000->28000 escalation loop that killed DeepSeek runs.
+    A schema WITH a large field (answer-style) must still escalate-retry."""
+    import json as _json
+    from pedacito.llm import LMStudio, LLMError
+    from pedacito.tools import STEP_SCHEMA
+    from pedacito.config import Config
+
+    cfg = Config(); cfg.json_mode = "object"
+
+    class Fake(LMStudio):
+        def __init__(self, replies, finish="length"):
+            object.__init__(self)
+            self.cfg = cfg; self.replies = list(replies); self.n = 0
+            self.last_finish_reason = finish
+        def chat(self, messages, max_tokens, schema=None, stream=False, **kw):
+            r = self.replies[min(self.n, len(self.replies) - 1)]; self.n += 1
+            return r
+
+    cut = ('{"action":"read","file":"a.txt","start":1,"end":40,'
+           '"pattern":"","symbol":"","content":"","reasoning":"See the im')
+    c = Fake([cut])
+    obj = c.chat_json([{"role": "user", "content": "t"}], STEP_SCHEMA, max_tokens=7000)
+    assert obj["action"] == "read" and obj["file"] == "a.txt"
+    assert c.step_truncated is True
+    assert c.n == 1                      # accepted immediately, no retry loop
+
+    good = _json.dumps({"action": "done", "file": "", "start": 0, "end": 0,
+                        "pattern": "", "symbol": "", "content": "",
+                        "reasoning": "ok"})
+    c2 = Fake([good], finish="stop")
+    obj2 = c2.chat_json([{"role": "user", "content": "t"}], STEP_SCHEMA, max_tokens=7000)
+    assert obj2["action"] == "done" and c2.step_truncated is False and c2.n == 1
+
+    big = {"type": "object",
+           "properties": {"action": {"type": "string"},
+                          "content": {"type": "string", "maxLength": 16000}},
+           "required": ["action", "content"], "additionalProperties": False}
+    # content cut mid-string (closing quote present, like a real DeepSeek
+    # cut-off): the salvage is PARTIAL content -- acting on half a file would
+    # corrupt it -- so the reply is NOT accepted immediately. It escalates
+    # once, and only at the retry ceiling is the last partial reply salvaged
+    # whole (flagged step_truncated) rather than raising blind.
+    cut_q = '{"action":"edit","content":"' + ("y" * 9000) + '"'
+    c3 = Fake([cut_q])
+    obj3 = c3.chat_json([{"role": "user", "content": "t"}], big, max_tokens=8000)
+    assert obj3["action"] == "edit" and len(obj3["content"]) > 5000
+    assert c3.n >= 2                     # escalated before accepting partials
+    assert c3.step_truncated is True     # gather() will warn the model
+
+    # A truncated whole-file write that survives salvage is PARTIAL content:
+    # it must never be executed blind (half a file on disk). The step is
+    # flagged step_truncated and the partial reply is returned so dispatch()
+    # in agent.py can refuse it with the chunked-append recipe instead.
+    c4 = Fake(['{"action":"edit","content":"' + ("x" * 9000)])
+    obj4 = c4.chat_json([{"role": "user", "content": "t"}], big, max_tokens=8000)
+    assert obj4["action"] == "edit" and len(obj4["content"]) > 5000
+    assert c4.step_truncated is True     # dispatch refuses + teaches chunking
+    assert c4.n >= 2                     # escalated before accepting partials

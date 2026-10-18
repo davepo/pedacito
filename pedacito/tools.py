@@ -63,8 +63,10 @@ STEP_SCHEMA = {
         "symbol": {"type": "string", "description": "For callers. Empty otherwise.",
                    "maxLength": 200},
         "content": {"type": "string",
-                    "description": "For write: the complete new file text. Empty otherwise.",
-                    "maxLength": 16000},
+                    "description": "For write: at most ~120 lines of file text "
+                                   "(larger files are appended chunk by chunk over "
+                                   "several steps). Empty otherwise.",
+                    "maxLength": 6000},
         "reasoning": {
             "type": "string",
             "description": "Under 15 words: what you still need. Not a plan.",
@@ -73,6 +75,12 @@ STEP_SCHEMA = {
     },
     # Flat + all-required beats nested oneOf/anyOf for small models: the grammar
     # stays simple and the model never has to pick a branch.
+    # NOTE: `content`'s maxLength MUST stay below llm._BIG_FIELD_MIN (8000).
+    # That threshold is what marks a schema "answer-style" (cut mid-content =>
+    # partial, must escalate) vs "step-style" (args all precede `reasoning`, so
+    # a salvaged action is complete and accepted on the first try). Raising it
+    # past 8000 silently disables step-truncation salvage; file-size limits are
+    # enforced by max_write_lines in dispatch()/tool_write(), not here.
     "required": ["action", "file", "start", "end", "pattern", "symbol",
                  "content", "reasoning"],
     "additionalProperties": False,

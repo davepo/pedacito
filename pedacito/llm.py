@@ -254,6 +254,24 @@ def repair_truncated_json(text: str) -> str | None:
             break                              # key with no colon yet
         vend = _complete_value_end(j + 1)
         if vend is None:
+            # Value is cut off mid-generation. If it is an *unterminated
+            # string* (the common DeepSeek failure: reply hits max_tokens
+            # inside a 'content' block), keep the raw fragment so callers can
+            # salvage partial content instead of discarding the step. The
+            # repair below closes the quote and the object.
+            k = j + 1
+            while k < n and buf[k] in " \t\r\n":
+                k += 1
+            if k < n and buf[k] == '"' and _complete_value_end(k) is None:
+                # The fragment starts with the opening quote, which we keep;
+                # escape only what came AFTER it (the original `buf[k]` itself
+                # must not be escaped or the repaired JSON has a stray \").
+                frag = buf[k + 1:]
+                frag = (frag.replace("\\", "\\\\")
+                            .replace('"', '\\"').replace("\n", "\\n")
+                            .replace("\r", "\\r").replace("\t", "\\t"))
+                kept.append(buf[i:k] + '"' + frag + '"')
+                break                          # nothing after the cut survives
             break                              # value missing or cut off
         kept.append(buf[i:vend])
         i = vend
@@ -687,6 +705,23 @@ class LMStudio:
         return strip_reasoning("".join(out))
 
     # --------------------------------------------------------------- helpers
+    @staticmethod
+    def _schema_has_big_fields(schema: dict | None) -> bool:
+        """True when the schema contains a string field large enough to hold
+        real file content (search/replace blocks, whole-file writes).
+
+        `content` in STEP_SCHEMA is deliberately capped at 6000 chars so a
+        step reply can never legitimately carry a whole large file -- if a
+        step reply gets cut off with that schema, it died inside 'reasoning',
+        and doubling max_tokens cannot fix that. Schemas WITHOUT such fields
+        therefore skip the budget-escalation retry loop entirely.
+        """
+        BIG_FIELD_MIN = 8000   # maxLength above which a string field is "large"
+        props = (schema or {}).get("properties", {})
+        return any(
+            p.get("type") == "string" and int(p.get("maxLength") or 0) > BIG_FIELD_MIN
+            for p in props.values())
+
     def chat_json(self, messages: list[dict], schema: dict, max_tokens: int,
                   retries: int = 2, cap: int | None = None) -> dict:
         """Send a grammar-constrained chat request and return the parsed
@@ -699,6 +734,13 @@ class LMStudio:
         """
         last = ""
         budget = max_tokens
+        # Truncation recovery state. `step_cut` counts how many times a
+        # schema-constrained step reply was cut off mid-'reasoning' (the only
+        # field left when the schema orders action/args first). Retrying such
+        # a step verbatim just re-rolls the same rambling essay, so after the
+        # second cut we stop retrying and treat the recovered action as final.
+        self.step_truncated = False
+        step_cut = 0
         # Ceiling for truncation-retry escalation. Default is NOT a hard
         # 2000 -- it is derived from the caller's own config (reserve /
         # answer budgets), so raising max_tokens_step or reserve_tokens in
@@ -769,10 +811,40 @@ class LMStudio:
                             obj = None
                         # Only trust it if the part that matters survived.
                         if isinstance(obj, dict) and obj.get("action"):
-                            print("[reply was cut off; recovered the action from "
-                                  "the partial reply]", file=sys.stderr)
-                            return obj
+                            if not self._schema_has_big_fields(schema):
+                                # A schema step's args all precede 'reasoning',
+                                # so a recovered action is COMPLETE -- retrying
+                                # only re-rolls the essay that got cut. Accept
+                                # it, flag the truncation so gather() can tell
+                                # the model to keep its next reasoning short,
+                                # and cap pointless retries at two.
+                                print("[reply was cut off; recovered the "
+                                      "action from the partial reply]",
+                                      file=sys.stderr)
+                                self.step_truncated = True
+                                return obj
+                            # Big-field (answer-style) schema: the cut landed
+                            # inside a content/replacement string, so what we
+                            # salvaged is PARTIAL. Do not act on half a file --
+                            # fall through to escalation/salvage-last logic.
+                            step_cut += 1
+                            if step_cut >= 2:
+                                print("[reply was cut off mid-content; last "
+                                      "attempt will be salvaged whole]",
+                                      file=sys.stderr)
+                                self.step_truncated = True
+                                return obj
                 if truncated:
+                    # A step schema has NO large fields -- a truncated step
+                    # reply can only have died inside 'reasoning', so there is
+                    # nothing to salvage and doubling the budget cannot help.
+                    # The old escalation path (7000 -> 14000 -> 28000 -> ...)
+                    # just re-sent the same oversized request three times on
+                    # DeepSeek, whose per-message OUTPUT cap (~8k tokens) is a
+                    # provider-side fact no client setting can raise. Skip the
+                    # escalation entirely for schema steps.
+                    if not self._schema_has_big_fields(schema):
+                        break   # fall through to the informative error below
                     nxt = min(budget * 2, cap)
                     if nxt > budget:
                         budget = nxt
@@ -781,7 +853,8 @@ class LMStudio:
                     else:
                         print(f"[reply was cut off at the token limit and "
                               f"max_tokens is already at the ceiling "
-                              f"({budget}); raising it further in your config]",
+                              f"({budget}); the answer will be salvaged from "
+                              f"what survived]",
                               file=sys.stderr)
                     continue
                 messages = messages + [
@@ -804,6 +877,10 @@ class LMStudio:
                 "  'content'/'replacement' block is longer than one step budget.\n"
                 "  Raise max_tokens_step (and/or reserve_tokens) in your active\n"
                 "  profile -- the ceiling follows those settings, it is not fixed.\n"
+                "  NOTE for hosted APIs (DeepSeek/OpenAI): their per-message OUTPUT\n"
+                "  cap (~8k tokens on deepseek-chat) is provider-side and cannot be\n"
+                "  raised from here -- keep max_tokens_step at/below it and let the\n"
+                "  chunked-write protocol split big files across turns instead.\n"
                 f"  Last partial reply: {last[-160:]}")
         raise LLMError(
             f"Model would not produce valid JSON after {retries + 1} tries.\n"
