@@ -111,6 +111,27 @@ def test_parse_edits_roundtrip():
     assert "hi" in blocks[1].search and blocks[1].replace.strip() == ""
 
 
+def test_parse_edits_keeps_equals_banner_in_search():
+    """A SEARCH that begins with a `/* ====...` comment banner must survive
+    parsing intact. The separator matcher used to match the '=' run inside the
+    banner, truncating the SEARCH to `/* ` (which then matched every comment
+    opener -- the 'search block appears N times' failure on JS renames)."""
+    reply = (
+        "--- FILE: sentences.js\n"
+        "<<<<<<< SEARCH\n"
+        "/* =========================================================\n"
+        "   sentences.js — Banco de oraciones\n"
+        "=======\n"
+        ">>>>>>> REPLACE\n"
+    )
+    blocks = edits.parse_edits(reply)
+    assert len(blocks) == 1
+    assert blocks[0].replace == ""
+    assert blocks[0].search.startswith("/* =="), repr(blocks[0].search)
+    assert "Banco de oraciones" in blocks[0].search
+
+
+
 def test_rename_pair_applies(tmp_path):
     """The exact regression behind 'nothing to review' on rename tasks:
     deleting the source file's full content (EOF block without trailing
@@ -158,6 +179,36 @@ def test_rename_with_opening_lines_search(tmp_path):
     assert (tmp_path / "new_name.py").is_file()
     assert not (tmp_path / "old_name.py").exists()
     assert "line5" in (tmp_path / "new_name.py").read_text()
+
+
+def test_rename_with_midfile_clear_block(tmp_path):
+    """Models anchor the clearing block on any UNIQUE text they read -- often
+    a script tag or snippet in the middle of a file, not its first lines. That
+    mid-file clear must still pair with the create block and move the whole
+    source, rather than deleting just the snippet and leaving a stub."""
+    _write(tmp_path / "index.html",
+           "<html>\n<head><title>x</title></head>\n<body>\n"
+           "<script src=\"sentences.js\"></script>\n"
+           "<p>real body content</p>\n</body>\n</html>\n")
+    reply = (
+        "--- FILE: renamed.html\n"
+        "<<<<<<< SEARCH\n"
+        "=======\n"
+        "<!-- placeholder: moved from index.html -->\n"
+        ">>>>>>> REPLACE\n\n"
+        "--- FILE: index.html\n"
+        "<<<<<<< SEARCH\n"
+        "<script src=\"sentences.js\"></script>\n"
+        "=======\n"
+        ">>>>>>> REPLACE\n"
+    )
+    results = edits.apply_edits(tmp_path, edits.parse_edits(reply),
+                                backup=False, dry_run=False)
+    assert all(r.ok for r in results), [r.message for r in results]
+    assert (tmp_path / "renamed.html").is_file()
+    assert not (tmp_path / "index.html").exists()
+    assert "real body content" in (tmp_path / "renamed.html").read_text()
+
 
 
 def test_review_write_deletes_rename_source(tmp_path):

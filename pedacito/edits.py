@@ -49,19 +49,20 @@ BLOCK_RE = re.compile(
     r"---\s*FILE:\s*(?P<file>[^\n]+?)\s*\n"
     r"[^\n]*<{5,}\s*SEARCH[^\n]*\n"
     r"(?P<search>.*?)"
-    # The separator is `=======` at the end of what it consumed: optionally
-    # one newline plus trailing spaces/tabs. `[^\n]*` here used to let the
-    # REPLACE body leak into the separator line when a model wrote `=======`
-    # directly above `>>>>>>> REPLACE` (an empty replacement), silently
-    # dropping whole edit blocks.
-    r"={5,}[ \t]*(?:\n[ \t]*)?"
+    # The `=======` separator must be a whole line of (mostly) equals signs.
+    # Matching any run of five or more '=' used to swallow the '===' banner
+    # inside a comment header that a SEARCH began with (`/* ====...`), which
+    # truncated the SEARCH to `/* ` and dumped the rest into REPLACE -- the
+    # "search block appears N times" failures on JS/CSS/HTML renames.
+    # Anchoring to a full line leaves such banners in the SEARCH body.
+    r"^[ \t]*={5,}[ \t]*$\n"
     # The replace body may be empty too: with no newline after the separator
-    # the closer sits on the very next line (`>{5,}` after `\n?`). A negative
+    # the closer sits on the very next line (`>{5,}` after `^`). A negative
     # look-ahead keeps the group from swallowing the next block's header when
     # two blocks sit adjacent.
     r"(?P<replace>(?:(?!-{3}\s*FILE:).)*?)"
-    r"\n?>{5,}\s*REPLACE",
-    re.DOTALL,
+    r"^[ \t]*>{5,}\s*REPLACE",
+    re.DOTALL | re.MULTILINE,
 )
 
 
@@ -494,14 +495,14 @@ def apply_edits(root: Path, edits: list[Edit], backup: bool = True,
                             if tspan is not None and _reaches_eof(tail, tspan):
                                 can_clear = True
                                 continue
-                elif _reaches_eof(e.search, span) or (span.start == 0
-                                                       and not span.fuzzy):
-                    # A clear block is either the whole file (the search runs
-                    # to end-of-file) or, per the rename protocol in the
-                    # answer prompt, just the file's opening lines -- the model
-                    # is told to quote only the first few lines, never the
-                    # whole file. Either way it identifies this path as the
-                    # source of a move, so flag it as a remover candidate.
+                elif span is not None and not span.fuzzy:
+                    # A clear block whose SEARCH matches uniquely anywhere in
+                    # the file identifies it as the source of a move: the model
+                    # anchors on any exact text it actually read -- the opening
+                    # lines, a mid-file script tag, or the whole file -- since
+                    # the SEARCH is only used to name the file, never as
+                    # content. Fuzzy (similarity) matches stay rejected; a
+                    # near-miss is too weak an identifier for a rename.
                     can_clear = True
         return can_create, can_clear
 
