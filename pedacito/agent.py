@@ -46,6 +46,12 @@ from .tools import STEP_SCHEMA, TOOL_HELP, dispatch
 # the ceiling mid-task produces the same "never read the files" failure the
 # nominal limit does.
 _MAX_STEPS_CEIL = 80
+# How many times the gather loop re-asks after a step reply dies at the
+# output cap / produces no salvageable JSON, before giving up and answering
+# from what was gathered. Each recovery costs one API call but keeps paid
+# lookups alive; two is enough for a model that rambles once in a while and
+# small enough that a persistently broken server cannot bill forever.
+_MAX_GATHER_RECOVERIES = 2
 
 # Matches the first line of a successful tool_read observation:
 #   "prep/index.html lines 315-325:"
@@ -299,14 +305,18 @@ Rules for edits:
 - To CREATE a brand-new file: emit exactly one block for it with an EMPTY
   SEARCH section (nothing between <<<<<<< SEARCH and =======) and the full
   file contents in REPLACE.
-- To RENAME or MOVE a file: emit three blocks -- (1) an empty-SEARCH creation
-  block for the NEW path whose REPLACE is just a short placeholder comment;
-  (2) for the OLD path, a block whose SEARCH is its entire current content
-  and whose REPLACE is empty; (3) optionally a block that edits the new path's
-  placeholder. When the creation and the clearing of the old path are both
-  present, Pedacito moves the old file's real contents to the new path and
-  removes the old file -- never type the old file's contents into REPLACE,
-  as that would double them.
+- To RENAME or MOVE a file: emit exactly two blocks -- (1) an empty-SEARCH
+  creation block for the NEW path whose REPLACE is just a short placeholder
+  comment; (2) a block for the OLD path whose SEARCH is its FIRST few lines
+  and whose REPLACE is EMPTY. Pedacito recognises the pair, moves the old
+  file's REAL contents to the new path itself, and removes the old file.
+  NEVER copy the old file's contents into either section -- not into REPLACE
+  (that would double them) and not into SEARCH (a whole-file SEARCH runs
+  past the output limit and gets cut off mid-block). The clearing block's
+  SEARCH text is only used to identify which file to move; three to five
+  exact opening lines are enough. Never create the placeholder without its
+  clearing block in the same reply: Pedacito refuses lone placeholders so a
+  half-finished rename cannot leave a stub file behind.
 
 Before the blocks, write a short plain explanation of what you changed and why.
 If the task is a question rather than a change, just answer it and output no blocks."""
@@ -366,6 +376,10 @@ class Agent:
         self.index = index
         self.client = client
         self.cfg = cfg
+        # Set by gather(); read by _repair_source() when a failed file is no
+        # longer on disk. Initialised here so apply() works even if it is
+        # called without a preceding gather().
+        self.gathered_source = ""
 
     # ------------------------------------------------------------------ phase 1
     def gather(self, task: str, verbose: bool = True,
@@ -443,6 +457,8 @@ class Agent:
         step = 0
         done_confirmed = False   # one-shot guard for the post-truncation
                                  # "are you really done?" nudge below
+        step_recoveries = 0      # budget for re-asking after a gather step
+                                 # died at the output cap (see LLMError path)
         while step < step_cap:
             step += 1
             try:
@@ -457,6 +473,25 @@ class Agent:
                 # exit after minutes of paid lookups.
                 msg = str(e).lower()
                 if "token limit" in msg or "valid json" in msg:
+                    # Do not bail on the FIRST bad step. A hosted model that
+                    # rambles past the output cap produces one doomed reply;
+                    # asking again with a short-reasoning instruction usually
+                    # gets a clean action back, and losing ten paid lookups of
+                    # context to an answer phase that cannot edit blind is the
+                    # worse outcome (this is exactly how the rename test died:
+                    # gather broke at step 10, the answer phase had no source,
+                    # and it emitted a lone placeholder stub). One retry per
+                    # failure, two failures total, then proceed as before.
+                    step_recoveries += 1
+                    if step_recoveries <= _MAX_GATHER_RECOVERIES:
+                        messages.append({"role": "user", "content":
+                            "[Your last reply hit the output token limit and "
+                            "contained no valid action. Choose your next "
+                            "action now: put ONE short phrase in 'reasoning' "
+                            "(under 10 words) and fill 'action' plus its "
+                            "fields. Reply with the JSON object only.]"})
+                        step -= 1        # the failed turn costs no step
+                        continue
                     print(f"  [gather step failed: {str(e)[:120]}...]\n"
                           "  [proceeding to the answer phase with what was "
                           "gathered so far]", file=sys.stderr)
@@ -927,6 +962,31 @@ class Agent:
             # model can copy exact text including real indentation.
             prev_blocks = self._failed_block_texts(reply, failures)
             src_slice = self._repair_source(failures, prev_blocks)
+            # A placeholder-creation refusal is a RENAME instruction problem,
+            # not an anchor problem: the model never needs to copy bytes (the
+            # clearing block's SEARCH is discarded -- Pedacito moves the real
+            # file). The generic "copy the SEARCH text byte for byte" wording
+            # above invites exactly the doomed full-content re-typing that
+            # gets cut off at the provider cap mid-block. Override it.
+            rename_refusals = [r for r in failures
+                               if "placeholder comment" in r.message]
+            extra = ""
+            if rename_refusals:
+                names = ", ".join(sorted({r.file for r in rename_refusals}))
+                extra = (
+                    f"\n\nRENAME PROTOCOL FOR {names}: these creations were "
+                    "refused because they are placeholders with no matching "
+                    "clearing block. Do NOT copy any file contents into your "
+                    "reply -- a whole-file SEARCH would be cut off by the "
+                    "output limit and is wasted effort. Instead emit ONLY:\n"
+                    "(1) one block for each NEW path: empty SEARCH section "
+                    "(nothing between <<<<<<< SEARCH and =======), REPLACE "
+                    "is a single short comment line;\n"
+                    "(2) one block for each OLD path being renamed away: its "
+                    "SEARCH may be just the FIRST 3-5 lines of the old file "
+                    "and its REPLACE must be EMPTY -- Pedacito recognises the "
+                    "pair and moves the entire real file itself.\n"
+                    "Keep this reply tiny: four blocks total, nothing else.")
             reply = self.client.chat(
                 [
                     {"role": "system", "content": ANSWER_SYSTEM},
@@ -934,7 +994,7 @@ class Agent:
                         f"SOURCE (current contents of the files that failed)\n\n{src_slice}\n\n"
                         f"TASK\n{task}\n\n"
                         f"YOUR PREVIOUS EDIT BLOCKS THAT FAILED:\n{prev_blocks}\n\n"
-                        f"These edits could not be applied:\n{fb}\n\n"
+                        f"These edits could not be applied:\n{fb}{extra}\n\n"
                         "Output ONLY the corrected search/replace blocks for the "
                         "failed edits -- do not repeat edits that already worked, "
                         "do not rewrite whole files. Copy the SEARCH text exactly "
