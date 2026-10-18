@@ -40,7 +40,11 @@ from .tools import STEP_SCHEMA, TOOL_HELP, dispatch
 # files a task names even when max_steps is tight; this keeps a confused
 # model from ping-ponging `done` <-> nudge forever. Each extension grants
 # exactly one more lookup and only while real coverage gaps remain.
-_MAX_STEPS_CEIL = 40
+# 80, not 40: models that work file-by-file through a multi-file task burn
+# two steps per file (locate + read) plus verification reads, and hitting
+# the ceiling mid-task produces the same "never read the files" failure the
+# nominal limit does.
+_MAX_STEPS_CEIL = 80
 
 # Matches the first line of a successful tool_read observation:
 #   "prep/index.html lines 315-325:"
