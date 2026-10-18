@@ -184,14 +184,33 @@ class Config:
     # "Context length", Ollama's num_ctx, an API's advertised window). Used by
     # `pedacito config` to sanity-check the token budgets below against it --
     # profiles set this per tier (8k for a small local model, 128k for hosted).
-    # The default matches the default budgets: flat map (4000) + gathered
-    # source (~6000 tok) + one step fits inside 16384 - 2048 with room left.
-    context_tokens: int = 16384
+    # The default is deliberately conservative (matches LM Studio's own stock
+    # setting), but you rarely need to set it at all: when a local server
+    # answers, pedacito probes its REAL configured context length via the
+    # native API and uses that instead of this number, and `auto_fit` then
+    # shrinks or grows every other budget to fit the window it found.
+    context_tokens: int = 8192
     # Tokens held back from `context_tokens` for the reply itself. A gather
     # plan that fills the window to the last token leaves nothing to answer
     # with, which is how truncation errors like "ran past max_tokens_step"
-    # usually start.
+    # usually start. auto_fit lowers this automatically when the window is
+    # too small for it.
     reserve_tokens: int = 2048
+    # Auto-fit every token budget to the server's real context window before
+    # each run (see config.auto_fit): shrink oversized budgets so requests
+    # stop hitting the limit mid-task, grow them when the window has room.
+    # Set false only if you want to hand-tune every knob yourself.
+    auto_fit: bool = True
+    # Probe the server for its actual configured context length (LM Studio's
+    # native /api/v0/models reports it; Ollama's /api/show does too). On
+    # success this overrides context_tokens unless YOU set context_tokens
+    # explicitly in your config/env. Set false to trust your file verbatim.
+    auto_detect_context: bool = True
+    # Ask the server for this many output tokens on generation calls. Some
+    # llama.cpp-based servers reject max_tokens values above their configured
+    # context window outright; auto_fit clamps this to fit. 0 means "omit
+    # max_tokens from requests entirely" (the server then decides).
+    request_max_tokens_cap: int = 32768
 
     # --- Project scaffolding (`pedacito new`) ---------------------------------
     # Cap on how many files a plan may propose; longer plans are truncated and
@@ -237,7 +256,15 @@ class Config:
 
     # Profile applied when --profile is not given. Set it in your user config
     # for a lasting default, or export PEDACITO_PROFILE for one shell session.
+    # It may also be set at the TOP level of the file (`default_profile = ...`),
+    # which `--setup` writes; a profile named here must exist in [profiles.*].
     default_profile: str = ""
+    # Optional preset tier for the NO-PROFILE run: "small", "medium", "large"
+    # or "hosted". Lets a simple two-line config (`tier = "hosted"` plus your
+    # server details) get sane token budgets without defining any profiles.
+    # Profiles carry their own `tier` key; this one only covers runs where no
+    # profile is selected.
+    tier: str = ""
 
     # Bookkeeping for `pedacito config`. Not settings.
     sources: dict = None
@@ -414,6 +441,23 @@ def load(root: Path | None = None, explicit: Path | None = None,
             cfg.sources[key] = f"{label} ({path})"
 
     cfg.profiles = profiles
+
+    # Top-level `tier` (no-profile preset). Validated before profile
+    # selection so a typo fails loudly here rather than silently doing
+    # nothing later.
+    top_tier = cfg.tier
+    if top_tier:
+        if top_tier not in PRESETS:
+            raise ConfigError(
+                f"tier must be one of {', '.join(PRESET_TIERS)}, "
+                f"got {top_tier!r}"
+                + (f" ({cfg.sources.get('tier')})" if cfg.sources.get("tier") else ""))
+        for key, value in PRESETS[top_tier].items():
+            if cfg.sources.get(key) == "default":
+                setattr(cfg, key, _coerce(key, value))
+                cfg.sources[key] = f"tier '{top_tier}' preset"
+        cfg.active_tier = top_tier
+
     # Which profile: explicit flag, then the shell environment, then a lasting
     # default from the config file.
     origin = "--profile"
@@ -426,9 +470,13 @@ def load(root: Path | None = None, explicit: Path | None = None,
     if profile:
         if profile not in profiles:
             known = ", ".join(sorted(profiles)) or "(none defined)"
+            hint = ("Define it in your config, or clear `default_profile`. "
+                    "Run `pedacito config --setup` to build both interactively."
+                    if origin == "default_profile" and not profiles else "")
             raise ConfigError(
                 f"No profile named '{profile}' (from {origin}). "
                 f"Defined profiles: {known}\n"
+                + (hint + "\n" if hint else "") +
                 "Add one to your config:\n\n"
                 f"  [profiles.{profile}]\n  model = \"...\"")
         body, tier = _apply_preset(profile, profiles[profile], origin)
@@ -490,6 +538,99 @@ def budget_warnings(cfg: Config) -> list[str]:
                  f"max_gathered_chars or flat_map_token_budget, or raise "
                  f"context_tokens if your server really has more room.")
     return w
+
+
+def auto_fit(cfg: Config, verbose: bool = True) -> list[str]:
+    """Fit every token budget to the server's real context window.
+
+    The single biggest source of "nothing worked, it kept hitting limits":
+    the built-in budgets assume a roomy window (they were tuned for 32k+),
+    while LM Studio ships models at 8192 by default and Ollama caps at 4096
+    unless told otherwise. A hosted profile (tier "hosted") also lands on
+    local hardware with 128k/16k numbers that the server flatly rejects.
+    Rather than fail mid-task, this rewrites the budgets to fit -- shrink
+    when the window is smaller than assumed, grow when it has room:
+
+      * reserve_tokens shrinks first so tiny windows keep usable space;
+      * max_tokens_answer / build are clamped to what the window can hold;
+      * max_gathered_chars and flat_map_token_budget are split between them
+        so map + source + one step always fits in (context - reserve);
+      * request_max_tokens_cap clamps every max_tokens we ever send, so a
+        llama.cpp server never sees a value above its configured window.
+
+    When cfg.auto_detect_context is on and the user did not set
+    context_tokens themselves, the live server is probed (LM Studio native
+    API / Ollama /api/show) and its REAL configured length is used. Probe
+    failures are silent -- hosted APIs and offline runs keep the declared
+    number. Returns human-readable notes about what changed (empty = no
+    changes needed). Never raises.
+    """
+    import sys as _sys
+    notes: list[str] = []
+    if not cfg.auto_fit:
+        return notes
+
+    ctx = cfg.context_tokens
+    origin = cfg.sources.get("context_tokens", "default")
+    if cfg.auto_detect_context and origin == "default":
+        try:
+            from .llm import LMStudio
+            detected = LMStudio(cfg).detect_context()
+        except Exception:
+            detected = None
+        if detected and detected != ctx:
+            notes.append(f"context: server reports {detected:,} tokens "
+                         f"(config default was {ctx:,}); using it")
+            ctx = detected
+            cfg.context_tokens = ctx
+            cfg.sources["context_tokens"] = "auto-detected from server"
+
+    def setv(key: str, value):
+        cur = getattr(cfg, key)
+        if cur == value:
+            return
+        src = cfg.sources.get(key, "default")
+        # Respect explicit user settings within reason: only clamp values
+        # that physically cannot work (bigger than the whole window).
+        if src != "default" and value < cur:
+            hard_max = max(1, ctx - 1)
+            if cur <= hard_max:
+                return          # user set it and it still fits -- leave it
+        setattr(cfg, key, value)
+        cfg.sources[key] = f"auto-fit (window {ctx:,} tok)"
+        notes.append(f"{key}: {cur:,} -> {value:,}")
+
+    # Reserve: needs at least ~512 tokens of reply room; ideally >= answer.
+    reserve = min(cfg.reserve_tokens, max(512, ctx // 4))
+    setv("reserve_tokens", reserve)
+    usable = max(ctx - cfg.reserve_tokens, ctx // 2)
+
+    # Per-request output caps must fit inside the window itself.
+    cap = max(256, min(cfg.request_max_tokens_cap, usable))
+    setv("request_max_tokens_cap", cap)
+
+    step_headroom = max(cfg.max_tokens_step, cfg.max_tokens_summary)
+    if step_headroom > usable:
+        shrunk = max(200, usable // 4)
+        setv("max_tokens_step", shrunk)
+        setv("max_tokens_summary", min(cfg.max_tokens_summary, max(120, shrunk // 3)))
+        step_headroom = shrunk
+
+    # Answer/build budgets: never ask for more than the server will allow.
+    setv("max_tokens_answer", min(cfg.max_tokens_answer, cap))
+    setv("max_tokens_build", min(cfg.max_tokens_build, cap))
+    setv("max_tokens_plan", min(cfg.max_tokens_plan, cap))
+
+    # Map + gathered source share the rest of the window. 4 chars/token.
+    left = max(usable - step_headroom, 512)
+    map_tok = min(cfg.flat_map_token_budget, max(400, left // 3))
+    setv("flat_map_token_budget", map_tok)
+    gathered_tok = max(left - map_tok, 256)
+    setv("max_gathered_chars", min(cfg.max_gathered_chars, gathered_tok * 4))
+
+    if notes and verbose:
+        print("[auto-fit] " + "; ".join(notes), file=_sys.stderr)
+    return notes
 
 
 def _parse_env(name: str, raw: str):
@@ -668,6 +809,48 @@ def _apply_preset(name: str, body: dict, origin: str) -> tuple[dict, str]:
 # `pedacito config --init` starter file
 # --------------------------------------------------------------------------
 TEMPLATE = '''\
+# Pedacito configuration.  Run `pedacito config --setup` to build this file
+# interactively (it finds LM Studio / Ollama on this machine for you), or
+# edit the two lines below.  Everything else is optional.
+#
+# MANDATORY (only if your server/model differ from these defaults):
+#   base_url  where the model lives. Default: http://localhost:1234/v1
+#   model     the exact name your server reports. Default: google/gemma-3-27b
+#
+base_url = "http://localhost:1234/v1"
+model    = "google/gemma-3-27b"
+
+# Optional: pick sane token budgets without defining any profiles.
+# One of "small" (~9B local), "medium" (~14-27B local), "large" (35B+),
+# or "hosted" (DeepSeek/OpenAI-style APIs).  Delete it to use built-ins.
+tier = "medium"
+
+# Profiles let one file hold several models/tiers; select with --profile NAME
+# (or default_profile below).  A hosted API profile looks like this:
+# [profiles.deepseek]
+# base_url = "https://api.deepseek.com/v1"
+# api_key  = "sk-..."
+# model    = "deepseek-chat"
+# tier     = "hosted"
+# json_mode = "object"      # hosted APIs usually lack structured-output schemas
+
+# default_profile = "deepseek"
+
+# Every other knob (max_steps, context_tokens, temperature, thinking control,
+# chunking, review...) has a working built-in default.  See them all with:
+#   pedacito config --reference        (annotated full template)
+#   pedacito config                    (current resolved values + who set them)
+# Precedence: defaults < this file < ./.pedacito.toml < --config FILE <
+# --profile NAME < CLI flags.
+'''
+
+
+# --------------------------------------------------------------------------
+# Full annotated reference. `--init` writes the short TEMPLATE above;
+# `pedacito config --reference` prints this one so every knob stays
+# documented without overwhelming first-time users.
+# --------------------------------------------------------------------------
+REFERENCE_TEMPLATE = '''\
 # Pedacito configuration.
 #
 # Lives at ~/.config/pedacito/config.toml (Linux/macOS) or
@@ -974,6 +1157,159 @@ model    = "google/gemma-3-27b"
 # thinking_suffix = "/no_think"
 # max_tokens_answer = 10000    # thinking needs headroom beyond the preset
 '''
+
+
+
+
+# --------------------------------------------------------------------------
+# `pedacito config --setup`  interactive first-run configuration
+# --------------------------------------------------------------------------
+_KNOWN_SERVERS = (
+    ("LM Studio", "http://localhost:1234/v1"),
+    ("Ollama",    "http://localhost:11434/v1"),
+)
+
+
+def discover_servers(timeout: float = 2.0) -> list[tuple[str, str, list[str]]]:
+    """Probe the known local OpenAI-compatible servers on this machine.
+
+    Returns [(label, base_url, [model ids]), ...] for every server that
+    answers GET <base_url>/models within `timeout`. A server that is up but
+    lists no models still appears, with an empty list. Shared by
+    interactive_setup() and the GUI's setup hint."""
+    import requests
+    found = []
+    for label, url in _KNOWN_SERVERS:
+        try:
+            r = requests.get(url.rstrip("/") + "/models", timeout=timeout)
+            r.raise_for_status()
+            ids = sorted({m.get("id", "?") for m in r.json().get("data", [])})
+        except Exception:
+            continue
+        found.append((label, url, ids))
+    return found
+
+
+def _ask(prompt: str, default: str = "") -> str:
+    suffix = f" [{default}]" if default else ""
+    try:
+        raw = input(f"{prompt}{suffix}: ").strip()
+    except EOFError:
+        raw = ""
+    return raw or default
+
+
+def interactive_setup(path: Path | None = None, force: bool = False,
+                      stdin=input, stdout=None) -> Path:
+    """Build a working config file step by step, then validate it.
+
+    Asks three questions at most (where is your model, which model, hosted
+    API?) and writes a minimal file: base_url, model, and a tier -- the only
+    settings that are genuinely mandatory. Existing files are backed up to
+    <path>.bak rather than silently overwritten. Raises ConfigError on bad
+    answers; the written file is load()-checked before returning."""
+    import sys
+    out = stdout or sys.stdout
+    def say(s=""):
+        print(s, file=out)
+
+    p = path or USER_CONFIG
+    if p.exists() and not force:
+        ans = _ask(f"{p} already exists. Overwrite it? [y/N]")
+        if ans.lower() not in ("y", "yes"):
+            raise ConfigError("setup cancelled; existing config left untouched")
+
+    say("Pedacito setup -- only two settings are mandatory: where your model")
+    say("lives (base_url) and its exact name (model). Everything else has a")
+    say("working default. Press Enter to accept any suggestion in [brackets].")
+    say()
+
+    servers = discover_servers()
+    base_url = model = ""
+    hosted = False
+    api_key = ""
+    if servers:
+        say("Found running model servers on this machine:")
+        for i, (label, url, ids) in enumerate(servers, 1):
+            say(f"  {i}) {label}  {url}  ({len(ids)} model(s) listed)")
+        say("  0) none of these -- use a hosted API (DeepSeek, OpenAI, ...)")
+        choice = _ask("Choose a server", str(len(servers)) if len(servers) == 1 else "1")
+        if choice == "0":
+            hosted = True
+        else:
+            try:
+                label, base_url, ids = servers[int(choice) - 1]
+            except (ValueError, IndexError):
+                raise ConfigError(f"not a valid server choice: {choice!r}")
+            if ids:
+                say("Models that server reports:")
+                for i, m in enumerate(ids, 1):
+                    say(f"  {i}) {m}")
+                pick = _ask("Which model should Pedacito use?", ids[0])
+                try:
+                    model = ids[int(pick) - 1]
+                except (ValueError, IndexError):
+                    model = pick          # allow typing an id not currently listed
+            else:
+                model = _ask("Model name (exactly as the server reports it)")
+    else:
+        say("No LM Studio or Ollama server answered on localhost.")
+        hosted = _ask("Is this a hosted API (DeepSeek/OpenAI-style)? [Y/n]"
+                      ).lower() != "n"
+
+    if hosted:
+        base_url = _ask("API base URL", "https://api.deepseek.com/v1")
+        api_key = _ask("API key (sent over HTTPS; stored in this file)")
+        model = _ask("Model name", "deepseek-chat")
+
+    if not base_url or not model:
+        raise ConfigError("base_url and model are mandatory -- setup needs both")
+
+    tier = "hosted" if hosted else _ask(
+        "Model size tier -- small (~9B), medium (~14-27B), large (35B+)",
+        "medium")
+    if tier not in PRESETS:
+        raise ConfigError(f"tier must be one of {', '.join(PRESET_TIERS)}, got {tier!r}")
+
+    lines = [
+        "# Written by `pedacito config --setup`.",
+        "# The only mandatory settings are base_url and model. See",
+        "# `pedacito config --reference` for every other knob.",
+        f'base_url = "{base_url}"',
+        f'model    = "{model}"',
+        f'tier     = "{tier}"',
+    ]
+    if api_key:
+        lines.insert(4, f'api_key  = "{api_key}"')
+        lines.insert(5, 'json_mode = "object"   # hosted APIs lack llama.cpp schemas')
+    body = "\n".join(lines) + "\n"
+
+    # Validate BEFORE touching the user's file: parse exactly as load() will.
+    probe = p.with_suffix(".toml.setup-probe") if p.parent.exists() else \
+        Path("pedacito-setup-probe.toml")
+    try:
+        probe.parent.mkdir(parents=True, exist_ok=True)
+        probe.write_text(body)
+        load(explicit=probe)
+    finally:
+        try:
+            probe.unlink()
+        except OSError:
+            pass
+
+    if p.exists():
+        backup = p.with_name(p.name + ".bak")
+        backup.write_bytes(p.read_bytes())
+        say(f"(previous config saved to {backup})")
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(body)
+    say()
+    say(f"Wrote {p}")
+    say(f"  base_url = {base_url}")
+    say(f"  model    = {model}")
+    say(f"  tier     = {tier}" + ("  (api_key set, json_mode=object)" if api_key else ""))
+    say("Test it any time with:  pedacito config --check")
+    return p
 
 
 def write_template(path: Path | None = None, force: bool = False) -> Path:

@@ -469,7 +469,15 @@ class Agent:
                 # the same file.
                 m = _READ_HEAD_RX.match(obs)
                 if m:
-                    key = m.group(1).strip().lower()
+                    # Normalise exactly like `_task_file_targets` does:
+                    # lower-case AND strip leading "./". Without the lstrip,
+                    # a model that asks for "./src/app.js" records coverage
+                    # under "./src/app.js" while `_compute_unread` looks up
+                    # "src/app.js" -- the file reads as permanently unread,
+                    # the `done` nudge loops until the step ceiling, and the
+                    # answer phase ends with zero edit blocks ("nothing to
+                    # review" in the GUI despite successful reads).
+                    key = m.group(1).strip().lower().lstrip("./")
                     spans.setdefault(key, []).append(
                         (int(m.group(2)), int(m.group(3))))
                 self._unread_files = self._compute_unread(task)
@@ -575,17 +583,17 @@ class Agent:
         wanted = self._task_file_targets(task)
         if not wanted:
             return []
-        matched: dict[str, str] = {}          # lower rel -> canonical rel
+        matched: dict[str, str] = {}          # normalised rel -> canonical rel
         for rel in self.index.files:
-            r = rel.lower()
-            for w in wanted:
-                if r == w or r.endswith("/" + w) or w.endswith("/" + r) or w == r:
-                    matched[rel.lower()] = rel
+            r = rel.lower().lstrip("./")      # same normalisation as the
+            for w in wanted:                  # spans ledger and _task_file_targets
+                if r == w or r.endswith("/" + w) or w.endswith("/" + r):
+                    matched[r] = rel
         if not matched:
             return []
         missing = []
         for low, rel in sorted(matched.items()):
-            if self._read_spans.get(low):
+            if any(span for span in self._read_spans.get(low, ())):
                 continue
             from . import fileio
             try:

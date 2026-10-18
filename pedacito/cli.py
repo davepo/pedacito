@@ -28,7 +28,9 @@ from pathlib import Path
 from . import index as index_mod
 from .agent import Agent
 from .edits import parse_edits
-from .config import Config, ConfigError, USER_CONFIG, find_project_config, load as load_config, write_template
+from .config import (Config, ConfigError, REFERENCE_TEMPLATE, TEMPLATE,
+                     USER_CONFIG, auto_fit, find_project_config,
+                     interactive_setup, load as load_config, write_template)
 from .llm import LMStudio, LLMError, estimate_tokens
 from .select import CODE_EXTS, REFERENCE_EXTS, Matcher, select
 from . import review as review_mod
@@ -107,6 +109,14 @@ def _config(args) -> Config:
     for flag, key in (("url", "base_url"), ("model", "model")):
         if getattr(args, flag, None):
             cfg.sources[key] = f"--{flag}"
+    # Fit every token budget to the server's real context window before any
+    # request goes out. Without this, built-in/hosted-tier budgets (3k-16k
+    # answers, 24k-100k gathered source) sail past LM Studio's stock 8192 or
+    # Ollama's default 4096 and every call gets truncated or rejected --
+    # "it just kept hitting limits" even with a correct base_url/model.
+    # `pedacito config` itself skips fitting so it can report true sources.
+    if not getattr(args, "cmd", "") == "config":
+        auto_fit(cfg, verbose=True)
     return cfg
 
 
@@ -190,6 +200,23 @@ def _cmd_config(args, cfg) -> int:
     """Implement `pedacito config`: with --init, write a starter config file;
     otherwise show every resolved setting and which file/profile set it,
     and with --check, verify the LM Studio connection and model."""
+    if getattr(args, "reference", False):
+        # The full annotated template: every knob, documented. Kept separate
+        # from the short starter file that --init writes so first-run users
+        # are not handed a 300-line wall of comments.
+        target = Path(args.path) if args.path else None
+        if target is not None:
+            try:
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_text(REFERENCE_TEMPLATE)
+            except OSError as e:
+                print(f"Could not write {target}: {e}", file=sys.stderr)
+                return 2
+            print(f"Wrote reference config to {target}", file=sys.stderr)
+        else:
+            sys.stdout.write(REFERENCE_TEMPLATE)
+        return 0
+
     if args.init:
         try:
             path = write_template(Path(args.path) if args.path else None, args.force)
@@ -197,7 +224,11 @@ def _cmd_config(args, cfg) -> int:
             print(f"{e}", file=sys.stderr)
             return 2
         print(f"Wrote {path}", file=sys.stderr)
-        print("Edit base_url and model, then run `pedacito config --check`.", file=sys.stderr)
+        print("Only two settings are mandatory: base_url and model (top of the\n"
+              "file). Everything else has a working default -- see\n"
+              "`pedacito config --reference` for the annotated full list, or run\n"
+              "`pedacito config --setup` to have it built and tested interactively.\n"
+              "Then: pedacito config --check", file=sys.stderr)
         return 0
 
     root = _root(args)
@@ -477,6 +508,12 @@ def main(argv=None) -> int:
     p_conf.add_argument("--force", action="store_true", help="overwrite an existing file")
     p_conf.add_argument("--check", action="store_true",
                         help="connect to LM Studio and verify the model is loaded")
+    p_conf.add_argument("--setup", action="store_true",
+                        help="interactive first-run setup: finds a local server, "
+                             "writes and validates a minimal config")
+    p_conf.add_argument("--reference", action="store_true",
+                        help="print (or with --path, write) the full annotated "
+                             "config template")
     p_conf.add_argument("--root", default=None)
     p_conf.add_argument("--profile", metavar="NAME")
     p_conf.add_argument("paths", nargs="*", default=["."], help=argparse.SUPPRESS)
@@ -547,6 +584,22 @@ def main(argv=None) -> int:
     p_gui.add_argument("--no-open", dest="open_browser", action="store_false")
 
     args = ap.parse_args(argv)
+
+    # `config --setup` is the recovery path for a broken or missing config,
+    # so it must run even when loading the current one fails. Handled here,
+    # before _config().
+    if args.cmd == "config" and getattr(args, "setup", False):
+        try:
+            interactive_setup(Path(args.path) if args.path else None,
+                              force=args.force)
+        except ConfigError as e:
+            print(f"Setup failed: {e}", file=sys.stderr)
+            return 2
+        except KeyboardInterrupt:
+            print("\nSetup cancelled.", file=sys.stderr)
+            return 130
+        return 0
+
     try:
         cfg = _config(args)
     except ConfigError as e:

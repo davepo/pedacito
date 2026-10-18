@@ -1,0 +1,3 @@
+[console_scripts]
+pdc = pedacito.cli:main
+pedacito = pedacito.cli:main

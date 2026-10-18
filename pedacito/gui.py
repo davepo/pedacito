@@ -191,6 +191,25 @@ class State:
                 "review_detail": self.review_detail,
                 "last_task": self.last_task,
                 "recent": _load_recent(),
+                # First-run guidance: no user config file yet means every
+                # value shown is a built-in default -- say so once, with the
+                # exact command that fixes it, instead of letting the user
+                # discover a connection failure mid-task.
+                "needs_setup": not USER_CONFIG.exists(),
+                # Token-budget parity with the CLI: show what the agent will
+                # actually spend each step, and where that number came from
+                # (config vs auto-detected from the live server). Overflow
+                # confusion starts with "what limit am I hitting?" -- answer
+                # it before the user has to ask.
+                "context_tokens": self.cfg.context_tokens if self.cfg else 0,
+                "reserve_tokens": self.cfg.reserve_tokens if self.cfg else 0,
+                "max_tokens_step": self.cfg.max_tokens_step if self.cfg else 0,
+                "context_origin": (self.cfg.sources.get("context_tokens", "default")
+                                   if self.cfg else ""),
+                "json_mode": self.cfg.json_mode if self.cfg else "",
+                "snapshots": [p.name for p in
+                              (workspace.list_backups(self.root)[:8]
+                               if self.root else [])],
             }
 
 
@@ -312,7 +331,10 @@ def _check_model() -> None:
 
     with STATE.lock:
         STATE.model_checked = True
-        STATE.model_status = f"reachable \u2014 models available: {loaded}"
+        budget = (f" \u00b7 window {client.cfg.context_tokens:,}"
+                  f" ({client.cfg.sources.get('context_tokens', 'default')})"
+                  f" \u00b7 reply cap {client.cfg.max_tokens_step:,}")
+        STATE.model_status = f"reachable \u2014 models available: {loaded}{budget}"
 
 
 def _run_task(task: str, apply_now: bool) -> None:
@@ -358,46 +380,61 @@ def _run_task(task: str, apply_now: bool) -> None:
 
     if reviewing:
         new_diffs = review_mod.diffs_from_results(results, root)
+        # A rename's SOURCE file is intentionally deleted by the move, so its
+        # Result comes back ok=False ("removed (renamed...)") -- those are
+        # not failures. The old code tested `any(r.ok ...)` first and fell to
+        # the generic "edits did not match" note whenever every *applied*
+        # result was such a stub, which is exactly what a task as simple as
+        # "rename a file" produces. Distinguish real failures from rename
+        # bookkeeping before writing any note.
+        fails = [r for r in results if not r.ok
+                 and "renamed" not in (getattr(r, "message", "") or "")]
         if new_diffs:
             new_nonce = review_mod.new_nonce()
             new_page = review_mod.build_page(
                 new_diffs, task, cfg.model, cfg.active_profile,
                 new_nonce, interactive=True, stamp=when)
             review_mod.save(root, new_page, when)
+            if fails:
+                # Stage the review anyway; say honestly what didn't make it.
+                detail = "; ".join(
+                    f"{getattr(r, 'file', '?')}: {getattr(r, 'message', '')}"
+                    for r in fails[:3])
+                note = (f"Review staged for {len(new_diffs)} file(s). "
+                        f"{len(fails)} block(s) did not match and are not "
+                        f"included: {detail}")
         elif any(r.ok for r in results):
             # Edits parsed and matched, but none actually changed a file
             # (every replacement equalled the original). Not an error --
             # but it must be visible, or the review pane looks broken.
             note = ("The model proposed edits, but they leave every file "
                     "unchanged, so there is nothing to review.")
+        elif fails:
+            detail = "; ".join(
+                f"{getattr(r, 'file', '?')}: {getattr(r, 'message', '')}"
+                for r in fails[:3])
+            note = (f"No review: the model's edits did not match the "
+                    f"files ({len(fails)} block(s) failed). {detail}")
         else:
-            fails = [r for r in results if not r.ok]
-            if fails:
-                detail = "; ".join(
-                    f"{getattr(r, 'file', '?')}: {getattr(r, 'message', '')}"
-                    for r in fails[:3])
-                note = (f"No review: the model's edits did not match the "
-                        f"files ({len(fails)} block(s) failed). {detail}")
+            # Say *why* it proposed nothing. A gather that never read a
+            # file the task names is the usual cause -- without this the
+            # user sees a blank review and no way to tell whether the
+            # agent lacked ability or lacked evidence.
+            unread = list(getattr(agent, "_unread_files", []) or [])
+            if unread:
+                note = ("No review: the model answered without proposing any "
+                        "edits -- it never `read` the files it would need to "
+                        "change: " + ", ".join(unread[:5]) +
+                        ". Raise max_steps so gathering has room to cover "
+                        "them.")
+            elif not getattr(agent, "read_any", True):
+                note = ("No review: the model answered without proposing any "
+                        "edits -- every lookup during gathering failed, so "
+                        "it never saw any source text. Check the step log "
+                        "for bad paths or line ranges.")
             else:
-                # Say *why* it proposed nothing. A gather that never read a
-                # file the task names is the usual cause -- without this the
-                # user sees a blank review and no way to tell whether the
-                # agent lacked ability or lacked evidence.
-                unread = list(getattr(agent, "_unread_files", []) or [])
-                if unread:
-                    note = ("No review: the model answered without proposing any "
-                            "edits -- it never `read` the files it would need to "
-                            "change: " + ", ".join(unread[:5]) +
-                            ". Raise max_steps so gathering has room to cover "
-                            "them.")
-                elif not getattr(agent, "read_any", True):
-                    note = ("No review: the model answered without proposing any "
-                            "edits -- every lookup during gathering failed, so "
-                            "it never saw any source text. Check the step log "
-                            "for bad paths or line ranges.")
-                else:
-                    note = ("No review: the model answered without proposing "
-                            "any edits.")
+                note = ("No review: the model answered without proposing "
+                        "any edits.")
     else:
         applied = any(r.ok for r in results)
         if applied:
@@ -460,6 +497,47 @@ def _apply_review() -> tuple[bool, str]:
         if STATE.agent is not None:
             STATE.agent.index = idx
     return ok, detail
+
+
+def _restore_snapshot(name: str = "") -> tuple[bool, str]:
+    """Undo an applied run by copying its backup snapshot back over the
+    working tree -- the GUI counterpart of `pedacito restore`. `name` is a
+    snapshot directory name from status()['snapshots']; empty means newest.
+    Files created since the snapshot stay on disk (workspace.restore
+    reports them as '(+)' rather than deleting anything)."""
+    with STATE.lock:
+        root = STATE.root
+        cfg = STATE.cfg
+        idx = STATE.idx
+    if root is None:
+        return False, "No project is open."
+    snaps = workspace.list_backups(root)
+    if not snaps:
+        return False, "No snapshots exist for this project yet."
+    snap = snaps[0]
+    if name:
+        matches = [s for s in snaps if s.name == name]
+        if not matches:
+            return False, f"Snapshot {name!r} no longer exists."
+        snap = matches[0]
+    restored = workspace.restore(root, snap)
+    # The tree changed underneath the index; rebuild coverage for what came
+    # back so the next task sees the restored contents, not stale summaries.
+    if idx is not None and cfg is not None:
+        for rel in restored:
+            idx = index_mod.reindex_file(idx, rel, cfg)
+        with STATE.lock:
+            STATE.idx = idx
+            if STATE.agent is not None:
+                STATE.agent.index = idx
+    with STATE.lock:
+        STATE.clear_review()
+    extra = sum(1 for r in restored if r.endswith(" (+)"))
+    detail = f"Restored {len(restored) - extra} file(s) from {snap.name}."
+    if extra:
+        detail += (f" {extra} file(s) created after that snapshot are still "
+                   "on disk; delete them by hand if unwanted.")
+    return True, detail
 
 
 # --------------------------------------------------------------------------
@@ -617,11 +695,23 @@ function render(s) {
   $('indexLbl').textContent = s.has_index ? (s.index_files + ' files indexed') : 'no index yet';
   $('buildBtn').hidden = s.has_index;
   $('modelStatus').textContent = s.model_checked ? s.model_status : '';
+  $('setupHint').hidden = !s.needs_setup;
+  // Restore UI: enabled only while a snapshot exists for the open project.
+  var snaps = s.snapshots || [];
+  $('restoreBtn').disabled = snaps.length === 0 || !s.root;   // busy applied below
+  var sel = $('snapshotSel');
+  sel.hidden = snaps.length < 2;
+  if (sel.dataset.snaps !== snaps.join('|')) {
+    sel.dataset.snaps = snaps.join('|');
+    sel.innerHTML = '<option value="">newest</option>' + snaps.map(function (n) {
+      return '<option value="' + n + '">' + n + '</option>'; }).join('');
+  }
   renderFiles(s.files || []);
 
   var busy = s.busy;
   ['openBtn', 'buildBtn', 'checkBtn', 'runBtn'].forEach(function (id) { $(id).disabled = busy || !s.root && id !== 'openBtn'; });
   $('runBtn').disabled = busy || !s.has_index;
+  if (busy) { $('restoreBtn').disabled = true; }
   var steps = (s.steps || []);
   var prog = busy ? (steps.length ? steps[steps.length - 1] + '\\u2026' : '') : '';
   $('busyLbl').textContent = busy ? (s.busy_what + '\\u2026 ' + prog) : '';
@@ -692,6 +782,15 @@ $('profile').addEventListener('change', function () {
 $('fileSearch').addEventListener('input', filterFiles);
 $('buildBtn').addEventListener('click', function () { post('/build_index', {}); });
 $('checkBtn').addEventListener('click', function () { post('/check_model', {}); });
+$('restoreBtn').addEventListener('click', function () {
+  if (!confirm('Restore the working tree from snapshot "' +
+               ($('snapshotSel').value || 'newest') +
+               '"? Files changed since then will be overwritten.')) return;
+  $('restoreMsg').textContent = 'restoring\\u2026';
+  post('/restore', { snapshot: $('snapshotSel').value }).then(function (res) {
+    $('restoreMsg').textContent = res.detail || (res.ok ? 'done' : 'failed');
+  });
+});
 $('runBtn').addEventListener('click', function () {
   var task = $('task').value.trim();
   if (!task) return;
@@ -766,6 +865,17 @@ PAGE_HTML = f"""<!doctype html>
   </div>
   <div class="status"><span id="busyLbl"></span></div>
   <div class="error" id="errLbl"></div>
+  <div id="setupHint" hidden style="margin-top:8px;padding:8px 10px;border:1px solid var(--line);border-radius:6px;background:var(--panel)">
+    No config file found &mdash; running on built-in defaults
+    (<code>http://localhost:1234/v1</code>). Set yours up in ~30 seconds:<br>
+    <code>pedacito config --setup</code>&nbsp;(finds LM Studio / Ollama for you)
+    or&nbsp;<code>pedacito config --init</code>&nbsp;(edit a 5-line starter file).
+  </div>
+  <div class="row" style="margin-top:8px">
+    <button id="restoreBtn" title="copy the newest backup snapshot back over the working tree">Restore last backup</button>
+    <select id="snapshotSel" title="choose which snapshot to restore" hidden></select>
+    <span id="restoreMsg"></span>
+  </div>
 </section>
 
 <section class="card">
@@ -890,6 +1000,9 @@ class _Handler(BaseHTTPRequestHandler):
                     "cancelled", "No files were changed.")
                 STATE.clear_review()
             self._json(200, {"ok": True})
+        elif path == "/restore":
+            ok, detail = _restore_snapshot(body.get("snapshot", ""))
+            self._json(200 if ok else 400, {"ok": ok, "detail": detail})
         elif path == "/shutdown":
             self._json(200, {"ok": True})
             threading.Thread(target=_shutdown_server, daemon=True).start()
