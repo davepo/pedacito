@@ -459,11 +459,20 @@ def apply_edits(root: Path, edits: list[Edit], backup: bool = True,
                     return True
                 return False
 
+            # A path whose blocks also CREATE it (empty SEARCH + non-empty
+            # REPLACE -- the placeholder half of a rename pair, or an
+            # overwrite) must never be classified as a remover from a stray
+            # empty-SEARCH/empty-REPLACE block: pairing it with itself would
+            # move a zero-byte stub into the new path and delete the real
+            # file. Such pairs are refused outright (see the renames loop).
+            creates_here = any(not e.search.strip() and e.replace.strip()
+                               for e in g)
             for e in g:
                 if e.replace.strip():
                     continue
                 if not e.search.strip():
-                    can_clear = True         # explicit wipe of an existing file
+                    if not creates_here:
+                        can_clear = True     # explicit wipe of an existing file
                     continue
                 span = locate(original, e.search, cfg)
                 if span is None:
@@ -501,24 +510,24 @@ def apply_edits(root: Path, edits: list[Edit], backup: bool = True,
             return str(Path(rel).with_suffix("")).lower()
 
         def _pair_score(old: str, new: str) -> int:
-            """Rank candidate pairings; -1 rejects a pair. Same directory is
-            the strongest signal (a rename almost always stays in place),
-            then same basename stem (sentences.js -> palabras.js scores 0 but
-            prep/index.html -> conversaciones/index.html must not win just by
-            alphabetical order of the target path). A NEW path whose name
-            CONTAINS the old file's stem (subj-imp/sentences.js ->
-            subj-imp/subjuntivo-imperativo-sentences.js) also scores high:
-            models lengthen names far more often than they shorten them, and
-            without this the pairing falls back to bare alphabetical order --
-            which silently mis-pairs multi-file renames."""
-            if Path(old).parent == Path(new).parent:
-                base = Path(old).name.lower()
-                if base in Path(new).name.lower():
-                    return 3
+            """Rank candidate pairings; -1 rejects a pair.
+
+            A rename almost always stays in the SAME directory -- and when it
+            doesn't, the old file's stem must survive in the new name (moving
+            `notes.md` into `docs/notes.md` is legitimate; pairing
+            root/index.html with subj-imp/index.html because both are named
+            index.html would WIPE the home page to "rename" an unrelated
+            placeholder). So cross-directory candidates are accepted only on
+            an exact stem match, same-directory ones always."""
+            same_dir = Path(old).parent == Path(new).parent
+            if not same_dir and _stem(old) != _stem(new):
+                return -1
+            base = Path(old).name.lower()
+            if base in Path(new).name.lower():
+                return 3
+            if same_dir:
                 return 2
-            if _stem(old) == _stem(new):
-                return 1
-            return 0
+            return 1
 
         def _pair(old: str, cands: list[str]):
             scored = [(s, n) for n in cands if (s := _pair_score(old, n)) >= 0]
@@ -529,11 +538,55 @@ def apply_edits(root: Path, edits: list[Edit], backup: bool = True,
 
         # Pass 1: same-directory pairs first -- they are unambiguous.
         rem_list, cre_list = sorted(removers), sorted(creators)
+
+        def _source_is_real(old: str) -> bool:
+            """True when the would-be rename source actually holds content
+            worth moving. A file whose whole body is a rename placeholder
+            comment (created by an earlier half-finished rename turn) carries
+            no real bytes: pairing it as a SOURCE turns the protocol's own
+            marker into a wipe of a live file -- exactly how root index.html
+            lost its contents when a stale subjuntivo-imperativo-sentences.js
+            stub matched the clearing block instead of sentences.js."""
+            path = root_resolved / old
+            if not path.is_file():
+                return False
+            try:
+                text, _ = fileio.read(path, errors="replace")
+            except OSError:
+                return False
+            return not _is_placeholder_only(text)
+
+        def _placeholder_target(new: str) -> bool:
+            """True when `new`'s create blocks in this reply are only a short
+            rename placeholder. Such a target may pair ONLY with a source that
+            has a NON-empty clearing block: an empty-SEARCH/empty-REPLACE wipe
+            also matches any other existing path in the reply (the model's
+            stray blank block against the file it just created), and pairing a
+            placeholder with that wipe moves zero bytes while leaving the real
+            file edited-but-not-renamed -- the exact silent half-rename from
+            the DeepSeek test. The wipe-vs-placeholder case stays allowed for
+            full-content targets (legit 'replace X with new content')."""
+            g = groups.get(new, [])
+            bodies = [e.replace.strip() for e in g
+                      if not e.search.strip() and e.replace.strip()]
+            return bool(bodies) and all(_is_placeholder_only(b) for b in bodies)
+
+        def _explicit_wipe_only(old: str) -> bool:
+            """True when every clearing block for `old` has an EMPTY search
+            (a bare wipe) -- i.e. there is no content-quoting clear to anchor
+            a placeholder pairing on."""
+            g = groups.get(old, [])
+            clears = [e for e in g if not e.replace.strip()]
+            return bool(clears) and all(not e.search.strip() for e in clears)
+
         for old in rem_list:
+            if not _source_is_real(old):
+                continue
             suffix = Path(old).suffix.lower()
             cand = [n for n in cre_list if n != old and n not in used
                     and Path(n).suffix.lower() == suffix
-                    and Path(n).parent == Path(old).parent]
+                    and Path(n).parent == Path(old).parent
+                    and not (_placeholder_target(n) and _explicit_wipe_only(old))]
             if cand:
                 new = min(cand)
                 renames[old] = new
@@ -541,11 +594,12 @@ def apply_edits(root: Path, edits: list[Edit], backup: bool = True,
         # Pass 2: remaining sources pair with remaining targets by stem, then
         # nearest common parent, then plain name order.
         for old in rem_list:
-            if old in renames:
+            if old in renames or not _source_is_real(old):
                 continue
             suffix = Path(old).suffix.lower()
             cand = [n for n in cre_list if n != old and n not in used
-                    and Path(n).suffix.lower() == suffix]
+                    and Path(n).suffix.lower() == suffix
+                    and not (_placeholder_target(n) and _explicit_wipe_only(old))]
             if not cand:
                 continue
             new = _pair(old, cand)
@@ -691,6 +745,10 @@ def apply_edits(root: Path, edits: list[Edit], backup: bool = True,
             continue
 
         srcs = tuple(o for o, n in renames.items() if n == rel)
+        # A rename whose SOURCE is the target itself (a self-pair that slipped
+        # past pairing rules) would read the placeholder back as "moved
+        # content" and then delete it -- a no-op at best, data loss at worst.
+        srcs = tuple(o for o in srcs if o != rel)
         # A path can be BOTH a rename source and a creation target ("replace
         # index.html with a new page, archive the old ones"). Its clear blocks
         # were dropped above; only empty-SEARCH create blocks remain -- treat
