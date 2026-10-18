@@ -78,6 +78,11 @@ Rules:
 - Paths are relative to the project root, forward slashes, no leading "./".
 - Include source files, tests, a README, and packaging/config if the spec
   implies them. Do not include lock files, binaries, or directories.
+- If the spec describes a runnable program or command-line tool, include a
+  `main.py` at the project root with a `main()` function and an
+  `if __name__ == "__main__": main()` guard, so it runs as `python main.py`
+  (packaging wires it to a console command too). Import the rest of the
+  project from `main.py` rather than duplicating logic there.
 - Prefer few, substantial files over many stubs: a small model loses track of
   a project that is spread too thin.
 - Keep it inside the limit you are given. If the spec needs more than that,
@@ -101,6 +106,8 @@ Rules:
 - Real, working code. No placeholders like TODO or pass-only bodies unless the
   spec asks for a stub.
 - Import only from files listed as existing. Never invent a sibling module.
+- If YOUR file is `main.py`, give it a `main()` function and an
+  `if __name__ == "__main__": main()` guard so `python main.py` runs the tool.
 - Do not write any other file, and do not explain yourself."""
 
 RESUME_SYSTEM = """\
@@ -329,6 +336,9 @@ version = "0.1.0"
 description = "{summary}"
 requires-python = ">=3.11"
 
+[project.scripts]
+{name} = "main:main"
+
 [build-system]
 requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
@@ -370,7 +380,8 @@ def apply_skeleton(root: Path, plan: Plan, dry_run: bool = False,
                    if f.path.lower() in ("readme.md", "docs/readme.md")), None)
     if readme is None:
         wanted.setdefault("README.md",
-                          f"# {plan.project_name}\n\n{plan.summary or ''}\n")
+                          f"# {plan.project_name}\n\n{plan.summary or ''}\n\n"
+                          "## Run\n\n```bash\npython main.py\n```\n")
     name = "".join(c for c in plan.project_name.lower().replace(" ", "-")
                    if c.isalnum() or c == "-").strip("-") or "project"
     wanted.setdefault("pyproject.toml",
@@ -558,11 +569,11 @@ def run_new(root: Path, cfg, client, spec: Spec, *, apply: bool = False,
     Stage gates, cheapest first:
       --plan-only  stop after stage 1+2: a tree of headers plus a saved index,
                    ready for `pedacito resume` or ordinary `ask --apply` runs.
-      default      dry-run the build passes: you see the code, nothing is
-                   written beyond the skeleton.
+      default      dry run: print the plan and a preview of the skeleton,
+                   nothing is written to disk.
       --apply      write the generated files to disk (backups taken first).
-      --review     dry-run the build, then open the side-by-side reviewer with
-                   everything it would have written.
+      --review     build, then open the side-by-side reviewer with the result
+                   (Discard restores the pre-build snapshot).
 
     A non-empty project directory is refused unless `force`: silently mixing a
     new project into an existing one is exactly the mistake this guards."""
@@ -579,7 +590,29 @@ def run_new(root: Path, cfg, client, spec: Spec, *, apply: bool = False,
 
     plan = build_plan(spec, client, cfg, root, verbose=verbose)
     print(render_plan(plan))
-    created = apply_skeleton(root, plan, dry_run=False, verbose=verbose)
+
+    # Write modes. The default (no --apply/--review/--plan-only) is a true dry
+    # run: show the plan and what the skeleton WOULD contain, write nothing.
+    # --plan-only writes just the header skeleton; --apply and --review write
+    # the skeleton and then build the files (review holds the result for
+    # sign-off). The old code always wrote the skeleton AND the build passes,
+    # so a bare `new` left a full project on disk and `--apply` simply re-ran
+    # the same work.
+    wants_skeleton = plan_only or apply or review
+    created = apply_skeleton(root, plan, dry_run=not wants_skeleton,
+                             verbose=verbose)
+    if not wants_skeleton:
+        if created:
+            preview = ", ".join(created[:12])
+            if len(created) > 12:
+                preview += f", ... (+{len(created) - 12})"
+            print(f"  [dry run] {len(created)} skeleton file(s) would be "
+                  f"created: {preview}", file=sys.stderr)
+        print("  Nothing was written. Re-run with --apply to build the "
+              "project, or --plan-only to write just the header skeleton.",
+              file=sys.stderr)
+        return 0
+
     idx = skeleton_index(root, plan, cfg)
     print(f"  skeleton on disk ({len(created)} new file(s)), indexed -> "
           f"{idx.root / '.pedacito'}", file=sys.stderr)
@@ -599,9 +632,8 @@ def run_new(root: Path, cfg, client, spec: Spec, *, apply: bool = False,
         when = workspace.stamp()
         backup_dir = workspace.new_backup_dir(root, when)
 
-    writing = apply and not review
     print(f"\n--- building {len(plan.sources)} file(s) "
-          f"({'WRITING' if writing else 'dry run, nothing will be written'}) ---",
+          f"({'WRITING' if apply else 'for review'}) ---",
           file=sys.stderr)
     summary = build_project(client, cfg, idx, plan, verbose=verbose)
     print("\n" + summarise_result(summary))
@@ -610,10 +642,6 @@ def run_new(root: Path, cfg, client, spec: Spec, *, apply: bool = False,
         results = _review_build(root, plan, summary, cfg, backup_dir, when)
         if results is None:
             return 1
-    elif not writing:
-        print("[dry run] re-run with --apply to write these files, or\n"
-              f"  pedacito ask {root} --apply -t \"...\" to iterate per file.",
-              file=sys.stderr)
     if cfg.log_sessions and when is not None:
         from . import workspace
         p = workspace.write_session(root, f"new: {plan.project_name}",

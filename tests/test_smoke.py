@@ -806,3 +806,38 @@ def test_step_truncation_salvage_no_escalation():
     assert obj4["action"] == "edit" and len(obj4["content"]) > 5000
     assert c4.step_truncated is True     # dispatch refuses + teaches chunking
     assert c4.n >= 2                     # escalated before accepting partials
+
+
+# ------------------------------------------------------------------- scaffold
+def test_new_dry_run_writes_nothing(tmp_path):
+    """A bare `pedacito new` (no --apply/--review/--plan-only) must be a true
+    dry run: it prints the plan and a skeleton preview but leaves the target
+    directory empty. The old code wrote the skeleton and the build passes
+    unconditionally, so 'new' and 'new --apply' produced identical trees."""
+    from pedacito import scaffold
+
+    class Stub:
+        stats = {"calls": 0, "completion_tokens": 0, "seconds": 0}
+        def chat_json(self, messages, schema, max_tokens=0):
+            return {"project_name": "md2html", "summary": "markdown to html",
+                    "files": [{"path": "main.py", "purpose": "CLI entry"},
+                              {"path": "parser.py", "purpose": "parse markdown"}]}
+        def chat(self, *a, **k):
+            return ""
+
+    code = scaffold.run_new(tmp_path, config_mod.Config(), Stub(),
+                            scaffold.Spec("markdown to html"),
+                            apply=False, review=False, plan_only=False,
+                            verbose=False)
+    assert code == 0
+    assert list(tmp_path.iterdir()) == [], "dry run wrote files to disk"
+
+
+def test_starter_pyproject_has_script_entry():
+    """The starter pyproject must wire a console-script entry point so a
+    generated CLI project is actually runnable after `pip install -e .`."""
+    from pedacito.scaffold import STARTER_PYPROJECT
+    data = tomllib.loads(STARTER_PYPROJECT.format(
+        name="md2html", summary="markdown to html"))
+    assert data["project"]["scripts"] == {"md2html": "main:main"}
+
