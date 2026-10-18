@@ -383,3 +383,45 @@ def test_compute_unread_reports_missing(tmp_path):
     agent._read_spans = {}
     missing = agent._compute_unread("edit pkg/mod.py")
     assert len(missing) == 1 and "not yet read" in missing[0]
+
+
+def test_hosted_configs_are_never_clamped_or_warned():
+    """The user-facing rule: hosted tier = no artificial token limits.
+
+    A `tier = "hosted"` config (or any non-localhost base_url) must NOT get
+    local-window treatment: budget_warnings stays silent, auto_fit is a
+    no-op even when the declared context_tokens is tiny, and chat_json's
+    truncation-retry ceiling is generous instead of being capped by
+    (context - reserve). This is the regression test for deepseek runs that
+    died at 'tried up to max_tokens=9600, ceiling 16384'.
+    """
+    import pathlib, tempfile
+    from pedacito.config import load, auto_fit, budget_warnings, is_hosted, PRESETS
+
+    def mk(text):
+        p = pathlib.Path(tempfile.mkdtemp()) / "c.toml"
+        p.write_text(text)
+        return load(explicit=p)
+
+    cfg = mk('tier = "hosted"\nbase_url = "https://api.deepseek.com/v1"'
+             '\nmodel = "deepseek-chat"\njson_mode = "object"\n')
+    assert is_hosted(cfg)
+    assert budget_warnings(cfg) == []
+    before = (cfg.max_tokens_step, cfg.max_tokens_answer, cfg.max_steps)
+    assert auto_fit(cfg, verbose=False) == []
+    assert (cfg.max_tokens_step, cfg.max_tokens_answer, cfg.max_steps) == before
+    assert cfg.max_steps >= 30          # turn limits raised by default
+
+    # Even an absurdly small declared window must not shrink hosted budgets.
+    cfg2 = mk('tier = "hosted"\nbase_url = "https://api.deepseek.com/v1"'
+              '\nmodel = "m"\njson_mode = "object"\ncontext_tokens = 8192\n')
+    assert auto_fit(cfg2, verbose=False) == []
+    assert cfg2.max_tokens_answer == PRESETS["hosted"]["max_tokens_answer"]
+
+    # Local profiles keep the old protective behaviour.
+    cfg3 = mk('[server]\nbase_url = "http://localhost:1234/v1"\nmodel = "m"\n'
+              'tier = "small"\ncontext_tokens = 8192\nmax_tokens_answer = 99999\n')
+    assert not is_hosted(cfg3)
+    assert budget_warnings(cfg3)
+    auto_fit(cfg3, verbose=False)
+    assert cfg3.max_tokens_answer <= cfg3.context_tokens - 512

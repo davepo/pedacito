@@ -764,9 +764,9 @@ profile you get the defaults in this table. See "Running multiple models".
 | `max_consecutive_failures` | 3 | Aborts an indexing batch after this many failures in a row. |
 | `json_mode` | `"schema"` | `"schema"` for local llama.cpp/LM Studio, `"object"` for hosted OpenAI-compatible APIs (DeepSeek, OpenAI, …). |
 | `temperature` | 0.2 | Higher makes tool selection noticeably worse. |
-| `max_tokens_step` | 700 | Budget for one tool call; raise for models that narrate at length. Thinking models need more than this looks — reasoning tokens count against it, and a budget spent entirely on thinking returns no action at all (pedacito reports that case explicitly now). |
-| `max_tokens_answer` | 3000 | Budget for the final answer/edit reply. |
-| `max_steps` | 6 | Lookups allowed before the model must answer. |
+| `max_tokens_step` | 700 (tier presets: small 500, medium 1500, large 1000, hosted 8000) | Budget for one tool call; raise for models that narrate at length. Thinking models need more than this looks — reasoning tokens count against it, and a budget spent entirely on thinking returns no action at all (pedacito reports that case explicitly now). |
+| `max_tokens_answer` | 3000 (hosted tier: 40000) | Budget for the final answer/edit reply. |
+| `max_steps` | 30 (tier presets: 40–100) | Lookups allowed before the model must answer. Deliberately generous: hitting this mid-gather is what produced "the model answered without proposing any edits" failures. |
 | `max_gathered_chars` | 24000 | Ceiling on accumulated source per task. |
 | `context_tokens` | 8192 | Assumed server context window. Ignored when auto-detection succeeds (see "Token budgets" below); set it explicitly only to override the detected value. |
 | `reserve_tokens` | 2048 | Headroom held back from `context_tokens` for chat-template overhead. Auto-fit shrinks it first on tiny windows. |
@@ -820,6 +820,17 @@ and gathered-source ceilings split whatever space is left. You'll see one
 overridden when they physically cannot work. This is also what makes a
 `tier = "hosted"` profile safe on local hardware — DeepSeek-sized numbers
 get squeezed to the real window instead of 400ing.
+
+**Hosted APIs are exempt.** When pedacito recognises a hosted API (an
+explicit `tier = "hosted"`, `json_mode = "object"`, or any non-localhost
+`base_url`), auto-fit becomes grow-only and the fit warnings go quiet: your
+`context_tokens` is treated as a budget, not hardware, and reply limits are
+never clamped by a stale local default. The truncation-retry ceiling in the
+JSON layer likewise jumps to at least 65k tokens for hosted runs, so a
+model writing several large files in one answer gets room to finish instead
+of dying at "tried up to max_tokens=9600, ceiling 16384". Set limits
+explicitly in your profile if your provider's real caps differ — explicit
+values always win.
 
 **Graceful overflow.** During a task, if the running conversation outgrows
 the window, the oldest read results are trimmed (their source already

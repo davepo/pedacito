@@ -407,7 +407,9 @@ base_url = "https://api.deepseek.com/v1"
 model = "deepseek-chat"
 json_mode = "object"               # hosted APIs reject json_schema
 # no tier line needed: ".../api.deepseek.com" + "deepseek-chat" infer "hosted"
-# -> 16000-token answers, 100k-char gathers, 12000-token map budget
+# -> 40000-token answers, 8000-token steps, 100-step gather budget.
+# Hosted profiles are never clamped to a local window: raise limits only if
+# your provider's real caps require it (explicit keys always win).
 
 [profiles.reasoning]
 model = "qwen3:32b"

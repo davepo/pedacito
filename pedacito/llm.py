@@ -704,15 +704,27 @@ class LMStudio:
         # answer budgets), so raising max_tokens_step or reserve_tokens in
         # the profile actually raises this limit too.
         if cap is None:
-            # Never escalate past what the model's context window can hold:
-            # a request bigger than (context - reserve) gets clamped by the
-            # server anyway, and a truncated retry at that size just wastes
-            # round trips. The ceiling is the smaller of the generous default
-            # and the caller's own usable window; it always clears max_tokens.
-            usable = self.cfg.context_tokens - self.cfg.reserve_tokens
-            cap = min(max(2048, self.cfg.reserve_tokens,
-                          self.cfg.max_tokens_answer, max_tokens * 4),
-                      max(usable, max_tokens))
+            from .config import is_hosted
+            if is_hosted(self.cfg):
+                # Hosted APIs have no local window to clamp against. DeepSeek
+                # alone allows 8k+ tokens of *output* per message; capping the
+                # retry ceiling at (context - reserve) -- where context was a
+                # stale local default like 8192 -- is exactly what produced
+                # "tried up to max_tokens=9600, ceiling 16384" and killed
+                # every big write. For hosted runs the escalation ceiling is
+                # generous and only bounded by what the config itself says.
+                cap = max(65536, self.cfg.max_tokens_answer,
+                          self.cfg.max_tokens_step * 8, max_tokens * 8)
+            else:
+                # Never escalate past what the model's context window can hold:
+                # a request bigger than (context - reserve) gets clamped by the
+                # server anyway, and a truncated retry at that size just wastes
+                # round trips. The ceiling is the smaller of the generous default
+                # and the caller's own usable window; it always clears max_tokens.
+                usable = self.cfg.context_tokens - self.cfg.reserve_tokens
+                cap = min(max(2048, self.cfg.reserve_tokens,
+                              self.cfg.max_tokens_answer, max_tokens * 4),
+                          max(usable, max_tokens))
         cap = max(cap, max_tokens)
         for attempt in range(retries + 1):
             raw = self.chat(messages, max_tokens=budget, schema=schema)

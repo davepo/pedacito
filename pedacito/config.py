@@ -154,8 +154,13 @@ class Config:
     # Nominal lookup budget for the gather phase. It is a guardrail against
     # looping, not a hard coverage limit: if the model says `done` while files
     # the task names are still unread, the loop extends step-by-step (up to an
-    # internal ceiling of 40) rather than failing the answer phase outright.
-    max_steps: int = 6
+    # internal ceiling of 80) rather than failing the answer phase outright.
+    # Models routinely need 15-25 lookups to cover a real task (locate, read
+    # each file fully, verify); at a stingy default the loop hit its nominal
+    # limit mid-gather and ended with "Raise max_steps so gathering has room
+    # to cover them". The guardrail only matters against looping models, and
+    # the loop already extends step-by-step while coverage improves.
+    max_steps: int = 30
     # Hard cap on how much source the gather phase may accumulate. A 27B's
     # usable reasoning window is well under its advertised context.
     max_gathered_chars: int = 24000
@@ -512,6 +517,15 @@ def budget_warnings(cfg: Config) -> list[str]:
     human-readable warnings; empty means the configuration fits. Never raises
     -- a conservative guess about someone's server should not block a run."""
     w: list[str] = []
+    # Hosted APIs (DeepSeek, OpenAI, ...) have no local window to fit to --
+    # their context_tokens is a budget, not hardware. Their server-side caps
+    # are enormous compared with anything we send, so the local-style "this
+    # cannot fit" warnings only create noise ("kept hitting limits" panic on
+    # configs that work fine). Explicit per-profile values still apply; we
+    # just stop second-guessing them here. auto_fit and llm.py likewise treat
+    # hosted runs as grow-only / unclamped.
+    if is_hosted(cfg):
+        return w
     usable = cfg.context_tokens - cfg.reserve_tokens
     if usable <= 0:
         w.append(f"reserve_tokens ({cfg.reserve_tokens}) leaves nothing of "
@@ -538,6 +552,29 @@ def budget_warnings(cfg: Config) -> list[str]:
                  f"max_gathered_chars or flat_map_token_budget, or raise "
                  f"context_tokens if your server really has more room.")
     return w
+
+
+def is_hosted(cfg: "Config") -> bool:
+    """True when the active config targets a remote API rather than a local
+    model server.
+
+    Signals, in order of authority: an explicit `tier = "hosted"` (top level
+    or profile); `json_mode = "object"`, which the setup wizard and every
+    template set only for hosted APIs; a base_url that points anywhere other
+    than localhost. Used by auto_fit to leave hosted budgets alone -- there
+    is no hardware window to fit them to -- and by llm.py's truncation-retry
+    ceiling so hosted runs are never clamped by a stale local default.
+    """
+    if cfg.active_tier == "hosted":
+        return True
+    if cfg.json_mode == "object":
+        return True
+    try:
+        from urllib.parse import urlparse
+        host = (urlparse(cfg.base_url).hostname or "").lower()
+    except ValueError:
+        return False
+    return host not in ("localhost", "127.0.0.1", "0.0.0.0", "::1", "")
 
 
 def auto_fit(cfg: Config, verbose: bool = True) -> list[str]:
@@ -570,9 +607,19 @@ def auto_fit(cfg: Config, verbose: bool = True) -> list[str]:
     if not cfg.auto_fit:
         return notes
 
+    # Hosted APIs have no local window to fit budgets to. Their declared
+    # context_tokens is a budget, not a hardware limit; clamping reply
+    # budgets against it (or worse, against an 8192 default left over from
+    # a local profile) is what made every deepseek step die at "tried up to
+    # max_tokens=9600, ceiling 16384" -- the model was allowed to write more
+    # than the clamp permitted, and the retry ceiling capped its recovery.
+    # For hosted runs we only ever GROW budgets toward the declared window;
+    # shrink/clamp is reserved for servers we can actually probe.
+    hosted = is_hosted(cfg)
+
     ctx = cfg.context_tokens
     origin = cfg.sources.get("context_tokens", "default")
-    if cfg.auto_detect_context and origin == "default":
+    if cfg.auto_detect_context and origin == "default" and not hosted:
         try:
             from .llm import LMStudio
             detected = LMStudio(cfg).detect_context()
@@ -596,6 +643,12 @@ def auto_fit(cfg: Config, verbose: bool = True) -> list[str]:
             hard_max = max(1, ctx - 1)
             if cur <= hard_max:
                 return          # user set it and it still fits -- leave it
+        # Hosted runs are grow-only: never shrink a budget below what the
+        # config/preset chose. There is no local window being enforced, and
+        # shrinking reply budgets is exactly how hosted tasks hit their
+        # server-side output caps mid-JSON instead of finishing.
+        if hosted and value < cur:
+            return
         setattr(cfg, key, value)
         cfg.sources[key] = f"auto-fit (window {ctx:,} tok)"
         notes.append(f"{key}: {cur:,} -> {value:,}")
@@ -637,17 +690,21 @@ def auto_fit(cfg: Config, verbose: bool = True) -> list[str]:
     gathered_tok = max(left - map_tok, 256)
     setv("max_gathered_chars", min(cfg.max_gathered_chars, gathered_tok * 4))
 
-    # Final sanity pass: every reply budget must leave real room for the
-    # prompt inside the window (llama.cpp 400s when prompt+max_tokens >
-    # n_ctx; Ollama silently truncates instead). This catches combinations
-    # the steps above could still miss -- e.g. a user who explicitly set a
-    # huge max_tokens_answer AND context_tokens barely above it.
-    hard_cap = max(128, ctx - 512)
-    for key in ("max_tokens_step", "max_tokens_summary", "max_tokens_answer",
-                "max_tokens_build", "max_tokens_plan"):
-        v = getattr(cfg, key)
-        if v > hard_cap:
-            setv(key, hard_cap)
+    if not hosted:
+        # Final sanity pass: every reply budget must leave real room for the
+        # prompt inside the window (llama.cpp 400s when prompt+max_tokens >
+        # n_ctx; Ollama silently truncates instead). This catches combinations
+        # the steps above could still miss -- e.g. a user who explicitly set a
+        # huge max_tokens_answer AND context_tokens barely above it.
+        # Skipped entirely for hosted runs: their budgets are deliberately
+        # allowed to exceed any stale local default, and the API's own limits
+        # (not ours) decide what actually fits.
+        hard_cap = max(128, ctx - 512)
+        for key in ("max_tokens_step", "max_tokens_summary", "max_tokens_answer",
+                    "max_tokens_build", "max_tokens_plan"):
+            v = getattr(cfg, key)
+            if v > hard_cap:
+                setv(key, hard_cap)
 
     if notes and verbose:
         print("[auto-fit] " + "; ".join(notes), file=_sys.stderr)
@@ -710,9 +767,13 @@ PRESET_TIERS = ("small", "medium", "large", "hosted")
 PRESETS: dict[str, dict] = {
     "small": {
         # Tight enough that nothing overflows an 8k window at 25 tok/s.
+        # max_steps is generous (40): a step is one lookup, cheap in tokens
+        # and only bounded by the context guardrails elsewhere; hitting the
+        # limit mid-gather is what produced "Raise max_steps so gathering
+        # has room to cover them" failures on real tasks.
         "max_tokens_summary": 160,
         "max_tokens_step": 500,
-        "max_steps": 8,
+        "max_steps": 40,
         "max_tokens_answer": 1500,
         "max_tokens_plan": 800,
         "max_tokens_build": 2000,
@@ -732,7 +793,7 @@ PRESETS: dict[str, dict] = {
         # finish_reason=length, no action, "didn't return an answer".
         "max_tokens_summary": 220,
         "max_tokens_step": 1500,
-        "max_steps": 12,
+        "max_steps": 50,
         "max_tokens_answer": 3000,
         "max_tokens_plan": 1200,
         "max_tokens_build": 4000,
@@ -748,7 +809,7 @@ PRESETS: dict[str, dict] = {
     "large": {
         "max_tokens_summary": 300,
         "max_tokens_step": 1000,
-        "max_steps": 16,
+        "max_steps": 60,
         "max_tokens_answer": 8000,
         "max_tokens_plan": 2500,
         "max_tokens_build": 8000,
@@ -764,12 +825,22 @@ PRESETS: dict[str, dict] = {
     "hosted": {
         # API pricing tolerates generous windows; answers and build passes
         # get real headroom instead of truncation retries.
+        #
+        # Hosted tiers are NOT auto-fit: the window here is a declared
+        # budget, not a server limit (auto_fit skips local probing for
+        # hosted profiles), so the budgets below only ever grow -- they
+        # never clamp anything the user set. A model writing four 800-line
+        # files in one answer needs ~40k output tokens; deepseek-chat's
+        # real ceiling is 8k, which no config can raise, but the budget
+        # must at least stop fighting the model within its true limits.
+        # max_tokens_step at 8k also gives thinking models room to reason
+        # and still emit a full write action in one step.
         "max_tokens_summary": 300,
-        "max_tokens_step": 1200,
-        "max_steps": 24,
-        "max_tokens_answer": 16000,
-        "max_tokens_plan": 3000,
-        "max_tokens_build": 12000,
+        "max_tokens_step": 8000,
+        "max_steps": 100,
+        "max_tokens_answer": 40000,
+        "max_tokens_plan": 8000,
+        "max_tokens_build": 32000,
         "flat_map_token_budget": 12000,
         "max_gathered_chars": 100000,
         "max_read_lines": 400,
@@ -1002,7 +1073,7 @@ model    = "google/gemma-3-27b"
 #                                  # hard wall: if the model says `done` while
 #                                  # files the task names are still unread,
 #                                  # the loop grants extra steps one at a time
-#                                  # (internal ceiling 40) until coverage is
+#                                  # (internal ceiling 80) until coverage is
 #                                  # complete or the gathered-char budget runs
 #                                  # out. Raise it for API models on big tasks.
 # max_gathered_chars = 24000       # ceiling on accumulated source per task
