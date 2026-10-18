@@ -200,6 +200,14 @@ class Config:
     # Hosted models re-anchor reliably and merit more rounds; small local
     # models mostly repeat the same bad copy, so fewer rounds wastes less time.
     repair_rounds: int = 2
+    # Per-message OUTPUT ceiling the provider actually honours. Hosted APIs
+    # cap one reply far below their advertised context window (deepseek-chat
+    # and dashscope Qwen: ~8k tokens; asking for more just truncates the
+    # reply mid-block). When set (>0) and the run targets a hosted API,
+    # auto_fit clamps max_tokens_answer/plan/build to this value so a huge
+    # budget can never turn a clean first block into a doomed truncated one.
+    # 0 keeps the historical behaviour (trust the declared budgets).
+    max_output_tokens: int = 0
 
     # --- Context window -------------------------------------------------------
     # The server-side context length you configured for the model (LM Studio's
@@ -565,6 +573,41 @@ def load(root: Path | None = None, explicit: Path | None = None,
         cfg.json_mode = "object"
         cfg._hosted_server = True
 
+    # Provider per-message OUTPUT ceiling autodetect. Some hosted APIs
+    # advertise a 64k-128k CONTEXT window but cut a single *thinking* reply
+    # off far earlier -- dashscope Qwen's thinking variants exhaust ~8k
+    # before emitting JSON ("cut off" / "failure to return json"). For those
+    # models, when max_output_tokens was not set explicitly, default it to
+    # the conservative 8k they honour; auto_fit then clamps every reply
+    # budget to it (the continuation loop in agent.py recovers whatever
+    # blocks survive).
+    #
+    # Deliberately NOT applied to plain deepseek-chat / generic remote hosts:
+    # their documented message ceiling is far larger than 8k, the shipped
+    # hosted preset budgets are already sized for them, and clamping here
+    # would silently shrink answers for users who chose tier="hosted"
+    # precisely to opt out of artificial limits. If a provider does truncate
+    # at N tokens, set `max_output_tokens = N` in the config -- it is honoured
+    # as a hard cap by auto_fit even when auto_fit is off.
+    qwen_thinking = any(t in cfg.model.lower() for t in
+                        ("qwq", "qwen3", "qwen-3", "thinking"))
+    if (qwen_thinking or deepseek) and cfg.json_mode == "schema":
+        # Same failure class from the other side: thinking models spend the
+        # whole reply budget on reasoning text and never reach the JSON. A
+        # schema response forces structured output immediately. Applies only
+        # when the user did not spell json_mode (source stays "default"), so
+        # an explicit choice is never overridden.
+        if cfg.sources.get("json_mode") == "default":
+            cfg.json_mode = "schema"
+            cfg.sources["json_mode"] = (
+                f"auto-selected for thinking model ({cfg.model}); set "
+                "json_mode explicitly to override")
+    if qwen_thinking and cfg.sources.get("max_output_tokens") == "default":
+        cfg.max_output_tokens = 8000
+        cfg.sources["max_output_tokens"] = (
+            f"auto-detected output ceiling for thinking model "
+            f"({cfg.model}); set max_output_tokens explicitly to override")
+
     # Loud-but-not-fatal: budgets that cannot fit the declared context window
     # are how truncation errors reach the user, so surface them at load time.
     for warning in budget_warnings(cfg):
@@ -666,7 +709,25 @@ def auto_fit(cfg: Config, verbose: bool = True) -> list[str]:
     """
     import sys as _sys
     notes: list[str] = []
+
+    # max_output_tokens is a HARD provider cap, honoured even when auto_fit
+    # is off -- asking the server for more than it will ever emit only
+    # guarantees a truncated reply. Clamp first; the window-fitting logic
+    # below then sees budgets that already fit the provider's ceiling.
+    mot0 = int(getattr(cfg, "max_output_tokens", 0) or 0)
+    if mot0 > 0:
+        for key in ("max_tokens_answer", "max_tokens_build",
+                    "max_tokens_plan", "max_tokens_step"):
+            v = getattr(cfg, key)
+            if v > mot0:
+                setattr(cfg, key, mot0)
+                cfg.sources[key] = f"max_output_tokens ({mot0:,})"
+                notes.append(f"{key}: {v:,} -> {mot0:,}")
+
     if not cfg.auto_fit:
+        if mot0 > 0 and verbose and notes:
+            print("[config] clamped to max_output_tokens: "
+                  + "; ".join(notes), file=_sys.stderr)
         return notes
 
     # Hosted APIs have no local window to fit budgets to. Their declared
@@ -744,6 +805,24 @@ def auto_fit(cfg: Config, verbose: bool = True) -> list[str]:
     setv("max_tokens_answer", min(cfg.max_tokens_answer, cap, usable - 256))
     setv("max_tokens_build", min(cfg.max_tokens_build, cap, usable - 256))
     setv("max_tokens_plan", min(cfg.max_tokens_plan, cap, usable - 256))
+
+    # Provider per-message OUTPUT ceiling. Hosted APIs advertise a huge
+    # context window but cut a single reply off far earlier (~8k tokens on
+    # deepseek-chat and dashscope Qwen). Asking for more than that never
+    # yields a longer answer -- it truncates one mid-JSON/mid-block, which
+    # is exactly the "son cut off / failure to return json" failure. When
+    # max_output_tokens is set, clamp every reply budget to it; unlike the
+    # grow-only hosted rule above, this shrink IS physical (the server
+    # enforces it regardless of what we request), so it applies even when
+    # the user explicitly raised a budget.
+    mot = int(getattr(cfg, "max_output_tokens", 0) or 0)
+    if mot > 0:
+        for key in ("max_tokens_answer", "max_tokens_build",
+                    "max_tokens_plan", "max_tokens_step"):
+            v = getattr(cfg, key)
+            if v > mot:
+                setv(key, mot)
+                cfg.sources[key] = f"auto-fit (max_output_tokens {mot:,})"
 
     # Map + gathered source share the rest of the window. 4 chars/token.
     left = max(usable - max(cfg.max_tokens_step, cfg.max_tokens_summary), 512)
