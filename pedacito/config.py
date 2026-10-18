@@ -609,24 +609,45 @@ def auto_fit(cfg: Config, verbose: bool = True) -> list[str]:
     cap = max(256, min(cfg.request_max_tokens_cap, usable))
     setv("request_max_tokens_cap", cap)
 
-    step_headroom = max(cfg.max_tokens_step, cfg.max_tokens_summary)
-    if step_headroom > usable:
-        shrunk = max(200, usable // 4)
-        setv("max_tokens_step", shrunk)
-        setv("max_tokens_summary", min(cfg.max_tokens_summary, max(120, shrunk // 3)))
-        step_headroom = shrunk
+    # Reply budgets must fit in the space LEFT OVER after the prompt, not
+    # just inside the window. llama.cpp/LM Studio answer "prompt +
+    # max_tokens > n_ctx" with a flat 400 -- which is exactly what DeepSeek-
+    # style "kept hitting limits" feels like on a local server: every gather
+    # step asked for 700-1200 reply tokens while the map+task prompt already
+    # filled most of an 8k window. So step/summary budgets are clamped to
+    # half the usable space (prompts during gathering are large), and the
+    # one-shot answer budget may use nearly all of it (its prompt is charged
+    # separately by max_gathered_chars).
+    step_ceiling = max(128, usable // 2)
+    if cfg.max_tokens_step > step_ceiling:
+        setv("max_tokens_step", step_ceiling)
+    summary_ceiling = max(64, min(cfg.max_tokens_summary, step_ceiling // 3))
+    if cfg.max_tokens_summary != summary_ceiling:
+        setv("max_tokens_summary", summary_ceiling)
 
-    # Answer/build budgets: never ask for more than the server will allow.
-    setv("max_tokens_answer", min(cfg.max_tokens_answer, cap))
-    setv("max_tokens_build", min(cfg.max_tokens_build, cap))
-    setv("max_tokens_plan", min(cfg.max_tokens_plan, cap))
+    # Answer/build budgets: never ask for more than fits after the prompt.
+    setv("max_tokens_answer", min(cfg.max_tokens_answer, cap, usable - 256))
+    setv("max_tokens_build", min(cfg.max_tokens_build, cap, usable - 256))
+    setv("max_tokens_plan", min(cfg.max_tokens_plan, cap, usable - 256))
 
     # Map + gathered source share the rest of the window. 4 chars/token.
-    left = max(usable - step_headroom, 512)
+    left = max(usable - max(cfg.max_tokens_step, cfg.max_tokens_summary), 512)
     map_tok = min(cfg.flat_map_token_budget, max(400, left // 3))
     setv("flat_map_token_budget", map_tok)
     gathered_tok = max(left - map_tok, 256)
     setv("max_gathered_chars", min(cfg.max_gathered_chars, gathered_tok * 4))
+
+    # Final sanity pass: every reply budget must leave real room for the
+    # prompt inside the window (llama.cpp 400s when prompt+max_tokens >
+    # n_ctx; Ollama silently truncates instead). This catches combinations
+    # the steps above could still miss -- e.g. a user who explicitly set a
+    # huge max_tokens_answer AND context_tokens barely above it.
+    hard_cap = max(128, ctx - 512)
+    for key in ("max_tokens_step", "max_tokens_summary", "max_tokens_answer",
+                "max_tokens_build", "max_tokens_plan"):
+        v = getattr(cfg, key)
+        if v > hard_cap:
+            setv(key, hard_cap)
 
     if notes and verbose:
         print("[auto-fit] " + "; ".join(notes), file=_sys.stderr)
@@ -705,10 +726,12 @@ PRESETS: dict[str, dict] = {
         "reserve_tokens": 2048,
     },
     "medium": {
-        # The built-in defaults, spelled out so a profile can inherit them
-        # explicitly and users see the ladder.
+        # ~14B-32B local models. max_tokens_step is deliberately generous:
+        # a THINKING model spends most of the step budget on hidden reasoning
+        # before emitting the JSON action, and at 700 that leaves nothing --
+        # finish_reason=length, no action, "didn't return an answer".
         "max_tokens_summary": 220,
-        "max_tokens_step": 700,
+        "max_tokens_step": 1500,
         "max_steps": 12,
         "max_tokens_answer": 3000,
         "max_tokens_plan": 1200,

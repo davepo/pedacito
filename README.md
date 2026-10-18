@@ -764,10 +764,15 @@ profile you get the defaults in this table. See "Running multiple models".
 | `max_consecutive_failures` | 3 | Aborts an indexing batch after this many failures in a row. |
 | `json_mode` | `"schema"` | `"schema"` for local llama.cpp/LM Studio, `"object"` for hosted OpenAI-compatible APIs (DeepSeek, OpenAI, …). |
 | `temperature` | 0.2 | Higher makes tool selection noticeably worse. |
-| `max_tokens_step` | 700 | Budget for one tool call; raise for models that narrate at length. |
+| `max_tokens_step` | 700 | Budget for one tool call; raise for models that narrate at length. Thinking models need more than this looks — reasoning tokens count against it, and a budget spent entirely on thinking returns no action at all (pedacito reports that case explicitly now). |
 | `max_tokens_answer` | 3000 | Budget for the final answer/edit reply. |
 | `max_steps` | 6 | Lookups allowed before the model must answer. |
 | `max_gathered_chars` | 24000 | Ceiling on accumulated source per task. |
+| `context_tokens` | 8192 | Assumed server context window. Ignored when auto-detection succeeds (see "Token budgets" below); set it explicitly only to override the detected value. |
+| `reserve_tokens` | 2048 | Headroom held back from `context_tokens` for chat-template overhead. Auto-fit shrinks it first on tiny windows. |
+| `auto_fit` | True | Rewrite every budget to fit the server's real window at startup (see "Token budgets"). Set false only if you want raw values sent to the server unchanged. |
+| `auto_detect_context` | True | Probe LM Studio's native API / Ollama `/api/show` for the configured context length instead of trusting the declared number. |
+| `request_max_tokens_cap` | 32768 | Hard ceiling on any `max_tokens` sent; auto-fit lowers it to the usable window so llama.cpp never 400s. |
 | `allow_write` | False | Let the gather loop write whole files via the `write` action (skips the edit path's backup/syntax-check/review — prefer search/replace blocks). |
 | `max_write_chars` | 200000 | Ceiling on one `write` call's contents. |
 | `max_new_files` | 24 | Cap on how many files a `pedacito new` plan may propose; excess is truncated and reported. |
@@ -789,6 +794,45 @@ profile you get the defaults in this table. See "Running multiple models".
 | `manage_gitignore` | True | Add Pedacito's workspace entries to `.gitignore` (creating it in a git checkout if absent). |
 | `create_ignore_file` | True | Create a starter `.pedacitoignore` on first run. |
 | `default_profile` | `""` | Profile applied when `--profile` isn't given. |
+
+## Token budgets: why you no longer need to tune any of this
+
+The single most common failure mode was "it keeps hitting limits and never
+returns anything" — and the cause was almost always a mismatch between our
+budgets and your server's real context window. Defaults were once sized for
+32k+ models while LM Studio ships at 8192 and Ollama caps at 4096; worse,
+llama.cpp servers reject a request outright when prompt + `max_tokens`
+exceeds the window (a flat 400 on every step), and Ollama silently
+truncates oversized prompts instead — which is how local runs ended up
+"answering" a task they had never actually seen. Three layers now prevent
+that:
+
+**Auto-detection.** At startup pedacito asks the server its *configured*
+context length (LM Studio native API, Ollama `/api/show`) and uses that
+instead of `context_tokens` — unless you set `context_tokens` yourself,
+which wins. Hosted APIs and offline runs keep the declared number.
+
+**Auto-fit (`auto_fit = true`, default).** Every budget is rewritten to fit
+the detected window: reply budgets are clamped so prompt + reply always
+fits inside it, `reserve_tokens` shrinks first on tiny windows, and the map
+and gathered-source ceilings split whatever space is left. You'll see one
+`[auto-fit] ...` line listing what changed. Explicit config values are only
+overridden when they physically cannot work. This is also what makes a
+`tier = "hosted"` profile safe on local hardware — DeepSeek-sized numbers
+get squeezed to the real window instead of 400ing.
+
+**Graceful overflow.** During a task, if the running conversation outgrows
+the window, the oldest read results are trimmed (their source already
+reaches the answer phase through the gathered buffer) rather than erroring;
+a server-side overflow error halves the reply budget and retries once
+before giving up; and a truncated JSON reply now reports "ran out of
+tokens mid-reply — raise max_tokens_step or disable thinking" instead of a
+generic parse failure.
+
+If answers still feel thin on an 8k window, the fix is usually server-side:
+raise the model's context length in LM Studio (e.g. 16k for a Q4 27B if VRAM
+allows) or set Ollama's `num_ctx`. Pedacito picks the new number up
+automatically on the next run.
 
 ## Two things to watch when pointing this at your own code
 
