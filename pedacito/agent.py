@@ -29,6 +29,7 @@ again.
 
 from __future__ import annotations
 
+import re
 import sys
 
 from .edits import apply_edits, parse_edits
@@ -513,6 +514,31 @@ class Agent:
                 break
 
             obs = dispatch(self.index, self.cfg, stepjson)
+            # If the model's last reply was cut off at the token limit and we
+            # salvaged the action from it, say so in the observation: the cut
+            # almost always happened inside 'reasoning', and an unmarked
+            # recovery lets the model keep writing essays until every step
+            # burns a truncation-retry round trip. One short sentence here
+            # stops that spiral.
+            if getattr(self.client, "step_truncated", False):
+                obs += ("\n[Note: your previous reply hit the output token "
+                        "limit before finishing its reasoning. Keep 'reasoning' "
+                        "under 10 words -- long ones get cut off and wasted.]")
+                # ...unless the cut landed INSIDE `content` of a write step:
+                # then what survived is half a file and the note above is the
+                # wrong advice. The partial content itself never reaches disk
+                # (dispatch() refuses oversized writes), but without this the
+                # model re-rolls the same giant write forever. Tell it the
+                # exact chunk size that fits one message instead.
+                if action == "write" and \
+                        len((stepjson.get("content") or "").splitlines()) > \
+                        max(1, int(getattr(self.cfg, "max_write_lines", 0) or 0)):
+                    obs += ("\n[Your `write` was CUT OFF mid-content by the "
+                            "output token limit -- it was NOT applied. Split it: "
+                            "`write` at most ~80 lines now; then `read` the "
+                            "file's last few lines and `write` again with those "
+                            "lines followed by the next ~80. Never put a whole "
+                            "large file in one reply.]")
             if action == "read" and not obs.startswith("ERROR"):
                 did_read = True
                 # Append-only span ledger. The eviction pass at the end of
@@ -610,6 +636,9 @@ class Agent:
         # from those same deltas so the answer phase sees each line exactly
         # once.
         new_items = _evict_duplicate_reads(messages, gathered, spans)
+        # Remember the deduped source so later phases (answer, repair) can
+        # rebuild their prompts without re-quoting every read from scratch.
+        self.gathered_source = "\n\n".join(new_items)
         # Final proactive trim: the loop above trims after each tool result,
         # but nudge turns (the "read these files first" prompts) can push the
         # conversation over the window between reads. Do one sweep before the
@@ -703,8 +732,28 @@ class Agent:
         reply_room = min(self.cfg.max_tokens_answer,
                          self.cfg.request_max_tokens_cap or
                          self.cfg.max_tokens_answer)
+        from .config import is_hosted as _is_hosted
+        if _is_hosted(self.cfg):
+            # Hosted APIs (DeepSeek, OpenAI, ...) have a real request-size
+            # limit too -- deepseek-chat rejects prompts over ~128k tokens,
+            # and a giant echoed history costs money and latency. Trim the
+            # OLDEST gathered chunks until the prompt fits a generous ceiling
+            # instead of refusing outright; the model still sees its most
+            # recent reads, which are the ones it wants to edit.
+            head = f"PROJECT MAP\n\n{repo_map}\n\n"
+            tail = f"\n\nTASK\n{task}"
+            ceil_ = int(getattr(self.cfg, "max_prompt_tokens", 0) or 60000)
+            src = gathered or "(nothing was looked up)"
+            while estimate_tokens(head + src + tail) > ceil_ and len(src) > 4000:
+                cut = max(4000, len(src) * 3 // 4)
+                dropped = src[cut:]
+                src = src[:cut]
+                src += ("\n\n[older gathered source trimmed to fit the "
+                        "request limit (%d chars dropped -- re-read a file "
+                        "if you need it again]" % len(dropped))
+            user = head + f"SOURCE YOU REQUESTED\n\n{src}\n" + tail
         room = self.cfg.context_tokens - reply_room - self.cfg.reserve_tokens // 2
-        if estimate_tokens(user) > room > 0:
+        if not _is_hosted(self.cfg) and estimate_tokens(user) > room > 0:
             over = estimate_tokens(user) - room
             raise LLMError(
                 f"The answer prompt would be ~{estimate_tokens(user)} tokens "
@@ -740,6 +789,52 @@ class Agent:
         only a block that must match existing text needs the repair loop."""
         if repair_rounds is None:
             repair_rounds = self.cfg.repair_rounds
+        # Answer-phase truncation continuation. Hosted APIs cap one message's
+        # OUTPUT (~8k tokens on deepseek-chat); a big multi-file task then gets
+        # cut off mid-reply no matter how large max_tokens_answer is. The old
+        # behaviour was fatal -- "kept running past the token limit" after 3
+        # identical doomed retries. Instead: keep whatever complete edit blocks
+        # survived, tell the model exactly which files still need work, and
+        # ask for just those in the next message. Each round emits a few
+        # blocks, fits under the provider cap, and the task finishes across
+        # turns. Guarded by a char budget so a rambling model cannot loop us
+        # into an infinite bill.
+        cont_budget = 0 if dry_run else \
+            max(1, int(getattr(self.cfg, "max_tokens_answer", 40000))) * 4
+        while getattr(self.client, "last_finish_reason", "") == "length" \
+                and cont_budget > 0:
+            parsed = parse_edits(reply)
+            done_files = {b.file.strip().lower().lstrip("./") for b in parsed}
+            if not done_files:
+                break                      # nothing survived; let repairs raise
+            cont_budget -= len(reply)
+            print(f"\n[reply hit the output limit mid-way; continuing with "
+                  f"{len(done_files)} file(s) done so far]", file=sys.stderr)
+            more = self.client.chat(
+                [
+                    {"role": "system", "content": ANSWER_SYSTEM},
+                    {"role": "user", "content":
+                        f"TASK\n{task}\n\n"
+                        f"EDITS ALREADY DELIVERED (do NOT repeat these):\n"
+                        + "\n".join(f"- {f}" for f in sorted(done_files)) +
+                        "\n\nYour previous reply was CUT OFF by the output "
+                        "token limit. Emit ONLY the remaining search/replace "
+                        "blocks for files not listed above -- at most two or "
+                        "three files per reply, never a whole large file in "
+                        "one REPLACE. If everything is already covered, reply "
+                        "with a single line: NOTHING MORE."},
+                ],
+                max_tokens=self.cfg.max_tokens_answer,
+                stream=True,
+            )
+            if "NOTHING MORE" in more and not parse_edits(more):
+                break
+            if not parse_edits(more):
+                # Continuation produced no edit blocks at all -- keep the
+                # truncated-but-parseable original rather than replacing it
+                # with prose, and stop so we cannot loop on empty replies.
+                break
+            reply = (reply.rstrip() + "\n\n" + more) if reply.strip() else more
         results = self._apply_once(reply, dry_run, backup_dir)
 
         for _ in range(repair_rounds):
@@ -748,15 +843,33 @@ class Agent:
                 break
             print(f"\n[{len(failures)} block(s) failed; asking the model to re-anchor]", file=sys.stderr)
             fb = "\n".join(f"- {r.file}: {r.message}" for r in failures)
+            # The repair prompt used to carry the ENTIRE gathered source plus
+            # the previous full reply back to the model. On DeepSeek that
+            # multi-GB context re-sends at input price, blows the request
+            # limit, and pushes the model to re-emit everything (truncating
+            # again). Rebuild it small: only the source of the FAILED files,
+            # and no echo of the old reply.
+            failed_paths = {(r.file or "").strip().lower().lstrip("./")
+                            for r in failures}
+            keep = []
+            for item in (self.gathered_source or gathered or "").split("\n\n"):
+                m = re.match(r"--- \w+ (\S+)", item)
+                low = m.group(1).lower().lstrip("./") if m else ""
+                if any(low == p0 or low.endswith("/" + p0) or
+                       p0.endswith("/" + low) for p0 in failed_paths if p0):
+                    keep.append(item)
+            src_slice = "\n\n".join(keep)[:12000] or "(source unavailable)"
             reply = self.client.chat(
                 [
                     {"role": "system", "content": ANSWER_SYSTEM},
-                    {"role": "user", "content": f"SOURCE\n\n{gathered}\n\nTASK\n{task}"},
-                    {"role": "assistant", "content": reply},
                     {"role": "user", "content":
+                        f"SOURCE (only the files that failed)\n\n{src_slice}\n\n"
+                        f"TASK\n{task}\n\n"
                         f"These edits could not be applied:\n{fb}\n\n"
-                        "Re-read the source above and output corrected search/replace blocks "
-                        "for ONLY the failed edits. Copy the SEARCH text exactly."},
+                        "Output ONLY the corrected search/replace blocks for the "
+                        "failed edits -- do not repeat edits that already worked, "
+                        "do not rewrite whole files. Copy the SEARCH text exactly "
+                        "from the source above."},
                 ],
                 max_tokens=self.cfg.max_tokens_answer,
                 stream=True,
