@@ -460,6 +460,7 @@ def build_pass(client, cfg, idx, plan: Plan, target: PlannedFile,
     header line to anchor on -- no repo map, because there is nothing to
     navigate yet. Returns (results, reply)."""
     from .agent import ANSWER_SYSTEM
+    from .edits import Result
 
     anchor = fileio.read_text(idx.root / target.path, errors="replace").split("\n")[0]
     spec = plan.spec.text if plan.spec else ""
@@ -488,8 +489,28 @@ def build_pass(client, cfg, idx, plan: Plan, target: PlannedFile,
         {"role": "system", "content": BUILD_SYSTEM + "\n\n" + ANSWER_SYSTEM},
         {"role": "user", "content": "\n".join(ctx)},
     ]
-    reply = client.chat(messages, max_tokens=getattr(cfg, "max_tokens_build", 8000),
-                        stream=verbose, disable_thinking=True)
+    max_tokens = getattr(cfg, "max_tokens_build", 8000)
+
+    reply = client.chat(messages, max_tokens=max_tokens, stream=verbose,
+                        disable_thinking=True)
+    if not parse_edits(reply):
+        # A reasoning model can spend its whole budget on the <think> block and
+        # return nothing usable -- some Qwen quants ignore enable_thinking=false.
+        # Nudge once with the no-think suffix plus a blunt instruction, then
+        # report the failure rather than silently dropping the file.
+        suffix = getattr(cfg, "thinking_suffix", "") or "/no_think"
+        messages[-1]["content"] += (
+            f"\n\n{suffix}\n"
+            "Output the complete file NOW as one search/replace block, and "
+            "nothing else. Do not explain.")
+        reply = client.chat(messages, max_tokens=max_tokens, stream=verbose,
+                            disable_thinking=True)
+
+    if not parse_edits(reply):
+        return [Result(False, target.path,
+                       "model returned no edit block (a thinking model may have "
+                       "spent the budget on its <think> block; try "
+                       "thinking_suffix=/no_think or a non-reasoning model)")], reply
     results = apply_edits(idx.root, parse_edits(reply), backup=cfg.backup,
                           dry_run=False, cfg=cfg)
     return results, reply
