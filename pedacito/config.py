@@ -255,8 +255,10 @@ class Config:
     # Spec documents longer than this are truncated, with a loud warning.
     max_spec_chars: int = 60_000
     # Token budgets for the two scaffold calls that do not reuse an existing
-    # answer budget.
-    max_tokens_plan: int = 1200
+    # answer budget. The plan call must clear the file-tree JSON AND, on a
+    # reasoning model, the <think> block that precedes it -- a budget sized
+    # for plain output spends itself on thinking and never emits the JSON.
+    max_tokens_plan: int = 2000
     max_tokens_build: int = 4000
 
     # --- Reasoning models -----------------------------------------------------
@@ -924,7 +926,7 @@ PRESETS: dict[str, dict] = {
         "max_tokens_step": 500,
         "max_steps": 40,
         "max_tokens_answer": 1500,
-        "max_tokens_plan": 800,
+        "max_tokens_plan": 1200,
         "max_tokens_build": 2000,
         "flat_map_token_budget": 1500,
         "max_gathered_chars": 12000,
@@ -944,7 +946,7 @@ PRESETS: dict[str, dict] = {
         "max_tokens_step": 1500,
         "max_steps": 50,
         "max_tokens_answer": 3000,
-        "max_tokens_plan": 1200,
+        "max_tokens_plan": 4000,
         "max_tokens_build": 4000,
         "flat_map_token_budget": 4000,
         "max_gathered_chars": 24000,
@@ -960,7 +962,7 @@ PRESETS: dict[str, dict] = {
         "max_tokens_step": 1000,
         "max_steps": 60,
         "max_tokens_answer": 8000,
-        "max_tokens_plan": 2500,
+        "max_tokens_plan": 8000,
         "max_tokens_build": 8000,
         "flat_map_token_budget": 8000,
         "max_gathered_chars": 60000,
@@ -1257,7 +1259,9 @@ model    = "google/gemma-3-27b"
 # [scaffold]
 # max_new_files = 24               # cap on how many files a plan may propose
 # max_spec_chars = 60000           # spec documents longer than this are cut
-# max_tokens_plan = 1200           # budget for the planning call
+# max_tokens_plan = 2000           # budget for the planning call (raise for
+#                                  # thinking models -- their <think> block
+#                                  # counts against this)
 # max_tokens_build = 4000          # budget for each per-file build pass
 
 # --- Reasoning models -------------------------------------------------------
@@ -1315,7 +1319,7 @@ model    = "google/gemma-3-27b"
 # max_steps          = 8
 # repair_rounds      = 1
 # max_tokens_answer  = 1500
-# max_tokens_plan    = 800
+# max_tokens_plan    = 1200
 # max_tokens_build   = 2000
 # flat_map_token_budget = 1500
 # max_gathered_chars = 12000
@@ -1343,7 +1347,7 @@ model    = "google/gemma-3-27b"
 # max_steps          = 12
 # repair_rounds      = 2
 # max_tokens_answer  = 3000
-# max_tokens_plan    = 1200
+# max_tokens_plan    = 4000
 # max_tokens_build   = 4000
 # flat_map_token_budget = 4000
 # max_gathered_chars = 24000
@@ -1364,7 +1368,7 @@ model    = "google/gemma-3-27b"
 # max_steps          = 16
 # repair_rounds      = 2
 # max_tokens_answer  = 8000
-# max_tokens_plan    = 2500
+# max_tokens_plan    = 8000
 # max_tokens_build   = 8000
 # flat_map_token_budget = 8000
 # max_gathered_chars = 60000

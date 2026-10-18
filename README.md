@@ -783,7 +783,7 @@ profile you get the defaults in this table. See "Running multiple models".
 | `max_write_chars` | 200000 | Ceiling on one `write` call's contents. |
 | `max_new_files` | 24 | Cap on how many files a `pedacito new` plan may propose; excess is truncated and reported. |
 | `max_spec_chars` | 60000 | Spec documents longer than this are cut, with a warning. |
-| `max_tokens_plan` | 1200 | Token budget for the planning call. |
+| `max_tokens_plan` | 2000 (tier presets: small 1200, medium 4000, large 8000, hosted 8000) | Token budget for the planning call. Thinking models spend this on their `<think>` block before the file-tree JSON, so a too-small value returns no plan at all — raise it or set `disable_thinking`. |
 | `max_tokens_build` | 4000 | Token budget for each per-file build pass. |
 | `flat_map_token_budget` | 4000 | Above this, the map switches from a full listing to per-file cards. |
 | `summarise_methods` | False | On if your methods lack useful docstrings. |
