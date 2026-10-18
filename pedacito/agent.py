@@ -441,9 +441,27 @@ class Agent:
         messages[-1]["content"] += "\n\n" + nudge(1)
 
         step = 0
+        done_confirmed = False   # one-shot guard for the post-truncation
+                                 # "are you really done?" nudge below
         while step < step_cap:
             step += 1
-            stepjson = self.client.chat_json(messages, STEP_SCHEMA, self.cfg.max_tokens_step)
+            try:
+                stepjson = self.client.chat_json(messages, STEP_SCHEMA, self.cfg.max_tokens_step)
+            except LLMError as e:
+                # A gather step that cannot produce JSON at all must not kill
+                # the whole run -- the DeepSeek failure class: json_object
+                # mode is only SOFT grammar there, so a rambling reply gets
+                # cut mid-essay and every salvage attempt fails. The answer
+                # phase rebuilds its own prompt from whatever was gathered
+                # (or the map alone), which is strictly better than an error
+                # exit after minutes of paid lookups.
+                msg = str(e).lower()
+                if "token limit" in msg or "valid json" in msg:
+                    print(f"  [gather step failed: {str(e)[:120]}...]\n"
+                          "  [proceeding to the answer phase with what was "
+                          "gathered so far]", file=sys.stderr)
+                    break
+                raise
             action = (stepjson.get("action") or "").strip()
             why = (stepjson.get("reasoning") or "").strip()
 
@@ -461,6 +479,29 @@ class Agent:
 
             if action == "done":
                 missing = list(self._unread_files)
+                # If the model kept rambling in 'reasoning' until the reply
+                # was cut off (step_truncated is set by chat_json's salvage
+                # path), its LAST words were chopped -- a deepseek-chat
+                # classic: it free-forms a long essay ("What if I rename the
+                # game files by writing new files that are the SAME content")
+                # and hits the ~8k provider cap mid-sentence. A `done` that
+                # arrives that way may be an accidental truncation artifact,
+                # not a decision; give it one explicit chance to confirm or
+                # continue gathering before honouring it.
+                if getattr(self.client, "step_truncated", False) \
+                        and not done_confirmed and step < step_cap:
+                    done_confirmed = True
+                    messages.append({"role": "assistant",
+                                     "content": _compact(stepjson)})
+                    messages.append({"role": "user", "content":
+                        "[Your previous reply hit the output token limit "
+                        "before it finished. If you truly have everything "
+                        "you need, say `done` again with 'reasoning' under 5 "
+                        "words. Otherwise take ONE more lookup.]"})
+                    if verbose:
+                        print("  (done after a truncated reply; asking once "
+                              "to confirm)", file=sys.stderr)
+                    continue
                 can_extend = (step_cap < _MAX_STEPS_CEIL and budget > 0)
                 if missing and (step < self.cfg.max_steps or can_extend):
                     # The model gathered on some files but wants to change
@@ -799,14 +840,34 @@ class Agent:
         # blocks, fits under the provider cap, and the task finishes across
         # turns. Guarded by a char budget so a rambling model cannot loop us
         # into an infinite bill.
+        #
+        # Detection lives in `stream_truncated`, NOT `last_finish_reason`:
+        # the answer phase streams (the user watches the blocks appear), and
+        # OpenAI-compatible SSE puts finish_reason only on the final chunk --
+        # the buffered parser that sets last_finish_reason never runs for a
+        # streamed reply, so it stayed "" after every stream and this loop
+        # could never trigger. That is why truncated answers silently lost
+        # their later files instead of continuing across turns.
         cont_budget = 0 if dry_run else \
             max(1, int(getattr(self.cfg, "max_tokens_answer", 40000))) * 4
-        while getattr(self.client, "last_finish_reason", "") == "length" \
+        while getattr(self.client, "stream_truncated", False) \
                 and cont_budget > 0:
             parsed = parse_edits(reply)
             done_files = {b.file.strip().lower().lstrip("./") for b in parsed}
             if not done_files:
                 break                      # nothing survived; let repairs raise
+            # The last streamed reply was cut mid-block: its dangling tail
+            # (header + partial SEARCH, maybe a ======= line but no closing
+            # REPLACE) would otherwise ride along into the next continuation
+            # prompt -- confusing the model and, worse, poisoning any later
+            # repair round that re-parses this accumulated text. Drop it now;
+            # we are about to ask the model to re-emit exactly that file.
+            if getattr(self.client, "stream_truncated", False):
+                trimmed = self._trim_dangling_block(reply)
+                if trimmed != reply:
+                    print("[dropped the unfinished block at the cut-off "
+                          "point; asking for it again]", file=sys.stderr)
+                    reply = trimmed
             cont_budget -= len(reply)
             print(f"\n[reply hit the output limit mid-way; continuing with "
                   f"{len(done_files)} file(s) done so far]", file=sys.stderr)
@@ -835,6 +896,18 @@ class Agent:
                 # with prose, and stop so we cannot loop on empty replies.
                 break
             reply = (reply.rstrip() + "\n\n" + more) if reply.strip() else more
+        # If the reply (original or its last continuation round) was cut off
+        # mid-block, trim the dangling tail before anything parses it. The
+        # loop above already trimmed between continuation rounds; this catches
+        # a truncated FIRST reply that never entered the loop (zero complete
+        # blocks -> `break` with nothing to continue from), and the final
+        # round when the budget ran out. BLOCK_RE needs a closing REPLACE to
+        # match, so an unterminated block would otherwise leave its header in
+        # the text -- which `_failed_block_texts` echoes back to the model as
+        # half a block, inviting it to "complete" the fragment instead of
+        # re-anchoring it.
+        if getattr(self.client, "stream_truncated", False):
+            reply = self._trim_dangling_block(reply)
         results = self._apply_once(reply, dry_run, backup_dir)
 
         for _round in range(repair_rounds):
@@ -885,6 +958,38 @@ class Agent:
         return results, reply
 
     # ------------------------------------------------------------- repair help
+    @staticmethod
+    def _trim_dangling_block(reply: str) -> str:
+        """Drop a truncated reply's unfinished tail.
+
+        A streamed answer cut off by the provider's output cap ends inside a
+        block -- after `--- FILE:` (maybe mid-SEARCH, maybe past `=======`)
+        but always without the closing `>>>>>>> REPLACE` the parser needs.
+        That fragment never survives parse_edits(), yet its header still
+        matches regex searches elsewhere (`_failed_block_texts`, repair
+        prompts), which is how a half-written file gets treated as "already
+        delivered" and silently lost. Trim from the last header that has no
+        closing marker after it; complete blocks earlier in the reply are
+        untouched."""
+        if not reply:
+            return reply
+        heads = [m.start() for m in re.finditer(r"(?m)^---\s*FILE:", reply)]
+        if not heads:
+            return reply
+        last = heads[-1]
+        tail = reply[last:]
+        if re.search(r"(?m)^>{5,}\s*REPLACE", tail):
+            return reply               # final block is complete -- keep all
+        # Cut at the earliest dangling marker inside that last block: a bare
+        # `<<<<<<< SEARCH` with no header above it can happen when a model
+        # omits `--- FILE:` entirely and got cut mid-block anyway.
+        cut = last
+        m = re.search(r"(?m)^<{5,}\s*SEARCH", tail)
+        if m and not re.search(r"(?m)^>{5,}\s*REPLACE", tail[m.end():]):
+            cut = min(cut, last + m.start())
+        trimmed = reply[:cut].rstrip()
+        return trimmed + "\n" if trimmed else ""
+
     @staticmethod
     def _failed_block_texts(reply: str, failures) -> str:
         """Echo back the blocks the model actually wrote for the failed files.

@@ -117,6 +117,12 @@ class Config:
     # One tool call plus a short note. Models that narrate a plan in the
     # `reasoning` field need more; the schema puts the action first so a
     # truncated reply still loses only the explanation.
+    # NOTE: hosted presets (and the DeepSeek default profile) override this
+    # to ~2000. A step reply is action+args+reasoning under grammar, but on a
+    # server that IGNORES response_format (DeepSeek in json_object mode among
+    # them) the model free-forms around the JSON and routinely blows past a
+    # 700-token budget before finishing the object. Keep any change here in
+    # sync with PRESETS below -- tests assert the hosted value.
     max_tokens_step: int = 700
     max_tokens_answer: int = 3000
 

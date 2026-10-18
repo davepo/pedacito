@@ -357,6 +357,15 @@ class LMStudio:
         # grammar-constrained call is the difference between "bad JSON" and
         # "valid JSON we never let it finish".
         self.last_finish_reason = ""
+        # Truncation signal for STREAMED (free-text, answer-phase) replies.
+        # DeepSeek and other OpenAI-compatible servers put finish_reason on
+        # the FINAL SSE chunk, which the delta loop never inspected -- so
+        # last_finish_reason stayed "" after every stream and apply()'s
+        # continuation loop ("reply hit the output limit; emit the rest")
+        # could never trigger. That is why a big edit run silently lost its
+        # later files instead of continuing across turns. The streaming path
+        # sets this directly; chat() clears it at the start of each call.
+        self.stream_truncated = False
 
     # ------------------------------------------------------------------ core
     def _context_too_long(self, body: str) -> bool:
@@ -662,6 +671,15 @@ class LMStudio:
 
         t0 = time.time()
         self.stats["calls"] += 1
+        # One truncation flag per LOGICAL call, not per HTTP attempt. chat()
+        # retries _chat_once after context-overflow trimming and transient
+        # failures; clearing here means a stale "length" from an abandoned
+        # earlier attempt can never make apply()'s continuation loop ask the
+        # model to repeat edits that already landed cleanly. The streaming
+        # path ORs into this so an escalation retry inside one logical call
+        # keeps the signal; chat_json sets last_finish_reason explicitly on
+        # every buffered attempt it inspects.
+        self.stream_truncated = False
 
         if not stream:
             r = self._post(payload)
@@ -695,9 +713,16 @@ class LMStudio:
             if body.strip() == "[DONE]":
                 break
             try:
-                d = json.loads(body)["choices"][0]["delta"]
+                chunk = json.loads(body)["choices"][0]
+                d = chunk.get("delta") or {}
+                fr = chunk.get("finish_reason") or ""
             except Exception:
                 continue
+            if fr == "length":
+                # OR, not =: a logical chat() call may contain several HTTP
+                # attempts (context-overflow retries); once any streamed
+                # attempt was cut, the reply we return IS cut.
+                self.stream_truncated = True
             delta = d.get("content")
             if not delta and not d.get("reasoning_content"):
                 continue
@@ -759,15 +784,22 @@ class LMStudio:
         if cap is None:
             from .config import is_hosted
             if is_hosted(self.cfg):
-                # Hosted APIs have no local window to clamp against. DeepSeek
-                # alone allows 8k+ tokens of *output* per message; capping the
-                # retry ceiling at (context - reserve) -- where context was a
-                # stale local default like 8192 -- is exactly what produced
-                # "tried up to max_tokens=9600, ceiling 16384" and killed
-                # every big write. For hosted runs the escalation ceiling is
-                # generous and only bounded by what the config itself says.
-                cap = max(65536, self.cfg.max_tokens_answer,
-                          self.cfg.max_tokens_step * 8, max_tokens * 8)
+                # Hosted APIs have no local window to clamp against, but
+                # they DO have a provider-side per-message OUTPUT ceiling
+                # (~8k tokens on deepseek-chat). The old ceiling here was
+                # max(65536, ...) unconditionally, which promised more than
+                # any hosted API can deliver: an escalated retry re-rolled
+                # the same doomed request twice more before erroring, with
+                # a message ("ceiling 65536") that sent users chasing a
+                # setting that cannot fix anything. Honour the configured
+                # provider ceiling when known; otherwise stay generous for
+                # providers that genuinely allow long messages.
+                mot = int(getattr(self.cfg, "max_output_tokens", 0) or 0)
+                if mot > 0:
+                    cap = max(mot, max_tokens)
+                else:
+                    cap = max(65536, self.cfg.max_tokens_answer,
+                              self.cfg.max_tokens_step * 8, max_tokens * 8)
             else:
                 # Never escalate past what the model's context window can hold:
                 # a request bigger than (context - reserve) gets clamped by the
