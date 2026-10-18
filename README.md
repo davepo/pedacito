@@ -292,7 +292,8 @@ explicitly wins over the preset:
 
 ```toml
 [profiles.ds]
-tier = "hosted"                  # answer budget 16000, gathered 100k chars, ...
+tier = "hosted"                  # step 7000 (under deepseek's ~8k output cap),
+#                                  # answer 40000, gathered 100k chars, 100 steps ...
 base_url = "https://api.deepseek.com/v1"
 model = "deepseek-chat"
 json_mode = "object"
@@ -764,10 +765,11 @@ profile you get the defaults in this table. See "Running multiple models".
 | `max_consecutive_failures` | 3 | Aborts an indexing batch after this many failures in a row. |
 | `json_mode` | `"schema"` | `"schema"` for local llama.cpp/LM Studio, `"object"` for hosted OpenAI-compatible APIs (DeepSeek, OpenAI, …). |
 | `temperature` | 0.2 | Higher makes tool selection noticeably worse. |
-| `max_tokens_step` | 700 (tier presets: small 500, medium 1500, large 1000, hosted 8000) | Budget for one tool call; raise for models that narrate at length. Thinking models need more than this looks — reasoning tokens count against it, and a budget spent entirely on thinking returns no action at all (pedacito reports that case explicitly now). |
+| `max_tokens_step` | 700 (tier presets: small 500, medium 1500, large 1000, hosted 7000) | Budget for one tool call; raise for models that narrate at length. Thinking models need more than this looks — reasoning tokens count against it, and a budget spent entirely on thinking returns no action at all (pedacito reports that case explicitly now). The hosted preset stays under the provider's real per-message output ceiling (~8k tokens for deepseek-chat); bigger outputs are chunked across steps via `max_write_lines`, not crammed into one reply. |
 | `max_tokens_answer` | 3000 (hosted tier: 40000) | Budget for the final answer/edit reply. |
 | `max_steps` | 30 (tier presets: 40–100) | Lookups allowed before the model must answer. Deliberately generous: hitting this mid-gather is what produced "the model answered without proposing any edits" failures. |
 | `max_gathered_chars` | 24000 | Ceiling on accumulated source per task. |
+| `max_write_lines` | 120 | Lines allowed in ONE write step (a `write` tool call or an edit block's REPLACE). Keeps every reply under the API's true per-message output limit; larger files are written in chunks across sequential steps, with the tool teaching the model the append protocol when it tries to dump a 791-line file in one message. Raise only if your provider emits longer messages. |
 | `context_tokens` | 8192 | Assumed server context window. Ignored when auto-detection succeeds (see "Token budgets" below); set it explicitly only to override the detected value. |
 | `reserve_tokens` | 2048 | Headroom held back from `context_tokens` for chat-template overhead. Auto-fit shrinks it first on tiny windows. |
 | `auto_fit` | True | Rewrite every budget to fit the server's real window at startup (see "Token budgets"). Set false only if you want raw values sent to the server unchanged. |

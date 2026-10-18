@@ -172,6 +172,15 @@ class Config:
     allow_write: bool = False
     # Ceiling on one `write` call's contents, in characters.
     max_write_chars: int = 200_000
+    # Budget for ONE write step (gather-loop `write` action or answer-phase
+    # edit block), expressed as the maximum number of LINES a single reply is
+    # allowed to emit for one file. The default (120) is sized so that a step
+    # fits inside deepseek-chat's real per-message output ceiling (~8k tokens,
+    # which no config can raise): 120 lines + reasoning stays under it with
+    # room to spare. Raise it only if your provider allows longer messages --
+    # setting it above the provider's true limit just converts clean steps
+    # into mid-string truncations again.
+    max_write_lines: int = 120
     # Recognise rename/move intent in edit blocks: a creation of a new path
     # paired with a block that empties an existing same-extension file is
     # applied as a real move (contents relocated, old file deleted) instead of
@@ -835,8 +844,15 @@ PRESETS: dict[str, dict] = {
         # must at least stop fighting the model within its true limits.
         # max_tokens_step at 8k also gives thinking models room to reason
         # and still emit a full write action in one step.
+        # max_tokens_step is deliberately NOT raised past ~8k here: the
+        # provider's per-message output ceiling (deepseek-chat: ~8k tokens)
+        # cannot be exceeded by any client setting. Asking for more just
+        # converts clean steps into mid-string truncations -- the failure
+        # users saw as "ran past max_tokens=16000". Big outputs are handled
+        # by chunking instead: see max_write_lines below and the chunking
+        # rules in the gather/answer prompts.
         "max_tokens_summary": 300,
-        "max_tokens_step": 8000,
+        "max_tokens_step": 7000,
         "max_steps": 100,
         "max_tokens_answer": 40000,
         "max_tokens_plan": 8000,
@@ -844,6 +860,11 @@ PRESETS: dict[str, dict] = {
         "flat_map_token_budget": 12000,
         "max_gathered_chars": 100000,
         "max_read_lines": 400,
+        # One write step stays under the provider's true per-message output
+        # limit (~8k tokens): 120 lines of code + short reasoning fits with
+        # room to spare. Multi-file / large-file tasks are split across
+        # sequential steps by the prompt rules, not crammed into one reply.
+        "max_write_lines": 120,
         "max_spec_chars": 200000,
         "max_new_files": 60,
         "repair_rounds": 3,
@@ -1081,6 +1102,12 @@ model    = "google/gemma-3-27b"
 # allow_write = false              # let the gather loop overwrite whole files
 #                                  # (skips backup/review; prefer edit blocks)
 # max_write_chars = 200000         # ceiling on one `write` call
+# max_write_lines = 120            # lines allowed in ONE write step; keeps a
+#                                  # single reply under the provider's real
+#                                  # per-message output limit (deepseek ~8k
+#                                  # tokens). Large files are written in
+#                                  # chunks across steps -- do not raise this
+#                                  # past what your API can emit per message.
 # allow_rename = true              # treat "create new path + empty old path"
 #                                  # block pairs as real renames (old file is
 #                                  # deleted); set false to never auto-delete

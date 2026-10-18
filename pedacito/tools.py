@@ -348,6 +348,25 @@ def tool_write(index, cfg, file: str, content: str) -> str:
     n = len(text.splitlines())
     note = (f"WROTE {rel} ({n} lines), replacing {len(original.splitlines())} "
             f"previous line(s)." if existed else f"CREATED {rel} ({n} lines).")
+
+    # Chunked-append protocol. `max_write_lines` is the budget for ONE write
+    # step: a reply that stays under it cannot overrun the provider's real
+    # per-message output ceiling (deepseek-chat ~8k tokens) -- cramming a
+    # 791-line file into one message is exactly what produced "ran past
+    # max_tokens ... Last partial reply" truncations. Large files are written
+    # in sequential chunks instead; each append re-reads the tail so the model
+    # quotes real text, and only after the final chunk is it told to finish.
+    budget = max(1, int(getattr(cfg, "max_write_lines", 0) or 0))
+    if budget and n > budget:
+        return (note + f"\n[Chunking is ON: one write step may emit at most "
+                f"{budget} lines. This file needs more. To add the rest, "
+                f"`read` the last few lines of {rel}, then issue another "
+                f"`write` whose content repeats those final lines followed by "
+                f"the next <={budget} new lines -- they replace the tail, "
+                f"growing the file. Repeat until complete. Do NOT choose "
+                f"`done` until every part of the task is written.]"
+                + "\n[This overwrite was applied directly, without a review "
+                "page. Undo with `pedacito restore` if it was wrong.]")
     return (note + "\n[This overwrite was applied directly, without a review "
             "page. Undo with `pedacito restore` if it was wrong. Now choose "
             "`done` and summarise what you wrote.]")
@@ -374,5 +393,24 @@ def dispatch(index, cfg, step: dict) -> str:
                     "Answer the task with search/replace edit blocks instead -- "
                     "`read` the lines you want to change, then emit them in your "
                     "final reply.")
-        return tool_write(index, cfg, step.get("file", ""), step.get("content", ""))
+        # Guard a whole-file write BEFORE it happens when its content already
+        # exceeds one write step's budget (max_write_lines). A 791-line
+        # `content` string can only have arrived here as a truncated reply --
+        # executing it would silently store half a file. Refuse and teach the
+        # chunked-append protocol instead so the model rebuilds the file in
+        # <=budget-line steps that each fit the provider's real output limit.
+        budget = max(1, int(getattr(cfg, "max_write_lines", 0) or 0))
+        content = step.get("content", "") or ""
+        nlines = len(content.splitlines())
+        if budget and nlines > budget:
+            return (f"ERROR: that `write` is {nlines} lines -- over the "
+                    f"{budget}-line budget for ONE step (max_write_lines). "
+                    f"Writing it in one message gets cut off at the token "
+                    f"limit. Do it in chunks instead: first `write` the file's "
+                    f"first <={budget} lines; then `read` its last few lines; "
+                    f"then `write` again with content = those final lines "
+                    f"followed by the next <={budget} new lines (this replaces "
+                    f"the tail and grows the file). Repeat until done. Choose "
+                    f"`done` only after every part of the task is written.")
+        return tool_write(index, cfg, step.get("file", ""), content)
     return f"ERROR: unknown action '{action}'."
