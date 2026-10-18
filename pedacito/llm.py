@@ -610,10 +610,21 @@ class LMStudio:
                 continue
             payload[k] = v
         # chat_template_kwargs is a llama.cpp/LM Studio convention. Hosted
-        # APIs don't understand it, and a strict one could 400 on it, so it's
-        # only sent when we're clearly talking to a local server (i.e. not
-        # json_mode = "object").
-        if self.cfg.disable_thinking and self.cfg.json_mode == "schema":
+        # APIs don't understand it, and a strict one could 400 on it, so gate
+        # on the URL being remote rather than on json_mode: a LOCAL server
+        # (LM Studio/Ollama) running a Qwen3 build with json_mode="object"
+        # must still be able to switch thinking off -- that combination was
+        # silently ignored before, which is exactly "I set disable_thinking
+        # and it still thinks / never returns JSON".
+        def _url_is_remote() -> bool:
+            try:
+                from urllib.parse import urlparse
+                h = (urlparse(self.cfg.base_url).hostname or "").lower()
+            except ValueError:
+                return False
+            return h not in ("localhost", "127.0.0.1", "0.0.0.0", "::1", "")
+
+        if self.cfg.disable_thinking and not _url_is_remote():
             # Two spellings, one intent: Qwen/DeepSeek-R1 family templates
             # read chat_template_kwargs.enable_thinking, llama.cpp's own
             # sampler reads no_temp/top_k style keys, and some builds accept
@@ -779,7 +790,32 @@ class LMStudio:
             try:
                 return json.loads(text)
             except json.JSONDecodeError:
-                # Salvage the outermost object if the model added prose.
+                # Salvage a JSON object if the model added prose around it.
+                # Scan EVERY '{' with raw_decode instead of slicing
+                # find("{")..rfind("}"): thinking models often emit several
+                # candidate objects (reasoning notes, examples) before the
+                # real reply, and the outermost slice glues junk between the
+                # first and last brace into one unparseable blob -- "failure
+                # to return json" even though valid JSON sat in the middle.
+                # Requiring an "action" key keeps a stray {"note": ...} from
+                # being mistaken for the step reply.
+                dec = json.JSONDecoder()
+                start = 0
+                while True:
+                    i = text.find("{", start)
+                    if i == -1:
+                        break
+                    try:
+                        obj, _end = dec.raw_decode(text[i:])
+                    except json.JSONDecodeError:
+                        start = i + 1
+                        continue
+                    if isinstance(obj, dict) and ("action" in obj or "edits" in obj):
+                        if i > 0 or _end + i < len(text.strip()):
+                            print("[prose around JSON; salvaged the object]",
+                                  file=sys.stderr)
+                        return obj
+                    start = i + 1
                 i, j = text.find("{"), text.rfind("}")
                 if i != -1 and j > i:
                     frag = text[i : j + 1]

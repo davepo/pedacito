@@ -32,7 +32,7 @@ from __future__ import annotations
 import re
 import sys
 
-from .edits import apply_edits, parse_edits
+from .edits import apply_edits, locate, parse_edits
 from .llm import LLMError, estimate_tokens
 from .tools import STEP_SCHEMA, TOOL_HELP, dispatch
 
@@ -837,46 +837,131 @@ class Agent:
             reply = (reply.rstrip() + "\n\n" + more) if reply.strip() else more
         results = self._apply_once(reply, dry_run, backup_dir)
 
-        for _ in range(repair_rounds):
+        for _round in range(repair_rounds):
             failures = [r for r in results if not r.ok]
             if not failures:
                 break
             print(f"\n[{len(failures)} block(s) failed; asking the model to re-anchor]", file=sys.stderr)
             fb = "\n".join(f"- {r.file}: {r.message}" for r in failures)
-            # The repair prompt used to carry the ENTIRE gathered source plus
-            # the previous full reply back to the model. On DeepSeek that
-            # multi-GB context re-sends at input price, blows the request
-            # limit, and pushes the model to re-emit everything (truncating
-            # again). Rebuild it small: only the source of the FAILED files,
-            # and no echo of the old reply.
-            failed_paths = {(r.file or "").strip().lower().lstrip("./")
-                            for r in failures}
-            keep = []
-            for item in (self.gathered_source or gathered or "").split("\n\n"):
-                m = re.match(r"--- \w+ (\S+)", item)
-                low = m.group(1).lower().lstrip("./") if m else ""
-                if any(low == p0 or low.endswith("/" + p0) or
-                       p0.endswith("/" + low) for p0 in failed_paths if p0):
-                    keep.append(item)
-            src_slice = "\n\n".join(keep)[:12000] or "(source unavailable)"
+            # Re-ground the repair prompt FROM DISK, not from the gathered
+            # buffer. The old code sliced the gather output (regex-filtered,
+            # 12k chars), so when a SEARCH block failed the exact lines it
+            # needed were often missing or truncated -- and local models
+            # correctly replied "I only have grep output, I can't produce a
+            # corrected edit" and burned every repair round on prose. Read
+            # the real file and quote the region around the fuzzy-matched
+            # anchor (or the target line range), with line numbers, so the
+            # model can copy exact text including real indentation.
+            prev_blocks = self._failed_block_texts(reply, failures)
+            src_slice = self._repair_source(failures, prev_blocks)
             reply = self.client.chat(
                 [
                     {"role": "system", "content": ANSWER_SYSTEM},
                     {"role": "user", "content":
-                        f"SOURCE (only the files that failed)\n\n{src_slice}\n\n"
+                        f"SOURCE (current contents of the files that failed)\n\n{src_slice}\n\n"
                         f"TASK\n{task}\n\n"
+                        f"YOUR PREVIOUS EDIT BLOCKS THAT FAILED:\n{prev_blocks}\n\n"
                         f"These edits could not be applied:\n{fb}\n\n"
                         "Output ONLY the corrected search/replace blocks for the "
                         "failed edits -- do not repeat edits that already worked, "
                         "do not rewrite whole files. Copy the SEARCH text exactly "
-                        "from the source above."},
+                        "from the SOURCE above, byte for byte, keeping its real "
+                        "indentation (ignore the line-number prefixes). Do not ask "
+                        "for more context -- the source you need is provided."},
                 ],
                 max_tokens=self.cfg.max_tokens_answer,
                 stream=True,
             )
+            if not parse_edits(reply):
+                # The model answered with prose instead of blocks (the classic
+                # small-model "I need a read first" reply). Re-sending the same
+                # prompt cannot plausibly end differently -- stop repairing
+                # rather than burning the remaining rounds/tokens on it.
+                print("[repair produced no edit blocks; stopping]",
+                      file=sys.stderr)
+                break
             good = [r for r in results if r.ok]
             results = good + self._apply_once(reply, dry_run, backup_dir)
         return results, reply
+
+    # ------------------------------------------------------------- repair help
+    @staticmethod
+    def _failed_block_texts(reply: str, failures) -> str:
+        """Echo back the blocks the model actually wrote for the failed files.
+        Telling it WHICH search text missed is what lets it re-anchor; without
+        this the feedback ('search block not found') gives nothing to correct."""
+        wanted = {(r.file or "").strip().lower().lstrip("./") for r in failures}
+        out = []
+        for e in parse_edits(reply):
+            low = e.file.strip().lower().lstrip("./")
+            if any(low == w or low.endswith("/" + w) or
+                   (w and low.endswith(w)) for w in wanted if w):
+                out.append(f"--- FILE: {e.file}\n<<<<<<< SEARCH\n{e.search}\n"
+                           f"=======\n{e.replace}\n>>>>>>> REPLACE")
+        return "\n\n".join(out)[:6000] or "(previous blocks unavailable)"
+
+    def _repair_source(self, failures, prev_blocks: str = "") -> str:
+        """Ground-truth source for the failed files, read fresh from disk.
+
+        For each failure we try to locate the model's previous SEARCH text in
+        the file fuzzily (locate() tolerates whitespace drift); on a hit we
+        quote +/-30 lines around it with line-number prefixes. On a miss we
+        fall back to the full file up to max_read_lines, then to whatever the
+        gather phase captured. Small windows keep the repair prompt cheap on
+        hosted APIs while still containing the exact bytes to copy."""
+        from . import fileio
+        from .edits import locate as _locate
+        chunks = []
+        seen: set[str] = set()
+        for r in failures:
+            rel = fileio.normalise_rel(r.file or "")
+            low = rel.lower()
+            if not rel or low in seen:
+                continue
+            seen.add(low)
+            path = self.index.root / rel
+            text = None
+            if path.is_file():
+                try:
+                    text, _style = fileio.read(path, errors="strict")
+                except OSError:
+                    text = None
+            if text is None:
+                # Not on disk (new-file create that mis-grouped, deleted
+                # mid-task): fall back to the gathered buffer for this file.
+                for item in (self.gathered_source or "").split("\n\n"):
+                    m = re.match(r"--- \w+ (\S+)", item)
+                    g = m.group(1).lower().lstrip("./") if m else ""
+                    if g and (g == low or g.endswith("/" + low) or
+                              low.endswith("/" + g)):
+                        chunks.append(item[:8000])
+                        break
+                continue
+            lines = text.split("\n")
+            start, end = 0, min(len(lines), int(getattr(self.cfg, "max_read_lines", 400)))
+            span = None
+            for blk in prev_blocks.split("--- FILE:")[1:]:
+                m = re.search(r"<<<<<<< SEARCH\n(.*?)\n=======", blk, re.S)
+                if not m:
+                    continue
+                needle = m.group(1)
+                if rel.lower() not in blk.lower().split("<<<<<<<")[0]:
+                    continue
+                span = _locate(text, needle, self.cfg)
+                if span:
+                    break
+            if span:
+                hit_line = text.count("\n", 0, span.start)
+                start = max(0, hit_line - 30)
+                end = min(len(lines), hit_line + 60)
+                end = max(end, min(start + 60, len(lines)))
+            numbered = "\n".join(f"{i:>5}| {lines[i]}"
+                                 for i in range(start, end))
+            header = f"FILE: {rel} ({len(lines)} lines total; showing {start + 1}-{end})"
+            chunks.append(header + "\n" + numbered[:8000])
+        joined = "\n\n".join(chunks)
+        return joined or "(source unavailable -- the failed files are new; " \
+                         "output the FULL intended file contents in one block)"
 
     def _apply_once(self, reply: str, dry_run: bool, backup_dir=None) -> list:
         """One parse-and-apply pass, with no repair round-trip.
