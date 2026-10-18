@@ -1,3 +1,3 @@
 __pycache__/
-*.pyc
-*.egg-info/
+*.py[cod]
+pedacito_local.egg-info/

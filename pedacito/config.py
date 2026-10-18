@@ -184,14 +184,33 @@ class Config:
     # "Context length", Ollama's num_ctx, an API's advertised window). Used by
     # `pedacito config` to sanity-check the token budgets below against it --
     # profiles set this per tier (8k for a small local model, 128k for hosted).
-    # The default matches the default budgets: flat map (4000) + gathered
-    # source (~6000 tok) + one step fits inside 16384 - 2048 with room left.
-    context_tokens: int = 16384
+    # The default is deliberately conservative (matches LM Studio's own stock
+    # setting), but you rarely need to set it at all: when a local server
+    # answers, pedacito probes its REAL configured context length via the
+    # native API and uses that instead of this number, and `auto_fit` then
+    # shrinks or grows every other budget to fit the window it found.
+    context_tokens: int = 8192
     # Tokens held back from `context_tokens` for the reply itself. A gather
     # plan that fills the window to the last token leaves nothing to answer
     # with, which is how truncation errors like "ran past max_tokens_step"
-    # usually start.
+    # usually start. auto_fit lowers this automatically when the window is
+    # too small for it.
     reserve_tokens: int = 2048
+    # Auto-fit every token budget to the server's real context window before
+    # each run (see config.auto_fit): shrink oversized budgets so requests
+    # stop hitting the limit mid-task, grow them when the window has room.
+    # Set false only if you want to hand-tune every knob yourself.
+    auto_fit: bool = True
+    # Probe the server for its actual configured context length (LM Studio's
+    # native /api/v0/models reports it; Ollama's /api/show does too). On
+    # success this overrides context_tokens unless YOU set context_tokens
+    # explicitly in your config/env. Set false to trust your file verbatim.
+    auto_detect_context: bool = True
+    # Ask the server for this many output tokens on generation calls. Some
+    # llama.cpp-based servers reject max_tokens values above their configured
+    # context window outright; auto_fit clamps this to fit. 0 means "omit
+    # max_tokens from requests entirely" (the server then decides).
+    request_max_tokens_cap: int = 32768
 
     # --- Project scaffolding (`pedacito new`) ---------------------------------
     # Cap on how many files a plan may propose; longer plans are truncated and
@@ -519,6 +538,99 @@ def budget_warnings(cfg: Config) -> list[str]:
                  f"max_gathered_chars or flat_map_token_budget, or raise "
                  f"context_tokens if your server really has more room.")
     return w
+
+
+def auto_fit(cfg: Config, verbose: bool = True) -> list[str]:
+    """Fit every token budget to the server's real context window.
+
+    The single biggest source of "nothing worked, it kept hitting limits":
+    the built-in budgets assume a roomy window (they were tuned for 32k+),
+    while LM Studio ships models at 8192 by default and Ollama caps at 4096
+    unless told otherwise. A hosted profile (tier "hosted") also lands on
+    local hardware with 128k/16k numbers that the server flatly rejects.
+    Rather than fail mid-task, this rewrites the budgets to fit -- shrink
+    when the window is smaller than assumed, grow when it has room:
+
+      * reserve_tokens shrinks first so tiny windows keep usable space;
+      * max_tokens_answer / build are clamped to what the window can hold;
+      * max_gathered_chars and flat_map_token_budget are split between them
+        so map + source + one step always fits in (context - reserve);
+      * request_max_tokens_cap clamps every max_tokens we ever send, so a
+        llama.cpp server never sees a value above its configured window.
+
+    When cfg.auto_detect_context is on and the user did not set
+    context_tokens themselves, the live server is probed (LM Studio native
+    API / Ollama /api/show) and its REAL configured length is used. Probe
+    failures are silent -- hosted APIs and offline runs keep the declared
+    number. Returns human-readable notes about what changed (empty = no
+    changes needed). Never raises.
+    """
+    import sys as _sys
+    notes: list[str] = []
+    if not cfg.auto_fit:
+        return notes
+
+    ctx = cfg.context_tokens
+    origin = cfg.sources.get("context_tokens", "default")
+    if cfg.auto_detect_context and origin == "default":
+        try:
+            from .llm import LMStudio
+            detected = LMStudio(cfg).detect_context()
+        except Exception:
+            detected = None
+        if detected and detected != ctx:
+            notes.append(f"context: server reports {detected:,} tokens "
+                         f"(config default was {ctx:,}); using it")
+            ctx = detected
+            cfg.context_tokens = ctx
+            cfg.sources["context_tokens"] = "auto-detected from server"
+
+    def setv(key: str, value):
+        cur = getattr(cfg, key)
+        if cur == value:
+            return
+        src = cfg.sources.get(key, "default")
+        # Respect explicit user settings within reason: only clamp values
+        # that physically cannot work (bigger than the whole window).
+        if src != "default" and value < cur:
+            hard_max = max(1, ctx - 1)
+            if cur <= hard_max:
+                return          # user set it and it still fits -- leave it
+        setattr(cfg, key, value)
+        cfg.sources[key] = f"auto-fit (window {ctx:,} tok)"
+        notes.append(f"{key}: {cur:,} -> {value:,}")
+
+    # Reserve: needs at least ~512 tokens of reply room; ideally >= answer.
+    reserve = min(cfg.reserve_tokens, max(512, ctx // 4))
+    setv("reserve_tokens", reserve)
+    usable = max(ctx - cfg.reserve_tokens, ctx // 2)
+
+    # Per-request output caps must fit inside the window itself.
+    cap = max(256, min(cfg.request_max_tokens_cap, usable))
+    setv("request_max_tokens_cap", cap)
+
+    step_headroom = max(cfg.max_tokens_step, cfg.max_tokens_summary)
+    if step_headroom > usable:
+        shrunk = max(200, usable // 4)
+        setv("max_tokens_step", shrunk)
+        setv("max_tokens_summary", min(cfg.max_tokens_summary, max(120, shrunk // 3)))
+        step_headroom = shrunk
+
+    # Answer/build budgets: never ask for more than the server will allow.
+    setv("max_tokens_answer", min(cfg.max_tokens_answer, cap))
+    setv("max_tokens_build", min(cfg.max_tokens_build, cap))
+    setv("max_tokens_plan", min(cfg.max_tokens_plan, cap))
+
+    # Map + gathered source share the rest of the window. 4 chars/token.
+    left = max(usable - step_headroom, 512)
+    map_tok = min(cfg.flat_map_token_budget, max(400, left // 3))
+    setv("flat_map_token_budget", map_tok)
+    gathered_tok = max(left - map_tok, 256)
+    setv("max_gathered_chars", min(cfg.max_gathered_chars, gathered_tok * 4))
+
+    if notes and verbose:
+        print("[auto-fit] " + "; ".join(notes), file=_sys.stderr)
+    return notes
 
 
 def _parse_env(name: str, raw: str):

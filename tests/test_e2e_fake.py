@@ -55,31 +55,16 @@ def fake_port():
     """Start tests/fake_llm.py once for the module.
 
     The FAKE_ACTIONS list is deliberately NOT sent here: with no actions
-    configured, the fake server answers every schema-constrained request
-    with its built-in default -- read one file, then done -- which lets
-    each test drive the gather loop against whatever files it created."""
+    configured, the fake server answers the first schema request with its
+    built-in default -- read old_name.py lines 1-200 (the file every test's
+    fixture project creates) -- then done, which lets each test drive the
+    gather loop against whatever files it created."""
     port = _free_port()
     env = dict(os.environ, FAKE_PORT=str(port), FAKE_REPLY=RENAME_REPLY)
     env.pop("FAKE_ACTIONS", None)
     proc = subprocess.Popen([sys.executable, str(FAKE)], env=env,
                             stdout=subprocess.DEVNULL,
                             stderr=subprocess.DEVNULL)
-    try:
-        deadline = time.time() + 10
-        while time.time() < deadline:
-            try:
-                with socket.create_connection(("127.0.0.1", port), 0.5):
-                    break
-            except OSError:
-                if proc.poll() is not None:
-                    pytest.fail("fake_llm exited early")
-                time.sleep(0.1)
-        else:
-            pytest.fail("fake_llm did not start")
-        yield port
-    finally:
-        proc.terminate()
-        proc.wait(timeout=5)
     try:
         deadline = time.time() + 10
         while time.time() < deadline:

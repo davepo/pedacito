@@ -29,8 +29,8 @@ from . import index as index_mod
 from .agent import Agent
 from .edits import parse_edits
 from .config import (Config, ConfigError, REFERENCE_TEMPLATE, TEMPLATE,
-                     USER_CONFIG, find_project_config, interactive_setup,
-                     load as load_config, write_template)
+                     USER_CONFIG, auto_fit, find_project_config,
+                     interactive_setup, load as load_config, write_template)
 from .llm import LMStudio, LLMError, estimate_tokens
 from .select import CODE_EXTS, REFERENCE_EXTS, Matcher, select
 from . import review as review_mod
@@ -109,6 +109,14 @@ def _config(args) -> Config:
     for flag, key in (("url", "base_url"), ("model", "model")):
         if getattr(args, flag, None):
             cfg.sources[key] = f"--{flag}"
+    # Fit every token budget to the server's real context window before any
+    # request goes out. Without this, built-in/hosted-tier budgets (3k-16k
+    # answers, 24k-100k gathered source) sail past LM Studio's stock 8192 or
+    # Ollama's default 4096 and every call gets truncated or rejected --
+    # "it just kept hitting limits" even with a correct base_url/model.
+    # `pedacito config` itself skips fitting so it can report true sources.
+    if not getattr(args, "cmd", "") == "config":
+        auto_fit(cfg, verbose=True)
     return cfg
 
 

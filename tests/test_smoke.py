@@ -6,14 +6,34 @@ apply, setup error carries a hint), the edit-block parser/renamer bugs
 """
 from __future__ import annotations
 
+import json
+import os
+import socket
+import subprocess
+import sys
+import time
 import tomllib
 from pathlib import Path
 
 import pytest
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
 from pedacito import config as config_mod
 from pedacito import edits
 from pedacito.agent import Agent
+from pedacito.llm import LMStudio, LLMError
+
+
+def _free_port() -> int:
+    s = socket.socket()
+    s.bind(("127.0.0.1", 0))
+    port = s.getsockname()[1]
+    s.close()
+    return port
+
+
+FAKE = Path(__file__).resolve().parent / "fake_llm.py"
 
 
 # --------------------------------------------------------------------- config
@@ -121,6 +141,133 @@ def test_search_block_matches_at_eof_with_newline_tail(tmp_path):
                                 backup=False, dry_run=False)
     assert results[0].ok, results[0].message
     assert (tmp_path / "a.py").read_text() == "x = 2\n"
+
+
+# ------------------------------------------------------------------ budgets
+def test_default_budgets_fit_small_windows():
+    """The historical failure: defaults sized for 32k+ models made every
+    step overflow an 8k local server (and DeepSeek's real window). The
+    default context_tokens must be small enough that the per-step prompt
+    budget is sane without any user tuning."""
+    cfg = config_mod.Config()
+    assert cfg.context_tokens <= 8192
+    usable = cfg.context_tokens - cfg.reserve_tokens
+    assert cfg.max_tokens_answer <= usable
+    assert cfg.max_tokens_step <= usable
+    # Every shipped tier preset must survive its own sanity check.
+    for name, vals in config_mod.PRESETS.items():
+        c = config_mod.Config()
+        for k, v in vals.items():
+            setattr(c, k, v)
+        assert not config_mod.budget_warnings(c), f"preset {name} is over-budget"
+
+
+def test_truncated_json_gets_token_limit_error():
+    """A thinking model that spends its whole budget on reasoning returns
+    no JSON at all and finish_reason='length'. chat_json must report THAT
+    (with actionable advice), not the generic 'would not produce valid JSON'
+    message that sends users hunting for a broken grammar.
+
+    The salvage path is covered by test_truncated_action_is_recovered: when
+    enough of the object survived to repair, the step is reused instead of
+    costing another round trip."""
+    p2 = _free_port()
+    # No FAKE_ACTIONS: the server's default script is read-then-done, so the
+    # first reply is truncated-but-recoverable; the retry escalation then
+    # meets the plain `done` object, which parses fine. That proves the
+    # recovery path end to end without needing a second server.
+    env = dict(os.environ, FAKE_PORT=str(p2),
+               FAKE_ACTIONS=json.dumps([{"action": "read", "file": "a.txt",
+                                         "start": 1, "end": 2,
+                                         "content": "trunc",
+                                         "_finish": "length"},
+                                        {"action": "done", "reasoning": ""}]),
+               FAKE_REPLY="")
+    proc = subprocess.Popen([sys.executable, str(FAKE)], env=env,
+                            stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL)
+    try:
+        deadline = time.time() + 10
+        while time.time() < deadline:
+            try:
+                with socket.create_connection(("127.0.0.1", p2), 0.5):
+                    break
+            except OSError:
+                if proc.poll() is not None:
+                    pytest.fail("fake_llm exited early")
+                time.sleep(0.1)
+        cfg = config_mod.Config()
+        cfg.base_url = f"http://127.0.0.1:{p2}/v1"
+        cfg.model = "fake-model"
+        client = LMStudio(cfg)
+        obj = client.chat_json([{"role": "user", "content": "go"}],
+                               {"type": "object"}, max_tokens=64)
+        assert obj.get("action") == "read", \
+            f"salvage failed: {obj!r}"
+    finally:
+        proc.terminate()
+        proc.wait(timeout=5)
+
+
+def test_unrecoverable_truncation_raises_token_limit_error():
+    """When NOTHING parseable survives (a thinking model that emitted only
+    prose before the cutoff), chat_json must raise the token-limit LLMError
+    with 'token limit' and 'max_tokens_step' in the message -- not the
+    generic grammar-failure text."""
+    p2 = _free_port()
+    s = socket.socket()
+    s.bind(("127.0.0.1", p2))
+    s.listen(8)
+    import threading
+
+    def serve():
+        while True:
+            try:
+                conn, _ = s.accept()
+            except OSError:
+                return
+            try:
+                data = b""
+                while b"\r\n\r\n" not in data:
+                    chunk = conn.recv(4096)
+                    if not chunk:
+                        break
+                    data += chunk
+                body_len = 0
+                head, _, rest = data.partition(b"\r\n\r\n")
+                for line in head.split(b"\r\n"):
+                    if line.lower().startswith(b"content-length:"):
+                        body_len = int(line.split(b":")[1])
+                while len(rest) < body_len:
+                    rest += conn.recv(4096)
+                payload = {
+                    "choices": [{"message": {
+                        "content": "I need to think about this very carefully "
+                                   "because the task requires reading several "
+                                   "files and considering many options..."},
+                        "finish_reason": "length"}], "usage": {}}
+                b_ = json.dumps(payload).encode()
+                conn.sendall(b"HTTP/1.1 200 OK\r\nContent-Type: application/json"
+                             b"\r\nContent-Length: " + str(len(b_)).encode()
+                             + b"\r\n\r\n" + b_)
+            finally:
+                conn.close()
+
+    t = threading.Thread(target=serve, daemon=True)
+    t.start()
+    try:
+        cfg = config_mod.Config()
+        cfg.base_url = f"http://127.0.0.1:{p2}/v1"
+        cfg.model = "fake-model"
+        client = LMStudio(cfg)
+        with pytest.raises(LLMError) as exc:
+            client.chat_json([{"role": "user", "content": "go"}],
+                             {"type": "object"}, max_tokens=64)
+        msg = str(exc.value)
+        assert "token limit" in msg.lower(), msg
+        assert "max_tokens_step" in msg, msg
+    finally:
+        s.close()
 
 
 # --------------------------------------------------------------------- agent

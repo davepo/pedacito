@@ -196,6 +196,17 @@ class State:
                 # exact command that fixes it, instead of letting the user
                 # discover a connection failure mid-task.
                 "needs_setup": not USER_CONFIG.exists(),
+                # Token-budget parity with the CLI: show what the agent will
+                # actually spend each step, and where that number came from
+                # (config vs auto-detected from the live server). Overflow
+                # confusion starts with "what limit am I hitting?" -- answer
+                # it before the user has to ask.
+                "context_tokens": self.cfg.context_tokens if self.cfg else 0,
+                "reserve_tokens": self.cfg.reserve_tokens if self.cfg else 0,
+                "max_tokens_step": self.cfg.max_tokens_step if self.cfg else 0,
+                "context_origin": (self.cfg.sources.get("context_tokens", "default")
+                                   if self.cfg else ""),
+                "json_mode": self.cfg.json_mode if self.cfg else "",
                 "snapshots": [p.name for p in
                               (workspace.list_backups(self.root)[:8]
                                if self.root else [])],
@@ -320,7 +331,10 @@ def _check_model() -> None:
 
     with STATE.lock:
         STATE.model_checked = True
-        STATE.model_status = f"reachable \u2014 models available: {loaded}"
+        budget = (f" \u00b7 window {client.cfg.context_tokens:,}"
+                  f" ({client.cfg.sources.get('context_tokens', 'default')})"
+                  f" \u00b7 reply cap {client.cfg.max_tokens_step:,}")
+        STATE.model_status = f"reachable \u2014 models available: {loaded}{budget}"
 
 
 def _run_task(task: str, apply_now: bool) -> None:

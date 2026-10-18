@@ -54,6 +54,12 @@ class TemplateError(LLMError):
     """The model's chat template rejected the message sequence."""
 
 
+class ContextOverflowError(LLMError):
+    """The server refused the request because the prompt is bigger than its
+    configured context window. Recoverable: `chat()` trims the conversation
+    and retries before giving up."""
+
+
 class _Transient(LLMError):
     """Worth retrying: model still loading, or the server is busy."""
 
@@ -328,6 +334,18 @@ class LMStudio:
         self.last_finish_reason = ""
 
     # ------------------------------------------------------------------ core
+    def _context_too_long(self, body: str) -> bool:
+        """True when a 400 body says the PROMPT overflowed the server's
+        context window -- distinct from "max_tokens too large", which is a
+        request-shape problem. llama.cpp/LM Studio phrase it as
+        "prompt ... exceeds ... context" / "n_ctx"; Ollama says
+        "context length exceeded" or "too many tokens"."""
+        low = (body or "").lower()
+        return any(h in low for h in (
+            "exceeds", "context length", "n_ctx", "ctx_len",
+            "too many tokens", "prompt is too long", "maximum context",
+            "out of range", "overfull"))
+
     def _post(self, payload: dict, stream: bool = False):
         """Send one HTTP request to the chat completions endpoint, raising a
         specific LLMError subclass based on the failure (connection refused,
@@ -350,6 +368,14 @@ class LMStudio:
                 raise TemplateError(body[:400])
             if r.status_code in (429, 503) or any(k in low for k in _LOADING):
                 raise _Transient(f"{r.status_code}: {body[:200]}")
+            if self._context_too_long(body):
+                # The PROMPT overflowed the server's window. chat() catches
+                # this, trims the conversation, and retries -- a mid-task
+                # death here is what "kept hitting limits" actually feels
+                # like to a user on stock LM Studio settings.
+                raise ContextOverflowError(
+                    f"Server says the request exceeds its context window: "
+                    f"{body[:300]}")
             raise LLMError(f"Server returned {r.status_code}: {body[:500]}")
         return r
 
@@ -371,10 +397,64 @@ class LMStudio:
         started = time.time()
         announced = False
         attempt = 0
+        trimmed_once = False
         while True:
             attempt += 1
             try:
                 return self._chat_once(messages, max_tokens, schema, stream)
+            except ContextOverflowError as e:
+                # The server's window is smaller than our budgets assumed
+                # (stock LM Studio 8192 / Ollama 4096 vs a hosted-tier
+                # profile, or simply a long gather). Salvage the call by
+                # dropping the oldest RESULT turns -- the newest tool output
+                # and the task itself are what the model needs to answer;
+                # stale middle history is the cheapest thing to lose. Two
+                # rounds of halving, then fail with a real diagnosis.
+                if not trimmed_once:
+                    body_idx = [i for i, m in enumerate(messages)
+                                if m["role"] == "user"
+                                and m["content"].startswith("RESULT:\n")]
+                    if len(body_idx) > 2:
+                        drop = set(body_idx[: len(body_idx) // 2])
+                        messages = [m for i, m in enumerate(messages)
+                                    if i not in drop]
+                        trimmed_once = True
+                        print("[server context overflow: dropped older tool "
+                              "results and retrying]", file=sys.stderr)
+                        continue
+                if any(m["role"] == "system" for m in messages) and \
+                        len([m for m in messages if m["role"] != "system"]) > 2:
+                    # No RESULT turns to shed (answer phase): shrink by
+                    # replacing middle user turns with a stub, keeping first
+                    # (map+task) and last (latest instruction/result).
+                    keep_first = next(i for i, m in enumerate(messages)
+                                      if m["role"] == "user")
+                    keep_last = max(i for i, m in enumerate(messages)
+                                    if m["role"] == "user")
+                    if keep_last - keep_first > 1:
+                        mid = [i for i in range(keep_first + 1, keep_last)
+                               if messages[i]["role"] == "assistant"]
+                        if mid:
+                            messages = [m for i, m in enumerate(messages)
+                                        if i not in set(mid)]
+                            print("[server context overflow: shortened the "
+                                  "conversation and retrying]", file=sys.stderr)
+                            continue
+                raise LLMError(
+                    f"{e}\n\n"
+                    "Pedacito already trimmed the conversation once and the "
+                    "server still refused.\nThis model's configured context "
+                    "window is too small for even a minimal run.\n"
+                    "  * LM Studio: raise 'Context length' in the model's "
+                    "runtime settings (8192 is\n"
+                    "    the stock default; 16384-32768 suits a 27B on most "
+                    "GPUs) and re-run.\n"
+                    "  * Ollama: set num_ctx (e.g. OLLAMA_NUM_CTX=16384, or "
+                    "options.num_ctx in a\n"
+                    "    Modelfile). Pedacito reads it automatically.\n"
+                    "  * Or lower context_tokens/max_gathered_chars in your "
+                    "profile so auto-fit\n"
+                    "    plans smaller prompts from the start.") from e
             except TemplateError as e:
                 # Most likely this model has no system role. Try again with the
                 # system prompt folded into the first user turn, and remember it.
@@ -436,6 +516,16 @@ class LMStudio:
             "max_tokens": max_tokens,
             "stream": stream,
         }
+        # Honour request_max_tokens_cap: llama.cpp-based servers (LM Studio)
+        # 400 when max_tokens exceeds the configured context window, and
+        # auto_fit lowers the cap to fit -- but a caller asking for more than
+        # the cap (an answer budget on a big window, an escalated truncation
+        # retry) must never smuggle a too-large value through. 0 disables
+        # clamping entirely for servers that prefer to decide themselves.
+        cap = getattr(self.cfg, "request_max_tokens_cap", 0) or 0
+        if cap and max_tokens > cap:
+            max_tokens = cap
+            payload["max_tokens"] = cap
         # User-supplied sampler parameters, merged verbatim. Anything the
         # server accepts can go here (top_p, top_k, min_p, repeat_penalty,
         # seed, stop, ...); anything it doesn't will 400 the request, so
@@ -592,6 +682,12 @@ class LMStudio:
                                                 "the JSON object only, and keep "
                                                 "'reasoning' under 15 words."},
                 ]
+        # If the LAST attempt was cut off at the token limit, that -- not a
+        # grammar failure -- is what went wrong (common with thinking models
+        # that spend the whole budget on reasoning before emitting JSON).
+        # Raise the informative error instead of the generic one below.
+        if truncated:
+            last = raw
         if self.last_finish_reason == "length":
             raise LLMError(
                 f"The model kept running past the token limit before finishing its "
@@ -632,6 +728,55 @@ class LMStudio:
             return None
         out = {m.get("id", "?"): m.get("state", "unknown") for m in data if isinstance(m, dict)}
         return out or None
+
+    def detect_context(self) -> int | None:
+        """Probe the server for the REAL context length configured for
+        `cfg.model`, so token budgets can be auto-fitted to what the model
+        will actually accept instead of a guessed config number.
+
+        Works against the two local servers Pedacito targets:
+          * LM Studio -- native /api/v0/models carries `context_length`
+            (the value typed into its UI; llama.cpp rejects requests bigger
+            than this with a 400, which is half of "kept hitting limits").
+          * Ollama -- POST /api/show returns parameters including num_ctx
+            (defaults to 4096 when unset, which explains why Ollama users
+            hit limits that a 32k-token model 'should' handle).
+
+        Returns None for hosted APIs and any server that doesn't answer --
+        callers then keep whatever context_tokens the config declares.
+        Never raises: this is an optimisation probe, not a requirement.
+        """
+        base = self.cfg.base_url.rstrip("/")
+        root = base[:-3] if base.endswith("/v1") else base
+        # LM Studio native API.
+        try:
+            r = requests.get(root + "/api/v0/models", headers=self.headers,
+                             timeout=5)
+            if r.status_code == 200:
+                for m in r.json().get("data", []):
+                    if not isinstance(m, dict):
+                        continue
+                    if m.get("id") == self.cfg.model or m.get("key") == self.cfg.model:
+                        ctx = (m.get("context_length")
+                               or (m.get("metadata") or {}).get("context_length"))
+                        if isinstance(ctx, int) and ctx > 0:
+                            return ctx
+        except Exception:
+            pass
+        # Ollama native API.
+        try:
+            r = requests.post(root + "/api/show",
+                              json={"name": self.cfg.model}, timeout=5)
+            if r.status_code == 200:
+                d = r.json()
+                ctx = ((d.get("model_info") or {}).get(
+                    "llama.context_length")
+                    or d.get("parameters", {}).get("num_ctx"))
+                if isinstance(ctx, int) and ctx > 0:
+                    return ctx
+        except Exception:
+            pass
+        return None
 
     def warmup(self, verbose: bool = True) -> None:
         """Force the model to load with one tiny generation before real work
