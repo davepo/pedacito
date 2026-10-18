@@ -164,11 +164,15 @@ the host's address) in Ollama's environment before starting it. Default
 port `11434`.
 
 **Hosted OpenAI-compatible APIs.** DeepSeek, OpenAI, Groq, Mistral and
-similar services work too. Set `base_url`, `api_key`, and `model`, and add
-`json_mode = "object"` under `[server]`. Those services accept
-`response_format: {"type": "json_object"}` but reject the stricter
-`json_schema` Pedacito sends by default, so without `json_mode = "object"`
-the gather loop fails on its first step. Reasoning models that return a
+similar services work too. Set `base_url`, `api_key`, and `model` — that's
+all you need: pedacito detects a remote host (or a `deepseek*` model name)
+and automatically switches to `json_mode = "object"`, the mode those
+services support. They accept `response_format: {"type": "json_object"}`
+but reject the stricter `json_schema` pedacito uses for local llama.cpp
+servers, so without the switch the gather loop fails on its first step
+("would not produce valid JSON"). You can still set `json_mode` yourself;
+the spellings `"object"`, `"json_object"` and `"json"` are all accepted
+(and `"json_schema"` means `"schema"`). Reasoning models that return a
 separate `reasoning_content` field (DeepSeek-R1, and most other R1
 distills) are handled the same as local `<think>` blocks — stripped
 before JSON parsing and before edit extraction.
@@ -763,7 +767,7 @@ profile you get the defaults in this table. See "Running multiple models".
 | `timeout` | 600.0 | Seconds per request; raise for very large files. |
 | `load_wait_seconds` | 240 | How long to wait for a model to load. |
 | `max_consecutive_failures` | 3 | Aborts an indexing batch after this many failures in a row. |
-| `json_mode` | `"schema"` | `"schema"` for local llama.cpp/LM Studio, `"object"` for hosted OpenAI-compatible APIs (DeepSeek, OpenAI, …). |
+| `json_mode` | `"schema"` | `"schema"` for local llama.cpp/LM Studio, `"object"` for hosted OpenAI-compatible APIs (DeepSeek, OpenAI, …). Auto-switches to `"object"` when the base_url is remote or the model name contains "deepseek". Accepted spellings: `object`/`json_object`/`json`, and `schema`/`json_schema`. |
 | `temperature` | 0.2 | Higher makes tool selection noticeably worse. |
 | `max_tokens_step` | 700 (tier presets: small 500, medium 1500, large 1000, hosted 7000) | Budget for one tool call; raise for models that narrate at length. Thinking models need more than this looks — reasoning tokens count against it, and a budget spent entirely on thinking returns no action at all (pedacito reports that case explicitly now). The hosted preset stays under the provider's real per-message output ceiling (~8k tokens for deepseek-chat); bigger outputs are chunked across steps via `max_write_lines`, not crammed into one reply. |
 | `max_tokens_answer` | 3000 (hosted tier: 40000) | Budget for the final answer/edit reply. |

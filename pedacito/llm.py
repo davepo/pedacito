@@ -740,10 +740,26 @@ class LMStudio:
                 # Salvage the outermost object if the model added prose.
                 i, j = text.find("{"), text.rfind("}")
                 if i != -1 and j > i:
+                    frag = text[i : j + 1]
                     try:
-                        return json.loads(text[i : j + 1])
+                        return json.loads(frag)
                     except json.JSONDecodeError:
                         pass
+                    # Some non-grammar-constrained servers (DeepSeek in
+                    # json_object mode among them) emit Python-style dicts
+                    # with single quotes instead of JSON. Convert only when
+                    # the fragment has no double quotes at all -- otherwise
+                    # apostrophes inside real strings would get mangled.
+                    if '"' not in frag and "'" in frag:
+                        cand = frag.replace("'", '"')
+                        try:
+                            obj = json.loads(cand)
+                        except json.JSONDecodeError:
+                            obj = None
+                        if isinstance(obj, dict) and obj:
+                            print("[reply was a single-quoted dict; "
+                                  "converted to JSON]", file=sys.stderr)
+                            return obj
                 if truncated:
                     patched = repair_truncated_json(text)
                     if patched:

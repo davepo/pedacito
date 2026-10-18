@@ -486,3 +486,74 @@ def test_write_step_budget_and_chunking():
     import json as _json
     obj = _json.loads(fixed)
     assert obj["action"] == "read" and obj["file"] == "a.txt"
+
+
+def test_json_mode_aliases_and_deepseek_autodetect(tmp_path, monkeypatch):
+    """DeepSeek's docs say response_format {"type": "json_object"}, so users
+    reasonably write json_mode = "json_object" in their config -- every
+    spelling must land on the internal "object" mode, and a DeepSeek target
+    must never be left running with json_schema (which it rejects)."""
+    for raw, want in (("json_object", "object"), ("JSON_OBJECT", "object"),
+                      ("json", "object"), ("  object ", "object"),
+                      ("schema", "schema"), ("json_schema", "schema")):
+        assert config_mod._coerce("json_mode", raw) == want
+    with pytest.raises(config_mod.ConfigError):
+        config_mod._coerce("json_mode", "json-object")
+
+    def load(text):
+        p = tmp_path / f"c{abs(hash(text))}.toml"
+        p.write_text(text, encoding="utf-8")
+        for k in [k for k in os.environ if k.startswith("PEDACITO_")]:
+            monkeypatch.delenv(k, raising=False)
+        return config_mod.load(explicit=p, use_env=True)
+
+    # remote host, no json_mode written -> auto-switch to object
+    cfg = load('[server]\nbase_url = "https://api.deepseek.com/v1"\n'
+               'model = "deepseek-chat"\napi_key = "sk-x"\n')
+    assert cfg.json_mode == "object"
+    assert "auto-detected" in cfg.sources["json_mode"]
+    assert config_mod.is_hosted(cfg)
+    assert config_mod.budget_warnings(cfg) == []
+
+    # deepseek model served LOCALLY (localhost) -> still object mode
+    cfg = load('[server]\nbase_url = "http://localhost:1234/v1"\n'
+               'model = "deepseek-r1-distill-27b"\n')
+    assert cfg.json_mode == "object"
+
+    # explicit schema + deepseek -> loud switch, never silent failure
+    cfg = load('[server]\nbase_url = "https://api.deepseek.com/v1"\n'
+               'model = "deepseek-chat"\njson_mode = "schema"\n')
+    assert cfg.json_mode == "object"
+
+    # plain local model untouched
+    cfg = load('[server]\nbase_url = "http://localhost:1234/v1"\n'
+               'model = "qwen3-27b"\n')
+    assert cfg.json_mode == "schema"
+    assert not config_mod.is_hosted(cfg)
+
+
+def test_single_quoted_dict_reply_salvage():
+    """Some hosted models in json_object mode emit Python-style dicts with
+    single quotes. chat_json must convert them instead of burning all three
+    retries and dying with 'would not produce valid JSON'."""
+    reply = ("{'action': 'read', 'file': 'subj-imp/index.html', "
+             "'start': 405, 'end': 445, "
+             "'reasoning': 'See subj-imp script tag'}")
+    client = LMStudio.__new__(LMStudio)          # no network needed
+    client.cfg = config_mod.Config(base_url="http://x.invalid/v1", model="m",
+                        json_mode="object")
+    client.stats = {"calls": 0, "prompt_tokens": 0,
+                    "completion_tokens": 0, "seconds": 0}
+    client.last_finish_reason = "stop"
+    schema = {"properties": {"action": {}, "file": {}}}
+    seen = {"n": 0}
+
+    def fake_chat(messages, max_tokens, schema=None):
+        seen["n"] += 1
+        return reply
+    client.chat = fake_chat
+    obj = client.chat_json([{"role": "user", "content": "hi"}],
+                           schema=schema, max_tokens=100)
+    assert obj["action"] == "read"
+    assert obj["file"] == "subj-imp/index.html"
+    assert seen["n"] == 1                     # salvaged on the first try

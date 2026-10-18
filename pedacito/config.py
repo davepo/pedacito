@@ -82,8 +82,16 @@ class Config:
     #   "object" -- send {"type": "json_object"} instead. Required for
     #     DeepSeek and most other hosted OpenAI-compatible APIs, which
     #     reject json_schema outright. Slightly less reliable in principle,
-    #     in practice fine on a frontier hosted model.
+    #     in practice fine on a frontier hosted model.  Accepted spellings:
+    #     "object", "json_object", "json" (and "json_schema" -> "schema"),
+    #     so the string from your API's docs works directly here.
     json_mode: str = "schema"
+    # True when the server was recognised as a hosted API at load time --
+    # either from its URL (api.deepseek.com etc.) or because the model name
+    # contains "deepseek". Set automatically; not a config key. When set,
+    # json_mode is forced to "object" unless the user spelled json_mode
+    # explicitly in their config/profile/env.
+    _hosted_server: bool = False
 
     # --- Generation -----------------------------------------------------------
     # Low temp for tool selection; a 27B at 0.2 is fine for prose and code too.
@@ -306,7 +314,17 @@ _SECTIONS = ("server", "lmstudio", "generation", "map", "indexing", "files",
 PROFILE_SECTION = "profiles"
 
 _FIELDS = {f.name: f for f in fields(Config)
-           if f.name not in ("sources", "profiles", "active_profile")}
+           if f.name not in ("sources", "profiles", "active_profile",
+                             "_hosted_server")}
+
+# Accepted spellings for json_mode. DeepSeek's own docs put the literal
+# string "json_object" inside response_format, so users reasonably write it
+# here; mapping every variant to the two internal modes removes a whole
+# class of "config only accepts object or schema" dead ends.
+_JSON_MODE_ALIASES = {
+    "schema": "schema", "json_schema": "schema",
+    "object": "object", "json_object": "object", "json": "object",
+}
 
 
 class ConfigError(RuntimeError):
@@ -373,10 +391,16 @@ def _coerce(name: str, value, path: Path | None = None):
             target, target)
     where = f"{path}: " if path else ""
     if name == "json_mode":
-        if value not in ("schema", "object"):
+        # Accept every spelling of the two modes, including "json_object" --
+        # the literal string DeepSeek's docs put in response_format. Users
+        # reasonably try it here; rejecting it only produces confusion.
+        norm = _JSON_MODE_ALIASES.get(str(value).strip().lower())
+        if norm is None:
             raise ConfigError(
-                f"{where}{name} must be 'schema' or 'object', got {value!r}")
-        return value
+                f"{where}{name} must be 'schema' or 'object', got {value!r}"
+                "  ('json_object' / 'json' mean 'object';"
+                " 'json_schema' means 'schema')")
+        return norm
     if name == "extra_extensions":
         if not isinstance(value, (list, tuple)):
             raise ConfigError(f"{where}{name} must be a list, "
@@ -514,6 +538,33 @@ def load(root: Path | None = None, explicit: Path | None = None,
             setattr(cfg, key, _parse_env(key, raw))
             cfg.sources[key] = f"env PEDACITO_{key.upper()}"
 
+    # Hosted-API autodetect: DeepSeek (by URL or model name) cannot accept
+    # response_format json_schema -- it 400s or silently ignores it, which
+    # surfaces as "would not produce valid JSON". Users should never have to
+    # know that. If we can tell the target is a hosted API and the user did
+    # not spell json_mode anywhere, switch to "object" ourselves and say so.
+    try:
+        from urllib.parse import urlparse
+        host = (urlparse(cfg.base_url).hostname or "").lower()
+    except ValueError:
+        host = ""
+    remote = host not in ("localhost", "127.0.0.1", "0.0.0.0", "::1", "")
+    deepseek = "deepseek" in cfg.model.lower() or "deepseek" in host
+    if (remote or deepseek) and cfg.sources.get("json_mode") == "default":
+        cfg.json_mode = "object"
+        cfg._hosted_server = True
+        cfg.sources["json_mode"] = (
+            "auto-detected hosted API "
+            f"({host or cfg.model}); set json_mode explicitly to override")
+    elif deepseek and cfg.json_mode == "schema":
+        print("[config warning] Model/server is DeepSeek but json_mode was "
+              "'schema' -- switching to \"object\" automatically. DeepSeek "
+              "rejects json_schema; without this, runs fail with 'would not "
+              "produce valid JSON'. Set json_mode explicitly to override.",
+              file=sys.stderr)
+        cfg.json_mode = "object"
+        cfg._hosted_server = True
+
     # Loud-but-not-fatal: budgets that cannot fit the declared context window
     # are how truncation errors reach the user, so surface them at load time.
     for warning in budget_warnings(cfg):
@@ -575,6 +626,8 @@ def is_hosted(cfg: "Config") -> bool:
     ceiling so hosted runs are never clamped by a stale local default.
     """
     if cfg.active_tier == "hosted":
+        return True
+    if getattr(cfg, "_hosted_server", False):
         return True
     if cfg.json_mode == "object":
         return True
@@ -727,10 +780,12 @@ def _parse_env(name: str, raw: str):
     if isinstance(target, str):
         target = {"str": str, "float": float, "int": int, "bool": bool}.get(target, str)
     if name == "json_mode":
-        if raw not in ("schema", "object"):
+        norm = _JSON_MODE_ALIASES.get(raw.strip().lower())
+        if norm is None:
             raise ConfigError(
-                f"PEDACITO_JSON_MODE={raw!r} must be 'schema' or 'object'")
-        return raw
+                f"PEDACITO_JSON_MODE={raw!r} must be 'schema' or 'object'"
+                "  ('json_object' / 'json' mean 'object')")
+        return norm
     if name == "extra_extensions":
         return tuple(x.strip() for x in raw.split(",") if x.strip())
     if name == "sampler":
@@ -1234,10 +1289,13 @@ model    = "google/gemma-3-27b"
 # context_tokens     = 65536
 # reserve_tokens     = 8192
 
-# Hosted DeepSeek. json_mode must be "object": hosted APIs reject the
-# json_schema Pedacito sends by default, and the gather loop fails on its
-# first step without this. An API affords far higher limits than a small
-# local model -- these are the "hosted" preset values.
+# Hosted DeepSeek. json_mode "object" is REQUIRED for hosted APIs -- they
+# reject the json_schema Pedacito sends by default, and the gather loop
+# fails on its first step without it. You normally do not have to write it:
+# pedacito auto-detects api.deepseek.com (or any remote host) and switches
+# to "object" itself; "json_object" / "json" are accepted spellings too.
+# An API affords far higher limits than a small local model -- these are
+# the "hosted" preset values.
 #
 # [profiles.deepseek]
 # # tier = "hosted"
