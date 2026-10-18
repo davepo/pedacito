@@ -580,6 +580,91 @@ def summarise_result(summary: dict, verbose: bool = True) -> str:
 
 
 # --------------------------------------------------------------------------
+# Post-build import check / fix pass
+# --------------------------------------------------------------------------
+def _first_import_error(root: Path, plan: Plan) -> str | None:
+    """Import the project's entry point in a subprocess and return the first
+    error (ImportError / AttributeError / ...), or None if it imports cleanly.
+
+    Files are generated one at a time, so a model can name an API in one file
+    (`parse_markdown`) and define it under a different name in another
+    (`parse`). This surfaces that mismatch instead of leaving the project to
+    fail on its first run."""
+    import subprocess
+    py = [f.path for f in plan.files
+          if f.path.endswith(".py") and (root / f.path).is_file()]
+    if not py:
+        return None
+    entry = next((p for p in py if p == "main.py"), None)
+    if entry is None:
+        entry = next((p for p in py if p.endswith("__init__.py")), None)
+    if entry is None:
+        entry = py[0]
+    mod = entry[:-3].replace("/", ".")
+    if mod.endswith(".__init__"):
+        mod = mod[: -len(".__init__")]
+    try:
+        proc = subprocess.run(
+            [sys.executable, "-c", f"import {mod}"], cwd=str(root),
+            capture_output=True, text=True, timeout=120)
+    except Exception as e:                      # pragma: no cover
+        return f"(could not run import check: {e})"
+    if proc.returncode == 0:
+        return None
+    return (proc.stderr or proc.stdout).strip()
+
+
+def fix_import_errors(client, cfg, idx: "Index", plan: Plan, backup_dir,
+                      verbose: bool = True, rounds: int = 3) -> int:
+    """Re-ask the model to repair import errors left by the per-file build.
+
+    On each round: import the project, and if it fails, hand the model the
+    error plus every built .py file and ask for search/replace fixes. Returns
+    the number of successful fix blocks applied."""
+    from .agent import ANSWER_SYSTEM
+
+    fixed = 0
+    for _ in range(rounds):
+        err = _first_import_error(idx.root, plan)
+        if err is None:
+            break
+        files = {}
+        for f in plan.files:
+            p = idx.root / f.path
+            if f.path.endswith(".py") and p.is_file():
+                files[f.path] = fileio.read_text(p)
+        if not files:
+            break
+        listing = "\n\n".join(
+            f"### {rel}\n```python\n{text}\n```"
+            for rel, text in sorted(files.items()))
+        user = (
+            f"TASK\n{plan.project_name}: make the project import cleanly.\n\n"
+            f"The project fails to import with this error:\n\n{err}\n\n"
+            "CURRENT FILES\n" + listing + "\n\n"
+            "Emit search/replace blocks that fix the import error: rename or "
+            "add the missing names so every import above resolves. Keep the "
+            "blocks small and do not rewrite whole files.")
+        reply = client.chat(
+            [{"role": "system", "content": ANSWER_SYSTEM},
+             {"role": "user", "content": user}],
+            max_tokens=getattr(cfg, "max_tokens_answer", 4000),
+            stream=verbose, disable_thinking=True)
+        if not parse_edits(reply):
+            break
+        results = apply_edits(idx.root, parse_edits(reply), backup=cfg.backup,
+                              dry_run=False, cfg=cfg, backup_dir=backup_dir)
+        ok = [r for r in results if r.ok]
+        if not ok:
+            break
+        fixed += len(ok)
+        from . import index as index_mod
+        for r in ok:
+            idx = index_mod.reindex_file(idx, r.file, cfg)
+    return fixed
+
+
+# --------------------------------------------------------------------------
 # The whole flow, for the CLI's `new` command
 # --------------------------------------------------------------------------
 def run_new(root: Path, cfg, client, spec: Spec, *, apply: bool = False,
@@ -662,6 +747,14 @@ def run_new(root: Path, cfg, client, spec: Spec, *, apply: bool = False,
     summary = build_project(client, cfg, idx, plan, verbose=verbose,
                             backup_dir=backup_dir)
     print("\n" + summarise_result(summary))
+
+    # Files are generated independently, so cross-file API mismatches (import
+    # `parse_markdown` but define `parse`) are common. Ask the model to repair
+    # them until the entry point imports cleanly.
+    n_fixed = fix_import_errors(client, cfg, idx, plan, backup_dir,
+                                verbose=verbose)
+    if n_fixed and verbose:
+        print(f"  fixed {n_fixed} import issue(s)", file=sys.stderr)
 
     if review and summary["done"]:
         results = _review_build(root, plan, summary, cfg, backup_dir, when)

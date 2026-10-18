@@ -841,3 +841,24 @@ def test_starter_pyproject_has_script_entry():
         name="md2html", summary="markdown to html"))
     assert data["project"]["scripts"] == {"md2html": "main:main"}
 
+
+def test_first_import_error_detects_cross_file_mismatch(tmp_path):
+    """Files are generated independently, so one module can import a name
+    another defines differently. The post-build import check must surface
+    that mismatch instead of leaving the project to fail on first run."""
+    from pedacito import scaffold
+    pkg = tmp_path / "md2html"
+    pkg.mkdir()
+    (tmp_path / "main.py").write_text(
+        "from md2html.parser import parse_markdown\n")
+    (pkg / "__init__.py").write_text("from .parser import parse_markdown\n")
+    (pkg / "parser.py").write_text("def parse(text):\n    return text\n")
+    plan = scaffold.Plan("md2html", "y", files=[
+        scaffold.PlannedFile("main.py", ""),
+        scaffold.PlannedFile("md2html/__init__.py", ""),
+        scaffold.PlannedFile("md2html/parser.py", ""),
+    ], spec=scaffold.Spec("y"))
+    err = scaffold._first_import_error(tmp_path, plan)
+    assert err and "parse_markdown" in err, err
+
+
