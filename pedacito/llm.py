@@ -414,7 +414,7 @@ class LMStudio:
         return r
 
     def chat(self, messages: list[dict], max_tokens: int, schema: dict | None = None,
-             stream: bool = False) -> str:
+             stream: bool = False, disable_thinking: bool | None = None) -> str:
         """Send a chat completion request and return the response text.
 
         Handles retries for transient failures (model still loading),
@@ -472,7 +472,8 @@ class LMStudio:
                           f"older tool results before sending]", file=sys.stderr)
                     messages = new_messages
             try:
-                return self._chat_once(messages, max_tokens, schema, stream)
+                return self._chat_once(messages, max_tokens, schema, stream,
+                                       disable_thinking)
             except ContextOverflowError as e:
                 # The server's window is smaller than our budgets assumed
                 # (stock LM Studio 8192 / Ollama 4096 vs a hosted-tier
@@ -575,7 +576,8 @@ class LMStudio:
                 delay = min(delay * 1.6, 10.0)
 
     def _chat_once(self, messages: list[dict], max_tokens: int,
-                   schema: dict | None = None, stream: bool = False) -> str:
+                   schema: dict | None = None, stream: bool = False,
+                   disable_thinking: bool | None = None) -> str:
         """Send exactly one HTTP request (no retry logic) and return the
         response text, either buffered or streamed to stdout."""
         msgs = [dict(m) for m in messages]
@@ -633,7 +635,8 @@ class LMStudio:
                 return False
             return h not in ("localhost", "127.0.0.1", "0.0.0.0", "::1", "")
 
-        if self.cfg.disable_thinking and not _url_is_remote():
+        if (disable_thinking if disable_thinking is not None
+                else self.cfg.disable_thinking) and not _url_is_remote():
             # Two spellings, one intent: Qwen/DeepSeek-R1 family templates
             # read chat_template_kwargs.enable_thinking, llama.cpp's own
             # sampler reads no_temp/top_k style keys, and some builds accept
@@ -759,7 +762,8 @@ class LMStudio:
             for p in props.values())
 
     def chat_json(self, messages: list[dict], schema: dict, max_tokens: int,
-                  retries: int = 2, cap: int | None = None) -> dict:
+                  retries: int = 2, cap: int | None = None,
+                  disable_thinking: bool | None = None) -> dict:
         """Send a grammar-constrained chat request and return the parsed
         JSON object.
 
@@ -812,7 +816,8 @@ class LMStudio:
                           max(usable, max_tokens))
         cap = max(cap, max_tokens)
         for attempt in range(retries + 1):
-            raw = self.chat(messages, max_tokens=budget, schema=schema)
+            raw = self.chat(messages, max_tokens=budget, schema=schema,
+                            disable_thinking=disable_thinking)
             last = raw
             truncated = self.last_finish_reason == "length"
             text = raw.strip()

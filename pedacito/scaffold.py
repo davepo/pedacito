@@ -262,7 +262,8 @@ def build_plan(spec: Spec, client, cfg, root: Path, verbose: bool = True) -> Pla
     messages = [{"role": "system", "content": PLAN_SYSTEM},
                 {"role": "user", "content": user}]
     raw = client.chat_json(messages, PLAN_SCHEMA,
-                           max_tokens=getattr(cfg, "max_tokens_plan", 1200))
+                           max_tokens=getattr(cfg, "max_tokens_plan", 2000),
+                           disable_thinking=True)
     if not isinstance(raw, dict):
         raise LLMError("The planning call did not return an object.")
 
@@ -487,8 +488,8 @@ def build_pass(client, cfg, idx, plan: Plan, target: PlannedFile,
         {"role": "system", "content": BUILD_SYSTEM + "\n\n" + ANSWER_SYSTEM},
         {"role": "user", "content": "\n".join(ctx)},
     ]
-    reply = client.chat(messages, max_tokens=getattr(cfg, "max_tokens_build", 4000),
-                        stream=verbose)
+    reply = client.chat(messages, max_tokens=getattr(cfg, "max_tokens_build", 8000),
+                        stream=verbose, disable_thinking=True)
     results = apply_edits(idx.root, parse_edits(reply), backup=cfg.backup,
                           dry_run=False, cfg=cfg)
     return results, reply

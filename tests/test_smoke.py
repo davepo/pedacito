@@ -733,7 +733,7 @@ def test_single_quoted_dict_reply_salvage():
     schema = {"properties": {"action": {}, "file": {}}}
     seen = {"n": 0}
 
-    def fake_chat(messages, max_tokens, schema=None):
+    def fake_chat(messages, max_tokens, schema=None, **kw):
         seen["n"] += 1
         return reply
     client.chat = fake_chat
@@ -818,7 +818,7 @@ def test_new_dry_run_writes_nothing(tmp_path):
 
     class Stub:
         stats = {"calls": 0, "completion_tokens": 0, "seconds": 0}
-        def chat_json(self, messages, schema, max_tokens=0):
+        def chat_json(self, messages, schema, max_tokens=0, **kw):
             return {"project_name": "md2html", "summary": "markdown to html",
                     "files": [{"path": "main.py", "purpose": "CLI entry"},
                               {"path": "parser.py", "purpose": "parse markdown"}]}

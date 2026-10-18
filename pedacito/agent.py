@@ -476,7 +476,9 @@ class Agent:
         while step < step_cap:
             step += 1
             try:
-                stepjson = self.client.chat_json(messages, STEP_SCHEMA, self.cfg.max_tokens_step)
+                stepjson = self.client.chat_json(messages, STEP_SCHEMA,
+                                                 self.cfg.max_tokens_step,
+                                                 disable_thinking=True)
             except LLMError as e:
                 # A gather step that cannot produce JSON at all must not kill
                 # the whole run -- the DeepSeek failure class: json_object

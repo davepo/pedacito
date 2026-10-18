@@ -258,8 +258,10 @@ class Config:
     # answer budget. The plan call must clear the file-tree JSON AND, on a
     # reasoning model, the <think> block that precedes it -- a budget sized
     # for plain output spends itself on thinking and never emits the JSON.
+    # (Thinking is disabled per-call for these two, so the whole budget goes
+    # to the actual output; still sized generously for whole files.)
     max_tokens_plan: int = 2000
-    max_tokens_build: int = 4000
+    max_tokens_build: int = 8000
 
     # --- Reasoning models -----------------------------------------------------
     # Qwen3 and friends emit a <think> block by default. Pedacito strips it either
@@ -927,7 +929,7 @@ PRESETS: dict[str, dict] = {
         "max_steps": 40,
         "max_tokens_answer": 1500,
         "max_tokens_plan": 1200,
-        "max_tokens_build": 2000,
+        "max_tokens_build": 4000,
         "flat_map_token_budget": 1500,
         "max_gathered_chars": 12000,
         "max_read_lines": 120,
@@ -947,7 +949,7 @@ PRESETS: dict[str, dict] = {
         "max_steps": 50,
         "max_tokens_answer": 3000,
         "max_tokens_plan": 4000,
-        "max_tokens_build": 4000,
+        "max_tokens_build": 8000,
         "flat_map_token_budget": 4000,
         "max_gathered_chars": 24000,
         "max_read_lines": 200,
@@ -1262,7 +1264,7 @@ model    = "google/gemma-3-27b"
 # max_tokens_plan = 2000           # budget for the planning call (raise for
 #                                  # thinking models -- their <think> block
 #                                  # counts against this)
-# max_tokens_build = 4000          # budget for each per-file build pass
+# max_tokens_build = 8000          # budget for each per-file build pass
 
 # --- Reasoning models -------------------------------------------------------
 # Qwen3 and friends emit a <think> block by default. Pedacito strips it
@@ -1320,7 +1322,7 @@ model    = "google/gemma-3-27b"
 # repair_rounds      = 1
 # max_tokens_answer  = 1500
 # max_tokens_plan    = 1200
-# max_tokens_build   = 2000
+# max_tokens_build   = 4000
 # flat_map_token_budget = 1500
 # max_gathered_chars = 12000
 # max_read_lines     = 120
@@ -1348,7 +1350,7 @@ model    = "google/gemma-3-27b"
 # repair_rounds      = 2
 # max_tokens_answer  = 3000
 # max_tokens_plan    = 4000
-# max_tokens_build   = 4000
+# max_tokens_build   = 8000
 # flat_map_token_budget = 4000
 # max_gathered_chars = 24000
 # max_read_lines     = 200
