@@ -370,6 +370,27 @@ def _is_placeholder_only(text: str) -> bool:
     return all(ln.startswith("#") or ln.startswith("//") for ln in lines)
 
 
+def _placeholder_comment(ph: str, suffix: str) -> str:
+    """Render a rename placeholder as a leading comment for a file of the
+    given suffix, without double-wrapping one the model already wrote as a
+    comment. Wrapping `/* ... */` in another `/* ... */` produced
+    `/* /* ... */ */`, a syntax error that aborted the whole rename."""
+    lines = ph.splitlines()
+    if suffix in (".html", ".htm"):
+        # HTML tolerates a bare line; keep the model's text verbatim.
+        return "\n".join(lines) + "\n"
+    if suffix == ".py":
+        return "".join(
+            (ln if ln.lstrip().startswith("#") else "# " + ln) + "\n"
+            for ln in lines)
+    if suffix in (".css", ".js", ".ts", ".scss"):
+        return "".join(
+            (ln if (ln.lstrip().startswith("//") or ln.lstrip().startswith("/*"))
+             else "/* " + ln + " */") + "\n"
+            for ln in lines)
+    return ph + "\n"
+
+
 def apply_edits(root: Path, edits: list[Edit], backup: bool = True,
                 dry_run: bool = False, backup_dir: Path | None = None,
                 cfg=None) -> list[Result]:
@@ -681,14 +702,8 @@ def apply_edits(root: Path, edits: list[Edit], backup: bool = True,
                 else:                         # pure creation: placeholder + moved bytes
                     ph = text.strip()
                     body = texts[0].rstrip("\n")
-                    suffix = path.suffix.lower()
-                    if ph and suffix in (".html", ".htm"):
-                        text = f"{ph}\n{body}\n"
-                    elif ph and suffix in (".py",):
-                        text = "".join(f"# {ln}\n" for ln in ph.splitlines()) \
-                               + body + "\n"
-                    elif ph and suffix in (".css", ".js", ".ts", ".scss"):
-                        text = "".join(f"/* {ln} */\n" for ln in ph.splitlines()) \
+                    if ph:
+                        text = _placeholder_comment(ph, path.suffix.lower()) \
                                + body + "\n"
                     else:
                         text = body + "\n"

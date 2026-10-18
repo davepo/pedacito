@@ -210,6 +210,40 @@ def test_rename_with_midfile_clear_block(tmp_path):
     assert "real body content" in (tmp_path / "renamed.html").read_text()
 
 
+def test_rename_placeholder_already_a_comment(tmp_path):
+    """A rename placeholder the model already wrote as a comment (`/* ... */`)
+    must be kept verbatim, not wrapped in a second `/* ... */` -- the
+    double-wrap produced `/* /* ... */ */`, a syntax error that aborted the
+    whole JS rename."""
+    _write(tmp_path / "sentences.js",
+           "/* =========================================================\n"
+           "   sentences.js — Banco de oraciones\n"
+           "   ========================================================= */\n"
+           "var s = ['uno'];\n")
+    reply = (
+        "--- FILE: subjuntivo-imperativo.js\n"
+        "<<<<<<< SEARCH\n"
+        "=======\n"
+        "/* placeholder — real contents are moved from sentences.js */\n"
+        ">>>>>>> REPLACE\n\n"
+        "--- FILE: sentences.js\n"
+        "<<<<<<< SEARCH\n"
+        "/* =========================================================\n"
+        "   sentences.js — Banco de oraciones\n"
+        "=======\n"
+        ">>>>>>> REPLACE\n"
+    )
+    results = edits.apply_edits(tmp_path, edits.parse_edits(reply),
+                                backup=False, dry_run=False)
+    assert all(r.ok for r in results), [r.message for r in results]
+    assert (tmp_path / "subjuntivo-imperativo.js").is_file()
+    assert not (tmp_path / "sentences.js").exists()
+    body = (tmp_path / "subjuntivo-imperativo.js").read_text()
+    assert "/* placeholder" in body
+    assert "var s = ['uno'];" in body
+
+
+
 
 def test_review_write_deletes_rename_source(tmp_path):
     """The review sign-off path must delete a rename's source file, not write
