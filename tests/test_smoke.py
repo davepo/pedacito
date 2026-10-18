@@ -252,6 +252,48 @@ def test_search_block_matches_at_eof_with_newline_tail(tmp_path):
     assert (tmp_path / "a.py").read_text() == "x = 2\n"
 
 
+def test_apply_continues_when_model_defers(tmp_path):
+    """A model that cleanly finishes with "the rest follows in the next turn"
+    (rather than truncating) must trigger a follow-up turn -- otherwise a
+    multi-file task stops at its first batch, 'only half the request was
+    addressed'. The completion loop re-prompts and applies the remaining work
+    until the model answers NOTHING MORE."""
+    from pedacito import index as index_mod
+    _write(tmp_path / "old.js", "var a = 1;\nvar b = 2;\n")
+    idx = index_mod.Index(tmp_path, [])
+
+    class StubClient:
+        stream_truncated = False
+        def __init__(self):
+            self.prompts = []
+        def chat(self, messages, max_tokens, schema=None, stream=False, **kw):
+            self.prompts.append(messages[-1]["content"])
+            return "NOTHING MORE"
+
+    client = StubClient()
+    agent = Agent(idx, client, config_mod.Config())
+    reply = (
+        "--- FILE: new.js\n"
+        "<<<<<<< SEARCH\n"
+        "=======\n"
+        "// placeholder\n"
+        ">>>>>>> REPLACE\n\n"
+        "--- FILE: old.js\n"
+        "<<<<<<< SEARCH\n"
+        "var a = 1;\n"
+        "=======\n"
+        ">>>>>>> REPLACE\n\n"
+        "The HTML renames will follow in the next turn.\n"
+    )
+    results, _ = agent.apply(reply, dry_run=False,
+                             task="rename old.js to new.js", gathered="")
+    assert all(r.ok for r in results), [r.message for r in results]
+    assert (tmp_path / "new.js").is_file()
+    assert not (tmp_path / "old.js").exists()
+    assert client.prompts, "deferral did not trigger a follow-up turn"
+    assert "EDITS ALREADY DELIVERED" in client.prompts[0]
+
+
 # ------------------------------------------------------------------ budgets
 def test_default_budgets_fit_small_windows():
     """The historical failure: defaults sized for 32k+ models made every
