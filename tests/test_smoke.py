@@ -162,6 +162,82 @@ def test_default_budgets_fit_small_windows():
         assert not config_mod.budget_warnings(c), f"preset {name} is over-budget"
 
 
+def test_auto_fit_clamps_hosted_profile_to_small_window():
+    """The DeepSeek symptom, reproduced offline: a `tier = "hosted"` config
+    pointed at an 8k local server asked for reply budgets (16k answer, 32k
+    cap) that exceed the whole window -- llama.cpp answers every request
+    with a flat 400 ("kept hitting limits"). auto_fit must rewrite every
+    budget so prompt + max_tokens fits inside context_tokens, and the
+    result must pass budget_warnings with nothing left to complain about."""
+    cfg = config_mod.Config()
+    for k, v in config_mod.PRESETS["hosted"].items():
+        setattr(cfg, k, v)
+    cfg.context_tokens = 8192
+    cfg.sources["context_tokens"] = "explicit"   # pretend the user set it
+    cfg.auto_detect_context = False              # no server in this test
+    notes = config_mod.auto_fit(cfg, verbose=False)
+    assert notes, "hosted budgets on an 8k window must trigger auto-fit"
+    usable = cfg.context_tokens - cfg.reserve_tokens
+    assert usable >= 512, "reserve must shrink first to keep usable space"
+    for key in ("max_tokens_step", "max_tokens_summary", "max_tokens_answer",
+                "max_tokens_build", "max_tokens_plan"):
+        v = getattr(cfg, key)
+        assert v <= cfg.context_tokens - 512, f"{key}={v} still overflows"
+    assert cfg.request_max_tokens_cap <= usable
+    # map + gathered source + one step must share the remaining window
+    map_tok = cfg.flat_map_token_budget
+    gathered_tok = cfg.max_gathered_chars // 4
+    assert map_tok + gathered_tok + cfg.max_tokens_step <= usable + 1
+    assert not config_mod.budget_warnings(cfg), \
+        f"post-fit warnings: {config_mod.budget_warnings(cfg)}"
+
+
+def test_auto_fit_respects_explicit_values_that_still_fit():
+    """auto_fit only clamps numbers that physically cannot work; a user who
+    explicitly sets a modest value keeps it untouched."""
+    cfg = config_mod.Config()
+    cfg.context_tokens = 8192
+    cfg.auto_detect_context = False
+    cfg.max_tokens_answer = 1000
+    cfg.sources["max_tokens_answer"] = "config file"
+    before = dict(vars(cfg))
+    config_mod.auto_fit(cfg, verbose=False)
+    assert cfg.max_tokens_answer == 1000
+    assert cfg.sources.get("max_tokens_answer") == "config file"
+    del before
+
+
+def test_evict_overflow_turns_clips_oldest_result():
+    """Gather-loop history grows every step; when it outgrows the window the
+    oldest RESULT turn must be clipped (head kept, so the file/line header
+    the coverage ledger parses survives) and the newest turns left intact --
+    the run degrades gracefully instead of 400ing forever."""
+    from pedacito.agent import _evict_overflow_turns
+    from pedacito.llm import estimate_tokens
+
+    cfg = config_mod.Config()
+    cfg.context_tokens = 4096
+    cfg.max_tokens_step = 512
+    cfg.reserve_tokens = 1024      # room = 4096-512-512 = 3072 tokens
+    msgs = [{"role": "system", "content": "map + task"},
+            {"role": "assistant", "content": "thinking"},
+            {"role": "user", "content": "RESULT:\n" + "\n".join(
+                f"line {i} " + "x" * 60 for i in range(300))},
+            {"role": "assistant", "content": "more thinking"},
+            {"role": "user", "content": "RESULT:\nyoung " + "y" * 100}]
+    room = cfg.context_tokens - cfg.max_tokens_step - cfg.reserve_tokens // 2
+    total_before = sum(estimate_tokens(m["content"]) for m in msgs)
+    assert total_before > room, "fixture must actually overflow"
+    changed = _evict_overflow_turns(msgs, client=None, cfg=cfg)
+    assert changed, "oversized history must be trimmed"
+    room = cfg.context_tokens - cfg.max_tokens_step - cfg.reserve_tokens // 2
+    assert sum(estimate_tokens(m["content"]) for m in msgs) <= room
+    assert msgs[0]["content"] == "map + task"          # untouched
+    old = next(m for m in msgs if m["content"].startswith("RESULT:\nline"))
+    assert "older read dropped" in old["content"]       # clip notice present
+    assert any("young" in m["content"] for m in msgs)   # newest survives
+
+
 def test_truncated_json_gets_token_limit_error():
     """A thinking model that spends its whole budget on reasoning returns
     no JSON at all and finish_reason='length'. chat_json must report THAT

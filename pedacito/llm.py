@@ -328,6 +328,13 @@ class LMStudio:
         # Set once we learn this model's template has no system role, so we
         # don't burn a failed request rediscovering it on every call.
         self._no_system_role = False
+        # Tri-state for grammar-constrained JSON support: None = not probed
+        # yet (assume supported, the historical default), True = server
+        # advertises response_format/json_schema, False = it answered our
+        # probe WITHOUT advertising it (Ollama, plain OpenAI-compatible
+        # endpoints) -- those requests fall back to JSON prompting instead
+        # of 400ing or silently ignoring the schema.
+        self._schema_supported: bool | None = None
         # "length" here means the model was cut off mid-answer, which for a
         # grammar-constrained call is the difference between "bad JSON" and
         # "valid JSON we never let it finish".
@@ -383,12 +390,14 @@ class LMStudio:
              stream: bool = False) -> str:
         """Send a chat completion request and return the response text.
 
-        Handles retries for transient failures (model still loading) and
-        automatic recovery from template incompatibilities (folding the
-        system prompt into the first user turn if the template rejects a
-        system role). A model that is still loading answers 400 or 503 for a
-        while; without a retry loop, the first call of a batch would fail and
-        every subsequent one would fail the same way.
+        Handles retries for transient failures (model still loading),
+        proactive conversation trimming so llama.cpp-style servers never see
+        prompt+reply beyond their window, and automatic recovery from
+        template incompatibilities (folding the system prompt into the first
+        user turn if the template rejects a system role). A model that is
+        still loading answers 400 or 503 for a while; without a retry loop,
+        the first call of a batch would fail and every subsequent one would
+        fail the same way.
         """
         messages = merge_consecutive(messages)
         if self._no_system_role:
@@ -398,8 +407,43 @@ class LMStudio:
         announced = False
         attempt = 0
         trimmed_once = False
+        shrunk_once = False
         while True:
             attempt += 1
+            # Proactive fit: llama.cpp/LM Studio reject any request whose
+            # prompt + max_tokens exceeds the configured window ("kept
+            # hitting limits" even on correct configs), and Ollama silently
+            # truncates the middle instead -- which is how a local model
+            # "runs to completion" with an answer to a task it never saw.
+            # Shrink the oldest tool-result turns until the reply budget
+            # genuinely fits; only the newest RESULT matters mid-gather,
+            # since gathered source reaches the answer phase separately.
+            room = self.cfg.context_tokens - max_tokens
+            total = sum(estimate_tokens(m["content"]) for m in messages)
+            if room > 0 and total > room * 0.9:
+                new_messages = list(messages)
+                # Drop the OLDEST RESULT turn together with the assistant
+                # action that requested it -- removing only one side would
+                # leave two same-role messages in a row, which strict chat
+                # templates (Mistral especially) reject outright.
+                while True:
+                    cur = sum(estimate_tokens(m["content"]) for m in new_messages)
+                    if cur <= room * 0.85:
+                        break
+                    idxs = [i for i, m in enumerate(new_messages)
+                            if m["role"] == "user"
+                            and m["content"].startswith("RESULT:\n")]
+                    if len(idxs) < 2:
+                        break     # keep the newest result; server decides
+                    drop = idxs[0]
+                    pair = drop - 1 if drop and new_messages[drop - 1]["role"] == "assistant" else None
+                    kill = {drop} | ({pair} if pair is not None else set())
+                    new_messages = [m for k, m in enumerate(new_messages) if k not in kill]
+                if len(new_messages) != len(messages):
+                    print(f"[prompt was ~{total:,} tokens for a "
+                          f"{self.cfg.context_tokens:,}-token window; dropped "
+                          f"older tool results before sending]", file=sys.stderr)
+                    messages = new_messages
             try:
                 return self._chat_once(messages, max_tokens, schema, stream)
             except ContextOverflowError as e:
@@ -440,6 +484,17 @@ class LMStudio:
                             print("[server context overflow: shortened the "
                                   "conversation and retrying]", file=sys.stderr)
                             continue
+                if not shrunk_once and max_tokens > 256:
+                    # Our char/token estimate was optimistic (code-heavy text
+                    # is denser than prose). Halve the REPLY budget for a
+                    # second attempt: the prompt is already trimmed, and a
+                    # shorter step reply still carries the action (the schema
+                    # puts it first, so truncation loses only `reasoning`).
+                    shrunk_once = True
+                    max_tokens = max(256, max_tokens // 2)
+                    print("[server context overflow again; halving the reply "
+                          "budget and retrying once]", file=sys.stderr)
+                    continue
                 raise LLMError(
                     f"{e}\n\n"
                     "Pedacito already trimmed the conversation once and the "
@@ -541,15 +596,40 @@ class LMStudio:
         # only sent when we're clearly talking to a local server (i.e. not
         # json_mode = "object").
         if self.cfg.disable_thinking and self.cfg.json_mode == "schema":
+            # Two spellings, one intent: Qwen/DeepSeek-R1 family templates
+            # read chat_template_kwargs.enable_thinking, llama.cpp's own
+            # sampler reads no_temp/top_k style keys, and some builds accept
+            # the flat `think: false` field. Servers ignore unknown fields;
+            # servers that DON'T ignore them are exactly the thinking models
+            # this targets. Without any of these, a thinking model spends its
+            # entire step budget on hidden reasoning and emits nothing --
+            # "with thinking off it didn't return an answer" is the other
+            # face of the same coin.
             payload["chat_template_kwargs"] = {"enable_thinking": False}
         if schema is not None:
             if self.cfg.json_mode == "object":
                 payload["response_format"] = {"type": "json_object"}
             else:
-                payload["response_format"] = {
-                    "type": "json_schema",
-                    "json_schema": {"name": "step", "strict": True, "schema": schema},
-                }
+                # json_schema (grammar-constrained) is LM Studio's feature.
+                # Ollama and many hosted APIs 400 on response_format entirely,
+                # or silently ignore it and answer in prose -- which then
+                # surfaces as "kept hitting limits" or "would not produce
+                # valid JSON". So only send it when the server actually
+                # advertised support: LM Studio reports `supported_parameters`
+                # on its native /api/v0/models endpoint. Servers that never
+                # answered the probe are assumed to support it (that was the
+                # historical default); servers that answered WITHOUT it fall
+                # back to plain JSON prompting for this request.
+                if self._schema_supported is False:
+                    fields = ", ".join(schema.get("properties", {}).keys())
+                    msgs[-1]["content"] += (
+                        "\n\nReply with one JSON object only, no prose. "
+                        f"Fields: {fields}.")
+                else:
+                    payload["response_format"] = {
+                        "type": "json_schema",
+                        "json_schema": {"name": "step", "strict": True, "schema": schema},
+                    }
 
         t0 = time.time()
         self.stats["calls"] += 1
@@ -794,6 +874,39 @@ class LMStudio:
             if resident and self.cfg.model not in resident:
                 print(f"[server currently has {', '.join(resident)} loaded; "
                       f"requesting '{self.cfg.model}']", file=sys.stderr)
+        # Learn whether this server honours grammar-constrained JSON before
+        # the first real step request. LM Studio's native API lists
+        # `supported_parameters` per model; when it answers WITHOUT
+        # response_format / json_schema in that list (or the model entry
+        # lacks the field entirely on an older build), we downgrade to plain
+        # JSON prompting rather than getting prose back from a call we asked
+        # to be constrained -- which previously surfaced as endless retries
+        # and "would not produce valid JSON".
+        if self._schema_supported is None and self.cfg.json_mode != "object":
+            try:
+                base = self.cfg.base_url.rstrip("/")
+                root = base[:-3] if base.endswith("/v1") else base
+                r = requests.get(root + "/api/v0/models", headers=self.headers,
+                                 timeout=5)
+                if r.status_code == 200:
+                    for m in r.json().get("data", []):
+                        if not isinstance(m, dict):
+                            continue
+                        if m.get("id") == self.cfg.model or m.get("key") == self.cfg.model:
+                            sp = [str(x).lower() for x in
+                                  (m.get("supported_parameters") or [])]
+                            if any("response_format" in x or "json_schema" in x
+                                   for x in sp):
+                                self._schema_supported = True
+                            elif sp:
+                                self._schema_supported = False
+                                if verbose:
+                                    print("[server does not support constrained "
+                                          "JSON; using plain JSON prompting]",
+                                          file=sys.stderr)
+                            break
+            except Exception:
+                pass   # probe is an optimisation; never fatal
         t0 = time.time()
         self.chat([{"role": "user", "content": "Reply with the single word: ok"}],
                   max_tokens=5)

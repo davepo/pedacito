@@ -103,12 +103,29 @@ same result, no `PATH` needed.
 ## Step 2 — Configure
 
 ```bash
-pedacito config --init
+pedacito config --setup
 ```
 
-Writes a starter file to `~/.config/pedacito/config.toml` (Linux/macOS) or
-`%APPDATA%\pedacito\config.toml` (Windows), and tells you which path it used.
-Open it and set two things:
+An interactive wizard: it probes for a running LM Studio or Ollama server,
+lists the models it finds, asks which to use (Enter accepts the
+auto-detected one), optionally takes a hosted API key (DeepSeek and
+friends), and writes a minimal config to `~/.config/pedacito/config.toml`
+(Linux/macOS) or `%APPDATA%\pedacito\config.toml` (Windows). Only two
+settings are ever mandatory — `base_url` and `model` — and the wizard fills
+both from what it discovers. Prefer doing it by hand? `pedacito config
+--init` writes the same two-line starter; `pedacito config --reference`
+shows every knob with explanations.
+
+Whatever path you chose, token budgets need no attention: pedacito asks
+your server its real context window at startup and fits every limit to it
+automatically (see "Token budgets" in the README). A DeepSeek-style hosted
+profile pointed at an 8k local model is now safe — the numbers get squeezed
+to fit instead of the server rejecting every request. If you still want per-
+model profiles, add `tier = "small"|"medium"|"large"|"hosted"` to a profile
+and all ten budget knobs come from that preset; keys you write explicitly
+still win.
+
+Then:
 
 ```toml
 [server]
@@ -116,18 +133,16 @@ base_url = "http://localhost:1234/v1"   # or :11434/v1 for Ollama
 model = "qwen3.5-9b"            # exact id/name the server reports
 ```
 
-The generated file also contains four ready-made profile skeletons —
-`small9b`, `local27`, `local35`, and `deepseek` — each with its **complete
-set of token limits spelled out** (answer/step/summary/plan/build budgets,
-gather ceiling, map budget). A 9B local model and a DeepSeek API call can't
-share one budget: the small tier keeps answers under 1500 tokens so nothing
-overflows an 8k context window, while the hosted tier allows 16000-token
-answers and 100k-char gathers. Uncomment whichever matches your hardware,
-fix the model name, and switch with `--profile NAME`. Add
-`tier = "small"|"medium"|"large"|"hosted"` to any profile to inherit those
-limits as a preset instead of spelling them out — keys you write still win.
+Whatever you do by hand, the file only ever needs those two lines. The old
+skeleton with four fully-spelled-out profile blocks is still available via
+`pedacito config --reference`. If you run several models and want to switch
+with `--profile NAME`, each profile can carry a one-word preset —
+`tier = "small"|"medium"|"large"|"hosted"` — instead of ten budget knobs;
+keys you write explicitly still win. And remember budgets self-fit to the
+server's real window at startup, so a wrong tier costs efficiency, not
+correctness.
 
-Then:
+Next, verify:
 
 ```bash
 pedacito config --check
@@ -474,7 +489,9 @@ code change, you get an answer and no edit blocks.
 | Model listed but won't load / generate | Usually VRAM: another model is still resident. Free it up, or lower context length. |
 | `search block not found` | The model copied line-number prefixes into its edit text, or picked a snippet that appears twice. Gets two automatic retries; if it keeps failing, narrow the task. |
 | Model claims a function doesn't exist | It's not in the index — check `pedacito files`, an ignore rule is probably too broad. |
-| `Model would not produce valid JSON` | Usually a truncated reply (the model wrote too much before finishing its tool call), not actually bad JSON. Pedacito retries with more room automatically; if it persists, raise `max_tokens_step`. |
+| `Model would not produce valid JSON` | Usually a truncated reply (the model wrote too much before finishing its tool call), not actually bad JSON. Pedacito retries with more room automatically; if it persists, raise `max_tokens_step`. A thinking model that spends its whole budget on reasoning returns no JSON at all — pedacito now says so explicitly; turn thinking off or give it more room. |
+| Every request fails / "kept hitting limits" | Budgets exceeded the server's context window. This is fixed automatically at startup (auto-detect + auto-fit) — check the `[auto-fit]` line it prints, and see "Token budgets" in the README. If you set `auto_fit = false` or an explicit `context_tokens`, remove that and let it probe the real value. |
+| Local run finishes but the answer is nonsense | The prompt was silently truncated by the server (Ollama does this instead of erroring) so the model never saw the task. Update pedacito — oversized answer prompts are now refused up front with instructions, and history is trimmed to fit mid-task. Raising the server-side context length helps too. |
 | Model reads the wrong things / seems lost | Raise `max_steps`, or name the file directly in the task. |
 | Answers turn vague and generic | The project may have crossed the map's token budget and switched from a full listing to per-file cards. `pedacito map ~/code/anki --tier auto` shows which mode is active. |
 | Stale or misleading summaries | Your docstrings are inaccurate — a docstring substitutes for a generated summary by default. Set `summarise_documented = true` and re-index. |

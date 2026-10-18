@@ -22,6 +22,11 @@ dev = ["pytest>=8"]
 
 [tool.pytest.ini_options]
 markers = ["network: tests that spawn the fake LLM server (fast, local)"]
+# Some environments ship a broken third-party pytest plugin (e.g. libtmux
+# versions whose own fixture carries a mark, which pytest >=8.4 rejects at
+# import time -- collection dies before any test runs). Disabling autoload
+# keeps `pytest` working everywhere; add plugins back with -p <name>.
+addopts = "-p no:cacheprovider --disable-plugin-autoload"
 
 [build-system]
 requires = ["setuptools>=68"]

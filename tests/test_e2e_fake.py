@@ -50,6 +50,8 @@ def _free_port() -> int:
     return port
 
 
+# NOTE: the `network` marker lives only on the test functions below, never
+# on this fixture -- pytest >=8.4 hard-errors on marks applied to fixtures.
 @pytest.fixture(scope="module")
 def fake_port():
     """Start tests/fake_llm.py once for the module.

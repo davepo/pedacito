@@ -32,7 +32,7 @@ from __future__ import annotations
 import sys
 
 from .edits import apply_edits, parse_edits
-from .llm import estimate_tokens
+from .llm import LLMError, estimate_tokens
 from .tools import STEP_SCHEMA, TOOL_HELP, dispatch
 
 # Absolute ceiling on gather-loop steps regardless of cfg.max_steps. The
@@ -302,6 +302,51 @@ Before the blocks, write a short plain explanation of what you changed and why.
 If the task is a question rather than a change, just answer it and output no blocks."""
 
 
+def _evict_overflow_turns(messages: list[dict], client, cfg) -> bool:
+    """Shrink the live conversation until it fits the server's window.
+
+    Returns True if anything was dropped. Drops the OLDEST RESULT turns
+    first (their source is already collected in `gathered` and reaches the
+    answer phase anyway); a lone huge turn is clipped line-by-line, keeping
+    its head -- which preserves the file/line header the coverage ledger
+    parses. Never touches the map+task message or the assistant turns.
+    """
+    import sys as _sys
+    from .llm import estimate_tokens
+
+    def over_by() -> int:
+        room = max(cfg.context_tokens - cfg.max_tokens_step
+                   - cfg.reserve_tokens // 2, 512)
+        return sum(estimate_tokens(m["content"]) for m in messages) - room
+
+    changed_any = False
+    while over_by() > 0:
+        idxs = [i for i, m in enumerate(messages)
+                if m["role"] == "user" and m["content"].startswith("RESULT:\n")]
+        if not idxs:
+            break
+        i = idxs[0]
+        content = messages[i]["content"]
+        lines = content.split("\n")
+        if len(lines) > 6:
+            keep = max(4, len(lines) // 2)
+            messages[i] = {"role": "user", "content": "\n".join(
+                lines[:keep] + ["[older read dropped to fit the model's "
+                                "context window; re-`read` it if you need "
+                                "the rest]", "", ""] + lines[-2:])}
+        else:
+            drop = {i}
+            nxt = [j for j in idxs[1:] if messages[j]["content"].startswith("RESULT:\n")]
+            if nxt:
+                drop.add(nxt[0])   # keep roles alternating after removal
+            messages[:] = [m for k, m in enumerate(messages) if k not in drop]
+        changed_any = True
+    if changed_any:
+        print("[conversation trimmed to fit the model's context window]",
+              file=_sys.stderr)
+    return changed_any
+
+
 class Agent:
     """Runs one task against an Index and an LM Studio client: gather source,
     generate an answer or edits, and apply those edits."""
@@ -531,6 +576,14 @@ class Agent:
             messages.append({"role": "user",
                              "content": f"RESULT:\n{obs}\n\n{nudge(step + 1)}"})
 
+            # Proactive window guard: our own char budget says there's room,
+            # but the live conversation (map + every RESULT turn echoed back
+            # on each request) can still outgrow the server's configured
+            # window -- LM Studio then 400s mid-task ("kept hitting limits")
+            # and Ollama silently drops the middle of the prompt (the model
+            # answers nonsense). Trim before sending the next request.
+            _evict_overflow_turns(messages, self.client, self.cfg)
+
             if budget <= 0:
                 if verbose:
                     print("  [context budget exhausted; moving to answer]", file=sys.stderr)
@@ -548,6 +601,12 @@ class Agent:
         # from those same deltas so the answer phase sees each line exactly
         # once.
         new_items = _evict_duplicate_reads(messages, gathered, spans)
+        # Final proactive trim: the loop above trims after each tool result,
+        # but nudge turns (the "read these files first" prompts) can push the
+        # conversation over the window between reads. Do one sweep before the
+        # answer phase so the next request cannot 400 or be silently
+        # truncated server-side.
+        _evict_overflow_turns(messages, self.client, self.cfg)
         return "\n\n".join(new_items)
 
     # ------------------------------------------------------ coverage bookkeeping
@@ -624,6 +683,34 @@ class Agent:
             f"SOURCE YOU REQUESTED\n\n{gathered or '(nothing was looked up)'}\n\n"
             f"TASK\n{task}"
         )
+        # Hard fit check: llama.cpp/LM Studio 400 when prompt + max_tokens
+        # exceeds the configured window, and Ollama does something worse --
+        # it silently truncates the PROMPT from the middle. The TASK sits at
+        # the very end of this message, so on a small window the model is
+        # shown a map and some source but never the actual request; it then
+        # "runs to completion" with a confident answer to some other task.
+        # That is exactly the local-model "provided answer is nonsense"
+        # symptom. Refuse loudly instead of letting the server mangle it.
+        reply_room = min(self.cfg.max_tokens_answer,
+                         self.cfg.request_max_tokens_cap or
+                         self.cfg.max_tokens_answer)
+        room = self.cfg.context_tokens - reply_room - self.cfg.reserve_tokens // 2
+        if estimate_tokens(user) > room > 0:
+            over = estimate_tokens(user) - room
+            raise LLMError(
+                f"The answer prompt would be ~{estimate_tokens(user)} tokens "
+                f"but this model's window only allows ~{room} here "
+                f"(context {self.cfg.context_tokens:,} minus a "
+                f"{reply_room:,}-token reply budget).\n"
+                "Sending it anyway means the server truncates the TASK itself "
+                "-- the model answers without ever seeing your request.\n"
+                "Fix by lowering ONE of these in your active profile:\n"
+                "  * max_gathered_chars   (less source quoted into the answer)"
+                "\n  * flat_map_token_budget (smaller project map)"
+                f"\n  * context_tokens       (currently {self.cfg.context_tokens:,};"
+                " LM Studio's stock\n    default is 8192 -- raising its runtime "
+                "'Context length' is the\n    better fix if your GPU can take it)"
+                f"\n(over-budget by ~{over} tokens)")
         print(f"[answer context ~{estimate_tokens(user)} tokens]", file=sys.stderr)
         return self.client.chat(
             [{"role": "system", "content": system or ANSWER_SYSTEM},
