@@ -612,10 +612,10 @@ def load(root: Path | None = None, explicit: Path | None = None,
             cfg.sources["json_mode"] = (
                 f"auto-selected for thinking model ({cfg.model}); set "
                 "json_mode explicitly to override")
-    if qwen_thinking and cfg.sources.get("max_output_tokens") == "default":
+    if qwen_thinking and remote and cfg.sources.get("max_output_tokens") == "default":
         cfg.max_output_tokens = 8000
         cfg.sources["max_output_tokens"] = (
-            f"auto-detected output ceiling for thinking model "
+            f"auto-detected output ceiling for hosted thinking model "
             f"({cfg.model}); set max_output_tokens explicitly to override")
 
     # Loud-but-not-fatal: budgets that cannot fit the declared context window
@@ -949,7 +949,7 @@ PRESETS: dict[str, dict] = {
         "max_steps": 50,
         "max_tokens_answer": 3000,
         "max_tokens_plan": 4000,
-        "max_tokens_build": 8000,
+        "max_tokens_build": 16000,
         "flat_map_token_budget": 4000,
         "max_gathered_chars": 24000,
         "max_read_lines": 200,
@@ -1350,7 +1350,7 @@ model    = "google/gemma-3-27b"
 # repair_rounds      = 2
 # max_tokens_answer  = 3000
 # max_tokens_plan    = 4000
-# max_tokens_build   = 8000
+# max_tokens_build   = 16000
 # flat_map_token_budget = 4000
 # max_gathered_chars = 24000
 # max_read_lines     = 200

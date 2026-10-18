@@ -453,7 +453,8 @@ def _existing_map(idx, plan: Plan, cfg, max_files: int = 12,
 
 
 def build_pass(client, cfg, idx, plan: Plan, target: PlannedFile,
-               done: list[str], verbose: bool = True) -> tuple[list, str]:
+               done: list[str], verbose: bool = True,
+               backup_dir=None) -> tuple[list, str]:
     """Generate one file's contents and apply it through the normal edit path.
 
     The prompt contains the spec, the plan, what already exists, and the exact
@@ -512,12 +513,12 @@ def build_pass(client, cfg, idx, plan: Plan, target: PlannedFile,
                        "spent the budget on its <think> block; try "
                        "thinking_suffix=/no_think or a non-reasoning model)")], reply
     results = apply_edits(idx.root, parse_edits(reply), backup=cfg.backup,
-                          dry_run=False, cfg=cfg)
+                          dry_run=False, cfg=cfg, backup_dir=backup_dir)
     return results, reply
 
 
 def build_project(client, cfg, idx, plan: Plan, verbose: bool = True,
-                  on_file=None) -> dict:
+                  on_file=None, backup_dir=None) -> dict:
     """Run a build pass for each planned source file, in plan order, stopping
     early if the server goes away. Returns a summary dict:
 
@@ -540,7 +541,8 @@ def build_project(client, cfg, idx, plan: Plan, verbose: bool = True,
         if verbose:
             print(f"\n--- building {t.path} ---", file=sys.stderr)
         try:
-            results, _reply = build_pass(client, cfg, idx, plan, t, done, verbose)
+            results, _reply = build_pass(client, cfg, idx, plan, t, done,
+                                         verbose, backup_dir=backup_dir)
         except LLMError as e:
             print(f"  stopped: {e}", file=sys.stderr)
             failed.append((t.path, "server error"))
@@ -657,7 +659,8 @@ def run_new(root: Path, cfg, client, spec: Spec, *, apply: bool = False,
     print(f"\n--- building {len(plan.sources)} file(s) "
           f"({'WRITING' if apply else 'for review'}) ---",
           file=sys.stderr)
-    summary = build_project(client, cfg, idx, plan, verbose=verbose)
+    summary = build_project(client, cfg, idx, plan, verbose=verbose,
+                            backup_dir=backup_dir)
     print("\n" + summarise_result(summary))
 
     if review and summary["done"]:
