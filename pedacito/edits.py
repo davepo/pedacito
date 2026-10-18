@@ -341,6 +341,34 @@ def _locate(haystack: str, needle: str) -> tuple[int, int] | None:
 # --------------------------------------------------------------------------
 # Public API
 # --------------------------------------------------------------------------
+_BLOCK_COMMENT_RE = re.compile(r"^/\*.*?\*/", re.DOTALL)
+
+
+def _is_placeholder_only(text: str) -> bool:
+    """True when `text` is nothing but a short comment -- the shape of a
+    rename placeholder ("/* Contenido movido desde sentences.js */"). Used
+    to refuse half-renames: a creation whose whole body is a placeholder and
+    which matched no rename source would otherwise write a few-byte stub for
+    a task that meant to move real content. A genuine new file either
+    carries non-comment content or is clearly longer than a one-line note."""
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+    if not lines or len(lines) > 3:
+        return False
+    joined = "\n".join(lines)
+    if len(joined.encode("utf-8")) > 200:
+        return False
+    # C-style block comments (possibly several, or line-spans of one).
+    rest = joined
+    m = _BLOCK_COMMENT_RE.match(rest)
+    while m:
+        rest = rest[m.end():].strip()
+        m = _BLOCK_COMMENT_RE.match(rest)
+    if rest == "":
+        return True
+    # Hash / slash line comments only.
+    return all(ln.startswith("#") or ln.startswith("//") for ln in lines)
+
+
 def apply_edits(root: Path, edits: list[Edit], backup: bool = True,
                 dry_run: bool = False, backup_dir: Path | None = None,
                 cfg=None) -> list[Result]:
@@ -438,7 +466,26 @@ def apply_edits(root: Path, edits: list[Edit], backup: bool = True,
                     can_clear = True         # explicit wipe of an existing file
                     continue
                 span = locate(original, e.search, cfg)
-                if span is not None and _reaches_eof(e.search, span):
+                if span is None:
+                    # Tolerate a truncated whole-file SEARCH: models that
+                    # quote the old file's content from memory drop lines in
+                    # the middle. If the quoted text matches contiguously at
+                    # the START and again at the very END of the file (the
+                    # tail reaching EOF), it still identifies this exact file
+                    # -- accept it as a clear block so the rename pairs up and
+                    # Pedacito moves the real bytes. A mid-file-only match
+                    # stays rejected; that is an ordinary edit anchor, not a
+                    # wipe. The SEARCH text itself is never used as content.
+                    first_nl = e.search.find("\n")
+                    head = (e.search if first_nl < 0 else e.search[:first_nl])
+                    if original.startswith(head):
+                        tail = e.search[first_nl + 1:] if first_nl >= 0 else ""
+                        if tail.strip():
+                            tspan = locate(original, tail, cfg)
+                            if tspan is not None and _reaches_eof(tail, tspan):
+                                can_clear = True
+                                continue
+                elif _reaches_eof(e.search, span):
                     can_clear = True         # search reaches end-of-file
         return can_create, can_clear
 
@@ -458,8 +505,16 @@ def apply_edits(root: Path, edits: list[Edit], backup: bool = True,
             the strongest signal (a rename almost always stays in place),
             then same basename stem (sentences.js -> palabras.js scores 0 but
             prep/index.html -> conversaciones/index.html must not win just by
-            alphabetical order of the target path)."""
+            alphabetical order of the target path). A NEW path whose name
+            CONTAINS the old file's stem (subj-imp/sentences.js ->
+            subj-imp/subjuntivo-imperativo-sentences.js) also scores high:
+            models lengthen names far more often than they shorten them, and
+            without this the pairing falls back to bare alphabetical order --
+            which silently mis-pairs multi-file renames."""
             if Path(old).parent == Path(new).parent:
+                base = Path(old).name.lower()
+                if base in Path(new).name.lower():
+                    return 3
                 return 2
             if _stem(old) == _stem(new):
                 return 1
@@ -731,6 +786,29 @@ def apply_edits(root: Path, edits: list[Edit], backup: bool = True,
                 if gone:
                     note += (" [already absent, nothing to move: " +
                              ", ".join(gone) + "]")
+            if _is_placeholder_only(text) and not srcs_now:
+                # The rename protocol says: create the NEW path with a tiny
+                # placeholder, then clear the OLD path with a full-content
+                # SEARCH / empty REPLACE; Pedacito moves the real bytes. When
+                # the clearing block is missing -- because the gather loop
+                # died at the output cap before the model could emit it -- the
+                # pairing above finds no source and this branch would write a
+                # few-token stub where a 26k-char file belongs. A truncated
+                # continuation reply can look EXACTLY like a placeholder
+                # (one short line), so refuse rather than half-rename: the
+                # old file stays untouched and the next turn re-asks.
+                results.append(Result(
+                    False, rel,
+                    "refusing to create this file: its content is only a "
+                    "placeholder comment and no rename source matched (no "
+                    "clearing block for an old path survived). If you are "
+                    "renaming a file, emit ONLY the empty-SEARCH creation "
+                    "block for the new path plus a block for the old path "
+                    "whose SEARCH is its entire content and whose REPLACE is "
+                    "empty -- Pedacito moves the real bytes; never copy them. "
+                    "If you mean to write this file's content yourself, put "
+                    "that content in REPLACE."))
+                continue
             results.append(_finish(rel, path, None, text, None, note,
                                    renames_from=srcs_now))
             continue
