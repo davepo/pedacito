@@ -85,6 +85,12 @@ class FileDiff:
     # model, silently leaving the source file in place next to its renamed
     # copy.
     renames_from: tuple[str, ...] = ()
+    # True for the display-only row that shows a rename's SOURCE being
+    # removed ("removed (renamed to X)"). Its after_text is empty and it
+    # must never be written as a truncated file on sign-off: the move is
+    # completed by the rename-removal loop, not by writing "" over the
+    # source.
+    removed_source: bool = False
 
 
 # --------------------------------------------------------------------------
@@ -215,7 +221,8 @@ def diffs_from_results(results, root=None) -> list[FileDiff]:
                 orows, oa, om = build_rows(otext, "")
                 out.append(FileDiff(old, orows, oa, om,
                                     hashlib.sha256(otext.encode("utf-8")).hexdigest(),
-                                    "", "removed (renamed to " + r.file + ")"))
+                                    "", "removed (renamed to " + r.file + ")",
+                                    removed_source=True))
     return out
 
 
@@ -793,6 +800,13 @@ def write_files(root: Path, diffs: list[FileDiff], backup_dir: Path | None):
     existed_at_check = {fd.rel: (root / fd.rel).exists() for fd in diffs}
     written = []
     for fd in diffs:
+        # A rename's source is shown as its own "removed (renamed to ...)"
+        # row for display, but it must not be written as an empty file here:
+        # the rename-removal loop below actually deletes it. Writing "" over
+        # it first would clobber the real bytes and make the removal loop's
+        # sha check refuse the move ("changed since preview").
+        if fd.removed_source:
+            continue
         p = root / fd.rel
         try:
             if p.exists():
@@ -864,11 +878,11 @@ def write_files(root: Path, diffs: list[FileDiff], backup_dir: Path | None):
         srcs = tuple(getattr(fd, "renames_from", ()) or ())
         if srcs:
             for old in srcs:
-                # The matching deletion row (when the page rendered one) pins
+                # The matching removal row (when the page rendered one) pins
                 # the source's pre-rename bytes; fall back to no sha check
                 # only when it is absent.
                 pin = next((d.sha for d in diffs
-                            if d.rel == old and "renamed to" in (d.message or "")), "")
+                            if d.rel == old and d.removed_source), "")
                 _remove_rename_source(old.strip(), pin)
             continue
         # Legacy fallback: older staged pages carry no renames_from field, so

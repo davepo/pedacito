@@ -494,8 +494,15 @@ def apply_edits(root: Path, edits: list[Edit], backup: bool = True,
                             if tspan is not None and _reaches_eof(tail, tspan):
                                 can_clear = True
                                 continue
-                elif _reaches_eof(e.search, span):
-                    can_clear = True         # search reaches end-of-file
+                elif _reaches_eof(e.search, span) or (span.start == 0
+                                                       and not span.fuzzy):
+                    # A clear block is either the whole file (the search runs
+                    # to end-of-file) or, per the rename protocol in the
+                    # answer prompt, just the file's opening lines -- the model
+                    # is told to quote only the first few lines, never the
+                    # whole file. Either way it identifies this path as the
+                    # source of a move, so flag it as a remover candidate.
+                    can_clear = True
         return can_create, can_clear
 
     classified = {rel: _classify(rel, g) for rel, g in groups.items()}
@@ -644,12 +651,6 @@ def apply_edits(root: Path, edits: list[Edit], backup: bool = True,
                 note: str, fuzzy: bool = False,
                 renames_from: tuple[str, ...] = ()) -> Result:
         """Validate, diff, back up, and write one finished file's content."""
-        err = _validate(path, text)
-        if err:
-            verb = "creation aborted" if original is None else "not written"
-            return Result(False, rel, f"edit produced {err}; {verb}",
-                          fuzzy=fuzzy)
-
         # Rename sources move their REAL bytes into the new path: the model's
         # creation REPLACE was only a placeholder (the system prompt says so --
         # retyping whole files wastes tokens and drops functions), so the
@@ -691,6 +692,17 @@ def apply_edits(root: Path, edits: list[Edit], backup: bool = True,
                     else:
                         text = body + "\n"
                     moved_original = ""       # nothing existed at the target
+
+        # Validate the FINAL text -- after a rename has folded the source's
+        # real bytes in. Validating the placeholder alone used to reject
+        # renames whose placeholder was a bare non-code comment (e.g. a plain
+        # "moved from old.py" line), and skipped checking the moved content
+        # entirely.
+        err = _validate(path, text)
+        if err:
+            verb = "creation aborted" if original is None else "not written"
+            return Result(False, rel, f"edit produced {err}; {verb}",
+                          fuzzy=fuzzy)
 
         diff = "".join(difflib.unified_diff(
             moved_original.splitlines(keepends=True), text.splitlines(keepends=True),

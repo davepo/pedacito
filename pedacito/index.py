@@ -576,7 +576,7 @@ def _ask(client, cfg, system: str, prompt: str, label: str,
 def _chunk_file(rel: str, path: Path, cfg) -> list[Chunk]:
     """Chunk one selected file with whichever chunker matches its extension:
     AST-based for Python (exact), tree-sitter for JS/TS/TSX when the
-    optional dependency is installed (also exact), or structural
+    tree-sitter dependency is importable (also exact), or structural
     reference-chunking otherwise.
 
     A JS/TS file with tree-sitter unavailable falls back to

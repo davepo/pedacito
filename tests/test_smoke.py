@@ -133,6 +133,64 @@ def test_rename_pair_applies(tmp_path):
     assert 'print("hi")' in (tmp_path / "new_name.py").read_text()
 
 
+def test_rename_with_opening_lines_search(tmp_path):
+    """The answer prompt tells the model to quote only the FIRST few lines of
+    the old file in the clearing block, never the whole file. That opening-
+    lines search must still pair with the create block and move the source's
+    real bytes -- requiring a search that reaches end-of-file here made the
+    documented protocol fail and left the old file half-cleared."""
+    _write(tmp_path / "old_name.py", "line1\nline2\nline3\nline4\nline5\n")
+    reply = (
+        "--- FILE: new_name.py\n"
+        "<<<<<<< SEARCH\n"
+        "=======\n"
+        "moved from old_name.py\n"
+        ">>>>>>> REPLACE\n\n"
+        "--- FILE: old_name.py\n"
+        "<<<<<<< SEARCH\n"
+        "line1\nline2\nline3\n"
+        "=======\n"
+        ">>>>>>> REPLACE\n"
+    )
+    results = edits.apply_edits(tmp_path, edits.parse_edits(reply),
+                                backup=False, dry_run=False)
+    assert all(r.ok for r in results), [r.message for r in results]
+    assert (tmp_path / "new_name.py").is_file()
+    assert not (tmp_path / "old_name.py").exists()
+    assert "line5" in (tmp_path / "new_name.py").read_text()
+
+
+def test_review_write_deletes_rename_source(tmp_path):
+    """The review sign-off path must delete a rename's source file, not write
+    an empty file over it. Writing '' first clobbered the source's bytes so
+    the removal loop's sha check refused, leaving an empty old_name.py next
+    to the renamed copy."""
+    from pedacito import review
+    _write(tmp_path / "old_name.py", "print('hi')\n")
+    reply = (
+        "--- FILE: new_name.py\n"
+        "<<<<<<< SEARCH\n"
+        "=======\n"
+        "moved from old_name.py\n"
+        ">>>>>>> REPLACE\n\n"
+        "--- FILE: old_name.py\n"
+        "<<<<<<< SEARCH\n"
+        "print('hi')\n"
+        "=======\n"
+        ">>>>>>> REPLACE\n"
+    )
+    results = edits.apply_edits(tmp_path, edits.parse_edits(reply),
+                                backup=False, dry_run=True)
+    diffs = review.diffs_from_results(results, root=tmp_path)
+    backup_dir = tmp_path / "bak"
+    backup_dir.mkdir()
+    ok, detail = review.write_files(tmp_path, diffs, backup_dir)
+    assert ok, detail
+    assert (tmp_path / "new_name.py").is_file()
+    assert not (tmp_path / "old_name.py").exists(), \
+        "rename source left behind as an empty file: " + detail
+
+
 def test_search_block_matches_at_eof_with_newline_tail(tmp_path):
     _write(tmp_path / "a.py", "x = 1\n")
     reply = ('--- FILE: a.py\n<<<<<<< SEARCH\nx = 1\n=======\nx = 2\n'
@@ -566,7 +624,7 @@ def test_step_truncation_salvage_no_escalation():
     the old 7000->14000->28000 escalation loop that killed DeepSeek runs.
     A schema WITH a large field (answer-style) must still escalate-retry."""
     import json as _json
-    from pedacito.llm import LMStudio, LLMError
+    from pedacito.llm import LMStudio
     from pedacito.tools import STEP_SCHEMA
     from pedacito.config import Config
 

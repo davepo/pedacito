@@ -7,7 +7,6 @@ without any real model or GPU. They open sockets on 127.0.0.1, hence the
 
 Run directly:  python -m pytest tests/test_e2e_fake.py -q -p no:libtmux
 """
-import json
 import os
 import socket
 import subprocess

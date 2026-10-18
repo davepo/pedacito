@@ -44,7 +44,6 @@ simultaneous POSTs can't both start a worker.
 
 from __future__ import annotations
 
-import dataclasses
 import json
 import sys
 import threading

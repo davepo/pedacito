@@ -28,7 +28,7 @@ from pathlib import Path
 from . import index as index_mod
 from .agent import Agent
 from .edits import parse_edits
-from .config import (Config, ConfigError, REFERENCE_TEMPLATE, TEMPLATE,
+from .config import (Config, ConfigError, REFERENCE_TEMPLATE,
                      USER_CONFIG, auto_fit, find_project_config,
                      interactive_setup, load as load_config, write_template)
 from .llm import LMStudio, LLMError, estimate_tokens

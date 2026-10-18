@@ -36,7 +36,6 @@ that already own them.
 
 from __future__ import annotations
 
-import json
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -45,6 +44,7 @@ from . import fileio
 from .chunker import Chunk, chunk_source
 from .config import ConfigError
 from .edits import apply_edits, parse_edits
+from .index import Index, file_hash
 from .llm import LLMError
 
 MAX_SPEC_CHARS = 60_000          # a spec longer than this is truncated, loudly
@@ -397,7 +397,7 @@ def apply_skeleton(root: Path, plan: Plan, dry_run: bool = False,
 # --------------------------------------------------------------------------
 # Indexing the skeleton
 # --------------------------------------------------------------------------
-def skeleton_index(root: Path, plan: Plan, cfg) -> "Index":
+def skeleton_index(root: Path, plan: Plan, cfg) -> Index:
     """Build an Index straight from the skeleton, without walking the tree.
 
     `index.build()` refuses to run on a project with nothing selectable in it,
@@ -405,8 +405,6 @@ def skeleton_index(root: Path, plan: Plan, cfg) -> "Index":
     exactly, so chunk each planned file directly. Static only -- no summaries,
     which cost an LLM call each and are pointless before the files have bodies.
     """
-    from .index import Index, file_hash
-
     chunks: list[Chunk] = []
     hashes: dict[str, str] = {}
     for f in plan.files:

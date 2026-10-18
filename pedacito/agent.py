@@ -32,7 +32,7 @@ from __future__ import annotations
 import re
 import sys
 
-from .edits import apply_edits, locate, parse_edits
+from .edits import apply_edits, parse_edits
 from .llm import LLMError, estimate_tokens
 from .tools import STEP_SCHEMA, TOOL_HELP, dispatch
 
@@ -411,7 +411,6 @@ class Agent:
         gathered: list[str] = []
         self.steps_log: list[str] = []
         did_read = False
-        nudged = False
         read_nudged = False
         # Successful reads only, as (rel_lower, start, end). Coverage checks
         # must count ONLY real source the model saw -- a grep hit or an ERROR
@@ -576,8 +575,8 @@ class Agent:
                     continue
                 if not did_read and step < step_cap:
                     # Answering from grep snippets produces edits that cannot
-                    # anchor, because grep output is trimmed. Send it back once.
-                    nudged = True
+                    # anchor, because grep output is trimmed. Send it back to
+                    # read the code it intends to change.
                     messages.append({"role": "assistant", "content": _compact(stepjson)})
                     messages.append({"role": "user", "content":
                         "You have not read any source yet, only located it. Edits "

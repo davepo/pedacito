@@ -35,15 +35,15 @@ shapes the tree (verified against parsed samples, not assumed from docs):
     with their property/member names recorded the same way a class's
     method names are.
 
-Requires the optional `tree-sitter` + `tree-sitter-language-pack` packages.
-If they aren't installed, `TS_AVAILABLE` is False and callers should fall
-back to reference-style chunking (see references.py) rather than fail.
+Requires the `tree-sitter` + `tree-sitter-language-pack` packages (both are
+base install dependencies, so they are normally present). If they ever are
+not importable, `TS_AVAILABLE` is False and callers should fall back to
+reference-style chunking (see references.py) rather than fail.
 """
 
 from __future__ import annotations
 
 import hashlib
-from dataclasses import dataclass
 
 from .chunker import Chunk
 

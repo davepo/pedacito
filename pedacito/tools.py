@@ -271,7 +271,7 @@ def tool_callers(index, symbol: str) -> str:
     return "\n".join(out)
 
 
-def tool_outline(index, file: str) -> str:
+def tool_outline(index, cfg, file: str) -> str:
     """Return every unit (function/class/method) in one file with its
     signature, line range, and summary.
 
@@ -317,8 +317,6 @@ def tool_write(index, cfg, file: str, content: str) -> str:
     style = None
     if existed:
         original, style = fileio.read(path, errors="strict")
-        if not original.strip() and not content.strip():
-            return f"ERROR: {rel} is already empty."
 
     text = content.replace("\r\n", "\n").replace("\r", "\n")
     if not text.endswith("\n"):
@@ -394,7 +392,7 @@ def dispatch(index, cfg, step: dict) -> str:
     if action == "callers":
         return tool_callers(index, step.get("symbol", ""))
     if action == "outline":
-        return tool_outline(index, step.get("file", ""))
+        return tool_outline(index, cfg, step.get("file", ""))
     if action == WRITE_ACTION:
         if not getattr(cfg, "allow_write", False):
             return ("ERROR: `write` is disabled (config allow_write = false). "

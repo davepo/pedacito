@@ -55,10 +55,9 @@ DEFAULT_IGNORE = [
 # Parsed by the AST and chunked semantically (see chunker.py).
 PY_EXTS = {".py"}
 
-# Parsed via tree-sitter and chunked semantically when the optional
-# tree-sitter dependency is installed (see chunker_ts.py); falls back to
-# structural reference-chunking (see references.py) if it isn't, rather
-# than being excluded from the index outright.
+# Parsed via tree-sitter and chunked semantically (see chunker_ts.py); falls
+# back to structural reference-chunking (see references.py) if tree-sitter is
+# unavailable, rather than being excluded from the index outright.
 JS_TS_EXTS = {".js", ".jsx", ".mjs", ".cjs", ".ts", ".tsx"}
 RUBY_EXTS = {".rb"}
 

@@ -25,7 +25,6 @@ from __future__ import annotations
 import ast
 import hashlib
 from dataclasses import dataclass, field, asdict
-from pathlib import Path
 
 # AST node types treated as "scopes" worth chunking on their own.
 DEF_NODES = (ast.FunctionDef, ast.AsyncFunctionDef)

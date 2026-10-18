@@ -29,7 +29,6 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
-from . import fileio
 from .index import BACKUP_DIR, SESSION_DIR, state_dir
 
 IGNORE_FILE = ".pedacitoignore"
