@@ -453,8 +453,15 @@ class LMStudio:
         if self.cfg.disable_thinking and self.cfg.json_mode == "schema":
             payload["chat_template_kwargs"] = {"enable_thinking": False}
         if schema is not None:
+            # `json_schema_extra` keys (e.g. {strict = true} for DashScope-
+            # style APIs) merge into whichever response_format we send; the
+            # structural keys cannot be overridden from config.
             if self.cfg.json_mode == "object":
-                payload["response_format"] = {"type": "json_object"}
+                fmt = {"type": "json_object"}
+                for k, v in (self.cfg.json_schema_extra or {}).items():
+                    if k != "type":
+                        fmt[k] = v
+                payload["response_format"] = fmt
             else:
                 payload["response_format"] = {
                     "type": "json_schema",

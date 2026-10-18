@@ -84,6 +84,20 @@ class Config:
     #     reject json_schema outright. Slightly less reliable in principle,
     #     in practice fine on a frontier hosted model.
     json_mode: str = "schema"
+    # Extra keys merged into every `response_format` object, verbatim. Exists
+    # for OpenAI-compatible endpoints that take their JSON-granularity switch
+    # in a sibling field rather than inside response_format -- the DashScope-
+    # style Qwen API is the motivating case, where an ungrammared
+    # {"type":"json_object"} makes the model free to emit prose around the
+    # step object (and then a cut-off reply has no salvageable prefix):
+    #
+    #   [server]
+    #   json_mode = "object"
+    #   json_schema_extra = { strict = true }
+    #
+    # Keys already present (type, json_schema) cannot be overridden from
+    # here; they are filtered out when the request is built.
+    json_schema_extra: dict = field(default_factory=dict)
 
     # --- Generation -----------------------------------------------------------
     # Low temp for tool selection; a 27B at 0.2 is fine for prose and code too.
@@ -177,6 +191,8 @@ class Config:
     # and asked to re-anchor it. This caps those repair round-trips per apply.
     # Hosted models re-anchor reliably and merit more rounds; small local
     # models mostly repeat the same bad copy, so fewer rounds wastes less time.
+    # A round spent *fetching* a re-read the model asked for does not count
+    # against this cap (the loop grants one extra round for it).
     repair_rounds: int = 2
 
     # --- Context window -------------------------------------------------------
@@ -350,6 +366,14 @@ def _coerce(name: str, value, path: Path | None = None):
                 f"{where}{name} must be a table, e.g. "
                 f"[profiles.NAME.sampler] with keys underneath")
         return dict(value)
+    if name == "json_schema_extra":
+        # Same passthrough idea as `sampler`, but merged into the request's
+        # `response_format` object instead of its top level.
+        if not isinstance(value, dict):
+            raise ConfigError(
+                f"{where}{name} must be a table, e.g. "
+                f'json_schema_extra = {{ strict = true }}')
+        return dict(value)
     if target is float and isinstance(value, int) and not isinstance(value, bool):
         return float(value)
     if target in (str, int, float, bool) and not isinstance(value, target):
@@ -505,7 +529,7 @@ def _parse_env(name: str, raw: str):
         return raw
     if name == "extra_extensions":
         return tuple(x.strip() for x in raw.split(",") if x.strip())
-    if name == "sampler":
+    if name == "sampler" or name == "json_schema_extra":
         # Not a natural environment-variable target; a JSON object is the
         # only sane spelling. Importing json here keeps the module's import
         # surface unchanged for the (much more common) case where nobody
@@ -515,10 +539,10 @@ def _parse_env(name: str, raw: str):
             obj = _json.loads(raw)
         except ValueError as e:
             raise ConfigError(
-                f"PEDACITO_SAMPLER={raw!r} is not valid JSON: {e}") from e
+                f"PEDACITO_{name.upper()}={raw!r} is not valid JSON: {e}") from e
         if not isinstance(obj, dict):
             raise ConfigError(
-                f"PEDACITO_SAMPLER={raw!r} must be a JSON object, "
+                f"PEDACITO_{name.upper()}={raw!r} must be a JSON object, "
                 f'e.g. \'{{"top_k": 40}}\'')
         return obj
     if target is bool:

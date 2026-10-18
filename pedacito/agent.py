@@ -50,6 +50,39 @@ import re as _re_mod
 
 _READ_HEAD_RX = _re_mod.compile(r"^(.+?) lines (\d+)-(\d+):")
 
+# Matches a file path with an extension inside prose (task text, or a model
+# reply). Used both for coverage bookkeeping and to detect when a failed edit
+# is really the model *asking for a re-read* rather than proposing a corrected
+# block ("I can't produce a corrected edit for `subj-imp/index.html` because I
+# only have grep output...").
+_FILE_TOKEN_RX = _re_mod.compile(
+    r"[A-Za-z0-9_][A-Za-z0-9_.\-\u00c0-\uffff/\\]*\.[A-Za-z][A-Za-z0-9]{0,7}")
+
+
+def _reply_requests_reread(reply: str) -> list[str]:
+    """File paths the model names in its reply while asking for more context.
+
+    The repair loop's first pass feeds back only the failure messages and the
+    already-gathered source. A small model that genuinely lacks the exact text
+    answers that with prose -- "I need a `read` of index.html around line 415"
+    -- instead of a corrected block, and the old loop then simply repeated the
+    same unanchorable edit once more and gave up. If the reply contains no
+    parseable edit blocks but does name files and reads like a request for a
+    re-read, return those file paths so the caller can actually perform the
+    reads and try one more time."""
+    if parse_edits(reply):
+        return []          # it did emit edits; nothing to fetch for it
+    low = reply.lower()
+    if not any(k in low for k in ("read", "grep", "context", "line",
+                                   "anchor", "match")):
+        return []
+    out: list[str] = []
+    for tok in _FILE_TOKEN_RX.findall(reply):
+        t = tok.strip("`*'\"()[]{}.,;:").lstrip("./").lower()
+        if len(t) > 2 and t not in out:
+            out.append(t)
+    return out[:6]
+
 
 def _first_seen_spans(spans_by_file: dict[str, list[tuple[int, int]]]
                       ) -> dict[str, list[tuple[int, int]]]:
@@ -221,6 +254,40 @@ def _fold_spans(spans: list[tuple[int, int]]) -> list[tuple[int, int]]:
         else:
             folded.append((a, b))
     return folded
+
+
+# The block markers, loose enough to recognise a half-written one. Mirrors
+# edits.BLOCK_RE's tolerance (5+ angle brackets) without importing it here.
+_SEARCH_OPEN_RX = _re_mod.compile(r"<{5,}\s*SEARCH")
+_REPLACE_CLOSE_RX = _re_mod.compile(r">{5,}\s*REPLACE")
+
+
+def _ends_mid_block(reply: str) -> bool:
+    """True when `reply` stops inside an unterminated search/replace block.
+
+    A truncated answer almost always dies mid-REPLACE: its last SEARCH opener
+    never gets a REPLACE closer. Detecting this by shape matters because some
+    servers omit `finish_reason` from streamed chunks -- without it, a silent
+    cut-off would sail through as "the model answered without proposing any
+    edits"."""
+    opens = len(_SEARCH_OPEN_RX.findall(reply or ""))
+    closes = len(_REPLACE_CLOSE_RX.findall(reply or ""))
+    return opens > closes
+
+
+def _merge_reply_blocks(first: str, second: str) -> str:
+    """Join a truncated answer with its continuation so `parse_edits` sees one
+    coherent reply.
+
+    Concatenating raw text can glue a partial block from `first` onto the
+    continuation in `second` and corrupt both. Instead keep everything up to
+    (and including) the last complete `>>>>>>> REPLACE` in `first`, then append
+    `second`. If `first` has no complete block at all, the continuation is the
+    whole answer."""
+    ends = [m.end() for m in _REPLACE_CLOSE_RX.finditer(first)]
+    if not ends:
+        return second
+    return first[:ends[-1]] + "\n\n" + second
 
 
 GATHER_BASE = f"""\
@@ -601,6 +668,17 @@ class Agent:
         return missing
 
     # ------------------------------------------------------------------ phase 2
+    def _answer_user_content(self, task: str, gathered: str) -> str:
+        """Assemble the answer prompt's user turn: map + source + task. Kept in
+        one place so the retry-on-truncation path rebuilds exactly the same
+        request."""
+        repo_map, _ = self.index.map_for_prompt(self.cfg)
+        return (
+            f"PROJECT MAP\n\n{repo_map}\n\n"
+            f"SOURCE YOU REQUESTED\n\n{gathered or '(nothing was looked up)'}\n\n"
+            f"TASK\n{task}"
+        )
+
     def answer(self, task: str, gathered: str, stream: bool = True,
                system: str | None = None, max_tokens: int | None = None) -> str:
         """Ask the model to answer the task, or produce search/replace edits,
@@ -609,20 +687,121 @@ class Agent:
         `system` and `max_tokens` override the defaults for special flows that
         need a different brief than "edit this existing code" -- e.g. resuming
         an unfinished scaffold (`Agent.resume_task`) or writing one whole file
-        of a new project (see scaffold.py)."""
-        repo_map, _ = self.index.map_for_prompt(self.cfg)
-        user = (
-            f"PROJECT MAP\n\n{repo_map}\n\n"
-            f"SOURCE YOU REQUESTED\n\n{gathered or '(nothing was looked up)'}\n\n"
-            f"TASK\n{task}"
-        )
-        print(f"[answer context ~{estimate_tokens(user)} tokens]", file=sys.stderr)
-        return self.client.chat(
-            [{"role": "system", "content": system or ANSWER_SYSTEM},
-             {"role": "user", "content": user}],
-            max_tokens=max_tokens or self.cfg.max_tokens_answer,
-            stream=stream,
-        )
+        of a new project (see scaffold.py).
+
+        The answer is free text with fenced search/replace blocks, so the one
+        failure mode that used to end a run silently was a reply cut off at
+        `max_tokens_answer`: the last block loses its `>>>>>>> REPLACE` closer,
+        parses as nothing, and the user sees "the model answered without
+        proposing any edits" while the terminal looks healthy. Detect the
+        truncation (`finish_reason == "length"`), salvage every *complete*
+        block from what did arrive, and -- when the reply stopped mid-block --
+        spend one more call asking the model to continue exactly where it
+        stopped, with a doubled token budget.
+
+        A server whose streaming chunks omit `finish_reason` (some do) is
+        handled by shape alone: if the reply ends inside an unterminated
+        search/replace block, treat it as truncated rather than letting a
+        half-written block fail against the file later.
+        """
+        budget = max_tokens or self.cfg.max_tokens_answer
+        messages = [{"role": "system", "content": system or ANSWER_SYSTEM},
+                    {"role": "user", "content": self._answer_user_content(task, gathered)}]
+        print(f"[answer context ~{estimate_tokens(messages[-1]['content'])} tokens]",
+              file=sys.stderr)
+        reply = self.client.chat(messages, max_tokens=budget, stream=stream)
+        truncated = (self.client.last_finish_reason == "length"
+                     or _ends_mid_block(reply))
+        if not truncated:
+            return reply
+
+        complete = parse_edits(reply)
+        if not complete and not _ends_mid_block(reply):
+            # Cut off, but not inside an edit block -- there is nothing a
+            # continuation could add that would parse. Don't burn a second
+            # generation on an essay; hand back what we have.
+            return reply
+
+        nxt = min(max(budget * 2, 2048), self._answer_budget_ceiling(budget))
+        if nxt <= budget:
+            print("[answer was cut off at the token limit; the ceiling is already "
+                  "at max_tokens_answer -- raise it (or context_tokens) in your "
+                  "profile]", file=sys.stderr)
+            return reply
+        print(f"[answer hit the {budget}-token limit after "
+              f"{len(complete)} complete block(s); asking for a continuation with "
+              f"max_tokens={nxt}]", file=sys.stderr)
+        cont_messages = list(messages)
+        if complete:
+            # The earlier blocks are safe to keep -- they anchor on text the
+            # model already quoted correctly -- so only ask for what remains.
+            cont_messages.append({"role": "assistant", "content": reply})
+            cont_messages.append({"role": "user", "content":
+                "Your reply was cut off by the token limit. The blocks above were "
+                "received. Output ONLY the remaining search/replace blocks, "
+                "starting exactly where you stopped -- no explanation, no recap."})
+        else:
+            cont_messages.append({"role": "assistant", "content": reply})
+            cont_messages.append({"role": "user", "content":
+                "Your reply was cut off by the token limit before any complete "
+                "block arrived. Re-output the full set of search/replace blocks "
+                "now, keeping each block small and local so the reply fits."})
+        cont = self.client.chat(cont_messages, max_tokens=nxt, stream=False)
+        merged = _merge_reply_blocks(reply, cont)
+        if self.client.last_finish_reason == "length":
+            print("[continuation was also cut off; using everything that parsed]",
+                  file=sys.stderr)
+        return merged
+
+    def _answer_budget_ceiling(self, current: int) -> int:
+        """Largest answer budget worth retrying at: never past what the
+        declared context window can hold, mirroring chat_json's escalation
+        cap so raising max_tokens_answer/reserve_tokens raises this too."""
+        usable = self.cfg.context_tokens - self.cfg.reserve_tokens
+        return max(min(16000, max(usable, 512)), current)
+
+    def reread_for(self, files: list[str], task_hint: str = "") -> str:
+        """Perform `read` lookups on Pedacito's own initiative and return the
+        source text, formatted like the gather loop's SOURCE items.
+
+        Used by the repair loop: when a model replies "I can't produce a
+        corrected edit because I only have grep output for that file", arguing
+        is pointless -- fetch the exact lines it asked for and put them in
+        front of it. Reads whole files in `max_read_lines` chunks, capped to a
+        slice of the gather budget per repair round so a confused model cannot
+        make us re-index the repo through this door."""
+        from .tools import tool_read
+        out: list[str] = []
+        budget = max(2000, self.cfg.max_gathered_chars // 3)
+        for f in files:
+            rel = self.index.resolve_file(f)
+            if rel is None:
+                continue
+            start = 1
+            total = None
+            while True:
+                obs = tool_read(self.index, self.cfg, rel, start,
+                                start + self.cfg.max_read_lines - 1)
+                if obs.startswith("ERROR"):
+                    break
+                m = _READ_HEAD_RX.match(obs)
+                if not m:
+                    break
+                s_, e_ = int(m.group(2)), int(m.group(3))
+                item = f"--- read {rel} L{s_}-{e_} (fetched during repair)\n{obs}"
+                if len(item) > budget:
+                    break
+                out.append(item)
+                budget -= len(item)
+                total = total or e_
+                if e_ < s_ or (total is not None and e_ >= total):
+                    break          # clamped read reached the file end
+                if e_ - s_ + 1 < self.cfg.max_read_lines:
+                    break          # short read: that was the whole file
+                start = e_ + 1
+                # Remember what we covered so coverage bookkeeping stays true.
+                self._read_spans.setdefault(rel.lower(), []).append((s_, e_))
+        return "\n\n".join(out)
 
     # ------------------------------------------------------------------- edits
     def apply(self, reply: str, dry_run: bool, repair_rounds: int | None = None,
@@ -638,21 +817,49 @@ class Agent:
             repair_rounds = self.cfg.repair_rounds
         results = self._apply_once(reply, dry_run, backup_dir)
 
-        for _ in range(repair_rounds):
+        # One extra round-trip is reserved for the "the model asked for a
+        # re-read" case below; `repair_rounds` still caps the ordinary
+        # re-anchor attempts.
+        rounds_left = repair_rounds
+        reread_done = False
+        while True:
             failures = [r for r in results if not r.ok]
             if not failures:
                 break
             print(f"\n[{len(failures)} block(s) failed; asking the model to re-anchor]", file=sys.stderr)
             fb = "\n".join(f"- {r.file}: {r.message}" for r in failures)
+            asked = _reply_requests_reread(reply)
+            extra_src = ""
+            if asked and not reread_done:
+                # The model isn't proposing a corrected copy -- it is telling
+                # us it never saw the exact text (grep-only context). Arguing
+                # back wastes the round; do the reads it asked for itself and
+                # put real source in front of it instead.
+                reread_done = True
+                extra_src = self.reread_for(asked)
+                if extra_src:
+                    gathered = (gathered + "\n\n" + extra_src) if gathered else extra_src
+                    print(f"  (fetched {len(asked)} file(s) it asked to re-read "
+                          f"before retrying)", file=sys.stderr)
+                    rounds_left += 1   # this round was spent fetching, not fixing
+            if rounds_left <= 0:
+                break
+            rounds_left -= 1
+            ask = ("Re-read the source above and output corrected search/replace "
+                   "blocks for ONLY the failed edits. Copy the SEARCH text exactly "
+                   "from `read` output (without the line-number prefixes)."
+                   if not extra_src else
+                   "You asked for a `read` before you could write the edit -- here "
+                   "it is, in the SOURCE section above, with exact line numbers. "
+                   "Now output corrected search/replace blocks for ONLY the failed "
+                   "edits, copying the SEARCH text character for character.")
             reply = self.client.chat(
                 [
                     {"role": "system", "content": ANSWER_SYSTEM},
                     {"role": "user", "content": f"SOURCE\n\n{gathered}\n\nTASK\n{task}"},
                     {"role": "assistant", "content": reply},
                     {"role": "user", "content":
-                        f"These edits could not be applied:\n{fb}\n\n"
-                        "Re-read the source above and output corrected search/replace blocks "
-                        "for ONLY the failed edits. Copy the SEARCH text exactly."},
+                        f"These edits could not be applied:\n{fb}\n\n" + ask},
                 ],
                 max_tokens=self.cfg.max_tokens_answer,
                 stream=True,
