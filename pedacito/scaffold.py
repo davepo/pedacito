@@ -88,26 +88,62 @@ Rules:
 - Keep it inside the limit you are given. If the spec needs more than that,
   plan the core and say so in `summary`."""
 
+INTERFACE_SYSTEM = """\
+You are designing the public API of a new Python project. Given a specification
+and a file plan, write, for EVERY planned source file, its complete public
+interface: every function and class with its full signature and a one-line
+docstring. Bodies must be `pass`, or `raise NotImplementedError` for functions
+that must return a value. Include the imports each file needs. Do NOT implement
+any body -- signatures only.
+
+This single reply is the contract every later file is implemented against, so
+the names must be consistent: a name imported in one file must be defined with
+exactly that spelling in the file that exports it. Prefer simple, obvious names
+(main, parse, render, run) and reuse the same name everywhere instead of
+inventing aliases."""
+
+INTERFACE_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "files": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "maxLength": 200},
+                    "code": {"type": "string", "maxLength": 12000},
+                },
+                "required": ["path", "code"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    "required": ["files"],
+    "additionalProperties": False,
+}
+
 BUILD_SYSTEM = """\
-You are writing one file of a new project, from its specification and a list of
-the other files that exist. Write the complete contents of YOUR file.
+You are implementing one file of a new Python project. The file already exists
+with its public interface stubbed out: every function and class has its full
+signature and a one-line docstring, and the body is `pass` or
+`raise NotImplementedError`.
 
 Output exactly one search/replace block, in this format and nothing else after it:
 
 --- FILE: relative/path.py
 <<<<<<< SEARCH
-(the header comment line that file currently starts with, copied exactly)
+(the file's current stubbed contents, copied exactly)
 =======
-(the full contents of the file)
+(the same signatures with their bodies implemented)
 >>>>>>> REPLACE
 
 Rules:
-- Replace the whole file: keep the header line as the first line of your output.
-- Real, working code. No placeholders like TODO or pass-only bodies unless the
-  spec asks for a stub.
+- Keep every function/class signature and docstring EXACTLY as written; only
+  replace the stub bodies with real code. Do not rename or reorder anything --
+  other files import these by their exact names.
+- Real, working code. No TODOs or pass-only bodies unless the spec asks for a
+  stub.
 - Import only from files listed as existing. Never invent a sibling module.
-- If YOUR file is `main.py`, give it a `main()` function and an
-  `if __name__ == "__main__": main()` guard so `python main.py` runs the tool.
 - Do not write any other file, and do not explain yourself."""
 
 RESUME_SYSTEM = """\
@@ -305,6 +341,42 @@ def build_plan(spec: Spec, client, cfg, root: Path, verbose: bool = True) -> Pla
     return plan
 
 
+def build_interface(plan: Plan, client, cfg, verbose: bool = True) -> dict[str, str]:
+    """Fix the public API of every source file in ONE call, so the later
+    per-file build only fills bodies against known signatures instead of
+    inventing a different API per file. Returns {path: stub_code}.
+
+    This is the step that makes multi-file scaffolding tractable for a small
+    model: designing one consistent set of signatures is done in a single
+    context (so names line up), and each build pass afterwards is the local
+    task of "implement this one file's known signatures"."""
+    sources = plan.sources or plan.files
+    file_tree = "\n".join(f"  {f.path}  -- {f.purpose}" for f in sources)
+    body = plan.spec.text[:getattr(cfg, "max_spec_chars", MAX_SPEC_CHARS) // 2]
+    messages = [
+        {"role": "system", "content": INTERFACE_SYSTEM},
+        {"role": "user", "content":
+            f"SPECIFICATION\n\n{body}\n\nFILE TREE\n\n{file_tree}\n\n"
+            f"Write the signature stubs for each of these {len(sources)} "
+            "files."},
+    ]
+    raw = client.chat_json(messages, INTERFACE_SCHEMA,
+                           max_tokens=getattr(cfg, "max_tokens_build", 16000),
+                           disable_thinking=True)
+    out: dict[str, str] = {}
+    for entry in raw.get("files") or []:
+        if not isinstance(entry, dict):
+            continue
+        rel = fileio.normalise_rel(str(entry.get("path", "")))
+        code = str(entry.get("code", ""))
+        if rel and code.strip():
+            out[rel] = code
+    if verbose:
+        print(f"  interface: {len(out)} file(s) with signature stubs",
+              file=sys.stderr)
+    return out
+
+
 def render_plan(plan: Plan) -> str:
     """Human-readable form of a plan, used both for --dry-run output and as the
     shared context handed to every build pass."""
@@ -366,16 +438,20 @@ def _header(rel: str, purpose: str) -> str:
 
 
 def apply_skeleton(root: Path, plan: Plan, dry_run: bool = False,
-                   verbose: bool = True) -> list[str]:
+                   verbose: bool = True,
+                   stubs: dict[str, str] | None = None) -> list[str]:
     """Create every planned file (and a starter pyproject.toml, README, and
-    .gitignore when missing) containing only its header line. Existing files
-    are never touched, so a second `new` run on the same directory is safe.
+    .gitignore when missing). Source files with an entry in `stubs` get their
+    signature-only stub; everything else gets a one-line header comment.
+    Existing files are never touched, so a second `new` run on the same
+    directory is safe.
 
     Returns the relative paths actually created (or that would be created)."""
+    stubs = stubs or {}
     created: list[str] = []
     wanted: dict[str, str] = {}
     for f in plan.files:
-        wanted[f.path] = _header(f.path, f.purpose)
+        wanted[f.path] = stubs.get(f.path, _header(f.path, f.purpose))
 
     readme = next((f.path for f in plan.files
                    if f.path.lower() in ("readme.md", "docs/readme.md")), None)
@@ -455,15 +531,16 @@ def _existing_map(idx, plan: Plan, cfg, max_files: int = 12,
 def build_pass(client, cfg, idx, plan: Plan, target: PlannedFile,
                done: list[str], verbose: bool = True,
                backup_dir=None) -> tuple[list, str]:
-    """Generate one file's contents and apply it through the normal edit path.
+    """Generate one file's implementation and apply it through the normal edit
+    path, against the signature stub already written by the interface step.
 
-    The prompt contains the spec, the plan, what already exists, and the exact
-    header line to anchor on -- no repo map, because there is nothing to
-    navigate yet. Returns (results, reply)."""
+    The prompt contains the spec, the plan, every file's known signature, and
+    the full stub of the target file to replace -- no repo map, because there
+    is nothing to navigate yet. Returns (results, reply)."""
     from .agent import ANSWER_SYSTEM
     from .edits import Result
 
-    anchor = fileio.read_text(idx.root / target.path, errors="replace").split("\n")[0]
+    stub = fileio.read_text(idx.root / target.path, errors="replace")
     spec = plan.spec.text if plan.spec else ""
     budget = getattr(cfg, "max_spec_chars", MAX_SPEC_CHARS) // 2
     ctx = [
@@ -472,17 +549,18 @@ def build_pass(client, cfg, idx, plan: Plan, target: PlannedFile,
         f"SPECIFICATION\n{spec[:budget]}",
         "",
         "FILE TREE\n" + "\n".join(
-            f"  {f.path}" + ("  <- YOU ARE WRITING THIS ONE" if f.path == target.path
+            f"  {f.path}" + ("  <- YOU ARE IMPLEMENTING THIS ONE" if f.path == target.path
                              else f"  -- {f.purpose}" if f.purpose else "")
             for f in plan.files),
         "",
-        "ALREADY IMPLEMENTED\n" + (_existing_map(idx, plan, cfg) or "(nothing yet)"),
+        "PUBLIC API (signatures every file imports by)\n" +
+        (_existing_map(idx, plan, cfg) or "(nothing yet)"),
         "",
         f"YOUR FILE: {target.path}",
-        f"It currently contains exactly one line:\n  {anchor}",
+        f"It currently contains this stubbed interface:\n```python\n{stub}\n```",
         "",
-        "Write this file now, as one search/replace block that replaces that "
-        "line with the complete file.",
+        "Implement it now, as one search/replace block that replaces the stub "
+        "with the same signatures and real, working bodies.",
     ]
     if done:
         ctx.insert(-2, "DONE SO FAR: " + ", ".join(done) + "\n")
@@ -708,8 +786,14 @@ def run_new(root: Path, cfg, client, spec: Spec, *, apply: bool = False,
     # so a bare `new` left a full project on disk and `--apply` simply re-ran
     # the same work.
     wants_skeleton = plan_only or apply or review
+    stubs = {}
+    if wants_skeleton:
+        # Fix the API contract once, in a single context, before writing the
+        # skeleton -- this is what keeps cross-file imports consistent for a
+        # small model that could not invent a matching API per file.
+        stubs = build_interface(plan, client, cfg, verbose=verbose)
     created = apply_skeleton(root, plan, dry_run=not wants_skeleton,
-                             verbose=verbose)
+                             verbose=verbose, stubs=stubs)
     if not wants_skeleton:
         if created:
             preview = ", ".join(created[:12])

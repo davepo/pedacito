@@ -862,3 +862,35 @@ def test_first_import_error_detects_cross_file_mismatch(tmp_path):
     assert err and "parse_markdown" in err, err
 
 
+def test_build_interface_fixes_contract_in_one_call(tmp_path):
+    """The interface step writes signature stubs for every source file in a
+    single call, so the per-file build implements a fixed contract instead of
+    inventing a different API per file (the cause of cross-file import bugs)."""
+    from pedacito import scaffold
+
+    class Stub:
+        def chat_json(self, messages, schema, max_tokens=0, **kw):
+            assert schema["required"] == ["files"]
+            return {"files": [
+                {"path": "parser.py",
+                 "code": "def parse_markdown(text):\n    \"\"\"parse\"\"\"\n    raise NotImplementedError\n"},
+                {"path": "renderer.py",
+                 "code": "def render_html(blocks):\n    \"\"\"render\"\"\"\n    raise NotImplementedError\n"},
+            ]}
+
+    plan = scaffold.Plan("md2html", "y", files=[
+        scaffold.PlannedFile("parser.py", "parse"),
+        scaffold.PlannedFile("renderer.py", "render"),
+    ], spec=scaffold.Spec("y"))
+    stubs = scaffold.build_interface(plan, Stub(), config_mod.Config(),
+                                     verbose=False)
+    assert stubs["parser.py"].startswith("def parse_markdown")
+    assert stubs["renderer.py"].startswith("def render_html")
+
+    # Those stubs are what the skeleton writes for source files.
+    scaffold.apply_skeleton(tmp_path, plan, dry_run=False,
+                            verbose=False, stubs=stubs)
+    assert "parse_markdown" in (tmp_path / "parser.py").read_text()
+
+
+
