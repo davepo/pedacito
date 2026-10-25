@@ -287,10 +287,12 @@ How to navigate it:
 - Never invent a line range. If a range is not in the map or an outline you have
   already run, you do not know it yet."""
 
-ANSWER_SYSTEM = """\
-You are a Python code assistant. You have a map of the project and the specific
-source you asked to see. Complete the user's task.
-
+# The search/replace edit format, shared by every answer brief. Custom system
+# prompts (scaffold stubs, resume) override the ROLE of the answer but must
+# always carry this exact format spec, or a small model invents its own --
+# markdown fences, a bare filename, `search/replace` tags -- and the parser
+# finds nothing ("no edit blocks in the reply").
+EDIT_FORMAT = """\
 If the task requires changing code, output edits as search/replace blocks in
 exactly this format, and nothing else around them:
 
@@ -316,6 +318,7 @@ Rules for edits:
   this turn and say what remains; the next turn continues where you left off.
   Long replies get cut off mid-block at the token limit and are discarded.
 - Do not output the whole file. Do not output a diff or patch format.
+- Do not wrap the blocks in triple-backtick fences; emit them as plain text.
 - If you are adding a new function, anchor the SEARCH on an existing nearby line.
 - To CREATE a brand-new file: emit exactly one block for it with an EMPTY
   SEARCH section (nothing between <<<<<<< SEARCH and =======) and the full
@@ -335,6 +338,12 @@ Rules for edits:
 
 Before the blocks, write a short plain explanation of what you changed and why.
 If the task is a question rather than a change, just answer it and output no blocks."""
+
+ANSWER_SYSTEM = """\
+You are a Python code assistant. You have a map of the project and the specific
+source you asked to see. Complete the user's task.
+
+""" + EDIT_FORMAT
 
 
 def _evict_overflow_turns(messages: list[dict], client, cfg) -> bool:
@@ -862,8 +871,10 @@ class Agent:
                 "'Context length' is the\n    better fix if your GPU can take it)"
                 f"\n(over-budget by ~{over} tokens)")
         print(f"[answer context ~{estimate_tokens(user)} tokens]", file=sys.stderr)
+        sys_prompt = ANSWER_SYSTEM if not system else \
+            system.rstrip() + "\n\n" + EDIT_FORMAT
         return self.client.chat(
-            [{"role": "system", "content": system or ANSWER_SYSTEM},
+            [{"role": "system", "content": sys_prompt},
              {"role": "user", "content": user}],
             max_tokens=max_tokens or self.cfg.max_tokens_answer,
             stream=stream,
@@ -905,8 +916,6 @@ class Agent:
                 and cont_budget > 0:
             parsed = parse_edits(reply)
             done_files = {b.file.strip().lower().lstrip("./") for b in parsed}
-            if not done_files:
-                break                      # nothing survived; let repairs raise
             # The last streamed reply was cut mid-block: its dangling tail
             # (header + partial SEARCH, maybe a ======= line but no closing
             # REPLACE) would otherwise ride along into the next continuation
@@ -920,28 +929,50 @@ class Agent:
                           "point; asking for it again]", file=sys.stderr)
                     reply = trimmed
             cont_budget -= len(reply)
-            print(f"\n[reply hit the output limit mid-way; continuing with "
-                  f"{len(done_files)} file(s) done so far]", file=sys.stderr)
+            if done_files:
+                print(f"\n[reply hit the output limit mid-way; continuing with "
+                      f"{len(done_files)} file(s) done so far]", file=sys.stderr)
+                prompt = (
+                    f"TASK\n{task}\n\n"
+                    f"EDITS ALREADY DELIVERED (do NOT repeat these):\n"
+                    + "\n".join(f"- {f}" for f in sorted(done_files)) +
+                    "\n\nYour previous reply was CUT OFF by the output "
+                    "token limit. Emit ONLY the remaining search/replace "
+                    "blocks for files not listed above -- at most two or "
+                    "three files per reply, never a whole large file in "
+                    "one REPLACE. If everything is already covered, reply "
+                    "with a single line: NOTHING MORE.")
+            else:
+                # Cut off before finishing even one block: the whole reply
+                # was lost. Re-ask for it, and teach the chunk protocol so a
+                # file too large for one message gets split across replies.
+                print(f"\n[reply was cut off before any complete block; "
+                      f"re-asking for the file]", file=sys.stderr)
+                prompt = (
+                    f"TASK\n{task}\n\n"
+                    "Your previous reply was CUT OFF by the output token "
+                    "limit before it finished even one block, so nothing was "
+                    "saved. Emit the search/replace blocks again now. If a "
+                    "file is large, split it into chunks of at most ~80 lines "
+                    "across successive blocks. Emit blocks only, no "
+                    "explanation.")
             more = self.client.chat(
-                [
-                    {"role": "system", "content": ANSWER_SYSTEM},
-                    {"role": "user", "content":
-                        f"TASK\n{task}\n\n"
-                        f"EDITS ALREADY DELIVERED (do NOT repeat these):\n"
-                        + "\n".join(f"- {f}" for f in sorted(done_files)) +
-                        "\n\nYour previous reply was CUT OFF by the output "
-                        "token limit. Emit ONLY the remaining search/replace "
-                        "blocks for files not listed above -- at most two or "
-                        "three files per reply, never a whole large file in "
-                        "one REPLACE. If everything is already covered, reply "
-                        "with a single line: NOTHING MORE."},
-                ],
+                [{"role": "system", "content": ANSWER_SYSTEM},
+                 {"role": "user", "content": prompt}],
                 max_tokens=self.cfg.max_tokens_answer,
                 stream=True,
             )
             if "NOTHING MORE" in more and not parse_edits(more):
                 break
             if not parse_edits(more):
+                if getattr(self.client, "stream_truncated", False):
+                    # The re-ask was ALSO cut off before any complete block.
+                    # Loop again (the char budget bounds us) instead of giving
+                    # up after one attempt -- a second, shorter retry sometimes
+                    # lands when the model decides to chunk.
+                    print("[re-ask was truncated too; trying once more]",
+                          file=sys.stderr)
+                    continue
                 # Continuation produced no edit blocks at all -- keep the
                 # truncated-but-parseable original rather than replacing it
                 # with prose, and stop so we cannot loop on empty replies.

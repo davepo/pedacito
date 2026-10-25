@@ -53,7 +53,8 @@ def test_tier_preset_applies_without_profiles(tmp_path):
     p = tmp_path / "config.toml"
     p.write_text(
         '[server]\nbase_url = "http://localhost:9/v1"\n'
-        'model = "m"\ntier = "small"\n', encoding="utf-8")
+        'model = "m"\ntier = "small"\n'
+        'vram_gb = 8\n', encoding="utf-8")
     cfg = config_mod.load(root=tmp_path, explicit=p, use_env=False)
     assert cfg.max_steps == config_mod.PRESETS["small"]["max_steps"]
     assert cfg.active_tier == "small"
@@ -286,6 +287,27 @@ def test_search_block_matches_at_eof_with_newline_tail(tmp_path):
     assert (tmp_path / "a.py").read_text() == "x = 2\n"
 
 
+def test_empty_search_overwrites_existing_file(tmp_path):
+    """An EMPTY-SEARCH block against an existing file is a whole-file replace
+    (the 'implement a stub' convention), not a failed anchor: there is nothing
+    to match, so the file is replaced outright. This is what --complex's
+    stub-implementing tasks rely on instead of reproducing the stub byte-for-byte."""
+    _write(tmp_path / "assets.py",
+           '"""doc"""\n\n\ndef foo():\n    raise NotImplementedError\n')
+    reply = (
+        "--- FILE: assets.py\n"
+        "<<<<<<< SEARCH\n"
+        "=======\n"
+        '"""doc"""\n\n\ndef foo():\n    return 42\n'
+        ">>>>>>> REPLACE\n"
+    )
+    results = edits.apply_edits(tmp_path, edits.parse_edits(reply),
+                                backup=False, dry_run=False)
+    assert results[0].ok, results[0].message
+    assert "return 42" in (tmp_path / "assets.py").read_text()
+    assert "raise NotImplementedError" not in (tmp_path / "assets.py").read_text()
+
+
 def test_apply_continues_when_model_defers(tmp_path):
     """A model that cleanly finishes with "the rest follows in the next turn"
     (rather than truncating) must trigger a follow-up turn -- otherwise a
@@ -328,6 +350,42 @@ def test_apply_continues_when_model_defers(tmp_path):
     assert "EDITS ALREADY DELIVERED" in client.prompts[0]
 
 
+def test_apply_reasks_when_truncated_before_any_block(tmp_path):
+    """A streamed reply cut off before completing even ONE block used to be
+    trimmed to nothing and silently fail ('no edit blocks in the reply').
+    It must instead re-ask the model for the file, so a whole-file write that
+    overflowed the output limit is recovered rather than dropped."""
+    from pedacito import index as index_mod
+    _write(tmp_path / "a.py", '"""doc"""\n\n\ndef foo():\n    raise NotImplementedError\n')
+    idx = index_mod.Index(tmp_path, [])
+
+    class StubClient:
+        stream_truncated = True          # the first reply is cut off
+        def __init__(self):
+            self.prompts = []
+        def chat(self, messages, max_tokens, schema=None, stream=False, **kw):
+            self.prompts.append(messages[-1]["content"])
+            self.stream_truncated = False      # the re-ask completes cleanly
+            return (
+                "--- FILE: a.py\n"
+                "<<<<<<< SEARCH\n"
+                "=======\n"
+                '"""doc"""\n\n\ndef foo():\n    return 42\n'
+                ">>>>>>> REPLACE\n"
+            )
+
+    client = StubClient()
+    agent = Agent(idx, client, config_mod.Config())
+    reply = ('--- FILE: a.py\n<<<<<<< SEARCH\n=======\n"""doc"""\n\n\n'
+             'def foo():\n    return 4')          # truncated: no closing REPLACE
+    results, _ = agent.apply(reply, dry_run=False,
+                             task="implement a.py", gathered="")
+    assert all(r.ok for r in results), [r.message for r in results]
+    assert "return 42" in (tmp_path / "a.py").read_text()
+    assert client.prompts, "a cut-off reply with no complete block must re-ask"
+    assert "CUT OFF" in client.prompts[0]
+
+
 # ------------------------------------------------------------------ budgets
 def test_default_budgets_fit_small_windows():
     """The historical failure: defaults sized for 32k+ models made every
@@ -355,6 +413,7 @@ def test_auto_fit_clamps_hosted_profile_to_small_window():
     budget so prompt + max_tokens fits inside context_tokens, and the
     result must pass budget_warnings with nothing left to complain about."""
     cfg = config_mod.Config()
+    cfg.vram_gb = 8
     for k, v in config_mod.PRESETS["hosted"].items():
         setattr(cfg, k, v)
     cfg.context_tokens = 8192
@@ -377,10 +436,112 @@ def test_auto_fit_clamps_hosted_profile_to_small_window():
         f"post-fit warnings: {config_mod.budget_warnings(cfg)}"
 
 
+def test_vram_setting_mandatory_for_local_servers(tmp_path):
+    """vram_gb is required for local runs (auto-fit needs it), but hosted
+    APIs run elsewhere and must not demand local specs."""
+    local = tmp_path / "local.toml"
+    local.write_text('[server]\nbase_url = "http://localhost:1234/v1"\n'
+                     'model = "m"\n', encoding="utf-8")
+    with pytest.raises(config_mod.ConfigError) as e:
+        config_mod.load(explicit=local, use_env=False)
+    assert "vram_gb" in str(e.value)
+
+    # The short alias lands on the canonical field.
+    local.write_text('[server]\nbase_url = "http://localhost:1234/v1"\n'
+                     'model = "m"\nvram = 8\n', encoding="utf-8")
+    cfg = config_mod.load(explicit=local, use_env=False)
+    assert cfg.vram_gb == cfg.vram == 8
+
+    hosted = tmp_path / "hosted.toml"
+    hosted.write_text('[server]\nbase_url = "https://api.deepseek.com/v1"\n'
+                      'model = "deepseek-chat"\njson_mode = "object"\n',
+                      encoding="utf-8")
+    cfg = config_mod.load(explicit=hosted, use_env=False)
+    assert config_mod.missing_hardware(cfg) == []
+
+
+def test_vram_estimate_caps_the_context_window():
+    """VRAM is a hard cap for the context window: planning for a larger
+    tier/default window than the GPU can hold spills the KV cache and tanks
+    tokens/sec. The fallback is used only when the size is unknown."""
+    def cfg_for(vram: int) -> config_mod.Config:
+        c = config_mod.Config()
+        c.base_url = "http://127.0.0.1:1/v1"
+        c.model = "m"
+        c.vram_gb = vram
+        c.context_tokens = 8192
+        c.sources["context_tokens"] = "tier 'small' preset"
+        c.auto_detect_context = False
+        c.model_size_bytes = 16_500_000_000
+        return c
+
+    # 19 GB VRAM - 16.5 GB model - 0.5 GB reserve leaves only a small
+    # window, so the 8k fallback is reduced to what actually fits.
+    low = cfg_for(19)
+    config_mod.auto_fit(low, verbose=False)
+    limit = config_mod.hardware_context_tokens(low.vram_gb,
+                                               low.model_size_bytes)
+    assert 0 < limit < 8192
+    assert low.context_tokens == limit
+
+    # More VRAM raises the window past the fallback.
+    high = cfg_for(48)
+    config_mod.auto_fit(high, verbose=False)
+    assert high.context_tokens > 8192
+
+    # An explicit context_tokens is never replaced by the estimate.
+    explicit = cfg_for(48)
+    explicit.context_tokens = 12000
+    explicit.sources["context_tokens"] = "config file"
+    config_mod.auto_fit(explicit, verbose=False)
+    assert explicit.context_tokens == 12000
+
+
+def test_server_configured_context_wins_over_vram_estimate(monkeypatch):
+    """A server's CONFIGURED context length is a fact -- it is exactly what
+    the server will accept -- while the VRAM estimate is a heuristic with no
+    knowledge of the model's KV architecture or quantization. Clamping to a
+    wrong estimate is what converted a working 262k-token setup into a 12k
+    window whose reply budgets no thinking model could emit JSON inside
+    (the 'kept running past the token limit ... max_tokens=1500' failure).
+    The estimate must stay a speed advisory: warn about KV spill, but keep
+    the server's window and fit budgets to THAT."""
+    import pedacito.llm as llm_mod
+
+    class FakeServer:
+        def __init__(self, cfg):
+            self.cfg = cfg
+
+        def model_info(self):
+            return {"size_bytes": int(17.2 * 1024 ** 3),
+                    "context_length": 262144,
+                    "max_context_length": 262144,
+                    "source": "lemonade"}
+
+    monkeypatch.setattr(llm_mod, "LMStudio", FakeServer)
+    cfg = config_mod.Config()
+    cfg.base_url = "http://localhost:13305/v1"
+    cfg.model = "qwen3-32b"
+    cfg.vram_gb = 24
+    for key, value in config_mod.PRESETS["large"].items():
+        setattr(cfg, key, value)
+    cfg.sources = {key: "tier 'large' preset"
+                   for key in config_mod.PRESETS["large"]}
+    notes = config_mod.auto_fit(cfg, verbose=False)
+    assert cfg.context_tokens == 262144
+    assert any("spill" in n for n in notes), notes
+    # Budgets are fitted to the SERVER's window, not the tiny VRAM estimate.
+    assert cfg.max_tokens_plan >= config_mod.PRESETS["large"]["max_tokens_plan"]
+    assert cfg.max_tokens_answer >= config_mod.PRESETS["large"]["max_tokens_answer"]
+    assert cfg.max_tokens_build >= config_mod.PRESETS["large"]["max_tokens_build"]
+    assert cfg.request_max_tokens_cap > 12000
+
+
 def test_auto_fit_respects_explicit_values_that_still_fit():
     """auto_fit only clamps numbers that physically cannot work; a user who
     explicitly sets a modest value keeps it untouched."""
     cfg = config_mod.Config()
+    cfg.vram_gb = 8
     cfg.context_tokens = 8192
     cfg.auto_detect_context = False
     cfg.max_tokens_answer = 1000
@@ -390,6 +551,63 @@ def test_auto_fit_respects_explicit_values_that_still_fit():
     assert cfg.max_tokens_answer == 1000
     assert cfg.sources.get("max_tokens_answer") == "config file"
     del before
+
+
+def test_auto_detected_output_cap_does_not_override_explicit_budgets(tmp_path):
+    """An explicit max_tokens_* value is a user instruction, not a guess.
+
+    The hosted Qwen heuristic auto-sets max_output_tokens = 8000. That
+    detected ceiling may govern tier/default budgets, but it must never
+    rewrite budgets the user spelled out themselves (the reported bug:
+    explicit 32k/32k/16k budgets were printed as 8000 by auto-fit).
+    """
+    path = tmp_path / "c.toml"
+    path.write_text(
+        '[server]\n'
+        'base_url = "https://api.example.com/v1"\n'
+        'model = "qwen3-32b"\n'
+        'max_tokens_answer = 32000\n'
+        'max_tokens_step = 32000\n'
+        'max_tokens_plan = 16000\n'
+        'max_tokens_build = 32000\n', encoding="utf-8")
+    cfg = config_mod.load(explicit=path, use_env=False)
+    assert cfg.max_output_tokens == 8000
+    assert "auto-detected" in cfg.sources["max_output_tokens"]
+    want = {
+        "max_tokens_answer": 32000,
+        "max_tokens_step": 32000,
+        "max_tokens_plan": 16000,
+        "max_tokens_build": 32000,
+    }
+    config_mod.auto_fit(cfg, verbose=False)
+    for key, value in want.items():
+        assert getattr(cfg, key) == value, \
+            f"{key} was changed by an auto-detected output cap"
+        assert cfg.sources[key].startswith("--config")
+
+    # auto_fit = false must not perform that rewrite either.
+    cfg2 = config_mod.load(explicit=path, use_env=False)
+    cfg2.auto_fit = False
+    config_mod.auto_fit(cfg2, verbose=False)
+    for key, value in want.items():
+        assert getattr(cfg2, key) == value
+
+
+def test_explicit_output_cap_is_still_a_hard_cap(tmp_path):
+    """When the user sets max_output_tokens themselves it is a deliberate
+    physical limit, so it still bounds reply budgets."""
+    path = tmp_path / "c.toml"
+    path.write_text(
+        '[server]\n'
+        'base_url = "https://api.example.com/v1"\n'
+        'model = "m"\n'
+        'max_output_tokens = 8000\n'
+        'max_tokens_answer = 32000\n', encoding="utf-8")
+    cfg = config_mod.load(explicit=path, use_env=False)
+    assert cfg.sources["max_output_tokens"].startswith("--config")
+    assert cfg.sources["max_tokens_answer"].startswith("--config")
+    config_mod.auto_fit(cfg, verbose=False)
+    assert cfg.max_tokens_answer == 8000
 
 
 def test_evict_overflow_turns_clips_oldest_result():
@@ -531,6 +749,54 @@ def test_unrecoverable_truncation_raises_token_limit_error():
         s.close()
 
 
+def test_truncated_no_json_gets_no_reasoning_reask():
+    """A schema step that dies at the token limit BEFORE emitting any JSON
+    (a thinking model spending its whole budget on the preamble -- the
+    frequent local-server 'kept running past the token limit' failure) must
+    be re-asked ONCE with an explicit no-reasoning instruction instead of
+    erroring on the first doomed reply. A model that still cannot stop
+    rambling falls through to the token-limit error."""
+
+    from pedacito.tools import STEP_SCHEMA
+    from pedacito.config import Config
+
+    cfg = Config()
+    cfg.json_mode = "object"
+
+    class Fake(LMStudio):
+        def __init__(self, replies):
+            object.__init__(self)
+            self.cfg = cfg
+            self.replies = list(replies)
+            self.n = 0
+            self.seen = []
+
+        def chat(self, messages, max_tokens, schema=None, stream=False, **kw):
+            reply, fr = self.replies[min(self.n, len(self.replies) - 1)]
+            self.n += 1
+            self.last_finish_reason = fr
+            self.seen.append(messages)
+            return reply
+
+    good = ('{"action":"done","file":"","start":0,"end":0,"pattern":"",'
+            '"symbol":"","content":"","reasoning":"ok"}')
+    c = Fake([("I need to think about this very carefully...", "length"),
+              (good, "stop")])
+    obj = c.chat_json([{"role": "user", "content": "t"}], STEP_SCHEMA,
+                      max_tokens=700)
+    assert obj["action"] == "done"
+    assert c.n == 2                      # one nudge re-ask, then success
+    nudge = [m["content"] for m in c.seen[1] if m["role"] == "user"][-1]
+    assert "cut off" in nudge and "JSON" in nudge
+
+    c2 = Fake([("prose prose prose", "length")] * 3)
+    with pytest.raises(LLMError) as exc:
+        c2.chat_json([{"role": "user", "content": "t"}], STEP_SCHEMA,
+                     max_tokens=700)
+    assert "token limit" in str(exc.value).lower()
+    assert c2.n == 2                     # nudge once, then give up with advice
+
+
 # --------------------------------------------------------------------- agent
 class FakeIndex:
     def __init__(self, root, files):
@@ -585,7 +851,8 @@ def test_hosted_configs_are_never_clamped_or_warned():
 
     def mk(text):
         p = pathlib.Path(tempfile.mkdtemp()) / "c.toml"
-        p.write_text(text)
+        p.write_text(text + '\n[hardware]\n'
+                     'vram_gb = 8\n')
         return load(explicit=p)
 
     cfg = mk('tier = "hosted"\nbase_url = "https://api.deepseek.com/v1"'
@@ -628,7 +895,8 @@ def test_write_step_budget_and_chunking():
 
     def mk(text):
         p = pathlib.Path(tempfile.mkdtemp()) / "c.toml"
-        p.write_text(text)
+        p.write_text(text + '\n[hardware]\n'
+                     'vram_gb = 8\n')
         return load(explicit=p)
 
     cfg = mk('tier = "hosted"\nbase_url = "https://api.deepseek.com/v1"'
@@ -687,7 +955,8 @@ def test_json_mode_aliases_and_deepseek_autodetect(tmp_path, monkeypatch):
 
     def load(text):
         p = tmp_path / f"c{abs(hash(text))}.toml"
-        p.write_text(text, encoding="utf-8")
+        p.write_text(text + '\n[hardware]\n'
+                     'vram_gb = 8\n', encoding="utf-8")
         for k in [k for k in os.environ if k.startswith("PEDACITO_")]:
             monkeypatch.delenv(k, raising=False)
         return config_mod.load(explicit=p, use_env=True)
@@ -894,3 +1163,108 @@ def test_build_interface_fixes_contract_in_one_call(tmp_path):
 
 
 
+
+
+def test_lemonade_model_metadata_is_absorbed():
+    """Lemonade extends OpenAI /v1/models with `size` (GB), context_length,
+    and max_context_window instead of LM Studio's size_bytes. Those must
+    feed the same hardware estimate, or Lemonade silently loses the feature."""
+    from pedacito.llm import LMStudio, _server_root
+
+    cfg = config_mod.Config(base_url="http://localhost:13305/api/v1",
+                            model="Qwen3-0.6B-GGUF")
+    got = LMStudio(cfg)._absorb_model_list([{
+        "id": "Qwen3-0.6B-GGUF",
+        "owned_by": "lemonade",
+        "recipe": "llamacpp",
+        "size": 0.38,
+        "context_length": 8192,
+        "max_context_window": 40960,
+    }], "openai-models")
+    assert got["source"] == "lemonade"
+    assert got["size_bytes"] == int(0.38 * 1024 ** 3)
+    assert got["context_length"] == 8192
+    assert got["max_context_length"] == 40960
+    # Both API prefixes are stripped before native endpoints are built.
+    assert _server_root("http://host:13305/api/v1") == "http://host:13305"
+    assert _server_root("http://host:13305/v1/") == "http://host:13305"
+
+
+def test_tier_budgets_are_monotonic():
+    """Each larger local tier must be at least as generous as the one below
+    it. The old presets had large's step (1000) and build (8000) SMALLER than
+    medium's (1500 / 16000), which made the tier name misleading."""
+    keys = ("max_tokens_summary", "max_tokens_step", "max_tokens_answer",
+            "max_tokens_plan", "max_tokens_build", "flat_map_token_budget",
+            "max_gathered_chars", "max_read_lines", "max_spec_chars",
+            "max_new_files", "max_steps", "context_tokens", "reserve_tokens",
+            "repair_rounds")
+    for lower, higher in (("small", "medium"), ("medium", "large"),
+                          ("large", "hosted")):
+        for key in keys:
+            assert config_mod.PRESETS[higher][key] >= \
+                config_mod.PRESETS[lower][key], \
+                f"{key}: {higher} ({config_mod.PRESETS[higher][key]}) < " \
+                f"{lower} ({config_mod.PRESETS[lower][key]})"
+
+
+def test_hardware_budgets_override_tier_values():
+    """A medium profile is only a fallback once the model size and VRAM are
+    known: 19 GB of weights on 48 GB VRAM with a 32k window has enough room
+    for larger reply budgets than the medium preset, and an explicit user
+    value must still win."""
+    cfg = config_mod.Config()
+    cfg.base_url = "http://127.0.0.1:1/v1"
+    cfg.model = "m"
+    cfg.vram_gb = 48
+    for key, value in config_mod.PRESETS["medium"].items():
+        setattr(cfg, key, value)
+        cfg.sources[key] = "tier 'medium' preset"
+    cfg.context_tokens = 32768
+    cfg.sources["context_tokens"] = "server"
+    cfg.auto_detect_context = False
+    cfg.model_size_bytes = 19_000_000_000
+    config_mod.auto_fit(cfg, verbose=False)
+    assert cfg.max_tokens_step > config_mod.PRESETS["medium"]["max_tokens_step"]
+    assert cfg.max_tokens_answer > config_mod.PRESETS["medium"]["max_tokens_answer"]
+    assert cfg.max_tokens_build > config_mod.PRESETS["medium"]["max_tokens_build"]
+    assert cfg.max_gathered_chars > \
+        config_mod.PRESETS["medium"]["max_gathered_chars"]
+
+    cfg2 = config_mod.Config()
+    cfg2.base_url = "http://127.0.0.1:1/v1"
+    cfg2.model = "m"
+    cfg2.vram_gb = 48
+    for key, value in config_mod.PRESETS["medium"].items():
+        setattr(cfg2, key, value)
+        cfg2.sources[key] = "tier 'medium' preset"
+    cfg2.context_tokens = 32768
+    cfg2.sources["context_tokens"] = "server"
+    cfg2.auto_detect_context = False
+    cfg2.model_size_bytes = 19_000_000_000
+    cfg2.max_tokens_answer = 2000
+    cfg2.sources["max_tokens_answer"] = "config file"
+    config_mod.auto_fit(cfg2, verbose=False)
+    assert cfg2.max_tokens_answer == 2000
+    assert cfg2.sources["max_tokens_answer"] == "config file"
+
+
+def test_explicit_max_tokens_override_vram_calculation_and_tier():
+    """The user's explicit budget wins over both the tier default and the
+    VRAM calculation (as long as it fits the server window)."""
+    cfg = config_mod.Config()
+    cfg.base_url = "http://127.0.0.1:1/v1"
+    cfg.model = "m"
+    cfg.vram_gb = 24
+    for key, value in config_mod.PRESETS["medium"].items():
+        setattr(cfg, key, value)
+        cfg.sources[key] = "tier 'medium' preset"
+    cfg.context_tokens = 32768
+    cfg.sources["context_tokens"] = "config file"
+    cfg.auto_detect_context = False
+    cfg.model_size_bytes = 19_000_000_000
+    cfg.max_tokens_answer = 20000
+    cfg.sources["max_tokens_answer"] = "config file"
+    config_mod.auto_fit(cfg, verbose=False)
+    assert cfg.max_tokens_answer == 20000
+    assert cfg.sources["max_tokens_answer"] == "config file"

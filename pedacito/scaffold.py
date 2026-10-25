@@ -40,6 +40,7 @@ import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from . import apicheck
 from . import fileio
 from .chunker import Chunk, chunk_source
 from .config import ConfigError
@@ -161,6 +162,33 @@ Rules:
 - Import only from files that exist in the map. Check a sibling's outline if
   you need to know what it exposes.
 - Prefer finishing a few files completely over touching many partially."""
+
+AUTO_IMPLEMENT_SYSTEM = """\
+You are implementing part of a project that has already been planned and
+scaffolded: the map's files exist on disk with their public interface stubbed
+out -- full function/class signatures and one-line docstrings, with bodies of
+`pass` or `raise NotImplementedError`.
+
+The task names what to implement. Read it carefully:
+
+- If the task names a whole file (just a path), output exactly one
+  search/replace block for it with an EMPTY SEARCH section (nothing between
+  <<<<<<< SEARCH and =======) and the COMPLETE implemented file in REPLACE.
+  An empty SEARCH replaces the whole file; do NOT copy the stub into SEARCH.
+
+- If the task names specific definitions ("Implement game/physics.py: foo, bar
+  (lines N-M)"), output ONE search/replace block PER named definition: SEARCH
+  is that definition's exact current stub (signature + docstring + `pass` or
+  `raise NotImplementedError`), REPLACE is the same signature with a real body.
+  Implement only the definitions the task names; leave the rest untouched.
+
+Rules:
+- `read` the file first so you can keep every signature and docstring EXACTLY
+  as written -- other files import these names. Only fill in the stub bodies.
+- No TODOs or pass-only bodies unless the task explicitly asks for stubs.
+- Import only from files that exist in the map. Check a sibling's outline if
+  you need to know what it exposes.
+- Finish the named work completely; do not wander into other functions or files."""
 
 
 # --------------------------------------------------------------------------
@@ -387,6 +415,82 @@ def render_plan(plan: Plan) -> str:
     for f in plan.files:
         lines.append(f"  {f.path}" + (f"  -- {f.purpose}" if f.purpose else ""))
     return "\n".join(lines)
+
+
+def _top_units(idx, rel: str) -> list[tuple[str, int, int]]:
+    """A file's top-level implementation units as (qualname, start, end).
+
+    A unit is one function, or one whole class (its methods included). Small
+    classes arrive as a single "class" chunk; larger ones as a "classheader"
+    chunk whose `scope_end` is the whole class, followed by "method" chunks
+    that belong to it and must be skipped. This is the granularity a split
+    task can be handed to the model as "implement these named definitions"."""
+    units = []
+    chunks = idx.in_file(rel)
+    i = 0
+    while i < len(chunks):
+        c = chunks[i]
+        if c.kind == "classheader":
+            units.append((c.qualname, c.start, c.scope_end or c.end))
+            i += 1
+            while i < len(chunks) and chunks[i].kind == "method":
+                i += 1
+        elif c.kind in ("function", "class"):
+            units.append((c.qualname, c.start, c.end))
+            i += 1
+        else:
+            i += 1
+    return units
+
+
+def plan_tasks(plan: Plan, idx=None, max_lines: int = 0) -> list[str]:
+    """One implementation task per source file, in plan (dependency) order.
+
+    This is the checklist `new --complex` hands to the autonomous loop: each
+    task names exactly one source file to implement against its stub, so a
+    fresh context window gets one bounded, verifiable unit of work.
+
+    `__init__.py` files are skipped: a package marker is already complete the
+    moment the skeleton is written, so tasking the model with "implement" one
+    makes it (correctly) answer "nothing to do" -- which the loop would then
+    read as a failed task and stop on.
+
+    When `idx` and a positive `max_lines` are given, a source file whose stub
+    is longer than `max_lines` is split into several tasks, one per group of
+    top-level definitions (each group small enough to implement in one reply).
+    This is the line guard that stops a whole-file write from overflowing the
+    model's output budget."""
+    tasks = []
+    for f in (plan.sources or plan.files):
+        if Path(f.path).name == "__init__.py":
+            continue
+        purpose = f" -- {f.purpose}" if f.purpose else ""
+        units = _top_units(idx, f.path) if idx is not None else []
+        total = max((end for _, _s, end in units), default=0)
+        if max_lines > 0 and total > max_lines and len(units) > 1:
+            for group in _group_units(units, max_lines):
+                names = ", ".join(q for q, _s, _e in group)
+                tasks.append(f"Implement {f.path}: {names} "
+                             f"(lines {group[0][1]}-{group[-1][2]})")
+        else:
+            tasks.append(f"Implement {f.path}{purpose}")
+    return tasks
+
+
+def _group_units(units: list[tuple[str, int, int]],
+                 max_lines: int) -> list[list[tuple[str, int, int]]]:
+    """Split `units` (sorted by start) into consecutive groups whose combined
+    line span stays within `max_lines`, keeping each unit whole."""
+    groups: list[list[tuple[str, int, int]]] = []
+    cur: list[tuple[str, int, int]] = []
+    for u in units:
+        if cur and (u[2] - cur[0][1] + 1) > max_lines:
+            groups.append(cur)
+            cur = []
+        cur.append(u)
+    if cur:
+        groups.append(cur)
+    return groups
 
 
 # --------------------------------------------------------------------------
@@ -742,25 +846,224 @@ def fix_import_errors(client, cfg, idx: "Index", plan: Plan, backup_dir,
     return fixed
 
 
+def _py_sources(root: Path, rels) -> dict[str, str]:
+    """Read every Python file in `rels` that exists, as rel -> text."""
+    out: dict[str, str] = {}
+    for rel in rels:
+        rel = str(rel)
+        if not rel.endswith(".py"):
+            continue
+        p = root / rel
+        if p.is_file():
+            try:
+                out[rel] = fileio.read_text(p)
+            except OSError:
+                pass
+    return out
+
+
+def fix_api_mismatches(client, cfg, idx: "Index", plan: Plan, backup_dir,
+                       verbose: bool = True, rounds: int = 2) -> int:
+    """Re-ask the model to repair cross-file call/signature mismatches.
+
+    Each file is implemented independently, so `core.py` can call `Level()`
+    while `level.py` defines `Level.__init__(self, level_data)`. An import
+    check passes anyway (`import main` does not run the call), so this
+    static pass finds the arity mismatches and asks for search/replace fixes.
+    Returns the number of successful fix blocks applied."""
+    from .agent import ANSWER_SYSTEM
+
+    fixed = 0
+    for _ in range(rounds):
+        sources = _py_sources(idx.root, [f.path for f in plan.files])
+        problems = apicheck.find_mismatches(sources)
+        if not problems:
+            break
+        listing = "\n".join(f"- {p}" for p in problems[:40])
+        files = "\n\n".join(
+            f"### {rel}\n```python\n{text}\n```"
+            for rel, text in sorted(sources.items()))
+        user = (
+            f"TASK\n{plan.project_name}: make every call match its definition.\n\n"
+            "These calls pass the wrong number of arguments and would crash at "
+            "runtime:\n" + listing + "\n\n"
+            "CURRENT FILES\n" + files + "\n\n"
+            "Emit search/replace blocks that fix each listed mismatch: either "
+            "pass the missing argument(s) at the call site, or give the "
+            "parameter a default in the definition. Keep the blocks small; do "
+            "not rewrite whole files.")
+        reply = client.chat(
+            [{"role": "system", "content": ANSWER_SYSTEM},
+             {"role": "user", "content": user}],
+            max_tokens=getattr(cfg, "max_tokens_answer", 4000),
+            stream=verbose, disable_thinking=True)
+        if not parse_edits(reply):
+            break
+        results = apply_edits(idx.root, parse_edits(reply), backup=cfg.backup,
+                              dry_run=False, cfg=cfg, backup_dir=backup_dir)
+        ok = [r for r in results if r.ok]
+        if not ok:
+            break
+        fixed += len(ok)
+        from . import index as index_mod
+        for r in ok:
+            idx = index_mod.reindex_file(idx, r.file, cfg)
+    return fixed
+
+
+# --------------------------------------------------------------------------
+# Runtime verification: actually run the thing, then repair
+# --------------------------------------------------------------------------
+# A headless box cannot open a window; those errors say nothing about the
+# generated code, so they must not be "repaired" or counted as failures.
+_ENV_ISSUE_HINTS = (
+    "no available video device", "video system not initialized",
+    "no display name", "cannot open display", "could not connect to display",
+    "unable to open display", "tclerror: no display", "no x11 display",
+    "xdg_runtime_dir is not set",
+)
+
+
+def _environment_issue(output: str) -> bool:
+    """True when a run failure is the environment (headless display), not the
+    generated code."""
+    low = (output or "").lower()
+    return any(h in low for h in _ENV_ISSUE_HINTS)
+
+
+def smoke_run(root: Path, entry: str = "main.py",
+              timeout: int = 20) -> tuple[bool, str]:
+    """Run the project's entry point once. Returns (passed, output).
+
+    A crash (non-zero exit before the timeout) is a failure with its traceback.
+    A process still running at the timeout is a SUCCESS: games, servers, and
+    UIs do not exit on their own, and having started is what the check is for.
+    """
+    import subprocess
+    try:
+        proc = subprocess.run([sys.executable, entry], cwd=str(root),
+                              stdin=subprocess.DEVNULL,
+                              capture_output=True, text=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        return True, f"(still running after {timeout}s -- treated as started)"
+    except Exception as e:                       # pragma: no cover - env specific
+        return False, f"(could not run {entry}: {e})"
+    out = ((proc.stdout or "") + (proc.stderr or "")).strip()
+    return proc.returncode == 0, out
+
+
+def _fix_from_output(client, cfg, idx: "Index", py_rels, project_name: str,
+                     backup_dir, label: str, output: str,
+                     verbose: bool = True) -> int:
+    """Ask the model to repair one failed check, given its output. Returns the
+    number of applied fix blocks."""
+    from .agent import ANSWER_SYSTEM
+
+    sources = _py_sources(idx.root, py_rels)
+    if not sources:
+        return 0
+    files = "\n\n".join(
+        f"### {rel}\n```python\n{text}\n```"
+        for rel, text in sorted(sources.items()))
+    user = (
+        f"TASK\n{project_name}: make this check pass.\n\n"
+        f"The check failed ({label}) with this output:\n\n{output[:5000]}\n\n"
+        "CURRENT FILES\n" + files + "\n\n"
+        "Emit search/replace blocks that fix the failure. Keep the blocks "
+        "small; do not rewrite whole files.")
+    reply = client.chat(
+        [{"role": "system", "content": ANSWER_SYSTEM},
+         {"role": "user", "content": user}],
+        max_tokens=getattr(cfg, "max_tokens_answer", 4000),
+        stream=verbose, disable_thinking=True)
+    if not parse_edits(reply):
+        return 0
+    results = apply_edits(idx.root, parse_edits(reply), backup=cfg.backup,
+                          dry_run=False, cfg=cfg, backup_dir=backup_dir)
+    ok = [r for r in results if r.ok]
+    if not ok:
+        return 0
+    from . import index as index_mod
+    for r in ok:
+        idx = index_mod.reindex_file(idx, r.file, cfg)
+    return len(ok)
+
+
+def verify_and_fix(client, cfg, idx: "Index", py_rels, project_name: str,
+                   backup_dir, *, explicit_cmd: str = "", rounds: int = 2,
+                   smoke: bool = True, smoke_timeout: int = 20,
+                   verbose: bool = True) -> tuple[bool, str]:
+    """Run the explicit --verify and/or an automatic smoke run, feeding any
+    failure back to the model and re-running, up to `rounds` repairs.
+
+    Returns (passed, final_output). Missing dependencies are reported rather
+    than repaired by editing source; environment (headless display) failures
+    are treated as "could not verify" rather than code failures."""
+    from . import loop
+
+    def checks():
+        if explicit_cmd:
+            ok, out = loop.run_verify(idx.root, explicit_cmd)
+            yield f"$ {explicit_cmd}", ok, out
+        if smoke and (idx.root / "main.py").is_file():
+            ok, out = smoke_run(idx.root, "main.py", smoke_timeout)
+            yield "smoke run: python main.py (timeout = started)", ok, out
+
+    last = ""
+    for attempt in range(rounds + 1):
+        failures = [(label, out) for label, ok, out in checks() if not ok]
+        if not failures:
+            return True, ""
+        # Split out failures that are not the code's fault: a headless display
+        # or an absent package cannot be repaired by editing source.
+        env = [(l, o) for l, o in failures if _environment_issue(o)]
+        deps = [(l, o) for l, o in failures if loop.missing_modules(o)]
+        code_fails = [(l, o) for l, o in failures
+                      if not _environment_issue(o) and not loop.missing_modules(o)]
+        if not code_fails:
+            if deps:
+                return False, deps[0][1]           # report as a dependency
+            return True, (f"could not verify in this environment: "
+                          f"{env[0][1][:200]}")
+        label, last = code_fails[0]
+        if attempt >= rounds:
+            return False, last
+        if verbose:
+            print(f"\n  [verify failed ({label}); repairing, "
+                  f"{attempt + 1}/{rounds}]", file=sys.stderr)
+        if not _fix_from_output(client, cfg, idx, py_rels, project_name,
+                                backup_dir, label, last, verbose):
+            return False, last
+    return False, last
+
+
 # --------------------------------------------------------------------------
 # The whole flow, for the CLI's `new` command
 # --------------------------------------------------------------------------
 def run_new(root: Path, cfg, client, spec: Spec, *, apply: bool = False,
             review: bool = False, plan_only: bool = False, force: bool = False,
-            verbose: bool = True) -> int:
+            verbose: bool = True, complex: bool = False, verify: str = "",
+            repair_rounds: int | None = None, max_tasks: int | None = None,
+            keep_going: bool = False, auto_install: bool = False) -> int:
     """Plan a new project from `spec`, lay down its skeleton, and (unless
-    asked to stop earlier) build every source file through the normal edit
-    path. Returns a process exit code; all progress goes to stderr so stdout
-    stays clean.
+    asked to stop earlier) implement every source file. Returns a process exit
+    code; all progress goes to stderr so stdout stays clean.
 
     Stage gates, cheapest first:
       --plan-only  stop after stage 1+2: a tree of headers plus a saved index,
                    ready for `pedacito resume` or ordinary `ask --apply` runs.
       default      dry run: print the plan and a preview of the skeleton,
                    nothing is written to disk.
-      --apply      write the generated files to disk (backups taken first).
+      --apply      write the generated files, then build each one through the
+                   normal edit path (backups taken first).
       --review     build, then open the side-by-side reviewer with the result
                    (Discard restores the pre-build snapshot).
+      --complex    like --apply, but implementation is handed to the autonomous
+                   outer loop (`pedacito auto`): one task per source file, each
+                   in a fresh context window, with an optional --verify command
+                   feeding failures back for repair. The plan becomes a
+                   resumable checklist (auto_plan_file) instead of one
+                   uninterruptible build pass.
 
     A non-empty project directory is refused unless `force`: silently mixing a
     new project into an existing one is exactly the mistake this guards."""
@@ -778,13 +1081,14 @@ def run_new(root: Path, cfg, client, spec: Spec, *, apply: bool = False,
     plan = build_plan(spec, client, cfg, root, verbose=verbose)
     print(render_plan(plan))
 
-    # Write modes. The default (no --apply/--review/--plan-only) is a true dry
-    # run: show the plan and what the skeleton WOULD contain, write nothing.
-    # --plan-only writes just the header skeleton; --apply and --review write
-    # the skeleton and then build the files (review holds the result for
-    # sign-off). The old code always wrote the skeleton AND the build passes,
-    # so a bare `new` left a full project on disk and `--apply` simply re-ran
-    # the same work.
+    # Write modes. The default (no --apply/--review/--plan-only/--complex) is
+    # a true dry run: show the plan and what the skeleton WOULD contain, write
+    # nothing. --plan-only writes just the header skeleton; --apply/--review
+    # write the skeleton and then build the files (review holds the result for
+    # sign-off); --complex writes the skeleton and hands implementation to the
+    # autonomous loop. The old code always wrote the skeleton AND the build
+    # passes, so a bare `new` left a full project on disk and `--apply` simply
+    # re-ran the same work.
     wants_skeleton = plan_only or apply or review
     stubs = {}
     if wants_skeleton:
@@ -801,8 +1105,14 @@ def run_new(root: Path, cfg, client, spec: Spec, *, apply: bool = False,
                 preview += f", ... (+{len(created) - 12})"
             print(f"  [dry run] {len(created)} skeleton file(s) would be "
                   f"created: {preview}", file=sys.stderr)
+        if complex:
+            print(f"  [dry run] --complex would hand these {len(plan_tasks(plan))} "
+                  f"task(s) to the autonomous loop:", file=sys.stderr)
+            for t in plan_tasks(plan):
+                print(f"      - {t}", file=sys.stderr)
         print("  Nothing was written. Re-run with --apply to build the "
-              "project, or --plan-only to write just the header skeleton.",
+              "project (or --complex --apply for the autonomous loop), "
+              "or --plan-only to write just the header skeleton.",
               file=sys.stderr)
         return 0
 
@@ -816,6 +1126,12 @@ def run_new(root: Path, cfg, client, spec: Spec, *, apply: bool = False,
               f"  Implement it later with:  pedacito ask {root} --apply "
               "-t \"implement the stub files\"", file=sys.stderr)
         return 0
+
+    if complex:
+        return _run_complex(root, cfg, client, idx, plan, spec,
+                            verify=verify, repair_rounds=repair_rounds,
+                            max_tasks=max_tasks, keep_going=keep_going,
+                            verbose=verbose, auto_install=auto_install)
 
     want_write = apply or review
     when = None
@@ -850,6 +1166,161 @@ def run_new(root: Path, cfg, client, spec: Spec, *, apply: bool = False,
                                     [], render_plan(plan), [], backup_dir, when)
         print(f"[session: {p.relative_to(root)}]", file=sys.stderr)
     return 0 if not summary["failed"] else 1
+
+
+def _run_complex(root: Path, cfg, client, idx, plan: Plan, spec: Spec, *,
+                 verify: str = "", repair_rounds: int | None = None,
+                 max_tasks: int | None = None, keep_going: bool = False,
+                 verbose: bool = True, auto_install: bool = False) -> int:
+    """Complex mode: the framework (skeleton + interface stubs + index) is in
+    place, so hand implementation to the autonomous outer loop.
+
+    The plan becomes a resumable checklist (cfg.auto_plan_file, default
+    PLAN.md) with one task per source file; the loop implements each in a
+    fresh context window, optionally re-running a `verify` command and feeding
+    failures back for repair. Returns the loop's exit code."""
+    from . import loop
+    from . import workspace
+
+    rr = cfg.auto_repair_rounds if repair_rounds is None else repair_rounds
+    mt = cfg.auto_max_tasks if max_tasks is None else max_tasks
+    vf = verify if verify else getattr(cfg, "auto_verify", "")
+
+    plan_file = root / getattr(cfg, "auto_plan_file", "PLAN.md")
+    split_lines = int(getattr(cfg, "auto_split_lines", 0) or 0)
+    titles = plan_tasks(plan, idx=idx, max_lines=split_lines)
+    loop.write_plan(plan_file, plan.project_name or spec.title, titles)
+
+    print(f"\n--- auto: implementing {len(titles)} task(s) in fresh contexts "
+          f"(plan: {plan_file}) ---", file=sys.stderr)
+    workspace.log_event(root, f"complex: {len(titles)} task(s) -> {plan_file.name}")
+    code = loop.run_loop(
+        root, cfg, client, idx, plan_file,
+        apply=True,
+        verify=vf,
+        repair_rounds=rr,
+        max_tasks=mt,
+        stop_on_fail=not keep_going,
+        answer_system=AUTO_IMPLEMENT_SYSTEM,
+        auto_install=auto_install,
+    )
+
+    # Cross-file API repair. Every task is implemented in a FRESH context, so
+    # the model can call `parse_markdown` in one file and define `parse` in
+    # another. The simple `new` build closes that gap with fix_import_errors;
+    # without the same pass here, complex mode can mark every task done and
+    # still ship a tree that cannot import. This runs after the loop, when the
+    # whole project exists. A missing third-party package is handled first and
+    # separately: editing source cannot add a dependency, so it must never be
+    # sent through the code-repair loop.
+    has_py = any(f.path.endswith(".py") for f in plan.files)
+    if has_py:
+        when = workspace.stamp()
+        fix_backup = workspace.new_backup_dir(root, when) if cfg.backup else None
+        err = _first_import_error(root, plan)
+        missing = loop.missing_modules(err or "")
+        if missing:
+            dists = ", ".join(loop.pip_name(m) for m in missing)
+            if auto_install:
+                print(f"  [import check: installing missing dependencies: "
+                      f"{dists}]", file=sys.stderr)
+                workspace.log_event(root, f"import check: installing {dists}")
+                ok, _out = loop.install_modules(missing, root)
+                workspace.log_event(root, f"pip install {'ok' if ok else 'FAILED'}: "
+                                          f"{dists}", "INFO" if ok else "ERROR")
+                err = _first_import_error(root, plan)
+                missing = loop.missing_modules(err or "")
+            else:
+                print(f"  [import check blocked by missing dependencies: "
+                      f"{dists}. Install with `pip install {dists}`, or rerun "
+                      f"with --auto-install.]", file=sys.stderr)
+                workspace.log_event(root, f"import check blocked by missing "
+                                          f"deps: {dists}", "ERROR")
+        if err and not missing:
+            n_fixed = fix_import_errors(client, cfg, idx, plan, fix_backup,
+                                        verbose=verbose)
+            if n_fixed and verbose:
+                print(f"  fixed {n_fixed} import issue(s)", file=sys.stderr)
+            err = _first_import_error(root, plan)
+            missing = loop.missing_modules(err or "")
+        if err:
+            if missing:
+                dists = ", ".join(loop.pip_name(m) for m in missing)
+                print(f"\n  [warning] the project needs dependencies that are "
+                      f"not installed: {dists}", file=sys.stderr)
+            else:
+                print("\n  [warning] the project still does not import "
+                      "cleanly:\n"
+                      + "\n".join(f"    {ln}" for ln in err.splitlines()[:8]),
+                      file=sys.stderr)
+            workspace.log_event(root, f"import check failed: {err[:200]}",
+                                "ERROR")
+            if code == 0:
+                code = 1
+        else:
+            note = ("imports cleanly (run behaviour was NOT exercised"
+                    + ("" if vf else "; pass --verify CMD to gate on it") + ")")
+            print(f"  import check: {note}", file=sys.stderr)
+            workspace.log_event(root, f"import check: {note}")
+            # An import does not execute a call, so `Level()` against
+            # `Level.__init__(self, level_data)` passes the check above and
+            # still crashes on first use. Check cross-file call arity
+            # statically and repair it the same way.
+            n_api = fix_api_mismatches(client, cfg, idx, plan, fix_backup,
+                                       verbose=verbose)
+            if n_api and verbose:
+                print(f"  fixed {n_api} call/signature mismatch(es)",
+                      file=sys.stderr)
+            problems = apicheck.find_mismatches(
+                _py_sources(root, [f.path for f in plan.files]))
+            if problems:
+                print("\n  [warning] call/signature mismatches remain:\n"
+                      + "\n".join(f"    {p}" for p in problems[:10]),
+                      file=sys.stderr)
+                workspace.log_event(root,
+                                    f"api mismatches remain: {problems[0]}",
+                                    "ERROR")
+                if code == 0:
+                    code = 1
+            else:
+                print("  api check: call signatures consistent",
+                      file=sys.stderr)
+                workspace.log_event(root, "api check: consistent")
+
+            # Runtime verification: static checks never EXECUTE the program, so
+            # a crash on first use can still slip through. Run the explicit
+            # --verify from the config, else smoke-run main.py (a process still
+            # running at the timeout counts as started), then feed any failure
+            # back to the model before the run is declared complete.
+            rounds = int(getattr(cfg, "auto_verify_rounds", 2) or 0)
+            do_smoke = bool(getattr(cfg, "auto_smoke", True))
+            smoke_timeout = int(getattr(cfg, "auto_smoke_timeout", 20) or 20)
+            if vf or do_smoke:
+                v_ok, v_out = verify_and_fix(
+                    client, cfg, idx, [f.path for f in plan.files],
+                    plan.project_name, fix_backup, explicit_cmd=vf,
+                    rounds=rounds, smoke=do_smoke,
+                    smoke_timeout=smoke_timeout, verbose=verbose)
+                if v_ok:
+                    vnote = "verify: passed" + (f" ({v_out})" if v_out else "")
+                    print(f"  {vnote}", file=sys.stderr)
+                    workspace.log_event(root, vnote)
+                else:
+                    print("\n  [warning] runtime verification failed after "
+                          "repair:\n"
+                          + "\n".join(f"    {ln}" for ln in v_out.splitlines()[:10]),
+                          file=sys.stderr)
+                    workspace.log_event(root, f"verify failed: {v_out[:200]}",
+                                        "ERROR")
+                    if code == 0:
+                        code = 1
+
+    if cfg.log_sessions:
+        p = workspace.write_session(root, f"new: {plan.project_name}",
+                                    [], render_plan(plan), [], None,
+                                    workspace.stamp())
+        print(f"[session: {p.relative_to(root)}]", file=sys.stderr)
+    return code
 
 
 def _review_build(root: Path, plan: Plan, summary: dict, cfg,

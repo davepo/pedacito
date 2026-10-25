@@ -107,6 +107,22 @@ LOAD_HELP = """\
   error it shows there is the real one -- the API only reports that it failed."""
 
 
+_GIB = 1024 ** 3
+
+
+def _server_root(base_url: str) -> str:
+    """Strip an OpenAI-style API suffix from base_url, leaving the server root.
+
+    Both `/v1` and `/api/v1` are common (Lemonade accepts either), and the
+    native endpoints live at the root (`/api/v0/models`, `/api/show`, ...).
+    """
+    base = base_url.rstrip("/")
+    for suffix in ("/api/v1", "/v1"):
+        if base.endswith(suffix):
+            return base[:-len(suffix)]
+    return base
+
+
 # --------------------------------------------------------------------------
 # Reasoning-model output handling
 # --------------------------------------------------------------------------
@@ -781,6 +797,12 @@ class LMStudio:
         # second cut we stop retrying and treat the recovered action as final.
         self.step_truncated = False
         step_cut = 0
+        # One re-ask per call for the "whole budget spent on a <think>/prose
+        # preamble, no JSON at all" failure: retrying verbatim just re-rolls
+        # the same essay, so the retry carries an explicit no-reasoning
+        # instruction instead. Bounded so a model that cannot stop rambling
+        # still falls through to the informative error.
+        trunc_nudged = False
         # Ceiling for truncation-retry escalation. Default is NOT a hard
         # 2000 -- it is derived from the caller's own config (reserve /
         # answer budgets), so raising max_tokens_step or reserve_tokens in
@@ -917,6 +939,29 @@ class LMStudio:
                     # provider-side fact no client setting can raise. Skip the
                     # escalation entirely for schema steps.
                     if not self._schema_has_big_fields(schema):
+                        # ...but do re-ask ONCE with an explicit no-reasoning
+                        # instruction before giving up. A thinking model that
+                        # spent its whole budget on the preamble (the frequent
+                        # local-server failure: "kept running past the token
+                        # limit before finishing its JSON") often lands the
+                        # JSON immediately when told to skip it -- this is the
+                        # same nudge agent.gather applies, moved down into
+                        # chat_json so plan/summary callers get it too.
+                        if not trunc_nudged and attempt < retries:
+                            trunc_nudged = True
+                            print("[reply was cut off before any JSON was "
+                                  "emitted; re-asking with a no-reasoning "
+                                  "nudge]", file=sys.stderr)
+                            messages = messages + [
+                                {"role": "assistant", "content": raw},
+                                {"role": "user", "content":
+                                    "Your previous reply was cut off by the "
+                                    "output token limit before you emitted "
+                                    "the JSON object. Do not think or explain: "
+                                    "output the JSON object itself now, with "
+                                    "'reasoning' kept under 10 words."},
+                            ]
+                            continue
                         break   # fall through to the informative error below
                     nxt = min(budget * 2, cap)
                     if nxt > budget:
@@ -979,9 +1024,7 @@ class LMStudio:
         /api/v0/models reports a state field instead. Returns None on any
         older LM Studio build that lacks this endpoint.
         """
-        base = self.cfg.base_url.rstrip("/")
-        if base.endswith("/v1"):
-            base = base[:-3]
+        base = _server_root(self.cfg.base_url)
         try:
             r = requests.get(base + "/api/v0/models", headers=self.headers, timeout=10)
             if r.status_code != 200:
@@ -992,54 +1035,215 @@ class LMStudio:
         out = {m.get("id", "?"): m.get("state", "unknown") for m in data if isinstance(m, dict)}
         return out or None
 
+    @staticmethod
+    def _pick_model(entries, model: str) -> dict | None:
+        """Find the entry for `model` in a server's model list.
+
+        Servers report the same model under several spellings: LM Studio uses
+        `id`/`key` (sometimes with an `@q4_k_m` variant suffix), Ollama uses
+        `name`, and OpenAI endpoints use `id`. Exact matches win; a match on
+        the part before `@` handles the variant suffix.
+        """
+        want = str(model or "").strip().lower()
+        if not want:
+            return None
+
+        def names(entry: dict) -> list[str]:
+            vals = (entry.get("id"), entry.get("key"), entry.get("name"),
+                    entry.get("model"), entry.get("display_name"))
+            return [str(v).strip().lower() for v in vals if v]
+
+        for entry in entries:
+            if isinstance(entry, dict) and want in names(entry):
+                return entry
+        base = want.split("@", 1)[0]
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            if any(n.split("@", 1)[0] == base for n in names(entry)):
+                return entry
+        return None
+
+    def _absorb_model_list(self, entries, source: str) -> dict:
+        """Extract size/context from one model-list entry.
+
+        Servers extend the OpenAI /v1/models shape differently:
+          * LM Studio v1: `size_bytes`, `loaded_instances[].config.context_length`,
+            `max_context_length`.
+          * Lemonade: `size` in GB, `context_length` (configured/loaded), and
+            `max_context_window`.
+        Both spellings are absorbed here so model_info does not need to know
+        which server answered.
+        """
+        m = self._pick_model(entries, self.cfg.model)
+        if not m:
+            return {}
+
+        def ctx_ok(value) -> int | None:
+            try:
+                n = int(value)
+            except (TypeError, ValueError):
+                return None
+            return n if n > 0 else None
+
+        got: dict = {}
+        raw_size = m.get("size_bytes")
+        if raw_size is not None:
+            try:
+                got["size_bytes"] = int(raw_size)
+            except (TypeError, ValueError):
+                pass
+        if not got.get("size_bytes") and m.get("size") is not None:
+            # Lemonade reports model size as a GB number, not bytes.
+            try:
+                got["size_bytes"] = int(float(m["size"]) * _GIB)
+            except (TypeError, ValueError):
+                pass
+        loaded = m.get("loaded_instances") or []
+        loaded_ctx = None
+        if loaded and isinstance(loaded[0], dict):
+            loaded_ctx = ctx_ok(
+                (loaded[0].get("config") or {}).get("context_length"))
+        ctx = (loaded_ctx or ctx_ok(m.get("context_length"))
+               or ctx_ok((m.get("recipe_options") or {}).get("ctx_size")))
+        if ctx:
+            got["context_length"] = ctx
+        max_ctx = ctx_ok(m.get("max_context_length")
+                         or m.get("max_context_window"))
+        if max_ctx:
+            got["max_context_length"] = max_ctx
+        if got:
+            if str(m.get("owned_by", "")).lower() == "lemonade" \
+                    or m.get("recipe"):
+                source = "lemonade"
+            got["source"] = source
+        return got
+
+    def model_info(self) -> dict | None:
+        """Ask the server for metadata about `cfg.model`: file size, configured
+        context length, and the model's maximum context.
+
+        Returns a dict with any of `size_bytes`, `context_length`,
+        `max_context_length`, plus `source`; None when nothing answers. This
+        is the start-of-run probe auto-fit uses to size the context window
+        from the machine's actual VRAM instead of trusting a hand-written
+        token budget.
+
+        Tried in order, stopping once both size and context are known:
+          * LM Studio v1 `/api/v1/models` -- `size_bytes`, loaded instance's
+            configured context, and `max_context_length`.
+          * Any OpenAI-compatible `/v1/models` -- Lemonade returns `size` (GB),
+            `context_length` and `max_context_window` there; plain servers
+            simply yield nothing useful.
+          * LM Studio v0 `/api/v0/models` -- context length on older builds
+            (and `size_bytes` when the build reports it).
+          * Ollama `/api/show` -- the weights' `size` and `llama.context_length`
+            / `num_ctx` (Lemonade also implements this endpoint).
+
+        Every probe is best-effort: a server that does not implement an
+        endpoint (or is offline) simply yields nothing, and the caller keeps
+        the config's declared context.
+        """
+        root = _server_root(self.cfg.base_url)
+        out: dict = {}
+
+        def enough() -> bool:
+            return bool(out.get("size_bytes") and (
+                out.get("context_length") or out.get("max_context_length")))
+
+        def merge(got: dict) -> None:
+            for key, value in got.items():
+                if key == "source":
+                    continue
+                if value and not out.get(key):
+                    out[key] = value
+            if got.get("source"):
+                out.setdefault("source", got["source"])
+
+        for url, source in (
+                (root + "/api/v1/models", "lmstudio-v1"),
+                (root + "/v1/models", "openai-models"),
+                (root + "/api/v0/models", "lmstudio-v0")):
+            if enough():
+                break
+            try:
+                r = requests.get(url, headers=self.headers, timeout=5)
+                if r.status_code != 200:
+                    continue
+                data = r.json()
+                if isinstance(data, dict):
+                    entries = data.get("models") or data.get("data") or []
+                else:
+                    entries = data if isinstance(data, list) else []
+                merge(self._absorb_model_list(entries, source))
+            except Exception:
+                pass
+
+        # Ollama /api/show (Lemonade implements it too) reports both the
+        # weights size and the configured context length.
+        if not enough():
+            try:
+                r = requests.post(root + "/api/show",
+                                  json={"name": self.cfg.model}, timeout=5)
+                if r.status_code == 200:
+                    d = r.json()
+                    got: dict = {}
+                    size = d.get("size")
+                    if size is not None:
+                        try:
+                            got["size_bytes"] = int(size)
+                        except (TypeError, ValueError):
+                            pass
+                    info = d.get("model_info") or {}
+                    params = d.get("parameters") or {}
+                    num_ctx = (params.get("num_ctx")
+                               if isinstance(params, dict) else None)
+                    ctx = num_ctx or info.get("llama.context_length")
+                    try:
+                        ctx = int(ctx)
+                    except (TypeError, ValueError):
+                        ctx = None
+                    if ctx and ctx > 0:
+                        got["context_length"] = ctx
+                    max_ctx = info.get("llama.context_length")
+                    try:
+                        max_ctx = int(max_ctx)
+                    except (TypeError, ValueError):
+                        max_ctx = None
+                    if max_ctx and max_ctx > 0:
+                        got["max_context_length"] = max_ctx
+                    details = d.get("details") or {}
+                    if not got.get("size_bytes") and details.get("parameter_size"):
+                        got["parameter_size"] = details["parameter_size"]
+                    if got:
+                        got["source"] = "ollama"
+                    merge(got)
+            except Exception:
+                pass
+
+        if not (out.get("size_bytes") or out.get("context_length")
+                or out.get("max_context_length")):
+            return None
+        return out
+
     def detect_context(self) -> int | None:
         """Probe the server for the REAL context length configured for
         `cfg.model`, so token budgets can be auto-fitted to what the model
         will actually accept instead of a guessed config number.
 
         Works against the two local servers Pedacito targets:
-          * LM Studio -- native /api/v0/models carries `context_length`
-            (the value typed into its UI; llama.cpp rejects requests bigger
-            than this with a 400, which is half of "kept hitting limits").
-          * Ollama -- POST /api/show returns parameters including num_ctx
-            (defaults to 4096 when unset, which explains why Ollama users
-            hit limits that a 32k-token model 'should' handle).
+          * LM Studio -- native /api/v1/models and /api/v0/models carry the
+            configured and maximum context lengths.
+          * Ollama -- POST /api/show returns model_info including
+            llama.context_length (and num_ctx when explicitly set; Ollama
+            defaults to 4096 when unset).
 
         Returns None for hosted APIs and any server that doesn't answer --
         callers then keep whatever context_tokens the config declares.
         Never raises: this is an optimisation probe, not a requirement.
         """
-        base = self.cfg.base_url.rstrip("/")
-        root = base[:-3] if base.endswith("/v1") else base
-        # LM Studio native API.
-        try:
-            r = requests.get(root + "/api/v0/models", headers=self.headers,
-                             timeout=5)
-            if r.status_code == 200:
-                for m in r.json().get("data", []):
-                    if not isinstance(m, dict):
-                        continue
-                    if m.get("id") == self.cfg.model or m.get("key") == self.cfg.model:
-                        ctx = (m.get("context_length")
-                               or (m.get("metadata") or {}).get("context_length"))
-                        if isinstance(ctx, int) and ctx > 0:
-                            return ctx
-        except Exception:
-            pass
-        # Ollama native API.
-        try:
-            r = requests.post(root + "/api/show",
-                              json={"name": self.cfg.model}, timeout=5)
-            if r.status_code == 200:
-                d = r.json()
-                ctx = ((d.get("model_info") or {}).get(
-                    "llama.context_length")
-                    or d.get("parameters", {}).get("num_ctx"))
-                if isinstance(ctx, int) and ctx > 0:
-                    return ctx
-        except Exception:
-            pass
-        return None
+        info = self.model_info() or {}
+        return info.get("context_length")
 
     def warmup(self, verbose: bool = True) -> None:
         """Force the model to load with one tiny generation before real work
@@ -1067,8 +1271,7 @@ class LMStudio:
         # and "would not produce valid JSON".
         if self._schema_supported is None and self.cfg.json_mode != "object":
             try:
-                base = self.cfg.base_url.rstrip("/")
-                root = base[:-3] if base.endswith("/v1") else base
+                root = _server_root(self.cfg.base_url)
                 r = requests.get(root + "/api/v0/models", headers=self.headers,
                                  timeout=5)
                 if r.status_code == 200:

@@ -9,8 +9,10 @@ Usage
     pedacito files  .                        # what would be indexed, and why
     pedacito cost   src/                     # what indexing would cost
     pedacito config --init                   # write a starter config file
+    pedacito how "how do I set up a config?" # built-in help from docs + code
     pedacito restore src/                    # undo the last --apply
     pedacito new  my-app -t "todo CLI"       # start a project from scratch
+    pedacito auto . -t "add retries" --apply # autonomous outer loop over tasks
 
 Run as `pedacito <command> ...` (after `pip install -e .`) or
 `python -m pedacito <command> ...`. `main()` is the single entry point invoked
@@ -21,20 +23,18 @@ by both `__main__.py` files. `pdc` is installed as a shorthand alias for
 from __future__ import annotations
 
 import argparse
-import dataclasses
 import sys
 from pathlib import Path
 
 from . import index as index_mod
+from . import loop
+from . import workspace
 from .agent import Agent
-from .edits import parse_edits
 from .config import (Config, ConfigError, REFERENCE_TEMPLATE,
                      USER_CONFIG, auto_fit, find_project_config,
                      interactive_setup, load as load_config, write_template)
 from .llm import LMStudio, LLMError, estimate_tokens
 from .select import CODE_EXTS, REFERENCE_EXTS, Matcher, select
-from . import review as review_mod
-from . import workspace
 
 
 # --------------------------------------------------------------------------
@@ -93,8 +93,12 @@ def _matcher(args, root: Path) -> Matcher:
 def _config(args) -> Config:
     """Build the effective Config for a parsed args namespace: load from
     files/profile, then apply any command-line overrides on top."""
+    # The config subcommand must be able to inspect (and repair) a file that
+    # predates the mandatory vram_gb setting; every real run requires it for
+    # local servers.
     cfg = load_config(root=_root(args), explicit=getattr(args, "config", None),
-                      profile=getattr(args, "profile", None))
+                      profile=getattr(args, "profile", None),
+                      require_hardware=(getattr(args, "cmd", "") != "config"))
     if getattr(args, "no_refs", False):
         cfg.include_references = False
     if getattr(args, "ext", None):
@@ -224,7 +228,7 @@ def _cmd_config(args, cfg) -> int:
             print(f"{e}", file=sys.stderr)
             return 2
         print(f"Wrote {path}", file=sys.stderr)
-        print("Only two settings are mandatory: base_url and model (top of the\n"
+        print("Mandatory settings: base_url, model and vram_gb (top of the\n"
               "file). Everything else has a working default -- see\n"
               "`pedacito config --reference` for the annotated full list, or run\n"
               "`pedacito config --setup` to have it built and tested interactively.\n"
@@ -426,56 +430,101 @@ def _wants_review(args, cfg) -> bool:
     return bool(getattr(args, "review", False) or cfg.review)
 
 
-def _review(root: Path, results, task: str, cfg, backup_dir, stamp: str) -> list:
-    """Build and serve the review page for a set of edit results, block
-    until the person applies or discards, and return the results as they
-    finally stand (so the session log records what actually happened)."""
-    diffs = review_mod.diffs_from_results(results, root)
-    if not diffs:
-        # Nothing anchored, so there is nothing to review. Say why rather than
-        # silently doing nothing.
-        print("\n  No review page: no edit block applied cleanly.", file=sys.stderr)
-        _report(results, dry_run=True)
-        return results
-    nonce = review_mod.new_nonce()
-    page = review_mod.build_page(diffs, task, cfg.model, cfg.active_profile,
-                                 nonce, interactive=True, stamp=stamp)
-    saved = review_mod.save(root, page, stamp)
-
-    def writer():
-        """Write the reviewed files to disk when the page's Apply fires."""
-        return review_mod.write_files(root, diffs, backup_dir)
-
-    print(f"  review page: {saved}", file=sys.stderr)
-    outcome, detail = review_mod.run(
-        page, nonce, writer, port=cfg.review_port,
-        open_browser=cfg.open_browser, timeout=cfg.review_timeout,
-        on_url=lambda u: print(f"  waiting for sign-off at {u}", file=sys.stderr))
-
-    if outcome == "applied":
-        print(f"  {detail}", file=sys.stderr)
-        return [dataclasses.replace(r, message="applied via review")
-                if r.ok else r for r in results]
-    print(f"  {detail}", file=sys.stderr)
-    return [dataclasses.replace(r, message=f"not written ({outcome})")
-            if r.ok else r for r in results]
-
-
 # --------------------------------------------------------------------------
-# Terminal reporting
+# `pedacito auto`: the autonomous outer loop
 # --------------------------------------------------------------------------
-def _report(results, dry_run: bool):
-    """Print each edit Result to stderr, including its unified diff when in
-    dry-run mode."""
-    if not results:
-        print("\n[no edit blocks in the reply]", file=sys.stderr)
-        return
-    print("", file=sys.stderr)
-    for r in results:
-        mark = "ok " if r.ok else "FAIL"
-        print(f"[{mark}] {r.file}: {r.message}", file=sys.stderr)
-        if r.ok and dry_run and r.diff:
-            print(r.diff)
+def _cmd_auto(args, cfg, client, idx, root: Path) -> int:
+    """Implement `pedacito auto`: generate a task list from a goal (or reuse
+    an existing plan file), then run the Ralph loop until it is empty.
+
+    Without --apply this is plan-only: generate/print the plan and stop, so a
+    bare `auto` never writes code. With --apply it implements every unchecked
+    task in a fresh context window, optionally verifying each with --verify."""
+    from . import scaffold
+
+    workspace.log_event(root, "command: " + " ".join(sys.argv))
+
+    plan_path = Path(args.plan) if getattr(args, "plan", None) else \
+        (root / cfg.auto_plan_file)
+    if not plan_path.is_absolute():
+        plan_path = (root / plan_path).resolve()
+
+    if args.task or args.spec:
+        spec = scaffold.load_spec(
+            prompt=args.task, spec_file=args.spec,
+            max_chars=getattr(cfg, "max_spec_chars", scaffold.MAX_SPEC_CHARS))
+        # Reuse an existing plan to RESUME only while it still has open tasks;
+        # once it is complete (or missing), a new -t/--spec goal starts a fresh
+        # plan. Otherwise `auto -t "fix the bug"` on a finished project would
+        # silently re-read the old all-checked checklist and report "all tasks
+        # complete" without touching the new goal at all.
+        regenerate = args.force or \
+            loop.next_task(loop.read_plan(plan_path)) is None
+        if regenerate:
+            if plan_path.exists():
+                print("  [existing plan has no open tasks; generating a new "
+                      "one from the goal]", file=sys.stderr)
+            titles = loop.generate_tasks(spec.text, client, cfg)
+            loop.write_plan(plan_path, spec.title, titles)
+        if not args.apply:
+            print(plan_path.read_text(encoding="utf-8"), file=sys.stderr)
+            print(f"Plan: {plan_path}", file=sys.stderr)
+            print("Run with --apply to implement it. Edit the checklist to "
+                  "reorder, add, or remove tasks first if you like.",
+                  file=sys.stderr)
+            return 0
+    else:
+        if not plan_path.exists():
+            print(f"No plan file at {plan_path}.\n"
+                  "  Give -t \"goal\" or --spec FILE to generate one, or\n"
+                  "  --plan FILE to point at an existing task checklist.",
+                  file=sys.stderr)
+            return 2
+
+    verify = args.verify if getattr(args, "verify", None) is not None \
+        else cfg.auto_verify
+    repair = args.repair if getattr(args, "repair", None) is not None \
+        else cfg.auto_repair_rounds
+    max_tasks = args.max_tasks if getattr(args, "max_tasks", None) is not None \
+        else cfg.auto_max_tasks
+    auto_install = bool(getattr(args, "auto_install", False)
+                        or getattr(cfg, "auto_install_deps", False))
+
+    code = loop.run_loop(root, cfg, client, idx, plan_path,
+                         apply=args.apply, verify=verify, repair_rounds=repair,
+                         max_tasks=max_tasks, stop_on_fail=not args.keep_going,
+                         auto_install=auto_install)
+
+    # Automatic post-run verification: after the checklist is done, exercise
+    # the project once (the explicit --verify and/or a smoke run of main.py)
+    # and feed a failure back for repair before returning. This is what lets a
+    # run correct itself instead of declaring success on broken code.
+    smoke = bool(getattr(cfg, "auto_smoke", True))
+    if args.apply and (verify or smoke):
+        skip = {".pedacito", "__pycache__", ".venv", "venv",
+                "node_modules", ".git"}
+        py_rels = sorted(
+            p.relative_to(root).as_posix() for p in root.rglob("*.py")
+            if not (set(p.parts) & skip))
+        v_ok, v_out = scaffold.verify_and_fix(
+            client, cfg, idx, py_rels, root.name, None,
+            explicit_cmd=verify,
+            rounds=int(getattr(cfg, "auto_verify_rounds", 2) or 0),
+            smoke=smoke,
+            smoke_timeout=int(getattr(cfg, "auto_smoke_timeout", 20) or 20),
+            verbose=True)
+        if v_ok:
+            note = "verify: passed" + (f" ({v_out})" if v_out else "")
+            print(f"  {note}", file=sys.stderr)
+            workspace.log_event(root, note)
+        else:
+            print("\n  [warning] runtime verification failed after repair:\n"
+                  + "\n".join(f"    {ln}" for ln in v_out.splitlines()[:10]),
+                  file=sys.stderr)
+            workspace.log_event(root, f"verify failed: {v_out[:200]}", "ERROR")
+            if code == 0:
+                code = 1
+    return code
 
 
 # --------------------------------------------------------------------------
@@ -518,6 +567,24 @@ def main(argv=None) -> int:
     p_conf.add_argument("--profile", metavar="NAME")
     p_conf.add_argument("paths", nargs="*", default=["."], help=argparse.SUPPRESS)
     p_conf.add_argument("--config", metavar="FILE")
+
+    p_how = sub.add_parser(
+        "how", help="ask how to use pedacito (smart built-in help)")
+    p_how.add_argument("question", nargs="*",
+                       help="your question; omit for an interactive prompt")
+    p_how.add_argument("-q", "--question", dest="question_opt", metavar="TEXT",
+                       help="your question (alternative to the positional form)")
+    p_how.add_argument("--url", "--server", dest="url",
+                       help="server base url override for this help session")
+    p_how.add_argument("--api-key", dest="api_key",
+                       help="API key override for this help session")
+    p_how.add_argument("--model", help="model id/name override")
+    p_how.add_argument("--vram", "--vram-gb", dest="vram_gb", type=int,
+                       metavar="GB", help="GPU VRAM in whole gigabytes")
+    p_how.add_argument("--config", metavar="FILE",
+                       help="use this config file as well")
+    p_how.add_argument("--profile", metavar="NAME",
+                       help="apply a [profiles.NAME] block from your config")
 
     # Same positional shape as every other command: the project path first.
     p_rest = sub.add_parser("restore", help="undo an --apply run from its backup snapshot")
@@ -566,12 +633,61 @@ def main(argv=None) -> int:
                             "side-by-side reviewer")
     p_new.add_argument("--force", action="store_true",
                        help="allow scaffolding into a non-empty directory")
+    p_new.add_argument("--complex", action="store_true",
+                       help="with --apply: after planning and scaffolding, hand "
+                            "implementation to the autonomous loop (one task per "
+                            "file, fresh context each, resumable PLAN.md)")
+    p_new.add_argument("--verify", default=None,
+                       help="(with --complex) shell command run after each task, "
+                            "e.g. 'pytest -q'; failures feed back for repair")
+    p_new.add_argument("--repair", type=int, default=None,
+                       help="(with --complex) fix rounds per failing verification")
+    p_new.add_argument("--max-tasks", type=int, default=None,
+                       help="(with --complex) stop after attempting this many tasks")
+    p_new.add_argument("--keep-going", action="store_true",
+                       help="(with --complex) continue past failed tasks "
+                            "instead of stopping")
+    p_new.add_argument("--auto-install", dest="auto_install",
+                       action="store_true",
+                       help="(with --complex --verify) pip-install a missing "
+                            "Python package and retry instead of reporting it")
     p_new.add_argument("--url", help="server base url override")
     p_new.add_argument("--model", help="model id/name override")
     p_new.add_argument("--config", metavar="FILE", help="use this config file as well")
     p_new.add_argument("--profile", metavar="NAME",
                        help="apply a [profiles.NAME] block from your config")
     p_new.add_argument("--no-review", dest="no_review", action="store_true")
+
+    p_auto = sub.add_parser(
+        "auto", help="autonomous loop: plan a goal, then implement its tasks "
+                     "one at a time in fresh contexts")
+    _add_common(p_auto)
+    p_auto.add_argument("-t", "--task", default=None,
+                        help="one-line goal to break into tasks")
+    p_auto.add_argument("--spec", metavar="FILE", default=None,
+                        help="a larger spec document (.md/.txt); may be combined "
+                             "with -t, or piped in via stdin")
+    p_auto.add_argument("--plan", metavar="FILE", default=None,
+                        help="use this task-list file (default: PLAN.md in the "
+                             "project root)")
+    p_auto.add_argument("--apply", action="store_true",
+                        help="implement the tasks and write edits (default: "
+                             "generate/print the plan only)")
+    p_auto.add_argument("--verify", default=None,
+                        help="shell command to run after each task, e.g. "
+                             "'pytest -q'; a failure feeds back for repair")
+    p_auto.add_argument("--repair", type=int, default=None,
+                        help="how many fix rounds a failing verification gets")
+    p_auto.add_argument("--max-tasks", type=int, default=None,
+                        help="stop after attempting this many tasks")
+    p_auto.add_argument("--keep-going", action="store_true",
+                        help="continue past failed tasks instead of stopping")
+    p_auto.add_argument("--auto-install", dest="auto_install",
+                        action="store_true",
+                        help="when --verify fails on a missing Python package, "
+                             "pip-install it and retry (off by default)")
+    p_auto.add_argument("--force", action="store_true",
+                        help="regenerate the plan file, discarding the existing one")
 
     p_chat = sub.add_parser("chat", help="interactive session")
     _add_common(p_chat)
@@ -599,6 +715,23 @@ def main(argv=None) -> int:
             print("\nSetup cancelled.", file=sys.stderr)
             return 130
         return 0
+
+    # `how` is standalone help: it needs a model connection, but no project
+    # path, index, or vram-derived token budget. Handle it before the shared
+    # config/index path so it works with a bare-minimum config or direct flags.
+    if args.cmd == "how":
+        from .how import HowError, run_cli as run_how
+        try:
+            return run_how(args)
+        except (ConfigError, HowError) as e:
+            print(f"How error: {e}", file=sys.stderr)
+            return 2
+        except LLMError as e:
+            print(f"\nERROR: {e}", file=sys.stderr)
+            return 1
+        except KeyboardInterrupt:
+            print("\nCancelled.", file=sys.stderr)
+            return 130
 
     try:
         cfg = _config(args)
@@ -729,6 +862,7 @@ def main(argv=None) -> int:
         if args.cmd == "new":
             from . import scaffold
             root = Path(args.project).expanduser().resolve()
+            workspace.log_event(root, "command: " + " ".join(sys.argv))
             spec = scaffold.load_spec(
                 prompt=args.task, spec_file=args.spec,
                 max_chars=getattr(cfg, "max_spec_chars", scaffold.MAX_SPEC_CHARS))
@@ -736,7 +870,16 @@ def main(argv=None) -> int:
                 root, cfg, client, spec,
                 apply=args.apply, review=args.review,
                 plan_only=args.plan_only, force=args.force,
-                verbose=True)
+                verbose=True, complex=args.complex,
+                verify=args.verify if getattr(args, "verify", None) is not None
+                else getattr(cfg, "auto_verify", ""),
+                repair_rounds=args.repair if getattr(args, "repair", None) is not None
+                else getattr(cfg, "auto_repair_rounds", 2),
+                max_tasks=args.max_tasks if getattr(args, "max_tasks", None) is not None
+                else getattr(cfg, "auto_max_tasks", 0),
+                keep_going=args.keep_going,
+                auto_install=bool(getattr(args, "auto_install", False)
+                                  or getattr(cfg, "auto_install_deps", False)))
             s = client.stats
             print(f"\n[{s['calls']} calls, {s['completion_tokens']} tokens out, "
                   f"{s['seconds']:.0f}s]", file=sys.stderr)
@@ -767,42 +910,15 @@ def main(argv=None) -> int:
         locals_ref = {"cfg": cfg, "client": client, "agent": agent, "idx": idx}
 
         def run(task: str):
-            """Execute one task end to end: gather source, get an answer or
-            edits, apply or review them, and write the session log."""
+            """Execute one task end to end through the shared inner loop."""
             nonlocal idx, agent, cfg, client
             cfg, client, agent = locals_ref["cfg"], locals_ref["client"], locals_ref["agent"]
             idx = locals_ref["idx"]
-            when = workspace.stamp()
-            reviewing = _wants_review(args, cfg)
-            wants_write = args.apply or reviewing
-            backup_dir = (workspace.new_backup_dir(root, when)
-                          if wants_write and cfg.backup else None)
-            print("\n--- looking things up ---", file=sys.stderr)
-            gathered = agent.gather(task)
-            print("--- answering ---\n", file=sys.stderr)
-            reply = agent.answer(task, gathered)
-            # With the reviewer, the run stays a dry run: the page writes.
-            results, reply = agent.apply(reply, dry_run=reviewing or not args.apply,
-                                         task=task, gathered=gathered,
-                                         backup_dir=None if reviewing else backup_dir)
-            if reviewing:
-                if not parse_edits(reply):
-                    print("\n  The model proposed no edits.", file=sys.stderr)
-                results = _review(root, results, task, cfg, backup_dir, when)
-                applied = any(r.ok and "applied" in r.message for r in results)
-            else:
-                _report(results, dry_run=not args.apply)
-                applied = args.apply
-            if applied:
-                for r in results:
-                    if r.ok:
-                        idx = index_mod.reindex_file(idx, r.file, cfg)
-                agent.index = idx
-                locals_ref["idx"] = idx
-            if cfg.log_sessions:
-                p = workspace.write_session(root, task, getattr(agent, "steps_log", []),
-                                            reply, results, backup_dir, when)
-                print(f"[session: {p.relative_to(root)}]", file=sys.stderr)
+            tr = loop.run_task(root, cfg, client, agent, idx, task,
+                               apply=args.apply, review=_wants_review(args, cfg))
+            idx = tr.idx
+            agent.index = idx
+            locals_ref["idx"] = idx
 
         if args.cmd == "ask":
             run(args.task)
@@ -810,6 +926,9 @@ def main(argv=None) -> int:
             print(f"\n[{s['calls']} calls, {s['completion_tokens']} tokens out, "
                   f"{s['seconds']:.0f}s]", file=sys.stderr)
             return 0
+
+        if args.cmd == "auto":
+            return _cmd_auto(args, cfg, client, idx, root)
 
         # --- chat: interactive loop with the index kept warm between tasks ---
         def banner():
@@ -843,6 +962,10 @@ def main(argv=None) -> int:
 
     except LLMError as e:
         print(f"\nERROR: {e}", file=sys.stderr)
+        try:
+            workspace.log_event(_root(args), f"ERROR: {e}", "ERROR")
+        except Exception:
+            pass                       # no project root yet; nothing to log to
         return 1
 
 

@@ -215,13 +215,18 @@ pedacito config --init
 
 Writes a starter config to `~/.config/pedacito/config.toml` (Linux/macOS) or
 `%APPDATA%\pedacito\config.toml` (Windows) — `pedacito config` always prints the
-exact path it's using. Edit the two lines that matter:
+exact path it's using. Edit the lines that matter:
 
 ```toml
 [server]
 base_url = "http://localhost:1234/v1"   # or :11434/v1 for Ollama
 model = "qwen3.5-9b"            # exact id/name the server reports
+vram_gb = 8                     # GPU VRAM on the model server, in GB
 ```
+
+`vram_gb` is mandatory for local servers: pedacito reads the model's file
+size from the server and uses it plus VRAM to size the context window
+automatically. Hosted API configs do not need it.
 
 `[server]` is the current section name; `[lmstudio]` still works as an
 alias for older config files.
@@ -259,6 +264,42 @@ re-index.
 
 ---
 
+## Asking Pedacito how to use itself
+
+`pedacito how` is built-in help that answers in your own words, using this
+README, the [Quick Start](QUICKSTART.md), and Pedacito's source code as its
+references. It needs no project and builds no index — just a model
+connection:
+
+```bash
+pedacito how "how do I set up a config file?"
+pedacito how "what command indexes a project?"
+pedacito how "how do I undo an apply?"
+pedacito how                          # interactive help prompt
+```
+
+Answers are written for a first-time user and include exact commands (or a
+minimal TOML snippet) whenever the question is about doing something. The
+resolved config for the help session is included automatically, so you can
+ask "what should I run with my setup?" and get an answer that uses your real
+server, model, profile, and limits. Secrets such as `api_key` are never sent
+to the model.
+
+It uses your normal config, plus optional per-session overrides:
+
+```bash
+pedacito how --config ./deepseek.toml "how do I use profiles?"
+pedacito how --url http://localhost:11434/v1 \
+             --api-key ollama --model qwen3:8b --vram 8 \
+             "what does max_steps do?"
+```
+
+`--server` is an alias for `--url`, and `--vram-gb` for `--vram`. Unlike the
+coding commands, `how` does not require `vram_gb` — without it, help uses
+conservative built-in token budgets instead of sizing them to your GPU.
+
+---
+
 ## Running multiple models
 
 Define a profile per model instead of editing `model =` each time:
@@ -291,8 +332,10 @@ budgets, so each profile carries its own complete set of limits. Add
 `tier = "small" | "medium" | "large" | "hosted"` and pedacito fills in all
 ten budget knobs (`max_tokens_summary/step/answer/plan/build`,
 `flat_map_token_budget`, `max_gathered_chars`, `max_read_lines`,
-`max_spec_chars`, `max_new_files`) from a preset; any limit you write
-explicitly wins over the preset:
+`max_spec_chars`, `max_new_files`) from a preset. On a local server those
+token budgets are floors: auto-fit uses the larger of the tier value and a
+VRAM-derived calculation when the server reports the model's file size (see
+"Token budgets"). A value you write explicitly overrides both:
 
 ```toml
 [profiles.ds]
@@ -587,7 +630,56 @@ tool uses:
 pedacito new my-app -t "a CLI todo manager with a sqlite backend" --apply
 pedacito new my-api --spec docs/spec.md --review      # sign off in the browser
 pedacito new my-app -t "..." --plan-only --apply      # stop after the skeleton
+pedacito new my-app --spec docs/spec.md --complex --apply   # auto-loop implementation
 ```
+
+For a large or complicated project, `--complex` swaps stage 3 (the build
+pass) for the autonomous outer loop: after planning and scaffolding it writes
+a resumable task checklist (`PLAN.md`, one task per source file) and hands
+implementation to `pedacito auto` — each file implemented in a fresh context
+window, with an optional `--verify` command feeding failures back for repair.
+
+```bash
+pedacito new my-app --spec docs/spec.md --complex --apply \
+    --verify "python -m pytest -q" --max-tasks 40
+```
+
+The `--verify`, `--repair`, `--max-tasks`, and `--keep-going` flags pass
+straight through to the auto loop and only apply with `--complex`. Unlike the
+default build pass, which runs one uninterruptible session, `--complex` leaves
+its progress in `PLAN.md` — stop it, edit the checklist, and re-run
+`pedacito auto . --apply` to resume exactly where it left off.
+
+When the loop finishes, `--complex` verifies the result before declaring
+success, and repairs failures. Verification is layered, cheapest first:
+
+1. **Import check** — the entry point must import cleanly. Failures are
+   repaired (this is the same pass the simple build runs).
+2. **Call/signature check** — a conservative static pass over the project's own
+   top-level functions/classes. Each file is implemented independently, so a
+   call can drift from its definition (`core.py` calls `Level()` while
+   `level.py` defines `Level.__init__(self, level_data)`). An import never runs
+   the call, so this catches it statically. Bare-name calls only, unambiguous
+   names only, `*args`/`**kwargs` skipped — a heuristic, not a type checker.
+3. **Runtime check** — because static checks never *execute* the program, the
+   project is then actually run. If you supplied `--verify CMD`, that command
+   runs; and by default a project with `main.py` is smoke-run
+   (`python main.py`). A process still running at `auto_smoke_timeout`
+   (default 20s) counts as **started successfully** — games, servers, and UIs
+   do not exit on their own. A crash before the timeout is a failure.
+
+Every failure at each layer is fed back to the model, which emits edits to fix
+it, and the check is re-run (up to `auto_verify_rounds`, default 2) *before* the
+run completes. A failure that survives repair is reported and makes the run
+exit non-zero. Two failure kinds are deliberately excluded from code repair:
+**missing packages** (reported, or installed with `--auto-install`) and
+**headless display errors** (`No available video device` and friends), which
+mean the machine cannot run a GUI, not that the code is wrong — those are
+reported as "could not verify in this environment".
+
+`--verify` is therefore optional. Pass it when you have a better functional
+check than the default (a test suite, a headless smoke command, a script); if
+you don't, the automatic import + static + smoke checks still run.
 
 Like everything else, it's a dry run by default: without `--apply` you get
 the plan and a preview of the skeleton, nothing on disk. `--plan-only`
@@ -603,6 +695,62 @@ Spec documents longer than `max_spec_chars` are truncated with a loud
 warning rather than silently dropped. A finished run leaves a session
 record under `.pedacito/sessions/` like any task, so you can see what was
 asked, planned, and written days later.
+
+## Autonomous mode
+
+`ask` and `chat` run *one* task end to end. `pedacito auto` wraps that in
+the **outer loop** (the "Ralph loop"): it breaks a goal into an ordered
+checklist, then implements each task one at a time — **each in a fresh
+context window** — until the list is empty. State lives in a plain markdown
+plan file on disk, not in any conversation, so a long autonomous run doesn't
+rot the way one ever-growing session does.
+
+```bash
+pedacito auto . -t "add retry logic to the sync client"     # plan only, nothing written
+pedacito auto . -t "..." --apply                            # plan, then implement every task
+pedacito auto . --apply --verify "pytest -q"                # verify each task, repair on failure
+pedacito auto . --apply --plan TODO.md                      # use an existing checklist instead
+```
+
+- **Plan file** — a markdown checklist (`PLAN.md` in the project root by
+  default, or `--plan FILE`). Each line is `- [ ] task`. You can edit it
+  before running, or mid-run: the loop just takes the first unchecked line
+  each pass. `--force` regenerates a plan over the existing one.
+- **Fresh context per task** — every task is run by a brand-new agent over
+  the same warm index, exactly like `ask`, so it inherits the identical edit
+  anchoring, repair rounds, backups, and session logs.
+- **Verification** — `--verify "pytest -q"` runs after each task. A failure
+  feeds the command's output back to the model, which edits to fix it, up to
+  `--repair` rounds (default 2). `--verify` is optional: after the checklist
+  finishes, `auto --apply` always exercises the project once more — running
+  your `--verify` if given, and by default smoke-running `main.py` (a process
+  still running at `auto_smoke_timeout` counts as started) — and repairs
+  failures before returning. Without any verify command a task counts as done
+  whenever its edits apply cleanly, so the final check is what keeps a run
+  from declaring success on broken code.
+- **Missing dependencies** — if `--verify` fails with `ModuleNotFoundError`
+  (or `ImportError: No module named ...`), there is nothing to fix in the
+  source, so it is *not* sent to the code-repair loop. It is reported as a
+  dependency problem, or installed and retried with `--auto-install`
+  (off by default: the module name comes from generated code).
+- **Guardrails** — `--max-tasks N` caps how many tasks one run attempts; by
+  default the loop stops on the first task that produces no applied edit or
+  still fails verification (`--keep-going` to flag it `[!]` and continue).
+- **Line guard** — a source file whose scaffold stub is longer than
+  `auto_split_lines` (default 120) is split into several implementation tasks,
+  one per group of top-level definitions, so no single reply has to emit a
+  whole oversized file and get cut off at the output token limit.
+
+Without `--apply` this is plan-only, like the rest of Pedacito: it writes the
+checklist and prints it, and nothing on disk changes. `pedacito restore` still
+undoes the whole run, and every task leaves a `.pedacito/sessions/` record.
+
+The config knobs `auto_plan_file`, `auto_verify`, `auto_max_tasks`,
+`auto_repair_rounds`, `auto_split_lines`, `auto_install_deps`, `auto_smoke`,
+`auto_smoke_timeout`, and `auto_verify_rounds` let you set these per project
+or per profile (see "Configuration reference"). A hosted profile can afford
+more tasks and more repair rounds than a 9B at local speed, so they ride with
+the profile like every other limit.
 
 ## Review page
 
@@ -699,7 +847,30 @@ project lives under that project's root:
     backups/<stamp>/     pre-write snapshots, mirroring the tree
     sessions/<stamp>.md  what was asked, looked up, and changed
     reviews/<stamp>.html saved copies of review pages
+    log.txt              the operational run log (see below)
 ```
+
+### The run log (`log.txt`)
+
+`log.txt` is the troubleshooting log: a flat, timestamped trace of commands,
+phase transitions, statuses, and errors — one line per event, with no model
+thinking or generated output (that stays in `sessions/`). For example:
+
+```
+2026-10-24 09:23:03.100  INFO   command: pdc new pkgame -t "..." --complex --apply
+2026-10-24 09:23:05.204  INFO   complex: 16 task(s) -> PLAN.md
+2026-10-24 09:23:05.205  INFO   auto loop: plan=PLAN.md verify=(none)
+2026-10-24 09:23:06.118  INFO   task: Implement game/player.py -- ...
+2026-10-24 09:24:01.001  WARN   answer reply truncated at the output limit
+2026-10-24 09:24:01.104  ERROR  no edit blocks parsed from the reply
+2026-10-24 09:24:01.150  ERROR  task produced no applied edits
+2026-10-24 09:25:12.900  INFO   auto loop finished: 3 done, 1 failed
+```
+
+Each run appends to it, so a whole `--complex` run reads top to bottom as one
+event trace — much easier to scan for where a failure happened than the
+per-task `sessions/` files (which hold the model's full reply and lookups
+when you need the detail behind a specific event).
 
 On first run in a project, Pedacito also creates a commented
 `.pedacitoignore` and adds its workspace entries — `.pedacito/`,
@@ -757,35 +928,65 @@ fills all ten limit fields (`max_tokens_summary/step/answer/plan/build`,
 `flat_map_token_budget`, `max_gathered_chars`, `max_read_lines`,
 `max_spec_chars`, `max_new_files`) from a preset tuned to that class of
 model — tight for a 9B on 8k local context, generous for DeepSeek-class
-APIs. Keys you write explicitly override the preset; with no tier and no
-profile you get the defaults in this table. See "Running multiple models".
+APIs. For local servers those token budgets are **floors**: when the server
+reports the model's file size, auto-fit uses the larger of the tier value
+and a VRAM-derived budget (see "Token budgets" below). Values you write
+explicitly override the preset and the calculated value. With no tier and no profile you get
+the defaults in this table. See "Running multiple models".
+
+Tier preset values, for reference:
+
+| Setting | small | medium | large | hosted |
+|---|---:|---:|---:|---:|
+| `max_tokens_summary` | 160 | 240 | 320 | 400 |
+| `max_tokens_step` | 500 | 1500 | 2500 | 7000 |
+| `max_tokens_answer` | 1500 | 8000 | 12000 | 40000 |
+| `max_tokens_plan` | 1200 | 5000 | 8000 | 8000 |
+| `max_tokens_build` | 4000 | 16000 | 24000 | 32000 |
+| `flat_map_token_budget` | 1500 | 6000 | 8000 | 12000 |
+| `max_gathered_chars` | 12000 | 48000 | 60000 | 100000 |
+| `max_read_lines` | 120 | 200 | 300 | 400 |
+| `max_spec_chars` | 20000 | 60000 | 120000 | 200000 |
+| `max_new_files` | 12 | 24 | 40 | 60 |
+| `max_steps` | 40 | 50 | 60 | 100 |
+| `repair_rounds` | 1 | 2 | 2 | 3 |
+| `context_tokens` | 8192 | 32768 | 65536 | 128000 |
+| `reserve_tokens` | 2048 | 4096 | 8192 | 16384 |
+
+The local token rows are floors: auto-fit uses the larger of the tier value
+and the VRAM-derived calculation at run time. `max_steps`, `max_read_lines`,
+`max_spec_chars`, `max_new_files`, and `repair_rounds` are not recalculated;
+`context_tokens` and `reserve_tokens` are still detected/clamped to the real
+window. The hosted column is never capped by local hardware.
 
 | Setting | Default | |
 |---|---|---|
 | `base_url` | `http://localhost:1234/v1` | Server address. |
 | `model` | *(none)* | Exact id/name as the server reports it. |
+| `vram_gb` | *(mandatory)* | Total GPU VRAM on the machine running the model, in whole gigabytes. Used with the model file size (queried from the server at every run) to estimate how much context fits, keeping 0.5 GB free for the system. System RAM is not counted. Not needed for hosted APIs. |
 | `timeout` | 600.0 | Seconds per request; raise for very large files. |
 | `load_wait_seconds` | 240 | How long to wait for a model to load. |
 | `max_consecutive_failures` | 3 | Aborts an indexing batch after this many failures in a row. |
 | `json_mode` | `"schema"` | `"schema"` for local llama.cpp/LM Studio, `"object"` for hosted OpenAI-compatible APIs (DeepSeek, OpenAI, …). Auto-switches to `"object"` when the base_url is remote or the model name contains "deepseek". Accepted spellings: `object`/`json_object`/`json`, and `schema`/`json_schema`. |
 | `temperature` | 0.2 | Higher makes tool selection noticeably worse. |
-| `max_tokens_step` | 700 (tier presets: small 500, medium 1500, large 1000, hosted 7000) | Budget for one tool call; raise for models that narrate at length. Thinking models need more than this looks — reasoning tokens count against it, and a budget spent entirely on thinking returns no action at all (pedacito reports that case explicitly now). The hosted preset stays under the provider's real per-message output ceiling (~8k tokens for deepseek-chat); bigger outputs are chunked across steps via `max_write_lines`, not crammed into one reply. |
-| `max_tokens_answer` | 3000 (hosted tier: 40000) | Budget for the final answer/edit reply. |
+| `max_tokens_summary` | 220 (tiers: 160 / 240 / 320 / 400) | Budget for one index summary. |
+| `max_tokens_step` | 700 (tiers: 500 / 1500 / 2500 / 7000) | Budget for one tool call. Thinking models need more than this looks — reasoning tokens count against it, and a budget spent entirely on thinking returns no action at all. On local servers auto-fit scales this with the hardware-sized window. The hosted preset stays under the provider's real per-message output ceiling (~8k tokens for deepseek-chat); bigger outputs are chunked across steps via `max_write_lines`, not crammed into one reply. |
+| `max_tokens_answer` | 3000 (tiers: 1500 / 8000 / 12000 / 40000) | Budget for the final answer/edit reply. Auto-fit raises this on local servers when the VRAM calculation has room (up to 24k, or the provider cap for hosted APIs); an explicit value overrides it. |
 | `max_steps` | 30 (tier presets: 40–100) | Lookups allowed before the model must answer. Deliberately generous: hitting this mid-gather is what produced "the model answered without proposing any edits" failures. |
-| `max_gathered_chars` | 24000 | Ceiling on accumulated source per task. |
+| `max_gathered_chars` | 24000 (tiers: 12000 / 48000 / 60000 / 100000) | Ceiling on accumulated source per task. Auto-fit may grow this on local servers, up to 200k characters. |
 | `max_write_lines` | 120 | Lines allowed in ONE write step (a `write` tool call or an edit block's REPLACE). Keeps every reply under the API's true per-message output limit; larger files are written in chunks across sequential steps, with the tool teaching the model the append protocol when it tries to dump a 791-line file in one message. Raise only if your provider emits longer messages. |
-| `context_tokens` | 8192 | Assumed server context window. Ignored when auto-detection succeeds (see "Token budgets" below); set it explicitly only to override the detected value. |
-| `reserve_tokens` | 2048 | Headroom held back from `context_tokens` for chat-template overhead. Auto-fit shrinks it first on tiny windows. |
-| `auto_fit` | True | Rewrite every budget to fit the server's real window at startup (see "Token budgets"). Set false only if you want raw values sent to the server unchanged. |
-| `auto_detect_context` | True | Probe LM Studio's native API / Ollama `/api/show` for the configured context length instead of trusting the declared number. |
+| `context_tokens` | 8192 (tiers: 8192 / 32768 / 65536 / 128000) | Assumed server context window. Ignored when auto-detection succeeds (see "Token budgets" below). The VRAM estimate caps it so the KV cache does not spill; the tier/default is only a fallback when the model size cannot be detected. Set it explicitly to override both. |
+| `reserve_tokens` | 2048 (tiers: 2048 / 4096 / 8192 / 16384) | Headroom held back from `context_tokens` for chat-template overhead. Auto-fit shrinks it first on tiny windows. |
+| `auto_fit` | True | Size every token budget from the VRAM-derived window at startup (see "Token budgets"). Tier/default values are floors; explicit values override both. Set false only if you want raw values sent to the server unchanged. |
+| `auto_detect_context` | True | Probe the server for the configured context length instead of trusting the declared number: LM Studio's native API, Lemonade's extended `/v1/models`, or Ollama `/api/show`. |
 | `request_max_tokens_cap` | 32768 | Hard ceiling on any `max_tokens` sent; auto-fit lowers it to the usable window so llama.cpp never 400s. |
 | `allow_write` | False | Let the gather loop write whole files via the `write` action (skips the edit path's backup/syntax-check/review — prefer search/replace blocks). |
 | `max_write_chars` | 200000 | Ceiling on one `write` call's contents. |
 | `max_new_files` | 24 | Cap on how many files a `pedacito new` plan may propose; excess is truncated and reported. |
 | `max_spec_chars` | 60000 | Spec documents longer than this are cut, with a warning. |
-| `max_tokens_plan` | 2000 (tier presets: small 1200, medium 4000, large 8000, hosted 8000) | Token budget for the planning call. Thinking models spend this on their `<think>` block before the file-tree JSON, so a too-small value returns no plan at all — raise it or set `disable_thinking`. |
-| `max_tokens_build` | 8000 (tier presets: small 4000, medium 16000, large 8000, hosted 32000) | Token budget for each per-file build pass. Thinking is disabled for these whole-file writes, but a model that ignores that hint (some reasoning quants) still spends this on its `<think>` block — raise it for those. |
-| `flat_map_token_budget` | 4000 | Above this, the map switches from a full listing to per-file cards. |
+| `max_tokens_plan` | 2000 (tiers: 1200 / 5000 / 8000 / 8000) | Token budget for the planning call. Thinking models spend this on their `<think>` block before the file-tree JSON, so a too-small value returns no plan at all — raise it or set `disable_thinking`. |
+| `max_tokens_build` | 8000 (tiers: 4000 / 16000 / 24000 / 32000) | Token budget for each per-file build pass. Thinking is disabled for these whole-file writes, but a model that ignores that hint (some reasoning quants) still spends this on its `<think>` block — raise it for those. Auto-fit scales this with the local window. |
+| `flat_map_token_budget` | 4000 (tiers: 1500 / 6000 / 8000 / 12000) | Above this, the map switches from a full listing to per-file cards. |
 | `summarise_methods` | False | On if your methods lack useful docstrings. |
 | `summarise_documented` | False | On if your existing docstrings are stale or wrong. |
 | `include_references` | True | Off indexes only Python/JS/TS/Ruby (code), not the other reference file types listed under "What gets indexed". |
@@ -810,22 +1011,62 @@ budgets and your server's real context window. Defaults were once sized for
 llama.cpp servers reject a request outright when prompt + `max_tokens`
 exceeds the window (a flat 400 on every step), and Ollama silently
 truncates oversized prompts instead — which is how local runs ended up
-"answering" a task they had never actually seen. Three layers now prevent
+"answering" a task they had never actually seen. Four layers now prevent
 that:
 
 **Auto-detection.** At startup pedacito asks the server its *configured*
-context length (LM Studio native API, Ollama `/api/show`) and uses that
-instead of `context_tokens` — unless you set `context_tokens` yourself,
+context length (LM Studio's native API, Lemonade's extended `/v1/models`,
+Ollama `/api/show`) and uses that instead of `context_tokens` — unless you
+set `context_tokens` yourself,
 which wins. Hosted APIs and offline runs keep the declared number.
 
-**Auto-fit (`auto_fit = true`, default).** Every budget is rewritten to fit
-the detected window: reply budgets are clamped so prompt + reply always
-fits inside it, `reserve_tokens` shrinks first on tiny windows, and the map
-and gathered-source ceilings split whatever space is left. You'll see one
-`[auto-fit] ...` line listing what changed. Explicit config values are only
-overridden when they physically cannot work. This is also what makes a
-`tier = "hosted"` profile safe on local hardware — DeepSeek-sized numbers
-get squeezed to the real window instead of 400ing.
+**VRAM-aware window.** The mandatory `vram_gb` setting describes the GPU
+running the model. At the start of every run pedacito asks the server for the
+configured model's file size (LM Studio's v1/v0 native API, Lemonade's
+`/v1/models`, or Ollama `/api/show`), subtracts the weights and 0.5 GB kept
+for the system, and derives how many context tokens fit in the remaining
+VRAM as a KV cache. System RAM is deliberately not counted: spilling there
+is slow and was producing context plans that did not actually fit on the
+GPU. Pedacito caps its own planning window at that estimate, but it does not
+change the context length the server loads the model with. If the server
+reports a larger configured window, lower it in LM Studio's "Context length"
+or Ollama's `num_ctx`; the `[auto-fit]` line prints a warning when it sees
+this. A server that does not report a size keeps the tier/server window.
+
+**Auto-fit (`auto_fit = true`, default).** On a local server with a known
+model size, the VRAM estimate first caps the context window (planning for a
+larger window than the GPU can hold spills the KV cache and collapses
+tokens/sec). Token budgets then take the LARGER of the tier/default value
+and the VRAM-derived calculation, provided that whole set still fits the
+capped window; if it does not, the calculated allocation is used so gathered
+source is not squeezed to nothing. Explicit values you write override both.
+The calculation targets are:
+
+| Budget | Target | Cap |
+|---|---|---|
+| `max_tokens_step` | 1/8 of the usable window | 4,096 |
+| `max_tokens_summary` | 1/4 of the step budget | 400 |
+| `max_tokens_answer` | 35% of the usable window | 24,000 |
+| `max_tokens_build` | 60% of the usable window | 32,000 / provider cap |
+| `max_tokens_plan` | 1/6 of the usable window | 8,000 |
+| `flat_map_token_budget` | 1/3 of the room left after the answer budget | 12,000 |
+| `max_gathered_chars` | the rest of that room, at 4 chars/token | 200,000 |
+
+Reply budgets always leave prompt room; the answer target is subtracted from
+the usable window before the map/gathered budgets are split, so prompt +
+reply fits with half of `reserve_tokens` still free. The server's own context
+window is always the hard upper bound. Explicit `max_tokens_*` and
+`context_tokens` values override the calculation and the tier/default, and
+they also override an **auto-detected** `max_output_tokens` ceiling (that
+value is only a heuristic for tier/default budgets). A `max_output_tokens`
+you set yourself is still a deliberate hard cap. `reserve_tokens` shrinks
+first on tiny windows. Thinking tokens count against
+`max_tokens_step`/`max_tokens_answer` exactly like any other generated token. You'll see one
+`[auto-fit] ...` line listing what changed. No `max_tokens_*` setting is
+required in your config. This is also what makes an oversized
+local profile (say, a copied hosted-style budget table) safe: its numbers
+get squeezed to the real window instead of 400ing. Hosted APIs are exempt:
+their tier budgets are never capped by local hardware.
 
 **Hosted APIs are exempt.** When pedacito recognises a hosted API (an
 explicit `tier = "hosted"`, `json_mode = "object"`, or any non-localhost

@@ -110,20 +110,24 @@ An interactive wizard: it probes for a running LM Studio or Ollama server,
 lists the models it finds, asks which to use (Enter accepts the
 auto-detected one), optionally takes a hosted API key (DeepSeek and
 friends), and writes a minimal config to `~/.config/pedacito/config.toml`
-(Linux/macOS) or `%APPDATA%\pedacito\config.toml` (Windows). Only two
-settings are ever mandatory — `base_url` and `model` — and the wizard fills
-both from what it discovers. Prefer doing it by hand? `pedacito config
---init` writes the same two-line starter; `pedacito config --reference`
-shows every knob with explanations.
+(Linux/macOS) or `%APPDATA%\pedacito\config.toml` (Windows). Three settings
+are mandatory — `base_url`, `model`, and the server machine's GPU memory
+(`vram_gb`) — and the wizard fills them in for you. Prefer doing it by hand?
+`pedacito config --init` writes the same starter; `pedacito config
+--reference` shows every knob with explanations. Hosted APIs
+(DeepSeek/OpenAI) do not need the VRAM value.
 
 Whatever path you chose, token budgets need no attention: pedacito asks
-your server its real context window at startup and fits every limit to it
-automatically (see "Token budgets" in the README). A DeepSeek-style hosted
-profile pointed at an 8k local model is now safe — the numbers get squeezed
-to fit instead of the server rejecting every request. If you still want per-
-model profiles, add `tier = "small"|"medium"|"large"|"hosted"` to a profile
-and all ten budget knobs come from that preset; keys you write explicitly
-still win.
+your server its real context window and the model's file size at startup,
+then fits every limit to the VRAM actually available (see "Token budgets"
+in the README). A DeepSeek-style hosted profile pointed at an 8k local model
+is now safe — the numbers get squeezed to fit instead of the server
+rejecting every request. If you still want per-model profiles, add
+`tier = "small"|"medium"|"large"|"hosted"` to a profile and all ten budget
+knobs come from that preset. On a local server VRAM caps the context window
+so the KV cache does not spill; the tier token values are used when they fit
+inside it, otherwise auto-fit uses the VRAM-derived allocation. A value you
+write explicitly overrides both.
 
 Then:
 
@@ -131,16 +135,17 @@ Then:
 [server]
 base_url = "http://localhost:1234/v1"   # or :11434/v1 for Ollama
 model = "qwen3.5-9b"            # exact id/name the server reports
+vram_gb = 8                     # GPU VRAM on the server machine, in GB
 ```
 
-Whatever you do by hand, the file only ever needs those two lines. The old
+Whatever you do by hand, the file only ever needs those three lines. The old
 skeleton with four fully-spelled-out profile blocks is still available via
 `pedacito config --reference`. If you run several models and want to switch
 with `--profile NAME`, each profile can carry a one-word preset —
 `tier = "small"|"medium"|"large"|"hosted"` — instead of ten budget knobs;
-keys you write explicitly still win. And remember budgets self-fit to the
-server's real window at startup, so a wrong tier costs efficiency, not
-correctness.
+values you write explicitly still win. And remember budgets self-fit to the
+server's real window and the GPU's VRAM at startup, so a wrong tier costs
+efficiency, not correctness.
 
 Next, verify:
 
@@ -153,6 +158,30 @@ defaults → the file above → a `.pedacito.toml` in a specific project (for
 per-project overrides) → `--config FILE` → command-line flags. Run
 `pedacito config` with no flags any time to see every resolved value and which
 layer set it.
+
+---
+
+## Stuck? Ask Pedacito itself
+
+```bash
+pedacito how "how do I set up a config file?"
+pedacito how "what command do I run to index a project?"
+```
+
+`pedacito how` is smart help: it answers from this guide, the README, and
+Pedacito's source code, and gives you the exact command or config snippet to
+use. Run it with no question for an interactive prompt. It does not need a
+project or an index, and it uses your current config automatically — so you
+can ask "what should I run with my setup?". To point it at a different
+server for one session:
+
+```bash
+pedacito how --url http://localhost:11434/v1 --model qwen3:8b --vram 8 \
+             "how do I make the index ignore a folder?"
+```
+
+`--api-key` is available too when the server needs one. `--server` and
+`--vram-gb` are aliases for `--url` and `--vram`.
 
 ---
 
@@ -407,7 +436,7 @@ base_url = "https://api.deepseek.com/v1"
 model = "deepseek-chat"
 json_mode = "object"               # hosted APIs reject json_schema
 # no tier line needed: ".../api.deepseek.com" + "deepseek-chat" infer "hosted"
-# -> 40000-token answers, 8000-token steps, 100-step gather budget.
+# -> 40000-token answers, 7000-token steps, 100-step gather budget.
 # Hosted profiles are never clamped to a local window: raise limits only if
 # your provider's real caps require it (explicit keys always win).
 
@@ -422,8 +451,13 @@ final answers, scaffold plan/build passes, gather ceiling, map budget.
 `tier = "small"|"medium"|"large"|"hosted"` sets all of them at once from a
 preset matched to the model class (or pedacito infers the tier from the
 model/server name); individual keys written in the profile win over the
-preset. That's what lets one config serve a 9B on laptop hardware and a
-DeepSeek API call without hand-tuning seven knobs per model.
+preset. On a local server these token values are fallbacks: when the server
+reports the model's file size, VRAM caps the context window and the tier
+token values are used only when they fit inside it; otherwise auto-fit uses
+the VRAM-derived allocation. Hosted tiers keep their generous values and are
+never hardware-capped.
+That's what lets one config serve a 9B on laptop hardware and a DeepSeek API
+call without hand-tuning seven knobs per model.
 
 ```bash
 pedacito ask anki -t "..." --profile big
@@ -510,6 +544,7 @@ costs a re-index. Or pass `--reindex` to `ask`/`chat`.
 | | |
 |---|---|
 | `pedacito config --check` | Is the server up, and does the model actually work? |
+| `pedacito how "..."` | Smart help: ask how to use Pedacito. No project needed. |
 | `pedacito files PROJ` | What would be indexed, and why. Free. |
 | `pedacito cost PROJ` | What indexing will cost. Free. |
 | `pedacito map PROJ` | Print the index. No model needed. |

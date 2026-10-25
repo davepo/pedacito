@@ -71,6 +71,32 @@ def stamp() -> str:
 
 
 # --------------------------------------------------------------------------
+# Run log: the operational trace (no model output)
+# --------------------------------------------------------------------------
+RUN_LOG_NAME = "log.txt"
+
+
+def run_log_path(root: Path) -> Path:
+    """Path of the operational run log for a project: `.pedacito/log.txt`."""
+    return state_dir(root, RUN_LOG_NAME)
+
+
+def log_event(root: Path, message: str, kind: str = "INFO") -> None:
+    """Append one timestamped line to the run log.
+
+    This is the troubleshooting log: commands, phase transitions, statuses,
+    and errors -- one line per event, with no model thinking or generated
+    output (that lives in `.pedacito/sessions/*.md`). Written at
+    `.pedacito/log.txt` and appended across runs, so a whole `--complex` run
+    reads top to bottom as a flat event trace."""
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+    p = run_log_path(root)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    with p.open("a", encoding="utf-8") as fh:
+        fh.write(f"{ts}  {kind:<6} {message}\n")
+
+
+# --------------------------------------------------------------------------
 # First-run scaffolding
 # --------------------------------------------------------------------------
 def ensure(root: Path, manage_gitignore: bool = True,
@@ -201,11 +227,16 @@ def restore(root: Path, snapshot: Path, dry_run: bool = False) -> list[str]:
 # Session logging
 # --------------------------------------------------------------------------
 def write_session(root: Path, task: str, steps: list[str], reply: str,
-                  results, backup: Path | None, when: str | None = None) -> Path:
+                  results, backup: Path | None, when: str | None = None,
+                  raw_reply: str | None = None) -> Path:
     """Write a readable Markdown record of one task (what was asked, every
     lookup made, the model's reply, and which edits landed) to
     .pedacito/sessions/<timestamp>.md. Useful when an edit turns out wrong
-    later and you need to see what the model was actually looking at."""
+    later and you need to see what the model was actually looking at.
+
+    `raw_reply`, when given, is the reply exactly as the model produced it
+    (before any truncation-trimming or continuation rounds rewrote it); it is
+    recorded verbatim so a cut-off answer can be diagnosed from the log alone."""
     d = state_dir(root, SESSION_DIR)
     d.mkdir(parents=True, exist_ok=True)
     when = when or stamp()
@@ -214,6 +245,9 @@ def write_session(root: Path, task: str, steps: list[str], reply: str,
         *(f"- {s}" for s in (steps or ["(none)"])),
         "", "## Response", "", reply.strip() or "(empty)", "", "## Edits", "",
     ]
+    if raw_reply is not None and raw_reply != reply:
+        lines += ["", "## Raw reply (as emitted, before parsing/trimming)", "",
+                  raw_reply.strip() or "(empty)"]
     if results:
         for r in results:
             lines.append(f"- {'applied' if r.ok else 'FAILED'} `{r.file}`: {r.message}")

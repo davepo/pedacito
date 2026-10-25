@@ -1,0 +1,610 @@
+"""The autonomous outer loop (`pedacito auto`): a Ralph loop over a task list.
+
+This is the piece that turns Pedacito from a single-shot tool into a
+full-featured coding agent. ``ask`` and ``chat`` run ONE task end to end
+(the *inner* loop: gather -> answer -> apply). ``auto`` wraps that in the
+*outer* loop the Ralph pattern describes:
+
+    pick the next unchecked task -> run it in a FRESH agent/context ->
+    verify (optional) -> mark it done in the plan file -> repeat.
+
+State lives in a plan file on disk (a markdown checklist), not in any
+conversation. Every task starts with a brand-new ``Agent`` and therefore a
+clean context window; what survives between iterations is only what the
+model wrote: the code, git history, and the checkbox it just ticked. That is
+the whole trick -- and the reason long autonomous runs do not rot the way a
+single ever-growing session does.
+
+Nothing here re-implements the inner loop: it calls the same ``gather`` /
+``answer`` / ``apply`` path as ``ask``, so an ``auto`` task gets the identical
+edit anchoring, repair rounds, backups, and session logging as a hand-typed
+one. The plan/task-list file is deliberately plain markdown so a human can
+edit it mid-run, and the loop just picks up the next unchecked line on the
+next pass.
+
+Usage
+-----
+    from . import loop
+
+    titles = loop.generate_tasks(spec, client, cfg)       # LLM task breakdown
+    loop.write_plan(path, goal, titles)                   # -> markdown checklist
+    code = loop.run_loop(root, cfg, client, idx, path,
+                         apply=True, verify="pytest -q")
+"""
+
+from __future__ import annotations
+
+import re
+import subprocess
+import sys
+from dataclasses import dataclass, replace
+from pathlib import Path
+
+from . import index as index_mod
+from . import review as review_mod
+from . import workspace
+from .edits import parse_edits
+from .llm import LLMError
+
+# A task line in the plan file: `- [ ] do the thing` / `- [x] done thing`.
+# `*` bullets are accepted too. The space in the box (or `x`) is captured as
+# group 2; group 3 is the task text.
+_TASK_LINE = re.compile(r"^(\s*[-*]\s*)\[([ xX])\]\s*(.*)$")
+
+PLAN_HEADER = "# Plan\n\n"
+
+
+def _is_noop(reply: str) -> bool:
+    """True when a task produced no edit blocks because there is nothing to
+    do -- the model read the file and reported it already complete. Only
+    consulted when NO edit applied, so an accidental match cannot mask a real
+    failure that did produce blocks; a genuinely empty/errored reply has none
+    of this language and still counts as a failure."""
+    low = (reply or "").lower()
+    return any(p in low for p in (
+        "no changes", "no change", "nothing to", "nothing needs",
+        "already ", "is already", "no edit", "no code change",
+        "leave as", "as-is", "already exists", "already correct",
+    ))
+
+
+# --------------------------------------------------------------------------
+# The plan file: a markdown checklist that is the loop's external memory
+# --------------------------------------------------------------------------
+def read_plan(path: Path) -> list[str]:
+    """Return the plan file's lines (empty list if it does not exist)."""
+    if path.exists():
+        return path.read_text(encoding="utf-8").split("\n")
+    return []
+
+
+def next_task(lines: list[str]) -> tuple[int, str] | None:
+    """Return (line_index, task_text) of the first unchecked task, or None.
+
+    Order is the order of the file, which is also priority order: the plan is
+    written dependencies-first, so "highest priority" is simply "first line".
+    """
+    for i, ln in enumerate(lines):
+        m = _TASK_LINE.match(ln)
+        if m and m.group(2).strip() == "":
+            return i, m.group(3).strip()
+    return None
+
+
+def _set_box(path: Path, task: str, box: str) -> bool:
+    """Set the checkbox of the first unchecked task matching `task` to `box`
+    ("x" = done, "!" = failed). Matching by text rather than line index means
+    a plan file the model edited mid-run still resolves. Returns False if the
+    task could not be found."""
+    lines = read_plan(path)
+    for i, ln in enumerate(lines):
+        m = _TASK_LINE.match(ln)
+        if m and m.group(2).strip() == "" and m.group(3).strip() == task:
+            lines[i] = _TASK_LINE.sub(
+                lambda mm: f"{mm.group(1)}[{box}] {mm.group(3)}", ln, count=1)
+            path.write_text("\n".join(lines), encoding="utf-8")
+            return True
+    return False
+
+
+def mark_done(path: Path, task: str) -> bool:
+    """Tick the first unchecked task whose text matches `task` as done."""
+    return _set_box(path, task, "x")
+
+
+def mark_failed(path: Path, task: str) -> bool:
+    """Flag the first unchecked task matching `task` as failed (`[!]`).
+
+    A failed box is neither unchecked (so the loop never re-picks it and
+    spins) nor done (so a human can see what to revisit)."""
+    return _set_box(path, task, "!")
+
+
+def write_plan(path: Path, goal: str, titles: list[str]) -> None:
+    """Write a fresh plan file: a goal line plus one unchecked task per title."""
+    body = [PLAN_HEADER.rstrip()]
+    if goal:
+        body += ["", f"Goal: {goal}"]
+    body += ["", *(f"- [ ] {t}" for t in titles)]
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("\n".join(body) + "\n", encoding="utf-8")
+
+
+# --------------------------------------------------------------------------
+# Planning: turn a goal into an ordered task list (one LLM call)
+# --------------------------------------------------------------------------
+TASK_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "goal": {"type": "string", "maxLength": 400},
+        "tasks": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "title": {"type": "string", "maxLength": 300},
+                    "acceptance": {"type": "string", "maxLength": 300},
+                },
+                "required": ["title"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    "required": ["tasks"],
+    "additionalProperties": False,
+}
+
+PLAN_SYSTEM = """\
+You break a software goal into a small, ordered list of single-focus
+implementation tasks for an autonomous coding loop. The loop will implement
+them one at a time, each in a fresh context window that sees only the goal,
+the current task, and whatever source it looks up.
+
+Rules:
+- Order matters: foundations and dependencies first, integration last.
+- Each task must be small enough to finish in one focused session and to
+  verify by running a command (tests, a linter, an import, a script).
+- Each title is a clear, imperative instruction ("Implement the markdown
+  parser"), not a wish ("there should be a parser").
+- Prefer 3-8 tasks for a small feature; never enumerate many tiny stubs.
+- Do not include meta-tasks (planning, documentation-only chores, git work).
+- If the goal is a BUG or a broken program (a traceback, a wrong result), do
+  not return an empty list: produce concrete repair steps -- reproduce the
+  failure, locate the cause, fix it, then verify. "Fix the bug" is a valid
+  task title when that is genuinely all there is to do.
+- NEVER return zero tasks. Every goal has at least one concrete step."""
+
+
+def _titles_from(raw) -> list[str]:
+    """Pull task titles out of a planning reply, tolerating a bare list or a
+    list of plain strings as well as the schema's [{title: ...}] shape."""
+    if isinstance(raw, dict):
+        entries = raw.get("tasks") or []
+    elif isinstance(raw, list):
+        entries = raw
+    else:
+        return []
+    titles = []
+    for entry in entries:
+        if isinstance(entry, dict):
+            title = str(entry.get("title", "")).strip()
+            if title:
+                titles.append(title)
+        elif isinstance(entry, str) and entry.strip():
+            titles.append(entry.strip())
+    return titles
+
+
+def generate_tasks(spec_text: str, client, cfg) -> list[str]:
+    """Ask the model to break `spec_text` into an ordered task list.
+
+    Retries once with an explicit "you returned zero tasks" nudge when the
+    first reply comes back empty (a model handed a bug-fix goal sometimes
+    reads it as "nothing to build"), and finally falls back to one task built
+    from the goal itself rather than aborting the whole run."""
+    budget = getattr(cfg, "max_spec_chars", 60_000)
+    body = spec_text.strip()[:budget]
+    max_tokens = getattr(cfg, "max_tokens_plan", 2000)
+    base_user = (f"GOAL\n\n{body}\n\n"
+                 "Break this into an ordered task list. Each task title must be "
+                 "a single imperative sentence a coding agent can implement and "
+                 "verify in isolation.")
+    raw = client.chat_json(
+        [{"role": "system", "content": PLAN_SYSTEM},
+         {"role": "user", "content": base_user}],
+        TASK_SCHEMA, max_tokens=max_tokens, disable_thinking=True)
+    titles = _titles_from(raw)
+    if not titles:
+        nudge = (base_user + "\n\nYou returned ZERO tasks. Every goal has at "
+                 "least one concrete step. For a bug, list the steps to "
+                 "reproduce, locate, fix, and verify it. Return the tasks now.")
+        raw = client.chat_json(
+            [{"role": "system", "content": PLAN_SYSTEM},
+             {"role": "user", "content": nudge}],
+            TASK_SCHEMA, max_tokens=max_tokens, disable_thinking=True)
+        titles = _titles_from(raw)
+    if not titles:
+        first = next((ln.strip() for ln in body.splitlines() if ln.strip()), "")
+        return [f"Address: {first[:200] or 'the requested change'}"]
+    return titles
+
+
+# --------------------------------------------------------------------------
+# Verification: the feedback loop the outer loop depends on
+# --------------------------------------------------------------------------
+def run_verify(root: Path, command: str, timeout: int = 600) -> tuple[bool, str]:
+    """Run `command` (a shell string) in `root`. Returns (passed, output).
+
+    A Ralph loop without a feedback signal is a chaos engine -- it keeps
+    churning out code no one checked. This is the signal: pass/fail plus the
+    command's output, fed back to the model for repair on failure."""
+    try:
+        proc = subprocess.run(
+            command, shell=True, cwd=str(root),
+            capture_output=True, text=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        return False, f"(verification timed out after {timeout}s)"
+    except Exception as e:                       # pragma: no cover - env specific
+        return False, f"(could not run verification: {e})"
+    out = ((proc.stdout or "") + (proc.stderr or "")).strip()
+    return proc.returncode == 0, out
+
+
+# --------------------------------------------------------------------------
+# Missing third-party dependencies
+# --------------------------------------------------------------------------
+_MISSING_MODULE_RE = re.compile(
+    r"(?:ModuleNotFoundError|ImportError):\s*No module named\s+['\"]([^'\"]+)['\"]")
+
+# Common import-name -> pip-distribution-name mismatches.
+_PIP_NAMES = {
+    "pil": "Pillow", "yaml": "PyYAML", "cv2": "opencv-python",
+    "sklearn": "scikit-learn", "bs4": "beautifulsoup4",
+    "dateutil": "python-dateutil", "dotenv": "python-dotenv",
+    "pkg_resources": "setuptools", "opengl": "PyOpenGL",
+}
+
+
+def missing_modules(output: str) -> list[str]:
+    """Top-level import names from ModuleNotFoundError/ImportError messages.
+
+    A failing verify often means a third-party dependency is absent rather
+    than the code being wrong; editing source cannot add one, so callers use
+    this to route the failure to dependency handling instead of the repair
+    loop. Returns the top-level module (``foo`` for ``foo.bar``)."""
+    out: list[str] = []
+    for m in _MISSING_MODULE_RE.finditer(output or ""):
+        name = m.group(1).split(".")[0].strip()
+        if name and name not in out:
+            out.append(name)
+    return out
+
+
+def pip_name(module: str) -> str:
+    """The pip distribution for a module import name (the same name unless it
+    is one of the common mismatches, e.g. ``PIL`` -> ``Pillow``)."""
+    return _PIP_NAMES.get(module.lower(), module)
+
+
+def install_modules(packages: list[str], root: Path) -> tuple[bool, str]:
+    """pip-install the distributions for `packages` into THIS interpreter's
+    environment, returning (ok, output).
+
+    Only called when the user opted in (``--auto-install``): the module names
+    come from model-generated code, so installing them is never automatic."""
+    dists = sorted({pip_name(p) for p in packages
+                    if re.fullmatch(r"[A-Za-z0-9_.-]+", p or "")})
+    if not dists:
+        return False, "no valid package names to install"
+    cmd = [sys.executable, "-m", "pip", "install", "--quiet", *dists]
+    try:
+        proc = subprocess.run(cmd, cwd=str(root), capture_output=True,
+                              text=True, timeout=600)
+    except Exception as e:                       # pragma: no cover - env specific
+        return False, f"could not run pip: {e}"
+    out = ((proc.stdout or "") + (proc.stderr or "")).strip()
+    return proc.returncode == 0, out
+
+
+# --------------------------------------------------------------------------
+# One task, end to end (the shared inner loop)
+# --------------------------------------------------------------------------
+@dataclass
+class TaskResult:
+    """What one task run produced: the edit results, the reply, whether any
+    writes landed, the files re-indexed, and the (possibly refreshed) index."""
+    results: list
+    reply: str
+    applied: bool
+    changed: list[str]
+    idx: "index_mod.Index"
+    session: Path | None = None
+
+
+def _report(results, dry_run: bool):
+    """Print each edit Result to stderr, with its unified diff in dry-run mode."""
+    if not results:
+        print("\n[no edit blocks in the reply]", file=sys.stderr)
+        return
+    print("", file=sys.stderr)
+    for r in results:
+        mark = "ok " if r.ok else "FAIL"
+        print(f"[{mark}] {r.file}: {r.message}", file=sys.stderr)
+        if r.ok and dry_run and r.diff:
+            print(r.diff)
+
+
+def _review(root: Path, results, task: str, cfg, backup_dir, stamp: str) -> list:
+    """Serve the side-by-side review page and return the results as they
+    finally stand (the page writes on Apply, so this re-stamps each result)."""
+    diffs = review_mod.diffs_from_results(results, root)
+    if not diffs:
+        print("\n  No review page: no edit block applied cleanly.", file=sys.stderr)
+        _report(results, dry_run=True)
+        return results
+    nonce = review_mod.new_nonce()
+    page = review_mod.build_page(diffs, task, cfg.model, cfg.active_profile,
+                                 nonce, interactive=True, stamp=stamp)
+    saved = review_mod.save(root, page, stamp)
+
+    def writer():
+        return review_mod.write_files(root, diffs, backup_dir)
+
+    print(f"  review page: {saved}", file=sys.stderr)
+    outcome, detail = review_mod.run(
+        page, nonce, writer, port=cfg.review_port,
+        open_browser=cfg.open_browser, timeout=cfg.review_timeout,
+        on_url=lambda u: print(f"  waiting for sign-off at {u}", file=sys.stderr))
+
+    if outcome == "applied":
+        print(f"  {detail}", file=sys.stderr)
+        return [replace(r, message="applied via review") if r.ok else r
+                for r in results]
+    print(f"  {detail}", file=sys.stderr)
+    return [replace(r, message=f"not written ({outcome})") if r.ok else r
+            for r in results]
+
+
+def run_task(root: Path, cfg, client, agent, idx, task: str, *,
+             apply: bool = True, review: bool = False,
+             answer_system: str | None = None) -> TaskResult:
+    """Run ONE task through the inner loop: gather source, answer (or edit),
+    apply or review, re-index the touched files, and write a session log.
+
+    `agent` and `idx` are passed in (not created here) so the caller controls
+    freshness -- the autonomous loop hands each task a brand-new Agent over
+    the same warm index, while `ask`/`chat` reuse one. `answer_system`, when
+    given, replaces the default edit brief (used to implement scaffold stubs
+    rather than edit existing code). Returns a TaskResult."""
+    when = workspace.stamp()
+    wants_write = apply or review
+    backup_dir = (workspace.new_backup_dir(root, when)
+                  if wants_write and cfg.backup else None)
+    workspace.log_event(root, f"task: {task}")
+    print("\n--- looking things up ---", file=sys.stderr)
+    gathered = agent.gather(task)
+    print("--- answering ---\n", file=sys.stderr)
+    raw_reply = agent.answer(task, gathered, system=answer_system)
+    truncated = bool(getattr(client, "stream_truncated", False))
+    if truncated:
+        workspace.log_event(root, "answer reply truncated at the output limit",
+                            "WARN")
+    results, reply = agent.apply(raw_reply, dry_run=review or not apply,
+                                 task=task, gathered=gathered,
+                                 backup_dir=None if review else backup_dir)
+    if not results:
+        workspace.log_event(root, "no edit blocks parsed from the reply", "ERROR")
+    else:
+        for r in results:
+            workspace.log_event(
+                root, f"{'applied' if r.ok else 'FAILED'} {r.file}: {r.message}",
+                "ERROR" if not r.ok else "INFO")
+    applied = False
+    if review:
+        if not parse_edits(reply):
+            print("\n  The model proposed no edits.", file=sys.stderr)
+        results = _review(root, results, task, cfg, backup_dir, when)
+        applied = any(r.ok and "applied" in r.message for r in results)
+    else:
+        _report(results, dry_run=not apply)
+        applied = apply
+
+    changed: list[str] = []
+    if applied:
+        for r in results:
+            if not r.ok:
+                continue
+            try:
+                idx = index_mod.reindex_file(idx, r.file, cfg)
+                changed.append(r.file)
+            except Exception:
+                pass               # a deleted/moved file re-indexes on next refresh
+        agent.index = idx
+
+    session = None
+    if cfg.log_sessions:
+        session = workspace.write_session(root, task,
+                                          getattr(agent, "steps_log", []),
+                                          reply, results, backup_dir, when,
+                                          raw_reply=raw_reply if truncated else None)
+        print(f"[session: {session.relative_to(root)}]", file=sys.stderr)
+    return TaskResult(results, reply, applied, changed, idx, session)
+
+
+# --------------------------------------------------------------------------
+# The outer loop itself
+# --------------------------------------------------------------------------
+def run_loop(root: Path, cfg, client, idx, plan_path: Path, *,
+             apply: bool = True, verify: str = "", repair_rounds: int = 2,
+             max_tasks: int = 0, stop_on_fail: bool = True,
+             answer_system: str | None = None, auto_install: bool = False,
+             on_task=None) -> int:
+    """Run the Ralph loop until the plan is empty (or a cap/stop is hit).
+
+    Each iteration: read the plan, take the first unchecked task, run it in a
+    fresh ``Agent`` (fresh context), optionally verify, then tick the task off
+    and continue. Returns a process exit code (0 = no failed tasks).
+
+    - ``apply``         write edits (False = the loop would tick tasks it never
+                        wrote, so callers pass True; the flag exists for symmetry
+                        with run_task).
+    - ``verify``        shell command run after each task; failure triggers a
+                        repair round-trip (up to repair_rounds) before the task
+                        is given up on.
+    - ``max_tasks``     0 = no cap; N = stop after N attempted tasks.
+    - ``stop_on_fail``  True = halt on the first task that produces no applied
+                        edit or still fails verification (the safe default);
+                        False = log it and carry on to the next task.
+    - ``answer_system`` replacement answer brief (used when the tasks implement
+                        scaffold stubs rather than edit existing code).
+    - ``auto_install`` when a verification fails on a missing third-party
+                        module, pip-install it and retry (opt-in: the module
+                        name comes from generated code). When off, the failure
+                        is reported as a dependency problem and the code-repair
+                        loop is skipped, since editing source cannot add a dep.
+    """
+    from .agent import Agent
+
+    attempted = 0
+    done = 0
+    failed = 0
+    workspace.log_event(root, f"auto loop: plan={plan_path.name}"
+                              f" verify={verify or '(none)'}")
+
+    def tick(count: int) -> bool:
+        """Return False once max_tasks (if any) is reached."""
+        return max_tasks == 0 or count < max_tasks
+
+    while tick(attempted):
+        lines = read_plan(plan_path)
+        nxt = next_task(lines)
+        if nxt is None:
+            print("\nAll tasks complete.", file=sys.stderr)
+            workspace.log_event(root, "all tasks complete")
+            break
+        _, task = nxt
+        attempted += 1
+        print(f"\n=== task {attempted}: {task} ===", file=sys.stderr)
+
+        try:
+            tr = run_task(root, cfg, client, Agent(idx, client, cfg), idx,
+                          task, apply=apply, review=False,
+                          answer_system=answer_system)
+        except LLMError as e:
+            print(f"  task failed: {e}", file=sys.stderr)
+            workspace.log_event(root, f"task failed: {e}", "ERROR")
+            failed += 1
+            if stop_on_fail:
+                break
+            mark_failed(plan_path, task)
+            continue
+        idx = tr.idx
+
+        ok_edits = [r for r in tr.results if r.ok]
+        if not tr.applied or not ok_edits:
+            if _is_noop(tr.reply):
+                print("  [model reports the task is already complete; "
+                      "marking it done]", file=sys.stderr)
+                workspace.log_event(root, "task already complete (no-op)")
+                mark_done(plan_path, task)
+                done += 1
+                continue
+            print(f"  [task produced no applied edits -- {'stopping' if stop_on_fail else 'skipping'}]",
+                  file=sys.stderr)
+            workspace.log_event(root, "task produced no applied edits", "ERROR")
+            failed += 1
+            if stop_on_fail:
+                break
+            mark_failed(plan_path, task)
+            continue
+
+        # Verification: the loop's quality gate. On failure, hand the model
+        # the command's output and let it fix its own work -- the feedback
+        # loop that separates a Ralph loop from a file-generator.
+        passed = True
+        dep_blocked: list[str] = []
+        if verify:
+            passed, output = run_verify(root, verify)
+            rounds = repair_rounds
+            while not passed:
+                # A missing third-party package is NOT a code bug: editing
+                # source cannot add a dependency, so sending it to the repair
+                # loop just burns rounds. Handle it as a dependency problem --
+                # install it if the user opted in, otherwise report and stop.
+                missing = missing_modules(output)
+                if missing:
+                    dists = ", ".join(pip_name(m) for m in missing)
+                    if auto_install:
+                        print(f"  [verify needs missing dependencies: {dists}; "
+                              f"installing]", file=sys.stderr)
+                        workspace.log_event(
+                            root, f"verify missing deps: {dists}; installing",
+                            "WARN")
+                        ok, inst = install_modules(missing, root)
+                        workspace.log_event(
+                            root, f"pip install {'ok' if ok else 'FAILED'}: {dists}",
+                            "INFO" if ok else "ERROR")
+                        if ok:
+                            passed, output = run_verify(root, verify)
+                            continue          # a dependency is not a repair round
+                    else:
+                        print(f"  [verify cannot run: missing dependencies: "
+                              f"{dists}. Install with `pip install {dists}`, "
+                              f"or rerun with --auto-install.]", file=sys.stderr)
+                        workspace.log_event(
+                            root, f"verify blocked by missing deps: {dists}",
+                            "ERROR")
+                    dep_blocked = missing
+                    break
+                if rounds <= 0:
+                    break
+                print(f"  [verification failed; asking the model to fix it "
+                      f"({rounds} round(s) left)]", file=sys.stderr)
+                workspace.log_event(root, f"verify failed: $ {verify}", "ERROR")
+                fix_task = (
+                    f"Your last change failed this check:\n\n"
+                    f"$ {verify}\n{output[:6000]}\n\n"
+                    f"Fix the code so that command succeeds. Re-run it in your "
+                    f"head before answering, and only then emit search/replace "
+                    f"blocks for the files that need changing.")
+                try:
+                    tr2 = run_task(root, cfg, client, Agent(idx, client, cfg),
+                                   idx, fix_task, apply=apply, review=False,
+                                   answer_system=answer_system)
+                except LLMError as e:
+                    print(f"  repair failed: {e}", file=sys.stderr)
+                    workspace.log_event(root, f"repair failed: {e}", "ERROR")
+                    break
+                idx = tr2.idx
+                passed, output = run_verify(root, verify)
+                rounds -= 1
+
+        if not passed:
+            if dep_blocked:
+                dists = ", ".join(pip_name(m) for m in dep_blocked)
+                print(f"  [verification blocked by missing dependencies: "
+                      f"{dists}]", file=sys.stderr)
+            else:
+                print(f"  [verification still failing: $ {verify}]",
+                      file=sys.stderr)
+                workspace.log_event(root, f"verify still failing: $ {verify}",
+                                    "ERROR")
+            failed += 1
+            if stop_on_fail:
+                break
+            mark_failed(plan_path, task)
+            continue
+
+        mark_done(plan_path, task)
+        done += 1
+        workspace.log_event(root, f"task done ({done})")
+        if on_task is not None:
+            try:
+                on_task(task)
+            except Exception:
+                pass
+
+    print(f"\n[{done} task(s) done, {failed} failed]", file=sys.stderr)
+    workspace.log_event(root, f"auto loop finished: {done} done, {failed} failed",
+                        "ERROR" if failed else "INFO")
+    return 0 if failed == 0 else 1

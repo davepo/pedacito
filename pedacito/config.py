@@ -61,6 +61,15 @@ class Config:
     """All Pedacito settings, with their defaults. See `load()` for how a
     Config is actually assembled from files, profiles, and env vars."""
 
+    # --- Hardware (mandatory for local model servers) ------------------------
+    # Total GPU VRAM on the machine running the model, in whole gigabytes.
+    # Pedacito asks the server for the model's file size at the start of every
+    # run, then estimates how much context (KV cache) still fits in VRAM next
+    # to the weights, keeping 0.5 GB free for the system. 0 means "not
+    # configured"; load() rejects that for local servers. Hosted APIs never
+    # use this value.
+    vram_gb: int = 0
+
     # --- LM Studio connection -------------------------------------------------
     # Over Tailscale this is the tailnet IP or MagicDNS name of the box running
     # LM Studio, e.g. "http://desktop.tail1234.ts.net:1234/v1".
@@ -210,8 +219,10 @@ class Config:
     # cap one reply far below their advertised context window (deepseek-chat
     # and dashscope Qwen: ~8k tokens; asking for more just truncates the
     # reply mid-block). When set (>0) and the run targets a hosted API,
-    # auto_fit clamps max_tokens_answer/plan/build to this value so a huge
+    # auto_fit clamps tier/default reply budgets to this value so a huge
     # budget can never turn a clean first block into a doomed truncated one.
+    # Explicit max_tokens_* values win over an AUTO-DETECTED ceiling; a value
+    # you set here yourself remains a deliberate hard cap.
     # 0 keeps the historical behaviour (trust the declared budgets).
     max_output_tokens: int = 0
 
@@ -223,8 +234,9 @@ class Config:
     # The default is deliberately conservative (matches LM Studio's own stock
     # setting), but you rarely need to set it at all: when a local server
     # answers, pedacito probes its REAL configured context length via the
-    # native API and uses that instead of this number, and `auto_fit` then
-    # shrinks or grows every other budget to fit the window it found.
+    # native API and uses that instead of this number. It also queries the
+    # model's file size and estimates the window from `vram_gb`, then
+    # `auto_fit` sizes every other budget from the resulting window.
     context_tokens: int = 8192
     # Tokens held back from `context_tokens` for the reply itself. A gather
     # plan that fills the window to the last token leaves nothing to answer
@@ -238,7 +250,8 @@ class Config:
     # Set false only if you want to hand-tune every knob yourself.
     auto_fit: bool = True
     # Probe the server for its actual configured context length (LM Studio's
-    # native /api/v0/models reports it; Ollama's /api/show does too). On
+    # native API, Lemonade's extended /v1/models, and Ollama's /api/show all
+    # report it). On
     # success this overrides context_tokens unless YOU set context_tokens
     # explicitly in your config/env. Set false to trust your file verbatim.
     auto_detect_context: bool = True
@@ -262,6 +275,46 @@ class Config:
     # to the actual output; still sized generously for whole files.)
     max_tokens_plan: int = 2000
     max_tokens_build: int = 8000
+
+    # --- Autonomous loop (`pedacito auto`) ------------------------------------
+    # The Ralph-loop outer loop: a goal is broken into a checklist, then each
+    # task is implemented one at a time in a fresh context window, with the
+    # plan file as the only surviving state. These are the loop's knobs.
+    # Plan file name (relative to the project root) used when --plan is not
+    # given. The file is plain markdown so you can edit it mid-run.
+    auto_plan_file: str = "PLAN.md"
+    # Shell command run after every task; a failure feeds the command's output
+    # back to the model for repair. Empty = no verification, so tasks are
+    # accepted whenever they apply cleanly.
+    auto_verify: str = ""
+    # Cap on how many tasks one `auto` run attempts; 0 = no cap (run until the
+    # checklist is empty). A guardrail against an unbounded night of calls.
+    auto_max_tasks: int = 0
+    # Fix rounds per failing verification before a task is given up on.
+    auto_repair_rounds: int = 2
+    # Per-file line guard for `new --complex` / `auto`: a source file whose
+    # scaffold stub is longer than this many lines is split into several
+    # implementation tasks (one per group of top-level definitions) so no
+    # single reply has to emit a whole oversized file and get cut off at the
+    # output token limit. 0 disables splitting.
+    auto_split_lines: int = 120
+    # When a --verify command fails because a third-party module is missing,
+    # pip-install it into the running interpreter's environment and retry.
+    # Off by default: the module name comes from model-generated code, so
+    # installing it automatically is opt-in. With it off, the failure is
+    # reported as a missing dependency (not a code bug) and the repair loop
+    # is skipped.
+    auto_install_deps: bool = False
+    # Runtime verification at the end of a `--complex` build: besides the
+    # import and call/signature checks, actually run the program once. With no
+    # --verify given, a project with main.py is smoke-run (a process still
+    # running at the timeout counts as started); otherwise the entry module is
+    # imported. Failures are fed back to the model before the run completes.
+    auto_smoke: bool = True
+    auto_smoke_timeout: int = 20
+    # Repair rounds for a failing runtime verification (each round: feed the
+    # failure's output to the model, apply its edits, re-run the check).
+    auto_verify_rounds: int = 2
 
     # --- Reasoning models -----------------------------------------------------
     # Qwen3 and friends emit a <think> block by default. Pedacito strips it either
@@ -311,6 +364,9 @@ class Config:
     profiles: dict = None
     active_profile: str = ""
     active_tier: str = ""   # preset tier applied to the active profile, if any
+    # Size of the configured model's weights in bytes, queried from the
+    # server by auto_fit. Not a user setting.
+    model_size_bytes: int = 0
 
     def __post_init__(self):
         """Initialise the mutable bookkeeping dicts (dataclasses cannot use
@@ -320,6 +376,17 @@ class Config:
         if self.profiles is None:
             self.profiles = {}
 
+    # Friendly aliases. The canonical fields carry their unit in the name so
+    # a bare 16 can never be mistaken for megabytes; these let callers use the
+    # shorter spelling without needing to remember the suffix.
+    @property
+    def vram(self) -> int:
+        return self.vram_gb
+
+    @vram.setter
+    def vram(self, value: int) -> None:
+        self.vram_gb = int(value)
+
 
 # TOML tables are allowed but optional: [lmstudio] base_url = ... works, and so
 # does a flat base_url = ... at the top level.
@@ -327,13 +394,27 @@ class Config:
 # is kept as an accepted alias so existing config files keep working. Pedacito
 # talks to any server exposing an OpenAI-compatible /v1 surface (LM Studio,
 # Ollama, and others), so "server" describes it without implying one product.
-_SECTIONS = ("server", "lmstudio", "generation", "map", "indexing", "files",
-             "agent", "scaffold", "editing", "reasoning", "review", "workspace")
+_SECTIONS = ("server", "lmstudio", "hardware", "generation", "map", "indexing",
+             "files", "agent", "scaffold", "editing", "reasoning", "review",
+             "workspace")
 PROFILE_SECTION = "profiles"
 
 _FIELDS = {f.name: f for f in fields(Config)
            if f.name not in ("sources", "profiles", "active_profile",
-                             "_hosted_server")}
+                             "model_size_bytes", "_hosted_server")}
+
+# `vram = 16` is a natural spelling, so accept it as an alias for the
+# canonical (unit-bearing) field name. The value is always whole gigabytes;
+# the suffix exists to make that impossible to misread.
+_ALIASES = {
+    "vram": "vram_gb",
+    "vram_gb": "vram_gb",
+}
+
+
+def _canonical(name: str) -> str:
+    """Resolve a config key spelling to its canonical Config field name."""
+    return _ALIASES.get(name, name)
 
 # Accepted spellings for json_mode. DeepSeek's own docs put the literal
 # string "json_object" inside response_format, so users reasonably write it
@@ -370,23 +451,25 @@ def _flatten(data: dict, path: Path) -> tuple[dict, dict]:
         if not isinstance(body, dict):
             raise ConfigError(f"{path}: [profiles.{name}] must be a table")
         # `tier` is a preset selector consumed by _apply_preset, not a setting.
-        bad = [k for k in body if k not in _FIELDS and k != "tier"]
+        bad = [k for k in body
+               if _canonical(k) not in _FIELDS and k != "tier"]
         if bad:
             raise ConfigError(f"{path}: [profiles.{name}] unknown setting(s): "
                               f"{', '.join(bad)}")
-        profiles[name] = dict(body)
+        profiles[name] = {_canonical(k): v for k, v in body.items()}
     for key, value in data.items():
         if isinstance(value, dict):
             if key not in _SECTIONS:
                 unknown.append(f"[{key}]")
                 continue
             for k, v in value.items():
-                if k in _FIELDS:
-                    flat[k] = v
+                field = _canonical(k)
+                if field in _FIELDS:
+                    flat[field] = v
                 else:
                     unknown.append(f"{key}.{k}")
-        elif key in _FIELDS:
-            flat[key] = value
+        elif _canonical(key) in _FIELDS:
+            flat[_canonical(key)] = value
         else:
             unknown.append(key)
     if unknown:
@@ -408,6 +491,12 @@ def _coerce(name: str, value, path: Path | None = None):
         target = {"str": str, "float": float, "int": int, "bool": bool}.get(
             target, target)
     where = f"{path}: " if path else ""
+    if name == "vram_gb":
+        if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+            raise ConfigError(
+                f"{where}{name} must be a positive whole number of gigabytes, "
+                f"got {value!r}")
+        return value
     if name == "json_mode":
         # Accept every spelling of the two modes, including "json_object" --
         # the literal string DeepSeek's docs put in response_format. Users
@@ -466,11 +555,18 @@ def find_project_config(root: Path) -> Path | None:
 # Public API
 # --------------------------------------------------------------------------
 def load(root: Path | None = None, explicit: Path | None = None,
-         use_env: bool = True, profile: str | None = None) -> Config:
+         use_env: bool = True, profile: str | None = None,
+         require_hardware: bool = True, warn_budgets: bool = True) -> Config:
     """Build a Config by layering every source in precedence order: defaults,
     user config, project config, an explicit --config file, a selected
     profile, then PEDACITO_* environment variables. Each field records which
-    layer set it, in `cfg.sources`, for `pedacito config` to display."""
+    layer set it, in `cfg.sources`, for `pedacito config` to display.
+
+    `vram_gb` is mandatory for local servers: without it auto-fit cannot know
+    how much context fits beside the model. The `config` subcommand passes
+    require_hardware=False so it can still inspect (and --init/--setup can
+    repair) an incomplete file. Hosted API configs never need it -- there is
+    no local GPU to measure."""
     cfg = Config()
     for f in _FIELDS:
         cfg.sources[f] = "default"
@@ -535,10 +631,15 @@ def load(root: Path | None = None, explicit: Path | None = None,
                 + (hint + "\n" if hint else "") +
                 "Add one to your config:\n\n"
                 f"  [profiles.{profile}]\n  model = \"...\"")
+        explicit = set(profiles[profile])
         body, tier = _apply_preset(profile, profiles[profile], origin)
         for key, value in body.items():
             setattr(cfg, key, _coerce(key, value))
-            cfg.sources[key] = f"profile '{profile}' (via {origin})"
+            # Mark preset-derived values so auto_fit may replace them with a
+            # hardware-sized budget. A key the user spelled in the profile is
+            # an explicit limit and is never grown past.
+            how = "explicit" if key in explicit else "tier preset"
+            cfg.sources[key] = f"profile '{profile}' (via {origin}; {how})"
         cfg.active_profile = profile
         cfg.active_tier = tier
 
@@ -588,17 +689,18 @@ def load(root: Path | None = None, explicit: Path | None = None,
     # off far earlier -- dashscope Qwen's thinking variants exhaust ~8k
     # before emitting JSON ("cut off" / "failure to return json"). For those
     # models, when max_output_tokens was not set explicitly, default it to
-    # the conservative 8k they honour; auto_fit then clamps every reply
-    # budget to it (the continuation loop in agent.py recovers whatever
-    # blocks survive).
+    # the conservative 8k they honour; auto_fit then clamps tier/default
+    # reply budgets to it (the continuation loop in agent.py recovers
+    # whatever blocks survive). Explicit max_tokens_* values are left alone:
+    # the user's instruction outranks this heuristic.
     #
     # Deliberately NOT applied to plain deepseek-chat / generic remote hosts:
     # their documented message ceiling is far larger than 8k, the shipped
     # hosted preset budgets are already sized for them, and clamping here
     # would silently shrink answers for users who chose tier="hosted"
     # precisely to opt out of artificial limits. If a provider does truncate
-    # at N tokens, set `max_output_tokens = N` in the config -- it is honoured
-    # as a hard cap by auto_fit even when auto_fit is off.
+    # at N tokens, set `max_output_tokens = N` in the config -- an explicit
+    # value is honoured as a hard cap by auto_fit even when auto_fit is off.
     qwen_thinking = any(t in cfg.model.lower() for t in
                         ("qwq", "qwen3", "qwen-3", "thinking"))
     if (qwen_thinking or deepseek) and cfg.json_mode == "schema":
@@ -618,10 +720,27 @@ def load(root: Path | None = None, explicit: Path | None = None,
             f"auto-detected output ceiling for hosted thinking model "
             f"({cfg.model}); set max_output_tokens explicitly to override")
 
+    if require_hardware:
+        missing = missing_hardware(cfg)
+        if missing:
+            raise ConfigError(
+                "vram_gb is mandatory for local model servers: auto-fit uses "
+                "it (with the model's file size, queried from the server) to "
+                "size the context window.\n"
+                "Add it to your config, in whole gigabytes of VRAM on the "
+                "machine running the model:\n\n"
+                "  vram_gb = 16\n\n"
+                "Missing: " + ", ".join(missing) + "\n"
+                "Run `pedacito config --setup` to have it written for you. "
+                "Hosted APIs (DeepSeek/OpenAI) do not need it.")
+
     # Loud-but-not-fatal: budgets that cannot fit the declared context window
     # are how truncation errors reach the user, so surface them at load time.
-    for warning in budget_warnings(cfg):
-        print(f"[config warning] {warning}", file=sys.stderr)
+    # Help (`pedacito how`) opts out: it uses its own excerpt budget and can
+    # run before VRAM/auto-fit has resized the coding budgets.
+    if warn_budgets:
+        for warning in budget_warnings(cfg):
+            print(f"[config warning] {warning}", file=sys.stderr)
     return cfg
 
 
@@ -692,6 +811,74 @@ def is_hosted(cfg: "Config") -> bool:
     return host not in ("localhost", "127.0.0.1", "0.0.0.0", "::1", "")
 
 
+_GIB = 1024 ** 3
+# KV-cache estimation constant: at roughly this many tokens of context, the
+# cache is about the same size as the model's weights on disk. That is a good
+# fit for the common llama/gemma/qwen GGUF families (a 27B Q4 is ~16 GB at
+# 32k, an 8B Q4 ~4-5 GB), and it scales sensibly for larger models. It is an
+# estimate, not a tokenizer: enough to keep auto-fit from planning a context
+# the hardware cannot hold, conservative enough that being wrong is cheap.
+_KV_REFERENCE_TOKENS = 32768
+
+
+def missing_hardware(cfg: Config) -> list[str]:
+    """Names of mandatory hardware settings still unset for a LOCAL server.
+
+    Hosted APIs return an empty list: their context is a provider-side budget,
+    not local GPU memory, so there is nothing to estimate. A remote URL is
+    treated as hosted by `is_hosted` (that is the existing convention), so
+    only localhost-style servers require the value.
+    """
+    if is_hosted(cfg):
+        return []
+    return [name for name in ("vram_gb",)
+            if int(getattr(cfg, name, 0) or 0) <= 0]
+
+
+def hardware_context_tokens(vram_gb: int, model_size_bytes: int) -> int:
+    """Estimate how many context tokens fit in VRAM after loading a model of
+    `model_size_bytes`.
+
+    Only the model weights and the KV cache live in VRAM; system RAM is not
+    counted, because spilling into it is slow and is exactly what this
+    estimate must avoid. Half a gigabyte is kept for the driver/desktop, then
+    the rest is available for KV cache. The cache size per token is derived
+    from the file size (see _KV_REFERENCE_TOKENS), a proxy for parameter
+    count that needs no architecture metadata and is stable across
+    quantizations.
+
+    Returns the estimated token count. 0 or a negative free-memory result
+    means the model does not fit at all; callers treat that as "use the
+    fallback budgets", not as a hard failure.
+    """
+    if model_size_bytes <= 0:
+        return 0
+    vram = max(0, int(vram_gb)) * _GIB
+    free = vram - int(model_size_bytes) - (_GIB // 2)
+    if free <= 0:
+        return 0
+    kv_per_token = max(16 * 1024,
+                       int(model_size_bytes) // _KV_REFERENCE_TOKENS)
+    return int(free // kv_per_token)
+
+
+def _is_explicit_limit(source: str) -> bool:
+    """True when a budget came from an explicit user choice.
+
+    Tier presets, built-in defaults, and values auto-fit itself set earlier
+    are fallbacks: hardware-derived budgets may replace them. Anything the
+    user wrote in a config file/profile/env/CLI is a deliberate limit and is
+    only respected when it is SMALLER than the hardware target.
+    """
+    if not source or source == "default":
+        return False
+    if "preset" in source:
+        return False
+    if source.startswith("auto-fit") or source.startswith("auto-detected"):
+        return False
+    return True
+
+
 def auto_fit(cfg: Config, verbose: bool = True) -> list[str]:
     """Fit every token budget to the server's real context window.
 
@@ -712,10 +899,22 @@ def auto_fit(cfg: Config, verbose: bool = True) -> list[str]:
 
     When cfg.auto_detect_context is on and the user did not set
     context_tokens themselves, the live server is probed (LM Studio native
-    API / Ollama /api/show) and its REAL configured length is used. Probe
+    API, Lemonade /v1/models, Ollama /api/show) and its REAL configured
+    length is used. Probe
     failures are silent -- hosted APIs and offline runs keep the declared
-    number. Returns human-readable notes about what changed (empty = no
-    changes needed). Never raises.
+    number.
+
+    For local servers the mandatory `vram_gb` setting and the model file size
+    reported by the server feed a KV-cache estimate. When the server reports
+    its CONFIGURED context length (LM Studio, Lemonade, Ollama), that is
+    authoritative -- the estimate only warns when it is below it (the KV
+    cache will spill to system RAM). When the server does not report one, the
+    estimate caps the fallback window so weights plus KV cache keep fitting
+    in VRAM with 0.5 GB kept for the system. Tier/default token
+    budgets are used when the whole set fits that window; otherwise the
+    VRAM-derived allocation is used. Explicit user values override both.
+    Returns human-readable notes about what changed (empty = no changes
+    needed). Raises ConfigError if `vram_gb` is missing for a local server.
     """
     import sys as _sys
     notes: list[str] = []
@@ -724,15 +923,28 @@ def auto_fit(cfg: Config, verbose: bool = True) -> list[str]:
     # is off -- asking the server for more than it will ever emit only
     # guarantees a truncated reply. Clamp first; the window-fitting logic
     # below then sees budgets that already fit the provider's ceiling.
+    #
+    # Exception: an AUTO-DETECTED cap must not rewrite values the user wrote
+    # explicitly. The detection heuristic (for example "hosted Qwen thinking
+    # models emit ~8k tokens per message") is a guess; an explicit
+    # max_tokens_answer/build/plan/step is a deliberate instruction. Explicit
+    # values still remain bounded by the server's real context window and by
+    # a max_output_tokens the user set themselves.
     mot0 = int(getattr(cfg, "max_output_tokens", 0) or 0)
+    mot_explicit = _is_explicit_limit(
+        cfg.sources.get("max_output_tokens", "default"))
     if mot0 > 0:
         for key in ("max_tokens_answer", "max_tokens_build",
                     "max_tokens_plan", "max_tokens_step"):
             v = getattr(cfg, key)
-            if v > mot0:
-                setattr(cfg, key, mot0)
-                cfg.sources[key] = f"max_output_tokens ({mot0:,})"
-                notes.append(f"{key}: {v:,} -> {mot0:,}")
+            if v <= mot0:
+                continue
+            if _is_explicit_limit(cfg.sources.get(key, "default")) \
+                    and not mot_explicit:
+                continue
+            setattr(cfg, key, mot0)
+            cfg.sources[key] = f"max_output_tokens ({mot0:,})"
+            notes.append(f"{key}: {v:,} -> {mot0:,}")
 
     if not cfg.auto_fit:
         if mot0 > 0 and verbose and notes:
@@ -752,18 +964,127 @@ def auto_fit(cfg: Config, verbose: bool = True) -> list[str]:
 
     ctx = cfg.context_tokens
     origin = cfg.sources.get("context_tokens", "default")
-    if cfg.auto_detect_context and origin == "default" and not hosted:
+    if not hosted:
+        missing = missing_hardware(cfg)
+        if missing:
+            raise ConfigError(
+                "auto-fit needs vram_gb for local model servers; missing: "
+                + ", ".join(missing) + ".\n"
+                "Set it in whole gigabytes of VRAM on the machine running "
+                "the model, or run `pedacito config --setup`.")
+        info: dict = {}
+        # A pre-set size (a test harness, or a caller that probed earlier)
+        # saves a round trip and lets the estimate run without a live server.
+        preset_size = int(getattr(cfg, "model_size_bytes", 0) or 0)
+        need_probe = preset_size <= 0 or (
+            cfg.auto_detect_context and origin == "default")
+        if need_probe:
+            try:
+                from .llm import LMStudio
+                info = LMStudio(cfg).model_info() or {}
+            except Exception:
+                info = {}
         try:
-            from .llm import LMStudio
-            detected = LMStudio(cfg).detect_context()
-        except Exception:
-            detected = None
-        if detected and detected != ctx:
-            notes.append(f"context: server reports {detected:,} tokens "
-                         f"(config default was {ctx:,}); using it")
-            ctx = detected
-            cfg.context_tokens = ctx
-            cfg.sources["context_tokens"] = "auto-detected from server"
+            model_bytes = int(info.get("size_bytes") or 0)
+        except (TypeError, ValueError):
+            model_bytes = 0
+        if model_bytes <= 0:
+            model_bytes = preset_size
+        cfg.model_size_bytes = model_bytes
+        if model_bytes > 0:
+            cfg.sources.setdefault("model_size_bytes",
+                                   "auto-detected from server")
+        # Only the CONFIGURED/loaded length is safe to fit budgets to. The
+        # model's advertised maximum (max_context_length) says nothing about
+        # what the server was told to allocate; using it as the window is how
+        # a stock 8k LM Studio setup gets 100k-token requests and 400s.
+        detected = info.get("context_length")
+        hw_ctx = (hardware_context_tokens(cfg.vram_gb, model_bytes)
+                  if model_bytes > 0 else 0)
+        user_ctx = _is_explicit_limit(origin)
+        server_ctx = None
+        if detected and cfg.auto_detect_context and not user_ctx:
+            server_ctx = detected
+            if detected != ctx:
+                notes.append(f"context: server reports {detected:,} tokens "
+                             f"(config fallback was {ctx:,}); using it")
+                ctx = detected
+                cfg.context_tokens = ctx
+                cfg.sources["context_tokens"] = "auto-detected from server"
+
+        # VRAM-only estimate. System RAM is deliberately NOT counted: spilling
+        # KV cache there is slow, and counting it produced context plans that
+        # did not actually fit on the GPU. Keep 0.5 GB for the driver/desktop.
+        # The estimate CAPS the context window only when the server did NOT
+        # report its configured length: planning for the tier/default window
+        # when VRAM cannot hold its KV cache is exactly what spills and
+        # collapses tokens/sec. When the server DID report one (the common
+        # case -- LM Studio, Lemonade, and Ollama all answer), that value is
+        # authoritative and the estimate is kept as a speed advisory instead
+        # of a clamp: it is a heuristic with no knowledge of the model's KV
+        # architecture (GQA) or KV quantization, and is routinely off by
+        # 2-4x. A wrong clamp converted working 262k-token setups into 12k
+        # windows whose budgets no thinking model could emit JSON inside.
+        # The tier/default is only a fallback when the model size is unknown
+        # or the model does not fit at all.
+        if model_bytes > 0 and not user_ctx:
+            size_gb = model_bytes / _GIB
+            mem = f"{cfg.vram_gb} GB VRAM"
+            if hw_ctx <= 0:
+                notes.append(
+                    f"memory: model is {size_gb:.1f} GB and {mem} leaves no "
+                    f"room after the 0.5 GB system reserve; keeping the "
+                    f"fallback window ({ctx:,} tokens)")
+            else:
+                notes.append(
+                    f"memory: model {size_gb:.1f} GB on {mem} leaves about "
+                    f"{hw_ctx:,} context tokens (0.5 GB kept for the system)")
+                if server_ctx:
+                    # The server's CONFIGURED context length is a fact: it is
+                    # exactly what the server will accept. The VRAM estimate
+                    # is a guess and must never override it -- clamping to a
+                    # wrong estimate is what shrank a working 262k-token
+                    # setup to 12k and made every reply budget too small for
+                    # a thinking model to finish its JSON in. Keep the
+                    # estimate as a speed advisory instead: below the
+                    # configured length it means KV cache spills to system
+                    # RAM (slow, but requests still work); at or above it
+                    # the cache fits entirely.
+                    new_ctx = server_ctx
+                    if hw_ctx < server_ctx:
+                        notes.append(
+                            f"warning: server is configured for {server_ctx:,} "
+                            f"tokens but the VRAM estimate only fits about "
+                            f"{hw_ctx:,} -- the KV cache will spill to system "
+                            f"RAM and tokens/sec will drop; lower the server's "
+                            f"context length (LM Studio 'Context length' / "
+                            f"Ollama num_ctx) to restore speed")
+                    else:
+                        notes.append(
+                            f"context: keeping {ctx:,} (fits the VRAM estimate)")
+                else:
+                    new_ctx = hw_ctx
+                    if new_ctx < ctx:
+                        notes.append(
+                            f"context: VRAM estimate {new_ctx:,} < fallback "
+                            f"{ctx:,}; using {new_ctx:,} so the KV cache stays in "
+                            f"VRAM")
+                    elif new_ctx > ctx:
+                        notes.append(
+                            f"context: VRAM estimate {new_ctx:,} > fallback "
+                            f"{ctx:,}; using {new_ctx:,}")
+                    else:
+                        notes.append(
+                            f"context: keeping {ctx:,} (fits the VRAM estimate)")
+                if new_ctx != ctx:
+                    ctx = new_ctx
+                    cfg.context_tokens = ctx
+                    cfg.sources["context_tokens"] = (
+                        f"auto-fit (VRAM: {mem}, model {size_gb:.1f} GB)")
+        elif model_bytes <= 0:
+            notes.append(
+                "memory: server did not report the model file size; using "
+                "the server/fallback window without a VRAM estimate")
 
     def setv(key: str, value):
         cur = getattr(cfg, key)
@@ -772,7 +1093,8 @@ def auto_fit(cfg: Config, verbose: bool = True) -> list[str]:
         src = cfg.sources.get(key, "default")
         # Respect explicit user settings within reason: only clamp values
         # that physically cannot work (bigger than the whole window).
-        if src != "default" and value < cur:
+        # Tier/default values are fallbacks and may always be re-fitted.
+        if _is_explicit_limit(src) and value < cur:
             hard_max = max(1, ctx - 1)
             if cur <= hard_max:
                 return          # user set it and it still fits -- leave it
@@ -795,51 +1117,157 @@ def auto_fit(cfg: Config, verbose: bool = True) -> list[str]:
     cap = max(256, min(cfg.request_max_tokens_cap, usable))
     setv("request_max_tokens_cap", cap)
 
-    # Reply budgets must fit in the space LEFT OVER after the prompt, not
-    # just inside the window. llama.cpp/LM Studio answer "prompt +
-    # max_tokens > n_ctx" with a flat 400 -- which is exactly what DeepSeek-
-    # style "kept hitting limits" feels like on a local server: every gather
-    # step asked for 700-1200 reply tokens while the map+task prompt already
-    # filled most of an 8k window. So step/summary budgets are clamped to
-    # half the usable space (prompts during gathering are large), and the
-    # one-shot answer budget may use nearly all of it (its prompt is charged
-    # separately by max_gathered_chars).
-    step_ceiling = max(128, usable // 2)
-    if cfg.max_tokens_step > step_ceiling:
-        setv("max_tokens_step", step_ceiling)
-    summary_ceiling = max(64, min(cfg.max_tokens_summary, step_ceiling // 3))
-    if cfg.max_tokens_summary != summary_ceiling:
-        setv("max_tokens_summary", summary_ceiling)
-
-    # Answer/build budgets: never ask for more than fits after the prompt.
-    setv("max_tokens_answer", min(cfg.max_tokens_answer, cap, usable - 256))
-    setv("max_tokens_build", min(cfg.max_tokens_build, cap, usable - 256))
-    setv("max_tokens_plan", min(cfg.max_tokens_plan, cap, usable - 256))
-
-    # Provider per-message OUTPUT ceiling. Hosted APIs advertise a huge
-    # context window but cut a single reply off far earlier (~8k tokens on
-    # deepseek-chat and dashscope Qwen). Asking for more than that never
-    # yields a longer answer -- it truncates one mid-JSON/mid-block, which
-    # is exactly the "son cut off / failure to return json" failure. When
-    # max_output_tokens is set, clamp every reply budget to it; unlike the
-    # grow-only hosted rule above, this shrink IS physical (the server
-    # enforces it regardless of what we request), so it applies even when
-    # the user explicitly raised a budget.
     mot = int(getattr(cfg, "max_output_tokens", 0) or 0)
-    if mot > 0:
-        for key in ("max_tokens_answer", "max_tokens_build",
-                    "max_tokens_plan", "max_tokens_step"):
-            v = getattr(cfg, key)
-            if v > mot:
-                setv(key, mot)
-                cfg.sources[key] = f"auto-fit (max_output_tokens {mot:,})"
 
-    # Map + gathered source share the rest of the window. 4 chars/token.
-    left = max(usable - max(cfg.max_tokens_step, cfg.max_tokens_summary), 512)
-    map_tok = min(cfg.flat_map_token_budget, max(400, left // 3))
-    setv("flat_map_token_budget", map_tok)
-    gathered_tok = max(left - map_tok, 256)
-    setv("max_gathered_chars", min(cfg.max_gathered_chars, gathered_tok * 4))
+    # Hardware-derived budgets. Tier/default values are used when the whole
+    # set fits the VRAM-capped window; if it does not, the calculated
+    # allocation wins so a default answer budget cannot squeeze gathered
+    # source down to nothing. Explicit user values override both (they are
+    # deliberate limits), though the window's physical cap still applies so
+    # a request cannot exceed the server's context.
+    if not hosted and model_bytes > 0:
+        # Calculate from the VRAM-derived window (bounded by the final/server
+        # window). If VRAM yields less than the tier/default, the calculated
+        # budgets come out small and the tier/default wins below.
+        calc_ctx = min(hw_ctx, ctx) if hw_ctx > 0 else 0
+        calc_reserve = min(cfg.reserve_tokens, max(512, calc_ctx // 4))
+        calc_usable = max(calc_ctx - calc_reserve, calc_ctx // 2)
+        calc_step = max(512, min(4096, calc_usable // 8))
+        calc_summary = max(160, min(400, calc_step // 4))
+        calc_answer = max(1500, min(24000, calc_usable * 7 // 20))
+        calc_build = max(4000, min(32000, calc_usable * 6 // 10))
+        calc_plan = max(1200, min(8000, calc_usable // 6))
+        if mot > 0:
+            calc_step = min(calc_step, mot)
+            calc_answer = min(calc_answer, mot)
+            calc_build = min(calc_build, mot)
+            calc_plan = min(calc_plan, mot)
+
+        def want(key: str, calculated: int) -> int:
+            """max(tier/default, calculated); explicit user values win."""
+            cur = getattr(cfg, key)
+            if _is_explicit_limit(cfg.sources.get(key, "default")):
+                return cur
+            return max(cur, calculated)
+
+        # Calculated map/source budgets for the VRAM window.
+        calc_prompt_room = max(calc_usable - calc_answer, 256)
+        calc_map = max(1500, min(12000, calc_prompt_room // 3))
+        calc_map = min(calc_map, max(256, calc_prompt_room - 256))
+        calc_gathered = max(calc_prompt_room - calc_map, 256) * 4
+
+        want_step = want("max_tokens_step", calc_step)
+        want_summary = want("max_tokens_summary", calc_summary)
+        want_answer = want("max_tokens_answer", calc_answer)
+        want_build = want("max_tokens_build", calc_build)
+        want_plan = want("max_tokens_plan", calc_plan)
+        want_map = want("flat_map_token_budget", calc_map)
+        want_gathered = want("max_gathered_chars", calc_gathered)
+
+        # Tier/default floors are only safe when the resulting answer prompt
+        # actually fits the VRAM window. If the whole set does not fit, use
+        # the calculated allocation instead of squeezing gathered source down
+        # to nothing (which is what made reads useless on small VRAM windows).
+        floors_fit = (want_answer + want_map + want_gathered // 4 <= usable
+                      and want_step <= max(128, usable // 2))
+        if not floors_fit:
+            def or_calculated(key: str, calculated: int) -> int:
+                cur = getattr(cfg, key)
+                if _is_explicit_limit(cfg.sources.get(key, "default")):
+                    return cur
+                return calculated
+            want_answer = or_calculated("max_tokens_answer", calc_answer)
+            want_build = or_calculated("max_tokens_build", calc_build)
+            want_plan = or_calculated("max_tokens_plan", calc_plan)
+            want_map = or_calculated("flat_map_token_budget", calc_map)
+            want_gathered = or_calculated("max_gathered_chars", calc_gathered)
+            notes.append(
+                "budgets: tier/default floors do not all fit the VRAM "
+                "window; using the calculated allocation")
+
+        step_v = min(want_step, max(128, usable // 2))
+        summary_v = min(want_summary, max(64, step_v // 3))
+        answer_v = min(want_answer, cap, max(256, usable - 256))
+        build_v = min(want_build, cap, max(256, usable - 256))
+        plan_v = min(want_plan, cap, max(256, usable - 256))
+
+        # Leave room for map + gathered source in the answer prompt. Using
+        # usable - answer guarantees the answer() fit check passes with half
+        # the reserve still free.
+        prompt_room = max(usable - answer_v, 256)
+        map_v = min(want_map, max(256, prompt_room - 256))
+        gathered_cap = max(1024, (prompt_room - map_v) * 4)
+        gathered_v = min(want_gathered, gathered_cap, 200000)
+
+        targets = (
+            ("max_tokens_step", step_v),
+            ("max_tokens_summary", summary_v),
+            ("max_tokens_answer", answer_v),
+            ("max_tokens_build", build_v),
+            ("max_tokens_plan", plan_v),
+            ("flat_map_token_budget", map_v),
+            ("max_gathered_chars", gathered_v),
+        )
+        changed = False
+        for key, value in targets:
+            cur = getattr(cfg, key)
+            if cur == value:
+                continue
+            setattr(cfg, key, value)
+            cfg.sources[key] = (
+                f"auto-fit (hardware budget, window {ctx:,} tok)")
+            notes.append(f"{key}: {cur:,} -> {value:,} (hardware)")
+            changed = True
+        if changed and floors_fit:
+            notes.append(
+                "tier/default budgets were used as floors; hardware raised "
+                "them where it had room, and explicit user values won")
+    else:
+        # No model size (old/other server) or hosted API: keep the existing
+        # tier/default values and only clamp what cannot physically fit.
+        # Hosted runs are grow-only, so this branch never shrinks them.
+        step_ceiling = max(128, usable // 2)
+        if cfg.max_tokens_step > step_ceiling:
+            setv("max_tokens_step", step_ceiling)
+        summary_ceiling = max(64, min(cfg.max_tokens_summary,
+                                      step_ceiling // 3))
+        if cfg.max_tokens_summary != summary_ceiling:
+            setv("max_tokens_summary", summary_ceiling)
+
+        # Answer/build budgets: never ask for more than fits after the prompt.
+        setv("max_tokens_answer", min(cfg.max_tokens_answer, cap,
+                                      usable - 256))
+        setv("max_tokens_build", min(cfg.max_tokens_build, cap, usable - 256))
+        setv("max_tokens_plan", min(cfg.max_tokens_plan, cap, usable - 256))
+
+        # Provider per-message OUTPUT ceiling. Hosted APIs advertise a huge
+        # context window but cut a single reply off far earlier (~8k tokens on
+        # deepseek-chat and dashscope Qwen). Asking for more than that never
+        # yields a longer answer -- it truncates one mid-JSON/mid-block, which
+        # is exactly the "son cut off / failure to return json" failure. When
+        # max_output_tokens is set, clamp tier/default reply budgets to it.
+        # An explicit max_tokens_* value still wins over an auto-detected
+        # ceiling; setv() only enforces this shrink for non-explicit budgets
+        # (or when max_output_tokens itself was set by the user).
+        if mot > 0:
+            for key in ("max_tokens_answer", "max_tokens_build",
+                        "max_tokens_plan", "max_tokens_step"):
+                v = getattr(cfg, key)
+                if v > mot:
+                    before = v
+                    setv(key, mot)
+                    if getattr(cfg, key) != before:
+                        cfg.sources[key] = (
+                            f"auto-fit (max_output_tokens {mot:,})")
+
+        # Map + gathered source share the rest of the window. 4 chars/token.
+        left = max(usable - max(cfg.max_tokens_step, cfg.max_tokens_summary),
+                   512)
+        map_tok = min(cfg.flat_map_token_budget, max(400, left // 3))
+        setv("flat_map_token_budget", map_tok)
+        gathered_tok = max(left - map_tok, 256)
+        setv("max_gathered_chars", min(cfg.max_gathered_chars,
+                                       gathered_tok * 4))
 
     if not hosted:
         # Final sanity pass: every reply budget must leave real room for the
@@ -896,9 +1324,14 @@ def _parse_env(name: str, raw: str):
     if target is bool:
         return raw.strip().lower() in ("1", "true", "yes", "on")
     try:
-        return target(raw) if target in (int, float) else raw
+        value = target(raw) if target in (int, float) else raw
     except ValueError as e:
         raise ConfigError(f"PEDACITO_{name.upper()}={raw!r} is not a valid {target.__name__}") from e
+    if name == "vram_gb" and value <= 0:
+        raise ConfigError(
+            f"PEDACITO_{name.upper()}={raw!r} must be a positive whole "
+            f"number of gigabytes")
+    return value
 
 
 # --------------------------------------------------------------------------
@@ -924,6 +1357,12 @@ PRESETS: dict[str, dict] = {
         # and only bounded by the context guardrails elsewhere; hitting the
         # limit mid-gather is what produced "Raise max_steps so gathering
         # has room to cover them" failures on real tasks.
+        #
+        # These values are a FALLBACK. When the server reports the model's
+        # file size, auto-fit derives larger budgets from VRAM (see
+        # config.auto_fit). They matter for servers that do not expose a
+        # size, and for the settings auto-fit does not generate (max_steps,
+        # max_read_lines, max_spec_chars, max_new_files).
         "max_tokens_summary": 160,
         "max_tokens_step": 500,
         "max_steps": 40,
@@ -944,14 +1383,17 @@ PRESETS: dict[str, dict] = {
         # a THINKING model spends most of the step budget on hidden reasoning
         # before emitting the JSON action, and at 700 that leaves nothing --
         # finish_reason=length, no action, "didn't return an answer".
-        "max_tokens_summary": 220,
+        #
+        # Fallback budgets for a 32k window. auto-fit replaces these with
+        # hardware-sized values on a server that reports the model size.
+        "max_tokens_summary": 240,
         "max_tokens_step": 1500,
         "max_steps": 50,
-        "max_tokens_answer": 3000,
-        "max_tokens_plan": 4000,
+        "max_tokens_answer": 8000,
+        "max_tokens_plan": 5000,
         "max_tokens_build": 16000,
-        "flat_map_token_budget": 4000,
-        "max_gathered_chars": 24000,
+        "flat_map_token_budget": 6000,
+        "max_gathered_chars": 48000,
         "max_read_lines": 200,
         "max_spec_chars": 60000,
         "max_new_files": 24,
@@ -960,12 +1402,16 @@ PRESETS: dict[str, dict] = {
         "reserve_tokens": 4096,
     },
     "large": {
-        "max_tokens_summary": 300,
-        "max_tokens_step": 1000,
+        # Big local rig: every reply/source budget is at least as large as
+        # medium's. The old preset had a SMALLER step and build budget than
+        # medium, which is exactly backwards for a model with a roomier
+        # window and deeper reasoning.
+        "max_tokens_summary": 320,
+        "max_tokens_step": 2500,
         "max_steps": 60,
-        "max_tokens_answer": 8000,
+        "max_tokens_answer": 12000,
         "max_tokens_plan": 8000,
-        "max_tokens_build": 8000,
+        "max_tokens_build": 24000,
         "flat_map_token_budget": 8000,
         "max_gathered_chars": 60000,
         "max_read_lines": 300,
@@ -982,20 +1428,17 @@ PRESETS: dict[str, dict] = {
         # Hosted tiers are NOT auto-fit: the window here is a declared
         # budget, not a server limit (auto_fit skips local probing for
         # hosted profiles), so the budgets below only ever grow -- they
-        # never clamp anything the user set. A model writing four 800-line
-        # files in one answer needs ~40k output tokens; deepseek-chat's
-        # real ceiling is 8k, which no config can raise, but the budget
-        # must at least stop fighting the model within its true limits.
-        # max_tokens_step at 8k also gives thinking models room to reason
-        # and still emit a full write action in one step.
-        # max_tokens_step is deliberately NOT raised past ~8k here: the
-        # provider's per-message output ceiling (deepseek-chat: ~8k tokens)
-        # cannot be exceeded by any client setting. Asking for more just
-        # converts clean steps into mid-string truncations -- the failure
-        # users saw as "ran past max_tokens=16000". Big outputs are handled
-        # by chunking instead: see max_write_lines below and the chunking
-        # rules in the gather/answer prompts.
-        "max_tokens_summary": 300,
+        # never clamp anything the user set. There is deliberately no
+        # hardware-derived cap: the provider's own limits decide.
+        # A model writing four 800-line files in one answer needs ~40k output
+        # tokens; deepseek-chat's real ceiling is 8k, which no config can
+        # raise, but the budget must at least stop fighting the model within
+        # its true limits. max_tokens_step stays below ~8k for the same
+        # reason: the provider's per-message output ceiling cannot be
+        # exceeded by any client setting, and asking for more only converts
+        # clean steps into mid-string truncations. Big outputs are handled
+        # by chunking: see max_write_lines and the gather/answer prompts.
+        "max_tokens_summary": 400,
         "max_tokens_step": 7000,
         "max_steps": 100,
         "max_tokens_answer": 40000,
@@ -1004,10 +1447,6 @@ PRESETS: dict[str, dict] = {
         "flat_map_token_budget": 12000,
         "max_gathered_chars": 100000,
         "max_read_lines": 400,
-        # One write step stays under the provider's true per-message output
-        # limit (~8k tokens): 120 lines of code + short reasoning fits with
-        # room to spare. Multi-file / large-file tasks are split across
-        # sequential steps by the prompt rules, not crammed into one reply.
         "max_write_lines": 120,
         "max_spec_chars": 200000,
         "max_new_files": 60,
@@ -1016,6 +1455,7 @@ PRESETS: dict[str, dict] = {
         "reserve_tokens": 16384,
     },
 }
+
 
 
 def _guess_tier(name: str, body: dict) -> str | None:
@@ -1070,14 +1510,20 @@ def _apply_preset(name: str, body: dict, origin: str) -> tuple[dict, str]:
 TEMPLATE = '''\
 # Pedacito configuration.  Run `pedacito config --setup` to build this file
 # interactively (it finds LM Studio / Ollama on this machine for you), or
-# edit the two lines below.  Everything else is optional.
+# edit the lines below.  Everything else is optional.
 #
-# MANDATORY (only if your server/model differ from these defaults):
-#   base_url  where the model lives. Default: http://localhost:1234/v1
-#   model     the exact name your server reports. Default: google/gemma-3-27b
+# MANDATORY:
+#   base_url       where the model lives. Default: http://localhost:1234/v1
+#   model          the exact name your server reports. Default: google/gemma-3-27b
+#   vram_gb        total GPU VRAM on the machine running the model
+# VRAM is a whole number of gigabytes.  Pedacito reads the model's file size
+# from the server and uses it plus VRAM to size the context window
+# automatically -- you do not need to set any max_tokens_* values.  It is
+# not needed for hosted APIs (DeepSeek/OpenAI), which run elsewhere.
 #
 base_url = "http://localhost:1234/v1"
 model    = "google/gemma-3-27b"
+vram_gb  = 8
 
 # Optional: pick sane token budgets without defining any profiles.
 # One of "small" (~9B local), "medium" (~14-27B local), "large" (35B+),
@@ -1163,7 +1609,20 @@ REFERENCE_TEMPLATE = '''\
 [server]
 base_url = "http://localhost:1234/v1"
 model    = "google/gemma-3-27b"
+vram_gb  = 8                   # MANDATORY for local servers: GPU VRAM in GB
 
+# Pedacito queries the server for the model's file size at the start of every
+# run. The server's CONFIGURED context length, when it reports one (LM Studio,
+# Lemonade, Ollama), is authoritative; the VRAM estimate is then only a speed
+# advisory -- when it is below the configured length, the KV cache will spill
+# to system RAM and tokens/sec drop, so lower the server's context length if
+# that matters to you. When the server does not report one, the estimate caps
+# the fallback window by how much KV cache fits in VRAM after loading the
+# weights (0.5 GB is kept for the system). Tier/default token budgets are
+# used when they fit that window; otherwise the VRAM-derived allocation is
+# used. You do not need to set any max_tokens_* values yourself; explicit
+# values override both.
+#
 # api_key = "lm-studio"        # ignored by local servers; any string works
 # json_mode = "schema"         # "schema" for local llama.cpp/LM Studio;
 #                              # "object" for hosted OpenAI-compatible APIs
@@ -1266,6 +1725,26 @@ model    = "google/gemma-3-27b"
 #                                  # counts against this)
 # max_tokens_build = 8000          # budget for each per-file build pass
 
+# --- Autonomous loop (`pedacito auto`) ---------------------------------------
+# The Ralph-loop outer loop: break a goal into a checklist (PLAN.md), then
+# implement each task in a fresh context window until the list is empty.
+# [auto]
+# auto_plan_file = "PLAN.md"       # plan file name in the project root
+# auto_verify = ""                 # shell command run after each task
+#                                  # ("pytest -q"); a failure feeds back for repair
+# auto_max_tasks = 0               # cap on tasks per run; 0 = run to completion
+# auto_repair_rounds = 2           # fix rounds per failing verification
+# auto_split_lines = 120           # split a source file whose stub is longer
+#                                  # than this into several implementation tasks
+# auto_install_deps = false        # when --verify fails on a missing module,
+#                                  # pip-install it and retry (opt-in)
+# auto_smoke = true                # after a --complex build, run main.py once
+#                                  # (a process still running at the timeout
+#                                  # counts as started); failures are repaired
+# auto_smoke_timeout = 20          # seconds before a smoke run is treated as
+#                                  # "started successfully"
+# auto_verify_rounds = 2           # repair rounds for a failing runtime check
+
 # --- Reasoning models -------------------------------------------------------
 # Qwen3 and friends emit a <think> block by default. Pedacito strips it
 # either way, but generating it still costs tokens and time. Both switches
@@ -1305,6 +1784,11 @@ model    = "google/gemma-3-27b"
 # your tier, or uncomment `tier =` to inherit the preset instead of spelling
 # it out.
 #
+# On a local server the server's own configured context length is what
+# auto-fit fits these token budgets to; the VRAM estimate only warns when
+# the KV cache will spill to system RAM. A value you write here always wins
+# over both.
+#
 # default_profile = "local27"
 
 # Small local model (~9B): everything stays inside an 8k context window at
@@ -1318,7 +1802,7 @@ model    = "google/gemma-3-27b"
 # api_key  = "lm-studio"
 # max_tokens_summary = 160
 # max_tokens_step    = 500
-# max_steps          = 8
+# max_steps          = 40
 # repair_rounds      = 1
 # max_tokens_answer  = 1500
 # max_tokens_plan    = 1200
@@ -1344,15 +1828,15 @@ model    = "google/gemma-3-27b"
 # # tier = "medium"
 # base_url = "http://localhost:1234/v1"
 # model    = "google/gemma-3-27b"
-# max_tokens_summary = 220
-# max_tokens_step    = 700
-# max_steps          = 12
+# max_tokens_summary = 240
+# max_tokens_step    = 1500
+# max_steps          = 50
 # repair_rounds      = 2
-# max_tokens_answer  = 3000
-# max_tokens_plan    = 4000
+# max_tokens_answer  = 8000
+# max_tokens_plan    = 5000
 # max_tokens_build   = 16000
-# flat_map_token_budget = 4000
-# max_gathered_chars = 24000
+# flat_map_token_budget = 6000
+# max_gathered_chars = 48000
 # max_read_lines     = 200
 # max_spec_chars     = 60000
 # max_new_files      = 24
@@ -1365,13 +1849,13 @@ model    = "google/gemma-3-27b"
 # # tier = "large"
 # base_url = "http://localhost:1234/v1"
 # model    = "qwen3-32b"        # or a 70B on a multi-GPU rig
-# max_tokens_summary = 300
-# max_tokens_step    = 1000
-# max_steps          = 16
+# max_tokens_summary = 320
+# max_tokens_step    = 2500
+# max_steps          = 60
 # repair_rounds      = 2
-# max_tokens_answer  = 8000
+# max_tokens_answer  = 12000
 # max_tokens_plan    = 8000
-# max_tokens_build   = 8000
+# max_tokens_build   = 24000
 # flat_map_token_budget = 8000
 # max_gathered_chars = 60000
 # max_read_lines     = 300
@@ -1395,13 +1879,13 @@ model    = "google/gemma-3-27b"
 # api_key   = "sk-..."
 # json_mode = "object"
 # timeout   = 120.0
-# max_tokens_summary = 300
-# max_tokens_step    = 1200
-# max_steps          = 24
+# max_tokens_summary = 400
+# max_tokens_step    = 7000
+# max_steps          = 100
 # repair_rounds      = 3
-# max_tokens_answer  = 16000
-# max_tokens_plan    = 3000
-# max_tokens_build   = 12000
+# max_tokens_answer  = 40000
+# max_tokens_plan    = 8000
+# max_tokens_build   = 32000
 # flat_map_token_budget = 12000
 # max_gathered_chars = 100000
 # max_read_lines     = 400
@@ -1473,11 +1957,12 @@ def interactive_setup(path: Path | None = None, force: bool = False,
                       stdin=input, stdout=None) -> Path:
     """Build a working config file step by step, then validate it.
 
-    Asks three questions at most (where is your model, which model, hosted
-    API?) and writes a minimal file: base_url, model, and a tier -- the only
-    settings that are genuinely mandatory. Existing files are backed up to
-    <path>.bak rather than silently overwritten. Raises ConfigError on bad
-    answers; the written file is load()-checked before returning."""
+    Asks where the model lives, which model, whether it is a hosted API, and
+    the server machine's VRAM, then writes a minimal file: base_url, model,
+    vram_gb, and a tier -- the settings that are genuinely mandatory. Existing
+    files are backed up to <path>.bak rather than silently overwritten. Raises
+    ConfigError on bad answers; the written file is load()-checked before
+    returning."""
     import sys
     out = stdout or sys.stdout
     def say(s=""):
@@ -1489,9 +1974,10 @@ def interactive_setup(path: Path | None = None, force: bool = False,
         if ans.lower() not in ("y", "yes"):
             raise ConfigError("setup cancelled; existing config left untouched")
 
-    say("Pedacito setup -- only two settings are mandatory: where your model")
-    say("lives (base_url) and its exact name (model). Everything else has a")
-    say("working default. Press Enter to accept any suggestion in [brackets].")
+    say("Pedacito setup -- three settings are mandatory: where your model")
+    say("lives (base_url), its exact name (model), and the VRAM on the machine")
+    say("running the server (vram_gb). Everything else has a working default.")
+    say("Press Enter to accept any suggestion in [brackets].")
     say()
 
     servers = discover_servers()
@@ -1535,6 +2021,21 @@ def interactive_setup(path: Path | None = None, force: bool = False,
     if not base_url or not model:
         raise ConfigError("base_url and model are mandatory -- setup needs both")
 
+    # Mandatory for local servers; harmless for hosted profiles and useful if
+    # the same file later gains a local profile.
+    def _gb(prompt: str, default: str) -> int:
+        raw = _ask(prompt, default)
+        try:
+            value = int(raw)
+        except ValueError:
+            raise ConfigError(f"{prompt}: expected a whole number of GB, "
+                              f"got {raw!r}")
+        if value <= 0:
+            raise ConfigError(f"{prompt}: must be greater than zero")
+        return value
+
+    vram_gb = _gb("GPU VRAM on the model server, in GB", "8")
+
     tier = "hosted" if hosted else _ask(
         "Model size tier -- small (~9B), medium (~14-27B), large (35B+)",
         "medium")
@@ -1543,15 +2044,16 @@ def interactive_setup(path: Path | None = None, force: bool = False,
 
     lines = [
         "# Written by `pedacito config --setup`.",
-        "# The only mandatory settings are base_url and model. See",
-        "# `pedacito config --reference` for every other knob.",
+        "# Mandatory: base_url, model, and the server machine's VRAM.",
+        "# See `pedacito config --reference` for every other knob.",
         f'base_url = "{base_url}"',
         f'model    = "{model}"',
+        f'vram_gb  = {vram_gb}',
         f'tier     = "{tier}"',
     ]
     if api_key:
-        lines.insert(4, f'api_key  = "{api_key}"')
-        lines.insert(5, 'json_mode = "object"   # hosted APIs lack llama.cpp schemas')
+        lines.insert(5, f'api_key       = "{api_key}"')
+        lines.insert(6, 'json_mode     = "object"   # hosted APIs lack llama.cpp schemas')
     body = "\n".join(lines) + "\n"
 
     # Validate BEFORE touching the user's file: parse exactly as load() will.
@@ -1577,6 +2079,7 @@ def interactive_setup(path: Path | None = None, force: bool = False,
     say(f"Wrote {p}")
     say(f"  base_url = {base_url}")
     say(f"  model    = {model}")
+    say(f"  vram_gb  = {vram_gb}")
     say(f"  tier     = {tier}" + ("  (api_key set, json_mode=object)" if api_key else ""))
     say("Test it any time with:  pedacito config --check")
     return p

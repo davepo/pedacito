@@ -104,7 +104,7 @@ def test_agent_rename_end_to_end(tmp_path, fake_port):
     review'."""
     root = _project(tmp_path)
     cfg = _cfg(fake_port)
-    idx = index_mod.build(["."], cfg, client=None, summarise=False, root=root)
+    idx = index_mod.build([str(root)], cfg, client=None, summarise=False, root=root)
     agent = Agent(idx, LMStudio(cfg), cfg)
 
     gathered = agent.gather("rename old_name.py to new_name.py", verbose=False)
@@ -138,7 +138,7 @@ def test_gather_coverage_ledger_counts_reads(tmp_path, fake_port):
     the done-nudge stops firing forever (the ledger key mismatch bug)."""
     root = _project(tmp_path)
     cfg = _cfg(fake_port)
-    idx = index_mod.build(["."], cfg, client=None, summarise=False, root=root)
+    idx = index_mod.build([str(root)], cfg, client=None, summarise=False, root=root)
     agent = Agent(idx, LMStudio(cfg), cfg)
     agent.gather("rename ./old_name.py to new_name.py", verbose=False)
     # The task names both files; the read covered old_name.py only, but the
