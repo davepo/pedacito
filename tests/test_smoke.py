@@ -641,6 +641,38 @@ def test_evict_overflow_turns_clips_oldest_result():
     assert any("young" in m["content"] for m in msgs)   # newest survives
 
 
+def test_apply_stops_after_repeated_truncation(tmp_path):
+    """A model that re-emits one oversized block every round must not spin
+    the continuation loop for the whole char budget (each round generates
+    the full max_tokens_answer -- minutes of GPU per attempt, the 'system
+    bogged down' failure). After the generic re-ask and ONE escalated
+    single-chunk ask, the loop gives up."""
+    from pedacito import index as index_mod
+    _write(tmp_path / "a.py", "x = 1\n")
+    idx = index_mod.Index(tmp_path, [])
+
+    class StubClient:
+        def __init__(self):
+            self.prompts = []
+            self.stream_truncated = True
+
+        def chat(self, messages, max_tokens, schema=None, stream=False, **kw):
+            self.prompts.append(messages[-1]["content"])
+            # Every attempt is cut off before any complete block.
+            return "--- FILE: a.py\n<<<<<<< SEARCH\n=======\n" + "y" * 200
+
+    client = StubClient()
+    agent = Agent(idx, client, config_mod.Config())
+    reply = "--- FILE: a.py\n<<<<<<< SEARCH\n=======\n" + "y" * 100
+    results, _ = agent.apply(reply, dry_run=False,
+                             task="implement a.py", gathered="")
+    assert results == [], results
+    assert len(client.prompts) == 2, \
+        f"expected generic re-ask + one escalated ask, got {client.prompts}"
+    assert "CUT OFF" in client.prompts[0]
+    assert "FIRST ~30 lines" in client.prompts[1]
+
+
 def test_truncated_json_gets_token_limit_error():
     """A thinking model that spends its whole budget on reasoning returns
     no JSON at all and finish_reason='length'. chat_json must report THAT

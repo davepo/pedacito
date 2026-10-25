@@ -334,6 +334,144 @@ def _report(results, dry_run: bool):
             print(r.diff)
 
 
+# --------------------------------------------------------------------------
+# Answer-phase recovery: a reply with no edit blocks
+# --------------------------------------------------------------------------
+# Small models in the ANSWER phase sometimes emit another agent framework's
+# tool-call syntax (Anthropic `<invoke name="read">`, or the `<tool_call>` /
+# `<function=read>` dialect) instead of search/replace blocks -- usually
+# because the task needs source the gather phase never read. The recovery
+# below parses those requests, honours the reads from disk, and re-asks for
+# the edit blocks. Both dialects are matched so the exact syntax the model
+# imitates does not matter.
+_READ_INVOKE_RE = re.compile(
+    r"<invoke\b[^>]*name\s*=\s*['\"]?read['\"]?[^>]*>(.*?)</invoke>",
+    re.DOTALL | re.IGNORECASE)
+_READ_TOOLCALL_RE = re.compile(
+    r"<tool_call>(.*?)</tool_call>", re.DOTALL | re.IGNORECASE)
+_FILEPATH_PARAM_RE = re.compile(
+    r"<parameter\b[^>]*name\s*=\s*['\"]file_path['\"][^>]*>\s*(.*?)\s*</parameter>",
+    re.DOTALL | re.IGNORECASE)
+_FILEPATH_EQ_PARAM_RE = re.compile(
+    r"<parameter\s*=\s*file_path>\s*(.*?)\s*</parameter>",
+    re.DOTALL | re.IGNORECASE)
+
+_MAX_RECOVERY_ROUNDS = 2
+_MAX_RECOVERY_FILES = 4
+_MAX_FILE_CHARS = 20000
+_MAX_EXTRA_CHARS = 30000
+
+
+def _read_requests(reply: str) -> list[str]:
+    """Extract the file paths a reply asked to `read` via tool-call syntax,
+    in reply order and de-duplicated. Empty when the reply has none."""
+    found: list[tuple[int, str]] = []
+    for m in _READ_INVOKE_RE.finditer(reply):
+        p = _FILEPATH_PARAM_RE.search(m.group(1))
+        if p:
+            found.append((m.start(), p.group(1).strip()))
+    for m in _READ_TOOLCALL_RE.finditer(reply):
+        body = m.group(1)
+        if not re.search(r"function\s*=\s*read\b", body, re.IGNORECASE):
+            continue
+        p = _FILEPATH_EQ_PARAM_RE.search(body)
+        if p:
+            found.append((m.start(), p.group(1).strip()))
+    seen: set[str] = set()
+    uniq = []
+    for _, path in sorted(found):
+        if path not in seen:
+            seen.add(path)
+            uniq.append(path)
+    return uniq
+
+
+def _honour_reads(root: Path, requests: list[str]) -> str:
+    """Read the requested files from disk and return them as one SOURCE block.
+
+    Paths are constrained to the project root: anything outside it (or
+    unreadable) is reported as unavailable instead. Per-file and total
+    character caps keep the re-ask inside the model's window."""
+    try:
+        base = root.resolve()
+    except OSError:
+        base = root.absolute()
+    blocks: list[str] = []
+    total = 0
+    for rel in requests[:_MAX_RECOVERY_FILES]:
+        name = str(rel).strip().strip("`'\"")
+        if not name:
+            continue
+        try:
+            p = (root / name).resolve()
+            inside = p.is_relative_to(base)
+        except (OSError, ValueError):
+            inside = False
+        if not inside or not p.is_file():
+            blocks.append(f"### {name}\n[not readable]\n")
+            continue
+        try:
+            text = p.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            blocks.append(f"### {name}\n[not readable]\n")
+            continue
+        if len(text) > _MAX_FILE_CHARS:
+            text = text[:_MAX_FILE_CHARS] + "\n[file truncated]\n"
+        room = _MAX_EXTRA_CHARS - total
+        if room <= 0:
+            break
+        text = text[:room]
+        total += len(text)
+        blocks.append(f"### {name}\n{text}\n")
+    return "\n\n".join(blocks)
+
+
+def _recover_no_edit_reply(root: Path, cfg, agent, task: str, gathered: str,
+                           reply: str, *, dry_run: bool, backup_dir,
+                           answer_system: str | None = None):
+    """Recover an answer reply that parsed to zero edit blocks.
+
+    Two failure classes are worth one retry each (bounded at two rounds
+    total): the model asked to READ more files via tool-call syntax (honour
+    the reads from disk and re-ask with that source included), or it simply
+    answered in prose (re-ask with an explicit 'no tools here, emit edit
+    blocks' instruction). Returns (results, reply) from the first re-ask
+    that produces blocks, or None when every round came back empty."""
+    asked = _read_requests(reply)
+    for _round in range(_MAX_RECOVERY_ROUNDS):
+        extra = _honour_reads(root, asked) if asked else ""
+        asked = []
+        if extra:
+            print("\n[reply asked to read more files; read them and "
+                  "re-asking]", file=sys.stderr)
+        else:
+            print("\n[reply had no edit blocks; re-asking with the edit "
+                  "protocol]", file=sys.stderr)
+        base = answer_system or "You are a Python code assistant."
+        system = (base.rstrip()
+                  + ("\n\n" if answer_system else " ")
+                  + "In this FINAL answer phase no tools are available: you "
+                  + "cannot read or write files directly. Complete the task "
+                  + "with search/replace edit blocks for the source provided "
+                  + "below.")
+        task2 = (task + "\n\n"
+                 "Your previous reply contained no edit blocks"
+                 + (" (it only emitted tool-call requests, which cannot run "
+                    "in this phase)" if extra else "")
+                 + ". Produce the edit blocks now.")
+        src = (gathered or "").strip()
+        if extra:
+            src = src + ("\n\n" if src else "") + \
+                "EXTRA SOURCE READ FOR YOU\n\n" + extra
+        raw = agent.answer(task2, src, system=system)
+        results2, reply2 = agent.apply(raw, dry_run=dry_run, task=task,
+                                       gathered=src, backup_dir=backup_dir)
+        if results2:
+            return results2, reply2
+        asked = _read_requests(raw)
+    return None
+
+
 def _review(root: Path, results, task: str, cfg, backup_dir, stamp: str) -> list:
     """Serve the side-by-side review page and return the results as they
     finally stand (the page writes on Apply, so this re-stamps each result)."""
@@ -392,6 +530,21 @@ def run_task(root: Path, cfg, client, agent, idx, task: str, *,
     results, reply = agent.apply(raw_reply, dry_run=review or not apply,
                                  task=task, gathered=gathered,
                                  backup_dir=None if review else backup_dir)
+    if not results and not _is_noop(reply):
+        # The answer phase produced zero edit blocks. Before declaring the
+        # task dead, give the model one bounded recovery: honour any read
+        # tool-calls it emitted, or re-ask with the edit protocol spelled
+        # out -- both without touching the no-op path ("already complete"
+        # replies must still mark the task done, not re-ask).
+        rec = _recover_no_edit_reply(
+            root, cfg, agent, task, gathered, reply,
+            dry_run=review or not apply,
+            backup_dir=None if review else backup_dir,
+            answer_system=answer_system)
+        if rec is not None:
+            results, reply = rec
+            workspace.log_event(root, "answer re-asked; recovered edit blocks",
+                                "INFO")
     if not results:
         workspace.log_event(root, "no edit blocks parsed from the reply", "ERROR")
     else:

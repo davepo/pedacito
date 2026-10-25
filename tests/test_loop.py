@@ -410,6 +410,85 @@ def test_run_task_applies_edits_and_reindexes(tmp_path):
     assert "applied new_name.py" in log
 
 
+def test_read_requests_parses_both_tool_call_dialects():
+    """Answer-phase replies that ask for reads come in at least two dialects:
+    the `<tool_call>`/`<function=read>` form and the Anthropic
+    `<invoke name="read">` form. Both must yield their file paths."""
+    reply = (
+        "<tool_call>\n<function=read>\n<parameter=file_path>\nsrc/game.py\n"
+        "</parameter>\n</function>\n</tool_call>\n"
+        '<invoke name="read">\n<parameter name="file_path">src/ui.py</parameter>\n'
+        "</invoke>\n"
+        '<invoke name="write">\n<parameter name="file_path">src/x.py</parameter>\n'
+        "</invoke>\n")
+    assert loop._read_requests(reply) == ["src/game.py", "src/ui.py"]
+    assert loop._read_requests("just prose, no tool calls") == []
+
+
+def test_honour_reads_refuses_paths_outside_root(tmp_path):
+    """Files requested by the model are read relative to the project root;
+    anything outside it (or missing) is reported as unreadable instead of
+    leaking the host filesystem into the prompt."""
+    (tmp_path / "a.py").write_text("x = 1\n", encoding="utf-8")
+    out = loop._honour_reads(tmp_path, ["a.py", "../../etc/passwd", "nope.py"])
+    assert "x = 1" in out
+    assert "### ../../etc/passwd" in out and "not readable" in out
+    assert "### nope.py" in out and "not readable" in out
+
+
+def test_run_task_recovers_after_tool_call_reply(tmp_path):
+    """The reported failure: the answer phase emitted `<tool_call>` reads for
+    files gather never touched, so no edit blocks parsed and the task died.
+    run_task must honour those reads from disk and re-ask -- the re-ask
+    carries the requested source and the task then applies cleanly."""
+    from pedacito import index as index_mod
+    from pedacito.agent import Agent
+
+    (tmp_path / "game.py").write_text("def tick():\n    pass\n", encoding="utf-8")
+    (tmp_path / "player.py").write_text("x = 1\n", encoding="utf-8")
+    cfg = Config()
+    cfg.log_sessions = False
+    idx = index_mod.build([str(tmp_path)], cfg, client=None, summarise=False,
+                          root=tmp_path)
+
+    TOOL_REPLY = (
+        "<tool_call>\n<function=read>\n<parameter=file_path>\ngame.py\n"
+        "</parameter>\n</function>\n</tool_call>\n")
+    EDIT_REPLY = (
+        "Implementing player.\n\n"
+        "--- FILE: player.py\n"
+        "<<<<<<< SEARCH\nx = 1\n=======\n"
+        "def update():\n    pass\n>>>>>>> REPLACE\n")
+
+    class StubClient:
+        stream_truncated = False
+        step_truncated = False
+
+        def __init__(self):
+            self.answers = 0
+
+        def chat_json(self, messages, schema, max_tokens=0, **kw):
+            return {"action": "done", "file": "", "pattern": "", "symbol": "",
+                    "start": 0, "end": 0, "content": "", "reasoning": "done"}
+
+        def chat(self, messages, max_tokens, schema=None, stream=False, **kw):
+            self.answers += 1
+            if self.answers == 1:
+                return TOOL_REPLY
+            user = "\n".join(m["content"] for m in messages
+                             if m["role"] == "user")
+            assert "EXTRA SOURCE READ FOR YOU" in user
+            assert "def tick()" in user
+            return EDIT_REPLY
+
+    client = StubClient()
+    tr = loop.run_task(tmp_path, cfg, client, Agent(idx, client, cfg), idx,
+                       "implement player.py", apply=True, review=False)
+    assert tr.applied, "recovery did not apply the re-asked edit"
+    assert "def update()" in (tmp_path / "player.py").read_text()
+    assert client.answers == 2
+
+
 def test_run_log_records_events(tmp_path):
     from pedacito import workspace
     workspace.log_event(tmp_path, "hello", "INFO")
