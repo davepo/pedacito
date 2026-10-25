@@ -4,83 +4,62 @@
 
 **Pedacito lets a small local LLM work on a codebase bigger than its context
 window.** Models in the 9B–27B range typically can't hold a real project in
-context, so instead of pasting your whole repo at the model, Pedacito builds
-a lookup index and lets the model request only the specific files, symbols,
-or snippets it needs for the task at hand — piece by piece (*pedacito* is
-Spanish for "little piece"), back and forth, until it has enough to answer
-or edit. It's aimed at the kind of hardware most people running local models
-actually have: a single consumer GPU with 16–24GB of VRAM, not a cluster.
+context. Instead of pasting your whole repo at the model, Pedacito builds a
+lookup index and lets the model request only the specific files, symbols, or
+snippets it needs for the task at hand — piece by piece (*pedacito* is Spanish
+for "little piece") — until it has enough to answer or edit. It's aimed at the
+hardware most people running local models actually have: a single consumer GPU
+with 16–24GB of VRAM, not a cluster.
 
-Works with any server exposing an OpenAI-compatible `/v1` API — tested
-against **LM Studio and Ollama** — on **Windows, Linux, or macOS**. Nothing
-in this document is specific to one server or one OS unless it says so.
-
-Chunking is AST-based for Python and tree-sitter-based for JavaScript,
-TypeScript, and Ruby — parser output, not line-based guessing, for most of
-the index — and edits come back as search/replace blocks rather than whole
-files. It can also start a project from scratch: hand it a one-line prompt
-or a spec document and it plans the file tree, scaffolds it, then fills in
-each file (`pedacito new`).
+- Works with any server exposing an OpenAI-compatible `/v1` API — tested
+  against **LM Studio and Ollama** — on Windows, Linux, and macOS. Hosted APIs
+  (DeepSeek, OpenAI, and similar) work too.
+- AST-based chunking for Python, tree-sitter for JavaScript, TypeScript, TSX,
+  and Ruby; structural indexing for everything else useful as context.
+- Edits come back as search/replace blocks rather than whole files or diffs.
+- It can also start a project from scratch (`pedacito new`) and run an
+  autonomous task loop (`pedacito auto`).
 
 ### What this is (and isn't)
 
-This was built by one person, for one person's use case: running local
-models over Tailscale against a single home GPU box, mostly for narrow,
-localized edits rather than sweeping refactors. It was designed and coded
-almost entirely through conversations with Claude (Anthropic's AI model) —
-this isn't a hand-rolled framework, it's what came out of iterating with an
-AI pair programmer against real bugs on real hardware. That background is
-worth knowing before you point it at your own workflow: it's had one user
-and one set of models exercising it so far, edge cases outside that path are
-more likely to be unpolished, and the code and docs may still read like
-something built for personal use first and a public tool second.
+Built by one person, for one person's use case: running local models over
+Tailscale against a single home GPU box, mostly for narrow, localized edits
+rather than sweeping refactors. It was designed and coded almost entirely
+through conversations with AI pair programmers — DeepSeek, Qwen, Claude, and
+local models — iterating against real bugs on real hardware. That background is
+worth knowing: it's had one user and one set of models exercising it so far, so
+edge cases outside that path are more likely to be unpolished.
 
-If you have the hardware or budget for a frontier hosted model, you will
-almost certainly get better results from tools built around those models —
-see "Alternatives" below. Pedacito exists for the case where you specifically
-want to stay local and small, and are willing to trade some capability for
-that.
+If you have the hardware or budget for a frontier hosted model, you'll almost
+certainly get better results from a tool built around those models (see
+"Alternatives" below). Pedacito exists for the case where you specifically want
+to stay local and small.
 
 ### Alternatives
 
 If you're not committed to a small local model, these are generally more
-capable and more polished:
+capable and polished:
 
-- **[Claude Code](https://claude.com/claude-code)** — Anthropic's
-  agentic coding tool. The flagship option if you can use Claude models.
-- **[Qwen Code](https://github.com/QwenLM/qwen-code)** — a similar
-  agentic CLI built around Qwen's models, works well with the same local
-  Qwen weights Pedacito can run against.
-- **[Aider](https://aider.chat)** — a mature, actively developed CLI
-  pair-programming tool with git-aware edits, repo maps, and support for
-  both hosted and local models. Closest in spirit to what Pedacito does,
-  and far more battle-tested.
-- **[Cline](https://github.com/cline/cline)** (and its fork
-  **[Roo Code](https://github.com/RooCodeInc/Roo-Code)**) — VS Code
-  extensions that turn Claude, GPT, or a local model into an autonomous
-  agent with file and terminal access, right inside the editor.
-- **[Continue](https://continue.dev)** — an open-source VS Code/JetBrains
-  extension for chat and autocomplete against hosted or local models.
-- **[Cursor](https://cursor.com)** and **[Windsurf](https://windsurf.com)**
-  — full AI-native editors, hosted-model-first, generally the smoothest
-  experience if you don't need to stay local.
+- **[opencode](https://opencode.ai)** — an open-source, terminal-based coding
+  agent that works with a wide range of providers, hosted and local.
+- **[DeepSeek Harness](https://github.com/deepseek-ai/harness)** — DeepSeek's
+  tooling for running and working with their models.
+- **[Qwen Code](https://github.com/QwenLM/qwen-code)** — an agentic coding CLI
+  built around Qwen's models; works well with the same local Qwen weights
+  Pedacito can run against.
+- **[Claude Code](https://claude.com/claude-code)** — Anthropic's agentic
+  coding tool, the flagship option if you can use Claude models.
 
-Pedacito is worth reaching for specifically when none of those fit: no
-internet access to a hosted API, a preference for keeping code entirely
-on your own hardware, or just wanting to see what a 9B–27B model can do
-on a real project when it's not fighting its context window.
-
-Pedacito can point at a hosted OpenAI-compatible API too (`json_mode =
-"object"`), but its whole design — rationed summaries, tiny maps,
-search/replace over diffs — is tuned for a 9B–27B model at local inference
-speeds, so a tool built for frontier models will still be the better fit
-there.
+Pedacito is worth reaching for when none of those fit: no internet access to a
+hosted API, a preference for keeping code entirely on your own hardware, or
+just wanting to see what a 9B–27B model can do on a real project when it's not
+fighting its context window.
 
 ---
 
 ## Install
 
-Requires Python 3.11+ (uses the standard-library `tomllib`).
+Requires Python 3.11+.
 
 **Windows (PowerShell):**
 
@@ -96,56 +75,15 @@ cd ~/pedacito
 pip install -e .          # or: pipx install -e .
 ```
 
-`-e` (editable) installs a pointer to this folder rather than copying files,
-so `git pull` or replacing a file here takes effect immediately. This pulls
-in `requests` — the only required dependency — and puts a `pedacito`
-command on your `PATH` — along with `pdc`, a shorter alias for the same
-command. Everywhere this document shows `pedacito <command>`, `pdc <command>`
-works identically.
+The editable install puts `pedacito` on your `PATH`, along with `pdc` (a shorter
+alias for the same command), and pulls in `requests` and `tree-sitter` (used for
+JS/TS/Ruby symbol indexing). If the command isn't found on `PATH` afterwards
+(common with per-user installs on Windows), `python -m pedacito` / `py -m
+pedacito` works identically.
 
-**JavaScript, TypeScript, and Ruby** get symbol-level indexing (a real map,
-not just `read`/`grep`) out of the box — `tree-sitter` and
-`tree-sitter-language-pack` (prebuilt wheels, no compiler needed) install
-alongside `requests` as part of the base install, no extra step needed.
-
-**Without installing**, from inside this folder: `pip install requests`,
-then `python -m pedacito --help` (`py -m pedacito --help` on Windows). That works
-but only from inside the folder, so installing is worth the one command.
-
-If `pedacito` (or `pdc`) isn't found on `PATH` after installing (common with
-a per-user pip install, especially on Windows), use `python -m pedacito` /
-`py -m pedacito` instead — identical result, no `PATH` needed.
-
-## Uninstall
-
-```bash
-pip uninstall pedacito-local
-```
-
-`pedacito-local` is the distribution name in `pyproject.toml` — not `pedacito`,
-which is just the command it installs. Confirmed by testing an actual
-install/uninstall cycle:
-
-| | Removed by uninstall? |
-|---|---|
-| The `pedacito` command on `PATH` | Yes |
-| The `pdc` command on `PATH` | Yes |
-| pip's pointer file in site-packages | Yes |
-| The source folder itself (wherever you cloned it) | No |
-| Per-project `.pedacito/` directories (index, backups, sessions) | No |
-| Your personal config (`~/.config/pedacito/` or `%APPDATA%\pedacito\`) | No |
-
-Reinstalling later (`pip install -e .` from inside the folder) picks up
-existing config and every project's `.pedacito/` untouched — nothing about
-uninstalling wipes them. For a genuinely clean slate, delete those three
-yourself: the source folder, the config directory above, and any `.pedacito/`
-folders in projects you'd tested against.
-
-One thing worth knowing since the install is editable: **don't delete or
-move the source folder while it's installed.** The `pedacito` and `pdc`
-commands are both pointers to that exact path, not a copy — move the folder
-and they start failing with import errors until you reinstall from the new
-location.
+Uninstall with `pip uninstall pedacito-local` (that's the distribution name in
+`pyproject.toml`). It removes the commands but leaves your config and every
+project's `.pedacito/` untouched.
 
 ---
 
@@ -153,38 +91,14 @@ location.
 
 Point Pedacito at any server that speaks the OpenAI chat-completions API.
 
-**LM Studio.** Load a model, start the server (Developer tab → Status:
-Running). If Pedacito runs on a different machine than LM Studio, enable
-**"Serve on Local Network"** in that tab — without it the server only
-listens on `127.0.0.1` and a remote machine is refused. Default port `1234`.
-
-**Ollama.** `ollama serve`, then `ollama pull <model>`. Listens on
-`127.0.0.1` by default; for a remote setup, set `OLLAMA_HOST=0.0.0.0` (or
-the host's address) in Ollama's environment before starting it. Default
-port `11434`.
-
-**Hosted OpenAI-compatible APIs.** DeepSeek, OpenAI, Groq, Mistral and
-similar services work too. Set `base_url`, `api_key`, and `model` — that's
-all you need: pedacito detects a remote host (or a `deepseek*` model name)
-and automatically switches to `json_mode = "object"`, the mode those
-services support. They accept `response_format: {"type": "json_object"}`
-but reject the stricter `json_schema` pedacito uses for local llama.cpp
-servers, so without the switch the gather loop fails on its first step
-("would not produce valid JSON"). You can still set `json_mode` yourself;
-the spellings `"object"`, `"json_object"` and `"json"` are all accepted
-(and `"json_schema"` means `"schema"`). Reasoning models that return a
-separate `reasoning_content` field (DeepSeek-R1, and most other R1
-distills) are handled the same as local `<think>` blocks — stripped
-before JSON parsing and before edit extraction.
-
-Pedacito's tool-selection loop depends on the server enforcing
-`response_format: {"type": "json_schema", ...}` — grammar-constrained JSON
-output, so a tool choice always parses. Every GGUF/llama.cpp model in LM
-Studio supports this. Ollama added support for it on `/v1/chat/completions`
-for self-hosted instances; Ollama Cloud currently accepts the field without
-enforcing it, so a Cloud endpoint should be treated as unverified until
-tested. Without schema support, the gather loop falls back to salvaging JSON
-from free text, which is markedly less reliable.
+- **LM Studio** — load a model and start the server (Developer tab). Default
+  port `1234`. If Pedacito runs on another machine, enable "Serve on Local
+  Network".
+- **Ollama** — `ollama serve`, then `ollama pull <model>`. Default port `11434`.
+  For a remote setup, set `OLLAMA_HOST=0.0.0.0` before starting it.
+- **Hosted OpenAI-compatible APIs** — DeepSeek, OpenAI, Groq, Mistral and
+  similar. Set `base_url`, `api_key`, and `model`; Pedacito detects a remote
+  host and switches to `json_mode = "object"` automatically.
 
 Verify the connection from wherever Pedacito runs:
 
@@ -192,18 +106,9 @@ Verify the connection from wherever Pedacito runs:
 pedacito config --check
 ```
 
-```
-Connecting to http://box.tail1234.ts.net:1234/v1 ...
-  reachable. Models available: qwen3.5-9b
-  currently loaded: (none)
-  'qwen3.5-9b' is not resident; it will be loaded on first use (up to 240s).
-  'qwen3.5-9b' is listed. Testing that it actually generates...
-  generation works. You're good.
-```
-
-This distinguishes "server unreachable" (network/firewall/not running) from
-"model not found or won't load" (usually a name mismatch, or not enough
-free VRAM) — different problems with different fixes.
+This distinguishes "server unreachable" from "model not found or won't load"
+(usually a name mismatch, or not enough free VRAM) — different problems with
+different fixes.
 
 ---
 
@@ -213,63 +118,35 @@ free VRAM) — different problems with different fixes.
 pedacito config --init
 ```
 
-Writes a starter config to `~/.config/pedacito/config.toml` (Linux/macOS) or
+writes a starter config to `~/.config/pedacito/config.toml` (Linux/macOS) or
 `%APPDATA%\pedacito\config.toml` (Windows) — `pedacito config` always prints the
-exact path it's using. Edit the lines that matter:
+exact path it uses. `pedacito config --setup` builds it interactively, finding
+LM Studio or Ollama for you. The three settings that matter:
 
 ```toml
-[server]
 base_url = "http://localhost:1234/v1"   # or :11434/v1 for Ollama
-model = "qwen3.5-9b"            # exact id/name the server reports
-vram_gb = 8                     # GPU VRAM on the model server, in GB
+model    = "your-model-id"              # exact id/name the server reports
+vram_gb  = 8                            # GPU VRAM on the model server, in GB
 ```
 
-`vram_gb` is mandatory for local servers: pedacito reads the model's file
-size from the server and uses it plus VRAM to size the context window
-automatically. Hosted API configs do not need it.
+`vram_gb` is mandatory for local servers (Pedacito uses it, plus the model's
+file size, to size the context window); hosted configs don't need it. Settings
+resolve in layers, each overriding the one before: built-in defaults → your
+user config → the project's `.pedacito.toml` → `--config FILE` → a selected
+`--profile` → command-line flags. `[server]` and `[lmstudio]` are both accepted
+as section names for the connection settings.
 
-`[server]` is the current section name; `[lmstudio]` still works as an
-alias for older config files.
-
-Settings resolve in layers, each overriding the one before:
-
-| | |
-|---|---|
-| built-in defaults | |
-| `~/.config/pedacito/config.toml` (`%APPDATA%\pedacito\config.toml` on Windows) | your machine: url, model |
-| `<project>/.pedacito.toml` | per-project overrides |
-| `--config FILE` | an explicit file |
-| command-line flags | one-off overrides |
-
-Run `pedacito config` with no arguments to see every resolved setting and
-which layer set it:
-
-```
-Resolved settings (non-default marked):
-  * base_url    'http://box.tail1234.ts.net:1234/v1'   <- user config (...)
-  * max_steps   4                                      <- project config (...)
-    temperature 0.2
-```
-
-Typos are rejected rather than silently ignored, with a suggestion:
-
-```
-Config error: /home/you/code/proj/.pedacito.toml: unknown setting(s):
-  server.base_ur1   did you mean 'base_url'?
-```
-
-State for each project lives in `.pedacito/` at that project's root — see
-"Workspace layout" below. Deleting it is always safe; it just forces a
-re-index.
+Run `pedacito config` with no arguments to see every resolved setting and which
+layer set it; typos are rejected with a suggestion. State for each project lives
+in `.pedacito/` at that project's root — see "Undo and workspace layout" below.
 
 ---
 
-## Asking Pedacito how to use itself
+## Built-in help: `pedacito how`
 
 `pedacito how` is built-in help that answers in your own words, using this
 README, the [Quick Start](QUICKSTART.md), and Pedacito's source code as its
-references. It needs no project and builds no index — just a model
-connection:
+references. It needs no project and builds no index — just a model connection:
 
 ```bash
 pedacito how "how do I set up a config file?"
@@ -279,341 +156,186 @@ pedacito how                          # interactive help prompt
 ```
 
 Answers are written for a first-time user and include exact commands (or a
-minimal TOML snippet) whenever the question is about doing something. The
-resolved config for the help session is included automatically, so you can
-ask "what should I run with my setup?" and get an answer that uses your real
-server, model, profile, and limits. Secrets such as `api_key` are never sent
-to the model.
+minimal TOML snippet) whenever the question is about doing something. It uses
+your normal config automatically — secrets such as `api_key` are never sent to
+the model — so you can ask "what should I run with my setup?" and get an answer
+that reflects your real server, model, and limits.
 
-It uses your normal config, plus optional per-session overrides:
-
-```bash
-pedacito how --config ./deepseek.toml "how do I use profiles?"
-pedacito how --url http://localhost:11434/v1 \
-             --api-key ollama --model qwen3:8b --vram 8 \
-             "what does max_steps do?"
-```
-
-`--server` is an alias for `--url`, and `--vram-gb` for `--vram`. Unlike the
-coding commands, `how` does not require `vram_gb` — without it, help uses
-conservative built-in token budgets instead of sizing them to your GPU.
+It also accepts per-session overrides (`--url`/`--server`, `--model`,
+`--api-key`, `--vram`/`--vram-gb`, `--config`, `--profile`). Unlike the coding
+commands, `how` does not require `vram_gb`.
 
 ---
 
-## Understanding your project's code
+## The basic workflow
 
-`pedacito explain` answers questions about the code in the indexed project
-you are working on — how a function works, what a file is responsible for,
-how data or control flows between parts, and so on. It gathers the relevant
-source through the same lookup index `ask` uses, then answers in prose. It
-produces no edits and no search/replace blocks.
+Three commands cover most day-to-day work. The project path is the first
+argument; state lands in `<project>/.pedacito/`.
 
 ```bash
+pedacito index   ~/code/anki                                    # build the index (once; cached)
+pedacito ask     ~/code/anki -t "make the leech threshold configurable"
 pedacito explain ~/code/anki -q "how does the scheduler pick the next card?"
-pedacito explain ~/code/anki -q "what does src/scheduler.py do?"
+```
+
+### `index` — build the lookup index
+
+Parses the project into a map of files, symbols, and line ranges, then
+optionally adds one-line LLM summaries. `--no-summaries` builds the static index
+only (instant, no LLM calls); `--resummarise` discards cached summaries and
+regenerates them with the current model. Summaries are rationed (units with
+docstrings and methods covered by their class are skipped) and cached by content
+hash, so re-indexing only costs what actually changed. `ask` and `chat` build or
+refresh the index automatically, so you only run `index` explicitly the first
+time.
+
+Three inspection commands help before and after indexing, none of which need a
+working model:
+
+- `pedacito files ~/code/anki` — every candidate file, and why it was kept or
+  dropped. Free.
+- `pedacito cost ~/code/anki` — what a first index will cost (LLM calls, time).
+  Free.
+- `pedacito map ~/code/anki` — prints the current index, no model.
+
+### `ask` — run one task
+
+`ask` is the core loop: it gathers the source the task needs (the model requests
+files, symbols, and snippets through the index), then produces edits as
+search/replace blocks. By default it's a dry run — you see a diff and nothing is
+written:
+
+```bash
+pedacito ask ~/code/anki -t "..." --apply     # write immediately
+pedacito ask ~/code/anki -t "..." --review    # side-by-side sign-off page
+```
+
+Every write snapshots originals first; `pedacito restore <project>` undoes the
+last one.
+
+### `explain` — answer questions about the code
+
+`explain` answers questions about the indexed project — how a function works,
+what a file is responsible for, how data or control flows between parts — in
+prose, with no edits:
+
+```bash
 pedacito explain ~/code/anki -q "trace the flow from answer to schedule"
 pedacito explain ~/code/anki        # interactive prompt
 ```
 
-Where `how` explains Pedacito itself and `ask` does tasks, `explain` is
-scoped to your project. It is always bound to that project's index, and it
-never builds one — if the project has no index yet, it points you at
-`pedacito index <project>` (or at navigating to a project you have already
-indexed). It accepts the same connection/config flags as `ask` (`--url`,
-`--model`, `--config`, `--profile`, …), plus the file-selection flags
-(`--exclude`, `--include`, `--ext`, `--no-refs`) used when the index needs
-refreshing.
+It's always scoped to the project's index and never builds one; if there's no
+index yet, it tells you to run `pedacito index` (or navigate to a project you've
+already indexed).
 
 ---
 
-## Running multiple models
+## More ways to work
 
-Define a profile per model instead of editing `model =` each time:
-
-```toml
-[profiles.small]
-model = "qwen2.5-coder:7b"        # example Ollama name
-
-[profiles.big]
-model = "devstral-small-2-24b-instruct-2512"   # example LM Studio id
-max_steps = 8
-
-[profiles.reasoning]
-model = "qwen3:32b"
-disable_thinking = true          # skip the <think> block: faster, cheaper
-thinking_suffix = "/no_think"    # a second, more universal way to ask; harmless to set both
-```
+### `chat` — interactive session
 
 ```bash
-pedacito ask anki -t "..." --profile big
-pedacito config --profile big        # confirm exactly what it resolves to
+pedacito chat ~/code/anki
 ```
 
-A profile can override any setting, not just the model — useful when a
-larger or slower model needs more lookups per task than a smaller one.
+Keeps the index warm between tasks instead of reloading it each time. Type a
+task, or `/help` for the slash commands: `/profile`, `/model`, `/apply`,
+`/steps`, `/status`, `/profiles`, `/quit`.
 
-**Token limits ride with the profile.** A 9B on an 8k local window and
-deepseek-chat over an API are the same code path with wildly different
-budgets, so each profile carries its own complete set of limits. Add
-`tier = "small" | "medium" | "large" | "hosted"` and pedacito fills in all
-ten budget knobs (`max_tokens_summary/step/answer/plan/build`,
-`flat_map_token_budget`, `max_gathered_chars`, `max_read_lines`,
-`max_spec_chars`, `max_new_files`) from a preset. On a local server those
-token budgets are floors: auto-fit uses the larger of the tier value and a
-VRAM-derived calculation when the server reports the model's file size (see
-"Token budgets"). A value you write explicitly overrides both:
+### `new` — start a project from scratch
 
-```toml
-[profiles.ds]
-tier = "hosted"                  # step 7000 (under deepseek's ~8k output cap),
-#                                  # answer 40000, gathered 100k chars, 100 steps ...
-base_url = "https://api.deepseek.com/v1"
-model = "deepseek-chat"
-json_mode = "object"
-max_tokens_answer = 20000        # your key beats the preset
+`ask` and `chat` edit an existing codebase; `new` builds one. Give it a one-line
+description (`-t`) or a spec document (`--spec`, also via stdin), and it plans
+the file tree, scaffolds it, then fills in each file:
+
+```bash
+pedacito new my-app -t "a CLI todo manager with a sqlite backend" --apply
+pedacito new my-api --spec docs/spec.md --review      # sign off in the browser
+pedacito new my-app -t "..." --plan-only --apply      # stop after the skeleton
 ```
 
-Even without a `tier` line, pedacito infers one from the model/server name
-(`...8b` → small, `...14b` → medium, `...27b/32b+` → large, deepseek/openai
-APIs → hosted); `tier = ""` turns inference off and keeps the built-in
-defaults. Running with no profile at all always uses the conservative
-defaults. `pedacito config` shows which tier is active and marks every
-limit that came from a profile.
+Dry run by default. `--plan-only` stops after the skeleton so you can adjust the
+plan yourself; `--complex` hands implementation to the autonomous loop.
 
-Model names are server-specific: LM Studio wants the id from `/v1/models`
-(shown by `pedacito config --check`); Ollama wants the name from `ollama
-list`. Copy it exactly — a mismatched name is the most common setup
-mistake.
+### `auto` — autonomous loop over a task list
 
-Four ways to select a profile, lowest to highest precedence:
-`default_profile =` in your config → `PEDACITO_PROFILE` environment variable
-→ `--profile` on one command → `/profile` inside a running `chat` session.
-Inside `chat`, `/profile NAME` switches models mid-session (waiting for the
-new one to load) while keeping the index warm — the cheapest way to compare
-two models on the same task.
+`auto` breaks a goal into an ordered checklist and implements each task in a
+fresh context window, with optional verification and repair:
 
-Switching models means the server has to load the new one, which can take
-anywhere from instant to a couple of minutes. Pedacito waits for this
-automatically (`load_wait_seconds`, default 240s) and reports progress:
-
-```
-[server currently has qwen3.5-9b loaded; requesting 'qwen3:32b']
-[waiting for 'qwen3:32b' to load -- switching models can take a minute or two]
-[model ready after 29s]
+```bash
+pedacito auto . -t "add retry logic to the sync client"     # plan only, nothing written
+pedacito auto . -t "..." --apply                            # plan, then implement every task
+pedacito auto . --apply --verify "pytest -q"                # verify each task, repair on failure
+pedacito auto . --apply --plan TODO.md                      # use an existing checklist instead
 ```
 
-A model that never finishes loading is a server-side problem, usually not
-enough free VRAM for both models at once.
+State lives in a plain markdown plan file (`PLAN.md` by default, or `--plan
+FILE`), so a run is resumable and editable mid-flight. `--verify CMD` runs after
+each task and feeds failures back for repair (`--repair` rounds); a missing
+Python dependency is reported, or installed with `--auto-install` (off by
+default). `--max-tasks N` caps the run. Without `--apply`, `auto` only generates
+and prints the plan.
 
-### Reasoning models
+### `gui` — browser control panel
 
-Models that emit a `<think>...</think>` block before answering (Qwen3 and
-similar) are supported: thinking is stripped before JSON parsing and before
-edit extraction, so it never corrupts a tool call, an edit, or a session
-log. Turning thinking off saves time and tokens but isn't required for
-correctness. Two independent switches exist because which one a given model
-honors varies: `disable_thinking` sends the server a
-`chat_template_kwargs: {"enable_thinking": false}` hint (LM Studio/llama.cpp
-convention); `thinking_suffix` appends literal text like `/no_think` to the
-prompt instead. Setting both is harmless.
+```bash
+pedacito gui                # opens in a browser at an OS-chosen port
+pedacito gui --no-open      # print the URL instead of opening a browser
+```
 
-### Chat template compatibility
-
-Chat templates differ in what message sequences they accept, and Pedacito
-handles the two common failure modes transparently:
-
-- **Mistral-family templates** (Devstral, Mistral Small) require strictly
-  alternating user/assistant turns and raise an error otherwise. The gather
-  loop is built to alternate; the client also collapses any adjacent
-  same-role messages before sending, as a second line of defense.
-- **Gemma** has no system role. If a template rejects one, the client folds
-  the system prompt into the first user turn and retries automatically,
-  remembering the result so it doesn't rediscover this on every call.
+A local control panel instead of the terminal: open a project, build the index,
+check the model, run tasks with the review page inline, and ask `explain`
+questions. One process, one page, bound to `127.0.0.1` like every other server
+Pedacito starts.
 
 ---
 
 ## What gets indexed
 
-**Python, JavaScript/TypeScript/TSX, and Ruby** are parsed and chunked
-semantically — functions, classes, methods, with exact line ranges —
-Python via the standard-library `ast` module, the other three via
-`tree-sitter`, installed by default (see "Install" above).
+**Python** (via the standard-library `ast`) and **JavaScript, TypeScript, TSX,
+and Ruby** (via `tree-sitter`, installed by default) are parsed into functions,
+classes, and methods with exact line ranges. Everything else useful as context
+— `.md .txt .rst .csv .tsv .json .toml .yaml .yml .ini .cfg .conf .env .sql
+.sh` — is indexed *structurally*: the map shows a CSV's columns, a JSON file's
+keys, a TOML file's sections, a markdown file's headings. Contents stay out of
+the map, but `read` and `grep` reach them normally.
 
-Everything else that's useful as context — `.md .rst .txt .csv .tsv .json
-.toml .yaml .yml .ini .cfg .conf .env .sql .sh` — is indexed *structurally*:
-the map shows a CSV's columns, a JSON file's top-level keys, a TOML file's
-sections, a markdown file's headings, each with real line ranges. Contents
-stay out of the map, but `read` and `grep` reach them normally — so one
-`grep` can cross code and config together:
-
-```
-data/config.csv:2: min_score,0.75,ratio,cutoff for the run filter
-src/app.py:18: return [i for i in items if i > self.cfg["min_score"]]
-```
-
-**Anything else is invisible by default** — not parsed, not structural, not
-in the map, and `read`/`grep` will report it as not indexed. A language
-without a symbol-level chunker (Go, Rust, Java, C, ...) only gets *any*
-coverage once you add its extension explicitly:
+Anything else is invisible until you add its extension explicitly:
 
 ```bash
 pedacito ask . -t "..." --ext .go
 ```
 
-which routes it through the same structural (fixed-size block) chunker as
-an unrecognized reference file — `read`/`grep` work, there's just no
-symbol map for it.
+which routes it through the same structural chunker — `read`/`grep` work,
+there's just no symbol map for it.
 
-Reference files (structural, of any kind) are never sent to the model for
-summarizing; their extracted shape already says more than a generated
-sentence would, for free.
+**Excluding files** works in three layers, increasing precedence:
 
-`grep`/`outline` locate code; only `read` returns text exact enough to
-paste into an edit. The gather loop enforces this — it will not accept
-`done` until the model has actually read something, so an edit can't be
-built from a trimmed `grep` snippet that would never match the file.
+1. `.pedacitoignore` in the project root (gitignore syntax) — the project's
+   `.gitignore` is read too.
+2. Command-line flags: `--exclude 'deprecated/'`, `--include
+   'deprecated/still_used.py'`, `--no-refs` (code only), `--no-gitignore`.
+3. Naming a path directly always wins — typing it is an explicit request.
 
-## Excluding and including files
+`pedacito files` shows every candidate and the reason it was kept or dropped.
 
-Three mechanisms, increasing precedence.
+## Index freshness, tiers, and summaries
 
-**1. `.pedacitoignore`** in the project root, gitignore syntax:
+The index stores a content hash per file and self-corrects on every command:
+edits Pedacito makes are re-chunked immediately, and edits you make in your
+editor are detected and refreshed automatically on the next run (line ranges are
+only meaningful against the bytes they were computed from). Run a full
+`pedacito index` after a large refactor or a `git pull`.
 
-```
-deprecated/           # a folder of old script versions
-*_old.py
-/scratch              # anchored to the root only
-experiments/**/tmp.py
-!deprecated/still_used.py   # negation; last match wins
-```
-
-The project's existing `.gitignore` is read too (`--no-gitignore` to skip
-it), plus built-in defaults: `.git`, `__pycache__`, `.venv`, `node_modules`,
-`build`, `dist`, `*.egg-info`, and Pedacito's own `.pedacito/`.
-
-**2. Command-line flags**, repeatable:
-
-```bash
-pedacito ask src/ -t "..." --exclude 'deprecated/' --exclude '*_v1.py'
-pedacito ask src/ -t "..." --include 'deprecated/still_used.py'
-pedacito ask . -t "..." --ext .jinja --ext .proto   # index extra file types
-pedacito ask . -t "..." --no-refs                   # code only (Python/JS/TS/Ruby), no .md/.json/etc.
-```
-
-**3. Naming a path directly always wins.** `pedacito ask deprecated/app_v1.py`
-indexes that file even though `deprecated/` is ignored — typing it is an
-explicit request.
-
-`pedacito files` shows every candidate with the reason it was kept or
-dropped, at no cost:
-
-```
-$ pedacito files .
-  code  src/app.py
-  ref   data/config.csv
-  skip  deprecated/app_v1.py   [ignored]
-  skip  .venv/lib/vendored.py  [ignored]
-```
-
-Two caveats on the pattern matcher, since it's a practical subset of
-gitignore rather than a full implepedacitoion: character ranges like `[abc]`
-aren't supported, and a negation always wins if it matches last — even if a
-parent directory was excluded. Real gitignore refuses to resurrect files
-under an excluded directory; this doesn't, because that's what most people
-expect when they write a negation.
-
-Files over `max_reference_bytes` (2MB default) are recorded by name and
-header only, so a large CSV still shows up in the map without being read in
-full.
-
----
-
-## Index freshness
-
-The index stores a content hash per file and checks it on every command.
-Edits Pedacito makes are re-chunked immediately, whether applied from the
-terminal or from the review page. Edits made outside Pedacito — in an editor,
-between sessions — are detected and corrected automatically on the next
-command:
-
-```
-index refreshed (2 changed, 1 new)
-```
-
-This matters because line ranges are only meaningful against the bytes they
-were computed from. Without this check, editing three lines at the top of a
-file would silently shift every range below it, and the model would read
-the wrong function while believing it read the right one. Deleted files are
-dropped from the index; new files are picked up structurally right away but
-arrive without a generated summary until the next `pedacito index`.
-
-Run a full `pedacito index` after a large refactor or a `git pull` that
-touched many files. Day to day, it isn't necessary — every command
-self-corrects. `pedacito map <project>` is always the fastest way to see
-exactly what Pedacito currently believes about a project, with no model
-involved.
-
----
-
-## The map is tiered
-
-A flat listing of every function does not survive a real project. Measured
-on 452KB of Python stdlib source (`inspect.py`, `typing.py`, `tarfile.py`,
-`argparse.py` — 570 units):
-
-| | tokens in every prompt |
-|---|---|
-| Flat map with summaries | ~35,500 |
-| Tier 0, file cards | **~1,500** |
-| Tier 1, one file's outline (on demand) | ~2,400 |
-
-Tier 0 is one card per file: line count, imports, a two-sentence summary,
-and top-level definitions with their line ranges attached — with ranges on
-the card, the model can often skip straight to `read` without an `outline`
-round trip. Projects small enough that the flat map fits under
-`flat_map_token_budget` get it automatically, since when it fits it is
-strictly more useful.
-
-When more detail is needed, the model descends: `outline` gives one file's
-full unit list, `read` gives exact lines. Outlines are treated as
-navigation rather than evidence — they stay in the gather conversation but
-are dropped before the answer prompt, since carrying a multi-thousand-token
-outline into the answer phase is pure waste once the model has decided what
-to read.
-
-## Summarizing is rationed
-
-Of those 570 units, 442 cleared the length threshold for a summary — but
-261 already had a docstring, and 281 were methods whose class summary plus
-signature already says enough. Summarizing only undocumented top-level
-units left 76 calls, plus one per file:
-
-```
-$ pedacito cost src/
-570 units across 4 files
-  eligible for a summary : 442
-  skipped, has docstring : 261
-  skipped, is a method   : 197
-  LLM calls              : 76 units + 4 files = 80
-  first index @ 25 tok/s : ~4 min (cached after)
-```
-
-`pedacito cost` builds only the static index, so it's instant and free — run
-it before `pedacito index` on anything large. File summaries are generated
-from a file's *skeleton* (imports plus signatures) rather than its raw
-source, since a 100KB module doesn't fit in a prompt but its skeleton does.
-
----
+The map is tiered so it survives real projects: a flat listing of every function
+fits small projects; larger ones get one *card* per file (imports, a summary,
+and top-level definitions with line ranges), and the model descends with
+`outline` and `read` on demand. `pedacito map <project> --tier auto` shows which
+side of the line a project landed on.
 
 ## Editing: search/replace, not diffs or whole files
 
-Small models get unified-diff hunk headers and line offsets wrong
-frequently, and a wrong header can silently corrupt a file. Whole-file
-rewrites are slow at local inference speeds and models tend to quietly drop
-a function somewhere in the middle of a long regeneration.
-
-Instead, edits are search/replace blocks anchored on text the model
-actually read:
+Edits are search/replace blocks anchored on text the model actually read:
 
 ```
 --- FILE: src/app.py
@@ -627,226 +349,29 @@ actually read:
 ```
 
 A block either matches the file exactly or it fails cleanly — no partial or
-silent corruption. Every edit is validated before anything is written —
-`ast.parse()` for Python, `tree-sitter`'s parse-error detection for JS/TS/Ruby
-(when that extra is installed) — and a result that doesn't parse cleanly is
-rejected, nothing written. A failed block's error is fed back to the model
-(up to two rounds) so it can re-anchor with more context.
-
-## Starting a project from scratch
-
-`ask` and `chat` edit an existing codebase. `pedacito new` builds one: give
-it a one-line description with `-t`, a larger spec document with `--spec`
-(a Markdown/text file, or piped in via stdin — the two can be combined),
-and it runs three stages against the same index machinery the rest of the
-tool uses:
-
-1. **Plan** — one model call turns the spec into a file tree: every file
-   with its path and purpose, as structured JSON (not prose). Plans longer
-   than `max_new_files` are truncated with the excess reported; small
-   models love to enumerate 40 tiny stubs.
-2. **Skeleton** — the plan is applied for real: directories created, each
-   source file written with only a header comment stating its purpose.
-   The skeleton gets its own in-memory index, so the next stage can see
-   the whole project without any of it being huge.
-3. **Build** — one pass per file fills in its implementation, given the
-   spec, the plan, and the current contents of its neighbouring files.
-
-```bash
-pedacito new my-app -t "a CLI todo manager with a sqlite backend" --apply
-pedacito new my-api --spec docs/spec.md --review      # sign off in the browser
-pedacito new my-app -t "..." --plan-only --apply      # stop after the skeleton
-pedacito new my-app --spec docs/spec.md --complex --apply   # auto-loop implementation
-```
-
-For a large or complicated project, `--complex` swaps stage 3 (the build
-pass) for the autonomous outer loop: after planning and scaffolding it writes
-a resumable task checklist (`PLAN.md`, one task per source file) and hands
-implementation to `pedacito auto` — each file implemented in a fresh context
-window, with an optional `--verify` command feeding failures back for repair.
-
-```bash
-pedacito new my-app --spec docs/spec.md --complex --apply \
-    --verify "python -m pytest -q" --max-tasks 40
-```
-
-The `--verify`, `--repair`, `--max-tasks`, and `--keep-going` flags pass
-straight through to the auto loop and only apply with `--complex`. Unlike the
-default build pass, which runs one uninterruptible session, `--complex` leaves
-its progress in `PLAN.md` — stop it, edit the checklist, and re-run
-`pedacito auto . --apply` to resume exactly where it left off.
-
-When the loop finishes, `--complex` verifies the result before declaring
-success, and repairs failures. Verification is layered, cheapest first:
-
-1. **Import check** — the entry point must import cleanly. Failures are
-   repaired (this is the same pass the simple build runs).
-2. **Call/signature check** — a conservative static pass over the project's own
-   top-level functions/classes. Each file is implemented independently, so a
-   call can drift from its definition (`core.py` calls `Level()` while
-   `level.py` defines `Level.__init__(self, level_data)`). An import never runs
-   the call, so this catches it statically. Bare-name calls only, unambiguous
-   names only, `*args`/`**kwargs` skipped — a heuristic, not a type checker.
-3. **Runtime check** — because static checks never *execute* the program, the
-   project is then actually run. If you supplied `--verify CMD`, that command
-   runs; and by default a project with `main.py` is smoke-run
-   (`python main.py`). A process still running at `auto_smoke_timeout`
-   (default 20s) counts as **started successfully** — games, servers, and UIs
-   do not exit on their own. A crash before the timeout is a failure.
-
-Every failure at each layer is fed back to the model, which emits edits to fix
-it, and the check is re-run (up to `auto_verify_rounds`, default 2) *before* the
-run completes. A failure that survives repair is reported and makes the run
-exit non-zero. Two failure kinds are deliberately excluded from code repair:
-**missing packages** (reported, or installed with `--auto-install`) and
-**headless display errors** (`No available video device` and friends), which
-mean the machine cannot run a GUI, not that the code is wrong — those are
-reported as "could not verify in this environment".
-
-`--verify` is therefore optional. Pass it when you have a better functional
-check than the default (a test suite, a headless smoke command, a script); if
-you don't, the automatic import + static + smoke checks still run.
-
-Like everything else, it's a dry run by default: without `--apply` you get
-the plan and a preview of the skeleton, nothing on disk. `--plan-only`
-stops after stages 1–2 so you can adjust the plan yourself and finish the
-job with ordinary `ask --apply` runs. The target directory must not exist
-or be empty; `--force` allows scaffolding over a non-empty one. Build
-passes write complete files directly (there's nothing to anchor a
-search/replace block against yet) but still land inside a normal backup
-snapshot — `pedacito restore <project>` undoes a whole `new` run exactly
-like any other apply.
-
-Spec documents longer than `max_spec_chars` are truncated with a loud
-warning rather than silently dropped. A finished run leaves a session
-record under `.pedacito/sessions/` like any task, so you can see what was
-asked, planned, and written days later.
-
-## Autonomous mode
-
-`ask` and `chat` run *one* task end to end. `pedacito auto` wraps that in
-the **outer loop** (the "Ralph loop"): it breaks a goal into an ordered
-checklist, then implements each task one at a time — **each in a fresh
-context window** — until the list is empty. State lives in a plain markdown
-plan file on disk, not in any conversation, so a long autonomous run doesn't
-rot the way one ever-growing session does.
-
-```bash
-pedacito auto . -t "add retry logic to the sync client"     # plan only, nothing written
-pedacito auto . -t "..." --apply                            # plan, then implement every task
-pedacito auto . --apply --verify "pytest -q"                # verify each task, repair on failure
-pedacito auto . --apply --plan TODO.md                      # use an existing checklist instead
-```
-
-- **Plan file** — a markdown checklist (`PLAN.md` in the project root by
-  default, or `--plan FILE`). Each line is `- [ ] task`. You can edit it
-  before running, or mid-run: the loop just takes the first unchecked line
-  each pass. `--force` regenerates a plan over the existing one.
-- **Fresh context per task** — every task is run by a brand-new agent over
-  the same warm index, exactly like `ask`, so it inherits the identical edit
-  anchoring, repair rounds, backups, and session logs.
-- **Verification** — `--verify "pytest -q"` runs after each task. A failure
-  feeds the command's output back to the model, which edits to fix it, up to
-  `--repair` rounds (default 2). `--verify` is optional: after the checklist
-  finishes, `auto --apply` always exercises the project once more — running
-  your `--verify` if given, and by default smoke-running `main.py` (a process
-  still running at `auto_smoke_timeout` counts as started) — and repairs
-  failures before returning. Without any verify command a task counts as done
-  whenever its edits apply cleanly, so the final check is what keeps a run
-  from declaring success on broken code.
-- **Missing dependencies** — if `--verify` fails with `ModuleNotFoundError`
-  (or `ImportError: No module named ...`), there is nothing to fix in the
-  source, so it is *not* sent to the code-repair loop. It is reported as a
-  dependency problem, or installed and retried with `--auto-install`
-  (off by default: the module name comes from generated code).
-- **Guardrails** — `--max-tasks N` caps how many tasks one run attempts; by
-  default the loop stops on the first task that produces no applied edit or
-  still fails verification (`--keep-going` to flag it `[!]` and continue).
-- **Line guard** — a source file whose scaffold stub is longer than
-  `auto_split_lines` (default 120) is split into several implementation tasks,
-  one per group of top-level definitions, so no single reply has to emit a
-  whole oversized file and get cut off at the output token limit.
-
-Without `--apply` this is plan-only, like the rest of Pedacito: it writes the
-checklist and prints it, and nothing on disk changes. `pedacito restore` still
-undoes the whole run, and every task leaves a `.pedacito/sessions/` record.
-
-The config knobs `auto_plan_file`, `auto_verify`, `auto_max_tasks`,
-`auto_repair_rounds`, `auto_split_lines`, `auto_install_deps`, `auto_smoke`,
-`auto_smoke_timeout`, and `auto_verify_rounds` let you set these per project
-or per profile (see "Configuration reference"). A hosted profile can afford
-more tasks and more repair rounds than a 9B at local speed, so they ride with
-the profile like every other limit.
+silent corruption. Every edit is validated before anything is written
+(`ast.parse()` for Python, `tree-sitter` for JS/TS/Ruby), and a failed block's
+error is fed back to the model (up to two rounds) so it can re-anchor with more
+context.
 
 ## Review page
 
-`--review` opens a side-by-side page instead of writing directly: current
-file on the left, proposed version on the right, changed words
-highlighted, long unchanged stretches folded. Self-contained HTML — no
-CDN, no external fonts — so it opens and works offline. Applying takes two
-deliberate clicks (tick an attestation, then confirm), and Enter never
-triggers a write.
+`--review` (or `review = true` in config) opens a side-by-side sign-off page
+instead of writing directly: current file on the left, proposed version on the
+right, changed words highlighted, long unchanged stretches folded. It's
+self-contained HTML — no CDN, no external fonts — so it opens and works offline.
+Applying takes two deliberate clicks, and Enter never triggers a write.
 
-The property that matters more than the buttons: the page carries the
-SHA-256 of every file as it stood when the preview was built, and applying
-re-hashes and refuses on any mismatch. Editing a file in your own editor
-while the review sits open causes the write to be refused rather than
-silently overwriting your change:
+The property that matters more than the buttons: the page pins the SHA-256 of
+every file as it stood when the preview was built, and applying re-hashes and
+refuses on any mismatch. Editing a file in your own editor while the review sits
+open causes the write to be refused rather than silently overwriting your
+change. The review server binds to `127.0.0.1` only.
 
-```
-Not written: src/scheduler.py (changed on disk). Re-run the task to rebuild the review.
-```
-
-The review server binds to `127.0.0.1` only and shuts down after sign-off,
-discard, or a timeout (`review_timeout`, default 1800s) — it writes files,
-so it has no business listening on a network interface. Make it the default
-for every task with `review = true` under `[review]` in your config, then
-use `--no-review` for terminal-only runs.
-
-## Browser GUI
-
-```bash
-pedacito gui                # opens in a browser at an OS-chosen port
-pedacito gui --port 8756    # fixed port instead
-pedacito gui --no-open      # print the URL instead of launching a browser
-```
-
-A local control panel instead of the terminal: pick a project, check the
-model, type a task, and watch the same review page above render inline —
-one process, one page, bound to `127.0.0.1` like every other server
-Pedacito starts.
-
-- **Project** — type or paste a path; a small recent-projects list is
-  remembered between sessions, and the profile dropdown fills in as soon
-  as you finish typing, before Open is ever clicked.
-- **Build index** only appears when the project has none yet — never
-  triggered silently, since indexing spends real model calls.
-- **Check model** runs the same reachability-plus-generation check as
-  `pedacito config --check`.
-- **Ask** runs a task with review on by default; tick "write directly" to
-  go straight to `--apply` instead.
-- **Explain** answers a question about the project's code in prose — how a
-  function works, what a file does, how data flows — no edits, no review.
-- A sidebar lists every file currently in the index, with a filter box.
-- Five color schemes (Parchment, Sage, Mocha, Clay, Nightshade), remembered
-  in the browser between sessions.
-- **Exit** stops the server from the page itself.
-
-Current limits: one project open at a time (switching directories reloads
-the warm index/agent rather than keeping several resident); detailed
-step-by-step gather/answer progress still prints to the terminal
-`pedacito gui` was launched from, not into the page; and `restore`, `how`,
-the advanced per-task flags (`--steps`, `--exclude`/`--include`,
-`--ext`, `--no-refs`, `--no-gitignore`, a one-off `--url`/`--model` override),
-and narrowing to a subset of paths are CLI-only for now.
-
-The recent-projects list lives in `gui_recent.json` next to your user
-config (see "Configure" above) — deleting it just empties the dropdown.
-
-## Undo
+## Undo and workspace layout
 
 Every write (from `--apply` or the review page) snapshots originals into
-`.pedacito/backups/<timestamp>/` first:
+`.pedacito/backups/<stamp>/` first:
 
 ```bash
 pedacito restore <project> --list
@@ -855,18 +380,8 @@ pedacito restore <project>
 pedacito restore <project> --snapshot 20260830-020724
 ```
 
-Restoration is byte-for-byte, including the original line-ending style.
-Each run also writes a session record — the task, every lookup the model
-made with its stated reason, the reply, and which edits landed — to
-`.pedacito/sessions/<timestamp>.md`. That's the file worth opening when an
-edit turns out wrong days later.
-
----
-
-## Workspace layout
-
-Nothing Pedacito writes lands beside your source files. Everything for one
-project lives under that project's root:
+Restoration is byte-for-byte. Everything Pedacito writes for a project lives
+under that project's root:
 
 ```
 <project>/.pedacito/
@@ -875,320 +390,108 @@ project lives under that project's root:
     backups/<stamp>/     pre-write snapshots, mirroring the tree
     sessions/<stamp>.md  what was asked, looked up, and changed
     reviews/<stamp>.html saved copies of review pages
-    log.txt              the operational run log (see below)
+    log.txt              a flat, timestamped event trace
 ```
 
-### The run log (`log.txt`)
-
-`log.txt` is the troubleshooting log: a flat, timestamped trace of commands,
-phase transitions, statuses, and errors — one line per event, with no model
-thinking or generated output (that stays in `sessions/`). For example:
-
-```
-2026-10-24 09:23:03.100  INFO   command: pdc new pkgame -t "..." --complex --apply
-2026-10-24 09:23:05.204  INFO   complex: 16 task(s) -> PLAN.md
-2026-10-24 09:23:05.205  INFO   auto loop: plan=PLAN.md verify=(none)
-2026-10-24 09:23:06.118  INFO   task: Implement game/player.py -- ...
-2026-10-24 09:24:01.001  WARN   answer reply truncated at the output limit
-2026-10-24 09:24:01.104  ERROR  no edit blocks parsed from the reply
-2026-10-24 09:24:01.150  ERROR  task produced no applied edits
-2026-10-24 09:25:12.900  INFO   auto loop finished: 3 done, 1 failed
-```
-
-Each run appends to it, so a whole `--complex` run reads top to bottom as one
-event trace — much easier to scan for where a failure happened than the
-per-task `sessions/` files (which hold the model's full reply and lookups
-when you need the detail behind a specific event).
-
-On first run in a project, Pedacito also creates a commented
-`.pedacitoignore` and adds its workspace entries — `.pedacito/`,
-`.pedacitoignore`, `.pedacito.toml`, `pedacito.toml` — to that project's
-`.gitignore`, creating the file if it's a git checkout that doesn't already
-have one. It never invents a `.gitignore` where there's no repo. Both
-behaviors are switchable (`create_ignore_file`, `manage_gitignore`).
-
-### The project root is inferred
-
-`.pedacito/` goes into the *project*, not wherever the terminal happens to be:
-
-```bash
-cd ~/pedacito
-pedacito ask ~/code/anki -t "..."     # state lands in ~/code/anki/.pedacito/
-```
-
-The root is the common ancestor of the paths given. Pass `--root` to
-override — for example, indexing one subdirectory of a larger repository
-while keeping paths relative to the repository root.
+`sessions/` is the file worth opening when an edit turns out wrong days later;
+`log.txt` is the quick scan for *where* a failure happened. On first run Pedacito
+also creates a commented `.pedacitoignore` and adds its workspace entries to
+`.gitignore` (both switchable via `create_ignore_file` and `manage_gitignore`).
 
 ---
 
-## Cross-platform correctness
+## Profiles, tiers, and token budgets
 
-Every path a project file takes through Pedacito is handled explicitly for
-Windows, since naive text I/O will silently corrupt files there:
+Define a profile per model instead of editing `model =` each time:
 
-- **Line endings are preserved exactly.** A CRLF file stays CRLF; an LF
-  file stays LF — even though matching and chunking work on LF internally.
-  This matters more than it sounds: default Python text I/O on Windows
-  translates line endings on write, which turns a three-line edit into a
-  whole-file rewrite the moment it touches an LF file.
-- **A UTF-8 byte-order mark**, if present, is stripped before parsing and
-  restored on write.
-- Both `src\app.py` and `src/app.py` are accepted anywhere a path is typed.
-  The index always stores POSIX-style paths internally, so `.pedacito/` built
-  on one machine reads correctly on another.
-- Ignore-pattern matching follows the platform, the same way git does:
-  case-insensitive on Windows, case-sensitive on Linux/macOS.
-- Paths on different Windows drive letters have no common ancestor for
-  root inference; pass `--root` explicitly if a run spans drives.
+```toml
+[profiles.small]
+model = "qwen2.5-coder:7b"
+
+[profiles.big]
+model = "some-27b-model"
+max_steps = 8
+```
+
+```bash
+pedacito ask anki -t "..." --profile big
+```
+
+Select a profile with `default_profile =` in config, the `PEDACITO_PROFILE`
+environment variable, `--profile` on a command, or `/profile` inside `chat`.
+A profile can override any setting, not just the model.
+
+Add `tier = "small" | "medium" | "large" | "hosted"` and Pedacito fills in all
+the token-budget knobs (`max_tokens_summary/step/answer/plan/build`,
+`flat_map_token_budget`, `max_gathered_chars`, `max_read_lines`,
+`max_spec_chars`, `max_new_files`) from a preset — tight for a 9B on an 8k
+local window, generous for DeepSeek-class APIs. You rarely need to tune any of
+this manually: Pedacito auto-detects the server's real context window and the
+model's file size (using `vram_gb`) and sizes every budget to fit (`auto_fit`,
+on by default). Explicit values you write always win. `pedacito config` shows
+which tier is active and marks every non-default value.
+
+Reasoning models (Qwen3 and similar) are supported — `<think>` blocks are
+stripped before parsing, so they never corrupt a tool call, an edit, or a
+session log. `disable_thinking` and `thinking_suffix` turn thinking off. The
+client also handles Mistral-family templates (strict role alternation) and
+Gemma (no system role) transparently.
 
 ---
 
 ## Configuration reference
 
-Set any of these under the matching section in your config, or as
-`[profiles.NAME]` overrides. `pedacito config` lists every field with its
-current value and where it came from.
-
-**Token limits are profile-scoped.** Every budget knob below can be set per
-profile, and a profile's `tier = "small"|"medium"|"large"|"hosted"` line
-fills all ten limit fields (`max_tokens_summary/step/answer/plan/build`,
-`flat_map_token_budget`, `max_gathered_chars`, `max_read_lines`,
-`max_spec_chars`, `max_new_files`) from a preset tuned to that class of
-model — tight for a 9B on 8k local context, generous for DeepSeek-class
-APIs. For local servers those token budgets are **floors**: when the server
-reports the model's file size, auto-fit uses the larger of the tier value
-and a VRAM-derived budget (see "Token budgets" below). Values you write
-explicitly override the preset and the calculated value. With no tier and no profile you get
-the defaults in this table. See "Running multiple models".
-
-Tier preset values, for reference:
-
-| Setting | small | medium | large | hosted |
-|---|---:|---:|---:|---:|
-| `max_tokens_summary` | 160 | 240 | 320 | 400 |
-| `max_tokens_step` | 500 | 1500 | 2500 | 7000 |
-| `max_tokens_answer` | 1500 | 8000 | 12000 | 40000 |
-| `max_tokens_plan` | 1200 | 5000 | 8000 | 8000 |
-| `max_tokens_build` | 4000 | 16000 | 24000 | 32000 |
-| `flat_map_token_budget` | 1500 | 6000 | 8000 | 12000 |
-| `max_gathered_chars` | 12000 | 48000 | 60000 | 100000 |
-| `max_read_lines` | 120 | 200 | 300 | 400 |
-| `max_spec_chars` | 20000 | 60000 | 120000 | 200000 |
-| `max_new_files` | 12 | 24 | 40 | 60 |
-| `max_steps` | 40 | 50 | 60 | 100 |
-| `repair_rounds` | 1 | 2 | 2 | 3 |
-| `context_tokens` | 8192 | 32768 | 65536 | 128000 |
-| `reserve_tokens` | 2048 | 4096 | 8192 | 16384 |
-
-The local token rows are floors: auto-fit uses the larger of the tier value
-and the VRAM-derived calculation at run time. `max_steps`, `max_read_lines`,
-`max_spec_chars`, `max_new_files`, and `repair_rounds` are not recalculated;
-`context_tokens` and `reserve_tokens` are still detected/clamped to the real
-window. The hosted column is never capped by local hardware.
+`pedacito config` lists every setting with its current value and origin;
+`pedacito config --reference` prints the full annotated template. The important
+ones:
 
 | Setting | Default | |
 |---|---|---|
 | `base_url` | `http://localhost:1234/v1` | Server address. |
-| `model` | *(none)* | Exact id/name as the server reports it. |
-| `vram_gb` | *(mandatory)* | Total GPU VRAM on the machine running the model, in whole gigabytes. Used with the model file size (queried from the server at every run) to estimate how much context fits, keeping 0.5 GB free for the system. System RAM is not counted. Not needed for hosted APIs. |
-| `timeout` | 600.0 | Seconds per request; raise for very large files. |
-| `load_wait_seconds` | 240 | How long to wait for a model to load. |
-| `max_consecutive_failures` | 3 | Aborts an indexing batch after this many failures in a row. |
-| `json_mode` | `"schema"` | `"schema"` for local llama.cpp/LM Studio, `"object"` for hosted OpenAI-compatible APIs (DeepSeek, OpenAI, …). Auto-switches to `"object"` when the base_url is remote or the model name contains "deepseek". Accepted spellings: `object`/`json_object`/`json`, and `schema`/`json_schema`. |
+| `model` | `google/gemma-3-27b` | Exact id/name the server reports. |
+| `vram_gb` | *(mandatory)* | GPU VRAM on the machine running the model (local only). |
+| `json_mode` | `"schema"` | `"schema"` for local llama.cpp/LM Studio, `"object"` for hosted APIs (auto-switched). |
+| `tier` | `""` | `small`/`medium`/`large`/`hosted` preset for token budgets. |
+| `max_steps` | 30 | Lookups before the model must answer. |
+| `max_write_lines` | 120 | Lines in one write step; larger files are written in chunks. |
 | `temperature` | 0.2 | Higher makes tool selection noticeably worse. |
-| `max_tokens_summary` | 220 (tiers: 160 / 240 / 320 / 400) | Budget for one index summary. |
-| `max_tokens_step` | 700 (tiers: 500 / 1500 / 2500 / 7000) | Budget for one tool call. Thinking models need more than this looks — reasoning tokens count against it, and a budget spent entirely on thinking returns no action at all. On local servers auto-fit scales this with the hardware-sized window. The hosted preset stays under the provider's real per-message output ceiling (~8k tokens for deepseek-chat); bigger outputs are chunked across steps via `max_write_lines`, not crammed into one reply. |
-| `max_tokens_answer` | 3000 (tiers: 1500 / 8000 / 12000 / 40000) | Budget for the final answer/edit reply. Auto-fit raises this on local servers when the VRAM calculation has room (up to 24k, or the provider cap for hosted APIs); an explicit value overrides it. |
-| `max_steps` | 30 (tier presets: 40–100) | Lookups allowed before the model must answer. Deliberately generous: hitting this mid-gather is what produced "the model answered without proposing any edits" failures. |
-| `max_gathered_chars` | 24000 (tiers: 12000 / 48000 / 60000 / 100000) | Ceiling on accumulated source per task. Auto-fit may grow this on local servers, up to 200k characters. |
-| `max_write_lines` | 120 | Lines allowed in ONE write step (a `write` tool call or an edit block's REPLACE). Keeps every reply under the API's true per-message output limit; larger files are written in chunks across sequential steps, with the tool teaching the model the append protocol when it tries to dump a 791-line file in one message. Raise only if your provider emits longer messages. |
-| `context_tokens` | 8192 (tiers: 8192 / 32768 / 65536 / 128000) | Assumed server context window. Ignored when auto-detection succeeds (see "Token budgets" below). The VRAM estimate caps it so the KV cache does not spill; the tier/default is only a fallback when the model size cannot be detected. Set it explicitly to override both. |
-| `reserve_tokens` | 2048 (tiers: 2048 / 4096 / 8192 / 16384) | Headroom held back from `context_tokens` for chat-template overhead. Auto-fit shrinks it first on tiny windows. |
-| `auto_fit` | True | Size every token budget from the VRAM-derived window at startup (see "Token budgets"). Tier/default values are floors; explicit values override both. Set false only if you want raw values sent to the server unchanged. |
-| `auto_detect_context` | True | Probe the server for the configured context length instead of trusting the declared number: LM Studio's native API, Lemonade's extended `/v1/models`, or Ollama `/api/show`. |
-| `request_max_tokens_cap` | 32768 | Hard ceiling on any `max_tokens` sent; auto-fit lowers it to the usable window so llama.cpp never 400s. |
-| `allow_write` | False | Let the gather loop write whole files via the `write` action (skips the edit path's backup/syntax-check/review — prefer search/replace blocks). |
-| `max_write_chars` | 200000 | Ceiling on one `write` call's contents. |
-| `max_new_files` | 24 | Cap on how many files a `pedacito new` plan may propose; excess is truncated and reported. |
-| `max_spec_chars` | 60000 | Spec documents longer than this are cut, with a warning. |
-| `max_tokens_plan` | 2000 (tiers: 1200 / 5000 / 8000 / 8000) | Token budget for the planning call. Thinking models spend this on their `<think>` block before the file-tree JSON, so a too-small value returns no plan at all — raise it or set `disable_thinking`. |
-| `max_tokens_build` | 8000 (tiers: 4000 / 16000 / 24000 / 32000) | Token budget for each per-file build pass. Thinking is disabled for these whole-file writes, but a model that ignores that hint (some reasoning quants) still spends this on its `<think>` block — raise it for those. Auto-fit scales this with the local window. |
-| `flat_map_token_budget` | 4000 (tiers: 1500 / 6000 / 8000 / 12000) | Above this, the map switches from a full listing to per-file cards. |
-| `summarise_methods` | False | On if your methods lack useful docstrings. |
-| `summarise_documented` | False | On if your existing docstrings are stale or wrong. |
-| `include_references` | True | Off indexes only Python/JS/TS/Ruby (code), not the other reference file types listed under "What gets indexed". |
-| `extra_extensions` | `()` | Extra reference file types, e.g. `(".jinja", ".proto")`. |
-| `max_reference_bytes` | 2MB | Above this, a reference file is header-only. |
-| `disable_thinking` | False | Sends a template hint to suppress `<think>` blocks. |
-| `thinking_suffix` | `""` | Text appended to the prompt for the same purpose, e.g. `/no_think`. |
 | `backup` | True | Snapshot originals before writing. |
 | `log_sessions` | True | Write a session record per task. |
 | `review` | False | Always open the side-by-side reviewer. |
-| `open_browser` | True | Off prints the review URL instead of launching a browser. |
-| `manage_gitignore` | True | Add Pedacito's workspace entries to `.gitignore` (creating it in a git checkout if absent). |
-| `create_ignore_file` | True | Create a starter `.pedacitoignore` on first run. |
+| `allow_write` | False | Let the gather loop overwrite whole files (prefer search/replace). |
+| `disable_thinking` | False | Suppress `<think>` blocks. |
 | `default_profile` | `""` | Profile applied when `--profile` isn't given. |
 
-## Token budgets: why you no longer need to tune any of this
+The remaining knobs (chunking, per-budget limits, review timeouts, auto-loop
+behavior, and more) all have working defaults and are documented in
+`pedacito config --reference`.
 
-The single most common failure mode was "it keeps hitting limits and never
-returns anything" — and the cause was almost always a mismatch between our
-budgets and your server's real context window. Defaults were once sized for
-32k+ models while LM Studio ships at 8192 and Ollama caps at 4096; worse,
-llama.cpp servers reject a request outright when prompt + `max_tokens`
-exceeds the window (a flat 400 on every step), and Ollama silently
-truncates oversized prompts instead — which is how local runs ended up
-"answering" a task they had never actually seen. Four layers now prevent
-that:
-
-**Auto-detection.** At startup pedacito asks the server its *configured*
-context length (LM Studio's native API, Lemonade's extended `/v1/models`,
-Ollama `/api/show`) and uses that instead of `context_tokens` — unless you
-set `context_tokens` yourself,
-which wins. Hosted APIs and offline runs keep the declared number.
-
-**VRAM-aware window.** The mandatory `vram_gb` setting describes the GPU
-running the model. At the start of every run pedacito asks the server for the
-configured model's file size (LM Studio's v1/v0 native API, Lemonade's
-`/v1/models`, or Ollama `/api/show`), subtracts the weights and 0.5 GB kept
-for the system, and derives how many context tokens fit in the remaining
-VRAM as a KV cache. System RAM is deliberately not counted: spilling there
-is slow and was producing context plans that did not actually fit on the
-GPU. Pedacito caps its own planning window at that estimate, but it does not
-change the context length the server loads the model with. If the server
-reports a larger configured window, lower it in LM Studio's "Context length"
-or Ollama's `num_ctx`; the `[auto-fit]` line prints a warning when it sees
-this. A server that does not report a size keeps the tier/server window.
-
-**Auto-fit (`auto_fit = true`, default).** On a local server with a known
-model size, the VRAM estimate first caps the context window (planning for a
-larger window than the GPU can hold spills the KV cache and collapses
-tokens/sec). Token budgets then take the LARGER of the tier/default value
-and the VRAM-derived calculation, provided that whole set still fits the
-capped window; if it does not, the calculated allocation is used so gathered
-source is not squeezed to nothing. Explicit values you write override both.
-The calculation targets are:
-
-| Budget | Target | Cap |
-|---|---|---|
-| `max_tokens_step` | 1/8 of the usable window | 4,096 |
-| `max_tokens_summary` | 1/4 of the step budget | 400 |
-| `max_tokens_answer` | 35% of the usable window | 24,000 |
-| `max_tokens_build` | 60% of the usable window | 32,000 / provider cap |
-| `max_tokens_plan` | 1/6 of the usable window | 8,000 |
-| `flat_map_token_budget` | 1/3 of the room left after the answer budget | 12,000 |
-| `max_gathered_chars` | the rest of that room, at 4 chars/token | 200,000 |
-
-Reply budgets always leave prompt room; the answer target is subtracted from
-the usable window before the map/gathered budgets are split, so prompt +
-reply fits with half of `reserve_tokens` still free. The server's own context
-window is always the hard upper bound. Explicit `max_tokens_*` and
-`context_tokens` values override the calculation and the tier/default, and
-they also override an **auto-detected** `max_output_tokens` ceiling (that
-value is only a heuristic for tier/default budgets). A `max_output_tokens`
-you set yourself is still a deliberate hard cap. `reserve_tokens` shrinks
-first on tiny windows. Thinking tokens count against
-`max_tokens_step`/`max_tokens_answer` exactly like any other generated token. You'll see one
-`[auto-fit] ...` line listing what changed. No `max_tokens_*` setting is
-required in your config. This is also what makes an oversized
-local profile (say, a copied hosted-style budget table) safe: its numbers
-get squeezed to the real window instead of 400ing. Hosted APIs are exempt:
-their tier budgets are never capped by local hardware.
-
-**Hosted APIs are exempt.** When pedacito recognises a hosted API (an
-explicit `tier = "hosted"`, `json_mode = "object"`, or any non-localhost
-`base_url`), auto-fit becomes grow-only and the fit warnings go quiet: your
-`context_tokens` is treated as a budget, not hardware, and reply limits are
-never clamped by a stale local default. The truncation-retry ceiling in the
-JSON layer likewise jumps to at least 65k tokens for hosted runs, so a
-model writing several large files in one answer gets room to finish instead
-of dying at "tried up to max_tokens=9600, ceiling 16384". Set limits
-explicitly in your profile if your provider's real caps differ — explicit
-values always win.
-
-**Graceful overflow.** During a task, if the running conversation outgrows
-the window, the oldest read results are trimmed (their source already
-reaches the answer phase through the gathered buffer) rather than erroring;
-a server-side overflow error halves the reply budget and retries once
-before giving up; and a truncated JSON reply now reports "ran out of
-tokens mid-reply — raise max_tokens_step or disable thinking" instead of a
-generic parse failure.
-
-If answers still feel thin on an 8k window, the fix is usually server-side:
-raise the model's context length in LM Studio (e.g. 16k for a Q4 27B if VRAM
-allows) or set Ollama's `num_ctx`. Pedacito picks the new number up
-automatically on the next run.
-
-## Two things to watch when pointing this at your own code
-
-**`summarise_documented=False` assumes your docstrings are accurate.** A
-docstring substitutes for a generated summary entirely — that's most of the
-indexing-time saving. If yours are stale or misleading, the map will be
-confidently wrong in exactly the places you'd least expect it. Set it to
-`true` and accept the longer first index.
-
-**`flat_map_token_budget=4000` is the tier switch.** If a mid-sized project
-feels like it's navigating worse than it should, run `pedacito map <project>
---tier auto` to see which side of the line it landed on — a project just
-above the threshold gets file cards when the flat map would have fit and
-served it better, and raising the budget is the fix.
+---
 
 ## Known limits
 
-- **Symbol-level parsing covers Python, JavaScript/TypeScript/TSX, and
-  Ruby** (the last three via `tree-sitter`, installed by default — see
-  "Install"). Any other extension either falls through to *structural*
-  indexing (the reference file types listed under "What gets indexed",
-  plus anything added via `--ext`/`extra_extensions`) or, if never
-  recognized or added, isn't indexed at all — no map entry, and `read`/
-  `grep` will report it as not found. `pedacito files` always shows which
-  bucket a given file landed in.
-- Ruby's nested `module`/`class` namespacing (`module App; class Foo; ...
-  end; end`) gets its own recursive handling distinct from the JS/TS
-  chunker, since that idiom has no real equivalent in the other two
-  languages. A small, unsplit container (under `class_split_lines`) is
-  captured whole rather than recursed into — the same trade-off
-  `chunker.py` already makes for a short Python class — so very deep
-  nesting inside a short file won't get a separate symbol per level.
-- The call graph matches on bare names, so two unrelated classes with a
-  `run` method are conflated. Fine for locating code, not sound for
-  automated refactoring.
+- Symbol-level parsing covers Python, JavaScript/TypeScript/TSX, and Ruby.
+  Other extensions are structural, or invisible until added via
+  `--ext`/`extra_extensions`.
+- The call graph matches on bare names, so two unrelated `run()` methods are
+  conflated — fine for locating code, not sound for automated refactoring.
 - No embeddings — `grep` plus the summary map covers most of what semantic
   search would, without a second model resident in memory.
-- Directory walking follows symlinks and is cycle-safe (a symlink pointing
-  back at an ancestor is visited once, not recursed forever), so a
-  vendored or shared directory reached only through a symlink is actually
-  indexed rather than silently skipped.
-- Broad, structural tasks ("modernize this codebase") are a poor fit
-  regardless of scaffolding — that's a limit of small local models, not
-  something retrieval can paper over. Narrow, localized tasks are where
-  this is genuinely useful.
-- The browser GUI (`pedacito gui`) covers ask/explain/review/build-index/
-  model-check; see "Browser GUI" above for what's still CLI-only.
+- Broad, structural tasks ("modernize this codebase") are a poor fit regardless
+  of scaffolding — that's a limit of small local models. Narrow, localized
+  tasks are where this is genuinely useful.
+- The browser GUI covers ask/explain/review/build-index/model-check;
+  `how`, `new`, `auto`, `restore`, and the advanced flags are CLI-only.
 
 ---
 
 ## Contributing
 
-This started as a personal tool built for one setup (LM Studio over
-Tailscale, a single home GPU box), so it hasn't been exercised against the
-range of models, servers, and projects a wider audience would throw at it.
 Issues and pull requests are welcome — bug reports with a repro, support for
-other model servers or languages, and fixes for anything that breaks outside
-the one setup this was built and tested on are all useful. Given the small
-scope, please open an issue before a large PR so the direction can be agreed
-on first.
+other model servers or languages, and fixes for anything that breaks outside the
+setup this was built and tested on. Given the small scope, please open an issue
+before a large PR so the direction can be agreed on first.
 
 ## License
 
-MIT — see [LICENSE](LICENSE). Short version: do essentially anything you
-want with this code (use, modify, redistribute, include in a commercial
-project), as long as the copyright notice stays attached; the software
-comes with no warranty.
-
-MIT was picked over Apache-2.0 because Apache's extra provisions (an
-explicit patent grant, contributor-notice tracking) mostly matter for
-larger projects with multiple contributors and real patent exposure —
-overhead this small, single-author tool doesn't need. MIT gives the same
-practical freedom with less text to read.
+MIT — see [LICENSE](LICENSE).
