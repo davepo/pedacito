@@ -825,6 +825,8 @@ Pedacito starts.
   `pedacito config --check`.
 - **Ask** runs a task with review on by default; tick "write directly" to
   go straight to `--apply` instead.
+- **Explain** answers a question about the project's code in prose — how a
+  function works, what a file does, how data flows — no edits, no review.
 - A sidebar lists every file currently in the index, with a filter box.
 - Five color schemes (Parchment, Sage, Mocha, Clay, Nightshade), remembered
   in the browser between sessions.
@@ -834,7 +836,7 @@ Current limits: one project open at a time (switching directories reloads
 the warm index/agent rather than keeping several resident); detailed
 step-by-step gather/answer progress still prints to the terminal
 `pedacito gui` was launched from, not into the page; and `restore`, `how`,
-`explain`, the advanced per-task flags (`--steps`, `--exclude`/`--include`,
+the advanced per-task flags (`--steps`, `--exclude`/`--include`,
 `--ext`, `--no-refs`, `--no-gitignore`, a one-off `--url`/`--model` override),
 and narrowing to a subset of paths are CLI-only for now.
 
@@ -1162,7 +1164,7 @@ served it better, and raising the budget is the fix.
   regardless of scaffolding — that's a limit of small local models, not
   something retrieval can paper over. Narrow, localized tasks are where
   this is genuinely useful.
-- The browser GUI (`pedacito gui`) covers ask/chat/review/build-index/
+- The browser GUI (`pedacito gui`) covers ask/explain/review/build-index/
   model-check; see "Browser GUI" above for what's still CLI-only.
 
 ---

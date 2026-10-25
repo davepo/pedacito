@@ -371,7 +371,9 @@ click Open — hit **Build index** the first time, then **Check model**,
 then type a task and hit **Run**. The review page from step 7 renders
 right there inline; sign off or discard exactly like the standalone
 version. Tick "write directly" to skip review and apply immediately, the
-GUI's equivalent of `--apply`.
+GUI's equivalent of `--apply`. An **Explain** box answers questions about
+the project's code in prose — no edits, no review — the GUI's equivalent of
+`pedacito explain`.
 
 A sidebar lists every file currently in the index with a filter box, so
 you can sanity-check step 4's `.pedacitoignore` changes without switching
@@ -572,10 +574,11 @@ costs a re-index. Or pass `--reindex` to `ask`/`chat`.
 | `pedacito ask PROJ -t "..." --review` | Same, with a side-by-side sign-off page. |
 | `pedacito ask PROJ -t "..." --apply` | Same, writes immediately. |
 | `pedacito chat PROJ` | Interactive; index stays warm between tasks. |
+| `pedacito explain PROJ -q "..."` | Answer a question about the project's code. No edits. |
 | `pedacito new DIR -t "..."` | Start a project from scratch: plan, scaffold, build. |
 | `pedacito new DIR --spec FILE` | Same, from a larger spec document. |
 | `pedacito restore PROJ` | Undo the last write. |
-| `pedacito gui` | Browser control panel: pick a project, check the model, ask, review inline. |
+| `pedacito gui` | Browser control panel: pick a project, check the model, ask, explain, review inline. |
 
 Useful flags on most commands: `--exclude 'pattern'`, `--include 'pattern'`,
 `--steps N`, `--model ID`, `--url URL`, `--profile NAME`, `--root PATH`.

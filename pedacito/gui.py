@@ -1,5 +1,6 @@
-"""A small local web GUI: pick a project, check the model, type a task, and
-review the diff inline -- one page, one local server, no new dependencies.
+"""A small local web GUI: pick a project, check the model, type a task (or
+ask a question), and review the diff inline -- one page, one local server,
+no new dependencies.
 
 Usage
 -----
@@ -53,6 +54,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from . import cli as cli_mod
+from . import explain as explain_mod
 from . import index as index_mod
 from . import review as review_mod
 from . import workspace
@@ -147,6 +149,10 @@ class State:
         self.last_backup_dir: Path | None = None
         self.last_stamp = ""
 
+        # The most recent `explain` question and its prose answer.
+        self.last_question = ""
+        self.explain_answer = ""
+
         self.review_page = ""
         self.review_nonce = ""
         self.review_diffs: list = []
@@ -189,6 +195,8 @@ class State:
                 "review_outcome": self.review_outcome,
                 "review_detail": self.review_detail,
                 "last_task": self.last_task,
+                "last_question": self.last_question,
+                "explain_answer": self.explain_answer,
                 "recent": _load_recent(),
                 # First-run guidance: no user config file yet means every
                 # value shown is a built-in default -- say so once, with the
@@ -276,6 +284,7 @@ def _open_project(path: str, profile: str) -> None:
         STATE.idx = idx
         STATE.agent = agent
         STATE.model_checked, STATE.model_status = False, ""
+        STATE.last_question, STATE.explain_answer = "", ""
         STATE.clear_review()
     _remember_recent(str(root))
 
@@ -475,6 +484,29 @@ def _run_task(task: str, apply_now: bool) -> None:
                                 reply, results, backup_dir, when)
 
 
+def _run_explain(question: str) -> None:
+    """Answer one question about the open project's code, in prose -- the
+    GUI counterpart of `pedacito explain`. Uses the same gather loop `ask`
+    does, but produces an explanation instead of edits."""
+    with STATE.lock:
+        if STATE.agent is None:
+            raise ConfigError("no index yet -- build the index first")
+        agent = STATE.agent
+
+    def _note(text: str) -> None:
+        with STATE.lock:
+            STATE.steps.append(text)
+
+    answer = explain_mod.answer(
+        agent, question, verbose=True,
+        on_step=lambda n: _note(f"step {n}"))
+    _note("done")
+
+    with STATE.lock:
+        STATE.last_question = question
+        STATE.explain_answer = answer
+
+
 def _apply_review() -> tuple[bool, str]:
     """Write the currently staged review's files to disk (the review
     page's Sign off button, handled on this server rather than a second
@@ -639,6 +671,9 @@ label.chk { display: flex; align-items: center; gap: 6px; color: var(--muted); f
 iframe#reviewFrame { width: 100%; height: 70vh; border: 1px solid var(--line);
   border-radius: 8px; background: #fff; }
 .placeholder { color: var(--muted); text-align: center; padding: 60px 0; }
+.answer { white-space: pre-wrap; font-size: 13px; line-height: 1.6; margin-top: 12px;
+  overflow-wrap: anywhere; }
+.answer .q { color: var(--muted); font-size: 12px; margin-bottom: 6px; }
 """
 
 JS = """
@@ -651,6 +686,7 @@ function post(path, body) {
 
 var lastReviewKey = '';
 var lastFilesKey = '';
+var lastQuestionKey = '';
 var lastState = {};
 var taskActive = false;   // set by the Run click, cleared when a poll shows idle
 
@@ -718,14 +754,36 @@ function render(s) {
   renderFiles(s.files || []);
 
   var busy = s.busy;
-  ['openBtn', 'buildBtn', 'checkBtn', 'runBtn'].forEach(function (id) { $(id).disabled = busy || !s.root && id !== 'openBtn'; });
+  ['openBtn', 'buildBtn', 'checkBtn', 'runBtn', 'explainBtn'].forEach(function (id) { $(id).disabled = busy || !s.root && id !== 'openBtn'; });
   $('runBtn').disabled = busy || !s.has_index;
+  $('explainBtn').disabled = busy || !s.has_index;
   if (busy) { $('restoreBtn').disabled = true; }
   var steps = (s.steps || []);
   var prog = busy ? (steps.length ? steps[steps.length - 1] + '\\u2026' : '') : '';
   $('busyLbl').textContent = busy ? (s.busy_what + '\\u2026 ' + prog) : '';
   $('busyLbl').className = busy ? 'busy' : '';
   $('errLbl').textContent = s.error || '';
+
+  // The Explain answer is prose (no diff), so it has its own pane. Render it
+  // via textContent so model output is never interpreted as HTML.
+  var qKey = (s.last_question || '') + '|' + (s.explain_answer || '');
+  if (qKey !== lastQuestionKey) {
+    lastQuestionKey = qKey;
+    var wrap = $('answerWrap');
+    wrap.innerHTML = '';
+    if (s.explain_answer) {
+      var q = document.createElement('div');
+      q.className = 'q';
+      q.textContent = s.last_question;
+      var a = document.createElement('div');
+      a.className = 'answer';
+      a.textContent = s.explain_answer;
+      wrap.appendChild(q);
+      wrap.appendChild(a);
+    } else {
+      wrap.innerHTML = '<p class="placeholder">Ask a question to see an explanation here.</p>';
+    }
+  }
 
   // A task ended without staging a review, applying edits, or raising an
   // error. Show why instead of leaving the pane blank -- silent "success"
@@ -806,6 +864,12 @@ $('runBtn').addEventListener('click', function () {
   taskActive = true;
   $('errLbl').textContent = '';
   post('/run', { task: task, apply: $('applyNow').checked });
+});
+$('explainBtn').addEventListener('click', function () {
+  var question = $('question').value.trim();
+  if (!question) return;
+  $('errLbl').textContent = '';
+  post('/explain', { question: question });
 });
 
 var THEME_KEY = 'pedacito_theme';
@@ -896,6 +960,15 @@ PAGE_HTML = f"""<!doctype html>
   </div>
   <p class="note">Review is on by default. Detailed step-by-step progress prints in the
     terminal this GUI was launched from.</p>
+</section>
+
+<section class="card">
+  <h2>Explain</h2>
+  <textarea id="question" placeholder="Ask about the project's code \u2014 how a function works, what a file does, or how data flows\u2026"></textarea>
+  <div class="row" style="margin-top:8px">
+    <button class="primary" id="explainBtn">Explain</button>
+  </div>
+  <div id="answerWrap"><p class="placeholder">Ask a question to see an explanation here.</p></div>
 </section>
 
 <section class="card">
@@ -993,6 +1066,13 @@ class _Handler(BaseHTTPRequestHandler):
                 return
             ok = _spawn(lambda: _run_task(task, bool(body.get("apply"))),
                        "running task")
+            self._json(202 if ok else 409, {"ok": ok})
+        elif path == "/explain":
+            question = (body.get("question") or "").strip()
+            if not question:
+                self._json(400, {"ok": False, "detail": "empty question"})
+                return
+            ok = _spawn(lambda: _run_explain(question), "explaining")
             self._json(202 if ok else 409, {"ok": ok})
         elif path == "/apply":
             with STATE.lock:

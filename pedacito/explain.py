@@ -75,15 +75,19 @@ How to answer:
 """
 
 
-def answer(agent, question: str, verbose: bool = True) -> str:
+def answer(agent, question: str, verbose: bool = True, on_step=None) -> str:
     """Answer one question about the indexed project, end to end.
 
     Runs the gather loop (with the explanation framing above) to collect the
     relevant source, then answers as prose -- no edit format, no apply.
     Returns the answer text. `agent` is an Agent bound to the project's
     index and client (see cli.py).
+
+    `on_step`, when given, is called with the step number after each gather
+    step, mirroring `Agent.gather`'s callback so a caller (e.g. the GUI) can
+    show live progress.
     """
     gathered = agent.gather(question, verbose=verbose,
-                            base=EXPLAIN_GATHER_BASE)
+                            base=EXPLAIN_GATHER_BASE, on_step=on_step)
     return agent.answer(question, gathered, system=EXPLAIN_SYSTEM,
                         include_edit_format=False, stream=False)
