@@ -256,6 +256,25 @@ is the fastest sanity check that the index looks right.
 
 ---
 
+## Understanding the code without changing it
+
+`pedacito explain` answers questions about the indexed project — how a
+function works, what a file does, how data or control flows between parts —
+without proposing any edits:
+
+```bash
+pedacito explain ~/code/anki -q "how does the scheduler pick the next card?"
+pedacito explain ~/code/anki -q "trace the flow from answer to schedule"
+pedacito explain ~/code/anki        # interactive prompt
+```
+
+It is always scoped to the project's index: it reads the relevant source
+through the same lookup index `ask` uses, then answers in prose. It never
+builds an index, so run `pedacito index ~/code/anki` first (or navigate to a
+project you've already indexed) — otherwise it tells you exactly that.
+
+---
+
 ## Step 6 — Ask for something, without changing anything
 
 ```bash

@@ -418,7 +418,7 @@ class Agent:
 
     # ------------------------------------------------------------------ phase 1
     def gather(self, task: str, verbose: bool = True,
-               on_step=None) -> str:
+               on_step=None, base: str | None = None) -> str:
         """Run the tool-calling loop: repeatedly ask the model to choose an
         action (read/grep/callers/outline/done) until it says `done` or
         cfg.max_steps is reached, accumulating the source it read.
@@ -432,9 +432,15 @@ class Agent:
         completed step (including the final `done`). The GUI passes a
         callback here so the browser can show live progress; CLI callers
         leave it None and see no difference.
+
+        `base`, when given, replaces `GATHER_BASE` as the system prompt's
+        preamble (the FLAT/CARDS navigation hints are still appended). The
+        `explain` flow uses this to frame gathering as answering a question
+        rather than as preparing an edit.
         """
         repo_map, tier = self.index.map_for_prompt(self.cfg)
-        system = GATHER_BASE + (FLAT_HINT if tier == "flat" else CARDS_HINT)
+        system = (base if base is not None else GATHER_BASE) + \
+            (FLAT_HINT if tier == "flat" else CARDS_HINT)
         if verbose:
             print(f"  [map: {tier}, ~{estimate_tokens(repo_map)} tokens, "
                   f"{len(self.index.files)} files]", file=sys.stderr)
@@ -819,14 +825,17 @@ class Agent:
 
     # ------------------------------------------------------------------ phase 2
     def answer(self, task: str, gathered: str, stream: bool = True,
-               system: str | None = None, max_tokens: int | None = None) -> str:
+               system: str | None = None, max_tokens: int | None = None,
+               include_edit_format: bool = True) -> str:
         """Ask the model to answer the task, or produce search/replace edits,
         given the project map and whatever source `gather()` collected.
 
         `system` and `max_tokens` override the defaults for special flows that
         need a different brief than "edit this existing code" -- e.g. resuming
         an unfinished scaffold (`Agent.resume_task`) or writing one whole file
-        of a new project (see scaffold.py)."""
+        of a new project (see scaffold.py). `include_edit_format=False` drops
+        the search/replace format spec even when `system` is given, for flows
+        that must answer in prose only (`explain`)."""
         repo_map, _ = self.index.map_for_prompt(self.cfg)
         user = (
             f"PROJECT MAP\n\n{repo_map}\n\n"
@@ -882,8 +891,11 @@ class Agent:
                 "'Context length' is the\n    better fix if your GPU can take it)"
                 f"\n(over-budget by ~{over} tokens)")
         print(f"[answer context ~{estimate_tokens(user)} tokens]", file=sys.stderr)
-        sys_prompt = ANSWER_SYSTEM if not system else \
-            system.rstrip() + "\n\n" + EDIT_FORMAT
+        sys_prompt = ANSWER_SYSTEM
+        if system is not None:
+            sys_prompt = system.rstrip()
+            if include_edit_format:
+                sys_prompt += "\n\n" + EDIT_FORMAT
         return self.client.chat(
             [{"role": "system", "content": sys_prompt},
              {"role": "user", "content": user}],

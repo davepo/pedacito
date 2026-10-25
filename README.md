@@ -300,6 +300,32 @@ conservative built-in token budgets instead of sizing them to your GPU.
 
 ---
 
+## Understanding your project's code
+
+`pedacito explain` answers questions about the code in the indexed project
+you are working on — how a function works, what a file is responsible for,
+how data or control flows between parts, and so on. It gathers the relevant
+source through the same lookup index `ask` uses, then answers in prose. It
+produces no edits and no search/replace blocks.
+
+```bash
+pedacito explain ~/code/anki -q "how does the scheduler pick the next card?"
+pedacito explain ~/code/anki -q "what does src/scheduler.py do?"
+pedacito explain ~/code/anki -q "trace the flow from answer to schedule"
+pedacito explain ~/code/anki        # interactive prompt
+```
+
+Where `how` explains Pedacito itself and `ask` does tasks, `explain` is
+scoped to your project. It is always bound to that project's index, and it
+never builds one — if the project has no index yet, it points you at
+`pedacito index <project>` (or at navigating to a project you have already
+indexed). It accepts the same connection/config flags as `ask` (`--url`,
+`--model`, `--config`, `--profile`, …), plus the file-selection flags
+(`--exclude`, `--include`, `--ext`, `--no-refs`) used when the index needs
+refreshing.
+
+---
+
 ## Running multiple models
 
 Define a profile per model instead of editing `model =` each time:
@@ -807,10 +833,10 @@ Pedacito starts.
 Current limits: one project open at a time (switching directories reloads
 the warm index/agent rather than keeping several resident); detailed
 step-by-step gather/answer progress still prints to the terminal
-`pedacito gui` was launched from, not into the page; and `restore`, the
-advanced per-task flags (`--steps`, `--exclude`/`--include`, `--ext`,
-`--no-refs`, `--no-gitignore`, a one-off `--url`/`--model` override), and
-narrowing to a subset of paths are CLI-only for now.
+`pedacito gui` was launched from, not into the page; and `restore`, `how`,
+`explain`, the advanced per-task flags (`--steps`, `--exclude`/`--include`,
+`--ext`, `--no-refs`, `--no-gitignore`, a one-off `--url`/`--model` override),
+and narrowing to a subset of paths are CLI-only for now.
 
 The recent-projects list lives in `gui_recent.json` next to your user
 config (see "Configure" above) — deleting it just empties the dropdown.

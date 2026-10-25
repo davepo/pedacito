@@ -10,6 +10,7 @@ Usage
     pedacito cost   src/                     # what indexing would cost
     pedacito config --init                   # write a starter config file
     pedacito how "how do I set up a config?" # built-in help from docs + code
+    pedacito explain src/ -q "how does X work?" # answer questions about the project
     pedacito restore src/                    # undo the last --apply
     pedacito new  my-app -t "todo CLI"       # start a project from scratch
     pedacito auto . -t "add retries" --apply # autonomous outer loop over tasks
@@ -528,6 +529,62 @@ def _cmd_auto(args, cfg, client, idx, root: Path) -> int:
 
 
 # --------------------------------------------------------------------------
+# `pedacito explain`: questions about the indexed project
+# --------------------------------------------------------------------------
+def _cmd_explain(args, client, agent) -> int:
+    """Implement `pedacito explain`: answer a question about the indexed
+    project, in prose (no edits, no apply).
+
+    The no-index case is gated in `main()` before a model connection is
+    made, so by the time this runs the index exists and is warm."""
+    from . import explain
+
+    question = (getattr(args, "question_opt", None) or "").strip()
+
+    def ask(q: str) -> str:
+        print("\n--- looking things up ---", file=sys.stderr)
+        return explain.answer(agent, q)
+
+    if question:
+        print(ask(question))
+    elif not sys.stdin.isatty():
+        piped = sys.stdin.read().strip()
+        if not piped:
+            print('Usage: pedacito explain PROJECT -q "your question"',
+                  file=sys.stderr)
+            return 2
+        print(ask(piped))
+    else:
+        print("Ask about this project's code. Type /quit to leave.",
+              file=sys.stderr)
+        while True:
+            try:
+                line = input("\nexplain> ").strip()
+            except (EOFError, KeyboardInterrupt):
+                print(file=sys.stderr)
+                break
+            if not line:
+                continue
+            if line.lower() in {"/quit", "/exit", "quit", "exit"}:
+                break
+            if line.lower() in {"/help", "help", "?"}:
+                print("  Ask anything about this project's code: how a "
+                      "function works,\n  what a file does, or how data or "
+                      "control flows between parts.\n  Examples: \"how does the "
+                      "sync client retry?\", \"what does src/app.py do?\",\n"
+                      "  \"trace the flow from request to response\".",
+                      file=sys.stderr)
+                continue
+            print()
+            print(ask(line))
+
+    s = client.stats
+    print(f"\n[{s['calls']} calls, {s['completion_tokens']} tokens out, "
+          f"{s['seconds']:.0f}s]", file=sys.stderr)
+    return 0
+
+
+# --------------------------------------------------------------------------
 # Entry point
 # --------------------------------------------------------------------------
 def main(argv=None) -> int:
@@ -613,6 +670,12 @@ def main(argv=None) -> int:
     p_ask.add_argument("--no-review", dest="no_review", action="store_true",
                        help="never open the reviewer, even if config enables it")
     p_ask.add_argument("--reindex", action="store_true", help="force a fresh index first")
+
+    p_explain = sub.add_parser(
+        "explain", help="answer questions about an indexed project's code")
+    _add_common(p_explain)
+    p_explain.add_argument("-q", "--question", dest="question_opt", metavar="TEXT",
+                           help="your question; omit for an interactive prompt")
 
     p_new = sub.add_parser(
         "new", help="start a project from scratch: plan, scaffold, build")
@@ -732,6 +795,23 @@ def main(argv=None) -> int:
         except KeyboardInterrupt:
             print("\nCancelled.", file=sys.stderr)
             return 130
+
+    # `explain` is scoped to an already-indexed project. Check for an index
+    # before touching the config or the model server, so a missing one gets a
+    # helpful direction immediately -- no model connection or vram_gb needed.
+    if args.cmd == "explain":
+        root = _root(args)
+        if index_mod.Index.load(root) is None:
+            print(
+                f"\nNo index found for {root}.\n"
+                "`pedacito explain` answers questions about an already-indexed\n"
+                "project; it never builds an index itself.\n\n"
+                "To use it:\n"
+                f"  1. navigate to a project you have indexed, or index this one\n"
+                f"     with:  pedacito index {root}\n"
+                f"  2. then run: pedacito explain {root} -q \"your question\"\n",
+                file=sys.stderr)
+            return 0
 
     try:
         cfg = _config(args)
@@ -908,6 +988,9 @@ def main(argv=None) -> int:
         # Slash commands rebind these, so they are shared through a dict rather
         # than captured by value.
         locals_ref = {"cfg": cfg, "client": client, "agent": agent, "idx": idx}
+
+        if args.cmd == "explain":
+            return _cmd_explain(args, client, agent)
 
         def run(task: str):
             """Execute one task end to end through the shared inner loop."""
