@@ -224,6 +224,8 @@ During the gather phase the model has a deliberately small set of actions:
 - `callers` — where a symbol is defined, what it calls, and the call-site
   lines of its callers.
 - `outline` — every unit in one file, with signatures and line ranges.
+- `sessions` — list, search, or read the `.pedacito/sessions/*.md` logs from
+  prior runs, so a model can see what was already asked and changed.
 - `write` / `append` / `move` / `delete` — opt-in whole-file operations when
   `allow_write = true`; `append` builds a file larger than one reply in
   sequential chunks.
@@ -419,7 +421,9 @@ under that project's root:
 ```
 
 `sessions/` is the file worth opening when an edit turns out wrong days later;
-`log.txt` is the quick scan for *where* a failure happened. On first run Pedacito
+`log.txt` is the quick scan for *where* a failure happened. The model can also
+search these logs through the `sessions` action, which is how a fresh run sees
+what earlier runs did. On first run Pedacito
 also creates a commented `.pedacitoignore` and adds its workspace entries to
 `.gitignore` (both switchable via `create_ignore_file` and `manage_gitignore`).
 

@@ -14,7 +14,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from pedacito import tools
+from pedacito import tools, workspace
 from pedacito.chunker import chunk_source
 from pedacito.config import Config
 from pedacito.index import Index
@@ -60,7 +60,7 @@ def _index(tmp_path: Path, files: dict[str, str] | None = None) -> Index:
 def test_schema_hides_disabled_actions_and_fields():
     plain = tools.schema_for(Config())
     assert plain["properties"]["action"]["enum"] == [
-        "read", "grep", "callers", "outline", "done"]
+        "read", "grep", "callers", "outline", "sessions", "done"]
     assert "content" not in plain["properties"]
     assert "to" not in plain["properties"]
     assert "command" not in plain["properties"]
@@ -362,6 +362,77 @@ def test_grep_falls_back_to_semantic_search(tmp_path):
     first_calls = client.calls
     tools.tool_grep(idx, "increment", cfg=cfg, client=client)
     assert client.calls == first_calls + 1, "unit embeddings were not cached"
+
+
+# ----------------------------------------------------------------- sessions
+def _session(tmp_path, when, task, reply, steps=("read pkg/app.py",)):
+    workspace.write_session(tmp_path, task, list(steps), reply, [],
+                            None, when=when)
+    return f"{when}.md"
+
+
+def test_sessions_lists_recent_runs(tmp_path):
+    idx = _index(tmp_path)
+    _session(tmp_path, "20260101-120000", "add retry logic", "done")
+    _session(tmp_path, "20260102-120000", "rename the parser", "done")
+
+    obs = tools.dispatch(idx, Config(), {"action": "sessions"})
+    assert "20260102-120000.md" in obs
+    assert "rename the parser" in obs
+    assert obs.index("20260102-120000.md") < obs.index("20260101-120000.md")
+
+
+def test_sessions_searches_and_retries_case_insensitively(tmp_path):
+    idx = _index(tmp_path)
+    _session(tmp_path, "20260101-120000", "add retry logic",
+             "wrapped the sync call in a retry loop")
+
+    obs = tools.dispatch(idx, Config(), {"action": "sessions",
+                                         "pattern": "RETRY"})
+    assert "case-insensitively" in obs
+    assert "retry loop" in obs
+
+
+def test_sessions_falls_back_to_literal_search(tmp_path):
+    idx = _index(tmp_path)
+    _session(tmp_path, "20260101-120000", "fix parser",
+             "broke at def parse(text)")
+
+    obs = tools.dispatch(idx, Config(), {"action": "sessions",
+                                         "pattern": "def parse("})
+    assert "not valid regex" in obs
+    assert "def parse" in obs
+
+
+def test_sessions_reads_one_log_safely(tmp_path):
+    idx = _index(tmp_path)
+    name = _session(tmp_path, "20260101-120000", "add retry logic", "done")
+
+    obs = tools.dispatch(idx, Config(), {"action": "sessions", "file": name,
+                                         "start": 1, "end": 5})
+    assert f"{name} (session log, not source) lines 1-5" in obs
+    assert "**Task:** add retry logic" in obs
+
+    bare = tools.dispatch(idx, Config(), {"action": "sessions",
+                                           "file": name[:-3]})
+    assert "add retry logic" in bare
+
+    escaped = tools.dispatch(idx, Config(), {"action": "sessions",
+                                             "file": "../index.json"})
+    assert escaped.startswith("ERROR")
+
+
+def test_sessions_scope_restricts_search(tmp_path):
+    idx = _index(tmp_path)
+    one = _session(tmp_path, "20260101-120000", "alpha task",
+                   "shared keyword here")
+    _session(tmp_path, "20260102-120000", "beta task", "shared keyword here")
+
+    obs = tools.dispatch(idx, Config(), {"action": "sessions",
+                                         "pattern": "shared keyword",
+                                         "file": one})
+    assert one in obs
+    assert "20260102-120000.md" not in obs
 
 
 def test_lmstudio_embed_returns_vectors_in_input_order(monkeypatch):

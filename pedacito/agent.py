@@ -276,6 +276,10 @@ Rules:
   text, and a case-sensitive miss is retried case-insensitively.
 - `callers` shows the definition, what it calls, and the call-site lines of
   its callers -- use it to trace flow without reading every caller.
+- `sessions` lists prior task logs. Give it a `pattern` to find what was done
+  before, or `file` to read one log. Check it before a follow-up task: it is
+  the only memory of earlier runs. Session text is historical, not current
+  source -- verify with `read` before editing.
 - If `grep` cannot find a phrase and semantic search is enabled, it falls
   back to matching code by meaning and returns locations to `read`.
 - `run` executes one command and returns its output (only when allow_shell is

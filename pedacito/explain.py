@@ -45,6 +45,9 @@ Rules:
 - Trace data and control flow across files: use `callers` to find who calls a
   function (it also shows the call-site lines and the definitions it calls),
   `outline` to see a file's structure, and `read` to see bodies.
+- `sessions` lists or searches prior task logs. If the question is about a
+  past change or the project's history, search those logs -- they record what
+  earlier runs asked, read, and changed.
 - Do not guess at code you have not read. If you need it, read it.
 - Choose `done` as soon as you have enough to answer the question. Do not browse.
 - Fill every field. Use "" for unused strings and 0 for unused numbers.

@@ -1,4 +1,4 @@
-"""The agent's tool surface: read, grep, callers, outline, write/append, done.
+"""The agent's tool surface: read, grep, callers, outline, sessions, write/append, done.
 
 Usage
 -----
@@ -9,10 +9,11 @@ Usage
 
 Deliberately a small, fixed set of tools. Local models degrade fast as the
 tool surface grows -- four to six is about the ceiling before a small model
-starts calling the wrong one or inventing arguments. The five navigation
-tools (read, grep, callers, outline, done) are the core surface. Everything
-destructive is behind an explicit gate: `write`/`append`/`move`/`delete`
-need `cfg.allow_write`, and `run` needs `cfg.allow_shell`. A default run
+starts calling the wrong one or inventing arguments. The six navigation
+tools (read, grep, callers, outline, sessions, done) are the core surface.
+`sessions` is read-only history and is how a fresh run sees prior tasks.
+Everything destructive is behind an explicit gate: `write`/`append`/`move`/
+`delete` need `cfg.allow_write`, and `run` needs `cfg.allow_shell`. A default run
 therefore exposes only the navigation surface; a user who opts in accepts a
 larger surface because they asked for those capabilities. Every tool returns
 plain text with line numbers attached, since the model needs those numbers
@@ -52,7 +53,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-from . import fileio
+from . import fileio, sessions
 
 TOOL_HELP = """\
 read     - read exact lines of a file.       args: file, start, end
@@ -61,6 +62,7 @@ grep     - regex or literal search. args: pattern, and optional file/dir/glob
            (with semantic_search on, falls back to search by meaning)
 callers  - who calls a symbol, with the call sites. args: symbol
 outline  - list every unit in one file.      args: file
+sessions - list/search what prior runs did.  args: pattern, optional file
 write    - overwrite a whole file with text. args: file, content
 append   - add text to the END of a file.    args: file, content
 move     - rename/move one file.             args: file (old), to (new)
@@ -79,8 +81,8 @@ STEP_SCHEMA = {
     "properties": {
         "action": {
             "type": "string",
-            "enum": ["read", "grep", "callers", "outline", "write", "append",
-                     "move", "delete", "run", "done"],
+            "enum": ["read", "grep", "callers", "outline", "sessions",
+                     "write", "append", "move", "delete", "run", "done"],
         },
         "file": {"type": "string",
                  "description": "For read/outline/write/append/move/delete. For "
@@ -131,8 +133,8 @@ STEP_SCHEMA = {
 
 # The action list is kept in one place so the schema, the gate in `dispatch`,
 # and the prompt help cannot drift apart.
-ACTIONS = ("read", "grep", "callers", "outline", "write", "append",
-           "move", "delete", "run", "done")
+ACTIONS = ("read", "grep", "callers", "outline", "sessions", "write",
+           "append", "move", "delete", "run", "done")
 WRITE_ACTION = "write"
 APPEND_ACTION = "append"
 MOVE_ACTION = "move"
@@ -153,7 +155,7 @@ def schema_for(cfg) -> dict:
     """
     import copy
 
-    actions = ["read", "grep", "callers", "outline"]
+    actions = ["read", "grep", "callers", "outline", "sessions"]
     if getattr(cfg, "allow_write", False):
         actions += ["write", "append", "move", "delete"]
     if getattr(cfg, "allow_shell", False):
@@ -659,6 +661,25 @@ def tool_outline(index, cfg, file: str) -> str:
     return index.render_outline(rel)
 
 
+def tool_sessions(index, cfg, pattern: str = "", file: str = "",
+                  start: int = 1, end: int = 0) -> str:
+    """List, search, or read prior task session logs.
+
+    `sessions` with no arguments lists the most recent runs. A `pattern`
+    searches all logs (or one, when `file` names it); `file` alone with a
+    start/end range reads that log's numbered lines. This is how a model sees
+    what earlier runs asked, looked at, and changed without keeping the old
+    conversation in context -- particularly useful for follow-up tasks on a
+    small model with no memory between runs.
+    """
+    if (pattern or "").strip():
+        return sessions.search(index.root, pattern, scope=file)
+    if (file or "").strip():
+        max_lines = max(1, int(getattr(cfg, "max_read_lines", 200) or 200))
+        return sessions.read(index.root, file, start, end, max_lines=max_lines)
+    return sessions.recent(index.root)
+
+
 def _snapshot(index, cfg, rel: str, path: Path, original: str,
               style) -> "str | None":
     """Snapshot `original` before a mutating action.
@@ -989,6 +1010,10 @@ def dispatch(index, cfg, step: dict, client=None) -> str:
         return tool_callers(index, step.get("symbol", ""))
     if action == "outline":
         return tool_outline(index, cfg, step.get("file", ""))
+    if action == "sessions":
+        return tool_sessions(index, cfg, step.get("pattern", ""),
+                             step.get("file", ""), step.get("start", 1),
+                             step.get("end", 0))
     if action == RUN_ACTION:
         return tool_run(index, cfg, step.get("command", ""))
     if action in MUTATING_ACTIONS:
