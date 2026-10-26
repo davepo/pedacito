@@ -56,6 +56,61 @@ def test_mark_unknown_task_returns_false(tmp_path):
     assert loop.mark_done(plan, "not in the plan") is False
 
 
+# ----------------------------------------------------------- task kinds
+def test_investigation_tasks_are_recognised():
+    assert loop._is_investigation_task(
+        "Reproduce the black screen by running main.py")
+    assert loop._is_investigation_task("Locate the cause of the crash")
+    assert loop._is_investigation_task("Check the render path")
+    assert not loop._is_investigation_task("Fix the black screen")
+    assert not loop._is_investigation_task("Reproduce and fix the crash")
+    assert not loop._is_investigation_task("Implement the parser")
+
+
+def test_tool_call_only_answer_is_detected():
+    assert loop._looks_like_tool_calls_only(
+        '<tool_call>{"name": "run", "arguments": {}}</tool_call>')
+    assert not loop._looks_like_tool_calls_only(
+        "Likely cause: the surface is never cleared. "
+        "The run produced no output, so the loop is spun before drawing.")
+
+
+def test_run_loop_marks_investigation_task_done_without_edits(tmp_path,
+                                                             monkeypatch):
+    """The reported failure: a reproduce/diagnose task is a success even when
+    it changes no code. It must be ticked and the next fix task must still
+    run, instead of stopping the whole loop on 'no applied edits'."""
+    plan = tmp_path / "PLAN.md"
+    loop.write_plan(plan, "fix the black screen",
+                    ["Reproduce the black screen",
+                     "Fix the rendering bug"])
+    idx = types.SimpleNamespace(root=tmp_path)
+    calls = []
+
+    def fake_investigate(root, cfg, client, agent, idx_, task,
+                         answer_system=None):
+        calls.append(("investigate", task))
+        return loop.TaskResult(
+            [], "Reproduced: the window opens black and the process produces "
+            "no output.", True, [], idx_)
+
+    def fake_run_task(root, cfg, client, agent, idx_, task, apply=True,
+                      review=False, answer_system=None):
+        calls.append(("edit", task))
+        return _result(idx_)
+
+    monkeypatch.setattr(loop, "run_investigation_task", fake_investigate)
+    monkeypatch.setattr(loop, "run_task", fake_run_task)
+    code = loop.run_loop(tmp_path, _cfg(), None, idx, plan, apply=True)
+    assert code == 0
+    assert [kind for kind, _ in calls] == ["investigate", "edit"]
+    fix_task = calls[1][1]
+    assert "CONTEXT FROM PRIOR INVESTIGATION" in fix_task
+    assert "window opens black" in fix_task
+    assert "- [x] Reproduce the black screen" in plan.read_text()
+    assert "- [x] Fix the rendering bug" in plan.read_text()
+
+
 # ------------------------------------------------------------------- planning
 def test_generate_tasks_extracts_titles():
     class Stub:

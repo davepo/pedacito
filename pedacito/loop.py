@@ -68,6 +68,38 @@ def _is_noop(reply: str) -> bool:
     ))
 
 
+# Tasks that are checkpoints rather than edits. The planner explicitly emits
+# "reproduce the failure" as a step for bugs, but the loop used to demand an
+# applied edit from every task -- so a successful reproduction was recorded as
+# a failure and `stop_on_fail` ended the run before the fix task. These titles
+# are recognised as investigation-only and answered in prose.
+_INVESTIGATE_START = (
+    "reproduce", "investigate", "diagnose", "analyze", "analyse", "inspect",
+    "trace", "locate", "find", "confirm", "check", "verify", "review",
+    "profile", "explain", "identify", "determine", "observe", "test",
+)
+# If any of these appear, the task also changes code and must stay on the edit
+# path ("Reproduce and fix the crash", "Locate and update the config").
+_EDIT_WORDS = (
+    "fix", "implement", "add", "remove", "delete", "rename", "move",
+    "update", "change", "refactor", "write", "replace", "create", "patch",
+    "correct", "repair", "build", "wire", "integrate", "migrate",
+)
+
+
+def _is_investigation_task(task: str) -> bool:
+    """True for a task whose deliverable is evidence, not a code change.
+
+    Heuristic by necessity: the plan is plain markdown the user can edit. A
+    leading investigation verb with no edit verb anywhere keeps the task out
+    of the apply/edit path; anything containing an edit verb stays there."""
+    low = (task or "").strip().lower()
+    first = re.match(r"[a-z]+", low)
+    if not first or not first.group(0).startswith(_INVESTIGATE_START):
+        return False
+    return not re.search(r"\b(" + "|".join(_EDIT_WORDS) + r")\b", low)
+
+
 # --------------------------------------------------------------------------
 # The plan file: a markdown checklist that is the loop's external memory
 # --------------------------------------------------------------------------
@@ -172,6 +204,10 @@ Rules:
   not return an empty list: produce concrete repair steps -- reproduce the
   failure, locate the cause, fix it, then verify. "Fix the bug" is a valid
   task title when that is genuinely all there is to do.
+- A task may be investigation-only ("Reproduce...", "Locate the cause...",
+  "Check..."). Keep such a title free of edit verbs and put the actual code
+  change in a later task; the loop treats it as a checkpoint and does not
+  expect edits.
 - NEVER return zero tasks. Every goal has at least one concrete step."""
 
 
@@ -503,6 +539,68 @@ def _review(root: Path, results, task: str, cfg, backup_dir, stamp: str) -> list
             for r in results]
 
 
+INVESTIGATE_SYSTEM = """\
+You are investigating a software problem, not editing code. You have a map of
+the project and whatever source and command output the gather phase collected.
+Report what you observed: what reproduces the problem, the exact evidence
+(command output, file and line ranges), the likely cause, and the smallest next
+fix someone should make. Do not call tools -- none are available in this phase.
+Do not emit search/replace blocks. Be concrete and concise; if the evidence is
+inconclusive, say what is still unknown and what to check next.
+"""
+
+_TOOL_SYNTAX = ("<tool_call", "<invoke", "<function=", '"name":')
+
+
+def _looks_like_tool_calls_only(reply: str) -> bool:
+    """True when a prose answer is really just agent-framework tool syntax.
+
+    Small models occasionally ignore "no tools here" and emit `<tool_call>` /
+    `<invoke>` blocks in the answer phase. For an investigation task that is
+    not an answer, so the caller substitutes the gathered evidence."""
+    low = (reply or "").lower()
+    if not low.strip() or not any(t in low for t in _TOOL_SYNTAX):
+        return False
+    plain = re.sub(r"<[^>]+>", " ", reply)
+    plain = re.sub(r"[{}\[\]\"]", " ", plain)
+    return len(re.findall(r"[A-Za-z]{3,}", plain)) < 8
+
+
+def run_investigation_task(root: Path, cfg, client, agent, idx, task: str, *,
+                           answer_system: str | None = None) -> TaskResult:
+    """Run a reproduction/diagnosis task whose deliverable is a report.
+
+    Unlike run_task(), no edits are expected or applied. The gather phase uses
+    the normal tools (including `run`), then the answer phase reports findings
+    in prose. This is what makes the planner's "reproduce the failure" step a
+    success instead of a no-edit failure. If the model answers with tool-call
+    syntax anyway, the gathered evidence is recorded as the report so the next
+    fix task (and the session log) still has something concrete to work from.
+    """
+    when = workspace.stamp()
+    workspace.log_event(root, f"investigate: {task}")
+    print("\n--- looking things up ---", file=sys.stderr)
+    gathered = agent.gather(task)
+    print("--- reporting ---\n", file=sys.stderr)
+    reply = agent.answer(task, gathered,
+                         system=answer_system or INVESTIGATE_SYSTEM,
+                         include_edit_format=False, stream=True)
+    if _looks_like_tool_calls_only(reply) or not (reply or "").strip():
+        steps = "\n".join(getattr(agent, "steps_log", []) or ["(no steps)"])
+        reply = ("No prose report was produced; the lookup phase recorded:\n\n"
+                 + steps)
+        evidence = (gathered or "").strip()
+        if evidence:
+            reply += "\n\nEVIDENCE\n" + evidence[:8000]
+    session = None
+    if cfg.log_sessions:
+        session = workspace.write_session(root, task,
+                                          getattr(agent, "steps_log", []),
+                                          reply, [], None, when)
+        print(f"[session: {session.relative_to(root)}]", file=sys.stderr)
+    return TaskResult([], reply, True, [], idx, session)
+
+
 def run_task(root: Path, cfg, client, agent, idx, task: str, *,
              apply: bool = True, review: bool = False,
              answer_system: str | None = None) -> TaskResult:
@@ -610,6 +708,8 @@ def run_loop(root: Path, cfg, client, idx, plan_path: Path, *,
                         False = log it and carry on to the next task.
     - ``answer_system`` replacement answer brief (used when the tasks implement
                         scaffold stubs rather than edit existing code).
+    - Investigation-only tasks ("Reproduce...", "Locate the cause...") are
+      answered in prose and marked done without requiring edits.
     - ``auto_install`` when a verification fails on a missing third-party
                         module, pip-install it and retry (opt-in: the module
                         name comes from generated code). When off, the failure
@@ -621,6 +721,10 @@ def run_loop(root: Path, cfg, client, idx, plan_path: Path, *,
     attempted = 0
     done = 0
     failed = 0
+    # Investigation tasks produce a report, not an edit. Carry the latest
+    # reports into subsequent task prompts so a fresh context still benefits
+    # from the reproduction -- the plan file itself stays untouched.
+    context_notes: list[str] = []
     workspace.log_event(root, f"auto loop: plan={plan_path.name}"
                               f" verify={verify or '(none)'}")
 
@@ -639,10 +743,21 @@ def run_loop(root: Path, cfg, client, idx, plan_path: Path, *,
         attempted += 1
         print(f"\n=== task {attempted}: {task} ===", file=sys.stderr)
 
+        investigate = _is_investigation_task(task)
+        task_for_agent = task
+        if context_notes:
+            task_for_agent = (
+                task + "\n\nCONTEXT FROM PRIOR INVESTIGATION\n\n"
+                + "\n\n".join(context_notes))
         try:
-            tr = run_task(root, cfg, client, Agent(idx, client, cfg), idx,
-                          task, apply=apply, review=False,
-                          answer_system=answer_system)
+            if investigate:
+                tr = run_investigation_task(
+                    root, cfg, client, Agent(idx, client, cfg), idx,
+                    task_for_agent, answer_system=answer_system)
+            else:
+                tr = run_task(root, cfg, client, Agent(idx, client, cfg), idx,
+                              task_for_agent, apply=apply, review=False,
+                              answer_system=answer_system)
         except LLMError as e:
             print(f"  task failed: {e}", file=sys.stderr)
             workspace.log_event(root, f"task failed: {e}", "ERROR")
@@ -652,6 +767,31 @@ def run_loop(root: Path, cfg, client, idx, plan_path: Path, *,
             mark_failed(plan_path, task)
             continue
         idx = tr.idx
+
+        if investigate:
+            # The report is the deliverable; there is no code change to apply
+            # or verify. A failed/empty run is still a failure.
+            if (tr.reply or "").strip():
+                context_notes.append(f"### {task}\n{(tr.reply or '')[:3000]}")
+                del context_notes[:-2]       # keep only the latest two
+                mark_done(plan_path, task)
+                done += 1
+                workspace.log_event(root, "investigation done")
+                if on_task is not None:
+                    try:
+                        on_task(task)
+                    except Exception:
+                        pass
+                continue
+            print("  [investigation produced no report -- "
+                  f"{'stopping' if stop_on_fail else 'skipping'}]",
+                  file=sys.stderr)
+            workspace.log_event(root, "investigation produced no report", "ERROR")
+            failed += 1
+            if stop_on_fail:
+                break
+            mark_failed(plan_path, task)
+            continue
 
         ok_edits = [r for r in tr.results if r.ok]
         if not tr.applied or not ok_edits:

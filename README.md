@@ -298,6 +298,10 @@ pedacito auto . --apply --verify "pytest -q"                # verify each task, 
 pedacito auto . --apply --plan TODO.md                      # use an existing checklist instead
 ```
 
+Investigation-only tasks such as "Reproduce the crash" or "Locate the cause"
+are answered as a report and marked done without requiring edits, so a bug-fix
+plan can have a diagnosis checkpoint before the repair task.
+
 State lives in a plain markdown plan file (`PLAN.md` by default, or `--plan
 FILE`), so a run is resumable and editable mid-flight. `--verify CMD` runs after
 each task and feeds failures back for repair (`--repair` rounds); a missing
