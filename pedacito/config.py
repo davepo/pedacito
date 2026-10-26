@@ -229,6 +229,19 @@ class Config:
     shell_allowlist: tuple[str, ...] = ()
     # Cap on command output fed back to the model, in characters.
     max_shell_output_chars: int = 8000
+    # Let the gather loop capture the screen and turn it into text the model
+    # can read (pixel statistics, OCR, optional vision-model description).
+    # Off by default: this captures the whole desktop, which is a privacy
+    # decision, and launching an app via `command` also needs allow_shell.
+    allow_screenshots: bool = False
+    # Seconds to wait after launching before capturing (the app needs time to
+    # open a window). The action's `start` value overrides this when set.
+    screenshot_wait_seconds: int = 5
+    # Optional multimodal model id (same server) used to describe a captured
+    # screenshot. Empty = no image model; the tool still reports pixel
+    # statistics and OCR text. Point this at e.g. a Qwen-VL model.
+    vision_model: str = ""
+    vision_max_tokens: int = 400
     # Optional semantic search over indexed units. When on, a `grep` whose
     # regex/literal/case-insensitive search finds nothing falls back to your
     # server's /v1/embeddings endpoint and reports the closest units by
@@ -1770,6 +1783,15 @@ vram_gb  = 8                   # MANDATORY for local servers: GPU VRAM in GB
 # shell_allowlist = []             # optional executables allowed for `run`,
 #                                  # e.g. ["pytest", "python", "ruff"]
 # max_shell_output_chars = 8000    # command output fed back to the model
+# allow_screenshots = false        # capture the screen and return pixel
+#                                  # stats/OCR/vision text. Off by default
+#                                  # (whole-desktop capture is a privacy
+#                                  # decision). Launching a command also needs
+#                                  # allow_shell.
+# screenshot_wait_seconds = 5      # wait after launch before capturing
+# vision_model = ""                # multimodal model id for screenshot
+#                                  # descriptions (empty = stats/OCR only)
+# vision_max_tokens = 400
 # semantic_search = false          # `grep` falls back to meaning-based search
 #                                  # via the server's /v1/embeddings when no
 #                                  # text match is found. Needs an embedding

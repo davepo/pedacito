@@ -1,4 +1,4 @@
-"""The agent's tool surface: read, grep, callers, outline, sessions, write/append, done.
+"""The agent's tool surface: read, grep, callers, outline, sessions, write/append, run, screenshot, done.
 
 Usage
 -----
@@ -12,12 +12,14 @@ tool surface grows -- four to six is about the ceiling before a small model
 starts calling the wrong one or inventing arguments. The six navigation
 tools (read, grep, callers, outline, sessions, done) are the core surface.
 `sessions` is read-only history and is how a fresh run sees prior tasks.
-Everything destructive is behind an explicit gate: `write`/`append`/`move`/
-`delete` need `cfg.allow_write`, and `run` needs `cfg.allow_shell`. A default run
-therefore exposes only the navigation surface; a user who opts in accepts a
-larger surface because they asked for those capabilities. Every tool returns
-plain text with line numbers attached, since the model needs those numbers
-to write search/replace edits later.
+Everything destructive or machine-visible is behind an explicit gate:
+`write`/`append`/`move`/`delete` need `cfg.allow_write`, `run` needs
+`cfg.allow_shell`, and `screenshot` needs `cfg.allow_screenshots` (plus
+`allow_shell` when it launches an app). A default run therefore exposes only
+the navigation surface; a user who opts in accepts a larger surface because
+they asked for those capabilities. Every tool returns plain text with line
+numbers attached, since the model needs those numbers to write search/replace
+edits later.
 
 The navigation tools are deliberately forgiving, because small models make
 argument mistakes that must not cost a whole lookup: `read` accepts a symbol
@@ -50,9 +52,11 @@ import re
 import shlex
 import shutil
 import sys
+import time
+from datetime import datetime
 from pathlib import Path
 
-from . import fileio, proc, sessions
+from . import fileio, proc, sessions, vision
 
 TOOL_HELP = """\
 read     - read exact lines of a file.       args: file, start, end
@@ -68,6 +72,9 @@ move     - rename/move one file.             args: file (old), to (new)
 delete   - delete one file.                  args: file
 run      - run one command, no shell pipes.  args: command
            (a quiet GUI/server is stopped after shell_idle_seconds)
+screenshot - launch app, wait, capture screen; returns text analysis.
+           args: command, start (seconds to wait), optional file (old shot)
+           (needs allow_screenshots; launching a command also needs allow_shell)
            (write/append/move/delete need allow_write; run needs allow_shell)
 done     - stop gathering; you have enough.  args: none"""
 
@@ -82,14 +89,18 @@ STEP_SCHEMA = {
         "action": {
             "type": "string",
             "enum": ["read", "grep", "callers", "outline", "sessions",
-                     "write", "append", "move", "delete", "run", "done"],
+                     "write", "append", "move", "delete", "run",
+                     "screenshot", "done"],
         },
         "file": {"type": "string",
                  "description": "For read/outline/write/append/move/delete. For "
                                 "grep, optionally a file, directory, or glob. "
+                                "For screenshot, an older screenshot to compare. "
                                 "Empty otherwise.",
                  "maxLength": 200},
-        "start": {"type": "integer", "description": "For read. 0 otherwise."},
+        "start": {"type": "integer",
+                  "description": "For read, or screenshot wait seconds. "
+                                 "0 otherwise."},
         "end": {"type": "integer", "description": "For read. 0 otherwise."},
         "pattern": {"type": "string",
                     "description": "For grep: regex, or plain text if it is not "
@@ -103,9 +114,9 @@ STEP_SCHEMA = {
                "description": "For move: the new path. Empty otherwise.",
                "maxLength": 200},
         "command": {"type": "string",
-                    "description": "For run: executable and arguments, e.g. "
-                                   "'pytest -q'. No pipes or redirection. "
-                                   "Empty otherwise.",
+                    "description": "For run/screenshot: executable and "
+                                   "arguments, e.g. 'pytest -q'. No pipes or "
+                                   "redirection. Empty otherwise.",
                     "maxLength": 300},
         "content": {"type": "string",
                     "description": "For write/append: at most ~120 lines of file "
@@ -134,12 +145,13 @@ STEP_SCHEMA = {
 # The action list is kept in one place so the schema, the gate in `dispatch`,
 # and the prompt help cannot drift apart.
 ACTIONS = ("read", "grep", "callers", "outline", "sessions", "write",
-           "append", "move", "delete", "run", "done")
+           "append", "move", "delete", "run", "screenshot", "done")
 WRITE_ACTION = "write"
 APPEND_ACTION = "append"
 MOVE_ACTION = "move"
 DELETE_ACTION = "delete"
 RUN_ACTION = "run"
+SCREENSHOT_ACTION = "screenshot"
 WRITE_ACTIONS = (WRITE_ACTION, APPEND_ACTION)
 MUTATING_ACTIONS = WRITE_ACTIONS + (MOVE_ACTION, DELETE_ACTION)
 
@@ -160,6 +172,8 @@ def schema_for(cfg) -> dict:
         actions += ["write", "append", "move", "delete"]
     if getattr(cfg, "allow_shell", False):
         actions.append("run")
+    if getattr(cfg, "allow_screenshots", False):
+        actions.append("screenshot")
     actions.append("done")
 
     schema = copy.deepcopy(STEP_SCHEMA)
@@ -169,7 +183,8 @@ def schema_for(cfg) -> dict:
     drop = set()
     if not getattr(cfg, "allow_write", False):
         drop |= {"content", "to"}
-    if not getattr(cfg, "allow_shell", False):
+    if not (getattr(cfg, "allow_shell", False)
+            or getattr(cfg, "allow_screenshots", False)):
         drop.add("command")
     for key in drop:
         schema["properties"].pop(key, None)
@@ -999,6 +1014,149 @@ def tool_run(index, cfg, command: str) -> str:
     return f"{head}\nOUTPUT:\n{out}{tail}"
 
 
+def _resolve_screenshot(index, name: str) -> "Path | None":
+    """Resolve an existing screenshot safely under the project root.
+
+    Accepts a path relative to the project, or a bare filename from
+    `.pedacito/screenshots/`. Absolute paths outside the root are refused."""
+    n = (name or "").strip().strip("`\"'")
+    if not n:
+        return None
+    root = Path(index.root).resolve()
+    cands = []
+    p = Path(n)
+    if p.is_absolute():
+        cands.append(p)
+    else:
+        cands.append(root / n)
+        cands.append(root / ".pedacito" / "screenshots" / Path(n).name)
+    for c in cands:
+        try:
+            c = c.resolve()
+            c.relative_to(root)
+        except (OSError, ValueError):
+            continue
+        if c.is_file():
+            return c
+    return None
+
+
+def tool_screenshot(index, cfg, client, command: str = "", file: str = "",
+                    start: int = 0) -> str:
+    """Capture the screen (optionally launching an app first) and report what
+    a text-only model can know about it.
+
+    A model cannot see a GUI. This tool turns the image into text: pixel
+    statistics and a blank/black verdict (Pillow), OCR text (tesseract), and
+    an optional description from a multimodal model (`vision_model`). The PNG
+    is kept under `.pedacito/screenshots/` so a human can inspect it.
+
+    Gated by `allow_screenshots`; when `command` is given, also by
+    `allow_shell` because it launches code. The launched process is stopped
+    after the capture, so it cannot block the task.
+    """
+    if not getattr(cfg, "allow_screenshots", False):
+        return ("ERROR: `screenshot` is disabled (config allow_screenshots = "
+                "false). Enable it to capture the screen for visual checks.")
+    cmd = (command or "").strip()
+    prev = _resolve_screenshot(index, file) if (file or "").strip() else None
+    if (file or "").strip() and prev is None:
+        return f"ERROR: no screenshot named '{file}' under the project root."
+
+    argv = []
+    if cmd:
+        if not getattr(cfg, "allow_shell", False):
+            return ("ERROR: launching a screenshot command needs allow_shell "
+                    "= true as well as allow_screenshots.")
+        try:
+            argv = _split_command(cmd)
+        except ValueError as e:
+            return f"ERROR: could not parse command ({e})."
+        if not argv:
+            return "ERROR: screenshot command is empty."
+        allow = tuple(getattr(cfg, "shell_allowlist", ()) or ())
+        if allow:
+            names = {Path(a).name.lower() for a in allow}
+            exe = Path(argv[0]).name.lower()
+            if exe not in names and \
+                    argv[0].lower() not in {a.lower() for a in allow}:
+                return (f"ERROR: `{argv[0]}` is not in shell_allowlist "
+                        f"({', '.join(allow)}).")
+
+    root = Path(index.root).resolve()
+    out_dir = root / ".pedacito" / "screenshots"
+    out = out_dir / (datetime.now().strftime("%Y%m%d-%H%M%S-%f") + ".png")
+    delay = int(start or getattr(cfg, "screenshot_wait_seconds", 5) or 0)
+    delay = max(0, min(delay, 60))
+    env = dict(os.environ, NO_COLOR="1", TERM="dumb", PAGER="cat",
+               GIT_PAGER="cat")
+
+    launched = None
+    exit_code = None
+    if prev is not None and not argv:
+        # File-only mode: analyse that image instead of capturing again.
+        out = prev
+        method = "existing screenshot"
+    else:
+        if argv:
+            try:
+                launched = proc.spawn(argv, cwd=root, env=env)
+            except OSError as e:
+                return f"ERROR: could not launch '{cmd}': {e}"
+            if delay:
+                time.sleep(delay)
+        elif delay:
+            # Give the currently running app a moment to settle.
+            time.sleep(delay)
+
+        exit_code = launched.poll() if launched is not None else None
+        ok, method = vision.capture(out)
+        if launched is not None:
+            proc.terminate(launched)
+            try:
+                launched.wait(timeout=5)
+            except Exception:
+                pass
+        if not ok:
+            return f"ERROR: could not capture the screen: {method}"
+
+    report = vision.analyze(out, previous=prev)
+    desc = ""
+    if (getattr(cfg, "vision_model", "") or "").strip():
+        try:
+            desc = vision.describe(client, cfg, out)
+        except Exception as e:
+            desc = f"(vision model failed: {str(e)[:200]})"
+
+    try:
+        rel_out = out.relative_to(root).as_posix()
+    except ValueError:                            # pragma: no cover
+        rel_out = str(out)
+    bits = [f"SCREENSHOT: {rel_out}", f"CAPTURE: {method}"]
+    if argv:
+        status = (f" (process had already exited with code {exit_code} before "
+                  f"the capture)" if exit_code is not None else
+                  " (still running; stopped after capture)")
+        bits.append(f"LAUNCHED: {cmd}{status}")
+    if prev is not None and argv:
+        try:
+            bits.append("COMPARED WITH: " + prev.relative_to(root).as_posix())
+        except ValueError:                        # pragma: no cover
+            bits.append("COMPARED WITH: " + str(prev))
+    bits.append("ANALYSIS:\n" + report)
+    if desc:
+        bits.append("VISION DESCRIPTION:\n" + desc)
+    else:
+        bits.append("[No vision_model configured: the evidence above is "
+                    "pixel/OCR text. Set vision_model to a multimodal model "
+                    "for an image description. The saved PNG can also be "
+                    "opened by a human.]")
+    bits.append("[A text model cannot see the image directly. Treat a "
+                "black/blank verdict or OCR text as evidence, not a guess "
+                "about rendering quality.]")
+    return "\n".join(bits)
+
+
 # --------------------------------------------------------------------------
 # Dispatch
 # --------------------------------------------------------------------------
@@ -1027,6 +1185,9 @@ def dispatch(index, cfg, step: dict, client=None) -> str:
                              step.get("end", 0))
     if action == RUN_ACTION:
         return tool_run(index, cfg, step.get("command", ""))
+    if action == SCREENSHOT_ACTION:
+        return tool_screenshot(index, cfg, client, step.get("command", ""),
+                               step.get("file", ""), step.get("start", 0))
     if action in MUTATING_ACTIONS:
         if not getattr(cfg, "allow_write", False):
             return (f"ERROR: `{action}` is disabled (config allow_write = false). "

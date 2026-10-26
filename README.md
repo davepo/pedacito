@@ -233,6 +233,10 @@ During the gather phase the model has a deliberately small set of actions:
   `pytest -q` or `ruff check`, with its output fed back to the model. A quiet
   GUI/server launch is stopped after `shell_idle_seconds`, so it cannot block
   the agent until someone closes the window.
+- `screenshot` — opt-in (`allow_screenshots = true`) screen capture turned
+  into text: size/brightness/blank-screen verdict, OCR, and an optional
+  description from a `vision_model`. A text-only coding model never sees the
+  image itself, but it can act on a “black/blank” verdict or OCR text.
 - Semantic fallback — with `semantic_search = true`, a `grep` that finds no
   text match queries the server's `/v1/embeddings` endpoint and returns the
   closest units by meaning.
@@ -241,6 +245,35 @@ During the gather phase the model has a deliberately small set of actions:
 The forgiving fallbacks matter most for 9B–27B models: a malformed argument
 usually still returns useful source instead of burning one of the task's
 lookups.
+
+### Seeing a GUI
+
+A text model cannot actually see a game or desktop window. The practical
+workaround is to turn the screen into text. Install the optional capture
+dependency and enable the two trust gates:
+
+```bash
+pip install -e ".[vision]"          # Pillow, for capture + pixel analysis
+```
+
+```toml
+allow_screenshots = true            # capture the screen
+allow_shell = true                  # only needed to launch the app first
+screenshot_wait_seconds = 5         # let the window appear
+vision_model = "your-vl-model-id"   # optional: a multimodal model on the same server
+```
+
+The model can then call `screenshot` (with an optional launch command and a
+machine-readable wait value) and gets back a text report: resolution, mean
+luminance, near-black/white percentage, a black/blank verdict, OCR text when
+`tesseract` is installed, and—if `vision_model` is set—a description from a
+vision model. PNGs are saved under `.pedacito/screenshots/`.
+
+This is evidence, not true perception: it reliably catches black screens,
+blank frames, missing text, and errors visible via OCR, but it does not judge
+art quality. For web UIs, a browser automation/accessibility tree would be
+more precise; for custom engines, a debug framebuffer dump is often the most
+reliable route.
 
 ### `explain` — answer questions about the code
 
@@ -502,6 +535,8 @@ ones:
 | `allow_write` | False | Let the gather loop create/overwrite/grow/move/delete files; prefer search/replace. |
 | `allow_shell` | False | Let the gather loop run one command per step (tests/linters); no shell pipes. |
 | `shell_idle_seconds` | 10 | Stop a quiet `run` command (GUI/server) instead of blocking until its window closes. |
+| `allow_screenshots` | False | Capture the screen and return pixel/OCR/vision text; privacy-sensitive. |
+| `vision_model` | `""` | Optional multimodal model id used to describe screenshots. |
 | `semantic_search` | False | Fall back to `/v1/embeddings` meaning-based search when `grep` finds nothing. |
 | `disable_thinking` | False | Suppress `<think>` blocks. |
 | `default_profile` | `""` | Profile applied when `--profile` isn't given. |
@@ -525,6 +560,10 @@ behavior, and more) all have working defaults and are documented in
   index, cached in `.pedacito/embeddings.json`.
 - `run` is opt-in (`allow_shell = true`) and executes model-chosen commands in
   the project, without a shell. Treat it as a trust decision, not a sandbox.
+- A text-only model still cannot see graphics. `screenshot` gives it a text
+  proxy (blank/black verdict, pixel stats, OCR, optional VLM description), not
+  visual judgement; install the `vision` extra and use a multimodal model for
+  richer descriptions.
 - Broad, structural tasks ("modernize this codebase") are a poor fit regardless
   of scaffolding — that's a limit of small local models. Narrow, localized
   tasks are where this is genuinely useful.

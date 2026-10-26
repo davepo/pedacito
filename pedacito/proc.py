@@ -31,6 +31,26 @@ import threading
 import time
 
 
+def spawn(command, *, cwd, shell: bool = False, env: dict | None = None,
+          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+          ) -> subprocess.Popen:
+    """Start a child in its own process group without waiting for it.
+
+    Used by the screenshot action: launch the GUI, capture after a delay,
+    then `terminate()` the whole tree. Output is discarded by default."""
+    kwargs = {}
+    if os.name != "nt":
+        kwargs["start_new_session"] = True
+    return subprocess.Popen(
+        command, cwd=str(cwd), stdin=subprocess.DEVNULL,
+        stdout=stdout, stderr=stderr, shell=shell, env=env, **kwargs)
+
+
+def terminate(proc: subprocess.Popen) -> None:
+    """Kill a process started by spawn(), including its descendants."""
+    _terminate(proc)
+
+
 def _terminate(proc: subprocess.Popen) -> None:
     """Kill the process and its descendants, not just the direct child."""
     if os.name == "nt":

@@ -266,6 +266,11 @@ Rules:
   back to matching code by meaning and returns locations to `read`.
 - `run` executes one command and returns its output (only when allow_shell is
   on); use it to run tests or a linter, not to inspect files.
+- `screenshot` launches an app (optional), waits, captures the screen, and
+  returns pixel statistics, OCR text, and optionally a vision-model
+  description. Use it to check a GUI/game; a black/blank verdict is evidence.
+  You cannot see the image directly -- rely on the text report. Needs
+  allow_screenshots, and allow_shell when a command is launched.
 - `move` and `delete` are available only when allow_write is on. Prefer the
   search/replace answer format for edits; use these for whole-file moves or
   removals the task explicitly asks for.

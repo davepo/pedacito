@@ -48,6 +48,9 @@ Rules:
 - `sessions` lists or searches prior task logs. If the question is about a
   past change or the project's history, search those logs -- they record what
   earlier runs asked, read, and changed.
+- `screenshot` captures the screen and returns a text report (pixel stats,
+  OCR, optional vision-model description). Use it for questions about a GUI's
+  visible state; you cannot see the image itself.
 - Do not guess at code you have not read. If you need it, read it.
 - Choose `done` as soon as you have enough to answer the question. Do not browse.
 - Fill every field. Use "" for unused strings and 0 for unused numbers.

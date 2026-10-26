@@ -31,10 +31,12 @@ Only dependency is `requests`.
 
 from __future__ import annotations
 
+import base64
 import json
 import re
 import sys
 import time
+from pathlib import Path
 
 import requests
 
@@ -464,6 +466,40 @@ class LMStudio:
         except Exception as e:                  # pragma: no cover - server shape
             raise LLMError(
                 f"Unexpected embeddings response: {r.text[:300]}") from e
+
+    def vision(self, prompt: str, image_path, model: str | None = None,
+               max_tokens: int = 400) -> str:
+        """Ask a multimodal model to describe one local image.
+
+        Sent as an OpenAI-compatible image_url data URI, which LM Studio and
+        Ollama's OpenAI endpoints accept for vision models. Kept separate from
+        chat() because it is only used by the opt-in screenshot action; a
+        text-only model will reject it, which the caller reports as an
+        observation rather than failing the task."""
+        path = Path(image_path)
+        mime = {".jpg": "image/jpeg", ".jpeg": "image/jpeg",
+                ".webp": "image/webp"}.get(path.suffix.lower(), "image/png")
+        b64 = base64.b64encode(path.read_bytes()).decode("ascii")
+        payload = {
+            "model": model or getattr(self.cfg, "vision_model", "")
+            or self.cfg.model,
+            "messages": [{"role": "user", "content": [
+                {"type": "text", "text": prompt},
+                {"type": "image_url",
+                 "image_url": {"url": f"data:{mime};base64,{b64}"}},
+            ]}],
+            "max_tokens": max_tokens,
+            "temperature": getattr(self.cfg, "temperature", 0.2),
+        }
+        r = self._post(payload)
+        try:
+            msg = r.json()["choices"][0]["message"]
+            content = msg.get("content") or ""
+            self.stats["calls"] += 1
+            return strip_reasoning(content).strip()
+        except Exception as e:                  # pragma: no cover - server shape
+            raise LLMError(
+                f"Unexpected vision response: {r.text[:300]}") from e
 
     def chat(self, messages: list[dict], max_tokens: int, schema: dict | None = None,
              stream: bool = False, disable_thinking: bool | None = None) -> str:

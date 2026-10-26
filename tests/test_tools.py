@@ -13,6 +13,8 @@ import sys
 import time
 from pathlib import Path
 
+import pytest
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from pedacito import tools, workspace
@@ -90,6 +92,14 @@ def test_schema_hides_disabled_actions_and_fields():
     assert {"write", "append", "move", "delete", "run"} <= set(
         full["properties"]["action"]["enum"])
     assert {"content", "to", "command"} <= set(full["required"])
+
+    shot = Config()
+    shot.allow_screenshots = True
+    shschema = tools.schema_for(shot)
+    assert "screenshot" in shschema["properties"]["action"]["enum"]
+    assert "run" not in shschema["properties"]["action"]["enum"]
+    assert "command" in shschema["required"]
+    assert "content" not in shschema["properties"]
 
 
 def test_gather_has_no_default_step_cap(tmp_path):
@@ -394,6 +404,48 @@ def test_run_honours_allowlist(tmp_path):
     assert obs.startswith("ERROR") and "shell_allowlist" in obs
 
 
+# ------------------------------------------------------------- screenshot
+def test_screenshot_is_disabled_by_default(tmp_path):
+    idx = _index(tmp_path)
+    obs = tools.dispatch(idx, Config(), {"action": "screenshot"})
+    assert obs.startswith("ERROR") and "allow_screenshots" in obs
+
+
+def test_screenshot_launch_also_needs_allow_shell(tmp_path):
+    idx = _index(tmp_path)
+    cfg = Config()
+    cfg.allow_screenshots = True
+    obs = tools.dispatch(idx, cfg, {"action": "screenshot",
+                                    "command": "python main.py"})
+    assert obs.startswith("ERROR") and "allow_shell" in obs
+
+
+def test_screenshot_analyzes_black_and_colored_images(tmp_path):
+    pytest.importorskip("PIL.Image")
+    from PIL import Image
+
+    idx = _index(tmp_path)
+    cfg = Config()
+    cfg.allow_screenshots = True
+
+    black = tmp_path / "black.png"
+    Image.new("RGB", (320, 200), (0, 0, 0)).save(black)
+    obs = tools.dispatch(idx, cfg, {"action": "screenshot",
+                                    "file": "black.png"})
+    assert "essentially BLACK/BLANK" in obs
+    assert "320x200" in obs
+
+    colors = tmp_path / "colors.png"
+    img = Image.new("RGB", (320, 200), (0, 0, 0))
+    for x in range(320):
+        for y in range(200, 100, -1):
+            img.putpixel((x, y - 1), ((x * 7) % 256, (y * 5) % 256, 120))
+    img.save(colors)
+    obs2 = tools.dispatch(idx, cfg, {"action": "screenshot",
+                                     "file": "colors.png"})
+    assert "has visible variation" in obs2
+
+
 # ---------------------------------------------------------- semantic search
 class _EmbedClient:
     """Deterministic stand-in for an OpenAI-compatible embeddings endpoint."""
@@ -532,6 +584,35 @@ def test_lmstudio_embed_returns_vectors_in_input_order(monkeypatch):
     cfg.base_url = "http://example.test/v1"
     cfg.model = "m"
     assert LMStudio(cfg).embed(["a", "b"]) == [[1.0, 0.0], [2.0, 0.0]]
+
+
+def test_lmstudio_vision_sends_a_data_uri(tmp_path, monkeypatch):
+    from pedacito.llm import LMStudio
+
+    image = tmp_path / "shot.png"
+    image.write_bytes(b"\x89PNG\r\n\x1a\nnot-a-real-png")
+    seen = {}
+
+    class Response:
+        status_code = 200
+        text = ""
+
+        def json(self):
+            return {"choices": [{"message": {"content": "a black window"}}]}
+
+    def post(*args, **kwargs):
+        seen["payload"] = kwargs.get("json") or {}
+        return Response()
+
+    monkeypatch.setattr("pedacito.llm.requests.post", post)
+    cfg = Config()
+    cfg.base_url = "http://example.test/v1"
+    cfg.model = "m"
+    cfg.vision_model = "vl"
+    assert LMStudio(cfg).vision("describe", image) == "a black window"
+    assert seen["payload"]["model"] == "vl"
+    content = seen["payload"]["messages"][0]["content"]
+    assert content[1]["image_url"]["url"].startswith("data:image/png;base64,")
 
 
 def test_semantic_failure_does_not_lose_the_grep_step(tmp_path):
