@@ -188,10 +188,11 @@ class Config:
     # usable reasoning window is well under its advertised context.
     max_gathered_chars: int = 24000
     max_read_lines: int = 200
-    # Let the gather loop create/overwrite whole files via the `write` tool.
-    # Off by default: a mid-gather write skips the edit path's backup, syntax
-    # check and review page, so prefer search/replace blocks unless a model
-    # genuinely cannot emit them.
+    # Let the gather loop create/overwrite whole files via `write`, grow them
+    # with `append`, and rename/remove them with `move`/`delete`. Off by
+    # default: a mid-gather write skips the edit path's syntax check and
+    # review page, so prefer search/replace blocks unless a model genuinely
+    # cannot emit them.
     allow_write: bool = False
     # Ceiling on one `write` call's contents, in characters.
     max_write_chars: int = 200_000
@@ -204,6 +205,33 @@ class Config:
     # setting it above the provider's true limit just converts clean steps
     # into mid-string truncations again.
     max_write_lines: int = 120
+    # Let the gather loop run ONE command per step (tests, linters, build
+    # checks) and feed its output back. Off by default: this executes code in
+    # the project, so enabling it is an explicit trust decision. Commands run
+    # WITHOUT a shell (argv only), so pipes, redirection, and `&&` do not
+    # work; use a small script if you need those.
+    allow_shell: bool = False
+    # Seconds before a `run` command is killed and its timeout reported.
+    shell_timeout: int = 120
+    # Optional executable allowlist for `run` (e.g. ["pytest", "python",
+    # "ruff"]). Empty means "any executable" once allow_shell is on.
+    shell_allowlist: tuple[str, ...] = ()
+    # Cap on command output fed back to the model, in characters.
+    max_shell_output_chars: int = 8000
+    # Optional semantic search over indexed units. When on, a `grep` whose
+    # regex/literal/case-insensitive search finds nothing falls back to your
+    # server's /v1/embeddings endpoint and reports the closest units by
+    # meaning. Off by default: it needs an embedding model and costs one
+    # embedding pass over the index the first time (cached afterwards).
+    semantic_search: bool = False
+    # Model id used for embeddings; empty means the chat model id. Point this
+    # at a dedicated embedding model (e.g. nomic-embed-text) when your server
+    # serves one alongside the chat model.
+    embedding_model: str = ""
+    semantic_top_k: int = 5
+    # Cosine similarity below this is not shown. Embedding scales differ by
+    # model, so tune this if results are too noisy or too sparse.
+    semantic_min_score: float = 0.2
     # Recognise rename/move intent in edit blocks: a creation of a new path
     # paired with a block that empties an existing same-extension file is
     # applied as a real move (contents relocated, old file deleted) instead of
@@ -508,10 +536,11 @@ def _coerce(name: str, value, path: Path | None = None):
                 "  ('json_object' / 'json' mean 'object';"
                 " 'json_schema' means 'schema')")
         return norm
-    if name == "extra_extensions":
+    if name in ("extra_extensions", "shell_allowlist"):
         if not isinstance(value, (list, tuple)):
-            raise ConfigError(f"{where}{name} must be a list, "
-                              f'e.g. [".jinja", ".proto"]')
+            example = ('["pytest", "python"]' if name == "shell_allowlist"
+                       else '[".jinja", ".proto"]')
+            raise ConfigError(f"{where}{name} must be a list, e.g. {example}")
         return tuple(str(v) for v in value)
     if name == "sampler":
         # A plain dict passthrough, however TOML spelled it: an inline table
@@ -1303,7 +1332,7 @@ def _parse_env(name: str, raw: str):
                 f"PEDACITO_JSON_MODE={raw!r} must be 'schema' or 'object'"
                 "  ('json_object' / 'json' mean 'object')")
         return norm
-    if name == "extra_extensions":
+    if name in ("extra_extensions", "shell_allowlist"):
         return tuple(x.strip() for x in raw.split(",") if x.strip())
     if name == "sampler":
         # Not a natural environment-variable target; a JSON object is the
@@ -1702,15 +1731,33 @@ vram_gb  = 8                   # MANDATORY for local servers: GPU VRAM in GB
 #                                  # out. Raise it for API models on big tasks.
 # max_gathered_chars = 24000       # ceiling on accumulated source per task
 # max_read_lines = 200             # cap on one `read` call's line count
-# allow_write = false              # let the gather loop overwrite whole files
-#                                  # (skips backup/review; prefer edit blocks)
-# max_write_chars = 200000         # ceiling on one `write` call
-# max_write_lines = 120            # lines allowed in ONE write step; keeps a
-#                                  # single reply under the provider's real
-#                                  # per-message output limit (deepseek ~8k
-#                                  # tokens). Large files are written in
-#                                  # chunks across steps -- do not raise this
-#                                  # past what your API can emit per message.
+# allow_write = false              # let the gather loop create/overwrite files
+#                                  # with `write`, grow them with `append`, and
+#                                  # move/delete files (skips review; prefer
+#                                  # search/replace edit blocks)
+# max_write_chars = 200000         # ceiling on one `write`/`append` result
+# max_write_lines = 120            # lines allowed in ONE write/append step;
+#                                  # keeps a single reply under the provider's
+#                                  # real per-message output limit (deepseek
+#                                  # ~8k tokens). Large files are built from
+#                                  # repeated `append` steps -- do not raise
+#                                  # this past what your API can emit.
+# allow_shell = false              # let the gather loop run ONE command per
+#                                  # step (tests/linters). Off by default: it
+#                                  # executes code in your project. Commands run
+#                                  # without a shell, so pipes/redirection and
+#                                  # `&&` do not work.
+# shell_timeout = 120              # seconds before a `run` command is killed
+# shell_allowlist = []             # optional executables allowed for `run`,
+#                                  # e.g. ["pytest", "python", "ruff"]
+# max_shell_output_chars = 8000    # command output fed back to the model
+# semantic_search = false          # `grep` falls back to meaning-based search
+#                                  # via the server's /v1/embeddings when no
+#                                  # text match is found. Needs an embedding
+#                                  # model; results are cached per unit.
+# embedding_model = ""             # embedding model id (empty = chat model)
+# semantic_top_k = 5               # semantic matches returned per query
+# semantic_min_score = 0.2         # cosine similarity floor for a match
 # allow_rename = true              # treat "create new path + empty old path"
 #                                  # block pairs as real renames (old file is
 #                                  # deleted); set false to never auto-delete

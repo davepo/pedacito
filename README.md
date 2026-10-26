@@ -213,6 +213,31 @@ pedacito ask ~/code/anki -t "..." --review    # side-by-side sign-off page
 Every write snapshots originals first; `pedacito restore <project>` undoes the
 last one.
 
+During the gather phase the model has a deliberately small set of actions:
+
+- `read` — exact numbered lines, or a definition by symbol name when it knows
+  what it wants but not where it lives.
+- `grep` — regex or literal search scoped to the whole project, a file, a
+  directory, or a glob. Hits are annotated with their enclosing symbol. A
+  pattern that is not valid regex is searched literally, and a case-sensitive
+  miss is retried case-insensitively.
+- `callers` — where a symbol is defined, what it calls, and the call-site
+  lines of its callers.
+- `outline` — every unit in one file, with signatures and line ranges.
+- `write` / `append` / `move` / `delete` — opt-in whole-file operations when
+  `allow_write = true`; `append` builds a file larger than one reply in
+  sequential chunks.
+- `run` — opt-in (`allow_shell = true`) execution of one command such as
+  `pytest -q` or `ruff check`, with its output fed back to the model.
+- Semantic fallback — with `semantic_search = true`, a `grep` that finds no
+  text match queries the server's `/v1/embeddings` endpoint and returns the
+  closest units by meaning.
+- `done` — stop gathering and answer.
+
+The forgiving fallbacks matter most for 9B–27B models: a malformed argument
+usually still returns useful source instead of burning one of the task's
+lookups.
+
 ### `explain` — answer questions about the code
 
 `explain` answers questions about the indexed project — how a function works,
@@ -458,7 +483,9 @@ ones:
 | `backup` | True | Snapshot originals before writing. |
 | `log_sessions` | True | Write a session record per task. |
 | `review` | False | Always open the side-by-side reviewer. |
-| `allow_write` | False | Let the gather loop overwrite whole files (prefer search/replace). |
+| `allow_write` | False | Let the gather loop create/overwrite/grow/move/delete files; prefer search/replace. |
+| `allow_shell` | False | Let the gather loop run one command per step (tests/linters); no shell pipes. |
+| `semantic_search` | False | Fall back to `/v1/embeddings` meaning-based search when `grep` finds nothing. |
 | `disable_thinking` | False | Suppress `<think>` blocks. |
 | `default_profile` | `""` | Profile applied when `--profile` isn't given. |
 
@@ -475,8 +502,12 @@ behavior, and more) all have working defaults and are documented in
   `--ext`/`extra_extensions`.
 - The call graph matches on bare names, so two unrelated `run()` methods are
   conflated — fine for locating code, not sound for automated refactoring.
-- No embeddings — `grep` plus the summary map covers most of what semantic
-  search would, without a second model resident in memory.
+- Semantic search is opt-in (`semantic_search = true`) and needs an embeddings
+  endpoint/model; grep plus the summary map remains the dependency-free
+  default. The first semantic query pays a one-time embedding pass over the
+  index, cached in `.pedacito/embeddings.json`.
+- `run` is opt-in (`allow_shell = true`) and executes model-chosen commands in
+  the project, without a shell. Treat it as a trust decision, not a sandbox.
 - Broad, structural tasks ("modernize this codebase") are a poor fit regardless
   of scaffolding — that's a limit of small local models. Narrow, localized
   tasks are where this is genuinely useful.

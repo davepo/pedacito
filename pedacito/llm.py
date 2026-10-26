@@ -429,6 +429,42 @@ class LMStudio:
             raise LLMError(f"Server returned {r.status_code}: {body[:500]}")
         return r
 
+    def embed(self, texts: list[str]) -> list[list[float]]:
+        """Return one embedding vector per text via `<base_url>/embeddings`.
+
+        Only used by optional semantic search (see semantic.py). Kept on the
+        same client so it inherits the configured base_url, API key, and
+        timeout; it does not participate in chat retry/template handling.
+        Accepts a plain string for convenience and always returns vectors in
+        input order (the API may return them out of order)."""
+        if isinstance(texts, str):
+            texts = [texts]
+        if not texts:
+            return []
+        url = self.cfg.base_url.rstrip("/") + "/embeddings"
+        model = getattr(self.cfg, "embedding_model", "") or self.cfg.model
+        try:
+            r = requests.post(url, headers=self.headers,
+                              json={"model": model, "input": list(texts)},
+                              timeout=self.cfg.timeout)
+        except requests.exceptions.ConnectionError as e:
+            raise LLMError(CONNECT_HELP.format(url=self.cfg.base_url)) from e
+        if r.status_code >= 400:
+            raise LLMError(
+                f"Embeddings request failed ({r.status_code}): {r.text[:300]}. "
+                f"Set embedding_model to a model your server can load, or turn "
+                f"semantic_search off.")
+        try:
+            data = r.json()["data"]
+            if isinstance(data, dict):        # single-input server shape
+                data = [data]
+            data = sorted(data, key=lambda d: d.get("index", 0))
+            self.stats["calls"] += 1
+            return [[float(x) for x in d["embedding"]] for d in data]
+        except Exception as e:                  # pragma: no cover - server shape
+            raise LLMError(
+                f"Unexpected embeddings response: {r.text[:300]}") from e
+
     def chat(self, messages: list[dict], max_tokens: int, schema: dict | None = None,
              stream: bool = False, disable_thinking: bool | None = None) -> str:
         """Send a chat completion request and return the response text.

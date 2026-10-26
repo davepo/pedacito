@@ -34,7 +34,7 @@ import sys
 
 from .edits import apply_edits, parse_edits
 from .llm import LLMError, estimate_tokens
-from .tools import STEP_SCHEMA, TOOL_HELP, dispatch
+from .tools import TOOL_HELP, dispatch, schema_for
 
 # Absolute ceiling on gather-loop steps regardless of cfg.max_steps. The
 # budget-extension logic exists so a small model can finish covering the
@@ -260,7 +260,7 @@ You are a code assistant working through a lookup index of a Python project.
 You cannot see the full source. You see a map of it, and you request the exact
 parts you need, one request at a time.
 
-Available actions:
+Actions (disabled ones are noted below):
 {TOOL_HELP}
 
 Rules:
@@ -268,6 +268,21 @@ Rules:
 - Line ranges in the map are exact. Read them directly.
 - `grep` and `outline` tell you WHERE code is. Only `read` shows you the exact
   text. You must `read` a region before you can change it.
+- Know a symbol's name but not its line? `read` with `symbol` set and `file`
+  empty reads that definition directly. If the name is ambiguous you get the
+  list of definitions to choose from.
+- `grep` accepts a file, directory, or glob in `file`, and its hits name the
+  enclosing symbol. A pattern that is not valid regex is searched as literal
+  text, and a case-sensitive miss is retried case-insensitively.
+- `callers` shows the definition, what it calls, and the call-site lines of
+  its callers -- use it to trace flow without reading every caller.
+- If `grep` cannot find a phrase and semantic search is enabled, it falls
+  back to matching code by meaning and returns locations to `read`.
+- `run` executes one command and returns its output (only when allow_shell is
+  on); use it to run tests or a linter, not to inspect files.
+- `move` and `delete` are available only when allow_write is on. Prefer the
+  search/replace answer format for edits; use these for whole-file moves or
+  removals the task explicitly asks for.
 - Do not guess at code you have not read. If you need it, read it.
 - Choose `done` as soon as you have enough to do the task. Do not browse.
 - Fill every field. Use "" for unused strings and 0 for unused numbers.
@@ -420,7 +435,7 @@ class Agent:
     def gather(self, task: str, verbose: bool = True,
                on_step=None, base: str | None = None) -> str:
         """Run the tool-calling loop: repeatedly ask the model to choose an
-        action (read/grep/callers/outline/done) until it says `done` or
+        action (read/grep/callers/outline/write/append/done) until it says `done` or
         cfg.max_steps is reached, accumulating the source it read.
 
         Returns the concatenated text of everything read, ready to hand to
@@ -495,6 +510,7 @@ class Agent:
         messages[-1]["content"] += "\n\n" + nudge(1)
 
         step = 0
+        step_schema = schema_for(self.cfg)
         done_confirmed = False   # one-shot guard for the post-truncation
                                  # "are you really done?" nudge below
         step_recoveries = 0      # budget for re-asking after a gather step
@@ -502,7 +518,7 @@ class Agent:
         while step < step_cap:
             step += 1
             try:
-                stepjson = self.client.chat_json(messages, STEP_SCHEMA,
+                stepjson = self.client.chat_json(messages, step_schema,
                                                  self.cfg.max_tokens_step,
                                                  disable_thinking=True)
             except LLMError as e:
@@ -542,9 +558,14 @@ class Agent:
             action = (stepjson.get("action") or "").strip()
             why = (stepjson.get("reasoning") or "").strip()
 
-            detail = stepjson.get("file") or stepjson.get("pattern") or stepjson.get("symbol") or ""
+            detail = (stepjson.get("file") or stepjson.get("pattern")
+                      or stepjson.get("symbol") or stepjson.get("command") or "")
             if action == "read":
                 detail = f"{stepjson.get('file')} L{stepjson.get('start')}-{stepjson.get('end')}"
+            elif action == "move":
+                detail = f"{stepjson.get('file')} -> {stepjson.get('to')}"
+            elif action == "run":
+                detail = stepjson.get("command", "")
             self.steps_log.append(f"{step}. {action} {detail}  ({why})")
             if on_step is not None:
                 try:
@@ -631,7 +652,7 @@ class Agent:
                     continue
                 break
 
-            obs = dispatch(self.index, self.cfg, stepjson)
+            obs = dispatch(self.index, self.cfg, stepjson, client=self.client)
             # If the model's last reply was cut off at the token limit and we
             # salvaged the action from it, say so in the observation: the cut
             # almost always happened inside 'reasoning', and an unmarked
@@ -648,15 +669,15 @@ class Agent:
                 # (dispatch() refuses oversized writes), but without this the
                 # model re-rolls the same giant write forever. Tell it the
                 # exact chunk size that fits one message instead.
-                if action == "write" and \
+                if action in ("write", "append") and \
                         len((stepjson.get("content") or "").splitlines()) > \
                         max(1, int(getattr(self.cfg, "max_write_lines", 0) or 0)):
-                    obs += ("\n[Your `write` was CUT OFF mid-content by the "
+                    obs += (f"\n[Your `{action}` was CUT OFF mid-content by the "
                             "output token limit -- it was NOT applied. Split it: "
-                            "`write` at most ~80 lines now; then `read` the "
-                            "file's last few lines and `write` again with those "
-                            "lines followed by the next ~80. Never put a whole "
-                            "large file in one reply.]")
+                            f"`write` at most ~80 lines now; then `append` the "
+                            "next ~80. Repeat `append` until the file is "
+                            "complete. Never put a whole large file in one "
+                            "reply.]")
             if action == "read" and not obs.startswith("ERROR"):
                 did_read = True
                 # Append-only span ledger. The eviction pass at the end of
@@ -686,7 +707,8 @@ class Agent:
             # alone and proposes nothing, which surfaces in the GUI as a
             # blank review page. Record failures compactly instead.
             if obs.startswith("ERROR"):
-                arg = stepjson.get("file") or stepjson.get("pattern") or stepjson.get("symbol") or ""
+                arg = (stepjson.get("file") or stepjson.get("pattern")
+                       or stepjson.get("symbol") or stepjson.get("command") or "")
                 item = f"--- {action} {arg} failed: {obs[:160]}"
                 gathered.append(item)
                 messages.append({"role": "assistant", "content": _compact(stepjson)})
@@ -713,7 +735,8 @@ class Agent:
                     obs = obs[:budget] + "\n[truncated: context budget reached]"
                 budget -= len(obs)
 
-            arg = stepjson.get("file") or stepjson.get("pattern") or stepjson.get("symbol")
+            arg = (stepjson.get("file") or stepjson.get("pattern")
+                   or stepjson.get("symbol") or stepjson.get("command"))
             if action == "outline":
                 # Outlines are navigation, not evidence. The model needs them to
                 # decide what to read; the answer phase needs the code it read.
