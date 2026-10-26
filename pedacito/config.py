@@ -213,6 +213,12 @@ class Config:
     allow_shell: bool = False
     # Seconds before a `run` command is killed and its timeout reported.
     shell_timeout: int = 120
+    # Stop a `run` command after this many seconds with NO output. GUI apps and
+    # servers print a startup banner and then go quiet, so this is what keeps
+    # them from blocking the agent until someone closes the window. Raise it if
+    # a legitimate test/build is silent while loading dependencies; 0 disables
+    # the idle rule (only shell_timeout remains).
+    shell_idle_seconds: int = 10
     # Optional executable allowlist for `run` (e.g. ["pytest", "python",
     # "ruff"]). Empty means "any executable" once allow_shell is on.
     shell_allowlist: tuple[str, ...] = ()
@@ -1747,7 +1753,10 @@ vram_gb  = 8                   # MANDATORY for local servers: GPU VRAM in GB
 #                                  # executes code in your project. Commands run
 #                                  # without a shell, so pipes/redirection and
 #                                  # `&&` do not work.
-# shell_timeout = 120              # seconds before a `run` command is killed
+# shell_timeout = 120              # hard seconds before a `run` is killed
+# shell_idle_seconds = 10          # stop `run` after this long with no output;
+#                                  # this is what unblocks GUI/server launches.
+#                                  # Raise it if a slow test is quiet at startup.
 # shell_allowlist = []             # optional executables allowed for `run`,
 #                                  # e.g. ["pytest", "python", "ruff"]
 # max_shell_output_chars = 8000    # command output fed back to the model

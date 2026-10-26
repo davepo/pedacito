@@ -938,18 +938,18 @@ def smoke_run(root: Path, entry: str = "main.py",
     A crash (non-zero exit before the timeout) is a failure with its traceback.
     A process still running at the timeout is a SUCCESS: games, servers, and
     UIs do not exit on their own, and having started is what the check is for.
+    The process group is killed at the timeout, so the game/window actually
+    closes instead of lingering after the check.
     """
-    import subprocess
-    try:
-        proc = subprocess.run([sys.executable, entry], cwd=str(root),
-                              stdin=subprocess.DEVNULL,
-                              capture_output=True, text=True, timeout=timeout)
-    except subprocess.TimeoutExpired:
+    from . import proc as proc_mod
+    rc, out, stopped, _ = proc_mod.run(
+        [sys.executable, entry], cwd=root, timeout=timeout,
+        max_output=200_000)
+    if stopped == "timeout":
         return True, f"(still running after {timeout}s -- treated as started)"
-    except Exception as e:                       # pragma: no cover - env specific
-        return False, f"(could not run {entry}: {e})"
-    out = ((proc.stdout or "") + (proc.stderr or "")).strip()
-    return proc.returncode == 0, out
+    if stopped == "error":
+        return False, f"(could not run {entry}: {out})"
+    return rc == 0, out.strip()
 
 
 def _fix_from_output(client, cfg, idx: "Index", py_rels, project_name: str,

@@ -237,17 +237,17 @@ def run_verify(root: Path, command: str, timeout: int = 600) -> tuple[bool, str]
 
     A Ralph loop without a feedback signal is a chaos engine -- it keeps
     churning out code no one checked. This is the signal: pass/fail plus the
-    command's output, fed back to the model for repair on failure."""
-    try:
-        proc = subprocess.run(
-            command, shell=True, cwd=str(root),
-            capture_output=True, text=True, timeout=timeout)
-    except subprocess.TimeoutExpired:
+    command's output, fed back to the model for repair on failure. The whole
+    process group is killed on timeout, so a GUI/launcher child cannot keep a
+    window alive after the check gives up."""
+    from . import proc as proc_mod
+    rc, out, stopped, _ = proc_mod.run(
+        command, cwd=root, timeout=timeout, shell=True, max_output=200_000)
+    if stopped == "timeout":
         return False, f"(verification timed out after {timeout}s)"
-    except Exception as e:                       # pragma: no cover - env specific
-        return False, f"(could not run verification: {e})"
-    out = ((proc.stdout or "") + (proc.stderr or "")).strip()
-    return proc.returncode == 0, out
+    if stopped == "error":
+        return False, f"(could not run verification: {out})"
+    return rc == 0, out.strip()
 
 
 # --------------------------------------------------------------------------

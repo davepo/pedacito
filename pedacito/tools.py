@@ -49,11 +49,10 @@ import os
 import re
 import shlex
 import shutil
-import subprocess
 import sys
 from pathlib import Path
 
-from . import fileio, sessions
+from . import fileio, proc, sessions
 
 TOOL_HELP = """\
 read     - read exact lines of a file.       args: file, start, end
@@ -68,6 +67,7 @@ append   - add text to the END of a file.    args: file, content
 move     - rename/move one file.             args: file (old), to (new)
 delete   - delete one file.                  args: file
 run      - run one command, no shell pipes.  args: command
+           (a quiet GUI/server is stopped after shell_idle_seconds)
            (write/append/move/delete need allow_write; run needs allow_shell)
 done     - stop gathering; you have enough.  args: none"""
 
@@ -924,7 +924,13 @@ def tool_run(index, cfg, command: str) -> str:
     pipes/redirection/`&&` are inert arguments rather than executed syntax.
     `shell_allowlist`, when set, restricts the executable name. Output and
     runtime are both capped so a hung or chatty command cannot eat the task's
-    context budget."""
+    context budget.
+
+    A GUI/server launch is the problem case: it opens a window and never
+    exits. `proc.run` watches output and stops the process (and its process
+    group) after `shell_idle_seconds` of silence, returning "started, then
+    stopped" instead of blocking until a person closes the window. Test
+    runners keep printing, so they still get the full `shell_timeout`."""
     if not getattr(cfg, "allow_shell", False):
         return ("ERROR: `run` is disabled (config allow_shell = false). Enable "
                 "it to run tests or linters from the gather loop, or run the "
@@ -948,18 +954,15 @@ def tool_run(index, cfg, command: str) -> str:
                     f"({', '.join(allow)}).")
 
     timeout = max(1, int(getattr(cfg, "shell_timeout", 120) or 120))
+    idle = max(0, int(getattr(cfg, "shell_idle_seconds", 10) or 0))
+    cap = max(200, int(getattr(cfg, "max_shell_output_chars", 8000) or 8000))
     env = dict(os.environ, NO_COLOR="1", TERM="dumb", GIT_PAGER="cat",
                PAGER="cat")
-    try:
-        proc = subprocess.run(argv, cwd=str(index.root), capture_output=True,
-                              text=True, errors="replace", timeout=timeout,
-                              env=env, stdin=subprocess.DEVNULL)
-    except subprocess.TimeoutExpired:
-        return f"ERROR: command timed out after {timeout}s: {cmd}"
-    except FileNotFoundError:
-        return f"ERROR: command not found: {argv[0]}"
-    except OSError as e:
-        return f"ERROR: could not run command: {e}"
+    rc, out, stopped, _elapsed = proc.run(
+        argv, cwd=index.root, timeout=timeout, idle_timeout=idle,
+        max_output=cap, env=env)
+    if stopped == "error":
+        return f"ERROR: could not run command: {out}"
 
     # A command can rewrite source (snapshot updates, codegen, formatters).
     # Line ranges are only valid against the bytes they were indexed from, so
@@ -978,14 +981,22 @@ def tool_run(index, cfg, command: str) -> str:
     except Exception as e:                     # stale index is not fatal
         print(f"[run] index refresh skipped: {e}", file=sys.stderr)
 
-    out = ((proc.stdout or "") + (proc.stderr or "")).strip()
-    cap = max(200, int(getattr(cfg, "max_shell_output_chars", 8000) or 8000))
-    if len(out) > cap:
-        out = out[:cap] + f"\n[output truncated to {cap} chars]"
-    if not out:
-        out = "(no output)"
-    status = "OK" if proc.returncode == 0 else "FAILED"
-    return f"RUN: {cmd}\nEXIT: {proc.returncode} ({status})\nOUTPUT:\n{out}"
+    out = out.strip() or "(no output)"
+    if stopped == "idle":
+        head = (f"RUN: {cmd}\nSTOPPED: no output for {idle}s; the process was "
+                "still running and has been killed.")
+        tail = ("\n[This usually means a GUI or a server. Startup is all this "
+                "check can observe; do not re-run it just to watch it. Use a "
+                "bounded test command for pass/fail.]")
+    elif stopped == "timeout":
+        head = f"RUN: {cmd}\nSTOPPED: timed out after {timeout}s (killed)."
+        tail = ("\n[The command was still running at the hard limit; the output "
+                "above is what it produced before being stopped.]")
+    else:
+        status = "OK" if rc == 0 else "FAILED"
+        head = f"RUN: {cmd}\nEXIT: {rc} ({status})"
+        tail = ""
+    return f"{head}\nOUTPUT:\n{out}{tail}"
 
 
 # --------------------------------------------------------------------------

@@ -230,7 +230,9 @@ During the gather phase the model has a deliberately small set of actions:
   `allow_write = true`; `append` builds a file larger than one reply in
   sequential chunks.
 - `run` — opt-in (`allow_shell = true`) execution of one command such as
-  `pytest -q` or `ruff check`, with its output fed back to the model.
+  `pytest -q` or `ruff check`, with its output fed back to the model. A quiet
+  GUI/server launch is stopped after `shell_idle_seconds`, so it cannot block
+  the agent until someone closes the window.
 - Semantic fallback — with `semantic_search = true`, a `grep` that finds no
   text match queries the server's `/v1/embeddings` endpoint and returns the
   closest units by meaning.
@@ -489,6 +491,7 @@ ones:
 | `review` | False | Always open the side-by-side reviewer. |
 | `allow_write` | False | Let the gather loop create/overwrite/grow/move/delete files; prefer search/replace. |
 | `allow_shell` | False | Let the gather loop run one command per step (tests/linters); no shell pipes. |
+| `shell_idle_seconds` | 10 | Stop a quiet `run` command (GUI/server) instead of blocking until its window closes. |
 | `semantic_search` | False | Fall back to `/v1/embeddings` meaning-based search when `grep` finds nothing. |
 | `disable_thinking` | False | Suppress `<think>` blocks. |
 | `default_profile` | `""` | Profile applied when `--profile` isn't given. |

@@ -8,6 +8,7 @@ case-insensitive fallbacks plus directory/glob scopes, call-site snippets in
 """
 from __future__ import annotations
 
+import os
 import sys
 import time
 from pathlib import Path
@@ -287,6 +288,57 @@ def test_run_executes_without_a_shell(tmp_path):
     })
     assert "EXIT: 0 (OK)" in obs
     assert "123" in obs
+
+
+def test_run_stops_a_silent_gui_like_process(tmp_path):
+    """The reported bug: `run python game.py` opens a window and blocks until
+    someone closes it. A process that goes quiet must be stopped automatically,
+    with an observation that continues the task instead of hanging."""
+    idx = _index(tmp_path)
+    cfg = Config()
+    cfg.allow_shell = True
+    cfg.shell_timeout = 30
+    cfg.shell_idle_seconds = 1
+    started = time.time()
+    obs = tools.dispatch(idx, cfg, {
+        "action": "run",
+        # A GUI typically prints a startup banner, then goes quiet forever.
+        "command": (f'{sys.executable} -c "print(\'pygame 2.5.2\'); '
+                    f'import time; time.sleep(30)"'),
+    })
+    assert "pygame 2.5.2" in obs
+    assert "STOPPED: no output for 1s" in obs
+    assert "GUI or a server" in obs
+    assert time.time() - started < 10
+
+
+def test_proc_stops_the_whole_process_tree(tmp_path):
+    """A launcher that spawns the visible window as a child must not survive
+    the idle stop -- that is the difference between a closed game and a window
+    left on screen after pedacito continues."""
+    if os.name == "nt":
+        return                       # taskkill path is Windows-specific
+    from pedacito import proc
+    marker = tmp_path / "child.pid"
+    script = tmp_path / "parent.py"
+    script.write_text(
+        "import subprocess, sys, time\n"
+        "p = subprocess.Popen([sys.executable, '-c', "
+        "'import time; time.sleep(30)'])\n"
+        f"open({str(marker)!r}, 'w').write(str(p.pid))\n"
+        "time.sleep(30)\n", encoding="utf-8")
+    _, _, stopped, _ = proc.run([sys.executable, str(script)], cwd=tmp_path,
+                                timeout=20, idle_timeout=1)
+    assert stopped == "idle"
+    pid = int(marker.read_text())
+    deadline = time.time() + 5
+    while time.time() < deadline:
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return
+        time.sleep(0.1)
+    raise AssertionError(f"grandchild {pid} survived the idle stop")
 
 
 def test_run_timeout_is_reported(tmp_path):
