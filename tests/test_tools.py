@@ -16,6 +16,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from pedacito import tools, workspace
+from pedacito.agent import Agent
 from pedacito.chunker import chunk_source
 from pedacito.config import Config
 from pedacito.index import Index
@@ -89,6 +90,32 @@ def test_schema_hides_disabled_actions_and_fields():
     assert {"write", "append", "move", "delete", "run"} <= set(
         full["properties"]["action"]["enum"])
     assert {"content", "to", "command"} <= set(full["required"])
+
+
+def test_gather_has_no_default_step_cap(tmp_path):
+    """max_steps=0 (the default) must not stop at the old internal ceiling;
+    only the token/gathered budget or a `done` ends the gather loop."""
+    idx = _index(tmp_path)
+    cfg = Config()
+    assert cfg.max_steps == 0
+
+    class ManySteps:
+        step_truncated = False
+
+        def __init__(self, target):
+            self.target = target
+            self.n = 0
+
+        def chat_json(self, messages, schema, max_tokens, **kw):
+            self.n += 1
+            if self.n > self.target:
+                return {"action": "done", "reasoning": "ok"}
+            return {"action": "read", "file": "pkg/app.py",
+                    "start": 1, "end": 1, "reasoning": "again"}
+
+    client = ManySteps(85)
+    Agent(idx, client, cfg).gather("look at the app", verbose=False)
+    assert client.n == 86, f"gather stopped after {client.n - 1} steps"
 
 
 def test_read_by_symbol_resolves_definition(tmp_path):

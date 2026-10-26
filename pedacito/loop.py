@@ -37,6 +37,7 @@ from __future__ import annotations
 import re
 import subprocess
 import sys
+import time
 from dataclasses import dataclass, replace
 from pathlib import Path
 
@@ -198,7 +199,9 @@ Rules:
   verify by running a command (tests, a linter, an import, a script).
 - Each title is a clear, imperative instruction ("Implement the markdown
   parser"), not a wish ("there should be a parser").
-- Prefer 3-8 tasks for a small feature; never enumerate many tiny stubs.
+- Use as many tasks as the work genuinely needs. Do not cap the count at a
+  fixed number; a large repair may need a dozen or more real steps, while a
+  small fix may need one. Do not pad the plan with tiny stub tasks.
 - Do not include meta-tasks (planning, documentation-only chores, git work).
 - If the goal is a BUG or a broken program (a traceback, a wrong result), do
   not return an empty list: produce concrete repair steps -- reproduce the
@@ -687,7 +690,8 @@ def run_task(root: Path, cfg, client, agent, idx, task: str, *,
 # --------------------------------------------------------------------------
 def run_loop(root: Path, cfg, client, idx, plan_path: Path, *,
              apply: bool = True, verify: str = "", repair_rounds: int = 2,
-             max_tasks: int = 0, stop_on_fail: bool = True,
+             max_tasks: int = 0, max_minutes: int = 0,
+             stop_on_fail: bool = True,
              answer_system: str | None = None, auto_install: bool = False,
              on_task=None) -> int:
     """Run the Ralph loop until the plan is empty (or a cap/stop is hit).
@@ -703,6 +707,8 @@ def run_loop(root: Path, cfg, client, idx, plan_path: Path, *,
                         repair round-trip (up to repair_rounds) before the task
                         is given up on.
     - ``max_tasks``     0 = no cap; N = stop after N attempted tasks.
+    - ``max_minutes``   0 = no cap; N = stop before starting a task once N
+                        minutes have elapsed. The current task is not killed.
     - ``stop_on_fail``  True = halt on the first task that produces no applied
                         edit or still fails verification (the safe default);
                         False = log it and carry on to the next task.
@@ -721,6 +727,7 @@ def run_loop(root: Path, cfg, client, idx, plan_path: Path, *,
     attempted = 0
     done = 0
     failed = 0
+    started_at = time.monotonic()
     # Investigation tasks produce a report, not an edit. Carry the latest
     # reports into subsequent task prompts so a fresh context still benefits
     # from the reproduction -- the plan file itself stays untouched.
@@ -738,6 +745,15 @@ def run_loop(root: Path, cfg, client, idx, plan_path: Path, *,
         if nxt is None:
             print("\nAll tasks complete.", file=sys.stderr)
             workspace.log_event(root, "all tasks complete")
+            break
+        if max_minutes and \
+                time.monotonic() - started_at >= max_minutes * 60:
+            print(f"\n[stopping: time limit reached "
+                  f"({max_minutes} min); remaining tasks are still "
+                  f"unchecked in {plan_path.name}]", file=sys.stderr)
+            workspace.log_event(
+                root, f"auto stopped: {max_minutes}-minute limit reached",
+                "WARN")
             break
         _, task = nxt
         attempted += 1

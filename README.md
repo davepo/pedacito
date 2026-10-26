@@ -302,6 +302,12 @@ Investigation-only tasks such as "Reproduce the crash" or "Locate the cause"
 are answered as a report and marked done without requiring edits, so a bug-fix
 plan can have a diagnosis checkpoint before the repair task.
 
+By default there is no task-count, lookup-step, or wall-clock cap: runs are
+bounded by the model's token/context budgets and per-command timeouts. Long
+runs are expected. Add an explicit wall only when you want one:
+`--max-tasks N`, `--max-minutes N`, or `--steps N` for the per-task lookup
+limit.
+
 State lives in a plain markdown plan file (`PLAN.md` by default, or `--plan
 FILE`), so a run is resumable and editable mid-flight. `--verify CMD` runs after
 each task and feeds failures back for repair (`--repair` rounds); a missing
@@ -445,7 +451,7 @@ model = "qwen2.5-coder:7b"
 
 [profiles.big]
 model = "some-27b-model"
-max_steps = 8
+max_steps = 8        # optional hard cap; omit for no lookup limit (default)
 ```
 
 ```bash
@@ -487,7 +493,7 @@ ones:
 | `vram_gb` | *(mandatory)* | GPU VRAM on the machine running the model (local only). |
 | `json_mode` | `"schema"` | `"schema"` for local llama.cpp/LM Studio, `"object"` for hosted APIs (auto-switched). |
 | `tier` | `""` | `small`/`medium`/`large`/`hosted` preset for token budgets. |
-| `max_steps` | 30 | Lookups before the model must answer. |
+| `max_steps` | 0 | Hard lookup limit per task; 0 = no limit (token budgets bound it). |
 | `max_write_lines` | 120 | Lines in one write step; larger files are written in chunks. |
 | `temperature` | 0.2 | Higher makes tool selection noticeably worse. |
 | `backup` | True | Snapshot originals before writing. |

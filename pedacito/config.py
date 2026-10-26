@@ -174,18 +174,23 @@ class Config:
     summarise_references: bool = False
 
     # --- Agent loop -----------------------------------------------------------
-    # Nominal lookup budget for the gather phase. It is a guardrail against
-    # looping, not a hard coverage limit: if the model says `done` while files
-    # the task names are still unread, the loop extends step-by-step (up to an
-    # internal ceiling of 80) rather than failing the answer phase outright.
-    # Models routinely need 15-25 lookups to cover a real task (locate, read
-    # each file fully, verify); at a stingy default the loop hit its nominal
-    # limit mid-gather and ended with "Raise max_steps so gathering has room
-    # to cover them". The guardrail only matters against looping models, and
-    # the loop already extends step-by-step while coverage improves.
-    max_steps: int = 30
+    # Hard lookup limit for the gather phase. 0 (the default) means NO step
+    # limit: the gathered-source/token budget and the model's `done` are the
+    # only bounds. Set a positive value only when you explicitly want a
+    # per-task wall. `--steps N` sets it for one command.
+    max_steps: int = 0
+    # Limit on follow-up answer turns when a model defers remaining work
+    # ("the next turn continues"). 0 = no limit; the loop stops when the model
+    # says NOTHING MORE or stops producing blocks. Set a positive value only
+    # if you want a hard wall on that deferral loop.
+    max_completion_rounds: int = 0
+    # Limit on truncation-continuation turns when a reply is cut off mid-block.
+    # 0 = no limit; the continuation char budget (proportional to
+    # max_tokens_answer) is the real bound. A positive value is a hard wall.
+    max_continuation_rounds: int = 0
     # Hard cap on how much source the gather phase may accumulate. A 27B's
-    # usable reasoning window is well under its advertised context.
+    # usable reasoning window is well under its advertised context. This is
+    # the intended constraint: token/context budget, not step count.
     max_gathered_chars: int = 24000
     max_read_lines: int = 200
     # Let the gather loop create/overwrite whole files via `write`, grow them
@@ -324,6 +329,10 @@ class Config:
     # Cap on how many tasks one `auto` run attempts; 0 = no cap (run until the
     # checklist is empty). A guardrail against an unbounded night of calls.
     auto_max_tasks: int = 0
+    # Wall-clock cap on one `auto` run, in minutes; 0 = no cap (the default).
+    # Checked between tasks, so a task already underway is allowed to finish.
+    # Per-command limits (shell_timeout, auto_smoke_timeout) still apply.
+    auto_max_minutes: int = 0
     # Fix rounds per failing verification before a task is given up on.
     auto_repair_rounds: int = 2
     # Per-file line guard for `new --complex` / `auto`: a source file whose
@@ -1388,10 +1397,9 @@ PRESET_TIERS = ("small", "medium", "large", "hosted")
 PRESETS: dict[str, dict] = {
     "small": {
         # Tight enough that nothing overflows an 8k window at 25 tok/s.
-        # max_steps is generous (40): a step is one lookup, cheap in tokens
-        # and only bounded by the context guardrails elsewhere; hitting the
-        # limit mid-gather is what produced "Raise max_steps so gathering
-        # has room to cover them" failures on real tasks.
+        # max_steps is 0 (no lookup limit): the token budgets below are the
+        # real constraint. Set a positive value only when you explicitly want
+        # a per-task wall.
         #
         # These values are a FALLBACK. When the server reports the model's
         # file size, auto-fit derives larger budgets from VRAM (see
@@ -1400,7 +1408,7 @@ PRESETS: dict[str, dict] = {
         # max_read_lines, max_spec_chars, max_new_files).
         "max_tokens_summary": 160,
         "max_tokens_step": 500,
-        "max_steps": 40,
+        "max_steps": 0,
         "max_tokens_answer": 1500,
         "max_tokens_plan": 1200,
         "max_tokens_build": 4000,
@@ -1423,7 +1431,7 @@ PRESETS: dict[str, dict] = {
         # hardware-sized values on a server that reports the model size.
         "max_tokens_summary": 240,
         "max_tokens_step": 1500,
-        "max_steps": 50,
+        "max_steps": 0,
         "max_tokens_answer": 8000,
         "max_tokens_plan": 5000,
         "max_tokens_build": 16000,
@@ -1443,7 +1451,7 @@ PRESETS: dict[str, dict] = {
         # window and deeper reasoning.
         "max_tokens_summary": 320,
         "max_tokens_step": 2500,
-        "max_steps": 60,
+        "max_steps": 0,
         "max_tokens_answer": 12000,
         "max_tokens_plan": 8000,
         "max_tokens_build": 24000,
@@ -1475,7 +1483,7 @@ PRESETS: dict[str, dict] = {
         # by chunking: see max_write_lines and the gather/answer prompts.
         "max_tokens_summary": 400,
         "max_tokens_step": 7000,
-        "max_steps": 100,
+        "max_steps": 0,
         "max_tokens_answer": 40000,
         "max_tokens_plan": 8000,
         "max_tokens_build": 32000,
@@ -1728,13 +1736,15 @@ vram_gb  = 8                   # MANDATORY for local servers: GPU VRAM in GB
 
 # --- Agent loop -------------------------------------------------------------
 # [agent]
-# max_steps = 6                    # nominal lookup budget per task. Not a
-#                                  # hard wall: if the model says `done` while
-#                                  # files the task names are still unread,
-#                                  # the loop grants extra steps one at a time
-#                                  # (internal ceiling 80) until coverage is
-#                                  # complete or the gathered-char budget runs
-#                                  # out. Raise it for API models on big tasks.
+# max_steps = 0                    # hard lookup limit per task; 0 = no limit
+#                                  # (the default). The gathered-source and
+#                                  # context token budgets are the intended
+#                                  # constraint. Set a positive value only if
+#                                  # you explicitly want a per-task wall.
+# max_completion_rounds = 0        # deferred-work follow-up turns; 0 = no limit
+# max_continuation_rounds = 0      # truncated-reply continuation turns;
+#                                  # 0 = no limit (the continuation char budget
+#                                  # is still enforced)
 # max_gathered_chars = 24000       # ceiling on accumulated source per task
 # max_read_lines = 200             # cap on one `read` call's line count
 # allow_write = false              # let the gather loop create/overwrite files
@@ -1789,6 +1799,8 @@ vram_gb  = 8                   # MANDATORY for local servers: GPU VRAM in GB
 # auto_verify = ""                 # shell command run after each task
 #                                  # ("pytest -q"); a failure feeds back for repair
 # auto_max_tasks = 0               # cap on tasks per run; 0 = run to completion
+# auto_max_minutes = 0             # wall-clock cap per auto run; 0 = no limit
+#                                  # (checked between tasks, not mid-task)
 # auto_repair_rounds = 2           # fix rounds per failing verification
 # auto_split_lines = 120           # split a source file whose stub is longer
 #                                  # than this into several implementation tasks
@@ -1858,7 +1870,7 @@ vram_gb  = 8                   # MANDATORY for local servers: GPU VRAM in GB
 # api_key  = "lm-studio"
 # max_tokens_summary = 160
 # max_tokens_step    = 500
-# max_steps          = 40
+# max_steps          = 0
 # repair_rounds      = 1
 # max_tokens_answer  = 1500
 # max_tokens_plan    = 1200
@@ -1886,7 +1898,7 @@ vram_gb  = 8                   # MANDATORY for local servers: GPU VRAM in GB
 # model    = "google/gemma-3-27b"
 # max_tokens_summary = 240
 # max_tokens_step    = 1500
-# max_steps          = 50
+# max_steps          = 0
 # repair_rounds      = 2
 # max_tokens_answer  = 8000
 # max_tokens_plan    = 5000
@@ -1907,7 +1919,7 @@ vram_gb  = 8                   # MANDATORY for local servers: GPU VRAM in GB
 # model    = "qwen3-32b"        # or a 70B on a multi-GPU rig
 # max_tokens_summary = 320
 # max_tokens_step    = 2500
-# max_steps          = 60
+# max_steps          = 0
 # repair_rounds      = 2
 # max_tokens_answer  = 12000
 # max_tokens_plan    = 8000
@@ -1937,7 +1949,7 @@ vram_gb  = 8                   # MANDATORY for local servers: GPU VRAM in GB
 # timeout   = 120.0
 # max_tokens_summary = 400
 # max_tokens_step    = 7000
-# max_steps          = 100
+# max_steps          = 0
 # repair_rounds      = 3
 # max_tokens_answer  = 40000
 # max_tokens_plan    = 8000

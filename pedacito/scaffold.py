@@ -1044,6 +1044,7 @@ def run_new(root: Path, cfg, client, spec: Spec, *, apply: bool = False,
             review: bool = False, plan_only: bool = False, force: bool = False,
             verbose: bool = True, complex: bool = False, verify: str = "",
             repair_rounds: int | None = None, max_tasks: int | None = None,
+            max_minutes: int | None = None,
             keep_going: bool = False, auto_install: bool = False) -> int:
     """Plan a new project from `spec`, lay down its skeleton, and (unless
     asked to stop earlier) implement every source file. Returns a process exit
@@ -1130,7 +1131,8 @@ def run_new(root: Path, cfg, client, spec: Spec, *, apply: bool = False,
     if complex:
         return _run_complex(root, cfg, client, idx, plan, spec,
                             verify=verify, repair_rounds=repair_rounds,
-                            max_tasks=max_tasks, keep_going=keep_going,
+                            max_tasks=max_tasks, max_minutes=max_minutes,
+                            keep_going=keep_going,
                             verbose=verbose, auto_install=auto_install)
 
     want_write = apply or review
@@ -1170,7 +1172,9 @@ def run_new(root: Path, cfg, client, spec: Spec, *, apply: bool = False,
 
 def _run_complex(root: Path, cfg, client, idx, plan: Plan, spec: Spec, *,
                  verify: str = "", repair_rounds: int | None = None,
-                 max_tasks: int | None = None, keep_going: bool = False,
+                 max_tasks: int | None = None,
+                 max_minutes: int | None = None,
+                 keep_going: bool = False,
                  verbose: bool = True, auto_install: bool = False) -> int:
     """Complex mode: the framework (skeleton + interface stubs + index) is in
     place, so hand implementation to the autonomous outer loop.
@@ -1184,6 +1188,8 @@ def _run_complex(root: Path, cfg, client, idx, plan: Plan, spec: Spec, *,
 
     rr = cfg.auto_repair_rounds if repair_rounds is None else repair_rounds
     mt = cfg.auto_max_tasks if max_tasks is None else max_tasks
+    mm = (getattr(cfg, "auto_max_minutes", 0) if max_minutes is None
+          else max_minutes)
     vf = verify if verify else getattr(cfg, "auto_verify", "")
 
     plan_file = root / getattr(cfg, "auto_plan_file", "PLAN.md")
@@ -1200,6 +1206,7 @@ def _run_complex(root: Path, cfg, client, idx, plan: Plan, spec: Spec, *,
         verify=vf,
         repair_rounds=rr,
         max_tasks=mt,
+        max_minutes=mm,
         stop_on_fail=not keep_going,
         answer_system=AUTO_IMPLEMENT_SYSTEM,
         auto_install=auto_install,

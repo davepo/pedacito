@@ -214,6 +214,30 @@ def test_run_loop_respects_max_tasks(tmp_path, monkeypatch):
     assert "- [ ] c" in plan.read_text()          # never reached
 
 
+def test_run_loop_respects_max_minutes_between_tasks(tmp_path, monkeypatch):
+    plan = tmp_path / "PLAN.md"
+    loop.write_plan(plan, "", ["a", "b"])
+    idx = types.SimpleNamespace(root=tmp_path)
+    calls = []
+
+    def fake_run_task(root, cfg, client, agent, idx_, task, apply=True,
+                      review=False, answer_system=None):
+        calls.append(task)
+        return _result(idx_)
+
+    # start, first-task check, second-task check (already over 1 minute).
+    clock = iter([0.0, 0.0, 61.0])
+    monkeypatch.setattr(loop.time, "monotonic", lambda: next(clock))
+    monkeypatch.setattr(loop, "run_task", fake_run_task)
+    code = loop.run_loop(tmp_path, _cfg(), None, idx, plan, apply=True,
+                         max_minutes=1)
+    assert code == 0
+    assert calls == ["a"]
+    text = plan.read_text()
+    assert "- [x] a" in text
+    assert "- [ ] b" in text              # not started after the time limit
+
+
 def test_run_loop_stops_on_failed_task(tmp_path, monkeypatch):
     plan = tmp_path / "PLAN.md"
     loop.write_plan(plan, "", ["broken", "never reached"])

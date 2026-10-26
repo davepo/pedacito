@@ -350,6 +350,39 @@ def test_apply_continues_when_model_defers(tmp_path):
     assert "EDITS ALREADY DELIVERED" in client.prompts[0]
 
 
+def test_completion_loop_has_no_default_round_cap(tmp_path):
+    """Deferred work used to stop after six turns regardless of progress.
+    With the default (0 = no cap) a model that keeps delivering blocks must
+    be allowed to finish; only NOTHING MORE / no blocks / the token-derived
+    budget ends the loop."""
+    from pedacito import index as index_mod
+    _write(tmp_path / "a.py", "x = 1\n")
+    idx = index_mod.Index(tmp_path, [])
+
+    class StubClient:
+        stream_truncated = False
+
+        def __init__(self):
+            self.n = 0
+
+        def chat(self, messages, max_tokens, schema=None, stream=False, **kw):
+            self.n += 1
+            if self.n > 7:
+                return "NOTHING MORE"
+            return (f"--- FILE: f{self.n}.py\n<<<<<<< SEARCH\n=======\n"
+                    f"x = {self.n}\n>>>>>>> REPLACE\n\n"
+                    "More follows in the next turn.")
+
+    client = StubClient()
+    agent = Agent(idx, client, config_mod.Config())
+    first = ("--- FILE: first.py\n<<<<<<< SEARCH\n=======\nx = 0\n"
+             ">>>>>>> REPLACE\n\nMore follows in the next turn.")
+    results, _ = agent.apply(first, dry_run=False, task="build files")
+    assert all(r.ok for r in results), [r.message for r in results]
+    assert client.n == 8, f"stopped after {client.n} completion turns"
+    assert (tmp_path / "f7.py").is_file()
+
+
 def test_apply_reasks_when_truncated_before_any_block(tmp_path):
     """A streamed reply cut off before completing even ONE block used to be
     trimmed to nothing and silently fail ('no edit blocks in the reply').
@@ -894,7 +927,7 @@ def test_hosted_configs_are_never_clamped_or_warned():
     before = (cfg.max_tokens_step, cfg.max_tokens_answer, cfg.max_steps)
     assert auto_fit(cfg, verbose=False) == []
     assert (cfg.max_tokens_step, cfg.max_tokens_answer, cfg.max_steps) == before
-    assert cfg.max_steps >= 30          # turn limits raised by default
+    assert cfg.max_steps == 0           # no lookup-step limit by default
 
     # Even an absurdly small declared window must not shrink hosted budgets.
     cfg2 = mk('tier = "hosted"\nbase_url = "https://api.deepseek.com/v1"'

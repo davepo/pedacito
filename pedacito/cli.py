@@ -65,7 +65,9 @@ def _add_common(p):
     p.add_argument("--config", metavar="FILE", help="use this config file as well")
     p.add_argument("--profile", metavar="NAME",
                    help="apply a [profiles.NAME] block from your config")
-    p.add_argument("--steps", type=int, help="max lookups in the gather phase")
+    p.add_argument("--steps", type=int,
+                   help="hard lookup limit for the gather phase; 0 = no limit "
+                        "(the default)")
 
 
 # --------------------------------------------------------------------------
@@ -108,7 +110,7 @@ def _config(args) -> Config:
         cfg.base_url = args.url
     if getattr(args, "model", None):
         cfg.model = args.model
-    if getattr(args, "steps", None):
+    if getattr(args, "steps", None) is not None:
         cfg.max_steps = args.steps
         cfg.sources["max_steps"] = "--steps"
     for flag, key in (("url", "base_url"), ("model", "model")):
@@ -488,12 +490,16 @@ def _cmd_auto(args, cfg, client, idx, root: Path) -> int:
         else cfg.auto_repair_rounds
     max_tasks = args.max_tasks if getattr(args, "max_tasks", None) is not None \
         else cfg.auto_max_tasks
+    max_minutes = args.max_minutes \
+        if getattr(args, "max_minutes", None) is not None \
+        else getattr(cfg, "auto_max_minutes", 0)
     auto_install = bool(getattr(args, "auto_install", False)
                         or getattr(cfg, "auto_install_deps", False))
 
     code = loop.run_loop(root, cfg, client, idx, plan_path,
                          apply=args.apply, verify=verify, repair_rounds=repair,
-                         max_tasks=max_tasks, stop_on_fail=not args.keep_going,
+                         max_tasks=max_tasks, max_minutes=max_minutes,
+                         stop_on_fail=not args.keep_going,
                          auto_install=auto_install)
 
     # Automatic post-run verification: after the checklist is done, exercise
@@ -707,6 +713,9 @@ def main(argv=None) -> int:
                        help="(with --complex) fix rounds per failing verification")
     p_new.add_argument("--max-tasks", type=int, default=None,
                        help="(with --complex) stop after attempting this many tasks")
+    p_new.add_argument("--max-minutes", type=int, default=None,
+                       help="(with --complex) stop before starting a task once "
+                            "this many minutes have elapsed (0 = no limit)")
     p_new.add_argument("--keep-going", action="store_true",
                        help="(with --complex) continue past failed tasks "
                             "instead of stopping")
@@ -743,6 +752,9 @@ def main(argv=None) -> int:
                         help="how many fix rounds a failing verification gets")
     p_auto.add_argument("--max-tasks", type=int, default=None,
                         help="stop after attempting this many tasks")
+    p_auto.add_argument("--max-minutes", type=int, default=None,
+                        help="stop before starting a task once this many "
+                             "minutes have elapsed (0 = no limit, the default)")
     p_auto.add_argument("--keep-going", action="store_true",
                         help="continue past failed tasks instead of stopping")
     p_auto.add_argument("--auto-install", dest="auto_install",
@@ -957,6 +969,9 @@ def main(argv=None) -> int:
                 else getattr(cfg, "auto_repair_rounds", 2),
                 max_tasks=args.max_tasks if getattr(args, "max_tasks", None) is not None
                 else getattr(cfg, "auto_max_tasks", 0),
+                max_minutes=args.max_minutes
+                if getattr(args, "max_minutes", None) is not None
+                else getattr(cfg, "auto_max_minutes", 0),
                 keep_going=args.keep_going,
                 auto_install=bool(getattr(args, "auto_install", False)
                                   or getattr(cfg, "auto_install_deps", False)))

@@ -450,7 +450,7 @@ tier = "small"                     # tight token limits: 1500-token answers,
 [profiles.big]
 model = "devstral-small-2-24b-instruct-2512"   # example LM Studio id
 tier = "large"                     # roomy budgets for a big local model
-max_steps = 8                      # your keys always override the tier preset
+max_steps = 8                      # optional hard lookup cap (0/default = none)
 
 [profiles.api]
 base_url = "https://api.deepseek.com/v1"
@@ -549,7 +549,7 @@ code change, you get an answer and no edit blocks.
 | `Model would not produce valid JSON` | Usually a truncated reply (the model wrote too much before finishing its tool call), not actually bad JSON. Pedacito retries with more room automatically; if it persists, raise `max_tokens_step`. A thinking model that spends its whole budget on reasoning returns no JSON at all — pedacito now says so explicitly; turn thinking off or give it more room. |
 | Every request fails / "kept hitting limits" | Budgets exceeded the server's context window. This is fixed automatically at startup (auto-detect + auto-fit) — check the `[auto-fit]` line it prints, and see "Token budgets" in the README. If you set `auto_fit = false` or an explicit `context_tokens`, remove that and let it probe the real value. |
 | Local run finishes but the answer is nonsense | The prompt was silently truncated by the server (Ollama does this instead of erroring) so the model never saw the task. Update pedacito — oversized answer prompts are now refused up front with instructions, and history is trimmed to fit mid-task. Raising the server-side context length helps too. |
-| Model reads the wrong things / seems lost | Raise `max_steps`, or name the file directly in the task. |
+| Model reads the wrong things / seems lost | There is no default lookup-step cap; if you set `--steps`/`max_steps`, raise it. Also name the file directly in the task. |
 | Answers turn vague and generic | The project may have crossed the map's token budget and switched from a full listing to per-file cards. `pedacito map ~/code/anki --tier auto` shows which mode is active. |
 | Stale or misleading summaries | Your docstrings are inaccurate — a docstring substitutes for a generated summary by default. Set `summarise_documented = true` and re-index. |
 | No review page appeared | Nothing anchored, so there was nothing to review — check the printed failures. |

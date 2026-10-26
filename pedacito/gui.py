@@ -431,20 +431,16 @@ def _run_task(task: str, apply_now: bool) -> None:
             unread = list(getattr(agent, "_unread_files", []) or [])
             if unread:
                 # The honest diagnosis is "the model stopped gathering and
-                # answered before reading the files it names". max_steps is
-                # already generous by default (30+, tier presets up to 100),
-                # so telling users to raise it first was misleading -- most
-                # such runs end because the model *chose* to finish early,
-                # not because the budget ran out. Lead with what actually
-                # helps; mention the knob only as a secondary option.
+                # answered before reading the files it names". There is no
+                # default step cap, so such runs end because the model
+                # *chose* to finish early, not because a budget ran out.
                 note = ("No review: the model answered without proposing any "
                         "edits -- it never `read` the files it would need to "
                         "change: " + ", ".join(unread[:5]) +
                         ". Try rephrasing the task to name those files "
                         "explicitly (e.g. \"read subj-imp/sentences.js in "
-                        "full, then ...\"), or raise max_steps / "
-                        "max_tokens_step if the model keeps finishing too "
-                        "early.")
+                        "full, then ...\"), or raise max_tokens_step if "
+                        "replies are getting truncated.")
             elif not getattr(agent, "read_any", True):
                 note = ("No review: the model answered without proposing any "
                         "edits -- every lookup during gathering failed, so "
