@@ -530,6 +530,136 @@ def test_vram_estimate_caps_the_context_window():
     assert explicit.context_tokens == 12000
 
 
+def test_kv_cache_quantization_refines_the_vram_estimate():
+    """The VRAM estimate assumes a 16-bit KV cache. When the runtime is using
+    quantized K/V caches, matching hints must scale the per-token cache down
+    instead of pretending the configured window does not fit."""
+    model = 19_000_000_000
+    base = config_mod.hardware_context_tokens(24, model)
+    quantized = config_mod.hardware_context_tokens(24, model, "q8_0", "q5_1")
+    measured = config_mod.hardware_context_tokens(
+        24, model, kv_cache_bytes_per_token=96 * 1024)
+
+    assert 0 < base < quantized < measured
+    # f16 K + f16 V -> q8_0 K + q5_1 V is roughly half the cache.
+    assert quantized > base * 1.8
+
+    with pytest.raises(config_mod.ConfigError):
+        config_mod.kv_quant_bits("q2_banana")
+
+
+def test_auto_fit_uses_kv_cache_hints():
+    """auto_fit must pass the profile's K/V cache hints into the estimate so
+    budgets are sized for the context the GPU actually holds."""
+    def cfg_for(k: str, v: str) -> config_mod.Config:
+        c = config_mod.Config()
+        c.base_url = "http://127.0.0.1:1/v1"
+        c.model = "m"
+        c.vram_gb = 24
+        c.auto_detect_context = False
+        c.model_size_bytes = 19_000_000_000
+        c.k_cache_quant = k
+        c.v_cache_quant = v
+        return c
+
+    plain = cfg_for("", "")
+    quant = cfg_for("q8_0", "q5_1")
+    config_mod.auto_fit(plain, verbose=False)
+    config_mod.auto_fit(quant, verbose=False)
+    assert quant.context_tokens > plain.context_tokens
+    assert quant.max_tokens_answer > plain.max_tokens_answer
+
+
+def test_kv_cache_config_aliases_and_spellings(tmp_path):
+    path = tmp_path / "c.toml"
+    path.write_text(
+        '[hardware]\n'
+        'vram_gb = 24\n'
+        'k_cache_type = "Q8_0"\n'
+        'v_cache_quantization = "Q5.1"\n'
+        'kv_cache_bytes_per_token = 131072\n', encoding="utf-8")
+    cfg = config_mod.load(explicit=path, use_env=False)
+    assert cfg.k_cache_quant == "q8_0"
+    assert cfg.v_cache_quant == "q5_1"
+    assert cfg.kv_cache_bytes_per_token == 131072
+
+    bad = tmp_path / "bad.toml"
+    bad.write_text('[hardware]\nvram_gb = 24\nk_cache_quant = "nope"\n',
+                   encoding="utf-8")
+    with pytest.raises(config_mod.ConfigError):
+        config_mod.load(explicit=bad, use_env=False)
+
+
+def test_lemonade_loaded_options_win_over_list_default(monkeypatch):
+    """Lemonade's model-list context_length may be the registry/default value
+    even when the model was loaded (or saved) with a larger ctx_size. The
+    health and per-model options endpoints report the real one."""
+    from pedacito import llm as llm_mod
+
+    def fake_get(url, **kwargs):
+        class R:
+            status_code = 200
+
+            def json(self):
+                if url.endswith("/options"):
+                    return {"resolved_ctx_size": 32768,
+                            "effective": {"ctx_size": 32768}}
+                if url.endswith("/health"):
+                    return {"all_models_loaded": [{
+                        "model_name": "qwen_coder_25",
+                        "recipe_options": {"ctx_size": 32768},
+                        "max_context_window": 262144,
+                    }]}
+                return {"data": []}
+
+        return R()
+
+    monkeypatch.setattr(llm_mod.requests, "get", fake_get)
+    cfg = config_mod.Config(base_url="http://localhost:13305/v1",
+                            model="qwen_coder_25")
+    client = llm_mod.LMStudio(cfg)
+    assert client._lemonade_health_context("http://localhost:13305") == \
+        (32768, 262144)
+    assert client._lemonade_options_context("http://localhost:13305") == 32768
+
+    got = client._absorb_model_list([{
+        "id": "qwen_coder_25",
+        "owned_by": "lemonade",
+        "size": 18.5,
+        "context_length": 16384,
+        "recipe_options": {"ctx_size": 32768},
+        "max_context_window": 262144,
+    }], "openai-models")
+    assert got["context_length"] == 32768
+
+
+def test_explicit_context_sizes_budgets_above_the_vram_estimate():
+    """A configured context_tokens is authoritative for budget fitting, just
+    like a server-reported one. The VRAM estimate may warn about cache spill,
+    but it must not shrink every reply budget to the estimate (the symptom
+    that made a 32k profile behave like an 8k one)."""
+    cfg = config_mod.Config()
+    cfg.base_url = "http://127.0.0.1:1/v1"
+    cfg.model = "m"
+    cfg.vram_gb = 24
+    for key, value in config_mod.PRESETS["small"].items():
+        setattr(cfg, key, value)
+        cfg.sources[key] = "tier 'small' preset"
+    cfg.context_tokens = 32768
+    cfg.sources["context_tokens"] = "config file"
+    cfg.auto_detect_context = False
+    cfg.model_size_bytes = 19_000_000_000
+
+    cfg.max_tokens_answer = 1500
+    cfg.sources["max_tokens_answer"] = "tier 'small' preset"
+    notes = config_mod.auto_fit(cfg, verbose=False)
+
+    hw = config_mod.hardware_context_tokens(24, 19_000_000_000)
+    assert cfg.context_tokens == 32768
+    assert cfg.max_tokens_answer > hw
+    assert any("configured context" in n for n in notes)
+
+
 def test_server_configured_context_wins_over_vram_estimate(monkeypatch):
     """A server's CONFIGURED context length is a fact -- it is exactly what
     the server will accept -- while the VRAM estimate is a heuristic with no

@@ -127,7 +127,12 @@ rejecting every request. If you still want per-model profiles, add
 knobs come from that preset. On a local server VRAM caps the context window
 so the KV cache does not spill; the tier token values are used when they fit
 inside it, otherwise auto-fit uses the VRAM-derived allocation. A value you
-write explicitly overrides both.
+write explicitly overrides both. If your runtime uses quantized K/V caches
+(LM Studio's cache quantization, llama.cpp `--cache-type-k/-v`, Ollama
+`OLLAMA_KV_CACHE_TYPE`), add `k_cache_quant = "q8_0"` and
+`v_cache_quant = "q5_1"` (or whatever you loaded) so the VRAM estimate uses
+the smaller cache. If the server reports its default window instead of your
+configured one, set `context_tokens` explicitly in that profile.
 
 Then:
 
@@ -547,7 +552,7 @@ code change, you get an answer and no edit blocks.
 | `search block not found` | The model copied line-number prefixes into its edit text, or picked a snippet that appears twice. Gets two automatic retries; if it keeps failing, narrow the task. |
 | Model claims a function doesn't exist | It's not in the index — check `pedacito files`, an ignore rule is probably too broad. |
 | `Model would not produce valid JSON` | Usually a truncated reply (the model wrote too much before finishing its tool call), not actually bad JSON. Pedacito retries with more room automatically; if it persists, raise `max_tokens_step`. A thinking model that spends its whole budget on reasoning returns no JSON at all — pedacito now says so explicitly; turn thinking off or give it more room. |
-| Every request fails / "kept hitting limits" | Budgets exceeded the server's context window. This is fixed automatically at startup (auto-detect + auto-fit) — check the `[auto-fit]` line it prints, and see "Token budgets" in the README. If you set `auto_fit = false` or an explicit `context_tokens`, remove that and let it probe the real value. |
+| Every request fails / "kept hitting limits" | Budgets exceeded the server's context window. This is fixed automatically at startup (auto-detect + auto-fit) — check the `[auto-fit]` line it prints, and see "Token budgets" in the README. If you set `auto_fit = false`, remove that. If the server reports a stale/default window, set `context_tokens` explicitly (and `k_cache_quant`/`v_cache_quant` if the cache is quantized). |
 | Local run finishes but the answer is nonsense | The prompt was silently truncated by the server (Ollama does this instead of erroring) so the model never saw the task. Update pedacito — oversized answer prompts are now refused up front with instructions, and history is trimmed to fit mid-task. Raising the server-side context length helps too. |
 | Model reads the wrong things / seems lost | There is no default lookup-step cap; if you set `--steps`/`max_steps`, raise it. Also name the file directly in the task. |
 | Answers turn vague and generic | The project may have crossed the map's token budget and switched from a full listing to per-file cards. `pedacito map ~/code/anki --tier auto` shows which mode is active. |

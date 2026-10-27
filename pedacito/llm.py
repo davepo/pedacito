@@ -1122,7 +1122,8 @@ class LMStudio:
 
         def names(entry: dict) -> list[str]:
             vals = (entry.get("id"), entry.get("key"), entry.get("name"),
-                    entry.get("model"), entry.get("display_name"))
+                    entry.get("model"), entry.get("model_name"),
+                    entry.get("display_name"))
             return [str(v).strip().lower() for v in vals if v]
 
         for entry in entries:
@@ -1176,8 +1177,13 @@ class LMStudio:
         if loaded and isinstance(loaded[0], dict):
             loaded_ctx = ctx_ok(
                 (loaded[0].get("config") or {}).get("context_length"))
-        ctx = (loaded_ctx or ctx_ok(m.get("context_length"))
-               or ctx_ok((m.get("recipe_options") or {}).get("ctx_size")))
+        # Lemonade puts the model's effective (including saved overrides)
+        # recipe options in the same list entry. Prefer that over its
+        # top-level context_length, which some versions leave at the
+        # registry/default value instead of the configured ctx_size.
+        recipe_ctx = ctx_ok((m.get("recipe_options") or {}).get("ctx_size"))
+        ctx = (loaded_ctx or recipe_ctx or ctx_ok(m.get("context_length"))
+               or ctx_ok((m.get("recipe_options") or {}).get("num_ctx")))
         if ctx:
             got["context_length"] = ctx
         max_ctx = ctx_ok(m.get("max_context_length")
@@ -1190,6 +1196,81 @@ class LMStudio:
                 source = "lemonade"
             got["source"] = source
         return got
+
+    def _lemonade_health_context(self, root: str) -> tuple[int | None, int | None]:
+        """Read the context a currently loaded Lemonade model is using.
+
+        Lemonade's /v1/models `context_length` can lag behind the options a
+        model was loaded with (and older builds reported a registry default).
+        The health endpoint lists resident models with the recipe options they
+        were actually launched with, which is the fact the budget fit needs.
+        Tries both prefixes because older builds expose /api/v0/health.
+        """
+        def ctx_ok(value):
+            try:
+                n = int(value)
+            except (TypeError, ValueError):
+                return None
+            return n if n > 0 else None
+
+        for path in ("/api/v1/health", "/api/v0/health"):
+            try:
+                r = requests.get(root + path, headers=self.headers, timeout=5)
+                if r.status_code != 200:
+                    continue
+                data = r.json()
+            except Exception:
+                continue
+            entries = data.get("all_models_loaded") or []
+            entry = self._pick_model(entries, self.cfg.model)
+            if not entry:
+                continue
+            opts = entry.get("recipe_options") or {}
+            ctx = (ctx_ok(opts.get("ctx_size"))
+                   or ctx_ok(entry.get("context_length")))
+            max_ctx = ctx_ok(entry.get("max_context_window"))
+            if ctx or max_ctx:
+                return ctx, max_ctx
+        return None, None
+
+    def _lemonade_options_context(self, root: str) -> int | None:
+        """Ask Lemonade which ctx_size a load would use right now.
+
+        /v1/models/{id}/options separates saved overrides from defaults and
+        reports `resolved_ctx_size` (including automatic sizing), so it is
+        more trustworthy than the model-list `context_length` on builds that
+        report a default there. Absent on older Lemonade versions, hence the
+        silent failure.
+        """
+        from urllib.parse import quote
+
+        def ctx_ok(value):
+            try:
+                n = int(value)
+            except (TypeError, ValueError):
+                return None
+            return n if n > 0 else None
+
+        url = (root + "/v1/models/" + quote(str(self.cfg.model), safe="")
+               + "/options")
+        try:
+            r = requests.get(url, headers=self.headers, timeout=5)
+            if r.status_code != 200:
+                return None
+            data = r.json()
+        except Exception:
+            return None
+        for key in ("resolved_ctx_size",):
+            ctx = ctx_ok(data.get(key))
+            if ctx:
+                return ctx
+        for key in ("effective", "saved"):
+            opts = data.get(key) or {}
+            if isinstance(opts, dict):
+                ctx = ctx_ok(opts.get("ctx_size"))
+                if ctx:
+                    return ctx
+        return None
 
     def model_info(self) -> dict | None:
         """Ask the server for metadata about `cfg.model`: file size, configured
@@ -1250,6 +1331,23 @@ class LMStudio:
                 merge(self._absorb_model_list(entries, source))
             except Exception:
                 pass
+
+        # Lemonade exposes the loaded recipe options separately from the
+        # OpenAI model list, and its per-model options endpoint knows the
+        # saved ctx_size override. Those are more accurate than a list entry
+        # that may carry the registry/default window.
+        if out.get("source") == "lemonade":
+            health_ctx, health_max = self._lemonade_health_context(root)
+            if health_max and not out.get("max_context_length"):
+                out["max_context_length"] = health_max
+            if health_ctx:
+                out["context_length"] = health_ctx
+                out["context_source"] = "lemonade loaded options"
+            else:
+                options_ctx = self._lemonade_options_context(root)
+                if options_ctx:
+                    out["context_length"] = options_ctx
+                    out["context_source"] = "lemonade saved options"
 
         # Ollama /api/show (Lemonade implements it too) reports both the
         # weights size and the configured context length.

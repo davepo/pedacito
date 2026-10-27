@@ -69,6 +69,21 @@ class Config:
     # configured"; load() rejects that for local servers. Hosted APIs never
     # use this value.
     vram_gb: int = 0
+    # Optional KV-cache hints for the VRAM estimate. Servers rarely expose the
+    # cache quantization they actually loaded, but LM Studio, llama.cpp and
+    # Ollama all let you choose it (LM Studio "K/V Cache Quantization Type",
+    # llama.cpp --cache-type-k/-v, Ollama OLLAMA_KV_CACHE_TYPE). Matching the
+    # values here stops the estimate from assuming a 16-bit cache and
+    # under-reporting the context that really fits. Accepted spellings are
+    # f16/fp16/bf16, f32/fp32, q8_0, q6_k, q5_1, q5_0, q4_1, q4_0, iq4_nl
+    # and iq4_xs (case, dots and hyphens are normalised). Empty = 16-bit.
+    k_cache_quant: str = ""
+    v_cache_quant: str = ""
+    # Precise escape hatch: measured KV-cache bytes per token of context.
+    # 0 (the default) uses the model-size estimate above. Set this when you
+    # know the real per-token cache size for the loaded architecture; it
+    # bypasses both the proxy and the quantization adjustment.
+    kv_cache_bytes_per_token: int = 0
 
     # --- LM Studio connection -------------------------------------------------
     # Over Tailscale this is the tailnet IP or MagicDNS name of the box running
@@ -465,7 +480,61 @@ _FIELDS = {f.name: f for f in fields(Config)
 _ALIASES = {
     "vram": "vram_gb",
     "vram_gb": "vram_gb",
+    # Common spellings from the runtime UIs / llama.cpp flags.
+    "k_cache_type": "k_cache_quant",
+    "v_cache_type": "v_cache_quant",
+    "k_cache_quantization": "k_cache_quant",
+    "v_cache_quantization": "v_cache_quant",
+    "kv_cache_k_quant": "k_cache_quant",
+    "kv_cache_v_quant": "v_cache_quant",
 }
+
+# Effective bits per cache element, including the per-block scale/min overhead
+# llama.cpp's quant blocks carry. Only the relative size against f16 matters,
+# so approximate values are fine -- they still turn a 4x-wrong estimate into a
+# useful one.
+_KV_QUANT_BITS = {
+    "f32": 32.0, "fp32": 32.0,
+    "f16": 16.0, "fp16": 16.0, "bf16": 16.0,
+    "q8_0": 8.5,
+    "q6_k": 6.5625,
+    "q5_1": 6.0, "q5_0": 5.5,
+    "q4_1": 5.0, "q4_0": 4.5, "iq4_nl": 4.5, "iq4_xs": 4.25,
+}
+_KV_QUANT_SHORT = {
+    "q8": "q8_0", "q6": "q6_k", "q6k": "q6_k",
+    "q5": "q5_1", "q5.1": "q5_1", "q5.0": "q5_0",
+    "q4": "q4_0", "q4.1": "q4_1", "q4.0": "q4_0",
+    "fp16": "f16", "float16": "f16", "half": "f16",
+    "fp32": "f32", "float32": "f32",
+    "bfloat16": "bf16",
+}
+
+
+def _normalise_kv_quant(value) -> str:
+    """Canonicalise a cache-quantization spelling, or raise ConfigError."""
+    raw = str(value or "").strip().lower().replace("-", "_")
+    if not raw or raw in ("auto", "default", "none", "false"):
+        return ""
+    # LM Studio / llama.cpp also write Q8_0, q5.1, "Q4 0", etc.
+    raw = raw.replace(" ", "_")
+    if raw in _KV_QUANT_BITS:
+        return raw
+    dotted = raw.replace("_", ".")
+    if dotted in _KV_QUANT_SHORT:
+        return _KV_QUANT_SHORT[dotted]
+    if raw in _KV_QUANT_SHORT:
+        return _KV_QUANT_SHORT[raw]
+    raise ConfigError(
+        f"k_cache_quant/v_cache_quant: unknown cache quantization {value!r}. "
+        "Use f16, bf16, f32, q8_0, q6_k, q5_1, q5_0, q4_1, q4_0, "
+        "iq4_nl or iq4_xs.")
+
+
+def kv_quant_bits(value: str) -> float | None:
+    """Effective bits per cache element for a normalized quantization name."""
+    name = _normalise_kv_quant(value)
+    return _KV_QUANT_BITS.get(name) if name else None
 
 
 def _canonical(name: str) -> str:
@@ -551,6 +620,14 @@ def _coerce(name: str, value, path: Path | None = None):
         if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
             raise ConfigError(
                 f"{where}{name} must be a positive whole number of gigabytes, "
+                f"got {value!r}")
+        return value
+    if name in ("k_cache_quant", "v_cache_quant"):
+        return _normalise_kv_quant(value)
+    if name == "kv_cache_bytes_per_token":
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise ConfigError(
+                f"{where}{name} must be a non-negative whole number of bytes, "
                 f"got {value!r}")
         return value
     if name == "json_mode":
@@ -892,7 +969,10 @@ def missing_hardware(cfg: Config) -> list[str]:
             if int(getattr(cfg, name, 0) or 0) <= 0]
 
 
-def hardware_context_tokens(vram_gb: int, model_size_bytes: int) -> int:
+def hardware_context_tokens(vram_gb: int, model_size_bytes: int,
+                            k_cache_quant: str = "",
+                            v_cache_quant: str = "",
+                            kv_cache_bytes_per_token: int = 0) -> int:
     """Estimate how many context tokens fit in VRAM after loading a model of
     `model_size_bytes`.
 
@@ -904,6 +984,11 @@ def hardware_context_tokens(vram_gb: int, model_size_bytes: int) -> int:
     count that needs no architecture metadata and is stable across
     quantizations.
 
+    `k_cache_quant` / `v_cache_quant` scale that f16-sized baseline by the
+    effective bits of the quantization the runtime actually loaded (LM
+    Studio's K/V cache types, llama.cpp's --cache-type-k/-v). A precise
+    `kv_cache_bytes_per_token` bypasses both the proxy and that scaling.
+
     Returns the estimated token count. 0 or a negative free-memory result
     means the model does not fit at all; callers treat that as "use the
     fallback budgets", not as a hard failure.
@@ -914,8 +999,21 @@ def hardware_context_tokens(vram_gb: int, model_size_bytes: int) -> int:
     free = vram - int(model_size_bytes) - (_GIB // 2)
     if free <= 0:
         return 0
-    kv_per_token = max(16 * 1024,
-                       int(model_size_bytes) // _KV_REFERENCE_TOKENS)
+    if kv_cache_bytes_per_token and kv_cache_bytes_per_token > 0:
+        kv_per_token = int(kv_cache_bytes_per_token)
+    else:
+        kv_per_token = max(16 * 1024,
+                           int(model_size_bytes) // _KV_REFERENCE_TOKENS)
+        k_bits = kv_quant_bits(k_cache_quant)
+        v_bits = kv_quant_bits(v_cache_quant)
+        if k_bits is not None or v_bits is not None:
+            # The baseline is an f16 cache (16 bits for each of K and V).
+            # Unset sides stay at f16 so setting only K still improves the
+            # estimate without pretending V was quantized too.
+            k_bits = 16.0 if k_bits is None else k_bits
+            v_bits = 16.0 if v_bits is None else v_bits
+            kv_per_token = max(
+                4 * 1024, int(kv_per_token * (k_bits + v_bits) / 32.0))
     return int(free // kv_per_token)
 
 
@@ -1056,7 +1154,11 @@ def auto_fit(cfg: Config, verbose: bool = True) -> list[str]:
         # what the server was told to allocate; using it as the window is how
         # a stock 8k LM Studio setup gets 100k-token requests and 400s.
         detected = info.get("context_length")
-        hw_ctx = (hardware_context_tokens(cfg.vram_gb, model_bytes)
+        hw_ctx = (hardware_context_tokens(
+                      cfg.vram_gb, model_bytes,
+                      getattr(cfg, "k_cache_quant", ""),
+                      getattr(cfg, "v_cache_quant", ""),
+                      int(getattr(cfg, "kv_cache_bytes_per_token", 0) or 0))
                   if model_bytes > 0 else 0)
         user_ctx = _is_explicit_limit(origin)
         server_ctx = None
@@ -1072,41 +1174,51 @@ def auto_fit(cfg: Config, verbose: bool = True) -> list[str]:
         # VRAM-only estimate. System RAM is deliberately NOT counted: spilling
         # KV cache there is slow, and counting it produced context plans that
         # did not actually fit on the GPU. Keep 0.5 GB for the driver/desktop.
-        # The estimate CAPS the context window only when the server did NOT
-        # report its configured length: planning for the tier/default window
-        # when VRAM cannot hold its KV cache is exactly what spills and
-        # collapses tokens/sec. When the server DID report one (the common
-        # case -- LM Studio, Lemonade, and Ollama all answer), that value is
-        # authoritative and the estimate is kept as a speed advisory instead
-        # of a clamp: it is a heuristic with no knowledge of the model's KV
-        # architecture (GQA) or KV quantization, and is routinely off by
+        # The estimate CAPS the context window only when neither the server
+        # nor the user supplied a configured length. Both of those are facts;
+        # the estimate is a heuristic with no knowledge of the model's KV
+        # architecture (GQA) or cache quantization, and is routinely off by
         # 2-4x. A wrong clamp converted working 262k-token setups into 12k
         # windows whose budgets no thinking model could emit JSON inside.
-        # The tier/default is only a fallback when the model size is unknown
-        # or the model does not fit at all.
-        if model_bytes > 0 and not user_ctx:
+        # When the configured length is below the estimate it stays a speed
+        # advisory: KV cache spills to system RAM, which is slow but works.
+        if model_bytes > 0:
             size_gb = model_bytes / _GIB
             mem = f"{cfg.vram_gb} GB VRAM"
+            kv_hint = ""
+            if getattr(cfg, "kv_cache_bytes_per_token", 0):
+                kv_hint = (f"; KV cache assumed "
+                           f"{int(cfg.kv_cache_bytes_per_token) / 1024:.0f} "
+                           f"KiB/token")
+            elif getattr(cfg, "k_cache_quant", "") or \
+                    getattr(cfg, "v_cache_quant", ""):
+                kv_hint = (f"; KV cache K={cfg.k_cache_quant or 'f16'}, "
+                           f"V={cfg.v_cache_quant or 'f16'}")
             if hw_ctx <= 0:
                 notes.append(
                     f"memory: model is {size_gb:.1f} GB and {mem} leaves no "
                     f"room after the 0.5 GB system reserve; keeping the "
-                    f"fallback window ({ctx:,} tokens)")
+                    f"configured/fallback window ({ctx:,} tokens){kv_hint}")
             else:
                 notes.append(
                     f"memory: model {size_gb:.1f} GB on {mem} leaves about "
-                    f"{hw_ctx:,} context tokens (0.5 GB kept for the system)")
-                if server_ctx:
-                    # The server's CONFIGURED context length is a fact: it is
-                    # exactly what the server will accept. The VRAM estimate
-                    # is a guess and must never override it -- clamping to a
-                    # wrong estimate is what shrank a working 262k-token
-                    # setup to 12k and made every reply budget too small for
-                    # a thinking model to finish its JSON in. Keep the
-                    # estimate as a speed advisory instead: below the
-                    # configured length it means KV cache spills to system
-                    # RAM (slow, but requests still work); at or above it
-                    # the cache fits entirely.
+                    f"{hw_ctx:,} context tokens (0.5 GB kept for the "
+                    f"system{kv_hint})")
+                if user_ctx:
+                    new_ctx = ctx
+                    if hw_ctx < ctx:
+                        notes.append(
+                            f"warning: configured context is {ctx:,} tokens "
+                            f"but the VRAM estimate only fits about "
+                            f"{hw_ctx:,} -- the KV cache will spill to system "
+                            f"RAM and tokens/sec will drop; lower the "
+                            f"configured context or set k_cache_quant/"
+                            f"v_cache_quant to match the server")
+                    else:
+                        notes.append(
+                            f"context: keeping configured {ctx:,} (fits the "
+                            f"VRAM estimate)")
+                elif server_ctx:
                     new_ctx = server_ctx
                     if hw_ctx < server_ctx:
                         notes.append(
@@ -1115,7 +1227,8 @@ def auto_fit(cfg: Config, verbose: bool = True) -> list[str]:
                             f"{hw_ctx:,} -- the KV cache will spill to system "
                             f"RAM and tokens/sec will drop; lower the server's "
                             f"context length (LM Studio 'Context length' / "
-                            f"Ollama num_ctx) to restore speed")
+                            f"Ollama num_ctx), or set k_cache_quant/"
+                            f"v_cache_quant to match the server")
                     else:
                         notes.append(
                             f"context: keeping {ctx:,} (fits the VRAM estimate)")
@@ -1183,10 +1296,14 @@ def auto_fit(cfg: Config, verbose: bool = True) -> list[str]:
     # deliberate limits), though the window's physical cap still applies so
     # a request cannot exceed the server's context.
     if not hosted and model_bytes > 0:
-        # Calculate from the VRAM-derived window (bounded by the final/server
-        # window). If VRAM yields less than the tier/default, the calculated
-        # budgets come out small and the tier/default wins below.
-        calc_ctx = min(hw_ctx, ctx) if hw_ctx > 0 else 0
+        # Calculate from the authoritative window when the server reported
+        # one or the user configured it: the VRAM estimate must not shrink a
+        # window that actually works. Only when both are absent does the
+        # estimate cap the fallback window.
+        if server_ctx or user_ctx:
+            calc_ctx = ctx
+        else:
+            calc_ctx = min(hw_ctx, ctx) if hw_ctx > 0 else 0
         calc_reserve = min(cfg.reserve_tokens, max(512, calc_ctx // 4))
         calc_usable = max(calc_ctx - calc_reserve, calc_ctx // 2)
         calc_step = max(512, min(4096, calc_usable // 8))
@@ -1362,6 +1479,8 @@ def _parse_env(name: str, raw: str):
         return norm
     if name in ("extra_extensions", "shell_allowlist"):
         return tuple(x.strip() for x in raw.split(",") if x.strip())
+    if name in ("k_cache_quant", "v_cache_quant"):
+        return _normalise_kv_quant(raw)
     if name == "sampler":
         # Not a natural environment-variable target; a JSON object is the
         # only sane spelling. Importing json here keeps the module's import
@@ -1677,7 +1796,11 @@ vram_gb  = 8                   # MANDATORY for local servers: GPU VRAM in GB
 # weights (0.5 GB is kept for the system). Tier/default token budgets are
 # used when they fit that window; otherwise the VRAM-derived allocation is
 # used. You do not need to set any max_tokens_* values yourself; explicit
-# values override both.
+# values override both. If the runtime loaded quantized K/V caches, set
+# k_cache_quant / v_cache_quant (see the context section below) so the
+# estimate matches the cache actually in VRAM. If the server reports a
+# stale/default window, set context_tokens explicitly to make yours
+# authoritative.
 #
 # api_key = "lm-studio"        # ignored by local servers; any string works
 # json_mode = "schema"         # "schema" for local llama.cpp/LM Studio;
@@ -1711,6 +1834,15 @@ vram_gb  = 8                   # MANDATORY for local servers: GPU VRAM in GB
 # Studio / Ollama / your API; profiles override both per model.
 # context_tokens = 16384       # server-side context length for this model
 # reserve_tokens = 2048        # tokens held back from the window for replies
+#
+# Optional KV-cache hints. The VRAM estimate assumes a 16-bit cache unless
+# you say otherwise; matching the runtime's cache quantization lets it use
+# the context the GPU really has. Same names LM Studio / llama.cpp / Ollama
+# use for their K/V cache types (f16, bf16, q8_0, q5_1, q5_0, q4_1, q4_0).
+# k_cache_quant = "q8_0"
+# v_cache_quant = "q5_1"
+# For a measured value instead of the estimate, use bytes per token:
+# kv_cache_bytes_per_token = 131072
 
 # Sampler parameters, merged verbatim into every /chat/completions request.
 # This is where top_k, min_p, repeat_penalty, seed, stop, and anything else

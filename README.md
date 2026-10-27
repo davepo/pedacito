@@ -505,6 +505,14 @@ model's file size (using `vram_gb`) and sizes every budget to fit (`auto_fit`,
 on by default). Explicit values you write always win. `pedacito config` shows
 which tier is active and marks every non-default value.
 
+The VRAM estimate assumes a 16-bit KV cache unless you tell it otherwise. If
+your runtime uses quantized caches (LM Studio's K/V cache quantization,
+llama.cpp's `--cache-type-k`/`-v`, Ollama's `OLLAMA_KV_CACHE_TYPE`), set
+`k_cache_quant` and `v_cache_quant` (for example `"q8_0"` and `"q5_1"`) so the
+estimate does not under-report the context that fits. When the server reports a
+stale/default window instead of your configured one, set `context_tokens`
+explicitly (per profile if needed) to make it authoritative.
+
 Reasoning models (Qwen3 and similar) are supported — `<think>` blocks are
 stripped before parsing, so they never corrupt a tool call, an edit, or a
 session log. `disable_thinking` and `thinking_suffix` turn thinking off. The
@@ -524,6 +532,9 @@ ones:
 | `base_url` | `http://localhost:1234/v1` | Server address. |
 | `model` | `google/gemma-3-27b` | Exact id/name the server reports. |
 | `vram_gb` | *(mandatory)* | GPU VRAM on the machine running the model (local only). |
+| `k_cache_quant` / `v_cache_quant` | `""` | K/V cache quantization the runtime loaded (e.g. `q8_0`, `q5_1`); refines the VRAM estimate. |
+| `kv_cache_bytes_per_token` | 0 | Measured KV-cache bytes per token; bypasses the estimate. 0 = estimate. |
+| `context_tokens` | auto | Server-side window. Set explicitly when detection reports a stale default; profiles override it. |
 | `json_mode` | `"schema"` | `"schema"` for local llama.cpp/LM Studio, `"object"` for hosted APIs (auto-switched). |
 | `tier` | `""` | `small`/`medium`/`large`/`hosted` preset for token budgets. |
 | `max_steps` | 0 | Hard lookup limit per task; 0 = no limit (token budgets bound it). |
