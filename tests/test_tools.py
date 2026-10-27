@@ -120,8 +120,13 @@ def test_gather_has_no_default_step_cap(tmp_path):
             self.n += 1
             if self.n > self.target:
                 return {"action": "done", "reasoning": "ok"}
-            return {"action": "read", "file": "pkg/app.py",
-                    "start": 1, "end": 1, "reasoning": "again"}
+            if self.n == 1:
+                return {"action": "read", "file": "pkg/app.py",
+                        "start": 1, "end": 1, "reasoning": "start"}
+            # Vary the lookup so this checks the step ceiling, not the
+            # duplicate-read guard (which correctly stops the same read).
+            return {"action": "grep", "file": "pkg/app.py",
+                    "pattern": f"needle_{self.n}", "reasoning": "again"}
 
     client = ManySteps(85)
     Agent(idx, client, cfg).gather("look at the app", verbose=False)

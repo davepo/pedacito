@@ -45,6 +45,14 @@ from .tools import TOOL_HELP, dispatch, schema_for
 # small enough that a persistently broken server cannot bill forever.
 _MAX_GATHER_RECOVERIES = 2
 
+# A re-read of a range that added no new source is navigation churn, not
+# progress. Small models can lock onto one range and emit it dozens of times
+# (each echo also keeps the bad pattern in context). One duplicate gets a
+# compact "already read" observation; after this many consecutive duplicates
+# the gather phase stops and lets the answer phase use the source it already
+# collected.
+_MAX_DUPLICATE_READS = 2
+
 # The answer prompt tells the model it may split a multi-file task across
 # turns ("say what remains; the next turn continues"). A cleanly-finished
 # reply that says more work is coming must actually trigger a next turn --
@@ -142,6 +150,26 @@ def _delta_len(obs: str, prior_spans: list[tuple[int, int]]) -> int:
         if not pm or not any(a <= int(pm.group(1)) <= b for a, b in prior_spans):
             total += len(ln) + 1
     return total
+
+
+def _read_has_new_lines(obs: str, prior_spans: list[tuple[int, int]]) -> bool:
+    """True when a read observation contains source lines not in `prior_spans`.
+
+    Separate from `_delta_len` because trailing notes ("[truncated ...]",
+    symbol-resolution notes) are real tokens but are NOT new source. Counting
+    them as progress would let an identical truncated re-read evade the
+    duplicate-read guard forever.
+    """
+    m = _READ_HEAD_RX.match(obs)
+    if not m:
+        return True
+    head_end = obs.index("\n") if "\n" in obs else len(obs)
+    body = obs[head_end + 1:]
+    for ln in body.split("\n"):
+        pm = _re_mod.match(r"\s*(\d+) \|", ln)
+        if pm and not any(a <= int(pm.group(1)) <= b for a, b in prior_spans):
+            return True
+    return False
 
 
 def _evict_duplicate_reads(messages: list[dict], gathered: list[str],
@@ -248,6 +276,8 @@ Actions (disabled ones are noted below):
 Rules:
 - Request one action per reply.
 - Line ranges in the map are exact. Read them directly.
+- Do not repeat a `read` whose range you have already seen; it returns no new
+  source. Move to another range, another tool, or `done`.
 - `grep` and `outline` tell you WHERE code is. Only `read` shows you the exact
   text. You must `read` a region before you can change it.
 - Know a symbol's name but not its line? `read` with `symbol` set and `file`
@@ -521,6 +551,7 @@ class Agent:
                                  # "are you really done?" nudge below
         step_recoveries = 0      # budget for re-asking after a gather step
                                  # died at the output cap (see LLMError path)
+        duplicate_reads = 0      # consecutive reads that added no new lines
         while unlimited or step < step_cap:
             step += 1
             try:
@@ -668,17 +699,15 @@ class Agent:
                             "next ~80. Repeat `append` until the file is "
                             "complete. Never put a whole large file in one "
                             "reply.]")
+            duplicate_read = False
+            read_delta = None
             if action == "read" and not obs.startswith("ERROR"):
-                did_read = True
-                # A real read is progress, so a later `done` with new missing
-                # files is allowed another coverage nudge.
-                read_nudged = False
-                # Append-only span ledger. The eviction pass at the end of
-                # the loop replays these spans in order to work out which
-                # lines each RESULT turn was the first to show -- so a
-                # re-read costs nothing against max_gathered_chars and the
-                # conversation cannot fill itself with duplicate copies of
-                # the same file.
+                # A successful read is progress only when it shows lines the
+                # conversation has not already supplied. Compare against the
+                # span ledger BEFORE recording this read, then keep only a
+                # compact "already read" note for an exact duplicate: echoing
+                # the same numbered lines back is what lets a small model lock
+                # onto one range and repeat it forever.
                 m = _READ_HEAD_RX.match(obs)
                 if m:
                     # Normalise exactly like `_task_file_targets` does:
@@ -690,8 +719,21 @@ class Agent:
                     # answer phase ends with zero edit blocks ("nothing to
                     # review" in the GUI despite successful reads).
                     key = m.group(1).strip().lower().lstrip("./")
-                    spans.setdefault(key, []).append(
-                        (int(m.group(2)), int(m.group(3))))
+                    s_, e_ = int(m.group(2)), int(m.group(3))
+                    prior = list(spans.get(key, []))
+                    read_delta = _delta_len(obs, prior)
+                    duplicate_read = not _read_has_new_lines(obs, prior)
+                    spans.setdefault(key, []).append((s_, e_))
+                    if duplicate_read:
+                        obs = (f"{m.group(1).strip()} lines {s_}-{e_}: "
+                               "[already read; this range contains no new "
+                               "source. Do not repeat it -- choose `done` or "
+                               "a different file/range.]")
+                if not duplicate_read:
+                    did_read = True
+                    # A real read is progress, so a later `done` with new
+                    # missing files is allowed another coverage nudge.
+                    read_nudged = False
                 self._unread_files = self._compute_unread(task)
             # An ERROR observation is navigation feedback ("that range does
             # not exist"), not source. Carrying it into the answer prompt as
@@ -715,9 +757,11 @@ class Agent:
             # phase mid-gather. The RESULT turn still shows the full read (the
             # eviction pass at the end of the loop dedups the conversation).
             if action == "read" and _READ_HEAD_RX.match(obs):
-                k0 = _READ_HEAD_RX.match(obs).group(1).strip().lower()
-                prior = [sp for sp in spans.get(k0, [])[:-1]]
-                delta = _delta_len(obs, prior)
+                if read_delta is None:
+                    k0 = _READ_HEAD_RX.match(obs).group(1).strip().lower()
+                    delta = _delta_len(obs, list(spans.get(k0, [])))
+                else:
+                    delta = read_delta
                 if delta > budget:
                     obs = obs[:budget] + "\n[truncated: context budget reached]"
                     budget = 0
@@ -727,6 +771,17 @@ class Agent:
                 if len(obs) > budget:
                     obs = obs[:budget] + "\n[truncated: context budget reached]"
                 budget -= len(obs)
+
+            if duplicate_read:
+                duplicate_reads += 1
+                if duplicate_reads >= _MAX_DUPLICATE_READS:
+                    if verbose:
+                        print("  [gather stopped: the model repeated the same "
+                              "read without new source; moving to answer]",
+                              file=sys.stderr)
+                    break
+            else:
+                duplicate_reads = 0
 
             arg = (stepjson.get("file") or stepjson.get("pattern")
                    or stepjson.get("symbol") or stepjson.get("command"))
@@ -739,7 +794,8 @@ class Agent:
                         f"{len(self.index.in_file(self.index.resolve_file(arg) or ''))} units)")
             else:
                 item = f"--- {action} {arg}\n{obs}"
-            gathered.append(item)
+            if not duplicate_read:
+                gathered.append(item)
 
             messages.append({"role": "assistant", "content": _compact(stepjson)})
             messages.append({"role": "user",

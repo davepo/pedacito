@@ -840,6 +840,41 @@ def test_evict_overflow_turns_makes_progress_on_short_turns():
     assert not any(m["content"] == old1 for m in msgs)  # stuck turn dropped
 
 
+def test_gather_stops_on_repeated_no_new_source_read(tmp_path):
+    """A small model can lock onto one range and emit the same `read` dozens
+    of times. The duplicate adds no source, yet the old loop echoed the same
+    numbered lines back and never reset progress, so it ran to the context
+    budget. The gather phase must detect the no-op, stop feeding the pattern,
+    and move on to the answer with the source already collected."""
+    from pedacito import index as index_mod
+
+    _write(tmp_path / "PLAN.md", "\n".join(
+        f"line {i}: parkour control note" for i in range(1, 14)) + "\n")
+    cfg = config_mod.Config()
+    idx = index_mod.build([str(tmp_path)], cfg, client=None,
+                          summarise=False, root=tmp_path, verbose=False)
+
+    class StubClient:
+        stream_truncated = False
+        step_truncated = False
+
+        def __init__(self):
+            self.calls = 0
+
+        def chat_json(self, messages, schema, max_tokens=0, **kw):
+            self.calls += 1
+            return {"action": "read", "file": "PLAN.md", "start": 1,
+                    "end": 13, "reasoning": "Check plan for parkour control"}
+
+    client = StubClient()
+    agent = Agent(idx, client, cfg)
+    gathered = agent.gather("fix parkour controls in PLAN.md", verbose=False)
+
+    assert client.calls == 3, f"gather kept repeating reads: {client.calls}"
+    assert len(agent.steps_log) == 3
+    assert "parkour control note" in gathered
+
+
 def test_apply_stops_after_repeated_truncation(tmp_path):
     """A model that re-emits one oversized block every round must not spin
     the continuation loop for the whole char budget (each round generates
