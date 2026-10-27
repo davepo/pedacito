@@ -391,11 +391,21 @@ def _evict_overflow_turns(messages: list[dict], client, cfg) -> bool:
         lines = content.split("\n")
         if len(lines) > 6:
             keep = max(4, len(lines) // 2)
-            messages[i] = {"role": "user", "content": "\n".join(
+            clipped = "\n".join(
                 lines[:keep] + ["[older read dropped to fit the model's "
                                 "context window; re-`read` it if you need "
-                                "the rest]", "", ""] + lines[-2:])}
-        else:
+                                "the rest]", "", ""] + lines[-2:])
+            # A short turn can reach a fixed point: for 8-10 lines the
+            # head+tail rewrite is the same size (or larger) than the
+            # original, so re-clipping it forever never gets under the
+            # window. Only rewrite when it actually saves tokens; otherwise
+            # fall through and drop the turn entirely so this loop always
+            # makes progress.
+            if estimate_tokens(clipped) < estimate_tokens(content):
+                messages[i] = {"role": "user", "content": clipped}
+            else:
+                lines = []      # force the removal path below
+        if not lines or len(lines) <= 6:
             drop = {i}
             nxt = [j for j in idxs[1:] if messages[j]["content"].startswith("RESULT:\n")]
             if nxt:

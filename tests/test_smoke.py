@@ -674,6 +674,42 @@ def test_evict_overflow_turns_clips_oldest_result():
     assert any("young" in m["content"] for m in msgs)   # newest survives
 
 
+def test_evict_overflow_turns_makes_progress_on_short_turns():
+    """A short RESULT turn can reach a fixed point where head+tail clipping is
+    the same size as the original. Re-clipping it forever used to hang the
+    gather loop right after the first trim notice (the model then looked
+    "idle-unloaded" because no further request was ever sent). The eviction
+    pass must drop such a turn instead of spinning."""
+    from pedacito.agent import _evict_overflow_turns
+    from pedacito.llm import estimate_tokens
+
+    cfg = config_mod.Config()
+    cfg.context_tokens = 4096
+    cfg.max_tokens_step = 512
+    cfg.reserve_tokens = 1024      # room = 4096-512-512 = 3072 tokens
+    room = cfg.context_tokens - cfg.max_tokens_step - cfg.reserve_tokens // 2
+
+    system = "x" * int((room - 310) * 3.6)
+    old1 = "RESULT:\n" + "\n".join(f"line {i}" for i in range(10))
+    old2 = "RESULT:\nshort"
+    young = "RESULT:\nyoung " + "y" * 1000
+    msgs = [{"role": "system", "content": system},
+            {"role": "assistant", "content": "thinking"},
+            {"role": "user", "content": old1},
+            {"role": "assistant", "content": "more thinking"},
+            {"role": "user", "content": old2},
+            {"role": "assistant", "content": "yet more thinking"},
+            {"role": "user", "content": young}]
+    assert sum(estimate_tokens(m["content"]) for m in msgs) > room
+
+    changed = _evict_overflow_turns(msgs, client=None, cfg=cfg)
+
+    assert changed
+    assert sum(estimate_tokens(m["content"]) for m in msgs) <= room
+    assert any("young" in m["content"] for m in msgs)   # newest survives
+    assert not any(m["content"] == old1 for m in msgs)  # stuck turn dropped
+
+
 def test_apply_stops_after_repeated_truncation(tmp_path):
     """A model that re-emits one oversized block every round must not spin
     the continuation loop for the whole char budget (each round generates
