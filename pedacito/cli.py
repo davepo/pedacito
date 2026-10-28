@@ -139,6 +139,10 @@ def _refresh(idx, args, cfg, root: Path, verbose: bool = True):
     hash, so only the parts you actually changed lose theirs.
     """
     changed, missing = idx.stale()
+    # stale() may have refreshed recorded [mtime, size] entries for files it
+    # hashed and found unchanged (a touch, a checkout); persisting those lets
+    # the NEXT run skip the hashes too.
+    stats_dirty = idx.stats_refreshed
     for rel in missing:
         idx.forget(rel)
     for rel in changed:
@@ -177,7 +181,7 @@ def _refresh(idx, args, cfg, root: Path, verbose: bool = True):
         print("  new files need summaries: run `pedacito index` when convenient",
               file=sys.stderr)
 
-    if changed or missing or added:
+    if changed or missing or added or stats_dirty:
         idx.save()
     return idx
 
@@ -611,7 +615,7 @@ def main(argv=None) -> int:
 
     p_map = sub.add_parser("map", help="print the current index")
     _add_common(p_map)
-    p_map.add_argument("--tier", choices=["auto", "cards", "flat"], default="auto")
+    p_map.add_argument("--tier", choices=["auto", "cards", "dirs", "flat"], default="auto")
 
     p_conf = sub.add_parser("config", help="show, create, or test the config file")
     p_conf.add_argument("--init", action="store_true",
@@ -841,6 +845,8 @@ def main(argv=None) -> int:
                 text = idx.render()
             elif args.tier == "cards":
                 text = idx.render_files(line_ranges=cfg.file_card_line_ranges)
+            elif args.tier == "dirs":
+                text = idx.render_dirs()
             else:
                 text, tier = idx.map_for_prompt(cfg)
                 print(f"[tier: {tier}]", file=sys.stderr)
@@ -931,6 +937,7 @@ def main(argv=None) -> int:
             mins = calls * 80 / args.tps / 60
             flat_t = estimate_tokens(idx.render())
             cards_t = estimate_tokens(idx.render_files(line_ranges=cfg.file_card_line_ranges))
+            dirs_t = estimate_tokens(idx.render_dirs())
             print(f"{plan['units']} units across {len(idx.files)} files "
                   f"({len(idx.code_files)} code, {len(idx.reference_files)} reference)")
             print(f"  eligible for a summary : {plan['eligible']}")
@@ -943,6 +950,9 @@ def main(argv=None) -> int:
             print(f"\nmap size, flat  : {flat_t:,} tokens")
             print(f"map size, cards : {cards_t:,} tokens"
                   f"   <- used above {cfg.flat_map_token_budget:,}")
+            print(f"map size, dirs  : {dirs_t:,} tokens"
+                  f"   <- used when cards exceed "
+                  f"{cfg.flat_map_token_budget * 2:,}")
             return 0
 
         client = LMStudio(cfg)

@@ -271,6 +271,18 @@ class Config:
     # Cosine similarity below this is not shown. Embedding scales differ by
     # model, so tune this if results are too noisy or too sparse.
     semantic_min_score: float = 0.2
+    # Read-only `diff` action for the gather loop: compare the working tree
+    # against Pedacito's own pre-write snapshots (.pedacito/backups/) to see
+    # what earlier writes changed. On by default -- it cannot damage anything
+    # -- but it is one more action on the tool surface, so set false for
+    # models that get confused by it.
+    allow_diff: bool = True
+    # EXPERIMENTAL: mark only `action` and `reasoning` required in the gather
+    # step schema, so grammar-constrained decoding may omit the empty fields
+    # a step does not use (~20-40 output tokens saved per step). Off by
+    # default: all-required keeps the grammar as simple as possible for small
+    # models -- measure it against your server before enabling.
+    compact_step_schema: bool = False
     # Recognise rename/move intent in edit blocks: a creation of a new path
     # paired with a block that empties an existing same-extension file is
     # applied as a real move (contents relocated, old file deleted) instead of
@@ -1931,6 +1943,14 @@ vram_gb  = 8                   # MANDATORY for local servers: GPU VRAM in GB
 # embedding_model = ""             # embedding model id (empty = chat model)
 # semantic_top_k = 5               # semantic matches returned per query
 # semantic_min_score = 0.2         # cosine similarity floor for a match
+# allow_diff = true                # read-only `diff` action: working tree vs
+#                                  # Pedacito's pre-write snapshots. Set false
+#                                  # to shrink the tool surface by one action.
+# compact_step_schema = false      # EXPERIMENTAL: only `action`+`reasoning`
+#                                  # required per gather step, so unused
+#                                  # fields may be omitted (saves ~20-40
+#                                  # output tokens per step); measure it on
+#                                  # your server before enabling
 # allow_rename = true              # treat "create new path + empty old path"
 #                                  # block pairs as real renames (old file is
 #                                  # deleted); set false to never auto-delete

@@ -66,6 +66,23 @@ def file_hash(path: Path) -> str:
         return ""
 
 
+def file_stat(path: Path) -> "list[int] | None":
+    """[mtime_ns, size] of a file, or None when it cannot be stat-ed.
+
+    The cheap freshness prefilter for `Index.stale()`: hashing every indexed
+    file on every command start (and after every `run` step) reads the whole
+    project from disk each time, which is pure waste for the overwhelmingly
+    common "nothing changed" answer. A stat sweep gets the same answer for
+    unchanged files without opening them; only a stat mismatch pays for a
+    hash. A file whose content changes while mtime_ns AND size both stay
+    identical is not observable on any filesystem Pedacito targets."""
+    try:
+        st = path.stat()
+        return [st.st_mtime_ns, st.st_size]
+    except OSError:
+        return None
+
+
 def state_dir(root: Path, *parts: str) -> Path:
     """Path under <root>/.pedacito/, optionally with subpath components
     appended. Everything Pedacito writes for a project lives here."""
@@ -125,7 +142,8 @@ class Index:
 
     def __init__(self, root: Path, chunks: list[Chunk],
                  file_summaries: dict[str, str] | None = None,
-                 file_hashes: dict[str, str] | None = None):
+                 file_hashes: dict[str, str] | None = None,
+                 file_stats: dict[str, list] | None = None):
         """Build an Index in memory from a flat list of chunks. Use
         `build()` or `Index.load()` rather than calling this directly in
         most cases."""
@@ -137,18 +155,52 @@ class Index:
         # and every range below the edit shifts, so the model would read the
         # wrong function while believing it read the right one.
         self.file_hashes = file_hashes or {}
+        # [mtime_ns, size] per file at index time: the fast path that lets
+        # stale() skip hashing files nothing has touched (see file_stat).
+        self.file_stats = file_stats or {}
+        # Set by stale() when it refreshed stat entries without finding
+        # content changes; callers persist the index so the NEXT run skips
+        # the hashes too.
+        self.stats_refreshed = False
         self._by_key = {c.key: c for c in chunks}
         self._by_file: dict[str, list[Chunk]] = defaultdict(list)
         for c in chunks:
             self._by_file[c.file].append(c)
         for v in self._by_file.values():
             v.sort(key=lambda c: c.start)
+        self._files_sorted: "list[str] | None" = None
+        self._build_symbol_caches()
+
+    def _build_symbol_caches(self) -> None:
+        """Lookup dicts that keep find_symbol/callers_of off a linear scan of
+        every chunk in the project. One `callers` step probes find_symbol up
+        to a dozen times (once per callee name); on a large index those
+        scans were the hot path of the navigation tools."""
+        by_qualname: dict[str, list[Chunk]] = {}
+        by_suffix: dict[str, list[Chunk]] = {}
+        by_call: dict[str, list[Chunk]] = {}
+        for c in self.chunks:
+            by_qualname.setdefault(c.qualname, []).append(c)
+            # Every dotted suffix of the lower-cased qualname, so one lookup
+            # covers both "qualname.lower() == s" and "endswith('.' + s)".
+            parts = c.qualname.lower().split(".")
+            for i in range(len(parts)):
+                by_suffix.setdefault(".".join(parts[i:]), []).append(c)
+            for name in c.calls:
+                by_call.setdefault(name, []).append(c)
+        self._by_qualname = by_qualname
+        self._by_suffix = by_suffix
+        self._by_call = by_call
 
     # ------------------------------------------------------------------ query
     @property
     def files(self) -> list[str]:
-        """All indexed file paths (relative to root), sorted."""
-        return sorted(self._by_file)
+        """All indexed file paths (relative to root), sorted. Cached -- this
+        is consulted several times per tool step -- and SHARED: callers must
+        not mutate the returned list."""
+        if self._files_sorted is None:
+            self._files_sorted = sorted(self._by_file)
+        return self._files_sorted
 
     def in_file(self, rel: str) -> list[Chunk]:
         """All chunks belonging to one file, in line order."""
@@ -162,16 +214,31 @@ class Index:
 
     def stale(self) -> tuple[list[str], list[str]]:
         """Return (changed, missing): files whose content hash no longer
-        matches what was indexed, and files that have been deleted since."""
+        matches what was indexed, and files that have been deleted since.
+
+        A file whose recorded [mtime_ns, size] still matches the filesystem
+        is skipped WITHOUT hashing -- the common case on every command start
+        and after every `run` step. When only the stat differs (a touch, a
+        checkout that rewrote identical bytes) the file is hashed, found
+        unchanged, and its stat entry refreshed; `stats_refreshed` tells the
+        caller that persisting the index would make the next run skip the
+        hash too."""
         changed, missing = [], []
+        self.stats_refreshed = False
         for rel in self.files:
             p = self.root / rel
             if not p.exists():
                 missing.append(rel)
                 continue
+            stat_now = file_stat(p)
+            if stat_now is not None and self.file_stats.get(rel) == stat_now:
+                continue                    # untouched since indexing
             known = self.file_hashes.get(rel)
             if known and file_hash(p) != known:
                 changed.append(rel)
+            elif stat_now is not None and self.file_stats.get(rel) != stat_now:
+                self.file_stats[rel] = stat_now
+                self.stats_refreshed = True
         return changed, missing
 
     def forget(self, rel: str) -> None:
@@ -181,6 +248,9 @@ class Index:
         self._by_file.pop(rel, None)
         self.file_summaries.pop(rel, None)
         self.file_hashes.pop(rel, None)
+        self.file_stats.pop(rel, None)
+        self._files_sorted = None
+        self._build_symbol_caches()
 
     def is_reference(self, rel: str) -> bool:
         """Whether a file was indexed structurally (non-Python) rather than
@@ -215,18 +285,19 @@ class Index:
     def find_symbol(self, symbol: str) -> list[Chunk]:
         """Find chunk(s) matching a symbol name: exact qualname match first,
         then case-insensitive qualname/suffix match, then (for methods of a
-        class that was indexed whole) the owning class."""
+        class that was indexed whole) the owning class. Lookups hit the
+        prebuilt dicts from _build_symbol_caches, not a scan of every chunk."""
         s = symbol.strip()
-        hits = [c for c in self.chunks if c.qualname == s]
+        hits = self._by_qualname.get(s)
         if hits:
-            return hits
-        low = s.lower()
-        hits = [c for c in self.chunks
-                if c.qualname.lower() == low or c.qualname.lower().endswith("." + low)]
-        if hits:
-            return hits
+            return list(hits)
+        # The suffix map covers both lowercase-equality and ".name" endings:
+        # every dotted suffix of every lower-cased qualname is a key.
         # Small classes are indexed whole, so a bare method name won't match a
         # qualname. Fall back to the class that declares it.
+        hits = self._by_suffix.get(s.lower())
+        if hits:
+            return list(hits)
         base = s.split(".")[-1]
         return [c for c in self.chunks if base in c.members]
 
@@ -234,7 +305,7 @@ class Index:
         """Chunks whose call list contains this symbol's bare name. An
         approximate cross-reference (names, not resolved bindings)."""
         base = symbol.split(".")[-1]
-        return [c for c in self.chunks if base in c.calls]
+        return list(self._by_call.get(base, []))
 
     # ------------------------------------------------------ tier 0: file cards
     def render_files(self, line_ranges: bool = True, max_names: int = 60) -> str:
@@ -243,8 +314,15 @@ class Index:
         attached to the names so the model can often go straight to `read`
         without an `outline` round trip -- worth the extra characters at
         ~25 tok/s."""
+        return self.render_cards(self.code_files + self.reference_files,
+                                 line_ranges, max_names)
+
+    def render_cards(self, rels: list[str], line_ranges: bool = True,
+                     max_names: int = 60) -> str:
+        """File cards for any subset of files: the tier-0 map's body, and
+        what `outline` renders when it is pointed at a directory."""
         out: list[str] = []
-        for f in self.code_files + self.reference_files:
+        for f in rels:
             units = self.in_file(f)
             if self.is_reference(f):
                 out.append(self._reference_card(f, units, line_ranges))
@@ -268,6 +346,36 @@ class Index:
                 extra = f" (+{hidden} hidden; use outline)" if hidden else ""
                 card.append(f"  defines: {', '.join(names)}{extra}")
             out.append("\n".join(card))
+        return "\n\n".join(out)
+
+    def render_dirs(self, max_dirs: int = 80, max_files: int = 12,
+                    summary_chars: int = 100) -> str:
+        """Render the directory-tier map: one card per top-level directory,
+        naming its files. The last resort for projects whose file cards do
+        not fit the prompt budget; the model descends with `outline <dir>`,
+        which renders that directory's file cards (see tools.tool_outline)."""
+        groups: dict[str, list[str]] = {}
+        for f in self.files:
+            top = f.split("/", 1)[0] + "/" if "/" in f else "(root)"
+            groups.setdefault(top, []).append(f)
+        out: list[str] = []
+        names = sorted(groups)
+        for d in names[:max_dirs]:
+            rels = groups[d]
+            card = [f"### {d}  ({len(rels)} files)"]
+            for f in rels[:max_files]:
+                summ = self.file_summaries.get(f) or ""
+                if len(summ) > summary_chars:
+                    summ = summ[:summary_chars - 1].rstrip() + "..."
+                card.append(f"  {f}" + (f"  -- {summ}" if summ else ""))
+            if len(rels) > max_files:
+                where = ("`outline` '.' to list every file" if d == "(root)"
+                         else "`outline` this directory")
+                card.append(f"  (+{len(rels) - max_files} more files; {where})")
+            out.append("\n".join(card))
+        if len(names) > max_dirs:
+            out.append(f"### ...  (+{len(names) - max_dirs} more directories; "
+                       f"`grep` or `outline` one to descend)")
         return "\n\n".join(out)
 
     def _reference_card(self, f: str, units: list[Chunk], line_ranges: bool) -> str:
@@ -337,24 +445,35 @@ class Index:
 
     # --------------------------------------------------------- tier selection
     def map_for_prompt(self, cfg) -> tuple[str, str]:
-        """Choose and render the map for a prompt: the flat map if it fits
-        within cfg.flat_map_token_budget, otherwise the tier-0 file cards.
+        """Choose and render the map for a prompt, at the richest tier that
+        fits: the flat map within cfg.flat_map_token_budget, else one card per
+        file, else -- when even the cards outrun twice the budget -- one card
+        per directory (the model descends with `outline <dir>`). Without the
+        third tier a large enough project produced a cards map bigger than the
+        window itself, and the map message is never evicted.
         Returns (map_text, tier_name)."""
         flat = self.render()
         if estimate_tokens(flat) <= cfg.flat_map_token_budget:
             return flat, "flat"
-        return self.render_files(line_ranges=cfg.file_card_line_ranges), "cards"
+        cards = self.render_files(line_ranges=cfg.file_card_line_ranges)
+        # The cards tier may run to twice the flat budget before descending:
+        # file-level cards are worth substantially more context than directory
+        # cards, and auto_fit already sizes the budget from the real window.
+        if estimate_tokens(cards) <= cfg.flat_map_token_budget * 2:
+            return cards, "cards"
+        return self.render_dirs(), "dirs"
 
     # ------------------------------------------------------------- persistence
     def save(self) -> Path:
-        """Write the index (chunks, file summaries, file hashes) to
-        .pedacito/index.json under the project root."""
+        """Write the index (chunks, file summaries, file hashes, file stats)
+        to .pedacito/index.json under the project root."""
         d = self.root / INDEX_DIR
         d.mkdir(exist_ok=True)
         payload = {
             "root": str(self.root),
             "file_summaries": self.file_summaries,
             "file_hashes": self.file_hashes,
+            "file_stats": self.file_stats,
             "chunks": [c.to_record() for c in self.chunks],
         }
         p = d / INDEX_FILE
@@ -387,7 +506,7 @@ class Index:
             if lines:
                 c.source = "\n".join(lines[c.start - 1 : c.end])
         return cls(root, chunks, data.get("file_summaries", {}),
-                   data.get("file_hashes", {}))
+                   data.get("file_hashes", {}), data.get("file_stats", {}))
 
 
 # --------------------------------------------------------------------------
@@ -646,6 +765,9 @@ def build(paths: list[str], cfg, client=None, root: Path | None = None,
         except ValueError:
             rel = f.name
         idx.file_hashes[rel] = file_hash(f)
+        st = file_stat(f)
+        if st is not None:
+            idx.file_stats[rel] = st
 
     # Apply whatever the cache already holds *before* the early return for
     # summarise=False. Callers that skip LLM work (map, files, cost, and
@@ -761,8 +883,13 @@ def reindex_file(index: Index, rel: str, cfg, save: bool = True) -> Index:
     for c in new:
         c.summary = _entry(cache[c.sha])[0] if c.sha in cache else ""
     merged = Index(root, kept + new, dict(index.file_summaries),
-                   dict(index.file_hashes))
+                   dict(index.file_hashes), dict(index.file_stats))
     merged.file_hashes[rel] = file_hash(root / rel)
+    st = file_stat(root / rel)
+    if st is not None:
+        merged.file_stats[rel] = st
+    else:
+        merged.file_stats.pop(rel, None)
     if save:
         merged.save()
     return merged

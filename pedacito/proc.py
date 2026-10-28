@@ -82,11 +82,16 @@ def run(command, *, cwd, timeout: float | None = None,
     `timeout` is the hard wall-clock limit; `idle_timeout` stops the process
     after that many seconds with no output (0 disables it). `stopped` is one
     of "", "idle", "timeout", or "error" (could not start). Output is combined
-    stdout+stderr and capped at `max_output` characters.
+    stdout+stderr, capped at about `max_output` characters by keeping the
+    HEAD and the TAIL and dropping the middle: a test runner's summary and a
+    traceback's final `Error:` line live at the end, which head-only
+    truncation threw away exactly when the output was long enough to matter.
     """
     timeout = float(timeout or 0)
     idle_timeout = float(idle_timeout or 0)
     cap = max(200, int(max_output or 8000))
+    head_cap = max(120, int(cap * 0.6))
+    tail_cap = max(80, cap - head_cap)
     started = time.monotonic()
     kwargs = {}
     if os.name != "nt":
@@ -100,7 +105,8 @@ def run(command, *, cwd, timeout: float | None = None,
     except (OSError, ValueError) as e:
         return None, str(e), "error", time.monotonic() - started
 
-    buf = bytearray()
+    buf = bytearray()      # the first head_cap bytes
+    tail = bytearray()     # rolling window: the last tail_cap bytes
     state = {"last": started, "overflow": False}
     lock = threading.Lock()
 
@@ -117,11 +123,17 @@ def run(command, *, cwd, timeout: float | None = None,
                 break
             with lock:
                 state["last"] = time.monotonic()
-                room = cap - len(buf)
-                if room > 0:
+                if not state["overflow"]:
+                    room = head_cap - len(buf)
+                    if len(chunk) <= room:
+                        buf.extend(chunk)
+                        continue
                     buf.extend(chunk[:room])
-                if len(chunk) > room:
                     state["overflow"] = True
+                    chunk = chunk[room:]
+                tail.extend(chunk)
+                if len(tail) > tail_cap:
+                    del tail[:len(tail) - tail_cap]
 
     reader = threading.Thread(target=pump, daemon=True)
     reader.start()
@@ -153,6 +165,9 @@ def run(command, *, cwd, timeout: float | None = None,
     reader.join(timeout=3)
 
     text = bytes(buf).decode("utf-8", "replace")
-    if state["overflow"] or len(text) > cap:
-        text = text[:cap] + f"\n[output truncated to {cap} chars]"
+    if state["overflow"]:
+        tail_text = bytes(tail).decode("utf-8", "replace")
+        text = (text + "\n[... output truncated: middle omitted; kept the "
+                f"first {head_cap} and last {tail_cap} chars ...]\n"
+                + tail_text)
     return rc, text, stopped, time.monotonic() - started

@@ -64,10 +64,24 @@ def _index(tmp_path: Path, files: dict[str, str] | None = None) -> Index:
 def test_schema_hides_disabled_actions_and_fields():
     plain = tools.schema_for(Config())
     assert plain["properties"]["action"]["enum"] == [
-        "read", "grep", "callers", "outline", "sessions", "done"]
+        "read", "grep", "callers", "outline", "sessions", "diff", "done"]
     assert "content" not in plain["properties"]
     assert "to" not in plain["properties"]
     assert "command" not in plain["properties"]
+
+    nodiff = Config()
+    nodiff.allow_diff = False
+    nschema = tools.schema_for(nodiff)
+    assert "diff" not in nschema["properties"]["action"]["enum"]
+
+    compact = Config()
+    compact.compact_step_schema = True
+    cschema = tools.schema_for(compact)
+    assert cschema["required"] == ["action", "reasoning"]
+    # The load-bearing field ORDER must survive: args before reasoning, so a
+    # truncated reply still salvages to a complete action.
+    assert list(cschema["properties"]) == [
+        "action", "file", "start", "end", "pattern", "symbol", "reasoning"]
 
     write_only = Config()
     write_only.allow_write = True
@@ -171,6 +185,31 @@ def test_outline_accepts_a_symbol_name_as_its_file(tmp_path):
     assert "pkg/app.py" in obs and "helper" in obs
 
 
+def test_outline_directory_lists_file_cards(tmp_path):
+    """`outline` pointed at a directory renders the file cards under it --
+    the way down from a directory-tier map to readable line ranges."""
+    idx = _index(tmp_path, {
+        "pkg/a.py": "def alpha():\n    return 1\n",
+        "pkg/b.py": "def beta():\n    return 2\n",
+        "other/c.py": "def gamma():\n    return 3\n",
+    })
+    obs = tools.tool_outline(idx, Config(), "pkg")
+    assert "### pkg (2 files)" in obs
+    assert "pkg/a.py" in obs and "pkg/b.py" in obs
+    assert "other/c.py" not in obs
+    assert "alpha:L1-2" in obs              # cards keep their line ranges
+    assert "Directory listing" in obs
+
+    # A glob works the same way.
+    globbed = tools.tool_outline(idx, Config(), "*.py")
+    assert "pkg/a.py" in globbed and "other/c.py" in globbed
+
+    # A name that matches nothing still gets the file-not-found hint, not a
+    # dump of every card in the project.
+    miss = tools.tool_outline(idx, Config(), "nosuchdir")
+    assert "ERROR" in miss and "### " not in miss
+
+
 def test_read_missing_symbol_suggests_a_close_match(tmp_path):
     idx = _index(tmp_path)
     obs = tools.tool_read(idx, Config(), "", 0, 0, symbol="helpr")
@@ -220,6 +259,42 @@ def test_grep_hit_names_the_enclosing_symbol(tmp_path):
     assert "[Server]" in obs
 
 
+def test_grep_sparse_hits_include_context_lines(tmp_path):
+    """A grep with a handful of hits shows one line of context around each
+    (GNU-grep style `file-N-` separator): with so few matches the model is
+    looking at THE place, and the neighbouring line saves a `read` round
+    trip."""
+    idx = _index(tmp_path, {
+        "m.py": "alpha = 1\nNEEDLE = 2\nomega = 3\n",
+    })
+    obs = tools.tool_grep(idx, "NEEDLE")
+    assert "m.py:2: NEEDLE = 2" in obs
+    assert "m.py-1- alpha = 1" in obs       # context before...
+    assert "m.py-3- omega = 3" in obs       # ...and after
+    assert "few matches" in obs             # and the note explaining '-'
+
+
+def test_grep_dense_hits_have_no_context(tmp_path):
+    """Once a grep returns many hits, context is noise: the plain hit list
+    must come back without it (and without doubling the tokens)."""
+    body = "".join(f"target_{i} = {i}\nfiller_{i} = {i}\n" for i in range(8))
+    idx = _index(tmp_path, {"m.py": body})
+    obs = tools.tool_grep(idx, "target_")
+    assert "m.py:1: target_0" in obs
+    assert "filler_0" not in obs            # no context lines
+    assert "few matches" not in obs
+
+
+def test_grep_miss_suggests_similar_symbols(tmp_path):
+    """A total miss should not be a dead end: the index knows every defined
+    name, so a near-miss of one comes back as a suggestion instead."""
+    idx = _index(tmp_path)
+    obs = tools.tool_grep(idx, "helpr")
+    assert "No matches" in obs
+    assert "similar symbol names" in obs
+    assert "helper" in obs
+
+
 def test_callers_shows_call_sites_and_callees(tmp_path):
     idx = _index(tmp_path)
     helper = tools.tool_callers(idx, "helper")
@@ -264,6 +339,25 @@ def test_append_is_gated_by_allow_write(tmp_path):
                                          "content": "a = 1"})
     assert obs.startswith("ERROR") and "allow_write" in obs
     assert not (tmp_path / "x.py").exists()
+
+
+def test_write_warns_when_python_does_not_parse(tmp_path):
+    """Advisory syntax check: the edit path refuses broken code, but the
+    write path cannot (a chunked file is legitimately unparseable until its
+    last append), so it must at least WARN in the same observation."""
+    idx = _index(tmp_path)
+    cfg = Config()
+    cfg.allow_write = True
+
+    obs = tools.dispatch(idx, cfg, {"action": "write", "file": "bad.py",
+                                    "content": "def f(:\n    pass\n"})
+    assert obs.startswith("CREATED bad.py")
+    assert "WARNING" in obs and "does not parse" in obs
+
+    ok = tools.dispatch(idx, cfg, {"action": "write", "file": "good.py",
+                                   "content": "def f():\n    return 1\n"})
+    assert ok.startswith("CREATED good.py")
+    assert "WARNING" not in ok
 
 
 # --------------------------------------------------------------- move/delete
@@ -395,6 +489,25 @@ def test_run_timeout_is_reported(tmp_path):
     })
     assert "timed out after 1s" in obs
     assert time.time() - started < 4
+
+
+def test_run_output_keeps_head_and_tail(tmp_path):
+    """Truncation must keep the TAIL: a test runner's failure summary and a
+    traceback's final `Error:` line live at the END of the output, which
+    head-only truncation threw away exactly when output was long enough to
+    matter."""
+    idx = _index(tmp_path)
+    cfg = Config()
+    cfg.allow_shell = True
+    cfg.max_shell_output_chars = 400
+    obs = tools.dispatch(idx, cfg, {
+        "action": "run",
+        "command": (f'{sys.executable} -c "print(\'A\' * 2000); '
+                    f'print(\'ZZTAILZZ\')"'),
+    })
+    assert "A" * 50 in obs           # head kept
+    assert "ZZTAILZZ" in obs         # tail kept
+    assert "middle omitted" in obs   # and the marker says what happened
 
 
 def test_run_honours_allowlist(tmp_path):
@@ -571,6 +684,97 @@ def test_sessions_scope_restricts_search(tmp_path):
     assert "20260102-120000.md" not in obs
 
 
+def _backup(tmp_path: Path, stamp: str, rel: str, text: str) -> Path:
+    """Simulate the pre-write copy every Pedacito write path makes into
+    .pedacito/backups/<stamp>/, mirroring the tree."""
+    snap = workspace.new_backup_dir(tmp_path, stamp)
+    dest = snap / rel
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    dest.write_text(text, encoding="utf-8")
+    return snap
+
+
+def test_diff_summarizes_changes_since_snapshots(tmp_path):
+    idx = _index(tmp_path)
+    _backup(tmp_path, "20260101-120000", "pkg/app.py", APP)
+    (tmp_path / "pkg/app.py").write_text(APP + "\nEXTRA = 1\n",
+                                         encoding="utf-8")
+
+    obs = tools.dispatch(idx, Config(), {"action": "diff"})
+    assert "1 file(s) changed" in obs
+    assert "DIFF pkg/app.py" in obs
+    assert "+EXTRA = 1" in obs
+    assert "not git" in obs                  # the provenance note
+
+
+def test_diff_of_one_file_shows_the_unified_diff(tmp_path):
+    idx = _index(tmp_path)
+    _backup(tmp_path, "20260101-120000", "pkg/app.py", APP)
+    (tmp_path / "pkg/app.py").write_text(
+        APP.replace("def helper(value):", "def helper(value, extra=0):"),
+        encoding="utf-8")
+
+    obs = tools.dispatch(idx, Config(), {"action": "diff",
+                                         "file": "pkg/app.py"})
+    assert "snapshot 20260101-120000" in obs
+    assert "-def helper(value):" in obs
+    assert "+def helper(value, extra=0):" in obs
+
+
+def test_diff_uses_the_newest_snapshot_of_a_file(tmp_path):
+    idx = _index(tmp_path)
+    _backup(tmp_path, "20260101-120000", "pkg/app.py", "OLD = 1\n")
+    _backup(tmp_path, "20260102-120000", "pkg/app.py", "MIDDLE = 1\n")
+    (tmp_path / "pkg/app.py").write_text("NEW = 1\n", encoding="utf-8")
+
+    obs = tools.dispatch(idx, Config(), {"action": "diff",
+                                         "file": "pkg/app.py"})
+    assert "snapshot 20260102-120000" in obs
+    assert "-MIDDLE = 1" in obs
+    assert "OLD = 1" not in obs
+
+
+def test_diff_marks_a_file_deleted_since_the_snapshot(tmp_path):
+    idx = _index(tmp_path, {"pkg/app.py": APP, "gone.py": "x = 1\n"})
+    _backup(tmp_path, "20260101-120000", "gone.py", "x = 1\n")
+    (tmp_path / "gone.py").unlink()
+
+    obs = tools.dispatch(idx, Config(), {"action": "diff", "file": "gone.py"})
+    assert "DELETED" in obs
+
+
+def test_diff_summary_skips_unchanged_files(tmp_path):
+    idx = _index(tmp_path)
+    _backup(tmp_path, "20260101-120000", "pkg/app.py", APP)   # == on disk
+
+    obs = tools.dispatch(idx, Config(), {"action": "diff"})
+    assert "No changes" in obs
+
+
+def test_diff_without_snapshots_says_so(tmp_path):
+    idx = _index(tmp_path)
+    obs = tools.dispatch(idx, Config(), {"action": "diff"})
+    assert "No Pedacito snapshots" in obs
+
+
+def test_diff_unknown_file_lists_what_is_snapshotted(tmp_path):
+    idx = _index(tmp_path)
+    _backup(tmp_path, "20260101-120000", "pkg/app.py", APP)
+
+    obs = tools.dispatch(idx, Config(), {"action": "diff", "file": "other.py"})
+    assert "No snapshot of 'other.py'" in obs
+    assert "pkg/app.py" in obs
+
+
+def test_diff_is_gated_by_allow_diff(tmp_path):
+    idx = _index(tmp_path)
+    cfg = Config()
+    cfg.allow_diff = False
+    assert "diff" not in tools.schema_for(cfg)["properties"]["action"]["enum"]
+    obs = tools.tool_diff(idx, cfg)
+    assert obs.startswith("ERROR")
+
+
 def test_lmstudio_embed_returns_vectors_in_input_order(monkeypatch):
     from pedacito.llm import LMStudio
 
@@ -632,3 +836,80 @@ def test_semantic_failure_does_not_lose_the_grep_step(tmp_path):
     obs = tools.tool_grep(idx, "increment", cfg=cfg, client=BadEmbed())
     assert "semantic search unavailable" in obs
     assert "No matches" in obs
+
+
+# ------------------------------------------------------- index freshness/map
+def test_stale_skips_hashing_when_stat_matches(tmp_path, monkeypatch):
+    """The [mtime_ns, size] prefilter: a file whose stat has not moved must
+    not be hashed at all; a touch must cost exactly one hash and then be
+    remembered (stats_refreshed tells the caller to persist that); and a
+    real edit must still be caught."""
+    from pedacito import index as index_mod
+
+    idx = _index(tmp_path)
+    p = tmp_path / "pkg/app.py"
+    idx.file_hashes["pkg/app.py"] = index_mod.file_hash(p)
+    idx.file_stats["pkg/app.py"] = index_mod.file_stat(p)
+
+    calls = []
+    real_hash = index_mod.file_hash
+    monkeypatch.setattr(index_mod, "file_hash",
+                        lambda path: (calls.append(str(path)),
+                                      real_hash(path))[1])
+
+    assert idx.stale() == ([], [])
+    assert calls == []                       # stat matched: no hashing
+    assert not idx.stats_refreshed
+
+    future = time.time() + 5
+    os.utime(p, (future, future))            # touch: stat differs, bytes same
+    assert idx.stale() == ([], [])
+    assert len(calls) == 1                   # paid exactly one hash
+    assert idx.stats_refreshed
+
+    assert idx.stale() == ([], [])
+    assert len(calls) == 1                   # refreshed stat: no rehash
+
+    p.write_text(APP + "\nEXTRA = 1\n", encoding="utf-8")
+    changed, missing = idx.stale()
+    assert changed == ["pkg/app.py"] and missing == []
+    assert len(calls) == 2
+
+
+def test_map_for_prompt_falls_back_to_dir_tier(tmp_path):
+    """A project too big even for file cards gets the directory-tier map:
+    one card per top-level directory, which `outline <dir>` descends."""
+    files = {f"pkg{d}/mod{m}.py": f"def f{m}():\n    return {m}\n"
+             for d in range(3) for m in range(4)}
+    idx = _index(tmp_path, files)
+
+    cfg = Config()
+    cfg.flat_map_token_budget = 5            # nothing fits but the dir cards
+    text, tier = idx.map_for_prompt(cfg)
+    assert tier == "dirs"
+    assert "### pkg0/" in text
+    assert "pkg0/mod0.py" in text
+
+    # And the directory tier is what `outline` descends from.
+    obs = tools.tool_outline(idx, cfg, "pkg1")
+    assert "### pkg1 (4 files)" in obs
+    assert "pkg1/mod2.py" in obs
+
+    cfg.flat_map_token_budget = 10 ** 9
+    text, tier = idx.map_for_prompt(cfg)
+    assert tier == "flat"
+
+
+def test_read_lines_cached_invalidates_on_change(tmp_path):
+    from pedacito import fileio
+
+    p = tmp_path / "f.txt"
+    p.write_text("one\n", encoding="utf-8")
+    first = fileio.read_lines_cached(p)
+    assert first == ["one", ""]
+    assert fileio.read_lines_cached(p) is first      # served from the cache
+
+    p.write_text("two\nthree\n", encoding="utf-8")   # new stat -> new entry
+    assert fileio.read_lines_cached(p) == ["two", "three", ""]
+
+    fileio.clear_line_cache()

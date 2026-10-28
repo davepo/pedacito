@@ -220,12 +220,20 @@ During the gather phase the model has a deliberately small set of actions:
 - `grep` — regex or literal search scoped to the whole project, a file, a
   directory, or a glob. Hits are annotated with their enclosing symbol. A
   pattern that is not valid regex is searched literally, and a case-sensitive
-  miss is retried case-insensitively.
+  miss is retried case-insensitively. A sparse result includes one line of
+  context around each hit; a total miss suggests similarly named symbols
+  from the index instead of returning a dead end.
 - `callers` — where a symbol is defined, what it calls, and the call-site
   lines of its callers.
 - `outline` — every unit in one file, with signatures and line ranges.
+  Pointed at a directory or glob instead, it lists those files' cards — the
+  way down from a directory-tier map on very large projects.
 - `sessions` — list, search, or read the `.pedacito/sessions/*.md` logs from
   prior runs, so a model can see what was already asked and changed.
+- `diff` — what changed in the working tree since Pedacito's own pre-write
+  snapshots (optionally one file), as a unified diff. Read-only and on by
+  default (`allow_diff`); it is how a follow-up run sees what the previous
+  one actually wrote.
 - `write` / `append` / `move` / `delete` — opt-in whole-file operations when
   `allow_write = true`; `append` builds a file larger than one reply in
   sequential chunks.
@@ -396,14 +404,18 @@ there's just no symbol map for it.
 The index stores a content hash per file and self-corrects on every command:
 edits Pedacito makes are re-chunked immediately, and edits you make in your
 editor are detected and refreshed automatically on the next run (line ranges are
-only meaningful against the bytes they were computed from). Run a full
-`pedacito index` after a large refactor or a `git pull`.
+only meaningful against the bytes they were computed from). A recorded
+`[mtime, size]` pair lets the check skip hashing files nothing has touched, so
+the refresh sweep stays cheap on large projects. Run a full `pedacito index`
+after a large refactor or a `git pull`.
 
 The map is tiered so it survives real projects: a flat listing of every function
 fits small projects; larger ones get one *card* per file (imports, a summary,
-and top-level definitions with line ranges), and the model descends with
-`outline` and `read` on demand. `pedacito map <project> --tier auto` shows which
-side of the line a project landed on.
+and top-level definitions with line ranges); projects too big even for file
+cards get one card per *directory*, which the model descends with
+`outline <dir>`. From any tier the model reaches exact text with `outline` and
+`read` on demand. `pedacito map <project> --tier auto` shows which tier a
+project landed on.
 
 ## Editing: search/replace, not diffs or whole files
 
@@ -549,6 +561,8 @@ ones:
 | `allow_screenshots` | False | Capture the screen and return pixel/OCR/vision text; privacy-sensitive. |
 | `vision_model` | `""` | Optional multimodal model id used to describe screenshots. |
 | `semantic_search` | False | Fall back to `/v1/embeddings` meaning-based search when `grep` finds nothing. |
+| `allow_diff` | True | Read-only `diff` action against Pedacito's pre-write snapshots; set false to shrink the tool surface. |
+| `compact_step_schema` | False | Experimental: only `action`/`reasoning` required per gather step, so unused fields can be omitted (saves output tokens). |
 | `disable_thinking` | False | Suppress `<think>` blocks. |
 | `default_profile` | `""` | Profile applied when `--profile` isn't given. |
 

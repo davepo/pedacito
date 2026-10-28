@@ -286,12 +286,18 @@ Rules:
 - `grep` accepts a file, directory, or glob in `file`, and its hits name the
   enclosing symbol. A pattern that is not valid regex is searched as literal
   text, and a case-sensitive miss is retried case-insensitively.
+- `outline` also accepts a directory or glob: it lists the file cards under
+  it. Use that to descend when the map shows directories instead of files.
 - `callers` shows the definition, what it calls, and the call-site lines of
   its callers -- use it to trace flow without reading every caller.
 - `sessions` lists prior task logs. Give it a `pattern` to find what was done
   before, or `file` to read one log. Check it before a follow-up task: it is
   the only memory of earlier runs. Session text is historical, not current
   source -- verify with `read` before editing.
+- `diff` shows what changed in the working tree since Pedacito last
+  snapshotted each file (optionally one `file`). On a follow-up task, it is
+  the fastest way to see what the previous run wrote. Snapshot text is
+  historical -- `read` a region before editing it.
 - If `grep` cannot find a phrase and semantic search is enabled, it falls
   back to matching code by meaning and returns locations to `read`.
 - `run` executes one command and returns its output (only when allow_shell is
@@ -328,6 +334,20 @@ How to navigate it:
   restrict the search to one file.
 - Never invent a line range. If a range is not in the map or an outline you have
   already run, you do not know it yet."""
+
+# The project is too big even for file cards; the map is one card per
+# directory and the model descends two levels (dir -> file cards -> units).
+DIRS_HINT = """
+The map below is one card per DIRECTORY, not per file: this project is too big
+to list its files up front. Each card names some of the directory's files.
+
+How to navigate it:
+- `outline` a directory to see its files' cards, with line ranges.
+- `outline` a file for its units; `read` for exact text.
+- A file already named in a card can be `read` or `outline`d directly.
+- `grep` when you do not know where something lives; its hits name the file,
+  line, and enclosing symbol.
+- Never invent a line range: use one from a card or an outline you have run."""
 
 # The search/replace edit format, shared by every answer brief. Custom system
 # prompts (scaffold stubs, resume) override the ROLE of the answer but must
@@ -401,21 +421,38 @@ def _evict_overflow_turns(messages: list[dict], client, cfg) -> bool:
     answer phase anyway); a lone huge turn is clipped line-by-line, keeping
     its head -- which preserves the file/line header the coverage ledger
     parses. Never touches the map+task message or the assistant turns.
+
+    Trimming runs with hysteresis: once over the edge, turns are dropped
+    until the conversation sits a headroom's worth of tokens BELOW it, not
+    exactly at it. Each rewrite invalidates the server's prompt-prefix cache
+    from that turn onward, so without headroom a run hovering at the window
+    edge re-trims (and re-pays the prefill) on every single observation.
     """
     import sys as _sys
     from .llm import estimate_tokens
 
+    room = max(cfg.context_tokens - cfg.max_tokens_step
+               - cfg.reserve_tokens // 2, 512)
+    headroom = max(256, room // 10)
+
     def over_by() -> int:
-        room = max(cfg.context_tokens - cfg.max_tokens_step
-                   - cfg.reserve_tokens // 2, 512)
         return sum(estimate_tokens(m["content"]) for m in messages) - room
 
     changed_any = False
-    while over_by() > 0:
+    while over_by() > -headroom:
         idxs = [i for i, m in enumerate(messages)
                 if m["role"] == "user" and m["content"].startswith("RESULT:\n")]
         if not idxs:
             break
+        if over_by() <= 0:
+            # Still UNDER the window -- trimming here is only cache
+            # amortisation, so it must never cost the newest observation
+            # (the model's next decision depends on seeing it). Once the
+            # conversation is actually over the window (over_by() > 0),
+            # every RESULT turn is fair game, newest included.
+            if len(idxs) < 2:
+                break
+            idxs = idxs[:-1]
         i = idxs[0]
         content = messages[i]["content"]
         lines = content.split("\n")
@@ -488,7 +525,8 @@ class Agent:
         """
         repo_map, tier = self.index.map_for_prompt(self.cfg)
         system = (base if base is not None else GATHER_BASE) + \
-            (FLAT_HINT if tier == "flat" else CARDS_HINT)
+            (FLAT_HINT if tier == "flat"
+             else CARDS_HINT if tier == "cards" else DIRS_HINT)
         if verbose:
             print(f"  [map: {tier}, ~{estimate_tokens(repo_map)} tokens, "
                   f"{len(self.index.files)} files]", file=sys.stderr)

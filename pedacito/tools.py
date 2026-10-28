@@ -1,4 +1,4 @@
-"""The agent's tool surface: read, grep, callers, outline, sessions, write/append, run, screenshot, done.
+"""The agent's tool surface: read, grep, callers, outline, sessions, diff, write/append, run, screenshot, done.
 
 Usage
 -----
@@ -9,9 +9,11 @@ Usage
 
 Deliberately a small, fixed set of tools. Local models degrade fast as the
 tool surface grows -- four to six is about the ceiling before a small model
-starts calling the wrong one or inventing arguments. The six navigation
-tools (read, grep, callers, outline, sessions, done) are the core surface.
-`sessions` is read-only history and is how a fresh run sees prior tasks.
+starts calling the wrong one or inventing arguments. The navigation tools
+(read, grep, callers, outline, sessions, diff, done) are the core surface.
+`sessions` is read-only history and is how a fresh run sees prior tasks;
+`diff` is read-only too -- it compares the working tree against Pedacito's
+own pre-write snapshots (`allow_diff = false` drops it).
 Everything destructive or machine-visible is behind an explicit gate:
 `write`/`append`/`move`/`delete` need `cfg.allow_write`, `run` needs
 `cfg.allow_shell`, and `screenshot` needs `cfg.allow_screenshots` (plus
@@ -25,10 +27,13 @@ The navigation tools are deliberately forgiving, because small models make
 argument mistakes that must not cost a whole lookup: `read` accepts a symbol
 name instead of a line range, `grep` falls back to a literal search when the
 "regex" does not compile, retries case-insensitively when a case-sensitive
-search finds nothing, and accepts a directory or glob as its scope. When
-`semantic_search` is on, a grep with no textual hits queries the server's
-embeddings endpoint instead of returning an empty observation. A step that
-would otherwise have failed can often still return useful source.
+search finds nothing, accepts a directory or glob as its scope, shows a line
+of context around each hit when there are few hits, and suggests similarly
+named symbols when there are none. `outline` accepts a directory and renders
+its file cards. When `semantic_search` is on, a grep with no textual hits
+queries the server's embeddings endpoint instead of returning an empty
+observation. A step that would otherwise have failed can often still return
+useful source.
 
 The mutating actions are off by default because a mid-gather change skips the
 edit path's syntax validation and review page entirely. They exist for the
@@ -64,8 +69,10 @@ read     - read exact lines of a file.       args: file, start, end
 grep     - regex or literal search. args: pattern, and optional file/dir/glob
            (with semantic_search on, falls back to search by meaning)
 callers  - who calls a symbol, with the call sites. args: symbol
-outline  - list every unit in one file.      args: file
+outline  - list every unit in one file, or the file cards in one directory.
+           args: file (a path, a symbol, or a directory/glob)
 sessions - list/search what prior runs did.  args: pattern, optional file
+diff     - what changed since Pedacito's last snapshot. args: optional file
 write    - overwrite a whole file with text. args: file, content
 append   - add text to the END of a file.    args: file, content
 move     - rename/move one file.             args: file (old), to (new)
@@ -89,14 +96,16 @@ STEP_SCHEMA = {
         "action": {
             "type": "string",
             "enum": ["read", "grep", "callers", "outline", "sessions",
-                     "write", "append", "move", "delete", "run",
+                     "diff", "write", "append", "move", "delete", "run",
                      "screenshot", "done"],
         },
         "file": {"type": "string",
-                 "description": "For read/outline/write/append/move/delete. For "
+                 "description": "For read/write/append/move/delete. For "
+                                "outline, a file OR a directory/glob. For "
                                 "grep, optionally a file, directory, or glob. "
-                                "For screenshot, an older screenshot to compare. "
-                                "Empty otherwise.",
+                                "For diff, optionally one file. For screenshot, "
+                                "an older screenshot to compare. Empty "
+                                "otherwise.",
                  "maxLength": 200},
         "start": {"type": "integer",
                   "description": "For read, or screenshot wait seconds. "
@@ -144,7 +153,7 @@ STEP_SCHEMA = {
 
 # The action list is kept in one place so the schema, the gate in `dispatch`,
 # and the prompt help cannot drift apart.
-ACTIONS = ("read", "grep", "callers", "outline", "sessions", "write",
+ACTIONS = ("read", "grep", "callers", "outline", "sessions", "diff", "write",
            "append", "move", "delete", "run", "screenshot", "done")
 WRITE_ACTION = "write"
 APPEND_ACTION = "append"
@@ -152,6 +161,7 @@ MOVE_ACTION = "move"
 DELETE_ACTION = "delete"
 RUN_ACTION = "run"
 SCREENSHOT_ACTION = "screenshot"
+DIFF_ACTION = "diff"
 WRITE_ACTIONS = (WRITE_ACTION, APPEND_ACTION)
 MUTATING_ACTIONS = WRITE_ACTIONS + (MOVE_ACTION, DELETE_ACTION)
 
@@ -162,12 +172,15 @@ def schema_for(cfg) -> dict:
     Grammar-constrained decoding sees the enum, so leaving disabled actions in
     it invites a small model to call them and burn a step on an ERROR. Gating
     the schema itself (not just dispatch) keeps the default surface at the
-    five navigation actions. Fields only used by a disabled action are dropped
+    five navigation actions (`diff` adds a sixth, read-only one unless
+    allow_diff = false). Fields only used by a disabled action are dropped
     too, so the model is not asked for `content`/`to`/`command` it cannot use.
     """
     import copy
 
     actions = ["read", "grep", "callers", "outline", "sessions"]
+    if getattr(cfg, "allow_diff", True):
+        actions.append("diff")
     if getattr(cfg, "allow_write", False):
         actions += ["write", "append", "move", "delete"]
     if getattr(cfg, "allow_shell", False):
@@ -191,6 +204,15 @@ def schema_for(cfg) -> dict:
     for key in ("content", "to", "command"):
         if key not in drop:
             required.append(key)
+    if getattr(cfg, "compact_step_schema", False):
+        # EXPERIMENTAL token-saver: only `action` (and the trailing
+        # `reasoning`) stay required, so grammar-constrained decoding may
+        # omit the empty fields a step does not use -- worth ~20-40 output
+        # tokens per step at ~25 tok/s. Field ORDER is untouched, so a
+        # truncated reply still salvages to a complete action. Off by
+        # default: all-required keeps the grammar maximally simple for
+        # small models; measure it on your server before enabling.
+        required = ["action", "reasoning"]
     # Keep the load-bearing field order: action+args, then content, then
     # reasoning last (a cut-off reply must still yield a usable action).
     ordered = ["action", "file", "start", "end", "pattern", "symbol",
@@ -324,37 +346,157 @@ def _grep_scope(index, scope: str) -> tuple[list[str], str]:
                    f"searched all {len(files)} indexed files instead]")
 
 
-def _scan_grep(index, files: list[str], rx: re.Pattern,
-               max_hits: int) -> tuple[list[str], bool]:
-    """Search `files` with `rx`; return (hits, stopped_at_cap)."""
-    hits: list[str] = []
+def _hit_text(index, rel: str, i: int, line: str) -> str:
+    """One formatted grep hit: `rel:lineno: [symbol] text` with the line
+    trimmed to 200 chars. Indentation is preserved: a stripped line looks
+    editable and is not, which is how a model ends up writing SEARCH blocks
+    that can never match."""
+    shown = line[:200].rstrip()
+    cut = " ...[line truncated]" if len(line) > 200 else ""
+    unit = _enclosing_chunk(index, rel, i)
+    where = (f" [{unit.qualname}]" if unit is not None
+             and unit.qualname != "module" else "")
+    return f"{rel}:{i}:{where} {shown}{cut}"
+
+
+# A grep with at most this many real hits gets one line of context around
+# each: with so few matches the model is almost certainly looking at THE
+# place, and seeing the neighbouring line saves a `read` round trip. Dense
+# results skip it -- context there is mostly noise and doubles the tokens.
+SPARSE_CONTEXT_MAX = 5
+
+
+def _context_line(index, rel: str, n: int) -> "str | None":
+    """Render line `n` of `rel` as a GNU-grep-style context line
+    (`file-N- text`), or None when it does not exist or is blank (a blank
+    neighbour carries no shape worth spending tokens on)."""
+    try:
+        lines = fileio.read_lines_cached(index.root / rel)
+    except OSError:
+        return None
+    if n < 1 or n > len(lines):
+        return None
+    line = lines[n - 1]
+    if not line.strip():
+        return None
+    shown = line[:200].rstrip()
+    cut = " ...[line truncated]" if len(line) > 200 else ""
+    return f"{rel}-{n}- {shown}{cut}"
+
+
+def _with_context(index, entries) -> list[str]:
+    """Flatten grep entries to lines, inserting one context line before and
+    after each hit. Entries already shown (as another hit's context, or as a
+    hit itself) are never repeated, so consecutive hits stay consecutive."""
+    emitted = {(rel, n) for rel, n, _ in entries if n is not None}
+    out: list[str] = []
+    for rel, n, text in entries:
+        if n is None:
+            out.append(text)                    # a cap/stop note
+            continue
+        if n - 1 >= 1 and (rel, n - 1) not in emitted:
+            cl = _context_line(index, rel, n - 1)
+            if cl is not None:
+                out.append(cl)
+                emitted.add((rel, n - 1))
+        out.append(text)
+        emitted.add((rel, n))
+        if (rel, n + 1) not in emitted:
+            cl = _context_line(index, rel, n + 1)
+            if cl is not None:
+                out.append(cl)
+                emitted.add((rel, n + 1))
+    return out
+
+
+def _scan_grep(index, files: list[str], rx: re.Pattern, max_hits: int,
+               rx_ci: "re.Pattern | None" = None) -> tuple[list, list]:
+    """Search `files` with `rx`, optionally collecting case-insensitive hits
+    for `rx_ci` in the SAME pass.
+
+    Returns (entries, ci_entries): lists of (rel, lineno, text) tuples, with
+    lineno None for cap/stop notes. Single-pass is the point -- the
+    case-insensitive fallback used to re-read every file from disk, doubling
+    the I/O of exactly the steps that found nothing. ci_entries is only
+    meaningful when `entries` has no real hits (the case-sensitive result
+    always wins), and collection for it stops at its own cap.
+    """
+    entries: list[tuple] = []
+    ci_entries: list[tuple] = []
     per_file_cap = max(5, max_hits // 4)
+    ci_done = False                  # ci list hit its global cap
     for rel in files:
         path = index.root / rel
         if not path.exists():
             continue
         file_hits = 0
-        for i, line in enumerate(fileio.read_lines(path), 1):
-            if not rx.search(line):
-                continue
-            if file_hits >= per_file_cap:
-                hits.append(f"{rel}: [more matches in this file; "
-                            f"grep it directly with `file` set]")
-                break
-            # Indentation is preserved: a stripped line looks editable and
-            # is not, which is how a model ends up writing SEARCH blocks
-            # that can never match.
-            shown = line[:200].rstrip()
-            cut = " ...[line truncated]" if len(line) > 200 else ""
-            unit = _enclosing_chunk(index, rel, i)
-            where = (f" [{unit.qualname}]" if unit is not None
-                     and unit.qualname != "module" else "")
-            hits.append(f"{rel}:{i}:{where} {shown}{cut}")
-            file_hits += 1
-            if len(hits) >= max_hits:
-                hits.append(f"[stopped at {max_hits} hits; narrow the pattern]")
-                return hits, True
-    return hits, False
+        ci_file_hits = 0
+        ci_note_added = False
+        for i, line in enumerate(fileio.read_lines_cached(path), 1):
+            if rx.search(line):
+                if file_hits >= per_file_cap:
+                    entries.append((rel, None,
+                                    f"{rel}: [more matches in this file; "
+                                    f"grep it directly with `file` set]"))
+                    # Breaking the file's scan is safe for the ci list too:
+                    # a per-file cap means real cs hits exist, and the ci
+                    # list is discarded whenever any cs hit was found.
+                    break
+                entries.append((rel, i, _hit_text(index, rel, i, line)))
+                file_hits += 1
+                if len(entries) >= max_hits:
+                    entries.append((rel, None,
+                                    f"[stopped at {max_hits} hits; narrow "
+                                    f"the pattern]"))
+                    return entries, ci_entries
+            elif rx_ci is not None and not ci_done and rx_ci.search(line):
+                if ci_file_hits >= per_file_cap:
+                    if not ci_note_added:
+                        ci_entries.append((rel, None,
+                                           f"{rel}: [more matches in this "
+                                           f"file; grep it directly with "
+                                           f"`file` set]"))
+                        ci_note_added = True
+                    continue
+                ci_entries.append((rel, i, _hit_text(index, rel, i, line)))
+                ci_file_hits += 1
+                if len(ci_entries) >= max_hits:
+                    ci_entries.append((rel, None,
+                                       f"[stopped at {max_hits} hits; narrow "
+                                       f"the pattern]"))
+                    ci_done = True
+    return entries, ci_entries
+
+
+def _symbol_suggestions(index, pattern: str) -> str:
+    """A free 'did you mean this symbol?' when a grep found nothing at all.
+
+    The index already knows every defined name; a pattern that misses as text
+    often IS a near-miss of a symbol name (typo, wrong case boundary, guessed
+    spelling). Substring matches come first (grep 'thresh' -> 'leech_threshold'),
+    then difflib's close matches. Returns '' when nothing is close, so a
+    natural-language miss stays a clean 'No matches'."""
+    p = (pattern or "").strip()
+    if len(p) < 3:
+        return ""
+    import difflib
+    try:
+        names = sorted({c.qualname for c in index.chunks
+                        if c.qualname not in ("module", "__trailing__")})
+    except Exception:
+        return ""
+    if not names:
+        return ""
+    low = p.lower()
+    subs = [n for n in names if low in n.lower()][:5]
+    close = difflib.get_close_matches(p, names, n=5, cutoff=0.6)
+    picks = list(dict.fromkeys(subs + close))[:5]
+    if not picks:
+        return ""
+    return ("[no text matches, but the index has similar symbol names: "
+            + ", ".join(picks)
+            + ". `read` one with `symbol` set, or see its uses with "
+              "`callers`.]")
 
 
 # --------------------------------------------------------------------------
@@ -506,7 +648,10 @@ def tool_grep(index, pattern: str, scope: str = "", max_hits: int = 40,
     Small models frequently send a literal string where a regex is expected
     (`def foo(`), or the wrong case (`RETURN`). Both are recovered instead of
     wasting the lookup: an invalid regex is searched as literal text, and a
-    case-sensitive search that finds nothing is retried case-insensitively.
+    case-sensitive search that finds nothing falls back to case-insensitive
+    hits collected in the same pass. A sparse result (a few hits) includes
+    one line of context around each hit; a total miss suggests similarly
+    named symbols from the index.
     """
     if not (pattern or "").strip():
         return ("ERROR: grep needs a `pattern` (a regex or plain text). To look "
@@ -534,15 +679,29 @@ def tool_grep(index, pattern: str, scope: str = "", max_hits: int = 40,
         return f"No indexed files to search for /{pattern}/."
 
     rx = re.compile(needle)
-    hits, _ = _scan_grep(index, files, rx, max_hits)
-    if not hits:
-        # Case-insensitive retry: the same code path, one cheap second pass.
-        rx_ci = re.compile(needle, re.IGNORECASE)
-        ci_hits, _ = _scan_grep(index, files, rx_ci, max_hits)
-        if ci_hits:
-            hits = ci_hits
-            notes.append("[note: no case-sensitive matches; retried "
-                         "case-insensitively]")
+    # The case-insensitive fallback rides along in the same pass over the
+    # files: re-reading the whole tree for a second sweep doubled the cost of
+    # exactly the greps that found nothing.
+    rx_ci = None
+    if not rx.flags & re.IGNORECASE:
+        try:
+            rx_ci = re.compile(needle, re.IGNORECASE)
+        except re.error:
+            rx_ci = None
+    entries, ci_entries = _scan_grep(index, files, rx, max_hits, rx_ci)
+    if not any(n is not None for _, n, _ in entries) \
+            and any(n is not None for _, n, _ in ci_entries):
+        entries = ci_entries
+        notes.append("[note: no case-sensitive matches; retried "
+                     "case-insensitively]")
+
+    real = [e for e in entries if e[1] is not None]
+    if real and len(real) <= SPARSE_CONTEXT_MAX:
+        hits = _with_context(index, entries)
+        notes.append("[note: few matches -- one line of context shown around "
+                     "each; a context line uses '-' where a hit uses ':']")
+    else:
+        hits = [t for _, _, t in entries]
 
     if not hits and client is not None and cfg is not None \
             and getattr(cfg, "semantic_search", False):
@@ -563,6 +722,13 @@ def tool_grep(index, pattern: str, scope: str = "", max_hits: int = 40,
                 notes.append("[semantic search found nothing above the "
                              "similarity threshold]")
 
+    if not hits:
+        # Total miss: hand the model the closest real symbol names instead of
+        # a dead end -- the index already knows them, so this costs nothing.
+        suggest = _symbol_suggestions(index, pattern)
+        if suggest:
+            notes.append(suggest)
+
     note_text = ("\n".join(notes) + "\n") if notes else ""
     if not hits:
         return note_text + f"No matches for /{pattern}/."
@@ -577,7 +743,7 @@ def _call_sites(index, chunk, base: str, limit: int = 2) -> list[str]:
     one -- and the grep warning already tells it not to edit from this."""
     path = index.root / chunk.file
     try:
-        lines = fileio.read_lines(path)
+        lines = fileio.read_lines_cached(path)
     except OSError:
         return []
     try:
@@ -656,11 +822,13 @@ def tool_callers(index, symbol: str) -> str:
 
 def tool_outline(index, cfg, file: str) -> str:
     """Return every unit (function/class/method) in one file with its
-    signature, line range, and summary.
+    signature, line range, and summary -- or, when `file` names a directory
+    or glob, the file cards of everything under it.
 
     This is the model's main navigation move on a large project: the
-    always-resident file card (see index.py) says a module exists; the
-    outline says where inside it to `read`.
+    always-resident map (file cards, or directory cards on the largest
+    projects) says something exists; the outline says where to `read` inside
+    it. The directory form is how the model descends a directory-tier map.
     """
     rel = index.resolve_file(file)
     if rel is None:
@@ -672,8 +840,49 @@ def tool_outline(index, cfg, file: str) -> str:
         if hits:
             rel = hits[0].file
     if rel is None:
+        # A directory or glob: list the file cards under it instead. "."
+        # lists the whole project (truncated) -- the escape hatch from a
+        # directory-tier map's "(root)" card.
+        name = fileio.normalise_rel(file or "").strip()
+        if name in (".", "./"):
+            return _outline_dir(index, ".", list(index.files))
+        if name:
+            matches, note = _grep_scope(index, name)
+            if not note and matches:
+                # note == "" means `name` really resolved as a file/dir/glob;
+                # a miss falls through to the file-not-found hint rather than
+                # dumping every card in the project.
+                if len(matches) == 1:
+                    rel = matches[0]
+                else:
+                    return _outline_dir(index, name, matches)
+    if rel is None:
         return _file_hint(index, file)
     return index.render_outline(rel)
+
+
+# Bounds for `outline <directory>`: enough cards to be useful, small enough
+# that one listing cannot eat the whole gathered-source budget.
+_OUTLINE_DIR_MAX_CARDS = 40
+_OUTLINE_DIR_MAX_CHARS = 8000
+
+
+def _outline_dir(index, name: str, matches: list[str]) -> str:
+    """File cards for one directory/glob -- `outline`'s second meaning, and
+    the way down from a directory-tier map to line ranges the model can
+    `read`."""
+    shown = matches[:_OUTLINE_DIR_MAX_CARDS]
+    text = index.render_cards(shown)
+    if len(text) > _OUTLINE_DIR_MAX_CHARS:
+        text = (text[:_OUTLINE_DIR_MAX_CHARS]
+                + "\n... [truncated; outline a narrower directory, or grep]")
+    extra = ""
+    if len(matches) > len(shown):
+        extra = (f"\n[+{len(matches) - len(shown)} more files not shown; "
+                 f"outline a subdirectory or grep to narrow]")
+    tail = ("\n[Directory listing: one card per file. `outline` a file for "
+            "its units; `read` straight from the line ranges shown.]")
+    return f"### {name} ({len(matches)} files)\n{text}{extra}{tail}"
 
 
 def tool_sessions(index, cfg, pattern: str = "", file: str = "",
@@ -695,6 +904,134 @@ def tool_sessions(index, cfg, pattern: str = "", file: str = "",
     return sessions.recent(index.root)
 
 
+DIFF_NOTE = ("[Diff against Pedacito's own pre-write snapshots, not git. "
+             "Historical record -- `read` a region before editing it.]")
+
+
+def _snapshot_copies(index) -> list:
+    """(rel, stamp, snapshot_path) for every file Pedacito has ever backed
+    up, newest snapshot copy per file.
+
+    Walks the backup dirs newest-first, so the first copy found for a rel is
+    its most recent 'before' state -- the diff then answers 'what changed
+    since Pedacito last touched this file' even when the last write to it was
+    several runs ago."""
+    from . import workspace
+    out: list = []
+    seen: set = set()
+    try:
+        snaps = workspace.list_backups(index.root)
+    except OSError:
+        snaps = []
+    for s in snaps:
+        try:
+            paths = sorted(s.rglob("*"))
+        except OSError:
+            continue
+        for p in paths:
+            if not p.is_file():
+                continue
+            rel = p.relative_to(s).as_posix()
+            if rel in seen:
+                continue
+            seen.add(rel)
+            out.append((rel, s.name, p))
+    out.sort()
+    return out
+
+
+def _diff_one(index, cfg, rel: str, stamp: str, snap: Path,
+              max_lines: int = 0) -> str:
+    """Unified diff of one file: its snapshot copy vs the current working
+    tree. Pure difflib -- deliberately no `git diff` subprocess, since git
+    attribute filters can execute code on checkout-adjacent operations."""
+    import difflib
+    try:
+        old, _style = fileio.read(snap, errors="replace")
+    except OSError as e:
+        return f"ERROR: could not read the snapshot of {rel}: {e}"
+    path = index.root / rel
+    if not path.is_file():
+        n = len(old.splitlines())
+        return (f"DIFF {rel} (snapshot {stamp} -> working tree): DELETED "
+                f"since the snapshot ({n} lines gone).\n{DIFF_NOTE}")
+    try:
+        new, _style = fileio.read(path, errors="replace")
+    except OSError as e:
+        return f"ERROR: could not read {rel}: {e}"
+    if old == new:
+        return f"DIFF {rel}: unchanged since snapshot {stamp}."
+    body = list(difflib.unified_diff(
+        old.splitlines(), new.splitlines(),
+        fromfile=f"snapshot/{stamp}/{rel}", tofile=f"working/{rel}",
+        lineterm="", n=3))
+    cap = int(max_lines or getattr(cfg, "max_read_lines", 200) or 200)
+    note = ""
+    if len(body) > cap:
+        body = body[:cap]
+        note = f"\n[diff truncated to {cap} lines]"
+    return (f"DIFF {rel} (snapshot {stamp} -> working tree):\n"
+            + "\n".join(body) + note + f"\n{DIFF_NOTE}")
+
+
+def tool_diff(index, cfg, file: str = "") -> str:
+    """Show what changed in the working tree since Pedacito last snapshotted
+    each file.
+
+    A read-only view of the tool's own footprint: every write path (`apply`,
+    the review page, gather's `write`/`append`/`move`/`delete`) copies each
+    original into `.pedacito/backups/<stamp>/` first, so snapshot-vs-working
+    answers "what did the previous run actually change?" without invoking
+    git. With no `file`, summarises every snapshotted file; with one, shows
+    that file's full unified diff. Gated by `allow_diff` (on by default;
+    turning it off shrinks the tool surface by one action)."""
+    if not getattr(cfg, "allow_diff", True):
+        return "ERROR: `diff` is disabled (config allow_diff = false)."
+    copies = _snapshot_copies(index)
+    if not copies:
+        return ("No Pedacito snapshots exist yet (.pedacito/backups/ is "
+                "empty). Snapshots are taken before Pedacito writes anything, "
+                "so until then there is nothing to diff against.")
+    want = fileio.normalise_rel(file or "")
+    if want:
+        rel = index.resolve_file(want) or want
+        pick = next((c for c in copies if c[0] == rel), None)
+        if pick is None:
+            known = ", ".join(r for r, _, _ in copies[:8])
+            more = f" (+{len(copies) - 8} more)" if len(copies) > 8 else ""
+            return (f"No snapshot of '{rel}' exists -- Pedacito has never "
+                    f"written that file, so there is nothing to diff. "
+                    f"Snapshotted files: {known}{more}.")
+        return _diff_one(index, cfg, *pick)
+    # No file: every snapshotted file, changed ones only, on a char budget
+    # (~40 diff lines per file) so a big apply batch cannot flood the
+    # observation.
+    budget = max(2000, int(getattr(cfg, "max_read_lines", 200) or 200) * 40)
+    out: list[str] = []
+    used = 0
+    changed = 0
+    skipped: list[str] = []
+    for rel, stamp, snap in copies:
+        text = _diff_one(index, cfg, rel, stamp, snap, max_lines=40)
+        if text.startswith(f"DIFF {rel}: unchanged"):
+            continue
+        changed += 1
+        if used + len(text) > budget and out:
+            skipped.append(rel)
+            continue
+        out.append(text)
+        used += len(text)
+    if not changed:
+        return ("No changes: every file Pedacito has snapshotted still "
+                f"matches its snapshot.\n{DIFF_NOTE}")
+    head = f"{changed} file(s) changed since Pedacito snapshotted them:"
+    if skipped:
+        out.append(f"[+{len(skipped)} more changed file(s) not shown: "
+                   + ", ".join(skipped[:8])
+                   + "; `diff` one with file=<path>]")
+    return "\n\n".join([head] + out)
+
+
 def _snapshot(index, cfg, rel: str, path: Path, original: str,
               style) -> "str | None":
     """Snapshot `original` before a mutating action.
@@ -712,6 +1049,42 @@ def _snapshot(index, cfg, rel: str, path: Path, original: str,
         return None
     except OSError as e:
         return f"ERROR: could not back up {rel}: {e}"
+
+
+def _syntax_note(path: Path, text: str) -> str:
+    """Advisory parse check on freshly written content: '' when it parses (or
+    the language is unknown), else a WARNING string.
+
+    The edit path validates and REFUSES broken syntax; the write path cannot
+    refuse -- a chunked file is legitimately unparseable until its last
+    `append` -- so it warns instead. Immediate feedback beats discovering the
+    breakage at the next test run, and the wording covers the mid-chunk case
+    so the warning does not get ignored as noise."""
+    suffix = path.suffix.lower()
+    err = None
+    if suffix == ".py":
+        import ast
+        try:
+            ast.parse(text)
+        except SyntaxError as e:
+            err = f"line {e.lineno}: {e.msg}"
+        except ValueError:
+            return ""                # null bytes etc.; not worth nagging
+    else:
+        try:
+            from .chunker_ts import LANG_BY_EXT, TS_AVAILABLE, has_syntax_error
+            if suffix in LANG_BY_EXT and TS_AVAILABLE:
+                bad, lineno = has_syntax_error(text, LANG_BY_EXT[suffix])
+                if bad:
+                    err = f"near line {lineno}"
+        except Exception:
+            return ""
+    if err is None:
+        return ""
+    return ("\n[WARNING: the file does not parse (" + err + "). Expected only "
+            "if more `append` chunks are coming; otherwise fix it before "
+            "`done` -- code that does not parse cannot run or be edited "
+            "reliably.]")
 
 
 def tool_write(index, cfg, file: str, content: str,
@@ -793,6 +1166,9 @@ def tool_write(index, cfg, file: str, content: str,
         print(f"  [write] index refresh failed for {rel}: {e}", file=sys.stderr)
 
     n = len(text.splitlines())
+    # Advisory only: a chunked file legitimately does not parse until its
+    # last append, so this warns rather than refusing (see _syntax_note).
+    syntax = _syntax_note(path, text)
     if append:
         added = len(new_text.splitlines())
         note = (f"APPENDED {added} line(s) to {rel} (now {n} lines total)."
@@ -800,7 +1176,8 @@ def tool_write(index, cfg, file: str, content: str,
         return (note + "\n[This change was applied directly, without a review "
                 "page. Undo with `pedacito restore` if it was wrong. If the "
                 "file is not complete yet, `append` the next chunk now; choose "
-                "`done` only once every part of the task is written.]")
+                "`done` only once every part of the task is written.]"
+                + syntax)
 
     note = (f"WROTE {rel} ({n} lines), replacing {len(original.splitlines())} "
             f"previous line(s)." if existed else f"CREATED {rel} ({n} lines).")
@@ -812,10 +1189,12 @@ def tool_write(index, cfg, file: str, content: str,
                 f"<={budget} lines of {rel}; repeat `append` until complete, "
                 f"then choose `done`.]"
                 + "\n[This overwrite was applied directly, without a review "
-                "page. Undo with `pedacito restore` if it was wrong.]")
+                "page. Undo with `pedacito restore` if it was wrong.]"
+                + syntax)
     return (note + "\n[This overwrite was applied directly, without a review "
             "page. Undo with `pedacito restore` if it was wrong. Now choose "
-            "`done` and summarise what you wrote.]")
+            "`done` and summarise what you wrote.]"
+            + syntax)
 
 
 def tool_append(index, cfg, file: str, content: str) -> str:
@@ -1183,6 +1562,8 @@ def dispatch(index, cfg, step: dict, client=None) -> str:
         return tool_sessions(index, cfg, step.get("pattern", ""),
                              step.get("file", ""), step.get("start", 1),
                              step.get("end", 0))
+    if action == DIFF_ACTION:
+        return tool_diff(index, cfg, step.get("file", ""))
     if action == RUN_ACTION:
         return tool_run(index, cfg, step.get("command", ""))
     if action == SCREENSHOT_ACTION:

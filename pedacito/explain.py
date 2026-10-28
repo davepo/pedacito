@@ -44,10 +44,14 @@ Rules:
   `file` empty reads that definition directly.
 - Trace data and control flow across files: use `callers` to find who calls a
   function (it also shows the call-site lines and the definitions it calls),
-  `outline` to see a file's structure, and `read` to see bodies.
+  `outline` to see a file's structure (or a directory's files, when the map
+  shows directories), and `read` to see bodies.
 - `sessions` lists or searches prior task logs. If the question is about a
   past change or the project's history, search those logs -- they record what
   earlier runs asked, read, and changed.
+- `diff` shows what changed in the working tree since Pedacito last
+  snapshotted each file -- the fastest answer to "what did the last run
+  change?". Snapshot text is historical; verify with `read`.
 - `screenshot` captures the screen and returns a text report (pixel stats,
   OCR, optional vision-model description). Use it for questions about a GUI's
   visible state; you cannot see the image itself.

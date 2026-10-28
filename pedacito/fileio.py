@@ -25,6 +25,7 @@ in the file's original style.
 
 from __future__ import annotations
 
+from collections import OrderedDict
 from pathlib import Path
 
 BOM = "\ufeff"
@@ -88,6 +89,53 @@ def read_text(path: Path, errors: str = "replace") -> str:
 def read_lines(path: Path) -> list[str]:
     """Read a file and split its LF-normalised text into lines."""
     return read_text(path).split("\n")
+
+
+# --------------------------------------------------------------------------
+# Read-mostly LRU cache
+# --------------------------------------------------------------------------
+# Keyed by (path, mtime_ns, size), so an entry can only go stale if the
+# filesystem's mtime granularity is coarser than the gap between two writes
+# of the same size (FAT-class filesystems). Callers whose output must reflect
+# the newest bytes no matter what (tool_read, the edit path) use read_lines()
+# directly; this cache serves the scan-heavy paths -- grep sweeps, call-site
+# peeks -- which re-read the same files step after step within one gather.
+_LINE_CACHE: "OrderedDict[tuple, tuple[list[str], int]]" = OrderedDict()
+_LINE_CACHE_BYTES = 0
+_LINE_CACHE_MAX_BYTES = 8_000_000
+
+
+def clear_line_cache() -> None:
+    """Drop every cached file's lines (used by tests and after big churn)."""
+    global _LINE_CACHE_BYTES
+    _LINE_CACHE.clear()
+    _LINE_CACHE_BYTES = 0
+
+
+def read_lines_cached(path: Path) -> list[str]:
+    """read_lines() backed by a bounded LRU keyed on (path, mtime_ns, size).
+
+    A file edited on disk produces a different key, so the next read sees the
+    new bytes; the old entry ages out of the LRU. The returned list is SHARED
+    with the cache -- callers must not mutate it."""
+    global _LINE_CACHE_BYTES
+    p = Path(path)
+    try:
+        st = p.stat()
+    except OSError:
+        return read_lines(p)          # let the caller see the real error
+    key = (str(p), st.st_mtime_ns, st.st_size)
+    hit = _LINE_CACHE.get(key)
+    if hit is not None:
+        _LINE_CACHE.move_to_end(key)
+        return hit[0]
+    lines = read_lines(p)
+    _LINE_CACHE[key] = (lines, st.st_size)
+    _LINE_CACHE_BYTES += st.st_size
+    while _LINE_CACHE_BYTES > _LINE_CACHE_MAX_BYTES and len(_LINE_CACHE) > 1:
+        _, (_, size) = _LINE_CACHE.popitem(last=False)
+        _LINE_CACHE_BYTES -= size
+    return lines
 
 
 def write(path: Path, text: str, style: TextStyle | None = None) -> None:
