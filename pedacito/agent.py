@@ -1191,11 +1191,11 @@ class Agent:
             # gets cut off at the provider cap mid-block. Override it.
             rename_refusals = [r for r in failures
                                if "placeholder comment" in r.message]
-            extra = ""
+            extras: list[str] = []
             if rename_refusals:
                 names = ", ".join(sorted({r.file for r in rename_refusals}))
-                extra = (
-                    f"\n\nRENAME PROTOCOL FOR {names}: these creations were "
+                extras.append(
+                    f"RENAME PROTOCOL FOR {names}: these creations were "
                     "refused because they are placeholders with no matching "
                     "clearing block. Do NOT copy any file contents into your "
                     "reply -- a whole-file SEARCH would be cut off by the "
@@ -1208,6 +1208,25 @@ class Agent:
                     "and its REPLACE must be EMPTY -- Pedacito recognises the "
                     "pair and moves the entire real file itself.\n"
                     "Keep this reply tiny: four blocks total, nothing else.")
+            if any("search block not found" in r.message for r in failures):
+                # An anchor miss on an existing file is very often a botched
+                # WHOLE-FILE rewrite (typically a stub implementation): the
+                # model quoted the old contents from memory -- or translated
+                # them into what the file should contain -- and no exact or
+                # fuzzy anchor survives. The base instruction below ("copy
+                # the SEARCH text exactly") then steers it straight back into
+                # the same wall, and a small model answers with prose and
+                # burns the round. Offer the supported way out instead: an
+                # empty SEARCH replaces the whole file, needing no quote of
+                # the old text at all.
+                extras.append(
+                    "WHOLE-FILE REWRITE: if one of these edits was meant to "
+                    "replace an entire file (typically implementing a stub), "
+                    "do NOT re-quote its old contents -- that is what just "
+                    "failed. Emit exactly one block for that file with an "
+                    "EMPTY SEARCH section (nothing between <<<<<<< SEARCH "
+                    "and =======) and the complete new content in REPLACE.")
+            extra = ("\n\n" + "\n\n".join(extras)) if extras else ""
             reply = self.client.chat(
                 [
                     {"role": "system", "content": ANSWER_SYSTEM},
@@ -1217,15 +1236,49 @@ class Agent:
                         f"YOUR PREVIOUS EDIT BLOCKS THAT FAILED:\n{prev_blocks}\n\n"
                         f"These edits could not be applied:\n{fb}{extra}\n\n"
                         "Output ONLY the corrected search/replace blocks for the "
-                        "failed edits -- do not repeat edits that already worked, "
-                        "do not rewrite whole files. Copy the SEARCH text exactly "
-                        "from the SOURCE above, byte for byte, keeping its real "
-                        "indentation (ignore the line-number prefixes). Do not ask "
-                        "for more context -- the source you need is provided."},
+                        "failed edits -- do not repeat edits that already worked. "
+                        "Except where a note above says otherwise, copy the "
+                        "SEARCH text exactly from the SOURCE above, byte for "
+                        "byte, keeping its real indentation (ignore the "
+                        "line-number prefixes), and keep every block small. Do "
+                        "not ask for more context -- the source you need is "
+                        "provided."},
                 ],
                 max_tokens=self.cfg.max_tokens_answer,
                 stream=True,
             )
+            if getattr(self.client, "stream_truncated", False):
+                reply = self._trim_dangling_block(reply)
+            if not parse_edits(reply) \
+                    and getattr(self.client, "stream_truncated", False):
+                # Cut off before the first block closed: a token-limit
+                # casualty, not a refusal. Unlike the prose case below, one
+                # smaller re-ask plausibly lands -- the empty-SEARCH
+                # whole-file form needs no re-quoting of the old text, so it
+                # fits caps the full quote-and-replace reply outran.
+                print("[repair reply was cut off mid-block; re-asking for "
+                      "one small block]", file=sys.stderr)
+                reply = self.client.chat(
+                    [
+                        {"role": "system", "content": ANSWER_SYSTEM},
+                        {"role": "user", "content":
+                            f"SOURCE (current contents of the files that failed)\n\n{src_slice}\n\n"
+                            f"TASK\n{task}\n\n"
+                            "Your previous reply was CUT OFF by the output "
+                            "token limit before it finished one edit block, "
+                            "so nothing was saved. Emit exactly ONE "
+                            "corrected block now -- nothing else. For a "
+                            "whole-file rewrite, use an EMPTY SEARCH section "
+                            "(nothing between <<<<<<< SEARCH and =======) "
+                            "and put the new content in REPLACE; never "
+                            "re-type the old content. Blocks only, no "
+                            "explanation."},
+                    ],
+                    max_tokens=self.cfg.max_tokens_answer,
+                    stream=True,
+                )
+                if getattr(self.client, "stream_truncated", False):
+                    reply = self._trim_dangling_block(reply)
             if not parse_edits(reply):
                 # The model answered with prose instead of blocks (the classic
                 # small-model "I need a read first" reply). Re-sending the same

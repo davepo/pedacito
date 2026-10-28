@@ -434,9 +434,13 @@ Edits are search/replace blocks anchored on text the model actually read:
 
 A block either matches the file exactly or it fails cleanly — no partial or
 silent corruption. Every edit is validated before anything is written
-(`ast.parse()` for Python, `tree-sitter` for JS/TS/Ruby), and a failed block's
-error is fed back to the model (up to two rounds) so it can re-anchor with more
-context.
+(`ast.parse()` for Python, `tree-sitter` for JS/TS/Ruby): an edit that breaks
+a clean file is refused, while an edit to a file that already failed to parse
+*before* the edit is applied with a loud warning — refusing those would lock
+broken files in their broken state forever. A failed block's error is fed back
+to the model (up to two rounds) so it can re-anchor with more context, and the
+repair prompt offers an empty-SEARCH whole-file rewrite when a block could not
+be anchored at all.
 
 ## Review page
 

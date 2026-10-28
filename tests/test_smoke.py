@@ -308,6 +308,60 @@ def test_empty_search_overwrites_existing_file(tmp_path):
     assert "raise NotImplementedError" not in (tmp_path / "assets.py").read_text()
 
 
+def test_edit_of_already_broken_file_applies_with_warning(tmp_path):
+    """A file that does not parse BEFORE the edit (a stub written in the wrong
+    language, a half-finished chunked write) can never be healed under the old
+    "an edit must produce parsing text" rule: every incremental fix
+    "produces" a file that still does not parse and was refused, locking the
+    file in its broken state forever. Such edits are written with a loud
+    warning instead. Clean files keep the full refusal, and a broken
+    CREATION is still aborted -- new files have no excuse."""
+    _write(tmp_path / "broken.py", "def f(:\n    pass\n")
+    reply = ("--- FILE: broken.py\n<<<<<<< SEARCH\ndef f(:\n=======\n"
+             "def f(::\n>>>>>>> REPLACE\n")
+    results = edits.apply_edits(tmp_path, edits.parse_edits(reply),
+                                backup=False, dry_run=False)
+    assert results[0].ok, results[0].message
+    assert "WARNING" in results[0].message
+    assert "does not parse" in results[0].message
+    assert (tmp_path / "broken.py").read_text() == "def f(::\n    pass\n"
+
+    # A CLEAN file broken by the edit is still refused and left untouched.
+    _write(tmp_path / "clean.py", "x = 1\n")
+    reply = ("--- FILE: clean.py\n<<<<<<< SEARCH\nx = 1\n=======\nx = (\n"
+             ">>>>>>> REPLACE\n")
+    results = edits.apply_edits(tmp_path, edits.parse_edits(reply),
+                                backup=False, dry_run=False)
+    assert not results[0].ok
+    assert "not written" in results[0].message
+    assert (tmp_path / "clean.py").read_text() == "x = 1\n"
+
+    # A creation that does not parse is still aborted outright.
+    reply = ("--- FILE: new.py\n<<<<<<< SEARCH\n=======\ndef f(:\n"
+             ">>>>>>> REPLACE\n")
+    results = edits.apply_edits(tmp_path, edits.parse_edits(reply),
+                                backup=False, dry_run=False)
+    assert not results[0].ok
+    assert "creation aborted" in results[0].message
+    assert not (tmp_path / "new.py").exists()
+
+
+def test_unanchored_block_message_offers_empty_search_path(tmp_path):
+    """The "search block not found" message is echoed verbatim to the model
+    in the repair round, and the dominant real-world cause is a botched
+    WHOLE-FILE rewrite (implementing a stub the model quoted from memory or
+    translated into another language). The message itself must point at the
+    supported escape hatch: an empty SEARCH replaces the entire file."""
+    _write(tmp_path / "a.py", "x = 1\n")
+    reply = ("--- FILE: a.py\n<<<<<<< SEARCH\ny = 999\n=======\nx = 2\n"
+             ">>>>>>> REPLACE\n")
+    results = edits.apply_edits(tmp_path, edits.parse_edits(reply),
+                                backup=False, dry_run=True)
+    assert not results[0].ok
+    assert "search block not found" in results[0].message
+    assert "EMPTY SEARCH" in results[0].message
+
+
 def test_apply_continues_when_model_defers(tmp_path):
     """A model that cleanly finishes with "the rest follows in the next turn"
     (rather than truncating) must trigger a follow-up turn -- otherwise a
@@ -417,6 +471,82 @@ def test_apply_reasks_when_truncated_before_any_block(tmp_path):
     assert "return 42" in (tmp_path / "a.py").read_text()
     assert client.prompts, "a cut-off reply with no complete block must re-ask"
     assert "CUT OFF" in client.prompts[0]
+
+
+def test_repair_prompt_offers_whole_file_rewrite(tmp_path):
+    """A locate miss on an existing file is very often a botched whole-file
+    rewrite: the model implementing a stub quoted the old contents from
+    memory -- or translated them into the language the file SHOULD be in --
+    so no exact or fuzzy anchor survives. The base repair instruction ("copy
+    the SEARCH text exactly") then steers it straight back into the same
+    wall and a small model answers with prose. The repair prompt must offer
+    the empty-SEARCH overwrite path whenever a block could not be anchored."""
+    from pedacito import index as index_mod
+    _write(tmp_path / "stub.js", "class A:\n    def run(self):\n        pass\n")
+    idx = index_mod.Index(tmp_path, [])
+
+    class StubClient:
+        stream_truncated = False
+        def __init__(self):
+            self.prompts = []
+        def chat(self, messages, max_tokens, schema=None, stream=False, **kw):
+            self.prompts.append("\n".join(m["content"] for m in messages))
+            return "I cannot anchor that block."     # prose: repair gives up
+
+    client = StubClient()
+    agent = Agent(idx, client, config_mod.Config())
+    reply = ("--- FILE: stub.js\n<<<<<<< SEARCH\nclass A {\n    run() {}\n"
+             "}\n=======\nclass A {\n    run() { return 1; }\n}\n"
+             ">>>>>>> REPLACE\n")
+    results, _ = agent.apply(reply, dry_run=False,
+                             task="implement stub.js", gathered="")
+    assert not results[0].ok
+    assert client.prompts, "no repair round happened"
+    prompt = client.prompts[0]
+    assert "WHOLE-FILE REWRITE" in prompt
+    assert "EMPTY SEARCH" in prompt
+    # The base instruction must defer to the notes instead of contradicting
+    # them ("do not rewrite whole files" used to cancel the hint out).
+    assert "Except where a note above says otherwise" in prompt
+
+
+def test_truncated_repair_reply_gets_one_reask(tmp_path):
+    """A repair reply cut off before its first block closes is a token-limit
+    casualty, not a refusal: unlike the prose case (where re-sending cannot
+    plausibly end differently), one smaller re-ask plausibly lands -- the
+    empty-SEARCH whole-file form needs no re-quoting of the old text. apply()
+    must tell the two apart: re-ask on truncation, stop on prose."""
+    from pedacito import index as index_mod
+    _write(tmp_path / "stub.js", "class A {\n    run() {}\n}\n")
+    idx = index_mod.Index(tmp_path, [])
+
+    class StubClient:
+        def __init__(self):
+            self.prompts = []
+            self.stream_truncated = False
+        def chat(self, messages, max_tokens, schema=None, stream=False, **kw):
+            self.prompts.append("\n".join(m["content"] for m in messages))
+            if len(self.prompts) == 1:
+                # First repair reply: cut off mid-block, before any REPLACE.
+                self.stream_truncated = True
+                return ("--- FILE: stub.js\n<<<<<<< SEARCH\n=======\n"
+                        "class A {\n    run() { return 4")
+            self.stream_truncated = False
+            return ("--- FILE: stub.js\n<<<<<<< SEARCH\n=======\n"
+                    "class A {\n    run() { return 42; }\n}\n"
+                    ">>>>>>> REPLACE\n")
+
+    client = StubClient()
+    agent = Agent(idx, client, config_mod.Config())
+    reply = ("--- FILE: stub.js\n<<<<<<< SEARCH\nclass Missing {\n"
+             "=======\nclass A {\n    run() { return 1; }\n}\n"
+             ">>>>>>> REPLACE\n")
+    results, _ = agent.apply(reply, dry_run=False,
+                             task="implement stub.js", gathered="")
+    assert len(client.prompts) == 2, "truncated repair did not trigger a re-ask"
+    assert "CUT OFF" in client.prompts[1]
+    assert any(r.ok for r in results), [r.message for r in results]
+    assert "return 42" in (tmp_path / "stub.js").read_text()
 
 
 # ------------------------------------------------------------------ budgets
@@ -1426,6 +1556,84 @@ def test_build_interface_fixes_contract_in_one_call(tmp_path):
     scaffold.apply_skeleton(tmp_path, plan, dry_run=False,
                             verbose=False, stubs=stubs)
     assert "parse_markdown" in (tmp_path / "parser.py").read_text()
+
+
+def test_stub_language_error_flags_wrong_language():
+    """The interface call answers for the whole plan in one reply, and small
+    models drift: the classic failure is Python stubs (class X: + def +
+    docstrings) for a plan's .js frontend files, because the scaffold is a
+    Python project. _stub_language_error is the deterministic net that
+    catches the drift before it poisons every later build task."""
+    from pedacito import scaffold
+    from pedacito.chunker_ts import TS_AVAILABLE
+
+    # Valid stubs in their own language pass.
+    assert scaffold._stub_language_error(
+        "main.py", "def main():\n    pass\n") is None
+    assert scaffold._stub_language_error(
+        "app.js", "class App {\n    run() {}\n}\n") is None
+    # Broken Python is caught without tree-sitter.
+    assert scaffold._stub_language_error("main.py", "def main(:\n") is not None
+    # Python syntax in a .js file is the classic drift.
+    if TS_AVAILABLE:
+        why = scaffold._stub_language_error(
+            "app.js",
+            'class App:\n    """doc"""\n\n    def run(self):\n        pass\n')
+        assert why and "javascript" in why
+    # Extensions with no checker are trusted as-is.
+    assert scaffold._stub_language_error("notes.gemini", "=> / link\n") is None
+
+
+def test_build_interface_retries_wrong_language_stubs(tmp_path):
+    """A wrong-language stub is worse than no stub: the implementer cannot
+    anchor SEARCH blocks against text its own syntax checker calls invalid.
+    build_interface validates every stub against its extension, retries the
+    bad ones once (same names, right language), and drops whatever still
+    fails so the file falls back to its header comment and its build task
+    creates it from scratch with an empty SEARCH."""
+    from pedacito import scaffold
+    from pedacito.chunker_ts import TS_AVAILABLE
+
+    calls = []
+
+    class Stub:
+        def chat_json(self, messages, schema, max_tokens=0, **kw):
+            calls.append(messages[-1]["content"])
+            if len(calls) == 1:
+                return {"files": [
+                    {"path": "main.py",
+                     "code": "def main():\n    \"\"\"run\"\"\"\n    raise NotImplementedError\n"},
+                    {"path": "static/app.js",
+                     "code": "class App:\n    \"\"\"the app\"\"\"\n\n    def run(self):\n        pass\n"},
+                    {"path": "static/broken.js",
+                     "code": "def also_wrong():\n    pass\n"},
+                ]}
+            # The retry fixes app.js but leaves broken.js wrong-language.
+            return {"files": [
+                {"path": "static/app.js",
+                 "code": "class App {\n    run() {\n        throw new Error(\"not implemented\");\n    }\n}\n"},
+                {"path": "static/broken.js",
+                 "code": "def still_wrong():\n    pass\n"},
+            ]}
+
+    plan = scaffold.Plan("game", "y", files=[
+        scaffold.PlannedFile("main.py", "entry"),
+        scaffold.PlannedFile("static/app.js", "app"),
+        scaffold.PlannedFile("static/broken.js", "bad"),
+    ], spec=scaffold.Spec("y"))
+    stubs = scaffold.build_interface(plan, Stub(), config_mod.Config(),
+                                     verbose=False)
+    assert stubs["main.py"].startswith("def main()")
+    if TS_AVAILABLE:
+        assert len(calls) == 2, "wrong-language stubs did not trigger a retry"
+        assert "WRONG LANGUAGE" in calls[1]
+        assert "static/app.js" in calls[1]
+        assert stubs["static/app.js"].startswith("class App {"), \
+            "the retried stub did not replace the wrong-language one"
+        assert "static/broken.js" not in stubs, \
+            "a stub still wrong-language after the retry must be dropped"
+    else:
+        assert len(calls) == 1, "no JS grammar: nothing is checked or retried"
 
 
 

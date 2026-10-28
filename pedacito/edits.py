@@ -715,6 +715,19 @@ def apply_edits(root: Path, edits: list[Edit], backup: bool = True,
         # "moved from old.py" line), and skipped checking the moved content
         # entirely.
         err = _validate(path, text)
+        if err and original is not None and _validate(path, original):
+            # The file did not parse BEFORE this edit either -- a stub written
+            # in the wrong language, a chunked write mid-stream, a broken
+            # file the task is about to fix. Refusing every edit of an
+            # already-broken file locks it in that state forever: each
+            # incremental repair "produces" a file that still does not parse,
+            # so the model can never chip away at the damage. Apply with a
+            # loud warning instead; backups and the review page still cover
+            # the change. A CLEAN file that an edit breaks is still refused.
+            err = None
+            note += (" [WARNING: this file does not parse -- it did not "
+                     "before this edit either, so the edit was applied "
+                     "anyway; finish fixing its syntax before relying on it]")
         if err:
             verb = "creation aborted" if original is None else "not written"
             return Result(False, rel, f"edit produced {err}; {verb}",
@@ -910,7 +923,11 @@ def apply_edits(root: Path, edits: list[Edit], backup: bool = True,
             span = locate(text, e.search, cfg, replacement=e.replace)
             if span is None:
                 n = text.count(e.search)
-                why = ("search block not found -- it must match the file exactly"
+                why = ("search block not found -- it must match the file "
+                       "exactly. If this block was meant to replace the "
+                       "WHOLE file, do not quote the old text at all: emit "
+                       "one block for the file with an EMPTY SEARCH section "
+                       "(nothing between <<<<<<< SEARCH and =======)"
                        if n == 0 else
                        f"search block appears {n} times -- include more surrounding lines")
                 results.append(Result(False, rel, f"block {k}: {why}"))

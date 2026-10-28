@@ -97,6 +97,14 @@ docstring. Bodies must be `pass`, or `raise NotImplementedError` for functions
 that must return a value. Include the imports each file needs. Do NOT implement
 any body -- signatures only.
 
+Write each file's stub in the language its file extension demands: `.py` files
+get Python, but a `.js`/`.mjs` file must contain valid JavaScript (ES6
+`class`/`function`, `//` comments, bodies that `throw new Error("not
+implemented")`) -- NEVER Python `def`, `class X:` or triple-quoted docstrings
+in a `.js` file, and likewise for any other extension. Every stub is
+syntax-checked against its extension; a wrong-language stub is discarded,
+leaving that file with no contract for the build passes.
+
 This single reply is the contract every later file is implemented against, so
 the names must be consistent: a name imported in one file must be defined with
 exactly that spelling in the file that exports it. Prefer simple, obvious names
@@ -369,6 +377,37 @@ def build_plan(spec: Spec, client, cfg, root: Path, verbose: bool = True) -> Pla
     return plan
 
 
+def _stub_language_error(rel: str, code: str) -> "str | None":
+    """Why `code` is not syntactically valid for `rel`'s extension, or None.
+
+    The interface call answers for the WHOLE plan in one reply, and small
+    models drift: the classic failure is Python stubs (`class X:` + `def` +
+    docstrings) for a plan's .js frontend files, because the prompt says
+    "Python project". Those stubs poison every later build task -- the
+    implementer model translates what it reads, cannot anchor a SEARCH block
+    against the real bytes, and the per-extension syntax check rejects any
+    result that keeps them. Catching the mismatch here, at generation time,
+    is the cheap end of the problem. Extensions with no available checker
+    are trusted as-is."""
+    ext = Path(rel).suffix.lower()
+    if ext == ".py":
+        import ast
+        try:
+            ast.parse(code)
+        except (SyntaxError, ValueError) as e:
+            return f"not valid Python ({getattr(e, 'msg', e)})"
+        return None
+    try:
+        from .chunker_ts import LANG_BY_EXT, TS_AVAILABLE, has_syntax_error
+        if TS_AVAILABLE and ext in LANG_BY_EXT:
+            bad, lineno = has_syntax_error(code, LANG_BY_EXT[ext])
+            if bad:
+                return f"not valid {LANG_BY_EXT[ext]} (near line {lineno})"
+    except Exception:
+        return None
+    return None
+
+
 def build_interface(plan: Plan, client, cfg, verbose: bool = True) -> dict[str, str]:
     """Fix the public API of every source file in ONE call, so the later
     per-file build only fills bodies against known signatures instead of
@@ -399,8 +438,56 @@ def build_interface(plan: Plan, client, cfg, verbose: bool = True) -> dict[str, 
         code = str(entry.get("code", ""))
         if rel and code.strip():
             out[rel] = code
+
+    # Language check: a stub that does not parse in its own extension's
+    # language (Python syntax in a .js file, the classic drift) is worse than
+    # no stub -- see _stub_language_error. One targeted retry keeps the API
+    # contract consistent (same names, right language); whatever still fails
+    # is dropped, so the file falls back to its one-line header comment and
+    # its build task creates it from scratch with an empty SEARCH.
+    bad: dict[str, str] = {}
+    for rel, code in out.items():
+        why = _stub_language_error(rel, code)
+        if why:
+            bad[rel] = why
+    if bad:
+        listed = "\n".join(f"  {rel}  ({why})"
+                           for rel, why in sorted(bad.items()))
+        if verbose:
+            print(f"  [interface: {len(bad)} stub(s) in the wrong language, "
+                  f"retrying: {', '.join(sorted(bad))}]", file=sys.stderr)
+        try:
+            raw2 = client.chat_json(
+                [{"role": "system", "content": INTERFACE_SYSTEM},
+                 {"role": "user", "content":
+                     "These stubs from your previous reply are written in "
+                     "the WRONG LANGUAGE for their file extension:\n"
+                     f"{listed}\n\nRewrite ONLY these files, each in the "
+                     "language its extension demands (a .js file must be "
+                     "valid JavaScript), keeping the same names and "
+                     "signatures."}],
+                INTERFACE_SCHEMA,
+                max_tokens=getattr(cfg, "max_tokens_build", 16000),
+                disable_thinking=True)
+            for entry in raw2.get("files") or []:
+                if not isinstance(entry, dict):
+                    continue
+                rel = fileio.normalise_rel(str(entry.get("path", "")))
+                code = str(entry.get("code", ""))
+                if rel in bad and code.strip() \
+                        and not _stub_language_error(rel, code):
+                    out[rel] = code
+                    bad.pop(rel)
+        except Exception as e:
+            if verbose:
+                print(f"  [interface language retry failed: {str(e)[:200]}]",
+                      file=sys.stderr)
+        for rel in bad:
+            out.pop(rel, None)
     if verbose:
-        print(f"  interface: {len(out)} file(s) with signature stubs",
+        print(f"  interface: {len(out)} file(s) with signature stubs"
+              + (f" [{len(bad)} wrong-language stub(s) dropped: "
+                 + ", ".join(sorted(bad)) + "]" if bad else ""),
               file=sys.stderr)
     return out
 
