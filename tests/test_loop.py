@@ -62,9 +62,15 @@ def test_investigation_tasks_are_recognised():
         "Reproduce the black screen by running main.py")
     assert loop._is_investigation_task("Locate the cause of the crash")
     assert loop._is_investigation_task("Check the render path")
+    assert loop._is_investigation_task(
+        "Audit the current game code to identify which of the seven requested "
+        "enhancements are already implemented and working")
+    assert loop._is_investigation_task("Assess which endpoints are covered")
+    assert loop._is_investigation_task("Report what the scheduler does")
     assert not loop._is_investigation_task("Fix the black screen")
     assert not loop._is_investigation_task("Reproduce and fix the crash")
     assert not loop._is_investigation_task("Implement the parser")
+    assert not loop._is_investigation_task("Audit and fix the collision logic")
 
 
 def test_tool_call_only_answer_is_detected():

@@ -78,6 +78,15 @@ _INVESTIGATE_START = (
     "reproduce", "investigate", "diagnose", "analyze", "analyse", "inspect",
     "trace", "locate", "find", "confirm", "check", "verify", "review",
     "profile", "explain", "identify", "determine", "observe", "test",
+    # Reporting/survey verbs the planner can emit for a "look at the code
+    # first" step. "Audit ... to identify which of X are already working" is
+    # the canonical case: it must be answered as a report, not forced through
+    # the edit path (which, via the no-edit recovery, made the model rewrite
+    # PLAN.md with its findings instead of moving on to the implementation
+    # tasks). The edit-word guard below still keeps any title that also says
+    # "fix"/"implement"/"add" on the edit path.
+    "audit", "assess", "evaluate", "report", "summarize", "summarise",
+    "list", "enumerate",
 )
 # If any of these appear, the task also changes code and must stay on the edit
 # path ("Reproduce and fix the crash", "Locate and update the config").

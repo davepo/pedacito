@@ -152,11 +152,32 @@ class Matcher:
 # --------------------------------------------------------------------------
 # Cycle-safe directory walk
 # --------------------------------------------------------------------------
+def is_venv_dir(path: Path) -> bool:
+    """True when `path` is the root of a Python virtual environment.
+
+    Both ``venv`` and ``virtualenv`` drop a ``pyvenv.cfg`` file at the
+    environment root, whatever the directory is named (``.venv``, ``venv``,
+    ``env``, ``pdc_venv``, ...). Matching that marker catches names the
+    ``DEFAULT_IGNORE`` list cannot, so a venv that lives INSIDE the project is
+    never walked: its ``site-packages`` (Flask and every other pip dependency)
+    is a dependency, not project code, and indexing it would flood the map and
+    invite the model to "helpfully" edit third-party sources.
+    """
+    try:
+        return (path / "pyvenv.cfg").is_file()
+    except OSError:
+        return False
+
+
 def _walk(path: Path) -> list[Path]:
     """Return every file under `path`, descending into symlinked directories
     (unlike `Path.rglob`, which treats a symlinked directory as a leaf and
     never looks inside it) while never re-entering a directory already
     visited in this walk.
+
+    Python virtual environments (detected by their ``pyvenv.cfg`` marker) are
+    skipped entirely, so a venv with a non-standard name sitting inside the
+    project does not drag its ``site-packages`` into the index.
 
     A directory is identified by its resolved ("real") path, so a cycle --
     a symlink pointing back at an ancestor, or two different routes to the
@@ -181,6 +202,8 @@ def _walk(path: Path) -> list[Path]:
             continue
         for entry in entries:
             if entry.is_dir():
+                if is_venv_dir(entry):
+                    continue
                 stack.append(entry)
             elif entry.is_file():
                 files.append(entry)

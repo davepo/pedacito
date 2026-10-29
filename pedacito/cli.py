@@ -35,7 +35,7 @@ from .config import (Config, ConfigError, REFERENCE_TEMPLATE,
                      USER_CONFIG, auto_fit, find_project_config,
                      interactive_setup, load as load_config, write_template)
 from .llm import LMStudio, LLMError, estimate_tokens
-from .select import CODE_EXTS, REFERENCE_EXTS, Matcher, select
+from .select import CODE_EXTS, REFERENCE_EXTS, Matcher, is_venv_dir, select
 
 
 # --------------------------------------------------------------------------
@@ -514,9 +514,16 @@ def _cmd_auto(args, cfg, client, idx, root: Path) -> int:
     if args.apply and (verify or smoke):
         skip = {".pedacito", "__pycache__", ".venv", "venv",
                 "node_modules", ".git"}
+
+        def _under_venv(p: Path) -> bool:
+            """True when `p` sits under a Python virtualenv (pyvenv.cfg marker),
+            so a venv with a non-standard name inside the project is not fed to
+            the smoke checker as if its site-packages were project code."""
+            return any(is_venv_dir(parent) for parent in p.parents)
+
         py_rels = sorted(
             p.relative_to(root).as_posix() for p in root.rglob("*.py")
-            if not (set(p.parts) & skip))
+            if not (set(p.parts) & skip) and not _under_venv(p))
         v_ok, v_out = scaffold.verify_and_fix(
             client, cfg, idx, py_rels, root.name, None,
             explicit_cmd=verify,
