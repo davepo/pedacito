@@ -116,8 +116,15 @@ def read(root, name: str, start: int = 1, end: int = 0,
         return f"ERROR: could not read {p.name}: {e}"
     if lines and lines[-1] == "" and len(lines) > 1:
         lines = lines[:-1]
-    start = max(1, int(start or 1))
-    end = int(end or 0) or len(lines)
+
+    def _int(value, default):
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return default
+
+    start = max(1, _int(start, 1))
+    end = _int(end, 0) or len(lines)
     end = min(end, len(lines))
     if start > len(lines):
         return f"ERROR: {p.name} has only {len(lines)} lines."

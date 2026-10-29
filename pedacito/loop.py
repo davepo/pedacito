@@ -395,14 +395,40 @@ def _report(results, dry_run: bool):
 _READ_INVOKE_RE = re.compile(
     r"<invoke\b[^>]*name\s*=\s*['\"]?read['\"]?[^>]*>(.*?)</invoke>",
     re.DOTALL | re.IGNORECASE)
+# A reply can be cut off before the closing tag (the exact case that made a
+# model spin: `<tool_call>read` repeated with no `</tool_call>`), so match up
+# to the next opening tag or end-of-reply rather than requiring closure.
 _READ_TOOLCALL_RE = re.compile(
-    r"<tool_call>(.*?)</tool_call>", re.DOTALL | re.IGNORECASE)
+    r"<tool_call>(.*?)(?=</tool_call>|<tool_call>|\Z)",
+    re.DOTALL | re.IGNORECASE)
+# Qwen-style native tool calls often use a bare <read> wrapper and a
+# <file_path> tag rather than Anthropic's <invoke>/<parameter> pair.
+_READ_BLOCK_RE = re.compile(
+    r"<read\b[^>]*>(.*?)(?=</read>|<read\b|\Z)",
+    re.DOTALL | re.IGNORECASE)
 _FILEPATH_PARAM_RE = re.compile(
     r"<parameter\b[^>]*name\s*=\s*['\"]file_path['\"][^>]*>\s*(.*?)\s*</parameter>",
     re.DOTALL | re.IGNORECASE)
 _FILEPATH_EQ_PARAM_RE = re.compile(
     r"<parameter\s*=\s*file_path>\s*(.*?)\s*</parameter>",
     re.DOTALL | re.IGNORECASE)
+_FILEPATH_TAG_RE = re.compile(
+    r"<file_path\b[^>]*>\s*(.*?)\s*(?:</file_path>|(?=<)|\Z)",
+    re.DOTALL | re.IGNORECASE)
+
+
+def _file_param(body: str) -> str:
+    """First file path in a tool-call body, across the common dialects."""
+    for rx in (_FILEPATH_PARAM_RE, _FILEPATH_EQ_PARAM_RE, _FILEPATH_TAG_RE):
+        m = rx.search(body or "")
+        if m:
+            path = m.group(1).strip().strip("`'\" \t\r\n")
+            # A degenerate reply can repeat one path for tens of thousands of
+            # characters. That is not a real request; do not carry it into a
+            # recovery prompt (and do not hand it to Path.resolve()).
+            return path if len(path) <= 1000 else ""
+    return ""
+
 
 _MAX_RECOVERY_ROUNDS = 2
 _MAX_RECOVERY_FILES = 4
@@ -415,16 +441,27 @@ def _read_requests(reply: str) -> list[str]:
     in reply order and de-duplicated. Empty when the reply has none."""
     found: list[tuple[int, str]] = []
     for m in _READ_INVOKE_RE.finditer(reply):
-        p = _FILEPATH_PARAM_RE.search(m.group(1))
-        if p:
-            found.append((m.start(), p.group(1).strip()))
+        path = _file_param(m.group(1))
+        if path:
+            found.append((m.start(), path))
     for m in _READ_TOOLCALL_RE.finditer(reply):
         body = m.group(1)
-        if not re.search(r"function\s*=\s*read\b", body, re.IGNORECASE):
+        # Accept both `<function=read>`/JSON `"name": "read"` and the bare
+        # `<read>` wrapper a degraded reply emits. A body that names another
+        # tool is skipped so a requested write is not mistaken for a read.
+        if not re.search(r"function\s*=\s*read\b|<read\b|"
+                         r"['\"]name['\"]\s*:\s*['\"]read['\"]",
+                         body, re.IGNORECASE):
             continue
-        p = _FILEPATH_EQ_PARAM_RE.search(body)
-        if p:
-            found.append((m.start(), p.group(1).strip()))
+        path = _file_param(body)
+        if path:
+            found.append((m.start(), path))
+    # A bare <read> block without a <tool_call> wrapper (Qwen's native shape
+    # in the reported runaway output).
+    for m in _READ_BLOCK_RE.finditer(reply):
+        path = _file_param(m.group(1))
+        if path:
+            found.append((m.start(), path))
     seen: set[str] = set()
     uniq = []
     for _, path in sorted(found):
@@ -504,8 +541,8 @@ def _recover_no_edit_reply(root: Path, cfg, agent, task: str, gathered: str,
                   + "below.")
         task2 = (task + "\n\n"
                  "Your previous reply contained no edit blocks"
-                 + (" (it only emitted tool-call requests, which cannot run "
-                    "in this phase)" if extra else "")
+                 + (" (it only asked to read more files, which cannot be "
+                    "fetched in this phase)" if extra else "")
                  + ". Produce the edit blocks now.")
         src = (gathered or "").strip()
         if extra:
@@ -561,7 +598,7 @@ Do not emit search/replace blocks. Be concrete and concise; if the evidence is
 inconclusive, say what is still unknown and what to check next.
 """
 
-_TOOL_SYNTAX = ("<tool_call", "<invoke", "<function=", '"name":')
+_TOOL_SYNTAX = ("<tool_call", "<invoke", "<function=", "<read", '"name":')
 
 
 def _looks_like_tool_calls_only(reply: str) -> bool:
@@ -573,9 +610,16 @@ def _looks_like_tool_calls_only(reply: str) -> bool:
     low = (reply or "").lower()
     if not low.strip() or not any(t in low for t in _TOOL_SYNTAX):
         return False
+    # A runaway reply can be mostly a giant repeated PATH, which the old
+    # word-count heuristic mistook for prose. Strip tags, paths, and JSON
+    # punctuation first; then a few repeated tool-call opens are enough.
+    opens = len(re.findall(r"<tool_call\b|<invoke\b|<function\s*=", reply,
+                           re.IGNORECASE))
     plain = re.sub(r"<[^>]+>", " ", reply)
+    plain = re.sub(r"\S*[/\\]\S*", " ", plain)      # paths
     plain = re.sub(r"[{}\[\]\"]", " ", plain)
-    return len(re.findall(r"[A-Za-z]{3,}", plain)) < 8
+    words = re.findall(r"[A-Za-z]{3,}", plain)
+    return opens >= 3 or len(words) < 8
 
 
 def run_investigation_task(root: Path, cfg, client, agent, idx, task: str, *,
@@ -630,7 +674,7 @@ def run_task(root: Path, cfg, client, agent, idx, task: str, *,
                   if wants_write and cfg.backup else None)
     workspace.log_event(root, f"task: {task}")
     print("\n--- looking things up ---", file=sys.stderr)
-    gathered = agent.gather(task)
+    gathered = agent.gather(task, backup_dir=backup_dir)
     print("--- answering ---\n", file=sys.stderr)
     raw_reply = agent.answer(task, gathered, system=answer_system)
     truncated = bool(getattr(client, "stream_truncated", False))

@@ -373,7 +373,8 @@ def _run_task(task: str, apply_now: bool) -> None:
             STATE.steps.append(text)
 
     gathered = agent.gather(task, verbose=True,
-                            on_step=lambda n: _note(f"step {n}"))
+                            on_step=lambda n: _note(f"step {n}"),
+                            backup_dir=backup_dir)
     _note("composing answer")
     reply = agent.answer(task, gathered, stream=False)
     results, reply = agent.apply(

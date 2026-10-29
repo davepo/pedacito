@@ -1015,3 +1015,25 @@ def test_custom_answer_system_still_carries_edit_format(tmp_path):
     # The default brief is unchanged: intro + the shared format.
     assert ANSWER_SYSTEM.startswith("You are a Python code assistant")
     assert ANSWER_SYSTEM.endswith(EDIT_FORMAT)
+
+
+def test_read_requests_parses_malformed_qwen_tool_calls():
+    """The reported runaway shape: `<tool_call>` + `<read>` + `<file_path>`,
+    repeated without closing tags. It must still yield the requested paths so
+    the answer-phase recovery can supply the source instead of re-asking the
+    model to emit the same broken block forever."""
+    reply = (
+        "<tool_call>\n<read>\n<file_path>\ngame.py\n</file_path>\n</read>\n"
+        "<tool_call>\n<read>\n<file_path>\nplayer.py"
+    )
+    assert loop._read_requests(reply) == ["game.py", "player.py"]
+    assert loop._looks_like_tool_calls_only(reply)
+
+
+def test_tool_call_only_detection_ignores_a_giant_repeated_path():
+    """A degenerate reply can be almost entirely one huge path; the old
+    word-count heuristic counted that path as prose and treated it as a
+    valid investigation report."""
+    reply = ("<tool_call>read\n</think>\n<read>\n<file_path>\n"
+             + "/Users/x/Projects/" * 80 + "\n")
+    assert loop._looks_like_tool_calls_only(reply)

@@ -913,3 +913,169 @@ def test_read_lines_cached_invalidates_on_change(tmp_path):
     assert fileio.read_lines_cached(p) == ["two", "three", ""]
 
     fileio.clear_line_cache()
+
+
+# ------------------------------------------------- runaway / malformed input
+def test_gather_stops_when_the_model_repeats_a_failing_read(tmp_path):
+    """The regression that forced a manual cancel: a model stuck on one bad
+    `read` produced an ERROR observation every step. Errors skipped the
+    gathered-source budget and `continue`d before the step guard, so with the
+    default max_steps=0 the gather loop never ended."""
+    idx = _index(tmp_path)
+    cfg = Config()
+    cfg.max_gathered_chars = 100_000
+
+    class Stuck:
+        step_truncated = False
+
+        def __init__(self):
+            self.n = 0
+
+        def chat_json(self, messages, schema, max_tokens, **kw):
+            self.n += 1
+            return {"action": "read", "file": "does_not_exist.py",
+                    "start": 1, "end": 20, "reasoning": "try again"}
+
+    client = Stuck()
+    Agent(idx, client, cfg).gather("look at the app", verbose=False)
+    assert client.n <= 4, f"gather kept spinning for {client.n} steps"
+
+
+def test_gather_stops_after_consecutive_different_errors(tmp_path):
+    """Different bad paths are still a stall: cap the error streak instead of
+    relying only on the exact-repeat signature."""
+    idx = _index(tmp_path)
+    cfg = Config()
+    cfg.max_gathered_chars = 100_000
+
+    class Failing:
+        step_truncated = False
+
+        def __init__(self):
+            self.n = 0
+
+        def chat_json(self, messages, schema, max_tokens, **kw):
+            self.n += 1
+            return {"action": "read", "file": f"missing_{self.n}.py",
+                    "start": 1, "end": 20, "reasoning": "next"}
+
+    client = Failing()
+    Agent(idx, client, cfg).gather("look at the app", verbose=False)
+    assert client.n <= 5, f"gather did not cap a failure streak ({client.n})"
+
+
+def test_read_and_grep_cannot_escape_the_project_root(tmp_path):
+    """`../secret.py` used to be adopted into the index on demand, which made
+    read/outline/grep serve a file outside the project root."""
+    root = tmp_path / "proj"
+    idx = _index(root)
+    (tmp_path / "secret.py").write_text("TOPSECRET = 1\n", encoding="utf-8")
+    cfg = Config()
+
+    read = tools.tool_read(idx, cfg, "../secret.py", 1, 10)
+    assert read.startswith("ERROR") and "TOPSECRET" not in read
+
+    grep = tools.tool_grep(idx, "TOPSECRET", "../secret.py")
+    assert "No matches for /TOPSECRET/" in grep
+    assert "= 1" not in grep
+
+    outline = tools.tool_outline(idx, cfg, "../secret.py")
+    assert "TOPSECRET" not in outline
+
+
+def test_absolute_path_inside_root_is_stored_relative(tmp_path):
+    """A model that sends an absolute path must not create an absolute
+    index/backup key (which silently skipped the backup and leaked host
+    paths into observations)."""
+    idx = _index(tmp_path)
+    cfg = Config()
+    cfg.allow_write = True
+    cfg._backup_dir = tmp_path / ".pedacito" / "backups" / "s"
+    abs_path = str(tmp_path / "pkg" / "app.py")
+
+    obs = tools.dispatch(idx, cfg, {"action": "write", "file": abs_path,
+                                    "content": "def helper():\n    return 9\n"})
+    assert obs.startswith("WROTE pkg/app.py"), obs
+    assert (cfg._backup_dir / "pkg" / "app.py").is_file()
+    assert (tmp_path / "pkg" / "app.py").read_text().endswith("return 9\n")
+
+
+def test_write_refuses_non_utf8_files_without_crashing(tmp_path):
+    idx = _index(tmp_path)
+    cfg = Config()
+    cfg.allow_write = True
+    binary = tmp_path / "bin.py"
+    original = b"\xff\xfe\x00binary\n"
+    binary.write_bytes(original)
+
+    obs = tools.dispatch(idx, cfg, {"action": "write", "file": "bin.py",
+                                    "content": "x = 1\n"})
+    assert obs.startswith("ERROR") and "UTF-8" in obs
+    assert binary.read_bytes() == original
+
+
+def test_move_and_delete_accept_non_utf8_files(tmp_path):
+    idx = _index(tmp_path)
+    cfg = Config()
+    cfg.allow_write = True
+    cfg.backup = False
+    binary = tmp_path / "blob.bin"
+    binary.write_bytes(b"\xff\x00\xfe")
+
+    moved = tools.dispatch(idx, cfg, {"action": "move", "file": "blob.bin",
+                                      "to": "moved.bin"})
+    assert moved.startswith("MOVED blob.bin -> moved.bin"), moved
+    deleted = tools.dispatch(idx, cfg, {"action": "delete",
+                                        "file": "moved.bin"})
+    assert deleted.startswith("DELETED moved.bin"), deleted
+    assert not (tmp_path / "moved.bin").exists()
+
+
+def test_null_and_non_numeric_fields_do_not_crash_a_step(tmp_path):
+    idx = _index(tmp_path)
+    cfg = Config()
+
+    assert tools.dispatch(idx, cfg, {"action": "callers",
+                                     "symbol": None}).startswith("ERROR")
+    # A non-numeric range is coerced to the defaults, not raised.
+    obs = tools.dispatch(idx, cfg, {"action": "read", "file": "pkg/app.py",
+                                    "start": "oops", "end": None})
+    assert obs.startswith("pkg/app.py lines"), obs
+    # A malformed step object is reported, not an AttributeError.
+    assert tools.dispatch(idx, cfg, None).startswith("ERROR")
+
+
+def test_gather_write_snapshots_into_backups_not_a_bak_beside_source(tmp_path):
+    """Nothing set `cfg._backup_dir`, so gather-phase writes fell through to
+    `<file>.bak`, which the next index pass could pick up as project code.
+    The snapshot belongs under .pedacito/backups/ like every other path."""
+    idx = _index(tmp_path)
+    cfg = Config()
+    cfg.allow_write = True
+    cfg.backup = True
+
+    class Writer:
+        step_truncated = False
+
+        def __init__(self):
+            self.n = 0
+
+        def chat_json(self, messages, schema, max_tokens, **kw):
+            self.n += 1
+            if self.n == 1:
+                return {"action": "write", "file": "pkg/app.py",
+                        "content": "x = 1\n", "reasoning": "replace"}
+            return {"action": "done", "reasoning": "ok"}
+
+    Agent(idx, Writer(), cfg).gather("change the app", verbose=False)
+    assert (tmp_path / "pkg" / "app.py").read_text() == "x = 1\n"
+    assert not (tmp_path / "pkg" / "app.py.bak").exists()
+    backups = list((tmp_path / ".pedacito" / "backups").rglob("pkg/app.py"))
+    assert backups, "gather write did not snapshot into .pedacito/backups"
+
+
+def test_read_empty_file_reports_zero_lines(tmp_path):
+    idx = _index(tmp_path)
+    (tmp_path / "empty.py").write_text("", encoding="utf-8")
+    obs = tools.tool_read(idx, Config(), "empty.py", 1, 10)
+    assert "empty (0 lines)" in obs

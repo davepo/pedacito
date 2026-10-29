@@ -53,6 +53,36 @@ _MAX_GATHER_RECOVERIES = 2
 # collected.
 _MAX_DUPLICATE_READS = 2
 
+# A step that fails (bad path, bad range, disabled action) is navigation
+# feedback, not source. A model that keeps retrying the SAME broken step must
+# not be allowed to spin forever: with max_steps = 0 (the default) the only
+# other bound is the gathered-source budget, and error observations used to
+# skip that charge entirely. Four consecutive failures is enough for a model
+# to correct itself; the same exact step three times means it is stuck.
+_MAX_CONSECUTIVE_ERRORS = 4
+_MAX_REPEATED_STEPS = 3
+
+
+def _step_signature(step: dict) -> tuple:
+    """Identity of a gather step for repetition detection.
+
+    `reasoning` is deliberately excluded: small models often re-emit the same
+    action with a slightly different note, which is still the same loop.
+    """
+    return tuple(sorted(
+        (k, str(v)) for k, v in (step or {}).items()
+        if k != "reasoning"))
+
+
+def _norm_key(path: str) -> str:
+    """Normalise a read-ledger path exactly once, everywhere.
+
+    The ledger, the duplicate-read eviction pass, and coverage all need the
+    same key: models alternate between `pkg/a.py` and `./pkg/a.py`, and a
+    mismatch silently disables both dedup and coverage.
+    """
+    return (path or "").strip().lower().lstrip("./")
+
 # The answer prompt tells the model it may split a multi-file task across
 # turns ("say what remains; the next turn continues"). A cleanly-finished
 # reply that says more work is coming must actually trigger a next turn --
@@ -198,7 +228,7 @@ def _evict_duplicate_reads(messages: list[dict], gathered: list[str],
         head = g.split("\n", 1)[0]
         if head.startswith("--- read ") and "\n" in g:
             rest = head[len("--- read "):].strip()
-            key = rest.rsplit(" L", 1)[0].strip().lower()
+            key = _norm_key(rest.rsplit(" L", 1)[0])
             body = g.split("\n", 1)[1]
             keep = deltas.get(key)
             if keep is None:
@@ -218,7 +248,7 @@ def _evict_duplicate_reads(messages: list[dict], gathered: list[str],
         m = _READ_HEAD_RX.match(body)
         if not m:
             continue
-        key = m.group(1).strip().lower()
+        key = _norm_key(m.group(1))
         s_, e_ = int(m.group(2)), int(m.group(3))
         # Spans of this same file shown by EARLIER turns only.
         prior = _fold_spans(_turn_spans(messages[:i], key))
@@ -249,7 +279,7 @@ def _turn_spans(messages: list[dict], key: str) -> list[tuple[int, int]]:
         if msg["role"] != "user" or not msg["content"].startswith("RESULT:\n"):
             continue
         m = _READ_HEAD_RX.match(msg["content"][len("RESULT:\n"):])
-        if m and m.group(1).strip().lower() == key:
+        if m and _norm_key(m.group(1)) == key:
             out.append((int(m.group(2)), int(m.group(3))))
     return out
 
@@ -372,11 +402,10 @@ Rules for edits:
   truncated; a SEARCH block copied from grep output will never match.
 - If you did not read the code you want to change, say so and propose nothing
   rather than guessing at an edit.
-- You are in the FINAL answer phase: no tools are available. Do not emit
-  tool-call requests (no <tool_call> or <invoke> blocks) -- they cannot run
-  here. Emit search/replace blocks only, for source you have already read.
-  If you lack a file you need, work with what you have and note what you
-  could not verify.
+- You are in the FINAL answer phase: no tools are available, and asking to
+  read another file cannot be fulfilled here. Emit search/replace blocks
+  only, for source you have already seen. If you lack a file you need, work
+  with what you have and note what you could not verify.
 - Include enough surrounding lines that the SEARCH text appears only once.
 - Keep each block small and local. Use several blocks rather than one large one.
 - A single reply must stay short enough to finish: emit at most a few blocks
@@ -501,7 +530,8 @@ class Agent:
 
     # ------------------------------------------------------------------ phase 1
     def gather(self, task: str, verbose: bool = True,
-               on_step=None, base: str | None = None) -> str:
+               on_step=None, base: str | None = None,
+               backup_dir=None) -> str:
         """Run the tool-calling loop: repeatedly ask the model to choose an
         action (read/grep/callers/outline/write/append/done) until it says
         `done`, the gathered-source token budget is exhausted, or an explicit
@@ -522,7 +552,17 @@ class Agent:
         preamble (the FLAT/CARDS navigation hints are still appended). The
         `explain` flow uses this to frame gathering as answering a question
         rather than as preparing an edit.
+
+        `backup_dir`, when given, is where gather-phase `write`/`append`/
+        `move`/`delete` snapshots go (the same run directory the answer
+        phase uses). When it is None the snapshot helper makes its own
+        directory under `.pedacito/backups/`; it never drops `.bak` files in
+        the source tree.
         """
+        # Clear any backup directory left by a previous task before this one
+        # starts: gathering is a fresh run, and a stale path would mix its
+        # snapshots into an older batch.
+        self.cfg._backup_dir = backup_dir
         repo_map, tier = self.index.map_for_prompt(self.cfg)
         system = (base if base is not None else GATHER_BASE) + \
             (FLAT_HINT if tier == "flat"
@@ -590,6 +630,9 @@ class Agent:
         step_recoveries = 0      # budget for re-asking after a gather step
                                  # died at the output cap (see LLMError path)
         duplicate_reads = 0      # consecutive reads that added no new lines
+        error_streak = 0         # consecutive failed (ERROR) observations
+        last_sig = None          # previous step's action+args, for loops
+        repeated = 0
         while unlimited or step < step_cap:
             step += 1
             try:
@@ -630,8 +673,18 @@ class Agent:
                           "gathered so far]", file=sys.stderr)
                     break
                 raise
-            action = (stepjson.get("action") or "").strip()
-            why = (stepjson.get("reasoning") or "").strip()
+            if not isinstance(stepjson, dict):
+                print(f"  [gather step was {type(stepjson).__name__}, not an "
+                      f"action object; moving to answer]", file=sys.stderr)
+                break
+            action = str(stepjson.get("action") or "").strip()
+            why = str(stepjson.get("reasoning") or "").strip()
+            sig = _step_signature(stepjson)
+            if sig == last_sig:
+                repeated += 1
+            else:
+                last_sig = sig
+                repeated = 1
 
             detail = (stepjson.get("file") or stepjson.get("pattern")
                       or stepjson.get("symbol") or stepjson.get("command") or "")
@@ -711,7 +764,24 @@ class Agent:
                     continue
                 break
 
-            obs = dispatch(self.index, self.cfg, stepjson, client=self.client)
+            if repeated >= _MAX_REPEATED_STEPS:
+                if verbose:
+                    print(f"  [gather stopped: the model repeated the same "
+                          f"`{action}` step {repeated} times; moving to "
+                          f"answer]", file=sys.stderr)
+                break
+
+            try:
+                obs = dispatch(self.index, self.cfg, stepjson,
+                               client=self.client)
+            except Exception as e:
+                # A tool must never crash the run: one malformed path or an
+                # unexpected filesystem error becomes an ERROR observation
+                # (and the consecutive-error guard above stops a loop on it).
+                print(f"  [{action} tool failed: "
+                      f"{type(e).__name__}: {e}]", file=sys.stderr)
+                obs = (f"ERROR: {action} failed "
+                       f"({type(e).__name__}): {str(e)[:200]}")
             # If the model's last reply was cut off at the token limit and we
             # salvaged the action from it, say so in the observation: the cut
             # almost always happened inside 'reasoning', and an unmarked
@@ -756,7 +826,7 @@ class Agent:
                     # the `done` nudge loops until the step ceiling, and the
                     # answer phase ends with zero edit blocks ("nothing to
                     # review" in the GUI despite successful reads).
-                    key = m.group(1).strip().lower().lstrip("./")
+                    key = _norm_key(m.group(1))
                     s_, e_ = int(m.group(2)), int(m.group(3))
                     prior = list(spans.get(key, []))
                     read_delta = _delta_len(obs, prior)
@@ -780,14 +850,36 @@ class Agent:
             # alone and proposes nothing, which surfaces in the GUI as a
             # blank review page. Record failures compactly instead.
             if obs.startswith("ERROR"):
+                error_streak += 1
+                duplicate_reads = 0      # an error is not a read
                 arg = (stepjson.get("file") or stepjson.get("pattern")
                        or stepjson.get("symbol") or stepjson.get("command") or "")
+                arg = arg if isinstance(arg, str) else str(arg)
                 item = f"--- {action} {arg} failed: {obs[:160]}"
                 gathered.append(item)
                 messages.append({"role": "assistant", "content": _compact(stepjson)})
                 messages.append({"role": "user",
                                  "content": f"{obs}\n\n{nudge(step + 1)}"})
+                # Errors used to `continue` before the budget was charged, so
+                # a model repeating one failing `read` (bad path, bad range)
+                # looped forever at the default max_steps = 0. Charge the
+                # error text and cap the streak: failures are feedback, not
+                # free steps.
+                budget -= len(obs)
+                _evict_overflow_turns(messages, self.client, self.cfg)
+                if error_streak >= _MAX_CONSECUTIVE_ERRORS:
+                    if verbose:
+                        print(f"  [gather stopped after {error_streak} "
+                              f"consecutive failed steps; moving to answer]",
+                              file=sys.stderr)
+                    break
+                if budget <= 0:
+                    if verbose:
+                        print("  [context budget exhausted; moving to answer]",
+                              file=sys.stderr)
+                    break
                 continue
+            error_streak = 0
             # Charge the gather budget by NEW LINES ONLY. A re-read of lines
             # already in context costs nothing here -- otherwise a small model
             # bouncing over one big file exhausts max_gathered_chars before it
@@ -796,7 +888,7 @@ class Agent:
             # eviction pass at the end of the loop dedups the conversation).
             if action == "read" and _READ_HEAD_RX.match(obs):
                 if read_delta is None:
-                    k0 = _READ_HEAD_RX.match(obs).group(1).strip().lower()
+                    k0 = _norm_key(_READ_HEAD_RX.match(obs).group(1))
                     delta = _delta_len(obs, list(spans.get(k0, [])))
                 else:
                     delta = read_delta
@@ -823,6 +915,7 @@ class Agent:
 
             arg = (stepjson.get("file") or stepjson.get("pattern")
                    or stepjson.get("symbol") or stepjson.get("command"))
+            arg = arg if isinstance(arg, str) else ("" if arg is None else str(arg))
             if action == "outline":
                 # Outlines are navigation, not evidence. The model needs them to
                 # decide what to read; the answer phase needs the code it read.
@@ -925,6 +1018,8 @@ class Agent:
                 lines = fileio.read_lines(self.index.root / rel)
                 if lines and lines[-1] == "" and len(lines) > 1:
                     lines = lines[:-1]   # same convention as tool_read
+                if not lines or lines == [""]:
+                    continue             # an empty file needs no read
                 n = max(1, len(lines))
             except OSError:
                 n = 0
@@ -1050,6 +1145,20 @@ class Agent:
         empty_rounds = 0
         cont_cap = max(0, int(getattr(self.cfg, "max_continuation_rounds", 0)
                               or 0))
+        # Each continuation is a FRESH conversation, so the source the model
+        # already saw must ride along. Without it a small model does the only
+        # thing that makes sense in its own head: asks to `read` the file
+        # again (often in native tool-call syntax, which cannot run in this
+        # phase) instead of writing edit blocks. Keep the most recent slice
+        # when the gathered source is larger than the configured budget.
+        cont_source = (gathered or getattr(self, "gathered_source", "") or "").strip()
+        if cont_source:
+            limit = max(4000, int(getattr(self.cfg, "max_gathered_chars",
+                                           24000) or 24000))
+            if len(cont_source) > limit:
+                cont_source = ("[earlier gathered source trimmed]\n"
+                               + cont_source[-limit:])
+            cont_source = f"SOURCE YOU REQUESTED\n\n{cont_source}\n\n"
         while getattr(self.client, "stream_truncated", False) \
                 and cont_budget > 0:
             cont_rounds += 1
@@ -1077,7 +1186,7 @@ class Agent:
                 print(f"\n[reply hit the output limit mid-way; continuing with "
                       f"{len(done_files)} file(s) done so far]", file=sys.stderr)
                 prompt = (
-                    f"TASK\n{task}\n\n"
+                    f"TASK\n{task}\n\n{cont_source}"
                     f"EDITS ALREADY DELIVERED (do NOT repeat these):\n"
                     + "\n".join(f"- {f}" for f in sorted(done_files)) +
                     "\n\nYour previous reply was CUT OFF by the output "
@@ -1096,7 +1205,7 @@ class Agent:
                 print(f"\n[reply was cut off before any complete block again; "
                       f"asking for a single small chunk]", file=sys.stderr)
                 prompt = (
-                    f"TASK\n{task}\n\n"
+                    f"TASK\n{task}\n\n{cont_source}"
                     "Your replies keep getting CUT OFF by the output token "
                     "limit because they are far too long. STOP emitting the "
                     "whole file. Emit exactly ONE search/replace block that "
@@ -1109,7 +1218,7 @@ class Agent:
                 print(f"\n[reply was cut off before any complete block; "
                       f"re-asking for the file]", file=sys.stderr)
                 prompt = (
-                    f"TASK\n{task}\n\n"
+                    f"TASK\n{task}\n\n{cont_source}"
                     "Your previous reply was CUT OFF by the output token "
                     "limit before it finished even one block, so nothing was "
                     "saved. Emit the search/replace blocks again now. If a "
@@ -1490,7 +1599,7 @@ class Agent:
         Returns (results, reply)."""
         from .scaffold import RESUME_SYSTEM
 
-        gathered = self.gather(task, verbose=True)
+        gathered = self.gather(task, verbose=True, backup_dir=backup_dir)
         reply = self.answer(task, gathered, stream=stream, system=RESUME_SYSTEM)
         return self.apply(reply, dry_run=dry_run, task=task, gathered=gathered,
                           backup_dir=backup_dir)

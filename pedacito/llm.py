@@ -136,6 +136,20 @@ def _server_root(base_url: str) -> str:
 _THINK_RE = re.compile(r"<(think|thinking|reasoning)>.*?</\1>", re.DOTALL | re.IGNORECASE)
 # An unterminated block: the model ran out of tokens mid-thought.
 _THINK_OPEN_RE = re.compile(r"^\s*<(think|thinking|reasoning)>.*", re.DOTALL | re.IGNORECASE)
+# Some templates emit only the closing marker (or duplicate it) when the
+# runtime has already routed the thinking text to a separate field. It is
+# noise, and in the answer phase it can be mistaken for content.
+_STRAY_THINK_CLOSE_RE = re.compile(r"</(think|thinking|reasoning)>",
+                                   re.IGNORECASE)
+# Native tool-call syntax in the ANSWER phase means the model has ignored
+# "no tools here" (usually because it wants source the gather phase did not
+# collect). A few are useful -- the recovery path can honour the reads --
+# but a stream that keeps emitting them is a degenerate loop that would
+# otherwise generate until the output cap. Six opens is well past any
+# legitimate multi-file read request (recovery honours at most four).
+_NATIVE_TOOL_OPEN_RE = re.compile(
+    r"<(?:tool_call|invoke|read)\b|<function\s*=", re.IGNORECASE)
+_MAX_STREAM_TOOL_OPENS = 6
 
 
 def strip_reasoning(text: str) -> str:
@@ -148,6 +162,8 @@ def strip_reasoning(text: str) -> str:
     if _THINK_OPEN_RE.match(out):
         # Nothing after the opening tag survived; there is no answer here.
         return ""
+    # Drop a stray closing marker without touching the surrounding answer.
+    out = _STRAY_THINK_CLOSE_RE.sub("", out)
     return out.strip()
 
 
@@ -790,6 +806,8 @@ class LMStudio:
 
         # Streaming: worth it at ~25 tok/s so the user sees progress.
         out = []
+        tool_opens = 0
+        probe_tail = ""
         r = self._post(payload, stream=True)
         for raw in r.iter_lines(decode_unicode=True):
             if not raw:
@@ -821,6 +839,21 @@ class LMStudio:
                 out.append(delta)
                 sys.stdout.write(delta)
                 sys.stdout.flush()
+                # Degenerate native-tool-call loop guard. The 4-char overlap
+                # catches an opening tag split across SSE chunks without
+                # double-counting a complete one.
+                probe = probe_tail + delta
+                tool_opens += len(_NATIVE_TOOL_OPEN_RE.findall(probe))
+                probe_tail = probe[-4:]
+                if tool_opens >= _MAX_STREAM_TOOL_OPENS:
+                    print("\n[stopped the reply: the model is repeating "
+                          "tool-call syntax instead of answering; no tools "
+                          "can run in this phase]", file=sys.stderr)
+                    try:
+                        r.close()
+                    except Exception:
+                        pass
+                    break
         sys.stdout.write("\n")
         self.stats["seconds"] += time.time() - t0
         # Reasoning models vary in where the thinking block lands. Some put

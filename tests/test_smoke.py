@@ -1845,3 +1845,85 @@ def test_explicit_max_tokens_override_vram_calculation_and_tier():
     config_mod.auto_fit(cfg, verbose=False)
     assert cfg.max_tokens_answer == 20000
     assert cfg.sources["max_tokens_answer"] == "config file"
+
+
+def test_truncation_reask_carries_gathered_source(tmp_path):
+    """A continuation is a fresh conversation. Without the source the model
+    already saw, a small model asks for the file again -- in native tool-call
+    syntax that cannot run in the answer phase -- instead of emitting edits."""
+    from pedacito import index as index_mod
+    _write(tmp_path / "a.py", "x = 1\n")
+    idx = index_mod.Index(tmp_path, [])
+
+    class StubClient:
+        stream_truncated = True
+
+        def __init__(self):
+            self.prompts = []
+
+        def chat(self, messages, max_tokens, schema=None, stream=False, **kw):
+            self.prompts.append(messages[-1]["content"])
+            self.stream_truncated = False
+            return ("--- FILE: a.py\n<<<<<<< SEARCH\nx = 1\n=======\n"
+                    "x = 2\n>>>>>>> REPLACE\n")
+
+    client = StubClient()
+    agent = Agent(idx, client, config_mod.Config())
+    gathered = "--- read a.py\n1 | x = 1\n"
+    reply = ("--- FILE: a.py\n<<<<<<< SEARCH\n=======\nx = 1")
+    results, _ = agent.apply(reply, dry_run=False, task="change a.py",
+                             gathered=gathered)
+    assert all(r.ok for r in results), [r.message for r in results]
+    assert client.prompts, "truncated reply was not re-asked"
+    assert "SOURCE YOU REQUESTED" in client.prompts[0]
+    assert "1 | x = 1" in client.prompts[0]
+
+
+def test_streaming_stops_a_degenerate_tool_call_loop(monkeypatch):
+    """A model that ignores the answer-phase brief and streams the same
+    `<tool_call>read` block forever must be stopped after a few opens instead
+    of generating until the token cap (the case that had to be cancelled)."""
+    chunk = 'data: {"choices":[{"delta":{"content":"<tool_call>read\\n' \
+            '</think>\\n"},"finish_reason":null}]}'
+
+    class Response:
+        status_code = 200
+        text = ""
+
+        def __init__(self):
+            self.closed = False
+            self.consumed = 0
+
+        def iter_lines(self, decode_unicode=False):
+            for _ in range(30):
+                self.consumed += 1
+                yield chunk
+            yield "data: [DONE]"
+
+        def close(self):
+            self.closed = True
+
+    response = Response()
+    monkeypatch.setattr("pedacito.llm.requests.post",
+                        lambda *a, **k: response)
+    cfg = config_mod.Config()
+    cfg.base_url = "http://127.0.0.1:1/v1"
+    cfg.model = "m"
+    client = LMStudio(cfg)
+    reply = client.chat([{"role": "user", "content": "go"}],
+                        max_tokens=100, stream=True)
+    assert response.closed, "the runaway stream was not closed"
+    assert response.consumed < 30, "kept reading every chunk"
+    assert reply.count("<tool_call>") <= 6
+    assert client.stream_truncated is False   # our stop, not the provider's
+
+
+def test_answer_brief_does_not_prime_native_tool_call_syntax():
+    """Naming `<tool_call>`/`<invoke>` even to forbid them is enough to make
+    some small models emit them in the answer phase. The brief must describe
+    the rule without printing the trigger tokens."""
+    from pedacito.agent import EDIT_FORMAT
+    low = EDIT_FORMAT.lower()
+    assert "<tool_call>" not in low
+    assert "<invoke" not in low
+    assert "no tools are available" in low
