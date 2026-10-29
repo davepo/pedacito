@@ -67,10 +67,64 @@ def test_investigation_tasks_are_recognised():
         "enhancements are already implemented and working")
     assert loop._is_investigation_task("Assess which endpoints are covered")
     assert loop._is_investigation_task("Report what the scheduler does")
+    assert loop._is_investigation_task(
+        "Run the game and verify the snake renders with a diamond head")
     assert not loop._is_investigation_task("Fix the black screen")
     assert not loop._is_investigation_task("Reproduce and fix the crash")
     assert not loop._is_investigation_task("Implement the parser")
     assert not loop._is_investigation_task("Audit and fix the collision logic")
+    assert not loop._is_investigation_task(
+        "Run the build and update the changelog")
+
+
+def test_verification_tasks_are_recognised():
+    assert loop._is_verification_task(
+        "Run the game and verify the snake renders taller")
+    assert loop._is_verification_task("Confirm the head colors changed")
+    assert loop._is_verification_task("Observe the snake in the browser")
+    assert loop._is_verification_task(
+        "Change the head colors and verify in the browser")
+    assert not loop._is_verification_task(
+        "Double the snake's body height while keeping its width")
+    # `check` only as a whole word: a checksum is not a checkpoint.
+    assert not loop._is_verification_task("Fix the checksum padding")
+
+
+def test_unverified_admissions_are_detected():
+    """The reported failure: the final task said "I can't launch the browser
+    in this final phase, so I can't produce a live visual verification" --
+    and the loop ticked it done anyway because an edit applied."""
+    assert loop._reply_says_unverified(
+        "I can't launch the browser in this final phase, so I can't produce "
+        "a live visual verification. I made the head frame use black-green-"
+        "black; the draw method already doubles the height.")
+    assert loop._reply_says_unverified(
+        "The server would not start; unable to verify the rendering.")
+    assert not loop._reply_says_unverified(
+        "Verified in the browser: the snake is 180px tall with a diamond "
+        "head (screenshot browser-2026.png).")
+
+
+def test_clip_report_keeps_head_and_tail():
+    """Investigation reports end with "Still unknown"/"Next check" -- the
+    doubt later tasks need. A head-only [:3000] clip dropped exactly that."""
+    reply = ("EVIDENCE. " + "x" * 4000
+             + " Next check: inspect main.js to confirm which snake class "
+               "is instantiated.")
+    clipped = loop._clip_report(reply)
+    assert clipped.startswith("EVIDENCE.")
+    assert "confirm which snake class" in clipped
+    assert "clipped" in clipped
+    assert len(clipped) < len(reply)
+    # Under budget: returned whole.
+    assert loop._clip_report("short report") == "short report"
+
+
+def test_evidence_hint_only_for_live_behavior_tasks():
+    hint = loop._evidence_hint(
+        "Run the game and verify the snake renders with a diamond head")
+    assert "lookup" in hint.lower() and "browser" in hint.lower()
+    assert loop._evidence_hint("Double the snake's body height") == ""
 
 
 def test_tool_call_only_answer_is_detected():
@@ -115,6 +169,99 @@ def test_run_loop_marks_investigation_task_done_without_edits(tmp_path,
     assert "window opens black" in fix_task
     assert "- [x] Reproduce the black screen" in plan.read_text()
     assert "- [x] Fix the rendering bug" in plan.read_text()
+
+
+def test_run_loop_fails_verify_task_that_gathered_no_evidence(tmp_path,
+                                                              monkeypatch):
+    """The reported failure: "Run the game and verify ..." could not launch
+    the browser, said so in its report, and was ticked done anyway. A
+    checkpoint that admits it gathered no evidence must fail the run."""
+    plan = tmp_path / "PLAN.md"
+    loop.write_plan(plan, "fix the snake",
+                    ["Fix the snake colors",
+                     "Run the game and verify the new colors render"])
+    idx = types.SimpleNamespace(root=tmp_path)
+    calls = []
+
+    def fake_run_task(root, cfg, client, agent, idx_, task, apply=True,
+                      review=False, answer_system=None):
+        calls.append(("edit", task))
+        return _result(idx_)
+
+    def fake_investigate(root, cfg, client, agent, idx_, task,
+                         answer_system=None):
+        calls.append(("investigate", task))
+        return loop.TaskResult(
+            [], "I can't launch the browser in this final phase, so I "
+                "can't produce a live visual verification.", True, [], idx_)
+
+    monkeypatch.setattr(loop, "run_task", fake_run_task)
+    monkeypatch.setattr(loop, "run_investigation_task", fake_investigate)
+    code = loop.run_loop(tmp_path, _cfg(), None, idx, plan, apply=True)
+    assert code == 1
+    assert [kind for kind, _ in calls] == ["edit", "investigate"]
+    # The verify task is told up front that tools live in the lookup phase.
+    assert "EVIDENCE" in calls[1][1]
+    text = plan.read_text()
+    assert "- [x] Fix the snake colors" in text
+    assert "- [x] Run the game" not in text
+
+
+def test_run_loop_edit_task_needs_evidence_when_title_says_verify(tmp_path,
+                                                                  monkeypatch):
+    """An edit-path task whose title asks to verify is not done just because
+    an edit applied while the reply admits the verification never ran."""
+    plan = tmp_path / "PLAN.md"
+    loop.write_plan(plan, "goal",
+                    ["Change the head colors and verify in the browser"])
+    idx = types.SimpleNamespace(root=tmp_path)
+
+    def fake_run_task(root, cfg, client, agent, idx_, task, apply=True,
+                      review=False, answer_system=None):
+        return loop.TaskResult(
+            [_ok()], "Applied the palette edit. I can't launch the browser "
+                     "in this final phase, so I can't produce a live visual "
+                     "verification.", True, ["a.py"], idx_)
+
+    monkeypatch.setattr(loop, "run_task", fake_run_task)
+    code = loop.run_loop(tmp_path, _cfg(), None, idx, plan, apply=True)
+    assert code == 1
+    assert "- [x]" not in plan.read_text()
+
+
+def test_context_notes_carry_report_tail(tmp_path, monkeypatch):
+    """Investigation reports put "Still unknown"/"Next check" last; the clip
+    carried into later tasks must keep that tail, not just the confident
+    conclusion at the top."""
+    plan = tmp_path / "PLAN.md"
+    loop.write_plan(plan, "goal",
+                    ["Locate the snake rendering code",
+                     "Fix the snake colors"])
+    idx = types.SimpleNamespace(root=tmp_path)
+    calls = []
+
+    def fake_investigate(root, cfg, client, agent, idx_, task,
+                         answer_system=None):
+        calls.append(("investigate", task))
+        report = ("Likely cause: enemies.js defines the snake. "
+                  + "x" * 4000
+                  + " Next check: inspect main.js to confirm which snake "
+                    "class is actually instantiated.")
+        return loop.TaskResult([], report, True, [], idx_)
+
+    def fake_run_task(root, cfg, client, agent, idx_, task, apply=True,
+                      review=False, answer_system=None):
+        calls.append(("edit", task))
+        return _result(idx_)
+
+    monkeypatch.setattr(loop, "run_investigation_task", fake_investigate)
+    monkeypatch.setattr(loop, "run_task", fake_run_task)
+    code = loop.run_loop(tmp_path, _cfg(), None, idx, plan, apply=True)
+    assert code == 0
+    fix_task = calls[1][1]
+    assert "CONTEXT FROM PRIOR INVESTIGATION" in fix_task
+    assert "Likely cause: enemies.js" in fix_task
+    assert "confirm which snake class" in fix_task
 
 
 # ------------------------------------------------------------------- planning

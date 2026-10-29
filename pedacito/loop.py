@@ -69,6 +69,86 @@ def _is_noop(reply: str) -> bool:
     ))
 
 
+def _reply_says_unverified(reply: str) -> bool:
+    """True when the model admits it could not perform the verification the
+    task asked for ("I can't launch the browser in this final phase"). A
+    checkpoint that confesses it gathered no evidence must not be ticked
+    done: that is how an auto run ends all-green with its edits in the wrong
+    file. Only consulted for tasks whose TITLE asks to verify/confirm/
+    observe, so an incidental phrase in a fix task's prose cannot fail it."""
+    low = (reply or "").lower()
+    return any(p in low for p in (
+        "can't verify", "cannot verify", "could not verify",
+        "couldn't verify", "unable to verify",
+        "can't confirm", "cannot confirm", "could not confirm",
+        "unable to confirm",
+        "can't launch the browser", "cannot launch the browser",
+        "could not launch the browser", "unable to launch the browser",
+        "can't run the game", "cannot run the game",
+        "could not run the game",
+        "can't produce a live visual verification",
+        "cannot produce a live visual verification",
+        "no live visual verification", "not visually verified",
+    ))
+
+
+# Words that make a task title a verification checkpoint: its deliverable is
+# evidence that the expected behavior was observed, not a code change.
+# `check` is matched as a whole word so "checksum" does not qualify.
+_VERIFY_WORDS = re.compile(
+    r"\b(?:verif|confirm|observ|validat)\w*|\bcheck(?:s|ed|ing)?\b")
+
+
+def _is_verification_task(task: str) -> bool:
+    """True for a task whose title asks to verify/confirm/observe behavior."""
+    return bool(_VERIFY_WORDS.search((task or "").lower()))
+
+
+# Clipping budget for the investigation reports carried between tasks. Local
+# models run tight contexts, so the notes are capped -- but the answer brief
+# puts the most actionable caveats ("Still unknown", "Next check") at the END
+# of a report, after the confident conclusion. Head-only truncation kept the
+# conclusion and silently dropped the doubt, and later tasks acted on the
+# guess the report itself had flagged as unconfirmed. Clip head AND tail.
+_REPORT_BUDGET = 3000
+
+
+def _clip_report(reply: str, budget: int = _REPORT_BUDGET) -> str:
+    """Clip a carried-over investigation report, keeping head and tail."""
+    text = (reply or "").strip()
+    if len(text) <= budget:
+        return text
+    head = int(budget * 0.6)
+    tail = budget - head
+    return (text[:head]
+            + "\n[...report clipped to fit; full text in the session log...]\n"
+            + text[-tail:])
+
+
+# Tasks whose deliverable includes live evidence (a running app, a
+# screenshot, observed behavior) are told up front that tools exist only in
+# the lookup phase. Models reliably discover this in the answer phase, when
+# it is too late ("I can't launch the browser in this final phase"), and
+# then pass the checkpoint on prose alone.
+_EVIDENCE_WORDS = re.compile(
+    r"\b(run|runs|running|launch|launches|verify|verifies|verification|"
+    r"confirm|confirms|observe|observes|observing|reproduce|reproduces|"
+    r"screenshot|screenshots|browser|visually|render|renders|rendering|"
+    r"game)\b")
+
+
+def _evidence_hint(task: str) -> str:
+    """A task-text addendum for live-evidence tasks; empty for code tasks."""
+    if not _EVIDENCE_WORDS.search((task or "").lower()):
+        return ""
+    return ("\n\nEVIDENCE: this task is about live behavior. The `run`, "
+            "`screenshot`, and `browser` tools exist ONLY in the lookup "
+            "phase; the final answer phase has no tools. Launch the app and "
+            "capture the evidence while gathering, before you answer -- a "
+            "verification postponed to the answer phase cannot happen, and "
+            "reporting the task done without that evidence fails it.")
+
+
 # Tasks that are checkpoints rather than edits. The planner explicitly emits
 # "reproduce the failure" as a step for bugs, but the loop used to demand an
 # applied edit from every task -- so a successful reproduction was recorded as
@@ -78,6 +158,12 @@ _INVESTIGATE_START = (
     "reproduce", "investigate", "diagnose", "analyze", "analyse", "inspect",
     "trace", "locate", "find", "confirm", "check", "verify", "review",
     "profile", "explain", "identify", "determine", "observe", "test",
+    # "Run the game and verify the fix" is a checkpoint, not a code change:
+    # on the edit path its success condition is "an edit applied", which let
+    # a live-verification task pass on a cosmetic edit to the wrong file
+    # with no evidence gathered at all. The edit-word guard below keeps
+    # "Run the build and update the docs" on the edit path.
+    "run",
     # Reporting/survey verbs the planner can emit for a "look at the code
     # first" step. "Audit ... to identify which of X are already working" is
     # the canonical case: it must be answered as a report, not forced through
@@ -769,6 +855,10 @@ def run_loop(root: Path, cfg, client, idx, plan_path: Path, *,
                         scaffold stubs rather than edit existing code).
     - Investigation-only tasks ("Reproduce...", "Locate the cause...") are
       answered in prose and marked done without requiring edits.
+    - Verification checkpoints (titles asking to verify/confirm/observe) are
+      FAILED, not ticked done, when their report admits it could not gather
+      the evidence ("I can't launch the browser in this final phase") -- an
+      applied edit is not evidence, even with the shell verify green.
     - ``auto_install`` when a verification fails on a missing third-party
                         module, pip-install it and retry (opt-in: the module
                         name comes from generated code). When off, the failure
@@ -813,10 +903,10 @@ def run_loop(root: Path, cfg, client, idx, plan_path: Path, *,
         print(f"\n=== task {attempted}: {task} ===", file=sys.stderr)
 
         investigate = _is_investigation_task(task)
-        task_for_agent = task
+        task_for_agent = task + _evidence_hint(task)
         if context_notes:
             task_for_agent = (
-                task + "\n\nCONTEXT FROM PRIOR INVESTIGATION\n\n"
+                task_for_agent + "\n\nCONTEXT FROM PRIOR INVESTIGATION\n\n"
                 + "\n\n".join(context_notes))
         try:
             if investigate:
@@ -841,7 +931,20 @@ def run_loop(root: Path, cfg, client, idx, plan_path: Path, *,
             # The report is the deliverable; there is no code change to apply
             # or verify. A failed/empty run is still a failure.
             if (tr.reply or "").strip():
-                context_notes.append(f"### {task}\n{(tr.reply or '')[:3000]}")
+                if _is_verification_task(task) and \
+                        _reply_says_unverified(tr.reply):
+                    print("  [verification task reports it could not gather "
+                          f"evidence -- {'stopping' if stop_on_fail else 'skipping'}]",
+                          file=sys.stderr)
+                    workspace.log_event(
+                        root, "verification task gathered no evidence",
+                        "ERROR")
+                    failed += 1
+                    if stop_on_fail:
+                        break
+                    mark_failed(plan_path, task)
+                    continue
+                context_notes.append(f"### {task}\n{_clip_report(tr.reply)}")
                 del context_notes[:-2]       # keep only the latest two
                 mark_done(plan_path, task)
                 done += 1
@@ -951,6 +1054,22 @@ def run_loop(root: Path, cfg, client, idx, plan_path: Path, *,
                       file=sys.stderr)
                 workspace.log_event(root, f"verify still failing: $ {verify}",
                                     "ERROR")
+            failed += 1
+            if stop_on_fail:
+                break
+            mark_failed(plan_path, task)
+            continue
+
+        if _is_verification_task(task) and _reply_says_unverified(tr.reply):
+            # An applied edit is not evidence: a task that asks to verify
+            # live behavior and then admits it could not ("I can't launch
+            # the browser in this final phase") has not earned its tick,
+            # even with edit blocks on the floor and the shell verify green.
+            print("  [task asked for verification but its report says it "
+                  f"could not verify -- {'stopping' if stop_on_fail else 'skipping'}]",
+                  file=sys.stderr)
+            workspace.log_event(
+                root, "verification task gathered no evidence", "ERROR")
             failed += 1
             if stop_on_fail:
                 break
