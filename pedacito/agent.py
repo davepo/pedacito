@@ -1462,12 +1462,14 @@ class Agent:
         """One parse-and-apply pass, with no repair round-trip.
 
         Duplicate FILE headers are NOT merged here any more: apply_edits
-        groups blocks by path itself and classifies each block individually
-        before folding. Pre-merging here glued a rename's create-block to its
-        own clear-block under one header, which made the rename pair invisible
-        to detection -- the task ended with a blank review page and the old
-        files untouched. It also corrupted new-file bodies with stray leading
-        blank lines.
+        groups blocks by path itself, classifies each block individually for
+        rename detection, and applies each path's blocks in order. Pre-merging
+        here glued a rename's create-block to its own clear-block under one
+        header, which made the rename pair invisible to detection -- the task
+        ended with a blank review page and the old files untouched. It also
+        corrupted new-file bodies with stray leading blank lines, and fused
+        the SEARCH bodies of ordinary multi-block edits into a needle that
+        could never match.
         """
         return apply_edits(self.index.root, parse_edits(reply),
                            backup=self.cfg.backup, dry_run=dry_run,

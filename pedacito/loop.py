@@ -914,6 +914,22 @@ def run_loop(root: Path, cfg, client, idx, plan_path: Path, *,
                 pass
 
     print(f"\n[{done} task(s) done, {failed} failed]", file=sys.stderr)
-    workspace.log_event(root, f"auto loop finished: {done} done, {failed} failed",
+    remaining = 0
+    for ln in read_plan(plan_path):
+        m = _TASK_LINE.match(ln)
+        if m and m.group(2).strip() == "":
+            remaining += 1
+    if remaining:
+        # The loop ended with work outstanding -- a cap, a time limit, or (the
+        # default) a stop on the first failed task. Say so plainly, with the
+        # two ways forward; without this a stopped run looks like the tool
+        # silently gave up after one task.
+        print(f"  [{remaining} task(s) are still unchecked in "
+              f"{plan_path.name}; rerun the same command to resume them"
+              + (", or add --keep-going to run through failures"
+                 if failed and stop_on_fail else "")
+              + ".]", file=sys.stderr)
+    workspace.log_event(root, f"auto loop finished: {done} done, "
+                              f"{failed} failed, {remaining} left",
                         "ERROR" if failed else "INFO")
     return 0 if failed == 0 else 1

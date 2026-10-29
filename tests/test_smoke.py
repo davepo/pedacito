@@ -308,6 +308,109 @@ def test_empty_search_overwrites_existing_file(tmp_path):
     assert "raise NotImplementedError" not in (tmp_path / "assets.py").read_text()
 
 
+def test_multiple_blocks_same_file_apply_sequentially(tmp_path):
+    """The answer protocol tells the model to "use several blocks rather than
+    one large one", so a reply with two or more edit blocks for ONE existing
+    file is the normal case. merge_duplicate_files used to concatenate their
+    SEARCH bodies into a single needle that appears nowhere in the file, so
+    the whole group died as "block 1: search block not found" no matter how
+    well each block anchored on its own -- in `auto`, that failed task then
+    stopped the entire run with most of the plan still unchecked. Each block
+    must instead apply in order against the text the previous one produced,
+    landing as ONE cumulative Result for the file."""
+    _write(tmp_path / "m.py", "import os\n\nx = 1\n\ny = 2\n")
+    reply = (
+        "--- FILE: m.py\n"
+        "<<<<<<< SEARCH\nimport os\n=======\nimport math\nimport os\n"
+        ">>>>>>> REPLACE\n\n"
+        "--- FILE: m.py\n"
+        "<<<<<<< SEARCH\nx = 1\n=======\nx = 10\n>>>>>>> REPLACE\n\n"
+        "--- FILE: m.py\n"
+        "<<<<<<< SEARCH\ny = 2\n=======\ny = 20\n>>>>>>> REPLACE\n"
+    )
+    results = edits.apply_edits(tmp_path, edits.parse_edits(reply),
+                                backup=False, dry_run=False)
+    assert len(results) == 1, [r.message for r in results]
+    assert results[0].ok, results[0].message
+    assert "3 block(s)" in results[0].message
+    body = (tmp_path / "m.py").read_text()
+    assert "import math" in body
+    assert "x = 10" in body and "y = 20" in body
+
+
+def test_later_block_anchors_on_earlier_replacement(tmp_path):
+    """Sequential application means a later block can SEARCH text that only
+    exists because an earlier block for the same file wrote it."""
+    _write(tmp_path / "s.py", "value = 1\n")
+    reply = (
+        "--- FILE: s.py\n<<<<<<< SEARCH\nvalue = 1\n=======\n"
+        "value = 2\nfinal = True\n>>>>>>> REPLACE\n\n"
+        "--- FILE: s.py\n<<<<<<< SEARCH\nfinal = True\n=======\n"
+        "final = False\n>>>>>>> REPLACE\n"
+    )
+    results = edits.apply_edits(tmp_path, edits.parse_edits(reply),
+                                backup=False, dry_run=False)
+    assert len(results) == 1
+    assert results[0].ok, results[0].message
+    assert (tmp_path / "s.py").read_text() == "value = 2\nfinal = False\n"
+
+
+def test_multiblock_dry_run_yields_one_cumulative_result(tmp_path):
+    """The review flow depends on one Result per path: its diff must show the
+    cumulative change (original -> final), not just the last block's."""
+    _write(tmp_path / "d.py", "a = 1\nb = 2\n")
+    reply = (
+        "--- FILE: d.py\n<<<<<<< SEARCH\na = 1\n=======\na = 10\n"
+        ">>>>>>> REPLACE\n\n"
+        "--- FILE: d.py\n<<<<<<< SEARCH\nb = 2\n=======\nb = 20\n"
+        ">>>>>>> REPLACE\n"
+    )
+    results = edits.apply_edits(tmp_path, edits.parse_edits(reply),
+                                backup=False, dry_run=True)
+    assert len(results) == 1
+    assert results[0].ok, results[0].message
+    assert results[0].before == "a = 1\nb = 2\n"
+    assert results[0].after == "a = 10\nb = 20\n"
+    assert "+a = 10" in results[0].diff and "+b = 20" in results[0].diff
+
+
+def test_chunked_creation_still_concatenates_parts(tmp_path):
+    """Several empty-SEARCH blocks for one NEW file are successive parts of
+    that file (the behaviour the old merge existed for): their REPLACE bodies
+    must still be concatenated in reply order, with no stray leading blank
+    line from the join."""
+    reply = (
+        "--- FILE: new.py\n<<<<<<< SEARCH\n=======\nimport os\n"
+        ">>>>>>> REPLACE\n\n"
+        "--- FILE: new.py\n<<<<<<< SEARCH\n=======\n\nx = 1\n"
+        ">>>>>>> REPLACE\n"
+    )
+    results = edits.apply_edits(tmp_path, edits.parse_edits(reply),
+                                backup=False, dry_run=False)
+    assert len(results) == 1
+    assert results[0].ok, results[0].message
+    assert (tmp_path / "new.py").read_text() == "import os\n\nx = 1\n"
+
+
+def test_empty_search_in_mixed_group_replaces_whole_file(tmp_path):
+    """An empty SEARCH means "replace the whole file" (the stub protocol). A
+    group of nothing but those goes through the overwrite branch; one mixed
+    in with real edit blocks must reset the text at its position in the
+    sequence instead of failing as an unlocatable search."""
+    _write(tmp_path / "stub.py", "def f():\n    raise NotImplementedError\n")
+    reply = (
+        "--- FILE: stub.py\n<<<<<<< SEARCH\n=======\ndef f():\n    return 1\n"
+        "\n\ng = 2\n>>>>>>> REPLACE\n\n"
+        "--- FILE: stub.py\n<<<<<<< SEARCH\ng = 2\n=======\ng = 3\n"
+        ">>>>>>> REPLACE\n"
+    )
+    results = edits.apply_edits(tmp_path, edits.parse_edits(reply),
+                                backup=False, dry_run=False)
+    assert len(results) == 1
+    assert results[0].ok, results[0].message
+    assert (tmp_path / "stub.py").read_text() == "def f():\n    return 1\n\n\ng = 3\n"
+
+
 def test_edit_of_already_broken_file_applies_with_warning(tmp_path):
     """A file that does not parse BEFORE the edit (a stub written in the wrong
     language, a half-finished chunked write) can never be healed under the old

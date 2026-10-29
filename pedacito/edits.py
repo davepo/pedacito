@@ -182,29 +182,16 @@ def parse_edits(text: str) -> list[Edit]:
     return edits
 
 
-def merge_duplicate_files(edits: list[Edit]) -> list[Edit]:
-    """Fold blocks that repeat the same `--- FILE:` header into one group.
-
-    Small models habitually re-emit a file's header instead of appending a
-    second block under it, and separate passes over one path are unsafe in
-    both directions: in dry-run (review) mode each pass computes its diff
-    from the *original* text, so the review page shows only the last version
-    and `write_files` refuses with a misleading "(deleted)" or "(changed on
-    disk)"; live, a creation block can run before an edit block for the same
-    path and clobber what was just created. Concatenating the bodies keeps
-    every intent in reply order -- empty SEARCH sections included.
-    """
-    seen: dict[str, int] = {}
-    merged: list[Edit] = []
-    for e in edits:
-        if e.file in seen:
-            prev = merged[seen[e.file]]
-            prev.search += "\n" + e.search
-            prev.replace += "\n" + e.replace
-        else:
-            seen[e.file] = len(merged)
-            merged.append(e)
-    return merged
+# NOTE: same-path blocks are deliberately NOT folded into one Edit. An older
+# `merge_duplicate_files` helper did exactly that -- fine for chunked
+# CREATIONS, whose empty SEARCH bodies concatenate harmlessly, but fatal for
+# ordinary edits: gluing two or more SEARCH bodies together produces a needle
+# that appears nowhere in the file, so any reply following the documented
+# "use several blocks rather than one large one" protocol failed wholesale as
+# "block 1: search block not found". apply_edits instead keeps every block on
+# its own and applies a path's blocks IN ORDER against the evolving text,
+# emitting one cumulative Result per file; the creation branches join the
+# REPLACE bodies of empty-SEARCH blocks themselves.
 
 
 # --------------------------------------------------------------------------
@@ -413,14 +400,14 @@ def apply_edits(root: Path, edits: list[Edit], backup: bool = True,
     the working tree unexpectedly.
     """
     results: list[Result] = []
-    # Group blocks by path *before* merging, so rename detection sees each
-    # SEARCH/REPLACE block on its own. merge_duplicate_files concatenates
-    # bodies; when a model emits "create index.html" and "empty out
-    # index.html" under the same header (the rename idiom), the merged
-    # group's search is non-empty while its replace keeps the new content --
-    # which previously made the whole path look like neither a creator nor a
-    # remover, silently dropping the rename pair and leaving the old files
-    # to fail as unmatched edits.
+    # Group blocks by path, keeping every SEARCH/REPLACE block on its own so
+    # rename detection (and the sequential application below) sees the raw
+    # blocks. When a model emits "create index.html" and "empty out
+    # index.html" under the same header (the rename idiom), folding those
+    # bodies into one Edit made the whole path look like neither a creator
+    # nor a remover -- its search turned non-empty while its replace kept the
+    # new content -- silently dropping the rename pair and leaving the old
+    # files to fail as unmatched edits.
     groups: dict[str, list[Edit]] = {}
     for e in edits:
         groups.setdefault(e.file, []).append(e)
@@ -636,7 +623,11 @@ def apply_edits(root: Path, edits: list[Edit], backup: bool = True,
                 renames[old] = new
                 used.add(new)
 
-    # Now fold repeated headers into one group per path for application.
+    # Collect the blocks to apply, one group per path, in reply order and
+    # UNMERGED: the application loop below runs each block against the text
+    # the previous one produced and emits a single cumulative Result per
+    # file -- which is also what the review flow needs (one diff per path,
+    # computed from the true original to the true final text).
     # Rename sources lose their clear blocks: live, they would fail to match
     # after the move removed the file; in dry-run they would preview as an
     # empty stub next to the rename. A path that is also a creator keeps its
@@ -649,9 +640,9 @@ def apply_edits(root: Path, edits: list[Edit], backup: bool = True,
                             and (e.search.strip() or rel in creators))]
             if not keep:
                 continue
-            by_file[rel] = merge_duplicate_files(keep)
+            by_file[rel] = keep
             continue
-        by_file[rel] = merge_duplicate_files(g)
+        by_file[rel] = list(g)
 
     def _validate(path: Path, text: str) -> str | None:
         """Return an error message if `text` does not parse as source of
@@ -827,21 +818,19 @@ def apply_edits(root: Path, edits: list[Edit], backup: bool = True,
 
         exists = path.exists()
         if not exists:
-            # New-file creation works on the *raw* blocks, before duplicate
-            # headers were concatenated: a model that re-emits the same
-            # `--- FILE:` header for each block leaves merged bodies glued
-            # together ("\n" + new content), which would otherwise be written
-            # with a stray leading blank line. Only empty-SEARCH blocks can
-            # create; a group mixing them with real searches is a failed edit
-            # against a file that isn't in the tree. Fuzzy matching does not
-            # apply here: with no existing content there is nothing to be
-            # similar to. The message must say which case it is, because
-            # "file not found" alone invites the model to answer by renaming
-            # files -- and Pedacito only honours that intent when the clear
-            # blocks match (see rename detection above).
-            raw = groups.get(rel, group)
-            creators = [e for e in raw if not e.search.strip()]
-            if not creators or len(creators) != len(raw):
+            # New-file creation: only empty-SEARCH blocks can do it. A model
+            # that re-emits the same `--- FILE:` header for each block is
+            # writing successive parts of ONE file, so the parts are
+            # concatenated in reply order below. A group mixing empty-SEARCH
+            # blocks with real searches is a failed edit against a file that
+            # isn't in the tree. Fuzzy matching does not apply here: with no
+            # existing content there is nothing to be similar to. The message
+            # must say which case it is, because "file not found" alone
+            # invites the model to answer by renaming files -- and Pedacito
+            # only honours that intent when the clear blocks match (see
+            # rename detection above).
+            creators = [e for e in group if not e.search.strip()]
+            if not creators or len(creators) != len(group):
                 hint = ""
                 if path.parent.is_dir():
                     try:
@@ -864,7 +853,7 @@ def apply_edits(root: Path, edits: list[Edit], backup: bool = True,
             # One block per created file: a model that re-emits the same
             # header for several create blocks was writing successive parts
             # of ONE file, so concatenate their bodies in reply order (the
-            # same rule merge_duplicate_files applies everywhere else).
+            # same rule the all-creators overwrite branch above applies).
             # Joining with "\n" never invents a blank line: parse_edits drops
             # exactly one trailing newline from every body, so a complete
             # block's terminator survives as the join character.
@@ -913,13 +902,26 @@ def apply_edits(root: Path, edits: list[Edit], backup: bool = True,
             continue
 
         # LF-normalised for matching; style remembered so the file is written
-        # back exactly as it was found.
+        # back exactly as it was found. The path's blocks apply IN ORDER,
+        # each anchored against the text the previous one produced, and the
+        # file is written (or refused) once at the end -- so several small
+        # blocks for one file, the shape the answer protocol asks for, land
+        # as a single cumulative change and a single Result.
         original, style = fileio.read(path, errors="strict")
         text = original
         failed = False
         any_fuzzy = False
         fuzzy_blocks: list[int] = []
         for k, e in enumerate(group, 1):
+            if not e.search.strip():
+                # An empty SEARCH replaces the WHOLE file (the documented
+                # stub-implementing protocol). A group of nothing but those
+                # is handled by the overwrite branch above; this catches one
+                # mixed in with real edits, where it resets the text that
+                # later blocks anchor against.
+                text = e.replace if not e.replace or e.replace.endswith("\n") \
+                    else e.replace + "\n"
+                continue
             span = locate(text, e.search, cfg, replacement=e.replace)
             if span is None:
                 n = text.count(e.search)
