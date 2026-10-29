@@ -1079,3 +1079,151 @@ def test_read_empty_file_reports_zero_lines(tmp_path):
     (tmp_path / "empty.py").write_text("", encoding="utf-8")
     obs = tools.tool_read(idx, Config(), "empty.py", 1, 10)
     assert "empty (0 lines)" in obs
+
+
+# ---------------------------------------------------------------- web / browser
+def test_browser_schema_is_hidden_until_enabled():
+    plain = tools.schema_for(Config())
+    assert "browser" not in plain["properties"]["action"]["enum"]
+    assert "command" not in plain["properties"]
+
+    cfg = Config()
+    cfg.allow_browser = True
+    schema = tools.schema_for(cfg)
+    assert "browser" in schema["properties"]["action"]["enum"]
+    assert "command" in schema["required"]
+    assert "content" not in schema["properties"]
+
+
+def test_browser_server_url_detection_and_action_parser():
+    from pedacito import browser
+
+    assert browser.find_server_url(
+        " * Running on http://127.0.0.1:5000/ (Press CTRL+C to quit)"
+    ) == "http://127.0.0.1:5000/"
+    assert browser.find_server_url(
+        "Serving at http://0.0.0.0:8000/game") == \
+        "http://127.0.0.1:8000/game"
+    assert browser.find_server_url("no URL here") == ""
+    assert browser.parse_actions(
+        "press Enter; click #start; wait 2; fill #name Ada; type hi") == [
+        ("press", "Enter"), ("click", "#start"), ("wait", 2.0),
+        ("fill", ("#name", "Ada")), ("type", "hi")]
+    assert browser.parse_actions("Enter") == [("press", "Enter")]
+
+
+def test_browser_is_gated_and_explains_a_missing_backend(tmp_path, monkeypatch):
+    idx = _index(tmp_path)
+    obs = tools.tool_browser(idx, Config(), None, "http://127.0.0.1:5000")
+    assert obs.startswith("ERROR") and "allow_browser" in obs
+
+    cfg = Config()
+    cfg.allow_browser = True
+    monkeypatch.setattr(tools.browser, "available", lambda: False)
+    monkeypatch.setattr(tools.browser, "chrome_executable", lambda: "")
+    obs = tools.tool_browser(idx, cfg, None, "http://127.0.0.1:5000")
+    assert obs.startswith("ERROR")
+    assert "playwright" in obs.lower()
+    assert "desktop screenshot" in obs.lower()
+
+
+class _FakeProc:
+    def poll(self):
+        return None
+
+    def wait(self, timeout=None):
+        return 0
+
+
+def test_browser_launches_server_interacts_and_reports_page(tmp_path,
+                                                            monkeypatch):
+    idx = _index(tmp_path)
+    cfg = Config()
+    cfg.allow_browser = True
+    cfg.allow_shell = True
+    seen = {}
+
+    def fake_launch(argv, *, cwd, env, wait_seconds):
+        seen["argv"] = argv
+        return _FakeProc(), "http://127.0.0.1:8000/game", "Serving at ..."
+
+    def fake_run(url, *, actions, wait, out, timeout, headless):
+        seen.update(url=url, actions=actions, wait=wait, out=out)
+        return True, {
+            "url": url, "title": "Turtle Game", "text": "Score: 0",
+            "canvas": "800x600", "console": ["error: boom"],
+            "actions": ["pressed Enter"], "action_errors": [],
+            "method": "fake browser",
+        }
+
+    monkeypatch.setattr(tools.browser, "launch_server", fake_launch)
+    monkeypatch.setattr(tools.browser, "run", fake_run)
+    monkeypatch.setattr(tools.proc, "terminate", lambda p: None)
+    monkeypatch.setattr(tools.vision, "analyze", lambda path, previous=None: "ANALYSIS")
+    monkeypatch.setattr(tools.vision, "describe", lambda *a, **k: "")
+
+    obs = tools.tool_browser(idx, cfg, None, "python main.py",
+                             "press Enter; wait 3", 4)
+    assert obs.startswith("BROWSER: http://127.0.0.1:8000/game")
+    assert "LAUNCHED: python main.py" in obs
+    assert "ACTIONS: pressed Enter" in obs
+    assert "CANVAS: 800x600" in obs
+    assert "PAGE TEXT:\nScore: 0" in obs
+    assert "CONSOLE:" in obs and "boom" in obs
+    assert "ANALYSIS:\nANALYSIS" in obs
+    assert seen["url"] == "http://127.0.0.1:8000/game"
+    assert seen["wait"] == 4
+
+
+def test_screenshot_warns_that_a_desktop_shot_is_not_a_web_page(tmp_path,
+                                                                monkeypatch):
+    idx = _index(tmp_path)
+    cfg = Config()
+    cfg.allow_screenshots = True
+    cfg.allow_shell = True
+
+    monkeypatch.setattr(
+        tools.browser, "launch_server",
+        lambda argv, *, cwd, env, wait_seconds: (
+            _FakeProc(), "http://127.0.0.1:8000/game", "Serving..."))
+    monkeypatch.setattr(tools.proc, "terminate", lambda p: None)
+    monkeypatch.setattr(tools.vision, "capture",
+                        lambda path: (True, "fake capture"))
+    monkeypatch.setattr(tools.vision, "analyze",
+                        lambda path, previous=None: "ANALYSIS")
+    monkeypatch.setattr(tools.vision, "describe", lambda *a, **k: "")
+
+    obs = tools.tool_screenshot(idx, cfg, None, "python main.py", "", 1)
+    assert "SERVER: http://127.0.0.1:8000/game" in obs
+    assert "WEB SERVER" in obs and "DESKTOP" in obs
+    assert "allow_browser is off" in obs or "allow_browser` is off" in obs
+
+
+def test_run_reports_a_web_server_url(tmp_path, monkeypatch):
+    idx = _index(tmp_path)
+    cfg = Config()
+    cfg.allow_shell = True
+    monkeypatch.setattr(
+        tools.proc, "run",
+        lambda *a, **k: (0, " * Running on http://127.0.0.1:5000/", "idle", 1.0))
+    obs = tools.tool_run(idx, cfg, "python main.py")
+    assert "SERVER: http://127.0.0.1:5000/" in obs
+    assert "WEB SERVER" in obs
+    assert "browser" in obs
+
+
+def test_browser_url_does_not_require_shell(tmp_path, monkeypatch):
+    idx = _index(tmp_path)
+    cfg = Config()
+    cfg.allow_browser = True
+    cfg.allow_shell = False
+    monkeypatch.setattr(tools.browser, "run", lambda *a, **k: (
+        True, {"url": "http://127.0.0.1:8000/", "title": "t",
+               "text": "hello", "canvas": "", "console": [],
+               "actions": [], "action_errors": [], "method": "fake"}))
+    monkeypatch.setattr(tools.vision, "analyze",
+                        lambda path, previous=None: "ANALYSIS")
+    monkeypatch.setattr(tools.vision, "describe", lambda *a, **k: "")
+    obs = tools.tool_browser(idx, cfg, None, "http://127.0.0.1:8000/")
+    assert obs.startswith("BROWSER: http://127.0.0.1:8000/")
+    assert "hello" in obs

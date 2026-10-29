@@ -55,6 +55,10 @@ Rules:
 - `screenshot` captures the screen and returns a text report (pixel stats,
   OCR, optional vision-model description). Use it for questions about a GUI's
   visible state; you cannot see the image itself.
+- `browser` opens a web page (directly or via a server command that prints
+  its URL), optionally presses keys/clicks, waits, and captures the page with
+  its text/console. Use it for HTTP-served UIs; a desktop screenshot cannot
+  see a page no browser opened.
 - Do not guess at code you have not read. If you need it, read it.
 - Choose `done` as soon as you have enough to answer the question. Do not browse.
 - Fill every field. Use "" for unused strings and 0 for unused numbers.

@@ -489,9 +489,9 @@ class LMStudio:
 
         Sent as an OpenAI-compatible image_url data URI, which LM Studio and
         Ollama's OpenAI endpoints accept for vision models. Kept separate from
-        chat() because it is only used by the opt-in screenshot action; a
-        text-only model will reject it, which the caller reports as an
-        observation rather than failing the task."""
+        chat() because it is only used by the opt-in screenshot/browser
+        actions; a text-only model will reject it, which the caller reports
+        as an observation rather than failing the task."""
         path = Path(image_path)
         mime = {".jpg": "image/jpeg", ".jpeg": "image/jpeg",
                 ".webp": "image/webp"}.get(path.suffix.lower(), "image/png")

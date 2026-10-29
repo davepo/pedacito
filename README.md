@@ -245,6 +245,11 @@ During the gather phase the model has a deliberately small set of actions:
   into text: size/brightness/blank-screen verdict, OCR, and an optional
   description from a `vision_model`. A text-only coding model never sees the
   image itself, but it can act on a “black/blank” verdict or OCR text.
+- `browser` — opt-in (`allow_browser = true`) headless-browser capture for
+  web apps. It can start a server command, find the URL it prints, navigate,
+  press keys/click/type, wait, capture the **page**, and report page text,
+  canvas sizes, and console errors. A desktop `screenshot` cannot see a page
+  that no browser opened.
 - Semantic fallback — with `semantic_search = true`, a `grep` that finds no
   text match queries the server's `/v1/embeddings` endpoint and returns the
   closest units by meaning.
@@ -279,9 +284,45 @@ vision model. PNGs are saved under `.pedacito/screenshots/`.
 
 This is evidence, not true perception: it reliably catches black screens,
 blank frames, missing text, and errors visible via OCR, but it does not judge
-art quality. For web UIs, a browser automation/accessibility tree would be
-more precise; for custom engines, a debug framebuffer dump is often the most
+art quality. For custom engines, a debug framebuffer dump is often the most
 reliable route.
+
+### Seeing a web page / web game
+
+A desktop screenshot is the wrong tool when the app is served over HTTP: the
+model may launch a dev server, capture a terminal or desktop, and conclude
+that a game it never opened is working. The opt-in `browser` action fixes
+that with a real headless browser:
+
+```bash
+pip install -e ".[browser]"
+python -m playwright install chromium
+```
+
+```toml
+allow_browser = true                # open URLs / drive pages
+allow_shell = true                  # only if browser should launch the server
+browser_wait_seconds = 3            # wait after actions before capture
+browser_server_wait_seconds = 15    # wait for a server to print its URL
+vision_model = "your-vl-model-id"   # optional image description
+```
+
+`browser` accepts either a URL or a server command that prints one:
+
+```text
+browser  command="python main.py"  pattern="press Enter; wait 3"  start=4
+```
+
+It starts the server, finds the `http://…` URL in its output, opens the page,
+presses Enter, waits, captures the page, and returns the page title/text,
+canvas sizes, console errors, and pixel/OCR/VLM analysis. If Playwright is
+not installed, it says so explicitly and tells the model not to infer web
+behavior from a desktop screenshot. A system Chrome/Chromium (without
+Playwright) can still load and capture a page, but cannot press keys or click.
+
+Both `screenshot` and `run` also detect a server URL in command output and
+label it as a web server, so the model is told that the desktop capture is
+not the page and that `browser` is the right next step.
 
 ### `explain` — answer questions about the code
 
@@ -563,6 +604,11 @@ ones:
 | `allow_shell` | False | Let the gather loop run one command per step (tests/linters); no shell pipes. |
 | `shell_idle_seconds` | 10 | Stop a quiet `run` command (GUI/server) instead of blocking until its window closes. |
 | `allow_screenshots` | False | Capture the screen and return pixel/OCR/vision text; privacy-sensitive. |
+| `allow_browser` | False | Open web pages in a headless browser, interact, capture, and report page text/console errors. |
+| `browser_wait_seconds` | 3 | Wait after browser actions before capturing. |
+| `browser_server_wait_seconds` | 15 | Wait for a launched server to print its URL. |
+| `browser_headless` | True | Run the browser without a visible window. |
+| `browser_timeout_seconds` | 20 | Per-navigation/action browser timeout. |
 | `vision_model` | `""` | Optional multimodal model id used to describe screenshots. |
 | `semantic_search` | False | Fall back to `/v1/embeddings` meaning-based search when `grep` finds nothing. |
 | `allow_diff` | True | Read-only `diff` action against Pedacito's pre-write snapshots; set false to shrink the tool surface. |
@@ -592,7 +638,8 @@ behavior, and more) all have working defaults and are documented in
 - A text-only model still cannot see graphics. `screenshot` gives it a text
   proxy (blank/black verdict, pixel stats, OCR, optional VLM description), not
   visual judgement; install the `vision` extra and use a multimodal model for
-  richer descriptions.
+  richer descriptions. For web games/UIs, use the `browser` extra and action:
+  it can navigate, press keys/click, wait, and capture the actual page.
 - Broad, structural tasks ("modernize this codebase") are a poor fit regardless
   of scaffolding — that's a limit of small local models. Narrow, localized
   tasks are where this is genuinely useful.

@@ -252,6 +252,23 @@ class Config:
     # Seconds to wait after launching before capturing (the app needs time to
     # open a window). The action's `start` value overrides this when set.
     screenshot_wait_seconds: int = 5
+    # Let the gather loop open a URL in a headless browser, optionally press
+    # keys/click, wait, capture the page, and read its text. This is how a
+    # model can verify a web game/server; a desktop screenshot cannot see a
+    # page that was never opened. It can reach any http(s) URL, so treat this
+    # as a trust decision like allow_shell. Needs the optional Playwright
+    # install:
+    #   pip install "pedacito-local[browser]"
+    #   python -m playwright install chromium
+    allow_browser: bool = False
+    # Seconds to wait after navigation/interaction before capturing.
+    browser_wait_seconds: int = 3
+    # Seconds to wait for a launched server to print its localhost URL.
+    browser_server_wait_seconds: int = 15
+    # Run the browser without a visible window (normal for screenshots).
+    browser_headless: bool = True
+    # Per-navigation/action timeout in seconds.
+    browser_timeout_seconds: int = 20
     # Optional multimodal model id (same server) used to describe a captured
     # screenshot. Empty = no image model; the tool still reports pixel
     # statistics and OCR text. Point this at e.g. a Qwen-VL model.
@@ -1933,6 +1950,17 @@ vram_gb  = 8                   # MANDATORY for local servers: GPU VRAM in GB
 #                                  # decision). Launching a command also needs
 #                                  # allow_shell.
 # screenshot_wait_seconds = 5      # wait after launch before capturing
+# allow_browser = false            # open a URL in headless Chromium, press
+#                                  # keys/click, wait, capture the PAGE, and
+#                                  # read its text. For web games/servers a
+#                                  # desktop screenshot is not enough. Needs
+#                                  # the optional playwright extra:
+#                                  #   pip install "pedacito-local[browser]"
+#                                  #   python -m playwright install chromium
+# browser_wait_seconds = 3         # wait after actions before capturing
+# browser_server_wait_seconds = 15 # wait for a launched server to print a URL
+# browser_headless = true          # no visible browser window
+# browser_timeout_seconds = 20     # navigation/action timeout
 # vision_model = ""                # multimodal model id for screenshot
 #                                  # descriptions (empty = stats/OCR only)
 # vision_max_tokens = 400

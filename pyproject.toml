@@ -21,6 +21,9 @@ pdc = "pedacito.cli:main"
 dev = ["pytest>=8"]
 # Screenshot capture/pixel analysis for the opt-in `screenshot` action.
 vision = ["Pillow>=10"]
+# Headless browser automation for the opt-in `browser` action. After
+# installing, run `python -m playwright install chromium` for the browser.
+browser = ["playwright>=1.40"]
 
 [tool.pytest.ini_options]
 markers = ["network: tests that spawn the fake LLM server (fast, local)"]

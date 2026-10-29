@@ -36,8 +36,9 @@ def spawn(command, *, cwd, shell: bool = False, env: dict | None = None,
           ) -> subprocess.Popen:
     """Start a child in its own process group without waiting for it.
 
-    Used by the screenshot action: launch the GUI, capture after a delay,
-    then `terminate()` the whole tree. Output is discarded by default."""
+    Used by the screenshot and browser actions: launch the GUI/server,
+    capture after a delay, then `terminate()` the whole tree. Output is
+    discarded by default (the browser launcher passes PIPE to find the URL)."""
     kwargs = {}
     if os.name != "nt":
         kwargs["start_new_session"] = True

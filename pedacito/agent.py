@@ -334,9 +334,19 @@ Rules:
   on); use it to run tests or a linter, not to inspect files.
 - `screenshot` launches an app (optional), waits, captures the screen, and
   returns pixel statistics, OCR text, and optionally a vision-model
-  description. Use it to check a GUI/game; a black/blank verdict is evidence.
-  You cannot see the image directly -- rely on the text report. Needs
-  allow_screenshots, and allow_shell when a command is launched.
+  description. Use it to check a desktop GUI/game; a black/blank verdict is
+  evidence. You cannot see the image directly -- rely on the text report.
+  Needs allow_screenshots, and allow_shell when a command is launched.
+- `browser` opens a URL (or starts a server command that prints its URL) in
+  a headless browser. Set `pattern` to interact first, e.g. `press Enter;
+  click #start; wait 3`, then `start` is the wait before capture. It returns
+  the page URL/title/text, canvas sizes, console errors, and a screenshot.
+  Use it for anything served over HTTP. A desktop `screenshot` cannot see a
+  web page that no browser opened. Needs allow_browser; launching a server
+  command also needs allow_shell.
+- Do not claim dynamic behavior (spawn rates, animation, timing) from one
+  screenshot or from reading code. If the app needs interaction and the
+  available tools cannot drive it, say so plainly instead of guessing.
 - `move` and `delete` are available only when allow_write is on. Prefer the
   search/replace answer format for edits; use these for whole-file moves or
   removals the task explicitly asks for.
@@ -694,6 +704,10 @@ class Agent:
                 detail = f"{stepjson.get('file')} -> {stepjson.get('to')}"
             elif action == "run":
                 detail = stepjson.get("command", "")
+            elif action == "browser":
+                detail = ((stepjson.get("command") or "")
+                          + (f" [{stepjson.get('pattern')}]"
+                             if stepjson.get("pattern") else ""))
             self.steps_log.append(f"{step}. {action} {detail}  ({why})")
             if on_step is not None:
                 try:

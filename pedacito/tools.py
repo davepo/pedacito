@@ -1,4 +1,4 @@
-"""The agent's tool surface: read, grep, callers, outline, sessions, diff, write/append, run, screenshot, done.
+"""The agent's tool surface: read, grep, callers, outline, sessions, diff, write/append, run, screenshot, browser, done.
 
 Usage
 -----
@@ -16,8 +16,9 @@ starts calling the wrong one or inventing arguments. The navigation tools
 own pre-write snapshots (`allow_diff = false` drops it).
 Everything destructive or machine-visible is behind an explicit gate:
 `write`/`append`/`move`/`delete` need `cfg.allow_write`, `run` needs
-`cfg.allow_shell`, and `screenshot` needs `cfg.allow_screenshots` (plus
-`allow_shell` when it launches an app). A default run therefore exposes only
+`cfg.allow_shell`, `screenshot` needs `cfg.allow_screenshots`, and `browser`
+needs `cfg.allow_browser`; both launch tools also need `allow_shell` when
+given a command. A default run therefore exposes only
 the navigation surface; a user who opts in accepts a larger surface because
 they asked for those capabilities. Every tool returns plain text with line
 numbers attached, since the model needs those numbers to write search/replace
@@ -61,7 +62,7 @@ import time
 from datetime import datetime
 from pathlib import Path
 
-from . import fileio, proc, sessions, vision
+from . import browser, fileio, proc, sessions, vision
 
 TOOL_HELP = """\
 read     - read exact lines of a file.       args: file, start, end
@@ -82,6 +83,12 @@ run      - run one command, no shell pipes.  args: command
 screenshot - launch app, wait, capture screen; returns text analysis.
            args: command, start (seconds to wait), optional file (old shot)
            (needs allow_screenshots; launching a command also needs allow_shell)
+browser  - open a web page in headless Chromium, interact, wait, capture it.
+           args: command (URL, or a command that prints a localhost URL),
+           pattern (optional "press Enter; click #start; wait 2"),
+           start (seconds to wait), optional file (old shot to compare)
+           (needs allow_browser; launching a command also needs allow_shell)
+           (a desktop screenshot cannot see a page that was never opened)
            (write/append/move/delete need allow_write; run needs allow_shell)
 done     - stop gathering; you have enough.  args: none"""
 
@@ -97,23 +104,25 @@ STEP_SCHEMA = {
             "type": "string",
             "enum": ["read", "grep", "callers", "outline", "sessions",
                      "diff", "write", "append", "move", "delete", "run",
-                     "screenshot", "done"],
+                     "screenshot", "browser", "done"],
         },
         "file": {"type": "string",
                  "description": "For read/write/append/move/delete. For "
                                 "outline, a file OR a directory/glob. For "
                                 "grep, optionally a file, directory, or glob. "
-                                "For diff, optionally one file. For screenshot, "
-                                "an older screenshot to compare. Empty "
+                                "For diff, optionally one file. For screenshot/"
+                                "browser, an older screenshot to compare. Empty "
                                 "otherwise.",
                  "maxLength": 200},
         "start": {"type": "integer",
-                  "description": "For read, or screenshot wait seconds. "
+                  "description": "For read, or screenshot/browser wait seconds. "
                                  "0 otherwise."},
         "end": {"type": "integer", "description": "For read. 0 otherwise."},
         "pattern": {"type": "string",
                     "description": "For grep: regex, or plain text if it is not "
-                                   "valid regex. Empty otherwise.",
+                                   "valid regex. For browser: optional actions "
+                                   "like 'press Enter; click #start; wait 2'. "
+                                   "Empty otherwise.",
                     "maxLength": 200},
         "symbol": {"type": "string",
                    "description": "For callers; or for read when file is empty "
@@ -124,8 +133,9 @@ STEP_SCHEMA = {
                "maxLength": 200},
         "command": {"type": "string",
                     "description": "For run/screenshot: executable and "
-                                   "arguments, e.g. 'pytest -q'. No pipes or "
-                                   "redirection. Empty otherwise.",
+                                   "arguments, e.g. 'pytest -q'. For browser: "
+                                   "a URL or a command that prints one. No "
+                                   "pipes or redirection. Empty otherwise.",
                     "maxLength": 300},
         "content": {"type": "string",
                     "description": "For write/append: at most ~120 lines of file "
@@ -154,13 +164,14 @@ STEP_SCHEMA = {
 # The action list is kept in one place so the schema, the gate in `dispatch`,
 # and the prompt help cannot drift apart.
 ACTIONS = ("read", "grep", "callers", "outline", "sessions", "diff", "write",
-           "append", "move", "delete", "run", "screenshot", "done")
+           "append", "move", "delete", "run", "screenshot", "browser", "done")
 WRITE_ACTION = "write"
 APPEND_ACTION = "append"
 MOVE_ACTION = "move"
 DELETE_ACTION = "delete"
 RUN_ACTION = "run"
 SCREENSHOT_ACTION = "screenshot"
+BROWSER_ACTION = "browser"
 DIFF_ACTION = "diff"
 WRITE_ACTIONS = (WRITE_ACTION, APPEND_ACTION)
 MUTATING_ACTIONS = WRITE_ACTIONS + (MOVE_ACTION, DELETE_ACTION)
@@ -187,6 +198,8 @@ def schema_for(cfg) -> dict:
         actions.append("run")
     if getattr(cfg, "allow_screenshots", False):
         actions.append("screenshot")
+    if getattr(cfg, "allow_browser", False):
+        actions.append("browser")
     actions.append("done")
 
     schema = copy.deepcopy(STEP_SCHEMA)
@@ -197,7 +210,8 @@ def schema_for(cfg) -> dict:
     if not getattr(cfg, "allow_write", False):
         drop |= {"content", "to"}
     if not (getattr(cfg, "allow_shell", False)
-            or getattr(cfg, "allow_screenshots", False)):
+            or getattr(cfg, "allow_screenshots", False)
+            or getattr(cfg, "allow_browser", False)):
         drop.add("command")
     for key in drop:
         schema["properties"].pop(key, None)
@@ -1446,6 +1460,19 @@ def _split_command(cmd: str) -> list[str]:
             else p for p in shlex.split(cmd, posix=False)]
 
 
+def _allowlist_error(cfg, argv: list[str]) -> str:
+    """Return an allowlist error for `argv`, or '' when it may run."""
+    allow = tuple(getattr(cfg, "shell_allowlist", ()) or ())
+    if not allow:
+        return ""
+    names = {Path(a).name.lower() for a in allow}
+    exe = Path(argv[0]).name.lower()
+    if exe in names or argv[0].lower() in {a.lower() for a in allow}:
+        return ""
+    return (f"ERROR: `{argv[0]}` is not in shell_allowlist "
+            f"({', '.join(allow)}).")
+
+
 def tool_run(index, cfg, command: str) -> str:
     """Run one command in the project root and return its output.
 
@@ -1475,13 +1502,9 @@ def tool_run(index, cfg, command: str) -> str:
     if not argv:
         return "ERROR: run needs a `command`."
 
-    allow = tuple(getattr(cfg, "shell_allowlist", ()) or ())
-    if allow:
-        names = {Path(a).name.lower() for a in allow}
-        exe = Path(argv[0]).name.lower()
-        if exe not in names and argv[0].lower() not in {a.lower() for a in allow}:
-            return (f"ERROR: `{argv[0]}` is not in shell_allowlist "
-                    f"({', '.join(allow)}).")
+    denied = _allowlist_error(cfg, argv)
+    if denied:
+        return denied
 
     timeout = max(1, _as_int(getattr(cfg, "shell_timeout", 120), 120))
     idle = max(0, _as_int(getattr(cfg, "shell_idle_seconds", 10), 10))
@@ -1526,6 +1549,19 @@ def tool_run(index, cfg, command: str) -> str:
         status = "OK" if rc == 0 else "FAILED"
         head = f"RUN: {cmd}\nEXIT: {rc} ({status})"
         tail = ""
+    server_url = browser.find_server_url(out)
+    if server_url:
+        head += f"\nSERVER: {server_url}"
+        if getattr(cfg, "allow_browser", False):
+            tail += ("\n[This was a WEB SERVER, not a GUI window. `run` stops "
+                     "a quiet server; use `browser` with command set to this "
+                     "launch command or its URL to open the page, interact, "
+                     "and capture it.]")
+        else:
+            tail += ("\n[This was a WEB SERVER. `run` stopped it after idle; "
+                     "a desktop screenshot cannot see its page. Enable "
+                     "allow_browser (and install the browser extra) to drive "
+                     "it, or verify with a console/headless check.]")
     return f"{head}\nOUTPUT:\n{out}{tail}"
 
 
@@ -1591,14 +1627,9 @@ def tool_screenshot(index, cfg, client, command: str = "", file: str = "",
             return f"ERROR: could not parse command ({e})."
         if not argv:
             return "ERROR: screenshot command is empty."
-        allow = tuple(getattr(cfg, "shell_allowlist", ()) or ())
-        if allow:
-            names = {Path(a).name.lower() for a in allow}
-            exe = Path(argv[0]).name.lower()
-            if exe not in names and \
-                    argv[0].lower() not in {a.lower() for a in allow}:
-                return (f"ERROR: `{argv[0]}` is not in shell_allowlist "
-                        f"({', '.join(allow)}).")
+        denied = _allowlist_error(cfg, argv)
+        if denied:
+            return denied
 
     root = Path(index.root).resolve()
     out_dir = root / ".pedacito" / "screenshots"
@@ -1610,18 +1641,30 @@ def tool_screenshot(index, cfg, client, command: str = "", file: str = "",
 
     launched = None
     exit_code = None
+    server_url = ""
+    launch_output = ""
     if prev is not None and not argv:
         # File-only mode: analyse that image instead of capturing again.
         out = prev
         method = "existing screenshot"
     else:
         if argv:
-            try:
-                launched = proc.spawn(argv, cwd=root, env=env)
-            except OSError as e:
-                return f"ERROR: could not launch '{cmd}': {e}"
             if delay:
-                time.sleep(delay)
+                # Use the server-aware launcher so a dev server's printed URL
+                # is recognised while we wait; a GUI simply waits the delay.
+                try:
+                    launched, server_url, launch_output = \
+                        browser.launch_server(
+                            argv, cwd=root, env=env, wait_seconds=delay)
+                except Exception as e:
+                    return f"ERROR: could not launch '{cmd}': {e}"
+                if launched is None:
+                    return f"ERROR: could not launch '{cmd}': {launch_output}"
+            else:
+                try:
+                    launched = proc.spawn(argv, cwd=root, env=env)
+                except OSError as e:
+                    return f"ERROR: could not launch '{cmd}': {e}"
         elif delay:
             # Give the currently running app a moment to settle.
             time.sleep(delay)
@@ -1658,6 +1701,25 @@ def tool_screenshot(index, cfg, client, command: str = "", file: str = "",
                   f"the capture)" if exit_code is not None else
                   " (still running; stopped after capture)")
         bits.append(f"LAUNCHED: {cmd}{status}")
+    if server_url:
+        # A desktop capture cannot show a page that no browser ever opened.
+        # Say that plainly: otherwise a small model reads a static/blank
+        # desktop shot as proof the game runs and behaves correctly.
+        bits.append(f"SERVER: {server_url}")
+        if getattr(cfg, "allow_browser", False):
+            bits.append(
+                "[This command is a WEB SERVER. The screenshot above is the "
+                "DESKTOP, not its page. Do not infer game/runtime behavior "
+                "from it. Use `browser` with command set to the URL or this "
+                "launch command, and pattern set to e.g. 'press Enter', to "
+                "open the page, interact, wait, and capture it.]")
+        else:
+            bits.append(
+                "[This command is a WEB SERVER. The screenshot above is the "
+                "DESKTOP, not its page. `allow_browser` is off, so this run "
+                "cannot open or drive the page. Do not claim runtime behavior "
+                "from this image; enable allow_browser (and install the "
+                "browser extra) or verify with a console/headless check.]")
     if prev is not None and argv:
         try:
             bits.append("COMPARED WITH: " + prev.relative_to(root).as_posix())
@@ -1674,6 +1736,165 @@ def tool_screenshot(index, cfg, client, command: str = "", file: str = "",
     bits.append("[A text model cannot see the image directly. Treat a "
                 "black/blank verdict or OCR text as evidence, not a guess "
                 "about rendering quality.]")
+    return "\n".join(bits)
+
+
+def tool_browser(index, cfg, client, command: str = "", pattern: str = "",
+                 start: int = 0, file: str = "") -> str:
+    """Open a web page, optionally interact with it, wait, and capture it.
+
+    `command` is either an http(s) URL or a command that starts a local web
+    server and prints its URL (the common `python main.py` case). `pattern`
+    holds a tiny interaction list -- `press Enter; click #start; wait 2` --
+    so the model can reach a game that waits behind a start screen. `start`
+    is the wait before capture. A desktop `screenshot` cannot do any of this;
+    this tool captures the PAGE and reports its text, canvas sizes, console
+    errors, and optional vision description.
+
+    Gated by `allow_browser`; launching a command also needs `allow_shell`.
+    """
+    if not getattr(cfg, "allow_browser", False):
+        return ("ERROR: `browser` is disabled (config allow_browser = false). "
+                "Enable it and install the browser extra:\n"
+                "  pip install \"pedacito-local[browser]\"\n"
+                "  python -m playwright install chromium")
+    cmd = _as_text(command).strip()
+    actions = _as_text(pattern).strip()
+    start = _as_int(start, 0)
+    file = _as_text(file).strip()
+    if not cmd:
+        return ("ERROR: browser needs `command`: an http(s) URL, or a command "
+                "that starts a local server and prints its URL.")
+    prev = _resolve_screenshot(index, file) if file else None
+    if file and prev is None:
+        return f"ERROR: no screenshot named '{file}' under the project root."
+
+    root = Path(index.root).resolve()
+    env = dict(os.environ, NO_COLOR="1", TERM="dumb", PAGER="cat",
+               GIT_PAGER="cat")
+    server = None
+    server_url = ""
+    if re.match(r"^(?:https?://|localhost(?::\d+)?(?:/|$)|"
+                r"127\.0\.0\.1(?::\d+)?(?:/|$))", cmd, re.IGNORECASE):
+        url = cmd if "://" in cmd else "http://" + cmd
+        url = browser.normalise_url(url)
+    else:
+        if not getattr(cfg, "allow_shell", False):
+            return ("ERROR: launching a browser server command needs "
+                    "allow_shell = true as well as allow_browser. Pass the "
+                    "URL directly if the server is already running.")
+        try:
+            argv = _split_command(cmd)
+        except ValueError as e:
+            return f"ERROR: could not parse command ({e})."
+        if not argv:
+            return "ERROR: browser command is empty."
+        denied = _allowlist_error(cfg, argv)
+        if denied:
+            return denied
+        wait = max(1, _as_int(getattr(cfg, "browser_server_wait_seconds", 15),
+                              15))
+        try:
+            server, url, launch_output = browser.launch_server(
+                argv, cwd=root, env=env, wait_seconds=wait)
+        except Exception as e:
+            return f"ERROR: could not launch '{cmd}': {e}"
+        if server is None:
+            return f"ERROR: could not launch '{cmd}': {launch_output}"
+        if not url:
+            proc.terminate(server)
+            try:
+                server.wait(timeout=5)
+            except Exception:
+                pass
+            detail = (launch_output or "").strip()[-1200:]
+            hint = ""
+            if getattr(cfg, "allow_shell", False):
+                hint = (" Start the server yourself and pass its URL as "
+                        "`command`, or run it with a console check.")
+            return (f"ERROR: '{cmd}' ran but printed no http:// URL within "
+                    f"{wait}s, so there is no page to open.{hint}\n"
+                    f"OUTPUT:\n{detail or '(no output)'}")
+        server_url = url
+
+    out_dir = root / ".pedacito" / "screenshots"
+    out = out_dir / ("browser-" + datetime.now().strftime("%Y%m%d-%H%M%S-%f")
+                     + ".png")
+    delay = start or _as_int(getattr(cfg, "browser_wait_seconds", 3), 3)
+    delay = max(0, min(delay, 60))
+    timeout = max(5, _as_int(getattr(cfg, "browser_timeout_seconds", 20), 20))
+    try:
+        ok, info = browser.run(
+            url, actions=actions, wait=delay, out=out, timeout=timeout,
+            headless=bool(getattr(cfg, "browser_headless", True)))
+    finally:
+        if server is not None:
+            proc.terminate(server)
+            try:
+                server.wait(timeout=5)
+            except Exception:
+                pass
+    if not ok:
+        return f"ERROR: {info}"
+
+    report = vision.analyze(out, previous=prev)
+    desc = ""
+    if (getattr(cfg, "vision_model", "") or "").strip():
+        try:
+            desc = vision.describe(client, cfg, out)
+        except Exception as e:
+            desc = f"(vision model failed: {str(e)[:200]})"
+
+    try:
+        rel_out = out.relative_to(root).as_posix()
+    except ValueError:                            # pragma: no cover
+        rel_out = str(out)
+    bits = [f"BROWSER: {info.get('url') or url}",
+            f"CAPTURE: {info.get('method') or 'browser'}"
+            f" ({rel_out})"]
+    if server_url:
+        bits.append(f"LAUNCHED: {cmd} (server {server_url}; stopped after "
+                    f"capture)")
+    if info.get("title"):
+        bits.append(f"TITLE: {info['title']}")
+    performed = info.get("actions") or []
+    if performed:
+        bits.append("ACTIONS: " + "; ".join(performed))
+    if actions and not performed:
+        bits.append(f"ACTIONS REQUESTED: {actions}")
+    if info.get("action_errors"):
+        bits.append("ACTION ERRORS:\n" + "\n".join(
+            f"- {e}" for e in info["action_errors"]))
+    if info.get("canvas"):
+        bits.append("CANVAS: " + str(info["canvas"]))
+    text = (info.get("text") or "").strip()
+    if text:
+        bits.append("PAGE TEXT:\n" + text[:3000])
+    else:
+        bits.append("PAGE TEXT: (none visible -- the page may draw only to "
+                    "a canvas)")
+    if info.get("console"):
+        bits.append("CONSOLE:\n" + "\n".join(
+            f"- {e}" for e in info["console"][-8:]))
+    if prev is not None:
+        try:
+            bits.append("COMPARED WITH: " + prev.relative_to(root).as_posix())
+        except ValueError:                        # pragma: no cover
+            bits.append("COMPARED WITH: " + str(prev))
+    bits.append("ANALYSIS:\n" + report)
+    if desc:
+        bits.append("VISION DESCRIPTION:\n" + desc)
+    else:
+        bits.append("[No vision_model configured: the evidence above is the "
+                    "page's text/canvas and pixel analysis. Set vision_model "
+                    "for an image description.]")
+    if not actions:
+        bits.append("[If the game waits behind a start screen, run `browser` "
+                    "again with pattern='press Enter' (or a click/type "
+                    "action) so the capture shows the running game.]")
+    bits.append("[A single capture is a snapshot. To judge time-dependent "
+                "behavior, take another capture after a known wait and "
+                "compare the two images/text.]")
     return "\n".join(bits)
 
 
@@ -1712,6 +1933,10 @@ def dispatch(index, cfg, step: dict, client=None) -> str:
     if action == SCREENSHOT_ACTION:
         return tool_screenshot(index, cfg, client, step.get("command", ""),
                                step.get("file", ""), step.get("start", 0))
+    if action == BROWSER_ACTION:
+        return tool_browser(index, cfg, client, step.get("command", ""),
+                            step.get("pattern", ""), step.get("start", 0),
+                            step.get("file", ""))
     if action in MUTATING_ACTIONS:
         if not getattr(cfg, "allow_write", False):
             return (f"ERROR: `{action}` is disabled (config allow_write = false). "
