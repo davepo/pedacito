@@ -164,6 +164,108 @@ def test_synthesized_steps_log_report_fails_verification():
     assert loop._evidence_failure("Locate the snake frames", tr) == ""
 
 
+def test_verdict_of_parses_the_last_verdict_line():
+    """Last match wins (a report may quote the brief's format before its own
+    verdict), and markdown bold/bullets around the line must not defeat the
+    parse -- small models decorate exactly those lines."""
+    assert loop._verdict_of("All good.\nVERDICT: PASSED") == ("PASSED", "")
+    assert loop._verdict_of(
+        "The brief says end with VERDICT: PASSED or VERDICT: FAILED.\n"
+        "Everything rendered.\n\n"
+        "**VERDICT: FAILED: the tail never tapered**") == (
+        "FAILED", "the tail never tapered")
+    assert loop._verdict_of("no verdict anywhere") == ("", "")
+
+
+def test_evidence_failure_reads_the_verdict_line():
+    """Run 10's terminal false green: task 11's report opened "Still
+    unknown: whether all five visual changes are actually visible" and was
+    ticked done -- no phrase pattern matched the wording. A FAILED verdict
+    must fail the check even when the surrounding prose is optimistic."""
+    tr = loop.TaskResult(
+        [], "The game runs and sprites were drawn; great progress overall.\n"
+            "\nVERDICT: FAILED: the sprite details were never shown live",
+        True, [], None,
+        steps=["1. browser python main.py [wait 3]  (Look.)"])
+    miss = loop._evidence_failure(
+        "Run the game and verify the sprites render", tr)
+    assert "VERDICT: FAILED" in miss
+    assert "never shown live" in miss
+
+
+def test_evidence_failure_pessimistic_on_contradictory_verdict():
+    """A PASSED verdict never overrides the phrase gate: when the body
+    confesses the check could not be performed, the contradiction resolves
+    against the pass -- pessimistic ties are the whole point of the gate."""
+    tr = loop.TaskResult(
+        [], "I could not verify the tail point in the capture.\n\n"
+            "VERDICT: PASSED",
+        True, [], None,
+        steps=["1. browser python main.py [wait 3]  (Look.)"])
+    assert loop._evidence_failure(
+        "Run the game and verify the tail tapers", tr)
+
+
+def test_evidence_failure_accepts_a_clean_passed_verdict():
+    tr = loop.TaskResult(
+        [], "The capture shows the snake falling head-first, its tail "
+            "tapering to a single pixel.\n\nVERDICT: PASSED",
+        True, [], None,
+        steps=["1. browser python main.py [wait 3]  (Look.)"])
+    assert loop._evidence_failure(
+        "Run the game and verify the snake orientation", tr) == ""
+
+
+def test_unverified_regex_catches_still_unknown_whether():
+    """The verdict-less fallback must also catch run 10's phrasing, where
+    the report's first line named the task's own claim as unknown -- while
+    a PASSED report's peripheral caveat ("Still unknown: direct
+    confirmation from index.html ...", same run, legitimately green) must
+    not trip it."""
+    assert loop._reply_says_unverified(
+        "Still unknown: whether all five visual changes are actually "
+        "visible in the running browser.")
+    assert loop._reply_says_unverified(
+        "Still unknown from the live capture: whether the frog visibly "
+        "scales, because the only evidence is a Game Over screen.")
+    assert not loop._reply_says_unverified(
+        "Still unknown: direct confirmation from index.html that the page "
+        "includes main.js, because that file was not gathered.")
+
+
+def test_investigation_answer_adds_the_verdict_brief_for_verify_titles(
+        tmp_path):
+    """Only verification-titled investigations get the verdict brief -- and
+    the decision must key off the clean TITLE, not the assembled prompt:
+    the goal block quotes the spec, whose verify words would otherwise put
+    PASSED/FAILED on every locate/reproduce task."""
+    seen = []
+
+    class StubAgent:
+        steps_log = ["1. browser python main.py [wait 3]  (Look.)"]
+
+        def gather(self, task, **kw):
+            return "EVIDENCE"
+
+        def answer(self, task, gathered, system=None, **kw):
+            seen.append(system)
+            return "The claim held.\n\nVERDICT: PASSED"
+
+    idx = types.SimpleNamespace(root=tmp_path)
+    loop.run_investigation_task(
+        tmp_path, _cfg(), None, StubAgent(), idx,
+        "ORIGINAL USER GOAL (background):\nKeep the sprite work verifiable.\n"
+        "\nCURRENT TASK\nVerify the tail tapers to a point")
+    assert "VERDICT: PASSED" in seen[0]
+    assert "very last line" in seen[0]
+
+    loop.run_investigation_task(
+        tmp_path, _cfg(), None, StubAgent(), idx,
+        "ORIGINAL USER GOAL (background):\nYou must verify nothing "
+        "regressed.\n\nCURRENT TASK\nLocate the snake rendering code")
+    assert "VERDICT" not in seen[1]
+
+
 def test_clip_report_keeps_head_and_tail():
     """Caveats can sit ANYWHERE in a report: the run that motivated this
     lost a mid-report "nothing shows this file is loaded by the running
@@ -233,6 +335,13 @@ def test_plan_system_requires_constraints_in_titles():
     assert "Carry every concrete constraint" in loop.PLAN_SYSTEM
 
 
+def test_plan_system_wants_a_checkpoint_per_visible_change():
+    """A five-item sprite spec verified by one big final check would make a
+    failure unattributable and unrepairable selectively -- the planner must
+    interleave a live checkpoint after each independent visible change."""
+    assert "after EACH one" in loop.PLAN_SYSTEM
+
+
 def test_gather_base_requires_locate_diligence():
     """Run 7's locate task concluded "done (Found snake frame and draw
     code)" after reading ONLY the dead enemies.js -- the first name match.
@@ -252,6 +361,18 @@ def test_gather_base_warns_browser_waits_add():
     the two waits add together."""
     from pedacito.agent import GATHER_BASE
     assert "add together" in GATHER_BASE
+
+
+def test_gather_base_documents_the_eval_action():
+    """State-dependent visual checks (does the frog SCALE when grown) are
+    undrivable by clicks alone: run 9's verify had no way to force the
+    grown state and could only recommend it in prose. The prompt must teach
+    the `eval` escape hatch or small models will never use it -- and run 10
+    showed the teaching must include the consumes-rest grammar, or the
+    model's multi-statement JS gets shredded by the `;` action splitter."""
+    from pedacito.agent import GATHER_BASE
+    assert "eval <js>" in GATHER_BASE
+    assert "put it LAST" in GATHER_BASE
 
 
 def test_run_investigation_task_retries_an_empty_answer(tmp_path):
@@ -363,7 +484,10 @@ def test_run_loop_fails_verify_task_that_gathered_no_evidence(tmp_path,
 
     monkeypatch.setattr(loop, "run_task", fake_run_task)
     monkeypatch.setattr(loop, "run_investigation_task", fake_investigate)
-    code = loop.run_loop(tmp_path, _cfg(), None, idx, plan, apply=True)
+    # repair_rounds=0 isolates the gate: with a budget, a failed check now
+    # gets a remediation task first (pinned in the remediation tests below).
+    code = loop.run_loop(tmp_path, _cfg(), None, idx, plan, apply=True,
+                         repair_rounds=0)
     assert code == 1
     assert [kind for kind, _ in calls] == ["edit", "investigate"]
     # The verify task is told up front that tools live in the lookup phase.
@@ -390,7 +514,9 @@ def test_run_loop_edit_task_needs_evidence_when_title_says_verify(tmp_path,
                      "verification.", True, ["a.py"], idx_)
 
     monkeypatch.setattr(loop, "run_task", fake_run_task)
-    code = loop.run_loop(tmp_path, _cfg(), None, idx, plan, apply=True)
+    code = loop.run_loop(tmp_path, _cfg(), None, idx, plan, apply=True,
+                         repair_rounds=0)   # isolate the gate; remediation
+                                            # has its own tests
     assert code == 1
     assert "- [x]" not in plan.read_text()
 
@@ -412,7 +538,9 @@ def test_run_loop_live_verify_needs_a_live_step(tmp_path, monkeypatch):
             steps=["1. read static/js/main.js L195-230  (Check frames.)"])
 
     monkeypatch.setattr(loop, "run_investigation_task", fake_investigate)
-    code = loop.run_loop(tmp_path, _cfg(), None, idx, plan, apply=True)
+    code = loop.run_loop(tmp_path, _cfg(), None, idx, plan, apply=True,
+                         repair_rounds=0)   # isolate the gate; remediation
+                                            # has its own tests
     assert code == 1
     assert "- [x]" not in plan.read_text()
 
@@ -437,6 +565,218 @@ def test_run_loop_live_verify_passes_with_browser_step(tmp_path, monkeypatch):
     assert "- [x] Run the game" in plan.read_text()
 
 
+def test_insert_task_before_keeps_the_failed_check_unchecked(tmp_path):
+    """The repair must run BEFORE the retried check, and the check must
+    stay unchecked so the top-down loop picks the repair first."""
+    plan = tmp_path / "PLAN.md"
+    loop.write_plan(plan, "goal", ["Fix the sprite rows",
+                                   "Run the game and verify one head"])
+    loop.mark_done(plan, "Fix the sprite rows")
+    assert loop.insert_task_before(plan, "Run the game and verify one head",
+                                   loop._REMEDIATION_TITLE)
+    lines = [ln for ln in plan.read_text().splitlines()
+             if ln.startswith("- [")]
+    assert lines == ["- [x] Fix the sprite rows",
+                     f"- [ ] {loop._REMEDIATION_TITLE}",
+                     "- [ ] Run the game and verify one head"]
+    assert not loop.insert_task_before(plan, "no such task", "Whatever")
+
+
+def test_remediation_title_routes_to_edit_branch_without_gate():
+    """The inserted repair task must not itself be an investigation task,
+    nor a verification checkpoint: a repair cannot always drive the app,
+    and the retried check right after it does the observing. A future
+    word-list change that breaks either property would quietly deadlock
+    the remediation path (repair fails its own gate -> more repairs)."""
+    t = loop._REMEDIATION_TITLE
+    assert not loop._is_investigation_task(t)
+    assert not loop._is_verification_task(t)
+    # Run 10's Goodhart: the field remediation "fixed" a failed survival
+    # check by moving enemy spawning 3s -> 12s, violating the goal's frozen
+    # spawn timing. The title must make frozen behavior off-limits and a
+    # conflict a reportable outcome -- while staying scan-clean (the two
+    # routing properties pinned above).
+    assert "freezes" in t and "do not edit" in t
+
+
+def test_run_loop_inserts_remediation_after_failed_verify(tmp_path, monkeypatch):
+    """Bug H: a failed verification used to end the run with its diagnosis
+    (often an exact repair recipe) left in the log and no task owning it.
+    Now the report becomes a FAILED LIVE TEST context note, a repair task
+    is inserted BEFORE the still-unchecked check, and -- within the same
+    run -- the repair lands and the check retries."""
+    plan = tmp_path / "PLAN.md"
+    loop.write_plan(plan, "goal",
+                    ["Run the game and verify the snake has one head"])
+    idx = types.SimpleNamespace(root=tmp_path)
+    verifies = []
+    repairs = []
+
+    def fake_investigate(root, cfg, client, agent, idx_, task,
+                         answer_system=None):
+        verifies.append(task)
+        if len(verifies) == 1:
+            return loop.TaskResult(
+                [], "Verification failed in the captured run: each snake "
+                    "still shows a second head block halfway down its body "
+                    "(main.js L213/L245).", True, [], idx_,
+                steps=["1. browser python main.py [wait 3]  (Look.)"])
+        return loop.TaskResult(
+            [], "Verified in the browser: every snake now shows a single "
+                "head at the top of its body.", True, [], idx_,
+            steps=["1. browser python main.py [wait 3]  (Look again.)"])
+
+    def fake_run_task(root, cfg, client, agent, idx_, task, apply=True,
+                      review=False, answer_system=None):
+        repairs.append(task)
+        return loop.TaskResult([_ok()], "Replaced the duplicated rows.",
+                               True, ["a.py"], idx_,
+                               steps=["1. read a.py L1-5  (Rows.)"])
+
+    monkeypatch.setattr(loop, "run_investigation_task", fake_investigate)
+    monkeypatch.setattr(loop, "run_task", fake_run_task)
+    code = loop.run_loop(tmp_path, _cfg(), None, idx, plan, apply=True)
+    assert code == 0
+    assert len(verifies) == 2          # the check retried within the run
+    assert len(repairs) == 1
+    assert repairs[0].startswith(loop._REMEDIATION_TITLE)
+    # the diagnosis itself must reach the repair worker: the failed check's
+    # report rides along in the assembled prompt's context notes
+    assert "FAILED LIVE TEST" in repairs[0]
+    assert "Verification failed in the captured run" in repairs[0]
+    # Fix M: the failed report's suggested fix must reach the repair worker
+    # flagged as a hypothesis, not a mandate -- run 10's repair followed the
+    # report's "delay the first spawn" recipe straight into a violation of
+    # the goal's frozen spawn timing.
+    assert "only a hypothesis" in repairs[0]
+    assert "freezes" in repairs[0]
+    text = plan.read_text()
+    assert text.count("- [x]") == 2    # repair + retried check
+    assert "- [ ]" not in text
+
+
+def test_run_loop_remediation_rounds_are_bounded(tmp_path, monkeypatch):
+    """Self-healing must not become self-deception: once repair_rounds
+    repairs were spent on one check, the next failure ends the run as
+    before, with the check's box left unchecked for a resume."""
+    plan = tmp_path / "PLAN.md"
+    loop.write_plan(plan, "goal",
+                    ["Run the game and verify the snake has one head"])
+    idx = types.SimpleNamespace(root=tmp_path)
+    verifies = []
+
+    def fake_investigate(root, cfg, client, agent, idx_, task,
+                         answer_system=None):
+        verifies.append(task)
+        return loop.TaskResult(
+            [], "Verification failed: the snake still shows two heads.",
+            True, [], idx_,
+            steps=["1. browser python main.py [wait 3]  (Look.)"])
+
+    def fake_run_task(root, cfg, client, agent, idx_, task, apply=True,
+                      review=False, answer_system=None):
+        return loop.TaskResult([_ok()], "Tried a fix.", True, ["a.py"],
+                               idx_, steps=["1. read a.py L1-5  (Rows.)"])
+
+    monkeypatch.setattr(loop, "run_investigation_task", fake_investigate)
+    monkeypatch.setattr(loop, "run_task", fake_run_task)
+    code = loop.run_loop(tmp_path, _cfg(), None, idx, plan, apply=True,
+                         repair_rounds=2)
+    assert code == 1
+    assert len(verifies) == 3          # initial + two post-repair retries
+    text = plan.read_text()
+    assert text.count("- [x] Repair") == 2
+    assert "- [ ] Run the game and verify" in text
+
+
+def test_run_loop_retires_a_check_whose_repair_refused_to_edit(tmp_path,
+                                                               monkeypatch):
+    """Bug N, from run 11: the planner titled task 1 "observe the spawn
+    timing to CONFIRM the 12-second delay" -- a defect-confirmation
+    checkpoint. The inserted repair did the goal's work instead (restored
+    the 3-second schedule), making the check permanently unpassable; the
+    next repair refused to re-break the code ("would conflict with the
+    goal"), the check failed again, and the run STOPPED with five
+    downstream tasks never run -- and a resume replays the deadlock
+    forever. A no-edit repair must retire the check as failed and let the
+    rest of the plan run."""
+    plan = tmp_path / "PLAN.md"
+    loop.write_plan(plan, "goal",
+                    ["Run the game and verify the delay is 12 seconds",
+                     "Fix the sprite rows"])
+    idx = types.SimpleNamespace(root=tmp_path)
+    verifies = []
+    repairs = []
+    fixes = []
+
+    def fake_investigate(root, cfg, client, agent, idx_, task,
+                         answer_system=None):
+        verifies.append(task)
+        return loop.TaskResult(
+            [], "The delay is gone; the goal's restore removed it.\n\n"
+                "VERDICT: FAILED: the 12-second delay no longer exists",
+            True, [], idx_,
+            steps=["1. browser python main.py [wait 3]  (Look.)"])
+
+    def fake_run_task(root, cfg, client, agent, idx_, task, apply=True,
+                      review=False, answer_system=None):
+        if task.startswith("Repair the defect"):
+            repairs.append(task)
+            return loop.TaskResult(
+                [], "No code edit is needed: the restored schedule is "
+                    "already in place, and reintroducing the delay would "
+                    "conflict with the goal.", True, [], idx_, steps=[])
+        fixes.append(task)
+        return loop.TaskResult([_ok()], "Fixed the rows.", True, ["a.py"],
+                               idx_, steps=["1. read a.py L1-5  (Rows.)"])
+
+    monkeypatch.setattr(loop, "run_investigation_task", fake_investigate)
+    monkeypatch.setattr(loop, "run_task", fake_run_task)
+    code = loop.run_loop(tmp_path, _cfg(), None, idx, plan, apply=True)
+    assert code == 1                     # the retired check stays a failure
+    assert len(verifies) == 2            # original + one retry, no more
+    assert len(repairs) == 1             # one repair, then retired
+    assert len(fixes) == 1               # the DOWNSTREAM task still ran
+    text = plan.read_text()
+    assert "- [!] Run the game and verify the delay" in text
+    assert "- [x] Fix the sprite rows" in text
+
+
+def test_plan_system_forbids_defect_confirming_checkpoints():
+    """Run 11's trap, planner-side: task 1 was "observe the current enemy
+    spawn timing to CONFIRM the 12-second delay and -12 offset" -- a
+    defect-confirmation checkpoint that the plan's own restore task makes
+    permanently unpassable. Pre-change observations must be Reproduce/
+    Investigate titles (ungated), and verify checkpoints must state the
+    AFTER-change expectation."""
+    assert "can never pass again" in loop.PLAN_SYSTEM
+    assert "AFTER-change" in loop.PLAN_SYSTEM
+
+
+def test_run_loop_empty_report_gets_no_remediation(tmp_path, monkeypatch):
+    """A synthesized steps-log stand-in carries no diagnosis -- a repair
+    task would be guessing at what to fix. Empty-report failures fail
+    straight away; a resume retries the whole check, and the answer-phase
+    retry in run_investigation_task may well produce a real report."""
+    plan = tmp_path / "PLAN.md"
+    loop.write_plan(plan, "goal",
+                    ["Run the game and verify the snake has one head"])
+    idx = types.SimpleNamespace(root=tmp_path)
+
+    def fake_investigate(root, cfg, client, agent, idx_, task,
+                         answer_system=None):
+        return loop.TaskResult(
+            [], "No prose report was produced; the lookup phase recorded:\n\n"
+                "3. browser python main.py [wait 10]  (Look.)",
+            True, [], idx_,
+            steps=["3. browser python main.py [wait 10]  (Look.)"])
+
+    monkeypatch.setattr(loop, "run_investigation_task", fake_investigate)
+    code = loop.run_loop(tmp_path, _cfg(), None, idx, plan, apply=True)
+    assert code == 1
+    assert "Repair the defect" not in plan.read_text()
+
+
 def test_run_loop_fails_verify_task_reporting_a_failed_verification(
         tmp_path, monkeypatch):
     """Run 7's terminal false green: the browser HAD been driven, so the
@@ -458,7 +798,9 @@ def test_run_loop_fails_verify_task_reporting_a_failed_verification(
             steps=["1. browser python main.py [press Enter; wait 3]  (Look.)"])
 
     monkeypatch.setattr(loop, "run_investigation_task", fake_investigate)
-    code = loop.run_loop(tmp_path, _cfg(), None, idx, plan, apply=True)
+    code = loop.run_loop(tmp_path, _cfg(), None, idx, plan, apply=True,
+                         repair_rounds=0)   # isolate the gate; remediation
+                                            # has its own tests
     assert code == 1
     assert "- [x]" not in plan.read_text()
 
@@ -483,7 +825,9 @@ def test_run_loop_fails_verify_task_with_no_prose_report(tmp_path, monkeypatch):
             steps=["3. browser python main.py [press Enter; wait 10]  (Look.)"])
 
     monkeypatch.setattr(loop, "run_investigation_task", fake_investigate)
-    code = loop.run_loop(tmp_path, _cfg(), None, idx, plan, apply=True)
+    code = loop.run_loop(tmp_path, _cfg(), None, idx, plan, apply=True,
+                         repair_rounds=0)   # isolate the gate; remediation
+                                            # has its own tests
     assert code == 1
     assert "- [x]" not in plan.read_text()
 
@@ -504,7 +848,9 @@ def test_run_loop_edit_verify_task_needs_live_step(tmp_path, monkeypatch):
                                steps=["1. read a.py L1-5  (Palette.)"])
 
     monkeypatch.setattr(loop, "run_task", fake_run_task)
-    code = loop.run_loop(tmp_path, _cfg(), None, idx, plan, apply=True)
+    code = loop.run_loop(tmp_path, _cfg(), None, idx, plan, apply=True,
+                         repair_rounds=0)   # isolate the gate; remediation
+                                            # has its own tests
     assert code == 1
     assert "- [x]" not in plan.read_text()
 
@@ -633,6 +979,48 @@ def test_context_notes_carry_report_tail(tmp_path, monkeypatch):
     assert "CONTEXT FROM PRIOR INVESTIGATION" in fix_task
     assert "Likely cause: enemies.js" in fix_task
     assert "confirm which snake class" in fix_task
+
+
+def test_prune_notes_pins_first_keeps_latest_two():
+    """Fix K unit pin: the window keeps note[0] (the reproduce anchor) plus
+    the latest two; only the middle rolls off."""
+    notes = ["n0", "n1", "n2"]
+    loop._prune_notes(notes)
+    assert notes == ["n0", "n1", "n2"]        # window not exceeded yet
+    notes.append("n3")
+    loop._prune_notes(notes)
+    assert notes == ["n0", "n2", "n3"]        # middle evicted, anchor kept
+    notes += ["n4", "n5"]
+    loop._prune_notes(notes)
+    assert notes == ["n0", "n4", "n5"]
+
+
+def test_run_loop_pins_the_reproduce_note_into_later_prompts(tmp_path,
+                                                             monkeypatch):
+    """Run 9's task 6 edited the dead player.js because task 1's reproduce
+    report -- the one that named the file as unconfirmed-live -- had been
+    evicted from the two-note window. The first note must ride along in
+    every later prompt."""
+    plan = tmp_path / "PLAN.md"
+    loop.write_plan(plan, "goal",
+                    [f"Investigate thing {i}" for i in range(1, 6)])
+    idx = types.SimpleNamespace(root=tmp_path)
+    prompts = []
+
+    def fake_investigate(root, cfg, client, agent, idx_, task,
+                         answer_system=None):
+        prompts.append(task)
+        n = len(prompts)
+        return loop.TaskResult(
+            [], f"NOTE-{n}: found evidence about thing {n}.", True, [], idx_)
+
+    monkeypatch.setattr(loop, "run_investigation_task", fake_investigate)
+    code = loop.run_loop(tmp_path, _cfg(), None, idx, plan, apply=True)
+    assert code == 0
+    last = prompts[4]                     # task 5's assembled prompt
+    assert "NOTE-1" in last               # the pinned reproduce anchor
+    assert "NOTE-3" in last and "NOTE-4" in last    # the latest two
+    assert "NOTE-2" not in last           # middle notes still evict
 
 
 # ------------------------------------------------------------------- planning

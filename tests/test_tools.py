@@ -1110,6 +1110,127 @@ def test_browser_server_url_detection_and_action_parser():
         ("press", "Enter"), ("click", "#start"), ("wait", 2.0),
         ("fill", ("#name", "Ada")), ("type", "hi")]
     assert browser.parse_actions("Enter") == [("press", "Enter")]
+    # Run 9's frog-scale verify could only RECOMMEND "force state.data.scale
+    # = 2 in the browser console" -- eval gives the pattern language that
+    # reach. Run 10 then showed the `;` splitter shredding multi-statement
+    # JS into a SyntaxError eval plus `press d.scale=2: Unknown key`
+    # fragments, so an eval now consumes the REST of the pattern (the docs
+    # say "put eval last"); `js` is accepted as an alias.
+    assert browser.parse_actions(
+        "press Enter; wait 2; eval var d = window.__game.data; "
+        "d.scale = 3") == [
+        ("press", "Enter"), ("wait", 2.0),
+        ("eval", "var d = window.__game.data; d.scale = 3")]
+    assert browser.parse_actions("eval") == []      # empty expr: dropped
+    # Run 10's forced-state expressions were truncated mid-token at 200,
+    # and schema-constrained sampling cannot emit what the schema forbids.
+    assert tools.STEP_SCHEMA["properties"]["pattern"]["maxLength"] == 600
+
+
+def test_browser_eval_action_runs_and_reports_its_value(tmp_path, monkeypatch):
+    """`eval` must execute one JS expression in the page and put the RESULT
+    into the action log -- the feedback is what lets a model confirm the
+    forced state took before the capture grades it (run 9's frog-scale
+    check needed exactly this and could only recommend it in prose)."""
+    import sys
+    import types as pytypes
+    from pedacito import browser
+
+    class FakeKeyboard:
+        def __init__(self):
+            self.pressed = []
+
+        def press(self, key):
+            self.pressed.append(key)
+
+        def type(self, text):
+            pass
+
+    class FakePage:
+        url = "http://127.0.0.1:5000/"
+
+        def __init__(self):
+            self.evaled = []
+            self.keyboard = FakeKeyboard()
+
+        def set_default_timeout(self, ms):
+            pass
+
+        def on(self, event, handler):
+            pass
+
+        def goto(self, url, wait_until=None, timeout=None):
+            pass
+
+        def evaluate(self, expr):
+            if expr.startswith("()"):
+                return []          # the _canvas_info probe
+            self.evaled.append(expr)
+            return 3               # as if the assignment yielded the value
+
+        def wait_for_timeout(self, ms):
+            pass
+
+        def screenshot(self, path=None, full_page=False):
+            with open(path, "wb") as fh:
+                fh.write(b"fake png")
+
+        def inner_text(self, sel):
+            return ""
+
+        def title(self):
+            return "Game"
+
+    class FakeBrowser:
+        def __init__(self, page):
+            self._page = page
+
+        def new_page(self, viewport=None):
+            return self._page
+
+        def close(self):
+            pass
+
+    class FakeChromium:
+        def __init__(self, page):
+            self._page = page
+
+        def launch(self, headless=True):
+            return FakeBrowser(self._page)
+
+    class FakePW:
+        def __init__(self, page):
+            self.chromium = FakeChromium(page)
+
+    class FakeCM:
+        def __init__(self, pw):
+            self._pw = pw
+
+        def __enter__(self):
+            return self._pw
+
+        def __exit__(self, *exc):
+            return False
+
+    page = FakePage()
+    fake_sync = pytypes.ModuleType("playwright.sync_api")
+    fake_sync.sync_playwright = lambda: FakeCM(FakePW(page))
+    fake_root = pytypes.ModuleType("playwright")
+    fake_root.sync_api = fake_sync
+    monkeypatch.setitem(sys.modules, "playwright", fake_root)
+    monkeypatch.setitem(sys.modules, "playwright.sync_api", fake_sync)
+    monkeypatch.setattr(browser, "available", lambda: True)
+
+    ok, info = browser.run(
+        "http://127.0.0.1:5000/",
+        actions="press Enter; eval state.data.scale = 3",
+        wait=0, out=tmp_path / "shot.png")
+    assert ok, info
+    assert page.keyboard.pressed == ["Enter"]
+    assert page.evaled == ["state.data.scale = 3"]
+    assert "pressed Enter" in info["actions"]
+    assert "eval'd state.data.scale = 3 -> 3" in info["actions"]
+    assert info["action_errors"] == []
 
 
 def test_browser_is_gated_and_explains_a_missing_backend(tmp_path, monkeypatch):

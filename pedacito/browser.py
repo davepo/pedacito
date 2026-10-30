@@ -123,18 +123,35 @@ def parse_actions(spec: str) -> list[tuple]:
         fill #name Ada           -> fill a field
         type hello               -> type into the focused element
         wait 2                   -> wait two seconds
+        eval x.y = 3             -> run JS in the page and report its value;
+                                     an eval consumes the REST of the spec
+                                     (put it last; `;` inside it is fine)
 
     Multiple actions are separated by semicolons, e.g.
     `press Enter; wait 3; click canvas`.
     """
     out: list[tuple] = []
-    for raw in (spec or "").split(";"):
-        part = raw.strip()
+    parts = [raw.strip() for raw in (spec or "").split(";")]
+    for i, part in enumerate(parts):
         if not part:
             continue
         head, _, rest = part.partition(" ")
         kind = head.lower()
         rest = rest.strip()
+        if kind in ("eval", "js"):
+            # Run 10 field-tested Fix J's eval and the grammar defeated
+            # itself: the `;` splitter shredded multi-statement JS ("eval
+            # (function(){var d=window.__game.data" -> SyntaxError, the tail
+            # fragments replayed as `press d.scale=2: Unknown key`) and the
+            # model diagnosed its own tool failure in prose but had no way
+            # around it. An eval now consumes the REST of the pattern -- one
+            # expression, semicolons allowed inside, documented everywhere
+            # as "put eval last". page.evaluate takes the whole string (CDP
+            # returns the completion value of statements and IIFEs alike).
+            expr = "; ".join(p for p in (rest, *parts[i + 1:]) if p)
+            if expr:
+                out.append(("eval", expr))
+            break
         if kind in ("press", "key"):
             out.append(("press", rest or "Enter"))
         elif kind == "click":
@@ -273,8 +290,8 @@ def run(url: str, *, actions: str = "", wait: float = 3.0, out=None,
         return False, install_hint()
     if parse_actions(actions):
         return False, ("A system Chrome/Chromium can load and capture a page, "
-                       "but cannot press keys or click. Install Playwright "
-                       "for interactions:\n"
+                       "but cannot press keys, click, or run scripts. "
+                       "Install Playwright for interactions:\n"
                        "  pip install \"pedacito-local[browser]\"\n"
                        "  python -m playwright install chromium")
     return _run_chrome(exe, url, wait=wait, out=out, timeout=timeout)
@@ -326,6 +343,13 @@ def _run_playwright(url: str, *, actions: str, wait: float, out,
                         elif kind == "wait":
                             page.wait_for_timeout(int(float(arg) * 1000))
                             action_log.append(f"waited {arg:g}s")
+                        elif kind == "eval":
+                            value = page.evaluate(arg)
+                            # 240: run 11's JSON.stringify state dumps -- the
+                            # canonical eval use -- lost their tail fields
+                            # (enemies, spawning) to the old 120-char clip.
+                            action_log.append(
+                                f"eval'd {arg[:60]} -> {str(value)[:240]}")
                     except Exception as e:
                         action_errors.append(f"{kind} {arg}: {str(e)[:160]}")
 

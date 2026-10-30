@@ -340,8 +340,12 @@ Rules:
 - `browser` opens a URL (or starts a server command that prints its URL) in
   a headless browser. Set `pattern` to interact first, e.g. `press Enter;
   click #start`, and `start` to the seconds to wait before capture. A `wait`
-  inside `pattern` and `start` add together -- set one, not both. It returns
-  the page URL/title/text, canvas sizes, console errors, and a screenshot.
+  inside `pattern` and `start` add together -- set one, not both. `eval <js>`
+  runs script in the page and reports the value back -- use it to force state
+  no interaction can reach (a grown player, a late level) before the capture;
+  put it LAST: everything after `eval` is one expression, semicolons allowed.
+  It returns the page URL/title/text, canvas sizes, console errors, and a
+  screenshot.
   Use it for anything served over HTTP. A desktop `screenshot` cannot see a
   web page that no browser opened. Needs allow_browser; launching a server
   command also needs allow_shell.

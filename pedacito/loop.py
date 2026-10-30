@@ -100,6 +100,17 @@ _UNVERIFIED_RES = (
     re.compile(r"\bnot\s+(?:\w+\s+){0,2}?verif(?:y|ied|ies|ying)\b"),
     # "no live run/verification/visual evidence".
     re.compile(r"\bno\s+live\s+(?:run|verification|visual|evidence)"),
+    # "Still unknown: whether the sprites render" -- run 10's twice-repeated
+    # false green in verdict-less form: the report's FIRST LINE named the
+    # task's own claim as unknown ("does not show a grown frog", "does not
+    # provide ... evidence" all escaped the patterns above). The `whether`
+    # window separates a core-claim unknown from a passing caveat ("Still
+    # unknown: direct confirmation from index.html ..." -- a legitimately
+    # PASSED report in the same run); the 40-char leash keeps that caveat
+    # style out. Pessimism is deliberate: a peripheral "still unknown
+    # whether" costs one bounded remediation round, a missed one costs the
+    # run's truthfulness.
+    re.compile(r"\bstill unknown\b[^.\n]{0,40}?\bwhether\b"),
 )
 
 
@@ -141,6 +152,29 @@ def _reply_says_unverified(reply: str) -> bool:
     return any(r.search(low) for r in _UNVERIFIED_RES)
 
 
+# Run 10 ended all-green with two checks whose reports opened "Still unknown:
+# whether <the task's own claim>" -- the phrase patterns above missed the
+# wording, and prose rewording will always outrun a pattern list. So
+# verification reports must END with a machine-readable verdict line (the
+# brief is appended in run_investigation_task) and _evidence_failure reads it
+# first. Last match wins: a report may quote the brief's format before
+# stating its own verdict. The prefix class tolerates markdown bold/bullets
+# ("**VERDICT: FAILED**", "- VERDICT: PASSED") -- small models decorate
+# exactly those lines.
+_VERDICT_RE = re.compile(
+    r"(?im)^[*\s-]{0,4}VERDICT:\s*(PASSED|FAILED)\b:?\s*(.*?)\s*$")
+
+
+def _verdict_of(reply: str) -> tuple[str, str]:
+    """The report's last verdict line as (state, reason): ("FAILED", "the
+    frog never rendered"), ("PASSED", ""), or ("", "") when absent."""
+    found = _VERDICT_RE.findall(reply or "")
+    if not found:
+        return "", ""
+    state, reason = found[-1]
+    return state.upper(), reason.strip().strip("*").strip()
+
+
 # Words that make a task title a verification checkpoint: its deliverable is
 # evidence that the expected behavior was observed, not a code change.
 # `check` is matched as a whole word so "checksum" does not qualify.
@@ -151,6 +185,22 @@ _VERIFY_WORDS = re.compile(
 def _is_verification_task(task: str) -> bool:
     """True for a task whose title asks to verify/confirm/observe behavior."""
     return bool(_VERIFY_WORDS.search((task or "").lower()))
+
+
+def _task_title(task: str) -> str:
+    """The clean title line out of a possibly-assembled worker prompt.
+
+    run_loop hands workers the assembled text (ORIGINAL USER GOAL block +
+    CURRENT TASK + context notes), but title-keyed decisions -- like the
+    verdict brief in run_investigation_task -- must not read the goal block:
+    it quotes the spec, whose prose can contain verify words that would put
+    PASSED/FAILED on every locate/reproduce task. With no goal block the
+    title is simply the first line."""
+    body = task or ""
+    marker = "\nCURRENT TASK\n"
+    if marker in body:
+        body = body.split(marker, 1)[1]
+    return body.split("\n", 1)[0]
 
 
 # Clipping budget for the investigation reports carried between tasks. Local
@@ -230,14 +280,18 @@ def _used_live_evidence(steps) -> bool:
 def _evidence_failure(task: str, tr) -> str:
     """A reason string when a verification checkpoint lacks evidence, else "".
 
-    Two independent signals, because either one alone has holes: the report
-    says the verification did not succeed -- it could not be performed, or it
-    was performed and came back negative (phrase/regex match; models reword
-    admissions constantly) -- and the session never drove the app at all
-    (objective: no run/browser/screenshot step, checked for titles that
-    promise live observation). A confident report over read-only lookups
-    still fails the second gate; a browser-driving report that says
-    "Verification failed" still fails the first."""
+    Three independent signals, pessimistic on ties: the report's own VERDICT
+    line (verification reports must end with VERDICT: PASSED/FAILED -- see
+    _VERDICT_BRIEF; a FAILED verdict fails the check no matter how
+    optimistic the prose around it is, and a PASSED verdict never overrides
+    the other two), the report saying the verification did not succeed -- it
+    could not be performed, or it was performed and came back negative
+    (phrase/regex match; models reword admissions constantly) -- and the
+    session never driving the app at all (objective: no
+    run/browser/screenshot step, checked for titles that promise live
+    observation). A confident report over read-only lookups still fails the
+    last gate; a browser-driving report that says "Verification failed"
+    still fails the second."""
     if not _is_verification_task(task):
         return ""
     if (tr.reply or "").startswith("No prose report was produced"):
@@ -248,6 +302,10 @@ def _evidence_failure(task: str, tr) -> str:
         # neither evidence nor caveats.
         return ("its report is empty (the answer phase produced no prose "
                 "even after a retry); a steps log is not a verification")
+    state, reason = _verdict_of(tr.reply)
+    if state == "FAILED":
+        return ("its own verdict line says VERDICT: FAILED"
+                + (f": {reason[:200]}" if reason else ""))
     if _reply_says_unverified(tr.reply):
         return ("its report says the verification did not succeed "
                 "(could not be performed, or was performed and failed)")
@@ -357,6 +415,63 @@ def mark_failed(path: Path, task: str) -> bool:
     return _set_box(path, task, "!")
 
 
+def insert_task_before(path: Path, task: str, new_title: str) -> bool:
+    """Insert an unchecked ``- [ ] new_title`` line immediately before the
+    first unchecked occurrence of ``task``. Used by the remediation path:
+    the failed check must stay unchecked (so it retries after the repair),
+    and the plan runs top-down, so "before" is the position that makes the
+    repair execute first. Returns False when the anchor task is not found."""
+    lines = read_plan(path)
+    for i, ln in enumerate(lines):
+        m = _TASK_LINE.match(ln)
+        if m and m.group(2).strip() == "" and m.group(3).strip() == task:
+            lines.insert(i, f"- [ ] {new_title}")
+            path.write_text("\n".join(lines), encoding="utf-8")
+            return True
+    return False
+
+
+# The repair task title inserted when a live verification checkpoint fails
+# its evidence gate. Bug H: run 7's failed verify carried an exact repair
+# recipe ("the GBGBG rows at main.js L213/L245 are still live") and no task
+# ever acted on it, because the plan is static. The title is deliberately
+# crafted to (a) route to the EDIT branch (no investigation start word) and
+# (b) carry no verify/confirm/observe/validate/check words, so the evidence
+# gate does not demand browser work from the repair itself -- the retried
+# check right after it does the observing. The diagnosis travels in the
+# FAILED LIVE TEST context note, never in this title (titles are mined for
+# forced file reads and must stay clean).
+# Run 10 added the frozen-behavior clause: its first field remediation
+# "fixed" a failed ~10s-survival check by moving enemy spawning from 3s to
+# 12s (a later one offset the spawn timers by -12) -- passing the check by
+# violating the goal's frozen "spawn timing unchanged" constraint. That is
+# the Goodhart trap in its purest form: the loop optimizes the signal it
+# reads (the gate) and discards the intent it cannot (the spec). A repair
+# whose only route to green breaks frozen behavior must refuse and surface
+# the conflict instead of re-tuning the program under test. Scan-clean:
+# freezes/conflict/instead add no verify words and no start word.
+_REMEDIATION_TITLE = (
+    "Repair the defect described in the FAILED LIVE TEST note in your "
+    "context: apply the smallest code fix that resolves it, keeping every "
+    "other constraint from the goal -- if the fix would change behavior the "
+    "goal freezes, do not edit; report the conflict instead")
+
+
+def _prune_notes(notes: list[str]) -> None:
+    """Trim the context-note window IN PLACE: keep the FIRST note plus the
+    latest two.
+
+    The first note is the run's reproduce/observe report (PLAN_SYSTEM always
+    makes task 1 one), and its live-path findings are the anchor every later
+    task needs: run 9's task 6 "replaced the frog" in the dead
+    static/js/entities/player.js because a plain latest-two window had
+    already evicted task 1's "player.js is not confirmed live" analysis --
+    the exact warning that would have redirected the edit. Middle notes
+    still roll off; only the anchor is pinned."""
+    if len(notes) > 3:
+        del notes[1:-2]
+
+
 def write_plan(path: Path, goal: str, titles: list[str]) -> None:
     """Write a fresh plan file: a goal line plus one unchecked task per title."""
     body = [PLAN_HEADER.rstrip()]
@@ -418,6 +533,17 @@ Rules:
   visible effect. Title them with how to observe ("Run the game and verify
   the snake is twice as tall in the browser"): the loop FAILS a verification
   task that never drove the app.
+- If the goal lists several independent visible changes, put a live
+  verification checkpoint after EACH one, not a single checkpoint at the
+  end: when one big final check fails, the failure cannot be attributed to
+  a single change and the loop cannot repair selectively.
+- A checkpoint that confirms a DEFECT ("observe the timing to confirm the
+  12-second delay") asserts the BEFORE state: once the plan's own change
+  lands, it can never pass again, and the loop will keep failing and
+  repairing it. Title pre-change observations "Reproduce..." or
+  "Investigate..." (they report findings; the loop does not gate them);
+  phrase every Verify/Confirm/Observe checkpoint as the AFTER-change
+  expectation ("Verify spawning begins 3 seconds into a round").
 - If the goal says an earlier change never took effect, treat WHICH FILE the
   program actually runs as unknown: include a task to confirm which code is
   really loaded (who imports or instantiates it) before any edit task --
@@ -818,6 +944,23 @@ Do not emit search/replace blocks. Be concrete and concise; if the evidence is
 inconclusive, say what is still unknown and what to check next.
 """
 
+# Appended to INVESTIGATE_SYSTEM for verification-titled investigations (see
+# run_investigation_task). Wording rules learned from the field: "partially
+# confirmed is FAILED" (run 10's final check ticked done on partial evidence
+# plus honest unknowns), "reading source is never live evidence" (the
+# perennial read-only pass), and an explicit do-not-hedge line because the
+# gate resolves PASSED-with-confession to a miss anyway -- the model should
+# not have to discover that asymmetry by watching its own runs.
+_VERDICT_BRIEF = """
+
+Your report must END with a verdict as its very last line, exactly one of
+these two forms:
+VERDICT: PASSED -- only when EVERY part of the task's claim was confirmed by
+live evidence you gathered in this session.
+VERDICT: FAILED: <one-sentence reason> -- in every other case. A partially
+confirmed claim is FAILED. Reading source code is never live evidence. Do not
+hedge: the loop reads this line mechanically and acts on it."""
+
 _TOOL_SYNTAX = ("<tool_call", "<invoke", "<function=", "<read", '"name":')
 
 
@@ -858,8 +1001,14 @@ def run_investigation_task(root: Path, cfg, client, agent, idx, task: str, *,
     print("\n--- looking things up ---", file=sys.stderr)
     gathered = agent.gather(task)
     print("--- reporting ---\n", file=sys.stderr)
+    system = answer_system or INVESTIGATE_SYSTEM
+    if answer_system is None and _is_verification_task(_task_title(task)):
+        # Fix L: force the binary verdict line, keyed off the clean TITLE
+        # (the assembled prompt's goal block quotes the spec, whose verify
+        # words would otherwise put the brief on every investigation).
+        system += _VERDICT_BRIEF
     reply = agent.answer(task, gathered,
-                         system=answer_system or INVESTIGATE_SYSTEM,
+                         system=system,
                          include_edit_format=False, stream=True)
     if _looks_like_tool_calls_only(reply) or not (reply or "").strip():
         # An empty answer phase leaves a verification checkpoint with no
@@ -868,7 +1017,7 @@ def run_investigation_task(root: Path, cfg, client, agent, idx, task: str, *,
         # transient empty completions local models produce before we fall
         # back to synthesizing a report from the lookups.
         retry = agent.answer(task, gathered,
-                             system=answer_system or INVESTIGATE_SYSTEM,
+                             system=system,
                              include_edit_format=False, stream=True)
         if (retry or "").strip() and not _looks_like_tool_calls_only(retry):
             reply = retry
@@ -1013,6 +1162,13 @@ def run_loop(root: Path, cfg, client, idx, plan_path: Path, *,
       is not a report). An applied edit is not evidence, even with the shell
       verify green; a driven browser is not a pass when the report says the
       claim failed.
+    - When a verification checkpoint fails its evidence gate, the loop does
+      not give up on the plan: the failed report becomes a FAILED LIVE TEST
+      context note and a repair task is inserted into the plan immediately
+      before the still-unchecked check, which retries after the repair
+      lands. Bounded per check by ``repair_rounds`` (a check whose report
+      was empty gets no repair -- there is no diagnosis to act on); once
+      the budget is spent the failure ends the run as before.
     - ``auto_install`` when a verification fails on a missing third-party
                         module, pip-install it and retry (opt-in: the module
                         name comes from generated code). When off, the failure
@@ -1041,6 +1197,59 @@ def run_loop(root: Path, cfg, client, idx, plan_path: Path, *,
     def tick(count: int) -> bool:
         """Return False once max_tasks (if any) is reached."""
         return max_tasks == 0 or count < max_tasks
+
+    remediated: dict[str, int] = {}     # verify title -> repair rounds used
+    # Bug N (run 11): a check whose inserted repair applied NO edits is a
+    # check the repair worker judged unfixable in code -- run 11's planner
+    # titled task 1 "observe the spawn timing to CONFIRM the 12-second
+    # delay", the inserted repair instead did the goal's work (restored the
+    # 3-second schedule), and the next repair refused to re-break the code
+    # ("would conflict with the goal"). Retrying such a check is futile,
+    # stopping strands every downstream task, and a resume replays the same
+    # deadlock forever. Track each repair's outcome per check: False =
+    # completed with no applied edits -> when the check misses again,
+    # retire it as failed and CONTINUE with the rest of the plan.
+    repair_outcome: dict[str, bool] = {}  # check title -> last repair edited?
+    pending_check: list[str] = []     # check whose repair runs next (0 or 1)
+
+    def offer_remediation(task: str, tr, miss: str) -> bool:
+        """Bug H: a failed verification checkpoint should not just end the
+        run -- its report is often an exact repair recipe, and a static plan
+        gives no task ownership of it. Record the diagnosis as a context
+        note and insert a repair task BEFORE the still-unchecked check: the
+        loop self-heals within the run, and the check retries afterwards.
+        Bounded per check by repair_rounds, so a verify that keeps failing
+        still ends the run loudly. Returns True when a repair was inserted
+        (caller must then continue instead of failing the task)."""
+        if (tr.reply or "").startswith("No prose report was produced"):
+            return False        # the answer phase was empty: there is no
+                                # diagnosis to act on, and a repair task
+                                # would be guessing. Fail loudly instead.
+        used = remediated.get(task, 0)
+        if used >= repair_rounds:
+            return False
+        remediated[task] = used + 1
+        context_notes.append(
+            f"### FAILED LIVE TEST: {task}\n"
+            f"The check did not pass: {miss}.\n"
+            f"Its report follows -- treat it as the diagnosis, and re-read "
+            f"the current files before acting on any line numbers in it. "
+            f"The report's suggested fix is only a hypothesis: if it would "
+            f"change behavior the goal freezes (timing, movement, rules), "
+            f"do NOT apply it -- explain the conflict in your reply "
+            f"instead:\n{_clip_report(tr.reply)}")
+        _prune_notes(context_notes)     # run anchor + latest two
+        insert_task_before(plan_path, task, _REMEDIATION_TITLE)
+        pending_check[:] = [task]       # replace: the repair is inserted
+                                        # immediately before its check, so
+                                        # its outcome belongs to THIS check
+        print(f"  [verification task failed: {miss} -- inserted a repair "
+              f"task ahead of it; the check retries after "
+              f"({repair_rounds - used - 1} repair round(s) left)]",
+              file=sys.stderr)
+        workspace.log_event(root, f"verification failed ({miss}); "
+                                  f"remediation task inserted", "WARN")
+        return True
 
     while tick(attempted):
         lines = read_plan(plan_path)
@@ -1111,6 +1320,30 @@ def run_loop(root: Path, cfg, client, idx, plan_path: Path, *,
             if (tr.reply or "").strip():
                 miss = _evidence_failure(task, tr)
                 if miss:
+                    if repair_outcome.get(task) is False:
+                        # Bug N: the repair inserted for THIS check completed
+                        # with no edits -- it judged the check unfixable in
+                        # code (run 11: refusing to reintroduce the defect
+                        # the goal had just removed). Another repair round
+                        # would refuse again, and stopping strands every
+                        # downstream task while a resume replays the same
+                        # deadlock forever. Retire the check loudly (failed
+                        # box, event log, stderr) and let the plan continue.
+                        print(f"  [verification task failed: {miss} -- its "
+                              f"repair applied no edits (a goal conflict or "
+                              f"an already-satisfied check); retiring the "
+                              f"check as failed and continuing]",
+                              file=sys.stderr)
+                        workspace.log_event(
+                            root, "verification check retired after a "
+                                  f"no-edit repair: {miss}", "ERROR")
+                        failed += 1
+                        mark_failed(plan_path, task)
+                        repair_outcome.pop(task, None)
+                        continue
+                    if offer_remediation(task, tr, miss):
+                        continue    # the check stays unchecked; the repair
+                                    # task runs next, then it retries
                     print(f"  [verification task failed: {miss} -- "
                           f"{'stopping' if stop_on_fail else 'skipping'}]",
                           file=sys.stderr)
@@ -1123,7 +1356,7 @@ def run_loop(root: Path, cfg, client, idx, plan_path: Path, *,
                     mark_failed(plan_path, task)
                     continue
                 context_notes.append(f"### {task}\n{_clip_report(tr.reply)}")
-                del context_notes[:-2]       # keep only the latest two
+                _prune_notes(context_notes)   # run anchor + latest two
                 mark_done(plan_path, task)
                 done += 1
                 workspace.log_event(root, "investigation done")
@@ -1149,6 +1382,11 @@ def run_loop(root: Path, cfg, client, idx, plan_path: Path, *,
                 print("  [model reports the task is already complete; "
                       "marking it done]", file=sys.stderr)
                 workspace.log_event(root, "task already complete (no-op)")
+                if task == _REMEDIATION_TITLE and pending_check:
+                    # The repair refused to edit (run 11: "Reintroducing the
+                    # 12-second delay ... would conflict with the goal").
+                    # Remember the refusal for the check that retries next.
+                    repair_outcome[pending_check.pop()] = False
                 mark_done(plan_path, task)
                 done += 1
                 continue
@@ -1160,6 +1398,12 @@ def run_loop(root: Path, cfg, client, idx, plan_path: Path, *,
                 break
             mark_failed(plan_path, task)
             continue
+
+        if task == _REMEDIATION_TITLE and pending_check:
+            # The repair edited code: a re-failing check stays on the normal
+            # remediation path (bug N's retire rule only fires for repairs
+            # that REFUSED to edit).
+            repair_outcome[pending_check.pop()] = True
 
         # Verification: the loop's quality gate. On failure, hand the model
         # the command's output and let it fix its own work -- the feedback
@@ -1240,6 +1484,9 @@ def run_loop(root: Path, cfg, client, idx, plan_path: Path, *,
 
         miss = _evidence_failure(task, tr)
         if miss:
+            if offer_remediation(task, tr, miss):
+                continue        # the check stays unchecked; the repair
+                                # task runs next, then it retries
             # An applied edit is not evidence: a task that asks to verify
             # live behavior has to show it drove the app, even with edit
             # blocks on the floor and the shell verify green.
@@ -1269,7 +1516,7 @@ def run_loop(root: Path, cfg, client, idx, plan_path: Path, *,
                 + "These files changed on disk AFTER the reports above; line "
                   "numbers and defect descriptions in earlier notes may be "
                   "stale -- re-read the current file state before quoting it.")
-            del context_notes[:-2]       # keep only the latest two
+            _prune_notes(context_notes)   # run anchor + latest two
 
         mark_done(plan_path, task)
         done += 1

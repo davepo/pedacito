@@ -85,7 +85,8 @@ screenshot - launch app, wait, capture screen; returns text analysis.
            (needs allow_screenshots; launching a command also needs allow_shell)
 browser  - open a web page in headless Chromium, interact, wait, capture it.
            args: command (URL, or a command that prints a localhost URL),
-           pattern (optional "press Enter; click #start; wait 2"),
+           pattern (optional "press Enter; click #start; wait 2; eval <js>";
+           `eval` goes last and consumes the rest of the pattern),
            start (seconds to wait), optional file (old shot to compare)
            (needs allow_browser; launching a command also needs allow_shell)
            (a desktop screenshot cannot see a page that was never opened)
@@ -121,9 +122,14 @@ STEP_SCHEMA = {
         "pattern": {"type": "string",
                     "description": "For grep: regex, or plain text if it is not "
                                    "valid regex. For browser: optional actions "
-                                   "like 'press Enter; click #start; wait 2'. "
+                                   "like 'press Enter; click #start; wait 2; "
+                                   "eval <js>' -- eval goes LAST and consumes "
+                                   "the rest (semicolons allowed inside). "
                                    "Empty otherwise.",
-                    "maxLength": 200},
+                    # 600: run 10's forced-state JS expressions were truncated
+                    # mid-token at 200, and schema-constrained sampling cannot
+                    # emit what the schema forbids.
+                    "maxLength": 600},
         "symbol": {"type": "string",
                    "description": "For callers; or for read when file is empty "
                                   "(reads that definition). Empty otherwise.",
@@ -1745,9 +1751,12 @@ def tool_browser(index, cfg, client, command: str = "", pattern: str = "",
 
     `command` is either an http(s) URL or a command that starts a local web
     server and prints its URL (the common `python main.py` case). `pattern`
-    holds a tiny interaction list -- `press Enter; click #start; wait 2` --
-    so the model can reach a game that waits behind a start screen. `start`
-    is the wait before capture. A desktop `screenshot` cannot do any of this;
+    holds a tiny interaction list -- `press Enter; click #start; wait 2;
+    eval <js expression>` -- so the model can reach a game that waits behind
+    a start screen and force state (a grown player, a late level) that
+    waiting alone cannot produce. An `eval` consumes the rest of the pattern
+    (put it last), so its expression may contain semicolons. `start` is the
+    wait before capture. A desktop `screenshot` cannot do any of this;
     this tool captures the PAGE and reports its text, canvas sizes, console
     errors, and optional vision description.
 
