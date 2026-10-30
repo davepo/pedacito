@@ -328,6 +328,19 @@ def test_investigate_system_demands_live_path_confirmation():
     assert "dead or duplicated" in loop.INVESTIGATE_SYSTEM
 
 
+def test_investigate_system_separates_loaded_from_used():
+    """Graveyard-run task 1 answered the load-based title literally ("all
+    22 files are loaded by index.html; none are dead code") even though it
+    knew loaded != used, and deferred the classification to a live check
+    that never came -- contradicting `explain`, which applied the usage
+    criterion and named all 23 files. The brief must state the criterion
+    outright: a load reference is itself part of what dead-code removal
+    cleans up, and when the app cannot run, reading the bootstrap module
+    for calls into the file IS valid usage evidence."""
+    assert "being loaded is not being used" in loop.INVESTIGATE_SYSTEM
+    assert "bootstrap module" in loop.INVESTIGATE_SYSTEM
+
+
 def test_plan_system_requires_constraints_in_titles():
     """Run 6's planner dropped "keeping the doubled height" from the fix
     task's title, and the worker -- whose attention goes to the title --
@@ -422,6 +435,71 @@ def test_tool_call_only_answer_is_detected():
         "The run produced no output, so the loop is spun before drawing.")
 
 
+def test_prose_collapse_flags_phrase_loops_but_not_parallel_prose():
+    """The graveyard run streamed a task answer cycling through quoted
+    fragments -- a sampling collapse no existing guard covers (llm.py's
+    stream guard counts tool-call syntax opens, not prose). The signal is
+    vocabulary novelty in the tail: a looping window reuses a tiny word
+    set (~0.13 measured), while even a 23-row file table keeps unique
+    paths and symbols on every line (~0.31). Paths and code spans are
+    deliberately NOT stripped -- their uniqueness is what separates a
+    table from a loop (a stripped 4-gram design false-positived on file
+    tables). Short replies are below the signal floor and exempt."""
+    looped = ("the file is loaded by the page but it is not used by the "
+              "game runtime after moving the dead code files ") * 6
+    assert loop._prose_collapse(looped)
+    table = "\n".join(
+        f"| static/js/mod{i:02d}.js | defines sprite{i:02d} | unused |"
+        for i in range(23))
+    assert not loop._prose_collapse(table)
+    assert not loop._prose_collapse("done. " * 30)      # < 60 words
+
+
+def test_run_investigation_task_regenerates_a_collapsed_answer(tmp_path):
+    """A collapsed answer is regenerated exactly once: catching it here
+    keeps looping garbage out of the context notes every later task
+    reads. When the regeneration is ALSO collapsed the retry is kept as
+    the report -- bounded, never an infinite regeneration loop."""
+    cfg = _cfg()
+    calls = []
+    COLLAPSED = ("the file is loaded by the page but it is not used by "
+                 "the game runtime after moving the dead code files ") * 6
+    CLEAN = ("The game launches and the snake renders with the new "
+             "colors; the browser screenshot at t=2s shows the diamond "
+             "head.\n\nVERDICT: PASSED")
+
+    class FakeAgent:
+        steps_log = ["1. browser http://localhost:8000 [wait 2]  (Look.)"]
+
+        def gather(self, task, **kw):
+            return "gathered source"
+
+        def answer(self, task, gathered, **kw):
+            calls.append(1)
+            return COLLAPSED if len(calls) == 1 else CLEAN
+
+    tr = loop.run_investigation_task(
+        tmp_path, cfg, None, FakeAgent(),
+        types.SimpleNamespace(root=tmp_path),
+        "Run the game and verify the snake renders")
+    assert len(calls) == 2
+    assert tr.reply == CLEAN
+    from pedacito import workspace
+    assert "collapsed" in workspace.run_log_path(tmp_path).read_text()
+
+    class AlwaysCollapsed(FakeAgent):
+        def answer(self, task, gathered, **kw):
+            calls.append(1)
+            return COLLAPSED
+
+    tr = loop.run_investigation_task(
+        tmp_path, cfg, None, AlwaysCollapsed(),
+        types.SimpleNamespace(root=tmp_path),
+        "Run the game and verify the snake renders")
+    assert len(calls) == 4          # one regeneration, then the retry stays
+    assert tr.reply == COLLAPSED
+
+
 def test_run_loop_marks_investigation_task_done_without_edits(tmp_path,
                                                              monkeypatch):
     """The reported failure: a reproduce/diagnose task is a success even when
@@ -462,7 +540,12 @@ def test_run_loop_fails_verify_task_that_gathered_no_evidence(tmp_path,
                                                               monkeypatch):
     """The reported failure: "Run the game and verify ..." could not launch
     the browser, said so in its report, and was ticked done anyway. A
-    checkpoint that admits it gathered no evidence must fail the run."""
+    checkpoint that admits it gathered no evidence must fail the run -- and
+    since bug T (graveyard run), it first gets ONE procedural re-run: a
+    failure with zero run/browser/screenshot steps describes the check run,
+    not the product, so the loop re-runs it with the toolset spelled out
+    (retry note in the prompt) instead of failing or remediating. When the
+    re-run stays source-only too, the check retires as unverified."""
     plan = tmp_path / "PLAN.md"
     loop.write_plan(plan, "fix the snake",
                     ["Fix the snake colors",
@@ -489,12 +572,68 @@ def test_run_loop_fails_verify_task_that_gathered_no_evidence(tmp_path,
     code = loop.run_loop(tmp_path, _cfg(), None, idx, plan, apply=True,
                          repair_rounds=0)
     assert code == 1
-    assert [kind for kind, _ in calls] == ["edit", "investigate"]
+    assert [kind for kind, _ in calls] == \
+        ["edit", "investigate", "investigate"]
     # The verify task is told up front that tools live in the lookup phase.
     assert "EVIDENCE" in calls[1][1]
+    # The procedural re-run carries the corrective note; the first try
+    # does not, and no remediation task was ever inserted.
+    assert "RETRY" in calls[2][1]
+    assert "RETRY" not in calls[1][1]
     text = plan.read_text()
     assert "- [x] Fix the snake colors" in text
     assert "- [x] Run the game" not in text
+    assert "- [!]" in text                  # retired as unverified
+    assert "Repair the defect" not in text  # never remediated
+
+
+def test_run_loop_procedural_verify_retry_can_pass(tmp_path, monkeypatch):
+    """The procedural re-run is a real second chance, not a delayed
+    failure: an attempt that drives the app and reports VERDICT: PASSED
+    ticks the check done with no repair ever inserted. Retiring as
+    unverified only happens when BOTH attempts stay source-only."""
+    plan = tmp_path / "PLAN.md"
+    loop.write_plan(plan, "fix the snake",
+                    ["Fix the snake colors",
+                     "Run the game and verify the new colors render"])
+    idx = types.SimpleNamespace(root=tmp_path)
+    calls = []
+
+    def fake_run_task(root, cfg, client, agent, idx_, task, apply=True,
+                      review=False, answer_system=None):
+        calls.append(("edit", task))
+        return _result(idx_)
+
+    def fake_investigate(root, cfg, client, agent, idx_, task,
+                         answer_system=None):
+        calls.append(("investigate", task))
+        if len(calls) == 2:
+            # First verify attempt: the field confabulation -- read-only
+            # steps plus a report declaring live verification impossible.
+            return loop.TaskResult(
+                [], "No live verification possible without tools.\n\n"
+                    "VERDICT: FAILED", True, [], idx_, None,
+                ["1. read main.js L1-40  (Inspect the draw call.)"])
+        return loop.TaskResult(
+            [], "The page loads, the canvas renders, and the snake shows "
+                "the new colors.\n\nVERDICT: PASSED", True, [], idx_, None,
+            ["1. run python -m http.server 8000  (Launch the game.)",
+             "2. browser http://localhost:8000 [wait 2]  (Look.)"])
+
+    monkeypatch.setattr(loop, "run_task", fake_run_task)
+    monkeypatch.setattr(loop, "run_investigation_task", fake_investigate)
+    code = loop.run_loop(tmp_path, _cfg(), None, idx, plan, apply=True,
+                         repair_rounds=0)
+    assert code == 0
+    assert [kind for kind, _ in calls] == \
+        ["edit", "investigate", "investigate"]
+    # The re-run carries the procedural corrective note, and only it does.
+    assert "NEVER RAN THE CHECK" in calls[2][1]
+    assert "RETRY" not in calls[1][1]
+    text = plan.read_text()
+    assert "- [x] Run the game" in text     # the check passed on attempt 2
+    assert "- [!]" not in text
+    assert "Repair the defect" not in text  # never remediated
 
 
 def test_run_loop_edit_task_needs_evidence_when_title_says_verify(tmp_path,
@@ -1211,6 +1350,72 @@ def test_run_loop_treats_noop_reply_as_done(tmp_path, monkeypatch):
     assert "- [x] real work" in text
 
 
+def test_declares_incomplete_separates_deferral_from_noop():
+    """Graveyard-run task 4 ("Move each file...") answered "I can't safely
+    emit the move blocks yet ... To continue, the first 3-5 lines of each
+    file must be read ... I won't guess" with ZERO edits -- and an
+    incidental "graveyard/ has already been created" (a PRIOR task's work)
+    matched _is_noop, ticking the move done. A reply describing work still
+    required is never a no-op. Mojibake apostrophes ("can\u00e2t") are folded
+    before matching; honest caveats, completion reports, and the canonical
+    no-op reply must not fire."""
+    field_reply = (
+        "I can't safely emit the move blocks yet. To continue, the first "
+        "3-5 lines of each file must be read so the destination paths are "
+        "known; I won't guess. Note: graveyard/ has already been created "
+        "by the earlier task.")
+    assert loop._is_noop(field_reply)              # the trap that fired
+    assert loop._declares_incomplete(field_reply)  # now outranked
+    assert loop._declares_incomplete(
+        field_reply.replace("can't", "can\u00e2t"))
+    assert not loop._declares_incomplete(
+        "No changes are needed; the file is already correct.")
+    assert not loop._declares_incomplete(
+        "Moved all 23 files into graveyard/ and updated the manifest.")
+    assert not loop._declares_incomplete(
+        "The fix is in place. I have not yet run the browser check, but "
+        "the code path is clear.")
+
+
+def test_run_loop_incomplete_move_task_is_not_a_noop(tmp_path, monkeypatch):
+    """The field replay: a build task that defers its own work with zero
+    edits applied is retried once with the toolset spelled out, then
+    failed loudly -- never ticked done via _is_noop's incidental "already"
+    match. The retry note lands in the second attempt's prompt only, and
+    with stop_on_fail=False the rest of the plan still runs."""
+    plan = tmp_path / "PLAN.md"
+    loop.write_plan(plan, "clean out the dead code",
+                    ["Move each file identified as dead code into the "
+                     "graveyard folder",
+                     "Update the manifest to list the moved files"])
+    idx = types.SimpleNamespace(root=tmp_path)
+    calls = []
+    DEFERRAL = (
+        "I can't safely emit the move blocks yet. To continue, the first "
+        "3-5 lines of each file must be read; I won't guess. Note: "
+        "graveyard/ has already been created by the earlier task.")
+
+    def fake_run_task(root, cfg, client, agent, idx_, task, apply=True,
+                      review=False, answer_system=None):
+        calls.append(task)
+        if "Move each file" in task:
+            return loop.TaskResult([], DEFERRAL, True, [], idx_)
+        return _result(idx_)
+
+    monkeypatch.setattr(loop, "run_task", fake_run_task)
+    code = loop.run_loop(tmp_path, _cfg(), None, idx, plan, apply=True,
+                         stop_on_fail=False)
+    assert code == 1
+    assert len(calls) == 3                  # move retried once + manifest
+    assert "Move each file" in calls[0] and "RETRY" not in calls[0]
+    assert "Move each file" in calls[1] and "DID NOT DO THE WORK" in calls[1]
+    assert "Update the manifest" in calls[2]
+    text = plan.read_text()
+    assert "- [x] Move each file" not in text   # the fake-done never ticks
+    assert "- [!] Move each file" in text       # failed loudly instead
+    assert "- [x] Update the manifest" in text  # the plan carries on
+
+
 def test_run_loop_verification_repair_round_trip(tmp_path, monkeypatch):
     plan = tmp_path / "PLAN.md"
     loop.write_plan(plan, "", ["needs tests"])
@@ -1479,6 +1684,82 @@ def test_run_task_recovers_after_tool_call_reply(tmp_path):
     assert tr.applied, "recovery did not apply the re-asked edit"
     assert "def update()" in (tmp_path / "player.py").read_text()
     assert client.answers == 2
+
+
+def test_edit_refusal_head_is_narrow():
+    """Only a reply that OPENS by declaring it made no edit counts -- the
+    match DISCARDS real edit blocks, so a qualified statement about one
+    file must not sweep them up. Mojibake apostrophes ("didn\u00e2t") are
+    folded before matching, and the canonical no-op reply must keep
+    working (run_loop ticks it done)."""
+    assert loop._edit_refusal_head("No edit.\n\nThe freeze forbids acting.")
+    assert loop._edit_refusal_head("No edits were made: the goal conflicts.")
+    assert loop._edit_refusal_head("I did not edit any file this round.")
+    assert loop._edit_refusal_head("I didn\u00e2t emit the blocks.")
+    assert loop._edit_refusal_head("# No changes.\nDetails follow.")
+    assert not loop._edit_refusal_head(
+        "No changes were needed in main.js; I fixed index.html instead.")
+    assert not loop._edit_refusal_head("I removed the stale script tags.")
+    assert not loop._edit_refusal_head(
+        "No changes are needed; the file is already correct.")
+
+
+def test_run_task_discards_edit_blocks_that_contradict_a_refusal(tmp_path):
+    """Graveyard repair 1: the prose said "No edit." and explained why
+    acting would violate the goal's freeze -- then the same reply emitted
+    a FILE block stripping 22 script tags from index.html, and the harness
+    APPLIED it. When a reply opens by refusing, its blocks are a
+    small-model coherence failure, not intent: honor the refusal, discard
+    the blocks, and never re-ask (the recovery path would pressure the
+    model into undoing its own refusal)."""
+    (tmp_path / "index.html").write_text(
+        '<script src="/static/js/main.js"></script>\n', encoding="utf-8")
+    idx = types.SimpleNamespace(root=tmp_path)
+    REPLY = (
+        "No edit.\n"
+        "\n"
+        "Restoring the tags would change what the page executes and "
+        "conflicts with the freeze.\n"
+        "\n"
+        "--- FILE: index.html\n"
+        "<<<<<<< SEARCH\n"
+        '<script src="/static/js/main.js"></script>\n'
+        "=======\n"
+        '<script src="/static/js/main.js"></script>\n'
+        '<script src="/static/js/player.js"></script>\n'
+        ">>>>>>> REPLACE\n")
+
+    class FakeAgent:
+        steps_log = []
+
+        def __init__(self):
+            self.apply_calls = 0
+
+        def gather(self, task, **kw):
+            return "gathered source"
+
+        def answer(self, task, gathered, **kw):
+            return REPLY
+
+        def apply(self, reply, **kw):
+            self.apply_calls += 1
+            return ([_ok("index.html")], reply)
+
+    agent = FakeAgent()
+    tr = loop.run_task(tmp_path, _cfg(), None, agent, idx,
+                       "Restore the script tags the last repair removed",
+                       apply=True)
+    assert agent.apply_calls == 0          # blocks never touched the disk
+    assert tr.results == []
+    assert tr.reply == REPLY               # the refusal stays the record
+    assert (tmp_path / "index.html").read_text() == \
+        '<script src="/static/js/main.js"></script>\n'
+    from pedacito import workspace
+    log = workspace.run_log_path(tmp_path).read_text()
+    assert "blocks discarded" in log
+    # The generic no-blocks ERROR is suppressed: this is a decision the
+    # harness honored, not a parse failure.
+    assert "no edit blocks parsed" not in log
 
 
 def test_run_log_records_events(tmp_path):

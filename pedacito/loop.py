@@ -69,6 +69,76 @@ def _is_noop(reply: str) -> bool:
     ))
 
 
+def _normalized_reply(reply: str) -> str:
+    """Lowercase with the apostrophe styles models emit folded to ASCII, so
+    refusal/incomplete phrasing matches whatever quoting came back. Local
+    servers often double-encode UTF-8: the right single quote (U+2019) shows
+    up as "â" ("canât"), which naive regexes silently miss."""
+    return ((reply or "").lower()
+            .replace("\u2019", "'")
+            .replace("â", "'"))
+
+
+# A reply that OPENS by declaring it made no edit. Narrow on purpose -- the
+# caller uses this to DISCARD edit blocks the same reply contains, so only
+# bare refusals count: "No edit.", "No edits were made:", "I did not edit
+# any file". Deliberately NOT matched: "No changes were needed in main.js;
+# I fixed index.html instead." -- a qualifier after the phrase means the
+# sentence is about one file, not a refusal to have edited at all.
+_EDIT_REFUSAL_HEAD_RE = re.compile(
+    r"^(?:[#*\-\s]*)"
+    r"(?:no\s+(?:edits?|changes?|code\s+changes?)"
+    r"(?:\s+were\s+(?:made|applied|needed|necessary|required))?[\s]*[.:!\r\n]"
+    r"|i\s+(?:did\s+not|didn't|won't|will\s+not)\s+"
+    r"(?:\w+\s+){0,2}?(?:edit|apply|make|emit|write)\b)")
+
+
+def _edit_refusal_head(reply: str) -> str:
+    """The matched refusal phrase when a reply opens by declaring it made no
+    edit; "" otherwise. Checked against the normalized first 200 chars."""
+    m = _EDIT_REFUSAL_HEAD_RE.match(
+        _normalized_reply(reply or "").strip()[:200])
+    return m.group(0).strip() if m else ""
+
+
+# Zero-edit replies that DECLARE THE WORK NOT DONE -- as opposed to _is_noop's
+# legitimate "nothing to do". Graveyard-run task 4 ("Move each file identified
+# as dead code into the 'graveyard' folder") answered "I can't safely emit the
+# move blocks yet ... To continue, the first 3-5 lines of each file must be
+# read ... I won't guess" with ZERO edits -- and an incidental "graveyard/ has
+# already been created" (a PRIOR task's work) matched _is_noop, ticking the
+# move done. The plan then reported a move that never happened; only the third
+# verify session caught the empty graveyard. Matched on _normalized_reply.
+_INCOMPLETE_RES = (
+    re.compile(r"\bcan(?:not|'t)\s+(?:\w+\s+){0,3}?"
+               r"(?:emit|apply|make|produce|write|complete|finish|move|"
+               r"create|edit|proceed|continue|do)\b"),
+    re.compile(r"\bunable to\s+(?:\w+\s+){0,3}?"
+               r"(?:emit|apply|make|produce|write|complete|finish|move|"
+               r"create|edit|proceed|continue|do)\b"),
+    re.compile(r"\bto continue\b"),
+    re.compile(r"\bremaining work\b"),
+    re.compile(r"\bmust(?:\s+first)?\s+be\s+(?:read|done|made)\b"),
+    re.compile(r"\bhave(?:n't| not)\s+(?:yet\s+)?"
+               r"(?:read|made|applied|done|finished|emitted)\b"),
+    re.compile(r"\bwon't guess\b"),
+    re.compile(r"\bnot yet been\s+"
+               r"(?:done|made|applied|performed|completed|moved)\b"),
+    re.compile(r"\bwill need to be\b"),
+)
+
+
+def _declares_incomplete(reply: str) -> bool:
+    """True when a zero-edit reply says the task is NOT done and could not be
+    completed now ("can't emit the blocks yet -- to continue, the files must
+    be read"). Such a reply is an incomplete task, never a no-op: the work it
+    defers was possible in the lookup phase, so the loop retries it once and
+    fails it loudly on a second deferral. Repair tasks are exempt at the call
+    site -- refusing to edit is a sanctioned repair outcome (see bug N)."""
+    low = _normalized_reply(reply)
+    return any(r.search(low) for r in _INCOMPLETE_RES)
+
+
 # Outcome-negative regexes, backing the substring list below. Run 7 ticked
 # two verify tasks done whose reports said the opposite: task 4's "could not
 # *visually* verify" (an adverb split every listed substring) and task 7's
@@ -937,7 +1007,13 @@ Report what you observed: what reproduces the problem, the exact evidence
 fix someone should make. Before naming a file as the cause, confirm the running
 program actually loads that code -- who imports it, who instantiates it;
 projects often contain dead or duplicated definitions that look authoritative
-but never execute. Prefer evidence from the running program over source
+but never execute. The reverse also holds: a file the entry point loads (a
+script tag, an import) but whose exports nothing ever calls is dead code --
+being loaded is not being used, and the load reference is itself part of what
+dead-code removal cleans up, never proof of life. When runtime evidence is
+unavailable, reading the bootstrap module for calls into that file IS valid
+usage evidence: classify from it instead of deferring the question to a live
+check. Prefer evidence from the running program over source
 reading, and if the live path is unconfirmed, lead "still unknown" with that.
 Do not call tools -- none are available in this phase.
 Do not emit search/replace blocks. Be concrete and concise; if the evidence is
@@ -985,6 +1061,32 @@ def _looks_like_tool_calls_only(reply: str) -> bool:
     return opens >= 3 or len(words) < 8
 
 
+def _prose_collapse(reply: str) -> bool:
+    """True when a prose reply's tail degenerated into a phrase loop.
+
+    The graveyard run streamed a task answer cycling through quoted fragments
+    ("...loaded by the page / used by the game runtime / executed / after
+    moving the dead code files...") -- a sampling collapse no existing guard
+    covers: llm.py's stream guard counts tool-call syntax opens, not prose.
+    The signal here is vocabulary novelty in the tail: a looping window reuses
+    a tiny word set, while even highly parallel legitimate prose (file tables,
+    per-module bullet lists) keeps unique paths and names on every line, so
+    paths and code are deliberately NOT stripped -- their uniqueness is what
+    separates a table from a loop. Detection only ever triggers a
+    regeneration, never a mutation: a false positive costs one extra answer
+    call, a false negative ships looping garbage into the context notes every
+    later task reads. The 0.22 floor sits well under real collapse ratios
+    (the field tail measured ~0.10) and well over legitimate parallel prose
+    (a 23-row file table measures ~0.28 -- every row keeps its own path).
+    Not applied to build replies: sprite grids and other legitimate
+    repetitive edit content would false-positive, and their stream already
+    has the truncation-continuation path."""
+    words = re.findall(r"\w+", (reply or "")[-1500:].lower())
+    if len(words) < 60:
+        return False
+    return len(set(words)) / len(words) < 0.22
+
+
 def run_investigation_task(root: Path, cfg, client, agent, idx, task: str, *,
                            answer_system: str | None = None) -> TaskResult:
     """Run a reproduction/diagnosis task whose deliverable is a report.
@@ -1010,12 +1112,22 @@ def run_investigation_task(root: Path, cfg, client, agent, idx, task: str, *,
     reply = agent.answer(task, gathered,
                          system=system,
                          include_edit_format=False, stream=True)
-    if _looks_like_tool_calls_only(reply) or not (reply or "").strip():
+    collapsed = _prose_collapse(reply)
+    if collapsed:
+        print("  [the answer collapsed into repeating phrases; "
+              "regenerating it once]", file=sys.stderr)
+        workspace.log_event(root, "answer collapsed into phrase repetition; "
+                            "regenerating once", "WARN")
+    if _looks_like_tool_calls_only(reply) or not (reply or "").strip() \
+            or collapsed:
         # An empty answer phase leaves a verification checkpoint with no
         # report at all -- run 8's final verify ticked done on the steps-log
         # fallback below plus a 15-word `done` reason. One retry absorbs the
         # transient empty completions local models produce before we fall
-        # back to synthesizing a report from the lookups.
+        # back to synthesizing a report from the lookups. The same retry
+        # regenerates a phrase-loop collapse (bug R, graveyard run): nothing
+        # is poisoned yet -- catching it here keeps looping garbage out of
+        # the context notes every later task reads.
         retry = agent.answer(task, gathered,
                              system=system,
                              include_edit_format=False, stream=True)
@@ -1062,15 +1174,35 @@ def run_task(root: Path, cfg, client, agent, idx, task: str, *,
     if truncated:
         workspace.log_event(root, "answer reply truncated at the output limit",
                             "WARN")
-    results, reply = agent.apply(raw_reply, dry_run=review or not apply,
-                                 task=task, gathered=gathered,
-                                 backup_dir=None if review else backup_dir)
-    if not results and not _is_noop(reply):
+    refusal = _edit_refusal_head(raw_reply)
+    contradicted = bool(refusal) and bool(parse_edits(raw_reply))
+    if contradicted:
+        # Bug U (graveyard run): the inserted repair's prose said "No edit."
+        # and explained why acting would violate the goal's freeze -- then
+        # the same reply emitted a FILE block stripping 22 script tags from
+        # index.html, and the harness applied it. When a reply OPENS by
+        # refusing, its blocks are a small-model coherence failure, not
+        # intent: honor the refusal and discard them.
+        print(f"  [reply opens by refusing edits (\"{refusal}\") but "
+              f"contains edit blocks; honoring the refusal and discarding "
+              f"them]", file=sys.stderr)
+        workspace.log_event(root, f"reply refused edits ('{refusal}') but "
+                                  f"contained edit blocks; blocks discarded",
+                            "WARN")
+        results, reply = [], raw_reply
+    else:
+        results, reply = agent.apply(raw_reply, dry_run=review or not apply,
+                                     task=task, gathered=gathered,
+                                     backup_dir=None if review else backup_dir)
+    if not results and not _is_noop(reply) and not contradicted:
         # The answer phase produced zero edit blocks. Before declaring the
         # task dead, give the model one bounded recovery: honour any read
         # tool-calls it emitted, or re-ask with the edit protocol spelled
         # out -- both without touching the no-op path ("already complete"
-        # replies must still mark the task done, not re-ask).
+        # replies must still mark the task done, not re-ask). A refused
+        # reply is coherent about doing nothing: re-asking with "produce the
+        # edit blocks now" would pressure the model into undoing its own
+        # refusal.
         rec = _recover_no_edit_reply(
             root, cfg, agent, task, gathered, reply,
             dry_run=review or not apply,
@@ -1080,9 +1212,9 @@ def run_task(root: Path, cfg, client, agent, idx, task: str, *,
             results, reply = rec
             workspace.log_event(root, "answer re-asked; recovered edit blocks",
                                 "INFO")
-    if not results:
+    if not results and not contradicted:
         workspace.log_event(root, "no edit blocks parsed from the reply", "ERROR")
-    else:
+    elif results:
         for r in results:
             workspace.log_event(
                 root, f"{'applied' if r.ok else 'FAILED'} {r.file}: {r.message}",
@@ -1123,6 +1255,37 @@ def run_task(root: Path, cfg, client, agent, idx, task: str, *,
 # --------------------------------------------------------------------------
 # The outer loop itself
 # --------------------------------------------------------------------------
+
+# Corrective re-runs are one-shot: a second identical failure is a verdict,
+# not a transient. Shared by the procedural-verify re-run (bug T) and the
+# incomplete-task retry (bug V); both keep the task unchecked so the next
+# iteration picks it up again, with a one-shot note appended to its prompt.
+_MAX_TASK_RETRIES = 1
+
+_VERIFY_RETRY_NOTE = (
+    "### RETRY -- THE PREVIOUS ATTEMPT NEVER RAN THE CHECK\n"
+    "This exact verification was already attempted and ended without a "
+    "single `run`, `screenshot`, or `browser` step: it declared live "
+    "verification impossible and answered from source alone. That "
+    "declaration was false -- those tools ARE available in this attempt's "
+    "lookup phase. Launch the app with `run`, drive the page with "
+    "`browser`, capture the evidence, and only then write the report with "
+    "its VERDICT line. If a tool itself fails, quote the exact error "
+    "output in the report.")
+
+_INCOMPLETE_RETRY_NOTE = (
+    "### RETRY -- THE PREVIOUS ATTEMPT DID NOT DO THE WORK\n"
+    "This exact task was already attempted and ended with ZERO changes "
+    "applied; its reply described what a future attempt would need instead "
+    "of doing it. There is no future attempt after this one. The lookup "
+    "phase has the full toolset: `read` opens any file in the project, and "
+    "`run` executes shell commands (mkdir, mv, ls, and launching the app "
+    "all work). Spend this attempt's lookups on the task's actual work and "
+    "finish it. If -- and only if -- the work is genuinely already "
+    "complete, or genuinely impossible, say exactly that as your first "
+    "line, with the evidence or the exact blocker.")
+
+
 def run_loop(root: Path, cfg, client, idx, plan_path: Path, *,
              apply: bool = True, verify: str = "", repair_rounds: int = 2,
              max_tasks: int = 0, max_minutes: int = 0,
@@ -1169,6 +1332,15 @@ def run_loop(root: Path, cfg, client, idx, plan_path: Path, *,
       lands. Bounded per check by ``repair_rounds`` (a check whose report
       was empty gets no repair -- there is no diagnosis to act on); once
       the budget is spent the failure ends the run as before.
+    - A verification that fails WITHOUT ever driving the app (no
+      run/browser/screenshot step) failed as a check RUN, not as a product
+      test: it is re-run once with the toolset spelled out and, if the
+      re-run stays source-only too, retired as unverified. Remediation is
+      never offered on zero evidence (bug T).
+    - A build task whose reply declares the work incomplete ("can't emit
+      the blocks yet -- to continue, the files must be read") with zero
+      edits applied is retried once, then failed -- never ticked done as a
+      no-op, even when the reply incidentally contains "already" (bug V).
     - ``auto_install`` when a verification fails on a missing third-party
                         module, pip-install it and retry (opt-in: the module
                         name comes from generated code). When off, the failure
@@ -1211,6 +1383,8 @@ def run_loop(root: Path, cfg, client, idx, plan_path: Path, *,
     # retire it as failed and CONTINUE with the rest of the plan.
     repair_outcome: dict[str, bool] = {}  # check title -> last repair edited?
     pending_check: list[str] = []     # check whose repair runs next (0 or 1)
+    retried: dict[str, int] = {}      # task title -> corrective re-runs used
+    retry_note: list[str] = []        # one-shot note for the next attempt
 
     def offer_remediation(task: str, tr, miss: str) -> bool:
         """Bug H: a failed verification checkpoint should not just end the
@@ -1287,6 +1461,12 @@ def run_loop(root: Path, cfg, client, idx, plan_path: Path, *,
             task_for_agent = (
                 task_for_agent + "\n\nCONTEXT FROM PRIOR INVESTIGATION\n\n"
                 + "\n\n".join(context_notes))
+        if retry_note:
+            # One-shot corrective note (bug T's procedural verify re-run or
+            # bug V's incomplete-task retry): appended LAST so it is the
+            # freshest thing the worker reads, and popped so it can never
+            # leak into an unrelated task.
+            task_for_agent += "\n\n" + retry_note.pop()
         try:
             agent = Agent(idx, client, cfg)
             # Forced reads ("files the task will change") are mined from the
@@ -1320,6 +1500,47 @@ def run_loop(root: Path, cfg, client, idx, plan_path: Path, *,
             if (tr.reply or "").strip():
                 miss = _evidence_failure(task, tr)
                 if miss:
+                    if not _used_live_evidence(tr.steps):
+                        # Bug T (graveyard run): verify 1 and verify 2 both
+                        # ended with zero run/browser/screenshot steps --
+                        # "no live verification possible without tools", a
+                        # confabulation primed by carried notes saturated
+                        # with "no evidence was captured". The loop treated
+                        # that WORKER failure as a PRODUCT defect and
+                        # inserted repairs; the first one stripped 22 script
+                        # tags from index.html while its prose said "No
+                        # edit". A check nobody executed says nothing about
+                        # the product: re-run it once with the toolset
+                        # spelled out, and only retire it -- never
+                        # remediate it -- when the re-run stays source-only
+                        # too.
+                        tries = retried.get(task, 0)
+                        if tries < _MAX_TASK_RETRIES:
+                            retried[task] = tries + 1
+                            retry_note[:] = [_VERIFY_RETRY_NOTE]
+                            print(f"  [verification task failed: {miss} -- "
+                                  f"but it never drove the app, so the "
+                                  f"failure describes the check run, not "
+                                  f"the product; re-running it once]",
+                                  file=sys.stderr)
+                            workspace.log_event(
+                                root, "verification ended without driving "
+                                      "the app (procedural failure); "
+                                      "re-running once, no remediation",
+                                "WARN")
+                            continue
+                        print("  [verification could not be executed: two "
+                              "attempts ended without driving the app -- "
+                              "retiring the check as unverified (not a "
+                              "product failure) and continuing]",
+                              file=sys.stderr)
+                        workspace.log_event(
+                            root, "verification check retired: two attempts "
+                                  "never drove the app", "ERROR")
+                        failed += 1
+                        mark_failed(plan_path, task)
+                        repair_outcome.pop(task, None)
+                        continue
                     if repair_outcome.get(task) is False:
                         # Bug N: the repair inserted for THIS check completed
                         # with no edits -- it judged the check unfixable in
@@ -1378,6 +1599,41 @@ def run_loop(root: Path, cfg, client, idx, plan_path: Path, *,
 
         ok_edits = [r for r in tr.results if r.ok]
         if not tr.applied or not ok_edits:
+            if task != _REMEDIATION_TITLE and _declares_incomplete(tr.reply):
+                # Bug V (graveyard run): task 4 "Move each file..." answered
+                # "I can't safely emit the move blocks yet -- to continue,
+                # the files must be read" with ZERO edits, and an incidental
+                # "graveyard/ has already been created" (a prior task's
+                # work) matched _is_noop: the move was ticked DONE without
+                # ever happening, and only the third verify session caught
+                # the empty graveyard. A reply describing work still
+                # required is never a no-op. The deferred work WAS possible
+                # in the lookup phase (read/run have the full toolset), so
+                # retry once with that spelled out, then fail loudly.
+                # Repair tasks are exempt: refusing to edit is their
+                # sanctioned conflict-report (bug N's retire keys off it).
+                tries = retried.get(task, 0)
+                if tries < _MAX_TASK_RETRIES:
+                    retried[task] = tries + 1
+                    retry_note[:] = [_INCOMPLETE_RETRY_NOTE]
+                    print("  [task declared itself incomplete with no edits "
+                          "applied -- retrying it once]", file=sys.stderr)
+                    workspace.log_event(
+                        root, "task declared itself incomplete with no edits "
+                              "applied; retrying once", "WARN")
+                    continue
+                print(f"  [task declared itself incomplete twice; marking "
+                      f"it failed -- "
+                      f"{'stopping' if stop_on_fail else 'continuing'}]",
+                      file=sys.stderr)
+                workspace.log_event(
+                    root, "task declared itself incomplete on retry; "
+                          "marking failed", "ERROR")
+                failed += 1
+                if stop_on_fail:
+                    break
+                mark_failed(plan_path, task)
+                continue
             if _is_noop(tr.reply):
                 print("  [model reports the task is already complete; "
                       "marking it done]", file=sys.stderr)
