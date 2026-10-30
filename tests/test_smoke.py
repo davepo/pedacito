@@ -77,6 +77,21 @@ def test_default_profile_missing_gives_setup_hint(tmp_path, monkeypatch):
     assert "--setup" in str(e.value)
 
 
+def test_missing_profile_error_names_the_configs_read(tmp_path, monkeypatch):
+    """The reported confusion: XDG_CONFIG_HOME pointed at another directory,
+    pedacito read a different config than the user edited, and the error just
+    said "(none defined)" -- with no clue which files it had opened."""
+    fake = tmp_path / "user.toml"
+    fake.write_text('[profiles.gpu]\nmodel = "m"\n', encoding="utf-8")
+    monkeypatch.setattr(config_mod, "USER_CONFIG", fake)
+    with pytest.raises(config_mod.ConfigError) as e:
+        config_mod.load(root=tmp_path, profile="qwen", use_env=False)
+    msg = str(e.value)
+    assert "Looked in:" in msg
+    assert str(fake) in msg        # the file that WAS read
+    assert "gpu" in msg            # and the profile it does define
+
+
 def test_discover_servers_and_interactive_setup_exist():
     assert callable(config_mod.discover_servers)
     assert callable(config_mod.interactive_setup)

@@ -460,6 +460,10 @@ def _cmd_auto(args, cfg, client, idx, root: Path) -> int:
         spec = scaffold.load_spec(
             prompt=args.task, spec_file=args.spec,
             max_chars=getattr(cfg, "max_spec_chars", scaffold.MAX_SPEC_CHARS))
+        # The full spec text (not just the title) travels with every task
+        # prompt: constraints the planner drops from a title must still bind
+        # the worker that implements it.
+        spec_text = spec.text
         # Reuse an existing plan to RESUME only while it still has open tasks;
         # once it is complete (or missing), a new -t/--spec goal starts a fresh
         # plan. Otherwise `auto -t "fix the bug"` on a finished project would
@@ -481,6 +485,7 @@ def _cmd_auto(args, cfg, client, idx, root: Path) -> int:
                   file=sys.stderr)
             return 0
     else:
+        spec_text = ""
         if not plan_path.exists():
             print(f"No plan file at {plan_path}.\n"
                   "  Give -t \"goal\" or --spec FILE to generate one, or\n"
@@ -504,7 +509,7 @@ def _cmd_auto(args, cfg, client, idx, root: Path) -> int:
                          apply=args.apply, verify=verify, repair_rounds=repair,
                          max_tasks=max_tasks, max_minutes=max_minutes,
                          stop_on_fail=not args.keep_going,
-                         auto_install=auto_install)
+                         auto_install=auto_install, goal=spec_text)
 
     # Automatic post-run verification: after the checklist is done, exercise
     # the project once (the explicit --verify and/or a smoke run of main.py)

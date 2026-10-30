@@ -339,7 +339,8 @@ Rules:
   Needs allow_screenshots, and allow_shell when a command is launched.
 - `browser` opens a URL (or starts a server command that prints its URL) in
   a headless browser. Set `pattern` to interact first, e.g. `press Enter;
-  click #start; wait 3`, then `start` is the wait before capture. It returns
+  click #start`, and `start` to the seconds to wait before capture. A `wait`
+  inside `pattern` and `start` add together -- set one, not both. It returns
   the page URL/title/text, canvas sizes, console errors, and a screenshot.
   Use it for anything served over HTTP. A desktop `screenshot` cannot see a
   web page that no browser opened. Needs allow_browser; launching a server
@@ -347,6 +348,11 @@ Rules:
 - Do not claim dynamic behavior (spawn rates, animation, timing) from one
   screenshot or from reading code. If the app needs interaction and the
   available tools cannot drive it, say so plainly instead of guessing.
+- When the task asks you to LOCATE the code behind a behavior, the first
+  matching file is a hypothesis, not an answer: before `done`, confirm the
+  program's entry point actually loads it -- the import, the `<script>` tag,
+  or the instantiation site. A matching file that nothing loads is dead
+  code, and "fixing" it changes nothing.
 - `move` and `delete` are available only when allow_write is on. Prefer the
   search/replace answer format for edits; use these for whole-file moves or
   removals the task explicitly asks for.
@@ -537,6 +543,14 @@ class Agent:
         # longer on disk. Initialised here so apply() works even if it is
         # called without a preceding gather().
         self.gathered_source = ""
+        # Optional override for the forced-read coverage check: when set,
+        # gather() mines "files the task will change" from THIS text (the
+        # clean plan title) instead of the full assembled prompt. Callers
+        # that append goal prose and prior investigation reports to the task
+        # text set this, because report prose -- even an explicit "do NOT
+        # change snake_spawner.py yet" list -- otherwise becomes a forced
+        # must-read list and buries the step budget in irrelevant files.
+        self.task_targets: str | None = None
 
     # ------------------------------------------------------------------ phase 1
     def gather(self, task: str, verbose: bool = True,
@@ -568,6 +582,12 @@ class Agent:
         phase uses). When it is None the snapshot helper makes its own
         directory under `.pedacito/backups/`; it never drops `.bak` files in
         the source tree.
+
+        `self.task_targets`, when set before the call, replaces `task` as the
+        text mined for the forced-read coverage check ("files the task will
+        change"). The auto loop sets it to the clean plan title so file names
+        mentioned descriptively in goal prose or prior reports do not become
+        must-reads.
         """
         # Clear any backup directory left by a previous task before this one
         # starts: gathering is a fresh run, and a stale path would mix its
@@ -601,7 +621,12 @@ class Agent:
         unlimited = step_cap <= 0
         # Files the task text names but no `read` has covered yet; refreshed
         # after every successful read so the `done` nudge can act on it.
-        self._unread_files: list[str] = self._compute_unread(task)
+        # Mined from `task_targets` (the clean title) when the caller set it:
+        # the full prompt carries goal prose and prior reports whose file
+        # mentions -- even "do NOT change X yet" -- are description, not
+        # edit intent, and forcing reads of them wastes steps and context.
+        self._targets_text = getattr(self, "task_targets", None) or task
+        self._unread_files: list[str] = self._compute_unread(self._targets_text)
         # The gathered-source ceiling is charged per NEW byte, not per echoed
         # byte: a re-read of lines already in context costs nothing, so a
         # small model bouncing over the same big file cannot exhaust the
@@ -856,7 +881,7 @@ class Agent:
                     # A real read is progress, so a later `done` with new
                     # missing files is allowed another coverage nudge.
                     read_nudged = False
-                self._unread_files = self._compute_unread(task)
+                self._unread_files = self._compute_unread(self._targets_text)
             # An ERROR observation is navigation feedback ("that range does
             # not exist"), not source. Carrying it into the answer prompt as
             # gathered text makes the SOURCE section look populated while it

@@ -93,30 +93,96 @@ def test_verification_tasks_are_recognised():
 def test_unverified_admissions_are_detected():
     """The reported failure: the final task said "I can't launch the browser
     in this final phase, so I can't produce a live visual verification" --
-    and the loop ticked it done anyway because an edit applied."""
+    and the loop ticked it done anyway because an edit applied. Models
+    reword the admission constantly ("No live run ... not directly
+    verified"), so the list has to stay broad."""
     assert loop._reply_says_unverified(
         "I can't launch the browser in this final phase, so I can't produce "
         "a live visual verification. I made the head frame use black-green-"
         "black; the draw method already doubles the height.")
     assert loop._reply_says_unverified(
         "The server would not start; unable to verify the rendering.")
+    assert loop._reply_says_unverified(
+        "No live run/screenshot output was available in the gathered "
+        "evidence, so the rendered snake in the running app is not "
+        "directly verified.")
+    assert loop._reply_says_unverified(
+        "I could not verify any yellow head pixels in the provided source.")
     assert not loop._reply_says_unverified(
         "Verified in the browser: the snake is 180px tall with a diamond "
         "head (screenshot browser-2026.png).")
 
 
+def test_negative_outcome_reports_count_as_unverified():
+    """Run 7 ticked two verify tasks done whose reports said the opposite:
+    task 4's "could not visually verify" (an adverb split every listed
+    substring) and task 7's literal first line "Verification failed in the
+    captured run" (an outcome, not an inability -- the browser HAD been
+    driven, so the objective gate passed too)."""
+    assert loop._reply_says_unverified(
+        "Verification failed in the captured run: after pressing Enter and "
+        "waiting about 10 seconds, the live browser was not still in play.")
+    assert loop._reply_says_unverified(
+        "Still unknown: I could not visually verify a one-head snake in the "
+        "running browser.")
+    assert loop._reply_says_unverified(
+        "I could not re-verify the live browser in this final phase.")
+    assert loop._reply_says_unverified(
+        "The verification did not pass: the sprite still shows two heads.")
+
+
+def test_honest_caveats_are_not_failed_verifications():
+    """The flip side, from the same run: task 1 confirmed the symptoms it
+    was asked to confirm while honestly listing what it could NOT confirm
+    ("the executing code path is not yet confirmed", "plausible but not
+    unambiguously confirmed"). Failing caveat prose would stop every run at
+    its reproduce step -- only inability verbs and the verify family count
+    as negative signals."""
+    assert not loop._reply_says_unverified(
+        "The live browser behavior is confirmed, but the executing code path "
+        "is not yet confirmed; the duplication is visually plausible but not "
+        "unambiguously confirmed by the captured text alone.")
+    assert not loop._reply_says_unverified(
+        "Verified in the browser: one head at the top, score 987 after 10s.")
+    assert not loop._reply_says_unverified(
+        "This verifies the fix did not regress the palette.")
+
+
+def test_synthesized_steps_log_report_fails_verification():
+    """Run 8's final verify: the answer phase returned nothing, so the loop
+    synthesized a "report" from the steps log, and the checkpoint ticked
+    done on a 15-word `done` reason ("snake sprites visible with single
+    head at top"). A steps log is not a verification -- but for a non-verify
+    investigation title the fallback still stands, since its findings feed
+    the next task's context notes."""
+    tr = types.SimpleNamespace(
+        reply="No prose report was produced; the lookup phase recorded:\n\n"
+              "3. browser python main.py [press Enter; wait 10]  (Look.)",
+        steps=["3. browser python main.py [press Enter; wait 10]  (Look.)"])
+    assert "empty" in loop._evidence_failure(
+        "Run the game and verify the snake has one head", tr)
+    assert loop._evidence_failure("Locate the snake frames", tr) == ""
+
+
 def test_clip_report_keeps_head_and_tail():
-    """Investigation reports end with "Still unknown"/"Next check" -- the
-    doubt later tasks need. A head-only [:3000] clip dropped exactly that."""
-    reply = ("EVIDENCE. " + "x" * 4000
-             + " Next check: inspect main.js to confirm which snake class "
-               "is instantiated.")
-    clipped = loop._clip_report(reply)
+    """Caveats can sit ANYWHERE in a report: the run that motivated this
+    lost a mid-report "nothing shows this file is loaded by the running
+    app" warning to a 3,000-char clip. Real reports run 4-7k chars and now
+    pass through whole; beyond the budget, clipping keeps head AND tail."""
+    real = ("EVIDENCE. " + "x" * 5000
+            + " Still unknown: whether the app loads this file at all.")
+    assert loop._clip_report(real) == real
+    huge = ("EVIDENCE. " + "x" * 9000
+            + " Next check: inspect main.js to confirm which snake class "
+              "is instantiated.")
+    clipped = loop._clip_report(huge)
     assert clipped.startswith("EVIDENCE.")
     assert "confirm which snake class" in clipped
     assert "clipped" in clipped
-    assert len(clipped) < len(reply)
-    # Under budget: returned whole.
+    assert len(clipped) < len(huge)
+    # An explicit small budget clips head AND tail, never head only.
+    small = loop._clip_report(huge, budget=1000)
+    assert small.startswith("EVIDENCE.") and "instantiated." in small
     assert loop._clip_report("short report") == "short report"
 
 
@@ -125,6 +191,106 @@ def test_evidence_hint_only_for_live_behavior_tasks():
         "Run the game and verify the snake renders with a diamond head")
     assert "lookup" in hint.lower() and "browser" in hint.lower()
     assert loop._evidence_hint("Double the snake's body height") == ""
+
+
+def test_live_evidence_gate_is_objective():
+    """The run that motivated this: "Locate ... and verify" never drove the
+    app, admitted it only in prose the phrase list had never seen, and was
+    ticked done. The steps log is the signal that cannot be reworded."""
+    assert loop._needs_live_evidence(
+        "Run the game and verify the snake is twice as tall")
+    assert loop._needs_live_evidence(
+        "Reproduce the rendering issue by running the game and observing")
+    assert not loop._needs_live_evidence("Locate the snake code")
+    assert not loop._needs_live_evidence("Double the snake body height")
+    # Step entries anchor on the ACTION token: a read step whose reason
+    # mentions running the game is not live evidence.
+    assert loop._used_live_evidence(
+        ["2. browser python main.py [wait 3]  (Launch it.)"])
+    assert loop._used_live_evidence(["3. run pytest -q  (Tests.)"])
+    assert not loop._used_live_evidence(
+        ["1. read main.py L1-10  (Need to know how to run the game.)"])
+
+
+def test_plan_system_requires_live_checkpoints():
+    """The run that motivated this: the planner dropped BOTH the reproduce
+    and the final verify tasks for a "not rendering in the game" spec, so
+    nothing in the plan ever looked at the live app."""
+    assert "FIRST task must run the program" in loop.PLAN_SYSTEM
+    assert "LAST task must run the program" in loop.PLAN_SYSTEM
+    assert "dead or duplicated" in loop.PLAN_SYSTEM
+
+
+def test_investigate_system_demands_live_path_confirmation():
+    assert "actually loads" in loop.INVESTIGATE_SYSTEM
+    assert "dead or duplicated" in loop.INVESTIGATE_SYSTEM
+
+
+def test_plan_system_requires_constraints_in_titles():
+    """Run 6's planner dropped "keeping the doubled height" from the fix
+    task's title, and the worker -- whose attention goes to the title --
+    deleted rows instead of replacing them, shrinking the sprite."""
+    assert "Carry every concrete constraint" in loop.PLAN_SYSTEM
+
+
+def test_gather_base_requires_locate_diligence():
+    """Run 7's locate task concluded "done (Found snake frame and draw
+    code)" after reading ONLY the dead enemies.js -- the first name match.
+    Run 6's equivalent was accidentally thorough because the forced-read
+    bug dragged it through main.js too; removing that crutch has to be
+    paired with telling the gather loop what diligence now means."""
+    from pedacito.agent import GATHER_BASE
+    assert "hypothesis, not an answer" in GATHER_BASE
+    assert "entry point" in GATHER_BASE
+
+
+def test_gather_base_warns_browser_waits_add():
+    """Runs 7 and 8 both captured at 2x the requested wait: the model put
+    `wait N` in the pattern AND N in `start`, and browser.py executes both
+    ("Time: 20" after a "wait 10" step muddled two runs' timing analysis).
+    The old TOOL_HELP example taught the duplication; the prompt must say
+    the two waits add together."""
+    from pedacito.agent import GATHER_BASE
+    assert "add together" in GATHER_BASE
+
+
+def test_run_investigation_task_retries_an_empty_answer(tmp_path):
+    """Run 8's task 6 had an empty answer phase and the loop fell straight
+    to the steps-log synthesis. The retry absorbs transient empty
+    completions from local models before that fallback is reached -- and
+    when the retry is also empty, the fallback still records what happened
+    (the gate fails verify titles on it)."""
+    cfg = _cfg()
+    calls = []
+
+    class FakeAgent:
+        steps_log = ["1. browser python main.py [wait 3]  (Look.)"]
+
+        def gather(self, task, **kw):
+            return "gathered source"
+
+        def answer(self, task, gathered, **kw):
+            calls.append(1)
+            return "" if len(calls) == 1 else (
+                "A real report with enough prose to pass the word heuristic.")
+
+    tr = loop.run_investigation_task(
+        tmp_path, cfg, None, FakeAgent(),
+        types.SimpleNamespace(root=tmp_path), "Reproduce the bug")
+    assert len(calls) == 2
+    assert tr.reply.startswith("A real report")
+
+    class AlwaysEmpty(FakeAgent):
+        def answer(self, task, gathered, **kw):
+            calls.append(1)
+            return ""
+
+    tr = loop.run_investigation_task(
+        tmp_path, cfg, None, AlwaysEmpty(),
+        types.SimpleNamespace(root=tmp_path), "Reproduce the bug")
+    assert len(calls) == 4
+    assert tr.reply.startswith("No prose report was produced")
+    assert "1. browser python main.py" in tr.reply
 
 
 def test_tool_call_only_answer_is_detected():
@@ -227,6 +393,211 @@ def test_run_loop_edit_task_needs_evidence_when_title_says_verify(tmp_path,
     code = loop.run_loop(tmp_path, _cfg(), None, idx, plan, apply=True)
     assert code == 1
     assert "- [x]" not in plan.read_text()
+
+
+def test_run_loop_live_verify_needs_a_live_step(tmp_path, monkeypatch):
+    """Confident prose over read-only lookups still fails the objective
+    gate: "Run the game and verify ..." with no run/browser/screenshot step
+    observed nothing, whatever the report claims."""
+    plan = tmp_path / "PLAN.md"
+    loop.write_plan(plan, "goal",
+                    ["Run the game and verify the snake is taller"])
+    idx = types.SimpleNamespace(root=tmp_path)
+
+    def fake_investigate(root, cfg, client, agent, idx_, task,
+                         answer_system=None):
+        return loop.TaskResult(
+            [], "Verified: the snake renders 180px tall with a diamond head.",
+            True, [], idx_,
+            steps=["1. read static/js/main.js L195-230  (Check frames.)"])
+
+    monkeypatch.setattr(loop, "run_investigation_task", fake_investigate)
+    code = loop.run_loop(tmp_path, _cfg(), None, idx, plan, apply=True)
+    assert code == 1
+    assert "- [x]" not in plan.read_text()
+
+
+def test_run_loop_live_verify_passes_with_browser_step(tmp_path, monkeypatch):
+    plan = tmp_path / "PLAN.md"
+    loop.write_plan(plan, "goal",
+                    ["Run the game and verify the snake is taller"])
+    idx = types.SimpleNamespace(root=tmp_path)
+
+    def fake_investigate(root, cfg, client, agent, idx_, task,
+                         answer_system=None):
+        return loop.TaskResult(
+            [], "Verified: the snake renders 180px tall with a diamond head.",
+            True, [], idx_,
+            steps=["1. browser python main.py [wait 3]  (Launch the game.)",
+                   "2. read static/js/main.js L195-230  (Confirm frames.)"])
+
+    monkeypatch.setattr(loop, "run_investigation_task", fake_investigate)
+    code = loop.run_loop(tmp_path, _cfg(), None, idx, plan, apply=True)
+    assert code == 0
+    assert "- [x] Run the game" in plan.read_text()
+
+
+def test_run_loop_fails_verify_task_reporting_a_failed_verification(
+        tmp_path, monkeypatch):
+    """Run 7's terminal false green: the browser HAD been driven, so the
+    objective gate passed, but the report's first line said "Verification
+    failed in the captured run" -- and the loop ticked it done, ending
+    "7 done, 0 failed" on a game that still missed its spec. A driven
+    browser is not a pass when the report says the claim failed."""
+    plan = tmp_path / "PLAN.md"
+    loop.write_plan(plan, "goal",
+                    ["Run the game and verify the snake has one head"])
+    idx = types.SimpleNamespace(root=tmp_path)
+
+    def fake_investigate(root, cfg, client, agent, idx_, task,
+                         answer_system=None):
+        return loop.TaskResult(
+            [], "Verification failed in the captured run: each snake still "
+                "shows a second head block halfway down its body.",
+            True, [], idx_,
+            steps=["1. browser python main.py [press Enter; wait 3]  (Look.)"])
+
+    monkeypatch.setattr(loop, "run_investigation_task", fake_investigate)
+    code = loop.run_loop(tmp_path, _cfg(), None, idx, plan, apply=True)
+    assert code == 1
+    assert "- [x]" not in plan.read_text()
+
+
+def test_run_loop_fails_verify_task_with_no_prose_report(tmp_path, monkeypatch):
+    """Run 8's terminal green: task 6's answer phase came back empty, the
+    loop synthesized a steps-log fallback whose embedded `done` reason
+    claimed success, and the final verify checkpoint ticked done with no
+    report at all -- zero model-authored evidence, marked passed. The
+    synthesized stand-in must fail verify titles."""
+    plan = tmp_path / "PLAN.md"
+    loop.write_plan(plan, "goal",
+                    ["Run the game and verify the snake has one head"])
+    idx = types.SimpleNamespace(root=tmp_path)
+
+    def fake_investigate(root, cfg, client, agent, idx_, task,
+                         answer_system=None):
+        return loop.TaskResult(
+            [], "No prose report was produced; the lookup phase recorded:\n\n"
+                "3. browser python main.py [press Enter; wait 10]  (Look.)",
+            True, [], idx_,
+            steps=["3. browser python main.py [press Enter; wait 10]  (Look.)"])
+
+    monkeypatch.setattr(loop, "run_investigation_task", fake_investigate)
+    code = loop.run_loop(tmp_path, _cfg(), None, idx, plan, apply=True)
+    assert code == 1
+    assert "- [x]" not in plan.read_text()
+
+
+def test_run_loop_edit_verify_task_needs_live_step(tmp_path, monkeypatch):
+    """An edit-path task whose title promises browser verification fails on
+    the objective gate too: edits applied, but the session never drove the
+    app, so nothing observed the claimed effect."""
+    plan = tmp_path / "PLAN.md"
+    loop.write_plan(plan, "goal",
+                    ["Change the head colors and verify in the browser"])
+    idx = types.SimpleNamespace(root=tmp_path)
+
+    def fake_run_task(root, cfg, client, agent, idx_, task, apply=True,
+                      review=False, answer_system=None):
+        return loop.TaskResult([_ok()], "Applied the new palette.", True,
+                               ["a.py"], idx_,
+                               steps=["1. read a.py L1-5  (Palette.)"])
+
+    monkeypatch.setattr(loop, "run_task", fake_run_task)
+    code = loop.run_loop(tmp_path, _cfg(), None, idx, plan, apply=True)
+    assert code == 1
+    assert "- [x]" not in plan.read_text()
+
+
+def test_run_loop_carries_goal_into_task_prompt(tmp_path, monkeypatch):
+    """Run 6's task 3 deleted rows instead of replacing them: the spec's
+    "keeping the doubled height" constraint existed only in the goal, which
+    no task prompt carried, and the planner's title had dropped it. Every
+    task prompt must include the goal as binding background -- while forced
+    reads stay mined from the clean title only."""
+    plan = tmp_path / "PLAN.md"
+    loop.write_plan(plan, "goal", ["Fix the sprite rows"])
+    idx = types.SimpleNamespace(root=tmp_path)
+    seen = {}
+
+    def fake_run_task(root, cfg, client, agent, idx_, task, apply=True,
+                      review=False, answer_system=None):
+        seen["task"] = task
+        seen["targets"] = getattr(agent, "task_targets", None)
+        return loop.TaskResult([_ok()], "reply", True, ["a.py"], idx_)
+
+    monkeypatch.setattr(loop, "run_task", fake_run_task)
+    code = loop.run_loop(tmp_path, _cfg(), None, idx, plan, apply=True,
+                         goal="Remove the mid-body head, KEEPING the "
+                              "doubled 30-row height.")
+    assert code == 0
+    assert "ORIGINAL USER GOAL" in seen["task"]
+    assert "KEEPING the doubled 30-row height" in seen["task"]
+    assert "CURRENT TASK\nFix the sprite rows" in seen["task"]
+    assert seen["targets"] == "Fix the sprite rows"
+
+
+def test_run_loop_flags_stale_notes_after_edits(tmp_path, monkeypatch):
+    """Run 6's verify task reconciled task 2's pre-edit report ("duplicated
+    block at L212-216") against post-edit source and half concluded the
+    browser served a cache. After an edit applies, the notes it feeds must
+    announce which files changed and that older descriptions are stale."""
+    plan = tmp_path / "PLAN.md"
+    loop.write_plan(plan, "goal", ["Fix the duplicated head block",
+                                   "Adjust the palette"])
+    idx = types.SimpleNamespace(root=tmp_path)
+    seen = {}
+
+    def fake_run_task(root, cfg, client, agent, idx_, task, apply=True,
+                      review=False, answer_system=None):
+        seen["task"] = task
+        return loop.TaskResult([_ok()], "Removed the middle rows.", True,
+                               ["static/js/main.js"], idx_)
+
+    monkeypatch.setattr(loop, "run_task", fake_run_task)
+    code = loop.run_loop(tmp_path, _cfg(), None, idx, plan, apply=True)
+    assert code == 0
+    # The second task's prompt carries the staleness marker for the first.
+    assert "EDITS APPLIED to: static/js/main.js" in seen["task"]
+    assert "stale" in seen["task"]
+
+
+def test_gather_mines_forced_reads_from_targets_only(tmp_path):
+    """Run 6: prior reports' "do NOT change snake_spawner.py yet" prose was
+    mined as files the task "will change", forcing ~14 dead-code reads per
+    task and leaving verify tasks no budget to drive the browser. With
+    task_targets set (the clean title), descriptive mentions are not
+    must-reads; without it, behavior is unchanged for ask/chat flows."""
+    from pedacito import index as index_mod
+    from pedacito.agent import Agent
+
+    (tmp_path / "snake_spawner.py").write_text("SNAKE = 1\n",
+                                               encoding="utf-8")
+    cfg = Config()
+    cfg.log_sessions = False
+    idx = index_mod.build([str(tmp_path)], cfg, client=None,
+                          summarise=False, root=tmp_path)
+
+    class DoneClient:
+        stream_truncated = False
+        step_truncated = False
+        def chat_json(self, messages, schema, max_tokens=0, **kw):
+            return {"action": "done", "file": "", "pattern": "",
+                    "symbol": "", "start": 0, "end": 0, "content": "",
+                    "reasoning": "done"}
+        def chat(self, messages, max_tokens, schema=None, stream=False, **kw):
+            return ""
+
+    assembled = ("Fix the sprite rows\n\nCONTEXT FROM PRIOR INVESTIGATION\n\n"
+                 "Do NOT change snake_spawner.py yet; it is not loaded.")
+    plain = Agent(idx, DoneClient(), cfg)
+    plain.gather(assembled, verbose=False)
+    assert plain._unread_files, "legacy behavior: prose mentions force reads"
+
+    targeted = Agent(idx, DoneClient(), cfg)
+    targeted.task_targets = "Fix the sprite rows"
+    targeted.gather(assembled, verbose=False)
+    assert targeted._unread_files == []
 
 
 def test_context_notes_carry_report_tail(tmp_path, monkeypatch):
@@ -346,7 +717,8 @@ def test_run_loop_implements_each_task_in_order(tmp_path, monkeypatch):
     monkeypatch.setattr(loop, "run_task", fake_run_task)
     code = loop.run_loop(tmp_path, _cfg(), None, idx, plan, apply=True)
     assert code == 0
-    assert calls == ["task A", "task B", "task C"]
+    # Titles only: tasks after an applied edit also carry the staleness note.
+    assert [c.split("\n\n")[0] for c in calls] == ["task A", "task B", "task C"]
     text = plan.read_text()
     assert "- [x] task A" in text and "- [x] task B" in text and "- [x] task C" in text
 
@@ -363,7 +735,7 @@ def test_run_loop_respects_max_tasks(tmp_path, monkeypatch):
 
     monkeypatch.setattr(loop, "run_task", fake_run_task)
     loop.run_loop(tmp_path, _cfg(), None, idx, plan, apply=True, max_tasks=2)
-    assert calls == ["a", "b"]
+    assert [c.split("\n\n")[0] for c in calls] == ["a", "b"]
     assert "- [ ] c" in plan.read_text()          # never reached
 
 

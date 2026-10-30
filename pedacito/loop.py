@@ -38,7 +38,7 @@ import re
 import subprocess
 import sys
 import time
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 from . import index as index_mod
@@ -69,27 +69,76 @@ def _is_noop(reply: str) -> bool:
     ))
 
 
+# Outcome-negative regexes, backing the substring list below. Run 7 ticked
+# two verify tasks done whose reports said the opposite: task 4's "could not
+# *visually* verify" (an adverb split every listed substring) and task 7's
+# literal first line "Verification failed in the captured run" -- an outcome
+# statement, not an inability, and the browser HAD been driven, so the
+# objective gate passed too. The run ended "7 done, 0 failed" on a game that
+# still missed its spec.
+# Deliberately NOT matched: a bare "not ... confirmed" or a be-verb form
+# ("the executing code path is not yet confirmed") -- honest reproduce
+# reports list what they could not confirm as diligence while still
+# confirming the symptoms they were asked about, and failing those would
+# stop every run at its first task. Inability verbs (can't/could not/unable/
+# failed to) and the verify family are the unambiguous signals.
+_UNVERIFIED_RES = (
+    # Inability, tolerating up to 4 intervening words and a hyphenated verb:
+    # "could not visually verify", "could not re-verify", "can't produce a
+    # live visual verification". Curly apostrophes occur in real model
+    # output, so both ' and \u2019 are accepted.
+    re.compile(r"\b(?:can(?:not|['\u2019]t)|could(?: not|n['\u2019]t)|"
+               r"unable to|failed to|impossible to)\s+"
+               r"(?:[\w-]+\s+){0,4}?[\w-]*(?:verif|confirm)"),
+    # The verdict itself: "verification failed", "the verify step fails".
+    re.compile(r"\bverif\w*\s+(?:failed|fails)\b"),
+    # "verification did not pass/succeed".
+    re.compile(r"\bverif\w*\s+(?:did|does)\s*(?:not|n['\u2019]t)\s+"
+               r"(?:pass|succeed|verify|confirm|hold)"),
+    # "not visually verified", "not directly verified" -- the verify family
+    # only; a bare "not confirmed" is too common in honest caveat prose.
+    re.compile(r"\bnot\s+(?:\w+\s+){0,2}?verif(?:y|ied|ies|ying)\b"),
+    # "no live run/verification/visual evidence".
+    re.compile(r"\bno\s+live\s+(?:run|verification|visual|evidence)"),
+)
+
+
 def _reply_says_unverified(reply: str) -> bool:
-    """True when the model admits it could not perform the verification the
-    task asked for ("I can't launch the browser in this final phase"). A
-    checkpoint that confesses it gathered no evidence must not be ticked
+    """True when the report says the verification did NOT succeed: either it
+    confesses it could not perform the check the task asked for ("I can't
+    launch the browser in this final phase", "could not visually verify"), or
+    it drove the app and reports a negative outcome ("Verification failed in
+    the captured run"). A checkpoint that confesses either must not be ticked
     done: that is how an auto run ends all-green with its edits in the wrong
-    file. Only consulted for tasks whose TITLE asks to verify/confirm/
-    observe, so an incidental phrase in a fix task's prose cannot fail it."""
+    file. Models reword these admissions constantly -- adverbs split phrases,
+    outcomes arrive as results -- so the substrings are backed by the
+    `_UNVERIFIED_RES` regexes, and both are only consulted for tasks whose
+    TITLE asks to verify/confirm/observe, so an incidental phrase in a fix
+    task's prose cannot fail it. Phrase matching alone is still brittle;
+    `_evidence_failure` pairs it with the objective tool-use signal."""
     low = (reply or "").lower()
-    return any(p in low for p in (
-        "can't verify", "cannot verify", "could not verify",
-        "couldn't verify", "unable to verify",
-        "can't confirm", "cannot confirm", "could not confirm",
-        "unable to confirm",
-        "can't launch the browser", "cannot launch the browser",
-        "could not launch the browser", "unable to launch the browser",
-        "can't run the game", "cannot run the game",
-        "could not run the game",
-        "can't produce a live visual verification",
-        "cannot produce a live visual verification",
-        "no live visual verification", "not visually verified",
-    ))
+    if any(p in low for p in (
+            "can't verify", "cannot verify", "could not verify",
+            "couldn't verify", "unable to verify",
+            "can't confirm", "cannot confirm", "could not confirm",
+            "unable to confirm",
+            "can't launch the browser", "cannot launch the browser",
+            "could not launch the browser", "unable to launch the browser",
+            "can't run the game", "cannot run the game",
+            "could not run the game",
+            "can't produce a live visual verification",
+            "cannot produce a live visual verification",
+            "no live visual verification", "not visually verified",
+            # Rewordings observed in the wild: a locate-and-verify checkpoint
+            # that only read source, and a color-fix task in the wrong file.
+            "not directly verified", "was not verified", "is not verified",
+            "no live run", "no live verification",
+            "could not be verified", "cannot be verified", "can't be verified",
+            "without running the", "without a live run",
+            "did not run the", "didn't run the", "never ran the",
+    )):
+        return True
+    return any(r.search(low) for r in _UNVERIFIED_RES)
 
 
 # Words that make a task title a verification checkpoint: its deliverable is
@@ -106,11 +155,13 @@ def _is_verification_task(task: str) -> bool:
 
 # Clipping budget for the investigation reports carried between tasks. Local
 # models run tight contexts, so the notes are capped -- but the answer brief
-# puts the most actionable caveats ("Still unknown", "Next check") at the END
-# of a report, after the confident conclusion. Head-only truncation kept the
-# conclusion and silently dropped the doubt, and later tasks acted on the
-# guess the report itself had flagged as unconfirmed. Clip head AND tail.
-_REPORT_BUDGET = 3000
+# puts caveats ("Still unknown", "Next check", live-path doubts) ANYWHERE in
+# a report, often after the confident conclusion. A 3,000-char head-only clip
+# lost a mid-report "nothing shows this file is even loaded by the running
+# app" warning and later tasks edited dead code; observed reports run 4-7k
+# chars, and two notes at 8k chars (~4k tokens) fit every context tier this
+# loop actually drives. Clip head AND tail only past the budget.
+_REPORT_BUDGET = 8000
 
 
 def _clip_report(reply: str, budget: int = _REPORT_BUDGET) -> str:
@@ -147,6 +198,64 @@ def _evidence_hint(task: str) -> str:
             "capture the evidence while gathering, before you answer -- a "
             "verification postponed to the answer phase cannot happen, and "
             "reporting the task done without that evidence fails it.")
+
+
+# A steps_log entry looks like "4. browser python main.py [wait 3]  (reason)".
+# Anchor on the ACTION token: a `read` step whose reason mentions "run the
+# game" is not live evidence.
+_LIVE_STEP = re.compile(r"^\d+\.\s+(?:run|browser|screenshot)\b")
+
+# Title words that promise live observation. Narrower than _EVIDENCE_WORDS
+# on purpose: paired with a verify word below, these titles are only
+# satisfied by evidence from the RUNNING app. "Check the render path" stays
+# a code-archaeology task; "Run the game and verify ..." does not.
+_LIVE_TITLE = re.compile(
+    r"\b(run|runs|running|launch|launches|start|starts|game|app|browser|"
+    r"visually|screenshot|screenshots|observe|observes|observing|"
+    r"reproduce|reproduces|live)\b")
+
+
+def _needs_live_evidence(task: str) -> bool:
+    """True when the title promises verification by live observation."""
+    low = (task or "").lower()
+    return bool(_VERIFY_WORDS.search(low) and _LIVE_TITLE.search(low))
+
+
+def _used_live_evidence(steps) -> bool:
+    """True when some lookup step actually drove the app (run/browser/
+    screenshot) -- the objective signal, immune to how the report words it."""
+    return any(_LIVE_STEP.match(s or "") for s in (steps or ()))
+
+
+def _evidence_failure(task: str, tr) -> str:
+    """A reason string when a verification checkpoint lacks evidence, else "".
+
+    Two independent signals, because either one alone has holes: the report
+    says the verification did not succeed -- it could not be performed, or it
+    was performed and came back negative (phrase/regex match; models reword
+    admissions constantly) -- and the session never drove the app at all
+    (objective: no run/browser/screenshot step, checked for titles that
+    promise live observation). A confident report over read-only lookups
+    still fails the second gate; a browser-driving report that says
+    "Verification failed" still fails the first."""
+    if not _is_verification_task(task):
+        return ""
+    if (tr.reply or "").startswith("No prose report was produced"):
+        # The answer phase returned nothing (even after the retry in
+        # run_investigation_task) and the loop synthesized this stand-in
+        # from the steps log. A steps log is not a verification: the
+        # checkpoint's deliverable is a report, and an empty one carries
+        # neither evidence nor caveats.
+        return ("its report is empty (the answer phase produced no prose "
+                "even after a retry); a steps log is not a verification")
+    if _reply_says_unverified(tr.reply):
+        return ("its report says the verification did not succeed "
+                "(could not be performed, or was performed and failed)")
+    if _needs_live_evidence(task) and not _used_live_evidence(
+            getattr(tr, "steps", ())):
+        return ("it never drove the app (no run/browser/screenshot step); "
+                "reading source is not live evidence")
+    return ""
 
 
 # Tasks that are checkpoints rather than edits. The planner explicitly emits
@@ -302,6 +411,22 @@ Rules:
   not return an empty list: produce concrete repair steps -- reproduce the
   failure, locate the cause, fix it, then verify. "Fix the bug" is a valid
   task title when that is genuinely all there is to do.
+- If the goal describes observable behavior -- a UI, a game, rendering, or a
+  complaint like "X was added but is not showing / still looks wrong" -- the
+  FIRST task must run the program and observe the actual current behavior,
+  and the LAST task must run the program and observe that the change took
+  visible effect. Title them with how to observe ("Run the game and verify
+  the snake is twice as tall in the browser"): the loop FAILS a verification
+  task that never drove the app.
+- If the goal says an earlier change never took effect, treat WHICH FILE the
+  program actually runs as unknown: include a task to confirm which code is
+  really loaded (who imports or instantiates it) before any edit task --
+  dead or duplicated definitions are the usual culprit.
+- Carry every concrete constraint from the goal into the titles of the tasks
+  that must honour it ("Remove the mid-body head block, KEEPING the doubled
+  30-row height and the width unchanged"): a worker's attention goes to its
+  title, and a numeric or visible constraint that lives only in the goal
+  prose is easily lost mid-edit.
 - A task may be investigation-only ("Reproduce...", "Locate the cause...",
   "Check..."). Keep such a title free of edit verbs and put the actual code
   change in a later task; the loop treats it as a checkpoint and does not
@@ -446,13 +571,17 @@ def install_modules(packages: list[str], root: Path) -> tuple[bool, str]:
 @dataclass
 class TaskResult:
     """What one task run produced: the edit results, the reply, whether any
-    writes landed, the files re-indexed, and the (possibly refreshed) index."""
+    writes landed, the files re-indexed, and the (possibly refreshed) index.
+    `steps` is the lookup phase's action log ("4. browser ..."), kept so the
+    outer loop can tell objectively whether a verification task ever drove
+    the app instead of trusting the report's prose."""
     results: list
     reply: str
     applied: bool
     changed: list[str]
     idx: "index_mod.Index"
     session: Path | None = None
+    steps: list[str] = field(default_factory=list)
 
 
 def _report(results, dry_run: bool):
@@ -679,7 +808,12 @@ You are investigating a software problem, not editing code. You have a map of
 the project and whatever source and command output the gather phase collected.
 Report what you observed: what reproduces the problem, the exact evidence
 (command output, file and line ranges), the likely cause, and the smallest next
-fix someone should make. Do not call tools -- none are available in this phase.
+fix someone should make. Before naming a file as the cause, confirm the running
+program actually loads that code -- who imports it, who instantiates it;
+projects often contain dead or duplicated definitions that look authoritative
+but never execute. Prefer evidence from the running program over source
+reading, and if the live path is unconfirmed, lead "still unknown" with that.
+Do not call tools -- none are available in this phase.
 Do not emit search/replace blocks. Be concrete and concise; if the evidence is
 inconclusive, say what is still unknown and what to check next.
 """
@@ -728,6 +862,17 @@ def run_investigation_task(root: Path, cfg, client, agent, idx, task: str, *,
                          system=answer_system or INVESTIGATE_SYSTEM,
                          include_edit_format=False, stream=True)
     if _looks_like_tool_calls_only(reply) or not (reply or "").strip():
+        # An empty answer phase leaves a verification checkpoint with no
+        # report at all -- run 8's final verify ticked done on the steps-log
+        # fallback below plus a 15-word `done` reason. One retry absorbs the
+        # transient empty completions local models produce before we fall
+        # back to synthesizing a report from the lookups.
+        retry = agent.answer(task, gathered,
+                             system=answer_system or INVESTIGATE_SYSTEM,
+                             include_edit_format=False, stream=True)
+        if (retry or "").strip() and not _looks_like_tool_calls_only(retry):
+            reply = retry
+    if _looks_like_tool_calls_only(reply) or not (reply or "").strip():
         steps = "\n".join(getattr(agent, "steps_log", []) or ["(no steps)"])
         reply = ("No prose report was produced; the lookup phase recorded:\n\n"
                  + steps)
@@ -740,7 +885,8 @@ def run_investigation_task(root: Path, cfg, client, agent, idx, task: str, *,
                                           getattr(agent, "steps_log", []),
                                           reply, [], None, when)
         print(f"[session: {session.relative_to(root)}]", file=sys.stderr)
-    return TaskResult([], reply, True, [], idx, session)
+    return TaskResult([], reply, True, [], idx, session,
+                      list(getattr(agent, "steps_log", []) or []))
 
 
 def run_task(root: Path, cfg, client, agent, idx, task: str, *,
@@ -821,7 +967,8 @@ def run_task(root: Path, cfg, client, agent, idx, task: str, *,
                                           reply, results, backup_dir, when,
                                           raw_reply=raw_reply if truncated else None)
         print(f"[session: {session.relative_to(root)}]", file=sys.stderr)
-    return TaskResult(results, reply, applied, changed, idx, session)
+    return TaskResult(results, reply, applied, changed, idx, session,
+                      list(getattr(agent, "steps_log", []) or []))
 
 
 # --------------------------------------------------------------------------
@@ -832,7 +979,7 @@ def run_loop(root: Path, cfg, client, idx, plan_path: Path, *,
              max_tasks: int = 0, max_minutes: int = 0,
              stop_on_fail: bool = True,
              answer_system: str | None = None, auto_install: bool = False,
-             on_task=None) -> int:
+             goal: str = "", on_task=None) -> int:
     """Run the Ralph loop until the plan is empty (or a cap/stop is hit).
 
     Each iteration: read the plan, take the first unchecked task, run it in a
@@ -856,14 +1003,27 @@ def run_loop(root: Path, cfg, client, idx, plan_path: Path, *,
     - Investigation-only tasks ("Reproduce...", "Locate the cause...") are
       answered in prose and marked done without requiring edits.
     - Verification checkpoints (titles asking to verify/confirm/observe) are
-      FAILED, not ticked done, when their report admits it could not gather
-      the evidence ("I can't launch the browser in this final phase") -- an
-      applied edit is not evidence, even with the shell verify green.
+      FAILED, not ticked done, when their report says the verification did
+      not succeed -- it could not be performed ("could not visually verify")
+      or was performed and came back negative ("Verification failed in the
+      captured run") -- or, for titles promising live observation ("Run the
+      game and verify ..."), when the session never drove the app (no
+      run/browser/screenshot step), or when the answer phase produced no
+      prose at all even after one retry (the synthesized steps-log stand-in
+      is not a report). An applied edit is not evidence, even with the shell
+      verify green; a driven browser is not a pass when the report says the
+      claim failed.
     - ``auto_install`` when a verification fails on a missing third-party
                         module, pip-install it and retry (opt-in: the module
                         name comes from generated code). When off, the failure
                         is reported as a dependency problem and the code-repair
                         loop is skipped, since editing source cannot add a dep.
+    - ``goal``          the user's original spec text. Every task prompt
+                        carries it as background, so constraints the planner
+                        dropped from a title ("keeping the doubled height")
+                        still bind the worker. Forced file-reads are mined
+                        from the task TITLE only (agent.task_targets), never
+                        from the goal or report prose.
     """
     from .agent import Agent
 
@@ -904,17 +1064,35 @@ def run_loop(root: Path, cfg, client, idx, plan_path: Path, *,
 
         investigate = _is_investigation_task(task)
         task_for_agent = task + _evidence_hint(task)
+        if goal:
+            # The workers used to see only their title and prior reports:
+            # a constraint that lived solely in the spec ("keep the doubled
+            # height") was lost the moment the planner's title dropped it,
+            # and the edit silently violated the user's goal.
+            task_for_agent = (
+                "ORIGINAL USER GOAL (background -- the CURRENT TASK below is "
+                "the step to do now; every constraint in the goal still "
+                "binds it):\n" + _clip_report(goal, budget=4000)
+                + "\n\nCURRENT TASK\n" + task_for_agent)
         if context_notes:
             task_for_agent = (
                 task_for_agent + "\n\nCONTEXT FROM PRIOR INVESTIGATION\n\n"
                 + "\n\n".join(context_notes))
         try:
+            agent = Agent(idx, client, cfg)
+            # Forced reads ("files the task will change") are mined from the
+            # clean title only. Mining the assembled prompt turned prior
+            # reports' descriptive file mentions -- even an explicit "do NOT
+            # change snake_spawner.py yet" list -- into a must-read list that
+            # buried verify tasks in dead-code reads until no steps were left
+            # to drive the browser.
+            agent.task_targets = task
             if investigate:
                 tr = run_investigation_task(
-                    root, cfg, client, Agent(idx, client, cfg), idx,
+                    root, cfg, client, agent, idx,
                     task_for_agent, answer_system=answer_system)
             else:
-                tr = run_task(root, cfg, client, Agent(idx, client, cfg), idx,
+                tr = run_task(root, cfg, client, agent, idx,
                               task_for_agent, apply=apply, review=False,
                               answer_system=answer_system)
         except LLMError as e:
@@ -931,13 +1109,13 @@ def run_loop(root: Path, cfg, client, idx, plan_path: Path, *,
             # The report is the deliverable; there is no code change to apply
             # or verify. A failed/empty run is still a failure.
             if (tr.reply or "").strip():
-                if _is_verification_task(task) and \
-                        _reply_says_unverified(tr.reply):
-                    print("  [verification task reports it could not gather "
-                          f"evidence -- {'stopping' if stop_on_fail else 'skipping'}]",
+                miss = _evidence_failure(task, tr)
+                if miss:
+                    print(f"  [verification task failed: {miss} -- "
+                          f"{'stopping' if stop_on_fail else 'skipping'}]",
                           file=sys.stderr)
                     workspace.log_event(
-                        root, "verification task gathered no evidence",
+                        root, f"verification task gathered no evidence: {miss}",
                         "ERROR")
                     failed += 1
                     if stop_on_fail:
@@ -1060,21 +1238,38 @@ def run_loop(root: Path, cfg, client, idx, plan_path: Path, *,
             mark_failed(plan_path, task)
             continue
 
-        if _is_verification_task(task) and _reply_says_unverified(tr.reply):
+        miss = _evidence_failure(task, tr)
+        if miss:
             # An applied edit is not evidence: a task that asks to verify
-            # live behavior and then admits it could not ("I can't launch
-            # the browser in this final phase") has not earned its tick,
-            # even with edit blocks on the floor and the shell verify green.
-            print("  [task asked for verification but its report says it "
-                  f"could not verify -- {'stopping' if stop_on_fail else 'skipping'}]",
+            # live behavior has to show it drove the app, even with edit
+            # blocks on the floor and the shell verify green.
+            print(f"  [verification task failed: {miss} -- "
+                  f"{'stopping' if stop_on_fail else 'skipping'}]",
                   file=sys.stderr)
             workspace.log_event(
-                root, "verification task gathered no evidence", "ERROR")
+                root, f"verification task gathered no evidence: {miss}",
+                "ERROR")
             failed += 1
             if stop_on_fail:
                 break
             mark_failed(plan_path, task)
             continue
+
+        if tr.applied and tr.changed:
+            # Later tasks must not trust pre-edit reports: after a fix
+            # landed, a verify task tried to reconcile the stale "duplicated
+            # block at L212-216" note against post-fix source and half
+            # concluded the browser was serving a cache. State the change
+            # explicitly so the notes carry their own expiry.
+            summary = (tr.reply or "").split("--- FILE:")[0].strip()
+            context_notes.append(
+                f"### {task}\nEDITS APPLIED to: "
+                f"{', '.join(sorted(set(tr.changed)))}.\n"
+                + (summary[:400] + "\n" if summary else "")
+                + "These files changed on disk AFTER the reports above; line "
+                  "numbers and defect descriptions in earlier notes may be "
+                  "stale -- re-read the current file state before quoting it.")
+            del context_notes[:-2]       # keep only the latest two
 
         mark_done(plan_path, task)
         done += 1

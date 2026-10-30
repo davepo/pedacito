@@ -785,12 +785,19 @@ def load(root: Path | None = None, explicit: Path | None = None,
     if profile:
         if profile not in profiles:
             known = ", ".join(sorted(profiles)) or "(none defined)"
+            # Say WHERE the profiles were looked for. XDG_CONFIG_HOME can
+            # silently redirect the user config (flatpak shells, IDE
+            # terminals), and "(none defined)" without the paths sends the
+            # user hunting through a config.toml that was never opened.
+            searched = "; ".join(f"{label}: {path}" for label, path in layers) \
+                or f"no config file found (expected: {USER_CONFIG})"
             hint = ("Define it in your config, or clear `default_profile`. "
                     "Run `pedacito config --setup` to build both interactively."
                     if origin == "default_profile" and not profiles else "")
             raise ConfigError(
                 f"No profile named '{profile}' (from {origin}). "
                 f"Defined profiles: {known}\n"
+                f"Looked in: {searched}\n"
                 + (hint + "\n" if hint else "") +
                 "Add one to your config:\n\n"
                 f"  [profiles.{profile}]\n  model = \"...\"")
