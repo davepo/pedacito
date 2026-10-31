@@ -1124,7 +1124,20 @@ def test_browser_server_url_detection_and_action_parser():
     assert browser.parse_actions("eval") == []      # empty expr: dropped
     # Run 10's forced-state expressions were truncated mid-token at 200,
     # and schema-constrained sampling cannot emit what the schema forbids.
-    assert tools.STEP_SCHEMA["properties"]["pattern"]["maxLength"] == 600
+    # Run 13 then guillotined every ~750-char measurement eval at exactly
+    # 600: the grammar force-closes the string AT maxLength -- valid JSON,
+    # finish_reason "stop", no truncation flag -- and the browser ran the
+    # fragment (identical SyntaxError in every retry; five checks retired).
+    # The cap must hold a legitimate measurement payload, and agent.gather
+    # refuses to dispatch one arriving at exactly it.
+    assert tools.STEP_SCHEMA["properties"]["pattern"]["maxLength"] == 2000
+    # Fix ZC (run 13e): the RESULT side needs the same budget, advertised
+    # where the model reads it every step -- five checks retired on
+    # measurements that HAD succeeded but reached the model decapitated
+    # at the old 240-char value clip ("the live eval output was truncated
+    # before returning whiteTop and blackBelow").
+    assert ("2000 chars" in
+            tools.STEP_SCHEMA["properties"]["pattern"]["description"])
 
 
 def test_browser_eval_action_runs_and_reports_its_value(tmp_path, monkeypatch):
@@ -1227,10 +1240,322 @@ def test_browser_eval_action_runs_and_reports_its_value(tmp_path, monkeypatch):
         wait=0, out=tmp_path / "shot.png")
     assert ok, info
     assert page.keyboard.pressed == ["Enter"]
-    assert page.evaled == ["state.data.scale = 3"]
+    # Bug Z (run 13c): the page-side source now rides inside a race
+    # wrapper (json-quoted) next to a settle-timer, so a never-resolving
+    # forced-state Promise surfaces as an action error instead of hanging
+    # evaluate -- which no set_default_timeout covers -- forever.
+    assert len(page.evaled) == 1
+    raced = page.evaled[0]
+    assert "Promise.race" in raced
+    assert '"state.data.scale = 3"' in raced      # source embedded verbatim
+    assert "setTimeout" in raced and "did not settle" in raced
     assert "pressed Enter" in info["actions"]
     assert "eval'd state.data.scale = 3 -> 3" in info["actions"]
     assert info["action_errors"] == []
+
+
+def test_raced_eval_bounds_a_never_settling_promise():
+    """Bug Z end-to-end (run 13c): a forced-state `new Promise(res =>
+    ...rAF...)` whose callback throws stays pending forever, and
+    page.evaluate -- which set_default_timeout does NOT cover -- waits
+    for it forever: the run hung 68 minutes with no log line while the
+    LLM server idle-unloaded the model. The raced wrapper must turn that
+    into a bounded rejection carrying the try/catch lesson, while plain
+    completion-value evals, function-shaped evals, and settling Promises
+    keep their exact semantics."""
+    from pedacito import browser
+
+    pytest.importorskip("playwright.sync_api")
+    from playwright.sync_api import sync_playwright
+
+    with sync_playwright() as pw:
+        try:
+            b = pw.chromium.launch(headless=True)
+        except Exception as e:                  # pragma: no cover
+            pytest.skip(f"chromium unavailable: {e}")
+        try:
+            pg = b.new_page()
+            pg.goto("data:text/html,<title>t</title><body>hi</body>")
+
+            t0 = time.monotonic()
+            with pytest.raises(Exception) as ei:
+                pg.evaluate(browser._raced_eval("new Promise(()=>{})", 1))
+            elapsed = time.monotonic() - t0
+            assert elapsed < 10, f"race timer never fired ({elapsed:.1f}s)"
+            assert "did not settle within 1s" in str(ei.value)
+
+            # The run-13c shape proper: the rAF callback throws, so the
+            # Promise stays pending forever -- same bounded outcome.
+            with pytest.raises(Exception):
+                pg.evaluate(browser._raced_eval(
+                    "new Promise(res => requestAnimationFrame(() => {"
+                    "undefinedFunction(); res(1); }))", 1))
+
+            # Completion-value semantics survive the wrapper (direct eval,
+            # last statement's value), and a bare function shape is called
+            # the way Playwright itself would call it.
+            assert pg.evaluate(
+                browser._raced_eval("var x = 41; x + 1", 5)) == 42
+            assert pg.evaluate(browser._raced_eval("() => 7", 5)) == 7
+            # A settling Promise resolves through the race with its value.
+            assert pg.evaluate(browser._raced_eval(
+                "new Promise(res => setTimeout(() => res('ok'), 50))",
+                5)) == "ok"
+        finally:
+            b.close()
+
+
+def test_unclosed_brackets_names_the_openers_that_never_close():
+    """Bug ZB (run 13d): V8 reports an unclosed construct as a bare
+    "Unexpected end of input" with NO position, so the model had no way
+    to find the one missing `}` in its 1,174-char measurement eval (the
+    IIFE body never closed). The scanner names every opener still live
+    at end of input, with its position and surrounding context."""
+    from pedacito import browser
+
+    # The field shape: every inner level closes, the IIFE itself never
+    # does -- the tail is one `}` short of `});})()`.
+    hint = browser._unclosed_brackets(
+        "(function(){return new Promise(function(res){res(1)})()")
+    assert "unclosed" in hint
+    assert "`(` from char 0" in hint
+    assert "`{` from char 11" in hint
+    assert "near the tail" in hint
+
+    # Balanced expressions produce no hint -- including brackets that
+    # live inside strings, template literals, or comments.
+    assert browser._unclosed_brackets("(function(){return 1;})()") == ""
+    assert browser._unclosed_brackets("var s = '})'; s + \"(\"") == ""
+    assert browser._unclosed_brackets("var t = `a{b(`; t") == ""
+    assert browser._unclosed_brackets("// }\nvar x = 1; x") == ""
+    assert browser._unclosed_brackets("/* ( */ 1 + 1") == ""
+
+    # A crossed pair and an unterminated string get their own diagnoses.
+    assert "cross" in browser._unclosed_brackets("(x]")
+    assert "string" in browser._unclosed_brackets("var s = 'abc")
+
+
+def test_browser_eval_syntax_error_teaches_the_missing_closers(
+        tmp_path, monkeypatch):
+    """Bug ZB end-to-end through the tool: run 13d's model saw only
+    "SyntaxError: Unexpected end of input" at a stack column pointing
+    into Playwright's machinery, next to a 60-char head echo of its own
+    arg -- and concluded the TOOL had truncated the string (it re-sent
+    the same broken tail five times and blamed the harness in its
+    FAILED verdict). The action error must state the length that
+    arrived intact, carry the bracket report, and quote the tail where
+    the missing closer belongs."""
+    import sys
+    import types as pytypes
+    from pedacito import browser
+
+    EXPR = "(function(){return new Promise(function(res){res(1)})()"
+
+    class FakeKeyboard:
+        def press(self, key):
+            pass
+
+        def type(self, text):
+            pass
+
+    class FakePage:
+        url = "http://127.0.0.1:5000/"
+
+        def __init__(self):
+            self.keyboard = FakeKeyboard()
+
+        def set_default_timeout(self, ms):
+            pass
+
+        def on(self, event, handler):
+            pass
+
+        def goto(self, url, wait_until=None, timeout=None):
+            pass
+
+        def evaluate(self, expr):
+            if expr.startswith("()"):
+                return []          # the _canvas_info probe
+            raise Exception(
+                "Page.evaluate: SyntaxError: Unexpected end of input\n"
+                "    at eval (eval at evaluate (:370:30), "
+                "<anonymous>:1:44)")
+
+        def wait_for_timeout(self, ms):
+            pass
+
+        def screenshot(self, path=None, full_page=False):
+            with open(path, "wb") as fh:
+                fh.write(b"fake png")
+
+        def inner_text(self, sel):
+            return ""
+
+        def title(self):
+            return "Game"
+
+    class FakeBrowser:
+        def __init__(self, page):
+            self._page = page
+
+        def new_page(self, viewport=None):
+            return self._page
+
+        def close(self):
+            pass
+
+    class FakeChromium:
+        def __init__(self, page):
+            self._page = page
+
+        def launch(self, headless=True):
+            return FakeBrowser(self._page)
+
+    class FakePW:
+        def __init__(self, page):
+            self.chromium = FakeChromium(page)
+
+    class FakeCM:
+        def __init__(self, pw):
+            self._pw = pw
+
+        def __enter__(self):
+            return self._pw
+
+        def __exit__(self, *exc):
+            return False
+
+    page = FakePage()
+    fake_sync = pytypes.ModuleType("playwright.sync_api")
+    fake_sync.sync_playwright = lambda: FakeCM(FakePW(page))
+    fake_root = pytypes.ModuleType("playwright")
+    fake_root.sync_api = fake_sync
+    monkeypatch.setitem(sys.modules, "playwright", fake_root)
+    monkeypatch.setitem(sys.modules, "playwright.sync_api", fake_sync)
+    monkeypatch.setattr(browser, "available", lambda: True)
+
+    ok, info = browser.run(
+        "http://127.0.0.1:5000/",
+        actions="press Enter; eval " + EXPR,
+        wait=0, out=tmp_path / "shot.png")
+    assert ok, info
+    assert len(info["action_errors"]) == 1
+    err = info["action_errors"][0]
+    assert "SYNTAX ERROR" in err
+    assert "Unexpected end of input" in err
+    assert f"received all {len(EXPR)} chars" in err   # counters "truncated"
+    assert "unclosed" in err and "`{` from char 11" in err
+    assert "Source tail:" in err and EXPR[-12:] in err
+    # The press before the eval still ran and logged; the eval itself
+    # logged no value (it never executed).
+    assert "pressed Enter" in info["actions"]
+    assert not any("eval'd" in a for a in info["actions"])
+
+
+def test_browser_eval_result_reaches_the_model_up_to_the_cap(
+        tmp_path, monkeypatch):
+    """Fix ZC (run 13e): five checks retired as failed on measurements
+    that HAD succeeded -- the evals ran and resolved per-row pixel
+    profiles, but the action log showed the model only str(value)[:240]
+    ("the live eval output was truncated before returning whiteTop and
+    blackBelow"), and the spec's checks demand per-row numbers, making
+    them structurally unpassable. The result clip now mirrors the
+    pattern cap: an eval may return as much as it may receive. The
+    gather budget still caps the session total with its own explicit
+    marker."""
+    import sys
+    import types as pytypes
+    from pedacito import browser
+
+    class FakeKeyboard:
+        def press(self, key):
+            pass
+
+        def type(self, text):
+            pass
+
+    class FakePage:
+        url = "http://127.0.0.1:5000/"
+
+        def __init__(self):
+            self.keyboard = FakeKeyboard()
+
+        def set_default_timeout(self, ms):
+            pass
+
+        def on(self, event, handler):
+            pass
+
+        def goto(self, url, wait_until=None, timeout=None):
+            pass
+
+        def evaluate(self, expr):
+            if expr.startswith("()"):
+                return []          # the _canvas_info probe
+            return "x" * 5000      # a per-row measurement profile, fat
+
+        def wait_for_timeout(self, ms):
+            pass
+
+        def screenshot(self, path=None, full_page=False):
+            with open(path, "wb") as fh:
+                fh.write(b"fake png")
+
+        def inner_text(self, sel):
+            return ""
+
+        def title(self):
+            return "Game"
+
+    class FakeBrowser:
+        def __init__(self, page):
+            self._page = page
+
+        def new_page(self, viewport=None):
+            return self._page
+
+        def close(self):
+            pass
+
+    class FakeChromium:
+        def __init__(self, page):
+            self._page = page
+
+        def launch(self, headless=True):
+            return FakeBrowser(self._page)
+
+    class FakePW:
+        def __init__(self, page):
+            self.chromium = FakeChromium(page)
+
+    class FakeCM:
+        def __init__(self, pw):
+            self._pw = pw
+
+        def __enter__(self):
+            return self._pw
+
+        def __exit__(self, *exc):
+            return False
+
+    page = FakePage()
+    fake_sync = pytypes.ModuleType("playwright.sync_api")
+    fake_sync.sync_playwright = lambda: FakeCM(FakePW(page))
+    fake_root = pytypes.ModuleType("playwright")
+    fake_root.sync_api = fake_sync
+    monkeypatch.setitem(sys.modules, "playwright", fake_root)
+    monkeypatch.setitem(sys.modules, "playwright.sync_api", fake_sync)
+    monkeypatch.setattr(browser, "available", lambda: True)
+
+    ok, info = browser.run(
+        "http://127.0.0.1:5000/",
+        actions="eval JSON.stringify(rows)",
+        wait=0, out=tmp_path / "shot.png")
+    assert ok, info
+    entry = [a for a in info["actions"] if a.startswith("eval'd")][0]
+    assert entry.startswith("eval'd JSON.stringify(rows) -> ")
+    assert "x" * 2000 in entry          # the full cap reaches the model
+    assert "x" * 2001 not in entry      # and not one char beyond
 
 
 def test_browser_is_gated_and_explains_a_missing_backend(tmp_path, monkeypatch):

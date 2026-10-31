@@ -65,7 +65,12 @@ def _is_noop(reply: str) -> bool:
     return any(p in low for p in (
         "no changes", "no change", "nothing to", "nothing needs",
         "already ", "is already", "no edit", "no code change",
-        "leave as", "as-is", "already exists", "already correct",
+        # "no code edit": run 13d's first repair reply -- "No code edit
+        # is appropriate here" -- matched NONE of the patterns above
+        # ("no edit" needs the words adjacent), so the honest refusal
+        # fell into the re-ask loop instead of the no-op path.
+        "no code edit", "leave as", "as-is", "already exists",
+        "already correct",
     ))
 
 
@@ -182,6 +187,66 @@ _UNVERIFIED_RES = (
     # run's truthfulness.
     re.compile(r"\bstill unknown\b[^.\n]{0,40}?\bwhether\b"),
 )
+
+
+# Fix ZE (run 13g): the frog check FINALLY passed clean -- full per-row
+# white/black counts quoted, discrete 2x2 cells confirmed, bare "VERDICT:
+# PASSED" -- and was then retired as FAILED because its "Likely cause of
+# the previous failure" section said the EARLIER eval "could not confirm
+# white eyes": the confession matcher read the whole report and could not
+# tell HISTORY from CONFESSION. Retry flows invite exactly that narration
+# (the check re-runs with the prior FAILED note in context, and a good
+# report explains it), so a PASSED verdict is now phrase-matched against
+# the report with prior-attempt sentences stripped. A sentence counts as
+# historical when it attributes something to a prior attempt ("the earlier
+# live eval", "the previous failure") or continues a dropped sentence as a
+# pronoun ("It did not count ... so it could not confirm ..."). Present-
+# tense first-person confessions ("I could not verify the tail point in
+# the capture") carry no attribution and survive the pruning -- the
+# pessimistic gate still fails them.
+_PRIOR_ATTEMPT_RE = re.compile(
+    r"\b(?:"
+    r"(?:earlier|previous|prior|first|initial|last|original)\s+"
+    r"(?:\w+\s+){0,2}?"
+    r"(?:attempt|attempts|try|eval|evals|run|runs|session|sessions|"
+    r"check|checks|verification|failure|failures|report|reports|"
+    r"response|round|measurement|measurements|scan|scans|profile|profiles)"
+    r"|previously|initially|originally|before this|in the past|at first"
+    r"|attempt(?:s)? (?:1|one)"
+    r")\b",
+    re.I)
+_PRONOUN_START_RE = re.compile(
+    r"^[\s\-*\u2022\d.)]*\b(it|its|it['\u2019]s|this|that|these|those|"
+    r"they|them|their|there|the same|said|which|both)\b", re.I)
+
+
+def _strip_prior_attempt_prose(reply: str) -> str:
+    """The report minus sentences describing PRIOR attempts (Fix ZE).
+
+    Sentence-scoped, attribution-driven, and deliberately over-eager on
+    pronoun continuations: dropping a kept-shape sentence costs nothing
+    (the matcher only looks for negatives), while a single surviving
+    historical "could not confirm" flips a passed check to failed. The
+    VERDICT line never carries an attribution or a pronoun head, so it
+    always survives -- and `_verdict_of` reads the FULL reply anyway;
+    only the phrase gate sees the pruned text. Sentences are rejoined with
+    newlines, never spaces, so pruning cannot glue two kept fragments
+    into an accidental confession phrase.
+    """
+    sentences = re.split(r"(?<=[.!?\n])\s+", reply or "")
+    kept, prev_dropped = [], False
+    for s in sentences:
+        if not s.strip():
+            continue
+        historical = bool(_PRIOR_ATTEMPT_RE.search(s))
+        if not historical and prev_dropped and _PRONOUN_START_RE.match(s):
+            historical = True          # "It did not count ... could not ..."
+        if historical:
+            prev_dropped = True
+            continue
+        prev_dropped = False
+        kept.append(s)
+    return "\n".join(kept)
 
 
 def _reply_says_unverified(reply: str) -> bool:
@@ -354,7 +419,9 @@ def _evidence_failure(task: str, tr) -> str:
     line (verification reports must end with VERDICT: PASSED/FAILED -- see
     _VERDICT_BRIEF; a FAILED verdict fails the check no matter how
     optimistic the prose around it is, and a PASSED verdict never overrides
-    the other two), the report saying the verification did not succeed -- it
+    the other two -- though for the phrase gate its prior-attempt narration
+    is stripped first, Fix ZE), the report saying the verification did not
+    succeed -- it
     could not be performed, or it was performed and came back negative
     (phrase/regex match; models reword admissions constantly) -- and the
     session never driving the app at all (objective: no
@@ -376,7 +443,14 @@ def _evidence_failure(task: str, tr) -> str:
     if state == "FAILED":
         return ("its own verdict line says VERDICT: FAILED"
                 + (f": {reason[:200]}" if reason else ""))
-    if _reply_says_unverified(tr.reply):
+    # Fix ZE (run 13g): a clean PASSED verdict is phrase-matched against
+    # the report minus its prior-attempt narration -- the frog check
+    # passed with fully quoted measurements and was still retired as
+    # failed because its "Likely cause of the previous failure" section
+    # said the EARLIER eval "could not confirm white eyes". Verdict-less
+    # and FAILED reports keep the full-text match (pessimistic on ties).
+    if _reply_says_unverified(tr.reply if state != "PASSED"
+                              else _strip_prior_attempt_prose(tr.reply)):
         return ("its report says the verification did not succeed "
                 "(could not be performed, or was performed and failed)")
     if _needs_live_evidence(task) and not _used_live_evidence(
@@ -564,8 +638,20 @@ TASK_SCHEMA = {
             "items": {
                 "type": "object",
                 "properties": {
-                    "title": {"type": "string", "maxLength": 300},
-                    "acceptance": {"type": "string", "maxLength": 300},
+                    # 800, and `title` is the ONLY field: the old 300 cap
+                    # guillotined every spec-derived title mid-sentence
+                    # (run 13's plan: "resolving {scale, pixe", "counts of
+                    # non-b") because grammar-constrained sampling force-
+                    # closes a string AT maxLength -- valid JSON, no
+                    # truncation flag -- and run 13b showed the worse half:
+                    # derailed by the forced close, the planner ended the
+                    # array after task 1, five of six spec checks were never
+                    # planned, and `auto` exited 0 with "all tasks
+                    # complete". An `acceptance` sibling used to sit here
+                    # and was silently DROPPED by _titles_from; one field is
+                    # one place for the criterion, and generate_tasks
+                    # re-asks when a title still arrives at the cap.
+                    "title": {"type": "string", "maxLength": 800},
                 },
                 "required": ["title"],
                 "additionalProperties": False,
@@ -588,6 +674,9 @@ Rules:
   verify by running a command (tests, a linter, an import, a script).
 - Each title is a clear, imperative instruction ("Implement the markdown
   parser"), not a wish ("there should be a parser").
+- A title that hits its length cap is CUT mid-sentence and loses criteria:
+  compress the goal's wording instead of copying long passages, and split a
+  check with sub-items (a/b/c/d) into one task per sub-item.
 - Use as many tasks as the work genuinely needs. Do not cap the count at a
   fixed number; a large repair may need a dozen or more real steps, while a
   small fix may need one. Do not pad the plan with tiny stub tasks.
@@ -655,8 +744,11 @@ def generate_tasks(spec_text: str, client, cfg) -> list[str]:
 
     Retries once with an explicit "you returned zero tasks" nudge when the
     first reply comes back empty (a model handed a bug-fix goal sometimes
-    reads it as "nothing to build"), and finally falls back to one task built
-    from the goal itself rather than aborting the whole run."""
+    reads it as "nothing to build"), re-asks once when a title arrives at
+    exactly the schema's length cap (grammar-constrained sampling force-
+    closed it mid-sentence -- Bug Y, runs 13/13b), and finally falls back
+    to one task built from the goal itself rather than aborting the whole
+    run."""
     budget = getattr(cfg, "max_spec_chars", 60_000)
     body = spec_text.strip()[:budget]
     max_tokens = getattr(cfg, "max_tokens_plan", 2000)
@@ -669,6 +761,42 @@ def generate_tasks(spec_text: str, client, cfg) -> list[str]:
          {"role": "user", "content": base_user}],
         TASK_SCHEMA, max_tokens=max_tokens, disable_thinking=True)
     titles = _titles_from(raw)
+    cap = TASK_SCHEMA["properties"]["tasks"]["items"]["properties"][
+        "title"]["maxLength"]
+    cut = [t for t in titles if len(t) >= cap]
+    if titles and cut:
+        # Bug Y (runs 13/13b): the cap guillotine again, this time in the
+        # planner. A title at exactly `cap` chars was force-closed
+        # mid-sentence (valid JSON, no flag), and run 13b showed the
+        # forced close can derail the model into ending the task array
+        # right there: one truncated task got planned, five of six spec
+        # checks were silently skipped, and the loop exited 0 with "all
+        # tasks complete". One bounded re-ask; if titles are STILL cut,
+        # accept them -- they remain workable (the full goal rides along
+        # in every task's background context) and looping burns budget.
+        print(f"  [planner returned {len(cut)} title(s) at exactly the "
+              f"{cap}-char schema cap (cut mid-sentence); re-asking]",
+              file=sys.stderr)
+        retry = (base_user + "\n\nYour previous reply was CUT: "
+                 f"{len(cut)} task title(s) arrived at exactly the {cap}-"
+                 "character schema cap, truncated mid-sentence"
+                 + (" -- your reply ended right after this task; the rest "
+                    "of the list was lost" if len(titles) == 1 else "")
+                 + ". Re-emit the COMPLETE task list now. Compress each "
+                   "title well under the cap (paraphrase the goal; never "
+                   "copy a long passage), and split any check with "
+                   "sub-items into one task per sub-item.")
+        raw = client.chat_json(
+            [{"role": "system", "content": PLAN_SYSTEM},
+             {"role": "user", "content": retry}],
+            TASK_SCHEMA, max_tokens=max_tokens, disable_thinking=True)
+        retried = _titles_from(raw)
+        if retried:
+            titles = retried
+        if any(len(t) >= cap for t in titles):
+            print("  [planner titles still at the cap after the re-ask; "
+                  "accepting -- the full goal rides along with every task]",
+                  file=sys.stderr)
     if not titles:
         nudge = (base_user + "\n\nYou returned ZERO tasks. Every goal has at "
                  "least one concrete step. For a bug, list the steps to "
@@ -954,7 +1082,11 @@ def _recover_no_edit_reply(root: Path, cfg, agent, task: str, gathered: str,
                  "Your previous reply contained no edit blocks"
                  + (" (it only asked to read more files, which cannot be "
                     "fetched in this phase)" if extra else "")
-                 + ". Produce the edit blocks now.")
+                 + ". Produce the edit blocks now. If -- and only if -- no "
+                   "edit is the correct outcome (the work is already done, "
+                   "or editing would violate the goal), reply with ONE line "
+                   "starting 'No changes:' and the reason; never emit a "
+                   "block whose SEARCH and REPLACE are identical.")
         src = (gathered or "").strip()
         if extra:
             src = src + ("\n\n" if src else "") + \
@@ -964,6 +1096,20 @@ def _recover_no_edit_reply(root: Path, cfg, agent, task: str, gathered: str,
                                        gathered=src, backup_dir=backup_dir)
         if results2:
             return results2, reply2
+        if _is_noop(reply2):
+            # Fix X2 (run 13d): the re-ask took the escape hatch task2
+            # offers -- an honest "No changes: <reason>" line -- and the
+            # old loop DISCARDED it: only block-producing rounds were
+            # returned, so the model was pressed a second time, both
+            # honest replies were thrown away (None kept the original
+            # prose), and the run stopped on a task that had correctly
+            # concluded no edit was warranted. Propagate the declaration
+            # instead: run_task keeps the parse-failure ERROR silent (a
+            # decision, not a parse failure) and run_loop's _is_noop path
+            # treats the repair as the refusal it is (repair_outcome
+            # False -> bug N retires the failing check instead of
+            # looping).
+            return [], reply2
         asked = _read_requests(raw)
     return None
 
@@ -1128,6 +1274,16 @@ def run_investigation_task(root: Path, cfg, client, agent, idx, task: str, *,
         # regenerates a phrase-loop collapse (bug R, graveyard run): nothing
         # is poisoned yet -- catching it here keeps looping garbage out of
         # the context notes every later task reads.
+        if not collapsed:
+            # Fix ZD: run 13f's empty answer left NO trace in the event log
+            # between "reporting" and the stand-in -- no way to tell a
+            # model flake from a harness bug after the fact. (The collapsed
+            # case prints and logs its own WARN above.)
+            print("  [the answer phase returned no usable prose; "
+                  "retrying once]", file=sys.stderr)
+            workspace.log_event(root, "answer phase produced no prose "
+                                "(empty or tool-calls-only completion); "
+                                "retrying once", "WARN")
         retry = agent.answer(task, gathered,
                              system=system,
                              include_edit_format=False, stream=True)
@@ -1140,6 +1296,9 @@ def run_investigation_task(root: Path, cfg, client, agent, idx, task: str, *,
         evidence = (gathered or "").strip()
         if evidence:
             reply += "\n\nEVIDENCE\n" + evidence[:8000]
+        workspace.log_event(root, "answer phase produced no prose even "
+                            "after the retry; synthesized a steps-log "
+                            "stand-in", "ERROR")
     session = None
     if cfg.log_sessions:
         session = workspace.write_session(root, task,
@@ -1176,6 +1335,7 @@ def run_task(root: Path, cfg, client, agent, idx, task: str, *,
                             "WARN")
     refusal = _edit_refusal_head(raw_reply)
     contradicted = bool(refusal) and bool(parse_edits(raw_reply))
+    fabricated = False       # reply's only blocks were no-ops (Fix X)
     if contradicted:
         # Bug U (graveyard run): the inserted repair's prose said "No edit."
         # and explained why acting would violate the goal's freeze -- then
@@ -1194,6 +1354,25 @@ def run_task(root: Path, cfg, client, agent, idx, task: str, *,
         results, reply = agent.apply(raw_reply, dry_run=review or not apply,
                                      task=task, gathered=gathered,
                                      backup_dir=None if review else backup_dir)
+        if not results and getattr(agent, "noop_discards", None):
+            # Fix X (run 13): the reply's only blocks were null edits
+            # (SEARCH == REPLACE), dropped by parse_edits -- a fabricated
+            # compliance with the edit protocol by a model that had
+            # concluded no edit was needed (run 13's last two repairs were
+            # pressed into exactly this by the re-ask below, on a file the
+            # goal froze). Honor that conclusion instead of re-asking for
+            # "real" blocks: the marker matches _is_noop, so the re-ask is
+            # skipped and the outer loop's no-op path treats the repair as
+            # the refusal it was (repair_outcome False -> the failing check
+            # retires instead of burning another verify round).
+            fabricated = True
+            files = ", ".join(dict.fromkeys(agent.noop_discards))
+            workspace.log_event(root, f"reply emitted only no-op edit "
+                                      f"block(s) ({files}); treated as a "
+                                      f"refusal to edit", "WARN")
+            reply = (reply.rstrip() + "\n\n[No changes: every edit block in "
+                     "the reply was a no-op (SEARCH == REPLACE) and was "
+                     "discarded; nothing was written.]")
     if not results and not _is_noop(reply) and not contradicted:
         # The answer phase produced zero edit blocks. Before declaring the
         # task dead, give the model one bounded recovery: honour any read
@@ -1210,9 +1389,35 @@ def run_task(root: Path, cfg, client, agent, idx, task: str, *,
             answer_system=answer_system)
         if rec is not None:
             results, reply = rec
-            workspace.log_event(root, "answer re-asked; recovered edit blocks",
-                                "INFO")
-    if not results and not contradicted:
+            if results:
+                workspace.log_event(
+                    root, "answer re-asked; recovered edit blocks", "INFO")
+            else:
+                # Fix X2: the re-ask came back with an honest "No
+                # changes:" declaration instead of blocks; it is now the
+                # reply (run_loop keys its refusal path off
+                # _is_noop(tr.reply)).
+                workspace.log_event(root, "re-ask declared no changes; "
+                                          "honored as a refusal to edit",
+                                    "WARN")
+        elif not contradicted and getattr(agent, "noop_discards", None):
+            # The re-ask itself produced only fabricated null edits
+            # (parse_edits dropped them): same treatment as the
+            # first-answer case above.
+            fabricated = True
+            files = ", ".join(dict.fromkeys(agent.noop_discards))
+            workspace.log_event(root, f"re-ask produced only no-op edit "
+                                      f"block(s) ({files}); treated as a "
+                                      f"refusal to edit", "WARN")
+            reply = (reply.rstrip() + "\n\n[No changes: every edit block in "
+                     "the reply was a no-op (SEARCH == REPLACE) and was "
+                     "discarded; nothing was written.]")
+    if (not results and not contradicted and not fabricated
+            and not _is_noop(reply)):
+        # Fix X2: a "no changes" declaration is a decision the loop
+        # honors (run_loop marks the task done or retires the repair),
+        # not a parse failure -- an ERROR here would only muddy the
+        # event trail of a clean refusal.
         workspace.log_event(root, "no edit blocks parsed from the reply", "ERROR")
     elif results:
         for r in results:
@@ -1272,6 +1477,22 @@ _VERIFY_RETRY_NOTE = (
     "`browser`, capture the evidence, and only then write the report with "
     "its VERDICT line. If a tool itself fails, quote the exact error "
     "output in the report.")
+
+# Fix ZD (run 13f): the frog check's gather phase succeeded PERFECTLY --
+# a flat async-IIFE eval resolved the full per-row profile and the
+# done-step reasoning confirmed the criterion -- then BOTH answer attempts
+# streamed zero visible content (Qwen3 thinking runaway on Ollama), the
+# loop synthesized the steps-log stand-in, and NO branch caught it: the run
+# stopped, stranding three healthy checks. An empty report over gathered
+# evidence is a report-writer flake, not a product verdict.
+_EMPTY_REPORT_RETRY_NOTE = (
+    "### RETRY -- THE PREVIOUS ATTEMPT'S REPORT CAME BACK EMPTY\n"
+    "This exact verification already ran once: its lookup phase completed "
+    "(the app WAS driven and evidence WAS gathered), but the final answer "
+    "phase returned no prose at all -- a model hiccup, not a verdict and "
+    "not your fault. Gather the evidence again the same way, then WRITE "
+    "THE REPORT: the observations with their exact numbers, any caveats, "
+    "and the final VERDICT: PASSED/FAILED line.")
 
 _INCOMPLETE_RETRY_NOTE = (
     "### RETRY -- THE PREVIOUS ATTEMPT DID NOT DO THE WORK\n"
@@ -1537,6 +1758,47 @@ def run_loop(root: Path, cfg, client, idx, plan_path: Path, *,
                         workspace.log_event(
                             root, "verification check retired: two attempts "
                                   "never drove the app", "ERROR")
+                        failed += 1
+                        mark_failed(plan_path, task)
+                        repair_outcome.pop(task, None)
+                        continue
+                    if (tr.reply or "").startswith(
+                            "No prose report was produced"):
+                        # Fix ZD (run 13f): the gather phase succeeded --
+                        # live evidence present, measurement complete --
+                        # and the ANSWER phase came back empty even after
+                        # its own retry (Qwen3 spent the whole 20k budget
+                        # on invisible reasoning, twice). The stand-in is
+                        # not a verdict and carries no diagnosis: nothing
+                        # to remediate, nothing real to fail. Re-run the
+                        # check once; a second empty answer retires it as
+                        # unverified (a procedural failure, never a
+                        # product verdict) and the plan CONTINUES -- run
+                        # 13f stranded three healthy checks because this
+                        # case fell through to the stop-on-fail tail.
+                        tries = retried.get(task, 0)
+                        if tries < _MAX_TASK_RETRIES:
+                            retried[task] = tries + 1
+                            retry_note[:] = [_EMPTY_REPORT_RETRY_NOTE]
+                            print(f"  [verification task failed: {miss} -- "
+                                  f"but the evidence WAS gathered and the "
+                                  f"answer phase was empty; that is a "
+                                  f"report-writer flake, not a verdict -- "
+                                  f"re-running it once]", file=sys.stderr)
+                            workspace.log_event(
+                                root, "verification report came back empty "
+                                      "despite gathered evidence "
+                                      "(procedural failure); re-running "
+                                      "once, no remediation", "WARN")
+                            continue
+                        print("  [verification report was empty twice -- "
+                              "retiring the check as unverified (not a "
+                              "product failure) and continuing]",
+                              file=sys.stderr)
+                        workspace.log_event(
+                            root, "verification check retired: the answer "
+                                  "phase produced no prose on two attempts",
+                            "ERROR")
                         failed += 1
                         mark_failed(plan_path, task)
                         repair_outcome.pop(task, None)

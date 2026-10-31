@@ -39,6 +39,7 @@ import ast
 import difflib
 import hashlib
 import re
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -154,12 +155,22 @@ def _strip_wrapping_fences(text: str) -> str:
     return "\n".join(lines)
 
 
-def parse_edits(text: str) -> list[Edit]:
+def parse_edits(text: str, discards: list | None = None) -> list[Edit]:
     """Extract every search/replace block from a model's reply text.
 
     Normalises the model's own line endings first, then strips the markdown
     fences wrapping the blocks so a model that answers inside a ``` still
     parses -- without touching fence lines that belong to the code itself.
+
+    A block whose SEARCH and REPLACE bodies are identical is DROPPED (its
+    file is appended to `discards` when given): it changes nothing on disk,
+    and run 13 showed what "applying" one costs -- a repair that had
+    correctly concluded "no code defect" was pressed by the no-edit re-ask
+    into fabricating a null block on a frozen file; the harness logged
+    "applied 1 block(s)", took a backup, and counted it as an EDIT,
+    burning a full verify re-run instead of retiring the check. locate()
+    already refuses to write matched text over itself; dropping at parse
+    time keeps every caller from mistaking a null edit for work.
     """
     text = text.replace("\r\n", "\n").replace("\r", "\n")
     cleaned = _strip_wrapping_fences(text)
@@ -178,6 +189,14 @@ def parse_edits(text: str) -> list[Edit]:
             search = search[:-1]
         if replace.endswith("\n"):
             replace = replace[:-1]
+        if search == replace:
+            fname = fileio.normalise_rel(m.group("file"))
+            print(f"  [discarded a no-op edit block for {fname}: SEARCH and "
+                  f"REPLACE are identical; it changes nothing]",
+                  file=sys.stderr)
+            if discards is not None:
+                discards.append(fname)
+            continue
         edits.append(Edit(fileio.normalise_rel(m.group("file")), search, replace))
     return edits
 

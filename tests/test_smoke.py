@@ -1591,6 +1591,73 @@ def test_step_truncation_salvage_no_escalation():
     assert c4.n >= 2                     # escalated before accepting partials
 
 
+def test_step_truncation_names_the_cut_payload_field():
+    """Bug W (run 13): the salvage-accept branch assumed a truncated step
+    reply can only die inside 'reasoning' ("a recovered action is
+    COMPLETE"). False when the budget runs out inside an arg:
+    repair_truncated_json keeps an unterminated string's FRAGMENT (or
+    drops the key whole), so a browser step salvaged from a cut `pattern`
+    carries half a JS program -- and the old code dispatched it while the
+    model believed its measurement eval had run. chat_json must name the
+    cut field (truncated_field) so gather() can refuse the step, treat
+    'reasoning' as the benign case, and not be fooled by escaped quotes
+    inside a JS payload."""
+    from pedacito.llm import LMStudio
+    from pedacito.tools import STEP_SCHEMA
+    from pedacito.config import Config
+
+    cfg = Config(); cfg.json_mode = "object"
+
+    class Fake(LMStudio):
+        def __init__(self, replies, finish="length"):
+            object.__init__(self)
+            self.cfg = cfg; self.replies = list(replies); self.n = 0
+            self.last_finish_reason = finish
+        def chat(self, messages, max_tokens, schema=None, stream=False, **kw):
+            r = self.replies[min(self.n, len(self.replies) - 1)]; self.n += 1
+            return r
+
+    msgs = [{"role": "user", "content": "t"}]
+
+    # Cut inside `pattern`: the salvage keeps the half JS as a fragment.
+    cut_pat = ('{"action":"browser","file":"","start":2,"end":0,'
+               '"pattern":"press Enter; eval new Promise(res => { '
+               'const img = ctx.getImageData(0, 0, 9, 9).data; const r = img[')
+    c = Fake([cut_pat])
+    obj = c.chat_json(msgs, STEP_SCHEMA, max_tokens=2500)
+    assert obj["action"] == "browser"
+    assert obj["pattern"].endswith("const r = img[")   # half a program
+    assert c.step_truncated is True
+    assert c.truncated_field == "pattern"
+
+    # Escaped quotes inside the JS must not masquerade as JSON keys: the
+    # last UNESCAPED key opened is still `pattern`.
+    cut_esc = ('{"action":"browser","file":"","start":0,"end":0,'
+               '"pattern":"eval JSON.stringify({\\"time\\": d.time, '
+               '\\"scale\\": d.sc')
+    c2 = Fake([cut_esc])
+    obj2 = c2.chat_json(msgs, STEP_SCHEMA, max_tokens=2500)
+    assert obj2["action"] == "browser"
+    assert c2.truncated_field == "pattern"
+
+    # The benign classic: cut inside 'reasoning' -- every arg survived.
+    cut_reason = ('{"action":"read","file":"a.txt","start":1,"end":40,'
+                  '"pattern":"","symbol":"","to":"","command":"",'
+                  '"content":"","reasoning":"See the im')
+    c3 = Fake([cut_reason])
+    obj3 = c3.chat_json(msgs, STEP_SCHEMA, max_tokens=2500)
+    assert obj3["action"] == "read" and obj3["file"] == "a.txt"
+    assert c3.truncated_field == "reasoning"
+
+    # A clean reply names nothing.
+    good = ('{"action":"done","file":"","start":0,"end":0,"pattern":"",'
+            '"symbol":"","to":"","command":"","content":"",'
+            '"reasoning":"ok"}')
+    c4 = Fake([good], finish="stop")
+    c4.chat_json(msgs, STEP_SCHEMA, max_tokens=2500)
+    assert c4.step_truncated is False and c4.truncated_field == ""
+
+
 # ------------------------------------------------------------------- scaffold
 def test_new_dry_run_writes_nothing(tmp_path):
     """A bare `pedacito new` (no --apply/--review/--plan-only) must be a true
@@ -1931,6 +1998,136 @@ def test_streaming_stops_a_degenerate_tool_call_loop(monkeypatch):
     assert response.consumed < 30, "kept reading every chunk"
     assert reply.count("<tool_call>") <= 6
     assert client.stream_truncated is False   # our stop, not the provider's
+
+
+def test_streaming_empty_answer_with_hidden_reasoning_disables_thinking(
+        monkeypatch):
+    """Fix ZD (run 13f): Qwen3 streamed ~4 minutes of reasoning_content --
+    which the delta loop skips without a trace -- until the 20k-token
+    answer budget died at finish_reason "length", returning an EMPTY
+    reply; the identical retry thought again, and the frog verification
+    (whose measurement had CONFIRMED its criterion) stopped the whole run.
+    An empty streamed completion with hidden reasoning behind it must
+    retry INSIDE chat() with thinking disabled, in both local spellings
+    (chat_template_kwargs for llama.cpp/LM Studio, flat `think` for
+    Ollama -- run 13f's actual server)."""
+    monkeypatch.setattr("pedacito.llm.time.sleep", lambda s: None)
+    reasoning = ('data: {"choices":[{"delta":{"reasoning_content":"hmm"},'
+                 '"finish_reason":null}]}')
+    length_end = 'data: {"choices":[{"delta":{},"finish_reason":"length"}]}'
+    content = ('data: {"choices":[{"delta":{"content":"REPORT"},'
+               '"finish_reason":null}]}')
+    stop_end = 'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}'
+
+    class Resp:
+        status_code = 200
+        text = ""
+
+        def __init__(self, lines):
+            self._lines = lines
+
+        def iter_lines(self, decode_unicode=False):
+            yield from self._lines
+            yield "data: [DONE]"
+
+        def close(self):
+            pass
+
+    posts = []
+
+    def fake_post(*a, **k):
+        posts.append(k["json"])
+        if len(posts) == 1:
+            return Resp([reasoning] * 3 + [length_end])
+        return Resp([content, stop_end])
+
+    monkeypatch.setattr("pedacito.llm.requests.post", fake_post)
+    cfg = config_mod.Config()
+    cfg.base_url = "http://127.0.0.1:1/v1"
+    cfg.model = "m"
+    client = LMStudio(cfg)
+    reply = client.chat([{"role": "user", "content": "go"}],
+                        max_tokens=100, stream=True)
+    assert reply == "REPORT"
+    assert len(posts) == 2
+    assert "chat_template_kwargs" not in posts[0]   # thinking was ON
+    assert "think" not in posts[0]
+    assert posts[1]["chat_template_kwargs"] == {"enable_thinking": False}
+    assert posts[1]["think"] is False               # Ollama's spelling
+    assert client.last_finish_reason == "stop"
+
+
+def test_streaming_empty_answer_retries_are_bounded(monkeypatch):
+    """Fix ZD bound: an instantly-empty completion (no reasoning -- an EOS
+    flake) retries IDENTICAL (no thinking flags to send), and after two
+    retries chat() hands the empty string back to the caller's own
+    machinery (run_investigation_task's stand-in, run_task's re-ask)
+    instead of looping forever."""
+    monkeypatch.setattr("pedacito.llm.time.sleep", lambda s: None)
+
+    class Resp:
+        status_code = 200
+        text = ""
+
+        def iter_lines(self, decode_unicode=False):
+            yield 'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}'
+            yield "data: [DONE]"
+
+        def close(self):
+            pass
+
+    posts = []
+
+    def fake_post(*a, **k):
+        posts.append(k["json"])
+        return Resp()
+
+    monkeypatch.setattr("pedacito.llm.requests.post", fake_post)
+    cfg = config_mod.Config()
+    cfg.base_url = "http://127.0.0.1:1/v1"
+    cfg.model = "m"
+    client = LMStudio(cfg)
+    reply = client.chat([{"role": "user", "content": "go"}],
+                        max_tokens=100, stream=True)
+    assert reply == ""
+    assert len(posts) == 3                  # 1 attempt + 2 retries, no more
+    assert all("think" not in p for p in posts)   # no reasoning: no switch
+
+
+def test_stream_collector_counts_hidden_reasoning(monkeypatch):
+    """Fix ZD diagnostic: the reasoning chars and finish reason an empty
+    completion leaves behind -- chat()'s escalation decision reads them,
+    and run 13f proved they were invisible before (two ~4-minute attempts,
+    zero trace in the log)."""
+    reasoning = ('data: {"choices":[{"delta":{"reasoning_content":"hmm"},'
+                 '"finish_reason":null}]}')
+    length_end = 'data: {"choices":[{"delta":{},"finish_reason":"length"}]}'
+
+    class Resp:
+        status_code = 200
+        text = ""
+
+        def iter_lines(self, decode_unicode=False):
+            yield reasoning
+            yield reasoning
+            yield reasoning
+            yield length_end
+            yield "data: [DONE]"
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr("pedacito.llm.requests.post", lambda *a, **k: Resp())
+    cfg = config_mod.Config()
+    cfg.base_url = "http://127.0.0.1:1/v1"
+    cfg.model = "m"
+    client = LMStudio(cfg)
+    reply = client._chat_once([{"role": "user", "content": "go"}],
+                              100, None, True, None)
+    assert reply == ""
+    assert client.last_reasoning_chars == 9         # 3 x "hmm"
+    assert client.last_finish_reason == "length"
+    assert client.stream_truncated is True          # budget died mid-thought
 
 
 def test_answer_brief_does_not_prime_native_tool_call_syntax():

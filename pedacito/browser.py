@@ -19,6 +19,7 @@ Chrome/Chromium binary is present, but it cannot press keys or click.
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import shutil
@@ -297,6 +298,123 @@ def run(url: str, *, actions: str = "", wait: float = 3.0, out=None,
     return _run_chrome(exe, url, wait=wait, out=out, timeout=timeout)
 
 
+def _raced_eval(expr: str, timeout_s: int) -> str:
+    """Wrap a model-authored eval in an in-page race against a timer.
+
+    page.evaluate() has NO timeout: page.set_default_timeout() covers
+    actions like goto/click/fill but never evaluate, so a Promise that
+    never settles makes it wait forever. Run 13c hung for over an hour on
+    the canonical forced-state measurement -- a `new Promise(res =>
+    ...double-rAF pixel rescan...)` whose rAF callback threw on the
+    hand-forced state object; the Promise stayed pending, evaluate kept
+    waiting, the whole loop stalled with no log line, and the LLM server
+    idle-unloaded the model because no request was in flight anymore.
+    Racing inside the page preserves the completion-value semantics (a
+    direct eval of the source string, exactly what CDP does today),
+    adopts a returned Promise, calls a bare function shape the way
+    Playwright itself would, and turns a never-settling eval into a
+    bounded rejection that the action loop reports as an action error.
+
+    Known residual gap: an eval that blocks the page's main thread
+    SYNCHRONOUSLY (while(true)) starves the race timer too; that shape
+    was never observed in 13 runs of the game testbed, and a Python-side
+    watchdog risks new hangs inside Playwright's greenlet machinery, so
+    it is deliberately not attempted here.
+    """
+    ms = max(1, int(timeout_s)) * 1000
+    src = json.dumps(expr)
+    return ("Promise.race([Promise.resolve().then(() => eval(" + src + "))"
+            ".then(v => typeof v === 'function' ? v() : v), "
+            "new Promise((_, reject) => setTimeout(() => reject(new Error("
+            f"'eval did not settle within {ms // 1000}s -- a Promise whose "
+            "callback threw never resolves; wrap risky page code in "
+            "try/catch and always resolve')), " + str(ms) + "))])")
+
+
+def _unclosed_brackets(expr: str) -> str:
+    """Describe the brackets still open at the end of a JS expression.
+
+    V8 reports an unclosed construct as a bare "Unexpected end of input"
+    with NO position, so a model staring at a 1,000+ char measurement
+    eval has no way to find which level failed to close (run 13d: the
+    IIFE's own `{`, one `}` missing near the tail, five identical
+    retries). This small scanner tracks (), [] and {} outside strings
+    and comments and names the openers still on the stack at end of
+    input, each with its position and context. Regex literals are not
+    distinguished from division -- a bracket inside /.../ could be
+    miscounted -- which is acceptable because the hint is only attached
+    to an eval that ALREADY failed to parse; it never gates a healthy
+    one.
+    """
+    stack: list[tuple[str, int]] = []
+    pairs = {")": "(", "]": "[", "}": "{"}
+    quote: str | None = None
+    i, n = 0, len(expr)
+    while i < n:
+        c = expr[i]
+        if quote:
+            if c == "\\":
+                i += 2
+                continue
+            if c == quote:
+                quote = None
+            elif quote != "`" and c == "\n":
+                quote = None      # unterminated one-line string; JS flags it
+        elif c in "'\"`":
+            quote = c
+        elif c == "/" and expr[i + 1:i + 2] == "/":
+            j = expr.find("\n", i)
+            i = n if j < 0 else j
+            continue
+        elif c == "/" and expr[i + 1:i + 2] == "*":
+            j = expr.find("*/", i + 2)
+            i = n if j < 0 else j + 2
+            continue
+        elif c in "([{":
+            stack.append((c, i))
+        elif c in ")]}":
+            if stack and stack[-1][0] == pairs[c]:
+                stack.pop()
+            elif stack:
+                ch, pos = stack[-1]
+                return (f"brackets cross at char {i}: found `{c}` but the "
+                        f"innermost still-open bracket is `{ch}` from char "
+                        f"{pos} (`{expr[max(0, pos - 16):pos + 16]}`)")
+        i += 1
+    if quote:
+        return (f"a {quote}-quoted string is still open at end of the "
+                "expression (unterminated string literal)")
+    if stack:
+        bits = []
+        for ch, pos in stack[-3:]:
+            ctx = expr[max(0, pos - 16):pos + 16].replace("\n", " ")
+            bits.append(f"`{ch}` from char {pos} (`{ctx}`)")
+        extra = f" (+{len(stack) - 3} more)" if len(stack) > 3 else ""
+        return ("unclosed at end of the expression: " + "; ".join(bits)
+                + extra + " -- the source ends before these close; the "
+                "missing closer belongs near the tail")
+    return ""
+
+
+def _eval_syntax_error(arg: str, msg: str) -> str:
+    """Build the action-error entry for an eval that failed to parse.
+
+    Three parts, all run-13d lessons: the length that arrived (the
+    model's truncation misdiagnosis came from a 60-char clipped arg
+    echo), the bracket report V8 never gives, and the source tail --
+    for "Unexpected end of input" the crime scene is at the END, and a
+    head echo never shows it.
+    """
+    first = msg.split("\n", 1)[0].strip()[:120]
+    text = (f"eval SYNTAX ERROR -- {first} -- the tool received all "
+            f"{len(arg)} chars of the source intact; nothing was "
+            "truncated in transit.")
+    hint = _unclosed_brackets(arg)
+    if hint:
+        text += " " + hint + "."
+    return text + f" Source tail: {arg[-70:]}"
+
+
 def _run_playwright(url: str, *, actions: str, wait: float, out,
                     timeout: int, headless: bool) -> tuple[bool, dict | str]:
     try:
@@ -344,14 +462,72 @@ def _run_playwright(url: str, *, actions: str, wait: float, out,
                             page.wait_for_timeout(int(float(arg) * 1000))
                             action_log.append(f"waited {arg:g}s")
                         elif kind == "eval":
-                            value = page.evaluate(arg)
-                            # 240: run 11's JSON.stringify state dumps -- the
-                            # canonical eval use -- lost their tail fields
-                            # (enemies, spawning) to the old 120-char clip.
+                            try:
+                                value = page.evaluate(
+                                    _raced_eval(arg, timeout))
+                            except Exception as ee:
+                                msg = str(ee)
+                                low2 = msg.lower()
+                                if ("content security policy" in low2
+                                        or "refused to evaluate" in low2):
+                                    # A strict-CSP page forbids the in-page
+                                    # eval() the race wrapper needs; CDP's
+                                    # own evaluate is the only CSP-immune
+                                    # path. Fall back to it UNBOUNDED: a
+                                    # CSP-hardened origin is not the
+                                    # local-app case this tool exists for,
+                                    # and refusing the eval entirely helps
+                                    # nobody.
+                                    value = page.evaluate(arg)
+                                elif "syntaxerror" in low2:
+                                    # Bug ZB (run 13d): the model's
+                                    # 1,174-char measurement eval was one
+                                    # `}` short -- its IIFE body never
+                                    # closed. V8 said only "Unexpected end
+                                    # of input" (no position), the stack's
+                                    # `:1:44` columns pointed at the eval
+                                    # CALL SITES inside Playwright's own
+                                    # machinery, and the 60-char head echo
+                                    # of the arg read like tool-side
+                                    # truncation: the model re-sent the
+                                    # same broken tail five times, then
+                                    # wrote a FAILED verdict blaming the
+                                    # harness for cutting its string. A
+                                    # parse failure now reports the length
+                                    # that arrived intact, which brackets
+                                    # never closed (with positions and
+                                    # context), and the tail where the
+                                    # missing closer belongs -- an error a
+                                    # model can FIX instead of one it
+                                    # argues with.
+                                    action_errors.append(
+                                        _eval_syntax_error(arg, msg))
+                                    continue
+                                else:
+                                    raise
+                            # 2000: run 11's JSON.stringify state dumps lost
+                            # their tail fields to the old 120-char clip, and
+                            # 240 was that era's answer -- but run 13e's spec
+                            # checks resolve per-row pixel profiles (~1-2k
+                            # chars), and at 240 EVERY one of them reached the
+                            # model decapitated ("the live eval output was
+                            # truncated before returning whiteTop and
+                            # blackBelow"): five checks retired as failed on
+                            # measurements that had SUCCEEDED. Mirror the
+                            # pattern cap: an eval may return as much as it
+                            # may receive. The gather budget still caps the
+                            # session total with its own explicit marker, and
+                            # the schema description teaches aggregation for
+                            # anything larger.
                             action_log.append(
-                                f"eval'd {arg[:60]} -> {str(value)[:240]}")
+                                f"eval'd {arg[:60]} -> {str(value)[:2000]}")
                     except Exception as e:
-                        action_errors.append(f"{kind} {arg}: {str(e)[:160]}")
+                        # 60: run 13c's ~1,100-char measurement eval would
+                        # otherwise flood the observation and bury the
+                        # actual error text -- the part the model must
+                        # react to (the action log already clips at 60).
+                        action_errors.append(
+                            f"{kind} {str(arg)[:60]}: {str(e)[:160]}")
 
                 page.wait_for_timeout(int(max(0.0, float(wait or 0)) * 1000))
                 if out is not None:

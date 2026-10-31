@@ -182,6 +182,51 @@ def extract_content(message: dict) -> str:
 # --------------------------------------------------------------------------
 # Truncated-JSON repair
 # --------------------------------------------------------------------------
+def _cut_field(text: str, obj: dict, schema: dict | None) -> str:
+    """Which schema field a truncated reply died inside, or "" when benign.
+
+    A JSON string value cannot contain an unescaped quote, so an unescaped
+    `"key":` in the raw reply is a real key opening, never payload text (a
+    JS object literal inside `pattern` carries its quotes escaped; the
+    negative lookbehind rejects those). The LAST opened key is where
+    generation stopped. Two salvage shapes mark it as cut:
+    repair_truncated_json either dropped the key whole (it is absent from
+    obj) or -- for an unterminated string -- kept the raw fragment and
+    closed the quote itself (it is present in obj, but no closing quote
+    exists in the raw text). Callers treat "reasoning" as the benign case
+    (every arg survived intact) and refuse to run steps whose payload
+    field was cut: half an eval is a SyntaxError that looks like a product
+    failure (run 13 retired five checks to exactly that confusion).
+    """
+    props = sorted((schema or {}).get("properties") or {})
+    if not props:
+        return ""
+    rx = re.compile(r'(?<!\\)"(' + "|".join(re.escape(p) for p in props)
+                    + r')"\s*:')
+    matches = list(rx.finditer(text))
+    if not matches:
+        return ""
+    last = matches[-1]
+    if last.group(1) not in obj:
+        return last.group(1)         # dropped whole by the salvage
+    # Fragment-kept case: scan the raw value for its unescaped closing
+    # quote; no terminator before EOF means the value is half a payload.
+    k = last.end()
+    while k < len(text) and text[k] in " \t\r\n":
+        k += 1
+    if k < len(text) and text[k] == '"':
+        j = k + 1
+        while j < len(text):
+            if text[j] == "\\":
+                j += 2
+                continue
+            if text[j] == '"':
+                return ""            # value completed; the cut landed later
+            j += 1
+        return last.group(1)         # unterminated: kept as a fragment
+    return ""                        # number/bool present in obj: complete
+
+
 def repair_truncated_json(text: str) -> str | None:
     """Salvage the complete top-level keys of a JSON object that was cut off
     mid-generation.
@@ -400,6 +445,17 @@ class LMStudio:
         # later files instead of continuing across turns. The streaming path
         # sets this directly; chat() clears it at the start of each call.
         self.stream_truncated = False
+        # Fix ZD (run 13f): a streamed answer can burn its ENTIRE budget on
+        # reasoning_content -- chunks the delta loop skips without a trace --
+        # and return "" while the server reports finish_reason "length".
+        # Both signals were invisible: last_finish_reason was only ever set
+        # on the BUFFERED path, and the reasoning stream was never counted,
+        # so two ~4-minute empty answer attempts (the frog check, whose
+        # measurement had CONFIRMED its criterion) left no diagnostic at
+        # all. chat()'s empty-completion retry reads these to tell an
+        # instant-EOS flake (retry identical) from a thinking runaway
+        # (retry with thinking disabled).
+        self.last_reasoning_chars = 0
 
     # ------------------------------------------------------------------ core
     def _context_too_long(self, body: str) -> bool:
@@ -539,6 +595,7 @@ class LMStudio:
         attempt = 0
         trimmed_once = False
         shrunk_once = False
+        empty_streak = 0        # Fix ZD: consecutive empty streamed replies
         while True:
             attempt += 1
             # Proactive fit: llama.cpp/LM Studio reject any request whose
@@ -576,7 +633,7 @@ class LMStudio:
                           f"older tool results before sending]", file=sys.stderr)
                     messages = new_messages
             try:
-                return self._chat_once(messages, max_tokens, schema, stream,
+                text = self._chat_once(messages, max_tokens, schema, stream,
                                        disable_thinking)
             except ContextOverflowError as e:
                 # The server's window is smaller than our budgets assumed
@@ -678,6 +735,40 @@ class LMStudio:
                     print(f"[still waiting, {waited:.0f}s elapsed]", file=sys.stderr)
                 time.sleep(delay)
                 delay = min(delay * 1.6, 10.0)
+                continue
+
+            if not stream or (text or "").strip():
+                return text
+            # Fix ZD (run 13f): the streamed answer came back EMPTY. The
+            # frog check shows how that ends: Qwen3 spent two whole
+            # 20k-token answer budgets on reasoning_content (invisible to
+            # the delta loop), finish_reason "length", zero visible
+            # content -- and the verification whose measurement had
+            # CONFIRMED its criterion stopped the run with no report. An
+            # empty completion is provider flake or thinking runaway,
+            # never a legitimate answer: retry INSIDE the call so every
+            # caller benefits. Bounded at two retries, then hand the ""
+            # back -- loop-level machinery (run_investigation_task's
+            # stand-in, run_task's re-ask) owns the final fallback.
+            empty_streak += 1
+            if empty_streak > 2:
+                return text
+            effective_thinking_off = (disable_thinking
+                                      if disable_thinking is not None
+                                      else self.cfg.disable_thinking)
+            if self.last_reasoning_chars and not effective_thinking_off:
+                # Thinking runaway: the model streamed hidden reasoning
+                # until the budget died. An identical re-roll would very
+                # likely think again -- switch thinking off instead.
+                disable_thinking = True
+                how = " with thinking disabled"
+            else:
+                how = ""
+            print(f"[the model streamed an EMPTY answer (~"
+                  f"{self.last_reasoning_chars:,} chars of hidden reasoning, "
+                  f"finish '{self.last_finish_reason or 'stop'}'); "
+                  f"retrying{how}]", file=sys.stderr)
+            time.sleep(1.0)
 
     def _chat_once(self, messages: list[dict], max_tokens: int,
                    schema: dict | None = None, stream: bool = False,
@@ -751,6 +842,13 @@ class LMStudio:
             # "with thinking off it didn't return an answer" is the other
             # face of the same coin.
             payload["chat_template_kwargs"] = {"enable_thinking": False}
+            # The comment above promised "some builds accept the flat
+            # `think: false` field", but only chat_template_kwargs was ever
+            # sent -- and run 13f's server is Ollama (port 11434), whose
+            # OpenAI-compatible endpoint reads the FLAT `think` field, not
+            # llama.cpp's template kwargs. Send both spellings; lenient
+            # servers ignore the field they don't know.
+            payload["think"] = False
         if schema is not None:
             if self.cfg.json_mode == "object":
                 payload["response_format"] = {"type": "json_object"}
@@ -808,6 +906,12 @@ class LMStudio:
         out = []
         tool_opens = 0
         probe_tail = ""
+        reasoning_chars = 0
+        # Per-HTTP-attempt diagnostics for chat()'s empty-completion retry
+        # (Fix ZD): describe THIS attempt, so the escalation decision reads
+        # the freshest finish reason and reasoning count, not a stale one.
+        self.last_finish_reason = ""
+        self.last_reasoning_chars = 0
         r = self._post(payload, stream=True)
         for raw in r.iter_lines(decode_unicode=True):
             if not raw:
@@ -827,14 +931,23 @@ class LMStudio:
                 fr = chunk.get("finish_reason") or ""
             except Exception:
                 continue
+            if fr:
+                self.last_finish_reason = fr
             if fr == "length":
                 # OR, not =: a logical chat() call may contain several HTTP
                 # attempts (context-overflow retries); once any streamed
                 # attempt was cut, the reply we return IS cut.
                 self.stream_truncated = True
             delta = d.get("content")
-            if not delta and not d.get("reasoning_content"):
+            rc = d.get("reasoning_content")
+            if not delta and not rc:
                 continue
+            if rc:
+                # Fix ZD: counted, never echoed -- this is the ONLY trace a
+                # thinking runaway leaves (run 13f: ~20k tokens of it per
+                # attempt, zero visible content, an empty reply, and three
+                # healthy checks stranded at the stop-on-fail tail).
+                reasoning_chars += len(rc)
             if delta:
                 out.append(delta)
                 sys.stdout.write(delta)
@@ -862,6 +975,7 @@ class LMStudio:
         # streaming loop above skips, since it only appends `content`).
         # Either way, the returned value never contains a <think> block, so
         # it's safe to hand straight to edit parsing.
+        self.last_reasoning_chars = reasoning_chars
         return strip_reasoning("".join(out))
 
     # --------------------------------------------------------------- helpers
@@ -901,6 +1015,11 @@ class LMStudio:
         # a step verbatim just re-rolls the same rambling essay, so after the
         # second cut we stop retrying and treat the recovered action as final.
         self.step_truncated = False
+        # Which schema field the cut landed in when a truncated reply got
+        # salvaged below ("" = nothing cut, or the cut is benign).
+        # agent.gather refuses to dispatch a step whose PAYLOAD field was
+        # cut: run 13 executed half a browser eval this way.
+        self.truncated_field = ""
         step_cut = 0
         # One re-ask per call for the "whole budget spent on a <think>/prose
         # preamble, no JSON at all" failure: retrying verbatim just re-rolls
@@ -1013,11 +1132,20 @@ class LMStudio:
                         if isinstance(obj, dict) and obj.get("action"):
                             if not self._schema_has_big_fields(schema):
                                 # A schema step's args all precede 'reasoning',
-                                # so a recovered action is COMPLETE -- retrying
-                                # only re-rolls the essay that got cut. Accept
-                                # it, flag the truncation so gather() can tell
-                                # the model to keep its next reasoning short,
-                                # and cap pointless retries at two.
+                                # so a cut USUALLY dies inside the essay and
+                                # the recovered action is complete. Not
+                                # always: a long `pattern` (browser eval JS)
+                                # or `content` (write payload) can eat the
+                                # budget itself, and the salvage then carries
+                                # only half of the very field the step exists
+                                # to deliver. Record WHICH field the cut
+                                # landed in so agent.gather can refuse to
+                                # dispatch it; a 'reasoning' cut stays the
+                                # benign, accepted case (gather just tells
+                                # the model to keep its next reasoning
+                                # short).
+                                self.truncated_field = _cut_field(text, obj,
+                                                                  schema)
                                 print("[reply was cut off; recovered the "
                                       "action from the partial reply]",
                                       file=sys.stderr)
@@ -1033,11 +1161,16 @@ class LMStudio:
                                       "attempt will be salvaged whole]",
                                       file=sys.stderr)
                                 self.step_truncated = True
+                                self.truncated_field = _cut_field(text, obj,
+                                                                  schema)
                                 return obj
                 if truncated:
-                    # A step schema has NO large fields -- a truncated step
-                    # reply can only have died inside 'reasoning', so there is
-                    # nothing to salvage and doubling the budget cannot help.
+                    # A step schema has NO large fields, and whatever survived
+                    # salvage was already accepted above (with
+                    # `truncated_field` naming any cut payload) -- reaching
+                    # here means the reply died before any usable action, so
+                    # there is nothing to salvage and doubling the budget
+                    # cannot help.
                     # The old escalation path (7000 -> 14000 -> 28000 -> ...)
                     # just re-sent the same oversized request three times on
                     # DeepSeek, whose per-message OUTPUT cap (~8k tokens) is a

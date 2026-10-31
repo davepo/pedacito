@@ -62,6 +62,12 @@ _MAX_DUPLICATE_READS = 2
 _MAX_CONSECUTIVE_ERRORS = 4
 _MAX_REPEATED_STEPS = 3
 
+# Cut-off payloads discarded before gather gives up and lets the answer
+# phase report the blocker (Bug W, run 13): two discards with actionable
+# "minify or split" feedback are enough -- a third means the model cannot
+# shrink its payload, and looping just burns steps.
+_MAX_PAYLOAD_CUTS = 2
+
 
 def _step_signature(step: dict) -> tuple:
     """Identity of a gather step for repetition detection.
@@ -349,6 +355,33 @@ Rules:
   Use it for anything served over HTTP. A desktop `screenshot` cannot see a
   web page that no browser opened. Needs allow_browser; launching a server
   command also needs allow_shell.
+- `eval` is a measuring instrument, not only a state forcer: the value it
+  returns is evidence you can quote, while a screenshot's vision
+  description is secondhand and often hedged. To verify a visual claim,
+  compute a NUMBER in the page -- count a sprite's non-background pixels
+  with `getImageData`, measure its drawn bounding box, or diff two forced
+  animation frames -- and return compact numbers or short JSON (the
+  logged value clips at 240 chars). "Frog pixels 84 -> 756 when scale
+  went 1 -> 3" is a defensible verdict; "looks larger" is not. The step
+  reply has its own token budget and every field a schema length cap: keep
+  eval JS minified (short names, no comments or newlines), and if the
+  harness reports your payload arrived cut off, send a shorter one or split
+  the measurement across two calls.
+- The page keeps running between your `eval` and the screenshot: a game
+  loop animates frames, moves sprites, and resumes spawning in that gap,
+  so the capture can show a later state than the one you forced. Build
+  forced states to survive it -- zero velocities, pin animation timers,
+  hold elapsed time under any spawn/phase threshold, or set the page's
+  paused flag if it has one -- and re-assert the state right before each
+  capture. When an eval'd number disagrees with the screenshot, the gap
+  explains it: re-force and re-measure rather than trusting either alone.
+- Canvas pixels are not game coordinates. Pixel-art sprites are drawn
+  zoomed -- each grid cell a block of device pixels, a 4x or 6x zoom is
+  common -- and may sit under a live `ctx.scale()`/`ctx.translate()`
+  transform (a growth multiplier, a camera). Before sampling pixels or
+  bounding boxes with `eval`, derive the mapping from the render source
+  or from canvas.width versus the logical world size, and scan a
+  generous region around a sprite's position instead of one exact point.
 - Do not claim dynamic behavior (spawn rates, animation, timing) from one
   screenshot or from reading code. If the app needs interaction and the
   available tools cannot drive it, say so plainly instead of guessing.
@@ -672,6 +705,7 @@ class Agent:
         error_streak = 0         # consecutive failed (ERROR) observations
         last_sig = None          # previous step's action+args, for loops
         repeated = 0
+        payload_cuts = 0         # steps discarded for a cut-off payload (W)
         while unlimited or step < step_cap:
             step += 1
             try:
@@ -724,6 +758,67 @@ class Agent:
             else:
                 last_sig = sig
                 repeated = 1
+
+            # Bug W (run 13): never dispatch a step whose payload arrived
+            # cut off. Two deterministic cut classes: the reply hit the
+            # token limit and chat_json's salvage kept only half the field
+            # (client.truncated_field names it), or grammar-constrained
+            # sampling force-closed a string at exactly its schema
+            # maxLength -- VALID JSON, no truncation flag, half a program.
+            # Run 13 retired all five pixel checks because the browser ran
+            # 600-char fragments of a ~750-char measurement eval (identical
+            # SyntaxError in every retry -- the cap is deterministic).
+            # Discard WITHOUT a live-step log line (one would falsely
+            # satisfy the live-evidence gate for a step that never ran),
+            # say why, and ask for a shorter or split payload.
+            cut = ""
+            note = ""
+            if getattr(self.client, "step_truncated", False):
+                tf = getattr(self.client, "truncated_field", "")
+                if tf and tf != "reasoning":
+                    cut = tf
+                    note = (f"your `{tf}` value was cut off by the reply "
+                            f"token limit before it finished")
+            if not cut:
+                props = (step_schema or {}).get("properties", {})
+                for tf, val in stepjson.items():
+                    if tf == "reasoning" or not isinstance(val, str):
+                        continue
+                    cap = int((props.get(tf) or {}).get("maxLength") or 0)
+                    if cap and len(val) >= cap:
+                        cut = tf
+                        note = (f"your `{tf}` value arrived at exactly {cap} "
+                                f"chars -- the schema length cap closed it "
+                                f"mid-payload")
+                        break
+            if cut:
+                payload_cuts += 1
+                self.steps_log.append(
+                    f"{step}. (discarded: `{cut}` payload cut off; NOT "
+                    f"executed)")
+                obs = (f"[Step NOT executed: {note}, so running it would "
+                       f"send half a payload. Send ONE shorter step now: "
+                       f"minify it (short names, no comments or extra "
+                       f"spaces), or split the work across two calls"
+                       + ("; build large file content with `write` then "
+                          "`append` chunks" if cut == "content" else "")
+                       + ".]")
+                messages.append({"role": "assistant",
+                                 "content": _compact(stepjson)})
+                messages.append({"role": "user",
+                                 "content": f"{obs}\n\n{nudge(step + 1)}"})
+                budget -= len(obs)
+                _evict_overflow_turns(messages, self.client, self.cfg)
+                if verbose:
+                    print(f"  [step {step} discarded: `{cut}` payload cut "
+                          f"off ({payload_cuts}/{_MAX_PAYLOAD_CUTS}); NOT "
+                          f"executed]", file=sys.stderr)
+                if payload_cuts >= _MAX_PAYLOAD_CUTS or budget <= 0:
+                    if verbose:
+                        print("  [gather stopped: payloads keep arriving "
+                              "cut off; moving to answer]", file=sys.stderr)
+                    break
+                continue
 
             detail = (stepjson.get("file") or stepjson.get("pattern")
                       or stepjson.get("symbol") or stepjson.get("command") or "")
@@ -1163,6 +1258,16 @@ class Agent:
         only a block that must match existing text needs the repair loop."""
         if repair_rounds is None:
             repair_rounds = self.cfg.repair_rounds
+        # Fix X (run 13): files whose blocks in THIS reply were no-ops
+        # (SEARCH == REPLACE), dropped by parse_edits. A repair that had
+        # correctly concluded "no code defect" was pressed by the no-edit
+        # re-ask into fabricating a null block on a frozen file; the harness
+        # logged "applied 1 block(s)" and counted it as an EDIT, burning a
+        # full verify re-run instead of retiring the check. loop.run_task
+        # reads this to treat fabricated null edits as the refusal they
+        # mean. Reset every call; the throwaway parse costs one regex pass.
+        self.noop_discards: list[str] = []
+        parse_edits(reply, discards=self.noop_discards)
         # Answer-phase truncation continuation. Hosted APIs cap one message's
         # OUTPUT (~8k tokens on deepseek-chat); a big multi-file task then gets
         # cut off mid-reply no matter how large max_tokens_answer is. The old

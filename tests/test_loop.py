@@ -216,6 +216,52 @@ def test_evidence_failure_accepts_a_clean_passed_verdict():
         "Run the game and verify the snake orientation", tr) == ""
 
 
+def test_prior_attempt_narration_does_not_fail_a_passed_verdict():
+    """Fix ZE (run 13g): the frog check FINALLY passed clean -- per-row
+    white/black counts quoted, discrete 2x2 cells confirmed, bare
+    "VERDICT: PASSED" -- and was retired as FAILED because its "Likely
+    cause of the previous failure" section (retry flows invite exactly
+    that narration) said the EARLIER eval "could not confirm white eyes
+    or black mouth pixels". The confession matcher must not read history
+    as confession. Present-tense first-person admissions still fire (the
+    pinned pessimism above): they carry no prior-attempt attribution."""
+    frog_report = (
+        "Observed live reproduction:\n\n"
+        "- row 70: `4` white pixels\n- row 82: `4` black pixels\n\n"
+        "Likely cause of the previous failure:\n\n"
+        "- The earlier live eval only classified pixels as background "
+        "versus non-background.\n"
+        "- It did not count `rgb(255,255,255)` or `rgb(0,0,0)` separately, "
+        "so it could not confirm white eyes or black mouth pixels.\n"
+        "- This session's eval added color-specific counts and produced "
+        "the required measurements.\n\n"
+        "Smallest next fix:\n\n"
+        "- No game-code fix is required.\n\n"
+        "VERDICT: PASSED")
+    pruned = loop._strip_prior_attempt_prose(frog_report)
+    assert not loop._reply_says_unverified(pruned)
+    assert "VERDICT: PASSED" in pruned          # the verdict always survives
+    tr = loop.TaskResult([], frog_report, True, [], None,
+                         steps=["3. browser python main.py [wait 1]  (M.)"])
+    assert loop._evidence_failure(
+        "Verify frog sprite details by measured pixels", tr) == ""
+    # The pinned pessimism, restated against the pruner: a PRESENT-tense
+    # confession under a PASSED verdict still fails the check.
+    tr2 = loop.TaskResult(
+        [], "I could not verify the tail point in the capture.\n\n"
+            "VERDICT: PASSED",
+        True, [], None, steps=["1. browser python main.py [w]  (L.)"])
+    assert loop._evidence_failure(
+        "Run the game and verify the tail tapers", tr2)
+    # Documented trade-off: a CURRENT-attempt failure narrated with an
+    # attempt noun ("the first eval could not confirm ...") is pruned too
+    # -- accepted, because that shape under a PASSED verdict is a
+    # self-contradiction, while the frog's shape recurs on every retry
+    # that passes.
+    assert not loop._reply_says_unverified(loop._strip_prior_attempt_prose(
+        "The first eval could not confirm the tail.\n\nVERDICT: PASSED"))
+
+
 def test_unverified_regex_catches_still_unknown_whether():
     """The verdict-less fallback must also catch run 10's phrasing, where
     the report's first line named the task's own claim as unknown -- while
@@ -388,6 +434,47 @@ def test_gather_base_documents_the_eval_action():
     assert "put it LAST" in GATHER_BASE
 
 
+def test_gather_base_teaches_eval_as_measurement():
+    """Run 12's retired visual checks died the same way twice: eval forced
+    the state correctly (scale 1 -> 3, snake frames 0/1), but the VERDICT
+    needed "visibly larger"/"frames differ" from the vision descriptions,
+    which came back hedged or truncated -- nothing quotable, so the checks
+    could not pass and retired after no-edit repairs. The frog-growth
+    report even prescribed the fix itself: "explicitly compare the frog's
+    bounding box or a numeric rendered size, rather than relying only on
+    total frame pixel difference". eval's RETURNED value is the
+    defensible evidence; the bullet must teach measuring numbers in the
+    page (pixel counts, bounding boxes, frame diffs)."""
+    from pedacito.agent import GATHER_BASE
+    assert "measuring instrument" in GATHER_BASE
+    assert "getImageData" in GATHER_BASE
+    assert "looks larger" in GATHER_BASE
+
+
+def test_gather_base_warns_about_capture_drift():
+    """Run 12's combined-frame verify forced a controlled scene (enemies
+    cleared, one snake and one turtle placed at fixed positions) but its
+    report found "by the time of the captures, Time: 4 shows that normal
+    spawning had resumed and extra scorpion sprites were present" -- the
+    page keeps simulating between the eval and the screenshot, so forced
+    states must be built to survive the gap and re-asserted right before
+    each capture."""
+    from pedacito.agent import GATHER_BASE
+    assert "keeps running between" in GATHER_BASE
+    assert "re-assert" in GATHER_BASE
+
+
+def test_gather_base_separates_canvas_pixels_from_coordinates():
+    """The getImageData measurement above is only sound if the model knows
+    device pixels != game coordinates: pitfall draws enemies as 6x6 pixel
+    blocks and the frog as 2x2 cells under a live ctx.scale(d.scale)
+    growth transform, so sampling at a logical position without deriving
+    the mapping -- and without a generous margin -- misses the sprite."""
+    from pedacito.agent import GATHER_BASE
+    assert "not game coordinates" in GATHER_BASE
+    assert "ctx.scale" in GATHER_BASE
+
+
 def test_run_investigation_task_retries_an_empty_answer(tmp_path):
     """Run 8's task 6 had an empty answer phase and the loop fell straight
     to the steps-log synthesis. The retry absorbs transient empty
@@ -425,6 +512,14 @@ def test_run_investigation_task_retries_an_empty_answer(tmp_path):
     assert len(calls) == 4
     assert tr.reply.startswith("No prose report was produced")
     assert "1. browser python main.py" in tr.reply
+    # Fix ZD visibility: run 13f's log.txt showed NOTHING between the
+    # context-size print and the run-stopping error -- no way to tell a
+    # model flake from a harness bug after the fact. Both the retry and
+    # the stand-in synthesis must land in the event log.
+    from pedacito import workspace
+    log = workspace.run_log_path(tmp_path).read_text()
+    assert "retrying once" in log
+    assert "synthesized a steps-log stand-in" in log
 
 
 def test_tool_call_only_answer_is_detected():
@@ -1085,6 +1180,92 @@ def test_gather_mines_forced_reads_from_targets_only(tmp_path):
     assert targeted._unread_files == []
 
 
+def test_gather_never_dispatches_a_step_whose_payload_was_cut(tmp_path, monkeypatch):
+    """Bug W (run 13): all five pixel checks retired because the browser
+    ran eval payloads that arrived cut off. Two deterministic cut classes:
+    the token-limit salvage leaves client.truncated_field naming the half
+    field, and grammar-constrained sampling force-closes a string at
+    exactly its schema maxLength with NO truncation flag at all. Either
+    way, dispatching the step runs half a program whose SyntaxError looks
+    like a product failure. gather() must discard such a step WITHOUT
+    logging a live browser step (that would falsely satisfy the
+    live-evidence gate), tell the model to minify or split, and stop after
+    _MAX_PAYLOAD_CUTS."""
+    from pedacito import agent as agent_mod
+    from pedacito import index as index_mod
+    from pedacito.agent import Agent
+    from pedacito.tools import schema_for
+
+    (tmp_path / "main.js").write_text("var a = 1;\n", encoding="utf-8")
+    cfg = Config()
+    cfg.log_sessions = False
+    cfg.allow_browser = True
+    idx = index_mod.build([str(tmp_path)], cfg, client=None,
+                          summarise=False, root=tmp_path)
+    dispatched = []
+    monkeypatch.setattr(agent_mod, "dispatch",
+                        lambda index, cfg_, step, client=None:
+                        dispatched.append(step.get("action")) or "ok")
+    cap = schema_for(cfg)["properties"]["pattern"]["maxLength"]
+
+    class Base:
+        stream_truncated = False
+        step_truncated = False
+        truncated_field = ""
+        def chat(self, messages, max_tokens, schema=None, stream=False, **kw):
+            return ""
+
+    class TokenCutClient(Base):
+        """The salvage kept half a `pattern`; truncated_field names it."""
+        step_truncated = True
+        truncated_field = "pattern"
+        def chat_json(self, messages, schema, max_tokens=0, **kw):
+            return {"action": "browser", "file": "", "start": 0, "end": 0,
+                    "pattern": "eval new Promise(res => { const img = ctx.",
+                    "symbol": "", "to": "", "command": "python main.py",
+                    "content": "", "reasoning": "measure the frog"}
+
+    class GuillotineClient(Base):
+        """The grammar closed `pattern` at exactly its cap: valid JSON."""
+        def chat_json(self, messages, schema, max_tokens=0, **kw):
+            return {"action": "browser", "file": "", "start": 0, "end": 0,
+                    "pattern": "x" * cap, "symbol": "", "to": "",
+                    "command": "python main.py", "content": "",
+                    "reasoning": "measure the frog"}
+
+    class ReasoningCutClient(Base):
+        """A reasoning cut is benign: the step must NOT be discarded."""
+        step_truncated = True
+        truncated_field = "reasoning"
+        def chat_json(self, messages, schema, max_tokens=0, **kw):
+            return {"action": "done", "file": "", "start": 0, "end": 0,
+                    "pattern": "", "symbol": "", "to": "", "command": "",
+                    "content": "", "reasoning": ""}
+
+    for client in (TokenCutClient(), GuillotineClient()):
+        dispatched.clear()
+        agent = Agent(idx, client, cfg)
+        agent.gather("Verify frog pixels by measurement", verbose=False)
+        assert dispatched == []                 # the half payload never ran
+        discarded = [s for s in agent.steps_log if "(discarded" in s]
+        assert len(discarded) == agent_mod._MAX_PAYLOAD_CUTS
+        assert all(not loop._LIVE_STEP.match(s) for s in agent.steps_log)
+
+    agent = Agent(idx, ReasoningCutClient(), cfg)
+    agent.gather("Verify frog pixels by measurement", verbose=False)
+    assert not any("(discarded" in s for s in agent.steps_log)
+
+
+def test_gather_base_warns_step_payloads_have_a_budget():
+    """Run 13: the model composed the Promise+rAF+getImageData recipe
+    correctly -- and the 600-char schema cap destroyed it. The cap got
+    headroom and the guards catch the rest, but the prompt must also teach
+    compact payloads and the shorten-or-split response to a cut report."""
+    from pedacito.agent import GATHER_BASE
+    assert "token budget" in GATHER_BASE
+    assert "minified" in GATHER_BASE
+
+
 def test_context_notes_carry_report_tail(tmp_path, monkeypatch):
     """Investigation reports put "Still unknown"/"Next check" last; the clip
     carried into later tasks must keep that tail, not just the confident
@@ -1213,6 +1394,79 @@ def test_generate_tasks_tolerates_plain_string_list():
             return {"tasks": ["First step", "Second step"]}
     assert loop.generate_tasks("do it", Stub(), Config()) == \
         ["First step", "Second step"]
+
+
+def test_task_schema_gives_titles_room_and_one_home():
+    """Bug Y (runs 13/13b): the planner's 300-char title cap guillotined
+    every spec-derived title mid-sentence -- grammar-constrained sampling
+    force-closes a string AT maxLength, producing valid JSON with no
+    truncation flag -- and run 13b's planner, derailed by the forced
+    close, ended the task array after task 1: five of six spec checks were
+    never planned and `auto` exited 0 with "all tasks complete". The cap
+    must hold a compressed-but-complete check, and `title` must be the
+    ONLY field: the old `acceptance` sibling was silently dropped by
+    _titles_from, so any criterion a model put there was lost."""
+    items = loop.TASK_SCHEMA["properties"]["tasks"]["items"]
+    assert items["properties"]["title"]["maxLength"] == 800
+    assert set(items["properties"]) == {"title"}
+    assert items["required"] == ["title"]
+
+
+def test_generate_tasks_reasks_when_a_title_hits_the_cap():
+    """The guard half of Bug Y: a title arriving at exactly the schema cap
+    was force-closed mid-sentence, and (run 13b) the forced close can
+    derail the model into ending the array after task 1. One bounded
+    re-ask must demand the COMPLETE list with compressed titles; a clean
+    retry replaces the cut plan, and a stubborn planner is accepted after
+    exactly one retry (cut titles still work -- the goal rides along)."""
+    cap = loop.TASK_SCHEMA["properties"]["tasks"]["items"]["properties"][
+        "title"]["maxLength"]
+
+    class Recovery:
+        def __init__(self):
+            self.prompts = []
+
+        def chat_json(self, messages, schema, max_tokens=0, **kw):
+            self.prompts.append(messages[1]["content"])
+            if len(self.prompts) == 1:
+                return {"tasks": [{"title": "x" * cap}]}   # run 13b's shape
+            return {"tasks": [{"title": "Verify the spawn schedule"},
+                              {"title": "Verify frog growth by pixels"}]}
+
+    c = Recovery()
+    titles = loop.generate_tasks("six checks", c, Config())
+    assert titles == ["Verify the spawn schedule",
+                      "Verify frog growth by pixels"]
+    assert len(c.prompts) == 2
+    assert "CUT" in c.prompts[1] and "COMPLETE" in c.prompts[1]
+    assert f"{cap}-character" in c.prompts[1]
+    # The single-task derailment gets the explicit "the rest was lost" line.
+    assert "the rest of the list was lost" in c.prompts[1]
+
+    class Stubborn:
+        def __init__(self):
+            self.n = 0
+
+        def chat_json(self, messages, schema, max_tokens=0, **kw):
+            self.n += 1
+            return {"tasks": [{"title": "y" * cap}, {"title": "short one"}]}
+
+    s = Stubborn()
+    titles2 = loop.generate_tasks("spec", s, Config())
+    assert s.n == 2                             # bounded: ONE re-ask
+    assert titles2 == ["y" * cap, "short one"]  # accepted, run can proceed
+
+
+def test_plan_system_teaches_compression_over_copying():
+    """The prompt side of Bug Y: PLAN_SYSTEM told the model to "Carry
+    every concrete constraint from the goal into the titles" with zero
+    length guidance -- small models complied by copying spec passages
+    verbatim into a capped field. The compression/split rule must exist,
+    and the carry-constraints rule must stay."""
+    assert "length cap" in loop.PLAN_SYSTEM.lower()
+    assert "compress" in loop.PLAN_SYSTEM.lower()
+    assert "one task per sub-item" in loop.PLAN_SYSTEM
+    assert "Carry every concrete constraint" in loop.PLAN_SYSTEM
 
 
 # ---------------------------------------------------------------- run_loop
@@ -1348,6 +1602,55 @@ def test_run_loop_treats_noop_reply_as_done(tmp_path, monkeypatch):
     text = plan.read_text()
     assert "- [x] already done" in text
     assert "- [x] real work" in text
+
+
+def test_run_loop_reruns_an_empty_report_once_then_retires_the_check(
+        tmp_path, monkeypatch):
+    """Fix ZD (run 13f): the frog check's gather phase succeeded -- its
+    eval resolved the full per-row profile and the done-step reasoning
+    confirmed the criterion -- then the answer phase came back empty twice
+    (thinking runaway), the loop synthesized the steps-log stand-in, and
+    NO branch caught it: the run STOPPED, stranding three healthy checks.
+    An empty report over gathered evidence is a report-writer flake, not a
+    verdict: re-run once, then retire as unverified and CONTINUE -- never
+    remediate (the stand-in carries no diagnosis)."""
+    plan = tmp_path / "PLAN.md"
+    loop.write_plan(plan, "", [
+        "Verify the frog sprite by measured pixels in the live game",
+        "real work"])
+    idx = types.SimpleNamespace(root=tmp_path)
+    calls = []
+    stand_in = ("No prose report was produced; the lookup phase recorded:\n"
+                "\n1. browser python main.py [wait 1]  (Measure.)")
+
+    def fake_investigate(root, cfg, client, agent, idx_, task,
+                         answer_system=None):
+        calls.append(task)
+        return loop.TaskResult(
+            [], stand_in, True, [], idx_, None,
+            ["1. browser python main.py [wait 1]  (Measure.)"])
+
+    def fake_run_task(root, cfg, client, agent, idx_, task, apply=True,
+                      review=False, answer_system=None):
+        calls.append(task)
+        return _result(idx_)
+
+    monkeypatch.setattr(loop, "run_investigation_task", fake_investigate)
+    monkeypatch.setattr(loop, "run_task", fake_run_task)
+    code = loop.run_loop(tmp_path, _cfg(), None, idx, plan, apply=True)
+    assert code == 1                        # the retired check is a failure
+    assert len(calls) == 3
+    assert calls[1].split("\n\n### RETRY")[0] == calls[0]   # same check
+    assert ("RETRY -- THE PREVIOUS ATTEMPT'S REPORT CAME BACK EMPTY"
+            in calls[1])
+    assert calls[2] == "real work"          # the plan CONTINUED
+    text = plan.read_text()
+    assert "- [!] Verify the frog sprite" in text
+    assert "- [x] real work" in text
+    from pedacito import workspace
+    log = workspace.run_log_path(tmp_path).read_text()
+    assert "re-running once, no remediation" in log
+    assert "produced no prose on two attempts" in log
 
 
 def test_declares_incomplete_separates_deferral_from_noop():
@@ -1760,6 +2063,200 @@ def test_run_task_discards_edit_blocks_that_contradict_a_refusal(tmp_path):
     # The generic no-blocks ERROR is suppressed: this is a decision the
     # harness honored, not a parse failure.
     assert "no edit blocks parsed" not in log
+
+
+def test_parse_edits_drops_noop_blocks():
+    """Fix X (run 13): a repair that had correctly concluded "no code
+    defect" was pressed by the no-edit re-ask into fabricating a block
+    whose SEARCH and REPLACE were identical (`window.__game = state;` over
+    itself, on a file the goal froze). The harness logged "applied 1
+    block(s)", took a backup, and counted it as an EDIT -- burning a full
+    verify re-run instead of retiring the check. A null edit is never
+    work: drop it at parse time so no caller can mistake it for work."""
+    from pedacito.edits import parse_edits
+    noop = ("--- FILE: main.js\n"
+            "<<<<<<< SEARCH\n"
+            "window.__game = state;\n"
+            "=======\n"
+            "window.__game = state;\n"
+            ">>>>>>> REPLACE\n")
+    discards = []
+    assert parse_edits(noop, discards=discards) == []
+    assert discards == ["main.js"]
+
+    real = ("--- FILE: main.js\n"
+            "<<<<<<< SEARCH\n"
+            "window.__game = state;\n"
+            "=======\n"
+            "window.__game = state;\n"
+            "window.__debug = true;\n"
+            ">>>>>>> REPLACE\n")
+    both = noop + "\n" + real
+    discards2 = []
+    got = parse_edits(both, discards=discards2)
+    assert len(got) == 1 and "window.__debug" in got[0].replace
+    assert discards2 == ["main.js"]          # only the null block
+
+
+def test_run_task_treats_fabricated_noop_blocks_as_a_refusal(tmp_path):
+    """Fix X end-to-end: the reply's only blocks were null edits, dropped
+    by parse_edits. run_task must NOT re-ask for "real" blocks -- that
+    pressure is what fabricated them in run 13 -- and must mark the reply
+    so the outer loop's no-op path sees the refusal (repair_outcome False
+    -> the failing check retires instead of burning another verify
+    round)."""
+    (tmp_path / "main.js").write_text("window.__game = state;\n",
+                                      encoding="utf-8")
+    idx = types.SimpleNamespace(root=tmp_path)
+    REPLY = ("No code defect was found: every failure was an eval payload "
+             "truncation, and the task forbids changes.\n"
+             "\n"
+             "--- FILE: main.js\n"
+             "<<<<<<< SEARCH\n"
+             "window.__game = state;\n"
+             "=======\n"
+             "window.__game = state;\n"
+             ">>>>>>> REPLACE\n")
+
+    class FakeAgent:
+        steps_log = []
+
+        def __init__(self):
+            self.apply_calls = 0
+            self.noop_discards = []
+
+        def gather(self, task, **kw):
+            return "gathered source"
+
+        def answer(self, task, gathered, **kw):
+            return REPLY
+
+        def apply(self, reply, **kw):
+            self.apply_calls += 1
+            self.noop_discards = ["main.js"]   # parse_edits dropped the block
+            return ([], reply)
+
+    agent = FakeAgent()
+    tr = loop.run_task(tmp_path, _cfg(), None, agent, idx,
+                       "Repair the defect described in the FAILED LIVE TEST "
+                       "note", apply=True)
+    assert agent.apply_calls == 1              # never re-asked for blocks
+    assert tr.results == []
+    assert "[No changes:" in tr.reply
+    assert loop._is_noop(tr.reply)             # the outer loop sees refusal
+    assert (tmp_path / "main.js").read_text() == "window.__game = state;\n"
+    from pedacito import workspace
+    log = workspace.run_log_path(tmp_path).read_text()
+    assert "treated as a refusal" in log
+    # Suppressed: a fabricated null edit is a decision the harness honored,
+    # not a parse failure.
+    assert "no edit blocks parsed" not in log
+
+
+def test_recover_no_edit_reply_offers_an_explicit_no_edit_way_out(tmp_path):
+    """Fix X, pressure side: the old re-ask said only "Produce the edit
+    blocks now." -- a model that had correctly concluded no edit was
+    needed could comply only by fabricating one, and in run 13 it did
+    (twice). The re-ask must name the honest exit (one 'No changes:' line)
+    and forbid blocks that change nothing."""
+    asked = []
+
+    class FakeAgent:
+        def answer(self, task, gathered, **kw):
+            asked.append(task)
+            return "still no blocks"
+
+        def apply(self, reply, **kw):
+            return ([], reply)
+
+    rec = loop._recover_no_edit_reply(tmp_path, _cfg(), FakeAgent(),
+                                      "Repair the defect", "src",
+                                      "prose reply",
+                                      dry_run=True, backup_dir=None)
+    assert rec is None
+    assert asked, "the re-ask never ran"
+    assert "No changes:" in asked[0]
+    assert "identical" in asked[0]
+
+
+def test_recover_honors_the_no_changes_escape_hatch_reply(tmp_path):
+    """Fix X2 (run 13d): the repair took the escape hatch the re-ask
+    teaches -- an honest "No changes: <reason>" line -- and the old loop
+    DISCARDED it: only block-producing rounds were returned, so the
+    model was pressed a second time, both honest replies were thrown
+    away (None kept the original prose), and the run stopped on a task
+    that had correctly concluded no edit was warranted. The declaration
+    must end the re-ask loop and propagate as the reply."""
+    asked = []
+
+    class FakeAgent:
+        def answer(self, task, gathered, **kw):
+            asked.append(task)
+            return ("No changes: the goal freezes all game code and the "
+                    "failure was a measurement error, not a defect.")
+
+        def apply(self, reply, **kw):
+            return ([], reply)
+
+    rec = loop._recover_no_edit_reply(tmp_path, _cfg(), FakeAgent(),
+                                      "Repair the defect", "src",
+                                      "prose reply",
+                                      dry_run=True, backup_dir=None)
+    assert rec is not None
+    results, reply = rec
+    assert results == []
+    assert reply.startswith("No changes:")
+    assert len(asked) == 1               # honored at once, no second re-ask
+
+
+def test_run_task_propagates_a_reask_no_changes_reply(tmp_path):
+    """Fix X2, run_task side: the propagated declaration becomes the
+    task reply -- run_loop keys its refusal path off _is_noop(tr.reply)
+    (for a repair: repair_outcome False -> the failing check retires)
+    -- and the "no edit blocks parsed" ERROR stays out of the log: an
+    honest refusal is a decision, not a parse failure."""
+    idx = types.SimpleNamespace(root=tmp_path)
+    answers = []
+
+    class FakeAgent:
+        steps_log = []
+        noop_discards = []
+
+        def gather(self, task, **kw):
+            return "gathered source"
+
+        def answer(self, task, gathered, **kw):
+            answers.append(task)
+            if len(answers) == 1:
+                return ("The failure was a measurement error, so editing "
+                        "is off the table.")
+            return "No changes: the goal freezes all game code."
+
+        def apply(self, reply, **kw):
+            return ([], reply)
+
+    tr = loop.run_task(tmp_path, _cfg(), None, FakeAgent(), idx,
+                       "Repair the defect described in the FAILED LIVE "
+                       "TEST note", apply=True)
+    assert len(answers) == 2             # first reply + exactly one re-ask
+    assert tr.results == []
+    assert tr.reply.startswith("No changes:")
+    assert loop._is_noop(tr.reply)       # the outer loop sees the refusal
+    from pedacito import workspace
+    log = workspace.run_log_path(tmp_path).read_text()
+    assert "no edit blocks parsed" not in log
+    assert "honored as a refusal" in log
+
+
+def test_is_noop_matches_the_refusal_phrasing_models_actually_use():
+    """Fix X2, pattern side: run 13d's FIRST repair reply -- "No code
+    edit is appropriate here" -- matched none of the _is_noop patterns
+    ("no edit" needs the words adjacent), so the honest refusal fell
+    into the re-ask loop at all. The phrasing must count as a no-op
+    declaration the moment it arrives."""
+    assert loop._is_noop("No code edit is appropriate here.")
+    assert loop._is_noop("No changes: the goal freezes the code.")
+    assert not loop._is_noop("I moved the spawn gate to time >= 3.")
 
 
 def test_run_log_records_events(tmp_path):

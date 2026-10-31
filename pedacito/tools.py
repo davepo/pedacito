@@ -86,7 +86,8 @@ screenshot - launch app, wait, capture screen; returns text analysis.
 browser  - open a web page in headless Chromium, interact, wait, capture it.
            args: command (URL, or a command that prints a localhost URL),
            pattern (optional "press Enter; click #start; wait 2; eval <js>";
-           `eval` goes last and consumes the rest of the pattern),
+           `eval` goes last and consumes the rest of the pattern; its result
+           comes back clipped at 2000 chars -- resolve compact JSON),
            start (seconds to wait), optional file (old shot to compare)
            (needs allow_browser; launching a command also needs allow_shell)
            (a desktop screenshot cannot see a page that was never opened)
@@ -124,12 +125,24 @@ STEP_SCHEMA = {
                                    "valid regex. For browser: optional actions "
                                    "like 'press Enter; click #start; wait 2; "
                                    "eval <js>' -- eval goes LAST and consumes "
-                                   "the rest (semicolons allowed inside). "
+                                   "the rest (semicolons allowed inside); its "
+                                   "RESULT is reported clipped at 2000 chars, "
+                                   "so resolve compact or aggregated JSON. "
                                    "Empty otherwise.",
-                    # 600: run 10's forced-state JS expressions were truncated
-                    # mid-token at 200, and schema-constrained sampling cannot
-                    # emit what the schema forbids.
-                    "maxLength": 600},
+                    # 2000: run 13's measurement evals (Promise + double-rAF
+                    # + getImageData scans, ~750-1200 chars) were guillotined
+                    # at the old 600 cap. Grammar-constrained sampling force-
+                    # closes a string AT maxLength: VALID JSON, finish_reason
+                    # "stop", no truncation flag -- and the browser then ran
+                    # the 600-char fragment (SyntaxError: Unexpected end of
+                    # input, at the identical character in every retry,
+                    # because the cap is deterministic). Five checks retired
+                    # to it. 600 itself came from run 10, whose forced-state
+                    # expressions were truncated mid-token at 200, and
+                    # schema-constrained sampling cannot emit what the schema
+                    # forbids. agent.gather now also refuses to dispatch a
+                    # payload arriving at exactly its cap.
+                    "maxLength": 2000},
         "symbol": {"type": "string",
                    "description": "For callers; or for read when file is empty "
                                   "(reads that definition). Empty otherwise.",
@@ -158,10 +171,14 @@ STEP_SCHEMA = {
     # stays simple and the model never has to pick a branch.
     # NOTE: `content`'s maxLength MUST stay below llm._BIG_FIELD_MIN (8000).
     # That threshold is what marks a schema "answer-style" (cut mid-content =>
-    # partial, must escalate) vs "step-style" (args all precede `reasoning`, so
-    # a salvaged action is complete and accepted on the first try). Raising it
-    # past 8000 silently disables step-truncation salvage; file-size limits are
-    # enforced by max_write_lines in dispatch()/tool_write(), not here.
+    # partial, must escalate) vs "step-style" (a salvaged action is accepted on
+    # the first try). "Args all precede reasoning" stops holding the moment a
+    # long eval `pattern` or write `content` eats the token budget itself, so
+    # llm.chat_json records WHICH field the cut landed in (`truncated_field`)
+    # and agent.gather refuses to dispatch a step whose payload was cut.
+    # Raising content past 8000 silently disables step-truncation salvage;
+    # file-size limits are enforced by max_write_lines in dispatch()/
+    # tool_write(), not here.
     "required": ["action", "file", "start", "end", "pattern", "symbol",
                  "to", "command", "content", "reasoning"],
     "additionalProperties": False,
@@ -1755,7 +1772,9 @@ def tool_browser(index, cfg, client, command: str = "", pattern: str = "",
     eval <js expression>` -- so the model can reach a game that waits behind
     a start screen and force state (a grown player, a late level) that
     waiting alone cannot produce. An `eval` consumes the rest of the pattern
-    (put it last), so its expression may contain semicolons. `start` is the
+    (put it last), so its expression may contain semicolons; its result is
+    reported back clipped at 2,000 chars, so aggregate large scans (e.g.
+    per-sprite-row counts) instead of dumping raw rows. `start` is the
     wait before capture. A desktop `screenshot` cannot do any of this;
     this tool captures the PAGE and reports its text, canvas sizes, console
     errors, and optional vision description.
