@@ -42,11 +42,87 @@ def test_templates_are_valid_toml():
         text = getattr(config_mod, name)
         data = tomllib.loads(text)          # must not raise
         assert isinstance(data, dict)
-    # The starter template must stay short -- that was the whole point of
-    # the simplification.
-    assert len(config_mod.TEMPLATE.splitlines()) < 80
+    # The starter is profile-based and lists every opt-in capability.
+    assert "[universal]" in config_mod.TEMPLATE
+    assert "[indexing]" in config_mod.TEMPLATE
+    assert "[agent]" in config_mod.TEMPLATE
+    assert "[profiles.default]" in config_mod.TEMPLATE
+    for key in ("allow_write", "allow_shell", "allow_screenshots",
+                "allow_browser", "allow_diff", "allow_mcp",
+                "semantic_search", "auto_diagnostics",
+                "use_project_instructions"):
+        assert key in config_mod.TEMPLATE
     assert "base_url" in config_mod.TEMPLATE
     assert "model" in config_mod.TEMPLATE
+
+
+def test_profile_default_is_the_implicit_fallback(tmp_path):
+    p = tmp_path / "config.toml"
+    p.write_text(
+        '[universal]\n'
+        'timeout = 12.5\n'
+        'allow_shell = true\n'
+        '[profiles.default]\n'
+        'base_url = "http://localhost:9/v1"\n'
+        'model = "m"\n'
+        'vram_gb = 8\n', encoding="utf-8")
+    cfg = config_mod.load(root=tmp_path, explicit=p, use_env=False,
+                          require_hardware=False, warn_budgets=False)
+    assert cfg.active_profile == "default"
+    assert cfg.base_url == "http://localhost:9/v1"
+    assert cfg.timeout == 12.5
+    assert cfg.allow_shell is True
+
+
+def test_named_default_profile_still_wins(tmp_path):
+    p = tmp_path / "config.toml"
+    p.write_text(
+        'default_profile = "other"\n'
+        '[profiles.default]\n'
+        'base_url = "http://localhost:1/v1"\n'
+        'model = "default"\n'
+        'vram_gb = 8\n'
+        '[profiles.other]\n'
+        'base_url = "http://localhost:2/v1"\n'
+        'model = "other"\n'
+        'vram_gb = 8\n', encoding="utf-8")
+    cfg = config_mod.load(root=tmp_path, explicit=p, use_env=False,
+                          require_hardware=False, warn_budgets=False)
+    assert cfg.active_profile == "other"
+    assert cfg.model == "other"
+
+
+def test_interactive_setup_writes_profile_based_config(tmp_path, monkeypatch):
+    import io
+
+    def ask(prompt, default=""):
+        if "VRAM" in prompt:
+            return "24"
+        if "tier" in prompt.lower():
+            return "medium"
+        if "Which model" in prompt:
+            return "qwen-local"
+        return default
+
+    monkeypatch.setattr(config_mod, "discover_servers",
+                        lambda timeout=2.0: [
+                            ("Ollama", "http://localhost:11434/v1",
+                             ["qwen-local"])])
+    monkeypatch.setattr(config_mod, "_ask", ask)
+    p = tmp_path / "config.toml"
+    config_mod.interactive_setup(path=p, force=True, stdout=io.StringIO())
+    data = tomllib.loads(p.read_text(encoding="utf-8"))
+    assert data["default_profile"] == "default"
+    raw = p.read_text(encoding="utf-8")
+    assert "[universal]" in raw and "[agent]" in raw
+    prof = data["profiles"]["default"]
+    assert prof["base_url"] == "http://localhost:11434/v1"
+    assert prof["model"] == "qwen-local"
+    assert data["universal"]["vram_gb"] == 24
+    cfg = config_mod.load(explicit=p, use_env=False,
+                          require_hardware=False, warn_budgets=False)
+    assert cfg.active_profile == "default"
+    assert cfg.model == "qwen-local"
 
 
 def test_tier_preset_applies_without_profiles(tmp_path):

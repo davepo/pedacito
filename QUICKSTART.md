@@ -109,10 +109,11 @@ pedacito config --setup
 An interactive wizard: it probes for a running LM Studio or Ollama server,
 lists the models it finds, asks which to use (Enter accepts the
 auto-detected one), optionally takes a hosted API key (DeepSeek and
-friends), and writes a minimal config to `~/.config/pedacito/config.toml`
-(Linux/macOS) or `%APPDATA%\pedacito\config.toml` (Windows). Three settings
-are mandatory — `base_url`, `model`, and the server machine's GPU memory
-(`vram_gb`) — and the wizard fills them in for you. Prefer doing it by hand?
+friends), and writes a full starter config to `~/.config/pedacito/config.toml`
+(Linux/macOS) or `%APPDATA%\pedacito\config.toml` (Windows). The connection
+values `base_url` and `model` live in `[profiles.default]`; the server
+machine's GPU memory (`vram_gb`) is a shared `[universal]` setting. The wizard
+fills all three for you. Prefer doing it by hand?
 `pedacito config --init` writes the same starter; `pedacito config
 --reference` shows every knob with explanations. Hosted APIs
 (DeepSeek/OpenAI) do not need the VRAM value.
@@ -137,17 +138,23 @@ configured one, set `context_tokens` explicitly in that profile.
 Then:
 
 ```toml
-[server]
+[profiles.default]
 base_url = "http://localhost:1234/v1"   # or :11434/v1 for Ollama
 model = "qwen3.5-9b"            # exact id/name the server reports
+
+[universal]
 vram_gb = 8                     # GPU VRAM on the server machine, in GB
 ```
 
-Whatever you do by hand, the file only ever needs those three lines. The old
-skeleton with four fully-spelled-out profile blocks is still available via
-`pedacito config --reference`. If you run several models and want to switch
-with `--profile NAME`, each profile can carry a one-word preset —
-`tier = "small"|"medium"|"large"|"hosted"` — instead of ten budget knobs;
+`vram_gb` is shared hardware configuration, so it lives in `[universal]`; a
+profile may override it for a model on a different GPU. `[profiles.default]`
+is the fallback when no profile is named. The generated starter also has
+`[universal]`, `[indexing]`, and `[agent]` sections, every profile-overridable
+key commented under `[profiles.default]`, and fully commented local-Qwen and
+hosted-DeepSeek examples. If you run several models and want to switch with
+`--profile NAME`, each profile can carry a one-word
+preset — `tier = "small"|"medium"|"large"|"hosted"` — instead of ten budget
+knobs;
 values you write explicitly still win. And remember budgets self-fit to the
 server's real window and the GPU's VRAM at startup, so a wrong tier costs
 efficiency, not correctness.

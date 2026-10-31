@@ -7,7 +7,10 @@ Usage
     cfg = load(root=project_root, explicit=None, profile="qwen")
     print(cfg.base_url, cfg.model)
 
-Settings come from a TOML file. Precedence, lowest to highest:
+Settings come from a TOML file. The file is profile-based: `[universal]`,
+`[indexing]`, and `[agent]` hold shared defaults, while `[profiles.NAME]`
+holds server/model-specific keys. `[profiles.default]` is the fallback when no
+profile is named. Precedence, lowest to highest:
 
     1. built-in defaults
     2. the user config file            your machine: LM Studio url, model
@@ -33,7 +36,7 @@ import re
 import tomllib
 import difflib
 import sys
-from dataclasses import dataclass, fields, field
+from dataclasses import MISSING, dataclass, fields, field
 from pathlib import Path
 
 
@@ -536,9 +539,9 @@ class Config:
 # is kept as an accepted alias so existing config files keep working. Pedacito
 # talks to any server exposing an OpenAI-compatible /v1 surface (LM Studio,
 # Ollama, and others), so "server" describes it without implying one product.
-_SECTIONS = ("server", "lmstudio", "hardware", "generation", "map", "indexing",
-             "files", "agent", "scaffold", "editing", "reasoning", "review",
-             "workspace")
+_SECTIONS = ("universal", "server", "lmstudio", "hardware", "generation",
+             "map", "indexing", "files", "agent", "scaffold", "editing",
+             "reasoning", "review", "workspace")
 PROFILE_SECTION = "profiles"
 
 _FIELDS = {f.name: f for f in fields(Config)
@@ -824,6 +827,11 @@ def load(root: Path | None = None, explicit: Path | None = None,
     if not profile:
         profile = cfg.default_profile
         origin = "default_profile"
+    if not profile and "default" in profiles:
+        # The profile-based config format makes [profiles.default] the
+        # fallback when no profile is named.
+        profile = "default"
+        origin = "implicit [profiles.default]"
     if profile:
         if profile not in profiles:
             known = ", ".join(sorted(profiles)) or "(none defined)"
@@ -1749,6 +1757,11 @@ def _apply_preset(name: str, body: dict, origin: str) -> tuple[dict, str]:
             raise ConfigError(
                 f"profile '{name}' ({origin}): tier must be one of "
                 f"{', '.join(PRESET_TIERS)}, got {tier!r}")
+    elif name == "default":
+        # [profiles.default] is the fallback overlay, not a model-sized tier:
+        # its keys sit on top of [universal]/[indexing]/[agent]. Guessing
+        # "large" from "27b" would silently replace those universal budgets.
+        tier = ""
     else:
         tier = _guess_tier(name, body) or ""
     if not tier:
@@ -1758,494 +1771,307 @@ def _apply_preset(name: str, body: dict, origin: str) -> tuple[dict, str]:
     return merged, tier
 
 
+def _toml_literal(value) -> str:
+    """Render a Config default as a TOML literal for the commented reference."""
+    import json
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, str):
+        return json.dumps(value)
+    if isinstance(value, (int, float)):
+        return repr(value)
+    if isinstance(value, (tuple, list)):
+        return "[" + ", ".join(_toml_literal(v) for v in value) + "]"
+    if isinstance(value, dict):
+        return "{" + ", ".join(f"{k} = {_toml_literal(v)}"
+                               for k, v in value.items()) + "}"
+    return json.dumps(str(value))
+
+
+_PROFILE_FIELD_EXCLUDE = {
+    "base_url", "model", "vram_gb", "default_profile", "tier", "active_tier",
+}
+
+
+def _profile_override_comments() -> str:
+    """Every profile-overridable setting, commented at its built-in default."""
+    out: list[str] = []
+    for name, f in _FIELDS.items():
+        if name in _PROFILE_FIELD_EXCLUDE:
+            continue
+        if f.default is not MISSING:
+            value = f.default
+        elif f.default_factory is not MISSING:      # type: ignore[comparison-overlap]
+            value = f.default_factory()
+        else:
+            continue
+        out.append(f"# {name} = {_toml_literal(value)}")
+    return "\n".join(out)
+
+
 # --------------------------------------------------------------------------
 # `pedacito config --init` starter file
 # --------------------------------------------------------------------------
 TEMPLATE = '''\
-# Pedacito configuration.  Run `pedacito config --setup` to build this file
-# interactively (it finds LM Studio / Ollama on this machine for you), or
-# edit the lines below.  Everything else is optional.
+# Pedacito configuration.
 #
-# MANDATORY:
-#   base_url       where the model lives. Default: http://localhost:1234/v1
-#   model          the exact name your server reports. Default: google/gemma-3-27b
-#   vram_gb        total GPU VRAM on the machine running the model
-# VRAM is a whole number of gigabytes.  Pedacito reads the model's file size
-# from the server and uses it plus VRAM to size the context window
-# automatically -- you do not need to set any max_tokens_* values.  It is
-# not needed for hosted APIs (DeepSeek/OpenAI), which run elsewhere.
+# Run `pedacito config --setup` to generate this file interactively, or edit
+# the values below. The file is profile-based:
 #
+#   [universal]  optional defaults that apply to every profile
+#   [indexing]   chunking, retrieval, and semantic-search defaults
+#   [agent]      tool opt-ins, budgets, and autonomous-loop settings
+#   [profiles.X] server/model-specific settings
+#
+# `[profiles.default]` is the fallback when no profile is named. Every key
+# there and in the sections above can be overridden by a profile. Select one
+# with --profile NAME, PEDACITO_PROFILE, or default_profile below.
+#
+# MANDATORY for a local setup: base_url and model in [profiles.default].
+# vram_gb is a shared hardware setting below; override it inside a profile only
+# when that model runs on a different GPU. Hosted APIs do not need vram_gb.
+#
+# Precedence: built-ins < this file < project .pedacito.toml < --config FILE
+#             < --profile NAME < CLI flags.
+
+default_profile = "default"
+
+[universal]
+# Connection, generation, and shared hardware/workspace defaults. A profile
+# overrides any of these. See `pedacito config --reference` for the full list.
+vram_gb = 8
+timeout = 600.0
+load_wait_seconds = 240
+max_consecutive_failures = 3
+json_mode = "schema"
+temperature = 0.2
+# sampler = { top_p = 0.95, top_k = 40, min_p = 0.05, repeat_penalty = 1.1 }
+disable_thinking = false
+thinking_suffix = ""
+k_cache_quant = ""
+v_cache_quant = ""
+kv_cache_bytes_per_token = 0
+max_tokens_summary = 220
+max_tokens_step = 700
+max_tokens_answer = 3000
+max_output_tokens = 0
+context_tokens = 8192
+reserve_tokens = 2048
+auto_fit = true
+auto_detect_context = true
+request_max_tokens_cap = 32768
+flat_map_token_budget = 4000
+file_card_line_ranges = true
+repair_rounds = 2
+backup = true
+log_sessions = true
+review = false
+review_port = 0
+open_browser = true
+review_timeout = 1800
+manage_gitignore = true
+create_ignore_file = true
+
+[indexing]
+# Chunking and retrieval. Oversized units split at statement boundaries.
+class_split_lines = 60
+max_unit_lines = 220
+max_unit_chars = 12000
+max_unit_tokens = 3000
+unit_overlap_lines = 0
+max_chunk_chars = 6000
+min_lines_to_summarise = 4
+summarise_methods = false
+summarise_documented = false
+include_references = true
+extra_extensions = []
+max_reference_bytes = 2000000
+summarise_references = false
+# Semantic search is opt-in. It needs an embeddings-capable server.
+semantic_search = false
+embedding_model = ""
+semantic_top_k = 5
+semantic_min_score = 0.2
+
+[agent]
+# Project context and the model's own checklist.
+use_project_instructions = true
+max_instruction_chars = 2000
+max_todo_chars = 1500
+max_steps = 0
+max_completion_rounds = 0
+max_continuation_rounds = 0
+max_gathered_chars = 24000
+max_read_lines = 200
+read_context_hint = true
+
+# Opt-in tool capabilities. Flip these only when the model should use them.
+allow_write = false
+max_write_chars = 200000
+max_write_lines = 120
+allow_shell = false
+shell_timeout = 120
+shell_idle_seconds = 10
+shell_allowlist = []
+max_shell_output_chars = 8000
+allow_screenshots = false
+screenshot_wait_seconds = 5
+allow_browser = false
+browser_wait_seconds = 3
+browser_server_wait_seconds = 15
+browser_headless = true
+browser_timeout_seconds = 20
+vision_model = ""
+vision_max_tokens = 400
+allow_diff = true
+compact_step_schema = false
+allow_rename = true
+
+# Diagnostics and MCP are opt-in. MCP also needs mcp_servers configured.
+auto_diagnostics = false
+diagnostics_timeout = 90
+max_diagnostics_chars = 8000
+allow_mcp = false
+mcp_servers = []
+mcp_timeout = 30
+
+# Autonomous loop (`pedacito auto`).
+auto_plan_file = "PLAN.md"
+auto_verify = ""
+auto_max_tasks = 0
+auto_max_minutes = 0
+auto_repair_rounds = 2
+auto_split_lines = 120
+auto_install_deps = false
+auto_smoke = true
+auto_smoke_timeout = 20
+auto_verify_rounds = 2
+
+# Project scaffolding (`pedacito new`).
+max_new_files = 24
+max_spec_chars = 60000
+max_tokens_plan = 2000
+max_tokens_build = 8000
+
+[profiles.default]
+# The fallback profile. Replace these with your server and model.
 base_url = "http://localhost:1234/v1"
 model    = "google/gemma-3-27b"
-vram_gb  = 8
 
-# Optional: pick sane token budgets without defining any profiles.
-# One of "small" (~9B local), "medium" (~14-27B local), "large" (35B+),
-# or "hosted" (DeepSeek/OpenAI-style APIs).  Delete it to use built-ins.
-tier = "medium"
+# Every profile-overridable setting, commented at its built-in default.
+# Uncomment only the keys this profile needs; a profile beats [universal],
+# [indexing], and [agent].
+# vram_gb = 8                   # optional per-model hardware override
+# tier = "medium"               # small | medium | large | hosted
+''' + _profile_override_comments() + '''
 
-# Profiles let one file hold several models/tiers; select with --profile NAME
-# (or default_profile below).  A hosted API profile looks like this:
-# [profiles.deepseek]
+# --- Local model example (Qwen) --------------------------------------------
+# [profiles.example_qwen]
+# base_url = "http://127.0.0.1:11434/v1"
+# model    = "Qwen3.8-27B-GSQ-RCO-GGUF"
+# vram_gb  = 24
+# tier     = "medium"
+# json_mode = "schema"
+# semantic_search = true
+# k_cache_quant = "q8_0"
+# v_cache_quant = "q5_1"
+# allow_shell = true
+# allow_screenshots = true
+# allow_browser = true
+# max_gathered_chars = 48000
+# max_read_lines = 200
+
+# --- Hosted API example (DeepSeek) -----------------------------------------
+# [profiles.example_deepseek]
 # base_url = "https://api.deepseek.com/v1"
 # api_key  = "sk-..."
 # model    = "deepseek-chat"
 # tier     = "hosted"
-# json_mode = "object"      # hosted APIs usually lack structured-output schemas
-
-# default_profile = "deepseek"
-
-# Every other knob (max_steps, context_tokens, temperature, thinking control,
-# chunking, review...) has a working built-in default.  See them all with:
-#   pedacito config --reference        (annotated full template)
-#   pedacito config                    (current resolved values + who set them)
-# Precedence: defaults < this file < ./.pedacito.toml < --config FILE <
-# --profile NAME < CLI flags.
+# json_mode = "object"          # hosted APIs usually reject json_schema
+# timeout  = 120.0
+# max_tokens_answer = 40000
+# context_tokens = 128000
+# max_gathered_chars = 100000
+# max_read_lines = 400
 '''
 
 
 # --------------------------------------------------------------------------
-# Full annotated reference. `--init` writes the short TEMPLATE above;
-# `pedacito config --reference` prints this one so every knob stays
-# documented without overwhelming first-time users.
+# Full annotated reference. `--init` writes the complete starter above;
+# `--reference` appends the longer explanations so every knob stays documented.
 # --------------------------------------------------------------------------
-REFERENCE_TEMPLATE = '''\
-# Pedacito configuration.
-#
-# Lives at ~/.config/pedacito/config.toml (Linux/macOS) or
-# %APPDATA%\\pedacito\\config.toml (Windows). A .pedacito.toml in a project
-# root overrides these for that project; command-line flags override both.
-#
-# Every setting below is optional -- the value shown in each commented line
-# is the built-in default. Pedacito runs with no config file at all, on
-# http://localhost:1234/v1 with google/gemma-3-27b.
-#
-# Precedence, lowest to highest:
-#   defaults -> this file -> <project>/.pedacito.toml -> --config FILE ->
-#   --profile NAME (tier preset underneath, your keys on top) -> CLI flags
-#
-# Run `pedacito config` to see every resolved value and which layer set it.
-#
-# TOKEN LIMITS ARE PROFILE-SCOPED ON PURPOSE. A 9B running locally on an 8k
-# context window and deepseek-chat over an API are the same code path with
-# wildly different budgets, so you do not hand-tune seven token knobs per
-# model -- each profile below carries its own complete set, generated from a
-# tier preset:
-#
-#   tier = "small"    ~9B local models (qwen3-8b, llama-3.1-8b)
-#   tier = "medium"   ~14B/27B local models (gemma-3-27b, qwen3-14b)
-#   tier = "large"    big local rigs (35B+, 70B)
-#   tier = "hosted"   capable APIs (DeepSeek, OpenAI, Anthropic, ...)
-#
-# The tier line in each profile below is commented out because the limits
-# spelled out under it ARE that tier's preset values, written out so you can
-# edit any of them individually. Keys you write always win over the preset;
-# uncommenting `tier =` just re-syncs the ones you left alone. Without a
-# tier key, pedacito also infers one from the model name ("...9b" -> small,
-# "...27b" -> large, deepseek/openai URLs -> hosted); `tier = ""` disables
-# inference entirely. Running with no profile keeps the conservative built-in
-# defaults shown in the reference sections below.
+REFERENCE_TEMPLATE = TEMPLATE + '''
 
 # ===========================================================================
-# QUICK START -- one local server, one hosted server, switch with --profile
+# DETAILED NOTES
 # ===========================================================================
 #
-# [server] holds the defaults for when no profile is selected. Every field
-# in it, including base_url / api_key / model / json_mode, can be overridden
-# by a profile -- so "switch servers" is just "switch profile":
+# The value on each commented line is the built-in default. Uncomment what you
+# need. Section names are organizational; any valid field is accepted under any
+# section, and a profile may override any universal/indexing/agent field.
 #
-#   pedacito ask proj -t "..." --profile deepseek
-#   pedacito chat proj            # then /profile deepseek mid-session
+# --- Connection and generation ---------------------------------------------
+# base_url / model are mandatory in the default local profile.
+# vram_gb is a shared hardware setting in [universal]; override it in a
+# profile when that model runs on a different GPU.
+# api_key is ignored by local servers; any string works.
+# json_mode: "schema" for llama.cpp/LM Studio, "object" for hosted APIs.
+# timeout: seconds per request. load_wait_seconds: model load wait.
+# max_consecutive_failures: abort an indexing batch after N failures.
+# temperature: keep low for tool calls.
+# sampler: per-server sampler keys, usually placed inside a profile.
 #
-# A fully worked two-server example is at the bottom of this file. The
-# [server] section here is what that example falls back to.
-
-[server]
-base_url = "http://localhost:1234/v1"
-model    = "google/gemma-3-27b"
-vram_gb  = 8                   # MANDATORY for local servers: GPU VRAM in GB
-
-# Pedacito queries the server for the model's file size at the start of every
-# run. The server's CONFIGURED context length, when it reports one (LM Studio,
-# Lemonade, Ollama), is authoritative; the VRAM estimate is then only a speed
-# advisory -- when it is below the configured length, the KV cache will spill
-# to system RAM and tokens/sec drop, so lower the server's context length if
-# that matters to you. When the server does not report one, the estimate caps
-# the fallback window by how much KV cache fits in VRAM after loading the
-# weights (0.5 GB is kept for the system). Tier/default token budgets are
-# used when they fit that window; otherwise the VRAM-derived allocation is
-# used. You do not need to set any max_tokens_* values yourself; explicit
-# values override both. If the runtime loaded quantized K/V caches, set
-# k_cache_quant / v_cache_quant (see the context section below) so the
-# estimate matches the cache actually in VRAM. If the server reports a
-# stale/default window, set context_tokens explicitly to make yours
-# authoritative.
+# --- Context and token budgets ---------------------------------------------
+# context_tokens is the server-side window. reserve_tokens is held back for
+# replies. Pedacito auto-fits budgets from the server's reported context and
+# VRAM; explicit profile values always win.
+# k_cache_quant / v_cache_quant let the VRAM estimate match the runtime's
+# KV-cache quantization (f16, bf16, q8_0, q5_1, q5_0, q4_1, q4_0, ...).
+# kv_cache_bytes_per_token is a measured escape hatch.
 #
-# api_key = "lm-studio"        # ignored by local servers; any string works
-# json_mode = "schema"         # "schema" for local llama.cpp/LM Studio;
-#                              # "object" for hosted OpenAI-compatible APIs
-#                              # (DeepSeek, OpenAI, ...), which reject schema
-# timeout = 600.0              # seconds per request
-# load_wait_seconds = 240      # how long to wait for a model to load
-# max_consecutive_failures = 3 # abort an indexing batch after N fails in a row
-
-# ===========================================================================
-# EVERY SETTING, with its default
-# ===========================================================================
-#
-# Nothing below the QUICK START block is required. It's a reference: the
-# section names are organizational only (any valid field is accepted under
-# any section), and every line is commented out. Uncomment what you want to
-# change.
-
-# --- Generation -------------------------------------------------------------
-# [generation]
-# temperature = 0.2            # raise toward 0.7 for prose; leave low for
-#                              # tool calls -- higher makes them worse
-# max_tokens_summary = 220     # budget for one summary sentence
-# max_tokens_step = 700        # budget for one tool call in the gather loop
-# max_tokens_answer = 3000     # budget for the final answer / edit reply
-#
-# Context window: what your server actually gives the model. Pedacito checks
-# every budget below against these two numbers at load time and prints a
-# warning if they cannot fit -- the usual root cause of "ran past the token
-# limit" errors. Set context_tokens to the context length configured in LM
-# Studio / Ollama / your API; profiles override both per model.
-# context_tokens = 16384       # server-side context length for this model
-# reserve_tokens = 2048        # tokens held back from the window for replies
-#
-# Optional KV-cache hints. The VRAM estimate assumes a 16-bit cache unless
-# you say otherwise; matching the runtime's cache quantization lets it use
-# the context the GPU really has. Same names LM Studio / llama.cpp / Ollama
-# use for their K/V cache types (f16, bf16, q8_0, q5_1, q5_0, q4_1, q4_0).
-# k_cache_quant = "q8_0"
-# v_cache_quant = "q5_1"
-# For a measured value instead of the estimate, use bytes per token:
-# kv_cache_bytes_per_token = 131072
-
-# Sampler parameters, merged verbatim into every /chat/completions request.
-# This is where top_k, min_p, repeat_penalty, seed, stop, and anything else
-# your local runtime accepts go -- the config has no first-class field for
-# them because the accepted set differs per server. Hosted APIs (DeepSeek,
-# OpenAI) 400 on unknown fields like top_k and min_p, so put this inside a
-# profile targeted at a specific server, not here.
-#
-# [profiles.lmstudio.sampler]
-# top_p          = 0.95
-# top_k          = 40
-# min_p          = 0.05
-# repeat_penalty = 1.1
-# seed           = -1
-
-# --- Map tiering ------------------------------------------------------------
-# [map]
-# flat_map_token_budget = 4000     # above this, switch from flat map to cards
-# file_card_line_ranges = true     # attach L11-21 to names on file cards;
-#                                  # costs a bit more, saves an outline round trip
-
 # --- Indexing ---------------------------------------------------------------
-# [indexing]
-# class_split_lines = 60           # classes shorter than this stay one chunk
-# max_unit_lines = 220             # split larger functions/methods at stmt boundaries
-# max_unit_chars = 12000           # ...or when the unit exceeds this many chars
-# max_unit_tokens = 3000           # ...or this many estimated tokens (0 = off)
-# unit_overlap_lines = 0           # context overlap for giant-statement windows
-# max_chunk_chars = 6000           # source truncated to this before summarising
-# min_lines_to_summarise = 4       # skip summarising trivially short units
-# summarise_methods = false        # true if your methods lack docstrings
-# summarise_documented = false     # true if your existing docstrings are stale
-
-# --- File selection ---------------------------------------------------------
-# [files]
-# include_references = true        # index .md/.json/.toml/... as reference files
-# extra_extensions = [".jinja", ".proto"]   # treat these as reference too
-# max_reference_bytes = 2000000    # above this, a reference file is header-only
-# summarise_references = false     # LLM summary on reference files; rarely worth it
-
-# --- Agent loop -------------------------------------------------------------
-# [agent]
-# use_project_instructions = true   # include PEDACEITO.md / AGENTS.md / CLAUDE.md
-# max_instruction_chars = 2000     # cap on that file's text in every prompt
-# max_todo_chars = 1500            # cap on the model's checklist in prompts
-# max_steps = 0                    # hard lookup limit per task; 0 = no limit
-#                                  # (the default). The gathered-source and
-#                                  # context token budgets are the intended
-#                                  # constraint. Set a positive value only if
-#                                  # you explicitly want a per-task wall.
-# max_completion_rounds = 0        # deferred-work follow-up turns; 0 = no limit
-# max_continuation_rounds = 0      # truncated-reply continuation turns;
-#                                  # 0 = no limit (the continuation char budget
-#                                  # is still enforced)
-# max_gathered_chars = 24000       # ceiling on accumulated source per task
-# max_read_lines = 200             # cap on one `read` call's line count
-# read_context_hint = true         # mid-file reads include the enclosing signature
-#                                  # and module imports when indexed
-# auto_diagnostics = false         # run detected linter/typechecker after each
-#                                  # auto task; repair rounds consume failures
-# diagnostics_timeout = 90         # seconds per diagnostic command
-# max_diagnostics_chars = 8000     # output cap fed back to the model
-# allow_mcp = false                # expose one `mcp` action for external servers
-# mcp_servers = []                 # command strings, e.g. ["python server.py"]
-# mcp_timeout = 30                 # seconds per MCP request
-# allow_write = false              # let the gather loop create/overwrite files
-#                                  # with `write`, grow them with `append`, and
-#                                  # move/delete files (skips review; prefer
-#                                  # search/replace edit blocks)
-# max_write_chars = 200000         # ceiling on one `write`/`append` result
-# max_write_lines = 120            # lines allowed in ONE write/append step;
-#                                  # keeps a single reply under the provider's
-#                                  # real per-message output limit (deepseek
-#                                  # ~8k tokens). Large files are built from
-#                                  # repeated `append` steps -- do not raise
-#                                  # this past what your API can emit.
-# allow_shell = false              # let the gather loop run ONE command per
-#                                  # step (tests/linters). Off by default: it
-#                                  # executes code in your project. Commands run
-#                                  # without a shell, so pipes/redirection and
-#                                  # `&&` do not work.
-# shell_timeout = 120              # hard seconds before a `run` is killed
-# shell_idle_seconds = 10          # stop `run` after this long with no output;
-#                                  # this is what unblocks GUI/server launches.
-#                                  # Raise it if a slow test is quiet at startup.
-# shell_allowlist = []             # optional executables allowed for `run`,
-#                                  # e.g. ["pytest", "python", "ruff"]
-# max_shell_output_chars = 8000    # command output fed back to the model
-# allow_screenshots = false        # capture the screen and return pixel
-#                                  # stats/OCR/vision text. Off by default
-#                                  # (whole-desktop capture is a privacy
-#                                  # decision). Launching a command also needs
-#                                  # allow_shell.
-# screenshot_wait_seconds = 5      # wait after launch before capturing
-# allow_browser = false            # open a URL in headless Chromium, press
-#                                  # keys/click, wait, capture the PAGE, and
-#                                  # read its text. For web games/servers a
-#                                  # desktop screenshot is not enough. Needs
-#                                  # the optional playwright extra:
-#                                  #   pip install "pedacito-local[browser]"
-#                                  #   python -m playwright install chromium
-# browser_wait_seconds = 3         # wait after actions before capturing
-# browser_server_wait_seconds = 15 # wait for a launched server to print a URL
-# browser_headless = true          # no visible browser window
-# browser_timeout_seconds = 20     # navigation/action timeout
-# vision_model = ""                # multimodal model id for screenshot
-#                                  # descriptions (empty = stats/OCR only)
-# vision_max_tokens = 400
-# semantic_search = false          # `grep` falls back to meaning-based search
-#                                  # via the server's /v1/embeddings when no
-#                                  # text match is found. Needs an embedding
-#                                  # model; results are cached per unit.
-# embedding_model = ""             # embedding model id (empty = chat model)
-# semantic_top_k = 5               # semantic matches returned per query
-# semantic_min_score = 0.2         # cosine similarity floor for a match
-# allow_diff = true                # read-only `diff` action: working tree vs
-#                                  # Pedacito's pre-write snapshots. Set false
-#                                  # to shrink the tool surface by one action.
-# compact_step_schema = false      # EXPERIMENTAL: only `action`+`reasoning`
-#                                  # required per gather step, so unused
-#                                  # fields may be omitted (saves ~20-40
-#                                  # output tokens per step); measure it on
-#                                  # your server before enabling
-# allow_rename = true              # treat "create new path + empty old path"
-#                                  # block pairs as real renames (old file is
-#                                  # deleted); set false to never auto-delete
-# repair_rounds = 2                # re-anchor attempts per failed edit block
-
-# --- Project scaffolding (`pedacito new`) -----------------------------------
-# [scaffold]
-# max_new_files = 24               # cap on how many files a plan may propose
-# max_spec_chars = 60000           # spec documents longer than this are cut
-# max_tokens_plan = 2000           # budget for the planning call (raise for
-#                                  # thinking models -- their <think> block
-#                                  # counts against this)
-# max_tokens_build = 8000          # budget for each per-file build pass
-
-# --- Autonomous loop (`pedacito auto`) ---------------------------------------
-# The Ralph-loop outer loop: break a goal into a checklist (PLAN.md), then
-# implement each task in a fresh context window until the list is empty.
-# [auto]
-# auto_plan_file = "PLAN.md"       # plan file name in the project root
-# auto_verify = ""                 # shell command run after each task
-#                                  # ("pytest -q"); a failure feeds back for repair
-# auto_max_tasks = 0               # cap on tasks per run; 0 = run to completion
-# auto_max_minutes = 0             # wall-clock cap per auto run; 0 = no limit
-#                                  # (checked between tasks, not mid-task)
-# auto_repair_rounds = 2           # fix rounds per failing verification
-# auto_split_lines = 120           # split a source file whose stub is longer
-#                                  # than this into several implementation tasks
-# auto_install_deps = false        # when --verify fails on a missing module,
-#                                  # pip-install it and retry (opt-in)
-# auto_smoke = true                # after a --complex build, run main.py once
-#                                  # (a process still running at the timeout
-#                                  # counts as started); failures are repaired
-# auto_smoke_timeout = 20          # seconds before a smoke run is treated as
-#                                  # "started successfully"
-# auto_verify_rounds = 2           # repair rounds for a failing runtime check
-
-# --- Reasoning models -------------------------------------------------------
-# Qwen3 and friends emit a <think> block by default. Pedacito strips it
-# either way, but generating it still costs tokens and time. Both switches
-# are provided because which one a given model honours varies; setting both
-# is harmless.
+# max_unit_lines / max_unit_chars / max_unit_tokens split oversized functions,
+# methods, classes, and preambles into name#2, name#3, ... parts.
+# unit_overlap_lines adds context to giant-statement line windows.
+# max_chunk_chars caps source sent to the summariser.
+# min_lines_to_summarise avoids spending a call on tiny units.
+# summarise_methods / summarise_documented re-enable summaries the defaults
+# skip to save time.
+# include_references indexes .md/.json/.toml/.yaml/.sql/.sh and similar files
+# structurally; extra_extensions adds more.
+# semantic_search is opt-in and needs an embeddings-capable server.
+# embedding_model empty means "use the chat model".
 #
-# [reasoning]
-# disable_thinking = false         # sends chat_template_kwargs {"enable_thinking": false}
-# thinking_suffix = ""             # appends a token like "/no_think" to the prompt
-
-# --- Editing ----------------------------------------------------------------
-# [editing]
-# backup = true                    # snapshot originals before writing;
-#                                  # `pedacito restore` puts them back
-# log_sessions = true              # write a session record per task
-
-# --- Review page ------------------------------------------------------------
-# [review]
-# review = false                   # always open the side-by-side reviewer
-# review_port = 0                  # 0 lets the OS pick a free port
-# open_browser = true              # false prints the URL instead of launching
-# review_timeout = 1800            # seconds before an unanswered review expires
-
-# --- Workspace --------------------------------------------------------------
-# [workspace]
-# manage_gitignore = true          # add .pedacito/ to .gitignore on first run
-# create_ignore_file = true        # create a starter .pedacitoignore
-
-# ===========================================================================
-# PROFILES -- one per server, or one per model, each with its own token limits
-# ===========================================================================
+# --- Agent loop and tool opt-ins --------------------------------------------
+# max_steps 0 means no lookup limit; token budgets are the intended bound.
+# max_gathered_chars caps accumulated source per task.
+# max_read_lines caps one `read` call.
+# read_context_hint adds the enclosing signature and module imports to a
+# mid-file read.
+# use_project_instructions includes PEDACEITO.md / AGENTS.md / CLAUDE.md.
+# allow_write enables write/append/move/delete during gather.
+# allow_shell enables run/diagnose; commands execute without a shell.
+# allow_screenshots enables desktop capture; allow_browser enables headless
+# page capture. Both are privacy/trust decisions and are off by default.
+# allow_diff keeps the read-only `diff` action.
+# allow_rename treats create-new + clear-old blocks as a real move.
+# compact_step_schema is experimental: drops unused fields from step replies.
+# auto_diagnostics runs the detected linter/typechecker after each auto task.
+# allow_mcp exposes one `mcp` action and a short tool catalog; mcp_servers is
+# a list of command strings such as ["python server.py"].
+# auto_plan_file / auto_verify / auto_* configure `pedacito auto`.
 #
-# A profile overrides any setting in this file, not just model. Select with
-# --profile NAME, /profile inside chat, PEDACITO_PROFILE in the shell, or
-# default_profile below. The token budgets below are generated from the four
-# tier presets (see the top of this file); edit any line to deviate from
-# your tier, or uncomment `tier =` to inherit the preset instead of spelling
-# it out.
+# --- Review, workspace, and backups ----------------------------------------
+# backup snapshots originals before writes; `pedacito restore` restores them.
+# log_sessions writes .pedacito/sessions/*.md.
+# review/review_port/open_browser/review_timeout control the side-by-side page.
+# manage_gitignore/create_ignore_file control first-run workspace scaffolding.
 #
-# On a local server the server's own configured context length is what
-# auto-fit fits these token budgets to; the VRAM estimate only warns when
-# the KV cache will spill to system RAM. A value you write here always wins
-# over both.
-#
-# default_profile = "local27"
-
-# Small local model (~9B): everything stays inside an 8k context window at
-# ~25 tok/s. json_mode "schema" (the default) is grammar-enforced by
-# llama.cpp / LM Studio, so a tool call always parses.
-#
-# [profiles.small9b]
-# # tier = "small"
-# base_url = "http://localhost:1234/v1"
-# model    = "qwen3-8b"
-# api_key  = "lm-studio"
-# max_tokens_summary = 160
-# max_tokens_step    = 500
-# max_steps          = 0
-# repair_rounds      = 1
-# max_tokens_answer  = 1500
-# max_tokens_plan    = 1200
-# max_tokens_build   = 4000
-# flat_map_token_budget = 1500
-# max_gathered_chars = 12000
-# max_read_lines     = 120
-# max_spec_chars     = 20000
-# max_new_files      = 12
-# context_tokens     = 8192
-# reserve_tokens     = 2048
-# disable_thinking   = true
-# thinking_suffix    = "/no_think"
-#
-# [profiles.small9b.sampler]
-# top_p          = 0.95
-# top_k          = 40
-# repeat_penalty = 1.1
-
-# Mid local model (~14B/27B). The spelled-out values are the "medium" preset.
-#
-# [profiles.local27]
-# # tier = "medium"
-# base_url = "http://localhost:1234/v1"
-# model    = "google/gemma-3-27b"
-# max_tokens_summary = 240
-# max_tokens_step    = 1500
-# max_steps          = 0
-# repair_rounds      = 2
-# max_tokens_answer  = 8000
-# max_tokens_plan    = 5000
-# max_tokens_build   = 16000
-# flat_map_token_budget = 6000
-# max_gathered_chars = 48000
-# max_read_lines     = 200
-# max_spec_chars     = 60000
-# max_new_files      = 24
-# context_tokens     = 32768
-# reserve_tokens     = 4096
-
-# Big local rig (35B+ with roomy context). The "large" preset.
-#
-# [profiles.local35]
-# # tier = "large"
-# base_url = "http://localhost:1234/v1"
-# model    = "qwen3-32b"        # or a 70B on a multi-GPU rig
-# max_tokens_summary = 320
-# max_tokens_step    = 2500
-# max_steps          = 0
-# repair_rounds      = 2
-# max_tokens_answer  = 12000
-# max_tokens_plan    = 8000
-# max_tokens_build   = 24000
-# flat_map_token_budget = 8000
-# max_gathered_chars = 60000
-# max_read_lines     = 300
-# max_spec_chars     = 120000
-# max_new_files      = 40
-# context_tokens     = 65536
-# reserve_tokens     = 8192
-
-# Hosted DeepSeek. json_mode "object" is REQUIRED for hosted APIs -- they
-# reject the json_schema Pedacito sends by default, and the gather loop
-# fails on its first step without it. You normally do not have to write it:
-# pedacito auto-detects api.deepseek.com (or any remote host) and switches
-# to "object" itself; "json_object" / "json" are accepted spellings too.
-# An API affords far higher limits than a small local model -- these are
-# the "hosted" preset values.
-#
-# [profiles.deepseek]
-# # tier = "hosted"
-# base_url  = "https://api.deepseek.com/v1"
-# model     = "deepseek-chat"
-# api_key   = "sk-..."
-# json_mode = "object"
-# timeout   = 120.0
-# max_tokens_summary = 400
-# max_tokens_step    = 7000
-# max_steps          = 0
-# repair_rounds      = 3
-# max_tokens_answer  = 40000
-# max_tokens_plan    = 8000
-# max_tokens_build   = 32000
-# flat_map_token_budget = 12000
-# max_gathered_chars = 100000
-# max_read_lines     = 400
-# max_spec_chars     = 200000
-# max_new_files      = 60
-# context_tokens     = 128000
-# reserve_tokens     = 16384
-#
-# [profiles.deepseek.sampler]
-# top_p            = 0.95
-# presence_penalty = 0.0
-# Note: no top_k or min_p here. DeepSeek 400s on those.
-
-# Reasoning model. Thinking off is faster and cheaper at ~25 tok/s, and the
-# two ways to ask cover models that honour only one of them. The "large"
-# tier preset underneath gives thinking output room; max_tokens_answer is
-# then raised further because reasoning burns budget on the <think> block.
-#
-# [profiles.qwen-thinking]
-# tier = "large"
-# model = "qwen/qwen3-32b"
-# disable_thinking = true
-# thinking_suffix = "/no_think"
-# max_tokens_answer = 10000    # thinking needs headroom beyond the preset
+# --- Profiles ---------------------------------------------------------------
+# A profile overrides any setting in [universal], [indexing], or [agent].
+# `tier` is a shortcut that applies a preset (small, medium, large, hosted)
+# underneath the keys you write explicitly. Without `tier`, Pedacito guesses
+# from the model name; set tier = "" to disable guessing.
 '''
 
 
@@ -2294,11 +2120,12 @@ def interactive_setup(path: Path | None = None, force: bool = False,
     """Build a working config file step by step, then validate it.
 
     Asks where the model lives, which model, whether it is a hosted API, and
-    the server machine's VRAM, then writes a minimal file: base_url, model,
-    vram_gb, and a tier -- the settings that are genuinely mandatory. Existing
-    files are backed up to <path>.bak rather than silently overwritten. Raises
-    ConfigError on bad answers; the written file is load()-checked before
-    returning."""
+    the server machine's VRAM, then writes the profile-based starter with your
+    values in [profiles.default]: the universal/indexing/agent sections, every
+    commented profile override, and the local/hosted examples stay as
+    reference. Existing files are backed up to <path>.bak rather than silently
+    overwritten. Raises ConfigError on bad answers; the written file is
+    load()-checked before returning."""
     import sys
     out = stdout or sys.stdout
     def say(s=""):
@@ -2379,18 +2206,31 @@ def interactive_setup(path: Path | None = None, force: bool = False,
         raise ConfigError(f"tier must be one of {', '.join(PRESET_TIERS)}, got {tier!r}")
 
     lines = [
-        "# Written by `pedacito config --setup`.",
-        "# Mandatory: base_url, model, and the server machine's VRAM.",
-        "# See `pedacito config --reference` for every other knob.",
-        f'base_url = "{base_url}"',
-        f'model    = "{model}"',
-        f'vram_gb  = {vram_gb}',
-        f'tier     = "{tier}"',
+        'default_profile = "default"',
+        "",
+        "[profiles.default]",
+        f"base_url = {_toml_literal(base_url)}",
+        f"model    = {_toml_literal(model)}",
+        f"tier     = {_toml_literal(tier)}",
     ]
     if api_key:
-        lines.insert(5, f'api_key       = "{api_key}"')
-        lines.insert(6, 'json_mode     = "object"   # hosted APIs lack llama.cpp schemas')
-    body = "\n".join(lines) + "\n"
+        lines.append(f"api_key  = {_toml_literal(api_key)}")
+    if hosted:
+        lines.append('json_mode = "object"   # hosted APIs lack llama.cpp schemas')
+    body = TEMPLATE.replace(
+        '''[profiles.default]
+# The fallback profile. Replace these with your server and model.
+base_url = "http://localhost:1234/v1"
+model    = "google/gemma-3-27b"
+''',
+        "[profiles.default]\n" + "\n".join(lines[3:]) + "\n")
+    # VRAM is a shared hardware setting now: update [universal], not the
+    # profile. The exact active line only exists once in the template.
+    body = body.replace("vram_gb = 8\n", f"vram_gb = {vram_gb}\n", 1)
+    # If the template shape ever changes, still write a valid profile-based
+    # file rather than silently leaving the generic defaults in place.
+    if body == TEMPLATE:
+        body = "\n".join(lines) + f"\n\n[universal]\nvram_gb = {vram_gb}\n"
 
     # Validate BEFORE touching the user's file: parse exactly as load() will.
     probe = p.with_suffix(".toml.setup-probe") if p.parent.exists() else \

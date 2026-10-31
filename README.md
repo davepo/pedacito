@@ -121,20 +121,37 @@ pedacito config --init
 writes a starter config to `~/.config/pedacito/config.toml` (Linux/macOS) or
 `%APPDATA%\pedacito\config.toml` (Windows) — `pedacito config` always prints the
 exact path it uses. `pedacito config --setup` builds it interactively, finding
-LM Studio or Ollama for you. The three settings that matter:
+LM Studio or Ollama for you. The file is profile-based:
+
+- `[universal]` — optional connection, generation, review, and workspace defaults
+- `[indexing]` — chunking, retrieval, and semantic-search defaults
+- `[agent]` — tool opt-ins, budgets, and autonomous-loop settings
+- `[profiles.default]` — the fallback server/model, used when no profile is named
+
+The mandatory connection settings live in `[profiles.default]`:
 
 ```toml
+[profiles.default]
 base_url = "http://localhost:1234/v1"   # or :11434/v1 for Ollama
 model    = "your-model-id"              # exact id/name the server reports
-vram_gb  = 8                            # GPU VRAM on the model server, in GB
+```
+
+`vram_gb` is a shared hardware setting in `[universal]`; set it once there, or
+override it inside a profile only if that model runs on a different GPU:
+
+```toml
+[universal]
+vram_gb = 8                             # GPU VRAM on the model server, in GB
 ```
 
 `vram_gb` is mandatory for local servers (Pedacito uses it, plus the model's
 file size, to size the context window); hosted configs don't need it. Settings
 resolve in layers, each overriding the one before: built-in defaults → your
 user config → the project's `.pedacito.toml` → `--config FILE` → a selected
-`--profile` → command-line flags. `[server]` and `[lmstudio]` are both accepted
-as section names for the connection settings.
+`--profile` → command-line flags. `[server]` and `[lmstudio]` are still accepted
+as aliases for connection settings. Every profile-overridable key is listed
+commented in `[profiles.default]`; the starter also includes fully commented
+local-Qwen and hosted-DeepSeek examples.
 
 Run `pedacito config` with no arguments to see every resolved setting and which
 layer set it; typos are rejected with a suggestion. State for each project lives
@@ -631,7 +648,7 @@ ones:
 |---|---|---|
 | `base_url` | `http://localhost:1234/v1` | Server address. |
 | `model` | `google/gemma-3-27b` | Exact id/name the server reports. |
-| `vram_gb` | *(mandatory)* | GPU VRAM on the machine running the model (local only). |
+| `vram_gb` | *(mandatory for local)* | GPU VRAM in `[universal]`; a profile can override it for a different GPU. |
 | `k_cache_quant` / `v_cache_quant` | `""` | K/V cache quantization the runtime loaded (e.g. `q8_0`, `q5_1`); refines the VRAM estimate. |
 | `kv_cache_bytes_per_token` | 0 | Measured KV-cache bytes per token; bypasses the estimate. 0 = estimate. |
 | `context_tokens` | auto | Server-side window. Set explicitly when detection reports a stale default; profiles override it. |

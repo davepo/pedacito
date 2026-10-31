@@ -212,9 +212,8 @@ def _cmd_config(args, cfg) -> int:
     otherwise show every resolved setting and which file/profile set it,
     and with --check, verify the LM Studio connection and model."""
     if getattr(args, "reference", False):
-        # The full annotated template: every knob, documented. Kept separate
-        # from the short starter file that --init writes so first-run users
-        # are not handed a 300-line wall of comments.
+        # The full annotated template. The starter is already profile-based
+        # and lists every opt-in; --reference appends the longer explanations.
         target = Path(args.path) if args.path else None
         if target is not None:
             try:
@@ -235,8 +234,9 @@ def _cmd_config(args, cfg) -> int:
             print(f"{e}", file=sys.stderr)
             return 2
         print(f"Wrote {path}", file=sys.stderr)
-        print("Mandatory settings: base_url, model and vram_gb (top of the\n"
-              "file). Everything else has a working default -- see\n"
+        print("Mandatory settings: base_url, model and vram_gb in "
+              "[profiles.default].\n"
+              "Everything else has a working default -- see\n"
               "`pedacito config --reference` for the annotated full list, or run\n"
               "`pedacito config --setup` to have it built and tested interactively.\n"
               "Then: pedacito config --check", file=sys.stderr)
