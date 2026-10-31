@@ -53,6 +53,7 @@ for how it is used in the gather loop.
 from __future__ import annotations
 
 import fnmatch
+import json
 import os
 import re
 import shlex
@@ -75,6 +76,11 @@ outline  - list every unit in one file, or the file cards in one directory.
            args: file (a path, a symbol, or a directory/glob)
 sessions - list/search what prior runs did.  args: pattern, optional file
 diff     - what changed since Pedacito's last snapshot. args: optional file
+diagnose - run the project's detected linter/typechecker. args: optional file
+todo     - replace the task checklist shown in later prompts. args: content
+           (one "- [ ]" / "- [x]" line per step; keep it short)
+mcp      - call an external MCP tool (opt-in). args: symbol (server/tool or
+           "server" to list), content (JSON arguments object)
 write    - overwrite a whole file with text. args: file, content
 append   - add text to the END of a file.    args: file, content
 move     - rename/move one file.             args: file (old), to (new)
@@ -92,7 +98,8 @@ browser  - open a web page in headless Chromium, interact, wait, capture it.
            start (seconds to wait), optional file (old shot to compare)
            (needs allow_browser; launching a command also needs allow_shell)
            (a desktop screenshot cannot see a page that was never opened)
-           (write/append/move/delete need allow_write; run needs allow_shell)
+           (write/append/move/delete need allow_write; run and diagnose need
+            allow_shell; mcp needs allow_mcp)
 done     - stop gathering; you have enough.  args: none"""
 
 # Field order is load-bearing. Grammar-constrained decoding emits keys in schema
@@ -106,8 +113,8 @@ STEP_SCHEMA = {
         "action": {
             "type": "string",
             "enum": ["read", "grep", "callers", "outline", "sessions",
-                     "diff", "write", "append", "move", "delete", "run",
-                     "screenshot", "browser", "done"],
+                     "diff", "diagnose", "write", "append", "move", "delete",
+                     "run", "screenshot", "browser", "todo", "mcp", "done"],
         },
         "file": {"type": "string",
                  "description": "For read/write/append/move/delete. For "
@@ -146,7 +153,9 @@ STEP_SCHEMA = {
                     "maxLength": 2000},
         "symbol": {"type": "string",
                    "description": "For callers; or for read when file is empty "
-                                  "(reads that definition). Empty otherwise.",
+                                  "(reads that definition). For mcp: "
+                                  "server/tool, or server to list its tools. "
+                                  "Empty otherwise.",
                    "maxLength": 200},
         "to": {"type": "string",
                "description": "For move: the new path. Empty otherwise.",
@@ -160,7 +169,9 @@ STEP_SCHEMA = {
         "content": {"type": "string",
                     "description": "For write/append: at most ~120 lines of file "
                                    "text (large files are built chunk by chunk over "
-                                   "several steps). Empty otherwise.",
+                                   "several steps). For todo: the full checklist, "
+                                   "one '- [ ]'/'- [x]' line per step. For mcp: "
+                                   "a JSON object of tool arguments. Empty otherwise.",
                     "maxLength": 6000},
         "reasoning": {
             "type": "string",
@@ -187,8 +198,9 @@ STEP_SCHEMA = {
 
 # The action list is kept in one place so the schema, the gate in `dispatch`,
 # and the prompt help cannot drift apart.
-ACTIONS = ("read", "grep", "callers", "outline", "sessions", "diff", "write",
-           "append", "move", "delete", "run", "screenshot", "browser", "done")
+ACTIONS = ("read", "grep", "callers", "outline", "sessions", "diff",
+           "diagnose", "write", "append", "move", "delete", "run",
+           "screenshot", "browser", "todo", "mcp", "done")
 WRITE_ACTION = "write"
 APPEND_ACTION = "append"
 MOVE_ACTION = "move"
@@ -197,6 +209,9 @@ RUN_ACTION = "run"
 SCREENSHOT_ACTION = "screenshot"
 BROWSER_ACTION = "browser"
 DIFF_ACTION = "diff"
+DIAGNOSE_ACTION = "diagnose"
+TODO_ACTION = "todo"
+MCP_ACTION = "mcp"
 WRITE_ACTIONS = (WRITE_ACTION, APPEND_ACTION)
 MUTATING_ACTIONS = WRITE_ACTIONS + (MOVE_ACTION, DELETE_ACTION)
 
@@ -213,17 +228,19 @@ def schema_for(cfg) -> dict:
     """
     import copy
 
-    actions = ["read", "grep", "callers", "outline", "sessions"]
+    actions = ["read", "grep", "callers", "outline", "sessions", "todo"]
     if getattr(cfg, "allow_diff", True):
         actions.append("diff")
+    if getattr(cfg, "allow_shell", False):
+        actions += ["run", "diagnose"]
     if getattr(cfg, "allow_write", False):
         actions += ["write", "append", "move", "delete"]
-    if getattr(cfg, "allow_shell", False):
-        actions.append("run")
     if getattr(cfg, "allow_screenshots", False):
         actions.append("screenshot")
     if getattr(cfg, "allow_browser", False):
         actions.append("browser")
+    if getattr(cfg, "allow_mcp", False):
+        actions.append("mcp")
     actions.append("done")
 
     schema = copy.deepcopy(STEP_SCHEMA)
@@ -232,7 +249,9 @@ def schema_for(cfg) -> dict:
                 "reasoning"]
     drop = set()
     if not getattr(cfg, "allow_write", False):
-        drop |= {"content", "to"}
+        # `content` stays: the always-available todo action uses it. `to` is
+        # only ever used by move.
+        drop.add("to")
     if not (getattr(cfg, "allow_shell", False)
             or getattr(cfg, "allow_screenshots", False)
             or getattr(cfg, "allow_browser", False)):
@@ -1072,6 +1091,12 @@ def tool_callers(index, symbol: str) -> str:
             out.append(f"  (+{len(callers) - 20} more callers)")
     elif defs:
         out.append(f"No callers of '{symbol}' found in the indexed files.")
+        importers = index.importers_of(defs[0].file)
+        if importers:
+            out.append("Imported by (no direct bare-name call found):")
+            out += [f"  {f}" for f in importers[:12]]
+            if len(importers) > 12:
+                out.append(f"  (+{len(importers) - 12} more)")
     else:
         return _symbol_hint(index, symbol)
     return "\n".join(out)
@@ -1295,6 +1320,70 @@ def tool_diff(index, cfg, file: str = "") -> str:
                    + ", ".join(skipped[:8])
                    + "; `diff` one with file=<path>]")
     return "\n\n".join([head] + out)
+
+
+def tool_todo(index, cfg, content: str = "") -> str:
+    """Read or replace the task checklist shown in later prompts.
+
+    The answer phase has no tools, so a checklist the model writes during
+    gathering is the only way its own sub-steps survive into the final turn.
+    Kept in `.pedacito/todo.md`, capped, and cleared at the start of each task.
+    """
+    from . import todo as todo_mod
+    text = _as_text(content).strip()
+    if not text:
+        current = todo_mod.read(index.root)
+        return ("CURRENT CHECKLIST:\n" + current if current else
+                "No checklist is set. Pass content with one '- [ ]' / "
+                "'- [x]' line per step to create one.")
+    saved = todo_mod.write(index.root, text)
+    if not saved:
+        return "ERROR: could not write the checklist under .pedacito/."
+    return "CHECKLIST UPDATED:\n" + saved
+
+
+def tool_diagnose(index, cfg, file: str = "") -> str:
+    """Run the project's detected linter/typechecker, optionally on one file.
+
+    Detection and command choice live in diagnostics.py; this tool only
+    supplies the project root and an optional target. Gated by allow_shell
+    because it executes local programs.
+    """
+    if not getattr(cfg, "allow_shell", False):
+        return ("ERROR: `diagnose` is disabled (config allow_shell = false). "
+                "Enable allow_shell to let Pedacito run the project's linter/"
+                "typechecker, or run the check yourself.")
+    from . import diagnostics
+    rel = ""
+    if _as_text(file).strip():
+        rel = index.resolve_file(_as_text(file)) or _root_rel(index, file) or ""
+        if not rel:
+            return f"ERROR: refusing to diagnose outside the project root: {file}"
+    ok, report = diagnostics.run_changed(
+        index.root, cfg, [rel] if rel else None)
+    if ok and not rel:
+        return report + "\n[No blocking diagnostics.]"
+    if ok:
+        return report + f"\n[No blocking diagnostics in {rel}.]"
+    return report + "\n[Fix these before claiming the task is complete.]"
+
+
+def tool_mcp(index, cfg, symbol: str = "", content: str = "") -> str:
+    """Invoke one opt-in MCP tool, or list the configured catalog."""
+    if not getattr(cfg, "allow_mcp", False):
+        return "ERROR: MCP is disabled (config allow_mcp = false)."
+    from . import mcp
+    target = _as_text(symbol).strip()
+    args = {}
+    raw = _as_text(content).strip()
+    if raw:
+        try:
+            args = json.loads(raw)
+        except ValueError as e:
+            return f"ERROR: mcp content must be a JSON object ({e})."
+        if not isinstance(args, dict):
+            return "ERROR: mcp content must be a JSON object."
+    return mcp.call(cfg, target, args)
 
 
 def _snapshot(index, cfg, rel: str, path: Path, original: str = "",
@@ -2099,6 +2188,13 @@ def dispatch(index, cfg, step: dict, client=None) -> str:
                              step.get("end", 0))
     if action == DIFF_ACTION:
         return tool_diff(index, cfg, step.get("file", ""))
+    if action == DIAGNOSE_ACTION:
+        return tool_diagnose(index, cfg, step.get("file", ""))
+    if action == TODO_ACTION:
+        return tool_todo(index, cfg, step.get("content", ""))
+    if action == MCP_ACTION:
+        return tool_mcp(index, cfg, step.get("symbol", ""),
+                        step.get("content", ""))
     if action == RUN_ACTION:
         return tool_run(index, cfg, step.get("command", ""))
     if action == SCREENSHOT_ACTION:

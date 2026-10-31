@@ -170,6 +170,14 @@ class Config:
     # max_gathered_chars) or is never read at all.
     max_unit_lines: int = 220
     max_unit_chars: int = 12000
+    # Extra token-budget guard (rough 3.6 chars/token estimate), useful at
+    # small context sizes where 12k chars is already a large fraction of the
+    # window. 0 disables the token check.
+    max_unit_tokens: int = 3000
+    # When a single giant statement (a huge dict/list literal) has to fall back
+    # to line windows, the next window repeats this many lines for context.
+    # 0 keeps windows disjoint; statement-boundary splits never overlap.
+    unit_overlap_lines: int = 0
     # Chunks larger than this get their source truncated before summarising.
     max_chunk_chars: int = 6000
     # Skip summarising trivially short chunks; the signature says enough.
@@ -202,6 +210,8 @@ class Config:
     # automatic context.
     use_project_instructions: bool = True
     max_instruction_chars: int = 2000
+    # Cap on the model's own checklist when it is injected into a prompt.
+    max_todo_chars: int = 1500
     # Hard lookup limit for the gather phase. 0 (the default) means NO step
     # limit: the gathered-source/token budget and the model's `done` are the
     # only bounds. Set a positive value only when you explicitly want a
@@ -225,6 +235,21 @@ class Config:
     # mid-file. Both are already in the index; this saves a round trip to the
     # file head for small models without changing what is on disk.
     read_context_hint: bool = True
+    # Run the project's detected linter/type checker after each `auto` task
+    # (when no --verify command is configured) and feed failures into the
+    # existing repair rounds. Off by default: a linter may report pre-existing
+    # issues unrelated to the task; enable it for a project whose checker is
+    # clean. The `diagnose` tool is separately available whenever
+    # allow_shell is on.
+    auto_diagnostics: bool = False
+    diagnostics_timeout: int = 90
+    max_diagnostics_chars: int = 8000
+    # Optional MCP client. Off by default: arbitrary external tools are a large,
+    # unpredictable surface for a small model. When on, one `mcp` action is
+    # exposed and a short tool catalog is injected into the prompt.
+    allow_mcp: bool = False
+    mcp_servers: tuple[str, ...] = ()
+    mcp_timeout: int = 30
     # Let the gather loop create/overwrite whole files via `write`, grow them
     # with `append`, and rename/remove them with `move`/`delete`. Off by
     # default: a mid-gather write skips the edit path's syntax check and
@@ -1923,6 +1948,8 @@ vram_gb  = 8                   # MANDATORY for local servers: GPU VRAM in GB
 # class_split_lines = 60           # classes shorter than this stay one chunk
 # max_unit_lines = 220             # split larger functions/methods at stmt boundaries
 # max_unit_chars = 12000           # ...or when the unit exceeds this many chars
+# max_unit_tokens = 3000           # ...or this many estimated tokens (0 = off)
+# unit_overlap_lines = 0           # context overlap for giant-statement windows
 # max_chunk_chars = 6000           # source truncated to this before summarising
 # min_lines_to_summarise = 4       # skip summarising trivially short units
 # summarise_methods = false        # true if your methods lack docstrings
@@ -1939,6 +1966,7 @@ vram_gb  = 8                   # MANDATORY for local servers: GPU VRAM in GB
 # [agent]
 # use_project_instructions = true   # include PEDACEITO.md / AGENTS.md / CLAUDE.md
 # max_instruction_chars = 2000     # cap on that file's text in every prompt
+# max_todo_chars = 1500            # cap on the model's checklist in prompts
 # max_steps = 0                    # hard lookup limit per task; 0 = no limit
 #                                  # (the default). The gathered-source and
 #                                  # context token budgets are the intended
@@ -1952,6 +1980,13 @@ vram_gb  = 8                   # MANDATORY for local servers: GPU VRAM in GB
 # max_read_lines = 200             # cap on one `read` call's line count
 # read_context_hint = true         # mid-file reads include the enclosing signature
 #                                  # and module imports when indexed
+# auto_diagnostics = false         # run detected linter/typechecker after each
+#                                  # auto task; repair rounds consume failures
+# diagnostics_timeout = 90         # seconds per diagnostic command
+# max_diagnostics_chars = 8000     # output cap fed back to the model
+# allow_mcp = false                # expose one `mcp` action for external servers
+# mcp_servers = []                 # command strings, e.g. ["python server.py"]
+# mcp_timeout = 30                 # seconds per MCP request
 # allow_write = false              # let the gather loop create/overwrite files
 #                                  # with `write`, grow them with `append`, and
 #                                  # move/delete files (skips review; prefer

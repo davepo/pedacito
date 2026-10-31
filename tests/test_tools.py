@@ -64,8 +64,10 @@ def _index(tmp_path: Path, files: dict[str, str] | None = None) -> Index:
 def test_schema_hides_disabled_actions_and_fields():
     plain = tools.schema_for(Config())
     assert plain["properties"]["action"]["enum"] == [
-        "read", "grep", "callers", "outline", "sessions", "diff", "done"]
-    assert "content" not in plain["properties"]
+        "read", "grep", "callers", "outline", "sessions", "todo",
+        "diff", "done"]
+    # `content` stays because the always-available todo action uses it.
+    assert "content" in plain["properties"]
     assert "to" not in plain["properties"]
     assert "command" not in plain["properties"]
 
@@ -81,7 +83,8 @@ def test_schema_hides_disabled_actions_and_fields():
     # The load-bearing field ORDER must survive: args before reasoning, so a
     # truncated reply still salvages to a complete action.
     assert list(cschema["properties"]) == [
-        "action", "file", "start", "end", "pattern", "symbol", "reasoning"]
+        "action", "file", "start", "end", "pattern", "symbol", "content",
+        "reasoning"]
 
     write_only = Config()
     write_only.allow_write = True
@@ -95,9 +98,10 @@ def test_schema_hides_disabled_actions_and_fields():
     shell_only.allow_shell = True
     sschema = tools.schema_for(shell_only)
     assert "run" in sschema["properties"]["action"]["enum"]
+    assert "diagnose" in sschema["properties"]["action"]["enum"]
     assert "write" not in sschema["properties"]["action"]["enum"]
     assert "command" in sschema["required"]
-    assert "content" not in sschema["properties"]
+    assert "content" in sschema["properties"]
 
     cfg = Config()
     cfg.allow_write = True
@@ -113,7 +117,7 @@ def test_schema_hides_disabled_actions_and_fields():
     assert "screenshot" in shschema["properties"]["action"]["enum"]
     assert "run" not in shschema["properties"]["action"]["enum"]
     assert "command" in shschema["required"]
-    assert "content" not in shschema["properties"]
+    assert "content" in shschema["properties"]
 
 
 def test_gather_has_no_default_step_cap(tmp_path):
@@ -363,6 +367,16 @@ def test_callers_shows_call_sites_and_callees(tmp_path):
     run = tools.tool_callers(idx, "run")
     assert "Calls (indexed definitions):" in run
     assert "Server:" in run and "start:" in run
+
+
+def test_callers_falls_back_to_cross_file_importers(tmp_path):
+    idx = _index(tmp_path, {
+        "pkg/app.py": "def helper():\n    return 1\n",
+        "pkg/other.py": "from pkg.app import helper\nx = 1\n",
+    })
+    obs = tools.tool_callers(idx, "helper")
+    assert "No callers" in obs
+    assert "Imported by" in obs and "pkg/other.py" in obs
 
 
 def test_append_creates_then_grows_a_file(tmp_path):
@@ -1243,7 +1257,7 @@ def test_browser_schema_is_hidden_until_enabled():
     schema = tools.schema_for(cfg)
     assert "browser" in schema["properties"]["action"]["enum"]
     assert "command" in schema["required"]
-    assert "content" not in schema["properties"]
+    assert "content" in schema["properties"]
 
 
 def test_browser_server_url_detection_and_action_parser():

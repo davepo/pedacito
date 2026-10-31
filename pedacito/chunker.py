@@ -173,29 +173,64 @@ def _imports(tree: ast.Module) -> list[str]:
     return out
 
 
+def _estimate_tokens(text: str) -> int:
+    """Rough code-token estimate (same 3.6 chars/token ratio as llm.py)."""
+    return int(len(text) / 3.6) + 1
+
+
 def _fits(lines: list[str], start: int, end: int,
-          max_lines: int, max_chars: int) -> bool:
+          max_lines: int, max_chars: int, max_tokens: int = 0) -> bool:
     """True when a 1-based inclusive line range fits the retrieval budget."""
     if end - start + 1 > max_lines:
         return False
-    return len(_slice(lines, start, end)) <= max_chars
+    text = _slice(lines, start, end)
+    if len(text) > max_chars:
+        return False
+    return not (max_tokens and _estimate_tokens(text) > max_tokens)
+
+
+def _window_parts(lines: list[str], first_line: int, last_line: int,
+                  max_lines: int, max_chars: int, max_tokens: int,
+                  overlap: int) -> list[tuple[int, int, list]] | None:
+    """Last-resort line windows for one oversized statement.
+
+    A single 5,000-line dict literal cannot be split at a statement boundary.
+    Line windows are not independently parseable, but they are a better
+    retrieval unit than one chunk that the model will never read. `overlap`
+    gives the next window a few lines of context.
+    """
+    parts: list[tuple[int, int, list]] = []
+    start = first_line
+    while start <= last_line:
+        end = start
+        while end < last_line and _fits(lines, start, end + 1, max_lines,
+                                        max_chars, max_tokens):
+            end += 1
+        parts.append((start, end, []))
+        if end >= last_line:
+            break
+        start = max(start + 1, end + 1 - max(0, overlap))
+    return parts if len(parts) > 1 else None
 
 
 def _split_statements(statements: list, lines: list[str], first_line: int,
                       last_line: int, max_lines: int,
-                      max_chars: int) -> list[tuple[int, int, list]] | None:
+                      max_chars: int, max_tokens: int = 0,
+                      overlap_lines: int = 0
+                      ) -> list[tuple[int, int, list]] | None:
     """Group top-level statements into retrieval-sized parts.
 
-    Returns None when the whole span already fits or cannot be split. Each
-    part is (start, end, statements). Parts are contiguous: comments and blank
-    lines between statements belong to the preceding part. A single statement
-    larger than the budget is kept whole -- splitting inside an expression
-    would produce invalid chunks.
+    Returns None when the whole span already fits. Each part is
+    (start, end, statements). Parts are contiguous: comments and blank lines
+    between statements belong to the preceding part. A single oversized
+    statement falls back to overlapping line windows so a giant data literal
+    is still retrievable; normal code is never cut inside an expression.
     """
-    if _fits(lines, first_line, last_line, max_lines, max_chars):
+    if _fits(lines, first_line, last_line, max_lines, max_chars, max_tokens):
         return None
     if len(statements) < 2:
-        return None
+        return _window_parts(lines, first_line, last_line, max_lines,
+                             max_chars, max_tokens, overlap_lines)
     parts: list[tuple[int, int, list]] = []
     cur_start = first_line
     cur_end = first_line - 1
@@ -203,8 +238,17 @@ def _split_statements(statements: list, lines: list[str], first_line: int,
     for stmt in statements:
         s = _first_line(stmt)
         e = stmt.end_lineno or s
+        if cur and s > cur_end and _section_start(lines, s) \
+                and _half_budget(lines, cur_start, cur_end, max_lines,
+                                 max_chars, max_tokens):
+            # Prefer a blank-line/comment boundary over a hard budget edge:
+            # the summary and the model both reason better about a section
+            # that starts where the author started it.
+            parts.append((cur_start, cur_end, cur))
+            cur_start, cur_end, cur = s, e, [stmt]
+            continue
         if cur and s > cur_end and \
-                not _fits(lines, cur_start, e, max_lines, max_chars):
+                not _fits(lines, cur_start, e, max_lines, max_chars, max_tokens):
             parts.append((cur_start, cur_end, cur))
             cur_start, cur_end, cur = s, e, [stmt]
         else:
@@ -215,13 +259,17 @@ def _split_statements(statements: list, lines: list[str], first_line: int,
     if len(parts) < 2:
         return None
     # Make the parts contiguous: a comment or blank line between two
-    # statements belongs to the preceding part instead of falling out of
-    # every chunk. The last part owns the scope's closing lines.
+    # statements belongs to the preceding part. The last part owns the scope's
+    # closing lines. Optional overlap gives a continuation part its context.
     for i in range(len(parts) - 1):
         ps, _pe, pnodes = parts[i]
         parts[i] = (ps, parts[i + 1][0] - 1, pnodes)
     ps, _pe, pnodes = parts[-1]
     parts[-1] = (ps, last_line, pnodes)
+    if overlap_lines > 0:
+        for i in range(1, len(parts)):
+            ps, pe, pnodes = parts[i]
+            parts[i] = (max(first_line, ps - overlap_lines), pe, pnodes)
     return parts
 
 
@@ -230,12 +278,34 @@ def _part_signature(sig: str, index: int, count: int) -> str:
     return f"{sig}  [part {index}/{count}]" if count > 1 else sig
 
 
+_COMMENT_PREFIXES = ("#", "//", "/*", "*", "--", "<!--")
+
+
+def _section_start(lines: list[str], line_no: int) -> bool:
+    """True when a statement starts a logical section (blank/comment above)."""
+    if line_no <= 1:
+        return False
+    prev = lines[line_no - 2].strip()
+    return prev == "" or prev.startswith(_COMMENT_PREFIXES)
+
+
+def _half_budget(lines: list[str], start: int, end: int, max_lines: int,
+                 max_chars: int, max_tokens: int) -> bool:
+    if end - start + 1 >= max(2, int(max_lines * 0.5)):
+        return True
+    text = _slice(lines, start, end)
+    if len(text) >= max(2, int(max_chars * 0.5)):
+        return True
+    return bool(max_tokens and _estimate_tokens(text) >= max_tokens * 0.5)
+
+
 # --------------------------------------------------------------------------
 # Public API
 # --------------------------------------------------------------------------
 def chunk_source(rel_path: str, src: str, class_split_lines: int = 60,
-                 max_unit_lines: int = 220,
-                 max_unit_chars: int = 12000) -> list[Chunk]:
+                 max_unit_lines: int = 220, max_unit_chars: int = 12000,
+                 max_unit_tokens: int = 3000,
+                 unit_overlap_lines: int = 0) -> list[Chunk]:
     """Chunk one Python file's source into a list of Chunk objects.
 
     Produces, in order: a module-preamble chunk (imports and top-level code
@@ -271,7 +341,8 @@ def chunk_source(rel_path: str, src: str, class_split_lines: int = 60,
             # here would attribute every call in every function to this chunk.
             preamble = [n for n in tree.body if (n.end_lineno or 0) <= end]
             parts = _split_statements(preamble, lines, 1, end,
-                                      max_unit_lines, max_unit_chars)
+                                      max_unit_lines, max_unit_chars,
+                                      max_unit_tokens, unit_overlap_lines)
             if parts:
                 for i, (ps, pe, nodes) in enumerate(parts, 1):
                     part_body = _slice(lines, ps, pe)
@@ -298,7 +369,8 @@ def chunk_source(rel_path: str, src: str, class_split_lines: int = 60,
         e = end if end is not None else (node.end_lineno or s)
         if kind in ("function", "method") and isinstance(node, DEF_NODES):
             parts = _split_statements(node.body, lines, s, e,
-                                      max_unit_lines, max_unit_chars)
+                                      max_unit_lines, max_unit_chars,
+                                      max_unit_tokens, unit_overlap_lines)
             if parts:
                 sig = _signature(node)
                 for i, (ps, pe, nodes) in enumerate(parts, 1):
@@ -335,7 +407,8 @@ def chunk_source(rel_path: str, src: str, class_split_lines: int = 60,
         if (end - start + 1) <= class_split_lines or not methods:
             if not methods:
                 parts = _split_statements(node.body, lines, start, end,
-                                          max_unit_lines, max_unit_chars)
+                                          max_unit_lines, max_unit_chars,
+                                          max_unit_tokens, unit_overlap_lines)
                 if parts:
                     sig = _signature(node)
                     for i, (ps, pe, nodes) in enumerate(parts, 1):
@@ -368,7 +441,8 @@ def chunk_source(rel_path: str, src: str, class_split_lines: int = 60,
                         if (n.end_lineno or 0) <= header_end]
         header_parts = _split_statements(header_nodes, lines, start,
                                          header_end, max_unit_lines,
-                                         max_unit_chars)
+                                         max_unit_chars, max_unit_tokens,
+                                         unit_overlap_lines)
         if header_parts:
             sig = _signature(node)
             for i, (ps, pe, nodes) in enumerate(header_parts, 1):
@@ -400,7 +474,8 @@ def chunk_source(rel_path: str, src: str, class_split_lines: int = 60,
             if body.strip():
                 tail = [n for n in tree.body if n.lineno > last_end]
                 parts = _split_statements(tail, lines, last_end + 1, total,
-                                          max_unit_lines, max_unit_chars)
+                                          max_unit_lines, max_unit_chars,
+                                          max_unit_tokens, unit_overlap_lines)
                 if parts:
                     for i, (ps, pe, nodes) in enumerate(parts, 1):
                         part_body = _slice(lines, ps, pe)

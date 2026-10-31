@@ -44,6 +44,7 @@ from pathlib import Path
 from . import index as index_mod
 from . import instructions as instructions_mod
 from . import review as review_mod
+from . import todo as todo_mod
 from . import workspace
 from .edits import parse_edits
 from .llm import LLMError
@@ -1263,6 +1264,7 @@ def run_investigation_task(root: Path, cfg, client, agent, idx, task: str, *,
     """
     when = workspace.stamp()
     workspace.log_event(root, f"investigate: {task}")
+    todo_mod.clear(root)
     print("\n--- looking things up ---", file=sys.stderr)
     gathered = agent.gather(task)
     print("--- reporting ---\n", file=sys.stderr)
@@ -1342,6 +1344,7 @@ def run_task(root: Path, cfg, client, agent, idx, task: str, *,
     backup_dir = (workspace.new_backup_dir(root, when)
                   if wants_write and cfg.backup else None)
     workspace.log_event(root, f"task: {task}")
+    todo_mod.clear(root)          # a fresh checklist per task; auto has PLAN.md
     print("\n--- looking things up ---", file=sys.stderr)
     gathered = agent.gather(task, backup_dir=backup_dir)
     print("--- answering ---\n", file=sys.stderr)
@@ -2009,10 +2012,24 @@ def run_loop(root: Path, cfg, client, idx, plan_path: Path, *,
         # Verification: the loop's quality gate. On failure, hand the model
         # the command's output and let it fix its own work -- the feedback
         # loop that separates a Ralph loop from a file-generator.
+        # With auto_diagnostics on and no explicit --verify, the same loop
+        # consumes linter/typechecker findings for the files the task changed.
+        use_diag = (not verify) and bool(
+            getattr(cfg, "auto_diagnostics", False))
+        check_label = f"$ {verify}" if verify else "project diagnostics"
+
+        def run_check(changed):
+            if verify:
+                return run_verify(root, verify)
+            if use_diag:
+                from . import diagnostics
+                return diagnostics.run_changed(root, cfg, changed)
+            return True, ""
+
         passed = True
         dep_blocked: list[str] = []
-        if verify:
-            passed, output = run_verify(root, verify)
+        if verify or use_diag:
+            passed, output = run_check(tr.changed)
             rounds = repair_rounds
             while not passed:
                 # A missing third-party package is NOT a code bug: editing
@@ -2033,7 +2050,7 @@ def run_loop(root: Path, cfg, client, idx, plan_path: Path, *,
                             root, f"pip install {'ok' if ok else 'FAILED'}: {dists}",
                             "INFO" if ok else "ERROR")
                         if ok:
-                            passed, output = run_verify(root, verify)
+                            passed, output = run_check(tr.changed)
                             continue          # a dependency is not a repair round
                     else:
                         print(f"  [verify cannot run: missing dependencies: "
@@ -2048,11 +2065,12 @@ def run_loop(root: Path, cfg, client, idx, plan_path: Path, *,
                     break
                 print(f"  [verification failed; asking the model to fix it "
                       f"({rounds} round(s) left)]", file=sys.stderr)
-                workspace.log_event(root, f"verify failed: $ {verify}", "ERROR")
+                workspace.log_event(root, f"verify failed: {check_label}",
+                                    "ERROR")
                 fix_task = (
                     f"Your last change failed this check:\n\n"
-                    f"$ {verify}\n{output[:6000]}\n\n"
-                    f"Fix the code so that command succeeds. Re-run it in your "
+                    f"{check_label}\n{output[:6000]}\n\n"
+                    f"Fix the code so that check succeeds. Re-run it in your "
                     f"head before answering, and only then emit search/replace "
                     f"blocks for the files that need changing.")
                 try:
@@ -2064,7 +2082,7 @@ def run_loop(root: Path, cfg, client, idx, plan_path: Path, *,
                     workspace.log_event(root, f"repair failed: {e}", "ERROR")
                     break
                 idx = tr2.idx
-                passed, output = run_verify(root, verify)
+                passed, output = run_check(tr2.changed)
                 rounds -= 1
 
         if not passed:
@@ -2073,10 +2091,10 @@ def run_loop(root: Path, cfg, client, idx, plan_path: Path, *,
                 print(f"  [verification blocked by missing dependencies: "
                       f"{dists}]", file=sys.stderr)
             else:
-                print(f"  [verification still failing: $ {verify}]",
+                print(f"  [verification still failing: {check_label}]",
                       file=sys.stderr)
-                workspace.log_event(root, f"verify still failing: $ {verify}",
-                                    "ERROR")
+                workspace.log_event(
+                    root, f"verify still failing: {check_label}", "ERROR")
             failed += 1
             if stop_on_fail:
                 break

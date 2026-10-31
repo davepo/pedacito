@@ -1801,6 +1801,39 @@ def test_run_loop_verification_repair_round_trip(tmp_path, monkeypatch):
     assert "- [x] needs tests" in plan.read_text()
 
 
+def test_run_loop_auto_diagnostics_feeds_repair_rounds(tmp_path, monkeypatch):
+    """With auto_diagnostics on and no --verify, a failing linter check is
+    treated exactly like a failed verification: one repair task, then the
+    check re-runs. No checker/pass must leave the task alone."""
+    from pedacito import diagnostics
+
+    plan = tmp_path / "PLAN.md"
+    loop.write_plan(plan, "", ["add the parser"])
+    idx = types.SimpleNamespace(root=tmp_path)
+    tasks = []
+    checks = []
+
+    def fake_run_task(root, cfg, client, agent, idx_, task, apply=True,
+                      review=False, answer_system=None):
+        tasks.append(task)
+        return _result(idx_)
+
+    def fake_diagnostics(root, cfg, changed):
+        checks.append(tuple(changed or ()))
+        return (len(checks) >= 2), "E501 line too long"
+
+    monkeypatch.setattr(loop, "run_task", fake_run_task)
+    monkeypatch.setattr(diagnostics, "run_changed", fake_diagnostics)
+    cfg = _cfg()
+    cfg.auto_diagnostics = True
+    code = loop.run_loop(tmp_path, cfg, None, idx, plan, apply=True,
+                         repair_rounds=1)
+    assert code == 0
+    assert len(tasks) == 2
+    assert "failed this check" in tasks[1]
+    assert checks and checks[0] == ("a.py",)
+
+
 def test_run_loop_verification_exhausts_repair_rounds(tmp_path, monkeypatch):
     plan = tmp_path / "PLAN.md"
     loop.write_plan(plan, "", ["always failing"])

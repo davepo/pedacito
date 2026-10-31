@@ -451,6 +451,18 @@ def _cmd_auto(args, cfg, client, idx, root: Path) -> int:
 
     workspace.log_event(root, "command: " + " ".join(sys.argv))
 
+    if getattr(args, "worktree", ""):
+        from . import worktree
+        from . import index as index_mod
+        try:
+            root = worktree.create(root, args.worktree)
+        except worktree.WorktreeError as e:
+            print(f"worktree error: {e}", file=sys.stderr)
+            return 2
+        print(f"  [running in git worktree {root}]", file=sys.stderr)
+        idx = index_mod.build([str(root)], cfg, client=client, root=root,
+                              summarise=False, verbose=True)
+
     plan_path = Path(args.plan) if getattr(args, "plan", None) else \
         (root / cfg.auto_plan_file)
     if not plan_path.is_absolute():
@@ -504,6 +516,8 @@ def _cmd_auto(args, cfg, client, idx, root: Path) -> int:
         else getattr(cfg, "auto_max_minutes", 0)
     auto_install = bool(getattr(args, "auto_install", False)
                         or getattr(cfg, "auto_install_deps", False))
+    if getattr(args, "diagnostics", False):
+        cfg.auto_diagnostics = True
 
     code = loop.run_loop(root, cfg, client, idx, plan_path,
                          apply=args.apply, verify=verify, repair_rounds=repair,
@@ -609,6 +623,49 @@ def _cmd_explain(args, client, agent) -> int:
 # --------------------------------------------------------------------------
 # Entry point
 # --------------------------------------------------------------------------
+def _cmd_worktree(args) -> int:
+    """Implement `pedacito worktree create|list|remove`."""
+    from . import worktree
+    root = Path(args.root).expanduser().resolve() if args.root else Path(".").resolve()
+    try:
+        if args.action == "create":
+            if not args.name:
+                print("worktree create needs a NAME", file=sys.stderr)
+                return 2
+            dest = worktree.create(root, args.name, base=args.base)
+            print(f"Worktree: {dest}")
+            print(f"Run there with:  cd {dest} && pedacito auto ...",
+                  file=sys.stderr)
+            return 0
+        if args.action == "list":
+            entries = worktree.list_paths(root)
+            for path, branch in entries:
+                print(f"{path}  [{branch}]")
+            return 0
+        if args.action == "remove":
+            if not args.name:
+                print("worktree remove needs a NAME", file=sys.stderr)
+                return 2
+            worktree.remove(root, args.name, force=args.force)
+            print(f"Removed worktree {args.name}", file=sys.stderr)
+            return 0
+        print(f"unknown worktree action: {args.action}", file=sys.stderr)
+        return 2
+    except worktree.WorktreeError as e:
+        print(f"worktree error: {e}", file=sys.stderr)
+        return 1
+
+
+def _cmd_diagnose(args) -> int:
+    """Implement `pedacito diagnose`."""
+    from . import diagnostics
+    root = Path(args.root).expanduser().resolve() if args.root else Path(".").resolve()
+    files = [args.file] if getattr(args, "file", "") else None
+    ok, report = diagnostics.run(root, Config(), files=files)
+    print(report)
+    return 0 if ok else 1
+
+
 def _configure_stdio() -> None:
     """Make the console streams UTF-8 tolerant on every platform.
 
@@ -693,6 +750,25 @@ def main(argv=None) -> int:
     p_rest.add_argument("--list", action="store_true", help="list snapshots and exit")
     p_rest.add_argument("--dry-run", action="store_true")
     p_rest.add_argument("--config", metavar="FILE")
+
+    p_wt = sub.add_parser(
+        "worktree",
+        help="create/list/remove an isolated git worktree for risky runs")
+    p_wt.add_argument("action", choices=["create", "list", "remove"])
+    p_wt.add_argument("name", nargs="?", default="")
+    p_wt.add_argument("--root", default=None,
+                      help="the repository (default: current directory)")
+    p_wt.add_argument("--base", default="HEAD",
+                      help="commit/branch for a new worktree (default: HEAD)")
+    p_wt.add_argument("--force", action="store_true",
+                      help="with remove: discard modified/untracked files")
+
+    p_diag = sub.add_parser(
+        "diagnose", help="run the project's detected linter/typechecker")
+    p_diag.add_argument("--root", default=None,
+                        help="the project (default: current directory)")
+    p_diag.add_argument("--file", default="",
+                        help="restrict to one project-relative file")
 
     p_files = sub.add_parser("files", help="show which files would be indexed, and why")
     _add_common(p_files)
@@ -784,6 +860,14 @@ def main(argv=None) -> int:
                              "'pytest -q'; a failure feeds back for repair")
     p_auto.add_argument("--repair", type=int, default=None,
                         help="how many fix rounds a failing verification gets")
+    p_auto.add_argument("--diagnostics", action="store_true",
+                        help="after each task, run the project's detected "
+                             "linter/typechecker and feed findings into the "
+                             "repair rounds (only when --verify is not set)")
+    p_auto.add_argument("--worktree", default="",
+                        help="run the plan in an isolated git worktree "
+                             ".pedacito/worktrees/NAME (created from --base, "
+                             "default HEAD)")
     p_auto.add_argument("--max-tasks", type=int, default=None,
                         help="stop after attempting this many tasks")
     p_auto.add_argument("--max-minutes", type=int, default=None,
@@ -824,6 +908,11 @@ def main(argv=None) -> int:
             print("\nSetup cancelled.", file=sys.stderr)
             return 130
         return 0
+
+    if args.cmd == "worktree":
+        return _cmd_worktree(args)
+    if args.cmd == "diagnose":
+        return _cmd_diagnose(args)
 
     # `how` is standalone help: it needs a model connection, but no project
     # path, index, or vram-derived token budget. Handle it before the shared

@@ -396,6 +396,118 @@ def _html_heading_split(rel: str, text: str, headings: list[dict]) -> list[Chunk
 # --------------------------------------------------------------------------
 # Public API
 # --------------------------------------------------------------------------
+_YAML_KEY_RE = re.compile(
+    r"^([A-Za-z_][\w.-]*|\"[^\"]+\"|'[^']+')\s*:")
+_SHELL_FUNC_RE = re.compile(
+    r"^\s*(?:function\s+([A-Za-z_][\w-]*)|"
+    r"([A-Za-z_][\w-]*)\s*\(\s*\))\s*\{?\s*$")
+_SHELL_PS_FUNC_RE = re.compile(
+    r"^\s*function\s+([A-Za-z_][\w-]*)\s*\{?\s*$", re.IGNORECASE)
+_SQL_OBJECT_RE = re.compile(
+    r"\bCREATE\s+(?:OR\s+REPLACE\s+)?"
+    r"(TABLE|VIEW|INDEX|FUNCTION|PROCEDURE|TRIGGER|SCHEMA)\s+"
+    r"([A-Za-z_][\w.\"]*)", re.IGNORECASE)
+
+
+def _yaml(rel: str, text: str) -> list[Chunk]:
+    """Top-level YAML keys as sections (no YAML parser dependency)."""
+    lines = text.splitlines()
+    nlines = len(lines)
+    keys: list[tuple[int, str]] = []
+    for i, line in enumerate(lines, 1):
+        if not line or line[0].isspace() or line.lstrip().startswith("#"):
+            continue
+        m = _YAML_KEY_RE.match(line)
+        if m:
+            keys.append((i, m.group(1).strip("\"'")))
+    if not keys:
+        return _blocks(rel, lines, "yaml")
+    out: list[Chunk] = []
+    if keys[0][0] > 1:
+        head = "\n".join(lines[:keys[0][0] - 1])
+        if head.strip():
+            out.append(_mk(rel, "document", 1, keys[0][0] - 1,
+                           "yaml document header", "", head))
+    for idx, (start, key) in enumerate(keys):
+        end = (keys[idx + 1][0] - 1) if idx + 1 < len(keys) else nlines
+        body = "\n".join(lines[start - 1:end])
+        out.append(_mk(rel, key, start, end, f"{key}:", "", body))
+    return out
+
+
+def _sql(rel: str, text: str) -> list[Chunk]:
+    """SQL statements split on a trailing semicolon (quotes respected enough
+    for the common schema/query files Pedacito indexes)."""
+    lines = text.splitlines()
+    nlines = len(lines)
+    spans: list[tuple[int, int]] = []
+    start = 1
+    in_single = in_double = False
+    for i, line in enumerate(lines, 1):
+        j = 0
+        while j < len(line):
+            ch = line[j]
+            if ch == "'" and not in_double:
+                if in_single and j + 1 < len(line) and line[j + 1] == "'":
+                    j += 1
+                else:
+                    in_single = not in_single
+            elif ch == '"' and not in_single:
+                in_double = not in_double
+            elif ch == ";" and not in_single and not in_double:
+                if line[j + 1:].strip() == "":
+                    spans.append((start, i))
+                    start = i + 1
+                break
+            j += 1
+    if start <= nlines:
+        tail = "\n".join(lines[start - 1:]).strip()
+        if tail:
+            spans.append((start, nlines))
+    if not spans:
+        return _blocks(rel, lines, "sql")
+    out: list[Chunk] = []
+    for start, end in spans:
+        body = "\n".join(lines[start - 1:end])
+        first = next((ln.strip() for ln in body.splitlines() if ln.strip()), "")
+        m = _SQL_OBJECT_RE.search(first)
+        qual = (f"create {m.group(1).lower()} {m.group(2)}"
+                if m else first[:60])
+        sig = first[:160]
+        out.append(_mk(rel, qual, start, end, sig, "", body))
+    return out
+
+
+def _shell(rel: str, text: str) -> list[Chunk]:
+    """Shell/PowerShell function definitions, plus header/trailing blocks."""
+    lines = text.splitlines()
+    nlines = len(lines)
+    funcs: list[tuple[int, str]] = []
+    for i, line in enumerate(lines, 1):
+        if line.lstrip().startswith("#"):
+            continue
+        m = _SHELL_PS_FUNC_RE.match(line)
+        if m:
+            funcs.append((i, m.group(1)))
+            continue
+        m = _SHELL_FUNC_RE.match(line)
+        if m:
+            funcs.append((i, m.group(1) or m.group(2)))
+    if not funcs:
+        return _blocks(rel, lines, "shell")
+    out: list[Chunk] = []
+    if funcs[0][0] > 1:
+        head = "\n".join(lines[:funcs[0][0] - 1])
+        if head.strip():
+            out.append(_mk(rel, "script", 1, funcs[0][0] - 1,
+                           "shell script header", "", head))
+    for idx, (start, name) in enumerate(funcs):
+        end = (funcs[idx + 1][0] - 1) if idx + 1 < len(funcs) else nlines
+        body = "\n".join(lines[start - 1:end])
+        out.append(_mk(rel, name, start, end, f"{name}()", "", body))
+    return out
+
+
 def chunk_reference(rel: str, path: Path, max_bytes: int = 2_000_000) -> list[Chunk]:
     """Produce structural chunks for one non-Python file, dispatching on its
     extension to the appropriate chunker above.
@@ -433,4 +545,10 @@ def chunk_reference(rel: str, path: Path, max_bytes: int = 2_000_000) -> list[Ch
         return _headed(rel, text)
     if ext in (".html", ".htm", ".xhtml"):
         return _html(rel, text)
+    if ext in (".yaml", ".yml"):
+        return _yaml(rel, text)
+    if ext == ".sql":
+        return _sql(rel, text)
+    if ext in (".sh", ".bash", ".zsh", ".ksh", ".ps1"):
+        return _shell(rel, text)
     return _blocks(rel, text.splitlines(), ext.lstrip(".") or "text")

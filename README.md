@@ -269,6 +269,26 @@ directories to leave alone, and verification steps — the context a small
 model would otherwise invent. The text is capped by `max_instruction_chars`
 (default 2000) and can be disabled with `use_project_instructions = false`.
 
+### Diagnostics and task checklist
+
+Two small-model aids sit beside the normal tools:
+
+- `diagnose` runs the project's detected linter/type checker (`ruff`,
+  `pyflakes`, `flake8`, `npm lint`, `tsc`, `cargo check`, `go vet`, or
+  `rubocop`) and returns concise findings. It needs `allow_shell`; the same
+  check is available from the terminal as `pedacito diagnose`. With
+  `pedacito auto --diagnostics` (or `auto_diagnostics = true`), the same
+  findings feed the existing repair rounds when no `--verify` command is set.
+- `todo` writes a short `- [ ]` checklist to `.pedacito/todo.md`. The checklist
+  is injected into the answer prompt, so sub-steps survive a gather phase that
+  has no tools. It is cleared at the start of each task; `auto` keeps its
+  long-lived plan in `PLAN.md`.
+- `mcp` is an optional MCP client. With `allow_mcp = true` and
+  `mcp_servers = ["python server.py"]`, Pedacito injects a compact tool catalog
+  and exposes one `mcp` action (`symbol = "server/tool"`, `content = JSON
+  arguments`). It is off by default because arbitrary external tools are a
+  large, unpredictable surface for a small model.
+
 ### Seeing a GUI
 
 A text model cannot actually see a game or desktop window. The practical
@@ -387,8 +407,14 @@ fresh context window, with optional verification and repair:
 pedacito auto . -t "add retry logic to the sync client"     # plan only, nothing written
 pedacito auto . -t "..." --apply                            # plan, then implement every task
 pedacito auto . --apply --verify "pytest -q"                # verify each task, repair on failure
+pedacito auto . --apply --diagnostics                       # lint/typecheck each task, repair findings
+pedacito auto . --apply --worktree refactor                  # isolated git worktree + branch
 pedacito auto . --apply --plan TODO.md                      # use an existing checklist instead
 ```
+
+`--worktree NAME` creates (or reuses) `.pedacito/worktrees/NAME` on a
+`pedacito/NAME` branch and runs the plan there, leaving the main checkout
+untouched. Review and merge with normal git when the run is good.
 
 Investigation-only tasks such as "Reproduce the crash" or "Locate the cause"
 are answered as a report and marked done without requiring edits, so a bug-fix
@@ -424,22 +450,24 @@ Pedacito starts.
 ## What gets indexed
 
 **Python** (via the standard-library `ast`) and **JavaScript, TypeScript, TSX,
-and Ruby** (via `tree-sitter`, installed by default) are parsed into functions,
-classes, and methods with exact line ranges. A function/method larger than
-`max_unit_lines` (220) or `max_unit_chars` (12000) is split at top-level
+Go, Rust, Java, C, C++, C#, and Ruby** (via `tree-sitter`, installed by
+default) are parsed into functions, classes, and methods with exact line
+ranges. A function/method larger than `max_unit_lines` (220),
+`max_unit_chars` (12000), or `max_unit_tokens` (3000) is split at top-level
 statement boundaries into `name#2`, `name#3`, ... parts, so one huge function
 cannot force a small model to read its whole body or skip it altogether. A
 mid-file `read` also carries the enclosing signature and module imports from
 the index instead of spending another lookup on the file head. Everything else
 useful as context — `.md .txt .rst .csv .tsv .json .toml .yaml .yml .ini .cfg
 .conf .env .sql .sh` — is indexed *structurally*: the map shows a CSV's columns,
-a JSON file's keys, a TOML file's sections, a markdown file's headings. Contents
-stay out of the map, but `read` and `grep` reach them normally.
+a JSON file's keys, a TOML/YAML file's sections, a markdown file's headings, a
+SQL statement's object, or a shell function. Contents stay out of the map, but
+`read` and `grep` reach them normally.
 
-Anything else is invisible until you add its extension explicitly:
+Everything else is invisible until you add its extension explicitly:
 
 ```bash
-pedacito ask . -t "..." --ext .go
+pedacito ask . -t "..." --ext .kt
 ```
 
 which routes it through the same structural chunker — `read`/`grep` work,

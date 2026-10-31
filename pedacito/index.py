@@ -307,6 +307,40 @@ class Index:
         base = symbol.split(".")[-1]
         return list(self._by_call.get(base, []))
 
+    def importers_of(self, rel: str) -> list[str]:
+        """Indexed files whose imports name the module behind `rel`.
+
+        This is the cross-file half of the symbol graph: `callers_of` finds
+        direct calls by bare name, while imports catch a file that brings the
+        module in and calls the symbol through an alias or a qualified path.
+        It is intentionally conservative (module names, not full symbol
+        resolution), so it is evidence rather than proof.
+        """
+        base = rel.rsplit(".", 1)[0]
+        if base.endswith("/__init__"):
+            base = base[:-len("/__init__")]
+        mod = base.replace("/", ".")
+        last = mod.rsplit(".", 1)[-1]
+        targets = {mod, last}
+        out: list[str] = []
+        for f in self.files:
+            if f == rel:
+                continue
+            for c in self.in_file(f):
+                for imp in c.imports:
+                    imp = (imp or "").strip().lstrip(".")
+                    if not imp:
+                        continue
+                    if imp in targets or imp.endswith("." + last) \
+                            or imp.startswith(mod + ".") \
+                            or imp.startswith(last + "."):
+                        out.append(f)
+                        break
+                else:
+                    continue
+                break
+        return sorted(set(out))
+
     # ------------------------------------------------------ tier 0: file cards
     def render_files(self, line_ranges: bool = True, max_names: int = 60) -> str:
         """Render the always-resident tier-0 map: one card per file naming
@@ -733,13 +767,15 @@ def _chunk_file(rel: str, path: Path, cfg) -> list[Chunk]:
         src = fileio.read_text(path)
         return _unique_qualnames(chunk_source(
             rel, src, cfg.class_split_lines,
-            cfg.max_unit_lines, cfg.max_unit_chars))
+            cfg.max_unit_lines, cfg.max_unit_chars,
+            cfg.max_unit_tokens, cfg.unit_overlap_lines))
     if suffix in LANG_BY_EXT:
         if TS_AVAILABLE:
             src = fileio.read_text(path)
             return _unique_qualnames(chunk_file_ts(
                 rel, src, suffix, cfg.class_split_lines,
-                cfg.max_unit_lines, cfg.max_unit_chars))
+                cfg.max_unit_lines, cfg.max_unit_chars,
+                cfg.max_unit_tokens, cfg.unit_overlap_lines))
         return chunk_reference(rel, path, cfg.max_reference_bytes)
     return chunk_reference(rel, path, cfg.max_reference_bytes)
 

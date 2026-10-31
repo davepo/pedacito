@@ -49,13 +49,36 @@ def test_python_char_budget_splits_long_lines():
     assert len([c for c in chunks if c.qualname.startswith("wide")]) > 1
 
 
-def test_python_single_giant_statement_is_not_cut_inside_an_expression():
+def test_python_single_giant_statement_falls_back_to_line_windows():
     literal = ",\n".join(f'    "k{i}": {i}' for i in range(300))
     src = "DATA = {\n" + literal + "\n}\n"
     chunks = chunk_source("data.py", src, max_unit_lines=20, max_unit_chars=1000)
-    data = [c for c in chunks if c.qualname in ("module", "module#2")]
-    assert len(data) == 1, "a single dict literal was split mid-expression"
-    assert data[0].start == 1 and data[0].end == len(src.splitlines())
+    data = [c for c in chunks if c.qualname == "module"
+            or c.qualname.startswith("module#")]
+    assert len(data) > 1, "a giant dict literal stayed one unreadable unit"
+    assert data[0].start == 1
+    assert data[-1].end == len(src.splitlines())
+    assert all(1 <= c.start <= c.end for c in data)
+
+
+def test_giant_statement_windows_can_overlap(tmp_path):
+    literal = ",\n".join(f'    "k{i}": {i}' for i in range(200))
+    src = "DATA = {\n" + literal + "\n}\n"
+    chunks = chunk_source("data.py", src, max_unit_lines=20,
+                          max_unit_chars=1000, unit_overlap_lines=3)
+    data = [c for c in chunks if c.qualname == "module"
+            or c.qualname.startswith("module#")]
+    assert len(data) > 1
+    assert any(b.start <= a.end for a, b in zip(data, data[1:]))
+
+
+def test_token_budget_can_split_before_line_or_char_limits():
+    body = "\n".join(f"    x{i} = {i}" for i in range(200))
+    src = f"def f():\n{body}\n"
+    chunks = chunk_source("tok.py", src, max_unit_lines=1000,
+                          max_unit_chars=100000, max_unit_tokens=50)
+    assert len([c for c in chunks if c.qualname == "f"
+                or c.qualname.startswith("f#")]) > 1
 
 
 def test_python_long_preamble_is_split():
@@ -67,6 +90,20 @@ def test_python_long_preamble_is_split():
     assert mods[0].qualname == "module"
     assert all(c.imports == ["os"] for c in mods)
     assert mods[-1].end < len(src.splitlines())
+
+
+def test_section_aware_splitting_prefers_blank_line_boundaries():
+    first = "\n".join(f"    a{i} = {i}" for i in range(40))
+    second = "\n".join(f"    b{i} = {i}" for i in range(40))
+    src = f"def f():\n{first}\n\n{second}\n    return a0\n"
+    chunks = chunk_source("sections.py", src, max_unit_lines=60,
+                          max_unit_chars=100000, max_unit_tokens=0)
+    parts = [c for c in chunks if c.qualname == "f"
+             or c.qualname.startswith("f#")]
+    assert len(parts) > 1
+    # The first part should end at the blank-line section boundary, not at
+    # the hard 60-line edge in the middle of the second section.
+    assert parts[0].end < 50
 
 
 def test_python_semicolon_statements_never_produce_invalid_ranges():
@@ -157,6 +194,25 @@ def test_ts_long_arrow_component_is_split():
              if c.qualname == "Widget" or c.qualname.startswith("Widget#")]
     assert len(parts) > 1
     assert all("part " in c.signature for c in parts)
+
+
+def test_ts_class_field_and_object_literal_methods_are_chunks():
+    if not TS_AVAILABLE:
+        return
+    src = (
+        "class A {\n"
+        "  handle = (x) => {\n    return x;\n  };\n"
+        "  value = 1;\n"
+        "}\n"
+        "const api = {\n"
+        "  foo(a) {\n    return a;\n  },\n"
+        "  bar: () => 1,\n"
+        "};\n")
+    chunks = chunk_file_ts("x.ts", src, ".ts", class_split_lines=2)
+    quals = [c.qualname for c in chunks]
+    assert "A.handle" in quals
+    assert "api.foo" in quals and "api.bar" in quals
+    assert "A.value" not in quals          # a data field is not a method
 
 
 def test_ruby_long_method_is_split_when_tree_sitter_is_available():

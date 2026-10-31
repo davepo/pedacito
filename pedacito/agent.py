@@ -38,6 +38,8 @@ from .edits import apply_edits, parse_edits
 from .llm import LLMError, estimate_tokens
 from .tools import TOOL_HELP, dispatch, schema_for
 from . import instructions as instructions_mod
+from . import todo as todo_mod
+from . import mcp as mcp_mod
 
 # How many times the gather loop re-asks after a step reply dies at the
 # output cap / produces no salvageable JSON, before giving up and answering
@@ -68,7 +70,8 @@ _MAX_REPEATED_STEPS = 3
 # same text into the conversation. `read` has its own duplicate-range guard;
 # these are the navigation steps the graveyard run looped on (grep X, grep X,
 # grep X, then outline main.js three times).
-_DEDUP_STEP_ACTIONS = {"grep", "outline", "callers", "sessions", "diff"}
+_DEDUP_STEP_ACTIONS = {"grep", "outline", "callers", "sessions", "diff",
+                       "diagnose"}
 
 # Cut-off payloads discarded before gather gives up and lets the answer
 # phase report the blocker (Bug W, run 13): two discards with actionable
@@ -503,6 +506,25 @@ source you asked to see. Complete the user's task.
 """ + EDIT_FORMAT
 
 
+def _compact_result_marker(content: str) -> str:
+    """A one-line reminder of a RESULT turn that is about to be dropped.
+
+    Extractive, not an LLM summary: it keeps the tool/header line so the model
+    still knows what it already looked at, without re-injecting source. If it
+    does not bring the conversation under the window, the next eviction pass
+    drops the marker too.
+    """
+    body = [ln.strip() for ln in (content or "").splitlines()[1:]
+            if ln.strip()]
+    if not body:
+        return ""
+    head = next((ln for ln in body if ln.startswith("--- ")), body[0])
+    head = head[4:].strip() if head.startswith("--- ") else head
+    if len(head) > 160:
+        head = head[:157].rstrip() + "..."
+    return f"RESULT:\n[compacted earlier lookup: {head}]"
+
+
 def _evict_overflow_turns(messages: list[dict], client, cfg) -> bool:
     """Shrink the live conversation until it fits the server's window.
 
@@ -563,10 +585,24 @@ def _evict_overflow_turns(messages: list[dict], client, cfg) -> bool:
             else:
                 lines = []      # force the removal path below
         if not lines or len(lines) <= 6:
+            content_now = messages[i]["content"]
+            if not content_now.startswith(
+                    "RESULT:\n[compacted earlier lookup:"):
+                marker = _compact_result_marker(content_now)
+                if marker and estimate_tokens(marker) < estimate_tokens(content_now):
+                    # Keep a one-line reminder instead of silently dropping
+                    # what the model already looked at. If this still leaves
+                    # the prompt over budget, the next pass drops the marker.
+                    messages[i] = {"role": "user", "content": marker}
+                    changed_any = True
+                    continue
+            # Drop the RESULT and the assistant turn immediately before it so
+            # the remaining system/user/assistant sequence stays alternating.
             drop = {i}
-            nxt = [j for j in idxs[1:] if messages[j]["content"].startswith("RESULT:\n")]
-            if nxt:
-                drop.add(nxt[0])   # keep roles alternating after removal
+            if i > 0 and messages[i - 1]["role"] == "assistant":
+                drop.add(i - 1)
+            elif i + 1 < len(messages) and messages[i + 1]["role"] == "assistant":
+                drop.add(i + 1)
             messages[:] = [m for k, m in enumerate(messages) if k not in drop]
         changed_any = True
     if changed_any:
@@ -643,8 +679,17 @@ class Agent:
             (FLAT_HINT if tier == "flat"
              else CARDS_HINT if tier == "cards" else DIRS_HINT)
         project_notes = instructions_mod.render(self.index.root, self.cfg)
+        todo_notes = todo_mod.render(self.index.root, self.cfg,
+                                     limit=int(getattr(
+                                         self.cfg, "max_todo_chars", 1500)))
         if project_notes:
             system += "\n\n" + project_notes
+        if todo_notes:
+            system += "\n\n" + todo_notes
+        if getattr(self.cfg, "allow_mcp", False):
+            mcp_notes = mcp_mod.render(self.cfg)
+            if mcp_notes:
+                system += "\n\n" + mcp_notes
         if verbose:
             print(f"  [map: {tier}, ~{estimate_tokens(repo_map)} tokens, "
                   f"{len(self.index.files)} files]", file=sys.stderr)
@@ -1203,7 +1248,18 @@ class Agent:
         that must answer in prose only (`explain`)."""
         repo_map, _ = self.index.map_for_prompt(self.cfg)
         project_notes = instructions_mod.render(self.index.root, self.cfg)
-        notes_prefix = (project_notes + "\n\n") if project_notes else ""
+        todo_notes = todo_mod.render(self.index.root, self.cfg,
+                                     limit=int(getattr(
+                                         self.cfg, "max_todo_chars", 1500)))
+        notes_prefix = ""
+        if project_notes:
+            notes_prefix += project_notes + "\n\n"
+        if todo_notes:
+            notes_prefix += todo_notes + "\n\n"
+        if getattr(self.cfg, "allow_mcp", False):
+            mcp_notes = mcp_mod.render(self.cfg)
+            if mcp_notes:
+                notes_prefix += mcp_notes + "\n\n"
         user = (
             notes_prefix +
             f"PROJECT MAP\n\n{repo_map}\n\n"
@@ -1249,8 +1305,8 @@ class Agent:
             # (the model still has the map/source/task) and keep the existing
             # over-budget refusal for the rest.
             user = user[len(notes_prefix):]
-            print("[project instructions omitted: answer prompt is over the "
-                  "window budget]", file=sys.stderr)
+            print("[project context (instructions/checklist) omitted: answer "
+                  "prompt is over the window budget]", file=sys.stderr)
             notes_prefix = ""
         if not _is_hosted(self.cfg) and estimate_tokens(user) > room > 0:
             over = estimate_tokens(user) - room
