@@ -27,7 +27,7 @@ import json
 import sys
 import threading
 import webbrowser
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from http.server import BaseHTTPRequestHandler
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -39,6 +39,7 @@ from . import workspace
 from .agent import Agent
 from .config import USER_CONFIG, ConfigError
 from .llm import LLMClient, LLMError
+from .local_server import LocalHTTPServer
 
 RECENT_FILE = USER_CONFIG.parent / "gui_recent.json"
 MAX_RECENT = 8
@@ -960,7 +961,7 @@ class _Handler(BaseHTTPRequestHandler):
             self._json(404, {"ok": False})
 
 
-_SERVER: ThreadingHTTPServer | None = None
+_SERVER: LocalHTTPServer | None = None
 _APPLY_LOCK = threading.Lock()
 
 
@@ -974,7 +975,7 @@ def _shutdown_server() -> None:
 def run(port: int = 0, open_browser: bool = True) -> None:
     """Start the GUI server; block until Ctrl-C or the page's Exit button."""
     global _SERVER
-    srv = ThreadingHTTPServer(("127.0.0.1", port), _Handler)
+    srv = LocalHTTPServer(("127.0.0.1", port), _Handler)
     _SERVER = srv
     url = f"http://127.0.0.1:{srv.server_address[1]}/"
     print(f"pedacito gui running at {url}  (Ctrl-C to stop)", file=sys.stderr)

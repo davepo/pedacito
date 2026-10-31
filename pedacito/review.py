@@ -25,12 +25,13 @@ import threading
 import webbrowser
 from dataclasses import dataclass, field
 from difflib import SequenceMatcher
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from http.server import BaseHTTPRequestHandler
 from itertools import accumulate
 from pathlib import Path
 
 from . import fileio
 from .index import state_dir
+from .local_server import LocalHTTPServer
 
 REVIEW_DIR = "reviews"
 CONTEXT = 4          # unchanged lines kept either side of a change
@@ -696,12 +697,15 @@ def write_files(root: Path, diffs: list[FileDiff], backup_dir: Path | None):
     EMPTY_SHA = _sha("")
 
     def _digest(p: Path) -> str:
-        # Raw bytes, so a concurrently deleted file is seen as absent rather
-        # than as an empty text read.
+        # Hash the same LF-normalised text the preview sha was recorded from.
+        # Hashing raw bytes here would make every CRLF file on Windows look
+        # "changed on disk" even though its text is identical.  A missing file
+        # is still reported as absent, not as an empty read.
         try:
-            return hashlib.sha256(p.read_bytes()).hexdigest()
+            text, _ = fileio.read(p, errors="replace")
         except FileNotFoundError:
             return EMPTY_SHA
+        return _sha(text)
 
     if not diffs:
         return False, ("Not written: this review contains no applicable "
@@ -764,7 +768,7 @@ def write_files(root: Path, diffs: list[FileDiff], backup_dir: Path | None):
         if not op.is_file() or not op.resolve().is_relative_to(root_resolved):
             return
         try:
-            cur = hashlib.sha256(op.read_bytes()).hexdigest()
+            cur = _digest(op)
         except OSError:
             return
         if expect_sha and cur != expect_sha:
@@ -815,7 +819,7 @@ def run(page: str, nonce: str, writer, port: int = 0, open_browser: bool = True,
     seconds. `writer()` -> (ok, detail) is called on Apply; `on_discard()` on
     Discard, for flows whose files are already on disk (`new --review`).
     Returns (outcome, detail); outcome is "applied", "cancelled" or "timeout"."""
-    srv = ThreadingHTTPServer(("127.0.0.1", port), _Handler)
+    srv = LocalHTTPServer(("127.0.0.1", port), _Handler)
     srv.page = page
     srv.nonce = nonce
     srv.writer = writer

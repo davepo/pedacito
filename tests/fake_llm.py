@@ -16,8 +16,14 @@ The action cursor resets whenever a NON-schema request arrives, i.e. when the
 agent moves from its gather loop to the answer phase, so every test's gather
 loop starts from action 0 even though the module-scoped server is reused.
 """
-import json, os
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import json, os, sys
+from http.server import BaseHTTPRequestHandler
+from pathlib import Path
+
+# When run as a script, sys.path[0] is tests/, not the checkout root.
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from pedacito.local_server import LocalHTTPServer
 
 ACTIONS = json.loads(os.environ.get("FAKE_ACTIONS", "[]"))
 REPLY = os.environ.get("FAKE_REPLY", "")
@@ -93,4 +99,4 @@ class H(BaseHTTPRequestHandler):
 
 
 port = int(os.environ.get("FAKE_PORT", "8931"))
-ThreadingHTTPServer(("127.0.0.1", port), H).serve_forever()
+LocalHTTPServer(("127.0.0.1", port), H).serve_forever()

@@ -34,7 +34,9 @@ def test_create_list_remove_worktree(tmp_path):
     dest = worktree.create(root, "demo")
     assert dest.is_dir() and (dest / ".git").exists()
     assert (dest / "a.txt").read_text(encoding="utf-8") == "hi\n"
-    listed = dict(worktree.list_paths(root))
-    assert str(dest) in listed
+    # git prints paths in its own form (forward slashes on Windows, resolved
+    # /private/var paths on macOS), so compare Path objects rather than strings.
+    listed = {Path(p).resolve() for p in dict(worktree.list_paths(root))}
+    assert dest.resolve() in listed
     worktree.remove(root, "demo")
     assert not dest.exists()

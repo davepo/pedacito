@@ -1964,10 +1964,13 @@ def test_normalized_reply_folds_double_encoded_apostrophes():
 
 
 def test_run_verify_runs_in_project_root(tmp_path):
-    ok, _ = loop.run_verify(tmp_path, f"{sys.executable} -c 'import sys; sys.exit(0)'")
+    # Double quotes around both the executable and the -c program: cmd.exe
+    # (Windows) does not treat single quotes as quoting.
+    ok, _ = loop.run_verify(
+        tmp_path, f'"{sys.executable}" -c "import sys; sys.exit(0)"')
     assert ok is True
-    bad, out = loop.run_verify(tmp_path,
-                               f"{sys.executable} -c 'import sys; sys.exit(3)'")
+    bad, out = loop.run_verify(
+        tmp_path, f'"{sys.executable}" -c "import sys; sys.exit(3)"')
     assert bad is False
 
 

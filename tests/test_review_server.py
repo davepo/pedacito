@@ -89,10 +89,9 @@ def test_write_files_keeps_first_backup_on_repeat_apply(tmp_path):
 
 
 def test_gui_handler_guards_and_empty_nonce():
-    from http.server import ThreadingHTTPServer
-
     from pedacito import gui
-    srv = ThreadingHTTPServer(("127.0.0.1", 0), gui._Handler)
+    from pedacito.local_server import LocalHTTPServer
+    srv = LocalHTTPServer(("127.0.0.1", 0), gui._Handler)
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     port = srv.server_address[1]
     try:

@@ -9,6 +9,7 @@ case-insensitive fallbacks plus directory/glob scopes, call-site snippets in
 from __future__ import annotations
 
 import os
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -540,11 +541,21 @@ def test_proc_stops_the_whole_process_tree(tmp_path):
                                 timeout=20, idle_timeout=1)
     assert stopped == "idle"
     pid = int(marker.read_text())
-    deadline = time.time() + 5
+    deadline = time.time() + 10
     while time.time() < deadline:
         try:
             os.kill(pid, 0)
         except ProcessLookupError:
+            return
+        # A killed process can linger as a zombie until its new parent reaps
+        # it. macOS/launchd can take a moment; "Z" means it is already gone.
+        try:
+            stat = subprocess.run(
+                ["ps", "-o", "stat=", "-p", str(pid)],
+                capture_output=True, text=True, timeout=5).stdout.strip()
+        except OSError:
+            stat = ""
+        if not stat or stat.startswith("Z"):
             return
         time.sleep(0.1)
     raise AssertionError(f"grandchild {pid} survived the idle stop")
