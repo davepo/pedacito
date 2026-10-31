@@ -68,7 +68,8 @@ TOOL_HELP = """\
 read     - read exact lines of a file.       args: file, start, end
            (or set symbol and leave file empty: read that definition)
 grep     - regex or literal search. args: pattern, and optional file/dir/glob
-           (with semantic_search on, falls back to search by meaning)
+           (pattern = an existing filename returns its references/imports;
+            with semantic_search on, falls back to search by meaning)
 callers  - who calls a symbol, with the call sites. args: symbol
 outline  - list every unit in one file, or the file cards in one directory.
            args: file (a path, a symbol, or a directory/glob)
@@ -742,8 +743,132 @@ def tool_read(index, cfg, file: str, start: int, end: int,
         note = f"\n[truncated to {max_lines} lines; read again from {end + 1} if needed]"
     else:
         note = ""
+    # Mid-file reads of a split unit otherwise show statements without the
+    # enclosing def/class or the module imports. Both are already indexed, so
+    # surface them for free instead of spending another read on the file head.
+    context = ""
+    if not symbol_note and start > 1 and getattr(cfg, "read_context_hint", True):
+        for c in index.in_file(rel):
+            if c.start <= start <= c.end:
+                bits = []
+                if c.kind in ("function", "method", "class", "classheader") \
+                        and c.signature:
+                    bits.append(c.signature)
+                imports = sorted({i.split(".")[0].lstrip(".")
+                                  for i in c.imports})
+                if imports:
+                    bits.append("module imports: " + ", ".join(imports[:10]))
+                if bits:
+                    context = "\n[context: " + "; ".join(bits) + "]"
+                break
     body = _numbered(lines[start - 1 : end], start)
-    return f"{rel} lines {start}-{end}:\n{body}{note}{symbol_note}"
+    return f"{rel} lines {start}-{end}:{context}\n{body}{note}{symbol_note}"
+
+
+_REF_IMPORT_RES = (
+    re.compile(r"^\s*(?:from|import)\b"),                       # Python
+    re.compile(r"^\s*(?:import|export)\b.*\bfrom\b"),           # JS/TS
+    re.compile(r"\brequire\s*\("),                              # CommonJS
+    re.compile(r"<(?:script|link|img|a|iframe)\b[^>]*\b"
+               r"(?:src|href)\s*=", re.IGNORECASE),             # HTML
+)
+
+
+def _file_reference_target(index, pattern: str, scope: str) -> str | None:
+    """If `pattern` is a real file path and no scope was given, return its
+    indexed relative path.
+
+    Small models answer "find references to X.py" by calling
+    `grep X.py` -- a search for the literal filename, not for its module.
+    Recognising that shape lets grep return a proper reference report
+    (imports plus textual mentions) instead of a dead-end miss followed by
+    the semantic-search fallback.
+    """
+    if scope.strip():
+        return None
+    raw = (pattern or "").strip()
+    if not raw or not re.fullmatch(r"[A-Za-z0-9_./\\-]+", raw):
+        return None
+    name = fileio.normalise_rel(raw).strip()
+    if name.startswith("./"):
+        name = name[2:]
+    if not name or ".." in Path(name).parts:
+        return None
+    rel = index.resolve_file(name)
+    if rel:
+        return rel
+    # `resolve_file` wants a known spelling; accept a unique path suffix too
+    # (models often omit or add a leading directory).
+    matches = [f for f in index.files
+               if f.lower() == name.lower()
+               or f.lower().endswith("/" + name.lower())]
+    return matches[0] if len(matches) == 1 else None
+
+
+def _file_references(index, rel: str) -> str:
+    """Report textual references to one file: imports first, then mentions.
+
+    This is deliberately evidence, not a proof of liveness: Python's
+    importlib, string-built module names, and templated asset paths can use a
+    file without ever writing its name as a literal.
+    """
+    base = Path(rel).name.lower()
+    full = rel.lower()
+    stem = Path(rel).stem.lower()
+    hits: list[tuple[str, int, str, str]] = []
+    code_files: set[str] = set()
+    for frel in index.files:
+        if frel == rel:
+            continue
+        try:
+            lines = fileio.read_lines_cached(index.root / frel)
+        except OSError:
+            continue
+        is_doc = Path(frel).suffix.lower() in {".md", ".rst", ".txt"}
+        for lineno, line in enumerate(lines, 1):
+            low = line.lower()
+            import_like = any(rx.search(line) for rx in _REF_IMPORT_RES)
+            matched = base in low or full in low
+            if not matched and import_like and stem and \
+                    re.search(r"\b" + re.escape(stem) + r"\b", low):
+                matched = True
+            if not matched:
+                continue
+            kind = "doc" if is_doc else ("import" if import_like else "text")
+            hits.append((frel, lineno, kind, line.strip()[:200]))
+            if not is_doc:
+                code_files.add(frel)
+            if len(hits) >= 80:
+                break
+        if len(hits) >= 80:
+            break
+
+    code_count = sum(1 for _f, _n, kind, _t in hits if kind != "doc")
+    doc_count = len(hits) - code_count
+    header = f"References to {rel} (textual evidence, not proof):"
+    if not hits:
+        return (f"No references to {rel} found in {len(index.files)} indexed "
+                "file(s).\n[It is a dead-code candidate -- check dynamic "
+                "imports and string-built paths before removing it.]")
+    if not code_count:
+        return (f"No CODE references to {rel} found in {len(index.files)} "
+                f"indexed file(s); only {doc_count} documentation "
+                "mention(s):\n"
+                + "\n".join(f"  {frel}:{lineno}  {text}"
+                            for frel, lineno, _k, text in hits)
+                + "\n[It is a dead-code candidate -- check dynamic imports "
+                  "and string-built paths before removing it.]")
+    out = [header]
+    for frel, lineno, kind, text in hits:
+        out.append(f"  {frel}:{lineno}  {kind:<6} {text}")
+    if len(hits) >= 80:
+        out.append("  (+more; narrow the search with a scope)")
+    out.append(f"Found {code_count} code reference(s) in {len(code_files)} "
+               f"file(s)" + (f" (+{doc_count} documentation mention(s))"
+                             if doc_count else "") + ".")
+    out.append(f"[To search INSIDE {rel}, call grep with pattern=<text> and "
+               f"file=\"{rel}\".]")
+    return "\n".join(out)
 
 
 def tool_grep(index, pattern: str, scope: str = "", max_hits: int = 40,
@@ -764,6 +889,12 @@ def tool_grep(index, pattern: str, scope: str = "", max_hits: int = 40,
     hits collected in the same pass. A sparse result (a few hits) includes
     one line of context around each hit; a total miss suggests similarly
     named symbols from the index.
+
+    When `pattern` is itself an existing file path and no `scope` was given,
+    return a reference report for that file (imports plus textual mentions)
+    instead of searching for the literal filename. That is how small models
+    phrase "find references to X.py", and it prevents a no-hit grep from
+    triggering the embedding fallback.
     """
     pattern = _as_text(pattern)
     scope = _as_text(scope)
@@ -771,6 +902,9 @@ def tool_grep(index, pattern: str, scope: str = "", max_hits: int = 40,
     if not pattern.strip():
         return ("ERROR: grep needs a `pattern` (a regex or plain text). To look "
                 "inside one file, use `outline`, or `read` it.")
+    ref_target = _file_reference_target(index, pattern, scope)
+    if ref_target:
+        return _file_references(index, ref_target)
     notes: list[str] = []
     needle = pattern
     try:
@@ -1488,8 +1622,17 @@ def _allowlist_error(cfg, argv: list[str]) -> str:
     allow = tuple(getattr(cfg, "shell_allowlist", ()) or ())
     if not allow:
         return ""
-    names = {Path(a).name.lower() for a in allow}
-    exe = Path(argv[0]).name.lower()
+
+    def _exe(name: str) -> str:
+        base = Path(name).name.lower()
+        # Windows resolves `python` to `python.exe`; compare the stem so an
+        # allowlist entry written without the extension keeps working there.
+        if os.name == "nt" and base.endswith(".exe"):
+            base = base[:-4]
+        return base
+
+    names = {_exe(a) for a in allow}
+    exe = _exe(argv[0])
     if exe in names or argv[0].lower() in {a.lower() for a in allow}:
         return ""
     return (f"ERROR: `{argv[0]}` is not in shell_allowlist "

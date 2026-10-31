@@ -37,6 +37,7 @@ import sys
 from .edits import apply_edits, parse_edits
 from .llm import LLMError, estimate_tokens
 from .tools import TOOL_HELP, dispatch, schema_for
+from . import instructions as instructions_mod
 
 # How many times the gather loop re-asks after a step reply dies at the
 # output cap / produces no salvageable JSON, before giving up and answering
@@ -61,6 +62,13 @@ _MAX_DUPLICATE_READS = 2
 # to correct itself; the same exact step three times means it is stuck.
 _MAX_CONSECUTIVE_ERRORS = 4
 _MAX_REPEATED_STEPS = 3
+
+# Read-only steps whose result cannot change while the previous step is the
+# identical call: re-running them just burns a tool pass and re-injects the
+# same text into the conversation. `read` has its own duplicate-range guard;
+# these are the navigation steps the graveyard run looped on (grep X, grep X,
+# grep X, then outline main.js three times).
+_DEDUP_STEP_ACTIONS = {"grep", "outline", "callers", "sessions", "diff"}
 
 # Cut-off payloads discarded before gather gives up and lets the answer
 # phase report the blocker (Bug W, run 13): two discards with actionable
@@ -302,7 +310,7 @@ def _fold_spans(spans: list[tuple[int, int]]) -> list[tuple[int, int]]:
 
 
 GATHER_BASE = f"""\
-You are a code assistant working through a lookup index of a Python project.
+You are a code assistant working through a lookup index of a software project.
 You cannot see the full source. You see a map of it, and you request the exact
 parts you need, one request at a time.
 
@@ -489,7 +497,7 @@ Before the blocks, write a short plain explanation of what you changed and why.
 If the task is a question rather than a change, just answer it and output no blocks."""
 
 ANSWER_SYSTEM = """\
-You are a Python code assistant. You have a map of the project and the specific
+You are a code assistant. You have a map of the project and the specific
 source you asked to see. Complete the user's task.
 
 """ + EDIT_FORMAT
@@ -634,6 +642,9 @@ class Agent:
         system = (base if base is not None else GATHER_BASE) + \
             (FLAT_HINT if tier == "flat"
              else CARDS_HINT if tier == "cards" else DIRS_HINT)
+        project_notes = instructions_mod.render(self.index.root, self.cfg)
+        if project_notes:
+            system += "\n\n" + project_notes
         if verbose:
             print(f"  [map: {tier}, ~{estimate_tokens(repo_map)} tokens, "
                   f"{len(self.index.files)} files]", file=sys.stderr)
@@ -753,7 +764,8 @@ class Agent:
             action = str(stepjson.get("action") or "").strip()
             why = str(stepjson.get("reasoning") or "").strip()
             sig = _step_signature(stepjson)
-            if sig == last_sig:
+            is_repeat = sig == last_sig
+            if is_repeat:
                 repeated += 1
             else:
                 last_sig = sig
@@ -909,17 +921,27 @@ class Agent:
                           f"answer]", file=sys.stderr)
                 break
 
-            try:
-                obs = dispatch(self.index, self.cfg, stepjson,
-                               client=self.client)
-            except Exception as e:
-                # A tool must never crash the run: one malformed path or an
-                # unexpected filesystem error becomes an ERROR observation
-                # (and the consecutive-error guard above stops a loop on it).
-                print(f"  [{action} tool failed: "
-                      f"{type(e).__name__}: {e}]", file=sys.stderr)
-                obs = (f"ERROR: {action} failed "
-                       f"({type(e).__name__}): {str(e)[:200]}")
+            dedup_step = is_repeat and action in _DEDUP_STEP_ACTIONS
+            if dedup_step:
+                # The previous step was byte-for-byte the same call, and
+                # nothing mutating ran in between. Re-dispatching it cannot
+                # change the result; give the model a short "already done"
+                # observation instead of a second identical result block.
+                obs = (f"[This exact `{action}` step already ran and its "
+                       "result is above. Repeating it cannot add information "
+                       "-- choose a different query/path or say done.]")
+            else:
+                try:
+                    obs = dispatch(self.index, self.cfg, stepjson,
+                                   client=self.client)
+                except Exception as e:
+                    # A tool must never crash the run: one malformed path or an
+                    # unexpected filesystem error becomes an ERROR observation
+                    # (and the consecutive-error guard above stops a loop on it).
+                    print(f"  [{action} tool failed: "
+                          f"{type(e).__name__}: {e}]", file=sys.stderr)
+                    obs = (f"ERROR: {action} failed "
+                           f"({type(e).__name__}): {str(e)[:200]}")
             # If the model's last reply was cut off at the token limit and we
             # salvaged the action from it, say so in the observation: the cut
             # almost always happened inside 'reasoning', and an unmarked
@@ -1180,7 +1202,10 @@ class Agent:
         the search/replace format spec even when `system` is given, for flows
         that must answer in prose only (`explain`)."""
         repo_map, _ = self.index.map_for_prompt(self.cfg)
+        project_notes = instructions_mod.render(self.index.root, self.cfg)
+        notes_prefix = (project_notes + "\n\n") if project_notes else ""
         user = (
+            notes_prefix +
             f"PROJECT MAP\n\n{repo_map}\n\n"
             f"SOURCE YOU REQUESTED\n\n{gathered or '(nothing was looked up)'}\n\n"
             f"TASK\n{task}"
@@ -1204,7 +1229,7 @@ class Agent:
             # OLDEST gathered chunks until the prompt fits a generous ceiling
             # instead of refusing outright; the model still sees its most
             # recent reads, which are the ones it wants to edit.
-            head = f"PROJECT MAP\n\n{repo_map}\n\n"
+            head = notes_prefix + f"PROJECT MAP\n\n{repo_map}\n\n"
             tail = f"\n\nTASK\n{task}"
             ceil_ = int(getattr(self.cfg, "max_prompt_tokens", 0) or 60000)
             src = gathered or "(nothing was looked up)"
@@ -1217,6 +1242,16 @@ class Agent:
                         "if you need it again]" % len(dropped))
             user = head + f"SOURCE YOU REQUESTED\n\n{src}\n" + tail
         room = self.cfg.context_tokens - reply_room - self.cfg.reserve_tokens // 2
+        if not _is_hosted(self.cfg) and estimate_tokens(user) > room > 0 \
+                and notes_prefix:
+            # Project instructions are valuable but must never turn a
+            # previously fitting prompt into a hard failure. Drop them first
+            # (the model still has the map/source/task) and keep the existing
+            # over-budget refusal for the rest.
+            user = user[len(notes_prefix):]
+            print("[project instructions omitted: answer prompt is over the "
+                  "window budget]", file=sys.stderr)
+            notes_prefix = ""
         if not _is_hosted(self.cfg) and estimate_tokens(user) > room > 0:
             over = estimate_tokens(user) - room
             raise LLMError(

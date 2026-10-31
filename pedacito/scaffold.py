@@ -875,7 +875,8 @@ def _first_import_error(root: Path, plan: Plan) -> str | None:
     try:
         proc = subprocess.run(
             [sys.executable, "-c", f"import {mod}"], cwd=str(root),
-            capture_output=True, text=True, timeout=120)
+            capture_output=True, text=True, encoding="utf-8",
+            errors="replace", timeout=120)
     except Exception as e:                      # pragma: no cover
         return f"(could not run import check: {e})"
     if proc.returncode == 0:

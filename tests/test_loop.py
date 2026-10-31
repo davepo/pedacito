@@ -1604,6 +1604,61 @@ def test_run_loop_treats_noop_reply_as_done(tmp_path, monkeypatch):
     assert "- [x] real work" in text
 
 
+def test_run_loop_retries_a_fabricated_noop_task_instead_of_ticking_it(
+        tmp_path, monkeypatch):
+    """The graveyard run's collision.py task emitted three null edits and was
+    ticked DONE because _is_noop matched the synthetic 'No changes' marker.
+    A fabricated no-op is a failed attempt, not a completion: retry once, and
+    only then fail."""
+    plan = tmp_path / "PLAN.md"
+    loop.write_plan(plan, "", ["move the dead file"])
+    idx = types.SimpleNamespace(root=tmp_path)
+    calls = []
+    notes = []
+
+    def fake_run_task(root, cfg, client, agent, idx_, task, apply=True,
+                      review=False, answer_system=None):
+        calls.append(task)
+        notes.append(task)
+        if len(calls) == 1:
+            return loop.TaskResult(
+                [], "I'll first read the file.\n\n[No changes: every edit "
+                "block in the reply was a no-op (SEARCH == REPLACE) and was "
+                "discarded; nothing was written.]", True, [], idx_,
+                fabricated=True)
+        return _result(idx_)
+
+    monkeypatch.setattr(loop, "run_task", fake_run_task)
+    code = loop.run_loop(tmp_path, _cfg(), None, idx, plan, apply=True)
+    assert code == 0
+    assert calls[0] == "move the dead file"
+    assert calls[1].startswith("move the dead file")
+    assert "NO-OPS" in calls[1]            # the retry carries the corrective note
+    assert "- [x] move the dead file" in plan.read_text()
+
+
+def test_run_loop_marks_a_twice_fabricated_noop_task_failed(tmp_path,
+                                                            monkeypatch):
+    plan = tmp_path / "PLAN.md"
+    loop.write_plan(plan, "", ["move the dead file"])
+    idx = types.SimpleNamespace(root=tmp_path)
+    calls = []
+
+    def fake_run_task(root, cfg, client, agent, idx_, task, apply=True,
+                      review=False, answer_system=None):
+        calls.append(task)
+        return loop.TaskResult(
+            [], "I'll first read the file.\n\n[No changes: every edit block "
+            "was a no-op.]", True, [], idx_, fabricated=True)
+
+    monkeypatch.setattr(loop, "run_task", fake_run_task)
+    code = loop.run_loop(tmp_path, _cfg(), None, idx, plan, apply=True,
+                         stop_on_fail=False)
+    assert code == 1
+    assert len(calls) == 2                 # one retry, then a verdict
+    assert "- [!] move the dead file" in plan.read_text()
+
+
 def test_run_loop_reruns_an_empty_report_once_then_retires_the_check(
         tmp_path, monkeypatch):
     """Fix ZD (run 13f): the frog check's gather phase succeeded -- its
@@ -2698,7 +2753,7 @@ def test_custom_answer_system_still_carries_edit_format(tmp_path):
     assert "--- FILE:" in sys_prompt
     assert ">>>>>>> REPLACE" in sys_prompt
     # The default brief is unchanged: intro + the shared format.
-    assert ANSWER_SYSTEM.startswith("You are a Python code assistant")
+    assert ANSWER_SYSTEM.startswith("You are a code assistant")
     assert ANSWER_SYSTEM.endswith(EDIT_FORMAT)
 
 

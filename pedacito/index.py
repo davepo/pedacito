@@ -118,7 +118,7 @@ def infer_root(paths: list[str]) -> Path:
 TOP_KINDS = ("function", "class", "classheader", "module")
 
 SUMMARY_SYSTEM = (
-    "You summarise Python code for a lookup index. Given one unit of code, reply with "
+    "You summarise source code for a lookup index. Given one unit of code, reply with "
     "ONE sentence (two at most) describing what it does and any non-obvious assumption, "
     "side effect, or external dependency it has. Do not restate the signature. Do not "
     "list parameters. Do not use bullet points, markdown, or a preamble. Start directly "
@@ -126,7 +126,7 @@ SUMMARY_SYSTEM = (
 )
 
 FILE_SUMMARY_SYSTEM = (
-    "You summarise a Python module for a lookup index. You are given the module's "
+    "You summarise a source file for a lookup index. You are given the module's "
     "skeleton: its imports and the signatures of everything it defines. Reply with TWO "
     "sentences: what this module is responsible for, and what another part of the system "
     "would come here to do. Do not list the functions back. No markdown, no preamble."
@@ -477,7 +477,7 @@ class Index:
             "chunks": [c.to_record() for c in self.chunks],
         }
         p = d / INDEX_FILE
-        p.write_text(json.dumps(payload, indent=1))
+        p.write_text(json.dumps(payload, indent=1), encoding="utf-8")
         return p
 
     @classmethod
@@ -489,7 +489,7 @@ class Index:
         p = root / INDEX_DIR / INDEX_FILE
         if not p.exists():
             return None
-        data = json.loads(p.read_text())
+        data = json.loads(p.read_text(encoding="utf-8"))
         chunks = [Chunk(**rec) for rec in data["chunks"]]
         cache: dict[str, list[str]] = {}
         for c in chunks:
@@ -557,7 +557,7 @@ def _load_cache(root: Path) -> dict:
     p = root / INDEX_DIR / CACHE_FILE
     if p.exists():
         try:
-            return json.loads(p.read_text())
+            return json.loads(p.read_text(encoding="utf-8"))
         except json.JSONDecodeError:
             return {}
     return {}
@@ -567,7 +567,8 @@ def _save_cache(root: Path, cache: dict) -> None:
     """Persist the summary cache to .pedacito/summaries.json."""
     d = root / INDEX_DIR
     d.mkdir(exist_ok=True)
-    (d / CACHE_FILE).write_text(json.dumps(cache, indent=1))
+    (d / CACHE_FILE).write_text(json.dumps(cache, indent=1),
+                                encoding="utf-8")
 
 
 # --------------------------------------------------------------------------
@@ -692,6 +693,29 @@ def _ask(client, cfg, system: str, prompt: str, label: str,
 # --------------------------------------------------------------------------
 # Per-file chunker dispatch
 # --------------------------------------------------------------------------
+def _unique_qualnames(chunks: list[Chunk]) -> list[Chunk]:
+    """Make every chunk's (file, qualname) key unique.
+
+    Python properties have a getter and a setter with the same name; TS
+    overloads and conditionally defined functions can do the same. The index
+    stores chunks by key, so a duplicate silently replaced one of the two
+    definitions. Suffix later occurrences (`vram#2`) rather than dropping
+    them -- both bodies are real and may need to be read.
+    """
+    used: set[str] = set()
+    for c in chunks:
+        base = c.qualname
+        name = base
+        n = 2
+        while name in used:
+            name = f"{base}#{n}"
+            n += 1
+        if name != base:
+            c.qualname = name
+        used.add(name)
+    return chunks
+
+
 def _chunk_file(rel: str, path: Path, cfg) -> list[Chunk]:
     """Chunk one selected file with whichever chunker matches its extension:
     AST-based for Python (exact), tree-sitter for JS/TS/TSX when the
@@ -707,11 +731,15 @@ def _chunk_file(rel: str, path: Path, cfg) -> list[Chunk]:
     suffix = path.suffix.lower()
     if suffix in PY_EXTS:
         src = fileio.read_text(path)
-        return chunk_source(rel, src, cfg.class_split_lines)
+        return _unique_qualnames(chunk_source(
+            rel, src, cfg.class_split_lines,
+            cfg.max_unit_lines, cfg.max_unit_chars))
     if suffix in LANG_BY_EXT:
         if TS_AVAILABLE:
             src = fileio.read_text(path)
-            return chunk_file_ts(rel, src, suffix, cfg.class_split_lines)
+            return _unique_qualnames(chunk_file_ts(
+                rel, src, suffix, cfg.class_split_lines,
+                cfg.max_unit_lines, cfg.max_unit_chars))
         return chunk_reference(rel, path, cfg.max_reference_bytes)
     return chunk_reference(rel, path, cfg.max_reference_bytes)
 

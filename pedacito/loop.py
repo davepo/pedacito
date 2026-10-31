@@ -42,6 +42,7 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 from . import index as index_mod
+from . import instructions as instructions_mod
 from . import review as review_mod
 from . import workspace
 from .edits import parse_edits
@@ -739,7 +740,8 @@ def _titles_from(raw) -> list[str]:
     return titles
 
 
-def generate_tasks(spec_text: str, client, cfg) -> list[str]:
+def generate_tasks(spec_text: str, client, cfg,
+                   root: Path | None = None) -> list[str]:
     """Ask the model to break `spec_text` into an ordered task list.
 
     Retries once with an explicit "you returned zero tasks" nudge when the
@@ -748,16 +750,24 @@ def generate_tasks(spec_text: str, client, cfg) -> list[str]:
     exactly the schema's length cap (grammar-constrained sampling force-
     closed it mid-sentence -- Bug Y, runs 13/13b), and finally falls back
     to one task built from the goal itself rather than aborting the whole
-    run."""
+    run.
+
+    When `root` is given, the project's instruction file is included in the
+    planner prompt too -- a plan that ignores "never edit generated/" is
+    wrong before the first edit happens."""
     budget = getattr(cfg, "max_spec_chars", 60_000)
     body = spec_text.strip()[:budget]
     max_tokens = getattr(cfg, "max_tokens_plan", 2000)
+    plan_system = PLAN_SYSTEM
+    notes = instructions_mod.render(root, cfg) if root is not None else ""
+    if notes:
+        plan_system += "\n\n" + notes
     base_user = (f"GOAL\n\n{body}\n\n"
                  "Break this into an ordered task list. Each task title must be "
                  "a single imperative sentence a coding agent can implement and "
                  "verify in isolation.")
     raw = client.chat_json(
-        [{"role": "system", "content": PLAN_SYSTEM},
+        [{"role": "system", "content": plan_system},
          {"role": "user", "content": base_user}],
         TASK_SCHEMA, max_tokens=max_tokens, disable_thinking=True)
     titles = _titles_from(raw)
@@ -787,7 +797,7 @@ def generate_tasks(spec_text: str, client, cfg) -> list[str]:
                    "copy a long passage), and split any check with "
                    "sub-items into one task per sub-item.")
         raw = client.chat_json(
-            [{"role": "system", "content": PLAN_SYSTEM},
+            [{"role": "system", "content": plan_system},
              {"role": "user", "content": retry}],
             TASK_SCHEMA, max_tokens=max_tokens, disable_thinking=True)
         retried = _titles_from(raw)
@@ -802,7 +812,7 @@ def generate_tasks(spec_text: str, client, cfg) -> list[str]:
                  "least one concrete step. For a bug, list the steps to "
                  "reproduce, locate, fix, and verify it. Return the tasks now.")
         raw = client.chat_json(
-            [{"role": "system", "content": PLAN_SYSTEM},
+            [{"role": "system", "content": plan_system},
              {"role": "user", "content": nudge}],
             TASK_SCHEMA, max_tokens=max_tokens, disable_thinking=True)
         titles = _titles_from(raw)
@@ -882,7 +892,8 @@ def install_modules(packages: list[str], root: Path) -> tuple[bool, str]:
     cmd = [sys.executable, "-m", "pip", "install", "--quiet", *dists]
     try:
         proc = subprocess.run(cmd, cwd=str(root), capture_output=True,
-                              text=True, timeout=600)
+                              text=True, encoding="utf-8", errors="replace",
+                              timeout=600)
     except Exception as e:                       # pragma: no cover - env specific
         return False, f"could not run pip: {e}"
     out = ((proc.stdout or "") + (proc.stderr or "")).strip()
@@ -906,6 +917,12 @@ class TaskResult:
     idx: "index_mod.Index"
     session: Path | None = None
     steps: list[str] = field(default_factory=list)
+    # True when the reply's only edit blocks were null edits (SEARCH ==
+    # REPLACE) and the reply did NOT itself declare the work complete. The
+    # outer loop must not treat that as "already done": it is a failed
+    # attempt to act (the graveyard run's task 2 ticked itself off this way
+    # after three discarded no-op blocks).
+    fabricated: bool = False
 
 
 def _report(results, dry_run: bool):
@@ -1336,6 +1353,20 @@ def run_task(root: Path, cfg, client, agent, idx, task: str, *,
     refusal = _edit_refusal_head(raw_reply)
     contradicted = bool(refusal) and bool(parse_edits(raw_reply))
     fabricated = False       # reply's only blocks were no-ops (Fix X)
+    fabricated_only = False  # ...and the reply did not declare "no changes"
+    def _mark_fabricated(text: str) -> str:
+        """Record null-only blocks; stamp the refusal marker only when the
+        reply itself was not already an honest "no changes" declaration.
+        Stamping a genuinely complete reply as fabricated would make the
+        outer loop retry work that is already done."""
+        nonlocal fabricated, fabricated_only
+        fabricated = True
+        if _is_noop(text):
+            return text
+        fabricated_only = True
+        return (text.rstrip() + "\n\n[No changes: every edit block in the "
+                "reply was a no-op (SEARCH == REPLACE) and was discarded; "
+                "nothing was written.]")
     if contradicted:
         # Bug U (graveyard run): the inserted repair's prose said "No edit."
         # and explained why acting would violate the goal's freeze -- then
@@ -1365,14 +1396,11 @@ def run_task(root: Path, cfg, client, agent, idx, task: str, *,
             # skipped and the outer loop's no-op path treats the repair as
             # the refusal it was (repair_outcome False -> the failing check
             # retires instead of burning another verify round).
-            fabricated = True
             files = ", ".join(dict.fromkeys(agent.noop_discards))
             workspace.log_event(root, f"reply emitted only no-op edit "
                                       f"block(s) ({files}); treated as a "
                                       f"refusal to edit", "WARN")
-            reply = (reply.rstrip() + "\n\n[No changes: every edit block in "
-                     "the reply was a no-op (SEARCH == REPLACE) and was "
-                     "discarded; nothing was written.]")
+            reply = _mark_fabricated(reply)
     if not results and not _is_noop(reply) and not contradicted:
         # The answer phase produced zero edit blocks. Before declaring the
         # task dead, give the model one bounded recovery: honour any read
@@ -1404,14 +1432,11 @@ def run_task(root: Path, cfg, client, agent, idx, task: str, *,
             # The re-ask itself produced only fabricated null edits
             # (parse_edits dropped them): same treatment as the
             # first-answer case above.
-            fabricated = True
             files = ", ".join(dict.fromkeys(agent.noop_discards))
             workspace.log_event(root, f"re-ask produced only no-op edit "
                                       f"block(s) ({files}); treated as a "
                                       f"refusal to edit", "WARN")
-            reply = (reply.rstrip() + "\n\n[No changes: every edit block in "
-                     "the reply was a no-op (SEARCH == REPLACE) and was "
-                     "discarded; nothing was written.]")
+            reply = _mark_fabricated(reply)
     if (not results and not contradicted and not fabricated
             and not _is_noop(reply)):
         # Fix X2: a "no changes" declaration is a decision the loop
@@ -1454,7 +1479,8 @@ def run_task(root: Path, cfg, client, agent, idx, task: str, *,
                                           raw_reply=raw_reply if truncated else None)
         print(f"[session: {session.relative_to(root)}]", file=sys.stderr)
     return TaskResult(results, reply, applied, changed, idx, session,
-                      list(getattr(agent, "steps_log", []) or []))
+                      list(getattr(agent, "steps_log", []) or []),
+                      fabricated=fabricated_only)
 
 
 # --------------------------------------------------------------------------
@@ -1499,12 +1525,37 @@ _INCOMPLETE_RETRY_NOTE = (
     "This exact task was already attempted and ended with ZERO changes "
     "applied; its reply described what a future attempt would need instead "
     "of doing it. There is no future attempt after this one. The lookup "
-    "phase has the full toolset: `read` opens any file in the project, and "
-    "`run` executes shell commands (mkdir, mv, ls, and launching the app "
-    "all work). Spend this attempt's lookups on the task's actual work and "
-    "finish it. If -- and only if -- the work is genuinely already "
-    "complete, or genuinely impossible, say exactly that as your first "
-    "line, with the evidence or the exact blocker.")
+    "phase has the full toolset: `read` opens any file in the project, "
+    "`grep` finds references, and `run` executes a command directly (a test "
+    "runner, `python`, or an app launcher). When allow_write is on, "
+    "`move`/`write`/`delete` change files too. Spend this attempt's lookups "
+    "on the task's actual work and finish it. If -- and only if -- the work "
+    "is genuinely already complete, or genuinely impossible, say exactly "
+    "that as your first line, with the evidence or the exact blocker.")
+
+_NOOP_EDIT_RETRY_NOTE = (
+    "### RETRY -- THE PREVIOUS ATTEMPT'S EDIT BLOCKS WERE NO-OPS\n"
+    "This exact task was already attempted and every edit block it emitted "
+    "had identical SEARCH and REPLACE text (a null edit), so nothing was "
+    "written. That is not a way to finish the task. Do the work now. To move "
+    "a file, emit a rename pair: one empty-SEARCH creation block for the NEW "
+    "path, plus one block for the OLD path whose SEARCH quotes a few real "
+    "lines and whose REPLACE is empty. Never retype the file's contents. If "
+    "the task is genuinely already complete, write exactly "
+    "`No changes: <reason>` as your first line and emit no blocks.")
+
+_NOOP_EDIT_RETRY_NOTE_MOVE = (
+    "### RETRY -- THE PREVIOUS ATTEMPT'S EDIT BLOCKS WERE NO-OPS\n"
+    "This exact task was already attempted and every edit block it emitted "
+    "had identical SEARCH and REPLACE text (a null edit), so nothing was "
+    "written. That is not a way to finish the task. Do the work now. A file "
+    "move has two supported forms: the gather `move` action (`file` = old "
+    "path, `to` = new path), or a rename pair of edit blocks -- one "
+    "empty-SEARCH creation block for the NEW path, plus one block for the OLD "
+    "path whose SEARCH quotes a few real lines and whose REPLACE is empty. "
+    "Never retype the file's contents. If the task is genuinely already "
+    "complete, write exactly `No changes: <reason>` as your first line and "
+    "emit no blocks.")
 
 
 def run_loop(root: Path, cfg, client, idx, plan_path: Path, *,
@@ -1890,6 +1941,38 @@ def run_loop(root: Path, cfg, client, idx, plan_path: Path, *,
                       file=sys.stderr)
                 workspace.log_event(
                     root, "task declared itself incomplete on retry; "
+                          "marking failed", "ERROR")
+                failed += 1
+                if stop_on_fail:
+                    break
+                mark_failed(plan_path, task)
+                continue
+            if getattr(tr, "fabricated", False) and task != _REMEDIATION_TITLE:
+                # The reply's only blocks were null edits (SEARCH == REPLACE)
+                # and it did not itself declare the work complete. _is_noop
+                # used to match the synthetic marker run_task appended and
+                # tick the task done -- the graveyard run's collision.py task
+                # "completed" without a single lookup or move. Retry once with
+                # the concrete move/rename instructions, then fail loudly.
+                tries = retried.get(task, 0)
+                if tries < _MAX_TASK_RETRIES:
+                    retried[task] = tries + 1
+                    retry_note[:] = [
+                        _NOOP_EDIT_RETRY_NOTE_MOVE
+                        if getattr(cfg, "allow_write", False)
+                        else _NOOP_EDIT_RETRY_NOTE]
+                    print("  [task emitted only no-op edit blocks -- "
+                          "retrying it once]", file=sys.stderr)
+                    workspace.log_event(
+                        root, "task emitted only no-op edit blocks; "
+                              "retrying once", "WARN")
+                    continue
+                print(f"  [task emitted only no-op edit blocks twice; "
+                      f"marking it failed -- "
+                      f"{'stopping' if stop_on_fail else 'continuing'}]",
+                      file=sys.stderr)
+                workspace.log_event(
+                    root, "task emitted only no-op edit blocks on retry; "
                           "marking failed", "ERROR")
                 failed += 1
                 if stop_on_fail:

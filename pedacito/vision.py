@@ -32,6 +32,7 @@ from pathlib import Path
 def _run(cmd: list[str], timeout: int = 30) -> tuple[bool, str]:
     try:
         p = subprocess.run(cmd, capture_output=True, text=True,
+                           encoding="utf-8", errors="replace",
                            timeout=timeout)
     except Exception as e:                       # pragma: no cover - env specific
         return False, str(e)
@@ -61,6 +62,10 @@ def capture(path) -> tuple[bool, str]:
             pass
 
     if os.name == "nt":                          # pragma: no cover - Windows
+        # PowerShell single-quoted literals escape an embedded quote by
+        # doubling it; without this, a project path containing "'" broke the
+        # capture script.
+        save_path = str(path).replace("'", "''")
         script = (
             "Add-Type -AssemblyName System.Windows.Forms;"
             "Add-Type -AssemblyName System.Drawing;"
@@ -69,7 +74,7 @@ def capture(path) -> tuple[bool, str]:
             "$g=[System.Drawing.Graphics]::FromImage($bmp);"
             "$g.CopyFromScreen($b.Location,[System.Drawing.Point]::Empty,"
             "$b.Size);"
-            f"$bmp.Save('{path}',[System.Drawing.Imaging.ImageFormat]::Png)"
+            f"$bmp.Save('{save_path}',[System.Drawing.Imaging.ImageFormat]::Png)"
         )
         ok, out = _run(["powershell", "-NoProfile", "-Command", script])
         if ok and path.exists():
@@ -104,14 +109,32 @@ def capture(path) -> tuple[bool, str]:
                    "scrot/ImageMagick (X11), or gnome-screenshot.")
 
 
+_TESSERACT_INIT_ERRORS = (
+    "error opening data file",
+    "failed loading language",
+    "tesseract couldn't load",
+    "could not initialize tesseract",
+    "please make sure the tessdata_prefix environment variable is set",
+)
+
+
 def ocr(path) -> str:
-    """Return OCR text for `path` when tesseract is installed, else ''."""
+    """Return OCR text for `path` when tesseract is installed, else ''.
+
+    tesseract is often installed without language data (`eng.traineddata`).
+    Its stderr then reads like OCR output and used to be pasted into the
+    report as "OCR text", which the model treated as evidence about the page.
+    Drop those initialisation lines; if nothing real remains, report no text.
+    """
     if not shutil.which("tesseract"):
         return ""
     ok, out = _run(["tesseract", str(path), "stdout"], timeout=30)
-    if not ok and not out:
+    lines = [ln for ln in (out or "").splitlines()
+             if not any(m in ln.lower() for m in _TESSERACT_INIT_ERRORS)]
+    text = "\n".join(lines).strip()
+    if not ok or not text:
         return ""
-    return out.strip()[:2000]
+    return text[:2000]
 
 
 def _compare(Image, path: Path, previous: Path) -> str:

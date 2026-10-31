@@ -112,11 +112,11 @@ def ensure(root: Path, manage_gitignore: bool = True,
     if create_ignore:
         ig = root / IGNORE_FILE
         if not ig.exists():
-            ig.write_text(IGNORE_TEMPLATE)
+            ig.write_text(IGNORE_TEMPLATE, encoding="utf-8")
             if verbose:
                 print(f"  created {ig}", file=sys.stderr)
-        elif ".pedacito" not in ig.read_text():
-            with ig.open("a") as fh:
+        elif ".pedacito" not in ig.read_text(encoding="utf-8", errors="replace"):
+            with ig.open("a", encoding="utf-8") as fh:
                 fh.write("\n.pedacito/\n")
 
     if manage_gitignore:
@@ -140,12 +140,13 @@ def _add_to_gitignore(root: Path, verbose: bool) -> None:
     if not gi.exists():
         if not (root / ".git").exists():
             return          # not a repo; leave the directory alone
-        gi.write_text("# Pedacito\n" + "\n".join(GITIGNORE_ENTRIES) + "\n")
+        gi.write_text("# Pedacito\n" + "\n".join(GITIGNORE_ENTRIES) + "\n",
+                      encoding="utf-8")
         if verbose:
             print(f"  created {gi} with Pedacito entries", file=sys.stderr)
         return
 
-    text = gi.read_text()
+    text = gi.read_text(encoding="utf-8", errors="replace")
     # Strip trailing slashes on both sides so ".pedacito" and ".pedacito/"
     # count as the same entry (gitignore treats them identically for a
     # directory), and ignore comment lines when checking for presence.
@@ -158,7 +159,7 @@ def _add_to_gitignore(root: Path, verbose: bool) -> None:
     if not to_add:
         return
 
-    with gi.open("a") as fh:
+    with gi.open("a", encoding="utf-8") as fh:
         if text and not text.endswith("\n"):
             fh.write("\n")
         if text:
@@ -257,5 +258,5 @@ def write_session(root: Path, task: str, steps: list[str], reply: str,
         lines += ["", f"Originals saved to `{backup.relative_to(root)}`.",
                   f"Restore with `pedacito restore {root} --snapshot {backup.name}`."]
     p = d / f"{when}.md"
-    p.write_text("\n".join(lines) + "\n")
+    p.write_text("\n".join(lines) + "\n", encoding="utf-8")
     return p

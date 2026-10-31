@@ -295,6 +295,65 @@ def test_grep_miss_suggests_similar_symbols(tmp_path):
     assert "helper" in obs
 
 
+def test_grep_file_path_reports_import_and_text_references(tmp_path):
+    """`grep collision.py` is how small models phrase "find references to
+    collision.py". It used to search for that literal string, find nothing,
+    and fall into semantic search (which re-embedded the project). Return a
+    proper import+mention report instead."""
+    idx = _index(tmp_path, {
+        "collision.py": "def check():\n    return True\n",
+        "fly_spawner.py": "from collision import check\nx = 1\n",
+        "notes.py": "# See collision.py for the collision rules.\nx = 1\n",
+    })
+    obs = tools.tool_grep(idx, "collision.py")
+    assert "References to collision.py" in obs
+    assert "fly_spawner.py:1" in obs and "import" in obs
+    assert "notes.py:1" in obs and "text" in obs
+    assert "Found 2 code reference(s)" in obs
+
+
+def test_grep_file_path_with_no_references_reports_dead_code(tmp_path):
+    idx = _index(tmp_path, {
+        "dead.py": "def unused():\n    return 1\n",
+        "live.py": "x = 1\n",
+    })
+    obs = tools.tool_grep(idx, "dead.py")
+    assert "No references to dead.py" in obs
+    assert "dead-code candidate" in obs
+
+
+def test_grep_file_reference_respects_an_explicit_scope(tmp_path):
+    """An explicit scope means "search inside this file", not "find
+    references to that file" -- the reference shortcut must not fire."""
+    idx = _index(tmp_path, {
+        "collision.py": "check = 1\n",
+        "notes.py": "# collision.py is mentioned here\nx = 1\n",
+    })
+    obs = tools.tool_grep(idx, "collision.py", "notes.py")
+    assert "References to" not in obs
+    assert "notes.py:1" in obs
+
+
+def test_read_mid_file_includes_the_enclosing_signature_and_imports(tmp_path):
+    """A mid-function read otherwise shows bare statements with no def line
+    and no import list. Both are already indexed, so include them for free."""
+    src = ("import os\nimport sys\n\n"
+           "def big():\n    a = os.getcwd()\n    b = sys.argv\n")
+    idx = _index(tmp_path, {"pkg/app.py": src})
+    obs = tools.tool_read(idx, Config(), "pkg/app.py", 5, 6)
+    assert "[context: def big()" in obs
+    assert "module imports: os, sys" in obs
+
+
+def test_read_context_hint_can_be_disabled(tmp_path):
+    src = "import os\n\ndef big():\n    a = os.getcwd()\n"
+    idx = _index(tmp_path, {"pkg/app.py": src})
+    cfg = Config()
+    cfg.read_context_hint = False
+    obs = tools.tool_read(idx, cfg, "pkg/app.py", 4, 4)
+    assert "[context:" not in obs
+
+
 def test_callers_shows_call_sites_and_callees(tmp_path):
     idx = _index(tmp_path)
     helper = tools.tool_callers(idx, "helper")
@@ -836,6 +895,98 @@ def test_semantic_failure_does_not_lose_the_grep_step(tmp_path):
     obs = tools.tool_grep(idx, "increment", cfg=cfg, client=BadEmbed())
     assert "semantic search unavailable" in obs
     assert "No matches" in obs
+
+
+def test_unsupported_embeddings_endpoint_is_not_retried(tmp_path):
+    """Lemonade's llama.cpp backend answers /v1/embeddings with 501 unless it
+    was started with --embeddings. Every no-hit grep used to re-embed all
+    units, fail again, and repeat the 189-unit banner. The verdict must be
+    remembered for the run (keyed by endpoint+model)."""
+    from pedacito import semantic
+    from pedacito.llm import LLMError
+
+    idx = _index(tmp_path, {"pkg/app.py": SEMANTIC_APP})
+
+    class Unsupported:
+        def __init__(self):
+            self.calls = 0
+
+        def embed(self, texts):
+            self.calls += 1
+            raise LLMError("Embeddings request failed (501): This server "
+                           "does not support embeddings.")
+
+    cfg = Config()
+    cfg.semantic_search = True
+    cfg.base_url = "http://test-501.invalid/v1"
+    cfg.model = "no-embed-model"
+    client = Unsupported()
+    try:
+        first = tools.tool_grep(idx, "increment", cfg=cfg, client=client)
+        assert "semantic search unavailable" in first
+        calls = client.calls
+        second = tools.tool_grep(idx, "increment", cfg=cfg, client=client)
+        assert client.calls == calls, \
+            "the unsupported endpoint was retried instead of cached"
+        assert "disabled for this run" in second
+    finally:
+        semantic._DISABLED.pop((cfg.base_url.rstrip("/"), cfg.model), None)
+
+
+def test_ocr_ignores_missing_tesseract_language_noise(monkeypatch):
+    """tesseract installed without eng.traineddata writes its init errors to
+    stderr; they used to be returned as OCR text and fed to the model as page
+    evidence. A failed run must report no OCR text."""
+    from pedacito import vision
+
+    monkeypatch.setattr(vision.shutil, "which",
+                        lambda name: "/usr/bin/tesseract")
+    monkeypatch.setattr(vision, "_run", lambda cmd, timeout=30: (False, (
+        "Error opening data file /usr/share/tessdata/eng.traineddata\n"
+        "Please make sure the TESSDATA_PREFIX environment variable is set "
+        "to your \"tessdata\" directory.\n"
+        "Failed loading language 'eng'\n"
+        "Tesseract couldn't load any languages!\n"
+        "Could not initialize tesseract.")))
+    assert vision.ocr("screen.png") == ""
+
+
+def test_ocr_keeps_real_text(monkeypatch):
+    from pedacito import vision
+
+    monkeypatch.setattr(vision.shutil, "which",
+                        lambda name: "/usr/bin/tesseract")
+    monkeypatch.setattr(vision, "_run",
+                        lambda cmd, timeout=30: (True, "Time: 4\nScore: 403"))
+    assert vision.ocr("screen.png") == "Time: 4\nScore: 403"
+
+
+def test_session_log_is_utf8_on_any_platform(tmp_path):
+    """Model replies contain em dashes, arrows, and non-ASCII paths. Session
+    logs used Path.write_text() with the platform default encoding, which
+    raises UnicodeEncodeError on a Windows cp1252 console host."""
+    p = workspace.write_session(
+        tmp_path, "move the dead — module", ["1. grep — collision"],
+        "Done — moved the file.", [], None, when="20260101-000000")
+    text = p.read_text(encoding="utf-8")
+    assert "dead — module" in text
+    assert "Done — moved the file." in text
+
+
+def test_windows_command_split_keeps_backslashes(monkeypatch):
+    """POSIX shlex eats backslashes in Windows paths; the non-POSIX splitter
+    keeps them and leaves surrounding quotes for the stripper."""
+    monkeypatch.setattr(tools.os, "name", "nt")
+    argv = tools._split_command(
+        '"C:\\Program Files\\Python\\python.exe" "a b.py"')
+    assert argv == ["C:\\Program Files\\Python\\python.exe", "a b.py"]
+
+
+def test_allowlist_matches_python_exe_on_windows(monkeypatch):
+    monkeypatch.setattr(tools.os, "name", "nt")
+    cfg = Config()
+    cfg.shell_allowlist = ("python",)
+    assert tools._allowlist_error(cfg, ["python.exe", "-V"]) == ""
 
 
 # ------------------------------------------------------- index freshness/map

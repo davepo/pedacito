@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import json
 import math
+import re
 import sys
 from pathlib import Path
 
@@ -32,6 +33,33 @@ from .llm import LLMError
 EMBEDDINGS_FILE = "embeddings.json"
 _BATCH = 32
 _MAX_UNIT_CHARS = 2000
+
+# Servers that cannot serve embeddings at all (Lemonade's llama.cpp backend
+# unless started with --embeddings returns HTTP 501; a wrong embedding_model
+# returns 400/404). Without this, every grep that finds no textual hit calls
+# semantic.search again, re-embeds all N units, fails again, and prints the
+# same banner -- the graveyard run did that 30+ times in one task. Remember
+# the verdict for the life of the process, keyed by endpoint + model so a
+# config change (or a different profile) starts fresh.
+_DISABLED: dict[tuple[str, str], str] = {}
+
+
+def _endpoint_key(cfg, model: str) -> tuple[str, str]:
+    return (str(getattr(cfg, "base_url", "") or "").rstrip("/"), model)
+
+
+def _permanent_embedding_failure(message: str) -> bool:
+    """True for failures that will recur on every retry (unsupported
+    endpoint, unknown model, bad request), as opposed to a transient
+    connection drop where a later grep might succeed."""
+    low = (message or "").lower()
+    if "not support" in low and "embedding" in low:
+        return True
+    m = re.search(r"embeddings request failed \((\d{3})\)", low)
+    if m:
+        code = int(m.group(1))
+        return 400 <= code < 500 or code == 501
+    return False
 
 
 def model_name(cfg) -> str:
@@ -96,6 +124,9 @@ def _ensure(index, cfg, client, verbose: bool = False
             ) -> tuple[dict[str, list[float]], str]:
     """Return (vectors_by_sha, model), embedding any missing units."""
     model = model_name(cfg)
+    key = _endpoint_key(cfg, model)
+    if key in _DISABLED:
+        raise LLMError(_DISABLED[key])
     vectors = _load_cache(index.root, model)
     units = [c for c in index.chunks
              if c.kind != "module" and c.sha and (c.source or "").strip()]
@@ -107,7 +138,16 @@ def _ensure(index, cfg, client, verbose: bool = False
               f"(cached afterwards)", file=sys.stderr)
     for start in range(0, len(missing), _BATCH):
         group = missing[start:start + _BATCH]
-        embedded = client.embed([_unit_text(c) for c in group])
+        try:
+            embedded = client.embed([_unit_text(c) for c in group])
+        except LLMError as e:
+            if _permanent_embedding_failure(str(e)):
+                _DISABLED[key] = (
+                    "semantic search disabled for this run: the server "
+                    f"cannot embed with {model} ({str(e)[:240]}). Start the "
+                    "server with embeddings support (llama.cpp: "
+                    "`--embeddings`) or set semantic_search = false.")
+            raise
         if len(embedded) != len(group):
             raise LLMError(
                 f"Embeddings server returned {len(embedded)} vectors for "

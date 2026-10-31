@@ -12,8 +12,8 @@ hardware most people running local models actually have: a single consumer GPU
 with 16–24GB of VRAM, not a cluster.
 
 - Works with any server exposing an OpenAI-compatible `/v1` API — tested
-  against **LM Studio and Ollama** — on Windows, Linux, and macOS. Hosted APIs
-  (DeepSeek, OpenAI, and similar) work too.
+  against **LM Studio, Ollama, and Lemonade** — on Windows, Linux, and macOS.
+  Hosted APIs (DeepSeek, OpenAI, and similar) work too.
 - AST-based chunking for Python, tree-sitter for JavaScript, TypeScript, TSX,
   and Ruby; structural indexing for everything else useful as context.
 - Edits come back as search/replace blocks rather than whole files or diffs.
@@ -259,6 +259,16 @@ The forgiving fallbacks matter most for 9B–27B models: a malformed argument
 usually still returns useful source instead of burning one of the task's
 lookups.
 
+### Project instructions
+
+Pedacito reads a short project conventions file into every gather and answer
+prompt. It checks, in order, `PEDACEITO.md`, `AGENTS.md`, `CLAUDE.md`,
+`.pedacito/instructions.md`, and `.pedacito/PEDACEITO.md`, and uses the first
+one found. This is the place for build/test commands, style rules, generated
+directories to leave alone, and verification steps — the context a small
+model would otherwise invent. The text is capped by `max_instruction_chars`
+(default 2000) and can be disabled with `use_project_instructions = false`.
+
 ### Seeing a GUI
 
 A text model cannot actually see a game or desktop window. The practical
@@ -415,11 +425,16 @@ Pedacito starts.
 
 **Python** (via the standard-library `ast`) and **JavaScript, TypeScript, TSX,
 and Ruby** (via `tree-sitter`, installed by default) are parsed into functions,
-classes, and methods with exact line ranges. Everything else useful as context
-— `.md .txt .rst .csv .tsv .json .toml .yaml .yml .ini .cfg .conf .env .sql
-.sh` — is indexed *structurally*: the map shows a CSV's columns, a JSON file's
-keys, a TOML file's sections, a markdown file's headings. Contents stay out of
-the map, but `read` and `grep` reach them normally.
+classes, and methods with exact line ranges. A function/method larger than
+`max_unit_lines` (220) or `max_unit_chars` (12000) is split at top-level
+statement boundaries into `name#2`, `name#3`, ... parts, so one huge function
+cannot force a small model to read its whole body or skip it altogether. A
+mid-file `read` also carries the enclosing signature and module imports from
+the index instead of spending another lookup on the file head. Everything else
+useful as context — `.md .txt .rst .csv .tsv .json .toml .yaml .yml .ini .cfg
+.conf .env .sql .sh` — is indexed *structurally*: the map shows a CSV's columns,
+a JSON file's keys, a TOML file's sections, a markdown file's headings. Contents
+stay out of the map, but `read` and `grep` reach them normally.
 
 Anything else is invisible until you add its extension explicitly:
 

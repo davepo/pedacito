@@ -261,6 +261,97 @@ def test_rename_placeholder_already_a_comment(tmp_path):
 
 
 
+def test_rename_into_graveyard_moves_full_content(tmp_path):
+    """A dead-code move into a SUBDIRECTORY (the documented graveyard
+    workflow) must pair even though the paths differ by a directory. The old
+    basename-only pairing compared the whole relative path, so it rejected
+    the pair and the harness wrote the placeholder stub while stripping the
+    live file's header -- a copy-like half-move instead of a real rename."""
+    source = ("\"\"\"Dead module.\"\"\"\n"
+              "import math\n"
+              "import os\n"
+              "\n"
+              "def helper():\n"
+              "    return math.pi\n")
+    _write(tmp_path / "dead.py", source)
+    reply = (
+        "--- FILE: graveyard/dead.py\n"
+        "<<<<<<< SEARCH\n"
+        "=======\n"
+        "# Moved from dead.py (dead code)\n"
+        ">>>>>>> REPLACE\n\n"
+        "--- FILE: dead.py\n"
+        "<<<<<<< SEARCH\n"
+        "\"\"\"Dead module.\"\"\"\n"
+        "import math\n"
+        "import os\n"
+        "=======\n"
+        ">>>>>>> REPLACE\n"
+    )
+    results = edits.apply_edits(tmp_path, edits.parse_edits(reply),
+                                backup=False, dry_run=False)
+    by_file = {r.file: r for r in results}
+    assert by_file["graveyard/dead.py"].renames_from == ("dead.py",), \
+        [r.message for r in results]
+    assert not (tmp_path / "dead.py").exists(), \
+        "source was not removed -- this is the copy-instead-of-move bug"
+    body = (tmp_path / "graveyard/dead.py").read_text()
+    assert "# Moved from dead.py" in body
+    assert "def helper():" in body and "return math.pi" in body
+
+
+def test_rename_nested_source_into_graveyard(tmp_path):
+    """Moving game/enemies.py to graveyard/game/enemies.py must keep the
+    surviving relative path as the pairing signal."""
+    _write(tmp_path / "game" / "enemies.py", "class Enemy:\n    hp = 1\n")
+    reply = (
+        "--- FILE: graveyard/game/enemies.py\n"
+        "<<<<<<< SEARCH\n"
+        "=======\n"
+        "# Moved from game/enemies.py (dead code)\n"
+        ">>>>>>> REPLACE\n\n"
+        "--- FILE: game/enemies.py\n"
+        "<<<<<<< SEARCH\n"
+        "class Enemy:\n"
+        "=======\n"
+        ">>>>>>> REPLACE\n"
+    )
+    results = edits.apply_edits(tmp_path, edits.parse_edits(reply),
+                                backup=False, dry_run=False)
+    by_file = {r.file: r for r in results}
+    assert by_file["graveyard/game/enemies.py"].renames_from == \
+        ("game/enemies.py",), [r.message for r in results]
+    assert not (tmp_path / "game" / "enemies.py").exists()
+    assert "class Enemy:" in (tmp_path / "graveyard/game/enemies.py").read_text()
+
+
+def test_orphan_placeholder_never_truncates_the_live_source(tmp_path):
+    """When a placeholder creation cannot be paired (an ambiguous basename
+    move into an arbitrary folder), the clearing block for the old file must
+    be refused too. Applying it alone stripped the first lines off the live
+    file while the stub was written -- silent data loss."""
+    original = "line1\nline2\nline3\nline4\nline5\n"
+    _write(tmp_path / "notes.md", original)
+    reply = (
+        "--- FILE: docs/notes.md\n"
+        "<<<<<<< SEARCH\n"
+        "=======\n"
+        "# archived\n"
+        ">>>>>>> REPLACE\n\n"
+        "--- FILE: notes.md\n"
+        "<<<<<<< SEARCH\n"
+        "line1\nline2\nline3\n"
+        "=======\n"
+        ">>>>>>> REPLACE\n"
+    )
+    results = edits.apply_edits(tmp_path, edits.parse_edits(reply),
+                                backup=False, dry_run=False)
+    assert results and not any(r.ok for r in results), \
+        [r.message for r in results]
+    assert (tmp_path / "notes.md").read_text() == original
+    assert not (tmp_path / "docs" / "notes.md").exists()
+
+
 def test_review_write_deletes_rename_source(tmp_path):
     """The review sign-off path must delete a rename's source file, not write
     an empty file over it. Writing '' first clobbered the source's bytes so
@@ -1121,6 +1212,50 @@ def test_gather_stops_on_repeated_no_new_source_read(tmp_path):
     assert client.calls == 3, f"gather kept repeating reads: {client.calls}"
     assert len(agent.steps_log) == 3
     assert "parkour control note" in gathered
+
+
+def test_gather_does_not_redispatch_an_identical_grep(tmp_path, monkeypatch):
+    """The graveyard run emitted `grep static/js/main.js` three times in a
+    row. A repeated navigation step cannot change its result when nothing
+    mutating ran in between, so it must not be dispatched again (which, with
+    semantic_search on, meant re-embedding the whole project each time)."""
+    from pedacito import index as index_mod
+    import pedacito.agent as agent_mod
+
+    _write(tmp_path / "a.py", "x = 1\n")
+    cfg = config_mod.Config()
+    cfg.semantic_search = False
+    idx = index_mod.build([str(tmp_path)], cfg, client=None,
+                          summarise=False, root=tmp_path, verbose=False)
+    dispatched = []
+    real_dispatch = agent_mod.dispatch
+
+    def counting_dispatch(*args, **kwargs):
+        dispatched.append(args)
+        return real_dispatch(*args, **kwargs)
+
+    monkeypatch.setattr(agent_mod, "dispatch", counting_dispatch)
+
+    class StubClient:
+        stream_truncated = False
+        step_truncated = False
+
+        def __init__(self):
+            self.calls = 0
+
+        def chat_json(self, messages, schema, max_tokens=0, **kw):
+            self.calls += 1
+            return {"action": "grep", "pattern": "static/js/main.js",
+                    "file": "", "reasoning": "Check main.js"}
+
+    client = StubClient()
+    agent = Agent(idx, client, cfg)
+    gathered = agent.gather("find references", verbose=False)
+
+    assert client.calls == 3
+    assert len(dispatched) == 1, \
+        f"identical grep was dispatched {len(dispatched)} times"
+    assert "Repeating it cannot add information" in gathered
 
 
 def test_apply_stops_after_repeated_truncation(tmp_path):

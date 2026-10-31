@@ -173,10 +173,69 @@ def _imports(tree: ast.Module) -> list[str]:
     return out
 
 
+def _fits(lines: list[str], start: int, end: int,
+          max_lines: int, max_chars: int) -> bool:
+    """True when a 1-based inclusive line range fits the retrieval budget."""
+    if end - start + 1 > max_lines:
+        return False
+    return len(_slice(lines, start, end)) <= max_chars
+
+
+def _split_statements(statements: list, lines: list[str], first_line: int,
+                      last_line: int, max_lines: int,
+                      max_chars: int) -> list[tuple[int, int, list]] | None:
+    """Group top-level statements into retrieval-sized parts.
+
+    Returns None when the whole span already fits or cannot be split. Each
+    part is (start, end, statements). Parts are contiguous: comments and blank
+    lines between statements belong to the preceding part. A single statement
+    larger than the budget is kept whole -- splitting inside an expression
+    would produce invalid chunks.
+    """
+    if _fits(lines, first_line, last_line, max_lines, max_chars):
+        return None
+    if len(statements) < 2:
+        return None
+    parts: list[tuple[int, int, list]] = []
+    cur_start = first_line
+    cur_end = first_line - 1
+    cur: list = []
+    for stmt in statements:
+        s = _first_line(stmt)
+        e = stmt.end_lineno or s
+        if cur and s > cur_end and \
+                not _fits(lines, cur_start, e, max_lines, max_chars):
+            parts.append((cur_start, cur_end, cur))
+            cur_start, cur_end, cur = s, e, [stmt]
+        else:
+            cur.append(stmt)
+            cur_end = max(cur_end, e)
+    if cur:
+        parts.append((cur_start, cur_end, cur))
+    if len(parts) < 2:
+        return None
+    # Make the parts contiguous: a comment or blank line between two
+    # statements belongs to the preceding part instead of falling out of
+    # every chunk. The last part owns the scope's closing lines.
+    for i in range(len(parts) - 1):
+        ps, _pe, pnodes = parts[i]
+        parts[i] = (ps, parts[i + 1][0] - 1, pnodes)
+    ps, _pe, pnodes = parts[-1]
+    parts[-1] = (ps, last_line, pnodes)
+    return parts
+
+
+def _part_signature(sig: str, index: int, count: int) -> str:
+    """Label a split unit so the map/outline makes the continuation visible."""
+    return f"{sig}  [part {index}/{count}]" if count > 1 else sig
+
+
 # --------------------------------------------------------------------------
 # Public API
 # --------------------------------------------------------------------------
-def chunk_source(rel_path: str, src: str, class_split_lines: int = 60) -> list[Chunk]:
+def chunk_source(rel_path: str, src: str, class_split_lines: int = 60,
+                 max_unit_lines: int = 220,
+                 max_unit_chars: int = 12000) -> list[Chunk]:
     """Chunk one Python file's source into a list of Chunk objects.
 
     Produces, in order: a module-preamble chunk (imports and top-level code
@@ -184,6 +243,13 @@ def chunk_source(rel_path: str, src: str, class_split_lines: int = 60) -> list[C
     per class (whole, or split into a classheader chunk plus one chunk per
     method if the class exceeds `class_split_lines`), and a trailing chunk
     for any code after the last top-level def/class (e.g. a __main__ guard).
+
+    Functions/methods and preamble/trailing code larger than `max_unit_lines`
+    or `max_unit_chars` are split at top-level statement boundaries into
+    `name#2`, `name#3`, ... parts. A 2,000-line function otherwise forces a
+    small model to read the whole thing (or none of it), and reading it once
+    can consume most of the gathered-source budget. Splitting never cuts
+    inside an expression; a single oversized statement stays whole.
 
     Raises SyntaxError if `src` is not valid Python.
     """
@@ -204,25 +270,57 @@ def chunk_source(rel_path: str, src: str, class_split_lines: int = 60) -> list[C
             # Only nodes actually in the preamble -- walking the whole module
             # here would attribute every call in every function to this chunk.
             preamble = [n for n in tree.body if (n.end_lineno or 0) <= end]
-            chunks.append(Chunk(
-                file=rel_path, qualname="module", kind="module",
-                start=1, end=end, imports=imports,
-                docline=_docline(tree), calls=_calls(*preamble),
-                source=body, sha=_sha(body),
-            ))
+            parts = _split_statements(preamble, lines, 1, end,
+                                      max_unit_lines, max_unit_chars)
+            if parts:
+                for i, (ps, pe, nodes) in enumerate(parts, 1):
+                    part_body = _slice(lines, ps, pe)
+                    chunks.append(Chunk(
+                        file=rel_path,
+                        qualname="module" if i == 1 else f"module#{i}",
+                        kind="module", start=ps, end=pe, imports=imports,
+                        docline=_docline(tree) if i == 1 else "",
+                        calls=_calls(*nodes),
+                        source=part_body, sha=_sha(part_body),
+                    ))
+            else:
+                chunks.append(Chunk(
+                    file=rel_path, qualname="module", kind="module",
+                    start=1, end=end, imports=imports,
+                    docline=_docline(tree), calls=_calls(*preamble),
+                    source=body, sha=_sha(body),
+                ))
 
     # --- helper: build and append one Chunk for a function/class/method node ---
     def add(node, qualname, kind, start=None, end=None, members=None, scope_end=0):
         """Build and append one Chunk for a function/class/method node."""
         s = start if start is not None else _first_line(node)
         e = end if end is not None else (node.end_lineno or s)
+        if kind in ("function", "method") and isinstance(node, DEF_NODES):
+            parts = _split_statements(node.body, lines, s, e,
+                                      max_unit_lines, max_unit_chars)
+            if parts:
+                sig = _signature(node)
+                for i, (ps, pe, nodes) in enumerate(parts, 1):
+                    part_body = _slice(lines, ps, pe)
+                    chunks.append(Chunk(
+                        file=rel_path,
+                        qualname=qualname if i == 1 else f"{qualname}#{i}",
+                        kind=kind, start=ps, end=pe,
+                        signature=_part_signature(sig, i, len(parts)),
+                        decorators=_decorators(node) if i == 1 else [],
+                        docline=_docline(node) if i == 1 else "",
+                        calls=_calls(*nodes), imports=imports,
+                        source=part_body, sha=_sha(part_body),
+                    ))
+                return
         body = _slice(lines, s, e)
         chunks.append(Chunk(
             file=rel_path, qualname=qualname, kind=kind, start=s, end=e,
             scope_end=scope_end,
             signature=_signature(node), decorators=_decorators(node),
             docline=_docline(node), calls=_calls(node), members=members or [],
-            source=body, sha=_sha(body),
+            imports=imports, source=body, sha=_sha(body),
         ))
 
     # --- top-level functions and classes ---
@@ -235,6 +333,25 @@ def chunk_source(rel_path: str, src: str, class_split_lines: int = 60) -> list[C
         start, end = _first_line(node), node.end_lineno or _first_line(node)
         methods = [m for m in node.body if isinstance(m, DEF_NODES)]
         if (end - start + 1) <= class_split_lines or not methods:
+            if not methods:
+                parts = _split_statements(node.body, lines, start, end,
+                                          max_unit_lines, max_unit_chars)
+                if parts:
+                    sig = _signature(node)
+                    for i, (ps, pe, nodes) in enumerate(parts, 1):
+                        part_body = _slice(lines, ps, pe)
+                        chunks.append(Chunk(
+                            file=rel_path,
+                            qualname=(node.name if i == 1
+                                      else f"{node.name}#{i}"),
+                            kind="class", start=ps, end=pe,
+                            signature=_part_signature(sig, i, len(parts)),
+                            decorators=_decorators(node) if i == 1 else [],
+                            docline=_docline(node) if i == 1 else "",
+                            calls=_calls(*nodes), imports=imports,
+                            source=part_body, sha=_sha(part_body),
+                        ))
+                    continue
             # Small class stays whole, but record its methods so symbol lookup
             # can still point at it.
             add(node, node.name, "class", members=[m.name for m in methods])
@@ -244,10 +361,34 @@ def chunk_source(rel_path: str, src: str, class_split_lines: int = 60) -> list[C
         # attributes) plus one chunk per method, so a 900-line class never has
         # to be read into context whole.
         header_end = min(_first_line(m) for m in methods) - 1
+        header_end = max(header_end, start)
         # scope_end carries the full class span. Without it a file summary
         # would report a 500-line class as a 7-line range.
-        add(node, node.name, "classheader", start=start, end=max(header_end, start),
-            members=[m.name for m in methods], scope_end=end)
+        header_nodes = [n for n in node.body
+                        if (n.end_lineno or 0) <= header_end]
+        header_parts = _split_statements(header_nodes, lines, start,
+                                         header_end, max_unit_lines,
+                                         max_unit_chars)
+        if header_parts:
+            sig = _signature(node)
+            for i, (ps, pe, nodes) in enumerate(header_parts, 1):
+                part_body = _slice(lines, ps, pe)
+                chunks.append(Chunk(
+                    file=rel_path,
+                    qualname=(node.name if i == 1
+                              else f"{node.name}#{i}"),
+                    kind="classheader", start=ps, end=pe,
+                    scope_end=end if i == 1 else 0,
+                    signature=_part_signature(sig, i, len(header_parts)),
+                    decorators=_decorators(node) if i == 1 else [],
+                    docline=_docline(node) if i == 1 else "",
+                    calls=_calls(*nodes), imports=imports,
+                    members=[m.name for m in methods] if i == 1 else [],
+                    source=part_body, sha=_sha(part_body),
+                ))
+        else:
+            add(node, node.name, "classheader", start=start, end=header_end,
+                members=[m.name for m in methods], scope_end=end)
         for m in methods:
             add(m, f"{node.name}.{m.name}", "method")
 
@@ -258,11 +399,25 @@ def chunk_source(rel_path: str, src: str, class_split_lines: int = 60) -> list[C
             body = _slice(lines, last_end + 1, total)
             if body.strip():
                 tail = [n for n in tree.body if n.lineno > last_end]
-                chunks.append(Chunk(
-                    file=rel_path, qualname="__trailing__", kind="module",
-                    start=last_end + 1, end=total, calls=_calls(*tail),
-                    source=body, sha=_sha(body),
-                ))
+                parts = _split_statements(tail, lines, last_end + 1, total,
+                                          max_unit_lines, max_unit_chars)
+                if parts:
+                    for i, (ps, pe, nodes) in enumerate(parts, 1):
+                        part_body = _slice(lines, ps, pe)
+                        chunks.append(Chunk(
+                            file=rel_path,
+                            qualname=("__trailing__" if i == 1
+                                      else f"__trailing__#{i}"),
+                            kind="module", start=ps, end=pe, imports=imports,
+                            calls=_calls(*nodes),
+                            source=part_body, sha=_sha(part_body),
+                        ))
+                else:
+                    chunks.append(Chunk(
+                        file=rel_path, qualname="__trailing__", kind="module",
+                        start=last_end + 1, end=total, imports=imports,
+                        calls=_calls(*tail), source=body, sha=_sha(body),
+                    ))
 
     chunks.sort(key=lambda c: c.start)
     return chunks

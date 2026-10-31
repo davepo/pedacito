@@ -87,7 +87,8 @@ def _args_for(root_str: str, profile: str | None) -> SimpleNamespace:
 def _load_recent() -> list[str]:
     """Return the most-recently-opened project paths, newest first."""
     try:
-        data = json.loads(RECENT_FILE.read_text())
+        data = json.loads(RECENT_FILE.read_text(encoding="utf-8",
+                                                errors="replace"))
         return [str(p) for p in data][:MAX_RECENT]
     except (OSError, ValueError):
         return []
@@ -99,7 +100,8 @@ def _remember_recent(root: str) -> None:
     recent = [root] + [r for r in _load_recent() if r != root]
     try:
         RECENT_FILE.parent.mkdir(parents=True, exist_ok=True)
-        RECENT_FILE.write_text(json.dumps(recent[:MAX_RECENT]))
+        RECENT_FILE.write_text(json.dumps(recent[:MAX_RECENT]),
+                               encoding="utf-8")
     except OSError:
         pass  # a lost recents list is not worth failing the request over
 

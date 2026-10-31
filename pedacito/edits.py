@@ -349,6 +349,7 @@ def _locate(haystack: str, needle: str) -> tuple[int, int] | None:
 # Public API
 # --------------------------------------------------------------------------
 _BLOCK_COMMENT_RE = re.compile(r"^/\*.*?\*/", re.DOTALL)
+_HTML_COMMENT_RE = re.compile(r"^<!--.*?-->", re.DOTALL)
 
 
 def _is_placeholder_only(text: str) -> bool:
@@ -364,16 +365,22 @@ def _is_placeholder_only(text: str) -> bool:
     joined = "\n".join(lines)
     if len(joined.encode("utf-8")) > 200:
         return False
-    # C-style block comments (possibly several, or line-spans of one).
+    # C-style block comments and HTML comments (possibly several, or
+    # line-spans of one).
     rest = joined
     m = _BLOCK_COMMENT_RE.match(rest)
     while m:
         rest = rest[m.end():].strip()
         m = _BLOCK_COMMENT_RE.match(rest)
+    m = _HTML_COMMENT_RE.match(rest)
+    while m:
+        rest = rest[m.end():].strip()
+        m = _HTML_COMMENT_RE.match(rest)
     if rest == "":
         return True
     # Hash / slash line comments only.
-    return all(ln.startswith("#") or ln.startswith("//") for ln in lines)
+    return all(ln.startswith("#") or ln.startswith("//") or
+               ln.startswith("<!--") for ln in lines)
 
 
 def _placeholder_comment(ph: str, suffix: str) -> str:
@@ -540,29 +547,71 @@ def apply_edits(root: Path, edits: list[Edit], backup: bool = True,
     renames: dict[str, str] = {}             # cleared rel -> created rel
     if cfg is None or getattr(cfg, "allow_rename", True):
         used: set[str] = set()
-        def _stem(rel: str) -> str:
-            """Path without the final extension, for same-basename pairing."""
-            return str(Path(rel).with_suffix("")).lower()
+
+        # Conventional folders for dead/archived code. A basename-only move
+        # across directories is otherwise ambiguous (root/index.html ->
+        # subj-imp/index.html is the archive-trap the old guard was written
+        # for), so allow it into one of these without further proof. This is
+        # what makes `foo.py -> graveyard/foo.py` work; before, the old
+        # `_stem` compared the WHOLE relative path ("foo" vs "graveyard/foo")
+        # so every move into a subfolder silently failed to pair and degraded
+        # into a placeholder copy plus a partial wipe of the live file.
+        _ARCHIVE_DIRS = {
+            "graveyard", "graveyards", "archive", "archived", "archives",
+            "trash", "deleted", "dead", "deadcode", "dead-code", "old",
+            "old_code", "deprecated", "bak", "backup", "backups", "attic",
+        }
+
+        def _is_archive_dir(path: str) -> bool:
+            return any(part.lower() in _ARCHIVE_DIRS
+                       for part in Path(path).parts[:-1])
+
+        def _placeholder_names_source(new: str, old: str) -> bool:
+            """True when a placeholder creation for `new` mentions `old`.
+
+            The documented rename idiom writes a short "moved from X" comment
+            in the new file. That explicit reference is enough to resolve a
+            basename-only cross-directory move (`notes.md ->
+            docs/notes.md`) without accepting every same-named path."""
+            names = {Path(old).name.lower(), Path(old).as_posix().lower(),
+                     Path(old).stem.lower()}
+            for e in groups.get(new, []):
+                if e.search.strip() or not e.replace.strip():
+                    continue
+                body = e.replace.lower()
+                if any(n and n in body for n in names):
+                    return True
+            return False
 
         def _pair_score(old: str, new: str) -> int:
             """Rank candidate pairings; -1 rejects a pair.
 
-            A rename almost always stays in the SAME directory -- and when it
-            doesn't, the old file's stem must survive in the new name (moving
-            `notes.md` into `docs/notes.md` is legitimate; pairing
-            root/index.html with subj-imp/index.html because both are named
-            index.html would WIPE the home page to "rename" an unrelated
-            placeholder). So cross-directory candidates are accepted only on
-            an exact stem match, same-directory ones always."""
+            Same-directory renames are unambiguous. Cross-directory ones are
+            accepted when the old relative path survives as a suffix (moving
+            `game/enemies.py` into `graveyard/game/enemies.py`), or when a
+            basename-only move has an explicit signal: the destination is a
+            conventional archive folder or the placeholder names the source.
+            A bare basename match into an arbitrary sibling directory stays
+            rejected -- that is the overwrite-and-archive trap that would
+            wipe the home page."""
             same_dir = Path(old).parent == Path(new).parent
-            if not same_dir and _stem(old) != _stem(new):
-                return -1
-            base = Path(old).name.lower()
-            if base in Path(new).name.lower():
-                return 3
+            old_posix = Path(old).as_posix().lower().lstrip("./")
+            new_posix = Path(new).as_posix().lower().lstrip("./")
+            old_name = Path(old).name.lower()
+            new_name = Path(new).name.lower()
             if same_dir:
+                return 3 if old_name in new_name else 2
+            # The whole old relative path survives under the new parent.
+            if "/" in old_posix and new_posix.endswith("/" + old_posix):
                 return 2
-            return 1
+            # Moving a file back out of a subdirectory to the same name.
+            if "/" in old_posix and old_posix.endswith("/" + new_posix):
+                return 1
+            # Basename-only cross-directory move: only on an explicit signal.
+            if new_name == old_name and (
+                    _is_archive_dir(new) or _placeholder_names_source(new, old)):
+                return 1
+            return -1
 
         def _pair(old: str, cands: list[str]):
             scored = [(s, n) for n in cands if (s := _pair_score(old, n)) >= 0]
@@ -663,6 +712,45 @@ def apply_edits(root: Path, edits: list[Edit], backup: bool = True,
             continue
         by_file[rel] = list(g)
 
+    # ---- orphan placement guard -------------------------------------------
+    # A placeholder-only creation with no rename source is a half-rename: the
+    # model asked for "move X here" but the clearing block for X never matched
+    # (wrong directory pairing, truncated reply, a guessed header). Writing
+    # the stub is bad enough; worse, applying the leftover clearing block
+    # strips the first lines off the LIVE file and leaves the old path
+    # truncated in place -- exactly the corruption the graveyard run produced
+    # (graveyard/snake_spawner.py became a one-line note while the real file
+    # lost its header). Detect the orphan up front and refuse the whole
+    # suspected pair: the new path is not created and content-quoting clears
+    # in the same reply are not applied. The repair loop then re-asks with the
+    # rename protocol, and nothing has been lost.
+    rename_targets = set(renames.values())
+
+    def _creation_text(g: list[Edit]) -> str:
+        text = "\n".join(e.replace for e in g if not e.search.strip())
+        if text and not text.endswith("\n"):
+            text += "\n"
+        return text
+
+    orphan_placeholders = {
+        rel for rel, g in by_file.items()
+        if rel not in rename_targets
+        and g and all(not e.search.strip() for e in g)
+        and any(e.replace.strip() for e in g)
+        and _is_placeholder_only(_creation_text(g))
+        and not any(o for o, n in renames.items()
+                    if n == rel and (root_resolved / o).is_file())
+    }
+
+    _ORPHAN_CREATE_MSG = (
+        "refusing to create this file: its content is only a placeholder "
+        "comment and no rename source matched. If you are renaming a file, "
+        "emit ONLY the empty-SEARCH creation block for the new path plus a "
+        "block for the old path whose SEARCH is part of its content and whose "
+        "REPLACE is empty -- Pedacito moves the real bytes; never copy them. "
+        "If you mean to write this file's content yourself, put that content "
+        "in REPLACE.")
+
     def _validate(path: Path, text: str) -> str | None:
         """Return an error message if `text` does not parse as source of
         `path`'s language, else None. A new file that fails to parse is not
@@ -718,6 +806,10 @@ def apply_edits(root: Path, edits: list[Edit], backup: bool = True,
                     else:
                         text = body + "\n"
                     moved_original = ""       # nothing existed at the target
+            # The caller's note describes the placeholder block ("created
+            # with 1 line(s)"), which is misleading for a move: say how many
+            # lines the finished file actually has.
+            note += f" [{len(text.splitlines())} line(s) in the final file]"
 
         # Validate the FINAL text -- after a rename has folded the source's
         # real bytes in. Validating the placeholder alone used to reject
@@ -793,6 +885,23 @@ def apply_edits(root: Path, edits: list[Edit], backup: bool = True,
             path.relative_to(root_resolved)
         except ValueError:
             results.append(Result(False, rel, "refusing to edit outside project root"))
+            continue
+
+        if rel in orphan_placeholders:
+            results.append(Result(False, rel, _ORPHAN_CREATE_MSG))
+            continue
+        if orphan_placeholders and all(not e.replace.strip() for e in group) \
+                and any(e.search.strip() for e in group):
+            # The other half of the refused placeholder pair. Applying it
+            # would delete lines from the live source while the destination
+            # stub was never written.
+            results.append(Result(
+                False, rel,
+                "not applying this clearing block: it looks like the other "
+                "half of a rename whose new path was refused (placeholder "
+                "creation with no matching source). Emit the rename pair "
+                "again with both blocks -- the old path's SEARCH quoting a "
+                "few real lines, the new path's SEARCH empty."))
             continue
 
         srcs = tuple(o for o, n in renames.items() if n == rel)

@@ -51,6 +51,8 @@ _CHROME_PATHS = (
     "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
     r"C:\Program Files\Google\Chrome\Application\chrome.exe",
     r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
+    r"C:\Program Files\Microsoft\Edge\Application\msedge.exe",
+    r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
 )
 _ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
 
@@ -571,6 +573,7 @@ def _run_chrome(exe: str, url: str, *, wait: float, out,
         ]
         try:
             p = subprocess.run(cmd, capture_output=True, text=True,
+                               encoding="utf-8", errors="replace",
                                timeout=max(5, int(timeout) + 15))
         except Exception as e:
             return False, f"could not run {Path(exe).name}: {e}"

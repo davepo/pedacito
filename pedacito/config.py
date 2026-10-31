@@ -163,6 +163,13 @@ class Config:
     # --- Indexing -------------------------------------------------------------
     # Classes shorter than this are indexed as one chunk instead of per-method.
     class_split_lines: int = 60
+    # Retrieval-sized units: a function/method (or module preamble/trailing
+    # block) larger than either limit is split at top-level statement
+    # boundaries into name#2, name#3, ... parts. Without this, one 2,000-line
+    # function either forces the model to read it whole (burning most of
+    # max_gathered_chars) or is never read at all.
+    max_unit_lines: int = 220
+    max_unit_chars: int = 12000
     # Chunks larger than this get their source truncated before summarising.
     max_chunk_chars: int = 6000
     # Skip summarising trivially short chunks; the signature says enough.
@@ -189,6 +196,12 @@ class Config:
     summarise_references: bool = False
 
     # --- Agent loop -----------------------------------------------------------
+    # Include the repository's PEDACEITO.md / AGENTS.md / CLAUDE.md in every
+    # prompt. One short conventions file prevents small models from inventing
+    # build commands and edit rules. Off only if the project wants no
+    # automatic context.
+    use_project_instructions: bool = True
+    max_instruction_chars: int = 2000
     # Hard lookup limit for the gather phase. 0 (the default) means NO step
     # limit: the gathered-source/token budget and the model's `done` are the
     # only bounds. Set a positive value only when you explicitly want a
@@ -208,6 +221,10 @@ class Config:
     # the intended constraint: token/context budget, not step count.
     max_gathered_chars: int = 24000
     max_read_lines: int = 200
+    # Attach the enclosing signature and module imports when a `read` starts
+    # mid-file. Both are already in the index; this saves a round trip to the
+    # file head for small models without changing what is on disk.
+    read_context_hint: bool = True
     # Let the gather loop create/overwrite whole files via `write`, grow them
     # with `append`, and rename/remove them with `move`/`delete`. Off by
     # default: a mid-gather write skips the edit path's syntax check and
@@ -1263,8 +1280,9 @@ def auto_fit(cfg: Config, verbose: bool = True) -> list[str]:
                             f"{hw_ctx:,} -- the KV cache will spill to system "
                             f"RAM and tokens/sec will drop; lower the server's "
                             f"context length (LM Studio 'Context length' / "
-                            f"Ollama num_ctx), or set k_cache_quant/"
-                            f"v_cache_quant to match the server")
+                            f"Ollama num_ctx / Lemonade model settings), or "
+                            f"set k_cache_quant/v_cache_quant to match the "
+                            f"server")
                     else:
                         notes.append(
                             f"context: keeping {ctx:,} (fits the VRAM estimate)")
@@ -1903,6 +1921,8 @@ vram_gb  = 8                   # MANDATORY for local servers: GPU VRAM in GB
 # --- Indexing ---------------------------------------------------------------
 # [indexing]
 # class_split_lines = 60           # classes shorter than this stay one chunk
+# max_unit_lines = 220             # split larger functions/methods at stmt boundaries
+# max_unit_chars = 12000           # ...or when the unit exceeds this many chars
 # max_chunk_chars = 6000           # source truncated to this before summarising
 # min_lines_to_summarise = 4       # skip summarising trivially short units
 # summarise_methods = false        # true if your methods lack docstrings
@@ -1917,6 +1937,8 @@ vram_gb  = 8                   # MANDATORY for local servers: GPU VRAM in GB
 
 # --- Agent loop -------------------------------------------------------------
 # [agent]
+# use_project_instructions = true   # include PEDACEITO.md / AGENTS.md / CLAUDE.md
+# max_instruction_chars = 2000     # cap on that file's text in every prompt
 # max_steps = 0                    # hard lookup limit per task; 0 = no limit
 #                                  # (the default). The gathered-source and
 #                                  # context token budgets are the intended
@@ -1928,6 +1950,8 @@ vram_gb  = 8                   # MANDATORY for local servers: GPU VRAM in GB
 #                                  # is still enforced)
 # max_gathered_chars = 24000       # ceiling on accumulated source per task
 # max_read_lines = 200             # cap on one `read` call's line count
+# read_context_hint = true         # mid-file reads include the enclosing signature
+#                                  # and module imports when indexed
 # allow_write = false              # let the gather loop create/overwrite files
 #                                  # with `write`, grow them with `append`, and
 #                                  # move/delete files (skips review; prefer
@@ -2338,7 +2362,7 @@ def interactive_setup(path: Path | None = None, force: bool = False,
         Path("pedacito-setup-probe.toml")
     try:
         probe.parent.mkdir(parents=True, exist_ok=True)
-        probe.write_text(body)
+        probe.write_text(body, encoding="utf-8")
         load(explicit=probe)
     finally:
         try:
@@ -2351,7 +2375,7 @@ def interactive_setup(path: Path | None = None, force: bool = False,
         backup.write_bytes(p.read_bytes())
         say(f"(previous config saved to {backup})")
     p.parent.mkdir(parents=True, exist_ok=True)
-    p.write_text(body)
+    p.write_text(body, encoding="utf-8")
     say()
     say(f"Wrote {p}")
     say(f"  base_url = {base_url}")
@@ -2369,5 +2393,5 @@ def write_template(path: Path | None = None, force: bool = False) -> Path:
     if p.exists() and not force:
         raise ConfigError(f"{p} already exists; pass --force to overwrite")
     p.parent.mkdir(parents=True, exist_ok=True)
-    p.write_text(TEMPLATE)
+    p.write_text(TEMPLATE, encoding="utf-8")
     return p

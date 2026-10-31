@@ -219,7 +219,7 @@ def _cmd_config(args, cfg) -> int:
         if target is not None:
             try:
                 target.parent.mkdir(parents=True, exist_ok=True)
-                target.write_text(REFERENCE_TEMPLATE)
+                target.write_text(REFERENCE_TEMPLATE, encoding="utf-8")
             except OSError as e:
                 print(f"Could not write {target}: {e}", file=sys.stderr)
                 return 2
@@ -475,7 +475,7 @@ def _cmd_auto(args, cfg, client, idx, root: Path) -> int:
             if plan_path.exists():
                 print("  [existing plan has no open tasks; generating a new "
                       "one from the goal]", file=sys.stderr)
-            titles = loop.generate_tasks(spec.text, client, cfg)
+            titles = loop.generate_tasks(spec.text, client, cfg, root=root)
             loop.write_plan(plan_path, spec.title, titles)
         if not args.apply:
             print(plan_path.read_text(encoding="utf-8"), file=sys.stderr)
@@ -609,9 +609,27 @@ def _cmd_explain(args, client, agent) -> int:
 # --------------------------------------------------------------------------
 # Entry point
 # --------------------------------------------------------------------------
+def _configure_stdio() -> None:
+    """Make the console streams UTF-8 tolerant on every platform.
+
+    Windows falls back to the locale code page (often cp1252) when stdout or
+    stderr is redirected to a file or pipe, so printing a model reply or a
+    path containing non-ASCII characters raised UnicodeEncodeError and killed
+    the run. Reconfiguring to UTF-8 with replacement keeps output lossless
+    enough and never crashes. StringIO-based test harnesses have no
+    `reconfigure`; skip them.
+    """
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except (AttributeError, OSError, ValueError):
+            pass
+
+
 def main(argv=None) -> int:
     """Parse command-line arguments and dispatch to the requested
     subcommand. Returns the process exit code."""
+    _configure_stdio()
     ap = argparse.ArgumentParser(prog="pedacito", description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)

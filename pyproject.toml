@@ -6,6 +6,9 @@ requires-python = ">=3.11"   # tomllib
 license = {file = "LICENSE"}
 classifiers = [
     "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
 ]
 dependencies = [
     "requests>=2.31",

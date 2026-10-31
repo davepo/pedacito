@@ -118,6 +118,74 @@ def _line_span(node) -> tuple[int, int]:
     return node.start_point.row + 1, node.end_point.row + 1
 
 
+def _fits(lines: list[str], start: int, end: int,
+          max_lines: int, max_chars: int) -> bool:
+    """True when a 1-based inclusive line range fits the retrieval budget."""
+    if end - start + 1 > max_lines:
+        return False
+    return len("\n".join(lines[start - 1:end])) <= max_chars
+
+
+def _split_nodes(stmts: list, lines: list[str], first_line: int, last_line: int,
+                 max_lines: int, max_chars: int
+                 ) -> list[tuple[int, int, list]] | None:
+    """Group top-level statement nodes into retrieval-sized parts."""
+    if _fits(lines, first_line, last_line, max_lines, max_chars):
+        return None
+    if len(stmts) < 2:
+        return None
+    parts: list[tuple[int, int, list]] = []
+    cur_start = first_line
+    cur_end = first_line - 1
+    cur: list = []
+    for stmt in stmts:
+        s, e = _line_span(stmt)
+        if cur and s > cur_end and \
+                not _fits(lines, cur_start, e, max_lines, max_chars):
+            parts.append((cur_start, cur_end, cur))
+            cur_start, cur_end, cur = s, e, [stmt]
+        else:
+            cur.append(stmt)
+            cur_end = max(cur_end, e)
+    if cur:
+        parts.append((cur_start, cur_end, cur))
+    if len(parts) < 2:
+        return None
+    # Contiguous parts: inter-statement comments/blanks belong to the
+    # preceding part; the last part owns the closing lines of the scope.
+    for i in range(len(parts) - 1):
+        ps, _pe, pnodes = parts[i]
+        parts[i] = (ps, parts[i + 1][0] - 1, pnodes)
+    ps, _pe, pnodes = parts[-1]
+    parts[-1] = (ps, last_line, pnodes)
+    return parts
+
+
+def _split_body(body_node, lines: list[str], first_line: int, last_line: int,
+                max_lines: int, max_chars: int
+                ) -> list[tuple[int, int, list]] | None:
+    """Group a function/method body's statements into retrieval-sized parts.
+
+    Returns None when the span fits or cannot be split safely. This is the
+    tree-sitter analogue of chunker.py's `_split_statements`: split only at
+    top-level statement boundaries, never inside an expression.
+    """
+    if body_node is None or (
+            "block" not in getattr(body_node, "type", "")
+            and getattr(body_node, "type", "") != "body_statement"):
+        return None
+    if _fits(lines, first_line, last_line, max_lines, max_chars):
+        return None
+    stmts = list(getattr(body_node, "named_children", []) or [])
+    return _split_nodes(stmts, lines, first_line, last_line,
+                        max_lines, max_chars)
+
+
+def _part_signature(sig: str, index: int, count: int) -> str:
+    """Label a split unit so the map/outline makes the continuation visible."""
+    return f"{sig}  [part {index}/{count}]" if count > 1 else sig
+
+
 def _unwrap_export(node):
     """If `node` is an export_statement (plain or `export default`), return
     the declaration it wraps, or None if it's a re-export/bare export with
@@ -246,7 +314,9 @@ def _imports(root, src: bytes) -> list[str]:
 # Public API
 # --------------------------------------------------------------------------
 def chunk_source_ts(rel_path: str, src: str, language: str,
-                     class_split_lines: int = 60) -> list[Chunk]:
+                     class_split_lines: int = 60,
+                     max_unit_lines: int = 220,
+                     max_unit_chars: int = 12000) -> list[Chunk]:
     """Chunk one JS/TS/TSX file's source into a list of Chunk objects.
 
     Produces, in order: a module-preamble chunk (imports and any top-level
@@ -340,13 +410,34 @@ def chunk_source_ts(rel_path: str, src: str, language: str,
         if inner.type in FUNCTION_NODES:
             name_node = inner.child_by_field_name("name")
             name = name_node.text.decode() if name_node else "<anonymous>"
+            sig = _signature_of_function(inner, src_bytes, name)
+            body_node = inner.child_by_field_name("body")
+            parts = _split_body(body_node, lines, start, end,
+                                max_unit_lines, max_unit_chars)
+            if parts:
+                for i, (ps, pe, nodes) in enumerate(parts, 1):
+                    part_body = "\n".join(lines[ps - 1:pe])
+                    p_calls: set[str] = set()
+                    for n in nodes:
+                        _walk_calls(n, p_calls)
+                    chunks.append(Chunk(
+                        file=rel_path,
+                        qualname=name if i == 1 else f"{name}#{i}",
+                        kind="function", start=ps, end=pe,
+                        signature=_part_signature(sig, i, len(parts)),
+                        decorators=decs if i == 1 else [],
+                        docline=doc if i == 1 else "",
+                        calls=sorted(p_calls), imports=imports,
+                        source=part_body, sha=_sha(part_body),
+                    ))
+                continue
             calls: set[str] = set()
             _walk_calls(inner, calls)
             chunks.append(Chunk(
                 file=rel_path, qualname=name, kind="function",
-                start=start, end=end, signature=_signature_of_function(inner, src_bytes, name),
+                start=start, end=end, signature=sig,
                 decorators=decs, docline=doc, calls=sorted(calls),
-                source=body, sha=_sha(body),
+                imports=imports, source=body, sha=_sha(body),
             ))
             continue
 
@@ -360,11 +451,31 @@ def chunk_source_ts(rel_path: str, src: str, language: str,
             _walk_calls(value, calls)
             params = value.child_by_field_name("parameters")
             sig = f"const {name} = {_text(params, src_bytes) if params else '()'} => ..."
+            body_node = value.child_by_field_name("body") if value is not None else None
+            parts = _split_body(body_node, lines, start, end,
+                                max_unit_lines, max_unit_chars)
+            if parts:
+                for i, (ps, pe, nodes) in enumerate(parts, 1):
+                    part_body = "\n".join(lines[ps - 1:pe])
+                    p_calls: set[str] = set()
+                    for n in nodes:
+                        _walk_calls(n, p_calls)
+                    chunks.append(Chunk(
+                        file=rel_path,
+                        qualname=name if i == 1 else f"{name}#{i}",
+                        kind="function", start=ps, end=pe,
+                        signature=_part_signature(sig, i, len(parts)),
+                        decorators=decs if i == 1 else [],
+                        docline=doc if i == 1 else "",
+                        calls=sorted(p_calls), imports=imports,
+                        source=part_body, sha=_sha(part_body),
+                    ))
+                continue
             chunks.append(Chunk(
                 file=rel_path, qualname=name, kind="function",
                 start=start, end=end, signature=sig,
                 decorators=decs, docline=doc, calls=sorted(calls),
-                source=body, sha=_sha(body),
+                imports=imports, source=body, sha=_sha(body),
             ))
             continue
 
@@ -384,7 +495,7 @@ def chunk_source_ts(rel_path: str, src: str, language: str,
                 start=start, end=end,
                 signature=f"{kind_word} {name}",
                 decorators=decs, docline=doc, members=members,
-                source=body, sha=_sha(body),
+                imports=imports, source=body, sha=_sha(body),
             ))
             continue
 
@@ -407,7 +518,8 @@ def chunk_source_ts(rel_path: str, src: str, language: str,
                 start=start, end=end,
                 signature=_signature_of_class(inner, src_bytes, name),
                 decorators=decs, docline=doc, members=member_names,
-                calls=sorted(calls), source=body, sha=_sha(body),
+                calls=sorted(calls), imports=imports,
+                source=body, sha=_sha(body),
             ))
             continue
 
@@ -426,22 +538,43 @@ def chunk_source_ts(rel_path: str, src: str, language: str,
             start=start, end=header_end, scope_end=end,
             signature=_signature_of_class(inner, src_bytes, name),
             decorators=decs, docline=doc, members=member_names,
-            source=header_body, sha=_sha(header_body),
+            imports=imports, source=header_body, sha=_sha(header_body),
         ))
         for m in methods:
             m_name_node = m.child_by_field_name("name")
             m_name = m_name_node.text.decode() if m_name_node else "<anonymous>"
             m_start, m_end = _line_span(m)
+            m_params = m.child_by_field_name("parameters")
+            m_sig = f"{m_name}{_text(m_params, src_bytes) if m_params else '()'}"
+            m_decs = _decorators(m, src_bytes)
+            body_node = m.child_by_field_name("body")
+            parts = _split_body(body_node, lines, m_start, m_end,
+                                max_unit_lines, max_unit_chars)
+            if parts:
+                for i, (ps, pe, nodes) in enumerate(parts, 1):
+                    part_body = "\n".join(lines[ps - 1:pe])
+                    p_calls: set[str] = set()
+                    for n in nodes:
+                        _walk_calls(n, p_calls)
+                    chunks.append(Chunk(
+                        file=rel_path,
+                        qualname=(f"{name}.{m_name}" if i == 1
+                                  else f"{name}.{m_name}#{i}"),
+                        kind="method", start=ps, end=pe,
+                        signature=_part_signature(m_sig, i, len(parts)),
+                        decorators=m_decs if i == 1 else [],
+                        calls=sorted(p_calls), imports=imports,
+                        source=part_body, sha=_sha(part_body),
+                    ))
+                continue
             m_body = "\n".join(lines[m_start - 1:m_end])
             m_calls: set[str] = set()
             _walk_calls(m, m_calls)
-            m_params = m.child_by_field_name("parameters")
-            m_sig = f"{m_name}{_text(m_params, src_bytes) if m_params else '()'}"
             chunks.append(Chunk(
                 file=rel_path, qualname=f"{name}.{m_name}", kind="method",
                 start=m_start, end=m_end, signature=m_sig,
-                decorators=_decorators(m, src_bytes),
-                calls=sorted(m_calls), source=m_body, sha=_sha(m_body),
+                decorators=m_decs, calls=sorted(m_calls),
+                imports=imports, source=m_body, sha=_sha(m_body),
             ))
 
     # --- trailing top-level code after the last scope ---
@@ -536,7 +669,9 @@ def _ruby_member_name(node) -> str:
 
 def _ruby_container(node, qualname_prefix: str, rel_path: str, lines: list[str],
                      src_bytes: bytes, class_split_lines: int,
-                     chunks: list[Chunk]) -> None:
+                     chunks: list[Chunk], max_unit_lines: int = 220,
+                     max_unit_chars: int = 12000,
+                     imports: list[str] | None = None) -> None:
     """Emit chunks for one class/module node. If it's split (too big, or
     with methods/nested containers to carve out), recurse into any nested
     class/module children so multi-level namespacing -- the idiomatic way
@@ -564,7 +699,7 @@ def _ruby_container(node, qualname_prefix: str, rel_path: str, lines: list[str],
             file=rel_path, qualname=qualname, kind="class",
             start=start, end=end, signature=_ruby_signature(node, src_bytes, name),
             docline=doc, members=member_names, calls=sorted(calls),
-            source=body_text, sha=_sha(body_text),
+            imports=list(imports or []), source=body_text, sha=_sha(body_text),
         ))
         return
 
@@ -575,6 +710,7 @@ def _ruby_container(node, qualname_prefix: str, rel_path: str, lines: list[str],
         start=start, end=header_end, scope_end=end,
         signature=_ruby_signature(node, src_bytes, name), docline=doc,
         members=[_ruby_member_name(c) for c in carve],
+        imports=list(imports or []),
         source=header_body, sha=_sha(header_body),
     ))
 
@@ -582,21 +718,44 @@ def _ruby_container(node, qualname_prefix: str, rel_path: str, lines: list[str],
         if c.type in RUBY_METHOD_NODES:
             m_name = _ruby_member_name(c)
             m_start, m_end = _line_span(c)
+            m_sig = _ruby_signature(c, src_bytes, m_name)
+            body_node = c.child_by_field_name("body")
+            parts = _split_body(body_node, lines, m_start, m_end,
+                                max_unit_lines, max_unit_chars)
+            if parts:
+                for i, (ps, pe, nodes) in enumerate(parts, 1):
+                    part_body = "\n".join(lines[ps - 1:pe])
+                    p_calls: set[str] = set()
+                    for n in nodes:
+                        _ruby_walk_calls(n, p_calls)
+                    chunks.append(Chunk(
+                        file=rel_path,
+                        qualname=(f"{qualname}.{m_name}" if i == 1
+                                  else f"{qualname}.{m_name}#{i}"),
+                        kind="method", start=ps, end=pe,
+                        signature=_part_signature(m_sig, i, len(parts)),
+                        calls=sorted(p_calls), imports=list(imports or []),
+                        source=part_body, sha=_sha(part_body),
+                    ))
+                continue
             m_body = "\n".join(lines[m_start - 1:m_end])
             m_calls: set[str] = set()
             _ruby_walk_calls(c, m_calls)
             chunks.append(Chunk(
                 file=rel_path, qualname=f"{qualname}.{m_name}", kind="method",
-                start=m_start, end=m_end,
-                signature=_ruby_signature(c, src_bytes, m_name),
-                calls=sorted(m_calls), source=m_body, sha=_sha(m_body),
+                start=m_start, end=m_end, signature=m_sig,
+                calls=sorted(m_calls), imports=list(imports or []),
+                source=m_body, sha=_sha(m_body),
             ))
         else:   # nested class/module -- recurse
             _ruby_container(c, qualname, rel_path, lines, src_bytes,
-                             class_split_lines, chunks)
+                             class_split_lines, chunks, max_unit_lines,
+                             max_unit_chars, imports)
 
 
-def chunk_source_ruby(rel_path: str, src: str, class_split_lines: int = 60) -> list[Chunk]:
+def chunk_source_ruby(rel_path: str, src: str, class_split_lines: int = 60,
+                      max_unit_lines: int = 220,
+                      max_unit_chars: int = 12000) -> list[Chunk]:
     """Chunk one Ruby file's source into a list of Chunk objects.
 
     Unlike chunk_source_ts, this recurses (see _ruby_container's
@@ -650,33 +809,71 @@ def chunk_source_ruby(rel_path: str, src: str, class_split_lines: int = 60) -> l
         end = first_start - 1
         body = "\n".join(lines[:end])
         if body.strip():
-            calls: set[str] = set()
-            for n in top:
-                if n.start_point.row + 1 > end:
-                    break
-                _ruby_walk_calls(n, calls)
-            chunks.append(Chunk(
-                file=rel_path, qualname="module", kind="module",
-                start=1, end=end, imports=imports, calls=sorted(calls),
-                source=body, sha=_sha(body),
-            ))
+            preamble_nodes = [n for n in top
+                              if n.start_point.row + 1 <= end]
+            parts = _split_nodes(preamble_nodes, lines, 1, end,
+                                 max_unit_lines, max_unit_chars)
+            if parts:
+                for i, (ps, pe, nodes) in enumerate(parts, 1):
+                    part_body = "\n".join(lines[ps - 1:pe])
+                    calls: set[str] = set()
+                    for n in nodes:
+                        _ruby_walk_calls(n, calls)
+                    chunks.append(Chunk(
+                        file=rel_path,
+                        qualname="module" if i == 1 else f"module#{i}",
+                        kind="module", start=ps, end=pe,
+                        imports=imports, calls=sorted(calls),
+                        source=part_body, sha=_sha(part_body),
+                    ))
+            else:
+                calls: set[str] = set()
+                for n in preamble_nodes:
+                    _ruby_walk_calls(n, calls)
+                chunks.append(Chunk(
+                    file=rel_path, qualname="module", kind="module",
+                    start=1, end=end, imports=imports, calls=sorted(calls),
+                    source=body, sha=_sha(body),
+                ))
 
     # --- each top-level scope: container (recursive) or bare def ---
     for node in scopes:
         if node.type in RUBY_CONTAINER_NODES:
             _ruby_container(node, "", rel_path, lines, src_bytes,
-                             class_split_lines, chunks)
+                             class_split_lines, chunks, max_unit_lines,
+                             max_unit_chars, imports)
             continue
         name = _ruby_member_name(node)
         start, end = _line_span(node)
-        body = "\n".join(lines[start - 1:end])
+        sig = _ruby_signature(node, src_bytes, name)
         doc = _leading_comment_doc(node)
+        body_node = node.child_by_field_name("body")
+        parts = _split_body(body_node, lines, start, end,
+                            max_unit_lines, max_unit_chars)
+        if parts:
+            for i, (ps, pe, nodes) in enumerate(parts, 1):
+                part_body = "\n".join(lines[ps - 1:pe])
+                p_calls: set[str] = set()
+                for n in nodes:
+                    _ruby_walk_calls(n, p_calls)
+                chunks.append(Chunk(
+                    file=rel_path,
+                    qualname=name if i == 1 else f"{name}#{i}",
+                    kind="function", start=ps, end=pe,
+                    signature=_part_signature(sig, i, len(parts)),
+                    docline=doc if i == 1 else "",
+                    calls=sorted(p_calls), imports=imports,
+                    source=part_body, sha=_sha(part_body),
+                ))
+            continue
+        body = "\n".join(lines[start - 1:end])
         calls: set[str] = set()
         _ruby_walk_calls(node, calls)
         chunks.append(Chunk(
             file=rel_path, qualname=name, kind="function",
-            start=start, end=end, signature=_ruby_signature(node, src_bytes, name),
-            docline=doc, calls=sorted(calls), source=body, sha=_sha(body),
+            start=start, end=end, signature=sig,
+            docline=doc, calls=sorted(calls), imports=imports,
+            source=body, sha=_sha(body),
         ))
 
     # --- trailing top-level code after the last scope ---
@@ -684,15 +881,33 @@ def chunk_source_ruby(rel_path: str, src: str, class_split_lines: int = 60) -> l
     if last_end < total:
         body = "\n".join(lines[last_end:])
         if body.strip():
-            calls: set[str] = set()
-            for n in top:
-                if n.start_point.row + 1 > last_end:
+            tail_nodes = [n for n in top
+                          if n.start_point.row + 1 > last_end]
+            parts = _split_nodes(tail_nodes, lines, last_end + 1, total,
+                                 max_unit_lines, max_unit_chars)
+            if parts:
+                for i, (ps, pe, nodes) in enumerate(parts, 1):
+                    part_body = "\n".join(lines[ps - 1:pe])
+                    calls: set[str] = set()
+                    for n in nodes:
+                        _ruby_walk_calls(n, calls)
+                    chunks.append(Chunk(
+                        file=rel_path,
+                        qualname=("__trailing__" if i == 1
+                                  else f"__trailing__#{i}"),
+                        kind="module", start=ps, end=pe, imports=imports,
+                        calls=sorted(calls), source=part_body,
+                        sha=_sha(part_body),
+                    ))
+            else:
+                calls: set[str] = set()
+                for n in tail_nodes:
                     _ruby_walk_calls(n, calls)
-            chunks.append(Chunk(
-                file=rel_path, qualname="__trailing__", kind="module",
-                start=last_end + 1, end=total, calls=sorted(calls),
-                source=body, sha=_sha(body),
-            ))
+                chunks.append(Chunk(
+                    file=rel_path, qualname="__trailing__", kind="module",
+                    start=last_end + 1, end=total, imports=imports,
+                    calls=sorted(calls), source=body, sha=_sha(body),
+                ))
 
     chunks.sort(key=lambda c: c.start)
     return chunks
@@ -702,15 +917,19 @@ def chunk_source_ruby(rel_path: str, src: str, class_split_lines: int = 60) -> l
 # Dispatch: extension -> the right chunker above
 # --------------------------------------------------------------------------
 def chunk_file_ts(rel_path: str, src: str, ext: str,
-                   class_split_lines: int = 60) -> list[Chunk]:
+                   class_split_lines: int = 60,
+                   max_unit_lines: int = 220,
+                   max_unit_chars: int = 12000) -> list[Chunk]:
     """Chunk one file using whichever tree-sitter chunker matches its
     extension. The single entry point index.py calls -- it doesn't need
     to know JS/TS and Ruby use genuinely different algorithms internally
     (export-unwrapping vs. recursive containers)."""
     lang = LANG_BY_EXT[ext.lower()]
     if lang == "ruby":
-        return chunk_source_ruby(rel_path, src, class_split_lines)
-    return chunk_source_ts(rel_path, src, lang, class_split_lines)
+        return chunk_source_ruby(rel_path, src, class_split_lines,
+                                 max_unit_lines, max_unit_chars)
+    return chunk_source_ts(rel_path, src, lang, class_split_lines,
+                           max_unit_lines, max_unit_chars)
 
 
 def has_syntax_error(text: str, language: str) -> tuple[bool, int | None]:
