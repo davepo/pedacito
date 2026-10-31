@@ -40,7 +40,7 @@ import shutil
 import sys
 import time
 from datetime import datetime
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 
 from . import browser, fileio, proc, sessions, vision
 
@@ -1532,7 +1532,11 @@ def _allowlist_error(cfg, argv: list[str]) -> str:
         return ""
 
     def _exe(name: str) -> str:
-        base = Path(name).name.lower()
+        # PureWindowsPath parses backslash paths on every host; pathlib.Path
+        # would try to instantiate WindowsPath when os.name is patched, which
+        # raises on POSIX (and inside tests that simulate Windows).
+        base = (PureWindowsPath(name) if os.name == "nt"
+                else Path(name)).name.lower()
         # Compare without `.exe` on Windows.
         if os.name == "nt" and base.endswith(".exe"):
             base = base[:-4]

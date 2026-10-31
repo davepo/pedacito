@@ -55,7 +55,7 @@ LANG_BY_EXT = {
     ".cxx": "cpp",
     ".hpp": "cpp",
     ".hh": "cpp",
-    ".cs": "c_sharp",
+    ".cs": "csharp",
 }
 
 # Function-like scope node types (same across the JS, TS, and TSX grammars).
@@ -1005,7 +1005,7 @@ GENERIC_SPECS = {
         "decls": {"enum_specifier", "type_definition", "template_declaration"},
         "imports": {"preproc_include"},
     },
-    "c_sharp": {
+    "csharp": {
         "functions": {"method_declaration", "constructor_declaration"},
         "containers": {"class_declaration", "interface_declaration",
                        "struct_declaration", "enum_declaration",
