@@ -9,10 +9,8 @@ Usage
     sessions.read(root, "20260101-120000.md")
 
 Logs live in `<root>/.pedacito/sessions/*.md` (written by
-`workspace.write_session`). They are not in the code index -- `.pedacito/` is
-ignored -- so this module is the agent's read-only view of what previous runs
-asked, looked at, and changed. It matters most for small models starting a
-follow-up task with no memory of the prior conversation.
+`workspace.write_session`) and are not in the code index, so this module is the
+agent's read-only view of what previous runs asked, read, and changed.
 """
 
 from __future__ import annotations
@@ -41,10 +39,8 @@ def paths(root) -> list[Path]:
 
 
 def _resolve(root, name: str) -> Path | None:
-    """Resolve a session filename safely to a file under the sessions dir.
-
-    Only a basename is accepted: session logs are flat, and this makes a
-    model-supplied `../index.json` or absolute path harmless."""
+    """Resolve a session filename to a file under the sessions dir. Only the
+    basename is used, so a model-supplied `../index.json` is harmless."""
     name = (name or "").strip().strip("`\"'").replace("\\", "/")
     if not name:
         return None
@@ -54,7 +50,7 @@ def _resolve(root, name: str) -> Path | None:
     p = session_dir(root) / base
     if p.is_file():
         return p
-    # A model may give the timestamp without the .md suffix.
+    # The timestamp may come without the .md suffix.
     if not base.endswith(".md"):
         p = session_dir(root) / (base + ".md")
         if p.is_file():
@@ -72,20 +68,20 @@ def _task(text: str) -> str:
 
 def _edit_count(text: str) -> int:
     return sum(1 for line in text.splitlines()
-               if line.startswith("- applied ") or line.startswith("- FAILED "))
+               if line.startswith(("- applied ", "- FAILED ")))
 
 
 def _read_text(p: Path) -> str:
     return p.read_text(encoding="utf-8", errors="replace")
 
 
-def recent(root, limit: int = MAX_LIST) -> str:
+def recent(root) -> str:
     """List recent session logs with their task and edit count."""
     ps = paths(root)
     if not ps:
         return ("No prior sessions are recorded for this project. Session "
                 "logging may be off (`log_sessions = false`).")
-    shown = ps[:max(1, int(limit or MAX_LIST))]
+    shown = ps[:MAX_LIST]
     out = [f"Prior sessions (most recent first; {len(ps)} total):"]
     for p in shown:
         try:
@@ -153,7 +149,7 @@ def _compile(query: str) -> tuple[re.Pattern, list[str]]:
     return re.compile(needle), notes
 
 
-def search(root, query: str, scope: str = "", max_hits: int = MAX_HITS) -> str:
+def search(root, query: str, scope: str = "") -> str:
     """Search session logs and return grouped matching lines."""
     q = (query or "").strip()
     if not q:
@@ -173,16 +169,22 @@ def search(root, query: str, scope: str = "", max_hits: int = MAX_HITS) -> str:
     rx, compile_notes = _compile(q)
     notes += compile_notes
 
+    lines_cache: dict[Path, list[str]] = {}
+
+    def lines_of(p: Path) -> list[str]:
+        if p not in lines_cache:
+            try:
+                lines_cache[p] = _read_text(p).splitlines()
+            except OSError:
+                lines_cache[p] = []
+        return lines_cache[p]
+
     def scan(rx: re.Pattern) -> list[str]:
         out: list[str] = []
-        per_file = max(3, max_hits // 4)
+        per_file = max(3, MAX_HITS // 4)
         for p in ps:
-            try:
-                lines = _read_text(p).splitlines()
-            except OSError:
-                continue
             file_hits = 0
-            for i, line in enumerate(lines, 1):
+            for i, line in enumerate(lines_of(p), 1):
                 if not rx.search(line):
                     continue
                 if file_hits >= per_file:
@@ -192,15 +194,14 @@ def search(root, query: str, scope: str = "", max_hits: int = MAX_HITS) -> str:
                 cut = " ...[truncated]" if len(line) > 200 else ""
                 out.append(f"  {p.name}:{i}: {text}{cut}")
                 file_hits += 1
-                if len(out) >= max_hits:
-                    out.append(f"  [stopped at {max_hits} hits; narrow the query]")
+                if len(out) >= MAX_HITS:
+                    out.append(f"  [stopped at {MAX_HITS} hits; narrow the query]")
                     return out
         return out
 
     hits = scan(rx)
     if not hits:
-        rx_ci = re.compile(rx.pattern, re.IGNORECASE)
-        hits = scan(rx_ci)
+        hits = scan(re.compile(rx.pattern, re.IGNORECASE))
         if hits:
             notes.append("[note: no case-sensitive matches; retried "
                          "case-insensitively]")

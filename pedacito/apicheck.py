@@ -1,28 +1,23 @@
 """Static cross-file API consistency for Python.
 
-The `--complex` build implements each file in a FRESH context window, so the
-model can call `Level()` in one file while defining
-`Level.__init__(self, level_data)` in another. `import main` does not execute
-those calls, so the import check never sees it -- the run reports success and
-the program crashes on first use.
+The `--complex` build implements each file in a fresh context window, so a
+call like `Level()` can disagree with `Level.__init__(self, level_data)` in
+another file. The import check never executes such calls.
 
 This AST pass compares bare-name calls against the project's own function and
-class definitions and reports argument-count mismatches before the tree is
-handed back. It is deliberately conservative, because a false positive would
-send a working project into the repair loop:
+class definitions and reports argument-count mismatches. It is conservative,
+because a false positive would send a working project into the repair loop:
 
 - only calls to a bare ``Name`` (not ``obj.method(...)``) are checked;
 - only names defined exactly once in the project are checked, so a shadowed
   or ambiguous name is never reported;
 - calls using ``*args`` / ``**kwargs`` are skipped;
-- classes with no ``__init__`` are treated as zero-argument (object's).
+- classes with no ``__init__`` and no base class or decorator are treated as
+  zero-argument (object's); any other class without one is never checked,
+  since it may inherit or generate its constructor.
 
-It is a heuristic, not a type checker: it catches missing/extra positional
-arguments, which is the common failure when independent file implementations
-invent slightly different APIs. It does not resolve imports, so a name that
-collides with a builtin or a local variable could in principle be misread --
-rare in generated projects, and the repair prompt shows the exact definition
-it matched so a wrong report is easy to see.
+It is a heuristic, not a type checker: it does not resolve imports, so a name
+that collides with a builtin or a local variable could be misread.
 """
 
 from __future__ import annotations
@@ -56,7 +51,7 @@ class Mismatch:
 def _sig(args: ast.arguments, drop_self: bool) -> _Sig:
     """Arity for a function/``__init__`` ``arguments`` node. ``drop_self``
     removes the leading self/cls (a class constructor is called without it)."""
-    positional = list(getattr(args, "posonlyargs", [])) + list(args.args)
+    positional = args.posonlyargs + args.args
     defaults = list(args.defaults)
     if drop_self and positional and positional[0].arg in ("self", "cls"):
         positional = positional[1:]
@@ -82,7 +77,12 @@ def _collect(sources: dict[str, str]) -> dict[str, list[tuple[_Sig, str]]]:
                 init = next((n for n in node.body
                              if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
                              and n.name == "__init__"), None)
-                sig = _Sig((), 0) if init is None else _sig(init.args, True)
+                if init is not None:
+                    sig = _sig(init.args, True)
+                elif node.bases or node.keywords or node.decorator_list:
+                    sig = _Sig((), None)           # inherited/generated: unknown
+                else:
+                    sig = _Sig((), 0)
                 defs.setdefault(node.name, []).append((sig, f"{rel}:{node.lineno}"))
     return defs
 

@@ -15,15 +15,14 @@ Usage
     pedacito new  my-app -t "todo CLI"       # start a project from scratch
     pedacito auto . -t "add retries" --apply # autonomous outer loop over tasks
 
-Run as `pedacito <command> ...` (after `pip install -e .`) or
-`python -m pedacito <command> ...`. `main()` is the single entry point invoked
-by both `__main__.py` files. `pdc` is installed as a shorthand alias for
-`pedacito` and accepts the exact same commands, e.g. `pdc ask src/ -t "..."`.
+Run as `pedacito <command> ...` or `python -m pedacito <command> ...`; `pdc`
+is a shorthand alias accepting the same commands. `main()` is the entry point.
 """
 
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 from pathlib import Path
 
@@ -32,19 +31,14 @@ from . import loop
 from . import workspace
 from .agent import Agent
 from .config import (Config, ConfigError, REFERENCE_TEMPLATE,
-                     USER_CONFIG, auto_fit, find_project_config,
+                     USER_CONFIG, _apply_preset, auto_fit, find_project_config,
                      interactive_setup, load as load_config, write_template)
-from .llm import LMStudio, LLMError, estimate_tokens
+from .llm import LLMClient, LLMError, estimate_tokens
 from .select import CODE_EXTS, REFERENCE_EXTS, Matcher, is_venv_dir, select
 
 
-# --------------------------------------------------------------------------
-# Shared argument setup
-# --------------------------------------------------------------------------
 def _add_common(p):
-    """Register the argument flags shared by every subcommand that operates
-    on a project: paths, file selection overrides, connection overrides,
-    and config selection."""
+    """Register the flags shared by the project subcommands."""
     p.add_argument("paths", nargs="+", help="files or directories to index")
     p.add_argument("--exclude", action="append", default=[], metavar="PATTERN",
                    help="gitignore-style pattern to skip; repeatable "
@@ -70,35 +64,27 @@ def _add_common(p):
                         "(the default)")
 
 
-# --------------------------------------------------------------------------
-# Argument -> runtime object helpers
-# --------------------------------------------------------------------------
 def _root(args) -> Path:
-    """Resolve the effective project root for a parsed args namespace:
-    --root if given, otherwise inferred from the paths."""
+    """--root if given, otherwise inferred from the paths."""
     if getattr(args, "root", None):
         return Path(args.root).resolve()
     return index_mod.infer_root(getattr(args, "paths", []) or ["."])
 
 
 def _matcher(args, root: Path) -> Matcher:
-    """Build the file-selection Matcher for a parsed args namespace:
-    .pedacitoignore/.gitignore defaults plus any --exclude/--include flags."""
+    """File-selection Matcher: ignore files plus --exclude/--include flags."""
     names = (".pedacitoignore",) if getattr(args, "no_gitignore", False) \
         else (".pedacitoignore", ".gitignore")
     m = Matcher.from_files(root, names=names)
     m.extend(getattr(args, "exclude", []))
-    # Includes are appended last so they win: last match wins.
+    # Last match wins, so includes go last.
     m.extend("!" + p for p in getattr(args, "include", []))
     return m
 
 
 def _config(args) -> Config:
-    """Build the effective Config for a parsed args namespace: load from
-    files/profile, then apply any command-line overrides on top."""
-    # The config subcommand must be able to inspect (and repair) a file that
-    # predates the mandatory vram_gb setting; every real run requires it for
-    # local servers.
+    """Load the Config from files/profile, then apply command-line overrides."""
+    # `config` must be able to inspect a file that lacks the mandatory vram_gb.
     cfg = load_config(root=_root(args), explicit=getattr(args, "config", None),
                       profile=getattr(args, "profile", None),
                       require_hardware=(getattr(args, "cmd", "") != "config"))
@@ -108,47 +94,36 @@ def _config(args) -> Config:
         cfg.extra_extensions = tuple(args.ext)
     if getattr(args, "url", None):
         cfg.base_url = args.url
+        cfg.sources["base_url"] = "--url"
     if getattr(args, "model", None):
         cfg.model = args.model
+        cfg.sources["model"] = "--model"
     if getattr(args, "steps", None) is not None:
         cfg.max_steps = args.steps
         cfg.sources["max_steps"] = "--steps"
-    for flag, key in (("url", "base_url"), ("model", "model")):
-        if getattr(args, flag, None):
-            cfg.sources[key] = f"--{flag}"
-    # Fit every token budget to the server's real context window before any
-    # request goes out. Without this, built-in/hosted-tier budgets (3k-16k
-    # answers, 24k-100k gathered source) sail past LM Studio's stock 8192 or
-    # Ollama's default 4096 and every call gets truncated or rejected --
-    # "it just kept hitting limits" even with a correct base_url/model.
-    # `pedacito config` itself skips fitting so it can report true sources.
-    if not getattr(args, "cmd", "") == "config":
+    # Fit token budgets to the server's real context window before any request;
+    # `config` skips this so it reports the true sources.
+    if getattr(args, "cmd", "") != "config":
         auto_fit(cfg, verbose=True)
     return cfg
 
 
-# --------------------------------------------------------------------------
-# Index loading and freshness
-# --------------------------------------------------------------------------
 def _refresh(idx, args, cfg, root: Path, verbose: bool = True):
     """Bring a loaded index back in line with what is on disk.
 
-    Line ranges are only meaningful against the bytes they were built from, so
-    a file you edited yourself between sessions would send the model to the
-    wrong lines. Re-chunking is fast and local; summaries survive by content
-    hash, so only the parts you actually changed lose theirs.
+    Files edited between sessions are re-chunked (fast, local); summaries
+    survive by content hash, so only changed parts lose theirs.
     """
     changed, missing = idx.stale()
-    # stale() may have refreshed recorded [mtime, size] entries for files it
-    # hashed and found unchanged (a touch, a checkout); persisting those lets
-    # the NEXT run skip the hashes too.
+    # stale() may refresh recorded [mtime, size] entries; persist them so the
+    # next run can skip the hashes.
     stats_dirty = idx.stats_refreshed
     for rel in missing:
         idx.forget(rel)
     for rel in changed:
         idx = index_mod.reindex_file(idx, rel, cfg, save=False)
 
-    # Files added since the last index will not be in it at all.
+    # Files added since the last index.
     exts = set(CODE_EXTS)
     if cfg.include_references:
         exts |= set(REFERENCE_EXTS)
@@ -171,10 +146,8 @@ def _refresh(idx, args, cfg, root: Path, verbose: bool = True):
             bits.append(f"{len(added)} new")
         print(f"  index refreshed ({', '.join(bits)})", file=sys.stderr)
 
-    # Splice new files into the existing index one at a time rather than
-    # rebuilding from scratch: a rebuild discards every cached summary (see
-    # the cache handling in index.build), and re-chunking the entire project
-    # to pick up one added file is a needless amount of work besides.
+    # Splice new files in rather than rebuilding, which would discard every
+    # cached summary.
     for rel in added:
         idx = index_mod.reindex_file(idx, rel, cfg, save=False)
     if verbose and added:
@@ -187,8 +160,8 @@ def _refresh(idx, args, cfg, root: Path, verbose: bool = True):
 
 
 def _get_index(args, cfg, client, rebuild: bool, summarise: bool = True):
-    """Load the project's index (refreshing it for staleness) or build it
-    from scratch if none exists yet or `rebuild` is set."""
+    """Load and refresh the project's index, or build it if none exists or
+    `rebuild` is set."""
     root = _root(args)
     if not rebuild:
         existing = index_mod.Index.load(root)
@@ -201,19 +174,15 @@ def _get_index(args, cfg, client, rebuild: bool, summarise: bool = True):
                            matcher=_matcher(args, root))
 
 
-# --------------------------------------------------------------------------
-# `pedacito config`
-# --------------------------------------------------------------------------
 SECRETISH = {"api_key"}
 
 
 def _cmd_config(args, cfg) -> int:
-    """Implement `pedacito config`: with --init, write a starter config file;
-    otherwise show every resolved setting and which file/profile set it,
-    and with --check, verify the LM Studio connection and model."""
+    """`pedacito config`: write a starter (--init) or the reference template,
+    else show each resolved setting and its origin; --check also tests the
+    server connection and model, --doctor additionally probes which
+    structured-output modes the server supports."""
     if getattr(args, "reference", False):
-        # The full annotated template. The starter is already profile-based
-        # and lists every opt-in; --reference appends the longer explanations.
         target = Path(args.path) if args.path else None
         if target is not None:
             try:
@@ -231,7 +200,7 @@ def _cmd_config(args, cfg) -> int:
         try:
             path = write_template(Path(args.path) if args.path else None, args.force)
         except ConfigError as e:
-            print(f"{e}", file=sys.stderr)
+            print(e, file=sys.stderr)
             return 2
         print(f"Wrote {path}", file=sys.stderr)
         print("Mandatory settings: base_url, model and vram_gb in "
@@ -256,9 +225,12 @@ def _cmd_config(args, cfg) -> int:
         print(f"\nProfiles defined: {', '.join(sorted(cfg.profiles))}")
         print(f"  use with: pedacito ask PROJ -t \"...\" --profile "
               f"{sorted(cfg.profiles)[0]}")
-        from .config import _apply_preset
         for name in sorted(cfg.profiles):
-            _, tier = _apply_preset(name, cfg.profiles[name], "config file")
+            try:
+                _, tier = _apply_preset(name, cfg.profiles[name], "config file")
+            except ConfigError as e:
+                print(f"  {name:<20} invalid: {e}")
+                continue
             if tier:
                 print(f"  {name:<20} tier '{tier}' preset applied "
                       "(token limits)")
@@ -277,16 +249,19 @@ def _cmd_config(args, cfg) -> int:
         note = "" if origin == "default" else f"   <- {origin}"
         print(f"  {mark}{key:<{width}}  {value!r}{note}")
 
-    if not args.check:
-        print("\nRun `pedacito config --check` to test the connection.", file=sys.stderr)
+    doctor = getattr(args, "doctor", False)
+    if not args.check and not doctor:
+        print("\nRun `pedacito config --check` to test the connection, or "
+              "`--doctor` to also probe its structured-output modes.",
+              file=sys.stderr)
         return 0
 
     print(f"\nConnecting to {cfg.base_url} ...")
-    client = LMStudio(cfg)
+    client = LLMClient(cfg)
     try:
         loaded = client.check(warn=False)
     except LLMError as e:
-        print(f"{e}", file=sys.stderr)
+        print(e, file=sys.stderr)
         return 1
     print(f"  reachable. Models available: {loaded}")
     if cfg.model not in loaded.split(", "):
@@ -294,8 +269,7 @@ def _cmd_config(args, cfg) -> int:
               file=sys.stderr)
         print("  Copy the id exactly as shown.", file=sys.stderr)
         return 1
-    # Listing a model does not prove it can load. Generate one token and find
-    # out now, rather than 35 chunks into an index.
+    # Listing a model does not prove it can load; generate a token to find out.
     state = client.loaded_models()
     if state is not None:
         resident = [m for m, st in state.items() if st == "loaded"]
@@ -309,13 +283,58 @@ def _cmd_config(args, cfg) -> int:
     except LLMError as e:
         print(f"\n{e}", file=sys.stderr)
         return 1
-    print("  generation works. You're good.")
+    if not doctor:
+        print("  generation works. You're good.")
+        return 0
+    print("  generation works.")
+
+    # --doctor: one-probe self-calibration. Reports what the server really
+    # supports so the config stops guessing.
+    print(f"\nProbing structured-output modes on '{cfg.model}' ...")
+    results = client.probe_json_modes()
+    width = max(len(m) for m, _ok, _d in results)
+    ok_modes = []
+    for mode, ok, detail in results:
+        print(f"  {mode:<{width}}  {'ok    ' if ok else 'FAILED'}  {detail}")
+        if ok:
+            ok_modes.append(mode)
+    if "json_schema" in ok_modes:
+        rec = "schema"
+        why = ("the server enforces a grammar, so step replies cannot come "
+               "back unparseable")
+    elif "json_object" in ok_modes:
+        rec = "object"
+        why = "no grammar support, but the server does enforce JSON mode"
+    else:
+        rec = "schema"
+        why = ("no structured mode works; Pedacito will fall back to JSON "
+               "prompting automatically, which needs an instruction-following "
+               "model")
+    print(f"\nRecommended: json_mode = \"{rec}\" -- {why}.")
+    if cfg.json_mode != rec:
+        print(f"  Your config currently says json_mode = \"{cfg.json_mode}\".")
+    info = client.model_info()
+    if info:
+        bits = []
+        if info.get("context_length"):
+            bits.append(f"context {info['context_length']:,}")
+        if info.get("max_context_length"):
+            bits.append(f"max {info['max_context_length']:,}")
+        if info.get("size_bytes"):
+            bits.append(f"weights {info['size_bytes'] / 1024 ** 3:.1f} GiB")
+        if bits:
+            print(f"Server reports ({info.get('source', '?')}): "
+                  + ", ".join(bits) + ".")
+    cpt = getattr(client, "chars_per_token", 0.0)
+    if cpt:
+        print(f"Tokenizer calibrated: ~{cpt:.2f} chars/token "
+              "(fit math will use this instead of the 3.6 default).")
+    else:
+        print("No tokenizer endpoint answered; fit math uses the "
+              "~3.6 chars/token heuristic.")
     return 0
 
 
-# --------------------------------------------------------------------------
-# `pedacito chat` slash commands
-# --------------------------------------------------------------------------
 CHAT_HELP = """\
   /profile NAME   switch model profile (loads it, waits if needed)
   /model ID       switch to a model id directly
@@ -327,13 +346,8 @@ CHAT_HELP = """\
 
 
 def _chat_command(line: str, args, cfg, ref) -> bool:
-    """Handle a /command typed in `pedacito chat`. Returns False to end the
-    session, True to continue.
-
-    Switching profiles mid-session is the point of this: comparing two
-    models on the same task is much easier when the index stays warm
-    between them.
-    """
+    """Handle a /command typed in `pedacito chat`; returns False to end the
+    session. Profile switching keeps the index warm between models."""
     parts = line[1:].split(None, 1)
     cmd = parts[0].lower() if parts else ""
     arg = parts[1].strip() if len(parts) > 1 else ""
@@ -346,14 +360,16 @@ def _chat_command(line: str, args, cfg, ref) -> bool:
         return True
 
     if cmd == "profiles":
-        from .config import _apply_preset
         if not cfg.profiles:
             print("  No profiles defined. Add [profiles.NAME] to your config.",
                   file=sys.stderr)
         for name, body in sorted(cfg.profiles.items()):
             mark = "*" if name == cfg.active_profile else " "
-            _, tier = _apply_preset(name, body, "config")
-            limits = f"  [tier {tier}]" if tier else ""
+            try:
+                _, tier = _apply_preset(name, body, "config")
+                limits = f"  [tier {tier}]" if tier else ""
+            except ConfigError as e:
+                limits = f"  [invalid: {e}]"
             print(f"  {mark} {name}: {body.get('model', '(inherits model)')}"
                   f"{limits}", file=sys.stderr)
         return True
@@ -382,10 +398,8 @@ def _chat_command(line: str, args, cfg, ref) -> bool:
         except ValueError:
             print("  Usage: /steps 8", file=sys.stderr)
             return True
-        # Update the parsed-args namespace too, not just the live cfg: a
-        # later `/profile` re-resolves config through `_config(args)`, which
-        # applies args.steps on top. Without this, the original --steps value
-        # (or None) would silently clobber the /steps override.
+        # Also update args: a later `/profile` re-resolves config via
+        # `_config(args)`, which applies args.steps on top.
         args.steps = n
         ref["cfg"].max_steps = n
         ref["agent"].cfg = ref["cfg"]
@@ -407,7 +421,7 @@ def _chat_command(line: str, args, cfg, ref) -> bool:
             args.profile, args.model = prev_profile, prev_model
             print(f"  {e}", file=sys.stderr)
             return True
-        new_client = LMStudio(new_cfg)
+        new_client = LLMClient(new_cfg)
         try:
             new_client.check(warn=False)
             new_client.warmup()
@@ -418,7 +432,12 @@ def _chat_command(line: str, args, cfg, ref) -> bool:
             return True
         ref["cfg"], ref["client"] = new_cfg, new_client
         ref["agent"] = Agent(ref["idx"], new_client, new_cfg)
-        label = f"profile {new_cfg.active_profile}" + (f" [{new_cfg.active_tier} limits]" if new_cfg.active_tier else "") + ", " if new_cfg.active_profile else ""
+        label = ""
+        if new_cfg.active_profile:
+            label = f"profile {new_cfg.active_profile}"
+            if new_cfg.active_tier:
+                label += f" [{new_cfg.active_tier} limits]"
+            label += ", "
         print(f"  now using {label}model {new_cfg.model}", file=sys.stderr)
         return True
 
@@ -426,34 +445,24 @@ def _chat_command(line: str, args, cfg, ref) -> bool:
     return True
 
 
-# --------------------------------------------------------------------------
-# Review-page integration
-# --------------------------------------------------------------------------
 def _wants_review(args, cfg) -> bool:
-    """Decide whether this run should use the side-by-side review page:
-    --review or config `review=true`, unless --no-review overrides it."""
+    """--review or config `review`, unless --no-review overrides it."""
     if getattr(args, "no_review", False):
         return False
     return bool(getattr(args, "review", False) or cfg.review)
 
 
-# --------------------------------------------------------------------------
-# `pedacito auto`: the autonomous outer loop
-# --------------------------------------------------------------------------
 def _cmd_auto(args, cfg, client, idx, root: Path) -> int:
-    """Implement `pedacito auto`: generate a task list from a goal (or reuse
-    an existing plan file), then run the Ralph loop until it is empty.
-
-    Without --apply this is plan-only: generate/print the plan and stop, so a
-    bare `auto` never writes code. With --apply it implements every unchecked
-    task in a fresh context window, optionally verifying each with --verify."""
+    """`pedacito auto`: generate a task list from a goal (or reuse a plan
+    file), then implement every unchecked task in a fresh context window,
+    optionally verifying each with --verify. Without --apply it only
+    generates and prints the plan."""
     from . import scaffold
 
     workspace.log_event(root, "command: " + " ".join(sys.argv))
 
     if getattr(args, "worktree", ""):
         from . import worktree
-        from . import index as index_mod
         try:
             root = worktree.create(root, args.worktree)
         except worktree.WorktreeError as e:
@@ -471,16 +480,12 @@ def _cmd_auto(args, cfg, client, idx, root: Path) -> int:
     if args.task or args.spec:
         spec = scaffold.load_spec(
             prompt=args.task, spec_file=args.spec,
-            max_chars=getattr(cfg, "max_spec_chars", scaffold.MAX_SPEC_CHARS))
-        # The full spec text (not just the title) travels with every task
-        # prompt: constraints the planner drops from a title must still bind
-        # the worker that implements it.
+            max_chars=cfg.max_spec_chars)
+        # The full spec travels with every task prompt so constraints dropped
+        # from the title still bind the worker.
         spec_text = spec.text
-        # Reuse an existing plan to RESUME only while it still has open tasks;
-        # once it is complete (or missing), a new -t/--spec goal starts a fresh
-        # plan. Otherwise `auto -t "fix the bug"` on a finished project would
-        # silently re-read the old all-checked checklist and report "all tasks
-        # complete" without touching the new goal at all.
+        # Resume an existing plan only while it has open tasks; otherwise a new
+        # goal starts a fresh plan.
         regenerate = args.force or \
             loop.next_task(loop.read_plan(plan_path)) is None
         if regenerate:
@@ -513,9 +518,9 @@ def _cmd_auto(args, cfg, client, idx, root: Path) -> int:
         else cfg.auto_max_tasks
     max_minutes = args.max_minutes \
         if getattr(args, "max_minutes", None) is not None \
-        else getattr(cfg, "auto_max_minutes", 0)
+        else cfg.auto_max_minutes
     auto_install = bool(getattr(args, "auto_install", False)
-                        or getattr(cfg, "auto_install_deps", False))
+                        or cfg.auto_install_deps)
     if getattr(args, "diagnostics", False):
         cfg.auto_diagnostics = True
 
@@ -525,30 +530,27 @@ def _cmd_auto(args, cfg, client, idx, root: Path) -> int:
                          stop_on_fail=not args.keep_going,
                          auto_install=auto_install, goal=spec_text)
 
-    # Automatic post-run verification: after the checklist is done, exercise
-    # the project once (the explicit --verify and/or a smoke run of main.py)
-    # and feed a failure back for repair before returning. This is what lets a
-    # run correct itself instead of declaring success on broken code.
-    smoke = bool(getattr(cfg, "auto_smoke", True))
+    # Post-run verification: exercise the project once (--verify and/or a smoke
+    # run of main.py) and feed a failure back for repair.
+    smoke = bool(cfg.auto_smoke)
     if args.apply and (verify or smoke):
         skip = {".pedacito", "__pycache__", ".venv", "venv",
                 "node_modules", ".git"}
-
-        def _under_venv(p: Path) -> bool:
-            """True when `p` sits under a Python virtualenv (pyvenv.cfg marker),
-            so a venv with a non-standard name inside the project is not fed to
-            the smoke checker as if its site-packages were project code."""
-            return any(is_venv_dir(parent) for parent in p.parents)
-
-        py_rels = sorted(
-            p.relative_to(root).as_posix() for p in root.rglob("*.py")
-            if not (set(p.parts) & skip) and not _under_venv(p))
+        # Prune skipped dirs and virtualenvs (any name, via pyvenv.cfg) while
+        # walking so their contents are never traversed.
+        py_rels = []
+        for dirpath, dirnames, filenames in os.walk(root):
+            dirnames[:] = [d for d in dirnames if d not in skip
+                           and not is_venv_dir(Path(dirpath, d))]
+            py_rels.extend(Path(dirpath, f).relative_to(root).as_posix()
+                           for f in filenames if f.endswith(".py"))
+        py_rels.sort()
         v_ok, v_out = scaffold.verify_and_fix(
             client, cfg, idx, py_rels, root.name, None,
             explicit_cmd=verify,
-            rounds=int(getattr(cfg, "auto_verify_rounds", 2) or 0),
+            rounds=int(cfg.auto_verify_rounds or 0),
             smoke=smoke,
-            smoke_timeout=int(getattr(cfg, "auto_smoke_timeout", 20) or 20),
+            smoke_timeout=int(cfg.auto_smoke_timeout or 20),
             verbose=True)
         if v_ok:
             note = "verify: passed" + (f" ({v_out})" if v_out else "")
@@ -564,15 +566,9 @@ def _cmd_auto(args, cfg, client, idx, root: Path) -> int:
     return code
 
 
-# --------------------------------------------------------------------------
-# `pedacito explain`: questions about the indexed project
-# --------------------------------------------------------------------------
 def _cmd_explain(args, client, agent) -> int:
-    """Implement `pedacito explain`: answer a question about the indexed
-    project, in prose (no edits, no apply).
-
-    The no-index case is gated in `main()` before a model connection is
-    made, so by the time this runs the index exists and is warm."""
+    """`pedacito explain`: answer questions about the indexed project in prose
+    (no edits). `main()` has already checked that an index exists."""
     from . import explain
 
     question = (getattr(args, "question_opt", None) or "").strip()
@@ -620,11 +616,8 @@ def _cmd_explain(args, client, agent) -> int:
     return 0
 
 
-# --------------------------------------------------------------------------
-# Entry point
-# --------------------------------------------------------------------------
 def _cmd_worktree(args) -> int:
-    """Implement `pedacito worktree create|list|remove`."""
+    """`pedacito worktree create|list|remove`."""
     from . import worktree
     root = Path(args.root).expanduser().resolve() if args.root else Path(".").resolve()
     try:
@@ -657,7 +650,7 @@ def _cmd_worktree(args) -> int:
 
 
 def _cmd_diagnose(args) -> int:
-    """Implement `pedacito diagnose`."""
+    """`pedacito diagnose`."""
     from . import diagnostics
     root = Path(args.root).expanduser().resolve() if args.root else Path(".").resolve()
     files = [args.file] if getattr(args, "file", "") else None
@@ -667,15 +660,9 @@ def _cmd_diagnose(args) -> int:
 
 
 def _configure_stdio() -> None:
-    """Make the console streams UTF-8 tolerant on every platform.
-
-    Windows falls back to the locale code page (often cp1252) when stdout or
-    stderr is redirected to a file or pipe, so printing a model reply or a
-    path containing non-ASCII characters raised UnicodeEncodeError and killed
-    the run. Reconfiguring to UTF-8 with replacement keeps output lossless
-    enough and never crashes. StringIO-based test harnesses have no
-    `reconfigure`; skip them.
-    """
+    """Make stdout/stderr UTF-8 with replacement so non-ASCII output cannot
+    raise UnicodeEncodeError on Windows code pages. Streams without
+    `reconfigure` (StringIO harnesses) are skipped."""
     for stream in (sys.stdout, sys.stderr):
         try:
             stream.reconfigure(encoding="utf-8", errors="replace")
@@ -684,8 +671,7 @@ def _configure_stdio() -> None:
 
 
 def main(argv=None) -> int:
-    """Parse command-line arguments and dispatch to the requested
-    subcommand. Returns the process exit code."""
+    """Parse arguments and dispatch to the subcommand; returns the exit code."""
     _configure_stdio()
     ap = argparse.ArgumentParser(prog="pedacito", description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -710,7 +696,12 @@ def main(argv=None) -> int:
     p_conf.add_argument("--path", metavar="FILE", help="write --init here instead")
     p_conf.add_argument("--force", action="store_true", help="overwrite an existing file")
     p_conf.add_argument("--check", action="store_true",
-                        help="connect to LM Studio and verify the model is loaded")
+                        help="connect to the model server and verify the model is loaded")
+    p_conf.add_argument("--doctor", action="store_true",
+                        help="like --check, plus probe which structured-output "
+                             "mode (json_schema / json_object / plain prompting) "
+                             "this server+model actually supports, and report "
+                             "its context length and tokenizer ratio")
     p_conf.add_argument("--setup", action="store_true",
                         help="interactive first-run setup: finds a local server, "
                              "writes and validates a minimal config")
@@ -740,7 +731,6 @@ def main(argv=None) -> int:
     p_how.add_argument("--profile", metavar="NAME",
                        help="apply a [profiles.NAME] block from your config")
 
-    # Same positional shape as every other command: the project path first.
     p_rest = sub.add_parser("restore", help="undo an --apply run from its backup snapshot")
     p_rest.add_argument("paths", nargs="*", default=["."],
                         help="the project (default: current directory)")
@@ -894,9 +884,7 @@ def main(argv=None) -> int:
 
     args = ap.parse_args(argv)
 
-    # `config --setup` is the recovery path for a broken or missing config,
-    # so it must run even when loading the current one fails. Handled here,
-    # before _config().
+    # `config --setup` repairs a broken config, so it runs before _config().
     if args.cmd == "config" and getattr(args, "setup", False):
         try:
             interactive_setup(Path(args.path) if args.path else None,
@@ -914,9 +902,7 @@ def main(argv=None) -> int:
     if args.cmd == "diagnose":
         return _cmd_diagnose(args)
 
-    # `how` is standalone help: it needs a model connection, but no project
-    # path, index, or vram-derived token budget. Handle it before the shared
-    # config/index path so it works with a bare-minimum config or direct flags.
+    # `how` needs a model connection but no project, index or vram budget.
     if args.cmd == "how":
         from .how import HowError, run_cli as run_how
         try:
@@ -931,9 +917,7 @@ def main(argv=None) -> int:
             print("\nCancelled.", file=sys.stderr)
             return 130
 
-    # `explain` is scoped to an already-indexed project. Check for an index
-    # before touching the config or the model server, so a missing one gets a
-    # helpful direction immediately -- no model connection or vram_gb needed.
+    # `explain` never builds an index; check before touching config or server.
     if args.cmd == "explain":
         root = _root(args)
         if index_mod.Index.load(root) is None:
@@ -942,7 +926,7 @@ def main(argv=None) -> int:
                 "`pedacito explain` answers questions about an already-indexed\n"
                 "project; it never builds an index itself.\n\n"
                 "To use it:\n"
-                f"  1. navigate to a project you have indexed, or index this one\n"
+                "  1. navigate to a project you have indexed, or index this one\n"
                 f"     with:  pedacito index {root}\n"
                 f"  2. then run: pedacito explain {root} -q \"your question\"\n",
                 file=sys.stderr)
@@ -1005,8 +989,8 @@ def main(argv=None) -> int:
 
         if args.cmd == "files":
             root = _root(args)
-            # `files` is the documented first command, so bootstrap here too:
-            # the whole point of running it is to get a .pedacitoignore to edit.
+            # `files` is the documented first command; bootstrap the workspace
+            # so there is a .pedacitoignore to edit.
             workspace.ensure(root, cfg.manage_gitignore, cfg.create_ignore_file)
             m = _matcher(args, root)
             exts = set(CODE_EXTS)
@@ -1031,8 +1015,7 @@ def main(argv=None) -> int:
                         print(f"  {kind} {rel}")
                         continue
                     skip += 1
-                    # Collapse ignored directories to one line. Listing every
-                    # file inside .git/ buries the answer you came for.
+                    # Collapse ignored directories to one line.
                     parts = rel.split("/")
                     top = next((("/".join(parts[: i + 1]))
                                 for i in range(len(parts) - 1)
@@ -1074,36 +1057,35 @@ def main(argv=None) -> int:
                   f"{cfg.flat_map_token_budget * 2:,}")
             return 0
 
-        client = LMStudio(cfg)
+        client = LLMClient(cfg)
         client.check()
 
-        # --- new: start a project from scratch (plan -> skeleton -> build) ---
-        # Handled before indexing: the project directory usually does not exist
-        # yet, and the skeleton gets its own in-memory index.
+        # `new` runs before indexing: the project directory usually does not
+        # exist yet, and the skeleton gets its own in-memory index.
         if args.cmd == "new":
             from . import scaffold
             root = Path(args.project).expanduser().resolve()
             workspace.log_event(root, "command: " + " ".join(sys.argv))
             spec = scaffold.load_spec(
                 prompt=args.task, spec_file=args.spec,
-                max_chars=getattr(cfg, "max_spec_chars", scaffold.MAX_SPEC_CHARS))
+                max_chars=cfg.max_spec_chars)
             code = scaffold.run_new(
                 root, cfg, client, spec,
                 apply=args.apply, review=args.review,
                 plan_only=args.plan_only, force=args.force,
                 verbose=True, complex=args.complex,
                 verify=args.verify if getattr(args, "verify", None) is not None
-                else getattr(cfg, "auto_verify", ""),
+                else cfg.auto_verify,
                 repair_rounds=args.repair if getattr(args, "repair", None) is not None
-                else getattr(cfg, "auto_repair_rounds", 2),
+                else cfg.auto_repair_rounds,
                 max_tasks=args.max_tasks if getattr(args, "max_tasks", None) is not None
-                else getattr(cfg, "auto_max_tasks", 0),
+                else cfg.auto_max_tasks,
                 max_minutes=args.max_minutes
                 if getattr(args, "max_minutes", None) is not None
-                else getattr(cfg, "auto_max_minutes", 0),
+                else cfg.auto_max_minutes,
                 keep_going=args.keep_going,
                 auto_install=bool(getattr(args, "auto_install", False)
-                                  or getattr(cfg, "auto_install_deps", False)))
+                                  or cfg.auto_install_deps))
             s = client.stats
             print(f"\n[{s['calls']} calls, {s['completion_tokens']} tokens out, "
                   f"{s['seconds']:.0f}s]", file=sys.stderr)
@@ -1123,14 +1105,13 @@ def main(argv=None) -> int:
             return 0
 
         idx = _get_index(args, cfg, client, rebuild=getattr(args, "reindex", False))
-        # Take the model load here, once, with a clear message. Otherwise a
-        # profile switch stalls silently inside the first gather step.
+        # Load the model here with a clear message rather than stalling
+        # silently inside the first gather step.
         client.warmup()
         agent = Agent(idx, client, cfg)
 
         root = _root(args)
-        # Slash commands rebind these, so they are shared through a dict rather
-        # than captured by value.
+        # Slash commands rebind these, so share them through a dict.
         locals_ref = {"cfg": cfg, "client": client, "agent": agent, "idx": idx}
 
         if args.cmd == "explain":
@@ -1157,7 +1138,7 @@ def main(argv=None) -> int:
         if args.cmd == "auto":
             return _cmd_auto(args, cfg, client, idx, root)
 
-        # --- chat: interactive loop with the index kept warm between tasks ---
+        # chat: interactive loop with the index kept warm between tasks
         def banner():
             """One-line status shown at the start of a chat session."""
             bits = [f"model {cfg.model}"]

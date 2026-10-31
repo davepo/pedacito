@@ -21,7 +21,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from pedacito import index as index_mod          # noqa: E402
 from pedacito.agent import Agent                 # noqa: E402
 from pedacito.config import Config               # noqa: E402
-from pedacito.llm import LMStudio                # noqa: E402
+from pedacito.llm import LLMClient                # noqa: E402
 from pedacito.review import diffs_from_results   # noqa: E402
 
 FAKE = Path(__file__).resolve().parent / "fake_llm.py"
@@ -105,7 +105,7 @@ def test_agent_rename_end_to_end(tmp_path, fake_port):
     root = _project(tmp_path)
     cfg = _cfg(fake_port)
     idx = index_mod.build([str(root)], cfg, client=None, summarise=False, root=root)
-    agent = Agent(idx, LMStudio(cfg), cfg)
+    agent = Agent(idx, LLMClient(cfg), cfg)
 
     gathered = agent.gather("rename old_name.py to new_name.py", verbose=False)
     assert "print" in gathered, "gather loop never surfaced the file's source"
@@ -139,7 +139,7 @@ def test_gather_coverage_ledger_counts_reads(tmp_path, fake_port):
     root = _project(tmp_path)
     cfg = _cfg(fake_port)
     idx = index_mod.build([str(root)], cfg, client=None, summarise=False, root=root)
-    agent = Agent(idx, LMStudio(cfg), cfg)
+    agent = Agent(idx, LLMClient(cfg), cfg)
     agent.gather("rename ./old_name.py to new_name.py", verbose=False)
     # The task names both files; the read covered old_name.py only, but the
     # point is the ledger normalised its key rather than storing "./...".

@@ -13,14 +13,18 @@ Servers are configured as command strings:
     allow_mcp = true
     mcp_servers = ["python /path/to/server.py", "node /path/to/server.js"]
 
-Each call starts the server, performs the MCP initialize handshake, invokes one
-tool, and stops it. That is slower than keeping a session open, but it keeps
-lifecycle, crashes, and orphan processes out of the agent loop -- important
-when the server is untrusted and the run may be long.
+Tool calls keep one live session per server command (a module-level cache):
+the server is started and initialized on first use and reused afterwards,
+which matters because a gather loop may call the same tool many times. A dead
+or desynced session is dropped and the call retried once on a fresh server;
+`close_all()` (registered with atexit) reaps every session when the process
+ends, so no orphan server outlives the run. The catalog listing still uses
+one throwaway session per server, since it is fetched at most once.
 """
 
 from __future__ import annotations
 
+import atexit
 import json
 import os
 import queue
@@ -33,6 +37,8 @@ from . import proc
 
 PROTOCOL_VERSION = "2024-11-05"
 _CATALOG_CACHE: dict[tuple[str, ...], list[tuple[str, str, str]]] = {}
+# Live keep-alive sessions by server command string (see module docstring).
+_SESSIONS: dict[str, "_Session"] = {}
 
 
 class MCPError(RuntimeError):
@@ -88,9 +94,11 @@ class _Session:
                 if not line:
                     continue
                 try:
-                    self._q.put(json.loads(line))
+                    msg = json.loads(line)
                 except ValueError:
                     continue
+                if isinstance(msg, dict):
+                    self._q.put(msg)
         except Exception:
             pass
 
@@ -110,7 +118,7 @@ class _Session:
                 msg = self._q.get(timeout=self.timeout)
             except queue.Empty:
                 raise MCPError(f"{method} timed out after {self.timeout}s")
-            if msg.get("id") == rid:
+            if msg.get("id") == rid and "method" not in msg:
                 if "error" in msg:
                     raise MCPError(str(msg["error"])[:400])
                 return msg.get("result") or {}
@@ -142,6 +150,43 @@ class _Session:
                 pass
 
 
+def _live_session(cmd: str, timeout: int) -> "_Session":
+    """The cached initialised session for `cmd`, restarted when the cached
+    process has exited. Callers `_drop_session` after a failed request so the
+    next call starts a fresh server."""
+    s = _SESSIONS.get(cmd)
+    if s is not None:
+        if s.proc.poll() is None:
+            return s
+        s.close()
+        _SESSIONS.pop(cmd, None)
+    s = _Session(cmd, timeout)
+    try:
+        s.initialize()
+    except Exception:
+        s.close()
+        raise
+    _SESSIONS[cmd] = s
+    return s
+
+
+def _drop_session(cmd: str) -> None:
+    """Close and forget `cmd`'s cached session after a failure."""
+    s = _SESSIONS.pop(cmd, None)
+    if s is not None:
+        s.close()
+
+
+def close_all() -> None:
+    """Close every cached MCP session. Registered with atexit so a kept-alive
+    server never outlives the process; tests call it between cases."""
+    for cmd in list(_SESSIONS):
+        _drop_session(cmd)
+
+
+atexit.register(close_all)
+
+
 def _servers(cfg) -> tuple[str, ...]:
     if not getattr(cfg, "allow_mcp", False):
         return ()
@@ -160,7 +205,12 @@ def catalog(cfg) -> list[tuple[str, str, str]]:
     out: list[tuple[str, str, str]] = []
     for cmd in servers:
         name = _server_name(cmd)
-        s = _Session(cmd, int(getattr(cfg, "mcp_timeout", 30) or 30))
+        try:
+            s = _Session(cmd, int(getattr(cfg, "mcp_timeout", 30) or 30))
+        except (OSError, ValueError) as e:
+            out.append((f"{name}/(unavailable)",
+                        f"server failed: {str(e)[:200]}", "{}"))
+            continue
         try:
             s.initialize()
             result = s.request("tools/list")
@@ -218,16 +268,20 @@ def call(cfg, target: str, args: dict | None = None) -> str:
                 if _server_name(c) == server_name), "")
     if not cmd:
         return f"ERROR: MCP server '{server_name}' is not configured."
-    s = _Session(cmd, int(getattr(cfg, "mcp_timeout", 30) or 30))
-    try:
-        s.initialize()
-        result = s.request("tools/call", {
-            "name": tool_name, "arguments": args or {},
-        })
-    except Exception as e:
-        return f"ERROR: MCP call failed: {str(e)[:400]}"
-    finally:
-        s.close()
+    timeout = int(getattr(cfg, "mcp_timeout", 30) or 30)
+    params = {"name": tool_name, "arguments": args or {}}
+    result: dict = {}
+    for attempt in (1, 2):
+        try:
+            s = _live_session(cmd, timeout)
+            result = s.request("tools/call", params)
+            break
+        except Exception as e:
+            # The session may be dead or desynced mid-request: drop it, and on
+            # the first failure retry once on a fresh server.
+            _drop_session(cmd)
+            if attempt == 2:
+                return f"ERROR: MCP call failed: {str(e)[:400]}"
     content = result.get("content") or []
     bits = []
     for item in content:

@@ -1,7 +1,6 @@
-"""Fallback entry point: allows running `python __main__.py ...` directly
-from an uninstalled checkout of this repository, in addition to the
-`python -m pedacito` and installed `pedacito` command forms (see
-pedacito/__main__.py and pyproject.toml's [project.scripts])."""
+"""Fallback entry point: runs `python __main__.py ...` from an uninstalled
+checkout, in addition to `python -m pedacito` and the installed `pedacito`
+command."""
 
 from pedacito.cli import main
 

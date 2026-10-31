@@ -42,8 +42,8 @@ def _run(cmd: list[str], timeout: int = 30) -> tuple[bool, str]:
 
 def _pillow():
     try:
-        from PIL import Image, ImageGrab, ImageStat  # noqa: F401
-        return Image, ImageGrab, ImageStat
+        from PIL import Image, ImageGrab
+        return Image, ImageGrab
     except Exception:
         return None
 
@@ -54,7 +54,7 @@ def capture(path) -> tuple[bool, str]:
     path.parent.mkdir(parents=True, exist_ok=True)
     pillow = _pillow()
     if pillow is not None:
-        _, ImageGrab, _ = pillow
+        _, ImageGrab = pillow
         try:
             ImageGrab.grab().save(path, "PNG")
             return True, "Pillow ImageGrab"
@@ -62,9 +62,7 @@ def capture(path) -> tuple[bool, str]:
             pass
 
     if os.name == "nt":                          # pragma: no cover - Windows
-        # PowerShell single-quoted literals escape an embedded quote by
-        # doubling it; without this, a project path containing "'" broke the
-        # capture script.
+        # PowerShell single-quoted literals escape a quote by doubling it.
         save_path = str(path).replace("'", "''")
         script = (
             "Add-Type -AssemblyName System.Windows.Forms;"
@@ -121,10 +119,8 @@ _TESSERACT_INIT_ERRORS = (
 def ocr(path) -> str:
     """Return OCR text for `path` when tesseract is installed, else ''.
 
-    tesseract is often installed without language data (`eng.traineddata`).
-    Its stderr then reads like OCR output and used to be pasted into the
-    report as "OCR text", which the model treated as evidence about the page.
-    Drop those initialisation lines; if nothing real remains, report no text.
+    Without language data, tesseract's stderr reads like OCR output; drop
+    those initialisation lines and report no text if nothing real remains.
     """
     if not shutil.which("tesseract"):
         return ""
@@ -170,7 +166,7 @@ def analyze(path, previous=None) -> str:
         if ocr_text:
             msg += "\n\nOCR text:\n" + ocr_text
         return msg
-    Image, _, _ = pillow
+    Image, _ = pillow
     try:
         img = Image.open(path).convert("RGB")
     except Exception as e:

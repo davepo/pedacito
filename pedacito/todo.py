@@ -1,16 +1,8 @@
 """A small, persistent task scratchpad for the gather/answer loop.
 
-Usage
------
-    from . import todo
-
-    todo.write(root, "- [x] inspect parser\\n- [ ] add the retry")
-    print(todo.render(root, cfg))
-
 The checklist lives in `.pedacito/todo.md`, so it is visible to the user and
 survives the gather -> answer transition (the answer phase has no tools). It is
-cleared at the start of each new task: `auto` already has the long-lived
-PLAN.md, and a stale checklist from the previous task is worse than none.
+cleared at the start of each new task.
 """
 
 from __future__ import annotations

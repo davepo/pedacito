@@ -7,26 +7,18 @@ Usage
     pedacito explain . -q "trace the flow from request to response"
     pedacito explain src/                          # interactive prompt
 
-Where `ask` does tasks and edits and `how` answers questions about Pedacito
-itself, `explain` answers questions about the *project the user is working
-on*: how a function works, what a file is responsible for, how data or
-control flows between parts, and so on. It is always scoped to the indexed
-Pedacito project -- it loads that project's existing index (never builds one)
-and, through the same gather loop `ask` uses, reads the relevant source before
-answering in prose. It produces no edits and no search/replace blocks.
-
-The caller (cli.py) is responsible for the no-index case: if the project has
-no index, it points the user at `pedacito index` / navigating to an indexed
-project rather than invoking this module.
+Answers questions about the *project the user is working on*, using the
+project's existing index (never builds one) and the same gather loop as `ask`.
+Prose only: no edits, no search/replace blocks. The caller (cli.py) handles the
+no-index case.
 """
 
 from __future__ import annotations
 
 from .tools import TOOL_HELP
 
-# The gather phase, reframed from "gather enough to edit" to "gather enough to
-# answer". Same tools and navigation hints (FLAT_HINT/CARDS_HINT are appended
-# by Agent.gather), only the framing differs.
+# Gather framing for answering rather than editing; Agent.gather appends the
+# map-tier navigation hints.
 EXPLAIN_GATHER_BASE = f"""\
 You are a code assistant working through a lookup index of a project. You
 cannot see the full source; you see a map of it, and you request the exact
@@ -93,16 +85,10 @@ How to answer:
 
 
 def answer(agent, question: str, verbose: bool = True, on_step=None) -> str:
-    """Answer one question about the indexed project, end to end.
+    """Answer one question about the indexed project and return the text.
 
-    Runs the gather loop (with the explanation framing above) to collect the
-    relevant source, then answers as prose -- no edit format, no apply.
-    Returns the answer text. `agent` is an Agent bound to the project's
-    index and client (see cli.py).
-
-    `on_step`, when given, is called with the step number after each gather
-    step, mirroring `Agent.gather`'s callback so a caller (e.g. the GUI) can
-    show live progress.
+    Runs the gather loop with the explanation framing, then answers in prose.
+    `on_step` is forwarded to `Agent.gather` for live progress.
     """
     gathered = agent.gather(question, verbose=verbose,
                             base=EXPLAIN_GATHER_BASE, on_step=on_step)

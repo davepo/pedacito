@@ -226,3 +226,10 @@ def test_ruby_long_method_is_split_when_tree_sitter_is_available():
            if c.qualname == "C.big" or c.qualname.startswith("C.big#")]
     assert len(big) > 1
     assert all("part " in c.signature for c in big)
+
+
+def test_form_feed_does_not_shift_line_ranges():
+    src = "import os\n\x0c\ndef f():\n    return 1\n\ndef g():\n    return 2\n"
+    chunks = {c.qualname: c for c in chunk_source("x.py", src)}
+    assert (chunks["g"].start, chunks["g"].end) == (6, 7)
+    assert chunks["g"].source.startswith("def g")

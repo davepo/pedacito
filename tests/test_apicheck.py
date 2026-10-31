@@ -101,3 +101,14 @@ def test_keyword_argument_satisfies_required():
         "a.py": "def f(x, y):\n    return x\n\ndef g():\n    return f(1, y=2)\n",
     }
     assert apicheck.find_mismatches(src) == []
+
+
+def test_class_without_init_but_with_base_or_decorator_is_not_checked():
+    """A dataclass or subclass may inherit/generate its constructor."""
+    src = {
+        "a.py": ("from dataclasses import dataclass\n\n"
+                 "@dataclass\nclass P:\n    x: int\n\n"
+                 "class Sprite(Base):\n    pass\n\n"
+                 "def g():\n    return P(1), Sprite(1, 2)\n"),
+    }
+    assert apicheck.find_mismatches(src) == []

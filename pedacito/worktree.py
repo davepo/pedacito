@@ -7,11 +7,9 @@ Usage
     path = worktree.create(root, "refactor")
     print(worktree.list_paths(root))
 
-Pedacito already snapshots every write under `.pedacito/backups/` and can
-restore it. A git worktree adds the other half of the safety story: run
-`pedacito auto` on a separate branch and checkout, review the diff in git, and
-merge only if it is good. This module is a thin wrapper around the git CLI --
-it never touches the working tree it is called from.
+Lets `pedacito auto` run on a separate branch and checkout so the diff can be
+reviewed in git. A thin wrapper around the git CLI; it never touches the
+working tree it is called from.
 """
 
 from __future__ import annotations
@@ -25,11 +23,17 @@ class WorktreeError(RuntimeError):
     pass
 
 
+def _safe_name(name: str) -> str:
+    """Filesystem- and branch-safe worktree name."""
+    return "".join(c if c.isalnum() or c in "-_." else "-"
+                   for c in (name or "").strip())
+
+
 def _git(root: Path, args: list[str], timeout: int = 60) -> str:
     if not shutil.which("git"):
         raise WorktreeError("git is not installed or not on PATH")
     try:
-        p = subprocess.run(["git", *args], cwd=str(root),
+        p = subprocess.run(["git", *args], cwd=str(root), check=False,
                            capture_output=True, text=True,
                            encoding="utf-8", errors="replace",
                            timeout=timeout)
@@ -45,15 +49,14 @@ def _root(root) -> Path:
     root = Path(root).expanduser().resolve()
     try:
         return Path(_git(root, ["rev-parse", "--show-toplevel"]))
-    except WorktreeError:
-        raise WorktreeError(f"{root} is not inside a git repository")
+    except WorktreeError as e:
+        raise WorktreeError(f"{root} is not inside a git repository") from e
 
 
 def create(root, name: str, base: str = "HEAD") -> Path:
     """Create (or reuse) a worktree at .pedacito/worktrees/<name>."""
     root = _root(root)
-    safe = "".join(c if c.isalnum() or c in "-_." else "-"
-                   for c in (name or "").strip())
+    safe = _safe_name(name)
     if not safe:
         raise WorktreeError("worktree name is empty")
     dest = root / ".pedacito" / "worktrees" / safe
@@ -88,10 +91,9 @@ def list_paths(root) -> list[tuple[str, str]]:
 
 
 def remove(root, name: str, force: bool = False) -> None:
+    """Remove the worktree .pedacito/worktrees/<name>."""
     root = _root(root)
-    safe = "".join(c if c.isalnum() or c in "-_." else "-"
-                   for c in (name or "").strip())
-    dest = root / ".pedacito" / "worktrees" / safe
+    dest = root / ".pedacito" / "worktrees" / _safe_name(name)
     args = ["worktree", "remove", str(dest)]
     if force:
         args.append("--force")

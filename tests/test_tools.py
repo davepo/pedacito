@@ -64,7 +64,7 @@ def _index(tmp_path: Path, files: dict[str, str] | None = None) -> Index:
 def test_schema_hides_disabled_actions_and_fields():
     plain = tools.schema_for(Config())
     assert plain["properties"]["action"]["enum"] == [
-        "read", "grep", "callers", "outline", "sessions", "todo",
+        "read", "grep", "find", "callers", "outline", "sessions", "todo",
         "diff", "done"]
     # `content` stays because the always-available todo action uses it.
     assert "content" in plain["properties"]
@@ -849,7 +849,7 @@ def test_diff_is_gated_by_allow_diff(tmp_path):
 
 
 def test_lmstudio_embed_returns_vectors_in_input_order(monkeypatch):
-    from pedacito.llm import LMStudio
+    from pedacito.llm import LLMClient
 
     class Response:
         status_code = 200
@@ -865,11 +865,11 @@ def test_lmstudio_embed_returns_vectors_in_input_order(monkeypatch):
     cfg = Config()
     cfg.base_url = "http://example.test/v1"
     cfg.model = "m"
-    assert LMStudio(cfg).embed(["a", "b"]) == [[1.0, 0.0], [2.0, 0.0]]
+    assert LLMClient(cfg).embed(["a", "b"]) == [[1.0, 0.0], [2.0, 0.0]]
 
 
 def test_lmstudio_vision_sends_a_data_uri(tmp_path, monkeypatch):
-    from pedacito.llm import LMStudio
+    from pedacito.llm import LLMClient
 
     image = tmp_path / "shot.png"
     image.write_bytes(b"\x89PNG\r\n\x1a\nnot-a-real-png")
@@ -891,7 +891,7 @@ def test_lmstudio_vision_sends_a_data_uri(tmp_path, monkeypatch):
     cfg.base_url = "http://example.test/v1"
     cfg.model = "m"
     cfg.vision_model = "vl"
-    assert LMStudio(cfg).vision("describe", image) == "a black window"
+    assert LLMClient(cfg).vision("describe", image) == "a black window"
     assert seen["payload"]["model"] == "vl"
     content = seen["payload"]["messages"][0]["content"]
     assert content[1]["image_url"]["url"].startswith("data:image/png;base64,")
@@ -1077,8 +1077,6 @@ def test_read_lines_cached_invalidates_on_change(tmp_path):
     p.write_text("two\nthree\n", encoding="utf-8")   # new stat -> new entry
     assert fileio.read_lines_cached(p) == ["two", "three", ""]
 
-    fileio.clear_line_cache()
-
 
 # ------------------------------------------------- runaway / malformed input
 def test_gather_stops_when_the_model_repeats_a_failing_read(tmp_path):
@@ -1237,6 +1235,20 @@ def test_gather_write_snapshots_into_backups_not_a_bak_beside_source(tmp_path):
     assert not (tmp_path / "pkg" / "app.py.bak").exists()
     backups = list((tmp_path / ".pedacito" / "backups").rglob("pkg/app.py"))
     assert backups, "gather write did not snapshot into .pedacito/backups"
+
+
+def test_repeated_writes_keep_the_original_in_the_backup(tmp_path):
+    idx = _index(tmp_path)
+    original = (tmp_path / "pkg" / "app.py").read_bytes()
+    cfg = Config()
+    cfg.allow_write = True
+    cfg.backup = True
+    cfg._backup_dir = tmp_path / "snap"
+    for body in ("x = 1\n", "x = 2\n"):
+        obs = tools.dispatch(idx, cfg, {"action": "write", "file": "pkg/app.py",
+                                        "content": body})
+        assert obs.startswith("WROTE"), obs
+    assert (tmp_path / "snap" / "pkg" / "app.py").read_bytes() == original
 
 
 def test_read_empty_file_reports_zero_lines(tmp_path):
@@ -1838,3 +1850,200 @@ def test_browser_url_does_not_require_shell(tmp_path, monkeypatch):
     obs = tools.tool_browser(idx, cfg, None, "http://127.0.0.1:8000/")
     assert obs.startswith("BROWSER: http://127.0.0.1:8000/")
     assert "hello" in obs
+
+
+# --------------------------------------------------------------------- find
+def test_find_ranks_name_hits_above_signature_hits(tmp_path):
+    src = ('def retry(fn):\n    return fn\n\n\n'
+           'def wrapper(retry_once):\n    """Call it with backoff."""\n'
+           '    return retry_once\n')
+    idx = _index(tmp_path, {"pkg/app.py": src})
+    obs = tools.tool_find(idx, "retry")
+    assert "2 definition(s) matching 'retry'" in obs
+    assert obs.index("def retry(fn)") < obs.index("def wrapper(retry_once)")
+
+
+def test_find_matches_exact_and_partial_names(tmp_path):
+    idx = _index(tmp_path)
+    exact = tools.tool_find(idx, "helper")
+    assert "def helper(value)" in exact
+    partial = tools.tool_find(idx, "elp")     # substring of the qualname
+    assert "def helper(value)" in partial
+
+
+def test_find_matches_members_of_a_class_indexed_whole(tmp_path):
+    """APP's Server fits in one chunk, so `start` lives in its members list
+    and the qualified name finds it; the card stands for the whole class."""
+    idx = _index(tmp_path)
+    obs = tools.tool_find(idx, "Server.start")
+    assert "[class] class Server" in obs
+    assert "pkg/app.py:8-13" in obs
+
+
+def test_find_matches_signature_and_docstring_words(tmp_path):
+    idx = _index(tmp_path)
+    by_sig = tools.tool_find(idx, "value")    # `def helper(value)`
+    assert "def helper(value)" in by_sig
+    src = 'def fetch(url):\n    """Download with backoff."""\n    return url\n'
+    idx2 = _index(tmp_path / "sub", {"pkg/app.py": src})
+    by_doc = tools.tool_find(idx2, "backoff")
+    assert "def fetch(url)" in by_doc
+
+
+def test_find_miss_suggests_close_names(tmp_path):
+    idx = _index(tmp_path)
+    obs = tools.tool_find(idx, "Servr")
+    assert obs.startswith("No definition matches 'Servr'.")
+    assert "Did you mean: Server?" in obs
+
+
+def test_find_needs_a_pattern(tmp_path):
+    idx = _index(tmp_path)
+    obs = tools.tool_find(idx, "   ")
+    assert obs.startswith("ERROR") and "`find` needs a pattern" in obs
+
+
+def test_find_caps_the_hit_list(tmp_path):
+    src = "".join(f"def target_{i}():\n    return {i}\n\n\n"
+                  for i in range(tools.FIND_MAX_HITS + 5))
+    idx = _index(tmp_path, {"many.py": src})
+    obs = tools.tool_find(idx, "target_")
+    assert obs.startswith(f"{tools.FIND_MAX_HITS + 5} definition(s) matching")
+    assert obs.count("many.py:") == tools.FIND_MAX_HITS
+    assert "(+5 more; narrow the pattern)" in obs
+
+
+def test_find_is_dispatchable_in_gather(tmp_path):
+    idx = _index(tmp_path)
+    obs = tools.dispatch(idx, Config(), {"action": "find", "pattern": "Server"})
+    assert "class Server" in obs
+
+
+# ------------------------------------------------- read context: class owner
+def test_read_method_shows_its_class_context(tmp_path):
+    """A mid-method read shows the method signature AND the class header it
+    belongs to: the class is too big to be in the window, but the chunk index
+    already knows the owner (qualname `Big.m1` -> class `Big`)."""
+    big = "import os\n\n\nclass Big:\n" + "".join(
+        f"    def m{i}(self):\n        x = os.getcwd()\n        return {i}\n"
+        + "\n" * 8 for i in range(7))
+    idx = _index(tmp_path, {"big.py": big})
+    m1 = next(c for c in idx.in_file("big.py") if c.qualname == "Big.m1")
+    obs = tools.tool_read(idx, Config(), "big.py", m1.start + 1, m1.start + 1)
+    assert "[context: def m1(self); in class Big" in obs
+
+
+# ------------------------------------------------- cards: test/module links
+def test_cards_link_modules_and_their_tests(tmp_path):
+    idx = _index(tmp_path, {
+        "pkg/foo.py": "def f():\n    return 1\n",
+        "pkg/test_foo.py": ("from pkg.foo import f\n\n\n"
+                            "def test_f():\n    assert f() == 1\n"),
+    })
+    cards = idx.render_cards(["pkg/foo.py", "pkg/test_foo.py"])
+    foo_card, test_card = cards.split("\n\n")
+    assert "  tested by: pkg/test_foo.py" in foo_card
+    assert "  tests: pkg/foo.py" in test_card
+
+
+def test_cards_test_link_needs_an_unambiguous_module(tmp_path):
+    idx = _index(tmp_path, {
+        "pkg/foo.py": "x = 1\n",
+        "other/foo.py": "y = 2\n",
+        "pkg/test_foo.py": "z = 3\n",
+    })
+    # Two modules share the stem: the test file gets no `tests:` link...
+    assert "tests:" not in idx.render_cards(["pkg/test_foo.py"])
+    # ...but each module still lists the test that covers its stem.
+    assert "tested by: pkg/test_foo.py" in idx.render_cards(["pkg/foo.py"])
+
+
+def test_cards_have_no_test_links_for_non_python(tmp_path):
+    from pedacito.chunker_ts import TS_AVAILABLE, chunk_file_ts
+    if not TS_AVAILABLE:
+        pytest.skip("tree-sitter unavailable")
+    files = {"web/app.js": "function a() { return 1; }\n",
+             "web/test_app.js": "function b() { return 2; }\n"}
+    chunks = []
+    for rel, src in files.items():
+        (tmp_path / rel).parent.mkdir(parents=True, exist_ok=True)
+        (tmp_path / rel).write_text(src, encoding="utf-8")
+        chunks.extend(chunk_file_ts(rel, src, ".js", 60))
+    idx = Index(tmp_path, chunks)
+    assert "tested by:" not in idx.render_cards(["web/app.js"])
+    assert "tests:" not in idx.render_cards(["web/test_app.js"])
+
+
+# --------------------------------------------------- task write allowlist
+def _armed_cfg() -> Config:
+    cfg = Config()
+    cfg.allow_write = True
+    cfg.auto_allowlist = True
+    cfg.backup = False
+    return cfg
+
+
+def test_auto_allowlist_blocks_writes_to_unread_files(tmp_path):
+    idx = _index(tmp_path, {"pkg/app.py": APP, "pkg/other.py": "x = 1\n"})
+    cfg = _armed_cfg()
+    cfg._task_reads = {"pkg/app.py": [(1, 5)]}   # the live gather ledger
+    cfg._task_allowlist = ()
+
+    blocked = tools.dispatch(idx, cfg, {"action": "write",
+                                        "file": "pkg/other.py",
+                                        "content": "x = 2\n"})
+    assert blocked.startswith("ERROR") and "task write allowlist" in blocked
+    assert (tmp_path / "pkg/other.py").read_text() == "x = 1\n"
+
+    allowed = tools.dispatch(idx, cfg, {"action": "write",
+                                        "file": "pkg/app.py",
+                                        "content": "y = 2\n"})
+    assert allowed.startswith("WROTE pkg/app.py")
+
+    created = tools.dispatch(idx, cfg, {"action": "write", "file": "fresh.py",
+                                        "content": "z = 3\n"})
+    assert created.startswith("CREATED fresh.py")   # creation always allowed
+
+
+def test_auto_allowlist_honours_task_title_targets(tmp_path):
+    idx = _index(tmp_path, {"pkg/other.py": "x = 1\n"})
+    cfg = _armed_cfg()
+    cfg._task_reads = {}                          # nothing was read...
+    cfg._task_allowlist = ("pkg/other.py",)       # ...but the title names it
+    obs = tools.dispatch(idx, cfg, {"action": "write", "file": "pkg/other.py",
+                                    "content": "x = 2\n"})
+    assert obs.startswith("WROTE pkg/other.py")
+
+
+def test_auto_allowlist_off_or_unarmed_allows_everything(tmp_path):
+    idx = _index(tmp_path, {"pkg/other.py": "x = 1\n"})
+    off = Config()
+    off.allow_write = True
+    off.backup = False
+    assert tools.dispatch(idx, off, {"action": "write", "file": "pkg/other.py",
+                                     "content": "x = 2\n"}).startswith("WROTE")
+
+    unarmed = _armed_cfg()      # on, but no gather ever armed the ledger
+    assert tools.dispatch(idx, unarmed, {
+        "action": "write", "file": "pkg/other.py",
+        "content": "x = 3\n"}).startswith("WROTE")
+
+
+def test_auto_allowlist_blocks_move_and_delete_of_unread_files(tmp_path):
+    idx = _index(tmp_path, {"pkg/app.py": APP, "pkg/other.py": "x = 1\n"})
+    cfg = _armed_cfg()
+    cfg._task_reads = {"pkg/app.py": [(1, 5)]}
+    cfg._task_allowlist = ()
+
+    moved = tools.dispatch(idx, cfg, {"action": "move", "file": "pkg/other.py",
+                                      "to": "pkg/moved.py"})
+    assert moved.startswith("ERROR") and "task write allowlist" in moved
+    assert (tmp_path / "pkg/other.py").is_file()
+
+    deleted = tools.dispatch(idx, cfg, {"action": "delete",
+                                        "file": "pkg/other.py"})
+    assert deleted.startswith("ERROR") and "task write allowlist" in deleted
+    assert (tmp_path / "pkg/other.py").is_file()
+
+    ok = tools.dispatch(idx, cfg, {"action": "delete", "file": "pkg/app.py"})
+    assert ok.startswith("DELETED pkg/app.py")

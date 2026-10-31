@@ -1,53 +1,35 @@
 """Text file I/O that preserves a file's on-disk encoding.
 
-Usage
------
-Every read or write of a project file goes through this module instead of
-`pathlib.Path.read_text` / `write_text` directly:
-
-    from . import fileio
+Every read or write of a project file goes through this module:
 
     text, style = fileio.read(path)      # text is always LF-normalised
-    ...
     fileio.write(path, new_text, style)  # written back in the original style
 
-Why this exists: `Path.read_text()` uses universal newlines, so a CRLF file
-comes back as LF, and `Path.write_text()` on Windows translates LF back to
-CRLF on the way out. That silently converts an LF file to CRLF on save,
-rewriting every line of a file only three lines of which changed. It also
-breaks search/replace matching, since the text a model read no longer matches
-the bytes on disk.
-
-The fix: read raw bytes, detect the line-ending style and BOM, normalise to
-LF for all internal processing (chunking, matching, diffing), and write back
-in the file's original style.
+`Path.read_text()` / `write_text()` would silently convert line endings (and
+break search/replace matching against what the model read). Here the raw bytes
+are read, the line-ending style and BOM detected, all processing happens on
+LF text, and writes restore the original style.
 """
 
 from __future__ import annotations
 
+import shutil
 from collections import OrderedDict
 from pathlib import Path
 
 BOM = "\ufeff"
 
 
-# --------------------------------------------------------------------------
-# Encoding descriptor
-# --------------------------------------------------------------------------
 class TextStyle:
     """Records a file's line-ending convention and BOM presence."""
 
-    __slots__ = ("newline", "bom")
+    __slots__ = ("bom", "newline")
 
     def __init__(self, newline: str = "\n", bom: bool = False):
-        """Record a file's line-ending string and whether it has a BOM."""
-        # newline: "\n", "\r\n", or "\r" -- whichever the file actually uses.
-        # bom: whether a UTF-8 byte-order-mark was present at the start.
-        self.newline = newline
-        self.bom = bom
+        self.newline = newline      # "\n", "\r\n" or "\r"
+        self.bom = bom              # a UTF-8 byte-order mark led the file
 
     def __repr__(self) -> str:
-        """Compact human-readable form, e.g. "<CRLF +BOM>"."""
         nl = {"\r\n": "CRLF", "\n": "LF", "\r": "CR"}.get(self.newline, repr(self.newline))
         return f"<{nl}{' +BOM' if self.bom else ''}>"
 
@@ -66,9 +48,6 @@ def detect(raw: bytes) -> TextStyle:
     return TextStyle(nl, raw.startswith(b"\xef\xbb\xbf"))
 
 
-# --------------------------------------------------------------------------
-# Public read/write API
-# --------------------------------------------------------------------------
 def read(path: Path, errors: str = "replace") -> tuple[str, TextStyle]:
     """Read a file and return (text normalised to LF, its original style)."""
     raw = Path(path).read_bytes()
@@ -91,33 +70,18 @@ def read_lines(path: Path) -> list[str]:
     return read_text(path).split("\n")
 
 
-# --------------------------------------------------------------------------
-# Read-mostly LRU cache
-# --------------------------------------------------------------------------
-# Keyed by (path, mtime_ns, size), so an entry can only go stale if the
-# filesystem's mtime granularity is coarser than the gap between two writes
-# of the same size (FAT-class filesystems). Callers whose output must reflect
-# the newest bytes no matter what (tool_read, the edit path) use read_lines()
-# directly; this cache serves the scan-heavy paths -- grep sweeps, call-site
-# peeks -- which re-read the same files step after step within one gather.
-_LINE_CACHE: "OrderedDict[tuple, tuple[list[str], int]]" = OrderedDict()
+# Bounded LRU keyed by (path, mtime_ns, size) for the scan-heavy paths (grep
+# sweeps, call-site peeks) that re-read the same files step after step.
+# Callers that must see the newest bytes (tool_read, the edit path) use
+# read_lines() directly.
+_LINE_CACHE: OrderedDict[tuple, tuple[list[str], int]] = OrderedDict()
 _LINE_CACHE_BYTES = 0
 _LINE_CACHE_MAX_BYTES = 8_000_000
 
 
-def clear_line_cache() -> None:
-    """Drop every cached file's lines (used by tests and after big churn)."""
-    global _LINE_CACHE_BYTES
-    _LINE_CACHE.clear()
-    _LINE_CACHE_BYTES = 0
-
-
 def read_lines_cached(path: Path) -> list[str]:
-    """read_lines() backed by a bounded LRU keyed on (path, mtime_ns, size).
-
-    A file edited on disk produces a different key, so the next read sees the
-    new bytes; the old entry ages out of the LRU. The returned list is SHARED
-    with the cache -- callers must not mutate it."""
+    """read_lines() backed by the LRU cache. The returned list is SHARED with
+    the cache -- callers must not mutate it."""
     global _LINE_CACHE_BYTES
     p = Path(path)
     try:
@@ -150,15 +114,19 @@ def write(path: Path, text: str, style: TextStyle | None = None) -> None:
     Path(path).write_bytes(data)
 
 
-# --------------------------------------------------------------------------
-# Path helpers
-# --------------------------------------------------------------------------
-def normalise_rel(name: str) -> str:
-    """Convert a user- or model-typed path (possibly using backslashes, quotes,
-    or backticks) into the plain forward-slash relative path the index uses.
+def backup_copy(src: Path, dest: Path, keep_existing: bool = True) -> None:
+    """Copy `src`'s exact bytes to `dest`, creating parent directories.
 
-    The index always stores POSIX-style paths so a project indexed on one OS
-    reads correctly on another; this function is the single place that accepts
-    whatever form a person or model actually typed and normalises it.
-    """
+    With `keep_existing`, an existing `dest` is left alone: backup snapshot
+    directories are shared by every write of a run, and the FIRST copy of a
+    file is the original that `restore` must bring back."""
+    if keep_existing and Path(dest).exists():
+        return
+    Path(dest).parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(str(src), str(dest))
+
+
+def normalise_rel(name: str) -> str:
+    """Turn a user- or model-typed path (backslashes, quotes, backticks) into
+    the forward-slash relative path the index stores."""
     return (name or "").strip().strip("`\"'").replace("\\", "/")

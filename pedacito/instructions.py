@@ -1,22 +1,10 @@
 """Project instruction files: the conventions a repository wants every task to
-follow (build commands, style rules, forbidden areas, verification steps).
+follow (build commands, style rules, forbidden areas, verification steps),
+following the `AGENTS.md` / `CLAUDE.md` convention.
 
-This mirrors the `AGENTS.md` / `CLAUDE.md` convention used by other coding
-harnesses. Small models are especially sensitive to missing conventions: they
-will invent a test command, use the wrong import style, or edit a generated
-directory unless the project says otherwise. Reading one short file once per
-task is far cheaper than a failed edit plus a repair round.
-
-Only the first file found is used, in this order:
-
-    PEDACEITO.md
-    AGENTS.md
-    CLAUDE.md
-    .pedacito/instructions.md
-    .pedacito/PEDACEITO.md
-
-The content is capped by `max_instruction_chars` so a long policy document
-cannot crowd out the project map on a small context window.
+Only the first file found is used, in the order of `CANDIDATE_FILES`. The
+content is capped by `max_instruction_chars` so a long document cannot crowd
+out the project map on a small context window.
 """
 
 from __future__ import annotations
@@ -26,16 +14,17 @@ from pathlib import Path
 from . import fileio
 
 CANDIDATE_FILES = (
+    "PEDACITO.md",
     "PEDACEITO.md",
     "AGENTS.md",
     "CLAUDE.md",
     ".pedacito/instructions.md",
+    ".pedacito/PEDACITO.md",
     ".pedacito/PEDACEITO.md",
 )
 
-# (path, mtime_ns, size) -> text. A changed file gets a new key, so an edit
-# during a run is picked up on the next task; the cache only avoids re-reading
-# an unchanged file for every gather/answer turn.
+# (path, mtime_ns, size) -> text. A changed file gets a new key, so edits are
+# picked up; the cache only avoids re-reading an unchanged file every turn.
 _CACHE: dict[tuple[str, int, int], str] = {}
 
 

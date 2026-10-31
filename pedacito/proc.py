@@ -8,18 +8,11 @@ Usage
         ["python", "main.py"], cwd=root, timeout=120, idle_timeout=10)
     # stopped is "" (normal exit), "idle", "timeout", or "error".
 
-Why this exists: `subprocess.run` waits for the process to exit and kills only
-the direct child on timeout. A game or GUI tool opens a window and never
-exits, so pedacito sits at a `run` step until a person closes it -- and a
-launcher can leave the visible window alive even after its parent is killed.
-This module watches output, stops a process that goes silent for
-`idle_timeout` seconds, and kills the whole process group (process tree on
-Windows) rather than just the parent.
-
-The idle rule is the key for GUI apps: a game usually prints a startup banner
-and then nothing, while a test runner keeps printing. It is deliberately
-based on observed output rather than command names, which are too varied to
-classify reliably.
+`subprocess.run` kills only the direct child on timeout and waits forever on a
+GUI app that never exits. This module stops a process that goes silent for
+`idle_timeout` seconds and kills the whole process group (process tree on
+Windows). The idle rule is based on observed output, not command names: a
+game prints a banner and then nothing, while a test runner keeps printing.
 """
 
 from __future__ import annotations
@@ -31,29 +24,23 @@ import threading
 import time
 
 
-def spawn(command, *, cwd, shell: bool = False, env: dict | None = None,
+def spawn(command, *, cwd, env: dict | None = None,
           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
           ) -> subprocess.Popen:
     """Start a child in its own process group without waiting for it.
 
-    Used by the screenshot and browser actions: launch the GUI/server,
-    capture after a delay, then `terminate()` the whole tree. Output is
-    discarded by default (the browser launcher passes PIPE to find the URL)."""
+    Used by the screenshot and browser actions, which later `terminate()` the
+    whole tree. Output is discarded unless the caller passes PIPE."""
     kwargs = {}
     if os.name != "nt":
         kwargs["start_new_session"] = True
     return subprocess.Popen(
         command, cwd=str(cwd), stdin=subprocess.DEVNULL,
-        stdout=stdout, stderr=stderr, shell=shell, env=env, **kwargs)
+        stdout=stdout, stderr=stderr, env=env, **kwargs)
 
 
 def terminate(proc: subprocess.Popen) -> None:
-    """Kill a process started by spawn(), including its descendants."""
-    _terminate(proc)
-
-
-def _terminate(proc: subprocess.Popen) -> None:
-    """Kill the process and its descendants, not just the direct child."""
+    """Kill a process started by spawn() or run(), including its descendants."""
     if os.name == "nt":
         try:
             subprocess.run(["taskkill", "/F", "/T", "/PID", str(proc.pid)],
@@ -83,10 +70,8 @@ def run(command, *, cwd, timeout: float | None = None,
     `timeout` is the hard wall-clock limit; `idle_timeout` stops the process
     after that many seconds with no output (0 disables it). `stopped` is one
     of "", "idle", "timeout", or "error" (could not start). Output is combined
-    stdout+stderr, capped at about `max_output` characters by keeping the
-    HEAD and the TAIL and dropping the middle: a test runner's summary and a
-    traceback's final `Error:` line live at the end, which head-only
-    truncation threw away exactly when the output was long enough to matter.
+    stdout+stderr, capped at about `max_output` characters by keeping the head
+    and the tail (test summaries and tracebacks end the output).
     """
     timeout = float(timeout or 0)
     idle_timeout = float(idle_timeout or 0)
@@ -147,18 +132,18 @@ def run(command, *, cwd, timeout: float | None = None,
         now = time.monotonic()
         if timeout and now - started >= timeout:
             stopped = "timeout"
-            _terminate(p)
+            terminate(p)
             break
         if idle_timeout and now - state["last"] >= idle_timeout:
             stopped = "idle"
-            _terminate(p)
+            terminate(p)
             break
         time.sleep(0.05)
 
     try:
         rc = p.wait(timeout=10)
     except subprocess.TimeoutExpired:
-        _terminate(p)
+        terminate(p)
         try:
             rc = p.wait(timeout=5)
         except subprocess.TimeoutExpired:

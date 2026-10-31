@@ -1,14 +1,5 @@
 """Project workspace setup: the .pedacito/ directory, ignore files, backups,
-and session logs.
-
-Usage
------
-    from . import workspace
-
-    workspace.ensure(project_root, manage_gitignore=True, create_ignore=True)
-    backup_dir = workspace.new_backup_dir(project_root)
-    ...
-    workspace.write_session(project_root, task, steps, reply, results, backup_dir)
+session logs, and the run log.
 
 Everything Pedacito writes for a project lives in one place:
 
@@ -17,10 +8,10 @@ Everything Pedacito writes for a project lives in one place:
         summaries.json      summary cache, keyed by content hash
         backups/<stamp>/    pre-edit snapshots, mirroring your tree
         sessions/<stamp>.md what was asked, looked up, and changed
+        log.txt             operational run log
 
-Nothing is written beside your source files. On first run this also creates
-a `.pedacitoignore` file to edit, and adds `.pedacito/` to `.gitignore` so the
-index and backups never end up in a commit.
+On first run this also creates a `.pedacitoignore` file and adds `.pedacito/`
+to `.gitignore`.
 """
 
 from __future__ import annotations
@@ -33,10 +24,9 @@ from .index import BACKUP_DIR, SESSION_DIR, state_dir
 
 IGNORE_FILE = ".pedacitoignore"
 
-# Paths Pedacito writes into a project that should never be committed.
-# `.pedacito/` covers the whole workspace tree (index, backups, sessions,
-# reviews, cached summaries); the other three are the ignore file and the
-# two project-config filenames find_project_config() looks for.
+# Paths Pedacito writes into a project that should never be committed: the
+# workspace tree, the ignore file, and the two project-config filenames
+# find_project_config() looks for.
 GITIGNORE_ENTRIES = (
     ".pedacito/",
     ".pedacitoignore",
@@ -61,18 +51,12 @@ IGNORE_TEMPLATE = """\
 """
 
 
-# --------------------------------------------------------------------------
-# Timestamps
-# --------------------------------------------------------------------------
 def stamp() -> str:
-    """Return the current time as a sortable filesystem-safe string, used to
-    name backup snapshots and session log files."""
+    """Current time as a sortable filesystem-safe string (backup and session
+    names)."""
     return datetime.now().strftime("%Y%m%d-%H%M%S")
 
 
-# --------------------------------------------------------------------------
-# Run log: the operational trace (no model output)
-# --------------------------------------------------------------------------
 RUN_LOG_NAME = "log.txt"
 
 
@@ -82,13 +66,9 @@ def run_log_path(root: Path) -> Path:
 
 
 def log_event(root: Path, message: str, kind: str = "INFO") -> None:
-    """Append one timestamped line to the run log.
-
-    This is the troubleshooting log: commands, phase transitions, statuses,
-    and errors -- one line per event, with no model thinking or generated
-    output (that lives in `.pedacito/sessions/*.md`). Written at
-    `.pedacito/log.txt` and appended across runs, so a whole `--complex` run
-    reads top to bottom as a flat event trace."""
+    """Append one timestamped line to the run log: commands, phase
+    transitions, statuses, and errors, but no model output (that lives in
+    `.pedacito/sessions/*.md`). Appended across runs."""
     ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
     p = run_log_path(root)
     p.parent.mkdir(parents=True, exist_ok=True)
@@ -96,14 +76,10 @@ def log_event(root: Path, message: str, kind: str = "INFO") -> None:
         fh.write(f"{ts}  {kind:<6} {message}\n")
 
 
-# --------------------------------------------------------------------------
-# First-run scaffolding
-# --------------------------------------------------------------------------
 def ensure(root: Path, manage_gitignore: bool = True,
-           create_ignore: bool = True, verbose: bool = True) -> Path:
-    """Create .pedacito/ under `root` and, on first run, the ignore
-    scaffolding (.pedacitoignore, and a .gitignore entry). Idempotent -- safe
-    to call on every command."""
+           create_ignore: bool = True) -> Path:
+    """Create .pedacito/ under `root` plus the ignore scaffolding
+    (.pedacitoignore, a .gitignore entry). Idempotent."""
     root = Path(root).resolve()
     d = state_dir(root)
     first_run = not d.exists()
@@ -113,43 +89,34 @@ def ensure(root: Path, manage_gitignore: bool = True,
         ig = root / IGNORE_FILE
         if not ig.exists():
             ig.write_text(IGNORE_TEMPLATE, encoding="utf-8")
-            if verbose:
-                print(f"  created {ig}", file=sys.stderr)
+            print(f"  created {ig}", file=sys.stderr)
         elif ".pedacito" not in ig.read_text(encoding="utf-8", errors="replace"):
             with ig.open("a", encoding="utf-8") as fh:
                 fh.write("\n.pedacito/\n")
 
     if manage_gitignore:
-        _add_to_gitignore(root, verbose)
+        _add_to_gitignore(root)
 
-    if first_run and verbose:
+    if first_run:
         print(f"  state for this project lives in {d}", file=sys.stderr)
     return d
 
 
-def _add_to_gitignore(root: Path, verbose: bool) -> None:
-    """Add Pedacito's workspace entries to the project's .gitignore, keeping
-    the index, backups, sessions, and per-project config out of commits.
-
-    Creates the file in a git checkout that doesn't already have one;
-    otherwise appends only the entries that aren't already present. Never
-    invents a .gitignore in a directory that isn't a repo -- that would be
-    presumptuous, and the README's contract says so.
-    """
+def _add_to_gitignore(root: Path) -> None:
+    """Add Pedacito's entries to the project's .gitignore: create it in a git
+    checkout that has none, else append the missing entries. Never creates one
+    outside a repo."""
     gi = root / ".gitignore"
     if not gi.exists():
         if not (root / ".git").exists():
             return          # not a repo; leave the directory alone
         gi.write_text("# Pedacito\n" + "\n".join(GITIGNORE_ENTRIES) + "\n",
                       encoding="utf-8")
-        if verbose:
-            print(f"  created {gi} with Pedacito entries", file=sys.stderr)
+        print(f"  created {gi} with Pedacito entries", file=sys.stderr)
         return
 
     text = gi.read_text(encoding="utf-8", errors="replace")
-    # Strip trailing slashes on both sides so ".pedacito" and ".pedacito/"
-    # count as the same entry (gitignore treats them identically for a
-    # directory), and ignore comment lines when checking for presence.
+    # ".pedacito" and ".pedacito/" count as the same entry
     existing = {
         ln.strip().rstrip("/")
         for ln in text.splitlines()
@@ -167,40 +134,29 @@ def _add_to_gitignore(root: Path, verbose: bool) -> None:
         fh.write("# Pedacito\n")
         for e in to_add:
             fh.write(f"{e}\n")
-    if verbose:
-        n = len(to_add)
-        print(f"  updated {gi} ({n} Pedacito entr"
-              f"{'y' if n == 1 else 'ies'} added)", file=sys.stderr)
+    n = len(to_add)
+    print(f"  updated {gi} ({n} Pedacito entr"
+          f"{'y' if n == 1 else 'ies'} added)", file=sys.stderr)
 
 
-# --------------------------------------------------------------------------
-# Backups and restore
-# --------------------------------------------------------------------------
 def new_backup_dir(root: Path, when: str | None = None) -> Path:
-    """Create and return a new timestamped backup directory under
-    .pedacito/backups/, ready to receive pre-edit file copies."""
+    """Create and return a timestamped directory under .pedacito/backups/."""
     d = state_dir(root, BACKUP_DIR, when or stamp())
     d.mkdir(parents=True, exist_ok=True)
     return d
 
 
 def list_backups(root: Path) -> list[Path]:
-    """List all backup snapshot directories under .pedacito/backups/, most
-    recent first."""
+    """Backup snapshot directories under .pedacito/backups/, newest first."""
     d = state_dir(root, BACKUP_DIR)
     return sorted((p for p in d.iterdir() if p.is_dir()), reverse=True) if d.exists() else []
 
 
 def restore(root: Path, snapshot: Path, dry_run: bool = False) -> list[str]:
     """Copy every file in a backup snapshot back over the working tree
-    byte-for-byte, restoring it to its pre-edit state. Returns the list of
-    relative paths restored (or that would be restored, if `dry_run`).
-
-    Files created by the edit have no copy in the snapshot -- there was
-    nothing to back up. They are reported as `rel (+)` and left on disk;
-    deleting files automatically is too dangerous for a tool whose whole
-    safety story is "nothing is ever removed". Remove them by hand, or undo
-    with git."""
+    byte-for-byte. Returns the relative paths restored (or that would be, if
+    `dry_run`). Files created since the snapshot have no copy in it and are
+    left in place, never deleted."""
     root = Path(root).resolve()
     restored: list[str] = []
     for src in sorted(snapshot.rglob("*")):
@@ -211,33 +167,16 @@ def restore(root: Path, snapshot: Path, dry_run: bool = False) -> list[str]:
         restored.append(rel)
         if not dry_run:
             dest.parent.mkdir(parents=True, exist_ok=True)
-            dest.write_bytes(src.read_bytes())   # byte-exact restore
-    # Note created files so `restore --list` output explains why they stay.
-    cur = {p.relative_to(root).as_posix() for p in root.rglob("*")
-           if p.is_file()}
-    snap = {p.relative_to(snapshot).as_posix() for p in snapshot.rglob("*")
-            if p.is_file()}
-    for rel in sorted(cur - snap):
-        if rel.startswith(".pedacito/"):
-            continue
-        restored.append(f"{rel} (+ new file, left in place)")
+            dest.write_bytes(src.read_bytes())
     return restored
 
 
-# --------------------------------------------------------------------------
-# Session logging
-# --------------------------------------------------------------------------
 def write_session(root: Path, task: str, steps: list[str], reply: str,
                   results, backup: Path | None, when: str | None = None,
                   raw_reply: str | None = None) -> Path:
-    """Write a readable Markdown record of one task (what was asked, every
-    lookup made, the model's reply, and which edits landed) to
-    .pedacito/sessions/<timestamp>.md. Useful when an edit turns out wrong
-    later and you need to see what the model was actually looking at.
-
-    `raw_reply`, when given, is the reply exactly as the model produced it
-    (before any truncation-trimming or continuation rounds rewrote it); it is
-    recorded verbatim so a cut-off answer can be diagnosed from the log alone."""
+    """Write a Markdown record of one task (request, lookups, reply, edits)
+    to .pedacito/sessions/<timestamp>.md. `raw_reply`, when given, is the
+    reply as the model emitted it, before trimming or continuation rounds."""
     d = state_dir(root, SESSION_DIR)
     d.mkdir(parents=True, exist_ok=True)
     when = when or stamp()

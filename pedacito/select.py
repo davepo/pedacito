@@ -9,8 +9,8 @@ Usage
     files = select(["src", "README.md"], project_root, matcher,
                    exts=CODE_EXTS | REFERENCE_EXTS)
 
-Supports a `.pedacitoignore` file (and a project's existing `.gitignore`) using
-a practical subset of gitignore syntax, plus programmatic include/exclude
+Supports a `.pedacitoignore` file (and a project's `.gitignore`) using a
+practical subset of gitignore syntax, plus programmatic include/exclude
 patterns from the CLI's `--exclude` / `--include` flags:
 
     build/              directory and everything under it
@@ -19,19 +19,13 @@ patterns from the CLI's `--exclude` / `--include` flags:
     old/**/legacy.py    ** spans directories
     !keep/important.py  negation; last matching pattern wins
 
-Not supported (documented rather than silently wrong): character ranges like
-[abc], and gitignore's rule that a negation cannot resurrect a file whose
-parent directory was excluded. Here a negation always wins if it matches
-last, which is the behaviour most people expect when they write one.
+Not supported: character ranges like [abc], and gitignore's rule that a
+negation cannot resurrect a file under an excluded directory (here a later
+negation always wins).
 
-Directory walking follows symlinks (so a vendored or shared directory
-reached only through a symlink is actually indexed, not silently skipped --
-`Path.rglob` does not descend into symlinked directories on its own), while
-guarding against symlink cycles by tracking each directory's resolved
-("real") path and never descending into one already visited. A file
-reachable by more than one route (two sibling paths pointing at the same
-real directory, or a symlink pointing back at an ancestor) is walked and
-kept exactly once.
+Directory walking follows symlinks (`Path.rglob` does not descend into
+symlinked directories) and guards against cycles by tracking resolved paths;
+a file reachable by several routes is kept once.
 """
 
 from __future__ import annotations
@@ -46,26 +40,23 @@ DEFAULT_IGNORE = [
     ".git/", "__pycache__/", ".venv/", "venv/", "env/", "node_modules/",
     ".mypy_cache/", ".pytest_cache/", ".ruff_cache/", ".tox/",
     ".pedacito/", "build/", "dist/", "*.egg-info/",
-    # Pedacito's own files. Indexing them wastes map budget and invites the model
-    # to "helpfully" edit its own configuration.
+    # Pedacito's own files.
     ".pedacito.toml", "pedacito.toml", ".pedacitoignore",
     "*.pyc", "*.pyo", "*.so", "*.bak", ".DS_Store",
 ]
 
-# Parsed by the AST and chunked semantically (see chunker.py).
+# Chunked by the Python AST (chunker.py).
 PY_EXTS = {".py"}
 
-# Parsed via tree-sitter and chunked semantically (see chunker_ts.py); falls
-# back to structural reference-chunking (see references.py) if tree-sitter is
-# unavailable, rather than being excluded from the index outright.
+# Chunked via tree-sitter (chunker_ts.py); falls back to structural
+# reference-chunking (references.py) if tree-sitter is unavailable.
 JS_TS_EXTS = {".js", ".jsx", ".mjs", ".cjs", ".ts", ".tsx"}
 RUBY_EXTS = {".rb"}
 
 CODE_EXTS = PY_EXTS | JS_TS_EXTS | RUBY_EXTS
 
-# Indexed structurally, not parsed: the model can `read` and `grep` them, and
-# the map shows their shape (CSV columns, JSON keys, markdown headings). See
-# references.py.
+# Indexed structurally (references.py): readable and greppable, with the map
+# showing their shape (CSV columns, JSON keys, markdown headings).
 REFERENCE_EXTS = {
     ".md", ".rst", ".txt", ".csv", ".tsv", ".json", ".toml",
     ".yaml", ".yml", ".ini", ".cfg", ".conf", ".env", ".sql", ".sh",
@@ -73,12 +64,8 @@ REFERENCE_EXTS = {
 }
 
 
-# --------------------------------------------------------------------------
-# Pattern matcher
-# --------------------------------------------------------------------------
 class Matcher:
-    """An ordered list of gitignore-style patterns. Last matching pattern
-    wins, matching gitignore's own precedence rule."""
+    """An ordered list of gitignore-style patterns; the last match wins."""
 
     def __init__(self, patterns: list[str] | None = None):
         """Build a Matcher from an initial list of pattern lines."""
@@ -102,18 +89,18 @@ class Matcher:
         if p:
             self.rules.append((p, negate, dir_only, anchored))
 
-    def extend(self, patterns) -> "Matcher":
+    def extend(self, patterns) -> Matcher:
         """Append multiple pattern lines at once; returns self for chaining."""
         for p in patterns or []:
             self.add(p)
         return self
 
     @classmethod
-    def from_files(cls, root: Path, names=(".pedacitoignore", ".gitignore"),
-                   use_defaults: bool = True) -> "Matcher":
+    def from_files(cls, root: Path, names=(".pedacitoignore", ".gitignore")
+                   ) -> Matcher:
         """Build a Matcher from the built-in defaults plus any of the named
         ignore files that exist under `root`, read in order."""
-        m = cls(DEFAULT_IGNORE if use_defaults else [])
+        m = cls(DEFAULT_IGNORE)
         for name in names:
             f = root / name
             if f.exists():
@@ -139,8 +126,7 @@ class Matcher:
         return any(fnmatch.fnmatch("/".join(parts[i:]), pat) for i in range(len(parts)))
 
     def excluded(self, rel: str) -> bool:
-        """Return True if `rel` (a project-relative path) should be excluded,
-        applying every rule in order so the last match wins."""
+        """True if the project-relative path `rel` is excluded."""
         rel = rel.replace("\\", "/")   # index paths are POSIX; inputs may not be
         verdict = False
         for pat, negate, dir_only, anchored in self.rules:
@@ -149,20 +135,10 @@ class Matcher:
         return verdict
 
 
-# --------------------------------------------------------------------------
-# Cycle-safe directory walk
-# --------------------------------------------------------------------------
 def is_venv_dir(path: Path) -> bool:
-    """True when `path` is the root of a Python virtual environment.
-
-    Both ``venv`` and ``virtualenv`` drop a ``pyvenv.cfg`` file at the
-    environment root, whatever the directory is named (``.venv``, ``venv``,
-    ``env``, ``pdc_venv``, ...). Matching that marker catches names the
-    ``DEFAULT_IGNORE`` list cannot, so a venv that lives INSIDE the project is
-    never walked: its ``site-packages`` (Flask and every other pip dependency)
-    is a dependency, not project code, and indexing it would flood the map and
-    invite the model to "helpfully" edit third-party sources.
-    """
+    """True when `path` is the root of a Python virtual environment (it holds
+    a ``pyvenv.cfg``, whatever the directory is named), so its site-packages
+    is never indexed as project code."""
     try:
         return (path / "pyvenv.cfg").is_file()
     except OSError:
@@ -170,20 +146,8 @@ def is_venv_dir(path: Path) -> bool:
 
 
 def _walk(path: Path) -> list[Path]:
-    """Return every file under `path`, descending into symlinked directories
-    (unlike `Path.rglob`, which treats a symlinked directory as a leaf and
-    never looks inside it) while never re-entering a directory already
-    visited in this walk.
-
-    Python virtual environments (detected by their ``pyvenv.cfg`` marker) are
-    skipped entirely, so a venv with a non-standard name sitting inside the
-    project does not drag its ``site-packages`` into the index.
-
-    A directory is identified by its resolved ("real") path, so a cycle --
-    a symlink pointing back at an ancestor, or two different routes to the
-    same real directory -- is visited once and then skipped, rather than
-    recursing forever or listing its contents twice.
-    """
+    """Return every file under `path`, following symlinked directories but
+    visiting each real directory once (cycle-safe) and skipping virtualenvs."""
     visited: set[Path] = set()
     stack: list[Path] = [path]
     files: list[Path] = []
@@ -210,26 +174,17 @@ def _walk(path: Path) -> list[Path]:
     return sorted(files)
 
 
-# --------------------------------------------------------------------------
-# Public API
-# --------------------------------------------------------------------------
 def select(paths: list[str], root: Path, matcher: Matcher,
-           exts: set[str], max_bytes: int = 0) -> list[Path]:
-    """Expand a list of files/directories into a filtered, deduplicated file
-    list.
+           exts: set[str]) -> list[Path]:
+    """Expand files/directories into a filtered, deduplicated file list.
 
-    Directories are walked recursively; each candidate file must have an
-    extension in `exts` and must not be excluded by `matcher`, unless it was
-    named explicitly (as opposed to discovered by walking a directory) --
-    a path typed directly on the command line is always included, since
-    typing it is an explicit request regardless of ignore rules.
+    Directory walks keep files whose extension is in `exts` and that `matcher`
+    does not exclude; a file named explicitly is exempt from ignore rules.
     """
     out: list[Path] = []
     seen: set[Path] = set()
 
     def keep(f: Path, explicit: bool) -> None:
-        """Add `f` to the result if it passes the extension, ignore-rule,
-        and size checks (ignore rules are skipped for explicit paths)."""
         r = f.resolve()
         if r in seen:
             return
@@ -242,8 +197,6 @@ def select(paths: list[str], root: Path, matcher: Matcher,
                 rel = f.name
             if matcher.excluded(rel):
                 return
-        if max_bytes and f.stat().st_size > max_bytes:
-            return
         seen.add(r)
         out.append(f)
 

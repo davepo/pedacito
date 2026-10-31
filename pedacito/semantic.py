@@ -7,17 +7,12 @@ Usage
     matches = semantic.search(index, cfg, client, "where do we retry?")
     text = semantic.render("where do we retry?", matches)
 
-Pedacito is deliberately dependency-free: `grep` plus the summary map covers
-most retrieval without a second model resident in memory. This module is the
-opt-in exception (`semantic_search = true`). It uses the SAME OpenAI-compatible
-server's `/v1/embeddings` endpoint -- no new Python dependency -- and only runs
-as a last resort when `grep` found nothing textually. That ordering matters for
-small models: exact identifiers still get exact results, and a natural-language
-query has a chance instead of returning an empty observation.
+Opt-in (`semantic_search = true`). Uses the same OpenAI-compatible server's
+`/v1/embeddings` endpoint and only runs as a last resort when `grep` found
+nothing textually, so exact identifiers still get exact results.
 
-Embeddings are cached by chunk content hash in `.pedacito/embeddings.json`, so
-the one-time cost is paid per changed unit, not per search. Switching the
-embedding model invalidates (and rewrites) the cache.
+Embeddings are cached by chunk content hash in `.pedacito/embeddings.json`;
+switching the embedding model invalidates the cache.
 """
 
 from __future__ import annotations
@@ -34,13 +29,10 @@ EMBEDDINGS_FILE = "embeddings.json"
 _BATCH = 32
 _MAX_UNIT_CHARS = 2000
 
-# Servers that cannot serve embeddings at all (Lemonade's llama.cpp backend
-# unless started with --embeddings returns HTTP 501; a wrong embedding_model
-# returns 400/404). Without this, every grep that finds no textual hit calls
-# semantic.search again, re-embeds all N units, fails again, and prints the
-# same banner -- the graveyard run did that 30+ times in one task. Remember
-# the verdict for the life of the process, keyed by endpoint + model so a
-# config change (or a different profile) starts fresh.
+# Endpoints that cannot serve embeddings (e.g. Lemonade's llama.cpp backend
+# without --embeddings returns 501; a wrong embedding_model returns 400/404).
+# Remembered per process, keyed by endpoint + model, so later greps fail fast
+# instead of re-embedding everything and failing again.
 _DISABLED: dict[tuple[str, str], str] = {}
 
 
@@ -80,7 +72,7 @@ def _load_cache(root, model: str) -> dict[str, list[float]]:
         data = json.loads(p.read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return {}
-    if data.get("model") != model:
+    if not isinstance(data, dict) or data.get("model") != model:
         return {}
     vectors = data.get("vectors") or {}
     return {k: v for k, v in vectors.items()
@@ -98,11 +90,8 @@ def _save_cache(root, model: str, vectors: dict[str, list[float]]) -> None:
 
 
 def _unit_text(chunk) -> str:
-    """Text embedded for one unit: identity first, then a capped body.
-
-    Including file/qualname/signature means "the function that retries" can
-    match a unit even when the implementation never uses the word; including
-    the body keeps the vector grounded in what the code actually does."""
+    """Text embedded for one unit: identity (file/qualname/signature) first, so
+    a query can match a unit whose body never uses the word, then a capped body."""
     bits = [chunk.file, chunk.qualname, chunk.signature or ""]
     if chunk.docline:
         bits.append(chunk.docline)
@@ -155,8 +144,7 @@ def _ensure(index, cfg, client, verbose: bool = False
         for chunk, vector in zip(group, embedded):
             if vector:
                 vectors[chunk.sha] = _normalise(vector)
-    # Prune entries for units that no longer exist, so the cache tracks the
-    # current project instead of growing forever across edits.
+    # Prune vectors for units that no longer exist.
     current = {c.sha for c in index.chunks if c.sha}
     vectors = {sha: v for sha, v in vectors.items() if sha in current}
     _save_cache(index.root, model, vectors)

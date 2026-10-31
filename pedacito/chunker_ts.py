@@ -1,52 +1,31 @@
-"""Tree-sitter based source chunking for JavaScript, TypeScript, and Ruby.
+"""Tree-sitter based source chunking for JS/TS, Ruby, Go, Rust, Java, C/C++, C#.
 
-Usage
------
-    from .chunker_ts import chunk_source_ts, LANG_BY_EXT, TS_AVAILABLE
+    chunks = chunk_file_ts("src/app.ts", source_text, ".ts", class_split_lines=60)
 
-    chunks = chunk_source_ts("src/app.ts", source_text, "typescript",
-                              class_split_lines=60)
-    for c in chunks:
-        print(c.qualname, c.start, c.end, c.signature)
+Mirrors chunker.py's contract (same Chunk dataclass, kind vocabulary, and line
+ranges), so nothing downstream cares which parser produced a file's chunks.
+Where the grammar differs from Python's:
 
-Mirrors chunker.py's contract exactly -- same Chunk dataclass, same kind
-vocabulary ("module", "function", "class", "classheader", "method"), same
-line-range guarantees -- so nothing downstream (index.py's map rendering,
-tools.py's outline/read/callers) needs to know or care that a file was
-parsed by tree-sitter instead of the `ast` module. Only index.py's two
-dispatch points (build/reindex_file) decide which chunker to call, based on
-file extension.
+  - `export` wraps the declaration it exports, so scope detection unwraps one
+    level. A bare `export default someIdentifier;` is not a scope.
+  - A top-level `const`/`let` is a scope only if its initializer is a function,
+    arrow function, or object literal.
+  - There is no docstring literal: `docline` comes from the immediately
+    preceding comment sibling (JSDoc or `//`).
+  - TS `interface`/`type`/`enum` are chunked like small whole classes.
+  - Ruby recurses into nested `module`/`class` namespaces.
 
-Differences from Python's AST chunking, driven by how the grammar actually
-shapes the tree (verified against parsed samples, not assumed from docs):
-
-  - `export` (and `export default`) wraps the thing it exports as a parent
-    node, so scope detection unwraps one level before classifying. A bare
-    `export default someIdentifier;` (re-exporting an existing name) isn't a
-    new scope and is left in the surrounding preamble/trailing text.
-  - A top-level `const`/`let` is only function-like if its initializer is a
-    function or arrow function (`export const f = () => ...`); otherwise
-    it's treated like any other module-level statement.
-  - There is no docstring literal. A JSDoc-style `/** ... */` comment is a
-    preceding *sibling* node, not something inside the scope, so `docline`
-    is pulled from the nearest immediately-preceding comment sibling.
-  - TypeScript's `interface`/`type`/`enum` declarations have no Python
-    analogue; they're chunked like a small whole class (kind="class"),
-    with their property/member names recorded the same way a class's
-    method names are.
-
-Requires the `tree-sitter` + `tree-sitter-language-pack` packages (both are
-base install dependencies, so they are normally present). If they ever are
-not importable, `TS_AVAILABLE` is False and callers should fall back to
-reference-style chunking (see references.py) rather than fail.
+Needs `tree-sitter` + `tree-sitter-language-pack`. If they are not importable,
+`TS_AVAILABLE` is False and callers fall back to references.py chunking.
 """
 
 from __future__ import annotations
 
-import hashlib
 import re
 
-from .chunker import Chunk
+from .chunker import (
+    Chunk, _part_signature, _sha, _split_statements, split_lines,
+)
 
 try:
     from tree_sitter_language_pack import get_parser
@@ -55,18 +34,17 @@ except ImportError:                                    # pragma: no cover
     get_parser = None
     TS_AVAILABLE = False
 
-# File extension -> tree-sitter grammar name. .ts deliberately does not
-# parse JSX (confirmed: the "typescript" grammar rejects JSX syntax with a
-# parse error), which is exactly the disambiguation a .ts/.tsx split implies.
+# File extension -> tree-sitter grammar name. The "typescript" grammar rejects
+# JSX, hence the separate "tsx".
 LANG_BY_EXT = {
     ".js": "javascript",
-    ".jsx": "javascript",   # the plain "javascript" grammar parses JSX fine
+    ".jsx": "javascript",
     ".mjs": "javascript",
     ".cjs": "javascript",
     ".ts": "typescript",
     ".tsx": "tsx",
     ".rb": "ruby",
-    # Generic tree-sitter chunkers (see GENERIC_SPECS).
+    # handled by chunk_source_generic (see GENERIC_SPECS)
     ".go": "go",
     ".rs": "rust",
     ".java": "java",
@@ -80,14 +58,12 @@ LANG_BY_EXT = {
     ".cs": "c_sharp",
 }
 
-# Node types that introduce a function-like scope, keyed by nothing more
-# than their tree-sitter type name -- these are the same across the JS,
-# TypeScript, and TSX grammars.
+# Function-like scope node types (same across the JS, TS, and TSX grammars).
 FUNCTION_NODES = {
     "function_declaration", "generator_function_declaration",
 }
 CLASS_NODES = {"class_declaration"}
-# TypeScript-only: chunked like small whole classes (see module docstring).
+# TypeScript-only: chunked like small whole classes.
 TS_DECL_NODES = {
     "interface_declaration", "type_alias_declaration", "enum_declaration",
 }
@@ -95,23 +71,13 @@ METHOD_NODES = {"method_definition"}
 FIELD_METHOD_NODES = {"field_definition", "public_field_definition"}
 OBJECT_NODES = {"object"}
 
-# Ruby node types (see chunk_source_ruby's docstring for why these need
-# their own recursive handling instead of reusing chunk_source_ts).
+# Ruby node types
 RUBY_CONTAINER_NODES = {"class", "module"}
 RUBY_METHOD_NODES = {"method", "singleton_method"}
 RUBY_CARVE_NODES = RUBY_CONTAINER_NODES | RUBY_METHOD_NODES
 RUBY_IMPORT_CALLS = {"require", "require_relative", "load"}
 
 _parsers: dict[str, "object"] = {}
-
-
-# --------------------------------------------------------------------------
-# Small internal helpers
-# --------------------------------------------------------------------------
-def _sha(text: str) -> str:
-    """Short content hash, same scheme as chunker.py, kept local so this
-    module has no private cross-imports."""
-    return hashlib.sha256(text.encode("utf-8", "replace")).hexdigest()[:16]
 
 
 def _get_parser(language: str):
@@ -133,86 +99,14 @@ def _line_span(node) -> tuple[int, int]:
     return node.start_point.row + 1, node.end_point.row + 1
 
 
-def _estimate_tokens(text: str) -> int:
-    """Rough code-token estimate (same 3.6 chars/token ratio as llm.py)."""
-    return int(len(text) / 3.6) + 1
-
-
-def _fits(lines: list[str], start: int, end: int,
-          max_lines: int, max_chars: int, max_tokens: int = 0) -> bool:
-    """True when a 1-based inclusive line range fits the retrieval budget."""
-    if end - start + 1 > max_lines:
-        return False
-    text = "\n".join(lines[start - 1:end])
-    if len(text) > max_chars:
-        return False
-    return not (max_tokens and _estimate_tokens(text) > max_tokens)
-
-
-def _window_parts(lines: list[str], first_line: int, last_line: int,
-                  max_lines: int, max_chars: int, max_tokens: int,
-                  overlap: int) -> list[tuple[int, int, list]] | None:
-    """Last-resort line windows for one oversized statement."""
-    parts: list[tuple[int, int, list]] = []
-    start = first_line
-    while start <= last_line:
-        end = start
-        while end < last_line and _fits(lines, start, end + 1, max_lines,
-                                        max_chars, max_tokens):
-            end += 1
-        parts.append((start, end, []))
-        if end >= last_line:
-            break
-        start = max(start + 1, end + 1 - max(0, overlap))
-    return parts if len(parts) > 1 else None
-
-
 def _split_nodes(stmts: list, lines: list[str], first_line: int, last_line: int,
                  max_lines: int, max_chars: int, max_tokens: int = 0,
                  overlap_lines: int = 0
                  ) -> list[tuple[int, int, list]] | None:
     """Group top-level statement nodes into retrieval-sized parts."""
-    if _fits(lines, first_line, last_line, max_lines, max_chars, max_tokens):
-        return None
-    if len(stmts) < 2:
-        return _window_parts(lines, first_line, last_line, max_lines,
-                             max_chars, max_tokens, overlap_lines)
-    parts: list[tuple[int, int, list]] = []
-    cur_start = first_line
-    cur_end = first_line - 1
-    cur: list = []
-    for stmt in stmts:
-        s, e = _line_span(stmt)
-        if cur and s > cur_end and _section_start(lines, s) \
-                and _half_budget(lines, cur_start, cur_end, max_lines,
-                                 max_chars, max_tokens):
-            parts.append((cur_start, cur_end, cur))
-            cur_start, cur_end, cur = s, e, [stmt]
-            continue
-        if cur and s > cur_end and \
-                not _fits(lines, cur_start, e, max_lines, max_chars,
-                          max_tokens):
-            parts.append((cur_start, cur_end, cur))
-            cur_start, cur_end, cur = s, e, [stmt]
-        else:
-            cur.append(stmt)
-            cur_end = max(cur_end, e)
-    if cur:
-        parts.append((cur_start, cur_end, cur))
-    if len(parts) < 2:
-        return None
-    # Contiguous parts: inter-statement comments/blanks belong to the
-    # preceding part; the last part owns the closing lines of the scope.
-    for i in range(len(parts) - 1):
-        ps, _pe, pnodes = parts[i]
-        parts[i] = (ps, parts[i + 1][0] - 1, pnodes)
-    ps, _pe, pnodes = parts[-1]
-    parts[-1] = (ps, last_line, pnodes)
-    if overlap_lines > 0:
-        for i in range(1, len(parts)):
-            ps, pe, pnodes = parts[i]
-            parts[i] = (max(first_line, ps - overlap_lines), pe, pnodes)
-    return parts
+    return _split_statements(stmts, lines, first_line, last_line, max_lines,
+                             max_chars, max_tokens, overlap_lines,
+                             span=_line_span)
 
 
 def _split_body(body_node, lines: list[str], first_line: int, last_line: int,
@@ -220,46 +114,14 @@ def _split_body(body_node, lines: list[str], first_line: int, last_line: int,
                 overlap_lines: int = 0
                 ) -> list[tuple[int, int, list]] | None:
     """Group a function/method body's statements into retrieval-sized parts.
-
-    Returns None when the span fits or cannot be split safely. This is the
-    tree-sitter analogue of chunker.py's `_split_statements`: split only at
-    top-level statement boundaries; a single giant statement falls back to
-    line windows.
-    """
+    Returns None when the span fits or the body is not a block."""
     if body_node is None or (
             "block" not in getattr(body_node, "type", "")
             and getattr(body_node, "type", "") != "body_statement"):
         return None
-    if _fits(lines, first_line, last_line, max_lines, max_chars, max_tokens):
-        return None
     stmts = list(getattr(body_node, "named_children", []) or [])
     return _split_nodes(stmts, lines, first_line, last_line,
                         max_lines, max_chars, max_tokens, overlap_lines)
-
-
-def _part_signature(sig: str, index: int, count: int) -> str:
-    """Label a split unit so the map/outline makes the continuation visible."""
-    return f"{sig}  [part {index}/{count}]" if count > 1 else sig
-
-
-_COMMENT_PREFIXES = ("#", "//", "/*", "*", "--", "<!--")
-
-
-def _section_start(lines: list[str], line_no: int) -> bool:
-    if line_no <= 1:
-        return False
-    prev = lines[line_no - 2].strip()
-    return prev == "" or prev.startswith(_COMMENT_PREFIXES)
-
-
-def _half_budget(lines: list[str], start: int, end: int, max_lines: int,
-                 max_chars: int, max_tokens: int) -> bool:
-    if end - start + 1 >= max(2, int(max_lines * 0.5)):
-        return True
-    text = "\n".join(lines[start - 1:end])
-    if len(text) >= max(2, int(max_chars * 0.5)):
-        return True
-    return bool(max_tokens and _estimate_tokens(text) >= max_tokens * 0.5)
 
 
 def _unwrap_export(node):
@@ -296,9 +158,7 @@ def _leading_comment_doc(node) -> str:
     if prev.type != "comment":
         return ""
     text = prev.text.decode("utf-8", "replace")
-    # Strip /** ... */, //, or Ruby's # decoration, keep the first content
-    # line. strip("/*#") handles all three comment styles this function
-    # is used for (JS/TS block and line comments, Ruby line comments).
+    # strip("/*#") covers JSDoc blocks, // comments, and Ruby # comments
     text = text.strip("/*#").strip()
     for line in text.splitlines():
         line = line.strip().lstrip("*#").strip()
@@ -318,9 +178,8 @@ def _decorators(node, src: bytes) -> list[str]:
 
 
 def _signature_of_function(node, src: bytes, name: str) -> str:
-    """Render an approximate signature: the declared keywords plus the
-    parameter list, taken verbatim from source rather than reconstructed --
-    tree-sitter gives exact byte ranges, so there's no unparse step needed."""
+    """Approximate signature: keywords plus the parameter list, verbatim from
+    source."""
     params = node.child_by_field_name("parameters")
     ret = node.child_by_field_name("return_type")
     is_async = any(c.type == "async" for c in node.children)
@@ -365,53 +224,50 @@ def _signature_of_field_method(node, src: bytes, name: str) -> str:
 
 
 def _walk_calls(node, out: set[str]) -> None:
-    """Collect names invoked via call/new expressions under `node`. Bare
-    identifiers are taken as-is; member calls (obj.method()) reduce to the
-    property name -- the same bare-name approximation chunker.py uses for
-    Python, kept consistent across languages."""
-    if node.type == "call_expression":
-        fn = node.child_by_field_name("function")
-        if fn is not None:
-            if fn.type == "identifier":
-                out.add(fn.text.decode())
-            elif fn.type == "member_expression":
-                prop = fn.child_by_field_name("property")
-                if prop is not None:
-                    out.add(prop.text.decode())
-            elif fn.type == "field_expression":
-                prop = fn.child_by_field_name("field")
-                if prop is not None:
-                    out.add(prop.text.decode())
-            elif fn.type == "selector_expression":
-                prop = fn.child_by_field_name("field")
-                if prop is not None:
-                    out.add(prop.text.decode())
-    elif node.type == "new_expression":
-        ctor = node.child_by_field_name("constructor")
-        if ctor is not None and ctor.type == "identifier":
-            out.add(ctor.text.decode())
-    elif node.type == "method_invocation":
-        nm = node.child_by_field_name("name")
-        if nm is not None:
-            out.add(nm.text.decode())
-    elif node.type == "object_creation_expression":
-        ty = node.child_by_field_name("type")
-        if ty is not None:
-            out.add(ty.text.decode().split(".")[-1])
-    elif node.type == "macro_invocation":
-        mac = node.child_by_field_name("macro")
-        if mac is not None:
-            out.add(mac.text.decode().rstrip("!"))
-    for child in node.children:
-        _walk_calls(child, out)
+    """Collect names invoked via call/new expressions under `node`. Member
+    calls (obj.method()) reduce to the property name: the same bare-name
+    approximation chunker.py uses for Python. Iterative, so deeply nested
+    trees (minified JS) cannot hit the recursion limit."""
+    stack = [node]
+    while stack:
+        node = stack.pop()
+        t = node.type
+        if t == "call_expression":
+            fn = node.child_by_field_name("function")
+            if fn is not None:
+                if fn.type == "identifier":
+                    out.add(fn.text.decode())
+                elif fn.type == "member_expression":
+                    prop = fn.child_by_field_name("property")
+                    if prop is not None:
+                        out.add(prop.text.decode())
+                elif fn.type in ("field_expression", "selector_expression"):
+                    prop = fn.child_by_field_name("field")
+                    if prop is not None:
+                        out.add(prop.text.decode())
+        elif t == "new_expression":
+            ctor = node.child_by_field_name("constructor")
+            if ctor is not None and ctor.type == "identifier":
+                out.add(ctor.text.decode())
+        elif t == "method_invocation":
+            nm = node.child_by_field_name("name")
+            if nm is not None:
+                out.add(nm.text.decode())
+        elif t == "object_creation_expression":
+            ty = node.child_by_field_name("type")
+            if ty is not None:
+                out.add(ty.text.decode().split(".")[-1])
+        elif t == "macro_invocation":
+            mac = node.child_by_field_name("macro")
+            if mac is not None:
+                out.add(mac.text.decode().rstrip("!"))
+        stack.extend(node.children)
 
 
 def _module_label(spec: str) -> str:
-    """Collapse an import specifier to a short display label for the file
-    card's "imports:" line -- mirrors what index.py's rendering does for
-    Python's dotted imports (take the meaningful top-level piece), since a
-    raw relative path like "./foo" would otherwise render as an empty
-    string once index.py strips a leading dot."""
+    """Collapse an import specifier to a short label for the file card's
+    "imports:" line ("./a/foo" -> "foo"; index.py strips leading dots, which
+    would otherwise empty a bare relative path)."""
     spec = spec.rstrip("/")
     if spec.startswith("."):
         return spec.rsplit("/", 1)[-1] or spec
@@ -433,32 +289,20 @@ def _imports(root, src: bytes) -> list[str]:
     return out
 
 
-# --------------------------------------------------------------------------
-# Public API
-# --------------------------------------------------------------------------
 def chunk_source_ts(rel_path: str, src: str, language: str,
                      class_split_lines: int = 60,
                      max_unit_lines: int = 220,
                      max_unit_chars: int = 12000,
                      max_unit_tokens: int = 3000,
                      unit_overlap_lines: int = 0) -> list[Chunk]:
-    """Chunk one JS/TS/TSX file's source into a list of Chunk objects.
+    """Chunk one JS/TS/TSX file's source into a list of Chunk objects: a
+    module preamble, one chunk per top-level function (including arrow
+    functions in a const/let), one per class or TS interface/type/enum (whole,
+    or classheader plus one chunk per method past `class_split_lines`), and a
+    trailing chunk.
 
-    Produces, in order: a module-preamble chunk (imports and any top-level
-    statements before the first function/class/interface/type/enum), one
-    chunk per top-level function (including arrow functions assigned to a
-    top-level const/let), one chunk per class or TS interface/type/enum
-    (whole, or split into a classheader chunk plus one chunk per method if
-    a class exceeds `class_split_lines`), and a trailing chunk for any code
-    after the last top-level scope.
-
-    Never raises on malformed source: tree-sitter is error-tolerant by
-    design (confirmed against deliberately broken input) and produces a
-    best-effort tree even around a syntax error, rather than refusing to
-    parse the way `ast.parse` does for Python. A badly broken file typically
-    degrades to fewer/coarser chunks (e.g. the whole file as one "module"
-    chunk) rather than failing outright -- there is no equivalent of
-    chunk_source's SyntaxError to catch here.
+    Never raises on malformed source: tree-sitter is error-tolerant, so a
+    broken file just degrades to fewer/coarser chunks.
     """
     if not TS_AVAILABLE:
         raise RuntimeError(
@@ -470,22 +314,18 @@ def chunk_source_ts(rel_path: str, src: str, language: str,
     src_bytes = src.encode("utf-8", "replace")
     tree = parser.parse(src_bytes)
     root = tree.root_node
-    lines = src.splitlines()
+    lines = split_lines(src)
     total = len(lines)
     chunks: list[Chunk] = []
     imports = _imports(root, src_bytes)
 
-    # --- classify each top-level statement, unwrapping export wrappers ---
+    # classify each top-level statement, unwrapping export wrappers
     scopes: list[tuple[object, object]] = []   # (outer_node, inner_decl_node)
     for outer in root.children:
         inner = _unwrap_export(outer)
         if inner is None:
             continue
-        if inner.type in FUNCTION_NODES:
-            scopes.append((outer, inner))
-        elif inner.type in CLASS_NODES:
-            scopes.append((outer, inner))
-        elif inner.type in TS_DECL_NODES:
+        if inner.type in FUNCTION_NODES | CLASS_NODES | TS_DECL_NODES:
             scopes.append((outer, inner))
         elif inner.type in ("lexical_declaration", "variable_declaration"):
             # Only function-like if a declarator's value is a function.
@@ -501,15 +341,17 @@ def chunk_source_ts(rel_path: str, src: str, language: str,
 
     if not scopes:
         if src.strip():
+            whole_calls: set[str] = set()
+            _walk_calls(root, whole_calls)
             chunks.append(Chunk(
                 file=rel_path, qualname="module", kind="module",
                 start=1, end=total, imports=imports,
-                calls=sorted(_calls_of(root, src_bytes)),
+                calls=sorted(whole_calls),
                 source=src, sha=_sha(src),
             ))
         return chunks
 
-    # --- module preamble: everything before the first scope's outer node ---
+    # module preamble: everything before the first scope
     first_start = scopes[0][0].start_point.row + 1
     if first_start > 1:
         end = first_start - 1
@@ -526,7 +368,7 @@ def chunk_source_ts(rel_path: str, src: str, language: str,
                 calls=sorted(calls), source=body, sha=_sha(body),
             ))
 
-    # --- each top-level scope ---
+    # each top-level scope
     for outer, inner in scopes:
         start, end = _line_span(outer)
         body = "\n".join(lines[start - 1:end])
@@ -797,7 +639,7 @@ def chunk_source_ts(rel_path: str, src: str, language: str,
                 imports=imports, source=m_body, sha=_sha(m_body),
             ))
 
-    # --- trailing top-level code after the last scope ---
+    # trailing top-level code after the last scope
     last_end = scopes[-1][0].end_point.row + 1
     if last_end < total:
         body = "\n".join(lines[last_end:])
@@ -816,21 +658,9 @@ def chunk_source_ts(rel_path: str, src: str, language: str,
     return chunks
 
 
-def _calls_of(node, src: bytes) -> set[str]:
-    """Convenience wrapper used only for the "whole file is one chunk"
-    (no top-level scopes found) case."""
-    out: set[str] = set()
-    _walk_calls(node, out)
-    return out
-
-
-# --------------------------------------------------------------------------
-# Ruby (recursive containers -- see chunk_source_ruby's docstring)
-# --------------------------------------------------------------------------
 def _ruby_call_name(node) -> str | None:
-    """The `method` field text for a Ruby `call` node (works for both
-    `foo(1)` and `obj.foo(1)` -- confirmed the field is present either
-    way), or None if `node` isn't a call at all."""
+    """The `method` field text of a Ruby `call` node (`foo(1)` or
+    `obj.foo(1)`), or None if `node` isn't a call."""
     if node.type != "call":
         return None
     m = node.child_by_field_name("method")
@@ -838,8 +668,8 @@ def _ruby_call_name(node) -> str | None:
 
 
 def _ruby_first_string_arg(call_node) -> str | None:
-    """First plain string literal argument of a call node, used to pull
-    the path out of a `require "./foo"` / `require_relative "./foo"`."""
+    """First plain string literal argument of a call node (the path in
+    `require "./foo"`)."""
     args = call_node.child_by_field_name("arguments")
     if args is None:
         args = next((c for c in call_node.children if c.type == "argument_list"), None)
@@ -854,8 +684,7 @@ def _ruby_first_string_arg(call_node) -> str | None:
 
 
 def _ruby_signature(node, src: bytes, name: str) -> str:
-    """Render a def/class/module signature verbatim from source, same
-    "slice, don't reconstruct" approach as the JS/TS signatures."""
+    """Render a def/class/module signature verbatim from source."""
     if node.type == "method":
         params = node.child_by_field_name("parameters")
         return f"def {name}{_text(params, src) if params else ''}"
@@ -873,13 +702,14 @@ def _ruby_signature(node, src: bytes, name: str) -> str:
 
 
 def _ruby_walk_calls(node, out: set[str]) -> None:
-    """Same bare-name approximation as _walk_calls, using Ruby's `call`
-    node shape instead of JS's call_expression/member_expression."""
-    name = _ruby_call_name(node)
-    if name:
-        out.add(name)
-    for child in node.children:
-        _ruby_walk_calls(child, out)
+    """Bare-name call collection like _walk_calls, for Ruby `call` nodes."""
+    stack = [node]
+    while stack:
+        node = stack.pop()
+        name = _ruby_call_name(node)
+        if name:
+            out.add(name)
+        stack.extend(node.children)
 
 
 def _ruby_member_name(node) -> str:
@@ -894,15 +724,10 @@ def _ruby_container(node, qualname_prefix: str, rel_path: str, lines: list[str],
                      max_unit_tokens: int = 3000,
                      unit_overlap_lines: int = 0,
                      imports: list[str] | None = None) -> None:
-    """Emit chunks for one class/module node. If it's split (too big, or
-    with methods/nested containers to carve out), recurse into any nested
-    class/module children so multi-level namespacing -- the idiomatic way
-    Ruby organises code (`module App; module Models; class Widget; ... end;
-    end; end`) -- still yields a symbol per level instead of one opaque
-    blob. A container that stays whole (short, or nothing to carve out) is
-    NOT recursed into: exactly the same parity chunker.py has for Python,
-    where a class under class_split_lines keeps any nested detail
-    unrepresented as separate chunks rather than half-splitting it.
+    """Emit chunks for one class/module node. When it is split, recurse into
+    nested class/module children so `module App; module Models; class Widget`
+    yields a symbol per level. A container that stays whole (short, or nothing
+    to carve out) is not recursed into.
     """
     name = _ruby_member_name(node)
     qualname = f"{qualname_prefix}::{name}" if qualname_prefix else name
@@ -984,14 +809,8 @@ def chunk_source_ruby(rel_path: str, src: str, class_split_lines: int = 60,
                       unit_overlap_lines: int = 0) -> list[Chunk]:
     """Chunk one Ruby file's source into a list of Chunk objects.
 
-    Unlike chunk_source_ts, this recurses (see _ruby_container's
-    docstring) because nested `module`/`class` namespacing is Ruby's
-    normal way of organising a file, not an edge case the way nested
-    classes are in Python or JS.
-
-    `require`/`require_relative`/`load` calls at the top level stand in
-    for `imports`, since Ruby's grammar has no import-statement node --
-    these are just ordinary method calls syntactically.
+    Top-level `require`/`require_relative`/`load` calls stand in for
+    `imports`, since Ruby's grammar has no import-statement node.
     """
     if not TS_AVAILABLE:
         raise RuntimeError(
@@ -1003,7 +822,7 @@ def chunk_source_ruby(rel_path: str, src: str, class_split_lines: int = 60,
     src_bytes = src.encode("utf-8", "replace")
     tree = parser.parse(src_bytes)
     root = tree.root_node
-    lines = src.splitlines()
+    lines = split_lines(src)
     total = len(lines)
     chunks: list[Chunk] = []
     top = list(root.children)
@@ -1029,7 +848,7 @@ def chunk_source_ruby(rel_path: str, src: str, class_split_lines: int = 60,
             ))
         return chunks
 
-    # --- module preamble: everything before the first top-level scope ---
+    # module preamble: everything before the first top-level scope
     first_start = scopes[0].start_point.row + 1
     if first_start > 1:
         end = first_start - 1
@@ -1063,7 +882,7 @@ def chunk_source_ruby(rel_path: str, src: str, class_split_lines: int = 60,
                     source=body, sha=_sha(body),
                 ))
 
-    # --- each top-level scope: container (recursive) or bare def ---
+    # each top-level scope: container (recursive) or bare def
     for node in scopes:
         if node.type in RUBY_CONTAINER_NODES:
             _ruby_container(node, "", rel_path, lines, src_bytes,
@@ -1105,7 +924,7 @@ def chunk_source_ruby(rel_path: str, src: str, class_split_lines: int = 60,
             source=body, sha=_sha(body),
         ))
 
-    # --- trailing top-level code after the last scope ---
+    # trailing top-level code after the last scope
     last_end = scopes[-1].end_point.row + 1
     if last_end < total:
         body = "\n".join(lines[last_end:])
@@ -1143,14 +962,10 @@ def chunk_source_ruby(rel_path: str, src: str, class_split_lines: int = 60,
     return chunks
 
 
-# --------------------------------------------------------------------------
-# Generic tree-sitter languages (Go, Rust, Java, C, C++, C#)
-# --------------------------------------------------------------------------
-# One grammar-shaped spec per language. The algorithms are the same:
-# top-level function-like nodes become function chunks, container nodes become
-# a class/classheader+methods, and declarations (struct/enum/type) become
-# class-shaped chunks. Keeping the node-name sets here makes adding a language
-# a data change rather than another chunker copy.
+# Generic tree-sitter languages (Go, Rust, Java, C, C++, C#): one node-name
+# spec per language. Function-like nodes become function chunks, containers a
+# class (or classheader + methods), and declarations (struct/enum/type)
+# class-shaped chunks.
 GENERIC_SPECS = {
     "go": {
         "functions": {"function_declaration", "method_declaration"},
@@ -1301,7 +1116,7 @@ def chunk_source_generic(rel_path: str, src: str, language: str,
     parser = _get_parser(language)
     src_bytes = src.encode("utf-8", "replace")
     root = parser.parse(src_bytes).root_node
-    lines = src.splitlines()
+    lines = split_lines(src)
     total = len(lines)
     chunks: list[Chunk] = []
     imports = _generic_imports(root, spec, src_bytes)
@@ -1468,7 +1283,7 @@ def chunk_source_generic(rel_path: str, src: str, language: str,
                 source=m_text, sha=_sha(m_text),
             ))
 
-    # Preamble before the first scope.
+    # preamble before the first scope
     if preamble:
         first_start = preamble[0].start_point.row + 1
         end = max(c.end_point.row + 1 for c in preamble)
@@ -1518,7 +1333,7 @@ def chunk_source_generic(rel_path: str, src: str, language: str,
                 source=body_text, sha=_sha(body_text),
             ))
 
-    # Trailing top-level code.
+    # trailing top-level code
     if scopes:
         last_end = max(_line_span(o)[1] for o, _i, _k in scopes)
         tail = [n for n in root.named_children
@@ -1557,19 +1372,14 @@ def chunk_source_generic(rel_path: str, src: str, language: str,
     return chunks
 
 
-# --------------------------------------------------------------------------
-# Dispatch: extension -> the right chunker above
-# --------------------------------------------------------------------------
 def chunk_file_ts(rel_path: str, src: str, ext: str,
                    class_split_lines: int = 60,
                    max_unit_lines: int = 220,
                    max_unit_chars: int = 12000,
                    max_unit_tokens: int = 3000,
                    unit_overlap_lines: int = 0) -> list[Chunk]:
-    """Chunk one file using whichever tree-sitter chunker matches its
-    extension. The single entry point index.py calls -- it doesn't need
-    to know JS/TS and Ruby use genuinely different algorithms internally
-    (export-unwrapping vs. recursive containers)."""
+    """Chunk one file with the tree-sitter chunker for its extension; the
+    entry point index.py calls."""
     lang = LANG_BY_EXT[ext.lower()]
     if lang == "ruby":
         return chunk_source_ruby(rel_path, src, class_split_lines,
@@ -1585,15 +1395,11 @@ def chunk_file_ts(rel_path: str, src: str, ext: str,
 
 
 def has_syntax_error(text: str, language: str) -> tuple[bool, int | None]:
-    """Return (has_error, line) for `text` parsed as `language` -- line is
-    the first ERROR node's 1-based line, or None if there's no error.
-    Tree-sitter is error-tolerant (see chunk_source_ts's docstring) but
-    still marks the damaged region with an ERROR node, confirmed against
-    deliberately broken input. This is edits.py's post-edit safety check
-    for JS/TS, the same role `ast.parse` plays for Python."""
+    """Return (has_error, line) for `text` parsed as `language`; line is the
+    1-based line of the first ERROR node, else None. edits.py's post-edit
+    syntax check, the counterpart of `ast.parse` for Python."""
     if not TS_AVAILABLE:
-        # Caller's responsibility to skip the check when unavailable; treat
-        # as "can't tell" rather than silently claiming success.
+        # callers must skip the check when unavailable
         raise RuntimeError("tree-sitter is not installed; cannot check syntax")
     parser = _get_parser(language)
     tree = parser.parse(text.encode("utf-8", "replace"))

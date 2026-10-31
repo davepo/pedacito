@@ -1,26 +1,19 @@
 """Optional headless-browser driver for the gather-loop `browser` action.
 
-A screenshot of the desktop is not a web page. Games and UIs served over
-HTTP need navigation, key presses/clicks, a wait, and a capture of the page
-itself. This module provides that using Playwright when it is installed,
-with a Chrome/Chromium `--headless --screenshot` fallback for simple
-navigation-only checks.
-
-Playwright is deliberately an optional extra::
+Navigates to a URL, presses keys/clicks/evaluates JS, waits, and captures the
+page using Playwright (an optional extra)::
 
     pip install "pedacito-local[browser]"
     python -m playwright install chromium
 
-Without it, `available()` is false and the tool returns an explicit
-installation hint instead of silently pretending a desktop screenshot was
-the page. The fallback still lets `browser` load a URL and capture it when a
-Chrome/Chromium binary is present, but it cannot press keys or click.
+Without Playwright, a system Chrome/Chromium `--headless --screenshot` fallback
+can load and capture a page but cannot interact; with neither, the tool
+returns an install hint.
 """
 
 from __future__ import annotations
 
 import json
-import os
 import re
 import shutil
 import subprocess
@@ -32,9 +25,8 @@ from pathlib import Path
 
 from . import proc
 
-# A URL printed by a dev server. Cover the common bind-all spelling
-# (0.0.0.0) as well as localhost/IPv6; `normalise_url` turns the former into
-# an address a browser can actually open.
+# A URL printed by a dev server, including the bind-all 0.0.0.0 spelling
+# (`normalise_url` makes it openable).
 _URL_RE = re.compile(
     r"https?://(?:\[[0-9a-fA-F:]+\]|localhost|127\.0\.0\.1|0\.0\.0\.0|"
     r"[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?)(?::\d{1,5})?"
@@ -44,7 +36,7 @@ _CHROME_NAMES = (
     "google-chrome", "google-chrome-stable", "chromium", "chromium-browser",
     "chrome", "msedge", "microsoft-edge",
 )
-# GUI installs are not always on PATH (macOS app bundles, Windows defaults).
+# GUI installs not on PATH (macOS app bundles, Windows defaults).
 _CHROME_PATHS = (
     "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
     "/Applications/Chromium.app/Contents/MacOS/Chromium",
@@ -116,9 +108,8 @@ def install_hint() -> str:
 
 
 def parse_actions(spec: str) -> list[tuple]:
-    """Parse a compact interaction list from the step's `pattern` field.
-
-    The grammar is deliberately tiny so a small model can use it:
+    """Parse the step's `pattern` field into (kind, arg) actions. A tiny
+    grammar, separated by semicolons:
 
         Enter                    -> press Enter
         press Enter              -> press a key
@@ -129,9 +120,6 @@ def parse_actions(spec: str) -> list[tuple]:
         eval x.y = 3             -> run JS in the page and report its value;
                                      an eval consumes the REST of the spec
                                      (put it last; `;` inside it is fine)
-
-    Multiple actions are separated by semicolons, e.g.
-    `press Enter; wait 3; click canvas`.
     """
     out: list[tuple] = []
     parts = [raw.strip() for raw in (spec or "").split(";")]
@@ -142,15 +130,8 @@ def parse_actions(spec: str) -> list[tuple]:
         kind = head.lower()
         rest = rest.strip()
         if kind in ("eval", "js"):
-            # Run 10 field-tested Fix J's eval and the grammar defeated
-            # itself: the `;` splitter shredded multi-statement JS ("eval
-            # (function(){var d=window.__game.data" -> SyntaxError, the tail
-            # fragments replayed as `press d.scale=2: Unknown key`) and the
-            # model diagnosed its own tool failure in prose but had no way
-            # around it. An eval now consumes the REST of the pattern -- one
-            # expression, semicolons allowed inside, documented everywhere
-            # as "put eval last". page.evaluate takes the whole string (CDP
-            # returns the completion value of statements and IIFEs alike).
+            # The rest of the pattern is one JS expression: splitting on `;`
+            # would shred multi-statement code.
             expr = "; ".join(p for p in (rest, *parts[i + 1:]) if p)
             if expr:
                 out.append(("eval", expr))
@@ -177,7 +158,8 @@ def parse_actions(spec: str) -> list[tuple]:
 
 
 class _OutputReader:
-    """Drain a child's combined stdout/stderr into a bounded rolling buffer."""
+    """Drain a child's combined stdout/stderr into a bounded buffer (the first
+    `limit` bytes) on a background thread."""
 
     def __init__(self, stream, limit: int = 20_000):
         self.stream = stream
@@ -210,9 +192,8 @@ def launch_server(argv: list[str], *, cwd, env: dict | None = None,
                   wait_seconds: int = 15) -> tuple:
     """Start a server and wait for it to print a URL.
 
-    Returns (process, url, output). The process is left RUNNING; the caller
-    owns it and must call `proc.terminate` when the browser step is done.
-    Returns (None, "", error) if the process could not start.
+    Returns (process, url, output); the process is left RUNNING and the caller
+    must `proc.terminate` it. Returns (None, "", error) if it cannot start.
     """
     try:
         p = proc.spawn(argv, cwd=cwd, env=env, stdout=subprocess.PIPE,
@@ -230,22 +211,22 @@ def launch_server(argv: list[str], *, cwd, env: dict | None = None,
             break
         time.sleep(0.1)
     if url:
-        _wait_until_listening(url, timeout=3.0)
+        _wait_until_listening(url)
     return p, url, reader.text()
 
 
-def _wait_until_listening(url: str, timeout: float = 3.0) -> bool:
-    """Give the HTTP listener a moment to bind after it prints its URL."""
-    deadline = time.monotonic() + max(0.0, timeout)
+def _wait_until_listening(url: str, timeout: float = 3.0) -> None:
+    """Give the HTTP listener up to `timeout` seconds to bind after it prints
+    its URL."""
+    deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         try:
             with urllib.request.urlopen(url, timeout=1.0):
-                return True
+                return
         except urllib.error.HTTPError:
-            return True                  # server is up; 4xx is still a server
+            return                       # server is up; 4xx is still a server
         except Exception:
             time.sleep(0.15)
-    return False
 
 
 def _page_text(page) -> str:
@@ -303,25 +284,11 @@ def run(url: str, *, actions: str = "", wait: float = 3.0, out=None,
 def _raced_eval(expr: str, timeout_s: int) -> str:
     """Wrap a model-authored eval in an in-page race against a timer.
 
-    page.evaluate() has NO timeout: page.set_default_timeout() covers
-    actions like goto/click/fill but never evaluate, so a Promise that
-    never settles makes it wait forever. Run 13c hung for over an hour on
-    the canonical forced-state measurement -- a `new Promise(res =>
-    ...double-rAF pixel rescan...)` whose rAF callback threw on the
-    hand-forced state object; the Promise stayed pending, evaluate kept
-    waiting, the whole loop stalled with no log line, and the LLM server
-    idle-unloaded the model because no request was in flight anymore.
-    Racing inside the page preserves the completion-value semantics (a
-    direct eval of the source string, exactly what CDP does today),
-    adopts a returned Promise, calls a bare function shape the way
-    Playwright itself would, and turns a never-settling eval into a
-    bounded rejection that the action loop reports as an action error.
-
-    Known residual gap: an eval that blocks the page's main thread
-    SYNCHRONOUSLY (while(true)) starves the race timer too; that shape
-    was never observed in 13 runs of the game testbed, and a Python-side
-    watchdog risks new hangs inside Playwright's greenlet machinery, so
-    it is deliberately not attempted here.
+    page.evaluate() has no timeout, so a Promise that never settles would hang
+    the whole loop. Racing inside the page keeps the completion-value
+    semantics, adopts a returned Promise, calls a bare function result, and
+    turns a never-settling eval into a rejection reported as an action error.
+    A synchronous infinite loop still starves the timer (not handled).
     """
     ms = max(1, int(timeout_s)) * 1000
     src = json.dumps(expr)
@@ -336,17 +303,11 @@ def _raced_eval(expr: str, timeout_s: int) -> str:
 def _unclosed_brackets(expr: str) -> str:
     """Describe the brackets still open at the end of a JS expression.
 
-    V8 reports an unclosed construct as a bare "Unexpected end of input"
-    with NO position, so a model staring at a 1,000+ char measurement
-    eval has no way to find which level failed to close (run 13d: the
-    IIFE's own `{`, one `}` missing near the tail, five identical
-    retries). This small scanner tracks (), [] and {} outside strings
-    and comments and names the openers still on the stack at end of
-    input, each with its position and context. Regex literals are not
-    distinguished from division -- a bracket inside /.../ could be
-    miscounted -- which is acceptable because the hint is only attached
-    to an eval that ALREADY failed to parse; it never gates a healthy
-    one.
+    V8 reports an unclosed construct as a bare "Unexpected end of input" with
+    no position. This scanner tracks (), [] and {} outside strings and
+    comments and names the openers left on the stack, with position and
+    context. Regex literals are not distinguished from division, which is fine
+    since the hint is only attached to an eval that already failed to parse.
     """
     stack: list[tuple[str, int]] = []
     pairs = {")": "(", "]": "[", "}": "{"}
@@ -399,14 +360,9 @@ def _unclosed_brackets(expr: str) -> str:
 
 
 def _eval_syntax_error(arg: str, msg: str) -> str:
-    """Build the action-error entry for an eval that failed to parse.
-
-    Three parts, all run-13d lessons: the length that arrived (the
-    model's truncation misdiagnosis came from a 60-char clipped arg
-    echo), the bracket report V8 never gives, and the source tail --
-    for "Unexpected end of input" the crime scene is at the END, and a
-    head echo never shows it.
-    """
+    """Action-error text for an eval that failed to parse: the length received
+    (so the model does not blame truncation), the bracket report V8 omits, and
+    the source tail where a missing closer belongs."""
     first = msg.split("\n", 1)[0].strip()[:120]
     text = (f"eval SYNTAX ERROR -- {first} -- the tool received all "
             f"{len(arg)} chars of the source intact; nothing was "
@@ -472,62 +428,19 @@ def _run_playwright(url: str, *, actions: str, wait: float, out,
                                 low2 = msg.lower()
                                 if ("content security policy" in low2
                                         or "refused to evaluate" in low2):
-                                    # A strict-CSP page forbids the in-page
-                                    # eval() the race wrapper needs; CDP's
-                                    # own evaluate is the only CSP-immune
-                                    # path. Fall back to it UNBOUNDED: a
-                                    # CSP-hardened origin is not the
-                                    # local-app case this tool exists for,
-                                    # and refusing the eval entirely helps
-                                    # nobody.
+                                    # A strict CSP forbids the in-page
+                                    # eval() the race needs; fall back to the
+                                    # CSP-immune, unbounded CDP evaluate.
                                     value = page.evaluate(arg)
                                 elif "syntaxerror" in low2:
-                                    # Bug ZB (run 13d): the model's
-                                    # 1,174-char measurement eval was one
-                                    # `}` short -- its IIFE body never
-                                    # closed. V8 said only "Unexpected end
-                                    # of input" (no position), the stack's
-                                    # `:1:44` columns pointed at the eval
-                                    # CALL SITES inside Playwright's own
-                                    # machinery, and the 60-char head echo
-                                    # of the arg read like tool-side
-                                    # truncation: the model re-sent the
-                                    # same broken tail five times, then
-                                    # wrote a FAILED verdict blaming the
-                                    # harness for cutting its string. A
-                                    # parse failure now reports the length
-                                    # that arrived intact, which brackets
-                                    # never closed (with positions and
-                                    # context), and the tail where the
-                                    # missing closer belongs -- an error a
-                                    # model can FIX instead of one it
-                                    # argues with.
                                     action_errors.append(
                                         _eval_syntax_error(arg, msg))
                                     continue
                                 else:
                                     raise
-                            # 2000: run 11's JSON.stringify state dumps lost
-                            # their tail fields to the old 120-char clip, and
-                            # 240 was that era's answer -- but run 13e's spec
-                            # checks resolve per-row pixel profiles (~1-2k
-                            # chars), and at 240 EVERY one of them reached the
-                            # model decapitated ("the live eval output was
-                            # truncated before returning whiteTop and
-                            # blackBelow"): five checks retired as failed on
-                            # measurements that had SUCCEEDED. Mirror the
-                            # pattern cap: an eval may return as much as it
-                            # may receive. The gather budget still caps the
-                            # session total with its own explicit marker, and
-                            # the schema description teaches aggregation for
-                            # anything larger.
                             action_log.append(
                                 f"eval'd {arg[:60]} -> {str(value)[:2000]}")
                     except Exception as e:
-                        # 60: run 13c's ~1,100-char measurement eval would
-                        # otherwise flood the observation and bury the
-                        # actual error text -- the part the model must
-                        # react to (the action log already clips at 60).
                         action_errors.append(
                             f"{kind} {str(arg)[:60]}: {str(e)[:160]}")
 
@@ -551,7 +464,7 @@ def _run_playwright(url: str, *, actions: str, wait: float, out,
         msg = str(e)
         hint = ""
         low = msg.lower()
-        if "executable doesn't exist" in low or "browserType.launch" in low:
+        if "executable doesn't exist" in low or "browsertype.launch" in low:
             hint = ("\nPlaywright is installed but Chromium is not. Run:\n"
                     "  python -m playwright install chromium")
         return False, f"browser launch failed: {msg[:400]}{hint}"
@@ -563,8 +476,7 @@ def _run_chrome(exe: str, url: str, *, wait: float, out,
         return False, "the Chrome fallback needs an output screenshot path"
     budget = max(1000, int(float(wait or 0) * 1000) + 3000)
     detail = ""
-    # Chrome 109+ prefers --headless=new; older builds only understand
-    # --headless. Try both before declaring the fallback unavailable.
+    # Chrome 109+ prefers --headless=new; older builds only know --headless.
     for mode in ("--headless=new", "--headless"):
         cmd = [
             exe, mode, "--disable-gpu", "--hide-scrollbars",

@@ -9,24 +9,19 @@ Usage
     reply = agent.answer(task, gathered)
     results, reply = agent.apply(reply, dry_run=True, task=task, gathered=gathered)
 
-Phase 1 (gather): the model picks tools under a JSON grammar (see tools.py).
-Constrained decoding here means tool calls never need freeform-text parsing.
-There is no default step limit: max_steps = 0 (the default) lets the loop run
-until the model says `done` or the gathered-source token budget is exhausted.
-When the model says `done` but files the task names were never read, one
-coverage nudge asks it to read them (repeated only after real progress), so a
-small model does not enter an answer phase that can only fail. A positive
-max_steps is an explicit hard user limit.
+Phase 1 (gather): the model picks tools under a JSON grammar (see tools.py), so
+tool calls never need freeform-text parsing. max_steps = 0 (the default) runs
+until the model says `done` or the gathered-source budget is exhausted; a
+positive max_steps is a hard limit. When the model says `done` but files the
+task names were never read, one nudge asks it to read them (repeated only
+after real progress).
 
-Phase 2 (answer): free text, no grammar. Code must NOT be forced through a
-JSON string field, since escaping newlines and quotes measurably degrades
-small-model output quality. So the edit format is fenced search/replace
-blocks instead (see edits.py).
+Phase 2 (answer): free text, no grammar. Code is not forced through a JSON
+string field because escaping degrades small-model output; edits are fenced
+search/replace blocks instead (see edits.py).
 
-Prompt layout is deliberate: the system message and repo map come first and
-never change within a gather loop, so llama.cpp's prefix cache hits on every
-turn and only the new observation has to be processed, not the whole map
-again.
+The system message and repo map come first and stay constant within a gather
+loop, so the server's prefix cache hits on every turn.
 """
 
 from __future__ import annotations
@@ -34,143 +29,118 @@ from __future__ import annotations
 import re
 import sys
 
-from .edits import apply_edits, parse_edits
+from . import diagnostics as diagnostics_mod
+from . import fileio
+from . import instructions as instructions_mod
+from . import mcp as mcp_mod
+from . import todo as todo_mod
+from .config import is_hosted
+from .edits import Result, apply_edits, locate, parse_edits
 from .llm import LLMError, estimate_tokens
 from .tools import TOOL_HELP, dispatch, schema_for
-from . import instructions as instructions_mod
-from . import todo as todo_mod
-from . import mcp as mcp_mod
 
-# How many times the gather loop re-asks after a step reply dies at the
-# output cap / produces no salvageable JSON, before giving up and answering
-# from what was gathered. Each recovery costs one API call but keeps paid
-# lookups alive; two is enough for a model that rambles once in a while and
-# small enough that a persistently broken server cannot bill forever.
+# Re-asks after a gather step reply dies at the output cap or has no salvageable
+# JSON, before giving up and answering from what was gathered.
 _MAX_GATHER_RECOVERIES = 2
 
-# A re-read of a range that added no new source is navigation churn, not
-# progress. Small models can lock onto one range and emit it dozens of times
-# (each echo also keeps the bad pattern in context). One duplicate gets a
-# compact "already read" observation; after this many consecutive duplicates
-# the gather phase stops and lets the answer phase use the source it already
-# collected.
+# Consecutive re-reads that add no new source before gather stops (one duplicate
+# only gets a compact "already read" observation).
 _MAX_DUPLICATE_READS = 2
 
-# A step that fails (bad path, bad range, disabled action) is navigation
-# feedback, not source. A model that keeps retrying the SAME broken step must
-# not be allowed to spin forever: with max_steps = 0 (the default) the only
-# other bound is the gathered-source budget, and error observations used to
-# skip that charge entirely. Four consecutive failures is enough for a model
-# to correct itself; the same exact step three times means it is stuck.
+# Failed steps (bad path, bad range, disabled action) are charged to the budget;
+# a streak of errors or the same exact step repeated ends the gather phase.
 _MAX_CONSECUTIVE_ERRORS = 4
 _MAX_REPEATED_STEPS = 3
 
-# Read-only steps whose result cannot change while the previous step is the
-# identical call: re-running them just burns a tool pass and re-injects the
-# same text into the conversation. `read` has its own duplicate-range guard;
-# these are the navigation steps the graveyard run looped on (grep X, grep X,
-# grep X, then outline main.js three times).
-_DEDUP_STEP_ACTIONS = {"grep", "outline", "callers", "sessions", "diff",
-                       "diagnose"}
+# Read-only steps whose result cannot change when the previous step is the
+# identical call. `read` has its own duplicate-range guard.
+_DEDUP_STEP_ACTIONS = {"grep", "find", "outline", "callers", "sessions",
+                       "diff", "diagnose"}
 
-# Cut-off payloads discarded before gather gives up and lets the answer
-# phase report the blocker (Bug W, run 13): two discards with actionable
-# "minify or split" feedback are enough -- a third means the model cannot
-# shrink its payload, and looping just burns steps.
+# Steps discarded for a cut-off payload before gather gives up.
 _MAX_PAYLOAD_CUTS = 2
 
 
 def _step_signature(step: dict) -> tuple:
-    """Identity of a gather step for repetition detection.
-
-    `reasoning` is deliberately excluded: small models often re-emit the same
-    action with a slightly different note, which is still the same loop.
-    """
+    """Identity of a gather step for repetition detection. `reasoning` is
+    excluded: the same action with a reworded note is still the same loop."""
     return tuple(sorted(
         (k, str(v)) for k, v in (step or {}).items()
         if k != "reasoning"))
 
 
 def _norm_key(path: str) -> str:
-    """Normalise a read-ledger path exactly once, everywhere.
-
-    The ledger, the duplicate-read eviction pass, and coverage all need the
-    same key: models alternate between `pkg/a.py` and `./pkg/a.py`, and a
-    mismatch silently disables both dedup and coverage.
-    """
+    """Normalise a read-ledger path. Models alternate between `pkg/a.py` and
+    `./pkg/a.py`; the ledger, eviction pass and coverage must share one key."""
     return (path or "").strip().lower().lstrip("./")
 
-# The answer prompt tells the model it may split a multi-file task across
-# turns ("say what remains; the next turn continues"). A cleanly-finished
-# reply that says more work is coming must actually trigger a next turn --
-# otherwise a multi-file task silently stops at the first batch. This regex
-# spots the deferral language; a false positive costs one "NOTHING MORE"
-# round-trip, a false negative leaves the task half done.
+
+# Spots deferral language ("the next turn continues") in a cleanly finished
+# reply so it triggers another answer turn; a false positive costs one
+# "NOTHING MORE" round-trip.
 _MORE_TO_DO_RE = re.compile(
     r"next turn|will follow|following turn|still to do|left to do|"
     r"remaining after|remaining work|remains to|to be done|not yet done",
     re.IGNORECASE,
 )
-# Matches the first line of a successful tool_read observation:
-#   "prep/index.html lines 315-325:"
-# Used for the read-span ledger and the eviction pass below. The path may
-# contain spaces; the numbers never do, so the regex is unambiguous.
-import re as _re_mod
+# First line of a successful tool_read observation: "prep/index.html lines 315-325:".
+_READ_HEAD_RX = re.compile(r"^(.+?) lines (\d+)-(\d+):")
+# A numbered source line in a read observation: "  42 | text".
+_NUMBERED_LINE_RX = re.compile(r"\s*(\d+) \|")
+_FILE_TOKEN_RX = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_./\-]*")
+_FILE_EXT_RX = re.compile(r"\.[A-Za-z][A-Za-z0-9]{0,7}$")
 
-_READ_HEAD_RX = _re_mod.compile(r"^(.+?) lines (\d+)-(\d+):")
+
+def _subtract_spans(uncovered: list[tuple[int, int]],
+                    covered: list[tuple[int, int]]) -> list[tuple[int, int]]:
+    """Remove every `covered` (start, end) span from the `uncovered` spans."""
+    for a, b in covered:
+        nxt = []
+        for cs, ce in uncovered:
+            if b < cs or a > ce:
+                nxt.append((cs, ce))
+                continue
+            if cs < a:
+                nxt.append((cs, a - 1))
+            if ce > b:
+                nxt.append((b + 1, ce))
+        uncovered = nxt
+    return uncovered
 
 
 def _first_seen_spans(spans_by_file: dict[str, list[tuple[int, int]]]
                       ) -> dict[str, list[tuple[int, int]]]:
     """Replay each file's read spans in step order and return, per file, the
-    set of (start, end) sub-spans that were NEW when they were first shown."""
+    (start, end) sub-spans that were NEW when they were first shown."""
     out: dict[str, list[tuple[int, int]]] = {}
     for key, seq in spans_by_file.items():
         seen: list[tuple[int, int]] = []
         deltas: list[tuple[int, int]] = []
         for s, e in seq:
-            # Lines already covered by earlier reads of this file.
-            uncovered = [(s, e)]
-            for a, b in seen:
-                nxt = []
-                for cs, ce in uncovered:
-                    if b < cs or a > ce:          # no overlap
-                        nxt.append((cs, ce))
-                        continue
-                    if cs < a:
-                        nxt.append((cs, a - 1))
-                    if ce > b:
-                        nxt.append((b + 1, ce))
-                uncovered = nxt
-            for cs, ce in uncovered:
-                deltas.append((cs, ce))
-            merged = sorted(seen + [(s, e)])
-            folded: list[tuple[int, int]] = []
-            for a, b in merged:
-                if folded and a <= folded[-1][1] + 1:
-                    folded[-1] = (folded[-1][0], max(folded[-1][1], b))
-                else:
-                    folded.append((a, b))
-            seen = folded
+            deltas.extend(_subtract_spans([(s, e)], seen))
+            seen = _fold_spans(seen + [(s, e)])
         if deltas:
             out[key] = deltas
     return out
 
 
+def _split_read_obs(obs: str) -> tuple[str, str]:
+    """Split a read observation into (header line, body)."""
+    head_end = obs.index("\n") if "\n" in obs else len(obs)
+    return obs[:head_end], obs[head_end + 1:]
+
+
 def _slice_numbered(obs: str, keep: list[tuple[int, int]]) -> str:
-    """Given a tool_read observation ("rel lines a-b:\\nNNN | text..."),
-    return the same observation narrowed to the numbered lines whose numbers
-    fall inside `keep` spans. Falls back to the original text if anything
-    about the format is unexpected -- correctness of the header matters more
-    than savings here."""
+    """Narrow a tool_read observation ("rel lines a-b:\\nNNN | text...") to the
+    numbered lines inside `keep` spans. Returns the original text if the format
+    is unexpected."""
     m = _READ_HEAD_RX.match(obs)
     if not m:
         return obs
-    head_end = obs.index("\n") if "\n" in obs else len(obs)
-    head, body = obs[:head_end], obs[head_end + 1:]
+    head, body = _split_read_obs(obs)
     kept: list[str] = []
     for ln in body.split("\n"):
-        pm = _re_mod.match(r"\s*(\d+) \|", ln)
+        pm = _NUMBERED_LINE_RX.match(ln)
         if not pm:
             kept.append(ln)     # trailing note lines ([truncated...] etc.)
             continue
@@ -183,17 +153,14 @@ def _slice_numbered(obs: str, keep: list[tuple[int, int]]) -> str:
 
 
 def _delta_len(obs: str, prior_spans: list[tuple[int, int]]) -> int:
-    """Length of the NEW part of a read observation: the numbered lines not
-    already covered by `prior_spans`. Used to charge max_gathered_chars per
-    new byte, so re-reads of the same region cost nothing."""
-    m = _READ_HEAD_RX.match(obs)
-    if not m:
+    """Length of the NEW part of a read observation: the lines not covered by
+    `prior_spans`. Used to charge max_gathered_chars per new byte."""
+    if not _READ_HEAD_RX.match(obs):
         return len(obs)
-    head_end = obs.index("\n") if "\n" in obs else len(obs)
-    body = obs[head_end + 1:]
+    _, body = _split_read_obs(obs)
     total = 0
     for ln in body.split("\n"):
-        pm = _re_mod.match(r"\s*(\d+) \|", ln)
+        pm = _NUMBERED_LINE_RX.match(ln)
         if not pm or not any(a <= int(pm.group(1)) <= b for a, b in prior_spans):
             total += len(ln) + 1
     return total
@@ -202,18 +169,15 @@ def _delta_len(obs: str, prior_spans: list[tuple[int, int]]) -> int:
 def _read_has_new_lines(obs: str, prior_spans: list[tuple[int, int]]) -> bool:
     """True when a read observation contains source lines not in `prior_spans`.
 
-    Separate from `_delta_len` because trailing notes ("[truncated ...]",
-    symbol-resolution notes) are real tokens but are NOT new source. Counting
-    them as progress would let an identical truncated re-read evade the
-    duplicate-read guard forever.
+    Separate from `_delta_len`: trailing notes ("[truncated ...]") are tokens
+    but not new source, and counting them would let an identical truncated
+    re-read evade the duplicate-read guard.
     """
-    m = _READ_HEAD_RX.match(obs)
-    if not m:
+    if not _READ_HEAD_RX.match(obs):
         return True
-    head_end = obs.index("\n") if "\n" in obs else len(obs)
-    body = obs[head_end + 1:]
+    _, body = _split_read_obs(obs)
     for ln in body.split("\n"):
-        pm = _re_mod.match(r"\s*(\d+) \|", ln)
+        pm = _NUMBERED_LINE_RX.match(ln)
         if pm and not any(a <= int(pm.group(1)) <= b for a, b in prior_spans):
             return True
     return False
@@ -223,23 +187,16 @@ def _evict_duplicate_reads(messages: list[dict], gathered: list[str],
                            spans: dict[str, list[tuple[int, int]]]) -> list[str]:
     """Rewrite duplicate source out of the conversation and the SOURCE block.
 
-    A small model covering a big file re-reads it in overlapping chunks
-    (L1-685 then L401-685), and every RESULT turn carried its full text. By
-    the time gathering ends the live conversation holds several copies of
-    the same lines -- which blows the *server's* context window even when
-    our own budget math says there is room, and makes the answer phase
-    process the same code two or three times.
-
-    Each read's RESULT turn is rewritten down to the lines it was the FIRST
-    to show (earlier turns keep theirs; later turns lose the overlap). The
-    gathered SOURCE items are rebuilt from the same deltas so the answer
-    prompt sees every line exactly once. Returns the new item list.
+    Overlapping re-reads (L1-685 then L401-685) leave several copies of the
+    same lines in the live conversation, which can overflow the server's
+    window. Each read's RESULT turn is cut down to the lines it was the first
+    to show, and the gathered SOURCE items are rebuilt from the same deltas so
+    the answer prompt sees every line once. Returns the new item list.
     """
     if not spans or not any(len(seq) > 1 for seq in spans.values()):
         return gathered
     deltas = _first_seen_spans(spans)
 
-    # Rebuild the SOURCE items: reads keep only their first-seen lines.
     new_items: list[str] = []
     for g in gathered:
         head = g.split("\n", 1)[0]
@@ -255,32 +212,18 @@ def _evict_duplicate_reads(messages: list[dict], gathered: list[str],
         else:
             new_items.append(g)
 
-    # Rewrite RESULT turns in the live conversation, oldest -> newest, so
-    # each turn keeps only the lines no earlier turn had already shown.
+    # Oldest -> newest, so each turn keeps only lines no earlier turn showed.
     for i, msg in enumerate(messages):
         if msg["role"] != "user" or not msg["content"].startswith("RESULT:\n"):
             continue
-        content = msg["content"]
-        body = content[len("RESULT:\n"):]
+        body = msg["content"][len("RESULT:\n"):]
         m = _READ_HEAD_RX.match(body)
         if not m:
             continue
         key = _norm_key(m.group(1))
         s_, e_ = int(m.group(2)), int(m.group(3))
-        # Spans of this same file shown by EARLIER turns only.
         prior = _fold_spans(_turn_spans(messages[:i], key))
-        uncovered = [(s_, e_)]
-        for a, b in prior:
-            nxt = []
-            for cs, ce in uncovered:
-                if b < cs or a > ce:
-                    nxt.append((cs, ce))
-                    continue
-                if cs < a:
-                    nxt.append((cs, a - 1))
-                if ce > b:
-                    nxt.append((b + 1, ce))
-            uncovered = nxt
+        uncovered = _subtract_spans([(s_, e_)], prior)
         if uncovered == [(s_, e_)]:
             continue          # this turn showed nothing that came before it
         trimmed = _slice_numbered(body, uncovered) if uncovered else \
@@ -333,6 +276,9 @@ Rules:
 - `grep` accepts a file, directory, or glob in `file`, and its hits name the
   enclosing symbol. A pattern that is not valid regex is searched as literal
   text, and a case-sensitive miss is retried case-insensitively.
+- `find` searches the index's definitions by NAME, SIGNATURE, or SUMMARY --
+  use it when you know roughly what something is called or what it does, but
+  not where it lives. No regex; its hits carry exact line ranges to `read`.
 - `outline` also accepts a directory or glob: it lists the file cards under
   it. Use that to descend when the map shows directories instead of files.
 - `callers` shows the definition, what it calls, and the call-site lines of
@@ -409,12 +355,12 @@ Rules:
 - Fill every field. Use "" for unused strings and 0 for unused numbers.
 - Keep `reasoning` under 15 words. It is a note to yourself, not a plan."""
 
-# The project is small enough that every unit is already listed.
+# Map tier hints: every unit listed.
 FLAT_HINT = """
 The map below lists every function and class in the project with its line range.
 Go straight to `read` for the ones you need."""
 
-# The project is too big for a full map; the model must descend a level.
+# One card per file.
 CARDS_HINT = """
 The map below is one card per FILE, not per function. Each card names the file's
 top-level definitions with their line ranges, but not their bodies or their
@@ -429,8 +375,7 @@ How to navigate it:
 - Never invent a line range. If a range is not in the map or an outline you have
   already run, you do not know it yet."""
 
-# The project is too big even for file cards; the map is one card per
-# directory and the model descends two levels (dir -> file cards -> units).
+# One card per directory.
 DIRS_HINT = """
 The map below is one card per DIRECTORY, not per file: this project is too big
 to list its files up front. Each card names some of the directory's files.
@@ -443,11 +388,8 @@ How to navigate it:
   line, and enclosing symbol.
 - Never invent a line range: use one from a card or an outline you have run."""
 
-# The search/replace edit format, shared by every answer brief. Custom system
-# prompts (scaffold stubs, resume) override the ROLE of the answer but must
-# always carry this exact format spec, or a small model invents its own --
-# markdown fences, a bare filename, `search/replace` tags -- and the parser
-# finds nothing ("no edit blocks in the reply").
+# The search/replace edit format shared by every answer brief; custom system
+# prompts must carry it so the model does not invent its own format.
 EDIT_FORMAT = """\
 If the task requires changing code, output edits as search/replace blocks in
 exactly this format, and nothing else around them:
@@ -471,6 +413,13 @@ Rules for edits:
   only, for source you have already seen. If you lack a file you need, work
   with what you have and note what you could not verify.
 - Include enough surrounding lines that the SEARCH text appears only once.
+- Instead of quoting old text, a block's FILE header may carry an anchor:
+  `--- FILE: path.py LINES 40-60` (a 1-based inclusive line range, copied
+  from what you read) or `--- FILE: path.py SYMBOL Class.method` (exactly one
+  definition of that file). For an anchored block leave SEARCH EMPTY and put
+  the FULL replacement text for that range in REPLACE; an empty REPLACE
+  deletes the range. Prefer an anchor when quoting the old text exactly is
+  risky, and widen a LINES range until it covers whole statements.
 - Keep each block small and local. Use several blocks rather than one large one.
 - A single reply must stay short enough to finish: emit at most a few blocks
   per reply, never a whole large file in one REPLACE/SEARCH section. If the
@@ -507,13 +456,13 @@ source you asked to see. Complete the user's task.
 
 
 def _compact_result_marker(content: str) -> str:
-    """A one-line reminder of a RESULT turn that is about to be dropped.
-
-    Extractive, not an LLM summary: it keeps the tool/header line so the model
-    still knows what it already looked at, without re-injecting source. If it
-    does not bring the conversation under the window, the next eviction pass
-    drops the marker too.
-    """
+    """A one-line extractive reminder of a RESULT turn about to be dropped:
+    a read compacts to a `read rel:a-b` stub; anything else keeps its
+    tool/header line without the source."""
+    m = _READ_HEAD_RX.match((content or "")[len("RESULT:\n"):])
+    if m:
+        return ("RESULT:\n[compacted earlier lookup: read "
+                f"{m.group(1).strip()}:{m.group(2)}-{m.group(3)}]")
     body = [ln.strip() for ln in (content or "").splitlines()[1:]
             if ln.strip()]
     if not body:
@@ -528,27 +477,23 @@ def _compact_result_marker(content: str) -> str:
 def _evict_overflow_turns(messages: list[dict], client, cfg) -> bool:
     """Shrink the live conversation until it fits the server's window.
 
-    Returns True if anything was dropped. Drops the OLDEST RESULT turns
-    first (their source is already collected in `gathered` and reaches the
-    answer phase anyway); a lone huge turn is clipped line-by-line, keeping
-    its head -- which preserves the file/line header the coverage ledger
-    parses. Never touches the map+task message or the assistant turns.
+    Returns True if anything was dropped. Drops the OLDEST RESULT turns first
+    (their source is already in `gathered`); a lone huge turn is clipped
+    line-by-line, keeping its head so the file/line header survives. Never
+    touches the map+task message or assistant turns.
 
-    Trimming runs with hysteresis: once over the edge, turns are dropped
-    until the conversation sits a headroom's worth of tokens BELOW it, not
-    exactly at it. Each rewrite invalidates the server's prompt-prefix cache
-    from that turn onward, so without headroom a run hovering at the window
-    edge re-trims (and re-pays the prefill) on every single observation.
+    Trimming has hysteresis: it stops a headroom's worth of tokens BELOW the
+    window, because each rewrite invalidates the server's prompt-prefix cache
+    from that turn onward.
     """
-    import sys as _sys
-    from .llm import estimate_tokens
-
     room = max(cfg.context_tokens - cfg.max_tokens_step
                - cfg.reserve_tokens // 2, 512)
     headroom = max(256, room // 10)
+    # A client whose tokenizer was calibrated measures instead of guessing.
+    est = getattr(client, "estimate_tokens", None) or estimate_tokens
 
     def over_by() -> int:
-        return sum(estimate_tokens(m["content"]) for m in messages) - room
+        return sum(est(m["content"]) for m in messages) - room
 
     changed_any = False
     while over_by() > -headroom:
@@ -557,11 +502,8 @@ def _evict_overflow_turns(messages: list[dict], client, cfg) -> bool:
         if not idxs:
             break
         if over_by() <= 0:
-            # Still UNDER the window -- trimming here is only cache
-            # amortisation, so it must never cost the newest observation
-            # (the model's next decision depends on seeing it). Once the
-            # conversation is actually over the window (over_by() > 0),
-            # every RESULT turn is fair game, newest included.
+            # Under the window: trimming is only cache amortisation, so never
+            # cost the newest observation.
             if len(idxs) < 2:
                 break
             idxs = idxs[:-1]
@@ -571,16 +513,13 @@ def _evict_overflow_turns(messages: list[dict], client, cfg) -> bool:
         if len(lines) > 6:
             keep = max(4, len(lines) // 2)
             clipped = "\n".join(
-                lines[:keep] + ["[older read dropped to fit the model's "
-                                "context window; re-`read` it if you need "
-                                "the rest]", "", ""] + lines[-2:])
-            # A short turn can reach a fixed point: for 8-10 lines the
-            # head+tail rewrite is the same size (or larger) than the
-            # original, so re-clipping it forever never gets under the
-            # window. Only rewrite when it actually saves tokens; otherwise
-            # fall through and drop the turn entirely so this loop always
-            # makes progress.
-            if estimate_tokens(clipped) < estimate_tokens(content):
+                lines[:keep] + [("[older read dropped to fit the model's "
+                                 "context window; re-`read` it if you need "
+                                 "the rest]"), "", ""] + lines[-2:])
+            # For 8-10 lines the clip can be as large as the original; only
+            # rewrite when it saves tokens, else drop the turn so the loop
+            # always makes progress.
+            if est(clipped) < est(content):
                 messages[i] = {"role": "user", "content": clipped}
             else:
                 lines = []      # force the removal path below
@@ -589,15 +528,14 @@ def _evict_overflow_turns(messages: list[dict], client, cfg) -> bool:
             if not content_now.startswith(
                     "RESULT:\n[compacted earlier lookup:"):
                 marker = _compact_result_marker(content_now)
-                if marker and estimate_tokens(marker) < estimate_tokens(content_now):
-                    # Keep a one-line reminder instead of silently dropping
-                    # what the model already looked at. If this still leaves
-                    # the prompt over budget, the next pass drops the marker.
+                if marker and est(marker) < est(content_now):
+                    # If this still leaves the prompt over budget, the next
+                    # pass drops the marker.
                     messages[i] = {"role": "user", "content": marker}
                     changed_any = True
                     continue
-            # Drop the RESULT and the assistant turn immediately before it so
-            # the remaining system/user/assistant sequence stays alternating.
+            # Drop the RESULT and its paired assistant turn so the sequence
+            # stays alternating.
             drop = {i}
             if i > 0 and messages[i - 1]["role"] == "assistant":
                 drop.add(i - 1)
@@ -607,72 +545,53 @@ def _evict_overflow_turns(messages: list[dict], client, cfg) -> bool:
         changed_any = True
     if changed_any:
         print("[conversation trimmed to fit the model's context window]",
-              file=_sys.stderr)
+              file=sys.stderr)
     return changed_any
 
 
 class Agent:
-    """Runs one task against an Index and an LM Studio client: gather source,
+    """Runs one task against an Index and a model client: gather source,
     generate an answer or edits, and apply those edits."""
 
     def __init__(self, index, client, cfg):
-        """Bind the agent to a project Index, an LMStudio client, and a Config."""
+        """Bind the agent to a project Index, an LLMClient, and a Config."""
         self.index = index
         self.client = client
         self.cfg = cfg
-        # Set by gather(); read by _repair_source() when a failed file is no
-        # longer on disk. Initialised here so apply() works even if it is
-        # called without a preceding gather().
+        # Set by gather(); _repair_source() falls back to it for files no
+        # longer on disk.
         self.gathered_source = ""
-        # Optional override for the forced-read coverage check: when set,
-        # gather() mines "files the task will change" from THIS text (the
-        # clean plan title) instead of the full assembled prompt. Callers
-        # that append goal prose and prior investigation reports to the task
-        # text set this, because report prose -- even an explicit "do NOT
-        # change snake_spawner.py yet" list -- otherwise becomes a forced
-        # must-read list and buries the step budget in irrelevant files.
+        # When set, gather() mines "files the task will change" from this text
+        # (the clean plan title) instead of the full prompt, so goal prose and
+        # prior reports do not become forced must-reads.
         self.task_targets: str | None = None
 
     # ------------------------------------------------------------------ phase 1
     def gather(self, task: str, verbose: bool = True,
                on_step=None, base: str | None = None,
                backup_dir=None) -> str:
-        """Run the tool-calling loop: repeatedly ask the model to choose an
-        action (read/grep/callers/outline/write/append/done) until it says
-        `done`, the gathered-source token budget is exhausted, or an explicit
-        cfg.max_steps limit is reached. `max_steps = 0` means no step limit
-        (the default); only the token/context budgets bound the loop.
+        """Run the tool-calling loop until the model says `done`, the
+        gathered-source budget is exhausted, or cfg.max_steps (0 = no limit)
+        is reached.
 
-        Returns the concatenated text of everything read, ready to hand to
-        `answer()`. Also sets `self.read_any` (whether any `read` succeeded)
-        and `self.steps_log` (a human-readable record of each step, used for
-        the session log).
+        Returns the concatenated text of everything read, ready for `answer()`.
+        Also sets `self.read_any` (whether any `read` succeeded) and
+        `self.steps_log` (one line per step, used for the session log).
 
         `on_step`, when given, is called with the step number after every
-        completed step (including the final `done`). The GUI passes a
-        callback here so the browser can show live progress; CLI callers
-        leave it None and see no difference.
+        completed step (the GUI uses it for live progress).
 
-        `base`, when given, replaces `GATHER_BASE` as the system prompt's
-        preamble (the FLAT/CARDS navigation hints are still appended). The
-        `explain` flow uses this to frame gathering as answering a question
-        rather than as preparing an edit.
+        `base` replaces `GATHER_BASE` as the system prompt preamble (the map
+        tier hints are still appended); `explain` uses it.
 
-        `backup_dir`, when given, is where gather-phase `write`/`append`/
-        `move`/`delete` snapshots go (the same run directory the answer
-        phase uses). When it is None the snapshot helper makes its own
-        directory under `.pedacito/backups/`; it never drops `.bak` files in
-        the source tree.
+        `backup_dir` is where gather-phase write/append/move/delete snapshots
+        go; when None the snapshot helper makes its own directory under
+        `.pedacito/backups/`.
 
-        `self.task_targets`, when set before the call, replaces `task` as the
-        text mined for the forced-read coverage check ("files the task will
-        change"). The auto loop sets it to the clean plan title so file names
-        mentioned descriptively in goal prose or prior reports do not become
-        must-reads.
+        `self.task_targets`, when set, replaces `task` as the text mined for
+        the forced-read coverage check.
         """
-        # Clear any backup directory left by a previous task before this one
-        # starts: gathering is a fresh run, and a stale path would mix its
-        # snapshots into an older batch.
+        # A fresh run: drop any backup directory left by a previous task.
         self.cfg._backup_dir = backup_dir
         repo_map, tier = self.index.map_for_prompt(self.cfg)
         system = (base if base is not None else GATHER_BASE) + \
@@ -693,50 +612,36 @@ class Agent:
         if verbose:
             print(f"  [map: {tier}, ~{estimate_tokens(repo_map)} tokens, "
                   f"{len(self.index.files)} files]", file=sys.stderr)
-        base = [
+        messages = [
             {"role": "system", "content": system},
             {"role": "user", "content": f"PROJECT MAP\n\n{repo_map}\n\nTASK\n{task}"},
         ]
-        messages = list(base)
         gathered: list[str] = []
         self.steps_log: list[str] = []
         did_read = False
         read_nudged = False
-        # Successful reads only, as (rel_lower, start, end). Coverage checks
-        # must count ONLY real source the model saw -- a grep hit or an ERROR
-        # line does not let it quote the file, and counting those as coverage
-        # is how a task ends with "answered without proposing any edits".
-        self._read_spans: dict[str, list[tuple[int, int]]] = {}
-        # 0 = no step limit: the gathered-source/token budgets are the only
-        # bound. A positive max_steps is an explicit, hard user limit. The
-        # done-coverage nudges below are progress checks, not a step budget.
+        # Successful reads only, per normalised file as (start, end) spans in
+        # step order. Coverage counts only real source the model saw, not grep
+        # hits or ERROR lines; the eviction pass replays it to find which
+        # lines each RESULT turn was first to show.
+        spans: dict[str, list[tuple[int, int]]] = {}
+        self._read_spans = spans
         step_cap = max(0, int(getattr(self.cfg, "max_steps", 0) or 0))
         unlimited = step_cap <= 0
-        # Files the task text names but no `read` has covered yet; refreshed
-        # after every successful read so the `done` nudge can act on it.
-        # Mined from `task_targets` (the clean title) when the caller set it:
-        # the full prompt carries goal prose and prior reports whose file
-        # mentions -- even "do NOT change X yet" -- are description, not
-        # edit intent, and forcing reads of them wastes steps and context.
+        # Files the task text names but no `read` has covered yet, refreshed
+        # after every successful read for the `done` nudge.
         self._targets_text = getattr(self, "task_targets", None) or task
         self._unread_files: list[str] = self._compute_unread(self._targets_text)
-        # The gathered-source ceiling is charged per NEW byte, not per echoed
-        # byte: a re-read of lines already in context costs nothing, so a
-        # small model bouncing over the same big file cannot exhaust the
-        # budget before it reaches the code it must edit.
+        # Inputs for the opt-in write allowlist (cfg.auto_allowlist): the live
+        # read ledger (same dict object, so it grows as gather reads) and the
+        # files the task title names. Reset per task, like _backup_dir above.
+        self.cfg._task_reads = spans
+        self.cfg._task_allowlist = self._task_file_targets(self._targets_text)
+        # Charged per NEW byte, so re-reading lines already in context is free.
         budget = self.cfg.max_gathered_chars
-        # Per-file line ledger: every read appends its (start, end) span here
-        # in step order. The eviction pass at the end of the loop replays the
-        # same sequence to work out which lines each RESULT turn was the first
-        # to show -- so the bookkeeping during the loop stays dead simple and
-        # a re-read costs nothing against max_gathered_chars.
-        spans: dict[str, list[tuple[int, int]]] = {}
-        self._read_spans = spans   # coverage truth for _compute_unread
 
         def nudge(step: int) -> str:
-            """Text appended to a turn reminding the model how many lookups
-            remain, or that there is no limit and only the token budget ends
-            the phase."""
+            """Suffix telling the model how many lookups remain."""
             if unlimited:
                 return ("[Next action? No lookup limit -- choose 'done' once "
                         "the task is covered.]")
@@ -745,23 +650,19 @@ class Agent:
                     if remaining else
                     "This is your LAST lookup. Choose 'done' unless you truly need one more.")
 
-        # The first nudge rides along with the map+task message. Every later one
-        # rides with its tool result. Mistral-family chat templates reject two
-        # user messages in a row, so the sequence must stay strictly
-        # system, user, assistant, user, assistant, ...
+        # Nudges ride with the preceding user message: some chat templates
+        # reject two user messages in a row.
         messages[-1]["content"] += "\n\n" + nudge(1)
 
         step = 0
         step_schema = schema_for(self.cfg)
-        done_confirmed = False   # one-shot guard for the post-truncation
-                                 # "are you really done?" nudge below
-        step_recoveries = 0      # budget for re-asking after a gather step
-                                 # died at the output cap (see LLMError path)
+        done_confirmed = False   # one-shot "are you really done?" after a truncated reply
+        step_recoveries = 0      # re-asks after a step died at the output cap
         duplicate_reads = 0      # consecutive reads that added no new lines
         error_streak = 0         # consecutive failed (ERROR) observations
         last_sig = None          # previous step's action+args, for loops
         repeated = 0
-        payload_cuts = 0         # steps discarded for a cut-off payload (W)
+        payload_cuts = 0         # steps discarded for a cut-off payload
         while unlimited or step < step_cap:
             step += 1
             try:
@@ -769,24 +670,11 @@ class Agent:
                                                  self.cfg.max_tokens_step,
                                                  disable_thinking=True)
             except LLMError as e:
-                # A gather step that cannot produce JSON at all must not kill
-                # the whole run -- the DeepSeek failure class: json_object
-                # mode is only SOFT grammar there, so a rambling reply gets
-                # cut mid-essay and every salvage attempt fails. The answer
-                # phase rebuilds its own prompt from whatever was gathered
-                # (or the map alone), which is strictly better than an error
-                # exit after minutes of paid lookups.
+                # A step that cannot produce JSON ends gather, not the run:
+                # the answer phase works from whatever was gathered. Re-ask
+                # a couple of times first so earlier lookups are not wasted.
                 msg = str(e).lower()
                 if "token limit" in msg or "valid json" in msg:
-                    # Do not bail on the FIRST bad step. A hosted model that
-                    # rambles past the output cap produces one doomed reply;
-                    # asking again with a short-reasoning instruction usually
-                    # gets a clean action back, and losing ten paid lookups of
-                    # context to an answer phase that cannot edit blind is the
-                    # worse outcome (this is exactly how the rename test died:
-                    # gather broke at step 10, the answer phase had no source,
-                    # and it emitted a lone placeholder stub). One retry per
-                    # failure, two failures total, then proceed as before.
                     step_recoveries += 1
                     if step_recoveries <= _MAX_GATHER_RECOVERIES:
                         messages.append({"role": "user", "content":
@@ -816,18 +704,12 @@ class Agent:
                 last_sig = sig
                 repeated = 1
 
-            # Bug W (run 13): never dispatch a step whose payload arrived
-            # cut off. Two deterministic cut classes: the reply hit the
-            # token limit and chat_json's salvage kept only half the field
-            # (client.truncated_field names it), or grammar-constrained
-            # sampling force-closed a string at exactly its schema
-            # maxLength -- VALID JSON, no truncation flag, half a program.
-            # Run 13 retired all five pixel checks because the browser ran
-            # 600-char fragments of a ~750-char measurement eval (identical
-            # SyntaxError in every retry -- the cap is deterministic).
-            # Discard WITHOUT a live-step log line (one would falsely
-            # satisfy the live-evidence gate for a step that never ran),
-            # say why, and ask for a shorter or split payload.
+            # Never dispatch a step whose payload arrived cut off: either the
+            # reply hit the token limit and the salvage kept half a field
+            # (client.truncated_field), or constrained sampling closed a string
+            # at exactly its schema maxLength. Discard without a live-step log
+            # line (it would falsely satisfy the live-evidence gate) and ask
+            # for a shorter or split payload.
             cut = ""
             note = ""
             if getattr(self.client, "step_truncated", False):
@@ -901,13 +783,8 @@ class Agent:
             if action == "done":
                 missing = list(self._unread_files)
                 at_limit = (not unlimited and step >= step_cap)
-                # If the model kept rambling in 'reasoning' until the reply
-                # was cut off (step_truncated is set by chat_json's salvage
-                # path), its LAST words were chopped -- a deepseek-chat
-                # classic: it free-forms a long essay and hits the provider
-                # cap mid-sentence. A `done` that arrives that way may be an
-                # accidental truncation artifact, not a decision; give it one
-                # explicit chance to confirm or continue before honouring it.
+                # A `done` salvaged from a reply cut off at the token limit may
+                # be a truncation artifact; ask once to confirm.
                 if getattr(self.client, "step_truncated", False) \
                         and not done_confirmed and not at_limit:
                     done_confirmed = True
@@ -923,12 +800,9 @@ class Agent:
                               "to confirm)", file=sys.stderr)
                     continue
                 if missing and not at_limit and not read_nudged:
-                    # The model gathered on some files but wants to change
-                    # others it never `read`. Its answer rules forbid quoting
-                    # unread code, so it would answer with zero blocks. Nudge
-                    # once per round of progress; if it still says `done`
-                    # without reading, accept and answer rather than looping
-                    # `done` -> nudge forever.
+                    # The task names files never `read`; the answer phase
+                    # cannot quote unread code. Nudge once per round of
+                    # progress, then accept `done`.
                     listing = "\n".join(f"- {f}" for f in missing[:6])
                     read_nudged = True
                     messages.append({"role": "assistant", "content": _compact(stepjson)})
@@ -944,9 +818,7 @@ class Agent:
                               "it to read them before answering)", file=sys.stderr)
                     continue
                 if not did_read and not at_limit and not read_nudged:
-                    # Answering from grep snippets produces edits that cannot
-                    # anchor, because grep output is trimmed. Nudge once; if
-                    # it still refuses to read, answer with what it has.
+                    # Grep output is trimmed, so edits cannot anchor on it.
                     read_nudged = True
                     messages.append({"role": "assistant", "content": _compact(stepjson)})
                     messages.append({"role": "user", "content":
@@ -968,10 +840,7 @@ class Agent:
 
             dedup_step = is_repeat and action in _DEDUP_STEP_ACTIONS
             if dedup_step:
-                # The previous step was byte-for-byte the same call, and
-                # nothing mutating ran in between. Re-dispatching it cannot
-                # change the result; give the model a short "already done"
-                # observation instead of a second identical result block.
+                # Identical to the previous (read-only) step: skip the dispatch.
                 obs = (f"[This exact `{action}` step already ran and its "
                        "result is above. Repeating it cannot add information "
                        "-- choose a different query/path or say done.]")
@@ -980,29 +849,20 @@ class Agent:
                     obs = dispatch(self.index, self.cfg, stepjson,
                                    client=self.client)
                 except Exception as e:
-                    # A tool must never crash the run: one malformed path or an
-                    # unexpected filesystem error becomes an ERROR observation
-                    # (and the consecutive-error guard above stops a loop on it).
+                    # A tool failure becomes an ERROR observation, not a crash.
                     print(f"  [{action} tool failed: "
                           f"{type(e).__name__}: {e}]", file=sys.stderr)
                     obs = (f"ERROR: {action} failed "
                            f"({type(e).__name__}): {str(e)[:200]}")
-            # If the model's last reply was cut off at the token limit and we
-            # salvaged the action from it, say so in the observation: the cut
-            # almost always happened inside 'reasoning', and an unmarked
-            # recovery lets the model keep writing essays until every step
-            # burns a truncation-retry round trip. One short sentence here
-            # stops that spiral.
+            # The cut almost always lands inside 'reasoning'; tell the model
+            # so it stops writing essays.
             if getattr(self.client, "step_truncated", False):
                 obs += ("\n[Note: your previous reply hit the output token "
                         "limit before finishing its reasoning. Keep 'reasoning' "
                         "under 10 words -- long ones get cut off and wasted.]")
-                # ...unless the cut landed INSIDE `content` of a write step:
-                # then what survived is half a file and the note above is the
-                # wrong advice. The partial content itself never reaches disk
-                # (dispatch() refuses oversized writes), but without this the
-                # model re-rolls the same giant write forever. Tell it the
-                # exact chunk size that fits one message instead.
+                # If the cut landed inside `content` of a write step, give the
+                # chunk size that fits one message (dispatch() refuses the
+                # oversized write).
                 if action in ("write", "append") and \
                         len((stepjson.get("content") or "").splitlines()) > \
                         max(1, int(getattr(self.cfg, "max_write_lines", 0) or 0)):
@@ -1015,22 +875,11 @@ class Agent:
             duplicate_read = False
             read_delta = None
             if action == "read" and not obs.startswith("ERROR"):
-                # A successful read is progress only when it shows lines the
-                # conversation has not already supplied. Compare against the
-                # span ledger BEFORE recording this read, then keep only a
-                # compact "already read" note for an exact duplicate: echoing
-                # the same numbered lines back is what lets a small model lock
-                # onto one range and repeat it forever.
+                # A read is progress only when it shows lines not already in the
+                # span ledger; an exact duplicate is replaced by a compact note
+                # so the model does not lock onto one range.
                 m = _READ_HEAD_RX.match(obs)
                 if m:
-                    # Normalise exactly like `_task_file_targets` does:
-                    # lower-case AND strip leading "./". Without the lstrip,
-                    # a model that asks for "./src/app.js" records coverage
-                    # under "./src/app.js" while `_compute_unread` looks up
-                    # "src/app.js" -- the file reads as permanently unread,
-                    # the `done` nudge loops until the step ceiling, and the
-                    # answer phase ends with zero edit blocks ("nothing to
-                    # review" in the GUI despite successful reads).
                     key = _norm_key(m.group(1))
                     s_, e_ = int(m.group(2)), int(m.group(3))
                     prior = list(spans.get(key, []))
@@ -1044,16 +893,10 @@ class Agent:
                                "a different file/range.]")
                 if not duplicate_read:
                     did_read = True
-                    # A real read is progress, so a later `done` with new
-                    # missing files is allowed another coverage nudge.
-                    read_nudged = False
+                    read_nudged = False     # progress re-arms the coverage nudge
                 self._unread_files = self._compute_unread(self._targets_text)
-            # An ERROR observation is navigation feedback ("that range does
-            # not exist"), not source. Carrying it into the answer prompt as
-            # gathered text makes the SOURCE section look populated while it
-            # contains no code at all -- the model then answers from the map
-            # alone and proposes nothing, which surfaces in the GUI as a
-            # blank review page. Record failures compactly instead.
+            # An ERROR is navigation feedback, not source: record it compactly
+            # so the SOURCE section does not look populated without code.
             if obs.startswith("ERROR"):
                 error_streak += 1
                 duplicate_reads = 0      # an error is not a read
@@ -1065,11 +908,8 @@ class Agent:
                 messages.append({"role": "assistant", "content": _compact(stepjson)})
                 messages.append({"role": "user",
                                  "content": f"{obs}\n\n{nudge(step + 1)}"})
-                # Errors used to `continue` before the budget was charged, so
-                # a model repeating one failing `read` (bad path, bad range)
-                # looped forever at the default max_steps = 0. Charge the
-                # error text and cap the streak: failures are feedback, not
-                # free steps.
+                # Charge errors too, so a model repeating one failing step
+                # cannot loop forever at max_steps = 0.
                 budget -= len(obs)
                 _evict_overflow_turns(messages, self.client, self.cfg)
                 if error_streak >= _MAX_CONSECUTIVE_ERRORS:
@@ -1085,23 +925,14 @@ class Agent:
                     break
                 continue
             error_streak = 0
-            # Charge the gather budget by NEW LINES ONLY. A re-read of lines
-            # already in context costs nothing here -- otherwise a small model
-            # bouncing over one big file exhausts max_gathered_chars before it
-            # reaches the code it must edit, and the loop cuts to the answer
-            # phase mid-gather. The RESULT turn still shows the full read (the
-            # eviction pass at the end of the loop dedups the conversation).
-            if action == "read" and _READ_HEAD_RX.match(obs):
-                if read_delta is None:
-                    k0 = _norm_key(_READ_HEAD_RX.match(obs).group(1))
-                    delta = _delta_len(obs, list(spans.get(k0, [])))
-                else:
-                    delta = read_delta
-                if delta > budget:
+            # Reads are charged by new lines only (the eviction pass at the
+            # end dedups the conversation).
+            if read_delta is not None:
+                if read_delta > budget:
                     obs = obs[:budget] + "\n[truncated: context budget reached]"
                     budget = 0
                 else:
-                    budget -= delta
+                    budget -= read_delta
             else:
                 if len(obs) > budget:
                     obs = obs[:budget] + "\n[truncated: context budget reached]"
@@ -1122,10 +953,7 @@ class Agent:
                    or stepjson.get("symbol") or stepjson.get("command"))
             arg = arg if isinstance(arg, str) else ("" if arg is None else str(arg))
             if action == "outline":
-                # Outlines are navigation, not evidence. The model needs them to
-                # decide what to read; the answer phase needs the code it read.
-                # Carrying a 2,400-token outline into the answer prompt is pure
-                # waste, so record only that it happened.
+                # Outlines are navigation only; keep them out of the answer prompt.
                 item = (f"--- outline {arg} (used for navigation; "
                         f"{len(self.index.in_file(self.index.resolve_file(arg) or ''))} units)")
             else:
@@ -1137,12 +965,9 @@ class Agent:
             messages.append({"role": "user",
                              "content": f"RESULT:\n{obs}\n\n{nudge(step + 1)}"})
 
-            # Proactive window guard: our own char budget says there's room,
-            # but the live conversation (map + every RESULT turn echoed back
-            # on each request) can still outgrow the server's configured
-            # window -- LM Studio then 400s mid-task ("kept hitting limits")
-            # and Ollama silently drops the middle of the prompt (the model
-            # answers nonsense). Trim before sending the next request.
+            # The live conversation can outgrow the server's window even when
+            # the char budget has room (some servers reject the request,
+            # others silently drop the middle of the prompt); trim first.
             _evict_overflow_turns(messages, self.client, self.cfg)
 
             if budget <= 0:
@@ -1151,74 +976,79 @@ class Agent:
                 break
 
         self.read_any = did_read
-        # Eviction pass. The dedup rule above charges the gather budget by
-        # NEW bytes only -- but until this pass every RESULT turn still
-        # carried its full text, so a model that re-reads a big file in
-        # overlapping chunks leaves multiple copies sitting in the live
-        # conversation. On a 9B/14B with an 8k-32k window that is how the
-        # *server* runs out of context mid-task even though our own budget
-        # says there is room. Rewrite each read's RESULT turn down to the
-        # lines it was the first to show, and rebuild the SOURCE section
-        # from those same deltas so the answer phase sees each line exactly
-        # once.
+        # Rewrite RESULT turns and SOURCE items down to the lines each read
+        # was first to show, so the answer phase sees every line once.
         new_items = _evict_duplicate_reads(messages, gathered, spans)
-        # Remember the deduped source so later phases (answer, repair) can
-        # rebuild their prompts without re-quoting every read from scratch.
+        digest = self._read_digest(spans)
+        if digest:
+            new_items = new_items + [digest]
         self.gathered_source = "\n\n".join(new_items)
-        # Final proactive trim: the loop above trims after each tool result,
-        # but nudge turns (the "read these files first" prompts) can push the
-        # conversation over the window between reads. Do one sweep before the
-        # answer phase so the next request cannot 400 or be silently
-        # truncated server-side.
+        # Nudge turns can push the conversation over the window between reads.
         _evict_overflow_turns(messages, self.client, self.cfg)
         return "\n\n".join(new_items)
 
+    def _read_digest(self, spans: dict) -> str:
+        """One line per file read during gather: the merged line ranges and
+        the definitions they cover. A cheap durable record of the lookups,
+        appended to the gathered source, so the answer phase keeps the map
+        even when eviction has dropped the original RESULT turns."""
+        lines = []
+        for key in sorted(spans):
+            folded = _fold_spans(spans[key])
+            ranges = ", ".join(f"{a}-{b}" for a, b in folded[:8])
+            if len(folded) > 8:
+                ranges += ", ..."
+            rel = self.index.resolve_file(key) or key
+            names = []
+            for c in self.index.in_file(rel):
+                if c.kind in ("module", "reference") \
+                        or c.qualname in ("module", "__trailing__"):
+                    continue
+                if any(c.start <= b and a <= (c.scope_end or c.end)
+                       for a, b in folded):
+                    names.append(c.qualname)
+            line = f"- {rel} lines {ranges}"
+            if names:
+                shown = ", ".join(names[:6])
+                if len(names) > 6:
+                    shown += f", +{len(names) - 6} more"
+                line += f" ({shown})"
+            lines.append(line)
+        if not lines:
+            return ""
+        return ("--- digest (files read during gather)\n"
+                + "\n".join(lines))[:2000]
+
     # ------------------------------------------------------ coverage bookkeeping
     def _task_file_targets(self, task: str) -> set[str]:
-        """Paths that look like files mentioned in the task text.
-
-        A bare word like `index` inside a sentence is not a path; only tokens
-        containing a slash or a dot-extension count, so this never nags about
-        prose. Matched against the index case-insensitively by the caller.
-        """
-        import re as _re
-        toks = _re.findall(r"[A-Za-z0-9_][A-Za-z0-9_./\-]*", task or "")
+        """Normalised paths mentioned in the task text. Only tokens containing
+        a slash or a dot-extension count, so prose words are ignored."""
         out = set()
-        for t in toks:
-            if "/" in t or _re.search(r"\.[A-Za-z][A-Za-z0-9]{0,7}$", t):
-                out.add(t.lower().lstrip("./"))
+        for t in _FILE_TOKEN_RX.findall(task or ""):
+            if "/" in t or _FILE_EXT_RX.search(t):
+                out.add(_norm_key(t))
         return out
 
     def _compute_unread(self, task: str) -> list[str]:
-        """Files the task names but no successful `read` covered.
-
-        Coverage comes from `self._read_spans` -- recorded only when a read
-        actually returned source text. A grep hit or an ERROR line is
-        navigation, not evidence; counting those as coverage is how a task
-        ends with "the model answered without proposing any edits" while the
-        terminal looks healthy.
-
-        Returns entries like "prep/sentences.js (not yet read -- it has 222
-        lines, use start=1 end=222)" so the nudge can carry exact ranges.
-        Any successful read of a file counts as coverage for it (a partial
-        read means the model saw real text and knows what remains).
-        """
+        """Files the task names but no successful `read` covered, as entries
+        like "prep/sentences.js (not yet read -- it has 222 lines, use start=1
+        end=222)". Any successful read of a file counts as coverage; grep hits
+        and ERROR lines do not."""
         wanted = self._task_file_targets(task)
         if not wanted:
             return []
         matched: dict[str, str] = {}          # normalised rel -> canonical rel
         for rel in self.index.files:
-            r = rel.lower().lstrip("./")      # same normalisation as the
-            for w in wanted:                  # spans ledger and _task_file_targets
+            r = _norm_key(rel)
+            for w in wanted:
                 if r == w or r.endswith("/" + w) or w.endswith("/" + r):
                     matched[r] = rel
         if not matched:
             return []
         missing = []
         for low, rel in sorted(matched.items()):
-            if any(span for span in self._read_spans.get(low, ())):
+            if self._read_spans.get(low):
                 continue
-            from . import fileio
             try:
                 lines = fileio.read_lines(self.index.root / rel)
                 if lines and lines[-1] == "" and len(lines) > 1:
@@ -1240,12 +1070,10 @@ class Agent:
         """Ask the model to answer the task, or produce search/replace edits,
         given the project map and whatever source `gather()` collected.
 
-        `system` and `max_tokens` override the defaults for special flows that
-        need a different brief than "edit this existing code" -- e.g. resuming
-        an unfinished scaffold (`Agent.resume_task`) or writing one whole file
-        of a new project (see scaffold.py). `include_edit_format=False` drops
-        the search/replace format spec even when `system` is given, for flows
-        that must answer in prose only (`explain`)."""
+        `system` and `max_tokens` override the defaults for flows that need a
+        different brief (e.g. scaffold.py). `include_edit_format=False` drops
+        the search/replace format spec even when `system` is given, for
+        prose-only flows (`explain`)."""
         repo_map, _ = self.index.map_for_prompt(self.cfg)
         project_notes = instructions_mod.render(self.index.root, self.cfg)
         todo_notes = todo_mod.render(self.index.root, self.cfg,
@@ -1266,52 +1094,42 @@ class Agent:
             f"SOURCE YOU REQUESTED\n\n{gathered or '(nothing was looked up)'}\n\n"
             f"TASK\n{task}"
         )
-        # Hard fit check: llama.cpp/LM Studio 400 when prompt + max_tokens
-        # exceeds the configured window, and Ollama does something worse --
-        # it silently truncates the PROMPT from the middle. The TASK sits at
-        # the very end of this message, so on a small window the model is
-        # shown a map and some source but never the actual request; it then
-        # "runs to completion" with a confident answer to some other task.
-        # That is exactly the local-model "provided answer is nonsense"
-        # symptom. Refuse loudly instead of letting the server mangle it.
+        # Hard fit check: a prompt over the window is rejected by some servers
+        # and silently truncated from the middle by others, which would cut
+        # off the TASK at the end. Refuse loudly instead.
+        est = getattr(self.client, "estimate_tokens", None) or estimate_tokens
         reply_room = min(self.cfg.max_tokens_answer,
                          self.cfg.request_max_tokens_cap or
                          self.cfg.max_tokens_answer)
-        from .config import is_hosted as _is_hosted
-        if _is_hosted(self.cfg):
-            # Hosted APIs (DeepSeek, OpenAI, ...) have a real request-size
-            # limit too -- deepseek-chat rejects prompts over ~128k tokens,
-            # and a giant echoed history costs money and latency. Trim the
-            # OLDEST gathered chunks until the prompt fits a generous ceiling
-            # instead of refusing outright; the model still sees its most
-            # recent reads, which are the ones it wants to edit.
+        hosted = is_hosted(self.cfg)
+        if hosted:
+            # Hosted APIs have a request-size limit and bill per token: drop
+            # the OLDEST gathered source until the prompt fits a ceiling.
             head = notes_prefix + f"PROJECT MAP\n\n{repo_map}\n\n"
             tail = f"\n\nTASK\n{task}"
             ceil_ = int(getattr(self.cfg, "max_prompt_tokens", 0) or 60000)
             src = gathered or "(nothing was looked up)"
-            while estimate_tokens(head + src + tail) > ceil_ and len(src) > 4000:
-                cut = max(4000, len(src) * 3 // 4)
-                dropped = src[cut:]
-                src = src[:cut]
-                src += ("\n\n[older gathered source trimmed to fit the "
-                        "request limit (%d chars dropped -- re-read a file "
-                        "if you need it again]" % len(dropped))
+            dropped = 0
+            while est(head + src + tail) > ceil_ and len(src) > 4000:
+                keep = max(4000, len(src) * 3 // 4)
+                dropped += len(src) - keep
+                src = src[-keep:]
+            if dropped:
+                src = ("[older gathered source trimmed to fit the request "
+                       f"limit ({dropped} chars dropped -- re-read a file if "
+                       "you need it again)]\n\n" + src)
             user = head + f"SOURCE YOU REQUESTED\n\n{src}\n" + tail
         room = self.cfg.context_tokens - reply_room - self.cfg.reserve_tokens // 2
-        if not _is_hosted(self.cfg) and estimate_tokens(user) > room > 0 \
-                and notes_prefix:
-            # Project instructions are valuable but must never turn a
-            # previously fitting prompt into a hard failure. Drop them first
-            # (the model still has the map/source/task) and keep the existing
-            # over-budget refusal for the rest.
+        if not hosted and est(user) > room > 0 and notes_prefix:
+            # Project instructions must never turn a fitting prompt into a
+            # hard failure: drop them first.
             user = user[len(notes_prefix):]
             print("[project context (instructions/checklist) omitted: answer "
                   "prompt is over the window budget]", file=sys.stderr)
-            notes_prefix = ""
-        if not _is_hosted(self.cfg) and estimate_tokens(user) > room > 0:
-            over = estimate_tokens(user) - room
+        if not hosted and est(user) > room > 0:
+            over = est(user) - room
             raise LLMError(
-                f"The answer prompt would be ~{estimate_tokens(user)} tokens "
+                f"The answer prompt would be ~{est(user)} tokens "
                 f"but this model's window only allows ~{room} here "
                 f"(context {self.cfg.context_tokens:,} minus a "
                 f"{reply_room:,}-token reply budget).\n"
@@ -1324,7 +1142,7 @@ class Agent:
                 " LM Studio's stock\n    default is 8192 -- raising its runtime "
                 "'Context length' is the\n    better fix if your GPU can take it)"
                 f"\n(over-budget by ~{over} tokens)")
-        print(f"[answer context ~{estimate_tokens(user)} tokens]", file=sys.stderr)
+        print(f"[answer context ~{est(user)} tokens]", file=sys.stderr)
         sys_prompt = ANSWER_SYSTEM
         if system is not None:
             sys_prompt = system.rstrip()
@@ -1349,47 +1167,24 @@ class Agent:
         only a block that must match existing text needs the repair loop."""
         if repair_rounds is None:
             repair_rounds = self.cfg.repair_rounds
-        # Fix X (run 13): files whose blocks in THIS reply were no-ops
-        # (SEARCH == REPLACE), dropped by parse_edits. A repair that had
-        # correctly concluded "no code defect" was pressed by the no-edit
-        # re-ask into fabricating a null block on a frozen file; the harness
-        # logged "applied 1 block(s)" and counted it as an EDIT, burning a
-        # full verify re-run instead of retiring the check. loop.run_task
-        # reads this to treat fabricated null edits as the refusal they
-        # mean. Reset every call; the throwaway parse costs one regex pass.
+        # Files whose blocks in this reply were no-ops (SEARCH == REPLACE) and
+        # dropped by parse_edits; loop.run_task reads this to treat fabricated
+        # null edits as a refusal. Reset on every call.
         self.noop_discards: list[str] = []
         parse_edits(reply, discards=self.noop_discards)
-        # Answer-phase truncation continuation. Hosted APIs cap one message's
-        # OUTPUT (~8k tokens on deepseek-chat); a big multi-file task then gets
-        # cut off mid-reply no matter how large max_tokens_answer is. The old
-        # behaviour was fatal -- "kept running past the token limit" after 3
-        # identical doomed retries. Instead: keep whatever complete edit blocks
-        # survived, tell the model exactly which files still need work, and
-        # ask for just those in the next message. Each round emits a few
-        # blocks, fits under the provider cap, and the task finishes across
-        # turns. Guarded by a char budget AND a round cap (a model that
-        # re-emits one oversized block every round would otherwise spin for
-        # the whole budget, generating the full max_tokens_answer each time).
-        #
-        # Detection lives in `stream_truncated`, NOT `last_finish_reason`:
-        # the answer phase streams (the user watches the blocks appear), and
-        # OpenAI-compatible SSE puts finish_reason only on the final chunk --
-        # the buffered parser that sets last_finish_reason never runs for a
-        # streamed reply, so it stayed "" after every stream and this loop
-        # could never trigger. That is why truncated answers silently lost
-        # their later files instead of continuing across turns.
+        # Truncation continuation: when the streamed reply was cut off at the
+        # output cap (`stream_truncated`; `last_finish_reason` is not set for
+        # streams), keep the complete blocks, name the files still to do, and
+        # ask for just those. Bounded by a char budget and a round cap.
         cont_budget = 0 if dry_run else \
             max(1, int(getattr(self.cfg, "max_tokens_answer", 40000))) * 4
         cont_rounds = 0
         empty_rounds = 0
         cont_cap = max(0, int(getattr(self.cfg, "max_continuation_rounds", 0)
                               or 0))
-        # Each continuation is a FRESH conversation, so the source the model
-        # already saw must ride along. Without it a small model does the only
-        # thing that makes sense in its own head: asks to `read` the file
-        # again (often in native tool-call syntax, which cannot run in this
-        # phase) instead of writing edit blocks. Keep the most recent slice
-        # when the gathered source is larger than the configured budget.
+        # Each continuation is a fresh conversation, so the source already seen
+        # rides along (most recent slice if over budget); otherwise the model
+        # asks to `read` again instead of writing blocks.
         cont_source = (gathered or getattr(self, "gathered_source", "") or "").strip()
         if cont_source:
             limit = max(4000, int(getattr(self.cfg, "max_gathered_chars",
@@ -1406,13 +1201,9 @@ class Agent:
                       "-round cap; stopping]", file=sys.stderr)
                 break
             parsed = parse_edits(reply)
-            done_files = {b.file.strip().lower().lstrip("./") for b in parsed}
-            # The last streamed reply was cut mid-block: its dangling tail
-            # (header + partial SEARCH, maybe a ======= line but no closing
-            # REPLACE) would otherwise ride along into the next continuation
-            # prompt -- confusing the model and, worse, poisoning any later
-            # repair round that re-parses this accumulated text. Drop it now;
-            # we are about to ask the model to re-emit exactly that file.
+            done_files = {_norm_key(b.file) for b in parsed}
+            # Drop the unfinished block at the cut-off point; the model is
+            # about to re-emit it, and it would poison later repair rounds.
             if getattr(self.client, "stream_truncated", False):
                 trimmed = self._trim_dangling_block(reply)
                 if trimmed != reply:
@@ -1435,14 +1226,10 @@ class Agent:
                     "one REPLACE. If everything is already covered, reply "
                     "with a single line: NOTHING MORE.")
             elif empty_rounds:
-                # Second consecutive empty round: the generic re-ask was
-                # ALSO cut off before any block, so the model is re-emitting
-                # one oversized block every time. Escalate once to an
-                # explicit single-small-chunk demand instead of rolling the
-                # same doomed request again; if that too is cut off, the
-                # loop below gives up.
-                print(f"\n[reply was cut off before any complete block again; "
-                      f"asking for a single small chunk]", file=sys.stderr)
+                # The generic re-ask was also cut off: escalate once to a
+                # single-small-chunk demand.
+                print("\n[reply was cut off before any complete block again; "
+                      "asking for a single small chunk]", file=sys.stderr)
                 prompt = (
                     f"TASK\n{task}\n\n{cont_source}"
                     "Your replies keep getting CUT OFF by the output token "
@@ -1451,11 +1238,10 @@ class Agent:
                     "covers only the FIRST ~30 lines of the file -- nothing "
                     "else. The remaining content is requested in later turns.")
             else:
-                # Cut off before finishing even one block: the whole reply
-                # was lost. Re-ask for it, and teach the chunk protocol so a
-                # file too large for one message gets split across replies.
-                print(f"\n[reply was cut off before any complete block; "
-                      f"re-asking for the file]", file=sys.stderr)
+                # Cut off before one block finished: re-ask, teaching the chunk
+                # protocol for files too large for one message.
+                print("\n[reply was cut off before any complete block; "
+                      "re-asking for the file]", file=sys.stderr)
                 prompt = (
                     f"TASK\n{task}\n\n{cont_source}"
                     "Your previous reply was CUT OFF by the output token "
@@ -1470,15 +1256,12 @@ class Agent:
                 max_tokens=self.cfg.max_tokens_answer,
                 stream=True,
             )
-            if "NOTHING MORE" in more and not parse_edits(more):
+            more_has_edits = bool(parse_edits(more))
+            if "NOTHING MORE" in more and not more_has_edits:
                 break
-            if not parse_edits(more):
+            if not more_has_edits:
                 if getattr(self.client, "stream_truncated", False):
-                    # The re-ask was ALSO cut off before any complete block.
-                    # One escalated attempt (above), then stop: a model that
-                    # keeps outgrowing the cap would otherwise spin this loop
-                    # for the whole char budget, generating the full
-                    # max_tokens_answer every round.
+                    # The re-ask was also cut off: one escalated attempt, then stop.
                     empty_rounds += 1
                     if empty_rounds >= 2:
                         print("\n[repeatedly cut off before any complete "
@@ -1488,30 +1271,26 @@ class Agent:
                     print("[re-ask was truncated too; trying once more]",
                           file=sys.stderr)
                     continue
-                # Continuation produced no edit blocks at all -- keep the
-                # truncated-but-parseable original rather than replacing it
-                # with prose, and stop so we cannot loop on empty replies.
+                # No blocks at all: keep the parseable original and stop.
                 break
             empty_rounds = 0
             reply = (reply.rstrip() + "\n\n" + more) if reply.strip() else more
-        # If the reply (original or its last continuation round) was cut off
-        # mid-block, trim the dangling tail before anything parses it. The
-        # loop above already trimmed between continuation rounds; this catches
-        # a truncated FIRST reply that never entered the loop (zero complete
-        # blocks -> `break` with nothing to continue from), and the final
-        # round when the budget ran out. BLOCK_RE needs a closing REPLACE to
-        # match, so an unterminated block would otherwise leave its header in
-        # the text -- which `_failed_block_texts` echoes back to the model as
-        # half a block, inviting it to "complete" the fragment instead of
-        # re-anchoring it.
+        # Trim a dangling tail the loop above did not (a truncated first
+        # reply, or the last round when the budget ran out), so repair prompts
+        # never echo half a block.
         if getattr(self.client, "stream_truncated", False):
             reply = self._trim_dangling_block(reply)
+        # Post-edit check baseline: the findings these files ALREADY had
+        # before this call touches them, so only new problems get fed back.
+        post_check = not dry_run and bool(getattr(self.cfg, "post_edit_check",
+                                                  True))
+        baseline: dict[str, list[str]] = {}
+        if post_check:
+            self._baseline_findings(baseline, parse_edits(reply))
         results = self._apply_once(reply, dry_run, backup_dir)
-        # Snapshot what this reply already delivered (including any truncation
-        # continuations folded into `reply` above) and whether it defers the
-        # rest to "the next turn" -- used by the completion loop below, and
-        # captured before the repair loop reassigns `reply`.
-        delivered = {b.file.strip().lower().lstrip("./") for b in parse_edits(reply)}
+        # Captured before the repair loop reassigns `reply`; used by the
+        # completion loop below.
+        delivered = {_norm_key(b.file) for b in parse_edits(reply)}
         deferred = bool(_MORE_TO_DO_RE.search(reply))
 
         for _round in range(repair_rounds):
@@ -1520,23 +1299,13 @@ class Agent:
                 break
             print(f"\n[{len(failures)} block(s) failed; asking the model to re-anchor]", file=sys.stderr)
             fb = "\n".join(f"- {r.file}: {r.message}" for r in failures)
-            # Re-ground the repair prompt FROM DISK, not from the gathered
-            # buffer. The old code sliced the gather output (regex-filtered,
-            # 12k chars), so when a SEARCH block failed the exact lines it
-            # needed were often missing or truncated -- and local models
-            # correctly replied "I only have grep output, I can't produce a
-            # corrected edit" and burned every repair round on prose. Read
-            # the real file and quote the region around the fuzzy-matched
-            # anchor (or the target line range), with line numbers, so the
-            # model can copy exact text including real indentation.
+            # Ground the repair prompt in the files on disk (the region around
+            # the fuzzy-matched anchor), not the gathered buffer.
             prev_blocks = self._failed_block_texts(reply, failures)
             src_slice = self._repair_source(failures, prev_blocks)
-            # A placeholder-creation refusal is a RENAME instruction problem,
-            # not an anchor problem: the model never needs to copy bytes (the
-            # clearing block's SEARCH is discarded -- Pedacito moves the real
-            # file). The generic "copy the SEARCH text byte for byte" wording
-            # above invites exactly the doomed full-content re-typing that
-            # gets cut off at the provider cap mid-block. Override it.
+            # A placeholder-creation refusal is a rename-protocol problem, not
+            # an anchor problem; the generic "copy the SEARCH text" wording
+            # would invite doomed full-content re-typing.
             rename_refusals = [r for r in failures
                                if "placeholder comment" in r.message]
             extras: list[str] = []
@@ -1557,16 +1326,8 @@ class Agent:
                     "pair and moves the entire real file itself.\n"
                     "Keep this reply tiny: four blocks total, nothing else.")
             if any("search block not found" in r.message for r in failures):
-                # An anchor miss on an existing file is very often a botched
-                # WHOLE-FILE rewrite (typically a stub implementation): the
-                # model quoted the old contents from memory -- or translated
-                # them into what the file should contain -- and no exact or
-                # fuzzy anchor survives. The base instruction below ("copy
-                # the SEARCH text exactly") then steers it straight back into
-                # the same wall, and a small model answers with prose and
-                # burns the round. Offer the supported way out instead: an
-                # empty SEARCH replaces the whole file, needing no quote of
-                # the old text at all.
+                # An anchor miss is often a botched whole-file rewrite; offer
+                # the empty-SEARCH form, which needs no quote of the old text.
                 extras.append(
                     "WHOLE-FILE REWRITE: if one of these edits was meant to "
                     "replace an entire file (typically implementing a stub), "
@@ -1599,11 +1360,8 @@ class Agent:
                 reply = self._trim_dangling_block(reply)
             if not parse_edits(reply) \
                     and getattr(self.client, "stream_truncated", False):
-                # Cut off before the first block closed: a token-limit
-                # casualty, not a refusal. Unlike the prose case below, one
-                # smaller re-ask plausibly lands -- the empty-SEARCH
-                # whole-file form needs no re-quoting of the old text, so it
-                # fits caps the full quote-and-replace reply outran.
+                # Cut off before the first block closed: one smaller re-ask
+                # (empty-SEARCH whole-file form) can fit under the cap.
                 print("[repair reply was cut off mid-block; re-asking for "
                       "one small block]", file=sys.stderr)
                 reply = self.client.chat(
@@ -1628,30 +1386,22 @@ class Agent:
                 if getattr(self.client, "stream_truncated", False):
                     reply = self._trim_dangling_block(reply)
             if not parse_edits(reply):
-                # The model answered with prose instead of blocks (the classic
-                # small-model "I need a read first" reply). Re-sending the same
-                # prompt cannot plausibly end differently -- stop repairing
-                # rather than burning the remaining rounds/tokens on it.
+                # Prose instead of blocks (e.g. "I need a read first"): the
+                # same prompt will not end differently, so stop repairing.
                 print("[repair produced no edit blocks; stopping]",
                       file=sys.stderr)
                 break
             good = [r for r in results if r.ok]
+            if post_check:
+                self._baseline_findings(baseline, parse_edits(reply))
             results = good + self._apply_once(reply, dry_run, backup_dir)
 
-        # Completion loop. The answer prompt invites the model to split a
-        # multi-file task across turns ("edit a few files this turn and say
-        # what remains"). A cleanly-finished reply that says more work is
-        # coming is NOT a truncation, so the continuation loop above never
-        # fired -- and the task would stop half done (the exact "only half my
-        # request was addressed" failure). When the reply defers, actually run
-        # the next turn: re-prompt with the delivered files and gathered
-        # source, apply any new blocks, and keep going until it reports
-        # NOTHING MORE or stops producing blocks.
+        # Completion loop: the answer prompt lets the model split a multi-file
+        # task across turns. When a cleanly finished reply defers the rest, run
+        # the next turn until it reports NOTHING MORE or emits no blocks.
         completion_cap = max(0, int(getattr(self.cfg, "max_completion_rounds", 0)
                                     or 0))
-        # Token-derived budget (same shape as the truncation-continuation
-        # budget) so an endlessly deferring model stops on tokens, not an
-        # arbitrary turn count.
+        # Token-derived budget so an endlessly deferring model stops on tokens.
         completion_budget = 0 if dry_run else \
             max(1, int(getattr(self.cfg, "max_tokens_answer", 40000))) * 4
         if not dry_run and deferred:
@@ -1679,36 +1429,83 @@ class Agent:
                     max_tokens=self.cfg.max_tokens_answer,
                     stream=True,
                 )
-                if "NOTHING MORE" in more and not parse_edits(more):
-                    break
-                if not parse_edits(more):
-                    break                      # no blocks -> treat as finished
+                more_edits = parse_edits(more)
+                if not more_edits:
+                    break                      # NOTHING MORE, or no blocks
                 completion_budget -= len(more)
                 reply = (reply.rstrip() + "\n\n" + more) if reply.strip() else more
+                if post_check:
+                    self._baseline_findings(baseline, more_edits)
                 results += self._apply_once(more, dry_run, backup_dir)
-                delivered |= {b.file.strip().lower().lstrip("./")
-                              for b in parse_edits(more)}
+                delivered |= {_norm_key(b.file) for b in more_edits}
                 if not _MORE_TO_DO_RE.search(more):
                     break
             if completion_budget <= 0:
                 print("\n[completion loop token budget exhausted; stopping]",
                       file=sys.stderr)
+
+        # Post-edit check: cheap lint of the files this call changed, diffed
+        # against their pre-edit baseline, so only problems the edits
+        # introduced are fed back. Runs last: the loops above are about
+        # applying blocks at all, this one is about what they did.
+        if post_check:
+            for _round in range(max(0, int(repair_rounds or 0))):
+                changed = sorted({fileio.normalise_rel(r.file)
+                                  for r in results if r.ok and r.file})
+                if not changed:
+                    break
+                try:
+                    current = diagnostics_mod.quick_findings(self.index.root,
+                                                             changed)
+                except Exception:
+                    break
+                found = diagnostics_mod.new_findings(baseline, current)
+                if not found:
+                    break
+                n = sum(len(v) for v in found.values())
+                print(f"\n[post-edit check: {n} new finding(s) in the changed "
+                      "files; asking for a fix]", file=sys.stderr)
+                fix = self.client.chat(
+                    [
+                        {"role": "system", "content": ANSWER_SYSTEM},
+                        {"role": "user", "content":
+                            f"TASK\n{task}\n\n"
+                            "Your edits applied, but a quick lint of the "
+                            "changed files reports NEW problems they "
+                            "introduced:\n"
+                            f"{diagnostics_mod.render_findings(found)}\n\n"
+                            "SOURCE (current contents around each finding)\n\n"
+                            f"{self._diagnostics_source(found)}\n\n"
+                            "Fix ONLY these problems with minimal search/"
+                            "replace blocks -- copy the SEARCH text exactly "
+                            "from the SOURCE above, byte for byte, keeping "
+                            "its real indentation (ignore the line-number "
+                            "prefixes). Do not repeat edits that already "
+                            "worked and do not refactor anything else. If a "
+                            "finding is a false positive or needs no code "
+                            "change, reply with a single line: NOTHING MORE."},
+                    ],
+                    max_tokens=self.cfg.max_tokens_answer,
+                    stream=True,
+                )
+                if getattr(self.client, "stream_truncated", False):
+                    fix = self._trim_dangling_block(fix)
+                if not parse_edits(fix):
+                    break                      # NOTHING MORE, or no blocks
+                # A file the fix touches for the first time gets its current
+                # findings as baseline; files already baselined keep the
+                # findings captured before this apply() call touched them.
+                self._baseline_findings(baseline, parse_edits(fix))
+                reply = (reply.rstrip() + "\n\n" + fix) if reply.strip() else fix
+                results += self._apply_once(fix, dry_run, backup_dir)
         return results, reply
 
     # ------------------------------------------------------------- repair help
     @staticmethod
     def _trim_dangling_block(reply: str) -> str:
-        """Drop a truncated reply's unfinished tail.
-
-        A streamed answer cut off by the provider's output cap ends inside a
-        block -- after `--- FILE:` (maybe mid-SEARCH, maybe past `=======`)
-        but always without the closing `>>>>>>> REPLACE` the parser needs.
-        That fragment never survives parse_edits(), yet its header still
-        matches regex searches elsewhere (`_failed_block_texts`, repair
-        prompts), which is how a half-written file gets treated as "already
-        delivered" and silently lost. Trim from the last header that has no
-        closing marker after it; complete blocks earlier in the reply are
-        untouched."""
+        """Drop a truncated reply's unfinished tail: everything from the last
+        `--- FILE:` header (or a bare `<<<<<<< SEARCH`) that has no closing
+        `>>>>>>> REPLACE`. Complete blocks are untouched."""
         if not reply:
             return reply
         heads = [m.start() for m in re.finditer(r"(?m)^---\s*FILE:", reply)]
@@ -1718,10 +1515,8 @@ class Agent:
         tail = reply[last:]
         if re.search(r"(?m)^>{5,}\s*REPLACE", tail):
             return reply               # final block is complete -- keep all
-        # Cut at the earliest dangling marker inside that last block: a bare
-        # `<<<<<<< SEARCH` with no header above it can happen when a model
-        # omits `--- FILE:` entirely and got cut mid-block anyway.
         cut = last
+        # A bare SEARCH marker without a header can also be cut mid-block.
         m = re.search(r"(?m)^<{5,}\s*SEARCH", tail)
         if m and not re.search(r"(?m)^>{5,}\s*REPLACE", tail[m.end():]):
             cut = min(cut, last + m.start())
@@ -1730,30 +1525,77 @@ class Agent:
 
     @staticmethod
     def _failed_block_texts(reply: str, failures) -> str:
-        """Echo back the blocks the model actually wrote for the failed files.
-        Telling it WHICH search text missed is what lets it re-anchor; without
-        this the feedback ('search block not found') gives nothing to correct."""
-        wanted = {(r.file or "").strip().lower().lstrip("./") for r in failures}
+        """Echo back the blocks the model wrote for the failed files, so it can
+        see which search text missed. Anchored headers keep their suffix."""
+        wanted = {_norm_key(r.file) for r in failures}
         out = []
         for e in parse_edits(reply):
-            low = e.file.strip().lower().lstrip("./")
+            low = _norm_key(e.file)
             if any(low == w or low.endswith("/" + w) or
                    (w and low.endswith(w)) for w in wanted if w):
-                out.append(f"--- FILE: {e.file}\n<<<<<<< SEARCH\n{e.search}\n"
+                head = f"--- FILE: {e.file}"
+                if e.lines:
+                    head += f" LINES {e.lines[0]}-{e.lines[1]}"
+                elif e.symbol:
+                    head += f" SYMBOL {e.symbol}"
+                out.append(f"{head}\n<<<<<<< SEARCH\n{e.search}\n"
                            f"=======\n{e.replace}\n>>>>>>> REPLACE")
         return "\n\n".join(out)[:6000] or "(previous blocks unavailable)"
 
-    def _repair_source(self, failures, prev_blocks: str = "") -> str:
-        """Ground-truth source for the failed files, read fresh from disk.
+    def _baseline_findings(self, baseline: dict, edits) -> None:
+        """Capture the lint findings each not-yet-seen file in `edits` has on
+        disk right now, BEFORE any block touches it. First capture wins: a
+        later round never re-baselines a file, so problems this apply() call
+        introduces cannot launder themselves into the baseline."""
+        fresh: list[str] = []
+        for e in edits or []:
+            rel = fileio.normalise_rel(e.file or "")
+            if rel and rel not in baseline:
+                baseline[rel] = []
+                fresh.append(rel)
+        if not fresh:
+            return
+        try:
+            found = diagnostics_mod.quick_findings(self.index.root, fresh)
+        except Exception:
+            found = {}
+        for rel in fresh:
+            baseline[rel] = found.get(rel, [])
 
-        For each failure we try to locate the model's previous SEARCH text in
-        the file fuzzily (locate() tolerates whitespace drift); on a hit we
-        quote +/-30 lines around it with line-number prefixes. On a miss we
-        fall back to the full file up to max_read_lines, then to whatever the
-        gather phase captured. Small windows keep the repair prompt cheap on
-        hosted APIs while still containing the exact bytes to copy."""
-        from . import fileio
-        from .edits import locate as _locate
+    def _diagnostics_source(self, found: dict) -> str:
+        """Numbered source windows around each finding, read fresh from disk,
+        so the fix prompt quotes the files as they are right now."""
+        chunks = []
+        for rel in sorted(found)[:6]:
+            path = self.index.root / rel
+            try:
+                text, _style = fileio.read(path, errors="strict")
+            except (OSError, UnicodeDecodeError):
+                continue
+            lines = text.split("\n")
+            spans: list[tuple[int, int]] = []
+            for it in (found[rel] or [])[:12]:
+                m = re.search(r":(\d+)(?::\d+)?[:\s]", it) \
+                    or re.search(r"line (\d+)", it)
+                if not m:
+                    continue
+                ln = int(m.group(1))
+                if 1 <= ln <= len(lines):
+                    spans.append((max(0, ln - 5),
+                                  min(len(lines), ln + 4)))  # ±4, 0-based
+            if not spans:
+                spans = [(0, min(len(lines), 20))]
+            shown: list[str] = []
+            for s, e in _fold_spans(spans):
+                shown.append(f"... lines {s + 1}-{e} ...")
+                shown.extend(f"{i + 1:>5}| {lines[i]}" for i in range(s, e))
+            chunks.append(f"FILE: {rel}\n" + "\n".join(shown))
+        return "\n\n".join(chunks)[:8000] or "(source unavailable)"
+
+    def _repair_source(self, failures, prev_blocks: str = "") -> str:
+        """Current source of the failed files, read fresh from disk: the lines
+        around the fuzzy-located previous SEARCH text, else the file head up
+        to max_read_lines, else what gather captured."""
         chunks = []
         seen: set[str] = set()
         for r in failures:
@@ -1767,11 +1609,10 @@ class Agent:
             if path.is_file():
                 try:
                     text, _style = fileio.read(path, errors="strict")
-                except OSError:
+                except (OSError, UnicodeDecodeError):
                     text = None
             if text is None:
-                # Not on disk (new-file create that mis-grouped, deleted
-                # mid-task): fall back to the gathered buffer for this file.
+                # Not on disk: fall back to the gathered buffer.
                 for item in (self.gathered_source or "").split("\n\n"):
                     m = re.match(r"--- \w+ (\S+)", item)
                     g = m.group(1).lower().lstrip("./") if m else ""
@@ -1784,13 +1625,13 @@ class Agent:
             start, end = 0, min(len(lines), int(getattr(self.cfg, "max_read_lines", 400)))
             span = None
             for blk in prev_blocks.split("--- FILE:")[1:]:
-                m = re.search(r"<<<<<<< SEARCH\n(.*?)\n=======", blk, re.S)
+                m = re.search(r"<<<<<<< SEARCH\n(.*?)\n=======", blk, re.DOTALL)
                 if not m:
                     continue
                 needle = m.group(1)
                 if rel.lower() not in blk.lower().split("<<<<<<<")[0]:
                     continue
-                span = _locate(text, needle, self.cfg)
+                span = locate(text, needle, self.cfg)
                 if span:
                     break
             if span:
@@ -1807,45 +1648,79 @@ class Agent:
                          "output the FULL intended file contents in one block)"
 
     def _apply_once(self, reply: str, dry_run: bool, backup_dir=None) -> list:
-        """One parse-and-apply pass, with no repair round-trip.
+        """One parse-and-apply pass, with no repair round-trip. Duplicate FILE
+        headers are not merged: apply_edits groups blocks by path and needs
+        them separate to detect renames. SYMBOL anchors are resolved to line
+        ranges here: the agent owns the index, apply_edits does not."""
+        failed, edits = self._resolve_symbol_anchors(parse_edits(reply))
+        if edits:
+            failed += apply_edits(self.index.root, edits,
+                                  backup=self.cfg.backup, dry_run=dry_run,
+                                  backup_dir=backup_dir, cfg=self.cfg,
+                                  allowlist=None if dry_run
+                                  else self._write_allowlist())
+        return failed
 
-        Duplicate FILE headers are NOT merged here any more: apply_edits
-        groups blocks by path itself, classifies each block individually for
-        rename detection, and applies each path's blocks in order. Pre-merging
-        here glued a rename's create-block to its own clear-block under one
-        header, which made the rename pair invisible to detection -- the task
-        ended with a blank review page and the old files untouched. It also
-        corrupted new-file bodies with stray leading blank lines, and fused
-        the SEARCH bodies of ordinary multi-block edits into a needle that
-        could never match.
-        """
-        return apply_edits(self.index.root, parse_edits(reply),
-                           backup=self.cfg.backup, dry_run=dry_run,
-                           backup_dir=backup_dir, cfg=self.cfg)
+    def _write_allowlist(self):
+        """Normalised paths this task may modify when cfg.auto_allowlist is
+        on: the files its title names plus the files gather actually read.
+        New creations stay allowed (apply_edits only gates existing files).
+        None disables the gate."""
+        if not getattr(self.cfg, "auto_allowlist", False):
+            return None
+        reads = getattr(self.cfg, "_task_reads", None)
+        if reads is None:
+            return None          # no gather ever armed the ledger
+        allowed = set(getattr(self.cfg, "_task_allowlist", None) or ())
+        allowed |= set(reads)
+        return allowed
 
-    # ------------------------------------------------------------------ resume
-    def resume_task(self, task: str, stream: bool = True, dry_run: bool = False,
-                    backup_dir=None) -> tuple[list, str]:
-        """Finish a scaffolded project whose files are still stubs.
-
-        `new --plan-only` leaves a real tree of one-line headers and a saved
-        index, so the ordinary gather loop can navigate it -- every file has an
-        outline and readable line numbers. The only thing missing is a brief that
-        says "implement these stubs" instead of "answer about this code", which
-        is what the `system` override below supplies. Everything else is the
-        normal path: gather, answer, edit blocks, repair rounds, backups, review.
-
-        Returns (results, reply)."""
-        from .scaffold import RESUME_SYSTEM
-
-        gathered = self.gather(task, verbose=True, backup_dir=backup_dir)
-        reply = self.answer(task, gathered, stream=stream, system=RESUME_SYSTEM)
-        return self.apply(reply, dry_run=dry_run, task=task, gathered=gathered,
-                          backup_dir=backup_dir)
+    def _resolve_symbol_anchors(self, edits: list) -> tuple[list, list]:
+        """Turn `SYMBOL name` anchors into LINES ranges via the index.
+        Returns (failure Results, edits left to apply). A file with a missing
+        or ambiguous symbol fails whole -- mirroring apply_edits' per-file
+        failure -- and the message feeds the repair loop."""
+        results: list = []
+        bad: set[str] = set()
+        for e in edits:
+            if not e.symbol or e.lines:
+                continue
+            want = _norm_key(e.symbol)
+            same = [c for c in self.index.find_symbol(e.symbol)
+                    if _norm_key(c.file) == _norm_key(e.file)]
+            # find_symbol also matches via class members; only a name that
+            # really ends with the symbol may be replaced.
+            exact = [c for c in same
+                     if _norm_key(c.qualname) == want
+                     or _norm_key(c.qualname).endswith("." + want)]
+            if len(exact) == 1:
+                c = exact[0]
+                # A classheader chunk stands for the whole class.
+                e.lines = (c.start, c.scope_end or c.end)
+                continue
+            bad.add(_norm_key(e.file))
+            if not same:
+                why = ("no definition by that name in this file; check the "
+                       "spelling against an `outline`")
+            elif not exact:
+                why = ("no definition NAMED that in this file (it only "
+                       "appears inside another unit); anchor with LINES "
+                       "<start>-<end> from a `read`")
+            else:
+                listing = ", ".join(f"{c.qualname} L{c.start}-{c.end}"
+                                    for c in exact[:5])
+                why = (f"{len(exact)} definitions match ({listing}); name "
+                       "one exactly or anchor with LINES <start>-<end>")
+            results.append(Result(
+                False, e.file,
+                f"SYMBOL anchor '{e.symbol}': {why}"))
+        if bad:
+            edits = [e for e in edits if _norm_key(e.file) not in bad]
+        return results, edits
 
 
 def _compact(step: dict) -> str:
-    """Render a parsed step back to text with empty fields dropped, used to
-    echo the model's own prior action into the conversation history."""
+    """Render a parsed step with empty fields dropped, to echo the model's
+    action into the conversation history."""
     keep = {k: v for k, v in step.items() if v not in ("", 0, None)}
     return str(keep)

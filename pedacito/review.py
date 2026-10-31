@@ -1,29 +1,17 @@
 """The review page: side-by-side diffs you sign off on before anything is written.
 
-Usage
------
-    from . import review
-
     diffs = review.diffs_from_results(edit_results)   # from apply_edits(dry_run=True)
     nonce = review.new_nonce()
     page = review.build_page(diffs, task, model, profile, nonce, interactive=True, stamp=when)
     outcome, detail = review.run(page, nonce, writer_fn, open_browser=True)
 
-Two halves.
+`build_page` renders a self-contained HTML file (no network, no webfonts).
+`run` serves it from a single-purpose server bound to 127.0.0.1 so the Apply and
+Cancel buttons work; requests with a foreign Host/Origin are refused.
 
-`build_page` turns edit results into a self-contained HTML file. No network,
-no webfonts, no external dependencies -- it opens from disk and works
-offline, which matters for a tool that talks to a model on your own hardware.
-
-`run` (backed by `_Handler`/`ThreadingHTTPServer`) serves that page from a
-single-purpose local server so its Apply and Cancel buttons do something. It
-binds to 127.0.0.1 only. This endpoint writes files, so it has no business
-listening on a network interface.
-
-The safety property that matters: the page carries the SHA-256 of every file
-as it was when the preview was built. Applying re-hashes and refuses on a
-mismatch. Without that, editing a file in your editor while the review sits
-open would let you write a preview built from content that no longer exists.
+Each FileDiff carries the SHA-256 of the file as previewed; applying re-hashes
+and refuses on a mismatch, so a file edited while the review sat open is never
+overwritten with a stale preview.
 """
 
 from __future__ import annotations
@@ -38,6 +26,7 @@ import webbrowser
 from dataclasses import dataclass, field
 from difflib import SequenceMatcher
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from itertools import accumulate
 from pathlib import Path
 
 from . import fileio
@@ -49,9 +38,6 @@ COLLAPSE_OVER = 10   # runs of unchanged lines longer than this get folded
 TOKEN_RE = re.compile(r"\w+|\s+|.")
 
 
-# --------------------------------------------------------------------------
-# Diff data model
-# --------------------------------------------------------------------------
 @dataclass
 class Row:
     """One rendered row of the side-by-side diff table."""
@@ -78,40 +64,24 @@ class FileDiff:
     sha: str            # file contents when the preview was built
     after_text: str     # what gets written on sign-off
     message: str
-    # For a creation detected as a rename: the old path(s) whose real bytes
-    # were moved into this file. Sign-off uses this structured data to
-    # complete the move; parsing them back out of `message` (the old
-    # behaviour) broke whenever wording or punctuation varied by locale or
-    # model, silently leaving the source file in place next to its renamed
-    # copy.
+    # For a creation detected as a rename: the old path(s) moved into this file.
     renames_from: tuple[str, ...] = ()
-    # True for the display-only row that shows a rename's SOURCE being
-    # removed ("removed (renamed to X)"). Its after_text is empty and it
-    # must never be written as a truncated file on sign-off: the move is
-    # completed by the rename-removal loop, not by writing "" over the
-    # source.
+    # Display-only row for a rename's source ("removed (renamed to X)"); never
+    # written on sign-off, the rename-removal pass deletes the source instead.
     removed_source: bool = False
 
 
-# --------------------------------------------------------------------------
-# Diff computation
-# --------------------------------------------------------------------------
-def _word_spans(a: str, b: str) -> tuple[list, list]:
-    """Compute character ranges that differ between two versions of one
-    line.
+def _sha(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
-    Line-level highlighting tells you a line changed; this tells you which
-    part, which is the whole reason to look at a diff side by side.
-    """
+
+def _word_spans(a: str, b: str) -> tuple[list, list]:
+    """Character ranges that differ between two versions of one line."""
     at, bt = TOKEN_RE.findall(a), TOKEN_RE.findall(b)
     sm = SequenceMatcher(None, at, bt, autojunk=False)
     a_spans, b_spans = [], []
-    offs_a = [0]
-    for t in at:
-        offs_a.append(offs_a[-1] + len(t))
-    offs_b = [0]
-    for t in bt:
-        offs_b.append(offs_b[-1] + len(t))
+    offs_a = [0, *accumulate(len(t) for t in at)]
+    offs_b = [0, *accumulate(len(t) for t in bt)]
     for tag, i1, i2, j1, j2 in sm.get_opcodes():
         if tag in ("replace", "delete") and i2 > i1:
             a_spans.append((offs_a[i1], offs_a[i2]))
@@ -120,17 +90,9 @@ def _word_spans(a: str, b: str) -> tuple[list, list]:
     return a_spans, b_spans
 
 
-def tag_is_last(sm, tag, i2, alen) -> bool:
-    """Return True when an equal run reaches the end of the file, so there
-    is no following change that needs trailing context."""
-    return i2 >= alen
-
-
 def build_rows(before: str, after: str) -> tuple[list[Row], int, int]:
-    """Compute the full row-by-row diff between two versions of a file's
-    text, with word-level highlight spans on replaced lines and long
-    unchanged runs collapsed behind a fold marker. Returns
-    (rows, lines_added, lines_removed)."""
+    """Row-by-row diff of two texts, with word-level spans on replaced lines
+    and long unchanged runs folded. Returns (rows, lines_added, lines_removed)."""
     a = before.split("\n")
     b = after.split("\n")
     sm = SequenceMatcher(None, a, b, autojunk=False)
@@ -147,10 +109,10 @@ def build_rows(before: str, after: str) -> tuple[list[Row], int, int]:
                 return Row("equal", i1 + k + 1, a[i1 + k], j1 + k + 1, b[j1 + k],
                            fold=fold)
 
-            # How much context to keep at each end. A run at the very top or
-            # bottom of the file only needs context on the side facing a change.
+            # A run at the top or bottom of the file only needs context on the
+            # side facing a change.
             head = 0 if not rows else CONTEXT
-            tail = 0 if tag_is_last(sm, tag, i2, len(a)) else CONTEXT
+            tail = 0 if i2 >= len(a) else CONTEXT
             if n > COLLAPSE_OVER + head + tail:
                 folds[0] += 1
                 fid = f"f{folds[0]}"
@@ -189,54 +151,40 @@ def build_rows(before: str, after: str) -> tuple[list[Row], int, int]:
                 rows.append(Row("insert", None, "", k + 1, b[k]))
                 added += 1
 
-    # Trim leading/trailing unchanged bulk that no collapse caught.
     return rows, added, removed
 
 
 def diffs_from_results(results, root=None) -> list[FileDiff]:
-    """Convert a list of edits.Result (from apply_edits(dry_run=True)) into
-    FileDiff objects ready for rendering. Only successful results with
-    computed before/after text produce a diff.
+    """Convert edits.Result objects (from apply_edits(dry_run=True)) into
+    FileDiffs. Only successful results with computed before/after text count.
 
-    `root` is the project directory; it is only consulted for rename results,
-    where the old file's real contents are shown as a deletion so the move is
-    visible on the review page instead of hidden inside the new file's note."""
+    `root` is only consulted for renames, where each source file's real
+    contents are shown as a deletion."""
     out: list[FileDiff] = []
     for r in results:
         if not r.ok or not r.sha:
             continue
         rows, added, removed = build_rows(r.before, r.after)
         out.append(FileDiff(r.file, rows, added, removed, r.sha, r.after,
-                            r.message, renames_from=tuple(getattr(r, "renames_from", ()))))
-        srcs = getattr(r, "renames_from", ())
-        if srcs and root is not None:
-            # The creation group above carries the "renamed from" note; here
-            # we render each source path's true contents being removed, using
-            # the bytes on disk (dry-run never wrote them).
-            for old in srcs:
-                try:
-                    otext, _ = fileio.read(Path(root) / old, errors="replace")
-                except OSError:
-                    continue
-                orows, oa, om = build_rows(otext, "")
-                out.append(FileDiff(old, orows, oa, om,
-                                    hashlib.sha256(otext.encode("utf-8")).hexdigest(),
-                                    "", "removed (renamed to " + r.file + ")",
-                                    removed_source=True))
+                            r.message, renames_from=tuple(r.renames_from)))
+        if root is None:
+            continue
+        for old in r.renames_from:
+            try:
+                otext, _ = fileio.read(Path(root) / old, errors="replace")
+            except OSError:
+                continue
+            orows, oa, om = build_rows(otext, "")
+            out.append(FileDiff(old, orows, oa, om, _sha(otext), "",
+                                "removed (renamed to " + r.file + ")",
+                                removed_source=True))
     return out
 
 
 def diffs_from_backup(root: Path, backup_dir: Path) -> list[FileDiff]:
-    """Reconstruct review diffs after files have already been written, by
-    pairing each file in a backup snapshot with its current content on disk.
-
-    Used by `pedacito new --review`: the build passes write directly (they
-    have no dry-run mode of their own), so the sign-off page is built from
-    the pre-build snapshots rather than from apply_edits results. The sha
-    pins the post-write bytes, so Discard can restore the originals safely.
-    Files that vanished from the working tree since the snapshot are skipped.
-    """
-    import hashlib
+    """Reconstruct diffs after files were already written, by pairing each file
+    in a backup snapshot with its current content (used by `new --review`).
+    The sha pins the post-write bytes. Files gone from the tree are skipped."""
     out: list[FileDiff] = []
     root = Path(root).resolve()
     if backup_dir is None or not Path(backup_dir).is_dir():
@@ -253,18 +201,13 @@ def diffs_from_backup(root: Path, backup_dir: Path) -> list[FileDiff]:
         if before == after:
             continue
         rows, added, removed = build_rows(before, after)
-        sha = hashlib.sha256(after.encode("utf-8")).hexdigest()
-        out.append(FileDiff(rel, rows, added, removed, sha, after,
+        out.append(FileDiff(rel, rows, added, removed, _sha(after), after,
                             f"built ({added}+ / {removed}-)"))
     return out
 
 
-# --------------------------------------------------------------------------
-# HTML rendering
-# --------------------------------------------------------------------------
 def _mark(text: str, spans: list) -> str:
-    """HTML-escape a line, wrapping the given character ranges in <mark> to
-    highlight the specific words that changed."""
+    """HTML-escape a line, wrapping the given character ranges in <mark>."""
     if not spans:
         return html.escape(text) or "&nbsp;"
     out, pos = [], 0
@@ -276,10 +219,6 @@ def _mark(text: str, spans: list) -> str:
     return "".join(out) or "&nbsp;"
 
 
-# Page styling: a self-contained stylesheet (system fonts only, no CDN) giving
-# the review page its two-column ledger appearance -- struck/set colour coding
-# for removed/added text, a sticky column header, and the sign-off stamp
-# animation shown after a successful write.
 CSS = """
 :root {
   --paper:  #e6ece4;   /* ledger stock */
@@ -334,7 +273,6 @@ main { padding: 22px 26px 150px; }
   font-family: "Cascadia Mono", Consolas, monospace;
   position: sticky; top: 0; z-index: 3; background: var(--card);
 }
-/* Column heads, so it is always obvious which side is which. */
 .file > h2::after {
   content: ""; position: absolute; left: 0; right: 0; bottom: -1px; height: 1px;
 }
@@ -361,7 +299,6 @@ td.tx {
   padding: 1px 10px; font-size: 13px; white-space: pre-wrap;
   overflow-wrap: anywhere; tab-size: 4;
 }
-/* The fold down the middle of the ledger. */
 td.gutter { border-left: 2px solid var(--rule); }
 
 tr.replace .a, tr.delete .a { background: var(--cut-bg); }
@@ -412,7 +349,7 @@ button.act:focus-visible, .attest input:focus-visible,
 tr.skip button:focus-visible { outline: 2px solid var(--stamp); outline-offset: 2px; }
 .note { margin-top: 9px; font-size: 12.5px; color: var(--ink-2); }
 
-/* Signature element: the sign-off stamp, struck across the page on apply. */
+/* Sign-off stamp shown on apply. */
 .stamp {
   position: fixed; inset: 0; display: none; place-items: center;
   background: rgba(238,241,236,0.86); z-index: 20;
@@ -444,11 +381,8 @@ tr.skip button:focus-visible { outline: 2px solid var(--stamp); outline-offset: 
 }
 """
 
-# Page behaviour: fold/unfold of collapsed unchanged runs, the two-step
-# sign-off (tick the checkbox, click once to arm, click again within 6s to
-# confirm), the Apply/Cancel POST requests to this module's local server, and
-# the sign-off stamp shown on success. Enter is explicitly blocked from
-# triggering a write.
+# Fold toggles, two-step sign-off (tick, click to arm, click again within 6s),
+# Apply/Cancel POSTs, and the sign-off stamp.
 JS = """
 document.querySelectorAll('tr.skip button').forEach(function (b) {
   b.addEventListener('click', function () {
@@ -539,8 +473,7 @@ document.addEventListener('keydown', function (e) {
 
 
 def _rows_html(fd: FileDiff, fid: int) -> str:
-    """Render one FileDiff's rows as HTML <tr> elements, including hidden
-    rows behind fold markers and word-level <mark> highlighting."""
+    """Render one FileDiff's rows as HTML <tr> elements (folded rows hidden)."""
     out = []
     for row in fd.rows:
         if row.kind == "skip":
@@ -569,10 +502,9 @@ def _rows_html(fd: FileDiff, fid: int) -> str:
 
 def build_page(diffs: list[FileDiff], task: str, model: str, profile: str,
                nonce: str, interactive: bool, stamp: str) -> str:
-    """Assemble the complete, self-contained review HTML page for a set of
-    FileDiffs. When `interactive` is True the page includes the sign-off
-    checkbox and Apply/Discard buttons wired to `nonce`; otherwise it is a
-    read-only preview (used when a review server isn't running)."""
+    """Assemble the self-contained review page. `interactive` adds the sign-off
+    checkbox and Apply/Discard buttons wired to `nonce`; otherwise the page is a
+    read-only preview."""
     files_html = []
     for i, fd in enumerate(diffs):
         files_html.append(f"""
@@ -663,21 +595,42 @@ def build_page(diffs: list[FileDiff], task: str, model: str, profile: str,
 </html>"""
 
 
-# --------------------------------------------------------------------------
-# Local server
-# --------------------------------------------------------------------------
+def request_allowed(handler, post: bool) -> bool:
+    """Guard for the loopback servers against DNS rebinding and cross-site
+    requests: Host must be this server, Origin (if sent) must match, and POSTs
+    must be JSON (a cross-site page cannot send that without a CORS preflight)."""
+    port = handler.server.server_address[1]
+    hosts = {f"127.0.0.1:{port}", f"localhost:{port}"}
+    if (handler.headers.get("Host") or "").lower() not in hosts:
+        return False
+    if not post:
+        return True
+    origin = handler.headers.get("Origin")
+    if origin and origin.lower() not in {f"http://{h}" for h in hosts}:
+        return False
+    ctype = (handler.headers.get("Content-Type") or "").split(";")[0]
+    return ctype.strip().lower() == "application/json"
+
+
+def read_json_body(handler) -> dict:
+    """Parse the request body as a JSON object; {} when absent or malformed."""
+    try:
+        n = max(0, int(handler.headers.get("Content-Length") or 0))
+        body = json.loads(handler.rfile.read(n) or b"{}")
+    except ValueError:
+        return {}
+    return body if isinstance(body, dict) else {}
+
+
 class _Handler(BaseHTTPRequestHandler):
-    """HTTP request handler for the review server: serves the page on GET,
-    and handles /apply and /cancel POST requests from the page's JS."""
+    """Serves the review page on GET and handles /apply and /cancel POSTs."""
 
     server_version = "Pedacito"
 
     def log_message(self, *a):
-        """Suppress default request logging to stderr."""
         pass
 
     def _send(self, code: int, body: bytes, ctype: str) -> None:
-        """Write one complete HTTP response."""
         self.send_response(code)
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(body)))
@@ -686,29 +639,26 @@ class _Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def do_GET(self):
-        """Serve the review page at "/"; 404 for anything else."""
+        if not request_allowed(self, post=False):
+            self._send(403, b"forbidden", "text/plain")
+            return
         if self.path.split("?")[0] != "/":
             self._send(404, b"not found", "text/plain")
             return
         self._send(200, self.server.page.encode("utf-8"), "text/html; charset=utf-8")
 
     def do_POST(self):
-        """Handle /cancel (end the review with no changes) and /apply
-        (verify the nonce, call the server's writer function, and report the
-        outcome as JSON)."""
+        if not request_allowed(self, post=True):
+            self._send(403, b'{"ok":false}', "application/json")
+            return
         path = self.path.split("?")[0]
-        try:
-            n = int(self.headers.get("Content-Length") or 0)
-            body = json.loads(self.rfile.read(n) or b"{}")
-        except (ValueError, json.JSONDecodeError):
-            body = {}
+        body = read_json_body(self)
 
         if path == "/cancel":
             self.server.outcome = ("cancelled", "No files were changed.")
-            on_discard = getattr(self.server, "on_discard", None)
-            if on_discard is not None:
+            if self.server.on_discard is not None:
                 try:
-                    on_discard()
+                    self.server.on_discard()
                 except Exception as e:          # never hang the review loop
                     self.server.outcome = ("cancelled", f"Discard failed: {e}")
             self._send(200, b'{"ok":true}', "application/json")
@@ -735,32 +685,25 @@ class _Handler(BaseHTTPRequestHandler):
 
 
 def write_files(root: Path, diffs: list[FileDiff], backup_dir: Path | None):
-    """Write the reviewed text for every FileDiff to disk.
+    """Write the reviewed text for every FileDiff to disk. Returns (ok, message).
 
-    Two passes for safety. Pass one refuses the whole operation if any file
-    that already exists has changed (or vanished) since the preview's sha was
-    recorded -- but a diff whose target is *absent* with an empty pinned sha
-    is a new-file creation (apply_edits records sha256 of ""), so its absence
-    is expected and not stale. Pass two writes, refusing again on a collision:
-    if a path from a creation diff now exists with different bytes, something
-    else created it while the review page sat open, and overwriting it
-    silently would destroy those contents. Backs up originals to `backup_dir`
-    first when given. Returns (ok, message)."""
-    EMPTY_SHA = hashlib.sha256(b"").hexdigest()
+    Pass one refuses the whole batch if any existing file changed (or vanished)
+    since its sha was recorded; a creation diff pins the sha of "" so its
+    absence is expected. A creation whose path now exists with different bytes
+    is refused too. Pass two writes, backing originals up to `backup_dir`
+    (never overwriting an existing backup), then completes renames by removing
+    their sources."""
+    EMPTY_SHA = _sha("")
 
     def _digest(p: Path) -> str:
-        # read_bytes straight off the Path (not fileio.read_text): that keeps
-        # this check honest under concurrent deletes -- a vanished file raises
-        # FileNotFoundError here rather than being swallowed by an errors=
-        # "replace" text read -- and it hashes the exact bytes on disk.
+        # Raw bytes, so a concurrently deleted file is seen as absent rather
+        # than as an empty text read.
         try:
-            return hashlib.sha256(Path(p).read_bytes()).hexdigest()
+            return hashlib.sha256(p.read_bytes()).hexdigest()
         except FileNotFoundError:
             return EMPTY_SHA
 
     if not diffs:
-        # An empty diff list means every block failed to anchor; applying
-        # "successfully" here would silently write nothing.
         return False, ("Not written: this review contains no applicable "
                        "changes. Re-run the task to rebuild the review.")
     stale = []
@@ -770,41 +713,24 @@ def write_files(root: Path, diffs: list[FileDiff], backup_dir: Path | None):
             if fd.sha and fd.sha != EMPTY_SHA:
                 stale.append(f"{fd.rel} (deleted)")
             continue
-        current = _digest(p)
-        # A creation diff pins the empty string's digest; anything else pins
-        # real pre-edit bytes. If the bytes on disk now equal what the preview
-        # intends to write, the edit is already applied -- not stale.
-        if current != fd.sha and current != hashlib.sha256(
-                fd.after_text.encode("utf-8")).hexdigest():
+        # Bytes already equal to what we would write: applied, not stale.
+        if _digest(p) not in (fd.sha, _sha(fd.after_text)):
             stale.append(f"{fd.rel} (changed on disk)")
     if stale:
         return False, ("Not written: " + ", ".join(stale) +
                        ". Re-run the task to rebuild the review.")
 
-    # Collision check before touching disk: a creation whose path appeared in
-    # the meantime must not be clobbered.
     for fd in diffs:
         p = root / fd.rel
-        if not fd.sha and p.exists() and _digest(p) != hashlib.sha256(
-                fd.after_text.encode("utf-8")).hexdigest():
+        if not fd.sha and p.exists() and _digest(p) != _sha(fd.after_text):
             return False, (f"Not written: {fd.rel} was created by something "
                            "else while this review was open. Re-run the task "
                            "to rebuild the review.")
 
-    # Snapshot which paths exist *before* writing anything. Pass two below
-    # re-checks existence at write time: a vanished path that pass one saw
-    # (a concurrent delete, or an earlier rename-stub in this very batch)
-    # must fail cleanly here instead of crashing the review server with a
-    # FileNotFoundError from fileio.read().
     default_style = fileio.TextStyle()
     existed_at_check = {fd.rel: (root / fd.rel).exists() for fd in diffs}
     written = []
     for fd in diffs:
-        # A rename's source is shown as its own "removed (renamed to ...)"
-        # row for display, but it must not be written as an empty file here:
-        # the rename-removal loop below actually deletes it. Writing "" over
-        # it first would clobber the real bytes and make the removal loop's
-        # sha check refuse the move ("changed since preview").
         if fd.removed_source:
             continue
         p = root / fd.rel
@@ -814,46 +740,31 @@ def write_files(root: Path, diffs: list[FileDiff], backup_dir: Path | None):
             elif existed_at_check[fd.rel]:
                 raise FileNotFoundError
             else:
-                # New-file creation: nothing on disk to read or back up.
-                original, style = "", default_style
+                original, style = "", default_style     # new file
         except FileNotFoundError:
-            # The file vanished between the snapshot and this read (a
-            # concurrent delete, or a rename-stub earlier in this batch).
-            # Fail cleanly with an honest partial-apply message instead of
-            # crashing the review server mid-request.
             return False, (f"Partially written: {fd.rel} vanished between "
                            "preview check and write; files already written "
                            "in this batch: " + (", ".join(written) or "none") +
                            ". Re-run the task to rebuild the review.")
         if backup_dir is not None and original:
             dest = backup_dir / fd.rel
-            dest.parent.mkdir(parents=True, exist_ok=True)
-            fileio.write(dest, original, style)
-        # Creation diffs can target a path whose parent directory does not
-        # exist yet (e.g. renaming into game1/index.html); without this the
-        # write would die with FileNotFoundError mid-batch.
+            if not dest.exists():
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                fileio.write(dest, original, style)
         p.parent.mkdir(parents=True, exist_ok=True)
         fileio.write(p, fd.after_text, style)
         written.append(fd.rel)
 
-    # Rename sources: prefer the structured FileDiff.renames_from recorded at
-    # preview time. The old path parsed "renamed from X" out of the message
-    # string, which broke whenever wording varied -- and a missed removal
-    # leaves the original sitting next to its renamed copy while the review
-    # claims success. At preview time X still held its content (the clearing
-    # block was folded into the move), so its recorded sha is X's pre-rename
-    # digest. If X is still on disk with exactly those bytes, complete the
-    # move by removing it; if anything else changed it meanwhile, leave it
-    # alone and say so.
     removed = []
     rename_notes = []
+    root_resolved = root.resolve()
 
     def _remove_rename_source(old: str, expect_sha: str) -> None:
         op = root / old
-        if not op.is_file():
+        if not op.is_file() or not op.resolve().is_relative_to(root_resolved):
             return
         try:
-            cur = hashlib.sha256(Path(op).read_bytes()).hexdigest()
+            cur = hashlib.sha256(op.read_bytes()).hexdigest()
         except OSError:
             return
         if expect_sha and cur != expect_sha:
@@ -861,37 +772,25 @@ def write_files(root: Path, diffs: list[FileDiff], backup_dir: Path | None):
             return
         if backup_dir is not None:
             dest = backup_dir / old
-            dest.parent.mkdir(parents=True, exist_ok=True)
-            try:
-                otext, ostyle = fileio.read(op, errors="replace")
-                fileio.write(dest, otext, ostyle)
-            except OSError:
-                pass
+            if not dest.exists():
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                try:
+                    otext, ostyle = fileio.read(op, errors="replace")
+                    fileio.write(dest, otext, ostyle)
+                except OSError:
+                    pass
         try:
             op.unlink()
             removed.append(old)
         except OSError:
             rename_notes.append(f"{old} could not be removed")
 
-    import re as _re
     for fd in diffs:
-        srcs = tuple(getattr(fd, "renames_from", ()) or ())
-        if srcs:
-            for old in srcs:
-                # The matching removal row (when the page rendered one) pins
-                # the source's pre-rename bytes; fall back to no sha check
-                # only when it is absent.
-                pin = next((d.sha for d in diffs
-                            if d.rel == old and d.removed_source), "")
-                _remove_rename_source(old.strip(), pin)
-            continue
-        # Legacy fallback: older staged pages carry no renames_from field, so
-        # they still get parsed from the message text.
-        m = _re.search(r"renamed from ([^()]+?)(?: \(|$)", fd.message or "")
-        if "renamed from" not in (fd.message or "") or not m:
-            continue
-        for old in (s.strip() for s in m.group(1).split(",")):
-            _remove_rename_source(old, "")
+        for old in fd.renames_from:
+            # The matching removal row pins the source's pre-rename bytes.
+            pin = next((d.sha for d in diffs
+                        if d.rel == old and d.removed_source), "")
+            _remove_rename_source(old.strip(), pin)
 
     msg = f"{len(written)} file(s) written: " + ", ".join(written)
     if removed:
@@ -902,8 +801,7 @@ def write_files(root: Path, diffs: list[FileDiff], backup_dir: Path | None):
 
 
 def save(root: Path, page: str, stamp: str) -> Path:
-    """Save the rendered review page to .pedacito/reviews/<stamp>.html for
-    later reference, and return its path."""
+    """Save the page to .pedacito/reviews/<stamp>.html and return its path."""
     d = state_dir(root, REVIEW_DIR)
     d.mkdir(parents=True, exist_ok=True)
     p = d / f"{stamp}.html"
@@ -913,14 +811,10 @@ def save(root: Path, page: str, stamp: str) -> Path:
 
 def run(page: str, nonce: str, writer, port: int = 0, open_browser: bool = True,
         timeout: float = 1800.0, on_url=None, on_discard=None):
-    """Start a local review server bound to 127.0.0.1, optionally open it in
-    a browser, and block until the person clicks Apply/Discard or `timeout`
-    seconds pass. `writer` is called on Apply to actually write files (e.g.
-    `write_files`). `on_discard`, if given, is called when the reviewer is
-    cancelled -- used by flows whose files are already on disk (see
-    scaffold's `new --review`) to undo the build from the snapshot. Returns
-    (outcome, detail) where outcome is one of "applied", "cancelled", or
-    "timeout"."""
+    """Serve the page on 127.0.0.1 and block until Apply/Discard or `timeout`
+    seconds. `writer()` -> (ok, detail) is called on Apply; `on_discard()` on
+    Discard, for flows whose files are already on disk (`new --review`).
+    Returns (outcome, detail); outcome is "applied", "cancelled" or "timeout"."""
     srv = ThreadingHTTPServer(("127.0.0.1", port), _Handler)
     srv.page = page
     srv.nonce = nonce
@@ -948,6 +842,5 @@ def run(page: str, nonce: str, writer, port: int = 0, open_browser: bool = True,
 
 
 def new_nonce() -> str:
-    """Generate a fresh single-use token used to authorise one review's
-    Apply request."""
+    """A fresh token authorising one review's Apply request."""
     return secrets.token_urlsafe(16)

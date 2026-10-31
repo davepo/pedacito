@@ -22,7 +22,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from pedacito import config as config_mod
 from pedacito import edits
 from pedacito.agent import Agent
-from pedacito.llm import LMStudio, LLMError
+from pedacito.llm import LLMClient, LLMError
 
 
 def _free_port() -> int:
@@ -884,6 +884,25 @@ def test_auto_fit_clamps_hosted_profile_to_small_window():
         f"post-fit warnings: {config_mod.budget_warnings(cfg)}"
 
 
+def test_top_level_sampler_table_is_accepted(tmp_path):
+    cfgfile = tmp_path / "c.toml"
+    cfgfile.write_text('vram_gb = 8\n[sampler]\ntop_k = 40\n', encoding="utf-8")
+    cfg = config_mod.load(explicit=cfgfile, use_env=False)
+    assert cfg.sampler == {"top_k": 40}
+
+
+def test_config_command_reports_invalid_profile_tier(tmp_path, monkeypatch, capsys):
+    from pedacito.cli import main
+    monkeypatch.setattr(config_mod, "USER_CONFIG", tmp_path / "none.toml")
+    cfgfile = tmp_path / "c.toml"
+    cfgfile.write_text(
+        'default_profile = "ok"\nvram_gb = 8\n'
+        '[profiles.ok]\nmodel = "m"\n[profiles.bad]\ntier = "bogus"\n',
+        encoding="utf-8")
+    assert main(["config", "--config", str(cfgfile), "--root", str(tmp_path)]) == 0
+    assert "bad" in capsys.readouterr().out
+
+
 def test_vram_setting_mandatory_for_local_servers(tmp_path):
     """vram_gb is required for local runs (auto-fit needs it), but hosted
     APIs run elsewhere and must not demand local specs."""
@@ -898,7 +917,7 @@ def test_vram_setting_mandatory_for_local_servers(tmp_path):
     local.write_text('[server]\nbase_url = "http://localhost:1234/v1"\n'
                      'model = "m"\nvram = 8\n', encoding="utf-8")
     cfg = config_mod.load(explicit=local, use_env=False)
-    assert cfg.vram_gb == cfg.vram == 8
+    assert cfg.vram_gb == 8
 
     hosted = tmp_path / "hosted.toml"
     hosted.write_text('[server]\nbase_url = "https://api.deepseek.com/v1"\n'
@@ -1032,7 +1051,7 @@ def test_lemonade_loaded_options_win_over_list_default(monkeypatch):
     monkeypatch.setattr(llm_mod.requests, "get", fake_get)
     cfg = config_mod.Config(base_url="http://localhost:13305/v1",
                             model="qwen_coder_25")
-    client = llm_mod.LMStudio(cfg)
+    client = llm_mod.LLMClient(cfg)
     assert client._lemonade_health_context("http://localhost:13305") == \
         (32768, 262144)
     assert client._lemonade_options_context("http://localhost:13305") == 32768
@@ -1096,7 +1115,7 @@ def test_server_configured_context_wins_over_vram_estimate(monkeypatch):
                     "max_context_length": 262144,
                     "source": "lemonade"}
 
-    monkeypatch.setattr(llm_mod, "LMStudio", FakeServer)
+    monkeypatch.setattr(llm_mod, "LLMClient", FakeServer)
     cfg = config_mod.Config()
     cfg.base_url = "http://localhost:13305/v1"
     cfg.model = "qwen3-32b"
@@ -1403,7 +1422,7 @@ def test_truncated_json_gets_token_limit_error():
         cfg = config_mod.Config()
         cfg.base_url = f"http://127.0.0.1:{p2}/v1"
         cfg.model = "fake-model"
-        client = LMStudio(cfg)
+        client = LLMClient(cfg)
         obj = client.chat_json([{"role": "user", "content": "go"}],
                                {"type": "object"}, max_tokens=64)
         assert obj.get("action") == "read", \
@@ -1463,7 +1482,7 @@ def test_unrecoverable_truncation_raises_token_limit_error():
         cfg = config_mod.Config()
         cfg.base_url = f"http://127.0.0.1:{p2}/v1"
         cfg.model = "fake-model"
-        client = LMStudio(cfg)
+        client = LLMClient(cfg)
         with pytest.raises(LLMError) as exc:
             client.chat_json([{"role": "user", "content": "go"}],
                              {"type": "object"}, max_tokens=64)
@@ -1488,7 +1507,7 @@ def test_truncated_no_json_gets_no_reasoning_reask():
     cfg = Config()
     cfg.json_mode = "object"
 
-    class Fake(LMStudio):
+    class Fake(LLMClient):
         def __init__(self, replies):
             object.__init__(self)
             self.cfg = cfg
@@ -1718,7 +1737,7 @@ def test_single_quoted_dict_reply_salvage():
     reply = ("{'action': 'read', 'file': 'subj-imp/index.html', "
              "'start': 405, 'end': 445, "
              "'reasoning': 'See subj-imp script tag'}")
-    client = LMStudio.__new__(LMStudio)          # no network needed
+    client = LLMClient.__new__(LLMClient)          # no network needed
     client.cfg = config_mod.Config(base_url="http://x.invalid/v1", model="m",
                         json_mode="object")
     client.stats = {"calls": 0, "prompt_tokens": 0,
@@ -1745,13 +1764,13 @@ def test_step_truncation_salvage_no_escalation():
     the old 7000->14000->28000 escalation loop that killed DeepSeek runs.
     A schema WITH a large field (answer-style) must still escalate-retry."""
     import json as _json
-    from pedacito.llm import LMStudio
+    from pedacito.llm import LLMClient
     from pedacito.tools import STEP_SCHEMA
     from pedacito.config import Config
 
     cfg = Config(); cfg.json_mode = "object"
 
-    class Fake(LMStudio):
+    class Fake(LLMClient):
         def __init__(self, replies, finish="length"):
             object.__init__(self)
             self.cfg = cfg; self.replies = list(replies); self.n = 0
@@ -1813,13 +1832,13 @@ def test_step_truncation_names_the_cut_payload_field():
     cut field (truncated_field) so gather() can refuse the step, treat
     'reasoning' as the benign case, and not be fooled by escaped quotes
     inside a JS payload."""
-    from pedacito.llm import LMStudio
+    from pedacito.llm import LLMClient
     from pedacito.tools import STEP_SCHEMA
     from pedacito.config import Config
 
     cfg = Config(); cfg.json_mode = "object"
 
-    class Fake(LMStudio):
+    class Fake(LLMClient):
         def __init__(self, replies, finish="length"):
             object.__init__(self)
             self.cfg = cfg; self.replies = list(replies); self.n = 0
@@ -2039,11 +2058,11 @@ def test_lemonade_model_metadata_is_absorbed():
     """Lemonade extends OpenAI /v1/models with `size` (GB), context_length,
     and max_context_window instead of LM Studio's size_bytes. Those must
     feed the same hardware estimate, or Lemonade silently loses the feature."""
-    from pedacito.llm import LMStudio, _server_root
+    from pedacito.llm import LLMClient, _server_root
 
     cfg = config_mod.Config(base_url="http://localhost:13305/api/v1",
                             model="Qwen3-0.6B-GGUF")
-    got = LMStudio(cfg)._absorb_model_list([{
+    got = LLMClient(cfg)._absorb_model_list([{
         "id": "Qwen3-0.6B-GGUF",
         "owned_by": "lemonade",
         "recipe": "llamacpp",
@@ -2069,8 +2088,8 @@ def test_tier_budgets_are_monotonic():
             "max_gathered_chars", "max_read_lines", "max_spec_chars",
             "max_new_files", "max_steps", "context_tokens", "reserve_tokens",
             "repair_rounds")
-    for lower, higher in (("small", "medium"), ("medium", "large"),
-                          ("large", "hosted")):
+    for lower, higher in (("tiny", "small"), ("small", "medium"),
+                          ("medium", "large"), ("large", "hosted")):
         for key in keys:
             assert config_mod.PRESETS[higher][key] >= \
                 config_mod.PRESETS[lower][key], \
@@ -2202,7 +2221,7 @@ def test_streaming_stops_a_degenerate_tool_call_loop(monkeypatch):
     cfg = config_mod.Config()
     cfg.base_url = "http://127.0.0.1:1/v1"
     cfg.model = "m"
-    client = LMStudio(cfg)
+    client = LLMClient(cfg)
     reply = client.chat([{"role": "user", "content": "go"}],
                         max_tokens=100, stream=True)
     assert response.closed, "the runaway stream was not closed"
@@ -2256,7 +2275,7 @@ def test_streaming_empty_answer_with_hidden_reasoning_disables_thinking(
     cfg = config_mod.Config()
     cfg.base_url = "http://127.0.0.1:1/v1"
     cfg.model = "m"
-    client = LMStudio(cfg)
+    client = LLMClient(cfg)
     reply = client.chat([{"role": "user", "content": "go"}],
                         max_tokens=100, stream=True)
     assert reply == "REPORT"
@@ -2297,7 +2316,7 @@ def test_streaming_empty_answer_retries_are_bounded(monkeypatch):
     cfg = config_mod.Config()
     cfg.base_url = "http://127.0.0.1:1/v1"
     cfg.model = "m"
-    client = LMStudio(cfg)
+    client = LLMClient(cfg)
     reply = client.chat([{"role": "user", "content": "go"}],
                         max_tokens=100, stream=True)
     assert reply == ""
@@ -2332,13 +2351,44 @@ def test_stream_collector_counts_hidden_reasoning(monkeypatch):
     cfg = config_mod.Config()
     cfg.base_url = "http://127.0.0.1:1/v1"
     cfg.model = "m"
-    client = LMStudio(cfg)
+    client = LLMClient(cfg)
     reply = client._chat_once([{"role": "user", "content": "go"}],
                               100, None, True, None)
     assert reply == ""
     assert client.last_reasoning_chars == 9         # 3 x "hmm"
     assert client.last_finish_reason == "length"
     assert client.stream_truncated is True          # budget died mid-thought
+
+
+def test_stream_collector_counts_ollama_reasoning_field(monkeypatch):
+    """Ollama streams hidden thinking as `reasoning`, not `reasoning_content`."""
+    reasoning = ('data: {"choices":[{"delta":{"reasoning":"hmm"},'
+                 '"finish_reason":null}]}')
+
+    class Resp:
+        status_code = 200
+        text = ""
+
+        def iter_lines(self, decode_unicode=False):
+            yield reasoning
+            yield "data: [DONE]"
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr("pedacito.llm.requests.post", lambda *a, **k: Resp())
+    cfg = config_mod.Config()
+    cfg.base_url = "http://127.0.0.1:1/v1"
+    cfg.model = "m"
+    client = LLMClient(cfg)
+    client._chat_once([{"role": "user", "content": "go"}], 100, None, True, None)
+    assert client.last_reasoning_chars == 3
+
+
+def test_repair_truncated_json_keeps_false_and_null_values():
+    from pedacito.llm import repair_truncated_json
+    fixed = repair_truncated_json('{"a": false, "b": null, "c": true, "d": "cut')
+    assert json.loads(fixed) == {"a": False, "b": None, "c": True, "d": "cut"}
 
 
 def test_answer_brief_does_not_prime_native_tool_call_syntax():
@@ -2350,3 +2400,371 @@ def test_answer_brief_does_not_prime_native_tool_call_syntax():
     assert "<tool_call>" not in low
     assert "<invoke" not in low
     assert "no tools are available" in low
+
+
+def _block(rel: str, search: str, replace: str) -> str:
+    return (f"--- FILE: {rel}\n<<<<<<< SEARCH\n{search}\n=======\n"
+            f"{replace}\n>>>>>>> REPLACE\n")
+
+
+def test_rename_never_reads_or_removes_a_source_outside_the_root(tmp_path):
+    root = tmp_path / "proj"
+    root.mkdir()
+    secret = tmp_path / "secret.py"
+    secret.write_text("TOKEN = 1\n", encoding="utf-8")
+    reply = (_block("new.py", "", "# moved from secret.py")
+             + _block("../secret.py", "TOKEN = 1", ""))
+    results = edits.apply_edits(root, edits.parse_edits(reply), backup=False)
+    assert secret.read_text(encoding="utf-8") == "TOKEN = 1\n"
+    assert not (root / "new.py").exists()
+    assert any("outside project root" in r.message for r in results)
+
+
+def test_ambiguous_exact_match_is_never_resolved_by_fuzzy_anchoring():
+    line = "    value = compute(alpha, beta)"
+    hay = "\n".join(["def f():", line, "    return value", "",
+                     "def g():", line, "    return value",
+                     "def h():", "    value = compute(alpha, gamma)",
+                     "    return value"])
+    cfg = type("C", (), {"fuzzy_match": True, "fuzzy_min_ratio": 0.5,
+                         "max_read_lines": 200})()
+    assert edits.locate(hay, line, cfg) is None
+
+
+def test_fuzzy_anchor_matches_a_near_miss():
+    hay = "\n".join(["def a():", "    x = 1", "    return x", "",
+                     "def b():", "    y = 2", "    return y"])
+    needle = "def b():\n    y = 3\n    return y"
+    cfg = type("C", (), {"fuzzy_match": True, "fuzzy_min_ratio": 0.6,
+                         "max_read_lines": 200})()
+    span = edits.locate(hay, needle, cfg, replacement="X")
+    assert span is not None and span.fuzzy
+    assert hay[span.start:span.stop] == "def b():\n    y = 2\n    return y"
+    assert edits.locate(hay, needle, None) is None
+
+
+def test_non_utf8_file_is_refused_not_a_crash(tmp_path):
+    p = tmp_path / "latin.txt"
+    p.write_bytes("caf\xe9 = 1\n".encode("latin-1"))
+    results = edits.apply_edits(tmp_path, edits.parse_edits(
+        _block("latin.txt", "= 1", "= 2")), backup=False)
+    assert not results[0].ok and "UTF-8" in results[0].message
+    assert p.read_bytes() == "caf\xe9 = 1\n".encode("latin-1")
+
+
+def test_backup_dir_keeps_the_first_snapshot_of_a_file(tmp_path):
+    (tmp_path / "a.txt").write_bytes(b"one\r\ntwo\r\n")
+    snap = tmp_path / "snap"
+    for old, new in (("one", "uno"), ("uno", "eins")):
+        res = edits.apply_edits(tmp_path, edits.parse_edits(
+            _block("a.txt", old, new)), backup_dir=snap)
+        assert res[0].ok, res[0].message
+    assert (snap / "a.txt").read_bytes() == b"one\r\ntwo\r\n"
+    assert (tmp_path / "a.txt").read_bytes() == b"eins\r\ntwo\r\n"
+
+
+def test_dry_run_does_not_create_directories(tmp_path):
+    edits.apply_edits(tmp_path, edits.parse_edits(
+        _block("newdir/mod.py", "", "x = 1")), backup=False, dry_run=True)
+    assert not (tmp_path / "newdir").exists()
+
+
+# ------------------------------------------------- structured output modes
+class _JsonResp:
+    """Minimal buffered chat-completions reply."""
+    status_code = 200
+    text = ""
+
+    def __init__(self, content='{"action": "done", "file": "", '
+                                '"reasoning": "probe"}'):
+        self._content = content
+
+    def json(self):
+        return {"choices": [{"message": {"content": self._content},
+                             "finish_reason": "stop"}]}
+
+
+def _client(base_url: str = "http://127.0.0.1:1/v1") -> LLMClient:
+    cfg = config_mod.Config()
+    cfg.base_url = base_url
+    cfg.model = "m"
+    return LLMClient(cfg)
+
+
+def test_schema_example_covers_every_field_type():
+    from pedacito.llm import _schema_example
+    schema = {"properties": {
+        "action": {"type": "string", "enum": ["read", "done"]},
+        "start": {"type": "integer"},
+        "ratio": {"type": "number"},
+        "flag": {"type": "boolean"},
+        "items": {"type": "array"},
+        "nested": {"type": "object"},
+        "text": {"type": "string"},
+    }}
+    assert json.loads(_schema_example(schema)) == {
+        "action": "read", "start": 0, "ratio": 0, "flag": False,
+        "items": [], "nested": {}, "text": ""}
+    assert _schema_example({}) == "{}"
+
+
+def test_unsupported_schema_mode_falls_back_to_a_few_shot_example(monkeypatch):
+    """With the probe verdict `_schema_supported is False`, chat_json must
+    prompt with the field list plus a concrete example instead of sending a
+    response_format the server 400s on."""
+    posts = []
+
+    def fake_post(*a, **k):
+        posts.append(k["json"])
+        return _JsonResp('{"ok": true}')
+
+    monkeypatch.setattr("pedacito.llm.requests.post", fake_post)
+    client = _client()
+    client._schema_supported = False
+    schema = {"properties": {
+        "action": {"type": "string", "enum": ["read", "done"]},
+        "reasoning": {"type": "string"}}}
+    out = client._chat_once([{"role": "user", "content": "go"}],
+                            100, schema, False, None)
+    assert out == '{"ok": true}'
+    body = posts[0]
+    assert "response_format" not in body
+    prompt = body["messages"][-1]["content"]
+    assert "Reply with one JSON object only" in prompt
+    assert '{"action": "read", "reasoning": ""}' in prompt
+
+
+def test_supported_schema_mode_sends_the_grammar(monkeypatch):
+    posts = []
+
+    def fake_post(*a, **k):
+        posts.append(k["json"])
+        return _JsonResp('{"ok": true}')
+
+    monkeypatch.setattr("pedacito.llm.requests.post", fake_post)
+    client = _client()
+    client._schema_supported = True
+    schema = {"properties": {"action": {"type": "string"}}}
+    client._chat_once([{"role": "user", "content": "go"}],
+                      100, schema, False, None)
+    fmt = posts[0]["response_format"]
+    assert fmt["type"] == "json_schema"
+    assert fmt["json_schema"]["schema"] == schema
+
+
+def test_probe_json_modes_tries_all_three_and_remembers_the_verdict(
+        monkeypatch, tmp_path):
+    monkeypatch.setattr(config_mod, "USER_CONFIG", tmp_path / "config.toml")
+    posts = []
+
+    def fake_post(*a, **k):
+        posts.append(k["json"])
+        return _JsonResp()
+
+    monkeypatch.setattr("pedacito.llm.requests.post", fake_post)
+    client = _client()
+    results = client.probe_json_modes()
+    assert [(m, ok) for m, ok, _ in results] == [
+        ("json_schema", True), ("json_object", True), ("prompt", True)]
+    assert client._schema_supported is True
+    assert posts[0]["response_format"]["type"] == "json_schema"
+    assert posts[1]["response_format"] == {"type": "json_object"}
+    assert "response_format" not in posts[2]
+    # the verdict is remembered per server+model, so runs skip the probe
+    from pedacito import llm as llm_mod
+    assert llm_mod._load_mode_cache(client.cfg.base_url, "m") is True
+
+
+def test_probe_json_modes_records_a_negative_verdict(monkeypatch, tmp_path):
+    monkeypatch.setattr(config_mod, "USER_CONFIG", tmp_path / "config.toml")
+    monkeypatch.setattr("pedacito.llm.requests.post",
+                        lambda *a, **k: _JsonResp("sorry, I cannot"))
+    client = _client()
+    results = client.probe_json_modes()
+    assert [ok for _m, ok, _ in results] == [False, False, False]
+    assert client._schema_supported is False
+    from pedacito import llm as llm_mod
+    assert llm_mod._load_mode_cache(client.cfg.base_url, "m") is False
+
+
+def test_probe_json_modes_survives_server_errors(monkeypatch, tmp_path):
+    monkeypatch.setattr(config_mod, "USER_CONFIG", tmp_path / "config.toml")
+
+    class Boom:
+        status_code = 500
+        text = "boom"
+
+    monkeypatch.setattr("pedacito.llm.requests.post", lambda *a, **k: Boom())
+    client = _client()
+    results = client.probe_json_modes()
+    assert len(results) == 3
+    assert all(not ok for _m, ok, _d in results)
+    assert "500" in results[0][2]
+    assert client._schema_supported is False
+
+
+def test_probe_json_modes_skips_the_verdict_in_object_mode(monkeypatch,
+                                                           tmp_path):
+    monkeypatch.setattr(config_mod, "USER_CONFIG", tmp_path / "config.toml")
+    monkeypatch.setattr("pedacito.llm.requests.post",
+                        lambda *a, **k: _JsonResp())
+    client = _client()
+    client.cfg.json_mode = "object"
+    results = client.probe_json_modes()
+    assert all(ok for _m, ok, _ in results)
+    assert client._schema_supported is None       # verdict not adopted...
+    assert not (tmp_path / "server_modes.json").exists()   # ...nor saved
+
+
+def test_mode_cache_roundtrip_expiry_and_corruption(tmp_path, monkeypatch):
+    monkeypatch.setattr(config_mod, "USER_CONFIG", tmp_path / "config.toml")
+    from pedacito import llm as llm_mod
+    assert llm_mod._load_mode_cache("http://x/v1", "m") is None
+    llm_mod._save_mode_cache("http://x/v1", "m", True)
+    assert llm_mod._load_mode_cache("http://x/v1", "m") is True
+    assert llm_mod._load_mode_cache("http://x/v1", "other") is None
+    assert llm_mod._load_mode_cache("http://x/v1/", "m") is True  # rstrip'd
+    path = tmp_path / "server_modes.json"
+    data = json.loads(path.read_text(encoding="utf-8"))
+    data["http://x/v1|m"]["ts"] = time.time() - llm_mod._MODE_CACHE_TTL - 10
+    path.write_text(json.dumps(data), encoding="utf-8")
+    assert llm_mod._load_mode_cache("http://x/v1", "m") is None   # stale
+    path.write_text("{not json", encoding="utf-8")
+    assert llm_mod._load_mode_cache("http://x/v1", "m") is None   # corrupt
+
+
+# ------------------------------------------------------- tokenizer probing
+def test_calibrate_tokenizer_reads_the_count_shape(monkeypatch):
+    from pedacito.llm import _TOKENIZER_SAMPLE
+    urls = []
+
+    class Resp:
+        status_code = 200
+
+        def json(self):
+            return {"count": len(_TOKENIZER_SAMPLE) // 2}
+
+    def fake_post(url, **k):
+        urls.append(url)
+        return Resp()
+
+    monkeypatch.setattr("pedacito.llm.requests.post", fake_post)
+    client = _client()
+    client.calibrate_tokenizer()
+    assert urls == ["http://127.0.0.1:1/api/v0/tokenize"]   # first hit wins
+    assert abs(client.chars_per_token - 2.0) < 0.05
+    assert 48 <= client.estimate_tokens("x" * 100) <= 52
+
+
+def test_calibrate_tokenizer_falls_back_to_the_llamacpp_endpoint(monkeypatch):
+    from pedacito.llm import _TOKENIZER_SAMPLE
+    urls = []
+
+    class Missing:
+        status_code = 404
+
+        def json(self):
+            return {}
+
+    class Tokens:
+        status_code = 200
+
+        def json(self):
+            return {"tokens": ["t"] * (len(_TOKENIZER_SAMPLE) // 4)}
+
+    def fake_post(url, **k):
+        urls.append(url)
+        return Missing() if len(urls) == 1 else Tokens()
+
+    monkeypatch.setattr("pedacito.llm.requests.post", fake_post)
+    client = _client()
+    client.calibrate_tokenizer()
+    assert urls == ["http://127.0.0.1:1/api/v0/tokenize",
+                    "http://127.0.0.1:1/tokenize"]
+    assert abs(client.chars_per_token - 4.0) < 0.1
+
+
+def test_calibrate_tokenizer_keeps_the_heuristic_without_an_endpoint(
+        monkeypatch):
+    class Missing:
+        status_code = 404
+
+        def json(self):
+            return {}
+
+    monkeypatch.setattr("pedacito.llm.requests.post",
+                        lambda *a, **k: Missing())
+    client = _client()
+    client.calibrate_tokenizer()
+    assert client.chars_per_token == 0.0
+    from pedacito import llm as llm_mod
+    assert client.estimate_tokens("hello world") == \
+        llm_mod.estimate_tokens("hello world")
+
+
+def test_calibrate_tokenizer_rejects_implausible_ratios(monkeypatch):
+    class Resp:
+        status_code = 200
+
+        def json(self):
+            return {"count": 1}          # ~700 chars/token: nonsense
+
+    monkeypatch.setattr("pedacito.llm.requests.post", lambda *a, **k: Resp())
+    client = _client()
+    client.calibrate_tokenizer()
+    assert client.chars_per_token == 0.0
+
+
+def test_model_info_takes_the_largest_context_length(monkeypatch):
+    class GetResp:
+        status_code = 404
+
+        def json(self):
+            return {}
+
+    class ShowResp:
+        status_code = 200
+
+        def json(self):
+            return {"size": 4_000_000_000,
+                    "model_info": {"llama.context_length": 4096,
+                                   "qwen2.context_length": 32768}}
+
+    posts = []
+
+    def fake_post(url, **k):
+        posts.append(url)
+        return ShowResp()
+
+    monkeypatch.setattr("pedacito.llm.requests.get", lambda *a, **k: GetResp())
+    monkeypatch.setattr("pedacito.llm.requests.post", fake_post)
+    info = _client().model_info()
+    assert posts == ["http://127.0.0.1:1/api/show"]
+    assert info["size_bytes"] == 4_000_000_000
+    assert info["context_length"] == 32768
+    assert info["max_context_length"] == 32768
+    assert info["source"] == "ollama"
+
+
+# ------------------------------------------------------------- tiny tier
+def test_guess_tier_boundaries():
+    g = config_mod._guess_tier
+    assert g("local", {"model": "qwen3-4b"}) == "tiny"
+    assert g("local", {"model": "qwen2.5-3b-instruct"}) == "tiny"
+    assert g("local", {"model": "llama-3.2-8b"}) == "small"
+    assert g("local", {"model": "qwen-14b"}) == "medium"
+    assert g("local", {"model": "gemma-3-27b"}) == "large"
+    assert g("local", {"model": "deepseek-r1-distill"}) == "hosted"
+    assert g("work", {"model": "x", "base_url": "https://api.example.com/v1"}) \
+        == "hosted"
+    assert g("local", {"model": "something"}) is None
+
+
+def test_tiny_preset_fits_a_4k_window():
+    assert config_mod.PRESET_TIERS[0] == "tiny"
+    t = config_mod.PRESETS["tiny"]
+    assert t["context_tokens"] == 4096
+    assert t["compact_step_schema"] is True
+    # the step prompt's worst case must fit beside the reserve
+    assert (t["flat_map_token_budget"] + t["max_gathered_chars"] // 4
+            + t["max_tokens_step"] <= t["context_tokens"] - t["reserve_tokens"])

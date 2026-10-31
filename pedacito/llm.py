@@ -3,27 +3,20 @@ model warmup.
 
 Usage
 -----
-    from .llm import LMStudio
+    from .llm import LLMClient
 
-    client = LMStudio(cfg)
+    client = LLMClient(cfg)
     client.check()                       # verify the server and model
     text = client.chat(messages, max_tokens=500)
     step = client.chat_json(messages, schema, max_tokens=500)
 
-Works against any server exposing an OpenAI-compatible /v1 surface --
-tested against LM Studio and Ollama. The class is named LMStudio for
-historical reasons; it isn't LM-Studio-specific. This module uses two
-features of that surface:
+Works against any server exposing an OpenAI-compatible /v1 surface (tested
+against LM Studio, Lemonade, and Ollama). The tool loop uses
+response_format={"type": "json_schema", ...}, which servers with grammar-
+constrained decoding enforce, so a small model cannot emit unparseable JSON.
 
-  * plain chat completions (for summaries and the final answer)
-  * response_format={"type": "json_schema", ...} for the tool loop, which is
-    grammar-constrained under the hood, so the model *cannot* emit unparseable
-    JSON. This matters far more with a small local model than with a frontier
-    hosted one.
-
-On top of the raw HTTP calls, this module handles the failure modes specific
-to running a model locally: templates that reject certain message shapes,
-responses truncated at the token limit, reasoning models that wrap their
+Also handles local-model failure modes: templates that reject certain message
+shapes, replies truncated at the token limit, reasoning models that wrap their
 answer in a <think> block, and a model that is still loading.
 
 Only dependency is `requests`.
@@ -37,19 +30,17 @@ import re
 import sys
 import time
 from pathlib import Path
+from urllib.parse import quote, urlparse
 
 import requests
 
 
-# --------------------------------------------------------------------------
-# Exceptions
-# --------------------------------------------------------------------------
 class LLMError(RuntimeError):
-    """Base class for any failure talking to LM Studio."""
+    """Base class for any failure talking to the model server."""
 
 
 class ModelLoadError(LLMError):
-    """LM Studio could not load the model. Retrying rarely helps."""
+    """The server could not load the model. Retrying rarely helps."""
 
 
 class TemplateError(LLMError):
@@ -57,34 +48,27 @@ class TemplateError(LLMError):
 
 
 class ContextOverflowError(LLMError):
-    """The server refused the request because the prompt is bigger than its
-    configured context window. Recoverable: `chat()` trims the conversation
-    and retries before giving up."""
+    """The prompt is bigger than the server's context window. `chat()` trims
+    the conversation and retries before giving up."""
 
 
 class _Transient(LLMError):
     """Worth retrying: model still loading, or the server is busy."""
 
 
-# --------------------------------------------------------------------------
-# Error classification
-# --------------------------------------------------------------------------
-# Chat templates differ in what they accept. Mistral-family templates raise a
-# Jinja exception on two user messages in a row; Gemma has no system role at
-# all. Neither is a server fault, so the fix is to reshape the request.
+# Mistral-family templates raise a Jinja exception on two user messages in a
+# row; Gemma has no system role. The fix is to reshape the request.
 _TEMPLATE_HINTS = (
     "jinja", "roles must alternate", "conversation roles",
     "system role not supported", "only user and assistant roles",
 )
 
-# LM Studio returns 400 for "still loading" and for "failed to load" alike, so
-# the status code alone can't distinguish transient from fatal.
+# LM Studio returns 400 for both "still loading" and "failed to load", so the
+# status code alone can't distinguish transient from fatal.
 _LOADING = ("is loading", "loading model", "model is not loaded", "please wait")
 _LOAD_FAILED = ("failed to load model", "error loading model", "no model loaded")
 
-# Shown on a plain connection failure. Covers both servers Pedacito is tested
-# against, since the fix differs: LM Studio needs a setting flipped, Ollama
-# needs an environment variable set before it starts.
+# Shown on a plain connection failure; the fix differs per server.
 CONNECT_HELP = """\
   Cannot reach the server at {url}.
   - Is a model server actually running there?
@@ -98,26 +82,39 @@ CONNECT_HELP = """\
 
 LOAD_HELP = """\
   The server found the model but could not load it. Usual causes, in order:
-  1. Not enough free VRAM. Another model is probably still resident -- open
-     LM Studio and eject it, or lower this model's context length.
+  1. Not enough free VRAM. Another model is probably still resident --
+     unload it in your model server, or lower this model's context length.
   2. The context length is set higher than the card can hold. Try 16384 with
      K/V cache at Q8_0 and flash attention on.
-  3. An incomplete or corrupt download. Re-download it in LM Studio.
+  3. An incomplete or corrupt download. Re-download the model.
   4. A runtime mismatch. Try switching between ROCm and Vulkan for this model.
 
-  Fastest way to tell: load the model by hand in the LM Studio UI. Whatever
+  Fastest way to tell: load the model by hand in the server's own UI. Whatever
   error it shows there is the real one -- the API only reports that it failed."""
 
 
 _GIB = 1024 ** 3
 
 
-def _server_root(base_url: str) -> str:
-    """Strip an OpenAI-style API suffix from base_url, leaving the server root.
+def _positive_int(value) -> int | None:
+    try:
+        n = int(value)
+    except (TypeError, ValueError):
+        return None
+    return n if n > 0 else None
 
-    Both `/v1` and `/api/v1` are common (Lemonade accepts either), and the
-    native endpoints live at the root (`/api/v0/models`, `/api/show`, ...).
-    """
+
+def _is_remote(base_url: str) -> bool:
+    try:
+        host = (urlparse(base_url).hostname or "").lower()
+    except ValueError:
+        return False
+    return host not in ("localhost", "127.0.0.1", "0.0.0.0", "::1", "")
+
+
+def _server_root(base_url: str) -> str:
+    """Strip a `/v1` or `/api/v1` suffix from base_url, leaving the server root
+    where the native endpoints (`/api/v0/models`, `/api/show`, ...) live."""
     base = base_url.rstrip("/")
     for suffix in ("/api/v1", "/v1"):
         if base.endswith(suffix):
@@ -125,78 +122,151 @@ def _server_root(base_url: str) -> str:
     return base
 
 
-# --------------------------------------------------------------------------
-# Reasoning-model output handling
-# --------------------------------------------------------------------------
-# Reasoning models (Qwen3, DeepSeek-R1 distills, and Qwen3-Coder) emit a
-# thinking block before their real answer. Some runtimes strip it into a
-# separate field, some leave it inline in `content`. Handle both: an unstripped
-# <think> block breaks JSON parsing in the gather loop, and would land verbatim
-# in the answer text and the session log.
+# A constrained-JSON verdict costs one round-trip to probe; remembering it per
+# server+model keeps repeat runs consistent and skips the probe.
+_MODE_CACHE_TTL = 7 * 24 * 3600
+
+
+def _mode_cache_key(base_url: str, model: str) -> str:
+    return f"{base_url.rstrip('/')}|{model}"
+
+
+def _load_mode_cache(base_url: str, model: str) -> bool | None:
+    """Cached `_schema_supported` verdict, or None when absent/stale/corrupt."""
+    try:
+        from . import config
+        path = config.USER_CONFIG.parent / "server_modes.json"
+        entry = json.loads(path.read_text(encoding="utf-8")).get(
+            _mode_cache_key(base_url, model))
+        if isinstance(entry, dict) and \
+                isinstance(entry.get("schema_supported"), bool) and \
+                time.time() - float(entry.get("ts", 0)) < _MODE_CACHE_TTL:
+            return entry["schema_supported"]
+    except Exception:
+        pass
+    return None
+
+
+def _save_mode_cache(base_url: str, model: str, supported: bool) -> None:
+    """Persist a probed verdict; an unwritable config dir never kills a run."""
+    try:
+        from . import config
+        path = config.USER_CONFIG.parent / "server_modes.json"
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            if not isinstance(data, dict):
+                data = {}
+        except Exception:
+            data = {}
+        data[_mode_cache_key(base_url, model)] = {
+            "schema_supported": supported, "ts": time.time()}
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(data, indent=1), encoding="utf-8")
+    except OSError:
+        pass
+
+
+def _schema_example(schema: dict) -> str:
+    """One well-formed dummy object for `schema`: the few-shot example shown
+    when structured output degrades to plain JSON prompting."""
+    ex = {}
+    for k, p in (schema or {}).get("properties", {}).items():
+        t = p.get("type")
+        if p.get("enum"):
+            ex[k] = p["enum"][0]
+        elif t in ("integer", "number"):
+            ex[k] = 0
+        elif t == "boolean":
+            ex[k] = False
+        elif t == "array":
+            ex[k] = []
+        elif t == "object":
+            ex[k] = {}
+        else:
+            ex[k] = ""
+    return json.dumps(ex)
+
+
+# Tiny step-shaped schema for `config --doctor`'s structured-output probes.
+_PROBE_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "action": {"type": "string", "enum": ["read", "done"]},
+        "file": {"type": "string"},
+        "reasoning": {"type": "string", "maxLength": 40},
+    },
+    "required": ["action", "file", "reasoning"],
+    "additionalProperties": False,
+}
+
+# Representative prose+code sample for tokenizer calibration; token density
+# differs per model family, so the server's own count beats a fixed 3.6.
+_TOKENIZER_SAMPLE = (
+    "def gather(self, task, verbose=True):\n"
+    '    """Run the tool-calling loop until the model says done."""\n'
+    "    budget = self.cfg.max_gathered_chars\n"
+    "    while budget > 0:\n"
+    "        step = self.client.chat_json(messages, schema, max_tokens=500)\n"
+    "        if step.get('action') == 'read':\n"
+    "            obs = tool_read(self.index, step['file'], step['start'])\n"
+    "            budget -= len(obs)\n"
+    "The quick brown fox jumps over the lazy dog. Structured output keeps "
+    "tool calls parseable: a small model cannot emit unparseable JSON when "
+    "the server constrains decoding with a grammar. Estimates matter too, "
+    "because prompt plus reply must fit the context window or the server "
+    "silently truncates the middle of the conversation.\n"
+)
+
+
+# Reasoning models emit a thinking block before the answer. Some runtimes move
+# it to a separate field, some leave it inline in `content`; an unstripped
+# block breaks JSON parsing and lands in the answer text.
 _THINK_RE = re.compile(r"<(think|thinking|reasoning)>.*?</\1>", re.DOTALL | re.IGNORECASE)
 # An unterminated block: the model ran out of tokens mid-thought.
 _THINK_OPEN_RE = re.compile(r"^\s*<(think|thinking|reasoning)>.*", re.DOTALL | re.IGNORECASE)
-# Some templates emit only the closing marker (or duplicate it) when the
-# runtime has already routed the thinking text to a separate field. It is
-# noise, and in the answer phase it can be mistaken for content.
+# Some templates emit only the closing marker when the runtime already routed
+# the thinking text to a separate field.
 _STRAY_THINK_CLOSE_RE = re.compile(r"</(think|thinking|reasoning)>",
                                    re.IGNORECASE)
-# Native tool-call syntax in the ANSWER phase means the model has ignored
-# "no tools here" (usually because it wants source the gather phase did not
-# collect). A few are useful -- the recovery path can honour the reads --
-# but a stream that keeps emitting them is a degenerate loop that would
-# otherwise generate until the output cap. Six opens is well past any
-# legitimate multi-file read request (recovery honours at most four).
+# Native tool-call syntax in the answer phase means the model ignored "no
+# tools here". A few are tolerated (recovery honours up to four reads), but a
+# stream that keeps emitting them is a degenerate loop; stop it at six.
 _NATIVE_TOOL_OPEN_RE = re.compile(
     r"<(?:tool_call|invoke|read)\b|<function\s*=", re.IGNORECASE)
 _MAX_STREAM_TOOL_OPENS = 6
 
 
 def strip_reasoning(text: str) -> str:
-    """Remove any <think>/<thinking>/<reasoning> block from model output. If
-    the text is nothing but an unterminated opening tag (truncated mid-thought),
-    returns an empty string rather than the thinking fragment."""
+    """Remove <think>/<thinking>/<reasoning> blocks from model output. Text
+    that is only an unterminated opening tag (cut mid-thought) becomes ""."""
     if not text:
         return ""
     out = _THINK_RE.sub("", text)
     if _THINK_OPEN_RE.match(out):
-        # Nothing after the opening tag survived; there is no answer here.
         return ""
-    # Drop a stray closing marker without touching the surrounding answer.
     out = _STRAY_THINK_CLOSE_RE.sub("", out)
     return out.strip()
 
 
 def extract_content(message: dict) -> str:
-    """Pull the answer text out of a response message, whichever field the
-    runtime put it in (content, or a separate reasoning field), with any
-    thinking block stripped."""
+    """Answer text of a response message (from `content`, else a reasoning
+    field), with any thinking block stripped."""
     content = message.get("content") or ""
     if not content.strip():
-        # Some runtimes route everything into a reasoning field and leave
-        # content empty. Better a thinking-tinged answer than none.
+        # Some runtimes put everything in a reasoning field; better than none.
         content = message.get("reasoning_content") or message.get("reasoning") or ""
     return strip_reasoning(content)
 
 
-# --------------------------------------------------------------------------
-# Truncated-JSON repair
-# --------------------------------------------------------------------------
 def _cut_field(text: str, obj: dict, schema: dict | None) -> str:
     """Which schema field a truncated reply died inside, or "" when benign.
 
-    A JSON string value cannot contain an unescaped quote, so an unescaped
-    `"key":` in the raw reply is a real key opening, never payload text (a
-    JS object literal inside `pattern` carries its quotes escaped; the
-    negative lookbehind rejects those). The LAST opened key is where
-    generation stopped. Two salvage shapes mark it as cut:
-    repair_truncated_json either dropped the key whole (it is absent from
-    obj) or -- for an unterminated string -- kept the raw fragment and
-    closed the quote itself (it is present in obj, but no closing quote
-    exists in the raw text). Callers treat "reasoning" as the benign case
-    (every arg survived intact) and refuse to run steps whose payload
-    field was cut: half an eval is a SyntaxError that looks like a product
-    failure (run 13 retired five checks to exactly that confusion).
+    An unescaped `"key":` in the raw reply is a real key opening, never payload
+    text (quotes inside string values are escaped). The LAST opened key is where
+    generation stopped; it counts as cut when repair_truncated_json dropped it
+    whole (absent from obj) or kept an unterminated string fragment. Callers
+    treat "reasoning" as benign and refuse to run steps whose payload field was
+    cut.
     """
     props = sorted((schema or {}).get("properties") or {})
     if not props:
@@ -209,8 +279,7 @@ def _cut_field(text: str, obj: dict, schema: dict | None) -> str:
     last = matches[-1]
     if last.group(1) not in obj:
         return last.group(1)         # dropped whole by the salvage
-    # Fragment-kept case: scan the raw value for its unescaped closing
-    # quote; no terminator before EOF means the value is half a payload.
+    # Fragment-kept case: no closing quote before EOF means a partial payload.
     k = last.end()
     while k < len(text) and text[k] in " \t\r\n":
         k += 1
@@ -228,23 +297,18 @@ def _cut_field(text: str, obj: dict, schema: dict | None) -> str:
 
 
 def repair_truncated_json(text: str) -> str | None:
-    """Salvage the complete top-level keys of a JSON object that was cut off
-    mid-generation.
+    """Salvage the complete top-level keys of a JSON object cut off mid-
+    generation.
 
-    Everything from the first incomplete token onward -- an unterminated
-    string, a bare key, a dangling colon or comma, even a number typed only
-    halfway -- is dropped, and the surviving pairs are closed into an object.
-    Nothing partial is ever completed or guessed at: `"search_lib"` could grow
-    into any of several file names, and acting on the fragment would silently
-    do the wrong thing, so the whole key goes instead.
+    Everything from the first incomplete token onward (unterminated string,
+    bare key, dangling colon/comma, half-typed number) is dropped and the
+    surviving pairs are closed into an object; nothing partial is guessed at,
+    except that an unterminated string VALUE is kept as a fragment (see
+    `_cut_field`). The step schema puts `action` and its arguments before
+    `reasoning`, so a cut inside the trailing explanation still yields a usable
+    step.
 
-    Returns the repaired JSON text, or None if `text` was not actually
-    truncated or nothing salvageable survived.
-
-    This is why the step schema (see tools.py) puts `action` and its
-    arguments before `reasoning`: a reply truncated inside the trailing
-    explanation still has everything the agent needs, so recovering the
-    prefix yields a usable step instead of costing another round trip.
+    Returns the repaired JSON text, or None if nothing salvageable survived.
     """
     start = text.find("{")
     if start == -1:
@@ -253,8 +317,8 @@ def repair_truncated_json(text: str) -> str | None:
     n = len(buf)
 
     def _complete_value_end(i: int) -> int | None:
-        """If a value begins at index i and is fully present, return the
-        index just after it; None if it is missing or cut off."""
+        """Index just after the value starting at i, or None if it is missing
+        or cut off."""
         while i < n and buf[i] in " \t\r\n":
             i += 1
         if i >= n:
@@ -297,23 +361,21 @@ def repair_truncated_json(text: str) -> str | None:
         if m:
             tok = m.group(0)
             j = i + len(tok)
-            # A digit followed straight by '.', 'e', or an exponent sign was
-            # cut mid-token ("1.5" truncated to "1", "1e3" to "1"). A trailing
-            # '.' or '-' can never legally follow a complete number.
+            # A digit followed by '.', 'e', or an exponent sign was cut
+            # mid-token; '.' or '-' can never legally follow a complete number.
             if j < n and (buf[j] == "." or (tok[-1].isdigit() and buf[j] in "eE+-")):
                 return None
-            # At the very end of the buffer a bare integer could still be
-            # unfinished; anything terminated by a delimiter is fine.
+            # A bare integer at the very end of the buffer may be unfinished.
             if j == n and tok[-1].isdigit():
                 return None
             return j
-        if buf.startswith(("true", "false", "null"), i):
-            return i + 4
+        for lit in ("true", "false", "null"):
+            if buf.startswith(lit, i):
+                return i + len(lit)
         return None
 
-    # Walk the object's members, keeping only key:value pairs that arrived
-    # complete. Stops at the first fragment, at the object's own close, or at
-    # the end of the buffer.
+    # Keep only key:value pairs that arrived complete; stop at the first
+    # fragment, the object's own close, or the end of the buffer.
     kept: list[str] = []
     i = 1                                      # past the opening brace
     while True:
@@ -333,18 +395,14 @@ def repair_truncated_json(text: str) -> str | None:
             break                              # key with no colon yet
         vend = _complete_value_end(j + 1)
         if vend is None:
-            # Value is cut off mid-generation. If it is an *unterminated
-            # string* (the common DeepSeek failure: reply hits max_tokens
-            # inside a 'content' block), keep the raw fragment so callers can
-            # salvage partial content instead of discarding the step. The
-            # repair below closes the quote and the object.
+            # An unterminated string value (reply hit max_tokens inside e.g. a
+            # 'content' block) is kept as a fragment so callers can salvage
+            # partial content; the quote and object are closed below.
             k = j + 1
             while k < n and buf[k] in " \t\r\n":
                 k += 1
             if k < n and buf[k] == '"' and _complete_value_end(k) is None:
-                # The fragment starts with the opening quote, which we keep;
-                # escape only what came AFTER it (the original `buf[k]` itself
-                # must not be escaped or the repaired JSON has a stray \").
+                # Keep the opening quote; escape only what follows it.
                 frag = buf[k + 1:]
                 frag = (frag.replace("\\", "\\\\")
                             .replace('"', '\\"').replace("\n", "\\n")
@@ -359,15 +417,9 @@ def repair_truncated_json(text: str) -> str | None:
     return "{" + ",".join(kept) + "}"
 
 
-# --------------------------------------------------------------------------
-# Message-shape normalisation
-# --------------------------------------------------------------------------
 def merge_consecutive(messages: list[dict]) -> list[dict]:
-    """Collapse adjacent same-role messages into one.
-
-    Belt and braces: the agent is written to alternate, but a single stray
-    append would otherwise surface as an opaque Jinja traceback from the server.
-    """
+    """Collapse adjacent same-role messages into one; a stray repeat would
+    otherwise surface as an opaque Jinja error from the server."""
     out: list[dict] = []
     for m in messages:
         if out and out[-1]["role"] == m["role"]:
@@ -393,28 +445,20 @@ def fold_system(messages: list[dict]) -> list[dict]:
 
 
 def estimate_tokens(text: str) -> int:
-    """Rough token count estimate. Crude but adequate: ~3.6 chars/token for
-    source code."""
+    """Rough token estimate (~3.6 chars/token for source code)."""
     return int(len(text) / 3.6) + 1
 
 
-# --------------------------------------------------------------------------
-# The client
-# --------------------------------------------------------------------------
-class LMStudio:
-    """A thin client for one LM Studio server + model combination, handling
-    retries, template quirks, and reasoning-model output transparently.
+class LLMClient:
+    """A thin client for one model server + model, handling retries, template
+    quirks, and reasoning-model output transparently.
 
-    Sampler parameters supplied via `cfg.sampler` are merged into every
-    request body verbatim, so a profile targeting LM Studio can pass top_k,
-    min_p, repeat_penalty, seed, and anything else llama.cpp understands --
-    none of which have a first-class config field, because the accepted set
-    differs per server.
+    Sampler parameters in `cfg.sampler` are merged into every request body
+    verbatim (top_k, min_p, repeat_penalty, seed, ...); the accepted set
+    differs per server, so they have no first-class config field.
     """
 
     def __init__(self, cfg):
-        """Initialise the client from a Config: connection details and the
-        per-instance state used to remember quirks discovered at runtime."""
         self.cfg = cfg
         self.url = cfg.base_url.rstrip("/") + "/chat/completions"
         self.headers = {
@@ -422,47 +466,36 @@ class LMStudio:
             "Authorization": f"Bearer {cfg.api_key}",
         }
         self.stats = {"calls": 0, "prompt_tokens": 0, "completion_tokens": 0, "seconds": 0.0}
-        # Set once we learn this model's template has no system role, so we
-        # don't burn a failed request rediscovering it on every call.
+        # Learned once the template rejects a system role.
         self._no_system_role = False
-        # Tri-state for grammar-constrained JSON support: None = not probed
-        # yet (assume supported, the historical default), True = server
-        # advertises response_format/json_schema, False = it answered our
-        # probe WITHOUT advertising it (Ollama, plain OpenAI-compatible
-        # endpoints) -- those requests fall back to JSON prompting instead
-        # of 400ing or silently ignoring the schema.
+        # Grammar-constrained JSON support: None = not probed (assume yes),
+        # True = server advertises response_format/json_schema, False = it
+        # answered the probe without advertising it (such requests fall back to
+        # JSON prompting).
         self._schema_supported: bool | None = None
-        # "length" here means the model was cut off mid-answer, which for a
-        # grammar-constrained call is the difference between "bad JSON" and
-        # "valid JSON we never let it finish".
+        # "length" means cut off mid-answer: "valid JSON we never let it finish".
         self.last_finish_reason = ""
-        # Truncation signal for STREAMED (free-text, answer-phase) replies.
-        # DeepSeek and other OpenAI-compatible servers put finish_reason on
-        # the FINAL SSE chunk, which the delta loop never inspected -- so
-        # last_finish_reason stayed "" after every stream and apply()'s
-        # continuation loop ("reply hit the output limit; emit the rest")
-        # could never trigger. That is why a big edit run silently lost its
-        # later files instead of continuing across turns. The streaming path
-        # sets this directly; chat() clears it at the start of each call.
+        # Calibrated chars-per-token from the server's tokenizer endpoint
+        # (calibrate_tokenizer); 0.0 = uncalibrated, module heuristic applies.
+        self.chars_per_token = 0.0
+        # Truncation signal for streamed replies (finish_reason arrives on the
+        # final SSE chunk); cleared per _chat_once call, sticky within it.
         self.stream_truncated = False
-        # Fix ZD (run 13f): a streamed answer can burn its ENTIRE budget on
-        # reasoning_content -- chunks the delta loop skips without a trace --
-        # and return "" while the server reports finish_reason "length".
-        # Both signals were invisible: last_finish_reason was only ever set
-        # on the BUFFERED path, and the reasoning stream was never counted,
-        # so two ~4-minute empty answer attempts (the frog check, whose
-        # measurement had CONFIRMED its criterion) left no diagnostic at
-        # all. chat()'s empty-completion retry reads these to tell an
-        # instant-EOS flake (retry identical) from a thinking runaway
-        # (retry with thinking disabled).
+        # Chars of hidden reasoning in the last streamed attempt. chat()'s
+        # empty-completion retry uses it to tell an instant-EOS flake (retry
+        # identical) from a thinking runaway (retry with thinking disabled).
         self.last_reasoning_chars = 0
 
-    # ------------------------------------------------------------------ core
+    def estimate_tokens(self, text: str) -> int:
+        """Token estimate for fit math: the server's calibrated chars-per-token
+        when warmup got one, else the module heuristic (~3.6)."""
+        if self.chars_per_token:
+            return int(len(text) / self.chars_per_token) + 1
+        return estimate_tokens(text)
+
     def _context_too_long(self, body: str) -> bool:
-        """True when a 400 body says the PROMPT overflowed the server's
-        context window -- distinct from "max_tokens too large", which is a
-        request-shape problem. llama.cpp/LM Studio phrase it as
-        "prompt ... exceeds ... context" / "n_ctx"; Ollama says
+        """True when a 400 body says the prompt overflowed the context window.
+        llama.cpp/LM Studio say "exceeds ... context" / "n_ctx"; Ollama says
         "context length exceeded" or "too many tokens"."""
         low = (body or "").lower()
         return any(h in low for h in (
@@ -471,10 +504,9 @@ class LMStudio:
             "out of range", "overfull"))
 
     def _post(self, payload: dict, stream: bool = False):
-        """Send one HTTP request to the chat completions endpoint, raising a
-        specific LLMError subclass based on the failure (connection refused,
-        model failed to load, template rejected the request, transient
-        loading state, or an unclassified server error)."""
+        """POST to the chat completions endpoint, raising a specific LLMError
+        subclass on failure (connection, load failure, template, transient,
+        context overflow, or other server error)."""
         try:
             r = requests.post(
                 self.url, headers=self.headers, json=payload,
@@ -493,10 +525,7 @@ class LMStudio:
             if r.status_code in (429, 503) or any(k in low for k in _LOADING):
                 raise _Transient(f"{r.status_code}: {body[:200]}")
             if self._context_too_long(body):
-                # The PROMPT overflowed the server's window. chat() catches
-                # this, trims the conversation, and retries -- a mid-task
-                # death here is what "kept hitting limits" actually feels
-                # like to a user on stock LM Studio settings.
+                # chat() catches this, trims the conversation, and retries.
                 raise ContextOverflowError(
                     f"Server says the request exceeds its context window: "
                     f"{body[:300]}")
@@ -504,13 +533,9 @@ class LMStudio:
         return r
 
     def embed(self, texts: list[str]) -> list[list[float]]:
-        """Return one embedding vector per text via `<base_url>/embeddings`.
-
-        Only used by optional semantic search (see semantic.py). Kept on the
-        same client so it inherits the configured base_url, API key, and
-        timeout; it does not participate in chat retry/template handling.
-        Accepts a plain string for convenience and always returns vectors in
-        input order (the API may return them out of order)."""
+        """One embedding vector per text via `<base_url>/embeddings`, in input
+        order. Used only by optional semantic search (semantic.py); no chat
+        retry/template handling."""
         if isinstance(texts, str):
             texts = [texts]
         if not texts:
@@ -541,13 +566,9 @@ class LMStudio:
 
     def vision(self, prompt: str, image_path, model: str | None = None,
                max_tokens: int = 400) -> str:
-        """Ask a multimodal model to describe one local image.
-
-        Sent as an OpenAI-compatible image_url data URI, which LM Studio and
-        Ollama's OpenAI endpoints accept for vision models. Kept separate from
-        chat() because it is only used by the opt-in screenshot/browser
-        actions; a text-only model will reject it, which the caller reports
-        as an observation rather than failing the task."""
+        """Ask a multimodal model to describe one local image (sent as an
+        image_url data URI). A text-only model will reject it; the caller
+        reports that as an observation."""
         path = Path(image_path)
         mime = {".jpg": "image/jpeg", ".jpeg": "image/jpeg",
                 ".webp": "image/webp"}.get(path.suffix.lower(), "image/png")
@@ -577,14 +598,10 @@ class LMStudio:
              stream: bool = False, disable_thinking: bool | None = None) -> str:
         """Send a chat completion request and return the response text.
 
-        Handles retries for transient failures (model still loading),
-        proactive conversation trimming so llama.cpp-style servers never see
-        prompt+reply beyond their window, and automatic recovery from
-        template incompatibilities (folding the system prompt into the first
-        user turn if the template rejects a system role). A model that is
-        still loading answers 400 or 503 for a while; without a retry loop,
-        the first call of a batch would fail and every subsequent one would
-        fail the same way.
+        Retries while the model is still loading, trims old tool results so
+        prompt + reply fit the context window, recovers from context overflow,
+        and folds the system prompt into the first user turn if the template
+        rejects a system role.
         """
         messages = merge_consecutive(messages)
         if self._no_system_role:
@@ -595,27 +612,22 @@ class LMStudio:
         attempt = 0
         trimmed_once = False
         shrunk_once = False
-        empty_streak = 0        # Fix ZD: consecutive empty streamed replies
+        empty_streak = 0        # consecutive empty streamed replies
         while True:
             attempt += 1
-            # Proactive fit: llama.cpp/LM Studio reject any request whose
-            # prompt + max_tokens exceeds the configured window ("kept
-            # hitting limits" even on correct configs), and Ollama silently
-            # truncates the middle instead -- which is how a local model
-            # "runs to completion" with an answer to a task it never saw.
-            # Shrink the oldest tool-result turns until the reply budget
-            # genuinely fits; only the newest RESULT matters mid-gather,
-            # since gathered source reaches the answer phase separately.
+            # Proactive fit: llama.cpp/LM Studio reject requests whose prompt +
+            # max_tokens exceeds the window, and Ollama silently truncates the
+            # middle. Shrink the oldest tool-result turns until the reply
+            # budget fits; only the newest RESULT matters mid-gather.
             room = self.cfg.context_tokens - max_tokens
-            total = sum(estimate_tokens(m["content"]) for m in messages)
+            total = sum(self.estimate_tokens(m["content"]) for m in messages)
             if room > 0 and total > room * 0.9:
                 new_messages = list(messages)
-                # Drop the OLDEST RESULT turn together with the assistant
-                # action that requested it -- removing only one side would
-                # leave two same-role messages in a row, which strict chat
-                # templates (Mistral especially) reject outright.
+                # Drop the oldest RESULT turn with the assistant action that
+                # requested it, so roles keep alternating.
                 while True:
-                    cur = sum(estimate_tokens(m["content"]) for m in new_messages)
+                    cur = sum(self.estimate_tokens(m["content"])
+                              for m in new_messages)
                     if cur <= room * 0.85:
                         break
                     idxs = [i for i, m in enumerate(new_messages)
@@ -637,29 +649,26 @@ class LMStudio:
                                        disable_thinking)
             except ContextOverflowError as e:
                 # The server's window is smaller than our budgets assumed
-                # (stock LM Studio 8192 / Ollama 4096 vs a hosted-tier
-                # profile, or simply a long gather). Salvage the call by
-                # dropping the oldest RESULT turns -- the newest tool output
-                # and the task itself are what the model needs to answer;
-                # stale middle history is the cheapest thing to lose. Two
-                # rounds of halving, then fail with a real diagnosis.
+                # (stock LM Studio 8192 / Ollama 4096). Shed stale middle
+                # history first, then halve the reply budget, then fail.
                 if not trimmed_once:
                     body_idx = [i for i, m in enumerate(messages)
                                 if m["role"] == "user"
                                 and m["content"].startswith("RESULT:\n")]
                     if len(body_idx) > 2:
                         drop = set(body_idx[: len(body_idx) // 2])
-                        messages = [m for i, m in enumerate(messages)
-                                    if i not in drop]
+                        messages = merge_consecutive(
+                            [m for i, m in enumerate(messages)
+                             if i not in drop])
                         trimmed_once = True
                         print("[server context overflow: dropped older tool "
                               "results and retrying]", file=sys.stderr)
                         continue
                 if any(m["role"] == "system" for m in messages) and \
                         len([m for m in messages if m["role"] != "system"]) > 2:
-                    # No RESULT turns to shed (answer phase): shrink by
-                    # replacing middle user turns with a stub, keeping first
-                    # (map+task) and last (latest instruction/result).
+                    # No RESULT turns to shed (answer phase): drop the middle
+                    # assistant turns, keeping the first user turn (map+task)
+                    # and the last (latest instruction/result).
                     keep_first = next(i for i, m in enumerate(messages)
                                       if m["role"] == "user")
                     keep_last = max(i for i, m in enumerate(messages)
@@ -668,17 +677,17 @@ class LMStudio:
                         mid = [i for i in range(keep_first + 1, keep_last)
                                if messages[i]["role"] == "assistant"]
                         if mid:
-                            messages = [m for i, m in enumerate(messages)
-                                        if i not in set(mid)]
+                            mid = set(mid)
+                            messages = merge_consecutive(
+                                [m for i, m in enumerate(messages)
+                                 if i not in mid])
                             print("[server context overflow: shortened the "
                                   "conversation and retrying]", file=sys.stderr)
                             continue
                 if not shrunk_once and max_tokens > 256:
-                    # Our char/token estimate was optimistic (code-heavy text
-                    # is denser than prose). Halve the REPLY budget for a
-                    # second attempt: the prompt is already trimmed, and a
-                    # shorter step reply still carries the action (the schema
-                    # puts it first, so truncation loses only `reasoning`).
+                    # Our token estimate was optimistic (code is denser than
+                    # prose). Halve the reply budget; the step schema puts the
+                    # action first, so a shorter reply loses only `reasoning`.
                     shrunk_once = True
                     max_tokens = max(256, max_tokens // 2)
                     print("[server context overflow again; halving the reply "
@@ -700,8 +709,8 @@ class LMStudio:
                     "profile so auto-fit\n"
                     "    plans smaller prompts from the start.") from e
             except TemplateError as e:
-                # Most likely this model has no system role. Try again with the
-                # system prompt folded into the first user turn, and remember it.
+                # Most likely no system role: fold it into the first user turn
+                # and remember that.
                 if any(m["role"] == "system" for m in messages):
                     if not self._no_system_role:
                         print(f"['{self.cfg.model}' has no system role; folding "
@@ -720,11 +729,11 @@ class LMStudio:
                 waited = time.time() - started
                 if waited >= self.cfg.load_wait_seconds:
                     raise LLMError(
-                        f"LM Studio was still not ready for '{self.cfg.model}' "
-                        f"after {waited:.0f}s.\n"
-                        "  If you are switching models, LM Studio may be waiting "
+                        f"The model server was still not ready for "
+                        f"'{self.cfg.model}' after {waited:.0f}s.\n"
+                        "  If you are switching models, the server may be waiting "
                         "for the previous one\n"
-                        "  to unload. Check its Developer tab, or raise "
+                        "  to unload. Check its model-management UI, or raise "
                         "load_wait_seconds in your config.\n"
                         f"  Last response: {e}") from e
                 if not announced:
@@ -739,17 +748,10 @@ class LMStudio:
 
             if not stream or (text or "").strip():
                 return text
-            # Fix ZD (run 13f): the streamed answer came back EMPTY. The
-            # frog check shows how that ends: Qwen3 spent two whole
-            # 20k-token answer budgets on reasoning_content (invisible to
-            # the delta loop), finish_reason "length", zero visible
-            # content -- and the verification whose measurement had
-            # CONFIRMED its criterion stopped the run with no report. An
-            # empty completion is provider flake or thinking runaway,
-            # never a legitimate answer: retry INSIDE the call so every
-            # caller benefits. Bounded at two retries, then hand the ""
-            # back -- loop-level machinery (run_investigation_task's
-            # stand-in, run_task's re-ask) owns the final fallback.
+            # An empty streamed answer is a provider flake or a thinking
+            # runaway (budget spent on hidden reasoning), never a legitimate
+            # answer. Retry up to twice here, then hand the "" back to the
+            # callers' own fallbacks.
             empty_streak += 1
             if empty_streak > 2:
                 return text
@@ -757,9 +759,8 @@ class LMStudio:
                                       if disable_thinking is not None
                                       else self.cfg.disable_thinking)
             if self.last_reasoning_chars and not effective_thinking_off:
-                # Thinking runaway: the model streamed hidden reasoning
-                # until the budget died. An identical re-roll would very
-                # likely think again -- switch thinking off instead.
+                # Thinking runaway: re-rolling would think again; switch
+                # thinking off instead.
                 disable_thinking = True
                 how = " with thinking disabled"
             else:
@@ -773,16 +774,14 @@ class LMStudio:
     def _chat_once(self, messages: list[dict], max_tokens: int,
                    schema: dict | None = None, stream: bool = False,
                    disable_thinking: bool | None = None) -> str:
-        """Send exactly one HTTP request (no retry logic) and return the
-        response text, either buffered or streamed to stdout."""
+        """One HTTP request (no retry logic); returns the response text,
+        buffered or streamed to stdout."""
         msgs = [dict(m) for m in messages]
         if self.cfg.thinking_suffix and msgs:
             msgs[-1]["content"] += "\n\n" + self.cfg.thinking_suffix
         if schema is not None and self.cfg.json_mode == "object" and msgs:
-            # Hosted OpenAI-compatible APIs require the word "json" to appear
-            # in the prompt before they'll honour json_object mode, and naming
-            # the expected fields in that same sentence measurably improves
-            # compliance on the schema-required keys.
+            # Hosted APIs require the word "json" in the prompt for
+            # json_object mode; naming the fields improves compliance.
             fields = ", ".join(schema.get("properties", {}).keys())
             msgs[-1]["content"] += (
                 f"\n\nReply with one JSON object only, no prose. "
@@ -795,79 +794,40 @@ class LMStudio:
             "max_tokens": max_tokens,
             "stream": stream,
         }
-        # Honour request_max_tokens_cap: llama.cpp-based servers (LM Studio)
-        # 400 when max_tokens exceeds the configured context window, and
-        # auto_fit lowers the cap to fit -- but a caller asking for more than
-        # the cap (an answer budget on a big window, an escalated truncation
-        # retry) must never smuggle a too-large value through. 0 disables
-        # clamping entirely for servers that prefer to decide themselves.
+        # request_max_tokens_cap (0 = off): llama.cpp-based servers 400 when
+        # max_tokens exceeds the context window, so never exceed the cap.
         cap = getattr(self.cfg, "request_max_tokens_cap", 0) or 0
         if cap and max_tokens > cap:
-            max_tokens = cap
             payload["max_tokens"] = cap
-        # User-supplied sampler parameters, merged verbatim. Anything the
-        # server accepts can go here (top_p, top_k, min_p, repeat_penalty,
-        # seed, stop, ...); anything it doesn't will 400 the request, so
-        # this belongs in the profile for the specific server it targets.
-        # The structural keys below are skipped: overriding them would
-        # produce a request Pedacito's own parsing cannot handle.
+        # Sampler parameters are merged verbatim (an unsupported one 400s the
+        # request); structural keys are skipped.
         for k, v in (self.cfg.sampler or {}).items():
             if k in ("model", "messages", "stream"):
                 continue
             payload[k] = v
-        # chat_template_kwargs is a llama.cpp/LM Studio convention. Hosted
-        # APIs don't understand it, and a strict one could 400 on it, so gate
-        # on the URL being remote rather than on json_mode: a LOCAL server
-        # (LM Studio/Ollama) running a Qwen3 build with json_mode="object"
-        # must still be able to switch thinking off -- that combination was
-        # silently ignored before, which is exactly "I set disable_thinking
-        # and it still thinks / never returns JSON".
-        def _url_is_remote() -> bool:
-            try:
-                from urllib.parse import urlparse
-                h = (urlparse(self.cfg.base_url).hostname or "").lower()
-            except ValueError:
-                return False
-            return h not in ("localhost", "127.0.0.1", "0.0.0.0", "::1", "")
-
+        # Thinking-off fields are only sent to local servers: a strict hosted
+        # API could 400 on them.
         if (disable_thinking if disable_thinking is not None
-                else self.cfg.disable_thinking) and not _url_is_remote():
-            # Two spellings, one intent: Qwen/DeepSeek-R1 family templates
-            # read chat_template_kwargs.enable_thinking, llama.cpp's own
-            # sampler reads no_temp/top_k style keys, and some builds accept
-            # the flat `think: false` field. Servers ignore unknown fields;
-            # servers that DON'T ignore them are exactly the thinking models
-            # this targets. Without any of these, a thinking model spends its
-            # entire step budget on hidden reasoning and emits nothing --
-            # "with thinking off it didn't return an answer" is the other
-            # face of the same coin.
+                else self.cfg.disable_thinking) and not _is_remote(self.cfg.base_url):
+            # Two spellings: llama.cpp/LM Studio templates read
+            # chat_template_kwargs.enable_thinking, Ollama's OpenAI endpoint
+            # reads the flat `think`. Servers ignore the one they don't know.
             payload["chat_template_kwargs"] = {"enable_thinking": False}
-            # The comment above promised "some builds accept the flat
-            # `think: false` field", but only chat_template_kwargs was ever
-            # sent -- and run 13f's server is Ollama (port 11434), whose
-            # OpenAI-compatible endpoint reads the FLAT `think` field, not
-            # llama.cpp's template kwargs. Send both spellings; lenient
-            # servers ignore the field they don't know.
             payload["think"] = False
         if schema is not None:
             if self.cfg.json_mode == "object":
                 payload["response_format"] = {"type": "json_object"}
             else:
-                # json_schema (grammar-constrained) is LM Studio's feature.
-                # Ollama and many hosted APIs 400 on response_format entirely,
-                # or silently ignore it and answer in prose -- which then
-                # surfaces as "kept hitting limits" or "would not produce
-                # valid JSON". So only send it when the server actually
-                # advertised support: LM Studio reports `supported_parameters`
-                # on its native /api/v0/models endpoint. Servers that never
-                # answered the probe are assumed to support it (that was the
-                # historical default); servers that answered WITHOUT it fall
-                # back to plain JSON prompting for this request.
+                # Send json_schema unless the warmup probe found the server
+                # answering without advertising support (LM Studio's
+                # /api/v0/models `supported_parameters`); Ollama and many
+                # hosted APIs 400 on it or answer in prose.
                 if self._schema_supported is False:
                     fields = ", ".join(schema.get("properties", {}).keys())
                     msgs[-1]["content"] += (
                         "\n\nReply with one JSON object only, no prose. "
-                        f"Fields: {fields}.")
+                        f"Fields: {fields}.\nExample of a well-formed reply:\n"
+                        + _schema_example(schema))
                 else:
                     payload["response_format"] = {
                         "type": "json_schema",
@@ -876,14 +836,8 @@ class LMStudio:
 
         t0 = time.time()
         self.stats["calls"] += 1
-        # One truncation flag per LOGICAL call, not per HTTP attempt. chat()
-        # retries _chat_once after context-overflow trimming and transient
-        # failures; clearing here means a stale "length" from an abandoned
-        # earlier attempt can never make apply()'s continuation loop ask the
-        # model to repeat edits that already landed cleanly. The streaming
-        # path ORs into this so an escalation retry inside one logical call
-        # keeps the signal; chat_json sets last_finish_reason explicitly on
-        # every buffered attempt it inspects.
+        # Cleared per attempt so a stale "length" from an abandoned attempt
+        # cannot trigger apply()'s continuation loop.
         self.stream_truncated = False
 
         if not stream:
@@ -902,14 +856,12 @@ class LMStudio:
             except (KeyError, IndexError) as e:
                 raise LLMError(f"Unexpected response shape: {json.dumps(data)[:500]}") from e
 
-        # Streaming: worth it at ~25 tok/s so the user sees progress.
+        # Streaming, so the user sees progress at local-model speeds.
         out = []
         tool_opens = 0
         probe_tail = ""
         reasoning_chars = 0
-        # Per-HTTP-attempt diagnostics for chat()'s empty-completion retry
-        # (Fix ZD): describe THIS attempt, so the escalation decision reads
-        # the freshest finish reason and reasoning count, not a stale one.
+        # Per-attempt diagnostics for chat()'s empty-completion retry.
         self.last_finish_reason = ""
         self.last_reasoning_chars = 0
         r = self._post(payload, stream=True)
@@ -917,7 +869,7 @@ class LMStudio:
             if not raw:
                 continue
             # requests only decodes when the response declares a charset, and
-            # LM Studio's text/event-stream often doesn't. Handle both.
+            # text/event-stream often doesn't.
             if isinstance(raw, bytes):
                 raw = raw.decode("utf-8", "replace")
             if not raw.startswith("data: "):
@@ -934,27 +886,19 @@ class LMStudio:
             if fr:
                 self.last_finish_reason = fr
             if fr == "length":
-                # OR, not =: a logical chat() call may contain several HTTP
-                # attempts (context-overflow retries); once any streamed
-                # attempt was cut, the reply we return IS cut.
                 self.stream_truncated = True
             delta = d.get("content")
-            rc = d.get("reasoning_content")
+            rc = d.get("reasoning_content") or d.get("reasoning")
             if not delta and not rc:
                 continue
             if rc:
-                # Fix ZD: counted, never echoed -- this is the ONLY trace a
-                # thinking runaway leaves (run 13f: ~20k tokens of it per
-                # attempt, zero visible content, an empty reply, and three
-                # healthy checks stranded at the stop-on-fail tail).
-                reasoning_chars += len(rc)
+                reasoning_chars += len(rc)       # counted, never echoed
             if delta:
                 out.append(delta)
                 sys.stdout.write(delta)
                 sys.stdout.flush()
-                # Degenerate native-tool-call loop guard. The 4-char overlap
-                # catches an opening tag split across SSE chunks without
-                # double-counting a complete one.
+                # Degenerate native-tool-call loop guard; the 4-char overlap
+                # catches an opening tag split across chunks.
                 probe = probe_tail + delta
                 tool_opens += len(_NATIVE_TOOL_OPEN_RE.findall(probe))
                 probe_tail = probe[-4:]
@@ -969,27 +913,15 @@ class LMStudio:
                     break
         sys.stdout.write("\n")
         self.stats["seconds"] += time.time() - t0
-        # Reasoning models vary in where the thinking block lands. Some put
-        # it inline in `content` (so it's in `out` and needs stripping);
-        # others route it to a separate `reasoning_content` field (which the
-        # streaming loop above skips, since it only appends `content`).
-        # Either way, the returned value never contains a <think> block, so
-        # it's safe to hand straight to edit parsing.
         self.last_reasoning_chars = reasoning_chars
         return strip_reasoning("".join(out))
 
-    # --------------------------------------------------------------- helpers
     @staticmethod
     def _schema_has_big_fields(schema: dict | None) -> bool:
-        """True when the schema contains a string field large enough to hold
-        real file content (search/replace blocks, whole-file writes).
-
-        `content` in STEP_SCHEMA is deliberately capped at 6000 chars so a
-        step reply can never legitimately carry a whole large file -- if a
-        step reply gets cut off with that schema, it died inside 'reasoning',
-        and doubling max_tokens cannot fix that. Schemas WITHOUT such fields
-        therefore skip the budget-escalation retry loop entirely.
-        """
+        """True when the schema has a string field large enough to hold real
+        file content. STEP_SCHEMA caps `content` at 6000 chars, so a cut step
+        reply died inside 'reasoning' and a bigger budget cannot help; such
+        schemas skip budget escalation."""
         BIG_FIELD_MIN = 8000   # maxLength above which a string field is "large"
         props = (schema or {}).get("properties", {})
         return any(
@@ -997,74 +929,48 @@ class LMStudio:
             for p in props.values())
 
     def chat_json(self, messages: list[dict], schema: dict, max_tokens: int,
-                  retries: int = 2, cap: int | None = None,
                   disable_thinking: bool | None = None) -> dict:
         """Send a grammar-constrained chat request and return the parsed
         JSON object.
 
-        The grammar guarantees well-formed JSON *if the model is allowed to
-        finish*. The common failure is not malformed output, it is a response
-        cut off at max_tokens mid-string. So a truncated attempt retries with
-        a larger budget rather than the same one, and says so.
+        The common failure is not malformed output but a reply cut off at
+        max_tokens, so a truncated attempt retries with a larger budget (see
+        `_schema_has_big_fields` for when it does not), or salvages the
+        complete prefix of the object.
         """
-        last = ""
+        retries = 2
         budget = max_tokens
-        # Truncation recovery state. `step_cut` counts how many times a
-        # schema-constrained step reply was cut off mid-'reasoning' (the only
-        # field left when the schema orders action/args first). Retrying such
-        # a step verbatim just re-rolls the same rambling essay, so after the
-        # second cut we stop retrying and treat the recovered action as final.
+        # Set when a truncated reply was salvaged; `truncated_field` names the
+        # schema field the cut landed in ("" = nothing cut, or benign) so
+        # agent.gather can refuse to dispatch a step whose payload was cut.
         self.step_truncated = False
-        # Which schema field the cut landed in when a truncated reply got
-        # salvaged below ("" = nothing cut, or the cut is benign).
-        # agent.gather refuses to dispatch a step whose PAYLOAD field was
-        # cut: run 13 executed half a browser eval this way.
         self.truncated_field = ""
+        # Cuts of an answer-style schema; after the second, accept the salvage.
         step_cut = 0
-        # One re-ask per call for the "whole budget spent on a <think>/prose
-        # preamble, no JSON at all" failure: retrying verbatim just re-rolls
-        # the same essay, so the retry carries an explicit no-reasoning
-        # instruction instead. Bounded so a model that cannot stop rambling
-        # still falls through to the informative error.
+        # One re-ask per call with an explicit no-reasoning instruction for
+        # "whole budget spent on a preamble, no JSON at all".
         trunc_nudged = False
-        # Ceiling for truncation-retry escalation. Default is NOT a hard
-        # 2000 -- it is derived from the caller's own config (reserve /
-        # answer budgets), so raising max_tokens_step or reserve_tokens in
-        # the profile actually raises this limit too.
-        if cap is None:
-            from .config import is_hosted
-            if is_hosted(self.cfg):
-                # Hosted APIs have no local window to clamp against, but
-                # they DO have a provider-side per-message OUTPUT ceiling
-                # (~8k tokens on deepseek-chat). The old ceiling here was
-                # max(65536, ...) unconditionally, which promised more than
-                # any hosted API can deliver: an escalated retry re-rolled
-                # the same doomed request twice more before erroring, with
-                # a message ("ceiling 65536") that sent users chasing a
-                # setting that cannot fix anything. Honour the configured
-                # provider ceiling when known; otherwise stay generous for
-                # providers that genuinely allow long messages.
-                mot = int(getattr(self.cfg, "max_output_tokens", 0) or 0)
-                if mot > 0:
-                    cap = max(mot, max_tokens)
-                else:
-                    cap = max(65536, self.cfg.max_tokens_answer,
-                              self.cfg.max_tokens_step * 8, max_tokens * 8)
+        # Ceiling for budget escalation, derived from the caller's config.
+        from .config import is_hosted
+        if is_hosted(self.cfg):
+            # Hosted APIs have a provider-side output ceiling (~8k tokens on
+            # deepseek-chat) that escalation cannot beat; honour it when known.
+            mot = int(getattr(self.cfg, "max_output_tokens", 0) or 0)
+            if mot > 0:
+                cap = max(mot, max_tokens)
             else:
-                # Never escalate past what the model's context window can hold:
-                # a request bigger than (context - reserve) gets clamped by the
-                # server anyway, and a truncated retry at that size just wastes
-                # round trips. The ceiling is the smaller of the generous default
-                # and the caller's own usable window; it always clears max_tokens.
-                usable = self.cfg.context_tokens - self.cfg.reserve_tokens
-                cap = min(max(2048, self.cfg.reserve_tokens,
-                              self.cfg.max_tokens_answer, max_tokens * 4),
-                          max(usable, max_tokens))
+                cap = max(65536, self.cfg.max_tokens_answer,
+                          self.cfg.max_tokens_step * 8, max_tokens * 8)
+        else:
+            # Never escalate past what the context window can hold.
+            usable = self.cfg.context_tokens - self.cfg.reserve_tokens
+            cap = min(max(2048, self.cfg.reserve_tokens,
+                          self.cfg.max_tokens_answer, max_tokens * 4),
+                      max(usable, max_tokens))
         cap = max(cap, max_tokens)
         for attempt in range(retries + 1):
             raw = self.chat(messages, max_tokens=budget, schema=schema,
                             disable_thinking=disable_thinking)
-            last = raw
             truncated = self.last_finish_reason == "length"
             text = raw.strip()
             if text.startswith("```"):
@@ -1073,15 +979,10 @@ class LMStudio:
             try:
                 return json.loads(text)
             except json.JSONDecodeError:
-                # Salvage a JSON object if the model added prose around it.
-                # Scan EVERY '{' with raw_decode instead of slicing
-                # find("{")..rfind("}"): thinking models often emit several
-                # candidate objects (reasoning notes, examples) before the
-                # real reply, and the outermost slice glues junk between the
-                # first and last brace into one unparseable blob -- "failure
-                # to return json" even though valid JSON sat in the middle.
-                # Requiring an "action" key keeps a stray {"note": ...} from
-                # being mistaken for the step reply.
+                # Salvage a JSON object surrounded by prose. Scan every '{'
+                # with raw_decode (thinking models emit several candidate
+                # objects first); requiring an "action"/"edits" key keeps a
+                # stray {"note": ...} from being taken for the reply.
                 dec = json.JSONDecoder()
                 start = 0
                 while True:
@@ -1094,7 +995,7 @@ class LMStudio:
                         start = i + 1
                         continue
                     if isinstance(obj, dict) and ("action" in obj or "edits" in obj):
-                        if i > 0 or _end + i < len(text.strip()):
+                        if i > 0 or _end + i < len(text):
                             print("[prose around JSON; salvaged the object]",
                                   file=sys.stderr)
                         return obj
@@ -1106,11 +1007,10 @@ class LMStudio:
                         return json.loads(frag)
                     except json.JSONDecodeError:
                         pass
-                    # Some non-grammar-constrained servers (DeepSeek in
-                    # json_object mode among them) emit Python-style dicts
-                    # with single quotes instead of JSON. Convert only when
-                    # the fragment has no double quotes at all -- otherwise
-                    # apostrophes inside real strings would get mangled.
+                    # Some servers (DeepSeek in json_object mode) emit
+                    # single-quoted Python dicts. Convert only when the
+                    # fragment has no double quotes, so apostrophes inside
+                    # real strings are not mangled.
                     if '"' not in frag and "'" in frag:
                         cand = frag.replace("'", '"')
                         try:
@@ -1131,19 +1031,10 @@ class LMStudio:
                         # Only trust it if the part that matters survived.
                         if isinstance(obj, dict) and obj.get("action"):
                             if not self._schema_has_big_fields(schema):
-                                # A schema step's args all precede 'reasoning',
-                                # so a cut USUALLY dies inside the essay and
-                                # the recovered action is complete. Not
-                                # always: a long `pattern` (browser eval JS)
-                                # or `content` (write payload) can eat the
-                                # budget itself, and the salvage then carries
-                                # only half of the very field the step exists
-                                # to deliver. Record WHICH field the cut
-                                # landed in so agent.gather can refuse to
-                                # dispatch it; a 'reasoning' cut stays the
-                                # benign, accepted case (gather just tells
-                                # the model to keep its next reasoning
-                                # short).
+                                # Args precede 'reasoning', so a cut usually
+                                # lands in the essay. A long `pattern` or
+                                # `content` can also be cut; record which
+                                # field so agent.gather can refuse it.
                                 self.truncated_field = _cut_field(text, obj,
                                                                   schema)
                                 print("[reply was cut off; recovered the "
@@ -1151,10 +1042,8 @@ class LMStudio:
                                       file=sys.stderr)
                                 self.step_truncated = True
                                 return obj
-                            # Big-field (answer-style) schema: the cut landed
-                            # inside a content/replacement string, so what we
-                            # salvaged is PARTIAL. Do not act on half a file --
-                            # fall through to escalation/salvage-last logic.
+                            # Answer-style schema: the salvage is partial, so
+                            # do not act on half a file; escalate instead.
                             step_cut += 1
                             if step_cut >= 2:
                                 print("[reply was cut off mid-content; last "
@@ -1165,26 +1054,10 @@ class LMStudio:
                                                                   schema)
                                 return obj
                 if truncated:
-                    # A step schema has NO large fields, and whatever survived
-                    # salvage was already accepted above (with
-                    # `truncated_field` naming any cut payload) -- reaching
-                    # here means the reply died before any usable action, so
-                    # there is nothing to salvage and doubling the budget
-                    # cannot help.
-                    # The old escalation path (7000 -> 14000 -> 28000 -> ...)
-                    # just re-sent the same oversized request three times on
-                    # DeepSeek, whose per-message OUTPUT cap (~8k tokens) is a
-                    # provider-side fact no client setting can raise. Skip the
-                    # escalation entirely for schema steps.
+                    # Step schemas: the reply died before any usable action,
+                    # so a bigger budget cannot help. Re-ask once with a
+                    # no-reasoning nudge, then fail.
                     if not self._schema_has_big_fields(schema):
-                        # ...but do re-ask ONCE with an explicit no-reasoning
-                        # instruction before giving up. A thinking model that
-                        # spent its whole budget on the preamble (the frequent
-                        # local-server failure: "kept running past the token
-                        # limit before finishing its JSON") often lands the
-                        # JSON immediately when told to skip it -- this is the
-                        # same nudge agent.gather applies, moved down into
-                        # chat_json so plan/summary callers get it too.
                         if not trunc_nudged and attempt < retries:
                             trunc_nudged = True
                             print("[reply was cut off before any JSON was "
@@ -1219,12 +1092,7 @@ class LMStudio:
                                                 "the JSON object only, and keep "
                                                 "'reasoning' under 15 words."},
                 ]
-        # If the LAST attempt was cut off at the token limit, that -- not a
-        # grammar failure -- is what went wrong (common with thinking models
-        # that spend the whole budget on reasoning before emitting JSON).
-        # Raise the informative error instead of the generic one below.
-        if truncated:
-            last = raw
+        # A cut-off last attempt, not a grammar failure, is what went wrong.
         if self.last_finish_reason == "length":
             raise LLMError(
                 f"The model kept running past the token limit before finishing its "
@@ -1242,7 +1110,7 @@ class LMStudio:
                 "  cap (~8k tokens on deepseek-chat) is provider-side and cannot be\n"
                 "  raised from here -- keep max_tokens_step at/below it and let the\n"
                 "  chunked-write protocol split big files across turns instead.\n"
-                f"  Last partial reply: {last[-160:]}")
+                f"  Last partial reply: {raw[-160:]}")
         raise LLMError(
             f"Model would not produce valid JSON after {retries + 1} tries.\n"
             "  If this is a hosted OpenAI-compatible API (DeepSeek, OpenAI, "
@@ -1252,16 +1120,12 @@ class LMStudio:
             "  If it's a local server, the runtime may be ignoring the JSON "
             "schema\n"
             "  (common with MLX builds; llama.cpp/GGUF supports it).\n"
-            f"  Last reply: {last[:300]}")
+            f"  Last reply: {raw[:300]}")
 
     def loaded_models(self) -> dict[str, str] | None:
-        """Query LM Studio's native REST API for {model_id: state}.
-
-        The OpenAI-compatible /v1/models lists everything *downloaded* when
-        JIT loading is on, so it cannot tell you what is resident.
-        /api/v0/models reports a state field instead. Returns None on any
-        older LM Studio build that lacks this endpoint.
-        """
+        """{model_id: state} from LM Studio's native /api/v0/models (the
+        OpenAI /v1/models lists everything downloaded, not what is resident).
+        None when the server lacks the endpoint."""
         base = _server_root(self.cfg.base_url)
         try:
             r = requests.get(base + "/api/v0/models", headers=self.headers, timeout=10)
@@ -1277,10 +1141,9 @@ class LMStudio:
     def _pick_model(entries, model: str) -> dict | None:
         """Find the entry for `model` in a server's model list.
 
-        Servers report the same model under several spellings: LM Studio uses
-        `id`/`key` (sometimes with an `@q4_k_m` variant suffix), Ollama uses
-        `name`, and OpenAI endpoints use `id`. Exact matches win; a match on
-        the part before `@` handles the variant suffix.
+        Servers spell the name differently (`id`/`key` with an optional
+        `@q4_k_m` variant suffix on LM Studio, `name` on Ollama). Exact matches
+        win, then a match ignoring the `@` suffix.
         """
         want = str(model or "").strip().lower()
         if not want:
@@ -1304,26 +1167,16 @@ class LMStudio:
         return None
 
     def _absorb_model_list(self, entries, source: str) -> dict:
-        """Extract size/context from one model-list entry.
+        """Extract size/context from the entry for `cfg.model` in a model list.
 
-        Servers extend the OpenAI /v1/models shape differently:
+        Absorbs both extensions of the OpenAI /v1/models shape:
           * LM Studio v1: `size_bytes`, `loaded_instances[].config.context_length`,
             `max_context_length`.
-          * Lemonade: `size` in GB, `context_length` (configured/loaded), and
-            `max_context_window`.
-        Both spellings are absorbed here so model_info does not need to know
-        which server answered.
+          * Lemonade: `size` in GB, `context_length`, `max_context_window`.
         """
         m = self._pick_model(entries, self.cfg.model)
         if not m:
             return {}
-
-        def ctx_ok(value) -> int | None:
-            try:
-                n = int(value)
-            except (TypeError, ValueError):
-                return None
-            return n if n > 0 else None
 
         got: dict = {}
         raw_size = m.get("size_bytes")
@@ -1341,19 +1194,19 @@ class LMStudio:
         loaded = m.get("loaded_instances") or []
         loaded_ctx = None
         if loaded and isinstance(loaded[0], dict):
-            loaded_ctx = ctx_ok(
+            loaded_ctx = _positive_int(
                 (loaded[0].get("config") or {}).get("context_length"))
-        # Lemonade puts the model's effective (including saved overrides)
-        # recipe options in the same list entry. Prefer that over its
-        # top-level context_length, which some versions leave at the
-        # registry/default value instead of the configured ctx_size.
-        recipe_ctx = ctx_ok((m.get("recipe_options") or {}).get("ctx_size"))
-        ctx = (loaded_ctx or recipe_ctx or ctx_ok(m.get("context_length"))
-               or ctx_ok((m.get("recipe_options") or {}).get("num_ctx")))
+        # Lemonade's recipe_options carry the effective ctx_size (with saved
+        # overrides); prefer it over the top-level context_length, which some
+        # versions leave at the registry default.
+        recipe = m.get("recipe_options") or {}
+        ctx = (loaded_ctx or _positive_int(recipe.get("ctx_size"))
+               or _positive_int(m.get("context_length"))
+               or _positive_int(recipe.get("num_ctx")))
         if ctx:
             got["context_length"] = ctx
-        max_ctx = ctx_ok(m.get("max_context_length")
-                         or m.get("max_context_window"))
+        max_ctx = _positive_int(m.get("max_context_length")
+                                or m.get("max_context_window"))
         if max_ctx:
             got["max_context_length"] = max_ctx
         if got:
@@ -1364,21 +1217,9 @@ class LMStudio:
         return got
 
     def _lemonade_health_context(self, root: str) -> tuple[int | None, int | None]:
-        """Read the context a currently loaded Lemonade model is using.
-
-        Lemonade's /v1/models `context_length` can lag behind the options a
-        model was loaded with (and older builds reported a registry default).
-        The health endpoint lists resident models with the recipe options they
-        were actually launched with, which is the fact the budget fit needs.
-        Tries both prefixes because older builds expose /api/v0/health.
-        """
-        def ctx_ok(value):
-            try:
-                n = int(value)
-            except (TypeError, ValueError):
-                return None
-            return n if n > 0 else None
-
+        """Context a currently loaded Lemonade model was launched with, from its
+        health endpoint (the model list's `context_length` can lag behind).
+        Tries both prefixes because older builds expose /api/v0/health."""
         for path in ("/api/v1/health", "/api/v0/health"):
             try:
                 r = requests.get(root + path, headers=self.headers, timeout=5)
@@ -1392,31 +1233,17 @@ class LMStudio:
             if not entry:
                 continue
             opts = entry.get("recipe_options") or {}
-            ctx = (ctx_ok(opts.get("ctx_size"))
-                   or ctx_ok(entry.get("context_length")))
-            max_ctx = ctx_ok(entry.get("max_context_window"))
+            ctx = (_positive_int(opts.get("ctx_size"))
+                   or _positive_int(entry.get("context_length")))
+            max_ctx = _positive_int(entry.get("max_context_window"))
             if ctx or max_ctx:
                 return ctx, max_ctx
         return None, None
 
     def _lemonade_options_context(self, root: str) -> int | None:
-        """Ask Lemonade which ctx_size a load would use right now.
-
-        /v1/models/{id}/options separates saved overrides from defaults and
-        reports `resolved_ctx_size` (including automatic sizing), so it is
-        more trustworthy than the model-list `context_length` on builds that
-        report a default there. Absent on older Lemonade versions, hence the
-        silent failure.
-        """
-        from urllib.parse import quote
-
-        def ctx_ok(value):
-            try:
-                n = int(value)
-            except (TypeError, ValueError):
-                return None
-            return n if n > 0 else None
-
+        """The ctx_size Lemonade would use for a load right now, from
+        /v1/models/{id}/options (`resolved_ctx_size` covers automatic sizing).
+        Absent on older versions, hence the silent failure."""
         url = (root + "/v1/models/" + quote(str(self.cfg.model), safe="")
                + "/options")
         try:
@@ -1426,42 +1253,30 @@ class LMStudio:
             data = r.json()
         except Exception:
             return None
-        for key in ("resolved_ctx_size",):
-            ctx = ctx_ok(data.get(key))
-            if ctx:
-                return ctx
+        ctx = _positive_int(data.get("resolved_ctx_size"))
+        if ctx:
+            return ctx
         for key in ("effective", "saved"):
             opts = data.get(key) or {}
             if isinstance(opts, dict):
-                ctx = ctx_ok(opts.get("ctx_size"))
+                ctx = _positive_int(opts.get("ctx_size"))
                 if ctx:
                     return ctx
         return None
 
     def model_info(self) -> dict | None:
-        """Ask the server for metadata about `cfg.model`: file size, configured
-        context length, and the model's maximum context.
-
-        Returns a dict with any of `size_bytes`, `context_length`,
-        `max_context_length`, plus `source`; None when nothing answers. This
-        is the start-of-run probe auto-fit uses to size the context window
-        from the machine's actual VRAM instead of trusting a hand-written
-        token budget.
+        """Metadata for `cfg.model`: any of `size_bytes`, `context_length`,
+        `max_context_length`, plus `source`; None when nothing answers. Used by
+        auto-fit to size the context window from the machine's VRAM.
 
         Tried in order, stopping once both size and context are known:
-          * LM Studio v1 `/api/v1/models` -- `size_bytes`, loaded instance's
-            configured context, and `max_context_length`.
-          * Any OpenAI-compatible `/v1/models` -- Lemonade returns `size` (GB),
-            `context_length` and `max_context_window` there; plain servers
-            simply yield nothing useful.
-          * LM Studio v0 `/api/v0/models` -- context length on older builds
-            (and `size_bytes` when the build reports it).
-          * Ollama `/api/show` -- the weights' `size` and `llama.context_length`
-            / `num_ctx` (Lemonade also implements this endpoint).
+          * LM Studio v1 `/api/v1/models`
+          * OpenAI-compatible `/v1/models` (Lemonade adds `size` in GB,
+            `context_length`, `max_context_window`)
+          * LM Studio v0 `/api/v0/models` (older builds)
+          * Ollama `/api/show` (also implemented by Lemonade)
 
-        Every probe is best-effort: a server that does not implement an
-        endpoint (or is offline) simply yields nothing, and the caller keeps
-        the config's declared context.
+        Every probe is best-effort; failures just yield nothing.
         """
         root = _server_root(self.cfg.base_url)
         out: dict = {}
@@ -1498,10 +1313,8 @@ class LMStudio:
             except Exception:
                 pass
 
-        # Lemonade exposes the loaded recipe options separately from the
-        # OpenAI model list, and its per-model options endpoint knows the
-        # saved ctx_size override. Those are more accurate than a list entry
-        # that may carry the registry/default window.
+        # Lemonade's loaded/saved recipe options beat a list entry that may
+        # carry the registry default window.
         if out.get("source") == "lemonade":
             health_ctx, health_max = self._lemonade_health_context(root)
             if health_max and not out.get("max_context_length"):
@@ -1515,8 +1328,7 @@ class LMStudio:
                     out["context_length"] = options_ctx
                     out["context_source"] = "lemonade saved options"
 
-        # Ollama /api/show (Lemonade implements it too) reports both the
-        # weights size and the configured context length.
+        # Ollama /api/show reports the weights size and context length.
         if not enough():
             try:
                 r = requests.post(root + "/api/show",
@@ -1534,19 +1346,17 @@ class LMStudio:
                     params = d.get("parameters") or {}
                     num_ctx = (params.get("num_ctx")
                                if isinstance(params, dict) else None)
-                    ctx = num_ctx or info.get("llama.context_length")
-                    try:
-                        ctx = int(ctx)
-                    except (TypeError, ValueError):
-                        ctx = None
-                    if ctx and ctx > 0:
+                    # Keys are architecture-prefixed (llama., qwen2., gemma.,
+                    # ...): accept any *.context_length, taking the largest.
+                    max_ctx = max(
+                        (v for v in (_positive_int(x)
+                                     for k, x in info.items()
+                                     if k.endswith(".context_length")) if v),
+                        default=0) or None
+                    ctx = _positive_int(num_ctx) or max_ctx
+                    if ctx:
                         got["context_length"] = ctx
-                    max_ctx = info.get("llama.context_length")
-                    try:
-                        max_ctx = int(max_ctx)
-                    except (TypeError, ValueError):
-                        max_ctx = None
-                    if max_ctx and max_ctx > 0:
+                    if max_ctx:
                         got["max_context_length"] = max_ctx
                     details = d.get("details") or {}
                     if not got.get("size_bytes") and details.get("parameter_size"):
@@ -1562,84 +1372,138 @@ class LMStudio:
             return None
         return out
 
-    def detect_context(self) -> int | None:
-        """Probe the server for the REAL context length configured for
-        `cfg.model`, so token budgets can be auto-fitted to what the model
-        will actually accept instead of a guessed config number.
-
-        Works against the two local servers Pedacito targets:
-          * LM Studio -- native /api/v1/models and /api/v0/models carry the
-            configured and maximum context lengths.
-          * Ollama -- POST /api/show returns model_info including
-            llama.context_length (and num_ctx when explicitly set; Ollama
-            defaults to 4096 when unset).
-
-        Returns None for hosted APIs and any server that doesn't answer --
-        callers then keep whatever context_tokens the config declares.
-        Never raises: this is an optimisation probe, not a requirement.
-        """
-        info = self.model_info() or {}
-        return info.get("context_length")
-
-    def warmup(self, verbose: bool = True) -> None:
-        """Force the model to load with one tiny generation before real work
-        begins.
-
-        Two jobs: it surfaces a load failure once, up front, with a real
-        diagnosis rather than as repeated identical warnings mid-index; and
-        when a profile switch changed the requested model, it absorbs the
-        load wait here with a clear message, rather than stalling silently
-        inside the gather loop.
-        """
+    def warmup(self) -> None:
+        """Load the model with one tiny generation before real work begins, so
+        a load failure or model-switch wait surfaces once, up front."""
         state = self.loaded_models()
-        if verbose and state is not None:
+        if state is not None:
             resident = [m for m, st in state.items() if st == "loaded"]
             if resident and self.cfg.model not in resident:
                 print(f"[server currently has {', '.join(resident)} loaded; "
                       f"requesting '{self.cfg.model}']", file=sys.stderr)
-        # Learn whether this server honours grammar-constrained JSON before
-        # the first real step request. LM Studio's native API lists
-        # `supported_parameters` per model; when it answers WITHOUT
-        # response_format / json_schema in that list (or the model entry
-        # lacks the field entirely on an older build), we downgrade to plain
-        # JSON prompting rather than getting prose back from a call we asked
-        # to be constrained -- which previously surfaced as endless retries
-        # and "would not produce valid JSON".
+        # LM Studio's native API lists `supported_parameters` per model; if
+        # that list omits response_format/json_schema, use plain JSON
+        # prompting instead of getting prose back from a "constrained" call.
+        # A remembered verdict (server_modes.json) skips the probe.
         if self._schema_supported is None and self.cfg.json_mode != "object":
-            try:
-                root = _server_root(self.cfg.base_url)
-                r = requests.get(root + "/api/v0/models", headers=self.headers,
-                                 timeout=5)
-                if r.status_code == 200:
-                    for m in r.json().get("data", []):
-                        if not isinstance(m, dict):
-                            continue
-                        if m.get("id") == self.cfg.model or m.get("key") == self.cfg.model:
-                            sp = [str(x).lower() for x in
-                                  (m.get("supported_parameters") or [])]
-                            if any("response_format" in x or "json_schema" in x
-                                   for x in sp):
-                                self._schema_supported = True
-                            elif sp:
-                                self._schema_supported = False
-                                if verbose:
+            cached = _load_mode_cache(self.cfg.base_url, self.cfg.model)
+            if cached is not None:
+                self._schema_supported = cached
+                if not cached:
+                    print("[remembered server capability: no constrained "
+                          "JSON; using plain JSON prompting]", file=sys.stderr)
+            else:
+                try:
+                    root = _server_root(self.cfg.base_url)
+                    r = requests.get(root + "/api/v0/models",
+                                     headers=self.headers, timeout=5)
+                    if r.status_code == 200:
+                        for m in r.json().get("data", []):
+                            if not isinstance(m, dict):
+                                continue
+                            if m.get("id") == self.cfg.model or m.get("key") == self.cfg.model:
+                                sp = [str(x).lower() for x in
+                                      (m.get("supported_parameters") or [])]
+                                if any("response_format" in x or "json_schema" in x
+                                       for x in sp):
+                                    self._schema_supported = True
+                                elif sp:
+                                    self._schema_supported = False
                                     print("[server does not support constrained "
                                           "JSON; using plain JSON prompting]",
                                           file=sys.stderr)
-                            break
-            except Exception:
-                pass   # probe is an optimisation; never fatal
+                                break
+                except Exception:
+                    pass   # best-effort probe
+                if self._schema_supported is not None:
+                    _save_mode_cache(self.cfg.base_url, self.cfg.model,
+                                     self._schema_supported)
         t0 = time.time()
         self.chat([{"role": "user", "content": "Reply with the single word: ok"}],
                   max_tokens=5)
         took = time.time() - t0
-        if verbose and took > 5:
+        if took > 5:
             print(f"[model ready after {took:.0f}s]", file=sys.stderr)
+        # The model is resident now: one cheap request can measure the real
+        # chars-per-token so the fit math stops guessing.
+        self.calibrate_tokenizer()
+
+    def calibrate_tokenizer(self) -> None:
+        """Derive chars-per-token from the server's tokenizer endpoint
+        (LM Studio `/api/v0/tokenize`, llama.cpp `/tokenize`). Best-effort:
+        with no endpoint the module heuristic (~3.6) stays in effect."""
+        sample = _TOKENIZER_SAMPLE
+        root = _server_root(self.cfg.base_url)
+        for url, payload in (
+                (root + "/api/v0/tokenize",
+                 {"model": self.cfg.model, "prompt": sample,
+                  "add_special_tokens": False}),
+                (root + "/tokenize", {"content": sample})):
+            try:
+                r = requests.post(url, headers=self.headers, json=payload,
+                                  timeout=10)
+                if r.status_code != 200:
+                    continue
+                d = r.json()
+                n = _positive_int(d.get("count")) or \
+                    (len(d["tokens"]) if isinstance(d.get("tokens"), list) else 0)
+                if n > 0:
+                    cpt = len(sample) / n
+                    if 1.0 <= cpt <= 8.0:
+                        self.chars_per_token = cpt
+                        return
+            except Exception:
+                continue
+
+    def probe_json_modes(self) -> list[tuple[str, bool, str]]:
+        """`pedacito config --doctor`: one tiny request per structured-output
+        mode. Returns [(mode, ok, detail)] for json_schema (strict grammar),
+        json_object, and plain prompting; `ok` means the reply parsed as the
+        expected JSON object. A json_schema verdict is remembered for runs."""
+        user = ("Reply with one JSON object only, no prose: "
+                '{"action": "done", "file": "", "reasoning": "probe"}')
+        results: list[tuple[str, bool, str]] = []
+        for mode, fmt in (
+                ("json_schema",
+                 {"type": "json_schema",
+                  "json_schema": {"name": "step", "strict": True,
+                                  "schema": _PROBE_SCHEMA}}),
+                ("json_object", {"type": "json_object"}),
+                ("prompt", None)):
+            payload = {
+                "model": self.cfg.model,
+                "messages": [{"role": "user", "content": user}],
+                "temperature": self.cfg.temperature,
+                "max_tokens": 120,
+                "stream": False,
+            }
+            if fmt is not None:
+                payload["response_format"] = fmt
+            try:
+                data = self._post(payload).json()
+                text = (extract_content(data["choices"][0]["message"]) or "").strip()
+                i, j = text.find("{"), text.rfind("}")
+                obj = json.loads(text[i:j + 1]) if i != -1 and j > i else None
+                if isinstance(obj, dict) and obj.get("action") == "done":
+                    results.append((mode, True, "valid JSON object"))
+                else:
+                    results.append((mode, False,
+                                    f"reply was not the expected object: "
+                                    f"{text[:80]!r}"))
+            except LLMError as e:
+                results.append((mode, False, str(e).split("\n")[0][:160]))
+            except Exception as e:
+                results.append((mode, False, f"{type(e).__name__}: {e}"[:160]))
+        if self.cfg.json_mode != "object":
+            for mode, ok, _detail in results:
+                if mode == "json_schema":
+                    self._schema_supported = ok
+                    _save_mode_cache(self.cfg.base_url, self.cfg.model, ok)
+        return results
 
     def check(self, warn: bool = True) -> str:
-        """Verify the server endpoint is reachable and return the
-        comma-joined list of model ids/names it reports. If `warn` is set
-        and the configured model isn't in that list, prints a warning."""
+        """Verify the server is reachable and return its comma-joined model ids;
+        with `warn`, print a warning if the configured model is not listed."""
         url = self.cfg.base_url.rstrip("/") + "/models"
         try:
             r = requests.get(url, headers=self.headers, timeout=15)
@@ -1655,18 +1519,3 @@ class LMStudio:
             print(f"[warn] model '{self.cfg.model}' not in loaded list: {ids}",
                   file=sys.stderr)
         return ", ".join(ids)
-
-
-def probe_server(base_url: str, timeout: float = 2.0) -> list[str] | None:
-    """Ask an arbitrary OpenAI-compatible endpoint which models it has.
-
-    Returns the sorted list of model ids, or None when nothing answers at
-    `<base_url>/models` within `timeout`. Unlike LMStudio.check() this never
-    raises -- callers (the interactive setup wizard, the GUI's server hint)
-    treat "no answer" as a normal outcome, not an error."""
-    try:
-        r = requests.get(base_url.rstrip("/") + "/models", timeout=timeout)
-        r.raise_for_status()
-        return sorted({m.get("id", "?") for m in r.json().get("data", [])})
-    except Exception:
-        return None

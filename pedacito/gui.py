@@ -1,46 +1,24 @@
-"""A small local web GUI: pick a project, check the model, type a task (or
-ask a question), and review the diff inline -- one page, one local server,
-no new dependencies.
+"""A small local web GUI: pick a project, check the model, run a task or ask a
+question, and review the diff inline -- one page, one local server.
 
-Usage
------
     pedacito gui                    # opens http://127.0.0.1:<port>/ in a browser
     pedacito gui --port 8756        # fixed port instead of an OS-chosen one
     pedacito gui --no-open          # print the URL instead of opening a browser
 
-Design
-------
-This reuses the same local-server pattern `review.py` already established
-(ThreadingHTTPServer bound to 127.0.0.1 only, since this endpoint writes
-files and has no business on a network interface) rather than introducing a
-second GUI toolkit. The review page itself is unmodified: `review.build_page`
-is served at GET /review and loaded in an <iframe>, so its existing
-Apply/Cancel JavaScript -- which POSTs to "/apply" and "/cancel" as relative
-paths -- lands on *this* server's routes instead of spinning up a second
-one. One process, one port, one warm Agent/Index/client, like `pedacito
-chat` but driven by HTTP requests instead of stdin.
+The server binds to 127.0.0.1 only and refuses foreign Host/Origin headers (see
+`review.request_allowed`), since it can write files. `review.build_page` is
+served at GET /review inside an <iframe>, so the review page's own Apply/Cancel
+requests land on this server's /apply and /cancel routes.
 
-Only one project is "open" at a time. Switching directories or profiles
-tears down and reloads the warm state rather than juggling several -- the
-same tradeoff `chat` makes implicitly by being one process per invocation.
+Only one project is open at a time; switching directories or profiles reloads
+the warm Agent/Index/client. Slow work (open, index, model check, task) runs on
+a background thread behind a single `busy` flag while the page polls GET /state.
+Step-by-step progress still prints to the launching terminal.
 
-Long-running work (opening a project, building the index, checking the
-model, running a task) happens on a background thread guarded by a single
-"busy" flag, so the HTTP handler never blocks and the page can poll
-GET /state for progress instead of hanging on a slow local-model call.
-Detailed step-by-step progress still goes to the terminal `pedacito gui`
-was launched from (the same prints `gather()`/`answer()` already produce) --
-piping that into the browser is a reasonable fast-follow, not done here.
-
-Thread safety: the `busy` flag plus every read or write of the shared
-`STATE` object goes through `STATE.lock` (an RLock). The rule that keeps
-the lock cheap is: hold it only around STATE mutations and the reads that
-feed them, never around a long-running call. In practice that means each
-worker snapshots what it needs under the lock, does all its model and
-filesystem work unlocked, and swaps the new STATE back in under the lock at
-the end. `status()` takes the lock so the poller always sees a coherent
-snapshot; `_spawn` takes it for the check-and-set of `busy` so two
-simultaneous POSTs can't both start a worker.
+Locking: every read or write of the shared `STATE` goes through `STATE.lock`
+(an RLock), held only around state mutations -- never around model or
+filesystem work. Workers snapshot what they need, work unlocked, then swap the
+results in under the lock.
 """
 
 from __future__ import annotations
@@ -60,20 +38,15 @@ from . import review as review_mod
 from . import workspace
 from .agent import Agent
 from .config import USER_CONFIG, ConfigError
-from .llm import LLMError, LMStudio
+from .llm import LLMClient, LLMError
 
 RECENT_FILE = USER_CONFIG.parent / "gui_recent.json"
 MAX_RECENT = 8
 
 
-# --------------------------------------------------------------------------
-# Reusing cli.py's internals
-# --------------------------------------------------------------------------
 def _args_for(root_str: str, profile: str | None) -> SimpleNamespace:
-    """Build a stand-in for the argparse Namespace that cli.py's internal
-    helpers (_config/_matcher/_root/_refresh) expect, so the GUI can reuse
-    them unmodified instead of re-implementing config loading, file
-    selection, and index staleness handling."""
+    """Stand-in for the argparse Namespace that cli.py's _config/_matcher/
+    _root/_refresh helpers expect."""
     return SimpleNamespace(
         paths=[root_str], root=root_str, config=None, profile=profile or None,
         exclude=[], include=[], ext=[], no_refs=False, no_gitignore=False,
@@ -81,9 +54,6 @@ def _args_for(root_str: str, profile: str | None) -> SimpleNamespace:
     )
 
 
-# --------------------------------------------------------------------------
-# Recent-projects list
-# --------------------------------------------------------------------------
 def _load_recent() -> list[str]:
     """Return the most-recently-opened project paths, newest first."""
     try:
@@ -95,8 +65,7 @@ def _load_recent() -> list[str]:
 
 
 def _remember_recent(root: str) -> None:
-    """Move `root` to the front of the recent-projects list, persisted
-    alongside the user config so it survives between GUI sessions."""
+    """Move `root` to the front of the persisted recent-projects list."""
     recent = [root] + [r for r in _load_recent() if r != root]
     try:
         RECENT_FILE.parent.mkdir(parents=True, exist_ok=True)
@@ -106,25 +75,16 @@ def _remember_recent(root: str) -> None:
         pass  # a lost recents list is not worth failing the request over
 
 
-# --------------------------------------------------------------------------
-# Shared state
-# --------------------------------------------------------------------------
 class State:
-    """Everything held between HTTP requests. One instance, one active
-    project -- see the module docstring for why.
-
-    Every read and write of this object goes through `self.lock` unless
-    noted otherwise. The lock is an RLock so that methods like
-    `clear_review()` can be called from inside a block that already holds
-    it (see `_run_task`, `_open_project`).
-    """
+    """Everything held between HTTP requests (one active project). The RLock
+    lets `clear_review()` be called from inside a block that holds it."""
 
     def __init__(self):
         self.lock = threading.RLock()
         self.root: Path | None = None
         self.args: SimpleNamespace | None = None
         self.cfg = None
-        self.client: LMStudio | None = None
+        self.client: LLMClient | None = None
         self.idx = None
         self.agent: Agent | None = None
 
@@ -132,11 +92,8 @@ class State:
         self.busy_what = ""
         self.error = ""
 
-        # Live progress + end-of-task report for the currently running
-        # worker. `_run_task` appends to steps as the agent gathers, and
-        # sets note/applied when it finishes; `_spawn` resets all of them
-        # before every new job. The page polls /state and renders these so
-        # a task can never end "blank" without saying why.
+        # Progress and end-of-task report of the running worker; `_spawn`
+        # resets them before every job.
         self.steps: list[str] = []
         self.note = ""
         self.applied = False
@@ -144,14 +101,9 @@ class State:
         self.model_checked = False
         self.model_status = ""
 
-        # The most recent run, staged for review or already applied.
         self.last_task = ""
-        self.last_reply = ""
-        self.last_results: list = []
         self.last_backup_dir: Path | None = None
-        self.last_stamp = ""
 
-        # The most recent `explain` question and its prose answer.
         self.last_question = ""
         self.explain_answer = ""
 
@@ -162,10 +114,7 @@ class State:
         self.review_detail = ""
 
     def clear_review(self) -> None:
-        """Discard whatever review is currently staged, without touching
-        disk. Called both on /cancel and whenever a new project or task
-        makes the old review meaningless. Callers must already hold (or
-        acquire) `self.lock`; the RLock makes that safe either way."""
+        """Discard the staged review without touching disk."""
         with self.lock:
             self.review_page = ""
             self.review_nonce = ""
@@ -200,16 +149,7 @@ class State:
                 "last_question": self.last_question,
                 "explain_answer": self.explain_answer,
                 "recent": _load_recent(),
-                # First-run guidance: no user config file yet means every
-                # value shown is a built-in default -- say so once, with the
-                # exact command that fixes it, instead of letting the user
-                # discover a connection failure mid-task.
                 "needs_setup": not USER_CONFIG.exists(),
-                # Token-budget parity with the CLI: show what the agent will
-                # actually spend each step, and where that number came from
-                # (config vs auto-detected from the live server). Overflow
-                # confusion starts with "what limit am I hitting?" -- answer
-                # it before the user has to ask.
                 "context_tokens": self.cfg.context_tokens if self.cfg else 0,
                 "reserve_tokens": self.cfg.reserve_tokens if self.cfg else 0,
                 "max_tokens_step": self.cfg.max_tokens_step if self.cfg else 0,
@@ -226,10 +166,7 @@ STATE = State()
 
 
 def _spawn(fn, what: str) -> bool:
-    """Run `fn` on a background thread, refusing to start a second one
-    while the model, the index, or the agent are already busy -- they are
-    single-user resources and running two tasks against them at once would
-    corrupt whichever finishes first."""
+    """Run `fn` on a background thread; refuse while another job is running."""
     with STATE.lock:
         if STATE.busy:
             return False
@@ -242,7 +179,7 @@ def _spawn(fn, what: str) -> bool:
         except (ConfigError, LLMError) as e:
             with STATE.lock:
                 STATE.error = str(e)
-        except Exception as e:  # surface it rather than hang the UI forever
+        except Exception as e:  # surface it in the UI
             with STATE.lock:
                 STATE.error = f"{type(e).__name__}: {e}"
         finally:
@@ -253,18 +190,9 @@ def _spawn(fn, what: str) -> bool:
     return True
 
 
-# --------------------------------------------------------------------------
-# Actions (run on the background thread via _spawn)
-# --------------------------------------------------------------------------
 def _open_project(path: str, profile: str) -> None:
-    """Resolve a directory as the active project: load its config (which is
-    what makes the profile dropdown meaningful -- profiles live in a config
-    resolved relative to root), ensure workspace scaffolding, and load
-    (never silently build) its index.
-
-    The slow parts (config resolution, workspace setup, index loading and
-    refresh) run unlocked; only the final state swap holds the lock.
-    """
+    """Make a directory the active project: load its config, ensure workspace
+    scaffolding, and load (never build) its index."""
     p = Path(path).expanduser()
     if not p.is_dir():
         raise ConfigError(f"not a directory: {p}")
@@ -277,7 +205,7 @@ def _open_project(path: str, profile: str) -> None:
     if idx is not None:
         idx = cli_mod._refresh(idx, args, cfg, root, verbose=False)
 
-    client = LMStudio(cfg)
+    client = LLMClient(cfg)
     agent = Agent(idx, client, cfg) if idx is not None else None
 
     with STATE.lock:
@@ -292,11 +220,8 @@ def _open_project(path: str, profile: str) -> None:
 
 
 def _peek_profiles(path: str) -> list[str]:
-    """Read just the profile names for a directory, without opening it as
-    the active project. Cheap (TOML parsing only, no LLM/index work), so
-    it runs synchronously in the request handler rather than through
-    _spawn -- it lets the profile dropdown fill in *before* you commit to
-    Open, instead of forcing a blind first open on the default profile."""
+    """Profile names for a directory, without opening it (cheap, so it runs
+    synchronously in the request handler)."""
     p = Path(path).expanduser()
     if not p.is_dir():
         raise ConfigError(f"not a directory: {p}")
@@ -306,11 +231,8 @@ def _peek_profiles(path: str) -> list[str]:
 
 
 def _build_index() -> None:
-    """Build (or rebuild) the index with summaries -- the same work
-    `pedacito index` does from the CLI. Kept as an explicit, visible action
-    rather than something that fires silently on first Run, since it makes
-    one LLM call per summarised unit and is not free.
-    """
+    """Build the index with summaries, like `pedacito index` (one LLM call per
+    summarised unit, so it is an explicit action)."""
     with STATE.lock:
         if STATE.root is None:
             raise ConfigError("no project selected")
@@ -329,8 +251,8 @@ def _build_index() -> None:
 
 
 def _check_model() -> None:
-    """Verify the server is reachable and the configured model actually
-    generates -- the same two checks as `pedacito config --check`."""
+    """Check the server is reachable and the model generates, like
+    `pedacito config --check`."""
     with STATE.lock:
         if STATE.client is None:
             raise ConfigError("no project selected")
@@ -348,13 +270,9 @@ def _check_model() -> None:
 
 
 def _run_task(task: str, apply_now: bool) -> None:
-    """Gather source, get an answer or edits, and either stage a review
-    (the default) or write immediately if `apply_now` was checked.
-
-    `stream=False` on the answer call is deliberate: LMStudio.chat's
-    streaming mode writes tokens straight to this process's stdout, which
-    is meaningless in an HTTP handler with no terminal on the other end.
-    """
+    """Gather source and get edits, then stage a review (default) or write
+    immediately when `apply_now`. The answer call uses `stream=False` because
+    streaming writes tokens to stdout."""
     with STATE.lock:
         if STATE.agent is None:
             raise ConfigError("no index yet -- build the index first")
@@ -368,9 +286,6 @@ def _run_task(task: str, apply_now: bool) -> None:
     backup_dir = workspace.new_backup_dir(root, when) if cfg.backup else None
 
     def _note(text: str) -> None:
-        """Publish a line of live progress to the page's poller. The agent's
-        own verbose output still goes to the terminal; this mirrors just the
-        step count so the browser knows the task is alive."""
         with STATE.lock:
             STATE.steps.append(text)
 
@@ -391,15 +306,11 @@ def _run_task(task: str, apply_now: bool) -> None:
 
     if reviewing:
         new_diffs = review_mod.diffs_from_results(results, root)
-        # A rename's SOURCE file is intentionally deleted by the move, so its
-        # Result comes back ok=False ("removed (renamed...)") -- those are
-        # not failures. The old code tested `any(r.ok ...)` first and fell to
-        # the generic "edits did not match" note whenever every *applied*
-        # result was such a stub, which is exactly what a task as simple as
-        # "rename a file" produces. Distinguish real failures from rename
-        # bookkeeping before writing any note.
+        # A rename's source is deleted by the move, so its Result is ok=False
+        # ("removed (renamed...)"); that is not a failure.
         fails = [r for r in results if not r.ok
-                 and "renamed" not in (getattr(r, "message", "") or "")]
+                 and "renamed" not in (r.message or "")]
+        detail = "; ".join(f"{r.file}: {r.message}" for r in fails[:3])
         if new_diffs:
             new_nonce = review_mod.new_nonce()
             new_page = review_mod.build_page(
@@ -407,36 +318,18 @@ def _run_task(task: str, apply_now: bool) -> None:
                 new_nonce, interactive=True, stamp=when)
             review_mod.save(root, new_page, when)
             if fails:
-                # Stage the review anyway; say honestly what didn't make it.
-                detail = "; ".join(
-                    f"{getattr(r, 'file', '?')}: {getattr(r, 'message', '')}"
-                    for r in fails[:3])
                 note = (f"Review staged for {len(new_diffs)} file(s). "
                         f"{len(fails)} block(s) did not match and are not "
                         f"included: {detail}")
         elif any(r.ok for r in results):
-            # Edits parsed and matched, but none actually changed a file
-            # (every replacement equalled the original). Not an error --
-            # but it must be visible, or the review pane looks broken.
             note = ("The model proposed edits, but they leave every file "
                     "unchanged, so there is nothing to review.")
         elif fails:
-            detail = "; ".join(
-                f"{getattr(r, 'file', '?')}: {getattr(r, 'message', '')}"
-                for r in fails[:3])
             note = (f"No review: the model's edits did not match the "
                     f"files ({len(fails)} block(s) failed). {detail}")
         else:
-            # Say *why* it proposed nothing. A gather that never read a
-            # file the task names is the usual cause -- without this the
-            # user sees a blank review and no way to tell whether the
-            # agent lacked ability or lacked evidence.
-            unread = list(getattr(agent, "_unread_files", []) or [])
+            unread = list(agent._unread_files)
             if unread:
-                # The honest diagnosis is "the model stopped gathering and
-                # answered before reading the files it names". There is no
-                # default step cap, so such runs end because the model
-                # *chose* to finish early, not because a budget ran out.
                 note = ("No review: the model answered without proposing any "
                         "edits -- it never `read` the files it would need to "
                         "change: " + ", ".join(unread[:5]) +
@@ -463,9 +356,8 @@ def _run_task(task: str, apply_now: bool) -> None:
                     "matched. See the terminal output for details.")
 
     with STATE.lock:
-        STATE.last_task, STATE.last_reply = task, reply
-        STATE.last_results, STATE.last_backup_dir, STATE.last_stamp = (
-            results, backup_dir, when)
+        STATE.last_task = task
+        STATE.last_backup_dir = backup_dir
         STATE.clear_review()
         if new_diffs:
             STATE.review_diffs = new_diffs
@@ -479,14 +371,13 @@ def _run_task(task: str, apply_now: bool) -> None:
                 STATE.agent.index = idx
 
     if cfg.log_sessions:
-        workspace.write_session(root, task, getattr(agent, "steps_log", []),
+        workspace.write_session(root, task, agent.steps_log,
                                 reply, results, backup_dir, when)
 
 
 def _run_explain(question: str) -> None:
-    """Answer one question about the open project's code, in prose -- the
-    GUI counterpart of `pedacito explain`. Uses the same gather loop `ask`
-    does, but produces an explanation instead of edits."""
+    """Answer one question about the open project in prose (GUI counterpart of
+    `pedacito explain`)."""
     with STATE.lock:
         if STATE.agent is None:
             raise ConfigError("no index yet -- build the index first")
@@ -507,15 +398,9 @@ def _run_explain(question: str) -> None:
 
 
 def _apply_review() -> tuple[bool, str]:
-    """Write the currently staged review's files to disk (the review
-    page's Sign off button, handled on this server rather than a second
-    one -- see the module docstring).
-
-    Snapshots the review state under the lock, does the actual write
-    unlocked (it's a synchronous filesystem operation, not slow, but it
-    has no business blocking the poller), then swaps the updated index
-    back in under the lock.
-    """
+    """Write the staged review's files to disk (the review page's Sign off
+    button) and reindex them. Clears the nonce so the review cannot be applied
+    twice."""
     with STATE.lock:
         if not STATE.review_diffs:
             return False, "No review is staged."
@@ -531,6 +416,7 @@ def _apply_review() -> tuple[bool, str]:
 
     with STATE.lock:
         STATE.review_outcome, STATE.review_detail = "applied", detail
+        STATE.review_nonce = ""
         for fd in diffs:
             idx = index_mod.reindex_file(idx, fd.rel, cfg)
         STATE.idx = idx
@@ -540,11 +426,10 @@ def _apply_review() -> tuple[bool, str]:
 
 
 def _restore_snapshot(name: str = "") -> tuple[bool, str]:
-    """Undo an applied run by copying its backup snapshot back over the
-    working tree -- the GUI counterpart of `pedacito restore`. `name` is a
-    snapshot directory name from status()['snapshots']; empty means newest.
-    Files created since the snapshot stay on disk (workspace.restore
-    reports them as '(+)' rather than deleting anything)."""
+    """Copy a backup snapshot back over the working tree (GUI counterpart of
+    `pedacito restore`). `name` is a snapshot directory name from
+    status()['snapshots']; empty means newest. Files created since the
+    snapshot stay on disk."""
     with STATE.lock:
         root = STATE.root
         cfg = STATE.cfg
@@ -561,8 +446,6 @@ def _restore_snapshot(name: str = "") -> tuple[bool, str]:
             return False, f"Snapshot {name!r} no longer exists."
         snap = matches[0]
     restored = workspace.restore(root, snap)
-    # The tree changed underneath the index; rebuild coverage for what came
-    # back so the next task sees the restored contents, not stale summaries.
     if idx is not None and cfg is not None:
         for rel in restored:
             idx = index_mod.reindex_file(idx, rel, cfg)
@@ -572,43 +455,31 @@ def _restore_snapshot(name: str = "") -> tuple[bool, str]:
                 STATE.agent.index = idx
     with STATE.lock:
         STATE.clear_review()
-    extra = sum(1 for r in restored if r.endswith(" (+)"))
-    detail = f"Restored {len(restored) - extra} file(s) from {snap.name}."
-    if extra:
-        detail += (f" {extra} file(s) created after that snapshot are still "
-                   "on disk; delete them by hand if unwanted.")
-    return True, detail
+    return True, f"Restored {len(restored)} file(s) from {snap.name}."
 
 
-# --------------------------------------------------------------------------
-# Page: CSS + HTML + JS (self-contained, no CDN -- same reasoning as
-# review.py: this opens on a machine that may have no other browser tab
-# open, and should not depend on anything reachable over the network).
-# --------------------------------------------------------------------------
 CSS = """
 :root {
   --bg: #f7f7f5; --panel: #ffffff; --line: #e4e2dc; --text: #2a2822;
   --muted: #86816f; --accent: #b5651d; --ok: #3c6e47; --err: #a4342a;
   font: 15px/1.5 -apple-system, "Segoe UI", system-ui, sans-serif;
 }
-/* Sage: light, muted eucalyptus green -- soft and easy on the eyes for
-   long sessions, warm-neutral text stays high-contrast on the pale bg. */
+/* Sage: light eucalyptus green. */
 html[data-theme="sage"] {
   --bg: #eef0ea; --panel: #ffffff; --line: #d7ddd0; --text: #283228;
   --muted: #74806d; --accent: #5b7a52; --ok: #3f8f6e; --err: #b1543a;
 }
-/* Mocha: light, warm neutral (the Pantone "Mocha Mousse" family of
-   trending warm-taupe palettes) -- cream background, cocoa text. */
+/* Mocha: light warm neutral, cream background, cocoa text. */
 html[data-theme="mocha"] {
   --bg: #f3ece4; --panel: #fffdfa; --line: #e2d2c2; --text: #3a2c22;
   --muted: #8a7360; --accent: #a56a3f; --ok: #4f7a52; --err: #b1493a;
 }
-/* Clay: dark, warm terracotta -- deep brown bg, clay-orange accent. */
+/* Clay: dark warm terracotta. */
 html[data-theme="clay"] {
   --bg: #221a16; --panel: #2c221c; --line: #4a362c; --text: #f1e6dc;
   --muted: #b9997f; --accent: #c9703a; --ok: #8fbf8a; --err: #e5776a;
 }
-/* Nightshade: dark, cool plum/navy with a coral accent for contrast. */
+/* Nightshade: dark plum/navy with a coral accent. */
 html[data-theme="nightshade"] {
   --bg: #1b1a24; --panel: #242232; --line: #3a3650; --text: #e9e6f2;
   --muted: #a79cc0; --accent: #c96a5a; --ok: #7ec98a; --err: #e2726a;
@@ -689,12 +560,17 @@ var lastQuestionKey = '';
 var lastState = {};
 var taskActive = false;   // set by the Run click, cleared when a poll shows idle
 
+function esc(s) {
+  return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+}
+
 function fillProfiles(list, wanted) {
   var sel = $('profile');
   var cur = wanted !== undefined ? wanted : sel.value;
   sel.innerHTML = '<option value="">(default)</option>' +
     list.map(function (p) {
-      return '<option value="' + p + '"' + (p === cur ? ' selected' : '') + '>' + p + '</option>';
+      return '<option value="' + esc(p) + '"' + (p === cur ? ' selected' : '') + '>' + esc(p) + '</option>';
     }).join('');
 }
 
@@ -728,11 +604,9 @@ function render(s) {
   if (document.activeElement !== $('path')) { $('path').value = s.root || $('path').value; }
   var recent = $('recent');
   recent.innerHTML = '<option value="">recent projects\\u2026</option>' +
-    s.recent.map(function (r) { return '<option value="' + r.replace(/"/g, '&quot;') + '">' + r + '</option>'; }).join('');
+    s.recent.map(function (r) { return '<option value="' + esc(r) + '">' + esc(r) + '</option>'; }).join('');
 
-  // Once a project is open, its config is the authority on which profiles
-  // exist. Before that, leave whatever /peek populated alone -- s.profiles
-  // is empty pre-open and would otherwise wipe out the picker.
+  // Before a project is open s.profiles is empty; keep what /peek populated.
   if (s.root) { fillProfiles(s.profiles, s.profile); }
 
   $('modelLbl').textContent = s.model || '\\u2014';
@@ -740,7 +614,6 @@ function render(s) {
   $('buildBtn').hidden = s.has_index;
   $('modelStatus').textContent = s.model_checked ? s.model_status : '';
   $('setupHint').hidden = !s.needs_setup;
-  // Restore UI: enabled only while a snapshot exists for the open project.
   var snaps = s.snapshots || [];
   $('restoreBtn').disabled = snaps.length === 0 || !s.root;   // busy applied below
   var sel = $('snapshotSel');
@@ -748,7 +621,7 @@ function render(s) {
   if (sel.dataset.snaps !== snaps.join('|')) {
     sel.dataset.snaps = snaps.join('|');
     sel.innerHTML = '<option value="">newest</option>' + snaps.map(function (n) {
-      return '<option value="' + n + '">' + n + '</option>'; }).join('');
+      return '<option value="' + esc(n) + '">' + esc(n) + '</option>'; }).join('');
   }
   renderFiles(s.files || []);
 
@@ -763,8 +636,7 @@ function render(s) {
   $('busyLbl').className = busy ? 'busy' : '';
   $('errLbl').textContent = s.error || '';
 
-  // The Explain answer is prose (no diff), so it has its own pane. Render it
-  // via textContent so model output is never interpreted as HTML.
+  // textContent: model output is never interpreted as HTML.
   var qKey = (s.last_question || '') + '|' + (s.explain_answer || '');
   if (qKey !== lastQuestionKey) {
     lastQuestionKey = qKey;
@@ -784,9 +656,7 @@ function render(s) {
     }
   }
 
-  // A task ended without staging a review, applying edits, or raising an
-  // error. Show why instead of leaving the pane blank -- silent "success"
-  // is what made renames look like they had vanished.
+  // A task that ended without a review, edits or error: show why.
   if (!busy && taskActive) {
     taskActive = false;
     if (s.note) { $('errLbl').textContent = s.note; }
@@ -798,7 +668,7 @@ function render(s) {
   } else if (!s.has_review && key !== lastReviewKey) {
     var ph = 'Run a task to see a review here.';
     if (!busy && s.note) { ph = s.note; }
-    $('reviewWrap').innerHTML = '<p class="placeholder">' + ph + '</p>';
+    $('reviewWrap').innerHTML = '<p class="placeholder">' + esc(ph) + '</p>';
   }
   lastReviewKey = key;
 }
@@ -820,9 +690,7 @@ $('recent').addEventListener('change', function () {
   if (this.value) { $('path').value = this.value; peekTimer = setTimeout(schedulePeek, 0); }
 });
 
-// Populate the profile dropdown for whatever directory is typed, before
-// Open is ever clicked -- so a profile can be picked up front instead of
-// opening once on the default profile and again after switching.
+// Fill the profile dropdown for the typed directory before Open is clicked.
 var peekTimer = null;
 var peekedPath = '';
 function schedulePeek() {
@@ -838,8 +706,7 @@ function schedulePeek() {
 $('path').addEventListener('input', schedulePeek);
 
 $('profile').addEventListener('change', function () {
-  // Only an already-open project should reopen on profile change; before
-  // that, this just stages the choice for the next Open click.
+  // Only an already-open project reopens on profile change.
   if (lastState.root) {
     var path = $('path').value.trim();
     if (path) { post('/project', { path: path, profile: this.value }); }
@@ -992,14 +859,9 @@ _NO_REVIEW_HTML = ("<!doctype html><html><body style='font:14px sans-serif;"
                    "No review staged.</body></html>")
 
 
-# --------------------------------------------------------------------------
-# HTTP server
-# --------------------------------------------------------------------------
 class _Handler(BaseHTTPRequestHandler):
-    """Serves the control page, its polling endpoints, and the embedded
-    review page's own /apply and /cancel routes -- all on one server so the
-    review page's existing same-origin fetch calls work unmodified inside
-    the <iframe>."""
+    """Serves the control page, its polling endpoints, and the embedded review
+    page's /apply and /cancel routes."""
 
     server_version = "PedacitoGUI"
 
@@ -1017,14 +879,10 @@ class _Handler(BaseHTTPRequestHandler):
     def _json(self, code: int, obj: dict) -> None:
         self._send(code, json.dumps(obj).encode(), "application/json")
 
-    def _body(self) -> dict:
-        try:
-            n = int(self.headers.get("Content-Length") or 0)
-            return json.loads(self.rfile.read(n) or b"{}")
-        except (ValueError, json.JSONDecodeError):
-            return {}
-
     def do_GET(self):
+        if not review_mod.request_allowed(self, post=False):
+            self._send(403, b'{"ok":false}', "application/json")
+            return
         path = self.path.split("?")[0]
         if path == "/":
             self._send(200, PAGE_HTML.encode("utf-8"), "text/html; charset=utf-8")
@@ -1038,12 +896,15 @@ class _Handler(BaseHTTPRequestHandler):
             self._send(404, b'{"ok":false}', "application/json")
 
     def do_POST(self):
+        if not review_mod.request_allowed(self, post=True):
+            self._send(403, b'{"ok":false}', "application/json")
+            return
         path = self.path.split("?")[0]
-        body = self._body()
+        body = review_mod.read_json_body(self)
 
         if path == "/peek":
             try:
-                profiles = _peek_profiles(body.get("path", ""))
+                profiles = _peek_profiles(str(body.get("path", "")))
                 self._json(200, {"ok": True, "profiles": profiles})
             except ConfigError as e:
                 self._json(200, {"ok": False, "detail": str(e)})
@@ -1074,13 +935,14 @@ class _Handler(BaseHTTPRequestHandler):
             ok = _spawn(lambda: _run_explain(question), "explaining")
             self._json(202 if ok else 409, {"ok": ok})
         elif path == "/apply":
-            with STATE.lock:
-                current_nonce = STATE.review_nonce
-            if body.get("nonce") != current_nonce:
-                self._json(403, {"ok": False,
-                                 "detail": "This review is no longer valid."})
-                return
-            ok, detail = _apply_review()
+            with _APPLY_LOCK:
+                with STATE.lock:
+                    current_nonce = STATE.review_nonce
+                if not current_nonce or body.get("nonce") != current_nonce:
+                    self._json(403, {"ok": False,
+                                     "detail": "This review is no longer valid."})
+                    return
+                ok, detail = _apply_review()
             self._json(200, {"ok": ok, "detail": detail})
         elif path == "/cancel":
             with STATE.lock:
@@ -1099,20 +961,18 @@ class _Handler(BaseHTTPRequestHandler):
 
 
 _SERVER: ThreadingHTTPServer | None = None
+_APPLY_LOCK = threading.Lock()
 
 
 def _shutdown_server() -> None:
-    """Stop serve_forever() from a thread other than the one running it,
-    as required by http.server -- called via the Exit button's /shutdown
-    request, on its own thread so this request's response is already on
-    the wire before the server actually stops."""
+    """Stop serve_forever() from a thread other than the one running it (the
+    /shutdown handler starts this after its response is sent)."""
     if _SERVER is not None:
         _SERVER.shutdown()
 
 
 def run(port: int = 0, open_browser: bool = True) -> None:
-    """Start the GUI server and block until interrupted (Ctrl-C or the
-    page's Exit button)."""
+    """Start the GUI server; block until Ctrl-C or the page's Exit button."""
     global _SERVER
     srv = ThreadingHTTPServer(("127.0.0.1", port), _Handler)
     _SERVER = srv

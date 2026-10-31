@@ -299,14 +299,14 @@ def test_investigation_answer_adds_the_verdict_brief_for_verify_titles(
 
     idx = types.SimpleNamespace(root=tmp_path)
     loop.run_investigation_task(
-        tmp_path, _cfg(), None, StubAgent(), idx,
+        tmp_path, _cfg(), StubAgent(), idx,
         "ORIGINAL USER GOAL (background):\nKeep the sprite work verifiable.\n"
         "\nCURRENT TASK\nVerify the tail tapers to a point")
     assert "VERDICT: PASSED" in seen[0]
     assert "very last line" in seen[0]
 
     loop.run_investigation_task(
-        tmp_path, _cfg(), None, StubAgent(), idx,
+        tmp_path, _cfg(), StubAgent(), idx,
         "ORIGINAL USER GOAL (background):\nYou must verify nothing "
         "regressed.\n\nCURRENT TASK\nLocate the snake rendering code")
     assert "VERDICT" not in seen[1]
@@ -496,7 +496,7 @@ def test_run_investigation_task_retries_an_empty_answer(tmp_path):
                 "A real report with enough prose to pass the word heuristic.")
 
     tr = loop.run_investigation_task(
-        tmp_path, cfg, None, FakeAgent(),
+        tmp_path, cfg, FakeAgent(),
         types.SimpleNamespace(root=tmp_path), "Reproduce the bug")
     assert len(calls) == 2
     assert tr.reply.startswith("A real report")
@@ -507,7 +507,7 @@ def test_run_investigation_task_retries_an_empty_answer(tmp_path):
             return ""
 
     tr = loop.run_investigation_task(
-        tmp_path, cfg, None, AlwaysEmpty(),
+        tmp_path, cfg, AlwaysEmpty(),
         types.SimpleNamespace(root=tmp_path), "Reproduce the bug")
     assert len(calls) == 4
     assert tr.reply.startswith("No prose report was produced")
@@ -574,7 +574,7 @@ def test_run_investigation_task_regenerates_a_collapsed_answer(tmp_path):
             return COLLAPSED if len(calls) == 1 else CLEAN
 
     tr = loop.run_investigation_task(
-        tmp_path, cfg, None, FakeAgent(),
+        tmp_path, cfg, FakeAgent(),
         types.SimpleNamespace(root=tmp_path),
         "Run the game and verify the snake renders")
     assert len(calls) == 2
@@ -588,7 +588,7 @@ def test_run_investigation_task_regenerates_a_collapsed_answer(tmp_path):
             return COLLAPSED
 
     tr = loop.run_investigation_task(
-        tmp_path, cfg, None, AlwaysCollapsed(),
+        tmp_path, cfg, AlwaysCollapsed(),
         types.SimpleNamespace(root=tmp_path),
         "Run the game and verify the snake renders")
     assert len(calls) == 4          # one regeneration, then the retry stays
@@ -607,7 +607,7 @@ def test_run_loop_marks_investigation_task_done_without_edits(tmp_path,
     idx = types.SimpleNamespace(root=tmp_path)
     calls = []
 
-    def fake_investigate(root, cfg, client, agent, idx_, task,
+    def fake_investigate(root, cfg, agent, idx_, task,
                          answer_system=None):
         calls.append(("investigate", task))
         return loop.TaskResult(
@@ -653,7 +653,7 @@ def test_run_loop_fails_verify_task_that_gathered_no_evidence(tmp_path,
         calls.append(("edit", task))
         return _result(idx_)
 
-    def fake_investigate(root, cfg, client, agent, idx_, task,
+    def fake_investigate(root, cfg, agent, idx_, task,
                          answer_system=None):
         calls.append(("investigate", task))
         return loop.TaskResult(
@@ -699,7 +699,7 @@ def test_run_loop_procedural_verify_retry_can_pass(tmp_path, monkeypatch):
         calls.append(("edit", task))
         return _result(idx_)
 
-    def fake_investigate(root, cfg, client, agent, idx_, task,
+    def fake_investigate(root, cfg, agent, idx_, task,
                          answer_system=None):
         calls.append(("investigate", task))
         if len(calls) == 2:
@@ -764,7 +764,7 @@ def test_run_loop_live_verify_needs_a_live_step(tmp_path, monkeypatch):
                     ["Run the game and verify the snake is taller"])
     idx = types.SimpleNamespace(root=tmp_path)
 
-    def fake_investigate(root, cfg, client, agent, idx_, task,
+    def fake_investigate(root, cfg, agent, idx_, task,
                          answer_system=None):
         return loop.TaskResult(
             [], "Verified: the snake renders 180px tall with a diamond head.",
@@ -785,7 +785,7 @@ def test_run_loop_live_verify_passes_with_browser_step(tmp_path, monkeypatch):
                     ["Run the game and verify the snake is taller"])
     idx = types.SimpleNamespace(root=tmp_path)
 
-    def fake_investigate(root, cfg, client, agent, idx_, task,
+    def fake_investigate(root, cfg, agent, idx_, task,
                          answer_system=None):
         return loop.TaskResult(
             [], "Verified: the snake renders 180px tall with a diamond head.",
@@ -846,7 +846,7 @@ def test_run_loop_inserts_remediation_after_failed_verify(tmp_path, monkeypatch)
     verifies = []
     repairs = []
 
-    def fake_investigate(root, cfg, client, agent, idx_, task,
+    def fake_investigate(root, cfg, agent, idx_, task,
                          answer_system=None):
         verifies.append(task)
         if len(verifies) == 1:
@@ -899,7 +899,7 @@ def test_run_loop_remediation_rounds_are_bounded(tmp_path, monkeypatch):
     idx = types.SimpleNamespace(root=tmp_path)
     verifies = []
 
-    def fake_investigate(root, cfg, client, agent, idx_, task,
+    def fake_investigate(root, cfg, agent, idx_, task,
                          answer_system=None):
         verifies.append(task)
         return loop.TaskResult(
@@ -943,7 +943,7 @@ def test_run_loop_retires_a_check_whose_repair_refused_to_edit(tmp_path,
     repairs = []
     fixes = []
 
-    def fake_investigate(root, cfg, client, agent, idx_, task,
+    def fake_investigate(root, cfg, agent, idx_, task,
                          answer_system=None):
         verifies.append(task)
         return loop.TaskResult(
@@ -997,7 +997,7 @@ def test_run_loop_empty_report_gets_no_remediation(tmp_path, monkeypatch):
                     ["Run the game and verify the snake has one head"])
     idx = types.SimpleNamespace(root=tmp_path)
 
-    def fake_investigate(root, cfg, client, agent, idx_, task,
+    def fake_investigate(root, cfg, agent, idx_, task,
                          answer_system=None):
         return loop.TaskResult(
             [], "No prose report was produced; the lookup phase recorded:\n\n"
@@ -1023,7 +1023,7 @@ def test_run_loop_fails_verify_task_reporting_a_failed_verification(
                     ["Run the game and verify the snake has one head"])
     idx = types.SimpleNamespace(root=tmp_path)
 
-    def fake_investigate(root, cfg, client, agent, idx_, task,
+    def fake_investigate(root, cfg, agent, idx_, task,
                          answer_system=None):
         return loop.TaskResult(
             [], "Verification failed in the captured run: each snake still "
@@ -1050,7 +1050,7 @@ def test_run_loop_fails_verify_task_with_no_prose_report(tmp_path, monkeypatch):
                     ["Run the game and verify the snake has one head"])
     idx = types.SimpleNamespace(root=tmp_path)
 
-    def fake_investigate(root, cfg, client, agent, idx_, task,
+    def fake_investigate(root, cfg, agent, idx_, task,
                          answer_system=None):
         return loop.TaskResult(
             [], "No prose report was produced; the lookup phase recorded:\n\n"
@@ -1138,7 +1138,7 @@ def test_run_loop_flags_stale_notes_after_edits(tmp_path, monkeypatch):
     code = loop.run_loop(tmp_path, _cfg(), None, idx, plan, apply=True)
     assert code == 0
     # The second task's prompt carries the staleness marker for the first.
-    assert "EDITS APPLIED to: static/js/main.js" in seen["task"]
+    assert "FILES CHANGED:\n- static/js/main.js" in seen["task"]
     assert "stale" in seen["task"]
 
 
@@ -1277,7 +1277,7 @@ def test_context_notes_carry_report_tail(tmp_path, monkeypatch):
     idx = types.SimpleNamespace(root=tmp_path)
     calls = []
 
-    def fake_investigate(root, cfg, client, agent, idx_, task,
+    def fake_investigate(root, cfg, agent, idx_, task,
                          answer_system=None):
         calls.append(("investigate", task))
         report = ("Likely cause: enemies.js defines the snake. "
@@ -1327,7 +1327,7 @@ def test_run_loop_pins_the_reproduce_note_into_later_prompts(tmp_path,
     idx = types.SimpleNamespace(root=tmp_path)
     prompts = []
 
-    def fake_investigate(root, cfg, client, agent, idx_, task,
+    def fake_investigate(root, cfg, agent, idx_, task,
                          answer_system=None):
         prompts.append(task)
         n = len(prompts)
@@ -1678,7 +1678,7 @@ def test_run_loop_reruns_an_empty_report_once_then_retires_the_check(
     stand_in = ("No prose report was produced; the lookup phase recorded:\n"
                 "\n1. browser python main.py [wait 1]  (Measure.)")
 
-    def fake_investigate(root, cfg, client, agent, idx_, task,
+    def fake_investigate(root, cfg, agent, idx_, task,
                          answer_system=None):
         calls.append(task)
         return loop.TaskResult(
@@ -1929,6 +1929,38 @@ def test_run_loop_auto_installs_missing_dependency(tmp_path, monkeypatch):
     assert code == 0
     assert installs == [["pygame"]]
     assert "- [x] implement main" in plan.read_text()
+
+
+def test_run_loop_auto_install_does_not_loop_when_module_stays_missing(
+        tmp_path, monkeypatch):
+    """If the install "succeeds" but verify still reports the same missing
+    module, the loop must stop instead of reinstalling forever."""
+    plan = tmp_path / "PLAN.md"
+    loop.write_plan(plan, "", ["implement main"])
+    idx = types.SimpleNamespace(root=tmp_path)
+    installs = []
+
+    monkeypatch.setattr(loop, "run_task", lambda *a, **k: _result(idx))
+    monkeypatch.setattr(loop, "run_verify", lambda root, cmd: (
+        False, "ModuleNotFoundError: No module named 'pygame'"))
+    monkeypatch.setattr(loop, "install_modules",
+                        lambda pkgs, root: (installs.append(list(pkgs)), (True, ""))[1])
+    code = loop.run_loop(tmp_path, _cfg(), None, idx, plan, apply=True,
+                         verify="python main.py", auto_install=True)
+    assert code == 1
+    assert installs == [["pygame"]]
+
+
+def test_install_modules_rejects_option_like_names(tmp_path):
+    ok, out = loop.install_modules(["--index-url", "-r"], tmp_path)
+    assert ok is False
+    assert "no valid package names" in out
+
+
+def test_normalized_reply_folds_double_encoded_apostrophes():
+    for bad in ("can\u2019t", "can\u00e2\u20ac\u2122t", "can\u00e2\x80\x99t"):
+        assert loop._normalized_reply(bad) == "can't"
+    assert loop._declares_incomplete("I can\u00e2\u20ac\u2122t emit the blocks yet")
 
 
 def test_run_verify_runs_in_project_root(tmp_path):
@@ -2257,7 +2289,7 @@ def test_recover_no_edit_reply_offers_an_explicit_no_edit_way_out(tmp_path):
         def apply(self, reply, **kw):
             return ([], reply)
 
-    rec = loop._recover_no_edit_reply(tmp_path, _cfg(), FakeAgent(),
+    rec = loop._recover_no_edit_reply(tmp_path, FakeAgent(),
                                       "Repair the defect", "src",
                                       "prose reply",
                                       dry_run=True, backup_dir=None)
@@ -2286,7 +2318,7 @@ def test_recover_honors_the_no_changes_escape_hatch_reply(tmp_path):
         def apply(self, reply, **kw):
             return ([], reply)
 
-    rec = loop._recover_no_edit_reply(tmp_path, _cfg(), FakeAgent(),
+    rec = loop._recover_no_edit_reply(tmp_path, FakeAgent(),
                                       "Repair the defect", "src",
                                       "prose reply",
                                       dry_run=True, backup_dir=None)
@@ -2810,3 +2842,120 @@ def test_tool_call_only_detection_ignores_a_giant_repeated_path():
     reply = ("<tool_call>read\n</think>\n<read>\n<file_path>\n"
              + "/Users/x/Projects/" * 80 + "\n")
     assert loop._looks_like_tool_calls_only(reply)
+
+
+# ------------------------------------------------------- rollback-if-worse
+def test_failure_score_counts_pytest_failures_and_errors():
+    assert loop._failure_score("== 2 failed, 30 passed in 1.2s ==") == 2
+    assert loop._failure_score("1 failed, 2 errors during collection") == 3
+    # no pytest counters: a flat 1, comparable across rounds but no finer
+    assert loop._failure_score("3 errors") == 1
+    assert loop._failure_score("boom") == 1
+    assert loop._failure_score("") == 1
+
+
+def test_failure_score_counts_diagnostic_finding_lines():
+    report = ("app.py:3:1: E501 line too long\n"
+              "app.py:9:12: F821 undefined name 'y'\n"
+              "util.py:1:1: W291 trailing whitespace\n"
+              "Found 3 problems.")
+    assert loop._failure_score(report, diag=True) == 3
+    assert loop._failure_score("no findings here", diag=True) == 1
+    # pytest counters win even in diag mode
+    assert loop._failure_score("2 failed, 1 passed", diag=True) == 2
+
+
+def test_run_loop_rolls_back_a_repair_that_made_verify_worse(tmp_path,
+                                                             monkeypatch):
+    """A repair round that raises the failure count is undone from its own
+    snapshot (the state before that round's writes), the better earlier state
+    survives, and the loop stops repairing instead of digging deeper."""
+    from pedacito import workspace
+
+    plan = tmp_path / "PLAN.md"
+    loop.write_plan(plan, "", ["needs tests"])
+    idx = types.SimpleNamespace(root=tmp_path)
+    (tmp_path / "a.py").write_text("GOOD = 1\n", encoding="utf-8")
+    tasks = []
+
+    def fake_run_task(root, cfg, client, agent, idx_, task, apply=True,
+                      review=False, answer_system=None):
+        tasks.append(task)
+        if len(tasks) == 1:
+            return loop.TaskResult([_ok()], "reply", True, ["a.py"], idx_)
+        # the repair: snapshots a.py first, then makes things worse
+        snap = workspace.new_backup_dir(root)
+        (snap / "a.py").write_bytes((root / "a.py").read_bytes())
+        (root / "a.py").write_text("GOOD = 1\nBAD = 2\nWORSE = 3\n",
+                                   encoding="utf-8")
+        return loop.TaskResult([_ok()], "reply", True, ["a.py"], idx_,
+                               backup_dir=snap)
+
+    checks = iter([(False, "1 failed"), (False, "3 failed")])
+    monkeypatch.setattr(loop, "run_task", fake_run_task)
+    monkeypatch.setattr(loop, "run_verify", lambda root, cmd: next(checks))
+    code = loop.run_loop(tmp_path, _cfg(), None, idx, plan, apply=True,
+                         verify="pytest -q", repair_rounds=3,
+                         stop_on_fail=False)
+    assert code == 1
+    assert len(tasks) == 2                       # gave up after the rollback
+    assert "failed this check" in tasks[1]
+    assert (tmp_path / "a.py").read_text() == "GOOD = 1\n"
+    assert "- [!] needs tests" in plan.read_text()
+
+
+def test_run_loop_keeps_repairing_while_the_score_does_not_rise(tmp_path,
+                                                                monkeypatch):
+    """Same count (or better) is not 'worse': the rounds continue until
+    repair_rounds runs out, with no rollback."""
+    plan = tmp_path / "PLAN.md"
+    loop.write_plan(plan, "", ["needs tests"])
+    idx = types.SimpleNamespace(root=tmp_path)
+    tasks = []
+
+    def fake_run_task(root, cfg, client, agent, idx_, task, apply=True,
+                      review=False, answer_system=None):
+        tasks.append(task)
+        return loop.TaskResult([_ok()], "reply", True, ["a.py"], idx_)
+
+    monkeypatch.setattr(loop, "run_task", fake_run_task)
+    monkeypatch.setattr(loop, "run_verify", lambda root, cmd: (False,
+                                                               "1 failed"))
+    code = loop.run_loop(tmp_path, _cfg(), None, idx, plan, apply=True,
+                         verify="pytest -q", repair_rounds=2)
+    assert code == 1
+    assert len(tasks) == 3                       # initial + two repairs
+
+
+# ---------------------------------------------------------- plan title lint
+def test_lint_plan_titles_warns_on_bundled_changes(tmp_path, capsys):
+    plan = tmp_path / "PLAN.md"
+    loop.write_plan(plan, "", ["Fix the parser and update the docs",
+                               "Add the retry helper"])
+    loop._lint_plan_titles(tmp_path, plan)
+    err = capsys.readouterr().err
+    assert "plan title bundles 2 changes" in err
+    assert "fix, update" in err
+    assert "Add the retry helper" not in err     # one verb: no warning
+
+
+def test_lint_plan_titles_ignores_checked_lines(tmp_path, capsys):
+    plan = tmp_path / "PLAN.md"
+    loop.write_plan(plan, "", ["Fix and update everything"])
+    loop.mark_done(plan, "Fix and update everything")
+    loop._lint_plan_titles(tmp_path, plan)
+    assert "bundles" not in capsys.readouterr().err
+
+
+def test_run_loop_lints_bundled_plan_titles_at_start(tmp_path, monkeypatch,
+                                                     capsys):
+    plan = tmp_path / "PLAN.md"
+    loop.write_plan(plan, "", ["Fix the parser and update the docs"])
+    idx = types.SimpleNamespace(root=tmp_path)
+    monkeypatch.setattr(loop, "run_task", lambda *a, **k: _result(idx))
+    loop.run_loop(tmp_path, _cfg(), None, idx, plan, apply=True)
+    assert "plan title bundles" in capsys.readouterr().err
+
+
+def test_plan_system_wants_one_change_per_title():
+    assert "One title, one change" in loop.PLAN_SYSTEM

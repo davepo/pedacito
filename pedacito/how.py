@@ -32,7 +32,7 @@ from . import config as config_mod
 from .chunker import Chunk, chunk_source
 from .config import (Config, ConfigError, auto_fit, find_project_config,
                      load as load_config, missing_hardware)
-from .llm import LMStudio, LLMError, estimate_tokens
+from .llm import LLMClient, LLMError, estimate_tokens
 from .references import chunk_reference
 
 DOC_FILES = ("README.md", "QUICKSTART.md")
@@ -96,16 +96,10 @@ class HowError(RuntimeError):
     """Raised when the help corpus cannot be located or built."""
 
 
-# --------------------------------------------------------------------------
-# Locating the documentation
-# --------------------------------------------------------------------------
 def find_docs_root() -> Path:
-    """Return the directory containing README.md and QUICKSTART.md.
-
-    Tries, in order: $PEDACITO_DOCS, the checkout around this package, the
-    package directory itself, the current directory, and the location used by
-    setuptools `data-files` for a non-editable install.
-    """
+    """Return the directory containing README.md and QUICKSTART.md: $PEDACITO_DOCS,
+    the checkout around this package, the package directory, setuptools
+    `data-files` locations, then the current directory."""
     here = Path(__file__).resolve().parent
     candidates: list[Path] = []
     env = os.environ.get("PEDACITO_DOCS")
@@ -123,9 +117,7 @@ def find_docs_root() -> Path:
     except Exception:
         pass
     candidates.append(Path(sys.prefix) / "share" / "pedacito")
-    # Last resort: a checkout/PEDACITO_DOCS directory the caller is standing
-    # in. Kept after the installed locations so a user project's own README
-    # cannot shadow Pedacito's documentation.
+    # Last, so a user project's own README cannot shadow Pedacito's.
     candidates.append(Path.cwd())
 
     seen: set[Path] = set()
@@ -143,12 +135,7 @@ def find_docs_root() -> Path:
 
 
 def _split_large(chunk: Chunk, limit: int = MAX_ITEM_CHARS) -> list[Chunk]:
-    """Split an oversized documentation/source chunk at line boundaries.
-
-    Line ranges stay accurate, so the excerpt labels still say where the text
-    came from. A section keeps its heading in the first part; later parts are
-    labelled by the same qualname and line range.
-    """
+    """Split an oversized chunk at line boundaries, keeping line ranges accurate."""
     source = chunk.source or ""
     if len(source) <= limit:
         return [chunk]
@@ -171,17 +158,12 @@ def _split_large(chunk: Chunk, limit: int = MAX_ITEM_CHARS) -> list[Chunk]:
         parts.append(replace(chunk, start=start,
                              end=start + len(cur) - 1,
                              source="\n".join(cur)))
-    return parts or [chunk]
+    return parts
 
 
 def _string_constants(rel: str, source: str) -> list[Chunk]:
-    """Extract the large string constants that document config examples.
-
-    chunk_source deliberately indexes definitions, not module-level string
-    assignments -- but config.TEMPLATE and REFERENCE_TEMPLATE are exactly what
-    a "how do I write a config file?" answer should quote. Pull just those two
-    named constants out of the source.
-    """
+    """Extract config.TEMPLATE and REFERENCE_TEMPLATE, which chunk_source skips
+    (module-level strings) but "how do I write a config?" answers should quote."""
     wanted = {"TEMPLATE", "REFERENCE_TEMPLATE"}
     try:
         tree = ast.parse(source)
@@ -206,8 +188,8 @@ def _string_constants(rel: str, source: str) -> list[Chunk]:
 
 
 def build_corpus(docs_root: Path | None = None) -> list[Chunk]:
-    """Load README, QUICKSTART, the starter config templates, and all Python
-    modules in the installed package as searchable chunks."""
+    """README, QUICKSTART, the config templates and the package's Python modules
+    as searchable chunks."""
     root = docs_root or find_docs_root()
     chunks: list[Chunk] = []
     for name in DOC_FILES:
@@ -224,9 +206,7 @@ def build_corpus(docs_root: Path | None = None) -> list[Chunk]:
     pkg = Path(__file__).resolve().parent
     for path in sorted(pkg.glob("*.py")):
         if path.name == "how.py":
-            # Do not let the help implementation retrieve itself; its
-            # comments mention every setting and would crowd out the real
-            # documentation for questions like "what does max_steps do?".
+            # Its text mentions every setting and would crowd out the real docs.
             continue
         rel = f"pedacito/{path.name}"
         try:
@@ -242,16 +222,9 @@ def build_corpus(docs_root: Path | None = None) -> list[Chunk]:
     return chunks
 
 
-# --------------------------------------------------------------------------
-# Retrieval
-# --------------------------------------------------------------------------
 def _weighted_terms(text: str) -> dict[str, float]:
-    """Lowercase question terms with relative weights.
-
-    A compound identifier such as `max_steps` counts fully; its pieces
-    ("max", "steps") count much less, so a question about the setting is not
-    swamped by every documentation section that happens to use "steps".
-    """
+    """Lowercase question terms with weights: a compound identifier such as
+    `max_steps` counts fully, its pieces much less."""
     raws: list[str] = []
     for raw in _WORD_RE.findall(text.lower()):
         raw = raw.strip(".-")
@@ -286,12 +259,8 @@ def _token_counts(text: str) -> Counter:
 
 
 def rank_chunks(question: str, chunks: list[Chunk]) -> list[tuple[float, Chunk]]:
-    """Rank corpus chunks against the question with a small BM25 variant.
-
-    Headings/file names count more than body text: a section called "Configure"
-    is a better hit for a setup question than a paragraph that merely says
-    "configure" in passing.
-    """
+    """Rank chunks against the question with a small BM25 variant; terms in a
+    chunk's file name or heading score extra."""
     weights = _weighted_terms(question)
     if not weights:
         return [(0.0, c) for c in chunks]
@@ -346,9 +315,7 @@ def _context_budget(cfg: Config, question: str, snapshot: str,
     room = cfg.context_tokens - cfg.reserve_tokens - answer - used
     chars = int(max(room, 512) * 3.6)
     chars = min(chars, max(3000, int(cfg.max_gathered_chars)))
-    # Help benefits from focus, not from filling a 128k hosted window: a
-    # handful of sections plus corroborating source is enough and keeps
-    # latency/cost down.
+    # A few sections plus source is enough; keeps latency and cost down.
     chars = min(chars, 24000)
     return max(2200, chars)
 
@@ -357,12 +324,9 @@ def select_references(question: str, chunks: list[Chunk], cfg: Config,
                       snapshot: str = "",
                       history: list[tuple[str, str]] | None = None
                       ) -> tuple[str, list[Chunk]]:
-    """Pick the documentation/source excerpts for one question.
-
-    Every answer gets at least the best README section, the best QUICKSTART
-    section, and the CLI usage preamble from source, so even an unusual
-    question is grounded in all three kinds of reference material.
-    """
+    """Pick excerpts for one question: always the best README section, the best
+    QUICKSTART section and the CLI preamble, then top-ranked source and docs
+    until the budget is used."""
     history = history or []
     ranked = rank_chunks(question, chunks)
     by_file: dict[str, list[tuple[float, Chunk]]] = {}
@@ -384,8 +348,7 @@ def select_references(question: str, chunks: list[Chunk], cfg: Config,
         if len(block) > room:
             if room < 900:
                 return False
-            # Keep the head of a long excerpt rather than dropping a highly
-            # relevant section just because it is a little over budget.
+            # Keep the head of an over-budget excerpt instead of dropping it.
             block = block[:room].rstrip() + "\n[...truncated to fit]"
         picked.append(chunk)
         blocks.append(block)
@@ -397,14 +360,13 @@ def select_references(question: str, chunks: list[Chunk], cfg: Config,
         candidates = [(s, c) for s, c in by_file.get(name, []) if c.source]
         add(candidates[0][1] if candidates else None)
 
-    # The command list at the top of cli.py is small and useful for almost
-    # every "what command..." question.
+    # cli.py's command list helps almost every "what command..." question.
     cli_preamble = next(
         (c for c in chunks
          if c.file == "pedacito/cli.py" and c.qualname == "module"), None)
     add(cli_preamble)
 
-    # The starter config template when the question is about setting up.
+    # Starter config template for setup questions.
     if terms & _CONFIG_WORDS:
         template = next(
             (c for c in chunks
@@ -437,15 +399,8 @@ def select_references(question: str, chunks: list[Chunk], cfg: Config,
     return "\n\n".join(blocks), picked
 
 
-# --------------------------------------------------------------------------
-# Current configuration
-# --------------------------------------------------------------------------
 def config_snapshot(cfg: Config, root: Path | None = None) -> str:
-    """Render the resolved settings for the help prompt, hiding secrets.
-
-    The model needs the user's real values to answer "what should I run with
-    my config?"; it never needs the API key itself.
-    """
+    """Render the resolved settings for the help prompt, hiding secrets."""
     root = root or Path.cwd()
     lines = [
         "Resolved Pedacito configuration for this help session "
@@ -483,9 +438,6 @@ def config_snapshot(cfg: Config, root: Path | None = None) -> str:
     return "\n".join(lines)
 
 
-# --------------------------------------------------------------------------
-# Answer generation
-# --------------------------------------------------------------------------
 QUESTION_SYSTEM = """\
 You are Pedacito's built-in help assistant. Pedacito is a Python command-line
 tool that lets a small local LLM work on a codebase through a lookup index.
@@ -527,7 +479,7 @@ def _history_messages(history: list[tuple[str, str]]) -> list[dict]:
 class HowSession:
     """One help conversation: corpus built once, config/model reused."""
 
-    def __init__(self, cfg: Config, client: LMStudio,
+    def __init__(self, cfg: Config, client: LLMClient,
                  docs_root: Path | None = None):
         self.cfg = cfg
         self.client = client
@@ -573,17 +525,9 @@ class HowSession:
         return answer
 
 
-# --------------------------------------------------------------------------
-# CLI-facing helpers
-# --------------------------------------------------------------------------
 def config_from_args(args) -> Config:
-    """Build the `how` config: normal config layers, then direct flags.
-
-    `how` is deliberately usable with a bare-minimum config (or no config at
-    all when the connection is passed directly). VRAM is optional here: if it
-    is absent for a local server we keep conservative built-in budgets instead
-    of refusing to answer a help question.
-    """
+    """Build the `how` config: normal layers, then direct flags. VRAM is optional
+    here; without it the built-in token budgets are kept."""
     root = Path.cwd()
     cfg = load_config(root=root,
                       explicit=getattr(args, "config", None),
@@ -625,7 +569,7 @@ def _read_question(args) -> str:
 def run_cli(args) -> int:
     """Entry point used by cli.main for `pedacito how`."""
     cfg = config_from_args(args)
-    client = LMStudio(cfg)
+    client = LLMClient(cfg)
     client.check()
     client.warmup()
     session = HowSession(cfg, client)

@@ -1,54 +1,41 @@
 """Starting a project from nothing: spec in, plan out, skeleton on disk.
 
-Usage
------
-    from .scaffold import load_spec, build_plan, render_plan, apply_skeleton
-
     spec = load_spec(prompt="a CLI todo manager", spec_file=None)
     plan = build_plan(spec, client, cfg, root)
     print(render_plan(plan))            # what it intends to create
     written = apply_skeleton(root, plan, dry_run=True)
 
-Why this exists as its own module: `ask` and `chat` are built around an index,
-and an index is built around files that already exist. A brand-new project has
-neither, so the gather loop would have nothing to look up. Here the model does
-not need to find code -- it writes all of it -- so the flow is inverted into
-three cheap, reviewable stages:
+`ask` and `chat` need an index of existing files, which a new project lacks,
+so the flow is three cheap, reviewable stages:
 
   1. PLAN     one JSON-constrained call turns the spec into a file list with
-              one-line descriptions. Cheap, and it bounds what the next stage
-              can do: a small model that rambles for 40 files gets stopped here
-              by `max_new_files`.
-  2. SKELETON local, zero LLM calls. Every planned file is created with only a
-              header comment (plus a starter pyproject/README/gitignore when
-              none exists). The project becomes real and indexable immediately,
-              so the implementation phase has line numbers and structure to
-              anchor its edits against instead of an empty directory.
-  3. BUILD    per-file generation passes, run through the ordinary edit path
-              (search/replace blocks anchored on the skeleton's header lines),
-              so they get the same backup, syntax validation, reviewer, restore
-              and session logging as any other Pedacito run.
+              one-line purposes, bounded by `max_new_files`.
+  2. SKELETON local, no LLM calls: every planned file is created with a header
+              comment or interface stub (plus a starter pyproject/README/
+              gitignore), so the build has structure to anchor edits against.
+  3. BUILD    per-file generation through the ordinary edit path (backup,
+              syntax validation, restore, session logging).
 
-Nothing here re-implements editing or prompting: it borrows `parse_edits`,
-`apply_edits`, the answer system prompt, and the tool schema from the modules
-that already own them.
+Editing and prompting are borrowed from `parse_edits`, `apply_edits`, the
+answer system prompt and the tool schema.
 """
 
 from __future__ import annotations
 
+import subprocess
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from . import apicheck
-from . import fileio
+from . import apicheck, fileio, workspace
+from . import index as index_mod
 from .chunker import Chunk, chunk_source
 from .config import ConfigError
-from .edits import apply_edits, parse_edits
+from .edits import Result, apply_edits, parse_edits
 from .index import Index, file_hash
 from .llm import LLMError
 
-MAX_SPEC_CHARS = 60_000          # a spec longer than this is truncated, loudly
+MAX_SPEC_CHARS = 60_000          # longer specs are truncated (with a notice)
 PLAN_SCHEMA = {
     "type": "object",
     "properties": {
@@ -155,22 +142,6 @@ Rules:
 - Import only from files listed as existing. Never invent a sibling module.
 - Do not write any other file, and do not explain yourself."""
 
-RESUME_SYSTEM = """\
-You are implementing a project that has already been planned and scaffolded:
-every file listed in the map exists on disk but holds only a one-line header
-comment stating its purpose. Your task is to replace those headers with real,
-working code -- one search/replace block per file you touch, anchored on that
-file's exact current contents (use `read` before you edit; never invent a
-SEARCH block).
-
-Rules:
-- Keep each file's header line as the first line of your replacement.
-- Implement every function/class the header and the task promise; no TODOs or
-  pass-only bodies unless the task explicitly asks for stubs.
-- Import only from files that exist in the map. Check a sibling's outline if
-  you need to know what it exposes.
-- Prefer finishing a few files completely over touching many partially."""
-
 AUTO_IMPLEMENT_SYSTEM = """\
 You are implementing part of a project that has already been planned and
 scaffolded: the map's files exist on disk with their public interface stubbed
@@ -199,13 +170,10 @@ Rules:
 - Finish the named work completely; do not wander into other functions or files."""
 
 
-# --------------------------------------------------------------------------
-# The specification
-# --------------------------------------------------------------------------
 @dataclass
 class Spec:
-    """A project description, however it was supplied: typed, from a file, or
-    read from stdin. `text` is always LF-normalised and length-capped."""
+    """A project description (typed, from a file, or from stdin); `text` is
+    LF-normalised and length-capped."""
 
     text: str
     origin: str = "prompt"
@@ -224,12 +192,8 @@ class Spec:
 
 def load_spec(prompt: str | None = None, spec_file: str | None = None,
               max_chars: int = MAX_SPEC_CHARS) -> Spec:
-    """Assemble the project specification from a -t string, a document file, or
-    piped stdin (any combination; they are concatenated in that order).
-
-    A document file is read through `fileio` so CRLF/BOM variants normalise the
-    same way source files do. If nothing was supplied at all, raises ConfigError
-    with the exact commands that would work."""
+    """Assemble the spec from a -t string, a document file and/or piped stdin
+    (concatenated in that order). Raises ConfigError if nothing was supplied."""
     parts: list[str] = []
     origin_bits: list[str] = []
     hint = ""
@@ -264,20 +228,14 @@ def load_spec(prompt: str | None = None, spec_file: str | None = None,
             "  cat SPEC.md | pedacito new PROJ")
 
     text = "\n\n".join(parts)
-    note = ""
     if len(text) > max_chars:
-        note = (f"[spec truncated from {len(text):,} to {max_chars:,} characters; "
-                f"raise max_spec_chars in your config if this cut something "
-                f"important]")
+        print(f"[spec truncated from {len(text):,} to {max_chars:,} characters; "
+              f"raise max_spec_chars in your config if this cut something "
+              f"important]", file=sys.stderr)
         text = text[:max_chars]
-    if note:
-        print(note, file=sys.stderr)
     return Spec(text=text, origin=", ".join(origin_bits), name_hint=hint)
 
 
-# --------------------------------------------------------------------------
-# Stage 1: the plan
-# --------------------------------------------------------------------------
 @dataclass
 class PlannedFile:
     """One entry of a project plan."""
@@ -304,17 +262,15 @@ class Plan:
 
 
 def _safe_rel(path: str, root: Path) -> str | None:
-    """Normalise a model-supplied path and refuse anything that escapes the
-    project root (absolute paths, '..', backslash tricks). Returns the clean
-    POSIX-relative path, or None if the entry must be dropped."""
+    """Normalise a model-supplied path; None if it escapes the project root
+    (absolute, '..', backslashes) and must be dropped."""
     rel = fileio.normalise_rel(path).lstrip("/")
     while rel.startswith("./"):
         rel = rel[2:]
     if not rel or rel.endswith("/"):
         return None
-    probe = (root / rel) if root is not None else Path(rel)
     try:
-        probe.resolve().relative_to(Path(root).resolve())
+        (root / rel).resolve().relative_to(root.resolve())
     except (ValueError, OSError):
         return None
     if ".." in Path(rel).parts:
@@ -324,8 +280,8 @@ def _safe_rel(path: str, root: Path) -> str | None:
 
 def build_plan(spec: Spec, client, cfg, root: Path, verbose: bool = True) -> Plan:
     """Ask the model for a file plan, then sanitise it: dedupe paths, drop
-    entries that escape the root or have no extension, and cap the count at
-    cfg.max_new_files. Raises LLMError if the model returns nothing usable."""
+    entries that escape the root or have no extension, cap at cfg.max_new_files.
+    Raises LLMError if nothing usable comes back."""
     limit = getattr(cfg, "max_new_files", 24)
     budget = getattr(cfg, "max_spec_chars", MAX_SPEC_CHARS)
     body = spec.text[:budget]
@@ -377,18 +333,12 @@ def build_plan(spec: Spec, client, cfg, root: Path, verbose: bool = True) -> Pla
     return plan
 
 
-def _stub_language_error(rel: str, code: str) -> "str | None":
-    """Why `code` is not syntactically valid for `rel`'s extension, or None.
+def _stub_language_error(rel: str, code: str) -> str | None:
+    """Why `code` is not valid syntax for `rel`'s extension, or None.
 
-    The interface call answers for the WHOLE plan in one reply, and small
-    models drift: the classic failure is Python stubs (`class X:` + `def` +
-    docstrings) for a plan's .js frontend files, because the prompt says
-    "Python project". Those stubs poison every later build task -- the
-    implementer model translates what it reads, cannot anchor a SEARCH block
-    against the real bytes, and the per-extension syntax check rejects any
-    result that keeps them. Catching the mismatch here, at generation time,
-    is the cheap end of the problem. Extensions with no available checker
-    are trusted as-is."""
+    Small models often write Python stubs for planned .js files; those poison
+    every later build task, so they are caught at generation time. Extensions
+    with no available checker are trusted."""
     ext = Path(rel).suffix.lower()
     if ext == ".py":
         import ast
@@ -409,14 +359,8 @@ def _stub_language_error(rel: str, code: str) -> "str | None":
 
 
 def build_interface(plan: Plan, client, cfg, verbose: bool = True) -> dict[str, str]:
-    """Fix the public API of every source file in ONE call, so the later
-    per-file build only fills bodies against known signatures instead of
-    inventing a different API per file. Returns {path: stub_code}.
-
-    This is the step that makes multi-file scaffolding tractable for a small
-    model: designing one consistent set of signatures is done in a single
-    context (so names line up), and each build pass afterwards is the local
-    task of "implement this one file's known signatures"."""
+    """Fix the public API of every source file in ONE call, so the per-file
+    build only fills bodies against known signatures. Returns {path: stub_code}."""
     sources = plan.sources or plan.files
     file_tree = "\n".join(f"  {f.path}  -- {f.purpose}" for f in sources)
     body = plan.spec.text[:getattr(cfg, "max_spec_chars", MAX_SPEC_CHARS) // 2]
@@ -439,12 +383,9 @@ def build_interface(plan: Plan, client, cfg, verbose: bool = True) -> dict[str, 
         if rel and code.strip():
             out[rel] = code
 
-    # Language check: a stub that does not parse in its own extension's
-    # language (Python syntax in a .js file, the classic drift) is worse than
-    # no stub -- see _stub_language_error. One targeted retry keeps the API
-    # contract consistent (same names, right language); whatever still fails
-    # is dropped, so the file falls back to its one-line header comment and
-    # its build task creates it from scratch with an empty SEARCH.
+    # Wrong-language stubs get one targeted retry; whatever still fails is
+    # dropped, so that file falls back to its header comment and is built from
+    # scratch with an empty SEARCH.
     bad: dict[str, str] = {}
     for rel, code in out.items():
         why = _stub_language_error(rel, code)
@@ -493,8 +434,7 @@ def build_interface(plan: Plan, client, cfg, verbose: bool = True) -> dict[str, 
 
 
 def render_plan(plan: Plan) -> str:
-    """Human-readable form of a plan, used both for --dry-run output and as the
-    shared context handed to every build pass."""
+    """Human-readable plan, for --dry-run output and build-pass context."""
     lines = [f"# {plan.project_name}", ""]
     if plan.summary:
         lines += [plan.summary, ""]
@@ -505,13 +445,9 @@ def render_plan(plan: Plan) -> str:
 
 
 def _top_units(idx, rel: str) -> list[tuple[str, int, int]]:
-    """A file's top-level implementation units as (qualname, start, end).
-
-    A unit is one function, or one whole class (its methods included). Small
-    classes arrive as a single "class" chunk; larger ones as a "classheader"
-    chunk whose `scope_end` is the whole class, followed by "method" chunks
-    that belong to it and must be skipped. This is the granularity a split
-    task can be handed to the model as "implement these named definitions"."""
+    """A file's top-level implementation units as (qualname, start, end): one
+    function, or one whole class. Large classes arrive as a "classheader" chunk
+    (`scope_end` = whole class) followed by "method" chunks, which are skipped."""
     units = []
     chunks = idx.in_file(rel)
     i = 0
@@ -531,22 +467,13 @@ def _top_units(idx, rel: str) -> list[tuple[str, int, int]]:
 
 
 def plan_tasks(plan: Plan, idx=None, max_lines: int = 0) -> list[str]:
-    """One implementation task per source file, in plan (dependency) order.
+    """One implementation task per source file, in plan order: the checklist
+    `new --complex` hands to the autonomous loop.
 
-    This is the checklist `new --complex` hands to the autonomous loop: each
-    task names exactly one source file to implement against its stub, so a
-    fresh context window gets one bounded, verifiable unit of work.
-
-    `__init__.py` files are skipped: a package marker is already complete the
-    moment the skeleton is written, so tasking the model with "implement" one
-    makes it (correctly) answer "nothing to do" -- which the loop would then
-    read as a failed task and stop on.
-
-    When `idx` and a positive `max_lines` are given, a source file whose stub
-    is longer than `max_lines` is split into several tasks, one per group of
-    top-level definitions (each group small enough to implement in one reply).
-    This is the line guard that stops a whole-file write from overflowing the
-    model's output budget."""
+    `__init__.py` files are skipped (already complete; a "nothing to do" answer
+    would read as a failed task). With `idx` and a positive `max_lines`, a file
+    whose stub is longer is split into one task per group of top-level
+    definitions, so a whole-file write cannot overflow the output budget."""
     tasks = []
     for f in (plan.sources or plan.files):
         if Path(f.path).name == "__init__.py":
@@ -580,9 +507,6 @@ def _group_units(units: list[tuple[str, int, int]],
     return groups
 
 
-# --------------------------------------------------------------------------
-# Stage 2: the skeleton (no LLM calls)
-# --------------------------------------------------------------------------
 STARTER_GITIGNORE = """\
 __pycache__/
 *.py[cod]
@@ -610,9 +534,9 @@ build-backend = "setuptools.build_meta"
 
 
 def _header(rel: str, purpose: str) -> str:
-    """Skeleton content for one planned file: a docstring/comment naming the
-    file and its purpose. This is also the anchor line the build pass replaces,
-    so it must be a single line that parses in any language."""
+    """Skeleton content for one planned file: a comment naming the file and its
+    purpose. It is the anchor the build pass replaces, so it must parse in the
+    file's language."""
     safe = (purpose or rel).replace("\n", " ").strip()
     ext = Path(rel).suffix.lower()
     if ext == ".py":
@@ -631,13 +555,10 @@ def _header(rel: str, purpose: str) -> str:
 def apply_skeleton(root: Path, plan: Plan, dry_run: bool = False,
                    verbose: bool = True,
                    stubs: dict[str, str] | None = None) -> list[str]:
-    """Create every planned file (and a starter pyproject.toml, README, and
-    .gitignore when missing). Source files with an entry in `stubs` get their
-    signature-only stub; everything else gets a one-line header comment.
-    Existing files are never touched, so a second `new` run on the same
-    directory is safe.
-
-    Returns the relative paths actually created (or that would be created)."""
+    """Create every planned file (plus a starter pyproject.toml, README and
+    .gitignore when missing). Files with a `stubs` entry get that stub, the rest
+    a header comment. Existing files are never touched. Returns the relative
+    paths created (or that would be)."""
     stubs = stubs or {}
     created: list[str] = []
     wanted: dict[str, str] = {}
@@ -673,17 +594,10 @@ def apply_skeleton(root: Path, plan: Plan, dry_run: bool = False,
     return created
 
 
-# --------------------------------------------------------------------------
-# Indexing the skeleton
-# --------------------------------------------------------------------------
 def skeleton_index(root: Path, plan: Plan, cfg) -> Index:
-    """Build an Index straight from the skeleton, without walking the tree.
-
-    `index.build()` refuses to run on a project with nothing selectable in it,
-    and it would also pick up unrelated neighbours; here the file list is known
-    exactly, so chunk each planned file directly. Static only -- no summaries,
-    which cost an LLM call each and are pointless before the files have bodies.
-    """
+    """Build a static Index (no summaries) straight from the planned files,
+    without walking the tree (`index.build()` would refuse a near-empty project
+    and pick up unrelated neighbours)."""
     chunks: list[Chunk] = []
     hashes: dict[str, str] = {}
     for f in plan.files:
@@ -695,20 +609,16 @@ def skeleton_index(root: Path, plan: Plan, cfg) -> Index:
         try:
             chunks.extend(chunk_source(f.path, src, cfg.class_split_lines))
         except SyntaxError:
-            pass                       # a header line cannot break, but be safe
+            pass
     idx = Index(root, chunks, {}, hashes)
     idx.save()
     return idx
 
 
-# --------------------------------------------------------------------------
-# Stage 3: building the files
-# --------------------------------------------------------------------------
 def _existing_map(idx, plan: Plan, cfg, max_files: int = 12,
                   max_chars: int = 4000) -> str:
-    """Compact `path: signature` listing of everything already implemented,
-    so a build pass can import siblings correctly. Falls back to the plan's own
-    file list when the index is still empty."""
+    """Compact `path: signature` listing of indexed files so a build pass can
+    import siblings correctly; falls back to the plan's file list."""
     lines: list[str] = []
     for rel in idx.files[:max_files]:
         names = [c.signature or c.qualname for c in idx.top_level(rel)][:12]
@@ -723,13 +633,9 @@ def build_pass(client, cfg, idx, plan: Plan, target: PlannedFile,
                done: list[str], verbose: bool = True,
                backup_dir=None) -> tuple[list, str]:
     """Generate one file's implementation and apply it through the normal edit
-    path, against the signature stub already written by the interface step.
-
-    The prompt contains the spec, the plan, every file's known signature, and
-    the full stub of the target file to replace -- no repo map, because there
-    is nothing to navigate yet. Returns (results, reply)."""
+    path, against its interface stub. The prompt holds the spec, the plan, every
+    file's known signatures and the target's full stub. Returns (results, reply)."""
     from .agent import ANSWER_SYSTEM
-    from .edits import Result
 
     stub = fileio.read_text(idx.root / target.path, errors="replace")
     spec = plan.spec.text if plan.spec else ""
@@ -764,10 +670,8 @@ def build_pass(client, cfg, idx, plan: Plan, target: PlannedFile,
     reply = client.chat(messages, max_tokens=max_tokens, stream=verbose,
                         disable_thinking=True)
     if not parse_edits(reply):
-        # A reasoning model can spend its whole budget on the <think> block and
-        # return nothing usable -- some Qwen quants ignore enable_thinking=false.
-        # Nudge once with the no-think suffix plus a blunt instruction, then
-        # report the failure rather than silently dropping the file.
+        # A reasoning model may spend its whole budget on <think> (some quants
+        # ignore enable_thinking=false): nudge once, then report the failure.
         suffix = getattr(cfg, "thinking_suffix", "") or "/no_think"
         messages[-1]["content"] += (
             f"\n\n{suffix}\n"
@@ -789,15 +693,8 @@ def build_pass(client, cfg, idx, plan: Plan, target: PlannedFile,
 def build_project(client, cfg, idx, plan: Plan, verbose: bool = True,
                   on_file=None, backup_dir=None) -> dict:
     """Run a build pass for each planned source file, in plan order, stopping
-    early if the server goes away. Returns a summary dict:
-
-        {"done": [paths], "failed": [(path, message)], "skipped": [paths]}
-
-    Files are built one at a time rather than in one giant answer: a 9B model
-    asked for a whole project emits a plausible-looking wall of code, whereas
-    asked for one file it usually writes a working one. Order matters -- the
-    plan is sorted, so modules come before the things that import them where
-    the model planned sensibly."""
+    early if the server goes away. Returns
+    {"done": [paths], "failed": [(path, message)], "skipped": [paths]}."""
     targets = plan.sources or plan.files
     done: list[str] = []
     failed: list[tuple[str, str]] = []
@@ -822,7 +719,6 @@ def build_project(client, cfg, idx, plan: Plan, verbose: bool = True,
         bad = [r for r in results if not r.ok]
         if ok:
             done.append(t.path)
-            from . import index as index_mod
             for r in ok:
                 idx = index_mod.reindex_file(idx, r.file, cfg)
             if on_file is not None:
@@ -848,18 +744,9 @@ def summarise_result(summary: dict, verbose: bool = True) -> str:
     return text
 
 
-# --------------------------------------------------------------------------
-# Post-build import check / fix pass
-# --------------------------------------------------------------------------
 def _first_import_error(root: Path, plan: Plan) -> str | None:
-    """Import the project's entry point in a subprocess and return the first
-    error (ImportError / AttributeError / ...), or None if it imports cleanly.
-
-    Files are generated one at a time, so a model can name an API in one file
-    (`parse_markdown`) and define it under a different name in another
-    (`parse`). This surfaces that mismatch instead of leaving the project to
-    fail on its first run."""
-    import subprocess
+    """Import the project's entry point in a subprocess; return the first
+    error, or None if it imports cleanly (catches cross-file name mismatches)."""
     py = [f.path for f in plan.files
           if f.path.endswith(".py") and (root / f.path).is_file()]
     if not py:
@@ -869,9 +756,7 @@ def _first_import_error(root: Path, plan: Plan) -> str | None:
         entry = next((p for p in py if p.endswith("__init__.py")), None)
     if entry is None:
         entry = py[0]
-    mod = entry[:-3].replace("/", ".")
-    if mod.endswith(".__init__"):
-        mod = mod[: -len(".__init__")]
+    mod = entry[:-3].replace("/", ".").removesuffix(".__init__")
     try:
         proc = subprocess.run(
             [sys.executable, "-c", f"import {mod}"], cwd=str(root),
@@ -884,13 +769,11 @@ def _first_import_error(root: Path, plan: Plan) -> str | None:
     return (proc.stderr or proc.stdout).strip()
 
 
-def fix_import_errors(client, cfg, idx: "Index", plan: Plan, backup_dir,
+def fix_import_errors(client, cfg, idx: Index, plan: Plan, backup_dir,
                       verbose: bool = True, rounds: int = 3) -> int:
-    """Re-ask the model to repair import errors left by the per-file build.
-
-    On each round: import the project, and if it fails, hand the model the
-    error plus every built .py file and ask for search/replace fixes. Returns
-    the number of successful fix blocks applied."""
+    """Repair import errors left by the per-file build: each round imports the
+    project and, on failure, sends the model the error plus every .py file.
+    Returns the number of fix blocks applied."""
     from .agent import ANSWER_SYSTEM
 
     fixed = 0
@@ -928,7 +811,6 @@ def fix_import_errors(client, cfg, idx: "Index", plan: Plan, backup_dir,
         if not ok:
             break
         fixed += len(ok)
-        from . import index as index_mod
         for r in ok:
             idx = index_mod.reindex_file(idx, r.file, cfg)
     return fixed
@@ -950,15 +832,10 @@ def _py_sources(root: Path, rels) -> dict[str, str]:
     return out
 
 
-def fix_api_mismatches(client, cfg, idx: "Index", plan: Plan, backup_dir,
+def fix_api_mismatches(client, cfg, idx: Index, plan: Plan, backup_dir,
                        verbose: bool = True, rounds: int = 2) -> int:
-    """Re-ask the model to repair cross-file call/signature mismatches.
-
-    Each file is implemented independently, so `core.py` can call `Level()`
-    while `level.py` defines `Level.__init__(self, level_data)`. An import
-    check passes anyway (`import main` does not run the call), so this
-    static pass finds the arity mismatches and asks for search/replace fixes.
-    Returns the number of successful fix blocks applied."""
+    """Repair cross-file call/signature (arity) mismatches that an import check
+    misses, using the static apicheck. Returns the number of fix blocks applied."""
     from .agent import ANSWER_SYSTEM
 
     fixed = 0
@@ -993,17 +870,13 @@ def fix_api_mismatches(client, cfg, idx: "Index", plan: Plan, backup_dir,
         if not ok:
             break
         fixed += len(ok)
-        from . import index as index_mod
         for r in ok:
             idx = index_mod.reindex_file(idx, r.file, cfg)
     return fixed
 
 
-# --------------------------------------------------------------------------
-# Runtime verification: actually run the thing, then repair
-# --------------------------------------------------------------------------
-# A headless box cannot open a window; those errors say nothing about the
-# generated code, so they must not be "repaired" or counted as failures.
+# Headless-display errors say nothing about the generated code, so they are
+# neither repaired nor counted as failures.
 _ENV_ISSUE_HINTS = (
     "no available video device", "video system not initialized",
     "no display name", "cannot open display", "could not connect to display",
@@ -1013,22 +886,16 @@ _ENV_ISSUE_HINTS = (
 
 
 def _environment_issue(output: str) -> bool:
-    """True when a run failure is the environment (headless display), not the
-    generated code."""
+    """True when a run failure is the environment (headless display), not the code."""
     low = (output or "").lower()
     return any(h in low for h in _ENV_ISSUE_HINTS)
 
 
 def smoke_run(root: Path, entry: str = "main.py",
               timeout: int = 20) -> tuple[bool, str]:
-    """Run the project's entry point once. Returns (passed, output).
-
-    A crash (non-zero exit before the timeout) is a failure with its traceback.
-    A process still running at the timeout is a SUCCESS: games, servers, and
-    UIs do not exit on their own, and having started is what the check is for.
-    The process group is killed at the timeout, so the game/window actually
-    closes instead of lingering after the check.
-    """
+    """Run the entry point once. Returns (passed, output). A crash is a failure;
+    a process still running at the timeout counts as started (games and servers
+    never exit) and its process group is killed."""
     from . import proc as proc_mod
     rc, out, stopped, _ = proc_mod.run(
         [sys.executable, entry], cwd=root, timeout=timeout,
@@ -1040,10 +907,10 @@ def smoke_run(root: Path, entry: str = "main.py",
     return rc == 0, out.strip()
 
 
-def _fix_from_output(client, cfg, idx: "Index", py_rels, project_name: str,
+def _fix_from_output(client, cfg, idx: Index, py_rels, project_name: str,
                      backup_dir, label: str, output: str,
                      verbose: bool = True) -> int:
-    """Ask the model to repair one failed check, given its output. Returns the
+    """Ask the model to repair one failed check from its output. Returns the
     number of applied fix blocks."""
     from .agent import ANSWER_SYSTEM
 
@@ -1071,22 +938,19 @@ def _fix_from_output(client, cfg, idx: "Index", py_rels, project_name: str,
     ok = [r for r in results if r.ok]
     if not ok:
         return 0
-    from . import index as index_mod
     for r in ok:
         idx = index_mod.reindex_file(idx, r.file, cfg)
     return len(ok)
 
 
-def verify_and_fix(client, cfg, idx: "Index", py_rels, project_name: str,
+def verify_and_fix(client, cfg, idx: Index, py_rels, project_name: str,
                    backup_dir, *, explicit_cmd: str = "", rounds: int = 2,
                    smoke: bool = True, smoke_timeout: int = 20,
                    verbose: bool = True) -> tuple[bool, str]:
-    """Run the explicit --verify and/or an automatic smoke run, feeding any
-    failure back to the model and re-running, up to `rounds` repairs.
-
-    Returns (passed, final_output). Missing dependencies are reported rather
-    than repaired by editing source; environment (headless display) failures
-    are treated as "could not verify" rather than code failures."""
+    """Run the explicit --verify and/or a smoke run, feeding failures back to
+    the model for up to `rounds` repairs. Returns (passed, final_output).
+    Missing dependencies are reported, not repaired; environment failures count
+    as "could not verify"."""
     from . import loop
 
     def checks():
@@ -1102,8 +966,6 @@ def verify_and_fix(client, cfg, idx: "Index", py_rels, project_name: str,
         failures = [(label, out) for label, ok, out in checks() if not ok]
         if not failures:
             return True, ""
-        # Split out failures that are not the code's fault: a headless display
-        # or an absent package cannot be repaired by editing source.
         env = [(l, o) for l, o in failures if _environment_issue(o)]
         deps = [(l, o) for l, o in failures if loop.missing_modules(o)]
         code_fails = [(l, o) for l, o in failures
@@ -1125,37 +987,26 @@ def verify_and_fix(client, cfg, idx: "Index", py_rels, project_name: str,
     return False, last
 
 
-# --------------------------------------------------------------------------
-# The whole flow, for the CLI's `new` command
-# --------------------------------------------------------------------------
 def run_new(root: Path, cfg, client, spec: Spec, *, apply: bool = False,
             review: bool = False, plan_only: bool = False, force: bool = False,
             verbose: bool = True, complex: bool = False, verify: str = "",
             repair_rounds: int | None = None, max_tasks: int | None = None,
             max_minutes: int | None = None,
             keep_going: bool = False, auto_install: bool = False) -> int:
-    """Plan a new project from `spec`, lay down its skeleton, and (unless
-    asked to stop earlier) implement every source file. Returns a process exit
-    code; all progress goes to stderr so stdout stays clean.
+    """Plan a new project from `spec`, lay down its skeleton, and (unless asked
+    to stop earlier) implement every source file. Returns a process exit code;
+    progress goes to stderr.
 
-    Stage gates, cheapest first:
-      --plan-only  stop after stage 1+2: a tree of headers plus a saved index,
-                   ready for `pedacito resume` or ordinary `ask --apply` runs.
-      default      dry run: print the plan and a preview of the skeleton,
-                   nothing is written to disk.
-      --apply      write the generated files, then build each one through the
-                   normal edit path (backups taken first).
-      --review     build, then open the side-by-side reviewer with the result
-                   (Discard restores the pre-build snapshot).
-      --complex    like --apply, but implementation is handed to the autonomous
-                   outer loop (`pedacito auto`): one task per source file, each
-                   in a fresh context window, with an optional --verify command
-                   feeding failures back for repair. The plan becomes a
-                   resumable checklist (auto_plan_file) instead of one
-                   uninterruptible build pass.
+      (default)    dry run: print the plan and skeleton preview, write nothing.
+      --plan-only  write the header skeleton and a saved index, then stop.
+      --apply      write the skeleton, then build each file through the normal
+                   edit path (backups first).
+      --review     build, then open the reviewer (Discard restores the snapshot).
+      --complex    like --apply, but hand implementation to the autonomous loop
+                   (`pedacito auto`): one task per source file in a fresh
+                   context, resumable via auto_plan_file.
 
-    A non-empty project directory is refused unless `force`: silently mixing a
-    new project into an existing one is exactly the mistake this guards."""
+    A non-empty directory is refused unless `force`."""
     if not force and any(root.glob("*")):
         existing = sorted(p.name for p in root.iterdir()
                           if p.name not in (".git", ".pedacito"))[:8]
@@ -1170,20 +1021,10 @@ def run_new(root: Path, cfg, client, spec: Spec, *, apply: bool = False,
     plan = build_plan(spec, client, cfg, root, verbose=verbose)
     print(render_plan(plan))
 
-    # Write modes. The default (no --apply/--review/--plan-only/--complex) is
-    # a true dry run: show the plan and what the skeleton WOULD contain, write
-    # nothing. --plan-only writes just the header skeleton; --apply/--review
-    # write the skeleton and then build the files (review holds the result for
-    # sign-off); --complex writes the skeleton and hands implementation to the
-    # autonomous loop. The old code always wrote the skeleton AND the build
-    # passes, so a bare `new` left a full project on disk and `--apply` simply
-    # re-ran the same work.
     wants_skeleton = plan_only or apply or review
     stubs = {}
     if wants_skeleton:
-        # Fix the API contract once, in a single context, before writing the
-        # skeleton -- this is what keeps cross-file imports consistent for a
-        # small model that could not invent a matching API per file.
+        # One call fixes the API contract so cross-file imports stay consistent.
         stubs = build_interface(plan, client, cfg, verbose=verbose)
     created = apply_skeleton(root, plan, dry_run=not wants_skeleton,
                              verbose=verbose, stubs=stubs)
@@ -1227,7 +1068,6 @@ def run_new(root: Path, cfg, client, spec: Spec, *, apply: bool = False,
     when = None
     backup_dir = None
     if want_write and cfg.backup:
-        from . import workspace
         when = workspace.stamp()
         backup_dir = workspace.new_backup_dir(root, when)
 
@@ -1238,9 +1078,7 @@ def run_new(root: Path, cfg, client, spec: Spec, *, apply: bool = False,
                             backup_dir=backup_dir)
     print("\n" + summarise_result(summary))
 
-    # Files are generated independently, so cross-file API mismatches (import
-    # `parse_markdown` but define `parse`) are common. Ask the model to repair
-    # them until the entry point imports cleanly.
+    # Files are built independently, so repair cross-file import mismatches.
     n_fixed = fix_import_errors(client, cfg, idx, plan, backup_dir,
                                 verbose=verbose)
     if n_fixed and verbose:
@@ -1251,7 +1089,6 @@ def run_new(root: Path, cfg, client, spec: Spec, *, apply: bool = False,
         if results is None:
             return 1
     if cfg.log_sessions and when is not None:
-        from . import workspace
         p = workspace.write_session(root, f"new: {plan.project_name}",
                                     [], render_plan(plan), [], backup_dir, when)
         print(f"[session: {p.relative_to(root)}]", file=sys.stderr)
@@ -1264,15 +1101,12 @@ def _run_complex(root: Path, cfg, client, idx, plan: Plan, spec: Spec, *,
                  max_minutes: int | None = None,
                  keep_going: bool = False,
                  verbose: bool = True, auto_install: bool = False) -> int:
-    """Complex mode: the framework (skeleton + interface stubs + index) is in
-    place, so hand implementation to the autonomous outer loop.
-
-    The plan becomes a resumable checklist (cfg.auto_plan_file, default
-    PLAN.md) with one task per source file; the loop implements each in a
-    fresh context window, optionally re-running a `verify` command and feeding
-    failures back for repair. Returns the loop's exit code."""
+    """Complex mode: with skeleton, stubs and index in place, hand
+    implementation to the autonomous loop. The plan becomes a resumable
+    checklist (cfg.auto_plan_file, default PLAN.md), one task per source file,
+    each run in a fresh context with optional `verify` repair. Returns the
+    loop's exit code."""
     from . import loop
-    from . import workspace
 
     rr = cfg.auto_repair_rounds if repair_rounds is None else repair_rounds
     mt = cfg.auto_max_tasks if max_tasks is None else max_tasks
@@ -1300,14 +1134,9 @@ def _run_complex(root: Path, cfg, client, idx, plan: Plan, spec: Spec, *,
         auto_install=auto_install,
     )
 
-    # Cross-file API repair. Every task is implemented in a FRESH context, so
-    # the model can call `parse_markdown` in one file and define `parse` in
-    # another. The simple `new` build closes that gap with fix_import_errors;
-    # without the same pass here, complex mode can mark every task done and
-    # still ship a tree that cannot import. This runs after the loop, when the
-    # whole project exists. A missing third-party package is handled first and
-    # separately: editing source cannot add a dependency, so it must never be
-    # sent through the code-repair loop.
+    # Cross-file repair after the loop (fresh contexts can disagree on names).
+    # Missing third-party packages are handled first: editing source cannot
+    # add a dependency.
     has_py = any(f.path.endswith(".py") for f in plan.files)
     if has_py:
         when = workspace.stamp()
@@ -1357,10 +1186,7 @@ def _run_complex(root: Path, cfg, client, idx, plan: Plan, spec: Spec, *,
                     + ("" if vf else "; pass --verify CMD to gate on it") + ")")
             print(f"  import check: {note}", file=sys.stderr)
             workspace.log_event(root, f"import check: {note}")
-            # An import does not execute a call, so `Level()` against
-            # `Level.__init__(self, level_data)` passes the check above and
-            # still crashes on first use. Check cross-file call arity
-            # statically and repair it the same way.
+            # An import executes no calls, so also check call arity statically.
             n_api = fix_api_mismatches(client, cfg, idx, plan, fix_backup,
                                        verbose=verbose)
             if n_api and verbose:
@@ -1382,11 +1208,8 @@ def _run_complex(root: Path, cfg, client, idx, plan: Plan, spec: Spec, *,
                       file=sys.stderr)
                 workspace.log_event(root, "api check: consistent")
 
-            # Runtime verification: static checks never EXECUTE the program, so
-            # a crash on first use can still slip through. Run the explicit
-            # --verify from the config, else smoke-run main.py (a process still
-            # running at the timeout counts as started), then feed any failure
-            # back to the model before the run is declared complete.
+            # Run the explicit --verify, else smoke-run main.py, and feed any
+            # failure back to the model.
             rounds = int(getattr(cfg, "auto_verify_rounds", 2) or 0)
             do_smoke = bool(getattr(cfg, "auto_smoke", True))
             smoke_timeout = int(getattr(cfg, "auto_smoke_timeout", 20) or 20)
@@ -1420,11 +1243,9 @@ def _run_complex(root: Path, cfg, client, idx, plan: Plan, spec: Spec, *,
 
 def _review_build(root: Path, plan: Plan, summary: dict, cfg,
                   backup_dir, stamp) -> list | None:
-    """Open the side-by-side reviewer over a finished build, using the
-    pre-build backups as the 'before' side. The build path writes directly
-    (it has no dry-run mode of its own), so `new --review` means: back up,
-    build, then hold everything on the review page where Apply keeps the
-    files and Discard restores them from the snapshot."""
+    """Open the reviewer over a finished build, with the pre-build backups as
+    the 'before' side. The build already wrote the files, so Apply just keeps
+    them and Discard restores the snapshot."""
     from . import review as review_mod
     diffs = review_mod.diffs_from_backup(root, backup_dir)
     if not diffs:
@@ -1438,12 +1259,10 @@ def _review_build(root: Path, plan: Plan, summary: dict, cfg,
     print(f"  review page: {saved}", file=sys.stderr)
 
     def discard():
-        """Undo the whole build: put every backed-up stub back."""
-        from . import workspace
         workspace.restore(root, backup_dir)
 
     outcome, detail = review_mod.run(
-        page, nonce, lambda: None,          # files are already on disk
+        page, nonce, lambda: (True, "Build kept."),
         port=cfg.review_port, open_browser=cfg.open_browser,
         timeout=cfg.review_timeout, on_url=lambda u: print(
             f"  waiting for sign-off at {u}", file=sys.stderr),

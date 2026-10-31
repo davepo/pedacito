@@ -1,4 +1,4 @@
-"""Project instruction files (PEDACEITO.md / AGENTS.md / CLAUDE.md)."""
+"""Project instruction files (PEDACITO.md / AGENTS.md / CLAUDE.md)."""
 from __future__ import annotations
 
 import sys
@@ -19,11 +19,16 @@ def _write(p: Path, text: str) -> None:
 
 def test_first_instruction_file_wins_and_is_labelled(tmp_path):
     _write(tmp_path / "AGENTS.md", "Use ruff.\nNever edit generated/.\n")
-    _write(tmp_path / "PEDACEITO.md", "Project-specific rule.\n")
+    _write(tmp_path / "PEDACITO.md", "Project-specific rule.\n")
     rendered = instructions.render(tmp_path, Config())
-    assert "from PEDACEITO.md" in rendered
+    assert "from PEDACITO.md" in rendered
     assert "Project-specific rule." in rendered
     assert "Use ruff." not in rendered
+
+
+def test_legacy_misspelled_instruction_file_still_works(tmp_path):
+    _write(tmp_path / "PEDACEITO.md", "Legacy rule.\n")
+    assert "from PEDACEITO.md" in instructions.render(tmp_path, Config())
 
 
 def test_instruction_text_is_capped(tmp_path):

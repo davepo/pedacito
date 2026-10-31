@@ -1,57 +1,36 @@
 """The agent's tool surface: read, grep, callers, outline, sessions, diff, write/append, run, screenshot, browser, done.
 
-Usage
------
-    from .tools import STEP_SCHEMA, TOOL_HELP, dispatch
-
     step = client.chat_json(messages, STEP_SCHEMA, max_tokens=700)
     observation = dispatch(index, cfg, step)
 
-Deliberately a small, fixed set of tools. Local models degrade fast as the
-tool surface grows -- four to six is about the ceiling before a small model
-starts calling the wrong one or inventing arguments. The navigation tools
-(read, grep, callers, outline, sessions, diff, done) are the core surface.
-`sessions` is read-only history and is how a fresh run sees prior tasks;
-`diff` is read-only too -- it compares the working tree against Pedacito's
-own pre-write snapshots (`allow_diff = false` drops it).
-Everything destructive or machine-visible is behind an explicit gate:
-`write`/`append`/`move`/`delete` need `cfg.allow_write`, `run` needs
-`cfg.allow_shell`, `screenshot` needs `cfg.allow_screenshots`, and `browser`
-needs `cfg.allow_browser`; both launch tools also need `allow_shell` when
-given a command. A default run therefore exposes only
-the navigation surface; a user who opts in accepts a larger surface because
-they asked for those capabilities. Every tool returns plain text with line
-numbers attached, since the model needs those numbers to write search/replace
-edits later.
+The set is deliberately small: local models start calling the wrong tool or
+inventing arguments beyond roughly half a dozen. Navigation tools (read, grep,
+callers, outline, sessions, diff, done) are always on; everything destructive
+or machine-visible is gated by config: `write`/`append`/`move`/`delete` need
+`allow_write`, `run`/`diagnose` need `allow_shell`, `screenshot` needs
+`allow_screenshots`, `browser` needs `allow_browser` (launching a command also
+needs `allow_shell`), `mcp` needs `allow_mcp`, and `diff` is dropped by
+`allow_diff = false`. Mutating actions skip the edit path's syntax validation
+and review page, so they are for wholesale replace/grow/move/remove of files a
+small model cannot express as a search/replace block.
 
-The navigation tools are deliberately forgiving, because small models make
-argument mistakes that must not cost a whole lookup: `read` accepts a symbol
-name instead of a line range, `grep` falls back to a literal search when the
-"regex" does not compile, retries case-insensitively when a case-sensitive
-search finds nothing, accepts a directory or glob as its scope, shows a line
-of context around each hit when there are few hits, and suggests similarly
-named symbols when there are none. `outline` accepts a directory and renders
-its file cards. When `semantic_search` is on, a grep with no textual hits
-queries the server's embeddings endpoint instead of returning an empty
-observation. A step that would otherwise have failed can often still return
-useful source.
+Every tool returns plain text with line numbers, since the model needs them to
+write search/replace edits. Navigation tools are forgiving of argument slips:
+`read` accepts a symbol name, `grep` falls back to literal text for an invalid
+regex, retries case-insensitively, accepts a directory or glob scope, adds
+context for sparse hits, suggests similar symbols on a miss, and (with
+`semantic_search`) queries the server's embeddings endpoint when nothing
+matches textually.
 
-The mutating actions are off by default because a mid-gather change skips the
-edit path's syntax validation and review page entirely. They exist for the
-case where an existing file must be replaced, grown, moved, or removed
-wholesale -- which a 9B model often cannot express as a search/replace block.
-`append` makes the chunked-file protocol explicit instead of asking the model
-to re-emit a tail and hope the writer notices. `run` feeds test/linter output
-back to the model but executes model-chosen commands, so it is a separate,
-equally explicit trust decision.
-
-STEP_SCHEMA is the JSON schema used with LM Studio's grammar-constrained
-`response_format`, so the model's tool choice always parses. See agent.py
-for how it is used in the gather loop.
+STEP_SCHEMA is the JSON schema used for the model server's grammar-constrained
+`response_format`, so the model's tool choice always parses.
 """
 
 from __future__ import annotations
 
+import ast
+import copy
+import difflib
 import fnmatch
 import json
 import os
@@ -71,6 +50,9 @@ read     - read exact lines of a file.       args: file, start, end
 grep     - regex or literal search. args: pattern, and optional file/dir/glob
            (pattern = an existing filename returns its references/imports;
             with semantic_search on, falls back to search by meaning)
+find     - search indexed definitions by name, signature, or summary.
+           args: pattern (a fragment like 'retry' or 'Server.start'). Hits
+           carry exact line ranges; no regex, no source-text guessing
 callers  - who calls a symbol, with the call sites. args: symbol
 outline  - list every unit in one file, or the file cards in one directory.
            args: file (a path, a symbol, or a directory/glob)
@@ -102,17 +84,15 @@ browser  - open a web page in headless Chromium, interact, wait, capture it.
             allow_shell; mcp needs allow_mcp)
 done     - stop gathering; you have enough.  args: none"""
 
-# Field order is load-bearing. Grammar-constrained decoding emits keys in schema
-# order, so the action and its arguments come first: if the response is cut off
-# by the token limit, the only thing lost is the explanation, and the step is
-# still usable. With `reasoning` first, one rambling sentence truncates the
-# whole object and the step is unrecoverable.
+# Field order is load-bearing: grammar-constrained decoding emits keys in
+# schema order, so a reply cut off by the token limit loses only the trailing
+# `reasoning`, not the action.
 STEP_SCHEMA = {
     "type": "object",
     "properties": {
         "action": {
             "type": "string",
-            "enum": ["read", "grep", "callers", "outline", "sessions",
+            "enum": ["read", "grep", "find", "callers", "outline", "sessions",
                      "diff", "diagnose", "write", "append", "move", "delete",
                      "run", "screenshot", "browser", "todo", "mcp", "done"],
         },
@@ -130,26 +110,18 @@ STEP_SCHEMA = {
         "end": {"type": "integer", "description": "For read. 0 otherwise."},
         "pattern": {"type": "string",
                     "description": "For grep: regex, or plain text if it is not "
-                                   "valid regex. For browser: optional actions "
-                                   "like 'press Enter; click #start; wait 2; "
+                                   "valid regex. For find: a name/signature/"
+                                   "summary fragment. For browser: optional "
+                                   "actions like 'press Enter; click #start; wait 2; "
                                    "eval <js>' -- eval goes LAST and consumes "
                                    "the rest (semicolons allowed inside); its "
                                    "RESULT is reported clipped at 2000 chars, "
                                    "so resolve compact or aggregated JSON. "
                                    "Empty otherwise.",
-                    # 2000: run 13's measurement evals (Promise + double-rAF
-                    # + getImageData scans, ~750-1200 chars) were guillotined
-                    # at the old 600 cap. Grammar-constrained sampling force-
-                    # closes a string AT maxLength: VALID JSON, finish_reason
-                    # "stop", no truncation flag -- and the browser then ran
-                    # the 600-char fragment (SyntaxError: Unexpected end of
-                    # input, at the identical character in every retry,
-                    # because the cap is deterministic). Five checks retired
-                    # to it. 600 itself came from run 10, whose forced-state
-                    # expressions were truncated mid-token at 200, and
-                    # schema-constrained sampling cannot emit what the schema
-                    # forbids. agent.gather now also refuses to dispatch a
-                    # payload arriving at exactly its cap.
+                    # Constrained sampling force-closes a string AT maxLength
+                    # (valid JSON, no truncation flag), so a cap shorter than
+                    # a real eval silently runs a fragment. agent.gather
+                    # refuses to dispatch a payload arriving at exactly its cap.
                     "maxLength": 2000},
         "symbol": {"type": "string",
                    "description": "For callers; or for read when file is empty "
@@ -179,28 +151,18 @@ STEP_SCHEMA = {
             "maxLength": 160,
         },
     },
-    # Flat + all-required beats nested oneOf/anyOf for small models: the grammar
-    # stays simple and the model never has to pick a branch.
-    # NOTE: `content`'s maxLength MUST stay below llm._BIG_FIELD_MIN (8000).
-    # That threshold is what marks a schema "answer-style" (cut mid-content =>
-    # partial, must escalate) vs "step-style" (a salvaged action is accepted on
-    # the first try). "Args all precede reasoning" stops holding the moment a
-    # long eval `pattern` or write `content` eats the token budget itself, so
-    # llm.chat_json records WHICH field the cut landed in (`truncated_field`)
-    # and agent.gather refuses to dispatch a step whose payload was cut.
-    # Raising content past 8000 silently disables step-truncation salvage;
-    # file-size limits are enforced by max_write_lines in dispatch()/
-    # tool_write(), not here.
+    # Flat + all-required keeps the grammar simple for small models.
+    # `content`'s maxLength MUST stay below llm._BIG_FIELD_MIN (8000): that
+    # threshold marks a schema "step-style" (a salvaged action is accepted)
+    # rather than "answer-style" (cut mid-content => partial). llm.chat_json
+    # records which field a cut landed in (`truncated_field`) and agent.gather
+    # refuses to dispatch a step whose payload was cut. File-size limits are
+    # enforced by max_write_lines in dispatch(), not here.
     "required": ["action", "file", "start", "end", "pattern", "symbol",
                  "to", "command", "content", "reasoning"],
     "additionalProperties": False,
 }
 
-# The action list is kept in one place so the schema, the gate in `dispatch`,
-# and the prompt help cannot drift apart.
-ACTIONS = ("read", "grep", "callers", "outline", "sessions", "diff",
-           "diagnose", "write", "append", "move", "delete", "run",
-           "screenshot", "browser", "todo", "mcp", "done")
 WRITE_ACTION = "write"
 APPEND_ACTION = "append"
 MOVE_ACTION = "move"
@@ -217,18 +179,10 @@ MUTATING_ACTIONS = WRITE_ACTIONS + (MOVE_ACTION, DELETE_ACTION)
 
 
 def schema_for(cfg) -> dict:
-    """Return STEP_SCHEMA narrowed to the actions this run actually allows.
-
-    Grammar-constrained decoding sees the enum, so leaving disabled actions in
-    it invites a small model to call them and burn a step on an ERROR. Gating
-    the schema itself (not just dispatch) keeps the default surface at the
-    five navigation actions (`diff` adds a sixth, read-only one unless
-    allow_diff = false). Fields only used by a disabled action are dropped
-    too, so the model is not asked for `content`/`to`/`command` it cannot use.
-    """
-    import copy
-
-    actions = ["read", "grep", "callers", "outline", "sessions", "todo"]
+    """Return STEP_SCHEMA narrowed to the actions this run allows, so the
+    model cannot pick a disabled action. Fields only a disabled action uses
+    (`to`, `command`) are dropped too."""
+    actions = ["read", "grep", "find", "callers", "outline", "sessions", "todo"]
     if getattr(cfg, "allow_diff", True):
         actions.append("diff")
     if getattr(cfg, "allow_shell", False):
@@ -262,16 +216,9 @@ def schema_for(cfg) -> dict:
         if key not in drop:
             required.append(key)
     if getattr(cfg, "compact_step_schema", False):
-        # EXPERIMENTAL token-saver: only `action` (and the trailing
-        # `reasoning`) stay required, so grammar-constrained decoding may
-        # omit the empty fields a step does not use -- worth ~20-40 output
-        # tokens per step at ~25 tok/s. Field ORDER is untouched, so a
-        # truncated reply still salvages to a complete action. Off by
-        # default: all-required keeps the grammar maximally simple for
-        # small models; measure it on your server before enabling.
+        # Experimental: only `action` and `reasoning` stay required, so empty
+        # unused fields may be omitted (saves ~20-40 output tokens per step).
         required = ["action", "reasoning"]
-    # Keep the load-bearing field order: action+args, then content, then
-    # reasoning last (a cut-off reply must still yield a usable action).
     ordered = ["action", "file", "start", "end", "pattern", "symbol",
                "to", "command", "content", "reasoning"]
     schema["properties"] = {k: schema["properties"][k] for k in ordered
@@ -280,16 +227,9 @@ def schema_for(cfg) -> dict:
     return schema
 
 
-# --------------------------------------------------------------------------
-# Internal helpers
-# --------------------------------------------------------------------------
 def _as_text(value) -> str:
-    """Best-effort string coercion for model-supplied step fields.
-
-    The JSON schema says these are strings, but a salvaged or repaired step
-    can still carry null/number/list values. One bad field must not raise
-    out of `dispatch` and kill the whole run, so tools normalise at the edge.
-    """
+    """String coercion for model-supplied step fields (a salvaged step can
+    carry null/number/list values; one bad field must not kill the run)."""
     if isinstance(value, str):
         return value
     if value is None:
@@ -298,33 +238,21 @@ def _as_text(value) -> str:
 
 
 def _as_int(value, default: int = 0) -> int:
-    """Coerce a model-supplied integer field without raising.
-
-    JSON-schema decoding normally guarantees an integer, but plain-JSON
-    prompting and truncated-JSON salvage do not: a model can send "12", 12.0,
-    null, or a prose fragment. Out-of-range line numbers are harmless (the
-    read tools clamp them); a TypeError/ValueError here would crash the step.
-    """
+    """Integer coercion for model-supplied fields ("12", 12.0, null, prose)
+    that never raises."""
     try:
         return int(value)
     except (TypeError, ValueError):
         try:
-            num = float(value)
-            return int(num) if num == num and abs(num) != float("inf") else default
+            return int(float(value))
         except (TypeError, ValueError, OverflowError):
             return default
 
 
-def _root_rel(index, name) -> "str | None":
-    """Resolve a model-supplied path to a project-relative path, or None.
-
-    This is the single gate for paths that the tools will touch. It accepts
-    absolute paths only when they point inside the project, collapses `..`,
-    and follows symlinks so a link inside the project cannot read/write an
-    outside file. Everything outside the root is rejected. Returning a
-    normalised relative path (instead of the raw input) also keeps backup
-    destinations and index keys sane when a model sends an absolute path.
-    """
+def _root_rel(index, name) -> str | None:
+    """Resolve a model-supplied path to a project-relative POSIX path, or None
+    when it is empty or escapes the root (`..`, absolute, or via a symlink).
+    This is the single gate for paths the tools touch."""
     raw = fileio.normalise_rel(_as_text(name))
     if not raw:
         return None
@@ -339,9 +267,7 @@ def _root_rel(index, name) -> "str | None":
 
 
 def _numbered(lines: list[str], start: int) -> str:
-    """Render a list of lines with right-aligned line numbers, starting at
-    `start`, in the "NNN | text" format the model reads and later echoes
-    back (minus the prefix) in search/replace edits."""
+    """Render lines as right-aligned "NNN | text", numbered from `start`."""
     width = len(str(start + len(lines) - 1))
     return "\n".join(f"{i:>{width}} | {ln}" for i, ln in enumerate(lines, start))
 
@@ -378,7 +304,7 @@ def _enclosing_chunk(index, rel: str, line: int):
     return best
 
 
-def _symbol_matches(index, symbol: str, rel: "str | None" = None) -> list:
+def _symbol_matches(index, symbol: str, rel: str | None = None) -> list:
     """Definitions matching `symbol`, optionally restricted to one file."""
     try:
         matches = index.find_symbol(_as_text(symbol).strip())
@@ -390,16 +316,11 @@ def _symbol_matches(index, symbol: str, rel: "str | None" = None) -> list:
 
 
 def _file_hint(index, name: str) -> str:
-    """Compact 'file not found' message: a few real paths plus close matches.
-
-    The old message joined every indexed path, which on a real project is
-    hundreds of paths -- a token sink that buries the correction. A small
-    model only needs one or two plausible names and a hint at the next move."""
+    """Compact 'file not found' message: close matches plus a few real paths."""
     name = _as_text(name)
     files = index.files
     if not files:
         return f"ERROR: '{name}' is not in the index (the index is empty)."
-    import difflib
     close = difflib.get_close_matches(
         fileio.normalise_rel(name), files, n=3, cutoff=0.55)
     if not close:
@@ -417,7 +338,6 @@ def _file_hint(index, name: str) -> str:
 
 def _symbol_hint(index, name: str) -> str:
     """Compact 'symbol not found' message with close-name suggestions."""
-    import difflib
     name = _as_text(name)
     try:
         names = sorted({c.qualname for c in index.chunks
@@ -431,13 +351,9 @@ def _symbol_hint(index, name: str) -> str:
 
 
 def _grep_scope(index, scope: str) -> tuple[list[str], str]:
-    """Resolve a grep scope to (files, note).
-
-    `scope` may be one file, a directory (`src/`, `src/pkg`), or a glob
-    (`*.py`, `tests/*.py`). Small models routinely put a directory or a
-    pattern in the `file` field; treating that as "not in the index, search
-    everything" wastes the lookup. Only an unresolvable scope falls back to
-    the whole index, with a note saying so."""
+    """Resolve a grep scope (a file, a directory like `src/pkg`, or a glob like
+    `tests/*.py`) to (files, note). An unresolvable scope falls back to the
+    whole index, with a note saying so."""
     files = index.files
     s = fileio.normalise_rel(_as_text(scope)).strip()
     if not s or s in (".", "./"):
@@ -461,10 +377,9 @@ def _grep_scope(index, scope: str) -> tuple[list[str], str]:
 
 
 def _hit_text(index, rel: str, i: int, line: str) -> str:
-    """One formatted grep hit: `rel:lineno: [symbol] text` with the line
-    trimmed to 200 chars. Indentation is preserved: a stripped line looks
-    editable and is not, which is how a model ends up writing SEARCH blocks
-    that can never match."""
+    """One formatted grep hit: `rel:lineno: [symbol] text`, line trimmed to 200
+    chars. Indentation is preserved so the model does not treat a stripped
+    line as quotable in a SEARCH block."""
     shown = line[:200].rstrip()
     cut = " ...[line truncated]" if len(line) > 200 else ""
     unit = _enclosing_chunk(index, rel, i)
@@ -473,14 +388,12 @@ def _hit_text(index, rel: str, i: int, line: str) -> str:
     return f"{rel}:{i}:{where} {shown}{cut}"
 
 
-# A grep with at most this many real hits gets one line of context around
-# each: with so few matches the model is almost certainly looking at THE
-# place, and seeing the neighbouring line saves a `read` round trip. Dense
-# results skip it -- context there is mostly noise and doubles the tokens.
+# A grep with at most this many hits gets one line of context around each.
 SPARSE_CONTEXT_MAX = 5
+GREP_MAX_HITS = 40
 
 
-def _context_line(index, rel: str, n: int) -> "str | None":
+def _context_line(index, rel: str, n: int) -> str | None:
     """Render line `n` of `rel` as a GNU-grep-style context line
     (`file-N- text`), or None when it does not exist or is blank (a blank
     neighbour carries no shape worth spending tokens on)."""
@@ -524,17 +437,13 @@ def _with_context(index, entries) -> list[str]:
 
 
 def _scan_grep(index, files: list[str], rx: re.Pattern, max_hits: int,
-               rx_ci: "re.Pattern | None" = None) -> tuple[list, list]:
-    """Search `files` with `rx`, optionally collecting case-insensitive hits
-    for `rx_ci` in the SAME pass.
+               rx_ci: re.Pattern | None = None) -> tuple[list, list]:
+    """Search `files` with `rx`, collecting case-insensitive hits for `rx_ci`
+    in the same pass.
 
     Returns (entries, ci_entries): lists of (rel, lineno, text) tuples, with
-    lineno None for cap/stop notes. Single-pass is the point -- the
-    case-insensitive fallback used to re-read every file from disk, doubling
-    the I/O of exactly the steps that found nothing. ci_entries is only
-    meaningful when `entries` has no real hits (the case-sensitive result
-    always wins), and collection for it stops at its own cap.
-    """
+    lineno None for cap/stop notes. ci_entries only matters when `entries`
+    has no real hits."""
     entries: list[tuple] = []
     ci_entries: list[tuple] = []
     per_file_cap = max(5, max_hits // 4)
@@ -556,10 +465,7 @@ def _scan_grep(index, files: list[str], rx: re.Pattern, max_hits: int,
                     entries.append((rel, None,
                                     f"{rel}: [more matches in this file; "
                                     f"grep it directly with `file` set]"))
-                    # Breaking the file's scan is safe for the ci list too:
-                    # a per-file cap means real cs hits exist, and the ci
-                    # list is discarded whenever any cs hit was found.
-                    break
+                    break    # real hits exist, so the ci list is discarded
                 entries.append((rel, i, _hit_text(index, rel, i, line)))
                 file_hits += 1
                 if len(entries) >= max_hits:
@@ -587,17 +493,11 @@ def _scan_grep(index, files: list[str], rx: re.Pattern, max_hits: int,
 
 
 def _symbol_suggestions(index, pattern: str) -> str:
-    """A free 'did you mean this symbol?' when a grep found nothing at all.
-
-    The index already knows every defined name; a pattern that misses as text
-    often IS a near-miss of a symbol name (typo, wrong case boundary, guessed
-    spelling). Substring matches come first (grep 'thresh' -> 'leech_threshold'),
-    then difflib's close matches. Returns '' when nothing is close, so a
-    natural-language miss stays a clean 'No matches'."""
+    """'Did you mean this symbol?' text for a grep that found nothing:
+    substring matches first, then difflib close matches; '' when none."""
     p = (pattern or "").strip()
     if len(p) < 3:
         return ""
-    import difflib
     try:
         names = sorted({c.qualname for c in index.chunks
                         if c.qualname not in ("module", "__trailing__")})
@@ -617,17 +517,9 @@ def _symbol_suggestions(index, pattern: str) -> str:
               "`callers`.]")
 
 
-# --------------------------------------------------------------------------
-# Tool implementations
-# --------------------------------------------------------------------------
 def _fresh_index(index, cfg, rel: str):
-    """Re-chunk a file that exists on disk but is not in the index yet.
-
-    A brand-new file has no chunks, so `read` and `outline` would both fail on
-    it ("not in the index") even though its contents are exactly what the model
-    needs to see before extending it -- the common case when resuming work on a
-    project whose index predates the file. Returns None if nothing could be
-    indexed."""
+    """Re-chunk a file that exists on disk but is not in the index yet; None
+    if nothing could be indexed."""
     rel = _root_rel(index, rel)
     if not rel:
         return None
@@ -638,14 +530,9 @@ def _fresh_index(index, cfg, rel: str):
         return None
 
 
-def adopt_if_on_disk(index, cfg, file: str) -> "str | None":
-    """If `file` names something that exists on disk but is missing from the
-    index, fold it in and return its indexed path; otherwise return None.
-
-    Shared by `read` and `outline`: a scaffolded or hand-added file should never
-    cost the model a lookup step just because indexing ran before it existed.
-    A path outside the project root is never adopted (that would make `read`
-    a filesystem-escape)."""
+def adopt_if_on_disk(index, cfg, file: str) -> str | None:
+    """If `file` exists on disk inside the project but is missing from the
+    index, fold it in and return its indexed path; otherwise None."""
     cand = _root_rel(index, file)
     if not cand:
         return None
@@ -659,8 +546,7 @@ def adopt_if_on_disk(index, cfg, file: str) -> "str | None":
 
 
 def _definition_list(symbol: str, matches: list) -> str:
-    """Render a compact list of definition locations when a symbol is
-    ambiguous (the same name in several files/classes)."""
+    """Definition locations for a symbol defined more than once."""
     out = [f"'{symbol}' has {len(matches)} definitions; choose one with "
            f"`read` file+start+end:"]
     for c in matches[:20]:
@@ -672,14 +558,11 @@ def _definition_list(symbol: str, matches: list) -> str:
 
 def tool_read(index, cfg, file: str, start: int, end: int,
               symbol: str = "") -> str:
-    """Return exact, line-numbered source text for `file` between `start`
-    and `end` (1-based, inclusive). This is the only tool whose output is
-    safe to quote verbatim in a search/replace edit.
+    """Return exact, line-numbered source for `file` between `start` and `end`
+    (1-based, inclusive): the only tool output safe to quote in an edit.
 
-    When `file` is empty and `symbol` is given, look the symbol up in the
-    index and read its definition -- a small model often knows the name of
-    the function it needs but not which file or line it lives on. If the
-    name is ambiguous, return the definition list rather than guessing."""
+    When `file` is empty and `symbol` is given, read that symbol's definition
+    (an ambiguous name returns the definition list)."""
     file = _as_text(file)
     symbol = _as_text(symbol).strip()
     start = _as_int(start, 1)
@@ -692,14 +575,9 @@ def tool_read(index, cfg, file: str, start: int, end: int,
     if file.strip():
         rel = index.resolve_file(file)
         if rel is None:
-            # Files created after the last indexing run are real, readable,
-            # and invisible to the index. Fold them in rather than losing the
-            # step.
             rel = adopt_if_on_disk(index, cfg, file)
         if rel is None and not symbol:
-            # A small model sometimes puts a symbol name in `file` by
-            # mistake. If it names a real definition, treat it as a symbol
-            # read rather than spending the lookup on an error.
+            # A symbol name in `file` is treated as a symbol read.
             if _symbol_matches(index, file):
                 symbol = file.strip()
             else:
@@ -718,9 +596,8 @@ def tool_read(index, cfg, file: str, start: int, end: int,
             if len(matches) > 1:
                 return _definition_list(symbol, matches)
             rel = matches[0].file
-        # A symbol-only read means "show me that definition", even when the
-        # grammar filled start/end with a default range. When a file AND a
-        # symbol were given, only override a placeholder range.
+        # Symbol-only reads ignore any default start/end; with a file too,
+        # only a placeholder range is overridden.
         if not file.strip() or (start <= 1 and end <= 1):
             c = matches[0]
             start, end = c.start, c.end
@@ -736,9 +613,7 @@ def tool_read(index, cfg, file: str, start: int, end: int,
         lines = fileio.read_lines(path)
     except OSError as e:
         return f"ERROR: could not read {rel}: {e}"
-    # A trailing newline leaves an empty phantom "last line" after split.
-    # Reporting it is how a model gets told a file has 685 lines, asks for
-    # L320-685, and watches the read clamp or fail right at the boundary.
+    # Drop the phantom empty line a trailing newline leaves after split.
     if lines and lines[-1] == "" and len(lines) > 1:
         lines = lines[:-1]
     elif lines == [""]:
@@ -753,26 +628,34 @@ def tool_read(index, cfg, file: str, start: int, end: int,
     if start > len(lines):
         return f"ERROR: {rel} has only {len(lines)} lines."
     if end < start:
-        # The model asked for a backwards range. Read forward from `start`
-        # instead of failing -- one lookup's budget is too precious to waste
-        # on an argument-order slip.
+        # Backwards range: read forward from `start` instead of failing.
         end = min(start + max_lines - 1, len(lines))
     if end - start + 1 > max_lines:
         end = start + max_lines - 1
         note = f"\n[truncated to {max_lines} lines; read again from {end + 1} if needed]"
     else:
         note = ""
-    # Mid-file reads of a split unit otherwise show statements without the
-    # enclosing def/class or the module imports. Both are already indexed, so
-    # surface them for free instead of spending another read on the file head.
+    # Mid-file reads: surface the enclosing signature and module imports.
     context = ""
     if not symbol_note and start > 1 and getattr(cfg, "read_context_hint", True):
-        for c in index.in_file(rel):
+        chunks = index.in_file(rel)
+        for c in chunks:
             if c.start <= start <= c.end:
                 bits = []
                 if c.kind in ("function", "method", "class", "classheader") \
                         and c.signature:
                     bits.append(c.signature)
+                # A method's signature alone lacks its class context; show
+                # the owner's header too (qualnames are "Class.method", so
+                # the owner is the dotted prefix).
+                if c.kind == "method" and "." in c.qualname:
+                    owner = c.qualname.rsplit(".", 1)[0]
+                    for k in chunks:
+                        if k.qualname == owner \
+                                and k.kind in ("class", "classheader") \
+                                and k.signature:
+                            bits.append("in " + k.signature)
+                            break
                 imports = sorted({i.split(".")[0].lstrip(".")
                                   for i in c.imports})
                 if imports:
@@ -794,30 +677,21 @@ _REF_IMPORT_RES = (
 
 
 def _file_reference_target(index, pattern: str, scope: str) -> str | None:
-    """If `pattern` is a real file path and no scope was given, return its
-    indexed relative path.
-
-    Small models answer "find references to X.py" by calling
-    `grep X.py` -- a search for the literal filename, not for its module.
-    Recognising that shape lets grep return a proper reference report
-    (imports plus textual mentions) instead of a dead-end miss followed by
-    the semantic-search fallback.
-    """
+    """If `pattern` names an indexed file and no scope was given, return its
+    indexed path: `grep X.py` is how models ask for references to X.py."""
     if scope.strip():
         return None
     raw = (pattern or "").strip()
     if not raw or not re.fullmatch(r"[A-Za-z0-9_./\\-]+", raw):
         return None
     name = fileio.normalise_rel(raw).strip()
-    if name.startswith("./"):
-        name = name[2:]
+    name = name.removeprefix("./")
     if not name or ".." in Path(name).parts:
         return None
     rel = index.resolve_file(name)
     if rel:
         return rel
-    # `resolve_file` wants a known spelling; accept a unique path suffix too
-    # (models often omit or add a leading directory).
+    # Accept a unique path suffix too (models drop or add a directory).
     matches = [f for f in index.files
                if f.lower() == name.lower()
                or f.lower().endswith("/" + name.lower())]
@@ -825,15 +699,12 @@ def _file_reference_target(index, pattern: str, scope: str) -> str | None:
 
 
 def _file_references(index, rel: str) -> str:
-    """Report textual references to one file: imports first, then mentions.
-
-    This is deliberately evidence, not a proof of liveness: Python's
-    importlib, string-built module names, and templated asset paths can use a
-    file without ever writing its name as a literal.
-    """
+    """Report textual references to one file (imports and mentions): evidence,
+    not proof of liveness, since dynamic imports never name the file."""
     base = Path(rel).name.lower()
     full = rel.lower()
     stem = Path(rel).stem.lower()
+    stem_rx = re.compile(r"\b" + re.escape(stem) + r"\b") if stem else None
     hits: list[tuple[str, int, str, str]] = []
     code_files: set[str] = set()
     for frel in index.files:
@@ -846,13 +717,14 @@ def _file_references(index, rel: str) -> str:
         is_doc = Path(frel).suffix.lower() in {".md", ".rst", ".txt"}
         for lineno, line in enumerate(lines, 1):
             low = line.lower()
-            import_like = any(rx.search(line) for rx in _REF_IMPORT_RES)
             matched = base in low or full in low
-            if not matched and import_like and stem and \
-                    re.search(r"\b" + re.escape(stem) + r"\b", low):
-                matched = True
+            import_like = None
             if not matched:
-                continue
+                import_like = any(rx.search(line) for rx in _REF_IMPORT_RES)
+                if not (import_like and stem_rx and stem_rx.search(low)):
+                    continue
+            if import_like is None:
+                import_like = any(rx.search(line) for rx in _REF_IMPORT_RES)
             kind = "doc" if is_doc else ("import" if import_like else "text")
             hits.append((frel, lineno, kind, line.strip()[:200]))
             if not is_doc:
@@ -890,34 +762,21 @@ def _file_references(index, rel: str) -> str:
     return "\n".join(out)
 
 
-def tool_grep(index, pattern: str, scope: str = "", max_hits: int = 40,
-              cfg=None, client=None) -> str:
-    """Regex search across every indexed file, or a narrower `scope`.
+def tool_grep(index, pattern: str, scope: str = "", cfg=None,
+              client=None) -> str:
+    """Regex search across every indexed file, or a narrower `scope` (a file,
+    directory or glob; an unindexed file on disk is adopted first).
 
-    `scope` may be one file, a directory (`src/`, `src/pkg`), or a glob
-    (`*.py`, `tests/*.py`); an unindexed file that exists on disk is folded
-    into the index first, like `read` does. Returns matching lines with their
-    file:line locations and the enclosing symbol, prefixed with a warning
-    that this output is for locating code, not for quoting into an edit
-    (lines may be truncated to 200 chars).
-
-    Small models frequently send a literal string where a regex is expected
-    (`def foo(`), or the wrong case (`RETURN`). Both are recovered instead of
-    wasting the lookup: an invalid regex is searched as literal text, and a
-    case-sensitive search that finds nothing falls back to case-insensitive
-    hits collected in the same pass. A sparse result (a few hits) includes
-    one line of context around each hit; a total miss suggests similarly
-    named symbols from the index.
-
-    When `pattern` is itself an existing file path and no `scope` was given,
-    return a reference report for that file (imports plus textual mentions)
-    instead of searching for the literal filename. That is how small models
-    phrase "find references to X.py", and it prevents a no-hit grep from
-    triggering the embedding fallback.
+    Returns `file:line: [symbol] text` hits (lines trimmed to 200 chars) under
+    a warning not to quote them in edits. An invalid regex is searched as
+    literal text; a case-sensitive miss falls back to case-insensitive hits;
+    a sparse result gets one context line per hit; a total miss tries
+    semantic search (if enabled) and similar symbol names. A `pattern` that
+    is itself an indexed file path (no scope) returns that file's references.
     """
     pattern = _as_text(pattern)
     scope = _as_text(scope)
-    max_hits = max(1, _as_int(max_hits, 40))
+    max_hits = GREP_MAX_HITS
     if not pattern.strip():
         return ("ERROR: grep needs a `pattern` (a regex or plain text). To look "
                 "inside one file, use `outline`, or `read` it.")
@@ -935,14 +794,10 @@ def tool_grep(index, pattern: str, scope: str = "", max_hits: int = 40,
         notes.append("[note: pattern was not valid regex; searched it as "
                      "literal text]")
 
-    # Adopt an on-disk file named as the scope, so a file created after the
-    # last index run is searchable in the same step that names it.
     if scope and cfg is not None and index.resolve_file(scope) is None:
         adopt_if_on_disk(index, cfg, scope)
     if scope:
-        # Normalise an absolute/`./`/`..` scope to a project-relative one so
-        # the directory/glob matcher below sees the same spelling as the
-        # index (`adopt_if_on_disk` already rejects anything outside root).
+        # Normalise an absolute/`./`/`..` scope to the index's spelling.
         safe_scope = _root_rel(index, scope)
         if safe_scope is not None:
             scope = safe_scope
@@ -954,9 +809,6 @@ def tool_grep(index, pattern: str, scope: str = "", max_hits: int = 40,
         return f"No indexed files to search for /{pattern}/."
 
     rx = re.compile(needle)
-    # The case-insensitive fallback rides along in the same pass over the
-    # files: re-reading the whole tree for a second sweep doubled the cost of
-    # exactly the greps that found nothing.
     rx_ci = None
     if not rx.flags & re.IGNORECASE:
         try:
@@ -980,9 +832,7 @@ def tool_grep(index, pattern: str, scope: str = "", max_hits: int = 40,
 
     if not hits and client is not None and cfg is not None \
             and getattr(cfg, "semantic_search", False):
-        # Last resort: find code by meaning. Exact search already failed, so
-        # a natural-language phrase ("where do we retry?") would otherwise
-        # come back empty and waste the lookup.
+        # Last resort: find code by meaning.
         try:
             from . import semantic
             matches = semantic.search(index, cfg, client, pattern, verbose=True)
@@ -998,8 +848,6 @@ def tool_grep(index, pattern: str, scope: str = "", max_hits: int = 40,
                              "similarity threshold]")
 
     if not hits:
-        # Total miss: hand the model the closest real symbol names instead of
-        # a dead end -- the index already knows them, so this costs nothing.
         suggest = _symbol_suggestions(index, pattern)
         if suggest:
             notes.append(suggest)
@@ -1011,11 +859,8 @@ def tool_grep(index, pattern: str, scope: str = "", max_hits: int = 40,
 
 
 def _call_sites(index, chunk, base: str, limit: int = 2) -> list[str]:
-    """The actual source lines inside `chunk` that mention `base`.
-
-    Ranges alone make the model fetch every caller just to see how it is
-    used. A couple of exact (trimmed) lines are enough to choose the right
-    one -- and the grep warning already tells it not to edit from this."""
+    """Up to `limit` source lines inside `chunk` that mention `base`, so the
+    model can pick a caller without reading each."""
     path = index.root / chunk.file
     try:
         lines = fileio.read_lines_cached(path)
@@ -1040,11 +885,7 @@ def _call_sites(index, chunk, base: str, limit: int = 2) -> list[str]:
 
 
 def _indexed_callees(index, chunk, limit: int = 8) -> list[str]:
-    """Definitions the chunk calls that exist in the index, with locations.
-
-    This turns `callers` into a cheap both-directions view: a small model
-    tracing an `explain` question can jump from a function to the helpers it
-    uses without spending an `outline` + `read` on each guess."""
+    """Definitions the chunk calls that exist in the index, with locations."""
     out: list[str] = []
     seen: set[str] = set()
     for name in getattr(chunk, "calls", ()) or ():
@@ -1063,10 +904,8 @@ def _indexed_callees(index, chunk, limit: int = 8) -> list[str]:
 
 
 def tool_callers(index, symbol: str) -> str:
-    """Report where a symbol is defined, what it calls, and (by matching bare
-    call names) which chunks appear to call it, with call-site lines. An
-    approximate cross-reference, not a sound one (see Index.callers_of in
-    index.py)."""
+    """Report where a symbol is defined, what it calls, and which chunks appear
+    to call it (bare-name matching; see Index.callers_of), with call sites."""
     symbol = _as_text(symbol).strip()
     if not symbol:
         return "ERROR: symbol is required."
@@ -1102,39 +941,79 @@ def tool_callers(index, symbol: str) -> str:
     return "\n".join(out)
 
 
-def tool_outline(index, cfg, file: str) -> str:
-    """Return every unit (function/class/method) in one file with its
-    signature, line range, and summary -- or, when `file` names a directory
-    or glob, the file cards of everything under it.
+# One line per hit; a broad pattern must not eat the whole gather budget.
+FIND_MAX_HITS = 40
 
-    This is the model's main navigation move on a large project: the
-    always-resident map (file cards, or directory cards on the largest
-    projects) says something exists; the outline says where to `read` inside
-    it. The directory form is how the model descends a directory-tier map.
-    """
+
+def tool_find(index, pattern: str) -> str:
+    """Search indexed definitions by name, signature, or summary: navigation
+    by concept, where grep needs the exact source spelling. Case-insensitive
+    substring; name hits rank above signature hits above summary hits."""
+    raw = _as_text(pattern).strip()
+    q = raw.lower()
+    if not q:
+        return ("ERROR: `find` needs a pattern: a name fragment ('retry'), a "
+                "qualified name ('Server.start'), or a concept word likely "
+                "in a summary.")
+    scored: list[tuple[int, str, int, object]] = []
+    for c in index.chunks:
+        if c.kind in ("module", "reference") \
+                or c.qualname in ("module", "__trailing__"):
+            continue
+        qual = c.qualname.lower()
+        # Methods of a class indexed whole live in its `members` list.
+        member_hit = any(q in f"{qual}.{m.lower()}" for m in c.members)
+        if q in qual or member_hit:
+            rank = 0 if qual == q or qual.endswith("." + q) else 1
+        elif q in (c.signature or "").lower():
+            rank = 2
+        elif q in f"{c.summary} {c.docline}".lower():
+            rank = 3
+        else:
+            continue
+        scored.append((rank, c.file, c.start, c))
+    if not scored:
+        names = sorted({c.qualname for c in index.chunks
+                        if c.qualname not in ("module", "__trailing__")})
+        close = difflib.get_close_matches(raw, names, n=5, cutoff=0.5)
+        hint = f" Did you mean: {', '.join(close)}?" if close else ""
+        return (f"No definition matches '{raw}'.{hint} Try a shorter name "
+                "fragment, or `grep` for the text itself.")
+    scored.sort(key=lambda t: (t[0], t[1], t[2]))
+    out = [f"{len(scored)} definition(s) matching '{raw}' -- line ranges are "
+           "exact; `read` them directly:"]
+    for _rank, rel, _start, c in scored[:FIND_MAX_HITS]:
+        sig = (c.signature or c.qualname)[:100]
+        note = f" -- {c.summary}" if c.summary else ""
+        end = c.scope_end or c.end    # a classheader stands for its class
+        out.append(f"  {rel}:{c.start}-{end} [{c.kind}] {sig}{note}")
+    if len(scored) > FIND_MAX_HITS:
+        out.append(f"  (+{len(scored) - FIND_MAX_HITS} more; narrow the pattern)")
+    return "\n".join(out)
+
+
+def tool_outline(index, cfg, file: str) -> str:
+    """Return every unit in one file with its signature and line range, or,
+    when `file` names a directory or glob, the file cards under it."""
     file = _as_text(file)
     rel = index.resolve_file(file)
     if rel is None:
         rel = adopt_if_on_disk(index, cfg, file)
     if rel is None:
-        # If the model named a symbol rather than a file, outline the file
-        # that defines it -- still one cheap navigation step, no error.
+        # A symbol name outlines the file that defines it.
         hits = _symbol_matches(index, file)
         if hits:
             rel = hits[0].file
     if rel is None:
-        # A directory or glob: list the file cards under it instead. "."
-        # lists the whole project (truncated) -- the escape hatch from a
-        # directory-tier map's "(root)" card.
+        # A directory or glob lists file cards; "." lists the whole project.
         name = fileio.normalise_rel(file or "").strip()
         if name in (".", "./"):
             return _outline_dir(index, ".", list(index.files))
         if name:
             matches, note = _grep_scope(index, name)
             if not note and matches:
-                # note == "" means `name` really resolved as a file/dir/glob;
-                # a miss falls through to the file-not-found hint rather than
-                # dumping every card in the project.
+                # No note means `name` resolved; a miss falls through to the
+                # file-not-found hint instead of dumping every card.
                 if len(matches) == 1:
                     rel = matches[0]
                 else:
@@ -1144,16 +1023,13 @@ def tool_outline(index, cfg, file: str) -> str:
     return index.render_outline(rel)
 
 
-# Bounds for `outline <directory>`: enough cards to be useful, small enough
-# that one listing cannot eat the whole gathered-source budget.
+# Bounds for `outline <directory>`.
 _OUTLINE_DIR_MAX_CARDS = 40
 _OUTLINE_DIR_MAX_CHARS = 8000
 
 
 def _outline_dir(index, name: str, matches: list[str]) -> str:
-    """File cards for one directory/glob -- `outline`'s second meaning, and
-    the way down from a directory-tier map to line ranges the model can
-    `read`."""
+    """File cards for one directory/glob, bounded by the _OUTLINE_DIR_* caps."""
     shown = matches[:_OUTLINE_DIR_MAX_CARDS]
     text = index.render_cards(shown)
     if len(text) > _OUTLINE_DIR_MAX_CHARS:
@@ -1170,15 +1046,8 @@ def _outline_dir(index, name: str, matches: list[str]) -> str:
 
 def tool_sessions(index, cfg, pattern: str = "", file: str = "",
                   start: int = 1, end: int = 0) -> str:
-    """List, search, or read prior task session logs.
-
-    `sessions` with no arguments lists the most recent runs. A `pattern`
-    searches all logs (or one, when `file` names it); `file` alone with a
-    start/end range reads that log's numbered lines. This is how a model sees
-    what earlier runs asked, looked at, and changed without keeping the old
-    conversation in context -- particularly useful for follow-up tasks on a
-    small model with no memory between runs.
-    """
+    """List recent session logs (no args), search them (`pattern`, optionally
+    one log via `file`), or read one log's numbered lines (`file` + range)."""
     pattern = _as_text(pattern)
     file = _as_text(file)
     start = _as_int(start, 1)
@@ -1196,13 +1065,8 @@ DIFF_NOTE = ("[Diff against Pedacito's own pre-write snapshots, not git. "
 
 
 def _snapshot_copies(index) -> list:
-    """(rel, stamp, snapshot_path) for every file Pedacito has ever backed
-    up, newest snapshot copy per file.
-
-    Walks the backup dirs newest-first, so the first copy found for a rel is
-    its most recent 'before' state -- the diff then answers 'what changed
-    since Pedacito last touched this file' even when the last write to it was
-    several runs ago."""
+    """(rel, stamp, snapshot_path) for every backed-up file, newest snapshot
+    copy per file."""
     from . import workspace
     out: list = []
     seen: set = set()
@@ -1229,10 +1093,8 @@ def _snapshot_copies(index) -> list:
 
 def _diff_one(index, cfg, rel: str, stamp: str, snap: Path,
               max_lines: int = 0) -> str:
-    """Unified diff of one file: its snapshot copy vs the current working
-    tree. Pure difflib -- deliberately no `git diff` subprocess, since git
-    attribute filters can execute code on checkout-adjacent operations."""
-    import difflib
+    """Unified diff of one file: its snapshot copy vs the working tree. Pure
+    difflib, no `git` subprocess (attribute filters can execute code)."""
     try:
         old, _style = fileio.read(snap, errors="replace")
     except OSError as e:
@@ -1263,16 +1125,9 @@ def _diff_one(index, cfg, rel: str, stamp: str, snap: Path,
 
 
 def tool_diff(index, cfg, file: str = "") -> str:
-    """Show what changed in the working tree since Pedacito last snapshotted
-    each file.
-
-    A read-only view of the tool's own footprint: every write path (`apply`,
-    the review page, gather's `write`/`append`/`move`/`delete`) copies each
-    original into `.pedacito/backups/<stamp>/` first, so snapshot-vs-working
-    answers "what did the previous run actually change?" without invoking
-    git. With no `file`, summarises every snapshotted file; with one, shows
-    that file's full unified diff. Gated by `allow_diff` (on by default;
-    turning it off shrinks the tool surface by one action)."""
+    """Show what changed in the working tree since Pedacito's backup snapshots
+    (`.pedacito/backups/<stamp>/`): every changed file, or one full diff when
+    `file` is given. Gated by `allow_diff`."""
     if not getattr(cfg, "allow_diff", True):
         return "ERROR: `diff` is disabled (config allow_diff = false)."
     copies = _snapshot_copies(index)
@@ -1293,9 +1148,7 @@ def tool_diff(index, cfg, file: str = "") -> str:
                     f"written that file, so there is nothing to diff. "
                     f"Snapshotted files: {known}{more}.")
         return _diff_one(index, cfg, *pick)
-    # No file: every snapshotted file, changed ones only, on a char budget
-    # (~40 diff lines per file) so a big apply batch cannot flood the
-    # observation.
+    # No file: changed files only, on a char budget (~40 diff lines each).
     budget = max(2000, _as_int(getattr(cfg, "max_read_lines", 200), 200) * 40)
     out: list[str] = []
     used = 0
@@ -1323,12 +1176,8 @@ def tool_diff(index, cfg, file: str = "") -> str:
 
 
 def tool_todo(index, cfg, content: str = "") -> str:
-    """Read or replace the task checklist shown in later prompts.
-
-    The answer phase has no tools, so a checklist the model writes during
-    gathering is the only way its own sub-steps survive into the final turn.
-    Kept in `.pedacito/todo.md`, capped, and cleared at the start of each task.
-    """
+    """Read or replace the task checklist shown in later prompts (kept in
+    `.pedacito/todo.md`, capped, cleared at the start of each task)."""
     from . import todo as todo_mod
     text = _as_text(content).strip()
     if not text:
@@ -1343,12 +1192,8 @@ def tool_todo(index, cfg, content: str = "") -> str:
 
 
 def tool_diagnose(index, cfg, file: str = "") -> str:
-    """Run the project's detected linter/typechecker, optionally on one file.
-
-    Detection and command choice live in diagnostics.py; this tool only
-    supplies the project root and an optional target. Gated by allow_shell
-    because it executes local programs.
-    """
+    """Run the project's detected linter/typechecker (see diagnostics.py),
+    optionally on one file. Gated by allow_shell."""
     if not getattr(cfg, "allow_shell", False):
         return ("ERROR: `diagnose` is disabled (config allow_shell = false). "
                 "Enable allow_shell to let Pedacito run the project's linter/"
@@ -1386,35 +1231,19 @@ def tool_mcp(index, cfg, symbol: str = "", content: str = "") -> str:
     return mcp.call(cfg, target, args)
 
 
-def _snapshot(index, cfg, rel: str, path: Path, original: str = "",
-              style=None) -> "str | None":
-    """Snapshot the file's bytes before a mutating action.
-
-    Returns an error string if the snapshot was requested and failed; None on
-    success or when backups are off. Shared by write/append/move/delete so the
-    destructive actions all honour the same `backup` setting.
-
-    The copy is byte-for-byte (`shutil.copy2`), not a decode/re-encode: a
-    backup that "helpfully" normalises line endings or mangles a non-UTF-8
-    file is worse than no backup, because `pedacito restore` promises the
-    original bytes back. `original`/`style` remain accepted for callers that
-    already read the file, but are no longer used for the copy.
-    """
+def _snapshot(index, cfg, rel: str, path: Path) -> str | None:
+    """Byte-exact copy of `path` into the run's backup dir before a mutating
+    action. Returns an error string if the copy failed; None on success or
+    when backups are off. An existing copy is kept: the first one is the
+    original that `pedacito restore` brings back."""
     if not getattr(cfg, "backup", False):
         return None
     bdir = getattr(cfg, "_backup_dir", None)
     try:
         if bdir is None:
-            # Gather-phase writes used to fall back to a `.bak` file beside
-            # the source. Nothing ever set `_backup_dir` on the config, so
-            # that was the path every `write`/`move`/`delete` took -- and the
-            # `.bak` could then be picked up by the index. Keep the snapshot
-            # inside `.pedacito/backups/` like every other write path.
             from . import workspace
             bdir = workspace.new_backup_dir(index.root)
-        dest = Path(bdir) / rel
-        dest.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(str(path), str(dest))
+        fileio.backup_copy(path, Path(bdir) / rel)
         return None
     except OSError as e:
         return f"ERROR: could not back up {rel}: {e}"
@@ -1422,17 +1251,11 @@ def _snapshot(index, cfg, rel: str, path: Path, original: str = "",
 
 def _syntax_note(path: Path, text: str) -> str:
     """Advisory parse check on freshly written content: '' when it parses (or
-    the language is unknown), else a WARNING string.
-
-    The edit path validates and REFUSES broken syntax; the write path cannot
-    refuse -- a chunked file is legitimately unparseable until its last
-    `append` -- so it warns instead. Immediate feedback beats discovering the
-    breakage at the next test run, and the wording covers the mid-chunk case
-    so the warning does not get ignored as noise."""
+    the language is unknown), else a WARNING. It cannot refuse like the edit
+    path: a chunked file is unparseable until its last `append`."""
     suffix = path.suffix.lower()
     err = None
     if suffix == ".py":
-        import ast
         try:
             ast.parse(text)
         except SyntaxError as e:
@@ -1456,24 +1279,39 @@ def _syntax_note(path: Path, text: str) -> str:
             "reliably.]")
 
 
+def _task_allowlist_error(index, cfg, rel: str, verb: str) -> str:
+    """ERROR observation when the opt-in task write allowlist (cfg.auto_
+    allowlist) refuses modifying an EXISTING file, else ''. A file is allowed
+    when the task title names it or the gather phase read it (cfg._task_reads
+    is the live read ledger); creating new files is always allowed."""
+    if not getattr(cfg, "auto_allowlist", False):
+        return ""
+    reads = getattr(cfg, "_task_reads", None)
+    if reads is None:
+        return ""                  # no gather ever armed the ledger
+    allowed = {(p or "").strip().lower().lstrip("./")
+               for p in (getattr(cfg, "_task_allowlist", None) or ())}
+    allowed |= {(p or "").strip().lower().lstrip("./") for p in reads}
+    if (rel or "").strip().lower().lstrip("./") in allowed:
+        return ""
+    if not (Path(index.root).resolve() / rel).is_file():
+        return ""                  # creation: always allowed
+    return (f"ERROR: {verb} of {rel} blocked by the task write allowlist "
+            "(auto_allowlist): this task never read the file and its title "
+            "does not name it. `read` it first if the task really needs to "
+            "change it; creating new files is always allowed.")
+
+
 def tool_write(index, cfg, file: str, content: str,
                append: bool = False) -> str:
     """Replace a whole file with `content` (or append it when `append` is
-    true), backing the original up first.
+    true), backing the original up first. Gated by `allow_write` in dispatch.
 
-    Only reachable when `cfg.allow_write` is on (see dispatch). Deliberately
-    minimal: it reuses the same safety rails as the edit path -- refuse to
-    escape the project root, snapshot the original into the run's backup dir,
-    preserve the file's encoding style -- but it cannot offer a review diff, so
-    the observation tells the model what it changed and points at `restore`.
-    New files are created; an empty write against an existing file is refused
-    rather than silently truncating it.
-
-    `append` is what makes chunked file creation work. The old protocol asked
-    the model to repeat the file's tail and trust the writer to fold it in;
-    that never happened, so every "second chunk" overwrote the first. An
-    explicit append action has no such ambiguity: the model writes the first
-    <=max_write_lines lines, then appends the next chunk, and so on."""
+    Refuses paths outside the project root, non-UTF-8 files and empty content;
+    preserves the file's line-ending/BOM style; creates missing files. There
+    is no review diff, so the observation points at `restore`. `append` makes
+    chunked creation explicit: write the first <=max_write_lines lines, then
+    append the next chunk, and so on."""
     verb = "append" if append else "write"
     if not _as_text(file).strip():
         return f"ERROR: {verb} needs a `file` path."
@@ -1498,6 +1336,9 @@ def tool_write(index, cfg, file: str, content: str,
         return f"ERROR: refusing to write outside the project root: {file}"
     if path.is_dir():
         return f"ERROR: {rel} is a directory, not a file."
+    err = _task_allowlist_error(index, cfg, rel, verb)
+    if err:
+        return err
 
     existed = path.is_file()
     original = None
@@ -1529,7 +1370,7 @@ def tool_write(index, cfg, file: str, content: str,
                 "blocks.")
 
     if existed:
-        err = _snapshot(index, cfg, rel, path, original, style)
+        err = _snapshot(index, cfg, rel, path)
         if err:
             return err
 
@@ -1539,9 +1380,7 @@ def tool_write(index, cfg, file: str, content: str,
     except OSError as e:
         return f"ERROR: could not write {rel}: {e}"
 
-    # Fold it into the index immediately: the map and line ranges would
-    # otherwise describe bytes that no longer exist, and the next `read` of the
-    # session would show the model stale code.
+    # Refresh the index so line ranges describe the bytes now on disk.
     try:
         from . import index as index_mod
         fresh = index_mod.reindex_file(index, rel, cfg, save=False)
@@ -1550,8 +1389,6 @@ def tool_write(index, cfg, file: str, content: str,
         print(f"  [write] index refresh failed for {rel}: {e}", file=sys.stderr)
 
     n = len(text.splitlines())
-    # Advisory only: a chunked file legitimately does not parse until its
-    # last append, so this warns rather than refusing (see _syntax_note).
     syntax = _syntax_note(path, text)
     if append:
         added = len(new_text.splitlines())
@@ -1581,22 +1418,9 @@ def tool_write(index, cfg, file: str, content: str,
             + syntax)
 
 
-def tool_append(index, cfg, file: str, content: str) -> str:
-    """Append `content` to the end of `file`, creating it if needed.
-
-    Thin wrapper over tool_write so the two actions share the same root guard,
-    backup, encoding handling, and index refresh. Gated by `allow_write` in
-    dispatch, like `write`."""
-    return tool_write(index, cfg, file, content, append=True)
-
-
 def tool_move(index, cfg, file: str, to: str) -> str:
     """Rename/move one file, refusing to overwrite an existing destination.
-
-    The answer phase can already express a rename with a paired set of edit
-    blocks; this is the gather-phase equivalent so a model can reorganise a
-    file it just read without leaving the tool loop. Gated by `allow_write`.
-    """
+    Gated by `allow_write`."""
     src_name = _as_text(file).strip()
     dst_name = _as_text(to).strip()
     if not src_name:
@@ -1617,16 +1441,17 @@ def tool_move(index, cfg, file: str, to: str) -> str:
         return f"ERROR: refusing to move outside the project root: {file} -> {to}"
     if not src.is_file():
         return f"ERROR: {src_rel} is not an existing file."
+    err = _task_allowlist_error(index, cfg, src_rel, "move")
+    if err:
+        return err
     if dst.exists():
         return (f"ERROR: destination already exists: {dst_rel}. Choose another "
                 f"path or read it first.")
     try:
-        # Move handles arbitrary files, including non-UTF-8 ones; only the
-        # line count in the observation needs decoded text.
-        original, style = fileio.read(src, errors="replace")
+        original = fileio.read_text(src)      # only for the line count
     except OSError as e:
         return f"ERROR: could not read {src_rel}: {e}"
-    err = _snapshot(index, cfg, src_rel, src, original, style)
+    err = _snapshot(index, cfg, src_rel, src)
     if err:
         return err
     try:
@@ -1653,11 +1478,8 @@ def tool_move(index, cfg, file: str, to: str) -> str:
 
 
 def tool_delete(index, cfg, file: str) -> str:
-    """Delete one file, after snapshotting it when backups are on.
-
-    Refuses directories and anything outside the project root. The index entry
-    is dropped immediately so the next prompt's map does not advertise a file
-    that no longer exists. Gated by `allow_write`."""
+    """Delete one file, after snapshotting it when backups are on. Refuses
+    directories and paths outside the root. Gated by `allow_write`."""
     name = _as_text(file).strip()
     if not name:
         return "ERROR: delete needs a `file` path."
@@ -1672,13 +1494,14 @@ def tool_delete(index, cfg, file: str) -> str:
         return f"ERROR: refusing to delete outside the project root: {file}"
     if not path.is_file():
         return f"ERROR: {rel} is not an existing file."
+    err = _task_allowlist_error(index, cfg, rel, "delete")
+    if err:
+        return err
     try:
-        # Delete works for any file; decoded text is only used for the line
-        # count and the observation.
-        original, style = fileio.read(path, errors="replace")
+        original = fileio.read_text(path)     # only for the line count
     except OSError as e:
         return f"ERROR: could not read {rel}: {e}"
-    err = _snapshot(index, cfg, rel, path, original, style)
+    err = _snapshot(index, cfg, rel, path)
     if err:
         return err
     try:
@@ -1694,12 +1517,8 @@ def tool_delete(index, cfg, file: str) -> str:
 
 
 def _split_command(cmd: str) -> list[str]:
-    """Split a command into argv without invoking a shell.
-
-    POSIX mode is used everywhere except Windows, where it would eat
-    backslashes in paths. Windows' non-POSIX splitter keeps the surrounding
-    quotes, so strip a matching pair from each token -- the subprocess layer
-    re-quotes arguments itself."""
+    """Split a command into argv without a shell. Windows uses non-POSIX
+    splitting (POSIX mode eats path backslashes) and strips the quotes it keeps."""
     if os.name != "nt":
         return shlex.split(cmd)
     return [p[1:-1] if len(p) >= 2 and p[0] == p[-1] and p[0] in "\"'"
@@ -1714,8 +1533,7 @@ def _allowlist_error(cfg, argv: list[str]) -> str:
 
     def _exe(name: str) -> str:
         base = Path(name).name.lower()
-        # Windows resolves `python` to `python.exe`; compare the stem so an
-        # allowlist entry written without the extension keeps working there.
+        # Compare without `.exe` on Windows.
         if os.name == "nt" and base.endswith(".exe"):
             base = base[:-4]
         return base
@@ -1729,20 +1547,13 @@ def _allowlist_error(cfg, argv: list[str]) -> str:
 
 
 def tool_run(index, cfg, command: str) -> str:
-    """Run one command in the project root and return its output.
+    """Run one command in the project root and return its output. Gated by
+    `allow_shell`.
 
-    Opt-in (`allow_shell = false` by default) because this executes code the
-    model wrote. The command is split into an argv and run WITHOUT a shell, so
-    pipes/redirection/`&&` are inert arguments rather than executed syntax.
-    `shell_allowlist`, when set, restricts the executable name. Output and
-    runtime are both capped so a hung or chatty command cannot eat the task's
-    context budget.
-
-    A GUI/server launch is the problem case: it opens a window and never
-    exits. `proc.run` watches output and stops the process (and its process
-    group) after `shell_idle_seconds` of silence, returning "started, then
-    stopped" instead of blocking until a person closes the window. Test
-    runners keep printing, so they still get the full `shell_timeout`."""
+    The command runs as an argv WITHOUT a shell (pipes and `&&` are inert);
+    `shell_allowlist` restricts the executable; output and runtime are capped.
+    `proc.run` stops a process that is silent for `shell_idle_seconds` (a
+    GUI or server), while test runners get the full `shell_timeout`."""
     if not getattr(cfg, "allow_shell", False):
         return ("ERROR: `run` is disabled (config allow_shell = false). Enable "
                 "it to run tests or linters from the gather loop, or run the "
@@ -1764,17 +1575,14 @@ def tool_run(index, cfg, command: str) -> str:
     timeout = max(1, _as_int(getattr(cfg, "shell_timeout", 120), 120))
     idle = max(0, _as_int(getattr(cfg, "shell_idle_seconds", 10), 10))
     cap = max(200, _as_int(getattr(cfg, "max_shell_output_chars", 8000), 8000))
-    env = dict(os.environ, NO_COLOR="1", TERM="dumb", GIT_PAGER="cat",
-               PAGER="cat")
+    env = _child_env()
     rc, out, stopped, _elapsed = proc.run(
         argv, cwd=index.root, timeout=timeout, idle_timeout=idle,
         max_output=cap, env=env)
     if stopped == "error":
         return f"ERROR: could not run command: {out}"
 
-    # A command can rewrite source (snapshot updates, codegen, formatters).
-    # Line ranges are only valid against the bytes they were indexed from, so
-    # refresh what changed before the next `read` sees a stale map.
+    # A command can rewrite source; refresh the index so line ranges stay valid.
     try:
         from . import index as index_mod
         changed, missing = index.stale()
@@ -1820,11 +1628,41 @@ def tool_run(index, cfg, command: str) -> str:
     return f"{head}\nOUTPUT:\n{out}{tail}"
 
 
-def _resolve_screenshot(index, name: str) -> "Path | None":
-    """Resolve an existing screenshot safely under the project root.
+def _child_env() -> dict:
+    """Environment for launched commands: no colour, no pagers."""
+    return dict(os.environ, NO_COLOR="1", TERM="dumb", PAGER="cat",
+                GIT_PAGER="cat")
 
-    Accepts a path relative to the project, or a bare filename from
-    `.pedacito/screenshots/`. Absolute paths outside the root are refused."""
+
+def _stop_process(p) -> None:
+    proc.terminate(p)
+    try:
+        p.wait(timeout=5)
+    except Exception:
+        pass
+
+
+def _vision_text(client, cfg, image: Path) -> str:
+    """Description from the configured vision model, or '' when none is set."""
+    if not (getattr(cfg, "vision_model", "") or "").strip():
+        return ""
+    try:
+        return vision.describe(client, cfg, image)
+    except Exception as e:
+        return f"(vision model failed: {str(e)[:200]})"
+
+
+def _rel_or_abs(root: Path, p: Path) -> str:
+    try:
+        return p.relative_to(root).as_posix()
+    except ValueError:                            # pragma: no cover
+        return str(p)
+
+
+def _resolve_screenshot(index, name: str) -> Path | None:
+    """Resolve an existing screenshot under the project root: a project-relative
+    path, or a bare filename from `.pedacito/screenshots/`. Paths outside the
+    root are refused."""
     n = _as_text(name).strip().strip("`\"'")
     if not n:
         return None
@@ -1849,17 +1687,13 @@ def _resolve_screenshot(index, name: str) -> "Path | None":
 
 def tool_screenshot(index, cfg, client, command: str = "", file: str = "",
                     start: int = 0) -> str:
-    """Capture the screen (optionally launching an app first) and report what
-    a text-only model can know about it.
+    """Capture the screen (optionally launching an app first) and report it as
+    text: pixel statistics and a blank verdict (Pillow), OCR text (tesseract),
+    and an optional `vision_model` description. The PNG is kept under
+    `.pedacito/screenshots/`.
 
-    A model cannot see a GUI. This tool turns the image into text: pixel
-    statistics and a blank/black verdict (Pillow), OCR text (tesseract), and
-    an optional description from a multimodal model (`vision_model`). The PNG
-    is kept under `.pedacito/screenshots/` so a human can inspect it.
-
-    Gated by `allow_screenshots`; when `command` is given, also by
-    `allow_shell` because it launches code. The launched process is stopped
-    after the capture, so it cannot block the task.
+    Gated by `allow_screenshots`; a `command` also needs `allow_shell`. The
+    launched process is stopped after the capture.
     """
     if not getattr(cfg, "allow_screenshots", False):
         return ("ERROR: `screenshot` is disabled (config allow_screenshots = "
@@ -1891,8 +1725,7 @@ def tool_screenshot(index, cfg, client, command: str = "", file: str = "",
     out = out_dir / (datetime.now().strftime("%Y%m%d-%H%M%S-%f") + ".png")
     delay = start or _as_int(getattr(cfg, "screenshot_wait_seconds", 5), 5)
     delay = max(0, min(delay, 60))
-    env = dict(os.environ, NO_COLOR="1", TERM="dumb", PAGER="cat",
-               GIT_PAGER="cat")
+    env = _child_env()
 
     launched = None
     exit_code = None
@@ -1905,8 +1738,7 @@ def tool_screenshot(index, cfg, client, command: str = "", file: str = "",
     else:
         if argv:
             if delay:
-                # Use the server-aware launcher so a dev server's printed URL
-                # is recognised while we wait; a GUI simply waits the delay.
+                # Server-aware launcher: recognises a dev server's printed URL.
                 try:
                     launched, server_url, launch_output = \
                         browser.launch_server(
@@ -1927,29 +1759,15 @@ def tool_screenshot(index, cfg, client, command: str = "", file: str = "",
         exit_code = launched.poll() if launched is not None else None
         ok, method = vision.capture(out)
         if launched is not None:
-            proc.terminate(launched)
-            try:
-                launched.wait(timeout=5)
-            except Exception:
-                pass
+            _stop_process(launched)
         if not ok:
             return f"ERROR: could not capture the screen: {method}"
 
-    # Only compare when a NEW capture was taken; in file-only analysis mode
-    # `out` and `prev` are the same file, so "0% changed from itself" is
-    # noise rather than evidence.
+    # Compare only against a NEW capture; in file-only mode out is prev.
     report = vision.analyze(out, previous=prev if argv else None)
-    desc = ""
-    if (getattr(cfg, "vision_model", "") or "").strip():
-        try:
-            desc = vision.describe(client, cfg, out)
-        except Exception as e:
-            desc = f"(vision model failed: {str(e)[:200]})"
+    desc = _vision_text(client, cfg, out)
 
-    try:
-        rel_out = out.relative_to(root).as_posix()
-    except ValueError:                            # pragma: no cover
-        rel_out = str(out)
+    rel_out = _rel_or_abs(root, out)
     bits = [f"SCREENSHOT: {rel_out}", f"CAPTURE: {method}"]
     if argv:
         status = (f" (process had already exited with code {exit_code} before "
@@ -1957,9 +1775,6 @@ def tool_screenshot(index, cfg, client, command: str = "", file: str = "",
                   " (still running; stopped after capture)")
         bits.append(f"LAUNCHED: {cmd}{status}")
     if server_url:
-        # A desktop capture cannot show a page that no browser ever opened.
-        # Say that plainly: otherwise a small model reads a static/blank
-        # desktop shot as proof the game runs and behaves correctly.
         bits.append(f"SERVER: {server_url}")
         if getattr(cfg, "allow_browser", False):
             bits.append(
@@ -1976,10 +1791,7 @@ def tool_screenshot(index, cfg, client, command: str = "", file: str = "",
                 "from this image; enable allow_browser (and install the "
                 "browser extra) or verify with a console/headless check.]")
     if prev is not None and argv:
-        try:
-            bits.append("COMPARED WITH: " + prev.relative_to(root).as_posix())
-        except ValueError:                        # pragma: no cover
-            bits.append("COMPARED WITH: " + str(prev))
+        bits.append("COMPARED WITH: " + _rel_or_abs(root, prev))
     bits.append("ANALYSIS:\n" + report)
     if desc:
         bits.append("VISION DESCRIPTION:\n" + desc)
@@ -1998,18 +1810,12 @@ def tool_browser(index, cfg, client, command: str = "", pattern: str = "",
                  start: int = 0, file: str = "") -> str:
     """Open a web page, optionally interact with it, wait, and capture it.
 
-    `command` is either an http(s) URL or a command that starts a local web
-    server and prints its URL (the common `python main.py` case). `pattern`
-    holds a tiny interaction list -- `press Enter; click #start; wait 2;
-    eval <js expression>` -- so the model can reach a game that waits behind
-    a start screen and force state (a grown player, a late level) that
-    waiting alone cannot produce. An `eval` consumes the rest of the pattern
-    (put it last), so its expression may contain semicolons; its result is
-    reported back clipped at 2,000 chars, so aggregate large scans (e.g.
-    per-sprite-row counts) instead of dumping raw rows. `start` is the
-    wait before capture. A desktop `screenshot` cannot do any of this;
-    this tool captures the PAGE and reports its text, canvas sizes, console
-    errors, and optional vision description.
+    `command` is an http(s) URL or a command that starts a local web server
+    and prints its URL. `pattern` is an interaction list (`press Enter; click
+    #start; wait 2; eval <js>`, see browser.parse_actions); `eval` consumes
+    the rest of the pattern and its result is clipped at 2,000 chars. `start`
+    is the wait before capture. Reports the page's text, canvas sizes,
+    console errors and an optional vision description.
 
     Gated by `allow_browser`; launching a command also needs `allow_shell`.
     """
@@ -2030,8 +1836,7 @@ def tool_browser(index, cfg, client, command: str = "", pattern: str = "",
         return f"ERROR: no screenshot named '{file}' under the project root."
 
     root = Path(index.root).resolve()
-    env = dict(os.environ, NO_COLOR="1", TERM="dumb", PAGER="cat",
-               GIT_PAGER="cat")
+    env = _child_env()
     server = None
     server_url = ""
     if re.match(r"^(?:https?://|localhost(?::\d+)?(?:/|$)|"
@@ -2062,11 +1867,7 @@ def tool_browser(index, cfg, client, command: str = "", pattern: str = "",
         if server is None:
             return f"ERROR: could not launch '{cmd}': {launch_output}"
         if not url:
-            proc.terminate(server)
-            try:
-                server.wait(timeout=5)
-            except Exception:
-                pass
+            _stop_process(server)
             detail = (launch_output or "").strip()[-1200:]
             hint = ""
             if getattr(cfg, "allow_shell", False):
@@ -2089,26 +1890,14 @@ def tool_browser(index, cfg, client, command: str = "", pattern: str = "",
             headless=bool(getattr(cfg, "browser_headless", True)))
     finally:
         if server is not None:
-            proc.terminate(server)
-            try:
-                server.wait(timeout=5)
-            except Exception:
-                pass
+            _stop_process(server)
     if not ok:
         return f"ERROR: {info}"
 
     report = vision.analyze(out, previous=prev)
-    desc = ""
-    if (getattr(cfg, "vision_model", "") or "").strip():
-        try:
-            desc = vision.describe(client, cfg, out)
-        except Exception as e:
-            desc = f"(vision model failed: {str(e)[:200]})"
+    desc = _vision_text(client, cfg, out)
 
-    try:
-        rel_out = out.relative_to(root).as_posix()
-    except ValueError:                            # pragma: no cover
-        rel_out = str(out)
+    rel_out = _rel_or_abs(root, out)
     bits = [f"BROWSER: {info.get('url') or url}",
             f"CAPTURE: {info.get('method') or 'browser'}"
             f" ({rel_out})"]
@@ -2137,10 +1926,7 @@ def tool_browser(index, cfg, client, command: str = "", pattern: str = "",
         bits.append("CONSOLE:\n" + "\n".join(
             f"- {e}" for e in info["console"][-8:]))
     if prev is not None:
-        try:
-            bits.append("COMPARED WITH: " + prev.relative_to(root).as_posix())
-        except ValueError:                        # pragma: no cover
-            bits.append("COMPARED WITH: " + str(prev))
+        bits.append("COMPARED WITH: " + _rel_or_abs(root, prev))
     bits.append("ANALYSIS:\n" + report)
     if desc:
         bits.append("VISION DESCRIPTION:\n" + desc)
@@ -2158,16 +1944,10 @@ def tool_browser(index, cfg, client, command: str = "", pattern: str = "",
     return "\n".join(bits)
 
 
-# --------------------------------------------------------------------------
-# Dispatch
-# --------------------------------------------------------------------------
 def dispatch(index, cfg, step: dict, client=None) -> str:
-    """Route one parsed agent step (matching STEP_SCHEMA) to the
-    corresponding tool_* function and return its text observation.
-
-    `client` is only needed for optional semantic search; every other action
-    works without it, so offline tests and CLI inspection callers can omit it.
-    """
+    """Route one parsed agent step (matching STEP_SCHEMA) to its tool_*
+    function and return the text observation. `client` is only needed for
+    semantic search, screenshot and browser vision descriptions."""
     if not isinstance(step, dict):
         return f"ERROR: malformed step (expected an object, got {type(step).__name__})."
     action = _as_text(step.get("action")).strip()
@@ -2178,6 +1958,8 @@ def dispatch(index, cfg, step: dict, client=None) -> str:
     if action == "grep":
         return tool_grep(index, step.get("pattern", ""), step.get("file", ""),
                          cfg=cfg, client=client)
+    if action == "find":
+        return tool_find(index, step.get("pattern", ""))
     if action == "callers":
         return tool_callers(index, step.get("symbol", ""))
     if action == "outline":
@@ -2215,12 +1997,9 @@ def dispatch(index, cfg, step: dict, client=None) -> str:
                              step.get("to", ""))
         if action == DELETE_ACTION:
             return tool_delete(index, cfg, step.get("file", ""))
-        # Guard a write/append BEFORE it happens when its content already
-        # exceeds one step's budget (max_write_lines). A 791-line `content`
-        # string can only have arrived here as a truncated reply -- executing
-        # it would silently store half a file. Refuse and teach the chunked
-        # protocol instead so the model writes <=budget-line steps that each
-        # fit the provider's real output limit.
+        # Refuse a write/append over one step's line budget: it can only have
+        # arrived as a truncated reply, and executing it would store half a
+        # file. Teach the chunked protocol instead.
         budget = max(1, _as_int(getattr(cfg, "max_write_lines", 0), 0))
         raw_content = step.get("content", "")
         content = raw_content if isinstance(raw_content, str) else ""
@@ -2239,7 +2018,6 @@ def dispatch(index, cfg, step: dict, client=None) -> str:
                     f"Writing it in one message gets cut off at the token "
                     f"limit. Do it in chunks instead: {advice} Choose `done` "
                     f"only after every part of the task is written.")
-        if action == APPEND_ACTION:
-            return tool_append(index, cfg, step.get("file", ""), content)
-        return tool_write(index, cfg, step.get("file", ""), content)
+        return tool_write(index, cfg, step.get("file", ""), content,
+                          append=action == APPEND_ACTION)
     return f"ERROR: unknown action '{action}'."

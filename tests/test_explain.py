@@ -119,8 +119,8 @@ def test_explain_answer_end_to_end(tmp_path, fake_port):
     cfg.max_steps = 6
     idx = index_mod.build([str(tmp_path)], cfg, client=None, summarise=False,
                           root=tmp_path)
-    from pedacito.llm import LMStudio
-    agent = Agent(idx, LMStudio(cfg), cfg)
+    from pedacito.llm import LLMClient
+    agent = Agent(idx, LLMClient(cfg), cfg)
     reply = explain.answer(agent, "what does old_name.py do?", verbose=False)
     assert reply.strip()
     assert "--- FILE:" not in reply

@@ -1,23 +1,14 @@
 """Edit application via search/replace blocks.
 
-Usage
------
-    from .edits import parse_edits, apply_edits
-
     edits = parse_edits(model_reply_text)
     results = apply_edits(project_root, edits, backup=True, dry_run=False)
     for r in results:
         print(r.ok, r.file, r.message)
 
-Why search/replace rather than unified diffs: small models get hunk headers
-and line offsets wrong constantly, and a wrong @@ header silently corrupts a
-file. Why not whole-file rewrites: at ~25 tok/s a 400-line file is minutes of
-generation, and the model will quietly drop a function somewhere in the
-middle.
-
-Search/replace instead anchors on content the model just read via the `read`
-tool. It either matches the file exactly or it doesn't, and a failed match is
-a clean, recoverable error that can be fed back to the model to retry.
+Search/replace rather than unified diffs (small models get hunk headers and
+offsets wrong) or whole-file rewrites (slow, and the model drops code): a block
+either matches the file exactly or fails with a recoverable error that is fed
+back to the model.
 
 Expected format in a model's reply:
 
@@ -28,9 +19,16 @@ Expected format in a model's reply:
     replacement lines
     >>>>>>> REPLACE
 
-An empty SEARCH section against a file that does not exist yet creates the
-file with the REPLACE content -- the agent's "write a new file" move, so it
-can add modules without a separate action vocabulary.
+An empty SEARCH section creates the file (or replaces its whole content).
+
+The FILE header may carry an anchor instead of a SEARCH body:
+
+    --- FILE: path/to/file.py LINES 40-60
+    --- FILE: path/to/file.py SYMBOL Server.start
+
+For an anchored block the REPLACE body overwrites that 1-based inclusive line
+range (LINES) or that definition (SYMBOL, resolved to a line range by the
+caller -- the agent, which owns the index), and SEARCH is ignored.
 """
 
 from __future__ import annotations
@@ -46,30 +44,43 @@ from pathlib import Path
 from . import fileio
 from .chunker_ts import LANG_BY_EXT, TS_AVAILABLE, has_syntax_error
 
+# The `=======` separator must be a whole line, so a `/* ====` banner at the
+# start of a SEARCH stays in the body. The REPLACE body may be empty, and the
+# look-ahead keeps it from swallowing the next block's header.
 BLOCK_RE = re.compile(
     r"---\s*FILE:\s*(?P<file>[^\n]+?)\s*\n"
     r"[^\n]*<{5,}\s*SEARCH[^\n]*\n"
     r"(?P<search>.*?)"
-    # The `=======` separator must be a whole line of (mostly) equals signs.
-    # Matching any run of five or more '=' used to swallow the '===' banner
-    # inside a comment header that a SEARCH began with (`/* ====...`), which
-    # truncated the SEARCH to `/* ` and dumped the rest into REPLACE -- the
-    # "search block appears N times" failures on JS/CSS/HTML renames.
-    # Anchoring to a full line leaves such banners in the SEARCH body.
     r"^[ \t]*={5,}[ \t]*$\n"
-    # The replace body may be empty too: with no newline after the separator
-    # the closer sits on the very next line (`>{5,}` after `^`). A negative
-    # look-ahead keeps the group from swallowing the next block's header when
-    # two blocks sit adjacent.
     r"(?P<replace>(?:(?!-{3}\s*FILE:).)*?)"
     r"^[ \t]*>{5,}\s*REPLACE",
     re.DOTALL | re.MULTILINE,
 )
 
+# Optional anchor suffix on the FILE header: "path LINES 40-60" replaces that
+# 1-based inclusive line range with the REPLACE body (SEARCH ignored);
+# "path SYMBOL name" replaces that definition (resolved to lines by the agent).
+_ANCHOR_RE = re.compile(
+    r"^(?P<path>.*?)[ \t]+(?:LINES[ \t]+(?P<start>\d+)[ \t]*-[ \t]*(?P<end>\d+)"
+    r"|SYMBOL[ \t]+(?P<symbol>\S+))[ \t]*$",
+    re.IGNORECASE,
+)
 
-# --------------------------------------------------------------------------
-# Data model
-# --------------------------------------------------------------------------
+
+def _is_anchored(e: "Edit") -> bool:
+    """True for a LINES/SYMBOL-anchored block: a line-range replacement, never
+    a creation, a rename half, or a no-op."""
+    return bool(e.lines or e.symbol)
+
+# Conventional folders for dead/archived code: a basename-only move into one
+# of these counts as a rename without further proof.
+_ARCHIVE_DIRS = frozenset({
+    "graveyard", "graveyards", "archive", "archived", "archives",
+    "trash", "deleted", "dead", "deadcode", "dead-code", "old",
+    "old_code", "deprecated", "bak", "backup", "backups", "attic",
+})
+
+
 @dataclass
 class Edit:
     """One parsed search/replace block, not yet applied."""
@@ -77,6 +88,11 @@ class Edit:
     file: str
     search: str
     replace: str
+    # FILE-header anchors: `LINES a-b` (1-based inclusive) as parsed; a
+    # `SYMBOL name` anchor keeps the name here until the caller resolves it
+    # into `lines` (apply_edits has no index).
+    lines: tuple[int, int] | None = None
+    symbol: str = ""
 
 
 @dataclass
@@ -87,50 +103,35 @@ class Result:
     file: str
     message: str
     diff: str = ""
-    # Populated on success. The reviewer renders before/after side by side, and
-    # `sha` pins the exact bytes the preview was built from so a later apply can
-    # refuse if the file changed underneath.
+    # before/after feed the reviewer; `sha` pins the bytes the preview was
+    # built from so a later apply can refuse if the file changed underneath.
     before: str = ""
     after: str = ""
     sha: str = ""
-    # True when at least one block in this file anchored approximately rather
-    # than matching exactly. Reviewers use it to flag the risky ones.
+    # At least one block anchored approximately rather than exactly.
     fuzzy: bool = False
-    # For a creation that was detected as a rename: the old path(s) whose real
-    # contents were moved into this file (and which apply then removed). The
-    # reviewer renders them as deleted so nothing about the move is hidden.
+    # For a creation detected as a rename: the old paths whose real contents
+    # were moved into this file (and removed by apply).
     renames_from: tuple[str, ...] = ()
 
 
 # --------------------------------------------------------------------------
 # Parsing
 # --------------------------------------------------------------------------
-# A bare ``` line at column zero toggles fenced-code state while scanning a
-# reply; anything inside a fence is content and must never be rewritten.
+# A bare ``` line toggles fenced-code state while scanning a reply.
 _FENCE_RE = re.compile(r"^\s{0,3}```.*$")
+_HEADER_START_RE = re.compile(r"(?<!\n)(---\s*FILE:)")
 
 
 def _strip_wrapping_fences(text: str) -> str:
-    """Blank out only the markdown fences that *wrap* the edit blocks -- an
-    opening ``` before the first `--- FILE:` header and a closing ``` after
-    the last `>>>>>>> REPLACE`.
-
-    The naive version of this (delete every line that looks like a fence)
-    corrupted real edits: replacement code that opens or closes a docstring
-    containing a fenced example lands exactly such a line inside the REPLACE
-    section, and deleting it silently wrote broken code to disk. Fences
-    between two `--- FILE:` headers are therefore left untouched; a model
-    that fences each block individually is handled by the outermost pair,
-    which also blanks any stray inter-block fences sitting outside every
-    search/replace block."""
+    """Blank out only the markdown fences that *wrap* the edit blocks: an
+    opening ``` before the first `--- FILE:` header and a closing ``` after the
+    last `>>>>>>> REPLACE`. Fences between headers belong to the replacement
+    code (e.g. a docstring with a fenced example) and are left alone."""
     lines = text.split("\n")
     first = text.find("--- FILE:")
     if first == -1:
         return text
-    # Opening fence: the last bare ``` line before the first header. The scan
-    # stops as soon as it reaches the line that actually holds the header --
-    # comparing whole-line lengths to a character offset was wrong and could
-    # stop early on a short preamble, leaving the real opening fence in place.
     open_idx = -1
     fenced = False
     consumed = 0
@@ -141,7 +142,6 @@ def _strip_wrapping_fences(text: str) -> str:
         if consumed <= first < consumed + len(ln) + 1:
             break                        # this line contains the header
         consumed += len(ln) + 1          # +1 for the newline we split on
-    # Closing fence: the first bare ``` line after the final REPLACE marker.
     close_idx = -1
     if "REPLACE" in text:
         tail_from = max(i for i in range(len(lines)) if "REPLACE" in lines[i])
@@ -158,59 +158,44 @@ def _strip_wrapping_fences(text: str) -> str:
 def parse_edits(text: str, discards: list | None = None) -> list[Edit]:
     """Extract every search/replace block from a model's reply text.
 
-    Normalises the model's own line endings first, then strips the markdown
-    fences wrapping the blocks so a model that answers inside a ``` still
-    parses -- without touching fence lines that belong to the code itself.
-
-    A block whose SEARCH and REPLACE bodies are identical is DROPPED (its
-    file is appended to `discards` when given): it changes nothing on disk,
-    and run 13 showed what "applying" one costs -- a repair that had
-    correctly concluded "no code defect" was pressed by the no-edit re-ask
-    into fabricating a null block on a frozen file; the harness logged
-    "applied 1 block(s)", took a backup, and counted it as an EDIT,
-    burning a full verify re-run instead of retiring the check. locate()
-    already refuses to write matched text over itself; dropping at parse
-    time keeps every caller from mistaking a null edit for work.
-    """
+    Normalises line endings and strips the fences wrapping the blocks. A block
+    whose SEARCH and REPLACE are identical changes nothing and is dropped; its
+    file is appended to `discards` when given, so callers never count a null
+    edit as work."""
     text = text.replace("\r\n", "\n").replace("\r", "\n")
     cleaned = _strip_wrapping_fences(text)
-    # A fence line blanked by the stripper can leave the header glued to the
-    # line above it; make sure every header starts its own line.
-    cleaned = re.sub(r"(?<!\n)(---\s*FILE:)", r"\n\1", cleaned)
+    # A blanked fence line can leave a header glued to the line above it.
+    cleaned = _HEADER_START_RE.sub(r"\n\1", cleaned)
     edits = []
     for m in BLOCK_RE.finditer(cleaned):
-        search, replace = m.group("search"), m.group("replace")
-        # The separator/closer may sit on the same line as the last body line
-        # (an empty replacement writes `=======` straight onto
-        # `>>>>>>> REPLACE`). Drop exactly one trailing newline so a normal
-        # block keeps its historical "no trailing newline" semantics while an
-        # empty replacement stays empty instead of becoming "\n".
-        if search.endswith("\n"):
-            search = search[:-1]
-        if replace.endswith("\n"):
-            replace = replace[:-1]
-        if search == replace:
-            fname = fileio.normalise_rel(m.group("file"))
+        # Drop exactly one trailing newline: the separator/closer may sit on
+        # the same line as the last body line, so an empty replacement must
+        # stay "" instead of becoming "\n".
+        search = m.group("search").removesuffix("\n")
+        replace = m.group("replace").removesuffix("\n")
+        raw_file = m.group("file").strip()
+        lines_anchor: tuple[int, int] | None = None
+        symbol_anchor = ""
+        am = _ANCHOR_RE.match(raw_file)
+        if am:
+            raw_file = am.group("path").strip()
+            if am.group("start"):
+                a, b = int(am.group("start")), int(am.group("end"))
+                lines_anchor = (min(a, b), max(a, b))
+            else:
+                symbol_anchor = am.group("symbol").strip()
+        fname = fileio.normalise_rel(raw_file)
+        anchored = bool(lines_anchor or symbol_anchor)
+        if search == replace and not anchored:
             print(f"  [discarded a no-op edit block for {fname}: SEARCH and "
                   f"REPLACE are identical; it changes nothing]",
                   file=sys.stderr)
             if discards is not None:
                 discards.append(fname)
             continue
-        edits.append(Edit(fileio.normalise_rel(m.group("file")), search, replace))
+        edits.append(Edit(fname, search, replace,
+                          lines=lines_anchor, symbol=symbol_anchor))
     return edits
-
-
-# NOTE: same-path blocks are deliberately NOT folded into one Edit. An older
-# `merge_duplicate_files` helper did exactly that -- fine for chunked
-# CREATIONS, whose empty SEARCH bodies concatenate harmlessly, but fatal for
-# ordinary edits: gluing two or more SEARCH bodies together produces a needle
-# that appears nowhere in the file, so any reply following the documented
-# "use several blocks rather than one large one" protocol failed wholesale as
-# "block 1: search block not found". apply_edits instead keeps every block on
-# its own and applies a path's blocks IN ORDER against the evolving text,
-# emitting one cumulative Result per file; the creation branches join the
-# REPLACE bodies of empty-SEARCH blocks themselves.
 
 
 # --------------------------------------------------------------------------
@@ -228,32 +213,27 @@ class Span:
 
 
 def locate(haystack: str, needle: str, cfg=None,
-           replacement: str | None = None) -> "Span | None":
+           replacement: str | None = None) -> Span | None:
     """Locate one search block in a file's text and return a Span, or None if
     it cannot be applied.
 
-    `replacement` is the text to splice in -- normally the block's REPLACE
-    body. It defaults to the needle itself ONLY as a safe no-op for callers
-    that just want to find a span; apply_edits must pass the real replacement,
-    because writing the matched text back over itself silently reports
-    "applied 1 block(s)" while changing nothing on disk (this was the worst
-    instance of the GUI's "nothing to review" bug: every plain edit parsed,
-    matched, validated, and rewrote the file byte-for-byte unchanged).
+    `replacement` is the text to splice in (the block's REPLACE body); it
+    defaults to the needle, a no-op, for callers that only want the span.
 
     Tries, in order: an exact unique match; a whitespace-tolerant unique match
-    (trailing whitespace and blank lines ignored), used only when
-    `cfg.fuzzy_match` allows it; and finally a similarity match against every
-    same-length window in the file, accepted only when the best window is both
-    close enough (`cfg.fuzzy_min_ratio`) and clearly better than the runner-up.
-    An ambiguous exact match is always a failure: editing the wrong occurrence
-    silently is worse than asking the model for more context.
+    (trailing whitespace and blank lines ignored); and, when `cfg.fuzzy_match`
+    allows, a similarity match against every same-length window, accepted only
+    if the best window clears `cfg.fuzzy_min_ratio` and clearly beats the
+    runner-up. An ambiguous match is always a failure: editing the wrong
+    occurrence silently is worse than asking the model for more context.
     """
     repl = needle if replacement is None else replacement
     span = _locate(haystack, needle)
     if span is not None:
         return Span(*span, repl)
-    fuzzy_on = bool(cfg is not None and getattr(cfg, "fuzzy_match", True))
-    if not fuzzy_on:
+    if haystack.count(needle) > 1:
+        return None
+    if not (cfg is not None and getattr(cfg, "fuzzy_match", False)):
         return None
     min_ratio = float(getattr(cfg, "fuzzy_min_ratio", 0.85))
     max_len = int(getattr(cfg, "max_read_lines", 200)) * 200
@@ -261,35 +241,30 @@ def locate(haystack: str, needle: str, cfg=None,
 
 
 def _locate_fuzzy(haystack: str, needle: str, min_ratio: float,
-                  max_needle: int, replacement: str | None = None) -> Span | None:
+                  max_needle: int, replacement: str) -> Span | None:
     """Best-effort anchor for a search block that does not match exactly.
 
-    `replacement` is what the caller wants spliced in at the located span
-    (see `locate`); it defaults to the needle, which makes the splice a
-    no-op -- correct for pure "find the span" callers like rename
-    classification, never for apply_edits, which passes the real REPLACE.
-
-    Compares the needle against every window of haystack with the same number
-    of lines, using difflib.SequenceMatcher (no external dependency). A match
-    is accepted only if the best window clears `min_ratio` and beats the second
-    best by a clear margin, so a genuinely near-miss anchors while an ambiguous
-    one still fails loudly. Refuses to run on very large needles: the scan is
-    O(lines x length) and a runaway whole-file block should fail, not stall."""
+    Compares the needle against every window of the haystack with the same
+    number of lines (difflib.SequenceMatcher). Accepted only if the best
+    window clears `min_ratio` and beats the second best by a clear margin.
+    Refuses very large needles: the scan is O(lines x length)."""
     if not needle.strip() or "\x00" in haystack or len(needle) > max_needle:
         return None
     hlines = haystack.split("\n")
     nlines = needle.split("\n")
     if len(nlines) > len(hlines):
         return None
-    target = "\n".join(nlines)
-    sm = difflib.SequenceMatcher(None, nlines, [""])
+    k = len(nlines)
+    sm = difflib.SequenceMatcher(None)
+    sm.set_seq2(nlines)              # the fixed side is cached by difflib
     best_ratio, second_ratio, best_i = 0.0, 0.0, -1
-    for i in range(len(hlines) - len(nlines) + 1):
-        window = "\n".join(hlines[i:i + len(nlines)])
-        if window == target:
+    for i in range(len(hlines) - k + 1):
+        window = hlines[i:i + k]
+        if window == nlines:
             continue                     # an exact match would have been found
-        sm.a = nlines
-        sm.b = hlines[i:i + len(nlines)]
+        sm.set_seq1(window)
+        if sm.real_quick_ratio() <= second_ratio or sm.quick_ratio() <= second_ratio:
+            continue                     # cannot change best or second best
         r = sm.ratio()
         if r > best_ratio:
             second_ratio = best_ratio
@@ -301,18 +276,98 @@ def _locate_fuzzy(haystack: str, needle: str, min_ratio: float,
     if second_ratio >= best_ratio - 0.03:
         return None                      # two plausible anchors: too risky
     start = sum(len(x) + 1 for x in hlines[:best_i])
-    seg = hlines[best_i:best_i + len(nlines)]
+    seg = hlines[best_i:best_i + k]
     stop = start + sum(len(x) for x in seg) + (len(seg) - 1)
-    repl = needle if replacement is None else replacement
-    return Span(start, stop, repl, fuzzy=True)
+    return Span(start, stop, replacement, fuzzy=True)
+
+
+def _rstripped_lines(s: str) -> list[str]:
+    return [ln.rstrip() for ln in s.splitlines()]
+
+
+def _line_span(text: str, start: int, end: int) -> tuple[int, int] | None:
+    """Char span of 1-based inclusive lines [start, end], INCLUDING the last
+    line's terminator, or None when the range is out of bounds."""
+    lines = text.splitlines(keepends=True)
+    if start < 1 or end < start or end > len(lines):
+        return None
+    off = sum(len(x) for x in lines[:start - 1])
+    return off, off + sum(len(x) for x in lines[start - 1:end])
+
+
+# Closest-window hint on a failed block: a lower similarity floor than fuzzy
+# application (this only REPORTS a location, never edits) and a hard cap on the
+# quoted lines so the repair feedback stays small.
+_CLOSEST_FLOOR = 0.5
+_CLOSEST_MAX_LINES = 18
+
+
+def _closest_window(haystack: str, needle: str,
+                    max_needle: int) -> tuple[int, int, float] | None:
+    """The window of `haystack` most similar to `needle`, as (first_line,
+    last_line, ratio) with 1-based inclusive lines, or None when nothing
+    reaches _CLOSEST_FLOOR. Same scan as _locate_fuzzy, without the
+    ambiguity/quality gates: used only in failure messages."""
+    if not needle.strip() or "\x00" in haystack or len(needle) > max_needle:
+        return None
+    hlines = haystack.split("\n")
+    nlines = needle.split("\n")
+    if len(nlines) > len(hlines):
+        return None
+    k = len(nlines)
+    sm = difflib.SequenceMatcher(None)
+    sm.set_seq2(nlines)
+    best_ratio, best_i, best_char = 0.0, -1, -1.0
+    for i in range(len(hlines) - k + 1):
+        window = hlines[i:i + k]
+        if window == nlines:
+            continue                     # an exact match would have been found
+        sm.set_seq1(window)
+        # `<`, not `<=`: a window tied on the line-level bound can still win
+        # the char-level tie-break below.
+        if sm.real_quick_ratio() < best_ratio or sm.quick_ratio() < best_ratio:
+            continue
+        r = sm.ratio()
+        if r > best_ratio:
+            best_ratio, best_i, best_char = r, i, -1.0
+        elif r == best_ratio and r >= _CLOSEST_FLOOR:
+            # Line-level tie: prefer the window closer character-for-character
+            # (a one-char change beats a shifted-by-one window).
+            c = difflib.SequenceMatcher(None, "\n".join(window), needle).ratio()
+            if best_char < 0.0:
+                best_char = difflib.SequenceMatcher(
+                    None, "\n".join(hlines[best_i:best_i + k]), needle).ratio()
+            if c > best_char:
+                best_i, best_char = i, c
+    if best_i < 0 or best_ratio < _CLOSEST_FLOOR:
+        return None
+    return best_i + 1, best_i + k, best_ratio
+
+
+def _closest_hint(text: str, needle: str, cfg=None) -> str:
+    """Failure-message suffix showing where the SEARCH text most nearly
+    matches, with real line numbers, so the model can re-anchor on facts
+    instead of re-guessing."""
+    max_needle = int(getattr(cfg, "max_read_lines", 200) or 200) * 200
+    win = _closest_window(text, needle, max_needle)
+    if win is None:
+        return ""
+    a, b, ratio = win
+    seg = text.split("\n")[a - 1:b]
+    shown = seg[:_CLOSEST_MAX_LINES]
+    more = (f"\n  (... {len(seg) - len(shown)} more line(s) in the range)"
+            if len(seg) > len(shown) else "")
+    body = "\n".join(f"  {a + i} | {ln}" for i, ln in enumerate(shown))
+    return (f" The closest text in the file right now is at lines {a}-{b} "
+            f"({ratio:.0%} similar):\n{body}{more}\n"
+            "Copy it exactly into SEARCH, or anchor the block with "
+            f"`--- FILE: <path> LINES {a}-{b}` and put the full replacement "
+            "text in REPLACE (SEARCH empty).")
 
 
 def _locate(haystack: str, needle: str) -> tuple[int, int] | None:
-    """Find the unique span of `needle` inside `haystack`: exact match first,
-    then a whitespace-tolerant retry (ignoring trailing whitespace per line).
-    Ambiguous matches (needle appears more than once) are treated as a
-    failure -- better to ask the model for more surrounding context than to
-    edit the wrong occurrence."""
+    """Find the unique span of `needle` in `haystack`: exact match first, then
+    a retry ignoring trailing whitespace per line. Ambiguous matches fail."""
     if not needle.strip():
         return None
     n = haystack.count(needle)
@@ -322,13 +377,7 @@ def _locate(haystack: str, needle: str) -> tuple[int, int] | None:
     if n > 1:
         return None
 
-    # Retry ignoring trailing whitespace and blank-line differences.
-    def norm(s: str) -> list[str]:
-        """Split into lines with trailing whitespace stripped, for the
-        whitespace-tolerant retry."""
-        return [ln.rstrip() for ln in s.splitlines()]
-
-    hay, need = norm(haystack), norm(needle)
+    hay, need = _rstripped_lines(haystack), _rstripped_lines(needle)
     if not need:
         return None
     starts = [i for i in range(len(hay) - len(need) + 1) if hay[i : i + len(need)] == need]
@@ -338,35 +387,29 @@ def _locate(haystack: str, needle: str) -> tuple[int, int] | None:
     lines = haystack.splitlines(keepends=True)
     seg = lines[s : s + len(need)]
     start = sum(len(x) for x in lines[:s])
-    # Exclude the final line terminator so the span matches exact-match
-    # semantics, where the needle has no trailing newline.
+    # Exclude the final line terminator: exact-match needles carry none.
     tail = len(seg[-1]) - len(seg[-1].rstrip("\r\n"))
     end = start + sum(len(x) for x in seg) - tail
     return start, end
 
 
 # --------------------------------------------------------------------------
-# Public API
+# Rename placeholders
 # --------------------------------------------------------------------------
 _BLOCK_COMMENT_RE = re.compile(r"^/\*.*?\*/", re.DOTALL)
 _HTML_COMMENT_RE = re.compile(r"^<!--.*?-->", re.DOTALL)
 
 
 def _is_placeholder_only(text: str) -> bool:
-    """True when `text` is nothing but a short comment -- the shape of a
-    rename placeholder ("/* Contenido movido desde sentences.js */"). Used
-    to refuse half-renames: a creation whose whole body is a placeholder and
-    which matched no rename source would otherwise write a few-byte stub for
-    a task that meant to move real content. A genuine new file either
-    carries non-comment content or is clearly longer than a one-line note."""
+    """True when `text` is nothing but a short comment -- the shape of a rename
+    placeholder ("/* moved from sentences.js */"). Used to refuse half-renames
+    that would otherwise write a few-byte stub in place of real content."""
     lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
     if not lines or len(lines) > 3:
         return False
     joined = "\n".join(lines)
     if len(joined.encode("utf-8")) > 200:
         return False
-    # C-style block comments and HTML comments (possibly several, or
-    # line-spans of one).
     rest = joined
     m = _BLOCK_COMMENT_RE.match(rest)
     while m:
@@ -378,19 +421,14 @@ def _is_placeholder_only(text: str) -> bool:
         m = _HTML_COMMENT_RE.match(rest)
     if rest == "":
         return True
-    # Hash / slash line comments only.
-    return all(ln.startswith("#") or ln.startswith("//") or
-               ln.startswith("<!--") for ln in lines)
+    return all(ln.startswith(("#", "//", "<!--")) for ln in lines)
 
 
 def _placeholder_comment(ph: str, suffix: str) -> str:
-    """Render a rename placeholder as a leading comment for a file of the
-    given suffix, without double-wrapping one the model already wrote as a
-    comment. Wrapping `/* ... */` in another `/* ... */` produced
-    `/* /* ... */ */`, a syntax error that aborted the whole rename."""
+    """Render a rename placeholder as a leading comment for a file of the given
+    suffix, without double-wrapping text the model already wrote as a comment."""
     lines = ph.splitlines()
     if suffix in (".html", ".htm"):
-        # HTML tolerates a bare line; keep the model's text verbatim.
         return "\n".join(lines) + "\n"
     if suffix == ".py":
         return "".join(
@@ -404,122 +442,162 @@ def _placeholder_comment(ph: str, suffix: str) -> str:
     return ph + "\n"
 
 
+_ORPHAN_CREATE_MSG = (
+    "refusing to create this file: its content is only a placeholder "
+    "comment and no rename source matched. If you are renaming a file, "
+    "emit ONLY the empty-SEARCH creation block for the new path plus a "
+    "block for the old path whose SEARCH is part of its content and whose "
+    "REPLACE is empty -- Pedacito moves the real bytes; never copy them. "
+    "If you mean to write this file's content yourself, put that content "
+    "in REPLACE.")
+
+
+def _validate(path: Path, text: str) -> str | None:
+    """Return an error message if `text` does not parse as source of `path`'s
+    language, else None."""
+    if path.suffix == ".py":
+        try:
+            ast.parse(text)
+        except SyntaxError as e:
+            return f"a syntax error at line {e.lineno}: {e.msg}"
+        except ValueError as e:               # null bytes (Python < 3.12)
+            return f"a parse error: {e}"
+    elif path.suffix.lower() in LANG_BY_EXT and TS_AVAILABLE:
+        bad, lineno = has_syntax_error(text, LANG_BY_EXT[path.suffix.lower()])
+        if bad:
+            return f"a syntax error near line {lineno}"
+    return None
+
+
+def _creation_text(group: list[Edit]) -> str:
+    """Body of a new file: the REPLACE bodies of the empty-SEARCH blocks, in
+    reply order (anchored blocks are line replacements, never creation text).
+    parse_edits drops one trailing newline from every body, so joining with
+    "\\n" never invents a blank line."""
+    text = "\n".join(e.replace for e in group
+                     if not e.search.strip() and not _is_anchored(e))
+    if text and not text.endswith("\n"):
+        text += "\n"
+    return text
+
+
+# --------------------------------------------------------------------------
+# Application
+# --------------------------------------------------------------------------
 def apply_edits(root: Path, edits: list[Edit], backup: bool = True,
                 dry_run: bool = False, backup_dir: Path | None = None,
-                cfg=None) -> list[Result]:
+                cfg=None, allowlist: set[str] | None = None) -> list[Result]:
     """Apply a list of Edits, grouped by file.
 
-    For each file: locate and apply every search/replace block, validate the
-    result still parses (Python via ast, tree-sitter languages via
-    chunker_ts), and either write it (with a backup of the original) or, in
-    dry-run mode, just compute the diff and before/after text without
-    touching disk. A block with an empty SEARCH against a file that does not
-    exist creates that file instead of failing.
+    Each path's blocks are applied IN ORDER against the evolving text, the
+    result is validated (Python via ast, tree-sitter languages via
+    chunker_ts), and then written (with a byte-exact backup of the original)
+    or, in dry-run mode, only diffed. One cumulative Result is returned per
+    file. An empty SEARCH against a missing file creates it. Paths outside
+    `root` are refused.
 
-    Pass `cfg` (a Config) to enable approximate anchoring (`fuzzy_match`) and
-    to control the repair loop's token budgets; without it, matching stays
-    exact-only and defaults are used elsewhere.
+    `cfg` enables approximate anchoring (`fuzzy_match`) and rename pairing
+    (`allow_rename`); without it matching is exact-only.
 
-    Backups go into a timestamped snapshot directory under .pedacito/backups/
-    rather than dropping .bak files beside the source, so a whole editing
-    session is restorable as a unit and nothing Pedacito writes ever lands in
-    the working tree unexpectedly.
+    `allowlist`, when given, is a set of normalised (lowercased, no leading
+    ./) paths the task may modify. Creating a new file is always allowed;
+    editing, moving or deleting an EXISTING file outside the set is refused
+    before any pairing, so a blocked rename source cannot be moved away.
+
+    Backups go to `backup_dir` (a snapshot under .pedacito/backups/); an
+    existing copy there is never overwritten, so the snapshot holds each
+    file's state before the run's FIRST change. Without `backup_dir`, a
+    `<file>.bak` is written beside the source.
     """
     results: list[Result] = []
-    # Group blocks by path, keeping every SEARCH/REPLACE block on its own so
-    # rename detection (and the sequential application below) sees the raw
-    # blocks. When a model emits "create index.html" and "empty out
-    # index.html" under the same header (the rename idiom), folding those
-    # bodies into one Edit made the whole path look like neither a creator
-    # nor a remover -- its search turned non-empty while its replace kept the
-    # new content -- silently dropping the rename pair and leaving the old
-    # files to fail as unmatched edits.
+    # Blocks stay unmerged: rename detection and sequential application both
+    # need the raw blocks, and gluing several SEARCH bodies together yields a
+    # needle that appears nowhere in the file.
     groups: dict[str, list[Edit]] = {}
     for e in edits:
         groups.setdefault(e.file, []).append(e)
 
     root_resolved = Path(root).resolve()
 
+    def _resolve_inside(rel: str) -> Path | None:
+        """Resolved path of `rel` when it stays inside the root (following
+        symlinks), else None."""
+        try:
+            p = (root_resolved / rel).resolve()
+            p.relative_to(root_resolved)
+        except (OSError, RuntimeError, ValueError):
+            return None
+        return p
+
+    # ---- opt-in write allowlist --------------------------------------------
+    # With `allowlist`, an EXISTING file may only be edited, moved or deleted
+    # when its normalised path is in the set (the task title named it or the
+    # lookup phase read it); creating new files is always allowed. Blocked
+    # paths are refused here, before rename pairing, so a blocked source can
+    # never be moved away by its pair.
+    if allowlist is not None:
+        allowed = {(p or "").strip().lower().lstrip("./") for p in allowlist}
+        for rel in list(groups):
+            key = (rel or "").strip().lower().lstrip("./")
+            if key in allowed:
+                continue
+            path = _resolve_inside(rel)
+            if path is not None and path.is_file():
+                results.append(Result(
+                    False, rel,
+                    "blocked by the write allowlist (auto_allowlist): this "
+                    "task never read this file and its title does not name "
+                    "it, so it may not be modified; creating new files is "
+                    "still allowed"))
+                del groups[rel]
+
     # ---- rename detection ---------------------------------------------------
-    # The documented rename protocol is: an empty-SEARCH creation block for
-    # the NEW path (a placeholder), plus a full-content SEARCH / empty REPLACE
-    # "clear" block for each OLD path. Pedacito then moves the old file's real
-    # bytes to the new path and removes it.
+    # Rename protocol: an empty-SEARCH creation block for the NEW path (a
+    # placeholder) plus a content-quoting SEARCH / empty-REPLACE "clear" block
+    # for each OLD path. Pedacito moves the old file's real bytes to the new
+    # path and removes it.
     #
-    # Two structural facts make this tricky, and both were sources of silent
-    # failures ("the review page stays blank, nothing gets renamed"):
-    #
-    #   1. Small models re-emit the same `--- FILE:` header per block --
-    #      including when the target of a rename shares its name with a source
-    #      (replace index.html with a new one, move the old ones aside). If
-    #      duplicate headers are concatenated *before* classification, such a
-    #      path looks like neither creator nor remover and the pair vanishes.
-    #      Classification therefore happens per raw block below.
-    #   2. A creation target exists on disk in the very common "overwrite +
-    #      archive" pattern, so creators must NOT be required to be absent --
-    #      they are identified by shape alone (empty SEARCH, non-empty
-    #      REPLACE). Removers are identified by a clear block whose search
-    #      actually reaches end-of-file.
-    #
-    # When a path is BOTH creator and remover (its own content archived
-    # elsewhere), it is treated as pure overwrite-and-rename: its clear blocks
-    # are dropped, because executing them would delete the freshly created
-    # file. Pairing only ever links distinct paths, so no data can be lost.
+    # Blocks are classified per raw block, because small models re-emit the
+    # same header per block (a rename target can share its name with a source),
+    # and creators are identified by shape alone (empty SEARCH, non-empty
+    # REPLACE) since the target often exists already ("overwrite + archive").
+    # A path that is both creator and remover is a pure overwrite: its clear
+    # blocks are dropped. Pairing only links distinct paths, so nothing is lost.
     def _classify(rel: str, g: list[Edit]) -> tuple[bool, bool]:
-        """Return (can_create, can_clear) for one path's raw blocks."""
+        """Return (can_create, can_clear) for one path's raw blocks. Anchored
+        blocks never count: they replace a line range, not a whole file."""
+        path = _resolve_inside(rel)
+        if path is None:
+            return False, False
+        g = [e for e in g if not _is_anchored(e)]
         can_create = any(not e.search.strip() and e.replace.strip() for e in g)
         can_clear = False
-        path = root_resolved / rel
         if path.is_file():
             original, _style = fileio.read(path, errors="replace")
 
             def _reaches_eof(search: str, span) -> bool:
-                """True when the matched span extends to end-of-file.
-
-                `locate()` deliberately excludes a trailing newline from its
-                span (exact-match semantics: needles carry no final "\\n"), so
-                a whole-file clear block whose REPLACE is empty would leave
-                exactly one "\\n" in `original[span.stop:]` -- and a strict
-                `.strip()` check used to reject it whenever the file ended
-                WITH a newline while accepting it when it didn't. Rename
-                pairing then silently dropped, which surfaced as the GUI's
-                "nothing to review" on tasks as simple as renaming a file.
-                Tolerate that one optional terminator instead of requiring
-                byte-exact EOF.
-                """
+                # locate() excludes a trailing newline from its span, so
+                # tolerate one optional terminator after a whole-file clear.
                 tail = original[span.stop:]
                 if not tail.strip():
                     return True
-                if tail in ("\n", "\r\n") and search.strip():
-                    return True
-                return False
+                return tail in ("\n", "\r\n") and bool(search.strip())
 
-            # A path whose blocks also CREATE it (empty SEARCH + non-empty
-            # REPLACE -- the placeholder half of a rename pair, or an
-            # overwrite) must never be classified as a remover from a stray
-            # empty-SEARCH/empty-REPLACE block: pairing it with itself would
-            # move a zero-byte stub into the new path and delete the real
-            # file. Such pairs are refused outright (see the renames loop).
-            creates_here = any(not e.search.strip() and e.replace.strip()
-                               for e in g)
             for e in g:
                 if e.replace.strip():
                     continue
                 if not e.search.strip():
-                    if not creates_here:
+                    # A path that also creates itself is never a remover: it
+                    # would pair with itself and delete the real file.
+                    if not can_create:
                         can_clear = True     # explicit wipe of an existing file
                     continue
                 span = locate(original, e.search, cfg)
                 if span is None:
-                    # Tolerate a truncated whole-file SEARCH: models that
-                    # quote the old file's content from memory drop lines in
-                    # the middle. If the quoted text matches contiguously at
-                    # the START and again at the very END of the file (the
-                    # tail reaching EOF), it still identifies this exact file
-                    # -- accept it as a clear block so the rename pairs up and
-                    # Pedacito moves the real bytes. A mid-file-only match
-                    # stays rejected; that is an ordinary edit anchor, not a
-                    # wipe. The SEARCH text itself is never used as content.
+                    # A truncated whole-file SEARCH (quoted from memory) still
+                    # identifies the file if it matches contiguously at the
+                    # START and again at the very END. The SEARCH text is
+                    # never used as content.
                     first_nl = e.search.find("\n")
                     head = (e.search if first_nl < 0 else e.search[:first_nl])
                     if original.startswith(head):
@@ -529,14 +607,10 @@ def apply_edits(root: Path, edits: list[Edit], backup: bool = True,
                             if tspan is not None and _reaches_eof(tail, tspan):
                                 can_clear = True
                                 continue
-                elif span is not None and not span.fuzzy:
-                    # A clear block whose SEARCH matches uniquely anywhere in
-                    # the file identifies it as the source of a move: the model
-                    # anchors on any exact text it actually read -- the opening
-                    # lines, a mid-file script tag, or the whole file -- since
-                    # the SEARCH is only used to name the file, never as
-                    # content. Fuzzy (similarity) matches stay rejected; a
-                    # near-miss is too weak an identifier for a rename.
+                elif not span.fuzzy:
+                    # A unique exact match anywhere names the file as the move
+                    # source; the SEARCH is never used as content. Fuzzy
+                    # matches are too weak an identifier.
                     can_clear = True
         return can_create, can_clear
 
@@ -548,31 +622,13 @@ def apply_edits(root: Path, edits: list[Edit], backup: bool = True,
     if cfg is None or getattr(cfg, "allow_rename", True):
         used: set[str] = set()
 
-        # Conventional folders for dead/archived code. A basename-only move
-        # across directories is otherwise ambiguous (root/index.html ->
-        # subj-imp/index.html is the archive-trap the old guard was written
-        # for), so allow it into one of these without further proof. This is
-        # what makes `foo.py -> graveyard/foo.py` work; before, the old
-        # `_stem` compared the WHOLE relative path ("foo" vs "graveyard/foo")
-        # so every move into a subfolder silently failed to pair and degraded
-        # into a placeholder copy plus a partial wipe of the live file.
-        _ARCHIVE_DIRS = {
-            "graveyard", "graveyards", "archive", "archived", "archives",
-            "trash", "deleted", "dead", "deadcode", "dead-code", "old",
-            "old_code", "deprecated", "bak", "backup", "backups", "attic",
-        }
-
         def _is_archive_dir(path: str) -> bool:
             return any(part.lower() in _ARCHIVE_DIRS
                        for part in Path(path).parts[:-1])
 
         def _placeholder_names_source(new: str, old: str) -> bool:
-            """True when a placeholder creation for `new` mentions `old`.
-
-            The documented rename idiom writes a short "moved from X" comment
-            in the new file. That explicit reference is enough to resolve a
-            basename-only cross-directory move (`notes.md ->
-            docs/notes.md`) without accepting every same-named path."""
+            """True when a placeholder creation for `new` mentions `old` (the
+            "moved from X" comment of the rename idiom)."""
             names = {Path(old).name.lower(), Path(old).as_posix().lower(),
                      Path(old).stem.lower()}
             for e in groups.get(new, []):
@@ -586,14 +642,11 @@ def apply_edits(root: Path, edits: list[Edit], backup: bool = True,
         def _pair_score(old: str, new: str) -> int:
             """Rank candidate pairings; -1 rejects a pair.
 
-            Same-directory renames are unambiguous. Cross-directory ones are
-            accepted when the old relative path survives as a suffix (moving
-            `game/enemies.py` into `graveyard/game/enemies.py`), or when a
-            basename-only move has an explicit signal: the destination is a
-            conventional archive folder or the placeholder names the source.
-            A bare basename match into an arbitrary sibling directory stays
-            rejected -- that is the overwrite-and-archive trap that would
-            wipe the home page."""
+            Same-directory renames are unambiguous. Cross-directory ones need
+            the old relative path to survive as a suffix, or, for a basename-
+            only move, an explicit signal (archive folder, or a placeholder
+            naming the source). A bare basename match into an arbitrary
+            sibling directory is rejected: the overwrite-and-archive trap."""
             same_dir = Path(old).parent == Path(new).parent
             old_posix = Path(old).as_posix().lower().lstrip("./")
             new_posix = Path(new).as_posix().lower().lstrip("./")
@@ -601,13 +654,11 @@ def apply_edits(root: Path, edits: list[Edit], backup: bool = True,
             new_name = Path(new).name.lower()
             if same_dir:
                 return 3 if old_name in new_name else 2
-            # The whole old relative path survives under the new parent.
             if "/" in old_posix and new_posix.endswith("/" + old_posix):
                 return 2
             # Moving a file back out of a subdirectory to the same name.
             if "/" in old_posix and old_posix.endswith("/" + new_posix):
                 return 1
-            # Basename-only cross-directory move: only on an explicit signal.
             if new_name == old_name and (
                     _is_archive_dir(new) or _placeholder_names_source(new, old)):
                 return 1
@@ -620,17 +671,12 @@ def apply_edits(root: Path, edits: list[Edit], backup: bool = True,
             scored.sort(key=lambda t: (-t[0], t[1]))
             return scored[0][1]
 
-        # Pass 1: same-directory pairs first -- they are unambiguous.
         rem_list, cre_list = sorted(removers), sorted(creators)
 
         def _source_is_real(old: str) -> bool:
-            """True when the would-be rename source actually holds content
-            worth moving. A file whose whole body is a rename placeholder
-            comment (created by an earlier half-finished rename turn) carries
-            no real bytes: pairing it as a SOURCE turns the protocol's own
-            marker into a wipe of a live file -- exactly how root index.html
-            lost its contents when a stale subjuntivo-imperativo-sentences.js
-            stub matched the clearing block instead of sentences.js."""
+            """True when the would-be source holds content worth moving. A file
+            that is itself a rename placeholder carries no real bytes; pairing
+            it as a source would wipe a live file."""
             path = root_resolved / old
             if not path.is_file():
                 return False
@@ -641,28 +687,20 @@ def apply_edits(root: Path, edits: list[Edit], backup: bool = True,
             return not _is_placeholder_only(text)
 
         def _placeholder_target(new: str) -> bool:
-            """True when `new`'s create blocks in this reply are only a short
-            rename placeholder. Such a target may pair ONLY with a source that
-            has a NON-empty clearing block: an empty-SEARCH/empty-REPLACE wipe
-            also matches any other existing path in the reply (the model's
-            stray blank block against the file it just created), and pairing a
-            placeholder with that wipe moves zero bytes while leaving the real
-            file edited-but-not-renamed -- the exact silent half-rename from
-            the DeepSeek test. The wipe-vs-placeholder case stays allowed for
-            full-content targets (legit 'replace X with new content')."""
-            g = groups.get(new, [])
-            bodies = [e.replace.strip() for e in g
+            """True when `new`'s create blocks are only a short placeholder.
+            Such a target may pair only with a source that has a
+            content-quoting clear block; pairing it with a bare wipe would
+            move zero bytes and leave a half-rename."""
+            bodies = [e.replace.strip() for e in groups.get(new, [])
                       if not e.search.strip() and e.replace.strip()]
             return bool(bodies) and all(_is_placeholder_only(b) for b in bodies)
 
         def _explicit_wipe_only(old: str) -> bool:
-            """True when every clearing block for `old` has an EMPTY search
-            (a bare wipe) -- i.e. there is no content-quoting clear to anchor
-            a placeholder pairing on."""
-            g = groups.get(old, [])
-            clears = [e for e in g if not e.replace.strip()]
+            """True when every clear block for `old` has an EMPTY search."""
+            clears = [e for e in groups.get(old, []) if not e.replace.strip()]
             return bool(clears) and all(not e.search.strip() for e in clears)
 
+        # Pass 1: same-directory pairs first -- they are unambiguous.
         for old in rem_list:
             if not _source_is_real(old):
                 continue
@@ -675,8 +713,7 @@ def apply_edits(root: Path, edits: list[Edit], backup: bool = True,
                 new = min(cand)
                 renames[old] = new
                 used.add(new)
-        # Pass 2: remaining sources pair with remaining targets by stem, then
-        # nearest common parent, then plain name order.
+        # Pass 2: remaining sources pair with remaining targets by score.
         for old in rem_list:
             if old in renames or not _source_is_real(old):
                 continue
@@ -691,15 +728,9 @@ def apply_edits(root: Path, edits: list[Edit], backup: bool = True,
                 renames[old] = new
                 used.add(new)
 
-    # Collect the blocks to apply, one group per path, in reply order and
-    # UNMERGED: the application loop below runs each block against the text
-    # the previous one produced and emits a single cumulative Result per
-    # file -- which is also what the review flow needs (one diff per path,
-    # computed from the true original to the true final text).
-    # Rename sources lose their clear blocks: live, they would fail to match
-    # after the move removed the file; in dry-run they would preview as an
-    # empty stub next to the rename. A path that is also a creator keeps its
-    # create blocks (see fact 3 above); a pure source drops out entirely.
+    # Blocks to apply, per path, in reply order. A rename source loses its
+    # clear blocks (they would fail to match after the move); a path that is
+    # also a creator keeps its create blocks, a pure source drops out.
     by_file: dict[str, list[Edit]] = {}
     for rel, g in groups.items():
         if rel in renames:
@@ -713,80 +744,41 @@ def apply_edits(root: Path, edits: list[Edit], backup: bool = True,
         by_file[rel] = list(g)
 
     # ---- orphan placement guard -------------------------------------------
-    # A placeholder-only creation with no rename source is a half-rename: the
-    # model asked for "move X here" but the clearing block for X never matched
-    # (wrong directory pairing, truncated reply, a guessed header). Writing
-    # the stub is bad enough; worse, applying the leftover clearing block
-    # strips the first lines off the LIVE file and leaves the old path
-    # truncated in place -- exactly the corruption the graveyard run produced
-    # (graveyard/snake_spawner.py became a one-line note while the real file
-    # lost its header). Detect the orphan up front and refuse the whole
-    # suspected pair: the new path is not created and content-quoting clears
-    # in the same reply are not applied. The repair loop then re-asks with the
-    # rename protocol, and nothing has been lost.
+    # A placeholder-only creation with no rename source is a half-rename (the
+    # clear block never matched). Refuse the new path AND any content-quoting
+    # clears in the same reply: applying a leftover clear would strip lines
+    # off the live file. The repair loop then re-asks with the rename protocol.
     rename_targets = set(renames.values())
-
-    def _creation_text(g: list[Edit]) -> str:
-        text = "\n".join(e.replace for e in g if not e.search.strip())
-        if text and not text.endswith("\n"):
-            text += "\n"
-        return text
-
     orphan_placeholders = {
         rel for rel, g in by_file.items()
         if rel not in rename_targets
-        and g and all(not e.search.strip() for e in g)
-        and any(e.replace.strip() for e in g)
-        and _is_placeholder_only(_creation_text(g))
+        and (plain := [e for e in g if not _is_anchored(e)])
+        and all(not e.search.strip() for e in plain)
+        and any(e.replace.strip() for e in plain)
+        and _is_placeholder_only(_creation_text(plain))
         and not any(o for o, n in renames.items()
                     if n == rel and (root_resolved / o).is_file())
     }
-
-    _ORPHAN_CREATE_MSG = (
-        "refusing to create this file: its content is only a placeholder "
-        "comment and no rename source matched. If you are renaming a file, "
-        "emit ONLY the empty-SEARCH creation block for the new path plus a "
-        "block for the old path whose SEARCH is part of its content and whose "
-        "REPLACE is empty -- Pedacito moves the real bytes; never copy them. "
-        "If you mean to write this file's content yourself, put that content "
-        "in REPLACE.")
-
-    def _validate(path: Path, text: str) -> str | None:
-        """Return an error message if `text` does not parse as source of
-        `path`'s language, else None. A new file that fails to parse is not
-        created at all; an edit that breaks an existing file leaves it
-        untouched."""
-        if path.suffix == ".py":
-            try:
-                ast.parse(text)
-            except SyntaxError as e:
-                return f"a syntax error at line {e.lineno}: {e.msg}"
-        elif path.suffix.lower() in LANG_BY_EXT and TS_AVAILABLE:
-            bad, lineno = has_syntax_error(text, LANG_BY_EXT[path.suffix.lower()])
-            if bad:
-                return f"a syntax error near line {lineno}"
-        return None
 
     def _finish(rel: str, path: Path, original: str | None, text: str, style,
                 note: str, fuzzy: bool = False,
                 renames_from: tuple[str, ...] = ()) -> Result:
         """Validate, diff, back up, and write one finished file's content."""
-        # Rename sources move their REAL bytes into the new path: the model's
-        # creation REPLACE was only a placeholder (the system prompt says so --
-        # retyping whole files wastes tokens and drops functions), so the
-        # moved content wins. The placeholder survives as an HTML comment at
-        # the top when it carries information the user should see.
-        # `moved_original` is what the review page diffs against and pins by
-        # sha for pure creations; for renames it is the first source's bytes.
+        # Rename sources move their REAL bytes into the new path; the model's
+        # creation REPLACE was only a placeholder. `moved_original` is what the
+        # review diffs against and pins by sha (for a pure creation, "").
         moved_original = original or ""
         if renames_from:
             texts = []
+            movable = []
             for old in renames_from:
                 try:
-                    otext, _ = fileio.read(root_resolved / old, errors="replace")
-                except OSError:
-                    continue
+                    otext, _ = fileio.read(root_resolved / old, errors="strict")
+                except (OSError, UnicodeDecodeError):
+                    continue     # unreadable or binary: left untouched
                 texts.append(otext)
+                movable.append(old)
+            renames_from = tuple(movable)
             if texts:
                 moved_original = texts[0]
                 if len(texts) > 1:
@@ -806,26 +798,13 @@ def apply_edits(root: Path, edits: list[Edit], backup: bool = True,
                     else:
                         text = body + "\n"
                     moved_original = ""       # nothing existed at the target
-            # The caller's note describes the placeholder block ("created
-            # with 1 line(s)"), which is misleading for a move: say how many
-            # lines the finished file actually has.
-            note += f" [{len(text.splitlines())} line(s) in the final file]"
+                note += f" [{len(text.splitlines())} line(s) in the final file]"
 
-        # Validate the FINAL text -- after a rename has folded the source's
-        # real bytes in. Validating the placeholder alone used to reject
-        # renames whose placeholder was a bare non-code comment (e.g. a plain
-        # "moved from old.py" line), and skipped checking the moved content
-        # entirely.
+        # Validate the FINAL text, after the moved bytes are folded in.
         err = _validate(path, text)
         if err and original is not None and _validate(path, original):
-            # The file did not parse BEFORE this edit either -- a stub written
-            # in the wrong language, a chunked write mid-stream, a broken
-            # file the task is about to fix. Refusing every edit of an
-            # already-broken file locks it in that state forever: each
-            # incremental repair "produces" a file that still does not parse,
-            # so the model can never chip away at the damage. Apply with a
-            # loud warning instead; backups and the review page still cover
-            # the change. A CLEAN file that an edit breaks is still refused.
+            # The file did not parse before this edit either; refusing would
+            # lock a broken file in that state forever. Apply with a warning.
             err = None
             note += (" [WARNING: this file does not parse -- it did not "
                      "before this edit either, so the edit was applied "
@@ -842,49 +821,41 @@ def apply_edits(root: Path, edits: list[Edit], backup: bool = True,
         sha = hashlib.sha256(moved_original.encode("utf-8")).hexdigest()
         if dry_run:
             return Result(True, rel, note + " (dry run)", diff, moved_original,
-                          text, sha, fuzzy=fuzzy, renames_from=tuple(renames_from))
+                          text, sha, fuzzy=fuzzy, renames_from=renames_from)
+
+        def _backup(src: Path, old_rel: str) -> None:
+            if backup_dir is not None:
+                fileio.backup_copy(src, backup_dir / old_rel)
+            else:
+                fileio.backup_copy(src, src.with_suffix(src.suffix + ".bak"),
+                                   keep_existing=False)
 
         if backup and original is not None:
-            if backup_dir is not None:
-                dest = backup_dir / rel
-                dest.parent.mkdir(parents=True, exist_ok=True)
-                fileio.write(dest, original, style)
-            else:
-                fileio.write(path.with_suffix(path.suffix + ".bak"), original, style)
+            _backup(path, rel)
 
-        # Renamed-in sources were backed up under their OLD path (below), so
-        # the snapshot dir can restore a rename by moving files back. A new
-        # file created from scratch has no bytes to preserve.
-        if renames_from:
-            for old in renames_from:
-                opath = root_resolved / old
-                try:
-                    otext, ostyle = fileio.read(opath, errors="strict")
-                except OSError:
-                    continue
+        # Sources are backed up under their OLD path so a snapshot restores a
+        # rename by moving files back.
+        for old in renames_from:
+            opath = root_resolved / old
+            try:
                 if backup:
-                    if backup_dir is not None:
-                        bdest = backup_dir / old
-                        bdest.parent.mkdir(parents=True, exist_ok=True)
-                        fileio.write(bdest, otext, ostyle)
-                    else:
-                        fileio.write(opath.with_suffix(
-                            opath.suffix + ".bak"), otext, ostyle)
-                try:
-                    opath.unlink()
-                except FileNotFoundError:
-                    pass
+                    _backup(opath, old)
+                opath.unlink()
+            except FileNotFoundError:
+                pass
 
+        path.parent.mkdir(parents=True, exist_ok=True)
         fileio.write(path, text, style)
         return Result(True, rel, note, diff, moved_original, text, sha,
-                      fuzzy=fuzzy, renames_from=tuple(renames_from))
+                      fuzzy=fuzzy, renames_from=renames_from)
 
     for rel, group in by_file.items():
-        path = (Path(root) / rel).resolve()
-        try:
-            path.relative_to(root_resolved)
-        except ValueError:
+        path = _resolve_inside(rel)
+        if path is None:
             results.append(Result(False, rel, "refusing to edit outside project root"))
+            continue
+        if path.is_dir():
+            results.append(Result(False, rel, "this path is a directory, not a file"))
             continue
 
         if rel in orphan_placeholders:
@@ -892,9 +863,8 @@ def apply_edits(root: Path, edits: list[Edit], backup: bool = True,
             continue
         if orphan_placeholders and all(not e.replace.strip() for e in group) \
                 and any(e.search.strip() for e in group):
-            # The other half of the refused placeholder pair. Applying it
-            # would delete lines from the live source while the destination
-            # stub was never written.
+            # The other half of a refused placeholder pair: applying it would
+            # delete lines from the live source with no destination written.
             results.append(Result(
                 False, rel,
                 "not applying this clearing block: it looks like the other "
@@ -904,181 +874,165 @@ def apply_edits(root: Path, edits: list[Edit], backup: bool = True,
                 "few real lines, the new path's SEARCH empty."))
             continue
 
-        srcs = tuple(o for o, n in renames.items() if n == rel)
-        # A rename whose SOURCE is the target itself (a self-pair that slipped
-        # past pairing rules) would read the placeholder back as "moved
-        # content" and then delete it -- a no-op at best, data loss at worst.
-        srcs = tuple(o for o in srcs if o != rel)
-        # A path can be BOTH a rename source and a creation target ("replace
-        # index.html with a new page, archive the old ones"). Its clear blocks
-        # were dropped above; only empty-SEARCH create blocks remain -- treat
-        # that as an overwrite creation rather than falling into the match
-        # loop below, which would fail against text the model never quoted.
-        leftover_creators = [e for e in group if not e.search.strip()]
-        if leftover_creators and len(leftover_creators) == len(group):
+        # A rename source equal to the target itself would read the placeholder
+        # back as "moved content" and delete it.
+        srcs = tuple(o for o, n in renames.items() if n == rel and o != rel)
+
+        # A group of only empty-SEARCH blocks is a creation or an overwrite
+        # (a path can be both a rename source and a creation target). Anchored
+        # blocks are line replacements and never part of this path.
+        creating = [e for e in group
+                    if not e.search.strip() and not _is_anchored(e)]
+        if creating and len(creating) == len(group):
             original = None
             if path.is_file():
                 original, _sty = fileio.read(path, errors="replace")
-            text = "\n".join(e.replace for e in leftover_creators)
-            if text and not text.endswith("\n"):
-                text += "\n"
-            path.parent.mkdir(parents=True, exist_ok=True)
+            text = _creation_text(group)
             note = f"created with {len(text.splitlines())} line(s)"
             if original is not None:
                 note = f"replaced contents ({len(original.splitlines())} -> {len(text.splitlines())} line(s))"
-            srcs_now = ()
-            if srcs:
-                # Only claim a rename if the source still exists at apply
-                # time; otherwise _finish's read fails silently and the note
-                # would promise a move that never happens.
-                srcs_now = tuple(o for o in srcs if (root_resolved / o).is_file())
-                gone = [o for o in srcs if o not in srcs_now]
-                if srcs_now:
-                    note += (" -- renamed from " + ", ".join(srcs_now) +
-                            " (the moved contents are appended after the new "
-                            "text; the old paths are removed)")
-                if gone:
-                    note += (" [already absent, nothing to move: " +
-                             ", ".join(gone) + "]")
+            # Claim only sources that still exist at apply time.
+            srcs_now = tuple(o for o in srcs if (root_resolved / o).is_file())
+            gone = [o for o in srcs if o not in srcs_now]
+            if srcs_now:
+                note += (" -- renamed from " + ", ".join(srcs_now) +
+                         " (the moved contents are appended after the new "
+                         "text; the old paths are removed)")
+            if gone:
+                note += (" [already absent, nothing to move: " +
+                         ", ".join(gone) + "]")
             results.append(_finish(rel, path, original, text, None, note,
                                    renames_from=srcs_now))
             continue
 
-        exists = path.exists()
-        if not exists:
-            # New-file creation: only empty-SEARCH blocks can do it. A model
-            # that re-emits the same `--- FILE:` header for each block is
-            # writing successive parts of ONE file, so the parts are
-            # concatenated in reply order below. A group mixing empty-SEARCH
-            # blocks with real searches is a failed edit against a file that
-            # isn't in the tree. Fuzzy matching does not apply here: with no
-            # existing content there is nothing to be similar to. The message
-            # must say which case it is, because "file not found" alone
-            # invites the model to answer by renaming files -- and Pedacito
-            # only honours that intent when the clear blocks match (see
-            # rename detection above).
-            creators = [e for e in group if not e.search.strip()]
-            if not creators or len(creators) != len(group):
-                hint = ""
-                if path.parent.is_dir():
-                    try:
-                        near = sorted(p.name for p in path.parent.iterdir()
-                                      if p.is_file())[:8]
-                    except OSError:
-                        near = []
-                    if near:
-                        hint = f" Files here: {', '.join(near)}."
-                results.append(Result(
-                    False, rel,
-                    "no edit matched: this path does not exist yet. To CREATE "
-                    "the file, emit exactly one block for it with an EMPTY "
-                    "SEARCH section (between <<<<<<< SEARCH and =======). "
-                    "To RENAME a file into this path, also emit a block for "
-                    "the old path whose SEARCH is its entire content and "
-                    "whose REPLACE is empty -- Pedacito will move the real "
-                    "contents and remove the old file." + hint))
-                continue
-            # One block per created file: a model that re-emits the same
-            # header for several create blocks was writing successive parts
-            # of ONE file, so concatenate their bodies in reply order (the
-            # same rule the all-creators overwrite branch above applies).
-            # Joining with "\n" never invents a blank line: parse_edits drops
-            # exactly one trailing newline from every body, so a complete
-            # block's terminator survives as the join character.
-            text = "\n".join(e.replace for e in creators)
-            if text and not text.endswith("\n"):
-                text += "\n"
-            path.parent.mkdir(parents=True, exist_ok=True)
-            note = f"created with {len(text.splitlines())} line(s)"
-            srcs_now = ()
-            if srcs:
-                # Same existence guard as the overwrite branch above.
-                srcs_now = tuple(o for o in srcs if (root_resolved / o).is_file())
-                gone = [o for o in srcs if o not in srcs_now]
-                if srcs_now:
-                    note += (" -- renamed from " + ", ".join(srcs_now) +
-                            " (the new file gets their current contents; the "
-                            "old paths are removed)")
-                if gone:
-                    note += (" [already absent, nothing to move: " +
-                             ", ".join(gone) + "]")
-            if _is_placeholder_only(text) and not srcs_now:
-                # The rename protocol says: create the NEW path with a tiny
-                # placeholder, then clear the OLD path with a full-content
-                # SEARCH / empty REPLACE; Pedacito moves the real bytes. When
-                # the clearing block is missing -- because the gather loop
-                # died at the output cap before the model could emit it -- the
-                # pairing above finds no source and this branch would write a
-                # few-token stub where a 26k-char file belongs. A truncated
-                # continuation reply can look EXACTLY like a placeholder
-                # (one short line), so refuse rather than half-rename: the
-                # old file stays untouched and the next turn re-asks.
-                results.append(Result(
-                    False, rel,
-                    "refusing to create this file: its content is only a "
-                    "placeholder comment and no rename source matched (no "
-                    "clearing block for an old path survived). If you are "
-                    "renaming a file, emit ONLY the empty-SEARCH creation "
-                    "block for the new path plus a block for the old path "
-                    "whose SEARCH is its entire content and whose REPLACE is "
-                    "empty -- Pedacito moves the real bytes; never copy them. "
-                    "If you mean to write this file's content yourself, put "
-                    "that content in REPLACE."))
-                continue
-            results.append(_finish(rel, path, None, text, None, note,
-                                   renames_from=srcs_now))
+        if not path.exists():
+            # A missing file can only be created by empty-SEARCH blocks; a
+            # mix with real searches is a failed edit against a file that is
+            # not in the tree. The message must say so: "file not found"
+            # alone invites the model to answer by renaming files.
+            hint = ""
+            if path.parent.is_dir():
+                try:
+                    near = sorted(p.name for p in path.parent.iterdir()
+                                  if p.is_file())[:8]
+                except OSError:
+                    near = []
+                if near:
+                    hint = f" Files here: {', '.join(near)}."
+            results.append(Result(
+                False, rel,
+                "no edit matched: this path does not exist yet. To CREATE "
+                "the file, emit exactly one block for it with an EMPTY "
+                "SEARCH section (between <<<<<<< SEARCH and =======). "
+                "To RENAME a file into this path, also emit a block for "
+                "the old path whose SEARCH is its entire content and "
+                "whose REPLACE is empty -- Pedacito will move the real "
+                "contents and remove the old file." + hint))
             continue
 
-        # LF-normalised for matching; style remembered so the file is written
-        # back exactly as it was found. The path's blocks apply IN ORDER,
-        # each anchored against the text the previous one produced, and the
-        # file is written (or refused) once at the end -- so several small
-        # blocks for one file, the shape the answer protocol asks for, land
-        # as a single cumulative change and a single Result.
-        original, style = fileio.read(path, errors="strict")
+        # The path's blocks apply IN ORDER, each anchored against the text the
+        # previous one produced; the file is written (or refused) once at the end.
+        try:
+            original, style = fileio.read(path, errors="strict")
+        except UnicodeDecodeError:
+            results.append(Result(False, rel, "file is not valid UTF-8; "
+                                  "refusing to edit it as text"))
+            continue
+        except OSError as e:
+            results.append(Result(False, rel, f"could not read file: {e}"))
+            continue
         text = original
         failed = False
-        any_fuzzy = False
         fuzzy_blocks: list[int] = []
+        # Anchored blocks resolve to (a, b) here for failure messages, and
+        # are rewritten to exact-text needles taken from the ORIGINAL file,
+        # so an earlier block in the same group cannot shift their lines and
+        # an externally drifted file still matches via locate()/fuzzy.
+        anchored: dict[int, tuple[int, int]] = {}
         for k, e in enumerate(group, 1):
+            if _is_anchored(e):
+                if not e.lines:
+                    results.append(Result(
+                        False, rel,
+                        f"block {k}: SYMBOL anchor '{e.symbol}' could not be "
+                        "resolved to a definition in this file; `read` the "
+                        "symbol and emit the block with LINES <start>-<end> "
+                        "instead"))
+                    failed = True
+                    break
+                a, b = e.lines
+                lspan = _line_span(original, a, b)
+                if lspan is None:
+                    results.append(Result(
+                        False, rel,
+                        f"block {k}: line range {a}-{b} is out of bounds -- "
+                        f"this file has {len(original.splitlines())} line(s); "
+                        "`read` it again and emit current line numbers"))
+                    failed = True
+                    break
+                anchored[k] = (a, b)
+                needle = original[lspan[0]:lspan[1]]
+                if not needle.strip():
+                    # A blank-lines-only needle would fall into the
+                    # empty-SEARCH whole-text branch below; refuse instead.
+                    results.append(Result(
+                        False, rel,
+                        f"block {k}: line range {a}-{b} is only blank lines -- "
+                        "widen the anchored range to include real code so it "
+                        "can be located"))
+                    failed = True
+                    break
+                repl = e.replace
+                if repl and needle.endswith("\n") and not repl.endswith("\n"):
+                    repl += "\n"
+                e = Edit(e.file, needle, repl)
             if not e.search.strip():
-                # An empty SEARCH replaces the WHOLE file (the documented
-                # stub-implementing protocol). A group of nothing but those
-                # is handled by the overwrite branch above; this catches one
-                # mixed in with real edits, where it resets the text that
-                # later blocks anchor against.
+                # An empty SEARCH mixed in with real edits replaces the WHOLE
+                # text that later blocks anchor against.
                 text = e.replace if not e.replace or e.replace.endswith("\n") \
                     else e.replace + "\n"
                 continue
             span = locate(text, e.search, cfg, replacement=e.replace)
             if span is None:
                 n = text.count(e.search)
-                why = ("search block not found -- it must match the file "
-                       "exactly. If this block was meant to replace the "
-                       "WHOLE file, do not quote the old text at all: emit "
-                       "one block for the file with an EMPTY SEARCH section "
-                       "(nothing between <<<<<<< SEARCH and =======)"
-                       if n == 0 else
-                       f"search block appears {n} times -- include more surrounding lines")
+                if k in anchored:
+                    a, b = anchored[k]
+                    why = (f"anchored range LINES {a}-{b} cannot be applied: "
+                           + ("an earlier block in this reply already changed "
+                              "those lines" if n == 0 else
+                              f"its text appears {n} times in the file -- "
+                              "widen the range until it is unique, or emit a "
+                              "SEARCH block with more context"))
+                else:
+                    why = ("search block not found -- it must match the file "
+                           "exactly. If this block was meant to replace the "
+                           "WHOLE file, do not quote the old text at all: emit "
+                           "one block for the file with an EMPTY SEARCH section "
+                           "(nothing between <<<<<<< SEARCH and =======)"
+                           if n == 0 else
+                           f"search block appears {n} times -- include more "
+                           "surrounding lines")
+                    if n == 0:
+                        # Show where the text most nearly matches, with real
+                        # line numbers, so the re-anchor is copyable.
+                        why += _closest_hint(text, e.search, cfg)
                 results.append(Result(False, rel, f"block {k}: {why}"))
                 failed = True
                 break
-            start, stop, replacement, fuzzy = span.start, span.stop, span.replacement, span.fuzzy
-            text = text[:start] + replacement + text[stop:]
-            if fuzzy:
-                any_fuzzy = True
+            text = text[:span.start] + span.replacement + text[span.stop:]
+            if span.fuzzy:
                 fuzzy_blocks.append(k)
 
         if failed:
             continue
 
         note = f"applied {len(group)} block(s)"
-        if any_fuzzy:
+        if fuzzy_blocks:
             note += (" [matched approximately on block"
                      + ("s " if len(fuzzy_blocks) > 1 else " ")
                      + ", ".join(str(b) for b in fuzzy_blocks)
                      + "; review the diff carefully]")
         results.append(_finish(rel, path, original, text, style, note,
-                               fuzzy=any_fuzzy))
+                               fuzzy=bool(fuzzy_blocks)))
 
     return results

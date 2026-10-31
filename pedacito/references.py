@@ -1,33 +1,18 @@
 """Structural chunking for non-Python reference files (config, data, docs, HTML).
 
-Usage
------
-    from .references import chunk_reference
-
     chunks = chunk_reference("data/config.csv", Path("data/config.csv"))
-    chunks = chunk_reference("site/index.html", Path("site/index.html"))
 
-These files are not parsed as code. The goal is that the model knows a
-`config.csv` exists, what columns it has, and roughly how big it is, so it
-can `read` or `grep` it when a task actually depends on it -- indexing the
-full *contents* of a 50,000-row CSV would be pointless and would overwhelm
-the map. So each reference file gets one or a few structural chunks: enough
-shape to decide whether to look closer, each with a real line range so
-`read` still works against the original file.
-
-The chunking strategy is chosen by file extension: CSV/TSV get a column
-summary and sample rows; JSON gets its top-level key/item shape; INI/TOML get
-one chunk per [section]; Markdown/RST get one chunk per heading; HTML gets
-one chunk per top-level landmark element (header, nav, main, section,
-article, aside, footer, form), with the id/class that identifies it and the
-first heading text inside as a label; anything else falls back to fixed-size
-line blocks.
+These files are not parsed as code. Each gets one or a few chunks that show its
+shape (columns, keys, sections, headings) with real line ranges, so the model
+can decide whether to `read` or `grep` it. Strategy by extension: CSV/TSV
+column summary; JSON top-level shape; INI/TOML sections; Markdown/RST
+headings; HTML landmark elements; YAML top-level keys; SQL statements; shell
+functions; anything else fixed-size line blocks.
 """
 
 from __future__ import annotations
 
 import csv
-import hashlib
 import io
 import json
 import re
@@ -35,35 +20,21 @@ from html.parser import HTMLParser
 from pathlib import Path
 
 from . import fileio
-from .chunker import Chunk
+from .chunker import Chunk, _sha, split_lines
 
 HEADING_RE = re.compile(r"^(#{1,6})\s+(.+?)\s*#*$")
 INI_SECTION_RE = re.compile(r"^\s*\[([^\]]+)\]")
-TOML_KEY_RE = re.compile(r"^\s*([A-Za-z_][\w.-]*)\s*=")
 BLOCK_LINES = 150   # fallback chunk size, in lines, for unstructured text
 
-# HTML landmark elements: their presence at the top level of <body> gives the
-# page a structure worth exposing. Nested landmarks are treated as detail
-# within their containing section, not as peer sections -- a <section> inside
-# a <main> belongs to the main section's chunk, not its own. That keeps the
-# card readable and the chunk count sane on real pages.
+# HTML landmark elements. Only top-level ones become chunks; nested landmarks
+# belong to their containing section.
 HTML_LANDMARKS = {
     "header", "nav", "main", "section", "article", "aside",
     "footer", "form", "figure", "details", "dialog", "template",
 }
 HTML_HEADINGS = {"h1", "h2", "h3", "h4", "h5", "h6"}
-# Elements whose text content is code, not prose: skip their data when
-# collecting heading text (which otherwise would pick up a stray string
-# from an inline <script>).
+# Elements whose text is code, not prose (skipped when collecting headings).
 HTML_RAW = {"script", "style"}
-
-
-# --------------------------------------------------------------------------
-# Chunk construction helper
-# --------------------------------------------------------------------------
-def _sha(t: str) -> str:
-    """Short content hash used to detect whether a chunk's text has changed."""
-    return hashlib.sha256(t.encode("utf-8", "replace")).hexdigest()[:16]
 
 
 def _mk(rel: str, qualname: str, start: int, end: int, sig: str,
@@ -75,13 +46,10 @@ def _mk(rel: str, qualname: str, start: int, end: int, sig: str,
                  signature=sig, docline=docline, source=src, sha=_sha(src or sig + docline))
 
 
-# --------------------------------------------------------------------------
-# Per-format chunkers (internal)
-# --------------------------------------------------------------------------
 def _tabular(rel: str, text: str, delim: str) -> list[Chunk]:
     """CSV/TSV: one chunk summarising column names, row count, and two sample
     rows, so the model can see the shape without reading the whole table."""
-    lines = text.splitlines()
+    lines = split_lines(text)
     if not lines:
         return []
     try:
@@ -104,7 +72,7 @@ def _tabular(rel: str, text: str, delim: str) -> list[Chunk]:
 def _structured(rel: str, text: str) -> list[Chunk]:
     """JSON: one chunk describing the top-level shape (object keys, array
     item type, or scalar type)."""
-    lines = text.splitlines()
+    lines = split_lines(text)
     try:
         data = json.loads(text)
     except (json.JSONDecodeError, ValueError):
@@ -127,7 +95,7 @@ def _structured(rel: str, text: str) -> list[Chunk]:
 
 def _sectioned(rel: str, text: str, rx: re.Pattern, label: str) -> list[Chunk]:
     """INI/TOML-style files: one chunk per [section], with real line ranges."""
-    lines = text.splitlines()
+    lines = split_lines(text)
     marks = [(i, m.group(1)) for i, line in enumerate(lines, 1)
              if (m := rx.match(line))]
     if not marks:
@@ -143,7 +111,7 @@ def _sectioned(rel: str, text: str, rx: re.Pattern, label: str) -> list[Chunk]:
 def _headed(rel: str, text: str) -> list[Chunk]:
     """Markdown/RST: one chunk per heading, falling back to fixed-size blocks
     if no headings are found."""
-    lines = text.splitlines()
+    lines = split_lines(text)
     marks = [(i, m.group(1), m.group(2)) for i, line in enumerate(lines, 1)
              if (m := HEADING_RE.match(line))]
     if not marks:
@@ -172,25 +140,10 @@ def _blocks(rel: str, lines: list[str], label: str) -> list[Chunk]:
     return out
 
 
-# --------------------------------------------------------------------------
-# HTML (outline-based structural chunking)
-# --------------------------------------------------------------------------
 class _HtmlOutline(HTMLParser):
-    """Streaming HTML walker that records, in order:
-
-      * top-level landmark elements (header/nav/main/section/...) with their
-        line range and their id or class, so a chunk can be labelled
-        meaningfully
-      * every heading, so a section's label can be its own first heading
-      * external dependencies (script src, stylesheet href), which are the
-        first thing you'd want to know about a page you haven't read
-
-    Nothing about text content beyond the title is kept: this is the same
-    "shape, not contents" contract the other reference chunkers honour.
-    Standard-library `html.parser` is tolerant enough for the purpose --
-    real-world HTML is rarely fully well-formed and this still produces a
-    useful outline around the broken bits.
-    """
+    """Streaming HTML walker recording top-level landmark elements (line
+    range, id, class), every heading, external script/stylesheet
+    dependencies, and the title. No other text content is kept."""
 
     def __init__(self):
         super().__init__(convert_charrefs=True)
@@ -204,14 +157,11 @@ class _HtmlOutline(HTMLParser):
         self._heading: dict | None = None    # currently open heading
         self._heading_buf: list[str] = []
 
-    # -- start tags --------------------------------------------------------
     def handle_starttag(self, tag, attrs):
         attrs = dict(attrs)
         line = self.getpos()[0]
         if tag in HTML_RAW:
             self._in_raw += 1
-            # Record the src/href of scripts and stylesheets as deps, but
-            # don't descend into their text -- it's code, not outline.
             if tag == "script" and attrs.get("src"):
                 self.deps["script"].append(attrs["src"])
             return
@@ -231,7 +181,6 @@ class _HtmlOutline(HTMLParser):
                 "class": attrs.get("class", ""),
             })
 
-    # -- end tags ----------------------------------------------------------
     def handle_endtag(self, tag):
         if tag in HTML_RAW:
             self._in_raw = max(0, self._in_raw - 1)
@@ -244,14 +193,12 @@ class _HtmlOutline(HTMLParser):
             self.headings.append(self._heading)
             self._heading = None
             return
-        # A landmark close: only pop if it matches the top of the stack, so
-        # a stray </section> doesn't silently drop an <article>.
+        # only pop on a match, so a stray </section> can't drop an <article>
         if self._stack and self._stack[-1]["tag"] == tag:
             node = self._stack.pop()
             node["end"] = self.getpos()[0]
             self.sections.append(node)
 
-    # -- text --------------------------------------------------------------
     def handle_data(self, data):
         if self._in_raw:
             return
@@ -263,13 +210,9 @@ class _HtmlOutline(HTMLParser):
         if self._heading is not None:
             self._heading_buf.append(text)
 
-    # -- finish ------------------------------------------------------------
     def close(self):
         super().close()
-        # Landmarks left unclosed at EOF (a malformed or truncated file):
-        # close them at the last line we know about rather than silently
-        # losing the section. Same spirit as tree-sitter's error-tolerant
-        # parse -- degrade, don't refuse.
+        # close landmarks left open at EOF at the last known line
         last = 1
         for s in self.sections:
             last = max(last, s.get("end", s["line"]))
@@ -283,13 +226,11 @@ class _HtmlOutline(HTMLParser):
 
 
 def _html(rel: str, text: str) -> list[Chunk]:
-    """HTML: one chunk per top-level landmark element, plus a document
-    header chunk carrying the title and external dependencies. Falls back to
-    heading-based splitting when the file has headings but no landmarks, and
-    to fixed-size line blocks when it has neither (a bare fragment, a
-    minified one-liner, or a `<div>`-soup template).
+    """HTML: one chunk per top-level landmark element plus a document header
+    chunk (title, dependencies). Falls back to heading-based splitting, then
+    to fixed-size line blocks when there are no landmarks/headings.
     """
-    lines = text.splitlines()
+    lines = split_lines(text)
     nlines = len(lines)
     if nlines < 3:
         return _blocks(rel, lines, "html")
@@ -299,8 +240,7 @@ def _html(rel: str, text: str) -> list[Chunk]:
         parser.feed(text)
         parser.close()
     except Exception:
-        # html.parser can raise on pathological input; fall back rather than
-        # refusing to index the file at all.
+        # html.parser can raise on pathological input
         return _blocks(rel, lines, "html")
 
     if not parser.sections and parser.headings:
@@ -311,9 +251,7 @@ def _html(rel: str, text: str) -> list[Chunk]:
     chunks: list[Chunk] = []
     headings = sorted(parser.headings, key=lambda h: h["line"])
 
-    # -- document header chunk: title, deps, everything above the first
-    # -- landmark. On a typical page that's <!doctype>, <head>, and the
-    # -- opening <body> -- exactly the "what is this page" summary.
+    # document header: title, deps, everything above the first landmark
     first = parser.sections[0]["line"]
     head_end = max(1, first - 1)
     deps_bits = []
@@ -330,17 +268,17 @@ def _html(rel: str, text: str) -> list[Chunk]:
         "\n".join(lines[:head_end]),
     ))
 
-    # -- landmark sections --
+    # landmark sections
     for sec in parser.sections:
         start = sec["line"]
         end = max(start, sec.get("end", start))
-        # Label with the first heading inside the section, if any.
+        # label: first heading inside the section
         label = ""
         for h in headings:
             if start <= h["line"] <= end:
                 label = f"{h['tag'].upper()}: {h['text'][:80]}"
                 break
-        # Signature: the tag with its id (preferred) or first classes.
+        # signature: tag with its id (preferred) or first classes
         sig = f"<{sec['tag']}"
         if sec["id"]:
             sig += f' id="{sec["id"]}"'
@@ -349,14 +287,13 @@ def _html(rel: str, text: str) -> list[Chunk]:
             sig += f' class="{",".join(classes)}"'
         sig += ">"
         qual = sec["id"] or sec["tag"]
-        # Disambiguate when a page has two sections with the same id or two
-        # anonymous <section> tags: chunk keys must be unique per file.
+        # chunk keys must be unique per file
         if any(c.qualname == qual for c in chunks):
             qual = f"{qual}#{start}"
         body = "\n".join(lines[start - 1:end])
         chunks.append(_mk(rel, qual, start, end, sig, label, body))
 
-    # -- trailing content after the last landmark --
+    # trailing content after the last landmark
     last_end = max(s.get("end", s["line"]) for s in parser.sections)
     if last_end < nlines:
         body = "\n".join(lines[last_end:])
@@ -367,12 +304,8 @@ def _html(rel: str, text: str) -> list[Chunk]:
 
 
 def _html_heading_split(rel: str, text: str, headings: list[dict]) -> list[Chunk]:
-    """Fallback for landmark-less HTML: split on headings, the way markdown
-    is split. A page that is a linear run of <h1>/<h2>/<p> has no landmark
-    structure to show, but its heading hierarchy still tells the model where
-    things are.
-    """
-    lines = text.splitlines()
+    """Fallback for landmark-less HTML: split on headings, like markdown."""
+    lines = split_lines(text)
     nlines = len(lines)
     headings = sorted(headings, key=lambda h: h["line"])
     out: list[Chunk] = []
@@ -393,9 +326,6 @@ def _html_heading_split(rel: str, text: str, headings: list[dict]) -> list[Chunk
     return out
 
 
-# --------------------------------------------------------------------------
-# Public API
-# --------------------------------------------------------------------------
 _YAML_KEY_RE = re.compile(
     r"^([A-Za-z_][\w.-]*|\"[^\"]+\"|'[^']+')\s*:")
 _SHELL_FUNC_RE = re.compile(
@@ -411,7 +341,7 @@ _SQL_OBJECT_RE = re.compile(
 
 def _yaml(rel: str, text: str) -> list[Chunk]:
     """Top-level YAML keys as sections (no YAML parser dependency)."""
-    lines = text.splitlines()
+    lines = split_lines(text)
     nlines = len(lines)
     keys: list[tuple[int, str]] = []
     for i, line in enumerate(lines, 1):
@@ -438,7 +368,7 @@ def _yaml(rel: str, text: str) -> list[Chunk]:
 def _sql(rel: str, text: str) -> list[Chunk]:
     """SQL statements split on a trailing semicolon (quotes respected enough
     for the common schema/query files Pedacito indexes)."""
-    lines = text.splitlines()
+    lines = split_lines(text)
     nlines = len(lines)
     spans: list[tuple[int, int]] = []
     start = 1
@@ -480,7 +410,7 @@ def _sql(rel: str, text: str) -> list[Chunk]:
 
 def _shell(rel: str, text: str) -> list[Chunk]:
     """Shell/PowerShell function definitions, plus header/trailing blocks."""
-    lines = text.splitlines()
+    lines = split_lines(text)
     nlines = len(lines)
     funcs: list[tuple[int, str]] = []
     for i, line in enumerate(lines, 1):
@@ -510,18 +440,14 @@ def _shell(rel: str, text: str) -> list[Chunk]:
 
 def chunk_reference(rel: str, path: Path, max_bytes: int = 2_000_000) -> list[Chunk]:
     """Produce structural chunks for one non-Python file, dispatching on its
-    extension to the appropriate chunker above.
-
-    Files larger than `max_bytes` are never read in full: only a header chunk
-    noting the file's size is produced, since the model can still `read` or
-    `grep` the file directly if a task needs it.
+    extension. Files larger than `max_bytes` are never read in full: they get
+    a single header chunk noting the size.
     """
     try:
         size = path.stat().st_size
     except OSError:
         return []
     if size > max_bytes:
-        # Header only. Enough to know it exists and roughly what it contains.
         with path.open("rb") as fh:
             head = b"".join(next(fh, b"") for _ in range(5)).decode("utf-8", "replace")
         return [_mk(rel, "content", 1, 0,
@@ -551,4 +477,4 @@ def chunk_reference(rel: str, path: Path, max_bytes: int = 2_000_000) -> list[Ch
         return _sql(rel, text)
     if ext in (".sh", ".bash", ".zsh", ".ksh", ".ps1"):
         return _shell(rel, text)
-    return _blocks(rel, text.splitlines(), ext.lstrip(".") or "text")
+    return _blocks(rel, split_lines(text), ext.lstrip(".") or "text")

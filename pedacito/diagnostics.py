@@ -1,34 +1,34 @@
 """Project diagnostics: run the linter/type checker the repository already uses.
 
-Usage
------
-    from . import diagnostics
-
     ok, report = diagnostics.run(root, cfg, files=["src/app.py"])
     ok, report = diagnostics.run_changed(root, cfg, changed_files)
 
-This is deliberately a thin, deterministic layer over tools that are already
-installed. Pedacito does not bundle a linter and does not guess a project's
-style; it detects the common ones and runs them through the same bounded
-process runner as `run`. A project with no detected checker is a no-op, not a
-failure.
+    baseline = diagnostics.quick_findings(root, files)   # before the task
+    ...apply edits...
+    new = diagnostics.new_findings(baseline, diagnostics.quick_findings(root, files))
 
-Detection (first match per language, cheapest/most focused first):
+A thin layer over tools that are already installed: nothing is bundled, and a
+project with no detected checker is a no-op, not a failure. Checks run through
+the bounded process runner (`proc`). Linting only the changed files keeps the
+feedback short for small models. `quick_findings` is the cheap per-file pass
+the post-edit feedback loop uses (one linter run per changed file, or a syntax
+parse when no linter is installed); `new_findings` diffs it against a baseline
+so only problems the edits introduced are reported back.
 
-    Python   ruff check --output-format concise [files|.]
-             pyflakes / flake8 as fallbacks
-    JS/TS    package.json "lint" script, else tsc --noEmit when tsconfig exists
+Detection (first match per language):
+
+    Python   ruff check --output-format concise [files|.]; pyflakes, flake8
+    JS/TS    package.json "lint" script, else tsc --noEmit when tsconfig
+             exists, else eslint on the given files
     Rust     cargo check --message-format short
     Go       go vet ./...
     Ruby     rubocop (only when a Gemfile/.rubocop.yml is present)
-
-File targeting matters for small models: linting only the changed file keeps
-the feedback short and avoids burying the actual error in pre-existing noise.
 """
 
 from __future__ import annotations
 
 import json
+import re
 import shutil
 from dataclasses import dataclass
 from pathlib import Path
@@ -69,7 +69,7 @@ def _package_scripts(root: Path) -> dict:
 
 
 def detect(root, files: list[str] | None = None) -> list[Check]:
-    """Return the checks applicable to this project (or these files)."""
+    """The checks applicable to this project (or these files)."""
     root = Path(root)
     checks: list[Check] = []
     files = list(files or [])
@@ -86,7 +86,7 @@ def detect(root, files: list[str] | None = None) -> list[Check]:
         elif _which("pyflakes"):
             checks.append(Check("pyflakes", ["pyflakes", *targets]))
         elif _which("flake8"):
-            checks.append(Check("flake8", *targets))
+            checks.append(Check("flake8", ["flake8", *targets]))
 
     if _has(root, "package.json"):
         scripts = _package_scripts(root)
@@ -110,17 +110,9 @@ def detect(root, files: list[str] | None = None) -> list[Check]:
     return checks
 
 
-def available(root) -> list[str]:
-    """Labels of the checks that would run, without executing anything."""
-    return [c.label for c in detect(root)]
-
-
 def run(root, cfg=None, files: list[str] | None = None) -> tuple[bool, str]:
-    """Run every detected check. Returns (passed, report).
-
-    No detected checker is a pass with an explanatory report: absence of a
-    linter must not fail a task.
-    """
+    """Run every detected check. Returns (passed, report). No detected
+    checker is a pass: absence of a linter must not fail a task."""
     root = Path(root)
     checks = detect(root, files)
     if not checks:
@@ -155,3 +147,112 @@ def run(root, cfg=None, files: list[str] | None = None) -> tuple[bool, str]:
 def run_changed(root, cfg, changed: list[str] | None = None) -> tuple[bool, str]:
     """Convenience wrapper for the automatic post-edit check."""
     return run(root, cfg, files=list(changed or []))
+
+
+# ---------------------------------------------------------------------------
+# Quick per-file checks + baseline diff (the post-edit feedback loop)
+# ---------------------------------------------------------------------------
+# Per-file timeout: this runs inline after every applied edit, so it must stay
+# far below the project-wide diagnostics_timeout.
+_QUICK_TIMEOUT = 30
+
+# "path:12:3:" / "path:12:" prefixes and bare "line 12" mentions: positions
+# shift when lines are inserted above, so the baseline diff ignores them.
+_POS_PREFIX_RE = re.compile(r"^\S+?:\d+(?::\d+)?:\s*")
+_LINE_WORD_RE = re.compile(r"\bline \d+\b")
+
+
+def _norm_finding(line: str) -> str:
+    """A finding with its positions erased, for baseline comparison."""
+    s = _POS_PREFIX_RE.sub("", line.strip())
+    s = _LINE_WORD_RE.sub("line N", s)
+    return s.strip() or line.strip()
+
+
+def _quick_python(root: Path, rel: str) -> list[str]:
+    """One Python file: the first installed linter run on just that file, else
+    a plain ast.parse. Finding lines keep their `rel:line:col:` prefix."""
+    for argv in (("ruff", "check", "--output-format", "concise"),
+                 ("pyflakes",),
+                 ("flake8",)):
+        if not _which(argv[0]):
+            continue
+        _rc, out, stopped, _secs = proc.run(
+            [*argv, rel], cwd=root, timeout=_QUICK_TIMEOUT,
+            idle_timeout=0, max_output=20000)
+        if stopped in ("timeout", "error"):
+            return []          # an unusable linter must not block edits
+        return [ln.strip() for ln in (out or "").splitlines() if ln.strip()]
+    import ast
+    try:
+        src = (root / rel).read_text(encoding="utf-8", errors="replace")
+        ast.parse(src)
+    except SyntaxError as e:
+        return [f"{rel}:{e.lineno or 0}: syntax error: {e.msg} (line {e.lineno})"]
+    except (OSError, ValueError):
+        return []
+    return []
+
+
+def _quick_js(root: Path, rel: str) -> list[str]:
+    """One JS/TS file: the tree-sitter syntax check used by edits._validate."""
+    from .chunker_ts import LANG_BY_EXT, TS_AVAILABLE, has_syntax_error
+    lang = LANG_BY_EXT.get(Path(rel).suffix.lower())
+    if not lang or not TS_AVAILABLE:
+        return []
+    try:
+        text = (root / rel).read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return []
+    bad, lineno = has_syntax_error(text, lang)
+    if bad:
+        return [f"{rel}:{lineno or 0}: syntax error (parse failed, "
+                f"line {lineno})"]
+    return []
+
+
+def quick_findings(root, files: list[str]) -> dict[str, list[str]]:
+    """Cheap per-file syntax/lint findings as {rel: [finding lines]}.
+
+    Python files go to the first installed linter (ruff, pyflakes, flake8)
+    scoped to that one file, falling back to ast.parse; JS/TS files get the
+    tree-sitter syntax check. Other languages have no cheap per-file checker
+    and are skipped. Never raises; an unreadable file maps to no findings."""
+    root = Path(root)
+    out: dict[str, list[str]] = {}
+    for rel in files or []:
+        rel = str(rel).strip()
+        if not rel:
+            continue
+        suffix = Path(rel).suffix.lower()
+        try:
+            if suffix in (".py", ".pyi"):
+                out[rel] = _quick_python(root, rel)
+            elif suffix in (".js", ".jsx", ".mjs", ".cjs", ".ts", ".tsx"):
+                out[rel] = _quick_js(root, rel)
+        except Exception:
+            out[rel] = []
+    return out
+
+
+def new_findings(baseline: dict[str, list[str]],
+                 current: dict[str, list[str]]) -> dict[str, list[str]]:
+    """Findings in `current` whose normalised text is absent from `baseline`
+    (per file): only problems the edits introduced, never pre-existing ones
+    whose line numbers shifted."""
+    out: dict[str, list[str]] = {}
+    for rel, items in current.items():
+        old = {_norm_finding(x) for x in baseline.get(rel, [])}
+        extra = [x for x in items if _norm_finding(x) not in old]
+        if extra:
+            out[rel] = extra
+    return out
+
+
+def render_findings(found: dict[str, list[str]], cap: int = 4000) -> str:
+    """The finding lines as feedback text, bounded."""
+    lines = [it for items in found.values() for it in items]
+    text = "\n".join(lines)
+    if len(text) > cap:
+        text = text[:cap].rstrip() + "\n[... more findings truncated]"
+    return text

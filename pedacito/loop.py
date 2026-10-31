@@ -1,26 +1,10 @@
 """The autonomous outer loop (`pedacito auto`): a Ralph loop over a task list.
 
-This is the piece that turns Pedacito from a single-shot tool into a
-full-featured coding agent. ``ask`` and ``chat`` run ONE task end to end
-(the *inner* loop: gather -> answer -> apply). ``auto`` wraps that in the
-*outer* loop the Ralph pattern describes:
-
-    pick the next unchecked task -> run it in a FRESH agent/context ->
-    verify (optional) -> mark it done in the plan file -> repeat.
-
-State lives in a plan file on disk (a markdown checklist), not in any
-conversation. Every task starts with a brand-new ``Agent`` and therefore a
-clean context window; what survives between iterations is only what the
-model wrote: the code, git history, and the checkbox it just ticked. That is
-the whole trick -- and the reason long autonomous runs do not rot the way a
-single ever-growing session does.
-
-Nothing here re-implements the inner loop: it calls the same ``gather`` /
-``answer`` / ``apply`` path as ``ask``, so an ``auto`` task gets the identical
-edit anchoring, repair rounds, backups, and session logging as a hand-typed
-one. The plan/task-list file is deliberately plain markdown so a human can
-edit it mid-run, and the loop just picks up the next unchecked line on the
-next pass.
+``ask`` and ``chat`` run ONE task through the inner loop (gather -> answer ->
+apply). ``auto`` wraps that in an outer loop: pick the next unchecked task in
+the plan file, run it with a FRESH agent/context, optionally verify, tick it
+off, repeat. State lives in the plan file (a plain markdown checklist a human
+can edit mid-run), not in any conversation.
 
 Usage
 -----
@@ -41,57 +25,49 @@ import time
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 
+from . import diagnostics, workspace
 from . import index as index_mod
 from . import instructions as instructions_mod
+from . import proc as proc_mod
 from . import review as review_mod
 from . import todo as todo_mod
-from . import workspace
 from .edits import parse_edits
 from .llm import LLMError
 
 # A task line in the plan file: `- [ ] do the thing` / `- [x] done thing`.
-# `*` bullets are accepted too. The space in the box (or `x`) is captured as
-# group 2; group 3 is the task text.
+# `*` bullets are accepted too. Group 2 is the box character, group 3 the text.
 _TASK_LINE = re.compile(r"^(\s*[-*]\s*)\[([ xX])\]\s*(.*)$")
 
 PLAN_HEADER = "# Plan\n\n"
 
+_NOOP_PHRASES = (
+    "no change", "nothing to", "nothing needs", "already ", "no edit",
+    "no code change", "no code edit", "leave as", "as-is",
+)
+
 
 def _is_noop(reply: str) -> bool:
-    """True when a task produced no edit blocks because there is nothing to
-    do -- the model read the file and reported it already complete. Only
-    consulted when NO edit applied, so an accidental match cannot mask a real
-    failure that did produce blocks; a genuinely empty/errored reply has none
-    of this language and still counts as a failure."""
+    """True when a zero-edit reply says there is nothing to do (the work is
+    already complete). Only consulted when NO edit applied."""
     low = (reply or "").lower()
-    return any(p in low for p in (
-        "no changes", "no change", "nothing to", "nothing needs",
-        "already ", "is already", "no edit", "no code change",
-        # "no code edit": run 13d's first repair reply -- "No code edit
-        # is appropriate here" -- matched NONE of the patterns above
-        # ("no edit" needs the words adjacent), so the honest refusal
-        # fell into the re-ask loop instead of the no-op path.
-        "no code edit", "leave as", "as-is", "already exists",
-        "already correct",
-    ))
+    return any(p in low for p in _NOOP_PHRASES)
 
 
 def _normalized_reply(reply: str) -> str:
-    """Lowercase with the apostrophe styles models emit folded to ASCII, so
-    refusal/incomplete phrasing matches whatever quoting came back. Local
-    servers often double-encode UTF-8: the right single quote (U+2019) shows
-    up as "â" ("canât"), which naive regexes silently miss."""
+    """Lowercase with apostrophe styles folded to ASCII, so refusal/incomplete
+    phrasing matches whatever quoting came back. Local servers sometimes
+    double-encode UTF-8, turning U+2019 into "â" plus stray characters."""
     return ((reply or "").lower()
             .replace("\u2019", "'")
+            .replace("â\u20ac\u2122", "'")
+            .replace("â\x80\x99", "'")
             .replace("â", "'"))
 
 
-# A reply that OPENS by declaring it made no edit. Narrow on purpose -- the
-# caller uses this to DISCARD edit blocks the same reply contains, so only
-# bare refusals count: "No edit.", "No edits were made:", "I did not edit
-# any file". Deliberately NOT matched: "No changes were needed in main.js;
-# I fixed index.html instead." -- a qualifier after the phrase means the
-# sentence is about one file, not a refusal to have edited at all.
+# A reply that OPENS by declaring it made no edit ("No edit.", "No edits were
+# made:", "I did not edit any file"). Narrow on purpose: the caller DISCARDS
+# the edit blocks of such a reply. A qualified sentence ("No changes were
+# needed in main.js; I fixed index.html instead.") is not a refusal.
 _EDIT_REFUSAL_HEAD_RE = re.compile(
     r"^(?:[#*\-\s]*)"
     r"(?:no\s+(?:edits?|changes?|code\s+changes?)"
@@ -108,21 +84,14 @@ def _edit_refusal_head(reply: str) -> str:
     return m.group(0).strip() if m else ""
 
 
-# Zero-edit replies that DECLARE THE WORK NOT DONE -- as opposed to _is_noop's
-# legitimate "nothing to do". Graveyard-run task 4 ("Move each file identified
-# as dead code into the 'graveyard' folder") answered "I can't safely emit the
-# move blocks yet ... To continue, the first 3-5 lines of each file must be
-# read ... I won't guess" with ZERO edits -- and an incidental "graveyard/ has
-# already been created" (a PRIOR task's work) matched _is_noop, ticking the
-# move done. The plan then reported a move that never happened; only the third
-# verify session caught the empty graveyard. Matched on _normalized_reply.
+# Zero-edit replies that DECLARE THE WORK NOT DONE ("I can't safely emit the
+# move blocks yet ... to continue, the files must be read"), as opposed to
+# _is_noop's "nothing to do". Matched on _normalized_reply.
+_INCOMPLETE_VERBS = (r"(?:emit|apply|make|produce|write|complete|finish|move|"
+                     r"create|edit|proceed|continue|do)\b")
 _INCOMPLETE_RES = (
-    re.compile(r"\bcan(?:not|'t)\s+(?:\w+\s+){0,3}?"
-               r"(?:emit|apply|make|produce|write|complete|finish|move|"
-               r"create|edit|proceed|continue|do)\b"),
-    re.compile(r"\bunable to\s+(?:\w+\s+){0,3}?"
-               r"(?:emit|apply|make|produce|write|complete|finish|move|"
-               r"create|edit|proceed|continue|do)\b"),
+    re.compile(r"\bcan(?:not|'t)\s+(?:\w+\s+){0,3}?" + _INCOMPLETE_VERBS),
+    re.compile(r"\bunable to\s+(?:\w+\s+){0,3}?" + _INCOMPLETE_VERBS),
     re.compile(r"\bto continue\b"),
     re.compile(r"\bremaining work\b"),
     re.compile(r"\bmust(?:\s+first)?\s+be\s+(?:read|done|made)\b"),
@@ -137,33 +106,22 @@ _INCOMPLETE_RES = (
 
 def _declares_incomplete(reply: str) -> bool:
     """True when a zero-edit reply says the task is NOT done and could not be
-    completed now ("can't emit the blocks yet -- to continue, the files must
-    be read"). Such a reply is an incomplete task, never a no-op: the work it
-    defers was possible in the lookup phase, so the loop retries it once and
-    fails it loudly on a second deferral. Repair tasks are exempt at the call
-    site -- refusing to edit is a sanctioned repair outcome (see bug N)."""
+    completed now. Such a reply is an incomplete task, never a no-op: the loop
+    retries it once and fails it on a second deferral. Repair tasks are exempt
+    at the call site (refusing to edit is a sanctioned repair outcome)."""
     low = _normalized_reply(reply)
     return any(r.search(low) for r in _INCOMPLETE_RES)
 
 
-# Outcome-negative regexes, backing the substring list below. Run 7 ticked
-# two verify tasks done whose reports said the opposite: task 4's "could not
-# *visually* verify" (an adverb split every listed substring) and task 7's
-# literal first line "Verification failed in the captured run" -- an outcome
-# statement, not an inability, and the browser HAD been driven, so the
-# objective gate passed too. The run ended "7 done, 0 failed" on a game that
-# still missed its spec.
-# Deliberately NOT matched: a bare "not ... confirmed" or a be-verb form
-# ("the executing code path is not yet confirmed") -- honest reproduce
-# reports list what they could not confirm as diligence while still
-# confirming the symptoms they were asked about, and failing those would
-# stop every run at its first task. Inability verbs (can't/could not/unable/
-# failed to) and the verify family are the unambiguous signals.
+# Outcome-negative patterns for verification reports. Deliberately NOT
+# matched: a bare "not ... confirmed" or a be-verb form ("is not yet
+# confirmed"): honest reports list what they could not confirm as diligence
+# while still confirming the asked-about symptoms. Inability verbs and the
+# verify family are the unambiguous signals.
 _UNVERIFIED_RES = (
     # Inability, tolerating up to 4 intervening words and a hyphenated verb:
-    # "could not visually verify", "could not re-verify", "can't produce a
-    # live visual verification". Curly apostrophes occur in real model
-    # output, so both ' and \u2019 are accepted.
+    # "could not visually verify", "can't produce a live visual verification".
+    # Both ' and \u2019 are accepted.
     re.compile(r"\b(?:can(?:not|['\u2019]t)|could(?: not|n['\u2019]t)|"
                r"unable to|failed to|impossible to)\s+"
                r"(?:[\w-]+\s+){0,4}?[\w-]*(?:verif|confirm)"),
@@ -177,35 +135,21 @@ _UNVERIFIED_RES = (
     re.compile(r"\bnot\s+(?:\w+\s+){0,2}?verif(?:y|ied|ies|ying)\b"),
     # "no live run/verification/visual evidence".
     re.compile(r"\bno\s+live\s+(?:run|verification|visual|evidence)"),
-    # "Still unknown: whether the sprites render" -- run 10's twice-repeated
-    # false green in verdict-less form: the report's FIRST LINE named the
-    # task's own claim as unknown ("does not show a grown frog", "does not
-    # provide ... evidence" all escaped the patterns above). The `whether`
-    # window separates a core-claim unknown from a passing caveat ("Still
-    # unknown: direct confirmation from index.html ..." -- a legitimately
-    # PASSED report in the same run); the 40-char leash keeps that caveat
-    # style out. Pessimism is deliberate: a peripheral "still unknown
-    # whether" costs one bounded remediation round, a missed one costs the
-    # run's truthfulness.
+    # "Still unknown: whether the sprites render": the report names the
+    # task's own claim as unknown. The `whether` window with a 40-char leash
+    # separates that from a passing caveat ("Still unknown: direct
+    # confirmation from index.html ..."). Pessimistic on purpose.
     re.compile(r"\bstill unknown\b[^.\n]{0,40}?\bwhether\b"),
 )
 
 
-# Fix ZE (run 13g): the frog check FINALLY passed clean -- full per-row
-# white/black counts quoted, discrete 2x2 cells confirmed, bare "VERDICT:
-# PASSED" -- and was then retired as FAILED because its "Likely cause of
-# the previous failure" section said the EARLIER eval "could not confirm
-# white eyes": the confession matcher read the whole report and could not
-# tell HISTORY from CONFESSION. Retry flows invite exactly that narration
-# (the check re-runs with the prior FAILED note in context, and a good
-# report explains it), so a PASSED verdict is now phrase-matched against
-# the report with prior-attempt sentences stripped. A sentence counts as
-# historical when it attributes something to a prior attempt ("the earlier
-# live eval", "the previous failure") or continues a dropped sentence as a
-# pronoun ("It did not count ... so it could not confirm ..."). Present-
-# tense first-person confessions ("I could not verify the tail point in
-# the capture") carry no attribution and survive the pruning -- the
-# pessimistic gate still fails them.
+# A PASSED verdict is phrase-matched against the report with prior-attempt
+# sentences stripped: retry flows narrate earlier failures ("the previous
+# failure ... could not confirm X"), which must not read as a present
+# confession. A sentence is historical when it attributes something to a
+# prior attempt or continues a dropped sentence as a pronoun ("It did not
+# count ... so it could not confirm ..."). Present-tense first-person
+# confessions carry no attribution and survive.
 _PRIOR_ATTEMPT_RE = re.compile(
     r"\b(?:"
     r"(?:earlier|previous|prior|first|initial|last|original)\s+"
@@ -216,25 +160,19 @@ _PRIOR_ATTEMPT_RE = re.compile(
     r"|previously|initially|originally|before this|in the past|at first"
     r"|attempt(?:s)? (?:1|one)"
     r")\b",
-    re.I)
+    re.IGNORECASE)
 _PRONOUN_START_RE = re.compile(
     r"^[\s\-*\u2022\d.)]*\b(it|its|it['\u2019]s|this|that|these|those|"
-    r"they|them|their|there|the same|said|which|both)\b", re.I)
+    r"they|them|their|there|the same|said|which|both)\b", re.IGNORECASE)
 
 
 def _strip_prior_attempt_prose(reply: str) -> str:
-    """The report minus sentences describing PRIOR attempts (Fix ZE).
+    """The report minus sentences describing PRIOR attempts.
 
-    Sentence-scoped, attribution-driven, and deliberately over-eager on
-    pronoun continuations: dropping a kept-shape sentence costs nothing
-    (the matcher only looks for negatives), while a single surviving
-    historical "could not confirm" flips a passed check to failed. The
-    VERDICT line never carries an attribution or a pronoun head, so it
-    always survives -- and `_verdict_of` reads the FULL reply anyway;
-    only the phrase gate sees the pruned text. Sentences are rejoined with
-    newlines, never spaces, so pruning cannot glue two kept fragments
-    into an accidental confession phrase.
-    """
+    Deliberately over-eager on pronoun continuations: dropping a harmless
+    sentence costs nothing (the matcher only looks for negatives). Sentences
+    are rejoined with newlines so pruning cannot glue two kept fragments into
+    an accidental confession phrase."""
     sentences = re.split(r"(?<=[.!?\n])\s+", reply or "")
     kept, prev_dropped = [], False
     for s in sentences:
@@ -251,53 +189,33 @@ def _strip_prior_attempt_prose(reply: str) -> str:
     return "\n".join(kept)
 
 
+# Substrings not covered by _UNVERIFIED_RES.
+_UNVERIFIED_PHRASES = (
+    "can't launch the browser", "cannot launch the browser",
+    "could not launch the browser", "unable to launch the browser",
+    "can't run the game", "cannot run the game", "could not run the game",
+    "without running the", "without a live run",
+    "did not run the", "didn't run the", "never ran the",
+)
+
+
 def _reply_says_unverified(reply: str) -> bool:
-    """True when the report says the verification did NOT succeed: either it
-    confesses it could not perform the check the task asked for ("I can't
-    launch the browser in this final phase", "could not visually verify"), or
-    it drove the app and reports a negative outcome ("Verification failed in
-    the captured run"). A checkpoint that confesses either must not be ticked
-    done: that is how an auto run ends all-green with its edits in the wrong
-    file. Models reword these admissions constantly -- adverbs split phrases,
-    outcomes arrive as results -- so the substrings are backed by the
-    `_UNVERIFIED_RES` regexes, and both are only consulted for tasks whose
-    TITLE asks to verify/confirm/observe, so an incidental phrase in a fix
-    task's prose cannot fail it. Phrase matching alone is still brittle;
+    """True when the report says the verification did NOT succeed: it confesses
+    it could not perform the check ("I can't launch the browser", "could not
+    visually verify") or reports a negative outcome ("Verification failed").
+    Only consulted for tasks whose TITLE asks to verify/confirm/observe;
     `_evidence_failure` pairs it with the objective tool-use signal."""
     low = (reply or "").lower()
-    if any(p in low for p in (
-            "can't verify", "cannot verify", "could not verify",
-            "couldn't verify", "unable to verify",
-            "can't confirm", "cannot confirm", "could not confirm",
-            "unable to confirm",
-            "can't launch the browser", "cannot launch the browser",
-            "could not launch the browser", "unable to launch the browser",
-            "can't run the game", "cannot run the game",
-            "could not run the game",
-            "can't produce a live visual verification",
-            "cannot produce a live visual verification",
-            "no live visual verification", "not visually verified",
-            # Rewordings observed in the wild: a locate-and-verify checkpoint
-            # that only read source, and a color-fix task in the wrong file.
-            "not directly verified", "was not verified", "is not verified",
-            "no live run", "no live verification",
-            "could not be verified", "cannot be verified", "can't be verified",
-            "without running the", "without a live run",
-            "did not run the", "didn't run the", "never ran the",
-    )):
+    if any(p in low for p in _UNVERIFIED_PHRASES):
         return True
     return any(r.search(low) for r in _UNVERIFIED_RES)
 
 
-# Run 10 ended all-green with two checks whose reports opened "Still unknown:
-# whether <the task's own claim>" -- the phrase patterns above missed the
-# wording, and prose rewording will always outrun a pattern list. So
-# verification reports must END with a machine-readable verdict line (the
+# Verification reports must END with a machine-readable verdict line (the
 # brief is appended in run_investigation_task) and _evidence_failure reads it
 # first. Last match wins: a report may quote the brief's format before
 # stating its own verdict. The prefix class tolerates markdown bold/bullets
-# ("**VERDICT: FAILED**", "- VERDICT: PASSED") -- small models decorate
-# exactly those lines.
+# ("**VERDICT: FAILED**", "- VERDICT: PASSED").
 _VERDICT_RE = re.compile(
     r"(?im)^[*\s-]{0,4}VERDICT:\s*(PASSED|FAILED)\b:?\s*(.*?)\s*$")
 
@@ -325,14 +243,10 @@ def _is_verification_task(task: str) -> bool:
 
 
 def _task_title(task: str) -> str:
-    """The clean title line out of a possibly-assembled worker prompt.
-
-    run_loop hands workers the assembled text (ORIGINAL USER GOAL block +
-    CURRENT TASK + context notes), but title-keyed decisions -- like the
-    verdict brief in run_investigation_task -- must not read the goal block:
-    it quotes the spec, whose prose can contain verify words that would put
-    PASSED/FAILED on every locate/reproduce task. With no goal block the
-    title is simply the first line."""
+    """The title line out of a possibly-assembled worker prompt (ORIGINAL USER
+    GOAL block + CURRENT TASK + notes). Title-keyed decisions must not read
+    the goal block: its spec prose can contain words that change the verdict.
+    With no goal block the title is the first line."""
     body = task or ""
     marker = "\nCURRENT TASK\n"
     if marker in body:
@@ -340,14 +254,8 @@ def _task_title(task: str) -> str:
     return body.split("\n", 1)[0]
 
 
-# Clipping budget for the investigation reports carried between tasks. Local
-# models run tight contexts, so the notes are capped -- but the answer brief
-# puts caveats ("Still unknown", "Next check", live-path doubts) ANYWHERE in
-# a report, often after the confident conclusion. A 3,000-char head-only clip
-# lost a mid-report "nothing shows this file is even loaded by the running
-# app" warning and later tasks edited dead code; observed reports run 4-7k
-# chars, and two notes at 8k chars (~4k tokens) fit every context tier this
-# loop actually drives. Clip head AND tail only past the budget.
+# Clipping budget for investigation reports carried between tasks. Caveats can
+# sit anywhere in a report, so only past the budget are head AND tail kept.
 _REPORT_BUDGET = 8000
 
 
@@ -363,11 +271,9 @@ def _clip_report(reply: str, budget: int = _REPORT_BUDGET) -> str:
             + text[-tail:])
 
 
-# Tasks whose deliverable includes live evidence (a running app, a
-# screenshot, observed behavior) are told up front that tools exist only in
-# the lookup phase. Models reliably discover this in the answer phase, when
-# it is too late ("I can't launch the browser in this final phase"), and
-# then pass the checkpoint on prose alone.
+# Tasks whose deliverable includes live evidence are told up front that the
+# tools exist only in the lookup phase (models otherwise discover this in the
+# answer phase, too late).
 _EVIDENCE_WORDS = re.compile(
     r"\b(run|runs|running|launch|launches|verify|verifies|verification|"
     r"confirm|confirms|observe|observes|observing|reproduce|reproduces|"
@@ -392,10 +298,9 @@ def _evidence_hint(task: str) -> str:
 # game" is not live evidence.
 _LIVE_STEP = re.compile(r"^\d+\.\s+(?:run|browser|screenshot)\b")
 
-# Title words that promise live observation. Narrower than _EVIDENCE_WORDS
-# on purpose: paired with a verify word below, these titles are only
-# satisfied by evidence from the RUNNING app. "Check the render path" stays
-# a code-archaeology task; "Run the game and verify ..." does not.
+# Title words that promise live observation. Narrower than _EVIDENCE_WORDS:
+# paired with a verify word, such titles need evidence from the RUNNING app.
+# "Check the render path" stays a source-reading task.
 _LIVE_TITLE = re.compile(
     r"\b(run|runs|running|launch|launches|start|starts|game|app|browser|"
     r"visually|screenshot|screenshots|observe|observes|observing|"
@@ -417,40 +322,21 @@ def _used_live_evidence(steps) -> bool:
 def _evidence_failure(task: str, tr) -> str:
     """A reason string when a verification checkpoint lacks evidence, else "".
 
-    Three independent signals, pessimistic on ties: the report's own VERDICT
-    line (verification reports must end with VERDICT: PASSED/FAILED -- see
-    _VERDICT_BRIEF; a FAILED verdict fails the check no matter how
-    optimistic the prose around it is, and a PASSED verdict never overrides
-    the other two -- though for the phrase gate its prior-attempt narration
-    is stripped first, Fix ZE), the report saying the verification did not
-    succeed -- it
-    could not be performed, or it was performed and came back negative
-    (phrase/regex match; models reword admissions constantly) -- and the
-    session never driving the app at all (objective: no
-    run/browser/screenshot step, checked for titles that promise live
-    observation). A confident report over read-only lookups still fails the
-    last gate; a browser-driving report that says "Verification failed"
-    still fails the second."""
+    Pessimistic on ties. Checks, in order: the report is a real report (not
+    the steps-log stand-in); its own VERDICT line is not FAILED; the prose
+    does not say the verification did not succeed; and, for titles promising
+    live observation, a run/browser/screenshot step actually happened."""
     if not _is_verification_task(task):
         return ""
     if (tr.reply or "").startswith("No prose report was produced"):
-        # The answer phase returned nothing (even after the retry in
-        # run_investigation_task) and the loop synthesized this stand-in
-        # from the steps log. A steps log is not a verification: the
-        # checkpoint's deliverable is a report, and an empty one carries
-        # neither evidence nor caveats.
         return ("its report is empty (the answer phase produced no prose "
                 "even after a retry); a steps log is not a verification")
     state, reason = _verdict_of(tr.reply)
     if state == "FAILED":
         return ("its own verdict line says VERDICT: FAILED"
                 + (f": {reason[:200]}" if reason else ""))
-    # Fix ZE (run 13g): a clean PASSED verdict is phrase-matched against
-    # the report minus its prior-attempt narration -- the frog check
-    # passed with fully quoted measurements and was still retired as
-    # failed because its "Likely cause of the previous failure" section
-    # said the EARLIER eval "could not confirm white eyes". Verdict-less
-    # and FAILED reports keep the full-text match (pessimistic on ties).
+    # A clean PASSED verdict is phrase-matched with prior-attempt narration
+    # stripped; verdict-less reports keep the full-text match.
     if _reply_says_unverified(tr.reply if state != "PASSED"
                               else _strip_prior_attempt_prose(tr.reply)):
         return ("its report says the verification did not succeed "
@@ -462,56 +348,56 @@ def _evidence_failure(task: str, tr) -> str:
     return ""
 
 
-# Tasks that are checkpoints rather than edits. The planner explicitly emits
-# "reproduce the failure" as a step for bugs, but the loop used to demand an
-# applied edit from every task -- so a successful reproduction was recorded as
-# a failure and `stop_on_fail` ended the run before the fix task. These titles
-# are recognised as investigation-only and answered in prose.
+# Titles starting with one of these verbs are checkpoints answered in prose,
+# not edit tasks (a successful "reproduce the failure" must not count as a
+# failure for lacking an applied edit).
 _INVESTIGATE_START = (
     "reproduce", "investigate", "diagnose", "analyze", "analyse", "inspect",
     "trace", "locate", "find", "confirm", "check", "verify", "review",
     "profile", "explain", "identify", "determine", "observe", "test",
-    # "Run the game and verify the fix" is a checkpoint, not a code change:
-    # on the edit path its success condition is "an edit applied", which let
-    # a live-verification task pass on a cosmetic edit to the wrong file
-    # with no evidence gathered at all. The edit-word guard below keeps
-    # "Run the build and update the docs" on the edit path.
     "run",
-    # Reporting/survey verbs the planner can emit for a "look at the code
-    # first" step. "Audit ... to identify which of X are already working" is
-    # the canonical case: it must be answered as a report, not forced through
-    # the edit path (which, via the no-edit recovery, made the model rewrite
-    # PLAN.md with its findings instead of moving on to the implementation
-    # tasks). The edit-word guard below still keeps any title that also says
-    # "fix"/"implement"/"add" on the edit path.
     "audit", "assess", "evaluate", "report", "summarize", "summarise",
     "list", "enumerate",
 )
-# If any of these appear, the task also changes code and must stay on the edit
-# path ("Reproduce and fix the crash", "Locate and update the config").
-_EDIT_WORDS = (
+# Any of these anywhere in the title keeps it on the edit path ("Reproduce and
+# fix the crash", "Run the build and update the docs").
+_EDIT_WORDS_RE = re.compile(r"\b(?:" + "|".join((
     "fix", "implement", "add", "remove", "delete", "rename", "move",
     "update", "change", "refactor", "write", "replace", "create", "patch",
     "correct", "repair", "build", "wire", "integrate", "migrate",
-)
+)) + r")\b")
 
 
 def _is_investigation_task(task: str) -> bool:
-    """True for a task whose deliverable is evidence, not a code change.
-
-    Heuristic by necessity: the plan is plain markdown the user can edit. A
-    leading investigation verb with no edit verb anywhere keeps the task out
-    of the apply/edit path; anything containing an edit verb stays there."""
+    """True for a task whose deliverable is evidence, not a code change: a
+    leading investigation verb and no edit verb anywhere in the title."""
     low = (task or "").strip().lower()
     first = re.match(r"[a-z]+", low)
     if not first or not first.group(0).startswith(_INVESTIGATE_START):
         return False
-    return not re.search(r"\b(" + "|".join(_EDIT_WORDS) + r")\b", low)
+    return not _EDIT_WORDS_RE.search(low)
 
 
-# --------------------------------------------------------------------------
-# The plan file: a markdown checklist that is the loop's external memory
-# --------------------------------------------------------------------------
+def _lint_plan_titles(root: Path, plan_path: Path) -> None:
+    """Advisory check at loop start: a title bundling 2+ distinct edit verbs
+    usually means several changes in one task, which blurs verification and
+    rollback. Warns on stderr and in the run log; never edits the plan."""
+    for ln in read_plan(plan_path):
+        m = _is_unchecked(ln)
+        if not m:
+            continue
+        title = m.group(3).strip()
+        verbs = sorted(set(_EDIT_WORDS_RE.findall(title.lower())))
+        if len(verbs) >= 2:
+            print(f"  [plan title bundles {len(verbs)} changes "
+                  f"({', '.join(verbs)}): \"{title[:70]}\" -- one change per "
+                  f"title keeps verification and rollback honest]",
+                  file=sys.stderr)
+            workspace.log_event(
+                root, f"plan title bundles edits ({', '.join(verbs)}): "
+                      f"{title[:80]}", "WARN")
+
+
 def read_plan(path: Path) -> list[str]:
     """Return the plan file's lines (empty list if it does not exist)."""
     if path.exists():
@@ -519,15 +405,26 @@ def read_plan(path: Path) -> list[str]:
     return []
 
 
+def _is_unchecked(line: str) -> re.Match[str] | None:
+    m = _TASK_LINE.match(line)
+    return m if m and m.group(2).strip() == "" else None
+
+
+def _find_unchecked(lines: list[str], task: str) -> int | None:
+    """Index of the first unchecked line whose task text is `task`."""
+    for i, ln in enumerate(lines):
+        m = _is_unchecked(ln)
+        if m and m.group(3).strip() == task:
+            return i
+    return None
+
+
 def next_task(lines: list[str]) -> tuple[int, str] | None:
     """Return (line_index, task_text) of the first unchecked task, or None.
-
-    Order is the order of the file, which is also priority order: the plan is
-    written dependencies-first, so "highest priority" is simply "first line".
-    """
+    File order is priority order (the plan is written dependencies-first)."""
     for i, ln in enumerate(lines):
-        m = _TASK_LINE.match(ln)
-        if m and m.group(2).strip() == "":
+        m = _is_unchecked(ln)
+        if m:
             return i, m.group(3).strip()
     return None
 
@@ -538,14 +435,13 @@ def _set_box(path: Path, task: str, box: str) -> bool:
     a plan file the model edited mid-run still resolves. Returns False if the
     task could not be found."""
     lines = read_plan(path)
-    for i, ln in enumerate(lines):
-        m = _TASK_LINE.match(ln)
-        if m and m.group(2).strip() == "" and m.group(3).strip() == task:
-            lines[i] = _TASK_LINE.sub(
-                lambda mm: f"{mm.group(1)}[{box}] {mm.group(3)}", ln, count=1)
-            path.write_text("\n".join(lines), encoding="utf-8")
-            return True
-    return False
+    i = _find_unchecked(lines, task)
+    if i is None:
+        return False
+    m = _TASK_LINE.match(lines[i])
+    lines[i] = f"{m.group(1)}[{box}] {m.group(3)}"
+    path.write_text("\n".join(lines), encoding="utf-8")
+    return True
 
 
 def mark_done(path: Path, task: str) -> bool:
@@ -563,39 +459,25 @@ def mark_failed(path: Path, task: str) -> bool:
 
 def insert_task_before(path: Path, task: str, new_title: str) -> bool:
     """Insert an unchecked ``- [ ] new_title`` line immediately before the
-    first unchecked occurrence of ``task``. Used by the remediation path:
-    the failed check must stay unchecked (so it retries after the repair),
-    and the plan runs top-down, so "before" is the position that makes the
-    repair execute first. Returns False when the anchor task is not found."""
+    first unchecked occurrence of ``task`` (the remediation path: the failed
+    check stays unchecked and retries after the repair). Returns False when
+    the anchor task is not found."""
     lines = read_plan(path)
-    for i, ln in enumerate(lines):
-        m = _TASK_LINE.match(ln)
-        if m and m.group(2).strip() == "" and m.group(3).strip() == task:
-            lines.insert(i, f"- [ ] {new_title}")
-            path.write_text("\n".join(lines), encoding="utf-8")
-            return True
-    return False
+    i = _find_unchecked(lines, task)
+    if i is None:
+        return False
+    lines.insert(i, f"- [ ] {new_title}")
+    path.write_text("\n".join(lines), encoding="utf-8")
+    return True
 
 
-# The repair task title inserted when a live verification checkpoint fails
-# its evidence gate. Bug H: run 7's failed verify carried an exact repair
-# recipe ("the GBGBG rows at main.js L213/L245 are still live") and no task
-# ever acted on it, because the plan is static. The title is deliberately
-# crafted to (a) route to the EDIT branch (no investigation start word) and
-# (b) carry no verify/confirm/observe/validate/check words, so the evidence
-# gate does not demand browser work from the repair itself -- the retried
-# check right after it does the observing. The diagnosis travels in the
-# FAILED LIVE TEST context note, never in this title (titles are mined for
-# forced file reads and must stay clean).
-# Run 10 added the frozen-behavior clause: its first field remediation
-# "fixed" a failed ~10s-survival check by moving enemy spawning from 3s to
-# 12s (a later one offset the spawn timers by -12) -- passing the check by
-# violating the goal's frozen "spawn timing unchanged" constraint. That is
-# the Goodhart trap in its purest form: the loop optimizes the signal it
-# reads (the gate) and discards the intent it cannot (the spec). A repair
-# whose only route to green breaks frozen behavior must refuse and surface
-# the conflict instead of re-tuning the program under test. Scan-clean:
-# freezes/conflict/instead add no verify words and no start word.
+# Title of the repair task inserted when a live verification fails its
+# evidence gate. It must route to the EDIT branch (no investigation start
+# word) and contain no verify/confirm/observe/validate/check words, so the
+# evidence gate does not demand browser work from the repair itself. The
+# diagnosis travels in the FAILED LIVE TEST context note, never in the title
+# (titles are mined for forced file reads). The final clause stops a repair
+# from passing the check by breaking behavior the goal freezes.
 _REMEDIATION_TITLE = (
     "Repair the defect described in the FAILED LIVE TEST note in your "
     "context: apply the smallest code fix that resolves it, keeping every "
@@ -604,16 +486,9 @@ _REMEDIATION_TITLE = (
 
 
 def _prune_notes(notes: list[str]) -> None:
-    """Trim the context-note window IN PLACE: keep the FIRST note plus the
-    latest two.
-
-    The first note is the run's reproduce/observe report (PLAN_SYSTEM always
-    makes task 1 one), and its live-path findings are the anchor every later
-    task needs: run 9's task 6 "replaced the frog" in the dead
-    static/js/entities/player.js because a plain latest-two window had
-    already evicted task 1's "player.js is not confirmed live" analysis --
-    the exact warning that would have redirected the edit. Middle notes
-    still roll off; only the anchor is pinned."""
+    """Trim the context-note window IN PLACE: keep the FIRST note (the run's
+    reproduce/observe report, whose live-path findings anchor later tasks)
+    plus the latest two."""
     if len(notes) > 3:
         del notes[1:-2]
 
@@ -628,9 +503,6 @@ def write_plan(path: Path, goal: str, titles: list[str]) -> None:
     path.write_text("\n".join(body) + "\n", encoding="utf-8")
 
 
-# --------------------------------------------------------------------------
-# Planning: turn a goal into an ordered task list (one LLM call)
-# --------------------------------------------------------------------------
 TASK_SCHEMA = {
     "type": "object",
     "properties": {
@@ -640,19 +512,11 @@ TASK_SCHEMA = {
             "items": {
                 "type": "object",
                 "properties": {
-                    # 800, and `title` is the ONLY field: the old 300 cap
-                    # guillotined every spec-derived title mid-sentence
-                    # (run 13's plan: "resolving {scale, pixe", "counts of
-                    # non-b") because grammar-constrained sampling force-
-                    # closes a string AT maxLength -- valid JSON, no
-                    # truncation flag -- and run 13b showed the worse half:
-                    # derailed by the forced close, the planner ended the
-                    # array after task 1, five of six spec checks were never
-                    # planned, and `auto` exited 0 with "all tasks
-                    # complete". An `acceptance` sibling used to sit here
-                    # and was silently DROPPED by _titles_from; one field is
-                    # one place for the criterion, and generate_tasks
-                    # re-asks when a title still arrives at the cap.
+                    # Grammar-constrained sampling force-closes a string AT
+                    # maxLength (valid JSON, no truncation flag), which can cut
+                    # a title mid-sentence or derail the planner into ending
+                    # the list early; generate_tasks re-asks when a title
+                    # arrives at the cap.
                     "title": {"type": "string", "maxLength": 800},
                 },
                 "required": ["title"],
@@ -676,6 +540,10 @@ Rules:
   verify by running a command (tests, a linter, an import, a script).
 - Each title is a clear, imperative instruction ("Implement the markdown
   parser"), not a wish ("there should be a parser").
+- One title, one change: never bundle distinct edits into one task ("Remove
+  the old header and update the CSS" is two tasks). A bundled task cannot be
+  verified or rolled back selectively when one of its changes breaks
+  something.
 - A title that hits its length cap is CUT mid-sentence and loses criteria:
   compress the goal's wording instead of copying long passages, and split a
   check with sub-items (a/b/c/d) into one task per sub-item.
@@ -745,17 +613,11 @@ def generate_tasks(spec_text: str, client, cfg,
                    root: Path | None = None) -> list[str]:
     """Ask the model to break `spec_text` into an ordered task list.
 
-    Retries once with an explicit "you returned zero tasks" nudge when the
-    first reply comes back empty (a model handed a bug-fix goal sometimes
-    reads it as "nothing to build"), re-asks once when a title arrives at
-    exactly the schema's length cap (grammar-constrained sampling force-
-    closed it mid-sentence -- Bug Y, runs 13/13b), and finally falls back
-    to one task built from the goal itself rather than aborting the whole
-    run.
-
-    When `root` is given, the project's instruction file is included in the
-    planner prompt too -- a plan that ignores "never edit generated/" is
-    wrong before the first edit happens."""
+    Re-asks once when a title arrives at exactly the schema's length cap
+    (force-closed mid-sentence), retries once with a "you returned zero
+    tasks" nudge on an empty reply, and finally falls back to one task built
+    from the goal. When `root` is given, the project's instruction file is
+    added to the planner prompt."""
     budget = getattr(cfg, "max_spec_chars", 60_000)
     body = spec_text.strip()[:budget]
     max_tokens = getattr(cfg, "max_tokens_plan", 2000)
@@ -776,15 +638,8 @@ def generate_tasks(spec_text: str, client, cfg,
         "title"]["maxLength"]
     cut = [t for t in titles if len(t) >= cap]
     if titles and cut:
-        # Bug Y (runs 13/13b): the cap guillotine again, this time in the
-        # planner. A title at exactly `cap` chars was force-closed
-        # mid-sentence (valid JSON, no flag), and run 13b showed the
-        # forced close can derail the model into ending the task array
-        # right there: one truncated task got planned, five of six spec
-        # checks were silently skipped, and the loop exited 0 with "all
-        # tasks complete". One bounded re-ask; if titles are STILL cut,
-        # accept them -- they remain workable (the full goal rides along
-        # in every task's background context) and looping burns budget.
+        # One bounded re-ask; titles still cut afterwards are accepted (the
+        # full goal rides along in every task's background context).
         print(f"  [planner returned {len(cut)} title(s) at exactly the "
               f"{cap}-char schema cap (cut mid-sentence); re-asking]",
               file=sys.stderr)
@@ -823,18 +678,11 @@ def generate_tasks(spec_text: str, client, cfg,
     return titles
 
 
-# --------------------------------------------------------------------------
-# Verification: the feedback loop the outer loop depends on
-# --------------------------------------------------------------------------
 def run_verify(root: Path, command: str, timeout: int = 600) -> tuple[bool, str]:
     """Run `command` (a shell string) in `root`. Returns (passed, output).
 
-    A Ralph loop without a feedback signal is a chaos engine -- it keeps
-    churning out code no one checked. This is the signal: pass/fail plus the
-    command's output, fed back to the model for repair on failure. The whole
-    process group is killed on timeout, so a GUI/launcher child cannot keep a
-    window alive after the check gives up."""
-    from . import proc as proc_mod
+    The whole process group is killed on timeout, so a GUI/launcher child
+    cannot keep a window alive after the check gives up."""
     rc, out, stopped, _ = proc_mod.run(
         command, cwd=root, timeout=timeout, shell=True, max_output=200_000)
     if stopped == "timeout":
@@ -844,9 +692,23 @@ def run_verify(root: Path, command: str, timeout: int = 600) -> tuple[bool, str]
     return rc == 0, out.strip()
 
 
-# --------------------------------------------------------------------------
-# Missing third-party dependencies
-# --------------------------------------------------------------------------
+def _failure_score(output: str, diag: bool = False) -> int:
+    """Severity of a failed check, for the rollback-if-worse guard: pytest-
+    style failure/error counters when present, finding-line count for a
+    diagnostics report, else a flat 1 (comparable across rounds, but no
+    finer)."""
+    text = output or ""
+    m = re.search(r"(\d+) failed", text)
+    if m:
+        score = int(m.group(1))
+        e = re.search(r"(\d+) errors?", text)
+        return score + (int(e.group(1)) if e else 0)
+    if diag:
+        return sum(1 for ln in text.splitlines()
+                   if re.match(r"^\S+?:\d+(?::\d+)?:", ln)) or 1
+    return 1
+
+
 _MISSING_MODULE_RE = re.compile(
     r"(?:ModuleNotFoundError|ImportError):\s*No module named\s+['\"]([^'\"]+)['\"]")
 
@@ -860,12 +722,9 @@ _PIP_NAMES = {
 
 
 def missing_modules(output: str) -> list[str]:
-    """Top-level import names from ModuleNotFoundError/ImportError messages.
-
-    A failing verify often means a third-party dependency is absent rather
-    than the code being wrong; editing source cannot add one, so callers use
-    this to route the failure to dependency handling instead of the repair
-    loop. Returns the top-level module (``foo`` for ``foo.bar``)."""
+    """Top-level import names (``foo`` for ``foo.bar``) from
+    ModuleNotFoundError/ImportError messages. Callers route these to
+    dependency handling instead of the code-repair loop."""
     out: list[str] = []
     for m in _MISSING_MODULE_RE.finditer(output or ""):
         name = m.group(1).split(".")[0].strip()
@@ -885,9 +744,9 @@ def install_modules(packages: list[str], root: Path) -> tuple[bool, str]:
     environment, returning (ok, output).
 
     Only called when the user opted in (``--auto-install``): the module names
-    come from model-generated code, so installing them is never automatic."""
+    come from model-generated code."""
     dists = sorted({pip_name(p) for p in packages
-                    if re.fullmatch(r"[A-Za-z0-9_.-]+", p or "")})
+                    if re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9_.-]*", p or "")})
     if not dists:
         return False, "no valid package names to install"
     cmd = [sys.executable, "-m", "pip", "install", "--quiet", *dists]
@@ -901,29 +760,27 @@ def install_modules(packages: list[str], root: Path) -> tuple[bool, str]:
     return proc.returncode == 0, out
 
 
-# --------------------------------------------------------------------------
-# One task, end to end (the shared inner loop)
-# --------------------------------------------------------------------------
 @dataclass
 class TaskResult:
     """What one task run produced: the edit results, the reply, whether any
     writes landed, the files re-indexed, and the (possibly refreshed) index.
-    `steps` is the lookup phase's action log ("4. browser ..."), kept so the
-    outer loop can tell objectively whether a verification task ever drove
-    the app instead of trusting the report's prose."""
+    `steps` is the lookup phase's action log ("4. browser ..."), which lets
+    the outer loop tell objectively whether a verification task drove the app."""
     results: list
     reply: str
     applied: bool
     changed: list[str]
-    idx: "index_mod.Index"
+    idx: index_mod.Index
     session: Path | None = None
     steps: list[str] = field(default_factory=list)
     # True when the reply's only edit blocks were null edits (SEARCH ==
-    # REPLACE) and the reply did NOT itself declare the work complete. The
-    # outer loop must not treat that as "already done": it is a failed
-    # attempt to act (the graveyard run's task 2 ticked itself off this way
-    # after three discarded no-op blocks).
+    # REPLACE) and the reply did not itself declare the work complete; the
+    # outer loop treats that as a failed attempt, not "already done".
     fabricated: bool = False
+    # The run's backup snapshot dir (when cfg.backup is on): what the
+    # rollback-if-worse guard restores to undo a repair that made the check
+    # worse.
+    backup_dir: Path | None = None
 
 
 def _report(results, dry_run: bool):
@@ -939,25 +796,22 @@ def _report(results, dry_run: bool):
             print(r.diff)
 
 
-# --------------------------------------------------------------------------
-# Answer-phase recovery: a reply with no edit blocks
-# --------------------------------------------------------------------------
-# Small models in the ANSWER phase sometimes emit another agent framework's
-# tool-call syntax (Anthropic `<invoke name="read">`, or the `<tool_call>` /
-# `<function=read>` dialect) instead of search/replace blocks -- usually
-# because the task needs source the gather phase never read. The recovery
-# below parses those requests, honours the reads from disk, and re-asks for
-# the edit blocks. Both dialects are matched so the exact syntax the model
-# imitates does not matter.
+# Answer-phase recovery. Small models sometimes emit another agent framework's
+# tool-call syntax (Anthropic `<invoke name="read">`, `<tool_call>` /
+# `<function=read>`) instead of search/replace blocks, usually because the
+# task needs source the gather phase never read. The recovery parses those
+# read requests, honours them from disk, and re-asks for the edit blocks.
 _READ_INVOKE_RE = re.compile(
     r"<invoke\b[^>]*name\s*=\s*['\"]?read['\"]?[^>]*>(.*?)</invoke>",
     re.DOTALL | re.IGNORECASE)
-# A reply can be cut off before the closing tag (the exact case that made a
-# model spin: `<tool_call>read` repeated with no `</tool_call>`), so match up
-# to the next opening tag or end-of-reply rather than requiring closure.
+# A reply can be cut off before the closing tag, so match up to the next
+# opening tag or end-of-reply rather than requiring closure.
 _READ_TOOLCALL_RE = re.compile(
     r"<tool_call>(.*?)(?=</tool_call>|<tool_call>|\Z)",
     re.DOTALL | re.IGNORECASE)
+_TOOLCALL_IS_READ_RE = re.compile(
+    r"function\s*=\s*read\b|<read\b|['\"]name['\"]\s*:\s*['\"]read['\"]",
+    re.IGNORECASE)
 # Qwen-style native tool calls often use a bare <read> wrapper and a
 # <file_path> tag rather than Anthropic's <invoke>/<parameter> pair.
 _READ_BLOCK_RE = re.compile(
@@ -980,9 +834,8 @@ def _file_param(body: str) -> str:
         m = rx.search(body or "")
         if m:
             path = m.group(1).strip().strip("`'\" \t\r\n")
-            # A degenerate reply can repeat one path for tens of thousands of
-            # characters. That is not a real request; do not carry it into a
-            # recovery prompt (and do not hand it to Path.resolve()).
+            # A degenerate reply can repeat one path for thousands of
+            # characters; that is not a real request.
             return path if len(path) <= 1000 else ""
     return ""
 
@@ -1003,18 +856,14 @@ def _read_requests(reply: str) -> list[str]:
             found.append((m.start(), path))
     for m in _READ_TOOLCALL_RE.finditer(reply):
         body = m.group(1)
-        # Accept both `<function=read>`/JSON `"name": "read"` and the bare
-        # `<read>` wrapper a degraded reply emits. A body that names another
-        # tool is skipped so a requested write is not mistaken for a read.
-        if not re.search(r"function\s*=\s*read\b|<read\b|"
-                         r"['\"]name['\"]\s*:\s*['\"]read['\"]",
-                         body, re.IGNORECASE):
+        # A body that names another tool is skipped so a requested write is
+        # not mistaken for a read.
+        if not _TOOLCALL_IS_READ_RE.search(body):
             continue
         path = _file_param(body)
         if path:
             found.append((m.start(), path))
-    # A bare <read> block without a <tool_call> wrapper (Qwen's native shape
-    # in the reported runaway output).
+    # A bare <read> block without a <tool_call> wrapper (Qwen's native shape).
     for m in _READ_BLOCK_RE.finditer(reply):
         path = _file_param(m.group(1))
         if path:
@@ -1068,17 +917,15 @@ def _honour_reads(root: Path, requests: list[str]) -> str:
     return "\n\n".join(blocks)
 
 
-def _recover_no_edit_reply(root: Path, cfg, agent, task: str, gathered: str,
+def _recover_no_edit_reply(root: Path, agent, task: str, gathered: str,
                            reply: str, *, dry_run: bool, backup_dir,
                            answer_system: str | None = None):
-    """Recover an answer reply that parsed to zero edit blocks.
-
-    Two failure classes are worth one retry each (bounded at two rounds
-    total): the model asked to READ more files via tool-call syntax (honour
-    the reads from disk and re-ask with that source included), or it simply
-    answered in prose (re-ask with an explicit 'no tools here, emit edit
-    blocks' instruction). Returns (results, reply) from the first re-ask
-    that produces blocks, or None when every round came back empty."""
+    """Recover an answer reply that parsed to zero edit blocks (at most two
+    rounds): if the model asked to READ files via tool-call syntax, honour
+    the reads from disk and re-ask with that source; otherwise re-ask with an
+    explicit 'no tools here, emit edit blocks' instruction. Returns
+    (results, reply) from the first re-ask that produces blocks or declares
+    "No changes", or None when every round came back empty."""
     asked = _read_requests(reply)
     for _round in range(_MAX_RECOVERY_ROUNDS):
         extra = _honour_reads(root, asked) if asked else ""
@@ -1115,18 +962,9 @@ def _recover_no_edit_reply(root: Path, cfg, agent, task: str, gathered: str,
         if results2:
             return results2, reply2
         if _is_noop(reply2):
-            # Fix X2 (run 13d): the re-ask took the escape hatch task2
-            # offers -- an honest "No changes: <reason>" line -- and the
-            # old loop DISCARDED it: only block-producing rounds were
-            # returned, so the model was pressed a second time, both
-            # honest replies were thrown away (None kept the original
-            # prose), and the run stopped on a task that had correctly
-            # concluded no edit was warranted. Propagate the declaration
-            # instead: run_task keeps the parse-failure ERROR silent (a
-            # decision, not a parse failure) and run_loop's _is_noop path
-            # treats the repair as the refusal it is (repair_outcome
-            # False -> bug N retires the failing check instead of
-            # looping).
+            # The re-ask took the "No changes: <reason>" escape hatch; hand
+            # the declaration back so run_task/run_loop treat it as a
+            # decision rather than pressing the model again.
             return [], reply2
         asked = _read_requests(raw)
     return None
@@ -1185,12 +1023,7 @@ inconclusive, say what is still unknown and what to check next.
 """
 
 # Appended to INVESTIGATE_SYSTEM for verification-titled investigations (see
-# run_investigation_task). Wording rules learned from the field: "partially
-# confirmed is FAILED" (run 10's final check ticked done on partial evidence
-# plus honest unknowns), "reading source is never live evidence" (the
-# perennial read-only pass), and an explicit do-not-hedge line because the
-# gate resolves PASSED-with-confession to a miss anyway -- the model should
-# not have to discover that asymmetry by watching its own runs.
+# run_investigation_task).
 _VERDICT_BRIEF = """
 
 Your report must END with a verdict as its very last line, exactly one of
@@ -1205,17 +1038,13 @@ _TOOL_SYNTAX = ("<tool_call", "<invoke", "<function=", "<read", '"name":')
 
 
 def _looks_like_tool_calls_only(reply: str) -> bool:
-    """True when a prose answer is really just agent-framework tool syntax.
-
-    Small models occasionally ignore "no tools here" and emit `<tool_call>` /
-    `<invoke>` blocks in the answer phase. For an investigation task that is
-    not an answer, so the caller substitutes the gathered evidence."""
+    """True when a prose answer is really just agent-framework tool syntax
+    (`<tool_call>` / `<invoke>` blocks emitted despite "no tools here")."""
     low = (reply or "").lower()
     if not low.strip() or not any(t in low for t in _TOOL_SYNTAX):
         return False
-    # A runaway reply can be mostly a giant repeated PATH, which the old
-    # word-count heuristic mistook for prose. Strip tags, paths, and JSON
-    # punctuation first; then a few repeated tool-call opens are enough.
+    # Strip tags, paths, and JSON punctuation (a runaway reply can be mostly
+    # one repeated path); then a few repeated tool-call opens are enough.
     opens = len(re.findall(r"<tool_call\b|<invoke\b|<function\s*=", reply,
                            re.IGNORECASE))
     plain = re.sub(r"<[^>]+>", " ", reply)
@@ -1228,40 +1057,26 @@ def _looks_like_tool_calls_only(reply: str) -> bool:
 def _prose_collapse(reply: str) -> bool:
     """True when a prose reply's tail degenerated into a phrase loop.
 
-    The graveyard run streamed a task answer cycling through quoted fragments
-    ("...loaded by the page / used by the game runtime / executed / after
-    moving the dead code files...") -- a sampling collapse no existing guard
-    covers: llm.py's stream guard counts tool-call syntax opens, not prose.
-    The signal here is vocabulary novelty in the tail: a looping window reuses
-    a tiny word set, while even highly parallel legitimate prose (file tables,
-    per-module bullet lists) keeps unique paths and names on every line, so
-    paths and code are deliberately NOT stripped -- their uniqueness is what
-    separates a table from a loop. Detection only ever triggers a
-    regeneration, never a mutation: a false positive costs one extra answer
-    call, a false negative ships looping garbage into the context notes every
-    later task reads. The 0.22 floor sits well under real collapse ratios
-    (the field tail measured ~0.10) and well over legitimate parallel prose
-    (a 23-row file table measures ~0.28 -- every row keeps its own path).
-    Not applied to build replies: sprite grids and other legitimate
-    repetitive edit content would false-positive, and their stream already
-    has the truncation-continuation path."""
+    Signal: low vocabulary novelty (unique/total words) in the last 1500
+    chars. Paths and code are deliberately NOT stripped: their uniqueness is
+    what separates a parallel file table (~0.28) from a loop (~0.10). A hit
+    only triggers a regeneration. Not applied to build replies, whose edit
+    content (sprite grids...) is legitimately repetitive."""
     words = re.findall(r"\w+", (reply or "")[-1500:].lower())
     if len(words) < 60:
         return False
     return len(set(words)) / len(words) < 0.22
 
 
-def run_investigation_task(root: Path, cfg, client, agent, idx, task: str, *,
+def run_investigation_task(root: Path, cfg, agent, idx, task: str, *,
                            answer_system: str | None = None) -> TaskResult:
     """Run a reproduction/diagnosis task whose deliverable is a report.
 
-    Unlike run_task(), no edits are expected or applied. The gather phase uses
-    the normal tools (including `run`), then the answer phase reports findings
-    in prose. This is what makes the planner's "reproduce the failure" step a
-    success instead of a no-edit failure. If the model answers with tool-call
-    syntax anyway, the gathered evidence is recorded as the report so the next
-    fix task (and the session log) still has something concrete to work from.
-    """
+    No edits are expected or applied: the gather phase uses the normal tools
+    (including `run`), then the answer phase reports findings in prose. If the
+    model answers with tool-call syntax or nothing, the answer is retried once
+    and then replaced by a stand-in built from the steps log and gathered
+    evidence."""
     when = workspace.stamp()
     workspace.log_event(root, f"investigate: {task}")
     todo_mod.clear(root)
@@ -1270,9 +1085,8 @@ def run_investigation_task(root: Path, cfg, client, agent, idx, task: str, *,
     print("--- reporting ---\n", file=sys.stderr)
     system = answer_system or INVESTIGATE_SYSTEM
     if answer_system is None and _is_verification_task(_task_title(task)):
-        # Fix L: force the binary verdict line, keyed off the clean TITLE
-        # (the assembled prompt's goal block quotes the spec, whose verify
-        # words would otherwise put the brief on every investigation).
+        # Keyed off the clean title: the goal block quotes the spec, whose
+        # verify words would otherwise put the brief on every investigation.
         system += _VERDICT_BRIEF
     reply = agent.answer(task, gathered,
                          system=system,
@@ -1285,19 +1099,10 @@ def run_investigation_task(root: Path, cfg, client, agent, idx, task: str, *,
                             "regenerating once", "WARN")
     if _looks_like_tool_calls_only(reply) or not (reply or "").strip() \
             or collapsed:
-        # An empty answer phase leaves a verification checkpoint with no
-        # report at all -- run 8's final verify ticked done on the steps-log
-        # fallback below plus a 15-word `done` reason. One retry absorbs the
-        # transient empty completions local models produce before we fall
-        # back to synthesizing a report from the lookups. The same retry
-        # regenerates a phrase-loop collapse (bug R, graveyard run): nothing
-        # is poisoned yet -- catching it here keeps looping garbage out of
-        # the context notes every later task reads.
+        # One retry absorbs transient empty completions and regenerates a
+        # phrase-loop collapse before it reaches the context notes every
+        # later task reads.
         if not collapsed:
-            # Fix ZD: run 13f's empty answer left NO trace in the event log
-            # between "reporting" and the stand-in -- no way to tell a
-            # model flake from a harness bug after the fact. (The collapsed
-            # case prints and logs its own WARN above.)
             print("  [the answer phase returned no usable prose; "
                   "retrying once]", file=sys.stderr)
             workspace.log_event(root, "answer phase produced no prose "
@@ -1308,8 +1113,9 @@ def run_investigation_task(root: Path, cfg, client, agent, idx, task: str, *,
                              include_edit_format=False, stream=True)
         if (retry or "").strip() and not _looks_like_tool_calls_only(retry):
             reply = retry
+    steps_log = list(getattr(agent, "steps_log", []) or [])
     if _looks_like_tool_calls_only(reply) or not (reply or "").strip():
-        steps = "\n".join(getattr(agent, "steps_log", []) or ["(no steps)"])
+        steps = "\n".join(steps_log or ["(no steps)"])
         reply = ("No prose report was produced; the lookup phase recorded:\n\n"
                  + steps)
         evidence = (gathered or "").strip()
@@ -1320,12 +1126,10 @@ def run_investigation_task(root: Path, cfg, client, agent, idx, task: str, *,
                             "stand-in", "ERROR")
     session = None
     if cfg.log_sessions:
-        session = workspace.write_session(root, task,
-                                          getattr(agent, "steps_log", []),
+        session = workspace.write_session(root, task, steps_log,
                                           reply, [], None, when)
         print(f"[session: {session.relative_to(root)}]", file=sys.stderr)
-    return TaskResult([], reply, True, [], idx, session,
-                      list(getattr(agent, "steps_log", []) or []))
+    return TaskResult([], reply, True, [], idx, session, steps_log)
 
 
 def run_task(root: Path, cfg, client, agent, idx, task: str, *,
@@ -1334,11 +1138,10 @@ def run_task(root: Path, cfg, client, agent, idx, task: str, *,
     """Run ONE task through the inner loop: gather source, answer (or edit),
     apply or review, re-index the touched files, and write a session log.
 
-    `agent` and `idx` are passed in (not created here) so the caller controls
-    freshness -- the autonomous loop hands each task a brand-new Agent over
-    the same warm index, while `ask`/`chat` reuse one. `answer_system`, when
-    given, replaces the default edit brief (used to implement scaffold stubs
-    rather than edit existing code). Returns a TaskResult."""
+    `agent` and `idx` are passed in so the caller controls freshness (`auto`
+    hands each task a brand-new Agent; `ask`/`chat` reuse one). `answer_system`,
+    when given, replaces the default edit brief (used to implement scaffold
+    stubs rather than edit existing code)."""
     when = workspace.stamp()
     wants_write = apply or review
     backup_dir = (workspace.new_backup_dir(root, when)
@@ -1355,13 +1158,12 @@ def run_task(root: Path, cfg, client, agent, idx, task: str, *,
                             "WARN")
     refusal = _edit_refusal_head(raw_reply)
     contradicted = bool(refusal) and bool(parse_edits(raw_reply))
-    fabricated = False       # reply's only blocks were no-ops (Fix X)
+    fabricated = False       # reply's only blocks were no-ops
     fabricated_only = False  # ...and the reply did not declare "no changes"
+
     def _mark_fabricated(text: str) -> str:
-        """Record null-only blocks; stamp the refusal marker only when the
-        reply itself was not already an honest "no changes" declaration.
-        Stamping a genuinely complete reply as fabricated would make the
-        outer loop retry work that is already done."""
+        """Record null-only blocks; add the "No changes" marker only when the
+        reply itself was not already an honest "no changes" declaration."""
         nonlocal fabricated, fabricated_only
         fabricated = True
         if _is_noop(text):
@@ -1370,13 +1172,10 @@ def run_task(root: Path, cfg, client, agent, idx, task: str, *,
         return (text.rstrip() + "\n\n[No changes: every edit block in the "
                 "reply was a no-op (SEARCH == REPLACE) and was discarded; "
                 "nothing was written.]")
+
     if contradicted:
-        # Bug U (graveyard run): the inserted repair's prose said "No edit."
-        # and explained why acting would violate the goal's freeze -- then
-        # the same reply emitted a FILE block stripping 22 script tags from
-        # index.html, and the harness applied it. When a reply OPENS by
-        # refusing, its blocks are a small-model coherence failure, not
-        # intent: honor the refusal and discard them.
+        # A reply that OPENS by refusing yet contains blocks is a small-model
+        # coherence failure, not intent: honor the refusal, discard the blocks.
         print(f"  [reply opens by refusing edits (\"{refusal}\") but "
               f"contains edit blocks; honoring the refusal and discarding "
               f"them]", file=sys.stderr)
@@ -1389,32 +1188,21 @@ def run_task(root: Path, cfg, client, agent, idx, task: str, *,
                                      task=task, gathered=gathered,
                                      backup_dir=None if review else backup_dir)
         if not results and getattr(agent, "noop_discards", None):
-            # Fix X (run 13): the reply's only blocks were null edits
-            # (SEARCH == REPLACE), dropped by parse_edits -- a fabricated
-            # compliance with the edit protocol by a model that had
-            # concluded no edit was needed (run 13's last two repairs were
-            # pressed into exactly this by the re-ask below, on a file the
-            # goal froze). Honor that conclusion instead of re-asking for
-            # "real" blocks: the marker matches _is_noop, so the re-ask is
-            # skipped and the outer loop's no-op path treats the repair as
-            # the refusal it was (repair_outcome False -> the failing check
-            # retires instead of burning another verify round).
+            # The reply's only blocks were null edits (SEARCH == REPLACE)
+            # dropped by parse_edits: the model had concluded no edit was
+            # needed. Honor that instead of re-asking for "real" blocks (the
+            # marker matches _is_noop, so the re-ask below is skipped).
             files = ", ".join(dict.fromkeys(agent.noop_discards))
             workspace.log_event(root, f"reply emitted only no-op edit "
                                       f"block(s) ({files}); treated as a "
                                       f"refusal to edit", "WARN")
             reply = _mark_fabricated(reply)
     if not results and not _is_noop(reply) and not contradicted:
-        # The answer phase produced zero edit blocks. Before declaring the
-        # task dead, give the model one bounded recovery: honour any read
-        # tool-calls it emitted, or re-ask with the edit protocol spelled
-        # out -- both without touching the no-op path ("already complete"
-        # replies must still mark the task done, not re-ask). A refused
-        # reply is coherent about doing nothing: re-asking with "produce the
-        # edit blocks now" would pressure the model into undoing its own
-        # refusal.
+        # Zero edit blocks: one bounded recovery (honour read tool-calls or
+        # re-ask with the edit protocol). Skipped for no-op replies ("already
+        # complete") and refusals, which are coherent about doing nothing.
         rec = _recover_no_edit_reply(
-            root, cfg, agent, task, gathered, reply,
+            root, agent, task, gathered, reply,
             dry_run=review or not apply,
             backup_dir=None if review else backup_dir,
             answer_system=answer_system)
@@ -1424,17 +1212,13 @@ def run_task(root: Path, cfg, client, agent, idx, task: str, *,
                 workspace.log_event(
                     root, "answer re-asked; recovered edit blocks", "INFO")
             else:
-                # Fix X2: the re-ask came back with an honest "No
-                # changes:" declaration instead of blocks; it is now the
-                # reply (run_loop keys its refusal path off
-                # _is_noop(tr.reply)).
+                # The "No changes:" declaration is now the reply (run_loop
+                # keys its refusal path off _is_noop(tr.reply)).
                 workspace.log_event(root, "re-ask declared no changes; "
                                           "honored as a refusal to edit",
                                     "WARN")
         elif not contradicted and getattr(agent, "noop_discards", None):
-            # The re-ask itself produced only fabricated null edits
-            # (parse_edits dropped them): same treatment as the
-            # first-answer case above.
+            # The re-ask itself produced only null edits: same treatment.
             files = ", ".join(dict.fromkeys(agent.noop_discards))
             workspace.log_event(root, f"re-ask produced only no-op edit "
                                       f"block(s) ({files}); treated as a "
@@ -1442,10 +1226,7 @@ def run_task(root: Path, cfg, client, agent, idx, task: str, *,
             reply = _mark_fabricated(reply)
     if (not results and not contradicted and not fabricated
             and not _is_noop(reply)):
-        # Fix X2: a "no changes" declaration is a decision the loop
-        # honors (run_loop marks the task done or retires the repair),
-        # not a parse failure -- an ERROR here would only muddy the
-        # event trail of a clean refusal.
+        # A "no changes" declaration is a decision, not a parse failure.
         workspace.log_event(root, "no edit blocks parsed from the reply", "ERROR")
     elif results:
         for r in results:
@@ -1474,26 +1255,21 @@ def run_task(root: Path, cfg, client, agent, idx, task: str, *,
                 pass               # a deleted/moved file re-indexes on next refresh
         agent.index = idx
 
+    steps_log = list(getattr(agent, "steps_log", []) or [])
     session = None
     if cfg.log_sessions:
-        session = workspace.write_session(root, task,
-                                          getattr(agent, "steps_log", []),
+        session = workspace.write_session(root, task, steps_log,
                                           reply, results, backup_dir, when,
                                           raw_reply=raw_reply if truncated else None)
         print(f"[session: {session.relative_to(root)}]", file=sys.stderr)
     return TaskResult(results, reply, applied, changed, idx, session,
-                      list(getattr(agent, "steps_log", []) or []),
-                      fabricated=fabricated_only)
+                      steps_log, fabricated=fabricated_only,
+                      backup_dir=backup_dir)
 
-
-# --------------------------------------------------------------------------
-# The outer loop itself
-# --------------------------------------------------------------------------
 
 # Corrective re-runs are one-shot: a second identical failure is a verdict,
-# not a transient. Shared by the procedural-verify re-run (bug T) and the
-# incomplete-task retry (bug V); both keep the task unchecked so the next
-# iteration picks it up again, with a one-shot note appended to its prompt.
+# not a transient. Each keeps the task unchecked so the next iteration picks
+# it up again, with a one-shot note appended to its prompt.
 _MAX_TASK_RETRIES = 1
 
 _VERIFY_RETRY_NOTE = (
@@ -1507,13 +1283,8 @@ _VERIFY_RETRY_NOTE = (
     "its VERDICT line. If a tool itself fails, quote the exact error "
     "output in the report.")
 
-# Fix ZD (run 13f): the frog check's gather phase succeeded PERFECTLY --
-# a flat async-IIFE eval resolved the full per-row profile and the
-# done-step reasoning confirmed the criterion -- then BOTH answer attempts
-# streamed zero visible content (Qwen3 thinking runaway on Ollama), the
-# loop synthesized the steps-log stand-in, and NO branch caught it: the run
-# stopped, stranding three healthy checks. An empty report over gathered
-# evidence is a report-writer flake, not a product verdict.
+# An empty report over gathered evidence is a report-writer flake (e.g. a
+# thinking runaway), not a product verdict.
 _EMPTY_REPORT_RETRY_NOTE = (
     "### RETRY -- THE PREVIOUS ATTEMPT'S REPORT CAME BACK EMPTY\n"
     "This exact verification already ran once: its lookup phase completed "
@@ -1573,9 +1344,7 @@ def run_loop(root: Path, cfg, client, idx, plan_path: Path, *,
     fresh ``Agent`` (fresh context), optionally verify, then tick the task off
     and continue. Returns a process exit code (0 = no failed tasks).
 
-    - ``apply``         write edits (False = the loop would tick tasks it never
-                        wrote, so callers pass True; the flag exists for symmetry
-                        with run_task).
+    - ``apply``         write edits (callers pass True; the flag mirrors run_task).
     - ``verify``        shell command run after each task; failure triggers a
                         repair round-trip (up to repair_rounds) before the task
                         is given up on.
@@ -1587,46 +1356,34 @@ def run_loop(root: Path, cfg, client, idx, plan_path: Path, *,
                         False = log it and carry on to the next task.
     - ``answer_system`` replacement answer brief (used when the tasks implement
                         scaffold stubs rather than edit existing code).
-    - Investigation-only tasks ("Reproduce...", "Locate the cause...") are
-      answered in prose and marked done without requiring edits.
-    - Verification checkpoints (titles asking to verify/confirm/observe) are
-      FAILED, not ticked done, when their report says the verification did
-      not succeed -- it could not be performed ("could not visually verify")
-      or was performed and came back negative ("Verification failed in the
-      captured run") -- or, for titles promising live observation ("Run the
-      game and verify ..."), when the session never drove the app (no
-      run/browser/screenshot step), or when the answer phase produced no
-      prose at all even after one retry (the synthesized steps-log stand-in
-      is not a report). An applied edit is not evidence, even with the shell
-      verify green; a driven browser is not a pass when the report says the
-      claim failed.
-    - When a verification checkpoint fails its evidence gate, the loop does
-      not give up on the plan: the failed report becomes a FAILED LIVE TEST
-      context note and a repair task is inserted into the plan immediately
-      before the still-unchecked check, which retries after the repair
-      lands. Bounded per check by ``repair_rounds`` (a check whose report
-      was empty gets no repair -- there is no diagnosis to act on); once
-      the budget is spent the failure ends the run as before.
-    - A verification that fails WITHOUT ever driving the app (no
-      run/browser/screenshot step) failed as a check RUN, not as a product
-      test: it is re-run once with the toolset spelled out and, if the
-      re-run stays source-only too, retired as unverified. Remediation is
-      never offered on zero evidence (bug T).
-    - A build task whose reply declares the work incomplete ("can't emit
-      the blocks yet -- to continue, the files must be read") with zero
-      edits applied is retried once, then failed -- never ticked done as a
-      no-op, even when the reply incidentally contains "already" (bug V).
-    - ``auto_install`` when a verification fails on a missing third-party
+    - ``auto_install``  when a verification fails on a missing third-party
                         module, pip-install it and retry (opt-in: the module
                         name comes from generated code). When off, the failure
                         is reported as a dependency problem and the code-repair
                         loop is skipped, since editing source cannot add a dep.
-    - ``goal``          the user's original spec text. Every task prompt
-                        carries it as background, so constraints the planner
-                        dropped from a title ("keeping the doubled height")
-                        still bind the worker. Forced file-reads are mined
-                        from the task TITLE only (agent.task_targets), never
-                        from the goal or report prose.
+    - ``goal``          the user's original spec text, carried by every task
+                        prompt as background so constraints the planner dropped
+                        from a title still bind the worker. Forced file-reads
+                        are mined from the task TITLE only (agent.task_targets).
+    - ``on_task``       optional callback invoked with each completed task.
+
+    Task handling:
+    - Investigation-only tasks ("Reproduce...", "Locate the cause...") are
+      answered in prose and marked done without requiring edits.
+    - Verification checkpoints (titles asking to verify/confirm/observe) are
+      FAILED, not ticked done, when their report says the verification did
+      not succeed, when (for titles promising live observation) the session
+      never drove the app (no run/browser/screenshot step), or when the answer
+      phase produced no prose even after one retry. An applied edit is not
+      evidence.
+    - A failed checkpoint gets a FAILED LIVE TEST context note and a repair
+      task inserted immediately before it; the check retries after the repair.
+      Bounded per check by ``repair_rounds`` (an empty report gets no repair).
+    - A verification that failed WITHOUT ever driving the app failed as a
+      check RUN, not as a product test: it is re-run once with the toolset
+      spelled out, then retired as unverified. Never remediated.
+    - A task whose reply declares the work incomplete with zero edits applied
+      is retried once, then failed -- never ticked done as a no-op.
     """
     from .agent import Agent
 
@@ -1634,46 +1391,31 @@ def run_loop(root: Path, cfg, client, idx, plan_path: Path, *,
     done = 0
     failed = 0
     started_at = time.monotonic()
-    # Investigation tasks produce a report, not an edit. Carry the latest
-    # reports into subsequent task prompts so a fresh context still benefits
-    # from the reproduction -- the plan file itself stays untouched.
+    # Reports/edit summaries carried into later task prompts so a fresh
+    # context still benefits from earlier findings.
     context_notes: list[str] = []
     workspace.log_event(root, f"auto loop: plan={plan_path.name}"
                               f" verify={verify or '(none)'}")
-
-    def tick(count: int) -> bool:
-        """Return False once max_tasks (if any) is reached."""
-        return max_tasks == 0 or count < max_tasks
+    _lint_plan_titles(root, plan_path)
 
     remediated: dict[str, int] = {}     # verify title -> repair rounds used
-    # Bug N (run 11): a check whose inserted repair applied NO edits is a
-    # check the repair worker judged unfixable in code -- run 11's planner
-    # titled task 1 "observe the spawn timing to CONFIRM the 12-second
-    # delay", the inserted repair instead did the goal's work (restored the
-    # 3-second schedule), and the next repair refused to re-break the code
-    # ("would conflict with the goal"). Retrying such a check is futile,
-    # stopping strands every downstream task, and a resume replays the same
-    # deadlock forever. Track each repair's outcome per check: False =
-    # completed with no applied edits -> when the check misses again,
-    # retire it as failed and CONTINUE with the rest of the plan.
+    # A check whose inserted repair applied NO edits was judged unfixable in
+    # code (e.g. the repair would re-break behavior the goal froze). Track
+    # each repair's outcome per check: False = no applied edits -> when the
+    # check misses again, retire it as failed and CONTINUE with the plan.
     repair_outcome: dict[str, bool] = {}  # check title -> last repair edited?
     pending_check: list[str] = []     # check whose repair runs next (0 or 1)
     retried: dict[str, int] = {}      # task title -> corrective re-runs used
     retry_note: list[str] = []        # one-shot note for the next attempt
 
     def offer_remediation(task: str, tr, miss: str) -> bool:
-        """Bug H: a failed verification checkpoint should not just end the
-        run -- its report is often an exact repair recipe, and a static plan
-        gives no task ownership of it. Record the diagnosis as a context
-        note and insert a repair task BEFORE the still-unchecked check: the
-        loop self-heals within the run, and the check retries afterwards.
-        Bounded per check by repair_rounds, so a verify that keeps failing
-        still ends the run loudly. Returns True when a repair was inserted
-        (caller must then continue instead of failing the task)."""
+        """Record a failed verification's report as a context note and insert
+        a repair task BEFORE the still-unchecked check, so the loop self-heals
+        and the check retries afterwards. Bounded per check by repair_rounds.
+        Returns True when a repair was inserted (caller must then continue
+        instead of failing the task)."""
         if (tr.reply or "").startswith("No prose report was produced"):
-            return False        # the answer phase was empty: there is no
-                                # diagnosis to act on, and a repair task
-                                # would be guessing. Fail loudly instead.
+            return False        # empty answer phase: no diagnosis to act on
         used = remediated.get(task, 0)
         if used >= repair_rounds:
             return False
@@ -1689,9 +1431,7 @@ def run_loop(root: Path, cfg, client, idx, plan_path: Path, *,
             f"instead:\n{_clip_report(tr.reply)}")
         _prune_notes(context_notes)     # run anchor + latest two
         insert_task_before(plan_path, task, _REMEDIATION_TITLE)
-        pending_check[:] = [task]       # replace: the repair is inserted
-                                        # immediately before its check, so
-                                        # its outcome belongs to THIS check
+        pending_check[:] = [task]       # the repair's outcome belongs to THIS check
         print(f"  [verification task failed: {miss} -- inserted a repair "
               f"task ahead of it; the check retries after "
               f"({repair_rounds - used - 1} repair round(s) left)]",
@@ -1700,9 +1440,25 @@ def run_loop(root: Path, cfg, client, idx, plan_path: Path, *,
                                   f"remediation task inserted", "WARN")
         return True
 
-    while tick(attempted):
-        lines = read_plan(plan_path)
-        nxt = next_task(lines)
+    use_diag = (not verify) and bool(getattr(cfg, "auto_diagnostics", False))
+    check_label = f"$ {verify}" if verify else "project diagnostics"
+
+    def run_check(changed):
+        if verify:
+            return run_verify(root, verify)
+        if use_diag:
+            return diagnostics.run_changed(root, cfg, changed)
+        return True, ""
+
+    def notify(task: str) -> None:
+        if on_task is not None:
+            try:
+                on_task(task)
+            except Exception:
+                pass
+
+    while max_tasks == 0 or attempted < max_tasks:
+        nxt = next_task(read_plan(plan_path))
         if nxt is None:
             print("\nAll tasks complete.", file=sys.stderr)
             workspace.log_event(root, "all tasks complete")
@@ -1723,10 +1479,6 @@ def run_loop(root: Path, cfg, client, idx, plan_path: Path, *,
         investigate = _is_investigation_task(task)
         task_for_agent = task + _evidence_hint(task)
         if goal:
-            # The workers used to see only their title and prior reports:
-            # a constraint that lived solely in the spec ("keep the doubled
-            # height") was lost the moment the planner's title dropped it,
-            # and the edit silently violated the user's goal.
             task_for_agent = (
                 "ORIGINAL USER GOAL (background -- the CURRENT TASK below is "
                 "the step to do now; every constraint in the goal still "
@@ -1737,23 +1489,17 @@ def run_loop(root: Path, cfg, client, idx, plan_path: Path, *,
                 task_for_agent + "\n\nCONTEXT FROM PRIOR INVESTIGATION\n\n"
                 + "\n\n".join(context_notes))
         if retry_note:
-            # One-shot corrective note (bug T's procedural verify re-run or
-            # bug V's incomplete-task retry): appended LAST so it is the
-            # freshest thing the worker reads, and popped so it can never
-            # leak into an unrelated task.
+            # One-shot corrective note, appended last (freshest thing the
+            # worker reads) and popped so it cannot leak into another task.
             task_for_agent += "\n\n" + retry_note.pop()
         try:
             agent = Agent(idx, client, cfg)
-            # Forced reads ("files the task will change") are mined from the
-            # clean title only. Mining the assembled prompt turned prior
-            # reports' descriptive file mentions -- even an explicit "do NOT
-            # change snake_spawner.py yet" list -- into a must-read list that
-            # buried verify tasks in dead-code reads until no steps were left
-            # to drive the browser.
+            # Forced reads are mined from the clean title only: prior reports
+            # mention files descriptively and would bloat the must-read list.
             agent.task_targets = task
             if investigate:
                 tr = run_investigation_task(
-                    root, cfg, client, agent, idx,
+                    root, cfg, agent, idx,
                     task_for_agent, answer_system=answer_system)
             else:
                 tr = run_task(root, cfg, client, agent, idx,
@@ -1776,19 +1522,10 @@ def run_loop(root: Path, cfg, client, idx, plan_path: Path, *,
                 miss = _evidence_failure(task, tr)
                 if miss:
                     if not _used_live_evidence(tr.steps):
-                        # Bug T (graveyard run): verify 1 and verify 2 both
-                        # ended with zero run/browser/screenshot steps --
-                        # "no live verification possible without tools", a
-                        # confabulation primed by carried notes saturated
-                        # with "no evidence was captured". The loop treated
-                        # that WORKER failure as a PRODUCT defect and
-                        # inserted repairs; the first one stripped 22 script
-                        # tags from index.html while its prose said "No
-                        # edit". A check nobody executed says nothing about
-                        # the product: re-run it once with the toolset
-                        # spelled out, and only retire it -- never
-                        # remediate it -- when the re-run stays source-only
-                        # too.
+                        # A check nobody executed says nothing about the
+                        # product: re-run it once with the toolset spelled
+                        # out, and only retire it (never remediate it) when
+                        # the re-run stays source-only too.
                         tries = retried.get(task, 0)
                         if tries < _MAX_TASK_RETRIES:
                             retried[task] = tries + 1
@@ -1818,18 +1555,10 @@ def run_loop(root: Path, cfg, client, idx, plan_path: Path, *,
                         continue
                     if (tr.reply or "").startswith(
                             "No prose report was produced"):
-                        # Fix ZD (run 13f): the gather phase succeeded --
-                        # live evidence present, measurement complete --
-                        # and the ANSWER phase came back empty even after
-                        # its own retry (Qwen3 spent the whole 20k budget
-                        # on invisible reasoning, twice). The stand-in is
-                        # not a verdict and carries no diagnosis: nothing
-                        # to remediate, nothing real to fail. Re-run the
-                        # check once; a second empty answer retires it as
-                        # unverified (a procedural failure, never a
-                        # product verdict) and the plan CONTINUES -- run
-                        # 13f stranded three healthy checks because this
-                        # case fell through to the stop-on-fail tail.
+                        # The stand-in is not a verdict and carries no
+                        # diagnosis. Re-run the check once; a second empty
+                        # answer retires it as unverified (a procedural
+                        # failure) and the plan CONTINUES.
                         tries = retried.get(task, 0)
                         if tries < _MAX_TASK_RETRIES:
                             retried[task] = tries + 1
@@ -1858,14 +1587,10 @@ def run_loop(root: Path, cfg, client, idx, plan_path: Path, *,
                         repair_outcome.pop(task, None)
                         continue
                     if repair_outcome.get(task) is False:
-                        # Bug N: the repair inserted for THIS check completed
-                        # with no edits -- it judged the check unfixable in
-                        # code (run 11: refusing to reintroduce the defect
-                        # the goal had just removed). Another repair round
-                        # would refuse again, and stopping strands every
-                        # downstream task while a resume replays the same
-                        # deadlock forever. Retire the check loudly (failed
-                        # box, event log, stderr) and let the plan continue.
+                        # The repair for THIS check applied no edits: another
+                        # round would refuse again and stopping would strand
+                        # every downstream task. Retire the check loudly and
+                        # let the plan continue.
                         print(f"  [verification task failed: {miss} -- its "
                               f"repair applied no edits (a goal conflict or "
                               f"an already-satisfied check); retiring the "
@@ -1897,11 +1622,7 @@ def run_loop(root: Path, cfg, client, idx, plan_path: Path, *,
                 mark_done(plan_path, task)
                 done += 1
                 workspace.log_event(root, "investigation done")
-                if on_task is not None:
-                    try:
-                        on_task(task)
-                    except Exception:
-                        pass
+                notify(task)
                 continue
             print("  [investigation produced no report -- "
                   f"{'stopping' if stop_on_fail else 'skipping'}]",
@@ -1916,18 +1637,11 @@ def run_loop(root: Path, cfg, client, idx, plan_path: Path, *,
         ok_edits = [r for r in tr.results if r.ok]
         if not tr.applied or not ok_edits:
             if task != _REMEDIATION_TITLE and _declares_incomplete(tr.reply):
-                # Bug V (graveyard run): task 4 "Move each file..." answered
-                # "I can't safely emit the move blocks yet -- to continue,
-                # the files must be read" with ZERO edits, and an incidental
-                # "graveyard/ has already been created" (a prior task's
-                # work) matched _is_noop: the move was ticked DONE without
-                # ever happening, and only the third verify session caught
-                # the empty graveyard. A reply describing work still
-                # required is never a no-op. The deferred work WAS possible
-                # in the lookup phase (read/run have the full toolset), so
-                # retry once with that spelled out, then fail loudly.
-                # Repair tasks are exempt: refusing to edit is their
-                # sanctioned conflict-report (bug N's retire keys off it).
+                # A reply describing work still required is never a no-op,
+                # even if it incidentally contains "already". The deferred
+                # work was possible in the lookup phase, so retry once with
+                # that spelled out, then fail. Repair tasks are exempt:
+                # refusing to edit is their sanctioned conflict-report.
                 tries = retried.get(task, 0)
                 if tries < _MAX_TASK_RETRIES:
                     retried[task] = tries + 1
@@ -1950,13 +1664,10 @@ def run_loop(root: Path, cfg, client, idx, plan_path: Path, *,
                     break
                 mark_failed(plan_path, task)
                 continue
-            if getattr(tr, "fabricated", False) and task != _REMEDIATION_TITLE:
-                # The reply's only blocks were null edits (SEARCH == REPLACE)
-                # and it did not itself declare the work complete. _is_noop
-                # used to match the synthetic marker run_task appended and
-                # tick the task done -- the graveyard run's collision.py task
-                # "completed" without a single lookup or move. Retry once with
-                # the concrete move/rename instructions, then fail loudly.
+            if tr.fabricated and task != _REMEDIATION_TITLE:
+                # The reply's only blocks were null edits and it did not
+                # itself declare the work complete. Retry once with concrete
+                # move/rename instructions, then fail.
                 tries = retried.get(task, 0)
                 if tries < _MAX_TASK_RETRIES:
                     retried[task] = tries + 1
@@ -1987,9 +1698,8 @@ def run_loop(root: Path, cfg, client, idx, plan_path: Path, *,
                       "marking it done]", file=sys.stderr)
                 workspace.log_event(root, "task already complete (no-op)")
                 if task == _REMEDIATION_TITLE and pending_check:
-                    # The repair refused to edit (run 11: "Reintroducing the
-                    # 12-second delay ... would conflict with the goal").
-                    # Remember the refusal for the check that retries next.
+                    # The repair refused to edit: remember that for the check
+                    # that retries next.
                     repair_outcome[pending_check.pop()] = False
                 mark_done(plan_path, task)
                 done += 1
@@ -2005,53 +1715,51 @@ def run_loop(root: Path, cfg, client, idx, plan_path: Path, *,
 
         if task == _REMEDIATION_TITLE and pending_check:
             # The repair edited code: a re-failing check stays on the normal
-            # remediation path (bug N's retire rule only fires for repairs
-            # that REFUSED to edit).
+            # remediation path (retiring only applies to refusing repairs).
             repair_outcome[pending_check.pop()] = True
 
-        # Verification: the loop's quality gate. On failure, hand the model
-        # the command's output and let it fix its own work -- the feedback
-        # loop that separates a Ralph loop from a file-generator.
-        # With auto_diagnostics on and no explicit --verify, the same loop
-        # consumes linter/typechecker findings for the files the task changed.
-        use_diag = (not verify) and bool(
-            getattr(cfg, "auto_diagnostics", False))
-        check_label = f"$ {verify}" if verify else "project diagnostics"
-
-        def run_check(changed):
-            if verify:
-                return run_verify(root, verify)
-            if use_diag:
-                from . import diagnostics
-                return diagnostics.run_changed(root, cfg, changed)
-            return True, ""
-
+        # Verification gate: on failure, hand the model the command's output
+        # to fix. With auto_diagnostics on and no explicit --verify, linter/
+        # typechecker findings for the changed files play the same role.
         passed = True
         dep_blocked: list[str] = []
         if verify or use_diag:
             passed, output = run_check(tr.changed)
             rounds = repair_rounds
+            installed: set[str] = set()
+            # Rollback-if-worse: the current failure's severity. A repair
+            # round that raises it gets undone from its own snapshot (which
+            # holds the state before that round's writes), keeping the
+            # better earlier state, and repair stops.
+            prev_score = None if passed else _failure_score(output, use_diag)
             while not passed:
                 # A missing third-party package is NOT a code bug: editing
-                # source cannot add a dependency, so sending it to the repair
-                # loop just burns rounds. Handle it as a dependency problem --
-                # install it if the user opted in, otherwise report and stop.
+                # source cannot add a dependency. Install it if the user opted
+                # in, otherwise report and stop.
                 missing = missing_modules(output)
                 if missing:
                     dists = ", ".join(pip_name(m) for m in missing)
-                    if auto_install:
+                    if auto_install and not installed.issuperset(missing):
+                        installed.update(missing)
                         print(f"  [verify needs missing dependencies: {dists}; "
                               f"installing]", file=sys.stderr)
                         workspace.log_event(
                             root, f"verify missing deps: {dists}; installing",
                             "WARN")
-                        ok, inst = install_modules(missing, root)
+                        ok, _ = install_modules(missing, root)
                         workspace.log_event(
                             root, f"pip install {'ok' if ok else 'FAILED'}: {dists}",
                             "INFO" if ok else "ERROR")
                         if ok:
                             passed, output = run_check(tr.changed)
                             continue          # a dependency is not a repair round
+                    elif auto_install:
+                        print(f"  [verify still reports missing dependencies "
+                              f"after installing them: {dists}]",
+                              file=sys.stderr)
+                        workspace.log_event(
+                            root, f"verify blocked by missing deps after "
+                                  f"install: {dists}", "ERROR")
                     else:
                         print(f"  [verify cannot run: missing dependencies: "
                               f"{dists}. Install with `pip install {dists}`, "
@@ -2083,6 +1791,27 @@ def run_loop(root: Path, cfg, client, idx, plan_path: Path, *,
                     break
                 idx = tr2.idx
                 passed, output = run_check(tr2.changed)
+                if not passed and prev_score is not None:
+                    score = _failure_score(output, use_diag)
+                    if score > prev_score and tr2.backup_dir \
+                            and tr2.backup_dir.is_dir():
+                        restored = workspace.restore(root, tr2.backup_dir)
+                        for f in restored:
+                            try:
+                                idx = index_mod.reindex_file(idx, f, cfg)
+                            except Exception:
+                                pass
+                        print(f"  [repair made the check worse "
+                              f"({prev_score} -> {score} problem(s)); "
+                              f"rolled back {len(restored)} file(s) from "
+                              f"{tr2.backup_dir.name} and stopped repairing]",
+                              file=sys.stderr)
+                        workspace.log_event(
+                            root, f"repair round made {check_label} worse "
+                                  f"({prev_score} -> {score}); restored "
+                                  f"{len(restored)} file(s)", "WARN")
+                        break
+                    prev_score = score
                 rounds -= 1
 
         if not passed:
@@ -2106,9 +1835,7 @@ def run_loop(root: Path, cfg, client, idx, plan_path: Path, *,
             if offer_remediation(task, tr, miss):
                 continue        # the check stays unchecked; the repair
                                 # task runs next, then it retries
-            # An applied edit is not evidence: a task that asks to verify
-            # live behavior has to show it drove the app, even with edit
-            # blocks on the floor and the shell verify green.
+            # An applied edit is not evidence, even with the shell verify green.
             print(f"  [verification task failed: {miss} -- "
                   f"{'stopping' if stop_on_fail else 'skipping'}]",
                   file=sys.stderr)
@@ -2122,41 +1849,27 @@ def run_loop(root: Path, cfg, client, idx, plan_path: Path, *,
             continue
 
         if tr.applied and tr.changed:
-            # Later tasks must not trust pre-edit reports: after a fix
-            # landed, a verify task tried to reconcile the stale "duplicated
-            # block at L212-216" note against post-fix source and half
-            # concluded the browser was serving a cache. State the change
-            # explicitly so the notes carry their own expiry.
-            summary = (tr.reply or "").split("--- FILE:")[0].strip()
+            # Mark earlier notes stale so later tasks do not trust pre-edit
+            # reports. Structured list, no reply prose: the model can re-read
+            # a file, but tokens spent re-summarising the change are wasted.
+            files = "\n".join(f"- {f}" for f in sorted(set(tr.changed)))
             context_notes.append(
-                f"### {task}\nEDITS APPLIED to: "
-                f"{', '.join(sorted(set(tr.changed)))}.\n"
-                + (summary[:400] + "\n" if summary else "")
-                + "These files changed on disk AFTER the reports above; line "
-                  "numbers and defect descriptions in earlier notes may be "
-                  "stale -- re-read the current file state before quoting it.")
+                f"### {task}\nFILES CHANGED:\n{files}\n"
+                "Earlier notes predate these writes; their line numbers and "
+                "defect descriptions may be stale -- re-read the current file "
+                "state before quoting it.")
             _prune_notes(context_notes)   # run anchor + latest two
 
         mark_done(plan_path, task)
         done += 1
         workspace.log_event(root, f"task done ({done})")
-        if on_task is not None:
-            try:
-                on_task(task)
-            except Exception:
-                pass
+        notify(task)
 
     print(f"\n[{done} task(s) done, {failed} failed]", file=sys.stderr)
-    remaining = 0
-    for ln in read_plan(plan_path):
-        m = _TASK_LINE.match(ln)
-        if m and m.group(2).strip() == "":
-            remaining += 1
+    remaining = sum(1 for ln in read_plan(plan_path) if _is_unchecked(ln))
     if remaining:
-        # The loop ended with work outstanding -- a cap, a time limit, or (the
-        # default) a stop on the first failed task. Say so plainly, with the
-        # two ways forward; without this a stopped run looks like the tool
-        # silently gave up after one task.
+        # Stopped with work outstanding (a cap, a time limit, or a failed
+        # task): say how to resume.
         print(f"  [{remaining} task(s) are still unchecked in "
               f"{plan_path.name}; rerun the same command to resume them"
               + (", or add --keep-going to run through failures"
