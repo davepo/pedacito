@@ -331,6 +331,9 @@ def _evidence_failure(task: str, tr) -> str:
     if (tr.reply or "").startswith("No prose report was produced"):
         return ("its report is empty (the answer phase produced no prose "
                 "even after a retry); a steps log is not a verification")
+    if _looks_like_unexecuted_promise(tr.reply):
+        return ("its report only promises to run the check; the answer phase "
+                "has no tools, so no observation was reported")
     state, reason = _verdict_of(tr.reply)
     if state == "FAILED":
         return ("its own verdict line says VERDICT: FAILED"
@@ -341,10 +344,13 @@ def _evidence_failure(task: str, tr) -> str:
                               else _strip_prior_attempt_prose(tr.reply)):
         return ("its report says the verification did not succeed "
                 "(could not be performed, or was performed and failed)")
-    if _needs_live_evidence(task) and not _used_live_evidence(
-            getattr(tr, "steps", ())):
-        return ("it never drove the app (no run/browser/screenshot step); "
-                "reading source is not live evidence")
+    live_ok = getattr(tr, "live_ok", None)
+    if live_ok is None:                 # callers/tests predating the flag
+        live_ok = _used_live_evidence(getattr(tr, "steps", ()))
+    if _needs_live_evidence(task) and not live_ok:
+        return ("it never successfully drove the app (no run/browser/"
+                "screenshot step produced an observation); reading source "
+                "or a failed launch attempt is not live evidence")
     return ""
 
 
@@ -559,9 +565,10 @@ Rules:
   complaint like "X was added but is not showing / still looks wrong" -- the
   FIRST task must run the program and observe the actual current behavior,
   and the LAST task must run the program and observe that the change took
-  visible effect. Title them with how to observe ("Run the game and verify
-  the snake is twice as tall in the browser"): the loop FAILS a verification
-  task that never drove the app.
+  visible effect. Title them with how to observe and, for a size/layout
+  claim, the number to measure ("Run the game and verify the canvas is at
+  most 480x360 and scrollHeight equals innerHeight"): the loop FAILS a
+  verification task that never drove the app.
 - If the goal lists several independent visible changes, put a live
   verification checkpoint after EACH one, not a single checkpoint at the
   end: when one big final check fails, the failure cannot be attributed to
@@ -781,6 +788,11 @@ class TaskResult:
     # rollback-if-worse guard restores to undo a repair that made the check
     # worse.
     backup_dir: Path | None = None
+    # Whether a run/browser/screenshot action actually executed and produced
+    # a non-error observation. None means the caller predates the flag; the
+    # steps log is then used as the fallback. A merely ATTEMPTED live step
+    # (bad URL, missing server) is not evidence.
+    live_ok: bool | None = None
 
 
 def _report(results, dry_run: bool):
@@ -1020,6 +1032,11 @@ reading, and if the live path is unconfirmed, lead "still unknown" with that.
 Do not call tools -- none are available in this phase.
 Do not emit search/replace blocks. Be concrete and concise; if the evidence is
 inconclusive, say what is still unknown and what to check next.
+For a layout or styling diagnosis, confirm the selector actually matches the
+live element (id/class in the markup) and that no script sets the value
+directly -- a rule whose selector matches nothing explains nothing. Also
+confirm which document the route actually serves: a template that is never
+rendered, or a stylesheet the served HTML never links, cannot be the cause.
 """
 
 # Appended to INVESTIGATE_SYSTEM for verification-titled investigations (see
@@ -1032,7 +1049,12 @@ VERDICT: PASSED -- only when EVERY part of the task's claim was confirmed by
 live evidence you gathered in this session.
 VERDICT: FAILED: <one-sentence reason> -- in every other case. A partially
 confirmed claim is FAILED. Reading source code is never live evidence. Do not
-hedge: the loop reads this line mechanically and acts on it."""
+hedge: the loop reads this line mechanically and acts on it.
+For a visual or layout claim, quote a concrete before/after measurement from
+the running page (element size, computed style, or scrollHeight vs
+innerHeight). "No scroll bars appeared" is not evidence that the play area
+changed; a number that is identical before and after means the fix did
+nothing."""
 
 _TOOL_SYNTAX = ("<tool_call", "<invoke", "<function=", "<read", '"name":')
 
@@ -1051,7 +1073,58 @@ def _looks_like_tool_calls_only(reply: str) -> bool:
     plain = re.sub(r"\S*[/\\]\S*", " ", plain)      # paths
     plain = re.sub(r"[{}\[\]\"]", " ", plain)
     words = re.findall(r"[A-Za-z]{3,}", plain)
+    if opens and len(words) < 40 and not _VERDICT_RE.search(reply):
+        # One tool call wrapped in a sentence of intent ("I'll run the game
+        # ...") is not a report. Real prose quoting tool syntax usually has
+        # enough surrounding report or a verdict line; a lone call does not.
+        return True
     return opens >= 3 or len(words) < 8
+
+
+# A verification report still to be performed: it opens with a promise
+# ("I'll run the game..."), names no observed result, and -- in the answer
+# phase there are no tools -- can never happen. The harness used to accept
+# exactly that shape as a PASSED check.
+_PROMISE_HEAD_RE = re.compile(
+    r"^[\s#*\-\u2022\d.)]*(?:i['\u2019]ll|i will|i['\u2019]m going to|"
+    r"i am going to|let me|first,? i['\u2019]ll|next,? i['\u2019]ll)\b")
+_REPORT_EVIDENCE_RE = re.compile(
+    r"\b(?:observed|observes|measured|measures|captured|shows?|showed|"
+    r"found|confirmed|verified|reported|rendered|loaded|screenshot|"
+    r"canvas|pixels?|dimensions?)\b|\d", re.IGNORECASE)
+
+
+def _report_prose(reply: str) -> str:
+    """The reply minus tool-call payloads and fenced code, for checks that
+    must not mistake JSON numbers or `<tool_call>` text for observations."""
+    text = re.sub(r"<tool_call\b[^>]*>.*?(?:</tool_call>|\Z)", " ", reply or "",
+                  flags=re.IGNORECASE | re.DOTALL)
+    text = re.sub(r"<invoke\b[^>]*>.*?(?:</invoke>|\Z)", " ", text,
+                  flags=re.IGNORECASE | re.DOTALL)
+    return re.sub(r"```.*?```", " ", text, flags=re.DOTALL)
+
+
+def _looks_like_unexecuted_promise(reply: str) -> bool:
+    """True for a report that only promises to run the check. The answer
+    phase has no tools, so no observation can follow the promise; a verdict
+    line or a concrete result marker makes it a real report."""
+    text = _report_prose(reply).strip()
+    if not text:
+        return False
+    norm = _normalized_reply(text)
+    if not _PROMISE_HEAD_RE.match(norm):
+        return False
+    if _VERDICT_RE.search(text):
+        return False
+    return not _REPORT_EVIDENCE_RE.search(norm)
+
+
+def _unusable_report(reply: str) -> bool:
+    """True when an investigation reply is not a report at all (empty,
+    tool-call syntax, or a bare promise to run the check later)."""
+    return (not (reply or "").strip()
+            or _looks_like_tool_calls_only(reply)
+            or _looks_like_unexecuted_promise(reply))
 
 
 def _prose_collapse(reply: str) -> bool:
@@ -1097,8 +1170,7 @@ def run_investigation_task(root: Path, cfg, agent, idx, task: str, *,
               "regenerating it once]", file=sys.stderr)
         workspace.log_event(root, "answer collapsed into phrase repetition; "
                             "regenerating once", "WARN")
-    if _looks_like_tool_calls_only(reply) or not (reply or "").strip() \
-            or collapsed:
+    if _unusable_report(reply) or collapsed:
         # One retry absorbs transient empty completions and regenerates a
         # phrase-loop collapse before it reaches the context notes every
         # later task reads.
@@ -1106,15 +1178,15 @@ def run_investigation_task(root: Path, cfg, agent, idx, task: str, *,
             print("  [the answer phase returned no usable prose; "
                   "retrying once]", file=sys.stderr)
             workspace.log_event(root, "answer phase produced no prose "
-                                "(empty or tool-calls-only completion); "
-                                "retrying once", "WARN")
+                                "(empty, tool-calls-only, or a promise to "
+                                "run the check later); retrying once", "WARN")
         retry = agent.answer(task, gathered,
                              system=system,
                              include_edit_format=False, stream=True)
-        if (retry or "").strip() and not _looks_like_tool_calls_only(retry):
+        if (retry or "").strip() and not _unusable_report(retry):
             reply = retry
     steps_log = list(getattr(agent, "steps_log", []) or [])
-    if _looks_like_tool_calls_only(reply) or not (reply or "").strip():
+    if _unusable_report(reply):
         steps = "\n".join(steps_log or ["(no steps)"])
         reply = ("No prose report was produced; the lookup phase recorded:\n\n"
                  + steps)
@@ -1129,7 +1201,8 @@ def run_investigation_task(root: Path, cfg, agent, idx, task: str, *,
         session = workspace.write_session(root, task, steps_log,
                                           reply, [], None, when)
         print(f"[session: {session.relative_to(root)}]", file=sys.stderr)
-    return TaskResult([], reply, True, [], idx, session, steps_log)
+    return TaskResult([], reply, True, [], idx, session, steps_log,
+                      live_ok=getattr(agent, "live_evidence_ok", None))
 
 
 def run_task(root: Path, cfg, client, agent, idx, task: str, *,
@@ -1264,7 +1337,8 @@ def run_task(root: Path, cfg, client, agent, idx, task: str, *,
         print(f"[session: {session.relative_to(root)}]", file=sys.stderr)
     return TaskResult(results, reply, applied, changed, idx, session,
                       steps_log, fabricated=fabricated_only,
-                      backup_dir=backup_dir)
+                      backup_dir=backup_dir,
+                      live_ok=getattr(agent, "live_evidence_ok", None))
 
 
 # Corrective re-runs are one-shot: a second identical failure is a verdict,

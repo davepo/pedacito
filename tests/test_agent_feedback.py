@@ -220,6 +220,50 @@ def test_write_allowlist_reflects_config_and_ledgers(tmp_path):
     assert agent._write_allowlist() == {"pkg/app.py", "README.md"}
 
 
+def test_gather_tracks_only_successful_live_steps(tmp_path, monkeypatch):
+    """A browser URL typo / missing server returns ERROR from the tool. That
+    step is still written to `steps_log` (for the session record), but it
+    must not satisfy the outer loop's live-evidence gate."""
+    import pedacito.agent as agent_mod
+
+    class Scripted:
+        step_truncated = False
+
+        def __init__(self):
+            self.n = 0
+
+        def chat_json(self, messages, schema, max_tokens, **kw):
+            self.n += 1
+            if self.n == 1:
+                return {"action": "browser", "command": "http://127.0.0.1:9/",
+                        "reasoning": "check"}
+            return {"action": "done", "reasoning": "finished"}
+
+    def failing_dispatch(index, cfg, step, client=None):
+        return "ERROR: could not open the page"
+
+    monkeypatch.setattr(agent_mod, "dispatch", failing_dispatch)
+    agent = _agent(tmp_path, Scripted())
+    agent.gather("run the game and verify it", verbose=False)
+    assert agent.live_evidence_ok is False
+    assert agent.steps_log                 # attempted step is still logged
+
+    class ScriptedOk(Scripted):
+        def chat_json(self, messages, schema, max_tokens, **kw):
+            self.n += 1
+            if self.n == 1:
+                return {"action": "browser", "command": "http://127.0.0.1:9/",
+                        "reasoning": "check"}
+            return {"action": "done", "reasoning": "finished"}
+
+    monkeypatch.setattr(
+        agent_mod, "dispatch",
+        lambda index, cfg, step, client=None: "BROWSER: http://127.0.0.1:9/")
+    agent = _agent(tmp_path, ScriptedOk())
+    agent.gather("run the game and verify it", verbose=False)
+    assert agent.live_evidence_ok is True
+
+
 def test_gather_arms_allowlist_ledgers_and_digests_reads(tmp_path):
     class Scripted:
         step_truncated = False

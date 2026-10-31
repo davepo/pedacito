@@ -410,6 +410,23 @@ def test_gather_base_requires_locate_diligence():
     from pedacito.agent import GATHER_BASE
     assert "hypothesis, not an answer" in GATHER_BASE
     assert "entry point" in GATHER_BASE
+    # The pitfall run edited `#game, canvas.game` while the live canvas is
+    # `#game-canvas` with no class: the rule never applied, so the "fix"
+    # changed nothing. Confirm the selector before blaming the rule.
+    assert "selector actually" in GATHER_BASE
+    assert "matches the live element" in GATHER_BASE
+    assert "canvas.width/height" in GATHER_BASE
+    assert "WHICH document is actually served" in GATHER_BASE
+    assert "inline\n  fallback" in GATHER_BASE
+
+
+def test_verdict_brief_demands_a_measurement_for_visual_claims():
+    """Same run: "no scroll bars" was true before and after because body
+    overflow was hidden, while the oversized canvas never changed. A visual
+    verdict must quote a number that can differ before/after."""
+    assert "before/after measurement" in loop._VERDICT_BRIEF
+    assert "scrollHeight" in loop._VERDICT_BRIEF
+    assert "number to measure" in loop.PLAN_SYSTEM
 
 
 def test_gather_base_warns_browser_waits_add():
@@ -522,12 +539,68 @@ def test_run_investigation_task_retries_an_empty_answer(tmp_path):
     assert "synthesized a steps-log stand-in" in log
 
 
+def test_run_investigation_task_retries_a_promise_answer(tmp_path):
+    """The answer phase has no tools. A reply that only says it will run the
+    check (plus a tool call) must be regenerated once, exactly like an empty
+    completion -- otherwise it reaches the evidence gate as a report."""
+    cfg = _cfg()
+    calls = []
+    PROMISE = (
+        "I'll run the game in the browser and check for scroll bars.\n\n"
+        '<tool_call>{"name": "run", "arguments": {"command": '
+        '"python main.py &"}}</tool_call>')
+    REAL = ("The canvas is 480x360 and scrollHeight equals innerHeight "
+            "after the fix.\n\nVERDICT: PASSED")
+
+    class FakeAgent:
+        steps_log = ["1. browser http://127.0.0.1:5000/  (Check.)"]
+        live_evidence_ok = True
+
+        def gather(self, task, **kw):
+            return "gathered source"
+
+        def answer(self, task, gathered, **kw):
+            calls.append(1)
+            return PROMISE if len(calls) == 1 else REAL
+
+    tr = loop.run_investigation_task(
+        tmp_path, cfg, FakeAgent(),
+        types.SimpleNamespace(root=tmp_path),
+        "Run the game and verify it displays without scroll bars")
+    assert len(calls) == 2
+    assert tr.reply == REAL
+
+
 def test_tool_call_only_answer_is_detected():
     assert loop._looks_like_tool_calls_only(
         '<tool_call>{"name": "run", "arguments": {}}</tool_call>')
     assert not loop._looks_like_tool_calls_only(
         "Likely cause: the surface is never cleared. "
         "The run produced no output, so the loop is spun before drawing.")
+
+
+def test_a_promise_with_one_tool_call_is_not_a_report():
+    """The run that motivated this: the final live check answered "I'll run
+    the game in the browser and check for scroll bars" plus ONE `run`
+    tool call -- the answer phase has no tools, so nothing was checked.
+    The old detector required 3 opens or <8 words and accepted it."""
+    reply = (
+        "I'll run the game in the browser and check for scroll bars after "
+        "the CSS fix.\n\n"
+        "<tool_call>\n"
+        '{"name": "run", "arguments": {"command": "python main.py &", '
+        '"timeout": 15, "background": true}}\n'
+        "</tool_call>")
+    assert loop._looks_like_tool_calls_only(reply)
+    assert loop._unusable_report(reply)
+    assert loop._looks_like_unexecuted_promise(reply)
+    # A real report quoting tool syntax is not mistaken for a promise.
+    real = ("The earlier browser step failed with "
+            "<tool_call>run</tool_call> because port 5000 was already in use; "
+            "the new capture shows the canvas at 480x360.\n\n"
+            "VERDICT: PASSED")
+    assert not loop._looks_like_tool_calls_only(real)
+    assert not loop._looks_like_unexecuted_promise(real)
 
 
 def test_prose_collapse_flags_phrase_loops_but_not_parallel_prose():
@@ -777,6 +850,47 @@ def test_run_loop_live_verify_needs_a_live_step(tmp_path, monkeypatch):
                                             # has its own tests
     assert code == 1
     assert "- [x]" not in plan.read_text()
+
+
+def test_failed_live_steps_do_not_satisfy_the_evidence_gate():
+    """An attempted browser step is not live evidence: bad URLs and server
+    launch failures share the same steps-log shape. The Agent records
+    whether a run/browser/screenshot step actually produced an observation,
+    and the gate prefers that over the steps-log regex."""
+    steps = ["1. browser http://127.0.0.1:5000/  (Check it.)",
+             "2. browser python main.py  (Launch it.)"]
+    failed = loop.TaskResult(
+        [], "The canvas is 1280x800 and the page has no scroll bars.",
+        True, [], None, steps=steps, live_ok=False)
+    assert "never successfully drove the app" in loop._evidence_failure(
+        "Run the game and verify the canvas is 480x360", failed)
+    passed = loop.TaskResult(
+        [], "The canvas is 480x360 and scrollHeight equals innerHeight.",
+        True, [], None, steps=steps, live_ok=True)
+    assert loop._evidence_failure(
+        "Run the game and verify the canvas is 480x360", passed) == ""
+
+
+def test_promise_only_verification_report_fails_the_gate():
+    """The exact terminal run: task 4 answered with a promise and one tool
+    call after four failed lookup steps, was marked done, and the run ended
+    "all tasks complete" although the screenshot after the fix was identical
+    to the one before it (canvas still 1280x800)."""
+    reply = (
+        "I'll run the game in the browser and check for scroll bars after "
+        "the CSS fix.\n\n"
+        "<tool_call>\n"
+        '{"name": "run", "arguments": {"command": "python main.py &", '
+        '"timeout": 15, "background": true}}\n'
+        "</tool_call>")
+    tr = loop.TaskResult(
+        [], reply, True, [], None,
+        steps=["3. browser http://127.0.0.1:5000/  (Check it.)"],
+        live_ok=True)
+    miss = loop._evidence_failure(
+        "Run the game in the browser and verify it displays without scroll "
+        "bars", tr)
+    assert "promises to run the check" in miss
 
 
 def test_run_loop_live_verify_passes_with_browser_step(tmp_path, monkeypatch):

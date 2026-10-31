@@ -347,6 +347,17 @@ Rules:
   program's entry point actually loads it -- the import, the `<script>` tag,
   or the instantiation site. A matching file that nothing loads is dead
   code, and "fixing" it changes nothing.
+- Before blaming or editing a CSS/layout rule, confirm the selector actually
+  matches the live element: read the markup for its id/classes, and use
+  `browser` + `eval` for computed styles or dimensions when available. A rule
+  whose selector matches nothing has no effect, however plausible it looks --
+  check for a script (canvas.width/height, inline styles) that sets the value
+  instead.
+- For a web UI, confirm WHICH document is actually served before editing a
+  template or stylesheet: read the route that answers `/`, and check the
+  browser report's TITLE and PAGE TEXT. A template is not live unless the
+  route renders it; a missing static file can silently select an inline
+  fallback, and that fallback may never link the stylesheet you are editing.
 - `move` and `delete` are available only when allow_write is on. Prefer the
   search/replace answer format for edits; use these for whole-file moves or
   removals the task explicitly asks for.
@@ -565,6 +576,10 @@ class Agent:
         # (the clean plan title) instead of the full prompt, so goal prose and
         # prior reports do not become forced must-reads.
         self.task_targets: str | None = None
+        # True once a run/browser/screenshot step executed successfully. The
+        # outer loop's evidence gate reads this: an attempted-but-failed
+        # browser launch is not live evidence.
+        self.live_evidence_ok = False
 
     # ------------------------------------------------------------------ phase 1
     def gather(self, task: str, verbose: bool = True,
@@ -618,6 +633,7 @@ class Agent:
         ]
         gathered: list[str] = []
         self.steps_log: list[str] = []
+        self.live_evidence_ok = False
         did_read = False
         read_nudged = False
         # Successful reads only, per normalised file as (start, end) spans in
@@ -848,6 +864,9 @@ class Agent:
                 try:
                     obs = dispatch(self.index, self.cfg, stepjson,
                                    client=self.client)
+                    if (action in ("run", "screenshot", "browser")
+                            and not obs.startswith("ERROR")):
+                        self.live_evidence_ok = True
                 except Exception as e:
                     # A tool failure becomes an ERROR observation, not a crash.
                     print(f"  [{action} tool failed: "
