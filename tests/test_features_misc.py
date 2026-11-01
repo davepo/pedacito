@@ -154,6 +154,10 @@ def test_git_tool_context_and_cochange(tmp_path):
 def test_git_conflict_detection(tmp_path):
     root, _ = _proj(tmp_path, {"a.py": "x = 1\n"})
     _git(root, "init", "-q", "-b", "main")
+    # The merge below runs git directly rather than through `_git`, so the
+    # identity has to live in the repo; CI runners have no global user.name.
+    _git(root, "config", "user.email", "a@b.c")
+    _git(root, "config", "user.name", "t")
     _git(root, "add", "-A")
     _git(root, "commit", "-qm", "base")
     _git(root, "checkout", "-qb", "side")

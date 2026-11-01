@@ -3,6 +3,7 @@ map selection, the repo brief, and the index's incremental updates."""
 from __future__ import annotations
 
 import os
+import shutil
 import stat
 import sys
 import textwrap
@@ -205,6 +206,11 @@ def test_ripgrep_only_prefilters_and_output_is_unchanged(tmp_path, monkeypatch):
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
     _fake_rg(bin_dir)
+    # Windows `shutil.which` only looks at PATHEXT extensions, so it cannot
+    # find a shebang script named plain `rg`; skip rather than testing the
+    # system ripgrep (which may not exist on the runner).
+    if shutil.which("rg", path=str(bin_dir)) is None:
+        pytest.skip("the fake rg script needs a POSIX shebang")
     monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ['PATH']}")
     calls = []
     real_scan = tools._scan_grep

@@ -8,6 +8,8 @@ import queue
 import sys
 from pathlib import Path
 
+import pytest
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
@@ -154,6 +156,8 @@ def test_should_plan_respects_threshold(tmp_path):
     assert not plan.should_plan("fix a typo", agent.index, agent.cfg)
 
 
+@pytest.mark.skipif(
+    os.name == "nt", reason="Windows steering reads the console, not a pipe")
 def test_steering_reads_lines_from_a_pipe():
     r, w = os.pipe()
     with steering.Steering(fd=r, poll=0.02) as s:
@@ -302,8 +306,6 @@ def test_mypy_detected_only_when_configured(tmp_path, monkeypatch):
     assert labels == ["ruff", "mypy"]
 
 
-import pytest
-
 _LANG_SAMPLES = {
     ".php": ("<?php\nnamespace App;\nuse Foo\\Bar;\nfunction top($a) { return helper($a); }\n"
              "class A extends B {\n  public function m($x) { return $this->go($x); }\n}\n"),
@@ -355,6 +357,8 @@ def test_mcp_dead_server_cools_down_instead_of_retrying_every_call():
     assert mcp._cooling(cmd) == 0
 
 
+@pytest.mark.skipif(
+    os.name == "nt", reason="Seatbelt/bwrap profiles are POSIX-only")
 def test_sandbox_profile_and_args_cover_the_guards(tmp_path, monkeypatch):
     from pedacito import sandbox
     (tmp_path / ".git").mkdir()
@@ -417,12 +421,17 @@ def test_sandbox_really_blocks_writes_when_a_backend_works(tmp_path):
     cfg = Config()
     if sandbox.status(cfg)[0] != "active":
         pytest.skip("no working sandbox backend on this machine")
-    outside = tmp_path.parent / "sandbox-escape.txt"
-    argv, _ = sandbox.wrap([sys.executable, "-c",
-                            f"open({str(outside)!r}, 'w').write('x'); "
-                            "open('inside.txt', 'w').write('y')"], cfg, tmp_path)
-    r = sp.run(argv, cwd=tmp_path, capture_output=True)
-    assert not outside.exists() and r.returncode != 0
+    # The parent of tmp_path is allowed on macOS (/private/var/folders), so
+    # aim at the home directory: both backends deny writes outside the root.
+    outside = Path.home() / f".pedacito-sandbox-escape-{os.getpid()}.txt"
+    try:
+        argv, _ = sandbox.wrap([sys.executable, "-c",
+                                f"open({str(outside)!r}, 'w').write('x'); "
+                                "open('inside.txt', 'w').write('y')"], cfg, tmp_path)
+        r = sp.run(argv, cwd=tmp_path, capture_output=True)
+        assert not outside.exists() and r.returncode != 0
+    finally:
+        outside.unlink(missing_ok=True)
 
 
 def test_atomic_edits_write_nothing_when_one_file_fails(tmp_path):
