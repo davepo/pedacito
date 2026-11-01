@@ -2284,7 +2284,8 @@ def test_streaming_empty_answer_with_hidden_reasoning_disables_thinking(
     assert len(posts) == 2
     assert "chat_template_kwargs" not in posts[0]   # thinking was ON
     assert "think" not in posts[0]
-    assert posts[1]["chat_template_kwargs"] == {"enable_thinking": False}
+    assert posts[1]["chat_template_kwargs"] == {"enable_thinking": False,
+                                                "thinking": False}
     assert posts[1]["think"] is False               # Ollama's spelling
     assert client.last_finish_reason == "stop"
 

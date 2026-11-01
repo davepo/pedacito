@@ -14,7 +14,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from pedacito import config as config_mod
 from pedacito import llm as llm_mod
 from pedacito.llm import (BudgetExceeded, CancelledError, LLMClient, LLMError,
-                          estimate_messages)
+                          estimate_messages, extract_content, strip_reasoning)
 
 
 def _cfg(**kw):
@@ -188,7 +188,125 @@ def test_sampler_cannot_override_structural_keys(monkeypatch):
     assert body["top_k"] == 7
     # a user's chat_template_kwargs survive and merge with ours
     assert body["chat_template_kwargs"] == {"preserve_thinking": True,
-                                            "enable_thinking": False}
+                                            "enable_thinking": False,
+                                            "thinking": False}
+
+
+# ----------------------------------------------------- thinking compatibility
+@pytest.mark.parametrize("text,expected", [
+    ("<think>plan</think>answer", "answer"),
+    ("<thinking>plan</thinking>answer", "answer"),
+    ("<reasoning>plan</reasoning>answer", "answer"),
+    ("<think>plan", ""),
+    ("preamble\n<think>plan", "preamble"),
+    ("answer</think>", "answer"),
+    ("[THINK]plan[/THINK]answer", "answer"),
+    ("[think]plan[/think]answer", "answer"),
+    ("[THINK]plan", ""),
+    ("answer[/THINK]", "answer"),
+    ("<seed:think>plan</seed:think>answer", "answer"),
+    ("<seed:think>plan", ""),
+    ("<seed:cot_budget_reflect>spent</seed:cot_budget_reflect>answer",
+     "answer"),
+    ('<|channel|>analysis<|message|>plan<|end|><|start|>assistant'
+     '<|channel|>final<|message|>answer<|end|>', "answer"),
+    ("<|channel|>analysis<|message|>only thoughts<|end|>", ""),
+    ("<|channel>thought\nplan<channel|>answer", "answer"),
+    ("<|channel>thought\n<channel|>answer", "answer"),
+    ("<|turn>model\n<|channel>thought\nplan<channel|>answer<turn|>",
+     "answer"),
+    ("<|channel>thought\nplan", ""),
+])
+def test_strip_reasoning_handles_family_markers(text, expected):
+    assert strip_reasoning(text) == expected
+
+
+def test_extract_content_reads_other_reasoning_fields():
+    assert extract_content({"content": "", "thinking": "<think>x</think>ok"}) \
+        == "ok"
+    assert extract_content({"content": "",
+                            "reasoning_details": [
+                                {"text": "<think>x</think>ok"}]}) == "ok"
+
+
+@pytest.mark.parametrize("model", [
+    "Qwen3.8-27B-GGUF", "qwen3:32b", "gemma-4-31b-it",
+    "Nanbeige4.2-3B", "LiquidAI/LFM2.5-1.2B-Thinking",
+    "some-org/Unknown-Model-7B",
+])
+def test_local_disable_sends_every_common_template_switch(monkeypatch, model):
+    posts = []
+    _patch_post(monkeypatch, lambda *a, **k: posts.append(k["json"]) or _ok())
+    LLMClient(_cfg(model=model, disable_thinking=True)).chat(
+        [{"role": "user", "content": "x"}], 20)
+    body = posts[0]
+    assert body["chat_template_kwargs"]["enable_thinking"] is False
+    assert body["chat_template_kwargs"]["thinking"] is False
+    assert body["think"] is False
+
+
+@pytest.mark.parametrize("model,where,key,value", [
+    ("Magistral-Small-2509", "kwargs", "reasoning_effort", "none"),
+    ("Seed-OSS-36B-Instruct", "kwargs", "thinking_budget", 0),
+    ("gpt-oss-20b", "body", "reasoning_effort", "low"),
+])
+def test_local_family_specific_thinking_switches(
+        monkeypatch, model, where, key, value):
+    posts = []
+    _patch_post(monkeypatch, lambda *a, **k: posts.append(k["json"]) or _ok())
+    LLMClient(_cfg(model=model, disable_thinking=True)).chat(
+        [{"role": "user", "content": "x"}], 20)
+    body = posts[0]
+    container = body["chat_template_kwargs"] if where == "kwargs" else body
+    assert container[key] == value
+
+
+def test_qwen_disables_with_hard_and_soft_switches_but_nanbeige_only_hard(
+        monkeypatch):
+    def body_for(model):
+        posts = []
+        _patch_post(monkeypatch,
+                    lambda *a, **k: posts.append(k["json"]) or _ok())
+        LLMClient(_cfg(model=model, disable_thinking=True)).chat(
+            [{"role": "user", "content": "x"}], 20)
+        return posts[0]
+
+    qwen = body_for("Qwen3.8-27B-GGUF")
+    assert qwen["messages"][-1]["content"].endswith("/no_think")
+    nanbeige = body_for("Nanbeige4.2-3B")
+    assert "/no_think" not in nanbeige["messages"][-1]["content"]
+
+
+@pytest.mark.parametrize("base_url,model,check", [
+    ("https://api.moonshot.ai/v1", "Kimi K2.6",
+     {"thinking": {"type": "disabled"}}),
+    ("https://api.moonshot.ai/v1", "kimi-k2.7-code", {}),
+    ("https://dashscope.aliyuncs.com/compatible-mode/v1", "qwen3-32b",
+     {"enable_thinking": False}),
+    ("https://api.inference.wandb.ai/v1", "google/gemma-4-31B-it",
+     {"chat_template_kwargs": {"enable_thinking": False}}),
+    ("https://api.deepseek.com/v1", "deepseek-chat", {}),
+    ("https://example.com/v1", "deepseek-v3.2",
+     {"chat_template_kwargs": {"thinking": False,
+                               "enable_thinking": False}}),
+    ("https://api.openai.com/v1", "gpt-5", {"reasoning_effort": "low"}),
+    ("https://example.com/v1", "some-model", {}),
+])
+def test_hosted_disable_uses_only_known_provider_fields(
+        monkeypatch, base_url, model, check):
+    posts = []
+    _patch_post(monkeypatch, lambda *a, **k: posts.append(k["json"]) or _ok())
+    LLMClient(_cfg(base_url=base_url, model=model,
+                   disable_thinking=True)).chat(
+        [{"role": "user", "content": "x"}], 20)
+    body = posts[0]
+    for key, value in check.items():
+        assert body[key] == value
+    if not check:
+        assert "chat_template_kwargs" not in body
+        assert "think" not in body
+        assert "thinking" not in body
+        assert "reasoning_effort" not in body
 
 
 def test_message_framing_overhead_is_counted():

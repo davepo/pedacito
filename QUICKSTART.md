@@ -321,7 +321,7 @@ model    = "deepseek-chat"      # remote hosts are detected automatically
 
 [profiles.reasoning]
 model = "qwen3:32b"
-disable_thinking = true         # skip the <think> block: faster
+disable_thinking = true         # family-aware: faster, less reasoning
 ```
 
 ```bash

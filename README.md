@@ -817,10 +817,27 @@ configured one, set `context_tokens` explicitly.
 Switching models makes the server load the new one; Pedacito waits up to
 `load_wait_seconds` (240).
 
-Reasoning models (Qwen3 and similar) are supported: `<think>` blocks are
-stripped before parsing, and `disable_thinking` / `thinking_suffix` turn
-thinking off. Mistral-style role alternation and Gemma's missing system role are
-handled automatically.
+Reasoning models are supported across families: `<think>`/`<thinking>`/
+`<reasoning>`, Magistral's `[THINK]`, Seed-OSS's `<seed:think>`, GPT-OSS
+harmony `analysis` channels, and Gemma 4's `<|channel>thought` block are
+stripped before parsing, while separate `reasoning_content`/`reasoning`/
+`thinking` fields are read directly. The
+`disable_thinking` switch is family-aware: local templates get the common
+`enable_thinking=false` and `thinking=false` kwargs (unknown template variables
+are ignored), plus `reasoning_effort=none` for Magistral and
+`thinking_budget=0` for Seed-OSS. Recognised hosted providers get their own
+spelling (Kimi's `thinking={"type":"disabled"}`, DashScope's
+`enable_thinking`, DeepSeek's template kwarg, `reasoning_effort` on
+OpenAI/Cerebras/GPT-OSS); an unknown hosted model gets no extra field, so a
+strict API cannot reject it. `thinking_suffix` adds a prompt soft switch, and
+auto-selects `/no_think` for Qwen3/SmolLM3. The Qwen, Gemma, Nanbeige, and
+LiquidAI families all use `enable_thinking` and are covered automatically.
+Some families have no off switch (GPT-OSS, Kimi K2.7/K3, LFM2.5-24B-A2B); their
+reasoning blocks are still stripped, but the tokens are unavoidable. For an
+unrecognised family, add the switch your model expects under the profile's
+`sampler` table (user keys survive and merge with the automatic ones).
+Mistral-style role alternation and Gemma's missing system role are handled
+automatically.
 
 ---
 
@@ -853,7 +870,7 @@ config --reference` prints the annotated template. Key settings:
 | `vision_model` | `""` | Multimodal model used to describe captures. |
 | `semantic_search` | false | Embeddings fallback for `grep`. |
 | `allow_diff` | true | Read-only `diff` action. |
-| `disable_thinking` | false | Suppress `<think>` blocks. |
+| `disable_thinking` | false | Ask for non-thinking mode using the model family's switch; output blocks are stripped regardless. |
 | `default_profile` | `""` | Profile used when `--profile` isn't given. |
 | `prompt_pack` | `""` | `tiny` / `small` / `full` instruction density; empty = model card, then tier. |
 | `answer_mode` | `""` | `rebuild` / `continue` / `auto`; empty = model card, then `auto` (hosted) or `rebuild` (local). |

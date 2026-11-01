@@ -17,7 +17,7 @@ constrained decoding enforce, so a small model cannot emit unparseable JSON.
 
 Also handles local-model failure modes: templates that reject certain message
 shapes, replies truncated at the token limit, reasoning models that wrap their
-answer in a <think> block, and a model that is still loading.
+answer in a family-specific thinking block, and a model that is still loading.
 
 Only dependency is `requests`.
 """
@@ -162,6 +162,180 @@ def _server_root(base_url: str) -> str:
     return base
 
 
+# --------------------------------------------------------------- thinking off
+# Families spell "stop reasoning" differently. The request-side matrix:
+#
+#   enable_thinking=false   Qwen3/Qwen3.5, Gemma 4, Nanbeige, LiquidAI LFM3,
+#                           GLM, Granite 4.2, most ChatML thinking templates
+#   thinking=false          DeepSeek V3.1/V3.2, Granite 3.2, Holo2, Kimi K2.x
+#                           (as a chat-template kwarg; Kimi's own API wants a
+#                           top-level {"type": "disabled"} object)
+#   reasoning_effort=...    Magistral/Mistral ("none" in the local template),
+#                           GPT-OSS/OpenAI/Cerebras ("low", or "none" where
+#                           the provider supports a true off)
+#   thinking_budget=0       Seed-OSS
+#   /no_think               Qwen3/SmolLM3 soft switch (prompt suffix)
+#
+# Local templates ignore kwargs they do not define, so a local request gets the
+# union of the template spellings. Hosted APIs are stricter: only a recognised
+# provider/family gets a field, and an unknown host gets none (safer than a 400).
+_LOCAL_THINKING_OFF = {"enable_thinking": False, "thinking": False}
+
+
+def _model_name(cfg) -> str:
+    """Lower-case model id with spaces/underscores normalised to hyphens, so
+    the same family check works for `LFM2_5`, `LFM2.5`, and `LFM2-5`."""
+    raw = (getattr(cfg, "model", "") or "").lower()
+    return re.sub(r"[\s_]+", "-", raw)
+
+
+def _host_name(cfg) -> str:
+    try:
+        return (urlparse(getattr(cfg, "base_url", "")).hostname or "").lower()
+    except ValueError:
+        return ""
+
+
+def _has(text: str, *needles: str) -> bool:
+    return any(n in text for n in needles)
+
+
+def _is_qwen_soft(model: str) -> bool:
+    """Qwen3/SmolLM3 are the families trained on the /no_think soft switch."""
+    return _has(model, "qwen3", "qwen-3", "smollm3", "smollm-3")
+
+
+def _is_gemma_reasoning(model: str) -> bool:
+    """Gemma 4 is the reasoning generation; Gemma 3 and older have no switch."""
+    return _has(model, "gemma-4", "gemma4")
+
+
+def _is_nanbeige(model: str) -> bool:
+    return "nanbeige" in model
+
+
+def _is_liquid_reasoning(model: str) -> bool:
+    """LFM3 and LFM2.5-Thinking expose enable_thinking; older LFM2 does not."""
+    return _has(model, "lfm3", "lfm-3", "lfm2.5", "lfm-2.5", "lfm2-5")
+
+
+def _is_glm_reasoning(model: str) -> bool:
+    return _has(model, "glm-4.5", "glm4.5", "glm-4.6", "glm4.6",
+                "glm-4.7", "glm4.7", "glm-5", "glm5")
+
+
+def _is_granite_reasoning(model: str) -> bool:
+    return _has(model, "granite-3.2", "granite3.2",
+                "granite-4", "granite4")
+
+
+def _is_deepseek(model: str) -> bool:
+    return "deepseek" in model
+
+
+def _is_kimi(model: str) -> bool:
+    return _has(model, "kimi", "moonshot")
+
+
+def _is_kimi_reasoning(model: str) -> bool:
+    return _has(model, "kimi-k2", "kimi-k3", "kimi-thinking")
+
+
+def _is_magistral(model: str) -> bool:
+    return _has(model, "magistral", "mistral-small-4", "mistral-small4",
+                "mistral-medium-3.5", "mistral-medium3.5")
+
+
+def _is_seed_oss(model: str) -> bool:
+    return _has(model, "seed-oss", "seedoss")
+
+
+def _is_gpt_oss(model: str) -> bool:
+    return _has(model, "gpt-oss", "gptoss")
+
+
+def _is_effort_model(model: str) -> bool:
+    """Hosted models with a reasoning_effort control (not every GPT-4.x)."""
+    return _has(model, "gpt-5", "gpt5", "gpt-6", "gpt6",
+                "o1", "o3", "o4", "codex")
+
+
+def _always_thinks(model: str) -> bool:
+    """Families with no off switch. Hosted Kimi K2.7/K3 reject a disabled
+    thinking object; LFM2.5-24B-A2B and GPT-OSS still reason at low effort."""
+    return _has(model, "kimi-k2.7", "kimi-k3", "kimi-k2-thinking",
+                "lfm2.5-24b-a2b", "gpt-oss", "gptoss")
+
+
+def thinking_suffix_for(cfg) -> str:
+    """Prompt suffix for a model whose soft switch we know (Qwen3/SmolLM3),
+    or the user's explicit `thinking_suffix`. Empty when neither applies."""
+    explicit = getattr(cfg, "thinking_suffix", "")
+    if explicit:
+        return explicit
+    if _is_qwen_soft(_model_name(cfg)):
+        return "/no_think"
+    return ""
+
+
+def _local_thinking_off(cfg) -> tuple[dict, dict]:
+    model = _model_name(cfg)
+    kwargs = dict(_LOCAL_THINKING_OFF)
+    top = {"think": False}
+    if _is_magistral(model):
+        kwargs["reasoning_effort"] = "none"
+    elif _is_seed_oss(model):
+        kwargs["thinking_budget"] = 0
+    elif _is_gpt_oss(model):
+        top["reasoning_effort"] = "low"
+    if _is_kimi(model) and _always_thinks(model):
+        # K2.7/K3 always reason; a false `thinking` kwarg is wrong for them.
+        kwargs.pop("thinking", None)
+    return kwargs, top
+
+
+def _hosted_thinking_off(cfg) -> tuple[dict, dict]:
+    model, host = _model_name(cfg), _host_name(cfg)
+    if _is_kimi(model) or "moonshot" in host:
+        # K2.5/K2.6 accept {"type": "disabled"}; K2.7/K3 always think and
+        # reject a disabled object. Kimi K1.x has no thinking switch.
+        if not _is_kimi_reasoning(model) or _always_thinks(model):
+            return {}, {}
+        return {}, {"thinking": {"type": "disabled"}}
+    if _is_gpt_oss(model):
+        return {}, {"reasoning_effort": "low"}      # no true off
+    if _is_deepseek(model) or "deepseek" in host:
+        if "api.deepseek.com" in host:
+            return {}, {}       # the model name chooses the mode
+        return {"thinking": False, "enable_thinking": False}, {}
+    if "cerebras" in host:
+        # Cerebras exposes reasoning_effort rather than template kwargs.
+        effort = "low" if _is_gpt_oss(model) else "none"
+        if _is_effort_model(model) or _is_qwen_soft(model) \
+                or _is_gemma_reasoning(model) or _is_gpt_oss(model):
+            return {}, {"reasoning_effort": effort}
+    if ("dashscope" in host or "aliyuncs" in host) and _is_qwen_soft(model):
+        return {}, {"enable_thinking": False}      # DashScope's spelling
+    if "openai" in host and _is_effort_model(model):
+        return {}, {"reasoning_effort": "low"}
+    if _is_qwen_soft(model) or _is_gemma_reasoning(model) \
+            or _is_nanbeige(model) or _is_liquid_reasoning(model) \
+            or _is_glm_reasoning(model) or _is_granite_reasoning(model):
+        return {"enable_thinking": False}, {}
+    return {}, {}
+
+
+def thinking_off_fields(cfg) -> tuple[dict, dict]:
+    """(chat_template_kwargs, top-level fields) asking for non-thinking mode.
+
+    Local servers get every template spelling; hosted APIs get only the field
+    their provider/family is known to accept. An unknown hosted model gets
+    nothing, because a strict API would 400 on an unknown field."""
+    if not _is_remote(getattr(cfg, "base_url", "")):
+        return _local_thinking_off(cfg)
+    return _hosted_thinking_off(cfg)
+
+
 # A constrained-JSON verdict costs one round-trip to probe; remembering it per
 # server+model keeps repeat runs consistent and skips the probe.
 _MODE_CACHE_TTL = 7 * 24 * 3600
@@ -271,14 +445,70 @@ _TOKENIZER_SAMPLE = (
 
 # Reasoning models emit a thinking block before the answer. Some runtimes move
 # it to a separate field, some leave it inline in `content`; an unstripped
-# block breaks JSON parsing and lands in the answer text.
-_THINK_RE = re.compile(r"<(think|thinking|reasoning)>.*?</\1>", re.DOTALL | re.IGNORECASE)
-# An unterminated block: the model ran out of tokens mid-thought.
-_THINK_OPEN_RE = re.compile(r"^\s*<(think|thinking|reasoning)>.*", re.DOTALL | re.IGNORECASE)
+# block breaks JSON parsing and lands in the answer text. Families spell the
+# block differently, so strip every known delimiter rather than assuming
+# Qwen's <think>:
+#   <think>...</think>             Qwen3, Phi-4-reasoning, distillations
+#   <thinking> / <reasoning>       other ChatML templates
+#   [THINK]...[/THINK]             Magistral / Mistral Small 4
+#   <seed:think>...</seed:think>   Seed-OSS
+#   <|channel|>analysis...         GPT-OSS harmony (handled separately)
+#   <|channel>thought...           Gemma 4 (handled separately)
+# The content may also arrive in reasoning_content / reasoning / thinking
+# fields; extract_content() and the stream collector read those.
+_THINK_PAIR_RE = re.compile(
+    r"<(think|thinking|reasoning)>.*?</\1>", re.DOTALL | re.IGNORECASE)
+# An unterminated block: the model ran out of tokens mid-thought. Drop from
+# the opening tag to EOF, keeping any prose before it.
+_THINK_UNCLOSED_RE = re.compile(
+    r"<(think|thinking|reasoning)>.*", re.DOTALL | re.IGNORECASE)
 # Some templates emit only the closing marker when the runtime already routed
 # the thinking text to a separate field.
-_STRAY_THINK_CLOSE_RE = re.compile(r"</(think|thinking|reasoning)>",
-                                   re.IGNORECASE)
+_STRAY_THINK_CLOSE_RE = re.compile(
+    r"</(think|thinking|reasoning)>", re.IGNORECASE)
+
+# Magistral uses literal [THINK] special tokens; Seed-OSS uses XML-ish tags
+# and may add a self-reflection marker inside the block.
+_BRACKET_THINK_PAIR_RE = re.compile(
+    r"\[THINK\].*?\[/THINK\]", re.DOTALL | re.IGNORECASE)
+_BRACKET_THINK_UNCLOSED_RE = re.compile(
+    r"\[THINK\].*", re.DOTALL | re.IGNORECASE)
+_BRACKET_THINK_CLOSE_RE = re.compile(r"\[/THINK\]", re.IGNORECASE)
+_SEED_THINK_PAIR_RE = re.compile(
+    r"<seed:think>.*?</seed:think>", re.DOTALL | re.IGNORECASE)
+_SEED_THINK_UNCLOSED_RE = re.compile(
+    r"<seed:think>.*", re.DOTALL | re.IGNORECASE)
+_SEED_REFLECT_PAIR_RE = re.compile(
+    r"<seed:cot_budget_reflect>.*?</seed:cot_budget_reflect>",
+    re.DOTALL | re.IGNORECASE)
+_SEED_REFLECT_CLOSE_RE = re.compile(
+    r"</seed:cot_budget_reflect>", re.IGNORECASE)
+
+# GPT-OSS harmony: <|channel|>analysis<|message|>...<|end|>. Servers with a
+# reasoning parser move the analysis channel to reasoning_content; a raw
+# llama.cpp stream leaves it in content, so pull out the final channel.
+_HARMONY_CHANNEL_RE = re.compile(
+    r"<\|channel\|>(analysis|commentary|final)<\|message\|>"
+    r"(.*?)(?=<\|end\|>|$)", re.DOTALL | re.IGNORECASE)
+_HARMONY_TOKEN_RE = re.compile(r"<\|[^|>]{1,40}\|>")
+
+# Gemma 4's thought channel uses <|channel>thought ... <channel|> (note the
+# pipes differ from GPT-OSS harmony). A server without a Gemma parser leaves
+# the whole block in content, and even non-thinking 12B/26B/31B models emit an
+# empty one.
+_GEMMA_THOUGHT_RE = re.compile(
+    r"<\|channel>\s*thought\b.*?<channel\|>", re.DOTALL | re.IGNORECASE)
+_GEMMA_THOUGHT_OPEN_RE = re.compile(
+    r"<\|channel>\s*thought\b.*", re.DOTALL | re.IGNORECASE)
+_GEMMA_ROLE_RE = re.compile(
+    r"<\|turn>\s*(?:model|assistant|user|system)\s*", re.IGNORECASE)
+# Gemma's delimiters are <|turn>/<turn|>, <|channel>/<channel|>, and
+# <|think|>; do NOT use a generic <think> pattern here -- that is a separate,
+# fully paired reasoning tag handled later.
+_GEMMA_TOKEN_RE = re.compile(
+    r"<\|(?:turn|channel|think)\|?>"
+    r"|<(?:turn|channel)\|>|<eos>|<bos>", re.IGNORECASE)
+
 # Native tool-call syntax in the answer phase means the model ignored "no
 # tools here". A few are tolerated (recovery honours up to four reads), but a
 # stream that keeps emitting them is a degenerate loop; stop it at six.
@@ -287,16 +517,62 @@ _NATIVE_TOOL_OPEN_RE = re.compile(
 _MAX_STREAM_TOOL_OPENS = 6
 
 
+def _strip_harmony(text: str) -> str:
+    """Text of the last `final` harmony channel, or "" when the reply contains
+    only analysis/commentary. Plain text passes through unchanged."""
+    if "<|channel|>" not in text.lower():
+        return text
+    finals = [m.group(2) for m in _HARMONY_CHANNEL_RE.finditer(text)
+              if m.group(1).lower() == "final"]
+    if not finals:
+        return ""
+    return _HARMONY_TOKEN_RE.sub("", finals[-1])
+
+
+def _strip_gemma4(text: str) -> str:
+    """Remove Gemma 4's `<|channel>thought ... <channel|>` block and the
+    structural turn/channel tokens a raw server may leave behind."""
+    out = _GEMMA_ROLE_RE.sub("", text)
+    out = _GEMMA_THOUGHT_RE.sub("", out)
+    out = _GEMMA_THOUGHT_OPEN_RE.sub("", out)
+    return _GEMMA_TOKEN_RE.sub("", out)
+
+
 def strip_reasoning(text: str) -> str:
-    """Remove <think>/<thinking>/<reasoning> blocks from model output. Text
-    that is only an unterminated opening tag (cut mid-thought) becomes ""."""
+    """Remove reasoning blocks from model output, whatever their family
+    spelling. Text that is only an unterminated opening tag (cut mid-thought)
+    becomes ""."""
     if not text:
         return ""
-    out = _THINK_RE.sub("", text)
-    if _THINK_OPEN_RE.match(out):
-        return ""
+    out = _strip_harmony(text)
+    out = _strip_gemma4(out)
+    out = _THINK_PAIR_RE.sub("", out)
+    out = _THINK_UNCLOSED_RE.sub("", out)
     out = _STRAY_THINK_CLOSE_RE.sub("", out)
+    out = _BRACKET_THINK_PAIR_RE.sub("", out)
+    out = _BRACKET_THINK_UNCLOSED_RE.sub("", out)
+    out = _BRACKET_THINK_CLOSE_RE.sub("", out)
+    out = _SEED_THINK_PAIR_RE.sub("", out)
+    out = _SEED_THINK_UNCLOSED_RE.sub("", out)
+    out = _SEED_REFLECT_PAIR_RE.sub("", out)
+    out = _SEED_REFLECT_CLOSE_RE.sub("", out)
     return out.strip()
+
+
+def _reasoning_text(message: dict) -> str:
+    """Reasoning text from the separate fields providers use (a string or a
+    list of `{text: ...}` parts)."""
+    for key in ("reasoning_content", "reasoning", "thinking",
+                "analysis", "reasoning_details"):
+        value = message.get(key)
+        if isinstance(value, str) and value.strip():
+            return value
+        if isinstance(value, list):
+            parts = [p.get("text") for p in value
+                     if isinstance(p, dict) and isinstance(p.get("text"), str)]
+            if parts:
+                return "".join(parts)
+    return ""
 
 
 def extract_content(message: dict) -> str:
@@ -305,7 +581,7 @@ def extract_content(message: dict) -> str:
     content = message.get("content") or ""
     if not content.strip():
         # Some runtimes put everything in a reasoning field; better than none.
-        content = message.get("reasoning_content") or message.get("reasoning") or ""
+        content = _reasoning_text(message)
     return strip_reasoning(content)
 
 
@@ -1083,8 +1359,16 @@ class LLMClient:
         buffered or streamed (to `stream_callback`, else stdout)."""
         self._check_budget()
         msgs = [dict(m) for m in messages]
-        if self.cfg.thinking_suffix and msgs:
-            msgs[-1]["content"] += "\n\n" + self.cfg.thinking_suffix
+        want_off = (disable_thinking if disable_thinking is not None
+                    else self.cfg.disable_thinking)
+        # An explicit suffix is always applied (it may be a user's own
+        # instruction). Otherwise use the family's soft switch only when we
+        # are actually asking for non-thinking mode.
+        suffix = getattr(self.cfg, "thinking_suffix", "")
+        if not suffix and want_off:
+            suffix = thinking_suffix_for(self.cfg)
+        if suffix and msgs:
+            msgs[-1]["content"] += "\n\n" + suffix
         if schema is not None and self.cfg.json_mode == "object" and msgs:
             # Hosted APIs require the word "json" in the prompt for
             # json_object mode; naming the fields improves compliance.
@@ -1114,18 +1398,17 @@ class LLMClient:
             if k in _PROTECTED_SAMPLER_KEYS:
                 continue
             payload[k] = v
-        # Thinking-off fields are only sent to local servers: a strict hosted
-        # API could 400 on them.
-        if (disable_thinking if disable_thinking is not None
-                else self.cfg.disable_thinking) and not _is_remote(self.cfg.base_url):
-            # Two spellings: llama.cpp/LM Studio templates read
-            # chat_template_kwargs.enable_thinking, Ollama's OpenAI endpoint
-            # reads the flat `think`. Servers ignore the one they don't know.
-            kwargs = dict(payload.get("chat_template_kwargs") or {}) \
-                if isinstance(payload.get("chat_template_kwargs"), dict) else {}
-            kwargs["enable_thinking"] = False
-            payload["chat_template_kwargs"] = kwargs
-            payload["think"] = False
+        if want_off:
+            # Local templates get the union of known spellings; hosted
+            # providers get only the field they are known to accept. Any
+            # user-supplied chat_template_kwargs survive and merge.
+            kwargs, top = thinking_off_fields(self.cfg)
+            if kwargs:
+                current = payload.get("chat_template_kwargs")
+                merged = dict(current) if isinstance(current, dict) else {}
+                merged.update(kwargs)
+                payload["chat_template_kwargs"] = merged
+            payload.update(top)
         if stream and self._stream_usage_ok is not False \
                 and getattr(self.cfg, "stream_usage", True):
             # Without this, a streamed reply (the whole answer phase) reports
@@ -1282,7 +1565,7 @@ class LLMClient:
                 if fr == "length":
                     self.stream_truncated = True
                 delta = d.get("content")
-                rc = d.get("reasoning_content") or d.get("reasoning")
+                rc = _reasoning_text(d)
                 if not delta and not rc:
                     continue
                 if rc:

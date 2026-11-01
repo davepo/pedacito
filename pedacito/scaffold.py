@@ -33,7 +33,7 @@ from .chunker import Chunk
 from .config import ConfigError
 from .edits import Result, apply_edits, parse_edits
 from .index import Index, file_hash
-from .llm import LLMError
+from .llm import LLMError, thinking_suffix_for
 
 MAX_SPEC_CHARS = 60_000          # longer specs are truncated (with a notice)
 PLAN_SCHEMA = {
@@ -694,10 +694,12 @@ def build_pass(client, cfg, idx, plan: Plan, target: PlannedFile,
     if not parse_edits(reply):
         # A reasoning model may spend its whole budget on <think> (some quants
         # ignore enable_thinking=false): nudge once, then report the failure.
-        suffix = getattr(cfg, "thinking_suffix", "") or "/no_think"
+        # `thinking_suffix_for` supplies /no_think only for families trained on
+        # it; other models just get the plain "output it now" instruction.
+        suffix = thinking_suffix_for(cfg)
         messages[-1]["content"] += (
-            f"\n\n{suffix}\n"
-            "Output the complete file NOW as one search/replace block, and "
+            (f"\n\n{suffix}" if suffix else "")
+            + "\nOutput the complete file NOW as one search/replace block, and "
             "nothing else. Do not explain.")
         reply = client.chat(messages, max_tokens=max_tokens, stream=verbose,
                             disable_thinking=True)

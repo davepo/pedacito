@@ -355,10 +355,15 @@ class Config:
     auto_verify_rounds: int = 2
 
     # --- Reasoning models -----------------------------------------------------
-    # <think> blocks are always stripped, but generating them costs tokens.
-    # Which switch works depends on the model and runtime; setting both is harmless.
-    #   disable_thinking -> sends chat_template_kwargs {"enable_thinking": false}
-    #   thinking_suffix  -> appends a token like "/no_think" to your last message
+    # Reasoning blocks (<think>, [THINK], <seed:think>, harmony channels) are
+    # always stripped, but generating them costs tokens.
+    #   disable_thinking -> ask the model/server for non-thinking mode. Local
+    #     servers get the common template switches (enable_thinking=false and
+    #     thinking=false); known hosted providers get their own field
+    #     (thinking={"type":"disabled"}, reasoning_effort, enable_thinking).
+    #     Unknown hosted models get nothing, so a strict API cannot 400.
+    #   thinking_suffix -> append a soft switch such as "/no_think" to the last
+    #     message. Empty = auto (/no_think for Qwen3/SmolLM3 only).
     disable_thinking: bool = False
     thinking_suffix: str = ""
 
@@ -1955,6 +1960,16 @@ REFERENCE_TEMPLATE = TEMPLATE + '''
 # max_consecutive_failures: abort an indexing batch after N failures.
 # temperature: keep low for tool calls.
 # sampler: per-server sampler keys, usually placed inside a profile.
+#
+# --- Reasoning models -------------------------------------------------------
+# disable_thinking is family-aware. Local servers get enable_thinking=false and
+# thinking=false (a template ignores the variable it does not use); Magistral
+# also gets reasoning_effort=none and Seed-OSS thinking_budget=0. Recognised
+# hosted providers get their own spelling; an unknown hosted model gets no
+# field, so a strict API cannot reject it. thinking_suffix appends a prompt
+# soft switch and defaults to /no_think for Qwen3/SmolLM3. Output markers
+# (<think>, [THINK], <seed:think>, harmony analysis, Gemma 4 thought) are
+# stripped regardless.
 #
 # --- Context and token budgets ---------------------------------------------
 # context_tokens is the server-side window. reserve_tokens is held back for
