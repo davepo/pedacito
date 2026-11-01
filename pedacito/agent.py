@@ -2444,6 +2444,21 @@ class Agent:
                         False, f, "refused: this file has unresolved git merge "
                                   "conflicts; resolve them first"))
                 edits = [e for e in edits if e not in blocked]
+        if edits and not dry_run and getattr(self.cfg, "atomic_edits", False):
+            # All or nothing: rehearse first, and write nothing when any
+            # file's edit (or any block already rejected above) would fail,
+            # so a coupled multi-file change is never left half-applied.
+            trial = apply_edits(self.index.root, edits, backup=False,
+                                dry_run=True, cfg=self.cfg,
+                                allowlist=self._write_allowlist())
+            bad = [r for r in trial if not r.ok]
+            if bad or failed:
+                held = [Result(False, r.file,
+                               "not written: atomic_edits is on and another "
+                               "file's edit failed; fix that one and resend "
+                               "ALL the blocks")
+                        for r in trial if r.ok]
+                return failed + bad + held
         if edits:
             failed += apply_edits(self.index.root, edits,
                                   backup=self.cfg.backup, dry_run=dry_run,

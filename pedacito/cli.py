@@ -74,6 +74,13 @@ def _add_common(p):
                         "--role planner=big --role summarizer=tiny; repeatable "
                         "(roles: worker planner verifier summarizer repair "
                         "escalate fallback)")
+    p.add_argument("--record", action="store_true",
+                   help="save this run's model responses to "
+                        ".pedacito/replay/<stamp>.jsonl")
+    p.add_argument("--replay", metavar="FILE",
+                   help="run against a recording instead of a model server "
+                        "(no model needed; reports where the harness's prompts "
+                        "differ from the recording)")
     p.add_argument("--jsonl", action="store_true",
                    help="machine-readable run: one JSON event per line on "
                         "stdout (steps, calls, the answer and diffs), human "
@@ -381,6 +388,9 @@ def _cmd_config(args, cfg) -> int:
     from . import testsel
     tc = testsel.detect_test_command(_root(args), cfg)
     print(f"Test command detected: {tc or '(none)'}")
+    from . import sandbox
+    state, detail = sandbox.status(cfg)
+    print(f"Sandbox: {state} -- {detail}")
     print("\nNext: `pedacito calibrate` measures tool choice, edit format, "
           "honesty and long-context retrieval, and saves a model card.")
     return 0
@@ -433,6 +443,8 @@ def _chat_command(line: str, args, cfg, ref) -> bool:
         print(f"  profile : {cfg.active_profile or '(none)'}", file=sys.stderr)
         print(f"  model   : {cfg.model}", file=sys.stderr)
         print(f"  steps   : {cfg.max_steps}", file=sys.stderr)
+        from . import sandbox
+        print(f"  sandbox : {sandbox.status(cfg)[0]}", file=sys.stderr)
         print(f"  writes  : {'ON' if args.apply else 'off (dry run)'}", file=sys.stderr)
         print(f"  prompts : pack {prompts_pack(cfg)}, answer "
               f"{ref['agent']._answer_mode()}, verify {cfg.verify_answer}"
@@ -1018,6 +1030,10 @@ def _main(argv=None) -> int:
     p_rest.add_argument("--root", default=None)
     p_rest.add_argument("--list", action="store_true", help="list snapshots and exit")
     p_rest.add_argument("--dry-run", action="store_true")
+    p_rest.add_argument("--delete-created", action="store_true",
+                        dest="delete_created",
+                        help="also delete the files that run created (they "
+                             "have no original to restore)")
     p_rest.add_argument("--config", metavar="FILE")
 
     p_wt = sub.add_parser(
@@ -1357,6 +1373,18 @@ def _main(argv=None) -> int:
             for f in files:
                 print(f"  {verb} {f}", file=sys.stderr)
             print(f"{verb} {len(files)} file(s) from {chosen.name}", file=sys.stderr)
+            if getattr(args, "delete_created", False):
+                gone = workspace.delete_created(root, chosen, dry_run=args.dry_run)
+                dverb = "would delete" if args.dry_run else "deleted"
+                for f in gone:
+                    print(f"  {dverb} {f} (created by that run)", file=sys.stderr)
+                print(f"{dverb} {len(gone)} created file(s)", file=sys.stderr)
+            else:
+                made = workspace.created_files(root, chosen)
+                if made:
+                    print(f"  that run also created {len(made)} file(s) "
+                          f"({', '.join(made[:4])}); add --delete-created to "
+                          "remove them", file=sys.stderr)
             return 0
 
         if args.cmd == "gui":
@@ -1434,8 +1462,24 @@ def _main(argv=None) -> int:
                   f"{cfg.flat_map_token_budget * 2:,}")
             return 0
 
-        client = LLMClient(cfg)
-        client.check()
+        if getattr(args, "replay", None):
+            from . import replay as replay_mod
+            try:
+                client = replay_mod.Replayer(args.replay)
+            except OSError as e:
+                print(f"Cannot read the recording: {e}", file=sys.stderr)
+                return 2
+            client.cfg = cfg
+            print(f"[replaying {args.replay}: no model server is used]",
+                  file=sys.stderr)
+        else:
+            client = LLMClient(cfg)
+            client.check()
+            if getattr(args, "record", False):
+                from . import replay as replay_mod
+                rpath = replay_mod.record_path(_root(args))
+                client = replay_mod.Recorder(client, rpath)
+                print(f"[recording model responses to {rpath}]", file=sys.stderr)
 
         # `new` runs before indexing: the project directory usually does not
         # exist yet, and the skeleton gets its own in-memory index.
@@ -1556,6 +1600,8 @@ def _main(argv=None) -> int:
                       file=sys.stderr)
                 return 130
             print("\n" + _usage_line(client), file=sys.stderr)
+            from . import replay as replay_mod
+            replay_mod.report(client)
             elog.emit("exit", code=0)
             return 0
 

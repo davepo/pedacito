@@ -43,7 +43,7 @@ import time
 from datetime import datetime
 from pathlib import Path, PureWindowsPath
 
-from . import browser, fileio, proc, safety, sessions, vision
+from . import browser, fileio, proc, safety, sandbox, sessions, vision
 
 TOOL_HELP = """\
 read     - read exact lines of a file.       args: file, start, end
@@ -1544,6 +1544,20 @@ def _snapshot(index, cfg, rel: str, path: Path) -> str | None:
         return f"ERROR: could not back up {rel}: {e}"
 
 
+def _note_created(index, cfg, rel: str) -> None:
+    """Remember that this run creates `rel` (for `restore --delete-created`)."""
+    if not getattr(cfg, "backup", False):
+        return
+    try:
+        bdir = getattr(cfg, "_backup_dir", None)
+        if bdir is None:
+            from . import workspace
+            bdir = workspace.new_backup_dir(index.root)
+        fileio.note_created(bdir, rel)
+    except OSError:
+        pass
+
+
 def _syntax_note(path: Path, text: str) -> str:
     """Advisory parse check on freshly written content: '' when it parses (or
     the language is unknown), else a WARNING. It cannot refuse like the edit
@@ -1676,6 +1690,8 @@ def tool_write(index, cfg, file: str, content: str,
         err = _snapshot(index, cfg, rel, path)
         if err:
             return err
+    else:
+        _note_created(index, cfg, rel)
 
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -1759,6 +1775,8 @@ def tool_move(index, cfg, file: str, to: str) -> str:
     err = _snapshot(index, cfg, src_rel, src)
     if err:
         return err
+    if not dst.exists():
+        _note_created(index, cfg, _rel_or_abs(Path(index.root).resolve(), dst))
     try:
         dst.parent.mkdir(parents=True, exist_ok=True)
         shutil.move(str(src), str(dst))
@@ -1900,8 +1918,12 @@ def tool_run(index, cfg, command: str) -> str:
     idle = max(0, _as_int(getattr(cfg, "shell_idle_seconds", 10), 10))
     cap = max(200, _as_int(getattr(cfg, "max_shell_output_chars", 8000), 8000))
     env = _child_env(cfg)
+    try:
+        run_argv, box = sandbox.wrap(argv, cfg, index.root)
+    except sandbox.SandboxRefused as e:
+        return f"ERROR: {e}"
     rc, out, stopped, _elapsed = proc.run(
-        argv, cwd=index.root, timeout=timeout, idle_timeout=idle,
+        run_argv, cwd=index.root, timeout=timeout, idle_timeout=idle,
         max_output=cap, env=env)
     if stopped == "error":
         return f"ERROR: could not run command: {out}"
@@ -1936,6 +1958,10 @@ def tool_run(index, cfg, command: str) -> str:
         status = "OK" if rc == 0 else "FAILED"
         head = f"RUN: {cmd}\nEXIT: {rc} ({status})"
         tail = ""
+        if rc != 0 and box:
+            tail = (f"\n[ran in a sandbox ({box}); a failure caused by a "
+                    "blocked write outside the project or by no network is "
+                    "the sandbox, not the code. Do not retry it.]")
     server_url = browser.find_server_url(out)
     if server_url:
         head += f"\nSERVER: {server_url}"

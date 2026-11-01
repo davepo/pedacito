@@ -367,3 +367,78 @@ def test_temperature_override_applies_only_inside_the_context(monkeypatch):
         client.chat([{"role": "user", "content": "x"}], 10)
     client.chat([{"role": "user", "content": "x"}], 10)
     assert [p["temperature"] for p in posts] == [0.9, 0.2]
+
+
+def _tool_resp(args: dict, finish="tool_calls"):
+    return Resp(200, {"choices": [{"message": {
+        "content": "", "tool_calls": [{"id": "1", "type": "function", "function": {
+            "name": "step", "arguments": json.dumps(args)}}]},
+        "finish_reason": finish}], "usage": {}})
+
+
+def test_native_mode_sends_a_forced_tool_and_reads_its_arguments(monkeypatch):
+    from pedacito.tools import schema_for
+    seen = {}
+
+    def fake(url, **kw):
+        seen.update(kw["json"])
+        return _tool_resp({"action": "grep", "pattern": "x", "reasoning": "r"})
+
+    _patch_post(monkeypatch, fake)
+    c = LLMClient(_cfg(tool_mode="native"))
+    out = c.chat_json([{"role": "user", "content": "go"}],
+                      schema_for(c.cfg), 200)
+    assert out["action"] == "grep"
+    assert seen["tools"][0]["function"]["name"] == "step"
+    assert seen["tool_choice"]["function"]["name"] == "step"
+    assert "response_format" not in seen
+
+
+def test_native_mode_is_off_for_other_schemas_and_by_default(monkeypatch):
+    seen = {}
+
+    def fake(url, **kw):
+        seen.clear()
+        seen.update(kw["json"])
+        return _ok('{"title": "t"}')
+
+    _patch_post(monkeypatch, fake)
+    c = LLMClient(_cfg(tool_mode="native"))
+    c.chat_json([{"role": "user", "content": "go"}],
+                {"type": "object", "properties": {"title": {"type": "string"}}}, 100)
+    assert "tools" not in seen and "response_format" in seen
+    c2 = LLMClient(_cfg())
+    from pedacito.tools import schema_for
+    c2.chat_json([{"role": "user", "content": "go"}], schema_for(c2.cfg), 100)
+    assert "tools" not in seen
+
+
+def test_native_mode_falls_back_when_the_server_rejects_tools(monkeypatch):
+    from pedacito.tools import schema_for
+    calls = []
+
+    def fake(url, **kw):
+        calls.append("tools" in kw["json"])
+        if "tools" in kw["json"]:
+            return Resp(400, text='{"error": "tools are not supported"}')
+        return _ok('{"action": "done", "reasoning": "r"}')
+
+    _patch_post(monkeypatch, fake)
+    c = LLMClient(_cfg(tool_mode="native"))
+    out = c.chat_json([{"role": "user", "content": "go"}], schema_for(c.cfg), 100)
+    assert out["action"] == "done" and calls == [True, False]
+    c.chat_json([{"role": "user", "content": "go"}], schema_for(c.cfg), 100)
+    assert calls == [True, False, False]          # remembered
+
+
+def test_calibrate_picks_native_only_when_it_measures_better():
+    from pedacito import modelcard
+    base = {"tool_choice": 0.6, "json_ok": 1.0, "edit_format": 1, "instructions": 1,
+            "honesty": 1, "needle": 1, "continuation": 1}
+    assert modelcard.choose({**base, "tool_choice_native": 0.9,
+                             "json_ok_native": 1.0}, False)["tool_mode"] == "native"
+    assert modelcard.choose({**base, "tool_choice_native": 0.65,
+                             "json_ok_native": 1.0}, False)["tool_mode"] == "grammar"
+    assert modelcard.choose({**base, "tool_choice_native": 0.9,
+                             "json_ok_native": 0.8}, False)["tool_mode"] == "grammar"
+    assert modelcard.choose(dict(base), False)["tool_mode"] == "grammar"

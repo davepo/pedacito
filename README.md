@@ -285,8 +285,8 @@ do:
 | semantic search | `semantic_search = true` | A `grep` with no hits falls back to the server's `/v1/embeddings` endpoint. |
 
 `run` and `mcp` execute model-chosen commands in your project. Treat them as a
-trust decision, not a sandbox — but see [Safety](#safety-and-trust) for what
-Pedacito does to limit the blast radius.
+trust decision — but see [Safety](#safety-and-trust): `run` is sandboxed by
+default where the OS allows, and the rest of the blast radius is limited too.
 
 ### Seeing a GUI or web page
 
@@ -425,7 +425,26 @@ pedacito memory PROJ [--add T | --forget T]
 pedacito skills PROJ
 pedacito prune PROJ --keep-sessions 50 --keep-backups 20 [--dry-run]
 pedacito trust PROJ                # approve a project's .pedacito.toml
+pedacito ask PROJ -t "..." --record          # save the model's responses
+pedacito ask PROJ -t "..." --replay FILE     # re-run the harness, no model needed
 ```
+
+`calibrate` also measures **native tool calls** against the JSON grammar on your
+model (same eight scenarios, both modes) and the card switches `tool_mode` to
+`native` only when it picks the right action at least 0.1 more often with no
+loss of well-formed steps. Native mode sends the step schema as one forced
+function and reads the model's tool-call arguments, which suits models trained
+on tool calling; a server that rejects `tools` falls back to the grammar once
+and remembers. Its short probes (instruction following, long-context needle)
+get a generous token budget and retry once with thinking off, so a reasoning
+model that spends a tiny budget on `<think>` is not scored as failing the skill.
+
+`--record` writes the ordered model responses to `.pedacito/replay/<stamp>.jsonl`
+(prompts as a hash and a short redacted preview, never in full); `--replay`
+feeds them back with no server, running the whole harness (gather loop, folding,
+preflight, edit parsing, repair) deterministically and free. It reports which
+calls were asked a *different* prompt than when recorded: that is how you test a
+change to the harness rather than to the model.
 
 `pedacito eval` runs eight tasks over three fixture repositories (Python,
 TypeScript, Go) — each with a gold file set, a substring check, a real test for
@@ -606,6 +625,22 @@ you configured. Within that:
   boxes), or anything in `protected_paths`. It will not edit a file that has
   unresolved git merge conflicts. `shell_deny = ["git push*", "rm -rf *"]`
   refuses matching commands even when the executable is allowed.
+- **OS sandbox (on by default).** `run` and the tests an edit triggers run under
+  an unprivileged OS sandbox: they can read the filesystem but write only to the
+  project and a private temp directory; `.git/` (hooks!), `.pedacito/` and the
+  project config are read-only; `~/.ssh`, `~/.aws`, `~/.config/pedacito` and
+  similar are hidden; and the **network is off**. Backends: bubblewrap on Linux
+  (`bwrap`), `sandbox-exec` on macOS; Windows has none that works without admin
+  rights. Where no backend works (not installed, user namespaces disabled,
+  Windows) commands run unsandboxed after ONE notice, so Pedacito behaves the
+  same everywhere. Opt out with `sandbox = false`; allow the network with
+  `sandbox_network = true` (needed for tests that talk to a server or install
+  packages); add writable directories with `sandbox_writable = ["~/.cache/pip"]`;
+  `sandbox_strict = true` refuses to run a command when no sandbox can be
+  applied. A failed command's observation says it ran sandboxed, so the model
+  does not chase a blocked write as a code bug. `pedacito config --doctor` and
+  `/status` show whether it is active. Your own hooks and `auto_verify` are
+  never sandboxed.
 - **Browser `eval`** runs model-written JavaScript, so it is limited to local
   pages (`browser_eval_hosts`).
 - **Secrets stay out.** Secret-bearing files are not indexed (above); secret-
@@ -623,8 +658,9 @@ you configured. Within that:
   decision on stdout, exit status 2 to deny a `pre_*` event. No shell, a
   timeout, the scrubbed environment; a failing hook is a warning.
 
-`run`, `browser` and MCP servers still execute on your machine. None of this is
-a sandbox: it removes the cheap mistakes, not a determined adversary.
+`browser` and MCP servers still execute unsandboxed on your machine (a server is
+a program you chose to run). The sandbox contains `run` and test commands; it is
+defence in depth, not a promise against a determined adversary or a kernel bug.
 
 ## Roles: a different model per job
 
@@ -676,9 +712,12 @@ pedacito restore PROJ --list
 pedacito restore PROJ --dry-run
 pedacito restore PROJ                        # newest snapshot, byte-for-byte
 pedacito restore PROJ --snapshot 20260830-020724
+pedacito restore PROJ --delete-created       # also remove files that run created
 ```
 
-Files created after a snapshot are left in place. Everything Pedacito writes for
+Files created after a snapshot are left in place unless you pass
+`--delete-created` (the run's created files are listed in a sidecar
+`backups/<stamp>.created`; directories left empty are removed too). Everything Pedacito writes for
 a project lives under `<project>/.pedacito/`:
 
 ```
@@ -809,6 +848,10 @@ config --reference` prints the annotated template. Key settings:
 | `max_observation_tokens` | 0 | Ceiling on one non-read observation, in tokens (0 = auto: a quarter of the window, 300-2200). |
 | `plan_threshold` / `max_replans` | 0 / 1 | Auto-plan tasks naming this many files or requirements (0 = only with `--plan`); planner revisions after a failed step. |
 | `allow_steering` | true | Deliver lines typed mid-task to the model in `chat`. |
+| `tool_mode` | `grammar` | `native` sends lookup steps through the model's tool-call channel; `calibrate` picks. |
+| `sandbox` / `sandbox_network` | true / false | OS sandbox for `run` and test commands; allow network inside it. |
+| `sandbox_writable` / `sandbox_strict` | `[]` / false | Extra writable dirs; refuse to run when no sandbox can be applied. |
+| `atomic_edits` | false | Write a multi-file reply all-or-nothing (any failure writes nothing). |
 
 Everything else (chunking, budgets, browser timeouts, auto-loop behavior) has a
 working default and is documented in `pedacito config --reference`.
@@ -825,13 +868,15 @@ working default and is documented in `pedacito config --reference`.
 - `py-tree-sitter` 0.26 can crash CPython 3.14 on files with several hundred
   top-level statements (an upstream bug; reproducible without Pedacito). CI
   covers 3.11–3.13.
-- `run`, `browser`, `fetch` and MCP are guarded (scrubbed environment,
-  protected paths, host allowlists, trust prompts), not sandboxed.
+- `run` and test commands are sandboxed where bubblewrap/sandbox-exec work (not
+  on Windows, not where user namespaces are disabled -- you get a notice, not a
+  silent downgrade); `browser`, `fetch` and MCP are guarded (scrubbed
+  environment, protected paths, host allowlists, trust prompts), not sandboxed.
 - `rename` is mechanical and conservative: it follows imports, not types, so a
   method renamed on a class used through another name is reported as "not
-  changed" rather than guessed. Several edit blocks across files are still
-  applied per file, not atomically (the snapshot and `pedacito restore` are the
-  safety net).
+  changed" rather than guessed. Several edit blocks across files are applied
+  per file unless `atomic_edits = true` (the snapshot and `pedacito restore` are
+  the safety net either way).
 - Languages: Python by AST; JS/TS, Ruby, Go, Rust, Java, C, C++, C#, PHP,
   Kotlin, Swift, Scala and Lua through tree-sitter (a grammar quirk can drop an
   occasional Swift call edge); everything else is searchable reference text.

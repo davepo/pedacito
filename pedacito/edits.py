@@ -879,6 +879,8 @@ def apply_edits(root: Path, edits: list[Edit], backup: bool = True,
 
         if backup and original is not None:
             _backup(path, rel)
+        elif backup and original is None and backup_dir is not None:
+            fileio.note_created(backup_dir, rel)
 
         # Sources are backed up under their OLD path so a snapshot restores a
         # rename by moving files back.

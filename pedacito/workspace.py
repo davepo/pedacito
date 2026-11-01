@@ -165,11 +165,58 @@ def list_backups(root: Path) -> list[Path]:
     return sorted((p for p in d.iterdir() if p.is_dir()), reverse=True) if d.exists() else []
 
 
+def created_files(root: Path, snapshot: Path) -> list[str]:
+    """Files the snapshot's run created that still exist (relative paths)."""
+    from .fileio import created_manifest
+    root = Path(root).resolve()
+    try:
+        names = created_manifest(snapshot).read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return []
+    out = []
+    for rel in names:
+        p = (root / rel).resolve()
+        if rel and _is_inside(p, root) and p.is_file():
+            out.append(rel)
+    return out
+
+
+def _is_inside(path: Path, root: Path) -> bool:
+    try:
+        path.relative_to(root)
+        return True
+    except ValueError:
+        return False
+
+
+def delete_created(root: Path, snapshot: Path, dry_run: bool = False) -> list[str]:
+    """Remove the files the snapshot's run created (and directories left
+    empty by that). Returns the relative paths removed (or that would be)."""
+    root = Path(root).resolve()
+    gone = created_files(root, snapshot)
+    if dry_run:
+        return gone
+    for rel in gone:
+        p = root / rel
+        try:
+            p.unlink()
+        except OSError:
+            continue
+        parent = p.parent
+        while parent != root and _is_inside(parent, root):
+            try:
+                parent.rmdir()            # only succeeds when empty
+            except OSError:
+                break
+            parent = parent.parent
+    return gone
+
+
 def restore(root: Path, snapshot: Path, dry_run: bool = False) -> list[str]:
     """Copy every file in a backup snapshot back over the working tree
     byte-for-byte. Returns the relative paths restored (or that would be, if
     `dry_run`). Files created since the snapshot have no copy in it and are
-    left in place, never deleted."""
+    left in place unless the caller also runs `delete_created`."""
     root = Path(root).resolve()
     restored: list[str] = []
     for src in sorted(snapshot.rglob("*")):
@@ -240,6 +287,11 @@ def prune(root: Path, keep_sessions: int = 0, keep_backups: int = 0,
             removed["backups"] += 1
             if not dry_run:
                 shutil.rmtree(snap, ignore_errors=True)
+                try:
+                    from .fileio import created_manifest
+                    created_manifest(snap).unlink()
+                except OSError:
+                    pass
     if keep_events > 0:
         d = state_dir(root, "events")
         files = sorted(d.glob("*.jsonl"), reverse=True) if d.is_dir() else []

@@ -126,6 +126,27 @@ def backup_copy(src: Path, dest: Path, keep_existing: bool = True) -> None:
     shutil.copy2(str(src), str(dest))
 
 
+def created_manifest(backup_dir) -> Path:
+    """Where a snapshot lists the files its run CREATED (a sibling file, so a
+    restore of the snapshot's own tree never copies it back)."""
+    d = Path(backup_dir)
+    return d.parent / f"{d.name}.created"
+
+
+def note_created(backup_dir, rel: str) -> None:
+    """Record that this run created `rel` (so `restore --delete-created` can
+    remove it). Best effort."""
+    try:
+        m = created_manifest(backup_dir)
+        m.parent.mkdir(parents=True, exist_ok=True)
+        have = m.read_text(encoding="utf-8").splitlines() if m.exists() else []
+        if rel not in have:
+            with m.open("a", encoding="utf-8") as fh:
+                fh.write(rel + "\n")
+    except OSError:
+        pass
+
+
 def normalise_rel(name: str) -> str:
     """Turn a user- or model-typed path (backslashes, quotes, backticks) into
     the forward-slash relative path the index stores."""

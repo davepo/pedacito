@@ -353,3 +353,129 @@ def test_mcp_dead_server_cools_down_instead_of_retrying_every_call():
         assert "retrying in" in str(e)
     mcp.close_all()
     assert mcp._cooling(cmd) == 0
+
+
+def test_sandbox_profile_and_args_cover_the_guards(tmp_path, monkeypatch):
+    from pedacito import sandbox
+    (tmp_path / ".git").mkdir()
+    (tmp_path / ".pedacito").mkdir()
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    (tmp_path / "home" / ".ssh").mkdir(parents=True)
+    root = (tmp_path / "proj")
+    root.mkdir()
+    (root / ".git").mkdir()
+    prof = sandbox.seatbelt_profile(root, False, [])
+    assert "(deny network*)" in prof and "(deny file-write*)" in prof
+    assert f'(deny file-write* (subpath "{root}/.git"))' in prof
+    assert f'(deny file-read* (subpath "{tmp_path}/home/.ssh"))' in prof
+    assert "(deny network*)" not in sandbox.seatbelt_profile(root, True, [])
+    args = sandbox._bwrap_args(root, False, [])
+    assert "--unshare-net" in args and args[-1] == "--"
+    assert "--unshare-net" not in sandbox._bwrap_args(root, True, [])
+    i = args.index("--ro-bind", args.index(str(root)))
+    assert args[i + 1] == str(root / ".git")
+    assert str(tmp_path / "home" / ".ssh") in args       # hidden by a tmpfs
+
+
+def test_sandbox_degrades_with_one_notice_and_strict_refuses(tmp_path, monkeypatch, capsys):
+    from pedacito import sandbox
+    monkeypatch.setattr(sandbox, "backend_name", lambda: "")
+    sandbox._noticed.clear()
+    cfg = Config()
+    argv, note = sandbox.wrap(["echo", "x"], cfg, tmp_path)
+    sandbox.wrap(["echo", "x"], cfg, tmp_path)
+    err = capsys.readouterr().err
+    assert argv == ["echo", "x"] and note == "" and err.count("[sandbox]") == 1
+    cfg.sandbox_strict = True
+    try:
+        sandbox.wrap(["echo"], cfg, tmp_path)
+        raise AssertionError("expected SandboxRefused")
+    except sandbox.SandboxRefused:
+        pass
+    cfg.sandbox = False
+    assert sandbox.wrap(["echo"], cfg, tmp_path) == (["echo"], "")
+
+
+def test_sandbox_wraps_when_active(tmp_path, monkeypatch):
+    from pedacito import sandbox
+    monkeypatch.setattr(sandbox, "backend_name", lambda: "bwrap")
+    monkeypatch.setattr(sandbox, "_probe", lambda b, n: (True, ""))
+    argv, note = sandbox.wrap(["pytest", "-q"], Config(), tmp_path)
+    assert argv[0] == "bwrap" and argv[-2:] == ["pytest", "-q"]
+    assert "network off" in note
+
+
+def test_sandbox_settings_need_trust_in_a_project_config():
+    from pedacito import config
+    assert {"sandbox", "sandbox_network", "sandbox_writable",
+            "sandbox_strict"} <= set(config.EXEC_FIELDS)
+
+
+def test_sandbox_really_blocks_writes_when_a_backend_works(tmp_path):
+    import subprocess as sp
+    from pedacito import sandbox
+    cfg = Config()
+    if sandbox.status(cfg)[0] != "active":
+        pytest.skip("no working sandbox backend on this machine")
+    outside = tmp_path.parent / "sandbox-escape.txt"
+    argv, _ = sandbox.wrap([sys.executable, "-c",
+                            f"open({str(outside)!r}, 'w').write('x'); "
+                            "open('inside.txt', 'w').write('y')"], cfg, tmp_path)
+    r = sp.run(argv, cwd=tmp_path, capture_output=True)
+    assert not outside.exists() and r.returncode != 0
+
+
+def test_atomic_edits_write_nothing_when_one_file_fails(tmp_path):
+    reply = ("--- FILE: a.py\n<<<<<<< SEARCH\nX = 1\n=======\nX = 2\n>>>>>>> REPLACE\n"
+             "--- FILE: b.py\n<<<<<<< SEARCH\nnot there\n=======\nY = 2\n>>>>>>> REPLACE\n")
+    files = {"a.py": "X = 1\n", "b.py": "Y = 1\n"}
+    agent = _agent(tmp_path / "off", Scripted(), files, allow_write=True)
+    results, _ = agent.apply(reply, dry_run=False, task="t", gathered="")
+    assert (tmp_path / "off" / "a.py").read_text() == "X = 2\n"        # partial, as before
+    agent = _agent(tmp_path / "on", Scripted(), files, allow_write=True,
+                   atomic_edits=True)
+    results, _ = agent.apply(reply, dry_run=False, task="t", gathered="")
+    assert (tmp_path / "on" / "a.py").read_text() == "X = 1\n"
+    held = [r for r in results if r.file == "a.py"]
+    assert held and not held[0].ok and "atomic_edits" in held[0].message
+    assert any(r.file == "b.py" and not r.ok for r in results)
+
+
+def test_restore_delete_created_removes_only_files_the_run_made(tmp_path):
+    from pedacito import workspace
+    from pedacito.edits import apply_edits, parse_edits
+    (tmp_path / "keep.py").write_text("A = 1\n")
+    reply = ("--- FILE: keep.py\n<<<<<<< SEARCH\nA = 1\n=======\nA = 2\n>>>>>>> REPLACE\n"
+             "--- FILE: pkg/new.py\n<<<<<<< SEARCH\n=======\nB = 1\n>>>>>>> REPLACE\n")
+    bdir = workspace.new_backup_dir(tmp_path)
+    res = apply_edits(tmp_path, parse_edits(reply), backup=True, backup_dir=bdir)
+    assert all(r.ok for r in res) and (tmp_path / "pkg/new.py").exists()
+    assert workspace.list_backups(tmp_path) == [bdir]          # manifest is not a snapshot
+    assert workspace.restore(tmp_path, bdir) == ["keep.py"]
+    assert (tmp_path / "keep.py").read_text() == "A = 1\n"
+    assert workspace.created_files(tmp_path, bdir) == ["pkg/new.py"]
+    assert workspace.delete_created(tmp_path, bdir, dry_run=True) == ["pkg/new.py"]
+    assert (tmp_path / "pkg/new.py").exists()
+    assert workspace.delete_created(tmp_path, bdir) == ["pkg/new.py"]
+    assert not (tmp_path / "pkg").exists() and (tmp_path / "keep.py").exists()
+
+
+def test_calibration_probe_retries_with_thinking_off_when_the_reply_is_empty():
+    from pedacito import modelcard
+
+    class Thinker:
+        last_finish_reason = ""
+        calls: list = []
+
+        def chat(self, messages, max_tokens, disable_thinking=None, **kw):
+            self.calls.append((max_tokens, disable_thinking))
+            if disable_thinking:
+                self.last_finish_reason = "stop"
+                return "OK: 1"
+            self.last_finish_reason = "length"
+            return ""
+
+    t = Thinker()
+    reply, note = modelcard._probe(t, [{"role": "user", "content": "x"}], 30)
+    assert reply == "OK: 1" and "thinking off" in note
+    assert t.calls[0][0] >= 1500 and t.calls[1][1] is True

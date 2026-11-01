@@ -83,6 +83,11 @@ class Config:
     #     json_schema (DeepSeek and most others).
     # Also accepted: "json_object", "json" (-> "object"), "json_schema" (-> "schema").
     json_mode: str = "schema"
+    # How lookup steps are produced: "grammar" (a JSON schema constrains the
+    # sampler) or "native" (the model's own tool-call channel: better for models
+    # trained on tool calling). `pedacito calibrate` measures both on your model
+    # and the card picks; set it here to force one.
+    tool_mode: str = "grammar"
     # Set by load() when the server is recognised as a hosted API (by URL or a
     # "deepseek" model name). Not a config key. Forces json_mode to "object"
     # unless the user set json_mode explicitly.
@@ -447,6 +452,22 @@ class Config:
     # Executable+args patterns `run` refuses (fnmatch on the command line),
     # e.g. ["rm -rf *", "git push*", "curl *"]; checked after shell_allowlist.
     shell_deny: tuple[str, ...] = ()
+    # All-or-nothing multi-file apply: when any file's edit would fail, write
+    # none of them (the model is told to resend every block).
+    atomic_edits: bool = False
+    # OS sandbox for commands the model (or its edits) cause to run (`run`,
+    # post-edit tests): writes limited to the project and a temp dir, `.git/`
+    # and `.pedacito/` read-only, credentials hidden. Needs bubblewrap (Linux)
+    # or sandbox-exec (macOS); elsewhere commands run unsandboxed with a notice.
+    sandbox: bool = True
+    # Let sandboxed commands use the network (off by default: no installs, no
+    # exfiltration; tests that need a server on localhost need this).
+    sandbox_network: bool = False
+    # Extra directories sandboxed commands may write (e.g. a package cache).
+    sandbox_writable: tuple[str, ...] = ()
+    # Refuse to run a command when no sandbox can be applied, instead of
+    # running it unsandboxed with a notice.
+    sandbox_strict: bool = False
     # Hosts where the browser `eval` action may run model-authored JavaScript.
     # Navigation anywhere is still allowed; eval elsewhere is refused.
     browser_eval_hosts: tuple[str, ...] = ("localhost", "127.0.0.1", "::1",
@@ -545,7 +566,8 @@ PROFILE_SECTION = "profiles"
 _TABLE_FIELDS = ("sampler", "roles", "hooks")
 _TUPLE_FIELDS = ("extra_extensions", "shell_allowlist", "mcp_servers",
                  "env_passthrough", "protected_paths", "shell_deny",
-                 "browser_eval_hosts", "fetch_allowed_hosts")
+                 "browser_eval_hosts", "fetch_allowed_hosts",
+                 "sandbox_writable")
 
 _FIELDS = {f.name: f for f in fields(Config)
            if f.name not in ("sources", "profiles", "active_profile",
@@ -708,6 +730,12 @@ def _coerce(name: str, value, path: Path | None = None):
                 "  ('json_object' / 'json' mean 'object';"
                 " 'json_schema' means 'schema')")
         return norm
+    if name == "tool_mode":
+        norm = str(value).strip().lower()
+        if norm not in ("grammar", "native"):
+            raise ConfigError(f"{where}{name} must be 'grammar' or 'native', "
+                              f"got {value!r}")
+        return norm
     if name in _TUPLE_FIELDS:
         if not isinstance(value, (list, tuple)):
             example = ('["pytest", "python"]' if name == "shell_allowlist"
@@ -776,7 +804,9 @@ def _hostname(base_url: str) -> str:
 # user's back: cloning a project and running `pedacito auto` would otherwise
 # run whatever its author wrote. They are honoured from a project config only
 # after `pedacito trust`, and trust lapses when that file changes.
-EXEC_FIELDS = ("hooks", "mcp_servers", "auto_verify", "test_command")
+EXEC_FIELDS = ("hooks", "mcp_servers", "auto_verify", "test_command",
+               "sandbox", "sandbox_network", "sandbox_writable",
+               "sandbox_strict")
 TRUST_FILE = "trusted_projects.json"
 
 
@@ -1748,6 +1778,8 @@ timeout = 600.0
 load_wait_seconds = 240
 max_consecutive_failures = 3
 json_mode = "schema"
+# tool_mode = "native"      # lookup steps via the model's tool-call channel
+#                           # ("grammar" = JSON schema); `pedacito calibrate` picks
 temperature = 0.2
 # sampler = { top_p = 0.95, top_k = 40, min_p = 0.05, repeat_penalty = 1.1 }
 disable_thinking = false
@@ -2023,6 +2055,14 @@ REFERENCE_TEMPLATE = TEMPLATE + '''
 # never write (on top of .git/, .pedacito/, the plan file); shell_deny lists
 # command patterns `run` refuses; browser_eval_hosts limits where the browser
 # `eval` action may run JavaScript.
+# atomic_edits = true writes a multi-file reply all-or-nothing.
+# sandbox (on) runs `run` and post-edit test commands under bubblewrap (Linux)
+# or sandbox-exec (macOS): writes only to the project and a temp dir, .git/ and
+# .pedacito/ read-only, credentials hidden, network off. sandbox_network = true
+# allows the network; sandbox_writable lists extra writable directories;
+# sandbox_strict refuses to run when no sandbox can be applied (the default is
+# one notice, then unsandboxed -- Windows has no backend). A project's own
+# config cannot change these until `pedacito trust`.
 # log_events writes .pedacito/events/*.jsonl (local only); keep_events,
 # keep_sessions, keep_backups and log_max_bytes feed `pedacito prune`.
 #

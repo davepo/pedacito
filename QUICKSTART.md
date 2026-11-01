@@ -262,7 +262,7 @@ so an unattended run can't compound damage.
 **Several changes in one task.** `pedacito ask . -t "..." --plan` runs each
 requirement in its own fresh context (bullets split with no model call) and
 re-plans once if a step fails. Weak models get this automatically after
-`pedacito calibrate`. While `chat` is working, type a line to steer it ("it's in
+`pedacito calibrate` (which also tests whether your model does better with native tool calls). While `chat` is working, type a line to steer it ("it's in
 sync.py"); it may also ask you one short question when a task is truly
 ambiguous. `--jsonl` turns a run into one JSON event per line for scripts and
 editors; `--role planner=big` sends one job to another profile for a run.
@@ -277,6 +277,18 @@ for long investigations), `allow_fetch = true` (read allow-listed web pages),
 and — the other direction — `auto_allowlist = true` (each `auto` task may only
 write existing files its title names or its lookups read; creating new files
 stays allowed). See the README for details.
+
+**Sandboxed commands.** Where your OS has bubblewrap (Linux) or sandbox-exec
+(macOS), `run` and post-edit tests execute in a sandbox: writes only to the
+project and a temp dir, `.git/` read-only, credentials hidden, **no network**.
+If a test needs the network, set `sandbox_network = true`; `sandbox = false`
+turns it off; on Windows (no backend) commands run as before after one notice.
+`pedacito config --doctor` shows whether it is active.
+
+**Undo, including new files.** `pedacito restore . --delete-created` also
+removes the files that run created. `pedacito ask . -t "..." --record` saves the
+model's responses and `--replay FILE` re-runs the harness against them with no
+model, which is how to test a harness change.
 
 **Safe by default.** Commands the model runs get a scrubbed environment (no
 ambient API keys), `.env`/key files are never indexed, tool output is fenced as

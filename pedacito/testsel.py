@@ -22,7 +22,7 @@ import shutil
 import sys
 from pathlib import Path
 
-from . import proc, safety, testlinks
+from . import proc, safety, sandbox, testlinks
 
 _NPM_PLACEHOLDER = re.compile(r"no test specified", re.IGNORECASE)
 
@@ -155,10 +155,18 @@ def run_command(root, cfg, command: str, timeout: int | None = None
     if not argv:
         return False, "(empty test command)"
     timeout = int(timeout or getattr(cfg, "test_timeout", 300) or 300)
+    try:
+        argv, box = sandbox.wrap(argv, cfg, root)
+    except sandbox.SandboxRefused as e:
+        return False, f"could not run `{command}`: {e}"
     rc, out, stopped, _el = proc.run(
         argv, cwd=Path(root), timeout=timeout, idle_timeout=0,
         max_output=int(getattr(cfg, "max_shell_output_chars", 8000) or 8000) * 2,
         env=safety.child_env(cfg))
+    if box and rc not in (0, None) and not stopped:
+        out += (f"\n[ran in a sandbox ({box}); a failure from a blocked write "
+                "outside the project or no network is the sandbox, not the "
+                "code]")
     if stopped == "error":
         return False, f"could not run `{command}`: {out}"
     if stopped:

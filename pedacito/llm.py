@@ -309,6 +309,19 @@ def extract_content(message: dict) -> str:
     return strip_reasoning(content)
 
 
+def _tool_call_arguments(message: dict) -> str:
+    """The JSON arguments of the first native tool call in a response message
+    ('' when the model answered in plain content)."""
+    for call in message.get("tool_calls") or []:
+        fn = (call or {}).get("function") or {}
+        args = fn.get("arguments")
+        if isinstance(args, dict):
+            return json.dumps(args)
+        if isinstance(args, str) and args.strip():
+            return args
+    return ""
+
+
 def _cut_field(text: str, obj: dict, schema: dict | None) -> str:
     """Which schema field a truncated reply died inside, or "" when benign.
 
@@ -608,6 +621,11 @@ class LLMClient:
         # answered the probe without advertising it (such requests fall back to
         # JSON prompting).
         self._schema_supported: bool | None = None
+        # Native tool calling for step schemas (cfg.tool_mode = "native"):
+        # None = not tried; False once the server rejected `tools`.
+        # `native_override` lets `calibrate` A/B the two modes.
+        self._native_ok: bool | None = None
+        self.native_override: bool | None = None
         # "length" means cut off mid-answer: "valid JSON we never let it finish".
         self.last_finish_reason = ""
         # Calibrated chars-per-token from the server's tokenizer endpoint
@@ -620,6 +638,18 @@ class LLMClient:
         # empty-completion retry uses it to tell an instant-EOS flake (retry
         # identical) from a thinking runaway (retry with thinking disabled).
         self.last_reasoning_chars = 0
+
+    def _native_for(self, schema: dict | None, stream: bool) -> bool:
+        """Whether this request should use the model's native tool-call channel
+        instead of a JSON grammar: only for step schemas (an `action` field),
+        never for streamed answers, and not after the server rejected tools."""
+        if schema is None or stream or self._native_ok is False:
+            return False
+        if "action" not in (schema.get("properties") or {}):
+            return False
+        if self.native_override is not None:
+            return self.native_override
+        return getattr(self.cfg, "tool_mode", "grammar") == "native"
 
     def estimate_tokens(self, text: str) -> int:
         """Token estimate for fit math: the server's calibrated chars-per-token
@@ -1101,7 +1131,19 @@ class LLMClient:
             # Without this, a streamed reply (the whole answer phase) reports
             # no usage at all and its cost/cache-hit data is lost.
             payload["stream_options"] = {"include_usage": True}
-        if schema is not None:
+        native = self._native_for(schema, stream)
+        if native:
+            # One function whose parameters ARE the step schema, forced: the
+            # model fills it in through its own tool-call training instead of a
+            # sampling grammar. A server that ignores tool_choice may answer in
+            # content; chat_json parses that the same way.
+            payload["tools"] = [{"type": "function", "function": {
+                "name": "step",
+                "description": "Choose the next action for the task.",
+                "parameters": schema}}]
+            payload["tool_choice"] = {"type": "function",
+                                      "function": {"name": "step"}}
+        elif schema is not None:
             if self.cfg.json_mode == "object":
                 payload["response_format"] = {"type": "json_object"}
             else:
@@ -1146,7 +1188,16 @@ class LLMClient:
             self._cancel.clear()
 
         if not stream:
-            r = self._post(payload)
+            try:
+                r = self._post(payload)
+            except LLMError as e:
+                if native and self._tools_rejected(e):
+                    self._native_ok = False
+                    print("[this server rejected native tool calls; using the "
+                          "JSON grammar instead]", file=sys.stderr)
+                    return self._chat_once(messages, max_tokens, schema, stream,
+                                           disable_thinking)
+                raise
             try:
                 data = r.json()
             finally:
@@ -1156,9 +1207,13 @@ class LLMClient:
             except (KeyError, IndexError, AttributeError, TypeError):
                 self.last_finish_reason = ""
             try:
-                text = extract_content(data["choices"][0]["message"])
+                msg = data["choices"][0]["message"]
+                text = (_tool_call_arguments(msg) if native else "") \
+                    or extract_content(msg)
             except (KeyError, IndexError, TypeError) as e:
                 raise LLMError(f"Unexpected response shape: {json.dumps(data)[:500]}") from e
+            if native and self._native_ok is None:
+                self._native_ok = True
             self._account(data.get("usage") or {}, data.get("timings"),
                           time.time() - t0, prompt_est, text)
             return text
@@ -1278,6 +1333,12 @@ class LLMClient:
                   f"({type(dropped).__name__}); treating the reply as cut "
                   f"off]", file=sys.stderr)
         return text
+
+    @staticmethod
+    def _tools_rejected(err: Exception) -> bool:
+        low = str(err).lower()
+        return any(w in low for w in ("tools", "tool_choice", "tool calling",
+                                      "function call", "tool use"))
 
     @staticmethod
     def _schema_has_big_fields(schema: dict | None) -> bool:

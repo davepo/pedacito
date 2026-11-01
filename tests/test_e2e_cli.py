@@ -155,3 +155,18 @@ def test_plan_mode_dry_run_lists_one_step_per_requirement(fake_port, env, capsys
     assert "plan (requirements; 2 step(s))" in err and "1. " in err and "2. " in err
     assert "LIMIT = 10" in (env / "app.py").read_text()
     assert list((env / ".pedacito" / "plans").glob("*.md"))
+
+
+@pytest.mark.network
+def test_record_then_replay_reproduces_the_run_without_a_server(fake_port, env, capsys):
+    assert cli.main(_args(fake_port, env, "--apply", "--record")) == 0
+    capsys.readouterr()
+    rec = next((env / ".pedacito" / "replay").glob("*.jsonl"))
+    assert "LIMIT = 25" in (env / "app.py").read_text()
+    (env / "app.py").write_text("LIMIT = 10\n\n\ndef check(n):\n    return n < LIMIT\n")
+    # a dead port proves no server is contacted
+    dead = _free_port()
+    assert cli.main(_args(dead, env, "--apply", "--replay", str(rec))) == 0
+    err = capsys.readouterr().err
+    assert "every prompt matched the recording" in err
+    assert "LIMIT = 25" in (env / "app.py").read_text()
