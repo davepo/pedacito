@@ -284,7 +284,7 @@ def _run_task(task: str, apply_now: bool) -> None:
 
     when = workspace.stamp()
     reviewing = not apply_now
-    backup_dir = workspace.new_backup_dir(root, when) if cfg.backup else None
+    backup_dir = workspace.new_backup_dir(root, when, unique=True) if cfg.backup else None
 
     def _note(text: str) -> None:
         with STATE.lock:

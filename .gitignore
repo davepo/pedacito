@@ -1,3 +1,23 @@
 __pycache__/
 *.pyc
 *.egg-info/
+
+# Pedacito's own per-project state, config, and ignore file (machine-specific)
+.pedacito/
+.pedacitoignore
+.pedacito.toml
+pedacito.toml
+
+# Tool caches, virtualenvs, editor and OS files
+.ruff_cache/
+.pytest_cache/
+.mypy_cache/
+.venv/
+venv/
+.env
+.env.*
+.idea/
+.vscode/
+.DS_Store
+build/
+dist/

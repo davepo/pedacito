@@ -92,6 +92,18 @@ window, and calibrates token math against the server's own tokenizer. The
 answers are remembered, so a server without grammar support falls back to
 JSON prompting automatically on later runs.
 
+Then, once per model:
+
+```bash
+pedacito calibrate
+```
+
+It spends about a minute measuring the model — does it pick the right lookup,
+emit valid edit blocks, resist a planted prompt injection, admit what it has
+not read, find a needle in a long prompt? — and saves a model card. Settings you
+left at their defaults (prompt pack, answer mode, verifier, best-of-N) then
+follow the card; `pedacito config` shows it.
+
 Stuck on anything else? `pedacito how "how do I ...?"` answers from these docs
 and the source, using your config. It needs no project or index.
 
@@ -135,6 +147,11 @@ On a large project, `cost` tells you whether the first index takes 2 minutes or
 need to run `index` again explicitly, since `ask` and `chat` refresh it.
 `pedacito map ~/code/anki` prints the index with no model, a quick sanity check.
 
+Curious what the model will actually see? `pedacito map ~/code/anki -t "make the
+leech threshold configurable"` prints the map a task would get: on a big project,
+the likeliest files first (each with a `why listed:` line) over a directory
+skeleton.
+
 ## 6. Ask for something (nothing is written)
 
 ```bash
@@ -155,6 +172,12 @@ pedacito ask ~/code/anki -t "make the leech threshold configurable"
 **Without `--apply` or `--review`, nothing is written**: you get a diff and
 decide. Stay in this mode for your first dozen tasks with a new model or project
 to learn how reliably its edits anchor.
+
+Every task ends with a usage line — calls, tokens in/out, the server's
+prompt-cache hit ratio, and cost if you set prices — and before any edit is
+written Pedacito checks it for the usual small-model mistakes (editing code it
+never read, a `TODO` instead of working code, a removed function whose callers
+were left behind). Findings are printed; errors trigger one corrected re-ask.
 
 To ask a question instead of changing code, use `explain`:
 
@@ -206,8 +229,20 @@ other commands stay in the terminal.
 **Interactive session.** `pedacito chat ~/code/anki` keeps the index warm
 between tasks (add `--apply` or `--review` for the whole session). Slash
 commands: `/profile NAME`, `/model ID`, `/apply on|off`, `/steps N`, `/status`,
-`/profiles`, `/help`, `/quit`. Switching profile and re-running a task is the
-cheapest way to compare two models.
+`/cost`, `/memory`, `/skills`, `/profiles`, `/help`, `/quit`. Ctrl-C cancels
+the running task and keeps the session. Switching profile and re-running a task
+is the cheapest way to compare two models.
+
+**Memory and skills.** The model can `remember` a fact about the project (a
+build command, a convention, a trap) into `.pedacito/memory.md`; you can edit
+it, or `pedacito memory ~/code/anki --add "..."`. Built-in skills
+(`pedacito skills`) give it recipes like *add-a-test* and *fix-a-failing-test*;
+write your own in `.pedacito/skills/NAME/SKILL.md`.
+
+**Measure it.** `pedacito eval` runs eight fixture tasks (Python, TypeScript,
+Go, with a planted prompt injection) and reports locate rate, first-apply
+success, tokens, cache hits and a failure taxonomy — change a setting, run it
+again, compare.
 
 **New project.** `pedacito new ~/code/my-app -t "a CLI todo manager with a
 sqlite backend" --apply` plans a file tree, writes a skeleton, then fills in
@@ -224,13 +259,30 @@ worktree), `--plan FILE` (use your own checklist), and `--max-tasks N` /
 makes the check worse is rolled back automatically and the task marked failed,
 so an unattended run can't compound damage.
 
+**Several changes in one task.** `pedacito ask . -t "..." --plan` runs each
+requirement in its own fresh context (bullets split with no model call) and
+re-plans once if a step fails. Weak models get this automatically after
+`pedacito calibrate`. While `chat` is working, type a line to steer it ("it's in
+sync.py"); it may also ask you one short question when a task is truly
+ambiguous. `--jsonl` turns a run into one JSON event per line for scripts and
+editors; `--role planner=big` sends one job to another profile for a run.
+
 **Optional abilities** (all off by default; set in your config):
-`allow_write = true` (create/overwrite/move/delete files), `allow_shell = true`
-(run tests and linters), `allow_screenshots = true` and `allow_browser = true`
-(let the model see a GUI or web page as text), and — the other direction —
-`auto_allowlist = true` (each `auto` task may only write existing files its
-title names or its lookups read; creating new files stays allowed). See the
-README for details.
+`allow_write = true` (create/overwrite/move/delete files, and a mechanical
+`rename` of a symbol across the files that import it), `allow_shell = true`
+(run tests and linters; add `verify_tests = true` to run the tests an edit can
+break), `allow_screenshots = true` and `allow_browser = true` (let the model
+see a GUI or web page as text), `allow_subagents = true` (a read-only helper
+for long investigations), `allow_fetch = true` (read allow-listed web pages),
+and — the other direction — `auto_allowlist = true` (each `auto` task may only
+write existing files its title names or its lookups read; creating new files
+stays allowed). See the README for details.
+
+**Safe by default.** Commands the model runs get a scrubbed environment (no
+ambient API keys), `.env`/key files are never indexed, tool output is fenced as
+data, the model can't write `.git/`, `.pedacito/` or the `auto` plan file, and a
+cloned project's `.pedacito.toml` cannot set hooks, MCP servers or verify
+commands until you read it and run `pedacito trust`.
 
 ## Several models: profiles
 
@@ -316,7 +368,14 @@ To force a clean rebuild, delete `<project>/.pedacito/` (always safe) or pass
 | `pedacito how "..."` | Ask how to use Pedacito. No project needed. |
 | `pedacito files PROJ` | What would be indexed, and why. Free. |
 | `pedacito cost PROJ` | What indexing will cost. Free. |
-| `pedacito map PROJ` | Print the index. No model needed. |
+| `pedacito map PROJ [-t "task"]` | Print the index (ranked for a task). No model needed. |
+| `pedacito calibrate` | Measure the model; save a model card that tunes defaults. |
+| `pedacito eval` | Score the harness on built-in fixture repos. |
+| `pedacito tests PROJ --files F` | Detected test command; tests an edit to F can break. |
+| `pedacito memory PROJ` | List / add / forget remembered facts. |
+| `pedacito skills PROJ` | List the available skills. |
+| `pedacito prune PROJ` | Delete old sessions/backups/events; trim the log. |
+| `pedacito trust PROJ` | Approve a project's `.pedacito.toml`. |
 | `pedacito index PROJ` | Build or refresh the index. |
 | `pedacito ask PROJ -t "..."` | One task; dry run by default. Add `--review` or `--apply`. |
 | `pedacito explain PROJ -q "..."` | Answer a question about the code. No edits. |
@@ -337,8 +396,10 @@ Flags available on most commands: `--exclude 'pattern'`, `--include 'pattern'`,
 Per project, under `<project>/.pedacito/`: `index.json` (the map),
 `summaries.json` (summary cache), `backups/<stamp>/` (pre-write snapshots),
 `sessions/<stamp>.md` (what was asked, looked up, and changed — open this when an
-edit turns out wrong later), `reviews/` (saved review pages), and `log.txt`
-(event trace). Deleting the folder is always safe; it only costs a re-index.
+edit turns out wrong later), `events/*.jsonl` (one JSON line per step, model
+call, fold and task: tokens, cache hits, latency), `memory.md`, `reviews/`
+(saved review pages), and `log.txt` (event trace). Deleting the folder is always
+safe; it only costs a re-index. `pedacito prune` trims the old files.
 
 Your settings live in `~/.config/pedacito/config.toml` (`%APPDATA%\pedacito\`
 on Windows); `pedacito config` shows every resolved value and which file or
@@ -346,4 +407,6 @@ profile set it. Settings resolve in layers: defaults → that file → a project
 `.pedacito.toml` → `--config FILE` → `--profile` → command-line flags. Next to
 the config file, the GUI remembers recent projects in `gui_recent.json` and
 `server_modes.json` stores what each server + model supports (JSON modes,
-tokenizer rate; refreshed by `--doctor`). Both are safe to delete.
+tokenizer rate; refreshed by `--doctor`), and `model_cards.json` holds the
+`pedacito calibrate` results (they expire after 30 days). All are safe to
+delete.

@@ -130,3 +130,13 @@ def normalise_rel(name: str) -> str:
     """Turn a user- or model-typed path (backslashes, quotes, backticks) into
     the forward-slash relative path the index stores."""
     return (name or "").strip().strip("`\"'").replace("\\", "/")
+
+
+def path_key(name: str) -> str:
+    """Comparison key for a project path: lower-case, forward slashes, and any
+    leading `./` segments removed. (`str.lstrip("./")` strips CHARACTERS, so
+    it turned `.hidden/x` into `hidden/x` and `../x` into `x`.)"""
+    p = normalise_rel(name).lower()
+    while p.startswith("./"):
+        p = p[2:]
+    return p

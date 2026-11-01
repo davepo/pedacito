@@ -145,6 +145,16 @@ class Config:
     # Above this size a reference file is recorded by name and header only.
     max_reference_bytes: int = 2_000_000
     summarise_references: bool = False
+    # Concurrent summary requests while indexing; 0 = auto (hosted APIs 4,
+    # local servers 1 -- a single GPU queue gains nothing from more).
+    summary_workers: int = 0
+    # Short units (<= 25 lines) summarised N per request while indexing; 1 = one
+    # per request. Fewer round-trips and prefills for a model that follows
+    # "reply with N numbered lines" (calibrate shows whether yours does).
+    summary_batch: int = 1
+    # After a task, re-summarise up to this many changed/new units so edited
+    # files keep their map text (0 = never; `pedacito index` does the rest).
+    refresh_summaries: int = 12
 
     # --- Agent loop -----------------------------------------------------------
     # Include the repository's PEDACITO.md / AGENTS.md / CLAUDE.md in every prompt.
@@ -161,6 +171,9 @@ class Config:
     # Limit on continuation turns when a reply is cut off mid-block; 0 = no
     # limit (the continuation char budget is the real bound).
     max_continuation_rounds: int = 0
+    # Ceiling on one NON-read observation (grep, run, mcp, ...), in tokens;
+    # 0 = auto (a quarter of the usable window, 300-2200).
+    max_observation_tokens: int = 0
     # Hard cap on source the gather phase may accumulate.
     max_gathered_chars: int = 24000
     max_read_lines: int = 200
@@ -371,6 +384,138 @@ class Config:
     # with no profile selected; profiles carry their own `tier` key.
     tier: str = ""
 
+    # --- Transport, cost, and budgets -----------------------------------------
+    # Ask the server to report usage on streamed replies too (OpenAI
+    # `stream_options.include_usage`); without it the answer phase's token,
+    # cost, and cache-hit numbers are unknown. A server that rejects the option
+    # is remembered and retried without it.
+    stream_usage: bool = True
+    # Provider cache-affinity key (hosted APIs that support it).
+    prompt_cache_key: str = ""
+    # Stop BEFORE the next model call once the session's prompt+completion
+    # tokens reach this (0 = no limit). `--max-tokens-budget` sets it per run.
+    max_total_tokens: int = 0
+    # Stop before the next call once the estimated spend reaches this many
+    # dollars (needs the price_* fields). 0 = no limit. `--max-cost` per run.
+    max_cost: float = 0.0
+    # USD per million tokens, for cost reporting and max_cost.
+    price_input_per_mtok: float = 0.0
+    price_output_per_mtok: float = 0.0
+    price_cached_per_mtok: float = 0.0
+
+    # --- Context management ---------------------------------------------------
+    # Prompt wording density: "tiny" | "small" | "full"; "" = chosen from the
+    # tier / model card. Tiny lists only the enabled actions and short rules.
+    prompt_pack: str = ""
+    # How the answer phase gets its context: "rebuild" (a fresh two-message
+    # prompt: map + source + task), "continue" (reuse the gather conversation
+    # so the server's prefix cache covers map and source), or "auto"
+    # (continue, falling back to rebuild on a bad reply). "" = the model card
+    # or tier default (hosted: auto, local: rebuild).
+    answer_mode: str = ""
+    # Recent gather steps kept verbatim when older ones are folded into a
+    # STATE digest at window pressure; 0 = chosen from the tier.
+    fold_tail_steps: int = 0
+    # How folded steps are summarised: "deterministic" (extractive digest,
+    # no model call), "model" (one small JSON call), or "off" (legacy
+    # per-turn eviction only).
+    compaction: str = "deterministic"
+
+    # --- Retrieval ------------------------------------------------------------
+    # Rank the project map by task relevance, import-graph importance, and
+    # proximity instead of listing files alphabetically.
+    rank_map: bool = True
+    # Prepend a deterministic repo brief (stack, entry points, test command,
+    # directory roles) to the map.
+    repo_brief: bool = True
+    max_brief_tokens: int = 500
+    # Use ripgrep for `grep` when installed (same output format).
+    use_ripgrep: bool = True
+
+    # --- Safety ---------------------------------------------------------------
+    # Launch commands with a minimal environment (no ambient API keys/tokens).
+    scrub_env: bool = True
+    # Extra environment variable names (or NAME* prefixes) commands may see.
+    env_passthrough: tuple[str, ...] = ()
+    # Fence tool output as untrusted data and flag instruction-like text.
+    wrap_observations: bool = True
+    # Mask secret-looking values in prompts, logs, and session files.
+    redact_secrets: bool = True
+    # Paths (gitignore-style fnmatch) the model may never write, on top of
+    # .git/, .pedacito/, PLAN.md and todo.md.
+    protected_paths: tuple[str, ...] = ()
+    # Executable+args patterns `run` refuses (fnmatch on the command line),
+    # e.g. ["rm -rf *", "git push*", "curl *"]; checked after shell_allowlist.
+    shell_deny: tuple[str, ...] = ()
+    # Hosts where the browser `eval` action may run model-authored JavaScript.
+    # Navigation anywhere is still allowed; eval elsewhere is refused.
+    browser_eval_hosts: tuple[str, ...] = ("localhost", "127.0.0.1", "::1",
+                                           "0.0.0.0")
+
+    # --- Verification and tests ----------------------------------------------
+    # Check an edit reply before/while applying it: "off", "deterministic"
+    # (free: dry-apply, placeholder / stale-reference / unread-citation
+    # checks), or "full" (adds one adversarial verifier model call).
+    verify_answer: str = "deterministic"
+    # Candidate edit replies sampled per task (1 = off); the best by the
+    # deterministic score wins. Costs (N-1) extra answer calls.
+    best_of: int = 1
+    # Run the project's tests after applied edits, impacted tests first.
+    # Needs allow_shell. `test_command` overrides detection.
+    verify_tests: bool = False
+    test_command: str = ""
+    test_timeout: int = 300
+
+    # --- Memory, skills, sub-agents, git --------------------------------------
+    # Push memory: `.pedacito/memory.md` (project) and the user-level
+    # memory.md next to the config file are shown to the model.
+    use_memory: bool = True
+    max_memory_chars: int = 1500
+    # Skills: `.pedacito/skills/*/SKILL.md`, `~/.config/pedacito/skills/*`
+    # and the bundled starters; a catalog is listed, text loads on demand.
+    use_skills: bool = True
+    max_skill_catalog_chars: int = 700
+    # `task` action: a child agent with a fresh window and read-only tools
+    # researches a question and returns a short digest.
+    allow_subagents: bool = False
+    subagent_max_steps: int = 8
+    # Read-only `git` action and a branch/dirty/recent-commits preamble.
+    allow_git: bool = True
+    git_context: bool = True
+    # Per-role profiles, e.g. roles = { planner = "big", summarizer = "tiny" }.
+    # Roles: planner, worker, verifier, summarizer, repair.
+    roles: dict = field(default_factory=dict)
+    # Hook commands per event, e.g. hooks = { post_edit = ["ruff format {file}"] }
+    # -- run without a shell, JSON event on stdin.
+    hooks: dict = field(default_factory=dict)
+    hook_timeout: int = 10
+    # Opt-in `fetch` action: URL -> readable text, domain-allowlisted.
+    allow_fetch: bool = False
+    fetch_allowed_hosts: tuple[str, ...] = ()
+    max_fetch_chars: int = 6000
+    # In `chat`, a line typed while the model is working is delivered to it at
+    # the next step ("stop reading tests, it's in sync.py").
+    allow_steering: bool = True
+    # Plan mode: auto-split a task that names this many files or holds this many
+    # requirements into steps run in fresh contexts (0 = only with `--plan`;
+    # a model card sets it for models that measure weak).
+    plan_threshold: int = 0
+    # Planner revisions of the remaining steps after a failed one.
+    max_replans: int = 1
+    # Targeted recovery prompts when the model gets stuck, before gather gives up.
+    stuck_recovery: bool = True
+    # Use the measured model card (`pedacito calibrate`) to pick defaults.
+    use_model_card: bool = True
+
+    # --- Telemetry and retention (local only) --------------------------------
+    # One JSON line per significant action under .pedacito/events/.
+    log_events: bool = True
+    # `pedacito prune` defaults (0 = keep everything).
+    keep_sessions: int = 0
+    keep_backups: int = 0
+    keep_events: int = 20
+    log_max_bytes: int = 2_000_000
+
     # Bookkeeping for `pedacito config`; not settings.
     sources: dict = None
     profiles: dict = None
@@ -394,6 +539,13 @@ _SECTIONS = ("universal", "server", "lmstudio", "hardware", "generation",
              "map", "indexing", "files", "agent", "scaffold", "editing",
              "reasoning", "review", "workspace")
 PROFILE_SECTION = "profiles"
+
+# Settings whose value is itself a table (never treated as a [section]), and
+# settings that are lists of strings (stored as tuples).
+_TABLE_FIELDS = ("sampler", "roles", "hooks")
+_TUPLE_FIELDS = ("extra_extensions", "shell_allowlist", "mcp_servers",
+                 "env_passthrough", "protected_paths", "shell_deny",
+                 "browser_eval_hosts", "fetch_allowed_hosts")
 
 _FIELDS = {f.name: f for f in fields(Config)
            if f.name not in ("sources", "profiles", "active_profile",
@@ -465,6 +617,17 @@ _JSON_MODE_ALIASES = {
 }
 
 
+# Closed-vocabulary string settings; "" means "choose automatically" where the
+# empty string is listed in _ENUM_EMPTY_OK.
+_ENUM_FIELDS = {
+    "prompt_pack": ("", "tiny", "small", "full"),
+    "answer_mode": ("", "rebuild", "continue", "auto"),
+    "compaction": ("deterministic", "model", "off"),
+    "verify_answer": ("off", "deterministic", "full"),
+}
+_ENUM_EMPTY_OK = ("prompt_pack", "answer_mode")
+
+
 class ConfigError(RuntimeError):
     """Invalid TOML, an unknown setting, a wrong type, or an unknown profile."""
 
@@ -490,7 +653,7 @@ def _flatten(data: dict, path: Path) -> tuple[dict, dict]:
                               f"{', '.join(bad)}")
         profiles[name] = {_canonical(k): v for k, v in body.items()}
     for key, value in data.items():
-        if isinstance(value, dict) and _canonical(key) != "sampler":
+        if isinstance(value, dict) and _canonical(key) not in _TABLE_FIELDS:
             if key not in _SECTIONS:
                 unknown.append(f"[{key}]")
                 continue
@@ -545,18 +708,27 @@ def _coerce(name: str, value, path: Path | None = None):
                 "  ('json_object' / 'json' mean 'object';"
                 " 'json_schema' means 'schema')")
         return norm
-    if name in ("extra_extensions", "shell_allowlist"):
+    if name in _TUPLE_FIELDS:
         if not isinstance(value, (list, tuple)):
             example = ('["pytest", "python"]' if name == "shell_allowlist"
-                       else '[".jinja", ".proto"]')
+                       else '[".jinja", ".proto"]' if name == "extra_extensions"
+                       else '["a", "b"]')
             raise ConfigError(f"{where}{name} must be a list, e.g. {example}")
         return tuple(str(v) for v in value)
-    if name == "sampler":
+    if name in _TABLE_FIELDS:
         if not isinstance(value, dict):
             raise ConfigError(
                 f"{where}{name} must be a table, e.g. "
-                f"[profiles.NAME.sampler] with keys underneath")
+                f"[profiles.NAME.{name}] with keys underneath")
         return dict(value)
+    if name in _ENUM_FIELDS:
+        norm = str(value).strip().lower()
+        if norm not in _ENUM_FIELDS[name]:
+            raise ConfigError(
+                f"{where}{name} must be one of "
+                f"{', '.join(repr(v) for v in _ENUM_FIELDS[name] if v or name in _ENUM_EMPTY_OK)}"
+                f", got {value!r}")
+        return norm
     if target is float and isinstance(value, int) and not isinstance(value, bool):
         return float(value)
     if target in (str, int, float, bool) and not isinstance(value, target):
@@ -599,6 +771,71 @@ def _hostname(base_url: str) -> str:
         return ""
 
 
+# Settings that make Pedacito EXECUTE something (a command, a server, a hook).
+# A repository's own `.pedacito.toml` must not be able to set them behind the
+# user's back: cloning a project and running `pedacito auto` would otherwise
+# run whatever its author wrote. They are honoured from a project config only
+# after `pedacito trust`, and trust lapses when that file changes.
+EXEC_FIELDS = ("hooks", "mcp_servers", "auto_verify", "test_command")
+TRUST_FILE = "trusted_projects.json"
+
+
+def _trust_path() -> Path:
+    return USER_CONFIG.parent / TRUST_FILE
+
+
+def _file_digest(path: Path) -> str:
+    import hashlib
+    try:
+        return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+    except OSError:
+        return ""
+
+
+def is_trusted(config_path: Path) -> bool:
+    """Whether the project config at `config_path` was approved (and not
+    edited since) with `pedacito trust`."""
+    try:
+        data = json.loads(_trust_path().read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False
+    return data.get(str(Path(config_path).resolve())) == _file_digest(config_path)
+
+
+def trust_project(config_path: Path) -> Path:
+    """Record the current contents of a project config as trusted."""
+    tp = _trust_path()
+    try:
+        data = json.loads(tp.read_text(encoding="utf-8"))
+        if not isinstance(data, dict):
+            data = {}
+    except (OSError, ValueError):
+        data = {}
+    data[str(Path(config_path).resolve())] = _file_digest(config_path)
+    tp.parent.mkdir(parents=True, exist_ok=True)
+    tp.write_text(json.dumps(data, indent=1), encoding="utf-8")
+    return tp
+
+
+_warned_untrusted: set[str] = set()
+
+
+def _drop_untrusted(path: Path, settings: dict, root, quiet: bool = False
+                    ) -> dict:
+    """`settings` minus the execution-capable keys when the project config is
+    not trusted (with one warning per file per process)."""
+    bad = [k for k in settings if k in EXEC_FIELDS]
+    if not bad or is_trusted(path):
+        return settings
+    key = str(path)
+    if not quiet and key not in _warned_untrusted:
+        _warned_untrusted.add(key)
+        print(f"[config] ignoring {', '.join(bad)} from {path}: a project "
+              "config can only run commands after you approve it. Review the "
+              "file, then run `pedacito trust`.", file=sys.stderr)
+    return {k: v for k, v in settings.items() if k not in EXEC_FIELDS}
+
+
 def load(root: Path | None = None, explicit: Path | None = None,
          use_env: bool = True, profile: str | None = None,
          require_hardware: bool = True, warn_budgets: bool = True) -> Config:
@@ -629,6 +866,10 @@ def load(root: Path | None = None, explicit: Path | None = None,
 
     for label, path in layers:
         settings, found = _read(path)
+        if label == "project config":
+            settings = _drop_untrusted(path, settings, root)
+            found = {n: _drop_untrusted(path, b, root, quiet=True)
+                     for n, b in found.items()}
         profiles.update(found)
         for key, value in settings.items():
             setattr(cfg, key, _coerce(key, value, path))
@@ -778,7 +1019,9 @@ def budget_warnings(cfg: Config) -> list[str]:
         w.append(f"max_tokens_step ({cfg.max_tokens_step}) exceeds the usable "
                  f"window (context_tokens - reserve_tokens = {usable}); a "
                  f"gather step can never finish before the window runs out")
-    # ~4 chars/token is a generous estimate for code-heavy content.
+    # ~4 chars/token is the BUDGETING ratio the tier presets and auto_fit are
+    # tuned with; fit checks on live prompts use the client's calibrated ratio
+    # (llm.CHARS_PER_TOKEN = 3.6 until `--doctor` measures the real one).
     gathered_tok = cfg.max_gathered_chars // 4
     map_tok = cfg.flat_map_token_budget
     step_headroom = max(cfg.max_tokens_step, cfg.max_tokens_summary)
@@ -1243,19 +1486,22 @@ def _parse_env(name: str, raw: str):
                 f"PEDACITO_JSON_MODE={raw!r} must be 'schema' or 'object'"
                 "  ('json_object' / 'json' mean 'object')")
         return norm
-    if name in ("extra_extensions", "shell_allowlist"):
+    if name in _TUPLE_FIELDS:
         return tuple(x.strip() for x in raw.split(",") if x.strip())
     if name in ("k_cache_quant", "v_cache_quant"):
         return _normalise_kv_quant(raw)
-    if name == "sampler":
+    if name in _ENUM_FIELDS:
+        return _coerce(name, raw)
+    if name in _TABLE_FIELDS:
+        name_ = name
         try:
             obj = json.loads(raw)
         except ValueError as e:
             raise ConfigError(
-                f"PEDACITO_SAMPLER={raw!r} is not valid JSON: {e}") from e
+                f"PEDACITO_{name_.upper()}={raw!r} is not valid JSON: {e}") from e
         if not isinstance(obj, dict):
             raise ConfigError(
-                f"PEDACITO_SAMPLER={raw!r} must be a JSON object, "
+                f"PEDACITO_{name_.upper()}={raw!r} must be a JSON object, "
                 f'e.g. \'{{"top_k": 40}}\'')
         return obj
     if target is bool:
@@ -1724,6 +1970,61 @@ REFERENCE_TEMPLATE = TEMPLATE + '''
 # allow_mcp exposes one `mcp` action and a short tool catalog; mcp_servers is
 # a list of command strings such as ["python server.py"].
 # auto_plan_file / auto_verify / auto_* configure `pedacito auto`.
+#
+# --- Context management and measurement ------------------------------------
+# prompt_pack (tiny/small/full) sets how dense the instructions are; empty
+# picks from the model card (`pedacito calibrate`), then the tier. Only enabled
+# actions are described either way.
+# answer_mode: "rebuild" sends the answer phase a fresh prompt; "continue"
+# appends to the lookup conversation so the server's prompt cache covers the map
+# and the source; "auto" continues and falls back to rebuild on a bad reply.
+# Empty = model card, then auto (hosted) / rebuild (local).
+# compaction: when the window fills, older lookups fold into ONE STATE digest
+# ("deterministic", or "model" for a model-written one); "off" keeps the old
+# turn-by-turn clipping. fold_tail_steps keeps the last N steps verbatim.
+# rank_map orders the big-project map by relevance to the task; repo_brief adds
+# a deterministic stack/entry-point/commands block above the map.
+# stream_usage asks servers to report usage on streamed replies;
+# max_total_tokens / max_cost stop before the next call once spent, and
+# price_*_per_mtok (USD per million tokens) enable cost reporting.
+# summary_workers sets concurrent index summaries (0 = hosted 4, local 1);
+# refresh_summaries re-summarises that many changed units after each task;
+# summary_batch > 1 sends short units N per request (fewer round-trips).
+# max_observation_tokens caps one non-read observation (0 = auto).
+# plan_threshold > 0 auto-splits tasks that name that many files/requirements
+# into single-focus steps (`ask --plan` forces it); max_replans bounds the
+# planner's revisions after a failed step; allow_steering delivers lines typed
+# mid-task in `chat`. roles also accept `escalate` (one retry on a stronger
+# model when no edit landed) and `fallback` (when the worker errors out).
+#
+# --- Verification, memory, helpers ------------------------------------------
+# verify_answer: "deterministic" checks edits before they are written (unread
+# code, placeholders, stale references, unaddressed requirements); "full" adds
+# one verifier model call; "off" disables. best_of > 1 samples candidates and
+# keeps the best-scoring one. verify_tests runs the tests an edit can break
+# (needs allow_shell; test_command overrides detection).
+# use_memory / use_skills push .pedacito/memory.md, rules and the skills
+# catalog. allow_git adds a read-only `git` action; git_context adds a
+# branch/dirty/recent-commits line. allow_subagents adds the `task` action
+# (read-only helper; subagent_max_steps bounds it). allow_fetch +
+# fetch_allowed_hosts add `fetch`.
+# roles = { planner = "big", verifier = "big", summarizer = "tiny" } routes
+# those jobs to other profiles. hooks = { post_edit = ["ruff format {file}"] }
+# runs your commands at events (see the README); in a PROJECT config, hooks,
+# mcp_servers, auto_verify and test_command only apply after `pedacito trust`.
+# stuck_recovery gives a stuck model one targeted nudge; use_model_card lets a
+# calibrated card fill settings you left at their defaults.
+#
+# --- Safety -----------------------------------------------------------------
+# scrub_env launches model-chosen commands with a minimal environment;
+# env_passthrough names variables (or PREFIX*) they may still see.
+# wrap_observations fences untrusted tool output; redact_secrets masks secrets
+# in session files, logs and events. protected_paths lists files the model may
+# never write (on top of .git/, .pedacito/, the plan file); shell_deny lists
+# command patterns `run` refuses; browser_eval_hosts limits where the browser
+# `eval` action may run JavaScript.
+# log_events writes .pedacito/events/*.jsonl (local only); keep_events,
+# keep_sessions, keep_backups and log_max_bytes feed `pedacito prune`.
 #
 # --- Review, workspace, and backups ----------------------------------------
 # backup snapshots originals before writes; `pedacito restore` restores them.

@@ -26,8 +26,12 @@ import os
 import sys
 from pathlib import Path
 
+from . import events as events_mod
+from . import hooks as hooks_mod
 from . import index as index_mod
 from . import loop
+from . import modelcard
+from . import roles as roles_mod
 from . import workspace
 from .agent import Agent
 from .config import (Config, ConfigError, REFERENCE_TEMPLATE,
@@ -62,6 +66,21 @@ def _add_common(p):
     p.add_argument("--steps", type=int,
                    help="hard lookup limit for the gather phase; 0 = no limit "
                         "(the default)")
+    p.add_argument("--max-tokens-budget", type=int, default=None, metavar="N",
+                   help="stop before the next model call once this many "
+                        "prompt+completion tokens were used (0 = no limit)")
+    p.add_argument("--role", action="append", default=[], metavar="ROLE=PROFILE",
+                   help="route one job to another profile for this run, e.g. "
+                        "--role planner=big --role summarizer=tiny; repeatable "
+                        "(roles: worker planner verifier summarizer repair "
+                        "escalate fallback)")
+    p.add_argument("--jsonl", action="store_true",
+                   help="machine-readable run: one JSON event per line on "
+                        "stdout (steps, calls, the answer and diffs), human "
+                        "text moves to stderr")
+    p.add_argument("--max-cost", type=float, default=None, metavar="USD",
+                   help="stop before the next call once the estimated spend "
+                        "reaches this (needs price_*_per_mtok in config)")
 
 
 def _root(args) -> Path:
@@ -90,6 +109,14 @@ def _config(args) -> Config:
                       require_hardware=(getattr(args, "cmd", "") != "config"))
     if getattr(args, "no_refs", False):
         cfg.include_references = False
+    if getattr(args, "jsonl", False):
+        cfg.log_events = True
+    for spec in getattr(args, "role", None) or []:
+        role, _eq, prof = spec.partition("=")
+        if role.strip() not in roles_mod.ROLES or not prof.strip():
+            raise ConfigError(f"--role {spec!r}: use ROLE=PROFILE with ROLE "
+                              f"one of {', '.join(roles_mod.ROLES)}")
+        cfg.roles = {**(cfg.roles or {}), role.strip(): prof.strip()}
     if getattr(args, "ext", None):
         cfg.extra_extensions = tuple(args.ext)
     if getattr(args, "url", None):
@@ -101,10 +128,21 @@ def _config(args) -> Config:
     if getattr(args, "steps", None) is not None:
         cfg.max_steps = args.steps
         cfg.sources["max_steps"] = "--steps"
+    if getattr(args, "max_tokens_budget", None) is not None:
+        cfg.max_total_tokens = args.max_tokens_budget
+        cfg.sources["max_total_tokens"] = "--max-tokens-budget"
+    if getattr(args, "max_cost", None) is not None:
+        cfg.max_cost = args.max_cost
+        cfg.sources["max_cost"] = "--max-cost"
     # Fit token budgets to the server's real context window before any request;
     # `config` skips this so it reports the true sources.
     if getattr(args, "cmd", "") != "config":
         auto_fit(cfg, verbose=True)
+    # A measured model card (`pedacito calibrate`) fills settings the user
+    # left at their defaults; explicit values always win.
+    if getattr(args, "cmd", "") not in ("config", "calibrate"):
+        modelcard.apply(cfg)
+    cfg._root = str(_root(args)) if getattr(args, "paths", None) else ""
     return cfg
 
 
@@ -249,6 +287,14 @@ def _cmd_config(args, cfg) -> int:
         note = "" if origin == "default" else f"   <- {origin}"
         print(f"  {mark}{key:<{width}}  {value!r}{note}")
 
+    if cfg.roles:
+        print("\nRoles: " + "; ".join(roles_mod.describe(cfg)))
+    card = modelcard.load(cfg)
+    if card:
+        print("\n" + modelcard.render(card))
+    else:
+        print("\nNo model card for this model yet: `pedacito calibrate` "
+              "measures it and tunes prompt pack, answer mode and verifier.")
     doctor = getattr(args, "doctor", False)
     if not args.check and not doctor:
         print("\nRun `pedacito config --check` to test the connection, or "
@@ -332,6 +378,11 @@ def _cmd_config(args, cfg) -> int:
     else:
         print("No tokenizer endpoint answered; fit math uses the "
               "~3.6 chars/token heuristic.")
+    from . import testsel
+    tc = testsel.detect_test_command(_root(args), cfg)
+    print(f"Test command detected: {tc or '(none)'}")
+    print("\nNext: `pedacito calibrate` measures tool choice, edit format, "
+          "honesty and long-context retrieval, and saves a model card.")
     return 0
 
 
@@ -340,9 +391,13 @@ CHAT_HELP = """\
   /model ID       switch to a model id directly
   /apply on|off   enable or disable writing edits
   /steps N        how many lookups the model gets per task
-  /status         current profile, model, and write mode
+  /status         current profile, model, write mode, prompt pack, budgets
+  /cost           tokens, cache-hit ratio and spend so far, by call site
+  /memory         what Pedacito remembers about this project
+  /skills         the available skills
   /profiles       list the profiles in your config
-  /quit           leave"""
+  /quit           leave
+  Ctrl-C          cancel the running task (the session stays open)"""
 
 
 def _chat_command(line: str, args, cfg, ref) -> bool:
@@ -379,6 +434,43 @@ def _chat_command(line: str, args, cfg, ref) -> bool:
         print(f"  model   : {cfg.model}", file=sys.stderr)
         print(f"  steps   : {cfg.max_steps}", file=sys.stderr)
         print(f"  writes  : {'ON' if args.apply else 'off (dry run)'}", file=sys.stderr)
+        print(f"  prompts : pack {prompts_pack(cfg)}, answer "
+              f"{ref['agent']._answer_mode()}, verify {cfg.verify_answer}"
+              f", best_of {cfg.best_of}", file=sys.stderr)
+        print(f"  window  : {cfg.context_tokens:,} tokens "
+              f"(map budget {cfg.flat_map_token_budget:,}, gathered source "
+              f"{cfg.max_gathered_chars:,} chars)", file=sys.stderr)
+        card = getattr(cfg, "_card", None)
+        print(f"  card    : {'calibrated ' + format(card['measured'].get('overall', '?')) if card else 'none (run `pedacito calibrate`)'}",
+              file=sys.stderr)
+        if cfg.max_total_tokens or cfg.max_cost:
+            print(f"  budget  : {cfg.max_total_tokens or 'no'} tokens / "
+                  f"${cfg.max_cost or 0:.2f}", file=sys.stderr)
+        return True
+
+    if cmd == "cost":
+        c = ref["client"]
+        print("  " + _usage_line(c), file=sys.stderr)
+        for site, row in sorted(c.stats.get("by_site", {}).items()):
+            print(f"    {site:<12} {row['calls']:>3} calls  "
+                  f"{row['prompt_tokens']:>8,} in  "
+                  f"{row['completion_tokens']:>7,} out  "
+                  f"{row['cached_tokens']:>8,} cached", file=sys.stderr)
+        return True
+
+    if cmd == "memory":
+        from . import memory
+        rows = memory.entries(_root(args))
+        if not rows:
+            print("  (nothing remembered yet)", file=sys.stderr)
+        for sc, cat, text in rows:
+            print(f"  [{sc}/{cat}] {text}", file=sys.stderr)
+        return True
+
+    if cmd == "skills":
+        from . import skills
+        for name, info in sorted(skills._scan(_root(args), cfg).items()):
+            print(f"  {name:<22} {info['description']}", file=sys.stderr)
         return True
 
     if cmd == "apply":
@@ -430,6 +522,9 @@ def _chat_command(line: str, args, cfg, ref) -> bool:
             print(f"  Could not switch: {e}", file=sys.stderr)
             print(f"  Staying on {cfg.model}.", file=sys.stderr)
             return True
+        for keep in ("_interactive", "_ask_user"):
+            if keep in cfg.__dict__:
+                new_cfg.__dict__[keep] = cfg.__dict__[keep]
         ref["cfg"], ref["client"] = new_cfg, new_client
         ref["agent"] = Agent(ref["idx"], new_client, new_cfg)
         label = ""
@@ -443,6 +538,41 @@ def _chat_command(line: str, args, cfg, ref) -> bool:
 
     print(f"  Unknown command '/{cmd}'. Try /help.", file=sys.stderr)
     return True
+
+
+def prompts_pack(cfg) -> str:
+    from . import prompts
+    return prompts.pack_for(cfg)
+
+
+def prompts_fingerprint(cfg) -> str:
+    from . import prompts
+    return prompts.fingerprint(cfg)
+
+
+def _usage_line(client) -> str:
+    """The closing `[N calls ...]` line: tokens, cache hit, cost."""
+    s = client.stats
+    bits = [f"{s['calls']} calls", f"{s['completion_tokens']} tokens out"]
+    if s.get("prompt_tokens"):
+        bits.append(f"{s['prompt_tokens']:,} in")
+        if s.get("cached_tokens"):
+            bits.append(f"cache hit "
+                        f"{events_mod.cache_hit_ratio(s):.0%}")
+    if s.get("cost"):
+        bits.append(f"${s['cost']:.4f}")
+    bits.append(f"{s['seconds']:.0f}s")
+    return "[" + ", ".join(bits) + "]"
+
+
+def _confirm_plan(plan_path) -> bool:
+    """`--review-plan`: let the user read/edit the plan file, then continue."""
+    try:
+        ans = input(f"\nEdit {plan_path} if you like, then press Enter to run "
+                    "it (n to cancel): ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        return False
+    return ans not in ("n", "no", "q")
 
 
 def _wants_review(args, cfg) -> bool:
@@ -492,7 +622,9 @@ def _cmd_auto(args, cfg, client, idx, root: Path) -> int:
             if plan_path.exists():
                 print("  [existing plan has no open tasks; generating a new "
                       "one from the goal]", file=sys.stderr)
-            titles = loop.generate_tasks(spec.text, client, cfg, root=root)
+            titles = loop.generate_tasks(
+                spec.text, roles_mod.client_for(cfg, "planner", client), cfg,
+                root=root)
             loop.write_plan(plan_path, spec.title, titles)
         if not args.apply:
             print(plan_path.read_text(encoding="utf-8"), file=sys.stderr)
@@ -610,9 +742,7 @@ def _cmd_explain(args, client, agent) -> int:
             print()
             print(ask(line))
 
-    s = client.stats
-    print(f"\n[{s['calls']} calls, {s['completion_tokens']} tokens out, "
-          f"{s['seconds']:.0f}s]", file=sys.stderr)
+    print("\n" + _usage_line(client), file=sys.stderr)
     return 0
 
 
@@ -659,6 +789,139 @@ def _cmd_diagnose(args) -> int:
     return 0 if ok else 1
 
 
+def _light_config(args) -> Config:
+    """Config for commands that never talk to a model (no vram_gb needed)."""
+    return load_config(root=_root(args), explicit=getattr(args, "config", None),
+                       profile=getattr(args, "profile", None),
+                       require_hardware=False, warn_budgets=False)
+
+
+def _cmd_calibrate(args, cfg) -> int:
+    """`pedacito calibrate`: run the scripted mini-suite against the configured
+    model and save its model card."""
+    existing = modelcard.load(cfg)
+    if existing and not args.recalibrate:
+        print(modelcard.render(existing))
+        print("\nA fresh card exists; pass --recalibrate to measure again.")
+        return 0
+    client = LLMClient(cfg)
+    client.check()
+    client.warmup()
+    card = modelcard.calibrate(client, cfg, verbose=True, quick=args.quick)
+    path = modelcard.save_card(card)
+    print()
+    print(modelcard.render(card))
+    print(f"\nSaved to {path}. Settings you left at their defaults now follow "
+          "the card (prompt pack, answer mode, verifier, best-of-N); explicit "
+          "config values still win.")
+    return 0
+
+
+def _cmd_prune(args) -> int:
+    """`pedacito prune`: retention for sessions, backups, events and log.txt."""
+    root = _root(args)
+    cfg = _light_config(args)
+    keep_s = args.keep_sessions if args.keep_sessions is not None \
+        else cfg.keep_sessions
+    keep_b = args.keep_backups if args.keep_backups is not None \
+        else cfg.keep_backups
+    removed = workspace.prune(root, keep_s, keep_b, cfg.keep_events,
+                              cfg.log_max_bytes, dry_run=args.dry_run)
+    verb = "would remove" if args.dry_run else "removed"
+    print(f"{verb}: {removed['sessions']} session(s), {removed['backups']} "
+          f"backup snapshot(s), {removed['events']} event file(s), "
+          f"{removed['log_bytes']:,} byte(s) of log.txt")
+    if not (keep_s or keep_b):
+        print("Nothing to do for sessions/backups: pass --keep-sessions N and "
+              "--keep-backups N (or set keep_sessions/keep_backups).")
+    return 0
+
+
+def _cmd_memory(args) -> int:
+    """`pedacito memory`: list, add or forget remembered facts."""
+    from . import memory
+    root = _root(args)
+    scope = "global" if args.use_global else "project"
+    if args.add:
+        ok, msg = memory.remember(root, args.add, scope=scope)
+        print(msg)
+        return 0 if ok else 1
+    if args.forget:
+        n = memory.forget(root, args.forget, scope=scope)
+        print(f"forgot {n} line(s)")
+        return 0
+    rows = memory.entries(root)
+    if not rows:
+        print("No memory yet. The model saves facts with its `remember` "
+              "action; add one with: pedacito memory PROJECT --add \"...\"")
+        return 0
+    for sc, cat, text in rows:
+        print(f"[{sc}/{cat}] {text}")
+    return 0
+
+
+def _cmd_trust(args) -> int:
+    """`pedacito trust`: approve this project's `.pedacito.toml` to set
+    execution-capable settings (hooks, mcp_servers, auto_verify, test_command)."""
+    from .config import EXEC_FIELDS, trust_project
+    root = _root(args)
+    path = find_project_config(root)
+    if path is None:
+        print(f"No .pedacito.toml / pedacito.toml in {root}; nothing to trust.")
+        return 0
+    print(f"{path}:\n")
+    print(path.read_text(encoding="utf-8", errors="replace"))
+    print(f"\nSettings that can run commands: {', '.join(EXEC_FIELDS)}.")
+    if not args.yes:
+        try:
+            ans = input("Trust this file as written? [y/N] ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            ans = ""
+        if ans not in ("y", "yes"):
+            print("Not trusted.")
+            return 1
+    trust_project(path)
+    print("Trusted (until the file changes).")
+    return 0
+
+
+def _cmd_tests(args) -> int:
+    """`pedacito tests`: the detected test command and, for given files, the
+    tests a change to them can break."""
+    from . import testsel
+    root = _root(args)
+    cfg = _light_config(args)
+    cmd = testsel.detect_test_command(root, cfg)
+    print(f"test command: {cmd or '(none detected; set test_command)'}")
+    if args.files:
+        idx = index_mod.Index.load(root)
+        if idx is None:
+            print("No index yet; run `pedacito index` first.")
+            return 1
+        rels = [idx.resolve_file(f) or f for f in args.files]
+        picked = testsel.impacted_tests(idx, rels)
+        if not picked:
+            print("no linked tests found")
+        for t, why in picked:
+            print(f"  {t}  ({why})")
+        narrowed, did = testsel.narrow_command(cmd, [t for t, _ in picked]) \
+            if cmd else ("", False)
+        if cmd and did:
+            print(f"narrowed: {narrowed}")
+    return 0
+
+
+def _cmd_skills(args) -> int:
+    from . import skills
+    root = _root(args)
+    cfg = _light_config(args)
+    found = skills._scan(root, cfg)
+    for name in sorted(found):
+        info = found[name]
+        print(f"{name:<22} {info['description']}  [{info['source']}]")
+    return 0
+
+
 def _configure_stdio() -> None:
     """Make stdout/stderr UTF-8 with replacement so non-ASCII output cannot
     raise UnicodeEncodeError on Windows code pages. Streams without
@@ -670,8 +933,21 @@ def _configure_stdio() -> None:
             pass
 
 
+_LOCKED: list = []        # project roots this process holds the run lock for
+
+
 def main(argv=None) -> int:
     """Parse arguments and dispatch to the subcommand; returns the exit code."""
+    real_stdout = sys.stdout
+    try:
+        return _main(argv)
+    finally:
+        sys.stdout = real_stdout     # `--jsonl` points it at stderr meanwhile
+        while _LOCKED:
+            workspace.release_lock(_LOCKED.pop())
+
+
+def _main(argv=None) -> int:
     _configure_stdio()
     ap = argparse.ArgumentParser(prog="pedacito", description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -688,7 +964,10 @@ def main(argv=None) -> int:
 
     p_map = sub.add_parser("map", help="print the current index")
     _add_common(p_map)
-    p_map.add_argument("--tier", choices=["auto", "cards", "dirs", "flat"], default="auto")
+    p_map.add_argument("--tier", choices=["auto", "cards", "dirs", "flat", "ranked"],
+                       default="auto")
+    p_map.add_argument("-t", "--task", default="",
+                       help="rank the map for this task (as `ask` would see it)")
 
     p_conf = sub.add_parser("config", help="show, create, or test the config file")
     p_conf.add_argument("--init", action="store_true",
@@ -776,6 +1055,15 @@ def main(argv=None) -> int:
     p_ask.add_argument("--no-review", dest="no_review", action="store_true",
                        help="never open the reviewer, even if config enables it")
     p_ask.add_argument("--reindex", action="store_true", help="force a fresh index first")
+    p_ask.add_argument("--plan", action="store_true",
+                       help="split the task into single-focus steps, each run "
+                            "in a fresh context (with one re-plan after a "
+                            "failure); automatic for multi-part tasks when "
+                            "plan_threshold is set")
+    p_ask.add_argument("--no-plan", dest="no_plan", action="store_true",
+                       help="never auto-plan this task")
+    p_ask.add_argument("--review-plan", dest="review_plan", action="store_true",
+                       help="show the plan and ask before running it")
 
     p_explain = sub.add_parser(
         "explain", help="answer questions about an indexed project's code")
@@ -878,6 +1166,76 @@ def main(argv=None) -> int:
     p_chat.add_argument("--review", action="store_true")
     p_chat.add_argument("--no-review", dest="no_review", action="store_true")
 
+    p_cal = sub.add_parser(
+        "calibrate", help="measure the configured model (tool choice, edit "
+                          "format, honesty, long context, ...) and save a "
+                          "model card that tunes the defaults")
+    p_cal.add_argument("--recalibrate", action="store_true",
+                       help="measure again even if a fresh card exists")
+    p_cal.add_argument("--quick", action="store_true",
+                       help="skip the long-context and capability probes")
+    for flag in ("--url", "--model", "--config", "--profile"):
+        p_cal.add_argument(flag)
+    p_cal.add_argument("--root", default=None)
+    p_cal.add_argument("paths", nargs="*", default=["."], help=argparse.SUPPRESS)
+
+    p_prune = sub.add_parser(
+        "prune", help="delete old sessions/backups/events, trim log.txt")
+    p_prune.add_argument("paths", nargs="*", default=["."])
+    p_prune.add_argument("--keep-sessions", type=int, default=None, metavar="N")
+    p_prune.add_argument("--keep-backups", type=int, default=None, metavar="N")
+    p_prune.add_argument("--dry-run", action="store_true")
+    p_prune.add_argument("--root", default=None)
+    p_prune.add_argument("--config", metavar="FILE")
+    p_prune.add_argument("--profile", metavar="NAME")
+
+    p_mem = sub.add_parser(
+        "memory", help="list, add or forget the facts Pedacito remembers")
+    p_mem.add_argument("paths", nargs="*", default=["."])
+    p_mem.add_argument("--add", metavar="TEXT")
+    p_mem.add_argument("--forget", metavar="TEXT")
+    p_mem.add_argument("--global", dest="use_global", action="store_true",
+                       help="use the user-level memory instead of the project's")
+    p_mem.add_argument("--root", default=None)
+    p_mem.add_argument("--config", metavar="FILE")
+    p_mem.add_argument("--profile", metavar="NAME")
+
+    p_trust = sub.add_parser(
+        "trust", help="approve this project's .pedacito.toml to run hooks, "
+                      "MCP servers and verify commands")
+    p_trust.add_argument("paths", nargs="*", default=["."])
+    p_trust.add_argument("--yes", action="store_true")
+    p_trust.add_argument("--root", default=None)
+    p_trust.add_argument("--config", metavar="FILE")
+    p_trust.add_argument("--profile", metavar="NAME")
+
+    p_tests = sub.add_parser(
+        "tests", help="show the detected test command and the tests a change "
+                      "to FILES can break")
+    p_tests.add_argument("paths", nargs="*", default=["."])
+    p_tests.add_argument("--files", nargs="*", default=[], metavar="FILE")
+    p_tests.add_argument("--root", default=None)
+    p_tests.add_argument("--config", metavar="FILE")
+    p_tests.add_argument("--profile", metavar="NAME")
+
+    p_skills = sub.add_parser("skills", help="list the available skills")
+    p_skills.add_argument("paths", nargs="*", default=["."])
+    p_skills.add_argument("--root", default=None)
+    p_skills.add_argument("--config", metavar="FILE")
+    p_skills.add_argument("--profile", metavar="NAME")
+
+    p_eval = sub.add_parser(
+        "eval", help="score the harness on built-in fixture repos (locate "
+                     "precision, edit success, tokens, cache hits)")
+    p_eval.add_argument("--task", action="append", default=[], metavar="ID",
+                        help="run only this task id; repeatable")
+    p_eval.add_argument("--out", metavar="FILE", help="write the JSON report here")
+    p_eval.add_argument("--list", action="store_true", help="list tasks and exit")
+    for flag in ("--url", "--model", "--config", "--profile"):
+        p_eval.add_argument(flag)
+    p_eval.add_argument("--root", default=None)
+    p_eval.add_argument("paths", nargs="*", default=["."], help=argparse.SUPPRESS)
+
     p_gui = sub.add_parser("gui", help="open the browser control panel")
     p_gui.add_argument("--port", type=int, default=0)
     p_gui.add_argument("--no-open", dest="open_browser", action="store_false")
@@ -901,6 +1259,14 @@ def main(argv=None) -> int:
         return _cmd_worktree(args)
     if args.cmd == "diagnose":
         return _cmd_diagnose(args)
+    light = {"prune": _cmd_prune, "memory": _cmd_memory, "trust": _cmd_trust,
+             "tests": _cmd_tests, "skills": _cmd_skills}
+    if args.cmd in light:
+        try:
+            return light[args.cmd](args)
+        except ConfigError as e:
+            print(f"Config error: {e}", file=sys.stderr)
+            return 2
 
     # `how` needs a model connection but no project, index or vram budget.
     if args.cmd == "how":
@@ -942,6 +1308,13 @@ def main(argv=None) -> int:
         if args.cmd == "config":
             return _cmd_config(args, cfg)
 
+        if args.cmd == "calibrate":
+            return _cmd_calibrate(args, cfg)
+
+        if args.cmd == "eval":
+            from . import evalrun
+            return evalrun.run_cli(args, cfg)
+
         if args.cmd == "map":
             idx = _get_index(args, cfg, None, rebuild=False, summarise=False)
             if args.tier == "flat":
@@ -950,8 +1323,12 @@ def main(argv=None) -> int:
                 text = idx.render_files(line_ranges=cfg.file_card_line_ranges)
             elif args.tier == "dirs":
                 text = idx.render_dirs()
+            elif args.tier == "ranked":
+                budget = max(400, int(cfg.flat_map_token_budget))
+                text = idx.render_ranked(cfg, args.task, budget)
+                print(f"[tier: ranked; budget {budget}]", file=sys.stderr)
             else:
-                text, tier = idx.map_for_prompt(cfg)
+                text, tier = idx.map_for_prompt(cfg, task=args.task)
                 print(f"[tier: {tier}]", file=sys.stderr)
             print(text)
             print(f"\n[{estimate_tokens(text):,} tokens in every prompt]", file=sys.stderr)
@@ -1095,7 +1472,9 @@ def main(argv=None) -> int:
             root = _root(args)
             workspace.ensure(root, cfg.manage_gitignore, cfg.create_ignore_file)
             idx = index_mod.build(args.paths, cfg,
-                                  client=None if args.no_summaries else client,
+                                  client=None if args.no_summaries
+                                  else roles_mod.client_for(cfg, "summarizer",
+                                                            client),
                                   root=root, summarise=not args.no_summaries,
                                   matcher=_matcher(args, root),
                                   resummarise=args.resummarise)
@@ -1108,9 +1487,34 @@ def main(argv=None) -> int:
         # Load the model here with a clear message rather than stalling
         # silently inside the first gather step.
         client.warmup()
+        if args.cmd in ("ask", "chat", "auto") and cfg.refresh_summaries:
+            index_mod.refresh_summaries(
+                idx, roles_mod.client_for(cfg, "summarizer", client), cfg,
+                limit=int(cfg.refresh_summaries))
         agent = Agent(idx, client, cfg)
+        from . import steering
+        if args.cmd in ("ask", "chat") and steering.Steering.available():
+            cfg._interactive = True
+            cfg._ask_user = steering.terminal_question
+        elog = events_mod.get(_root(args), cfg)
+        if getattr(args, "jsonl", False):
+            elog.tee = sys.stdout
+            sys.stdout = sys.stderr
+        events_mod.attach(client, elog)
+        elog.emit("session_start", cmd=args.cmd, model=cfg.model,
+                  tier=cfg.active_tier, pack=prompts_pack(cfg),
+                  fingerprint=prompts_fingerprint(cfg))
+        hooks_mod.fire(cfg, _root(args), "session_start", cmd=args.cmd) \
+            if hooks_mod.has_hooks(cfg, "session_start") else None
 
         root = _root(args)
+        if args.cmd in ("ask", "chat", "auto") and getattr(args, "apply", False):
+            try:
+                workspace.acquire_lock(root)
+            except workspace.ProjectBusy as e:
+                print(f"ERROR: {e}", file=sys.stderr)
+                return 2
+            _LOCKED.append(root)
         # Slash commands rebind these, so share them through a dict.
         locals_ref = {"cfg": cfg, "client": client, "agent": agent, "idx": idx}
 
@@ -1122,6 +1526,21 @@ def main(argv=None) -> int:
             nonlocal idx, agent, cfg, client
             cfg, client, agent = locals_ref["cfg"], locals_ref["client"], locals_ref["agent"]
             idx = locals_ref["idx"]
+            from . import plan as plan_mod
+            want_plan = getattr(args, "plan", False) or (
+                not getattr(args, "no_plan", False)
+                and plan_mod.should_plan(task, idx, cfg))
+            if want_plan and not _wants_review(args, cfg):
+                code = plan_mod.run_planned(
+                    root, cfg, client, idx, task, apply=args.apply,
+                    confirm=_confirm_plan if getattr(args, "review_plan", False)
+                    else None)
+                fresh = index_mod.Index.load(root)
+                if fresh is not None:
+                    idx = fresh
+                    agent.index = idx
+                    locals_ref["idx"] = idx
+                return code
             tr = loop.run_task(root, cfg, client, agent, idx, task,
                                apply=args.apply, review=_wants_review(args, cfg))
             idx = tr.idx
@@ -1129,10 +1548,15 @@ def main(argv=None) -> int:
             locals_ref["idx"] = idx
 
         if args.cmd == "ask":
-            run(args.task)
-            s = client.stats
-            print(f"\n[{s['calls']} calls, {s['completion_tokens']} tokens out, "
-                  f"{s['seconds']:.0f}s]", file=sys.stderr)
+            try:
+                run(args.task)
+            except KeyboardInterrupt:
+                print("\nCancelled. Nothing further was applied; "
+                      "`pedacito restore` undoes anything already written.",
+                      file=sys.stderr)
+                return 130
+            print("\n" + _usage_line(client), file=sys.stderr)
+            elog.emit("exit", code=0)
             return 0
 
         if args.cmd == "auto":
@@ -1165,7 +1589,27 @@ def main(argv=None) -> int:
                     break
                 cfg, client, agent = locals_ref["cfg"], locals_ref["client"], locals_ref["agent"]
                 continue
-            run(task)
+            try:
+                if steering.Steering.available() and cfg.allow_steering:
+                    with steering.Steering() as steer:
+                        locals_ref["cfg"]._steer = steer.queue
+                        try:
+                            run(task)
+                        finally:
+                            locals_ref["cfg"].__dict__.pop("_steer", None)
+                else:
+                    run(task)
+            except KeyboardInterrupt:
+                # Ctrl-C stops the current task, never the whole session.
+                try:
+                    locals_ref["client"].cancel()
+                except Exception:
+                    pass
+                print("\n  [cancelled; the session is still open -- edits "
+                      "already written can be undone with `pedacito restore`]",
+                      file=sys.stderr)
+            except LLMError as e:
+                print(f"\nERROR: {e}", file=sys.stderr)
         return 0
 
     except LLMError as e:

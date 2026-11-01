@@ -21,6 +21,7 @@ Needs `tree-sitter` + `tree-sitter-language-pack`. If they are not importable,
 
 from __future__ import annotations
 
+import gc
 import re
 
 from .chunker import (
@@ -56,6 +57,12 @@ LANG_BY_EXT = {
     ".hpp": "cpp",
     ".hh": "cpp",
     ".cs": "csharp",
+    ".php": "php",
+    ".kt": "kotlin",
+    ".kts": "kotlin",
+    ".swift": "swift",
+    ".scala": "scala",
+    ".lua": "lua",
 }
 
 # Function-like scope node types (same across the JS, TS, and TSX grammars).
@@ -223,6 +230,47 @@ def _signature_of_field_method(node, src: bytes, name: str) -> str:
     return f"{name} = {_text(params, src) if params else '()'} => ..."
 
 
+def _callee_name(fn) -> str:
+    """Bare callee name of a call's function expression, across grammars:
+    `f`, `obj.f` (JS member/Go selector/Rust field/C# member access),
+    `a::b::f` (Rust/C++ scoped), and generic instantiations `f::<T>`/`F<T>`."""
+    for _ in range(6):
+        t = fn.type
+        if t in ("identifier", "field_identifier", "property_identifier",
+                 "type_identifier", "simple_identifier", "name"):
+            return fn.text.decode()
+        if t in ("navigation_expression", "member_expression_kt"):
+            # Kotlin/Swift `a.b.f`: the last simple identifier
+            ids = [c for c in fn.named_children
+                   if c.type in ("simple_identifier", "navigation_suffix")]
+            if not ids:
+                return ""
+            last = ids[-1]
+            if last.type == "navigation_suffix":
+                inner = [c for c in last.named_children
+                         if c.type == "simple_identifier"]
+                return inner[-1].text.decode() if inner else ""
+            return last.text.decode()
+        if t == "member_expression":
+            n = fn.child_by_field_name("property")
+        elif t in ("field_expression", "selector_expression"):
+            n = fn.child_by_field_name("field")
+        elif t in ("member_access_expression", "scoped_identifier",
+                   "qualified_identifier", "scoped_type_identifier",
+                   "member_binding_expression", "conditional_access_expression"):
+            n = fn.child_by_field_name("name") \
+                or (fn.named_children[-1] if fn.named_children else None)
+        elif t in ("generic_function", "generic_name"):
+            n = fn.child_by_field_name("function") or (
+                fn.named_children[0] if fn.named_children else None)
+        else:
+            return ""
+        if n is None:
+            return ""
+        fn = n
+    return ""
+
+
 def _walk_calls(node, out: set[str]) -> None:
     """Collect names invoked via call/new expressions under `node`. Member
     calls (obj.method()) reduce to the property name: the same bare-name
@@ -232,19 +280,27 @@ def _walk_calls(node, out: set[str]) -> None:
     while stack:
         node = stack.pop()
         t = node.type
-        if t == "call_expression":
+        if t in ("call_expression", "invocation_expression"):
             fn = node.child_by_field_name("function")
-            if fn is not None:
-                if fn.type == "identifier":
-                    out.add(fn.text.decode())
-                elif fn.type == "member_expression":
-                    prop = fn.child_by_field_name("property")
-                    if prop is not None:
-                        out.add(prop.text.decode())
-                elif fn.type in ("field_expression", "selector_expression"):
-                    prop = fn.child_by_field_name("field")
-                    if prop is not None:
-                        out.add(prop.text.decode())
+            if fn is None and node.named_children:
+                fn = node.named_children[0]       # Kotlin/Swift: no field
+            name = _callee_name(fn) if fn is not None else ""
+            if name:
+                out.add(name)
+        elif t in ("function_call_expression",):             # PHP
+            fn = node.child_by_field_name("function")
+            name = _callee_name(fn) if fn is not None else ""
+            if name:
+                out.add(name)
+        elif t in ("member_call_expression", "scoped_call_expression",
+                   "nullsafe_member_call_expression"):       # PHP
+            nm = node.child_by_field_name("name")
+            if nm is not None:
+                out.add(nm.text.decode())
+        elif t == "function_call":                           # Lua
+            nm = node.child_by_field_name("name")
+            if nm is not None:
+                out.add(nm.text.decode().replace(":", ".").split(".")[-1])
         elif t == "new_expression":
             ctor = node.child_by_field_name("constructor")
             if ctor is not None and ctor.type == "identifier":
@@ -264,6 +320,47 @@ def _walk_calls(node, out: set[str]) -> None:
         stack.extend(node.children)
 
 
+def _module_chunks(rel_path: str, nodes: list, lines: list[str], first: int,
+                   last: int, imports: list[str], base_name: str,
+                   max_unit_lines: int, max_unit_chars: int,
+                   max_unit_tokens: int, unit_overlap_lines: int,
+                   with_imports: bool = True) -> list[Chunk]:
+    """Chunk(s) for a run of top-level statements (a preamble, a trailing
+    block, or a whole script with no scopes). A block larger than the unit
+    limits is split at statement boundaries, as Python's chunker does, so a
+    plain script cannot become one unbounded `module` chunk."""
+    out: list[Chunk] = []
+    if last < first:
+        return out
+    parts = _split_nodes(nodes, lines, first, last, max_unit_lines,
+                         max_unit_chars, max_unit_tokens, unit_overlap_lines)
+    if not parts:
+        body = "\n".join(lines[first - 1:last])
+        if not body.strip():
+            return out
+        calls: set[str] = set()
+        for n in nodes:
+            _walk_calls(n, calls)
+        out.append(Chunk(
+            file=rel_path, qualname=base_name, kind="module", start=first,
+            end=last, imports=imports if with_imports else [],
+            calls=sorted(calls), source=body, sha=_sha(body)))
+        return out
+    for i, (ps, pe, part_nodes) in enumerate(parts, 1):
+        part_body = "\n".join(lines[ps - 1:pe])
+        if not part_body.strip():
+            continue
+        calls = set()
+        for n in part_nodes:
+            _walk_calls(n, calls)
+        out.append(Chunk(
+            file=rel_path, qualname=base_name if i == 1 else f"{base_name}#{i}",
+            kind="module", start=ps, end=pe,
+            imports=imports if with_imports else [], calls=sorted(calls),
+            source=part_body, sha=_sha(part_body)))
+    return out
+
+
 def _module_label(spec: str) -> str:
     """Collapse an import specifier to a short label for the file card's
     "imports:" line ("./a/foo" -> "foo"; index.py strips leading dots, which
@@ -275,7 +372,10 @@ def _module_label(spec: str) -> str:
 
 
 def _imports(root, src: bytes) -> list[str]:
-    """Collect module specifiers from every top-level import_statement."""
+    """Module specifiers of every top-level import_statement, plus CommonJS
+    `require("x")`, dynamic `import("x")` and `export ... from "x"` anywhere
+    in the file (labels, de-duplicated)."""
+    from .imports import raw_imports
     out: list[str] = []
     for node in root.children:
         if node.type != "import_statement":
@@ -286,6 +386,10 @@ def _imports(root, src: bytes) -> list[str]:
                              if c.type == "string_fragment"), None)
                 if frag is not None:
                     out.append(_module_label(frag.text.decode()))
+    for spec in raw_imports("x.js", src.decode("utf-8", "replace")):
+        label = _module_label(spec)
+        if label not in out:
+            out.append(label)
     return out
 
 
@@ -341,32 +445,20 @@ def chunk_source_ts(rel_path: str, src: str, language: str,
 
     if not scopes:
         if src.strip():
-            whole_calls: set[str] = set()
-            _walk_calls(root, whole_calls)
-            chunks.append(Chunk(
-                file=rel_path, qualname="module", kind="module",
-                start=1, end=total, imports=imports,
-                calls=sorted(whole_calls),
-                source=src, sha=_sha(src),
-            ))
+            chunks.extend(_module_chunks(
+                rel_path, list(root.children), lines, 1, total, imports,
+                "module", max_unit_lines, max_unit_chars, max_unit_tokens,
+                unit_overlap_lines))
         return chunks
 
     # module preamble: everything before the first scope
     first_start = scopes[0][0].start_point.row + 1
     if first_start > 1:
         end = first_start - 1
-        body = "\n".join(lines[:end])
-        if body.strip():
-            calls: set[str] = set()
-            for node in root.children:
-                if node.start_point.row + 1 > end:
-                    break
-                _walk_calls(node, calls)
-            chunks.append(Chunk(
-                file=rel_path, qualname="module", kind="module",
-                start=1, end=end, imports=imports,
-                calls=sorted(calls), source=body, sha=_sha(body),
-            ))
+        pre = [n for n in root.children if n.start_point.row + 1 <= end]
+        chunks.extend(_module_chunks(
+            rel_path, pre, lines, 1, end, imports, "module", max_unit_lines,
+            max_unit_chars, max_unit_tokens, unit_overlap_lines))
 
     # each top-level scope
     for outer, inner in scopes:
@@ -642,17 +734,11 @@ def chunk_source_ts(rel_path: str, src: str, language: str,
     # trailing top-level code after the last scope
     last_end = scopes[-1][0].end_point.row + 1
     if last_end < total:
-        body = "\n".join(lines[last_end:])
-        if body.strip():
-            calls: set[str] = set()
-            for node in root.children:
-                if node.start_point.row + 1 > last_end:
-                    _walk_calls(node, calls)
-            chunks.append(Chunk(
-                file=rel_path, qualname="__trailing__", kind="module",
-                start=last_end + 1, end=total, calls=sorted(calls),
-                source=body, sha=_sha(body),
-            ))
+        tail = [n for n in root.children if n.start_point.row + 1 > last_end]
+        chunks.extend(_module_chunks(
+            rel_path, tail, lines, last_end + 1, total, imports,
+            "__trailing__", max_unit_lines, max_unit_chars, max_unit_tokens,
+            unit_overlap_lines, with_imports=False))
 
     chunks.sort(key=lambda c: c.start)
     return chunks
@@ -980,6 +1066,9 @@ GENERIC_SPECS = {
         "methods": {"function_item"},
         "decls": {"struct_item", "enum_item", "mod_item", "type_item"},
         "imports": {"use_declaration"},
+        # `mod x { ... }` with a body: its items are chunked (qualified `x.`)
+        "namespaces": {"mod_item"},
+        "namespace_prefix": True,
     },
     "java": {
         "functions": {"method_declaration", "constructor_declaration"},
@@ -1005,6 +1094,46 @@ GENERIC_SPECS = {
         "decls": {"enum_specifier", "type_definition", "template_declaration"},
         "imports": {"preproc_include"},
     },
+    "php": {
+        "functions": {"function_definition"},
+        "containers": {"class_declaration", "interface_declaration",
+                       "trait_declaration", "enum_declaration"},
+        "methods": {"method_declaration"},
+        "decls": set(),
+        "imports": {"namespace_use_declaration"},
+        "namespaces": {"namespace_definition"},
+        "namespace_prefix": False,
+    },
+    "kotlin": {
+        "functions": {"function_declaration"},
+        "containers": {"class_declaration", "object_declaration"},
+        "methods": {"function_declaration"},
+        "decls": set(),
+        "imports": {"import_list", "import_header"},
+    },
+    "swift": {
+        "functions": {"function_declaration"},
+        "containers": {"class_declaration", "protocol_declaration"},
+        "methods": {"function_declaration", "init_declaration",
+                    "protocol_function_declaration"},
+        "decls": set(),
+        "imports": {"import_declaration"},
+    },
+    "scala": {
+        "functions": {"function_definition"},
+        "containers": {"class_definition", "trait_definition",
+                       "object_definition"},
+        "methods": {"function_definition"},
+        "decls": set(),
+        "imports": {"import_declaration"},
+    },
+    "lua": {
+        "functions": {"function_declaration"},
+        "containers": set(),
+        "methods": set(),
+        "decls": set(),
+        "imports": set(),
+    },
     "csharp": {
         "functions": {"method_declaration", "constructor_declaration"},
         "containers": {"class_declaration", "interface_declaration",
@@ -1013,6 +1142,10 @@ GENERIC_SPECS = {
         "methods": {"method_declaration", "constructor_declaration"},
         "decls": set(),
         "imports": {"using_directive"},
+        # Block-scoped `namespace X { ... }`: the types inside are chunked
+        # (file-scoped `namespace X;` already leaves them at top level).
+        "namespaces": {"namespace_declaration"},
+        "namespace_prefix": False,
     },
 }
 
@@ -1057,7 +1190,8 @@ def _generic_name(node, src: bytes) -> str:
                 text = _text(n, src).strip()
                 if text:
                     return text
-        if child.type in ("type_spec", "type_identifier", "identifier"):
+        if child.type in ("type_spec", "type_identifier", "identifier",
+                          "simple_identifier", "name"):
             return _text(child, src).strip()
     return "<anonymous>"
 
@@ -1074,7 +1208,8 @@ def _generic_body(node):
     body_types = {
         "class_body", "declaration_list", "field_declaration_list",
         "enum_body", "interface_body", "struct_body", "block",
-        "compound_statement", "body",
+        "compound_statement", "body", "enum_declaration_list",
+        "enum_class_body", "template_body", "protocol_body",
     }
     for c in node.named_children:
         if c.type in body_types:
@@ -1082,9 +1217,48 @@ def _generic_body(node):
     return None
 
 
+def _namespace_body(node):
+    """The declaration list of a namespace/mod node, or None (`mod x;`)."""
+    b = node.child_by_field_name("body")
+    if b is not None:
+        return b
+    return next((c for c in node.named_children
+                 if c.type == "declaration_list"), None)
+
+
+def _walk_namespaces(nodes, spec):
+    """Yield every node in `nodes`, descending into namespace bodies."""
+    for node in nodes:
+        yield node
+        if node.type in spec.get("namespaces", ()):
+            body = _namespace_body(node)
+            if body is not None:
+                yield from _walk_namespaces(body.named_children, spec)
+
+
+def _go_receiver(node, src: bytes) -> str:
+    """Receiver type name of a Go method declaration ("" for functions)."""
+    recv = node.child_by_field_name("receiver")
+    if recv is None:
+        return ""
+    text = _text(recv, src)
+    m = re.search(r"\*?\s*([A-Za-z_]\w*)\s*(?:\[[^\]]*\])?\s*\)?\s*$", text.strip("() \t\n"))
+    return m.group(1) if m else ""
+
+
+def _rust_impl_label(node, src: bytes, name: str) -> str:
+    """`impl Foo` / `impl Trait for Foo` as the impl chunk's qualname, so the
+    struct, its inherent impls and its trait impls stay distinguishable."""
+    trait = node.child_by_field_name("trait")
+    if trait is not None:
+        t = _text(trait, src).split("<", 1)[0].strip()
+        return f"impl {t} for {name}"
+    return f"impl {name}"
+
+
 def _generic_imports(root, spec, src: bytes) -> list[str]:
     out: list[str] = []
-    for node in root.named_children:
+    for node in _walk_namespaces(root.named_children, spec):
         if node.type not in spec["imports"]:
             continue
         text = _text(node, src)
@@ -1121,31 +1295,42 @@ def chunk_source_generic(rel_path: str, src: str, language: str,
     chunks: list[Chunk] = []
     imports = _generic_imports(root, spec, src_bytes)
 
-    scopes: list[tuple[object, object, str]] = []
+    scopes: list[tuple[object, object, str, str]] = []   # outer, inner, kind, prefix
     preamble: list = []
     seen_scope = False
-    for node in root.named_children:
-        inner = node
-        if node.type == "template_declaration":
-            inner = next((c for c in node.named_children
-                          if c.type in spec["functions"]
-                          or c.type in spec["containers"]
-                          or c.type in spec["decls"]), node)
-        if inner.type in spec["functions"]:
-            scopes.append((node, inner, "function"))
-            seen_scope = True
-        elif inner.type in spec["containers"]:
-            scopes.append((node, inner, "container"))
-            seen_scope = True
-        elif inner.type in spec["decls"]:
-            scopes.append((node, inner, "decl"))
-            seen_scope = True
-        elif inner.type in spec["imports"]:
-            continue
-        elif not seen_scope:
-            preamble.append(node)
+    ns_types = spec.get("namespaces", ())
 
-    def emit_function(outer, inner, name):
+    def classify(nodes, prefix: str) -> None:
+        nonlocal seen_scope
+        for node in nodes:
+            inner = node
+            if node.type == "template_declaration":
+                inner = next((c for c in node.named_children
+                              if c.type in spec["functions"]
+                              or c.type in spec["containers"]
+                              or c.type in spec["decls"]), node)
+            if inner.type in ns_types and _namespace_body(inner) is not None:
+                ns_name = _generic_name(inner, src_bytes)
+                nxt = (prefix + ns_name + ".") if spec.get(
+                    "namespace_prefix") else prefix
+                classify(_namespace_body(inner).named_children, nxt)
+            elif inner.type in spec["functions"]:
+                scopes.append((node, inner, "function", prefix))
+                seen_scope = True
+            elif inner.type in spec["containers"]:
+                scopes.append((node, inner, "container", prefix))
+                seen_scope = True
+            elif inner.type in spec["decls"]:
+                scopes.append((node, inner, "decl", prefix))
+                seen_scope = True
+            elif inner.type in spec["imports"]:
+                continue
+            elif not seen_scope:
+                preamble.append(node)
+
+    classify(root.named_children, "")
+
+    def emit_function(outer, inner, name, kind="function"):
         start, end = _line_span(outer)
         sig = _generic_signature(outer, src_bytes)
         body = inner.child_by_field_name("body")
@@ -1161,7 +1346,7 @@ def chunk_source_generic(rel_path: str, src: str, language: str,
                 chunks.append(Chunk(
                     file=rel_path,
                     qualname=name if i == 1 else f"{name}#{i}",
-                    kind="function", start=ps, end=pe,
+                    kind=kind, start=ps, end=pe,
                     signature=_part_signature(sig, i, len(parts)),
                     calls=sorted(calls), imports=imports,
                     source=part_body, sha=_sha(part_body),
@@ -1171,12 +1356,15 @@ def chunk_source_generic(rel_path: str, src: str, language: str,
         _walk_calls(inner, calls)
         body_text = "\n".join(lines[start - 1:end])
         chunks.append(Chunk(
-            file=rel_path, qualname=name, kind="function",
+            file=rel_path, qualname=name, kind=kind,
             start=start, end=end, signature=sig, calls=sorted(calls),
             imports=imports, source=body_text, sha=_sha(body_text),
         ))
 
-    def emit_container(outer, inner, name):
+    def emit_container(outer, inner, name, label=None):
+        """`name` qualifies member methods (`Foo.bar`); `label` is the
+        container chunk's own qualname (`impl Foo` for a Rust impl)."""
+        label = label or name
         start, end = _line_span(outer)
         sig = _generic_signature(outer, src_bytes)
         body = _generic_body(inner)
@@ -1195,8 +1383,8 @@ def chunk_source_generic(rel_path: str, src: str, language: str,
                             _walk_calls(n, calls)
                         chunks.append(Chunk(
                             file=rel_path,
-                            qualname=name if i == 1
-                            else f"{name}#{i}",
+                            qualname=label if i == 1
+                            else f"{label}#{i}",
                             kind="class", start=ps, end=pe,
                             signature=_part_signature(sig, i, len(parts)),
                             calls=sorted(calls), imports=imports,
@@ -1207,7 +1395,7 @@ def chunk_source_generic(rel_path: str, src: str, language: str,
             _walk_calls(inner, calls)
             body_text = "\n".join(lines[start - 1:end])
             chunks.append(Chunk(
-                file=rel_path, qualname=name, kind="class",
+                file=rel_path, qualname=label, kind="class",
                 start=start, end=end, signature=sig,
                 members=[_generic_name(m, src_bytes) for m in methods],
                 calls=sorted(calls), imports=imports,
@@ -1230,7 +1418,7 @@ def chunk_source_generic(rel_path: str, src: str, language: str,
                     _walk_calls(n, calls)
                 chunks.append(Chunk(
                     file=rel_path,
-                    qualname=name if i == 1 else f"{name}#{i}",
+                    qualname=label if i == 1 else f"{label}#{i}",
                     kind="classheader", start=ps, end=pe,
                     scope_end=end if i == 1 else 0,
                     signature=_part_signature(sig, i, len(header_parts)),
@@ -1242,7 +1430,7 @@ def chunk_source_generic(rel_path: str, src: str, language: str,
         else:
             header_body = "\n".join(lines[start - 1:header_end])
             chunks.append(Chunk(
-                file=rel_path, qualname=name, kind="classheader",
+                file=rel_path, qualname=label, kind="classheader",
                 start=start, end=header_end, scope_end=end,
                 signature=sig,
                 members=[_generic_name(m, src_bytes) for m in methods],
@@ -1314,19 +1502,29 @@ def chunk_source_generic(rel_path: str, src: str, language: str,
                 calls=sorted(calls), source=body_text, sha=_sha(body_text),
             ))
 
-    for outer, inner, kind in scopes:
+    for outer, inner, kind, prefix in scopes:
         name = _generic_name(inner, src_bytes)
         if kind == "function":
-            emit_function(outer, inner, name)
+            recv = _go_receiver(inner, src_bytes) \
+                if language == "go" and inner.type == "method_declaration" \
+                else ""
+            if recv:
+                emit_function(outer, inner, f"{recv}.{name}", "method")
+            else:
+                emit_function(outer, inner, prefix + name)
         elif kind == "container":
-            emit_container(outer, inner, name)
+            label = _rust_impl_label(inner, src_bytes, name) \
+                if inner.type == "impl_item" else None
+            if label and prefix:
+                label = prefix + label
+            emit_container(outer, inner, prefix + name, label)
         else:
             start, end = _line_span(outer)
             body_text = "\n".join(lines[start - 1:end])
             calls: set[str] = set()
             _walk_calls(inner, calls)
             chunks.append(Chunk(
-                file=rel_path, qualname=name, kind="class",
+                file=rel_path, qualname=prefix + name, kind="class",
                 start=start, end=end, signature=_generic_signature(
                     outer, src_bytes),
                 calls=sorted(calls), imports=imports,
@@ -1335,7 +1533,7 @@ def chunk_source_generic(rel_path: str, src: str, language: str,
 
     # trailing top-level code
     if scopes:
-        last_end = max(_line_span(o)[1] for o, _i, _k in scopes)
+        last_end = max(_line_span(o)[1] for o, _i, _k, _p in scopes)
         tail = [n for n in root.named_children
                 if n.start_point.row + 1 > last_end]
         if tail:
@@ -1379,19 +1577,32 @@ def chunk_file_ts(rel_path: str, src: str, ext: str,
                    max_unit_tokens: int = 3000,
                    unit_overlap_lines: int = 0) -> list[Chunk]:
     """Chunk one file with the tree-sitter chunker for its extension; the
-    entry point index.py calls."""
+    entry point index.py calls.
+
+    The cyclic garbage collector is paused while tree-sitter nodes are alive:
+    py-tree-sitter 0.26 on CPython 3.14 is unstable when a collection runs
+    over live Node objects. (It can still crash on files with several hundred
+    top-level statements on that exact combination -- an upstream bug; CI runs
+    3.11-3.13.) Nodes are freed by reference counting when the chunker
+    returns, so nothing accumulates."""
     lang = LANG_BY_EXT[ext.lower()]
-    if lang == "ruby":
-        return chunk_source_ruby(rel_path, src, class_split_lines,
-                                 max_unit_lines, max_unit_chars,
-                                 max_unit_tokens, unit_overlap_lines)
-    if lang in GENERIC_SPECS:
-        return chunk_source_generic(rel_path, src, lang, class_split_lines,
-                                    max_unit_lines, max_unit_chars,
-                                    max_unit_tokens, unit_overlap_lines)
-    return chunk_source_ts(rel_path, src, lang, class_split_lines,
-                           max_unit_lines, max_unit_chars,
-                           max_unit_tokens, unit_overlap_lines)
+    was_enabled = gc.isenabled()
+    gc.disable()
+    try:
+        if lang == "ruby":
+            return chunk_source_ruby(rel_path, src, class_split_lines,
+                                     max_unit_lines, max_unit_chars,
+                                     max_unit_tokens, unit_overlap_lines)
+        if lang in GENERIC_SPECS:
+            return chunk_source_generic(rel_path, src, lang, class_split_lines,
+                                        max_unit_lines, max_unit_chars,
+                                        max_unit_tokens, unit_overlap_lines)
+        return chunk_source_ts(rel_path, src, lang, class_split_lines,
+                               max_unit_lines, max_unit_chars,
+                               max_unit_tokens, unit_overlap_lines)
+    finally:
+        if was_enabled:
+            gc.enable()
 
 
 def has_syntax_error(text: str, language: str) -> tuple[bool, int | None]:

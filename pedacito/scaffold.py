@@ -29,7 +29,7 @@ from pathlib import Path
 
 from . import apicheck, fileio, workspace
 from . import index as index_mod
-from .chunker import Chunk, chunk_source
+from .chunker import Chunk
 from .config import ConfigError
 from .edits import Result, apply_edits, parse_edits
 from .index import Index, file_hash
@@ -255,10 +255,24 @@ class Plan:
 
     @property
     def sources(self) -> list[PlannedFile]:
-        """Non-test, non-config files -- the ones worth a build pass each."""
+        """Non-test, non-config files -- the ones worth a build pass each.
+        Tests are recognised by convention in every language (`test_x.py`,
+        `x.test.ts`, `x_test.go`, `tests/`, ...), so `testimony.py` stays a
+        source file and a `.test.js` is not mistaken for one."""
+        from .testlinks import classify
         return [f for f in self.files
-                if "/test" not in f.path and not f.path.startswith("test")
+                if not classify(f.path)[0]
                 and not f.path.endswith((".md", ".toml", ".txt", ".cfg", ".ini"))]
+
+
+    @property
+    def tests(self) -> list[PlannedFile]:
+        """Planned test files (by convention, any language): built AFTER the
+        sources so each test is written against the real API."""
+        from .testlinks import classify
+        return [f for f in self.files if classify(f.path)[0]
+                and not f.path.endswith((".md", ".toml", ".txt", ".cfg", ".ini"))
+                and Path(f.path).name not in ("__init__.py", "conftest.py")]
 
 
 def _safe_rel(path: str, root: Path) -> str | None:
@@ -598,19 +612,27 @@ def skeleton_index(root: Path, plan: Plan, cfg) -> Index:
     """Build a static Index (no summaries) straight from the planned files,
     without walking the tree (`index.build()` would refuse a near-empty project
     and pick up unrelated neighbours)."""
+    from .index import _chunk_with_imports
+    from .select import CODE_EXTS
     chunks: list[Chunk] = []
     hashes: dict[str, str] = {}
+    imports: dict[str, list[str]] = {}
     for f in plan.files:
         path = root / f.path
         if not path.is_file():
             continue
         hashes[f.path] = file_hash(path)
-        src = fileio.read_text(path, errors="replace")
+        if path.suffix.lower() not in CODE_EXTS:
+            continue
         try:
-            chunks.extend(chunk_source(f.path, src, cfg.class_split_lines))
-        except SyntaxError:
-            pass
-    idx = Index(root, chunks, {}, hashes)
+            # the index's own language dispatch: Python via ast, JS/TS/Go/
+            # Rust/Java/... via tree-sitter -- not the Python chunker for all
+            got, imps = _chunk_with_imports(f.path, path, cfg)
+        except (SyntaxError, OSError):
+            continue
+        chunks.extend(got)
+        imports[f.path] = imps
+    idx = Index(root, chunks, {}, hashes, file_imports=imports)
     idx.save()
     return idx
 
@@ -695,7 +717,10 @@ def build_project(client, cfg, idx, plan: Plan, verbose: bool = True,
     """Run a build pass for each planned source file, in plan order, stopping
     early if the server goes away. Returns
     {"done": [paths], "failed": [(path, message)], "skipped": [paths]}."""
-    targets = plan.sources or plan.files
+    # sources first, then the tests that exercise them (a planner that emits
+    # test stubs expects them filled in; they used to be silently skipped)
+    targets = (plan.sources or plan.files) + [
+        t for t in plan.tests if t not in (plan.sources or ())]
     done: list[str] = []
     failed: list[tuple[str, str]] = []
     skipped: list[str] = []

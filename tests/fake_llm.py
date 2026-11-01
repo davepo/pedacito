@@ -61,6 +61,28 @@ class H(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(b)
 
+    def _stream(self, text, req):
+        """Answer a streaming request with real SSE frames (and a usage frame
+        when the client asked for one), like OpenAI-compatible servers."""
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Connection", "close")
+        self.end_headers()
+        step = max(1, len(text) // 4)
+        for i in range(0, len(text), step):
+            frame = {"choices": [{"delta": {"content": text[i:i + step]},
+                                  "finish_reason": None}]}
+            self.wfile.write(("data: " + json.dumps(frame) + "\n\n").encode())
+        self.wfile.write(("data: " + json.dumps(
+            {"choices": [{"delta": {}, "finish_reason": "stop"}]}) + "\n\n").encode())
+        if (req.get("stream_options") or {}).get("include_usage"):
+            usage = {"choices": [], "usage": {
+                "prompt_tokens": 120, "completion_tokens": max(1, len(text) // 4),
+                "prompt_tokens_details": {"cached_tokens": 60}}}
+            self.wfile.write(("data: " + json.dumps(usage) + "\n\n").encode())
+        self.wfile.write(b"data: [DONE]\n\n")
+        self.wfile.flush()
+
     def do_POST(self):
         n = int(self.headers.get("Content-Length") or 0)
         req = json.loads(self.rfile.read(n) or b"{}")
@@ -93,6 +115,9 @@ class H(BaseHTTPRequestHandler):
         if "single word: ok" in last:
             self._send({"choices": [{"message": {"content": "ok"},
                                      "finish_reason": "stop"}], "usage": {}})
+            return
+        if req.get("stream"):
+            self._stream(REPLY, req)
             return
         self._send({"choices": [{"message": {"content": REPLY},
                                  "finish_reason": "stop"}], "usage": {}})

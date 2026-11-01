@@ -108,20 +108,97 @@ def _sectioned(rel: str, text: str, rx: re.Pattern, label: str) -> list[Chunk]:
     return out
 
 
-def _headed(rel: str, text: str) -> list[Chunk]:
-    """Markdown/RST: one chunk per heading, falling back to fixed-size blocks
-    if no headings are found."""
+_FENCE_LINE_RE = re.compile(r"^\s{0,3}(`{3,}|~{3,})")
+_SETEXT_RE = re.compile(r"^\s{0,3}(=+|-+)\s*$")
+_RST_ADORN_RE = re.compile(r"""^([!-/:-@\[-`{-~])\1{2,}\s*$""")
+
+
+def _heading_marks(lines: list[str], rst: bool) -> list[tuple[int, int, str]]:
+    """(start line, level, title) for every heading: ATX `#` headings and
+    Markdown setext (`Title` over `===`/`---`) headings, outside fenced code
+    (a `# comment` inside a fenced bash block is not a heading); for RST,
+    adorned titles (underline, or over+underline) with levels by first
+    appearance of each adornment style."""
+    marks: list[tuple[int, int, str]] = []
+    in_fence = ""
+    styles: list[str] = []
+    n = len(lines)
+    i = 0
+    while i < n:
+        line = lines[i]
+        fm = _FENCE_LINE_RE.match(line)
+        if fm and not rst:
+            mark = fm.group(1)[0]
+            if not in_fence:
+                in_fence = mark
+            elif in_fence == mark:
+                in_fence = ""
+            i += 1
+            continue
+        if in_fence:
+            i += 1
+            continue
+        if rst:
+            nxt = lines[i + 1] if i + 1 < n else ""
+            # overline + title + underline
+            if _RST_ADORN_RE.match(line) and i + 2 < n and lines[i + 1].strip() \
+                    and _RST_ADORN_RE.match(lines[i + 2]) \
+                    and lines[i + 2][0] == line[0] \
+                    and len(lines[i + 2].rstrip()) >= len(lines[i + 1].strip()):
+                style = "o" + line[0]
+                if style not in styles:
+                    styles.append(style)
+                marks.append((i + 1, styles.index(style) + 1,
+                              lines[i + 1].strip()))
+                i += 3
+                continue
+            if line.strip() and not _RST_ADORN_RE.match(line) \
+                    and _RST_ADORN_RE.match(nxt) \
+                    and len(nxt.rstrip()) >= len(line.strip()) >= 1 \
+                    and not line.startswith((" ", "\t")):
+                style = "u" + nxt[0]
+                if style not in styles:
+                    styles.append(style)
+                marks.append((i + 1, styles.index(style) + 1, line.strip()))
+                i += 2
+                continue
+            i += 1
+            continue
+        m = HEADING_RE.match(line)
+        if m:
+            marks.append((i + 1, len(m.group(1)), m.group(2)))
+            i += 1
+            continue
+        if line.strip() and i + 1 < n and not line.lstrip().startswith(
+                (">", "|", "-", "*", "+", "<")):
+            sm = _SETEXT_RE.match(lines[i + 1])
+            if sm and (sm.group(1)[0] == "=" or len(sm.group(1)) >= 2):
+                marks.append((i + 1, 1 if sm.group(1)[0] == "=" else 2,
+                              line.strip()))
+                i += 2
+                continue
+        i += 1
+    return marks
+
+
+def _headed(rel: str, text: str, rst: bool = False) -> list[Chunk]:
+    """Markdown/RST: one chunk per heading (plus a `preamble` for text above
+    the first one), falling back to fixed-size blocks if there are none."""
     lines = split_lines(text)
-    marks = [(i, m.group(1), m.group(2)) for i, line in enumerate(lines, 1)
-             if (m := HEADING_RE.match(line))]
+    marks = _heading_marks(lines, rst)
     if not marks:
         return _blocks(rel, lines, "text")
     out = []
-    for j, (ln, hashes, title) in enumerate(marks):
+    if marks[0][0] > 1:
+        head = "\n".join(lines[:marks[0][0] - 1])
+        if head.strip():
+            out.append(_mk(rel, "preamble", 1, marks[0][0] - 1,
+                           "text before the first heading", "", head))
+    for j, (ln, level, title) in enumerate(marks):
         end = marks[j + 1][0] - 1 if j + 1 < len(marks) else len(lines)
         body = "\n".join(lines[ln - 1 : end])
         out.append(_mk(rel, title[:60], ln, end,
-                       f"{'#' * len(hashes)} {title[:80]}", "", body))
+                       f"{'#' * level} {title[:80]}", "", body))
     return out
 
 
@@ -365,41 +442,104 @@ def _yaml(rel: str, text: str) -> list[Chunk]:
     return out
 
 
+_DOLLAR_RE = re.compile(r"\$([A-Za-z_]\w*)?\$")
+
+
+def _sql_spans(text: str) -> list[tuple[int, int]]:
+    """Line spans of SQL statements: a statement ends at a `;` outside string
+    literals, `--` and `/* */` comments, and `$tag$ ... $tag$` dollar-quoted
+    bodies (function bodies full of `;`). Several statements on one line stay
+    one span."""
+    spans: list[tuple[int, int]] = []
+    n = len(text)
+    line = 1
+    start = 1
+    pending = False          # a `;` ended a statement on the current line
+    saw_code = False         # current statement has any non-comment text
+    i = 0
+    quote = ""               # "'" or '"' while inside a literal/identifier
+    dollar = ""              # closing `$tag$` while inside a dollar body
+    block = False
+    while i < n:
+        ch = text[i]
+        if ch == "\n":
+            if pending:
+                spans.append((start, line))
+                start = line + 1
+                pending = False
+                saw_code = False
+            line += 1
+            i += 1
+            continue
+        if block:
+            if text.startswith("*/", i):
+                block = False
+                i += 2
+            else:
+                i += 1
+            continue
+        if dollar:
+            if text.startswith(dollar, i):
+                i += len(dollar)
+                dollar = ""
+            else:
+                i += 1
+            continue
+        if quote:
+            if ch == quote:
+                if text.startswith(quote * 2, i):
+                    i += 2
+                    continue
+                quote = ""
+            i += 1
+            continue
+        if text.startswith("--", i):
+            j = text.find("\n", i)
+            i = n if j == -1 else j
+            continue
+        if text.startswith("/*", i):
+            block = True
+            i += 2
+            continue
+        if ch in ("'", '"'):
+            quote = ch
+            saw_code = True
+            pending = False
+        elif ch == "$":
+            m = _DOLLAR_RE.match(text, i)
+            if m:
+                dollar = m.group(0)
+                saw_code = True
+                pending = False
+                i = m.end()
+                continue
+        elif ch == ";":
+            if saw_code:
+                pending = True
+        elif not ch.isspace():
+            saw_code = True
+            pending = False
+        i += 1
+    if saw_code or pending:
+        spans.append((start, line))
+    return spans
+
+
 def _sql(rel: str, text: str) -> list[Chunk]:
-    """SQL statements split on a trailing semicolon (quotes respected enough
-    for the common schema/query files Pedacito indexes)."""
+    """SQL statements (comment/quote/dollar-quote aware), named by the object
+    a CREATE defines, else by their first line."""
     lines = split_lines(text)
     nlines = len(lines)
-    spans: list[tuple[int, int]] = []
-    start = 1
-    in_single = in_double = False
-    for i, line in enumerate(lines, 1):
-        j = 0
-        while j < len(line):
-            ch = line[j]
-            if ch == "'" and not in_double:
-                if in_single and j + 1 < len(line) and line[j + 1] == "'":
-                    j += 1
-                else:
-                    in_single = not in_single
-            elif ch == '"' and not in_single:
-                in_double = not in_double
-            elif ch == ";" and not in_single and not in_double:
-                if line[j + 1:].strip() == "":
-                    spans.append((start, i))
-                    start = i + 1
-                break
-            j += 1
-    if start <= nlines:
-        tail = "\n".join(lines[start - 1:]).strip()
-        if tail:
-            spans.append((start, nlines))
+    spans = [(a, min(b, nlines)) for a, b in _sql_spans(text)
+             if a <= nlines]
     if not spans:
         return _blocks(rel, lines, "sql")
     out: list[Chunk] = []
     for start, end in spans:
         body = "\n".join(lines[start - 1:end])
-        first = next((ln.strip() for ln in body.splitlines() if ln.strip()), "")
+        first = next((ln.strip() for ln in body.splitlines()
+                      if ln.strip() and not ln.strip().startswith(("--", "/*"))),
+                     "")
         m = _SQL_OBJECT_RE.search(first)
         qual = (f"create {m.group(1).lower()} {m.group(2)}"
                 if m else first[:60])
@@ -408,8 +548,32 @@ def _sql(rel: str, text: str) -> list[Chunk]:
     return out
 
 
+def _shell_func_end(lines: list[str], start: int) -> int | None:
+    """1-based last line of the brace-delimited shell function starting at
+    line `start`, or None when braces never balance (then the caller falls
+    back to the next definition's start)."""
+    depth = 0
+    opened = False
+    for i in range(start - 1, min(len(lines), start + 2000)):
+        raw = lines[i]
+        stripped = re.sub(r"\"(?:\\.|[^\"\\])*\"|'[^']*'", "", raw)
+        stripped = stripped.split(" #", 1)[0]
+        for ch in stripped:
+            if ch == "{":
+                depth += 1
+                opened = True
+            elif ch == "}":
+                depth -= 1
+        if opened and depth <= 0:
+            return i + 1
+        if not opened and i > start and lines[i].strip():
+            return None
+    return None
+
+
 def _shell(rel: str, text: str) -> list[Chunk]:
-    """Shell/PowerShell function definitions, plus header/trailing blocks."""
+    """Shell/PowerShell function definitions with their real end lines (brace
+    matched), plus `script` chunks for the top-level code between them."""
     lines = split_lines(text)
     nlines = len(lines)
     funcs: list[tuple[int, str]] = []
@@ -426,15 +590,30 @@ def _shell(rel: str, text: str) -> list[Chunk]:
     if not funcs:
         return _blocks(rel, lines, "shell")
     out: list[Chunk] = []
-    if funcs[0][0] > 1:
-        head = "\n".join(lines[:funcs[0][0] - 1])
-        if head.strip():
-            out.append(_mk(rel, "script", 1, funcs[0][0] - 1,
-                           "shell script header", "", head))
+
+    def script(a: int, b: int) -> None:
+        if a > b:
+            return
+        body = "\n".join(lines[a - 1:b])
+        if body.strip():
+            first = a == 1
+            out.append(_mk(rel, "script" if first else f"script_L{a}", a, b,
+                           "shell script header" if first
+                           else "shell top-level code", "", body))
+
+    script(1, funcs[0][0] - 1)
+    prev_end = funcs[0][0] - 1
     for idx, (start, name) in enumerate(funcs):
-        end = (funcs[idx + 1][0] - 1) if idx + 1 < len(funcs) else nlines
+        if start <= prev_end:
+            continue               # nested definition inside the previous one
+        nxt = funcs[idx + 1][0] - 1 if idx + 1 < len(funcs) else nlines
+        end = _shell_func_end(lines, start) or nxt
+        end = min(max(end, start), nlines)
         body = "\n".join(lines[start - 1:end])
         out.append(_mk(rel, name, start, end, f"{name}()", "", body))
+        prev_end = end
+        stop = funcs[idx + 1][0] - 1 if idx + 1 < len(funcs) else nlines
+        script(end + 1, stop)
     return out
 
 
@@ -468,7 +647,7 @@ def chunk_reference(rel: str, path: Path, max_bytes: int = 2_000_000) -> list[Ch
     if ext == ".toml":
         return _sectioned(rel, text, INI_SECTION_RE, "toml")
     if ext in (".md", ".rst"):
-        return _headed(rel, text)
+        return _headed(rel, text, rst=ext == ".rst")
     if ext in (".html", ".htm", ".xhtml"):
         return _html(rel, text)
     if ext in (".yaml", ".yml"):

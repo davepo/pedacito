@@ -157,14 +157,23 @@ def _calls(*nodes: ast.AST) -> list[str]:
 
 
 def _imports(tree: ast.Module) -> list[str]:
-    """Collect fully-qualified names for every top-level import statement."""
+    """Collect fully-qualified names for every import statement in the module,
+    including function-local, class-body, and `try:`/`if:` guarded ones (a
+    top-level-only scan hid every lazily imported dependency)."""
     out: list[str] = []
-    for n in tree.body:
+    seen: set[str] = set()
+    for n in ast.walk(tree):
+        names: list[str] = []
         if isinstance(n, ast.Import):
-            out += [a.name for a in n.names]
+            names = [a.name for a in n.names]
         elif isinstance(n, ast.ImportFrom):
             mod = ("." * (n.level or 0)) + (n.module or "")
-            out += [f"{mod}.{a.name}" if mod else a.name for a in n.names]
+            names = [(f"{mod}{a.name}" if mod.endswith(".") else
+                      f"{mod}.{a.name}") if mod else a.name for a in n.names]
+        for name in names:
+            if name not in seen:
+                seen.add(name)
+                out.append(name)
     return out
 
 

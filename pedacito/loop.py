@@ -25,13 +25,15 @@ import time
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 
-from . import diagnostics, workspace
+from . import diagnostics, events as events_mod, hooks as hooks_mod
+from . import safety, workspace
 from . import index as index_mod
 from . import instructions as instructions_mod
 from . import proc as proc_mod
 from . import review as review_mod
+from . import testsel
 from . import todo as todo_mod
-from .edits import parse_edits
+from .edits import Result, parse_edits
 from .llm import LLMError
 
 # A task line in the plan file: `- [ ] do the thing` / `- [x] done thing`.
@@ -534,6 +536,13 @@ TASK_SCHEMA = {
     "additionalProperties": False,
 }
 
+# Plan mode's variant: the same shape plus an optional `depends_on`. Kept apart
+# so `auto` (and its one-field-per-task contract for small models) is untouched.
+import copy as _copy
+PLAN_SCHEMA = _copy.deepcopy(TASK_SCHEMA)
+PLAN_SCHEMA["properties"]["tasks"]["items"]["properties"]["depends_on"] = {
+    "type": "array", "items": {"type": "integer"}}
+
 PLAN_SYSTEM = """\
 You break a software goal into a small, ordered list of single-focus
 implementation tasks for an autonomous coding loop. The loop will implement
@@ -596,6 +605,61 @@ Rules:
 - NEVER return zero tasks. Every goal has at least one concrete step."""
 
 
+def deps_from(raw, n: int) -> list[list[int]]:
+    """Per-task `depends_on` lists (0-based indexes of EARLIER tasks), aligned
+    with `_titles_from(raw)`; [] entries where none were given."""
+    entries = raw.get("tasks") if isinstance(raw, dict) else raw
+    out: list[list[int]] = []
+    for i, entry in enumerate(entries or []):
+        deps: list[int] = []
+        if isinstance(entry, dict):
+            for d in entry.get("depends_on") or []:
+                try:
+                    k = int(d) - 1
+                except (TypeError, ValueError):
+                    continue
+                if 0 <= k < n and k != i:
+                    deps.append(k)
+        out.append(deps)
+    return out[:n] + [[] for _ in range(max(0, n - len(out)))]
+
+
+def order_by_dependencies(titles: list[str], deps: list[list[int]]) -> list[str]:
+    """Titles in an order that respects `deps` (stable: ties keep the
+    planner's order; a cycle is broken by keeping the original order)."""
+    n = len(titles)
+    placed: list[int] = []
+    left = list(range(n))
+    while left:
+        for i in left:
+            if all(d in placed for d in deps[i] if d < n):
+                placed.append(i)
+                left.remove(i)
+                break
+        else:                       # a cycle: give up on ordering the rest
+            placed.extend(left)
+            break
+    return [titles[i] for i in placed]
+
+
+def replace_unchecked(path: Path, titles: list[str]) -> None:
+    """Replace every still-unchecked task in a plan file with `titles`, keeping
+    done/failed lines and the header (used when the planner revises the rest)."""
+    lines = path.read_text(encoding="utf-8").splitlines()
+    out: list[str] = []
+    inserted = False
+    for ln in lines:
+        if _is_unchecked(ln):
+            if not inserted:
+                out += [f"- [ ] {t}" for t in titles]
+                inserted = True
+            continue
+        out.append(ln)
+    if not inserted:
+        out += [f"- [ ] {t}" for t in titles]
+    path.write_text("\n".join(out) + "\n", encoding="utf-8")
+
+
 def _titles_from(raw) -> list[str]:
     """Pull task titles out of a planning reply, tolerating a bare list or a
     list of plain strings as well as the schema's [{title: ...}] shape."""
@@ -617,7 +681,7 @@ def _titles_from(raw) -> list[str]:
 
 
 def generate_tasks(spec_text: str, client, cfg,
-                   root: Path | None = None) -> list[str]:
+                   root: Path | None = None, with_deps: bool = False):
     """Ask the model to break `spec_text` into an ordered task list.
 
     Re-asks once when a title arrives at exactly the schema's length cap
@@ -625,6 +689,7 @@ def generate_tasks(spec_text: str, client, cfg,
     tasks" nudge on an empty reply, and finally falls back to one task built
     from the goal. When `root` is given, the project's instruction file is
     added to the planner prompt."""
+    schema = PLAN_SCHEMA if with_deps else TASK_SCHEMA
     budget = getattr(cfg, "max_spec_chars", 60_000)
     body = spec_text.strip()[:budget]
     max_tokens = getattr(cfg, "max_tokens_plan", 2000)
@@ -639,7 +704,7 @@ def generate_tasks(spec_text: str, client, cfg,
     raw = client.chat_json(
         [{"role": "system", "content": plan_system},
          {"role": "user", "content": base_user}],
-        TASK_SCHEMA, max_tokens=max_tokens, disable_thinking=True)
+        schema, max_tokens=max_tokens, disable_thinking=True)
     titles = _titles_from(raw)
     cap = TASK_SCHEMA["properties"]["tasks"]["items"]["properties"][
         "title"]["maxLength"]
@@ -662,7 +727,7 @@ def generate_tasks(spec_text: str, client, cfg,
         raw = client.chat_json(
             [{"role": "system", "content": plan_system},
              {"role": "user", "content": retry}],
-            TASK_SCHEMA, max_tokens=max_tokens, disable_thinking=True)
+            schema, max_tokens=max_tokens, disable_thinking=True)
         retried = _titles_from(raw)
         if retried:
             titles = retried
@@ -677,11 +742,14 @@ def generate_tasks(spec_text: str, client, cfg,
         raw = client.chat_json(
             [{"role": "system", "content": plan_system},
              {"role": "user", "content": nudge}],
-            TASK_SCHEMA, max_tokens=max_tokens, disable_thinking=True)
+            schema, max_tokens=max_tokens, disable_thinking=True)
         titles = _titles_from(raw)
     if not titles:
         first = next((ln.strip() for ln in body.splitlines() if ln.strip()), "")
-        return [f"Address: {first[:200] or 'the requested change'}"]
+        only = [f"Address: {first[:200] or 'the requested change'}"]
+        return (only, [[]]) if with_deps else only
+    if with_deps:
+        return titles, deps_from(raw, len(titles))
     return titles
 
 
@@ -793,6 +861,110 @@ class TaskResult:
     # steps log is then used as the fallback. A merely ATTEMPTED live step
     # (bad URL, missing server) is not evidence.
     live_ok: bool | None = None
+    # Deterministic/verifier findings on the proposed edits (verify.Finding).
+    findings: list = field(default_factory=list)
+    # Per-task usage: tokens, cache-hit ratio, seconds, cost (see _task_stats).
+    stats: dict = field(default_factory=dict)
+
+
+def _snapshot_stats(client) -> dict:
+    """Copy of a client's cumulative usage counters (test doubles may have
+    none)."""
+    st = getattr(client, "stats", None)
+    if not isinstance(st, dict):
+        return {}
+    return {k: v for k, v in st.items() if isinstance(v, (int, float))}
+
+
+def _task_stats(client, before: dict, started: float) -> dict:
+    """Usage consumed since `before`: calls, tokens, cached share, dollars."""
+    now = _snapshot_stats(client)
+    d = {k: now.get(k, 0) - before.get(k, 0) for k in now}
+    pt = d.get("prompt_tokens", 0)
+    return {"calls": d.get("calls", 0), "prompt_tokens": pt,
+            "completion_tokens": d.get("completion_tokens", 0),
+            "cached_tokens": d.get("cached_tokens", 0),
+            "cache_hit": round(d.get("cached_tokens", 0) / pt, 3) if pt else 0.0,
+            "cost": round(d.get("cost", 0.0), 6),
+            "seconds": round(time.time() - started, 2)}
+
+
+def safe_text(text: str, cfg=None) -> str:
+    """`text` with secret-looking values masked when redaction is on (log
+    lines and session files must not become a secret store)."""
+    if cfg is not None and not getattr(cfg, "redact_secrets", True):
+        return text
+    return safety.redact(text)
+
+
+def _fire(cfg, root, event: str, **fields):
+    """Fire a user hook; a HookResult that allows when none is configured."""
+    if not hooks_mod.has_hooks(cfg, event):
+        return hooks_mod.HookResult()
+    return hooks_mod.fire(cfg, root, event, **fields)
+
+
+def _run_tests(idx, cfg, files: list[str]):
+    """(passed, output, description) of the tests impacted by `files`; None
+    when no test command exists or the run itself failed to start."""
+    try:
+        ok, out, desc = testsel.run_impacted(idx, cfg, files)
+    except Exception as e:
+        print(f"  [tests: could not run ({type(e).__name__}: {e})]",
+              file=sys.stderr)
+        return None
+    if desc == "no test command detected":
+        return None
+    return ok, out, desc
+
+
+def _post_edit_tests(root, cfg, agent, idx, task, results, reply, backup_dir,
+                     baseline, edit_files):
+    """After edits were written, run the impacted tests (`verify_tests`).
+    New failures -- worse than the pre-edit baseline -- are fed back for up to
+    `repair_rounds` fix rounds, exactly like the post-edit lint check."""
+    if not (getattr(cfg, "verify_tests", False)
+            and getattr(cfg, "allow_shell", False)):
+        return results, reply
+    from . import verify as verify_mod
+    changed = sorted({r.file for r in results if r.ok and r.file}) or edit_files
+    base_score = 0
+    if baseline is not None and not baseline[0]:
+        base_score = _failure_score(baseline[1])
+    for round_ in range(max(0, int(getattr(cfg, "repair_rounds", 2) or 0)) + 1):
+        got = _run_tests(idx, cfg, changed)
+        if got is None:
+            return results, reply
+        ok, out, desc = got
+        score = 0 if ok else _failure_score(out)
+        print(f"  [tests: {'passed' if ok else 'FAILED'} -- {desc}]",
+              file=sys.stderr)
+        workspace.log_event(root, f"tests {'passed' if ok else 'failed'}: "
+                                  f"{desc}", "INFO" if ok else "ERROR")
+        events_mod.get(root, cfg).emit("tests", ok=ok, score=score,
+                                       baseline=base_score, round=round_)
+        if ok or score <= base_score or round_ >= int(
+                getattr(cfg, "repair_rounds", 2) or 0):
+            break
+        finding = verify_mod.Finding(
+            "tests", "error", "",
+            "after your edits these tests fail (they did not before):\n"
+            + out[-1800:])
+        fixed = agent._repair_from_findings(task, reply, [finding], results)
+        if not fixed:
+            break
+        new = agent._apply_once(fixed, False, backup_dir)
+        if not any(r.ok for r in new):
+            break
+        results = [r for r in results if r.ok] + new
+        reply = (reply.rstrip() + "\n\n" + fixed)
+        changed = sorted({fileio_norm(r.file) for r in results if r.ok})
+    return results, reply
+
+
+def fileio_norm(name: str) -> str:
+    from . import fileio
+    return fileio.normalise_rel(name)
 
 
 def _report(results, dry_run: bool):
@@ -1151,7 +1323,7 @@ def run_investigation_task(root: Path, cfg, agent, idx, task: str, *,
     and then replaced by a stand-in built from the steps log and gathered
     evidence."""
     when = workspace.stamp()
-    workspace.log_event(root, f"investigate: {task}")
+    workspace.log_event(root, f"investigate: {safe_text(task, cfg)}")
     todo_mod.clear(root)
     print("\n--- looking things up ---", file=sys.stderr)
     gathered = agent.gather(task)
@@ -1198,8 +1370,9 @@ def run_investigation_task(root: Path, cfg, agent, idx, task: str, *,
                             "stand-in", "ERROR")
     session = None
     if cfg.log_sessions:
-        session = workspace.write_session(root, task, steps_log,
-                                          reply, [], None, when)
+        session = workspace.write_session(root, safe_text(task, cfg),
+                                          steps_log, safe_text(reply, cfg),
+                                          [], None, when)
         print(f"[session: {session.relative_to(root)}]", file=sys.stderr)
     return TaskResult([], reply, True, [], idx, session, steps_log,
                       live_ok=getattr(agent, "live_evidence_ok", None))
@@ -1208,6 +1381,76 @@ def run_investigation_task(root: Path, cfg, agent, idx, task: str, *,
 def run_task(root: Path, cfg, client, agent, idx, task: str, *,
              apply: bool = True, review: bool = False,
              answer_system: str | None = None) -> TaskResult:
+    """`_run_ladder`, plus failure memory: a task that ends without a usable
+    edit is remembered (files looked at, why) so a similar later task is warned
+    off the same dead end; a success clears the warning."""
+    from . import memory as memory_mod
+    tr = _run_ladder(root, cfg, client, agent, idx, task, apply=apply,
+                     review=review, answer_system=answer_system)
+    if answer_system is not None or review or not getattr(cfg, "use_memory", True):
+        return tr
+    try:
+        if any(r.ok for r in tr.results) or _is_noop(tr.reply):
+            memory_mod.clear_attempts(root, task)
+        else:
+            looked = [ln.split(None, 2)[-1][:60] for ln in tr.steps
+                      if " read " in f" {ln} "][:4]
+            why = ("fabricated edits" if tr.fabricated
+                   else "no valid edit was produced")
+            memory_mod.note_attempt(root, task, why, looked)
+    except Exception:
+        pass
+    return tr
+
+
+def _run_ladder(root: Path, cfg, client, agent, idx, task: str, *,
+                apply: bool = True, review: bool = False,
+                answer_system: str | None = None) -> TaskResult:
+    """`_run_task_once`, plus the bounded recovery ladder: an unreachable or
+    failing worker falls over to the `fallback` role's model, and a task that
+    ends with NO edit applied gets one more attempt on the `escalate` role's
+    (stronger) model. Each rung is used at most once per task, and only when
+    that role is configured, so a local model's bad day cannot silently burn a
+    hosted budget."""
+    from . import roles as roles_mod
+    from .llm import BudgetExceeded, CancelledError
+    kw = dict(apply=apply, review=review, answer_system=answer_system)
+    try:
+        tr = _run_task_once(root, cfg, client, agent, idx, task, **kw)
+    except (BudgetExceeded, CancelledError):
+        raise
+    except LLMError as e:
+        fb = roles_mod.client_for(cfg, "fallback", client)
+        if fb is client:
+            raise
+        print(f"\n[worker failed ({str(e).splitlines()[0][:100]}); falling "
+              f"back to the `fallback` role's model]", file=sys.stderr)
+        workspace.log_event(root, f"fallback to role model after: {e}", "WARN")
+        from .agent import Agent
+        return _run_task_once(root, cfg, fb, Agent(idx, fb, cfg), idx, task,
+                              **kw)
+    if answer_system is not None or review:
+        return tr
+    esc = roles_mod.client_for(cfg, "escalate", client)
+    if esc is client or (tr.applied and any(r.ok for r in tr.results)):
+        return tr
+    if any(r.ok for r in tr.results) and not apply:
+        return tr                      # a dry run that produced a valid diff
+    if _is_noop(tr.reply):
+        return tr                      # a coherent "nothing to change"
+    print("\n[no edit landed; one more attempt on the `escalate` role's "
+          "model]", file=sys.stderr)
+    workspace.log_event(root, "escalating a failed task to the escalate role",
+                        "WARN")
+    from .agent import Agent
+    tr2 = _run_task_once(root, cfg, esc, Agent(tr.idx, esc, cfg), tr.idx, task,
+                         **kw)
+    return tr2 if any(r.ok for r in tr2.results) else tr
+
+
+def _run_task_once(root: Path, cfg, client, agent, idx, task: str, *,
+                   apply: bool = True, review: bool = False,
+                   answer_system: str | None = None) -> TaskResult:
     """Run ONE task through the inner loop: gather source, answer (or edit),
     apply or review, re-index the touched files, and write a session log.
 
@@ -1217,14 +1460,31 @@ def run_task(root: Path, cfg, client, agent, idx, task: str, *,
     stubs rather than edit existing code)."""
     when = workspace.stamp()
     wants_write = apply or review
-    backup_dir = (workspace.new_backup_dir(root, when)
+    backup_dir = (workspace.new_backup_dir(root, when, unique=True)
                   if wants_write and cfg.backup else None)
-    workspace.log_event(root, f"task: {task}")
+    t_started = time.time()
+    usage0 = _snapshot_stats(client)
+    workspace.log_event(root, f"task: {safe_text(task, cfg)}")
     todo_mod.clear(root)          # a fresh checklist per task; auto has PLAN.md
+    _fire(cfg, root, "pre_task", task=task[:500])
     print("\n--- looking things up ---", file=sys.stderr)
     gathered = agent.gather(task, backup_dir=backup_dir)
     print("--- answering ---\n", file=sys.stderr)
     raw_reply = agent.answer(task, gathered, system=answer_system)
+    findings: list = []
+    if answer_system is None and parse_edits(raw_reply) \
+            and not _edit_refusal_head(raw_reply):
+        # Several candidates, scored by the free deterministic checks (opt-in).
+        if int(getattr(cfg, "best_of", 1) or 1) > 1 \
+                and hasattr(agent, "best_of"):
+            raw_reply = agent.best_of(task, raw_reply, gathered)
+        # Check the proposed edits BEFORE anything is written: unread code,
+        # placeholders, stale references, unaddressed requirements.
+        if hasattr(agent, "preflight"):
+            raw_reply, findings = agent.preflight(task, raw_reply, gathered)
+            for f in findings:
+                workspace.log_event(root, f"verify: {f.render()}",
+                                    "WARN" if f.severity == "warn" else "ERROR")
     truncated = bool(getattr(client, "stream_truncated", False))
     if truncated:
         workspace.log_event(root, "answer reply truncated at the output limit",
@@ -1257,9 +1517,28 @@ def run_task(root: Path, cfg, client, agent, idx, task: str, *,
                             "WARN")
         results, reply = [], raw_reply
     else:
-        results, reply = agent.apply(raw_reply, dry_run=review or not apply,
-                                     task=task, gathered=gathered,
-                                     backup_dir=None if review else backup_dir)
+        edit_files = sorted({e.file for e in parse_edits(raw_reply)})
+        pre = _fire(cfg, root, "pre_edit", files=edit_files, task=task[:300])
+        baseline_tests = None
+        if apply and not review and edit_files and getattr(
+                cfg, "verify_tests", False) and getattr(cfg, "allow_shell", False):
+            baseline_tests = _run_tests(idx, cfg, edit_files)
+        if pre.denied:
+            print(f"  [edits blocked by a pre_edit hook: {pre.message}]",
+                  file=sys.stderr)
+            results = [Result(False, f, f"blocked by a pre_edit hook: "
+                                        f"{pre.message}") for f in edit_files]
+            reply = raw_reply
+        else:
+            results, reply = agent.apply(raw_reply, dry_run=review or not apply,
+                                         task=task, gathered=gathered,
+                                         backup_dir=None if review else backup_dir)
+            if apply and not review and any(r.ok for r in results):
+                _fire(cfg, root, "post_edit",
+                      files=[r.file for r in results if r.ok])
+                results, reply = _post_edit_tests(
+                    root, cfg, agent, idx, task, results, reply,
+                    backup_dir, baseline_tests, edit_files)
         if not results and getattr(agent, "noop_discards", None):
             # The reply's only blocks were null edits (SEARCH == REPLACE)
             # dropped by parse_edits: the model had concluded no edit was
@@ -1328,17 +1607,50 @@ def run_task(root: Path, cfg, client, agent, idx, task: str, *,
                 pass               # a deleted/moved file re-indexes on next refresh
         agent.index = idx
 
+    if applied and changed and int(getattr(cfg, "refresh_summaries", 0) or 0):
+        try:
+            from . import roles as roles_mod
+            index_mod.refresh_summaries(
+                idx, roles_mod.client_for(cfg, "summarizer", client), cfg,
+                limit=int(cfg.refresh_summaries), verbose=True)
+        except Exception as e:                 # never fail a task over a summary
+            print(f"  [summary refresh skipped: {e}]", file=sys.stderr)
+
     steps_log = list(getattr(agent, "steps_log", []) or [])
     session = None
     if cfg.log_sessions:
-        session = workspace.write_session(root, task, steps_log,
-                                          reply, results, backup_dir, when,
-                                          raw_reply=raw_reply if truncated else None)
+        session = workspace.write_session(root, safe_text(task, cfg),
+                                          steps_log,
+                                          safe_text(reply, cfg), results,
+                                          backup_dir, when,
+                                          raw_reply=safe_text(raw_reply, cfg)
+                                          if truncated else None)
         print(f"[session: {session.relative_to(root)}]", file=sys.stderr)
+    stats = _task_stats(client, usage0, t_started)
+    ok_n = sum(1 for r in results if r.ok)
+    events_mod.get(root, cfg).emit(
+        "task", task=task[:200], steps=len(steps_log), applied=applied,
+        edits_ok=ok_n, edits_failed=len(results) - ok_n, changed=changed,
+        findings=[f.kind for f in findings],
+        answer_mode=getattr(agent, "answer_mode_used", ""),
+        folds=getattr(agent, "fold_count", 0), **stats)
+    events_mod.get(root, cfg).emit(
+        "result", _full=True, task=task[:200], reply=reply, applied=applied,
+        edits=[{"file": r.file, "ok": r.ok, "message": r.message,
+                "diff": r.diff} for r in results])
+    if stats.get("calls"):
+        print(f"[task: {stats['calls']} calls, {stats['prompt_tokens']:,} "
+              f"in / {stats['completion_tokens']:,} out tokens, cache hit "
+              f"{stats['cache_hit']:.0%}"
+              + (f", ${stats['cost']:.4f}" if stats.get("cost") else "")
+              + f", {stats['seconds']:.0f}s]", file=sys.stderr)
+    _fire(cfg, root, "post_task", task=task[:300], applied=applied,
+          files=changed, ok=ok_n, failed=len(results) - ok_n)
     return TaskResult(results, reply, applied, changed, idx, session,
                       steps_log, fabricated=fabricated_only,
                       backup_dir=backup_dir,
-                      live_ok=getattr(agent, "live_evidence_ok", None))
+                      live_ok=getattr(agent, "live_evidence_ok", None),
+                      findings=findings, stats=stats)
 
 
 # Corrective re-runs are one-shot: a second identical failure is a verdict,
@@ -1471,6 +1783,14 @@ def run_loop(root: Path, cfg, client, idx, plan_path: Path, *,
     workspace.log_event(root, f"auto loop: plan={plan_path.name}"
                               f" verify={verify or '(none)'}")
     _lint_plan_titles(root, plan_path)
+    # The plan file is harness state: only the loop ticks its boxes, so the
+    # model may not write it through any tool or edit block.
+    try:
+        plan_rel = plan_path.resolve().relative_to(Path(root).resolve()).as_posix()
+        if plan_rel not in cfg.protected_paths:
+            cfg.protected_paths = tuple(cfg.protected_paths) + (plan_rel,)
+    except (ValueError, OSError):
+        pass
 
     remediated: dict[str, int] = {}     # verify title -> repair rounds used
     # A check whose inserted repair applied NO edits was judged unfixable in
@@ -1952,4 +2272,6 @@ def run_loop(root: Path, cfg, client, idx, plan_path: Path, *,
     workspace.log_event(root, f"auto loop finished: {done} done, "
                               f"{failed} failed, {remaining} left",
                         "ERROR" if failed else "INFO")
+    _fire(cfg, root, "notification", message=f"pedacito auto finished: "
+          f"{done} done, {failed} failed, {remaining} left")
     return 0 if failed == 0 else 1

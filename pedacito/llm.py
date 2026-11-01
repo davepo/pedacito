@@ -26,8 +26,10 @@ from __future__ import annotations
 
 import base64
 import json
+import random
 import re
 import sys
+import threading
 import time
 from pathlib import Path
 from urllib.parse import quote, urlparse
@@ -36,25 +38,63 @@ import requests
 
 
 class LLMError(RuntimeError):
-    """Base class for any failure talking to the model server."""
+    """Base class for any failure talking to the model server. `kind` is a
+    short taxonomy label used in logs and events."""
+
+    kind = "error"
 
 
 class ModelLoadError(LLMError):
     """The server could not load the model. Retrying rarely helps."""
 
+    kind = "load"
+
 
 class TemplateError(LLMError):
     """The model's chat template rejected the message sequence."""
+
+    kind = "template"
 
 
 class ContextOverflowError(LLMError):
     """The prompt is bigger than the server's context window. `chat()` trims
     the conversation and retries before giving up."""
 
+    kind = "context"
+
+
+class BudgetExceeded(LLMError):
+    """A configured token or cost budget is spent; no further call is made."""
+
+    kind = "budget"
+
+
+class CancelledError(LLMError):
+    """The caller cancelled the in-flight call (`client.cancel()`); partial
+    output is kept in `client.partial_text`."""
+
+    kind = "cancelled"
+
 
 class _Transient(LLMError):
-    """Worth retrying: model still loading, or the server is busy."""
+    """Worth retrying: model still loading, or the server is busy.
 
+    `rate_limited` separates "provider says slow down" (429, a hosted 503)
+    from "local model is still loading": the two have separate wait budgets so
+    a hosted 429 never burns the 240 s model-load deadline."""
+
+    kind = "transient"
+
+    def __init__(self, message: str, retry_after: float | None = None,
+                 rate_limited: bool = False):
+        super().__init__(message)
+        self.retry_after = retry_after
+        self.rate_limited = rate_limited
+
+
+# Rate-limit retries (429/hosted 503) before giving up; separate from the
+# local model-load wait.
+_MAX_RATE_LIMIT_RETRIES = 5
 
 # Mistral-family templates raise a Jinja exception on two user messages in a
 # row; Gemma has no system role. The fix is to reshape the request.
@@ -184,6 +224,17 @@ def _schema_example(schema: dict) -> str:
             ex[k] = {}
         else:
             ex[k] = ""
+    return json.dumps(ex)
+
+
+def schema_example_with(schema: dict, **overrides) -> str:
+    """A well-formed object for `schema` with some fields filled in (used to
+    build worked examples from the real project for servers without grammar
+    support)."""
+    ex = json.loads(_schema_example(schema))
+    for k, v in overrides.items():
+        if k in ex:
+            ex[k] = v
     return json.dumps(ex)
 
 
@@ -444,9 +495,69 @@ def fold_system(messages: list[dict]) -> list[dict]:
     return merge_consecutive(rest)
 
 
+# One density constant for every estimate in the package (fit math, config
+# warnings, chunk token guards); a calibrated client overrides it per model.
+CHARS_PER_TOKEN = 3.6
+# Chat templates wrap every message in role markers; ~4 tokens each plus a
+# few for the reply primer. Counting only `len(content)` undercounts a long
+# agent conversation by hundreds of tokens.
+MESSAGE_OVERHEAD_TOKENS = 4
+
+
 def estimate_tokens(text: str) -> int:
     """Rough token estimate (~3.6 chars/token for source code)."""
-    return int(len(text) / 3.6) + 1
+    return int(len(text) / CHARS_PER_TOKEN) + 1
+
+
+def estimate_messages(messages: list[dict], est=None) -> int:
+    """Token estimate for a whole conversation, including per-message framing
+    overhead. `est` is a text estimator (a client's calibrated one)."""
+    est = est or estimate_tokens
+    return sum(est(m.get("content") or "") + MESSAGE_OVERHEAD_TOKENS
+               for m in messages) + 3
+
+
+# Structural request keys a user `sampler` table must never override: they
+# would defeat the output cap, the grammar, or the streaming protocol.
+_PROTECTED_SAMPLER_KEYS = frozenset({
+    "model", "messages", "stream", "max_tokens", "max_completion_tokens",
+    "response_format", "tools", "tool_choice", "functions", "function_call",
+    "stream_options", "n",
+})
+
+# A 400 body that says the PROMPT overflowed the window (as opposed to any
+# unrelated 400 that merely contains the word "exceeds").
+_CONTEXT_OVERFLOW_RE = re.compile(
+    r"context[ _-]?(?:length|window|size)|\bn_ctx\b|ctx_len|too many tokens|"
+    r"prompt is too long|input is too long|maximum (?:context|prompt)|"
+    r"exceed\w*[^.\n]{0,60}\bcontext\b|\bcontext\b[^.\n]{0,60}exceed|"
+    r"reduce the length of the (?:messages|prompt|input)|"
+    r"context_length_exceeded|tokens? (?:in|of) (?:the )?(?:prompt|input|request)"
+    r"[^.\n]{0,40}(?:exceed|over|more than)",
+    re.IGNORECASE)
+
+# Pool one connection set per client; tests (and users) may monkeypatch
+# `requests.post`, so a patched function is honoured over the session.
+_REAL_POST = requests.post
+
+
+def _close(response) -> None:
+    """Close a response on every path; mocks without close() are fine."""
+    try:
+        response.close()
+    except Exception:
+        pass
+
+
+def _retry_after(response) -> float | None:
+    """Seconds from a `Retry-After` header (delta-seconds form), clamped."""
+    try:
+        raw = (getattr(response, "headers", None) or {}).get("Retry-After")
+        if raw is None:
+            return None
+        return max(0.0, min(float(raw), 120.0))
+    except (TypeError, ValueError, AttributeError):
+        return None
 
 
 class LLMClient:
@@ -465,7 +576,31 @@ class LLMClient:
             "Content-Type": "application/json",
             "Authorization": f"Bearer {cfg.api_key}",
         }
-        self.stats = {"calls": 0, "prompt_tokens": 0, "completion_tokens": 0, "seconds": 0.0}
+        self.stats = {"calls": 0, "prompt_tokens": 0, "completion_tokens": 0,
+                      "cached_tokens": 0, "seconds": 0.0, "cost": 0.0,
+                      "by_site": {}}
+        self._session = requests.Session()
+        self._session_used = False
+        self._stats_lock = threading.Lock()
+        self._cancel = threading.Event()
+        # Called with each streamed text delta instead of echoing to stdout
+        # (GUI streaming, tests). None = echo to stdout.
+        self.stream_callback = None
+        self.echo_stream = True
+        # Called with one dict per finished request (events.py attaches here).
+        self.on_call = None
+        # Label for the current call site (gather / answer / repair / ...);
+        # set with `client.site = "answer"` and read by usage accounting.
+        self.site = ""
+        # Text streamed before a cancel or a mid-stream disconnect.
+        self.partial_text = ""
+        # Temporary sampling temperature (best-of-N candidates); None = config.
+        self._temp_override: float | None = None
+        # Worked step examples built from the real project (set by the agent):
+        # shown instead of one dummy object when the server has no grammar.
+        self.fewshot: list[dict] = []
+        # None = untested; False after a server rejected stream_options.
+        self._stream_usage_ok: bool | None = None
         # Learned once the template rejects a system role.
         self._no_system_role = False
         # Grammar-constrained JSON support: None = not probed (assume yes),
@@ -495,35 +630,99 @@ class LLMClient:
 
     def _context_too_long(self, body: str) -> bool:
         """True when a 400 body says the prompt overflowed the context window.
-        llama.cpp/LM Studio say "exceeds ... context" / "n_ctx"; Ollama says
-        "context length exceeded" or "too many tokens"."""
-        low = (body or "").lower()
-        return any(h in low for h in (
-            "exceeds", "context length", "n_ctx", "ctx_len",
-            "too many tokens", "prompt is too long", "maximum context",
-            "out of range", "overfull"))
+        llama.cpp/LM Studio say "exceeds the available context size" /
+        "n_ctx"; Ollama says "context length exceeded" or "too many tokens";
+        hosted APIs say "maximum context length" or `context_length_exceeded`.
+        Bare "exceeds"/"out of range" are NOT enough: an unrelated 400 (a bad
+        temperature, say) would otherwise trigger a pointless trim cascade."""
+        return bool(_CONTEXT_OVERFLOW_RE.search(body or ""))
+
+    def _http_post(self, url: str, **kw):
+        """`requests.post` through this client's pooled session (a fresh TCP/TLS
+        handshake per call is pure latency on hosted APIs), unless a caller
+        replaced `requests.post`."""
+        fn = requests.post
+        if fn is not _REAL_POST:
+            return fn(url, **kw)
+        return self._session.post(url, **kw)
+
+    def temperature(self, value: float):
+        """Context manager: sample at `value` for the calls inside it (used to
+        diversify best-of-N candidates)."""
+        from contextlib import contextmanager
+
+        @contextmanager
+        def cm():
+            prev = self._temp_override
+            self._temp_override = value
+            try:
+                yield self
+            finally:
+                self._temp_override = prev
+        return cm()
+
+    def _reset_session(self) -> None:
+        try:
+            self._session.close()
+        except Exception:
+            pass
+        self._session = requests.Session()
+        self._session_used = False
+
+    def cancel(self) -> None:
+        """Ask the in-flight (or next) streamed call to stop at the next
+        chunk. Safe from any thread; cleared when the next call starts."""
+        self._cancel.set()
 
     def _post(self, payload: dict, stream: bool = False):
         """POST to the chat completions endpoint, raising a specific LLMError
-        subclass on failure (connection, load failure, template, transient,
-        context overflow, or other server error)."""
+        subclass on failure (connection, timeout, load failure, template,
+        transient/rate limit, context overflow, or other server error)."""
         try:
-            r = requests.post(
-                self.url, headers=self.headers, json=payload,
-                timeout=self.cfg.timeout, stream=stream,
-            )
+            try:
+                r = self._http_post(
+                    self.url, headers=self.headers, json=payload,
+                    timeout=self.cfg.timeout, stream=stream)
+            except requests.exceptions.ConnectionError:
+                # A pooled keep-alive connection the server already closed
+                # looks like a refused connection; retry once on a fresh
+                # session before declaring the server unreachable.
+                if not self._session_used:
+                    raise
+                self._reset_session()
+                r = self._http_post(
+                    self.url, headers=self.headers, json=payload,
+                    timeout=self.cfg.timeout, stream=stream)
+            self._session_used = True
         except requests.exceptions.ConnectionError as e:
             raise LLMError(CONNECT_HELP.format(url=self.cfg.base_url)) from e
+        except requests.exceptions.Timeout as e:
+            raise LLMError(
+                f"The server at {self.cfg.base_url} did not answer within "
+                f"{self.cfg.timeout:g}s (`timeout` in your config). A slow "
+                "local model may need a larger timeout; a hosted API may be "
+                "overloaded.") from e
+        except requests.exceptions.RequestException as e:
+            raise LLMError(
+                f"Request to {self.cfg.base_url} failed: "
+                f"{type(e).__name__}: {str(e)[:200]}") from e
         if r.status_code >= 400:
-            body = r.text[:800]
+            try:
+                body = r.text[:800]
+            finally:
+                _close(r)
             low = body.lower()
             if any(k in low for k in _LOAD_FAILED):
                 raise ModelLoadError(
                     f"The server could not load '{self.cfg.model}'.\n{LOAD_HELP}")
             if any(k in low for k in _TEMPLATE_HINTS):
                 raise TemplateError(body[:400])
-            if r.status_code in (429, 503) or any(k in low for k in _LOADING):
-                raise _Transient(f"{r.status_code}: {body[:200]}")
+            loading = any(k in low for k in _LOADING)
+            if r.status_code in (429, 503) or loading:
+                raise _Transient(
+                    f"{r.status_code}: {body[:200]}",
+                    retry_after=None if loading else _retry_after(r),
+                    rate_limited=not loading)
             if self._context_too_long(body):
                 # chat() catches this, trims the conversation, and retries.
                 raise ContextOverflowError(
@@ -543,11 +742,14 @@ class LLMClient:
         url = self.cfg.base_url.rstrip("/") + "/embeddings"
         model = getattr(self.cfg, "embedding_model", "") or self.cfg.model
         try:
-            r = requests.post(url, headers=self.headers,
-                              json={"model": model, "input": list(texts)},
-                              timeout=self.cfg.timeout)
+            r = self._http_post(url, headers=self.headers,
+                                json={"model": model, "input": list(texts)},
+                                timeout=self.cfg.timeout)
         except requests.exceptions.ConnectionError as e:
             raise LLMError(CONNECT_HELP.format(url=self.cfg.base_url)) from e
+        except requests.exceptions.RequestException as e:
+            raise LLMError(f"Embeddings request failed: "
+                           f"{type(e).__name__}: {str(e)[:200]}") from e
         if r.status_code >= 400:
             raise LLMError(
                 f"Embeddings request failed ({r.status_code}): {r.text[:300]}. "
@@ -598,10 +800,17 @@ class LLMClient:
              stream: bool = False, disable_thinking: bool | None = None) -> str:
         """Send a chat completion request and return the response text.
 
-        Retries while the model is still loading, trims old tool results so
-        prompt + reply fit the context window, recovers from context overflow,
-        and folds the system prompt into the first user turn if the template
-        rejects a system role.
+        Retries while the model is still loading (and, separately, while a
+        provider rate-limits), lowers `max_tokens` so prompt + reply fit the
+        window, recovers from a server-reported context overflow, and folds
+        the system prompt into the first user turn if the template rejects a
+        system role.
+
+        The client never rewrites conversation history on its own to make a
+        prompt fit: that is the agent's job (one fold point, see
+        agent.fold_middle) because every rewrite invalidates the server's
+        prompt-prefix cache. The overflow path below is the last resort, taken
+        only after the server itself refused the request.
         """
         messages = merge_consecutive(messages)
         if self._no_system_role:
@@ -613,44 +822,34 @@ class LLMClient:
         trimmed_once = False
         shrunk_once = False
         empty_streak = 0        # consecutive empty streamed replies
+        rate_waits = 0          # rate-limit retries, budgeted apart from loading
         while True:
             attempt += 1
-            # Proactive fit: llama.cpp/LM Studio reject requests whose prompt +
-            # max_tokens exceeds the window, and Ollama silently truncates the
-            # middle. Shrink the oldest tool-result turns until the reply
-            # budget fits; only the newest RESULT matters mid-gather.
-            room = self.cfg.context_tokens - max_tokens
-            total = sum(self.estimate_tokens(m["content"]) for m in messages)
-            if room > 0 and total > room * 0.9:
-                new_messages = list(messages)
-                # Drop the oldest RESULT turn with the assistant action that
-                # requested it, so roles keep alternating.
-                while True:
-                    cur = sum(self.estimate_tokens(m["content"])
-                              for m in new_messages)
-                    if cur <= room * 0.85:
-                        break
-                    idxs = [i for i, m in enumerate(new_messages)
-                            if m["role"] == "user"
-                            and m["content"].startswith("RESULT:\n")]
-                    if len(idxs) < 2:
-                        break     # keep the newest result; server decides
-                    drop = idxs[0]
-                    pair = drop - 1 if drop and new_messages[drop - 1]["role"] == "assistant" else None
-                    kill = {drop} | ({pair} if pair is not None else set())
-                    new_messages = [m for k, m in enumerate(new_messages) if k not in kill]
-                if len(new_messages) != len(messages):
-                    print(f"[prompt was ~{total:,} tokens for a "
-                          f"{self.cfg.context_tokens:,}-token window; dropped "
-                          f"older tool results before sending]", file=sys.stderr)
-                    messages = new_messages
+            # Fit the REPLY to the window: llama.cpp/LM Studio reject requests
+            # whose prompt + max_tokens exceed it. Only max_tokens moves.
+            window = self.cfg.context_tokens
+            if window > 0 and not _is_remote(self.cfg.base_url):
+                total = estimate_messages(messages, self.estimate_tokens)
+                fit = window - total - 32
+                if fit < max_tokens and fit >= 256:
+                    print(f"[prompt ~{total:,} tokens in a {window:,}-token "
+                          f"window; lowering the reply budget "
+                          f"{max_tokens:,} -> {fit:,}]", file=sys.stderr)
+                    max_tokens = fit
             try:
                 text = self._chat_once(messages, max_tokens, schema, stream,
                                        disable_thinking)
             except ContextOverflowError as e:
                 # The server's window is smaller than our budgets assumed
-                # (stock LM Studio 8192 / Ollama 4096). Shed stale middle
-                # history first, then halve the reply budget, then fail.
+                # (stock LM Studio 8192 / Ollama 4096). Halve the reply budget
+                # first (no history rewrite), then shed stale middle history,
+                # then fail.
+                if not shrunk_once and max_tokens > 256:
+                    shrunk_once = True
+                    max_tokens = max(256, max_tokens // 2)
+                    print("[server context overflow; halving the reply "
+                          "budget and retrying once]", file=sys.stderr)
+                    continue
                 if not trimmed_once:
                     body_idx = [i for i, m in enumerate(messages)
                                 if m["role"] == "user"
@@ -684,15 +883,6 @@ class LLMClient:
                             print("[server context overflow: shortened the "
                                   "conversation and retrying]", file=sys.stderr)
                             continue
-                if not shrunk_once and max_tokens > 256:
-                    # Our token estimate was optimistic (code is denser than
-                    # prose). Halve the reply budget; the step schema puts the
-                    # action first, so a shorter reply loses only `reasoning`.
-                    shrunk_once = True
-                    max_tokens = max(256, max_tokens // 2)
-                    print("[server context overflow again; halving the reply "
-                          "budget and retrying once]", file=sys.stderr)
-                    continue
                 raise LLMError(
                     f"{e}\n\n"
                     "Pedacito already trimmed the conversation once and the "
@@ -710,7 +900,8 @@ class LLMClient:
                     "    plans smaller prompts from the start.") from e
             except TemplateError as e:
                 # Most likely no system role: fold it into the first user turn
-                # and remember that.
+                # and remember that. (warmup() resolves this before the first
+                # real turn, so a mid-run flip is the rare case.)
                 if any(m["role"] == "system" for m in messages):
                     if not self._no_system_role:
                         print(f"['{self.cfg.model}' has no system role; folding "
@@ -726,6 +917,23 @@ class LLMClient:
                     "Gemma and Qwen templates are\nmore permissive than "
                     "Mistral's.") from e
             except _Transient as e:
+                if e.rate_limited:
+                    # A provider asking us to slow down is not a model load:
+                    # own budget, honour Retry-After, add jitter.
+                    rate_waits += 1
+                    if rate_waits > _MAX_RATE_LIMIT_RETRIES:
+                        raise LLMError(
+                            f"The server kept rate-limiting requests "
+                            f"({_MAX_RATE_LIMIT_RETRIES} retries). Last "
+                            f"response: {e}") from e
+                    wait = e.retry_after if e.retry_after is not None \
+                        else min(2.0 * 2 ** (rate_waits - 1), 30.0)
+                    wait += random.uniform(0, 0.25 * max(wait, 1.0))
+                    print(f"[rate limited by the server; waiting {wait:.0f}s "
+                          f"({rate_waits}/{_MAX_RATE_LIMIT_RETRIES})]",
+                          file=sys.stderr)
+                    time.sleep(wait)
+                    continue
                 waited = time.time() - started
                 if waited >= self.cfg.load_wait_seconds:
                     raise LLMError(
@@ -742,7 +950,7 @@ class LLMClient:
                     announced = True
                 elif attempt % 5 == 0:
                     print(f"[still waiting, {waited:.0f}s elapsed]", file=sys.stderr)
-                time.sleep(delay)
+                time.sleep(delay + random.uniform(0, 0.5))
                 delay = min(delay * 1.6, 10.0)
                 continue
 
@@ -771,11 +979,79 @@ class LLMClient:
                   f"retrying{how}]", file=sys.stderr)
             time.sleep(1.0)
 
+    def _check_budget(self) -> None:
+        """Raise BudgetExceeded before a call when a configured token/cost
+        budget is already spent."""
+        cap_tokens = int(getattr(self.cfg, "max_total_tokens", 0) or 0)
+        used = self.stats["prompt_tokens"] + self.stats["completion_tokens"]
+        if cap_tokens and used >= cap_tokens:
+            raise BudgetExceeded(
+                f"Token budget spent: {used:,} of max_total_tokens="
+                f"{cap_tokens:,}. Raise it (or pass --max-tokens-budget) to "
+                "continue; progress so far is saved.")
+        cap_cost = float(getattr(self.cfg, "max_cost", 0) or 0)
+        if cap_cost and self.stats["cost"] >= cap_cost:
+            raise BudgetExceeded(
+                f"Cost budget spent: ${self.stats['cost']:.4f} of max_cost="
+                f"${cap_cost:.2f}. Raise it (or pass --max-cost) to continue.")
+
+    def _account(self, usage: dict, timings: dict | None, seconds: float,
+                 prompt_est: int, out_text: str = "") -> dict:
+        """Fold one response's usage into the stats; returns the call record
+        handed to `on_call`."""
+        usage = usage or {}
+        pt = int(usage.get("prompt_tokens") or 0)
+        ct = int(usage.get("completion_tokens") or 0)
+        if not pt and not ct:
+            # The server reported nothing: keep estimates so budgets and the
+            # per-task summary still mean something.
+            pt = prompt_est
+            ct = self.estimate_tokens(out_text) if out_text else 0
+        details = usage.get("prompt_tokens_details") or {}
+        cached = int(details.get("cached_tokens") or 0) if isinstance(
+            details, dict) else 0
+        cached = cached or int(usage.get("prompt_cache_hit_tokens") or 0) \
+            or int((timings or {}).get("cache_n") or 0)
+        cost = 0.0
+        p_in = float(getattr(self.cfg, "price_input_per_mtok", 0) or 0)
+        p_out = float(getattr(self.cfg, "price_output_per_mtok", 0) or 0)
+        p_cached = float(getattr(self.cfg, "price_cached_per_mtok", 0) or 0)
+        if p_in or p_out:
+            fresh = max(0, pt - cached)
+            cost = (fresh * p_in + cached * (p_cached or p_in)
+                    + ct * p_out) / 1_000_000
+        site = self.site or "call"
+        with self._stats_lock:      # summaries may run on several threads
+            self.stats["prompt_tokens"] += pt
+            self.stats["completion_tokens"] += ct
+            self.stats["cached_tokens"] += cached
+            self.stats["seconds"] += seconds
+            self.stats["cost"] += cost
+            row = self.stats["by_site"].setdefault(
+                site, {"calls": 0, "prompt_tokens": 0, "completion_tokens": 0,
+                       "cached_tokens": 0})
+            row["calls"] += 1
+            row["prompt_tokens"] += pt
+            row["completion_tokens"] += ct
+            row["cached_tokens"] += cached
+        record = {"site": site, "prompt_tokens": pt, "completion_tokens": ct,
+                  "cached_tokens": cached, "seconds": round(seconds, 3),
+                  "cost": round(cost, 6), "model": self.cfg.model,
+                  "finish": self.last_finish_reason}
+        cb = self.on_call
+        if cb is not None:
+            try:
+                cb(record)
+            except Exception:
+                pass          # telemetry must never break a call
+        return record
+
     def _chat_once(self, messages: list[dict], max_tokens: int,
                    schema: dict | None = None, stream: bool = False,
                    disable_thinking: bool | None = None) -> str:
         """One HTTP request (no retry logic); returns the response text,
-        buffered or streamed to stdout."""
+        buffered or streamed (to `stream_callback`, else stdout)."""
+        self._check_budget()
         msgs = [dict(m) for m in messages]
         if self.cfg.thinking_suffix and msgs:
             msgs[-1]["content"] += "\n\n" + self.cfg.thinking_suffix
@@ -790,7 +1066,9 @@ class LLMClient:
         payload = {
             "model": self.cfg.model,
             "messages": msgs,
-            "temperature": self.cfg.temperature,
+            "temperature": (self._temp_override
+                            if self._temp_override is not None
+                            else self.cfg.temperature),
             "max_tokens": max_tokens,
             "stream": stream,
         }
@@ -800,9 +1078,10 @@ class LLMClient:
         if cap and max_tokens > cap:
             payload["max_tokens"] = cap
         # Sampler parameters are merged verbatim (an unsupported one 400s the
-        # request); structural keys are skipped.
+        # request); structural keys (output cap, grammar, tools, streaming)
+        # are protected so a sampler table cannot defeat them.
         for k, v in (self.cfg.sampler or {}).items():
-            if k in ("model", "messages", "stream"):
+            if k in _PROTECTED_SAMPLER_KEYS:
                 continue
             payload[k] = v
         # Thinking-off fields are only sent to local servers: a strict hosted
@@ -812,8 +1091,16 @@ class LLMClient:
             # Two spellings: llama.cpp/LM Studio templates read
             # chat_template_kwargs.enable_thinking, Ollama's OpenAI endpoint
             # reads the flat `think`. Servers ignore the one they don't know.
-            payload["chat_template_kwargs"] = {"enable_thinking": False}
+            kwargs = dict(payload.get("chat_template_kwargs") or {}) \
+                if isinstance(payload.get("chat_template_kwargs"), dict) else {}
+            kwargs["enable_thinking"] = False
+            payload["chat_template_kwargs"] = kwargs
             payload["think"] = False
+        if stream and self._stream_usage_ok is not False \
+                and getattr(self.cfg, "stream_usage", True):
+            # Without this, a streamed reply (the whole answer phase) reports
+            # no usage at all and its cost/cache-hit data is lost.
+            payload["stream_options"] = {"include_usage": True}
         if schema is not None:
             if self.cfg.json_mode == "object":
                 payload["response_format"] = {"type": "json_object"}
@@ -824,97 +1111,173 @@ class LLMClient:
                 # hosted APIs 400 on it or answer in prose.
                 if self._schema_supported is False:
                     fields = ", ".join(schema.get("properties", {}).keys())
-                    msgs[-1]["content"] += (
-                        "\n\nReply with one JSON object only, no prose. "
-                        f"Fields: {fields}.\nExample of a well-formed reply:\n"
-                        + _schema_example(schema))
+                    shots = self.fewshot if "action" in (
+                        schema.get("properties") or {}) else []
+                    if shots:
+                        examples = "\n".join(
+                            schema_example_with(schema, **s) for s in shots)
+                        msgs[-1]["content"] += (
+                            "\n\nReply with one JSON object only, no prose. "
+                            f"Fields: {fields}.\nWorked examples (for THIS "
+                            f"project; choose what the task needs):\n"
+                            + examples)
+                    else:
+                        msgs[-1]["content"] += (
+                            "\n\nReply with one JSON object only, no prose. "
+                            f"Fields: {fields}.\nExample of a well-formed "
+                            "reply:\n" + _schema_example(schema))
                 else:
                     payload["response_format"] = {
                         "type": "json_schema",
                         "json_schema": {"name": "step", "strict": True, "schema": schema},
                     }
+        key = getattr(self.cfg, "prompt_cache_key", "")
+        if key and _is_remote(self.cfg.base_url):
+            payload["prompt_cache_key"] = key
 
+        prompt_est = estimate_messages(msgs, self.estimate_tokens)
         t0 = time.time()
         self.stats["calls"] += 1
         # Cleared per attempt so a stale "length" from an abandoned attempt
         # cannot trigger apply()'s continuation loop.
         self.stream_truncated = False
+        self.partial_text = ""
+        if stream:
+            self._cancel.clear()
 
         if not stream:
             r = self._post(payload)
-            data = r.json()
+            try:
+                data = r.json()
+            finally:
+                _close(r)
             try:
                 self.last_finish_reason = data["choices"][0].get("finish_reason") or ""
-            except (KeyError, IndexError):
+            except (KeyError, IndexError, AttributeError, TypeError):
                 self.last_finish_reason = ""
-            usage = data.get("usage") or {}
-            self.stats["prompt_tokens"] += usage.get("prompt_tokens", 0)
-            self.stats["completion_tokens"] += usage.get("completion_tokens", 0)
-            self.stats["seconds"] += time.time() - t0
             try:
-                return extract_content(data["choices"][0]["message"])
-            except (KeyError, IndexError) as e:
+                text = extract_content(data["choices"][0]["message"])
+            except (KeyError, IndexError, TypeError) as e:
                 raise LLMError(f"Unexpected response shape: {json.dumps(data)[:500]}") from e
+            self._account(data.get("usage") or {}, data.get("timings"),
+                          time.time() - t0, prompt_est, text)
+            return text
 
         # Streaming, so the user sees progress at local-model speeds.
-        out = []
+        out: list[str] = []
         tool_opens = 0
         probe_tail = ""
         reasoning_chars = 0
+        usage: dict = {}
+        timings: dict | None = None
         # Per-attempt diagnostics for chat()'s empty-completion retry.
         self.last_finish_reason = ""
         self.last_reasoning_chars = 0
-        r = self._post(payload, stream=True)
-        for raw in r.iter_lines(decode_unicode=True):
-            if not raw:
-                continue
-            # requests only decodes when the response declares a charset, and
-            # text/event-stream often doesn't.
-            if isinstance(raw, bytes):
-                raw = raw.decode("utf-8", "replace")
-            if not raw.startswith("data: "):
-                continue
-            body = raw[6:]
-            if body.strip() == "[DONE]":
-                break
-            try:
-                chunk = json.loads(body)["choices"][0]
-                d = chunk.get("delta") or {}
-                fr = chunk.get("finish_reason") or ""
-            except Exception:
-                continue
-            if fr:
-                self.last_finish_reason = fr
-            if fr == "length":
-                self.stream_truncated = True
-            delta = d.get("content")
-            rc = d.get("reasoning_content") or d.get("reasoning")
-            if not delta and not rc:
-                continue
-            if rc:
-                reasoning_chars += len(rc)       # counted, never echoed
-            if delta:
-                out.append(delta)
-                sys.stdout.write(delta)
-                sys.stdout.flush()
-                # Degenerate native-tool-call loop guard; the 4-char overlap
-                # catches an opening tag split across chunks.
-                probe = probe_tail + delta
-                tool_opens += len(_NATIVE_TOOL_OPEN_RE.findall(probe))
-                probe_tail = probe[-4:]
-                if tool_opens >= _MAX_STREAM_TOOL_OPENS:
-                    print("\n[stopped the reply: the model is repeating "
-                          "tool-call syntax instead of answering; no tools "
-                          "can run in this phase]", file=sys.stderr)
-                    try:
-                        r.close()
-                    except Exception:
-                        pass
+        try:
+            r = self._post(payload, stream=True)
+        except LLMError as e:
+            low = str(e).lower()
+            if "stream_options" in payload and (
+                    "stream_options" in low or "include_usage" in low):
+                # An older server that rejects the usage option: remember and
+                # retry once without it.
+                self._stream_usage_ok = False
+                payload.pop("stream_options", None)
+                r = self._post(payload, stream=True)
+            else:
+                raise
+        sink = self.stream_callback
+        cancelled = False
+        dropped: Exception | None = None
+        try:
+            for raw in r.iter_lines(decode_unicode=True):
+                if self._cancel.is_set():
+                    cancelled = True
                     break
-        sys.stdout.write("\n")
-        self.stats["seconds"] += time.time() - t0
+                if not raw:
+                    continue
+                # requests only decodes when the response declares a charset,
+                # and text/event-stream often doesn't.
+                if isinstance(raw, bytes):
+                    raw = raw.decode("utf-8", "replace")
+                if raw.startswith(":"):
+                    continue                    # SSE comment / keep-alive
+                if raw.startswith("data:"):
+                    body = raw[5:].lstrip()
+                else:
+                    continue
+                if body.strip() == "[DONE]":
+                    break
+                try:
+                    obj = json.loads(body)
+                except Exception:
+                    continue
+                if isinstance(obj, dict) and obj.get("usage"):
+                    usage = obj["usage"]
+                if isinstance(obj, dict) and obj.get("timings"):
+                    timings = obj["timings"]
+                try:
+                    chunk = obj["choices"][0]
+                    d = chunk.get("delta") or {}
+                    fr = chunk.get("finish_reason") or ""
+                except Exception:
+                    continue
+                if fr:
+                    self.last_finish_reason = fr
+                if fr == "length":
+                    self.stream_truncated = True
+                delta = d.get("content")
+                rc = d.get("reasoning_content") or d.get("reasoning")
+                if not delta and not rc:
+                    continue
+                if rc:
+                    reasoning_chars += len(rc)       # counted, never echoed
+                if delta:
+                    out.append(delta)
+                    if sink is not None:
+                        try:
+                            sink(delta)
+                        except Exception:
+                            pass
+                    elif self.echo_stream:
+                        sys.stdout.write(delta)
+                        sys.stdout.flush()
+                    # Degenerate native-tool-call loop guard; the 4-char
+                    # overlap catches an opening tag split across chunks.
+                    probe = probe_tail + delta
+                    tool_opens += len(_NATIVE_TOOL_OPEN_RE.findall(probe))
+                    probe_tail = probe[-4:]
+                    if tool_opens >= _MAX_STREAM_TOOL_OPENS:
+                        print("\n[stopped the reply: the model is repeating "
+                              "tool-call syntax instead of answering; no tools "
+                              "can run in this phase]", file=sys.stderr)
+                        break
+        except requests.exceptions.RequestException as e:
+            dropped = e
+        finally:
+            _close(r)
+        if sink is None and self.echo_stream:
+            sys.stdout.write("\n")
         self.last_reasoning_chars = reasoning_chars
-        return strip_reasoning("".join(out))
+        text = strip_reasoning("".join(out))
+        self.partial_text = text
+        self._account(usage, timings, time.time() - t0, prompt_est, text)
+        if cancelled:
+            raise CancelledError("Cancelled by the user; the partial reply is "
+                                 "kept in client.partial_text.")
+        if dropped is not None:
+            if not text.strip():
+                raise LLMError(
+                    f"The connection to {self.cfg.base_url} dropped mid-reply "
+                    f"({type(dropped).__name__}: {str(dropped)[:160]}).") \
+                    from dropped
+            # Partial answer survives: flag it truncated so the existing
+            # continuation machinery asks for the rest instead of losing it.
+            self.stream_truncated = True
+            print(f"\n[connection dropped mid-reply "
+                  f"({type(dropped).__name__}); treating the reply as cut "
+                  f"off]", file=sys.stderr)
+        return text
 
     @staticmethod
     def _schema_has_big_fields(schema: dict | None) -> bool:
@@ -1419,7 +1782,12 @@ class LLMClient:
                     _save_mode_cache(self.cfg.base_url, self.cfg.model,
                                      self._schema_supported)
         t0 = time.time()
-        self.chat([{"role": "user", "content": "Reply with the single word: ok"}],
+        # Include a system message so a template without a system role (Gemma)
+        # is discovered HERE, before the first real turn -- a mid-run flip
+        # would rewrite the head of the conversation and break the server's
+        # prompt cache at the worst moment.
+        self.chat([{"role": "system", "content": "You are a terse assistant."},
+                   {"role": "user", "content": "Reply with the single word: ok"}],
                   max_tokens=5)
         took = time.time() - t0
         if took > 5:

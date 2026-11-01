@@ -65,8 +65,14 @@ def _index(tmp_path: Path, files: dict[str, str] | None = None) -> Index:
 def test_schema_hides_disabled_actions_and_fields():
     plain = tools.schema_for(Config())
     assert plain["properties"]["action"]["enum"] == [
-        "read", "grep", "find", "callers", "outline", "sessions", "todo",
-        "diff", "done"]
+        "read", "grep", "find", "callers", "context", "outline", "sessions",
+        "todo", "diff", "git", "remember", "skill", "done"]
+    # a tiny pack keeps the small core (+ context) and never sees the rest
+    tiny = Config()
+    tiny.prompt_pack = "tiny"
+    assert tools.schema_for(tiny)["properties"]["action"]["enum"] == [
+        "read", "grep", "find", "callers", "context", "outline", "sessions",
+        "todo", "diff", "done"]
     # `content` stays because the always-available todo action uses it.
     assert "content" in plain["properties"]
     assert "to" not in plain["properties"]
@@ -1098,6 +1104,7 @@ def test_gather_stops_when_the_model_repeats_a_failing_read(tmp_path):
     idx = _index(tmp_path)
     cfg = Config()
     cfg.max_gathered_chars = 100_000
+    cfg.stuck_recovery = False
 
     class Stuck:
         step_truncated = False
@@ -1121,6 +1128,7 @@ def test_gather_stops_after_consecutive_different_errors(tmp_path):
     idx = _index(tmp_path)
     cfg = Config()
     cfg.max_gathered_chars = 100_000
+    cfg.stuck_recovery = False
 
     class Failing:
         step_truncated = False

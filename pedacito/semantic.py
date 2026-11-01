@@ -117,9 +117,16 @@ def _ensure(index, cfg, client, verbose: bool = False
     if key in _DISABLED:
         raise LLMError(_DISABLED[key])
     vectors = _load_cache(index.root, model)
-    units = [c for c in index.chunks
-             if c.kind != "module" and c.sha and (c.source or "").strip()]
-    missing = [c for c in units if c.sha not in vectors]
+    # Source is hydrated lazily: only units with no cached vector are read.
+    missing = []
+    for c in index.chunks:
+        if c.kind == "module" or not c.sha or c.sha in vectors:
+            continue
+        hydrate = getattr(index, "hydrate", None)
+        if hydrate is not None:
+            hydrate(c)
+        if (c.source or "").strip():
+            missing.append(c)
     if not missing:
         return vectors, model
     if verbose:

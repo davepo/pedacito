@@ -37,12 +37,13 @@ import os
 import re
 import shlex
 import shutil
+import subprocess
 import sys
 import time
 from datetime import datetime
 from pathlib import Path, PureWindowsPath
 
-from . import browser, fileio, proc, sessions, vision
+from . import browser, fileio, proc, safety, sessions, vision
 
 TOOL_HELP = """\
 read     - read exact lines of a file.       args: file, start, end
@@ -53,7 +54,11 @@ grep     - regex or literal search. args: pattern, and optional file/dir/glob
 find     - search indexed definitions by name, signature, or summary.
            args: pattern (a fragment like 'retry' or 'Server.start'). Hits
            carry exact line ranges; no regex, no source-text guessing
-callers  - who calls a symbol, with the call sites. args: symbol
+callers  - who calls a symbol, with the call sites, plus the files and tests
+            a change to it can affect. args: symbol
+context  - one reply with a definition's source, its class header, the
+            signatures it calls, its callers and its tests. args: symbol
+            (or file, for a file's card, importers and tests)
 outline  - list every unit in one file, or the file cards in one directory.
            args: file (a path, a symbol, or a directory/glob)
 sessions - list/search what prior runs did.  args: pattern, optional file
@@ -61,8 +66,22 @@ diff     - what changed since Pedacito's last snapshot. args: optional file
 diagnose - run the project's detected linter/typechecker. args: optional file
 todo     - replace the task checklist shown in later prompts. args: content
            (one "- [ ]" / "- [x]" line per step; keep it short)
+question - ask the USER one short clarifying question (interactive sessions
+           only; use when the task is genuinely ambiguous). args: content
+           (the question, with 2-3 numbered options if possible)
+git      - read-only git: status, diff [path], log [-n N] [path], show REV,
+           blame PATH. args: pattern (e.g. "log -n 5 src/app.py")
+remember - save ONE durable fact about this project for future runs.
+           args: content (a build command, a convention, a trap)
+skill    - load a named procedure from the skills list. args: symbol
+task     - hand a bounded read-only research question to a helper agent
+           with a fresh window; returns a short digest. args: content
+fetch    - URL to readable text (external, untrusted). args: pattern (URL)
 mcp      - call an external MCP tool (opt-in). args: symbol (server/tool or
            "server" to list), content (JSON arguments object)
+rename   - mechanically rename ONE definition and its references in the
+           files that import it (refuses ambiguous names). args: symbol (old
+           name), to (new name)
 write    - overwrite a whole file with text. args: file, content
 append   - add text to the END of a file.    args: file, content
 move     - rename/move one file.             args: file (old), to (new)
@@ -92,9 +111,12 @@ STEP_SCHEMA = {
     "properties": {
         "action": {
             "type": "string",
-            "enum": ["read", "grep", "find", "callers", "outline", "sessions",
-                     "diff", "diagnose", "write", "append", "move", "delete",
-                     "run", "screenshot", "browser", "todo", "mcp", "done"],
+            "enum": ["read", "grep", "find", "callers", "context", "outline",
+                     "sessions", "diff", "git", "diagnose", "write", "append",
+                     "move", "delete", "rename", "run", "screenshot", "browser",
+                     "todo",
+                     "remember", "skill", "task", "fetch", "question", "mcp",
+                     "done"],
         },
         "file": {"type": "string",
                  "description": "For read/write/append/move/delete. For "
@@ -111,7 +133,8 @@ STEP_SCHEMA = {
         "pattern": {"type": "string",
                     "description": "For grep: regex, or plain text if it is not "
                                    "valid regex. For find: a name/signature/"
-                                   "summary fragment. For browser: optional "
+                                   "summary fragment. For git: the git "
+                                   "arguments. For fetch: the URL. For browser: optional "
                                    "actions like 'press Enter; click #start; wait 2; "
                                    "eval <js>' -- eval goes LAST and consumes "
                                    "the rest (semicolons allowed inside); its "
@@ -124,13 +147,15 @@ STEP_SCHEMA = {
                     # refuses to dispatch a payload arriving at exactly its cap.
                     "maxLength": 2000},
         "symbol": {"type": "string",
-                   "description": "For callers; or for read when file is empty "
-                                  "(reads that definition). For mcp: "
+                   "description": "For callers/context/rename (old name); or for read when file "
+                                  "is empty (reads that definition). For "
+                                  "skill: the skill name. For mcp: "
                                   "server/tool, or server to list its tools. "
                                   "Empty otherwise.",
                    "maxLength": 200},
         "to": {"type": "string",
-               "description": "For move: the new path. Empty otherwise.",
+               "description": "For move: the new path. For rename: the new "
+                                "name. Empty otherwise.",
                "maxLength": 200},
         "command": {"type": "string",
                     "description": "For run/screenshot: executable and "
@@ -142,8 +167,10 @@ STEP_SCHEMA = {
                     "description": "For write/append: at most ~120 lines of file "
                                    "text (large files are built chunk by chunk over "
                                    "several steps). For todo: the full checklist, "
-                                   "one '- [ ]'/'- [x]' line per step. For mcp: "
-                                   "a JSON object of tool arguments. Empty otherwise.",
+                                   "one '- [ ]'/'- [x]' line per step. For "
+                                   "remember: the fact. For task: the question. "
+                                   "For mcp: a JSON object of tool arguments. "
+                                   "Empty otherwise.",
                     "maxLength": 6000},
         "reasoning": {
             "type": "string",
@@ -178,21 +205,50 @@ WRITE_ACTIONS = (WRITE_ACTION, APPEND_ACTION)
 MUTATING_ACTIONS = WRITE_ACTIONS + (MOVE_ACTION, DELETE_ACTION)
 
 
+def _skills_exist(cfg) -> bool:
+    if not getattr(cfg, "use_skills", True):
+        return False
+    root = getattr(cfg, "_root", None)
+    if not root:
+        return True            # bundled starters are always there
+    from . import skills
+    return bool(skills.names(root, cfg))
+
+
 def schema_for(cfg) -> dict:
     """Return STEP_SCHEMA narrowed to the actions this run allows, so the
     model cannot pick a disabled action. Fields only a disabled action uses
-    (`to`, `command`) are dropped too."""
-    actions = ["read", "grep", "find", "callers", "outline", "sessions", "todo"]
+    (`to`, `command`) are dropped too. A tiny pack keeps the small core plus
+    `context`: a 4B model never sees two dozen tools."""
+    from .prompts import pack_for
+    pack = pack_for(cfg)
+    tiny = pack == "tiny"
+    actions = ["read", "grep", "find", "callers"]
+    actions.append("context")
+    actions += ["outline", "sessions", "todo"]
     if getattr(cfg, "allow_diff", True):
         actions.append("diff")
+    if getattr(cfg, "allow_git", True) and not tiny \
+            and getattr(cfg, "_is_git", True):
+        actions.append("git")
     if getattr(cfg, "allow_shell", False):
         actions += ["run", "diagnose"]
     if getattr(cfg, "allow_write", False):
-        actions += ["write", "append", "move", "delete"]
+        actions += ["write", "append", "move", "delete", "rename"]
     if getattr(cfg, "allow_screenshots", False):
         actions.append("screenshot")
     if getattr(cfg, "allow_browser", False):
         actions.append("browser")
+    if getattr(cfg, "use_memory", True) and not tiny:
+        actions.append("remember")
+    if pack == "full" and _skills_exist(cfg):
+        actions.append("skill")
+    if getattr(cfg, "allow_subagents", False) and not tiny:
+        actions.append("task")
+    if getattr(cfg, "allow_fetch", False) and not tiny:
+        actions.append("fetch")
+    if getattr(cfg, "_interactive", False):
+        actions.append("question")
     if getattr(cfg, "allow_mcp", False):
         actions.append("mcp")
     actions.append("done")
@@ -361,15 +417,15 @@ def _grep_scope(index, scope: str) -> tuple[list[str], str]:
     one = index.resolve_file(s)
     if one:
         return [one], ""
-    low = s.lower().lstrip("./").rstrip("/")
+    low = fileio.path_key(s).rstrip("/")
     if any(ch in low for ch in "*?["):
         matches = [f for f in files
                    if fnmatch.fnmatch(f.lower(), low)
                    or fnmatch.fnmatch(Path(f).name.lower(), low)]
     else:
         matches = [f for f in files
-                   if f.lower().lstrip("./") == low
-                   or f.lower().lstrip("./").startswith(low + "/")]
+                   if fileio.path_key(f) == low
+                   or fileio.path_key(f).startswith(low + "/")]
     if matches:
         return matches, ""
     return files, (f"[note: '{scope}' matched no indexed file or directory; "
@@ -436,8 +492,62 @@ def _with_context(index, entries) -> list[str]:
     return out
 
 
+_REGEX_META_RE = re.compile(r"[.^$*+?{}\[\]\\|()]")
+
+
+def _literal_of(pattern: str, needle: str) -> str | None:
+    """The plain text a grep pattern means when it has no regex syntax (or was
+    escaped to literal text), else None. Literal patterns skip per-line regex
+    matching."""
+    if not _REGEX_META_RE.search(needle):
+        return needle
+    if needle == re.escape(pattern):
+        return pattern
+    return None
+
+
+def _rg_candidates(index, cfg, files: list[str], needle: str) -> list[str] | None:
+    """Narrow `files` to those ripgrep says contain a (case-insensitive)
+    match, in `files` order; None when rg is unavailable or rejects the
+    pattern (the Python scan then covers every file). rg only PRE-FILTERS: the
+    hits themselves still come from `_scan_grep`, so the output format and
+    symbol labels are identical with or without rg."""
+    if cfg is None or not getattr(cfg, "use_ripgrep", True) or len(files) < 40:
+        return None
+    exe = shutil.which("rg")
+    if not exe:
+        return None
+    keep: set[str] = set()
+    batch: list[str] = []
+    size = 0
+    batches: list[list[str]] = []
+    for f in files:
+        if size + len(f) > 20000 and batch:
+            batches.append(batch)
+            batch, size = [], 0
+        batch.append(f)
+        size += len(f) + 1
+    if batch:
+        batches.append(batch)
+    for b in batches:
+        try:
+            r = subprocess.run(
+                [exe, "--files-with-matches", "--ignore-case", "--no-config",
+                 "--no-messages", "--no-ignore", "--hidden", "-e", needle,
+                 "--", *b],
+                cwd=str(index.root), capture_output=True, timeout=15)
+        except (OSError, subprocess.SubprocessError):
+            return None
+        if r.returncode == 2 and not r.stdout:
+            return None                    # pattern rg cannot parse
+        keep.update(ln.strip() for ln in r.stdout.decode(
+            "utf-8", "replace").splitlines() if ln.strip())
+    return [f for f in files if f in keep]
+
+
 def _scan_grep(index, files: list[str], rx: re.Pattern, max_hits: int,
-               rx_ci: re.Pattern | None = None) -> tuple[list, list]:
+               rx_ci: re.Pattern | None = None,
+               lit: str | None = None) -> tuple[list, list]:
     """Search `files` with `rx`, collecting case-insensitive hits for `rx_ci`
     in the same pass.
 
@@ -447,6 +557,14 @@ def _scan_grep(index, files: list[str], rx: re.Pattern, max_hits: int,
     entries: list[tuple] = []
     ci_entries: list[tuple] = []
     per_file_cap = max(5, max_hits // 4)
+    if lit is not None:
+        lit_low = lit.lower()
+        cs_match = lambda line: lit in line           # noqa: E731
+        ci_match = (lambda line: lit_low in line.lower()) \
+            if rx_ci is not None else None            # noqa: E731
+    else:
+        cs_match = rx.search
+        ci_match = rx_ci.search if rx_ci is not None else None
     ci_done = False                  # ci list hit its global cap
     for rel in files:
         path = index.root / rel
@@ -460,7 +578,7 @@ def _scan_grep(index, files: list[str], rx: re.Pattern, max_hits: int,
         ci_file_hits = 0
         ci_note_added = False
         for i, line in enumerate(lines, 1):
-            if rx.search(line):
+            if cs_match(line):
                 if file_hits >= per_file_cap:
                     entries.append((rel, None,
                                     f"{rel}: [more matches in this file; "
@@ -473,7 +591,7 @@ def _scan_grep(index, files: list[str], rx: re.Pattern, max_hits: int,
                                     f"[stopped at {max_hits} hits; narrow "
                                     f"the pattern]"))
                     return entries, ci_entries
-            elif rx_ci is not None and not ci_done and rx_ci.search(line):
+            elif ci_match is not None and not ci_done and ci_match(line):
                 if ci_file_hits >= per_file_cap:
                     if not ci_note_added:
                         ci_entries.append((rel, None,
@@ -515,6 +633,25 @@ def _symbol_suggestions(index, pattern: str) -> str:
             + ", ".join(picks)
             + ". `read` one with `symbol` set, or see its uses with "
               "`callers`.]")
+
+
+def _bm25_suggestions(index, pattern: str) -> str:
+    """'Closest definitions by name/summary' for a grep that found nothing:
+    BM25 over the index, before any embeddings round-trip."""
+    p = (pattern or "").strip()
+    if len(p) < 3 or len(p) > 120:
+        return ""
+    try:
+        hits = index.bm25.query(p, limit=4, kinds=("function", "method",
+                                                   "class", "classheader"))
+    except Exception:
+        return ""
+    if not hits:
+        return ""
+    rows = "; ".join(f"{c.file}:{c.start}-{c.scope_end or c.end} {c.qualname}"
+                     for _s, c in hits)
+    return ("[no text matches, but these definitions match the words by name/"
+            f"summary: {rows}. `read` one before relying on it.]")
 
 
 def _fresh_index(index, cfg, rel: str):
@@ -635,14 +772,17 @@ def tool_read(index, cfg, file: str, start: int, end: int,
         note = f"\n[truncated to {max_lines} lines; read again from {end + 1} if needed]"
     else:
         note = ""
-    # Mid-file reads: surface the enclosing signature and module imports.
+    # Mid-file reads: surface the enclosing signature and module imports. A
+    # symbol read already names its definition, but a METHOD still gets its
+    # owner's header: `read symbol=Class.method` must not lose the class.
     context = ""
-    if not symbol_note and start > 1 and getattr(cfg, "read_context_hint", True):
+    if start > 1 and getattr(cfg, "read_context_hint", True):
         chunks = index.in_file(rel)
         for c in chunks:
             if c.start <= start <= c.end:
                 bits = []
-                if c.kind in ("function", "method", "class", "classheader") \
+                if not symbol_note and c.kind in (
+                        "function", "method", "class", "classheader") \
                         and c.signature:
                     bits.append(c.signature)
                 # A method's signature alone lacks its class context; show
@@ -656,10 +796,11 @@ def tool_read(index, cfg, file: str, start: int, end: int,
                                 and k.signature:
                             bits.append("in " + k.signature)
                             break
-                imports = sorted({i.split(".")[0].lstrip(".")
-                                  for i in c.imports})
-                if imports:
-                    bits.append("module imports: " + ", ".join(imports[:10]))
+                if not symbol_note:
+                    imports = sorted({i.split(".")[0].lstrip(".")
+                                      for i in c.imports})
+                    if imports:
+                        bits.append("module imports: " + ", ".join(imports[:10]))
                 if bits:
                     context = "\n[context: " + "; ".join(bits) + "]"
                 break
@@ -815,7 +956,12 @@ def tool_grep(index, pattern: str, scope: str = "", cfg=None,
             rx_ci = re.compile(needle, re.IGNORECASE)
         except re.error:
             rx_ci = None
-    entries, ci_entries = _scan_grep(index, files, rx, max_hits, rx_ci)
+    lit = _literal_of(pattern, needle)
+    scan_files = files
+    narrowed = _rg_candidates(index, cfg, files, needle)
+    if narrowed is not None:
+        scan_files = narrowed
+    entries, ci_entries = _scan_grep(index, scan_files, rx, max_hits, rx_ci, lit)
     if not any(n is not None for _, n, _ in entries) \
             and any(n is not None for _, n, _ in ci_entries):
         entries = ci_entries
@@ -830,8 +976,17 @@ def tool_grep(index, pattern: str, scope: str = "", cfg=None,
     else:
         hits = [t for _, _, t in entries]
 
-    if not hits and client is not None and cfg is not None \
-            and getattr(cfg, "semantic_search", False):
+    suggestions: list[str] = []
+    if not hits:
+        # Cheapest first: similar symbol names and BM25 over names/summaries
+        # (zero model calls). Embeddings are the optional last resort.
+        for text in (_symbol_suggestions(index, pattern),
+                     _bm25_suggestions(index, pattern)):
+            if text:
+                suggestions.append(text)
+
+    if not hits and not suggestions and client is not None \
+            and cfg is not None and getattr(cfg, "semantic_search", False):
         # Last resort: find code by meaning.
         try:
             from . import semantic
@@ -848,9 +1003,7 @@ def tool_grep(index, pattern: str, scope: str = "", cfg=None,
                              "similarity threshold]")
 
     if not hits:
-        suggest = _symbol_suggestions(index, pattern)
-        if suggest:
-            notes.append(suggest)
+        notes.extend(suggestions)
 
     note_text = ("\n".join(notes) + "\n") if notes else ""
     if not hits:
@@ -910,7 +1063,9 @@ def tool_callers(index, symbol: str) -> str:
     if not symbol:
         return "ERROR: symbol is required."
     defs = index.find_symbol(symbol)
-    callers = [c for c in index.callers_of(symbol) if c not in defs]
+    sure, approx = index.callers_ranked(symbol, defs[0].file if defs else None)
+    callers = [c for c in sure if c not in defs]
+    approx = [c for c in approx if c not in defs]
     out: list[str] = []
     if defs:
         out.append("Defined at:")
@@ -928,7 +1083,15 @@ def tool_callers(index, symbol: str) -> str:
             out += _call_sites(index, c, base)
         if len(callers) > 20:
             out.append(f"  (+{len(callers) - 20} more callers)")
-    elif defs:
+    if approx and defs:
+        out.append("Same name, but the file neither is nor imports the "
+                   "definition's file (likely a different function -- "
+                   "name match only):")
+        for c in approx[:6]:
+            out.append(f"  {c.file}:{c.start}-{c.end}  {c.qualname}")
+        if len(approx) > 6:
+            out.append(f"  (+{len(approx) - 6} more)")
+    if not callers and defs:
         out.append(f"No callers of '{symbol}' found in the indexed files.")
         importers = index.importers_of(defs[0].file)
         if importers:
@@ -936,9 +1099,112 @@ def tool_callers(index, symbol: str) -> str:
             out += [f"  {f}" for f in importers[:12]]
             if len(importers) > 12:
                 out.append(f"  (+{len(importers) - 12} more)")
-    else:
+    if not defs and not callers:
         return _symbol_hint(index, symbol)
+    if defs:
+        out += _impact_lines(index, defs[0].file)
     return "\n".join(out)
+
+
+def _impact_lines(index, rel: str, depth: int = 2, limit: int = 8) -> list[str]:
+    """`Likely affected` files (transitive importers/callers) and tests for a
+    change to `rel`: blast radius in four lines, marked as evidence."""
+    try:
+        reach = index.graph.impact(rel, depth)
+        if not reach:
+            return []
+        from . import testsel
+        out = ["Likely affected by a change to this file (imports/calls, "
+               f"depth {depth}; evidence, not proof):"]
+        ordered = sorted(reach.items(), key=lambda kv: (kv[1], kv[0]))
+        out.append("  " + ", ".join(f"{f} (hop {h})" for f, h in ordered[:limit])
+                   + (f", +{len(ordered) - limit} more" if len(ordered) > limit
+                      else ""))
+        picked = testsel.impacted_tests(index, [rel], limit=5)
+        if picked:
+            out.append("Likely affected tests: "
+                       + ", ".join(t for t, _w in picked))
+        return out
+    except Exception:
+        return []
+
+
+def tool_context(index, cfg, symbol: str = "", file: str = "") -> str:
+    """One bundled observation for a definition (or a file): the definition's
+    numbered source -- a normal `read` result, so the lines are quotable --
+    followed by its class header, the signatures it calls, its callers with
+    call sites, importers, linked tests, and the likely blast radius. Replaces
+    the usual read + outline + callers + tests-search exploration with one
+    step, within a fixed character budget."""
+    symbol = _as_text(symbol).strip()
+    file = _as_text(file).strip()
+    if not symbol and not file:
+        return ("ERROR: context needs a `symbol` (a function/class/method "
+                "name) or a `file`.")
+    budget = max(1500, min(6000, int(getattr(cfg, "max_read_lines", 200) or 200) * 25))
+    if not symbol:
+        rel = index.resolve_file(file) or adopt_if_on_disk(index, cfg, file)
+        if rel is None:
+            return _file_hint(index, file)
+        parts = [f"FILE CONTEXT {rel}", index.render_cards([rel])]
+        imp = index.importers_of(rel)
+        if imp:
+            parts.append("imported by: " + ", ".join(imp[:10])
+                         + (f", +{len(imp) - 10} more" if len(imp) > 10 else ""))
+        parts += _impact_lines(index, rel)
+        return "\n".join(parts)[:budget]
+
+    rel = index.resolve_file(file) if file else None
+    matches = _symbol_matches(index, symbol, rel)
+    if not matches:
+        return _symbol_hint(index, symbol)
+    if len(matches) > 1 and rel is None:
+        return _definition_list(symbol, matches)
+    c = matches[0]
+    end = c.scope_end or c.end
+    body = tool_read(index, cfg, c.file, c.start, end)
+    if body.startswith("ERROR"):
+        return body
+    rel = c.file
+    related: list[str] = []
+    chunks = index.in_file(rel)
+    if c.kind == "method" and "." in c.qualname:
+        owner = c.qualname.rsplit(".", 1)[0]
+        for k in chunks:
+            if k.qualname == owner and k.kind in ("class", "classheader") \
+                    and k.signature:
+                related.append(f"owner: {k.signature}  ({rel}:{k.start}-"
+                               f"{k.scope_end or k.end})")
+                break
+    callees = _indexed_callees(index, c, limit=8)
+    if callees:
+        related.append("calls (indexed definitions):")
+        related += callees
+    base = c.qualname.split("#")[0].split(".")[-1]
+    sure, approx = index.callers_ranked(base, rel)
+    callers = [k for k in sure if k is not c
+               and not (k.file == rel and k.qualname.split("#")[0] == c.qualname.split("#")[0])]
+    if callers:
+        related.append(f"called from ({len(callers)}):")
+        for k in callers[:6]:
+            related.append(f"  {k.file}:{k.start}-{k.end}  {k.qualname}")
+            related += _call_sites(index, k, base, limit=1)
+        if len(callers) > 6:
+            related.append(f"  (+{len(callers) - 6} more; `callers` lists all)")
+    else:
+        related.append("called from: nothing found in the indexed files")
+    if approx:
+        related.append(f"(+{len(approx)} same-name call(s) in files that do not "
+                       "import this one -- likely other functions; see "
+                       "`callers`)")
+    imp = index.importers_of(rel)
+    if imp:
+        related.append("file imported by: " + ", ".join(imp[:6])
+                       + (f", +{len(imp) - 6} more" if len(imp) > 6 else ""))
+    related += _impact_lines(index, rel, limit=6)
+    text = body + "\n--- related context (evidence; `read` before quoting) ---\n" \
+        + "\n".join(related)
+    return text if len(text) <= budget + 4000 else text[:budget + 4000] + "\n[context truncated]"
 
 
 # One line per hit; a broad pattern must not eat the whole gather budget.
@@ -948,7 +1214,9 @@ FIND_MAX_HITS = 40
 def tool_find(index, pattern: str) -> str:
     """Search indexed definitions by name, signature, or summary: navigation
     by concept, where grep needs the exact source spelling. Case-insensitive
-    substring; name hits rank above signature hits above summary hits."""
+    substring hits come first (name above signature above summary); the
+    remaining slots are filled by BM25 over the same fields, so a multi-word
+    concept ('retry backoff') finds `retry_with_delay` too."""
     raw = _as_text(pattern).strip()
     q = raw.lower()
     if not q:
@@ -972,21 +1240,48 @@ def tool_find(index, pattern: str) -> str:
         else:
             continue
         scored.append((rank, c.file, c.start, c))
-    if not scored:
-        names = sorted({c.qualname for c in index.chunks
-                        if c.qualname not in ("module", "__trailing__")})
-        close = difflib.get_close_matches(raw, names, n=5, cutoff=0.5)
-        hint = f" Did you mean: {', '.join(close)}?" if close else ""
-        return (f"No definition matches '{raw}'.{hint} Try a shorter name "
-                "fragment, or `grep` for the text itself.")
     scored.sort(key=lambda t: (t[0], t[1], t[2]))
+    return _render_find(index, raw, scored)
+
+
+def _bm25_extra(index, raw: str, have: set, limit: int) -> list:
+    """BM25 hits (name > signature > summary, multi-word, stemmed) for units
+    the substring tiers did not already return."""
+    try:
+        hits = index.bm25.query(raw, limit=limit * 2,
+                                kinds=("function", "method", "class",
+                                       "classheader"))
+    except Exception:
+        return []
+    return [(4, c.file, c.start, c) for _sc, c in hits if id(c) not in have][:limit]
+
+
+def _find_miss(index, raw: str) -> str:
+    names = sorted({c.qualname for c in index.chunks
+                    if c.qualname not in ("module", "__trailing__")})
+    close = difflib.get_close_matches(raw, names, n=5, cutoff=0.5)
+    hint = f" Did you mean: {', '.join(close)}?" if close else ""
+    return (f"No definition matches '{raw}'.{hint} Try a shorter name "
+            "fragment, or `grep` for the text itself.")
+
+
+def _render_find(index, raw: str, scored: list) -> str:
+    have = {id(t[3]) for t in scored}
+    if len(scored) < FIND_MAX_HITS:
+        scored = scored + _bm25_extra(index, raw, have, FIND_MAX_HITS - len(scored))
+    if not scored:
+        return _find_miss(index, raw)
     out = [f"{len(scored)} definition(s) matching '{raw}' -- line ranges are "
            "exact; `read` them directly:"]
-    for _rank, rel, _start, c in scored[:FIND_MAX_HITS]:
+    for rank, rel, _start, c in scored[:FIND_MAX_HITS]:
         sig = (c.signature or c.qualname)[:100]
         note = f" -- {c.summary}" if c.summary else ""
         end = c.scope_end or c.end    # a classheader stands for its class
-        out.append(f"  {rel}:{c.start}-{end} [{c.kind}] {sig}{note}")
+        why = ""
+        if rank == 4:
+            terms = index.bm25.matched_terms(c, raw)
+            why = f"  (matches: {', '.join(terms[:3])})" if terms else ""
+        out.append(f"  {rel}:{c.start}-{end} [{c.kind}] {sig}{note}{why}")
     if len(scored) > FIND_MAX_HITS:
         out.append(f"  (+{len(scored) - FIND_MAX_HITS} more; narrow the pattern)")
     return "\n".join(out)
@@ -1279,6 +1574,13 @@ def _syntax_note(path: Path, text: str) -> str:
             "reliably.]")
 
 
+def _protected_error(cfg, rel: str, verb: str) -> str:
+    """ERROR observation when `rel` is a path the model may never write
+    (.git/, .pedacito/, the plan file, protected_paths), else ''."""
+    why = safety.is_protected(rel, cfg)
+    return f"ERROR: {verb} refused: {why}." if why else ""
+
+
 def _task_allowlist_error(index, cfg, rel: str, verb: str) -> str:
     """ERROR observation when the opt-in task write allowlist (cfg.auto_
     allowlist) refuses modifying an EXISTING file, else ''. A file is allowed
@@ -1289,10 +1591,10 @@ def _task_allowlist_error(index, cfg, rel: str, verb: str) -> str:
     reads = getattr(cfg, "_task_reads", None)
     if reads is None:
         return ""                  # no gather ever armed the ledger
-    allowed = {(p or "").strip().lower().lstrip("./")
+    allowed = {fileio.path_key(p)
                for p in (getattr(cfg, "_task_allowlist", None) or ())}
-    allowed |= {(p or "").strip().lower().lstrip("./") for p in reads}
-    if (rel or "").strip().lower().lstrip("./") in allowed:
+    allowed |= {fileio.path_key(p) for p in reads}
+    if fileio.path_key(rel) in allowed:
         return ""
     if not (Path(index.root).resolve() / rel).is_file():
         return ""                  # creation: always allowed
@@ -1336,7 +1638,8 @@ def tool_write(index, cfg, file: str, content: str,
         return f"ERROR: refusing to write outside the project root: {file}"
     if path.is_dir():
         return f"ERROR: {rel} is a directory, not a file."
-    err = _task_allowlist_error(index, cfg, rel, verb)
+    err = _protected_error(cfg, rel, verb) \
+        or _task_allowlist_error(index, cfg, rel, verb)
     if err:
         return err
 
@@ -1441,7 +1744,9 @@ def tool_move(index, cfg, file: str, to: str) -> str:
         return f"ERROR: refusing to move outside the project root: {file} -> {to}"
     if not src.is_file():
         return f"ERROR: {src_rel} is not an existing file."
-    err = _task_allowlist_error(index, cfg, src_rel, "move")
+    err = _protected_error(cfg, src_rel, "move") \
+        or _protected_error(cfg, dst_rel, "move") \
+        or _task_allowlist_error(index, cfg, src_rel, "move")
     if err:
         return err
     if dst.exists():
@@ -1494,7 +1799,8 @@ def tool_delete(index, cfg, file: str) -> str:
         return f"ERROR: refusing to delete outside the project root: {file}"
     if not path.is_file():
         return f"ERROR: {rel} is not an existing file."
-    err = _task_allowlist_error(index, cfg, rel, "delete")
+    err = _protected_error(cfg, rel, "delete") \
+        or _task_allowlist_error(index, cfg, rel, "delete")
     if err:
         return err
     try:
@@ -1525,8 +1831,22 @@ def _split_command(cmd: str) -> list[str]:
             else p for p in shlex.split(cmd, posix=False)]
 
 
+def _deny_error(cfg, argv: list[str]) -> str:
+    """Error when the command line matches a `shell_deny` pattern (fnmatch on
+    the whole line, case-insensitive), else ''."""
+    line = " ".join(argv).lower()
+    for pat in tuple(getattr(cfg, "shell_deny", ()) or ()):
+        if fnmatch.fnmatchcase(line, pat.lower()):
+            return (f"ERROR: `{' '.join(argv)[:80]}` matches the shell_deny "
+                    f"rule `{pat}`.")
+    return ""
+
+
 def _allowlist_error(cfg, argv: list[str]) -> str:
-    """Return an allowlist error for `argv`, or '' when it may run."""
+    """Return an allowlist/denylist error for `argv`, or '' when it may run."""
+    denied = _deny_error(cfg, argv)
+    if denied:
+        return denied
     allow = tuple(getattr(cfg, "shell_allowlist", ()) or ())
     if not allow:
         return ""
@@ -1579,7 +1899,7 @@ def tool_run(index, cfg, command: str) -> str:
     timeout = max(1, _as_int(getattr(cfg, "shell_timeout", 120), 120))
     idle = max(0, _as_int(getattr(cfg, "shell_idle_seconds", 10), 10))
     cap = max(200, _as_int(getattr(cfg, "max_shell_output_chars", 8000), 8000))
-    env = _child_env()
+    env = _child_env(cfg)
     rc, out, stopped, _elapsed = proc.run(
         argv, cwd=index.root, timeout=timeout, idle_timeout=idle,
         max_output=cap, env=env)
@@ -1632,10 +1952,10 @@ def tool_run(index, cfg, command: str) -> str:
     return f"{head}\nOUTPUT:\n{out}{tail}"
 
 
-def _child_env() -> dict:
-    """Environment for launched commands: no colour, no pagers."""
-    return dict(os.environ, NO_COLOR="1", TERM="dumb", PAGER="cat",
-                GIT_PAGER="cat")
+def _child_env(cfg=None) -> dict:
+    """Environment for launched commands: no colour, no pagers, and (unless
+    `scrub_env` is off) no ambient API keys or tokens."""
+    return safety.child_env(cfg)
 
 
 def _stop_process(p) -> None:
@@ -1729,7 +2049,7 @@ def tool_screenshot(index, cfg, client, command: str = "", file: str = "",
     out = out_dir / (datetime.now().strftime("%Y%m%d-%H%M%S-%f") + ".png")
     delay = start or _as_int(getattr(cfg, "screenshot_wait_seconds", 5), 5)
     delay = max(0, min(delay, 60))
-    env = _child_env()
+    env = _child_env(cfg)
 
     launched = None
     exit_code = None
@@ -1840,7 +2160,7 @@ def tool_browser(index, cfg, client, command: str = "", pattern: str = "",
         return f"ERROR: no screenshot named '{file}' under the project root."
 
     root = Path(index.root).resolve()
-    env = _child_env()
+    env = _child_env(cfg)
     server = None
     server_url = ""
     if re.match(r"^(?:https?://|localhost(?::\d+)?(?:/|$)|"
@@ -1881,6 +2201,22 @@ def tool_browser(index, cfg, client, command: str = "", pattern: str = "",
                     f"{wait}s, so there is no page to open.{hint}\n"
                     f"OUTPUT:\n{detail or '(no output)'}")
         server_url = url
+
+    # `eval` runs model-authored JavaScript inside the page: on a remote site
+    # that is an exfiltration channel, so it is limited to local hosts (or
+    # hosts the user listed in browser_eval_hosts).
+    if actions and any(k == "eval" for k, _a in browser.parse_actions(actions)):
+        from urllib.parse import urlparse
+        host = (urlparse(url).hostname or "").lower()
+        allowed = {h.lower() for h in
+                   (getattr(cfg, "browser_eval_hosts", ()) or ())}
+        if "*" not in allowed and host not in allowed:
+            if server is not None:
+                _stop_process(server)
+            return (f"ERROR: `eval` is only allowed on local pages "
+                    f"(browser_eval_hosts = {sorted(allowed)}); {host or url} "
+                    "is not one of them. Drop the eval and use click/type/"
+                    "press actions, or add the host to browser_eval_hosts.")
 
     out_dir = root / ".pedacito" / "screenshots"
     out = out_dir / ("browser-" + datetime.now().strftime("%Y%m%d-%H%M%S-%f")
@@ -1966,6 +2302,28 @@ def dispatch(index, cfg, step: dict, client=None) -> str:
         return tool_find(index, step.get("pattern", ""))
     if action == "callers":
         return tool_callers(index, step.get("symbol", ""))
+    if action == "context":
+        return tool_context(index, cfg, step.get("symbol", ""),
+                            step.get("file", ""))
+    if action == "git":
+        from . import gitinfo
+        return gitinfo.tool_git(index, cfg, step.get("pattern", ""))
+    if action == "remember":
+        from . import memory
+        return memory.tool_remember(index, cfg, step.get("content", ""))
+    if action == "skill":
+        from . import skills
+        return skills.tool_skill(index, cfg, step.get("symbol", ""))
+    if action == "task":
+        from . import subagent
+        return subagent.tool_task(index, cfg, client, step.get("content", ""))
+    if action == "question":
+        return ("ERROR: `question` is only available in an interactive "
+                "session. State the ambiguity in your answer and take the "
+                "safest reading.")
+    if action == "fetch":
+        from . import webfetch
+        return webfetch.tool_fetch(index, cfg, step.get("pattern", ""))
     if action == "outline":
         return tool_outline(index, cfg, step.get("file", ""))
     if action == "sessions":
@@ -1990,6 +2348,10 @@ def dispatch(index, cfg, step: dict, client=None) -> str:
         return tool_browser(index, cfg, client, step.get("command", ""),
                             step.get("pattern", ""), step.get("start", 0),
                             step.get("file", ""))
+    if action == "rename":
+        from . import refactor
+        return refactor.tool_rename(index, cfg, step.get("symbol", ""),
+                                    step.get("to", ""), step.get("file", ""))
     if action in MUTATING_ACTIONS:
         if not getattr(cfg, "allow_write", False):
             return (f"ERROR: `{action}` is disabled (config allow_write = false). "

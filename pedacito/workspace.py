@@ -139,9 +139,22 @@ def _add_to_gitignore(root: Path) -> None:
           f"{'y' if n == 1 else 'ies'} added)", file=sys.stderr)
 
 
-def new_backup_dir(root: Path, when: str | None = None) -> Path:
-    """Create and return a timestamped directory under .pedacito/backups/."""
-    d = state_dir(root, BACKUP_DIR, when or stamp())
+def new_backup_dir(root: Path, when: str | None = None,
+                   unique: bool = False) -> Path:
+    """Create and return a timestamped directory under .pedacito/backups/.
+
+    With `unique`, a directory that already holds a snapshot (two runs began
+    within the same second) is never reused: the new one gets a `-2`, `-3`
+    suffix, so one run's originals cannot merge into another's. Without it the
+    stamp's directory is shared on purpose -- every write of one run snapshots
+    into the same place, first copy wins."""
+    base = when or stamp()
+    d = state_dir(root, BACKUP_DIR, base)
+    if unique:
+        n = 2
+        while d.exists() and any(d.iterdir()):
+            d = state_dir(root, BACKUP_DIR, f"{base}-{n}")
+            n += 1
     d.mkdir(parents=True, exist_ok=True)
     return d
 
@@ -197,5 +210,104 @@ def write_session(root: Path, task: str, steps: list[str], reply: str,
         lines += ["", f"Originals saved to `{backup.relative_to(root)}`.",
                   f"Restore with `pedacito restore {root} --snapshot {backup.name}`."]
     p = d / f"{when}.md"
+    n = 2
+    while p.exists():             # two tasks in one second must not overwrite
+        p = d / f"{when}-{n}.md"
+        n += 1
     p.write_text("\n".join(lines) + "\n", encoding="utf-8")
     return p
+
+
+# ---------------------------------------------------------------- retention
+def prune(root: Path, keep_sessions: int = 0, keep_backups: int = 0,
+          keep_events: int = 0, log_max_bytes: int = 0,
+          dry_run: bool = False) -> dict[str, int]:
+    """Delete old sessions, backup snapshots and event files, keeping the
+    newest N of each (0 = leave that kind alone), and trim `log.txt` to its
+    last `log_max_bytes`. Returns how many of each were (or would be) removed.
+    Backups are the undo path: only the oldest beyond the limit go."""
+    import shutil
+    removed = {"sessions": 0, "backups": 0, "events": 0, "log_bytes": 0}
+    if keep_sessions > 0:
+        d = state_dir(root, SESSION_DIR)
+        files = sorted(d.glob("*.md"), reverse=True) if d.is_dir() else []
+        for p in files[keep_sessions:]:
+            removed["sessions"] += 1
+            if not dry_run:
+                p.unlink(missing_ok=True)
+    if keep_backups > 0:
+        for snap in list_backups(root)[keep_backups:]:
+            removed["backups"] += 1
+            if not dry_run:
+                shutil.rmtree(snap, ignore_errors=True)
+    if keep_events > 0:
+        d = state_dir(root, "events")
+        files = sorted(d.glob("*.jsonl"), reverse=True) if d.is_dir() else []
+        for p in files[keep_events:]:
+            removed["events"] += 1
+            if not dry_run:
+                p.unlink(missing_ok=True)
+    if log_max_bytes > 0:
+        lp = run_log_path(root)
+        try:
+            size = lp.stat().st_size
+        except OSError:
+            size = 0
+        if size > log_max_bytes:
+            removed["log_bytes"] = size - log_max_bytes
+            if not dry_run:
+                data = lp.read_bytes()[-log_max_bytes:]
+                nl = data.find(b"\n")
+                lp.write_bytes(data[nl + 1:] if nl >= 0 else data)
+    return removed
+
+
+class ProjectBusy(RuntimeError):
+    """Another live pedacito process is writing to this project."""
+
+
+def _pid_alive(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    try:
+        import os
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+    return True
+
+
+def acquire_lock(root) -> Path:
+    """Claim `<root>/.pedacito/run.lock` for this process. Two runs writing
+    the same tree would race on backups, the index and the plan file; a stale
+    lock (dead pid) is taken over. Raises ProjectBusy when the holder lives."""
+    import os
+    path = state_dir(Path(root)) / "run.lock"
+    try:
+        pid = int(path.read_text(encoding="utf-8").split()[0])
+    except (OSError, ValueError, IndexError):
+        pid = 0
+    if pid and pid != os.getpid() and _pid_alive(pid):
+        raise ProjectBusy(
+            f"another pedacito run (pid {pid}) is using this project; wait "
+            f"for it, or delete {path} if it is stale")
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(f"{os.getpid()}\n", encoding="utf-8")
+    except OSError:
+        pass
+    return path
+
+
+def release_lock(root) -> None:
+    import os
+    path = state_dir(Path(root)) / "run.lock"
+    try:
+        if int(path.read_text(encoding="utf-8").split()[0]) == os.getpid():
+            path.unlink()
+    except (OSError, ValueError, IndexError):
+        pass

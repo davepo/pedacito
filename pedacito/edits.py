@@ -41,7 +41,7 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 
-from . import fileio
+from . import fileio, safety
 from .chunker_ts import LANG_BY_EXT, TS_AVAILABLE, has_syntax_error
 
 # The `=======` separator must be a whole line, so a `/* ====` banner at the
@@ -153,6 +153,46 @@ def _strip_wrapping_fences(text: str) -> str:
         if k != -1:
             lines[k] = ""
     return "\n".join(lines)
+
+
+_HEADER_LINE_RE = re.compile(r"(?m)^[ \t]*-{3}\s*FILE:[ \t]*(?P<file>[^\n]*)$")
+_SEARCH_MARK_RE = re.compile(r"(?m)^[ \t]*<{5,}\s*SEARCH")
+_WRONG_HEADER_RE = re.compile(
+    r"(?im)^[ \t]*(?:\*{2})?(?:file|path)\s*[:=]\s*(?P<file>[^\n]+?)(?:\*{2})?\s*$"
+    r"|^[ \t]*#{2,4}\s+(?P<file2>[\w./\\-]+\.\w+)\s*$")
+
+
+def malformed_blocks(text: str, parsed: int) -> list[tuple[str, str]]:
+    """[(file, hint)] for blocks the model STARTED but that did not parse:
+    `<<<<<<< SEARCH` markers or `--- FILE:` headers with no complete block
+    behind them (a missing `=======` or `>>>>>>> REPLACE`, a wrong header
+    spelling). Without this they are silently dropped and the model never
+    learns its edit was ignored. `parsed` is the number of blocks that did
+    parse, so a clean reply returns []."""
+    text = text.replace("\r\n", "\n")
+    headers = _HEADER_LINE_RE.findall(text)
+    searches = len(_SEARCH_MARK_RE.findall(text))
+    started = max(len(headers), searches)
+    if started <= parsed:
+        return []
+    out: list[tuple[str, str]] = []
+    missing = started - parsed
+    if searches > len(headers):
+        hint = ("a `<<<<<<< SEARCH` block has no `--- FILE: path` header "
+                "above it -- did you mean `--- FILE: relative/path.py`?")
+        wrong = _WRONG_HEADER_RE.search(text)
+        out.append(((wrong.group("file") or wrong.group("file2")).strip()
+                    if wrong else "(unknown file)", hint))
+        missing -= 1
+    for f in headers:
+        if missing <= 0:
+            break
+        out.append((f.strip() or "(unknown file)",
+                    "its block is incomplete: it needs `<<<<<<< SEARCH`, "
+                    "`=======`, and `>>>>>>> REPLACE` lines, each on its own "
+                    "line, in that order"))
+        missing -= 1
+    return out
 
 
 def parse_edits(text: str, discards: list | None = None) -> list[Edit]:
@@ -519,6 +559,13 @@ def apply_edits(root: Path, edits: list[Edit], backup: bool = True,
 
     root_resolved = Path(root).resolve()
 
+    # ---- protected paths (.git/, .pedacito/, the plan file, config) --------
+    for rel in list(groups):
+        why = safety.is_protected(rel, cfg)
+        if why:
+            results.append(Result(False, rel, f"refused: {why}"))
+            del groups[rel]
+
     def _resolve_inside(rel: str) -> Path | None:
         """Resolved path of `rel` when it stays inside the root (following
         symlinks), else None."""
@@ -536,9 +583,9 @@ def apply_edits(root: Path, edits: list[Edit], backup: bool = True,
     # paths are refused here, before rename pairing, so a blocked source can
     # never be moved away by its pair.
     if allowlist is not None:
-        allowed = {(p or "").strip().lower().lstrip("./") for p in allowlist}
+        allowed = {fileio.path_key(p) for p in allowlist}
         for rel in list(groups):
-            key = (rel or "").strip().lower().lstrip("./")
+            key = fileio.path_key(rel)
             if key in allowed:
                 continue
             path = _resolve_inside(rel)
@@ -648,8 +695,8 @@ def apply_edits(root: Path, edits: list[Edit], backup: bool = True,
             naming the source). A bare basename match into an arbitrary
             sibling directory is rejected: the overwrite-and-archive trap."""
             same_dir = Path(old).parent == Path(new).parent
-            old_posix = Path(old).as_posix().lower().lstrip("./")
-            new_posix = Path(new).as_posix().lower().lstrip("./")
+            old_posix = fileio.path_key(Path(old).as_posix())
+            new_posix = fileio.path_key(Path(new).as_posix())
             old_name = Path(old).name.lower()
             new_name = Path(new).name.lower()
             if same_dir:

@@ -1285,6 +1285,7 @@ def test_gather_stops_on_repeated_no_new_source_read(tmp_path):
     _write(tmp_path / "PLAN.md", "\n".join(
         f"line {i}: parkour control note" for i in range(1, 14)) + "\n")
     cfg = config_mod.Config()
+    cfg.stuck_recovery = False       # the legacy cap; recovery has its own test
     idx = index_mod.build([str(tmp_path)], cfg, client=None,
                           summarise=False, root=tmp_path, verbose=False)
 
@@ -1320,6 +1321,7 @@ def test_gather_does_not_redispatch_an_identical_grep(tmp_path, monkeypatch):
     _write(tmp_path / "a.py", "x = 1\n")
     cfg = config_mod.Config()
     cfg.semantic_search = False
+    cfg.stuck_recovery = False
     idx = index_mod.build([str(tmp_path)], cfg, client=None,
                           summarise=False, root=tmp_path, verbose=False)
     dispatched = []

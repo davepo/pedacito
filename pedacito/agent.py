@@ -30,13 +30,22 @@ import re
 import sys
 
 from . import diagnostics as diagnostics_mod
+from . import events as events_mod
 from . import fileio
+from . import fold as fold_mod
+from . import gitinfo
+from . import hooks as hooks_mod
 from . import instructions as instructions_mod
 from . import mcp as mcp_mod
+from . import memory as memory_mod
+from . import prompts as prompts_mod
+from . import safety
+from . import skills as skills_mod
+from . import steering as steering_mod
 from . import todo as todo_mod
 from .config import is_hosted
-from .edits import Result, apply_edits, locate, parse_edits
-from .llm import LLMError, estimate_tokens
+from .edits import Result, apply_edits, locate, malformed_blocks, parse_edits
+from .llm import LLMError, estimate_messages, estimate_tokens
 from .tools import TOOL_HELP, dispatch, schema_for
 
 # Re-asks after a gather step reply dies at the output cap or has no salvageable
@@ -57,6 +66,14 @@ _MAX_REPEATED_STEPS = 3
 _DEDUP_STEP_ACTIONS = {"grep", "find", "outline", "callers", "sessions",
                        "diff", "diagnose"}
 
+# Read-only steps whose repeat (even many steps later) adds nothing while the
+# index, the conversation and the working tree are unchanged.
+_CACHEABLE_ACTIONS = {"grep", "find", "outline", "callers", "context", "git",
+                      "diagnose", "sessions", "fetch"}
+# Steps that can change what the cacheable ones return.
+_MUTATING = {"write", "append", "move", "delete", "rename", "run", "browser",
+             "screenshot", "mcp", "task"}
+
 # Steps discarded for a cut-off payload before gather gives up.
 _MAX_PAYLOAD_CUTS = 2
 
@@ -72,7 +89,7 @@ def _step_signature(step: dict) -> tuple:
 def _norm_key(path: str) -> str:
     """Normalise a read-ledger path. Models alternate between `pkg/a.py` and
     `./pkg/a.py`; the ledger, eviction pass and coverage must share one key."""
-    return (path or "").strip().lower().lstrip("./")
+    return fileio.path_key(path)
 
 
 # Spots deferral language ("the next turn continues") in a cleanly finished
@@ -386,6 +403,21 @@ How to navigate it:
 - Never invent a line range. If a range is not in the map or an outline you have
   already run, you do not know it yet."""
 
+# The largest projects: likely-relevant file cards over a directory skeleton.
+RANKED_HINT = """
+The map below is too big to list every file, so it has two parts. First,
+LIKELY RELEVANT FILES: the files most related to your task (named in it,
+matching its words, or close to those in the import graph), with their
+definitions and line ranges -- `read` straight from them. Second, a
+DIRECTORY SKELETON of the whole project.
+
+How to navigate it:
+- Start with the likely-relevant files; the "why listed" line says why each is
+  there. That ranking is a hint: it can be wrong.
+- If what you need is not listed, `find` by name or concept, `grep` for text,
+  or `outline` a directory from the skeleton to descend.
+- Never invent a line range: use one from a card or an outline you have run."""
+
 # One card per directory.
 DIRS_HINT = """
 The map below is one card per DIRECTORY, not per file: this project is too big
@@ -464,6 +496,64 @@ You are a code assistant. You have a map of the project and the specific
 source you asked to see. Complete the user's task.
 
 """ + EDIT_FORMAT
+
+
+_TOOLISH_RE = re.compile(
+    r"^\s*\{[^}]*['\"]action['\"]\s*:|<tool_call|<function\s*=|<invoke\b",
+    re.IGNORECASE)
+
+
+def _unusable_continuation(reply: str) -> bool:
+    """A continued answer that is empty or still shaped like a tool call (the
+    model imitating its own earlier JSON actions) must be rebuilt."""
+    text = (reply or "").strip()
+    return not text or bool(_TOOLISH_RE.match(text))
+
+
+_ITEM_SPLIT = re.compile(r"\n\n(?=--- )")
+
+
+def _trim_gathered(src: str, too_big) -> tuple[str, int]:
+    """Drop the OLDEST whole gathered-source items until `too_big(text)` is
+    false, leaving a re-read pointer per dropped item and always keeping the
+    final digest. A single oversize item is clipped from its front on a line
+    boundary as a last resort. Returns (text, items_dropped)."""
+    items = _ITEM_SPLIT.split(src)
+    dropped: list[str] = []
+    keep_tail = [i for i in items if i.startswith("--- digest")]
+    body = [i for i in items if not i.startswith("--- digest")]
+
+    def render(b: list[str]) -> str:
+        parts = b + keep_tail
+        text = "\n\n".join(parts)
+        if dropped:
+            pointers = "; ".join(dropped[:8]) + ("; ..." if len(dropped) > 8
+                                                  else "")
+            text = ("[older gathered source trimmed to fit the request limit "
+                    f"(re-`read` if you need it again: {pointers})]\n\n"
+                    + text)
+        return text
+
+    while too_big(render(body)) and len(body) > 1:
+        gone = body.pop(0)
+        head = gone.split("\n", 1)[0][4:].strip()
+        dropped.append(head[:70])
+    text = render(body)
+    if too_big(text) and body:
+        # one item is still too big: keep its tail, whole lines only
+        only = body[0]
+        n_dropped = 0
+        while too_big(render([only])) and len(only) > 4000:
+            keep = max(4000, len(only) * 3 // 4)
+            cut = only[len(only) - keep:]
+            nl = cut.find("\n")
+            only = cut[nl + 1:] if 0 <= nl < len(cut) - 1 else cut
+            n_dropped += 1
+        if n_dropped and not dropped:
+            dropped.append("the earliest part of one long read")
+        body = [only]
+        text = render(body)
+    return text, len(dropped)
 
 
 def _compact_result_marker(content: str) -> str:
@@ -580,6 +670,228 @@ class Agent:
         # outer loop's evidence gate reads this: an attempted-but-failed
         # browser launch is not live evidence.
         self.live_evidence_ok = False
+        # Telemetry sink (events.EventLog); bound on first gather.
+        self.events = None
+        # Gather conversation kept for answer continuation (see answer()).
+        self._messages: list[dict] = []
+        self._lossy = False
+        self.fold_count = 0
+        self.answer_mode_used = "rebuild"
+        self._gather_task = ""
+        self._rules_shown: set[str] = set()
+
+    # ------------------------------------------------------------ helpers
+    def _set_site(self, site: str) -> None:
+        """Label the client's current call site for usage accounting."""
+        try:
+            self.client.site = site
+        except Exception:
+            pass
+
+    def _map(self, task: str) -> tuple[str, str]:
+        """(map text, tier) for `task`; index doubles that predate the
+        ranked map (`map_for_prompt(cfg)`) still work."""
+        try:
+            return self.index.map_for_prompt(self.cfg, task=task)
+        except TypeError:
+            return self.index.map_for_prompt(self.cfg)
+
+    def _prime_fewshot(self) -> None:
+        """Worked step examples from THIS project (a real file, a real symbol)
+        for the client to show when the server cannot enforce a JSON grammar:
+        a small model copies a concrete example far better than a dummy
+        `{"action": "read", "file": ""}`."""
+        if not hasattr(self.client, "fewshot"):
+            return
+        try:
+            unit = None
+            for f in self.index.code_files:
+                tops = self.index.top_level(f)
+                if tops:
+                    unit = tops[0]
+                    break
+            if unit is None:
+                self.client.fewshot = []
+                return
+            end = min(unit.scope_end or unit.end, unit.start + 40)
+            self.client.fewshot = [
+                {"action": "grep", "pattern": unit.qualname.split(".")[0],
+                 "reasoning": "find where it is used"},
+                {"action": "read", "file": unit.file, "start": unit.start,
+                 "end": end, "reasoning": "read the definition"},
+                {"action": "done", "reasoning": "have what I need"},
+            ]
+        except Exception:
+            self.client.fewshot = []
+
+    def _lead_notes(self) -> str:
+        """Per-task orientation placed above the map: repo brief and git state."""
+        bits: list[str] = []
+        if getattr(self.cfg, "repo_brief", True):
+            try:
+                from .brief import build_brief
+                budget = int(getattr(self.cfg, "flat_map_token_budget", 4000))
+                brief = build_brief(
+                    self.index, self.cfg,
+                    max_tokens=min(int(getattr(self.cfg, "max_brief_tokens", 500)),
+                                   max(80, budget // 5)))
+                if brief:
+                    bits.append(brief)
+            except Exception:
+                pass
+        try:
+            git = gitinfo.preamble(self.index.root, self.cfg)
+        except Exception:
+            git = ""
+        if git:
+            bits.append(git)
+        return "\n".join(bits)
+
+    def _emit(self, kind: str, **fields) -> None:
+        if self.events is not None:
+            self.events.emit(kind, **fields)
+
+    def _hook(self, event: str, **fields):
+        """Fire a user hook (hooks.py) when one is configured for `event`."""
+        if not hooks_mod.has_hooks(self.cfg, event):
+            return hooks_mod.HookResult()
+        return hooks_mod.fire(self.cfg, self.index.root, event, **fields)
+
+    def _cap_observation(self, action: str, obs: str) -> str:
+        """Per-action ceiling for everything but source reads: one broad grep,
+        a chatty command or a big MCP reply must not eat the gather budget or
+        the tail of the window. Cut on a line boundary, say how much was left
+        and how to narrow it."""
+        if action in ("read", "context", "done", "todo") \
+                or obs.startswith("ERROR"):
+            return obs
+        tokens = int(getattr(self.cfg, "max_observation_tokens", 0) or 0)
+        if tokens <= 0:
+            # auto: a quarter of the usable window, between 300 and 2,200 tokens
+            tokens = max(300, min(2200, self._room() // 4))
+        cap = int(tokens * 3.6)
+        if len(obs) <= cap:
+            return obs
+        cut = obs[:cap]
+        nl = cut.rfind("\n")
+        if nl > cap // 2:
+            cut = cut[:nl]
+        left = obs.count("\n") - cut.count("\n")
+        return (cut + f"\n[output capped at ~{tokens} tokens; {max(left, 1)} "
+                "more line(s) not shown -- narrow the query (a file, a "
+                "tighter pattern) to see them]")
+
+    def _ask_user(self, text: str, asked: int) -> str:
+        """The `question` action: relay one question to the user (bounded per
+        task); an empty answer tells the model to choose the safest reading."""
+        ask = getattr(self.cfg, "_ask_user", None)
+        if ask is None or not text.strip():
+            return ("ERROR: no user is available to answer. State the "
+                    "ambiguity and choose the safest interpretation.")
+        if asked >= steering_mod.MAX_QUESTIONS:
+            return ("ERROR: you already asked the maximum number of "
+                    "questions. Decide, and state your assumption.")
+        answer = (ask(text.strip()[:600]) or "").strip()
+        self._emit("question", asked=asked + 1, answered=bool(answer))
+        if not answer:
+            return ("USER ANSWER: (none) -- choose the safest interpretation "
+                    "and say what you assumed.")
+        return f"USER ANSWER: {answer[:500]}"
+
+    def _scoped_rules(self, rel: str) -> str:
+        """Path-scoped rules (`.pedacito/rules/*.md`, nested AGENTS.md) for a
+        file the model just read, once per rule per task."""
+        if not getattr(self.cfg, "use_memory", True):
+            return ""
+        try:
+            found = memory_mod.rules_for(self.index.root, rel)
+        except Exception:
+            return ""
+        out = []
+        for src, text in found:
+            if src in self._rules_shown or not text.strip():
+                continue
+            self._rules_shown.add(src)
+            out.append(f"\n[project rule from {src} -- applies to this "
+                       f"file; a hint, verify against source]\n{text}")
+        return "".join(out)
+
+    # ----------------------------------------------------- window pressure
+    def _room(self) -> int:
+        cfg = self.cfg
+        return max(cfg.context_tokens - cfg.max_tokens_step
+                   - cfg.reserve_tokens // 2, 512)
+
+    def _fit(self, messages: list[dict]) -> bool:
+        """Keep the live conversation inside the server's window. Only acts on
+        REAL overflow: it folds the older band into one STATE digest (one
+        cache break; see fold.py), and falls back to the legacy per-turn clip
+        only if the recent tail alone is still too big. Returns True when it
+        changed anything."""
+        cfg = self.cfg
+        est = getattr(self.client, "estimate_tokens", None) or estimate_tokens
+        room = self._room()
+        if estimate_messages(messages, est) <= room:
+            return False
+        changed = False
+        if getattr(cfg, "compaction", "deterministic") != "off":
+            keep = fold_mod.tail_pairs_for(cfg)
+            max_chars = max(500, min(2500, int(room * 3.6 * 0.10)))
+            while True:
+                before = estimate_messages(messages, est)
+                if fold_mod.fold_middle(messages, keep, max_chars):
+                    self._after_fold(messages, est, before)
+                    changed = True
+                if estimate_messages(messages, est) <= room or keep <= 1:
+                    break
+                keep -= 1
+        if estimate_messages(messages, est) > room:
+            if _evict_overflow_turns(messages, self.client, cfg):
+                self._lossy = True
+                changed = True
+        return changed
+
+    def _after_fold(self, messages: list[dict], est, before: int) -> None:
+        """Bookkeeping (and the optional model-written STATE) after a fold."""
+        self.fold_count += 1
+        self._lossy = True
+        if getattr(self.cfg, "compaction", "") == "model" and len(messages) > 3:
+            state = messages[3]["content"] if messages[3]["role"] == "user" \
+                else ""
+            better = self._model_state(state)
+            if better:
+                messages[3] = {"role": "user", "content": better}
+        self._emit("fold", n=self.fold_count, tokens_before=before,
+                   tokens_after=estimate_messages(messages, est))
+        self._hook("post_compact", folds=self.fold_count)
+        print("[older lookups folded into a STATE digest to fit the model's "
+              "context window]", file=sys.stderr)
+
+    def _model_state(self, state_msg: str) -> str:
+        """One small call that rewrites the extractive STATE into goal /
+        findings / next-step lines (cfg.compaction = "model"); '' on any
+        failure so the deterministic digest stays."""
+        from . import fold as fold_mod_
+        body = state_msg[len(fold_mod_.STATE_HEAD):].strip()
+        if not body:
+            return ""
+        try:
+            self._set_site("compaction")
+            text = self.client.chat(
+                [{"role": "system", "content":
+                  "You compress a coding assistant's lookup log. Reply with at "
+                  "most 8 short lines: GOAL, FOUND (files and line ranges that "
+                  "matter), RULED OUT, NEXT. Keep file paths and numbers exact. "
+                  "No preamble."},
+                 {"role": "user", "content":
+                  f"TASK\n{self._gather_task[:600]}\n\nLOOKUP LOG\n{body}"}],
+                max_tokens=int(getattr(self.cfg, "max_tokens_summary", 220)) + 120)
+        except Exception:
+            return ""
+        finally:
+            self._set_site("gather")
+        text = (text or "").strip()
+        return (fold_mod_.STATE_HEAD + "\n" + text[:1600]) if text else ""
 
     # ------------------------------------------------------------------ phase 1
     def gather(self, task: str, verbose: bool = True,
@@ -608,16 +920,32 @@ class Agent:
         """
         # A fresh run: drop any backup directory left by a previous task.
         self.cfg._backup_dir = backup_dir
-        repo_map, tier = self.index.map_for_prompt(self.cfg)
-        system = (base if base is not None else GATHER_BASE) + \
-            (FLAT_HINT if tier == "flat"
-             else CARDS_HINT if tier == "cards" else DIRS_HINT)
-        project_notes = instructions_mod.render(self.index.root, self.cfg)
-        todo_notes = todo_mod.render(self.index.root, self.cfg,
+        root = self.index.root
+        self.cfg._root = str(root)
+        self.cfg._is_git = gitinfo.is_repo(root)
+        if self.events is None:
+            self.events = events_mod.get(root, self.cfg)
+            events_mod.attach(self.client, self.events)
+        self._set_site("gather")
+        self._prime_fewshot()
+        repo_map, tier = self._map(task)
+        hint = {"flat": FLAT_HINT, "cards": CARDS_HINT,
+                "ranked": RANKED_HINT}.get(tier, DIRS_HINT)
+        system = prompts_mod.gather_system(
+            self.cfg, base if base is not None else GATHER_BASE, TOOL_HELP) + hint
+        project_notes = instructions_mod.render(root, self.cfg)
+        todo_notes = todo_mod.render(root, self.cfg,
                                      limit=int(getattr(
                                          self.cfg, "max_todo_chars", 1500)))
         if project_notes:
             system += "\n\n" + project_notes
+        memory_notes = memory_mod.render(root, self.cfg)
+        if memory_notes:
+            system += "\n\n" + memory_notes
+        if "skill" in schema_for(self.cfg)["properties"]["action"]["enum"]:
+            skill_notes = skills_mod.catalog(root, self.cfg, task=task)
+            if skill_notes:
+                system += "\n\n" + skill_notes
         if todo_notes:
             system += "\n\n" + todo_notes
         if getattr(self.cfg, "allow_mcp", False):
@@ -627,10 +955,31 @@ class Agent:
         if verbose:
             print(f"  [map: {tier}, ~{estimate_tokens(repo_map)} tokens, "
                   f"{len(self.index.files)} files]", file=sys.stderr)
+        # Orientation that changes per task (git state) or per index (the
+        # brief) rides in the first user turn, not the system prompt, so the
+        # system prompt stays byte-identical across tasks for the server cache.
+        lead = self._lead_notes()
+        try:
+            tried = memory_mod.attempts_note(self.index.root, task, self.cfg)
+        except Exception:
+            tried = ""
+        if tried:
+            lead = (lead + "\n" if lead else "") + tried
+        user0 = (lead + "\n\n" if lead else "") \
+            + f"PROJECT MAP\n\n{repo_map}\n\nTASK\n{task}"
+        if safety.has_secret(task) and is_hosted(self.cfg) \
+                and getattr(self.cfg, "redact_secrets", True):
+            print("  [warning: the task text looks like it contains a secret "
+                  "and goes to a hosted API]", file=sys.stderr)
         messages = [
             {"role": "system", "content": system},
-            {"role": "user", "content": f"PROJECT MAP\n\n{repo_map}\n\nTASK\n{task}"},
+            {"role": "user", "content": user0},
         ]
+        self._messages = messages
+        self._lossy = False          # True once history was folded/evicted
+        self.fold_count = 0
+        self._gather_task = task
+        self._rules_shown: set[str] = set()
         gathered: list[str] = []
         self.steps_log: list[str] = []
         self.live_evidence_ok = False
@@ -679,8 +1028,25 @@ class Agent:
         last_sig = None          # previous step's action+args, for loops
         repeated = 0
         payload_cuts = 0         # steps discarded for a cut-off payload
+        # One targeted recovery prompt per distress signal before gather gives
+        # up (cfg.stuck_recovery): a small model often escapes a loop when
+        # told, specifically, what it is doing.
+        recoveries = {"repeat": 0, "errors": 0, "dup": 0}
+        questions = 0            # clarifying questions asked so far
+        ran: dict = {}           # step signature -> (step, index gen, folds, mutations)
+        mutations = 0            # bumps when something that can change results ran
+        recover_on = bool(getattr(self.cfg, "stuck_recovery", True))
         while unlimited or step < step_cap:
             step += 1
+            # Steering: lines the user typed mid-run join the turn that has
+            # not been sent yet, so the cached prefix is untouched.
+            for note in steering_mod.drain(getattr(self.cfg, "_steer", None)):
+                messages[-1]["content"] += (
+                    f"\n\n[The USER says, mid-task: {note}  -- follow this "
+                    "over your earlier plan.]")
+                self._emit("steer", step=step, chars=len(note))
+                if verbose:
+                    print(f"  [steering delivered: {note[:70]}]", file=sys.stderr)
             try:
                 stepjson = self.client.chat_json(messages, step_schema,
                                                  self.cfg.max_tokens_step,
@@ -763,7 +1129,7 @@ class Agent:
                 messages.append({"role": "user",
                                  "content": f"{obs}\n\n{nudge(step + 1)}"})
                 budget -= len(obs)
-                _evict_overflow_turns(messages, self.client, self.cfg)
+                self._fit(messages)
                 if verbose:
                     print(f"  [step {step} discarded: `{cut}` payload cut "
                           f"off ({payload_cuts}/{_MAX_PAYLOAD_CUTS}); NOT "
@@ -847,7 +1213,37 @@ class Agent:
                     continue
                 break
 
+            if action == "question":
+                obs = self._ask_user(str(stepjson.get("content") or ""),
+                                     questions)
+                questions += 1
+                messages.append({"role": "assistant",
+                                 "content": _compact(stepjson)})
+                messages.append({"role": "user",
+                                 "content": f"RESULT:\n{obs}\n\n{nudge(step + 1)}"})
+                self.steps_log[-1] += "  [asked the user]"
+                continue
+
             if repeated >= _MAX_REPEATED_STEPS:
+                if recover_on and recoveries["repeat"] < 1:
+                    recoveries["repeat"] += 1
+                    note = (f"[STUCK: you have sent the identical `{action}` "
+                            f"step {repeated} times; its result cannot change. "
+                            "Do something DIFFERENT now: a different file or "
+                            "range, `find`/`grep` for what you are missing, or "
+                            "`done` if you already have what you need.]")
+                    messages.append({"role": "assistant",
+                                     "content": _compact(stepjson)})
+                    messages.append({"role": "user",
+                                     "content": f"{note}\n\n{nudge(step + 1)}"})
+                    repeated, last_sig = 0, None
+                    self._emit("recovery", signal="repeat", step=step)
+                    if verbose:
+                        print(f"  [recovery: the same `{action}` step was "
+                              f"repeated; asking for a different move]",
+                              file=sys.stderr)
+                    self._fit(messages)
+                    continue
                 if verbose:
                     print(f"  [gather stopped: the model repeated the same "
                           f"`{action}` step {repeated} times; moving to "
@@ -855,15 +1251,45 @@ class Agent:
                 break
 
             dedup_step = is_repeat and action in _DEDUP_STEP_ACTIONS
+            earlier = ran.get(sig) if action in _CACHEABLE_ACTIONS else None
+            if earlier is not None and (earlier[1] != self.index.generation
+                                        or earlier[2] != self.fold_count
+                                        or earlier[3] != mutations):
+                earlier = None       # the world or the conversation changed
             if dedup_step:
                 # Identical to the previous (read-only) step: skip the dispatch.
                 obs = (f"[This exact `{action}` step already ran and its "
                        "result is above. Repeating it cannot add information "
                        "-- choose a different query/path or say done.]")
+            elif earlier is not None:
+                # The same read-only query ran earlier (not just one step ago)
+                # and nothing changed since: point at it instead of paying for
+                # the same observation twice.
+                obs = (f"[This exact `{action}` already ran at step "
+                       f"{earlier[0]} and nothing changed since; its result is "
+                       "earlier in this conversation. Use it, or choose a "
+                       "different query.]")
+                self._emit("cached_step", action=action, first=earlier[0])
             else:
                 try:
-                    obs = dispatch(self.index, self.cfg, stepjson,
-                                   client=self.client)
+                    hk = self._hook("pre_tool", action=action,
+                                    args={k: v for k, v in stepjson.items()
+                                          if v not in ("", 0, None)
+                                          and k != "reasoning"})
+                    if not hk.denied and action == "run":
+                        hk = self._hook("pre_run", command=str(
+                            stepjson.get("command", "")))
+                    if hk.denied:
+                        obs = (f"ERROR: `{action}` was blocked by a pre_tool "
+                               f"hook: {hk.message}")
+                    else:
+                        obs = dispatch(self.index, self.cfg, stepjson,
+                                       client=self.client)
+                        post = self._hook("post_run" if action == "run"
+                                          else "post_tool", action=action,
+                                          ok=not obs.startswith("ERROR"))
+                        if post.context and not obs.startswith("ERROR"):
+                            obs += f"\n[hook output: {post.context}]"
                     if (action in ("run", "screenshot", "browser")
                             and not obs.startswith("ERROR")):
                         self.live_evidence_ok = True
@@ -873,6 +1299,16 @@ class Agent:
                           f"{type(e).__name__}: {e}]", file=sys.stderr)
                     obs = (f"ERROR: {action} failed "
                            f"({type(e).__name__}): {str(e)[:200]}")
+                # Output from outside the project's own text is fenced as
+                # data, control characters are stripped, and instruction-like
+                # wording is flagged (small models are suggestible).
+                obs = safety.frame(action, obs, self.cfg)
+                obs = self._cap_observation(action, obs)
+                if action in _CACHEABLE_ACTIONS and not obs.startswith("ERROR"):
+                    ran[sig] = (step, self.index.generation, self.fold_count,
+                                mutations)
+                if action in _MUTATING:
+                    mutations += 1
             # The cut almost always lands inside 'reasoning'; tell the model
             # so it stops writing essays.
             if getattr(self.client, "step_truncated", False):
@@ -893,7 +1329,7 @@ class Agent:
                             "reply.]")
             duplicate_read = False
             read_delta = None
-            if action == "read" and not obs.startswith("ERROR"):
+            if action in ("read", "context") and not obs.startswith("ERROR"):
                 # A read is progress only when it shows lines not already in the
                 # span ledger; an exact duplicate is replaced by a compact note
                 # so the model does not lock onto one range.
@@ -903,7 +1339,8 @@ class Agent:
                     s_, e_ = int(m.group(2)), int(m.group(3))
                     prior = list(spans.get(key, []))
                     read_delta = _delta_len(obs, prior)
-                    duplicate_read = not _read_has_new_lines(obs, prior)
+                    duplicate_read = (action == "read"
+                                      and not _read_has_new_lines(obs, prior))
                     spans.setdefault(key, []).append((s_, e_))
                     if duplicate_read:
                         obs = (f"{m.group(1).strip()} lines {s_}-{e_}: "
@@ -913,6 +1350,8 @@ class Agent:
                 if not duplicate_read:
                     did_read = True
                     read_nudged = False     # progress re-arms the coverage nudge
+                    if m:
+                        obs += self._scoped_rules(m.group(1).strip())
                 self._unread_files = self._compute_unread(self._targets_text)
             # An ERROR is navigation feedback, not source: record it compactly
             # so the SOURCE section does not look populated without code.
@@ -924,14 +1363,31 @@ class Agent:
                 arg = arg if isinstance(arg, str) else str(arg)
                 item = f"--- {action} {arg} failed: {obs[:160]}"
                 gathered.append(item)
+                self._emit("step", n=step, action=action, detail=arg[:120],
+                           obs_chars=len(obs), error=True)
                 messages.append({"role": "assistant", "content": _compact(stepjson)})
                 messages.append({"role": "user",
                                  "content": f"{obs}\n\n{nudge(step + 1)}"})
                 # Charge errors too, so a model repeating one failing step
                 # cannot loop forever at max_steps = 0.
                 budget -= len(obs)
-                _evict_overflow_turns(messages, self.client, self.cfg)
+                self._fit(messages)
                 if error_streak >= _MAX_CONSECUTIVE_ERRORS:
+                    if recover_on and recoveries["errors"] < 1 and budget > 0:
+                        recoveries["errors"] += 1
+                        messages[-1]["content"] += (
+                            f"\n\n[STUCK: your last {error_streak} actions "
+                            "all failed. Re-read the PROJECT MAP for exact "
+                            "paths and line ranges; use `find` or `outline` "
+                            "to get a valid file name before `read`; never "
+                            "invent a range.]")
+                        error_streak = 0
+                        self._emit("recovery", signal="errors", step=step)
+                        if verbose:
+                            print("  [recovery: several failed steps in a row; "
+                                  "pointing the model back at the map]",
+                                  file=sys.stderr)
+                        continue
                     if verbose:
                         print(f"  [gather stopped after {error_streak} "
                               f"consecutive failed steps; moving to answer]",
@@ -960,11 +1416,25 @@ class Agent:
             if duplicate_read:
                 duplicate_reads += 1
                 if duplicate_reads >= _MAX_DUPLICATE_READS:
-                    if verbose:
-                        print("  [gather stopped: the model repeated the same "
-                              "read without new source; moving to answer]",
-                              file=sys.stderr)
-                    break
+                    if recover_on and recoveries["dup"] < 1:
+                        recoveries["dup"] += 1
+                        duplicate_reads = 0
+                        obs += ("\n[STUCK: you keep re-reading lines you "
+                                "already have. They are above in this "
+                                "conversation. Read a DIFFERENT range or "
+                                "file, or say `done`.]")
+                        self._emit("recovery", signal="duplicate_reads",
+                                   step=step)
+                        if verbose:
+                            print("  [recovery: repeated reads without new "
+                                  "source; asking for a new range]",
+                                  file=sys.stderr)
+                    else:
+                        if verbose:
+                            print("  [gather stopped: the model repeated the "
+                                  "same read without new source; moving to "
+                                  "answer]", file=sys.stderr)
+                        break
             else:
                 duplicate_reads = 0
 
@@ -980,14 +1450,17 @@ class Agent:
             if not duplicate_read:
                 gathered.append(item)
 
+            self._emit("step", n=step, action=action, detail=str(detail)[:120],
+                       obs_chars=len(obs), duplicate=duplicate_read)
             messages.append({"role": "assistant", "content": _compact(stepjson)})
             messages.append({"role": "user",
                              "content": f"RESULT:\n{obs}\n\n{nudge(step + 1)}"})
 
             # The live conversation can outgrow the server's window even when
             # the char budget has room (some servers reject the request,
-            # others silently drop the middle of the prompt); trim first.
-            _evict_overflow_turns(messages, self.client, self.cfg)
+            # others silently drop the middle of the prompt): fold the older
+            # band ONCE (see fold.py) instead of trimming turn by turn.
+            self._fit(messages)
 
             if budget <= 0:
                 if verbose:
@@ -995,15 +1468,18 @@ class Agent:
                 break
 
         self.read_any = did_read
-        # Rewrite RESULT turns and SOURCE items down to the lines each read
-        # was first to show, so the answer phase sees every line once.
-        new_items = _evict_duplicate_reads(messages, gathered, spans)
+        # Rewrite the SOURCE items down to the lines each read was first to
+        # show, so the answer phase sees every line once. The live
+        # conversation is NOT rewritten: it is only needed for answer
+        # continuation, which wants the cached prefix untouched.
+        new_items = _evict_duplicate_reads(list(messages), gathered, spans)
         digest = self._read_digest(spans)
         if digest:
             new_items = new_items + [digest]
         self.gathered_source = "\n\n".join(new_items)
-        # Nudge turns can push the conversation over the window between reads.
-        _evict_overflow_turns(messages, self.client, self.cfg)
+        self._emit("gather_done", steps=step, files_read=len(spans),
+                   folds=self.fold_count, lossy=self._lossy,
+                   gathered_chars=len(self.gathered_source))
         return "\n\n".join(new_items)
 
     def _read_digest(self, spans: dict) -> str:
@@ -1092,68 +1568,341 @@ class Agent:
         `system` and `max_tokens` override the defaults for flows that need a
         different brief (e.g. scaffold.py). `include_edit_format=False` drops
         the search/replace format spec even when `system` is given, for
-        prose-only flows (`explain`)."""
-        repo_map, _ = self.index.map_for_prompt(self.cfg)
+        prose-only flows (`explain`).
+
+        Two ways to build the prompt (`answer_mode`): REBUILD sends a fresh
+        two-message conversation (map + source + task); CONTINUE appends one
+        instruction to the gather conversation so the server's prompt cache
+        covers the map and every lookup. `auto` continues and falls back to a
+        rebuild when the continued reply is empty or tool-shaped."""
+        self._set_site("answer")
+        brief = self._answer_brief(system, include_edit_format)
+        mode = self._answer_mode()
+        if mode in ("continue", "auto") and self._can_continue(task, brief,
+                                                               max_tokens):
+            reply = self._answer_continue(task, brief, stream, max_tokens)
+            if reply is not None and (mode == "continue"
+                                      or not _unusable_continuation(reply)):
+                self.answer_mode_used = "continue"
+                self._emit("answer", mode="continue",
+                           reply_chars=len(reply or ""))
+                return reply
+            if reply is not None:
+                print("  [the continued answer was unusable; rebuilding the "
+                      "answer prompt]", file=sys.stderr)
+        self.answer_mode_used = "rebuild"
+        reply = self._answer_rebuild(task, gathered, stream, brief, max_tokens)
+        self._emit("answer", mode="rebuild", reply_chars=len(reply or ""))
+        return reply
+
+    # ------------------------------------------------- verify before applying
+    def preflight(self, task: str, reply: str, gathered: str = "",
+                  verbose: bool = True):
+        """Check an edit reply BEFORE anything is written: dry-apply every
+        block, run the deterministic checks (verify.py), and -- when they find
+        errors -- ask the model for one corrected reply. With
+        verify_answer = "full" and a clean deterministic pass, one adversarial
+        verifier call is made too. Returns (reply, findings)."""
+        from . import verify as verify_mod
+        mode = (getattr(self.cfg, "verify_answer", "deterministic") or "off")
+        if mode == "off" or not parse_edits(reply):
+            return reply, []
+        self._set_site("verify")
+        findings: list = []
+        for round_ in range(2):          # the check, and at most one repair
+            results = self._apply_once(reply, dry_run=True)
+            findings = verify_mod.check(self, task, reply, results, gathered)
+            if mode == "full" and round_ == 0 and not any(
+                    f.severity == "error" for f in findings):
+                findings += self._model_verify(task, reply, gathered)
+            errors = [f for f in findings if f.severity == "error"]
+            self._emit("verify", round=round_, errors=len(errors),
+                       warnings=len(findings) - len(errors),
+                       kinds=sorted({f.kind for f in findings}))
+            if not errors or round_ == 1:
+                break
+            if verbose:
+                print(f"\n[preflight: {len(errors)} problem(s) in the "
+                      "proposed edits; asking for a corrected reply]",
+                      file=sys.stderr)
+                for f in errors[:4]:
+                    print("  " + f.render(), file=sys.stderr)
+            fixed = self._repair_from_findings(task, reply, errors, results)
+            if not fixed:
+                break
+            reply = fixed
+        if verbose:
+            for f in findings:
+                if f.severity == "warn":
+                    print("  " + f.render(), file=sys.stderr)
+        return reply, findings
+
+    def _repair_from_findings(self, task: str, reply: str, errors,
+                              results) -> str:
+        """One re-ask that shows the model its own edits plus the check's
+        findings; '' when it produced no usable blocks."""
+        from . import verify as verify_mod
+
+        class _F:
+            def __init__(self, file):
+                self.file = file
+                self.message = "check failed"
+
+        files = [fileio.normalise_rel(f.file) for f in errors if f.file]
+        src = self._repair_source([_F(f) for f in dict.fromkeys(files)],
+                                  "") if files else ""
+        blocks = self._failed_block_texts(
+            reply, [_F(e.file) for e in parse_edits(reply)])
+        client = self._role_client("repair")
+        try:
+            new = client.chat(
+                [{"role": "system", "content": self._answer_sys()},
+                 {"role": "user", "content":
+                  (f"SOURCE (current contents of the files involved)\n\n{src}\n\n"
+                   if src else "")
+                  + f"TASK\n{task}\n\n"
+                  f"YOUR PROPOSED EDIT BLOCKS:\n{blocks}\n\n"
+                  "An automatic check of these edits found problems:\n"
+                  + verify_mod.render(errors) + "\n\n"
+                  "Output the COMPLETE corrected set of search/replace blocks "
+                  "for the whole task (not only the changed ones). Fix each "
+                  "problem, or -- if a problem means you are editing code you "
+                  "never read -- drop that edit and say what you could not "
+                  "verify. Copy SEARCH text exactly from the SOURCE above. "
+                  "Blocks only after a one-line explanation."}],
+                max_tokens=self.cfg.max_tokens_answer, stream=False)
+        except LLMError:
+            return ""
+        return new if parse_edits(new) else ""
+
+    def _model_verify(self, task: str, reply: str, gathered: str):
+        """The optional adversarial verifier call (verify_answer = "full")."""
+        from . import verify as verify_mod
+        est = getattr(self.client, "estimate_tokens", None) or estimate_tokens
+        limit = max(1500, int((self.cfg.context_tokens - 900) * 0.5))
+        src, _ = _trim_gathered(gathered or "(nothing was looked up)",
+                                lambda t: est(t) > limit)
+        blocks = self._failed_block_texts(
+            reply, [type("F", (), {"file": e.file})() for e in parse_edits(reply)])
+        client = self._role_client("verifier")
+        try:
+            text = client.chat(
+                [{"role": "system", "content": verify_mod.VERIFIER_SYSTEM},
+                 {"role": "user", "content":
+                  f"TASK\n{task}\n\nSOURCE\n{src}\n\nPROPOSED EDITS\n{blocks}"}],
+                max_tokens=350, stream=False)
+        except LLMError:
+            return []
+        return verify_mod.parse_verdict(text)
+
+    def _role_client(self, role: str):
+        """The client a role resolves to (falls back to the worker)."""
+        from . import roles as roles_mod
+        try:
+            return roles_mod.client_for(self.cfg, role, self.client)
+        except Exception:
+            return self.client
+
+    def best_of(self, task: str, first_reply: str, gathered: str = "",
+                verbose: bool = True) -> str:
+        """Best-of-N for weak models: sample N-1 more candidate replies at a
+        higher temperature, score every candidate with the deterministic
+        checks (blocks dry-apply, no placeholder/unread/stale errors,
+        requirements addressed), and keep the best. N = cfg.best_of."""
+        from . import verify as verify_mod
+        n = int(getattr(self.cfg, "best_of", 1) or 1)
+        if n <= 1 or not parse_edits(first_reply):
+            return first_reply
+        candidates = [first_reply]
+        temp = min(1.0, float(getattr(self.cfg, "temperature", 0.2)) + 0.4)
+        for i in range(n - 1):
+            try:
+                ctx = self.client.temperature(temp) \
+                    if hasattr(self.client, "temperature") else None
+                if ctx is not None:
+                    with ctx:
+                        cand = self.answer(task, gathered, stream=False)
+                else:
+                    cand = self.answer(task, gathered, stream=False)
+            except LLMError:
+                break
+            if cand and parse_edits(cand):
+                candidates.append(cand)
+        if len(candidates) == 1:
+            return first_reply
+        best, best_score = first_reply, None
+        scores = []
+        for cand in candidates:
+            results = self._apply_once(cand, dry_run=True)
+            score, _f = verify_mod.score_candidate(self, task, cand, results,
+                                                   gathered)
+            scores.append(round(score, 1))
+            if best_score is None or score > best_score:
+                best, best_score = cand, score
+        if verbose:
+            print(f"  [best-of-{len(candidates)}: candidate scores {scores}; "
+                  f"kept #{candidates.index(best) + 1}]", file=sys.stderr)
+        self._emit("best_of", scores=scores, kept=candidates.index(best))
+        return best
+
+    # ---- answer helpers
+    def _answer_sys(self) -> str:
+        """The default answer-phase system prompt (pack-aware, overridable)."""
+        return prompts_mod.answer_system(self.cfg, EDIT_FORMAT)
+
+    def _answer_brief(self, system: str | None, include_edit_format: bool
+                      ) -> str:
+        """The answer-phase instructions: the default edit brief, or a
+        caller's system text (plus the edit format when asked)."""
+        if system is None:
+            return prompts_mod.answer_system(self.cfg, EDIT_FORMAT)
+        brief = system.rstrip()
+        if include_edit_format:
+            brief += "\n\n" + prompts_mod.edit_format(self.cfg, EDIT_FORMAT)
+        return brief
+
+    def _answer_mode(self) -> str:
+        """rebuild | continue | auto: the setting, else the model card, else
+        auto for hosted APIs (cheap, and well-behaved) and rebuild for local
+        models (which sometimes imitate their own tool JSON)."""
+        mode = (getattr(self.cfg, "answer_mode", "") or "").strip().lower()
+        if mode in ("rebuild", "continue", "auto"):
+            return mode
+        card = getattr(self.cfg, "_card", None) or {}
+        chosen = (card.get("choices") or {}).get("answer_mode")
+        if chosen in ("rebuild", "continue", "auto"):
+            return chosen
+        return "auto" if is_hosted(self.cfg) else "rebuild"
+
+    def _can_continue(self, task: str, brief: str, max_tokens: int | None
+                      ) -> bool:
+        """The gather conversation can host the answer: it exists, nothing in
+        it was folded away (the answer needs the source), and the final
+        instruction still fits the window."""
+        msgs = self._messages
+        if len(msgs) < 2 or self._lossy:
+            return False
+        est = getattr(self.client, "estimate_tokens", None) or estimate_tokens
+        reply_room = min(max_tokens or self.cfg.max_tokens_answer,
+                         self.cfg.request_max_tokens_cap
+                         or self.cfg.max_tokens_answer)
+        need = (estimate_messages(msgs, est) + est(brief) + est(task)
+                + 120 + reply_room)
+        window = self.cfg.context_tokens - self.cfg.reserve_tokens // 2
+        return need <= window if not is_hosted(self.cfg) else True
+
+    def _answer_continue(self, task: str, brief: str, stream: bool,
+                         max_tokens: int | None) -> str | None:
+        """Append the final instruction to the gather conversation and answer
+        with no grammar. The server reuses the whole warm prefix. Returns None
+        when the call itself failed in a way a rebuild might survive."""
+        msgs = [dict(m) for m in self._messages]
+        digest = self._read_digest(self._read_spans) \
+            if getattr(self, "_read_spans", None) else ""
+        if msgs[-1]["role"] == "user":
+            msgs.append({"role": "assistant", "content":
+                         "{'action': 'done', 'reasoning': 'enough'}"})
+        final = ("THE LOOKUP PHASE IS OVER. No tools are available now: do "
+                 "NOT emit JSON actions, tool calls or `done`. Answer the task "
+                 "below using only the source you read above.\n\n"
+                 f"TASK\n{task}\n\n"
+                 + (digest + "\n\n" if digest else "")
+                 + "ANSWER INSTRUCTIONS\n" + brief)
+        msgs.append({"role": "user", "content": final})
+        est = getattr(self.client, "estimate_tokens", None) or estimate_tokens
+        print(f"[answer continues the lookup conversation, "
+              f"~{estimate_messages(msgs, est)} tokens, prefix cached]",
+              file=sys.stderr)
+        try:
+            return self.client.chat(
+                msgs, max_tokens=max_tokens or self.cfg.max_tokens_answer,
+                stream=stream)
+        except LLMError as e:
+            print(f"  [continued answer failed ({str(e)[:100]}); rebuilding]",
+                  file=sys.stderr)
+            return None
+
+    def _answer_rebuild(self, task: str, gathered: str, stream: bool,
+                        brief: str, max_tokens: int | None) -> str:
+        """A fresh two-message answer conversation. Over budget it DEGRADES
+        (drop project notes, shrink the map, drop the oldest whole source
+        items with re-read pointers) before it ever refuses."""
+        repo_map, _tier = self._map(task)
         project_notes = instructions_mod.render(self.index.root, self.cfg)
         todo_notes = todo_mod.render(self.index.root, self.cfg,
                                      limit=int(getattr(
                                          self.cfg, "max_todo_chars", 1500)))
+        memory_notes = memory_mod.render(self.index.root, self.cfg)
         notes_prefix = ""
         if project_notes:
             notes_prefix += project_notes + "\n\n"
+        if memory_notes:
+            notes_prefix += memory_notes + "\n\n"
         if todo_notes:
             notes_prefix += todo_notes + "\n\n"
         if getattr(self.cfg, "allow_mcp", False):
             mcp_notes = mcp_mod.render(self.cfg)
             if mcp_notes:
                 notes_prefix += mcp_notes + "\n\n"
-        user = (
-            notes_prefix +
-            f"PROJECT MAP\n\n{repo_map}\n\n"
-            f"SOURCE YOU REQUESTED\n\n{gathered or '(nothing was looked up)'}\n\n"
-            f"TASK\n{task}"
-        )
-        # Hard fit check: a prompt over the window is rejected by some servers
-        # and silently truncated from the middle by others, which would cut
-        # off the TASK at the end. Refuse loudly instead.
+        src = gathered or "(nothing was looked up)"
+
+        def assemble(notes: str, rmap: str, source: str) -> str:
+            return (notes + f"PROJECT MAP\n\n{rmap}\n\n"
+                    f"SOURCE YOU REQUESTED\n\n{source}\n\n"
+                    f"TASK\n{task}")
+
         est = getattr(self.client, "estimate_tokens", None) or estimate_tokens
-        reply_room = min(self.cfg.max_tokens_answer,
+        reply_room = min(max_tokens or self.cfg.max_tokens_answer,
                          self.cfg.request_max_tokens_cap or
                          self.cfg.max_tokens_answer)
         hosted = is_hosted(self.cfg)
         if hosted:
-            # Hosted APIs have a request-size limit and bill per token: drop
-            # the OLDEST gathered source until the prompt fits a ceiling.
-            head = notes_prefix + f"PROJECT MAP\n\n{repo_map}\n\n"
-            tail = f"\n\nTASK\n{task}"
-            ceil_ = int(getattr(self.cfg, "max_prompt_tokens", 0) or 60000)
-            src = gathered or "(nothing was looked up)"
-            dropped = 0
-            while est(head + src + tail) > ceil_ and len(src) > 4000:
-                keep = max(4000, len(src) * 3 // 4)
-                dropped += len(src) - keep
-                src = src[-keep:]
+            # Hosted APIs have a request-size limit and bill per token.
+            limit = int(getattr(self.cfg, "max_prompt_tokens", 0) or 60000)
+        else:
+            limit = self.cfg.context_tokens - reply_room \
+                - self.cfg.reserve_tokens // 2
+        user = assemble(notes_prefix, repo_map, src)
+        notices: list[str] = []
+        if est(user) > limit > 0:
+            # 1. project notes / memory / checklist are the first to go
+            if notes_prefix and not hosted:
+                notes_prefix = ""
+                notices.append("project notes omitted")
+                user = assemble(notes_prefix, repo_map, src)
+        if est(user) > limit > 0 and not hosted:
+            # 2. a smaller map (the model can `outline`/`find` for the rest)
+            import copy as _copy
+            small = _copy.copy(self.cfg)
+            for _ in range(2):
+                if est(user) <= limit:
+                    break
+                small.flat_map_token_budget = max(
+                    200, int(small.flat_map_token_budget) // 2)
+                try:
+                    repo_map, _t = self.index.map_for_prompt(small, task=task)
+                except TypeError:
+                    break
+                user = assemble(notes_prefix, repo_map, src)
+                notices.append(f"map shrunk to ~{small.flat_map_token_budget}"
+                               " tokens")
+        if est(user) > limit > 0:
+            # 3. oldest whole source items out, with re-read pointers
+            head = assemble(notes_prefix, repo_map, "")
+            src, dropped = _trim_gathered(
+                src, lambda text: est(head) + est(text) > limit)
             if dropped:
-                src = ("[older gathered source trimmed to fit the request "
-                       f"limit ({dropped} chars dropped -- re-read a file if "
-                       "you need it again)]\n\n" + src)
-            user = head + f"SOURCE YOU REQUESTED\n\n{src}\n" + tail
-        room = self.cfg.context_tokens - reply_room - self.cfg.reserve_tokens // 2
-        if not hosted and est(user) > room > 0 and notes_prefix:
-            # Project instructions must never turn a fitting prompt into a
-            # hard failure: drop them first.
-            user = user[len(notes_prefix):]
-            print("[project context (instructions/checklist) omitted: answer "
-                  "prompt is over the window budget]", file=sys.stderr)
-        if not hosted and est(user) > room > 0:
-            over = est(user) - room
+                notices.append(f"{dropped} older source item(s) trimmed")
+            user = assemble(notes_prefix, repo_map, src)
+        if est(user) > limit > 0 and not hosted:
+            over = est(user) - limit
             raise LLMError(
                 f"The answer prompt would be ~{est(user)} tokens "
-                f"but this model's window only allows ~{room} here "
+                f"but this model's window only allows ~{limit} here "
                 f"(context {self.cfg.context_tokens:,} minus a "
                 f"{reply_room:,}-token reply budget).\n"
-                "Sending it anyway means the server truncates the TASK itself "
-                "-- the model answers without ever seeing your request.\n"
+                "Even after dropping notes, shrinking the map and trimming "
+                "source, the TASK plus the minimum context does not fit.\n"
                 "Fix by lowering ONE of these in your active profile:\n"
                 "  * max_gathered_chars   (less source quoted into the answer)"
                 "\n  * flat_map_token_budget (smaller project map)"
@@ -1161,14 +1910,13 @@ class Agent:
                 " LM Studio's stock\n    default is 8192 -- raising its runtime "
                 "'Context length' is the\n    better fix if your GPU can take it)"
                 f"\n(over-budget by ~{over} tokens)")
+        if notices:
+            print("[answer prompt over budget; degraded: "
+                  + "; ".join(notices) + "]", file=sys.stderr)
+            self._emit("degrade", notices=notices)
         print(f"[answer context ~{est(user)} tokens]", file=sys.stderr)
-        sys_prompt = ANSWER_SYSTEM
-        if system is not None:
-            sys_prompt = system.rstrip()
-            if include_edit_format:
-                sys_prompt += "\n\n" + EDIT_FORMAT
         return self.client.chat(
-            [{"role": "system", "content": sys_prompt},
+            [{"role": "system", "content": brief},
              {"role": "user", "content": user}],
             max_tokens=max_tokens or self.cfg.max_tokens_answer,
             stream=stream,
@@ -1186,6 +1934,7 @@ class Agent:
         only a block that must match existing text needs the repair loop."""
         if repair_rounds is None:
             repair_rounds = self.cfg.repair_rounds
+        self._set_site("repair")
         # Files whose blocks in this reply were no-ops (SEARCH == REPLACE) and
         # dropped by parse_edits; loop.run_task reads this to treat fabricated
         # null edits as a refusal. Reset on every call.
@@ -1270,7 +2019,7 @@ class Agent:
                     "across successive blocks. Emit blocks only, no "
                     "explanation.")
             more = self.client.chat(
-                [{"role": "system", "content": ANSWER_SYSTEM},
+                [{"role": "system", "content": self._answer_sys()},
                  {"role": "user", "content": prompt}],
                 max_tokens=self.cfg.max_tokens_answer,
                 stream=True,
@@ -1357,7 +2106,7 @@ class Agent:
             extra = ("\n\n" + "\n\n".join(extras)) if extras else ""
             reply = self.client.chat(
                 [
-                    {"role": "system", "content": ANSWER_SYSTEM},
+                    {"role": "system", "content": self._answer_sys()},
                     {"role": "user", "content":
                         f"SOURCE (current contents of the files that failed)\n\n{src_slice}\n\n"
                         f"TASK\n{task}\n\n"
@@ -1385,7 +2134,7 @@ class Agent:
                       "one small block]", file=sys.stderr)
                 reply = self.client.chat(
                     [
-                        {"role": "system", "content": ANSWER_SYSTEM},
+                        {"role": "system", "content": self._answer_sys()},
                         {"role": "user", "content":
                             f"SOURCE (current contents of the files that failed)\n\n{src_slice}\n\n"
                             f"TASK\n{task}\n\n"
@@ -1431,7 +2180,7 @@ class Agent:
                 src = (gathered or "").strip()
                 more = self.client.chat(
                     [
-                        {"role": "system", "content": ANSWER_SYSTEM},
+                        {"role": "system", "content": self._answer_sys()},
                         {"role": "user", "content":
                             f"TASK\n{task}\n\n"
                             + (f"SOURCE YOU REQUESTED\n\n{gathered}\n\n"
@@ -1486,7 +2235,7 @@ class Agent:
                       "files; asking for a fix]", file=sys.stderr)
                 fix = self.client.chat(
                     [
-                        {"role": "system", "content": ANSWER_SYSTEM},
+                        {"role": "system", "content": self._answer_sys()},
                         {"role": "user", "content":
                             f"TASK\n{task}\n\n"
                             "Your edits applied, but a quick lint of the "
@@ -1634,7 +2383,7 @@ class Agent:
                 # Not on disk: fall back to the gathered buffer.
                 for item in (self.gathered_source or "").split("\n\n"):
                     m = re.match(r"--- \w+ (\S+)", item)
-                    g = m.group(1).lower().lstrip("./") if m else ""
+                    g = fileio.path_key(m.group(1)) if m else ""
                     if g and (g == low or g.endswith("/" + low) or
                               low.endswith("/" + g)):
                         chunks.append(item[:8000])
@@ -1671,7 +2420,30 @@ class Agent:
         headers are not merged: apply_edits groups blocks by path and needs
         them separate to detect renames. SYMBOL anchors are resolved to line
         ranges here: the agent owns the index, apply_edits does not."""
-        failed, edits = self._resolve_symbol_anchors(parse_edits(reply))
+        discards: list = []
+        parsed = parse_edits(reply, discards=discards)
+        failed, edits = self._resolve_symbol_anchors(parsed)
+        # A block the model started but never finished is not silently
+        # ignored: it becomes a failed result the repair loop reports back.
+        if not getattr(self.client, "stream_truncated", False):
+            for f, hint in malformed_blocks(reply, len(parsed) + len(discards)):
+                failed.append(Result(False, f, f"malformed edit block: {hint}"))
+        if edits and not dry_run:
+            # never edit a file that is mid-merge: the conflict markers are
+            # the user's to resolve, and an edit would bury them
+            try:
+                conflicted = set(gitinfo.status(self.index.root)["conflicts"]) \
+                    if gitinfo.is_repo(self.index.root) else set()
+            except Exception:
+                conflicted = set()
+            if conflicted:
+                blocked = [e for e in edits
+                           if fileio.normalise_rel(e.file) in conflicted]
+                for f in dict.fromkeys(e.file for e in blocked):
+                    failed.append(Result(
+                        False, f, "refused: this file has unresolved git merge "
+                                  "conflicts; resolve them first"))
+                edits = [e for e in edits if e not in blocked]
         if edits:
             failed += apply_edits(self.index.root, edits,
                                   backup=self.cfg.backup, dry_run=dry_run,

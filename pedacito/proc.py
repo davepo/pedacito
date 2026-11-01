@@ -63,7 +63,8 @@ def terminate(proc: subprocess.Popen) -> None:
 
 def run(command, *, cwd, timeout: float | None = None,
         idle_timeout: float = 0, shell: bool = False,
-        max_output: int = 8000, env: dict | None = None
+        max_output: int = 8000, env: dict | None = None,
+        stdin_text: str | None = None
         ) -> tuple[int | None, str, str, float]:
     """Run `command` and return (returncode, output, stopped, seconds).
 
@@ -85,11 +86,24 @@ def run(command, *, cwd, timeout: float | None = None,
         kwargs["start_new_session"] = True
     try:
         p = subprocess.Popen(
-            command, cwd=str(cwd), stdin=subprocess.DEVNULL,
+            command, cwd=str(cwd),
+            stdin=subprocess.DEVNULL if stdin_text is None else subprocess.PIPE,
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
             shell=shell, env=env, **kwargs)
     except (OSError, ValueError) as e:
         return None, str(e), "error", time.monotonic() - started
+    if stdin_text is not None and p.stdin is not None:
+        def feed() -> None:
+            try:
+                p.stdin.write(stdin_text.encode("utf-8", "replace"))
+            except (OSError, ValueError):
+                pass
+            finally:
+                try:
+                    p.stdin.close()
+                except (OSError, ValueError):
+                    pass
+        threading.Thread(target=feed, daemon=True).start()
 
     buf = bytearray()      # the first head_cap bytes
     tail = bytearray()     # rolling window: the last tail_cap bytes

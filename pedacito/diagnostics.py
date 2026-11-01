@@ -17,7 +17,8 @@ so only problems the edits introduced are reported back.
 
 Detection (first match per language):
 
-    Python   ruff check --output-format concise [files|.]; pyflakes, flake8
+    Python   ruff check --output-format concise [files|.]; pyflakes, flake8;
+             plus mypy or pyright when the project configures one
     JS/TS    package.json "lint" script, else tsc --noEmit when tsconfig
              exists, else eslint on the given files
     Rust     cargo check --message-format short
@@ -48,6 +49,21 @@ def _has(root: Path, name: str) -> bool:
 
 def _which(name: str) -> str:
     return shutil.which(name) or ""
+
+
+def _py_typechecker_configured(root: Path, name: str) -> bool:
+    if name == "mypy" and any(_has(root, n) for n in ("mypy.ini", ".mypy.ini")):
+        return True
+    if name == "pyright" and _has(root, "pyrightconfig.json"):
+        return True
+    for cfg in ("pyproject.toml", "setup.cfg", "tox.ini"):
+        try:
+            text = (root / cfg).read_text(encoding="utf-8")
+        except OSError:
+            continue
+        if re.search(rf"^\[(tool\.)?{name}[\].]", text, re.M):
+            return True
+    return False
 
 
 def _py_files(files: list[str] | None) -> list[str]:
@@ -87,6 +103,13 @@ def detect(root, files: list[str] | None = None) -> list[Check]:
             checks.append(Check("pyflakes", ["pyflakes", *targets]))
         elif _which("flake8"):
             checks.append(Check("flake8", ["flake8", *targets]))
+        # a type checker only when the project configured one (an unconfigured
+        # run on a whole tree is mostly noise a small model then chases)
+        if _py_typechecker_configured(root, "mypy") and _which("mypy"):
+            checks.append(Check("mypy", ["mypy", "--no-error-summary",
+                                         "--no-color-output", *targets]))
+        elif _py_typechecker_configured(root, "pyright") and _which("pyright"):
+            checks.append(Check("pyright", ["pyright", *targets]))
 
     if _has(root, "package.json"):
         scripts = _package_scripts(root)
@@ -117,7 +140,7 @@ def run(root, cfg=None, files: list[str] | None = None) -> tuple[bool, str]:
     checks = detect(root, files)
     if not checks:
         return True, ("No linter/type checker detected (looked for ruff, "
-                      "pyflakes, flake8, npm lint, tsc, cargo, go vet, "
+                      "pyflakes, flake8, mypy, pyright, npm lint, tsc, cargo, go vet, "
                       "rubocop).")
     timeout = int(getattr(cfg, "diagnostics_timeout", 90) or 90)
     cap = int(getattr(cfg, "max_diagnostics_chars", 8000) or 8000)
