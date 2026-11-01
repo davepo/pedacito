@@ -1647,7 +1647,8 @@ class Agent:
     def _repair_from_findings(self, task: str, reply: str, errors,
                               results) -> str:
         """One re-ask that shows the model its own edits plus the check's
-        findings; '' when it produced no usable blocks."""
+        findings; '' when it produced no usable blocks -- said out loud, so
+        a give-up mid-repair never reads as a clean run."""
         from . import verify as verify_mod
 
         class _F:
@@ -1678,9 +1679,15 @@ class Agent:
                   "verify. Copy SEARCH text exactly from the SOURCE above. "
                   "Blocks only after a one-line explanation."}],
                 max_tokens=self.cfg.max_tokens_answer, stream=False)
-        except LLMError:
+        except LLMError as e:
+            print("  [repair: re-ask failed (%s); failing checks remain]"
+                  % type(e).__name__, file=sys.stderr)
             return ""
-        return new if parse_edits(new) else ""
+        if not parse_edits(new):
+            print("  [repair: re-ask produced no usable fix; failing checks "
+                  "remain]", file=sys.stderr)
+            return ""
+        return new
 
     def _model_verify(self, task: str, reply: str, gathered: str):
         """The optional adversarial verifier call (verify_answer = "full")."""

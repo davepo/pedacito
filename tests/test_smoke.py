@@ -834,6 +834,107 @@ def test_truncated_repair_reply_gets_one_reask(tmp_path):
     assert "return 42" in (tmp_path / "stub.js").read_text()
 
 
+def test_repair_prose_give_up_is_announced(tmp_path, capsys):
+    """When a failing check sends the model a repair re-ask and the model
+    answers in prose (no blocks), `_repair_from_findings` returns '' and the
+    caller's loop stops -- but a run whose check still fails must not go
+    quiet: the post-edit tests loop would otherwise end with the suite red
+    and no line saying the fix attempt gave up."""
+    from pedacito import index as index_mod, verify as verify_mod
+    _write(tmp_path / "stub.js", "class A {\n    run() {}\n}\n")
+    idx = index_mod.Index(tmp_path, [])
+
+    class StubClient:
+        stream_truncated = False
+        def chat(self, messages, max_tokens, schema=None, stream=False, **kw):
+            return "I cannot fix this block."     # prose: repair gives up
+
+    agent = Agent(idx, StubClient(), config_mod.Config())
+    finding = verify_mod.Finding("tests", "error", "",
+                                 "after your edits these tests fail")
+    reply = ("--- FILE: stub.js\n<<<<<<< SEARCH\n=======\n"
+             "class A {\n    run() {}\n}\n>>>>>>> REPLACE\n")
+    assert agent._repair_from_findings("fix stub", reply, [finding], []) == ""
+    err = capsys.readouterr().err
+    assert "no usable fix" in err
+    assert "failing checks remain" in err
+
+
+def test_repair_llm_error_is_announced(tmp_path, capsys):
+    """Same for a repair re-ask the server refuses outright: the exception
+    is swallowed by design (a failed fix round must not kill the task), so
+    at least the give-up must be visible."""
+    from pedacito import index as index_mod, verify as verify_mod
+    _write(tmp_path / "stub.js", "class A {\n    run() {}\n}\n")
+    idx = index_mod.Index(tmp_path, [])
+
+    class FailingClient:
+        stream_truncated = False
+        def chat(self, messages, max_tokens, schema=None, stream=False, **kw):
+            raise LLMError("server exploded")
+
+    agent = Agent(idx, FailingClient(), config_mod.Config())
+    finding = verify_mod.Finding("tests", "error", "",
+                                 "after your edits these tests fail")
+    reply = ("--- FILE: stub.js\n<<<<<<< SEARCH\n=======\n"
+             "class A {\n    run() {}\n}\n>>>>>>> REPLACE\n")
+    assert agent._repair_from_findings("fix stub", reply, [finding], []) == ""
+    err = capsys.readouterr().err
+    assert "re-ask failed (LLMError)" in err
+
+
+def test_window_rewrite_guard(tmp_path):
+    """A `write` lookup step only carries what the model has SEEN. In the
+    field a model read 40 lines of a 488-line file, then `write`d back that
+    window minus one line -- and the tool happily truncated the real file to
+    a torso. The guard refuses the signature: big shrink (>2x) whose content
+    is every line a verbatim, in-order copy of the original. A genuine
+    rewrite (new wording) still goes through, a full re-quote that deletes
+    one line is not a >2x shrink and stays legal, shrinking below the
+    60-line floor is everyday work, and a refused write leaves the file
+    untouched."""
+    import pathlib
+    from pedacito import tools as tools_mod
+
+    class FakeIndex:
+        root = pathlib.Path(tmp_path)
+        files = []
+        def resolve_file(self, f):
+            return None
+
+    cfg = config_mod.Config()
+    cfg.allow_write = True
+    idx = FakeIndex()
+    lines = [f"const item_{i} = {i};" for i in range(200)]
+    assert tools_mod.tool_write(idx, cfg, "big.js",
+                                "\n".join(lines)).startswith("CREATED")
+
+    # Middle-window verbatim excerpt, 40 of 200 lines: refused, file intact.
+    excerpt = "\n".join(lines[80:120])
+    obs = tools_mod.tool_write(idx, cfg, "big.js", excerpt)
+    assert obs.startswith("ERROR"), obs
+    assert "PARTIAL read" in obs
+    assert len((tmp_path / "big.js").read_text().splitlines()) == 200, \
+        "refused overwrite must not touch the file"
+
+    # Re-quoting the whole file minus one line: not a >2x shrink, allowed.
+    almost = "\n".join(lines[:17] + lines[18:])
+    assert tools_mod.tool_write(idx, cfg, "big.js",
+                                almost).startswith("WROTE")
+
+    # Genuine rewrite with invented content (shorter): allowed.
+    fresh = "\n".join(f"short_{i}" for i in range(30))
+    assert "WROTE big.js (30 lines)" in tools_mod.tool_write(
+        idx, cfg, "big.js", fresh)
+
+    # Below the 60-line floor: verbatim shrinking is legitimate editing.
+    small_lines = lines[:50]
+    assert tools_mod.tool_write(idx, cfg, "small.js",
+                                "\n".join(small_lines)).startswith("CREATED")
+    assert tools_mod.tool_write(idx, cfg, "small.js",
+                                "\n".join(small_lines[:4])).startswith("WROTE")
+
+
 # ------------------------------------------------------------------ budgets
 def test_default_budgets_fit_small_windows():
     """The historical failure: defaults sized for 32k+ models made every
@@ -1922,6 +2023,32 @@ def test_starter_pyproject_has_script_entry():
     data = tomllib.loads(STARTER_PYPROJECT.format(
         name="md2html", summary="markdown to html"))
     assert data["project"]["scripts"] == {"md2html": "main:main"}
+
+
+def test_apply_skeleton_pyproject_only_for_python_plans(tmp_path):
+    """A JS/HTML project must not get a starter pyproject.toml: it misleads
+    the repo brief, linter detection, and the model about the stack. Python
+    plans still get one; .gitignore is universal and stays."""
+    from pedacito import scaffold
+
+    js_plan = scaffold.Plan("Temple Dash", "canvas game", files=[
+        scaffold.PlannedFile("index.html", "shell"),
+        scaffold.PlannedFile("src/game-core.js", "pure logic"),
+        scaffold.PlannedFile("tests/game-core.test.js", "node --test"),
+    ], spec=scaffold.Spec("canvas game"))
+    created = scaffold.apply_skeleton(tmp_path / "js", js_plan,
+                                      dry_run=False, verbose=False)
+    assert "pyproject.toml" not in created
+    assert not (tmp_path / "js" / "pyproject.toml").exists()
+    assert (tmp_path / "js" / ".gitignore").exists()
+
+    py_plan = scaffold.Plan("md2html", "markdown to html", files=[
+        scaffold.PlannedFile("main.py", "CLI entry"),
+    ], spec=scaffold.Spec("markdown to html"))
+    created = scaffold.apply_skeleton(tmp_path / "py", py_plan,
+                                      dry_run=False, verbose=False)
+    assert "pyproject.toml" in created
+    assert (tmp_path / "py" / "pyproject.toml").exists()
 
 
 def test_first_import_error_detects_cross_file_mismatch(tmp_path):

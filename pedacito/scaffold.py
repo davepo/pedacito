@@ -606,11 +606,15 @@ def apply_skeleton(root: Path, plan: Plan, dry_run: bool = False,
         wanted.setdefault("README.md",
                           f"# {plan.project_name}\n\n{plan.summary or ''}\n\n"
                           "## Run\n\n```bash\npython main.py\n```\n")
-    name = "".join(c for c in plan.project_name.lower().replace(" ", "-")
-                   if c.isalnum() or c == "-").strip("-") or "project"
-    wanted.setdefault("pyproject.toml",
-                      STARTER_PYPROJECT.format(name=name,
-                                               summary=(plan.summary or name)[:120]))
+    if any(f.path.endswith(".py") for f in plan.files):
+        # A starter pyproject belongs in a Python plan only: in a JS/HTML project
+        # it would mislead the repo brief, the diagnostics, and the model about
+        # what stack and test command the project has.
+        name = "".join(c for c in plan.project_name.lower().replace(" ", "-")
+                       if c.isalnum() or c == "-").strip("-") or "project"
+        wanted.setdefault("pyproject.toml",
+                          STARTER_PYPROJECT.format(name=name,
+                                                   summary=(plan.summary or name)[:120]))
     wanted.setdefault(".gitignore", STARTER_GITIGNORE)
 
     for rel, text in sorted(wanted.items()):

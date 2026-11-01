@@ -1752,6 +1752,27 @@ def tool_write(index, cfg, file: str, content: str,
         return (f"ERROR: the resulting file is {len(text):,} chars, over the "
                 f"{max_chars:,} limit. Write a smaller file, or use edit "
                 "blocks.")
+    if existed and not append and original is not None:
+        # Window-rewrite guard. A `write` step can only carry what the model
+        # has seen; overwriting a big file from a partial read erases every
+        # line outside the window -- silently, since the result is valid text.
+        # The signature: the new content shrinks the file by more than half
+        # AND its lines all already occur, in order, in the original. A real
+        # rewrite changes or invents lines; a re-quote of a window does not.
+        old_ls = [l.strip() for l in original.splitlines() if l.strip()]
+        new_ls = [l.strip() for l in new_text.splitlines() if l.strip()]
+        if new_ls and len(old_ls) >= 60 and 2 * len(new_ls) < len(old_ls):
+            probe = iter(old_ls)
+            if all(l in probe for l in new_ls):
+                return (f"ERROR: refusing to overwrite {rel}: your content has "
+                        f"{len(new_ls)} non-blank lines but the file has "
+                        f"{len(old_ls)}, and every one of your lines is a "
+                        "verbatim copy from the file in order -- the signature "
+                        "of rewriting a file from a PARTIAL read, which would "
+                        "erase the lines you never saw. Make a targeted "
+                        "search/replace edit instead. If you truly mean to "
+                        "shrink this file, `read` it completely first so your "
+                        "new content can differ from what you keep.")
 
     if existed:
         err = _snapshot(index, cfg, rel, path)
