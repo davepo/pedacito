@@ -301,6 +301,9 @@ commands until you read it and run `pedacito trust`.
 
 ## Several models: profiles
 
+For VRAM-based model selection, thinking/reasoning advice, and role routing, see
+the [model guide](MODEL_GUIDE.md).
+
 ```toml
 [profiles.tiny]
 model = "qwen2.5-coder:1.5b"

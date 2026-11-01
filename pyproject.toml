@@ -53,4 +53,4 @@ packages = ["pedacito", "pedacito.gui"]
 # `pedacito how` reads these two files at runtime. Keep them in a normal
 # (non-editable) install as well as in a checkout.
 [tool.setuptools.data-files]
-"share/pedacito" = ["README.md", "QUICKSTART.md"]
+"share/pedacito" = ["README.md", "QUICKSTART.md", "MODEL_GUIDE.md"]

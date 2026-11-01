@@ -8,8 +8,9 @@ Usage
     pedacito how                                  # interactive help prompt
 
 Unlike every other Pedacito command, `how` does not need a project or an
-index. It builds a small in-memory corpus from README.md, QUICKSTART.md and
-Pedacito's Python source, finds the passages relevant to the question, and
+index. It builds a small in-memory corpus from README.md, QUICKSTART.md,
+MODEL_GUIDE.md and Pedacito's Python source, finds the passages relevant to the
+question, and
 asks the configured model to answer from those passages only. The current
 resolved config is included (with secrets hidden) so questions like "what
 should I run with my setup?" can be answered against the real settings.
@@ -36,6 +37,9 @@ from .llm import LLMClient, LLMError, estimate_tokens
 from .references import chunk_reference
 
 DOC_FILES = ("README.md", "QUICKSTART.md")
+# Optional docs: older installs may not have these, so they are not required
+# for find_docs_root(), but they join the help corpus when present.
+OPTIONAL_DOC_FILES = ("MODEL_GUIDE.md",)
 # Split long documentation sections and source units so retrieval can pick the
 # matching part instead of feeding a 20k-character section to a small model.
 MAX_ITEM_CHARS = 3200
@@ -192,7 +196,7 @@ def build_corpus(docs_root: Path | None = None) -> list[Chunk]:
     as searchable chunks."""
     root = docs_root or find_docs_root()
     chunks: list[Chunk] = []
-    for name in DOC_FILES:
+    for name in DOC_FILES + OPTIONAL_DOC_FILES:
         path = root / name
         if not path.is_file():
             continue

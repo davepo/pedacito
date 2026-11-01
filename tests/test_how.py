@@ -34,6 +34,7 @@ def test_corpus_contains_docs_templates_and_source():
     files = {c.file for c in chunks}
     assert "README.md" in files
     assert "QUICKSTART.md" in files
+    assert "MODEL_GUIDE.md" in files
     assert "pedacito/cli.py" in files
     assert "pedacito/config.py" in files
     # The starter config template is a module-level string, not a function;

@@ -142,8 +142,13 @@ an alias for `[server]`.
 
 ## Built-in help: `pedacito how`
 
+For model selection, VRAM sizing, thinking settings, and role routing, see the
+[model guide](MODEL_GUIDE.md). It has concrete starting points for 6, 8, 12, 16,
+24, and 32 GB GPUs.
+
 `pedacito how` answers questions about using Pedacito, drawing on this README,
-the [Quick Start](QUICKSTART.md), and the source. It needs no project and no
+the [Quick Start](QUICKSTART.md), the [model guide](MODEL_GUIDE.md), and the
+source. It needs no project and no
 index, only a model connection, and it uses your config (never sending
 `api_key`) so answers reflect your setup:
 
