@@ -1291,6 +1291,6 @@ def _review_build(root: Path, plan: Plan, summary: dict, cfg,
         port=cfg.review_port, open_browser=cfg.open_browser,
         timeout=cfg.review_timeout, on_url=lambda u: print(
             f"  waiting for sign-off at {u}", file=sys.stderr),
-        on_discard=discard)
+        on_discard=discard, diffs=diffs, task=f"new: {plan.project_name}")
     print(f"  {detail}", file=sys.stderr)
     return [] if outcome == "applied" else None

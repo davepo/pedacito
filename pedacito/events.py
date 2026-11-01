@@ -43,6 +43,9 @@ class EventLog:
         # `--jsonl`: also write every event, one per line, to this stream
         # (the real stdout, while human text is redirected to stderr).
         self.tee = None
+        # Live observers, called as fn(kind, fields) for every emit (the GUI
+        # streams steps from here). A failing listener is ignored.
+        self.listeners: list = []
 
     def _open(self) -> Path | None:
         if self.path is not None:
@@ -62,6 +65,11 @@ class EventLog:
     def emit(self, kind: str, _full: bool = False, **fields) -> None:
         """Record one event (`_full`: keep long strings, for answers and
         diffs). Never raises."""
+        for fn in list(self.listeners):
+            try:
+                fn(kind, fields)
+            except Exception:
+                pass
         if not self.enabled:
             return
         try:

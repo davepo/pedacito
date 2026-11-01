@@ -84,13 +84,16 @@ How to answer:
 """
 
 
-def answer(agent, question: str, verbose: bool = True, on_step=None) -> str:
+def answer(agent, question: str, verbose: bool = True, on_step=None,
+           stream: bool = False) -> str:
     """Answer one question about the indexed project and return the text.
 
     Runs the gather loop with the explanation framing, then answers in prose.
-    `on_step` is forwarded to `Agent.gather` for live progress.
+    `on_step` is forwarded to `Agent.gather` for live progress. `stream`
+    streams the prose through the client's stream callback (the GUI uses it);
+    the CLI keeps it off and prints the returned text.
     """
     gathered = agent.gather(question, verbose=verbose,
                             base=EXPLAIN_GATHER_BASE, on_step=on_step)
     return agent.answer(question, gathered, system=EXPLAIN_SYSTEM,
-                        include_edit_format=False, stream=False)
+                        include_edit_format=False, stream=stream)

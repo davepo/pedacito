@@ -407,12 +407,46 @@ branch, leaving your checkout untouched. Manage worktrees directly with
 ### `gui` — browser control panel
 
 ```bash
-pedacito gui [--port N] [--no-open]
+pedacito gui [PROJECT] [--profile NAME] [--port N] [--no-open]
 ```
 
-A local page (bound to `127.0.0.1`) to open a project, build the index, check
-the model, run tasks with the review page inline, ask `explain` questions, and
-restore snapshots. `how`, `new`, `auto`, and the advanced flags are CLI-only.
+A local page (bound to `127.0.0.1`, no CDN or extra dependencies, so it works
+offline) that runs the same engine as the commands (`ask`, `explain`, `auto`,
+`new`), so planning, preflight checks, escalation and post-edit tests behave
+identically.
+
+| Area | What it does |
+|---|---|
+| **Header** | Open a project (type a path, **Browse…** the machine's folders, or pick a recent one), choose its model profile, see the model server's status light and the session's token/cache/cost totals. |
+| **Chat** (left) | Four modes next to the box: **Task** (edit code; *review* or *write directly*, planning auto/always/never, max lookups), **Explain** (read-only questions, answer streams in), **Auto** (goal → plan → implement; plan-only or implement, verify command, repair rounds, task/minute caps, worktree, keep-going, pip-install), **New** (start a project from scratch in a folder: preview, build, build-then-review, skeleton only, and *complex* for the autonomous loop). **Attach** (or drag in) a text file as the task, question, or spec. While a task runs, type to **steer** the model, answer its clarifying questions inline, or **Stop** it. |
+| **Changes** (middle) | The proposed edits as *Old code | Updated code* side by side with word-level highlights. Accept or reject the whole set, untick files to accept only some, or **Edit updated** to hand-edit a file before accepting. Backups are made first and a file that changed on disk since the preview is refused. |
+| **Plan** (middle) | The `auto`/plan checklist with live progress; edit it, then **Run this plan**. |
+| **File** (middle) | Read-only viewer for any indexed file (click it in the tree). |
+| **Terminal** (bottom) | Everything pedacito prints, live, with ANSI colours — the same text the launching terminal shows. |
+| **Files** (right) | Filterable tree of the indexed files; files in the pending review are highlighted. |
+| **Settings** | See below. |
+
+Panels resize (drag the dividers), the layout and colour scheme are
+remembered, and on a narrow window the panels become tabs.
+
+**Settings** edits the user config or the open project's `.pedacito.toml`
+without touching the rest of the file — comments survive, every edit is checked
+with the same rules the loader uses before it is written, and the previous file
+is kept as `config.toml.bak`. Tabs: **Profiles** (create, duplicate, delete,
+make default; server URL, key, model with a *Test connection* that lists the
+server's models, tier, VRAM, JSON mode, and the common switches), **All
+settings** (every setting, searchable, with its help text and where its value
+comes from, applied globally or to one profile), and **Raw file**. With no
+config at all, a first-run form (with *Find servers* for LM Studio/Ollama) builds
+one. A project config's execution settings stay ignored until you trust it
+(*Review & trust…*, the same as `pedacito trust`).
+
+How it stays safe: it refuses requests with a foreign `Host`/`Origin`, accepts
+only JSON `POST`s, sends a strict Content-Security-Policy, and serves a project's
+files only from inside that project. API keys are never shown in the profile
+forms (leave the box blank to keep one); the **Raw file** tab does show the file
+as written, key included. Only one job runs at a time, and jobs that write directly take the
+same project lock as the command line.
 
 ### Measurement and upkeep
 

@@ -88,19 +88,21 @@ def test_write_files_keeps_first_backup_on_repeat_apply(tmp_path):
     assert (tmp_path / "a.txt").read_text() == "two\n"
 
 
-def test_gui_handler_guards_and_empty_nonce():
-    from pedacito import gui
+def test_gui_handler_guards_and_stale_review_ids():
+    from pedacito.gui import core, server
     from pedacito.local_server import LocalHTTPServer
-    srv = LocalHTTPServer(("127.0.0.1", 0), gui._Handler)
+    srv = LocalHTTPServer(("127.0.0.1", 0), server._Handler)
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     port = srv.server_address[1]
     try:
-        assert _req(port, "GET", "/state")[0] == 200
-        assert _req(port, "GET", "/state", headers={"Host": "evil.example"})[0] == 403
-        assert _req(port, "POST", "/run", {"task": "x", "apply": True},
+        assert _req(port, "GET", "/api/state")[0] == 200
+        assert _req(port, "GET", "/api/state",
+                    headers={"Host": "evil.example"})[0] == 403
+        assert _req(port, "POST", "/api/run", {"mode": "task", "text": "x"},
                     headers={"Content-Type": "text/plain"})[0] == 403
-        gui.STATE.clear_review()
-        assert _req(port, "POST", "/apply", {"nonce": ""})[0] == 403
+        core.STATE.review = None
+        assert _req(port, "POST", "/api/review/decide",
+                    {"id": 0, "action": "apply"})[0] == 409
     finally:
         srv.shutdown()
         srv.server_close()

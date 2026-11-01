@@ -1174,11 +1174,18 @@ def _review(root: Path, results, task: str, cfg, backup_dir, stamp: str) -> list
     outcome, detail = review_mod.run(
         page, nonce, writer, port=cfg.review_port,
         open_browser=cfg.open_browser, timeout=cfg.review_timeout,
-        on_url=lambda u: print(f"  waiting for sign-off at {u}", file=sys.stderr))
+        on_url=lambda u: print(f"  waiting for sign-off at {u}", file=sys.stderr),
+        diffs=diffs, task=task)
 
     if outcome == "applied":
         print(f"  {detail}", file=sys.stderr)
-        return [replace(r, message="applied via review") if r.ok else r
+        # A reviewer may sign off on only some files (the GUI can), dropping
+        # the rest from `diffs`; only those were written.
+        written = {d.rel for d in diffs}
+        return [replace(r, message="applied via review")
+                if r.ok and r.file in written
+                else replace(r, message="not written (left out of the review)")
+                if r.ok else r
                 for r in results]
     print(f"  {detail}", file=sys.stderr)
     return [replace(r, message=f"not written ({outcome})") if r.ok else r

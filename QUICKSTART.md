@@ -221,10 +221,13 @@ pedacito restore ~/code/anki --snapshot 20260830-005535
 
 ## More ways to work
 
-**Browser GUI.** `pedacito gui` opens a local page where you open a project,
-build the index, check the model, run tasks with the review page inline, ask
-`explain` questions, and restore snapshots. Install, configuration, and the
-other commands stay in the terminal.
+**Browser GUI.** `pedacito gui [PROJECT]` opens a local page for everything
+above: open a project and profile, run a **Task** (with the diff shown old vs
+updated, accept/reject per file), **Explain** questions, **Auto** (plan, then
+implement), or start a **New** project from scratch (including *complex*).
+Attach a task or spec file, steer or stop a running job, watch the live
+terminal, and edit your settings and profiles in **Settings** — no TOML by hand
+(it also builds your first config if you have none). Full tour in the README.
 
 **Interactive session.** `pedacito chat ~/code/anki` keeps the index warm
 between tasks (add `--apply` or `--review` for the whole session). Slash
@@ -397,7 +400,7 @@ To force a clean rebuild, delete `<project>/.pedacito/` (always safe) or pass
 | `pedacito diagnose` | Run the project's linter/type checker. |
 | `pedacito worktree create\|list\|remove NAME` | Manage isolated git worktrees. |
 | `pedacito restore PROJ` | Undo the last write. |
-| `pedacito gui` | Browser control panel. |
+| `pedacito gui [PROJECT]` | Browser control panel: tasks, explain, auto, new, review, settings. |
 
 Flags available on most commands: `--exclude 'pattern'`, `--include 'pattern'`,
 `--ext .kt`, `--steps N`, `--model ID`, `--url URL`, `--profile NAME`,

@@ -813,12 +813,25 @@ def save(root: Path, page: str, stamp: str) -> Path:
     return p
 
 
+# When set (the GUI does), `run` hands the review to this callable instead of
+# opening a second browser window. It receives the same inputs as keyword
+# arguments, plus `diffs` and `task`, and returns the same (outcome, detail).
+# A runner may drop entries from `diffs` in place before calling `writer()`
+# (per-file accept); callers therefore re-read `diffs` afterwards.
+RUNNER = None
+
+
 def run(page: str, nonce: str, writer, port: int = 0, open_browser: bool = True,
-        timeout: float = 1800.0, on_url=None, on_discard=None):
+        timeout: float = 1800.0, on_url=None, on_discard=None,
+        diffs=None, task: str = ""):
     """Serve the page on 127.0.0.1 and block until Apply/Discard or `timeout`
     seconds. `writer()` -> (ok, detail) is called on Apply; `on_discard()` on
     Discard, for flows whose files are already on disk (`new --review`).
-    Returns (outcome, detail); outcome is "applied", "cancelled" or "timeout"."""
+    Returns (outcome, detail); outcome is "applied", "cancelled" or "timeout".
+    `diffs` and `task` are only used by an installed `RUNNER`."""
+    if RUNNER is not None:
+        return RUNNER(page=page, nonce=nonce, writer=writer, timeout=timeout,
+                      on_discard=on_discard, diffs=diffs, task=task)
     srv = LocalHTTPServer(("127.0.0.1", port), _Handler)
     srv.page = page
     srv.nonce = nonce

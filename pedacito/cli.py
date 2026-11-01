@@ -1253,6 +1253,10 @@ def _main(argv=None) -> int:
     p_eval.add_argument("paths", nargs="*", default=["."], help=argparse.SUPPRESS)
 
     p_gui = sub.add_parser("gui", help="open the browser control panel")
+    p_gui.add_argument("project", nargs="?", default=None,
+                       help="project folder to open at startup")
+    p_gui.add_argument("--profile", metavar="NAME",
+                       help="model profile for that project")
     p_gui.add_argument("--port", type=int, default=0)
     p_gui.add_argument("--no-open", dest="open_browser", action="store_false")
 
@@ -1269,6 +1273,14 @@ def _main(argv=None) -> int:
         except KeyboardInterrupt:
             print("\nSetup cancelled.", file=sys.stderr)
             return 130
+        return 0
+
+    # The GUI loads config per project (and can create it), so it must start
+    # even when no valid config exists yet.
+    if args.cmd == "gui":
+        from . import gui as gui_mod
+        gui_mod.run(port=args.port, open_browser=args.open_browser,
+                    project=args.project, profile=args.profile)
         return 0
 
     if args.cmd == "worktree":
@@ -1385,11 +1397,6 @@ def _main(argv=None) -> int:
                     print(f"  that run also created {len(made)} file(s) "
                           f"({', '.join(made[:4])}); add --delete-created to "
                           "remove them", file=sys.stderr)
-            return 0
-
-        if args.cmd == "gui":
-            from . import gui as gui_mod
-            gui_mod.run(port=args.port, open_browser=args.open_browser)
             return 0
 
         if args.cmd == "files":
