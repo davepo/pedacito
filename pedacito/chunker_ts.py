@@ -23,17 +23,51 @@ from __future__ import annotations
 
 import gc
 import re
+from importlib.metadata import PackageNotFoundError, version as _dist_version
 
 from .chunker import (
     Chunk, _part_signature, _sha, _split_statements, split_lines,
 )
 
+
+def _version_tuple(raw: str) -> tuple[int, ...]:
+    """A comparable (major, minor, patch) tuple from a version string."""
+    parts: list[int] = []
+    for piece in (raw or "").split(".")[:3]:
+        m = re.match(r"\d+", piece)
+        parts.append(int(m.group()) if m else 0)
+    return tuple(parts)
+
+
+def _tree_sitter_is_safe(version: str) -> bool:
+    """False for tree-sitter >= 0.26, whose Node lifetime regression
+    (py-tree-sitter#472) segfaults CPython while a live tree is walked.
+    Pedacito pins `<0.26`; this guard keeps an environment that ignored the
+    pin from crashing the whole process instead of using the fallback
+    chunker."""
+    return _version_tuple(version) < (0, 26)
+
+
+_TS_DISABLED_REASON = ""
 try:
     from tree_sitter_language_pack import get_parser
-    TS_AVAILABLE = True
+    _ts_version = ""
+    try:
+        _ts_version = _dist_version("tree-sitter")
+    except PackageNotFoundError:                       # pragma: no cover
+        pass
+    if _ts_version and not _tree_sitter_is_safe(_ts_version):
+        get_parser = None
+        TS_AVAILABLE = False
+        _TS_DISABLED_REASON = (
+            f"tree-sitter {_ts_version} is unsafe (py-tree-sitter#472: "
+            "segfault on live Node objects); install tree-sitter<0.26")
+    else:
+        TS_AVAILABLE = True
 except ImportError:                                    # pragma: no cover
     get_parser = None
     TS_AVAILABLE = False
+    _TS_DISABLED_REASON = "tree-sitter-language-pack is not installed"
 
 # File extension -> tree-sitter grammar name. The "typescript" grammar rejects
 # JSX, hence the separate "tsx".
