@@ -318,11 +318,45 @@ class ProjectBusy(RuntimeError):
     """Another live pedacito process is writing to this project."""
 
 
+def _pid_alive_windows(pid: int) -> bool:
+    """Existence check that works on Windows. `os.kill(pid, 0)` is not a
+    probe there: Windows calls TerminateProcess for every signal except the
+    console control events, so checking a live lock holder would kill it."""
+    import ctypes
+    from ctypes import wintypes
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL,
+                                     wintypes.DWORD]
+    kernel32.OpenProcess.restype = wintypes.HANDLE
+    kernel32.GetExitCodeProcess.argtypes = [
+        wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
+    kernel32.GetExitCodeProcess.restype = wintypes.BOOL
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel32.CloseHandle.restype = wintypes.BOOL
+
+    PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+    ERROR_ACCESS_DENIED = 5
+    STILL_ACTIVE = 259
+    handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+    if not handle:
+        # A process we may not inspect still exists (another user's run).
+        return ctypes.get_last_error() == ERROR_ACCESS_DENIED
+    try:
+        code = wintypes.DWORD()
+        if not kernel32.GetExitCodeProcess(handle, ctypes.byref(code)):
+            return False
+        return code.value == STILL_ACTIVE
+    finally:
+        kernel32.CloseHandle(handle)
+
+
 def _pid_alive(pid: int) -> bool:
     if pid <= 0:
         return False
+    import os
+    if os.name == "nt":
+        return _pid_alive_windows(pid)
     try:
-        import os
         os.kill(pid, 0)
     except ProcessLookupError:
         return False

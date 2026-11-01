@@ -274,6 +274,7 @@ def test_run_lock_blocks_a_live_holder_and_takes_over_a_stale_one(tmp_path):
             raise AssertionError("expected ProjectBusy")
         except workspace.ProjectBusy as e:
             assert str(sleeper.pid) in str(e)
+            assert sleeper.poll() is None       # probing must not kill the holder
     finally:
         sleeper.kill()
         sleeper.wait()

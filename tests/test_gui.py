@@ -265,7 +265,9 @@ def test_folder_browser_lists_dirs_hides_dotfiles_and_flags_projects(tmp_path):
 def test_file_viewer_stays_inside_the_project(gui):
     root = gui.tmp / "p"
     root.mkdir()
-    (root / "a.py").write_text("x = 1\n")
+    # The viewer returns the file's bytes verbatim; write LF explicitly so
+    # Windows' text-mode newline translation does not turn this into CRLF.
+    (root / "a.py").write_bytes(b"x = 1\n")
     (root / "b.bin").write_bytes(b"\x00\x01\x02")
     (gui.tmp / "secret.txt").write_text("nope")
     core.STATE.root = root
