@@ -494,6 +494,76 @@ def render(rows: list[dict], summary: dict) -> str:
     return "\n".join(out)
 
 
+def compare_reports(baseline: dict, current: dict,
+                    max_token_growth: float = 0.20,
+                    max_time_growth: float = 0.50) -> tuple[list[str], list[str]]:
+    """A/B gate: regressions and improvements in two `eval --out` reports.
+
+    Hard failures: lower pass/locate/first-apply-clean rates, more injection
+    successes, or token/time growth beyond the tolerances. This is deliberately
+    deterministic and conservative: it gates a release, it does not judge a
+    model's prose.
+    """
+    b = baseline.get("summary") or {}
+    c = current.get("summary") or {}
+    regressions: list[str] = []
+    improvements: list[str] = []
+
+    def rate(key, label):
+        old, new = float(b.get(key, 0) or 0), float(c.get(key, 0) or 0)
+        if new + 0.001 < old:
+            regressions.append(f"{label}: {old:.0%} -> {new:.0%}")
+        elif new > old + 0.001:
+            improvements.append(f"{label}: {old:.0%} -> {new:.0%}")
+
+    rate("pass_rate", "pass rate")
+    rate("locate_rate", "locate rate")
+    rate("first_apply_clean", "first-apply-clean")
+
+    old_inj = int(b.get("injection_followed", 0) or 0)
+    new_inj = int(c.get("injection_followed", 0) or 0)
+    if new_inj > old_inj:
+        regressions.append(f"injection followed: {old_inj} -> {new_inj}")
+    elif new_inj < old_inj:
+        improvements.append(f"injection followed: {old_inj} -> {new_inj}")
+
+    def growth(key, label, tolerance):
+        old = float(b.get(key, 0) or 0)
+        new = float(c.get(key, 0) or 0)
+        if old > 0 and new > old * (1 + tolerance):
+            regressions.append(
+                f"{label}: {old:.0f} -> {new:.0f} "
+                f"(+{(new / old - 1) * 100:.0f}% > {tolerance:.0%})")
+        elif old > 0 and new < old * 0.8:
+            improvements.append(f"{label}: {old:.0f} -> {new:.0f}")
+
+    growth("mean_prompt_tokens", "mean prompt tokens", max_token_growth)
+    growth("mean_completion_tokens", "mean completion tokens", max_token_growth)
+    growth("mean_calls", "mean calls", max_token_growth)
+    growth("mean_seconds", "mean seconds", max_time_growth)
+
+    old_f = b.get("failures") or {}
+    new_f = c.get("failures") or {}
+    for kind, n in new_f.items():
+        if int(n) > int(old_f.get(kind, 0)):
+            regressions.append(f"failure '{kind}': {old_f.get(kind, 0)} -> {n}")
+    return regressions, improvements
+
+
+def render_compare(regressions: list[str], improvements: list[str]) -> str:
+    lines = ["A/B gate vs baseline:"]
+    if regressions:
+        lines.append("  REGRESSIONS")
+        lines += [f"    - {r}" for r in regressions]
+    if improvements:
+        lines.append("  improvements")
+        lines += [f"    + {r}" for r in improvements]
+    if not regressions and not improvements:
+        lines.append("  no material change")
+    lines.append("  result: " + ("FAIL" if regressions else "PASS"))
+    return "\n".join(lines)
+
+
 def run_cli(args, cfg) -> int:
     """`pedacito eval`."""
     from .llm import LLMClient
@@ -522,4 +592,17 @@ def run_cli(args, cfg) -> int:
             {"model": cfg.model, "pack": getattr(cfg, "prompt_pack", ""),
              "summary": summary, "rows": rows}, indent=1), encoding="utf-8")
         print(f"\nreport: {args.out}")
-    return 0 if summary["pass_rate"] > 0 else 1
+    failed = summary["pass_rate"] <= 0
+    if getattr(args, "baseline", None):
+        try:
+            base = json.loads(Path(args.baseline).read_text(encoding="utf-8"))
+        except (OSError, ValueError) as e:
+            print(f"Cannot read baseline {args.baseline}: {e}", file=sys.stderr)
+            return 2
+        reg, imp = compare_reports(
+            base, {"summary": summary, "rows": rows},
+            max_token_growth=float(getattr(args, "max_token_growth", 0.20)),
+            max_time_growth=float(getattr(args, "max_time_growth", 0.50)))
+        print("\n" + render_compare(reg, imp))
+        failed = failed or bool(reg)
+    return 1 if failed else 0

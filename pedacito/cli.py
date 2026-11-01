@@ -81,6 +81,9 @@ def _add_common(p):
                    help="run against a recording instead of a model server "
                         "(no model needed; reports where the harness's prompts "
                         "differ from the recording)")
+    p.add_argument("--strict-replay", dest="strict_replay", action="store_true",
+                   help="with --replay: exit 1 when any prompt differs from "
+                        "the recording (CI A/B gate)")
     p.add_argument("--jsonl", action="store_true",
                    help="machine-readable run: one JSON event per line on "
                         "stdout (steps, calls, the answer and diffs), human "
@@ -594,6 +597,17 @@ def _wants_review(args, cfg) -> bool:
     return bool(getattr(args, "review", False) or cfg.review)
 
 
+def _strict_replay_error(args, client) -> str:
+    """The strict-replay failure text, or '' when the gate passes/disabled."""
+    if not getattr(args, "strict_replay", False):
+        return ""
+    from . import replay as replay_mod
+    if isinstance(client, replay_mod.Replayer) and client.diverged:
+        return ("strict replay: the harness's prompts differed from the "
+                f"recording at call(s) {client.diverged[:8]}")
+    return ""
+
+
 def _cmd_auto(args, cfg, client, idx, root: Path) -> int:
     """`pedacito auto`: generate a task list from a goal (or reuse a plan
     file), then implement every unchecked task in a fresh context window,
@@ -849,6 +863,70 @@ def _cmd_prune(args) -> int:
     return 0
 
 
+def _cmd_serve(args) -> int:
+    """`pedacito serve`: start a background dev server and register it."""
+    from . import processes
+    root = _root(args)
+    cfg = _light_config(args)
+    command = [c for c in (getattr(args, "command", None) or [])
+               if c != "--"]
+    if not command:
+        print("Usage: pedacito serve --root PROJ [--name NAME] -- COMMAND...",
+              file=sys.stderr)
+        return 2
+    try:
+        rec = processes.start(
+            root, command, name=getattr(args, "name", "") or "",
+            cfg=cfg,
+            wait=(args.wait if getattr(args, "wait", None) is not None
+                  else cfg.serve_wait))
+    except (OSError, ValueError) as e:
+        print(f"serve error: {e}", file=sys.stderr)
+        return 2
+    print(f"{rec['name']} [{rec.get('status')}] pid {rec.get('pid')}")
+    if rec.get("url"):
+        print(f"url: {rec['url']}")
+    print(f"log: {rec['log']}")
+    return 0 if rec.get("status") == "running" else 1
+
+
+def _cmd_procs(args) -> int:
+    """`pedacito procs`: list, show logs from, or stop background servers."""
+    from . import processes
+    root = _root(args)
+    action = getattr(args, "action", "list") or "list"
+    name = getattr(args, "name", "") or ""
+    if action == "list":
+        print(processes.render_list(root))
+        return 0
+    if not name:
+        print(f"procs {action} needs a process NAME", file=sys.stderr)
+        return 2
+    if action == "logs":
+        print(processes.logs(root, name, tail=args.tail))
+        return 0
+    if action == "stop":
+        print(processes.stop(root, name))
+        return 0
+    print(f"unknown procs action: {action}", file=sys.stderr)
+    return 2
+
+
+def _cmd_lsp(args) -> int:
+    """`pedacito lsp`: definition/references/hover/diagnostics via a server."""
+    from . import lsp
+    root = _root(args)
+    cfg = _light_config(args)
+    rel = (args.file or "").replace("\\", "/")
+    try:
+        rel = Path(rel).resolve().relative_to(root).as_posix()
+    except (ValueError, OSError):
+        pass
+    print(lsp.result(root, cfg, args.op, rel,
+                     line=args.line, column=args.column))
+    return 0
+
+
 def _cmd_memory(args) -> int:
     """`pedacito memory`: list, add or forget remembered facts."""
     from . import memory
@@ -1071,6 +1149,8 @@ def _main(argv=None) -> int:
     p_ask.add_argument("--no-review", dest="no_review", action="store_true",
                        help="never open the reviewer, even if config enables it")
     p_ask.add_argument("--reindex", action="store_true", help="force a fresh index first")
+    p_ask.add_argument("--continue", dest="continue_", action="store_true",
+                       help="resume the newest ask checkpoint as context")
     p_ask.add_argument("--plan", action="store_true",
                        help="split the task into single-focus steps, each run "
                             "in a fresh context (with one re-plan after a "
@@ -1099,6 +1179,10 @@ def _main(argv=None) -> int:
     p_new.add_argument("--plan-only", dest="plan_only", action="store_true",
                        help="stop after the plan + header skeleton; implement "
                            "later with ordinary `ask --apply` runs")
+    p_new.add_argument("--design", action="store_true",
+                       help="design interfaces, data shapes and tests first; "
+                            "save .pedacito/design.md and build tests before "
+                            "sources")
     p_new.add_argument("--apply", action="store_true",
                        help="write the generated files to disk (default: dry run)")
     p_new.add_argument("--review", action="store_true",
@@ -1181,6 +1265,9 @@ def _main(argv=None) -> int:
     p_chat.add_argument("--apply", action="store_true")
     p_chat.add_argument("--review", action="store_true")
     p_chat.add_argument("--no-review", dest="no_review", action="store_true")
+    p_chat.add_argument("--resume", action="store_true",
+                        help="seed the first task with the newest chat "
+                             "checkpoint")
 
     p_cal = sub.add_parser(
         "calibrate", help="measure the configured model (tool choice, edit "
@@ -1204,6 +1291,43 @@ def _main(argv=None) -> int:
     p_prune.add_argument("--root", default=None)
     p_prune.add_argument("--config", metavar="FILE")
     p_prune.add_argument("--profile", metavar="NAME")
+
+    p_serve = sub.add_parser(
+        "serve", help="start a background dev server (registered under "
+                      ".pedacito/procs/)")
+    p_serve.add_argument("command", nargs=argparse.REMAINDER,
+                         help="the command to run; use `-- COMMAND...`")
+    p_serve.add_argument("--name", default="",
+                         help="registry name (default: derived from the command)")
+    p_serve.add_argument("--wait", type=float, default=None,
+                         help="seconds to wait for a printed URL")
+    p_serve.add_argument("--root", default=None)
+    p_serve.add_argument("--config", metavar="FILE")
+    p_serve.add_argument("--profile", metavar="NAME")
+
+    p_procs = sub.add_parser(
+        "procs", help="list, show logs from, or stop background servers")
+    p_procs.add_argument("action", nargs="?", default="list",
+                         choices=["list", "logs", "stop"])
+    p_procs.add_argument("name", nargs="?", default="")
+    p_procs.add_argument("--tail", type=int, default=4000,
+                         help="with logs: last N characters (default 4000)")
+    p_procs.add_argument("--root", default=None)
+    p_procs.add_argument("--config", metavar="FILE")
+    p_procs.add_argument("--profile", metavar="NAME")
+
+    p_lsp = sub.add_parser(
+        "lsp", help="exact symbols/diagnostics through an optional language "
+                    "server (allow_lsp)")
+    p_lsp.add_argument("--file", required=True, help="project-relative file")
+    p_lsp.add_argument("--op", default="definition",
+                       choices=["definition", "references", "hover",
+                                "diagnostics"])
+    p_lsp.add_argument("--line", type=int, default=1)
+    p_lsp.add_argument("--column", type=int, default=1)
+    p_lsp.add_argument("--root", default=None)
+    p_lsp.add_argument("--config", metavar="FILE")
+    p_lsp.add_argument("--profile", metavar="NAME")
 
     p_mem = sub.add_parser(
         "memory", help="list, add or forget the facts Pedacito remembers")
@@ -1246,6 +1370,18 @@ def _main(argv=None) -> int:
     p_eval.add_argument("--task", action="append", default=[], metavar="ID",
                         help="run only this task id; repeatable")
     p_eval.add_argument("--out", metavar="FILE", help="write the JSON report here")
+    p_eval.add_argument("--baseline", metavar="FILE",
+                        help="A/B gate: compare this run's metrics with an "
+                             "earlier eval --out report; exit nonzero on a "
+                             "regression")
+    p_eval.add_argument("--max-token-growth", type=float, default=0.20,
+                        metavar="FRAC",
+                        help="allow this much token growth vs baseline "
+                             "(default 0.20)")
+    p_eval.add_argument("--max-time-growth", type=float, default=0.50,
+                        metavar="FRAC",
+                        help="allow this much wall-time growth vs baseline "
+                             "(default 0.50)")
     p_eval.add_argument("--list", action="store_true", help="list tasks and exit")
     for flag in ("--url", "--model", "--config", "--profile"):
         p_eval.add_argument(flag)
@@ -1288,7 +1424,8 @@ def _main(argv=None) -> int:
     if args.cmd == "diagnose":
         return _cmd_diagnose(args)
     light = {"prune": _cmd_prune, "memory": _cmd_memory, "trust": _cmd_trust,
-             "tests": _cmd_tests, "skills": _cmd_skills}
+             "tests": _cmd_tests, "skills": _cmd_skills,
+             "serve": _cmd_serve, "procs": _cmd_procs, "lsp": _cmd_lsp}
     if args.cmd in light:
         try:
             return light[args.cmd](args)
@@ -1512,6 +1649,7 @@ def _main(argv=None) -> int:
                 if getattr(args, "max_minutes", None) is not None
                 else cfg.auto_max_minutes,
                 keep_going=args.keep_going,
+                design=bool(getattr(args, "design", False)),
                 auto_install=bool(getattr(args, "auto_install", False)
                                   or cfg.auto_install_deps))
             s = client.stats
@@ -1559,6 +1697,22 @@ def _main(argv=None) -> int:
             if hooks_mod.has_hooks(cfg, "session_start") else None
 
         root = _root(args)
+        from . import checkpoint
+        resume_context = ""
+        if args.cmd == "ask" and getattr(args, "continue_", False):
+            cp = checkpoint.latest(root, "ask")
+            if cp is None:
+                print("No ask checkpoint to continue. Run `pedacito ask` "
+                      "once first, or omit --continue.", file=sys.stderr)
+                return 2
+            resume_context = checkpoint.render(cp)
+        elif args.cmd == "chat" and getattr(args, "resume", False):
+            cp = checkpoint.latest(root, "chat")
+            if cp is None:
+                print("No chat checkpoint to resume.", file=sys.stderr)
+                return 2
+            resume_context = checkpoint.render(cp)
+            print("\n" + resume_context, file=sys.stderr)
         if args.cmd in ("ask", "chat", "auto") and getattr(args, "apply", False):
             try:
                 workspace.acquire_lock(root)
@@ -1574,9 +1728,13 @@ def _main(argv=None) -> int:
 
         def run(task: str):
             """Execute one task end to end through the shared inner loop."""
-            nonlocal idx, agent, cfg, client
+            nonlocal idx, agent, cfg, client, resume_context
             cfg, client, agent = locals_ref["cfg"], locals_ref["client"], locals_ref["agent"]
             idx = locals_ref["idx"]
+            if resume_context:
+                task = (resume_context + "\n\nNEW TASK\n" + task)
+                resume_context = ""
+            locals_ref["last_result"] = None
             from . import plan as plan_mod
             want_plan = getattr(args, "plan", False) or (
                 not getattr(args, "no_plan", False)
@@ -1594,13 +1752,30 @@ def _main(argv=None) -> int:
                 return code
             tr = loop.run_task(root, cfg, client, agent, idx, task,
                                apply=args.apply, review=_wants_review(args, cfg))
+            locals_ref["last_result"] = tr
             idx = tr.idx
             agent.index = idx
             locals_ref["idx"] = idx
 
+        def save_checkpoint(task: str):
+            """Persist what the last task actually said, for --continue/--resume."""
+            tr = locals_ref.get("last_result")
+            if tr is None:
+                return
+            msgs = getattr(agent, "_messages", None) or []
+            checkpoint.save(
+                root, args.cmd, task, msgs,
+                getattr(tr, "reply", "") if tr is not None else "", cfg,
+                extra={"steps": list(getattr(tr, "steps", []) or [])[:60],
+                       "applied": bool(getattr(tr, "applied", False))})
+
         if args.cmd == "ask":
             try:
                 run(args.task)
+                try:
+                    save_checkpoint(args.task)
+                except (OSError, ValueError):
+                    pass                 # checkpointing must not lose the task
             except KeyboardInterrupt:
                 print("\nCancelled. Nothing further was applied; "
                       "`pedacito restore` undoes anything already written.",
@@ -1609,11 +1784,21 @@ def _main(argv=None) -> int:
             print("\n" + _usage_line(client), file=sys.stderr)
             from . import replay as replay_mod
             replay_mod.report(client)
+            strict = _strict_replay_error(args, client)
+            if strict:
+                print(f"ERROR: {strict}", file=sys.stderr)
+                elog.emit("exit", code=1)
+                return 1
             elog.emit("exit", code=0)
             return 0
 
         if args.cmd == "auto":
-            return _cmd_auto(args, cfg, client, idx, root)
+            code = _cmd_auto(args, cfg, client, idx, root)
+            strict = _strict_replay_error(args, client)
+            if strict:
+                print(f"ERROR: {strict}", file=sys.stderr)
+                return 1
+            return code
 
         # chat: interactive loop with the index kept warm between tasks
         def banner():
@@ -1652,6 +1837,10 @@ def _main(argv=None) -> int:
                             locals_ref["cfg"].__dict__.pop("_steer", None)
                 else:
                     run(task)
+                try:
+                    save_checkpoint(task)
+                except (OSError, ValueError):
+                    pass                 # checkpointing must not end the session
             except KeyboardInterrupt:
                 # Ctrl-C stops the current task, never the whole session.
                 try:
@@ -1663,6 +1852,10 @@ def _main(argv=None) -> int:
                       file=sys.stderr)
             except LLMError as e:
                 print(f"\nERROR: {e}", file=sys.stderr)
+        strict = _strict_replay_error(args, client)
+        if strict:
+            print(f"ERROR: {strict}", file=sys.stderr)
+            return 1
         return 0
 
     except LLMError as e:

@@ -740,6 +740,13 @@ class Agent:
             except Exception:
                 pass
         try:
+            from . import design as design_mod
+            design_brief = design_mod.brief(self.index.root)
+            if design_brief:
+                bits.append(design_brief)
+        except Exception:
+            pass
+        try:
             git = gitinfo.preamble(self.index.root, self.cfg)
         except Exception:
             git = ""

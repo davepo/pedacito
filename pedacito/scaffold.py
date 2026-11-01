@@ -292,14 +292,20 @@ def _safe_rel(path: str, root: Path) -> str | None:
     return rel
 
 
-def build_plan(spec: Spec, client, cfg, root: Path, verbose: bool = True) -> Plan:
+def build_plan(spec: Spec, client, cfg, root: Path, verbose: bool = True,
+               design: dict | None = None) -> Plan:
     """Ask the model for a file plan, then sanitise it: dedupe paths, drop
     entries that escape the root or have no extension, cap at cfg.max_new_files.
-    Raises LLMError if nothing usable comes back."""
+    Raises LLMError if nothing usable comes back. `design`, when given, is a
+    compact architecture contract the file list must follow."""
     limit = getattr(cfg, "max_new_files", 24)
     budget = getattr(cfg, "max_spec_chars", MAX_SPEC_CHARS)
     body = spec.text[:budget]
-    user = (f"SPECIFICATION ({spec.origin})\n\n{body}\n\n"
+    extra = ""
+    if design:
+        from . import design as design_mod
+        extra = "\n\n" + design_mod.planner_context(design)
+    user = (f"SPECIFICATION ({spec.origin})\n\n{body}{extra}\n\n"
             f"Plan at most {limit} files for this project.")
     messages = [{"role": "system", "content": PLAN_SYSTEM},
                 {"role": "user", "content": user}]
@@ -372,16 +378,23 @@ def _stub_language_error(rel: str, code: str) -> str | None:
     return None
 
 
-def build_interface(plan: Plan, client, cfg, verbose: bool = True) -> dict[str, str]:
+def build_interface(plan: Plan, client, cfg, verbose: bool = True,
+                    design: dict | None = None) -> dict[str, str]:
     """Fix the public API of every source file in ONE call, so the per-file
-    build only fills bodies against known signatures. Returns {path: stub_code}."""
+    build only fills bodies against known signatures. Returns {path: stub_code}.
+    `design`, when given, supplies the interface/data contract the stubs must
+    follow."""
     sources = plan.sources or plan.files
     file_tree = "\n".join(f"  {f.path}  -- {f.purpose}" for f in sources)
     body = plan.spec.text[:getattr(cfg, "max_spec_chars", MAX_SPEC_CHARS) // 2]
+    contract = ""
+    if design:
+        from . import design as design_mod
+        contract = "\n\n" + design_mod.planner_context(design)
     messages = [
         {"role": "system", "content": INTERFACE_SYSTEM},
         {"role": "user", "content":
-            f"SPECIFICATION\n\n{body}\n\nFILE TREE\n\n{file_tree}\n\n"
+            f"SPECIFICATION\n\n{body}{contract}\n\nFILE TREE\n\n{file_tree}\n\n"
             f"Write the signature stubs for each of these {len(sources)} "
             "files."},
     ]
@@ -480,16 +493,24 @@ def _top_units(idx, rel: str) -> list[tuple[str, int, int]]:
     return units
 
 
-def plan_tasks(plan: Plan, idx=None, max_lines: int = 0) -> list[str]:
+def plan_tasks(plan: Plan, idx=None, max_lines: int = 0,
+               include_tests: bool = False,
+               tests_first: bool = False) -> list[str]:
     """One implementation task per source file, in plan order: the checklist
     `new --complex` hands to the autonomous loop.
 
     `__init__.py` files are skipped (already complete; a "nothing to do" answer
     would read as a failed task). With `idx` and a positive `max_lines`, a file
     whose stub is longer is split into one task per group of top-level
-    definitions, so a whole-file write cannot overflow the output budget."""
+    definitions, so a whole-file write cannot overflow the output budget.
+    `include_tests` adds planned test files; `tests_first` puts them before
+    sources (used by spec-driven scaffolding)."""
+    sources = list(plan.sources or plan.files)
+    tests = [t for t in plan.tests if t not in sources]
+    files = (tests + sources) if (include_tests and tests_first) else (
+        sources + tests if include_tests else sources)
     tasks = []
-    for f in (plan.sources or plan.files):
+    for f in files:
         if Path(f.path).name == "__init__.py":
             continue
         purpose = f" -- {f.purpose}" if f.purpose else ""
@@ -715,14 +736,20 @@ def build_pass(client, cfg, idx, plan: Plan, target: PlannedFile,
 
 
 def build_project(client, cfg, idx, plan: Plan, verbose: bool = True,
-                  on_file=None, backup_dir=None) -> dict:
+                  on_file=None, backup_dir=None,
+                  tests_first: bool | None = None) -> dict:
     """Run a build pass for each planned source file, in plan order, stopping
     early if the server goes away. Returns
-    {"done": [paths], "failed": [(path, message)], "skipped": [paths]}."""
-    # sources first, then the tests that exercise them (a planner that emits
-    # test stubs expects them filled in; they used to be silently skipped)
-    targets = (plan.sources or plan.files) + [
-        t for t in plan.tests if t not in (plan.sources or ())]
+    {"done": [paths], "failed": [(path, message)], "skipped": [paths]}.
+
+    With `tests_first` (spec-driven scaffolding), test stubs are implemented
+    before their sources so the tests define the contract. The default keeps
+    the historical source-first order."""
+    sources = list(plan.sources or plan.files)
+    tests = [t for t in plan.tests if t not in sources]
+    if tests_first is None:
+        tests_first = bool(getattr(cfg, "build_tests_first", False))
+    targets = (tests + sources) if tests_first else (sources + tests)
     done: list[str] = []
     failed: list[tuple[str, str]] = []
     skipped: list[str] = []
@@ -1019,7 +1046,8 @@ def run_new(root: Path, cfg, client, spec: Spec, *, apply: bool = False,
             verbose: bool = True, complex: bool = False, verify: str = "",
             repair_rounds: int | None = None, max_tasks: int | None = None,
             max_minutes: int | None = None,
-            keep_going: bool = False, auto_install: bool = False) -> int:
+            keep_going: bool = False, auto_install: bool = False,
+            design: bool = False) -> int:
     """Plan a new project from `spec`, lay down its skeleton, and (unless asked
     to stop earlier) implement every source file. Returns a process exit code;
     progress goes to stderr.
@@ -1045,14 +1073,30 @@ def run_new(root: Path, cfg, client, spec: Spec, *, apply: bool = False,
                   file=sys.stderr)
             return 2
 
-    plan = build_plan(spec, client, cfg, root, verbose=verbose)
+    design_doc = None
+    if design:
+        from . import design as design_mod
+        print("\n--- designing interfaces, data shapes, and tests ---",
+              file=sys.stderr)
+        design_doc = design_mod.generate(client, cfg, spec, root)
+        warnings = design_mod.validate(design_doc, cfg)
+        print(design_mod.render(design_doc))
+        if warnings:
+            print("\n[design warnings]", file=sys.stderr)
+            for w in warnings:
+                print(f"  - {w}", file=sys.stderr)
+        print(f"  [saved {root / '.pedacito' / 'design.md'}]", file=sys.stderr)
+
+    plan = build_plan(spec, client, cfg, root, verbose=verbose,
+                      design=design_doc)
     print(render_plan(plan))
 
     wants_skeleton = plan_only or apply or review
     stubs = {}
     if wants_skeleton:
         # One call fixes the API contract so cross-file imports stay consistent.
-        stubs = build_interface(plan, client, cfg, verbose=verbose)
+        stubs = build_interface(plan, client, cfg, verbose=verbose,
+                                design=design_doc)
     created = apply_skeleton(root, plan, dry_run=not wants_skeleton,
                              verbose=verbose, stubs=stubs)
     if not wants_skeleton:
@@ -1089,7 +1133,8 @@ def run_new(root: Path, cfg, client, spec: Spec, *, apply: bool = False,
                             verify=verify, repair_rounds=repair_rounds,
                             max_tasks=max_tasks, max_minutes=max_minutes,
                             keep_going=keep_going,
-                            verbose=verbose, auto_install=auto_install)
+                            verbose=verbose, auto_install=auto_install,
+                            design=design_doc is not None)
 
     want_write = apply or review
     when = None
@@ -1102,7 +1147,8 @@ def run_new(root: Path, cfg, client, spec: Spec, *, apply: bool = False,
           f"({'WRITING' if apply else 'for review'}) ---",
           file=sys.stderr)
     summary = build_project(client, cfg, idx, plan, verbose=verbose,
-                            backup_dir=backup_dir)
+                            backup_dir=backup_dir,
+                            tests_first=True if design_doc else None)
     print("\n" + summarise_result(summary))
 
     # Files are built independently, so repair cross-file import mismatches.
@@ -1127,7 +1173,8 @@ def _run_complex(root: Path, cfg, client, idx, plan: Plan, spec: Spec, *,
                  max_tasks: int | None = None,
                  max_minutes: int | None = None,
                  keep_going: bool = False,
-                 verbose: bool = True, auto_install: bool = False) -> int:
+                 verbose: bool = True, auto_install: bool = False,
+                 design: bool = False) -> int:
     """Complex mode: with skeleton, stubs and index in place, hand
     implementation to the autonomous loop. The plan becomes a resumable
     checklist (cfg.auto_plan_file, default PLAN.md), one task per source file,
@@ -1143,7 +1190,8 @@ def _run_complex(root: Path, cfg, client, idx, plan: Plan, spec: Spec, *,
 
     plan_file = root / getattr(cfg, "auto_plan_file", "PLAN.md")
     split_lines = int(getattr(cfg, "auto_split_lines", 0) or 0)
-    titles = plan_tasks(plan, idx=idx, max_lines=split_lines)
+    titles = plan_tasks(plan, idx=idx, max_lines=split_lines,
+                        include_tests=design, tests_first=design)
     loop.write_plan(plan_file, plan.project_name or spec.title, titles)
 
     print(f"\n--- auto: implementing {len(titles)} task(s) in fresh contexts "

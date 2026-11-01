@@ -76,6 +76,13 @@ class CancelledError(LLMError):
     kind = "cancelled"
 
 
+class CircuitOpenError(LLMError):
+    """Repeated transport/server failures opened the circuit breaker; callers
+    get a fast, actionable error instead of another timeout."""
+
+    kind = "circuit"
+
+
 class _Transient(LLMError):
     """Worth retrying: model still loading, or the server is busy.
 
@@ -914,6 +921,11 @@ class LLMClient:
         # empty-completion retry uses it to tell an instant-EOS flake (retry
         # identical) from a thinking runaway (retry with thinking disabled).
         self.last_reasoning_chars = 0
+        # Circuit breaker: consecutive transport/server failures, and the
+        # monotonic deadline before which calls fail fast. A success closes it.
+        self._failures = 0
+        self._circuit_until = 0.0
+        self.circuit_trips = 0
 
     def _native_for(self, schema: dict | None, stream: bool) -> bool:
         """Whether this request should use the model's native tool-call channel
@@ -980,10 +992,48 @@ class LLMClient:
         chunk. Safe from any thread; cleared when the next call starts."""
         self._cancel.set()
 
+    def _circuit_enabled(self) -> bool:
+        return bool(getattr(self.cfg, "circuit_breaker", True))
+
+    def _check_circuit(self) -> None:
+        """Fail fast while the breaker is open; half-open after the cooldown."""
+        if not self._circuit_enabled() or not self._circuit_until:
+            return
+        now = time.monotonic()
+        if now < self._circuit_until:
+            wait = self._circuit_until - now
+            raise CircuitOpenError(
+                f"The model server failed repeatedly; pausing requests for "
+                f"another {wait:.0f}s (circuit breaker). Check that "
+                f"{self.cfg.base_url} is reachable and the model is loaded, "
+                "or set circuit_breaker = false to disable this guard.")
+        # Cooldown elapsed: allow one probe. A failure re-opens immediately.
+        self._circuit_until = 0.0
+
+    def _record_success(self) -> None:
+        self._failures = 0
+        self._circuit_until = 0.0
+
+    def _record_failure(self) -> None:
+        if not self._circuit_enabled():
+            return
+        self._failures += 1
+        limit = max(1, int(getattr(self.cfg, "circuit_failures", 4) or 4))
+        if self._failures < limit:
+            return
+        cooldown = max(1.0, float(getattr(self.cfg, "circuit_cooldown", 60.0)
+                                  or 60.0))
+        self._failures = 0
+        self._circuit_until = time.monotonic() + cooldown
+        self.circuit_trips += 1
+        print(f"[circuit breaker: {limit} consecutive model-server failures; "
+              f"pausing requests for {cooldown:.0f}s]", file=sys.stderr)
+
     def _post(self, payload: dict, stream: bool = False):
         """POST to the chat completions endpoint, raising a specific LLMError
         subclass on failure (connection, timeout, load failure, template,
         transient/rate limit, context overflow, or other server error)."""
+        self._check_circuit()
         try:
             try:
                 r = self._http_post(
@@ -1001,14 +1051,17 @@ class LLMClient:
                     timeout=self.cfg.timeout, stream=stream)
             self._session_used = True
         except requests.exceptions.ConnectionError as e:
+            self._record_failure()
             raise LLMError(CONNECT_HELP.format(url=self.cfg.base_url)) from e
         except requests.exceptions.Timeout as e:
+            self._record_failure()
             raise LLMError(
                 f"The server at {self.cfg.base_url} did not answer within "
                 f"{self.cfg.timeout:g}s (`timeout` in your config). A slow "
                 "local model may need a larger timeout; a hosted API may be "
                 "overloaded.") from e
         except requests.exceptions.RequestException as e:
+            self._record_failure()
             raise LLMError(
                 f"Request to {self.cfg.base_url} failed: "
                 f"{type(e).__name__}: {str(e)[:200]}") from e
@@ -1034,7 +1087,10 @@ class LLMClient:
                 raise ContextOverflowError(
                     f"Server says the request exceeds its context window: "
                     f"{body[:300]}")
+            if r.status_code >= 500 and not loading:
+                self._record_failure()
             raise LLMError(f"Server returned {r.status_code}: {body[:500]}")
+        self._record_success()
         return r
 
     def embed(self, texts: list[str]) -> list[list[float]]:
@@ -1604,6 +1660,7 @@ class LLMClient:
             raise CancelledError("Cancelled by the user; the partial reply is "
                                  "kept in client.partial_text.")
         if dropped is not None:
+            self._record_failure()
             if not text.strip():
                 raise LLMError(
                     f"The connection to {self.cfg.base_url} dropped mid-reply "

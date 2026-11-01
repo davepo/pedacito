@@ -339,6 +339,13 @@ def test_extra_tree_sitter_languages_chunk_with_calls(ext):
     assert isinstance(bad, bool)
 
 
+def test_tree_sitter_is_pinned_below_the_026_segfault_regression():
+    root = Path(__file__).resolve().parents[1]
+    for name in ("pyproject.toml", "requirements.txt"):
+        text = (root / name).read_text(encoding="utf-8")
+        assert "tree-sitter>=0.23,<0.26" in text, name
+
+
 def test_mcp_dead_server_cools_down_instead_of_retrying_every_call():
     from pedacito import mcp
     mcp.close_all()

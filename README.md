@@ -276,10 +276,12 @@ do:
 | `write` / `append` / `move` / `delete` | `allow_write = true` | Whole-file operations; `append` builds a file larger than one reply. |
 | `rename` | `allow_write = true` | Mechanically rename one definition and its references in the files that import it (strings and comments untouched, every file re-parsed, snapshotted). Refuses a name defined in several places and lists the references it left alone. |
 | `run` | `allow_shell = true` | Run one command (e.g. `pytest -q`), without a shell. A quiet GUI/server is stopped after `shell_idle_seconds`. |
+| `serve` | `allow_serve = true` | Start, list, log, or stop a background dev server. The registry and logs live under `.pedacito/procs/`; also `pedacito serve` / `pedacito procs`. |
 | `diagnose` | `allow_shell = true` | Run the detected linter/type checker (`ruff`, `pyflakes`, `flake8`, `mypy`/`pyright` when configured, `npm lint`, `tsc`, `cargo check`, `go vet`, `rubocop`). Also available as `pedacito diagnose`. |
+| `lsp` | `allow_lsp = true` | Exact definition/references/hover/diagnostics through pyright/pylsp/typescript-language-server/rust-analyzer/gopls, or commands in `lsp_servers`. Also `pedacito lsp`. |
 | `screenshot` | `allow_screenshots = true` | Capture the screen as text: size, brightness, blank-screen verdict, OCR, optional `vision_model` description. Needs the `vision` extra. |
 | `browser` | `allow_browser = true` | Headless browser: start a server command, open the page, click/type, and report page text, canvas sizes, and console errors. Needs the `browser` extra. |
-| `mcp` | `allow_mcp = true` + `mcp_servers = [...]` | Call tools from MCP servers. The catalog shows each tool's arguments, calls are validated against the tool's schema, one live session per server is kept warm, and a server that was down at startup is retried. |
+| `mcp` | `allow_mcp = true` + `mcp_servers = [...]` | Call tools, prompts (`prompt:server/name`), or resources (`resource:server/uri`) from MCP servers. The catalog shows arguments, calls are validated, one live session per server is kept warm, and a server that was down at startup is retried. |
 | `task` | `allow_subagents = true` | Hand a bounded, read-only research question to a helper agent with a fresh context window; only a short digest comes back. Depth is capped (1 local, 2 hosted). |
 | `fetch` | `allow_fetch = true` + `fetch_allowed_hosts` | URL → readable text, host-allowlisted, size-capped, cached, labelled untrusted. Private/loopback addresses are refused. |
 | semantic search | `semantic_search = true` | A `grep` with no hits falls back to the server's `/v1/embeddings` endpoint. |
@@ -461,6 +463,13 @@ pedacito prune PROJ --keep-sessions 50 --keep-backups 20 [--dry-run]
 pedacito trust PROJ                # approve a project's .pedacito.toml
 pedacito ask PROJ -t "..." --record          # save the model's responses
 pedacito ask PROJ -t "..." --replay FILE     # re-run the harness, no model needed
+pedacito ask PROJ -t "..." --replay FILE --strict-replay  # fail on prompt drift
+pedacito ask PROJ -t "..." --continue        # seed the task from the newest ask checkpoint
+pedacito eval --out new.json --baseline base.json         # CI A/B regression gate
+pedacito new app -t "..." --design           # interfaces/data/tests before code
+pedacito serve --root PROJ --name web -- npm run dev
+pedacito procs --root PROJ [logs|stop NAME]
+pedacito lsp --root PROJ --file src/a.py --line 12 --op definition
 ```
 
 `calibrate` also measures **native tool calls** against the JSON grammar on your
@@ -486,7 +495,12 @@ Python, and a planted prompt injection — and prints locate rate, first-apply
 success, repair calls, tokens, cache-hit ratio, wall time and a failure
 taxonomy (wrong file, unread edit, format error, truncation, refusal,
 hallucination, test regression, injection followed). Use it to A/B any setting:
-run it, change `prompt_pack` or `answer_mode`, run it again.
+run it, change `prompt_pack` or `answer_mode`, run it again. With
+`--baseline base.json`, the new report is compared with the old one and the
+command exits nonzero on a quality regression, more followed injections, or
+token/time growth beyond the configured tolerances — a CI gate over a replay
+or a live run. `ask --replay FILE --strict-replay` does the same for prompt
+drift: it exits 1 when the harness asks a different prompt than the recording.
 
 ---
 
@@ -760,9 +774,12 @@ summaries.json        summary cache, keyed by content hash
 embeddings.json       semantic-search cache (if enabled)
 backups/<stamp>/      pre-write snapshots (never merged: -2, -3 on a clash)
 sessions/<stamp>.md   what was asked, looked up, and changed (secrets masked)
+checkpoints/          ask/chat conversation checkpoints (JSON)
 events/<stamp>.jsonl  one JSON line per step, call, fold, verify, task
 reviews/<stamp>.html  saved review pages
 screenshots/          captures (if enabled)
+procs/                background process records and logs
+design.json/.md       spec-driven design (interfaces, data, tests)
 memory.md             remembered facts (hints for the model)
 rules/*.md            path-scoped rules       skills/*/SKILL.md   your skills
 prompts/*.md          prompt overrides        fetch/              fetch cache
@@ -866,9 +883,12 @@ config --reference` prints the annotated template. Key settings:
 | `auto_allowlist` | false | Restrict `auto` task writes to files the title names or the lookup read (new files always allowed). |
 | `allow_write` | false | Whole-file write/append/move/delete during gathering. |
 | `allow_shell` | false | `run` and `diagnose`. |
+| `allow_serve` / `serve_wait` | false / 3.0 | Background dev servers (`serve` action, `pedacito serve`); seconds to wait for a printed URL. |
+| `allow_lsp` / `lsp_servers` / `lsp_timeout` | false / `{}` / 10 | Exact definition/references/hover/diagnostics via a language server; per-extension commands override PATH detection. |
 | `allow_screenshots` / `allow_browser` | false | Screen and headless-browser capture. |
 | `vision_model` | `""` | Multimodal model used to describe captures. |
 | `semantic_search` | false | Embeddings fallback for `grep`. |
+| `circuit_breaker` / `circuit_failures` / `circuit_cooldown` | true / 4 / 60 | Fail fast after repeated transport/server failures; rate limits, context overflows and 4xx errors do not trip it. |
 | `allow_diff` | true | Read-only `diff` action. |
 | `disable_thinking` | false | Ask for non-thinking mode using the model family's switch; output blocks are stripped regardless. |
 | `default_profile` | `""` | Profile used when `--profile` isn't given. |
@@ -916,13 +936,16 @@ working default and is documented in `pedacito config --reference`.
   edges are resolved per language (relative paths, packages, `crate::`), but an
   import it cannot tie to an indexed file is treated as external, and the
   "no importers" hint is evidence, not proof (dynamic loading, entry points).
-- `py-tree-sitter` 0.26 can crash CPython 3.14 on files with several hundred
-  top-level statements (an upstream bug; reproducible without Pedacito). CI
-  covers 3.11–3.13.
+- `py-tree-sitter` 0.26 regressed Node lifetime handling and can segfault
+  CPython 3.12/3.14 (upstream py-tree-sitter#472; reproducible without
+  Pedacito). The dependency is pinned to `<0.26` (0.25.2 has cp314 wheels);
+  CI covers 3.11–3.14. The chunker also pauses the cyclic GC around live
+  nodes as a second line of defence.
 - `run` and test commands are sandboxed where bubblewrap/sandbox-exec work (not
   on Windows, not where user namespaces are disabled -- you get a notice, not a
-  silent downgrade); `browser`, `fetch` and MCP are guarded (scrubbed
-  environment, protected paths, host allowlists, trust prompts), not sandboxed.
+  silent downgrade); `browser`, `fetch`, MCP, background `serve` processes and
+  LSP servers are guarded (scrubbed environment, protected paths, allowlists,
+  trust prompts), not sandboxed.
 - `rename` is mechanical and conservative: it follows imports, not types, so a
   method renamed on a class used through another name is reported as "not
   changed" rather than guessed. Several edit blocks across files are applied

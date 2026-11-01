@@ -1580,10 +1580,10 @@ def chunk_file_ts(rel_path: str, src: str, ext: str,
     entry point index.py calls.
 
     The cyclic garbage collector is paused while tree-sitter nodes are alive:
-    py-tree-sitter 0.26 on CPython 3.14 is unstable when a collection runs
-    over live Node objects. (It can still crash on files with several hundred
-    top-level statements on that exact combination -- an upstream bug; CI runs
-    3.11-3.13.) Nodes are freed by reference counting when the chunker
+    py-tree-sitter 0.26 can segfault when a collection runs over live Node
+    objects (upstream py-tree-sitter#472). The dependency is pinned to
+    `<0.26`; this is the second line of defence for an environment that still
+    has 0.26 installed. Nodes are freed by reference counting when the chunker
     returns, so nothing accumulates."""
     lang = LANG_BY_EXT[ext.lower()]
     was_enabled = gc.isenabled()

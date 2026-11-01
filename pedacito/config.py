@@ -206,6 +206,12 @@ class Config:
     allow_mcp: bool = False
     mcp_servers: tuple[str, ...] = ()
     mcp_timeout: int = 30
+    # Optional LSP: exact definition/references/hover/diagnostics through a
+    # language server on PATH (or `lsp_servers` per extension). Off by default:
+    # a server can use significant RAM and is another external process.
+    allow_lsp: bool = False
+    lsp_servers: dict = field(default_factory=dict)
+    lsp_timeout: float = 10.0
     # Let the gather loop create/overwrite files via `write`, grow them with
     # `append`, and rename/remove them with `move`/`delete`. Off by default: a
     # mid-gather write skips the edit path's syntax check and review page.
@@ -221,6 +227,11 @@ class Config:
     # Off by default: enabling it is a trust decision. Commands run WITHOUT a
     # shell (argv only), so pipes, redirection and `&&` do not work.
     allow_shell: bool = False
+    # Background dev servers: start a command, keep it alive, capture its log,
+    # and stop it later (`serve` action or `pedacito serve`). This can run
+    # arbitrary commands, so it is a separate opt-in from allow_shell.
+    allow_serve: bool = False
+    serve_wait: float = 3.0
     # Seconds before a `run` command is killed.
     shell_timeout: int = 120
     # Kill a `run` command after this many seconds with NO output (keeps GUI
@@ -402,6 +413,14 @@ class Config:
     stream_usage: bool = True
     # Provider cache-affinity key (hosted APIs that support it).
     prompt_cache_key: str = ""
+    # Circuit breaker for repeated transport/server failures. After
+    # `circuit_failures` consecutive failures (timeouts, dropped streams, 5xx;
+    # not rate limits, context overflows, or 4xx requests) calls fail fast for
+    # `circuit_cooldown` seconds instead of retrying a dead server. A success
+    # closes the circuit; after the cooldown one probe is allowed.
+    circuit_breaker: bool = True
+    circuit_failures: int = 4
+    circuit_cooldown: float = 60.0
     # Stop BEFORE the next model call once the session's prompt+completion
     # tokens reach this (0 = no limit). `--max-tokens-budget` sets it per run.
     max_total_tokens: int = 0
@@ -568,7 +587,7 @@ PROFILE_SECTION = "profiles"
 
 # Settings whose value is itself a table (never treated as a [section]), and
 # settings that are lists of strings (stored as tuples).
-_TABLE_FIELDS = ("sampler", "roles", "hooks")
+_TABLE_FIELDS = ("sampler", "roles", "hooks", "lsp_servers")
 _TUPLE_FIELDS = ("extra_extensions", "shell_allowlist", "mcp_servers",
                  "env_passthrough", "protected_paths", "shell_deny",
                  "browser_eval_hosts", "fetch_allowed_hosts",
@@ -810,8 +829,8 @@ def _hostname(base_url: str) -> str:
 # run whatever its author wrote. They are honoured from a project config only
 # after `pedacito trust`, and trust lapses when that file changes.
 EXEC_FIELDS = ("hooks", "mcp_servers", "auto_verify", "test_command",
-               "sandbox", "sandbox_network", "sandbox_writable",
-               "sandbox_strict")
+               "allow_serve", "allow_lsp", "lsp_servers", "sandbox",
+               "sandbox_network", "sandbox_writable", "sandbox_strict")
 TRUST_FILE = "trusted_projects.json"
 
 
@@ -1789,6 +1808,9 @@ temperature = 0.2
 # sampler = { top_p = 0.95, top_k = 40, min_p = 0.05, repeat_penalty = 1.1 }
 disable_thinking = false
 thinking_suffix = ""
+circuit_breaker = true
+circuit_failures = 4
+circuit_cooldown = 60.0
 k_cache_quant = ""
 v_cache_quant = ""
 kv_cache_bytes_per_token = 0
@@ -1851,6 +1873,8 @@ allow_write = false
 max_write_chars = 200000
 max_write_lines = 120
 allow_shell = false
+allow_serve = false
+serve_wait = 3.0
 shell_timeout = 120
 shell_idle_seconds = 10
 shell_allowlist = []
@@ -1879,6 +1903,9 @@ max_diagnostics_chars = 8000
 allow_mcp = false
 mcp_servers = []
 mcp_timeout = 30
+allow_lsp = false
+# lsp_servers = { ".py" = "pyright-langserver --stdio" }
+lsp_timeout = 10.0
 
 # Autonomous loop (`pedacito auto`).
 auto_plan_file = "PLAN.md"
@@ -1971,6 +1998,11 @@ REFERENCE_TEMPLATE = TEMPLATE + '''
 # (<think>, [THINK], <seed:think>, harmony analysis, Gemma 4 thought) are
 # stripped regardless.
 #
+# --- Reliability -------------------------------------------------------------
+# circuit_breaker fails fast after repeated transport/server failures instead
+# of retrying a dead server; circuit_failures and circuit_cooldown tune it.
+# Rate limits, context overflows and 4xx request errors do not trip it.
+#
 # --- Context and token budgets ---------------------------------------------
 # context_tokens is the server-side window. reserve_tokens is held back for
 # replies. Pedacito auto-fits budgets from the server's reported context and
@@ -2001,6 +2033,8 @@ REFERENCE_TEMPLATE = TEMPLATE + '''
 # use_project_instructions includes PEDACITO.md / AGENTS.md / CLAUDE.md.
 # allow_write enables write/append/move/delete during gather.
 # allow_shell enables run/diagnose; commands execute without a shell.
+# allow_serve enables the background server registry (`serve` action and
+# `pedacito serve`); serve_wait is how long to wait for a printed URL.
 # allow_screenshots enables desktop capture; allow_browser enables headless
 # page capture. Both are privacy/trust decisions and are off by default.
 # allow_diff keeps the read-only `diff` action.
@@ -2016,6 +2050,9 @@ REFERENCE_TEMPLATE = TEMPLATE + '''
 # new files are always allowed. Off by default.
 # allow_mcp exposes one `mcp` action and a short tool catalog; mcp_servers is
 # a list of command strings such as ["python server.py"].
+# allow_lsp exposes exact definition/references/hover/diagnostics through a
+# language server; lsp_servers maps extensions to commands, and PATH detection
+# covers pyright/pylsp/typescript-language-server/rust-analyzer/gopls.
 # auto_plan_file / auto_verify / auto_* configure `pedacito auto`.
 #
 # --- Context management and measurement ------------------------------------

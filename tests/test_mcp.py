@@ -68,7 +68,32 @@ def test_mcp_missing_server_binary_is_reported_not_raised():
 # ------------------------------------------------------------- keep-alive
 def _reset():
     mcp._CATALOG_CACHE.clear()
+    mcp._EXTRA_CACHE.clear()
+    mcp._EXTRA_TIME.clear()
     mcp.close_all()
+
+
+def test_mcp_prompts_and_resources_are_listed_and_called():
+    cfg = _cfg()
+    _reset()
+    try:
+        ps = mcp.prompts(cfg)
+        assert ps[0][0] == "fake_mcp/review"
+        assert mcp.prompt(cfg, "fake_mcp/review", {"file": "a.py"}) \
+            .endswith('review:{"file": "a.py"}')
+        assert mcp.call(cfg, "prompt:fake_mcp/review", {"file": "b.py"}) \
+            .endswith('review:{"file": "b.py"}')
+
+        rs = mcp.resources(cfg)
+        assert rs[0][0] == "fake_mcp/file:///README.md"
+        assert mcp.resource(cfg, "fake_mcp/file:///README.md") == "# fake readme"
+        assert mcp.call(cfg, "resource:file:///README.md") == "# fake readme"
+
+        rendered = mcp.render(cfg)
+        assert "MCP PROMPTS" in rendered and "prompt:fake_mcp/review" in rendered
+        assert "MCP RESOURCES" in rendered and "resource:fake_mcp/file:///README.md" in rendered
+    finally:
+        _reset()
 
 
 def test_mcp_call_keeps_one_live_session_per_server():

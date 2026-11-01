@@ -101,6 +101,8 @@ def _compact_tool_help(cfg) -> str:
         "rename": "rename symbol to - rename ONE definition + its references",
         "delete": "delete file - delete a file",
         "run": "run command - one command, no shell",
+        "serve": "serve symbol command - start/list/log/stop a background server",
+        "lsp": "lsp symbol file start end - exact definitions/references/diagnostics",
         "screenshot": "screenshot command start - capture the screen as text",
         "browser": "browser command pattern start - open a page, capture it",
         "done": "done - you have enough",

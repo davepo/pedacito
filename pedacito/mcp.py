@@ -39,6 +39,10 @@ from . import proc
 PROTOCOL_VERSION = "2024-11-05"
 _CATALOG_CACHE: dict[tuple[str, ...], list[tuple[str, str, str]]] = {}
 _CATALOG_TIME: dict[tuple[str, ...], float] = {}
+# Prompts and resources are listed with the same short retry window as tools.
+_EXTRA_CACHE: dict[tuple[str, tuple[str, ...]],
+                   list[tuple[str, str, str]]] = {}
+_EXTRA_TIME: dict[tuple[str, tuple[str, ...]], float] = {}
 # A catalog holding an "(unavailable)" entry (a server that was down at
 # startup) is retried after this many seconds instead of poisoning the whole
 # run: servers come up late, and a restart should not need a new session.
@@ -226,6 +230,8 @@ def close_all() -> None:
     for cmd in list(_SESSIONS):
         _drop_session(cmd)
     _COOLDOWN.clear()
+    _EXTRA_CACHE.clear()
+    _EXTRA_TIME.clear()
 
 
 atexit.register(close_all)
@@ -338,16 +344,212 @@ def validate_args(schema_json: str, args: dict) -> str:
             + "; ".join(problems) + f". Expected {signature(schema_json)}.")
 
 
+def _prompt_signature(args_json: str) -> str:
+    """`(file: string, style?: string)` from a prompts/list arguments array."""
+    try:
+        args = json.loads(args_json or "[]")
+    except ValueError:
+        return "()"
+    parts = []
+    for arg in (args or [])[:6]:
+        if not isinstance(arg, dict):
+            continue
+        name = str(arg.get("name") or "").strip()
+        if name:
+            parts.append(f"{name}{'' if arg.get('required') else '?'}")
+    if len(args or []) > 6:
+        parts.append("...")
+    return "(" + ", ".join(parts) + ")"
+
+
+def _extra(cfg, kind: str, method: str, parse) -> list[tuple[str, str, str]]:
+    """Cached prompts/resources listing. Servers that do not implement the
+    method (or are down) contribute nothing, and the result is retried after
+    the same short window as the tool catalog."""
+    servers = _servers(cfg)
+    if not servers:
+        return []
+    key = (kind, tuple(servers))
+    if key in _EXTRA_CACHE:
+        if time.time() - _EXTRA_TIME.get(key, 0.0) < _RETRY_UNAVAILABLE_AFTER:
+            return _EXTRA_CACHE[key]
+        _EXTRA_CACHE.pop(key, None)
+    out: list[tuple[str, str, str]] = []
+    timeout = int(getattr(cfg, "mcp_timeout", 30) or 30)
+    for name, cmd in server_names(servers).items():
+        s = None
+        try:
+            s = _Session(cmd, timeout)
+            s.initialize()
+            result = s.request(method)
+            out.extend(parse(name, result))
+        except Exception:
+            pass                    # method unsupported or server unavailable
+        finally:
+            if s is not None:
+                s.close()
+    _EXTRA_CACHE[key] = out
+    _EXTRA_TIME[key] = time.time()
+    return out
+
+
+def prompts(cfg) -> list[tuple[str, str, str]]:
+    """[(server/name, description, arguments_json)] for enabled servers."""
+    def parse(server, result):
+        out = []
+        for p in (result or {}).get("prompts") or []:
+            if not isinstance(p, dict):
+                continue
+            name = str(p.get("name") or "").strip()
+            if name:
+                out.append((f"{server}/{name}",
+                            str(p.get("description") or "").strip(),
+                            json.dumps(p.get("arguments") or [],
+                                       ensure_ascii=True)))
+        return out
+    return _extra(cfg, "prompts", "prompts/list", parse)
+
+
+def resources(cfg) -> list[tuple[str, str, str]]:
+    """[(server/uri, description, mimeType)] for enabled servers."""
+    def parse(server, result):
+        out = []
+        for r in (result or {}).get("resources") or []:
+            if not isinstance(r, dict):
+                continue
+            uri = str(r.get("uri") or "").strip()
+            if uri:
+                desc = str(r.get("description") or r.get("name") or "").strip()
+                out.append((f"{server}/{uri}", desc,
+                            str(r.get("mimeType") or "").strip()))
+        return out
+    return _extra(cfg, "resources", "resources/list", parse)
+
+
+def _resolve_extra(entries, target: str) -> str:
+    """Resolve `server/name` or a bare name/URI to a catalog entry."""
+    names = [e[0] for e in entries]
+    if target in names:
+        return target
+    tail = target.rsplit("/", 1)[-1]
+    hits = [n for n in names if n.rsplit("/", 1)[-1] == tail]
+    return hits[0] if len(hits) == 1 else ""
+
+
+def _content_text(value) -> str:
+    if isinstance(value, str):
+        return value
+    if isinstance(value, dict):
+        if value.get("type") == "text":
+            return str(value.get("text") or "")
+        return ""
+    if isinstance(value, list):
+        return "\n".join(_content_text(v) for v in value if _content_text(v))
+    return ""
+
+
+def _cap(cfg, text: str) -> str:
+    cap = max(500, int(getattr(cfg, "max_shell_output_chars", 8000) or 8000))
+    if len(text) > cap:
+        return text[:cap] + f"\n[MCP result truncated at {cap} chars]"
+    return text
+
+
+def prompt(cfg, target: str, args: dict | None = None) -> str:
+    """Load one MCP prompt. `target` is `server/name` or a bare name."""
+    entries = prompts(cfg)
+    if not entries:
+        return "ERROR: no MCP prompts are available (allow_mcp and mcp_servers)."
+    full = _resolve_extra(entries, target)
+    if not full:
+        return (f"ERROR: unknown or ambiguous MCP prompt '{target}'. "
+                f"Available: {', '.join(e[0] for e in entries[:20])}")
+    server, name = full.split("/", 1)
+    cmd = server_names(_servers(cfg)).get(server, "")
+    if not cmd:
+        return f"ERROR: MCP server '{server}' is not configured."
+    timeout = int(getattr(cfg, "mcp_timeout", 30) or 30)
+    try:
+        s = _live_session(cmd, timeout)
+        result = s.request("prompts/get",
+                           {"name": name, "arguments": args or {}})
+    except Exception as e:
+        _drop_session(cmd)
+        return f"ERROR: MCP prompt failed: {str(e)[:400]}"
+    bits = []
+    desc = str(result.get("description") or "").strip()
+    if desc:
+        bits.append(desc)
+    for msg in result.get("messages") or []:
+        if not isinstance(msg, dict):
+            continue
+        role = str(msg.get("role") or "user")
+        text = _content_text(msg.get("content"))
+        if text:
+            bits.append(f"[{role}] {text}")
+    return _cap(cfg, "\n".join(bits).strip() or "(prompt returned no text)")
+
+
+def resource(cfg, target: str, args: dict | None = None) -> str:
+    """Read one MCP resource. `target` is `server/uri` or a bare URI."""
+    entries = resources(cfg)
+    if not entries:
+        return ("ERROR: no MCP resources are available (allow_mcp and "
+                "mcp_servers).")
+    full = _resolve_extra(entries, target)
+    if not full:
+        return (f"ERROR: unknown or ambiguous MCP resource '{target}'. "
+                f"Available: {', '.join(e[0] for e in entries[:20])}")
+    server, uri = full.split("/", 1)
+    cmd = server_names(_servers(cfg)).get(server, "")
+    if not cmd:
+        return f"ERROR: MCP server '{server}' is not configured."
+    timeout = int(getattr(cfg, "mcp_timeout", 30) or 30)
+    try:
+        s = _live_session(cmd, timeout)
+        result = s.request("resources/read", {"uri": uri})
+    except Exception as e:
+        _drop_session(cmd)
+        return f"ERROR: MCP resource read failed: {str(e)[:400]}"
+    bits = []
+    for item in result.get("contents") or []:
+        if not isinstance(item, dict):
+            continue
+        if item.get("text") is not None:
+            bits.append(str(item.get("text") or ""))
+        elif item.get("blob") is not None:
+            n = len(str(item.get("blob") or ""))
+            bits.append(f"[binary resource: {item.get('mimeType') or 'unknown'}"
+                        f", base64 length {n}]")
+    return _cap(cfg, "\n".join(b for b in bits if b).strip()
+                or "(resource returned no text)")
+
+
 def render(cfg, limit: int = 2500) -> str:
     """A compact catalog for the project prompt, or '' when MCP is off."""
     entries = catalog(cfg)
-    if not entries:
+    prompt_entries = prompts(cfg)
+    resource_entries = resources(cfg)
+    if not (entries or prompt_entries or resource_entries):
         return ""
-    lines = ["MCP TOOLS (call with action=mcp, symbol=server/tool, "
-             "content=<JSON args>):"]
-    for name, desc, schema in entries:
-        sig = signature(schema) if schema and schema != "{}" else ""
-        lines.append(f"  {name}{sig} -- {desc[:160]}")
+    lines = []
+    if entries:
+        lines.append("MCP TOOLS (call with action=mcp, symbol=server/tool, "
+                     "content=<JSON args>):")
+        for name, desc, schema in entries:
+            sig = signature(schema) if schema and schema != "{}" else ""
+            lines.append(f"  {name}{sig} -- {desc[:160]}")
+    if prompt_entries:
+        lines.append("MCP PROMPTS (action=mcp, symbol=prompt:server/name, "
+                     "content=<JSON args>):")
+        for name, desc, args in prompt_entries:
+            lines.append(f"  prompt:{name}{_prompt_signature(args)} -- "
+                         f"{desc[:160]}")
+    if resource_entries:
+        lines.append("MCP RESOURCES (action=mcp, symbol=resource:server/uri):")
+        for name, desc, mime in resource_entries:
+            tail = f" [{mime}]" if mime else ""
+            lines.append(f"  resource:{name}{tail} -- {desc[:160]}")
     text = "\n".join(lines)
     if len(text) > limit:
         text = text[:limit].rstrip() + "\n[... MCP catalog truncated]"
@@ -355,7 +557,15 @@ def render(cfg, limit: int = 2500) -> str:
 
 
 def call(cfg, target: str, args: dict | None = None) -> str:
-    """Invoke one MCP tool. `target` is "server/tool" or a bare tool name."""
+    """Invoke one MCP tool, prompt, or resource.
+
+    Targets: `server/tool`, `prompt:server/name`, `resource:server/uri`, or a
+    bare tool/prompt name. A bare resource URI is resolved by suffix."""
+    target = (target or "").strip()
+    if target.startswith("prompt:"):
+        return prompt(cfg, target[len("prompt:"):].strip(), args)
+    if target.startswith("resource:"):
+        return resource(cfg, target[len("resource:"):].strip(), args)
     entries = catalog(cfg)
     if not entries:
         return "ERROR: MCP is disabled or no MCP servers are configured."

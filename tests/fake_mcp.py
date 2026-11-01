@@ -28,6 +28,33 @@ for line in sys.stdin:
         result = {"content": [{"type": "text",
                                "text": "echo:" + json.dumps(args,
                                                             sort_keys=True)}]}
+    elif method == "prompts/list":
+        result = {"prompts": [{
+            "name": "review",
+            "description": "review a file",
+            "arguments": [{"name": "file", "required": True}],
+        }]}
+    elif method == "prompts/get":
+        params = msg.get("params") or {}
+        args = params.get("arguments") or {}
+        result = {"description": "review a file",
+                  "messages": [{"role": "user", "content": {
+                      "type": "text",
+                      "text": "review:" + json.dumps(args, sort_keys=True),
+                  }}]}
+    elif method == "resources/list":
+        result = {"resources": [{
+            "uri": "file:///README.md",
+            "name": "README",
+            "description": "project readme",
+            "mimeType": "text/markdown",
+        }]}
+    elif method == "resources/read":
+        result = {"contents": [{
+            "uri": (msg.get("params") or {}).get("uri", ""),
+            "mimeType": "text/markdown",
+            "text": "# fake readme",
+        }]}
     elif method == "ping":
         result = {}
     else:

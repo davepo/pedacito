@@ -12,7 +12,10 @@ classifiers = [
 ]
 dependencies = [
     "requests>=2.31",
-    "tree-sitter>=0.23",
+    # 0.26.0 regressed Node lifetime handling and segfaults CPython 3.12/3.14
+    # (py-tree-sitter#472). 0.25.2 is the last known-good release and ships
+    # cp314 wheels; keep the ceiling until upstream ships a fixed release.
+    "tree-sitter>=0.23,<0.26",
     "tree-sitter-language-pack>=1.0",
 ]
 

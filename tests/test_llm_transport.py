@@ -13,8 +13,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from pedacito import config as config_mod
 from pedacito import llm as llm_mod
-from pedacito.llm import (BudgetExceeded, CancelledError, LLMClient, LLMError,
-                          estimate_messages, extract_content, strip_reasoning)
+from pedacito.llm import (BudgetExceeded, CancelledError, CircuitOpenError,
+                          LLMClient, LLMError, estimate_messages,
+                          extract_content, strip_reasoning)
 
 
 def _cfg(**kw):
@@ -163,6 +164,59 @@ def test_persistent_rate_limit_gives_up_with_a_clear_error(monkeypatch):
         LLMClient(_cfg()).chat([{"role": "user", "content": "x"}], 10)
     assert "rate-limiting" in str(e.value)
     assert len(n) == llm_mod._MAX_RATE_LIMIT_RETRIES + 1
+
+
+def test_circuit_breaker_fails_fast_after_repeated_server_errors(monkeypatch):
+    calls = []
+    _patch_post(monkeypatch, lambda *a, **k: calls.append(1) or Resp(
+        500, text="boom"))
+    cfg = _cfg(circuit_breaker=True, circuit_failures=3, circuit_cooldown=30)
+    client = LLMClient(cfg)
+    for _ in range(3):
+        with pytest.raises(LLMError):
+            client.chat([{"role": "user", "content": "x"}], 10)
+    assert len(calls) == 3
+    with pytest.raises(CircuitOpenError) as e:
+        client.chat([{"role": "user", "content": "x"}], 10)
+    assert "pausing requests" in str(e.value)
+    assert len(calls) == 3                 # no request while open
+    assert client.circuit_trips == 1
+
+    # Cooldown elapsed: one probe is allowed, and a success closes the circuit.
+    monkeypatch.setattr(llm_mod.time, "monotonic",
+                        lambda: client._circuit_until + 1)
+    _patch_post(monkeypatch, lambda *a, **k: _ok("fine"))
+    assert client.chat([{"role": "user", "content": "x"}], 10) == "fine"
+    assert client._circuit_until == 0 and client._failures == 0
+
+
+def test_circuit_breaker_ignores_rate_limits_and_bad_requests(monkeypatch):
+    monkeypatch.setattr(llm_mod.time, "sleep", lambda s: None)
+    posts = []
+    _patch_post(monkeypatch, lambda *a, **k: posts.append(1) or Resp(
+        429, text="slow down"))
+    cfg = _cfg(circuit_breaker=True, circuit_failures=1)
+    client = LLMClient(cfg)
+    with pytest.raises(LLMError):
+        client.chat([{"role": "user", "content": "x"}], 10)
+    assert client.circuit_trips == 0      # a rate limit is not a dead server
+    assert len(posts) > 1                 # the normal retry budget still ran
+
+    _patch_post(monkeypatch, lambda *a, **k: Resp(400, text="bad request"))
+    with pytest.raises(LLMError):
+        client.chat([{"role": "user", "content": "x"}], 10)
+    assert client.circuit_trips == 0      # a bad request will not heal by waiting
+
+
+def test_circuit_breaker_can_be_disabled(monkeypatch):
+    calls = []
+    _patch_post(monkeypatch, lambda *a, **k: calls.append(1) or Resp(
+        500, text="boom"))
+    client = LLMClient(_cfg(circuit_breaker=False, circuit_failures=1))
+    for _ in range(3):
+        with pytest.raises(LLMError):
+            client.chat([{"role": "user", "content": "x"}], 10)
+    assert len(calls) == 3 and client.circuit_trips == 0
 
 
 def test_model_loading_still_uses_the_load_deadline(monkeypatch):

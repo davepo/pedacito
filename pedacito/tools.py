@@ -77,8 +77,14 @@ skill    - load a named procedure from the skills list. args: symbol
 task     - hand a bounded read-only research question to a helper agent
            with a fresh window; returns a short digest. args: content
 fetch    - URL to readable text (external, untrusted). args: pattern (URL)
-mcp      - call an external MCP tool (opt-in). args: symbol (server/tool or
-           "server" to list), content (JSON arguments object)
+mcp      - call an external MCP tool, prompt, or resource (opt-in). args:
+           symbol (server/tool, prompt:server/name, or resource:server/uri),
+           content (JSON arguments object)
+serve    - manage background servers (opt-in). args: symbol (start, list,
+           logs, stop), command (start) or file (name for logs/stop)
+lsp      - exact language-server symbols/diagnostics (opt-in). args: symbol
+           (definition, references, hover, diagnostics), file, start=line,
+           end=column
 rename   - mechanically rename ONE definition and its references in the
            files that import it (refuses ambiguous names). args: symbol (old
            name), to (new name)
@@ -233,6 +239,8 @@ def schema_for(cfg) -> dict:
         actions.append("git")
     if getattr(cfg, "allow_shell", False):
         actions += ["run", "diagnose"]
+    if getattr(cfg, "allow_serve", False):
+        actions.append("serve")
     if getattr(cfg, "allow_write", False):
         actions += ["write", "append", "move", "delete", "rename"]
     if getattr(cfg, "allow_screenshots", False):
@@ -251,6 +259,8 @@ def schema_for(cfg) -> dict:
         actions.append("question")
     if getattr(cfg, "allow_mcp", False):
         actions.append("mcp")
+    if getattr(cfg, "allow_lsp", False):
+        actions.append("lsp")
     actions.append("done")
 
     schema = copy.deepcopy(STEP_SCHEMA)
@@ -263,6 +273,7 @@ def schema_for(cfg) -> dict:
         # only ever used by move.
         drop.add("to")
     if not (getattr(cfg, "allow_shell", False)
+            or getattr(cfg, "allow_serve", False)
             or getattr(cfg, "allow_screenshots", False)
             or getattr(cfg, "allow_browser", False)):
         drop.add("command")
@@ -1508,8 +1519,64 @@ def tool_diagnose(index, cfg, file: str = "") -> str:
     return report + "\n[Fix these before claiming the task is complete.]"
 
 
+def tool_lsp(index, cfg, symbol: str = "", file: str = "",
+             start: int = 0, end: int = 0) -> str:
+    """Definition/references/hover/diagnostics through an optional LSP."""
+    if not getattr(cfg, "allow_lsp", False):
+        return ("ERROR: `lsp` is disabled (config allow_lsp = false). "
+                "Enable it to use a language server.")
+    from . import lsp
+    op = (_as_text(symbol).strip() or "definition").lower()
+    rel = index.resolve_file(_as_text(file)) or _root_rel(index, _as_text(file))
+    if not rel:
+        return f"ERROR: refusing to use LSP outside the project root: {file}"
+    if op not in ("definition", "references", "hover", "diagnostics"):
+        return ("ERROR: lsp symbol must be definition, references, hover, or "
+                "diagnostics.")
+    return lsp.result(index.root, cfg, op, rel,
+                      line=_as_int(start, 1) or 1,
+                      column=_as_int(end, 1) or 1)
+
+
+def tool_serve(index, cfg, symbol: str = "", command: str = "",
+               file: str = "") -> str:
+    """Start/list/log/stop background dev servers (opt-in allow_serve)."""
+    if not getattr(cfg, "allow_serve", False):
+        return ("ERROR: `serve` is disabled (config allow_serve = false). "
+                "Enable it to manage background servers.")
+    from . import processes
+    op = (_as_text(symbol).strip() or "start").lower()
+    name = _as_text(file).strip()
+    cmd = _as_text(command).strip()
+    if op in ("list", "ls"):
+        return processes.render_list(index.root)
+    if op in ("logs", "log"):
+        return processes.logs(index.root, name or cmd)
+    if op in ("stop", "kill"):
+        return processes.stop(index.root, name or cmd)
+    if op in ("start", "up", "serve"):
+        if not cmd:
+            return "ERROR: serve start needs a command."
+        try:
+            rec = processes.start(index.root, cmd, name=name, cfg=cfg,
+                                  wait=float(getattr(cfg, "serve_wait", 3.0)))
+        except (OSError, ValueError) as e:
+            return f"ERROR: could not start server: {e}"
+        bits = [f"started {rec['name']} (pid {rec.get('pid')})"]
+        if rec.get("url"):
+            bits.append(f"url: {rec['url']}")
+        if rec.get("status") != "running":
+            bits.append(f"status: {rec.get('status')} "
+                        f"(see logs with action=serve, symbol=logs, "
+                        f"file={rec['name']})")
+        bits.append(f"log: {rec.get('log')}")
+        return "\n".join(bits)
+    return ("ERROR: serve symbol must be start, list, logs, or stop; "
+            "put the command in `command` and the process name in `file`.")
+
+
 def tool_mcp(index, cfg, symbol: str = "", content: str = "") -> str:
-    """Invoke one opt-in MCP tool, or list the configured catalog."""
+    """Invoke one opt-in MCP tool/prompt/resource, or list the catalog."""
     if not getattr(cfg, "allow_mcp", False):
         return "ERROR: MCP is disabled (config allow_mcp = false)."
     from . import mcp
@@ -2365,6 +2432,13 @@ def dispatch(index, cfg, step: dict, client=None) -> str:
     if action == MCP_ACTION:
         return tool_mcp(index, cfg, step.get("symbol", ""),
                         step.get("content", ""))
+    if action == "serve":
+        return tool_serve(index, cfg, step.get("symbol", ""),
+                          step.get("command", ""), step.get("file", ""))
+    if action == "lsp":
+        return tool_lsp(index, cfg, step.get("symbol", ""),
+                        step.get("file", ""), step.get("start", 0),
+                        step.get("end", 0))
     if action == RUN_ACTION:
         return tool_run(index, cfg, step.get("command", ""))
     if action == SCREENSHOT_ACTION:
