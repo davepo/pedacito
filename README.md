@@ -489,6 +489,7 @@ pedacito ask PROJ -t "..." --replay FILE     # re-run the harness, no model need
 pedacito ask PROJ -t "..." --replay FILE --strict-replay  # fail on prompt drift
 pedacito ask PROJ -t "..." --continue        # seed the task from the newest ask checkpoint
 pedacito eval --out new.json --baseline base.json         # CI A/B regression gate
+pedacito eval --repeats 3 --seed 1 --out new.json   # 3 seeded runs: pass counts, mean ± spread
 pedacito new app -t "..." --design           # interfaces/data/tests before code
 pedacito serve --root PROJ --name web -- npm run dev
 pedacito procs --root PROJ [logs|stop NAME]
@@ -540,7 +541,13 @@ or a live run. Rates are compared per task over the tasks both reports ran: a
 drop of up to one task-equivalent is noise and only noted, a larger drop (or a
 task that passed in every one of three or more repeats and now never does)
 fails, and a failure label the baseline's taxonomy could not emit is reported
-as information rather than a regression. Two reports that ran with different `disable_thinking` settings
+as information rather than a regression. `--repeats N` runs the task set N times, repeat *i*
+with `sampler.seed = S + i` (`--seed S`; default your own sampler seed, else 0),
+and the report gains per-task pass counts and the mean ± standard deviation of
+calls, tokens, seconds and cache-hit across repeats; the gate widens its margin
+to twice the standard error when the repeats themselves are noisy. Repeats
+reuse the server's warm prompt cache, so `cache_hit` reads a little higher than
+for a single run. Two reports that ran with different `disable_thinking` settings
 are flagged instead of compared on growth: thinking on/off moves tokens more
 than any harness change, and the gate must not blame (or bless) the harness
 for the config. `ask --replay FILE --strict-replay` does the same for prompt

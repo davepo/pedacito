@@ -1643,6 +1643,14 @@ def _main(argv=None) -> int:
                         metavar="FRAC",
                         help="allow this much wall-time growth vs baseline "
                              "(default 0.50)")
+    p_eval.add_argument("--repeats", type=int, default=1, metavar="N",
+                        help="run the whole task set N times, each repeat with "
+                             "its own sampler.seed, and report per-task pass "
+                             "counts and mean ± spread (default 1)")
+    p_eval.add_argument("--seed", type=int, default=None, metavar="S",
+                        help="base sampler.seed: repeat i uses S+i (default: "
+                             "your sampler seed, else 0, when --repeats > 1; "
+                             "unset for a single run)")
     p_eval.add_argument("--list", action="store_true", help="list tasks and exit")
     for flag in ("--url", "--model", "--config", "--profile"):
         p_eval.add_argument(flag)

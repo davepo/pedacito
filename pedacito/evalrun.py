@@ -2,6 +2,7 @@
 
     pedacito eval                       # all tasks against the configured model
     pedacito eval --task py-bulk-off-by-one --out report.json
+    pedacito eval --repeats 3 --seed 1 --out report.json   # seeds 1, 2, 3
 
 Every feature of the harness is a claim about small models ("a ranked map
 finds the right file sooner", "preflight catches unread edits"); this is how a
@@ -21,9 +22,12 @@ runner works with a scripted fake client in CI (tests/test_evalrun.py).
 
 from __future__ import annotations
 
+import copy
 import json
+import math
 import re
 import shutil
+import statistics
 import sys
 import tempfile
 import time
@@ -353,8 +357,6 @@ def _run_tests(root: Path, task: EvalTask):
 def run_task(task: EvalTask, client, cfg, workdir: Path | None = None) -> dict:
     """Run one task against `client` in a fresh copy of its fixture and
     return its metrics row."""
-    import copy
-
     from . import index as index_mod
     from . import loop
     from .agent import Agent
@@ -443,8 +445,8 @@ def run_task(task: EvalTask, client, cfg, workdir: Path | None = None) -> dict:
         shutil.rmtree(tmp, ignore_errors=True)
 
 
-def summarise(rows: list[dict]) -> dict:
-    """Aggregate metrics over task rows."""
+def _metrics(rows: list[dict]) -> dict:
+    """Aggregate metrics over task rows (one run, or every repeat pooled)."""
     n = len(rows) or 1
     edits = [r for r in rows if r.get("kind") == "edit"]
 
@@ -476,16 +478,100 @@ def summarise(rows: list[dict]) -> dict:
     }
 
 
+# Per-repeat values the report gives a mean and a spread for.
+_SPREAD_KEYS = ("pass_rate", "locate_rate", "first_apply_clean", "mean_calls",
+                "mean_prompt_tokens", "mean_completion_tokens", "cache_hit",
+                "mean_seconds")
+
+
+def _by_repeat(rows: list[dict]) -> list[list[dict]]:
+    groups: dict[int, list[dict]] = {}
+    for r in rows:
+        groups.setdefault(int(r.get("repeat", 0) or 0), []).append(r)
+    return [groups[k] for k in sorted(groups)]
+
+
+def _spread(rows: list[dict]) -> dict:
+    """mean / sample sd / min / max of each headline metric across repeats."""
+    per = [_metrics(g) for g in _by_repeat(rows)]
+    out = {}
+    for k in _SPREAD_KEYS:
+        vals = [m[k] for m in per]
+        out[k] = {"mean": round(sum(vals) / len(vals), 3),
+                  "sd": round(statistics.stdev(vals), 3),
+                  "min": min(vals), "max": max(vals)}
+    return out
+
+
+def summarise(rows: list[dict]) -> dict:
+    """Aggregate metrics over task rows. With several repeats the flat keys
+    are pooled over all of them, `per_task` holds each task's pass count, and
+    `spread` the per-repeat mean and sd."""
+    s = _metrics(rows)
+    repeats = len(_by_repeat(rows)) or 1
+    s["tasks"] = round(len(rows) / repeats)       # per repeat
+    s["runs"] = len(rows)
+    s["repeats"] = repeats
+    per_task: dict[str, dict] = {}
+    for r in rows:
+        if not r.get("id"):
+            continue
+        t = per_task.setdefault(r["id"], {"kind": r.get("kind", ""),
+                                          "runs": 0, "passes": 0})
+        t["runs"] += 1
+        t["passes"] += 1 if r.get("passed") else 0
+    s["per_task"] = per_task
+    if repeats > 1:
+        s["spread"] = _spread(rows)
+    return s
+
+
+def _collapse(rows: list[dict]) -> list[dict]:
+    """One display row per task over its repeats: pass count, mean metrics,
+    and every distinct failure label."""
+    by: dict[str, list[dict]] = {}
+    for r in rows:
+        by.setdefault(r["id"], []).append(r)
+    out = []
+    for tid, rs in by.items():
+        def mean(key):
+            vals = [r[key] for r in rs if isinstance(r.get(key), (int, float))
+                    and not isinstance(r.get(key), bool)]
+            return sum(vals) / len(vals) if vals else 0
+        out.append({
+            "id": tid, "passes": f"{sum(1 for r in rs if r.get('passed'))}/{len(rs)}",
+            "located": round(mean("located"), 2),
+            "steps": round(mean("steps"), 1) if any("steps" in r for r in rs) else "-",
+            "calls": round(mean("calls"), 1), "prompt_tokens": mean("prompt_tokens"),
+            "cache_hit": mean("cache_hit"), "seconds": mean("seconds"),
+            "failure": ",".join(sorted({r["failure"] for r in rs
+                                        if r.get("failure")}))})
+    return out
+
+
+def _pm(sp: dict, key: str, fmt: str) -> str:
+    e = sp.get(key) or {}
+    return f"{format(e.get('mean', 0), fmt)} ±{format(e.get('sd', 0), fmt)}"
+
+
 def render(rows: list[dict], summary: dict) -> str:
     out = [f"{'task':<24}{'ok':<5}{'locate':<8}{'steps':<7}{'calls':<7}"
            f"{'tok in':<9}{'cache':<7}{'sec':<6}failure"]
-    for r in rows:
-        out.append(
-            f"{r['id']:<24}{'yes' if r.get('passed') else 'NO':<5}"
-            f"{r.get('located', 0):<8}{r.get('steps', '-')!s:<7}"
-            f"{r.get('calls', 0):<7}{r.get('prompt_tokens', 0):<9}"
-            f"{r.get('cache_hit', 0):<7.0%}{r.get('seconds', 0):<6.0f}"
-            f"{r.get('failure', '')}")
+    repeats = int(summary.get("repeats") or 1)
+    if repeats > 1:
+        for r in _collapse(rows):
+            out.append(
+                f"{r['id']:<24}{r['passes']:<5}{r['located']:<8}"
+                f"{r['steps']!s:<7}{r['calls']:<7}{r['prompt_tokens']:<9.0f}"
+                f"{r['cache_hit']:<7.0%}{r['seconds']:<6.0f}{r['failure']}")
+    else:
+        for r in rows:
+            out.append(
+                f"{r['id']:<24}{'yes' if r.get('passed') else 'NO':<5}"
+                f"{r.get('located', 0):<8}{r.get('steps', '-')!s:<7}"
+                f"{r.get('calls', 0):<7}{r.get('prompt_tokens', 0):<9}"
+                f"{r.get('cache_hit', 0):<7.0%}{r.get('seconds', 0):<6.0f}"
+                f"{r.get('failure', '')}")
     s = summary
     out.append("")
     out.append(f"pass {s['pass_rate']:.0%}  locate {s['locate_rate']:.0%}  "
@@ -494,6 +580,16 @@ def render(rows: list[dict], summary: dict) -> str:
                f"mean {s['mean_calls']:.1f} calls / "
                f"{s['mean_prompt_tokens']:.0f} tokens in / "
                f"{s['mean_seconds']:.0f}s")
+    sp = s.get("spread")
+    if sp:
+        out.append(
+            f"over {repeats} repeats (mean ±sd): "
+            f"pass {_pm(sp, 'pass_rate', '.0%')}  "
+            f"calls {_pm(sp, 'mean_calls', '.1f')}  "
+            f"tokens in {_pm(sp, 'mean_prompt_tokens', '.0f')}  "
+            f"tokens out {_pm(sp, 'mean_completion_tokens', '.0f')}  "
+            f"cache-hit {_pm(sp, 'cache_hit', '.0%')}  "
+            f"seconds {_pm(sp, 'mean_seconds', '.1f')}")
     if s["failures"]:
         out.append("failures: " + ", ".join(f"{k} x{v}" for k, v in
                                             sorted(s["failures"].items())))
@@ -552,6 +648,23 @@ def _repeats(report: dict) -> int:
         return max(1, int((report.get("summary") or {}).get("repeats") or 1))
     except (TypeError, ValueError):
         return 1
+
+
+def _repeat_means(rows: list[dict], fn) -> list[float]:
+    """The mean of `fn` over each repeat's rows."""
+    by: dict[int, list[float]] = {}
+    for r in rows:
+        v = fn(r)
+        if v is not None:
+            by.setdefault(int(r.get("repeat", 0) or 0), []).append(v)
+    return [sum(v) / len(v) for _k, v in sorted(by.items())]
+
+
+def _std_error(*series: list[float]) -> float:
+    """Standard error of a difference of means, from per-repeat values. A
+    side with one repeat has no measured spread and adds nothing."""
+    return math.sqrt(sum(statistics.variance(x) / len(x)
+                         for x in series if len(x) >= 2))
 
 
 def _num(v):
@@ -633,15 +746,20 @@ def compare_reports(baseline: dict, current: dict,
                 continue
             old, new = sum(bv) / len(bv), sum(cv) / len(cv)
             items = min(len(bv) / b_rep, len(cv) / c_rep)
-            tol = 1.0 / max(1.0, items)
+            # One task-equivalent, or twice the standard error of the two
+            # runs' repeat-to-repeat spread when that is larger: a noisy
+            # model widens its own margin instead of failing on a coin flip.
+            tol = max(1.0 / max(1.0, items), 2 * _std_error(
+                _repeat_means(b_rows, fn), _repeat_means(c_rows, fn)))
             drop = old - new
             if drop > tol + _TOLERANCE_EPS:
                 regressions.append(
-                    f"{label}: {old:.0%} -> {new:.0%} (-{drop / tol:.1f} "
-                    "task-equivalents, tolerance 1)")
+                    f"{label}: {old:.0%} -> {new:.0%} (-{drop * items:.1f} "
+                    f"task-equivalents, tolerance {tol * items:.1f})")
             elif drop > _TOLERANCE_EPS:
-                info.append(f"{label}: {old:.0%} -> {new:.0%} (-{drop / tol:.1f} "
-                            "task-equivalent, within tolerance)")
+                info.append(f"{label}: {old:.0%} -> {new:.0%} (-{drop * items:.1f} "
+                            f"task-equivalents, within tolerance "
+                            f"{tol * items:.1f})")
             elif -drop > tol + _TOLERANCE_EPS:
                 improvements.append(f"{label}: {old:.0%} -> {new:.0%}")
         for t in common:
@@ -673,7 +791,14 @@ def compare_reports(baseline: dict, current: dict,
     def growth(key, label, tolerance):
         old = float(b.get(key, 0) or 0)
         new = float(c.get(key, 0) or 0)
-        if old > 0 and new > old * (1 + tolerance):
+        row_key = key[5:] if key.startswith("mean_") else key
+        fn = lambda r: _num(r.get(row_key))            # noqa: E731
+        se = _std_error(_repeat_means(baseline.get("rows") or [], fn),
+                        _repeat_means(current.get("rows") or [], fn))
+        if old > 0 and new > old * (1 + tolerance) and new - old <= 2 * se:
+            info.append(f"{label}: {old:.0f} -> {new:.0f} (+{(new / old - 1) * 100:.0f}"
+                        f"%, within 2 standard errors of the repeat spread)")
+        elif old > 0 and new > old * (1 + tolerance):
             regressions.append(
                 f"{label}: {old:.0f} -> {new:.0f} "
                 f"(+{(new / old - 1) * 100:.0f}% > {tolerance:.0%})")
@@ -735,6 +860,20 @@ def render_compare(regressions: list[str], improvements: list[str],
     return "\n".join(lines)
 
 
+def repeat_seeds(cfg, repeats: int, seed: int | None) -> list[int | None]:
+    """The `sampler.seed` of each repeat: base + i. With neither --repeats nor
+    --seed the sampler is left exactly as the user wrote it ([None]). Without
+    --seed the base is the user's own sampler seed, else 0, so repeats differ
+    from each other but a run can be repeated."""
+    if seed is None and repeats <= 1:
+        return [None]
+    if seed is None:
+        mine = (getattr(cfg, "sampler", None) or {}).get("seed")
+        seed = mine if isinstance(mine, int) and not isinstance(mine, bool) \
+            else 0
+    return [seed + i for i in range(repeats)]
+
+
 def run_cli(args, cfg) -> int:
     """`pedacito eval`."""
     from .llm import LLMClient
@@ -748,19 +887,40 @@ def run_cli(args, cfg) -> int:
         print("No such task. `pedacito eval --list` shows the ids.",
               file=sys.stderr)
         return 2
-    client = LLMClient(cfg)
+    repeats = int(getattr(args, "repeats", 1))
+    if repeats < 1:
+        print("--repeats must be at least 1.", file=sys.stderr)
+        return 2
+    seeds = repeat_seeds(cfg, repeats, getattr(args, "seed", None))
+    # Seeding writes the sampler, so it goes on a copy: the user's config
+    # (and whatever sampler they wrote) is never touched.
+    run_cfg = copy.copy(cfg) if seeds[0] is not None else cfg
+    client = LLMClient(run_cfg)
     client.check()
     client.warmup()
     rows = []
-    for t in tasks:
-        print(f"\n=== {t.id}: {t.prompt[:70]}", file=sys.stderr)
-        rows.append(run_task(t, client, cfg))
+    for i, seed in enumerate(seeds):
+        if repeats > 1:
+            print(f"\n##### repeat {i + 1}/{repeats}"
+                  + (f" (seed {seed})" if seed is not None else ""),
+                  file=sys.stderr)
+        if seed is not None:
+            run_cfg.sampler = {**(cfg.sampler or {}), "seed": seed}
+        for t in tasks:
+            print(f"\n=== {t.id}: {t.prompt[:70]}", file=sys.stderr)
+            row = run_task(t, client, run_cfg)
+            row["repeat"] = i
+            if seed is not None:
+                row["seed"] = seed
+            rows.append(row)
     summary = summarise(rows)
     print()
     print(render(rows, summary))
     report = {"model": cfg.model, "pack": getattr(cfg, "prompt_pack", ""),
               "disable_thinking": bool(getattr(cfg, "disable_thinking", False)),
-              "taxonomy": TAXONOMY_VERSION, "summary": summary, "rows": rows}
+              "taxonomy": TAXONOMY_VERSION, "repeats": repeats,
+              "seeds": seeds if seeds[0] is not None else [],
+              "summary": summary, "rows": rows}
     if args.out:
         Path(args.out).write_text(json.dumps(report, indent=1),
                                   encoding="utf-8")
