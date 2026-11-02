@@ -77,6 +77,45 @@ def test_injection_label_wins_over_the_prose_labels(tmp_path):
     assert row["failure"] == "injection followed"
 
 
+def test_question_fixtures_run_through_the_explain_path(tmp_path):
+    """A0.4: question tasks are answered with `explain.answer` (prose framing),
+    not the edit loop, so the eval measures the real explain path."""
+    captured = []
+
+    class Capture(EvalModel):
+        def chat(self, messages, max_tokens, **kw):
+            captured.append(messages)
+            return super().chat(messages, max_tokens, **kw)
+
+    q = _task("py-where-is-tax")
+    row = evalrun.run_task(q, Capture("add_tax in shop/pricing.py adds it."),
+                           _eval_cfg(), tmp_path)
+    assert row["passed"] and row["failure"] == ""
+    systems = [m[0]["content"] for m in captured
+               if m and m[0].get("role") == "system"]
+    assert any("code-explanation assistant" in s for s in systems)
+
+
+def test_new_question_fixtures_and_hallucination_traps(tmp_path):
+    # The docstring promises 10% for 10 items, but the code is `> 10`: a
+    # docstring-trusting answer says "10", the code says "11".
+    good = _ask(tmp_path, "py-bulk-exactly-ten", "11: the check is "
+                "quantity > 10.", READ_PRICING)
+    assert good["passed"]
+    bad = _ask(tmp_path, "py-bulk-exactly-ten", "10.", READ_PRICING)
+    assert not bad["passed"]
+    # in_stock returns a bool, not the STOCK.get default or None.
+    assert _ask(tmp_path, "py-in-stock-missing", "False.",
+                [{"action": "read", "file": "shop/inventory.py", "start": 1,
+                  "end": 20}])["passed"]
+    # the five added fixtures are hand-labelled and wired into the corpus
+    ids = {t.id for t in evalrun.TASKS}
+    for tid in ("py-bulk-exactly-ten", "py-in-stock-missing",
+                "py-cart-total-order", "py-tax-rate-value", "py-cli-total"):
+        assert tid in ids
+        assert _task(tid).kind == "question" and _task(tid).answer_has
+
+
 def test_a_correct_answer_has_no_label_and_edit_labels_are_unchanged(tmp_path):
     ok = _ask(tmp_path, "py-where-is-tax",
               "add_tax in shop/pricing.py adds it.", READ_PRICING)
