@@ -91,6 +91,119 @@ def test_quick_findings_python_syntax_error_via_ast_fallback(tmp_path,
     assert "syntax error" in found["bad.py"][0]
 
 
+def test_quick_python_fallback_flags_undefined_names(tmp_path, monkeypatch):
+    """P9: with no linter installed, the fallback still catches the
+    NameError class `ast.parse` waves through -- a name loaded but bound
+    nowhere (deepclitest workers kept shipping files that referenced
+    helpers no longer present after a botched from-memory rewrite)."""
+    monkeypatch.setattr(diagnostics.shutil, "which", lambda name: "")
+    (tmp_path / "m.py").write_text(
+        "import os\n"
+        "\n"
+        "def f(a):\n"
+        "    return os.path.join(a, g(a))\n", encoding="utf-8")
+    found = diagnostics.quick_findings(tmp_path, ["m.py"])["m.py"]
+    assert len(found) == 1
+    assert found[0].startswith("m.py:4:")
+    assert "undefined name 'g'" in found[0]
+
+
+def test_quick_python_fallback_keeps_quiet_on_sound_code(tmp_path,
+                                                          monkeypatch):
+    monkeypatch.setattr(diagnostics.shutil, "which", lambda name: "")
+    (tmp_path / "ok.py").write_text(
+        "import json\n"
+        "from pathlib import Path\n"
+        "CONST = 1\n"
+        "\n"
+        "def helper(x):\n"
+        "    return x * CONST\n"
+        "\n"
+        "class C:\n"
+        "    attr = [helper(i) for i in range(3)]\n"
+        "\n"
+        "    def method(self):\n"
+        "        total = sum(v for v in self.items)\n"
+        "        return json.dumps({'t': total, 'p': str(Path('.'))})\n"
+        "\n"
+        "def outer():\n"
+        "    count = 0\n"
+        "    def inner():\n"
+        "        nonlocal count\n"
+        "        count += 1\n"
+        "    inner()\n"
+        "    squares = [y := n * n for n in range(3)]\n"
+        "    return count, y, squares\n"
+        "\n"
+        "def uses_later():\n"
+        "    return later_defined()      # forward reference: legal\n"
+        "\n"
+        "def later_defined():\n"
+        "    return 42\n", encoding="utf-8")
+    assert diagnostics.quick_findings(tmp_path, ["ok.py"])["ok.py"] == []
+
+
+def test_quick_python_fallback_skips_dynamic_name_sources(tmp_path,
+                                                           monkeypatch):
+    """Star-imports and eval/exec can bring in any name at runtime, so the
+    whole file is skipped rather than risking a false alarm."""
+    monkeypatch.setattr(diagnostics.shutil, "which", lambda name: "")
+    (tmp_path / "star.py").write_text(
+        "from os.path import *\nprint(join('a', 'b'))\n", encoding="utf-8")
+    (tmp_path / "dyn.py").write_text(
+        "exec('x = 1')\nprint(x)\n", encoding="utf-8")
+    found = diagnostics.quick_findings(tmp_path, ["star.py", "dyn.py"])
+    assert found["star.py"] == []
+    assert found["dyn.py"] == []
+
+
+def test_quick_python_fallback_respects_class_scope_rules(tmp_path,
+                                                           monkeypatch):
+    """A class body is not part of the lookup chain of the scopes nested in
+    it: a method (or a comprehension!) reaching for a class attribute is a
+    genuine NameError and gets flagged; the class body itself is fine."""
+    monkeypatch.setattr(diagnostics.shutil, "which", lambda name: "")
+    (tmp_path / "c.py").write_text(
+        "class C:\n"
+        "    LIMIT = 10\n"
+        "    doubled = [v * 2 for v in range(LIMIT)]\n"
+        "    same = LIMIT * 2\n"
+        "\n"
+        "    def m(self):\n"
+        "        return LIMIT\n", encoding="utf-8")
+    found = diagnostics.quick_findings(tmp_path, ["c.py"])["c.py"]
+    assert any(x.startswith("c.py:3:") and "undefined name 'LIMIT'" in x
+               for x in found)
+    assert any(x.startswith("c.py:7:") and "undefined name 'LIMIT'" in x
+               for x in found)
+    assert not any(x.startswith("c.py:4:") for x in found)
+
+
+def test_quick_python_fallback_caps_runaway_findings(tmp_path, monkeypatch):
+    monkeypatch.setattr(diagnostics.shutil, "which", lambda name: "")
+    src = "".join(f"print(undefined_{i})\n" for i in range(45))
+    (tmp_path / "many.py").write_text(src, encoding="utf-8")
+    found = diagnostics.quick_findings(tmp_path, ["many.py"])["many.py"]
+    assert len(found) == diagnostics._MAX_UNDEFINED + 1
+    assert "more undefined names" in found[-1] and "fragment" in found[-1]
+
+
+def test_new_findings_surfaces_an_introduced_undefined_name(tmp_path,
+                                                             monkeypatch):
+    """End-to-end through the post-edit diff: an undefined name the edit
+    introduced is reported, pre-existing findings are not."""
+    monkeypatch.setattr(diagnostics.shutil, "which", lambda name: "")
+    (tmp_path / "a.py").write_text("def f():\n    return stale_thing\n",
+                                   encoding="utf-8")
+    base = diagnostics.quick_findings(tmp_path, ["a.py"])
+    (tmp_path / "a.py").write_text(
+        "def f():\n    return stale_thing + missing\n", encoding="utf-8")
+    cur = diagnostics.quick_findings(tmp_path, ["a.py"])
+    new = diagnostics.new_findings(base, cur)
+    assert [x for x in new["a.py"] if "'missing'" in x]
+    assert not [x for x in new["a.py"] if "'stale_thing'" in x]
+
+
 def test_quick_findings_prefers_an_installed_linter(tmp_path, monkeypatch):
     monkeypatch.setattr(diagnostics.shutil, "which",
                         lambda name: "/usr/bin/ruff" if name == "ruff" else "")

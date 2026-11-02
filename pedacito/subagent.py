@@ -54,7 +54,8 @@ def child_config(cfg):
     child._interactive = False        # a helper never interrupts the user
     child.__dict__.pop("_steer", None)
     child.log_events = getattr(cfg, "log_events", True)
-    for scratch in ("_backup_dir", "_task_reads", "_task_allowlist"):
+    for scratch in ("_backup_dir", "_task_reads", "_task_allowlist",
+                    "_task_mutations"):
         child.__dict__.pop(scratch, None)
     return child
 

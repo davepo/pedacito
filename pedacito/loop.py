@@ -865,6 +865,10 @@ class TaskResult:
     findings: list = field(default_factory=list)
     # Per-task usage: tokens, cache-hit ratio, seconds, cost (see _task_stats).
     stats: dict = field(default_factory=dict)
+    # The post-edit impacted-tests verdict: None when the tests did not run
+    # (verification off / no test command), else True/False from the last
+    # verification round. `ask --strict` exits nonzero on False.
+    tests_ok: bool | None = None
 
 
 def _snapshot_stats(client) -> dict:
@@ -922,20 +926,26 @@ def _post_edit_tests(root, cfg, agent, idx, task, results, reply, backup_dir,
                      baseline, edit_files):
     """After edits were written, run the impacted tests (`verify_tests`).
     New failures -- worse than the pre-edit baseline -- are fed back for up to
-    `repair_rounds` fix rounds, exactly like the post-edit lint check."""
+    `repair_rounds` fix rounds, exactly like the post-edit lint check.
+    Returns (results, reply, tests_ok); tests_ok is None when the tests did
+    not run (verification off, or no test command), else the last run's
+    pass/fail -- surfaced as TaskResult.tests_ok for `ask --strict` and the
+    eval scorer."""
     if not (getattr(cfg, "verify_tests", False)
             and getattr(cfg, "allow_shell", False)):
-        return results, reply
+        return results, reply, None
     from . import verify as verify_mod
     changed = sorted({r.file for r in results if r.ok and r.file}) or edit_files
     base_score = 0
     if baseline is not None and not baseline[0]:
         base_score = _failure_score(baseline[1])
+    tests_ok = None
     for round_ in range(max(0, int(getattr(cfg, "repair_rounds", 2) or 0)) + 1):
         got = _run_tests(idx, cfg, changed)
         if got is None:
-            return results, reply
+            return results, reply, tests_ok
         ok, out, desc = got
+        tests_ok = ok
         score = 0 if ok else _failure_score(out)
         print(f"  [tests: {'passed' if ok else 'FAILED'} -- {desc}]",
               file=sys.stderr)
@@ -967,7 +977,7 @@ def _post_edit_tests(root, cfg, agent, idx, task, results, reply, backup_dir,
         results = [r for r in results if r.ok] + new
         reply = (reply.rstrip() + "\n\n" + fixed)
         changed = sorted({fileio_norm(r.file) for r in results if r.ok})
-    return results, reply
+    return results, reply, tests_ok
 
 
 def fileio_norm(name: str) -> str:
@@ -1405,7 +1415,7 @@ def run_task(root: Path, cfg, client, agent, idx, task: str, *,
     if answer_system is not None or review or not getattr(cfg, "use_memory", True):
         return tr
     try:
-        if any(r.ok for r in tr.results) or _is_noop(tr.reply):
+        if any(r.ok for r in tr.results) or tr.changed or _is_noop(tr.reply):
             memory_mod.clear_attempts(root, task)
         else:
             looked = [ln.split(None, 2)[-1][:60] for ln in tr.steps
@@ -1429,6 +1439,7 @@ def _run_ladder(root: Path, cfg, client, agent, idx, task: str, *,
     hosted budget."""
     from . import roles as roles_mod
     from .llm import BudgetExceeded, CancelledError
+    cfg._task_mutations = []      # a fresh gather-mutation ledger per task
     kw = dict(apply=apply, review=review, answer_system=answer_system)
     try:
         tr = _run_task_once(root, cfg, client, agent, idx, task, **kw)
@@ -1447,7 +1458,8 @@ def _run_ladder(root: Path, cfg, client, agent, idx, task: str, *,
     if answer_system is not None or review:
         return tr
     esc = roles_mod.client_for(cfg, "escalate", client)
-    if esc is client or (tr.applied and any(r.ok for r in tr.results)):
+    if esc is client or (tr.applied
+                         and (any(r.ok for r in tr.results) or tr.changed)):
         return tr
     if any(r.ok for r in tr.results) and not apply:
         return tr                      # a dry run that produced a valid diff
@@ -1484,6 +1496,12 @@ def _run_task_once(root: Path, cfg, client, agent, idx, task: str, *,
     _fire(cfg, root, "pre_task", task=task[:500])
     print("\n--- looking things up ---", file=sys.stderr)
     gathered = agent.gather(task, backup_dir=backup_dir)
+    # Files a gather-phase action wrote/moved/deleted (write/append/move/
+    # delete/rename). A worker that finishes the job with gather actions --
+    # the deepclitest pattern -- produces no answer-phase edit blocks, and
+    # its mutations used to bypass post-edit verification entirely.
+    gather_mut = list(getattr(cfg, "_task_mutations", None) or ())
+    tests_ok = None
     print("--- answering ---\n", file=sys.stderr)
     raw_reply = agent.answer(task, gathered, system=answer_system)
     findings: list = []
@@ -1548,12 +1566,15 @@ def _run_task_once(root: Path, cfg, client, agent, idx, task: str, *,
             results, reply = agent.apply(raw_reply, dry_run=review or not apply,
                                          task=task, gathered=gathered,
                                          backup_dir=None if review else backup_dir)
-            if apply and not review and any(r.ok for r in results):
+            if apply and not review and (
+                    any(r.ok for r in results) or gather_mut):
                 _fire(cfg, root, "post_edit",
-                      files=[r.file for r in results if r.ok])
-                results, reply = _post_edit_tests(
+                      files=sorted({r.file for r in results if r.ok}
+                                   | set(gather_mut)))
+                results, reply, tests_ok = _post_edit_tests(
                     root, cfg, agent, idx, task, results, reply,
-                    backup_dir, baseline_tests, edit_files)
+                    backup_dir, baseline_tests,
+                    sorted(set(edit_files) | set(gather_mut)))
         if not results and getattr(agent, "noop_discards", None):
             # The reply's only blocks were null edits (SEARCH == REPLACE)
             # dropped by parse_edits: the model had concluded no edit was
@@ -1564,10 +1585,14 @@ def _run_task_once(root: Path, cfg, client, agent, idx, task: str, *,
                                       f"block(s) ({files}); treated as a "
                                       f"refusal to edit", "WARN")
             reply = _mark_fabricated(reply)
-    if not results and not _is_noop(reply) and not contradicted:
+    if not results and not _is_noop(reply) and not contradicted \
+            and not gather_mut:
         # Zero edit blocks: one bounded recovery (honour read tool-calls or
         # re-ask with the edit protocol). Skipped for no-op replies ("already
-        # complete") and refusals, which are coherent about doing nothing.
+        # complete") and refusals, which are coherent about doing nothing,
+        # and for gather-only runs: the mutation ledger proves the work
+        # landed during the lookup phase, so pressing the reply for "real"
+        # blocks would only invite fabricated no-ops.
         rec = _recover_no_edit_reply(
             root, agent, task, gathered, reply,
             dry_run=review or not apply,
@@ -1592,8 +1617,10 @@ def _run_task_once(root: Path, cfg, client, agent, idx, task: str, *,
                                       f"refusal to edit", "WARN")
             reply = _mark_fabricated(reply)
     if (not results and not contradicted and not fabricated
-            and not _is_noop(reply)):
-        # A "no changes" declaration is a decision, not a parse failure.
+            and not _is_noop(reply) and not gather_mut):
+        # A "no changes" declaration is a decision, not a parse failure, and
+        # a gather-only run wrote its changes with tool actions instead of
+        # blocks -- neither belongs in the log as an ERROR.
         workspace.log_event(root, "no edit blocks parsed from the reply", "ERROR")
     elif results:
         for r in results:
@@ -1620,6 +1647,12 @@ def _run_task_once(root: Path, cfg, client, agent, idx, task: str, *,
                 changed.append(r.file)
             except Exception:
                 pass               # a deleted/moved file re-indexes on next refresh
+        for rel in gather_mut:
+            # Gather-phase writes are re-indexed by the tools themselves;
+            # only files that still exist join `changed` so lint and the
+            # diagnostics check never receive a deleted path.
+            if rel not in changed and (root / rel).exists():
+                changed.append(rel)
         agent.index = idx
 
     if applied and changed and int(getattr(cfg, "refresh_summaries", 0) or 0):
@@ -1665,7 +1698,7 @@ def _run_task_once(root: Path, cfg, client, agent, idx, task: str, *,
                       steps_log, fabricated=fabricated_only,
                       backup_dir=backup_dir,
                       live_ok=getattr(agent, "live_evidence_ok", None),
-                      findings=findings, stats=stats)
+                      findings=findings, stats=stats, tests_ok=tests_ok)
 
 
 # Corrective re-runs are one-shot: a second identical failure is a verdict,
@@ -1738,7 +1771,7 @@ def run_loop(root: Path, cfg, client, idx, plan_path: Path, *,
              max_tasks: int = 0, max_minutes: int = 0,
              stop_on_fail: bool = True,
              answer_system: str | None = None, auto_install: bool = False,
-             goal: str = "", on_task=None) -> int:
+             goal: str = "", on_task=None, strict: bool = False) -> int:
     """Run the Ralph loop until the plan is empty (or a cap/stop is hit).
 
     Each iteration: read the plan, take the first unchecked task, run it in a
@@ -1785,12 +1818,16 @@ def run_loop(root: Path, cfg, client, idx, plan_path: Path, *,
       spelled out, then retired as unverified. Never remediated.
     - A task whose reply declares the work incomplete with zero edits applied
       is retried once, then failed -- never ticked done as a no-op.
+    - ``strict`` exits 1 when a task landed edits but left a failed edit
+      block (a partial application) or impacted tests still failing after
+      the repair rounds; without it both are reported but the run exits 0.
     """
     from .agent import Agent
 
     attempted = 0
     done = 0
     failed = 0
+    strict_bad = False
     started_at = time.monotonic()
     # Reports/edit summaries carried into later task prompts so a fresh
     # context still benefits from earlier findings.
@@ -2044,7 +2081,7 @@ def run_loop(root: Path, cfg, client, idx, plan_path: Path, *,
             continue
 
         ok_edits = [r for r in tr.results if r.ok]
-        if not tr.applied or not ok_edits:
+        if not tr.applied or not (ok_edits or tr.changed):
             if task != _REMEDIATION_TITLE and _declares_incomplete(tr.reply):
                 # A reply describing work still required is never a no-op,
                 # even if it incidentally contains "already". The deferred
@@ -2269,6 +2306,30 @@ def run_loop(root: Path, cfg, client, idx, plan_path: Path, *,
                 "state before quoting it.")
             _prune_notes(context_notes)   # run anchor + latest two
 
+            if any(f.endswith((".html", ".htm", ".js", ".mjs", ".cjs"))
+                   for f in tr.changed):
+                # Contract lint for web files (webcheck): a notice board,
+                # never a task failure -- regex-level checks can misread a
+                # dynamically built id, but the warnings land in the run log
+                # where a later task (or the user) can act on them.
+                try:
+                    from . import webcheck
+                    notes = webcheck.run(root, tr.changed)[:8]
+                except Exception:
+                    notes = []
+                for note in notes:
+                    print(f"  [webcheck] {note}", file=sys.stderr)
+                    workspace.log_event(root, f"webcheck: {note}", "WARN")
+
+        if strict and (tr.tests_ok is False
+                       or any(not r.ok for r in tr.results)):
+            # The work landed but is not clean: a failed edit block (a
+            # partial application) or impacted tests still red after the
+            # repair rounds. Without --strict this stays a run-log note.
+            strict_bad = True
+            workspace.log_event(root, "strict: a task applied edits but left "
+                                "failed blocks or failing tests", "ERROR")
+
         mark_done(plan_path, task)
         done += 1
         workspace.log_event(root, f"task done ({done})")
@@ -2289,4 +2350,4 @@ def run_loop(root: Path, cfg, client, idx, plan_path: Path, *,
                         "ERROR" if failed else "INFO")
     _fire(cfg, root, "notification", message=f"pedacito auto finished: "
           f"{done} done, {failed} failed, {remaining} left")
-    return 0 if failed == 0 else 1
+    return 0 if failed == 0 and not strict_bad else 1

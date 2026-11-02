@@ -94,16 +94,19 @@ It tells "server unreachable" apart from "model not found or won't load"
 same check, then probes which structured-output modes the server really
 supports (`json_schema`, `json_object`, plain prompting), prints a recommended
 `json_mode`, reports the server's real context window and model weight size,
-and calibrates token math against the server's own tokenizer. Verdicts are
-remembered per server and model for a week, so a server without grammar
-support automatically gets a few-shot JSON example in the prompt on later runs.
+calibrates token math against the server's own tokenizer, and reports whether
+tree-sitter parsing is active (with its version, or why it is disabled).
+Verdicts are remembered per server and model for a week, so a server without
+grammar support automatically gets a few-shot JSON example in the prompt on
+later runs.
 
 Once per model, run `pedacito calibrate`. It spends about a minute on a scripted
 mini-suite — tool choice, JSON adherence, edit format, planted-injection and
-honesty checks, long-context retrieval, continuation, capabilities — and saves
-a **model card**. Settings you left at their defaults then follow the card
-(prompt pack, answer mode, verifier, best-of-N, fold depth); anything you set
-explicitly still wins. `pedacito config` shows the card.
+honesty checks, long-context retrieval, continuation, a thinking A/B,
+capabilities — and saves a **model card**. Settings you left at their defaults
+then follow the card (prompt pack, answer mode, verifier, best-of-N, fold
+depth, the thinking switch); anything you set explicitly still wins.
+`pedacito config` shows the card.
 
 ---
 
@@ -200,14 +203,20 @@ pedacito ask PROJ -t "..." --plan       # split a multi-part task into steps
 pedacito ask PROJ -t "..." --jsonl      # one JSON event per line on stdout
 ```
 
-Other useful flags: `--steps N` (lookup limit), `--model`, `--url`, `--profile`,
+Other useful flags: `--steps N` (lookup limit), `--strict` (exit 1 when a task
+applied edits but left a failed edit block or impacted tests still failing
+after the repair rounds), `--model`, `--url`, `--profile`,
 `--role planner=big` (route one job to another profile for this run),
 `--config`, `--root`, `--exclude`, `--include`, `--ext`.
 
 **Plan mode.** A task that changes three things in one context window usually
 gets the first done, the second half done and the third forgotten. `--plan`
 (or `plan_threshold`, which a model card sets for weaker models) gives each
-change its own window, lookups, evidence checks and rollback. A task written as
+change its own window, lookups, evidence checks and rollback. A task that
+names five or more files is planned even when `plan_threshold` is 0 — the
+default, and what a strong model's card picks — because width is a
+window-capacity problem, not a skill problem; an explicit `plan_threshold` in
+your config still governs, and `--no-plan` opts one task out. A task written as
 bullets or several clear requirements is split deterministically, with no model
 call; anything else goes to the `planner` role (which may declare
 `depends_on`). The plan is a markdown checklist in `.pedacito/plans/` you can
@@ -280,12 +289,13 @@ do:
 |---|---|---|
 | `write` / `append` / `move` / `delete` | `allow_write = true` | Whole-file operations; `append` builds a file larger than one reply. |
 | `rename` | `allow_write = true` | Mechanically rename one definition and its references in the files that import it (strings and comments untouched, every file re-parsed, snapshotted). Refuses a name defined in several places and lists the references it left alone. |
+| `undo` | `allow_write = true` (+ `backup`, on by default) | Self-recovery mid-task: reverts what this task's `write`/`append`/`move`/`delete` actions did so far (or just one of their files) — pre-task snapshots come back, files the task created go away. |
 | `run` | `allow_shell = true` | Run one command (e.g. `pytest -q`), without a shell. A quiet GUI/server is stopped after `shell_idle_seconds`. |
 | `serve` | `allow_serve = true` | Start, list, log, or stop a background dev server. The registry and logs live under `.pedacito/procs/`; also `pedacito serve` / `pedacito procs`. |
 | `diagnose` | `allow_shell = true` | Run the detected linter/type checker (`ruff`, `pyflakes`, `flake8`, `mypy`/`pyright` when configured, `npm lint`, `tsc`, `cargo check`, `go vet`, `rubocop`). Also available as `pedacito diagnose`. |
 | `lsp` | `allow_lsp = true` | Exact definition/references/hover/diagnostics through pyright/pylsp/typescript-language-server/rust-analyzer/gopls, or commands in `lsp_servers`. Also `pedacito lsp`. |
 | `screenshot` | `allow_screenshots = true` | Capture the screen as text: size, brightness, blank-screen verdict, OCR, optional `vision_model` description. Needs the `vision` extra. |
-| `browser` | `allow_browser = true` | Headless browser: start a server command, open the page, click/type, and report page text, canvas sizes, and console errors. Needs the `browser` extra. |
+| `browser` | `allow_browser = true` | Headless browser: start a server command, open the page, click/type/hold keys, and report page text, canvas sizes, and console errors. Needs the `browser` extra. |
 | `mcp` | `allow_mcp = true` + `mcp_servers = [...]` | Call tools, prompts (`prompt:server/name`), or resources (`resource:server/uri`) from MCP servers. The catalog shows arguments, calls are validated, one live session per server is kept warm, and a server that was down at startup is retried. |
 | `task` | `allow_subagents = true` | Hand a bounded, read-only research question to a helper agent with a fresh context window; only a short digest comes back. Depth is capped (1 local, 2 hosted). |
 | `fetch` | `allow_fetch = true` + `fetch_allowed_hosts` | URL → readable text, host-allowlisted, size-capped, cached, labelled untrusted. Private/loopback addresses are refused. |
@@ -314,8 +324,11 @@ actions:
 browser  command="python main.py"  pattern="press Enter; wait 3"  start=4
 ```
 
-This reliably catches black screens, blank pages, missing text, and console
-errors; it does not judge visual quality. PNGs are saved under
+The `pattern` grammar also covers `hold ArrowUp 1.5` (a key kept DOWN for N
+seconds — an instant `press` can fall between two samples of a fixed-timestep
+game loop), `click #start`, `fill #name Ada`, `type hello`, and `eval` (JS in
+the page). This reliably catches black screens, blank pages, missing text, and
+console errors; it does not judge visual quality. PNGs are saved under
 `.pedacito/screenshots/`.
 
 ### Memory, rules, and skills
@@ -397,6 +410,9 @@ and editable. There is no default cap on tasks, steps, or time; add one with
 `--max-tasks N`, `--max-minutes N`, or `--steps N`. `--repair N` sets repair
 rounds per failed verification, `--keep-going` continues past failed tasks, and
 `--auto-install` installs a missing Python package instead of reporting it.
+`--strict` exits 1 when a task applied edits but left a failed edit block or
+impacted tests still failing after the repair rounds — for CI and unattended
+pipelines (without it both are reported and the run exits 0).
 
 Guards for unattended runs: a repair round that makes the check *worse* (more
 test failures, more findings) is rolled back from that round's own snapshot
@@ -462,6 +478,7 @@ pedacito calibrate                 # measure the model; save a model card
 pedacito eval [--task ID] [--out report.json]   # score the harness on fixtures
 pedacito map PROJ -t "fix X"       # see the map a task would get (ranked)
 pedacito tests PROJ --files src/a.py   # detected test command + impacted tests
+pedacito webcheck PROJ             # static contract checks for web files
 pedacito memory PROJ [--add T | --forget T]
 pedacito skills PROJ
 pedacito prune PROJ --keep-sessions 50 --keep-backups 20 [--dry-run]
@@ -477,6 +494,15 @@ pedacito procs --root PROJ [logs|stop NAME]
 pedacito lsp --root PROJ --file src/a.py --line 12 --op definition
 ```
 
+`webcheck` runs static cross-file contract checks on a web project, no browser
+needed: DOM ids that exist in no HTML file, ESM syntax loaded through a classic
+`<script src>` (a silent SyntaxError), duplicate globals across classic
+scripts, `<script src>` files that do not exist, bare imports package.json
+never declared, and inline handlers calling members nothing defines. It is
+regex-level on purpose, so its results are notices — the command, the `new`
+scaffold summary, and a WARN after `auto` tasks that touched web files — never
+hard failures.
+
 `calibrate` also measures **native tool calls** against the JSON grammar on your
 model (same eight scenarios, both modes) and the card switches `tool_mode` to
 `native` only when it picks the right action at least 0.1 more often with no
@@ -486,6 +512,11 @@ on tool calling; a server that rejects `tools` falls back to the grammar once
 and remembers. Its short probes (instruction following, long-context needle)
 get a generous token budget and retry once with thinking off, so a reasoning
 model that spends a tiny budget on `<think>` is not scored as failing the skill.
+The thinking A/B then asks the same short edit question at the real answer
+budget, once with thinking on and once off: a model that is only usable with
+thinking off gets `disable_thinking = true` persisted on the card, so later
+runs start in the winning mode instead of rediscovering it one empty reply —
+one wasted round-trip — at a time.
 
 `--record` writes the ordered model responses to `.pedacito/replay/<stamp>.jsonl`
 (prompts as a hash and a short redacted preview, never in full); `--replay`
@@ -504,7 +535,10 @@ run it, change `prompt_pack` or `answer_mode`, run it again. With
 `--baseline base.json`, the new report is compared with the old one and the
 command exits nonzero on a quality regression, more followed injections, or
 token/time growth beyond the configured tolerances — a CI gate over a replay
-or a live run. `ask --replay FILE --strict-replay` does the same for prompt
+or a live run. Two reports that ran with different `disable_thinking` settings
+are flagged instead of compared on growth: thinking on/off moves tokens more
+than any harness change, and the gate must not blame (or bless) the harness
+for the config. `ask --replay FILE --strict-replay` does the same for prompt
 drift: it exits 1 when the harness asks a different prompt than the recording.
 
 ---
@@ -770,8 +804,11 @@ pedacito restore PROJ --delete-created       # also remove files that run create
 
 Files created after a snapshot are left in place unless you pass
 `--delete-created` (the run's created files are listed in a sidecar
-`backups/<stamp>.created`; directories left empty are removed too). Everything Pedacito writes for
-a project lives under `<project>/.pedacito/`:
+`backups/<stamp>.created`; directories left empty are removed too). The model
+can trigger the same rewind mid-task: the gather `undo` action (`allow_write`,
+backups on) reverts everything its own writes did in the current task, so it
+recovers from a compounding bad edit instead of ending the run on one.
+Everything Pedacito writes for a project lives under `<project>/.pedacito/`:
 
 ```
 index.json            the map (versioned, written atomically)
@@ -922,7 +959,7 @@ config --reference` prints the annotated template. Key settings:
 | `summary_workers` / `refresh_summaries` | 0 / 12 | Concurrent summaries (0 = auto: hosted 4, local 1); units re-summarised after a task. |
 | `summary_batch` | 1 | Short units summarised N per request while indexing (fewer round-trips; unparsed lines fall back to single requests). |
 | `max_observation_tokens` | 0 | Ceiling on one non-read observation, in tokens (0 = auto: a quarter of the window, 300-2200). |
-| `plan_threshold` / `max_replans` | 0 / 1 | Auto-plan tasks naming this many files or requirements (0 = only with `--plan`); planner revisions after a failed step. |
+| `plan_threshold` / `max_replans` | 0 / 1 | Auto-plan tasks naming this many files or requirements; tasks naming 5+ files auto-plan even at 0 unless this is set explicitly (`--plan` forces one task, `--no-plan` opts out); planner revisions after a failed step. |
 | `allow_steering` | true | Deliver lines typed mid-task to the model in `chat`. |
 | `tool_mode` | `grammar` | `native` sends lookup steps through the model's tool-call channel; `calibrate` picks. |
 | `sandbox` / `sandbox_network` | true / false | OS sandbox for `run` and test commands; allow network inside it. |

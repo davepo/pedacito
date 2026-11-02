@@ -100,7 +100,12 @@ def rename_text(rel: str, text: str, old: str, new: str) -> tuple[str, int]:
 def tool_rename(index, cfg, old: str, new: str, file: str = "") -> str:
     """Rename a definition and its high-confidence references."""
     from .edits import _validate
-    from .tools import _protected_error, _snapshot, _task_allowlist_error
+    from .tools import (
+        _note_mutation,
+        _protected_error,
+        _snapshot,
+        _task_allowlist_error,
+    )
 
     old = (old or "").strip()
     new = (new or "").strip()
@@ -189,6 +194,7 @@ def tool_rename(index, cfg, old: str, new: str, file: str = "") -> str:
     from . import index as index_mod
     for rel in changes:
         index_mod.reindex_file(index, rel, cfg, save=False)
+    _note_mutation(cfg, *changes)
     total = sum(n for *_x, n, _s in changes.values())
     out = [f"RENAMED `{base_old}` -> `{base_new}`: {total} replacement(s) in "
            f"{len(changes)} file(s): {', '.join(changes)}",

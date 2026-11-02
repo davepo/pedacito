@@ -62,3 +62,18 @@ def test_generate_saves_json_and_markdown(tmp_path):
     assert "todo" in design.planner_context(out)
     assert design.load(tmp_path)["project_name"] == "todo"
     assert "DESIGN BRIEF" in design.brief(tmp_path)
+
+
+def test_generate_can_skip_saving_for_dry_runs(tmp_path):
+    """HARNESS-2: `new --design` without --apply must leave the project
+    directory untouched; the design still guides this run's plan."""
+    class Stub:
+        def chat_json(self, messages, schema, max_tokens=0, **kw):
+            return _design()
+
+    out = design.generate(Stub(), Config(),
+                          type("S", (), {"text": "todo CLI"})(), tmp_path,
+                          save_it=False)
+    assert out["project_name"] == "todo"
+    assert not (tmp_path / ".pedacito").exists()
+    assert design.load(tmp_path) is None

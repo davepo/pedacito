@@ -295,8 +295,10 @@ def save(root, design: dict) -> tuple[Path, Path]:
     return jp, mp
 
 
-def generate(client, cfg, spec, root) -> dict:
-    """One JSON design call, normalized and saved under `.pedacito/`."""
+def generate(client, cfg, spec, root, save_it: bool = True) -> dict:
+    """One JSON design call, normalized and (unless `save_it` is False, e.g.
+    a dry-run `new` that must not touch the project) saved under
+    `.pedacito/`."""
     messages = [
         {"role": "system", "content": DESIGN_SYSTEM},
         {"role": "user", "content":
@@ -307,8 +309,9 @@ def generate(client, cfg, spec, root) -> dict:
         max_tokens=int(getattr(cfg, "max_tokens_plan", 2000) or 2000),
         disable_thinking=True)
     design = _norm(raw if isinstance(raw, dict) else {})
-    try:
-        save(root, design)
-    except OSError:
-        pass                       # the design still guides this run
+    if save_it:
+        try:
+            save(root, design)
+        except OSError:
+            pass                       # the design still guides this run
     return design

@@ -84,6 +84,11 @@ def _add_common(p):
     p.add_argument("--strict-replay", dest="strict_replay", action="store_true",
                    help="with --replay: exit 1 when any prompt differs from "
                         "the recording (CI A/B gate)")
+    p.add_argument("--strict", action="store_true",
+                   help="exit 1 when a task applied edits but left a failed "
+                        "edit block or impacted tests still failing after the "
+                        "repair rounds (ask/auto; without it both are "
+                        "reported but the run exits 0)")
     p.add_argument("--jsonl", action="store_true",
                    help="machine-readable run: one JSON event per line on "
                         "stdout (steps, calls, the answer and diffs), human "
@@ -223,6 +228,24 @@ def _get_index(args, cfg, client, rebuild: bool, summarise: bool = True):
 
 
 SECRETISH = {"api_key"}
+
+
+def _tree_sitter_report() -> str:
+    """One `config --doctor` probe line: whether tree-sitter powers the exact
+    syntax checks, and when it does not, why not. An unsafe tree-sitter
+    (>=0.26, py-tree-sitter#472) silently disables the chunker and every
+    edit then gets only regex-level syntax feedback -- the probe makes that
+    degradation visible where the user can fix it."""
+    from . import chunker_ts
+    ver = getattr(chunker_ts, "_ts_version", "") or ""
+    if chunker_ts.TS_AVAILABLE:
+        tail = f" (tree-sitter {ver})" if ver else ""
+        return (f"Tree-sitter: active{tail} -- exact syntax gate for edits "
+                "and per-language chunking.")
+    why = getattr(chunker_ts, "_TS_DISABLED_REASON", "") or "not importable"
+    return (f"Tree-sitter: INACTIVE -- {why}. Edit syntax checks fall back "
+            "to regex-level heuristics (weaker); fix the install to get "
+            "them back.")
 
 
 def _cmd_config(args, cfg) -> int:
@@ -394,6 +417,7 @@ def _cmd_config(args, cfg) -> int:
     from . import sandbox
     state, detail = sandbox.status(cfg)
     print(f"Sandbox: {state} -- {detail}")
+    print(_tree_sitter_report())
     print("\nNext: `pedacito calibrate` measures tool choice, edit format, "
           "honesty and long-context retrieval, and saves a model card.")
     return 0
@@ -608,6 +632,21 @@ def _strict_replay_error(args, client) -> str:
     return ""
 
 
+def _strict_task_error(args, tr) -> str:
+    """The --strict failure text for one task result, or '' when the gate
+    passes or is disabled: a failed edit block (a partial application) or
+    impacted tests still red after the repair rounds."""
+    if not getattr(args, "strict", False) or tr is None:
+        return ""
+    bad = [r for r in getattr(tr, "results", []) if not r.ok]
+    if bad:
+        detail = "; ".join(f"{r.file}: {r.message}" for r in bad)
+        return f"strict: {len(bad)} edit block(s) failed: {detail[:300]}"
+    if getattr(tr, "tests_ok", None) is False:
+        return "strict: impacted tests still fail after the repair rounds"
+    return ""
+
+
 def _cmd_auto(args, cfg, client, idx, root: Path) -> int:
     """`pedacito auto`: generate a task list from a goal (or reuse a plan
     file), then implement every unchecked task in a fresh context window,
@@ -686,7 +725,8 @@ def _cmd_auto(args, cfg, client, idx, root: Path) -> int:
                          apply=args.apply, verify=verify, repair_rounds=repair,
                          max_tasks=max_tasks, max_minutes=max_minutes,
                          stop_on_fail=not args.keep_going,
-                         auto_install=auto_install, goal=spec_text)
+                         auto_install=auto_install, goal=spec_text,
+                         strict=bool(getattr(args, "strict", False)))
 
     # Post-run verification: exercise the project once (--verify and/or a smoke
     # run of main.py) and feed a failure back for repair.
@@ -1001,6 +1041,25 @@ def _cmd_tests(args) -> int:
     return 0
 
 
+def _cmd_webcheck(args) -> int:
+    """`pedacito webcheck`: static cross-file contract checks for web
+    projects (DOM ids, ESM behind classic scripts, duplicate globals,
+    undeclared imports, undefined members). Findings go to stdout in the
+    usual `rel:line: message` shape; the exit code gates on them."""
+    from . import webcheck
+    root = _root(args)
+    files = [Path(f).as_posix() for f in args.files] if args.files else None
+    found = webcheck.run(root, files=files)
+    if not found:
+        print("no web contract problems found (looked at every .html/.js "
+              "outside node_modules and friends)")
+        return 0
+    for f in found:
+        print(f)
+    print(f"{len(found)} finding(s); re-run after fixing to confirm")
+    return 1
+
+
 def _cmd_skills(args) -> int:
     from . import skills
     root = _root(args)
@@ -1070,7 +1129,8 @@ def _main(argv=None) -> int:
                         help="like --check, plus probe which structured-output "
                              "mode (json_schema / json_object / plain prompting) "
                              "this server+model actually supports, and report "
-                             "its context length and tokenizer ratio")
+                             "its context length, tokenizer ratio and the "
+                             "tree-sitter syntax-check status")
     p_conf.add_argument("--setup", action="store_true",
                         help="interactive first-run setup: finds a local server, "
                              "writes and validates a minimal config")
@@ -1155,7 +1215,8 @@ def _main(argv=None) -> int:
                        help="split the task into single-focus steps, each run "
                             "in a fresh context (with one re-plan after a "
                             "failure); automatic for multi-part tasks when "
-                            "plan_threshold is set")
+                            "plan_threshold is set, and for tasks that name "
+                            "5+ files")
     p_ask.add_argument("--no-plan", dest="no_plan", action="store_true",
                        help="never auto-plan this task")
     p_ask.add_argument("--review-plan", dest="review_plan", action="store_true",
@@ -1358,6 +1419,16 @@ def _main(argv=None) -> int:
     p_tests.add_argument("--config", metavar="FILE")
     p_tests.add_argument("--profile", metavar="NAME")
 
+    p_web = sub.add_parser(
+        "webcheck", help="static contract checks for a web project: DOM id "
+                         "references, ESM syntax in classic scripts, duplicate "
+                         "globals, undeclared imports, undefined members")
+    p_web.add_argument("paths", nargs="*", default=["."])
+    p_web.add_argument("--files", nargs="*", default=[], metavar="FILE")
+    p_web.add_argument("--root", default=None)
+    p_web.add_argument("--config", metavar="FILE")
+    p_web.add_argument("--profile", metavar="NAME")
+
     p_skills = sub.add_parser("skills", help="list the available skills")
     p_skills.add_argument("paths", nargs="*", default=["."])
     p_skills.add_argument("--root", default=None)
@@ -1424,7 +1495,8 @@ def _main(argv=None) -> int:
     if args.cmd == "diagnose":
         return _cmd_diagnose(args)
     light = {"prune": _cmd_prune, "memory": _cmd_memory, "trust": _cmd_trust,
-             "tests": _cmd_tests, "skills": _cmd_skills,
+             "tests": _cmd_tests, "webcheck": _cmd_webcheck,
+             "skills": _cmd_skills,
              "serve": _cmd_serve, "procs": _cmd_procs, "lsp": _cmd_lsp}
     if args.cmd in light:
         try:
@@ -1743,7 +1815,7 @@ def _main(argv=None) -> int:
                 code = plan_mod.run_planned(
                     root, cfg, client, idx, task, apply=args.apply,
                     confirm=_confirm_plan if getattr(args, "review_plan", False)
-                    else None)
+                    else None, strict=bool(getattr(args, "strict", False)))
                 fresh = index_mod.Index.load(root)
                 if fresh is not None:
                     idx = fresh
@@ -1784,7 +1856,9 @@ def _main(argv=None) -> int:
             print("\n" + _usage_line(client), file=sys.stderr)
             from . import replay as replay_mod
             replay_mod.report(client)
-            strict = _strict_replay_error(args, client)
+            strict = (_strict_replay_error(args, client)
+                      or _strict_task_error(args,
+                                            locals_ref.get("last_result")))
             if strict:
                 print(f"ERROR: {strict}", file=sys.stderr)
                 elog.emit("exit", code=1)

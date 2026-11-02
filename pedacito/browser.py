@@ -113,6 +113,10 @@ def parse_actions(spec: str) -> list[tuple]:
 
         Enter                    -> press Enter
         press Enter              -> press a key
+        hold ArrowUp 1.5         -> keep a key DOWN for N seconds (default 1,
+                                    capped at 30): `press` is an instant
+                                    down+up pair a fixed-timestep game loop
+                                    can miss entirely between two samples
         click #start             -> click a CSS/text selector
         fill #name Ada           -> fill a field
         type hello               -> type into the focused element
@@ -138,6 +142,14 @@ def parse_actions(spec: str) -> list[tuple]:
             break
         if kind in ("press", "key"):
             out.append(("press", rest or "Enter"))
+        elif kind == "hold":
+            key, _, secs = rest.partition(" ")
+            if key:
+                try:
+                    dur = max(0.05, min(float(secs), 30.0))
+                except (TypeError, ValueError):
+                    dur = 1.0
+                out.append(("hold", (key, dur)))
         elif kind == "click":
             if rest:
                 out.append(("click", rest))
@@ -406,6 +418,12 @@ def _run_playwright(url: str, *, actions: str, wait: float, out,
                         if kind == "press":
                             page.keyboard.press(arg)
                             action_log.append(f"pressed {arg}")
+                        elif kind == "hold":
+                            key, secs = arg
+                            page.keyboard.down(key)
+                            page.wait_for_timeout(int(secs * 1000))
+                            page.keyboard.up(key)
+                            action_log.append(f"held {key} for {secs:g}s")
                         elif kind == "click":
                             page.click(arg)
                             action_log.append(f"clicked {arg}")

@@ -11,8 +11,9 @@ A thin layer over tools that are already installed: nothing is bundled, and a
 project with no detected checker is a no-op, not a failure. Checks run through
 the bounded process runner (`proc`). Linting only the changed files keeps the
 feedback short for small models. `quick_findings` is the cheap per-file pass
-the post-edit feedback loop uses (one linter run per changed file, or a syntax
-parse when no linter is installed); `new_findings` diffs it against a baseline
+the post-edit feedback loop uses (one linter run per changed file; with no
+linter installed, a syntax parse plus a conservative undefined-name check);
+`new_findings` diffs it against a baseline
 so only problems the edits introduced are reported back.
 
 Detection (first match per language):
@@ -28,6 +29,8 @@ Detection (first match per language):
 
 from __future__ import annotations
 
+import ast
+import builtins
 import json
 import re
 import shutil
@@ -192,9 +195,258 @@ def _norm_finding(line: str) -> str:
     return s.strip() or line.strip()
 
 
+# Names that always resolve: the builtins plus the module dunders the import
+# system injects (__path__ only exists in a package's __init__, but a static
+# check cannot know which file it is looking at).
+_ALWAYS_DEFINED = set(vars(builtins)) | {
+    "__name__", "__file__", "__doc__", "__package__", "__spec__",
+    "__loader__", "__builtins__", "__debug__", "__path__",
+}
+
+# The undefined-name pass reports at most this many findings per file; a file
+# over the cap is a fragment, not a lint problem, and the note says so.
+_MAX_UNDEFINED = 40
+
+
+class _Scope:
+    """One Python namespace: module, function/lambda, class body, or the
+    private scope of a comprehension."""
+    __slots__ = ("bindings", "kind", "loads", "parent")
+
+    def __init__(self, kind: str, parent: _Scope | None):
+        self.kind = kind
+        self.parent = parent
+        self.bindings: set[str] = set()
+        self.loads: list[tuple[str, int, int]] = []   # name, line, col
+
+
+def _undefined_names(tree: ast.AST, rel: str) -> list[str]:
+    """A mini-pyflakes limited to the highest-signal check: a name that is
+    loaded but bound nowhere in its scope chain and is no builtin -- the
+    NameError class `ast.parse` waves through. Only used when no real linter
+    is installed.
+
+    Deliberately conservative, because these findings gate edits and a false
+    alarm costs a whole repair round: files with a star-import or an
+    eval/exec are skipped outright (names can arrive dynamically there),
+    augmented assignments and `del` count as bindings, argument annotations
+    are never checked, and a `nonlocal` name is never reported anywhere.
+    Resolution is deferred until the whole tree is walked, so forward
+    references (a helper defined below its first caller) are fine. Finding
+    lines keep the `rel:line:col:` prefix the linters use."""
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom) \
+                and any(a.name == "*" for a in node.names):
+            return []
+        if isinstance(node, ast.Name) and node.id in ("eval", "exec") \
+                and isinstance(node.ctx, ast.Load):
+            return []
+
+    scopes: list[_Scope] = []
+    nonlocal_pass: set[str] = set()
+    module = _Scope("module", None)
+    scopes.append(module)
+
+    def _enclosing_func(sc: _Scope) -> _Scope:
+        while sc is not None and sc.kind not in ("module", "function"):
+            sc = sc.parent
+        return sc or module
+
+    class _Visitor(ast.NodeVisitor):
+        def __init__(self):
+            self.scope = module
+
+        def _push(self, kind: str) -> _Scope:
+            outer = self.scope
+            self.scope = _Scope(kind, outer)
+            scopes.append(self.scope)
+            return outer                      # caller restores it on pop
+
+        # --- bindings -----------------------------------------------------
+        def visit_Name(self, node):
+            if isinstance(node.ctx, ast.Load):
+                self.scope.loads.append(
+                    (node.id, node.lineno, node.col_offset))
+            else:
+                self.scope.bindings.add(node.id)      # Store and Del
+
+        def visit_NamedExpr(self, node):
+            self.visit(node.value)
+            # a walrus inside a comprehension leaks into the enclosing
+            # function scope (CPython semantics)
+            if isinstance(node.target, ast.Name) and self.scope.kind == "comp":
+                _enclosing_func(self.scope).bindings.add(node.target.id)
+            self.visit(node.target)
+
+        def visit_Global(self, node):
+            module.bindings.update(node.names)
+
+        def visit_Nonlocal(self, node):
+            nonlocal_pass.update(node.names)
+
+        def visit_Import(self, node):
+            for a in node.names:
+                self.scope.bindings.add(a.asname or a.name.split(".")[0])
+
+        def visit_ImportFrom(self, node):
+            for a in node.names:
+                if a.name != "*":
+                    self.scope.bindings.add(a.asname or a.name)
+
+        def visit_ExceptHandler(self, node):
+            if node.name:
+                self.scope.bindings.add(node.name)
+            self.generic_visit(node)
+
+        def _bind_pattern(self, pattern):
+            """Capture names of a match-statement pattern (py3.10+)."""
+            name = getattr(pattern, "name", None)
+            if isinstance(name, str):
+                self.scope.bindings.add(name)
+            rest = getattr(pattern, "rest", None)
+            if isinstance(rest, str):
+                self.scope.bindings.add(rest)
+            for child in ast.iter_child_nodes(pattern):
+                self._bind_pattern(child)
+
+        def visit_Match(self, node):
+            self.visit(node.subject)
+            for case in node.cases:
+                self._bind_pattern(case.pattern)
+                self.generic_visit(case.pattern)   # value expressions load
+                if case.guard:
+                    self.visit(case.guard)
+                for stmt in case.body:
+                    self.visit(stmt)
+
+        def _bind_type_params(self, node):
+            for tp in getattr(node, "type_params", None) or []:
+                name = getattr(tp, "name", None)
+                if isinstance(name, str):
+                    self.scope.bindings.add(name)
+                self.generic_visit(tp)             # bounds/defaults load
+
+        def _bind_args(self, args):
+            for a in (*args.posonlyargs, *args.args, *args.kwonlyargs):
+                self.scope.bindings.add(a.arg)
+            if args.vararg:
+                self.scope.bindings.add(args.vararg.arg)
+            if args.kwarg:
+                self.scope.bindings.add(args.kwarg.arg)
+
+        # --- scope creators ------------------------------------------------
+        def visit_FunctionDef(self, node):
+            self._function(node)
+
+        def visit_AsyncFunctionDef(self, node):
+            self._function(node)
+
+        def _function(self, node):
+            self.scope.bindings.add(node.name)
+            # decorators, defaults and the return annotation are evaluated in
+            # the ENCLOSING scope, at def time
+            for deco in node.decorator_list:
+                self.visit(deco)
+            for default in (*node.args.defaults,
+                            *(d for d in node.args.kw_defaults if d)):
+                self.visit(default)
+            if node.returns:
+                self.visit(node.returns)
+            outer = self._push("function")
+            self._bind_type_params(node)
+            self._bind_args(node.args)
+            for stmt in node.body:
+                self.visit(stmt)
+            self.scope = outer
+
+        def visit_ClassDef(self, node):
+            self.scope.bindings.add(node.name)
+            for deco in node.decorator_list:
+                self.visit(deco)
+            for base in node.bases:
+                self.visit(base)
+            for kw in node.keywords:
+                self.visit(kw.value)
+            outer = self._push("class")
+            self._bind_type_params(node)
+            for stmt in node.body:
+                self.visit(stmt)
+            self.scope = outer
+
+        def visit_Lambda(self, node):
+            for default in (*node.args.defaults,
+                            *(d for d in node.args.kw_defaults if d)):
+                self.visit(default)
+            outer = self._push("function")
+            self._bind_args(node.args)
+            self.visit(node.body)
+            self.scope = outer
+
+        def _comprehension(self, node, elts):
+            outer = self._push("comp")
+            for gen in node.generators:
+                self.visit(gen.iter)
+                self.visit(gen.target)
+                for cond in gen.ifs:
+                    self.visit(cond)
+            for elt in elts:
+                self.visit(elt)
+            self.scope = outer
+
+        def visit_ListComp(self, node):
+            self._comprehension(node, [node.elt])
+
+        def visit_SetComp(self, node):
+            self._comprehension(node, [node.elt])
+
+        def visit_GeneratorExp(self, node):
+            self._comprehension(node, [node.elt])
+
+        def visit_DictComp(self, node):
+            self._comprehension(node, [node.key, node.value])
+
+        def visit_TypeAlias(self, node):           # py3.12+ `type X = ...`
+            self.visit(node.name)
+            self._bind_type_params(node)
+            self.visit(node.value)
+
+    _Visitor().visit(tree)
+
+    def _resolves(name: str, sc: _Scope) -> bool:
+        if name in nonlocal_pass:
+            return True
+        cur: _Scope | None = sc
+        while cur is not None:
+            if name in cur.bindings:
+                return True
+            cur = cur.parent
+            # a class body is not part of the lookup chain of the scopes
+            # nested inside it (methods cannot see class attributes)
+            while cur is not None and cur.kind == "class":
+                cur = cur.parent
+        return name in _ALWAYS_DEFINED
+
+    hits: list[tuple[int, int, str]] = []
+    for sc in scopes:
+        for name, lineno, col in sc.loads:
+            if not _resolves(name, sc):
+                hits.append((lineno, col,
+                             (f"{rel}:{lineno}:{col + 1}: undefined name "
+                              f"'{name}'")))
+    hits.sort()
+    found = [h[2] for h in hits]
+    if len(found) > _MAX_UNDEFINED:
+        found = found[:_MAX_UNDEFINED] + [
+            (f"{rel}:0: ... and {len(found) - _MAX_UNDEFINED} more undefined "
+             "names -- the file looks like a fragment; re-read the original "
+             "and restore the missing parts")]
+    return found
+
+
 def _quick_python(root: Path, rel: str) -> list[str]:
-    """One Python file: the first installed linter run on just that file, else
-    a plain ast.parse. Finding lines keep their `rel:line:col:` prefix."""
+    """One Python file: the first installed linter run on just that file,
+    else a plain ast.parse plus the conservative undefined-name pass.
+    Finding lines keep their `rel:line:col:` prefix."""
     for argv in (("ruff", "check", "--output-format", "concise"),
                  ("pyflakes",),
                  ("flake8",)):
@@ -206,15 +458,14 @@ def _quick_python(root: Path, rel: str) -> list[str]:
         if stopped in ("timeout", "error"):
             return []          # an unusable linter must not block edits
         return [ln.strip() for ln in (out or "").splitlines() if ln.strip()]
-    import ast
     try:
         src = (root / rel).read_text(encoding="utf-8", errors="replace")
-        ast.parse(src)
+        tree = ast.parse(src)
     except SyntaxError as e:
         return [f"{rel}:{e.lineno or 0}: syntax error: {e.msg} (line {e.lineno})"]
     except (OSError, ValueError):
         return []
-    return []
+    return _undefined_names(tree, rel)
 
 
 def _quick_js(root: Path, rel: str) -> list[str]:
@@ -229,8 +480,8 @@ def _quick_js(root: Path, rel: str) -> list[str]:
         return []
     bad, lineno = has_syntax_error(text, lang)
     if bad:
-        return [f"{rel}:{lineno or 0}: syntax error (parse failed, "
-                f"line {lineno})"]
+        return [(f"{rel}:{lineno or 0}: syntax error (parse failed, "
+                 f"line {lineno})")]
     return []
 
 
@@ -238,7 +489,8 @@ def quick_findings(root, files: list[str]) -> dict[str, list[str]]:
     """Cheap per-file syntax/lint findings as {rel: [finding lines]}.
 
     Python files go to the first installed linter (ruff, pyflakes, flake8)
-    scoped to that one file, falling back to ast.parse; JS/TS files get the
+    scoped to that one file, falling back to ast.parse plus a conservative
+    undefined-name pass; JS/TS files get the
     tree-sitter syntax check. Other languages have no cheap per-file checker
     and are skipped. Never raises; an unreadable file maps to no findings."""
     root = Path(root)

@@ -17,7 +17,10 @@ change its own window, its own lookups, its own evidence checks and rollback
   * After a failed step the planner is asked ONCE to revise the remaining steps
     given what finished, what failed and why (`replan`).
   * `plan_threshold` (or the model card) turns this on automatically for tasks
-    that name that many files or hold that many requirements; `--plan` forces it.
+    that name that many files or hold that many requirements; `--plan` forces
+    it. A WIDE task (`WIDE_TASK_FILES` or more named files or requirements) is
+    planned even when auto-planning is off -- unless the config explicitly set
+    `plan_threshold`; `--no-plan` still opts one task out.
 """
 
 from __future__ import annotations
@@ -27,6 +30,16 @@ from pathlib import Path
 
 from . import loop, rank, verify, workspace
 
+# A task this wide is planned even with auto-planning off (`plan_threshold` 0,
+# the default and what a strong model's card picks): one context window cannot
+# hold the lookups for that many files, and "did the first, half-did the
+# second, forgot the third" is what plan mode exists to prevent -- the
+# deepclitest runs kept losing the tail of exactly these tasks. Width is a
+# capacity problem, not a skill problem, so the card's verdict does not skip
+# it; an explicit `plan_threshold` in the config (any value, 0 included) still
+# governs.
+WIDE_TASK_FILES = 5
+
 
 def requirement_titles(task: str, limit: int = 6) -> list[str]:
     """One step per clearly separate requirement, '' when it is one change."""
@@ -35,15 +48,24 @@ def requirement_titles(task: str, limit: int = 6) -> list[str]:
 
 
 def should_plan(task: str, idx, cfg) -> bool:
-    """Whether to auto-plan: enough files named, or enough requirements."""
+    """Whether to auto-plan: enough files named, or enough requirements.
+    With auto-planning off, a wide-enough task is still planned unless the
+    user explicitly set `plan_threshold` (the model card's 0 for a strong
+    model does not count as an opt-out -- it measured skill on small probes,
+    not window capacity on a five-file task)."""
     n = int(getattr(cfg, "plan_threshold", 0) or 0)
-    if n <= 0:
-        return False
     try:
         named = len(rank.task_files(idx, task))
     except Exception:
         named = 0
-    return named >= n or len(requirement_titles(task, limit=8)) >= n
+    reqs = len(requirement_titles(task, limit=8))
+    if n > 0:
+        return named >= n or reqs >= n
+    sources = getattr(cfg, "sources", None) or {}
+    if sources.get("plan_threshold", "default") not in ("default",
+                                                        "model card"):
+        return False
+    return named >= WIDE_TASK_FILES or reqs >= WIDE_TASK_FILES
 
 
 def make_plan(task: str, idx, client, cfg, root: Path
@@ -94,7 +116,8 @@ def replan(task: str, plan_path: Path, client, cfg, failed: str,
 
 
 def run_planned(root: Path, cfg, client, idx, task: str, *, apply: bool,
-                review: bool = False, confirm=None) -> int:
+                review: bool = False, confirm=None,
+                strict: bool = False) -> int:
     """Plan `task`, show the plan, run it step by step (with one re-plan after
     a failure), and return an exit code. `confirm`, when given, is called with
     the plan path to let the user approve or edit it first (returns False to
@@ -121,7 +144,8 @@ def run_planned(root: Path, cfg, client, idx, task: str, *, apply: bool,
     for attempt in range(replans + 1):
         code = loop.run_loop(root, cfg, client, idx, plan_path, apply=True,
                              stop_on_fail=True, goal=goal,
-                             repair_rounds=cfg.auto_repair_rounds)
+                             repair_rounds=cfg.auto_repair_rounds,
+                             strict=strict)
         remaining = sum(1 for ln in loop.read_plan(plan_path)
                         if loop._is_unchecked(ln))
         if code == 0 or not remaining or attempt >= replans:

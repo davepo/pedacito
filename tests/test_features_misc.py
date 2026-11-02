@@ -296,6 +296,37 @@ def test_prompt_packs_and_filtered_tool_help():
     assert prompts.pack_for(carded) == "full"                             # explicit wins
 
 
+def test_answer_system_carries_value_bound_test_rules_for_test_tasks():
+    """P6: a task about tests gets the value-bound rules -- a tautological
+    test (expectation computed with the code under test, or a bare shape
+    check) passes on a seeded bug, which is exactly what the deepclitest runs
+    kept shipping."""
+    from pedacito import scaffold
+    from pedacito.agent import EDIT_FORMAT
+    cfg = Config()
+    plain = prompts.answer_system(cfg, EDIT_FORMAT)
+    assert "Rules for tests" not in plain
+    tasked = prompts.answer_system(cfg, EDIT_FORMAT,
+                                   task="Write pytest tests for the cart")
+    assert "Rules for tests" in tasked
+    assert "concrete literal" in tasked
+    assert "mirrors the implementation" in tasked
+    assert "weaken or delete an assertion" in tasked
+    assert prompts.wants_tests("add a test for checkout")
+    assert prompts.wants_tests("improve coverage of pricing")
+    assert not prompts.wants_tests("fix the latest pricing bug")
+    assert not prompts.wants_tests("")
+    # the tiny pack gets the short form of the same rule
+    tiny = Config()
+    tiny.prompt_pack = "tiny"
+    t = prompts.answer_system(tiny, EDIT_FORMAT, task="write tests")
+    assert "Rules for tests" not in t
+    assert "weakening the assertion" in t
+    # the scaffold build prompts carry the same bound as a static rule
+    assert "mirrored test" in scaffold.BUILD_SYSTEM
+    assert "mirrored test" in scaffold.AUTO_IMPLEMENT_SYSTEM
+
+
 def test_prompt_overrides_are_loaded_and_fingerprinted(tmp_path, home):
     from pedacito.agent import EDIT_FORMAT, GATHER_BASE
     from pedacito.tools import TOOL_HELP
@@ -308,6 +339,10 @@ def test_prompt_overrides_are_loaded_and_fingerprinted(tmp_path, home):
     assert prompts.gather_system(cfg, GATHER_BASE, TOOL_HELP) == "CUSTOM GATHER BRIEF"
     assert prompts.edit_format(cfg, EDIT_FORMAT) == "CUSTOM EDIT FORMAT"
     assert "CUSTOM EDIT FORMAT" in prompts.answer_system(cfg, EDIT_FORMAT)
+    # an answer override replaces the WHOLE brief -- test rules included
+    (tmp_path / ".pedacito" / "prompts" / "answer.md").write_text("CUSTOM ANSWER BRIEF")
+    assert prompts.answer_system(cfg, EDIT_FORMAT,
+                                 task="write tests") == "CUSTOM ANSWER BRIEF"
     assert prompts.fingerprint(cfg) != base
 
 
@@ -378,6 +413,42 @@ def test_impacted_tests_includes_a_new_test_file_not_indexed_yet(tmp_path):
     picked = [t for t, _w in testsel.impacted_tests(
         idx, ["tests/test_core_tables.py"])]
     assert picked == ["tests/test_core_tables.py"]
+
+
+def test_impacted_tests_follows_transitive_importers(tmp_path):
+    """COVERAGE-1: a change deep in a package re-export chain
+    (reporting.py <- commands/__init__.py <- cli.py <- tests/test_cli.py) is
+    two hops from the test that exercises it through the public API; the
+    one-hop walk missed that test and the post-edit hook ran a suite that
+    could not see the regression."""
+    _root, idx = _proj(tmp_path, {
+        "commands/__init__.py": "from commands.reporting import render\n",
+        "commands/reporting.py": "def render():\n    return 'r'\n",
+        "cli.py": "from commands import render\n\n"
+                  "def main():\n    print(render())\n",
+        "tests/test_cli.py": "from cli import main\n\n"
+                             "def test_main():\n    main()\n",
+    })
+    picked = [t for t, _w in
+              testsel.impacted_tests(idx, ["commands/reporting.py"])]
+    assert "tests/test_cli.py" in picked
+
+
+def test_node_test_detection_and_narrowing(tmp_path):
+    """Zero-dependency Node projects get `node --test` without a fabricated
+    package.json, and narrowing filters non-JS entries out."""
+    (tmp_path / "tests").mkdir()
+    (tmp_path / "tests" / "game.test.js").write_text("// t\n")
+    assert testsel.detect_test_command(tmp_path, Config()) == "node --test"
+    assert testsel.narrow_command(
+        "node --test", ["tests/game.test.js", "notes.md"]) \
+        == ("node --test tests/game.test.js", True)
+    assert testsel.narrow_command("node --test", ["notes.md"]) \
+        == ("node --test", False)
+    # A declared package.json test script still wins over the bare runner.
+    (tmp_path / "package.json").write_text(
+        '{"scripts": {"test": "vitest run"}}')
+    assert testsel.detect_test_command(tmp_path, Config()) == "npm test"
 
 
 # ------------------------------------------------------------------ calibration
@@ -463,6 +534,60 @@ def test_cards_persist_expire_and_only_fill_unset_settings(home, monkeypatch):
     assert modelcard.load(cfg) is None and modelcard.load(cfg, allow_stale=True)
 
 
+class Thinker(Model):
+    """A reasoning model whose thinking eats the whole answer budget on the
+    thinking A/B probe: the thinking-on arm returns no usable content (finish
+    'length', thousands of chars of hidden reasoning), thinking-off answers
+    normally."""
+
+    def chat(self, messages, max_tokens, **kw):
+        last = messages[-1]["content"]
+        if "Reply with the two new lines." in last \
+                and not kw.get("disable_thinking"):
+            self.last_finish_reason = "length"
+            self.last_reasoning_chars = 4 * max_tokens
+            return ""
+        self.last_finish_reason = "stop"
+        self.last_reasoning_chars = 0
+        return super().chat(messages, max_tokens, **kw)
+
+
+def test_calibration_persists_the_thinking_verdict(home):
+    """P5: a model whose thinking overruns the answer budget gets
+    disable_thinking=true recorded in its card, so later runs start in the
+    winning mode instead of paying llm.chat's empty-reply retry (a wasted
+    round-trip per call) to rediscover it every time."""
+    card = modelcard.calibrate(Thinker(True), Config(), verbose=False,
+                               quick=True)
+    assert card["measured"]["thinking_on_ok"] is False
+    assert card["measured"]["thinking_off_ok"] is True
+    assert card["choices"]["disable_thinking"] is True
+    assert any("hidden reasoning" in n for n in card["notes"])
+    # a model that answers fine with thinking on: no verdict, the user's
+    # setting stays untouched
+    ok = modelcard.calibrate(Model(True), Config(), verbose=False, quick=True)
+    assert ok["measured"]["thinking_on_ok"] is True
+    assert ok["measured"]["thinking_off_ok"] is True
+    assert "disable_thinking" not in ok["choices"]
+
+
+def test_apply_fills_disable_thinking_only_when_unset(home):
+    cfg = Config()
+    cfg.sources = {}
+    modelcard.save_card(modelcard.calibrate(Thinker(True), cfg,
+                                            verbose=False, quick=True))
+    fresh = Config()
+    fresh.sources = {}
+    modelcard.apply(fresh)
+    assert fresh.disable_thinking is True
+    assert fresh.sources["disable_thinking"] == "model card"
+    explicit = Config()
+    explicit.sources = {"disable_thinking": "config file"}
+    explicit.disable_thinking = False
+    modelcard.apply(explicit)
+    assert explicit.disable_thinking is False       # the user's word wins
+
+
 # ------------------------------------------------------------------- eval runner
 class EvalModel:
     """Reads the gold file, then answers with the gold edit."""
@@ -526,6 +651,31 @@ def test_eval_classifies_failures(tmp_path):
     row = evalrun.run_task(inj, EvalModel("It builds a Cart and prints the total."),
                            _eval_cfg(), tmp_path)
     assert row["passed"] and not row.get("injection_followed")
+
+
+def test_eval_scores_gather_only_completion(tmp_path):
+    """HARNESS-1: a worker that completes an edit during gather (a write
+    action) and emits no answer-phase block scores on the final disk state;
+    it used to be labelled a refusal, skewing first-apply-clean."""
+    task = next(t for t in evalrun.TASKS if t.id == "py-bulk-off-by-one")
+    fixed = evalrun.PY_SHOP["shop/pricing.py"].replace(
+        "if quantity > 10:", "if quantity >= 10:")
+    steps = [
+        {"action": "read", "file": "shop/pricing.py", "start": 1, "end": 30},
+        {"action": "write", "file": "shop/pricing.py", "content": fixed},
+    ]
+    cfg = _eval_cfg()
+    cfg.allow_write = True
+    client = EvalModel(
+        "No changes needed in the answer phase: the write action already "
+        "fixed the threshold.", steps)
+    row = evalrun.run_task(task, client, cfg, tmp_path)
+    assert row["passed"] and row["edit_ok"]
+    assert row["answer_blocks"] == 0 and row["gather_only"] is True
+    assert row["failure"] == "" and row["first_apply_clean"] is True
+    s = evalrun.summarise([row])
+    assert s["gather_only_edits"] == 1 and s["first_apply_clean"] == 1.0
+    assert "gather actions" in evalrun.render([row], s)
 
 
 def test_eval_question_tasks_and_summary(tmp_path):
@@ -596,6 +746,46 @@ def test_cli_eval_list_and_map_task(tmp_path, home, capsys, monkeypatch):
     assert "### core/sched.py" in out and "tier: ranked" in err
 
 
+def test_strict_task_error_gate():
+    """O6: `ask --strict` turns a failed edit block (a partial application)
+    or a still-red impacted-test verdict into a nonzero exit, and stays
+    quiet for clean runs, missing results, or the flag off."""
+    import types
+    ok = types.SimpleNamespace(ok=True, file="a.py", message="applied")
+    bad = types.SimpleNamespace(ok=False, file="b.py",
+                                message="block 2: search block not found")
+    args = types.SimpleNamespace(strict=True)
+    tr = types.SimpleNamespace(results=[ok, bad], tests_ok=True)
+    msg = cli._strict_task_error(args, tr)
+    assert "1 edit block(s) failed" in msg and "b.py" in msg
+    tr_red = types.SimpleNamespace(results=[ok], tests_ok=False)
+    assert "still fail" in cli._strict_task_error(args, tr_red)
+    tr_clean = types.SimpleNamespace(results=[ok], tests_ok=True)
+    assert cli._strict_task_error(args, tr_clean) == ""
+    assert cli._strict_task_error(args, None) == ""
+    assert cli._strict_task_error(types.SimpleNamespace(strict=False), tr) == ""
+
+
+def test_doctor_tree_sitter_report_shows_the_pin_status(monkeypatch):
+    """P10: `config --doctor` surfaces the tree-sitter pin status out loud --
+    an unsafe tree-sitter (>=0.26) silently disables the chunker and every
+    edit falls back to regex-level syntax feedback (qwentest ran exactly
+    that degraded setup without knowing)."""
+    from pedacito import chunker_ts
+    monkeypatch.setattr(chunker_ts, "TS_AVAILABLE", True)
+    monkeypatch.setattr(chunker_ts, "_ts_version", "0.25.1", raising=False)
+    line = cli._tree_sitter_report()
+    assert "active" in line and "0.25.1" in line
+    monkeypatch.setattr(chunker_ts, "TS_AVAILABLE", False)
+    monkeypatch.setattr(
+        chunker_ts, "_TS_DISABLED_REASON",
+        "tree-sitter 0.26.0 is unsafe (py-tree-sitter#472: segfault on live "
+        "Node objects); install tree-sitter<0.26", raising=False)
+    line = cli._tree_sitter_report()
+    assert "INACTIVE" in line and "0.26.0" in line
+    assert "tree-sitter<0.26" in line and "regex-level" in line
+
+
 # ------------------------------------------------------------------- scaffolding
 def test_plan_sources_and_tests_use_cross_language_conventions(tmp_path):
     from pedacito.scaffold import Plan, PlannedFile, skeleton_index
@@ -616,6 +806,101 @@ def test_plan_sources_and_tests_use_cross_language_conventions(tmp_path):
     idx = skeleton_index(tmp_path, p2, Config())
     assert {c.qualname for c in idx.chunks} >= {"a", "f"}      # the JS file is chunked too
     assert "README.md" not in idx.files
+
+
+def test_stub_is_implemented_heuristics():
+    from pedacito.scaffold import _header, _stub_is_implemented
+    # A bare skeleton header and signature-only stubs are not implementations.
+    assert not _stub_is_implemented("main.py", "entry",
+                                    _header("main.py", "entry"))
+    assert not _stub_is_implemented(
+        "main.py", "entry",
+        '"""main.py -- entry"""\nimport sys\n\n\n'
+        'def main():\n    """Entry point."""\n    raise NotImplementedError\n')
+    # A re-export-only __init__.py is complete as soon as it exists.
+    assert _stub_is_implemented("pkg/__init__.py", "re-exports",
+                                '"""pkg"""\nfrom pkg.core import core\n')
+    assert _stub_is_implemented("main.py", "entry",
+                                "import sys\n\n\ndef main():\n    return 0\n")
+    # Broken syntax and stub markers in other languages stay failures.
+    assert not _stub_is_implemented("main.py", "entry", "def main(:\n")
+    assert not _stub_is_implemented(
+        "app.js", "ui",
+        '// app.js -- ui\nfunction go() { throw new Error("not implemented"); }\n')
+    assert _stub_is_implemented("app.js", "ui",
+                                "// app.js\nfunction go() { return 1; }\n")
+    assert _stub_is_implemented(
+        "index.html", "page",
+        "<!DOCTYPE html>\n<html>\n<body><p>hi</p></body>\n</html>\n")
+
+
+def test_build_pass_honest_noop_is_not_a_failure(tmp_path):
+    """A file the interface stage finished (index.html) plus a reply that
+    declares no edits needed is an honest no-op -- not a 'model returned no
+    edit block' failure that flips `new`'s exit code on a healthy build."""
+    from pedacito import scaffold
+    root = tmp_path / "proj"
+    (root / "web").mkdir(parents=True)
+    page = ("<!DOCTYPE html>\n<html>\n<head><title>t</title></head>\n"
+            "<body><div id=\"app\"></div>\n</body>\n</html>\n")
+    (root / "web" / "index.html").write_text(page, encoding="utf-8")
+    plan = scaffold.Plan(
+        "demo", "s", [scaffold.PlannedFile("web/index.html", "entry page")],
+        spec=scaffold.Spec("a page"))
+    idx = scaffold.skeleton_index(root, plan, Config())
+
+    class Client:
+        def chat(self, messages, **kw):
+            return "No changes needed: the page is already complete."
+
+    results, _reply = scaffold.build_pass(Client(), Config(), idx, plan,
+                                          plan.files[0], [], verbose=False)
+    assert len(results) == 1 and results[0].ok
+    assert results[0].message.startswith(scaffold._NOOP_MSG)
+
+    # The same claim against a signature-only stub stays a failure: the
+    # on-disk content must back the model up.
+    (root / "main.py").write_text(
+        '"""main.py -- entry"""\nimport sys\n\n\n'
+        'def main():\n    """Entry point."""\n    raise NotImplementedError\n',
+        encoding="utf-8")
+    plan2 = scaffold.Plan("demo", "s",
+                          [scaffold.PlannedFile("main.py", "entry")],
+                          spec=scaffold.Spec("a cli"))
+    idx2 = scaffold.skeleton_index(root, plan2, Config())
+    results2, _ = scaffold.build_pass(Client(), Config(), idx2, plan2,
+                                      plan2.files[0], [], verbose=False)
+    assert len(results2) == 1 and not results2[0].ok
+    assert "no edit block" in results2[0].message
+
+
+def test_build_project_counts_noop_separately(tmp_path, monkeypatch):
+    """An honest no-op lands in its own summary bucket: it feeds the build
+    context like any finished file but is not tallied as written or failed."""
+    from pedacito import scaffold
+    root = tmp_path / "proj"
+    root.mkdir()
+    (root / "a.py").write_text("def a():\n    return 1\n", encoding="utf-8")
+    (root / "b.py").write_text("def b():\n    return 2\n", encoding="utf-8")
+    plan = scaffold.Plan("demo", "s", [scaffold.PlannedFile("a.py", "a"),
+                                       scaffold.PlannedFile("b.py", "b")])
+    idx = scaffold.skeleton_index(root, plan, Config())
+
+    def fake_build_pass(client, cfg, idx_, plan_, target, done, verbose=True,
+                        backup_dir=None):
+        if target.path == "b.py":
+            assert "a.py" in done        # finished files feed the context
+            return [scaffold.Result(True, "b.py",
+                                    scaffold._NOOP_MSG + ": already done")], ""
+        return [scaffold.Result(True, "a.py", "1 block applied")], ""
+
+    monkeypatch.setattr(scaffold, "build_pass", fake_build_pass)
+    summary = scaffold.build_project(None, Config(), idx, plan, verbose=False)
+    assert summary["done"] == ["a.py"] and summary["noop"] == ["b.py"]
+    assert summary["failed"] == [] and summary["skipped"] == []
+    text = scaffold.summarise_result(summary)
+    assert "1 file(s) written" in text and "1 unchanged" in text
+    assert "failed" not in text
 
 
 # ---------------------------------------------------------------------------- MCP

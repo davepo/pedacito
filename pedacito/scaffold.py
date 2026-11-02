@@ -139,6 +139,10 @@ Rules:
   other files import these by their exact names.
 - Real, working code. No TODOs or pass-only bodies unless the spec asks for a
   stub.
+- In a test file, bind every expectation to a concrete literal you worked out
+  from the spec by hand (`assert total == 25.92`); never compute an expected
+  value with the code under test -- a mirrored test passes even when the code
+  is wrong.
 - Import only from files listed as existing. Never invent a sibling module.
 - Do not write any other file, and do not explain yourself."""
 
@@ -165,6 +169,10 @@ Rules:
 - `read` the file first so you can keep every signature and docstring EXACTLY
   as written -- other files import these names. Only fill in the stub bodies.
 - No TODOs or pass-only bodies unless the task explicitly asks for stubs.
+- In a test file, bind every expectation to a concrete literal you worked out
+  from the spec by hand (`assert total == 25.92`); never compute an expected
+  value with the code under test -- a mirrored test passes even when the code
+  is wrong.
 - Import only from files that exist in the map. Check a sibling's outline if
   you need to know what it exposes.
 - Finish the named work completely; do not wander into other functions or files."""
@@ -676,6 +684,79 @@ def _existing_map(idx, plan: Plan, cfg, max_files: int = 12,
     return text[:max_chars]
 
 
+# Message prefix for a build_pass result that accepted an honest "this file
+# needs no edit" reply. build_project routes those files into a separate
+# summary bucket so a file the interface stage already finished is reported
+# as unchanged instead of counted as a failure (which used to flip `new`'s
+# exit code even though the build was fine).
+_NOOP_MSG = "no changes needed"
+
+
+def _py_is_placeholder(stmt) -> bool:
+    """True for the statements an interface-only stub consists of: docstrings,
+    `pass`, `...`, bare `raise NotImplementedError`, and defs/classes whose
+    bodies are entirely those."""
+    import ast
+    if isinstance(stmt, ast.Pass):
+        return True
+    if isinstance(stmt, ast.Expr) and isinstance(stmt.value, ast.Constant):
+        v = stmt.value.value
+        return isinstance(v, str) or v is Ellipsis
+    if isinstance(stmt, ast.Raise):
+        exc = getattr(stmt.exc, "func", stmt.exc)
+        if getattr(exc, "id", getattr(exc, "attr", "")) == "NotImplementedError":
+            return True
+    if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+        return all(_py_is_placeholder(s) for s in stmt.body)
+    return False
+
+
+def _stub_is_implemented(rel: str, purpose: str, text: str) -> bool:
+    """Whether `rel`'s content is substantive enough that a zero-edit build
+    reply can be honest: not the bare skeleton header, has real code lines,
+    parses in its extension's language, and carries more than stub bodies.
+    A re-export-only `__init__.py` counts as complete; imports plus
+    placeholder defs do not. Non-Python interface stubs throw/report "not
+    implemented" in every body (INTERFACE_SYSTEM), so that marker still
+    present means the file is a stub."""
+    if not text.strip():
+        return False
+    if text.strip() == _header(rel, purpose).strip():
+        return False
+    code: list[str] = []
+    in_block = False
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        if in_block:
+            if "*/" in line or "-->" in line:
+                in_block = False
+            continue
+        if line.startswith(("/*", "<!--")):
+            if "*/" not in line and "-->" not in line:
+                in_block = True
+            continue
+        if line.startswith(("#", "//", "*", '"""', "'''")):
+            continue
+        code.append(line)
+    if not code or _stub_language_error(rel, text) is not None:
+        return False
+    if rel.endswith(".py"):
+        import ast
+        try:
+            tree = ast.parse(text)
+        except (SyntaxError, ValueError):
+            return False
+        has_defs = any(isinstance(s, (ast.FunctionDef, ast.AsyncFunctionDef,
+                                      ast.ClassDef)) for s in tree.body)
+        if has_defs:
+            return any(not _py_is_placeholder(s) for s in tree.body
+                       if not isinstance(s, (ast.Import, ast.ImportFrom)))
+        return any(not _py_is_placeholder(s) for s in tree.body)
+    return "not implemented" not in text.lower()
+
+
 def build_pass(client, cfg, idx, plan: Plan, target: PlannedFile,
                done: list[str], verbose: bool = True,
                backup_dir=None) -> tuple[list, str]:
@@ -716,7 +797,8 @@ def build_pass(client, cfg, idx, plan: Plan, target: PlannedFile,
 
     reply = client.chat(messages, max_tokens=max_tokens, stream=verbose,
                         disable_thinking=True)
-    if not parse_edits(reply):
+    discards: list[str] = []
+    if not parse_edits(reply, discards=discards):
         # A reasoning model may spend its whole budget on <think> (some quants
         # ignore enable_thinking=false): nudge once, then report the failure.
         # `thinking_suffix_for` supplies /no_think only for families trained on
@@ -729,7 +811,26 @@ def build_pass(client, cfg, idx, plan: Plan, target: PlannedFile,
         reply = client.chat(messages, max_tokens=max_tokens, stream=verbose,
                             disable_thinking=True)
 
-    if not parse_edits(reply):
+    if not parse_edits(reply, discards=discards):
+        # Zero blocks has two very different stories: a thinking model that
+        # spent its budget on a file that needed implementing (a failure), and
+        # an honest "this file is already finished" for content the interface
+        # stage completed (index.html, a re-export __init__.py). The second is
+        # not a failure: the reply either says nothing needs changing or emits
+        # an explicit SEARCH==REPLACE no-op block for this file, AND the file
+        # on disk backs the claim up (parses, more than a header or stub
+        # bodies). Counting those as failures flipped `new`'s exit code on
+        # healthy builds.
+        from .loop import _is_noop
+        declared = _is_noop(reply) or any(
+            fileio.path_key(d) == fileio.path_key(target.path)
+            for d in discards)
+        if declared and _stub_is_implemented(target.path, target.purpose,
+                                             stub):
+            return [Result(True, target.path,
+                           _NOOP_MSG + ": the file already satisfies the "
+                           "interface (model declared no edits needed and the "
+                           "content on disk parses clean)")], reply
         return [Result(False, target.path,
                        "model returned no edit block (a thinking model may have "
                        "spent the budget on its <think> block; try "
@@ -744,7 +845,9 @@ def build_project(client, cfg, idx, plan: Plan, verbose: bool = True,
                   tests_first: bool | None = None) -> dict:
     """Run a build pass for each planned source file, in plan order, stopping
     early if the server goes away. Returns
-    {"done": [paths], "failed": [(path, message)], "skipped": [paths]}.
+    {"done": [paths], "noop": [paths], "failed": [(path, message)],
+     "skipped": [paths]}; `noop` holds files the build left untouched because
+    they were already complete (they count as finished, not failed).
 
     With `tests_first` (spec-driven scaffolding), test stubs are implemented
     before their sources so the tests define the contract. The default keeps
@@ -755,6 +858,7 @@ def build_project(client, cfg, idx, plan: Plan, verbose: bool = True,
         tests_first = bool(getattr(cfg, "build_tests_first", False))
     targets = (tests + sources) if tests_first else (sources + tests)
     done: list[str] = []
+    noop: list[str] = []
     failed: list[tuple[str, str]] = []
     skipped: list[str] = []
     for t in targets:
@@ -765,18 +869,23 @@ def build_project(client, cfg, idx, plan: Plan, verbose: bool = True,
         if verbose:
             print(f"\n--- building {t.path} ---", file=sys.stderr)
         try:
-            results, _reply = build_pass(client, cfg, idx, plan, t, done,
-                                         verbose, backup_dir=backup_dir)
+            results, _reply = build_pass(client, cfg, idx, plan, t,
+                                         done + noop, verbose,
+                                         backup_dir=backup_dir)
         except LLMError as e:
             print(f"  stopped: {e}", file=sys.stderr)
             failed.append((t.path, "server error"))
             skipped.extend(x.path for x in targets
-                           if x.path not in done and x.path != t.path)
+                           if x.path not in done and x.path not in noop
+                           and x.path != t.path)
             break
         ok = [r for r in results if r.ok]
         bad = [r for r in results if not r.ok]
         if ok:
-            done.append(t.path)
+            if all(r.message.startswith(_NOOP_MSG) for r in ok):
+                noop.append(t.path)
+            else:
+                done.append(t.path)
             for r in ok:
                 idx = index_mod.reindex_file(idx, r.file, cfg)
             if on_file is not None:
@@ -786,12 +895,14 @@ def build_project(client, cfg, idx, plan: Plan, verbose: bool = True,
             if verbose:
                 for r in bad:
                     print(f"  FAILED {r.file}: {r.message}", file=sys.stderr)
-    return {"done": done, "failed": failed, "skipped": skipped}
+    return {"done": done, "noop": noop, "failed": failed, "skipped": skipped}
 
 
 def summarise_result(summary: dict, verbose: bool = True) -> str:
     """One-paragraph report of a build run, printed at the end of `new`."""
     bits = [f"{len(summary['done'])} file(s) written"]
+    if summary.get("noop"):
+        bits.append(f"{len(summary['noop'])} unchanged (already complete)")
     if summary["failed"]:
         bits.append(f"{len(summary['failed'])} failed")
     if summary["skipped"]:
@@ -1077,25 +1188,34 @@ def run_new(root: Path, cfg, client, spec: Spec, *, apply: bool = False,
                   file=sys.stderr)
             return 2
 
+    wants_skeleton = plan_only or apply or review
     design_doc = None
     if design:
         from . import design as design_mod
         print("\n--- designing interfaces, data shapes, and tests ---",
               file=sys.stderr)
-        design_doc = design_mod.generate(client, cfg, spec, root)
+        # A dry run must leave the directory untouched: the design still
+        # guides this run's plan, but nothing is written under .pedacito/
+        # (HARNESS-2). Re-running with --apply regenerates and saves it.
+        design_doc = design_mod.generate(client, cfg, spec, root,
+                                         save_it=wants_skeleton)
         warnings = design_mod.validate(design_doc, cfg)
         print(design_mod.render(design_doc))
         if warnings:
             print("\n[design warnings]", file=sys.stderr)
             for w in warnings:
                 print(f"  - {w}", file=sys.stderr)
-        print(f"  [saved {root / '.pedacito' / 'design.md'}]", file=sys.stderr)
+        if wants_skeleton:
+            print(f"  [saved {root / '.pedacito' / 'design.md'}]",
+                  file=sys.stderr)
+        else:
+            print("  [dry run] design not saved; --apply persists it under "
+                  ".pedacito/", file=sys.stderr)
 
     plan = build_plan(spec, client, cfg, root, verbose=verbose,
                       design=design_doc)
     print(render_plan(plan))
 
-    wants_skeleton = plan_only or apply or review
     stubs = {}
     if wants_skeleton:
         # One call fixes the API contract so cross-file imports stay consistent.
@@ -1160,6 +1280,14 @@ def run_new(root: Path, cfg, client, spec: Spec, *, apply: bool = False,
                                 verbose=verbose)
     if n_fixed and verbose:
         print(f"  fixed {n_fixed} import issue(s)", file=sys.stderr)
+
+    if apply:
+        # Contract lint for browser projects (webcheck): a notice board on
+        # stderr, never a build failure -- the rc keys off `failed` alone.
+        from . import webcheck
+        if webcheck.notice(root):
+            workspace.log_event(root, "webcheck reported contract findings "
+                                "after the build", "WARN")
 
     if review and summary["done"]:
         results = _review_build(root, plan, summary, cfg, backup_dir, when)

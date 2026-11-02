@@ -407,10 +407,18 @@ def run_task(task: EvalTask, client, cfg, workdir: Path | None = None) -> dict:
             if isinstance(by_site, dict) else 0
         row["findings"] = sorted({f.kind for f in (tr.findings or [])})
         if task.kind == "edit":
-            ok_edit = bool(tr.applied and tr.results
-                           and all(r.ok for r in tr.results)
-                           and _edit_ok(task, tmp))
+            # Score the DISK, not the reply's shape (HARNESS-1). A worker that
+            # finishes the task with gather actions (write/rename/move) has no
+            # answer-phase blocks; requiring them scored correct on-disk work
+            # as a failure or refusal and skewed first-apply-clean across
+            # profiles. Failed answer blocks still count against the run: a
+            # block that did not land means the reply was not clean, even if a
+            # gather action or a repair produced the right file anyway.
+            blocks_ok = all(r.ok for r in tr.results)  # vacuous when gather-only
+            ok_edit = bool(tr.applied and blocks_ok and _edit_ok(task, tmp))
             row["edit_ok"] = ok_edit
+            row["answer_blocks"] = len(tr.results)
+            row["gather_only"] = bool(ok_edit and not tr.results)
             row["first_apply_clean"] = bool(ok_edit and row["repair_calls"] == 0)
             tests_ok = _run_tests(tmp, task) if ok_edit else (
                 None if not task.test_cmd else False)
@@ -456,6 +464,7 @@ def summarise(rows: list[dict]) -> dict:
         "first_apply_clean": round(
             sum(1 for r in edits if r.get("first_apply_clean"))
             / max(1, len(edits)), 3),
+        "gather_only_edits": sum(1 for r in edits if r.get("gather_only")),
         "mean_steps": avg("steps"),
         "mean_calls": avg("calls"),
         "mean_prompt_tokens": avg("prompt_tokens"),
@@ -488,6 +497,10 @@ def render(rows: list[dict], summary: dict) -> str:
     if s["failures"]:
         out.append("failures: " + ", ".join(f"{k} x{v}" for k, v in
                                             sorted(s["failures"].items())))
+    if s.get("gather_only_edits"):
+        out.append(f"note: {s['gather_only_edits']} edit task(s) were completed "
+                   f"by gather actions (write/rename/move) with no answer-phase "
+                   f"block; scored on final disk state")
     if s["injection_followed"]:
         out.append(f"!! prompt injection FOLLOWED in "
                    f"{s['injection_followed']} task(s)")
@@ -503,6 +516,13 @@ def compare_reports(baseline: dict, current: dict,
     successes, or token/time growth beyond the tolerances. This is deliberately
     deterministic and conservative: it gates a release, it does not judge a
     model's prose.
+
+    Token/time growth is only compared when both reports ran with the same
+    `disable_thinking` setting: thinking on/off moves completion tokens and
+    seconds more than any harness change, so across a split the growth numbers
+    measure the setting, not the code. The mismatch is itself a hard flag --
+    a release gate that cannot compare must not wave the run through.
+    Reports without the key (older `--out` files) compare as before.
     """
     b = baseline.get("summary") or {}
     c = current.get("summary") or {}
@@ -537,10 +557,20 @@ def compare_reports(baseline: dict, current: dict,
         elif old > 0 and new < old * 0.8:
             improvements.append(f"{label}: {old:.0f} -> {new:.0f}")
 
-    growth("mean_prompt_tokens", "mean prompt tokens", max_token_growth)
-    growth("mean_completion_tokens", "mean completion tokens", max_token_growth)
-    growth("mean_calls", "mean calls", max_token_growth)
-    growth("mean_seconds", "mean seconds", max_time_growth)
+    b_think = baseline.get("disable_thinking")
+    c_think = current.get("disable_thinking")
+    if b_think is not None and c_think is not None \
+            and bool(b_think) != bool(c_think):
+        regressions.append(
+            f"disable_thinking differs (baseline {bool(b_think)}, current "
+            f"{bool(c_think)}): token/time growth is not comparable -- "
+            "re-run the baseline with the current setting")
+    else:
+        growth("mean_prompt_tokens", "mean prompt tokens", max_token_growth)
+        growth("mean_completion_tokens", "mean completion tokens",
+               max_token_growth)
+        growth("mean_calls", "mean calls", max_token_growth)
+        growth("mean_seconds", "mean seconds", max_time_growth)
 
     old_f = b.get("failures") or {}
     new_f = c.get("failures") or {}
@@ -590,6 +620,7 @@ def run_cli(args, cfg) -> int:
     if args.out:
         Path(args.out).write_text(json.dumps(
             {"model": cfg.model, "pack": getattr(cfg, "prompt_pack", ""),
+             "disable_thinking": bool(getattr(cfg, "disable_thinking", False)),
              "summary": summary, "rows": rows}, indent=1), encoding="utf-8")
         print(f"\nreport: {args.out}")
     failed = summary["pass_rate"] <= 0
@@ -600,7 +631,9 @@ def run_cli(args, cfg) -> int:
             print(f"Cannot read baseline {args.baseline}: {e}", file=sys.stderr)
             return 2
         reg, imp = compare_reports(
-            base, {"summary": summary, "rows": rows},
+            base, {"disable_thinking":
+                       bool(getattr(cfg, "disable_thinking", False)),
+                   "summary": summary, "rows": rows},
             max_token_growth=float(getattr(args, "max_token_growth", 0.20)),
             max_time_growth=float(getattr(args, "max_time_growth", 0.50)))
         print("\n" + render_compare(reg, imp))

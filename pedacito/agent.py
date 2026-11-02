@@ -71,8 +71,8 @@ _DEDUP_STEP_ACTIONS = {"grep", "find", "outline", "callers", "sessions",
 _CACHEABLE_ACTIONS = {"grep", "find", "outline", "callers", "context", "git",
                       "diagnose", "sessions", "fetch"}
 # Steps that can change what the cacheable ones return.
-_MUTATING = {"write", "append", "move", "delete", "rename", "run", "browser",
-             "screenshot", "mcp", "task"}
+_MUTATING = {"write", "append", "move", "delete", "undo", "rename", "run",
+             "browser", "screenshot", "mcp", "task"}
 
 # Steps discarded for a cut-off payload before gather gives up.
 _MAX_PAYLOAD_CUTS = 2
@@ -319,7 +319,10 @@ Rules:
   Needs allow_screenshots, and allow_shell when a command is launched.
 - `browser` opens a URL (or starts a server command that prints its URL) in
   a headless browser. Set `pattern` to interact first, e.g. `press Enter;
-  click #start`, and `start` to the seconds to wait before capture. A `wait`
+  click #start`, and `start` to the seconds to wait before capture. `press`
+  is an instant down+up pair -- a game loop sampling input at a fixed
+  timestep can miss it entirely, so for those use `hold ArrowUp 1.5` (key,
+  seconds) to keep the key down across frames. A `wait`
   inside `pattern` and `start` add together -- set one, not both. `eval <js>`
   runs script in the page and reports the value back -- use it to force state
   no interaction can reach (a grown player, a late level) before the capture;
@@ -1583,7 +1586,7 @@ class Agent:
         covers the map and every lookup. `auto` continues and falls back to a
         rebuild when the continued reply is empty or tool-shaped."""
         self._set_site("answer")
-        brief = self._answer_brief(system, include_edit_format)
+        brief = self._answer_brief(system, include_edit_format, task)
         mode = self._answer_mode()
         if mode in ("continue", "auto") and self._can_continue(task, brief,
                                                                max_tokens):
@@ -1662,9 +1665,18 @@ class Agent:
         blocks = self._failed_block_texts(
             reply, [_F(e.file) for e in parse_edits(reply)])
         client = self._role_client("repair")
+        system = self._answer_sys(task)
+        if any(getattr(f, "kind", "") == "tests" for f in errors):
+            # The repair IS about failing tests; the value-bound rules ride
+            # along even when the task text never says "test" ("fix the cart
+            # total") -- the classic move there is weakening the red
+            # assertion instead of fixing the code.
+            rules = prompts_mod.test_rules(self.cfg)
+            if rules not in system:
+                system += "\n\n" + rules
         try:
             new = client.chat(
-                [{"role": "system", "content": self._answer_sys()},
+                [{"role": "system", "content": system},
                  {"role": "user", "content":
                   (f"SOURCE (current contents of the files involved)\n\n{src}\n\n"
                    if src else "")
@@ -1760,16 +1772,17 @@ class Agent:
         return best
 
     # ---- answer helpers
-    def _answer_sys(self) -> str:
-        """The default answer-phase system prompt (pack-aware, overridable)."""
-        return prompts_mod.answer_system(self.cfg, EDIT_FORMAT)
+    def _answer_sys(self, task: str = "") -> str:
+        """The default answer-phase system prompt (pack-aware, overridable;
+        a test-shaped `task` adds the value-bound test rules)."""
+        return prompts_mod.answer_system(self.cfg, EDIT_FORMAT, task)
 
-    def _answer_brief(self, system: str | None, include_edit_format: bool
-                      ) -> str:
+    def _answer_brief(self, system: str | None, include_edit_format: bool,
+                      task: str = "") -> str:
         """The answer-phase instructions: the default edit brief, or a
         caller's system text (plus the edit format when asked)."""
         if system is None:
-            return prompts_mod.answer_system(self.cfg, EDIT_FORMAT)
+            return prompts_mod.answer_system(self.cfg, EDIT_FORMAT, task)
         brief = system.rstrip()
         if include_edit_format:
             brief += "\n\n" + prompts_mod.edit_format(self.cfg, EDIT_FORMAT)

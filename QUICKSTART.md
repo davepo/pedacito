@@ -88,9 +88,10 @@ pedacito config --doctor
 
 It repeats the check, then probes which structured-output modes your server
 really supports, prints a recommended `json_mode`, reports the real context
-window, and calibrates token math against the server's own tokenizer. The
-answers are remembered, so a server without grammar support falls back to
-JSON prompting automatically on later runs.
+window, calibrates token math against the server's own tokenizer, and reports
+whether tree-sitter parsing is active. The answers are remembered, so a server
+without grammar support falls back to JSON prompting automatically on later
+runs.
 
 Then, once per model:
 
@@ -100,9 +101,10 @@ pedacito calibrate
 
 It spends about a minute measuring the model — does it pick the right lookup,
 emit valid edit blocks, resist a planted prompt injection, admit what it has
-not read, find a needle in a long prompt? — and saves a model card. Settings you
-left at their defaults (prompt pack, answer mode, verifier, best-of-N) then
-follow the card; `pedacito config` shows it.
+not read, find a needle in a long prompt, answer without its whole budget
+going to hidden reasoning? — and saves a model card. Settings you left at
+their defaults (prompt pack, answer mode, verifier, best-of-N, the thinking
+switch) then follow the card; `pedacito config` shows it.
 
 Stuck on anything else? `pedacito how "how do I ...?"` answers from these docs
 and the source, using your config. It needs no project or index.
@@ -217,6 +219,10 @@ pedacito restore ~/code/anki                # restore it, byte-for-byte
 pedacito restore ~/code/anki --snapshot 20260830-005535
 ```
 
+Inside a task the model can do the same to its own writes with an `undo`
+action (needs `allow_write` and backups, on by default): this task's snapshots
+come back, files it created go away.
+
 ---
 
 ## More ways to work
@@ -257,22 +263,27 @@ first, and `--plan-only` to stop after the skeleton. It is a dry run without
 prints a task checklist; add `--apply` to implement it task by task. Useful
 flags: `--verify "pytest -q"` (check and repair each task), `--diagnostics`
 (lint/typecheck each task), `--worktree NAME` (work in an isolated git
-worktree), `--plan FILE` (use your own checklist), and `--max-tasks N` /
-`--max-minutes N` (set limits; there are none by default). A repair round that
+worktree), `--plan FILE` (use your own checklist), `--max-tasks N` /
+`--max-minutes N` (set limits; there are none by default), and `--strict`
+(exit 1 when an applied task left a failed edit block or impacted tests
+failing — for CI). A repair round that
 makes the check worse is rolled back automatically and the task marked failed,
 so an unattended run can't compound damage.
 
 **Several changes in one task.** `pedacito ask . -t "..." --plan` runs each
 requirement in its own fresh context (bullets split with no model call) and
 re-plans once if a step fails. Weak models get this automatically after
-`pedacito calibrate` (which also tests whether your model does better with native tool calls). While `chat` is working, type a line to steer it ("it's in
+`pedacito calibrate` (which also tests whether your model does better with
+native tool calls), and any task naming five or more files gets it too — one
+window rarely holds that many lookups. While `chat` is working, type a line to steer it ("it's in
 sync.py"); it may also ask you one short question when a task is truly
 ambiguous. `--jsonl` turns a run into one JSON event per line for scripts and
 editors; `--role planner=big` sends one job to another profile for a run.
 
 **Optional abilities** (all off by default; set in your config):
-`allow_write = true` (create/overwrite/move/delete files, and a mechanical
-`rename` of a symbol across the files that import it), `allow_shell = true`
+`allow_write = true` (create/overwrite/move/delete files, a mechanical
+`rename` of a symbol across the files that import it, and an `undo` that
+reverts this task's own writes), `allow_shell = true`
 (run tests and linters; add `verify_tests = true` to run the tests an edit can
 break), `allow_screenshots = true` and `allow_browser = true` (let the model
 see a GUI or web page as text), `allow_subagents = true` (a read-only helper
@@ -390,6 +401,7 @@ To force a clean rebuild, delete `<project>/.pedacito/` (always safe) or pass
 | `pedacito calibrate` | Measure the model; save a model card that tunes defaults. |
 | `pedacito eval` | Score the harness on built-in fixture repos. |
 | `pedacito tests PROJ --files F` | Detected test command; tests an edit to F can break. |
+| `pedacito webcheck PROJ` | Static contract checks for web files: DOM ids, ESM in classic scripts, duplicate globals, missing script srcs. |
 | `pedacito memory PROJ` | List / add / forget remembered facts. |
 | `pedacito skills PROJ` | List the available skills. |
 | `pedacito prune PROJ` | Delete old sessions/backups/events; trim the log. |

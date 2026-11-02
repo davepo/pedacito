@@ -14,6 +14,8 @@ The suite is ~20 short, scripted calls against the configured server:
   honesty          does it admit it has not read code it was never shown?
   long context     can it fetch a needle from a prompt of window-relative size?
   continuation     after a lookup transcript, does it ANSWER (not emit more JSON)?
+  thinking A/B     does hidden reasoning eat the whole answer budget -- and
+                   does switching it off produce a usable reply?
   capabilities     native tool calls, image input, embeddings, chars/token
 
 The result is a versioned card per `url|model` in `<config dir>/model_cards.json`
@@ -87,13 +89,18 @@ def apply(cfg) -> dict | None:
     if not card:
         return None
     ch = card.get("choices") or {}
-    sources = getattr(cfg, "sources", {}) or {}
+    sources = getattr(cfg, "sources", None)
+    if not isinstance(sources, dict):
+        # Attach the provenance dict instead of mutating a throwaway copy
+        # (`{} or {}` detaches): even a bare Config should record the fill.
+        sources = {}
+        cfg.sources = sources
 
     def unset(name: str) -> bool:
         return sources.get(name, "default") == "default"
 
     for name in ("best_of", "verify_answer", "fold_tail_steps", "plan_threshold",
-                 "tool_mode"):
+                 "tool_mode", "disable_thinking"):
         if name in ch and unset(name):
             setattr(cfg, name, ch[name])
             sources[name] = "model card"
@@ -352,6 +359,62 @@ def _t_continuation(client, cfg) -> tuple[float, list[str]]:
                                            "edit block"])
 
 
+_THINKING_MSGS = [
+    {"role": "system", "content":
+     "You are a code assistant. Answer with the changed lines only."},
+    {"role": "user", "content":
+     "SOURCE\nsrc/m.py:\n  1 | def is_leech(self, lapses):\n"
+     "  2 |     return lapses >= 8\n\nTASK\nChange the threshold from 8 to "
+     "10. Reply with the two new lines."},
+]
+
+
+def _t_thinking(client, cfg) -> tuple[bool, bool, list[str]]:
+    """(on_ok, off_ok, notes): one short answer call at the REAL answer
+    budget, once with the model's default thinking and once with thinking
+    explicitly off (`disable_thinking=False` forces the default even when the
+    config already disables it, so the A/B measures the model, not the
+    setting). A reasoning model can spend the whole budget on hidden
+    reasoning and hand back nothing usable; at runtime llm.chat discovers
+    that one empty reply at a time. Calibration discovers it once, and
+    `choose` persists the verdict as a `disable_thinking` card choice."""
+    budget = int(getattr(cfg, "max_tokens_answer", 1024) or 1024)
+    notes: list[str] = []
+    usable: dict[str, bool] = {}
+    for arm in ("on", "off"):
+        off = arm == "off"
+        reply = ""
+        try:
+            reply = client.chat(_THINKING_MSGS, max_tokens=budget,
+                                disable_thinking=off)
+        except LLMError as e:
+            notes.append(f"thinking {arm} call failed: "
+                         f"{str(e).splitlines()[0][:60]}")
+        cut = getattr(client, "last_finish_reason", "") == "length"
+        ok = bool((reply or "").strip()) and not cut
+        if arm == "on" and not ok \
+                and not getattr(client, "last_reasoning_chars", 0):
+            # No hidden reasoning behind the empty reply: that is the
+            # instant-EOS flake llm.chat retries identically, not thinking
+            # eating the budget -- give it the same one retry before blaming
+            # thinking.
+            try:
+                reply = client.chat(_THINKING_MSGS, max_tokens=budget,
+                                    disable_thinking=off)
+                cut = getattr(client, "last_finish_reason", "") == "length"
+                ok = bool((reply or "").strip()) and not cut
+            except LLMError:
+                pass
+        usable[arm] = ok
+        if arm == "on" and not ok:
+            notes.append(
+                f"thinking on: no usable answer within {budget} tokens "
+                f"({getattr(client, 'last_reasoning_chars', 0):,} chars of "
+                f"hidden reasoning, finish "
+                f"'{getattr(client, 'last_finish_reason', '') or 'stop'}')")
+    return usable["on"], usable["off"], notes
+
+
 def _t_capabilities(client, cfg) -> dict:
     caps: dict = {"native_tools": None, "images": None, "embeddings": None}
     import requests
@@ -415,6 +478,15 @@ def choose(measured: dict, hosted: bool) -> dict:
     ch: dict = {"prompt_pack": pack,
                 "answer_mode": "auto" if cont >= 1.0 else "rebuild",
                 "tool_mode": "native" if native_wins else "grammar"}
+    # The thinking A/B verdict, persisted so every later run starts in the
+    # winning mode instead of rediscovering it one empty reply at a time.
+    # Only a decisive split is recorded: thinking burned the answer budget
+    # AND switching it off produced a usable reply. Anything else (both arms
+    # fine, both broken, a server that rejects the thinking switch) leaves
+    # the user's setting alone.
+    if measured.get("thinking_on_ok") is False \
+            and measured.get("thinking_off_ok"):
+        ch["disable_thinking"] = True
     if not hosted:
         ch["best_of"] = 2 if overall < 0.5 else 1
         ch["fold_tail_steps"] = 2 if overall < 0.55 else 3 if overall < 0.8 else 5
@@ -471,6 +543,11 @@ def calibrate(client, cfg, verbose: bool = True, quick: bool = False) -> dict:
     measured["continuation"] = round(cont, 2)
     notes += n
     say(f"  continuation     {cont:>4.0%}")
+    th_on, th_off, n = _t_thinking(client, cfg)
+    measured["thinking_on_ok"], measured["thinking_off_ok"] = th_on, th_off
+    notes += n
+    say(f"  thinking A/B     on: {'usable' if th_on else 'UNUSABLE'}, "
+        f"off: {'usable' if th_off else 'UNUSABLE'}")
     if not quick:
         nd, n = _t_needle(client, cfg)
         measured["needle"] = round(nd, 2)

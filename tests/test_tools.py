@@ -1306,6 +1306,15 @@ def test_browser_server_url_detection_and_action_parser():
         ("press", "Enter"), ("click", "#start"), ("wait", 2.0),
         ("fill", ("#name", "Ada")), ("type", "hi")]
     assert browser.parse_actions("Enter") == [("press", "Enter")]
+    # deepclitest: Playwright's press is an instant down+up pair, and the
+    # frog game's fixed-timestep loop never sampled the key between two
+    # frames -- `hold` keeps it down across them (seconds default to 1,
+    # clamp to 30, and a keyless `hold` is dropped).
+    assert browser.parse_actions("hold ArrowUp 1.5; hold Space") == [
+        ("hold", ("ArrowUp", 1.5)), ("hold", ("Space", 1.0))]
+    assert browser.parse_actions("hold Space 999") == [
+        ("hold", ("Space", 30.0))]
+    assert browser.parse_actions("hold") == []
     # Run 9's frog-scale verify could only RECOMMEND "force state.data.scale
     # = 2 in the browser console" -- eval gives the pattern language that
     # reach. Run 10 then showed the `;` splitter shredding multi-statement
@@ -1447,6 +1456,105 @@ def test_browser_eval_action_runs_and_reports_its_value(tmp_path, monkeypatch):
     assert "setTimeout" in raced and "did not settle" in raced
     assert "pressed Enter" in info["actions"]
     assert "eval'd state.data.scale = 3 -> 3" in info["actions"]
+    assert info["action_errors"] == []
+
+
+def test_browser_hold_action_keeps_the_key_down(tmp_path, monkeypatch):
+    """P7: `hold` must produce a down/wait/up sequence instead of one
+    instant press -- a fixed-timestep game loop samples the keyboard once
+    per frame, so a key released between two samples never registers (the
+    deepclitest frog game ignored every tapped jump for exactly this
+    reason)."""
+    import sys
+    import types as pytypes
+    from pedacito import browser
+
+    events = []
+
+    class FakeKeyboard:
+        def press(self, key):
+            events.append(("press", key))
+
+        def down(self, key):
+            events.append(("down", key))
+
+        def up(self, key):
+            events.append(("up", key))
+
+        def type(self, text):
+            events.append(("type", text))
+
+    class FakePage:
+        url = "http://127.0.0.1:5000/"
+
+        def __init__(self):
+            self.keyboard = FakeKeyboard()
+
+        def set_default_timeout(self, ms):
+            pass
+
+        def on(self, event, handler):
+            pass
+
+        def goto(self, url, wait_until=None, timeout=None):
+            pass
+
+        def evaluate(self, expr):
+            return []          # the _canvas_info probe
+
+        def wait_for_timeout(self, ms):
+            events.append(("wait", ms))
+
+        def screenshot(self, path=None, full_page=False):
+            with open(path, "wb") as fh:
+                fh.write(b"fake png")
+
+        def inner_text(self, sel):
+            return ""
+
+        def title(self):
+            return "Game"
+
+    class FakeBrowser:
+        def new_page(self, viewport=None):
+            return page
+
+        def close(self):
+            pass
+
+    class FakeChromium:
+        def launch(self, headless=True):
+            return FakeBrowser()
+
+    class FakePW:
+        chromium = FakeChromium()
+
+    class FakeCM:
+        def __enter__(self):
+            return FakePW()
+
+        def __exit__(self, *exc):
+            return False
+
+    page = FakePage()
+    fake_sync = pytypes.ModuleType("playwright.sync_api")
+    fake_sync.sync_playwright = lambda: FakeCM()
+    fake_root = pytypes.ModuleType("playwright")
+    fake_root.sync_api = fake_sync
+    monkeypatch.setitem(sys.modules, "playwright", fake_root)
+    monkeypatch.setitem(sys.modules, "playwright.sync_api", fake_sync)
+    monkeypatch.setattr(browser, "available", lambda: True)
+
+    ok, info = browser.run(
+        "http://127.0.0.1:5000/",
+        actions="hold ArrowUp 1.5",
+        wait=0, out=tmp_path / "shot.png")
+    assert ok, info
+    # the order is the point: down, stay down across the wait, then up
+    assert events.index(("down", "ArrowUp")) < events.index(("wait", 1500)) \
+        < events.index(("up", "ArrowUp"))
+    assert ("press", "ArrowUp") not in events
+    assert "held ArrowUp for 1.5s" in info["actions"]
     assert info["action_errors"] == []
 
 

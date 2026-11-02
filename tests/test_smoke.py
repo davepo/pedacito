@@ -860,6 +860,38 @@ def test_repair_prose_give_up_is_announced(tmp_path, capsys):
     assert "failing checks remain" in err
 
 
+def test_repair_for_failing_tests_carries_the_value_bound_rules(tmp_path):
+    """P6: a repair round triggered by failing impacted tests carries the
+    value-bound rules even when the task text never says "test" ("fix the
+    cart total") -- the classic move there is weakening the red assertion
+    instead of fixing the code."""
+    from pedacito import index as index_mod, verify as verify_mod
+    _write(tmp_path / "stub.js", "class A {}\n")
+    idx = index_mod.Index(tmp_path, [])
+
+    class StubClient:
+        stream_truncated = False
+
+        def __init__(self):
+            self.systems = []
+
+        def chat(self, messages, max_tokens, schema=None, stream=False, **kw):
+            self.systems.append(messages[0]["content"])
+            return "no fix"          # prose: the repair gives up
+
+    client = StubClient()
+    agent = Agent(idx, client, config_mod.Config())
+    finding = verify_mod.Finding("tests", "error", "",
+                                 "after your edits these tests fail")
+    agent._repair_from_findings("make the cart total right", "", [finding], [])
+    assert "Rules for tests" in client.systems[-1]
+    assert "weaken or delete an assertion" in client.systems[-1]
+    # a non-tests finding (a lint placeholder, say) adds nothing
+    other = verify_mod.Finding("placeholder", "error", "stub.js", "TODO left")
+    agent._repair_from_findings("make the cart total right", "", [other], [])
+    assert "Rules for tests" not in client.systems[-1]
+
+
 def test_repair_llm_error_is_announced(tmp_path, capsys):
     """Same for a repair re-ask the server refuses outright: the exception
     is swallowed by design (a failed fix round must not kill the task), so
@@ -1028,6 +1060,95 @@ def test_write_refuses_tiny_fragment_and_invalid_syntax(tmp_path):
         idx, cfg, "reporting.py",
         "\n".join(f"def fixed_{i}(): return {i}" for i in range(12))
     ).startswith("WROTE")
+
+
+def test_empty_search_overwrite_gets_the_write_guard(tmp_path):
+    """An answer-phase empty-SEARCH whole-file replacement is the twin of the
+    `write` action and must refuse the same fragment shapes; the guard used to
+    live only in the tool, so a window re-quote from a partial read could
+    erase everything outside the quoted window through the edit path."""
+    original = "\n".join(f"def helper_{i}(): return {i}"
+                         for i in range(40)) + "\n"
+    (tmp_path / "mod.py").write_text(original)
+
+    # A verbatim 10-line window over a 40-line file: refused, file untouched.
+    window = "\n".join(f"def helper_{i}(): return {i}" for i in range(10, 20))
+    reply = ("--- FILE: mod.py\n<<<<<<< SEARCH\n=======\n"
+             + window + "\n>>>>>>> REPLACE\n")
+    results = edits.apply_edits(tmp_path, edits.parse_edits(reply),
+                                backup=False)
+    assert len(results) == 1 and not results[0].ok
+    assert "PARTIAL read" in results[0].message
+    assert (tmp_path / "mod.py").read_text() == original
+
+    # The same guard covers an empty-SEARCH block mixed with a real edit.
+    reply = ("--- FILE: mod.py\n<<<<<<< SEARCH\ndef helper_0(): return 0\n"
+             "=======\ndef helper_0(): return 100\n>>>>>>> REPLACE\n"
+             "--- FILE: mod.py\n<<<<<<< SEARCH\n=======\n"
+             + window + "\n>>>>>>> REPLACE\n")
+    results = edits.apply_edits(tmp_path, edits.parse_edits(reply),
+                                backup=False)
+    assert any(not r.ok for r in results)
+    assert (tmp_path / "mod.py").read_text() == original
+
+    # A genuine whole-file rewrite (invented content) still applies.
+    fresh = "\n".join(f"def brand_new_{i}(): return {i}" for i in range(12))
+    reply = ("--- FILE: mod.py\n<<<<<<< SEARCH\n=======\n"
+             + fresh + "\n>>>>>>> REPLACE\n")
+    results = edits.apply_edits(tmp_path, edits.parse_edits(reply),
+                                backup=False)
+    assert len(results) == 1 and results[0].ok
+    assert (tmp_path / "mod.py").read_text().startswith("def brand_new_0")
+
+
+def test_reapplied_block_scores_already_applied(tmp_path):
+    """Re-emitting a block whose SEARCH no longer matches because the edit
+    already landed (a gather write mutated the file before the answer phase)
+    used to fail the whole file; it now scores as a clean 'already applied'
+    and leaves the bytes alone."""
+    (tmp_path / "mod.py").write_text("def f():\n    return 1\n")
+    reply = ("--- FILE: mod.py\n<<<<<<< SEARCH\ndef f():\n    return 1\n"
+             "=======\ndef f():\n    return 2\n>>>>>>> REPLACE\n")
+    first = edits.apply_edits(tmp_path, edits.parse_edits(reply), backup=False)
+    assert first[0].ok
+    assert (tmp_path / "mod.py").read_text() == "def f():\n    return 2\n"
+
+    again = edits.apply_edits(tmp_path, edits.parse_edits(reply), backup=False)
+    assert len(again) == 1 and again[0].ok
+    assert "already applied" in again[0].message
+    assert (tmp_path / "mod.py").read_text() == "def f():\n    return 2\n"
+
+    # A single-line REPLACE is never treated as already-applied: too
+    # ambiguous, so the miss stays a real failure.
+    (tmp_path / "flag.py").write_text("FLAG = True\nOTHER = 1\n")
+    reply = ("--- FILE: flag.py\n<<<<<<< SEARCH\nFLAG = False\n=======\n"
+             "FLAG = True\n>>>>>>> REPLACE\n")
+    res = edits.apply_edits(tmp_path, edits.parse_edits(reply), backup=False)
+    assert len(res) == 1 and not res[0].ok
+    assert "not found" in res[0].message
+
+
+def test_repeat_append_block_is_not_duplicated(tmp_path):
+    """Repair rounds re-emitted the same append-style block (SEARCH = the
+    anchor, REPLACE = anchor + the new test) and every pass appended the test
+    again -- the suite ended with the same test pair three times. Once the
+    REPLACE content sits verbatim at the matched span, the block scores as
+    already applied instead of duplicating it."""
+    (tmp_path / "test_app.py").write_text("def test_a():\n    assert True\n")
+    reply = ("--- FILE: test_app.py\n"
+             "<<<<<<< SEARCH\ndef test_a():\n    assert True\n=======\n"
+             "def test_a():\n    assert True\n\n\n"
+             "def test_b():\n    assert not False\n>>>>>>> REPLACE\n")
+    first = edits.apply_edits(tmp_path, edits.parse_edits(reply), backup=False)
+    assert first[0].ok
+    once = (tmp_path / "test_app.py").read_text()
+    assert once.count("def test_b") == 1
+
+    for _ in range(2):                       # two repair rounds re-emit it
+        again = edits.apply_edits(tmp_path, edits.parse_edits(reply),
+                                  backup=False)
+        assert again[0].ok and "already applied" in again[0].message
+    assert (tmp_path / "test_app.py").read_text() == once
 
 
 # ------------------------------------------------------------------ budgets

@@ -41,9 +41,10 @@ import subprocess
 import sys
 import time
 from datetime import datetime
-from pathlib import Path, PureWindowsPath
+from pathlib import Path, PurePosixPath, PureWindowsPath
 
 from . import browser, fileio, proc, safety, sandbox, sessions, vision
+from . import edits as edits_mod
 
 TOOL_HELP = """\
 read     - read exact lines of a file.       args: file, start, end
@@ -92,6 +93,10 @@ write    - overwrite a whole file with text. args: file, content
 append   - add text to the END of a file.    args: file, content
 move     - rename/move one file.             args: file (old), to (new)
 delete   - delete one file.                  args: file
+undo     - revert what THIS task's write/append/move/delete actions did so
+           far (or just one of their files): pre-task snapshots come back,
+           files the task created go away. args: optional file
+           (needs allow_write and backup)
 run      - run one command, no shell pipes.  args: command
            (a quiet GUI/server is stopped after shell_idle_seconds)
 screenshot - launch app, wait, capture screen; returns text analysis.
@@ -99,7 +104,9 @@ screenshot - launch app, wait, capture screen; returns text analysis.
            (needs allow_screenshots; launching a command also needs allow_shell)
 browser  - open a web page in headless Chromium, interact, wait, capture it.
            args: command (URL, or a command that prints a localhost URL),
-           pattern (optional "press Enter; click #start; wait 2; eval <js>";
+           pattern (optional "press Enter; hold Space 1.5; click #start;
+           wait 2; eval <js>"; `hold <key> <sec>` keeps a key DOWN -- an
+           instant press is invisible to fixed-timestep game loops;
            `eval` goes last and consumes the rest of the pattern; its result
            comes back clipped at 2000 chars -- resolve compact JSON),
            start (seconds to wait), optional file (old shot to compare)
@@ -125,7 +132,7 @@ STEP_SCHEMA = {
                      "done"],
         },
         "file": {"type": "string",
-                 "description": "For read/write/append/move/delete. For "
+                 "description": "For read/write/append/move/delete/undo. For "
                                 "outline, a file OR a directory/glob. For "
                                 "grep, optionally a file, directory, or glob. "
                                 "For diff, optionally one file. For screenshot/"
@@ -141,8 +148,11 @@ STEP_SCHEMA = {
                                    "valid regex. For find: a name/signature/"
                                    "summary fragment. For git: the git "
                                    "arguments. For fetch: the URL. For browser: optional "
-                                   "actions like 'press Enter; click #start; wait 2; "
-                                   "eval <js>' -- eval goes LAST and consumes "
+                                   "actions like 'press Enter; hold Space 1.5; "
+                                   "click #start; wait 2; eval <js>' -- hold "
+                                   "keeps a key DOWN for N seconds (an instant "
+                                   "press is invisible to fixed-timestep game "
+                                   "loops); eval goes LAST and consumes "
                                    "the rest (semicolons allowed inside); its "
                                    "RESULT is reported clipped at 2000 chars, "
                                    "so resolve compact or aggregated JSON. "
@@ -200,6 +210,7 @@ WRITE_ACTION = "write"
 APPEND_ACTION = "append"
 MOVE_ACTION = "move"
 DELETE_ACTION = "delete"
+UNDO_ACTION = "undo"
 RUN_ACTION = "run"
 SCREENSHOT_ACTION = "screenshot"
 BROWSER_ACTION = "browser"
@@ -208,7 +219,7 @@ DIAGNOSE_ACTION = "diagnose"
 TODO_ACTION = "todo"
 MCP_ACTION = "mcp"
 WRITE_ACTIONS = (WRITE_ACTION, APPEND_ACTION)
-MUTATING_ACTIONS = WRITE_ACTIONS + (MOVE_ACTION, DELETE_ACTION)
+MUTATING_ACTIONS = WRITE_ACTIONS + (MOVE_ACTION, DELETE_ACTION, UNDO_ACTION)
 
 
 def _skills_exist(cfg) -> bool:
@@ -243,6 +254,10 @@ def schema_for(cfg) -> dict:
         actions.append("serve")
     if getattr(cfg, "allow_write", False):
         actions += ["write", "append", "move", "delete", "rename"]
+        if getattr(cfg, "backup", False):
+            # `undo` can only work from the task's snapshot dir; offering it
+            # with backups off would promise a recovery that cannot happen.
+            actions.append("undo")
     if getattr(cfg, "allow_screenshots", False):
         actions.append("screenshot")
     if getattr(cfg, "allow_browser", False):
@@ -1625,6 +1640,27 @@ def _note_created(index, cfg, rel: str) -> None:
         pass
 
 
+def _note_mutation(cfg, *rels: str) -> None:
+    """Record that a gather-phase action changed `rels` on disk. The task loop
+    reads the ledger (cfg._task_mutations, reset per task) and runs post-edit
+    verification (hooks, impacted tests, lint) even when the answer phase
+    produces no edit blocks at all -- a worker that finishes the job with
+    write/move/delete/rename actions used to land its changes with no
+    verification of any kind."""
+    if cfg is None or not rels:
+        return
+    seen = getattr(cfg, "_task_mutations", None)
+    if seen is None:
+        seen = []
+        try:
+            cfg._task_mutations = seen
+        except AttributeError:
+            return
+    for rel in rels:
+        if rel and rel not in seen:
+            seen.append(rel)
+
+
 def _parse_error(path: Path, text: str) -> str:
     """'' when `text` parses as this file's language (or the language is
     unknown), else a short description of the syntax error."""
@@ -1759,59 +1795,17 @@ def tool_write(index, cfg, file: str, content: str,
                 f"{max_chars:,} limit. Write a smaller file, or use edit "
                 "blocks.")
     if existed and not append and original is not None:
-        # Partial-rewrite guard. A `write` step can only carry what the model
-        # actually composed; overwriting an existing file from a partial read
-        # (or from a fragment it stitched together) erases every line outside
-        # that fragment -- silently, since the result is still valid text.
-        # Two shapes are refused when the content shrinks the file by more
-        # than half and the file is big enough to matter:
-        #   (1) every new line is a verbatim, in-order copy of the original
-        #       (the game-session PED-4 window re-quote);
-        #   (2) the content reuses some original lines but drops the file's
-        #       first or last one (a lost head/tail fragment -- the
-        #       deepclitest incident: 42 lines replaced by a 9-line tail plus
-        #       new code, which passed the old every-line check because the
-        #       new helper was not in the original).
-        # A genuine rewrite (no copied lines) still goes through, as does a
-        # full re-quote that only deletes a line or two. Below the floor a
-        # shrink is ordinary small-file editing and stays allowed.
-        old_ls = [l.strip() for l in original.splitlines() if l.strip()]
-        new_ls = [l.strip() for l in new_text.splitlines() if l.strip()]
-        # A handful of lines is never a full-file rewrite of a real module:
-        # it is the fragment the model composed for its addition, not the
-        # file. (deepclitest: a 42-line module was replaced by the 2-line
-        # helper the task asked to append.)
-        if new_ls and len(old_ls) >= 20 and len(new_ls) < 10:
-            return (f"ERROR: refusing to overwrite {rel}: your content has only "
-                    f"{len(new_ls)} non-blank lines but the file has "
-                    f"{len(old_ls)} -- that is a fragment, not a whole file. "
-                    "Keep the existing file and add your lines with a "
-                    "search/replace edit block (or `append` for the end of "
-                    "the file).")
-        if new_ls and len(old_ls) >= 8 and 2 * len(new_ls) < len(old_ls):
-            probe = iter(old_ls)
-            if all(l in probe for l in new_ls):
-                return (f"ERROR: refusing to overwrite {rel}: your content has "
-                        f"{len(new_ls)} non-blank lines but the file has "
-                        f"{len(old_ls)}, and every one of your lines is a "
-                        "verbatim copy from the file in order -- the signature "
-                        "of rewriting a file from a PARTIAL read, which would "
-                        "erase the lines you never saw. Make a targeted "
-                        "search/replace edit instead. If you truly mean to "
-                        "shrink this file, `read` it completely first so your "
-                        "new content can differ from what you keep.")
-            shared = set(old_ls) & set(new_ls)
-            keeps_ends = old_ls[0] in new_ls and old_ls[-1] in new_ls
-            if shared and not keeps_ends:
-                return (f"ERROR: refusing to overwrite {rel}: your content has "
-                        f"{len(new_ls)} non-blank lines but the file has "
-                        f"{len(old_ls)}, reuses text from the file, and drops "
-                        "its beginning or end -- the signature of a lost "
-                        "fragment, which would erase the lines you never "
-                        "included. Make a targeted search/replace edit "
-                        "instead. If you truly mean to shrink the whole file, "
-                        "read it completely and rewrite it without copying "
-                        "pieces of the old text.")
+        # Partial-rewrite guard, shared with the edit path's empty-SEARCH
+        # whole-file replacement (edits.fragment_refusal): a `write` step can
+        # only carry what the model actually composed; overwriting an existing
+        # file from a partial read (or from a fragment it stitched together)
+        # erases every line outside that fragment -- silently, since the
+        # result is still valid text. Refused shapes: tiny fragments, window
+        # re-quotes, and lost head/tail fragments; genuine rewrites and small
+        # shrinks stay allowed.
+        refusal = edits_mod.fragment_refusal(rel, original, new_text)
+        if refusal:
+            return refusal
         # Syntax gate: refusing here is the write-action equivalent of the
         # edit path's "edit produced a syntax error; not written". A file
         # that parses now must not be replaced by text that does not; a
@@ -1845,6 +1839,8 @@ def tool_write(index, cfg, file: str, content: str,
         index.__dict__.update(fresh.__dict__)
     except Exception as e:
         print(f"  [write] index refresh failed for {rel}: {e}", file=sys.stderr)
+
+    _note_mutation(cfg, rel)
 
     n = len(text.splitlines())
     syntax = _syntax_note(path, text)
@@ -1933,6 +1929,7 @@ def tool_move(index, cfg, file: str, to: str) -> str:
     except Exception as e:
         print(f"  [move] index refresh failed for {dst_rel}: {e}", file=sys.stderr)
 
+    _note_mutation(cfg, src_rel, dst_rel)
     n = len(original.splitlines())
     return (f"MOVED {src_rel} -> {dst_rel} ({n} lines). "
             "[This change was applied directly, without a review page. Undo "
@@ -1972,11 +1969,108 @@ def tool_delete(index, cfg, file: str) -> str:
     except OSError as e:
         return f"ERROR: could not delete {rel}: {e}"
     index.forget(rel)
+    _note_mutation(cfg, rel)
     n = len(original.splitlines())
     undo = ("backed up; use `pedacito restore` to undo."
             if getattr(cfg, "backup", False) else
             "backups are OFF, so this cannot be undone.")
     return f"DELETED {rel} ({n} lines) -- {undo}"
+
+
+def tool_undo(index, cfg, file: str = "") -> str:
+    """Revert this task's own mutations from its backup snapshot.
+
+    A gather-phase worker that notices its write/append/move/delete was a
+    mistake has, until now, had exactly one recovery path: rewriting the
+    file from memory -- which is how botched renames ended in half-remembered
+    files. The task's backup dir already holds the pre-task bytes of every
+    file it touched (the first copy `_snapshot` keeps), and the created
+    manifest lists the files that did not exist before; together they are
+    exactly the information an undo needs. Without `file` it reverts every
+    mutation this task made (newest first); with `file` only that one.
+    Gated by `allow_write` and `backup`."""
+    if not getattr(cfg, "allow_write", False):
+        return "ERROR: `undo` is disabled (config allow_write = false)."
+    if not getattr(cfg, "backup", False):
+        return ("ERROR: `undo` needs backups (config backup = false): there "
+                "is no pre-task snapshot of this task's changes.")
+    muts = list(getattr(cfg, "_task_mutations", None) or ())
+    if not muts:
+        return "Nothing to undo: this task has not mutated any file yet."
+    want = _as_text(file).strip()
+    if want:
+        key = fileio.path_key(_root_rel(index, want) or want)
+        targets = [rel for rel in muts if fileio.path_key(rel) == key]
+        if not targets:
+            # The index may no longer resolve a name the task moved/deleted
+            # away, so fall back to a basename match inside the ledger.
+            base = PurePosixPath(want.replace("\\", "/")).name
+            targets = [rel for rel in muts
+                       if PurePosixPath(rel).name == base]
+        if not targets:
+            return (f"Nothing to undo for '{want}': not a file this task "
+                    f"mutated. It mutated: {', '.join(muts)}.")
+    else:
+        targets = muts
+    bdir = getattr(cfg, "_backup_dir", None)
+    if bdir is None:
+        from . import workspace
+        bdir = workspace.new_backup_dir(index.root)
+    bdir = Path(bdir)
+    try:
+        created = set(fileio.created_manifest(bdir)
+                      .read_text(encoding="utf-8").splitlines())
+    except OSError:
+        created = set()
+    root = Path(index.root).resolve()
+    restored: list[str] = []
+    removed: list[str] = []
+    notes: list[str] = []
+    for rel in reversed(targets):
+        err = _protected_error(cfg, rel, "undo")
+        if err:
+            notes.append(err)
+            continue
+        snap = bdir / rel
+        dest = root / rel
+        if snap.is_file():
+            # Snapshot-first, not created-first: a file the task deleted and
+            # then recreated has BOTH marks, and the honest undo restores the
+            # original bytes rather than leaving the world without the file.
+            try:
+                fileio.backup_copy(snap, dest, keep_existing=False)
+            except OSError as e:
+                notes.append(f"ERROR: could not restore {rel}: {e}")
+                continue
+            # Refresh the index so line ranges describe the restored bytes.
+            try:
+                from . import index as index_mod
+                fresh = index_mod.reindex_file(index, rel, cfg, save=False)
+                index.__dict__.update(fresh.__dict__)
+            except Exception as e:
+                print(f"  [undo] index refresh failed for {rel}: {e}",
+                      file=sys.stderr)
+            restored.append(rel)
+        elif rel in created and dest.exists():
+            try:
+                dest.unlink()
+            except OSError as e:
+                notes.append(f"ERROR: could not remove {rel}: {e}")
+                continue
+            index.forget(rel)
+            removed.append(rel)
+        else:
+            notes.append(f"{rel}: no snapshot and not a file this task "
+                         "created -- left as-is.")
+    out: list[str] = []
+    if restored:
+        out.append("UNDONE (pre-task contents restored): "
+                   + ", ".join(restored))
+    if removed:
+        out.append("REMOVED (created by this task, did not exist before): "
+                   + ", ".join(removed))
+    out.extend(notes)
+    return "\n".join(out) if out else "Nothing to undo."
 
 
 def _split_command(cmd: str) -> list[str]:
@@ -2300,11 +2394,13 @@ def tool_browser(index, cfg, client, command: str = "", pattern: str = "",
     """Open a web page, optionally interact with it, wait, and capture it.
 
     `command` is an http(s) URL or a command that starts a local web server
-    and prints its URL. `pattern` is an interaction list (`press Enter; click
-    #start; wait 2; eval <js>`, see browser.parse_actions); `eval` consumes
-    the rest of the pattern and its result is clipped at 2,000 chars. `start`
-    is the wait before capture. Reports the page's text, canvas sizes,
-    console errors and an optional vision description.
+    and prints its URL. `pattern` is an interaction list (`press Enter;
+    hold Space 1.5; click #start; wait 2; eval <js>`, see
+    browser.parse_actions); `hold` keeps a key down for N seconds (an
+    instant press is invisible to fixed-timestep game loops), `eval`
+    consumes the rest of the pattern and its result is clipped at 2,000
+    chars. `start` is the wait before capture. Reports the page's text,
+    canvas sizes, console errors and an optional vision description.
 
     Gated by `allow_browser`; launching a command also needs `allow_shell`.
     """
@@ -2530,6 +2626,9 @@ def dispatch(index, cfg, step: dict, client=None) -> str:
                     "Answer the task with search/replace edit blocks instead -- "
                     "`read` the lines you want to change, then emit them in your "
                     "final reply.")
+        if action == UNDO_ACTION:
+            # Before the write-budget logic: undo carries no content.
+            return tool_undo(index, cfg, step.get("file", ""))
         if action == MOVE_ACTION:
             return tool_move(index, cfg, step.get("file", ""),
                              step.get("to", ""))

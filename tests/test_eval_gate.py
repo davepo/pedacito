@@ -49,6 +49,30 @@ def test_ab_gate_reports_improvements():
     assert "pass rate" in text and "mean prompt tokens" in text
 
 
+def test_ab_gate_flags_a_thinking_setting_split():
+    """P5: token/time growth across a disable_thinking change measures the
+    setting, not the harness -- the gate hard-flags the split and skips the
+    growth comparison. Reports without the key (older --out files) compare
+    exactly as before."""
+    base = _report()
+    base["disable_thinking"] = False
+    hot = _report(mean_completion_tokens=900, mean_seconds=40)
+    hot["disable_thinking"] = True
+    reg, _imp = evalrun.compare_reports(base, hot)
+    assert any("disable_thinking differs" in r for r in reg)
+    assert not any("completion tokens" in r for r in reg)
+    assert "FAIL" in evalrun.render_compare(reg, [])
+    # the same setting on both sides: growth compares as usual
+    base["disable_thinking"] = True
+    reg, _ = evalrun.compare_reports(base, hot)
+    assert not any("differs" in r for r in reg)
+    assert any("mean completion tokens" in r for r in reg)
+    # older reports without the key: no flag, growth still compared
+    reg, _ = evalrun.compare_reports(_report(), _report(mean_seconds=40))
+    assert not any("differs" in r for r in reg)
+    assert any("mean seconds" in r for r in reg)
+
+
 def test_replayer_marks_a_divergent_prompt(tmp_path):
     rec = tmp_path / "run.jsonl"
     rec.write_text(json.dumps({

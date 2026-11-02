@@ -31,6 +31,18 @@ def _has(root: Path, *names: str) -> bool:
     return any((root / n).exists() for n in names)
 
 
+def _has_js_tests(root: Path) -> bool:
+    """True when the tree has Node-style test files (`*.test.js`/`.mjs` or a
+    `test*/` dir of them) that `node --test` can run."""
+    for pattern in ("*.test.js", "*.test.mjs", "tests/*.test.js",
+                    "test/*.test.js", "tests/*.test.mjs", "test/*.test.mjs",
+                    "src/**/*.test.js", "tests/**/*.test.js",
+                    "test/**/*.test.js"):
+        if any(root.glob(pattern)):
+            return True
+    return False
+
+
 def detect_test_command(root, cfg=None) -> str:
     """The project's test command, or '' when none is evident. A configured
     `test_command` always wins."""
@@ -56,6 +68,12 @@ def detect_test_command(root, cfg=None) -> str:
         return "cargo test"
     if _has(root, "go.mod"):
         return "go test ./..."
+    if _has_js_tests(root):
+        # Zero-dependency Node projects (no package.json test script, or no
+        # package.json at all) still have a runner: `node --test` discovers
+        # *.test.js recursively since Node 18/20. Both game sessions had to
+        # fabricate a package.json purely so detection would fire.
+        return "node --test"
     py_markers = _has(root, "pytest.ini", "tox.ini", "conftest.py", "pyproject.toml",
                       "setup.cfg", "setup.py")
     has_py_tests = any(root.glob("tests/test_*.py")) or any(root.glob("test_*.py")) \
@@ -118,6 +136,21 @@ def impacted_tests(index, changed: list[str], limit: int = 12) -> list[tuple[str
             for t in testlinks.tests_of(dep, tests_map):
                 add(t, f"tests {posixpath.basename(dep)}, which uses "
                        f"{posixpath.basename(f)}")
+    # Transitive dependents (COVERAGE-1): a change deep in a package re-export
+    # chain (reporting.py <- commands/__init__.py <- cli.py <- test_cli.py) is
+    # only two hops from the test that exercises it through the public API, so
+    # a one-hop walk misses it and the hook runs a suite that cannot see the
+    # regression. Walk the impact graph to depth 2 and add those tests LAST:
+    # `add` keeps the first reason and `limit` truncates the tail, so direct
+    # links always win the slots and this only widens when there is room.
+    for f in changed:
+        impact = g.impact(f, depth=2)
+        for dep in sorted(impact, key=lambda d: (impact[d], d)):
+            if dep in all_tests:
+                add(dep, f"transitively imports {posixpath.basename(f)}")
+            for t in testlinks.tests_of(dep, tests_map):
+                add(t, f"tests {posixpath.basename(dep)}, which transitively "
+                       f"uses {posixpath.basename(f)}")
     return list(out.items())[:limit]
 
 
@@ -130,6 +163,13 @@ def narrow_command(command: str, tests: list[str]) -> tuple[str, bool]:
     files = " ".join(shlex.quote(t) for t in tests)
     if "pytest" in low:
         return f"{command} {files}", True
+    if low.startswith("node --test") or low == "node -t":
+        # `node --test FILE...` runs exactly those files; non-JS entries in
+        # `tests` (a mixed tree) would make the runner error, so filter.
+        js = [t for t in tests if t.lower().endswith((".js", ".mjs", ".cjs"))]
+        if js:
+            return f"{command} " + " ".join(shlex.quote(t) for t in js), True
+        return command, False
     if low.startswith(("npm test", "pnpm test", "yarn test")):
         sep = "" if low.startswith("yarn") else " --"
         return f"{command}{sep} {files}", True

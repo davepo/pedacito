@@ -2076,7 +2076,9 @@ REFERENCE_TEMPLATE = TEMPLATE + '''
 # summary_batch > 1 sends short units N per request (fewer round-trips).
 # max_observation_tokens caps one non-read observation (0 = auto).
 # plan_threshold > 0 auto-splits tasks that name that many files/requirements
-# into single-focus steps (`ask --plan` forces it); max_replans bounds the
+# into single-focus steps (`ask --plan` forces it, `--no-plan` opts one task
+# out; a task naming 5+ files is auto-split even at 0 unless plan_threshold
+# is set here explicitly); max_replans bounds the
 # planner's revisions after a failed step; allow_steering delivers lines typed
 # mid-task in `chat`. roles also accept `escalate` (one retry on a stronger
 # model when no edit landed) and `fallback` (when the worker errors out).

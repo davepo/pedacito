@@ -521,6 +521,91 @@ def _creation_text(group: list[Edit]) -> str:
     return text
 
 
+def fragment_refusal(rel: str, original: str, new_text: str) -> str | None:
+    """Why replacing `original` with `new_text` looks like a fragment of a
+    partial read rather than a whole-file rewrite, or None when it is safe.
+    Shared by the `write` tool and the edit path's empty-SEARCH whole-file
+    replacement, so a model cannot dodge the guard by picking the other
+    shape. Two shrinking forms are refused when the file is big enough to
+    matter:
+
+      (1) a tiny fragment: the file has >= 20 non-blank lines and the new
+          content has < 10 (deepclitest: a 42-line module replaced by the
+          2-line helper the task asked to append);
+      (2) a window re-quote: the content shrinks the file by more than half
+          and every new line is a verbatim, in-order copy of the original
+          (the game-session PED-4 write), or it reuses original lines but
+          drops the file's first or last one (a lost head/tail fragment).
+
+    A genuine rewrite (no copied lines) still goes through, as does a full
+    re-quote that only deletes a line or two. Below the floor a shrink is
+    ordinary small-file editing and stays allowed."""
+    old_ls = [l.strip() for l in original.splitlines() if l.strip()]
+    new_ls = [l.strip() for l in new_text.splitlines() if l.strip()]
+    # A handful of lines is never a full-file rewrite of a real module:
+    # it is the fragment the model composed for its addition, not the
+    # file. (deepclitest: a 42-line module was replaced by the 2-line
+    # helper the task asked to append.)
+    if new_ls and len(old_ls) >= 20 and len(new_ls) < 10:
+        return (f"ERROR: refusing to overwrite {rel}: your content has only "
+                f"{len(new_ls)} non-blank lines but the file has "
+                f"{len(old_ls)} -- that is a fragment, not a whole file. "
+                "Keep the existing file and add your lines with a "
+                "search/replace edit block (or `append` for the end of "
+                "the file).")
+    if new_ls and len(old_ls) >= 8 and 2 * len(new_ls) < len(old_ls):
+        probe = iter(old_ls)
+        if all(l in probe for l in new_ls):
+            return (f"ERROR: refusing to overwrite {rel}: your content has "
+                    f"{len(new_ls)} non-blank lines but the file has "
+                    f"{len(old_ls)}, and every one of your lines is a "
+                    "verbatim copy from the file in order -- the signature "
+                    "of rewriting a file from a PARTIAL read, which would "
+                    "erase the lines you never saw. Make a targeted "
+                    "search/replace edit instead. If you truly mean to "
+                    "shrink this file, `read` it completely first so your "
+                    "new content can differ from what you keep.")
+        shared = set(old_ls) & set(new_ls)
+        keeps_ends = old_ls[0] in new_ls and old_ls[-1] in new_ls
+        if shared and not keeps_ends:
+            return (f"ERROR: refusing to overwrite {rel}: your content has "
+                    f"{len(new_ls)} non-blank lines but the file has "
+                    f"{len(old_ls)}, reuses text from the file, and drops "
+                    "its beginning or end -- the signature of a lost "
+                    "fragment, which would erase the lines you never "
+                    "included. Make a targeted search/replace edit "
+                    "instead. If you truly mean to shrink the whole file, "
+                    "read it completely and rewrite it without copying "
+                    "pieces of the old text.")
+    return None
+
+
+def _content_lines(text: str) -> list[str]:
+    """Lines that carry content (blanks dropped, trailing whitespace
+    stripped), for already-applied comparisons."""
+    return [l.rstrip() for l in text.splitlines() if l.strip()]
+
+
+def _replace_already_present(text: str, repl: str, start: int = -1) -> bool:
+    """True when `repl`'s content lines already occur in `text` as one
+    contiguous run -- at offset `start` when given (the span the block
+    matched), anywhere otherwise. Replaces shorter than two content lines
+    never count: a single common line is too ambiguous to skip a real edit
+    over. Catches two field failures: a block re-emitted after a gather
+    write already landed it (the SEARCH no longer matches but the REPLACE
+    content is on disk), and repair rounds that appended the same test pair
+    again and again (the SEARCH still matches and the REPLACE sits verbatim
+    at the span, so applying would duplicate it)."""
+    want = _content_lines(repl)
+    if len(want) < 2:
+        return False
+    hay = _content_lines(text if start < 0 else text[start:])
+    for i in range(len(hay) - len(want) + 1):
+        if hay[i:i + len(want)] == want:
+            return True
+    return False
+
+
 # --------------------------------------------------------------------------
 # Application
 # --------------------------------------------------------------------------
@@ -943,6 +1028,17 @@ def apply_edits(root: Path, edits: list[Edit], backup: bool = True,
             # Claim only sources that still exist at apply time.
             srcs_now = tuple(o for o in srcs if (root_resolved / o).is_file())
             gone = [o for o in srcs if o not in srcs_now]
+            if original is not None and not srcs_now:
+                # Overwriting an existing file with model-composed whole-file
+                # content is the edit-path twin of the `write` action, so it
+                # gets the same fragment guard (a window re-quote from a
+                # partial read would silently erase the rest of the file).
+                # A rename target is exempt: its real content arrives from
+                # the moved source, not from the REPLACE text.
+                refusal = fragment_refusal(rel, original, text)
+                if refusal:
+                    results.append(Result(False, rel, refusal))
+                    continue
             if srcs_now:
                 note += (" -- renamed from " + ", ".join(srcs_now) +
                          " (the moved contents are appended after the new "
@@ -993,6 +1089,7 @@ def apply_edits(root: Path, edits: list[Edit], backup: bool = True,
         text = original
         failed = False
         fuzzy_blocks: list[int] = []
+        already: list[int] = []       # blocks whose REPLACE is already on disk
         # Anchored blocks resolve to (a, b) here for failure messages, and
         # are rewritten to exact-text needles taken from the ORIGINAL file,
         # so an earlier block in the same group cannot shift their lines and
@@ -1037,13 +1134,28 @@ def apply_edits(root: Path, edits: list[Edit], backup: bool = True,
                 e = Edit(e.file, needle, repl)
             if not e.search.strip():
                 # An empty SEARCH mixed in with real edits replaces the WHOLE
-                # text that later blocks anchor against.
-                text = e.replace if not e.replace or e.replace.endswith("\n") \
+                # text that later blocks anchor against. That replacement is
+                # model-composed whole-file content, so it gets the same
+                # fragment guard the `write` action applies.
+                whole = e.replace if not e.replace or e.replace.endswith("\n") \
                     else e.replace + "\n"
+                refusal = fragment_refusal(rel, text, whole)
+                if refusal:
+                    results.append(Result(False, rel, f"block {k}: {refusal}"))
+                    failed = True
+                    break
+                text = whole
                 continue
             span = locate(text, e.search, cfg, replacement=e.replace)
             if span is None:
                 n = text.count(e.search)
+                if n == 0 and _replace_already_present(text, e.replace):
+                    # The block was already applied -- typically a gather
+                    # write landed it before the answer phase, so the SEARCH
+                    # no longer matches but the REPLACE content is on disk.
+                    # Score it clean instead of failing the whole file.
+                    already.append(k)
+                    continue
                 if k in anchored:
                     a, b = anchored[k]
                     why = (f"anchored range LINES {a}-{b} cannot be applied: "
@@ -1068,6 +1180,14 @@ def apply_edits(root: Path, edits: list[Edit], backup: bool = True,
                 results.append(Result(False, rel, f"block {k}: {why}"))
                 failed = True
                 break
+            if _replace_already_present(text, e.replace, span.start):
+                # The replacement already sits verbatim at the matched span:
+                # a repair round re-emitted an append-style block whose
+                # content landed in an earlier round. Applying again would
+                # duplicate it (the triple-appended test pair), so score the
+                # block as already applied.
+                already.append(k)
+                continue
             text = text[:span.start] + span.replacement + text[span.stop:]
             if span.fuzzy:
                 fuzzy_blocks.append(k)
@@ -1075,7 +1195,22 @@ def apply_edits(root: Path, edits: list[Edit], backup: bool = True,
         if failed:
             continue
 
+        if text == original and already:
+            # Every block was already applied: nothing to write. Rewriting
+            # the identical bytes would still count the file as changed
+            # (backup, reindex, post-edit hooks) for nothing.
+            results.append(Result(
+                True, rel,
+                "no change: block(s) "
+                + ", ".join(str(b) for b in already)
+                + " already applied -- their REPLACE content is present in "
+                  "the file"))
+            continue
+
         note = f"applied {len(group)} block(s)"
+        if already:
+            note += (" [block(s) " + ", ".join(str(b) for b in already)
+                     + " already applied -- content present, left as-is]")
         if fuzzy_blocks:
             note += (" [matched approximately on block"
                      + ("s " if len(fuzzy_blocks) > 1 else " ")

@@ -279,14 +279,61 @@ def edit_format(cfg, full: str, pack: str | None = None) -> str:
     return _TINY_EDIT if pack == "tiny" else full
 
 
-def answer_system(cfg, full_edit_format: str) -> str:
-    """The default answer-phase system prompt for the run."""
+# --------------------------------------------------------------------------
+# Value-bound test rules
+# --------------------------------------------------------------------------
+# Rides along with the answer brief for tasks that touch tests. A
+# tautological test -- an expectation computed with the code under test, or a
+# bare shape check -- passes on a seeded bug; the deepclitest runs kept
+# shipping exactly those, and only hand-computed literals caught the plants.
+_TEST_TASK_RE = re.compile(r"(?i)\btests?\b|\bpytest\b|\bcoverage\b")
+
+TEST_RULES = """\
+Rules for tests:
+- Bind every expected value to a concrete literal you worked out yourself,
+  from the spec or by hand for that input (`assert total == 25.92`). Never
+  compute the expectation by calling the code under test, and never restate
+  its formula in the assertion: a test that mirrors the implementation
+  passes even when the implementation is wrong.
+- Shape checks (`is not None`, `isinstance(...)`, `len(x) > 0`) may support a
+  test but never carry it alone.
+- Cover the boundary the spec names: empty input, zero, the threshold itself,
+  one past it.
+- When an existing test fails after your change, fix the CODE. Change the
+  test only when it contradicts the task or spec, and say so explicitly;
+  never weaken or delete an assertion just to turn a red test green."""
+
+_TINY_TEST_RULES = """\
+In tests, assert concrete literal values you worked out from the spec (never
+compute the expectation with the code under test), and turn a red test green
+by fixing the code -- never by weakening the assertion."""
+
+
+def wants_tests(task: str) -> bool:
+    """True when the task text is about tests, so the answer brief should
+    carry the value-bound rules."""
+    return bool(_TEST_TASK_RE.search(task or ""))
+
+
+def test_rules(cfg) -> str:
+    """The value-bound test rules at this run's density."""
+    return _TINY_TEST_RULES if pack_for(cfg) == "tiny" else TEST_RULES
+
+
+def answer_system(cfg, full_edit_format: str, task: str = "") -> str:
+    """The default answer-phase system prompt for the run. A task about
+    tests also gets the value-bound rules -- they cost tokens, so they only
+    ride along when tests are actually in play. A project or user override
+    of `answer` replaces the whole brief."""
     override = load_override(cfg, "answer")
     if override:
         return override
-    return ("You are a code assistant. You have a map of the project and the "
+    text = ("You are a code assistant. You have a map of the project and the "
             "specific\nsource you asked to see. Complete the user's task.\n\n"
             + edit_format(cfg, full_edit_format))
+    if wants_tests(task):
+        text += "\n\n" + test_rules(cfg)
+    return text
 
 
 # --------------------------------------------------------------------------

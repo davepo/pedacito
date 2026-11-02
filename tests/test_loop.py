@@ -2485,6 +2485,124 @@ def test_run_task_propagates_a_reask_no_changes_reply(tmp_path):
     assert "honored as a refusal" in log
 
 
+def test_gather_only_run_is_verified_not_escalated(tmp_path, monkeypatch):
+    """O2: a worker that finishes the task during the LOOKUP phase (rename/
+    write actions -- the deepclitest pattern) and emits no answer-phase edit
+    blocks used to end with no hook, no impacted-test run, an empty `changed`,
+    a re-ask that invites fabricated no-op blocks, an escalation re-run
+    against mutated disk, and a "no valid edit was produced" failure-memory
+    note. The gather-mutation ledger makes the run first-class: the tests run
+    over the gathered files, they join `changed`, and re-ask, escalation and
+    the failure note all stand down."""
+    (tmp_path / "pricing.py").write_text(
+        "def apply_discount(p):\n    return p\n", encoding="utf-8")
+    idx = types.SimpleNamespace(root=tmp_path)
+    cfg = _cfg()
+    cfg.verify_tests = True
+    cfg.allow_shell = True
+    ran = []
+    monkeypatch.setattr(loop, "_run_tests",
+                        lambda idx_, cfg_, files: ran.append(list(files))
+                        or (True, "1 passed", "tests/test_pricing.py"))
+    from pedacito import memory as memory_mod
+    noted = []
+    monkeypatch.setattr(memory_mod, "note_attempt",
+                        lambda *a, **k: noted.append(a))
+    answers = []
+
+    class FakeAgent:
+        steps_log = ["1. read pricing.py  (def apply_discount...)"]
+
+        def __init__(self):
+            self.index = idx
+
+        def gather(self, task, **kw):
+            from pedacito import tools
+            (tmp_path / "pricing.py").write_text(
+                "def discounted_price(p):\n    return p * 0.9\n",
+                encoding="utf-8")
+            tools._note_mutation(cfg, "pricing.py")
+            return "gathered source"
+
+        def answer(self, task, gathered, **kw):
+            answers.append(task)
+            return ("Done: renamed apply_discount to discounted_price with "
+                    "the rename action during the lookup phase.")
+
+        def apply(self, reply, **kw):
+            return ([], reply)
+
+    tr = loop.run_task(tmp_path, cfg, None, FakeAgent(), idx,
+                       "Rename apply_discount to discounted_price everywhere",
+                       apply=True)
+    assert len(answers) == 1               # no re-ask for "real" blocks
+    assert ran == [["pricing.py"]]         # impacted tests ran over the file
+    assert tr.tests_ok is True
+    assert tr.changed == ["pricing.py"]
+    assert tr.results == [] and not tr.fabricated
+    assert noted == []                     # work landed: no failure memory
+    from pedacito import workspace
+    log = workspace.run_log_path(tmp_path).read_text()
+    assert "no edit blocks parsed" not in log
+
+
+def test_run_loop_accepts_gather_only_progress(tmp_path, monkeypatch):
+    """O2, outer loop: a task whose work landed through gather actions
+    (empty results, non-empty `changed`) is progress -- run_loop marks it
+    done instead of failing it as "produced no applied edits"."""
+    plan = tmp_path / "PLAN.md"
+    loop.write_plan(plan, "goal", ["Rename the helper everywhere"])
+    idx = types.SimpleNamespace(root=tmp_path)
+
+    def fake_run_task(root, cfg, client, agent, idx_, task, apply=True,
+                      review=False, answer_system=None):
+        return loop.TaskResult([], "Done via the rename action.", True,
+                               ["pkg/core.py"], idx_)
+
+    monkeypatch.setattr(loop, "run_task", fake_run_task)
+    code = loop.run_loop(tmp_path, _cfg(), None, idx, plan, apply=True)
+    assert code == 0
+    assert "- [x] Rename the helper everywhere" in plan.read_text()
+
+
+def test_run_loop_strict_flags_unclean_tasks(tmp_path, monkeypatch):
+    """O6: with --strict the run's exit code reports a task that landed
+    edits but is not clean -- it left a failed edit block (a partial
+    application) or impacted tests still red after the repair rounds -- as
+    1, even though the task itself is ticked done. Without it both exit 0
+    and only the run log notes the problem."""
+    idx = types.SimpleNamespace(root=tmp_path)
+    ok_block = types.SimpleNamespace(ok=True, file="a.py",
+                                     message="applied 1 block(s)")
+    bad_block = types.SimpleNamespace(ok=False, file="a.py",
+                                      message="block 2: search block not found")
+    n = [0]
+
+    def run_once(tr, *, strict):
+        n[0] += 1
+        plan = tmp_path / f"PLAN-{n[0]}.md"
+        loop.write_plan(plan, "goal", ["Fix the discount"])
+        monkeypatch.setattr(loop, "run_task", lambda *a, **k: tr)
+        code = loop.run_loop(tmp_path, _cfg(), None, idx, plan, apply=True,
+                             strict=strict)
+        # the task is still ticked done: strict changes the exit code, not
+        # the plan's bookkeeping
+        assert "- [x] Fix the discount" in plan.read_text()
+        return code
+
+    partial = loop.TaskResult([ok_block, bad_block], "done", True,
+                              ["a.py"], idx)
+    assert run_once(partial, strict=True) == 1
+    assert run_once(partial, strict=False) == 0
+    red = loop.TaskResult([ok_block], "done", True, ["a.py"], idx,
+                          tests_ok=False)
+    assert run_once(red, strict=True) == 1
+    assert run_once(red, strict=False) == 0
+    clean = loop.TaskResult([ok_block], "done", True, ["a.py"], idx,
+                            tests_ok=True)
+    assert run_once(clean, strict=True) == 0
+
+
 def test_is_noop_matches_the_refusal_phrasing_models_actually_use():
     """Fix X2, pattern side: run 13d's FIRST repair reply -- "No code
     edit is appropriate here" -- matched none of the _is_noop patterns

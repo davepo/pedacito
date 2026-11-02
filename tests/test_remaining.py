@@ -156,6 +156,35 @@ def test_should_plan_respects_threshold(tmp_path):
     assert not plan.should_plan("fix a typo", agent.index, agent.cfg)
 
 
+def test_wide_task_plans_even_with_the_threshold_off(tmp_path):
+    """P11: a task that names WIDE_TASK_FILES or more files gets planned even
+    when plan_threshold is 0 -- the default, and what a strong model's card
+    picks. One window cannot hold the lookups for that many files, and the
+    deepclitest runs kept losing the tail of exactly those tasks. The card's
+    0 is not a user opt-out (it measured skill on small probes, not window
+    capacity); an explicit config plan_threshold still governs."""
+    files = dict(SRC)
+    files.update({f"pkg/extra{i}.py": f"def f{i}():\n    return {i}\n"
+                  for i in range(4)})
+    agent = _agent(tmp_path, Scripted(), files)
+    wide = ("touch pkg/core.py, pkg/shop.py, pkg/other.py, pkg/extra0.py "
+            "and pkg/extra1.py")
+    agent.cfg.plan_threshold = 0
+    agent.cfg.sources = {}                            # the default origin
+    assert plan.should_plan(wide, agent.index, agent.cfg)
+    assert not plan.should_plan("fix a typo in pkg/core.py",
+                                agent.index, agent.cfg)
+    # a model card's 0 does not silence the wide rule ...
+    agent.cfg.sources = {"plan_threshold": "model card"}
+    assert plan.should_plan(wide, agent.index, agent.cfg)
+    # ... an explicit user setting does, whatever its value
+    agent.cfg.sources = {"plan_threshold": "config file (/x/pedacito.toml)"}
+    assert not plan.should_plan(wide, agent.index, agent.cfg)
+    agent.cfg.plan_threshold = 2
+    assert plan.should_plan("update pkg/core.py and pkg/shop.py",
+                            agent.index, agent.cfg)
+
+
 @pytest.mark.skipif(
     os.name == "nt", reason="Windows steering reads the console, not a pipe")
 def test_steering_reads_lines_from_a_pipe():
@@ -230,6 +259,112 @@ def test_rename_refuses_ambiguous_and_taken_names(tmp_path):
         agent2.index, agent2.cfg, "apply_discount", "class")
     ro = _agent(tmp_path / "c", Scripted(), SRC, allow_write=False)
     assert "allow_write" in refactor.tool_rename(ro.index, ro.cfg, "apply_discount", "z")
+
+
+def test_mutating_actions_fill_the_task_mutation_ledger(tmp_path):
+    """O2: every gather-phase tool action that writes records the files it
+    touched on cfg._task_mutations, so the task loop can verify a gather-only
+    run's work (hooks, impacted tests, lint) even when the answer phase
+    produces no edit block at all."""
+    agent = _agent(tmp_path, Scripted(), SRC, allow_write=True)
+    cfg = agent.cfg
+    out = refactor.tool_rename(agent.index, cfg, "apply_discount", "discounted")
+    assert out.startswith("RENAMED")
+    assert set(cfg._task_mutations) == {"pkg/core.py", "pkg/shop.py"}
+    assert tools.tool_write(agent.index, cfg, "pkg/notes.md",
+                            "# notes\n").startswith("CREATED")
+    assert tools.tool_move(agent.index, cfg, "pkg/notes.md",
+                           "pkg/NOTES.md").startswith("MOVED")
+    assert tools.tool_delete(agent.index, cfg,
+                             "pkg/NOTES.md").startswith("DELETED")
+    # A move records both endpoints; touching a recorded path again does not
+    # duplicate it (the ledger stays ordered and duplicate-free).
+    assert cfg._task_mutations[-2:] == ["pkg/notes.md", "pkg/NOTES.md"]
+    assert set(cfg._task_mutations) == {"pkg/core.py", "pkg/shop.py",
+                                        "pkg/notes.md", "pkg/NOTES.md"}
+    assert len(cfg._task_mutations) == 4
+
+
+def test_undo_reverts_every_mutation_of_the_task(tmp_path):
+    """P8: a gather-phase worker whose mutations went wrong gets its files
+    back from the task's snapshot dir instead of rewriting them from memory
+    (which is how botched renames ended in half-remembered files): the
+    overwritten file returns to its pre-task bytes, created files go away,
+    and a move un-happens at both endpoints."""
+    from pedacito import workspace
+    agent = _agent(tmp_path, Scripted(), SRC, allow_write=True, backup=True)
+    cfg = agent.cfg
+    cfg._backup_dir = workspace.new_backup_dir(tmp_path)
+    assert tools.tool_write(agent.index, cfg, "pkg/core.py",
+                            "BROKEN = True\n").startswith("WROTE")
+    assert tools.tool_write(agent.index, cfg, "pkg/notes.md",
+                            "# notes\n").startswith("CREATED")
+    assert tools.tool_move(agent.index, cfg, "pkg/shop.py",
+                           "pkg/store.py").startswith("MOVED")
+    out = tools.tool_undo(agent.index, cfg, "")
+    assert "UNDONE (pre-task contents restored)" in out
+    assert "REMOVED (created by this task" in out
+    assert (tmp_path / "pkg/core.py").read_text() == SRC["pkg/core.py"]
+    assert (tmp_path / "pkg/shop.py").read_text() == SRC["pkg/shop.py"]
+    assert not (tmp_path / "pkg/notes.md").exists()
+    assert not (tmp_path / "pkg/store.py").exists()
+    # the index sees the restored world again
+    assert agent.index.resolve_file("shop.py") == "pkg/shop.py"
+    assert agent.index.resolve_file("store.py") is None
+
+
+def test_undo_one_file_leaves_the_other_mutations_alone(tmp_path):
+    from pedacito import workspace
+    agent = _agent(tmp_path, Scripted(), SRC, allow_write=True, backup=True)
+    cfg = agent.cfg
+    cfg._backup_dir = workspace.new_backup_dir(tmp_path)
+    # a fresh task has nothing to undo
+    assert "has not mutated any file yet" in tools.tool_undo(
+        agent.index, cfg, "")
+    tools.tool_write(agent.index, cfg, "pkg/core.py", "BROKEN = True\n")
+    tools.tool_write(agent.index, cfg, "pkg/other.py", "BROKEN = True\n")
+    out = tools.tool_undo(agent.index, cfg, "pkg/core.py")
+    assert (tmp_path / "pkg/core.py").read_text() == SRC["pkg/core.py"]
+    assert (tmp_path / "pkg/other.py").read_text() == "BROKEN = True\n"
+    assert "pkg/core.py" in out and "pkg/other.py" not in out
+    # a name the ledger does not know lists what the task actually touched
+    out = tools.tool_undo(agent.index, cfg, "pkg/nope.py")
+    assert "Nothing to undo for 'pkg/nope.py'" in out
+    assert "pkg/other.py" in out
+    # gates: read-only or backups-off runs cannot undo
+    ro = _agent(tmp_path / "ro", Scripted(), SRC, allow_write=False,
+                backup=True)
+    assert "allow_write = false" in tools.tool_undo(ro.index, ro.cfg, "")
+    nb = _agent(tmp_path / "nb", Scripted(), SRC, allow_write=True)
+    assert "backup = false" in tools.tool_undo(nb.index, nb.cfg, "")
+
+
+def test_undo_is_offered_and_dispatched_only_when_it_can_work(tmp_path):
+    # the schema only lists `undo` when snapshots actually exist to undo
+    cfg = Config()
+    cfg.allow_write, cfg.backup = True, True
+    assert "undo" in tools.schema_for(cfg)["properties"]["action"]["enum"]
+    cfg.backup = False
+    assert "undo" not in tools.schema_for(cfg)["properties"]["action"]["enum"]
+    ro = Config()
+    ro.allow_write, ro.backup = False, True
+    assert "undo" not in tools.schema_for(ro)["properties"]["action"]["enum"]
+
+    from pedacito import workspace
+    agent = _agent(tmp_path, Scripted(), SRC, allow_write=True, backup=True)
+    cfg = agent.cfg
+    cfg._backup_dir = workspace.new_backup_dir(tmp_path)
+    tools.dispatch(agent.index, cfg, {"action": "write", "file": "pkg/core.py",
+                                      "content": "BROKEN = True\n"})
+    out = tools.dispatch(agent.index, cfg, {"action": "undo", "file": ""})
+    assert "UNDONE" in out
+    assert (tmp_path / "pkg/core.py").read_text() == SRC["pkg/core.py"]
+    # without write permission the generic mutation gate refuses undo too
+    ro_agent = _agent(tmp_path / "ro", Scripted(), SRC, allow_write=False,
+                      backup=True)
+    out = tools.dispatch(ro_agent.index, ro_agent.cfg,
+                         {"action": "undo", "file": ""})
+    assert "`undo` is disabled" in out
 
 
 def test_rename_text_generic_skips_strings_and_comments():
