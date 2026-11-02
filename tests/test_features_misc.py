@@ -634,6 +634,28 @@ def test_eval_scores_a_correct_edit_with_its_test(tmp_path):
     assert row["calls"] >= 2
 
 
+def test_verify_tests_task_runs_the_post_edit_test_loop(tmp_path, monkeypatch):
+    """A0.5: the py-bulk-off-by-one fixture carries verify_tests, so its run
+    exercises the post-edit test-repair loop (P2 becomes measurable)."""
+    task = next(t for t in evalrun.TASKS if t.id == "py-bulk-off-by-one")
+    assert task.verify_tests is True
+    ran = []
+
+    def fake_impacted(idx, cfg, files):
+        ran.append(list(files))
+        return True, "", "fake impacted tests"
+
+    monkeypatch.setattr(testsel, "run_impacted", fake_impacted)
+    reply = ("Changed the threshold.\n--- FILE: shop/pricing.py\n<<<<<<< SEARCH\n"
+             "    if quantity > 10:\n=======\n    if quantity >= 10:\n>>>>>>> REPLACE\n")
+    row = evalrun.run_task(
+        task, EvalModel(reply, [{"action": "read", "file": "shop/pricing.py",
+                                 "start": 1, "end": 30}]), _eval_cfg(), tmp_path)
+    assert ran, "the post-edit test loop did not run"
+    assert any("pricing.py" in " ".join(f) for f in ran)
+    assert row["passed"]
+
+
 def test_eval_classifies_failures(tmp_path):
     task = next(t for t in evalrun.TASKS if t.id == "py-bulk-off-by-one")
     read = [{"action": "read", "file": "shop/pricing.py", "start": 1, "end": 30}]

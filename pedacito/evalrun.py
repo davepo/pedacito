@@ -222,6 +222,11 @@ class EvalTask:
     test_cmd: str = ""
     injection: bool = False
     hard: bool = False
+    # Run this task's post-edit test-repair loop (`verify_tests`), with shell
+    # allowed inside the sandbox so the impacted tests can actually run. Off
+    # for every other task: the corpus is offline, so only one fixture needs to
+    # measure P2.
+    verify_tests: bool = False
 
 
 TASKS = [
@@ -229,7 +234,7 @@ TASKS = [
              "bulk_discount should give the 10% discount for 10 or more items, "
              "not only for more than 10. Fix it.",
              ["shop/pricing.py"], expect={"shop/pricing.py": ["quantity >= 10"]},
-             test_cmd="tests/test_pricing.py"),
+             test_cmd="tests/test_pricing.py", verify_tests=True),
     EvalTask("py-cart-remove", "pyshop",
              "Add a remove(name) method to Cart that deletes an item and "
              "raises KeyError when the item is not in the cart.",
@@ -463,8 +468,8 @@ def run_task(task: EvalTask, client, cfg, workdir: Path | None = None) -> dict:
         c = copy.copy(cfg)
         c.backup = True
         c.review = False
-        c.allow_shell = False
-        c.verify_tests = False
+        c.allow_shell = task.verify_tests
+        c.verify_tests = task.verify_tests
         c.log_sessions = False
         c.refresh_summaries = 0
         c.sources = dict(cfg.sources or {})
