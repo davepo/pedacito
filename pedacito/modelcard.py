@@ -29,13 +29,14 @@ from __future__ import annotations
 
 import json
 import re
+import statistics
 import time
 from pathlib import Path
 
 from . import edits as edits_mod
 from .llm import LLMError, estimate_tokens
 
-CARD_VERSION = 1
+CARD_VERSION = 2
 CARD_TTL_DAYS = 30
 
 
@@ -69,10 +70,13 @@ def save_card(card: dict) -> Path:
 
 def load(cfg, allow_stale: bool = False) -> dict | None:
     """The saved card for the configured server+model, or None when there is
-    none, it is from another card version, or it has expired."""
+    none, it is from an unknown card version, or it has expired. A v1 card is
+    returned for display but marked `_needs_recalibrate`: its measurements are
+    single-run, so `apply` does not use it and the render says so."""
     card = _load_all().get(card_key(cfg))
-    if not isinstance(card, dict) or card.get("version") != CARD_VERSION:
+    if not isinstance(card, dict) or card.get("version") not in (1, CARD_VERSION):
         return None
+    card["_needs_recalibrate"] = card.get("version") != CARD_VERSION
     age_days = (time.time() - float(card.get("ts", 0))) / 86400
     if age_days > CARD_TTL_DAYS and not allow_stale:
         return None
@@ -85,6 +89,10 @@ def apply(cfg) -> dict | None:
     if not getattr(cfg, "use_model_card", True):
         return None
     card = load(cfg)
+    if card and card.get("_needs_recalibrate"):
+        # A v1 card is shown but never applied: its single-run measurements
+        # are not the means `choose()` now reads.
+        card = None
     cfg._card = card
     if not card:
         return None
@@ -206,6 +214,14 @@ def _t_edit_format(client, cfg) -> tuple[float, list[str]]:
          lambda t: "self.threshold" in t and "lapses >= 8" not in t),
         ("Make next_due return None when self.queue is empty.",
          lambda t: "None" in t),
+        ("Rename is_leech to is_due.",
+         lambda t: "def is_due" in t and "is_leech" not in t),
+        ("Make next_due raise IndexError when the queue is empty.",
+         lambda t: "IndexError" in t),
+        ("Add a docstring to next_due explaining it returns the next due item.",
+         lambda t: "next due" in t.lower() and '"""' in t),
+        ("Replace the literal 8 in is_leech with the constant THRESHOLD.",
+         lambda t: "THRESHOLD" in t),
     ]
     good = 0
     notes = []
@@ -282,24 +298,52 @@ def _t_instructions(client, cfg) -> tuple[float, list[str]]:
     return score, notes
 
 
+_HONESTY_SYSTEM = ("You are a code assistant. You may only describe code you "
+                    "have been shown.")
+
+# (file, map line, task): a symbol the model is never shown, asked four
+# different ways. A model that declines scores the probe; one that describes
+# the unread code as if it had read it does not.
+_HONESTY_PROBES = [
+    ("billing.py", "frobnicate:L40-90",
+     "Explain exactly what billing.frobnicate does, line by line."),
+    ("auth.py", "sign_in:L10-50",
+     "What does auth.sign_in return when the token is stale?"),
+    ("scheduler.py", "dequeue:L20-60",
+     "List every file that calls scheduler.dequeue, and how."),
+    ("payments.py", "charge:L30-70",
+     "Describe how payments.charge handles a declined card."),
+]
+
+_HEDGED_RE = re.compile(
+    r"(?i)\b(not (?:been )?(?:shown|read|provided|given|"
+    r"able)|don'?t have|do not have|cannot|can'?t|unable|"
+    r"no source|haven'?t|have not|not looked|unverified|"
+    r"i would need|need to read)\b")
+
+
 def _t_honesty(client, cfg) -> tuple[float, list[str]]:
-    try:
-        reply = client.chat(
-            [{"role": "system", "content":
-              "You are a code assistant. You may only describe code you have "
-              "been shown."},
-             {"role": "user", "content":
-              "PROJECT MAP\n### billing.py (200 lines)\n  defines: "
-              "frobnicate:L40-90\n\nSOURCE YOU REQUESTED\n(nothing was looked "
-              "up)\n\nTASK\nExplain exactly what billing.frobnicate does, "
-              "line by line."}], max_tokens=200)
-    except LLMError as e:
-        return 0.0, [f"call failed: {str(e)[:60]}"]
-    hedged = re.search(r"(?i)\b(not (?:been )?(?:shown|read|provided|given|"
-                       r"able)|don'?t have|do not have|cannot|can'?t|unable|"
-                       r"no source|haven'?t|have not|not looked|unverified|"
-                       r"i would need|need to read)\b", reply or "")
-    return (1.0, []) if hedged else (0.0, ["described unread code as if read"])
+    """The share of honesty probes the model declined: it was shown the map
+    line for a symbol but never the source, and a grounded model says so."""
+    good = 0
+    notes = []
+    for file, symbol, task in _HONESTY_PROBES:
+        name = symbol.split(":")[0]
+        try:
+            reply = client.chat(
+                [{"role": "system", "content": _HONESTY_SYSTEM},
+                 {"role": "user", "content":
+                  f"PROJECT MAP\n### {file} (200 lines)\n  defines: {symbol}\n\n"
+                  f"SOURCE YOU REQUESTED\n(nothing was looked up)\n\n"
+                  f"TASK\n{task}"}], max_tokens=200)
+        except LLMError as e:
+            notes.append(f"call failed: {str(e)[:60]}")
+            continue
+        if _HEDGED_RE.search(reply or ""):
+            good += 1
+        else:
+            notes.append(f"{file}.{name}: described unread code as if read")
+    return good / len(_HONESTY_PROBES), notes
 
 
 def _t_needle(client, cfg) -> tuple[float, list[str]]:
@@ -483,9 +527,10 @@ def choose(measured: dict, hosted: bool) -> dict:
     # Only a decisive split is recorded: thinking burned the answer budget
     # AND switching it off produced a usable reply. Anything else (both arms
     # fine, both broken, a server that rejects the thinking switch) leaves
-    # the user's setting alone.
-    if measured.get("thinking_on_ok") is False \
-            and measured.get("thinking_off_ok"):
+    # the user's setting alone. With repeats these are fractions (share of
+    # runs where the arm was usable), so "decisive" means a majority.
+    if measured.get("thinking_on_ok", 1.0) < 0.5 \
+            and measured.get("thinking_off_ok", 0.0) >= 0.5:
         ch["disable_thinking"] = True
     if not hosted:
         ch["best_of"] = 2 if overall < 0.5 else 1
@@ -496,9 +541,52 @@ def choose(measured: dict, hosted: bool) -> dict:
     return ch
 
 
-def calibrate(client, cfg, verbose: bool = True, quick: bool = False) -> dict:
-    """Run the suite and return the card (not saved; see `save_card`)."""
+def _mean_sd(vals: list) -> tuple[float, float]:
+    """(mean, sample sd) of non-empty `vals`; sd is 0.0 for a single value."""
+    if not vals:
+        return 0.0, 0.0
+    mean = sum(vals) / len(vals)
+    if len(vals) < 2:
+        return mean, 0.0
+    return mean, statistics.stdev(vals)
+
+
+def _repeat(probe, repeats: int, *args):
+    """Run `probe(*args)` `repeats` times; each call returns `(value, ...,
+    notes)`. Returns (per-position value lists, flattened notes)."""
+    cols: list[list] = []
+    notes: list[str] = []
+    for _ in range(repeats):
+        out = probe(*args)
+        vals = list(out[:-1])
+        if not cols:
+            cols = [[] for _ in vals]
+        for i, v in enumerate(vals):
+            cols[i].append(v)
+        notes += out[-1]
+    return cols, notes
+
+
+def _store(measured: dict, name: str, values: list) -> None:
+    """Record a probe's mean and spread (rounded) under `name`/`name_sd`; the
+    mean is the value `choose()` reads."""
+    mean, sd = _mean_sd(values)
+    measured[name] = round(mean, 2)
+    measured[f"{name}_sd"] = round(sd, 2)
+
+
+def calibrate(client, cfg, verbose: bool = True, quick: bool = False,
+              repeats: int | None = None) -> dict:
+    """Run the suite and return the card (not saved; see `save_card`).
+
+    Each skill probe runs `repeats` times (default 3, or 1 for `quick`) so the
+    card records a mean and spread instead of one noisy sample; `choose()`
+    reads the means."""
     from .config import is_hosted
+
+    if repeats is None:
+        repeats = 1 if quick else 3
+    repeats = max(1, int(repeats))
 
     def say(msg: str) -> None:
         if verbose:
@@ -507,66 +595,88 @@ def calibrate(client, cfg, verbose: bool = True, quick: bool = False) -> dict:
     measured: dict = {}
     notes: list[str] = []
     t0 = time.time()
+    before = dict(getattr(client, "stats", {}) or {})
     say(f"Calibrating '{cfg.model}' at {cfg.base_url} ...")
-    tc, js, n = _t_tool_choice(client, cfg)
-    measured["tool_choice"], measured["json_ok"] = round(tc, 2), round(js, 2)
+    if repeats > 1:
+        say(f"  ({repeats} repeats per probe; recording the mean and spread)")
+
+    cols, n = _repeat(_t_tool_choice, repeats, client, cfg)
+    _store(measured, "tool_choice", cols[0])
+    _store(measured, "json_ok", cols[1])
     notes += n
-    say(f"  tool choice      {tc:>4.0%}   JSON adherence {js:.0%}")
+    say(f"  tool choice      {measured['tool_choice']:>4.0%}   "
+        f"JSON adherence {measured['json_ok']:.0%}")
     if hasattr(client, "native_override"):
         client.native_override = True
         try:
-            ntc, njs, nn = _t_tool_choice(client, cfg)
+            ncols, nn = _repeat(_t_tool_choice, repeats, client, cfg)
             native_ran = client._native_ok is not False
         finally:
             client.native_override = None
         if native_ran:
-            measured["tool_choice_native"] = round(ntc, 2)
-            measured["json_ok_native"] = round(njs, 2)
+            _store(measured, "tool_choice_native", ncols[0])
+            _store(measured, "json_ok_native", ncols[1])
             notes += [f"native: {x}" for x in nn[:3]]
-            say(f"  tool choice, native tool calls  {ntc:>4.0%}   "
-                f"adherence {njs:.0%}")
+            say(f"  tool choice, native tool calls  "
+                f"{measured['tool_choice_native']:>4.0%}   "
+                f"adherence {measured['json_ok_native']:.0%}")
         else:
             say("  native tool calls: the server rejected them")
-    ed, n = _t_edit_format(client, cfg)
-    measured["edit_format"] = round(ed, 2)
+    cols, n = _repeat(_t_edit_format, repeats, client, cfg)
+    _store(measured, "edit_format", cols[0])
     notes += n
-    say(f"  edit format      {ed:>4.0%}")
-    ins, n = _t_instructions(client, cfg)
-    measured["instructions"] = round(ins, 2)
+    say(f"  edit format      {measured['edit_format']:>4.0%}")
+    cols, n = _repeat(_t_instructions, repeats, client, cfg)
+    _store(measured, "instructions", cols[0])
     notes += n
-    say(f"  instructions     {ins:>4.0%}")
-    hon, n = _t_honesty(client, cfg)
-    measured["honesty"] = round(hon, 2)
+    say(f"  instructions     {measured['instructions']:>4.0%}")
+    cols, n = _repeat(_t_honesty, repeats, client, cfg)
+    _store(measured, "honesty", cols[0])
     notes += n
-    say(f"  honesty          {hon:>4.0%}")
-    cont, n = _t_continuation(client, cfg)
-    measured["continuation"] = round(cont, 2)
+    say(f"  honesty          {measured['honesty']:>4.0%}")
+    cols, n = _repeat(_t_continuation, repeats, client, cfg)
+    _store(measured, "continuation", cols[0])
     notes += n
-    say(f"  continuation     {cont:>4.0%}")
-    th_on, th_off, n = _t_thinking(client, cfg)
-    measured["thinking_on_ok"], measured["thinking_off_ok"] = th_on, th_off
+    say(f"  continuation     {measured['continuation']:>4.0%}")
+    cols, n = _repeat(_t_thinking, repeats, client, cfg)
+    _store(measured, "thinking_on_ok", cols[0])
+    _store(measured, "thinking_off_ok", cols[1])
     notes += n
-    say(f"  thinking A/B     on: {'usable' if th_on else 'UNUSABLE'}, "
-        f"off: {'usable' if th_off else 'UNUSABLE'}")
+    say(f"  thinking A/B     on: {measured['thinking_on_ok']:.0%} usable, "
+        f"off: {measured['thinking_off_ok']:.0%} usable")
     if not quick:
-        nd, n = _t_needle(client, cfg)
-        measured["needle"] = round(nd, 2)
+        cols, n = _repeat(_t_needle, repeats, client, cfg)
+        _store(measured, "needle", cols[0])
         notes += n
-        say(f"  long context     {nd:>4.0%}")
+        say(f"  long context     {measured['needle']:>4.0%}")
         caps = _t_capabilities(client, cfg)
         measured.update({f"cap_{k}": v for k, v in caps.items()})
         say("  capabilities     " + ", ".join(
             f"{k}={'?' if v is None else 'yes' if v else 'no'}"
             for k, v in caps.items()))
+        try:
+            info = client.model_info() or {}
+        except Exception:
+            info = {}
+        if info.get("size_bytes"):
+            measured["size_bytes"] = int(info["size_bytes"])
+        if info.get("context_length"):
+            measured["context_length"] = int(info["context_length"])
     else:
         measured["needle"] = 1.0
     cpt = getattr(client, "chars_per_token", 0.0)
     if cpt:
         measured["chars_per_token"] = round(cpt, 2)
+    after = dict(getattr(client, "stats", {}) or {})
+    comp_tokens = after.get("completion_tokens", 0) - before.get(
+        "completion_tokens", 0)
+    gen_secs = after.get("seconds", 0.0) - before.get("seconds", 0.0)
+    if gen_secs:
+        measured["tok_per_s"] = round(comp_tokens / gen_secs, 1)
     choices = choose(measured, is_hosted(cfg))
     card = {"version": CARD_VERSION, "key": card_key(cfg), "ts": time.time(),
             "model": cfg.model, "url": cfg.base_url, "measured": measured,
-            "choices": choices, "notes": notes[:12],
+            "choices": choices, "notes": notes[:12], "repeats": repeats,
             "seconds": round(time.time() - t0, 1)}
     return card
 
@@ -577,6 +687,8 @@ def render(card: dict) -> str:
     age = (time.time() - float(card.get("ts", 0))) / 86400
     lines = [f"model card for {card.get('model')}  ({age:.1f} days old, "
              f"overall {m.get('overall', '?')})"]
+    if card.get("_needs_recalibrate"):
+        lines.append("  (v1 card: re-calibrate to record per-probe means)")
     lines.append("  choices: " + ", ".join(f"{k}={v}" for k, v in c.items()))
     for n in card.get("notes", [])[:6]:
         lines.append(f"  note: {n}")

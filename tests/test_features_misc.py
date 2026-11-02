@@ -478,16 +478,31 @@ class Model:
             return "{'action': 'read'}"
         if "OK:" in messages[0]["content"]:
             return "OK: x is 1"
-        if "billing.py" in last:
-            return "I have not been shown the source of frobnicate, so I cannot say."
+        if "nothing was looked up" in last:
+            return "I have not been shown that source, so I cannot say."
         if "SECRET_PORT" in last:
             return "48213"
-        if "threshold from 8" in last:
-            return ("Done.\n--- FILE: src/m.py\n<<<<<<< SEARCH\n    return lapses >= 8\n"
+        if "threshold from 8 to self.threshold" in last:
+            return ("--- FILE: src/m.py\n<<<<<<< SEARCH\n    return lapses >= 8\n"
                     "=======\n    return lapses >= self.threshold\n>>>>>>> REPLACE")
-        if "next_due" in last:
+        if "return None when self.queue is empty" in last:
             return ("--- FILE: src/m.py\n<<<<<<< SEARCH\n    return self.queue[0]\n"
-                    "=======\n    return self.queue[0] if self.queue else None\n>>>>>>> REPLACE")
+                    "=======\n    return self.queue[0] if self.queue else None\n"
+                    ">>>>>>> REPLACE")
+        if "Rename is_leech" in last:
+            return ("--- FILE: src/m.py\n<<<<<<< SEARCH\ndef is_leech(self, lapses):\n"
+                    "=======\ndef is_due(self, lapses):\n>>>>>>> REPLACE")
+        if "IndexError" in last:
+            return ("--- FILE: src/m.py\n<<<<<<< SEARCH\n    return self.queue[0]\n"
+                    "=======\n    if not self.queue:\n        raise IndexError("
+                    "'empty queue')\n    return self.queue[0]\n>>>>>>> REPLACE")
+        if "docstring" in last:
+            return ("--- FILE: src/m.py\n<<<<<<< SEARCH\ndef next_due(self):\n"
+                    "=======\ndef next_due(self):\n    \"\"\"Return the next due "
+                    "item.\"\"\"\n>>>>>>> REPLACE")
+        if "THRESHOLD" in last:
+            return ("--- FILE: src/m.py\n<<<<<<< SEARCH\n    return lapses >= 8\n"
+                    "=======\n    return lapses >= THRESHOLD\n>>>>>>> REPLACE")
         return ("--- FILE: src/m.py\n<<<<<<< SEARCH\n    return lapses >= 8\n=======\n"
                 "    return lapses >= 10\n>>>>>>> REPLACE")
 
@@ -559,15 +574,15 @@ def test_calibration_persists_the_thinking_verdict(home):
     round-trip per call) to rediscover it every time."""
     card = modelcard.calibrate(Thinker(True), Config(), verbose=False,
                                quick=True)
-    assert card["measured"]["thinking_on_ok"] is False
-    assert card["measured"]["thinking_off_ok"] is True
+    assert card["measured"]["thinking_on_ok"] == 0.0
+    assert card["measured"]["thinking_off_ok"] == 1.0
     assert card["choices"]["disable_thinking"] is True
     assert any("hidden reasoning" in n for n in card["notes"])
     # a model that answers fine with thinking on: no verdict, the user's
     # setting stays untouched
     ok = modelcard.calibrate(Model(True), Config(), verbose=False, quick=True)
-    assert ok["measured"]["thinking_on_ok"] is True
-    assert ok["measured"]["thinking_off_ok"] is True
+    assert ok["measured"]["thinking_on_ok"] == 1.0
+    assert ok["measured"]["thinking_off_ok"] == 1.0
     assert "disable_thinking" not in ok["choices"]
 
 
@@ -586,6 +601,65 @@ def test_apply_fills_disable_thinking_only_when_unset(home):
     explicit.disable_thinking = False
     modelcard.apply(explicit)
     assert explicit.disable_thinking is False       # the user's word wins
+
+
+def test_calibration_repeats_record_mean_and_spread(home):
+    """A0.6: each probe runs N times; the card stores a mean and spread."""
+    card = modelcard.calibrate(Model(True), Config(), verbose=False,
+                               quick=True, repeats=3)
+    assert card["repeats"] == 3 and card["version"] == modelcard.CARD_VERSION
+    m = card["measured"]
+    for key in ("tool_choice", "json_ok", "edit_format", "instructions",
+                "honesty", "continuation", "thinking_on_ok", "thinking_off_ok"):
+        assert key in m and f"{key}_sd" in m
+    assert m["tool_choice"] == 1.0 and m["tool_choice_sd"] == 0.0
+    assert m["honesty"] == 1.0 and m["honesty_sd"] == 0.0
+    # quick still defaults to one repeat
+    assert modelcard.calibrate(Model(True), Config(), verbose=False,
+                               quick=True)["repeats"] == 1
+
+
+def test_calibration_probes_are_expanded():
+    """A0.6: 3 honesty variants and 4 edit-format tasks join the suite."""
+    assert len(modelcard._HONESTY_PROBES) == 4
+
+    class Partial(Model):
+        def chat(self, messages, max_tokens, **kw):
+            last = messages[-1]["content"]
+            if "scheduler.dequeue" in last:
+                return "dequeue pops the head of the queue."  # hallucinated
+            return super().chat(messages, max_tokens, **kw)
+
+    card = modelcard.calibrate(Partial(), Config(), verbose=False, quick=True)
+    assert card["measured"]["honesty"] == 0.75          # 3 of 4 hedged
+    # a model that answers every edit task gets the full score (6 tasks)
+    assert modelcard.calibrate(Model(True), Config(), verbose=False,
+                               quick=True)["measured"]["edit_format"] == 1.0
+
+
+def test_v1_card_is_shown_but_not_applied(home):
+    """B0: a v1 card still loads (marked re-calibrate) but does not apply."""
+    card = modelcard.calibrate(Model(True), Config(), verbose=False, quick=True)
+    card["version"] = 1
+    modelcard.save_card(card)
+    loaded = modelcard.load(Config())
+    assert loaded and loaded["_needs_recalibrate"]
+    assert "re-calibrate" in modelcard.render(loaded)
+    fresh = Config()
+    fresh.sources = {}
+    assert modelcard.apply(fresh) is None
+    assert getattr(fresh, "_card", None) is None
+
+
+def test_choose_reads_means_not_the_first_sample():
+    """A0.6: `choose()` reads the per-probe mean; `_sd` is metadata only."""
+    base = {"tool_choice": 0.6, "json_ok": 1.0, "edit_format": 1,
+            "instructions": 1, "honesty": 1, "needle": 1, "continuation": 1}
+    noisy = dict(base)
+    noisy["tool_choice"] = 0.6          # the mean, with a spread recorded
+    noisy["tool_choice_sd"] = 0.4
+    assert modelcard.choose(noisy, False)["prompt_pack"] \
+        == modelcard.choose(base, False)["prompt_pack"]
 
 
 # ------------------------------------------------------------------- eval runner

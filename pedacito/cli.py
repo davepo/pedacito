@@ -874,7 +874,8 @@ def _cmd_calibrate(args, cfg) -> int:
     client = LLMClient(cfg)
     client.check()
     client.warmup()
-    card = modelcard.calibrate(client, cfg, verbose=True, quick=args.quick)
+    card = modelcard.calibrate(client, cfg, verbose=True, quick=args.quick,
+                               repeats=getattr(args, "repeats", None))
     path = modelcard.save_card(card)
     print()
     print(modelcard.render(card))
@@ -1499,6 +1500,9 @@ def _main(argv=None) -> int:
                        help="measure again even if a fresh card exists")
     p_cal.add_argument("--quick", action="store_true",
                        help="skip the long-context and capability probes")
+    p_cal.add_argument("--repeats", type=int, default=None,
+                       help="run each probe this many times (default: 3, or 1 "
+                            "with --quick) and record the mean and spread")
     for flag in ("--url", "--model", "--config", "--profile"):
         p_cal.add_argument(flag)
     p_cal.add_argument("--root", default=None)
