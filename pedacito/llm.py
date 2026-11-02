@@ -151,6 +151,21 @@ def _positive_int(value) -> int | None:
     return n if n > 0 else None
 
 
+def _usage_tokens(usage: dict, *names: str) -> int:
+    """The first non-zero integer for any of `names`, looked up at the usage
+    payload's top level and then inside `prompt_tokens_details` (providers put
+    cache fields in either place)."""
+    details = usage.get("prompt_tokens_details")
+    if not isinstance(details, dict):
+        details = {}
+    for name in names:
+        for source in (usage, details):
+            n = _positive_int(source.get(name))
+            if n:
+                return n
+    return 0
+
+
 def _is_remote(base_url: str) -> bool:
     try:
         host = (urlparse(base_url).hostname or "").lower()
@@ -873,8 +888,8 @@ class LLMClient:
             "Authorization": f"Bearer {cfg.api_key}",
         }
         self.stats = {"calls": 0, "prompt_tokens": 0, "completion_tokens": 0,
-                      "cached_tokens": 0, "seconds": 0.0, "cost": 0.0,
-                      "by_site": {}}
+                      "cached_tokens": 0, "cache_write_tokens": 0,
+                      "seconds": 0.0, "cost": 0.0, "by_site": {}}
         self._session = requests.Session()
         self._session_used = False
         self._stats_lock = threading.Lock()
@@ -1369,35 +1384,43 @@ class LLMClient:
             # per-task summary still mean something.
             pt = prompt_est
             ct = self.estimate_tokens(out_text) if out_text else 0
-        details = usage.get("prompt_tokens_details") or {}
-        cached = int(details.get("cached_tokens") or 0) if isinstance(
-            details, dict) else 0
-        cached = cached or int(usage.get("prompt_cache_hit_tokens") or 0) \
-            or int((timings or {}).get("cache_n") or 0)
+        # Cache reads: OpenAI `cached_tokens`, DeepSeek's implicit hit tokens,
+        # Anthropic/DashScope `cache_read_input_tokens`, or a local server's KV
+        # reuse. Cache writes are the explicit-cache creation tokens.
+        cached = _usage_tokens(usage, "cached_tokens", "prompt_cache_hit_tokens",
+                               "cache_read_input_tokens")
+        cached = cached or (_positive_int((timings or {}).get("cache_n")) or 0)
+        written = _usage_tokens(usage, "cache_creation_input_tokens",
+                                "cache_write_tokens")
         cost = 0.0
         p_in = float(getattr(self.cfg, "price_input_per_mtok", 0) or 0)
         p_out = float(getattr(self.cfg, "price_output_per_mtok", 0) or 0)
         p_cached = float(getattr(self.cfg, "price_cached_per_mtok", 0) or 0)
+        p_write = float(getattr(self.cfg, "price_cache_write_per_mtok", 0) or 0)
         if p_in or p_out:
-            fresh = max(0, pt - cached)
+            fresh = max(0, pt - cached - written)
             cost = (fresh * p_in + cached * (p_cached or p_in)
+                    + written * (p_write or p_in)
                     + ct * p_out) / 1_000_000
         site = self.site or "call"
         with self._stats_lock:      # summaries may run on several threads
             self.stats["prompt_tokens"] += pt
             self.stats["completion_tokens"] += ct
             self.stats["cached_tokens"] += cached
+            self.stats["cache_write_tokens"] += written
             self.stats["seconds"] += seconds
             self.stats["cost"] += cost
             row = self.stats["by_site"].setdefault(
                 site, {"calls": 0, "prompt_tokens": 0, "completion_tokens": 0,
-                       "cached_tokens": 0})
+                       "cached_tokens": 0, "cache_write_tokens": 0})
             row["calls"] += 1
             row["prompt_tokens"] += pt
             row["completion_tokens"] += ct
             row["cached_tokens"] += cached
+            row["cache_write_tokens"] += written
         record = {"site": site, "prompt_tokens": pt, "completion_tokens": ct,
-                  "cached_tokens": cached, "seconds": round(seconds, 3),
+                  "cached_tokens": cached, "cache_write_tokens": written,
+                  "seconds": round(seconds, 3),
                   "cost": round(cost, 6), "model": self.cfg.model,
                   "finish": self.last_finish_reason}
         cb = self.on_call

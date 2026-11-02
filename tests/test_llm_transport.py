@@ -448,6 +448,62 @@ def test_cached_token_fields_of_other_providers(monkeypatch):
         assert c.stats["cached_tokens"] == want
 
 
+@pytest.mark.parametrize("usage,want_read,want_write", [
+    # DeepSeek: implicit cache hit/miss tokens at the top level.
+    ({"prompt_tokens": 50, "completion_tokens": 1,
+      "prompt_cache_hit_tokens": 30, "prompt_cache_miss_tokens": 20}, 30, 0),
+    # OpenAI: cached_tokens inside prompt_tokens_details.
+    ({"prompt_tokens": 50, "completion_tokens": 1,
+      "prompt_tokens_details": {"cached_tokens": 30}}, 30, 0),
+    # Anthropic-style: cache_read_input_tokens + cache_creation_input_tokens.
+    ({"prompt_tokens": 50, "completion_tokens": 1,
+      "cache_read_input_tokens": 30, "cache_creation_input_tokens": 15},
+     30, 15),
+    # DashScope-style: creation inside prompt_tokens_details.
+    ({"prompt_tokens": 50, "completion_tokens": 1,
+      "prompt_tokens_details": {"cache_creation_input_tokens": 15},
+      "cache_read_input_tokens": 30}, 30, 15),
+    # The generic cache_write_tokens spelling.
+    ({"prompt_tokens": 50, "completion_tokens": 1,
+      "cache_write_tokens": 15, "cached_tokens": 30}, 30, 15),
+])
+def test_cache_read_and_write_fields_of_each_provider_shape(
+        monkeypatch, usage, want_read, want_write):
+    _patch_post(monkeypatch, lambda *a, **k: _ok("x", usage))
+    c = LLMClient(_cfg())
+    c.chat([{"role": "user", "content": "x"}], 10)
+    assert c.stats["cached_tokens"] == want_read
+    assert c.stats["cache_write_tokens"] == want_write
+
+
+def test_cache_writes_are_charged_at_the_write_price(monkeypatch):
+    usage = {"prompt_tokens": 100, "completion_tokens": 10,
+             "prompt_tokens_details": {
+                 "cached_tokens": 30, "cache_creation_input_tokens": 40}}
+    _patch_post(monkeypatch, lambda *a, **k: _ok("x", usage))
+    client = LLMClient(_cfg(price_input_per_mtok=1.0, price_output_per_mtok=2.0,
+                            price_cached_per_mtok=0.1,
+                            price_cache_write_per_mtok=1.25))
+    client.site = "answer"
+    client.chat([{"role": "user", "content": "x"}], 10)
+    s = client.stats
+    assert s["cached_tokens"] == 30 and s["cache_write_tokens"] == 40
+    # fresh = 100 - 30 - 40 = 30; read at 0.1, write at 1.25, out at 2.0.
+    expected = (30 * 1.0 + 30 * 0.1 + 40 * 1.25 + 10 * 2.0) / 1e6
+    assert s["cost"] == pytest.approx(expected)
+    assert s["by_site"]["answer"]["cache_write_tokens"] == 40
+
+
+def test_cache_writes_fall_back_to_the_input_price_when_unset(monkeypatch):
+    usage = {"prompt_tokens": 100, "completion_tokens": 0,
+             "cache_creation_input_tokens": 100}
+    _patch_post(monkeypatch, lambda *a, **k: _ok("x", usage))
+    client = LLMClient(_cfg(price_input_per_mtok=1.0))
+    client.chat([{"role": "user", "content": "x"}], 10)
+    # No write price: the write tokens are charged as plain input.
+    assert client.stats["cost"] == pytest.approx(100 * 1.0 / 1e6)
+
+
 def test_a_server_rejecting_stream_options_is_retried_without_them(monkeypatch):
     bodies = []
 

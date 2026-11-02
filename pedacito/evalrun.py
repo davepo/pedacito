@@ -501,7 +501,7 @@ def run_task(task: EvalTask, client, cfg, workdir: Path | None = None) -> dict:
         stats = dict(getattr(client, "stats", {}) or {})
         d = {k: stats.get(k, 0) - before.get(k, 0)
              for k in ("calls", "prompt_tokens", "completion_tokens",
-                       "cached_tokens") if k in stats}
+                       "cached_tokens", "cache_write_tokens") if k in stats}
         row.update(d)
         pt = d.get("prompt_tokens", 0)
         row["cache_hit"] = round(d.get("cached_tokens", 0) / pt, 3) if pt else 0.0
@@ -583,6 +583,7 @@ def _metrics(rows: list[dict]) -> dict:
         "mean_prompt_tokens": avg("prompt_tokens"),
         "mean_completion_tokens": avg("completion_tokens"),
         "cache_hit": avg("cache_hit"),
+        "mean_cache_write_tokens": avg("cache_write_tokens"),
         "mean_seconds": avg("seconds"),
         "injection_followed": sum(1 for r in rows if r.get("injection_followed")),
         "failures": fails,
@@ -699,6 +700,7 @@ def render(rows: list[dict], summary: dict) -> str:
     out.append(f"pass {s['pass_rate']:.0%}  locate {s['locate_rate']:.0%}  "
                f"first-apply-clean {s['first_apply_clean']:.0%}  "
                f"cache-hit {s['cache_hit']:.0%}  "
+               f"cache-write {s['mean_cache_write_tokens']:.0f} tok  "
                f"mean {s['mean_calls']:.1f} calls / "
                f"{s['mean_prompt_tokens']:.0f} tokens in / "
                f"{s['mean_seconds']:.0f}s")

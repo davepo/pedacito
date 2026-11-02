@@ -431,6 +431,9 @@ class Config:
     price_input_per_mtok: float = 0.0
     price_output_per_mtok: float = 0.0
     price_cached_per_mtok: float = 0.0
+    # Cache-write tokens (explicit prompt caching) are billed separately from
+    # cache reads on Anthropic/DashScope-style providers.
+    price_cache_write_per_mtok: float = 0.0
 
     # --- Context management ---------------------------------------------------
     # Prompt wording density: "tiny" | "small" | "full"; "" = chosen from the

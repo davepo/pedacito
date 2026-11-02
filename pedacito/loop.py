@@ -888,6 +888,7 @@ def _task_stats(client, before: dict, started: float) -> dict:
     return {"calls": d.get("calls", 0), "prompt_tokens": pt,
             "completion_tokens": d.get("completion_tokens", 0),
             "cached_tokens": d.get("cached_tokens", 0),
+            "cache_write_tokens": d.get("cache_write_tokens", 0),
             "cache_hit": round(d.get("cached_tokens", 0) / pt, 3) if pt else 0.0,
             "cost": round(d.get("cost", 0.0), 6),
             "seconds": round(time.time() - started, 2)}
@@ -1690,6 +1691,8 @@ def _run_task_once(root: Path, cfg, client, agent, idx, task: str, *,
         print(f"[task: {stats['calls']} calls, {stats['prompt_tokens']:,} "
               f"in / {stats['completion_tokens']:,} out tokens, cache hit "
               f"{stats['cache_hit']:.0%}"
+              + (f", {stats['cache_write_tokens']:,} written to cache"
+                 if stats.get("cache_write_tokens") else "")
               + (f", ${stats['cost']:.4f}" if stats.get("cost") else "")
               + f", {stats['seconds']:.0f}s]", file=sys.stderr)
     _fire(cfg, root, "post_task", task=task[:300], applied=applied,
