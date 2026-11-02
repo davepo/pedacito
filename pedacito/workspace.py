@@ -314,6 +314,75 @@ def prune(root: Path, keep_sessions: int = 0, keep_backups: int = 0,
     return removed
 
 
+# Content under `.pedacito/` that the user authored rather than Pedacito
+# generated. `reset` keeps it when `keep_config` is set.
+AUTHORED_DIRS = ("rules", "skills", "prompts")
+AUTHORED_FILES = ("instructions.md", "PEDACITO.md", "PEDACEITO.md")
+MEMORY_FILE = "memory.md"
+
+
+def _walk_files(path: Path):
+    """Every regular file under `path`, without following symlinks."""
+    if path.is_symlink():
+        return
+    if path.is_file():
+        yield path
+        return
+    for f in path.rglob("*"):
+        if f.is_file() and not f.is_symlink():
+            yield f
+
+
+def reset(root: Path, keep_memory: bool = False,
+          keep_config: bool = False, dry_run: bool = False) -> dict:
+    """Delete the project's `.pedacito/` runtime state.
+
+    Returns ``{path, removed, kept, files, bytes}`` where `removed`/`kept` are
+    top-level entry names. Code and the project's scaffolding files
+    (`.pedacito.toml`, `.pedacitoignore`, `.gitignore`) are never touched.
+    `keep_memory` preserves `memory.md`; `keep_config` preserves authored
+    `rules/`, `skills/`, `prompts/` and instruction files. With `dry_run` the
+    counts are reported but nothing is deleted.
+    """
+    d = state_dir(Path(root))
+    keep: set[str] = set()
+    if keep_memory:
+        keep.add(MEMORY_FILE)
+    if keep_config:
+        keep.update(AUTHORED_DIRS)
+        keep.update(AUTHORED_FILES)
+    result = {"path": d, "removed": [], "kept": [], "files": 0, "bytes": 0}
+    if d.is_symlink():
+        raise OSError(f"refusing to reset {d}: it is a symlink")
+    if not d.is_dir():
+        return result
+    for p in sorted(d.iterdir()):
+        if p.name in keep:
+            result["kept"].append(p.name)
+            continue
+        result["removed"].append(p.name)
+        for f in _walk_files(p):
+            result["files"] += 1
+            try:
+                result["bytes"] += f.stat().st_size
+            except OSError:
+                pass
+    if dry_run:
+        return result
+    import shutil
+    for name in result["removed"]:
+        p = d / name
+        try:
+            if p.is_symlink() or p.is_file():
+                p.unlink(missing_ok=True)
+            elif p.is_dir():
+                shutil.rmtree(p)
+        except FileNotFoundError:
+            pass                  # a concurrent prune took it; nothing to do
+    d.mkdir(parents=True, exist_ok=True)
+    return result
+
+
 class ProjectBusy(RuntimeError):
     """Another live pedacito process is writing to this project."""
 

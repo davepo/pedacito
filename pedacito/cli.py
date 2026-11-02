@@ -12,6 +12,7 @@ Usage
     pedacito how "how do I set up a config?" # built-in help from docs + code
     pedacito explain src/ -q "how does X work?" # answer questions about the project
     pedacito restore src/                    # undo the last --apply
+    pedacito reset  ~/code/app               # wipe .pedacito/ state (code stays)
     pedacito new  my-app -t "todo CLI"       # start a project from scratch
     pedacito auto . -t "add retries" --apply # autonomous outer loop over tasks
 
@@ -903,6 +904,166 @@ def _cmd_prune(args) -> int:
     return 0
 
 
+def _reset_worktrees(root: Path) -> list[tuple[str, str]]:
+    """Git worktrees registered directly under `.pedacito/worktrees/`."""
+    from . import worktree
+    base = workspace.state_dir(root, "worktrees")
+    try:
+        base = base.resolve()
+        entries = worktree.list_paths(root)
+    except (OSError, worktree.WorktreeError):
+        return []
+    out: list[tuple[str, str]] = []
+    for path, branch in entries:
+        try:
+            p = Path(path).resolve()
+        except OSError:
+            continue
+        if p.parent == base:
+            out.append((p.name, branch))
+    return sorted(out)
+
+
+def _reset_reindex(args, root: Path) -> int:
+    """Rebuild the index after `pedacito reset --reindex`."""
+    try:
+        cfg = _config(args)
+    except ConfigError as e:
+        print(f"Config error: {e}", file=sys.stderr)
+        return 2
+    no_summaries = bool(getattr(args, "no_summaries", False))
+    client = None
+    try:
+        if not no_summaries:
+            client = LLMClient(cfg)
+            client.check()
+            client = roles_mod.client_for(cfg, "summarizer", client)
+        idx = index_mod.build([str(root)], cfg, client=client, root=root,
+                              summarise=not no_summaries,
+                              matcher=_matcher(args, root))
+    except (LLMError, OSError) as e:
+        print(f"reset: index rebuild failed: {e}", file=sys.stderr)
+        print("The state was reset; run `pedacito index PROJ` to retry.",
+              file=sys.stderr)
+        return 1
+    print(f"Indexed {len(idx.chunks)} units across {len(idx.files)} files "
+          f"({len(idx.code_files)} code, {len(idx.reference_files)} reference) "
+          f"-> {index_mod.state_dir(root)}", file=sys.stderr)
+    return 0
+
+
+def _cmd_reset(args) -> int:
+    """`pedacito reset`: wipe this project's `.pedacito/` runtime state.
+
+    Code, `.pedacito.toml`, `.pedacitoignore` and `.gitignore` are untouched.
+    Registered background servers are stopped first; live git worktrees under
+    `.pedacito/worktrees/` refuse the reset unless --force is given.
+    """
+    from . import processes, worktree
+
+    root = _root(args)
+    if not root.is_dir():
+        print(f"reset: no such project directory: {root}", file=sys.stderr)
+        return 2
+    d = workspace.state_dir(root)
+    if d.is_symlink():
+        print(f"reset: refusing to reset {d}: it is a symlink", file=sys.stderr)
+        return 1
+    dry_run = bool(getattr(args, "dry_run", False))
+    keep_memory = bool(getattr(args, "keep_memory", False))
+    keep_config = bool(getattr(args, "keep_config", False))
+    force = bool(getattr(args, "force", False))
+
+    lock_held = False
+    if not dry_run:
+        try:
+            workspace.acquire_lock(root)
+            lock_held = True
+        except workspace.ProjectBusy as e:
+            print(f"ERROR: {e}", file=sys.stderr)
+            return 2
+    try:
+        running = [r for r in processes.list_procs(root)
+                   if r.get("status") == "running"]
+        wts = _reset_worktrees(root)
+        if wts and not force:
+            names = ", ".join(name for name, _ in wts)
+            print(f"reset: {len(wts)} git worktree(s) live under "
+                  f"{d}/worktrees ({names}).\n  Remove them with "
+                  "`pedacito worktree remove NAME` first, or pass --force to "
+                  "discard anything uncommitted there.", file=sys.stderr)
+            return 2
+
+        try:
+            plan = workspace.reset(root, keep_memory=keep_memory,
+                                   keep_config=keep_config, dry_run=True)
+        except OSError as e:
+            print(f"reset: {e}", file=sys.stderr)
+            return 1
+
+        size = plan["bytes"]
+        size_text = (f"{size / 1024 / 1024:.1f} MB" if size >= 1024 * 1024
+                     else f"{size / 1024:.1f} KB")
+        print(f"{'Would reset' if dry_run else 'Resetting'} {d}: "
+              f"{plan['files']} file(s), {size_text}", file=sys.stderr)
+        if plan["removed"]:
+            shown = ", ".join(plan["removed"][:12])
+            extra = len(plan["removed"]) - 12
+            print(f"  remove: {shown}" + (f" (+{extra} more)" if extra > 0 else ""),
+                  file=sys.stderr)
+        if plan["kept"]:
+            print(f"  keep  : {', '.join(plan['kept'])}", file=sys.stderr)
+        if running:
+            print(f"  {'stop' if dry_run else 'stopping'}: "
+                  + ", ".join(str(r.get("name")) for r in running),
+                  file=sys.stderr)
+        if wts:
+            print(f"  {'remove' if dry_run else 'removing'} worktree(s): "
+                  + ", ".join(name for name, _ in wts), file=sys.stderr)
+
+        if not dry_run and not getattr(args, "yes", False) \
+                and sys.stdin.isatty():
+            try:
+                ans = input("Delete this state? Code is untouched. [y/N] "
+                            ).strip().lower()
+            except (EOFError, KeyboardInterrupt):
+                ans = ""
+            if ans not in ("y", "yes"):
+                print("Nothing reset.", file=sys.stderr)
+                return 1
+
+        if dry_run:
+            print("Dry run: nothing was deleted.", file=sys.stderr)
+            return 0
+
+        for rec in running:
+            msg = processes.stop(root, str(rec.get("name") or ""))
+            if msg.startswith("ERROR"):
+                print(f"  warning: {msg}", file=sys.stderr)
+            else:
+                print(f"  {msg}", file=sys.stderr)
+        for name, _branch in wts:
+            worktree.remove(root, name, force=True)
+            print(f"  removed worktree {name}", file=sys.stderr)
+        try:
+            result = workspace.reset(root, keep_memory=keep_memory,
+                                     keep_config=keep_config)
+        except OSError as e:
+            print(f"reset: {e}", file=sys.stderr)
+            return 1
+        print(f"  cleared {result['files']} file(s) under {d}", file=sys.stderr)
+        if getattr(args, "reindex", False):
+            return _reset_reindex(args, root)
+    finally:
+        if lock_held:
+            workspace.release_lock(root)
+
+    print("Code and project config were left untouched. "
+          "Run `pedacito index PROJ` when you want a fresh map.",
+          file=sys.stderr)
+    return 0
+
+
 def _cmd_serve(args) -> int:
     """`pedacito serve`: start a background dev server and register it."""
     from . import processes
@@ -1343,6 +1504,35 @@ def _main(argv=None) -> int:
     p_cal.add_argument("--root", default=None)
     p_cal.add_argument("paths", nargs="*", default=["."], help=argparse.SUPPRESS)
 
+    p_reset = sub.add_parser(
+        "reset", help="wipe this project's Pedacito state (index, plans, "
+                      "caches, sessions); code is untouched")
+    p_reset.add_argument("paths", nargs="*", default=["."],
+                         help=argparse.SUPPRESS)
+    p_reset.add_argument("--root", default=None)
+    p_reset.add_argument("--dry-run", action="store_true",
+                         help="show what would be removed, then exit")
+    p_reset.add_argument("-y", "--yes", action="store_true",
+                         help="do not ask for confirmation")
+    p_reset.add_argument("--keep-memory", action="store_true",
+                         help="keep .pedacito/memory.md (remembered facts)")
+    p_reset.add_argument("--keep-config", "--keep-authored",
+                         dest="keep_config", action="store_true",
+                         help="keep authored .pedacito/rules, skills, prompts "
+                              "and instruction files")
+    p_reset.add_argument("--force", action="store_true",
+                         help="also remove git worktrees under "
+                              ".pedacito/worktrees (discards uncommitted work)")
+    p_reset.add_argument("--reindex", action="store_true",
+                         help="rebuild the index after the wipe")
+    p_reset.add_argument("--no-summaries", action="store_true",
+                         help="with --reindex: build the static index only "
+                              "(no model calls)")
+    p_reset.add_argument("--url", help="server base url (with --reindex)")
+    p_reset.add_argument("--model", help="model id/name (with --reindex)")
+    p_reset.add_argument("--config", metavar="FILE")
+    p_reset.add_argument("--profile", metavar="NAME")
+
     p_prune = sub.add_parser(
         "prune", help="delete old sessions/backups/events, trim log.txt")
     p_prune.add_argument("paths", nargs="*", default=["."])
@@ -1494,9 +1684,9 @@ def _main(argv=None) -> int:
         return _cmd_worktree(args)
     if args.cmd == "diagnose":
         return _cmd_diagnose(args)
-    light = {"prune": _cmd_prune, "memory": _cmd_memory, "trust": _cmd_trust,
-             "tests": _cmd_tests, "webcheck": _cmd_webcheck,
-             "skills": _cmd_skills,
+    light = {"prune": _cmd_prune, "reset": _cmd_reset, "memory": _cmd_memory,
+             "trust": _cmd_trust, "tests": _cmd_tests,
+             "webcheck": _cmd_webcheck, "skills": _cmd_skills,
              "serve": _cmd_serve, "procs": _cmd_procs, "lsp": _cmd_lsp}
     if args.cmd in light:
         try:

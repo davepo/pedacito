@@ -482,6 +482,7 @@ pedacito webcheck PROJ             # static contract checks for web files
 pedacito memory PROJ [--add T | --forget T]
 pedacito skills PROJ
 pedacito prune PROJ --keep-sessions 50 --keep-backups 20 [--dry-run]
+pedacito reset PROJ [--dry-run] [--keep-memory] [--keep-config] [--reindex]
 pedacito trust PROJ                # approve a project's .pedacito.toml
 pedacito ask PROJ -t "..." --record          # save the model's responses
 pedacito ask PROJ -t "..." --replay FILE     # re-run the harness, no model needed
@@ -833,8 +834,17 @@ log.txt               timestamped event trace
 `log.txt` shows where a failure happened. On first run Pedacito creates a
 commented `.pedacitoignore` and adds its entries to `.gitignore` (switch off
 with `create_ignore_file = false` / `manage_gitignore = false`). Deleting
-`.pedacito/` is always safe; it only costs a re-index. `pedacito prune` keeps
-the newest N sessions, backups and event files and trims `log.txt`.
+`.pedacito/` is always safe; it only costs a re-index. `pedacito reset PROJ`
+does that in one step: it stops registered background servers, then clears the
+runtime state (index, summaries, plans, sessions, checkpoints, backups, events,
+reviews, screenshots, fetch cache, procs, `log.txt`) while leaving your code,
+`.pedacito.toml`, `.pedacitoignore` and `.gitignore` alone. `--keep-memory`
+preserves remembered facts, `--keep-config` preserves authored `rules/`,
+`skills/`, `prompts/` and instruction files, and `--reindex` rebuilds the map
+(`--no-summaries` makes that rebuild static, with no model calls). `--dry-run`
+shows what would go; live git worktrees under `.pedacito/worktrees/` make it
+refuse unless you pass `--force`. `pedacito prune` keeps the newest N sessions,
+backups and event files and trims `log.txt`.
 
 ---
 

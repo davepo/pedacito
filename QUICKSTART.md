@@ -386,8 +386,12 @@ answer and no edits.
 | No review page appeared | Nothing anchored, so there was nothing to review. Check the printed failures. |
 | Everything is slow | Throughput has likely collapsed because the model spilled out of VRAM. |
 
-To force a clean rebuild, delete `<project>/.pedacito/` (always safe) or pass
-`--reindex` to `ask`/`chat`.
+To force a clean rebuild, run `pedacito reset PROJ --reindex` (or pass
+`--reindex` to `ask`/`chat`). `reset` wipes the project's `.pedacito/` runtime
+state without touching your code or `.pedacito.toml`; `--dry-run` previews it,
+`--keep-memory` keeps remembered facts, and `--keep-config` keeps authored
+rules/skills/prompts/instructions. A plain `--reindex` is the lighter option
+when only the map is stale.
 
 ## The commands, briefly
 
@@ -405,6 +409,7 @@ To force a clean rebuild, delete `<project>/.pedacito/` (always safe) or pass
 | `pedacito memory PROJ` | List / add / forget remembered facts. |
 | `pedacito skills PROJ` | List the available skills. |
 | `pedacito prune PROJ` | Delete old sessions/backups/events; trim the log. |
+| `pedacito reset PROJ [--reindex]` | Wipe `.pedacito/` runtime state; code and config stay. |
 | `pedacito trust PROJ` | Approve a project's `.pedacito.toml`. |
 | `pedacito index PROJ` | Build or refresh the index. |
 | `pedacito ask PROJ -t "..."` | One task; dry run by default. Add `--review` or `--apply`. |
@@ -429,7 +434,9 @@ Per project, under `<project>/.pedacito/`: `index.json` (the map),
 edit turns out wrong later), `events/*.jsonl` (one JSON line per step, model
 call, fold and task: tokens, cache hits, latency), `memory.md`, `reviews/`
 (saved review pages), and `log.txt` (event trace). Deleting the folder is always
-safe; it only costs a re-index. `pedacito prune` trims the old files.
+safe; it only costs a re-index. `pedacito reset PROJ` clears it for you (and
+`--reindex` rebuilds the map immediately), while `pedacito prune` trims the old
+files.
 
 Your settings live in `~/.config/pedacito/config.toml` (`%APPDATA%\pedacito\`
 on Windows); `pedacito config` shows every resolved value and which file or
