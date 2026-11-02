@@ -536,7 +536,11 @@ run it, change `prompt_pack` or `answer_mode`, run it again. With
 `--baseline base.json`, the new report is compared with the old one and the
 command exits nonzero on a quality regression, more followed injections, or
 token/time growth beyond the configured tolerances — a CI gate over a replay
-or a live run. Two reports that ran with different `disable_thinking` settings
+or a live run. Rates are compared per task over the tasks both reports ran: a
+drop of up to one task-equivalent is noise and only noted, a larger drop (or a
+task that passed in every one of three or more repeats and now never does)
+fails, and a failure label the baseline's taxonomy could not emit is reported
+as information rather than a regression. Two reports that ran with different `disable_thinking` settings
 are flagged instead of compared on growth: thinking on/off moves tokens more
 than any harness change, and the gate must not blame (or bless) the harness
 for the config. `ask --replay FILE --strict-replay` does the same for prompt

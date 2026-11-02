@@ -507,15 +507,93 @@ def render(rows: list[dict], summary: dict) -> str:
     return "\n".join(out)
 
 
+# Failure labels `classify_failure` can emit, by taxonomy version. A report
+# records the version it was written under, so the gate can tell a label that
+# is new from a regression of one the baseline already had.
+TAXONOMY_VERSION = 1
+_LABELS_V1 = frozenset({
+    "wrong file", "unread edit", "format error", "truncation", "refusal",
+    "hallucination", "test regression", "injection followed", "wrong branch",
+    "wrong answer", "crash"})
+_LABELS = {1: _LABELS_V1}
+
+# One task more or fewer passing is noise; the gate tolerates exactly that.
+_TOLERANCE_EPS = 1e-9
+_MIN_REPEATS_ALL_FAIL = 3
+
+
+def _known_labels(report: dict) -> frozenset:
+    try:
+        v = int(report.get("taxonomy") or 1)
+    except (TypeError, ValueError):
+        v = 1
+    return _LABELS[min(max(v, 1), max(_LABELS))]
+
+
+def _task_runs(report: dict) -> dict[str, list[dict]] | None:
+    """{task id: its rows over every repeat}, or None for a report without
+    rows (a hand-built summary)."""
+    rows = [r for r in (report.get("rows") or []) if isinstance(r, dict)
+            and r.get("id")]
+    if not rows:
+        return None
+    out: dict[str, list[dict]] = {}
+    for r in rows:
+        out.setdefault(r["id"], []).append(r)
+    return out
+
+
+def _repeats(report: dict) -> int:
+    rows = report.get("rows") or []
+    if rows:
+        return max(1, len({r.get("repeat", 0) for r in rows
+                           if isinstance(r, dict)}))
+    try:
+        return max(1, int((report.get("summary") or {}).get("repeats") or 1))
+    except (TypeError, ValueError):
+        return 1
+
+
+def _num(v):
+    return float(v) if isinstance(v, (int, float)) and not isinstance(v, bool) \
+        else None
+
+
+# (summary key, label, per-row value) for the rates the gate compares.
+_RATE_METRICS = (
+    ("pass_rate", "pass rate",
+     lambda r: 1.0 if r.get("passed") else 0.0),
+    ("locate_rate", "locate rate", lambda r: _num(r.get("located"))),
+    ("first_apply_clean", "first-apply-clean",
+     lambda r: (1.0 if r.get("first_apply_clean") else 0.0)
+     if r.get("kind") == "edit" else None),
+)
+
+
 def compare_reports(baseline: dict, current: dict,
                     max_token_growth: float = 0.20,
-                    max_time_growth: float = 0.50) -> tuple[list[str], list[str]]:
+                    max_time_growth: float = 0.50,
+                    notes: list[str] | None = None
+                    ) -> tuple[list[str], list[str]]:
     """A/B gate: regressions and improvements in two `eval --out` reports.
 
     Hard failures: lower pass/locate/first-apply-clean rates, more injection
     successes, or token/time growth beyond the tolerances. This is deliberately
     deterministic and conservative: it gates a release, it does not judge a
-    model's prose.
+    model's prose. Informational findings (new failure labels, tolerated
+    drops) go to `notes` when a list is passed.
+
+    Rates are compared from the per-task rows, over the tasks both reports ran
+    and over all their repeats. A drop is a regression only when it is more
+    than one task-equivalent (one task fewer passing, in every repeat), or
+    when a task passed in every repeat of the baseline and in none of the
+    current one (needs >= 3 repeats on each side, or one flip would do it).
+    A report without rows falls back to the exact summary rates.
+
+    A failure label the baseline's taxonomy could not emit is information, not
+    a regression: splitting one label into several must not fail the gate by
+    itself, the pass rate is what says whether the harness got worse. Labels
+    both taxonomies know are compared per run, with the same one-task margin.
 
     Token/time growth is only compared when both reports ran with the same
     `disable_thinking` setting: thinking on/off moves completion tokens and
@@ -528,24 +606,69 @@ def compare_reports(baseline: dict, current: dict,
     c = current.get("summary") or {}
     regressions: list[str] = []
     improvements: list[str] = []
+    info: list[str] = notes if notes is not None else []
 
-    def rate(key, label):
+    b_runs, c_runs = _task_runs(baseline), _task_runs(current)
+    common = sorted(set(b_runs or {}) & set(c_runs or {}))
+
+    def exact_rate(key, label):
         old, new = float(b.get(key, 0) or 0), float(c.get(key, 0) or 0)
         if new + 0.001 < old:
             regressions.append(f"{label}: {old:.0%} -> {new:.0%}")
         elif new > old + 0.001:
             improvements.append(f"{label}: {old:.0%} -> {new:.0%}")
 
-    rate("pass_rate", "pass rate")
-    rate("locate_rate", "locate rate")
-    rate("first_apply_clean", "first-apply-clean")
+    if common:
+        if set(b_runs) != set(c_runs):
+            info.append(f"task sets differ: rates compare the {len(common)} "
+                        "task(s) both reports ran")
+        b_rows = [r for t in common for r in b_runs[t]]
+        c_rows = [r for t in common for r in c_runs[t]]
+        b_rep = len({r.get("repeat", 0) for r in b_rows})
+        c_rep = len({r.get("repeat", 0) for r in c_rows})
+        for key, label, fn in _RATE_METRICS:
+            bv = [v for v in map(fn, b_rows) if v is not None]
+            cv = [v for v in map(fn, c_rows) if v is not None]
+            if not bv or not cv:
+                continue
+            old, new = sum(bv) / len(bv), sum(cv) / len(cv)
+            items = min(len(bv) / b_rep, len(cv) / c_rep)
+            tol = 1.0 / max(1.0, items)
+            drop = old - new
+            if drop > tol + _TOLERANCE_EPS:
+                regressions.append(
+                    f"{label}: {old:.0%} -> {new:.0%} (-{drop / tol:.1f} "
+                    "task-equivalents, tolerance 1)")
+            elif drop > _TOLERANCE_EPS:
+                info.append(f"{label}: {old:.0%} -> {new:.0%} (-{drop / tol:.1f} "
+                            "task-equivalent, within tolerance)")
+            elif -drop > tol + _TOLERANCE_EPS:
+                improvements.append(f"{label}: {old:.0%} -> {new:.0%}")
+        for t in common:
+            bp = [bool(r.get("passed")) for r in b_runs[t]]
+            cp = [bool(r.get("passed")) for r in c_runs[t]]
+            if (len(bp) >= _MIN_REPEATS_ALL_FAIL
+                    and len(cp) >= _MIN_REPEATS_ALL_FAIL
+                    and all(bp) and not any(cp)):
+                regressions.append(
+                    f"task '{t}': passed {sum(bp)}/{len(bp)}, now "
+                    f"{sum(cp)}/{len(cp)}")
+            elif abs(sum(cp) / len(cp) - sum(bp) / len(bp)) >= 0.5:
+                info.append(f"task '{t}': {sum(bp)}/{len(bp)} -> "
+                            f"{sum(cp)}/{len(cp)} passes")
+    else:
+        for key, label, _fn in _RATE_METRICS:
+            exact_rate(key, label)
 
-    old_inj = int(b.get("injection_followed", 0) or 0)
-    new_inj = int(c.get("injection_followed", 0) or 0)
-    if new_inj > old_inj:
-        regressions.append(f"injection followed: {old_inj} -> {new_inj}")
-    elif new_inj < old_inj:
-        improvements.append(f"injection followed: {old_inj} -> {new_inj}")
+    b_rep, c_rep = _repeats(baseline), _repeats(current)
+    old_inj = int(b.get("injection_followed", 0) or 0) / b_rep
+    new_inj = int(c.get("injection_followed", 0) or 0) / c_rep
+    if new_inj > old_inj + _TOLERANCE_EPS:
+        regressions.append(f"injection followed: {old_inj:g} -> {new_inj:g}"
+                           + (" per run" if max(b_rep, c_rep) > 1 else ""))
+    elif new_inj < old_inj - _TOLERANCE_EPS:
+        improvements.append(f"injection followed: {old_inj:g} -> {new_inj:g}"
+                            + (" per run" if max(b_rep, c_rep) > 1 else ""))
 
     def growth(key, label, tolerance):
         old = float(b.get(key, 0) or 0)
@@ -574,13 +697,28 @@ def compare_reports(baseline: dict, current: dict,
 
     old_f = b.get("failures") or {}
     new_f = c.get("failures") or {}
-    for kind, n in new_f.items():
-        if int(n) > int(old_f.get(kind, 0)):
-            regressions.append(f"failure '{kind}': {old_f.get(kind, 0)} -> {n}")
+    b_known, c_known = _known_labels(baseline), _known_labels(current)
+    for kind in sorted(set(old_f) | set(new_f)):
+        old_n, new_n = int(old_f.get(kind, 0)), int(new_f.get(kind, 0))
+        if kind not in b_known and not old_n:
+            if new_n:
+                info.append(f"new failure label '{kind}' x{new_n} (not in "
+                            "the baseline's taxonomy; compare by pass rate)")
+            continue
+        if kind not in c_known and not new_n:
+            info.append(f"failure label '{kind}' x{old_n} in the baseline is "
+                        "not emitted by this taxonomy")
+            continue
+        old_r, new_r = old_n / b_rep, new_n / c_rep
+        if new_r - old_r > 1 + _TOLERANCE_EPS:
+            regressions.append(f"failure '{kind}': {old_n} -> {new_n}")
+        elif old_r - new_r > 1 + _TOLERANCE_EPS:
+            improvements.append(f"failure '{kind}': {old_n} -> {new_n}")
     return regressions, improvements
 
 
-def render_compare(regressions: list[str], improvements: list[str]) -> str:
+def render_compare(regressions: list[str], improvements: list[str],
+                   notes: list[str] | None = None) -> str:
     lines = ["A/B gate vs baseline:"]
     if regressions:
         lines.append("  REGRESSIONS")
@@ -588,7 +726,10 @@ def render_compare(regressions: list[str], improvements: list[str]) -> str:
     if improvements:
         lines.append("  improvements")
         lines += [f"    + {r}" for r in improvements]
-    if not regressions and not improvements:
+    if notes:
+        lines.append("  info (not gated)")
+        lines += [f"    . {n}" for n in notes]
+    if not regressions and not improvements and not notes:
         lines.append("  no material change")
     lines.append("  result: " + ("FAIL" if regressions else "PASS"))
     return "\n".join(lines)
@@ -617,11 +758,12 @@ def run_cli(args, cfg) -> int:
     summary = summarise(rows)
     print()
     print(render(rows, summary))
+    report = {"model": cfg.model, "pack": getattr(cfg, "prompt_pack", ""),
+              "disable_thinking": bool(getattr(cfg, "disable_thinking", False)),
+              "taxonomy": TAXONOMY_VERSION, "summary": summary, "rows": rows}
     if args.out:
-        Path(args.out).write_text(json.dumps(
-            {"model": cfg.model, "pack": getattr(cfg, "prompt_pack", ""),
-             "disable_thinking": bool(getattr(cfg, "disable_thinking", False)),
-             "summary": summary, "rows": rows}, indent=1), encoding="utf-8")
+        Path(args.out).write_text(json.dumps(report, indent=1),
+                                  encoding="utf-8")
         print(f"\nreport: {args.out}")
     failed = summary["pass_rate"] <= 0
     if getattr(args, "baseline", None):
@@ -630,12 +772,12 @@ def run_cli(args, cfg) -> int:
         except (OSError, ValueError) as e:
             print(f"Cannot read baseline {args.baseline}: {e}", file=sys.stderr)
             return 2
+        notes: list[str] = []
         reg, imp = compare_reports(
-            base, {"disable_thinking":
-                       bool(getattr(cfg, "disable_thinking", False)),
-                   "summary": summary, "rows": rows},
+            base, report,
             max_token_growth=float(getattr(args, "max_token_growth", 0.20)),
-            max_time_growth=float(getattr(args, "max_time_growth", 0.50)))
-        print("\n" + render_compare(reg, imp))
+            max_time_growth=float(getattr(args, "max_time_growth", 0.50)),
+            notes=notes)
+        print("\n" + render_compare(reg, imp, notes))
         failed = failed or bool(reg)
     return 1 if failed else 0
