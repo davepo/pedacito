@@ -1625,29 +1625,35 @@ def _note_created(index, cfg, rel: str) -> None:
         pass
 
 
-def _syntax_note(path: Path, text: str) -> str:
-    """Advisory parse check on freshly written content: '' when it parses (or
-    the language is unknown), else a WARNING. It cannot refuse like the edit
-    path: a chunked file is unparseable until its last `append`."""
+def _parse_error(path: Path, text: str) -> str:
+    """'' when `text` parses as this file's language (or the language is
+    unknown), else a short description of the syntax error."""
     suffix = path.suffix.lower()
-    err = None
     if suffix == ".py":
         try:
             ast.parse(text)
         except SyntaxError as e:
-            err = f"line {e.lineno}: {e.msg}"
+            return f"a syntax error at line {e.lineno}: {e.msg}"
         except ValueError:
-            return ""                # null bytes etc.; not worth nagging
-    else:
-        try:
-            from .chunker_ts import LANG_BY_EXT, TS_AVAILABLE, has_syntax_error
-            if suffix in LANG_BY_EXT and TS_AVAILABLE:
-                bad, lineno = has_syntax_error(text, LANG_BY_EXT[suffix])
-                if bad:
-                    err = f"near line {lineno}"
-        except Exception:
             return ""
-    if err is None:
+        return ""
+    try:
+        from .chunker_ts import LANG_BY_EXT, TS_AVAILABLE, has_syntax_error
+        if suffix in LANG_BY_EXT and TS_AVAILABLE:
+            bad, lineno = has_syntax_error(text, LANG_BY_EXT[suffix])
+            if bad:
+                return f"a syntax error near line {lineno}"
+    except Exception:
+        return ""
+    return ""
+
+
+def _syntax_note(path: Path, text: str) -> str:
+    """Advisory parse check on freshly written content: '' when it parses (or
+    the language is unknown), else a WARNING. It cannot refuse like the edit
+    path: a chunked file is unparseable until its last `append`."""
+    err = _parse_error(path, text)
+    if not err:
         return ""
     return ("\n[WARNING: the file does not parse (" + err + "). Expected only "
             "if more `append` chunks are coming; otherwise fix it before "
@@ -1753,15 +1759,36 @@ def tool_write(index, cfg, file: str, content: str,
                 f"{max_chars:,} limit. Write a smaller file, or use edit "
                 "blocks.")
     if existed and not append and original is not None:
-        # Window-rewrite guard. A `write` step can only carry what the model
-        # has seen; overwriting a big file from a partial read erases every
-        # line outside the window -- silently, since the result is valid text.
-        # The signature: the new content shrinks the file by more than half
-        # AND its lines all already occur, in order, in the original. A real
-        # rewrite changes or invents lines; a re-quote of a window does not.
+        # Partial-rewrite guard. A `write` step can only carry what the model
+        # actually composed; overwriting an existing file from a partial read
+        # (or from a fragment it stitched together) erases every line outside
+        # that fragment -- silently, since the result is still valid text.
+        # Two shapes are refused when the content shrinks the file by more
+        # than half and the file is big enough to matter:
+        #   (1) every new line is a verbatim, in-order copy of the original
+        #       (the game-session PED-4 window re-quote);
+        #   (2) the content reuses some original lines but drops the file's
+        #       first or last one (a lost head/tail fragment -- the
+        #       deepclitest incident: 42 lines replaced by a 9-line tail plus
+        #       new code, which passed the old every-line check because the
+        #       new helper was not in the original).
+        # A genuine rewrite (no copied lines) still goes through, as does a
+        # full re-quote that only deletes a line or two. Below the floor a
+        # shrink is ordinary small-file editing and stays allowed.
         old_ls = [l.strip() for l in original.splitlines() if l.strip()]
         new_ls = [l.strip() for l in new_text.splitlines() if l.strip()]
-        if new_ls and len(old_ls) >= 60 and 2 * len(new_ls) < len(old_ls):
+        # A handful of lines is never a full-file rewrite of a real module:
+        # it is the fragment the model composed for its addition, not the
+        # file. (deepclitest: a 42-line module was replaced by the 2-line
+        # helper the task asked to append.)
+        if new_ls and len(old_ls) >= 20 and len(new_ls) < 10:
+            return (f"ERROR: refusing to overwrite {rel}: your content has only "
+                    f"{len(new_ls)} non-blank lines but the file has "
+                    f"{len(old_ls)} -- that is a fragment, not a whole file. "
+                    "Keep the existing file and add your lines with a "
+                    "search/replace edit block (or `append` for the end of "
+                    "the file).")
+        if new_ls and len(old_ls) >= 8 and 2 * len(new_ls) < len(old_ls):
             probe = iter(old_ls)
             if all(l in probe for l in new_ls):
                 return (f"ERROR: refusing to overwrite {rel}: your content has "
@@ -1773,6 +1800,30 @@ def tool_write(index, cfg, file: str, content: str,
                         "search/replace edit instead. If you truly mean to "
                         "shrink this file, `read` it completely first so your "
                         "new content can differ from what you keep.")
+            shared = set(old_ls) & set(new_ls)
+            keeps_ends = old_ls[0] in new_ls and old_ls[-1] in new_ls
+            if shared and not keeps_ends:
+                return (f"ERROR: refusing to overwrite {rel}: your content has "
+                        f"{len(new_ls)} non-blank lines but the file has "
+                        f"{len(old_ls)}, reuses text from the file, and drops "
+                        "its beginning or end -- the signature of a lost "
+                        "fragment, which would erase the lines you never "
+                        "included. Make a targeted search/replace edit "
+                        "instead. If you truly mean to shrink the whole file, "
+                        "read it completely and rewrite it without copying "
+                        "pieces of the old text.")
+        # Syntax gate: refusing here is the write-action equivalent of the
+        # edit path's "edit produced a syntax error; not written". A file
+        # that parses now must not be replaced by text that does not; a
+        # recovery write over an already-broken file is still allowed (the
+        # warning below tells the model to finish it).
+        if not _parse_error(path, original):
+            syntax_err = _parse_error(path, text)
+            if syntax_err:
+                return (f"ERROR: refusing to overwrite {rel}: the new content "
+                        f"has {syntax_err} while the file parses now. Fix the "
+                        "syntax, or use targeted search/replace edit blocks; "
+                        "the file was left untouched.")
 
     if existed:
         err = _snapshot(index, cfg, rel, path)

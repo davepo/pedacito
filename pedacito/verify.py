@@ -91,6 +91,18 @@ def check_unread(agent, edits, results) -> list[Finding]:
     if not spans and not getattr(agent, "read_any", False):
         # nothing was read at all: the answer-phase refusal logic owns that
         return []
+    # A file this run CREATED during lookup (a `write` step) was never
+    # "read", but the model authored every byte of it, so a later edit block
+    # for it is not an unread guess. The run's backup dir records creations.
+    created: set[str] = set()
+    bdir = getattr(getattr(agent, "cfg", None), "_backup_dir", None)
+    if bdir:
+        try:
+            created = {fileio.path_key(x) for x in
+                       fileio.created_manifest(bdir).read_text(
+                           encoding="utf-8").splitlines() if x.strip()}
+        except OSError:
+            created = set()
     out: list[Finding] = []
     root = agent.index.root
     seen_files: set[str] = set()
@@ -100,6 +112,8 @@ def check_unread(agent, edits, results) -> list[Finding]:
         path = root / rel
         if not path.is_file():
             continue                      # a creation: nothing to have read
+        if key in created:
+            continue                      # created by this run's own write
         read = spans.get(key) or next(
             (v for k, v in spans.items() if k.endswith("/" + key)
              or key.endswith("/" + k)), None)

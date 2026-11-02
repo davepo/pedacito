@@ -419,6 +419,24 @@ def test_preflight_catches_placeholders_unread_files_and_stale_references(tmp_pa
     assert stale and "use.py:1" in stale[0].message and "`helper`" in stale[0].message
 
 
+def test_preflight_skips_files_created_by_this_run(tmp_path):
+    """A file written during lookup by the model's own `write` step has no
+    read spans, but editing it is not an unread guess: the run's created
+    manifest proves the model authored the bytes. The old check flagged it
+    as 'never read' and spent a repair round on a false positive."""
+    from pedacito import fileio
+    agent = _verify_agent(tmp_path, Scripted(), backup=True)
+    (tmp_path / "newmod.py").write_text("VALUE = 1\n", encoding="utf-8")
+    bdir = tmp_path / "backup-1"
+    bdir.mkdir()
+    fileio.note_created(bdir, "newmod.py")
+    agent.cfg._backup_dir = bdir
+    reply = _edit("newmod.py", "VALUE = 1", "VALUE = 2")
+    res = agent._apply_once(reply, dry_run=True)
+    kinds = [f.kind for f in verify.check(agent, "bump value", reply, res)]
+    assert "unread" not in kinds
+
+
 def test_preflight_unread_region_of_a_read_file_is_a_warning_when_overlapping(tmp_path):
     agent = _verify_agent(tmp_path, Scripted())
     agent._read_spans["lib.py"] = [(1, 2)]
@@ -540,7 +558,7 @@ def test_impacted_tests_run_after_an_edit_and_new_failures_are_repaired(tmp_path
     assert "tests/test_calc.py" in prompt or "test_add" in prompt
 
 
-def test_a_failing_test_that_failed_before_the_edit_is_not_blamed_on_it(tmp_path):
+def test_a_failing_test_that_failed_before_the_edit_is_not_blamed_on_it(tmp_path, capsys):
     pytest.importorskip("pytest")
     from pedacito import loop
     files = {
@@ -558,3 +576,6 @@ def test_a_failing_test_that_failed_before_the_edit_is_not_blamed_on_it(tmp_path
     loop.run_task(tmp_path, agent.cfg, client, agent, agent.index,
                   "document the add function", apply=True)
     assert len(client.chat_calls) == 1                         # no repair round
+    # ...and the run says the remaining red is pre-existing, not silent.
+    err = capsys.readouterr().err
+    assert "predate it and were not auto-repaired" in err

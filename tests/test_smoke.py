@@ -927,12 +927,107 @@ def test_window_rewrite_guard(tmp_path):
     assert "WROTE big.js (30 lines)" in tools_mod.tool_write(
         idx, cfg, "big.js", fresh)
 
-    # Below the 60-line floor: verbatim shrinking is legitimate editing.
-    small_lines = lines[:50]
+    # Below the floor: verbatim shrinking is ordinary small-file editing.
+    small_lines = lines[:7]
     assert tools_mod.tool_write(idx, cfg, "small.js",
                                 "\n".join(small_lines)).startswith("CREATED")
     assert tools_mod.tool_write(idx, cfg, "small.js",
-                                "\n".join(small_lines[:4])).startswith("WROTE")
+                                "\n".join(small_lines[:3])).startswith("WROTE")
+
+
+def test_write_guard_refuses_lost_head_fragment(tmp_path):
+    """deepclitest incident: a model read a 42-line module, then `write`d a
+    9-line fragment made of the file's tail plus new code. Every line was not
+    a verbatim copy (the new helper was invented), so the older every-line
+    guard missed it and the file was destroyed. A shrinking overwrite that
+    reuses original lines but drops the first or last one must be refused,
+    while a genuine rewrite with invented content still goes through."""
+    import pathlib
+    from pedacito import tools as tools_mod
+
+    class FakeIndex:
+        root = pathlib.Path(tmp_path)
+        files = []
+        def resolve_file(self, f):
+            return None
+
+    cfg = config_mod.Config()
+    cfg.allow_write = True
+    idx = FakeIndex()
+    python_lines = [
+        '"""Report command."""',
+        "import json",
+        "import sys",
+        "",
+    ] + [f"def helper_{i}(): return {i}" for i in range(12)] + [
+        "def cmd_report(args):",
+        "    return 0",
+    ]
+    original = "\n".join(python_lines) + "\n"
+    (tmp_path / "reporting.py").write_text(original)
+    fragment = "\n".join([
+        "    return 0",
+        "",
+        "def format_seconds(value)",
+        "    return f\"{value}s\"",
+        "",
+    ])
+    obs = tools_mod.tool_write(idx, cfg, "reporting.py", fragment)
+    assert obs.startswith("ERROR"), obs
+    assert "lost fragment" in obs or "beginning or end" in obs
+    assert (tmp_path / "reporting.py").read_text() == original, \
+        "refused fragment overwrite must not touch the file"
+
+    # A genuine rewrite that copies no original line is still allowed.
+    fresh = "\n".join(f"def brand_new_{i}(): return {i}" for i in range(4))
+    assert tools_mod.tool_write(idx, cfg, "reporting.py",
+                                fresh).startswith("WROTE")
+
+
+def test_write_refuses_tiny_fragment_and_invalid_syntax(tmp_path):
+    """Two more destruction shapes from the deepclitest probe: a 2-line
+    fragment written over a 42-line module, and a full-size overwrite whose
+    Python does not parse. Both are refused and the original file survives;
+    a recovery write over an already-broken file is still allowed."""
+    import pathlib
+    from pedacito import tools as tools_mod
+
+    class FakeIndex:
+        root = pathlib.Path(tmp_path)
+        files = []
+        def resolve_file(self, f):
+            return None
+
+    cfg = config_mod.Config()
+    cfg.allow_write = True
+    idx = FakeIndex()
+    original = "\n".join(
+        ['"""Module doc."""', "import json"]
+        + [f"def helper_{i}(): return {i}" for i in range(20)]
+        + ["def cmd_report(args):", "    return 0"]
+    ) + "\n"
+    (tmp_path / "reporting.py").write_text(original)
+
+    # 2-line fragment (also invalid syntax) -> refused, file intact.
+    obs = tools_mod.tool_write(
+        idx, cfg, "reporting.py",
+        'def format_seconds(value)\n    return f"{value}s"')
+    assert obs.startswith("ERROR"), obs
+    assert (tmp_path / "reporting.py").read_text() == original
+
+    # Full-size rewrite with a syntax error -> refused by the syntax gate.
+    big_broken = "\n".join(f"def brand_new_{i}(:" for i in range(20))
+    obs = tools_mod.tool_write(idx, cfg, "reporting.py", big_broken)
+    assert obs.startswith("ERROR"), obs
+    assert "syntax" in obs.lower()
+    assert (tmp_path / "reporting.py").read_text() == original
+
+    # A broken file may still be repaired by a write.
+    (tmp_path / "reporting.py").write_text("def broken(:\n")
+    assert tools_mod.tool_write(
+        idx, cfg, "reporting.py",
+        "\n".join(f"def fixed_{i}(): return {i}" for i in range(12))
+    ).startswith("WROTE")
 
 
 # ------------------------------------------------------------------ budgets

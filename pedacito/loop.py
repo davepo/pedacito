@@ -945,6 +945,14 @@ def _post_edit_tests(root, cfg, agent, idx, task, results, reply, backup_dir,
                                        baseline=base_score, round=round_)
         if ok or score <= base_score or round_ >= int(
                 getattr(cfg, "repair_rounds", 2) or 0):
+            if not ok and score > 0 and score <= base_score:
+                # Honest exit: the suite is still red, but it was at least
+                # this red before the task, so the remaining failures are
+                # pre-existing and were deliberately not blamed on these
+                # edits. Say so instead of ending on a silent FAILED line.
+                print(f"  [tests: {score} failure(s) remain; the suite "
+                      f"already had {base_score} before this task, so they "
+                      "predate it and were not auto-repaired]", file=sys.stderr)
             break
         finding = verify_mod.Finding(
             "tests", "error", "",

@@ -92,6 +92,10 @@ def impacted_tests(index, changed: list[str], limit: int = 12) -> list[tuple[str
     g = index.graph
     _, tests_map = testlinks.build_maps(index.files)
     all_tests = {f for f in index.files if testlinks.classify(f)[0]}
+    # A test file CREATED by the apply that triggered this check is not in the
+    # index yet (it is reindexed after the run). Classify the changed paths
+    # too, so a brand-new test file still runs in the post-edit hook.
+    all_tests |= {f for f in changed if testlinks.classify(f)[0]}
     out: dict[str, str] = {}
 
     def add(t: str, why: str) -> None:

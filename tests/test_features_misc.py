@@ -363,6 +363,23 @@ def test_impacted_tests_rank_named_then_importers_then_dependents(tmp_path):
     assert not ok
 
 
+def test_impacted_tests_includes_a_new_test_file_not_indexed_yet(tmp_path):
+    """The apply that CREATES a test file triggers the post-edit hook before
+    the index is refreshed, so the new path is absent from index.files. The
+    hook must still run it (it used to report 'no linked tests found' and
+    silently skip the brand-new suite)."""
+    root, idx = _proj(tmp_path, {
+        "pkg/__init__.py": "",
+        "pkg/core.py": "def core():\n    return 1\n",
+        "tests/test_core.py": "def test_core():\n    assert True\n",
+    })
+    new_test = root / "tests" / "test_core_tables.py"
+    new_test.write_text("def test_table():\n    assert True\n")
+    picked = [t for t, _w in testsel.impacted_tests(
+        idx, ["tests/test_core_tables.py"])]
+    assert picked == ["tests/test_core_tables.py"]
+
+
 # ------------------------------------------------------------------ calibration
 class Model:
     """A scripted 'good' model for the calibration suite."""
