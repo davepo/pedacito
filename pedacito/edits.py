@@ -1131,6 +1131,23 @@ def apply_edits(root: Path, edits: list[Edit], backup: bool = True,
                 repl = e.replace
                 if repl and needle.endswith("\n") and not repl.endswith("\n"):
                     repl += "\n"
+                # A LINES range that covers the whole file is a whole-file
+                # replacement, even though its SEARCH text is non-empty. The
+                # fragment guard must cover this shape too: the model can
+                # otherwise dodge it by sending `LINES 1-N` with an empty
+                # replacement instead of an empty SEARCH (test_1a O7: a
+                # 214-line src/main.js was reduced to 52 lines this way after
+                # the `write` action had already refused the same fragment).
+                total_lines = len(original.splitlines())
+                if a <= 1 and b >= total_lines:
+                    whole = repl if not repl or repl.endswith("\n") \
+                        else repl + "\n"
+                    refusal = fragment_refusal(rel, text, whole)
+                    if refusal:
+                        results.append(Result(False, rel,
+                                              f"block {k}: {refusal}"))
+                        failed = True
+                        break
                 e = Edit(e.file, needle, repl)
             if not e.search.strip():
                 # An empty SEARCH mixed in with real edits replaces the WHOLE

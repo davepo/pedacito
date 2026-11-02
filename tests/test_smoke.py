@@ -1101,6 +1101,35 @@ def test_empty_search_overwrite_gets_the_write_guard(tmp_path):
     assert (tmp_path / "mod.py").read_text().startswith("def brand_new_0")
 
 
+def test_anchored_whole_file_replacement_gets_the_write_guard(tmp_path):
+    """A `LINES 1-N` header spanning the whole file is a whole-file rewrite
+    even though its SEARCH text is non-empty. The fragment guard has to
+    cover it: test_1a O7 saw a 214-line src/main.js reduced to a 52-line
+    fragment through this shape after the `write` action had already refused
+    the same content."""
+    original = "\n".join(f"def helper_{i}(): return {i}"
+                         for i in range(40)) + "\n"
+    (tmp_path / "mod.py").write_text(original)
+
+    window = "\n".join(f"def helper_{i}(): return {i}" for i in range(10, 20))
+    reply = ("--- FILE: mod.py LINES 1-40\n<<<<<<< SEARCH\n=======\n"
+             + window + "\n>>>>>>> REPLACE\n")
+    results = edits.apply_edits(tmp_path, edits.parse_edits(reply),
+                                backup=False)
+    assert len(results) == 1 and not results[0].ok
+    assert "PARTIAL read" in results[0].message
+    assert (tmp_path / "mod.py").read_text() == original
+
+    # A genuine whole-file rewrite (invented content) still applies.
+    fresh = "\n".join(f"def brand_new_{i}(): return {i}" for i in range(12))
+    reply = ("--- FILE: mod.py LINES 1-40\n<<<<<<< SEARCH\n=======\n"
+             + fresh + "\n>>>>>>> REPLACE\n")
+    results = edits.apply_edits(tmp_path, edits.parse_edits(reply),
+                                backup=False)
+    assert len(results) == 1 and results[0].ok
+    assert (tmp_path / "mod.py").read_text().startswith("def brand_new_0")
+
+
 def test_reapplied_block_scores_already_applied(tmp_path):
     """Re-emitting a block whose SEARCH no longer matches because the edit
     already landed (a gather write mutated the file before the answer phase)

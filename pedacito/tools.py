@@ -1900,9 +1900,32 @@ def tool_move(index, cfg, file: str, to: str) -> str:
         or _task_allowlist_error(index, cfg, src_rel, "move")
     if err:
         return err
+    case_only = False
     if dst.exists():
-        return (f"ERROR: destination already exists: {dst_rel}. Choose another "
-                f"path or read it first.")
+        try:
+            same_file = os.path.samefile(src, dst)
+        except OSError:
+            same_file = False
+        if not same_file or fileio.path_key(src_rel) != fileio.path_key(dst_rel):
+            return (f"ERROR: destination already exists: {dst_rel}. Choose "
+                    f"another path or read it first.")
+        # A case-only rename (notes.md -> NOTES.md) looks like an existing
+        # destination on case-insensitive filesystems. Resolving the path
+        # folds it back onto the source name (Windows always, macOS often),
+        # so rebuild it from the requested spelling before touching disk.
+        requested = Path(fileio.normalise_rel(dst_name))
+        if not requested.is_absolute():
+            requested = root / requested
+        try:
+            requested = Path(os.path.normpath(str(requested)))
+            dst_rel = requested.relative_to(root).as_posix()
+        except ValueError:                    # pragma: no cover
+            requested = dst
+        dst = requested
+        case_only = src_rel != dst_rel
+        if not case_only:
+            return (f"ERROR: destination already exists: {dst_rel}. Choose "
+                    f"another path or read it first.")
     try:
         original = fileio.read_text(src)      # only for the line count
     except OSError as e:
@@ -1914,7 +1937,26 @@ def tool_move(index, cfg, file: str, to: str) -> str:
         _note_created(index, cfg, _rel_or_abs(Path(index.root).resolve(), dst))
     try:
         dst.parent.mkdir(parents=True, exist_ok=True)
-        shutil.move(str(src), str(dst))
+        if case_only:
+            # Renaming directly between names that differ only in case is a
+            # no-op (or a failure) on a case-insensitive filesystem; go via a
+            # temporary name so the spelling actually changes.
+            tmp = dst.with_name(dst.name + ".pedacito-move-tmp")
+            n = 0
+            while tmp.exists():
+                n += 1
+                tmp = dst.with_name(f"{dst.name}.pedacito-move-tmp{n}")
+            os.rename(src, tmp)
+            try:
+                os.rename(tmp, dst)
+            except OSError:
+                try:
+                    os.rename(tmp, src)
+                except OSError:
+                    pass
+                raise
+        else:
+            shutil.move(str(src), str(dst))
     except OSError as e:
         return f"ERROR: could not move {src_rel} -> {dst_rel}: {e}"
 
