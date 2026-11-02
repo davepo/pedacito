@@ -18,7 +18,8 @@ and -- for a failure -- a taxonomy label. Edits: wrong file, unread edit,
 format error, truncation, refusal, hallucination, test regression, injection
 followed. Questions: retrieval miss, ungrounded citation, invented behaviour,
 over-refusal. Scoring is deterministic given the model's replies, so the same
-runner works with a scripted fake client in CI (tests/test_evalrun.py).
+runner works with a scripted fake client in CI (the `EvalModel` in
+tests/test_features_misc.py, exercised by tests/test_eval_taxonomy.py).
 """
 
 from __future__ import annotations
