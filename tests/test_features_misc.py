@@ -682,9 +682,9 @@ def test_eval_question_tasks_and_summary(tmp_path):
     q = next(t for t in evalrun.TASKS if t.id == "py-where-is-tax")
     ok = evalrun.run_task(q, EvalModel("add_tax in shop/pricing.py adds it."), _eval_cfg(), tmp_path)
     bad = evalrun.run_task(q, EvalModel("It is in cart.py."), _eval_cfg(), tmp_path)
-    assert ok["passed"] and bad["failure"] == "wrong answer"
+    assert ok["passed"] and bad["failure"] == "retrieval miss"   # never read it
     s = evalrun.summarise([ok, bad])
-    assert s["pass_rate"] == 0.5 and s["failures"] == {"wrong answer": 1}
+    assert s["pass_rate"] == 0.5 and s["failures"] == {"retrieval miss": 1}
     table = evalrun.render([ok, bad], s)
     assert "py-where-is-tax" in table and "pass 50%" in table
     assert all(t.fixture in evalrun.FIXTURES for t in evalrun.TASKS)

@@ -531,8 +531,12 @@ change to the harness rather than to the model.
 TypeScript, Go) — each with a gold file set, a substring check, a real test for
 Python, and a planted prompt injection — and prints locate rate, first-apply
 success, repair calls, tokens, cache-hit ratio, wall time and a failure
-taxonomy (wrong file, unread edit, format error, truncation, refusal,
-hallucination, test regression, injection followed). Use it to A/B any setting:
+taxonomy — for edits: wrong file, unread edit, format error, truncation,
+refusal, hallucination, test regression, injection followed; for questions:
+retrieval miss (never read the gold file), ungrounded citation (a file or line
+the project does not have), invented behaviour (read it and still got it
+wrong), over-refusal (read it and declined). The summary also reports each
+kind (edit, question) separately, and the gate checks them separately. Use it to A/B any setting:
 run it, change `prompt_pack` or `answer_mode`, run it again. With
 `--baseline base.json`, the new report is compared with the old one and the
 command exits nonzero on a quality regression, more followed injections, or
