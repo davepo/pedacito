@@ -945,7 +945,7 @@ def test_window_rewrite_guard(tmp_path):
     excerpt = "\n".join(lines[80:120])
     obs = tools_mod.tool_write(idx, cfg, "big.js", excerpt)
     assert obs.startswith("ERROR"), obs
-    assert "PARTIAL read" in obs
+    assert "PARTIAL read" in obs or "lost fragment" in obs
     assert len((tmp_path / "big.js").read_text().splitlines()) == 200, \
         "refused overwrite must not touch the file"
 
@@ -959,12 +959,21 @@ def test_window_rewrite_guard(tmp_path):
     assert "WROTE big.js (30 lines)" in tools_mod.tool_write(
         idx, cfg, "big.js", fresh)
 
-    # Below the floor: verbatim shrinking is ordinary small-file editing.
+    # A small file's verbatim shrink that drops its tail is still a lost
+    # fragment: test_1a's 7-line README was written back as its 2-line
+    # Changelog tail. A genuine rewrite with invented content is allowed.
     small_lines = lines[:7]
     assert tools_mod.tool_write(idx, cfg, "small.js",
                                 "\n".join(small_lines)).startswith("CREATED")
-    assert tools_mod.tool_write(idx, cfg, "small.js",
-                                "\n".join(small_lines[:3])).startswith("WROTE")
+    obs = tools_mod.tool_write(idx, cfg, "small.js",
+                               "\n".join(small_lines[:3]))
+    assert obs.startswith("ERROR"), obs
+    assert "lost" in obs.lower() or "fragment" in obs.lower()
+    assert (tmp_path / "small.js").read_text() == \
+        "\n".join(small_lines) + "\n"
+    assert tools_mod.tool_write(
+        idx, cfg, "small.js",
+        "brand_new_a()\nbrand_new_b()\nbrand_new_c()").startswith("WROTE")
 
 
 def test_write_guard_refuses_lost_head_fragment(tmp_path):
@@ -1013,6 +1022,41 @@ def test_write_guard_refuses_lost_head_fragment(tmp_path):
     # A genuine rewrite that copies no original line is still allowed.
     fresh = "\n".join(f"def brand_new_{i}(): return {i}" for i in range(4))
     assert tools_mod.tool_write(idx, cfg, "reporting.py",
+                                fresh).startswith("WROTE")
+
+
+def test_write_guard_refuses_chunked_tail_loss(tmp_path):
+    """test_1a O7: a 182-line module was written back as its first 120 lines
+    (the model planned a chunked write and forgot the appends). The file
+    still parsed and had not shrunk by more than half, so both older guards
+    passed -- but checkLanding/calculateScore/isGameOver/restart were gone.
+    Copied text that drops top-level definitions is now refused."""
+    import pathlib
+    from pedacito import tools as tools_mod
+
+    class FakeIndex:
+        root = pathlib.Path(tmp_path)
+        files = []
+        def resolve_file(self, f):
+            return None
+
+    cfg = config_mod.Config()
+    cfg.allow_write = True
+    idx = FakeIndex()
+    lines = [f"def helper_{i}(): return {i}" for i in range(40)]
+    original = "\n".join(lines) + "\n"
+    (tmp_path / "core.py").write_text(original)
+
+    # First 25 of 40 lines: not a tiny fragment, not a >half shrink.
+    chunk = "\n".join(lines[:25])
+    obs = tools_mod.tool_write(idx, cfg, "core.py", chunk)
+    assert obs.startswith("ERROR"), obs
+    assert "lost fragment" in obs or "drops top-level" in obs
+    assert (tmp_path / "core.py").read_text() == original
+
+    # A genuine rewrite with invented content still applies.
+    fresh = "\n".join(f"def brand_new_{i}(): return {i}" for i in range(12))
+    assert tools_mod.tool_write(idx, cfg, "core.py",
                                 fresh).startswith("WROTE")
 
 
@@ -1078,7 +1122,8 @@ def test_empty_search_overwrite_gets_the_write_guard(tmp_path):
     results = edits.apply_edits(tmp_path, edits.parse_edits(reply),
                                 backup=False)
     assert len(results) == 1 and not results[0].ok
-    assert "PARTIAL read" in results[0].message
+    assert ("PARTIAL read" in results[0].message
+            or "lost fragment" in results[0].message)
     assert (tmp_path / "mod.py").read_text() == original
 
     # The same guard covers an empty-SEARCH block mixed with a real edit.
@@ -1101,6 +1146,44 @@ def test_empty_search_overwrite_gets_the_write_guard(tmp_path):
     assert (tmp_path / "mod.py").read_text().startswith("def brand_new_0")
 
 
+def test_single_line_reapply_after_earlier_landed_block(tmp_path):
+    """test_1a P3: a gather `write` landed a two-block reply, then the answer
+    phase re-sent both blocks. Block 1 was recognised as already applied, but
+    block 2's REPLACE was a single line, which the old guard refused as too
+    ambiguous -- a spurious FAIL for an edit already on disk. Once an earlier
+    block proves the reply drifted ahead of the file, a single-line REPLACE
+    that occurs exactly once is accepted too."""
+    (tmp_path / "gen.py").write_text(
+        "def clamp(v, lo, hi):\n"
+        "    return max(lo, min(hi, v))\n"
+        "\n"
+        "WIDTH = 10\n")
+    reply = (
+        "--- FILE: gen.py\n<<<<<<< SEARCH\n"
+        "def clamp(v, lo, hi):\n    return v\n"
+        "=======\ndef clamp(v, lo, hi):\n    return max(lo, min(hi, v))\n"
+        ">>>>>>> REPLACE\n"
+        "--- FILE: gen.py\n<<<<<<< SEARCH\nWIDTH = 5\n"
+        "=======\nWIDTH = 10\n>>>>>>> REPLACE\n")
+    results = edits.apply_edits(tmp_path, edits.parse_edits(reply),
+                                backup=False)
+    assert len(results) == 1 and results[0].ok, results
+    assert "already applied" in results[0].message
+    assert (tmp_path / "gen.py").read_text() == (
+        "def clamp(v, lo, hi):\n"
+        "    return max(lo, min(hi, v))\n"
+        "\n"
+        "WIDTH = 10\n")
+
+    # Without an earlier landed block the single-line miss stays a failure.
+    (tmp_path / "flag.py").write_text("FLAG = True\nOTHER = 1\n")
+    reply = ("--- FILE: flag.py\n<<<<<<< SEARCH\nFLAG = False\n=======\n"
+             "FLAG = True\n>>>>>>> REPLACE\n")
+    res = edits.apply_edits(tmp_path, edits.parse_edits(reply), backup=False)
+    assert len(res) == 1 and not res[0].ok
+    assert "not found" in res[0].message
+
+
 def test_anchored_whole_file_replacement_gets_the_write_guard(tmp_path):
     """A `LINES 1-N` header spanning the whole file is a whole-file rewrite
     even though its SEARCH text is non-empty. The fragment guard has to
@@ -1117,7 +1200,8 @@ def test_anchored_whole_file_replacement_gets_the_write_guard(tmp_path):
     results = edits.apply_edits(tmp_path, edits.parse_edits(reply),
                                 backup=False)
     assert len(results) == 1 and not results[0].ok
-    assert "PARTIAL read" in results[0].message
+    assert ("PARTIAL read" in results[0].message
+            or "lost fragment" in results[0].message)
     assert (tmp_path / "mod.py").read_text() == original
 
     # A genuine whole-file rewrite (invented content) still applies.

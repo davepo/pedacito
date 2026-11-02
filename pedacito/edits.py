@@ -521,6 +521,18 @@ def _creation_text(group: list[Edit]) -> str:
     return text
 
 
+_DEF_NAME_RE = re.compile(
+    r"^[ \t]*(?:export\s+)?(?:async\s+)?"
+    r"(?:def|function|class|func|type)\s+"
+    r"([A-Za-z_$][\w$]*)", re.M)
+
+
+def _defined_names(text: str) -> set[str]:
+    """Top-level declaration names in a source file, language-agnostic
+    enough for the fragment guard (function/def/class/func/type/const...)."""
+    return set(_DEF_NAME_RE.findall(text))
+
+
 def fragment_refusal(rel: str, original: str, new_text: str) -> str | None:
     """Why replacing `original` with `new_text` looks like a fragment of a
     partial read rather than a whole-file rewrite, or None when it is safe.
@@ -542,6 +554,28 @@ def fragment_refusal(rel: str, original: str, new_text: str) -> str | None:
     ordinary small-file editing and stays allowed."""
     old_ls = [l.strip() for l in original.splitlines() if l.strip()]
     new_ls = [l.strip() for l in new_text.splitlines() if l.strip()]
+    # A chunked write that stops early keeps most of the file's text but
+    # drops the definitions that lived in the tail (test_1a: a 182-line
+    # module written back as its first 120 lines passed the >half-shrink
+    # rule and deleted checkLanding, calculateScore, isGameOver and
+    # restart). If the new content is largely an in-order copy of the old
+    # and loses a top-level name, it is a fragment even when it is not a
+    # tiny one and the file did not shrink by half.
+    if new_ls and len(old_ls) >= 8:
+        lost = _defined_names(original) - _defined_names(new_text)
+        if lost:
+            probe = iter(old_ls)
+            copied = sum(1 for l in new_ls if l in probe)
+            if copied >= max(5, int(0.8 * len(new_ls))):
+                names = ", ".join(sorted(lost)[:4])
+                more = "" if len(lost) <= 4 else f" (+{len(lost) - 4} more)"
+                return (f"ERROR: refusing to overwrite {rel}: the new "
+                        f"content is an in-order copy of the file but drops "
+                        f"top-level definition(s) {names}{more} -- the "
+                        "signature of writing back only the first chunk you "
+                        "read (lost fragment). Keep the file and use "
+                        "targeted search/replace edits, or `append` the "
+                        "remaining lines.")
     # A handful of lines is never a full-file rewrite of a real module:
     # it is the fragment the model composed for its addition, not the
     # file. (deepclitest: a 42-line module was replaced by the 2-line
@@ -553,6 +587,22 @@ def fragment_refusal(rel: str, original: str, new_text: str) -> str | None:
                 "Keep the existing file and add your lines with a "
                 "search/replace edit block (or `append` for the end of "
                 "the file).")
+    # The floor for a head/tail loss is lower than the window re-quote
+    # floor: test_1a's 7-line README was written back as its 2-line
+    # Changelog tail, which is data loss even though the file is small.
+    if new_ls and len(old_ls) >= 5 and 2 * len(new_ls) < len(old_ls):
+        shared_small = set(old_ls) & set(new_ls)
+        keeps_ends_small = old_ls[0] in new_ls and old_ls[-1] in new_ls
+        if shared_small and not keeps_ends_small:
+            return (f"ERROR: refusing to overwrite {rel}: your content has "
+                    f"{len(new_ls)} non-blank lines but the file has "
+                    f"{len(old_ls)}, reuses text from the file, and drops "
+                    "its beginning or end -- the signature of a lost "
+                    "fragment, which would erase the lines you never "
+                    "included. Make a targeted search/replace edit "
+                    "instead. If you truly mean to shrink the whole file, "
+                    "read it completely and rewrite it without copying "
+                    "pieces of the old text.")
     if new_ls and len(old_ls) >= 8 and 2 * len(new_ls) < len(old_ls):
         probe = iter(old_ls)
         if all(l in probe for l in new_ls):
@@ -586,22 +636,30 @@ def _content_lines(text: str) -> list[str]:
     return [l.rstrip() for l in text.splitlines() if l.strip()]
 
 
-def _replace_already_present(text: str, repl: str, start: int = -1) -> bool:
+def _replace_already_present(text: str, repl: str, start: int = -1,
+                             allow_single: bool = False) -> bool:
     """True when `repl`'s content lines already occur in `text` as one
     contiguous run -- at offset `start` when given (the span the block
     matched), anywhere otherwise. Replaces shorter than two content lines
-    never count: a single common line is too ambiguous to skip a real edit
-    over. Catches two field failures: a block re-emitted after a gather
-    write already landed it (the SEARCH no longer matches but the REPLACE
-    content is on disk), and repair rounds that appended the same test pair
-    again and again (the SEARCH still matches and the REPLACE sits verbatim
-    at the span, so applying would duplicate it)."""
+    never count by default: a single common line is too ambiguous to skip a
+    real edit over. `allow_single` relaxes that only after an earlier block
+    in the same file was already found on disk (gather-write drift), and
+    then only when the line occurs exactly once. Catches two field failures:
+    a block re-emitted after a gather write already landed it (the SEARCH no
+    longer matches but the REPLACE content is on disk), and repair rounds
+    that appended the same test pair again and again (the SEARCH still
+    matches and the REPLACE sits verbatim at the span, so applying would
+    duplicate it)."""
     want = _content_lines(repl)
-    if len(want) < 2:
+    if len(want) < 2 and not allow_single:
+        return False
+    if not want:
         return False
     hay = _content_lines(text if start < 0 else text[start:])
     for i in range(len(hay) - len(want) + 1):
         if hay[i:i + len(want)] == want:
+            if len(want) == 1 and hay.count(want[0]) != 1:
+                return False
             return True
     return False
 
@@ -1166,7 +1224,8 @@ def apply_edits(root: Path, edits: list[Edit], backup: bool = True,
             span = locate(text, e.search, cfg, replacement=e.replace)
             if span is None:
                 n = text.count(e.search)
-                if n == 0 and _replace_already_present(text, e.replace):
+                if n == 0 and _replace_already_present(
+                        text, e.replace, allow_single=bool(already)):
                     # The block was already applied -- typically a gather
                     # write landed it before the answer phase, so the SEARCH
                     # no longer matches but the REPLACE content is on disk.
