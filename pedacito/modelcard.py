@@ -10,8 +10,8 @@ The suite is ~20 short, scripted calls against the configured server:
                    ten small scenarios (against a tiny fake map)?
   JSON adherence   did every step reply parse on the first try?  (the tool-choice
                    scenarios also run with native tool calls and with
-                   `reasoning` first; an arm is adopted only if it scores 0.1
-                   better with no loss of JSON adherence)
+                   `reasoning` first and with worked examples; an arm is adopted
+                   only if it scores 0.1 better with no loss of JSON adherence)
   edit format      can it emit a search/replace block that anchors and applies?
   instructions     does it keep a planted constraint, ignore a planted injection?
   honesty          does it admit it has not read code it was never shown?
@@ -111,7 +111,8 @@ def apply(cfg) -> dict | None:
         return sources.get(name, "default") == "default"
 
     for name in ("best_of", "verify_answer", "fold_tail_steps", "plan_threshold",
-                 "tool_mode", "disable_thinking", "step_reasoning_first"):
+                 "tool_mode", "disable_thinking", "step_reasoning_first",
+                 "fewshot_steps"):
         if name in ch and unset(name):
             setattr(cfg, name, ch[name])
             sources[name] = "model card"
@@ -163,11 +164,23 @@ def _gather_system(cfg) -> str:
     return prompts_mod.gather_system(cfg, GATHER_BASE, TOOL_HELP) + FLAT_HINT
 
 
-def _t_tool_choice(client, cfg, reasoning_first: bool = False
-                   ) -> tuple[float, float, list[str]]:
+def _fewshot_text(schema: dict) -> str:
+    """The worked-examples block gather would show for the probe's tiny
+    project: its first definition (`Scheduler` in src/scheduler.py), built by
+    the same code the agent uses."""
+    from .agent import fewshot_actions, fewshot_block
+    return fewshot_block(
+        fewshot_actions("src/scheduler.py", "Scheduler", 10, 50), schema)
+
+
+def _t_tool_choice(client, cfg, reasoning_first: bool = False,
+                   fewshot: bool = False) -> tuple[float, float, list[str]]:
     """(accuracy, json_ok rate, notes). `reasoning_first` runs the same eight
-    scenarios against the reason-first step schema."""
+    scenarios against the reason-first step schema; `fewshot` shows the
+    project's worked steps between the map and the task (one arm at a time, so
+    each is measured against the plain baseline)."""
     schema = _step_schema(cfg, reasoning_first)
+    examples = _fewshot_text(schema) + "\n\n" if fewshot else ""
     system = _gather_system(cfg)
     right = parsed = 0
     notes = []
@@ -188,7 +201,7 @@ def _t_tool_choice(client, cfg, reasoning_first: bool = False
     for task, extra, ok in scenarios:
         msgs = [{"role": "system", "content": system},
                 {"role": "user", "content":
-                 f"PROJECT MAP\n\n{_MAP}\n\nTASK\n{task}\n\n"
+                 f"PROJECT MAP\n\n{_MAP}\n\n{examples}TASK\n{task}\n\n"
                  "[Next action? No lookup limit -- choose 'done' once the "
                  "task is covered.]"}] + extra
         try:
@@ -545,6 +558,9 @@ def choose(measured: dict, hosted: bool) -> dict:
     # Reason-first steps follow the same rule: only when they measure better.
     if _arm_wins(measured, "rf", tc, js):
         ch["step_reasoning_first"] = True
+    # ...and so do worked examples in the first user turn.
+    if _arm_wins(measured, "fs", tc, js):
+        ch["fewshot_steps"] = True
     # The thinking A/B verdict, persisted so every later run starts in the
     # winning mode instead of rediscovering it one empty reply at a time.
     # Only a decisive split is recorded: thinking burned the answer budget
@@ -652,6 +668,13 @@ def calibrate(client, cfg, verbose: bool = True, quick: bool = False,
     say(f"  tool choice, reasoning first    "
         f"{measured['tool_choice_rf']:>4.0%}   "
         f"adherence {measured['json_ok_rf']:.0%}")
+    cols, n = _repeat(_t_tool_choice, repeats, client, cfg, False, True)
+    _store(measured, "tool_choice_fs", cols[0])
+    _store(measured, "json_ok_fs", cols[1])
+    notes += [f"few-shot: {x}" for x in n[:3]]
+    say(f"  tool choice, worked examples    "
+        f"{measured['tool_choice_fs']:>4.0%}   "
+        f"adherence {measured['json_ok_fs']:.0%}")
     cols, n = _repeat(_t_edit_format, repeats, client, cfg)
     _store(measured, "edit_format", cols[0])
     notes += n

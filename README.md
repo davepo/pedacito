@@ -989,6 +989,7 @@ config --reference` prints the annotated template. Key settings:
 | `allow_steering` | true | Deliver lines typed mid-task to the model in `chat`. |
 | `tool_mode` | `grammar` | `native` sends lookup steps through the model's tool-call channel; `calibrate` picks. |
 | `step_reasoning_first` | unset | `true` puts `reasoning` before the action in each lookup step (the model says what it needs, then picks); unset lets the model card decide. `calibrate` measures both orders with the same adopt-only-if-0.1-better rule as `tool_mode`. |
+| `fewshot_steps` | unset | `true` shows three worked steps from your project (grep a symbol, read it, done) once in the first user turn, even under grammar or native tool calls; unset lets the model card decide. About 100 extra prompt tokens per task, cached for the whole gather. `calibrate` adopts it only if it picks the right action 0.1 more often with no loss of well-formed steps. |
 | `edit_plan_brief` | false | The edit brief asks for 1-3 plan lines before the blocks (file, lines or symbol, why) and no other text between or inside blocks. A prompt override (`edit_format.md`, `answer.md`) bypasses it. |
 | `sandbox` / `sandbox_network` | true / false | OS sandbox for `run` and test commands; allow network inside it. |
 | `sandbox_writable` / `sandbox_strict` | `[]` / false | Extra writable dirs; refuse to run when no sandbox can be applied. |

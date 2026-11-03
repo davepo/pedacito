@@ -293,6 +293,10 @@ class Config:
     # it needs before it picks the action. None = the model card decides
     # (`pedacito calibrate` measures both orders); true/false forces it.
     step_reasoning_first: bool | None = None
+    # Show three worked steps from this project (grep, read, done) once in the
+    # first user turn, between the map and the task, even when a grammar or
+    # native tool call guarantees the format. None = the model card decides.
+    fewshot_steps: bool | None = None
     # Treat a creation of a new path paired with a block that empties an
     # existing same-extension file as a real move (old file deleted). Set
     # false for strict create+clear semantics that never delete automatically.
@@ -615,6 +619,7 @@ _TUPLE_FIELDS = ("extra_extensions", "shell_allowlist", "mcp_servers",
 # global value) decides. TOML has no null, so a key that is absent stays None.
 _OPTIONAL_TYPES = {
     "step_reasoning_first": bool,
+    "fewshot_steps": bool,
     "temperature_answer": float,
     "temperature_repair": float,
 }
@@ -2105,6 +2110,8 @@ REFERENCE_TEMPLATE = TEMPLATE + '''
 # compact_step_schema is experimental: drops unused fields from step replies.
 # step_reasoning_first puts `reasoning` before the action in each step; unset
 # lets the model card decide (`pedacito calibrate` measures both orders).
+# fewshot_steps shows three worked steps from this project once in the first
+# user turn (unset = the model card decides).
 # edit_plan_brief asks for 1-3 plan lines before the edit blocks.
 # auto_diagnostics runs the detected linter/typechecker after each auto task.
 # post_edit_check runs a cheap per-file lint/syntax check after every applied

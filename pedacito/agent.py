@@ -27,6 +27,7 @@ loop, so the server's prefix cache hits on every turn.
 from __future__ import annotations
 
 import contextlib
+import json
 import re
 import sys
 
@@ -77,6 +78,39 @@ _MUTATING = {"write", "append", "move", "delete", "undo", "rename", "run",
 
 # Steps discarded for a cut-off payload before gather gives up.
 _MAX_PAYLOAD_CUTS = 2
+
+
+def fewshot_enabled(cfg) -> bool:
+    """True when `fewshot_steps` asks for worked steps in the first user turn.
+    Only an explicit True (the user's, or a model card's) turns it on."""
+    return getattr(cfg, "fewshot_steps", None) is True
+
+
+def fewshot_actions(file: str, symbol: str, start: int, end: int) -> list[dict]:
+    """The three worked steps for a definition `symbol` in `file`."""
+    return [
+        {"action": "grep", "pattern": symbol,
+         "reasoning": "find where it is used"},
+        {"action": "read", "file": file, "start": start, "end": end,
+         "reasoning": "read the definition"},
+        {"action": "done", "reasoning": "have what I need"},
+    ]
+
+
+def fewshot_block(shots: list[dict], schema: dict) -> str:
+    """The worked-examples text for the first user turn: three lines, one
+    step each, in the step schema's field order, unused fields left out (the
+    transcript echoes steps the same way). "" when there are no shots."""
+    from .llm import schema_example_with
+    lines = []
+    for shot in shots[:3]:
+        full = json.loads(schema_example_with(schema, **shot))
+        lines.append(json.dumps({k: v for k, v in full.items()
+                                 if v not in ("", 0, None)}))
+    if not lines:
+        return ""
+    return ("WORKED EXAMPLES from this project (unused fields stay \"\" or 0; "
+            "choose the action the task needs):\n" + "\n".join(lines))
 
 
 def _step_signature(step: dict) -> tuple:
@@ -724,33 +758,32 @@ class Agent:
         except TypeError:
             return self.index.map_for_prompt(self.cfg)
 
-    def _prime_fewshot(self) -> None:
-        """Worked step examples from THIS project (a real file, a real symbol)
-        for the client to show when the server cannot enforce a JSON grammar:
-        a small model copies a concrete example far better than a dummy
-        `{"action": "read", "file": ""}`."""
-        if not hasattr(self.client, "fewshot"):
-            return
+    def _fewshot_shots(self) -> list[dict]:
+        """Three worked steps from THIS project (a real file, a real symbol):
+        grep it, read its definition, done. [] when the project has no code."""
         try:
-            unit = None
             for f in self.index.code_files:
                 tops = self.index.top_level(f)
                 if tops:
                     unit = tops[0]
-                    break
-            if unit is None:
-                self.client.fewshot = []
-                return
-            end = min(unit.scope_end or unit.end, unit.start + 40)
-            self.client.fewshot = [
-                {"action": "grep", "pattern": unit.qualname.split(".")[0],
-                 "reasoning": "find where it is used"},
-                {"action": "read", "file": unit.file, "start": unit.start,
-                 "end": end, "reasoning": "read the definition"},
-                {"action": "done", "reasoning": "have what I need"},
-            ]
+                    return fewshot_actions(
+                        unit.file, unit.qualname.split(".")[0], unit.start,
+                        min(unit.scope_end or unit.end, unit.start + 40))
         except Exception:
-            self.client.fewshot = []
+            pass
+        return []
+
+    def _prime_fewshot(self) -> None:
+        """Worked step examples from THIS project for the client to show when
+        the server cannot enforce a JSON grammar: a small model copies a
+        concrete example far better than a dummy `{"action": "read", "file":
+        ""}`. With `fewshot_steps` on, gather puts the same examples in the
+        first user turn instead, so the client falls back to its one dummy
+        example rather than repeating them."""
+        if not hasattr(self.client, "fewshot"):
+            return
+        self.client.fewshot = [] if fewshot_enabled(self.cfg) \
+            else self._fewshot_shots()
 
     def _lead_notes(self) -> str:
         """Per-task orientation placed above the map: repo brief and git state."""
@@ -1000,8 +1033,15 @@ class Agent:
             tried = ""
         if tried:
             lead = (lead + "\n" if lead else "") + tried
+        examples = ""
+        if fewshot_enabled(self.cfg):
+            # Once, here: user0 is sent as the cached prefix on every step, so
+            # three lines cost their tokens once per gather, not once per step.
+            examples = fewshot_block(self._fewshot_shots(),
+                                     schema_for(self.cfg))
         user0 = (lead + "\n\n" if lead else "") \
-            + f"PROJECT MAP\n\n{repo_map}\n\nTASK\n{task}"
+            + f"PROJECT MAP\n\n{repo_map}\n\n" \
+            + (examples + "\n\n" if examples else "") + f"TASK\n{task}"
         if safety.has_secret(task) and is_hosted(self.cfg) \
                 and getattr(self.cfg, "redact_secrets", True):
             print("  [warning: the task text looks like it contains a secret "

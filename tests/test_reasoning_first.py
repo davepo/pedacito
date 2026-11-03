@@ -346,8 +346,9 @@ def test_calibration_adopts_reason_first_only_when_it_measures_better():
     assert m["tool_choice_rf"] == 1.0 and m["json_ok_rf"] == 1.0
     assert m["tool_choice"] < 0.5                 # the baseline arm: action first
     assert card["choices"]["step_reasoning_first"] is True
-    # the baseline arm is action-first, the new arm reasoning-first
-    assert good.first_props.count("action") == 10
+    # the plain arm (and the few-shot arm, which keeps the default order) are
+    # action-first, the reason-first arm reasoning-first
+    assert good.first_props.count("action") == 20
     assert good.first_props.count("reasoning") == 10
 
     flat = _OrderSensitive(rf_good=False)
