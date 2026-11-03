@@ -299,6 +299,11 @@ class Config:
     fuzzy_min_ratio: float = 0.85
     # Repair round-trips per apply when a search/replace block fails to match.
     repair_rounds: int = 2
+    # Ask the model to open an edit reply with 1-3 lines naming the file, the
+    # lines or symbol it will change, and why (and to put no other text between
+    # or inside blocks). Off by default so it can be ablated. A prompt override
+    # (`.pedacito/prompts/edit_format.md` or `answer.md`) bypasses it.
+    edit_plan_brief: bool = False
     # Per-message OUTPUT ceiling the provider honours (hosted APIs cap one
     # reply far below their context window, e.g. ~8k tokens). When >0 and the
     # run targets a hosted API, auto_fit clamps reply budgets to it. Explicit

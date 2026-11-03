@@ -1286,6 +1286,7 @@ def _looks_like_tool_calls_only(reply: str) -> bool:
 _PROMISE_HEAD_RE = re.compile(
     r"^[\s#*\-\u2022\d.)]*(?:i['\u2019]ll|i will|i['\u2019]m going to|"
     r"i am going to|let me|first,? i['\u2019]ll|next,? i['\u2019]ll)\b")
+_EDIT_BLOCK_MARK_RE = re.compile(r"(?m)^<{5,}\s*SEARCH\b")
 _REPORT_EVIDENCE_RE = re.compile(
     r"\b(?:observed|observes|measured|measures|captured|shows?|showed|"
     r"found|confirmed|verified|reported|rendered|loaded|screenshot|"
@@ -1309,6 +1310,8 @@ def _looks_like_unexecuted_promise(reply: str) -> bool:
     text = _report_prose(reply).strip()
     if not text:
         return False
+    if _EDIT_BLOCK_MARK_RE.search(text):
+        return False        # a plan line ("I'll rename X ...") before blocks
     norm = _normalized_reply(text)
     if not _PROMISE_HEAD_RE.match(norm):
         return False

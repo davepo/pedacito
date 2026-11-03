@@ -270,13 +270,41 @@ propose no edit." Write a short explanation first. If the task is only a
 question, answer it and emit no blocks."""
 
 
+# edit_plan_brief: (built-in wording, replacement) pairs. The plan line is what
+# the model states before its blocks; the format line keeps text out of and
+# between them. A phrase that is not in the text (a caller's own `full`) is
+# left alone.
+PLAN_LINE = ("Before the blocks, write 1-3 lines: the file, the lines or "
+             "symbol you will change, and why.")
+_PLAN_BRIEF_SWAPS = (
+    ("exactly this format, and nothing else around them:",
+     "exactly this format, with no other text between or inside blocks:"),
+    ("Before the blocks, write a short plain explanation of what you changed "
+     "and why.", PLAN_LINE),
+    ("exactly this format and\nnothing else around them:",
+     "exactly this format with\nno other text between or inside blocks:"),
+    ("Write a short explanation first.", PLAN_LINE),
+)
+
+
+def plan_brief(text: str) -> str:
+    """`text` (an edit brief) reworded for `edit_plan_brief`."""
+    for old, new in _PLAN_BRIEF_SWAPS:
+        text = text.replace(old, new)
+    return text
+
+
 def edit_format(cfg, full: str, pack: str | None = None) -> str:
-    """EDIT_FORMAT at the run's density (override `edit_format` wins)."""
+    """EDIT_FORMAT at the run's density (override `edit_format` wins, and
+    bypasses `edit_plan_brief`)."""
     override = load_override(cfg, "edit_format")
     if override:
         return override
     pack = pack or pack_for(cfg)
-    return _TINY_EDIT if pack == "tiny" else full
+    text = _TINY_EDIT if pack == "tiny" else full
+    if getattr(cfg, "edit_plan_brief", False):
+        text = plan_brief(text)
+    return text
 
 
 # --------------------------------------------------------------------------

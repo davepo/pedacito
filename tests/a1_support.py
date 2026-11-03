@@ -27,7 +27,7 @@ PRICING = (
 def make_project(tmp_path, **cfg_attrs):
     """(root, idx, cfg) for a one-file project; `cfg_attrs` set on the config."""
     root = tmp_path / "proj"
-    root.mkdir(exist_ok=True)
+    root.mkdir(parents=True, exist_ok=True)
     (root / "pricing.py").write_text(PRICING, encoding="utf-8")
     cfg = Config()
     cfg.log_events = False
@@ -42,17 +42,20 @@ def make_project(tmp_path, **cfg_attrs):
 
 class Scripted(EvalModel):
     """EvalModel that records the message contents and schema of every step
-    call, and the temperature each chat() ran at."""
+    call, and the messages of every chat() call."""
 
     def __init__(self, steps=None, reply=""):
         super().__init__(reply, steps)
         self.seen: list[tuple[list[str], dict]] = []
-        self.temps: list[float | None] = []
-        self._override = None
+        self.chats: list[list[dict]] = []
 
     def chat_json(self, messages, schema, max_tokens, **kw):
         self.seen.append(([m["content"] for m in messages], schema))
         return super().chat_json(messages, schema, max_tokens, **kw)
+
+    def chat(self, messages, max_tokens, **kw):
+        self.chats.append([dict(m) for m in messages])
+        return super().chat(messages, max_tokens, **kw)
 
 
 def gather(tmp_path, steps, cfg_attrs=None, client=None, task="Fix bulk_discount"):
