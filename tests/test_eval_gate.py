@@ -209,6 +209,20 @@ def test_gate_reads_old_reports_whose_rows_have_no_repeat_key():
     assert evalrun.compare_reports(base, cur)[0] != []
 
 
+def test_gate_refuses_a_baseline_from_before_per_task_repair_counts():
+    """first-apply-clean used to read the client's cumulative repair total, so
+    a baseline from that code is not comparable with a current report."""
+    old, cur = _eight(), _eight()
+    cur["metrics"] = evalrun.METRICS_VERSION
+    reg, _ = evalrun.compare_reports(old, cur)
+    assert any("predates per-task repair counts" in r for r in reg)
+    # same vintage on both sides, old or new, compares as usual
+    assert evalrun.compare_reports(_eight(), _eight())[0] == []
+    base = _eight()
+    base["metrics"] = evalrun.METRICS_VERSION
+    assert evalrun.compare_reports(base, cur)[0] == []
+
+
 def test_replayer_marks_a_divergent_prompt(tmp_path):
     rec = tmp_path / "run.jsonl"
     rec.write_text(json.dumps({

@@ -760,6 +760,10 @@ def render(rows: list[dict], summary: dict) -> str:
 # records the version it was written under, so the gate can tell a label that
 # is new from a regression of one the baseline already had.
 TAXONOMY_VERSION = 2
+# Bumped when a row's meaning changes. 2: `repair_calls` counts one task's
+# repair calls (it used to read the client's cumulative total, so one repair
+# marked every later edit task as not first-apply-clean).
+METRICS_VERSION = 2
 _LABELS_V1 = frozenset({
     "wrong file", "unread edit", "format error", "truncation", "refusal",
     "hallucination", "test regression", "injection followed", "wrong branch",
@@ -965,6 +969,13 @@ def compare_reports(baseline: dict, current: dict,
         elif old > 0 and new < old * 0.8:
             improvements.append(f"{label}: {old:.0f} -> {new:.0f}")
 
+    b_met = int(baseline.get("metrics") or 1)
+    c_met = int(current.get("metrics") or 1)
+    if b_met < METRICS_VERSION <= c_met:
+        regressions.append(
+            "baseline predates per-task repair counts (metrics "
+            f"{b_met} vs {c_met}): its first-apply-clean is not comparable "
+            "-- re-run the baseline with this version")
     b_think = baseline.get("disable_thinking")
     c_think = current.get("disable_thinking")
     if b_think is not None and c_think is not None \
@@ -1078,7 +1089,7 @@ def run_cli(args, cfg) -> int:
     print(render(rows, summary))
     report = {"model": cfg.model, "pack": getattr(cfg, "prompt_pack", ""),
               "disable_thinking": bool(getattr(cfg, "disable_thinking", False)),
-              "taxonomy": TAXONOMY_VERSION, "repeats": repeats,
+              "taxonomy": TAXONOMY_VERSION, "metrics": METRICS_VERSION, "repeats": repeats,
               "seeds": seeds if seeds[0] is not None else [],
               "summary": summary, "rows": rows}
     if args.out:
