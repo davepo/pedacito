@@ -117,8 +117,11 @@ browser  - open a web page in headless Chromium, interact, wait, capture it.
 done     - stop gathering; you have enough.  args: none"""
 
 # Field order is load-bearing: grammar-constrained decoding emits keys in
-# schema order, so a reply cut off by the token limit loses only the trailing
-# `reasoning`, not the action.
+# schema order. By default `reasoning` is last, so a reply cut off by the token
+# limit loses only the trailing note, not the action. With step_reasoning_first
+# (schema_for) it is first: a cut inside it leaves no action (llm.chat_json
+# re-asks), and a cut after it lands in an argument, which llm._cut_field names
+# so agent.gather refuses the step.
 STEP_SCHEMA = {
     "type": "object",
     "properties": {
@@ -232,11 +235,18 @@ def _skills_exist(cfg) -> bool:
     return bool(skills.names(root, cfg))
 
 
+def reasoning_first(cfg) -> bool:
+    """True when the step schema puts `reasoning` before the action. Only an
+    explicit True (the user's, or a model card's) turns it on."""
+    return getattr(cfg, "step_reasoning_first", None) is True
+
+
 def schema_for(cfg) -> dict:
     """Return STEP_SCHEMA narrowed to the actions this run allows, so the
     model cannot pick a disabled action. Fields only a disabled action uses
     (`to`, `command`) are dropped too. A tiny pack keeps the small core plus
-    `context`: a 4B model never sees two dozen tools."""
+    `context`: a 4B model never sees two dozen tools. `step_reasoning_first`
+    moves `reasoning` to the front."""
     from .prompts import pack_for
     pack = pack_for(cfg)
     tiny = pack == "tiny"
@@ -303,6 +313,10 @@ def schema_for(cfg) -> dict:
         required = ["action", "reasoning"]
     ordered = ["action", "file", "start", "end", "pattern", "symbol",
                "to", "command", "content", "reasoning"]
+    if reasoning_first(cfg):
+        ordered = ["reasoning"] + [k for k in ordered if k != "reasoning"]
+        schema["properties"]["reasoning"]["description"] = (
+            "Under 20 words: what you need next and why this action.")
     schema["properties"] = {k: schema["properties"][k] for k in ordered
                             if k in schema["properties"]}
     schema["required"] = [k for k in ordered if k in required]

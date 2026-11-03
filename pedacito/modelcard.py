@@ -8,7 +8,10 @@ The suite is ~20 short, scripted calls against the configured server:
 
   tool choice      does it pick read / find / callers / outline / done for
                    ten small scenarios (against a tiny fake map)?
-  JSON adherence   did every step reply parse on the first try?
+  JSON adherence   did every step reply parse on the first try?  (the tool-choice
+                   scenarios also run with native tool calls and with
+                   `reasoning` first; an arm is adopted only if it scores 0.1
+                   better with no loss of JSON adherence)
   edit format      can it emit a search/replace block that anchors and applies?
   instructions     does it keep a planted constraint, ignore a planted injection?
   honesty          does it admit it has not read code it was never shown?
@@ -108,7 +111,7 @@ def apply(cfg) -> dict | None:
         return sources.get(name, "default") == "default"
 
     for name in ("best_of", "verify_answer", "fold_tail_steps", "plan_threshold",
-                 "tool_mode", "disable_thinking"):
+                 "tool_mode", "disable_thinking", "step_reasoning_first"):
         if name in ch and unset(name):
             setattr(cfg, name, ch[name])
             sources[name] = "model card"
@@ -141,12 +144,15 @@ _SCENARIOS: list[tuple[str, list[dict], set[str]]] = [
 ]
 
 
-def _step_schema(cfg):
+def _step_schema(cfg, reasoning_first: bool = False):
+    """The probe's step schema. `reasoning_first` is pinned either way, so the
+    baseline arm never inherits a flag the user or an old card already set."""
     import copy as _copy
     from .tools import schema_for
     c = _copy.copy(cfg)
     c.allow_write = c.allow_shell = c.allow_browser = c.allow_screenshots = False
     c.allow_mcp = c.allow_subagents = c.allow_fetch = False
+    c.step_reasoning_first = reasoning_first
     return schema_for(c)
 
 
@@ -157,9 +163,11 @@ def _gather_system(cfg) -> str:
     return prompts_mod.gather_system(cfg, GATHER_BASE, TOOL_HELP) + FLAT_HINT
 
 
-def _t_tool_choice(client, cfg) -> tuple[float, float, list[str]]:
-    """(accuracy, json_ok rate, notes)."""
-    schema = _step_schema(cfg)
+def _t_tool_choice(client, cfg, reasoning_first: bool = False
+                   ) -> tuple[float, float, list[str]]:
+    """(accuracy, json_ok rate, notes). `reasoning_first` runs the same eight
+    scenarios against the reason-first step schema."""
+    schema = _step_schema(cfg, reasoning_first)
     system = _gather_system(cfg)
     right = parsed = 0
     notes = []
@@ -501,6 +509,21 @@ def _t_capabilities(client, cfg) -> dict:
     return caps
 
 
+_ARM_GAIN = 0.1
+
+
+def _arm_wins(measured: dict, arm: str, tc: float, js: float) -> bool:
+    """Adopt an `_t_tool_choice` arm (native tool calls, reason-first steps,
+    ...) only when it MEASURES better: a clear gain in choosing the right
+    action (`tool_choice_<arm>` >= baseline + 0.1) with no loss of well-formed
+    steps (`json_ok_<arm>` >= baseline). Means are rounded to 2 places, so the
+    gain is compared with a small epsilon (0.7 + 0.1 is 0.7999999999999999)."""
+    score = measured.get(f"tool_choice_{arm}")
+    return (score is not None
+            and score + 1e-9 >= tc + _ARM_GAIN
+            and measured.get(f"json_ok_{arm}", 0.0) >= js)
+
+
 def choose(measured: dict, hosted: bool) -> dict:
     """Card choices from the measurements."""
     tc = measured.get("tool_choice", 0.0)
@@ -515,13 +538,13 @@ def choose(measured: dict, hosted: bool) -> dict:
     pack = "full" if overall >= 0.8 else "small" if overall >= 0.55 else "tiny"
     # Native tool calls only when they MEASURE better: a clear gain in choosing
     # the right action with no loss of well-formed steps.
-    ntc = measured.get("tool_choice_native")
-    native_wins = (ntc is not None
-                   and ntc >= tc + 0.1
-                   and measured.get("json_ok_native", 0.0) >= js)
+    native_wins = _arm_wins(measured, "native", tc, js)
     ch: dict = {"prompt_pack": pack,
                 "answer_mode": "auto" if cont >= 1.0 else "rebuild",
                 "tool_mode": "native" if native_wins else "grammar"}
+    # Reason-first steps follow the same rule: only when they measure better.
+    if _arm_wins(measured, "rf", tc, js):
+        ch["step_reasoning_first"] = True
     # The thinking A/B verdict, persisted so every later run starts in the
     # winning mode instead of rediscovering it one empty reply at a time.
     # Only a decisive split is recorded: thinking burned the answer budget
@@ -622,6 +645,13 @@ def calibrate(client, cfg, verbose: bool = True, quick: bool = False,
                 f"adherence {measured['json_ok_native']:.0%}")
         else:
             say("  native tool calls: the server rejected them")
+    cols, n = _repeat(_t_tool_choice, repeats, client, cfg, True)
+    _store(measured, "tool_choice_rf", cols[0])
+    _store(measured, "json_ok_rf", cols[1])
+    notes += [f"reason-first: {x}" for x in n[:3]]
+    say(f"  tool choice, reasoning first    "
+        f"{measured['tool_choice_rf']:>4.0%}   "
+        f"adherence {measured['json_ok_rf']:.0%}")
     cols, n = _repeat(_t_edit_format, repeats, client, cfg)
     _store(measured, "edit_format", cols[0])
     notes += n

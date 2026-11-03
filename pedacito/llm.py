@@ -623,12 +623,31 @@ def _tool_call_arguments(message: dict) -> str:
 def _cut_field(text: str, obj: dict, schema: dict | None) -> str:
     """Which schema field a truncated reply died inside, or "" when benign.
 
+    With `reasoning` last (the default step schema) the last opened key is the
+    answer; callers treat "reasoning" as benign and refuse to run steps whose
+    payload field was cut. With `reasoning` first, a reply can also die between
+    arguments, inside a half-typed key that `_last_key_cut` never sees, so the
+    first required argument missing from the salvage is the cut field.
+    """
+    field = _last_key_cut(text, obj, schema)
+    props = (schema or {}).get("properties") or {}
+    if field or next(iter(props), "") != "reasoning":
+        return field
+    required = set((schema or {}).get("required") or [])
+    for key in props:
+        if key in required and key != "reasoning" and key not in obj:
+            return key
+    return ""
+
+
+def _last_key_cut(text: str, obj: dict, schema: dict | None) -> str:
+    """The field the LAST opened `"key":` of a truncated reply names, when the
+    salvage dropped it whole or kept an unterminated string fragment.
+
     An unescaped `"key":` in the raw reply is a real key opening, never payload
     text (quotes inside string values are escaped). The LAST opened key is where
     generation stopped; it counts as cut when repair_truncated_json dropped it
-    whole (absent from obj) or kept an unterminated string fragment. Callers
-    treat "reasoning" as benign and refuse to run steps whose payload field was
-    cut.
+    whole (absent from obj) or kept an unterminated string fragment.
     """
     props = sorted((schema or {}).get("properties") or {})
     if not props:
@@ -666,9 +685,10 @@ def repair_truncated_json(text: str) -> str | None:
     bare key, dangling colon/comma, half-typed number) is dropped and the
     surviving pairs are closed into an object; nothing partial is guessed at,
     except that an unterminated string VALUE is kept as a fragment (see
-    `_cut_field`). The step schema puts `action` and its arguments before
-    `reasoning`, so a cut inside the trailing explanation still yields a usable
-    step.
+    `_cut_field`). The default step schema puts `action` and its arguments
+    before `reasoning`, so a cut inside the trailing explanation still yields a
+    usable step; with `reasoning` first, a cut inside it yields no action and
+    chat_json re-asks.
 
     Returns the repaired JSON text, or None if nothing salvageable survived.
     """
@@ -1706,9 +1726,9 @@ class LLMClient:
     @staticmethod
     def _schema_has_big_fields(schema: dict | None) -> bool:
         """True when the schema has a string field large enough to hold real
-        file content. STEP_SCHEMA caps `content` at 6000 chars, so a cut step
-        reply died inside 'reasoning' and a bigger budget cannot help; such
-        schemas skip budget escalation."""
+        file content. STEP_SCHEMA caps `content` at 6000 chars, so a bigger
+        budget cannot help a cut step reply (it died inside a short field);
+        such schemas skip budget escalation."""
         BIG_FIELD_MIN = 8000   # maxLength above which a string field is "large"
         props = (schema or {}).get("properties", {})
         return any(
@@ -1818,9 +1838,10 @@ class LLMClient:
                         # Only trust it if the part that matters survived.
                         if isinstance(obj, dict) and obj.get("action"):
                             if not self._schema_has_big_fields(schema):
-                                # Args precede 'reasoning', so a cut usually
-                                # lands in the essay. A long `pattern` or
-                                # `content` can also be cut; record which
+                                # By default args precede 'reasoning', so a
+                                # cut usually lands in the essay. A long
+                                # `pattern` or `content` can also be cut (and,
+                                # reasoning-first, any arg); record which
                                 # field so agent.gather can refuse it.
                                 self.truncated_field = _cut_field(text, obj,
                                                                   schema)

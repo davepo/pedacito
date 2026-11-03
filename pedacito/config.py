@@ -283,6 +283,10 @@ class Config:
     # output tokens per step). Off by default: all-required keeps the grammar
     # simplest for small models.
     compact_step_schema: bool = False
+    # Put `reasoning` FIRST in the gather step schema, so the model states what
+    # it needs before it picks the action. None = the model card decides
+    # (`pedacito calibrate` measures both orders); true/false forces it.
+    step_reasoning_first: bool | None = None
     # Treat a creation of a new path paired with a block that empties an
     # existing same-extension file as a real move (old file deleted). Set
     # false for strict create+clear semantics that never delete automatically.
@@ -596,6 +600,13 @@ _TUPLE_FIELDS = ("extra_extensions", "shell_allowlist", "mcp_servers",
                  "browser_eval_hosts", "fetch_allowed_hosts",
                  "sandbox_writable")
 
+# Settings that are a bool or a number, or None when the model card (or the
+# global value) decides. TOML has no null, so a key that is absent stays None.
+_OPTIONAL_TYPES = {
+    "step_reasoning_first": bool,
+}
+_NONE_WORDS = ("", "auto", "none", "default", "card")
+
 _FIELDS = {f.name: f for f in fields(Config)
            if f.name not in ("sources", "profiles", "active_profile",
                              "model_size_bytes", "_hosted_server")}
@@ -763,6 +774,20 @@ def _coerce(name: str, value, path: Path | None = None):
             raise ConfigError(f"{where}{name} must be 'grammar' or 'native', "
                               f"got {value!r}")
         return norm
+    if name in _OPTIONAL_TYPES:
+        want = _OPTIONAL_TYPES[name]
+        if want is bool:
+            if not isinstance(value, bool):
+                raise ConfigError(
+                    f"{where}{name} should be true or false (leave it out to "
+                    f"let the model card decide), got {value!r}")
+            return value
+        if isinstance(value, bool) or not isinstance(value, (int, float)) \
+                or value < 0:
+            raise ConfigError(
+                f"{where}{name} should be a non-negative number (leave it out "
+                f"to use the global value), got {value!r}")
+        return float(value)
     if name in _TUPLE_FIELDS:
         if not isinstance(value, (list, tuple)):
             example = ('["pytest", "python"]' if name == "shell_allowlist"
@@ -1543,6 +1568,17 @@ def _parse_env(name: str, raw: str):
                 f"PEDACITO_JSON_MODE={raw!r} must be 'schema' or 'object'"
                 "  ('json_object' / 'json' mean 'object')")
         return norm
+    if name in _OPTIONAL_TYPES:
+        text = raw.strip().lower()
+        if text in _NONE_WORDS:
+            return None
+        if _OPTIONAL_TYPES[name] is bool:
+            return text in ("1", "true", "yes", "on")
+        try:
+            return _coerce(name, float(text))
+        except ValueError as e:
+            raise ConfigError(f"PEDACITO_{name.upper()}={raw!r} is not a valid "
+                              "number (or 'auto')") from e
     if name in _TUPLE_FIELDS:
         return tuple(x.strip() for x in raw.split(",") if x.strip())
     if name in ("k_cache_quant", "v_cache_quant"):
@@ -1768,6 +1804,13 @@ def _profile_override_comments() -> str:
         elif f.default_factory is not MISSING:
             value = f.default_factory()
         else:
+            continue
+        if value is None and name in _OPTIONAL_TYPES:
+            # TOML has no null: show an example value, and what unset means.
+            sample, unset = (("true", "the model card decides")
+                             if _OPTIONAL_TYPES[name] is bool
+                             else ("0.0", "the global value applies"))
+            out.append(f"# {name} = {sample}   # unset: {unset}")
             continue
         out.append(f"# {name} = {_toml_literal(value)}")
     return "\n".join(out)
