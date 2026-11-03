@@ -80,6 +80,15 @@ _MUTATING = {"write", "append", "move", "delete", "undo", "rename", "run",
 _MAX_PAYLOAD_CUTS = 2
 
 
+# The block rides in user0, which every lookup call re-sends (the server's
+# cache makes it cheap, but `prompt_tokens` still counts it on each call), so
+# it is kept as short as it can be: a one-line label and three compact steps.
+FEWSHOT_HEADER = "EXAMPLE STEPS (this project):"
+# A copied `read` example stays in the transcript for every later call, so the
+# user0 examples read only a few lines. (The no-grammar fallback keeps 40.)
+FEWSHOT_USER0_READ_LINES = 12
+
+
 def fewshot_enabled(cfg) -> bool:
     """True when `fewshot_steps` asks for worked steps in the first user turn.
     Only an explicit True (the user's, or a model card's) turns it on."""
@@ -109,8 +118,7 @@ def fewshot_block(shots: list[dict], schema: dict) -> str:
                                  if v not in ("", 0, None)}))
     if not lines:
         return ""
-    return ("WORKED EXAMPLES from this project (unused fields stay \"\" or 0; "
-            "choose the action the task needs):\n" + "\n".join(lines))
+    return FEWSHOT_HEADER + "\n" + "\n".join(lines)
 
 
 def _step_signature(step: dict) -> tuple:
@@ -758,9 +766,10 @@ class Agent:
         except TypeError:
             return self.index.map_for_prompt(self.cfg)
 
-    def _fewshot_shots(self) -> list[dict]:
+    def _fewshot_shots(self, read_lines: int = 40) -> list[dict]:
         """Three worked steps from THIS project (a real file, a real symbol):
-        grep it, read its definition, done. [] when the project has no code."""
+        grep it, read its definition (at most `read_lines` lines), done. []
+        when the project has no code."""
         try:
             for f in self.index.code_files:
                 tops = self.index.top_level(f)
@@ -768,7 +777,8 @@ class Agent:
                     unit = tops[0]
                     return fewshot_actions(
                         unit.file, unit.qualname.split(".")[0], unit.start,
-                        min(unit.scope_end or unit.end, unit.start + 40))
+                        min(unit.scope_end or unit.end,
+                            unit.start + read_lines))
         except Exception:
             pass
         return []
@@ -1035,10 +1045,11 @@ class Agent:
             lead = (lead + "\n" if lead else "") + tried
         examples = ""
         if fewshot_enabled(self.cfg):
-            # Once, here: user0 is sent as the cached prefix on every step, so
-            # three lines cost their tokens once per gather, not once per step.
-            examples = fewshot_block(self._fewshot_shots(),
-                                     schema_for(self.cfg))
+            # Once, here, never appended to a later turn: user0 is the cached
+            # prefix of every step.
+            examples = fewshot_block(
+                self._fewshot_shots(FEWSHOT_USER0_READ_LINES),
+                schema_for(self.cfg))
         user0 = (lead + "\n\n" if lead else "") \
             + f"PROJECT MAP\n\n{repo_map}\n\n" \
             + (examples + "\n\n" if examples else "") + f"TASK\n{task}"

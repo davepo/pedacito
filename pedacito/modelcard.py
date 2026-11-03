@@ -168,9 +168,10 @@ def _fewshot_text(schema: dict) -> str:
     """The worked-examples block gather would show for the probe's tiny
     project: its first definition (`Scheduler` in src/scheduler.py), built by
     the same code the agent uses."""
-    from .agent import fewshot_actions, fewshot_block
+    from .agent import FEWSHOT_USER0_READ_LINES, fewshot_actions, fewshot_block
     return fewshot_block(
-        fewshot_actions("src/scheduler.py", "Scheduler", 10, 50), schema)
+        fewshot_actions("src/scheduler.py", "Scheduler", 10,
+                        10 + FEWSHOT_USER0_READ_LINES), schema)
 
 
 def _t_tool_choice(client, cfg, reasoning_first: bool = False,

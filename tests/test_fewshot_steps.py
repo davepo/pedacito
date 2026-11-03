@@ -25,7 +25,7 @@ from pedacito.gui import settings as S
 from pedacito.llm import LLMClient, estimate_tokens
 from test_llm_transport import _cfg, _ok, _patch_post
 
-HEADER = "WORKED EXAMPLES from this project"
+HEADER = agent_mod.FEWSHOT_HEADER
 
 
 def _user0(client) -> str:
@@ -83,7 +83,74 @@ def test_examples_are_about_a_hundred_tokens(tmp_path):
     _a, on = gather(tmp_path / "on", READ_THEN_GREP, {"fewshot_steps": True})
     _a, off = gather(tmp_path / "off", READ_THEN_GREP)
     extra = estimate_tokens(_user0(on)) - estimate_tokens(_user0(off))
-    assert 60 <= extra <= 160
+    assert 40 <= extra <= 90
+
+
+def test_the_read_example_is_short_but_the_fallback_keeps_its_span(tmp_path):
+    """A copied read example sits in every later call, so user0's is short;
+    the no-grammar fallback (flag off) keeps its 40 lines."""
+    root = tmp_path / "big"
+    root.mkdir()
+    body = "".join(f"    x{i} = {i}\n" for i in range(80))
+    (root / "m.py").write_text("def long_one():\n" + body, encoding="utf-8")
+    from pedacito import index as index_mod
+    cfg = Config()
+    cfg.log_events = False
+    cfg.sources = {}
+    idx = index_mod.build([str(root)], cfg, client=None, summarise=False,
+                          root=root, verbose=False)
+    agent = Agent(idx, Scripted(READ_THEN_GREP), cfg)
+    short = agent._fewshot_shots(agent_mod.FEWSHOT_USER0_READ_LINES)[1]
+    assert short["end"] - short["start"] == agent_mod.FEWSHOT_USER0_READ_LINES
+    wide = agent._fewshot_shots()[1]
+    assert wide["end"] - wide["start"] == 40
+    client = LLMClient(_cfg())
+    off = Agent(idx, client, cfg)
+    off._prime_fewshot()                          # flag unset: the fallback's
+    assert client.fewshot[1]["end"] - client.fewshot[1]["start"] == 40
+    cfg.fewshot_steps = True
+    off._prime_fewshot()                          # flag on: user0 has them
+    assert client.fewshot == []
+
+
+@pytest.mark.parametrize("over", [
+    {}, {"tool_mode": "native"}, {"json_mode": "object"}, {"schema_off": True}])
+def test_every_request_carries_the_examples_once_in_the_first_user_turn(
+        tmp_path, monkeypatch, over):
+    """The real client, in every transport mode: each lookup request holds the
+    block exactly once, in message 1 and nowhere else, byte-identical from
+    step to step (prompt tokens grow by that block per call, never more)."""
+    over = dict(over)
+    schema_off = over.pop("schema_off", False)
+    bodies = []
+
+    def post(url, **k):
+        p = k["json"]
+        bodies.append(p)
+        step = {"action": "grep", "pattern": "bulk_discount",
+                "reasoning": "r"} if len(bodies) == 1 else {
+            "action": "done", "reasoning": "r"}
+        if "tools" in p:
+            msg = {"content": None, "tool_calls": [
+                {"function": {"arguments": json.dumps(step)}}]}
+            return type(_ok())(200, {"choices": [{"message": msg,
+                                                  "finish_reason": "stop"}],
+                                     "usage": {}})
+        return _ok(json.dumps(step))
+
+    _patch_post(monkeypatch, post)
+    _root, idx, cfg = make_project(tmp_path, fewshot_steps=True, **over)
+    client = LLMClient(cfg)
+    client._schema_supported = not schema_off
+    Agent(idx, client, cfg).gather("Fix bulk_discount", verbose=False)
+    assert len(bodies) >= 2
+    first = [b["messages"][1]["content"] for b in bodies]
+    for b in bodies:
+        texts = [m["content"] for m in b["messages"]]
+        assert sum(t.count(HEADER) for t in texts) == 1
+        assert HEADER in texts[1]
+    # the stored first user turn does not change as the gather goes on
+    assert len({f.split("\n\nTASK\n")[0] for f in first}) == 1
 
 
 def test_examples_follow_the_step_schema_order(tmp_path):
