@@ -707,16 +707,17 @@ def calibrate(client, cfg, verbose: bool = True, quick: bool = False,
         say("  capabilities     " + ", ".join(
             f"{k}={'?' if v is None else 'yes' if v else 'no'}"
             for k, v in caps.items()))
-        try:
-            info = client.model_info() or {}
-        except Exception:
-            info = {}
-        if info.get("size_bytes"):
-            measured["size_bytes"] = int(info["size_bytes"])
-        if info.get("context_length"):
-            measured["context_length"] = int(info["context_length"])
     else:
         measured["needle"] = 1.0
+    # Size and context are metadata, not probes: a --quick card carries them too.
+    try:
+        info = client.model_info() or {}
+    except Exception:
+        info = {}
+    if info.get("size_bytes"):
+        measured["size_bytes"] = int(info["size_bytes"])
+    if info.get("context_length"):
+        measured["context_length"] = int(info["context_length"])
     cpt = getattr(client, "chars_per_token", 0.0)
     if cpt:
         measured["chars_per_token"] = round(cpt, 2)

@@ -100,10 +100,13 @@ Verdicts are remembered per server and model for a week, so a server without
 grammar support automatically gets a few-shot JSON example in the prompt on
 later runs.
 
-Once per model, run `pedacito calibrate`. It spends about a minute on a scripted
+Once per model, run `pedacito calibrate`. It runs a scripted
 mini-suite — tool choice, JSON adherence, edit format, planted-injection and
 honesty checks, long-context retrieval, continuation, a thinking A/B,
-capabilities — and saves a **model card**. Settings you left at their defaults
+capabilities — and saves a **model card**. Each probe runs 3 times (1 with
+`--quick`; `--repeats N` overrides) and the card records the mean and spread,
+so the choices come from a mean, not one noisy sample; a card from before
+this (version 1) is shown with a re-calibrate note and is not applied. Settings you left at their defaults
 then follow the card (prompt pack, answer mode, verifier, best-of-N, fold
 depth, the thinking switch); anything you set explicitly still wins.
 `pedacito config` shows the card.
@@ -474,7 +477,7 @@ same project lock as the command line.
 ### Measurement and upkeep
 
 ```bash
-pedacito calibrate                 # measure the model; save a model card
+pedacito calibrate [--quick] [--repeats N]   # measure the model; save a model card
 pedacito eval [--task ID] [--out report.json]   # score the harness on fixtures
 pedacito map PROJ -t "fix X"       # see the map a task would get (ranked)
 pedacito tests PROJ --files src/a.py   # detected test command + impacted tests

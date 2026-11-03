@@ -637,6 +637,35 @@ def test_calibration_probes_are_expanded():
                                quick=True)["measured"]["edit_format"] == 1.0
 
 
+def test_quick_card_carries_size_and_context_metadata(home):
+    """B0: size and context come from model_info, with or without --quick."""
+    class Info(Model):
+        def model_info(self):
+            return {"size_bytes": 8_900_000_000, "context_length": 32768}
+
+    for quick in (True, False):
+        m = modelcard.calibrate(Info(True), Config(), verbose=False,
+                                quick=quick, repeats=1)["measured"]
+        assert m["size_bytes"] == 8_900_000_000
+        assert m["context_length"] == 32768
+    # a server with no model_info still calibrates
+    bare = modelcard.calibrate(Model(True), Config(), verbose=False,
+                               quick=True)["measured"]
+    assert "size_bytes" not in bare
+
+
+def test_cost_reports_split_cache_reads_and_writes():
+    """C1: the usage line names cache-write tokens next to the hit ratio."""
+    from pedacito import cli
+    stats = {"calls": 2, "completion_tokens": 10, "prompt_tokens": 100,
+             "cached_tokens": 30, "cache_write_tokens": 40, "cost": 0.0,
+             "seconds": 1.0}
+    line = cli._usage_line(type("C", (), {"stats": stats})())
+    assert "cache hit 30%" in line and "40 written to cache" in line
+    stats["cache_write_tokens"] = 0
+    assert "written" not in cli._usage_line(type("C", (), {"stats": stats})())
+
+
 def test_v1_card_is_shown_but_not_applied(home):
     """B0: a v1 card still loads (marked re-calibrate) but does not apply."""
     card = modelcard.calibrate(Model(True), Config(), verbose=False, quick=True)

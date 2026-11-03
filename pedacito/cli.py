@@ -495,7 +495,10 @@ def _chat_command(line: str, args, cfg, ref) -> bool:
             print(f"    {site:<12} {row['calls']:>3} calls  "
                   f"{row['prompt_tokens']:>8,} in  "
                   f"{row['completion_tokens']:>7,} out  "
-                  f"{row['cached_tokens']:>8,} cached", file=sys.stderr)
+                  f"{row['cached_tokens']:>8,} cached"
+                  + (f"  {row['cache_write_tokens']:>8,} written"
+                     if row.get("cache_write_tokens") else ""),
+                  file=sys.stderr)
         return True
 
     if cmd == "memory":
@@ -599,6 +602,8 @@ def _usage_line(client) -> str:
         if s.get("cached_tokens"):
             bits.append(f"cache hit "
                         f"{events_mod.cache_hit_ratio(s):.0%}")
+        if s.get("cache_write_tokens"):
+            bits.append(f"{s['cache_write_tokens']:,} written to cache")
     if s.get("cost"):
         bits.append(f"${s['cost']:.4f}")
     bits.append(f"{s['seconds']:.0f}s")
