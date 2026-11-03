@@ -26,6 +26,7 @@ loop, so the server's prefix cache hits on every turn.
 
 from __future__ import annotations
 
+import contextlib
 import re
 import sys
 
@@ -682,8 +683,32 @@ class Agent:
         self.answer_mode_used = "rebuild"
         self._gather_task = ""
         self._rules_shown: set[str] = set()
+        # SEARCH blocks that matched nowhere in the file, over every apply()
+        # round of this agent (the eval row reports it next to repair calls).
+        self.search_mismatches = 0
 
     # ------------------------------------------------------------ helpers
+    def _phase_temp(self, setting: str, client=None):
+        """Context manager that samples at `cfg.<setting>`
+        (temperature_answer / temperature_repair) for the calls inside it.
+        A no-op when the setting is None (the global temperature applies),
+        when the client cannot override (replay), or when an outer override is
+        already active (best_of's higher temperature for its extra candidates
+        must not be reset to the answer value)."""
+        client = self.client if client is None else client
+        cfg = getattr(client, "cfg", None) or self.cfg
+        value = getattr(cfg, setting, None)
+        if value is None or not hasattr(client, "temperature") \
+                or getattr(client, "_temp_override", None) is not None:
+            return contextlib.nullcontext()
+        return client.temperature(float(value))
+
+    def _chat_at(self, setting: str, messages, client=None, **kw):
+        """`client.chat(messages, **kw)` at the phase temperature `setting`."""
+        client = self.client if client is None else client
+        with self._phase_temp(setting, client):
+            return client.chat(messages, **kw)
+
     def _set_site(self, site: str) -> None:
         """Label the client's current call site for usage accounting."""
         try:
@@ -1584,7 +1609,17 @@ class Agent:
         two-message conversation (map + source + task); CONTINUE appends one
         instruction to the gather conversation so the server's prompt cache
         covers the map and every lookup. `auto` continues and falls back to a
-        rebuild when the continued reply is empty or tool-shaped."""
+        rebuild when the continued reply is empty or tool-shaped.
+
+        Samples at `temperature_answer` when set (the reply copies SEARCH text
+        character for character from what was read)."""
+        with self._phase_temp("temperature_answer"):
+            return self._answer(task, gathered, stream, system, max_tokens,
+                                include_edit_format)
+
+    def _answer(self, task: str, gathered: str, stream: bool,
+                system: str | None, max_tokens: int | None,
+                include_edit_format: bool) -> str:
         self._set_site("answer")
         brief = self._answer_brief(system, include_edit_format, task)
         mode = self._answer_mode()
@@ -1675,7 +1710,8 @@ class Agent:
             if rules not in system:
                 system += "\n\n" + rules
         try:
-            new = client.chat(
+            new = self._chat_at(
+                "temperature_repair",
                 [{"role": "system", "content": system},
                  {"role": "user", "content":
                   (f"SOURCE (current contents of the files involved)\n\n{src}\n\n"
@@ -1690,7 +1726,8 @@ class Agent:
                   "never read -- drop that edit and say what you could not "
                   "verify. Copy SEARCH text exactly from the SOURCE above. "
                   "Blocks only after a one-line explanation."}],
-                max_tokens=self.cfg.max_tokens_answer, stream=False)
+                client=client, max_tokens=self.cfg.max_tokens_answer,
+                stream=False)
         except LLMError as e:
             print("  [repair: re-ask failed (%s); failing checks remain]"
                   % type(e).__name__, file=sys.stderr)
@@ -1740,7 +1777,10 @@ class Agent:
         if n <= 1 or not parse_edits(first_reply):
             return first_reply
         candidates = [first_reply]
-        temp = min(1.0, float(getattr(self.cfg, "temperature", 0.2)) + 0.4)
+        base = getattr(self.cfg, "temperature_answer", None)
+        if base is None:
+            base = getattr(self.cfg, "temperature", 0.2)
+        temp = min(1.0, float(base) + 0.4)
         for i in range(n - 1):
             try:
                 ctx = self.client.temperature(temp) \
@@ -2045,7 +2085,8 @@ class Agent:
                     "file is large, split it into chunks of at most ~80 lines "
                     "across successive blocks. Emit blocks only, no "
                     "explanation.")
-            more = self.client.chat(
+            more = self._chat_at(
+                "temperature_answer",
                 [{"role": "system", "content": self._answer_sys()},
                  {"role": "user", "content": prompt}],
                 max_tokens=self.cfg.max_tokens_answer,
@@ -2082,7 +2123,7 @@ class Agent:
         baseline: dict[str, list[str]] = {}
         if post_check:
             self._baseline_findings(baseline, parse_edits(reply))
-        results = self._apply_once(reply, dry_run, backup_dir)
+        results = self._apply_counted(reply, dry_run, backup_dir)
         # Captured before the repair loop reassigns `reply`; used by the
         # completion loop below.
         delivered = {_norm_key(b.file) for b in parse_edits(reply)}
@@ -2131,7 +2172,8 @@ class Agent:
                     "EMPTY SEARCH section (nothing between <<<<<<< SEARCH "
                     "and =======) and the complete new content in REPLACE.")
             extra = ("\n\n" + "\n\n".join(extras)) if extras else ""
-            reply = self.client.chat(
+            reply = self._chat_at(
+                "temperature_repair",
                 [
                     {"role": "system", "content": self._answer_sys()},
                     {"role": "user", "content":
@@ -2159,7 +2201,8 @@ class Agent:
                 # (empty-SEARCH whole-file form) can fit under the cap.
                 print("[repair reply was cut off mid-block; re-asking for "
                       "one small block]", file=sys.stderr)
-                reply = self.client.chat(
+                reply = self._chat_at(
+                    "temperature_repair",
                     [
                         {"role": "system", "content": self._answer_sys()},
                         {"role": "user", "content":
@@ -2189,7 +2232,7 @@ class Agent:
             good = [r for r in results if r.ok]
             if post_check:
                 self._baseline_findings(baseline, parse_edits(reply))
-            results = good + self._apply_once(reply, dry_run, backup_dir)
+            results = good + self._apply_counted(reply, dry_run, backup_dir)
 
         # Completion loop: the answer prompt lets the model split a multi-file
         # task across turns. When a cleanly finished reply defers the rest, run
@@ -2205,7 +2248,8 @@ class Agent:
                     and completion_budget > 0:
                 rounds_done += 1
                 src = (gathered or "").strip()
-                more = self.client.chat(
+                more = self._chat_at(
+                    "temperature_answer",
                     [
                         {"role": "system", "content": self._answer_sys()},
                         {"role": "user", "content":
@@ -2231,7 +2275,7 @@ class Agent:
                 reply = (reply.rstrip() + "\n\n" + more) if reply.strip() else more
                 if post_check:
                     self._baseline_findings(baseline, more_edits)
-                results += self._apply_once(more, dry_run, backup_dir)
+                results += self._apply_counted(more, dry_run, backup_dir)
                 delivered |= {_norm_key(b.file) for b in more_edits}
                 if not _MORE_TO_DO_RE.search(more):
                     break
@@ -2260,7 +2304,8 @@ class Agent:
                 n = sum(len(v) for v in found.values())
                 print(f"\n[post-edit check: {n} new finding(s) in the changed "
                       "files; asking for a fix]", file=sys.stderr)
-                fix = self.client.chat(
+                fix = self._chat_at(
+                    "temperature_repair",
                     [
                         {"role": "system", "content": self._answer_sys()},
                         {"role": "user", "content":
@@ -2292,7 +2337,7 @@ class Agent:
                 # findings captured before this apply() call touched them.
                 self._baseline_findings(baseline, parse_edits(fix))
                 reply = (reply.rstrip() + "\n\n" + fix) if reply.strip() else fix
-                results += self._apply_once(fix, dry_run, backup_dir)
+                results += self._apply_counted(fix, dry_run, backup_dir)
         return results, reply
 
     # ------------------------------------------------------------- repair help
@@ -2441,6 +2486,15 @@ class Agent:
         joined = "\n\n".join(chunks)
         return joined or "(source unavailable -- the failed files are new; " \
                          "output the FULL intended file contents in one block)"
+
+    def _apply_counted(self, reply: str, dry_run: bool, backup_dir=None) -> list:
+        """`_apply_once` for apply()'s rounds, counting SEARCH blocks that
+        matched nowhere (the eval's `search_mismatches`)."""
+        results = self._apply_once(reply, dry_run, backup_dir)
+        self.search_mismatches += sum(
+            1 for r in results
+            if not r.ok and "search block not found" in r.message)
+        return results
 
     def _apply_once(self, reply: str, dry_run: bool, backup_dir=None) -> list:
         """One parse-and-apply pass, with no repair round-trip. Duplicate FILE

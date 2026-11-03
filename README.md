@@ -942,6 +942,7 @@ config --reference` prints the annotated template. Key settings:
 | `tier` | `""` | Budget preset: `tiny`/`small`/`medium`/`large`/`hosted`; guessed from the model name when unset. |
 | `max_steps` | 0 | Lookup limit per task; 0 = none. |
 | `temperature` | 0.2 | Higher values make tool selection worse. |
+| `temperature_answer` / `temperature_repair` | unset | Sampling temperature for the answer and for the repair re-asks, which copy SEARCH text character for character (0 = greedy). Unset uses `temperature`. Gather keeps `temperature`; `best_of` candidates run at the answer temperature + 0.4. |
 | `backup` | true | Snapshot originals before writing. |
 | `log_sessions` | true | Write a session record per task. |
 | `review` | false | Always use the review page. |

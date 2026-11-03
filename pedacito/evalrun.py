@@ -454,6 +454,15 @@ def _run_tests(root: Path, task: EvalTask):
     return rc == 0
 
 
+def _site_calls(client, site: str) -> int:
+    """Calls the client has made from one call site so far (by_site is
+    cumulative over the client's life, so a task reports a difference)."""
+    by_site = (getattr(client, "stats", {}) or {}).get("by_site", {})
+    if not isinstance(by_site, dict):
+        return 0
+    return int((by_site.get(site) or {}).get("calls", 0) or 0)
+
+
 def run_task(task: EvalTask, client, cfg, workdir: Path | None = None) -> dict:
     """Run one task against `client` in a fresh copy of its fixture and
     return its metrics row."""
@@ -478,6 +487,7 @@ def run_task(task: EvalTask, client, cfg, workdir: Path | None = None) -> dict:
                               root=tmp, verbose=False)
         agent = Agent(idx, client, c)
         before = dict(getattr(client, "stats", {}) or {})
+        repair_before = _site_calls(client, "repair")
         t0 = time.time()
         err = ""
         tr = None
@@ -515,9 +525,10 @@ def run_task(task: EvalTask, client, cfg, workdir: Path | None = None) -> dict:
         first = next((n for n, f in reads if f.lower() in gold), None)
         row["steps_to_gold"] = first
         row["steps"] = len(tr.steps)
-        by_site = (getattr(client, "stats", {}) or {}).get("by_site", {})
-        row["repair_calls"] = by_site.get("repair", {}).get("calls", 0) \
-            if isinstance(by_site, dict) else 0
+        row["repair_calls"] = _site_calls(client, "repair") - repair_before
+        # SEARCH blocks that matched nowhere, over every apply round (the
+        # repair calls above are what they cost).
+        row["search_mismatches"] = int(getattr(agent, "search_mismatches", 0) or 0)
         row["findings"] = sorted({f.kind for f in (tr.findings or [])})
         if task.kind == "edit":
             # Score the DISK, not the reply's shape (HARNESS-1). A worker that
@@ -579,6 +590,8 @@ def _metrics(rows: list[dict]) -> dict:
             / max(1, len(edits)), 3),
         "gather_only_edits": sum(1 for r in edits if r.get("gather_only")),
         "mean_steps": avg("steps"),
+        "mean_repair_calls": avg("repair_calls", edits),
+        "mean_search_mismatches": avg("search_mismatches", edits),
         "mean_calls": avg("calls"),
         "mean_prompt_tokens": avg("prompt_tokens"),
         "mean_completion_tokens": avg("completion_tokens"),
@@ -716,6 +729,10 @@ def render(rows: list[dict], summary: dict) -> str:
                 line += "  | " + ", ".join(f"{a} x{b}" for a, b in
                                            sorted(k["failures"].items()))
             out.append(line)
+    if any(r.get("kind") == "edit" for r in rows):
+        out.append(f"edits: {s.get('mean_repair_calls', 0):.2f} repair calls and "
+                   f"{s.get('mean_search_mismatches', 0):.2f} SEARCH mismatches "
+                   f"per task")
     sp = s.get("spread")
     if sp:
         out.append(

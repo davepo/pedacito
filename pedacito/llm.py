@@ -1497,6 +1497,10 @@ class LLMClient:
             if k in _PROTECTED_SAMPLER_KEYS:
                 continue
             payload[k] = v
+        if self._temp_override is not None:
+            # A phase temperature (temperature_answer/_repair, best_of) is more
+            # specific than a `temperature` key in the sampler table.
+            payload["temperature"] = self._temp_override
         if want_off:
             # Local templates get the union of known spellings; hosted
             # providers get only the field they are known to accept. Any

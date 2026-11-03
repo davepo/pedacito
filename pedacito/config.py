@@ -95,6 +95,12 @@ class Config:
 
     # --- Generation -----------------------------------------------------------
     temperature: float = 0.2
+    # Per-phase overrides for the phases that copy text character for character
+    # (the answer and the repair re-asks). None = the global `temperature`;
+    # 0 is greedy decoding. Gather keeps the global value. `best_of` samples its
+    # extra candidates at the answer temperature + 0.4.
+    temperature_answer: float | None = None
+    temperature_repair: float | None = None
     # Extra sampler parameters (top_k, min_p, repeat_penalty, seed, stop, ...)
     # merged verbatim into every /chat/completions body; model, messages and
     # stream cannot be overridden. Best placed in a profile, because hosted
@@ -609,6 +615,8 @@ _TUPLE_FIELDS = ("extra_extensions", "shell_allowlist", "mcp_servers",
 # global value) decides. TOML has no null, so a key that is absent stays None.
 _OPTIONAL_TYPES = {
     "step_reasoning_first": bool,
+    "temperature_answer": float,
+    "temperature_repair": float,
 }
 _NONE_WORDS = ("", "auto", "none", "default", "card")
 
@@ -2036,7 +2044,10 @@ REFERENCE_TEMPLATE = TEMPLATE + '''
 # json_mode: "schema" for llama.cpp/LM Studio, "object" for hosted APIs.
 # timeout: seconds per request. load_wait_seconds: model load wait.
 # max_consecutive_failures: abort an indexing batch after N failures.
-# temperature: keep low for tool calls.
+# temperature: keep low for tool calls. temperature_answer / temperature_repair
+# override it for the answer and the repair re-asks, which copy SEARCH text
+# character for character (0 = greedy; unset = temperature). Gather keeps
+# `temperature`; best_of candidates run at the answer temperature + 0.4.
 # sampler: per-server sampler keys, usually placed inside a profile.
 #
 # --- Reasoning models -------------------------------------------------------
@@ -2092,6 +2103,9 @@ REFERENCE_TEMPLATE = TEMPLATE + '''
 # allow_rename treats create-new + clear-old blocks as a real move.
 # fuzzy_match anchors near-miss search blocks to the most similar text.
 # compact_step_schema is experimental: drops unused fields from step replies.
+# step_reasoning_first puts `reasoning` before the action in each step; unset
+# lets the model card decide (`pedacito calibrate` measures both orders).
+# edit_plan_brief asks for 1-3 plan lines before the edit blocks.
 # auto_diagnostics runs the detected linter/typechecker after each auto task.
 # post_edit_check runs a cheap per-file lint/syntax check after every applied
 # edit and feeds back only NEW findings (diffed against a pre-task baseline);
