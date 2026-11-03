@@ -772,7 +772,6 @@ _LABELS = {1: _LABELS_V1, 2: _LABELS_V2}
 
 # One task more or fewer passing is noise; the gate tolerates exactly that.
 _TOLERANCE_EPS = 1e-9
-_MIN_REPEATS_ALL_FAIL = 3
 
 
 def _known_labels(report: dict) -> frozenset:
@@ -855,9 +854,8 @@ def compare_reports(baseline: dict, current: dict,
 
     Rates are compared from the per-task rows, over the tasks both reports ran
     and over all their repeats. A drop is a regression only when it is more
-    than one task-equivalent (one task fewer passing, in every repeat), or
-    when a task passed in every repeat of the baseline and in none of the
-    current one (needs >= 3 repeats on each side, or one flip would do it).
+    than one task-equivalent (one task fewer passing, in every repeat), so a
+    single task flipping, even across every repeat, is noted and not gated.
     A report without rows falls back to the exact summary rates.
 
     A failure label the baseline's taxonomy could not emit is information, not
@@ -933,13 +931,7 @@ def compare_reports(baseline: dict, current: dict,
         for t in common:
             bp = [bool(r.get("passed")) for r in b_runs[t]]
             cp = [bool(r.get("passed")) for r in c_runs[t]]
-            if (len(bp) >= _MIN_REPEATS_ALL_FAIL
-                    and len(cp) >= _MIN_REPEATS_ALL_FAIL
-                    and all(bp) and not any(cp)):
-                regressions.append(
-                    f"task '{t}': passed {sum(bp)}/{len(bp)}, now "
-                    f"{sum(cp)}/{len(cp)}")
-            elif abs(sum(cp) / len(cp) - sum(bp) / len(bp)) >= 0.5:
+            if abs(sum(cp) / len(cp) - sum(bp) / len(bp)) >= 0.5:
                 info.append(f"task '{t}': {sum(bp)}/{len(bp)} -> "
                             f"{sum(cp)}/{len(cp)} passes")
     else:

@@ -231,7 +231,9 @@ def test_report_from_run_cli_round_trips_through_the_gate(monkeypatch,
     for r in again["rows"]:
         r["passed"] = False
     again["summary"] = evalrun.summarise(again["rows"])
-    reg, _ = evalrun.compare_reports(report, again)
-    # a one-task fixture losing its only task: inside the one-task margin
-    # for the rate, but the all-pass -> all-fail rule catches it
-    assert reg == ["task 'py-bulk-off-by-one': passed 3/3, now 0/3"]
+    notes = []
+    reg, _ = evalrun.compare_reports(report, again, notes=notes)
+    # a one-task fixture losing its only task is one task-equivalent: noted,
+    # not gated (the CLI's own "pass rate 0" exit code still fails the run)
+    assert reg == []
+    assert any("task 'py-bulk-off-by-one': 3/3 -> 0/3" in n for n in notes)

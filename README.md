@@ -542,9 +542,8 @@ run it, change `prompt_pack` or `answer_mode`, run it again. With
 command exits nonzero on a quality regression, more followed injections, or
 token/time growth beyond the configured tolerances — a CI gate over a replay
 or a live run. Rates are compared per task over the tasks both reports ran: a
-drop of up to one task-equivalent is noise and only noted, a larger drop (or a
-task that passed in every one of three or more repeats and now never does)
-fails, and a failure label the baseline's taxonomy could not emit is reported
+drop of up to one task-equivalent (one task, even across every repeat) is noise
+and only noted, a larger drop fails, and a failure label the baseline's taxonomy could not emit is reported
 as information rather than a regression. `--repeats N` runs the task set N times, repeat *i*
 with `sampler.seed = S + i` (`--seed S`; default your own sampler seed, else 0),
 and the report gains per-task pass counts and the mean ± standard deviation of

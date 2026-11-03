@@ -145,17 +145,21 @@ def test_gate_more_than_one_task_equivalent_is_a_regression():
     assert any(r.startswith("pass rate") for r in reg)
 
 
-def test_gate_task_that_goes_from_all_pass_to_all_fail_regresses():
+def test_gate_a_task_flipping_in_every_repeat_is_one_task_equivalent():
+    """Plan A0.1: a single-task flip across 3 repeats does not fail the gate;
+    it is noted. A second task flipping as well is beyond the tolerance."""
     base = _eight(repeats=3)
+    notes = []
     reg, _ = evalrun.compare_reports(
-        base, _eight(flip={(0, 0), (0, 1), (0, 2)}, repeats=3))
-    assert reg == ["task 't0': passed 3/3, now 0/3"]    # one task's worth, but
-    # a single repeat of one task flipping is never enough
-    assert evalrun.compare_reports(_eight(), _eight(flip={(0, 0)}))[0] == []
-    # and two repeats on a side are not enough evidence for the all-fail rule
-    reg, _ = evalrun.compare_reports(
-        _eight(repeats=2), _eight(flip={(0, 0), (0, 1)}, repeats=2))
+        base, _eight(flip={(0, 0), (0, 1), (0, 2)}, repeats=3), notes=notes)
     assert reg == []
+    assert any("task 't0': 3/3 -> 0/3" in n for n in notes)
+    reg, _ = evalrun.compare_reports(
+        base, _eight(flip={(0, 0), (0, 1), (0, 2), (1, 0), (1, 1), (1, 2)},
+                     repeats=3))
+    assert any(r.startswith("pass rate") for r in reg)
+    # and a single repeat of one task flipping is never enough
+    assert evalrun.compare_reports(_eight(), _eight(flip={(0, 0)}))[0] == []
 
 
 def test_gate_compares_only_the_tasks_both_reports_ran():
