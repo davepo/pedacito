@@ -33,6 +33,7 @@ from __future__ import annotations
 import json
 import re
 import statistics
+import sys
 import time
 from pathlib import Path
 
@@ -118,6 +119,20 @@ def apply(cfg) -> dict | None:
             sources[name] = "model card"
     if "chars_per_token" in (card.get("measured") or {}):
         cfg._card_cpt = card["measured"]["chars_per_token"]
+    # P3 (A4.1): the capability probe records whether the server serves
+    # /v1/embeddings. If it does not, semantic search can only waste a call
+    # and error, so auto-disable it when the user left it at a default, and
+    # warn (without overriding) when the user turned it on explicitly.
+    if (card.get("measured") or {}).get("cap_embeddings") is False \
+            and getattr(cfg, "semantic_search", False):
+        if unset("semantic_search"):
+            cfg.semantic_search = False
+            sources["semantic_search"] = "model card (no embeddings)"
+            print("[model card] no embeddings support on this model; "
+                  "semantic_search disabled", file=sys.stderr)
+        else:
+            print("[model card] warning: semantic_search is on, but this model "
+                  "reported no embeddings support", file=sys.stderr)
     return card
 
 

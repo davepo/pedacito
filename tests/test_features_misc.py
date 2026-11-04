@@ -603,6 +603,25 @@ def test_apply_fills_disable_thinking_only_when_unset(home):
     assert explicit.disable_thinking is False       # the user's word wins
 
 
+def test_apply_disables_semantic_search_without_embeddings(home):
+    """A4.1: cap_embeddings=False auto-disables semantic_search unless the user
+    set it explicitly (then it warns and leaves it on)."""
+    card = modelcard.calibrate(Model(True), Config(), verbose=False, quick=True)
+    card["measured"]["cap_embeddings"] = False
+    modelcard.save_card(card)
+    fresh = Config()
+    fresh.sources = {}
+    fresh.semantic_search = True
+    modelcard.apply(fresh)
+    assert fresh.semantic_search is False
+    assert fresh.sources["semantic_search"] == "model card (no embeddings)"
+    explicit = Config()
+    explicit.sources = {"semantic_search": "config file"}
+    explicit.semantic_search = True
+    modelcard.apply(explicit)
+    assert explicit.semantic_search is True         # the user's word wins
+
+
 def test_calibration_repeats_record_mean_and_spread(home):
     """A0.6: each probe runs N times; the card stores a mean and spread."""
     card = modelcard.calibrate(Model(True), Config(), verbose=False,
