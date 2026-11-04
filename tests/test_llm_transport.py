@@ -471,6 +471,58 @@ def test_prompt_cache_key_auto_is_sent_only_to_accepting_providers(monkeypatch):
     assert "prompt_cache_key" not in posts[-1]
 
 
+def test_explicit_cache_markers_wrap_system_user0_and_last(monkeypatch):
+    """C2: explicit mode wraps system, user0, and last message in content
+    arrays with a cache_control marker; non-breakpoint turns stay strings."""
+    posts = []
+    _patch_post(monkeypatch, lambda *a, **k: posts.append(k["json"]) or _ok())
+    cfg = _cfg(base_url="https://dashscope.aliyuncs.com/v1",
+               prompt_cache="explicit")
+    LLMClient(cfg).chat(
+        [{"role": "system", "content": "SYS"},
+         {"role": "user", "content": "U0"},
+         {"role": "assistant", "content": "A"},
+         {"role": "user", "content": "LAST"}], 10)
+    msgs = posts[-1]["messages"]
+    for i in (0, 1, 3):
+        part = msgs[i]["content"][0]
+        assert part["type"] == "text"
+        assert part["cache_control"] == {"type": "ephemeral", "ttl": "5m"}
+    assert msgs[2]["content"] == "A"
+
+
+def test_explicit_markers_do_not_mutate_the_input_messages(monkeypatch):
+    _patch_post(monkeypatch, lambda *a, **k: _ok())
+    cfg = _cfg(base_url="https://dashscope.aliyuncs.com/v1",
+               prompt_cache="explicit")
+    msgs = [{"role": "system", "content": "SYS"},
+            {"role": "user", "content": "U0"}]
+    LLMClient(cfg).chat(msgs, 10)
+    assert msgs[0]["content"] == "SYS" and msgs[1]["content"] == "U0"
+
+
+def test_explicit_markers_fall_back_to_implicit_on_400(monkeypatch):
+    posts = []
+
+    def post(*a, **k):
+        p = k["json"]
+        posts.append(p)
+        if any(isinstance(m.get("content"), list) for m in p["messages"]):
+            return Resp(400, body={"error": {"message":
+                                             "cache_control not supported"}})
+        return _ok()
+
+    _patch_post(monkeypatch, post)
+    cfg = _cfg(base_url="https://dashscope.aliyuncs.com/v1",
+               prompt_cache="explicit")
+    client = LLMClient(cfg)
+    assert client.chat([{"role": "system", "content": "SYS"},
+                        {"role": "user", "content": "U0"}], 10) == "hello"
+    assert isinstance(posts[0]["messages"][0]["content"], list)
+    assert posts[1]["messages"][0]["content"] == "SYS"
+    assert client._cache_markers_rejected is True
+
+
 @pytest.mark.parametrize("usage,want_read,want_write", [
     # DeepSeek: implicit cache hit/miss tokens at the top level.
     ({"prompt_tokens": 50, "completion_tokens": 1,

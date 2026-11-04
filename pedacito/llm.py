@@ -944,6 +944,9 @@ class LLMClient:
         # `native_override` lets `calibrate` A/B the two modes.
         self._native_ok: bool | None = None
         self.native_override: bool | None = None
+        # Explicit prompt-cache markers (cache_control): False once the server
+        # returned 400 on them; then this client falls back to implicit.
+        self._cache_markers_rejected = False
         # "length" means cut off mid-answer: "valid JSON we never let it finish".
         self.last_finish_reason = ""
         # Calibrated chars-per-token from the server's tokenizer endpoint
@@ -1569,6 +1572,10 @@ class LLMClient:
                 payload["prompt_cache_key"] = key
 
         prompt_est = estimate_messages(msgs, self.estimate_tokens)
+        # Explicit prompt-cache markers go on AFTER the estimate and after the
+        # replay digest (which hashes the original `messages`, not `msgs`), so
+        # neither the budget math nor --replay matching sees them.
+        self._apply_cache_markers(msgs)
         t0 = time.time()
         self.stats["calls"] += 1
         # Cleared per attempt so a stale "length" from an abandoned attempt
@@ -1582,6 +1589,13 @@ class LLMClient:
             try:
                 r = self._post(payload)
             except LLMError as e:
+                if self._cache_markers_rejected_by(e):
+                    self._cache_markers_rejected = True
+                    print("[this server rejected explicit cache_control "
+                          "markers; falling back to implicit caching]",
+                          file=sys.stderr)
+                    return self._chat_once(messages, max_tokens, schema,
+                                           stream, disable_thinking)
                 if native and self._tools_rejected(e):
                     self._native_ok = False
                     print("[this server rejected native tool calls; using the "
@@ -1622,6 +1636,12 @@ class LLMClient:
         try:
             r = self._post(payload, stream=True)
         except LLMError as e:
+            if self._cache_markers_rejected_by(e):
+                self._cache_markers_rejected = True
+                print("[this server rejected explicit cache_control markers; "
+                      "falling back to implicit caching]", file=sys.stderr)
+                return self._chat_once(messages, max_tokens, schema, stream,
+                                       disable_thinking)
             low = str(e).lower()
             if "stream_options" in payload and (
                     "stream_options" in low or "include_usage" in low):
@@ -1731,6 +1751,52 @@ class LLMClient:
         low = str(err).lower()
         return any(w in low for w in ("tools", "tool_choice", "tool calling",
                                       "function call", "tool use"))
+
+    @staticmethod
+    def _cache_markers_rejected_by(err: Exception) -> bool:
+        low = str(err).lower()
+        return "cache_control" in low or "cache-control" in low
+
+    def _apply_cache_markers(self, msgs: list[dict]) -> bool:
+        """In explicit prompt-cache mode, wrap the breakpoint messages' content
+        in a content-part array carrying a `cache_control` marker: system end,
+        user0 end, and the last message. Returns True when any marker was
+        added. No-op when the mode is not explicit, or a 400 rejection already
+        disabled markers for this server+model."""
+        if self._cache_markers_rejected:
+            return False
+        from .providers import cache_mode_for, provider_for
+        if cache_mode_for(self.cfg) != "explicit":
+            return False
+        prov = provider_for(self.cfg.base_url, self.cfg.model)
+        max_markers = prov.max_markers or 4
+        ttl = (getattr(self.cfg, "prompt_cache_ttl", "5m")
+               or "5m").strip().lower()
+        if prov.ttls and ttl not in prov.ttls:
+            ttl = ""       # an unsupported TTL: send a plain ephemeral marker
+        idxs: list[int] = []
+        for i, m in enumerate(msgs):
+            if m.get("role") == "system":
+                idxs.append(i)
+                break
+        for i, m in enumerate(msgs):
+            if m.get("role") == "user" and i not in idxs:
+                idxs.append(i)
+                break
+        if idxs and idxs[-1] != len(msgs) - 1:
+            idxs.append(len(msgs) - 1)
+        added = False
+        for i in idxs[:max_markers]:
+            content = msgs[i].get("content")
+            if not isinstance(content, str):
+                continue
+            cc: dict = {"type": "ephemeral"}
+            if ttl:
+                cc["ttl"] = ttl
+            msgs[i]["content"] = [{"type": "text", "text": content,
+                                   "cache_control": cc}]
+            added = True
+        return added
 
     @staticmethod
     def _schema_has_big_fields(schema: dict | None) -> bool:
