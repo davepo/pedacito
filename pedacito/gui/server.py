@@ -399,6 +399,16 @@ def _discover(q, body):
                              for a, b, c in found]}
 
 
+@post("/api/settings/scan")
+def _scan(q, body):
+    return 200, settings_api.scan_servers()
+
+
+@get("/api/profiles")
+def _profiles(q, body=None):
+    return 200, settings_api.list_profiles()
+
+
 # --- the handler ------------------------------------------------------------------
 
 class _Handler(BaseHTTPRequestHandler):

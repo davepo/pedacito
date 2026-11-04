@@ -198,3 +198,23 @@ def probe_server(base_url: str, api_key: str, which: str = "user",
     except Exception as e:
         return {"ok": False, "error": f"{type(e).__name__}: {str(e)[:200]}"}
     return {"ok": True, "models": ids}
+
+
+def list_profiles() -> dict:
+    """The profiles table (identity + measured scores + recommendations) for
+    the settings page, from the same renderer the CLI uses."""
+    from .. import profiles as profiles_mod
+    cfg = STATE.cfg if STATE.cfg is not None else config_mod.Config()
+    rows = profiles_mod.list_profiles(cfg)
+    return {"profiles": rows, "recommendations": profiles_mod.recommend(rows)}
+
+
+def scan_servers() -> dict:
+    """Discover servers and list each one's models with metadata (loaded,
+    size, context, embedding/too-big already dropped)."""
+    from .. import discovery
+    servers = []
+    for label, base_url, _ids in discovery.discover_servers(timeout=1.5):
+        servers.append({"label": label, "base_url": base_url,
+                        "models": discovery.describe_models(base_url)})
+    return {"servers": servers}

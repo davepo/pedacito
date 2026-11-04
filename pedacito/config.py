@@ -2324,6 +2324,9 @@ def interactive_setup(path: Path | None = None, force: bool = False,
     base_url = model = ""
     hosted = False
     api_key_env = ""
+    scan = False
+    scan_label = scan_url = ""
+    scan_ids: list[str] = []
     if servers:
         say("Found running model servers on this machine:")
         for i, (label, url, ids) in enumerate(servers, 1):
@@ -2341,11 +2344,19 @@ def interactive_setup(path: Path | None = None, force: bool = False,
                 say("Models that server reports:")
                 for i, m in enumerate(ids, 1):
                     say(f"  {i}) {m}")
-                pick = _ask("Which model should Pedacito use?", ids[0])
-                try:
-                    model = ids[int(pick) - 1]
-                except (ValueError, IndexError):
-                    model = pick          # allow typing an id not currently listed
+                if len(ids) > 1:
+                    ans = _ask("Add a profile for every model listed "
+                               "(recommended)? [Y/n]", "y")
+                    if ans.lower() != "n":
+                        scan = True
+                        scan_label, scan_url, scan_ids = label, base_url, ids
+                        model = ids[0]   # placeholder; the scan writes all
+                if not scan:
+                    pick = _ask("Which model should Pedacito use?", ids[0])
+                    try:
+                        model = ids[int(pick) - 1]
+                    except (ValueError, IndexError):
+                        model = pick          # allow typing an id not currently listed
             else:
                 model = _ask("Model name (exactly as the server reports it)")
     else:
@@ -2375,12 +2386,22 @@ def interactive_setup(path: Path | None = None, force: bool = False,
 
     vram_gb = _gb("GPU VRAM on the model server, in GB", "8")
 
-    tier = "hosted" if hosted else _ask(
-        "Model size tier -- tiny (3-4B), small (~9B), medium (~14-27B), "
-        "large (35B+)",
-        "medium")
-    if tier not in PRESETS:
-        raise ConfigError(f"tier must be one of {', '.join(PRESET_TIERS)}, got {tier!r}")
+    if scan:
+        # The first listed model becomes the default profile; the rest are
+        # appended below as their own profiles.
+        model = scan_ids[0]
+        base_url = scan_url
+        tier = _guess_tier(model, {"model": model,
+                                   "base_url": base_url}) or "medium"
+        scan_extra = scan_ids[1:]
+    else:
+        tier = "hosted" if hosted else _ask(
+            "Model size tier -- tiny (3-4B), small (~9B), medium (~14-27B), "
+            "large (35B+)",
+            "medium")
+        if tier not in PRESETS:
+            raise ConfigError(f"tier must be one of {', '.join(PRESET_TIERS)}, got {tier!r}")
+        scan_extra = []
 
     lines = [
         'default_profile = "default"',
@@ -2406,6 +2427,15 @@ model    = "google/gemma-3-27b"
     if body == TEMPLATE:
         body = "\n".join(lines) + f"\n\n[universal]\nvram_gb = {vram_gb}\n"
 
+    if scan_extra:
+        from . import config_editor
+        entries = [{"model": mid, "base_url": scan_url,
+                    "server_label": scan_label,
+                    "tier": _guess_tier(mid, {"model": mid,
+                                               "base_url": scan_url}) or "medium",
+                    "vram_gb": vram_gb} for mid in scan_extra]
+        body = config_editor.upsert_profiles(body, entries)
+
     # Validate before touching the user's file.
     probe = p.with_suffix(".toml.setup-probe") if p.parent.exists() else \
         Path("pedacito-setup-probe.toml")
@@ -2427,10 +2457,16 @@ model    = "google/gemma-3-27b"
     p.write_text(body, encoding="utf-8")
     say()
     say(f"Wrote {p}")
-    say(f"  base_url = {base_url}")
-    say(f"  model    = {model}")
-    say(f"  vram_gb  = {vram_gb}")
-    say(f"  tier     = {tier}" + ("  (api_key_env set, json_mode=object)" if api_key_env else ""))
+    if scan:
+        say(f"  server   = {scan_label}  ({scan_url})")
+        say(f"  profiles = {len(scan_ids)} model(s); default = {scan_ids[0]}")
+        say(f"  vram_gb  = {vram_gb}")
+    else:
+        say(f"  base_url = {base_url}")
+        say(f"  model    = {model}")
+        say(f"  vram_gb  = {vram_gb}")
+        say(f"  tier     = {tier}"
+            + ("  (api_key_env set, json_mode=object)" if api_key_env else ""))
     say("Test it any time with:  pedacito config --check")
     return p
 
