@@ -366,6 +366,16 @@ def check_coverage(task: str, reply: str, edits) -> list[Finding]:
     return out[:3]
 
 
+def check_fuzzy(results) -> list[Finding]:
+    """A block anchored approximately (fuzzy_match) is a warning, not an
+    error: it landed somewhere the SEARCH text did not exactly match, so the
+    diff needs a human's eye before it is trusted."""
+    return [Finding("fuzzy", "warn", r.file,
+                    "one or more blocks matched approximately (not exactly); "
+                    "review the diff carefully")
+            for r in (results or []) if getattr(r, "fuzzy", False)]
+
+
 # --------------------------------------------------------------- entry points
 def check(agent, task: str, reply: str, results, gathered: str = ""
           ) -> list[Finding]:
@@ -379,6 +389,7 @@ def check(agent, task: str, reply: str, results, gathered: str = ""
         findings += check_moved_imports(agent, results)
         findings += check_citations(agent, reply)
         findings += check_coverage(task, reply, edits)
+        findings += check_fuzzy(results)
     except Exception as e:                  # a checker bug must not block a task
         findings.append(Finding("model", "warn", "",
                                 f"verification skipped ({type(e).__name__})"))

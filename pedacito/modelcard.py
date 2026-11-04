@@ -112,7 +112,7 @@ def apply(cfg) -> dict | None:
 
     for name in ("best_of", "verify_answer", "fold_tail_steps", "plan_threshold",
                  "tool_mode", "disable_thinking", "step_reasoning_first",
-                 "fewshot_steps"):
+                 "fewshot_steps", "fuzzy_match"):
         if name in ch and unset(name):
             setattr(cfg, name, ch[name])
             sources[name] = "model card"
@@ -562,6 +562,12 @@ def choose(measured: dict, hosted: bool) -> dict:
     # ...and so do worked examples in the first user turn.
     if _arm_wins(measured, "fs", tc, js):
         ch["fewshot_steps"] = True
+    # Fuzzy anchoring for weak edit-format cards: exact SEARCH quoting is the
+    # skill they lack, so a near-miss may still anchor. Gated on the repeated
+    # edit-format probe (edit_format < 1.0), never forced on a card that
+    # quotes exactly.
+    if ed < 1.0:
+        ch["fuzzy_match"] = True
     # The thinking A/B verdict, persisted so every later run starts in the
     # winning mode instead of rediscovering it one empty reply at a time.
     # Only a decisive split is recorded: thinking burned the answer budget

@@ -543,7 +543,12 @@ def run_task(task: EvalTask, client, cfg, workdir: Path | None = None) -> dict:
             row["edit_ok"] = ok_edit
             row["answer_blocks"] = len(tr.results)
             row["gather_only"] = bool(ok_edit and not tr.results)
-            row["first_apply_clean"] = bool(ok_edit and row["repair_calls"] == 0)
+            # A block that anchored approximately (fuzzy_match) is counted
+            # separately and never counts as a clean first apply.
+            row["fuzzy_applies"] = sum(
+                1 for r in tr.results if getattr(r, "fuzzy", False))
+            row["first_apply_clean"] = bool(ok_edit and row["repair_calls"] == 0
+                                            and row["fuzzy_applies"] == 0)
             tests_ok = _run_tests(tmp, task) if ok_edit else (
                 None if not task.test_cmd else False)
             row["tests_ok"] = tests_ok

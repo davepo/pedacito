@@ -691,6 +691,16 @@ def test_choose_reads_means_not_the_first_sample():
         == modelcard.choose(base, False)["prompt_pack"]
 
 
+def test_choose_gates_fuzzy_match_on_the_edit_format_probe():
+    """A2.4: a card that quotes edits imperfectly (edit_format < 1.0) gets
+    fuzzy anchoring; a card that quotes exactly does not."""
+    base = {"tool_choice": 0.6, "json_ok": 1.0, "edit_format": 1,
+            "instructions": 1, "honesty": 1, "needle": 1, "continuation": 1}
+    assert "fuzzy_match" not in modelcard.choose(base, False)
+    weak = dict(base, edit_format=0.67)
+    assert modelcard.choose(weak, False)["fuzzy_match"] is True
+
+
 # ------------------------------------------------------------------- eval runner
 class EvalModel:
     """Reads the gold file, then answers with the gold edit."""
@@ -757,6 +767,34 @@ def test_verify_tests_task_runs_the_post_edit_test_loop(tmp_path, monkeypatch):
     assert ran, "the post-edit test loop did not run"
     assert any("pricing.py" in " ".join(f) for f in ran)
     assert row["passed"]
+
+
+def test_fuzzy_apply_is_counted_and_not_a_clean_first_apply(tmp_path):
+    """A2.4: a near-miss SEARCH that anchors via fuzzy_match still edits the
+    right file, but it is reported as `fuzzy_applies` and never counts as a
+    clean first apply."""
+    task = next(t for t in evalrun.TASKS if t.id == "py-bulk-off-by-one")
+    reply = ("--- FILE: shop/pricing.py\n<<<<<<< SEARCH\n"
+             "def bulk_discount(quantity):\n"
+             "    \"\"\"Percent discount for buying many items: 10% off for 10 or more.\"\"\"\n"
+             "    if quantity > 10:\n"
+             "        return 11\n"
+             "    return 0\n"
+             "=======\n"
+             "def bulk_discount(quantity):\n"
+             "    \"\"\"Percent discount for buying many items: 10% off for 10 or more.\"\"\"\n"
+             "    if quantity >= 10:\n"
+             "        return 10\n"
+             "    return 0\n"
+             ">>>>>>> REPLACE\n")
+    cfg = _eval_cfg()
+    cfg.fuzzy_match = True
+    cfg.fuzzy_min_ratio = 0.5
+    row = evalrun.run_task(
+        task, EvalModel(reply, [{"action": "read", "file": "shop/pricing.py",
+                                 "start": 1, "end": 30}]), cfg, tmp_path)
+    assert row["passed"] and row["fuzzy_applies"] == 1
+    assert not row["first_apply_clean"]
 
 
 def test_recovered_edits_also_run_the_post_edit_test_loop(tmp_path, monkeypatch):

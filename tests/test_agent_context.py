@@ -515,6 +515,18 @@ def test_a_hallucinated_verdict_does_not_trigger_a_repair_round(tmp_path):
     assert len(client.chat_calls) == 1       # just the adversarial call
 
 
+def test_fuzzy_applies_are_reported_as_a_warning_not_an_error(tmp_path):
+    """A2.4: a block that anchored approximately is a warn, never an error
+    (it applied somewhere the SEARCH text did not exactly match)."""
+    import types
+    results = [types.SimpleNamespace(file="lib.py", fuzzy=True),
+               types.SimpleNamespace(file="use.py", fuzzy=False)]
+    out = verify.check_fuzzy(results)
+    assert [f.kind for f in out] == ["fuzzy"]
+    assert all(f.severity == "warn" and f.file == "lib.py" for f in out)
+    assert verify.check_fuzzy(results[1:]) == []
+
+
 def test_requirement_ledger_and_coverage_warning(tmp_path):
     reqs = verify.requirement_ledger(
         "Make compute triple its result and add a test for compute. Also update the README.")
