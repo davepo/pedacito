@@ -96,3 +96,24 @@ def test_doctor_probe_reports_not_observed_for_a_local_server():
             return "ok"
 
     assert C().doctor_prompt_cache(delay=0) == "not observed"
+
+
+def test_cache_key_is_stable_and_differs_across_projects():
+    """C3: 'auto' is a stable hash of project root + profile + model, so one
+    project routes to a warm cache across runs while two projects differ."""
+    def cfg(root, profile="x", model="m"):
+        c = Config()
+        c._root = root
+        c.active_profile = profile
+        c.model = model
+        c.prompt_cache_key = "auto"
+        return c
+
+    a, b = cfg("/proj/a"), cfg("/proj/a")
+    assert providers.cache_key(a) == providers.cache_key(b)
+    assert providers.cache_key(a) != providers.cache_key(cfg("/proj/b"))
+    assert providers.cache_key(a) != providers.cache_key(cfg("/proj/a", "y"))
+    explicit = Config()
+    explicit.prompt_cache_key = "my-key"
+    assert providers.cache_key(explicit) == "my-key"
+    assert providers.cache_key(Config()) == ""

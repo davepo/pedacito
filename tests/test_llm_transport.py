@@ -448,6 +448,29 @@ def test_cached_token_fields_of_other_providers(monkeypatch):
         assert c.stats["cached_tokens"] == want
 
 
+def test_prompt_cache_key_auto_is_sent_only_to_accepting_providers(monkeypatch):
+    """C3: prompt_cache_key='auto' derives a stable key and is sent only where
+    the provider table says the parameter is accepted (OpenAI, not DeepSeek)."""
+    posts = []
+    _patch_post(monkeypatch, lambda *a, **k: posts.append(k["json"]) or _ok())
+    openai = LLMClient(_cfg(base_url="https://api.openai.com/v1",
+                            prompt_cache_key="auto"))
+    openai.cfg._root = "/proj/a"
+    openai.chat([{"role": "user", "content": "hi"}], 10)
+    assert "prompt_cache_key" in posts[-1]
+    again = LLMClient(_cfg(base_url="https://api.openai.com/v1",
+                           prompt_cache_key="auto"))
+    again.cfg._root = "/proj/a"
+    again.chat([{"role": "user", "content": "hi"}], 10)
+    assert posts[-1]["prompt_cache_key"] == posts[-2]["prompt_cache_key"]
+    posts.clear()
+    ds = LLMClient(_cfg(base_url="https://api.deepseek.com/v1",
+                        prompt_cache_key="auto"))
+    ds.cfg._root = "/proj/a"
+    ds.chat([{"role": "user", "content": "hi"}], 10)
+    assert "prompt_cache_key" not in posts[-1]
+
+
 @pytest.mark.parametrize("usage,want_read,want_write", [
     # DeepSeek: implicit cache hit/miss tokens at the top level.
     ({"prompt_tokens": 50, "completion_tokens": 1,

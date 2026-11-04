@@ -88,3 +88,22 @@ def cache_mode_for(cfg) -> str:
         return setting
     return provider_for(getattr(cfg, "base_url", ""),
                         getattr(cfg, "model", "")).cache_mode
+
+
+def cache_key(cfg) -> str:
+    """The effective prompt_cache_key: an explicit non-"auto" value verbatim,
+    "auto" as a stable hash of the project root + profile + model (so one
+    project routes to a warm cache across runs, while two projects differ),
+    "" for nothing."""
+    raw = (getattr(cfg, "prompt_cache_key", "") or "").strip()
+    if not raw:
+        return ""
+    if raw != "auto":
+        return raw
+    import hashlib
+    h = hashlib.sha256()
+    for part in (getattr(cfg, "_root", None) or "",
+                 getattr(cfg, "active_profile", None) or "",
+                 getattr(cfg, "model", "") or ""):
+        h.update((str(part) + "\0").encode("utf-8", "replace"))
+    return h.hexdigest()[:32]

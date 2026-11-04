@@ -1559,9 +1559,14 @@ class LLMClient:
                         "type": "json_schema",
                         "json_schema": {"name": "step", "strict": True, "schema": schema},
                     }
-        key = getattr(self.cfg, "prompt_cache_key", "")
-        if key and _is_remote(self.cfg.base_url):
-            payload["prompt_cache_key"] = key
+        key = getattr(self.cfg, "prompt_cache_key", "") or ""
+        if key:
+            from .providers import cache_key, provider_for
+            key = cache_key(self.cfg)
+            if key and provider_for(self.cfg.base_url,
+                                    self.cfg.model).cache_key_ok \
+                    and _is_remote(self.cfg.base_url):
+                payload["prompt_cache_key"] = key
 
         prompt_est = estimate_messages(msgs, self.estimate_tokens)
         t0 = time.time()
