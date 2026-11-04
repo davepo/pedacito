@@ -1,0 +1,186 @@
+# Techniques: getting the most out of small models
+
+Pedacito is built for local models in roughly the 4B–27B range, usually with a
+tight context window and no spare VRAM for parallel reasoning. That changes the
+whole calculus: techniques that help a frontier model for free are often too
+expensive, too slow, or actively harmful here.
+
+Everything below is judged on one question: **does it raise task success and
+answer faithfulness per token and per second?** A technique ships only when it
+wins that trade-off, and it is gated behind a config flag, a model card, or a
+measured win — never enabled on trust. This page lists what Pedacito actually
+does, and, at the end, the well-known techniques it deliberately does *not*.
+
+The reasons and measurement plan behind each choice live in
+[`loop_techniques_proposal.md`](loop_techniques_proposal.md) and the build
+order in [`upgrade_plan.md`](upgrade_plan.md).
+
+---
+
+## The guiding constraints
+
+Four rules shape every decision:
+
+1. **Token economy.** Every token the model re-reads costs time and window
+   space. The harness tries to hand the model only the relevant lines, once.
+2. **Prompt-cache reuse.** Local servers cache the prompt *prefix*, and the
+   first user turn is the fold point. A technique that rewrites the head of the
+   conversation throws the cache away for the whole task.
+3. **Bounded loops.** Every recovery is a fixed number of rounds, never an
+   open-ended "keep thinking".
+4. **Deterministic before model-based.** Code correctness is checkable against
+   source and tests, so Pedacito verifies for free first and only pays for a
+   model's opinion where there is nothing to check mechanically (prose).
+
+---
+
+## What Pedacito does
+
+### 1. A harness-managed retrieval loop, not free-form reasoning
+
+The `gather` phase is a ReAct loop, but the harness owns it. Each step is a
+grammar-constrained JSON `{action, file, pattern, symbol, start, end, ...}`
+followed by a `RESULT:` observation, until the model says `done` or hits a
+budget. Because the schema constrains the *choice of action* (not just the
+format), a small model cannot wander into unsupported actions. Recovery nudges
+fire once each for the classic stalls — re-reading the same range, repeating a
+step, a run of errors, or a `[STUCK:]` on identical actions.
+
+Why it helps: the loop itself is the biggest intelligence win — a ranked map,
+symbol resolution, and bounded lookups get a 4B model to the right 300 lines of
+a 12,000-line project without it having to hold the whole thing in context.
+
+### 2. Reasoning *before* acting (zero-cost "chain of thought")
+
+Small non-thinking models commit to an action before writing any rationale.
+Three changes move the deliberation in front of the decision at roughly zero
+extra cost:
+
+- **Reason-first steps** (`step_reasoning_first`, on by default). The `reasoning`
+  field is emitted *before* the action, so the model deliberates before it
+  commits. The model card still picks the ordering per model, since thinking
+  models already deliberate and gain nothing.
+- **Edit-plan brief** (`edit_plan_brief`, on by default). Before the SEARCH
+  blocks, the answer states 1–3 lines: the file, the lines or symbol it will
+  change, and why. This is the only pre-edit reasoning the answer phase gets,
+  and it replaces a self-contradictory "explain what you did" line.
+- **Worked examples** (`fewshot_steps`, off by default). Three short worked
+  steps from the project itself (grep a symbol, read it, done) shown once in the
+  first user turn, so grammar/native mode also teaches *good action choice*,
+  not just well-formed output.
+
+### 3. Deterministic grounding and verification (free checks)
+
+Before any edit is written — and, in shadow mode, for prose answers too — a set
+of zero-call checks catches the specific ways small models go wrong:
+
+- **Unread edits.** A SEARCH block that quotes lines the model never `read` is
+  flagged: it is guessing, not editing. The read ledger tracks exactly which
+  line spans were shown.
+- **Citations.** A `file:line` claim about a file (or line) the model never saw
+  is a warning; an invented path that doesn't resolve is reported too.
+- **Placeholders, stale references, moved imports.** `TODO`/`pass` stubs the
+  task didn't ask for, a renamed function still called elsewhere, a moved file
+  still imported by its old path.
+- **Coverage.** Requirements extracted from the task that no edit or sentence
+  addresses.
+- **Verdict filter.** When a model *verifier* reports a `DEFECT`, it only counts
+  as an error if the cited file resolves and the line is inside it — a
+  hallucinating small-model verifier can't feed the repair loop.
+- **Fuzzy-match warnings.** A block that anchored only approximately is flagged
+  for review, never silently credited as clean.
+- **Prose shadow verification.** For no-edit answers (`explain`), the citation
+  and identifier checks run and are *logged only*, never acted on, until they
+  prove precise enough to promote.
+
+### 4. Harness initiative — save the model its most error-prone steps
+
+The harness already knows what the task names, so it can fetch it instead of
+making a small model hunt:
+
+- **Step-0 prefetch** (`prefetch_targets`, off by default). Task-named files and
+  symbols are read through the normal tool path *before* the first model step,
+  so the read ledger is populated and edits can quote real source.
+- **Post-gather prefetch** (a narrow P6 trigger). If the model finishes gather
+  with named targets still unread, or never read any ranked top-3 file, the
+  harness does *one* extra bounded read before answering — a single expansion,
+  never a new loop.
+
+### 5. Execution-grounded repair (objective error signals)
+
+The cheapest reliable feedback is the code itself:
+
+- **Verify→repair.** Deterministic findings feed one bounded re-ask; the model
+  corrects against concrete, quoted problems rather than a vague "try again".
+- **Post-edit tests and lint.** After an edit, impacted tests run and
+  linter/type-checker output is diffed against a pre-edit baseline, and
+  failures feed the repair rounds. An applied edit that breaks tests is an
+  objective signal no model self-critique can fake.
+
+### 6. Sampling the right amount
+
+- **Per-phase temperature** (`temperature_answer=0`, `temperature_repair`). The
+  answer and repair phases copy SEARCH text character-for-character, so they
+  decode greedily; the gather phase keeps a little diversity for when it gets
+  stuck.
+- **Best-of-N** (`best_of`, off by default). A weak model may sample a second
+  edit reply at higher temperature, both scored deterministically, keeping the
+  best. No majority voting — see below.
+
+### 7. Adaptive defaults from a measured card
+
+`pedacito calibrate` runs a short scripted suite — tool choice, JSON adherence,
+edit format, planted-injection and honesty, long-context retrieval,
+continuation, a thinking A/B, and capabilities — and stores a per-model card.
+The card then picks `prompt_pack`, `answer_mode`, `best_of`, `verify_answer`,
+`tool_mode`, `fuzzy_match`, and `edit_style` *only for settings the user left
+at their default*, with an explicit config value always winning. The direction
+is deliberate: the *weakest* models get the *most* safety net.
+
+### 8. Prompt-cache layout
+
+The system prompt and first user turn are byte-identical within a gather, and
+history is folded past one point, so the server's prompt-prefix cache survives
+every step. On hosted providers, explicit `cache_control` breakpoints are placed
+at the stable prefix (and the provider table decides which API accepts them),
+so the repeated re-sends of the gather prefix cost as little as possible.
+
+### 9. Shallow failure memory
+
+A failed task is remembered as harness facts — what was tried, why, which files
+were touched — and injected (capped, cache-stable) into similar later tasks.
+The memory is *facts*, not model-written reflection, which a small model would
+get wrong.
+
+### 10. Discovery and role routing
+
+`pedacito models scan` + `pedacito profiles` find servers, calibrate models,
+and recommend which profile to use for each role. This matters for small models
+because the highest-leverage trick is often *routing* the hard job — the
+`verifier` or `planner` — to a larger local or hosted model, while the cheap
+work stays on the small worker.
+
+---
+
+## Techniques that exist but are not a good fit
+
+These are real methods with real literature behind them. Pedacito rejects them
+not because they never work, but because they cost more than they return for a
+4B–27B model on one GPU — or because a cheaper deterministic substitute already
+covers the need.
+
+| Technique | Why not, here |
+|---|---|
+| **Full Chain-of-Verification** (generate verification questions, answer them independently) | Adds calls without new information for *code*: correctness is checkable against source and tests, so the questions just re-derive what the deterministic checks already know. |
+| **Tree / Graph of Thoughts** (branch, score, backtrack) | Too many calls and too much context; a local window can't keep multiple branches alive. The one useful fragment — a second plan on failure — is a small deterministic lint + rescore, not a search tree. |
+| **Majority-vote self-consistency** (sample N, take the modal answer) | `best_of` already samples and re-ranks; voting over code *diffs* is brittle, and small-model errors are correlated, so "majority" doesn't buy independence. |
+| **Always-on model self-critique / Reflexion** (the model reviews its own full draft) | Small-model self-critique is unreliable, and re-sending the full draft/source costs tokens and can break the warm prefix. Deterministic checks + one bounded repair cover the same ground more cheaply. |
+| **Model-written reflection notes in memory** | Same unreliability; harness-fact records (what was tried, why) give the benefit without asking the model to write truthful prose about itself. |
+| **Model-based compaction** (`compaction = "model"`) | One extra call per fold, and a small model's summary drops exactly the line-level facts the edit phase must later quote. The deterministic extractive fold is the right default. |
+| **Parallel `n > 1` sampling** | Local servers split one GPU across slots, so latency barely improves; `best_of` is off by default anyway. |
+| **Logprob / entropy confidence as an effort trigger** | No logprob plumbing exists, server support differs across runtimes, and the extra fields would perturb replay. The cheap per-task triggers (no edit, no locate, repeated steps) are enough. |
+| **LSP default-on** | External language servers are slow to start and optional; the step-0 prefetch already recovers most of the "go to definition" value without one. |
+
+The through-line: **if a deterministic, harness-side check can answer the
+question, Pedacito uses that before paying for a model call — and it never
+spends a call where a small model's own opinion is the weak link.**

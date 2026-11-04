@@ -42,6 +42,10 @@ better: [opencode](https://opencode.ai),
 [Claude Code](https://claude.com/claude-code) are good options. Pedacito is for
 when you specifically want to stay local and small.
 
+Getting a small model to do useful work takes a specific set of harness
+techniques — [TECHNIQUES.md](TECHNIQUES.md) walks through the ones Pedacito
+uses and the well-known ones it deliberately avoids, and why.
+
 ---
 
 ## Install
