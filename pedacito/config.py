@@ -2278,26 +2278,10 @@ REFERENCE_TEMPLATE = TEMPLATE + '''
 '''
 
 
-_KNOWN_SERVERS = (
-    ("LM Studio", "http://localhost:1234/v1"),
-    ("Ollama",    "http://localhost:11434/v1"),
-)
-
-
-def discover_servers(timeout: float = 2.0) -> list[tuple[str, str, list[str]]]:
-    """Probe the known local servers; returns [(label, base_url, [model ids])]
-    for each one answering GET <base_url>/models within `timeout`."""
-    import requests
-    found = []
-    for label, url in _KNOWN_SERVERS:
-        try:
-            r = requests.get(url.rstrip("/") + "/models", timeout=timeout)
-            r.raise_for_status()
-            ids = sorted({m.get("id", "?") for m in r.json().get("data", [])})
-        except Exception:
-            continue
-        found.append((label, url, ids))
-    return found
+# Server discovery lives in `discovery.py`, which labels servers by fingerprint
+# (their replies) rather than a fixed port -> name table. Re-exported here so
+# existing callers keep working.
+from .discovery import discover_servers  # noqa: F401
 
 
 def _ask(prompt: str, default: str = "") -> str:

@@ -124,8 +124,9 @@ CONNECT_HELP = """\
   - Ollama: it binds to 127.0.0.1 by default. Set OLLAMA_HOST=0.0.0.0 (or the
     machine's address) in its environment before starting it, then restart.
   - If you're on a different machine from the server, check the URL and port
-    in your config match where it's actually listening (LM Studio default
-    port 1234, Ollama default port 11434)."""
+    in your config match where it's actually listening (LM Studio defaults to
+    port 1234 and Ollama to 11434, but any port works; `pedacito models scan`
+    finds a server wherever it listens)."""
 
 LOAD_HELP = """\
   The server found the model but could not load it. Usual causes, in order:
@@ -2062,15 +2063,16 @@ class LLMClient:
                 return entry
         return None
 
-    def _absorb_model_list(self, entries, source: str) -> dict:
-        """Extract size/context from the entry for `cfg.model` in a model list.
+    def _absorb_model_list(self, entries, source: str,
+                           model: str | None = None) -> dict:
+        """Extract size/context from the entry for `model` in a model list.
 
         Absorbs both extensions of the OpenAI /v1/models shape:
           * LM Studio v1: `size_bytes`, `loaded_instances[].config.context_length`,
             `max_context_length`.
           * Lemonade: `size` in GB, `context_length`, `max_context_window`.
         """
-        m = self._pick_model(entries, self.cfg.model)
+        m = self._pick_model(entries, model or self.cfg.model)
         if not m:
             return {}
 
@@ -2112,7 +2114,8 @@ class LLMClient:
             got["source"] = source
         return got
 
-    def _lemonade_health_context(self, root: str) -> tuple[int | None, int | None]:
+    def _lemonade_health_context(self, root: str,
+                                 model: str | None = None) -> tuple[int | None, int | None]:
         """Context a currently loaded Lemonade model was launched with, from its
         health endpoint (the model list's `context_length` can lag behind).
         Tries both prefixes because older builds expose /api/v0/health."""
@@ -2125,7 +2128,7 @@ class LLMClient:
             except Exception:
                 continue
             entries = data.get("all_models_loaded") or []
-            entry = self._pick_model(entries, self.cfg.model)
+            entry = self._pick_model(entries, model or self.cfg.model)
             if not entry:
                 continue
             opts = entry.get("recipe_options") or {}
@@ -2136,11 +2139,12 @@ class LLMClient:
                 return ctx, max_ctx
         return None, None
 
-    def _lemonade_options_context(self, root: str) -> int | None:
+    def _lemonade_options_context(self, root: str,
+                                  model: str | None = None) -> int | None:
         """The ctx_size Lemonade would use for a load right now, from
         /v1/models/{id}/options (`resolved_ctx_size` covers automatic sizing).
         Absent on older versions, hence the silent failure."""
-        url = (root + "/v1/models/" + quote(str(self.cfg.model), safe="")
+        url = (root + "/v1/models/" + quote(str(model or self.cfg.model), safe="")
                + "/options")
         try:
             r = requests.get(url, headers=self.headers, timeout=5)
@@ -2160,10 +2164,11 @@ class LLMClient:
                     return ctx
         return None
 
-    def model_info(self) -> dict | None:
-        """Metadata for `cfg.model`: any of `size_bytes`, `context_length`,
-        `max_context_length`, plus `source`; None when nothing answers. Used by
-        auto-fit to size the context window from the machine's VRAM.
+    def model_info(self, model: str | None = None) -> dict | None:
+        """Metadata for a model ID (default `cfg.model`): any of `size_bytes`,
+        `context_length`, `max_context_length`, plus `source`; None when nothing
+        answers. Used by auto-fit to size the context window from the machine's
+        VRAM, and by `models scan` to describe each listed model.
 
         Tried in order, stopping once both size and context are known:
           * LM Studio v1 `/api/v1/models`
@@ -2174,6 +2179,7 @@ class LLMClient:
 
         Every probe is best-effort; failures just yield nothing.
         """
+        model = model or self.cfg.model
         root = _server_root(self.cfg.base_url)
         out: dict = {}
 
@@ -2205,21 +2211,21 @@ class LLMClient:
                     entries = data.get("models") or data.get("data") or []
                 else:
                     entries = data if isinstance(data, list) else []
-                merge(self._absorb_model_list(entries, source))
+                merge(self._absorb_model_list(entries, source, model))
             except Exception:
                 pass
 
         # Lemonade's loaded/saved recipe options beat a list entry that may
         # carry the registry default window.
         if out.get("source") == "lemonade":
-            health_ctx, health_max = self._lemonade_health_context(root)
+            health_ctx, health_max = self._lemonade_health_context(root, model)
             if health_max and not out.get("max_context_length"):
                 out["max_context_length"] = health_max
             if health_ctx:
                 out["context_length"] = health_ctx
                 out["context_source"] = "lemonade loaded options"
             else:
-                options_ctx = self._lemonade_options_context(root)
+                options_ctx = self._lemonade_options_context(root, model)
                 if options_ctx:
                     out["context_length"] = options_ctx
                     out["context_source"] = "lemonade saved options"
@@ -2228,7 +2234,7 @@ class LLMClient:
         if not enough():
             try:
                 r = requests.post(root + "/api/show",
-                                  json={"name": self.cfg.model}, timeout=5)
+                                  json={"name": model}, timeout=5)
                 if r.status_code == 200:
                     d = r.json()
                     got: dict = {}

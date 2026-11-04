@@ -393,8 +393,8 @@ def _models(q, body):
 
 @post("/api/settings/discover")
 def _discover(q, body):
-    from .. import config as config_mod
-    found = config_mod.discover_servers(timeout=1.5)
+    from ..discovery import discover_servers
+    found = discover_servers(timeout=1.5)
     return 200, {"servers": [{"label": a, "base_url": b, "models": c}
                              for a, b, c in found]}
 
