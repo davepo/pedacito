@@ -56,6 +56,8 @@ def _choices(name: str) -> list[str] | None:
         return ["schema", "object"]
     if name == "tool_mode":
         return ["grammar", "native"]
+    if name == "edit_style":
+        return ["quote", "anchor"]
     if name == "tier":
         return ["", *config_mod.PRESET_TIERS]
     if name in ("k_cache_quant", "v_cache_quant"):

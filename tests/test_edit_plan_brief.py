@@ -104,6 +104,23 @@ def test_a_callers_own_brief_is_left_alone():
     assert prompts.plan_brief("nothing to reword") == "nothing to reword"
 
 
+def test_anchor_style_rewords_the_brief_and_quote_is_the_default():
+    """A2.5: edit_style 'anchor' prefers SYMBOL anchors; 'quote' (and unset)
+    keep the quote-first wording."""
+    assert Config().edit_style is None
+    on = prompts.edit_format(_cfg(edit_style="anchor"), EDIT_FORMAT)
+    assert prompts.ANCHOR_HINT in on
+    assert "Prefer an anchor when quoting the old text exactly is" not in on
+    for style in ("quote", None):
+        off = prompts.edit_format(_cfg(edit_style=style), EDIT_FORMAT)
+        assert "Prefer an anchor when quoting the old text exactly is" in off
+        assert prompts.ANCHOR_HINT not in off
+    # the tiny brief is reworded too
+    tiny = prompts.edit_format(_cfg(prompt_pack="tiny", edit_style="anchor"),
+                               EDIT_FORMAT)
+    assert "Prefer SYMBOL over LINES" in tiny
+
+
 def test_prompt_overrides_bypass_the_flag(tmp_path):
     root = tmp_path / "proj"
     (root / ".pedacito" / "prompts").mkdir(parents=True)
@@ -237,3 +254,13 @@ def test_the_flag_is_a_plain_bool_in_config_and_the_gui(tmp_path):
     S.validate_text(out)
     kept = [ln for ln in out.splitlines() if ln != "edit_plan_brief = true"]
     assert kept == config_mod.TEMPLATE.splitlines()
+
+
+def test_edit_style_is_a_closed_vocabulary_that_defaults_to_the_card():
+    S.validate_text('edit_style = "anchor"\n')
+    S.validate_text('edit_style = "quote"\n')
+    with pytest.raises(config_mod.ConfigError):
+        S.validate_text('edit_style = "sidebar"\n')
+    item = next(i for i in S.schema() if i["name"] == "edit_style")
+    assert item["type"] == "str" and item["default"] is None
+    assert item["choices"] == ["quote", "anchor"]

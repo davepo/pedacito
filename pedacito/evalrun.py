@@ -469,6 +469,7 @@ def run_task(task: EvalTask, client, cfg, workdir: Path | None = None) -> dict:
     from . import index as index_mod
     from . import loop
     from .agent import Agent
+    from .edits import parse_edits
 
     tmp = Path(tempfile.mkdtemp(prefix=f"pdc-eval-{task.id}-", dir=workdir))
     row = {"id": task.id, "fixture": task.fixture, "kind": task.kind,
@@ -547,6 +548,11 @@ def run_task(task: EvalTask, client, cfg, workdir: Path | None = None) -> dict:
             # separately and never counts as a clean first apply.
             row["fuzzy_applies"] = sum(
                 1 for r in tr.results if getattr(r, "fuzzy", False))
+            # Blocks that used a SYMBOL/LINES anchor rather than SEARCH quoting
+            # (edit_style = "anchor"): evidence the model followed the variant.
+            row["anchor_blocks"] = sum(
+                1 for e in parse_edits(tr.reply or "")
+                if (e.symbol or e.lines))
             row["first_apply_clean"] = bool(ok_edit and row["repair_calls"] == 0
                                             and row["fuzzy_applies"] == 0)
             tests_ok = _run_tests(tmp, task) if ok_edit else (

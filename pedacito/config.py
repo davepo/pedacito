@@ -321,6 +321,11 @@ class Config:
     # or inside blocks). On by default. Set false to ablate it. A prompt
     # override (`.pedacito/prompts/edit_format.md` or `answer.md`) bypasses it.
     edit_plan_brief: bool = True
+    # Edit block style: "quote" (SEARCH quoting is the default), "anchor"
+    # (SYMBOL anchors with a full new definition are the default; SEARCH only
+    # for small edits outside a definition), or None = the model card decides
+    # (`pedacito calibrate` measures both).
+    edit_style: str | None = None
     # Per-message OUTPUT ceiling the provider honours (hosted APIs cap one
     # reply far below their context window, e.g. ~8k tokens). When >0 and the
     # run targets a hosted API, auto_fit clamps reply budgets to it. Explicit
@@ -797,6 +802,15 @@ def _coerce(name: str, value, path: Path | None = None):
         norm = str(value).strip().lower()
         if norm not in ("grammar", "native"):
             raise ConfigError(f"{where}{name} must be 'grammar' or 'native', "
+                              f"got {value!r}")
+        return norm
+    if name == "edit_style":
+        norm = str(value).strip().lower()
+        if norm in _NONE_WORDS:
+            return None
+        if norm not in ("quote", "anchor"):
+            raise ConfigError(f"{where}{name} must be 'quote' or 'anchor' "
+                              "(leave it out to let the model card decide), "
                               f"got {value!r}")
         return norm
     if name in _OPTIONAL_TYPES:
@@ -1593,6 +1607,14 @@ def _parse_env(name: str, raw: str):
                 f"PEDACITO_JSON_MODE={raw!r} must be 'schema' or 'object'"
                 "  ('json_object' / 'json' mean 'object')")
         return norm
+    if name == "edit_style":
+        text = raw.strip().lower()
+        if text in _NONE_WORDS:
+            return None
+        if text not in ("quote", "anchor"):
+            raise ConfigError(f"PEDACITO_EDIT_STYLE={raw!r} must be 'quote' "
+                              "or 'anchor' (or 'auto')")
+        return text
     if name in _OPTIONAL_TYPES:
         text = raw.strip().lower()
         if text in _NONE_WORDS:
@@ -1836,6 +1858,9 @@ def _profile_override_comments() -> str:
                              if _OPTIONAL_TYPES[name] is bool
                              else ("0.0", "the global value applies"))
             out.append(f"# {name} = {sample}   # unset: {unset}")
+            continue
+        if name == "edit_style":
+            out.append('# edit_style = "anchor"   # unset: the model card decides')
             continue
         out.append(f"# {name} = {_toml_literal(value)}")
     return "\n".join(out)

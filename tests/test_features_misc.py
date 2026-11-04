@@ -701,6 +701,16 @@ def test_choose_gates_fuzzy_match_on_the_edit_format_probe():
     assert modelcard.choose(weak, False)["fuzzy_match"] is True
 
 
+def test_choose_gates_anchor_style_on_the_anchor_arm():
+    """A2.5: the anchor-first brief is adopted only when it measures clearly
+    better than the quote-first brief."""
+    base = {"tool_choice": 0.6, "json_ok": 1.0, "edit_format": 0.5,
+            "instructions": 1, "honesty": 1, "needle": 1, "continuation": 1}
+    assert "edit_style" not in modelcard.choose(base, False)
+    assert modelcard.choose({**base, "edit_format_anchor": 0.7}, False)["edit_style"] == "anchor"
+    assert "edit_style" not in modelcard.choose({**base, "edit_format_anchor": 0.55}, False)
+
+
 # ------------------------------------------------------------------- eval runner
 class EvalModel:
     """Reads the gold file, then answers with the gold edit."""

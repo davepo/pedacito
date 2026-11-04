@@ -112,7 +112,7 @@ def apply(cfg) -> dict | None:
 
     for name in ("best_of", "verify_answer", "fold_tail_steps", "plan_threshold",
                  "tool_mode", "disable_thinking", "step_reasoning_first",
-                 "fewshot_steps", "fuzzy_match"):
+                 "fewshot_steps", "fuzzy_match", "edit_style"):
         if name in ch and unset(name):
             setattr(cfg, name, ch[name])
             sources[name] = "model card"
@@ -226,11 +226,13 @@ _FIXTURE = ("def is_leech(self, lapses):\n    return lapses >= 8\n\n"
             "def next_due(self):\n    return self.queue[0]\n")
 
 
-def _t_edit_format(client, cfg) -> tuple[float, list[str]]:
+def _t_edit_format(client, cfg, anchor: bool = False) -> tuple[float, list[str]]:
     from .agent import EDIT_FORMAT
+    from .prompts import anchor_brief
+    brief = anchor_brief(EDIT_FORMAT) if anchor else EDIT_FORMAT
     numbered = "\n".join(f"{i:>3} | {ln}" for i, ln in
                          enumerate(_FIXTURE.splitlines(), 1))
-    system = "You are a code assistant. Complete the task.\n\n" + EDIT_FORMAT
+    system = "You are a code assistant. Complete the task.\n\n" + brief
     tasks = [
         ("Change the leech threshold from 8 to self.threshold.",
          lambda t: "self.threshold" in t and "lapses >= 8" not in t),
@@ -261,20 +263,57 @@ def _t_edit_format(client, cfg) -> tuple[float, list[str]]:
         if not blocks:
             notes.append(f"'{task[:30]}...': no search/replace block")
             continue
-        text = _FIXTURE
-        applied = text
-        ok = True
-        for b in blocks:
-            span = edits_mod.locate(applied, b.search, cfg) if b.search else None
-            if span is None:
-                ok = False
-                break
-            applied = applied[:span.start] + b.replace + applied[span.stop:]
-        if ok and check(applied):
+        applied = _apply_probe_blocks(_FIXTURE, blocks, cfg)
+        if applied is not None and check(applied):
             good += 1
         else:
             notes.append(f"'{task[:30]}...': block did not anchor or apply")
     return good / len(tasks), notes
+
+
+def _def_span(text: str, symbol: str) -> tuple[int, int] | None:
+    """(start, stop) char span of the definition `symbol` in `text` (its whole
+    body, plus the trailing terminator), or None when absent."""
+    lines = text.split("\n")
+    for i, ln in enumerate(lines):
+        if not re.match(r"\s*def\s+" + re.escape(symbol) + r"\s*\(", ln):
+            continue
+        start = sum(len(x) + 1 for x in lines[:i])
+        j = i + 1
+        while j < len(lines):
+            nxt = lines[j]
+            if nxt.strip() == "":
+                j += 1
+                continue
+            if re.match(r"\s*(def|class)\s+", nxt) or not nxt[:1].isspace():
+                break
+            j += 1
+        stop = sum(len(x) + 1 for x in lines[:j])
+        return start, stop
+    return None
+
+
+def _apply_probe_blocks(text: str, blocks, cfg) -> str | None:
+    """Apply SEARCH / LINES / SYMBOL blocks to `text` in order; None when any
+    block cannot anchor. The probe's fixture is too small for an index, so
+    SYMBOL anchors are resolved against `def <symbol>` here."""
+    for b in blocks:
+        if b.symbol:
+            span = _def_span(text, b.symbol)
+            if span is None:
+                return None
+            text = text[:span[0]] + b.replace + text[span[1]:]
+        elif b.lines:
+            lspan = edits_mod._line_span(text, b.lines[0], b.lines[1])
+            if lspan is None:
+                return None
+            text = text[:lspan[0]] + b.replace + text[lspan[1]:]
+        else:
+            s = edits_mod.locate(text, b.search, cfg) if b.search else None
+            if s is None:
+                return None
+            text = text[:s.start] + b.replace + text[s.stop:]
+    return text
 
 
 _PROBE_BUDGET = 1500
@@ -568,6 +607,10 @@ def choose(measured: dict, hosted: bool) -> dict:
     # quotes exactly.
     if ed < 1.0:
         ch["fuzzy_match"] = True
+    # The anchor-first brief wins when it measures clearly better at producing
+    # correctly-anchored edits than the quote-first brief.
+    if measured.get("edit_format_anchor", 0.0) + 1e-9 >= ed + _ARM_GAIN:
+        ch["edit_style"] = "anchor"
     # The thinking A/B verdict, persisted so every later run starts in the
     # winning mode instead of rediscovering it one empty reply at a time.
     # Only a decisive split is recorded: thinking burned the answer budget
@@ -686,6 +729,10 @@ def calibrate(client, cfg, verbose: bool = True, quick: bool = False,
     _store(measured, "edit_format", cols[0])
     notes += n
     say(f"  edit format      {measured['edit_format']:>4.0%}")
+    cols, n = _repeat(_t_edit_format, repeats, client, cfg, True)
+    _store(measured, "edit_format_anchor", cols[0])
+    notes += [f"edit-anchor: {x}" for x in n[:3]]
+    say(f"  edit format, anchor-first  {measured['edit_format_anchor']:>4.0%}")
     cols, n = _repeat(_t_instructions, repeats, client, cfg)
     _store(measured, "instructions", cols[0])
     notes += n

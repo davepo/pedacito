@@ -294,6 +294,32 @@ def plan_brief(text: str) -> str:
     return text
 
 
+# edit_style "anchor": SYMBOL anchors become the default for definitions (the
+# model writes a whole new definition instead of copying the old text exactly),
+# and SEARCH quoting is reserved for small edits outside a definition.
+ANCHOR_HINT = ("To change a function or method, use `--- FILE: path.py SYMBOL "
+               "name` with the FULL new definition in REPLACE (leave SEARCH "
+               "EMPTY). Use SEARCH blocks only for small edits outside a "
+               "definition.")
+_ANCHOR_BRIEF_SWAPS = (
+    # The full edit brief's anchor bullet ends by treating anchors as a
+    # fallback for risky quotes; the anchor variant makes SYMBOL the default.
+    ("Prefer an anchor when quoting the old text exactly is\n  risky, and "
+     "widen a LINES range until it covers whole statements.", ANCHOR_HINT),
+    # The tiny brief's anchor bullet.
+    ("Anchor instead of quoting: `--- FILE: path.py LINES 40-60` or",
+     "Prefer SYMBOL over LINES: " + ANCHOR_HINT + " LINES fallback: "
+     "`--- FILE: path.py LINES 40-60` or"),
+)
+
+
+def anchor_brief(text: str) -> str:
+    """`text` (an edit brief) reworded for `edit_style = "anchor"`."""
+    for old, new in _ANCHOR_BRIEF_SWAPS:
+        text = text.replace(old, new)
+    return text
+
+
 def edit_format(cfg, full: str, pack: str | None = None) -> str:
     """EDIT_FORMAT at the run's density (override `edit_format` wins, and
     bypasses `edit_plan_brief`)."""
@@ -304,6 +330,8 @@ def edit_format(cfg, full: str, pack: str | None = None) -> str:
     text = _TINY_EDIT if pack == "tiny" else full
     if getattr(cfg, "edit_plan_brief", False):
         text = plan_brief(text)
+    if getattr(cfg, "edit_style", None) == "anchor":
+        text = anchor_brief(text)
     return text
 
 
