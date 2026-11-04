@@ -78,8 +78,14 @@ Pedacito its base URL and a model name.
 | **Lemonade** | Start the server and load a model. | The URL it prints (ends in `/v1` or `/api/v1`) |
 | **Hosted API** | Get an API key. | e.g. `https://api.deepseek.com/v1` |
 
-For hosted APIs set `base_url`, `api_key`, and `model`. Pedacito detects a
-remote host and switches to `json_mode = "object"` automatically.
+The default ports above are hints, not rules: any port works, and the scan
+identifies a server by its replies, so two servers can coexist on one host
+(for example Lemonade on 11434 next to LM Studio on 1234).
+
+For hosted APIs set `base_url`, `api_key`, and `model` (or `api_key_env`, the
+name of an environment variable holding the key, so the secret stays out of the
+file). Pedacito detects a remote host and switches to `json_mode = "object"`
+automatically.
 
 Verify the connection from the machine where Pedacito runs:
 
@@ -116,11 +122,21 @@ depth, the thinking switch); anything you set explicitly still wins.
 ## Configure
 
 ```bash
-pedacito config --setup     # interactive: finds LM Studio/Ollama, lists models
+pedacito config --setup     # finds local servers, writes a profile per model
+pedacito models scan        # re-run later to add models or servers
+pedacito profiles           # see scores and role recommendations
 pedacito config --init      # or write a commented starter file
 pedacito config             # show every resolved setting and where it came from
 pedacito config --reference # print the full annotated template
 ```
+
+`config --setup` (and `models scan`) finds local model servers — LM Studio,
+Ollama, Lemonade, llama.cpp — **on any port**, identifies each by its replies
+rather than its port (so two servers can share one machine), lists its models,
+and writes one identity-only profile per model, then sets a default. Pass
+`--url` to point at a server on another machine or a hosted API; `models scan
+--match PATTERN --calibrate quick|full|none` re-runs it. Prefer to edit by
+hand? The minimum:
 
 The file is `~/.config/pedacito/config.toml` (Linux/macOS) or
 `%APPDATA%\pedacito\config.toml` (Windows). The minimum:
@@ -143,6 +159,37 @@ command-line flags. Environment variables `PEDACITO_<KEY>` (for example
 `PEDACITO_MODEL`) and `PEDACITO_PROFILE` are also honored. Unknown keys are
 rejected with a suggestion. The legacy `[lmstudio]` section is still accepted as
 an alias for `[server]`.
+
+## Hosted prompt caching
+
+Pedacito keeps the prompt prefix stable (the system prompt and first user turn
+are byte-identical within a gather), so a hosted provider that caches on its own
+reuses it across steps automatically. A provider table matches on the host of
+`base_url` and decides the cache mode, plus a few compatibility quirks:
+
+| Host | Caching | What Pedacito sets |
+|---|---|---|
+| `api.deepseek.com` | Automatic (implicit) | nothing extra; reads hit/miss tokens |
+| `api.openai.com` | Automatic for prompts ≥ 1024 tokens | `prompt_cache_key` routes to a warm cache |
+| Qwen / DashScope | Implicit automatic; explicit opt-in | `cache_control` markers in `explicit` mode |
+| `api.anthropic.com` (OpenAI-compatible) | Not supported on this surface | `json_mode = "schema"`, omits `temperature`, `tool_mode = "grammar"` |
+| Moonshot, Gemini, xAI, Groq | Automatic / implicit | nothing extra; hits are counted when returned |
+
+Set `prompt_cache` to override the table per profile:
+
+```toml
+[profiles.qwen]
+prompt_cache = "explicit"   # auto (the table decides) | implicit | explicit | off
+prompt_cache_ttl = "5m"     # explicit-mode breakpoint TTL: "5m" or "1h"
+prompt_cache_key = "auto"   # a stable hash of project + profile + model, sent
+                            # only where the provider accepts it; "" = nothing
+```
+
+Cache writes are billed separately from reads: set
+`price_cache_write_per_mtok` to count them in cost. `pedacito config --doctor`
+probes the active provider and reports the cache as *observed*, *not observed*,
+or *explicit-only* (DeepSeek-style caches persist asynchronously, so "not
+observed" is not "unsupported").
 
 ---
 
@@ -795,6 +842,11 @@ a hosted budget. An unset role uses the active model; a role whose server is
 unreachable falls back to it with one warning. Usage is counted per call site
 either way. `--role planner=big` sets one for a single run.
 
+`pedacito profiles --recommend` suggests a profile per role (worker, escalate,
+verifier, planner, summarizer) with a one-line reason, from the measured
+harness-fit and eval evidence; `--apply-roles` writes the roles after you
+confirm.
+
 A task that ends without a usable edit is also remembered in
 `.pedacito/attempts.json` (files looked at, why); a similar later task is told
 what was already tried. A success clears it.
@@ -866,6 +918,12 @@ backups and event files and trims `log.txt`.
 ---
 
 ## Profiles, tiers, and token budgets
+
+`pedacito profiles` lists every profile with its measured harness-fit (mean ±
+spread), eval pass rate when a report exists, generation speed, the context
+that fits its VRAM, and card status; `--recommend` adds per-role suggestions
+and `--json` emits the same as JSON. `pedacito models scan` writes an
+identity-only profile per model a server lists.
 
 Define a profile per model instead of editing `model =` each time:
 

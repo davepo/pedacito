@@ -22,8 +22,13 @@ Pedacito talks to any server with an OpenAI-compatible `/v1` API.
 - **Ollama:** `ollama serve`, then `ollama pull <model>`. Default port `11434`.
   For a different machine, set `OLLAMA_HOST=0.0.0.0` before starting it.
 - **Lemonade:** start the server and load a model; use the base URL it shows.
+- **llama.cpp:** run the server; use the URL it prints (often `:8080`).
 - **Hosted API (DeepSeek, OpenAI, ...):** you only need the URL, an API key, and
   a model name.
+
+Those ports are defaults, not rules: any port works, and the scan identifies a
+server by its replies — so two servers can run on one machine (for example
+Lemonade on 11434 next to LM Studio on 1234).
 
 ## 2. Install
 
@@ -42,8 +47,11 @@ pip install -e .            # Windows: py -m pip install -e .
 pedacito config --setup
 ```
 
-The wizard probes for a running LM Studio or Ollama server, lists its models,
-asks which to use, optionally takes a hosted API key, and writes
+The wizard finds running local model servers (LM Studio, Ollama, Lemonade,
+llama.cpp) on any port, lists their models, and offers to write a profile for
+every model and pick a default. For a server on another machine or a hosted
+API, run `pedacito models scan --url <url>` (with `--api-key-env VAR` and
+`--match PATTERN` for a hosted catalogue). It writes
 `~/.config/pedacito/config.toml` (`%APPDATA%\pedacito\config.toml` on Windows).
 Prefer to edit by hand? `pedacito config --init` writes a commented starter.
 The essentials:
@@ -313,7 +321,9 @@ commands until you read it and run `pedacito trust`.
 ## Several models: profiles
 
 For VRAM-based model selection, thinking/reasoning advice, and role routing, see
-the [model guide](MODEL_GUIDE.md).
+the [model guide](MODEL_GUIDE.md). `pedacito models scan` finds a server and
+writes one profile per model; `pedacito profiles --recommend` shows measured
+scores and per-role suggestions.
 
 ```toml
 [profiles.tiny]

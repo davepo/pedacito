@@ -2360,7 +2360,8 @@ def interactive_setup(path: Path | None = None, force: bool = False,
             else:
                 model = _ask("Model name (exactly as the server reports it)")
     else:
-        say("No LM Studio or Ollama server answered on localhost.")
+        say("No local model server (LM Studio, Ollama, Lemonade, llama.cpp) "
+            "answered on localhost.")
         hosted = _ask("Is this a hosted API (DeepSeek/OpenAI-style)? [Y/n]"
                       ).lower() != "n"
 
