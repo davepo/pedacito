@@ -128,6 +128,28 @@ def test_schema_hides_disabled_actions_and_fields():
     assert "content" in shschema["properties"]
 
 
+def test_descriptions_never_mention_disabled_actions():
+    """A2.6: with default flags, no browser, fetch, or MCP wording appears in
+    the schema -- native tool mode sends the descriptions verbatim, so advice
+    about a disabled tool is pure distraction."""
+    plain = tools.schema_for(Config())
+    text = " ".join(prop.get("description", "")
+                    for prop in plain["properties"].values())
+    for word in ("browser", "screenshot", "fetch", "MCP", "server/tool",
+                 "press Enter"):
+        assert word.lower() not in text.lower(), word
+    # the base STEP_SCHEMA still carries the full wording
+    assert "browser" in tools.STEP_SCHEMA["properties"]["pattern"]["description"]
+    # enabling a tool brings its wording back
+    full = Config()
+    full.allow_browser = True
+    full.allow_fetch = True
+    full.allow_mcp = True
+    full_text = " ".join(prop.get("description", "")
+                         for prop in tools.schema_for(full)["properties"].values())
+    assert "browser" in full_text and "fetch" in full_text and "server/tool" in full_text
+
+
 def test_gather_has_no_default_step_cap(tmp_path):
     """max_steps=0 (the default) must not stop at the old internal ceiling;
     only the token/gathered budget or a `done` ends the gather loop."""

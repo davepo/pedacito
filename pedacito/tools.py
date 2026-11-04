@@ -241,6 +241,92 @@ def reasoning_first(cfg) -> bool:
     return getattr(cfg, "step_reasoning_first", None) is True
 
 
+# Per-field description fragments, keyed by the action(s) they describe, plus a
+# tail that always applies. schema_for rebuilds each field's description from
+# only the fragments whose actions are in the final enum: under native tool
+# mode the whole description is sent as a tool definition, so a disabled tool's
+# argument advice (browser, fetch, MCP, ...) is pure distraction that can steer
+# a small model toward actions it is not allowed to use.
+_FIELD_ACTION_FRAGMENTS = {
+    "file": [
+        (("read",), "For read."),
+        (("write", "append", "move", "delete", "undo"),
+         "For write/append/move/delete/undo."),
+        (("outline",), "For outline, a file OR a directory/glob."),
+        (("grep",), "For grep, optionally a file, directory, or glob."),
+        (("diff",), "For diff, optionally one file."),
+        (("screenshot", "browser"),
+         "For screenshot/browser, an older screenshot to compare."),
+    ],
+    "start": [
+        (("read",), "For read."),
+        (("screenshot", "browser"), "For screenshot/browser, wait seconds."),
+    ],
+    "pattern": [
+        (("grep",), "For grep: regex, or plain text if it is not valid regex."),
+        (("find",), "For find: a name/signature/summary fragment."),
+        (("git",), "For git: the git arguments."),
+        (("fetch",), "For fetch: the URL."),
+        (("browser",),
+         "For browser: optional actions like 'press Enter; hold Space 1.5; "
+         "click #start; wait 2; eval <js>' -- hold keeps a key DOWN for N "
+         "seconds (an instant press is invisible to fixed-timestep game "
+         "loops); eval goes LAST and consumes the rest (semicolons allowed "
+         "inside); its RESULT is reported clipped at 2000 chars, so resolve "
+         "compact or aggregated JSON."),
+    ],
+    "symbol": [
+        (("callers", "context", "rename"),
+         "For callers/context/rename (old name);"),
+        (("read",), "or for read when file is empty (reads that definition)."),
+        (("skill",), "For skill: the skill name."),
+        (("mcp",), "For mcp: server/tool, or server to list its tools."),
+    ],
+    "command": [
+        (("run", "screenshot"),
+         "For run/screenshot: executable and arguments, e.g. 'pytest -q'."),
+        (("browser",),
+         "For browser: a URL or a command that prints one. No pipes or "
+         "redirection."),
+    ],
+    "content": [
+        (("write", "append"),
+         "For write/append: at most ~120 lines of file text (large files are "
+         "built chunk by chunk over several steps)."),
+        (("todo",), "For todo: the full checklist, one '- [ ]'/'- [x]' line "
+                    "per step."),
+        (("remember",), "For remember: the fact."),
+        (("task",), "For task: the question."),
+        (("mcp",), "For mcp: a JSON object of tool arguments."),
+    ],
+}
+_FIELD_DESCRIPTION_TAILS = {
+    "file": "Empty otherwise.",
+    "start": "0 otherwise.",
+    "pattern": "Empty otherwise.",
+    "symbol": "Empty otherwise.",
+    "command": "Empty otherwise.",
+    "content": "Empty otherwise.",
+}
+
+
+def _prune_descriptions(schema: dict, actions: list[str]) -> None:
+    """Rebuild each prunable field's description from the fragments whose
+    actions are enabled, plus the field's tail. Fields not listed keep the
+    base STEP_SCHEMA wording (they only describe always-on actions)."""
+    enabled = set(actions)
+    for field, fragments in _FIELD_ACTION_FRAGMENTS.items():
+        prop = schema.get("properties", {}).get(field)
+        if not prop:
+            continue
+        kept = [frag for acts, frag in fragments if enabled & set(acts)]
+        desc = " ".join(kept)
+        tail = _FIELD_DESCRIPTION_TAILS.get(field, "")
+        if tail:
+            desc = (desc + " " + tail) if desc else tail
+        prop["description"] = desc
+
+
 def schema_for(cfg) -> dict:
     """Return STEP_SCHEMA narrowed to the actions this run allows, so the
     model cannot pick a disabled action. Fields only a disabled action uses
@@ -304,6 +390,7 @@ def schema_for(cfg) -> dict:
         drop.add("command")
     for key in drop:
         schema["properties"].pop(key, None)
+    _prune_descriptions(schema, actions)
     for key in ("content", "to", "command"):
         if key not in drop:
             required.append(key)
