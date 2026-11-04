@@ -53,21 +53,27 @@ def _changed_lines(old: str, new: str) -> tuple[list[str], list[str]]:
     return gone, added
 
 
-# ------------------------------------------------------------- off by default
-def test_off_by_default_the_briefs_are_unchanged():
-    assert Config().edit_plan_brief is False
+# -------------------------------------------------------------- on by default
+def test_on_by_default_the_briefs_are_reworded():
+    assert Config().edit_plan_brief is True
     for pack in ("full", "small", "tiny"):
         cfg = _cfg(prompt_pack=pack)
         want = prompts._TINY_EDIT if pack == "tiny" else EDIT_FORMAT
-        assert prompts.edit_format(cfg, EDIT_FORMAT) == want
+        assert prompts.edit_format(cfg, EDIT_FORMAT) != want
+        assert prompts.PLAN_LINE in prompts.edit_format(cfg, EDIT_FORMAT)
+    # the flag-off path stays byte-identical to the original briefs
+    for pack in ("full", "small", "tiny"):
+        off = _cfg(prompt_pack=pack, edit_plan_brief=False)
+        want = prompts._TINY_EDIT if pack == "tiny" else EDIT_FORMAT
+        assert prompts.edit_format(off, EDIT_FORMAT) == want
         assert "nothing else around them" in want
-        assert prompts.answer_system(cfg, EDIT_FORMAT, "task").endswith(want)
 
 
 # ------------------------------------------------------------------- new path
 @pytest.mark.parametrize("pack", ["full", "tiny"])
 def test_the_brief_rewords_exactly_two_places(pack):
-    off = prompts.edit_format(_cfg(prompt_pack=pack), EDIT_FORMAT)
+    off = prompts.edit_format(_cfg(prompt_pack=pack, edit_plan_brief=False),
+                              EDIT_FORMAT)
     on = prompts.edit_format(_cfg(prompt_pack=pack, edit_plan_brief=True),
                              EDIT_FORMAT)
     assert "nothing else around them" not in on
@@ -226,7 +232,7 @@ def test_the_flag_is_a_plain_bool_in_config_and_the_gui(tmp_path):
     with pytest.raises(config_mod.ConfigError):
         S.validate_text('edit_plan_brief = "yes"\n')
     item = next(i for i in S.schema() if i["name"] == "edit_plan_brief")
-    assert item["type"] == "bool" and item["default"] is False
+    assert item["type"] == "bool" and item["default"] is True
     out = S.set_values(config_mod.TEMPLATE, {"edit_plan_brief": True})
     S.validate_text(out)
     kept = [ln for ln in out.splitlines() if ln != "edit_plan_brief = true"]

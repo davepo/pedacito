@@ -97,9 +97,11 @@ class Config:
     temperature: float = 0.2
     # Per-phase overrides for the phases that copy text character for character
     # (the answer and the repair re-asks). None = the global `temperature`;
-    # 0 is greedy decoding. Gather keeps the global value. `best_of` samples its
-    # extra candidates at the answer temperature + 0.4.
-    temperature_answer: float | None = None
+    # 0 is greedy decoding. The answer defaults to 0 (greedy, so SEARCH text is
+    # copied exactly) and the repair re-asks to None (the global value). Gather
+    # keeps the global value. `best_of` samples its extra candidates at the
+    # answer temperature + 0.4.
+    temperature_answer: float | None = 0.0
     temperature_repair: float | None = None
     # Extra sampler parameters (top_k, min_p, repeat_penalty, seed, stop, ...)
     # merged verbatim into every /chat/completions body; model, messages and
@@ -290,9 +292,9 @@ class Config:
     # simplest for small models.
     compact_step_schema: bool = False
     # Put `reasoning` FIRST in the gather step schema, so the model states what
-    # it needs before it picks the action. None = the model card decides
-    # (`pedacito calibrate` measures both orders); true/false forces it.
-    step_reasoning_first: bool | None = None
+    # it needs before it picks the action. On by default. None = the model card
+    # decides (`pedacito calibrate` measures both orders); true/false forces it.
+    step_reasoning_first: bool | None = True
     # Show three worked steps from this project (grep, read, done) once in the
     # first user turn, between the map and the task, even when a grammar or
     # native tool call guarantees the format. None = the model card decides.
@@ -311,9 +313,9 @@ class Config:
     repair_rounds: int = 2
     # Ask the model to open an edit reply with 1-3 lines naming the file, the
     # lines or symbol it will change, and why (and to put no other text between
-    # or inside blocks). Off by default so it can be ablated. A prompt override
-    # (`.pedacito/prompts/edit_format.md` or `answer.md`) bypasses it.
-    edit_plan_brief: bool = False
+    # or inside blocks). On by default. Set false to ablate it. A prompt
+    # override (`.pedacito/prompts/edit_format.md` or `answer.md`) bypasses it.
+    edit_plan_brief: bool = True
     # Per-message OUTPUT ceiling the provider honours (hosted APIs cap one
     # reply far below their context window, e.g. ~8k tokens). When >0 and the
     # run targets a hosted API, auto_fit clamps reply budgets to it. Explicit
@@ -2051,7 +2053,8 @@ REFERENCE_TEMPLATE = TEMPLATE + '''
 # max_consecutive_failures: abort an indexing batch after N failures.
 # temperature: keep low for tool calls. temperature_answer / temperature_repair
 # override it for the answer and the repair re-asks, which copy SEARCH text
-# character for character (0 = greedy; unset = temperature). Gather keeps
+# character for character (0 = greedy; unset = temperature). temperature_answer
+# defaults to 0; temperature_repair defaults to unset. Gather keeps
 # `temperature`; best_of candidates run at the answer temperature + 0.4.
 # sampler: per-server sampler keys, usually placed inside a profile.
 #
@@ -2108,11 +2111,13 @@ REFERENCE_TEMPLATE = TEMPLATE + '''
 # allow_rename treats create-new + clear-old blocks as a real move.
 # fuzzy_match anchors near-miss search blocks to the most similar text.
 # compact_step_schema is experimental: drops unused fields from step replies.
-# step_reasoning_first puts `reasoning` before the action in each step; unset
-# lets the model card decide (`pedacito calibrate` measures both orders).
+# step_reasoning_first puts `reasoning` before the action in each step; it is
+# on by default (set false to disable, or leave it unset for the card to decide
+# via `pedacito calibrate`).
 # fewshot_steps shows three worked steps from this project once in the first
 # user turn (unset = the model card decides).
-# edit_plan_brief asks for 1-3 plan lines before the edit blocks.
+# edit_plan_brief asks for 1-3 plan lines before the edit blocks (on by
+# default; set false to ablate it).
 # auto_diagnostics runs the detected linter/typechecker after each auto task.
 # post_edit_check runs a cheap per-file lint/syntax check after every applied
 # edit and feeds back only NEW findings (diffed against a pre-task baseline);

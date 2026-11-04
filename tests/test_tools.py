@@ -85,6 +85,7 @@ def test_schema_hides_disabled_actions_and_fields():
 
     compact = Config()
     compact.compact_step_schema = True
+    compact.step_reasoning_first = False      # test the action-first order
     cschema = tools.schema_for(compact)
     assert cschema["required"] == ["action", "reasoning"]
     # The load-bearing field ORDER must survive: args before reasoning, so a

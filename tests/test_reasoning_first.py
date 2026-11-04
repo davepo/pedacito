@@ -37,10 +37,15 @@ def _rf_cfg(**kw):
     return cfg
 
 
-# ------------------------------------------------------------- off by default
-def test_default_schema_is_unchanged():
-    assert Config().step_reasoning_first is None
-    for cfg in (Config(), _rf_cfg(step_reasoning_first=False),
+# -------------------------------------------------------------- on by default
+def test_default_schema_is_reason_first():
+    assert Config().step_reasoning_first is True
+    for cfg in (Config(), _rf_cfg(step_reasoning_first=True)):
+        s = tools.schema_for(cfg)
+        assert list(s["properties"]) == NEW_ORDER
+        assert s["required"] == NEW_ORDER
+    # None and False both keep the action-first order and its short hint.
+    for cfg in (_rf_cfg(step_reasoning_first=False),
                 _rf_cfg(step_reasoning_first=None)):
         s = tools.schema_for(cfg)
         assert list(s["properties"]) == OLD_ORDER
@@ -51,9 +56,9 @@ def test_default_schema_is_unchanged():
         "Under 15 words: what you still need. Not a plan."
 
 
-def test_default_gather_prompt_and_schema_are_the_old_ones(tmp_path):
+def test_default_gather_prompt_and_schema_are_reason_first(tmp_path):
     _a, client = gather(tmp_path, READ_THEN_GREP)
-    assert all(list(schema["properties"]) == OLD_ORDER
+    assert all(list(schema["properties"]) == NEW_ORDER
                for _msgs, schema in client.seen)
 
 
@@ -192,9 +197,9 @@ def test_a_complete_reason_first_reply_flags_nothing():
 
 
 def test_default_order_cut_behaviour_is_unchanged():
-    """The default schema still treats a cut inside the trailing `reasoning`
-    as benign (the guard for the flag-off path)."""
-    default = tools.schema_for(Config())
+    """The action-first schema still treats a cut inside the trailing
+    `reasoning` as benign (the guard for the flag-off path)."""
+    default = tools.schema_for(_rf_cfg(step_reasoning_first=False))
     cut = ('{"action":"read","file":"a.py","start":1,"end":9,"pattern":"",'
            '"symbol":"","content":"","reasoning":"See the im')
     c = _Fake([(cut, "length")])
@@ -465,13 +470,12 @@ def test_config_writer_keeps_comments_and_other_keys():
     live = [ln for ln in again.splitlines()
             if ln.startswith("step_reasoning_first")]
     assert live == ["step_reasoning_first = false"]
-    assert "# step_reasoning_first = true   # unset: the model card decides" \
-        in again                                # the commented example stays
+    assert "# step_reasoning_first = true" in again   # the commented example stays
     prof = S.set_values(text, {"step_reasoning_first": True}, profile="default")
     assert "step_reasoning_first = true" in prof.split("\n[profiles.default]\n")[1]
 
 
 def test_settings_schema_lists_the_flag_with_its_default():
     item = next(i for i in S.schema() if i["name"] == "step_reasoning_first")
-    assert item["type"] == "bool" and item["default"] is None
+    assert item["type"] == "bool" and item["default"] is True
     assert "reasoning" in item["help"].lower()

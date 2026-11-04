@@ -141,7 +141,9 @@ def _manifest_facts(root: Path) -> tuple[list[str], list[str], list[str]]:
 def build_brief(index, cfg=None, max_tokens: int = 500) -> str:
     """The repo brief text ('' when the project is empty), within roughly
     `max_tokens` (trimmed by dropping the layout lines last-first)."""
-    key = (id(index), index.generation, max_tokens,
+    # Identity by content, not `id(index)`: a garbage-collected index can hand
+    # its address to a new one, and a stale brief would leak across projects.
+    key = (str(index.root), index.generation, tuple(index.files), max_tokens,
            getattr(cfg, "test_command", ""))
     hit = _CACHE.get(key)
     if hit is not None:

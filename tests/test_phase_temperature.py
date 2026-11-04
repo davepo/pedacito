@@ -72,16 +72,33 @@ def _temps(client, site):
 
 
 # ------------------------------------------------------------- off by default
-def test_unset_means_the_global_temperature_in_every_phase(tmp_path):
+def test_defaults_are_greedy_answer_and_global_repair():
     cfg0 = Config()
-    assert cfg0.temperature_answer is None and cfg0.temperature_repair is None
+    assert cfg0.temperature_answer == 0.0 and cfg0.temperature_repair is None
+
+
+def test_unset_means_the_global_temperature_in_every_phase(tmp_path):
     agent, client, cfg = _setup(tmp_path, replies=[MISS, GOOD, GOOD],
-                                steps=READ_THEN_GREP)
+                                steps=READ_THEN_GREP,
+                                temperature_answer=None,
+                                temperature_repair=None)
     agent.gather("Fix bulk_discount", verbose=False)
     first = agent.answer("Fix bulk_discount", "src", stream=False)
     agent.apply(first, dry_run=False, task="Fix bulk_discount", gathered="src")
     assert client.log and all(t == cfg.temperature for _s, t in client.log)
     assert {s for s, _t in client.log} >= {"step", "answer", "repair"}
+
+
+def test_the_default_answer_runs_greedy_while_repair_keeps_the_global(
+        tmp_path):
+    agent, client, cfg = _setup(tmp_path, replies=[MISS, GOOD],
+                                steps=READ_THEN_GREP)
+    agent.gather("Fix bulk_discount", verbose=False)
+    reply = agent.answer("Fix bulk_discount", "src", stream=False)
+    agent.apply(reply, dry_run=False, task="Fix bulk_discount", gathered="src")
+    assert _temps(client, "step") == [cfg.temperature] * 3
+    assert _temps(client, "answer") == [0.0]
+    assert _temps(client, "repair") == [cfg.temperature]
 
 
 # ------------------------------------------------------------------- new path
@@ -108,7 +125,7 @@ def test_the_two_settings_are_independent(tmp_path):
     assert _temps(client, "answer") == [0.0]
     assert _temps(client, "repair") == [cfg.temperature]
     agent, client, cfg = _setup(tmp_path / "b", replies=[MISS, GOOD],
-                                temperature_repair=0.0)
+                                temperature_answer=None, temperature_repair=0.0)
     reply = agent.answer("t", "src", stream=False)
     agent.apply(reply, dry_run=False, task="t", gathered="src")
     assert _temps(client, "answer") == [cfg.temperature]
@@ -187,7 +204,7 @@ def test_best_of_candidates_run_hotter_than_the_first_reply(tmp_path):
 
 
 def test_best_of_offset_is_unchanged_when_unset(tmp_path):
-    agent, client, cfg = _best_of_setup(tmp_path)
+    agent, client, cfg = _best_of_setup(tmp_path, temperature_answer=None)
     first = agent.answer("Fix bulk_discount", "src", stream=False)
     agent.best_of("Fix bulk_discount", first, "src", verbose=False)
     assert _temps(client, "answer") == [0.2, pytest.approx(0.6), pytest.approx(0.6)]
@@ -356,9 +373,9 @@ def test_config_writer_keeps_comments_for_the_temperatures():
     assert live == ["temperature_answer = 0.0", "temperature_repair = 0.0"]
     kept = [ln for ln in out.splitlines() if ln not in live]
     assert kept == text.splitlines()          # no comment or key was lost
-    assert "# temperature_answer = 0.0   # unset: the global value applies" in out
+    assert "# temperature_answer = 0.0" in out
     import tomllib
     tomllib.loads(config_mod.REFERENCE_TEMPLATE)
     names = {i["name"]: i for i in S.schema()}
     assert names["temperature_answer"]["type"] == "float"
-    assert names["temperature_answer"]["default"] is None
+    assert names["temperature_answer"]["default"] == 0.0
