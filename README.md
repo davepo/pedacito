@@ -581,9 +581,10 @@ preflight, edit parsing, repair) deterministically and free. It reports which
 calls were asked a *different* prompt than when recorded: that is how you test a
 change to the harness rather than to the model.
 
-`pedacito eval` runs eight tasks over three fixture repositories (Python,
-TypeScript, Go) — each with a gold file set, a substring check, a real test for
-Python, and a planted prompt injection — and prints locate rate, first-apply
+`pedacito eval` runs 15 tasks over four fixture repositories — a small Python
+shop, a TypeScript app, a Go CLI, and a medium multi-file Python service with
+decoy modules — each with a gold file set, a substring check, a real test for
+Python, and planted prompt injections — and prints locate rate, first-apply
 success, repair calls, tokens, cache-hit ratio, wall time and a failure
 taxonomy — for edits: wrong file, unread edit, format error, truncation,
 refusal, hallucination, test regression, injection followed; for questions:
@@ -998,19 +999,21 @@ config --reference` prints the annotated template. Key settings:
 |---|---|---|
 | `base_url` | `http://localhost:1234/v1` | Server address. |
 | `model` | `google/gemma-3-27b` | Exact id/name the server reports. |
-| `api_key` | `""` | For hosted APIs and secured servers. |
+| `api_key` / `api_key_env` | `""` / `""` | For hosted APIs and secured servers. `api_key_env` stores the *name* of an environment variable holding the key, so the secret never lands in the config file. |
 | `vram_gb` | *(required for local)* | GPU VRAM; set in `[universal]`, overridable per profile. |
 | `context_tokens` | auto | Server-side context window; set when detection is wrong. |
 | `k_cache_quant` / `v_cache_quant` | `""` | KV-cache quantization the runtime uses. |
 | `json_mode` | `"schema"` | `"schema"` for local servers, `"object"` for hosted (auto-switched). |
 | `tier` | `""` | Budget preset: `tiny`/`small`/`medium`/`large`/`hosted`; guessed from the model name when unset. |
 | `max_steps` | 0 | Lookup limit per task; 0 = none. |
+| `prefetch_targets` | 0 | Read up to this many task-named files/symbols through the normal tool path before the first lookup step (and once more after gather when a named target is still unread). Prefetch reads don't count toward `max_steps`. |
 | `temperature` | 0.2 | Higher values make tool selection worse. |
-| `temperature_answer` / `temperature_repair` | unset | Sampling temperature for the answer and for the repair re-asks, which copy SEARCH text character for character (0 = greedy). Unset uses `temperature`. Gather keeps `temperature`; `best_of` candidates run at the answer temperature + 0.4. |
+| `temperature_answer` / `temperature_repair` | 0 / unset | Sampling temperature for the answer and for the repair re-asks, which copy SEARCH text character for character. The answer defaults to `0` (greedy, so copied text is exact); the repair re-asks are unset (they use `temperature`). Gather keeps `temperature`; `best_of` candidates run at the answer temperature + 0.4. |
 | `backup` | true | Snapshot originals before writing. |
 | `log_sessions` | true | Write a session record per task. |
 | `review` | false | Always use the review page. |
 | `fuzzy_match` | false | Anchor near-miss search blocks approximately. |
+| `edit_style` | unset | `quote` (default brief) or `anchor` (prefer `SYMBOL` + full definition, SEARCH only for small edits); unset lets the model card decide. |
 | `post_edit_check` | true | After applied edits, feed back only NEW linter/syntax findings on the changed files. |
 | `auto_allowlist` | false | Restrict `auto` task writes to files the title names or the lookup read (new files always allowed). |
 | `allow_write` | false | Whole-file write/append/move/delete during gathering. |
@@ -1042,7 +1045,8 @@ config --reference` prints the annotated template. Key settings:
 | `protected_paths` / `shell_deny` | `[]` | Paths the model may not write; command patterns `run` refuses. |
 | `wrap_observations` / `redact_secrets` | true | Fence untrusted output; mask secrets in logs and sessions. |
 | `max_total_tokens` / `max_cost` | 0 | Stop before the next call once spent (0 = no limit). |
-| `price_input_per_mtok` / `price_output_per_mtok` / `price_cached_per_mtok` | 0 | USD per million tokens, for cost reporting. |
+| `price_input_per_mtok` / `price_output_per_mtok` / `price_cached_per_mtok` / `price_cache_write_per_mtok` | 0 | USD per million tokens, for cost reporting; the write price covers explicit-cache creation tokens. |
+| `prompt_cache` / `prompt_cache_ttl` / `prompt_cache_key` | `auto` / `5m` / `""` | Hosted prompt caching (see [Hosted prompt caching](#hosted-prompt-caching)): `auto` lets the provider table decide, `implicit`/`explicit`/`off` override it, `prompt_cache_key = "auto"` derives a stable cache-affinity key. |
 | `stuck_recovery` | true | One targeted recovery prompt before gather gives up. |
 | `use_model_card` | true | Let `pedacito calibrate`'s card fill unset settings. |
 | `log_events` / `keep_events` | true / 20 | Local JSONL telemetry under `.pedacito/events/`. |
@@ -1052,9 +1056,9 @@ config --reference` prints the annotated template. Key settings:
 | `plan_threshold` / `max_replans` | 0 / 1 | Auto-plan tasks naming this many files or requirements; tasks naming 5+ files auto-plan even at 0 unless this is set explicitly (`--plan` forces one task, `--no-plan` opts out); planner revisions after a failed step. |
 | `allow_steering` | true | Deliver lines typed mid-task to the model in `chat`. |
 | `tool_mode` | `grammar` | `native` sends lookup steps through the model's tool-call channel; `calibrate` picks. |
-| `step_reasoning_first` | unset | `true` puts `reasoning` before the action in each lookup step (the model says what it needs, then picks); unset lets the model card decide. `calibrate` measures both orders with the same adopt-only-if-0.1-better rule as `tool_mode`. |
+| `step_reasoning_first` | true | `true` puts `reasoning` before the action in each lookup step (the model says what it needs, then picks); unset lets the model card decide. `calibrate` measures both orders with the same adopt-only-if-0.1-better rule as `tool_mode`. |
 | `fewshot_steps` | unset | `true` shows three worked steps from your project (grep a symbol, read it, done) once in the first user turn, even under grammar or native tool calls; unset lets the model card decide. About 70 extra prompt tokens on every lookup call (the server caches them after the first, but a prompt-token count such as `eval`'s still includes them on each call). `calibrate` adopts it only if it picks the right action 0.1 more often with no loss of well-formed steps. |
-| `edit_plan_brief` | false | The edit brief asks for 1-3 plan lines before the blocks (file, lines or symbol, why) and no other text between or inside blocks. A prompt override (`edit_format.md`, `answer.md`) bypasses it. |
+| `edit_plan_brief` | true | The edit brief asks for 1-3 plan lines before the blocks (file, lines or symbol, why) and no other text between or inside blocks. A prompt override (`edit_format.md`, `answer.md`) bypasses it. |
 | `sandbox` / `sandbox_network` | true / false | OS sandbox for `run` and test commands; allow network inside it. |
 | `sandbox_writable` / `sandbox_strict` | `[]` / false | Extra writable dirs; refuse to run when no sandbox can be applied. |
 | `atomic_edits` | false | Write a multi-file reply all-or-nothing (any failure writes nothing). |
