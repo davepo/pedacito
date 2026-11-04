@@ -20,6 +20,26 @@ def _task(tid):
     return next(t for t in evalrun.TASKS if t.id == tid)
 
 
+def test_medium_fixture_makes_wrong_file_reachable(tmp_path):
+    """A0.7: the medium fixture has 40+ files, decoys with similar names, a
+    deep call chain, and a gold file -- so editing a decoy scores `wrong file`."""
+    assert len(evalrun.FIXTURES["medium"]) >= 40
+    for path in ("orders/processor.py", "orders/processors.py",
+                 "orders/processor_utils.py", "orders/order_processor.py",
+                 "orders/api.py", "orders/service.py"):
+        assert path in evalrun.FIXTURES["medium"]
+    task = _task("py-medium-threshold")
+    assert task.gold_files == ["orders/processor.py"]
+    reply = ("--- FILE: orders/processors.py\n<<<<<<< SEARCH\n"
+             "        if quantity > 10:\n"
+             "=======\n        if quantity >= 10:\n>>>>>>> REPLACE\n")
+    row = evalrun.run_task(
+        task, EvalModel(reply, [{"action": "read", "file": "orders/processors.py",
+                                 "start": 1, "end": 30}]),
+        _eval_cfg(), tmp_path)
+    assert row["failure"] == "wrong file"
+
+
 def _ask(tmp_path, tid, reply, steps=None):
     return evalrun.run_task(_task(tid), EvalModel(reply, steps), _eval_cfg(),
                             tmp_path)

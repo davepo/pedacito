@@ -205,7 +205,142 @@ func (s *Store) Get(key string) (string, error) {
 ''',
 }
 
-FIXTURES = {"pyshop": PY_SHOP, "tsapp": TS_APP, "gocli": GO_CLI}
+def _medium_fixture() -> dict:
+    """A 40+ file order service: decoy modules with near-identical names and
+    thresholds, a deep call chain, and a single gold file, so the `wrong file`
+    label is actually reachable (A0.7, unblocks P3)."""
+    files = {
+        "README.md": "# orders\n\nAn order-processing service.\n",
+        "orders/__init__.py": "",
+        "orders/models.py": '''"""The order model."""
+
+
+class Order:
+    def __init__(self, items):
+        self.items = items          # list of (price, quantity)
+
+    def total_quantity(self):
+        return sum(qty for _price, qty in self.items)
+''',
+        "orders/pricing.py": '''"""Price and discount helpers."""
+
+TAX_RATE = 0.08
+
+
+def apply_tax(price):
+    return round(price * (1 + TAX_RATE), 2)
+
+
+def bulk_discount(quantity):
+    """Percent discount for an order of 10 or more items."""
+    if quantity >= 10:
+        return 10
+    return 0
+''',
+        # The gold file: the off-by-one lives here, deep in the call chain.
+        "orders/processor.py": '''"""Order processing: apply discounts and tax."""
+from orders import pricing
+
+
+def process_order(order):
+    """Return the total with a bulk discount and tax applied."""
+    quantity = order.total_quantity()
+    subtotal = sum(price * qty for price, qty in order.items)
+    if quantity > 10:
+        discount = pricing.bulk_discount(quantity)
+    else:
+        discount = 0
+    return pricing.apply_tax(subtotal * (1 - discount / 100))
+''',
+        "orders/handler.py": '''"""Request handler: routes an order to the service."""
+from orders.service import handle_order
+
+
+def on_order_received(items):
+    return handle_order(items)
+''',
+        "orders/service.py": '''"""Service layer: turns items into a processed order."""
+from orders.models import Order
+from orders.processor import process_order
+
+
+def handle_order(items):
+    return process_order(Order(items))
+''',
+        "orders/api.py": '''"""Public entry point."""
+from orders.handler import on_order_received
+
+
+def create_order(items):
+    return on_order_received(items)
+''',
+        # Decoys: near-identical names and the same-looking `> 10` threshold,
+        # so a model that anchors on a name or a snippet can land here.
+        "orders/processors.py": '''"""Batch processors (a different path)."""
+
+
+def process_batch(orders):
+    total = 0.0
+    for order in orders:
+        quantity = order.total_quantity()
+        if quantity > 10:
+            total += 0.9 * sum(p * q for p, q in order.items)
+        else:
+            total += sum(p * q for p, q in order.items)
+    return total
+''',
+        "orders/processor_utils.py": '''"""Helpers shared by the processors."""
+
+
+def discount_rate(quantity):
+    if quantity > 10:
+        return 0.1
+    return 0.0
+''',
+        "orders/order_processor.py": '''"""An alternate processing entry point."""
+
+
+def run(items):
+    quantity = sum(q for _p, q in items)
+    if quantity > 10:
+        return 0.9 * sum(p * q for p, q in items)
+    return sum(p * q for p, q in items)
+''',
+        "orders/price.py": '''"""Standalone price helpers."""
+
+TAX_RATE = 0.08
+
+
+def with_tax(price):
+    return price * (1 + TAX_RATE)
+''',
+        "orders/pricing_utils.py": '''"""Utilities around pricing."""
+
+
+def discount(quantity):
+    if quantity > 10:
+        return 10
+    return 0
+''',
+        "tests/__init__.py": "",
+        "tests/test_orders.py": '''from orders.models import Order
+from orders.processor import process_order
+
+
+def test_ten_items_get_the_discount():
+    o = Order([(1.0, 5), (1.0, 5)])   # 10 items at $1 each
+    assert process_order(o) == 9.72
+''',
+    }
+    # Filler modules push the fixture past 40 files and widen the map.
+    for i in range(32):
+        files[f"orders/legacy/module_{i:02d}.py"] = (
+            f"# legacy module {i}\n\n\ndef legacy_{i}():\n    return {i}\n")
+    return files
+
+
+FIXTURES = {"pyshop": PY_SHOP, "tsapp": TS_APP, "gocli": GO_CLI,
+            "medium": _medium_fixture()}
 
 
 # ------------------------------------------------------------------------ tasks
@@ -293,6 +428,20 @@ TASKS = [
              "instead of an empty string.",
              ["store/store.go"],
              expect={"store/store.go": ["ErrNotFound"]}),
+    # Medium fixture: decoys and a deep call chain make the wrong file
+    # reachable; the gold fix is one threshold in orders/processor.py.
+    EvalTask("py-medium-threshold", "medium",
+             "The order processor should give the bulk discount at 10 or more "
+             "items, not only above 10. Fix the threshold.",
+             ["orders/processor.py"],
+             expect={"orders/processor.py": ["quantity >= 10"]},
+             test_cmd="tests/test_orders.py"),
+    EvalTask("py-medium-chain", "medium",
+             "Starting from orders/api.py, which function ultimately applies "
+             "the discount, and in which file?",
+             ["orders/api.py", "orders/handler.py", "orders/service.py",
+              "orders/processor.py", "orders/pricing.py"], kind="question",
+             answer_has=["process_order", "processor.py"]),
 ]
 
 
