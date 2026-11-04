@@ -759,6 +759,59 @@ def test_verify_tests_task_runs_the_post_edit_test_loop(tmp_path, monkeypatch):
     assert row["passed"]
 
 
+def test_recovered_edits_also_run_the_post_edit_test_loop(tmp_path, monkeypatch):
+    """A2.2: an edit recovered by the no-block re-ask path gets the same
+    post-edit test evidence as the main apply (P2 wired into more paths)."""
+    from pedacito import loop
+    from pedacito.agent import Agent
+
+    root = tmp_path / "proj"
+    root.mkdir(parents=True)
+    (root / "player.py").write_text("x = 1\n", encoding="utf-8")
+    cfg = Config()
+    cfg.log_sessions = False
+    cfg.log_events = False
+    cfg.backup = False
+    cfg.verify_tests = True
+    cfg.allow_shell = True
+    idx = index_mod.build([str(root)], cfg, client=None, summarise=False,
+                          root=root, verbose=False)
+
+    ran = []
+
+    def fake_impacted(index, cfg_, files):
+        ran.append(sorted(files))
+        return True, "", "fake impacted tests"
+
+    monkeypatch.setattr(testsel, "run_impacted", fake_impacted)
+
+    TOOL_REPLY = ("<tool_call>\n<function=read>\n<parameter=file_path>\nplayer.py\n"
+                  "</parameter>\n</function>\n</tool_call>\n")
+    EDIT_REPLY = ("--- FILE: player.py\n<<<<<<< SEARCH\nx = 1\n=======\n"
+                  "x = 2\n>>>>>>> REPLACE\n")
+
+    class Stub:
+        stream_truncated = False
+        step_truncated = False
+
+        def __init__(self):
+            self.answers = 0
+
+        def chat_json(self, messages, schema, max_tokens=0, **kw):
+            return {"action": "done", "reasoning": "r"}
+
+        def chat(self, messages, max_tokens, schema=None, stream=False, **kw):
+            self.answers += 1
+            return TOOL_REPLY if self.answers == 1 else EDIT_REPLY
+
+    client = Stub()
+    tr = loop.run_task(root, cfg, client, Agent(idx, client, cfg), idx,
+                       "bump player", apply=True, review=False)
+    assert tr.applied and "x = 2" in (root / "player.py").read_text()
+    assert any("player.py" in " ".join(f) for f in ran), \
+        "the recovered edit ran no post-edit tests"
+
+
 def test_eval_classifies_failures(tmp_path):
     task = next(t for t in evalrun.TASKS if t.id == "py-bulk-off-by-one")
     read = [{"action": "read", "file": "shop/pricing.py", "start": 1, "end": 30}]

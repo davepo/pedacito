@@ -1607,6 +1607,15 @@ def _run_task_once(root: Path, cfg, client, agent, idx, task: str, *,
             if results:
                 workspace.log_event(
                     root, "answer re-asked; recovered edit blocks", "INFO")
+                if apply and not review:
+                    # The recovered reply applied edits on its own path; run
+                    # the same post-edit test evidence the main apply gets.
+                    _fire(cfg, root, "post_edit",
+                          files=sorted({r.file for r in results if r.ok}))
+                    results, reply, tests_ok = _post_edit_tests(
+                        root, cfg, agent, idx, task, results, reply,
+                        backup_dir, None,
+                        sorted({e.file for e in parse_edits(reply)}))
             else:
                 # The "No changes:" declaration is now the reply (run_loop
                 # keys its refusal path off _is_noop(tr.reply)).
