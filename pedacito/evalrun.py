@@ -1056,6 +1056,35 @@ def repeat_seeds(cfg, repeats: int, seed: int | None) -> list[int | None]:
     return [seed + i for i in range(repeats)]
 
 
+def _eval_reports_path() -> Path:
+    from . import config as config_mod
+    return config_mod.USER_CONFIG.parent / "eval_reports.json"
+
+
+def eval_reports() -> dict:
+    """The saved eval summaries, keyed by card key (`base_url|model`)."""
+    try:
+        data = json.loads(_eval_reports_path().read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def save_eval_summary(cfg, summary: dict) -> Path:
+    """Store this run's summary under the model's card key, so `profiles` can
+    show eval evidence next to the harness-fit."""
+    from .modelcard import card_key
+    p = _eval_reports_path()
+    data = eval_reports()
+    data[card_key(cfg)] = {"ts": time.time(), "model": cfg.model,
+                           "summary": summary}
+    p.parent.mkdir(parents=True, exist_ok=True)
+    tmp = p.with_suffix(".tmp")
+    tmp.write_text(json.dumps(data, indent=1), encoding="utf-8")
+    tmp.replace(p)
+    return p
+
+
 def run_cli(args, cfg) -> int:
     """`pedacito eval`."""
     from .llm import LLMClient
@@ -1103,6 +1132,8 @@ def run_cli(args, cfg) -> int:
               "taxonomy": TAXONOMY_VERSION, "metrics": METRICS_VERSION, "repeats": repeats,
               "seeds": seeds if seeds[0] is not None else [],
               "summary": summary, "rows": rows}
+    if cfg.active_profile:
+        save_eval_summary(cfg, summary)
     if args.out:
         Path(args.out).write_text(json.dumps(report, indent=1),
                                   encoding="utf-8")
