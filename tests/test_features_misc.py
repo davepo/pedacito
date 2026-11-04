@@ -1033,6 +1033,9 @@ def test_doctor_tree_sitter_report_shows_the_pin_status(monkeypatch):
 
 # ------------------------------------------------------------------- scaffolding
 def test_plan_sources_and_tests_use_cross_language_conventions(tmp_path):
+    from pedacito.chunker_ts import TS_AVAILABLE
+    if not TS_AVAILABLE:
+        pytest.skip("tree-sitter unavailable (JS chunking falls back to lines)")
     from pedacito.scaffold import Plan, PlannedFile, skeleton_index
     plan = Plan("demo", "s", [PlannedFile(p) for p in (
         "src/testimony.py", "src/app.py", "tests/test_app.py", "web/app.test.js",

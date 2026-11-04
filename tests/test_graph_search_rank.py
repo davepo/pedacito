@@ -117,6 +117,9 @@ def test_test_conventions_across_languages(rel, expect):
 
 
 def test_cards_link_tests_for_every_language(tmp_path):
+    from pedacito.chunker_ts import TS_AVAILABLE
+    if not TS_AVAILABLE:
+        pytest.skip("tree-sitter unavailable (JS/Go chunking falls back to lines)")
     idx = _project(tmp_path, {
         "web/app.js": "function a() { return 1; }\n",
         "web/app.test.js": "test('a', () => a());\n",
