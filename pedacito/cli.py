@@ -419,6 +419,13 @@ def _cmd_config(args, cfg) -> int:
     state, detail = sandbox.status(cfg)
     print(f"Sandbox: {state} -- {detail}")
     print(_tree_sitter_report())
+    # Prompt-cache doctor: resolve the mode from the provider table (the
+    # setting wins), then send one 1.2k-token prompt twice and report whether
+    # the second call hit a cache.
+    from . import providers
+    mode = providers.cache_mode_for(cfg)
+    cap = client.doctor_prompt_cache()
+    print(f"\nPrompt cache: {mode} -- observed {cap}.")
     print("\nNext: `pedacito calibrate` measures tool choice, edit format, "
           "honesty and long-context retrieval, and saves a model card.")
     return 0

@@ -442,8 +442,17 @@ class Config:
     # cost, and cache-hit numbers are unknown. A server that rejects the option
     # is remembered and retried without it.
     stream_usage: bool = True
-    # Provider cache-affinity key (hosted APIs that support it).
+    # Provider cache-affinity key (hosted APIs that support it). "auto" derives
+    # a stable hash of the project root and profile; "" sends nothing.
     prompt_cache_key: str = ""
+    # Prompt caching on hosted providers: "auto" (the provider table decides),
+    # "implicit" (send nothing extra; the provider caches on its own),
+    # "explicit" (add `cache_control` markers on the stable prefix), or "off"
+    # (no markers and no cache key).
+    prompt_cache: str = "auto"
+    # Explicit-mode cache TTL: "5m" or "1h" (the provider must support it;
+    # otherwise it is ignored with a one-time notice).
+    prompt_cache_ttl: str = "5m"
     # Circuit breaker for repeated transport/server failures. After
     # `circuit_failures` consecutive failures (timeouts, dropped streams, 5xx;
     # not rate limits, context overflows, or 4xx requests) calls fail fast for
@@ -714,6 +723,8 @@ _ENUM_FIELDS = {
     "answer_mode": ("", "rebuild", "continue", "auto"),
     "compaction": ("deterministic", "model", "off"),
     "verify_answer": ("off", "deterministic", "full"),
+    "prompt_cache": ("auto", "implicit", "explicit", "off"),
+    "prompt_cache_ttl": ("5m", "1h"),
 }
 _ENUM_EMPTY_OK = ("prompt_pack", "answer_mode")
 

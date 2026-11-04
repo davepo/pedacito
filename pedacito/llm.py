@@ -2272,6 +2272,31 @@ class LLMClient:
             except Exception:
                 continue
 
+    def doctor_prompt_cache(self, delay: float = 2.0) -> str:
+        """Send one >= 1.2k-token prompt twice, a few seconds apart, and report
+        whether the second call hit a cache: 'observed', 'not observed', or
+        'explicit-only' (the provider table says explicit markers are the only
+        path). Never 'unsupported': DeepSeek-style caches persist
+        asynchronously, so a single miss proves nothing."""
+        from .providers import provider_for
+        text = "\n".join(
+            f"Line {i:03d}: the quick brown fox jumps over the lazy dog."
+            for i in range(130))
+        msgs = [{"role": "system", "content": text}]
+        try:
+            self.chat(msgs, max_tokens=8)
+            time.sleep(delay)
+            before = int(self.stats.get("cached_tokens", 0) or 0)
+            self.chat(msgs, max_tokens=8)
+        except Exception:
+            return "not observed"
+        if int(self.stats.get("cached_tokens", 0) or 0) > before:
+            return "observed"
+        prov = provider_for(self.cfg.base_url, self.cfg.model)
+        if prov.cache_mode == "explicit":
+            return "explicit-only"
+        return "not observed"
+
     def probe_json_modes(self) -> list[tuple[str, bool, str]]:
         """`pedacito config --doctor`: one tiny request per structured-output
         mode. Returns [(mode, ok, detail)] for json_schema (strict grammar),
