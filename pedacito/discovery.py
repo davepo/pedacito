@@ -205,6 +205,78 @@ def discover_servers(timeout: float = 2.0, urls=(), ports=None,
     return found
 
 
+def _quant_of(entry: dict) -> str:
+    """The quantization for a model entry, from the `@q4_k_m` id suffix or
+    Ollama's `details.quantization_level`; "" when unknown."""
+    mid = _model_id(entry) or ""
+    if "@" in mid:
+        return mid.partition("@")[2]
+    details = entry.get("details") or {}
+    return str(details.get("quantization_level") or "")
+
+
+def describe_models(base_url: str, timeout: float = 5.0, headers=None,
+                    vram_gb: int = 0) -> list[dict]:
+    """The scan's per-model view of one server.
+
+    Lists the server's models, attaches the metadata the scan needs
+    (`size_bytes`, `context_length`, `quant`) via `LLMClient.model_info(model)`,
+    and marks `loaded` where the server reports resident state (`True` loaded,
+    `False` not loaded, `None` unknown). Embedding models and models too big
+    for `vram_gb` (0 = no filter) are dropped. Each record carries `id`,
+    `base_url`, `loaded`.
+    """
+    from .config import Config
+    from .llm import LLMClient
+
+    root = _root(base_url)
+    entries = None
+    for prefix in ("/v1", "/api/v1"):
+        got = _list_entries(root + prefix + "/models", timeout, headers)
+        if got is not None:
+            entries = got
+            break
+    if entries is None:
+        label = _fingerprint(root, timeout, headers)
+        if label == "Ollama":
+            entries = _ollama_entries(root, timeout, headers)
+        elif label == "LM Studio":
+            entries = _list_entries(root + "/api/v0/models", timeout, headers)
+    entries = entries or []
+
+    cfg = Config()
+    cfg.base_url = base_url
+    client = LLMClient(cfg)
+    states = client.loaded_models() or {}
+
+    out: list[dict] = []
+    for entry in entries:
+        mid = _model_id(entry)
+        if not mid or looks_embedding(entry):
+            continue
+        info: dict = {}
+        try:
+            info = client.model_info(mid) or {}
+        except Exception:
+            info = {}
+        rec: dict = {"id": mid, "base_url": base_url}
+        if mid in states:
+            rec["loaded"] = states[mid] == "loaded"
+        else:
+            rec["loaded"] = None
+        if info.get("size_bytes"):
+            rec["size_bytes"] = int(info["size_bytes"])
+        if info.get("context_length"):
+            rec["context_length"] = int(info["context_length"])
+        quant = _quant_of(entry)
+        if quant:
+            rec["quant"] = quant
+        if vram_gb and too_big_for_vram(rec.get("size_bytes"), vram_gb):
+            continue
+        out.append(rec)
+    return out
+
+
 def looks_embedding(entry: dict) -> bool:
     """True when a model entry is an embedding model, from its `type` field or
     its name. Embedding models cannot run the harness, so the scan drops them."""

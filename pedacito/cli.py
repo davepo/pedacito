@@ -23,10 +23,13 @@ is a shorthand alias accepting the same commands. `main()` is the entry point.
 from __future__ import annotations
 
 import argparse
+import fnmatch
 import os
 import sys
 from pathlib import Path
 
+from . import config_editor
+from . import discovery
 from . import events as events_mod
 from . import hooks as hooks_mod
 from . import index as index_mod
@@ -35,9 +38,10 @@ from . import modelcard
 from . import roles as roles_mod
 from . import workspace
 from .agent import Agent
-from .config import (Config, ConfigError, REFERENCE_TEMPLATE,
-                     USER_CONFIG, _apply_preset, auto_fit, find_project_config,
-                     interactive_setup, load as load_config, write_template)
+from .config import (Config, ConfigError, REFERENCE_TEMPLATE, TEMPLATE,
+                     USER_CONFIG, _apply_preset, _ask, _guess_tier, auto_fit,
+                     find_project_config, interactive_setup, load as load_config,
+                     write_template)
 from .llm import LLMClient, LLMError, estimate_tokens
 from .select import CODE_EXTS, REFERENCE_EXTS, Matcher, is_venv_dir, select
 
@@ -897,6 +901,211 @@ def _cmd_calibrate(args, cfg) -> int:
     return 0
 
 
+def _profile_base_urls() -> list[str]:
+    """base_urls already recorded in the user config, so a re-scan re-finds a
+    server on a custom port without the user repeating `--url`."""
+    try:
+        text = USER_CONFIG.read_text(encoding="utf-8")
+    except OSError:
+        return []
+    try:
+        flat, profiles = config_editor.validate_text(text)
+    except ConfigError:
+        return []
+    urls: list[str] = []
+    if flat.get("base_url"):
+        urls.append(flat["base_url"])
+    for body in profiles.values():
+        if body.get("base_url"):
+            urls.append(body["base_url"])
+    return list(dict.fromkeys(urls))
+
+
+def _ask_vram(label: str, base_url: str, args) -> int:
+    """The VRAM of the machine running this server, asked once per server."""
+    if getattr(args, "vram_gb", None):
+        return int(args.vram_gb)
+    if getattr(args, "yes", False):
+        return 0                       # non-interactive: leave VRAM unset
+    raw = _ask(f"GPU VRAM on the '{label}' server machine ({base_url}), in GB",
+               "0")
+    try:
+        return int(raw)
+    except ValueError:
+        return 0
+
+
+def _scan_filter(models: list[dict], args) -> list[dict]:
+    """Apply `--match`, `--all`, `--loaded` to one server's model list,
+    keeping loaded models first."""
+    pat = (getattr(args, "match", "") or "").lower()
+    out = []
+    for m in models:
+        if pat and not fnmatch.fnmatch(m["id"].lower(), pat):
+            continue
+        if getattr(args, "loaded", False) and m.get("loaded") is not True:
+            continue
+        if not getattr(args, "all", False) and m.get("loaded") is False:
+            continue
+        out.append(m)
+    out.sort(key=lambda m: (0 if m.get("loaded") else 1))
+    return out
+
+
+def _interactive_pick(label: str, base_url: str, models: list[dict]) -> list[dict]:
+    """Let the user pick models from one server's list."""
+    print(f"\n{label}  {base_url}  ({len(models)} model(s))")
+    for i, m in enumerate(models, 1):
+        mark = "*" if m.get("loaded") else " "
+        bits = [f"{i:>2}) {mark} {m['id']}"]
+        if m.get("size_bytes"):
+            bits.append(f"{m['size_bytes'] / (1024 ** 3):.1f} GB")
+        print("  " + "  ".join(bits))
+    raw = _ask("Choose models (numbers, comma-separated, or 'all')", "all")
+    if raw.strip().lower() in ("", "all"):
+        return models
+    picks: set[int] = set()
+    for part in raw.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if "-" in part:
+            a, _, b = part.partition("-")
+            try:
+                picks.update(range(int(a), int(b) + 1))
+            except ValueError:
+                pass
+        else:
+            try:
+                picks.add(int(part))
+            except ValueError:
+                pass
+    return [m for i, m in enumerate(models, 1) if i in picks]
+
+
+def _read_config_text(target: Path) -> str:
+    """The text to add profiles to: the target file if it has content, else
+    the starter template (so a first scan produces a valid config)."""
+    try:
+        text = target.read_text(encoding="utf-8")
+        if text.strip():
+            return text
+    except OSError:
+        pass
+    return TEMPLATE
+
+
+def _write_config_backup(target: Path, text: str) -> None:
+    """Validate, back up the old file as `.bak`, and write atomically."""
+    config_editor.validate_text(text, str(target))
+    target.parent.mkdir(parents=True, exist_ok=True)
+    if target.exists():
+        try:
+            Path(str(target) + ".bak").write_bytes(target.read_bytes())
+        except OSError:
+            pass
+    tmp = target.with_name(target.name + ".tmp")
+    tmp.write_text(text, encoding="utf-8", newline="")
+    os.replace(tmp, target)
+
+
+def _scan_cfg(model: dict) -> Config:
+    """A Config for one scanned model, with identity only (no card applied)."""
+    cfg = Config()
+    cfg.base_url = model["base_url"]
+    cfg.model = model["id"]
+    if model.get("vram_gb"):
+        cfg.vram_gb = int(model["vram_gb"])
+    if model.get("tier"):
+        cfg.tier = model["tier"]
+    cfg.sources = {}
+    return cfg
+
+
+def _scan_calibrate(models: list[dict], quick: bool) -> None:
+    """Calibrate the selected models, loaded first, skipping fresh cards. Each
+    card is saved as soon as it finishes, so Ctrl-C keeps the cards done so
+    far."""
+    order = sorted(models, key=lambda m: (0 if m.get("loaded") else 1))
+    todo: list[Config] = []
+    for m in order:
+        cfg = _scan_cfg(m)
+        if modelcard.load(cfg):
+            continue
+        todo.append(cfg)
+    if not todo:
+        print("\nAll selected models already have a fresh card.")
+        return
+    print(f"\nCalibrating {len(todo)} model(s) "
+          f"({'quick' if quick else 'full'}); this can take a few minutes each.")
+    done = 0
+    try:
+        for cfg in todo:
+            client = LLMClient(cfg)
+            client.check()
+            client.warmup()
+            card = modelcard.calibrate(client, cfg, verbose=True, quick=quick)
+            modelcard.save_card(card)
+            done += 1
+    except KeyboardInterrupt:
+        print(f"\nInterrupted: kept the {done} card(s) finished so far.")
+    except LLMError as e:
+        print(f"\nCalibration stopped: {e}", file=sys.stderr)
+
+
+def _cmd_models_scan(args) -> int:
+    """`pedacito models scan`: discover servers, pick models, write identity
+    profiles (with a backup), then optionally calibrate the chosen models."""
+    servers = discovery.discover_servers(
+        timeout=2.0, urls=list(getattr(args, "url", None) or []),
+        profile_urls=_profile_base_urls())
+    if not servers:
+        print("No local model servers answered.", file=sys.stderr)
+        print("  Start one (LM Studio, Ollama, Lemonade, llama.cpp) and re-run,"
+              " or pass --url to probe a specific address.", file=sys.stderr)
+        return 1
+
+    target = Path(args.config) if getattr(args, "config", None) else USER_CONFIG
+    text = _read_config_text(target)
+
+    selected: list[dict] = []
+    for label, base_url, _ids in servers:
+        vram = _ask_vram(label, base_url, args)
+        models = discovery.describe_models(base_url, vram_gb=vram)
+        picked = _scan_filter(models, args)
+        chosen = picked if getattr(args, "yes", False) \
+            else _interactive_pick(label, base_url, picked)
+        for m in chosen:
+            m["server_label"] = label
+            m["vram_gb"] = vram
+            if not m.get("tier"):
+                m["tier"] = _guess_tier(m["id"], {"model": m["id"],
+                                                   "base_url": base_url}) or ""
+        selected.extend(chosen)
+
+    if not selected:
+        print("No models matched the selection.", file=sys.stderr)
+        return 1
+
+    entries = [{"model": m["id"], "base_url": m["base_url"],
+                "server_label": m["server_label"], "tier": m.get("tier"),
+                "vram_gb": m.get("vram_gb"), "quant": m.get("quant"),
+                "size_gb": (f"{m['size_bytes'] / (1024 ** 3):.1f}"
+                            if m.get("size_bytes") else None)}
+               for m in selected]
+    new = config_editor.upsert_profiles(text, entries)
+    if new == text:
+        print("All selected models already have profiles.")
+    else:
+        _write_config_backup(target, new)
+        print(f"Wrote {len(entries)} profile(s) to {target}")
+
+    if getattr(args, "calibrate", "quick") != "none":
+        _scan_calibrate(selected,
+                        quick=getattr(args, "calibrate", "quick") != "full")
+    return 0
+
+
 def _cmd_prune(args) -> int:
     """`pedacito prune`: retention for sessions, backups, events and log.txt."""
     root = _root(args)
@@ -1520,6 +1729,33 @@ def _main(argv=None) -> int:
     p_cal.add_argument("--root", default=None)
     p_cal.add_argument("paths", nargs="*", default=["."], help=argparse.SUPPRESS)
 
+    p_models = sub.add_parser(
+        "models", help="discover model servers, write profiles, calibrate")
+    p_models.add_argument("action", choices=["scan"],
+                          help="'scan' finds local servers and sets up profiles")
+    p_models.add_argument("--url", action="append", default=[], metavar="URL",
+                          help="server base url to probe; repeatable")
+    p_models.add_argument("--api-key-env", metavar="VAR",
+                          help="environment variable holding the API key "
+                               "(hosted servers only)")
+    p_models.add_argument("--match", metavar="PATTERN",
+                          help="only consider models whose id matches (fnmatch)")
+    grp = p_models.add_mutually_exclusive_group()
+    grp.add_argument("--all", action="store_true",
+                     help="include models the server has not loaded")
+    grp.add_argument("--loaded", action="store_true",
+                     help="only models the server reports as loaded")
+    p_models.add_argument("--calibrate", choices=["none", "quick", "full"],
+                          default="quick",
+                          help="calibrate selected models (default: quick)")
+    p_models.add_argument("-y", "--yes", action="store_true",
+                          help="non-interactive: select all matching models")
+    p_models.add_argument("--vram-gb", type=int, default=None, metavar="GB",
+                          help="GPU VRAM of the server machine (asked if omitted)")
+    p_models.add_argument("--config", metavar="FILE",
+                          help="write profiles to this config file "
+                               "(default: the user config)")
+
     p_reset = sub.add_parser(
         "reset", help="wipe this project's Pedacito state (index, plans, "
                       "caches, sessions); code is untouched")
@@ -1708,6 +1944,10 @@ def _main(argv=None) -> int:
         return _cmd_worktree(args)
     if args.cmd == "diagnose":
         return _cmd_diagnose(args)
+    # `models scan` discovers servers and writes profiles, so it must run
+    # before _config() (a first-run machine may have no valid config yet).
+    if args.cmd == "models":
+        return _cmd_models_scan(args)
     light = {"prune": _cmd_prune, "reset": _cmd_reset, "memory": _cmd_memory,
              "trust": _cmd_trust, "tests": _cmd_tests,
              "webcheck": _cmd_webcheck, "skills": _cmd_skills,
