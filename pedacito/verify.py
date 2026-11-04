@@ -425,13 +425,35 @@ DEFECT: <file>:<line> -- <what is wrong and what it should be>"""
 _DEFECT_RE = re.compile(r"(?im)^\s*DEFECT\s*:\s*(?P<where>[^\s]+)\s*(?:--|-|:)\s*(?P<what>.+)$")
 
 
-def parse_verdict(text: str) -> list[Finding]:
-    """Defects from a verifier reply ([] for PASS or anything unparseable)."""
+def parse_verdict(text: str, resolve=None, root=None) -> list[Finding]:
+    """Defects from a verifier reply ([] for PASS or anything unparseable).
+
+    `resolve` is a file-name -> indexed-path resolver (``index.resolve_file``);
+    `root` is the project directory. With both, a DEFECT is kept as an `error`
+    only when the file resolves and the cited line is inside it; otherwise it
+    is a `warn` -- a verifier hallucinating a path or a line number must not
+    feed the repair re-ask. Without `resolve`, every defect is an error (the
+    caller has no index to check against)."""
     out = []
     for m in _DEFECT_RE.finditer(text or ""):
         where = m.group("where")
         f, _, line = where.partition(":")
-        out.append(Finding("model", "error", f.strip("`"),
-                           m.group("what").strip()[:240],
-                           int(line) if line.isdigit() else 0))
+        name = f.strip("`")
+        line_no = int(line) if line.isdigit() else 0
+        severity = "error"
+        file = name
+        if resolve is not None:
+            rel = resolve(name)
+            if rel is None or line_no <= 0:
+                severity = "warn"
+            else:
+                file = rel
+                if root is not None:
+                    try:
+                        if line_no > len(fileio.read_lines_cached(root / rel)):
+                            severity = "warn"
+                    except OSError:
+                        severity = "warn"
+        out.append(Finding("model", severity, file,
+                           m.group("what").strip()[:240], line_no))
     return out[:5]

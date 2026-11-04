@@ -1807,7 +1807,8 @@ class Agent:
                 max_tokens=350, stream=False)
         except LLMError:
             return []
-        return verify_mod.parse_verdict(text)
+        return verify_mod.parse_verdict(text, self.index.resolve_file,
+                                        self.index.root)
 
     def _role_client(self, role: str):
         """The client a role resolves to (falls back to the worker)."""

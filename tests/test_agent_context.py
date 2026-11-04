@@ -488,6 +488,33 @@ def test_full_mode_adds_one_adversarial_verifier_call(tmp_path):
     assert [(x.file, x.line) for x in d] == [("a.py", 3), ("b.py", 0)]
 
 
+def test_verdict_filter_downgrades_hallucinated_files_and_lines(tmp_path):
+    """A2.1: a DEFECT stays an error only when the file resolves and the line
+    is inside it; a hallucinated path or line is only a warning."""
+    agent = _verify_agent(tmp_path, Scripted())
+    resolve, root = agent.index.resolve_file, agent.index.root
+    d = verify.parse_verdict("DEFECT: lib.py:6 -- the wrong change", resolve,
+                             root)
+    assert [(x.severity, x.file, x.line) for x in d] == [("error", "lib.py", 6)]
+    d = verify.parse_verdict(
+        "DEFECT: missing.py:1 -- invented file\n"
+        "DEFECT: lib.py:999 -- line past the end\n"
+        "DEFECT: lib.py -- no line at all", resolve, root)
+    assert [(x.severity, x.file, x.line) for x in d] == [
+        ("warn", "missing.py", 1), ("warn", "lib.py", 999),
+        ("warn", "lib.py", 0)]
+
+
+def test_a_hallucinated_verdict_does_not_trigger_a_repair_round(tmp_path):
+    ok = _edit("lib.py", "    return helper(x) * 2", "    return helper(x) * 3")
+    client = Scripted(replies=["DEFECT: missing.py:1 -- invented file"])
+    agent = _verify_agent(tmp_path, client, verify_answer="full")
+    reply, findings = agent.preflight("triple the result of compute", ok, "SRC")
+    assert reply == ok                       # no re-ask: the defect is only a warn
+    assert not [f for f in findings if f.severity == "error"]
+    assert len(client.chat_calls) == 1       # just the adversarial call
+
+
 def test_requirement_ledger_and_coverage_warning(tmp_path):
     reqs = verify.requirement_ledger(
         "Make compute triple its result and add a test for compute. Also update the README.")
