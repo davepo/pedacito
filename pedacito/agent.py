@@ -1561,6 +1561,12 @@ class Agent:
                     print("  [context budget exhausted; moving to answer]", file=sys.stderr)
                 break
 
+        # P6 (A4.2): one bounded post-gather prefetch when named targets are
+        # still unread or no ranked top-3 file was read.
+        if getattr(self.cfg, "prefetch_targets", 0):
+            did_read = self._post_gather_prefetch(
+                task, messages, gathered, spans, nudge, verbose) or did_read
+
         self.read_any = did_read
         # Rewrite the SOURCE items down to the lines each read was first to
         # show, so the answer phase sees every line once. The live
@@ -1651,6 +1657,74 @@ class Agent:
                    "it does not exist on disk yet"
             missing.append(f"{rel} (not yet read -- {hint})")
         return missing
+
+    def _post_gather_prefetch(self, task, messages, gathered, spans, nudge,
+                              verbose) -> bool:
+        """P6 (A4.2): after gather, if named targets are still unread or no
+        ranked top-3 file was read, do ONE extra read through the normal tool
+        path (2.3's mechanism) -- a bounded expansion, never a new loop.
+        Returns True when it read something."""
+        if int(getattr(self.cfg, "prefetch_targets", 0) or 0) <= 0:
+            return False
+        from . import rank as rank_mod
+        max_lines = max(1, int(getattr(self.cfg, "max_read_lines", 200) or 200))
+
+        def lines_of(rel):
+            try:
+                lines = fileio.read_lines(self.index.root / rel)
+                if lines and lines[-1] == "" and len(lines) > 1:
+                    lines = lines[:-1]
+                return max(1, len(lines)) if lines and lines != [""] else 0
+            except OSError:
+                return 0
+
+        target = None
+        # Trigger 1: a task-named file no `read` covered yet.
+        wanted = self._task_file_targets(task)
+        for rel in sorted(self.index.files):
+            r = _norm_key(rel)
+            if any(r == w or r.endswith("/" + w) or w.endswith("/" + r)
+                   for w in wanted) and not self._read_spans.get(r):
+                n = lines_of(rel)
+                if n:
+                    target = (rel, 1, min(n, max_lines))
+                    break
+        # Trigger 2: zero reads of any ranked top-3 file.
+        if target is None:
+            for rk in rank_mod.rank_files(self.index, task)[:3]:
+                if not self._read_spans.get(_norm_key(rk.file)):
+                    n = lines_of(rk.file)
+                    if n:
+                        target = (rk.file, 1, min(n, max_lines))
+                    break
+        if target is None:
+            return False
+        rel, start, end = target
+        if end <= 0:
+            return False
+        stepjson = {"action": "read", "file": rel, "start": start,
+                    "end": end, "reasoning": "prefetch"}
+        try:
+            obs = dispatch(self.index, self.cfg, stepjson, client=self.client)
+        except Exception:
+            return False
+        obs = safety.frame("read", obs, self.cfg)
+        obs = self._cap_observation("read", obs)
+        if obs.startswith("ERROR"):
+            return False
+        m = _READ_HEAD_RX.match(obs)
+        if m:
+            spans.setdefault(_norm_key(m.group(1)), []).append(
+                (int(m.group(2)), int(m.group(3))))
+        gathered.append(f"--- read {rel}\n{obs}")
+        self.steps_log.append(f"post read {rel} L{start}-{end}  (prefetch)")
+        messages.append({"role": "assistant", "content": _compact(stepjson)})
+        messages.append({"role": "user",
+                         "content": f"RESULT:\n{obs}\n\n{nudge(1)}"})
+        self._unread_files = self._compute_unread(self._targets_text)
+        if verbose:
+            print(f"  (post-gather prefetch: read {rel})", file=sys.stderr)
+        return True
 
     def _prefetch_step0(self, task: str, messages: list, gathered: list,
                         spans: dict, budget: int, nudge, verbose: bool) -> int:
