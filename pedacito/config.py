@@ -1079,6 +1079,32 @@ def load(root: Path | None = None, explicit: Path | None = None,
     host = _hostname(cfg.base_url)
     remote = host not in _LOCAL_HOSTS
     deepseek = "deepseek" in cfg.model.lower() or "deepseek" in host
+
+    # Provider compatibility quirks (C4) from the C0 table, applied before the
+    # generic hosted switch so a provider's json_mode is not overwritten by it.
+    # Claude's OpenAI-compatible endpoint accepts only strict json_schema
+    # (json_object 400s) and rejects forced tool_choice; the table records both
+    # as json_mode / native_tool_choice. Only defaults are touched, so an
+    # explicit value always wins.
+    try:
+        from . import providers as providers_mod
+        prov = providers_mod.provider_for(cfg.base_url, cfg.model)
+    except Exception:
+        prov = None
+    if prov is not None:
+        if prov.json_mode and cfg.sources.get("json_mode") == "default":
+            cfg.json_mode = prov.json_mode
+            cfg._hosted_server = True
+            cfg.sources["json_mode"] = (
+                f"provider table ({host or cfg.model}); "
+                "set json_mode explicitly to override")
+        if not prov.native_tool_choice and \
+                cfg.sources.get("tool_mode") == "default":
+            cfg.tool_mode = "grammar"
+            cfg.sources["tool_mode"] = (
+                f"provider table ({host or cfg.model}); "
+                "set tool_mode explicitly to override")
+
     if (remote or deepseek) and cfg.sources.get("json_mode") == "default":
         cfg.json_mode = "object"
         cfg._hosted_server = True

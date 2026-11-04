@@ -117,3 +117,29 @@ def test_cache_key_is_stable_and_differs_across_projects():
     explicit.prompt_cache_key = "my-key"
     assert providers.cache_key(explicit) == "my-key"
     assert providers.cache_key(Config()) == ""
+
+
+def test_claude_quirks_apply_only_for_anthropic_and_users_can_override(
+        tmp_path, monkeypatch):
+    """C4: api.anthropic.com gets json_mode='schema' and tool_mode='grammar'
+    from the provider table (never json_object, never forced tool_choice), and
+    an explicit user value still wins."""
+    from pedacito import config as config_mod
+    monkeypatch.setattr(config_mod, "USER_CONFIG", tmp_path / "none.toml")
+    proj = tmp_path / "p"
+    proj.mkdir()
+
+    def load(text):
+        (tmp_path / "cfg.toml").write_text(text, encoding="utf-8")
+        return config_mod.load(root=proj, explicit=tmp_path / "cfg.toml",
+                               use_env=False, require_hardware=False,
+                               warn_budgets=False)
+
+    anth = load('base_url = "https://api.anthropic.com/v1"\n'
+                'model = "claude-4-7"\n')
+    assert anth.json_mode == "schema" and anth.tool_mode == "grammar"
+    explicit = load('base_url = "https://api.anthropic.com/v1"\n'
+                    'model = "claude-4-7"\njson_mode = "object"\n')
+    assert explicit.json_mode == "object"          # the user overrode the quirk
+    oai = load('base_url = "https://api.openai.com/v1"\nmodel = "gpt-4"\n')
+    assert oai.json_mode == "object"               # generic hosted switch

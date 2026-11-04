@@ -1017,6 +1017,15 @@ class LLMClient:
                 self._temp_override = prev
         return cm()
 
+    def _provider(self):
+        """The C0 provider entry for this client's server+model (cached)."""
+        prov = getattr(self, "_prov", None)
+        if prov is None:
+            from .providers import provider_for
+            prov = provider_for(self.cfg.base_url, self.cfg.model)
+            self._prov = prov
+        return prov
+
     def _reset_session(self) -> None:
         try:
             self._session.close()
@@ -1479,15 +1488,19 @@ class LLMClient:
                 f"\n\nReply with one JSON object only, no prose. "
                 f"Fields: {fields}.")
 
+        temp = (self._temp_override
+                if self._temp_override is not None
+                else self.cfg.temperature)
         payload = {
             "model": self.cfg.model,
             "messages": msgs,
-            "temperature": (self._temp_override
-                            if self._temp_override is not None
-                            else self.cfg.temperature),
             "max_tokens": max_tokens,
             "stream": stream,
         }
+        # Claude 4.7+ rejects any `temperature` below 1; the provider table
+        # marks that with omit_temperature, so drop the key rather than 400.
+        if not (self._provider().omit_temperature and float(temp) < 1.0):
+            payload["temperature"] = temp
         # request_max_tokens_cap (0 = off): llama.cpp-based servers 400 when
         # max_tokens exceeds the context window, so never exceed the cap.
         cap = getattr(self.cfg, "request_max_tokens_cap", 0) or 0
