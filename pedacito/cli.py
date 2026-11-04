@@ -35,11 +35,12 @@ from . import hooks as hooks_mod
 from . import index as index_mod
 from . import loop
 from . import modelcard
+from . import profiles as profiles_mod
 from . import roles as roles_mod
 from . import workspace
 from .agent import Agent
 from .config import (Config, ConfigError, REFERENCE_TEMPLATE, TEMPLATE,
-                     USER_CONFIG, _apply_preset, _ask, _guess_tier, auto_fit,
+                     USER_CONFIG, _ask, _guess_tier, auto_fit,
                      find_project_config, interactive_setup, load as load_config,
                      write_template)
 from .llm import LLMClient, LLMError, estimate_tokens
@@ -298,18 +299,8 @@ def _cmd_config(args, cfg) -> int:
         print(f"  explicit {args.config}")
 
     if cfg.profiles:
-        print(f"\nProfiles defined: {', '.join(sorted(cfg.profiles))}")
-        print(f"  use with: pedacito ask PROJ -t \"...\" --profile "
-              f"{sorted(cfg.profiles)[0]}")
-        for name in sorted(cfg.profiles):
-            try:
-                _, tier = _apply_preset(name, cfg.profiles[name], "config file")
-            except ConfigError as e:
-                print(f"  {name:<20} invalid: {e}")
-                continue
-            if tier:
-                print(f"  {name:<20} tier '{tier}' preset applied "
-                      "(token limits)")
+        print(f"\nProfiles defined ({len(cfg.profiles)}):")
+        print(profiles_mod.render(profiles_mod.list_profiles(cfg)))
     if cfg.active_profile:
         tier = f", tier {cfg.active_tier}" if cfg.active_tier else ""
         print(f"  active: {cfg.active_profile}{tier}")
@@ -467,15 +458,9 @@ def _chat_command(line: str, args, cfg, ref) -> bool:
         if not cfg.profiles:
             print("  No profiles defined. Add [profiles.NAME] to your config.",
                   file=sys.stderr)
-        for name, body in sorted(cfg.profiles.items()):
-            mark = "*" if name == cfg.active_profile else " "
-            try:
-                _, tier = _apply_preset(name, body, "config")
-                limits = f"  [tier {tier}]" if tier else ""
-            except ConfigError as e:
-                limits = f"  [invalid: {e}]"
-            print(f"  {mark} {name}: {body.get('model', '(inherits model)')}"
-                  f"{limits}", file=sys.stderr)
+        else:
+            print(profiles_mod.render(profiles_mod.list_profiles(cfg)),
+                  file=sys.stderr)
         return True
 
     if cmd == "status":
@@ -1103,6 +1088,45 @@ def _cmd_models_scan(args) -> int:
     if getattr(args, "calibrate", "quick") != "none":
         _scan_calibrate(selected,
                         quick=getattr(args, "calibrate", "quick") != "full")
+    return 0
+
+
+def _cmd_profiles(args, cfg) -> int:
+    """`pedacito profiles`: the shared table, optional recommendations, --json,
+    and --apply-roles."""
+    rows = profiles_mod.list_profiles(cfg)
+    recs = profiles_mod.recommend(rows)
+    if getattr(args, "json", False):
+        import json as _json
+        payload: dict = {"profiles": rows}
+        if getattr(args, "recommend", False):
+            payload["recommendations"] = recs
+        print(_json.dumps(payload, default=str))
+        return 0
+    print(profiles_mod.render(
+        rows, recs if getattr(args, "recommend", False) else None))
+    if getattr(args, "apply_roles", False):
+        return _cmd_profiles_apply(args, recs)
+    return 0
+
+
+def _cmd_profiles_apply(args, recs) -> int:
+    """Write the recommended `roles = {...}` after confirmation."""
+    target = Path(args.config) if getattr(args, "config", None) else USER_CONFIG
+    text = _read_config_text(target)
+    new = profiles_mod.apply_roles(text, recs)
+    if new == text:
+        print("No role recommendations to apply.")
+        return 0
+    roles = {role: rec["name"] for role, rec in recs.items()
+             if role in profiles_mod._SPECIALIST_ROLES and rec.get("name")}
+    if not getattr(args, "yes", False):
+        ans = _ask(f"Write roles = {roles} to {target}? [y/N]", "n")
+        if ans.lower() not in ("y", "yes"):
+            print("Not written.")
+            return 0
+    _write_config_backup(target, new)
+    print(f"Wrote roles = {roles} to {target}")
     return 0
 
 
@@ -1756,6 +1780,20 @@ def _main(argv=None) -> int:
                           help="write profiles to this config file "
                                "(default: the user config)")
 
+    p_profiles = sub.add_parser(
+        "profiles", help="list model profiles and their measured scores")
+    p_profiles.add_argument("--recommend", action="store_true",
+                            help="suggest a profile per role, with reasons")
+    p_profiles.add_argument("--apply-roles", dest="apply_roles",
+                            action="store_true",
+                            help="write the recommended roles = {...} (asks first)")
+    p_profiles.add_argument("--json", action="store_true",
+                            help="print the profiles as JSON")
+    p_profiles.add_argument("-y", "--yes", action="store_true",
+                            help="with --apply-roles: do not ask for confirmation")
+    p_profiles.add_argument("--config", metavar="FILE")
+    p_profiles.add_argument("--profile", metavar="NAME")
+
     p_reset = sub.add_parser(
         "reset", help="wipe this project's Pedacito state (index, plans, "
                       "caches, sessions); code is untouched")
@@ -1948,6 +1986,12 @@ def _main(argv=None) -> int:
     # before _config() (a first-run machine may have no valid config yet).
     if args.cmd == "models":
         return _cmd_models_scan(args)
+    if args.cmd == "profiles":
+        try:
+            return _cmd_profiles(args, _light_config(args))
+        except ConfigError as e:
+            print(f"Config error: {e}", file=sys.stderr)
+            return 2
     light = {"prune": _cmd_prune, "reset": _cmd_reset, "memory": _cmd_memory,
              "trust": _cmd_trust, "tests": _cmd_tests,
              "webcheck": _cmd_webcheck, "skills": _cmd_skills,
