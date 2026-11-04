@@ -458,11 +458,15 @@ def upsert_profiles(text: str, found, *, now: str | None = None) -> str:
         name = short_name(model, taken, entry.get("server_label", ""))
         taken.add(name)
         existing[key] = name
-        values: dict = {"base_url": base, "model": model}
-        if entry.get("tier"):
-            values["tier"] = entry["tier"]
-        if entry.get("vram_gb"):
-            values["vram_gb"] = entry["vram_gb"]
+        values: dict = {}
+        # Identity only, plus the API-key reference; card choices are never
+        # written. Provider compatibility keys (prompt_cache, json_mode,
+        # tool_mode) are transport settings a hosted scan adds from the C0
+        # provider table, and the user can still override them.
+        for k in ("base_url", "model", "tier", "vram_gb", "api_key_env",
+                  "prompt_cache", "json_mode", "tool_mode"):
+            if entry.get(k):
+                values[k] = entry[k]
         blocks.append(_profile_block(name, values, _provenance(entry, when)))
 
     if not blocks:

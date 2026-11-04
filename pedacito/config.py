@@ -70,6 +70,10 @@ class Config:
     # --- Server connection ----------------------------------------------------
     base_url: str = "http://localhost:1234/v1"
     api_key: str = "lm-studio"
+    # Name of an environment variable holding the API key (hosted APIs only).
+    # Storing the variable name instead of the secret keeps the key out of the
+    # config file; `llm.py` reads it at request time.
+    api_key_env: str = ""
     model: str = "google/gemma-3-27b"
     timeout: float = 600.0
     # Seconds to wait while the server loads a model (unload + read from disk).
@@ -2319,7 +2323,7 @@ def interactive_setup(path: Path | None = None, force: bool = False,
     servers = discover_servers()
     base_url = model = ""
     hosted = False
-    api_key = ""
+    api_key_env = ""
     if servers:
         say("Found running model servers on this machine:")
         for i, (label, url, ids) in enumerate(servers, 1):
@@ -2351,7 +2355,8 @@ def interactive_setup(path: Path | None = None, force: bool = False,
 
     if hosted:
         base_url = _ask("API base URL", "https://api.deepseek.com/v1")
-        api_key = _ask("API key (sent over HTTPS; stored in this file)")
+        api_key_env = _ask("Env var holding the API key (e.g. DEEPSEEK_API_KEY); "
+                           "the key itself is never written to this file")
         model = _ask("Model name", "deepseek-chat")
 
     if not base_url or not model:
@@ -2385,8 +2390,8 @@ def interactive_setup(path: Path | None = None, force: bool = False,
         f"model    = {_toml_literal(model)}",
         f"tier     = {_toml_literal(tier)}",
     ]
-    if api_key:
-        lines.append(f"api_key  = {_toml_literal(api_key)}")
+    if api_key_env:
+        lines.append(f"api_key_env = {_toml_literal(api_key_env)}")
     if hosted:
         lines.append('json_mode = "object"   # hosted APIs lack llama.cpp schemas')
     body = TEMPLATE.replace(
@@ -2425,7 +2430,7 @@ model    = "google/gemma-3-27b"
     say(f"  base_url = {base_url}")
     say(f"  model    = {model}")
     say(f"  vram_gb  = {vram_gb}")
-    say(f"  tier     = {tier}" + ("  (api_key set, json_mode=object)" if api_key else ""))
+    say(f"  tier     = {tier}" + ("  (api_key_env set, json_mode=object)" if api_key_env else ""))
     say("Test it any time with:  pedacito config --check")
     return p
 

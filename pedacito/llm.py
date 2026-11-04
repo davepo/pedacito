@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import base64
 import json
+import os
 import random
 import re
 import sys
@@ -183,6 +184,16 @@ def _server_root(base_url: str) -> str:
         if base.endswith(suffix):
             return base[:-len(suffix)]
     return base
+
+
+def _api_key(cfg) -> str:
+    """The API key for a request: `api_key_env` (the name of an environment
+    variable) beats the plain `api_key` string, so a secret never has to be
+    written to the config file."""
+    env = getattr(cfg, "api_key_env", "") or ""
+    if env:
+        return os.environ.get(env, "")
+    return getattr(cfg, "api_key", "") or ""
 
 
 # --------------------------------------------------------------- thinking off
@@ -906,7 +917,7 @@ class LLMClient:
         self.url = cfg.base_url.rstrip("/") + "/chat/completions"
         self.headers = {
             "Content-Type": "application/json",
-            "Authorization": f"Bearer {cfg.api_key}",
+            "Authorization": f"Bearer {_api_key(cfg)}",
         }
         self.stats = {"calls": 0, "prompt_tokens": 0, "completion_tokens": 0,
                       "cached_tokens": 0, "cache_write_tokens": 0,

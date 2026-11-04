@@ -107,3 +107,20 @@ def cache_key(cfg) -> str:
                  getattr(cfg, "model", "") or ""):
         h.update((str(part) + "\0").encode("utf-8", "replace"))
     return h.hexdigest()[:32]
+
+
+def profile_overrides(base_url: str, model: str = "") -> dict:
+    """The profile keys a hosted scan should write for this provider, so the
+    profile carries the table's caching and compatibility choices (and the user
+    can still override them). Never a secret -- only settings."""
+    p = provider_for(base_url, model)
+    out: dict = {}
+    mode = {"implicit": "implicit", "explicit": "explicit",
+            "unsupported": "off"}.get(p.cache_mode)
+    if mode:
+        out["prompt_cache"] = mode
+    if p.json_mode:
+        out["json_mode"] = p.json_mode
+    if not p.native_tool_choice:
+        out["tool_mode"] = "grammar"
+    return out

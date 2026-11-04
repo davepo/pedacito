@@ -1038,46 +1038,123 @@ def _scan_calibrate(models: list[dict], quick: bool) -> None:
         print(f"\nCalibration stopped: {e}", file=sys.stderr)
 
 
+def _is_hosted_url(url: str) -> bool:
+    from urllib.parse import urlparse
+    host = (urlparse(url or "").hostname or "").lower()
+    return bool(host) and host not in ("localhost", "127.0.0.1", "0.0.0.0", "::1")
+
+
+def _host_label(url: str) -> str:
+    from urllib.parse import urlparse
+    return urlparse(url or "").hostname or "hosted"
+
+
+def _scan_hosted(args, urls: list[str]) -> list[dict]:
+    """Hosted APIs are never auto-probed: the user passes --url + --api-key-env.
+    The key is read from the environment, never written to disk, and `--match`
+    is required because hosted catalogues can hold hundreds of models."""
+    from . import providers
+    if not urls:
+        return []
+    api_key_env = getattr(args, "api_key_env", None)
+    if not api_key_env:
+        print("A hosted --url needs --api-key-env VAR (the secret is never "
+              "written to the config).", file=sys.stderr)
+        return []
+    key = os.environ.get(api_key_env, "")
+    if not key:
+        print(f"--api-key-env {api_key_env}: not set in the environment.",
+              file=sys.stderr)
+        return []
+    pat = (getattr(args, "match", "") or "").lower()
+    if not pat:
+        print("Hosted catalogues can hold hundreds of models; pass "
+              "--match PATTERN to choose which to add.", file=sys.stderr)
+        return []
+    out: list[dict] = []
+    for url in urls:
+        headers = {"Authorization": f"Bearer {key}"}
+        for mid in discovery.list_models(url, headers=headers):
+            if pat and not fnmatch.fnmatch(mid.lower(), pat):
+                continue
+            rec = {"id": mid, "base_url": url, "server_label": _host_label(url),
+                   "tier": "hosted", "api_key_env": api_key_env}
+            rec.update(providers.profile_overrides(url, mid))
+            out.append(rec)
+    return out
+
+
+def _hosted_calibrate(models: list[dict], quick: bool) -> None:
+    """Calibration for hosted models is opt-in: print a token estimate and
+    confirm before spending."""
+    est = len(models) * (60_000 if quick else 120_000)
+    print(f"\nCalibrating hosted model(s) costs roughly {est:,} tokens.")
+    ans = _ask("Proceed with hosted calibration? [y/N]", "n")
+    if ans.lower() not in ("y", "yes"):
+        print("Skipped hosted calibration.")
+        return
+    _scan_calibrate(models, quick=quick)
+
+
+def _to_scan_entry(m: dict) -> dict:
+    """The keys `upsert_profiles` writes for one scanned model."""
+    entry: dict = {"model": m["id"], "base_url": m["base_url"],
+                   "server_label": m.get("server_label", ""),
+                   "tier": m.get("tier") or "",
+                   "vram_gb": m.get("vram_gb"),
+                   "quant": m.get("quant"),
+                   "size_gb": (f"{m['size_bytes'] / (1024 ** 3):.1f}"
+                               if m.get("size_bytes") else None),
+                   "api_key_env": m.get("api_key_env"),
+                   "prompt_cache": m.get("prompt_cache"),
+                   "json_mode": m.get("json_mode"),
+                   "tool_mode": m.get("tool_mode")}
+    return entry
+
+
 def _cmd_models_scan(args) -> int:
-    """`pedacito models scan`: discover servers, pick models, write identity
-    profiles (with a backup), then optionally calibrate the chosen models."""
-    servers = discovery.discover_servers(
-        timeout=2.0, urls=list(getattr(args, "url", None) or []),
-        profile_urls=_profile_base_urls())
-    if not servers:
+    """`pedacito models scan`: discover local servers and/or probe a hosted API,
+    pick models, write identity profiles (with a backup), then optionally
+    calibrate the chosen models."""
+    urls = list(getattr(args, "url", None) or [])
+    local_urls = [u for u in urls if not _is_hosted_url(u)]
+    hosted_urls = [u for u in urls if _is_hosted_url(u)]
+
+    servers = discovery.discover_servers(timeout=2.0, urls=local_urls,
+                                         profile_urls=_profile_base_urls())
+    selected: list[dict] = []
+    if servers:
+        for label, base_url, _ids in servers:
+            vram = _ask_vram(label, base_url, args)
+            models = discovery.describe_models(base_url, vram_gb=vram)
+            picked = _scan_filter(models, args)
+            chosen = picked if getattr(args, "yes", False) \
+                else _interactive_pick(label, base_url, picked)
+            for m in chosen:
+                m["server_label"] = label
+                m["vram_gb"] = vram
+                if not m.get("tier"):
+                    m["tier"] = _guess_tier(
+                        m["id"], {"model": m["id"], "base_url": base_url}) or ""
+            selected.extend(chosen)
+    elif not hosted_urls:
         print("No local model servers answered.", file=sys.stderr)
         print("  Start one (LM Studio, Ollama, Lemonade, llama.cpp) and re-run,"
               " or pass --url to probe a specific address.", file=sys.stderr)
         return 1
 
-    target = Path(args.config) if getattr(args, "config", None) else USER_CONFIG
-    text = _read_config_text(target)
-
-    selected: list[dict] = []
-    for label, base_url, _ids in servers:
-        vram = _ask_vram(label, base_url, args)
-        models = discovery.describe_models(base_url, vram_gb=vram)
-        picked = _scan_filter(models, args)
-        chosen = picked if getattr(args, "yes", False) \
-            else _interactive_pick(label, base_url, picked)
-        for m in chosen:
-            m["server_label"] = label
-            m["vram_gb"] = vram
-            if not m.get("tier"):
-                m["tier"] = _guess_tier(m["id"], {"model": m["id"],
-                                                   "base_url": base_url}) or ""
-        selected.extend(chosen)
+    hosted = _scan_hosted(args, hosted_urls)
+    if hosted_urls and not hosted:
+        return 1
+    selected += hosted
 
     if not selected:
         print("No models matched the selection.", file=sys.stderr)
         return 1
 
-    entries = [{"model": m["id"], "base_url": m["base_url"],
-                "server_label": m["server_label"], "tier": m.get("tier"),
-                "vram_gb": m.get("vram_gb"), "quant": m.get("quant"),
-                "size_gb": (f"{m['size_bytes'] / (1024 ** 3):.1f}"
-                            if m.get("size_bytes") else None)}
-               for m in selected]
+    target = Path(args.config) if getattr(args, "config", None) else USER_CONFIG
+    text = _read_config_text(target)
+    entries = [_to_scan_entry(m) for m in selected]
     new = config_editor.upsert_profiles(text, entries)
     if new == text:
         print("All selected models already have profiles.")
@@ -1085,9 +1162,16 @@ def _cmd_models_scan(args) -> int:
         _write_config_backup(target, new)
         print(f"Wrote {len(entries)} profile(s) to {target}")
 
-    if getattr(args, "calibrate", "quick") != "none":
-        _scan_calibrate(selected,
-                        quick=getattr(args, "calibrate", "quick") != "full")
+    # Calibration: local defaults to quick; hosted is opt-in (only when
+    # --calibrate is given explicitly).
+    calibrate = getattr(args, "calibrate", None)
+    if calibrate != "none":
+        local = [m for m in selected if m.get("tier") != "hosted"]
+        hosted_models = [m for m in selected if m.get("tier") == "hosted"]
+        if local:
+            _scan_calibrate(local, quick=(calibrate or "quick") != "full")
+        if hosted_models and calibrate:
+            _hosted_calibrate(hosted_models, quick=calibrate != "full")
     return 0
 
 
@@ -1770,8 +1854,9 @@ def _main(argv=None) -> int:
     grp.add_argument("--loaded", action="store_true",
                      help="only models the server reports as loaded")
     p_models.add_argument("--calibrate", choices=["none", "quick", "full"],
-                          default="quick",
-                          help="calibrate selected models (default: quick)")
+                          default=None,
+                          help="calibrate selected models (local default: quick; "
+                               "hosted: only when given)")
     p_models.add_argument("-y", "--yes", action="store_true",
                           help="non-interactive: select all matching models")
     p_models.add_argument("--vram-gb", type=int, default=None, metavar="GB",

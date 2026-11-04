@@ -215,6 +215,18 @@ def _quant_of(entry: dict) -> str:
     return str(details.get("quantization_level") or "")
 
 
+def list_models(base_url: str, timeout: float = 5.0, headers=None) -> list[str]:
+    """Model ids from a server's OpenAI-compatible listing (hosted or local),
+    tried with both `/v1` and `/api/v1`. Hosted callers pass an Authorization
+    header in `headers`."""
+    root = _root(base_url)
+    for prefix in ("/v1", "/api/v1"):
+        entries = _list_entries(root + prefix + "/models", timeout, headers)
+        if entries is not None:
+            return [mid for m in entries if (mid := _model_id(m))]
+    return []
+
+
 def describe_models(base_url: str, timeout: float = 5.0, headers=None,
                     vram_gb: int = 0) -> list[dict]:
     """The scan's per-model view of one server.
