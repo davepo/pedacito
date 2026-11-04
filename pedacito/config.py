@@ -178,6 +178,11 @@ class Config:
     # Hard lookup limit for the gather phase; 0 = none (token budget and the
     # model's `done` are the only bounds). `--steps N` sets it for one command.
     max_steps: int = 0
+    # Step-0 prefetch: read up to this many task-named files / task-named
+    # symbols before the first model step (0 = off). Prefetch reads do not
+    # count toward max_steps and are capped at a quarter of the observation
+    # room. Off by default: only enable it after it measures a win.
+    prefetch_targets: int = 0
     # Limit on follow-up answer turns when the model defers remaining work;
     # 0 = no limit (stops on NOTHING MORE or when no blocks are produced).
     max_completion_rounds: int = 0

@@ -1105,6 +1105,14 @@ class Agent:
         # reject two user messages in a row.
         messages[-1]["content"] += "\n\n" + nudge(1)
 
+        # Step-0 prefetch (opt-in): read the task-named files/symbols before
+        # the first model step. Runs through the normal tool path so the read
+        # ledger and SOURCE block are populated; the reads do not count toward
+        # max_steps.
+        if getattr(self.cfg, "prefetch_targets", 0):
+            budget = self._prefetch_step0(task, messages, gathered, spans,
+                                          budget, nudge, verbose)
+
         step = 0
         step_schema = schema_for(self.cfg)
         done_confirmed = False   # one-shot "are you really done?" after a truncated reply
@@ -1643,6 +1651,90 @@ class Agent:
                    "it does not exist on disk yet"
             missing.append(f"{rel} (not yet read -- {hint})")
         return missing
+
+    def _prefetch_step0(self, task: str, messages: list, gathered: list,
+                        spans: dict, budget: int, nudge, verbose: bool) -> int:
+        """Read up to `cfg.prefetch_targets` task-named files and symbols
+        before the first model step, through the normal tool path so `spans`,
+        `gathered` and `steps_log` update. Returns the remaining char budget.
+        Prefetch reads do not count toward `max_steps`; the whole step-0 band
+        is capped at a quarter of the observation room."""
+        limit = max(0, int(getattr(self.cfg, "prefetch_targets", 0) or 0))
+        if limit <= 0 or budget <= 0:
+            return budget
+        from . import rank as rank_mod
+        max_lines = max(1, int(getattr(self.cfg, "max_read_lines", 200) or 200))
+        est = getattr(self.client, "estimate_tokens", None) or estimate_tokens
+        room = max(1, self._room()) // 4        # <= 25% of the observation room
+
+        wanted = self._task_file_targets(task)
+        named: dict[str, str] = {}              # normalised key -> canonical rel
+        for rel in self.index.files:
+            r = _norm_key(rel)
+            for w in wanted:
+                if r == w or r.endswith("/" + w) or w.endswith("/" + r):
+                    named[r] = rel
+
+        def lines_of(rel: str) -> int:
+            try:
+                lines = fileio.read_lines(self.index.root / rel)
+                if lines and lines[-1] == "" and len(lines) > 1:
+                    lines = lines[:-1]
+                return max(1, len(lines)) if lines and lines != [""] else 0
+            except OSError:
+                return 0
+
+        targets: list[tuple[str, int, int]] = []
+        seen: set[str] = set()
+        # 1) task-named files small enough to read whole.
+        for rel in sorted(named.values()):
+            n = lines_of(rel)
+            if 0 < n <= max_lines:
+                seen.add(rel)
+                targets.append((rel, 1, n))
+        # 2) the files defining task-named symbols, trimmed to max_read_lines.
+        for c in rank_mod.task_symbols(self.index, task):
+            if c.file in seen:
+                continue
+            end = c.scope_end or c.end
+            if end - c.start + 1 > max_lines:
+                end = c.start + max_lines - 1
+            seen.add(c.file)
+            targets.append((c.file, c.start, end))
+
+        spent = 0                                # prefetched tokens so far
+        prefetched = 0
+        for rel, start, end in targets[:limit]:
+            if prefetched >= limit or budget <= 0 or spent >= room:
+                break
+            stepjson = {"action": "read", "file": rel, "start": start,
+                        "end": end, "reasoning": "prefetch"}
+            try:
+                obs = dispatch(self.index, self.cfg, stepjson,
+                               client=self.client)
+            except Exception:
+                continue
+            obs = safety.frame("read", obs, self.cfg)
+            obs = self._cap_observation("read", obs)
+            if obs.startswith("ERROR"):
+                continue
+            m = _READ_HEAD_RX.match(obs)
+            if m:
+                spans.setdefault(_norm_key(m.group(1)), []).append(
+                    (int(m.group(2)), int(m.group(3))))
+                delta = _delta_len(obs, [])
+            else:
+                delta = len(obs)
+            budget -= delta
+            gathered.append(f"--- read {rel}\n{obs}")
+            self.steps_log.append(f"0. read {rel} L{start}-{end}  (prefetch)")
+            messages.append({"role": "assistant", "content": _compact(stepjson)})
+            messages.append({"role": "user",
+                             "content": f"RESULT:\n{obs}\n\n{nudge(1)}"})
+            spent += est(obs)
+            prefetched += 1
+        self._unread_files = self._compute_unread(self._targets_text)
+        return budget
 
     # ------------------------------------------------------------------ phase 2
     def answer(self, task: str, gathered: str, stream: bool = True,
