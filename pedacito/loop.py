@@ -1522,6 +1522,16 @@ def _run_task_once(root: Path, cfg, client, agent, idx, task: str, *,
             for f in findings:
                 workspace.log_event(root, f"verify: {f.render()}",
                                     "WARN" if f.severity == "warn" else "ERROR")
+    elif answer_system is None and not parse_edits(raw_reply):
+        # P1a shadow mode: a no-edit reply gets the grounded-prose checks
+        # logged (citations, ungrounded identifiers, unaddressed requirements),
+        # never acted on.
+        try:
+            from . import verify as verify_mod
+            for f in verify_mod.prose_shadow(agent, task, raw_reply):
+                workspace.log_event(root, f"prose: {f.render()}", "WARN")
+        except Exception:
+            pass
     truncated = bool(getattr(client, "stream_truncated", False))
     if truncated:
         workspace.log_event(root, "answer reply truncated at the output limit",

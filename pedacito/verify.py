@@ -280,8 +280,9 @@ def _prose(reply: str) -> str:
 
 
 def check_citations(agent, reply: str) -> list[Finding]:
-    """`file:line` claims in the reply about files that exist but were never
-    read: the model is describing code it has not seen."""
+    """`file:line` claims in the reply about files that were never read (or
+    lines outside what was read): the model is describing code it has not
+    seen. An unresolvable path is reported too, rather than silently skipped."""
     spans = _ledger(agent)
     if not spans:
         return []
@@ -289,19 +290,78 @@ def check_citations(agent, reply: str) -> list[Finding]:
     seen: set[str] = set()
     for rx in _CITE_RES:
         for m in rx.finditer(_prose(reply)):
-            rel = agent.index.resolve_file(m.group(1))
-            if not rel or rel in seen:
+            name = m.group(1)
+            rel = agent.index.resolve_file(name)
+            if not rel:
+                if name not in seen:
+                    seen.add(name)
+                    out.append(Finding(
+                        "citation", "warn", name,
+                        f"the reply cites {name}:{m.group(2)}, a file that does "
+                        "not resolve in the project"))
                 continue
-            key = fileio.path_key(rel)
-            read = spans.get(key)
-            if read:
+            if rel in seen:
                 continue
             seen.add(rel)
-            out.append(Finding(
-                "citation", "warn", rel,
-                f"the reply cites line {m.group(2)} of a file the lookup "
-                "phase never read", line=int(m.group(2))))
+            key = fileio.path_key(rel)
+            read = spans.get(key)
+            line = int(m.group(2))
+            if not read:
+                out.append(Finding(
+                    "citation", "warn", rel,
+                    f"the reply cites line {line} of a file the lookup phase "
+                    "never read", line=line))
+            elif not any(s <= line <= t for s, t in read):
+                out.append(Finding(
+                    "citation", "warn", rel,
+                    f"the reply cites line {line}, which was not among the "
+                    "lines read", line=line))
     return out[:4]
+
+
+# ------------------------------------------- shadow-mode prose verification
+_SNAKE_RE = re.compile(r"\b[A-Za-z_][A-Za-z0-9]*(?:_[A-Za-z0-9]+)+\b")
+_CAMEL_RE = re.compile(r"\b[a-z][a-z0-9]*[A-Z][A-Za-z0-9]*\b")
+
+
+def check_ungrounded_identifiers(agent, reply: str, task: str) -> list[Finding]:
+    """Identifier-shaped tokens (snake_case or camelCase) in the prose that
+    resolve to nothing in the index and are not named in the task -- a signal
+    of an invented symbol. Shadow only: findings are logged, never acted on."""
+    index = getattr(agent, "index", None)
+    if index is None:
+        return []
+    task_words = {w.lower() for w in _WORD_RE.findall(task or "")}
+    out: list[Finding] = []
+    seen: set[str] = set()
+    for rx in (_SNAKE_RE, _CAMEL_RE):
+        for w in rx.findall(_prose(reply)):
+            low = w.lower()
+            if low in seen or low in task_words:
+                continue
+            seen.add(low)
+            if not index.find_symbol(w):
+                out.append(Finding(
+                    "identifier", "warn", "",
+                    f"'{w}' looks like a symbol but is neither in the index "
+                    "nor named in the task"))
+    return out[:4]
+
+
+def prose_shadow(agent, task: str, reply: str, edits=None) -> list[Finding]:
+    """Shadow-mode prose verification (P1a): the checks run on a no-edit
+    answer, and every finding is a `warn` that is logged for later labelling --
+    never promoted to an error or fed to repair."""
+    findings: list[Finding] = []
+    try:
+        findings += check_citations(agent, reply)
+        findings += check_ungrounded_identifiers(agent, reply, task)
+        findings += check_coverage(task, reply, edits or [])
+    except Exception:
+        pass
+    for f in findings:
+        f.severity = "warn"
+    return findings
 
 
 # ----------------------------------------------------- requirement ledger
@@ -347,9 +407,10 @@ def requirement_ledger(task: str, limit: int = 5) -> list[tuple[str, list[str]]]
 
 def check_coverage(task: str, reply: str, edits) -> list[Finding]:
     """Requirements whose key terms appear nowhere in the edits, their file
-    names, or the reply's prose."""
+    names, or the reply's prose. Runs for prose-only replies too (P1a), not
+    only when edit blocks are present."""
     reqs = requirement_ledger(task)
-    if len(reqs) < 2 or not edits:
+    if len(reqs) < 2:
         return []
     haystack = "\n".join([_prose(reply)] + [f"{e.file}\n{e.replace}\n{e.search}"
                                             for e in edits]).lower()

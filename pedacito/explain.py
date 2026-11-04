@@ -95,5 +95,16 @@ def answer(agent, question: str, verbose: bool = True, on_step=None,
     """
     gathered = agent.gather(question, verbose=verbose,
                             base=EXPLAIN_GATHER_BASE, on_step=on_step)
-    return agent.answer(question, gathered, system=EXPLAIN_SYSTEM,
-                        include_edit_format=False, stream=stream)
+    reply = agent.answer(question, gathered, system=EXPLAIN_SYSTEM,
+                         include_edit_format=False, stream=stream)
+    # P1a shadow mode: log prose-grounding findings (citations, ungrounded
+    # identifiers, unaddressed requirements), never act on them.
+    try:
+        from . import verify, workspace
+        root = getattr(agent.index, "root", None)
+        if root is not None:
+            for f in verify.prose_shadow(agent, question, reply):
+                workspace.log_event(root, f"prose: {f.render()}", "WARN")
+    except Exception:
+        pass
+    return reply
