@@ -33,6 +33,17 @@ MAX_MESSAGES = 600
 MAX_TERM_CHARS = 200_000
 QUESTION_TIMEOUT = 900.0
 
+# Job kinds that drive the Engine V2 loop (and thus the activity telemetry).
+RUN_KINDS = ("task", "explain", "auto", "new")
+# Harness event kind -> the phase the ACTIVITY & PLAN panel should show.
+EVENT_PHASE = {"step": "gather", "gather_done": "edit", "answer": "edit",
+               "edit_intents": "edit", "incremental_edit": "edit",
+               "verify": "verify", "tests": "verify",
+               "rehydrate": "gather", "fold": "gather"}
+# client.site -> phase, while a run is live (the call site is authoritative).
+SITE_PHASE = {"gather": "gather", "compaction": "gather", "answer": "edit",
+              "verify": "verify", "repair": "repair"}
+
 
 class Bus:
     """A bounded, replayable event stream. Each event gets an increasing `seq`
@@ -259,6 +270,13 @@ class State:
         self.last_auto: dict = {}
         self.plan_path: Path | None = None
 
+        # Engine V2 telemetry for the ACTIVITY & PLAN panel (see
+        # `note_event` and `engine`): the live phase, the last gather step
+        # count, and the most recent harness tool actions.
+        self.phase = ""
+        self.gather_steps = 0
+        self.actions: deque[dict] = deque(maxlen=60)
+
     # --- project & index auto-detect --------------------------------------------
 
     def set_root(self, root: Path | str | None) -> None:
@@ -355,6 +373,10 @@ class State:
             self._job_counter += 1
             self.job = Job(self._job_counter, kind, title)
             self.error, self.note = "", ""
+            if kind in RUN_KINDS:      # a fresh run starts the telemetry afresh
+                self.phase = "gather"
+                self.gather_steps = 0
+                self.actions.clear()
             job = self.job
         self.bus.publish("job", job=job.id, state="start", kind=kind,
                          title=title)
@@ -365,8 +387,102 @@ class State:
             job.active = False
             if error:
                 self.error = error
+            if job.kind in RUN_KINDS:
+                self.phase = "done"    # the panel keeps the finished run's feed
         self.bus.publish("job", job=job.id, state="end", kind=job.kind,
                          error=error)
+
+    # --- engine telemetry ---------------------------------------------------------
+
+    def note_event(self, kind: str, f: dict) -> None:
+        """Fold one harness event (the agent's EventLog listener) into the
+        activity telemetry: the live phase and a recent tool-action feed.
+        Only a phase change or a recorded action pings the page."""
+        action = None
+        step_n = None
+        if kind == "step":
+            action = {"tool": str(f.get("action") or "step"),
+                      "detail": str(f.get("detail") or "")[:120],
+                      "ok": not f.get("error")}
+            step_n = f.get("n")
+        elif kind == "incremental_edit":
+            tail = "" if f.get("ok") else \
+                " -- " + str(f.get("reason") or "")[:80]
+            action = {"tool": "edit-hunk",
+                      "detail": f"{f.get('target', '?')}/{f.get('of', '?')}"
+                                + tail,
+                      "ok": bool(f.get("ok"))}
+        elif kind == "edit_intents":
+            action = {"tool": "edit-intents",
+                      "detail": ", ".join(str(x)
+                                          for x in (f.get("files") or []))[:120],
+                      "ok": True}
+        elif kind == "verify":
+            action = {"tool": "verify",
+                      "detail": f"round {f.get('round', '?')}: "
+                                f"{f.get('errors', 0)} error(s), "
+                                f"{f.get('warnings', 0)} warning(s)",
+                      "ok": not f.get("errors")}
+        elif kind == "tests":
+            action = {"tool": "tests",
+                      "detail": "passed" if f.get("ok") else "failed",
+                      "ok": bool(f.get("ok"))}
+        ping = kind in EVENT_PHASE or action is not None
+        with self.lock:
+            if kind in EVENT_PHASE:
+                self.phase = EVENT_PHASE[kind]
+            if step_n is not None:
+                try:
+                    self.gather_steps = max(self.gather_steps, int(step_n))
+                except (TypeError, ValueError):
+                    pass
+            if action is not None:
+                self.actions.append(action)
+        if ping:
+            self.bus.publish("status")
+
+    def engine(self) -> dict:
+        """Engine V2 state for the ACTIVITY & PLAN panel: the live phase,
+        step/call counters, read spans in the ledger, the requirement ledger,
+        and the recent gather/microloop actions. The shared agent is read
+        best-effort: its per-run attributes survive the run, so the ledger
+        keeps showing what the last GUI-driven task/explain run touched."""
+        with self.lock:
+            agent, client = self.agent, self.client
+            job = self.job if self.job is not None and self.job.active else None
+            actions = [dict(a) for a in self.actions][-12:]
+            steps = self.gather_steps
+            stats = dict(client.stats) if client is not None else {}
+            if job is None:
+                phase = self.phase or "idle"
+            else:
+                phase = self.phase or (
+                    "gather" if job.kind in RUN_KINDS else "idle")
+                site = str(getattr(client, "site", "") or "") if client else ""
+                phase = SITE_PHASE.get(site, phase)
+        read_spans = 0
+        requirements: list[dict] = []
+        try:
+            ledger = getattr(agent, "_read_spans", None) or {}
+            read_spans = sum(len(v) for v in ledger.values())
+        except (TypeError, AttributeError, RuntimeError):
+            pass
+        try:
+            tracker = getattr(agent, "requirements", None)
+            for req in list(getattr(tracker, "items", None) or []):
+                requirements.append({
+                    "text": str(req.text)[:90],
+                    "state": str(req.state),
+                    "kind": str(req.kind),
+                    "reads": len(req.read_spans),
+                    "edits": len(req.edit_spans),
+                    "anchors": len(req.anchors),
+                })
+        except (TypeError, AttributeError):
+            pass
+        return {"phase": phase, "steps": steps, "calls": stats.get("calls", 0),
+                "read_spans": read_spans,
+                "requirements": requirements[:8], "actions": actions}
 
     # --- questions and steering -----------------------------------------------
 
@@ -598,6 +714,7 @@ class State:
                                if self.root else [])],
                 "plan_file": (cfg.auto_plan_file if cfg else "PLAN.md"),
                 "last_auto": dict(self.last_auto),
+                "engine": self.engine(),
             }
 
     def review_meta_brief(self) -> dict | None:

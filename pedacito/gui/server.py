@@ -166,6 +166,13 @@ def _state(q, body=None):
     return 200, STATE.status()
 
 
+@get("/api/engine")
+def _engine(q, body=None):
+    """Engine V2 telemetry for the ACTIVITY & PLAN panel. `status.engine`
+    carries the same payload; this route is the cheap standalone poll."""
+    return 200, STATE.engine()
+
+
 @get("/api/snapshot")
 def _snapshot(q, body=None):
     return 200, STATE.snapshot()

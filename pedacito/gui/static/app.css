@@ -11,6 +11,7 @@
   --text: #d5d9e2; --muted: #878fa0; --soft: #20242e;
   --accent: #8ab4f8; --accent-fg: #0e1117; --accent-soft: #22304a;
   --ok: #7fd98c; --err: #ff7d87; --warn: #ffc47a;
+  --cyan: #6fd7cf; --rep: #c0a6ff;
   --add-bg: #2f8a4c; --del-bg: #c2524a;
   --term-bg: #0b0d11; --code-bg: #11141a;
   --font: ui-monospace, "SF Mono", "JetBrains Mono", "Cascadia Code", Menlo,
@@ -25,6 +26,7 @@ html[data-theme="parchment"] {
   --text: #2a2822; --muted: #86816f; --soft: #e9e6dc;
   --accent: #b5651d; --accent-fg: #fff; --accent-soft: #f3e3cf;
   --ok: #3c6e47; --err: #a4342a; --warn: #9a6b00;
+  --cyan: #0f8f88; --rep: #6a4fb3;
   --add-bg: #4c9e5f; --del-bg: #cf675c;
   --term-bg: #26231c; --code-bg: #faf9f6;
   color-scheme: light;
@@ -55,6 +57,7 @@ html[data-theme="clay"] {
   --text: #332722; --muted: #8b7568; --soft: #e7d9cc;
   --accent: #b4552d; --accent-fg: #fff; --accent-soft: #f0d6c4;
   --ok: #43744c; --err: #a93c2c; --warn: #96690a;
+  --cyan: #0f8f88; --rep: #6a4fb3;
   --add-bg: #4c9e5f; --del-bg: #cf675c;
   --term-bg: #2b211c; --code-bg: #f8f2ec;
   color-scheme: light;
@@ -410,7 +413,61 @@ details pre { background: var(--code-bg); border: 1px solid var(--line); border-
 .ptask.current .st { color: var(--accent); }
 .ptask.skipped { opacity: .55; }
 
-/* ----------------------------------------------------------- terminal pane -- */
+/* ------------------------------------------------------------------ ACTIVITY
+   & PLAN: Engine V2 telemetry -- live phase bar, requirement ledger badges
+   and the recent gather/microloop action feed. --cyan/--rep come from the
+   theme blocks above. */
+.eng-bar { display: flex; flex-wrap: wrap; gap: 8px; align-items: center;
+  padding: 2px 0 7px; margin-bottom: 7px; border-bottom: 1px solid var(--line); }
+.phase { font-size: 10px; font-weight: 700; text-transform: uppercase;
+  letter-spacing: .7px; padding: 2px 9px; border-radius: 999px; flex: none;
+  background: var(--panel2); color: var(--muted); border: 1px solid var(--line2); }
+.phase.gather { color: var(--accent); border-color: var(--accent); }
+.phase.edit { color: var(--warn); border-color: var(--warn); }
+.phase.verify { color: var(--ok); border-color: var(--ok); }
+.phase.repair { color: var(--err); border-color: var(--err); }
+.phase.done { color: var(--ok); }
+.estat { font-size: 11px; color: var(--muted); white-space: nowrap; }
+.estat b { color: var(--text); }
+.eng-sec { margin-top: 9px; }
+.eng-sec > b { display: block; font-size: 10px; text-transform: uppercase;
+  letter-spacing: .8px; color: var(--muted); margin-bottom: 3px; }
+.reqs { list-style: none; margin: 0; padding: 0; font-size: 11.5px; }
+.reqrow { display: flex; gap: 6px; align-items: baseline; padding: 2px 0;
+  border-bottom: 1px solid color-mix(in srgb, var(--line) 55%, transparent); }
+.reqrow .tx { flex: 1 1 auto; min-width: 0; white-space: nowrap;
+  overflow: hidden; text-overflow: ellipsis; }
+.reqrow > .muted { flex: none; }
+.rq { flex: none; font-size: 9px; font-weight: 700; letter-spacing: .5px;
+  padding: 1px 6px; border-radius: 4px; white-space: nowrap; }
+.rq.st-unlocated { background: var(--panel3); color: var(--muted); }
+.rq.st-located { background: color-mix(in srgb, var(--accent) 20%, transparent); color: var(--accent); }
+.rq.st-read { background: color-mix(in srgb, var(--cyan) 20%, transparent); color: var(--cyan); }
+.rq.st-edited { background: color-mix(in srgb, var(--warn) 22%, transparent); color: var(--warn); }
+.rq.st-verified { background: color-mix(in srgb, var(--ok) 22%, transparent); color: var(--ok); }
+.rq.st-reported { background: color-mix(in srgb, var(--rep) 20%, transparent); color: var(--rep); }
+.acts { list-style: none; margin: 0; padding: 0; font-size: 11.5px;
+  max-height: 170px; overflow-y: auto; }
+.actrow { display: flex; gap: 6px; align-items: baseline; padding: 2px 0;
+  border-bottom: 1px solid color-mix(in srgb, var(--line) 55%, transparent);
+  color: var(--muted); }
+.actrow .tx { flex: 0 1 auto; min-width: 0; overflow: hidden;
+  text-overflow: ellipsis; white-space: nowrap; font-family: var(--mono); }
+.actrow .tx2 { flex: none; max-width: 45%; overflow: hidden;
+  text-overflow: ellipsis; white-space: nowrap; }
+.actrow.bad .atool { color: var(--err); border-color: var(--err); }
+.aline { flex: none; font-size: 10px; color: var(--cyan); font-family: var(--mono); }
+.atool { flex: none; min-width: 48px; text-align: center; font-size: 9px;
+  font-weight: 700; text-transform: uppercase; letter-spacing: .4px;
+  background: var(--panel2); border: 1px solid var(--line); border-radius: 4px;
+  padding: 0 5px; color: var(--text); }
+.atool.k-edit-hunk { color: var(--warn); border-color: var(--warn); }
+.atool.k-edit-intents, .atool.k-verify { color: var(--ok); border-color: var(--line2); }
+#engCount { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+
+/* ------------------------------------------------------------ terminal pane -- */
+.panel-head .term-sub { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+@media (max-width: 1180px) { .panel-head .term-sub { display: none; } }
 #term { flex: 1 1 auto; min-height: 0; overflow: auto; background: var(--term-bg);
   color: #cdd3df; font-family: var(--mono); font-size: 12px; line-height: 1.45; padding: 6px 8px;
   white-space: pre-wrap; word-break: break-word; }

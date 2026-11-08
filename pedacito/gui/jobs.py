@@ -131,6 +131,7 @@ class _Feed:
             STATE.append_message(self.activity_mid, "\n" + line)
 
     def event(self, kind: str, f: dict) -> None:
+        STATE.note_event(kind, f)      # feeds the ACTIVITY & PLAN panel
         if kind == "step":
             self.activity(f"{f.get('n', '?')}. {f.get('action', '')} "
                           f"{f.get('detail', '')}".rstrip())

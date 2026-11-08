@@ -700,7 +700,7 @@ function TopBar() {
                 onClick=${() => PDC.browse({ title: 'Choose a project folder',
                   start: ((pathRef.current && pathRef.current.value) || s.root || '').replace(/[\\/][^\\/]*[\\/]$/, ''),
                   pickLabel: 'Open this folder',
-                  onPick: (p) => { if (pathRef.current) pathRef.current.value = p; openProject(p, S.ui.pendingProfile || ''); } })}>Browse&hellip;</button>
+                  onPick: (p) => { if (pathRef.current) pathRef.current.value = p; openProject(p, S.ui.pendingProfile || ''); } })}>Browse…</button>
         <select id="recent" title="recent projects"
                 onchange=${(e) => { const v = e.target.value; e.target.value = ''; if (v) { if (pathRef.current) pathRef.current.value = v; openProject(v, ''); } }}>
           <option value="">recent\u2026</option>
@@ -712,7 +712,7 @@ function TopBar() {
       </div>
       <div id="indexBox">
         <span class="chip" id="indexChip" title=${idxTitle}>
-          <i class=${'dot ' + (indexed ? 'ok' : 'idle')}"></i>
+          <i class=${'dot ' + (indexed ? 'ok' : 'idle')}></i>
           <b>${indexed ? 'indexed' : 'no index'}</b>
           ${indexed ? html`<span class="muted small-text">${PDC.fmtInt(s.index_files)} files \u00B7 ${PDC.fmtInt(s.index_chunks)} units</span>` : null}
         </span>
@@ -723,7 +723,7 @@ function TopBar() {
         <span class="chip" id="modelChip"
               title=${(s.model_status || 'click to check the model server') + (s.base_url ? '\n' + s.base_url : '') + (s.context_tokens ? '\nwindow ' + PDC.fmtInt(s.context_tokens) + ' tokens (' + s.context_origin + ')' : '')}
               onClick=${() => { if (s.root && !j) checkModel(); }}>
-          <i class=${'dot ' + (j ? 'busy' : s.model_ok === true ? 'ok' : s.model_ok === false ? 'bad' : 'idle')}"></i>
+          <i class=${'dot ' + (j ? 'busy' : s.model_ok === true ? 'ok' : s.model_ok === false ? 'bad' : 'idle')}></i>
           <b>${s.root ? (s.model || '\u2014') : 'no project'}</b>
         </span>
         ${(s.usage && s.usage.calls) ? html`
@@ -732,7 +732,7 @@ function TopBar() {
               + (s.usage.cache_hit ? ' \u00B7 cache ' + Math.round(s.usage.cache_hit * 100) + '%' : '')
               + (s.usage.cost ? ' \u00B7 $' + Number(s.usage.cost).toFixed(4) : '')}</b>
           </span>` : null}
-        <${Menu} button=${html`<button id="projMenuBtn" title="index, restore and other project actions">Project &#9662;</button>`}>
+        <${Menu} button=${html`<button id="projMenuBtn" title="index, restore and other project actions">Project ▾</button>`}>
           <${MenuItem} label="Check model (loads it)" disabled=${!!j || !s.root} action=${checkModel} />
           <${MenuItem} label="Restore from a backup\u2026" disabled=${!!j || !(s.snapshots || []).length} action=${restoreDialog} />
           <${MenuItem} label="Clear terminal" action=${clearTerm} />
@@ -1179,9 +1179,25 @@ function DiffPane() {
     </div>`;
 }
 
-// -------------------------------------------------------------- right pane ---
+// ------------------------------------------------- right pane: ACTIVITY & PLAN -
+// The right column is one ACTIVITY & PLAN panel: this pane carries the Engine
+// V2 telemetry (`status.engine` -- live phase, counters, the requirement
+// ledger, recent gather/microloop actions) and the Plan checklist pane sits
+// right below it. Without engine data the classic activity-steps feed renders
+// exactly as before, so Auto-mode checklists and transcripts are unchanged.
+function actParts(a) {                 // "app.py L12-40" -> file + line badges
+  const d = String(a.detail || '');
+  const m = /^(.+?)\s+L(\d+)\s*-\s*(\d+)(.*)$/.exec(d);
+  if (m) {
+    return [html`<span key="f" class="tx">${m[1]}</span>`,
+            html`<span key="l" class="aline">L${m[2]}-${m[3]}</span>`,
+            m[4].trim() ? html`<span key="r" class="tx2">${m[4].trim()}</span>` : null];
+  }
+  return [html`<span key="f" class="tx">${d}</span>`];
+}
+
 function ActivityPane() {
-  const s = S.status, j = s.job;
+  const s = S.status, j = s.job, eng = s.engine || {};
   const lastActivity = useMemo(() => {
     for (let i = S.msgs.length - 1; i >= 0; i--) {
       const m = S.msgs[i];
@@ -1201,21 +1217,49 @@ function ActivityPane() {
   }, [S.msgTick, j && j.id]);
   const lines = (lastActivity && lastActivity.text ? lastActivity.text.split('\n') : []);
   const tail = lines.slice(-120);
-  const phase = j ? (j.cancelled ? 'stopping\u2026' : j.title + '\u2026') : 'idle';
+  const acts = (eng.actions || []).slice(-12).reverse();
+  const reqs = eng.requirements || [];
+  const phase = eng.phase || (j ? 'gather' : 'idle');
   return html`
     <section class="panel" id="activityPanel">
       <div class="panel-head">
         <h2>Activity</h2>
         <span class="chip">
-          <i class=${'dot ' + (j ? 'busy' : 'idle')}"></i><b>${phase}</b></span>
-        <span class="muted small-text grow">${lastActivity ? lines.length + ' steps' : ''}</span>
+          <i class=${'dot ' + (j ? 'busy' : 'idle')}></i><b>${phase}</b></span>
+        <span class="muted small-text grow" id="engCount">
+          ${PDC.fmtInt(eng.calls || 0)} calls \u00B7 ${PDC.fmtInt(eng.steps || 0)} steps</span>
         ${j ? html`<button class="ghost small" onClick=${() => stop()}>Stop</button>` : null}
       </div>
       <div id="activityBody">
-        ${tail.length ? html`<ol class="steps">
+        <div class="eng-bar" title="Engine V2 state (during and after runs)">
+          <span class=${'phase ' + phase}>${phase}</span>
+          <span class="estat" title="model calls this session">calls
+            <b>${PDC.fmtInt(eng.calls || 0)}</b></span>
+          <span class="estat" title="gather steps in the last run">step
+            <b>${PDC.fmtInt(eng.steps || 0)}</b></span>
+          <span class="estat" title="read spans recorded in the ledger">read spans
+            <b>${PDC.fmtInt(eng.read_spans || 0)}</b></span>
+        </div>
+        ${reqs.length ? html`
+          <div class="eng-sec"><b>Requirement ledger</b><ol class="reqs">
+            ${reqs.map((rq, i) => html`
+              <li key=${i} class="reqrow" title=${rq.text}>
+                <span class=${'rq st-' + String(rq.state || 'UNLOCATED').toLowerCase()}>${rq.state}</span>
+                <span class="tx">${rq.text}</span>
+                <span class="muted small-text">${rq.reads || 0}r${rq.edits ? ' \u00B7 ' + rq.edits + 'e' : ''}${rq.anchors ? ' \u00B7 ' + rq.anchors + 'a' : ''}</span>
+              </li>`)}
+          </ol></div>` : null}
+        ${acts.length ? html`
+          <div class="eng-sec"><b>Recent actions</b><ul class="acts">
+            ${acts.map((a, i) => html`
+              <li key=${i} class=${'actrow' + (a.ok === false ? ' bad' : '')}>
+                <span class=${'atool k-' + String(a.tool || 'step').toLowerCase().replace(/[^a-z0-9-]+/g, '')}>${a.tool}</span>
+                ${actParts(a)}</li>`)}
+          </ul></div>` : null}
+        ${tail.length ? html`<ol class="steps" hidden=${!!acts.length}>
             ${tail.map((l, i) => html`<li key=${'l' + (lines.length - tail.length + i)}>
               <span class="tx">${l}</span></li>`)}
-          </ol>` : html`<div class="tip">No lookups yet \u2014 run something.</div>`}
+          </ol>` : (acts.length ? null : html`<div class="tip">No lookups yet \u2014 run something.</div>`)}
         ${lastStream && lastStream.text ? html`
           <div class="streamtail" title="live model output"><b>${lastStream.site || 'answer'}</b>
           <pre>${lastStream.text.slice(-2000)}</pre></div>` : null}
@@ -1276,7 +1320,7 @@ function TermPane() {
     <section class=${'panel' + (S.ui.termCollapsed ? ' collapsed' : '')} id="termPanel">
       <div class="panel-head">
         <h2>Terminal</h2>
-        <span class="muted small-text grow">live output of whatever pedacito is doing</span>
+        <span class="muted small-text grow term-sub">live output</span>
         <label class="chk"><input type="checkbox" checked=${S.ui.termFollow}
                onchange=${(e) => { S.ui.termFollow = e.target.checked; if (term) { term.follow = e.target.checked; if (e.target.checked) term.schedule(); } }} />follow</label>
         <button class="ghost small" onClick=${() => clearTerm()}>Clear</button>
