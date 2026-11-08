@@ -25,6 +25,7 @@ from .. import review as review_mod
 from .. import workspace
 from ..config import USER_CONFIG
 from ..events import cache_hit_ratio
+from ..index import INDEX_VERSION
 
 RECENT_FILE = USER_CONFIG.parent / "gui_recent.json"
 MAX_RECENT = 8
@@ -110,6 +111,34 @@ def args_for(root_str: str, profile: str | None) -> SimpleNamespace:
         exclude=[], include=[], ext=[], no_refs=False, no_gitignore=False,
         url=None, model=None, steps=None,
     )
+
+
+INDEX_SUBPATH = Path(".pedacito") / "index.json"
+
+
+def detect_index_meta(root) -> dict:
+    """Read just enough of `.pedacito/index.json` to describe it (count of
+    files and chunks, modified time) without building the in-memory Index.
+    Runs off the STATE lock; a missing or unreadable file is simply 'no
+    index', since `jobs.open_project` still loads the full index later."""
+    meta = {"indexed": False, "files": 0, "chunks": 0, "time": 0.0}
+    if root is None:
+        return meta
+    p = Path(root) / INDEX_SUBPATH
+    try:
+        data = json.loads(p.read_text(encoding="utf-8", errors="replace"))
+        if int(data.get("version", 1)) > INDEX_VERSION:
+            return meta          # unusable: same verdict as Index.load
+        chunks = data.get("chunks") or []
+        names = set(data.get("file_hashes") or {})
+        names.update(c.get("file") for c in chunks
+                     if isinstance(c, dict) and c.get("file"))
+        names.discard(None)
+        meta = {"indexed": True, "files": len(names), "chunks": len(chunks),
+                "time": p.stat().st_mtime}
+    except (OSError, ValueError, TypeError, AttributeError):
+        pass
+    return meta
 
 
 def load_recent() -> list[str]:
@@ -200,6 +229,9 @@ class State:
         self.agent = None
         self.profile_request = ""
         self.index_gen = 0
+        # auto-detected `.pedacito/index.json` metadata (see `set_root`):
+        # {"indexed": bool, "files": n, "chunks": n, "time": mtime}
+        self.index_meta: dict = detect_index_meta(self.root)
 
         self.job: Job | None = None
         self._job_counter = 0
@@ -226,6 +258,38 @@ class State:
         self.last_backup_dir: Path | None = None
         self.last_auto: dict = {}
         self.plan_path: Path | None = None
+
+    # --- project & index auto-detect --------------------------------------------
+
+    def set_root(self, root: Path | str | None) -> None:
+        """Adopt a project folder and immediately look for an existing
+        `.pedacito/index.json`, so `/api/state` reports the index (count and
+        timestamp) the moment the switch starts -- not only after the whole
+        open job (config, model probe, index load) has finished. The disk
+        read happens outside the lock; only the swap holds it."""
+        meta = detect_index_meta(root)
+        with self.lock:
+            self.root = Path(root) if root is not None else None
+            self.index_meta = meta
+
+    def apply_index(self, idx) -> None:
+        """Refresh the reported index metadata after `STATE.idx` changed.
+        Call with the new (or None) index; disk stat runs outside the lock."""
+        with self.lock:
+            root = self.root
+        if idx is not None:
+            time = 0.0
+            if root is not None:
+                try:
+                    time = (Path(root) / INDEX_SUBPATH).stat().st_mtime
+                except OSError:
+                    pass
+            meta = {"indexed": True, "files": len(idx.files),
+                    "chunks": len(idx.chunks), "time": time}
+        else:
+            meta = detect_index_meta(root)
+        with self.lock:
+            self.index_meta = meta
 
     # --- chat transcript ----------------------------------------------------
 
@@ -478,18 +542,31 @@ class State:
         """The JSON payload the page polls to update itself."""
         with self.lock:
             cfg, client, idx = self.cfg, self.client, self.idx
+            meta = self.index_meta
+            indexed = idx is not None or meta["indexed"]
             job = self.job if self.job is not None and self.job.active else None
             stats = dict(client.stats) if client is not None else {}
+            profile_models = {}
+            if cfg:
+                for name, body in (cfg.profiles or {}).items():
+                    model = body.get("model") if isinstance(body, dict) else ""
+                    profile_models[name] = str(model or cfg.model or "")
             return {
                 "root": str(self.root) if self.root else "",
                 "profile": cfg.active_profile if cfg else "",
                 "profiles": sorted(cfg.profiles) if cfg else [],
+                "profile_models": profile_models,
                 "default_profile": cfg.default_profile if cfg else "",
                 "model": cfg.model if cfg else "",
                 "base_url": cfg.base_url if cfg else "",
                 "review_default": bool(cfg.review) if cfg else True,
-                "has_index": idx is not None,
-                "index_files": len(idx.files) if idx else 0,
+                "has_index": indexed,
+                "indexed": indexed,
+                "index_files": (len(idx.files) if idx is not None
+                                else meta["files"]),
+                "index_chunks": (len(idx.chunks) if idx is not None
+                                 else meta["chunks"]),
+                "index_time": meta["time"],
                 "files_sig": self.files_signature(),
                 "job": ({"id": job.id, "kind": job.kind, "title": job.title,
                          "started": job.started,

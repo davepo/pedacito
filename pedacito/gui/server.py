@@ -28,6 +28,15 @@ STATIC = Path(__file__).parent / "static"
 MAX_BODY = 12 * 1024 * 1024
 MAX_VIEW_BYTES = 600_000
 
+# Explicit allowlist of served types (everything under STATIC/ is still
+# directory-contained below). vendor.js is the vendored preact+htm bundle and
+# must arrive as a JS MIME for `import` to accept it.
+STATIC_TYPES = {".html": "text/html", ".css": "text/css",
+                ".js": "application/javascript", ".mjs": "application/javascript",
+                ".json": "application/json", ".svg": "image/svg+xml",
+                ".woff2": "font/woff2", ".png": "image/png",
+                ".ico": "image/x-icon"}
+
 CSP = ("default-src 'self'; style-src 'self' 'unsafe-inline'; "
        "script-src 'self'; connect-src 'self'; img-src 'self' data:; "
        "frame-ancestors 'none'; base-uri 'none'; form-action 'none'")
@@ -232,6 +241,23 @@ def _project(q, body):
     return _busy_reply(jobs.spawn(
         "project", "opening project",
         lambda job: jobs.open_project(path, profile)))
+
+
+@post("/api/profile")
+def _profile_switch(q, body):
+    """Switch the active model profile and re-open the current project with
+    it, so subsequent runs use the chosen profile."""
+    name = str(body.get("profile", "")).strip()
+    with STATE.lock:
+        root = STATE.root
+        known = sorted(STATE.cfg.profiles) if STATE.cfg else []
+    if root is None:
+        return 400, {"ok": False, "detail": "Open a project first."}
+    if name and known and name not in known:
+        return 400, {"ok": False, "detail": f"no profile named {name!r}"}
+    return _busy_reply(jobs.spawn(
+        "project", f"switching profile to {name or 'default'}",
+        lambda job: jobs.open_project(str(root), name)))
 
 
 @post("/api/index")
@@ -449,7 +475,9 @@ class _Handler(BaseHTTPRequestHandler):
         if not p.is_file():
             self._send(404, b"not found", "text/plain")
             return
-        ctype = mimetypes.guess_type(p.name)[0] or "application/octet-stream"
+        ctype = (STATIC_TYPES.get(p.suffix.lower())
+                 or mimetypes.guess_type(p.name)[0]
+                 or "application/octet-stream")
         if ctype.startswith("text/") or ctype.endswith("javascript"):
             ctype += "; charset=utf-8"
         self._send(200, p.read_bytes(), ctype)
@@ -566,6 +594,7 @@ def run(port: int = 0, open_browser: bool = True, project: str | None = None,
     install_runner()
     if project:
         path = str(Path(project).expanduser().resolve())
+        STATE.set_root(path)     # report any existing index before the open job
         jobs.spawn("project", "opening project",
                    lambda job: jobs.open_project(path, profile or ""))
     if open_browser:

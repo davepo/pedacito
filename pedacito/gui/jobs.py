@@ -212,6 +212,7 @@ def _swap_index(idx) -> None:
         STATE.index_gen += 1
         if STATE.agent is not None:
             STATE.agent.index = idx
+    STATE.apply_index(idx)
 
 
 def _refresh_index(p: SimpleNamespace) -> None:
@@ -261,6 +262,7 @@ def open_project(path: str, profile: str, announce: bool = True) -> None:
     args = args_for(str(p), profile)
     cfg = cli_mod._config(args)
     root = cli_mod._root(args)
+    STATE.set_root(root)            # adopt + auto-detect any existing index
     workspace.ensure(root, cfg.manage_gitignore, cfg.create_ignore_file)
 
     idx = index_mod.Index.load(root)
@@ -271,7 +273,7 @@ def open_project(path: str, profile: str, announce: bool = True) -> None:
     agent = Agent(idx, client, cfg) if idx is not None else None
 
     with STATE.lock:
-        STATE.root, STATE.args, STATE.cfg = root, args, cfg
+        STATE.args, STATE.cfg = args, cfg
         STATE.client, STATE.idx, STATE.agent = client, idx, agent
         STATE.profile_request = profile or ""
         STATE.index_gen += 1
@@ -279,6 +281,7 @@ def open_project(path: str, profile: str, announce: bool = True) -> None:
         STATE.review = None
         STATE.plan_path = None
         STATE.last_auto = {}
+    STATE.apply_index(idx)
     remember_recent(str(root))
     _probe_server(client, cfg)
     if announce:
@@ -337,6 +340,7 @@ def build_index(job: Job, summarise: bool = True) -> None:
         STATE.idx = idx
         STATE.agent = Agent(idx, p.client, p.cfg)
         STATE.index_gen += 1
+    STATE.apply_index(idx)
     STATE.add_message("system", f"Indexed {len(idx.chunks)} units across "
                       f"{len(idx.files)} files.", kind="indexed")
 
