@@ -813,7 +813,8 @@ class RequirementTracker:
             # are generic to the observation, so they do not locate every
             # requirement in the task.
             evidence = o_hit or (
-                q_hit and action in ("find", "outline", "callers", "context"))
+                q_hit and action in ("find", "outline", "callers", "usages",
+                                     "context"))
             if not evidence:
                 continue
             files = []

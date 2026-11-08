@@ -22,7 +22,9 @@ from __future__ import annotations
 
 import fnmatch
 import hashlib
+import json
 import re
+import time
 from pathlib import Path
 
 from . import safety
@@ -252,6 +254,231 @@ def attempts_note(root, task: str, cfg=None) -> str:
         files = f" (looked at {', '.join(r['files'])})" if r.get("files") else ""
         lines.append(f"- {r['task'][:120]}: {r.get('why') or 'no edit landed'}{files}")
     return "\n".join(lines)
+
+
+# ------------------------------------------------- repository micro-facts
+#
+# TokenEconomizer's Micro-Skills are zero-LLM-call facts a session derives
+# deterministically instead of rediscovering every run. Pedacito keeps only
+# the environment/command slice: a command that succeeds twice (or succeeds
+# after an earlier failure) becomes a confirmed fact and is injected, capped,
+# into the stable prompt prefix. A later failure is a contradiction: the fact
+# is retired immediately so stale advice cannot linger.
+
+MICRO_FACTS_FILE = "micro_facts.json"
+TOOL_STATS_FILE = "tool_stats.json"
+_MAX_MICRO_FACTS = 24
+_MAX_PENDING_FACTS = 24
+
+
+def micro_facts_file(root) -> Path:
+    return Path(root) / ".pedacito" / MICRO_FACTS_FILE
+
+
+def tool_stats_file(root) -> Path:
+    return Path(root) / ".pedacito" / TOOL_STATS_FILE
+
+
+def _read_json(path: Path, default):
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        return data if isinstance(data, type(default)) else default
+    except (OSError, ValueError):
+        return default
+
+
+def _write_json(path: Path, data) -> None:
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(data, indent=1, sort_keys=True),
+                       encoding="utf-8")
+        tmp.replace(path)
+    except OSError:
+        pass
+
+
+def _facts_doc(root) -> dict:
+    """The micro-fact document: {facts, pending, retired}."""
+    raw = _read_json(micro_facts_file(root), {})
+    facts = [f for f in raw.get("facts", ())
+             if isinstance(f, dict) and f.get("fact_id") and f.get("text")]
+    pending = [f for f in raw.get("pending", ())
+               if isinstance(f, dict) and f.get("fact_id") and f.get("text")]
+    retired = [f for f in raw.get("retired", ())
+               if isinstance(f, dict) and f.get("fact_id")]
+    return {"facts": facts[-_MAX_MICRO_FACTS:],
+            "pending": pending[-_MAX_PENDING_FACTS:],
+            "retired": retired[-_MAX_MICRO_FACTS:]}
+
+
+def load_micro_facts(root, include_retired: bool = False) -> list[dict]:
+    """Confirmed facts (or every record, including retired ones) for tests
+    and inspection."""
+    doc = _facts_doc(root)
+    rows = list(doc["facts"])
+    if include_retired:
+        rows += list(doc["retired"])
+    return rows
+
+
+def _command_identity(command: str) -> tuple[str, str]:
+    norm = " ".join(str(command or "").split())
+    digest = hashlib.sha1(norm.lower().encode("utf-8", "replace")).hexdigest()
+    return norm, f"cmd:{digest[:12]}"
+
+
+def _fact_text(command: str, kind: str, confirmations: int) -> str:
+    runs = "run" if confirmations == 1 else "runs"
+    if kind == "test":
+        return f"`{command}` works as the test command here ({confirmations} {runs})."
+    return f"`{command}` works here ({confirmations} {runs})."
+
+
+def observe_command(root, command: str, ok: bool, cfg=None,
+                    kind: str = "command") -> dict | None:
+    """Record one executed command outcome and promote/retire a micro-fact.
+
+    Promotion needs two successes, or one success after an earlier failure.
+    An active fact contradicted by a failure is moved to `retired` with its
+    contradiction count incremented; retired facts are never injected.
+    Returns the promoted fact, or None.
+    """
+    if cfg is not None and not getattr(cfg, "micro_facts", True):
+        return None
+    command, fact_id = _command_identity(command)
+    if not command or len(command) > 240:
+        return None
+    if safety.looks_like_injection(command):
+        return None
+    command = safety.redact(command)
+    now = time.time()
+    doc = _facts_doc(root)
+
+    for fact in list(doc["facts"]):
+        if fact.get("fact_id") != fact_id:
+            continue
+        confirmations = int(fact.get("confirmations", 0) or 0)
+        if ok:
+            fact["confirmations"] = confirmations + 1
+            fact["last_seen"] = now
+            fact["text"] = _fact_text(command, fact.get("kind", kind),
+                                      fact["confirmations"])
+            _write_json(micro_facts_file(root), doc)
+            return fact
+        # Contradiction: the command that used to work now fails. Retire it
+        # at once -- a stale environment fact is worse than none.
+        fact["contradictions"] = int(fact.get("contradictions", 0) or 0) + 1
+        fact["last_seen"] = now
+        doc["facts"].remove(fact)
+        doc["retired"] = (doc["retired"] + [fact])[-_MAX_MICRO_FACTS:]
+        _write_json(micro_facts_file(root), doc)
+        return None
+
+    pending = next((p for p in doc["pending"]
+                    if p.get("fact_id") == fact_id), None)
+    if pending is None:
+        pending = {"fact_id": fact_id, "text": _fact_text(command, kind, 0),
+                   "successes": 0, "failures": 0, "last_seen": now,
+                   "kind": kind}
+        doc["pending"].append(pending)
+    pending["last_seen"] = now
+    if ok:
+        pending["successes"] = int(pending.get("successes", 0) or 0) + 1
+    else:
+        pending["failures"] = int(pending.get("failures", 0) or 0) + 1
+
+    promoted = None
+    if ok and (pending["successes"] >= 2 or pending["failures"] >= 1):
+        promoted = {
+            "fact_id": fact_id,
+            "text": _fact_text(command, kind, pending["successes"]),
+            "confirmations": pending["successes"],
+            "contradictions": 0,
+            "last_seen": now,
+            "kind": kind,
+        }
+        doc["facts"].append(promoted)
+        doc["pending"].remove(pending)
+    doc["facts"] = doc["facts"][-_MAX_MICRO_FACTS:]
+    doc["pending"] = doc["pending"][-_MAX_PENDING_FACTS:]
+    _write_json(micro_facts_file(root), doc)
+    return promoted
+
+
+def render_micro_facts(root, cfg=None, limit: int | None = None) -> str:
+    """Confirmed micro-facts as a short stable-prefix block ('' if none)."""
+    if cfg is not None and not getattr(cfg, "micro_facts", True):
+        return ""
+    facts = _facts_doc(root)["facts"]
+    if not facts:
+        return ""
+    facts = sorted(facts, key=lambda f: (-int(f.get("confirmations", 0) or 0),
+                                         -float(f.get("last_seen", 0) or 0),
+                                         str(f.get("text", ""))))[:10]
+    tokens = int(limit if limit is not None
+                 else getattr(cfg, "max_micro_fact_tokens", 150) or 150)
+    budget = max(160, tokens * 4)
+    head = ("REPO MICRO-FACTS (confirmed commands from earlier runs; hints, "
+            "not truth):")
+    rows = [f"- {f['text']}" for f in facts
+            if f.get("text") and not safety.looks_like_injection(str(f["text"]))]
+    while rows and len(head) + 1 + sum(len(r) + 1 for r in rows) > budget:
+        rows.pop()                     # least-confirmed first
+    return head + "\n" + "\n".join(rows) if rows else ""
+
+
+# ------------------------------------------------------------ tool stats
+#
+# Dynamic tool schema pruning needs one cheap signal: how many repository
+# tasks have run since each optional action was last used. Task starts bump
+# the counter; dispatch records actual uses. A never-used tool therefore
+# becomes prunable after `tool_prune_after_tasks` tasks, and a recently used
+# one stays visible. All local, deterministic, and capped.
+
+def _tool_stats_doc(root) -> dict:
+    raw = _read_json(tool_stats_file(root), {})
+    uses = raw.get("uses") if isinstance(raw.get("uses"), dict) else {}
+    last = raw.get("last_task") if isinstance(raw.get("last_task"), dict) else {}
+    return {"tasks": max(0, int(raw.get("tasks", 0) or 0)),
+            "uses": {str(k): int(v or 0) for k, v in uses.items()},
+            "last_task": {str(k): int(v or 0) for k, v in last.items()}}
+
+
+def begin_tool_task(root, cfg=None) -> int:
+    """Count one task start; returns the repository's task counter."""
+    if cfg is not None and not getattr(cfg, "dynamic_tool_pruning", True):
+        return 0
+    doc = _tool_stats_doc(root)
+    doc["tasks"] += 1
+    _write_json(tool_stats_file(root), doc)
+    if cfg is not None:
+        try:
+            cfg._track_tool_use = True
+        except Exception:
+            pass
+    return doc["tasks"]
+
+
+def record_tool_use(root, action: str, cfg=None) -> None:
+    """Record one dispatched action for dynamic schema pruning."""
+    if cfg is not None and not getattr(cfg, "dynamic_tool_pruning", True):
+        return
+    if cfg is not None and not getattr(cfg, "_track_tool_use", False):
+        return
+    action = str(action or "").strip()
+    if not action:
+        return
+    doc = _tool_stats_doc(root)
+    doc["uses"][action] = int(doc["uses"].get(action, 0)) + 1
+    doc["last_task"][action] = doc["tasks"]
+    _write_json(tool_stats_file(root), doc)
+
+
+def tool_unused_tasks(root, action: str) -> int:
+    """Tasks since `action` was last used (0 when never used)."""
+    doc = _tool_stats_doc(root)
+    return max(0, doc["tasks"] - int(doc["last_task"].get(action, 0) or 0))
 
 
 # ------------------------------------------------------------ scoped rules

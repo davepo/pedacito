@@ -753,7 +753,8 @@ def generate_tasks(spec_text: str, client, cfg,
     return titles
 
 
-def run_verify(root: Path, command: str, timeout: int = 600) -> tuple[bool, str]:
+def run_verify(root: Path, command: str, timeout: int = 600, cfg=None
+               ) -> tuple[bool, str]:
     """Run `command` (a shell string) in `root`. Returns (passed, output).
 
     The whole process group is killed on timeout, so a GUI/launcher child
@@ -764,6 +765,12 @@ def run_verify(root: Path, command: str, timeout: int = 600) -> tuple[bool, str]
         return False, f"(verification timed out after {timeout}s)"
     if stopped == "error":
         return False, f"(could not run verification: {out})"
+    if cfg is not None:
+        try:
+            from . import memory
+            memory.observe_command(root, command, rc == 0, cfg, kind="test")
+        except Exception:
+            pass
     return rc == 0, out.strip()
 
 
@@ -2545,7 +2552,16 @@ def run_loop(root: Path, cfg, client, idx, plan_path: Path, *,
 
     def run_check(changed):
         if verify:
-            return run_verify(root, verify)
+            # Call positionally: existing callers (and tests) monkeypatch
+            # run_verify with a two-argument callable. Record the outcome here,
+            # where cfg is available, rather than threading it into the call.
+            ok, out = run_verify(root, verify)
+            try:
+                from . import memory
+                memory.observe_command(root, verify, ok, cfg, kind="test")
+            except Exception:
+                pass
+            return ok, out
         if use_diag:
             return diagnostics.run_changed(root, cfg, changed)
         return True, ""

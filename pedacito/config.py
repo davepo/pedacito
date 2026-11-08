@@ -191,6 +191,21 @@ class Config:
     # harness note and the run moves on to the answer phase. 0 = off.
     max_total_model_calls: int = 30
     max_no_progress_steps: int = 4
+    # Dynamic tool schema pruning: keep the core navigation actions always
+    # available, but omit an enabled optional/specialized action from the
+    # prompt schema once the repository's tool-use stats show it has gone
+    # unused for `tool_prune_after_tasks` tasks and the current task text has
+    # no trigger keyword for it. Disabled actions are already omitted.
+    dynamic_tool_pruning: bool = True
+    # Consecutive tasks a tool may go unused before pruning considers it.
+    tool_prune_after_tasks: int = 10
+    # Deterministic repository micro-facts: remember commands that have proved
+    # successful here (>=2 runs, or a success after an earlier failure) in
+    # .pedacito/micro_facts.json and inject the confirmed ones into the stable
+    # session prefix. A later failure retires the stale fact immediately.
+    micro_facts: bool = True
+    # Token cap for the injected micro-fact block.
+    max_micro_fact_tokens: int = 150
     # Step-0 prefetch: read up to this many task-named files / task-named
     # symbols before the first model step (0 = off). Prefetch reads do not
     # count toward max_steps and are capped at a quarter of the observation

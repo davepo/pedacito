@@ -78,13 +78,14 @@ _MAX_REPEATED_STEPS = 3
 
 # Read-only steps whose result cannot change when the previous step is the
 # identical call. `read` has its own duplicate-range guard.
-_DEDUP_STEP_ACTIONS = {"grep", "find", "outline", "callers", "sessions",
-                       "diff", "diagnose"}
+_DEDUP_STEP_ACTIONS = {"grep", "find", "outline", "usages", "callers",
+                       "sessions", "diff", "git_diff", "diagnose"}
 
 # Read-only steps whose repeat (even many steps later) adds nothing while the
 # index, the conversation and the working tree are unchanged.
-_CACHEABLE_ACTIONS = {"grep", "find", "outline", "callers", "context", "git",
-                      "diagnose", "sessions", "fetch"}
+_CACHEABLE_ACTIONS = {"grep", "find", "outline", "usages", "callers",
+                      "context", "git", "git_diff", "diagnose", "sessions",
+                      "fetch"}
 # Steps that can change what the cacheable ones return.
 _MUTATING = {"write", "append", "move", "delete", "undo", "rename", "run",
              "browser", "screenshot", "mcp", "task"}
@@ -1713,6 +1714,14 @@ class Agent:
         root = self.index.root
         self.cfg._root = str(root)
         self.cfg._is_git = gitinfo.is_repo(root)
+        # Dynamic tool pruning reads the task text for trigger words and the
+        # repository's per-tool task counters. A task start bumps the counter;
+        # dispatch records actual uses while this gather runs.
+        self.cfg._task_text = task
+        try:
+            memory_mod.begin_tool_task(root, self.cfg)
+        except Exception:
+            pass
         if self.events is None:
             self.events = events_mod.get(root, self.cfg)
             events_mod.attach(self.client, self.events)
@@ -1732,6 +1741,12 @@ class Agent:
         memory_notes = memory_mod.render(root, self.cfg)
         if memory_notes:
             system += "\n\n" + memory_notes
+        try:
+            micro_notes = memory_mod.render_micro_facts(root, self.cfg)
+        except Exception:
+            micro_notes = ""
+        if micro_notes:
+            system += "\n\n" + micro_notes
         if "skill" in schema_for(self.cfg)["properties"]["action"]["enum"]:
             skill_notes = skills_mod.catalog(root, self.cfg, task=task)
             if skill_notes:
@@ -1860,6 +1875,7 @@ class Agent:
         no_progress_cap = max(0, int(getattr(self.cfg, "max_no_progress_steps", 0) or 0))
         model_calls = 0
         no_progress = 0
+        loop_guard_fired = False    # TokenEconomizer r = 1 pre-lease redirect
         resolved_symbols: set[str] = set()
 
         def harness_note(text: str) -> None:
@@ -1873,10 +1889,30 @@ class Agent:
 
         def note_progress(made_progress: bool) -> bool:
             """Update the no-progress streak; True return means the lease is
-            spent and gather must move on to the next phase."""
-            nonlocal no_progress
+            spent and gather must move on to the next phase.
+
+            One step before the hard lease, inject a single high-salience
+            redirect (TokenEconomizer's Loop Guard, r = 1): retrying the same
+            strategy is the commonest small-model stall, so name a different
+            tool before terminating. It fires at most once per turn."""
+            nonlocal no_progress, loop_guard_fired
             no_progress = 0 if made_progress else no_progress + 1
             if no_progress_cap <= 0 or no_progress < no_progress_cap:
+                if (no_progress_cap > 1 and no_progress == no_progress_cap - 1
+                        and not loop_guard_fired):
+                    loop_guard_fired = True
+                    harness_note(
+                        f"[LOOP GUARD: You have taken {no_progress} steps "
+                        "without adding new source lines or resolving new "
+                        "symbols. Do NOT repeat your previous search/lookup "
+                        "strategy. Either try a different tool (e.g. "
+                        "outline/usages) on an unread requirement target, or "
+                        "emit 'done' now.]")
+                    self._emit("recovery", signal="loop_guard", step=step)
+                    if verbose:
+                        print("  [loop guard: one redirect before the "
+                              "no-progress lease; asking for a different "
+                              "strategy]", file=sys.stderr)
                 return False
             harness_note(f"[Harness: gather stopped after {no_progress} "
                          "consecutive steps that added no unread line span "
@@ -3486,11 +3522,17 @@ class Agent:
                                      limit=int(getattr(
                                          self.cfg, "max_todo_chars", 1500)))
         memory_notes = memory_mod.render(self.index.root, self.cfg)
+        try:
+            micro_notes = memory_mod.render_micro_facts(self.index.root, self.cfg)
+        except Exception:
+            micro_notes = ""
         notes_prefix = ""
         if project_notes:
             notes_prefix += project_notes + "\n\n"
         if memory_notes:
             notes_prefix += memory_notes + "\n\n"
+        if micro_notes:
+            notes_prefix += micro_notes + "\n\n"
         if todo_notes:
             notes_prefix += todo_notes + "\n\n"
         if getattr(self.cfg, "allow_mcp", False):

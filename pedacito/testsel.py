@@ -215,6 +215,11 @@ def run_command(root, cfg, command: str, timeout: int | None = None
         return False, f"could not run `{command}`: {out}"
     if stopped:
         return False, f"`{command}` was stopped ({stopped}) after {timeout}s\n{out}"
+    try:
+        from . import memory
+        memory.observe_command(root, command, rc == 0, cfg, kind="test")
+    except Exception:
+        pass
     return rc == 0, out
 
 

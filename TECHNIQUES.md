@@ -53,7 +53,9 @@ bounds consecutive gather steps that neither add a new unread line span to
 the read ledger nor resolve a new symbol — a run of greps, a run of errors,
 and a run of identical steps all count alike. Whichever ceiling trips first
 ends gather cleanly with a harness note appended to the conversation, and the
-run moves on to the answer phase with what was gathered.
+run moves on to the answer phase with what was gathered. One step before the
+no-progress lease trips, a single high-salience loop-guard redirect names a
+different strategy first (§16); the hard ceiling is unchanged.
 
 Gather also carries a free **requirement evidence state machine**. Each task
 clause is tracked from its first mention to its closing evidence: an edit
@@ -392,6 +394,120 @@ nondeterministic hydration; candidate-first RRF buys by-meaning search
 without the N-embedding bill it used to cost; skeletons buy a map of a giant
 unit at ~7% of its tokens, replacing "read page 1 of 3" hunts with one
 targeted read.
+
+### 13. A deterministic inspection toolkit: `outline`, `usages`, `git_diff`
+
+Three additions to the gather action set target the most token-expensive
+small-model habits: reading a whole file to find its shape, running several
+blind greps to find callers, and asking for a free-form review of work it
+cannot see.
+
+- **`outline` is a compact table of contents.** It renders one line per
+  class, function and method with the exact `[start-end]` range, no bodies and
+  no docstrings: `class Server [4-9]`, `def start(self) [5-6]`. A whole-class
+  chunk is expanded from the Python AST so its methods still get exact ranges;
+  a directory or glob keeps the existing file-card view. The output comes
+  entirely from the chunker/AST index — no model call, no source read — so a
+  several-hundred-line file arrives as a short map that tells the model
+  exactly which lines to `read` next.
+- **`usages` is one-step cross-reference.** Given a symbol, it joins the call
+  graph, the resolved import graph and the persisted lexical sidecar, then
+  reports deduplicated exact `file:line` call sites and import lines. It
+  handles methods (`Store.get`) and module-level names, caps the result, and
+  marks the evidence as name-based so the model still reads before editing.
+  One `usages` step replaces the several blind `grep` calls a small model
+  otherwise spends on the same question.
+- **`git_diff` is read-only working-tree inspection.** It runs
+  `git status --short` plus a bounded `git diff` (staged and unstaged, against
+  `HEAD` when one exists) and caps the diff by `max_read_tokens`; an optional
+  `file` narrows both. It is distinct from `diff` (Pedacito's own pre-write
+  snapshots) and from `git` (general read-only history), and it gives the
+  model immediate evidence when the task says "review" or "fix recent work".
+
+All three are navigation-only, deterministic and bounded. `outline` and
+`usages` are in the always-on core; `git_diff` is optional and can be pruned
+by the rule in §15. `git_diff` is offered only in a git repository and obeys
+`allow_git`.
+
+### 14. Repository micro-facts with contradiction retirement
+
+Adapted from Microsoft Research's **TokenEconomizer** Micro-Skills: a session
+should not pay a model call to rediscover facts the harness can observe for
+free. Pedacito keeps the environment/command slice of that idea in
+`.pedacito/micro_facts.json`:
+
+```json
+{"fact_id": "cmd:…", "text": "Use `python -m pytest -q` here.",
+ "confirmations": 2, "contradictions": 0, "last_seen": 1712345678.0}
+```
+
+- **Promotion.** Every command whose outcome the harness sees (`run`,
+  impacted tests, post-edit checks, `auto --verify`) is recorded as pending.
+  It is promoted to a confirmed fact when it succeeds after an earlier
+  failure, or when it succeeds across at least two runs. This is exactly the
+  `pytest` vs `python -m pytest` case, a required flag, or a working linter
+  invocation: the truth is measured, never inferred by a model.
+- **Injection.** Confirmed facts are rendered into the stable session prefix
+  at task start (the system prompt, and the rebuild answer prompt), ordered by
+  confirmation count, capped by `max_micro_fact_tokens` (default ~150 tokens)
+  and labelled as hints. Repeating facts cost no extra model calls and sit in
+  the cached prefix.
+- **Contradiction retirement.** If a later run executes a stored command and
+  it fails, the fact's `contradictions` count is incremented and the fact is
+  moved out of the active list into `retired` immediately. It is never
+  injected again; a fresh promotion has to earn its place. Stale environment
+  advice therefore cannot outlive the run that disproved it.
+
+The file is deterministic JSON under `.pedacito/`, so it can be inspected,
+edited or deleted like the rest of the harness state. `micro_facts = false`
+turns recording and injection off.
+
+### 15. Dynamic tool schema pruning
+
+A 4B–9B model chooses worse when every optional tool definition is in front
+of it on every turn. Pedacito now tracks per-repository usage in
+`.pedacito/tool_stats.json` (`tasks`, `uses`, `last_task` per action) and
+prunes the prompt schema deterministically:
+
+- **Core actions never disappear:** `read`, `grep`, `find`, `callers`,
+  `context`, `outline`, `usages`, `sessions`, `todo` and `done`.
+- **Config-disabled actions are already omitted**, as before.
+- **An enabled optional action is pruned** once it has gone unused for
+  `tool_prune_after_tasks` (default 10) repository tasks *and* the current
+  task text contains none of its trigger words: no URL/`http`/`web` for
+  `fetch`, no `git`/`uncommitted`/`diff`/`review` for `git_diff`, no
+  `lsp`/language-server wording for `lsp`, no `subagent`/`delegate`/`research`
+  for `task`, and so on. A trigger word brings it back for that task; a recent
+  use keeps it active regardless of the prompt.
+- **The help text follows the schema.** `prompts.tool_help` lists only the
+  actions `schema_for` actually offers, so pruning removes both the tool
+  definition and its prose advice. That matters most in native tool mode,
+  where the definition is sent verbatim, and for models that imitate nearby
+  tool descriptions.
+
+`dynamic_tool_pruning = false` restores the full enabled schema. The stats are
+local, small and per repository; nothing is sent to a server.
+
+### 16. Pre-lease loop-guard redirects
+
+TokenEconomizer's Loop Guard stops a trajectory from repeating the same
+failing strategy forever. Pedacito already has the hard lease
+(`max_no_progress_steps`, §1); this adds its one-shot pre-lease redirect
+(`r = 1`):
+
+- When the no-progress streak reaches `max_no_progress_steps - 1` — one step
+  before hard termination — the harness appends a single high-salience
+  `[LOOP GUARD: …]` observation to the conversation. It names the number of
+  unproductive steps, forbids repeating the previous search/lookup strategy,
+  and suggests a different tool (`outline`/`usages`) on an unread requirement
+  target or an immediate `done`.
+- It fires **at most once per turn**. The message is appended at the tail,
+  never written into cached history, and costs no extra model call; the model
+  simply gets one last chance to change strategy before the existing lease
+  ends gather cleanly.
+- The redirect does not weaken the bound: if the next step still adds no new
+  source line and resolves no new symbol, the normal no-progress note fires
+  and the run moves to the answer phase with what it already gathered.
 
 ---
 

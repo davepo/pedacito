@@ -251,3 +251,87 @@ def tool_git(index, cfg, args: str) -> str:
 def _paths(rest: list[str]) -> list[str]:
     paths = [a for a in rest if _SAFE_ARG_RE.match(a) and not a.startswith("-")]
     return ["--"] + paths if paths else []
+
+
+def tool_git_diff(index, cfg, file: str = "") -> str:
+    """`git_diff`: `git status --short` plus a bounded working-tree diff.
+
+    Read-only by construction (status/diff only), fast, and capped by
+    cfg.max_read_tokens. With a `file`, both status and diff are narrowed to
+    it. HEAD's absence (a new repo) is handled with the index-vs-worktree
+    diffs instead of failing.
+    """
+    from . import fileio
+    root = Path(index.root)
+    if not getattr(cfg, "allow_git", True):
+        return "ERROR: `git_diff` is disabled (allow_git = false)."
+    if shutil.which("git") is None:
+        return "ERROR: git is not installed."
+    if not is_repo(root):
+        return "ERROR: this project is not a git repository."
+    raw = str(file or "").strip()
+    rel = ""
+    if raw:
+        norm = fileio.normalise_rel(raw)
+        norm = index.resolve_file(norm) or norm
+        try:
+            cand = Path(norm)
+            if not cand.is_absolute():
+                cand = root / cand
+            rel = cand.resolve().relative_to(root.resolve()).as_posix()
+        except (OSError, ValueError):
+            return f"ERROR: refusing to diff outside the project root: {raw}"
+
+    path_args = ["--", rel] if rel else []
+    rc, status = _git(root, "status", "--short", *path_args)
+    if rc != 0:
+        return "ERROR: `git status --short` failed."
+    status = status.strip()
+
+    diff_args = ["diff", "--no-color", "-U3"]
+    if head(root):
+        diff_args.append("HEAD")
+    diff_args += path_args
+    _rc, diff = _git(root, *diff_args, timeout=15)
+    if not head(root):
+        # No commit to compare against: include staged and unstaged changes.
+        _rc2, cached = _git(root, "diff", "--cached", "--no-color", "-U3",
+                            *path_args, timeout=15)
+        diff = "\n".join(x for x in (diff.strip(), cached.strip()) if x)
+
+    cap = max(400, int(getattr(cfg, "max_read_tokens", 1200) or 1200) * 3.5)
+    status_lines = status.splitlines()
+    status_note = ""
+    if len(status_lines) > 60:
+        total_status = len(status_lines)
+        status_lines = status_lines[:60]
+        status_note = f"[status truncated to 60 of {total_status} lines]"
+    status = "\n".join(status_lines)
+    diff = diff.strip()
+    diff_note = ""
+    if len(diff) > cap:
+        cut = diff[:int(cap)]
+        nl = cut.rfind("\n")
+        if nl > cap // 2:
+            cut = cut[:nl]
+        diff = cut
+        diff_note = (f"\n[diff capped at ~{int(getattr(cfg, 'max_read_tokens', 1200) or 1200)} "
+                     "tokens; pass file=<path> for one file]")
+    if not status and not diff:
+        return ("GIT WORKING TREE (read-only): no uncommitted changes"
+                + (f" in {rel}." if rel else "."))
+    out = ["GIT WORKING TREE (read-only)",
+           "STATUS (git status --short):",
+           status or "(clean)",]
+    if status_note:
+        out.append(status_note)
+    out.append("DIFF (staged + unstaged"
+               + (" vs HEAD" if head(root) else "")
+               + "):")
+    out.append(diff or "(no tracked diff; untracked files are listed in "
+                       "STATUS)")
+    if diff_note:
+        out.append(diff_note)
+    out.append("[Read-only working-tree evidence; `read` a file before "
+               "editing it.]")
+    return "\n".join(out)

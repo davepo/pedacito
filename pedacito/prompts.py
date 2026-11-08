@@ -82,11 +82,13 @@ def _compact_tool_help(cfg) -> str:
         "grep": "grep pattern [file] - find text; hits say WHERE only",
         "find": "find pattern - search definitions by name/summary",
         "callers": "callers symbol - who calls it, and what it affects",
-        "outline": "outline file - units of a file, or files of a directory",
+        "outline": "outline file - compact TOC with exact line ranges",
+        "usages": "usages symbol - exact call sites + imports, deduped to file:line",
         "context": "context symbol - definition + callers + callees + tests in one reply",
         "sessions": "sessions [pattern] - earlier task logs",
         "diff": "diff [file] - changes since the last snapshot",
         "git": "git pattern - read-only git (status, log, diff, show, blame)",
+        "git_diff": "git_diff [file] - status + bounded uncommitted diff",
         "diagnose": "diagnose [file] - run the linter",
         "todo": "todo content - short '- [ ]' checklist",
         "remember": "remember content - save one durable fact about this project",
@@ -164,8 +166,14 @@ _EXTRA_BULLETS = (
     ("task", "- `task` hands a bounded read-only research question to a "
              "helper with a fresh window; it returns a short digest. Use it "
              "to trace a long call chain, not for simple reads."),
+    ("usages", "- `usages` returns every exact call site and import of a "
+               "symbol, deduplicated to file:line, in one step -- use it "
+               "instead of several blind grep calls."),
     ("git", "- `git` runs read-only git (status, log, diff, show, blame) -- "
             "`blame`/`log` on a file explain why code looks the way it does."),
+    ("git_diff", "- `git_diff` shows `git status --short` plus a bounded "
+                 "uncommitted diff (staged + unstaged); use it first when the "
+                 "task says review or fix recent work."),
     ("question", "- `question` asks the USER one short question with 2-3 "
                  "numbered options. Use it ONLY when the task is genuinely "
                  "ambiguous (several plausible files, no acceptance "

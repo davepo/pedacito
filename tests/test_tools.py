@@ -65,14 +65,15 @@ def _index(tmp_path: Path, files: dict[str, str] | None = None) -> Index:
 def test_schema_hides_disabled_actions_and_fields():
     plain = tools.schema_for(Config())
     assert plain["properties"]["action"]["enum"] == [
-        "read", "grep", "find", "callers", "context", "outline", "sessions",
-        "todo", "diff", "git", "remember", "skill", "done"]
+        "read", "grep", "find", "callers", "context", "outline", "usages",
+        "sessions", "todo", "diff", "git", "git_diff", "remember", "skill",
+        "done"]
     # a tiny pack keeps the small core (+ context) and never sees the rest
     tiny = Config()
     tiny.prompt_pack = "tiny"
     assert tools.schema_for(tiny)["properties"]["action"]["enum"] == [
-        "read", "grep", "find", "callers", "context", "outline", "sessions",
-        "todo", "diff", "done"]
+        "read", "grep", "find", "callers", "context", "outline", "usages",
+        "sessions", "todo", "diff", "done"]
     # `content` stays because the always-available todo action uses it.
     assert "content" in plain["properties"]
     assert "to" not in plain["properties"]

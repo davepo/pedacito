@@ -1,11 +1,12 @@
-"""The agent's tool surface: read, grep, callers, outline, sessions, diff, write/append, run, screenshot, browser, done.
+"""The agent's tool surface: read, grep, callers, outline, usages, sessions, diff, git_diff, write/append, run, screenshot, browser, done.
 
     step = client.chat_json(messages, STEP_SCHEMA, max_tokens=700)
     observation = dispatch(index, cfg, step)
 
 The set is deliberately small: local models start calling the wrong tool or
 inventing arguments beyond roughly half a dozen. Navigation tools (read, grep,
-callers, outline, sessions, diff, done) are always on; everything destructive
+callers, outline, usages, sessions, diff, git_diff, done) are always on unless
+dynamic pruning removes a stale optional tool; everything destructive
 or machine-visible is gated by config: `write`/`append`/`move`/`delete` need
 `allow_write`, `run`/`diagnose` need `allow_shell`, `screenshot` needs
 `allow_screenshots`, `browser` needs `allow_browser` (launching a command also
@@ -66,10 +67,16 @@ callers  - who calls a symbol, with the call sites, plus the files and tests
 context  - one reply with a definition's source, its class header, the
             signatures it calls, its callers and its tests. args: symbol
             (or file, for a file's card, importers and tests)
-outline  - list every unit in one file, or the file cards in one directory.
-           args: file (a path, a symbol, or a directory/glob)
+outline  - compact table of contents: every class, method and function in one
+           file with its exact start-end line numbers, bodies omitted. A
+           directory/glob lists file cards instead. args: file (a path, a
+           symbol, or a directory/glob)
+usages   - exact call sites and imports of a symbol across the repository,
+           deduplicated to file:line, in one step. args: symbol
 sessions - list/search what prior runs did.  args: pattern, optional file
 diff     - what changed since Pedacito's last snapshot. args: optional file
+git_diff - read-only `git status --short` plus a bounded working-tree diff
+           (staged + unstaged) capped by max_read_tokens. args: optional file
 diagnose - run the project's detected linter/typechecker. args: optional file
 todo     - replace the task checklist shown in later prompts. args: content
            (one "- [ ]" / "- [x]" line per step; keep it short)
@@ -134,7 +141,8 @@ STEP_SCHEMA = {
         "action": {
             "type": "string",
             "enum": ["read", "grep", "find", "callers", "context", "outline",
-                     "sessions", "diff", "git", "diagnose", "write", "append",
+                     "usages", "sessions", "diff", "git", "git_diff",
+                     "diagnose", "write", "append",
                      "move", "delete", "rename", "run", "screenshot", "browser",
                      "todo",
                      "remember", "skill", "task", "fetch", "question", "mcp",
@@ -144,9 +152,9 @@ STEP_SCHEMA = {
                  "description": "For read/write/append/move/delete/undo. For "
                                 "outline, a file OR a directory/glob. For "
                                 "grep, optionally a file, directory, or glob. "
-                                "For diff, optionally one file. For screenshot/"
-                                "browser, an older screenshot to compare. Empty "
-                                "otherwise.",
+                                "For diff or git_diff, optionally one file. For "
+                                "screenshot/browser, an older screenshot to "
+                                "compare. Empty otherwise.",
                  "maxLength": 200},
         "start": {"type": "integer",
                   "description": "For read, or screenshot/browser wait seconds. "
@@ -172,7 +180,8 @@ STEP_SCHEMA = {
                     # refuses to dispatch a payload arriving at exactly its cap.
                     "maxLength": 2000},
         "symbol": {"type": "string",
-                   "description": "For callers/context/rename (old name); or for read when file "
+                   "description": "For callers/context/usages/rename (old "
+                                  "name); or for read when file "
                                   "is empty (reads that definition). For "
                                   "skill: the skill name. For mcp: "
                                   "server/tool, or server to list its tools. "
@@ -224,11 +233,86 @@ RUN_ACTION = "run"
 SCREENSHOT_ACTION = "screenshot"
 BROWSER_ACTION = "browser"
 DIFF_ACTION = "diff"
+GIT_DIFF_ACTION = "git_diff"
+USAGES_ACTION = "usages"
 DIAGNOSE_ACTION = "diagnose"
 TODO_ACTION = "todo"
 MCP_ACTION = "mcp"
 WRITE_ACTIONS = (WRITE_ACTION, APPEND_ACTION)
 MUTATING_ACTIONS = WRITE_ACTIONS + (MOVE_ACTION, DELETE_ACTION, UNDO_ACTION)
+
+# Always-on navigation actions. Dynamic tool pruning never removes these:
+# a small model must always be able to read, locate, outline and check usages.
+CORE_ACTIONS = frozenset({
+    "read", "grep", "find", "callers", "context", "outline", "usages",
+    "sessions", "todo", "done",
+})
+
+# Optional/specialized actions and the prompt words that justify keeping
+# them even when the repository's stats call them unused. Matching is
+# case-insensitive. An action absent here is never auto-pruned.
+_PRUNE_TRIGGERS = {
+    "diff": re.compile(r"\b(diff|snapshot|uncommitted|working tree|"
+                       r"recent change|what changed|review)\b", re.I),
+    "git": re.compile(r"\b(git|commit|branch|history|blame|log|checkout|"
+                      r"merge|rebase)\b", re.I),
+    GIT_DIFF_ACTION: re.compile(r"\b(git|uncommitted|diff|working tree|"
+                                 r"staged|commit|review|recent change|"
+                                 r"what changed)\b", re.I),
+    "diagnose": re.compile(r"\b(lint|linter|typecheck|type check|diagnose|"
+                           r"diagnostic|ruff|mypy|pyflakes|flake8)\b", re.I),
+    "run": re.compile(r"\b(run|test|tests|pytest|build|execute|command|"
+                      r"make|npm|cargo|go test)\b", re.I),
+    "serve": re.compile(r"\b(serve|server|port|localhost|dev server|"
+                        r"background process)\b", re.I),
+    "remember": re.compile(r"\b(remember|memory|convention|landmine|note)\b",
+                           re.I),
+    "skill": re.compile(r"\b(skill|procedure|playbook|workflow)\b", re.I),
+    "task": re.compile(r"\b(subagent|sub-agent|delegate|research|"
+                       r"helper agent)\b", re.I),
+    "fetch": re.compile(r"(https?://|www\.|\b(url|web|website|fetch|"
+                        r"download|http|endpoint)\b)", re.I),
+    "question": re.compile(r"\b(question|clarify|ambiguous|ask the user)\b",
+                           re.I),
+    "mcp": re.compile(r"\b(mcp|external tool|model context protocol)\b", re.I),
+    "lsp": re.compile(r"\b(lsp|language server|go to definition|references|"
+                      r"hover|diagnostics)\b", re.I),
+    "screenshot": re.compile(r"\b(screenshot|screen capture|capture the "
+                             r"screen|desktop)\b", re.I),
+    "browser": re.compile(r"\b(browser|web page|website|url|http|localhost|"
+                          r"headless|chromium)\b", re.I),
+}
+
+
+def _prune_optional_actions(cfg, actions: list[str]) -> list[str]:
+    """Drop enabled-but-stale optional actions from the prompt schema.
+
+    A tool is pruned only when dynamic_tool_pruning is on, the repository has
+    reached the task threshold, the tool has gone unused that long, and the
+    current task text contains none of its trigger words. Core actions are
+    never candidates; config-disabled actions are already absent.
+    """
+    if not getattr(cfg, "dynamic_tool_pruning", True):
+        return actions
+    root = getattr(cfg, "_root", None)
+    if not root:
+        return actions
+    threshold = max(1, int(getattr(cfg, "tool_prune_after_tasks", 10) or 10))
+    prompt = str(getattr(cfg, "_task_text", "") or "")
+    from . import memory
+    kept: list[str] = []
+    for action in actions:
+        if action in CORE_ACTIONS or action not in _PRUNE_TRIGGERS:
+            kept.append(action)
+            continue
+        if memory.tool_unused_tasks(root, action) < threshold:
+            kept.append(action)
+            continue
+        if _PRUNE_TRIGGERS[action].search(prompt):
+            kept.append(action)
+            continue
+        # stale and untriggered: omit its schema and its help entry
+    return kept
 
 
 def _skills_exist(cfg) -> bool:
@@ -261,6 +345,7 @@ _FIELD_ACTION_FRAGMENTS = {
         (("outline",), "For outline, a file OR a directory/glob."),
         (("grep",), "For grep, optionally a file, directory, or glob."),
         (("diff",), "For diff, optionally one file."),
+        (("git_diff",), "For git_diff, optionally one file."),
         (("screenshot", "browser"),
          "For screenshot/browser, an older screenshot to compare."),
     ],
@@ -282,8 +367,8 @@ _FIELD_ACTION_FRAGMENTS = {
          "compact or aggregated JSON."),
     ],
     "symbol": [
-        (("callers", "context", "rename"),
-         "For callers/context/rename (old name);"),
+        (("callers", "context", "usages", "rename"),
+         "For callers/context/usages/rename (old name);"),
         (("read",), "or for read when file is empty (reads that definition)."),
         (("skill",), "For skill: the skill name."),
         (("mcp",), "For mcp: server/tool, or server to list its tools."),
@@ -344,12 +429,12 @@ def schema_for(cfg) -> dict:
     tiny = pack == "tiny"
     actions = ["read", "grep", "find", "callers"]
     actions.append("context")
-    actions += ["outline", "sessions", "todo"]
+    actions += ["outline", "usages", "sessions", "todo"]
     if getattr(cfg, "allow_diff", True):
         actions.append("diff")
     if getattr(cfg, "allow_git", True) and not tiny \
             and getattr(cfg, "_is_git", True):
-        actions.append("git")
+        actions += ["git", GIT_DIFF_ACTION]
     if getattr(cfg, "allow_shell", False):
         actions += ["run", "diagnose"]
     if getattr(cfg, "allow_serve", False):
@@ -379,6 +464,7 @@ def schema_for(cfg) -> dict:
     if getattr(cfg, "allow_lsp", False):
         actions.append("lsp")
     actions.append("done")
+    actions = _prune_optional_actions(cfg, actions)
 
     schema = copy.deepcopy(STEP_SCHEMA)
     schema["properties"]["action"]["enum"] = actions
@@ -1439,6 +1525,145 @@ def tool_callers(index, symbol: str) -> str:
     return "\n".join(out)
 
 
+_USAGES_MAX_SITES = 40
+_USAGES_MAX_IMPORTS = 20
+_USAGES_MAX_CANDIDATES = 250
+
+
+def _importish(line: str) -> bool:
+    return bool(re.match(r"^\s*(from\s+\S+\s+)?import\s+", line))
+
+
+def _definition_line(line: str, base: str) -> bool:
+    return bool(re.match(
+        r"^\s*(async\s+)?(def|class)\s+" + re.escape(base) + r"\b", line))
+
+
+def tool_usages(index, cfg, symbol: str) -> str:
+    """Every exact call site and import of `symbol`, deduplicated to
+    `file:line`, from the call graph, resolved import graph, and the persisted
+    lexical sidecar. One step replaces several blind grep calls."""
+    raw = _as_text(symbol).strip()
+    if not raw:
+        return ("ERROR: `usages` needs a symbol: a function, method or class "
+                "name (e.g. `Store.get`).")
+    base = raw.split(".")[-1]
+    defs = index.find_symbol(raw)
+    def_keys = {(c.file, c.start) for c in defs}
+    def_files = sorted({c.file for c in defs})
+    try:
+        from .chunker import split_ident
+        tokens = set(split_ident(base))
+    except Exception:
+        tokens = set()
+    if not tokens:
+        tokens = {base.lower()}
+
+    # Call-graph candidates plus units whose persisted lexical sidecar names
+    # the symbol (catches a call in a file the coarse call list missed).
+    candidates: dict[tuple[str, int], object] = {}
+    for c in index.callers_of(raw):
+        candidates[(c.file, c.start)] = c
+    scanned = 0
+    for c in index.chunks:
+        if scanned >= _USAGES_MAX_CANDIDATES:
+            break
+        scanned += 1
+        if (c.file, c.start) in candidates or (c.file, c.start) in def_keys:
+            continue
+        if tokens & set(c.lex or ()):
+            candidates[(c.file, c.start)] = c
+
+    # Files that import a defining file, plus lexical candidates (an import
+    # line may be in a module chunk that the call graph never links).
+    import_files: set[str] = set()
+    for rel in def_files:
+        try:
+            import_files.update(index.graph.importers_of(rel))
+        except Exception:
+            pass
+    import_files.update(c.file for _key, c in candidates.items())
+    stems = {Path(rel).stem for rel in def_files}
+    modules = {Path(rel).with_suffix("").as_posix().replace("/", ".")
+               for rel in def_files}
+    stems.discard("__init__")
+
+    call_rx = re.compile(r"(?<![\w])" + re.escape(base) + r"\s*\(")
+    call_sites: list[tuple[str, int, str]] = []
+    imports: list[tuple[str, int, str]] = []
+    seen_calls: set[tuple[str, int]] = set()
+    seen_imports: set[tuple[str, int]] = set()
+
+    for (rel, _start), c in sorted(candidates.items(),
+                                   key=lambda kv: (kv[0][0], kv[0][1])):
+        if (rel, c.start) in def_keys:
+            continue
+        try:
+            lines = fileio.read_lines_cached(Path(index.root) / rel)
+        except OSError:
+            continue
+        for n in range(max(1, c.start), min(c.end, len(lines)) + 1):
+            line = lines[n - 1]
+            stripped = line.strip()
+            if _importish(line):
+                if ((rel, n) not in seen_imports
+                        and (base in line or any(s and s in line
+                                                 for s in stems))):
+                    imports.append((rel, n, stripped[:180]))
+                    seen_imports.add((rel, n))
+                continue
+            if _definition_line(line, base):
+                continue
+            if ((rel, n) not in seen_calls and call_rx.search(line)):
+                call_sites.append((rel, n, stripped[:180]))
+                seen_calls.add((rel, n))
+
+    for rel in sorted(import_files):
+        try:
+            lines = fileio.read_lines_cached(Path(index.root) / rel)
+        except OSError:
+            continue
+        for n, line in enumerate(lines, 1):
+            if (rel, n) in seen_imports or not _importish(line):
+                continue
+            if not (base in line or any(s and s in line for s in stems)
+                    or any(m and m in line for m in modules)):
+                continue
+            imports.append((rel, n, line.strip()[:180]))
+            seen_imports.add((rel, n))
+
+    call_sites.sort(key=lambda t: (t[0], t[1]))
+    imports.sort(key=lambda t: (t[0], t[1]))
+    if not defs and not call_sites and not imports:
+        return (f"No definition, call site or import found for '{raw}' in the "
+                f"indexed files. Try `grep` for the exact spelling or `find` "
+                f"for a shorter name fragment.")
+    out = [f"USAGES {raw}" + (f" -- defined at "
+                              + ", ".join(f"{c.file}:{c.start}-{c.end}"
+                                          for c in defs[:5])
+                              if defs else " -- no indexed definition")]
+    if call_sites:
+        out.append(f"Call sites ({len(call_sites)}"
+                   + (f", showing {_USAGES_MAX_SITES}"
+                      if len(call_sites) > _USAGES_MAX_SITES else "") + "):")
+        for rel, n, text in call_sites[:_USAGES_MAX_SITES]:
+            out.append(f"  {rel}:{n}  {text}")
+    else:
+        out.append("Call sites: none found.")
+    if imports:
+        out.append(f"Imports ({len(imports)}"
+                   + (f", showing {_USAGES_MAX_IMPORTS}"
+                      if len(imports) > _USAGES_MAX_IMPORTS else "") + "):")
+        for rel, n, text in imports[:_USAGES_MAX_IMPORTS]:
+            out.append(f"  {rel}:{n}  {text}")
+    else:
+        out.append("Imports: none found.")
+    if call_sites or imports:
+        out.append("[Name-based evidence from the call/import graph and lexical "
+                   "sidecar; `read` a call site before editing.]")
+    return "\n".join(out)
+
+
 def _impact_lines(index, rel: str, depth: int = 2, limit: int = 8) -> list[str]:
     """`Likely affected` files (transitive importers/callers) and tests for a
     change to `rel`: blast radius in four lines, marked as evidence."""
@@ -1620,9 +1845,66 @@ def _render_find(index, raw: str, scored: list) -> str:
     return "\n".join(out)
 
 
+_OUTLINE_MAX_ROWS = 120
+
+
+def _compact_member_rows(index, rel: str, chunk) -> list[str]:
+    """Method rows for a whole-class chunk. Python gets exact AST ranges;
+    other languages fall back to the chunker's member names (still a useful
+    map, just without per-method lines)."""
+    if not chunk.members:
+        return []
+    try:
+        from .chunker import _first_line, _signature
+        src = (Path(index.root) / rel).read_text(encoding="utf-8",
+                                                 errors="replace")
+        tree = ast.parse(src)
+        target = next(
+            (n for n in tree.body
+             if isinstance(n, ast.ClassDef) and _first_line(n) == chunk.start),
+            None)
+        if target is not None:
+            rows = [f"  {_signature(n)} [{_first_line(n)}-{n.end_lineno}]"
+                    for n in target.body
+                    if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))]
+            if rows:
+                return rows
+    except (OSError, SyntaxError, ValueError, TypeError):
+        pass
+    return [f"  {name}()" for name in chunk.members]
+
+
+def _compact_outline(index, rel: str) -> str:
+    """A table-of-contents view: class/function/method signatures with exact
+    `[start-end]` line numbers and no bodies or docstrings."""
+    if index.is_reference(rel):
+        return index.render_outline(rel)
+    rows = [f"### {rel}"]
+    units = index.in_file(rel)
+    for c in units:
+        if len(rows) >= _OUTLINE_MAX_ROWS:
+            rows.append(f"[+{len(units) - (len(rows) - 1)} more units; "
+                        "read the file or narrow the request]")
+            break
+        if c.kind == "module":
+            rows.append(f"  module [{c.start}-{c.end}]")
+        elif c.kind == "classheader":
+            rows.append(f"{c.signature} [{c.start}-{c.scope_end or c.end}]")
+        elif c.kind == "class":
+            rows.append(f"{c.signature} [{c.start}-{c.end}]")
+            rows.extend(_compact_member_rows(index, rel, c))
+        elif c.kind in ("function", "method"):
+            indent = "  " if c.kind == "method" else ""
+            rows.append(f"{indent}{c.signature} [{c.start}-{c.end}]")
+        elif c.kind == "reference":
+            rows.append(f"  {c.signature} [{c.start}-{c.end}]")
+    return "\n".join(rows[: _OUTLINE_MAX_ROWS + 1])
+
+
 def tool_outline(index, cfg, file: str) -> str:
-    """Return every unit in one file with its signature and line range, or,
-    when `file` names a directory or glob, the file cards under it."""
+    """Return a compact table of contents for one file (classes, methods and
+    functions with exact start-end lines), or, when `file` names a directory
+    or glob, the file cards under it."""
     file = _as_text(file)
     rel = index.resolve_file(file)
     if rel is None:
@@ -1648,7 +1930,7 @@ def tool_outline(index, cfg, file: str) -> str:
                     return _outline_dir(index, name, matches)
     if rel is None:
         return _file_hint(index, file)
-    return index.render_outline(rel)
+    return _compact_outline(index, rel)
 
 
 # Bounds for `outline <directory>`.
@@ -2510,6 +2792,21 @@ def tool_run(index, cfg, command: str) -> str:
     if stopped == "error":
         return f"ERROR: could not run command: {out}"
 
+    # TokenEconomizer micro-facts: only a bounded, finished execution is
+    # evidence. A GUI/server stopped for idleness or a timeout says nothing
+    # about whether the command is the project's test/lint command.
+    if stopped not in ("idle", "timeout"):
+        try:
+            from . import memory
+            low = cmd.lower()
+            kind = "test" if any(w in low for w in
+                                 ("pytest", "test", "npm run", "cargo test",
+                                  "go test", "tox", "nox", "rspec")) \
+                else "command"
+            memory.observe_command(index.root, cmd, rc == 0, cfg, kind=kind)
+        except Exception:
+            pass
+
     # A command can rewrite source; refresh the index so line ranges stay valid.
     try:
         from . import index as index_mod
@@ -2901,6 +3198,12 @@ def dispatch(index, cfg, step: dict, client=None) -> str:
     if not isinstance(step, dict):
         return f"ERROR: malformed step (expected an object, got {type(step).__name__})."
     action = _as_text(step.get("action")).strip()
+    if action:
+        try:
+            from . import memory
+            memory.record_tool_use(index.root, action, cfg)
+        except Exception:
+            pass
     if action == "read":
         return tool_read(index, cfg, step.get("file", ""),
                          step.get("start", 1), step.get("end", 0),
@@ -2912,12 +3215,17 @@ def dispatch(index, cfg, step: dict, client=None) -> str:
         return tool_find(index, step.get("pattern", ""))
     if action == "callers":
         return tool_callers(index, step.get("symbol", ""))
+    if action == USAGES_ACTION:
+        return tool_usages(index, cfg, step.get("symbol", ""))
     if action == "context":
         return tool_context(index, cfg, step.get("symbol", ""),
                             step.get("file", ""))
     if action == "git":
         from . import gitinfo
         return gitinfo.tool_git(index, cfg, step.get("pattern", ""))
+    if action == GIT_DIFF_ACTION:
+        from . import gitinfo
+        return gitinfo.tool_git_diff(index, cfg, step.get("file", ""))
     if action == "remember":
         from . import memory
         return memory.tool_remember(index, cfg, step.get("content", ""))
