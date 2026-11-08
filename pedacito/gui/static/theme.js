@@ -1,6 +1,7 @@
 // Applied before first paint so a saved theme/layout does not flash.
 // The default scheme is "slate" (GitHub Dark), carried by :root with no
-// attribute; older theme names remain aliases in app.css.
+// attribute; the old alias names are gone, so an unknown saved value simply
+// falls back to that default.
 (function () {
   try {
     var t = localStorage.getItem('pedacito_theme');

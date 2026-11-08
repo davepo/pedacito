@@ -1,9 +1,11 @@
 /* pedacito gui -- one file, no external assets, works offline.
-   Five crisp schemes, three dark and two light. The default (no attribute, or
-   data-theme="slate") is GitHub Dark; the older names are kept as aliases so
-   a saved preference still resolves to a clean palette. theme.js applies the
-   attribute before first paint; --left / --right / --term-h size the split
-   workspace and are restored from localStorage. */
+   Nine crisp schemes: five clean modern ones (three dark, two light) plus
+   four high-craft 1990s palettes (two dark, two light). The default (no
+   attribute, or data-theme="slate") is GitHub Dark. The legacy alias names
+   (mocha, sage, parchment, clay, nightshade) are gone; a saved preference
+   carrying one of them simply falls back to that default. theme.js applies
+   the attribute before first paint; --left / --right / --term-h size the
+   split workspace and are restored from localStorage. */
 
 /* Slate -- GitHub Dark (the default) */
 :root, html[data-theme="slate"] {
@@ -43,9 +45,8 @@ html[data-theme="light"] {
   --shadow: 0 8px 24px rgba(31, 35, 40, .14);
   color-scheme: light;
 }
-/* Daylight / Parchment / Clay -- warm paper light */
-html[data-theme="daylight"], html[data-theme="parchment"],
-html[data-theme="clay"] {
+/* Daylight -- warm paper light */
+html[data-theme="daylight"] {
   --bg: #fcfaf2; --panel: #f3efe2; --panel2: #f8f5ea; --panel3: #ebe5d5;
   --line: #ddd5c3; --line2: #c3b8a2;
   --text: #1c1e21; --muted: #6b665a; --soft: #efe9db;
@@ -61,9 +62,8 @@ html[data-theme="clay"] {
   --shadow: 0 8px 24px rgba(70, 55, 25, .16);
   color-scheme: light;
 }
-/* Nord / Mocha / Sage -- Catppuccin-style modern dark */
-html[data-theme="nord"], html[data-theme="mocha"],
-html[data-theme="sage"] {
+/* Nord -- Catppuccin-style modern dark */
+html[data-theme="nord"] {
   --bg: #181825; --panel: #1e1e2e; --panel2: #24243a; --panel3: #2a2a40;
   --line: #313244; --line2: #45475a;
   --text: #cdd6f4; --muted: #a6adc8; --soft: #292940;
@@ -79,8 +79,8 @@ html[data-theme="sage"] {
   --shadow: 0 8px 24px rgba(0, 0, 0, .5);
   color-scheme: dark;
 }
-/* Midnight / Nightshade -- high-contrast dark */
-html[data-theme="midnight"], html[data-theme="nightshade"] {
+/* Midnight -- high-contrast dark */
+html[data-theme="midnight"] {
   --bg: #05070a; --panel: #0f141c; --panel2: #151c26; --panel3: #1b2430;
   --line: #3b4659; --line2: #55637a;
   --text: #ffffff; --muted: #aab6c8; --soft: #1a2330;
@@ -95,6 +95,117 @@ html[data-theme="midnight"], html[data-theme="nightshade"] {
   --ansi-6: #22d3ee; --ansi-7: #ffffff;
   --shadow: 0 8px 28px rgba(0, 0, 0, .7);
   color-scheme: dark;
+}
+
+/* ------------------------------------------------------------- 1990s -------
+   Four high-craft retro schemes (Sprint E). Each carries the complete
+   variable palette so chat, code blocks, forms and the terminal stay at
+   WCAG text contrast, plus a thin geometric accent band painted across the
+   top bar's bottom border. Body text pairs: deep ink #161925 with muted
+   #3d5a5b on warm paper (6.6:1), crisp #f8f9fa with muted #a5accd on arcade
+   indigo (8:1), navy-black #101828 with muted #475467 on binder sheet (7:1)
+   and off-white #f3effb with muted #b5a8ce on retro plum (8:1). */
+
+/* Jazz Cup -- 1991 teal-and-purple zigzag on warm paper (light) */
+html[data-theme="jazz_solo"] {
+  --bg: #f4f1ea; --panel: #ffffff; --panel2: #e6f4f3; --panel3: #d5eae7;
+  --line: #b2dfdb; --line2: #008b8b;
+  --text: #161925; --muted: #3d5a5b; --soft: #cfe3df;
+  --accent: #009688; --accent-fg: #ffffff; --accent-soft: #d3ece9;
+  --ok: #1a7f37; --err: #c62828; --warn: #8a5a00;
+  --cyan: #00695c; --rep: #8e24aa;
+  --add-bg: #2e7d32; --del-bg: #c62828;
+  --term-bg: #fbf8f0; --term-text: #161925; --code-bg: #f9f6ef;
+  --danger-fg: #ffffff;
+  --ansi-0: #6b6258; --ansi-1: #c62828; --ansi-2: #1a7f37;
+  --ansi-3: #8a5a00; --ansi-4: #0b6bcb; --ansi-5: #8e24aa;
+  --ansi-6: #00695c; --ansi-7: #161925;
+  --shadow: 0 8px 24px rgba(22, 25, 37, .16);
+  color-scheme: light;
+}
+/* grunge zigzag stripe: electric teal -> purpleberry -> radical magenta, and
+ * the tiny teal-on-aqua chips switch to purpleberry to keep AA contrast */
+html[data-theme="jazz_solo"] #topbar {
+  border-bottom: 3px solid;
+  border-image: linear-gradient(90deg, #009688, #8e24aa, #d81b60) 1;
+}
+html[data-theme="jazz_solo"] .badge,
+html[data-theme="jazz_solo"] #wsTabs button.on,
+html[data-theme="jazz_solo"] .phase.gather { color: #8e24aa; }
+html[data-theme="jazz_solo"] .phase.gather { border-color: #8e24aa; }
+
+/* Memphis Arcade -- arcade-indigo dark, neon cyan / hot pink / yellow geometry */
+html[data-theme="memphis_arcade"] {
+  --bg: #121324; --panel: #1b1d36; --panel2: #232645; --panel3: #2b2f57;
+  --line: #393e6f; --line2: #576099;
+  --text: #f8f9fa; --muted: #a5accd; --soft: #2a2e54;
+  --accent: #00e5ff; --accent-fg: #121324; --accent-soft: #0a2f3d;
+  --ok: #00e676; --err: #ff2a85; --warn: #ffe600;
+  --cyan: #64ffda; --rep: #b388ff;
+  --add-bg: #006b2e; --del-bg: #d81b60;
+  --term-bg: #0b0c1a; --term-text: #e8eaf6; --code-bg: #171930;
+  --danger-fg: #121324;
+  --ansi-0: #6b74a6; --ansi-1: #ff5c8a; --ansi-2: #69f0ae;
+  --ansi-3: #ffe600; --ansi-4: #40c4ff; --ansi-5: #ea80fc;
+  --ansi-6: #00e5ff; --ansi-7: #f8f9fa;
+  --shadow: 0 8px 24px rgba(0, 0, 0, .55);
+  color-scheme: dark;
+}
+/* arcade-carpet dashes: cyan, neon pink, geometric yellow over indigo gaps;
+ * focus outlines already land on --accent, the #00e5ff active border */
+html[data-theme="memphis_arcade"] #topbar {
+  border-bottom: 3px solid;
+  border-image: repeating-linear-gradient(90deg, #00e5ff 0 14px, #121324 14px 18px,
+    #ff2a85 18px 32px, #121324 32px 36px, #ffe600 36px 50px, #121324 50px 54px) 1;
+}
+
+/* Trapper Keeper -- cool stationery sheet, cobalt / coral / lime (light) */
+html[data-theme="trapper_keeper"] {
+  --bg: #eef2f9; --panel: #ffffff; --panel2: #dfe7f5; --panel3: #ccd8ec;
+  --line: #b8c7e0; --line2: #2541b2;
+  --text: #101828; --muted: #475467; --soft: #d6e1f2;
+  --accent: #2541b2; --accent-fg: #ffffff; --accent-soft: #dbe4fa;
+  --ok: #087f3a; --err: #b3261e; --warn: #8a5a00;
+  --cyan: #0b6bcb; --rep: #6a4fb3;
+  --add-bg: #087f3a; --del-bg: #d84315;
+  --term-bg: #ffffff; --term-text: #101828; --code-bg: #f2f6fd;
+  --danger-fg: #ffffff;
+  --ansi-0: #5c6675; --ansi-1: #b3261e; --ansi-2: #087f3a;
+  --ansi-3: #8a5a00; --ansi-4: #2541b2; --ansi-5: #6a4fb3;
+  --ansi-6: #0b6bcb; --ansi-7: #101828;
+  --shadow: 0 8px 24px rgba(37, 65, 178, .18);
+  color-scheme: light;
+}
+/* binder-cover diagonals: cobalt, coral orange, neon binder green */
+html[data-theme="trapper_keeper"] #topbar {
+  border-bottom: 3px solid;
+  border-image: repeating-linear-gradient(135deg, #2541b2 0 14px, #ff5722 14px 28px,
+    #00c853 28px 42px) 1;
+}
+
+/* Windbreaker -- 1992 color-block nylon: plum / turquoise / coral / gold.
+ * Strict rule: muted violet-slate borders only -- no white anywhere. */
+html[data-theme="windbreaker"] {
+  --bg: #191326; --panel: #241c35; --panel2: #2f2544; --panel3: #3a2f52;
+  --line: #463866; --line2: #5e4b85;
+  --text: #f3effb; --muted: #b5a8ce; --soft: #3a2f52;
+  --accent: #00d2b8; --accent-fg: #191326; --accent-soft: #123c3b;
+  --ok: #3ddc84; --err: #ff5252; --warn: #ffca28;
+  --cyan: #4dd0e1; --rep: #ea80fc;
+  --add-bg: #0d7a3a; --del-bg: #d63b3b;
+  --term-bg: #120d1e; --term-text: #f3effb; --code-bg: #1d1630;
+  --danger-fg: #191326;
+  --ansi-0: #8a7fa8; --ansi-1: #ff5252; --ansi-2: #3ddc84;
+  --ansi-3: #ffca28; --ansi-4: #40c4ff; --ansi-5: #ea80fc;
+  --ansi-6: #4dd0e1; --ansi-7: #f3effb;
+  --shadow: 0 8px 24px rgba(0, 0, 0, .6);
+  color-scheme: dark;
+}
+/* parachute-jacket color blocks: turquoise, coral red, gold zipper, plum */
+html[data-theme="windbreaker"] #topbar {
+  border-bottom: 3px solid;
+  border-image: linear-gradient(90deg, #00d2b8 0 25%, #ff5252 25% 50%,
+    #ffca28 50% 75%, #7c4dff 75% 100%) 1;
 }
 
 * { box-sizing: border-box; }

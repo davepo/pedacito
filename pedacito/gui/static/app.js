@@ -969,12 +969,11 @@ function TopBar() {
             <option value="nord">Nord \u2014 Catppuccin</option>
             <option value="midnight">Midnight \u2014 high contrast</option>
           </optgroup>
-          <optgroup label="Legacy aliases">
-            <option value="parchment">Parchment \u2192 Daylight</option>
-            <option value="clay">Clay \u2192 Daylight</option>
-            <option value="mocha">Mocha \u2192 Nord</option>
-            <option value="sage">Sage \u2192 Nord</option>
-            <option value="nightshade">Nightshade \u2192 Midnight</option>
+          <optgroup label="1990s">
+            <option value="jazz_solo">Jazz Cup \u2014 '91 teal/purple</option>
+            <option value="trapper_keeper">Trapper Keeper \u2014 cobalt/coral</option>
+            <option value="memphis_arcade">Memphis Arcade \u2014 neon geometry</option>
+            <option value="windbreaker">Windbreaker \u2014 color-block nylon</option>
           </optgroup>
         </select>
         <button class="danger" id="exitBtn" title="stop the pedacito gui server"
@@ -1756,7 +1755,13 @@ function callSettings() {
 // ------------------------------------------------------------------- boot ----
 function initThemeSelect() {
   const sel = $('theme');
-  if (sel) sel.value = localStorage.getItem('pedacito_theme') || 'slate';
+  if (sel) {
+    let t = localStorage.getItem('pedacito_theme') || 'slate';
+    // the Sprint-E legacy names (mocha/sage/parchment/clay/nightshade) no
+    // longer exist: an unknown saved value falls back to the slate default
+    if (!Array.prototype.some.call(sel.options, (o) => o.value === t)) t = 'slate';
+    sel.value = t;
+  }
   if (S.ui.view) document.body.dataset.view = S.ui.view;
 }
 
