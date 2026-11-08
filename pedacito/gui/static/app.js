@@ -357,6 +357,10 @@ PDC.refreshState = refreshState;
 function applyStatus(s) {
   const prev = S.status;
   S.status = s;
+  if (prev.active_thread_id && s.active_thread_id && s.active_thread_id !== prev.active_thread_id) {
+    S.msgs = [];                       // a different conversation: the ids
+    S.msgTick++;                       // restart, so merging would mix threads
+  }
   if (Array.isArray(s.messages)) reconcileMessages(s.messages);
   if (s.error && s.error !== lastErr && !s.job) PDC.toast(s.error.split('\n')[0], true);
   lastErr = s.error || '';
@@ -537,6 +541,43 @@ function buildIndex(summarise) {
   PDC.api('/api/index', { summarise: summarise }).then((j) => {
     if (!j.ok) PDC.toast(j.detail || 'busy', true);
     refreshState();
+  });
+}
+
+// ---- chat threads (the project's saved conversations) ----
+// Threads live in `.pedacito/gui/threads/`; the switcher in the Chat head
+// lists them, `+ New` starts another one without losing this one, and the
+// page resyncs after any switch (message ids restart per thread).
+function swapTranscript() {
+  S.msgs = [];
+  S.msgTick++;
+  emit();
+  refreshState();
+}
+function newThread() {
+  PDC.api('/api/threads/new', { profile: S.status.profile || '' }).then((j) => {
+    if (!j.ok) { PDC.toast(j.detail || 'could not start a new chat', true); return; }
+    swapTranscript();
+  });
+}
+function selectThread(id) {
+  if (!id || id === S.status.active_thread_id) return;
+  PDC.api('/api/threads/select', { id: id }).then((j) => {
+    if (!j.ok) { PDC.toast(j.detail || 'could not open that chat', true); return; }
+    swapTranscript();
+  });
+}
+function deleteCurrentThread() {
+  const s = S.status;
+  PDC.confirm('Delete \u201c' + (s.thread_title || 'this conversation') +
+              '\u201d?\n\nIts thread file under .pedacito/gui/threads/ is removed. This cannot be undone.',
+              'Delete', true).then((ok) => {
+    if (!ok) return;
+    PDC.api('/api/threads/delete', { id: s.active_thread_id }).then((j) => {
+      if (!j.ok) { PDC.toast(j.detail || 'could not delete', true); return; }
+      PDC.toast('Conversation deleted.');
+      swapTranscript();
+    });
   });
 }
 
@@ -1665,6 +1706,16 @@ function App() {
                       onClick=${() => { S.ui.diffOpen = true; emit(); }}>
                 \u29C6 ${s.review.pending ? 'Review staged' : 'Review'}
                 ${(s.review.files || []).length ? ' \u00B7 ' + s.review.files.filter((f) => !f.source).length + ' file(s)' : ''} \u2014 expand</button>` : null}
+            <select id="threadSel" title="this project's saved conversations"
+                    value=${s.active_thread_id || ''} disabled=${!!s.job}
+                    onchange=${(e) => selectThread(e.target.value)}>
+              ${(s.threads || []).map((t) => html`
+                <option key=${t.id} value=${t.id}>${t.title} \u00b7 ${t.message_count} msg${t.message_count === 1 ? '' : 's'}</option>`)}
+            </select>
+            <button class="ghost small" id="newThread" title="start a new conversation (this one stays saved in the project)"
+                    disabled=${!!s.job} onClick=${newThread}>+ New</button>
+            <button class="ghost small danger" id="delThread" title="delete this conversation and its saved thread"
+                    disabled=${!!s.job} onClick=${deleteCurrentThread}>Delete</button>
             <button class="ghost small" id="clearChat" title="clear the conversation"
                     onClick=${() => PDC.api('/api/clear', {})}>Clear</button>
           </div>

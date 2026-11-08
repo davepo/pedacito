@@ -156,6 +156,52 @@ def test_dedup_by_server_root(fake):
     assert len(found) == 1
 
 
+def test_normalize_url_collapses_server_spellings():
+    """One server, every spelling: one key. Trailing slash, `/v1`, `/api/v1`
+    and the `localhost` name are all cosmetic."""
+    assert discovery.normalize_url("http://localhost:11434/v1/") == "http://127.0.0.1:11434"
+    assert discovery.normalize_url("http://127.0.0.1:11434") == "http://127.0.0.1:11434"
+    assert discovery.normalize_url("http://localhost:8001/api/v1") == "http://127.0.0.1:8001"
+    assert discovery.normalize_url("https://localhost:1234/v1") == "https://127.0.0.1:1234"
+    assert discovery.normalize_url(" HTTP://LOCALHOST:9/ ") == "http://127.0.0.1:9"
+    # anything past the version prefix stays part of the URL
+    assert discovery.normalize_url("http://h.test:8080/v1/extra/") == "http://h.test:8080/v1/extra"
+    # a host that merely starts with "localhost" is not the loopback alias
+    assert discovery.normalize_url("http://localhost.example/v1") == "http://localhost.example"
+    assert discovery.normalize_url("") == ""
+    # idempotent: normalizing a normalized URL changes nothing
+    assert discovery.normalize_url("http://127.0.0.1:11434") == \
+        discovery.normalize_url("http://localhost:11434/v1/")
+
+
+def test_candidate_roots_collapse_spellings():
+    """localhost vs 127.0.0.1, with or without /v1 or a trailing slash, is
+    one probe -- never two entries for one server."""
+    roots = discovery._candidate_roots(
+        ["http://localhost:9999/v1/", "http://127.0.0.1:9999"], [], [])
+    assert roots == ["http://127.0.0.1:9999"]
+    # the well-known port spellings land on the same key as a profile URL
+    roots = discovery._candidate_roots([], ["http://localhost:11434/v1"], [11434])
+    assert roots == ["http://127.0.0.1:11434"]
+
+
+def test_one_server_three_spellings_answers_once(fake, monkeypatch):
+    url = fake(_openai())
+    port = url.rsplit(":", 1)[1]
+    probed = []
+    real_probe = discovery._probe_root
+
+    def spy(root, *a, **kw):
+        probed.append(root)
+        return real_probe(root, *a, **kw)
+
+    monkeypatch.setattr(discovery, "_probe_root", spy)
+    found = discovery.discover_servers(
+        urls=[f"http://localhost:{port}/v1/", url, f"http://127.0.0.1:{port}/"],
+        ports=())
+    assert len(found) == 1 and len(probed) == 1
+
+
 def test_looks_embedding_from_type_or_name():
     assert discovery.looks_embedding({"id": "text-embedding-3-small"})
     assert discovery.looks_embedding({"type": "embeddings", "id": "x"})

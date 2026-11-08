@@ -13,10 +13,13 @@ and terminal text are also kept here, so a reloaded page rebuilds itself from
 from __future__ import annotations
 
 import json
+import os
 import queue
+import re
 import sys
 import threading
 import time
+import uuid
 from collections import deque
 from pathlib import Path
 from types import SimpleNamespace
@@ -43,6 +46,87 @@ EVENT_PHASE = {"step": "gather", "gather_done": "edit", "answer": "edit",
 # client.site -> phase, while a run is live (the call site is authoritative).
 SITE_PHASE = {"gather": "gather", "compaction": "gather", "answer": "edit",
               "verify": "verify", "repair": "repair"}
+
+# Chat threads live inside the project: <root>/.pedacito/gui/threads/<id>.json,
+# one readable file per conversation, kept so the GUI can restore the last chat
+# after a restart. Titles are generated locally from the first user message -
+# no extra model call, and the title stays honest because it is literally what
+# the user asked.
+THREADS_SUBPATH = Path(".pedacito") / "gui" / "threads"
+DEFAULT_THREAD_TITLE = "New conversation"
+THREAD_TITLE_CHARS = 48
+# Only this many most-recent threads load into memory per project; older files
+# stay on disk untouched.
+MAX_THREADS = 100
+
+_THREAD_ID_RE = re.compile(r"\A[A-Za-z0-9_-]{1,64}\Z")
+
+
+def threads_dir(root) -> Path:
+    return Path(root) / THREADS_SUBPATH
+
+
+def thread_title_from(text) -> str:
+    """The auto-title for a conversation: its first request, one line, short."""
+    collapse = re.sub(r"\s+", " ", str(text or "")).strip()
+    if not collapse:
+        return DEFAULT_THREAD_TITLE
+    if len(collapse) <= THREAD_TITLE_CHARS:
+        return collapse
+    return collapse[:THREAD_TITLE_CHARS].rstrip() + "…"
+
+
+def read_thread_file(path):
+    """One thread JSON -> a normalized record, or None (with a warning) when
+    the file is not a thread. A corrupt thread must never stop the GUI from
+    opening the project."""
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        sys.stderr.write("[gui] ignoring thread %s: %s\n" % (path.name, exc))
+        return None
+    if not isinstance(data, dict):
+        sys.stderr.write("[gui] ignoring thread %s: not an object\n" % path.name)
+        return None
+    tid = data.get("id")
+    if not (isinstance(tid, str) and _THREAD_ID_RE.match(tid)):
+        sys.stderr.write("[gui] ignoring thread %s: bad id\n" % path.name)
+        return None
+    raw_msgs = data.get("messages")
+    if not isinstance(raw_msgs, list):
+        sys.stderr.write("[gui] ignoring thread %s: bad messages\n" % path.name)
+        return None
+    messages = []
+    for i, m in enumerate(raw_msgs):
+        if not isinstance(m, dict):
+            continue
+        try:
+            ts = float(m.get("ts") or 0)
+        except (TypeError, ValueError):
+            ts = 0.0
+        # the file stores {role, content, ts}; the runtime transcript is
+        # {id, role, text, time, ...}
+        messages.append({"id": i + 1, "role": str(m.get("role") or "user"),
+                         "text": str(m.get("content") or ""), "time": ts})
+    try:
+        created = float(data.get("created_at") or 0)
+        updated = float(data.get("updated_at") or created or 0)
+    except (TypeError, ValueError):
+        created = updated = time.time()
+    title = str(data.get("title") or "").strip() or DEFAULT_THREAD_TITLE
+    return {"id": tid, "title": title, "created_at": created, "updated_at": updated,
+            "profile": str(data.get("profile") or ""), "messages": messages}
+
+
+def load_thread_records(root):
+    """The project's saved threads, newest first, capped at MAX_THREADS."""
+    try:
+        paths = list(threads_dir(root).glob("*.json"))
+    except OSError:
+        return []
+    records = [rec for rec in (read_thread_file(p) for p in paths) if rec]
+    records.sort(key=lambda r: r["updated_at"], reverse=True)
+    return records[:MAX_THREADS]
 
 
 class Bus:
@@ -257,6 +341,15 @@ class State:
         self._mid = 0
         self.term = ""
 
+        # Per-project chat threads (see `save_active_thread`). `messages` IS
+        # the active record's list while a thread is attached, so every turn
+        # that lands in the transcript lands in the thread too.
+        self.threads: dict[str, dict] = {}
+        self.thread_id = ""
+        self._thread_io = threading.Lock()
+        self._last_thread_save = 0.0
+        self._load_threads()
+
         self.review: Review | None = None
         self._rid = 0
         self.apply_lock = threading.Lock()
@@ -284,11 +377,31 @@ class State:
         `.pedacito/index.json`, so `/api/state` reports the index (count and
         timestamp) the moment the switch starts -- not only after the whole
         open job (config, model probe, index load) has finished. The disk
-        read happens outside the lock; only the swap holds it."""
+        read happens outside the lock; only the swap holds it.
+
+        Chat threads follow the project: the outgoing thread is flushed to
+        the folder being left, then that folder's saved threads are loaded
+        and the most recently updated one becomes the active chat. Opening
+        the same root again (a profile switch) keeps the current thread."""
         meta = detect_index_meta(root)
+        new_root = Path(root) if root is not None else None
         with self.lock:
-            self.root = Path(root) if root is not None else None
+            same_root = new_root == self.root
+        if not same_root:
+            self.save_active_thread(force=True)   # flush to the folder being left
+        records = load_thread_records(new_root) if new_root else []
+        with self.lock:
+            self.root = new_root
             self.index_meta = meta
+            if same_root:
+                return
+            self.threads = {r["id"]: r for r in records}
+            if records:
+                self._attach_thread(records[0])
+            else:
+                rec = self._new_thread_locked()
+                self.threads[rec["id"]] = rec
+                self._attach_thread(rec)
 
     def apply_index(self, idx) -> None:
         """Refresh the reported index metadata after `STATE.idx` changed.
@@ -319,7 +432,15 @@ class State:
             self.messages.append(msg)
             del self.messages[:-MAX_MESSAGES]
             snap = dict(msg)
+            rec = self.threads.get(self.thread_id)
+            if role == "user" and rec is not None and \
+                    rec["title"] == DEFAULT_THREAD_TITLE and \
+                    not any(m["role"] == "user" for m in self.messages[:-1]):
+                rec["title"] = thread_title_from(text)
         self.bus.publish("msg_new", msg=snap)
+        # a whole new message is always worth persisting; only streaming
+        # appends (`append_message`) ride the throttle
+        self.save_active_thread(force=True)
         return snap
 
     def append_message(self, mid: int, text: str) -> None:
@@ -333,6 +454,7 @@ class State:
             else:
                 return
         self.bus.publish("msg_append", id=mid, text=text)
+        self.save_active_thread()          # throttled: streaming appends are many
 
     def set_message(self, mid: int, **fields) -> None:
         with self.lock:
@@ -343,6 +465,7 @@ class State:
             else:
                 return
         self.bus.publish("msg_set", id=mid, fields=fields)
+        self.save_active_thread()
 
     def message_text(self, mid: int) -> str:
         """The current text of one message ("" when it is gone)."""
@@ -358,9 +481,162 @@ class State:
             return [dict(m) for m in self.messages]
 
     def clear_messages(self) -> None:
+        """Empty the current conversation. The thread file stays (this is the
+        same chat, restarted from a blank slate); only switching with `new_thread`
+        opens another one."""
         with self.lock:
-            self.messages = []
+            self.messages.clear()
+            self._mid = 0
+            rec = self.threads.get(self.thread_id)
+            if rec is not None:
+                rec["title"] = DEFAULT_THREAD_TITLE
         self.bus.publish("msgs_clear")
+        self.save_active_thread(force=True)
+        self.bus.publish("status")
+
+    # --- chat threads (per-project persistence) --------------------------------
+
+    def _new_thread_locked(self, profile: str = "") -> dict:
+        """Build a fresh unsaved thread record. Caller holds `self.lock`."""
+        now = time.time()
+        return {"id": uuid.uuid4().hex, "title": DEFAULT_THREAD_TITLE,
+                "created_at": now, "updated_at": now, "profile": profile,
+                "messages": []}
+
+    def _attach_thread(self, rec: dict) -> None:
+        """Point the live transcript at a thread record. Caller holds `self.lock`."""
+        self.thread_id = rec["id"]
+        self.messages = rec["messages"]
+        self._mid = max((m.get("id", 0) for m in self.messages), default=0)
+
+    def _load_threads(self) -> None:
+        """Restore the project's saved threads (used at startup); falls back
+        to one fresh in-memory thread when there is nothing to load."""
+        records = load_thread_records(self.root) if self.root else []
+        with self.lock:
+            self.threads = {r["id"]: r for r in records}
+            if records:
+                self._attach_thread(records[0])
+            else:
+                rec = self._new_thread_locked()
+                self.threads[rec["id"]] = rec
+                self._attach_thread(rec)
+
+    def save_active_thread(self, force: bool = False) -> None:
+        """Persist the active thread to `<root>/.pedacito/gui/threads/<id>.json`
+        (atomic write: temp file + rename, so a crash mid-save cannot truncate
+        a conversation). Streaming appends are throttled to ~1/s; the save on
+        job end is forced. The thread follows the project folder: switching to
+        another project never moves these files."""
+        rec = self.threads.get(self.thread_id)
+        if rec is None or not self.root:
+            return
+        now = time.monotonic()
+        if not force and (now - self._last_thread_save) < 1.0:
+            return
+        with self.lock:
+            self._last_thread_save = now
+            rec["updated_at"] = time.time()
+            payload = {
+                "id": rec["id"],
+                "title": rec["title"],
+                "created_at": rec["created_at"],
+                "updated_at": rec["updated_at"],
+                "profile": rec.get("profile", ""),
+                "messages": [{"role": m.get("role"),
+                              "content": str(m.get("text") or ""),
+                              "ts": m.get("time")}
+                             for m in self.messages],
+            }
+        path = threads_dir(self.root) / (payload["id"] + ".json")
+        with self._thread_io:            # serialize writers; never hold `lock` during I/O
+            try:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                tmp = path.with_name(payload["id"] + ".json.tmp")
+                tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=1),
+                               encoding="utf-8")
+                os.replace(tmp, path)
+            except OSError as exc:
+                sys.stderr.write("[gui] could not save thread %s: %s\n" % (path, exc))
+
+    def _threads_summary_locked(self) -> list:
+        """The project's threads for the switcher, newest updated first.
+        Caller holds `self.lock`."""
+        items = [{
+            "id": rec["id"], "title": rec["title"],
+            "created_at": rec["created_at"], "updated_at": rec["updated_at"],
+            "profile": rec.get("profile", ""),
+            "message_count": len(rec["messages"]),
+            "active": rec["id"] == self.thread_id,
+        } for rec in self.threads.values()]
+        items.sort(key=lambda it: it["updated_at"], reverse=True)
+        return items
+
+    def threads_summary(self) -> list:
+        with self.lock:
+            return self._threads_summary_locked()
+
+    def new_thread(self, profile: str = "") -> str:
+        """Start a fresh conversation in this project and return its id. The
+        previous thread stays saved in the folder."""
+        self.save_active_thread(force=True)
+        with self.lock:
+            rec = self._new_thread_locked(profile)
+            self.threads[rec["id"]] = rec
+            self._attach_thread(rec)
+        self.save_active_thread(force=True)
+        self.bus.publish("msgs_clear")
+        self.bus.publish("status")
+        return rec["id"]
+
+    def select_thread(self, tid: str) -> bool:
+        """Make a saved thread of this project the active conversation.
+        False when there is no thread with that id."""
+        with self.lock:
+            if tid == self.thread_id:
+                return True
+        self.save_active_thread(force=True)
+        with self.lock:
+            rec = self.threads.get(tid)
+            if rec is None:
+                return False
+            self._attach_thread(rec)
+        self.bus.publish("msgs_clear")
+        self.bus.publish("status")
+        return True
+
+    def delete_thread(self, tid: str) -> bool:
+        """Forget a thread and remove its file. Deleting the active one opens
+        the most recent survivor, or a fresh chat when nothing is left."""
+        path = None
+        with self.lock:
+            rec = self.threads.pop(tid, None)
+            if rec is None:
+                return False
+            if self.root:
+                path = threads_dir(self.root) / (tid + ".json")
+            was_active = tid == self.thread_id
+            if was_active:
+                if self.threads:
+                    self._attach_thread(max(self.threads.values(),
+                                            key=lambda r: r["updated_at"]))
+                else:
+                    fresh = self._new_thread_locked()
+                    self.threads[fresh["id"]] = fresh
+                    self._attach_thread(fresh)
+        if path is not None:
+            with self._thread_io:
+                try:
+                    path.unlink()
+                except FileNotFoundError:
+                    pass
+                except OSError as exc:
+                    sys.stderr.write("[gui] could not delete thread %s: %s\n"
+                                     % (path, exc))
+        if was_active:
+            self.bus.publish("msgs_clear")
+        self.bus.publish("status")
+        return True
 
     # --- terminal -----------------------------------------------------------
 
@@ -745,6 +1021,12 @@ class State:
                 "review": self.review_meta_brief(),
                 "question": bool(self.question_mid),
                 "recent": load_recent(),
+                # the chat thread currently open, plus the project's history
+                # (see `_load_threads`), so the page can offer "switch back"
+                "active_thread_id": self.thread_id,
+                "thread_title": (self.threads.get(self.thread_id) or {}).get(
+                    "title", DEFAULT_THREAD_TITLE),
+                "threads": self._threads_summary_locked(),
                 "needs_setup": not USER_CONFIG.exists(),
                 "context_tokens": cfg.context_tokens if cfg else 0,
                 "context_origin": (cfg.sources.get("context_tokens", "default")

@@ -8,6 +8,7 @@ server probe used by "test connection".
 from __future__ import annotations
 
 import os
+import re
 import time
 from pathlib import Path
 
@@ -216,7 +217,12 @@ def scan_servers() -> dict:
     size, context, embedding/too-big already dropped)."""
     from .. import discovery
     servers = []
+    seen: set[str] = set()
     for label, base_url, _ids in discovery.discover_servers(timeout=1.5):
+        key = _norm_url(base_url)
+        if key in seen:
+            continue          # the same server spelled two ways: probe once
+        seen.add(key)
         servers.append({"label": label, "base_url": base_url,
                         "models": discovery.describe_models(base_url)})
     return {"servers": servers}
@@ -353,13 +359,65 @@ def reload_state_config() -> dict:
 # --- selective model discovery and import ---------------------------------------
 
 def _norm_url(url) -> str:
-    return str(url or "").rstrip("/")
+    """The canonical spelling of a server URL (see `discovery.normalize_url`):
+    no trailing slash, `localhost` folded to `127.0.0.1`, `/v1` suffix gone."""
+    from .. import discovery
+    return discovery.normalize_url(url)
+
+
+# What the profile editor (and the settings page) accept as a profile name.
+PROFILE_NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,31}")
+_MAX_PROFILE_NAME = 32
+
+
+def _sanitize_profile_name(raw_name: str) -> str:
+    """Harden a profile name so version numbers survive the round trip.
+
+    Model ids carry things a profile name may not: `qwen3.8-27b` smuggles a
+    dot, `glm-4.7-flash:latest` a colon, `mistral@7b` an at-sign. Each run of
+    characters outside `[a-z 0-9 _ -]` becomes one `_` (`3.8` -> `3_8`), the
+    name is lower-cased, repeated and dangling separators are collapsed and
+    trimmed, a redundant `-gguf`/`_gguf` tail is dropped, and the result is
+    capped at `_MAX_PROFILE_NAME`. A `/` is deliberately left untouched: it
+    marks a name a human typed (an org path or a slip), and the import check
+    should refuse that loudly instead of guessing a rewrite.
+    """
+    s = str(raw_name or "").strip().lower()
+    s = re.sub(r"[^a-z0-9_/-]+", "_", s)
+    s = re.sub(r"[-_]{2,}", lambda m: m.group(0)[0], s)
+    s = s.strip("-_")
+    while len(s) > 4 and s.endswith(("-gguf", "_gguf")):
+        s = s[: -len("-gguf")].strip("-_")
+    if len(s) > _MAX_PROFILE_NAME:
+        s = s[:_MAX_PROFILE_NAME].strip("-_")
+    return s
+
+
+def _suggest_profile_name(model_id: str, taken: set, label: str = "") -> str:
+    """The scan's suggested profile name: `config_editor.short_name`'s slug,
+    sanitized (version dots and all), and made unique with `_2`, `_3`, ... if
+    two ids collapse to the same slug."""
+    base = _sanitize_profile_name(config_editor.short_name(model_id, taken,
+                                                           label)) or "model"
+    name = base
+    i = 2
+    while name in taken:
+        tail = "_%d" % i
+        name = base[:_MAX_PROFILE_NAME - len(tail)].strip("-_") + tail
+        i += 1
+    taken.add(name)
+    return name
 
 
 def scan_models(urls=(), vram_gb=0) -> dict:
     """`pedacito models scan`'s discovery pass WITHOUT the writes: probe the
     well-known local ports, every configured profile's server, and `urls`;
-    return one selectable row per model. Nothing is written to the config."""
+    return one selectable row per model. Nothing is written to the config.
+
+    Candidates arrive spelled many ways (`localhost` vs `127.0.0.1`, a
+    trailing `/v1`, a trailing slash), so every server is keyed by its
+    normalized URL: one server probes once, and the returned list holds one
+    row per (normalized server URL, model id) -- never a duplicate."""
     from .. import cli as cli_mod
     from .. import discovery
     explicit = [str(u).strip() for u in (urls or ()) if str(u).strip()]
@@ -381,7 +439,13 @@ def scan_models(urls=(), vram_gb=0) -> dict:
                  str(b.get("model") or "")) for b in existing.values()}
     taken = set(existing)
     servers_out, models_out = [], []
+    seen_servers: set[str] = set()
+    seen_models: set[tuple[str, str]] = set()
     for label, base_url, _ids in found:
+        skey = _norm_url(base_url)
+        if skey and skey in seen_servers:
+            continue        # the same server spelled another way: probe once
+        seen_servers.add(skey)
         try:
             recs = discovery.describe_models(base_url, vram_gb=vram)
         except Exception:
@@ -389,11 +453,11 @@ def scan_models(urls=(), vram_gb=0) -> dict:
         rows = []
         for rec in recs:
             mid = str(rec.get("id") or "")
-            if not mid:
-                continue
-            already = (_norm_url(base_url), mid) in imported
-            name = config_editor.short_name(mid, taken, label)
-            taken.add(name)
+            if not mid or (skey, mid) in seen_models:
+                continue    # one row per (normalized server URL, model id)
+            seen_models.add((skey, mid))
+            already = (skey, mid) in imported
+            name = _suggest_profile_name(mid, taken, label)
             row = {"server_url": base_url, "provider": label, "model_id": mid,
                    "base_url": base_url, "loaded": rec.get("loaded"),
                    "context_length": int(rec.get("context_length") or 0),
@@ -438,6 +502,16 @@ def import_models(models) -> dict:
         if not name or not mid or not base:
             raise ConfigError("Each imported model needs a profile name, a "
                               "model id, and a server URL.")
+        # version numbers never fail an import: `qwen3.8` is auto-fixed to
+        # `qwen3_8`. A name a human typed truly wrong (an org `path/`, say)
+        # stays invalid and is refused rather than silently rewritten.
+        fixed = _sanitize_profile_name(name)
+        if not fixed or not PROFILE_NAME_RE.fullmatch(fixed):
+            raise ConfigError(
+                f"profile name {name!r} must use letters, digits, '-' and "
+                "'_' (starting with a letter or digit, max "
+                f"{_MAX_PROFILE_NAME} characters)")
+        name = fixed
         if name in config_editor.profile_names(text):
             skipped.append(name)
             if sel.get("set_default"):

@@ -85,6 +85,9 @@ def spawn(kind: str, title: str, fn, *, echo=None) -> Job | None:
                     break
                 except KeyboardInterrupt:
                     continue
+            # the turn is over: the thread on disk must match what the user
+            # just saw, including anything the throttled saves held back
+            STATE.save_active_thread(force=True)
 
     job.thread = threading.Thread(target=worker, daemon=True)
     job.thread.start()

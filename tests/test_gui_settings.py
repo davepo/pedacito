@@ -1,9 +1,19 @@
 """GUI config editing: schema, validation, and comment-preserving TOML patches."""
+import re
+import sys
+from pathlib import Path
+
 import pytest
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from pedacito import config
 from pedacito.config import ConfigError
 from pedacito.gui import settings as S
+from pedacito.gui import settings_api
+from test_gui import gui  # noqa: F401  (the shared server fixture)
+from test_models_scan import _lmstudio, _serve
 
 BASE = '''\
 # my config
@@ -195,3 +205,87 @@ def test_resolved_hides_secrets():
     res = S.resolved(cfg)
     assert res["api_key"]["value"] == ""
     assert res["vram_gb"]["source"] == "user config (x)"
+
+
+# --- Model Discovery: version dots in model ids -> valid profile names ------
+# (the scan + import endpoints run against the fake LM Studio server from
+# test_models_scan, using test_gui's `gui` server fixture)
+
+GIB = 1024 ** 3
+
+DOT_MODELS = [
+    {"id": "qwen3.8-27b-gsq-rco-gguf", "size_bytes": 17 * GIB,
+     "context_length": 40960, "quantization": "q4_k_m",
+     "loaded_in_memory": True},
+    {"id": "zai-org/glm-4.7-flash:latest", "size_bytes": 4 * GIB,
+     "context_length": 32768},
+]
+
+
+@pytest.fixture
+def dot_server():
+    srv = _serve(_lmstudio(DOT_MODELS))
+    yield f"http://127.0.0.1:{srv.server_address[1]}/v1"
+    srv.shutdown()
+    srv.server_close()
+
+
+def test_sanitize_profile_name_rules():
+    f = settings_api._sanitize_profile_name
+    assert f("qwen3.8") == "qwen3_8"                       # the version dot
+    assert f("glm-4.7-flash-gguf") == "glm-4_7-flash"      # and the gguf tail
+    assert f("QWEN3.8-27B-GSQ-RCO-GGUF") == "qwen3_8-27b-gsq-rco"
+    assert f("Mistral 7B @ Q4") == "mistral_7b_q4"         # spaces and @ fold in
+    assert f("--weird--") == "weird"                      # trimmed, collapsed
+    assert f("x" * 40) == "x" * 32                        # capped for the UI
+    # an org `path/` is a name a human typed wrong: kept invalid on purpose so
+    # the import refuses it loudly instead of silently renaming
+    assert "/" in f("zai-org/glm-4.7-flash:latest")
+    assert re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,31}",
+                        f("qwen3.8-27b-gsq-rco-gguf"))
+
+
+def test_suggested_names_get_unique_on_sanitizer_collisions():
+    taken: set = set()
+    a = settings_api._suggest_profile_name("qwen3.8b", taken)
+    b = settings_api._suggest_profile_name("qwen3_8b", taken)   # same slug after sanitizing
+    assert a == "qwen3_8b" and b != a
+    assert re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,31}", b)
+
+
+def test_scan_suggests_dot_free_names(gui, dot_server):
+    status, j = gui.post("/api/models/scan", {"urls": [dot_server],
+                                              "vram_gb": 24})
+    assert status == 200 and j["ok"]
+    rows = [m for m in j["models"] if m["server_url"] == dot_server]
+    assert sorted(r["suggested_profile_name"] for r in rows) == \
+        ["glm-4_7-flash", "qwen3_8-27b-gsq-rco"]
+    for r in rows:
+        assert re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,31}",
+                            r["suggested_profile_name"]), r
+
+
+def test_import_auto_fixes_dotted_names(gui, dot_server):
+    """A profile name still carrying the model id's version dots imports
+    cleanly: the backend sanitizes it instead of failing on `3.8`."""
+    base = dot_server
+    status, j = gui.post("/api/models/import", {"models": [
+        {"profile_name": "qwen3.8-27b-gsq-rco-gguf", "base_url": base,
+         "model": "qwen3.8-27b-gsq-rco-gguf", "set_default": True},
+        {"profile_name": "glm-4.7-flash", "base_url": base,
+         "model": "zai-org/glm-4.7-flash:latest"}]})
+    assert status == 200 and j["ok"], j
+    assert sorted(j["imported"]) == ["glm-4_7-flash", "qwen3_8-27b-gsq-rco"]
+    assert j["default_profile"] == "qwen3_8-27b-gsq-rco"
+    text = gui.cfg_path.read_text(encoding="utf-8")
+    assert "[profiles.qwen3_8-27b-gsq-rco]" in text
+    assert "[profiles.glm-4_7-flash]" in text
+    assert 'model = "qwen3.8-27b-gsq-rco-gguf"' in text   # the id keeps its dots
+    status, st = gui.get("/api/state")
+    assert set(st["profiles"]) >= {"glm-4_7-flash", "qwen3_8-27b-gsq-rco"}
+    # a truly invalid name is still refused, and nothing extra was written
+    before = gui.cfg_path.read_text(encoding="utf-8")
+    status, j = gui.post("/api/models/import", {"models": [
+        {"profile_name": "bad/name", "base_url": base, "model": "x"}]})
+    assert status == 400 and "detail" in j
+    assert gui.cfg_path.read_text(encoding="utf-8") == before

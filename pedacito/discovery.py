@@ -27,6 +27,7 @@ that serves only one of them still shows up.
 from __future__ import annotations
 
 import os
+import re
 
 import requests
 
@@ -42,6 +43,34 @@ _EMBEDDING_NAME_MARKERS = (
 )
 
 _GIB = 1024 ** 3
+
+
+_LOCALHOST_RE = re.compile(r"^([a-zA-Z][a-zA-Z0-9+.\-]*://)localhost(?=/|:|$)",
+                           re.IGNORECASE)
+_AUTHORITY_RE = re.compile(r"\A([a-zA-Z][a-zA-Z0-9+.\-]*://[^/]*)(.*)\Z")
+
+
+def normalize_url(url) -> str:
+    """The canonical form of a server URL for comparing candidates.
+
+    One server is often spelled several ways (a profile's
+    `http://localhost:11434/v1/` vs a scan's `http://127.0.0.1:11434`), and
+    probing both spellings makes the same server show up twice. This folds
+    those spellings into one key: trailing slashes dropped, the `localhost`
+    host written as `127.0.0.1`, and a `/v1` (or `/api/v1`) suffix removed so
+    the same endpoint is never probed -- or listed -- twice."""
+    u = str(url or "").strip().rstrip("/")
+    u = _LOCALHOST_RE.sub(r"\g<1>127.0.0.1", u, count=1)
+    # scheme and host are case-insensitive; the path is not, so lower only the
+    # `scheme://authority` part ("HTTP://LocalHost:9/" == "http://127.0.0.1:9")
+    m = _AUTHORITY_RE.match(u)
+    if m:
+        u = m.group(1).lower() + m.group(2)
+    for suffix in ("/api/v1", "/v1"):
+        if u.endswith(suffix):
+            u = u[: -len(suffix)].rstrip("/")
+            break
+    return u
 
 
 def _root(base_url: str) -> str:
@@ -164,11 +193,15 @@ def _probe_root(root: str, timeout: float, headers=None):
 
 
 def _candidate_roots(urls, profile_urls, ports) -> list[str]:
-    """The deduplicated server roots to probe, in the documented order."""
+    """The deduplicated server roots to probe, in the documented order.
+
+    Every candidate goes through `normalize_url` first, so `localhost` and
+    `127.0.0.1` spellings (and trailing slashes or `/v1` suffixes) of one
+    server collapse into a single root that is probed exactly once."""
     roots: list[str] = []
 
     def add(url: str) -> None:
-        root = _root(url)
+        root = normalize_url(url)
         if root and root not in roots:
             roots.append(root)
 
@@ -188,14 +221,15 @@ def discover_servers(timeout: float = 2.0, urls=(), ports=None,
     """Probe candidates for local model servers.
 
     Returns `[(label, base_url, [model ids])]` for each server that answers,
-    deduplicated by server root. `ports=None` means the well-known local ports;
-    pass `ports=()` to probe only the explicit `urls` / `profile_urls`."""
+    deduplicated by normalized server root (`normalize_url`). `ports=None`
+    means the well-known local ports; pass `ports=()` to probe only the
+    explicit `urls` / `profile_urls`."""
     roots = _candidate_roots(urls, profile_urls,
                              DEFAULT_PORTS if ports is None else ports)
     found: list[tuple[str, str, list[str]]] = []
     seen: set[str] = set()
     for root in roots:
-        key = root.rstrip("/")
+        key = normalize_url(root)
         if key in seen:
             continue
         result = _probe_root(root, timeout, headers)

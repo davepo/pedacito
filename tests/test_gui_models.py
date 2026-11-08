@@ -160,6 +160,40 @@ def test_scan_of_an_unreachable_url_reports_no_rows(gui):
     assert status == 200 and _rows(j, "http://127.0.0.1:1/v1") == []
 
 
+def test_scan_collapses_url_spellings_into_one_server_and_row(gui, fake_local):
+    """`localhost` vs `127.0.0.1`, with or without `/v1` or a trailing slash:
+    one server probed once, listed once, one row per model."""
+    base = fake_local(MODELS)                       # http://127.0.0.1:PORT/v1
+    port = base.rsplit(":", 1)[1].split("/")[0]
+    spellings = [f"http://localhost:{port}/v1/", base,
+                 f"http://127.0.0.1:{port}/v1/"]
+    status, j = gui.post("/api/models/scan", {"urls": spellings, "vram_gb": 16})
+    assert status == 200 and j["ok"]
+    # (this machine may run a real LM Studio on a default port: look only at
+    # the rows that came from the fake server's URL)
+    assert len(_rows(j, base)) == 1
+    assert [r["model_id"] for r in _rows(j, base)] == ["lmstudio-ai/qwen3-8b"]
+    same = [s for s in j["servers"] if any(m["server_url"] == base for m in s["models"])]
+    assert len(same) == 1 and same[0]["base_url"] == base
+
+
+def test_scan_dedups_even_when_discovery_repeats_a_server(gui, fake_local,
+                                                          monkeypatch):
+    """Belt and braces at the display layer: if discovery ever hands the same
+    server twice (differently spelled), the scan still returns one row per
+    (normalized server URL, model id)."""
+    from pedacito import discovery
+    base = fake_local(MODELS)
+    dup = [("LM Studio", base, ["x"]),
+           ("LM Studio", base + "/", ["x"])]
+    monkeypatch.setattr(discovery, "discover_servers",
+                        lambda *a, **k: list(dup))
+    status, j = gui.post("/api/models/scan", {"urls": [base], "vram_gb": 16})
+    assert status == 200 and j["ok"]
+    assert len(j["models"]) == 1 and len(j["servers"]) == 1
+    assert j["models"][0]["server_url"] == base
+
+
 # ---------------------------------------------------------------- selective import
 
 def _sel(base, name, model, default=False, ctx=40960, vram=16):

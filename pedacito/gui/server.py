@@ -437,6 +437,33 @@ def _clear(q, body):
     return 200, {"ok": True}
 
 
+# chat threads: the conversation history stored in the project itself ------
+
+@post("/api/threads/new")
+def _thread_new(q, body):
+    """Start a fresh conversation in this project. The current thread stays
+    saved under `.pedacito/gui/threads/`, so nothing is lost."""
+    tid = STATE.new_thread(str(body.get("profile") or ""))
+    return 200, {"ok": True, "id": tid}
+
+
+@post("/api/threads/select")
+def _thread_select(q, body):
+    """Open one of this project's saved threads (switching chats)."""
+    if not STATE.select_thread(str(body.get("id") or "")):
+        return 400, {"ok": False, "detail": "No such saved thread."}
+    return 200, {"ok": True, "id": STATE.thread_id}
+
+
+@post("/api/threads/delete")
+def _thread_delete(q, body):
+    """Forget a thread and delete its file. If it was the active chat, the
+    most recently updated survivor opens in its place."""
+    if not STATE.delete_thread(str(body.get("id") or "")):
+        return 400, {"ok": False, "detail": "No such saved thread."}
+    return 200, {"ok": True, "id": STATE.thread_id}
+
+
 @post("/api/term_clear")
 def _term_clear(q, body):
     STATE.term_clear()

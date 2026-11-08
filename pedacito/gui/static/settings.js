@@ -170,8 +170,41 @@
   }
 
   // ----- model discovery, selective import, calibration -------------------------------
-  function rowKey(r) { return r.server_url + '\u0000' + r.model_id; }
+  // Canonical URL spelling, mirroring `discovery.normalize_url` on the server: one
+  // local server is often written several ways (localhost vs 127.0.0.1, trailing
+  // /v1 or slash), and each spelling would key its own checkbox and group header.
+  function normUrl(u) {
+    u = String(u || '').trim().replace(/\/+$/, '');
+    u = u.replace(/^([a-zA-Z][a-zA-Z0-9+.\-]*:\/\/)localhost(?=[:/]|$)/i, '$1127.0.0.1');
+    var auth = u.match(/^([a-zA-Z][a-zA-Z0-9+.\-]*:\/\/[^/]*)([\s\S]*)$/);
+    if (auth) u = auth[1].toLowerCase() + auth[2];   // scheme+host are case-insensitive; the path is not
+    var sfx = u.match(/(\/api\/v1|\/v1)$/);
+    if (sfx) u = u.slice(0, -sfx[0].length).replace(/\/+$/, '');
+    return u;
+  }
+  // Mirrors `settings_api._sanitize_profile_name`: version dots (and : @ space)
+  // become _, names lower-case, separator runs collapse and trim, a -gguf tail
+  // drops, max 32 chars. A '/' is left in place on purpose: that is a name a
+  // human typed, and the import check should refuse it rather than guess.
+  function sanitizeName(s) {
+    s = String(s || '').trim().toLowerCase().replace(/[^a-z0-9_\-\/]+/g, '_');
+    s = s.replace(/([-_]){2,}/g, '$1');
+    s = s.replace(/^[-_]+|[-_]+$/g, '');
+    while (s.length > 4 && /[-_]gguf$/.test(s)) s = s.replace(/[-_]gguf$/, '').replace(/^[-_]+|[-_]+$/g, '');
+    if (s.length > 32) s = s.slice(0, 32).replace(/[-_]+$/, '');
+    return s;
+  }
+  function rowKey(r) { return normUrl(r.server_url) + '::' + r.model_id; }
   function pickedRows() { return SCAN.rows.filter(function (r) { return SCAN.pick[rowKey(r)]; }); }
+  function groupRows(skey) { return SCAN.rows.filter(function (r) { return normUrl(r.server_url) === skey; }); }
+  function setPicks(rows, on) {
+    rows.forEach(function (r) {
+      if (!r.already_imported) SCAN.pick[rowKey(r)] = on;
+    });
+    if (SCAN.def && !SCAN.pick[SCAN.def]) SCAN.def = '';
+    if (on && !SCAN.def) { var first = pickedRows()[0]; if (first) SCAN.def = rowKey(first); }
+    render();
+  }
   function fmtSize(bytes) {
     if (!bytes) return '';
     var gb = bytes / 1073741824;
@@ -221,18 +254,34 @@
     if (SCAN.err) box.appendChild(h('div', { class: 'note-box err', text: SCAN.err }));
     if (SCAN.busy) { box.appendChild(h('div', { class: 'tip', text: 'Asking each server what it has\u2026' })); return box; }
     if (!SCAN.rows.length) return box;
+    // pick whole sets at once: with 15+ GGUFs on one server you tick the two
+    // you want by unselecting everything, not by hunting fourteen checkboxes
+    box.appendChild(h('div', { class: 'row', style: 'margin:10px 0 4px' },
+      h('button', { class: 'small ghost', text: 'Select all', onclick: function () { setPicks(SCAN.rows, true); } }),
+      h('button', { class: 'small ghost', text: 'Unselect all', onclick: function () { setPicks(SCAN.rows, false); } }),
+      h('span', { class: 'muted small-text grow', text: 'tick only the models to import; the name box fixes version dots (\u201c3.8\u201d \u2192 \u201c3_8\u201d) as you type' })));
     var head = h('tr', {}, h('th', { text: 'import' }), h('th', { text: 'default' }), h('th', { text: 'profile name' }),
       h('th', { text: 'model' }), h('th', { text: 'ctx' }), h('th', { text: 'size' }), h('th', { text: '' }));
     var tbody = h('tbody', {});
     var last = '';
     SCAN.rows.forEach(function (r, i) {
       var k = rowKey(r);
-      if (r.server_url !== last) {
-        last = r.server_url;
-        tbody.appendChild(h('tr', { class: 'scan-server' }, h('td', { colspan: '7', text: (r.provider || 'server') + '  \u00b7  ' + r.server_url })));
+      var skey = normUrl(r.server_url);
+      if (skey !== last) {
+        last = skey;
+        var grp = groupRows(skey);
+        tbody.appendChild(h('tr', { class: 'scan-server' }, h('td', { colspan: '7' },
+          h('div', { class: 'row sg-group' },
+            h('span', { class: 'grow mono small-text ellip', text: (r.provider || 'server') + '  \u00b7  ' + r.server_url }),
+            h('button', { class: 'small ghost', text: 'select all', onclick: function () { setPicks(grp, true); } }),
+            h('button', { class: 'small ghost', text: 'unselect', onclick: function () { setPicks(grp, false); } })))));
       }
       var name = h('input', { type: 'text', class: 'mono', value: SCAN.name[k] === undefined ? r.suggested_profile_name : SCAN.name[k], disabled: r.already_imported });
-      name.addEventListener('input', function () { SCAN.name[k] = name.value.trim(); });
+      name.addEventListener('input', function () {
+        var fixed = sanitizeName(name.value);
+        if (fixed !== name.value) name.value = fixed;   // "qwen3.8" becomes "qwen3_8" live, so the import never trips on it
+        SCAN.name[k] = name.value;
+      });
       var cb = h('input', { type: 'checkbox', checked: !!SCAN.pick[k], disabled: !!r.already_imported,
         onchange: function (e) { SCAN.pick[k] = e.target.checked; if (!e.target.checked && SCAN.def === k) SCAN.def = ''; render(); } });
       var rd = h('input', { type: 'radio', name: 'importdefault', checked: SCAN.def === k, disabled: !!r.already_imported,
@@ -248,7 +297,7 @@
     box.appendChild(h('table', { class: 'scan-table' }, h('thead', {}, head), tbody));
     var n = pickedRows().length;
     box.appendChild(h('div', { class: 'row', style: 'margin-top:10px' },
-      h('button', { class: 'primary', text: SCAN.importing ? 'Importing\u2026' : 'Import ' + n + ' model' + (n === 1 ? '' : 's'), disabled: !n || SCAN.importing, onclick: doImport }),
+      h('button', { class: 'primary', text: SCAN.importing ? 'Importing\u2026' : 'Import Selected (' + n + ')', disabled: !n || SCAN.importing, onclick: doImport }),
       h('span', { class: 'muted small-text grow', text: 'each import becomes an editable profile, so you can tune per-model limits afterwards' })));
     return box;
   }
@@ -261,7 +310,12 @@
     PDC.api('/api/models/scan', body).then(function (j) {
       SCAN.busy = false;
       if (!j.ok) { SCAN.err = 'Scan failed: ' + (j.detail || 'bad response'); render(); return; }
-      SCAN.rows = j.models || [];
+      var seenRow = {};
+      SCAN.rows = (j.models || []).filter(function (r) {   // one row per server+model, whatever URL spelling it arrived under
+        var rk = rowKey(r);
+        if (seenRow[rk]) return false;
+        seenRow[rk] = 1; return true;
+      });
       SCAN.pick = {}; SCAN.name = {}; SCAN.def = '';
       SCAN.rows.forEach(function (r) {
         var k = rowKey(r);
@@ -282,7 +336,9 @@
     var vram = parseFloat(SCAN.vram) || 0;
     var list = sel.map(function (r) {
       var k = rowKey(r);
-      return { profile_name: SCAN.name[k] || r.suggested_profile_name, base_url: r.server_url,
+      var pname = sanitizeName(SCAN.name[k] || r.suggested_profile_name);
+      SCAN.name[k] = pname;
+      return { profile_name: pname, base_url: r.server_url,
         model: r.model_id, context_length: r.context_length || 0, vram_gb: vram,
         set_default: SCAN.def === k };
     });

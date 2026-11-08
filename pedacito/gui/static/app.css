@@ -241,6 +241,13 @@ textarea { resize: none; background: var(--panel); }
   border-radius: 999px; padding: 1px 8px; font-weight: 700; flex: none; }
 #busyLbl { font-size: 11.5px; color: var(--warn); white-space: nowrap;
   overflow: hidden; text-overflow: ellipsis; }
+/* chat-thread switcher in the Chat head: long auto-titles must not push the
+ * buttons off the panel */
+#threadSel { font-size: 12px; padding: 2px 6px; max-width: 260px;
+  min-width: 0; flex: 0 1 auto; background: var(--panel3);
+  border-color: var(--line); color: var(--muted); border-radius: 7px; }
+#threadSel:disabled { opacity: .45; }
+@media (max-width: 900px) { #threadSel { max-width: 130px; } }
 #planPath { font-size: 10.5px; color: var(--muted); white-space: nowrap;
   overflow: hidden; text-overflow: ellipsis; }
 
@@ -669,6 +676,9 @@ details pre { background: var(--code-bg); border: 1px solid var(--line); border-
 .scan-table th:nth-child(2), .scan-table td:nth-child(2) { width: 1%; text-align: center; }
 .scan-table tr.scan-server td { background: var(--panel2); color: var(--muted);
   font-family: var(--mono); font-size: 11.5px; }
+/* per-server bulk-pick controls sit flush right in the group header row */
+.scan-table tr.scan-server .sg-group { flex-wrap: nowrap; gap: 6px; }
+.scan-table tr.scan-server .sg-group button { flex: none; font-size: 10.5px; padding: 1px 7px; }
 .scan-table tr.imp { opacity: .55; }
 .scan-table input[type=text] { width: 172px; }
 .prow { display: flex; align-items: center; gap: 8px; padding: 7px 10px; min-width: 0;
