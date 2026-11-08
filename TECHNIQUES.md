@@ -55,6 +55,27 @@ and a run of identical steps all count alike. Whichever ceiling trips first
 ends gather cleanly with a harness note appended to the conversation, and the
 run moves on to the answer phase with what was gathered.
 
+Gather also carries a free **requirement evidence state machine**. Each task
+clause is tracked from its first mention to its closing evidence: an edit
+requirement walks `UNLOCATED -> LOCATED -> READ -> EDITED -> VERIFIED`, while
+an investigation/explain clause walks `UNLOCATED -> (LOCATED) -> READ ->
+REPORTED`. Search, find, outline and caller results advance a clause to
+`LOCATED` only when their query/result names its terms; a displayed read span
+advances it to `READ`; a clean patch touching its file/terms advances it to
+`EDITED`; passing verification advances it to `VERIFIED` (prose that answers
+a read investigation reports it). No transition costs a model call — every
+one is derived from a tool result or patch the harness already has.
+
+When the model says `done`, or gather stalls with budget left, the oldest
+requirement still `UNLOCATED` or `LOCATED` gets the cheapest deterministic
+action: read a located anchor directly, otherwise `grep` its most specific
+term, then read the anchor that search located. The result is APPENDED at the
+conversation tail (never a rewrite of earlier turns), bounded to one assist
+per requirement, and only on multi-requirement tasks — a single clause still
+uses the ordinary read nudge / prefetch path. Gather's SOURCE log itself stays
+append-only; packing evidence is a phase-boundary operation (section 4), so
+the prompt-prefix cache survives the whole lookup loop.
+
 Why it helps: the loop itself is the biggest intelligence win — a ranked map,
 symbol resolution, and bounded lookups get a 4B model to the right 300 lines of
 a 12,000-line project without it having to hold the whole thing in context.
@@ -103,8 +124,14 @@ of zero-call checks catches the specific ways small models go wrong:
 - **Placeholders, stale references, moved imports.** `TODO`/`pass` stubs the
   task didn't ask for, a renamed function still called elsewhere, a moved file
   still imported by its old path.
-- **Coverage.** Requirements extracted from the task that no edit or sentence
-  addresses.
+- **Coverage and requirement states.** Every extracted task clause carries an
+  evidence state, not just a post-answer keyword check: an edit requirement
+  must reach `EDITED`/`VERIFIED`, and an investigation clause must reach
+  `REPORTED`, before it counts as addressed. The advance rules are strict
+  enough to be useful: a search can only supply `LOCATED`, a displayed read
+  `READ`, a dry-applied patch `EDITED`, and a patch accepted by the checks (or
+  the post-edit tests/lint) `VERIFIED`. Coverage then warns about the clauses
+  whose state never got there, with the state named in the message.
 - **Verdict filter.** When a model *verifier* reports a `DEFECT`, it only counts
   as an error if the cited file resolves and the line is inside it — a
   hallucinating small-model verifier can't feed the repair loop.
@@ -126,6 +153,22 @@ making a small model hunt:
   with named targets still unread, or never read any ranked top-3 file, the
   harness does *one* extra bounded read before answering — a single expansion,
   never a new loop.
+- **Requirement completion assist.** On a multi-requirement task, a `done` (or
+  a stall exit) with the oldest clause still `UNLOCATED`/`LOCATED` gets one
+  deterministic lookup: read the located anchor, else grep the most specific
+  requirement term and read what it locates. The observation is appended, one
+  assist per clause, so the model never spends a call deciding what to do next
+  and the cached prefix is untouched.
+- **Deterministic utility source packing.** At the gather -> answer/edit
+  boundary the SOURCE copy is packed by evidence utility instead of FIFO.
+  Exact spans for located/read requirements and active failing diagnostics are
+  **pinned**; every other item is scored by requirement-keyword overlap,
+  call-graph proximity, and new information per token, with token-Jaccard/MMR
+  discounting near-duplicates. A definition plus its caller chain therefore
+  survives ahead of scattered unrelated reads. Dropped items leave whole-item
+  re-read pointers and the digest always survives. This runs only on the
+  phase-boundary copy, never inside gather, so the prompt-prefix cache stays
+  intact.
 
 ### 5. Execution-grounded repair (objective error signals)
 

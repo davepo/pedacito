@@ -732,46 +732,272 @@ def _unusable_continuation(reply: str) -> bool:
 _ITEM_SPLIT = re.compile(r"\n\n(?=--- )")
 
 
-def _trim_gathered(src: str, too_big) -> tuple[str, int]:
-    """Drop the OLDEST whole gathered-source items until `too_big(text)` is
-    false, leaving a re-read pointer per dropped item and always keeping the
-    final digest. A single oversize item is clipped from its front on a line
-    boundary as a last resort. Returns (text, items_dropped)."""
+# ---------------------------------------------------- utility source packing
+# Sprint 3: at the gather -> answer/edit boundary the source is packed by
+# evidence utility instead of FIFO. Gather itself stays append-only; only this
+# rendered copy is reordered/packed, so the live prompt prefix is untouched.
+_PACK_HEAD_RE = re.compile(r"^---\s+(\w+)\s*(.*)$")
+_PACK_TARGET_RE = re.compile(r"^(.*?)(?:\s+L(\d+)-(\d+))?$")
+_PACK_BODY_HEAD_RE = re.compile(r"^(.+?) lines (\d+)-(\d+):", re.MULTILINE)
+_PACK_TOKEN_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*|\d+")
+_PACK_NUMBER_PREFIX_RE = re.compile(r"^\s*\d+\s*\|")
+
+
+@dataclass
+class _PackItem:
+    """One gathered SOURCE item plus the metadata the packer scores."""
+    text: str
+    order: int
+    kind: str = ""
+    file: str = ""
+    start: int = 0
+    end: int = 0
+    tokens: set = field(default_factory=set)
+    lower: str = ""
+
+
+def _pack_item(text: str, order: int) -> _PackItem:
+    head, _, body = text.partition("\n")
+    m = _PACK_HEAD_RE.match(head)
+    kind = m.group(1) if m else ""
+    target = m.group(2).strip() if m else head.strip("- ")
+    meta = _PackItem(text=text, order=order, kind=kind, lower=text.lower())
+    tm = _PACK_TARGET_RE.match(target)
+    if tm:
+        first = (tm.group(1).strip().split() or [""])[0]
+        if re.search(r"\.[A-Za-z0-9]{1,8}$", first):
+            meta.file = fileio.normalise_rel(first)
+        if tm.group(2):
+            meta.start, meta.end = int(tm.group(2)), int(tm.group(3))
+    bm = _PACK_BODY_HEAD_RE.search(body)
+    if bm and kind in ("read", "context", ""):
+        meta.file = fileio.normalise_rel(bm.group(1).strip())
+        meta.start, meta.end = int(bm.group(2)), int(bm.group(3))
+    clean = _PACK_NUMBER_PREFIX_RE.sub("", body).lower()
+    meta.tokens = set(_PACK_TOKEN_RE.findall(clean))
+    return meta
+
+
+def _pack_same(a: str, b: str) -> bool:
+    a, b = fileio.path_key(a or ""), fileio.path_key(b or "")
+    return bool(a and b and (a == b or a.endswith("/" + b)
+                             or b.endswith("/" + a)))
+
+
+def _pack_overlap(a1: int, b1: int, a2: int, b2: int) -> bool:
+    if not a1 or not a2:
+        return True
+    b1 = b1 or 10 ** 9
+    b2 = b2 or 10 ** 9
+    return not (b1 < a2 or b2 < a1)
+
+
+def _pack_term_in(term: str, text: str) -> bool:
+    term = (term or "").strip().lower()
+    if not term or not text:
+        return False
+    if re.search(r"(?<![\w])" + re.escape(term) + r"(?![\w])", text):
+        return True
+    stem = term.rstrip("s")
+    return stem != term and bool(
+        re.search(r"(?<![\w])" + re.escape(stem) + r"(?![\w])", text))
+
+
+def _pack_jaccard(a: set, b: set) -> float:
+    if not a or not b:
+        return 0.0
+    return len(a & b) / float(len(a | b))
+
+
+def _diagnostic_pins(diagnostics) -> list[tuple]:
+    """(file, start, end) spans for active failing diagnostics. Accepts the
+    dict quick_findings/new_findings return, or Finding-like objects."""
+    pins: list[tuple] = []
+    if not diagnostics:
+        return pins
+    if isinstance(diagnostics, dict):
+        for rel, rows in diagnostics.items():
+            if isinstance(rows, str):
+                rows = [rows]
+            for row in rows or ():
+                text = row if isinstance(row, str) else str(row)
+                m = (re.search(r":(\d+)(?::\d+)?[:\s]", text)
+                     or re.search(r"\bline\s+(\d+)", text, re.IGNORECASE))
+                line = int(m.group(1)) if m else 0
+                pins.append((fileio.normalise_rel(rel), line or 1, line or 0))
+        return pins
+    if not isinstance(diagnostics, (list, tuple, set)):
+        diagnostics = [diagnostics]
+    for f in diagnostics:
+        rel = fileio.normalise_rel(
+            getattr(f, "file", "") or (f.get("file", "")
+                                       if isinstance(f, dict) else ""))
+        lines = getattr(f, "lines", ()) if not isinstance(f, dict) else \
+            f.get("lines", ())
+        line = getattr(f, "line", 0) if not isinstance(f, dict) else \
+            f.get("line", 0)
+        if lines:
+            pins.append((rel, int(lines[0]), int(lines[-1])))
+        else:
+            pins.append((rel, int(line or 1), int(line or 0)))
+    return pins
+
+
+def _item_has_pin(meta: _PackItem, pins) -> bool:
+    for rel, a, b in pins:
+        if not rel:
+            continue
+        same = _pack_same(meta.file, rel) if meta.file else False
+        if not same and rel.lower() not in meta.lower:
+            continue
+        if not meta.start or _pack_overlap(meta.start, meta.end, a, b):
+            return True
+    return False
+
+
+def _clip_item_to_pins(meta: _PackItem, pins) -> str:
+    """Keep only the numbered lines around this item's pinned spans -- used
+    when even the pinned set alone exceeds the request budget."""
+    if meta.kind not in ("read", "context", "") or not meta.start:
+        return meta.text
+    spans = []
+    for rel, a, b in pins:
+        if not _pack_same(meta.file, rel):
+            continue
+        lo = max(meta.start, (a or meta.start) - 3)
+        hi = min(meta.end or (b or a), (b or a) + 3)
+        if hi >= lo:
+            spans.append((lo, hi))
+    if not spans:
+        return meta.text
+    head, _, body = meta.text.partition("\n")
+    return head + "\n" + _slice_numbered(body, _fold_spans(spans))
+
+
+def _trim_gathered(src: str, too_big, requirements=None, diagnostics=None,
+                   index=None) -> tuple[str, int]:
+    """Deterministically pack gathered SOURCE items to fit `too_big`.
+
+    Unlike the old FIFO drop, this is evidence-aware:
+
+    * exact spans for requirements that are LOCATED/READ/EDITED and active
+      failing diagnostics are PINNED and never evicted wholesale;
+    * the rest is scored by requirement-keyword overlap, call-graph proximity,
+      and new information per token (near-duplicates lose via token Jaccard);
+    * definition + caller items earn a proximity bonus, so a coherent chain
+      survives ahead of scattered unrelated reads.
+
+    A single oversize item is still clipped from its front on a line boundary
+    as a last resort. Returns (text, items_dropped).
+    """
     items = _ITEM_SPLIT.split(src)
     dropped: list[str] = []
     keep_tail = [i for i in items if i.startswith("--- digest")]
     body = [i for i in items if not i.startswith("--- digest")]
+    metas = [_pack_item(item, i) for i, item in enumerate(body)]
 
-    def render(b: list[str]) -> str:
-        parts = b + keep_tail
+    def render(idxs: list[int]) -> str:
+        parts = [metas[i].text for i in idxs] + keep_tail
         text = "\n\n".join(parts)
         if dropped:
             pointers = "; ".join(dropped[:8]) + ("; ..." if len(dropped) > 8
-                                                  else "")
+                                                 else "")
             text = ("[older gathered source trimmed to fit the request limit "
                     f"(re-`read` if you need it again: {pointers})]\n\n"
                     + text)
         return text
 
-    while too_big(render(body)) and len(body) > 1:
-        gone = body.pop(0)
-        head = gone.split("\n", 1)[0][4:].strip()
+    pins = list(requirements.pinned_spans()) \
+        if hasattr(requirements, "pinned_spans") else []
+    pins += _diagnostic_pins(diagnostics)
+    pinned = {i for i, m in enumerate(metas) if _item_has_pin(m, pins)}
+    terms = requirements.packing_terms() \
+        if hasattr(requirements, "packing_terms") else []
+    anchor_files = {rel for rel, _a, _b in pins if rel}
+
+    graph = getattr(index, "graph", None) if index is not None else None
+    neighbor_cache: dict[str, set] = {}
+
+    def neighbors(rel: str) -> set:
+        if not rel or graph is None:
+            return set()
+        if rel not in neighbor_cache:
+            try:
+                neighbor_cache[rel] = set(graph.neighbors(rel))
+            except Exception:
+                neighbor_cache[rel] = set()
+        return neighbor_cache[rel]
+
+    def utility(i: int, keep: list[int]) -> float:
+        m = metas[i]
+        base = 0.0
+        for req_terms, weight in terms:
+            hits = sum(1 for t in req_terms if _pack_term_in(t, m.lower))
+            base += weight * min(hits, 3)
+        prox = 0.0
+        if m.file:
+            if any(_pack_same(m.file, f) for f in anchor_files):
+                prox = 3.0
+            elif any(_pack_same(m.file, n) for f in anchor_files
+                     for n in neighbors(f)):
+                prox = 2.0
+        # A coherent definition + caller chain beats scattered reads.
+        for j in keep:
+            if j == i:
+                continue
+            other = metas[j]
+            if not m.file or not other.file:
+                continue
+            if _pack_same(m.file, other.file):
+                prox = max(prox, 1.5)
+            elif other.file in neighbors(m.file):
+                prox = max(prox, 1.0)
+        base += 2.0 * prox
+        base += {"read": 1.5, "context": 1.2, "grep": 0.4,
+                 "find": 0.4}.get(m.kind, 0.1)
+        sim = 0.0
+        for j in keep:
+            if j != i:
+                sim = max(sim, _pack_jaccard(m.tokens, metas[j].tokens))
+        base += 1.25 * (1.0 - sim)       # MMR: near-duplicates lose value
+        return base / (1.0 + len(m.tokens) / 600.0)
+
+    keep = list(range(len(metas)))
+    while too_big(render(keep)) and len(keep) > 1:
+        candidates = [i for i in keep if i not in pinned]
+        if not candidates:
+            break                       # pins are never evicted
+        worst = min(candidates, key=lambda i: (utility(i, keep), i))
+        keep.remove(worst)
+        head = metas[worst].text.split("\n", 1)[0][4:].strip()
         dropped.append(head[:70])
-    text = render(body)
-    if too_big(text) and body:
-        # one item is still too big: keep its tail, whole lines only
-        only = body[0]
+
+    # If the pinned set alone is still too big, narrow each pinned read to the
+    # exact anchor region instead of dropping it.
+    if too_big(render(keep)) and pinned:
+        for i in sorted(pinned):
+            metas[i].text = _clip_item_to_pins(metas[i], pins)
+    text = render(keep)
+
+    if too_big(text) and keep:
+        # one item is still too big: keep its tail, whole lines only. A pinned
+        # item is never clipped away; if only pins remain, preserve them.
+        candidates = [i for i in keep if i not in pinned]
+        if not candidates:
+            return text, len(dropped)
+        idx = max(candidates, key=lambda i: len(metas[i].text))
+        only = metas[idx].text
         n_dropped = 0
-        while too_big(render([only])) and len(only) > 4000:
-            keep = max(4000, len(only) * 3 // 4)
-            cut = only[len(only) - keep:]
+        while too_big(render(keep)) and len(only) > 4000:
+            keep_chars = max(4000, len(only) * 3 // 4)
+            cut = only[len(only) - keep_chars:]
             nl = cut.find("\n")
             only = cut[nl + 1:] if 0 <= nl < len(cut) - 1 else cut
+            metas[idx].text = only
             n_dropped += 1
         if n_dropped and not dropped:
             dropped.append("the earliest part of one long read")
-        body = [only]
-        text = render(body)
+        text = render(keep)
     return text, len(dropped)
 
 
@@ -901,6 +1127,10 @@ class Agent:
         # Explicit NEED / implicit repair rehydration rounds used this run
         # (telemetry; reset in gather).
         self.rehydration_rounds = 0
+        # Sprint 3: requirement evidence state machine and the diagnostics whose
+        # exact spans the answer packer must pin. Both reset per task.
+        self.requirements = None
+        self.active_diagnostics: dict = {}
         self._lossy = False
         self.fold_count = 0
         self.answer_mode_used = "rebuild"
@@ -1449,6 +1679,11 @@ class Agent:
         # the ledger and backup dir below.
         self.evidence = EvidenceStore()
         self.rehydration_rounds = 0
+        # Sprint 3: one requirement tracker for this task. It advances only
+        # from tool results and patches, never from an extra model call.
+        from . import verify as verify_mod
+        self.requirements = verify_mod.RequirementTracker(task)
+        self.active_diagnostics = {}
         gathered: list[str] = []
         self.steps_log: list[str] = []
         self.live_evidence_ok = False
@@ -1549,6 +1784,127 @@ class Agent:
                 print("  [gather stopped: the no-progress lease ran out; "
                       "moving to answer]", file=sys.stderr)
             return True
+
+        # --- Sprint 3: deterministic requirement completion gate -----------
+        # One cheap harness action per unmet requirement (never a model call):
+        # read a located anchor, or grep for a specific term. The model sees
+        # the appended RESULT and gets the next turn; a stall cleanup variant
+        # appends at the tail without re-entering the loop.
+        req_assists: set[int] = set()
+        self._requirement_assists = req_assists
+
+        def _requirement_action(plan: dict, req, tail: bool) -> bool:
+            nonlocal budget, did_read, read_nudged
+            act = plan.get("action")
+            if act not in ("read", "grep"):
+                return False
+            payload = {"action": act,
+                       "reasoning": "harness requirement assist"}
+            if act == "read":
+                payload.update(file=plan.get("file", ""),
+                               start=plan.get("start", 1),
+                               end=plan.get("end", 0))
+                detail = f"{payload['file']} L{payload['start']}-{payload['end']}"
+            else:
+                payload["pattern"] = plan.get("pattern", "")
+                detail = str(payload["pattern"])
+            try:
+                obs = dispatch(self.index, self.cfg, payload,
+                               client=self.client)
+            except Exception as e:
+                obs = (f"ERROR: {act} failed ({type(e).__name__}): "
+                       f"{str(e)[:160]}")
+            if not obs.startswith("ERROR"):
+                obs = safety.frame(act, obs, self.cfg)
+                obs = self._cap_observation(act, obs)
+            changed = False
+            if act == "read":
+                if not obs.startswith("ERROR"):
+                    obs = self._clip_read_to_token_budget(obs)
+                m = _READ_HEAD_RX.match(obs)
+                if m:
+                    key = _norm_key(m.group(1))
+                    s_, e_ = int(m.group(2)), int(m.group(3))
+                    prior = list(spans.get(key, []))
+                    new_lines = _read_has_new_lines(obs, prior)
+                    delta = _delta_len(obs, prior)
+                    spans.setdefault(key, []).append((s_, e_))
+                    self.requirements.observe_read(
+                        m.group(1).strip(), s_, e_, obs, self.index)
+                    self._unread_files = self._compute_unread(
+                        self._targets_text)
+                    if new_lines:
+                        did_read = True
+                        read_nudged = False
+                        self._record_evidence(obs, step)
+                        gathered.append(
+                            f"--- read {payload.get('file') or m.group(1).strip()}"
+                            f"\n{obs}")
+                        changed = True
+                    if delta > budget:
+                        obs = (obs[:budget] +
+                               "\n[truncated: context budget reached]")
+                        budget = 0
+                    else:
+                        budget -= delta
+                else:
+                    budget -= len(obs)
+                    self.requirements.observe_search(
+                        act, payload, obs, self.index)
+            else:
+                budget -= len(obs)
+                self.requirements.observe_search(act, payload, obs, self.index)
+                gathered.append(f"--- {act} {detail}\n{obs}")
+                changed = True
+            if obs.startswith("ERROR"):
+                gathered.append(f"--- {act} {detail} failed: {obs[:160]}")
+            self.steps_log.append(
+                f"{step}. auto-{act} {detail}  (requirement assist)")
+            if tail and messages and messages[-1]["role"] == "user":
+                messages[-1]["content"] += (
+                    f"\n\n[HARNESS {act.upper()} for an unmet requirement]\n"
+                    f"RESULT:\n{obs}")
+            else:
+                messages.append({"role": "assistant",
+                                 "content": _compact(payload)})
+                messages.append({"role": "user",
+                                 "content": f"RESULT:\n{obs}\n\n{nudge(step + 1)}"})
+            self._emit("step", n=step, action=act, detail=detail[:120],
+                       obs_chars=len(obs), auto=True)
+            return changed or True
+
+        def _requirement_assist(tail: bool = False) -> bool:
+            """Run up to two deterministic actions for the oldest unmet
+            requirement (grep -> read when the grep located an anchor)."""
+            acted = False
+            last_idx = None
+            last_sig = None
+            for _ in range(2):
+                if budget <= 0 or not self.requirements:
+                    break
+                plan, req = self.requirements.next_action(self.index)
+                if plan is None or req is None:
+                    break
+                idx = self.requirements.items.index(req)
+                if idx in req_assists:
+                    break
+                sig = (plan.get("action"), plan.get("file"), plan.get("start"),
+                       plan.get("end"), plan.get("pattern"))
+                if sig == last_sig:
+                    break
+                last_sig, last_idx = sig, idx
+                _requirement_action(plan, req, tail)
+                acted = True
+                # A grep that located an anchor earns the immediate read of
+                # that exact span; READ/final requirements need no more.
+                if (plan.get("action") == "grep"
+                        and req.state == verify_mod.REQ_LOCATED
+                        and req.anchors):
+                    continue
+                break
+            if acted and last_idx is not None:
+                req_assists.add(last_idx)
+            return acted
 
         while unlimited or step < step_cap:
             if call_cap > 0 and model_calls >= call_cap:
@@ -1739,6 +2095,32 @@ class Agent:
                         print("  (no source read yet; asking it to read before "
                               "answering)", file=sys.stderr)
                     continue
+                # Sprint 3: before accepting `done`, make sure every
+                # requirement has at least LOCATED/READ evidence. The cheapest
+                # action is deterministic: read a located anchor, else grep a
+                # specific requirement term. One assist per requirement. The
+                # gate is for multi-requirement tasks; a single clause already
+                # has the read nudge / prefetch path and must not turn an
+                # opt-out into a surprise lookup.
+                if (not at_limit and budget > 0 and self.requirements
+                        and len(self.requirements) >= 2):
+                    req = self.requirements.next_unmet()
+                    idx = (self.requirements.items.index(req)
+                           if req is not None else -1)
+                    if req is not None and idx not in req_assists:
+                        messages.append({"role": "assistant",
+                                         "content": _compact(stepjson)})
+                        messages.append({"role": "user", "content":
+                            self.requirements.prompt(req)
+                            + "\n[Harness: taking the cheapest lookup for it "
+                              "now.]"})
+                        if _requirement_assist():
+                            if verbose:
+                                print("  (a requirement was still "
+                                      f"{req.state}; the harness fetched the "
+                                      "cheapest lookup before accepting done)",
+                                      file=sys.stderr)
+                            continue
                 break
 
             if action == "question":
@@ -1882,6 +2264,9 @@ class Agent:
                     read_delta = _delta_len(obs, prior)
                     duplicate_read = (action == "read" and not new_lines)
                     spans.setdefault(key, []).append((s_, e_))
+                    if self.requirements:
+                        self.requirements.observe_read(
+                            m.group(1).strip(), s_, e_, obs, self.index)
                     if duplicate_read:
                         obs = (f"{m.group(1).strip()} lines {s_}-{e_}: "
                                "[already read; this range contains no new "
@@ -1951,6 +2336,13 @@ class Agent:
                     break
                 continue
             error_streak = 0
+            if self.requirements:
+                if action in ("write", "append", "move", "delete", "rename"):
+                    target = (stepjson.get("file") or stepjson.get("to") or "")
+                    self.requirements.observe_patch(str(target), obs)
+                elif action not in ("read", "context"):
+                    self.requirements.observe_search(
+                        action, stepjson, obs, self.index)
             # Reads are charged by new lines only (the eviction pass at the
             # end dedups the conversation).
             if read_delta is not None:
@@ -2026,6 +2418,24 @@ class Agent:
 
             if note_progress(step_progress):
                 break
+
+        # Sprint 3: a stall exit on a multi-requirement task still gets one
+        # deterministic requirement lookup while budget remains. It is appended
+        # at the tail, never rewriting a cached prefix, and costs no model call.
+        if (budget > 0 and self.requirements
+                and len(self.requirements) >= 2):
+            req = self.requirements.next_unmet()
+            if req is not None:
+                idx = self.requirements.items.index(req)
+                if idx not in req_assists:
+                    harness_note(self.requirements.prompt(req)
+                                 + "\n[Harness: one final deterministic "
+                                   "lookup for it.]")
+                    if _requirement_assist(tail=True):
+                        if verbose:
+                            print("  [gather stalled; the harness fetched "
+                                  "the oldest unmet requirement]",
+                                  file=sys.stderr)
 
         # P6 (A4.2): one bounded post-gather prefetch when named targets are
         # still unread or no ranked top-3 file was read.
@@ -2366,6 +2776,9 @@ class Agent:
             if not fixed:
                 break
             reply = fixed
+        tracker = getattr(self, "requirements", None)
+        if tracker is not None and getattr(tracker, "task", "") == task:
+            tracker.observe_edit(results)
         if verbose:
             for f in findings:
                 if f.severity == "warn":
@@ -2444,8 +2857,12 @@ class Agent:
         from . import verify as verify_mod
         est = getattr(self.client, "estimate_tokens", None) or estimate_tokens
         limit = max(1500, int((self.cfg.context_tokens - 900) * 0.5))
-        src, _ = _trim_gathered(gathered or "(nothing was looked up)",
-                                lambda t: est(t) > limit)
+        src, _ = _trim_gathered(
+            gathered or "(nothing was looked up)",
+            lambda t: est(t) > limit,
+            requirements=getattr(self, "requirements", None),
+            diagnostics=getattr(self, "active_diagnostics", None),
+            index=self.index)
         blocks = self._failed_block_texts(
             reply, [type("F", (), {"file": e.file})() for e in parse_edits(reply)])
         client = self._role_client("verifier")
@@ -2667,10 +3084,14 @@ class Agent:
                 notices.append(f"map shrunk to ~{small.flat_map_token_budget}"
                                " tokens")
         if est(user) > limit > 0:
-            # 3. oldest whole source items out, with re-read pointers
+            # 3. pack source by evidence utility (pinned requirement anchors,
+            # diagnostics, then keyword/graph/information-per-token score)
             head = assemble(notes_prefix, repo_map, "")
             src, dropped = _trim_gathered(
-                src, lambda text: est(head) + est(text) > limit)
+                src, lambda text: est(head) + est(text) > limit,
+                requirements=getattr(self, "requirements", None),
+                diagnostics=getattr(self, "active_diagnostics", None),
+                index=self.index)
             if dropped:
                 notices.append(f"{dropped} older source item(s) trimmed")
             user = assemble(notes_prefix, repo_map, src)
@@ -3012,6 +3433,7 @@ class Agent:
                 except Exception:
                     break
                 found = diagnostics_mod.new_findings(baseline, current)
+                self.active_diagnostics = found or {}
                 if not found:
                     break
                 n = sum(len(v) for v in found.values())
@@ -3051,6 +3473,12 @@ class Agent:
                 self._baseline_findings(baseline, parse_edits(fix))
                 reply = (reply.rstrip() + "\n\n" + fix) if reply.strip() else fix
                 results += self._apply_counted(fix, dry_run, backup_dir)
+        tracker = getattr(self, "requirements", None)
+        if tracker is not None and task and getattr(tracker, "task", "") == task:
+            tracker.observe_edit(results)
+            if not dry_run and not any(not r.ok for r in results):
+                tracker.observe_verified(
+                    {r.file for r in results if r.ok and r.file})
         return results, reply
 
     # ------------------------------------------------------------- repair help

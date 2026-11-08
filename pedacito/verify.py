@@ -18,7 +18,14 @@ edit blocks, before anything is written:
   moved import  a moved file is still imported by its old path
   citations     the prose cites `file:line` in files that were never read
   coverage      requirements extracted from the task that no edit or sentence
-                of the reply touches (a warning: heuristic)
+                of the reply touches (a warning: heuristic); each requirement
+                also carries an evidence state (UNLOCATED -> LOCATED -> READ
+                -> EDITED -> VERIFIED, or READ -> REPORTED for investigations)
+
+Sprint 3 makes that coverage ledger a run-scoped state machine
+(`RequirementTracker`): search results, displayed reads and clean patches move
+each clause forward, and the agent uses the oldest unmet clause to pick its
+next deterministic lookup. No transition costs a model call.
 
 Errors feed one bounded repair round; warnings are shown and logged. A model
 verifier (`verify_answer = "full"`) is one extra call, used only when the
@@ -37,7 +44,7 @@ from __future__ import annotations
 
 import difflib
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from . import fileio
 from .edits import locate, parse_edits
@@ -393,17 +400,197 @@ _VERBS = {"add", "make", "fix", "update", "change", "remove", "rename", "create"
           "your", "our", "its", "are", "can", "get", "set", "new", "old"}
 _WORD_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]{3,}")
 
+# Sprint 3: requirement evidence state machine. An edit requirement has to
+# travel UNLOCATED -> LOCATED -> READ -> EDITED -> VERIFIED; an investigation /
+# explain requirement travels UNLOCATED -> (LOCATED) -> READ -> REPORTED. A
+# search/find/outline result supplies LOCATED evidence, a displayed read span
+# supplies READ, a clean patch supplies EDITED/VERIFIED, and prose supplies
+# REPORTED. The tracker is cheap (no model calls) and monotonic.
+REQ_UNLOCATED = "UNLOCATED"
+REQ_LOCATED = "LOCATED"
+REQ_READ = "READ"
+REQ_EDITED = "EDITED"
+REQ_VERIFIED = "VERIFIED"
+REQ_REPORTED = "REPORTED"
 
-def requirement_ledger(task: str, limit: int = 5) -> list[tuple[str, list[str]]]:
-    """[(requirement text, key terms)] for up to `limit` clauses of the task.
-    Heuristic and free: split on sentence/bullet/`and add ...` boundaries, keep
-    each clause's distinctive words (identifiers, file names, numbers,
-    quoted text)."""
+# Short aliases so callers can spell a state the way the plan does.
+UNLOCATED = REQ_UNLOCATED
+LOCATED = REQ_LOCATED
+READ = REQ_READ
+EDITED = REQ_EDITED
+VERIFIED = REQ_VERIFIED
+REPORTED = REQ_REPORTED
+
+_REQ_ORDER = {
+    REQ_UNLOCATED: 0, REQ_LOCATED: 1, REQ_READ: 2,
+    REQ_EDITED: 3, REQ_REPORTED: 3, REQ_VERIFIED: 4,
+}
+_REQ_EDIT_RE = re.compile(
+    r"\b(?:add|make|fix|update|change|remove|rename|create|write|ensure|"
+    r"handle|support|use|return|move|delete|implement|refactor|replace|"
+    r"edit|modify|adjust|correct|bump|upgrade|migrate|introduce|apply|"
+    r"keep|allow|accept|raise|lower|increase|decrease|reduce|extend|"
+    r"prevent|avoid|guard|validate|normalize|normalise|convert|switch|"
+    r"wire|hook|register|append|insert|set)\b", re.IGNORECASE)
+_REQ_REPORT_RE = re.compile(
+    r"\b(?:explain|describe|summari[sz]e|investigate|trace|find|locate|"
+    r"identify|report|why|how|what|where|which|who|tell|show|list|answer|"
+    r"determine|clarify|review|audit)\b|\?", re.IGNORECASE)
+_REQ_LOCATION_RE = re.compile(
+    r"(?<![\w/.-])([A-Za-z0-9_./\\-]+\.[A-Za-z0-9_]{1,8}):(\d+)"
+    r"(?:-(\d+))?")
+
+
+@dataclass
+class Requirement:
+    """One task clause plus the evidence the harness has gathered for it."""
+    text: str
+    terms: list[str]
+    kind: str = "edit"                 # edit | report
+    state: str = REQ_UNLOCATED
+    anchors: list[tuple] = field(default_factory=list)    # (file, start, end)
+    read_spans: list[tuple] = field(default_factory=list)
+    edit_spans: list[tuple] = field(default_factory=list)
+
+    def __post_init__(self):
+        if self.kind not in ("edit", "report"):
+            self.kind = "edit"
+        if self.state not in _REQ_ORDER:
+            self.state = REQ_UNLOCATED
+        self.terms = list(dict.fromkeys(self.terms))
+
+    @property
+    def is_edit(self) -> bool:
+        return self.kind == "edit"
+
+    @property
+    def final(self) -> bool:
+        return self.state == (REQ_VERIFIED if self.is_edit else REQ_REPORTED)
+
+    @property
+    def open(self) -> bool:
+        return not self.final
+
+    def add_anchor(self, rel: str, start: int, end: int) -> None:
+        span = (fileio.normalise_rel(rel or ""), int(start or 1),
+                int(end or 0))
+        if span[0] and span not in self.anchors:
+            self.anchors.append(span)
+
+    def add_read(self, rel: str, start: int, end: int) -> None:
+        span = (fileio.normalise_rel(rel or ""), int(start or 1),
+                int(end or 0))
+        if span[0] and span not in self.read_spans:
+            self.read_spans.append(span)
+
+    def add_edit(self, rel: str) -> None:
+        rel = fileio.normalise_rel(rel or "")
+        if rel:
+            span = (rel, 0, 0)
+            if span not in self.edit_spans:
+                self.edit_spans.append(span)
+
+    def search_term(self) -> str:
+        """The most specific term to grep/find when this requirement has no
+        located anchor yet (identifiers and file names win over prose)."""
+        generic = {
+            "explain", "describe", "summarize", "summarise", "investigate",
+            "trace", "find", "locate", "identify", "report", "works", "work",
+            "logic", "thing", "things", "stuff", "code", "file", "files",
+            "update", "change", "make", "fix", "add", "new", "old", "the",
+            "and", "for", "with", "that", "this", "into", "from",
+        }
+
+        def rank(t: str):
+            score = len(t)
+            if "_" in t:
+                score += 8
+            if "." in t or "/" in t:
+                score += 6
+            if any(c.isdigit() for c in t):
+                score += 3
+            if t.isupper():
+                score += 2
+            if t.isdigit():
+                score -= 4
+            if t.lower() in generic:
+                score -= 10
+            return score
+        terms = [t for t in self.terms if len(t) >= 3]
+        return max(terms, key=rank) if terms else ""
+
+
+def _term_in(term: str, text: str) -> bool:
+    """Whether `term` appears as a word (or a simple plural stem) in `text`."""
+    term = (term or "").strip().lower()
+    if not term or not text:
+        return False
+    low = text.lower()
+    if re.search(r"(?<![\w])" + re.escape(term) + r"(?![\w])", low):
+        return True
+    stem = term.rstrip("s")
+    return stem != term and bool(
+        re.search(r"(?<![\w])" + re.escape(stem) + r"(?![\w])", low))
+
+
+def _match_score(terms, text: str) -> int:
+    return sum(1 for t in terms or () if _term_in(t, text))
+
+
+def _resolve_rel(name: str, index=None) -> str:
+    name = (name or "").strip().strip("`'\"")
+    if not name:
+        return ""
+    if index is not None:
+        try:
+            rel = index.resolve_file(name)
+            if rel:
+                return rel
+        except Exception:
+            pass
+    return fileio.normalise_rel(name)
+
+
+def _anchors_from_text(text: str, index=None) -> list[tuple]:
+    """Exact `file:line` / `file:start-end` anchors in a tool observation."""
+    out: list[tuple] = []
+    seen: set[tuple] = set()
+    for m in _REQ_LOCATION_RE.finditer(text or ""):
+        name = m.group(1)
+        if name.lower().startswith("http"):
+            continue
+        start = int(m.group(2))
+        end = int(m.group(3) or start)
+        if start <= 0 or end < start:
+            continue
+        rel = _resolve_rel(name, index)
+        if not rel:
+            continue
+        span = (rel, start, end)
+        if span not in seen:
+            seen.add(span)
+            out.append(span)
+        if len(out) >= 40:
+            break
+    return out
+
+
+def _clause_kind(clause: str, default: str) -> str:
+    if _REQ_EDIT_RE.search(clause or ""):
+        return "edit"
+    if _REQ_REPORT_RE.search(clause or ""):
+        return "report"
+    return default
+
+
+def _requirements_from_task(task: str, limit: int = 5) -> list[Requirement]:
     text = (task or "").split("\nTASK\n")[-1].strip()
     if not text:
         return []
     parts = [p.strip(" \t\n.,;") for p in _REQ_SPLIT_RE.split(text) if p]
-    reqs: list[tuple[str, list[str]]] = []
+    task_kind = "edit" if _REQ_EDIT_RE.search(text) else (
+        "report" if _REQ_REPORT_RE.search(text) else "edit")
+    reqs: list[Requirement] = []
     for p in parts:
         if len(p) < 8:
             continue
@@ -415,30 +602,350 @@ def requirement_ledger(task: str, limit: int = 5) -> list[tuple[str, list[str]]]
         terms += re.findall(r"\b\d+\b", p)
         terms += re.findall(r"[\"'`]([^\"'`]{2,40})[\"'`]", p)
         if terms:
-            reqs.append((p[:140], list(dict.fromkeys(terms))[:8]))
+            reqs.append(Requirement(
+                p[:140], list(dict.fromkeys(terms))[:8],
+                _clause_kind(p, task_kind)))
     return reqs[:limit]
 
 
-def check_coverage(task: str, reply: str, edits) -> list[Finding]:
+def requirement_ledger(task: str, limit: int = 5) -> list[tuple[str, list[str]]]:
+    """[(requirement text, key terms)] for up to `limit` clauses of the task.
+    Heuristic and free: split on sentence/bullet/`and add ...` boundaries, keep
+    each clause's distinctive words (identifiers, file names, numbers,
+    quoted text)."""
+    return [(r.text, r.terms) for r in _requirements_from_task(task, limit)]
+
+
+class RequirementTracker:
+    """Run-scoped requirement evidence state machine.
+
+    The tracker is deliberately deterministic: every transition comes from a
+    tool result or a proposed patch the harness already has, never from another
+    model call. It powers both the gather completion gate (oldest unmet
+    requirement) and the answer-phase source packer (pinned located spans).
+    """
+
+    def __init__(self, task: str = "", limit: int = 5):
+        self.task = task or ""
+        self.items = _requirements_from_task(self.task, limit)
+
+    # ---- container conveniences
+    def __iter__(self):
+        return iter(self.items)
+
+    def __len__(self):
+        return len(self.items)
+
+    def __getitem__(self, i):
+        return self.items[i]
+
+    @property
+    def requirements(self) -> list[Requirement]:
+        return self.items
+
+    def states(self) -> list[tuple[str, str]]:
+        return [(r.text, r.state) for r in self.items]
+
+    def unmet(self, states=(REQ_UNLOCATED, REQ_LOCATED)) -> list[Requirement]:
+        return [r for r in self.items if r.state in states]
+
+    def next_unmet(self, states=(REQ_UNLOCATED, REQ_LOCATED)):
+        found = self.unmet(states)
+        return found[0] if found else None
+
+    # Alias kept explicit: the gather gate asks for the OLDEST requirement.
+    oldest_unmet = next_unmet
+
+    def _advance(self, req: Requirement, target: str) -> bool:
+        """Promote `req` monotonically to `target`, filling in the states a
+        stronger piece of evidence implies (a verified patch also proves the
+        span was read). Returns True when the state changed."""
+        if _REQ_ORDER.get(req.state, 0) >= _REQ_ORDER.get(target, 0):
+            return False
+        req.state = target
+        return True
+
+    def _locate(self, req: Requirement, anchors=(), files=()) -> None:
+        for rel, a, b in anchors:
+            req.add_anchor(rel, a, b)
+        for rel in files:
+            req.add_anchor(rel, 1, 0)
+        self._advance(req, REQ_LOCATED)
+
+    # ---- evidence transitions
+    def observe_search(self, action: str, step: dict | None = None,
+                       observation: str = "", index=None) -> list[Requirement]:
+        """A grep/find/outline/callers/context result that names a requirement
+        term (or a file/line anchor) advances it to LOCATED."""
+        step = step or {}
+        obs = observation or ""
+        if obs.startswith("ERROR"):
+            return []
+        query = " ".join(str(step.get(k) or "") for k in
+                         ("pattern", "symbol", "file", "content", "command"))
+        anchors = _anchors_from_text(obs, index)
+        changed = []
+        for req in self.items:
+            if req.state not in (REQ_UNLOCATED, REQ_LOCATED):
+                continue
+            q_hit = _match_score(req.terms, query)
+            o_hit = _match_score(req.terms, obs)
+            # A grep only locates when its RESULT mentions the term; find /
+            # outline / callers may locate from the query itself because their
+            # output is a definition list for exactly that query. Anchors alone
+            # are generic to the observation, so they do not locate every
+            # requirement in the task.
+            evidence = o_hit or (
+                q_hit and action in ("find", "outline", "callers", "context"))
+            if not evidence:
+                continue
+            files = []
+            for key in ("file", "pattern", "symbol"):
+                val = step.get(key)
+                if not isinstance(val, str) or not _match_score(req.terms, val):
+                    continue
+                rel = _resolve_rel(val, index)
+                if rel and "." in val:
+                    files.append(rel)
+            self._locate(req, anchors, files)
+            changed.append(req)
+        return changed
+
+    def observe_read(self, file: str, start: int, end: int, text: str = "",
+                     index=None) -> list[Requirement]:
+        """A displayed read/context span that touches requirement terms or a
+        previously located anchor advances the requirement to READ."""
+        rel = _resolve_rel(file, index)
+        if not rel or (text or "").startswith("ERROR"):
+            return []
+        changed = []
+        for req in self.items:
+            if req.final:
+                continue
+            hit = _match_score(req.terms, rel + "\n" + (text or ""))
+            overlap = any(
+                _same_file(rel, a_rel) and _spans_overlap(start, end, a, b)
+                for a_rel, a, b in req.anchors)
+            if not (hit or overlap):
+                continue
+            req.add_read(rel, start, end)
+            if req.state != REQ_READ and self._advance(req, REQ_READ):
+                changed.append(req)
+        return changed
+
+    def observe_edit(self, edits=None, *, file: str = "", search: str = "",
+                     replace: str = "", ok: bool = True) -> list[Requirement]:
+        """A clean patch whose file/text touches a requirement advances it to
+        EDITED (passing through the earlier states, which the patch proves)."""
+        if edits is None:
+            edits = [{"file": file, "search": search,
+                      "replace": replace, "ok": ok}]
+        elif isinstance(edits, (str, dict)) or hasattr(edits, "file"):
+            edits = [edits]
+        changed = []
+        for e in edits or ():
+            if isinstance(e, str):
+                e = {"file": e, "search": "", "replace": "", "ok": True}
+            if isinstance(e, dict):
+                rel = e.get("file", "")
+                before = e.get("search", "")
+                after = e.get("replace", "")
+                good = e.get("ok", True)
+            else:
+                rel = getattr(e, "file", "")
+                before = getattr(e, "search", "") or getattr(e, "before", "")
+                after = getattr(e, "replace", "") or getattr(e, "after", "")
+                good = getattr(e, "ok", True)
+            if not good or not rel:
+                continue
+            rel = _resolve_rel(rel)
+            text = f"{rel}\n{before}\n{after}"
+            for req in self.items:
+                if not req.is_edit or req.final:
+                    continue
+                hit = _match_score(req.terms, text)
+                overlap = any(
+                    _same_file(rel, a_rel)
+                    for a_rel, _a, _b in req.anchors + req.read_spans)
+                if not (hit or overlap):
+                    continue
+                req.add_edit(rel)
+                if self._advance(req, REQ_EDITED):
+                    changed.append(req)
+        return changed
+
+    def observe_patch(self, file: str, text: str = "", ok: bool = True
+                      ) -> list[Requirement]:
+        """A `write`/`append`/`move` tool result is an edit too."""
+        return self.observe_edit(file=file, replace=text, ok=ok)
+
+    def observe_verified(self, files=None) -> list[Requirement]:
+        """Promote EDITED edit requirements to VERIFIED after the checks and
+        tests accept the patch. `files` narrows it to the touched files."""
+        changed = []
+        wanted = {_resolve_rel(f) for f in files} if files else None
+        for req in self.items:
+            if not req.is_edit or req.state != REQ_EDITED:
+                continue
+            if wanted is not None and not any(
+                    _same_file(f, rel) for rel in wanted
+                    for f, _a, _b in req.edit_spans):
+                continue
+            if self._advance(req, REQ_VERIFIED):
+                changed.append(req)
+        return changed
+
+    def observe_report(self, reply: str) -> list[Requirement]:
+        """Prose that answers a READ investigation requirement reports it."""
+        changed = []
+        for req in self.items:
+            if req.kind != "report" or req.state != REQ_READ:
+                continue
+            if _match_score(req.terms, _prose(reply)):
+                self._advance(req, REQ_REPORTED)
+                changed.append(req)
+        return changed
+
+    def observe_answer(self, reply: str, edits=None, results=None
+                       ) -> list[Requirement]:
+        changed = []
+        if results is not None:
+            changed += self.observe_edit(results)
+        elif edits is not None:
+            changed += self.observe_edit(edits)
+        changed += self.observe_report(reply)
+        return changed
+
+    # ---- gather completion / packing helpers
+    def next_action(self, index=None) -> tuple[dict | None, Requirement | None]:
+        """The cheapest deterministic action for the oldest requirement that
+        is still UNLOCATED or LOCATED, or (None, None). A located anchor is
+        read directly; otherwise a specific term is searched."""
+        for req in self.items:
+            if req.state not in (REQ_UNLOCATED, REQ_LOCATED):
+                continue
+            if req.state == REQ_LOCATED:
+                for rel, a, b in req.anchors:
+                    if any(_same_file(rel, r) and _spans_overlap(a, b or a, x, y)
+                           for r, x, y in req.read_spans):
+                        continue
+                    start, end = max(1, a), max(0, b)
+                    # A grep hit names a line; when it lands inside an indexed
+                    # definition, read that whole definition so the eventual
+                    # SEARCH block can quote real body lines.
+                    if index is not None:
+                        try:
+                            units = [c for c in index.in_file(rel)
+                                     if c.kind not in ("module", "reference")
+                                     and c.start <= start <= c.end]
+                            if units:
+                                unit = min(units, key=lambda c: c.nlines)
+                                start = max(1, unit.start)
+                                end = max(start, unit.scope_end or unit.end)
+                        except Exception:
+                            pass
+                    return {"action": "read", "file": rel,
+                            "start": start, "end": end}, req
+            term = req.search_term()
+            if term:
+                return {"action": "grep", "pattern": term}, req
+        return None, None
+
+    # Explicit alias for callers that describe the choice, not the ordering.
+    cheapest_action = next_action
+
+    def prompt(self, req: Requirement | None = None) -> str:
+        """A specific harness nudge naming the oldest unmet requirement."""
+        req = req or self.next_unmet()
+        if req is None:
+            return ""
+        if req.state == REQ_LOCATED and req.anchors:
+            rel, a, b = req.anchors[0]
+            span = f"{rel}:{a}-{b}" if b else f"{rel}:{a}"
+            return (f"[Harness: requirement still {req.state}: '{req.text}'. "
+                    f"You located it at {span} but have not read it; `read` "
+                    f"that exact span before answering.]")
+        term = req.search_term()
+        how = f"`grep`/`find` for '{term}'" if term else "locate the code"
+        return (f"[Harness: requirement still {req.state}: '{req.text}'. "
+                f"Use {how} and then `read` the matching span before "
+                f"answering.]")
+
+    def pinned_spans(self) -> list[tuple]:
+        """Exact spans the answer packer must never evict: located anchors and
+        displayed reads for every requirement that got past UNLOCATED."""
+        out: list[tuple] = []
+        for req in self.items:
+            if req.state == REQ_UNLOCATED:
+                continue
+            for span in req.anchors + req.read_spans:
+                if span not in out:
+                    out.append(span)
+        return out
+
+    def packing_terms(self) -> list[tuple[list[str], int]]:
+        """(terms, weight) for the source packer; unread requirements weigh
+        most because their evidence is what the answer still needs."""
+        out = []
+        for req in self.items:
+            if req.final:
+                continue
+            weight = 3 if req.state in (REQ_UNLOCATED, REQ_LOCATED) else (
+                2 if req.state == REQ_READ else 1)
+            out.append((req.terms, weight))
+        return out
+
+
+def requirement_tracker(task: str, limit: int = 5) -> RequirementTracker:
+    """Convenience constructor for the run-scoped state machine."""
+    return RequirementTracker(task, limit)
+
+
+def _same_file(a: str, b: str) -> bool:
+    a, b = fileio.path_key(a or ""), fileio.path_key(b or "")
+    return bool(a and b and (a == b or a.endswith("/" + b)
+                             or b.endswith("/" + a)))
+
+
+def _spans_overlap(a1: int, b1: int, a2: int, b2: int) -> bool:
+    """Overlap for 1-based inclusive spans; an end of 0 means whole file."""
+    if not a1 or not a2:
+        return True
+    b1 = b1 or 10 ** 9
+    b2 = b2 or 10 ** 9
+    return not (b1 < a2 or b2 < a1)
+
+
+def check_coverage(task: str, reply: str, edits,
+                   tracker: RequirementTracker | None = None) -> list[Finding]:
     """Requirements whose key terms appear nowhere in the edits, their file
     names, or the reply's prose. Runs for prose-only replies too (P1a), not
-    only when edit blocks are present."""
-    reqs = requirement_ledger(task)
+    only when edit blocks are present. When a live RequirementTracker is
+    supplied, its states are authoritative for what counts as addressed."""
+    if tracker is None or tracker.task != task:
+        tracker = RequirementTracker(task)
+    reqs = tracker.items
     if len(reqs) < 2:
         return []
+    tracker.observe_edit(edits)
+    tracker.observe_report(reply)
     haystack = "\n".join([_prose(reply)] + [f"{e.file}\n{e.replace}\n{e.search}"
                                             for e in edits]).lower()
     out = []
-    for text, terms in reqs:
+    for req in reqs:
+        text, terms = req.text, req.terms
         hit = sum(1 for t in terms if t.lower() in haystack
                   or t.lower().rstrip("s") in haystack)
         if "test" in text.lower() and any("test" in e.file.lower() for e in edits):
             continue
+        if req.state in (REQ_EDITED, REQ_VERIFIED, REQ_REPORTED):
+            continue
         if hit == 0:
             out.append(Finding(
                 "coverage", "warn", "", f"no edit or sentence addresses: "
-                f"'{text}'"))
+                f"'{text}' (still {req.state})"))
     return out[:3]
+
 
 
 def _fuzzy_regions(before: str, after: str) -> list[tuple[int, int]]:
@@ -585,7 +1092,10 @@ def check(agent, task: str, reply: str, results, gathered: str = ""
         findings += check_stale_references(agent, results)
         findings += check_moved_imports(agent, results)
         findings += check_citations(agent, reply)
-        findings += check_coverage(task, reply, edits)
+        tracker = getattr(agent, "requirements", None)
+        if tracker is not None and getattr(tracker, "task", "") != task:
+            tracker = None
+        findings += check_coverage(task, reply, edits, tracker=tracker)
         findings += check_fuzzy(results)
     except Exception as e:                  # a checker bug must not block a task
         findings.append(Finding("model", "warn", "",
