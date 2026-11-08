@@ -180,6 +180,29 @@ The cheapest reliable feedback is the code itself:
   linter/type-checker output is diffed against a pre-edit baseline, and
   failures feed the repair rounds. An applied edit that breaks tests is an
   objective signal no model self-critique can fake.
+- **Immediate AST syntax gate.** Before any linter or pytest subprocess starts,
+  the dry-applied in-memory buffers are parsed in-process: `ast.parse` for
+  Python, the existing tree-sitter grammar for every other supported language.
+  A file that parsed before but does not parse after is rejected immediately
+  (typically under 5 ms), and repair receives only the parser diagnostic plus a
+  single 10-line window around the error. The subprocess check is deferred
+  until the patch parses. Because the gate compares before and after, a file
+  that was already broken can still be repaired — only a *new* syntax error
+  trips it.
+- **Failure-identity diffing.** Pytest's stable node ids (plus a normalized
+  assertion signature when no id survives truncation) identify each failure
+  across runs. The post-edit run is classified against the pre-edit baseline as
+  `new`, `fixed`, `pre-existing`, or `still_failing`. A `new` failure triggers
+  repair even when the total failure count is unchanged or lower — the scalar
+  count cannot see "one old failure fixed, one new failure introduced".
+- **Traceback Repair Packets.** Instead of the last 1,800 characters of raw
+  output, repair gets a structured packet: the failing test's node id and
+  normalized signature, a ~15-line window around the failing assertion, and a
+  ~15-line window around the innermost implicated project traceback frame.
+  Frames from `.venv`, `site-packages`, `dist-packages`, `node_modules` and
+  other environment directories are discarded, as are unrelated pre-existing
+  failures, so the model sees the code that actually broke and not a
+  transcript.
 
 ### 6. Sampling the right amount
 

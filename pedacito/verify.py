@@ -42,6 +42,7 @@ those exact lines from disk at its tail.
 
 from __future__ import annotations
 
+import ast
 import difflib
 import re
 from dataclasses import dataclass, field
@@ -65,6 +66,122 @@ class Finding:
     def render(self) -> str:
         loc = f"{self.file}:{self.line}" if self.line else self.file
         return f"[{self.severity}] {self.kind}: {loc} -- {self.message}"
+
+
+# ------------------------------------------------------- immediate syntax gate
+# A candidate patch is parsed in memory BEFORE any linter or test subprocess is
+# started. Python uses `ast.parse`; every other language chunker_ts knows uses
+# its tree-sitter grammar. The check compares the dry-applied `after` text with
+# the original `before` text, so a file that was already broken stays editable
+# (the edit path's recovery case) while a NEW syntax error rejects the patch in
+# microseconds. The repair prompt gets the parser diagnostic plus a single
+# 10-line window, never the whole file or a subprocess transcript.
+_SYNTAX_WINDOW_LINES = 10
+
+
+def _file_suffix(rel: str) -> str:
+    """Lowercase extension of a path without importing Path for every check."""
+    name = str(rel or "").replace("\\", "/").rsplit("/", 1)[-1]
+    return ("." + name.rsplit(".", 1)[-1].lower()) if "." in name else ""
+
+
+def _syntax_problem(rel: str, text: str) -> tuple[bool, int | None, str]:
+    """(has_error, 1-based line, parser diagnostic) for `text` as `rel`'s
+    language. Unsupported extensions and unavailable parsers are not errors."""
+    suffix = _file_suffix(rel)
+    body = text if isinstance(text, str) else ""
+    if suffix == ".py":
+        try:
+            ast.parse(body)
+        except SyntaxError as e:
+            line = int(e.lineno or 0) or None
+            col = int(e.offset or 0)
+            return (True, line,
+                    f"ast.parse: {e.msg} (line {line or '?'}"
+                    + (f", column {col}" if col else "") + ")")
+        except (ValueError, TypeError) as e:      # null bytes / bad source type
+            return True, None, f"ast.parse: {type(e).__name__}: {e}"
+        return False, None, ""
+
+    try:
+        from .chunker_ts import LANG_BY_EXT, TS_AVAILABLE, has_syntax_error
+    except Exception:                              # pragma: no cover - import guard
+        return False, None, ""
+    language = LANG_BY_EXT.get(suffix)
+    if not language or not TS_AVAILABLE:
+        return False, None, ""
+    try:
+        bad, line = has_syntax_error(body, language)
+    except Exception:                              # unsupported/broken grammar
+        return False, None, ""
+    if not bad:
+        return False, None, ""
+    line = int(line or 0) or None
+    return (True, line,
+            f"tree-sitter {language}: ERROR node near line {line or '?'}")
+
+
+def _syntax_window(text: str, line: int | None,
+                   max_lines: int = _SYNTAX_WINDOW_LINES
+                   ) -> tuple[str, int, int]:
+    """(numbered window, first line, last line) around `line`; at most
+    `max_lines` source lines, with the error line marked by `>>`."""
+    lines = str(text or "").split("\n")
+    if lines and lines[-1] == "" and len(lines) > 1:
+        lines.pop()
+    if not lines:
+        return "", 0, 0
+    err = max(1, min(int(line or 1), len(lines)))
+    before = max(1, max_lines // 2)
+    start = max(1, err - before)
+    end = min(len(lines), start + max_lines - 1)
+    start = max(1, end - max_lines + 1)
+    shown = []
+    for i in range(start, end + 1):
+        mark = ">>" if i == err else "  "
+        shown.append(f"{mark}{i:>4}| {lines[i - 1]}")
+    return "\n".join(shown), start, end
+
+
+def check_syntax(results) -> list[Finding]:
+    """New syntax errors in dry-applied results, checked in-process.
+
+    `Result.before`/`Result.after` are the in-memory buffers before and after a
+    file's blocks. A parse failure that already existed in `before` is not a
+    new failure (repairing a broken file must stay possible); only a transition
+    from parseable to unparseable rejects the patch. Each finding carries the
+    parser diagnostic and exactly the error's 10-line window, so callers can
+    feed repair without running a linter or test subprocess first."""
+    out: list[Finding] = []
+    for r in results or ():
+        if not getattr(r, "ok", False) or not getattr(r, "file", ""):
+            continue
+        after = getattr(r, "after", None)
+        if after is None:
+            continue
+        before = getattr(r, "before", None)
+        if before is None:
+            before = ""
+        was_bad, _, _ = _syntax_problem(r.file, before)
+        if was_bad:
+            continue
+        is_bad, line, diagnostic = _syntax_problem(r.file, after)
+        if not is_bad:
+            continue
+        window, start, end = _syntax_window(after, line)
+        message = (
+            f"this edit introduces a syntax error at {r.file}:"
+            f"{line or '?'}; {diagnostic}. No lint or test process was run. "
+            f"Fix the syntax first; only the {_SYNTAX_WINDOW_LINES}-line "
+            f"parser window is shown:\n"
+            f"lines {start}-{end}:\n{window}")
+        out.append(Finding("syntax", "error", r.file, message,
+                           line=line or 0, lines=(start, end)))
+    return out
+
+
+# Readable alias for callers that describe the result rather than the check.
+syntax_findings = check_syntax
 
 
 # ------------------------------------------------------------ placeholders
@@ -1087,6 +1204,7 @@ def check(agent, task: str, reply: str, results, gathered: str = ""
     findings: list[Finding] = []
     try:
         edits = parse_edits(reply)
+        findings += check_syntax(results)
         findings += check_placeholders(task, edits)
         findings += check_unread(agent, edits, results)
         findings += check_stale_references(agent, results)

@@ -784,6 +784,445 @@ def _failure_score(output: str, diag: bool = False) -> int:
     return 1
 
 
+# ------------------------------------------- failure identity + traceback packet
+# A scalar count cannot tell "one old failure fixed, one new failure added"
+# from "nothing changed". These helpers key each failure by its stable pytest
+# node id (falling back to a normalized assertion signature when no id exists)
+# and diff two runs by identity. A truly new id repairs even when the totals
+# are equal. The repair prompt gets a small structured packet instead of the
+# tail of the raw test output.
+_ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
+_PYTEST_SUMMARY_RE = re.compile(
+    r"(?m)^(?P<kind>FAILED|ERROR)\s+(?P<id>.+?)"
+    r"(?:\s+-\s+(?P<reason>.*))?$")
+_PYTEST_SECTION_RE = re.compile(r"^=+\s*(?:FAILURES|ERRORS)\s*=+$")
+_PYTEST_SHORT_RE = re.compile(r"^=+\s*short test summary info\s*=+$")
+_PYTEST_BLOCK_RE = re.compile(r"^_{3,}\s*(?P<name>.+?)\s*_{3,}$")
+_PYTEST_LOCATION_RE = re.compile(
+    r"^(?P<file>[^\s:][^:]*):(?P<line>\d+):\s*(?P<rest>.*)$")
+_PYTEST_FRAME_RE = re.compile(
+    r'^\s*File\s+"(?P<file>[^"]+)",\s+line\s+(?P<line>\d+),'
+    r'\s+in\s+(?P<func>.*)$', re.M)
+_TRACEBACK_EXC_RE = re.compile(
+    r"(?m)^(?P<exc>[A-Za-z_][\w.]*(?:Error|Exception|Failure|Exit))\b"
+    r"(?::\s*(?P<msg>.*))?$")
+
+
+@dataclass
+class FailureIdentity:
+    """One failing test, stable across runs by node id + assertion signature."""
+    test_id: str
+    signature: str = ""
+    kind: str = "failed"          # "failed" | "error"
+    file: str = ""                # location line from the traceback block
+    line: int = 0
+    block: str = ""
+    frames: list[tuple[str, int, str]] = field(default_factory=list)
+
+
+@dataclass
+class FailureDiff:
+    """Identity-level comparison of a pre-edit and post-edit test run.
+
+    `new` drives repair. `fixed`, `still_failing` and `pre_existing` are kept
+    for the packet and the run log: `pre_existing` is every failure the suite
+    already had before the edit, and `still_failing` is the subset still red.
+    """
+    new: list[FailureIdentity] = field(default_factory=list)
+    fixed: list[FailureIdentity] = field(default_factory=list)
+    pre_existing: list[FailureIdentity] = field(default_factory=list)
+    still_failing: list[FailureIdentity] = field(default_factory=list)
+
+    @property
+    def has_new(self) -> bool:
+        return bool(self.new)
+
+
+def _normalise_test_id(test_id: str) -> str:
+    """Normalise path separators and a leading `./` so the same node id from
+    two runs compares equal; keep the class/function/param suffix intact."""
+    parts = str(test_id or "").strip().split("::")
+    head = parts[0].replace("\\", "/")
+    while head.startswith("./"):
+        head = head[2:]
+    return "::".join([head] + parts[1:])
+
+
+def _normalise_failure_signature(text: str) -> str:
+    """A stable assertion signature: whitespace, ANSI colour, object
+    addresses, source paths and line numbers are normalised; the assertion and
+    exception wording survives so two different failures stay distinguishable.
+    """
+    sig = _ANSI_ESCAPE_RE.sub("", str(text or ""))
+    sig = re.sub(r"0x[0-9a-fA-F]+", "0x<addr>", sig)
+    sig = re.sub(
+        r"(?<![\w])(?:[A-Za-z]:)?(?:[/\\][^\s:]+)+"
+        r"\.(?:py|pyw|js|jsx|ts|tsx|rb|go|rs|java|c|cc|cpp|h|hpp|cs|php|kt|"
+        r"kts|swift|scala|lua)(?::\d+)?", "<path>", sig)
+    sig = re.sub(
+        r"\b[\w./\\-]+\.(?:py|pyw|js|jsx|ts|tsx|rb|go|rs|java|c|cc|cpp|h|"
+        r"hpp|cs|php|kt|kts|swift|scala|lua):\d+\b", "<path>", sig)
+    sig = re.sub(r"\bline \d+\b", "line <n>", sig, flags=re.IGNORECASE)
+    sig = re.sub(r"\s+", " ", sig).strip()
+    return sig[:240] or "(no assertion message)"
+
+
+def _pytest_summary_rows(text: str) -> list[tuple[str, str, str]]:
+    """(kind, node id, reason) rows from pytest's short summary."""
+    rows = []
+    for m in _PYTEST_SUMMARY_RE.finditer(text or ""):
+        node_id = m.group("id").strip()
+        if not node_id:
+            continue
+        rows.append((m.group("kind").lower(), _normalise_test_id(node_id),
+                     _normalise_failure_signature(m.group("reason") or "")))
+    return rows
+
+
+def _pytest_failure_blocks(text: str) -> list[tuple[str, str]]:
+    """(header name, block text) for each pytest FAILURES/ERRORS section."""
+    blocks: list[tuple[str, str]] = []
+    in_failures = False
+    name = ""
+    buf: list[str] = []
+
+    def flush() -> None:
+        nonlocal name, buf
+        if name:
+            body = "\n".join(buf).strip("\n")
+            if body.strip():
+                blocks.append((name, body))
+        name, buf = "", []
+
+    for line in (text or "").splitlines():
+        if _PYTEST_SECTION_RE.match(line):
+            flush()
+            in_failures = True
+            continue
+        if _PYTEST_SHORT_RE.match(line):
+            flush()
+            in_failures = False
+            continue
+        if not in_failures:
+            continue
+        m = _PYTEST_BLOCK_RE.match(line)
+        if m:
+            flush()
+            name = m.group("name").strip()
+            continue
+        if name:
+            buf.append(line)
+    flush()
+    return blocks
+
+
+def _block_failure(name: str, block: str,
+                   node_id: str = "") -> FailureIdentity:
+    """Build a FailureIdentity from one pytest traceback/assertion block."""
+    lines = block.splitlines()
+    reason = ""
+    for ln in lines:
+        stripped = ln.lstrip()
+        if stripped.startswith("E ") or stripped == "E":
+            reason = stripped[1:].strip()
+            if reason:
+                break
+    loc_file, loc_line, loc_rest = "", 0, ""
+    for ln in reversed(lines):
+        m = _PYTEST_LOCATION_RE.match(ln.strip())
+        if not m:
+            continue
+        candidate = m.group("file").strip()
+        if "." in candidate or "/" in candidate or "\\" in candidate:
+            loc_file = candidate
+            loc_line = int(m.group("line"))
+            loc_rest = m.group("rest").strip()
+            break
+    if not reason:
+        reason = loc_rest
+    if not reason:
+        m = _TRACEBACK_EXC_RE.search(block)
+        if m:
+            reason = (m.group("exc")
+                      + (": " + m.group("msg") if m.group("msg") else ""))
+    frames = [(m.group("file"), int(m.group("line")), m.group("func").strip())
+              for m in _PYTEST_FRAME_RE.finditer(block)]
+    if not node_id:
+        if "::" in name:
+            node_id = name
+        elif loc_file:
+            node_id = f"{loc_file}::{name}"
+        else:
+            node_id = name
+    node_id = _normalise_test_id(node_id)
+    return FailureIdentity(
+        node_id, _normalise_failure_signature(reason),
+        "failed", loc_file, loc_line, block, frames)
+
+
+def _block_match(node_id: str, blocks: list[tuple[str, str]],
+                 used: set[int]) -> int | None:
+    """Index of the failure block that belongs to `node_id`, if any."""
+    tail = node_id.split("::")[-1]
+    bare = tail.split("[", 1)[0]
+    for i, (name, _body) in enumerate(blocks):
+        if i in used:
+            continue
+        n_tail = name.split("::")[-1].split("[", 1)[0]
+        if (name == node_id or name == tail
+                or node_id.endswith("::" + name)
+                or n_tail == bare):
+            return i
+    return None
+
+
+def failure_identities(output: str) -> dict[str, FailureIdentity]:
+    """Stable failing-test identities from a pytest run, keyed by node id.
+
+    The short summary supplies ids and reasons; the FAILURES/ERRORS blocks
+    add the source location and project traceback frames. When a run has no
+    pytest summary (truncated output, another runner) a bare traceback still
+    yields one signature-keyed identity rather than silently losing the
+    failure. No model call and no file I/O happen here."""
+    text = _ANSI_ESCAPE_RE.sub("", output or "")
+    blocks = _pytest_failure_blocks(text)
+    infos: dict[str, FailureIdentity] = {}
+    used: set[int] = set()
+    for kind, node_id, reason in _pytest_summary_rows(text):
+        info = FailureIdentity(node_id, reason, kind)
+        i = _block_match(node_id, blocks, used)
+        if i is not None:
+            used.add(i)
+            detail = _block_failure(blocks[i][0], blocks[i][1], node_id)
+            info.file, info.line = detail.file, detail.line
+            info.block, info.frames = detail.block, detail.frames
+            if info.signature.startswith("(no assertion"):
+                info.signature = detail.signature
+        infos[node_id] = info
+    for i, (name, block) in enumerate(blocks):
+        if i in used:
+            continue
+        info = _block_failure(name, block)
+        if not info.test_id:
+            info.test_id = f"signature::{info.signature}"
+        if info.test_id in infos:
+            old = infos[info.test_id]
+            old.file, old.line = info.file, info.line
+            old.block, old.frames = info.block, info.frames
+            if old.signature.startswith("(no assertion"):
+                old.signature = info.signature
+        else:
+            infos[info.test_id] = info
+    if not infos:
+        frames = [(m.group("file"), int(m.group("line")),
+                   m.group("func").strip())
+                  for m in _PYTEST_FRAME_RE.finditer(text)]
+        m = None
+        for m in _TRACEBACK_EXC_RE.finditer(text):
+            pass
+        if frames or m:
+            reason = ((m.group("exc")
+                       + (": " + m.group("msg") if m.group("msg") else ""))
+                      if m else "test failed")
+            signature = _normalise_failure_signature(reason)
+            ident = ("output::" + signature)
+            info = FailureIdentity(ident, signature, "error")
+            if frames:
+                info.frames = frames
+                info.file, info.line = frames[-1][0], frames[-1][1]
+            infos[ident] = info
+    return infos
+
+
+# Aliases used by callers that describe the parse step rather than the result.
+parse_failure_identities = failure_identities
+_failure_identities = failure_identities
+
+
+def classify_failures(baseline_output: str,
+                      current_output: str) -> FailureDiff:
+    """Diff post-edit failures against the pre-edit baseline by identity.
+
+    `new` is a current node id that was not failing before (or a signature
+    when ids are unavailable); `fixed` is a baseline id that is gone;
+    `still_failing` is the baseline intersection. A new failure is a repair
+    trigger even when the total failure count is unchanged."""
+    before = failure_identities(baseline_output)
+    after = failure_identities(current_output)
+    diff = FailureDiff(pre_existing=list(before.values()))
+    for key, failure in after.items():
+        if key in before:
+            diff.still_failing.append(failure)
+        else:
+            diff.new.append(failure)
+    diff.fixed = [failure for key, failure in before.items()
+                  if key not in after]
+    return diff
+
+
+_classify_failures = classify_failures
+
+
+def _project_rel(root: Path, name: str) -> str:
+    """Project-relative path for a traceback frame, or "" for a path outside
+    the project or inside an environment directory (`.venv`, site-packages,
+    node_modules...). Those frames are never sent to repair."""
+    if not name:
+        return ""
+    path = Path(name)
+    if not path.is_absolute():
+        path = Path(root) / path
+    try:
+        rel = path.resolve().relative_to(Path(root).resolve())
+    except (OSError, RuntimeError, ValueError):
+        return ""
+    parts = [part.lower() for part in rel.parts]
+    if any(part in {".venv", "venv", ".tox", "node_modules", "site-packages",
+                    "dist-packages"} for part in parts):
+        return ""
+    if any("site-packages" in part or "dist-packages" in part
+           for part in parts):
+        return ""
+    return rel.as_posix()
+
+
+def _same_rel(a: str, b: str) -> bool:
+    a = str(a or "").replace("\\", "/").lstrip("./")
+    b = str(b or "").replace("\\", "/").lstrip("./")
+    return bool(a and b and (a == b or a.endswith("/" + b)
+                             or b.endswith("/" + a)))
+
+
+def _source_window(root: Path, rel: str, line: int,
+                   max_lines: int = 15) -> tuple[str, int, int, str]:
+    """(numbered window, first line, last line, rel) around `line`; 15 lines
+    by default, with the implicated line marked `>>`."""
+    project_rel = _project_rel(root, rel)
+    if not project_rel:
+        return "", 0, 0, ""
+    try:
+        text = (Path(root) / project_rel).read_text(
+            encoding="utf-8", errors="replace")
+    except OSError:
+        return "", 0, 0, project_rel
+    lines = text.split("\n")
+    if lines and lines[-1] == "" and len(lines) > 1:
+        lines.pop()
+    if not lines:
+        return "", 0, 0, project_rel
+    hit = max(1, min(int(line or 1), len(lines)))
+    before = max(1, max_lines // 2)
+    start = max(1, hit - before)
+    end = min(len(lines), start + max_lines - 1)
+    start = max(1, end - max_lines + 1)
+    shown = []
+    for i in range(start, end + 1):
+        mark = ">>" if i == hit else "  "
+        shown.append(f"{mark}{i:>4}| {lines[i - 1]}")
+    return "\n".join(shown), start, end, project_rel
+
+
+def _test_def_line(root: Path, test_id: str) -> int:
+    """Line of the test function named by a node id, when the traceback did
+    not record one (used to anchor the assertion window)."""
+    if "::" not in (test_id or ""):
+        return 0
+    file_part, _, tail = test_id.partition("::")
+    func = tail.split("::")[-1].split("[", 1)[0].strip()
+    rel = _project_rel(root, file_part)
+    if not rel or not func:
+        return 0
+    try:
+        lines = (Path(root) / rel).read_text(
+            encoding="utf-8", errors="replace").split("\n")
+    except OSError:
+        return 0
+    rx = re.compile(r"^\s*(?:async\s+)?def\s+" + re.escape(func) + r"\s*\(")
+    for i, line in enumerate(lines, 1):
+        if rx.match(line):
+            return i
+    return 0
+
+
+def _assertion_anchor(root: Path, failure: FailureIdentity) -> tuple[str, int]:
+    """(project file, line) of the failing assertion window."""
+    test_file = (failure.test_id.split("::", 1)[0]
+                 if "::" in (failure.test_id or "") else "")
+    if failure.file and failure.line:
+        if not test_file or _same_rel(failure.file, test_file):
+            return failure.file, failure.line
+    line = _test_def_line(root, failure.test_id)
+    if line:
+        return test_file, line
+    return (failure.file or test_file), failure.line
+
+
+def _project_frame(root: Path, failure: FailureIdentity,
+                   test_rel: str = "") -> tuple[str, int, str] | None:
+    """The innermost project-owned traceback frame outside the test file."""
+    for file, line, func in reversed(failure.frames or ()):
+        rel = _project_rel(root, file)
+        if not rel:
+            continue
+        if test_rel and _same_rel(rel, test_rel):
+            continue
+        return rel, int(line or 0), func
+    return None
+
+
+def traceback_repair_packet(root: Path, diff: FailureDiff,
+                            current=None) -> str:
+    """A compact, structured repair payload for a failed post-edit test run.
+
+    Only project-owned frames are quoted (`.venv`/site-packages are dropped).
+    Each new failure gets its normalized signature, a ~15-line failing-test
+    assertion window, and a ~15-line window around the innermost implicated
+    project traceback frame. Fixed and pre-existing ids are listed so the
+    model neither re-fixes old red tests nor chases unrelated ones."""
+    current = current or {}
+    focus = list(diff.new) or list(diff.still_failing) or list(current.values())
+    out = ["TRACEBACK REPAIR PACKET",
+           f"Failure identity diff: {len(diff.new)} new, {len(diff.fixed)} "
+           f"fixed, {len(diff.still_failing)} still failing, "
+           f"{len(diff.pre_existing)} pre-existing."]
+    if diff.fixed:
+        out.append("Fixed since the pre-edit baseline: "
+                   + ", ".join(f.test_id for f in diff.fixed[:5]))
+    if diff.still_failing:
+        out.append("Pre-existing failures still red (NOT caused by this edit): "
+                   + ", ".join(f.test_id for f in diff.still_failing[:5]))
+    if not focus:
+        out.append("No structured pytest node ids were parsed from the output.")
+        return "\n".join(out)
+    for failure in focus[:3]:
+        out.append("")
+        out.append(f"FAILING TEST: {failure.test_id}")
+        out.append(f"NORMALIZED FAILURE SIGNATURE: {failure.signature}")
+        anchor, line = _assertion_anchor(root, failure)
+        window, start, end, rel = _source_window(root, anchor, line)
+        if window:
+            out.append(f"ASSERTION WINDOW ({rel}:{start}-{end}):")
+            out.append(window)
+        test_rel = (_project_rel(root, failure.test_id.split("::", 1)[0])
+                    if "::" in (failure.test_id or "") else rel)
+        frame = _project_frame(root, failure, test_rel)
+        if frame:
+            frame_rel, frame_line, func = frame
+            fwindow, fs, fe, frel = _source_window(
+                root, frame_rel, frame_line)
+            if fwindow:
+                out.append(
+                    f"PROJECT TRACEBACK FRAME ({frel}:{frame_line}, in "
+                    f"{func or '?'}) window {fs}-{fe}:")
+                out.append(fwindow)
+    text = "\n".join(out)
+    return text[:9000]
+
+
+# Internal names kept short where the call sites read better.
+_traceback_packet = traceback_repair_packet
+
+
 _MISSING_MODULE_RE = re.compile(
     r"(?:ModuleNotFoundError|ImportError):\s*No module named\s+['\"]([^'\"]+)['\"]")
 
@@ -923,11 +1362,29 @@ def _run_tests(idx, cfg, files: list[str]):
     return ok, out, desc
 
 
+def _merge_repair_results(results, new):
+    """Keep earlier good files, but let a repair's successful Result replace
+    the stale pre-repair buffer for the same file (otherwise the syntax gate
+    would keep re-reading an error the repair just fixed)."""
+    replaced = {fileio_norm(r.file) for r in new
+                if r.ok and getattr(r, "file", "")}
+    return [r for r in results
+            if not (r.ok and getattr(r, "file", "")
+                    and fileio_norm(r.file) in replaced)] + new
+
+
 def _post_edit_tests(root, cfg, agent, idx, task, results, reply, backup_dir,
                      baseline, edit_files):
     """After edits were written, run the impacted tests (`verify_tests`).
-    New failures -- worse than the pre-edit baseline -- are fed back for up to
-    `repair_rounds` fix rounds, exactly like the post-edit lint check.
+
+    Before every subprocess run the dry-applied buffers are parsed in-process:
+    a NEW syntax error rejects the hunk immediately and only the parser
+    diagnostic + 10-line window goes to repair. Once the patch parses, failures
+    are diffed by stable test identity against the pre-edit baseline (`new` /
+    `fixed` / `pre-existing` / `still_failing`), and any `new` failure repairs
+    even when the total count did not rise. Repair receives a structured
+    Traceback Repair Packet, not the raw output tail.
+
     Returns (results, reply, tests_ok); tests_ok is None when the tests did
     not run (verification off, or no test command), else the last run's
     pass/fail -- surfaced as TaskResult.tests_ok for `ask --strict` and the
@@ -937,45 +1394,90 @@ def _post_edit_tests(root, cfg, agent, idx, task, results, reply, backup_dir,
         return results, reply, None
     from . import verify as verify_mod
     changed = sorted({r.file for r in results if r.ok and r.file}) or edit_files
-    base_score = 0
-    if baseline is not None and not baseline[0]:
-        base_score = _failure_score(baseline[1])
+    base_out = (baseline[1] if baseline is not None and not baseline[0]
+                else "")
+    base_failures = failure_identities(base_out)
+    base_score = _failure_score(base_out) if base_out else 0
+    max_rounds = max(0, int(getattr(cfg, "repair_rounds", 2) or 0))
     tests_ok = None
-    for round_ in range(max(0, int(getattr(cfg, "repair_rounds", 2) or 0)) + 1):
+    for round_ in range(max_rounds + 1):
+        syntax = verify_mod.check_syntax(results)
+        if syntax:
+            tests_ok = False
+            print(f"  [syntax: {len(syntax)} new syntax error(s) -- "
+                  f"test/lint subprocess skipped until the patch parses]",
+                  file=sys.stderr)
+            workspace.log_event(
+                root, "syntax gate rejected the patch; subprocess checks "
+                      "skipped", "ERROR")
+            events_mod.get(root, cfg).emit(
+                "tests", ok=False, score=len(syntax), baseline=base_score,
+                round=round_, syntax=True, new=len(syntax), fixed=0,
+                still_failing=0, pre_existing=len(base_failures))
+            if round_ >= max_rounds:
+                break
+            fixed = agent._repair_from_findings(task, reply, syntax, results)
+            if not fixed:
+                break
+            new = agent._apply_once(fixed, False, backup_dir)
+            if not any(r.ok for r in new):
+                break
+            results = _merge_repair_results(results, new)
+            reply = (reply.rstrip() + "\n\n" + fixed)
+            changed = sorted({fileio_norm(r.file) for r in results if r.ok})
+            continue
+
         got = _run_tests(idx, cfg, changed)
         if got is None:
             return results, reply, tests_ok
         ok, out, desc = got
         tests_ok = ok
         score = 0 if ok else _failure_score(out)
-        print(f"  [tests: {'passed' if ok else 'FAILED'} -- {desc}]",
+        current = failure_identities(out)
+        diff = classify_failures(base_out, out)
+        detail = ""
+        if diff.new or diff.fixed or diff.still_failing:
+            detail = (f"; {len(diff.new)} new, {len(diff.fixed)} fixed, "
+                      f"{len(diff.still_failing)} still failing")
+        print(f"  [tests: {'passed' if ok else 'FAILED'} -- {desc}{detail}]",
               file=sys.stderr)
         workspace.log_event(root, f"tests {'passed' if ok else 'failed'}: "
                                   f"{desc}", "INFO" if ok else "ERROR")
-        events_mod.get(root, cfg).emit("tests", ok=ok, score=score,
-                                       baseline=base_score, round=round_)
-        if ok or score <= base_score or round_ >= int(
-                getattr(cfg, "repair_rounds", 2) or 0):
-            if not ok and score > 0 and score <= base_score:
-                # Honest exit: the suite is still red, but it was at least
-                # this red before the task, so the remaining failures are
-                # pre-existing and were deliberately not blamed on these
-                # edits. Say so instead of ending on a silent FAILED line.
+        events_mod.get(root, cfg).emit(
+            "tests", ok=ok, score=score, baseline=base_score, round=round_,
+            new=len(diff.new), fixed=len(diff.fixed),
+            still_failing=len(diff.still_failing),
+            pre_existing=len(diff.pre_existing))
+        if ok:
+            break
+        # A new identity repairs even when the total count is flat or lower;
+        # a genuinely worse count (including output with no parseable ids)
+        # keeps the old score-based guard.
+        should_repair = bool(diff.new) or score > base_score
+        if not should_repair:
+            if not ok and score > 0:
+                # Honest exit: the suite is still red, but every remaining
+                # failure predates this task (or no identity could be parsed
+                # and it was no worse than the baseline). Say so instead of
+                # ending on a silent FAILED line.
                 print(f"  [tests: {score} failure(s) remain; the suite "
                       f"already had {base_score} before this task, so they "
                       "predate it and were not auto-repaired]", file=sys.stderr)
             break
-        finding = verify_mod.Finding(
-            "tests", "error", "",
-            "after your edits these tests fail (they did not before):\n"
-            + out[-1800:])
+        if round_ >= max_rounds:
+            break
+        packet = traceback_repair_packet(root, diff, current=current)
+        intro = ("after your edits these tests fail (they did not before):\n"
+                 if diff.new else
+                 "after your edits the test suite is failing more severely:\n")
+        finding = verify_mod.Finding("tests", "error", "", intro + packet)
         fixed = agent._repair_from_findings(task, reply, [finding], results)
         if not fixed:
             break
         new = agent._apply_once(fixed, False, backup_dir)
         if not any(r.ok for r in new):
             break
-        results = [r for r in results if r.ok] + new
+        results = _merge_repair_results(results, new)
         reply = (reply.rstrip() + "\n\n" + fixed)
         changed = sorted({fileio_norm(r.file) for r in results if r.ok})
     return results, reply, tests_ok
@@ -2195,7 +2697,24 @@ def run_loop(root: Path, cfg, client, idx, plan_path: Path, *,
         passed = True
         dep_blocked: list[str] = []
         if verify or use_diag:
-            passed, output = run_check(tr.changed)
+            from . import verify as verify_mod
+
+            def _gated_check(result):
+                """Parse the applied buffers before starting any subprocess;
+                a new syntax error is an immediate, structured failure."""
+                syntax = verify_mod.check_syntax(
+                    getattr(result, "results", None))
+                if not syntax:
+                    return run_check(result.changed)
+                print(f"  [syntax: {len(syntax)} new syntax error(s); "
+                      f"{check_label} subprocess skipped until the patch "
+                      f"parses]", file=sys.stderr)
+                workspace.log_event(
+                    root, "syntax gate rejected the patch; verify subprocess "
+                          "skipped", "ERROR")
+                return False, verify_mod.render(syntax)
+
+            passed, output = _gated_check(tr)
             rounds = repair_rounds
             installed: set[str] = set()
             # Rollback-if-worse: the current failure's severity. A repair
@@ -2222,7 +2741,7 @@ def run_loop(root: Path, cfg, client, idx, plan_path: Path, *,
                             root, f"pip install {'ok' if ok else 'FAILED'}: {dists}",
                             "INFO" if ok else "ERROR")
                         if ok:
-                            passed, output = run_check(tr.changed)
+                            passed, output = _gated_check(tr)
                             continue          # a dependency is not a repair round
                     elif auto_install:
                         print(f"  [verify still reports missing dependencies "
@@ -2261,7 +2780,7 @@ def run_loop(root: Path, cfg, client, idx, plan_path: Path, *,
                     workspace.log_event(root, f"repair failed: {e}", "ERROR")
                     break
                 idx = tr2.idx
-                passed, output = run_check(tr2.changed)
+                passed, output = _gated_check(tr2)
                 if not passed and prev_score is not None:
                     score = _failure_score(output, use_diag)
                     if score > prev_score and tr2.backup_dir \
