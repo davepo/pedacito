@@ -1178,7 +1178,8 @@ function Composer() {
                 oninput=${(e) => { S.drafts[S.mode] = e.target.value; }}
                 onkeydown=${(e) => { if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) { e.preventDefault(); send(); } }} />
       <div id="optsBox" key=${S.mode} hidden=${!S.ui.optsOpen}>
-        ${OPTS[S.mode].map((o, idx) => html`<${OptField} key=${idx} o=${o} />`)}
+        <div class="opts-grid">${OPTS[S.mode].filter((o) => o.type !== 'check').map((o, idx) => html`<${OptField} key=${'g' + idx} o=${o} />`)}</div>
+        ${OPTS[S.mode].some((o) => o.type === 'check') ? html`<div class="opts-checks">${OPTS[S.mode].filter((o) => o.type === 'check').map((o, idx) => html`<${OptField} key=${'c' + idx} o=${o} />`)}</div>` : null}
       </div>
       <div id="composerBtns">
         <button id="attachBtn" title="attach a text file (or drop one here)"
@@ -1207,7 +1208,7 @@ function OptField(props) {
       ${o.opts.map((x) => html`<option key=${x[0]} value=${x[0]}>${x[1]}</option>`)}
     </select>`;
   } else if (o.type === 'check') {
-    return html`<label class=${'f' + (o.span2 ? ' span2' : '') + ' chk'}><input type="checkbox" checked=${!!val}
+    return html`<label class="chk"><input type="checkbox" checked=${!!val}
                    onchange=${(e) => set(e.target.checked)} />${o.label}</label>`;
   } else if (o.type === 'number') {
     el = html`<input type="number" min="0" defaultValue=${String(val == null ? '' : val)}

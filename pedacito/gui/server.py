@@ -513,6 +513,60 @@ def _scan(q, body):
     return 200, settings_api.scan_servers()
 
 
+@post("/api/settings/reset")
+def _settings_reset(q, body):
+    """Wipe all profiles/roles and restore the recommended baseline defaults,
+    after backing the current user config up as config.toml.reset.<stamp>.bak."""
+    try:
+        return 200, {"ok": True, **settings_api.reset_to_baseline()}
+    except ConfigError as e:
+        return 400, {"ok": False, "detail": str(e)}
+
+
+@post("/api/models/scan")
+def _models_scan(q, body):
+    """Discover local model servers (and any explicit URLs) and list every
+    importable model WITHOUT writing anything to the config."""
+    urls = body.get("urls") or body.get("url") or []
+    if isinstance(urls, str):
+        urls = [urls]
+    try:
+        out = settings_api.scan_models(
+            urls, vram_gb=body.get("vram_gb") or 0)
+    except ConfigError as e:
+        return 400, {"ok": False, "detail": str(e)}
+    return 200, {"ok": True, **out}
+
+
+@post("/api/models/import")
+def _models_import(q, body):
+    """Write only the profiles the user selected in the discovery table."""
+    try:
+        return 200, {"ok": True,
+                     **settings_api.import_models(body.get("models") or [])}
+    except ConfigError as e:
+        return 400, {"ok": False, "detail": str(e)}
+
+
+@post("/api/models/calibrate")
+def _models_calibrate(q, body):
+    """Run `pedacito calibrate`'s suite against one profile as a background
+    job (it takes about a minute; progress streams to the terminal pane)."""
+    name = str(body.get("profile", "")).strip()
+    mode = "full" if str(body.get("mode", "")) == "full" else "quick"
+    if not name:
+        return 400, {"ok": False, "detail": "Pick a profile to calibrate."}
+    known = settings_api.known_profiles()
+    if name not in known:
+        hint = ", ".join(known) if known else "none configured yet"
+        return 400, {"ok": False,
+                     "detail": f"no profile named {name!r} (profiles: {hint})"}
+    job = jobs.spawn("calibrate", f"calibrating profile {name}",
+                     lambda j: jobs.run_calibrate(j, {"profile": name,
+                                                      "mode": mode}))
+    return _busy_reply(job)
+
+
 @get("/api/profiles")
 def _profiles(q, body=None):
     return 200, settings_api.list_profiles()

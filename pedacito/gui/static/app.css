@@ -121,7 +121,13 @@ button.small { font-size: 12px; padding: 2px 8px; }
 button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-visible {
   outline: 2px solid var(--accent); outline-offset: -1px;
 }
-input[type=checkbox] { accent-color: var(--accent); padding: 0; }
+/* Checkboxes and radios must never inherit the fluid `.f`/`input` width: without
+ * this they stretch to 100% of a grid cell and look like broken layout blocks. */
+input[type=checkbox], input[type=radio] {
+  width: auto; min-width: 0; max-width: none; height: auto;
+  flex: 0 0 auto; margin: 0; padding: 0; accent-color: var(--accent); cursor: pointer;
+}
+input[type=checkbox]:disabled, input[type=radio]:disabled { cursor: default; }
 input:disabled, textarea:disabled { opacity: .55; }
 textarea { resize: none; background: var(--panel); }
 ::selection { background: color-mix(in srgb, var(--accent) 35%, transparent); }
@@ -134,8 +140,11 @@ textarea { resize: none; background: var(--panel); }
 .mono { font-family: var(--mono); }
 .grow { flex: 1 1 0; min-width: 0; }
 .row { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; }
-.chk { display: flex; gap: 5px; align-items: center; font-size: 11.5px; color: var(--muted);
-  margin: 0; white-space: nowrap; }
+/* Checkbox/radio label. Always an inline row: box, then text, never stacked. */
+.chk { display: inline-flex; align-items: center; gap: 8px; white-space: nowrap;
+  cursor: pointer; margin: 0; font-size: 12.5px; color: var(--muted); font-weight: 500; }
+.chk input[type=checkbox], .chk input[type=radio] { width: auto; flex: 0 0 auto; }
+.chk.off { opacity: .45; }
 .tip { color: var(--muted); font-style: italic; padding: 10px; font-size: 12.5px; }
 .placeholder { color: var(--muted); text-align: center; padding: 40px 24px; font-size: 13px; }
 .placeholder b { color: var(--text); }
@@ -341,14 +350,23 @@ details pre { background: var(--code-bg); border: 1px solid var(--line); border-
 #composerBtns #sendBtn { margin-left: auto; min-width: 92px; }
 #composerBtns #optsBtn { min-width: 86px; }
 #sendHint { font-size: 11px; color: var(--ok); text-align: right; }
-#optsBox { display: grid; grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
-  gap: 6px 10px; background: var(--panel); border: 1px solid var(--line);
-  border-radius: 8px; padding: 8px 10px; max-height: 230px; overflow: auto; }
+/* Options box: a column of two blocks — the auto-fitting field grid, then the
+ * wrapping checkbox row. `auto-fill` (not `auto-fit`) keeps one column per field
+ * so a text input can never collide with a following checkbox. */
+#optsBox { display: flex; flex-direction: column; gap: 10px; background: var(--panel);
+  border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px;
+  max-height: 260px; overflow: auto; }
+.opts-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+  gap: 12px; }
+.opts-checks { display: flex; flex-wrap: wrap; gap: 12px 20px; align-items: center;
+  padding-top: 2px; border-top: 1px dashed var(--line); }
 #optsBox .f { display: flex; flex-direction: column; gap: 2px; font-size: 11px;
   color: var(--muted); min-width: 0; }
 #optsBox .f > .row { gap: 4px; }
-#optsBox .f.span2 { grid-column: 1 / -1; }
-#optsBox .f.chk { flex-direction: row; align-items: center; }
+.opts-grid .f.span2 { grid-column: 1 / -1; }
+/* The fluid-width rule below is for text/number/select only: checkboxes and
+ * radios must stay intrinsic-sized or they fill the whole grid cell. */
+#optsBox input[type=checkbox], #optsBox input[type=radio] { width: auto; flex: 0 0 auto; }
 #optsBox input, #optsBox select { font-size: 12px; width: 100%; background: var(--panel2); }
 #optsBox .muted { font-size: 10.5px; }
 
@@ -637,6 +655,29 @@ details pre { background: var(--code-bg); border: 1px solid var(--line); border-
 .note-box.err { border-color: var(--err); color: var(--err); white-space: pre-wrap; }
 #rawText { width: 100%; height: 50vh; font: 12.5px/1.5 var(--mono); white-space: pre; }
 .setgrp > summary { cursor: pointer; font-weight: 700; padding: 4px 0; font-size: 13px; }
+
+/* ------------------------------------------------- discovery / reset tabs -- */
+.ellip { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.scan-table { width: 100%; border-collapse: collapse; font-size: 12.5px; }
+.scan-table th { text-align: left; color: var(--muted); font-weight: 600; font-size: 11px;
+  padding: 4px 8px; border-bottom: 1px solid var(--line); white-space: nowrap; }
+.scan-table td { padding: 4px 8px; border-bottom: 1px dashed var(--line); vertical-align: middle; }
+.scan-table td:nth-child(4) { max-width: 340px; overflow: hidden; text-overflow: ellipsis; }
+.scan-table td:nth-child(5), .scan-table td:nth-child(6),
+.scan-table td:nth-child(7) { white-space: nowrap; }
+.scan-table th:nth-child(1), .scan-table td:nth-child(1),
+.scan-table th:nth-child(2), .scan-table td:nth-child(2) { width: 1%; text-align: center; }
+.scan-table tr.scan-server td { background: var(--panel2); color: var(--muted);
+  font-family: var(--mono); font-size: 11.5px; }
+.scan-table tr.imp { opacity: .55; }
+.scan-table input[type=text] { width: 172px; }
+.prow { display: flex; align-items: center; gap: 8px; padding: 7px 10px; min-width: 0;
+  border: 1px solid var(--line); border-radius: 8px; margin-bottom: 6px; font-size: 12.5px; }
+.prow-actions { display: flex; align-items: center; gap: 6px; flex: none; }
+.reset-box { margin-top: 16px; padding: 10px 12px; border: 1px solid var(--err);
+  border-radius: 8px; background: color-mix(in srgb, var(--err) 8%, transparent);
+  display: flex; flex-direction: column; gap: 6px; font-size: 12.5px; }
+.reset-box b { color: var(--err); }
 
 /* ------------------------------------------------------------ mobile tabs -- */
 #mobileTabs { display: none; }

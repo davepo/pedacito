@@ -384,6 +384,40 @@ def check_model(job: Job) -> None:
     STATE.add_message("system", STATE.model_status, kind="model")
 
 
+def run_calibrate(job: Job, opts: dict) -> None:
+    """`pedacito calibrate` for one profile: run the scripted mini-suite
+    against its model and save the measured card. The suite's progress prints
+    to stdout, which the GUI tee streams into the terminal pane; the score
+    lands in the chat when it finishes."""
+    from .. import config as config_mod
+    from .. import modelcard
+    name = str(opts.get("profile") or "").strip()
+    quick = str(opts.get("mode") or "quick") != "full"
+    with STATE.lock:
+        root = STATE.root
+    cfg = config_mod.load(root=root, profile=name or None,
+                          require_hardware=False, warn_budgets=False)
+    label = name or cfg.active_profile or "the current config"
+    STATE.add_message(
+        "system", f"Calibrating '{label}' \u2014 {cfg.model} at {cfg.base_url} "
+        f"({'quick' if quick else 'full'} suite). Progress streams to the "
+        "TERMINAL tab.", kind="calibrating")
+    client = LLMClient(cfg)
+    client.check(warn=False)
+    client.warmup()
+    card = modelcard.calibrate(client, cfg, verbose=True, quick=quick)
+    path = modelcard.save_card(card)
+    m = card.get("measured") or {}
+    caps = ", ".join(
+        f"{k[4:]}={'yes' if v else 'no' if v is False else '?'}"
+        for k, v in sorted(m.items()) if k.startswith("cap_"))
+    STATE.add_message(
+        "system", f"Calibration of '{label}' finished \u2014 "
+        f"overall score {m.get('overall', '?')} "
+        f"in {card.get('seconds', '?')} s. Card saved to {path}."
+        + (f" Capabilities: {caps}." if caps else ""), kind="calibrated")
+
+
 def build_index(job: Job, summarise: bool = True) -> None:
     """Build the index, like `pedacito index` (summaries cost one model call
     per unit, so it is an explicit action)."""

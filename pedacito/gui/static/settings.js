@@ -8,9 +8,13 @@
   var COMMON = ['base_url', 'api_key', 'model', 'tier', 'vram_gb', 'json_mode', 'tool_mode', 'timeout',
     'context_tokens', 'allow_write', 'allow_shell', 'allow_browser', 'allow_screenshots', 'semantic_search', 'review'];
   var X = null;      // {data, which, tab, profile, target, pending, modal, body}
+  // Model discovery lives outside X: its state survives switching tabs, and a
+  // scan is read-only, so re-rendering must not throw the results away.
+  var SCAN = { busy: false, rows: [], err: '', custom: '', vram: '',
+               pick: {}, name: {}, def: '', importing: false };
 
   PDC.openSettings = function () {
-    X = { data: null, which: 'user', tab: 'profiles', profile: '', target: '', pending: {}, models: [], search: '' };
+    X = { data: null, which: 'user', tab: 'discovery', profile: '', target: '', pending: {}, models: [], search: '' };
     X.modal = PDC.modal('Settings', h('div', { class: 'tip', text: 'Loading\u2026' }), [{ label: 'Close' }]);
     X.body = X.modal.body;
     PDC.api('/api/settings').then(function (d) { X.data = d; pickDefaults(); render(); });
@@ -101,11 +105,12 @@
         h('button', { class: 'small', text: 'Review & trust\u2026', onclick: trust })));
     }
     var tabs = h('div', { class: 'stabs' });
-    [['profiles', 'Profiles'], ['all', 'All settings'], ['raw', 'Raw file']].forEach(function (t) {
+    [['discovery', 'Model discovery'], ['profiles', 'Profiles'], ['all', 'All settings'], ['raw', 'Raw file / reset']].forEach(function (t) {
       tabs.appendChild(h('button', { class: X.tab === t[0] ? 'on' : '', text: t[1], onclick: function () { X.tab = t[0]; X.pending = {}; render(); } }));
     });
     body.appendChild(tabs);
-    if (X.tab === 'profiles') body.appendChild(profilesTab());
+    if (X.tab === 'discovery') body.appendChild(discoveryTab());
+    else if (X.tab === 'profiles') body.appendChild(profilesTab());
     else if (X.tab === 'all') body.appendChild(allTab());
     else body.appendChild(rawTab());
   }
@@ -163,6 +168,162 @@
       } })));
     return box;
   }
+
+  // ----- model discovery, selective import, calibration -------------------------------
+  function rowKey(r) { return r.server_url + '\u0000' + r.model_id; }
+  function pickedRows() { return SCAN.rows.filter(function (r) { return SCAN.pick[rowKey(r)]; }); }
+  function fmtSize(bytes) {
+    if (!bytes) return '';
+    var gb = bytes / 1073741824;
+    return gb >= 1 ? gb.toFixed(1) + ' GB' : Math.round(bytes / 1048576) + ' MB';
+  }
+  function discoveryTab() {
+    var f = file(), names = Object.keys(f.profiles || {}).sort();
+    var box = h('div', {});
+    box.appendChild(scanner());
+    box.appendChild(h('div', { class: 'muted small-text', style: 'margin:14px 0 6px', text: 'Profiles in ' + (X.which === 'user' ? 'the user config' : 'this project') + ' \u2014 calibrate the ones you actually use:' }));
+    if (!names.length) {
+      box.appendChild(h('div', { class: 'tip', text: 'No profiles yet. Scan a local server above and import the models you want to use.' }));
+      return box;
+    }
+    var defName = (f.settings || {}).default_profile || '';
+    names.forEach(function (n) {
+      var p = f.profiles[n] || {};
+      var row = h('div', { class: 'prow' },
+        h('span', { class: 'grow mono', text: n, title: 'open this profile', style: 'cursor:pointer', onclick: function () { gotoProfile(n); } }),
+        h('span', { class: 'muted small-text ellip', text: (p.model || '') + (p.base_url ? ' @ ' + p.base_url : '') }),
+        n === X.data.active_profile ? h('span', { class: 'tag act', text: 'active' }) : null,
+        n === defName ? h('span', { class: 'tag', text: 'default' }) : null,
+        h('span', { class: 'prow-actions' },
+          h('button', { class: 'small', text: 'Calibrate', title: 'Measure this model and store the scores in its model card', onclick: function () { calibrate(n, 'quick'); } }),
+          n === defName ? h('button', { class: 'small ghost', disabled: true, text: 'Default' })
+            : h('button', { class: 'small', text: 'Set default', onclick: function () { setDefaultProfile(n); } }),
+          h('button', { class: 'small danger', text: 'Delete', onclick: function () { delProfileNamed(n); } })));
+      box.appendChild(row);
+    });
+    box.appendChild(h('div', { class: 'row', style: 'margin-top:10px' },
+      h('button', { class: 'small', text: '+ New profile', onclick: newProfile }),
+      h('span', { class: 'muted small-text grow', text: 'Calibrating takes about a minute and streams to the Output tab.' })));
+    return box;
+  }
+  function scanner() {
+    var box = h('div', {});
+    var url = h('input', { type: 'text', class: 'grow mono', placeholder: 'another server URL (optional)', value: SCAN.custom });
+    url.addEventListener('input', function () { SCAN.custom = url.value; });
+    var vram = h('input', { type: 'number', min: '1', step: '1', style: 'width:74px', placeholder: 'VRAM GB', value: SCAN.vram });
+    vram.addEventListener('input', function () { SCAN.vram = vram.value; });
+    box.appendChild(h('div', { class: 'note-box' },
+      'Find the models your local servers have loaded, then import only the ones you want. A scan reads nothing: nothing is written to the config until you press Import.',
+      h('div', { class: 'row', style: 'margin-top:8px' },
+        h('button', { class: 'primary', text: SCAN.busy ? 'Scanning\u2026' : (SCAN.rows.length ? 'Scan again' : 'Scan local servers'), disabled: SCAN.busy, onclick: doScan }),
+        url, vram,
+        h('span', { class: 'muted small-text grow', text: 'probes LM Studio, Ollama, llama.cpp and your existing profiles' }))));
+    if (SCAN.err) box.appendChild(h('div', { class: 'note-box err', text: SCAN.err }));
+    if (SCAN.busy) { box.appendChild(h('div', { class: 'tip', text: 'Asking each server what it has\u2026' })); return box; }
+    if (!SCAN.rows.length) return box;
+    var head = h('tr', {}, h('th', { text: 'import' }), h('th', { text: 'default' }), h('th', { text: 'profile name' }),
+      h('th', { text: 'model' }), h('th', { text: 'ctx' }), h('th', { text: 'size' }), h('th', { text: '' }));
+    var tbody = h('tbody', {});
+    var last = '';
+    SCAN.rows.forEach(function (r, i) {
+      var k = rowKey(r);
+      if (r.server_url !== last) {
+        last = r.server_url;
+        tbody.appendChild(h('tr', { class: 'scan-server' }, h('td', { colspan: '7', text: (r.provider || 'server') + '  \u00b7  ' + r.server_url })));
+      }
+      var name = h('input', { type: 'text', class: 'mono', value: SCAN.name[k] === undefined ? r.suggested_profile_name : SCAN.name[k], disabled: r.already_imported });
+      name.addEventListener('input', function () { SCAN.name[k] = name.value.trim(); });
+      var cb = h('input', { type: 'checkbox', checked: !!SCAN.pick[k], disabled: !!r.already_imported,
+        onchange: function (e) { SCAN.pick[k] = e.target.checked; if (!e.target.checked && SCAN.def === k) SCAN.def = ''; render(); } });
+      var rd = h('input', { type: 'radio', name: 'importdefault', checked: SCAN.def === k, disabled: !!r.already_imported,
+        onchange: function () { SCAN.def = k; if (!SCAN.pick[k]) { SCAN.pick[k] = true; } render(); } });
+      tbody.appendChild(h('tr', { class: r.already_imported ? 'imp' : '' },
+        h('td', {}, cb), h('td', {}, rd), h('td', {}, name),
+        h('td', { class: 'mono small-text', text: r.model_id, title: r.model_id }),
+        h('td', { class: 'small-text', text: r.context_length ? PDC.fmtInt(r.context_length) : '\u2014' }),
+        h('td', { class: 'small-text muted', text: fmtSize(r.size_bytes) + (r.quant ? ' ' + r.quant : '') }),
+        h('td', {}, r.already_imported ? h('span', { class: 'tag', text: 'already imported' })
+          : r.loaded ? h('span', { class: 'tag act', text: 'loaded' }) : null)));
+    });
+    box.appendChild(h('table', { class: 'scan-table' }, h('thead', {}, head), tbody));
+    var n = pickedRows().length;
+    box.appendChild(h('div', { class: 'row', style: 'margin-top:10px' },
+      h('button', { class: 'primary', text: SCAN.importing ? 'Importing\u2026' : 'Import ' + n + ' model' + (n === 1 ? '' : 's'), disabled: !n || SCAN.importing, onclick: doImport }),
+      h('span', { class: 'muted small-text grow', text: 'each import becomes an editable profile, so you can tune per-model limits afterwards' })));
+    return box;
+  }
+  function doScan() {
+    SCAN.busy = true; SCAN.err = ''; SCAN.rows = []; render();
+    var body = {};
+    var extra = (SCAN.custom || '').trim();
+    if (extra) body.urls = [extra];
+    if (SCAN.vram) body.vram_gb = parseFloat(SCAN.vram) || 0;
+    PDC.api('/api/models/scan', body).then(function (j) {
+      SCAN.busy = false;
+      if (!j.ok) { SCAN.err = 'Scan failed: ' + (j.detail || 'bad response'); render(); return; }
+      SCAN.rows = j.models || [];
+      SCAN.pick = {}; SCAN.name = {}; SCAN.def = '';
+      SCAN.rows.forEach(function (r) {
+        var k = rowKey(r);
+        SCAN.pick[k] = !r.already_imported;
+        SCAN.name[k] = r.suggested_profile_name;
+      });
+      if (!SCAN.rows.length) SCAN.err = 'No server answered. Start LM Studio / Ollama / llama.cpp, or type its URL above (it must end in /v1 for OpenAI-style servers).';
+      else {
+        var first = SCAN.rows.filter(function (r) { return SCAN.pick[rowKey(r)]; })[0];
+        if (first) SCAN.def = rowKey(first);
+      }
+      render();
+    });
+  }
+  function doImport() {
+    var sel = pickedRows();
+    if (!sel.length) return;
+    var vram = parseFloat(SCAN.vram) || 0;
+    var list = sel.map(function (r) {
+      var k = rowKey(r);
+      return { profile_name: SCAN.name[k] || r.suggested_profile_name, base_url: r.server_url,
+        model: r.model_id, context_length: r.context_length || 0, vram_gb: vram,
+        set_default: SCAN.def === k };
+    });
+    var bad = list.filter(function (m) { return !/^[A-Za-z0-9][A-Za-z0-9_-]{0,31}$/.test(m.profile_name); });
+    if (bad.length) { PDC.toast('Profile names may use letters, digits, - and _: ' + bad.map(function (m) { return '"' + m.profile_name + '"'; }).join(', '), true); return; }
+    SCAN.importing = true; render();
+    PDC.api('/api/models/import', { models: list }).then(function (j) {
+      SCAN.importing = false;
+      if (!j.ok) { SCAN.err = 'Import failed: ' + (j.detail || 'bad response'); render(); return; }
+      var done = {};
+      (j.imported || []).concat(j.skipped || []).forEach(function (nm) { done[nm] = 1; });
+      SCAN.rows.forEach(function (r) {
+        var k = rowKey(r);
+        if (done[SCAN.name[k] || r.suggested_profile_name]) { r.already_imported = true; SCAN.pick[k] = false; if (SCAN.def === k) SCAN.def = ''; }
+      });
+      X.data = j; pickDefaults(); render();
+      PDC.toast((j.imported || []).length + ' profile(s) imported' + ((j.skipped || []).length ? ', ' + j.skipped.length + ' already there' : '') + (j.default_profile ? '; default is "' + j.default_profile + '"' : ''));
+      PDC.refreshState();
+    });
+  }
+  function calibrate(name, mode) {
+    PDC.confirm('Calibrate \u201c' + name + '\u201d?\n\n' + (mode === 'quick'
+      ? 'A short probe: a few timed calls to measure how fast this model answers, how long a prompt it can actually hold, and how reliably it uses tools. The result is stored in its model card and the tuned limits are written to the profile.'
+      : 'The full suite \u2014 slower and more calls, but it also checks tool calls that must happen in order.'), 'Run it').then(function (ok) {
+      if (!ok) return;
+      PDC.api('/api/models/calibrate', { profile: name, mode: mode }).then(function (j) {
+        if (!j.ok) { PDC.toast(j.detail || 'could not start the calibration', true); return; }
+        PDC.toast('Calibrating "' + name + '" \u2014 watch the Output tab.');
+        PDC.refreshState();
+      });
+    });
+  }
+  function setDefaultProfile(name) {
+    save({ file: X.which, profile: null, changes: { default_profile: name } }, '/api/settings/set', '"' + name + '" is now the default profile.');
+  }
+  function delProfileNamed(name) {
+    PDC.confirm('Delete profile \u201c' + name + '\u201d from ' + (X.which === 'user' ? 'the user config' : 'this project') + '?\n\nA .bak copy of the file is kept, so this can be undone.', 'Delete', true).then(function (ok) {
+      if (ok) save({ file: X.which, action: 'delete', name: name }, '/api/settings/profile', 'Profile deleted.').then(function () { X.profile = ''; pickDefaults(); render(); });
+    });
+  }
+  function gotoProfile(name) { X.profile = name; X.pending = {}; X.tab = 'profiles'; render(); }
 
   // ----- profiles ----------------------------------------------------------------------
   function profilesTab() {
@@ -314,6 +475,27 @@
     var msg = h('div', { class: 'muted small-text', style: 'margin-top:6px', text: 'Saved edits are checked with the same rules the loader uses; the previous file is kept as ' + (f.path || '') + '.bak.' });
     return h('div', {}, ta, msg, h('div', { class: 'row', style: 'margin-top:8px' },
       h('button', { class: 'primary', text: 'Validate & save', onclick: function () { save({ file: X.which, text: ta.value }, '/api/settings/raw', 'Config file saved.'); } }),
-      h('button', { text: 'Revert', onclick: function () { ta.value = f.text || ''; } })));
+      h('button', { text: 'Revert', onclick: function () { ta.value = f.text || ''; } })),
+      resetBox());
+  }
+
+  // ----- reset to the recommended baseline ---------------------------------------------
+  function resetBox() {
+    return h('div', { class: 'reset-box' },
+      h('b', { text: 'Reset to baseline defaults' }),
+      h('div', { class: 'small-text', text: 'Start over from the settings pedacito recommends for a local GPU: every profile and every hand-edited value in the user config is removed, the tuned defaults are written back, and the file you have now is kept as config.toml.reset.<date>.bak. Project settings are not touched.' }),
+      h('div', { class: 'row', style: 'margin-top:8px' },
+        h('button', { class: 'danger small', disabled: X.which !== 'user', onclick: function () {
+          PDC.confirm('Reset the user config to the recommended baseline?\n\nAll profiles are removed and your current settings are replaced by the defaults pedacito recommends for a local GPU. The file as it stands is saved first as config.toml.reset.<date>.bak, so this can be undone.', 'Reset it', true).then(function (ok) {
+            if (!ok) return;
+            PDC.api('/api/settings/reset', {}).then(function (j) {
+              if (!j.ok) { PDC.toast(j.detail || 'could not reset', true); return; }
+              X.data = j; X.which = 'user'; X.profile = ''; X.pending = {}; pickDefaults(); render();
+              PDC.toast('Reset done. Backup: ' + (j.backup || ''));
+              PDC.refreshState();
+            });
+          });
+        } }, 'Reset to baseline defaults'),
+        X.which !== 'user' ? h('span', { class: 'muted small-text', text: 'switch to the user config to reset it' }) : null));
   }
 })();
