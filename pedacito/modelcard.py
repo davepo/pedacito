@@ -113,7 +113,8 @@ def apply(cfg) -> dict | None:
 
     for name in ("best_of", "verify_answer", "fold_tail_steps", "plan_threshold",
                  "tool_mode", "disable_thinking", "step_reasoning_first",
-                 "fewshot_steps", "fuzzy_match", "edit_style"):
+                 "fewshot_steps", "fuzzy_match", "edit_style",
+                 "incremental_edit_loop"):
         if name in ch and unset(name):
             setattr(cfg, name, ch[name])
             sources[name] = "model card"
@@ -622,6 +623,11 @@ def choose(measured: dict, hosted: bool) -> dict:
     # quotes exactly.
     if ed < 1.0:
         ch["fuzzy_match"] = True
+    # The models that cannot hold a large multi-file patch get one verified
+    # symbol hunk at a time. A card may enable the microloop explicitly; an
+    # explicit user value still wins in `apply()`.
+    if ed < 1.0 or overall < 0.8:
+        ch["incremental_edit_loop"] = True
     # The anchor-first brief wins when it measures clearly better at producing
     # correctly-anchored edits than the quote-first brief.
     if measured.get("edit_format_anchor", 0.0) + 1e-9 >= ed + _ARM_GAIN:

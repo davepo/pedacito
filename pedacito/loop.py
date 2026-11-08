@@ -1483,6 +1483,73 @@ def _post_edit_tests(root, cfg, agent, idx, task, results, reply, backup_dir,
     return results, reply, tests_ok
 
 
+def _post_edit_lint_incremental(root, cfg, agent, task, results, reply,
+                                backup_dir, baseline):
+    """The lint half of the post-edit check after a symbol microloop.
+
+    `agent.apply()` owns this loop on the ordinary path; the incremental path
+    writes hunks itself, so the outer loop runs the same baseline diff here
+    once ALL symbols have landed. Returns (results, reply)."""
+    if not getattr(cfg, "post_edit_check", True):
+        return results, reply
+    max_rounds = max(0, int(getattr(cfg, "repair_rounds", 2) or 0))
+    for _round in range(max_rounds):
+        changed = sorted({fileio_norm(r.file) for r in results
+                          if r.ok and r.file})
+        if not changed:
+            break
+        try:
+            current = diagnostics.quick_findings(root, changed)
+        except Exception:
+            break
+        found = diagnostics.new_findings(baseline, current)
+        agent.active_diagnostics = found or {}
+        if not found:
+            break
+        n = sum(len(v) for v in found.values())
+        print(f"\n[incremental post-edit lint: {n} new finding(s) in the "
+              "changed files; asking for a fix]", file=sys.stderr)
+        fix = agent._chat_at(
+            "temperature_repair",
+            [
+                {"role": "system", "content": agent._answer_sys(task)},
+                {"role": "user", "content":
+                    f"TASK\n{task}\n\n"
+                    "Your incremental symbol edits applied, but a quick lint "
+                    "of the changed files reports NEW problems they "
+                    "introduced:\n"
+                    f"{diagnostics.render_findings(found)}\n\n"
+                    "SOURCE (current contents around each finding)\n\n"
+                    f"{agent._diagnostics_source(found)}\n\n"
+                    "Fix ONLY these problems with minimal search/replace "
+                    "blocks -- copy the SEARCH text exactly from the SOURCE "
+                    "above, byte for byte. Do not repeat edits that already "
+                    "worked and do not refactor anything else. If a finding "
+                    "is a false positive, reply with a single line: NOTHING "
+                    "MORE."},
+            ],
+            max_tokens=cfg.max_tokens_answer,
+            stream=True,
+        )
+        if getattr(agent.client, "stream_truncated", False):
+            fix = agent._trim_dangling_block(fix)
+        if not parse_edits(fix):
+            break
+        fresh = sorted({fileio_norm(e.file) for e in parse_edits(fix)}
+                       - set(baseline))
+        if fresh:
+            try:
+                baseline.update(diagnostics.quick_findings(root, fresh))
+            except Exception:
+                pass
+        new = agent._apply_once(fix, False, backup_dir)
+        results = _merge_repair_results(results, new)
+        if not any(r.ok for r in new):
+            break
+        reply = (reply.rstrip() + "\n\n" + fix) if reply.strip() else fix
+    return results, reply
+
+
 def fileio_norm(name: str) -> str:
     from . import fileio
     return fileio.normalise_rel(name)
@@ -2009,39 +2076,20 @@ def _run_task_once(root: Path, cfg, client, agent, idx, task: str, *,
     gather_mut = list(getattr(cfg, "_task_mutations", None) or ())
     tests_ok = None
     print("--- answering ---\n", file=sys.stderr)
-    raw_reply = agent.answer(task, gathered, system=answer_system)
     findings: list = []
-    if answer_system is None and parse_edits(raw_reply) \
-            and not _edit_refusal_head(raw_reply):
-        # Several candidates, scored by the free deterministic checks (opt-in).
-        if int(getattr(cfg, "best_of", 1) or 1) > 1 \
-                and hasattr(agent, "best_of"):
-            raw_reply = agent.best_of(task, raw_reply, gathered)
-        # Check the proposed edits BEFORE anything is written: unread code,
-        # placeholders, stale references, unaddressed requirements.
-        if hasattr(agent, "preflight"):
-            raw_reply, findings = agent.preflight(task, raw_reply, gathered)
-            for f in findings:
-                workspace.log_event(root, f"verify: {f.render()}",
-                                    "WARN" if f.severity == "warn" else "ERROR")
-    elif answer_system is None and not parse_edits(raw_reply):
-        # P1a shadow mode: a no-edit reply gets the grounded-prose checks
-        # logged (citations, ungrounded identifiers, unaddressed requirements),
-        # never acted on.
-        try:
-            from . import verify as verify_mod
-            for f in verify_mod.prose_shadow(agent, task, raw_reply):
-                workspace.log_event(root, f"prose: {f.render()}", "WARN")
-        except Exception:
-            pass
-    truncated = bool(getattr(client, "stream_truncated", False))
-    if truncated:
-        workspace.log_event(root, "answer reply truncated at the output limit",
-                            "WARN")
-    refusal = _edit_refusal_head(raw_reply)
-    contradicted = bool(refusal) and bool(parse_edits(raw_reply))
+    truncated = False
+    refusal = ""
+    contradicted = False
     fabricated = False       # reply's only blocks were no-ops
     fabricated_only = False  # ...and the reply did not declare "no changes"
+    intents: list = []
+    if (answer_system is None and apply and not review
+            and hasattr(agent, "incremental_eligible")
+            and agent.incremental_eligible(task)):
+        intents = agent.plan_edit_intents(task, gathered)
+        if len(intents) < 2:
+            intents = []          # single target: the ordinary reply is cheaper
+    incremental = bool(intents)
 
     def _mark_fabricated(text: str) -> str:
         """Record null-only blocks; add the "No changes" marker only when the
@@ -2055,35 +2103,38 @@ def _run_task_once(root: Path, cfg, client, agent, idx, task: str, *,
                 "reply was a no-op (SEARCH == REPLACE) and was discarded; "
                 "nothing was written.]")
 
-    if contradicted:
-        # A reply that OPENS by refusing yet contains blocks is a small-model
-        # coherence failure, not intent: honor the refusal, discard the blocks.
-        print(f"  [reply opens by refusing edits (\"{refusal}\") but "
-              f"contains edit blocks; honoring the refusal and discarding "
-              f"them]", file=sys.stderr)
-        workspace.log_event(root, f"reply refused edits ('{refusal}') but "
-                                  f"contained edit blocks; blocks discarded",
-                            "WARN")
-        results, reply = [], raw_reply
-    else:
-        edit_files = sorted({e.file for e in parse_edits(raw_reply)})
+    if incremental:
+        # Sprint 5: one symbol hunk at a time, each dry-applied and verified
+        # before it is written. The full impacted-test/lint pass runs once,
+        # after the last hunk, exactly like the ordinary apply path.
+        edit_files = sorted({
+            fileio_norm(i.get("file", "")) for i in intents if i.get("file")})
         pre = _fire(cfg, root, "pre_edit", files=edit_files, task=task[:300])
         baseline_tests = None
-        if apply and not review and edit_files and getattr(
-                cfg, "verify_tests", False) and getattr(cfg, "allow_shell", False):
+        if edit_files and getattr(cfg, "verify_tests", False) \
+                and getattr(cfg, "allow_shell", False):
             baseline_tests = _run_tests(idx, cfg, edit_files)
+        lint_baseline: dict = {}
+        if getattr(cfg, "post_edit_check", True):
+            try:
+                lint_baseline = diagnostics.quick_findings(root, edit_files)
+            except Exception:
+                lint_baseline = {}
         if pre.denied:
             print(f"  [edits blocked by a pre_edit hook: {pre.message}]",
                   file=sys.stderr)
             results = [Result(False, f, f"blocked by a pre_edit hook: "
                                         f"{pre.message}") for f in edit_files]
-            reply = raw_reply
+            reply = raw_reply = ""
         else:
-            results, reply = agent.apply(raw_reply, dry_run=review or not apply,
-                                         task=task, gathered=gathered,
-                                         backup_dir=None if review else backup_dir)
-            if apply and not review and (
-                    any(r.ok for r in results) or gather_mut):
+            results, reply, findings = agent.apply_edit_intents(
+                task, gathered, intents, backup_dir=backup_dir,
+                verbose=True)
+            raw_reply = reply
+            for f in findings:
+                workspace.log_event(root, f"verify: {f.render()}",
+                                    "WARN" if f.severity == "warn" else "ERROR")
+            if any(r.ok for r in results) or gather_mut:
                 _fire(cfg, root, "post_edit",
                       files=sorted({r.file for r in results if r.ok}
                                    | set(gather_mut)))
@@ -2091,18 +2142,94 @@ def _run_task_once(root: Path, cfg, client, agent, idx, task: str, *,
                     root, cfg, agent, idx, task, results, reply,
                     backup_dir, baseline_tests,
                     sorted(set(edit_files) | set(gather_mut)))
-        if not results and getattr(agent, "noop_discards", None):
-            # The reply's only blocks were null edits (SEARCH == REPLACE)
-            # dropped by parse_edits: the model had concluded no edit was
-            # needed. Honor that instead of re-asking for "real" blocks (the
-            # marker matches _is_noop, so the re-ask below is skipped).
-            files = ", ".join(dict.fromkeys(agent.noop_discards))
-            workspace.log_event(root, f"reply emitted only no-op edit "
-                                      f"block(s) ({files}); treated as a "
-                                      f"refusal to edit", "WARN")
-            reply = _mark_fabricated(reply)
-    if not results and not _is_noop(reply) and not contradicted \
-            and not gather_mut:
+                results, reply = _post_edit_lint_incremental(
+                    root, cfg, agent, task, results, reply, backup_dir,
+                    lint_baseline)
+    else:
+        raw_reply = agent.answer(task, gathered, system=answer_system)
+        if answer_system is None and parse_edits(raw_reply) \
+                and not _edit_refusal_head(raw_reply):
+            # Several candidates, scored by the free deterministic checks (opt-in).
+            if int(getattr(cfg, "best_of", 1) or 1) > 1 \
+                    and hasattr(agent, "best_of"):
+                raw_reply = agent.best_of(task, raw_reply, gathered)
+            # Check the proposed edits BEFORE anything is written: unread code,
+            # placeholders, stale references, unaddressed requirements.
+            if hasattr(agent, "preflight"):
+                raw_reply, findings = agent.preflight(task, raw_reply, gathered)
+                for f in findings:
+                    workspace.log_event(root, f"verify: {f.render()}",
+                                        "WARN" if f.severity == "warn"
+                                        else "ERROR")
+        elif answer_system is None and not parse_edits(raw_reply):
+            # P1a shadow mode: a no-edit reply gets the grounded-prose checks
+            # logged (citations, ungrounded identifiers, unaddressed
+            # requirements), never acted on.
+            try:
+                from . import verify as verify_mod
+                for f in verify_mod.prose_shadow(agent, task, raw_reply):
+                    workspace.log_event(root, f"prose: {f.render()}", "WARN")
+            except Exception:
+                pass
+        truncated = bool(getattr(client, "stream_truncated", False))
+        if truncated:
+            workspace.log_event(root, "answer reply truncated at the output "
+                                      "limit", "WARN")
+        refusal = _edit_refusal_head(raw_reply)
+        contradicted = bool(refusal) and bool(parse_edits(raw_reply))
+
+        if contradicted:
+            # A reply that OPENS by refusing yet contains blocks is a small-
+            # model coherence failure, not intent: honor the refusal, discard
+            # the blocks.
+            print(f"  [reply opens by refusing edits (\"{refusal}\") but "
+                  f"contains edit blocks; honoring the refusal and discarding "
+                  f"them]", file=sys.stderr)
+            workspace.log_event(root, f"reply refused edits ('{refusal}') but "
+                                      f"contained edit blocks; blocks "
+                                      f"discarded", "WARN")
+            results, reply = [], raw_reply
+        else:
+            edit_files = sorted({e.file for e in parse_edits(raw_reply)})
+            pre = _fire(cfg, root, "pre_edit", files=edit_files, task=task[:300])
+            baseline_tests = None
+            if apply and not review and edit_files and getattr(
+                    cfg, "verify_tests", False) \
+                    and getattr(cfg, "allow_shell", False):
+                baseline_tests = _run_tests(idx, cfg, edit_files)
+            if pre.denied:
+                print(f"  [edits blocked by a pre_edit hook: {pre.message}]",
+                      file=sys.stderr)
+                results = [Result(False, f, f"blocked by a pre_edit hook: "
+                                            f"{pre.message}")
+                           for f in edit_files]
+                reply = raw_reply
+            else:
+                results, reply = agent.apply(
+                    raw_reply, dry_run=review or not apply, task=task,
+                    gathered=gathered,
+                    backup_dir=None if review else backup_dir)
+                if apply and not review and (
+                        any(r.ok for r in results) or gather_mut):
+                    _fire(cfg, root, "post_edit",
+                          files=sorted({r.file for r in results if r.ok}
+                                       | set(gather_mut)))
+                    results, reply, tests_ok = _post_edit_tests(
+                        root, cfg, agent, idx, task, results, reply,
+                        backup_dir, baseline_tests,
+                        sorted(set(edit_files) | set(gather_mut)))
+            if not results and getattr(agent, "noop_discards", None):
+                # The reply's only blocks were null edits (SEARCH == REPLACE)
+                # dropped by parse_edits: the model had concluded no edit was
+                # needed. Honor that instead of re-asking for "real" blocks
+                # (the marker matches _is_noop, so the re-ask below is skipped).
+                files = ", ".join(dict.fromkeys(agent.noop_discards))
+                workspace.log_event(root, f"reply emitted only no-op edit "
+                                          f"block(s) ({files}); treated as a "
+                                          f"refusal to edit", "WARN")
+                reply = _mark_fabricated(reply)
+    if not incremental and not results and not _is_noop(reply) \
+            and not contradicted and not gather_mut:
         # Zero edit blocks: one bounded recovery (honour read tool-calls or
         # re-ask with the edit protocol). Skipped for no-op replies ("already
         # complete") and refusals, which are coherent about doing nothing,
@@ -2141,7 +2268,7 @@ def _run_task_once(root: Path, cfg, client, agent, idx, task: str, *,
                                       f"block(s) ({files}); treated as a "
                                       f"refusal to edit", "WARN")
             reply = _mark_fabricated(reply)
-    if (not results and not contradicted and not fabricated
+    if (not incremental and not results and not contradicted and not fabricated
             and not _is_noop(reply) and not gather_mut):
         # A "no changes" declaration is a decision, not a parse failure, and
         # a gather-only run wrote its changes with tool actions instead of

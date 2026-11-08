@@ -349,6 +349,19 @@ class Config:
     # or inside blocks). On by default. Set false to ablate it. A prompt
     # override (`.pedacito/prompts/edit_format.md` or `answer.md`) bypasses it.
     edit_plan_brief: bool = True
+    # Symbol-anchored incremental edit-verify microloops. On a multi-hunk or
+    # multi-file task the model first emits structured edit intents
+    # ([{file, symbol, intended_change}]); the harness then resolves one symbol
+    # at a time, appends its exact current body, takes exactly ONE
+    # SEARCH/REPLACE hunk at temperature_answer=0, dry-applies it, runs the
+    # deterministic checks plus the in-process AST/tree-sitter syntax gate,
+    # and only then writes it. The temporary source is replaced by a one-line
+    # `[EDITED file:symbol]` receipt before the next symbol, so a 4B-9B model
+    # never has to hold or emit a huge multi-file patch in one reply. The full
+    # impacted-test and lint pass still runs once after all hunks land.
+    # Model cards make it an explicit choice for weaker edit-format scores;
+    # an explicit false here wins and keeps the ordinary single-reply path.
+    incremental_edit_loop: bool = True
     # Edit block style: "quote" (SEARCH quoting is the default), "anchor"
     # (SYMBOL anchors with a full new definition are the default; SEARCH only
     # for small edits outside a definition), or None = the model card decides
@@ -2215,6 +2228,9 @@ REFERENCE_TEMPLATE = TEMPLATE + '''
 # user turn (unset = the model card decides).
 # edit_plan_brief asks for 1-3 plan lines before the edit blocks (on by
 # default; set false to ablate it).
+# incremental_edit_loop keeps multi-hunk/multi-file edits to one verified
+# symbol hunk at a time (on by default; the model card turns it on for weaker
+# edit-format scores, and an explicit false disables it).
 # auto_diagnostics runs the detected linter/typechecker after each auto task.
 # post_edit_check runs a cheap per-file lint/syntax check after every applied
 # edit and feeds back only NEW findings (diffed against a pre-task baseline);

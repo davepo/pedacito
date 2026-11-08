@@ -83,7 +83,7 @@ a 12,000-line project without it having to hold the whole thing in context.
 ### 2. Reasoning *before* acting (zero-cost "chain of thought")
 
 Small non-thinking models commit to an action before writing any rationale.
-Three changes move the deliberation in front of the decision at roughly zero
+Four changes move the deliberation in front of the decision at roughly zero
 extra cost:
 
 - **Reason-first steps** (`step_reasoning_first`, on by default). The `reasoning`
@@ -94,6 +94,18 @@ extra cost:
   blocks, the answer states 1–3 lines: the file, the lines or symbol it will
   change, and why. This is the only pre-edit reasoning the answer phase gets,
   and it replaces a self-contradictory "explain what you did" line.
+- **Symbol-anchored incremental edit-verify microloops**
+  (`incremental_edit_loop`, on by default; model cards enable it for weaker
+  edit-format scores). On a multi-hunk or multi-file task the model first
+  emits structured edit intents, `[{file, symbol, intended_change}]`. The
+  harness resolves one symbol at a time, appends that symbol's exact current
+  body at the conversation tail, and asks for **one** SEARCH/REPLACE hunk at
+  `temperature_answer=0`. It dry-applies the hunk, runs `verify.py` and the
+  AST/tree-sitter syntax gate, writes it only if clean, then replaces the
+  temporary source with a one-line `[EDITED file:symbol]` receipt before
+  moving to the next symbol. The full impacted-test and lint pass still runs
+  once after the last hunk. Section 5 covers why the single-hunk boundary is
+  the reliability win.
 - **Worked examples** (`fewshot_steps`, off by default). Three short worked
   steps from the project itself (grep a symbol, read it, done) shown once in the
   first user turn, so grammar/native mode also teaches *good action choice*,
@@ -189,6 +201,15 @@ The cheapest reliable feedback is the code itself:
   until the patch parses. Because the gate compares before and after, a file
   that was already broken can still be repaired — only a *new* syntax error
   trips it.
+- **Symbol-anchored incremental edit-verify microloops.** A multi-hunk answer
+  is not one atomic gamble. The intent list names each `{file, symbol}` target;
+  the harness then runs a bounded loop per symbol: append that definition's
+  exact current source, take one greedy hunk, dry-apply it, run `verify.py`
+  plus the AST gate, write it only when clean, and replace the temporary source
+  with `[EDITED file:symbol]` before the next target. A rejected hunk repairs
+  only itself; it cannot poison the hunks that follow. Once every symbol has
+  landed, the normal impacted-test and lint verification runs over the whole
+  changed set — so the final gate still judges the combined patch.
 - **Failure-identity diffing.** Pytest's stable node ids (plus a normalized
   assertion signature when no id survives truncation) identify each failure
   across runs. The post-edit run is classified against the pre-edit baseline as
@@ -203,6 +224,20 @@ The cheapest reliable feedback is the code itself:
   other environment directories are discarded, as are unrelated pre-existing
   failures, so the model sees the code that actually broke and not a
   transcript.
+
+Why single-hunk generation prevents patch corruption on 4B–9B models: a large
+reply makes three failures correlated. The model must copy several SEARCH
+regions exactly while its attention is spread across unrelated files; one stale
+line number or indentation drift makes a later block anchor in the wrong place
+or not at all. The output cap truncates the tail mid-block, so the blocks after
+the cut are silently lost, and a small model asked to repair the combined reply
+often rewrites blocks that already worked. Keeping exactly one symbol and one
+hunk in flight removes that coupling: the current body is the last thing in the
+prompt (fresh from disk, not from memory), the hunk is short enough to finish
+before the cap, and verification either accepts it or rejects only that symbol.
+The one-line receipt preserves the *fact* of the edit without re-sending its
+source, so context stays small and later hunks start from the real post-edit
+file rather than a stale multi-file patch.
 
 ### 6. Sampling the right amount
 

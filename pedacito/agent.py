@@ -717,6 +717,109 @@ source you asked to see. Complete the user's task.
 """ + EDIT_FORMAT
 
 
+# ------------------------------------------------------------------------
+# Sprint 5: symbol-anchored incremental edit-verify microloops
+# ------------------------------------------------------------------------
+# A 4B-9B model can emit one small, exact hunk reliably; a multi-file patch is
+# where truncation, stale line numbers and cross-block contamination appear.
+# The harness therefore asks for a short JSON intent list, resolves one symbol
+# at a time, appends that symbol's CURRENT exact source at the conversation
+# tail, and accepts exactly one hunk only after a dry apply + deterministic
+# checks + the AST/tree-sitter syntax gate. Temporary source is popped after
+# each symbol (a one-line receipt remains), so context does not accumulate.
+INCREMENTAL_INTENT_SYSTEM = """\
+You plan a code change as a short sequence of symbol-sized edits. Reply with
+ONLY a JSON array, no prose and no code fences:
+[{"file": "relative/path.py", "symbol": "function_or_class",
+  "intended_change": "one sentence describing the change"}]
+
+Rules:
+- One item per definition that must change. Use the exact symbol name shown in
+  the project map or source, or "" for a whole new file.
+- Keep the list in a safe edit order (definitions before their callers when
+  the callers must be updated too).
+- Do not include files or symbols you do not intend to edit.
+- If the task needs no code change, reply exactly []."""
+
+_MAX_EDIT_INTENTS = 8
+_INTERNAL_SYMBOLS = {"", "file", "whole file", "*", "(file)", "(whole file)"}
+
+
+def parse_edit_intents(text: str) -> list[dict]:
+    """Structured `[{file, symbol, intended_change}]` intents from a reply.
+
+    Tolerates prose and code fences around one JSON array (small models add
+    both), and the common wrappers `{"edits": [...]}` / `{"intents": [...]}`.
+    Returns [] rather than raising: an unparseable plan falls back to the
+    ordinary single-reply edit path."""
+    raw = (text or "").strip()
+    if not raw:
+        return []
+    if raw.startswith("```"):
+        raw = re.sub(r"^\s*```[A-Za-z0-9_-]*\s*", "", raw)
+        raw = re.sub(r"\s*```\s*$", "", raw).strip()
+    candidates: list[str] = []
+    starts = [i for i in (raw.find("["), raw.find("{")) if i >= 0]
+    if starts:
+        start = min(starts)
+        end = max(raw.rfind("]"), raw.rfind("}"))
+        if end > start:
+            candidates.append(raw[start:end + 1])
+    candidates.append(raw)
+
+    data = None
+    for cand in candidates:
+        try:
+            data = json.loads(cand)
+            break
+        except (ValueError, TypeError):
+            continue
+    if isinstance(data, dict):
+        for key in ("edits", "intents", "plan", "targets"):
+            if isinstance(data.get(key), list):
+                data = data[key]
+                break
+        else:
+            data = [data] if (data.get("file") or data.get("symbol")) else []
+    if not isinstance(data, list):
+        return []
+
+    out: list[dict] = []
+    seen: set[tuple[str, str]] = set()
+    for item in data:
+        if isinstance(item, str):
+            m = re.match(r"\s*([^\s:]+)\s*:\s*([^\s]+)\s*(?:[-:]\s*(.*))?$",
+                         item)
+            if not m:
+                continue
+            item = {"file": m.group(1), "symbol": m.group(2),
+                    "intended_change": (m.group(3) or "").strip()}
+        if not isinstance(item, dict):
+            continue
+        file = str(item.get("file") or item.get("path") or "").strip()
+        symbol = str(item.get("symbol") or item.get("name") or "").strip()
+        change = str(item.get("intended_change") or item.get("change")
+                     or item.get("why") or "").strip()
+        if not file and not symbol:
+            continue
+        key = (fileio.path_key(file), fileio.path_key(symbol))
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append({"file": file, "symbol": symbol,
+                    "intended_change": change[:300]})
+        if len(out) >= _MAX_EDIT_INTENTS:
+            break
+    return out
+
+
+def _same_rel(a: str, b: str) -> bool:
+    """Path equality tolerant of `pkg/a.py` vs `./pkg/a.py`."""
+    ka, kb = fileio.path_key(a or ""), fileio.path_key(b or "")
+    return bool(ka and kb and (ka == kb or ka.endswith("/" + kb)
+                               or kb.endswith("/" + ka)))
+
+
 _TOOLISH_RE = re.compile(
     r"^\s*\{[^}]*['\"]action['\"]\s*:|<tool_call|<function\s*=|<invoke\b",
     re.IGNORECASE)
@@ -2740,6 +2843,360 @@ class Agent:
         return reply
 
     # ------------------------------------------------- verify before applying
+    # ------------------------------------- Sprint 5: incremental edit microloop
+    def incremental_eligible(self, task: str) -> bool:
+        """True when this task is multi-hunk/multi-file enough to use the
+        symbol-anchored microloop. Single-target edits keep the ordinary
+        one-reply path: the extra intent call would only add latency."""
+        if not bool(getattr(self.cfg, "incremental_edit_loop", True)):
+            return False
+        tracker = getattr(self, "requirements", None)
+        edits = [r for r in getattr(tracker, "items", ())
+                 if getattr(r, "is_edit", False)]
+        if len(edits) >= 2:
+            return True
+        text = getattr(self, "task_targets", None) or task or ""
+        if len(self._task_file_targets(text)) >= 2:
+            return True
+        names: set[str] = set()
+        for tok in re.findall(r"[A-Za-z_][A-Za-z0-9_.]*", text)[:48]:
+            if len(tok) < 3 or tok.lower() in {
+                    "the", "and", "for", "with", "this", "that", "from",
+                    "into", "file", "files", "code", "test", "tests"}:
+                continue
+            try:
+                if self.index.find_symbol(tok):
+                    names.add(tok)
+            except Exception:
+                pass
+        return len(names) >= 2
+
+    def _intent_source(self, gathered: str) -> str:
+        """Gathered source trimmed for the intent-planner call (token-budgeted
+        by the same utility packer the answer phase uses)."""
+        est = getattr(self.client, "estimate_tokens", None) or estimate_tokens
+        limit = max(1500, int((self.cfg.context_tokens - 1200) * 0.55))
+        src, _dropped = _trim_gathered(
+            gathered or "(nothing was looked up)",
+            lambda t: est(t) > limit,
+            requirements=getattr(self, "requirements", None),
+            diagnostics=getattr(self, "active_diagnostics", None),
+            index=self.index)
+        return src
+
+    def plan_edit_intents(self, task: str, gathered: str,
+                          verbose: bool = False) -> list[dict]:
+        """Ask for the structured `[{file, symbol, intended_change}]` plan.
+
+        One small greedy call. An empty/unparseable reply returns [] so the
+        caller can fall back to the ordinary answer path; no failure here can
+        block a task."""
+        try:
+            repo_map, _tier = self._map(task)
+        except Exception:
+            repo_map = ""
+        source = self._intent_source(gathered)
+        messages = [
+            {"role": "system", "content": INCREMENTAL_INTENT_SYSTEM},
+            {"role": "user", "content":
+             f"PROJECT MAP\n\n{repo_map}\n\n"
+             f"SOURCE YOU REQUESTED\n\n{source}\n\n"
+             f"TASK\n{task}\n\n"
+             "List the symbol-sized edits this task needs. JSON array only."},
+        ]
+        try:
+            self._set_site("answer")
+            text = self._chat_at(
+                "temperature_answer", messages,
+                max_tokens=min(int(getattr(self.cfg, "max_tokens_answer",
+                                            3000) or 3000), 1200),
+                stream=False)
+        except LLMError as e:
+            if verbose:
+                print(f"  [edit-intent plan failed ({type(e).__name__}); "
+                      "using the ordinary answer path]", file=sys.stderr)
+            return []
+        intents = parse_edit_intents(text)
+        self._emit("edit_intents", count=len(intents),
+                   files=sorted({i["file"] for i in intents if i["file"]}))
+        if verbose and intents:
+            print(f"  [incremental edit plan: {len(intents)} symbol(s)]",
+                  file=sys.stderr)
+        return intents
+
+    def _resolve_edit_intent(self, intent: dict):
+        """Resolve one intent to (target, failure). `target` carries the file,
+        symbol, exact 1-based line range and the planner's intended change."""
+        raw_file = str(intent.get("file") or "").strip()
+        symbol = str(intent.get("symbol") or "").strip()
+        change = str(intent.get("intended_change") or "").strip()
+        rel = self.index.resolve_file(raw_file) if raw_file else None
+        if not rel and raw_file:
+            cand = fileio.normalise_rel(raw_file)
+            if cand and ((self.index.root / cand).exists()
+                         or not symbol
+                         or symbol.lower() in _INTERNAL_SYMBOLS):
+                rel = cand
+        if not rel and symbol:
+            hits = self.index.find_symbol(symbol)
+            files = {c.file for c in hits if c.file}
+            if len(files) == 1:
+                rel = files.pop()
+        if not rel:
+            return None, Result(
+                False, raw_file or symbol,
+                f"edit intent cannot be resolved to a project file "
+                f"(file={raw_file!r}, symbol={symbol!r})")
+
+        path = self.index.root / rel
+        if not symbol or symbol.lower() in _INTERNAL_SYMBOLS:
+            if path.is_file():
+                try:
+                    lines = fileio.read_lines(path)
+                except OSError as e:
+                    return None, Result(False, rel, f"cannot read file: {e}")
+                end = len(lines)
+                if lines and lines[-1] == "" and len(lines) > 1:
+                    end -= 1
+                start = 1
+            else:
+                start, end = 1, 0          # a new file: nothing to quote
+            return {"file": rel, "symbol": "", "start": start, "end": end,
+                    "intended_change": change}, None
+
+        same = [c for c in self.index.find_symbol(symbol)
+                if _same_rel(c.file, rel)]
+        want = fileio.path_key(symbol)
+        exact = [c for c in same if fileio.path_key(c.qualname) == want
+                 or fileio.path_key(c.qualname).endswith("." + want)]
+        if len(exact) == 1:
+            c = exact[0]
+        elif len(same) == 1:
+            c = same[0]                    # a method inside a whole-class chunk
+        else:
+            if not same:
+                why = "no definition by that name in this file"
+            else:
+                listing = ", ".join(f"{c.qualname} L{c.start}-{c.end}"
+                                    for c in same[:5])
+                why = f"{len(same)} definitions match ({listing})"
+            return None, Result(
+                False, rel, f"edit intent symbol {symbol!r}: {why}")
+        start = max(1, int(c.start or 1))
+        end = int(getattr(c, "scope_end", 0) or c.end or start)
+        return {"file": rel, "symbol": symbol, "start": start, "end": end,
+                "intended_change": change}, None
+
+    def _check_incremental_hunk(self, task: str, gathered: str, rel: str,
+                                symbol: str, reply: str):
+        """Dry-apply ONE target hunk, then run verify.py and the AST gate."""
+        from . import verify as verify_mod
+        parsed = parse_edits(reply)
+        if len(parsed) != 1:
+            return [Result(
+                False, rel,
+                f"incremental edit must contain exactly ONE block for "
+                f"{rel}:{symbol or '(file)'}; got {len(parsed)}")], []
+        block = parsed[0]
+        if not _same_rel(block.file, rel):
+            return [Result(
+                False, rel,
+                f"incremental edit targeted {block.file!r}, but the current "
+                f"symbol is in {rel}")], []
+        if symbol and block.symbol:
+            bw, tw = fileio.path_key(block.symbol), fileio.path_key(symbol)
+            if not (bw == tw or bw.endswith("." + tw) or tw.endswith("." + bw)):
+                return [Result(
+                    False, rel,
+                    f"incremental edit anchored {block.symbol!r}, but the "
+                    f"current target is {symbol!r}")], []
+        if symbol and not block.symbol and not block.lines \
+                and not block.search.strip():
+            return [Result(
+                False, rel,
+                "an empty SEARCH without a SYMBOL/LINES anchor would replace "
+                f"the WHOLE file; target {symbol!r} with a SYMBOL header")], []
+        results = self._apply_once(reply, dry_run=True)
+        # Run the syntax gate explicitly (verify.check also invokes it; the
+        # duplicate is cheap and keeps this microloop's contract self-evident).
+        syntax = verify_mod.check_syntax(results)
+        findings = syntax + [
+            f for f in verify_mod.check(self, task, reply, results, gathered)
+            if getattr(f, "kind", "") != "syntax"]
+        return results, findings
+
+    @staticmethod
+    def _incremental_receipt(rel: str, symbol: str, ok: bool,
+                             reason: str = "") -> str:
+        name = f"{rel}:{symbol}" if symbol else rel
+        if ok:
+            return f"[EDITED {name}]"
+        tail = f" -- {reason}" if reason else ""
+        return f"[FAILED {name}{tail}]"
+
+    def apply_edit_intents(self, task: str, gathered: str, intents: list[dict],
+                           backup_dir=None, verbose: bool = False):
+        """Apply a planned intent list one symbol at a time.
+
+        Each target is resolved against the CURRENT index/disk, its exact source
+        is appended at the prompt tail, and the model emits exactly one hunk.
+        The hunk is dry-applied and checked before anything is written; after a
+        success the temporary source is gone from the next prompt (only a
+        one-line receipt remains). Returns (results, reply, findings)."""
+        from . import verify as verify_mod
+        self._set_site("answer")
+        system = self._answer_sys(task) + (
+            "\n\nINCREMENTAL EDIT MODE: you are editing ONE symbol at a time. "
+            "Emit exactly ONE search/replace block and nothing else. Prefer "
+            "the SYMBOL anchor with EMPTY SEARCH and the FULL new definition "
+            "in REPLACE; otherwise quote the exact current source. Do not "
+            "repeat earlier hunks or edit any other symbol.")
+        history = [
+            {"role": "system", "content": system},
+            {"role": "user", "content": f"TASK\n{task}"},
+        ]
+        results_all: list = []
+        findings_all: list = []
+        receipts: list[str] = []
+        attempts = 1 + max(0, min(int(getattr(self.cfg, "repair_rounds", 2)
+                                           or 0), 3))
+        total = len(intents)
+        for n, intent in enumerate(intents, 1):
+            target, failure = self._resolve_edit_intent(intent)
+            if target is None:
+                results_all.append(failure)
+                reason = (failure.message.split(":", 1)[-1].strip()
+                          if failure and failure.message else "unresolved")
+                receipts.append(self._incremental_receipt(
+                    getattr(failure, "file", "") or str(intent.get("file")),
+                    str(intent.get("symbol") or ""), False, reason[:120]))
+                self._emit("incremental_edit", target=n, of=total, ok=False,
+                           reason=reason[:160])
+                continue
+            rel = target["file"]
+            symbol = target["symbol"]
+            start, end = target["start"], target["end"]
+            source = self._fetch_exact_span(rel, start, end) if end >= start \
+                else ""
+            if not source:
+                source = (f"{rel} lines {start}-{end}: (this file does not "
+                          "exist yet; the REPLACE body is its full contents)")
+            already = ("\n\nEDITS ALREADY VERIFIED (their source was removed "
+                       "to save context):\n" + "\n".join(receipts)
+                       if receipts else "")
+            target_msg = (
+                already + f"\n\nINCREMENTAL TARGET {n}/{total}\n"
+                f"file: {rel}\nsymbol: {symbol or '(whole file)'}\n"
+                f"intended change: {target['intended_change'] or task}\n\n"
+                "EXACT CURRENT SOURCE (fresh from disk, numbered like a "
+                "`read`; ignore the line-number prefixes):\n"
+                f"{source}\n\n"
+                "Emit EXACTLY ONE search/replace block for THIS target now. "
+                "Use `--- FILE: " + rel + (" SYMBOL " + symbol if symbol
+                                           else "") +
+                "` with an EMPTY SEARCH and the full new definition in "
+                "REPLACE, or quote the exact lines in SEARCH. No other text "
+                "and no other block.")
+            msgs = history + [{"role": "user", "content": target_msg}]
+            last_results: list = []
+            last_findings: list = []
+            accepted = None
+            for attempt in range(attempts):
+                try:
+                    reply = self._chat_at(
+                        "temperature_answer", msgs,
+                        max_tokens=self.cfg.max_tokens_answer, stream=False)
+                except LLMError as e:
+                    last_results = [Result(
+                        False, rel, f"edit generation failed: {type(e).__name__}")]
+                    break
+                hunk_results, hunk_findings = self._check_incremental_hunk(
+                    task, gathered, rel, symbol, reply)
+                errors = [f for f in hunk_findings if f.severity == "error"]
+                clean = bool(hunk_results) and all(
+                    getattr(r, "ok", False) for r in hunk_results) and not errors
+                if clean and getattr(self.client, "stream_truncated", False):
+                    clean = False
+                    hunk_results = [Result(
+                        False, rel, "the incremental hunk was truncated at the "
+                                    "output limit")]
+                if clean:
+                    applied = self._apply_once(reply, False, backup_dir)
+                    if applied and all(getattr(r, "ok", False) for r in applied):
+                        accepted = (applied, hunk_findings, reply, attempt)
+                        break
+                    hunk_results = applied or hunk_results
+                    errors = []
+                last_results, last_findings = hunk_results, hunk_findings
+                self._emit("incremental_edit", target=n, of=total, ok=False,
+                           attempt=attempt + 1,
+                           errors=len(errors),
+                           failed=sum(1 for r in hunk_results
+                                      if not getattr(r, "ok", False)))
+                if attempt + 1 >= attempts:
+                    break
+                problems = verify_mod.render(errors) or "\n".join(
+                    f"- {r.file}: {r.message}" for r in hunk_results
+                    if not getattr(r, "ok", False))
+                msgs.append({"role": "assistant", "content": reply})
+                msgs.append({"role": "user", "content":
+                    f"THE HUNK FOR {rel}:{symbol or '(file)'} WAS REJECTED "
+                    f"before writing:\n{problems}\n\n"
+                    "Re-emit EXACTLY ONE corrected search/replace block for "
+                    "this same target. Copy SEARCH text exactly from the "
+                    "source shown above, or use the SYMBOL anchor with an "
+                    "EMPTY SEARCH and the full new definition. No other text."})
+            if accepted:
+                applied, hunk_findings, _reply, attempt = accepted
+                results_all.extend(applied)
+                findings_all.extend(hunk_findings)
+                try:
+                    from . import index as index_mod
+                    index_mod.reindex_file(self.index, rel, self.cfg,
+                                           save=False)
+                except Exception:
+                    pass
+                receipts.append(self._incremental_receipt(rel, symbol, True))
+                self._emit("incremental_edit", target=n, of=total, ok=True,
+                           attempt=attempt + 1)
+                if verbose:
+                    print(f"  [incremental {n}/{total}: {rel}:{symbol or '(file)'}"
+                          " applied and verified]", file=sys.stderr)
+            else:
+                if not last_results:
+                    last_results = [Result(
+                        False, rel, "no usable incremental hunk was produced")]
+                results_all.extend(last_results)
+                findings_all.extend(last_findings)
+                reason = next((r.message for r in last_results
+                               if not getattr(r, "ok", False)), "")
+                receipts.append(self._incremental_receipt(
+                    rel, symbol, False, (reason or "rejected")[:120]))
+                if verbose:
+                    print(f"  [incremental {n}/{total}: {rel}:{symbol or '(file)'}"
+                          f" not applied -- {(reason or 'rejected')[:120]}]",
+                          file=sys.stderr)
+        tracker = getattr(self, "requirements", None)
+        if tracker is not None and getattr(tracker, "task", "") == task:
+            tracker.observe_edit(results_all)
+            if results_all and all(getattr(r, "ok", False)
+                                   for r in results_all):
+                tracker.observe_verified(
+                    {r.file for r in results_all if r.file})
+        reply = ("Symbol-anchored incremental edits:\n" + "\n".join(receipts)
+                 if receipts else "No symbol-anchored edits were applied.")
+        return results_all, reply, findings_all
+
+    def incremental_edit(self, task: str, gathered: str, backup_dir=None,
+                         verbose: bool = False):
+        """Plan then apply the incremental microloop, or None when the plan has
+        fewer than two targets (the caller should use the ordinary answer)."""
+        intents = self.plan_edit_intents(task, gathered, verbose=verbose)
+        if len(intents) < 2:
+            return None
+        return self.apply_edit_intents(task, gathered, intents,
+                                       backup_dir=backup_dir, verbose=verbose)
+
     def preflight(self, task: str, reply: str, gathered: str = "",
                   verbose: bool = True):
         """Check an edit reply BEFORE anything is written: dry-apply every
