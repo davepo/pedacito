@@ -6,6 +6,7 @@ CLI can use them without importing the GUI package:
     validate_text(text)               parse + check a config file's text
     set_values(text, changes, ...)    change keys in place, keeping comments
     remove_profile / add_profile      whole-profile edits
+    rename_profile(text, old, new)    rename a table and its references
     short_name(model_id, ...)         derive a profile name from a model id
     upsert_profiles(text, found)      append identity-only profiles idempotently
 
@@ -339,6 +340,88 @@ def profile_body(text: str, name: str) -> dict:
     """The raw settings written under `[profiles.NAME]` in this text."""
     _flat, profiles = validate_text(text)
     return dict(profiles.get(name, {}))
+
+
+def _retarget_roles(lines: list[str], old_name: str, new_name: str) -> None:
+    """Rewrite the quoted profile name `old_name` to `new_name` wherever the
+    roles table stores it: an inline/multi-line `roles = {...}` assignment
+    outside the profiles, or a `[roles]` section. Trailing comments survive."""
+    swaps = (('"' + old_name + '"', '"' + new_name + '"'),
+             ("'" + old_name + "'", "'" + new_name + "'"))
+
+    def swap(seg: str) -> str:
+        for a, b in swaps:
+            seg = seg.replace(a, b)
+        return seg
+
+    for r in _regions(lines):
+        if _is_profile(r["name"]) or r.get("array"):
+            continue
+        if r["name"] == "roles":
+            i = r["start"]
+            while i < r["end"]:
+                m = _ASSIGN_RE.match(lines[i])
+                if not m:
+                    i += 1
+                    continue
+                j, ec = _value_end(lines, i, m.start(3))
+                if j == i:
+                    lines[i] = (lines[i][:m.start(3)]
+                                + swap(lines[i][m.start(3):ec]) + lines[i][ec:])
+                else:
+                    lines[i] = lines[i][:m.start(3)] + swap(lines[i][m.start(3):])
+                    for k in range(i + 1, j):
+                        lines[k] = swap(lines[k])
+                    lines[j] = swap(lines[j][:ec]) + lines[j][ec:]
+                i = j + 1
+            continue
+        hit = _find_key(lines, r, "roles")
+        if not hit:
+            continue
+        a, vs, b, ec = hit
+        if a == b:
+            lines[a] = lines[a][:vs] + swap(lines[a][vs:ec]) + lines[a][ec:]
+        else:   # a multi-line inline table: swap inside each value line
+            lines[a] = lines[a][:vs] + swap(lines[a][vs:])
+            for k in range(a + 1, b):
+                lines[k] = swap(lines[k])
+            lines[b] = swap(lines[b][:ec]) + lines[b][ec:]
+
+
+def rename_profile(text: str, old_name: str, new_name: str) -> str:
+    """Rename `[profiles.OLD]` (and any of its sub-tables) to
+    `[profiles.NEW]`, keeping every key and comment outside the changed lines.
+
+    References are retargeted automatically: a top-level `default_profile`
+    equal to the old name and any `roles` value that named it. Raises
+    ConfigError when the old profile does not exist or the new name does."""
+    names = profile_names(text)
+    if old_name not in names:
+        raise ConfigError(f"no profile named '{old_name}' in this file")
+    if new_name == old_name:
+        return text
+    if new_name in names:
+        raise ConfigError(f"a profile named '{new_name}' already exists")
+    nl = "\r\n" if "\r\n" in text else "\n"
+    lines = text.replace("\r\n", "\n").split("\n")
+    target = "profiles" + SEP + old_name
+    for r in _regions(lines):
+        if r["name"] != target and not r["name"].startswith(target + SEP):
+            continue
+        parts = r["name"].split(SEP)
+        parts[1] = new_name
+        line = lines[r["line"]]
+        m = _HEADER_RE.match(line)
+        s, e = m.span(2)
+        lines[r["line"]] = line[:s] + table_name(*parts) + line[e:]
+    _retarget_roles(lines, old_name, new_name)
+    out = nl.join(lines)
+    # `default_profile` lives outside the profiles: replace it in place.
+    flat, _profiles = validate_text(out, "renamed config")
+    if flat.get("default_profile") == old_name:
+        out = set_values(out, {"default_profile": new_name})
+    validate_text(out, "renamed config")
+    return out
 
 
 def new_user_config(base_url: str, model: str, vram_gb: int | None) -> str:

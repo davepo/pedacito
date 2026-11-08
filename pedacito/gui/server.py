@@ -518,6 +518,10 @@ POST_ROUTES["/api/settings/setup"] = _settings_write(
         b.get("vram_gb")))
 POST_ROUTES["/api/settings/trust"] = _settings_write(
     lambda b: settings_api.trust_project_config())
+POST_ROUTES["/api/profiles/rename"] = _settings_write(
+    lambda b: settings_api.rename_profile(
+        b.get("file", "user"), str(b.get("old_name", "")),
+        str(b.get("new_name", ""))))
 
 
 @post("/api/settings/models")

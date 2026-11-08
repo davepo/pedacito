@@ -22,7 +22,8 @@ from ..config import Config
 # The comment-preserving editor, moved out of gui/ so the CLI can use it.
 from ..config_editor import (  # noqa: F401
     add_profile, literal, new_user_config, profile_body, profile_names,
-    remove_profile, set_values, table_name, upsert_profiles, validate_text,
+    remove_profile, rename_profile, set_values, table_name, upsert_profiles,
+    validate_text,
 )
 
 SECRET_KEYS = ("api_key",)

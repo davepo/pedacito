@@ -40,17 +40,28 @@
 
   // ----- typed controls ----------------------------------------------------------
   // `value === undefined` means "not set here" (inherit). onchange(newValue|null)
-  function control(item, value, onchange, placeholder) {
+  // The "(inherit)" option only exists when the caller passes an
+  // `inheritLabel` — that is, while editing a PROFILE override. Universal
+  // settings are the top-level user config (nothing above them to inherit
+  // from), so they render concrete values only: booleans as on/off, enums as
+  // their real choices. Clearing a universal key still removes it, restoring
+  // the built-in default.
+  function control(item, value, onchange, placeholder, inheritLabel) {
     var t = item.type, el;
     if (t === 'bool' || item.choices) {
-      var opts = t === 'bool' ? [['', '(inherit)'], ['true', 'on'], ['false', 'off']]
-        : [['__inherit__', '(inherit)']].concat(item.choices.map(function (c) { return [c, c === '' ? '(none)' : c]; }));
+      var opts = t === 'bool' ? [['true', 'on'], ['false', 'off']]
+        : item.choices.map(function (c) { return [c, c === '' ? '(none)' : c]; });
+      if (inheritLabel) opts = [['__inherit__', inheritLabel]].concat(opts);
       el = h('select', {}, opts.map(function (o) { return h('option', { value: o[0], text: o[1] }); }));
-      el.value = value === undefined ? (t === 'bool' ? '' : '__inherit__') : (t === 'bool' ? String(value) : value);
+      var unset = value === undefined || value === null;
+      // without an inherit option, a genuinely unset optional (fewshot_steps,
+      // edit_style, …) shows no preselection until the user picks one
+      el.value = unset ? (inheritLabel ? '__inherit__' : '\u0000')
+                       : (t === 'bool' ? String(value) : value);
       el.addEventListener('change', function () {
         var v = el.value;
-        if (v === '' && t === 'bool' || v === '__inherit__') onchange(null);
-        else onchange(t === 'bool' ? v === 'true' : v);
+        if (v === '__inherit__') onchange(null);
+        else if (v !== '\u0000') onchange(t === 'bool' ? v === 'true' : v);
       });
       return el;
     }
@@ -82,6 +93,26 @@
     else { v = item.default; tag = '  (default)'; }
     if (v === '' || v == null) return 'default';
     return (Array.isArray(v) ? v.join(', ') : String(v)) + tag;
+  }
+  // The concrete value that applies when the file's own layer says nothing:
+  // the value written in the file, else the effective resolved one (always a
+  // concrete value — the payload falls back to the Config() defaults), else
+  // the schema default. Universal settings render this, never "(inherit)".
+  function universalValue(item) {
+    var g = (file().settings || {})[item.name];
+    if (g !== undefined) return g;
+    var r = X.data.resolved[item.name];
+    if (r && r.value !== undefined && r.value !== null) return r.value;
+    return item.default === null ? undefined : item.default;
+  }
+  // What the profile picker shows for the inherit option, so the user can
+  // see which universal value the profile takes when left unset.
+  function inheritLabel(item) {
+    var v = universalValue(item);
+    if (item.type === 'bool') v = v ? 'on' : 'off';
+    else if (v === undefined || v === null) v = '';
+    var s = Array.isArray(v) ? v.join(', ') : String(v);
+    return '(inherit \u2014 universal: ' + (s === '' ? 'unset' : s) + ')';
   }
 
   // ----- render ---------------------------------------------------------------------
@@ -231,6 +262,7 @@
           h('button', { class: 'small', text: 'Calibrate', title: 'Measure this model and store the scores in its model card', onclick: function () { calibrate(n, 'quick'); } }),
           n === defName ? h('button', { class: 'small ghost', disabled: true, text: 'Default' })
             : h('button', { class: 'small', text: 'Set default', onclick: function () { setDefaultProfile(n); } }),
+          h('button', { class: 'small', text: 'Rename', title: 'Rename this profile (the default-profile and role references follow it)', onclick: function () { renameProfileNamed(n); } }),
           h('button', { class: 'small danger', text: 'Delete', onclick: function () { delProfileNamed(n); } })));
       box.appendChild(row);
     });
@@ -379,6 +411,22 @@
       if (ok) save({ file: X.which, action: 'delete', name: name }, '/api/settings/profile', 'Profile deleted.').then(function () { X.profile = ''; pickDefaults(); render(); });
     });
   }
+  function renameProfileNamed(oldName) {
+    askName('Rename profile \u201c' + oldName + '\u201d to', oldName, function (raw) {
+      var name = sanitizeName(raw);
+      if (!name || name === oldName) return;
+      if (!/^[A-Za-z0-9][A-Za-z0-9_-]{0,31}$/.test(name)) {
+        PDC.toast('Profile names may use letters, digits, - and _: "' + name + '"', true);
+        return;
+      }
+      // The backend retargets default_profile / roles and reloads STATE;
+      // save() re-renders the modal and PDC.refreshState() updates the
+      // header Profile dropdown in one shot.
+      save({ file: X.which, old_name: oldName, new_name: name }, '/api/profiles/rename',
+        'Renamed \u201c' + oldName + '\u201d to \u201c' + name + '\u201d.')
+        .then(function (j) { if (j && j.ok) { if (X.profile === oldName) X.profile = name; render(); } });
+    });
+  }
   function gotoProfile(name) { X.profile = name; X.pending = {}; X.tab = 'profiles'; render(); }
 
   // ----- profiles ----------------------------------------------------------------------
@@ -396,6 +444,7 @@
     var side = h('div', {}, list, h('div', { class: 'row', style: 'margin-top:8px' },
       h('button', { class: 'small', text: '+ New', onclick: newProfile }),
       h('button', { class: 'small', text: 'Duplicate', disabled: !X.profile, onclick: dupProfile }),
+      h('button', { class: 'small', text: 'Rename', disabled: !X.profile, title: 'Rename this profile (the default-profile and role references follow it)', onclick: function () { renameProfileNamed(X.profile); } }),
       h('button', { class: 'small danger', text: 'Delete', disabled: !X.profile, onclick: delProfile })));
     return h('div', { class: 'set-layout' }, side, X.profile ? profileForm(f.profiles[X.profile] || {}) : h('div', { class: 'tip', text: 'Create a profile to point pedacito at a model.' }));
   }
@@ -441,7 +490,7 @@
     COMMON.forEach(function (key) {
       var item = schemaItem(key); if (!item) return;
       var cur = key === 'api_key' ? undefined : body[key];
-      var el = control(item, cur, function (v) { setPending(key, v); }, placeholderFor(item));
+      var el = control(item, cur, function (v) { setPending(key, v); }, placeholderFor(item), inheritLabel(item));
       if (key === 'api_key') apiKeyEl = el;
       if (key === 'model') el.setAttribute('list', 'modelOptions');
       form.appendChild(h('label', { text: key, title: item.help }));
@@ -508,8 +557,13 @@
           var src = set !== undefined ? 'set here' : ((res.source || 'default').replace(/\s*\(.*$/, '') || 'default');
           var row = h('div', { class: 'set-row' });
           row.appendChild(h('span', { class: 'name', text: it.name, title: it.help }));
-          var shown = X.pending[it.name] !== undefined ? (X.pending[it.name] === null ? undefined : X.pending[it.name]) : set;
-          row.appendChild(control(it, shown, function (v) { setPending(it.name, v, row); }, placeholderFor(it)));
+          var pending = pendingFor(it.name);
+          var shown = pending !== undefined ? (pending === null ? undefined : pending)
+            : (X.target ? set : universalValue(it));
+          // "inherit" is a profile-override concept only: the global layer is
+          // the top of the user config and always shows a concrete value.
+          row.appendChild(control(it, shown, function (v) { setPending(it.name, v, row); },
+                                  placeholderFor(it), X.target ? inheritLabel(it) : null));
           row.appendChild(h('span', { class: 'src', text: src }));
           if (it.help) row.appendChild(h('div', { class: 'set-help', text: it.help.length > 260 ? it.help.slice(0, 257) + '\u2026' : it.help }));
           det.appendChild(row);
@@ -521,7 +575,9 @@
     search.addEventListener('input', function () { X.search = search.value; fill(); });
     fill();
     return h('div', {}, h('div', { class: 'row', style: 'margin-bottom:8px' }, h('span', { class: 'muted', text: 'Apply to:' }), targetSel, search, saveBtn),
-      h('div', { class: 'muted small-text', style: 'margin-bottom:6px', text: 'A blank box means "not set here" \u2014 the value comes from the layer below it (the badge on the right says which). Clearing a box removes the key from the file.' }), holder);
+      h('div', { class: 'muted small-text', style: 'margin-bottom:6px', text: X.target
+        ? 'A blank box means "not set here" \u2014 the profile inherits the universal value the control names (the badge on the right says where each value comes from). Clearing a box removes the override from the file.'
+        : 'Universal settings always show the value that applies (the file\u0027s own value, else the effective one, else the built-in default \u2014 the badge on the right says which). Clearing a box removes the key from the file and restores the default.' }), holder);
   }
 
   // ----- raw ---------------------------------------------------------------------------

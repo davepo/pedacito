@@ -207,6 +207,127 @@ def test_resolved_hides_secrets():
     assert res["vram_gb"]["source"] == "user config (x)"
 
 
+# --- Sprint D: profile renaming --------------------------------------------------
+
+def _config(gui):
+    gui.post("/api/settings/setup",
+             {"base_url": "http://x:1/v1", "model": "m", "vram_gb": "8"})
+
+
+def test_rename_profile_text_keeps_body_comments_and_default_reference():
+    base = _clean(BASE)
+    out = S.rename_profile(base, "default", "primary")
+    assert "[profiles.primary]" in out and "[profiles.default]" not in out
+    assert 'model = "a"   # keep me' in out          # body + inline comment
+    assert "# my config" in out                      # file header comment
+    assert 'default_profile = "primary"' in out      # the reference follows
+    S.validate_text(out)
+    assert S.rename_profile(base, "default", "default") == base
+    with pytest.raises(ConfigError, match="no profile named"):
+        S.rename_profile(base, "ghost", "x")
+    with pytest.raises(ConfigError, match="already exists"):
+        S.rename_profile(base, "default", "my.qwen")
+
+
+def test_rename_profile_moves_quoted_names_and_subtables():
+    text = ('[profiles."my.qwen"]\nmodel = "q"\n\n'
+            '[profiles."my.qwen".sampler]\ntop_p = 0.9\n')
+    out = S.rename_profile(text, "my.qwen", "qwen2")
+    assert "[profiles.qwen2]" in out and "[profiles.qwen2.sampler]" in out
+    assert "my.qwen" not in out
+    _flat, profiles = S.validate_text(out)
+    assert profiles["qwen2"]["sampler"] == {"top_p": 0.9}
+
+
+def test_rename_profile_updates_roles_whichever_form_the_file_uses():
+    section = ('default_profile = "fast"\n\n[roles]\nplanner = "fast"\n'
+               'worker = "tiny"\n\n[profiles.fast]\nmodel = "m"\n\n'
+               '[profiles.tiny]\nmodel = "t"\n')
+    out = S.rename_profile(section, "fast", "quick")
+    assert 'planner = "quick"' in out and 'worker = "tiny"' in out
+    assert 'default_profile = "quick"' in out
+    assert "[profiles.quick]" in out and "[profiles.fast]" not in out
+    S.validate_text(out)
+    inline = ('roles = { planner = "fast", worker = "tiny" }  # keep me\n\n'
+              '[profiles.fast]\nmodel = "m"\n\n[profiles.tiny]\nmodel = "t"\n')
+    out = S.rename_profile(inline, "fast", "quick")
+    assert 'roles = { planner = "quick", worker = "tiny" }  # keep me' in out
+    S.validate_text(out)
+
+
+def test_profiles_rename_endpoint_updates_references(gui):
+    _config(gui)
+    assert gui.post("/api/settings/profile", {
+        "file": "user", "action": "create", "name": "fast",
+        "values": {"base_url": "http://y/v1", "model": "tiny"}})[0] == 200
+    assert gui.post("/api/settings/set", {"file": "user", "changes": {
+        "default_profile": "fast",
+        "roles": {"planner": "fast", "worker": "default"}}})[0] == 200
+    status, body = gui.post("/api/profiles/rename", {
+        "file": "user", "old_name": "fast", "new_name": "quick"})
+    assert status == 200 and body["ok"], body
+    assert "quick" in body["user"]["profiles"]
+    assert "fast" not in body["user"]["profiles"]
+    assert body["renamed"] == {"from": "fast", "to": "quick"}
+    assert body["profiles"] == ["default", "quick"]
+    text = gui.cfg_path.read_text(encoding="utf-8")
+    assert "[profiles.quick]" in text and "[profiles.fast]" not in text
+    assert 'model = "tiny"' in text
+    assert re.search(r'^default_profile = "quick"', text, re.M)
+    assert 'planner = "quick"' in text and 'worker = "default"' in text
+    # STATE sees the new name immediately: the header dropdown's list too
+    status, st = gui.get("/api/state")
+    assert st["profiles"] == ["default", "quick"]
+    assert st["profile"] == "quick" and st["default_profile"] == "quick"
+
+
+def test_profiles_rename_endpoint_validation(gui):
+    _config(gui)
+    before = gui.cfg_path.read_text(encoding="utf-8")
+    assert gui.post("/api/profiles/rename",
+                    {"old_name": "ghost", "new_name": "x"})[0] == 400
+    assert gui.post("/api/profiles/rename",
+                    {"old_name": "default", "new_name": "default"})[0] == 400
+    assert gui.post("/api/profiles/rename",
+                    {"old_name": "default", "new_name": "bad/name"})[0] == 400
+    assert gui.post("/api/profiles/rename",
+                    {"old_name": "default", "new_name": ""})[0] == 400
+    assert gui.cfg_path.read_text(encoding="utf-8") == before
+    # version dots are sanitized like the import endpoint
+    status, body = gui.post("/api/profiles/rename", {
+        "old_name": "default", "new_name": "qwen3.8"})
+    assert status == 200 and "qwen3_8" in body["user"]["profiles"], body
+    text = gui.cfg_path.read_text(encoding="utf-8")
+    assert "[profiles.qwen3_8]" in text
+    assert 'default_profile = "qwen3_8"' in text   # the reference followed it
+
+
+# --- Sprint D: universal settings are always concrete ----------------------------
+
+def test_settings_payload_resolves_concrete_universal_values(gui):
+    """No project open and no user config yet: every universal setting still
+    gets a concrete effective value (the Config() default) in /api/settings —
+    there is nothing above the universal layer to inherit from."""
+    status, p = gui.get("/api/settings")
+    assert status == 200
+    by = {i["name"]: i for i in p["schema"]}
+    assert set(by) == set(p["resolved"])           # nothing missing
+    for name in by:
+        assert "value" in p["resolved"][name] and "source" in p["resolved"][name]
+    assert p["resolved"]["allow_shell"]["value"] is False
+    assert p["resolved"]["auto_fit"]["value"] is True
+    assert p["resolved"]["temperature"]["value"] == 0.2
+    assert p["resolved"]["temperature_answer"]["value"] == 0.0
+    assert p["resolved"]["json_mode"]["value"] == "schema"
+    assert p["resolved"]["context_tokens"]["value"] == \
+        by["context_tokens"]["default"] == 8192
+    # written values still win over the defaults
+    _config(gui)
+    status, p = gui.get("/api/settings")
+    assert p["user"]["settings"]["vram_gb"] == 8
+    assert p["resolved"]["api_key"]["value"] == ""    # secrets stay masked
+
+
 # --- Model Discovery: version dots in model ids -> valid profile names ------
 # (the scan + import endpoints run against the fake LM Studio server from
 # test_models_scan, using test_gui's `gui` server fixture)

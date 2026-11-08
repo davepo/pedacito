@@ -97,7 +97,12 @@ def payload() -> dict:
     cfg = STATE.cfg
     return {
         "schema": settings.schema(),
-        "resolved": settings.resolved(cfg) if cfg is not None else {},
+        # Universal settings must always carry a concrete effective value:
+        # the open project's resolved one when there is a config, else the
+        # built-in `Config()` defaults (a GUI session can start without a
+        # project open, and the user file may not exist yet).
+        "resolved": settings.resolved(cfg if cfg is not None
+                                      else config_mod.Config()),
         "active_profile": cfg.active_profile if cfg is not None else "",
         "tiers": list(config_mod.PRESET_TIERS),
         "user": file_info("user"),
@@ -143,6 +148,46 @@ def profile_action(which: str, action: str, name: str, values: dict,
         raise ConfigError(f"unknown profile action {action!r}")
     write_config(path, new)
     return payload()
+
+
+def rename_profile(which: str, old_name: str, new_name: str) -> dict:
+    """Rename `[profiles.OLD]` to `[profiles.NEW]` in place (comments and
+    every other key survive), retarget `default_profile` and `roles`
+    references, and reload STATE so the header dropdown and the settings
+    payload show the new name at once."""
+    old_name = str(old_name or "").strip()
+    raw_new = str(new_name or "").strip()
+    new_name = _sanitize_profile_name(raw_new)
+    # version dots never fail a rename either (`qwen3.8` -> `qwen3_8`), but a
+    # truly wrong human name (an org `path/`) is refused, like the import.
+    if not new_name or not PROFILE_NAME_RE.fullmatch(new_name):
+        raise ConfigError(
+            f"profile name {raw_new!r} must use letters, digits, '-' and "
+            "'_' (starting with a letter or digit, max "
+            f"{_MAX_PROFILE_NAME} characters)")
+    path = config_path(which)
+    text = _read_text(path)
+    known = config_editor.profile_names(text)
+    if old_name not in known:
+        raise ConfigError(f"no profile named '{old_name}' in this file")
+    if new_name == old_name:
+        raise ConfigError(f"the profile is already named '{old_name}'")
+    if new_name in known:
+        raise ConfigError(f"a profile named '{new_name}' already exists")
+    write_config(path, config_editor.rename_profile(text, old_name, new_name))
+    # Keep the selection following the renamed profile: an explicit
+    # user-chosen profile (STATE.profile_request) or the active one.
+    with STATE.lock:
+        requested = STATE.profile_request
+        active = STATE.cfg.active_profile if STATE.cfg is not None else ""
+    out = reload_state_config(profile=new_name
+                              if requested == old_name else None)
+    if out["active_profile"] == "" and active == old_name:
+        out = reload_state_config(profile=new_name)
+    out["renamed"] = {"from": old_name, "to": new_name}
+    out["profiles"] = sorted(set((out["user"].get("profiles") or {}))
+                             | set((out["project"].get("profiles") or {})))
+    return out
 
 
 def save_raw(which: str, text: str) -> dict:
@@ -333,17 +378,21 @@ def reset_to_baseline() -> dict:
 
 # --- immediate STATE config reload --------------------------------------------
 
-def reload_state_config() -> dict:
+def reload_state_config(profile: str | None = None) -> dict:
     """Re-read the config files into STATE so /api/state and /api/settings
     show the change at once (the profile dropdown included), without waiting
-    for a project re-open job. Returns the fresh settings payload."""
+    for a project re-open job. Returns the fresh settings payload.
+
+    `profile` forces the profile selection after the reload (the rename
+    endpoint passes it when the renamed profile was the explicitly chosen
+    one); None keeps the files' own selection and clears any stale request."""
     from ..agent import Agent
     from ..llm import LLMClient
     with STATE.lock:
         root = STATE.root
     try:
-        cfg = config_mod.load(root=root, require_hardware=False,
-                              warn_budgets=False)
+        cfg = config_mod.load(root=root, profile=profile,
+                              require_hardware=False, warn_budgets=False)
     except ConfigError:
         cfg = None
     with STATE.lock:
@@ -351,7 +400,7 @@ def reload_state_config() -> dict:
         STATE.client = LLMClient(cfg) if cfg is not None else None
         STATE.agent = (Agent(STATE.idx, STATE.client, cfg)
                        if cfg is not None and STATE.idx is not None else None)
-        STATE.profile_request = ""
+        STATE.profile_request = profile or ""
         STATE.model_checked, STATE.model_status, STATE.model_ok = False, "", None
     return payload()
 
