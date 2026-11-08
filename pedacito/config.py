@@ -226,6 +226,12 @@ class Config:
     # Attach the enclosing signature and module imports when a `read` starts
     # mid-file.
     read_context_hint: bool = True
+    # When a `read` targets a class/module larger than the read budget,
+    # return a deterministic AST skeleton (signatures + docstrings +
+    # [lines X-Y] pointers, bodies folded) instead of the first page of the
+    # giant unit; continuation parts of a split definition auto-merge into
+    # one span either way. Set false for the old truncated-read behaviour.
+    read_skeleton: bool = True
     # After each `auto` task (when no --verify command is set), run the
     # project's detected linter/type checker and feed failures into the repair
     # rounds. Off by default: pre-existing lint issues would be blamed on the
@@ -2043,6 +2049,9 @@ max_rehydration_rounds = 2
 max_gathered_chars = 24000
 max_read_lines = 200
 read_context_hint = true
+# Oversized class/module reads return a folded AST skeleton (signatures,
+# docstrings, [lines X-Y] pointers) instead of a truncated first page.
+read_skeleton = true
 
 # Opt-in tool capabilities. Flip these only when the model should use them.
 allow_write = false

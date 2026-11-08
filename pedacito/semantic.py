@@ -5,11 +5,19 @@ Usage
     from . import semantic
 
     matches = semantic.search(index, cfg, client, "where do we retry?")
+    matches = semantic.hybrid_search(index, cfg, client, query, candidates)
     text = semantic.render("where do we retry?", matches)
 
 Opt-in (`semantic_search = true`). Uses the same OpenAI-compatible server's
 `/v1/embeddings` endpoint and only runs as a last resort when `grep` found
 nothing textually, so exact identifiers still get exact results.
+
+The grep fallback is CANDIDATE-FIRST: the free lexical pass (BM25, symbol
+names, call graph) assembles a bounded top-K short-list (K = 50), only the
+query and those K units are embedded, and the two rankings are merged with
+Reciprocal Rank Fusion. A no-hit grep costs K+1 embedding calls, never one
+pass over the whole project. `search()` keeps the full-index mode for
+callers that want plain by-meaning retrieval without a candidate set.
 
 Embeddings are cached by chunk content hash in `.pedacito/embeddings.json`;
 switching the embedding model invalidates the cache.
@@ -28,6 +36,14 @@ from .llm import LLMError
 EMBEDDINGS_FILE = "embeddings.json"
 _BATCH = 32
 _MAX_UNIT_CHARS = 2000
+
+# Candidate-first hybrid retrieval: the free lexical pass supplies at most
+# this many units to embed (never the whole project), and RRF_K is the
+# smoothing constant of Reciprocal Rank Fusion -- a rank contributes
+# 1/(RRF_K + rank), so the merge values agreement between the two rankings
+# without needing their scores to be comparable.
+CANDIDATE_LIMIT = 50
+RRF_K = 60
 
 # Endpoints that cannot serve embeddings (e.g. Lemonade's llama.cpp backend
 # without --embeddings returns 501; a wrong embedding_model returns 400/404).
@@ -109,9 +125,14 @@ def _normalise(vector: list[float]) -> list[float]:
     return [round(x / norm, 6) for x in vector] if norm else vector
 
 
-def _ensure(index, cfg, client, verbose: bool = False
-            ) -> tuple[dict[str, list[float]], str]:
-    """Return (vectors_by_sha, model), embedding any missing units."""
+def _ensure(index, cfg, client, verbose: bool = False, units=None
+           ) -> tuple[dict[str, list[float]], str]:
+    """Return (vectors_by_sha, model), embedding any missing units.
+
+    `units` restricts the embedding work to one candidate set: only those
+    units are hydrated and embedded, so a hybrid lookup costs at most K
+    unit embeddings plus the query, never a pass over the whole index.
+    None means every indexed unit (the standalone `search()` mode)."""
     model = model_name(cfg)
     key = _endpoint_key(cfg, model)
     if key in _DISABLED:
@@ -119,7 +140,7 @@ def _ensure(index, cfg, client, verbose: bool = False
     vectors = _load_cache(index.root, model)
     # Source is hydrated lazily: only units with no cached vector are read.
     missing = []
-    for c in index.chunks:
+    for c in (index.chunks if units is None else units):
         if c.kind == "module" or not c.sha or c.sha in vectors:
             continue
         hydrate = getattr(index, "hydrate", None)
@@ -187,20 +208,86 @@ def search(index, cfg, client, query: str, top_k: int | None = None,
     return scored[:k]
 
 
-def render(query: str, matches: list[tuple[float, object]]) -> str:
+def hybrid_search(index, cfg, client, query: str, candidates,
+                  top_k: int | None = None,
+                  verbose: bool = False) -> list[tuple[float, object, float]]:
+    """Candidate-first hybrid retrieval with Reciprocal Rank Fusion.
+
+    `candidates` is the bounded top-K short-list from the free lexical pass
+    (BM25 over names/summaries/sidecars, symbol names, call graph), in that
+    rank order. Only the query and those candidates are hydrated and
+    embedded -- the whole index is never embedded for one no-hit grep. The
+    lexical ranking and the embedding ranking are then merged with RRF:
+
+        rrf(c) = 1 / (RRF_K + lex_rank) + 1 / (RRF_K + sem_rank)
+
+    RRF needs only the ranks, not comparable scores, so a cosine of 0.83 and
+    a BM25 of 11.4 fuse cleanly. Units whose cosine falls below
+    `semantic_min_score` are dropped: this list is the by-meaning answer,
+    and a unit with no semantic signal is better served by the plain
+    lexical suggestions than by an embedding vote it never earned.
+
+    Returns [(rrf, chunk, cosine)], best first."""
+    q = (query or "").strip()
+    if not q or not getattr(client, "embed", None):
+        return []
+    units = [c for c in candidates or []
+             if getattr(c, "sha", "") and getattr(c, "kind", "") != "module"]
+    units = units[:CANDIDATE_LIMIT]
+    if not units:
+        return []
+    vectors, _ = _ensure(index, cfg, client, verbose=verbose, units=units)
+    embedded = client.embed([q])
+    if not embedded or not embedded[0]:
+        return []
+    qv = _normalise(embedded[0])
+    min_score = float(getattr(cfg, "semantic_min_score", 0.2) or 0.0)
+    semantic: list[tuple[float, int, object]] = []
+    for rank, c in enumerate(units):
+        vector = vectors.get(c.sha)
+        if not vector or len(vector) != len(qv):
+            continue
+        cos = sum(a * b for a, b in zip(qv, vector))
+        if cos >= min_score:
+            semantic.append((cos, rank, c))
+    if not semantic:
+        return []
+    semantic.sort(key=lambda item: (-item[0], item[1]))
+    sem_pos = {id(c): pos for pos, (_cos, _r, c) in enumerate(semantic)}
+    cos_by_id = {id(c): cos for cos, _r, c in semantic}
+    fused: list[tuple[float, int, object]] = []
+    for lex_rank, c in enumerate(units):
+        pos = sem_pos.get(id(c))
+        if pos is None:
+            continue
+        rrf = (1.0 / (RRF_K + lex_rank + 1)
+               + 1.0 / (RRF_K + pos + 1))
+        fused.append((rrf, lex_rank, c))
+    fused.sort(key=lambda item: (-item[0], item[1]))
+    k = int(top_k or getattr(cfg, "semantic_top_k", 5) or 5)
+    return [(rrf, c, cos_by_id[id(c)]) for rrf, _lr, c in fused[:k]]
+
+
+def render(query: str, matches) -> str:
     """Render search results as locations, not source.
 
     The model still has to `read` the chosen unit before editing, so quote
-    only what identifies it (path, range, symbol, summary)."""
+    only what identifies it (path, range, symbol, summary). `matches` items
+    are (score, chunk) from search(), or (rrf, chunk, cosine) from
+    hybrid_search()."""
     if not matches:
         return f"No semantic matches for: {query}"
     out = [f"Semantic matches for: {query}"]
-    for score, c in matches:
-        out.append(f"  {c.file}:{c.start}-{c.end}  {c.qualname}  "
-                   f"(score {score:.2f})")
-        extra = c.summary or c.docline
-        if extra:
-            out.append(f"      {extra}")
+    for item in matches:
+        score, c = item[0], item[1]
+        hybrid = len(item) > 2
+        cos = item[2] if hybrid else score
+        extra = f", fused rank {score:.3f}" if hybrid else ""
+        out.append(f"  {c.file}:{c.start}-{getattr(c, 'scope_end', 0) or c.end}"
+                   f"  {c.qualname}  (score {cos:.2f}{extra})")
+        detail = c.summary or c.docline
+        if detail:
+            out.append(f"      {detail}")
     out.append("[These are locations by meaning, not exact text. `read` a "
                "region before editing or quoting it.]")
     return "\n".join(out)

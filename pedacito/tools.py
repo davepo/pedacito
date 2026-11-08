@@ -16,11 +16,13 @@ small model cannot express as a search/replace block.
 
 Every tool returns plain text with line numbers, since the model needs them to
 write search/replace edits. Navigation tools are forgiving of argument slips:
-`read` accepts a symbol name, `grep` falls back to literal text for an invalid
-regex, retries case-insensitively, accepts a directory or glob scope, adds
-context for sparse hits, suggests similar symbols on a miss, and (with
-`semantic_search`) queries the server's embeddings endpoint when nothing
-matches textually.
+`read` accepts a symbol name (continuation parts auto-merge; an oversized
+class/module returns a folded AST skeleton), `grep` falls back to literal text
+for an invalid regex, retries case-insensitively, accepts a directory or glob
+scope, adds context for sparse hits, suggests similar symbols on a miss, and
+(with `semantic_search`) runs candidate-first hybrid retrieval: the free
+lexical pass short-lists at most K units, only those plus the query are
+embedded, and the rankings merge via reciprocal-rank fusion (see semantic.py).
 
 STEP_SCHEMA is the JSON schema used for the model server's grammar-constrained
 `response_format`, so the model's tool choice always parses.
@@ -48,10 +50,14 @@ from . import edits as edits_mod
 
 TOOL_HELP = """\
 read     - read exact lines of a file.       args: file, start, end
-           (or set symbol and leave file empty: read that definition)
+           (or set symbol and leave file empty: read that definition; a
+            split definition's parts auto-merge; a class/module too big for
+            the read budget comes back as a folded SKELETON: signatures +
+            docstrings + [lines X-Y] pointers, then read one range)
 grep     - regex or literal search. args: pattern, and optional file/dir/glob
            (pattern = an existing filename returns its references/imports;
-            with semantic_search on, falls back to search by meaning)
+            with semantic_search on, a no-hit grep falls back to hybrid
+            BM25+embedding search over its top-50 candidates, RRF-merged)
 find     - search indexed definitions by name, signature, or summary.
            args: pattern (a fragment like 'retry' or 'Server.start'). Hits
            carry exact line ranges; no regex, no source-text guessing
@@ -763,8 +769,9 @@ def _symbol_suggestions(index, pattern: str) -> str:
 
 
 def _bm25_suggestions(index, pattern: str) -> str:
-    """'Closest definitions by name/summary' for a grep that found nothing:
-    BM25 over the index, before any embeddings round-trip."""
+    """'Closest definitions by name/summary/body-sidecar' for a grep that
+    found nothing: BM25 over the persisted index fields (zero model calls),
+    before any embeddings round-trip."""
     p = (pattern or "").strip()
     if len(p) < 3 or len(p) > 120:
         return ""
@@ -777,8 +784,58 @@ def _bm25_suggestions(index, pattern: str) -> str:
         return ""
     rows = "; ".join(f"{c.file}:{c.start}-{c.scope_end or c.end} {c.qualname}"
                      for _s, c in hits)
-    return ("[no text matches, but these definitions match the words by name/"
-            f"summary: {rows}. `read` one before relying on it.]")
+    return ("[no text matches, but these definitions match the words by "
+            f"name/summary/indexed body text: {rows}. `read` one before "
+            "relying on it.]")
+
+
+_HYBRID_K = 50   # bounded candidate set for hybrid search (see semantic.CANDIDATE_LIMIT)
+
+
+def _hybrid_candidates(index, pattern: str, limit: int = _HYBRID_K) -> list:
+    """Bounded candidate short-list for candidate-first hybrid search, built
+    from the FREE matchers only, in rank order: BM25 (names, signatures,
+    summaries, and the persisted lexical sidecar), then similar symbol names,
+    then chunks whose call graph touches a query word. Deterministic index
+    order fills any remaining slots: a zero-lexical-signal query (pure
+    natural language) still gets candidates embedded, but at most K of them
+    instead of one pass over the whole project."""
+    raw = (pattern or "").strip()
+    if not raw:
+        return []
+    out: dict[str, object] = {}
+    try:
+        for _s, c in index.bm25.query(raw, limit=limit):
+            out.setdefault(c.key, c)
+    except Exception:
+        pass
+    names = sorted({c.qualname for c in index.chunks
+                    if c.qualname not in ("module", "__trailing__")})
+    close = set(difflib.get_close_matches(raw, names, n=10, cutoff=0.6))
+    low = raw.lower()
+    if len(raw) >= 3:
+        close.update(n for n in names if low in n.lower())
+    if close:
+        for c in index.chunks:
+            if c.qualname in close:
+                out.setdefault(c.key, c)
+            if len(out) >= limit:
+                return list(out.values())
+    # Graph signal: units that CALL a symbol named by a query word.
+    for word in re.findall(r"[A-Za-z_][A-Za-z0-9_]{2,}", raw)[:6]:
+        try:
+            for c in index.callers_of(word):
+                out.setdefault(c.key, c)
+        except Exception:
+            pass
+    if len(out) < limit:
+        for c in index.chunks:
+            if len(out) >= limit:
+                break
+            if c.kind in ("module", "reference") or not getattr(c, "sha", ""):
+                continue
+            out.setdefault(c.key, c)
+    return list(out.values())
 
 
 def _fresh_index(index, cfg, rel: str):
@@ -820,17 +877,128 @@ def _definition_list(symbol: str, matches: list) -> str:
     return "\n".join(out)
 
 
+def _continuation_end(index, rel: str, chunk) -> int:
+    """Fold a split unit's adjacent fragments into one span (parent/child
+    auto-merge): when `chunk` is `big` or `big#2`, follow the persisted
+    continuation lineage (`part_of`/`part`, or the `name#N` qualname scheme
+    on older indexes) and return the end line of the last contiguous part.
+    Overlapping fragments collapse via max(); a gap stops the walk so a
+    same-named neighbor can never extend a read into unrelated code."""
+    try:
+        units = index.in_file(rel)
+    except Exception:
+        return chunk.end
+    byq = {c.qualname: c for c in units}
+    base = getattr(chunk, "part_of", "") or chunk.qualname
+    end = chunk.end
+    part = max(1, getattr(chunk, "part", 1)) + 1
+    while True:
+        nxt = byq.get(f"{base}#{part}")
+        if nxt is None or nxt.start > end + 1:
+            break
+        end = max(end, nxt.end)
+        part += 1
+    return end
+
+
+# Caps for the skeleton view: it must stay dramatically smaller than the
+# source it replaces (the whole point is that a small model can inspect a
+# 500-line class in ~40 lines).
+_SKELETON_MAX_ROWS = 160
+_SKELETON_MAX_CHARS = 6000
+
+
+def _skeleton_view(index, rel: str, head, total_lines: int) -> str:
+    """Deterministic AST skeleton for a class/module that overflows the read
+    budget: signatures + first docstring lines + [lines X-Y] pointers, every
+    body folded. Built from indexed chunk facts (or, for a module head, the
+    file's top-level units), so it costs zero model calls and the breadcrumb
+    -- file, unit kind, signature, full span -- is printed exactly once
+    instead of duplicating parent source above each child. Returns '' when
+    there is nothing to skeletonise (fewer than two named children); the
+    caller then falls back to the ordinary truncated read."""
+    if head is not None and head.kind in ("class", "classheader"):
+        lo, hi = head.start, (head.scope_end or head.end)
+
+        def show(c):
+            return (getattr(c, "parent", "") == head.qualname
+                    or c.kind in ("method", "class", "classheader")) \
+                and not getattr(c, "part_of", "")
+    else:
+        # Module scope: the whole file with its top-level definitions only
+        # (methods nest under their class row, whose pointer covers the
+        # full class span; continuation parts fold into the base row).
+        lo, hi = 1, total_lines
+
+        def show(c):
+            return (c.kind in ("function", "class", "classheader", "module")
+                    and not getattr(c, "part_of", "")
+                    and getattr(c, "parent", "") == "")
+    hi = max(hi, lo)
+    rows: list[str] = []
+    dropped = 0
+    first_child = ""
+    for c in index.in_file(rel):
+        if c is head or c.kind == "reference":
+            continue
+        if not (lo <= c.start <= hi) or not show(c):
+            continue
+        if len(rows) >= _SKELETON_MAX_ROWS:
+            dropped += 1
+            continue
+        if not first_child:
+            first_child = c.qualname
+        end = _continuation_end(index, rel, c)
+        if getattr(c, "scope_end", 0) > end:
+            end = c.scope_end          # a classheader stands for its class
+        if hi:
+            end = min(end, hi)
+        sig = (c.signature or c.qualname)[:100]
+        doc = f"  # {c.docline[:80]}" if c.docline else ""
+        indent = "  " if getattr(c, "parent", "") else ""
+        rows.append(f"{indent}{sig}  [lines {c.start}-{end}]{doc}")
+    if len(rows) < 2:
+        return ""
+    title = (f"{rel} [module]" if head is None or head.kind == "module"
+             else f"{rel} [{head.kind}] {head.signature or head.qualname}")
+    head_doc = f"  {head.docline[:120]}" if head is not None and head.docline \
+        else ""
+    out = [f"{title}  [lines {lo}-{hi}] -- SKELETON view ({hi - lo + 1} "
+           f"lines, bodies folded):"]
+    if head_doc:
+        out.append(head_doc)
+    out.extend(rows[:_SKELETON_MAX_ROWS])
+    if dropped:
+        out.append(f"  (+{dropped} more units; `outline` {rel} shows them all)")
+    out.append("[Signatures, docstrings and line pointers only (from the AST "
+               "index -- deterministic, no model). `read` a [lines X-Y] range, "
+               f"or `read` symbol='{first_child}' for the exact source of a "
+               "unit before editing it.]")
+    text = "\n".join(out)
+    if len(text) > _SKELETON_MAX_CHARS:
+        text = text[:_SKELETON_MAX_CHARS] + "\n[... skeleton truncated; " \
+            "outline the file, or read a smaller range]"
+    return text
+
+
 def tool_read(index, cfg, file: str, start: int, end: int,
               symbol: str = "") -> str:
     """Return exact, line-numbered source for `file` between `start` and `end`
     (1-based, inclusive): the only tool output safe to quote in an edit.
 
     When `file` is empty and `symbol` is given, read that symbol's definition
-    (an ambiguous name returns the definition list)."""
+    (an ambiguous name returns the definition list). A symbol whose
+    definition was split into `name#2` continuation parts auto-merges them
+    into one span (persisted parent/child lineage, so no extra read step is
+    needed). When a class/module read exceeds the read budget, a
+    deterministic AST skeleton view (signatures + docstrings + line
+    pointers, bodies folded) is returned instead of the first page of a
+    giant class -- `read_skeleton = false` restores plain truncation."""
     file = _as_text(file)
     symbol = _as_text(symbol).strip()
     start = _as_int(start, 1)
     end = _as_int(end, 0)
+    max_lines = max(1, _as_int(getattr(cfg, "max_read_lines", 200), 200))
     if not file.strip() and not symbol:
         return ("ERROR: read needs a `file` (optionally with start/end), or a "
                 "`symbol` with `file` empty. Use `grep` or `outline` to locate "
@@ -864,9 +1032,19 @@ def tool_read(index, cfg, file: str, start: int, end: int,
         # only a placeholder range is overridden.
         if not file.strip() or (start <= 1 and end <= 1):
             c = matches[0]
-            start, end = c.start, c.end
+            start = c.start
+            end = _continuation_end(index, rel, c)   # auto-merge #N parts
+            merged = "" if end == c.end else \
+                " (split definition: continuation parts merged)"
             symbol_note = (f"\n[symbol '{symbol}' resolved to {c.qualname} "
-                           f"at {rel}:{c.start}-{c.end}]")
+                           f"at {rel}:{start}-{end}{merged}]")
+            if getattr(cfg, "read_skeleton", True) \
+                    and c.kind in ("class", "classheader"):
+                full = max(end, getattr(c, "scope_end", 0) or end)
+                if full - c.start + 1 > max_lines:
+                    skel = _skeleton_view(index, rel, c, full)
+                    if skel:
+                        return skel
 
     if rel is None:
         return _file_hint(index, file)
@@ -885,7 +1063,6 @@ def tool_read(index, cfg, file: str, start: int, end: int,
     if not lines:
         return f"{rel} is empty (0 lines)."
 
-    max_lines = max(1, _as_int(getattr(cfg, "max_read_lines", 200), 200))
     start = max(1, start)
     end = end or len(lines)
     end = min(end, len(lines))
@@ -894,6 +1071,15 @@ def tool_read(index, cfg, file: str, start: int, end: int,
     if end < start:
         # Backwards range: read forward from `start` instead of failing.
         end = min(start + max_lines - 1, len(lines))
+    # Whole-file read of a module that overflows the budget: return the
+    # deterministic skeleton instead of the first 200 lines of a giant file.
+    if (not symbol and getattr(cfg, "read_skeleton", True)
+            and start == 1 and end >= len(lines) and len(lines) > max_lines):
+        mod = next((c for c in index.in_file(rel)
+                    if c.kind == "module" and c.qualname == "module"), None)
+        skel = _skeleton_view(index, rel, mod, len(lines))
+        if skel:
+            return skel
     if end - start + 1 > max_lines:
         end = start + max_lines - 1
         note = f"\n[truncated to {max_lines} lines; read again from {end + 1} if needed]"
@@ -916,13 +1102,20 @@ def tool_read(index, cfg, file: str, start: int, end: int,
                 # the owner's header too (qualnames are "Class.method", so
                 # the owner is the dotted prefix).
                 if c.kind == "method" and "." in c.qualname:
-                    owner = c.qualname.rsplit(".", 1)[0]
+                    # The owner is the persisted `parent` when present (and
+                    # the dotted prefix on older indexes); methods of a
+                    # split unit (`Class.m#2`) inherit it from part one.
+                    owner = getattr(c, "parent", "") \
+                        or c.qualname.rsplit(".", 1)[0]
                     for k in chunks:
                         if k.qualname == owner \
                                 and k.kind in ("class", "classheader") \
                                 and k.signature:
                             bits.append("in " + k.signature)
                             break
+                if getattr(c, "part_of", ""):
+                    bits.append(f"continues {c.part_of} "
+                                f"(part {c.part} of a split definition)")
                 if not symbol_note:
                     imports = sorted({i.split(".")[0].lstrip(".")
                                       for i in c.imports})
@@ -1038,8 +1231,11 @@ def tool_grep(index, pattern: str, scope: str = "", cfg=None,
     Returns `file:line: [symbol] text` hits (lines trimmed to 200 chars) under
     a warning not to quote them in edits. An invalid regex is searched as
     literal text; a case-sensitive miss falls back to case-insensitive hits;
-    a sparse result gets one context line per hit; a total miss tries
-    semantic search (if enabled) and similar symbol names. A `pattern` that
+    a sparse result gets one context line per hit; a total miss suggests
+    similar symbols and BM25 candidates (names, summaries and the persisted
+    lexical sidecar) for free, then -- if `semantic_search` is on -- runs
+    candidate-first hybrid retrieval (embed the query plus at most K lexical
+    candidates, merge by reciprocal-rank fusion). A `pattern` that
     is itself an indexed file path (no scope) returns that file's references.
     """
     pattern = _as_text(pattern)
@@ -1106,28 +1302,38 @@ def tool_grep(index, pattern: str, scope: str = "", cfg=None,
     suggestions: list[str] = []
     if not hits:
         # Cheapest first: similar symbol names and BM25 over names/summaries
-        # (zero model calls). Embeddings are the optional last resort.
+        # and the persisted lexical sidecar (zero model calls). Embeddings
+        # are the optional last resort -- and now candidate-first: only the
+        # top-K lexical short-list is ever embedded.
         for text in (_symbol_suggestions(index, pattern),
                      _bm25_suggestions(index, pattern)):
             if text:
                 suggestions.append(text)
 
-    if not hits and not suggestions and client is not None \
+    if not hits and client is not None \
             and cfg is not None and getattr(cfg, "semantic_search", False):
-        # Last resort: find code by meaning.
-        try:
-            from . import semantic
-            matches = semantic.search(index, cfg, client, pattern, verbose=True)
-        except Exception as e:
-            notes.append(f"[semantic search unavailable: {str(e)[:200]}]")
-        else:
-            if matches:
-                notes.append("[no text matches; showing semantic matches by "
-                             "meaning. `read` a region before editing.]")
-                hits = semantic.render(pattern, matches).splitlines()
+        # Last resort, bounded: embed ONLY the query and the candidate
+        # short-list, and merge the lexical and embedding rankings with
+        # reciprocal-rank fusion instead of embedding every chunk.
+        candidates = _hybrid_candidates(index, pattern)
+        if candidates:
+            try:
+                from . import semantic
+                matches = semantic.hybrid_search(index, cfg, client, pattern,
+                                                 candidates, verbose=True)
+            except Exception as e:
+                notes.append(f"[semantic search unavailable: {str(e)[:200]}]")
             else:
-                notes.append("[semantic search found nothing above the "
-                             "similarity threshold]")
+                if matches:
+                    notes.append("[no text matches; showing hybrid matches "
+                                 "by meaning -- BM25 short-list fused with "
+                                 "embedding ranks (RRF) over "
+                                 f"{len(candidates)} candidate unit(s). `read` "
+                                 "a region before editing.]")
+                    hits = semantic.render(pattern, matches).splitlines()
+                else:
+                    notes.append("[semantic search found nothing above the "
+                                 "similarity threshold]")
 
     if not hits:
         notes.extend(suggestions)

@@ -325,6 +325,74 @@ comes with its ground truth instead of only a complaint. Token economy (#1)
 holds because the rehydrated payload is triple-bounded — spans not files,
 the read token budget, and round and span caps.
 
+### 12. Index-driven retrieval: sidecars, candidate-first RRF, skeleton reads
+
+Three upgrades to the indexing layer (chunker / search / semantic / tools),
+each extending Guiding Constraints #1 and #4 — *deterministic first, bounded
+always*:
+
+- **Persisted lexical body sidecar.** BM25 (`search.py`) deliberately refused
+  to score source bodies: a loaded index hydrates source lazily, and a
+  ranking that changed depending on whether a chunk happened to have been
+  read from disk yet was a determinism bug, not a feature. Instead of giving
+  up on body words, chunking (`chunker.py`) now extracts a **bounded lexical
+  sidecar** per unit — split identifier tokens, docstring/comment words,
+  string-literal words (error messages, prompts, config values) and
+  config/dict keys, categories capped separately so an identifier-heavy body
+  cannot evict the strings a query would actually look for — and it ships
+  inside `index.json`. `search.py` scores it as the body field at the
+  existing low weight (0.3, behind name 3.0 / sig 1.5), and matched-term
+  reasons now see it too. Consequence: `find`, the BM25 miss-suggestions, and
+  file-level task ranking can hit an error string, a config key, or an
+  internal call name even with `--no-summaries`, and the ranking is
+  **100% hydration-stable** — the sidecar travels with the record, so a
+  freshly built index and a reloaded one rank identically. Chunks indexed
+  before the sidecar existed simply score no body terms; the next re-chunk
+  fills them in.
+- **Candidate-first hybrid retrieval with RRF.** Embeddings used to be a
+  last resort that either never fired (any free suggestion suppressed it) or
+  embedded *every* chunk on first use — one no-hit grep cost a pass over the
+  whole project. Now a no-hit `grep` first builds a bounded top-K (K = 50)
+  candidate short-list from the *free* matchers — BM25 over names,
+  summaries and the sidecar, similar symbol names, call-graph hits — and
+  only the query plus those K units are hydrated and embedded. The lexical
+  and embedding rankings are merged with **Reciprocal Rank Fusion**
+  (`score = Σ 1/(60 + rank)` per list): RRF needs ranks, not comparable
+  scores, so BM25 points and cosine similarity fuse without any scale
+  tuning, and a unit that ranks well in *both* lists beats one that only one
+  signal likes. A no-hit grep now costs at most K + 1 embeddings instead of
+  N + 1; chunk-sha embedding caching, the similarity floor, and the
+  remember-the-permanent-failure behavior (a server without `--embeddings`
+  is not retried within a run) are all unchanged. Candidates whose cosine
+  falls below `semantic_min_score` are dropped rather than promoted by a
+  lexical vote alone — a pure-name miss is still better served by the free
+  suggestions.
+- **Hierarchical chunks and skeleton views.** Every chunk now persists its
+  place in the tree: `parent` (the owning definition of a method), and
+  `part_of` / `part` (which split unit a `name#2` fragment continues).
+  `read` uses that lineage twice. **Adjacent fragments auto-merge:** reading
+  a symbol whose definition was split for the retrieval budget returns the
+  whole merged span, so a model can never act on a function's head while
+  its tail went unseen, and no extra read step is spent stitching parts.
+  **Skeleton view:** when a class or module exceeds the read budget, `read`
+  returns a deterministic AST skeleton — signatures, first docstring lines,
+  and `[lines X-Y]` pointers with every body folded — instead of a truncated
+  first page. The breadcrumb (file, unit, full span, module docstring) is
+  printed exactly once and no parent/child source is duplicated. A
+  500-line class arrives as ~35 lines of named ranges; the model then reads
+  exactly the one method it intends to edit. Zero model calls (all facts
+  come from the index), bounded (row and char caps), and gated behind
+  `read_skeleton` (on by default; `false` restores plain truncation).
+
+Why it helps: all three keep the retrieval contract small models depend on —
+the same query must return the same ranking in the same run *and* across
+runs, every paid step must be bounded, and the output a model re-reads must
+be only what it needs. The sidecar buys body-word recall without importing
+nondeterministic hydration; candidate-first RRF buys by-meaning search
+without the N-embedding bill it used to cost; skeletons buy a map of a giant
+unit at ~7% of its tokens, replacing "read page 1 of 3" hunts with one
+targeted read.
+
 ---
 
 ## Techniques that exist but are not a good fit

@@ -8,6 +8,17 @@ carries its exact 1-based inclusive line range. Static facts (signatures,
 decorators, docstrings, imports, call names) come from the AST; only the
 one-line summaries are LLM-generated (see index.py).
 
+Two retrieval facts are computed at chunking time and PERSISTED with the
+chunk, so lexical ranking never depends on whether a loaded index has read
+the file from disk yet:
+
+* `lex` -- a bounded lexical sidecar (split identifier tokens, docstring and
+  comment words, string-literal words, config/dict keys) that search.py
+  scores as the BM25 body field;
+* `parent` / `part_of` / `part` -- parent-child and continuation lineage, so
+  readers can auto-merge the `name#2`, `name#3`, ... fragments of a split
+  unit and print a class/module breadcrumb once without duplicating source.
+
 This module also holds the splitting helpers shared with chunker_ts.py.
 """
 
@@ -15,6 +26,7 @@ from __future__ import annotations
 
 import ast
 import hashlib
+import re
 from dataclasses import dataclass, field, asdict
 
 # AST node types treated as "scopes" worth chunking on their own.
@@ -39,6 +51,10 @@ class Chunk:
     calls: list[str] = field(default_factory=list)
     imports: list[str] = field(default_factory=list)
     members: list[str] = field(default_factory=list)  # method names, for whole-class chunks
+    lex: list[str] = field(default_factory=list)  # persisted lexical sidecar (see lex_sidecar)
+    parent: str = ""     # enclosing definition's qualname ("Server.start" -> "Server")
+    part_of: str = ""    # base qualname when this chunk continues a split unit ("big" for "big#2")
+    part: int = 1        # 1-based index within a split unit (continuation metadata)
     source: str = ""           # not persisted in the compact index
     sha: str = ""
     summary: str = ""
@@ -300,6 +316,139 @@ def _half_budget(lines: list[str], start: int, end: int, max_lines: int,
     return bool(max_tokens and _estimate_tokens(text) >= max_tokens * 0.5)
 
 
+# ---------------------------------------------------------------------------
+# Persisted lexical sidecar
+#
+# A bounded, deterministic bag of the words that make a unit FINDABLE by
+# lexical search even when its source text is not in memory: split
+# identifier tokens, docstring/comment words, string-literal words (error
+# messages, prompts, config values) and config/dict keys. Stored on the
+# chunk and persisted inside index.json, so search.py can score the body
+# field without ever hydrating source from disk -- the ranking is identical
+# whether or not a loaded Index has read the file yet (100% hydration-
+# stable, and it works with `--no-summaries`). Categories are capped
+# separately so an identifier-heavy body cannot push the error strings and
+# dict keys -- the words queries actually look for -- out of the budget.
+# ---------------------------------------------------------------------------
+
+LEX_LIMIT = 72  # hard cap on persisted terms per chunk
+
+_LEX_IDENT_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]{2,}")
+_LEX_WORD_RE = re.compile(r"[A-Za-z][A-Za-z0-9]*|\d+")
+_LEX_CAMEL_RE = re.compile(r"[A-Z]+(?![a-z])|[A-Z]?[a-z]+|\d+")
+# `name:` / "key": at line start (dict/config keys) and quoted inline keys.
+_LEX_KEY_RE = re.compile(r"""^\s*(?:["']([A-Za-z_][A-Za-z0-9_]{2,})["']"""
+                         r"""|([A-Za-z_][A-Za-z0-9_]{2,}))\s*:""",
+                         re.MULTILINE)
+_LEX_INLINE_KEY_RE = re.compile(r"""["']([A-Za-z_][A-Za-z0-9_]{2,})["']\s*:""")
+_LEX_STR_RE = re.compile(
+    r"'''(.*?)'''|\"\"\"(.*?)\"\"\"|'([^'\n]*)'|\"([^\"\n]*)\"", re.DOTALL)
+
+# Python keywords and self-evident names are noise in a lexical index.
+_LEX_STOP = frozenset("""
+and as assert async await break class continue def del elif else except
+finally for from global if import in is lambda nonlocal not or pass raise
+return try while with yield self cls none true false
+""".split())
+
+
+def split_ident(name: str) -> list[str]:
+    """camelCase/snake_case words of one identifier, lower-cased; fragments
+    shorter than 3 chars and Python keywords are dropped. search.tokenize
+    applies stopword removal and stemming on top when BM25 is built; the
+    sidecar keeps raw split words so an analyzer change never forces a
+    re-index of semantics into persisted data."""
+    out: list[str] = []
+    for word in _LEX_WORD_RE.findall((name or "").replace("_", " ")):
+        for part in _LEX_CAMEL_RE.findall(word):
+            w = part.lower()
+            if len(w) >= 3 and w not in _LEX_STOP:
+                out.append(w)
+    return out
+
+
+def lex_sidecar(text: str, limit: int = LEX_LIMIT) -> list[str]:
+    """Build the bounded lexical sidecar for one chunk's source text.
+
+    Deterministic (fixed scan order, insertion order kept) and derived only
+    from the text passed in -- never from disk state -- so a chunk's
+    persisted sidecar is identical at build time and after a reload. Order:
+    dict/config keys, string-literal words, comment words, identifier
+    tokens, then truncated to `limit`."""
+    keys: dict[str, None] = {}
+    strings: dict[str, None] = {}
+    comments: dict[str, None] = {}
+    idents: dict[str, None] = {}
+
+    def put(bucket: dict[str, None], word: str, cap: int) -> None:
+        if len(bucket) < cap:
+            bucket.setdefault(word, None)
+
+    # 1. config/dict keys: `name:` and "name": (settings modules, schemas).
+    for m in _LEX_KEY_RE.finditer(text):
+        for w in split_ident(m.group(1) or m.group(2) or ""):
+            put(keys, w, 16)
+    for m in _LEX_INLINE_KEY_RE.finditer(text):
+        for w in split_ident(m.group(1)):
+            put(keys, w, 16)
+    # 2. string-literal tokens: error messages, prompts, config values.
+    for m in _LEX_STR_RE.finditer(text):
+        value = next((g for g in m.groups() if g is not None), "")
+        for w in _LEX_WORD_RE.findall(value):
+            for part in split_ident(w):
+                put(strings, part, 32)
+    # 3. comment words (docstrings are string literals, captured above).
+    for line in text.split("\n"):
+        pos = line.find("#")
+        if pos < 0:
+            continue
+        for w in _LEX_WORD_RE.findall(line[pos + 1:]):
+            for part in split_ident(w):
+                put(comments, part, 20)
+    # 4. identifier tokens: names, attributes, kwargs (internal call surface).
+    for m in _LEX_IDENT_RE.finditer(text):
+        for part in split_ident(m.group(0)):
+            put(idents, part, 24)
+
+    terms: dict[str, None] = {}
+    for bucket in (keys, strings, comments, idents):
+        for w in bucket:
+            if len(terms) >= limit:
+                return list(terms)
+            terms.setdefault(w, None)
+    return list(terms)
+
+
+# qualname of a continuation part: "big#2", "Server.run#3", "module#2"...
+_PART_RE = re.compile(r"(.+)#(\d+)$")
+
+
+def _attach_lex_and_lineage(chunks: list[Chunk]) -> None:
+    """Fill the persisted lexical sidecar and parent/continuation metadata
+    on every chunk of one file, from the in-memory source only (hydration-
+    independent).
+
+    parent: the enclosing definition (a method's class, inherited by its
+    continuation parts). part_of/part: which split unit a `name#N` fragment
+    continues, so tools can auto-merge adjacent fragments and print the
+    class/module breadcrumb once instead of duplicating parent source."""
+    byq: dict[str, Chunk] = {}
+    for c in chunks:
+        byq.setdefault(c.qualname, c)
+    for c in chunks:
+        m = _PART_RE.fullmatch(c.qualname)
+        if m:
+            c.part_of, c.part = m.group(1), int(m.group(2))
+            base = byq.get(c.part_of)
+            if base is not None:
+                c.parent = base.parent
+        else:
+            c.part = 1
+        if c.kind == "method" and "." in c.qualname:
+            c.parent = c.qualname.rsplit(".", 1)[0]
+        c.lex = lex_sidecar(c.source or "")
+
+
 def chunk_source(rel_path: str, src: str, class_split_lines: int = 60,
                  max_unit_lines: int = 220, max_unit_chars: int = 12000,
                  max_unit_tokens: int = 3000,
@@ -481,5 +630,6 @@ def chunk_source(rel_path: str, src: str, class_split_lines: int = 60,
                         calls=_calls(*tail), source=body, sha=_sha(body),
                     ))
 
+    _attach_lex_and_lineage(chunks)
     chunks.sort(key=lambda c: c.start)
     return chunks

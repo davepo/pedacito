@@ -6,10 +6,15 @@
 
 Every unit is one document with weighted fields: its qualname (split into
 camelCase / snake_case words), signature, path, summary + docline, call and
-member names, and a small sample of identifiers from its source. A word found
-in a unit's NAME counts for far more than one found in a docstring, so
+member names, and its persisted lexical sidecar (`chunker.lex`: split
+identifiers, docstring/comment words, string-literal words, dict keys). A
+word found in a unit's NAME counts for far more than one found in prose, so
 `find retry` ranks `retry_with_backoff` above a function that merely mentions
-retrying. Zero model calls: it replaces the embeddings round-trip that used to
+retrying, while an error string or config key still matches through the
+sidecar even when summaries were never generated (`--no-summaries`). The
+sidecar ships inside index.json, so body scoring never waits on hydration:
+the ranking is identical whether or not the unit's source has been read from
+disk. Zero model calls: it replaces the embeddings round-trip that used to
 be the only fuzzy search, and usually beats chat-model embeddings at it.
 
 The index is built lazily in memory (a few hundred ms for 100k units) and
@@ -24,7 +29,6 @@ from collections import defaultdict
 
 _WORD_RE = re.compile(r"[A-Za-z][A-Za-z0-9]*|\d+")
 _CAMEL_RE = re.compile(r"[A-Z]+(?![a-z])|[A-Z]?[a-z]+|\d+")
-_IDENT_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]{2,}")
 
 STOPWORDS = frozenset("""
 a an and are as at be by for from has have how i if in into is it its of on or
@@ -85,19 +89,6 @@ def query_terms(text: str) -> list[str]:
     return out
 
 
-def _body_identifiers(source: str, limit: int = 40) -> list[str]:
-    """A capped sample of distinct identifiers from a unit's source."""
-    seen: dict[str, None] = {}
-    for m in _IDENT_RE.finditer(source or ""):
-        seen.setdefault(m.group(0), None)
-        if len(seen) >= limit * 3:
-            break
-    words: list[str] = []
-    for ident in list(seen)[:limit * 3]:
-        words.extend(tokenize(ident, keep_whole=False))
-    return words[:limit * 2]
-
-
 class BM25Index:
     """Weighted-field BM25 with incremental add/remove per file."""
 
@@ -115,6 +106,15 @@ class BM25Index:
         name = getattr(c, "qualname", "") or ""
         members = " ".join(getattr(c, "members", ()) or ())
         calls = " ".join(getattr(c, "calls", ()) or ())
+        # The persisted lexical sidecar (chunker.lex): the unit's identifier,
+        # docstring/comment, string-literal and dict-key words, captured at
+        # chunking time and shipped inside index.json. Scoring it here keeps
+        # body-word search (error strings, config keys, internal calls)
+        # working with --no-summaries, and the ranking is identical whether
+        # or not a loaded Index has hydrated source from disk yet -- the
+        # sidecar travels with the record, the source does not. Chunks
+        # chunked before the sidecar existed simply score no body terms.
+        lex = " ".join(getattr(c, "lex", ()) or ())
         return {
             "name": tokenize(name.replace(".", " ").replace("#", " ")),
             "sig": tokenize(sig),
@@ -123,10 +123,7 @@ class BM25Index:
             "text": tokenize(f"{getattr(c, 'summary', '')} "
                              f"{getattr(c, 'docline', '')}", keep_whole=False),
             "refs": tokenize(f"{members} {calls}", keep_whole=False),
-            # Source text is not indexed: a loaded Index hydrates source
-            # lazily, and a ranking that depended on whether a chunk had been
-            # read from disk yet would differ between runs.
-            "body": [],
+            "body": tokenize(lex, keep_whole=False) if lex else [],
         }
 
     def add(self, chunks) -> None:
@@ -212,10 +209,10 @@ class BM25Index:
         return dict(top)
 
     def matched_terms(self, chunk, text: str) -> list[str]:
-        """Query words that matched `chunk` (for one-line reasons)."""
+        """Query words that matched `chunk` in any scored field. The sidecar
+        counts because it is persisted with the record, not hydrated."""
         terms = query_terms(text)
         have = set()
-        for field, toks in self._fields(chunk).items():
-            if field != "body":
-                have.update(toks)
+        for toks in self._fields(chunk).values():
+            have.update(toks)
         return [t for t in terms if t in have]
