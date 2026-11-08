@@ -287,8 +287,8 @@ const MODES = {
   explain: { label: 'Ask', send: 'Ask',
     hint: 'Ask how the code works. Read-only \u2014 nothing is written.',
     ph: 'e.g. how does the sync client retry?' },
-  auto: { label: 'Auto', send: 'Start',
-    hint: 'Give a goal. Pedacito plans a checklist, then implements it task by task, each in a fresh context.',
+  auto: { label: 'Auto', send: 'Apply & run',
+    hint: 'Give a goal. Pedacito plans a checklist, then applies and verifies each change automatically. Tick \u201cPlan only\u201d in Options to review the plan first. By using Auto mode you accept the tool trust boundary: it may write files and run commands in this project.',
     ph: 'e.g. add CSV export to the report page, with tests' },
   'new': { label: 'New', send: 'Create',
     hint: 'Describe a project to start from scratch in a new folder.',
@@ -304,7 +304,7 @@ const OPTS = {
   ],
   explain: [],
   auto: [
-    { k: 'run', label: 'Run', type: 'select', def: 'plan', opts: [['plan', 'Write the plan only (review it first)'], ['apply', 'Plan and implement it']], span2: true },
+    { k: 'plan_only', label: 'Plan only (write the checklist, change no files)', type: 'check', def: false, span2: true },
     { k: 'plan_file', label: 'Use an existing plan file', type: 'text', browse: 'file', span2: true, ph: 'optional (default PLAN.md)' },
     { k: 'verify', label: 'Verify command after each task', type: 'text', span2: true, ph: 'e.g. pytest -q' },
     { k: 'repair', label: 'Repair rounds', type: 'number', def: '' },
@@ -352,6 +352,7 @@ PDC.refreshState = refreshState;
 function applyStatus(s) {
   const prev = S.status;
   S.status = s;
+  if (Array.isArray(s.messages)) reconcileMessages(s.messages);
   if (s.error && s.error !== lastErr && !s.job) PDC.toast(s.error.split('\n')[0], true);
   lastErr = s.error || '';
   const rkey = s.review ? s.review.id + ':' + s.review.outcome : '';
@@ -379,9 +380,66 @@ function jobActive(id) { return !!(job() && job().id === id); }
 // ---- snapshot + SSE stream ----
 let es = null;
 function addMsg(m) {
-  m.rev = 0;
-  if (m.role === 'stream' || m.role === 'activity') m.uiOpen = jobActive(m.job);
-  S.msgs = S.msgs.concat([m]);
+  if (!m || m.id == null) return;
+  const i = S.msgs.findIndex((x) => x.id === m.id);
+  if (i >= 0) {                           // already reconciled from state
+    const prev = S.msgs[i];
+    const merged = { ...prev, ...m, rev: (prev.rev || 0) + 1 };
+    if (m.role === 'stream' && prev.role !== 'stream') {
+      merged.role = prev.role;            // don't undo a final promotion
+      merged.text = prev.text;
+    }
+    S.msgs = S.msgs.slice();
+    S.msgs[i] = merged;
+  } else {
+    m.rev = 0;
+    if (m.role === 'stream' || m.role === 'activity') m.uiOpen = jobActive(m.job);
+    S.msgs = S.msgs.concat([m]);
+  }
+  S.msgTick++;
+}
+
+// Fold /api/state's transcript into the live one. The server list is
+// authoritative, but the response can predate an SSE event already applied in
+// the page; keep those newer messages (id greater than the newest server id)
+// instead of dropping them. Existing messages keep their UI state (open/closed
+// folds, rendered markdown) and only re-render when their text or role changed.
+function reconcileMessages(incoming) {
+  if (!Array.isArray(incoming)) return;
+  if (!incoming.length) {                  // an explicitly cleared transcript
+    if (S.msgs.length) { S.msgs = []; S.msgTick++; }
+    return;
+  }
+  const old = new Map(S.msgs.map((m) => [m.id, m]));
+  const seen = new Set();
+  let changed = incoming.length !== S.msgs.length;
+  const merged = incoming.map((m) => {
+    seen.add(m.id);
+    const prev = old.get(m.id);
+    if (!prev) { changed = true; return { ...m, rev: 0 }; }
+    // A poll response can predate the msg_set that promoted a stream to the
+    // final assistant answer; never let that stale copy fold it back.
+    const staleStream = m.role === 'stream' && prev.role !== 'stream';
+    let text = staleStream ? (prev.text || '')
+      : (typeof m.text === 'string' ? m.text : (prev.text || ''));
+    // Never replace a longer live stream with an older, shorter snapshot.
+    if (m.role === 'stream' && prev.role === 'stream'
+        && (prev.text || '').length > text.length) text = prev.text;
+    const role = staleStream ? prev.role : (m.role || prev.role);
+    const dirty = text !== prev.text || role !== prev.role
+      || Object.keys(m).some((k) => k !== 'text' && k !== 'role'
+        && k !== 'rev' && k !== 'uiOpen'
+        && JSON.stringify(m[k]) !== JSON.stringify(prev[k]));
+    if (dirty) changed = true;
+    return { ...prev, ...m, text, role, rev: (prev.rev || 0) + (dirty ? 1 : 0) };
+  });
+  const newest = incoming.length ? incoming[incoming.length - 1].id : 0;
+  S.msgs.forEach((m) => {
+    if (!seen.has(m.id) && m.id > newest) { merged.push(m); changed = true; }
+  });
+  if (!changed) return;
+  merged.sort((a, b) => a.id - b.id);
+  S.msgs = merged;
   S.msgTick++;
 }
 function loadSnapshot() {
@@ -407,15 +465,20 @@ function connect(seq) {
   on('msg_new', (e) => { addMsg(e.msg); emit(); });
   on('msg_append', (e) => {
     const m = S.msgs.find((x) => x.id === e.id);
-    if (!m) return;
+    if (!m) { refreshState(); return; }   // fell out of the local view
     m.text += e.text; m.rev = (m.rev || 0) + 1; S.msgTick++;
     emit();
   });
   on('msg_set', (e) => {
     const i = S.msgs.findIndex((x) => x.id === e.id);
-    if (i < 0) return;
+    if (i < 0) { refreshState(); return; }
+    const prev = S.msgs[i];
+    const fields = { ...e.fields };
+    if (prev.role === 'assistant' && fields.role === 'stream') {
+      delete fields.role;                 // never undo a final promotion
+    }
     S.msgs = S.msgs.slice();
-    S.msgs[i] = { ...S.msgs[i], ...e.fields, rev: (S.msgs[i].rev || 0) + 1 };
+    S.msgs[i] = { ...prev, ...fields, rev: (prev.rev || 0) + 1 };
     S.msgTick++; emit();
   });
   on('msgs_clear', () => { S.msgs = []; S.msgTick++; emit(); });
@@ -491,7 +554,10 @@ function send() {
   if (S.mode !== 'new' && !s.has_index) { PDC.toast('Build the index first.', true); return; }
   const body = { mode: S.mode, text: text, attachments: S.attachments.slice() };
   OPTS[S.mode].forEach((d) => { body[d.k] = opt(S.mode, d.k); });
-  if (S.mode === 'auto') body.apply = body.run === 'apply';
+  if (S.mode === 'auto') {
+    body.plan_only = !!body.plan_only;
+    body.apply = !body.plan_only;      // Auto applies unless Plan only is ticked
+  }
   PDC.startRun(body).then((r) => {
     if (r.ok) {
       S.drafts[S.mode] = '';
@@ -587,7 +653,7 @@ PDC.runPlan = function () {
   const a = (S.opts && S.opts.auto) || {};
   const s = S.status;
   const goal = (s.last_auto && s.last_auto.text && info.path === s.plan_file) ? s.last_auto.text : '';
-  PDC.startRun({ mode: 'auto', text: goal, plan_file: info.path, apply: true, verify: a.verify || '', repair: a.repair || '',
+  PDC.startRun({ mode: 'auto', text: goal, plan_file: info.path, plan_only: false, apply: true, verify: a.verify || '', repair: a.repair || '',
     max_tasks: a.max_tasks || '', max_minutes: a.max_minutes || '', keep_going: !!a.keep_going, auto_install: !!a.auto_install, diagnostics: !!a.diagnostics });
 };
 
@@ -746,12 +812,22 @@ function TopBar() {
                   else document.documentElement.setAttribute('data-theme', v);
                   try { localStorage.setItem('pedacito_theme', v); } catch (err) {}
                 }}>
-          <option value="slate">Slate</option>
-          <option value="parchment">Parchment</option>
-          <option value="sage">Sage</option>
-          <option value="mocha">Mocha</option>
-          <option value="clay">Clay</option>
-          <option value="nightshade">Nightshade</option>
+          <optgroup label="Light">
+            <option value="light">Light \u2014 GitHub</option>
+            <option value="daylight">Daylight \u2014 warm paper</option>
+          </optgroup>
+          <optgroup label="Dark">
+            <option value="slate">Slate \u2014 GitHub Dark</option>
+            <option value="nord">Nord \u2014 Catppuccin</option>
+            <option value="midnight">Midnight \u2014 high contrast</option>
+          </optgroup>
+          <optgroup label="Legacy aliases">
+            <option value="parchment">Parchment \u2192 Daylight</option>
+            <option value="clay">Clay \u2192 Daylight</option>
+            <option value="mocha">Mocha \u2192 Nord</option>
+            <option value="sage">Sage \u2192 Nord</option>
+            <option value="nightshade">Nightshade \u2192 Midnight</option>
+          </optgroup>
         </select>
         <button class="danger" id="exitBtn" title="stop the pedacito gui server"
                 onClick=${() => PDC.confirm('Stop the pedacito gui server? Run "pedacito gui" again to reopen it.', 'Stop server', true).then((ok) => {
@@ -1006,7 +1082,7 @@ function Composer() {
         <button id="sendBtn" class=${j ? 'danger' : 'primary'} disabled=${!!(j && j.cancelled)}
                 onClick=${() => { if (j) stop(); else send(); }}>
           ${j ? (j.cancelled ? 'Stopping\u2026' : 'Stop')
-              : (S.mode === 'auto' && opt('auto', 'run') === 'apply' ? 'Plan & run' : m.send)}
+              : (S.mode === 'auto' ? (opt('auto', 'plan_only') ? 'Plan only' : 'Apply & run') : m.send)}
         </button>
         <input type="file" id="filePick" multiple hidden
                onchange=${(e) => { attachFiles(e.target.files); e.target.value = ''; }} />

@@ -163,7 +163,10 @@ def _busy_reply(job):
 
 @get("/api/state")
 def _state(q, body=None):
-    return 200, STATE.status()
+    # `status` carries the header/engine telemetry; the chat transcript rides
+    # alongside it so a polling client can reconcile messages in one call.
+    # (`messages` is the same field name /api/snapshot uses.)
+    return 200, {**STATE.status(), "messages": STATE.messages_snapshot()}
 
 
 @get("/api/engine")
@@ -290,7 +293,15 @@ def _run(q, body):
     if mode not in fns:
         return 400, {"ok": False, "detail": f"unknown mode {mode!r}"}
     fn, title = fns[mode]
-    return _busy_reply(jobs.spawn(mode, title, lambda job: fn(job, body)))
+    opts = {**body, "_echoed": True}
+    if mode == "auto":
+        # Auto applies by default (like `pedacito auto --apply`); only an
+        # explicit "Plan only" request keeps it read-only.
+        opts["plan_only"] = jobs.auto_plan_only(opts)
+        opts["apply"] = not opts["plan_only"]
+    return _busy_reply(jobs.spawn(
+        mode, title, lambda job: fn(job, opts),
+        echo=lambda: jobs.echo_submission(mode, body)))
 
 
 @post("/api/stop")

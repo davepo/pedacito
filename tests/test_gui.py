@@ -677,6 +677,27 @@ def test_explain_streams_into_the_chat_as_an_answer(project):
 
 
 @pytest.mark.network
+def test_explain_populates_the_state_transcript_with_prompt_and_answer(project):
+    prompt = "how does greet work?"
+    status, _ = project.post("/api/run", {"mode": "explain", "text": prompt})
+    assert status == 202
+    # The user message is recorded before the worker starts, so it is already
+    # visible while the model is still warming up.
+    during = project.get("/api/state")[1]["messages"]
+    assert any(m["role"] == "user" and m.get("mode") == "explain"
+               and prompt in m["text"] for m in during)
+    assert project.wait_idle(30)
+    messages = project.get("/api/state")[1]["messages"]
+    assert any(m["role"] == "user" and prompt in m["text"] for m in messages)
+    answer = [m for m in messages
+              if m["role"] == "assistant" and m.get("kind") == "answer"]
+    assert answer and answer[-1]["text"].strip()
+    # and the same transcript is in the reload snapshot
+    snapshot = project.get("/api/snapshot")[1]["messages"]
+    assert [m["id"] for m in snapshot] == [m["id"] for m in messages]
+
+
+@pytest.mark.network
 def test_running_without_an_index_is_refused_with_guidance(gui, fake_port):
     gui.post("/api/settings/setup", {"base_url": f"http://127.0.0.1:{fake_port}/v1",
                                      "model": "fake-model", "vram_gb": "8"})
@@ -707,3 +728,52 @@ def test_new_project_preview_writes_nothing(gui, fake_port):
     gui.post("/api/run", {"mode": "new", "text": "", "project": str(target)})
     assert gui.wait_idle(30)
     assert "Describe" in core.STATE.messages[-1]["text"]
+
+
+@pytest.mark.network
+def test_auto_applies_by_default_backs_up_and_lists_changed_files(
+        project, monkeypatch):
+    from pedacito import fileio, workspace
+
+    seen = {}
+    app = project.root / "app.py"
+    cfg = core.STATE.cfg
+    before = (cfg.allow_write, cfg.allow_shell, cfg.backup)
+
+    def fake_auto(ns, cfg, client, idx, root):
+        seen.update(apply=ns.apply, backup=cfg.backup,
+                    allow_write=cfg.allow_write, allow_shell=cfg.allow_shell)
+        if ns.apply:
+            snap = workspace.new_backup_dir(root, unique=True)
+            fileio.backup_copy(app, snap / "app.py")   # pre-edit original
+            app.write_text(APP.replace("print", "return"))
+        return 0
+
+    monkeypatch.setattr(jobs.cli_mod, "_cmd_auto", fake_auto)
+    (project.root / "PLAN.md").write_text("# Plan\n\n- [x] change greet\n")
+    status, _ = project.post("/api/run", {"mode": "auto",
+                                          "text": "make greet return"})
+    assert status == 202 and project.wait_idle(30)
+    assert seen == {"apply": True, "backup": True,
+                    "allow_write": True, "allow_shell": True}
+    # Auto's trust-boundary opt-ins are scoped to the run.
+    assert (cfg.allow_write, cfg.allow_shell, cfg.backup) == before
+    result = [m for m in core.STATE.messages
+              if m.get("kind") == "result"][-1]
+    assert "app.py" in result["text"] and result["files"] == ["app.py"]
+    state = project.get("/api/state")[1]
+    assert state["snapshots"]
+    assert project.get("/api/file?path=app.py")[1]["text"].startswith(
+        "def greet(name):\n    return")
+
+    # ...but the explicit Plan only option still makes it read-only.
+    seen.clear()
+    project.post("/api/run", {"mode": "auto", "text": "plan only",
+                              "plan_only": True})
+    assert project.wait_idle(30)
+    assert seen["apply"] is False
+    # Plan-only must not inherit the trust-boundary opt-ins.
+    assert (seen["allow_write"], seen["allow_shell"]) == before[:2]
+    plan = [m for m in core.STATE.messages
+            if m.get("kind") == "plan_ready"][-1]
+    assert "Plan ready" in plan["text"]

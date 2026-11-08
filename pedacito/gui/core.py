@@ -344,6 +344,19 @@ class State:
                 return
         self.bus.publish("msg_set", id=mid, fields=fields)
 
+    def message_text(self, mid: int) -> str:
+        """The current text of one message ("" when it is gone)."""
+        with self.lock:
+            for m in reversed(self.messages):
+                if m["id"] == mid:
+                    return str(m.get("text") or "")
+        return ""
+
+    def messages_snapshot(self) -> list[dict]:
+        """A consistent, JSON-safe copy of the chat transcript."""
+        with self.lock:
+            return [dict(m) for m in self.messages]
+
     def clear_messages(self) -> None:
         with self.lock:
             self.messages = []
@@ -646,7 +659,8 @@ class State:
 
     def snapshot(self) -> dict:
         with self.lock:
-            return {"seq": self.bus.seq, "messages": list(self.messages),
+            return {"seq": self.bus.seq,
+                    "messages": self.messages_snapshot(),
                     "term": self.term, "status": self.status()}
 
     def files_signature(self) -> str:

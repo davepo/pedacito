@@ -23,13 +23,14 @@ from types import SimpleNamespace
 from .. import cli as cli_mod
 from .. import events as events_mod
 from .. import explain as explain_mod
+from .. import fileio, gitinfo
 from .. import index as index_mod
 from .. import loop, scaffold, steering, workspace
 from .. import plan as plan_mod
 from ..agent import Agent
 from ..config import ConfigError
 from ..llm import LLMClient, LLMError
-from .core import STATE, Job, args_for, remember_recent
+from .core import STATE, Job, RUN_KINDS, args_for, remember_recent
 
 MAX_TEXT_CHARS = 60000
 _EDIT_BLOCK_RE = re.compile(
@@ -38,11 +39,20 @@ _EDIT_BLOCK_RE = re.compile(
 
 # --- running jobs -------------------------------------------------------------
 
-def spawn(kind: str, title: str, fn) -> Job | None:
-    """Run `fn(job)` on a background thread; None while another job runs."""
+def spawn(kind: str, title: str, fn, *, echo=None) -> Job | None:
+    """Run `fn(job)` on a background thread; None while another job runs.
+
+    `echo` (when given) runs synchronously after the job slot is claimed and
+    before the thread starts, so a submitted prompt reaches the chat
+    transcript -- and the SSE stream -- without waiting for the worker."""
     job = STATE.begin_job(kind, title)
     if job is None:
         return None
+    if echo is not None:
+        try:
+            echo()
+        except Exception:
+            pass                    # a chat echo must never block the job
 
     def worker():
         err = ""
@@ -55,10 +65,16 @@ def spawn(kind: str, title: str, fn) -> Job | None:
                     "undone with Restore (project menu).", kind="cancelled")
             except (ConfigError, LLMError) as e:
                 err = str(e)
+                if job.kind in RUN_KINDS:
+                    STATE.add_message("assistant", err, kind="error",
+                                      level="warn")
                 STATE.add_message("error", err)
             except Exception as e:  # surface it in the UI, keep the server up
                 traceback.print_exc()
                 err = f"{type(e).__name__}: {e}"
+                if job.kind in RUN_KINDS:
+                    STATE.add_message("assistant", err, kind="error",
+                                      level="warn")
                 STATE.add_message("error", err)
         except KeyboardInterrupt:
             pass            # a Stop that arrived after the job body finished
@@ -121,6 +137,26 @@ class _Feed:
     def end_stream(self) -> int:
         mid, self.stream_mid, self.stream_site = self.stream_mid, 0, None
         return mid
+
+    def finish(self, text: str = "", **fields):
+        """Promote the current stream to the final assistant message.
+
+        The streamed text is the fallback when the engine returns no final
+        answer, so a table of tokens already on screen is never replaced by
+        an empty bubble. With no stream, a normal assistant message is added.
+        """
+        mid = self.end_stream()
+        text = (text or "").strip()
+        if mid:
+            if not text:
+                text = STATE.message_text(mid).strip()
+            if text:
+                fields["text"] = text
+            STATE.set_message(mid, role="assistant", **fields)
+            return mid
+        if text:
+            return STATE.add_message("assistant", text, **fields)["id"]
+        return 0
 
     def activity(self, line: str) -> None:
         if not self.activity_mid:
@@ -245,11 +281,31 @@ def compose(text: str, attachments: list | None) -> str:
     return out
 
 
-def _echo_user(mode: str, text: str, attachments: list | None) -> None:
+def _echo_user(mode: str, text: str, attachments: list | None,
+               opts: dict | None = None) -> None:
+    if opts is not None and opts.get("_echoed"):
+        return                      # already recorded synchronously by spawn
     shown = text if len(text) <= 4000 else text[:4000] + "\n[...]"
     STATE.add_message("user", shown, mode=mode, attachments=[
         {"name": str(a.get("name", "")), "chars": len(str(a.get("text", "")))}
         for a in attachments or []])
+
+
+def echo_submission(mode: str, body: dict) -> None:
+    """Record the submitted prompt before the worker thread starts.
+
+    The job functions also call `_echo_user`, but they see the `_echoed`
+    marker and skip it, so the prompt appears exactly once -- immediately,
+    even while the model is still warming up."""
+    text = str(body.get("text") or "")
+    attachments = body.get("attachments") or []
+    plan_file = str(body.get("plan_file") or "").strip()
+    if not text.strip() and not attachments and not (
+            mode == "auto" and plan_file):
+        return
+    shown = text or (f"plan: {plan_file}" if mode == "auto" and plan_file
+                     else "")
+    _echo_user(mode, shown, attachments)
 
 
 # --- project ------------------------------------------------------------------
@@ -383,7 +439,8 @@ def run_task(job: Job, opts: dict) -> None:
     task = compose(opts.get("text", ""), opts.get("attachments"))
     if not task:
         raise ConfigError("Describe the change you want first.")
-    _echo_user("task", opts.get("text", "") or task, opts.get("attachments"))
+    _echo_user("task", opts.get("text", "") or task, opts.get("attachments"),
+               opts)
     write = opts.get("write", "review")
     reviewing, apply = write == "review", write == "apply"
     plan_pref = opts.get("plan", "auto")
@@ -468,6 +525,9 @@ def _post_task_result(tr, client, reviewing: bool) -> None:
         level, head = "warn", "No edit was applied."
     else:
         level, head = "info", ""
+    if not prose:
+        # A reply made only of edit blocks still needs a visible result card.
+        prose = head or "The task finished. See the diff and activity panes."
     STATE.add_message("assistant", prose, kind="result", level=level,
                       head=head, results=results, stats=tr.stats or
                       _usage_stats(client))
@@ -480,31 +540,91 @@ def run_explain(job: Job, opts: dict) -> None:
     if not question:
         raise ConfigError("Ask a question first.")
     _echo_user("explain", opts.get("text", "") or question,
-               opts.get("attachments"))
+               opts.get("attachments"), opts)
     with session(p, job, interactive=False, lock=False) as feed:
         p.client.warmup()
         answer = explain_mod.answer(p.agent, question, verbose=True,
                                     stream=True)
-        mid = feed.end_stream()
-    if mid:
-        STATE.set_message(mid, role="assistant", kind="answer", text=answer,
-                          stats=_usage_stats(p.client))
-    else:
-        STATE.add_message("assistant", answer, kind="answer",
-                          stats=_usage_stats(p.client))
+    text = (answer or "").strip()
+    if not text and feed.stream_mid:
+        text = STATE.message_text(feed.stream_mid).strip()
+    if not text:
+        text = "The model finished without returning an answer."
+    feed.finish(text, kind="answer", stats=_usage_stats(p.client))
+
+
+def auto_plan_only(opts: dict) -> bool:
+    """True only when the user explicitly chose the Auto "Plan only" option.
+
+    The default is to apply changes (the GUI mirrors `pedacito auto --apply`).
+    The `run` alias keeps older clients that sent run="plan" working."""
+    if "plan_only" in opts:
+        value = opts.get("plan_only")
+        if isinstance(value, str):
+            return value.strip().lower() in (
+                "1", "true", "yes", "on", "plan", "plan-only", "plan_only")
+        return bool(value)
+    run = str(opts.get("run") or "").strip().lower()
+    return run in ("plan", "plan-only", "plan_only")
+
+
+def _files_in_backups(dirs) -> list[str]:
+    """Relative paths a set of backup snapshots recorded as written/created."""
+    names: set[str] = set()
+    for d in dirs:
+        try:
+            names.update(p.relative_to(d).as_posix()
+                         for p in d.rglob("*") if p.is_file())
+        except OSError:
+            continue
+        try:
+            manifest = fileio.created_manifest(d)
+            names.update(line.strip() for line in
+                         manifest.read_text(encoding="utf-8",
+                                            errors="replace").splitlines()
+                         if line.strip())
+        except OSError:
+            pass
+    return sorted(names)
+
+
+def _auto_changed_files(root: Path, before_backups: set,
+                        git_status: dict) -> list[str]:
+    """The files this auto run wrote, from its task backups (falling back to
+    git's dirty/untracked list when the project has no backup snapshots)."""
+    new_dirs = [d for d in workspace.list_backups(root)
+                if d not in before_backups]
+    names = _files_in_backups(new_dirs)
+    if not names and not new_dirs:
+        # No task snapshot was taken (e.g. a custom runner): fall back to the
+        # repository's post-run dirty/untracked files.
+        names = sorted(set(git_status.get("dirty") or [])
+                       | set(git_status.get("untracked") or []))
+    return names
 
 
 def run_auto(job: Job, opts: dict) -> None:
     """`auto`: turn a goal into a task list, then implement it task by task.
-    Without `apply` it only writes the plan, for review in the Plan tab."""
+
+    Applying is the default -- each step writes its changes and runs the
+    configured verification, like `pedacito auto --apply`. The user opts out
+    explicitly with the "Plan only" option (or run="plan" from older clients).
+
+    An applying Auto run is also an explicit acceptance of the tool trust
+    boundary: the gather phase gets `allow_write` (move/write/delete/rename)
+    and `allow_shell` (run/diagnose) for the run, even when the global config
+    leaves those opt-ins off. The original values are restored afterwards;
+    Plan-only keeps the user's real settings."""
     p = _project()
     goal = compose(opts.get("text", ""), opts.get("attachments"))
     plan_file = (opts.get("plan_file") or "").strip()
     if not goal and not plan_file:
         raise ConfigError("Give a goal, attach a spec, or choose a plan file.")
     _echo_user("auto", opts.get("text", "") or goal or f"plan: {plan_file}",
-               opts.get("attachments"))
-    apply = bool(opts.get("apply"))
+               opts.get("attachments"), opts)
+    # Applying is the default: the GUI behaves like `pedacito auto --apply`
+    # unless the user explicitly ticked "Plan only".
+    apply = not auto_plan_only(opts)
     ns = SimpleNamespace(
         task=goal or None, spec=None, plan=plan_file or None, apply=apply,
         verify=(opts.get("verify") or None),
@@ -524,24 +644,66 @@ def run_auto(job: Job, opts: dict) -> None:
         plan_path = (root / plan_path).resolve()
     with STATE.lock:
         STATE.plan_path = plan_path
-    with session(p, job, interactive=False, lock=apply) as feed:
-        client.warmup()
-        code = cli_mod._cmd_auto(ns, cfg, client, STATE.idx, root)
-        feed.end_stream()
+    # Snapshot the backup names before the run so the files this run writes
+    # can be reported afterwards. Forcing cfg.backup on while applying makes
+    # the loop take its usual pre-edit snapshot of every file it touches,
+    # even if the user normally turns backups off -- otherwise Restore would
+    # have nothing to roll back to.
+    before_backups = set(workspace.list_backups(root)) if apply else set()
+    saved_backup = getattr(cfg, "backup", True)
+    # An applying Auto run accepts the tool trust boundary: the lookup phase
+    # may move, write, delete and run commands even when the global opt-ins
+    # are off. Plan-only keeps the user's real settings (it must not write).
+    auto_optins = ("allow_write", "allow_shell")
+    saved_optins = {name: cfg.__dict__.get(name, _MISSING)
+                    for name in auto_optins}
+    if apply:
+        cfg.backup = True
+        for name in auto_optins:
+            setattr(cfg, name, True)
+    try:
+        with session(p, job, interactive=False, lock=apply) as feed:
+            client.warmup()
+            code = cli_mod._cmd_auto(ns, cfg, client, STATE.idx, root)
+            feed.end_stream()
+    finally:
+        if apply:
+            cfg.backup = saved_backup
+            for name, value in saved_optins.items():
+                if value is _MISSING:
+                    cfg.__dict__.pop(name, None)
+                else:
+                    setattr(cfg, name, value)
+    git_status: dict = {}
+    changed: list[str] = []
     if apply:
         _refresh_index(p)
+        git_status = gitinfo.status(root)
+        changed = _auto_changed_files(root, before_backups, git_status)
     done, total = plan_progress(plan_path)
     if not apply and code == 0:
         STATE.add_message(
             "assistant", f"Plan ready: {total} task(s). Review or edit it in "
             "the Plan tab, then run it.", kind="plan_ready", level="info",
-            auto=True)
+            auto=True, files=[])
     else:
+        text = (f"Auto finished: {done}/{total} task(s) done."
+                if code == 0 else
+                f"Auto stopped: {done}/{total} task(s) done; see the Plan "
+                "tab and terminal.")
+        if changed:
+            shown = changed[:40]
+            text += (f"\n\nApplied changes to {len(changed)} file(s):\n"
+                     + "\n".join(f"- {name}" for name in shown))
+            if len(changed) > len(shown):
+                text += f"\n- ... and {len(changed) - len(shown)} more"
+        elif apply and code == 0:
+            text += "\n\nNo files were changed."
         STATE.add_message(
-            "assistant", f"Auto finished: {done}/{total} task(s) done."
-            if code == 0 else f"Auto stopped: {done}/{total} task(s) done; "
-            "see the Plan tab and terminal.", kind="result",
-            level="ok" if code == 0 else "warn", stats=_usage_stats(client))
+            "assistant", text, kind="result",
+            level="ok" if code == 0 else "warn", auto=True,
+            files=changed, changed=changed, git=git_status,
+            stats=_usage_stats(client))
 
 
 def _int_or_none(value) -> int | None:
@@ -566,7 +728,7 @@ def run_new(job: Job, opts: dict) -> None:
         raise ConfigError("Describe the project (or attach a spec file).")
     target = Path(project).expanduser().resolve()
     _echo_user("new", opts.get("text", "") or spec_text,
-               opts.get("attachments"))
+               opts.get("attachments"), opts)
     mode = opts.get("build", "preview")       # preview | plan | build | review
     parent = target
     while not parent.exists() and parent != parent.parent:
