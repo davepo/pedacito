@@ -24,14 +24,25 @@ search/replace blocks instead (see edits.py).
 
 The system message and repo map come first and stay constant within a gather
 loop, so the server's prefix cache hits on every turn.
+
+Sprint 2 adds a content-addressed evidence store: every source span the
+harness displays (`read`, prefetch, `context` -- post token-clip) is hashed
+and recorded on the Agent as an `EvidenceSpan`. Two rehydration paths hand a
+span back to the model without ever rewriting history: the explicit
+`NEED path:120-168` directive (answer, repair and verifier replies) and the
+implicit repair auto-rehydration for unread-region / fuzzy-match findings
+that touch recorded evidence. Both APPEND at the conversation tail, so the
+prompt-prefix cache survives the round (TECHNIQUES.md, section 11).
 """
 
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import json
 import re
 import sys
+from dataclasses import dataclass, field
 
 from . import diagnostics as diagnostics_mod
 from . import events as events_mod
@@ -86,6 +97,30 @@ _MAX_PAYLOAD_CUTS = 2
 # a calibrated `client.chars_per_token` measures instead.
 _READ_CHARS_PER_TOKEN = 3.5
 
+# --- Sprint 2: content-addressed evidence + append-only exact-span rehydration
+# `NEED path:120-168` re-asks allowed per generation (Guiding Constraint #3:
+# a bounded loop). cfg.max_rehydration_rounds overrides.
+_MAX_REHYDRATION_ROUNDS = 2
+# Lines of slack when a repair finding is matched to a recorded evidence span
+# (Guiding Constraint #1: hand back only what is relevant, not the file).
+_EVIDENCE_WINDOW = 30
+# `read_step` value recorded for spans the harness re-fetched (during NEED
+# rehydration or repair auto-rehydration) rather than a gather step showed.
+_READ_STEP_REFETCH = -1
+# `NEED` lines honoured per round; keeps one reply's tail small (#1).
+_MAX_NEEDS_PER_ROUND = 4
+# Hard char ceiling on one appended rehydration body.
+_MAX_REHYDRATED_CHARS = 8000
+# The standing offer the answer, repair and verifier instructions make: ask
+# for exact lines instead of guessing them. Lives at the TAIL of a turn the
+# harness builds fresh, so it never rewrites cached history bytes.
+_NEED_HINT = (
+    "\n\nIf a specific line range you need is missing from the source above, "
+    "do NOT guess its contents: put `NEED path/to/file.py:START-END` on its "
+    "own line (the exact range only, at most two such lines). The harness "
+    "will fetch those exact lines and ask you again. If you have everything "
+    "you need, answer now and write no NEED line.")
+
 
 # The block rides in user0, which every lookup call re-sends (the server's
 # cache makes it cheap, but `prompt_tokens` still counts it on each call), so
@@ -126,6 +161,137 @@ def fewshot_block(shots: list[dict], schema: dict) -> str:
     if not lines:
         return ""
     return FEWSHOT_HEADER + "\n" + "\n".join(lines)
+
+
+@dataclass(frozen=True)
+class EvidenceSpan:
+    """One piece of exact source the harness actually showed the model.
+
+    `start`/`end` are 1-based inclusive lines as delivered (post token-clip),
+    `content_sha` is the SHA-256 of `exact_text`, and `read_step` is the
+    gather step that displayed it: 0 for a harness prefetch, a positive step
+    number during the lookup loop, or `_READ_STEP_REFETCH` (-1) when the
+    harness re-read the range for a NEED rehydration or a repair hint. The
+    hash is what makes the span *addressable*: a `NEED` line or a repair
+    re-fetch can prove the text now on disk is still the text the model read."""
+
+    file: str
+    start: int
+    end: int
+    content_sha: str
+    exact_text: str
+    read_step: int
+
+
+def sha256_text(text: str) -> str:
+    """Content hash of one evidence span's exact text."""
+    return hashlib.sha256((text or "").encode("utf-8", "replace")).hexdigest()
+
+
+@dataclass
+class EvidenceStore:
+    """Append-only, content-addressed record of the source spans displayed.
+
+    Lookups are tolerant of the two ways a small model writes a path
+    (`pkg/a.py` and `./pkg/a.py`), matching `_norm_key`. A span records what
+    *was* shown; it is never a promise about what is on disk now, so every
+    rehydration reads afresh and compares hashes instead of serving the
+    stored text back. `record_displayed` is how the gather loop feeds this
+    store from a post-clip observation."""
+
+    spans: list[EvidenceSpan] = field(default_factory=list)
+
+    def record(self, file: str, start: int, end: int, exact_text: str,
+               read_step: int) -> EvidenceSpan:
+        """Append one displayed span; returns what was recorded."""
+        span = EvidenceSpan(fileio.normalise_rel(file), int(start), int(end),
+                            sha256_text(exact_text), exact_text,
+                            int(read_step))
+        self.spans.append(span)
+        return span
+
+    def record_displayed(self, obs: str, read_step: int) -> EvidenceSpan | None:
+        """Record the numbered source lines a delivered `read`/`context`
+        observation actually shows, stripping the `NNN | ` prefixes.
+
+        Called after the token clip, so the range and the hashed text are what
+        the model saw -- not what was requested. Returns None when the text is
+        not a numbered read (an outline, an ERROR line, a compacted
+        duplicate-range note): those display no quotable source."""
+        m = _READ_HEAD_RX.match(obs or "")
+        if not m:
+            return None
+        head_len = obs.index("\n") + 1 if "\n" in obs else len(obs)
+        lines = obs[head_len:].split("\n")
+        # The char-budget tail can cut the final numbered line mid-text; a
+        # half line is not addressable source, so it is not credited.
+        if lines and lines[-1].startswith("[truncated: context budget"):
+            while lines and lines[-1].startswith("["):
+                lines.pop()
+            while lines and not _NUMBERED_LINE_RX.match(lines[-1]):
+                lines.pop()
+            if lines:
+                lines.pop()           # the possibly-cut last line
+        lo = int(m.group(2))
+        shown: list[str] = []
+        n = lo
+        for ln in lines:
+            pm = _NUMBERED_LINE_RX.match(ln)
+            if not pm:
+                # A mid-file read shows a `[context: enclosing signature;
+                # module imports]` preamble before its first numbered line:
+                # navigation, not source -- step over it, stop at real prose.
+                if not shown and ln.startswith("["):
+                    continue
+                break             # notes / trailing text: the display ends
+            if int(pm.group(1)) != n:
+                break
+            rest = ln[pm.end():]      # everything after the `|`
+            shown.append(rest[1:] if rest.startswith(" ") else rest)
+            n += 1
+        if not shown:
+            return None
+        start, end = lo, lo + len(shown) - 1
+        return self.record(m.group(1).strip(), start, end,
+                           "\n".join(shown), read_step)
+
+    def _match(self, want: str) -> list[EvidenceSpan]:
+        key = _norm_key(want)
+        return [s for s in self.spans
+                if _norm_key(s.file) == key
+                or _norm_key(s.file).endswith("/" + key)
+                or key.endswith("/" + _norm_key(s.file))]
+
+    def for_file(self, file: str) -> list[EvidenceSpan]:
+        return self._match(file)
+
+    def covering(self, file: str, start: int, end: int) -> list[EvidenceSpan]:
+        """Spans inside `file` that already show every line of `start`-`end`."""
+        lo, hi = int(start), int(end)
+        return [s for s in self._match(file) if s.start <= lo and hi <= s.end]
+
+    def nearby(self, file: str, start: int, end: int,
+               window: int = _EVIDENCE_WINDOW) -> list[EvidenceSpan]:
+        """Spans in `file` overlapping `start`-`end` or within `window` lines
+        of it: the proximity rule the repair auto-rehydration is gated on."""
+        lo, hi = int(start), int(end)
+        return [s for s in self._match(file)
+                if not (s.end < lo - window or s.start > hi + window)]
+
+    def exact(self, file: str, start: int, end: int) -> EvidenceSpan | None:
+        """The newest span recorded for exactly this range, or None."""
+        hits = [s for s in self._match(file)
+                if (s.start, s.end) == (int(start), int(end))]
+        return hits[-1] if hits else None
+
+    def digest(self) -> str:
+        """One line per recorded span: `rel a-b sha=…`. A cheap durable
+        record of what was displayed, hash-pinned so a later `NEED` or a
+        repair can address exactly the text the model saw -- even after the
+        conversation itself has been folded or evicted."""
+        return "\n".join(
+            f"{s.file} {s.start}-{s.end} sha={s.content_sha[:12]}"
+            for s in self.spans)[:2000]
 
 
 def _step_signature(step: dict) -> tuple:
@@ -727,6 +893,14 @@ class Agent:
         self.events = None
         # Gather conversation kept for answer continuation (see answer()).
         self._messages: list[dict] = []
+        # Content-addressed evidence store and the read ledger (Sprint 2A):
+        # every displayed span is hashed here; the ledger maps normalised
+        # file -> (start, end) spans in display order. Both reset per run.
+        self.evidence = EvidenceStore()
+        self._read_spans: dict[str, list[tuple[int, int]]] = {}
+        # Explicit NEED / implicit repair rehydration rounds used this run
+        # (telemetry; reset in gather).
+        self.rehydration_rounds = 0
         self._lossy = False
         self.fold_count = 0
         self.answer_mode_used = "rebuild"
@@ -922,6 +1096,147 @@ class Agent:
                 head[m.end():] + "\n" + "\n".join(kept) +
                 f"\n[CLIPPED at line {shown_end} due to token budget. Use "
                 f"next_start={shown_end + 1} to continue reading.]")
+
+    # ------------------------------------------- evidence & exact-span rehydration
+    def _record_evidence(self, obs: str, step: int) -> EvidenceSpan | None:
+        """Hash and record the source lines a delivered read/context
+        observation actually shows (post clip), into `self.evidence`.
+        Observations with no numbered source -- outline cards, ERROR lines,
+        duplicate-range notes -- record nothing."""
+        span = self.evidence.record_displayed(obs, step)
+        if span is not None:
+            self._emit("evidence", file=span.file, start=span.start,
+                       end=span.end, sha=span.content_sha[:12],
+                       step=span.read_step)
+        return span
+
+    def _rehydration_rounds_left(self) -> int:
+        """Rounds the explicit NEED rehydration may still run (Guiding
+        Constraint #3): cfg.max_rehydration_rounds, default 2; 0 disables."""
+        return max(0, int(getattr(self.cfg, "max_rehydration_rounds",
+                                  _MAX_REHYDRATION_ROUNDS) or 0))
+
+    def _fetch_exact_span(self, name: str, start: int, end: int) -> str:
+        """Rehydration's single fetch point: lines `start`-`end` read FRESH
+        from disk, rendered exactly like a `read` observation, clipped to the
+        same `cfg.max_read_tokens` budget, hashed into the evidence store and
+        credited to the read ledger. Returns the rendered text (with a
+        hash-compare note when the file moved since a span covered by the
+        same range was recorded), or "" when the file/range is not on disk."""
+        rel = self.index.resolve_file(name) or fileio.normalise_rel(name)
+        path = self.index.root / rel
+        if not rel or not path.is_file():
+            return ""
+        try:
+            lines = fileio.read_lines(path)
+        except OSError:
+            return ""
+        if lines and lines[-1] == "" and len(lines) > 1:
+            lines = lines[:-1]             # same convention as tool_read
+        s = max(1, int(start))
+        e = min(max(int(end), s), len(lines))
+        if not lines or s > len(lines):
+            return ""
+        width = max(1, len(str(e)))
+        body = "\n".join(f"{i:>{width}} | {lines[i - 1]}"
+                         for i in range(s, e + 1))
+        obs = self._clip_read_to_token_budget(f"{rel} lines {s}-{e}:\n{body}")
+        # The span that LAST showed these lines: an exact-range record
+        # compares whole, a wider covering record contributes just the
+        # s-e slice of its stored text (else every repair re-fetch would
+        # "change" against a superset hash that never matched to begin with).
+        covers = self.evidence.covering(rel, s, e)
+        prior = covers[-1] if covers and covers[-1].exact_text else None
+        prior_sha = ""
+        if prior is not None:
+            if (prior.start, prior.end) == (s, e):
+                prior_sha = prior.content_sha
+            else:
+                seg = "\n".join(prior.exact_text.split("\n")
+                                [s - prior.start:e - prior.start + 1])
+                prior_sha = sha256_text(seg)
+        span = self._record_evidence(obs, _READ_STEP_REFETCH)
+        if span is None:
+            span = self.evidence.record(rel, s, e, "", _READ_STEP_REFETCH)
+        key = _norm_key(rel)
+        if not isinstance(getattr(self, "_read_spans", None), dict):
+            self._read_spans = {}
+        self._read_spans.setdefault(key, []).append((span.start, span.end))
+        if prior and prior_sha != span.content_sha:
+            obs += (f"\n[content changed since it was last shown at step "
+                    f"{prior.read_step}: was {prior_sha[:12]}..., "
+                    f"now {span.content_sha[:12]}...]")
+        elif prior:
+            obs += f"\n[unchanged since step {prior.read_step}]"
+        return obs
+
+    def _chat_needs(self, chat, msgs: list[dict]) -> str:
+        """Generate with the explicit `NEED path/to/file.py:120-168`
+        directive honoured (Sprint 2B, explicit): one `chat(msgs)` pass, and
+        while the reply's prose carries NEED lines and rehydration rounds
+        remain, fetch ONLY those exact spans and APPEND them as a fresh
+        assistant+user turn pair at the tail -- history is never rewritten,
+        so the server's prefix cache still covers every earlier byte -- then
+        re-ask. Bounded by cfg.max_rehydration_rounds (default 2, 0 = off).
+        `chat` raises LLMError on failure; callers keep their own handling."""
+        from . import verify as verify_mod
+        reply = chat(msgs)
+        rounds = self._rehydration_rounds_left()
+        while rounds:
+            wants = verify_mod.find_needs(reply or "")
+            if not wants:
+                break
+            rounds -= 1
+            fetched = []
+            for name, a, b in wants[:_MAX_NEEDS_PER_ROUND]:
+                obs = self._fetch_exact_span(name, a, b)
+                if obs:
+                    fetched.append(obs)
+            self.rehydration_rounds += 1
+            self._emit("rehydrate", mode="needs", asked=len(wants),
+                       fetched=len(fetched), round=self.rehydration_rounds)
+            msgs.append({"role": "assistant", "content": reply})
+            if fetched:
+                msgs.append({"role": "user", "content":
+                    "EXACT SOURCE FETCHED FOR YOUR `NEED` LINES (re-read from "
+                    "disk just now, numbered like a `read`; copy SEARCH text "
+                    "from it byte for byte, ignoring the line-number "
+                    "prefixes). Continue the task now. Do not output a NEED "
+                    "line for a span shown here.\n\n"
+                    + "\n\n".join(fetched)})
+            else:
+                msgs.append({"role": "user", "content":
+                    "None of those `NEED` ranges could be fetched (the file "
+                    "or the lines are not on disk). Answer from the source "
+                    "you have already seen and say what you could not "
+                    "verify."})
+            reply = chat(msgs)
+        return reply
+
+    def _auto_rehydrate(self, findings) -> str:
+        """Implicit repair auto-rehydration (Sprint 2B): for unread-region
+        and fuzzy-match findings that touch recorded evidence, re-fetch the
+        flagged spans fresh from disk and return a block to append at the
+        TAIL of the repair prompt. The read ledger is credited, so a
+        corrected reply quoting the rehydrated text no longer reads as a
+        guess. "" when no finding touches evidence."""
+        from . import verify as verify_mod
+        targets = verify_mod.evidence_rehydrations(self, findings)
+        chunks = []
+        for rel, a, b in targets:
+            obs = self._fetch_exact_span(rel, a, b)
+            if obs:
+                chunks.append(obs)
+        if not chunks:
+            return ""
+        self.rehydration_rounds += 1
+        self._emit("rehydrate", mode="auto", spans=len(chunks),
+                   round=self.rehydration_rounds)
+        return ("\n\nFRESH SOURCE FOR THE FLAGGED REGIONS (re-read from disk "
+                "after the check flagged them; numbered like a `read` -- "
+                "copy SEARCH text from here, byte for byte, ignoring the "
+                "line-number prefixes):\n\n"
+                + "\n\n".join(chunks))[:_MAX_REHYDRATED_CHARS]
 
     def _ask_user(self, text: str, asked: int) -> str:
         """The `question` action: relay one question to the user (bounded per
@@ -1130,6 +1445,10 @@ class Agent:
         self.fold_count = 0
         self._gather_task = task
         self._rules_shown: set[str] = set()
+        # Fresh evidence store and rehydration counters for this run, like
+        # the ledger and backup dir below.
+        self.evidence = EvidenceStore()
+        self.rehydration_rounds = 0
         gathered: list[str] = []
         self.steps_log: list[str] = []
         self.live_evidence_ok = False
@@ -1682,6 +2001,12 @@ class Agent:
             if not duplicate_read:
                 gathered.append(item)
 
+            if action in ("read", "context") and not duplicate_read:
+                # Content-address what the model was ACTUALLY shown: the obs
+                # here has survived the token clip, the char-budget cut and
+                # any scoped-rule note, so the span records the delivered
+                # lines, not the requested ones.
+                self._record_evidence(obs, step)
             self._emit("step", n=step, action=action, detail=str(detail)[:120],
                        obs_chars=len(obs), duplicate=duplicate_read)
             messages.append({"role": "assistant", "content": _compact(stepjson)})
@@ -1860,6 +2185,7 @@ class Agent:
         if m:
             spans.setdefault(_norm_key(m.group(1)), []).append(
                 (int(m.group(2)), int(m.group(3))))
+        self._record_evidence(obs, 0)      # prefetch displays = step 0
         gathered.append(f"--- read {rel}\n{obs}")
         self.steps_log.append(f"post read {rel} L{start}-{end}  (prefetch)")
         messages.append({"role": "assistant", "content": _compact(stepjson)})
@@ -1944,6 +2270,7 @@ class Agent:
                 delta = _delta_len(obs, [])
             else:
                 delta = len(obs)
+            self._record_evidence(obs, 0)  # prefetch displays = step 0
             budget -= delta
             gathered.append(f"--- read {rel}\n{obs}")
             self.steps_log.append(f"0. read {rel} L{start}-{end}  (prefetch)")
@@ -2034,7 +2361,8 @@ class Agent:
                       file=sys.stderr)
                 for f in errors[:4]:
                     print("  " + f.render(), file=sys.stderr)
-            fixed = self._repair_from_findings(task, reply, errors, results)
+            fixed = self._repair_from_findings(task, reply, errors, results,
+                                               findings=findings)
             if not fixed:
                 break
             reply = fixed
@@ -2045,10 +2373,12 @@ class Agent:
         return reply, findings
 
     def _repair_from_findings(self, task: str, reply: str, errors,
-                              results) -> str:
+                              results, findings=None) -> str:
         """One re-ask that shows the model its own edits plus the check's
         findings; '' when it produced no usable blocks -- said out loud, so
-        a give-up mid-repair never reads as a clean run."""
+        a give-up mid-repair never reads as a clean run. `findings` (all
+        severities) additionally enables the implicit rehydration for fuzzy
+        WARNINGS; `errors` alone still drives the repair."""
         from . import verify as verify_mod
 
         class _F:
@@ -2071,25 +2401,34 @@ class Agent:
             rules = prompts_mod.test_rules(self.cfg)
             if rules not in system:
                 system += "\n\n" + rules
+        # Implicit rehydration (Sprint 2B): flagged regions the model WAS
+        # shown get their fresh exact bytes appended at the TAIL of this
+        # repair prompt, and the read ledger is credited -- the corrected
+        # quote can then land without re-flagging as an unread edit.
+        rehyd = self._auto_rehydrate(findings if findings is not None
+                                     else errors)
+        msgs = [{"role": "system", "content": system},
+                {"role": "user", "content":
+                    (f"SOURCE (current contents of the files involved)\n\n{src}\n\n"
+                     if src else "")
+                    + f"TASK\n{task}\n\n"
+                    + f"YOUR PROPOSED EDIT BLOCKS:\n{blocks}\n\n"
+                    + "An automatic check of these edits found problems:\n"
+                    + verify_mod.render(errors) + "\n\n"
+                    + "Output the COMPLETE corrected set of search/replace blocks "
+                    "for the whole task (not only the changed ones). Fix each "
+                    "problem, or -- if a problem means you are editing code you "
+                    "never read -- drop that edit and say what you could not "
+                    "verify. Copy SEARCH text exactly from the SOURCE above. "
+                    "Blocks only after a one-line explanation."
+                    + (_NEED_HINT if self._rehydration_rounds_left() else "")
+                    + rehyd}]
         try:
-            new = self._chat_at(
-                "temperature_repair",
-                [{"role": "system", "content": system},
-                 {"role": "user", "content":
-                  (f"SOURCE (current contents of the files involved)\n\n{src}\n\n"
-                   if src else "")
-                  + f"TASK\n{task}\n\n"
-                  f"YOUR PROPOSED EDIT BLOCKS:\n{blocks}\n\n"
-                  "An automatic check of these edits found problems:\n"
-                  + verify_mod.render(errors) + "\n\n"
-                  "Output the COMPLETE corrected set of search/replace blocks "
-                  "for the whole task (not only the changed ones). Fix each "
-                  "problem, or -- if a problem means you are editing code you "
-                  "never read -- drop that edit and say what you could not "
-                  "verify. Copy SEARCH text exactly from the SOURCE above. "
-                  "Blocks only after a one-line explanation."}],
-                client=client, max_tokens=self.cfg.max_tokens_answer,
-                stream=False)
+            new = self._chat_needs(
+                lambda m: self._chat_at("temperature_repair", m, client=client,
+                                        max_tokens=self.cfg.max_tokens_answer,
+                                        stream=False),
+                msgs)
         except LLMError as e:
             print("  [repair: re-ask failed (%s); failing checks remain]"
                   % type(e).__name__, file=sys.stderr)
@@ -2111,11 +2450,15 @@ class Agent:
             reply, [type("F", (), {"file": e.file})() for e in parse_edits(reply)])
         client = self._role_client("verifier")
         try:
-            text = client.chat(
+            # The verifier may also ask: a `NEED file:120-168` line gets that
+            # exact span appended at the tail and one bounded re-ask, so its
+            # verdict judges real source instead of a trimmed summary.
+            text = self._chat_needs(
+                lambda m: client.chat(m, max_tokens=350, stream=False),
                 [{"role": "system", "content": verify_mod.VERIFIER_SYSTEM},
                  {"role": "user", "content":
-                  f"TASK\n{task}\n\nSOURCE\n{src}\n\nPROPOSED EDITS\n{blocks}"}],
-                max_tokens=350, stream=False)
+                  f"TASK\n{task}\n\nSOURCE\n{src}\n\nPROPOSED EDITS\n{blocks}"
+                  + (_NEED_HINT if self._rehydration_rounds_left() else "")}])
         except LLMError:
             return []
         return verify_mod.parse_verdict(text, self.index.resolve_file,
@@ -2237,16 +2580,22 @@ class Agent:
                  "below using only the source you read above.\n\n"
                  f"TASK\n{task}\n\n"
                  + (digest + "\n\n" if digest else "")
-                 + "ANSWER INSTRUCTIONS\n" + brief)
+                 + "ANSWER INSTRUCTIONS\n" + brief
+                 + (_NEED_HINT if self._rehydration_rounds_left() else ""))
         msgs.append({"role": "user", "content": final})
         est = getattr(self.client, "estimate_tokens", None) or estimate_tokens
         print(f"[answer continues the lookup conversation, "
               f"~{estimate_messages(msgs, est)} tokens, prefix cached]",
               file=sys.stderr)
         try:
-            return self.client.chat(
-                msgs, max_tokens=max_tokens or self.cfg.max_tokens_answer,
-                stream=stream)
+            # `NEED path:120-168` rehydration (2B): fetched spans append at
+            # this conversation's TAIL, so the cached gather prefix is never
+            # rewritten and the extra round costs a cache hit, not a miss.
+            return self._chat_needs(
+                lambda m: self.client.chat(
+                    m, max_tokens=max_tokens or self.cfg.max_tokens_answer,
+                    stream=stream),
+                msgs)
         except LLMError as e:
             print(f"  [continued answer failed ({str(e)[:100]}); rebuilding]",
                   file=sys.stderr)
@@ -2275,11 +2624,12 @@ class Agent:
             if mcp_notes:
                 notes_prefix += mcp_notes + "\n\n"
         src = gathered or "(nothing was looked up)"
+        need_hint = _NEED_HINT if self._rehydration_rounds_left() else ""
 
         def assemble(notes: str, rmap: str, source: str) -> str:
             return (notes + f"PROJECT MAP\n\n{rmap}\n\n"
                     f"SOURCE YOU REQUESTED\n\n{source}\n\n"
-                    f"TASK\n{task}")
+                    f"TASK\n{task}" + need_hint)
 
         est = getattr(self.client, "estimate_tokens", None) or estimate_tokens
         reply_room = min(max_tokens or self.cfg.max_tokens_answer,
@@ -2345,12 +2695,12 @@ class Agent:
                   + "; ".join(notices) + "]", file=sys.stderr)
             self._emit("degrade", notices=notices)
         print(f"[answer context ~{est(user)} tokens]", file=sys.stderr)
-        return self.client.chat(
+        return self._chat_needs(
+            lambda m: self.client.chat(
+                m, max_tokens=max_tokens or self.cfg.max_tokens_answer,
+                stream=stream),
             [{"role": "system", "content": brief},
-             {"role": "user", "content": user}],
-            max_tokens=max_tokens or self.cfg.max_tokens_answer,
-            stream=stream,
-        )
+             {"role": "user", "content": user}])
 
     # ------------------------------------------------------------------- edits
     def apply(self, reply: str, dry_run: bool, repair_rounds: int | None = None,

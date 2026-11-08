@@ -85,7 +85,9 @@ of zero-call checks catches the specific ways small models go wrong:
 
 - **Unread edits.** A SEARCH block that quotes lines the model never `read` is
   flagged: it is guessing, not editing. The read ledger tracks exactly which
-  line spans were shown.
+  line spans were shown. When the flagged region touches what the evidence
+  store recorded (§11), the repair re-ask gets those exact lines re-read from
+  disk appended at its tail.
 - **Ledger-accurate token-budgeted reads.** Every `read`/`context` observation
   is clipped to `max_read_tokens` (default 1200) *before* the source is shown
   and before the span ledger sees it. The clip uses the server's calibrated
@@ -178,6 +180,49 @@ and recommend which profile to use for each role. This matters for small models
 because the highest-leverage trick is often *routing* the hard job — the
 `verifier` or `planner` — to a larger local or hosted model, while the cheap
 work stays on the small worker.
+
+### 11. Content-addressed evidence and append-only rehydration
+
+Two moves that share one mechanism: the harness remembers the *exact bytes* it
+showed the model — hashed — and the only way source reaches the model after
+gather is by **appending** at the conversation tail.
+
+- **Evidence store.** Every `read`, `context` and prefetch observation is
+  parsed *after* the token clip: the displayed lines, stripped of their
+  `NNN | ` prefixes, are SHA-256'd and recorded as
+  `EvidenceSpan(file, start, end, content_sha, exact_text, read_step)`. The
+  span is content-addressed — its hash pins exactly what the model saw — so
+  the harness can later prove whether the file moved, instead of trusting the
+  model's (or its own) memory of it. Clipped-away lines are never hashed or
+  credited: the ledger and the store record the same delivered range.
+- **Explicit rehydration (`NEED` directive).** The answer, repair and
+  verifier phases have no tools, but the model may emit one line:
+  `NEED shop/pricing.py:120-168`. The harness fetches *only* those lines from
+  disk under the same `max_read_tokens` budget as a normal read, compares
+  them against the recorded hash (`[unchanged since step N]`, or a
+  `[content changed …]` note with both hashes when the file moved since),
+  credits the read ledger, and APPENDS the exact span as a fresh turn pair at
+  the tail before re-asking. Bounded by `max_rehydration_rounds` (default 2;
+  0 disables the directive), a few spans per round.
+- **Implicit rehydration.** When the deterministic checks flag an
+  unread-region edit or a fuzzy-matched anchor, and the flagged span is
+  covered by — or sits within ±30 lines of — text the store recorded as
+  *displayed*, the repair prompt automatically gets that region's fresh exact
+  bytes appended at its tail before the model is asked to fix the patch. The
+  ledger credit means a corrected quote stops reading as a guess on the next
+  check. Where no recorded evidence is anywhere near, nothing rehydrates: a
+  model that never read a file should have `read` it during gather, not be
+  handed unseen code to copy from.
+
+Why it helps: this is Guiding Constraint #2 applied to the phases after
+gather. A reply that needs one more span gets it — instead of hallucinating a
+quote — and it arrives after the last cached byte, so every earlier byte of
+the conversation still rides the server's prompt-prefix cache: the re-ask
+costs a cache hit, not a fresh prefill. It also makes the free checks
+(Constraint #4) self-repairing: an unread-edit finding near real evidence now
+comes with its ground truth instead of only a complaint. Token economy (#1)
+holds because the rehydrated payload is triple-bounded — spans not files,
+the read token budget, and round and span caps.
 
 ---
 

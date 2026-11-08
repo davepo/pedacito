@@ -202,6 +202,13 @@ class Config:
     # Limit on continuation turns when a reply is cut off mid-block; 0 = no
     # limit (the continuation char budget is the real bound).
     max_continuation_rounds: int = 0
+    # Rounds of `NEED path/to/file.py:120-168` exact-span rehydration allowed
+    # per answer, repair or verifier generation: the harness fetches ONLY
+    # those spans (hash-checked, token-clipped like a `read`), APPENDS them
+    # at the conversation tail so the prompt-prefix cache survives, and
+    # re-asks. 0 disables the directive (repair auto-rehydration still
+    # records evidence but is bounded by its own rounds counter).
+    max_rehydration_rounds: int = 2
     # Ceiling on one NON-read observation (grep, run, mcp, ...), in tokens;
     # 0 = auto (a quarter of the usable window, 300-2200).
     max_observation_tokens: int = 0
@@ -2018,6 +2025,8 @@ max_todo_chars = 1500
 max_steps = 0
 max_completion_rounds = 0
 max_continuation_rounds = 0
+# `NEED file.py:120-168` exact-span rehydration rounds per generation.
+max_rehydration_rounds = 2
 max_gathered_chars = 24000
 max_read_lines = 200
 read_context_hint = true

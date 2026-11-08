@@ -23,10 +23,19 @@ edit blocks, before anything is written:
 Errors feed one bounded repair round; warnings are shown and logged. A model
 verifier (`verify_answer = "full"`) is one extra call, used only when the
 deterministic pass found nothing to fix.
+
+Sprint 2 adds the two hooks the harness uses to hand source back WITHOUT ever
+rewriting history (TECHNIQUES.md section 11): `find_needs` parses the
+explicit `NEED path/to/file.py:120-168` directive from an answer, repair or
+verifier reply, and `evidence_rehydrations` selects the unread / fuzzy
+findings whose flagged region was recorded in the agent's EvidenceStore (or
+sits within ±30 lines of a recorded span) so the repair prompt can append
+those exact lines from disk at its tail.
 """
 
 from __future__ import annotations
 
+import difflib
 import re
 from dataclasses import dataclass
 
@@ -41,6 +50,10 @@ class Finding:
     file: str
     message: str
     line: int = 0
+    # The 1-based inclusive (start, end) region the finding flags, when the
+    # check knows one (unread regions, fuzzy-anchored blocks). Sprint 2B's
+    # repair auto-rehydration re-fetches exactly these lines.
+    lines: tuple = ()
 
     def render(self) -> str:
         loc = f"{self.file}:{self.line}" if self.line else self.file
@@ -146,7 +159,8 @@ def check_unread(agent, edits, results) -> list[Finding]:
             out.append(Finding(
                 "unread", "warn" if overlap else "error", rel,
                 f"lines {a}-{b} were not (fully) among the lines read "
-                f"({_fmt(_merge(read))}); the edit may be a guess", line=a))
+                f"({_fmt(_merge(read))}); the edit may be a guess",
+                line=a, lines=(a, b)))
     return out
 
 
@@ -427,14 +441,136 @@ def check_coverage(task: str, reply: str, edits) -> list[Finding]:
     return out[:3]
 
 
+def _fuzzy_regions(before: str, after: str) -> list[tuple[int, int]]:
+    """1-based inclusive line ranges of `before` that `after` changes: where
+    the approximately-anchored blocks landed, computed free with difflib so a
+    fuzzy finding carries the region rehydration should re-fetch."""
+    if not before or not after or before == after:
+        return []
+    sm = difflib.SequenceMatcher(
+        None, before.splitlines(), after.splitlines(), autojunk=False)
+    out: list[tuple[int, int]] = []
+    for tag, i1, i2, _j1, _j2 in sm.get_opcodes():
+        if tag == "equal":
+            continue
+        a = i1 + 1
+        out.append((a, max(i2, a)))
+        if len(out) >= 4:
+            break
+    return out
+
+
 def check_fuzzy(results) -> list[Finding]:
     """A block anchored approximately (fuzzy_match) is a warning, not an
     error: it landed somewhere the SEARCH text did not exactly match, so the
-    diff needs a human's eye before it is trusted."""
-    return [Finding("fuzzy", "warn", r.file,
-                    "one or more blocks matched approximately (not exactly); "
-                    "review the diff carefully")
-            for r in (results or []) if getattr(r, "fuzzy", False)]
+    diff needs a human's eye before it is trusted. The finding carries the
+    region it anchored on (Sprint 2B: near recorded evidence, the repair
+    re-fetches exactly those lines)."""
+    out: list[Finding] = []
+    for r in (results or []):
+        if not getattr(r, "fuzzy", False):
+            continue
+        a = b = 0
+        try:
+            regions = _fuzzy_regions(getattr(r, "before", ""),
+                                     getattr(r, "after", ""))
+            if regions:
+                a, b = regions[0]
+        except Exception:
+            a = b = 0
+        out.append(Finding(
+            "fuzzy", "warn", r.file,
+            "one or more blocks matched approximately (not exactly); "
+            "review the diff carefully", line=a,
+            lines=(a, b) if a else ()))
+    return out
+
+
+# --------------------------------------------- Sprint 2: exact-span rehydration
+# `NEED shop/pricing.py:120-168` -- the model asks the harness for exactly
+# the lines it needs, and the harness APPENDS them at the conversation tail
+# so the prompt-prefix cache survives the round (TECHNIQUES.md #2). A plain
+# `file:line` citation is not a request: the path needs an extension and a
+# `:` or space before the line numbers.
+_NEED_RE = re.compile(
+    r"(?im)^[ \t]*(?:[-*]|\d+[.)])?[ \t]*NEED[ \t]+[`'\"]?[ \t]*"
+    r"([\w./\\-]+\.[A-Za-z][A-Za-z0-9]{0,7})"
+    r"(?:[ \t]*:[ \t]*|[ \t]+)"
+    r"(\d+)(?:[ \t]*(?:-|\u2013|[ \t]to)[ \t]*(\d+))?[ \t]*[`'\"]?[ \t]*$")
+
+
+def find_needs(reply: str) -> list[tuple[str, int, int]]:
+    """`(file, start, end)` for each `NEED path:120-168` directive line in a
+    reply (deduplicated, order preserved, capped). A single line number asks
+    for one line; a reversed range is swapped. Anything without an extension
+    and a number is prose about needing something, not a directive."""
+    out: list[tuple[str, int, int]] = []
+    seen: set[tuple[str, int, int]] = set()
+    for m in _NEED_RE.finditer(reply or ""):
+        name = m.group(1).strip()
+        a = int(m.group(2))
+        b = int(m.group(3)) if m.group(3) else a
+        if a > b:
+            a, b = b, a
+        key = (name, a, b)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(key)
+        if len(out) >= 8:
+            break
+    return out
+
+
+_MAX_REHYDRATE_SPANS = 4
+
+
+def _finding_region(f) -> tuple[int, int]:
+    """The line region a finding flags: its `lines` pair, else its single
+    `line`, else (0, 0) when the check knows no position."""
+    if len(getattr(f, "lines", ()) or ()) == 2:
+        return int(f.lines[0]), int(f.lines[1])
+    if getattr(f, "line", 0):
+        a = int(f.line)
+        return a, a
+    return 0, 0
+
+
+def evidence_rehydrations(agent, findings) -> list[tuple[str, int, int]]:
+    """`(rel, start, end)` spans the repair prompt should re-fetch from disk.
+
+    Only `unread` and `fuzzy` findings qualify, and only when the flagged
+    region is covered by, or within the evidence window (±30 lines) of, a
+    span the EvidenceStore recorded as DISPLAYED to the model: the model
+    misquoted source it saw, so handing back its fresh exact bytes fixes the
+    patch for free. An unread region far from any recorded span is source it
+    never saw at all -- rehydrating there would dump an unseen file on the
+    model (against token economy #1) instead of grounding a correction."""
+    store = getattr(agent, "evidence", None)
+    if store is None or not findings:
+        return []
+    out: list[tuple[str, int, int]] = []
+    seen: set[tuple[str, int, int]] = set()
+    for f in findings:
+        if getattr(f, "kind", "") not in ("unread", "fuzzy") or not f.file:
+            continue
+        a, b = _finding_region(f)
+        if a <= 0:
+            continue
+        try:
+            rel = agent.index.resolve_file(f.file) or fileio.normalise_rel(f.file)
+        except Exception:
+            rel = fileio.normalise_rel(f.file)
+        if not rel or not store.nearby(rel, a, b):
+            continue
+        key = (rel, a, b)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(key)
+        if len(out) >= _MAX_REHYDRATE_SPANS:
+            break
+    return out
 
 
 # --------------------------------------------------------------- entry points
@@ -492,7 +628,11 @@ about code that is not in the SOURCE.
 
 Reply with either the single word PASS, or one line per concrete defect in
 exactly this form (at most 5 lines, no preamble):
-DEFECT: <file>:<line> -- <what is wrong and what it should be>"""
+DEFECT: <file>:<line> -- <what is wrong and what it should be>
+
+If the SOURCE is missing a region you must inspect to judge it, you may put
+`NEED <file>:<start>-<end>` lines (at most two) before your verdict: the
+harness fetches those exact lines and asks you again."""
 
 _DEFECT_RE = re.compile(r"(?im)^\s*DEFECT\s*:\s*(?P<where>[^\s]+)\s*(?:--|-|:)\s*(?P<what>.+)$")
 
