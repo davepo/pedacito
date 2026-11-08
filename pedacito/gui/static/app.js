@@ -73,7 +73,7 @@ PDC.modal = (title, body, buttons, opts) => {
       onclick: () => { const keep = b.onclick && b.onclick(close); if (keep !== false && !b.stay) close(); }
     }));
   });
-  const box = h('div', { class: 'modal' + (opts.narrow ? ' narrow' : '') },
+  const box = h('div', { class: 'modal' + (opts.narrow ? ' narrow' : '') + (opts.wide ? ' wide' : '') },
     h('div', { class: 'modal-head' }, h('h3', { text: title }),
       h('button', { class: 'ghost', text: '\u2715', onclick: close })),
     h('div', { class: 'modal-body' }, body),
@@ -199,10 +199,15 @@ const S = {
   msgs: [], msgTick: 0,                   // msgTick bumps on any message change
   plan: { path: '', exists: false, text: '', tasks: [] },
   review: null, diff: null, diffRel: '', sel: {}, editing: false,
+  editAfterLoad: false,
+  ws: { tab: localStorage.getItem('pedacito_ws_tab') || 'files', files: [],
+        indexed: [], indexedSet: null, sig: '', filter: '', truncated: false,
+        loading: false, backups: [], backupsAt: 0 },
   mode: localStorage.getItem('pedacito_mode') || 'task',
   drafts: {}, attachments: [],
   opts: (() => { try { return JSON.parse(localStorage.getItem('pedacito_opts') || '{}'); } catch (e) { return {}; } })(),
-  ui: { diffOpen: false, termCollapsed: false, termFollow: true, optsOpen: false,
+  ui: { diffOpen: false, wsCollapsed: false, termFollow: true, optsOpen: false,
+        diffMode: localStorage.getItem('pedacito_diff_mode') || 'split',
         view: 'chat', folds: {}, planEditing: false, pendingProfile: '' },
   peek: null,
 };
@@ -341,7 +346,7 @@ function opt(mode, k) {
 function saveOpts() { try { localStorage.setItem('pedacito_opts', JSON.stringify(S.opts)); } catch (e) {} }
 
 // --------------------------------------------------------------- actions ------
-let lastErr = '', lastReviewKey = '', lastJobId = 0;
+let lastErr = '', lastReviewKey = '', lastJobId = 0, lastFilesSig = '';
 let inputEl = null;                       // the composer textarea (uncontrolled)
 
 function refreshState() {
@@ -359,8 +364,12 @@ function applyStatus(s) {
   if (rkey !== lastReviewKey) { lastReviewKey = rkey; loadReview(); }
   const j = s.job;
   if (j && j.id !== lastJobId) loadPlan();
-  if (!j && lastJobId) { collapseDone(); loadPlan(); loadReview(); }
+  if (!j && lastJobId) { collapseDone(); loadPlan(); loadReview(); loadFiles(); loadBackups(); }
   lastJobId = j ? j.id : 0;
+  if ((s.files_sig || '') !== lastFilesSig) {   // index or workspace changed
+    lastFilesSig = s.files_sig || '';
+    if (S.ws.tab === 'files' && s.root) loadFiles();
+  }
   if (S.ui.pendingProfile && s.profile === S.ui.pendingProfile) S.ui.pendingProfile = '';
   if (s.needs_setup && !sessionStorage.getItem('pedacito_setup_shown')) {
     sessionStorage.setItem('pedacito_setup_shown', '1');
@@ -450,10 +459,12 @@ function loadSnapshot() {
     S.status = snap.status || {};
     lastJobId = S.status.job ? S.status.job.id : 0;
     lastReviewKey = S.status.review ? S.status.review.id + ':' + S.status.review.outcome : '';
+    lastFilesSig = S.status.files_sig || '';
     if (term) term.reset(snap.term || '');
     connect(snap.seq || 0);
     loadReview();
     loadPlan();
+    if (S.status.root && S.ws.tab === 'files') loadFiles(true);
     emit();
   });
 }
@@ -580,18 +591,24 @@ function attachFiles(files) {
 function loadReview() {
   return PDC.api('/api/review').then((j) => {
     const meta = j.review || null;
-    const changed = meta ? (!S.review || meta.id !== S.review.id || meta.outcome !== S.review.outcome)
+    const isNew = !!meta && (!S.review || meta.id !== S.review.id);
+    const changed = meta ? (isNew || meta.outcome !== S.review.outcome)
                          : !!S.review;
     S.review = meta;
     if (!meta) { S.diff = null; S.editing = false; emit(); return; }
     if (!changed) { emit(); return; }
     S.editing = false;
+    S.editAfterLoad = false;
     S.sel = {};
     meta.files.forEach((f) => { S.sel[f.rel] = true; });
     S.ui.folds = {};
     const fresh = !meta.files.some((f) => f.rel === S.diffRel);
     if (fresh) S.diffRel = ((meta.files.filter((f) => !f.source)[0] || meta.files[0] || {}).rel) || '';
-    if (meta.pending && fresh) S.ui.diffOpen = true;   // stage it, expand it
+    if (meta.pending && (isNew || fresh)) {
+      S.ui.diffOpen = true;               // stage it, expand it: chat beside it
+      if (isNew) PDC.toast('Staged review \u2014 '
+        + meta.files.filter((f) => !f.source).length + ' file(s) awaiting your decision.');
+    }
     if (S.diffRel) loadDiffFile(S.diffRel); else { S.diff = null; emit(); }
   });
 }
@@ -601,12 +618,16 @@ function loadDiffFile(rel) {
   emit();
   PDC.api('/api/review/file?id=' + S.review.id + '&rel=' + encodeURIComponent(rel)).then((d) => {
     S.diff = d._status === 200 ? d : null;
+    if (S.editAfterLoad) {                // the \u270E on a file-strip row
+      S.editAfterLoad = false;
+      S.editing = !!S.diff;
+    }
     emit();
   });
 }
 function decide(action) {
   if (!S.review) return;
-  if (S.editing) { PDC.toast('Click "\u2714 Show diff" to keep your edit first.', true); return; }
+  if (S.editing) { PDC.toast('Click "\u2716 Show diff" to keep your edit first.', true); return; }
   const files = S.review.partial_ok
     ? S.review.files.filter((f) => !f.source && S.sel[f.rel] !== false).map((f) => f.rel)
     : null;
@@ -629,6 +650,92 @@ function toggleEdit() {
     } else PDC.toast(d.detail || 'could not update', true);
     emit();
   });
+}
+
+// ---- workspace panel (files / backups / logs) ----
+function loadFiles(force) {
+  if (!S.status.root) { S.ws.files = []; S.ws.indexed = []; return Promise.resolve(); }
+  if (!force && S.ws.sig === (S.status.files_sig || '')) { emit(); return Promise.resolve(); }
+  S.ws.loading = true; emit();
+  return PDC.api('/api/files').then((j) => {
+    S.ws.loading = false;
+    if (j._status !== 200 || !Array.isArray(j.files)) { emit(); return; }
+    S.ws.files = j.files;
+    S.ws.indexed = j.indexed || [];
+    S.ws.indexedSet = new Set(S.ws.indexed);
+    S.ws.sig = j.sig || '';
+    S.ws.truncated = !!j.truncated;
+    emit();
+  }, () => { S.ws.loading = false; emit(); });
+}
+function loadBackups(force) {
+  if (!S.status.root) { S.ws.backups = []; emit(); return Promise.resolve(); }
+  if (!force && S.ws.backups.length && Date.now() - S.ws.backupsAt < 4000) return Promise.resolve();
+  return PDC.api('/api/backups').then((j) => {
+    if (j._status === 200) { S.ws.backups = j.backups || []; S.ws.backupsAt = Date.now(); }
+    emit();
+  }, () => {});
+}
+function setWsTab(t) {
+  if (S.ws.tab === t && !S.ui.wsCollapsed) {      // the tab already showing:
+    if (t === 'files') loadFiles(true);           // click again = rescan
+    else if (t === 'backups') loadBackups(true);
+    return;
+  }
+  S.ws.tab = t;
+  S.ui.wsCollapsed = false;
+  try { localStorage.setItem('pedacito_ws_tab', t); } catch (e) {}
+  if (t === 'files') loadFiles();
+  if (t === 'backups') loadBackups();
+  if (t === 'logs' && term) { term.follow = S.ui.termFollow; term.schedule(); }
+  emit();
+}
+function fmtTime(t) {
+  return t ? new Date(t * 1000).toLocaleString() : '';
+}
+function insertRef(rel) {                          // "@" the file into the
+  const el = inputEl || $('input');                // chat composer
+  const tok = '@' + rel;
+  if (el) {
+    el.value = (el.value ? (/\s$/.test(el.value) ? el.value : el.value + ' ') : '') + tok + ' ';
+    S.drafts[S.mode] = el.value;
+    el.focus();
+    el.selectionStart = el.selectionEnd = el.value.length;
+  } else {
+    S.drafts[S.mode] = ((S.drafts[S.mode] || '') + (S.drafts[S.mode] && !/\s$/.test(S.drafts[S.mode]) ? ' ' : '') + tok + ' ');
+  }
+  PDC.toast('Added ' + tok + ' to the chat input.');
+  emit();
+}
+function previewFile(rel) {                        // read-only file preview
+  PDC.api('/api/file?path=' + encodeURIComponent(rel)).then((j) => {
+    if (j._status !== 200) { PDC.toast(j.detail || 'could not read ' + rel, true); return; }
+    let body;
+    if (j.binary) {
+      body = h('div', { class: 'tip', text: 'Binary file \u2014 ' + PDC.fmtInt(j.size) + ' bytes. No text preview.' });
+    } else {
+      const lines = String(j.text || '').replace(/\r\n/g, '\n').split('\n');
+      const box = h('div', { class: 'pv' });
+      lines.forEach((ln, i) => box.appendChild(h('div', { class: 'pv-line' },
+        h('span', { class: 'pv-n', text: String(i + 1) }),
+        h('span', { class: 'pv-t', text: ln }))));
+      body = h('div', {}, box,
+        j.truncated ? h('div', { class: 'muted small-text', text: 'Preview truncated at 600 KB.' }) : null);
+    }
+    PDC.modal(rel + ' \u00B7 ' + PDC.fmtInt(j.size) + ' bytes', body,
+      [{ label: '\u2295 Use in chat', onclick: () => insertRef(rel) }], { wide: true });
+  });
+}
+function restoreBackup(name) {
+  if (!name) { PDC.toast('There is no backup snapshot to restore.', true); return; }
+  PDC.confirm('Restore \u201c' + name + '\u201d?\n\nCopies the snapshot back over the working tree. Files changed since then are overwritten; files created since stay on disk.',
+    'Restore', true).then((ok) => {
+      if (!ok) return;
+      PDC.api('/api/restore', { snapshot: name }).then((j) => {
+        PDC.toast(j.detail || (j.ok ? 'restored' : 'failed'), !j.ok);
+        refreshState(); loadFiles(true); loadBackups(true);
+      });
+    });
 }
 
 // ---- plan ----
@@ -1132,6 +1239,11 @@ function OptField(props) {
 }
 
 // ---------------------------------------------------------------- diff pane --
+function setDiffMode(m) {
+  S.ui.diffMode = m;
+  try { localStorage.setItem('pedacito_diff_mode', m); } catch (e) {}
+  emit();
+}
 function markedCells(text, spans) {
   if (!spans || !spans.length) return [text];
   const out = [];
@@ -1150,9 +1262,18 @@ function codeLine(kind, no, cells, show, key) {
     <span class="t">${cells}</span>
   </div>`;
 }
+function uniLine(kind, no, cells, show, key) {   // unified row with +/\u2212 mark
+  const pm = kind === 'add' ? '+' : (kind === 'del' ? '\u2212' : '\u00A0');
+  return html`<div key=${key} class=${'l u ' + kind} hidden=${!show}>
+    <span class="n">${no == null ? '' : String(no)}</span>
+    <span class="pm">${pm}</span>
+    <span class="t">${cells}</span>
+  </div>`;
+}
 
 function DiffPane() {
   const R = S.review, D = S.diff;
+  const unified = S.ui.diffMode === 'unified';
   const oldRef = useRef(null), newRef = useRef(null);
   useEffect(() => {                       // keep the two panes in step
     const a = oldRef.current, b = newRef.current;
@@ -1178,7 +1299,7 @@ function DiffPane() {
   const editable = R.files.filter((f) => !f.source);
   const nSel = R.partial_ok ? editable.filter((f) => S.sel[f.rel] !== false).length : editable.length;
   const rows = (D && D.rows) || [];
-  const oldRows = [], newRows = [];
+  const oldRows = [], newRows = [], uniRows = [];
   rows.forEach((r, i) => {
     const key = 'r' + i;
     if (r[0] === 'skip') {
@@ -1187,22 +1308,27 @@ function DiffPane() {
       const label = '\u22EF ' + r[1] + ' unchanged line' + (r[1] === 1 ? '' : 's') + ' \u2014 click to show';
       const mk = () => html`<div key=${key} class="skip" hidden=${opened}
         onClick=${() => { S.ui.folds[foldKey] = true; emit(); }}>${label}</div>`;
-      oldRows.push(mk()); newRows.push(mk());
+      oldRows.push(mk()); newRows.push(mk()); uniRows.push(mk());
       return;
     }
     const kind = r[0], show = !r[7] || S.ui.folds[S.diffRel + '#' + r[7]] === true;
     if (kind === 'equal') {
       oldRows.push(codeLine('equal', r[1], r[2], show, key));
       newRows.push(codeLine('equal', r[3], r[4], show, key));
+      uniRows.push(uniLine('equal', r[1], r[2], show, key));
     } else if (kind === 'replace') {
       oldRows.push(codeLine('replace del', r[1], markedCells(r[2], r[5]), show, key));
       newRows.push(codeLine('replace add', r[3], markedCells(r[4], r[6]), show, key));
+      uniRows.push(uniLine('del', r[1], markedCells(r[2], r[5]), show, key + 'a'));
+      uniRows.push(uniLine('add', r[3], markedCells(r[4], r[6]), show, key + 'b'));
     } else if (kind === 'delete') {
       oldRows.push(codeLine('delete', r[1], r[2], show, key));
       newRows.push(codeLine('blank', null, '', show, key));
+      uniRows.push(uniLine('del', r[1], r[2], show, key));
     } else {
       oldRows.push(codeLine('blank', null, '', show, key));
       newRows.push(codeLine('insert', r[3], r[4], show, key));
+      uniRows.push(uniLine('add', r[3], r[4], show, key));
     }
   });
   const acceptLabel = !R.partial_ok || nSel === editable.length
@@ -1217,10 +1343,14 @@ function DiffPane() {
         <div id="reviewActions">
           <button class="ghost small" title="collapse the diff (Chat stays full-width)"
                   onClick=${() => { S.ui.diffOpen = false; emit(); }}>\u29C9 Collapse</button>
+          <span id="diffViewToggle" title="diff layout: two panes or one unified column">
+            <button class=${'small' + (unified ? '' : ' on')} onClick=${() => setDiffMode('split')}>Side by side</button>
+            <button class=${'small' + (unified ? ' on' : '')} onClick=${() => setDiffMode('unified')}>Unified</button>
+          </span>
           ${pending ? html`
             <button class="small" id="editBtn" hidden=${!R.partial_ok}
-                    title="edit the updated code by hand before accepting"
-                    onClick=${toggleEdit}>${S.editing ? '\u2714 Show diff' : '\u270E Edit updated'}</button>
+                    title="edit the proposed code for the selected file by hand before accepting"
+                    onClick=${toggleEdit}>${S.editing ? '\u2716 Show diff' : '\u270E Edit proposed'}</button>
             <button class="small danger" onClick=${() => decide('reject')}>Reject${R.files.length > 1 ? ' all' : ''}</button>
             <button class="small primary" disabled=${nSel === 0}
                     onClick=${() => decide('apply')}>${acceptLabel}</button>` : null}
@@ -1237,9 +1367,24 @@ function DiffPane() {
             <span>${f.rel}</span>
             ${f.edited ? html`<span class="muted">(edited)</span>` : null}
             <span class="a">+${f.added}</span><span class="r">\u2212${f.removed}</span>
+            ${pending && !f.source && R.partial_ok ? html`
+              <button class="fedit" title="edit this file's proposed code"
+                      onClick=${(e) => {
+                        e.stopPropagation();
+                        if (f.rel === S.diffRel && S.diff) { toggleEdit(); }
+                        else { S.editAfterLoad = true; loadDiffFile(f.rel); }
+                      }}>\u270E</button>` : null}
           </div>`)}
       </div>
-      ${!D ? html`<div class="tip">${R.files.length ? 'Loading\u2026' : 'No files in this review.'}</div>` : html`
+      ${!D ? html`<div class="tip">${R.files.length ? 'Loading\u2026' : 'No files in this review.'}</div>` : (unified ? html`
+        <div id="panes" class="unified">
+          <div class="pane">
+            <div class="pane-head"><span>${S.diffRel}</span><span>\u2212${D.removed} / +${D.added} lines</span></div>
+            <div class="code" hidden=${S.editing}>${uniRows}</div>
+            <textarea id="editBox" spellcheck="false" hidden=${!S.editing}
+                      ref=${(el) => { editBox.current = el; }}></textarea>
+          </div>
+        </div>` : html`
         <div id="panes">
           <div class="pane">
             <div class="pane-head"><span>Old code</span><span>\u2212${D.removed} lines</span></div>
@@ -1251,7 +1396,7 @@ function DiffPane() {
             <textarea id="editBox" spellcheck="false" hidden=${!S.editing}
                       ref=${(el) => { editBox.current = el; }}></textarea>
           </div>
-        </div>`}
+        </div>`)}
     </div>`;
 }
 
@@ -1387,26 +1532,104 @@ function PlanPane() {
     </section>`;
 }
 
-function TermPane() {
+// ------------------------------------------------------- workspace pane ----
+// The bottom-right panel: three tabs replacing the old static TERMINAL box.
+// FILES browses the project (index + workspace scan), BACKUPS restores a
+// snapshot with one click, LOGS keeps the raw terminal output. The #term
+// element stays mounted in every tab so the live Term buffer never resets.
+const WS_TABS = [['files', 'Files'], ['backups', 'Backups'], ['logs', 'Logs']];
+
+function WorkspacePane() {
+  const s = S.status, j = s.job;
   const termRef = useRef(null);
   useEffect(() => {
     if (termRef.current && !term) term = new Term(termRef.current);
   }, []);
+  const tab = S.ws.tab;
+  const idxSet = S.ws.indexedSet || new Set();
+  const flt = S.ws.filter.trim().toLowerCase();
+  const all = S.ws.files || [];
+  const shown = (flt ? all.filter((f) => f.toLowerCase().indexOf(flt) >= 0) : all).slice(0, 600);
+  const fileRow = (f) => {
+    const i = f.lastIndexOf('/');
+    const base = i < 0 ? f : f.slice(i + 1);
+    const dir = i < 0 ? '' : f.slice(0, i);
+    return html`
+      <div key=${f} class="wsrow" title=${f}>
+        <button class="ws-open" title="preview"
+                onClick=${() => previewFile(f)}>
+          <span class="ws-base">${base}</span>${dir ? html`<span class="ws-dir">${dir}/</span>` : null}
+        </button>
+        ${idxSet.has(f) ? html`<span class="tag idx" title="in the index">indexed</span>` : null}
+        <span class="grow"></span>
+        <button class="ws-at" title="insert @${f} into the chat input"
+                onClick=${() => insertRef(f)}>@</button>
+      </div>`;
+  };
+  const snap = S.ws.backups[0] || (s.snapshots || [])[0] || null;
+  const snapName = snap ? (snap.name || snap) : '';
   return html`
-    <section class=${'panel' + (S.ui.termCollapsed ? ' collapsed' : '')} id="termPanel">
+    <section class=${'panel' + (S.ui.wsCollapsed ? ' collapsed' : '')} id="wsPanel">
       <div class="panel-head">
-        <h2>Terminal</h2>
-        <span class="muted small-text grow term-sub">live output</span>
-        <label class="chk"><input type="checkbox" checked=${S.ui.termFollow}
-               onchange=${(e) => { S.ui.termFollow = e.target.checked; if (term) { term.follow = e.target.checked; if (e.target.checked) term.schedule(); } }} />follow</label>
-        <button class="ghost small" onClick=${() => clearTerm()}>Clear</button>
+        <div id="wsTabs">
+          ${WS_TABS.map(([k, lbl]) => html`
+            <button key=${k} class=${tab === k ? 'on' : ''}
+                    onClick=${() => setWsTab(k)}>${lbl}</button>`)}
+        </div>
+        <span class="muted small-text grow ws-sub">
+          ${tab === 'files' ? (s.root ? PDC.fmtInt(S.ws.indexed.length) + ' of ' + PDC.fmtInt(all.length) + ' files indexed' : 'no project open')
+          : tab === 'backups' ? 'undo a Task/Edit or Auto write'
+          : 'live output'}
+        </span>
+        ${tab === 'logs' ? html`
+          <label class="chk"><input type="checkbox" checked=${S.ui.termFollow}
+                 onchange=${(e) => { S.ui.termFollow = e.target.checked; if (term) { term.follow = e.target.checked; if (e.target.checked) term.schedule(); } }} />follow</label>
+          <button class="ghost small" onClick=${() => clearTerm()}>Clear</button>` : null}
         <button class="ghost small" title="collapse / expand"
-                onClick=${() => { S.ui.termCollapsed = !S.ui.termCollapsed; emit(); }}>${S.ui.termCollapsed ? '\u25B2' : '\u25BC'}</button>
+                onClick=${() => { S.ui.wsCollapsed = !S.ui.wsCollapsed; emit(); }}>${S.ui.wsCollapsed ? '\u25B2' : '\u25BC'}</button>
       </div>
-      <div id="term" ref=${termRef}
-           onwheel=${() => { const el = termRef.current;
-             if (term && term.follow && el && el.scrollTop + el.clientHeight < el.scrollHeight - 40) {
-               term.follow = false; S.ui.termFollow = false; emit(); } }}></div>
+      <div class="ws-body" id="wsFiles" hidden=${tab !== 'files'}>
+        <div class="ws-tools">
+          <input type="text" class="grow" placeholder="filter files\u2026"
+                 spellcheck="false" value=${S.ws.filter}
+                 oninput=${(e) => { S.ws.filter = e.target.value; emit(); }} />
+          <button class="small" disabled=${S.ws.loading || !s.root} title="rescan the project folder"
+                  onClick=${() => loadFiles(true)}>\u27F3</button>
+        </div>
+        ${!s.root ? html`<div class="tip">Open a project to browse its files.</div>`
+        : S.ws.loading && !all.length ? html`<div class="tip">Scanning the workspace\u2026</div>`
+        : !shown.length ? html`<div class="tip">${all.length ? 'No file matches the filter.' : 'No files found.'}</div>`
+        : html`<div class="ws-list">${shown.map(fileRow)}</div>`}
+        <div class="muted small-text ws-foot" hidden=${!all.length}>
+          ${'Showing ' + PDC.fmtInt(shown.length) + ' of ' + PDC.fmtInt(all.length) + ' files'
+            + (S.ws.truncated ? ' \u00B7 scan capped at ' + PDC.fmtInt(all.length) : '')}
+        </div>
+      </div>
+      <div class="ws-body" id="wsBackups" hidden=${tab !== 'backups'}>
+        <div class="ws-tools">
+          <button class="small danger" disabled=${!!j || !snapName}
+                  title=${snapName ? 'restore ' + snapName : 'no snapshot yet'}
+                  onClick=${() => restoreBackup(snapName)}>\u21BA Restore last backup</button>
+          <button class="small" onClick=${() => loadBackups(true)} title="relist snapshots">\u27F3</button>
+          <span class="muted small-text grow">${'backups taken before writes (' + PDC.fmtInt(S.ws.backups.length) + ')'}</span>
+        </div>
+        ${!S.ws.backups.length ? html`<div class="tip">No snapshots yet \u2014 direct writes and reviewed accepts back up the originals first.</div>`
+        : html`<div class="ws-list">${S.ws.backups.map((b, i) => html`
+          <div key=${b.name} class="wsrow" title=${b.name}>
+            <span class="ws-base mono">${b.name}</span>
+            ${i === 0 ? html`<span class="tag idx" title="newest snapshot">newest</span>` : null}
+            <span class="muted small-text">${PDC.fmtInt(b.files)} file(s) \u00B7 ${fmtTime(b.time)}</span>
+            <span class="grow"></span>
+            <button class="small" disabled=${!!j} title="copy this snapshot back over the working tree"
+                    onClick=${() => restoreBackup(b.name)}>Restore</button>
+          </div>`)}</div>`}
+      </div>
+      <div class="ws-body" id="wsLogs" hidden=${tab !== 'logs'}>
+        <div id="term" ref=${termRef}
+             onwheel=${() => { const el = termRef.current;
+               if (term && term.follow && el && el.scrollTop + el.clientHeight < el.scrollHeight - 40) {
+                 term.follow = false; S.ui.termFollow = false; emit(); } }}></div>
+      </div>
     </section>`;
 }
 
@@ -1439,7 +1662,8 @@ function App() {
             ${dm === 'collapsed' ? html`
               <button class="small primary" id="diffPill" title="show the staged diff beside the chat"
                       onClick=${() => { S.ui.diffOpen = true; emit(); }}>
-                \u29C6 ${s.review.pending ? 'Review staged' : 'Review'} \u2014 expand</button>` : null}
+                \u29C6 ${s.review.pending ? 'Review staged' : 'Review'}
+                ${(s.review.files || []).length ? ' \u00B7 ' + s.review.files.filter((f) => !f.source).length + ' file(s)' : ''} \u2014 expand</button>` : null}
             <button class="ghost small" id="clearChat" title="clear the conversation"
                     onClick=${() => PDC.api('/api/clear', {})}>Clear</button>
           </div>
@@ -1455,7 +1679,7 @@ function App() {
           <${ActivityPane} />
           <${PlanPane} />
           <div class="splitter h" id="split2" title="drag to resize" onMousedown=${dragTerm(rightRef)}></div>
-          <${TermPane} />
+          <${WorkspacePane} />
         </aside>
       </main>
       <nav id="mobileTabs">

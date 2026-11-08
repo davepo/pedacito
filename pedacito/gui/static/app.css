@@ -220,9 +220,9 @@ textarea { resize: none; background: var(--panel); }
 .panelcol { display: flex; flex-direction: column; min-height: 0; }
 #activityPanel { flex: 1.15 1 0; min-height: 60px; }
 #planPanel { flex: 1 1 0; min-height: 60px; border-top: none; }
-#termPanel { flex: 0 0 var(--term-h); min-height: 36px; }
-#termPanel.collapsed { flex-basis: 36px; }
-#termPanel.collapsed #term { display: none; }
+#wsPanel { flex: 0 0 var(--term-h); min-height: 36px; }
+#wsPanel.collapsed { flex-basis: 36px; }
+#wsPanel.collapsed .ws-body { display: none; }
 
 .panel-head { display: flex; align-items: center; gap: 7px; padding: 7px 10px;
   background: var(--panel2); border-bottom: 1px solid var(--line); min-height: 34px; }
@@ -488,9 +488,42 @@ details pre { background: var(--code-bg); border: 1px solid var(--line); border-
 .atool.k-edit-intents, .atool.k-verify { color: var(--ok); border-color: var(--line2); }
 #engCount { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 
-/* ------------------------------------------------------------ terminal pane -- */
-.panel-head .term-sub { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-@media (max-width: 1180px) { .panel-head .term-sub { display: none; } }
+/* ------------------------------------------------------------- workspace pane --
+   Three-tab bottom-right panel: Files / Backups / Logs. The #term element and
+   its ANSI classes stay exactly as before; they just live inside the LOGS tab
+   now (kept mounted in every tab so the live buffer never resets). */
+.panel-head .ws-sub { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+@media (max-width: 1180px) { .panel-head .ws-sub { display: none; } }
+#wsTabs { display: flex; gap: 2px; flex: none; }
+#wsTabs button { border: 1px solid var(--line); border-radius: 6px; padding: 2px 10px;
+  font-size: 11.5px; background: var(--panel); color: var(--muted); }
+#wsTabs button.on { color: var(--accent); font-weight: 700; background: var(--accent-soft);
+  border-color: var(--accent); }
+.ws-body { flex: 1 1 auto; min-height: 0; display: flex; flex-direction: column;
+  background: var(--bg); }
+.ws-tools { display: flex; gap: 6px; align-items: center; padding: 6px 8px; flex: none;
+  border-bottom: 1px solid var(--line); background: var(--panel2); }
+.ws-tools input { font-size: 12px; background: var(--panel); }
+.ws-list { flex: 1 1 auto; min-height: 0; overflow-y: auto; padding: 2px 4px 6px; }
+.wsrow { display: flex; gap: 7px; align-items: center; padding: 2px 6px;
+  border-bottom: 1px solid color-mix(in srgb, var(--line) 55%, transparent); font-size: 12px; }
+.wsrow:hover { background: var(--panel2); }
+.ws-open { display: flex; gap: 5px; align-items: baseline; min-width: 0; flex: 0 1 auto;
+  border: none; background: transparent; padding: 0; text-align: left; }
+.ws-open:hover .ws-base { color: var(--accent); text-decoration: underline; }
+.ws-base { font-family: var(--mono); white-space: nowrap; overflow: hidden;
+  text-overflow: ellipsis; color: var(--text); }
+.ws-dir { font-family: var(--mono); font-size: 10.5px; color: var(--muted); white-space: nowrap;
+  overflow: hidden; text-overflow: ellipsis; min-width: 0; }
+.tag.idx { font-size: 9.5px; color: var(--ok); border-color: var(--ok);
+  border: 1px solid var(--ok); border-radius: 999px; padding: 0 6px; flex: none;
+  text-transform: lowercase; }
+.ws-at { flex: none; width: 22px; height: 20px; padding: 0; border-radius: 5px;
+  font-family: var(--mono); font-size: 12px; color: var(--accent);
+  background: var(--panel2); border: 1px solid var(--line); }
+.ws-at:hover { border-color: var(--accent); }
+.ws-foot { flex: none; padding: 3px 8px; border-top: 1px solid var(--line);
+  background: var(--panel2); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 #term { flex: 1 1 auto; min-height: 0; overflow: auto; background: var(--term-bg);
   color: var(--term-text); font-family: var(--mono); font-size: 12px; line-height: 1.45; padding: 6px 8px;
   white-space: pre-wrap; word-break: break-word; }
@@ -501,6 +534,41 @@ details pre { background: var(--code-bg); border: 1px solid var(--line); border-
 #term .c32 { color: var(--ansi-2); } #term .c33 { color: var(--ansi-3); }
 #term .c34 { color: var(--ansi-4); } #term .c35 { color: var(--ansi-5); }
 #term .c36 { color: var(--ansi-6); } #term .c37 { color: var(--ansi-7); }
+
+/* ------------------------------------------------------- file preview modal -- */
+.modal.wide { width: min(1060px, 97vw); }
+.pv { background: var(--code-bg); border: 1px solid var(--line); border-radius: 8px;
+  overflow: auto; max-height: 70vh; font-family: var(--mono); font-size: 12px;
+  line-height: 1.5; padding: 6px 0; }
+.pv-line { display: flex; }
+.pv-line:hover { background: var(--panel2); }
+.pv-n { flex: none; width: 46px; text-align: right; padding: 0 10px 0 6px; color: var(--muted);
+  background: var(--panel2); user-select: none; border-right: 1px solid var(--line); }
+.pv-t { padding: 0 10px; white-space: pre; color: var(--text); }
+
+/* ------------------------------------------------------------- review polish -- */
+#diffViewToggle { display: inline-flex; gap: 0; flex: none; }
+#diffViewToggle button { border-radius: 0; padding: 2px 8px; font-size: 11px;
+  color: var(--muted); border-color: var(--line); background: var(--panel); }
+#diffViewToggle button:first-child { border-radius: 5px 0 0 5px; }
+#diffViewToggle button:last-child { border-radius: 0 5px 5px 0; border-left: none; }
+#diffViewToggle button.on { color: var(--accent); font-weight: 700; background: var(--accent-soft); }
+#panes.unified { grid-template-columns: minmax(0, 1fr); }
+.code .l.u .pm { flex: none; width: 16px; text-align: center; color: var(--muted);
+  user-select: none; font-weight: 700; }
+.code .l.u.add .pm { color: var(--ok); }
+.code .l.u.del .pm { color: var(--err); }
+.code .l.u.add { background: color-mix(in srgb, var(--add-bg) 20%, transparent); }
+.code .l.u.add > .t { background: color-mix(in srgb, var(--add-bg) 20%, transparent); }
+.code .l.u.del { background: color-mix(in srgb, var(--del-bg) 18%, transparent); }
+.code .l.u.del > .t { background: color-mix(in srgb, var(--del-bg) 18%, transparent); }
+.fileitem .fedit { flex: none; width: 20px; height: 20px; padding: 0; line-height: 1;
+  border-radius: 5px; border: 1px solid var(--line); background: var(--panel2);
+  color: var(--muted); font-size: 12px; }
+.fileitem .fedit:hover { color: var(--warn); border-color: var(--warn); }
+.msg.assistant.review_applied .bubble { border-left: 3px solid var(--ok); }
+.msg.assistant.review_rejected .bubble { border-left: 3px solid var(--err); }
+.msg.assistant.review_staged .bubble { border-left: 3px solid var(--warn); }
 
 /* ----------------------------------------------------------------- toast -- */
 #toast { position: fixed; bottom: 14px; right: 14px; display: flex;

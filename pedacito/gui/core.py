@@ -547,11 +547,15 @@ class State:
             self._rid += 1
             rv = Review(self._rid, **rv_args)
             self.review = rv
-        msg = self.add_message(
-            "review", rv.task, review_id=rv.id,
-            files=len([d for d in rv.diffs if not d.removed_source]),
-            outcome="")
+        n = len([d for d in rv.diffs if not d.removed_source])
+        msg = self.add_message("review", rv.task, review_id=rv.id, files=n,
+                               outcome="")
         rv.mid = msg["id"]
+        # A plain transcript line next to the card, so the chat history of a
+        # run reads: prompt -> ... -> "Staged changes across N file(s)".
+        self.add_message("assistant",
+                         f"Staged changes across {n} file(s) for review.",
+                         kind="review_staged", review_id=rv.id, files=n)
         self.bus.publish("review", id=rv.id)
         return rv
 
@@ -621,6 +625,8 @@ class State:
             if action == "reject":
                 self._finish_review(rv, "cancelled", "No files were changed.",
                                     discard=True)
+                self.add_message("assistant", "Rejected staged changes",
+                                 kind="review_rejected", review_id=rv.id)
                 return True, rv.detail
             if rv.partial_ok and files is not None:
                 keep = set(files)
@@ -640,7 +646,37 @@ class State:
             if not ok:
                 return False, detail
             self._finish_review(rv, "applied", detail)
+            written = [d.rel for d in rv.diffs if not d.removed_source]
+            self.add_message("assistant",
+                             f"Applied changes to {len(written)} file(s)",
+                             kind="review_applied", review_id=rv.id,
+                             files=written)
+            self.reindex_written(written)
             return True, detail
+
+    def reindex_written(self, rels: list[str]) -> None:
+        """Fold freshly accepted files back into the open index so the Files
+        tab and the next run see the new contents right after a review is
+        applied. When a job thread was blocked on the review (Task/Edit), the
+        loop re-indexes and swaps the result itself; only a review accepted
+        with no job running needs to do it here."""
+        if not rels:
+            return
+        with self.lock:
+            idx, cfg = self.idx, self.cfg
+            busy = self.job is not None and self.job.active
+        if busy or idx is None or cfg is None:
+            return
+        from .. import index as index_mod  # lazy: core loads before index
+        for rel in rels:
+            try:
+                index_mod.reindex_file(idx, rel, cfg)
+            except Exception:
+                pass        # a moved/deleted file re-indexes on the next run
+        with self.lock:
+            self.index_gen += 1
+        self.apply_index(idx)
+        self.bus.publish("status")
 
     def _finish_review(self, rv: Review, outcome: str, detail: str,
                        discard: bool = False) -> None:
@@ -732,10 +768,18 @@ class State:
             }
 
     def review_meta_brief(self) -> dict | None:
+        """The staged review as `/api/state` reports it: enough for the page
+        (and a polling client) to show the review panel and its per-file diff
+        payload without a second round trip. `/api/review/file` carries the
+        row-level rows; the brief carries the per-file summary."""
         rv = self.review
         if rv is None:
             return None
-        return {"id": rv.id, "pending": not rv.outcome, "outcome": rv.outcome}
+        return {"id": rv.id, "pending": not rv.outcome, "outcome": rv.outcome,
+                "task": rv.task, "partial_ok": rv.partial_ok,
+                "files": [{"rel": d.rel, "added": d.added, "removed": d.removed,
+                           "source": d.removed_source,
+                           "edited": d.rel in rv.edits} for d in rv.diffs]}
 
 
 STATE = State()

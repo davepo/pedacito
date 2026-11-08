@@ -19,14 +19,18 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
 from .. import review as review_mod
+from .. import workspace
 from ..config import ConfigError
 from ..local_server import LocalHTTPServer
+from ..select import Matcher, is_venv_dir
 from . import jobs, settings_api
 from .core import STATE, install_runner, install_tee, uninstall_runner, uninstall_tee
 
 STATIC = Path(__file__).parent / "static"
 MAX_BODY = 12 * 1024 * 1024
 MAX_VIEW_BYTES = 600_000
+MAX_SCAN_FILES = 4000          # workspace scan cap for the Files tab
+MAX_BACKUPS = 20
 
 # Explicit allowlist of served types (everything under STATIC/ is still
 # directory-contained below). vendor.js is the vendored preact+htm bundle and
@@ -113,6 +117,64 @@ def read_project_file(rel: str) -> dict:
             "truncated": size > MAX_VIEW_BYTES}
 
 
+def project_files() -> dict:
+    """The FILES tab list: the index's files when one is loaded, unioned with
+    a bounded workspace scan (honouring `.pedacitoignore`/`.gitignore`) so
+    files written since the last index still show up -- and the list works at
+    all before the first index is built. `indexed` marks which entries the
+    index knows."""
+    with STATE.lock:
+        root, idx, args = STATE.root, STATE.idx, STATE.args
+        indexed = sorted(idx.files) if idx is not None else []
+        sig = STATE.files_signature()
+    out = {"sig": sig, "indexed": indexed, "files": indexed, "truncated": False}
+    if root is None or not root.is_dir():
+        return out
+    matcher = Matcher.from_files(root)
+    if args is not None:
+        matcher.extend(args.exclude or [])
+        matcher.extend("!" + p for p in (args.include or []))
+    found, scanned, stop = set(indexed), 0, False
+    for dirpath, dirnames, filenames in os.walk(root):
+        if stop:
+            break
+        d = Path(dirpath)
+        base = "" if d == root else d.relative_to(root).as_posix()
+        dirnames[:] = [x for x in dirnames
+                       if not is_venv_dir(d / x)
+                       and not matcher.prunable_dir(f"{base}/{x}" if base else x)]
+        for name in sorted(filenames):
+            rel = f"{base}/{name}" if base else name
+            if rel in found or matcher.excluded(rel):
+                continue
+            found.add(rel)
+            scanned += 1
+            if scanned >= MAX_SCAN_FILES:
+                out["truncated"] = True
+                stop = True
+                break
+    out["files"] = sorted(found)
+    return out
+
+
+def backup_snapshots() -> list:
+    """The BACKUPS tab list: snapshot directories newest first, with a file
+    count and timestamp for each."""
+    with STATE.lock:
+        root = STATE.root
+    out = []
+    if root is None:
+        return out
+    for d in workspace.list_backups(root)[:MAX_BACKUPS]:
+        try:
+            n = sum(1 for p in d.rglob("*") if p.is_file())
+            when = d.stat().st_mtime
+        except OSError:
+            n, when = 0, 0.0
+        out.append({"name": d.name, "files": n, "time": when})
+    return out
+
+
 def plan_payload() -> dict:
     with STATE.lock:
         path, root = STATE.plan_path, STATE.root
@@ -183,10 +245,13 @@ def _snapshot(q, body=None):
 
 @get("/api/files")
 def _files(q, body=None):
-    with STATE.lock:
-        files = sorted(STATE.idx.files) if STATE.idx else []
-        sig = STATE.files_signature()
-    return 200, {"sig": sig, "files": files}
+    return 200, project_files()
+
+
+@get("/api/backups")
+def _backups(q, body=None):
+    """Backup snapshots for the WORKSPACE panel's BACKUPS tab."""
+    return 200, {"backups": backup_snapshots()}
 
 
 @get("/api/file")

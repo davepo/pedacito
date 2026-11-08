@@ -420,6 +420,124 @@ def test_review_apply_with_no_files_selected_is_refused(gui):
     thread.join(10)
 
 
+def test_a_staged_review_is_broadcast_with_its_diff_in_the_state(gui):
+    """Item #4: the review must reach a polling page as a diff payload, and the
+    transcript must say what happened at both ends of the decision."""
+    core.STATE.job = core.Job(1, "task", "t")
+    root, thread, out = _staged(gui, [])
+    state = gui.get("/api/state")[1]
+    rv = state["review"]
+    assert rv["pending"] and rv["partial_ok"] and rv["task"] == "t"
+    assert [f["rel"] for f in rv["files"]] == ["a.txt", "b.txt"]
+    a, b = rv["files"]
+    assert (a["added"], a["removed"]) == (1, 1) and not a["edited"]
+    assert not a["source"] and b["rel"] == "b.txt" and b["added"] == 1
+    assert ("Staged changes across 2 file(s) for review."
+            in [m["text"] for m in state["messages"]])
+
+    status, body = gui.post("/api/review/decide",
+                            {"id": rv["id"], "action": "apply", "files": ["a.txt"]})
+    thread.join(10)
+    assert status == 200 and body["ok"] and out["res"][0] == "applied"
+    rv = gui.get("/api/state")[1]["review"]
+    assert not rv["pending"] and rv["outcome"] == "applied"
+    assert not any(f["source"] for f in rv["files"])
+    assert (root / "a.txt").read_text() == "ONE\ntwo\n"
+    assert "Applied changes to 1 file(s)" in [m["text"] for m in
+                                              gui.get("/api/state")[1]["messages"]]
+
+
+def test_a_rejected_review_says_so_and_writes_nothing(gui):
+    core.STATE.job = core.Job(1, "task", "t")
+    root, thread, out = _staged(gui, [])
+    rid = gui.get("/api/state")[1]["review"]["id"]
+    assert gui.post("/api/review/decide", {"id": rid, "action": "reject"})[0] == 200
+    thread.join(10)
+    assert out["res"][0] == "cancelled"
+    assert (root / "a.txt").read_text() == "one\ntwo\n"
+    assert (root / "b.txt").read_text() == "alpha\n"
+    state = gui.get("/api/state")[1]
+    texts = [m["text"] for m in state["messages"]]
+    assert "Rejected staged changes" in texts
+    kinds = [m.get("kind") for m in state["messages"]]
+    assert "review_rejected" in kinds
+    assert not state["review"]["pending"]
+
+
+# --- workspace panel endpoints (Files / Backups) ---------------------------------------
+
+def test_files_api_scans_the_workspace_and_honours_the_ignore_file(gui, tmp_path,
+                                                                   monkeypatch):
+    """The Files tab shows what is in the project, not only what the index has
+    seen: new files included, `.pedacitoignore` and the state dir excluded."""
+    root = tmp_path / "scanproj"
+    (root / "src").mkdir(parents=True)
+    (root / "src" / "a.py").write_text("1\n")
+    (root / "notes.md").write_text("1\n")
+    (root / "fresh.txt").write_text("1\n")            # never indexed
+    (root / "ignored.txt").write_text("1\n")
+    (root / ".pedacitoignore").write_text("ignored.txt\n")
+    (root / ".pedacito").mkdir()
+    (root / ".pedacito" / "settings.toml").write_text("")
+    monkeypatch.setattr(core.STATE, "root", root)
+    monkeypatch.setattr(core.STATE, "idx", None)
+    out = gui.get("/api/files")[1]
+    assert out["files"] == ["fresh.txt", "notes.md", "src/a.py"]
+    assert out["indexed"] == [] and out["truncated"] is False
+
+
+def test_files_api_marks_the_indexed_ones_and_keeps_the_signature(gui, tmp_path,
+                                                                  monkeypatch):
+    class _Idx:
+        def __init__(self):
+            self.files = {"app.py": [], "new.py": []}
+    root = tmp_path / "idxproj"
+    root.mkdir()
+    (root / "app.py").write_text("1\n")
+    (root / "new.py").write_text("1\n")
+    monkeypatch.setattr(core.STATE, "root", root)
+    monkeypatch.setattr(core.STATE, "idx", _Idx())
+    out = gui.get("/api/files")[1]
+    assert out["indexed"] == ["app.py", "new.py"]
+    assert out["files"] == ["app.py", "new.py"]
+    assert out["sig"] == core.STATE.files_signature()
+
+
+def test_backups_api_lists_snapshots_newest_first(gui):
+    from pedacito import workspace
+    root = core.STATE.root = gui.tmp / "bk"
+    root.mkdir()
+    assert gui.get("/api/backups")[1]["backups"] == []      # nothing yet
+    old = workspace.new_backup_dir(root, when="20260101-000000", unique=True)
+    (old / "a.txt").write_text("one\n")
+    new = workspace.new_backup_dir(root, when="20260102-000000", unique=True)
+    (new / "a.txt").write_text("one\n")
+    (new / "b.txt").write_text("two\n")
+    snaps = gui.get("/api/backups")[1]["backups"]
+    assert [s["name"] for s in snaps] == [new.name, old.name]
+    assert [s["files"] for s in snaps] == [2, 1]
+    assert all(s["time"] > 0 for s in snaps)
+
+
+def test_restore_endpoint_puts_the_last_backup_back(gui, tmp_path, monkeypatch):
+    """The BACKUPS tab's one-click restore is the same /api/restore the CLI
+    uses: the file comes back byte for byte, and the pane reports it."""
+    from pedacito import workspace
+    root = tmp_path / "rsp"
+    root.mkdir()
+    (root / "a.txt").write_text("one\n")
+    snap = workspace.new_backup_dir(root, unique=True)
+    (snap / "a.txt").write_text("one\n")
+    (root / "a.txt").write_text("TWO\n")                   # the edit to undo
+    monkeypatch.setattr(core.STATE, "root", root)
+    monkeypatch.setattr(core.STATE, "cfg", None)
+    monkeypatch.setattr(core.STATE, "idx", None)
+    status, body = gui.post("/api/restore", {})
+    assert status == 200 and body["ok"], body
+    assert (root / "a.txt").read_text() == "one\n"
+    assert any("restor" in m["text"].lower() for m in core.STATE.messages)
+
+
 # --- settings endpoints ----------------------------------------------------------------
 
 def test_settings_first_run_creates_a_working_config(gui):
@@ -616,17 +734,26 @@ def _review_accept_flow(project):
     state = project.wait_for(_review_pending, 30)
     assert state, core.STATE.messages
     assert (project.root / "app.py").read_text() == APP       # nothing written yet
+    # the staged diff reaches a polling page as part of the state payload, and
+    # the chat says a review is waiting
+    assert [f["rel"] for f in state["review"]["files"]] == ["app.py"]
+    assert state["review"]["files"][0]["added"] == 1
+    assert "Staged changes across 1 file(s) for review." in [
+        m["text"] for m in state["messages"]]
     meta = project.get("/api/review")[1]["review"]
     assert [f["rel"] for f in meta["files"]] == ["app.py"]
     status, f = project.get(f"/api/review/file?id={meta['id']}&rel=app.py")
     kinds = [r[0] for r in f["rows"]]
     assert "replace" in kinds and f["added"] == 1 and f["removed"] == 1
+    assert 'return f"hello' in f["after"]
     status, body = project.post("/api/review/decide",
                                 {"id": meta["id"], "action": "apply",
                                  "files": ["app.py"]})
     assert status == 200 and body["ok"]
     assert project.wait_idle(30)
     assert 'return f"hello {name}"' in (project.root / "app.py").read_text()
+    assert "Applied changes to 1 file(s)" in [
+        m["text"] for m in project.get("/api/state")[1]["messages"]]
     result = [m for m in core.STATE.messages if m.get("kind") == "result"][-1]
     assert result["head"] == "Wrote 1 file(s)."
     assert result["results"][0]["file"] == "app.py"
@@ -648,6 +775,8 @@ def test_task_review_reject_leaves_the_file_alone(project):
     assert (project.root / "app.py").read_text() == APP
     card = [m for m in core.STATE.messages if m["role"] == "review"][-1]
     assert card["outcome"] == "cancelled"
+    assert "Rejected staged changes" in [
+        m["text"] for m in project.get("/api/state")[1]["messages"]]
 
 
 @pytest.mark.network
