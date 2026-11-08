@@ -152,10 +152,14 @@ def test_descriptions_never_mention_disabled_actions():
 
 def test_gather_has_no_default_step_cap(tmp_path):
     """max_steps=0 (the default) must not stop at the old internal ceiling;
-    only the token/gathered budget or a `done` ends the gather loop."""
+    the gather loop is bounded by the model's `done`, the budgets, and the
+    global safety leases -- which this test turns off to isolate the point.
+    """
     idx = _index(tmp_path)
     cfg = Config()
     assert cfg.max_steps == 0
+    cfg.max_total_model_calls = 0
+    cfg.max_no_progress_steps = 0
 
     class ManySteps:
         step_truncated = False

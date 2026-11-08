@@ -179,9 +179,18 @@ class Config:
     max_instruction_chars: int = 2000
     # Cap on the model's own checklist when injected into a prompt.
     max_todo_chars: int = 1500
-    # Hard lookup limit for the gather phase; 0 = none (token budget and the
-    # model's `done` are the only bounds). `--steps N` sets it for one command.
+    # Hard lookup limit for the gather phase; 0 = none (token budget, the
+    # global bounds below, and the model's `done` are the only bounds).
+    # `--steps N` sets it for one command.
     max_steps: int = 0
+    # Action-independent global safety bounds that still apply when
+    # max_steps = 0 removes the lookup cap: a hard ceiling on total LLM
+    # invocations per task, and a ceiling on consecutive gather steps that
+    # show no progress (add no new unread line span to the read ledger and
+    # resolve no new symbol). Either ceiling ends gather cleanly with a
+    # harness note and the run moves on to the answer phase. 0 = off.
+    max_total_model_calls: int = 30
+    max_no_progress_steps: int = 4
     # Step-0 prefetch: read up to this many task-named files / task-named
     # symbols before the first model step (0 = off). Prefetch reads do not
     # count toward max_steps and are capped at a quarter of the observation
@@ -199,6 +208,14 @@ class Config:
     # Hard cap on source the gather phase may accumulate.
     max_gathered_chars: int = 24000
     max_read_lines: int = 200
+    # Hard per-observation token budget for `read` and `context` during
+    # gather, enforced BEFORE the source is shown and before the span
+    # ledger sees it; 0 = off. Tokenizer-aware: the server's calibrated
+    # chars-per-token when `pedacito calibrate` measured one, ~3.5
+    # chars/token otherwise. Truncation is strict at whole-line boundaries
+    # and the ledger records only the lines actually displayed, with a
+    # next_start hint so the model can continue where the clip landed.
+    max_read_tokens: int = 1200
     # Attach the enclosing signature and module imports when a `read` starts
     # mid-file.
     read_context_hint: bool = True

@@ -11,7 +11,9 @@ Usage
 
 Phase 1 (gather): the model picks tools under a JSON grammar (see tools.py), so
 tool calls never need freeform-text parsing. max_steps = 0 (the default) runs
-until the model says `done` or the gathered-source budget is exhausted; a
+until the model says `done`, the gathered-source budget is exhausted, or one
+of the action-independent global bounds (cfg.max_total_model_calls,
+cfg.max_no_progress_steps) ends the loop cleanly with a harness note; a
 positive max_steps is a hard limit. When the model says `done` but files the
 task names were never read, one nudge asks it to read them (repeated only
 after real progress).
@@ -78,6 +80,11 @@ _MUTATING = {"write", "append", "move", "delete", "undo", "rename", "run",
 
 # Steps discarded for a cut-off payload before gather gives up.
 _MAX_PAYLOAD_CUTS = 2
+
+# Chars-per-token heuristic for the `read`/`context` token budget
+# (cfg.max_read_tokens) when the server has no calibrated tokenizer;
+# a calibrated `client.chars_per_token` measures instead.
+_READ_CHARS_PER_TOKEN = 3.5
 
 
 # The block rides in user0, which every lookup call re-sends (the server's
@@ -859,6 +866,63 @@ class Agent:
                 "more line(s) not shown -- narrow the query (a file, a "
                 "tighter pattern) to see them]")
 
+    def _read_budget_chars(self) -> float:
+        """Char room for cfg.max_read_tokens on one read/context observation:
+        the server's calibrated tokenizer when one answered, ~3.5
+        chars/token otherwise. 0.0 = budget off."""
+        cap = int(getattr(self.cfg, "max_read_tokens", 0) or 0)
+        if cap <= 0:
+            return 0.0
+        cpt = float(getattr(self.client, "chars_per_token", 0.0) or 0.0)
+        if cpt <= 0:
+            cpt = _READ_CHARS_PER_TOKEN
+        return cap * cpt
+
+    def _clip_read_to_token_budget(self, obs: str) -> str:
+        """Enforce the read token budget on a `read`/`context` observation
+        BEFORE it is displayed and before the span ledger records it.
+
+        Truncates strictly at whole-line boundaries, rewrites the header to
+        the range actually delivered, and appends a next_start hint -- so the
+        ledger credits (start, actual_end): lines clipped away are never
+        falsely recorded as read, and an edit quoting them stays flagged as
+        quoting unread source."""
+        budget = self._read_budget_chars()
+        if not budget or len(obs) <= budget:
+            return obs
+        m = _READ_HEAD_RX.match(obs)
+        head, body = _split_read_obs(obs)
+        start = int(m.group(2)) if m else 0
+        body_lines = body.split("\n")
+        kept: list[str] = []
+        used = len(head) + 1
+        shown_end = start - 1        # last numbered line that survived
+        for ln in body_lines:
+            # Truncate strictly at whole-line boundaries: stop on the first
+            # line that no longer fits -- but never leave a numbered read
+            # with zero source lines (keep going until the first numbered
+            # line is kept).
+            if (used + len(ln) + 1 > budget and kept
+                    and (not m or shown_end >= start)):
+                break
+            used += len(ln) + 1
+            kept.append(ln)
+            pm = _NUMBERED_LINE_RX.match(ln)
+            if pm:
+                shown_end = max(shown_end, int(pm.group(1)))
+        if len(kept) == len(body_lines):
+            return obs               # odd or short body: nothing was clipped
+        if not m or shown_end < start:
+            # Not a numbered read (e.g. `context` for a whole file): the
+            # ledger never saw this shape, so a line-boundary cut suffices.
+            return (head + "\n" + "\n".join(kept) +
+                    "\n[CLIPPED due to token budget; use a narrower range "
+                    "to see the rest.]")
+        return (f"{m.group(1).strip()} lines {start}-{shown_end}:" +
+                head[m.end():] + "\n" + "\n".join(kept) +
+                f"\n[CLIPPED at line {shown_end} due to token budget. Use "
+                f"next_start={shown_end + 1} to continue reading.]")
+
     def _ask_user(self, text: str, asked: int) -> str:
         """The `question` action: relay one question to the user (bounded per
         task); an empty answer tells the model to choose the safest reading."""
@@ -1130,7 +1194,54 @@ class Agent:
         ran: dict = {}           # step signature -> (step, index gen, folds, mutations)
         mutations = 0            # bumps when something that can change results ran
         recover_on = bool(getattr(self.cfg, "stuck_recovery", True))
+        # Action-independent global leases: they bound gather even when
+        # max_steps = 0 has removed the fixed lookup cap. `model_calls` is a
+        # hard ceiling on LLM invocations for this task; `no_progress` counts
+        # consecutive gather steps that added no new unread line span to the
+        # read ledger and resolved no new symbol. 0 on either turns it off.
+        call_cap = max(0, int(getattr(self.cfg, "max_total_model_calls", 0) or 0))
+        no_progress_cap = max(0, int(getattr(self.cfg, "max_no_progress_steps", 0) or 0))
+        model_calls = 0
+        no_progress = 0
+        resolved_symbols: set[str] = set()
+
+        def harness_note(text: str) -> None:
+            """Attach a harness verdict to the pending user turn; two bare
+            user messages in a row break some chat templates, so it rides
+            with the last one (as the nudges do)."""
+            if messages and messages[-1]["role"] == "user":
+                messages[-1]["content"] += "\n\n" + text
+            else:
+                messages.append({"role": "user", "content": text})
+
+        def note_progress(made_progress: bool) -> bool:
+            """Update the no-progress streak; True return means the lease is
+            spent and gather must move on to the next phase."""
+            nonlocal no_progress
+            no_progress = 0 if made_progress else no_progress + 1
+            if no_progress_cap <= 0 or no_progress < no_progress_cap:
+                return False
+            harness_note(f"[Harness: gather stopped after {no_progress} "
+                         "consecutive steps that added no unread line span "
+                         "to the read ledger and resolved no new symbol. "
+                         "Answer from what was already gathered.]")
+            self._emit("recovery", signal="no_progress", step=step)
+            if verbose:
+                print("  [gather stopped: the no-progress lease ran out; "
+                      "moving to answer]", file=sys.stderr)
+            return True
+
         while unlimited or step < step_cap:
+            if call_cap > 0 and model_calls >= call_cap:
+                harness_note(f"[Harness: gather stopped -- this task reached "
+                             f"its ceiling of {call_cap} model calls. Answer "
+                             f"from what was already gathered.]")
+                self._emit("recovery", signal="model_calls", step=step)
+                if verbose:
+                    print(f"  [gather stopped: {model_calls} model calls "
+                          f"(cfg.max_total_model_calls); moving to answer]",
+                          file=sys.stderr)
+                break
             step += 1
             # Steering: lines the user typed mid-run join the turn that has
             # not been sent yet, so the cached prefix is untouched.
@@ -1141,6 +1252,7 @@ class Agent:
                 self._emit("steer", step=step, chars=len(note))
                 if verbose:
                     print(f"  [steering delivered: {note[:70]}]", file=sys.stderr)
+            model_calls += 1
             try:
                 stepjson = self.client.chat_json(messages, step_schema,
                                                  self.cfg.max_tokens_step,
@@ -1233,6 +1345,9 @@ class Agent:
                         print("  [gather stopped: payloads keep arriving "
                               "cut off; moving to answer]", file=sys.stderr)
                     break
+                # A discarded payload made no retrieval progress.
+                if note_progress(False):
+                    break
                 continue
 
             detail = (stepjson.get("file") or stepjson.get("pattern")
@@ -1316,6 +1431,8 @@ class Agent:
                 messages.append({"role": "user",
                                  "content": f"RESULT:\n{obs}\n\n{nudge(step + 1)}"})
                 self.steps_log[-1] += "  [asked the user]"
+                if note_progress(False):
+                    break
                 continue
 
             if repeated >= _MAX_REPEATED_STEPS:
@@ -1337,6 +1454,8 @@ class Agent:
                               f"repeated; asking for a different move]",
                               file=sys.stderr)
                     self._fit(messages)
+                    if note_progress(False):
+                        break
                     continue
                 if verbose:
                     print(f"  [gather stopped: the model repeated the same "
@@ -1423,7 +1542,14 @@ class Agent:
                             "reply.]")
             duplicate_read = False
             read_delta = None
+            step_progress = False
             if action in ("read", "context") and not obs.startswith("ERROR"):
+                # Tokenizer-aware hard budget (cfg.max_read_tokens) applied
+                # BEFORE the source is displayed and before the ledger sees
+                # it: a clipped read has its header rewritten to the range
+                # actually delivered, so the span recorded below credits
+                # only the lines the model was shown.
+                obs = self._clip_read_to_token_budget(obs)
                 # A read is progress only when it shows lines not already in the
                 # span ledger; an exact duplicate is replaced by a compact note
                 # so the model does not lock onto one range.
@@ -1432,9 +1558,10 @@ class Agent:
                     key = _norm_key(m.group(1))
                     s_, e_ = int(m.group(2)), int(m.group(3))
                     prior = list(spans.get(key, []))
+                    new_lines = _read_has_new_lines(obs, prior)
+                    step_progress = new_lines
                     read_delta = _delta_len(obs, prior)
-                    duplicate_read = (action == "read"
-                                      and not _read_has_new_lines(obs, prior))
+                    duplicate_read = (action == "read" and not new_lines)
                     spans.setdefault(key, []).append((s_, e_))
                     if duplicate_read:
                         obs = (f"{m.group(1).strip()} lines {s_}-{e_}: "
@@ -1447,6 +1574,15 @@ class Agent:
                     if m:
                         obs += self._scoped_rules(m.group(1).strip())
                 self._unread_files = self._compute_unread(self._targets_text)
+            # Progress also means a lookup step RESOLVED a symbol the ledger
+            # has never seen: naming a definition is information the answer
+            # phase could not derive from an earlier turn.
+            sym = str(stepjson.get("symbol") or "").strip().lower()
+            if (sym and action in ("read", "context")
+                    and not obs.startswith("ERROR")
+                    and sym not in resolved_symbols):
+                resolved_symbols.add(sym)
+                step_progress = True
             # An ERROR is navigation feedback, not source: record it compactly
             # so the SOURCE section does not look populated without code.
             if obs.startswith("ERROR"):
@@ -1491,6 +1627,8 @@ class Agent:
                     if verbose:
                         print("  [context budget exhausted; moving to answer]",
                               file=sys.stderr)
+                    break
+                if note_progress(False):      # an ERROR showed no new source
                     break
                 continue
             error_streak = 0
@@ -1559,6 +1697,9 @@ class Agent:
             if budget <= 0:
                 if verbose:
                     print("  [context budget exhausted; moving to answer]", file=sys.stderr)
+                break
+
+            if note_progress(step_progress):
                 break
 
         # P6 (A4.2): one bounded post-gather prefetch when named targets are
@@ -1712,6 +1853,9 @@ class Agent:
         obs = self._cap_observation("read", obs)
         if obs.startswith("ERROR"):
             return False
+        # Same token budget as live reads, so the ledger credits exactly the
+        # lines the prefetch actually displayed.
+        obs = self._clip_read_to_token_budget(obs)
         m = _READ_HEAD_RX.match(obs)
         if m:
             spans.setdefault(_norm_key(m.group(1)), []).append(
@@ -1792,6 +1936,7 @@ class Agent:
             obs = self._cap_observation("read", obs)
             if obs.startswith("ERROR"):
                 continue
+            obs = self._clip_read_to_token_budget(obs)
             m = _READ_HEAD_RX.match(obs)
             if m:
                 spans.setdefault(_norm_key(m.group(1)), []).append(

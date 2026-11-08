@@ -46,6 +46,15 @@ format), a small model cannot wander into unsupported actions. Recovery nudges
 fire once each for the classic stalls — re-reading the same range, repeating a
 step, a run of errors, or a `[STUCK:]` on identical actions.
 
+Two action-independent global leases back-stop the loop when `max_steps = 0`
+removes the fixed lookup cap: `max_total_model_calls` (default 30) is a hard
+ceiling on LLM invocations per task, and `max_no_progress_steps` (default 4)
+bounds consecutive gather steps that neither add a new unread line span to
+the read ledger nor resolve a new symbol — a run of greps, a run of errors,
+and a run of identical steps all count alike. Whichever ceiling trips first
+ends gather cleanly with a harness note appended to the conversation, and the
+run moves on to the answer phase with what was gathered.
+
 Why it helps: the loop itself is the biggest intelligence win — a ranked map,
 symbol resolution, and bounded lookups get a 4B model to the right 300 lines of
 a 12,000-line project without it having to hold the whole thing in context.
@@ -77,6 +86,16 @@ of zero-call checks catches the specific ways small models go wrong:
 - **Unread edits.** A SEARCH block that quotes lines the model never `read` is
   flagged: it is guessing, not editing. The read ledger tracks exactly which
   line spans were shown.
+- **Ledger-accurate token-budgeted reads.** Every `read`/`context` observation
+  is clipped to `max_read_tokens` (default 1200) *before* the source is shown
+  and before the span ledger sees it. The clip uses the server's calibrated
+  tokenizer when `pedacito calibrate` measured one, ~3.5 chars per token
+  otherwise, and truncates strictly at whole-line boundaries: the header is
+  rewritten to the delivered range and a `Use next_start=… to continue
+  reading.` hint tells the model where the cut landed. The ledger records
+  `(start, actual_end)` — not the requested range — so lines that were
+  clipped away are never falsely credited as read, and an edit quoting them
+  stays flagged as an unread edit.
 - **Citations.** A `file:line` claim about a file (or line) the model never saw
   is a warning; an invented path that doesn't resolve is reported too.
 - **Placeholders, stale references, moved imports.** `TODO`/`pass` stubs the
