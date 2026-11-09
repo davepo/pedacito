@@ -25,7 +25,7 @@
   --font: ui-monospace, "SF Mono", "JetBrains Mono", "Cascadia Code", Menlo,
           Consolas, "DejaVu Sans Mono", monospace;
   --mono: var(--font);
-  --left: 460px; --right: 340px; --term-h: 220px;
+  --left: 460px; --right: 340px; --term-h: 220px; --composer-h: 110px;
   color-scheme: dark;
 }
 /* Light -- GitHub Light */
@@ -383,8 +383,8 @@ textarea { resize: none; background: var(--panel); }
   overflow: hidden; text-overflow: ellipsis; }
 
 /* ------------------------------------------------------------------ chat -- */
-#messages { flex: 1 1 auto; overflow-y: auto; padding: 12px;
-  display: flex; flex-direction: column; gap: 10px; min-height: 0; background: var(--bg); }
+#messages { flex: 1 1 0; overflow-y: auto; padding: 12px;
+  display: flex; flex-direction: column; gap: 10px; min-height: 120px; background: var(--bg); }
 .hello { text-align: center; color: var(--muted); padding: 36px 18px; font-size: 13.5px;
   display: flex; flex-direction: column; align-items: center; gap: 8px; }
 .hello h3 { margin: 0 0 4px; font-size: 19px; letter-spacing: .5px; color: var(--text); font-weight: 800; }
@@ -482,11 +482,26 @@ details pre { background: var(--code-bg); border: 1px solid var(--line); border-
   border-radius: 5px; padding: 2px 7px; }
 #attachRow .attach button { border: none; background: none; padding: 0 3px; color: var(--muted); }
 #attachRow:empty { display: none; }
-#input { width: 100%; min-height: 64px; flex: none; background: var(--panel);
+#input { width: 100%; height: var(--composer-h); min-height: 64px; flex: none;
+  resize: vertical; background: var(--panel);
   font-family: var(--mono); font-size: 13px; }
+/* Composer splitter: the 6px grab strip at the very top edge of the composer
+ * (its negative margins cancel the composer's padding so it spans full width,
+ * hugging the border). A centered pill hints at the drag; hovering or dragging
+ * lights it in the accent color like the IDE's other splitters. */
+.composer-resizer { flex: none; height: 6px; margin: -8px -8px 0; cursor: ns-resize;
+  display: flex; align-items: center; justify-content: center; background: var(--panel2); }
+.composer-resizer::after { content: ""; width: 36px; height: 3px; border-radius: 2px;
+  background: var(--line); transition: background .12s; }
+.composer-resizer:hover::after, .composer-resizer.dragging::after { background: var(--accent); }
 #composerBtns { display: flex; gap: 8px; align-items: center; }
 #composerBtns #sendBtn { margin-left: auto; min-width: 92px; }
 #composerBtns #optsBtn { min-width: 86px; }
+/* Refine Prompt: a ghost button that breathes while the architect call runs
+ * (the animation overrides the dim `button:disabled` opacity while busy). */
+#refineBtn.busy { cursor: progress; animation: refine-pulse 1.2s ease-in-out infinite; }
+@keyframes refine-pulse { 0%, 100% { opacity: 1; } 50% { opacity: .35; } }
+#undoRefineBtn { color: var(--accent); }
 #sendHint { font-size: 11px; color: var(--ok); text-align: right; }
 /* Options box: a column of two blocks — the auto-fitting field grid, then the
  * wrapping checkbox row. `auto-fill` (not `auto-fit`) keeps one column per field

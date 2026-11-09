@@ -11,5 +11,7 @@
     if (w.left) r.setProperty('--left', w.left + 'px');
     if (w.right) r.setProperty('--right', w.right + 'px');
     if (w.term) r.setProperty('--term-h', w.term + 'px');
+    var ch = parseInt(localStorage.getItem('pedacito_composer_height') || '0', 10);
+    if (ch) r.setProperty('--composer-h', Math.max(64, ch) + 'px');
   } catch (e) {}
 })();

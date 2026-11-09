@@ -509,6 +509,68 @@ failing strategy forever. Pedacito already has the hard lease
   source line and resolves no new symbol, the normal no-progress note fires
   and the run moves to the answer phase with what it already gathered.
 
+### 17. The Prompt/Spec Architect
+
+Small models execute detailed specs well but invent structure when handed a
+one-line idea -- and in `auto`, that invented structure is what Step 7 will
+contradict. `pedacito/spec.py:refine_prompt` spends **one** schema-constrained
+call up front to turn a brief into a fixed five-section spec: *Objective /
+Files to Create or Modify / Interface Contracts / Requirements / Edge Cases /
+Verification*, with the original request appended verbatim so nothing is lost.
+(`--refine` on `ask`/`new`/`auto`; the GUI composer's **✦ Refine Prompt**
+button, with **↶ Undo Refine** to restore the brief.)
+
+- The user message carries a zero-LLM repo snapshot: up to 40 scored file
+  paths plus AST outlines of the files the prompt *mentions*. The architect
+  plans against the real tree ("modify `parser.py`", not `parser_v2.py`)
+  without a search phase.
+- The system prompt is written for 9B--35B instruct models: every contract is
+  one exact signature line, one spelling, defined once -- the vocabulary the
+  later steps will be locked to (see §18). Numbers and names the brief only
+  implies must be made explicit; extra features are forbidden.
+- **It cannot dead-end.** If the server is unreachable or answers nothing
+  usable, a deterministic fallback shapes the same sections from the snapshot,
+  so the button and the flag always return a spec of identical shape.
+- Cost: one call of ~3k tokens per task the user *starts*, replacing several
+  repair rounds caused by an under-specified first task.
+
+### 18. Contract-first interface locking & cross-file verification
+
+The documented killer of multi-step small-model plans is name drift: Step K
+forgets Step 1's function name, re-reads files at full token cost to
+rediscover it, or calls a signature that no longer exists. `interface_lock`
+(default on) closes that hole with a *lock* and a *gate*, shared by `auto`
+and `new --complex`:
+
+- **The lock.** Before every task, `extract_project_contracts` renders the
+  project's exact public surface -- `def parse_line(text, sep=',')`,
+  `class TableParser: __init__(encoding='utf-8')`, JS/TS `function`
+  signatures -- into a ~300-token block headed
+  `[PROJECT INTERFACE CONTRACTS — DO NOT BREAK SIGNATURES]` and injects it
+  into the task prompt. Files touched by the last step sort first so the
+  freshest contracts survive the cap; `new`'s build passes read the same map
+  ("PUBLIC API"). Deterministic AST/regex parsing: zero model tokens, no
+  subprocess, re-run per task.
+- **The gate.** After every applied task, beside the existing syntax gate,
+  `verify_cross_file_contracts` walks every local import and imported-name
+  call in the project: a `from parser import parse_row` that references a
+  symbol the module does not define, or a call whose argument count cannot
+  satisfy the real signature (defaults, `*args`/`**kwargs` respected), fails
+  the task *immediately* -- before any verify subprocess -- and the exact
+  diagnostic (`ContractError in cli.py:18: imports 'parse_row' from
+  parser.py, but parser.py only defines ['parse_line', 'TableParser']`) is
+  fed straight into the repair prompt instead of letting the error propagate
+  through three more steps.
+- **Deliberately conservative.** Unknown absolute imports are treated as
+  third-party, star-imports and shadowed names are trusted, classes without
+  an explicit `__init__` are never arity-checked: a false positive would
+  waste a repair round on a working project, which the technique exists to
+  prevent. The same drift listing also extends `new`'s `fix_api_mismatches`
+  repair and its final consistency warning.
+
+Together the two halves turn interfaces into a shared, checked fact of the
+plan rather than something each fresh context must rediscover.
+
 ---
 
 ## Techniques that exist but are not a good fit

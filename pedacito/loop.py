@@ -2548,7 +2548,16 @@ def run_loop(root: Path, cfg, client, idx, plan_path: Path, *,
         return True
 
     use_diag = (not verify) and bool(getattr(cfg, "auto_diagnostics", False))
-    check_label = f"$ {verify}" if verify else "project diagnostics"
+    check_label = (f"$ {verify}" if verify else
+                   "project diagnostics" if use_diag
+                   else "interface contracts")
+    spec_mod = None
+    if getattr(cfg, "interface_lock", True):
+        # Contract-first interface locking: every task sees the project's
+        # exact public signatures, and a deterministic cross-file gate runs
+        # after every task even with no --verify command configured.
+        from . import spec as _spec_mod
+        spec_mod = _spec_mod
 
     def run_check(changed):
         if verify:
@@ -2604,6 +2613,15 @@ def run_loop(root: Path, cfg, client, idx, plan_path: Path, *,
             task_for_agent = (
                 task_for_agent + "\n\nCONTEXT FROM PRIOR INVESTIGATION\n\n"
                 + "\n\n".join(context_notes))
+        if spec_mod is not None and not investigate:
+            # Interface lock: the live signature map rides ahead of the
+            # retry note so no step can forget what an earlier step wrote.
+            try:
+                cmap = spec_mod.contract_map_block(root)
+            except Exception:
+                cmap = ""
+            if cmap:
+                task_for_agent += "\n\n" + cmap
         if retry_note:
             # One-shot corrective note, appended last (freshest thing the
             # worker reads) and popped so it cannot leak into another task.
@@ -2839,16 +2857,35 @@ def run_loop(root: Path, cfg, client, idx, plan_path: Path, *,
         # typechecker findings for the changed files play the same role.
         passed = True
         dep_blocked: list[str] = []
-        if verify or use_diag:
+        if verify or use_diag or spec_mod is not None:
             from . import verify as verify_mod
 
             def _gated_check(result):
                 """Parse the applied buffers before starting any subprocess;
-                a new syntax error is an immediate, structured failure."""
+                a new syntax error is an immediate, structured failure. When
+                the runtime check passes, the cross-file contract gate gets
+                the same veto -- an import that cannot resolve is a failed
+                task even if the (possibly absent) test suite is green."""
                 syntax = verify_mod.check_syntax(
                     getattr(result, "results", None))
                 if not syntax:
-                    return run_check(result.changed)
+                    ok, out = run_check(result.changed)
+                    if ok and spec_mod is not None:
+                        try:
+                            bad = spec_mod.verify_cross_file_contracts(
+                                root, result.changed or [])
+                        except Exception:
+                            bad = []
+                        if bad:
+                            return False, (
+                                "CROSS-FILE INTERFACE CONTRACT VIOLATIONS\n"
+                                "(the names below do not exist in the module "
+                                "they are imported from, or the call cannot "
+                                "satisfy the real signature -- fix the "
+                                "exporter and every importer in one step; "
+                                "do not rename around the problem)\n\n"
+                                + "\n".join(f"- {e}" for e in bad))
+                    return ok, out
                 print(f"  [syntax: {len(syntax)} new syntax error(s); "
                       f"{check_label} subprocess skipped until the patch "
                       f"parses]", file=sys.stderr)

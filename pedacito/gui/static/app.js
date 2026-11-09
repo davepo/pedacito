@@ -243,7 +243,8 @@ const S = {
   opts: (() => { try { return JSON.parse(localStorage.getItem('pedacito_opts') || '{}'); } catch (e) { return {}; } })(),
   ui: { diffOpen: false, wsCollapsed: false, termFollow: true, optsOpen: false,
         diffMode: localStorage.getItem('pedacito_diff_mode') || 'split',
-        view: 'chat', folds: {}, planEditing: false, pendingProfile: null },
+        view: 'chat', folds: {}, planEditing: false, pendingProfile: null,
+        refining: false, previousPrompt: null },
   peek: null,
   how: { query: '', answer: null, loading: false, error: '', useModel: true },
 };
@@ -1226,6 +1227,55 @@ function dragTerm(paneRef) {
     setVar('--term-h', Math.max(60, Math.min(r.bottom - ev.clientY, r.height - 120)));
   });
 }
+// Composer splitter: the prompt textarea's height is the `--composer-h` CSS
+// variable (app.css default 110px, restored before first paint by theme.js),
+// clamped between 64px and 65% of the viewport so the bottom buttons always
+// stay on screen. Dragging trades height with the chat transcript above; the
+// final size persists under its own key, double-click toggles 320/96, and a
+// fresh refined spec auto-expands a too-small composer so it can be read.
+let composerH = 110;
+try {
+  const stored = parseInt(localStorage.getItem('pedacito_composer_height') || '', 10);
+  if (stored) composerH = stored;
+} catch (e) {}
+function clampComposerH(px) {
+  return Math.max(64, Math.min(Math.round(px), Math.round(window.innerHeight * 0.65)));
+}
+function setComposerH(px, save) {
+  composerH = clampComposerH(px);
+  setVar('--composer-h', composerH);
+  const el = $('input');
+  if (el) el.style.height = '';        // a native resize grip must not win
+  if (save) {
+    try { localStorage.setItem('pedacito_composer_height', String(composerH)); } catch (e) {}
+  }
+}
+function composerHeightNow() {
+  const el = $('input');
+  return (el && el.offsetHeight) || composerH;
+}
+function dragComposer(e) {
+  e.preventDefault();
+  const el = e.currentTarget;
+  const start = composerHeightNow(), y0 = e.clientY;
+  const move = (ev) => {
+    el.classList.add('dragging');
+    setComposerH(start + (y0 - ev.clientY));       // up = taller
+  };
+  const up = () => {
+    el.classList.remove('dragging');
+    document.body.style.userSelect = '';
+    document.removeEventListener('mousemove', move);
+    document.removeEventListener('mouseup', up);
+    setComposerH(composerHeightNow(), true);       // keep the final height
+  };
+  document.body.style.userSelect = 'none';
+  document.addEventListener('mousemove', move);
+  document.addEventListener('mouseup', up);
+}
+function toggleComposer() {
+  setComposerH(composerHeightNow() >= 200 ? 96 : 320, true);
+}
 function setView(v) {
   S.ui.view = v;
   document.body.dataset.view = v;
@@ -1679,6 +1729,51 @@ function ReviewCard(props) {
     </div>`;
 }
 
+// ---- Prompt/Spec Architect ----
+// One click turns the composer brief into a sectioned spec (objective, files,
+// interface contracts, requirements, edge cases, verification). The original
+// text is kept in S.ui.previousPrompt so the step can be undone, and repeated
+// refines keep the FIRST original -- undo always returns the untouched brief.
+function refinePrompt() {
+  const el = $('input');
+  const text = ((el && el.value) || '').trim();
+  if (!text || S.ui.refining) return;
+  S.ui.refining = true;
+  emit();
+  PDC.api('/api/spec/refine', { prompt: text, mode: S.mode }).then((j) => {
+    S.ui.refining = false;
+    if (j._status !== 200 || !j.ok || !j.refined) {
+      PDC.toast(j.detail || 'The spec architect did not answer.', true);
+      emit();
+      return;
+    }
+    if (S.ui.previousPrompt == null && el) S.ui.previousPrompt = el.value;
+    if (el) el.value = j.refined;
+    S.drafts[S.mode] = j.refined;
+    // A full spec is many lines: if the composer is compact, grow it just
+    // enough to read what came back (never shrink a user's larger setting).
+    if ((j.refined.match(/\n/g) || []).length > 8 && composerHeightNow() < 220) {
+      setComposerH(260, true);
+    }
+    PDC.toast(j.contracts && j.contracts.length
+      ? 'Refined \u00b7 ' + j.contracts.length + ' interface contract(s) fixed'
+      : 'Refined into a full spec.');
+    emit();
+  }, () => {
+    S.ui.refining = false;
+    PDC.toast('The GUI server did not answer.', true);
+    emit();
+  });
+}
+function undoRefine() {
+  if (S.ui.previousPrompt == null) return;
+  const el = $('input');
+  if (el) el.value = S.ui.previousPrompt;
+  S.drafts[S.mode] = S.ui.previousPrompt;
+  S.ui.previousPrompt = null;
+  emit();
+}
+
 // --------------------------------------------------------------- composer ----
 function Composer() {
   const s = S.status, j = job(), m = MODES[S.mode] || MODES.task;
@@ -1695,6 +1790,7 @@ function Composer() {
   const setMode = (k) => {
     if (taRef.current) S.drafts[S.mode] = taRef.current.value;
     S.mode = k;
+    S.ui.previousPrompt = null;
     try { localStorage.setItem('pedacito_mode', k); } catch (e) {}
     S.ui.optsOpen = false;
     emit();
@@ -1705,6 +1801,9 @@ function Composer() {
          ondragover=${(e) => { e.preventDefault(); }}
          ondragleave=${(e) => { e.currentTarget.classList.remove('drop'); }}
          ondrop=${(e) => { e.preventDefault(); e.currentTarget.classList.remove('drop'); if (e.dataTransfer && e.dataTransfer.files.length) attachFiles(e.dataTransfer.files); }}>
+      <div class="composer-resizer"
+           title="Drag to resize composer (double-click to toggle expand/compact)"
+           onMousedown=${dragComposer} onDblclick=${toggleComposer}></div>
       <div id="modeTabs">
         ${MODE_ORDER.map((k) => html`
           <button key=${k} class=${k === S.mode ? 'on' : ''} onClick=${() => setMode(k)}>${MODES[k].label}</button>`)}
@@ -1726,7 +1825,9 @@ function Composer() {
       <textarea id="input" rows="3" spellcheck="true" ref=${taRef}
                 placeholder=${isHow ? m.ph : (j ? (steerable ? 'Type a note to steer the model (Enter)\u2026' : 'Working\u2026 press Stop to cancel.') : m.ph)}
                 disabled=${!!j && !steerable && !isHow}
-                oninput=${(e) => { S.drafts[S.mode] = e.target.value; }}
+                oninput=${(e) => { S.drafts[S.mode] = e.target.value;
+                  const rb = $('refineBtn');
+                  if (rb) rb.disabled = S.ui.refining || !e.target.value.trim(); }}
                 onkeydown=${(e) => { if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) { e.preventDefault(); send(); } }} />
       <div id="optsBox" key=${S.mode} hidden=${!S.ui.optsOpen}>
         <div class="opts-grid">${OPTS[S.mode].filter((o) => o.type !== 'check').map((o, idx) => html`<${OptField} key=${'g' + idx} o=${o} />`)}</div>
@@ -1738,6 +1839,13 @@ function Composer() {
                 disabled=${!!j} onClick=${() => $('filePick').click()}>\uD83D\uDCCE Attach</button>
         <button id="optsBtn" class="ghost" hidden=${!OPTS[S.mode].length}
                 onClick=${() => { S.ui.optsOpen = !S.ui.optsOpen; emit(); }}>Options \u25BE</button>
+        <button id="refineBtn" class="ghost${S.ui.refining ? ' busy' : ''}" hidden=${isHow}
+                title="expand this brief into a full spec with interface contracts (one architect call)"
+                disabled=${!!j || S.ui.refining || !(S.drafts[S.mode] || '').trim()}
+                onClick=${refinePrompt}>${S.ui.refining ? '\u2726 Refining\u2026' : '\u2726 Refine Prompt'}</button>
+        <button id="undoRefineBtn" class="ghost" hidden=${isHow || S.ui.previousPrompt == null}
+                title="restore the prompt as it was before refining"
+                onClick=${undoRefine}>↶ Undo Refine</button>
         <span class="grow muted small-text" id="sendHint">${isHow ? 'answers stay out of this chat thread' : (steerable ? 'delivered at the next lookup step' : '')}</span>
         <button id="sendBtn" class=${isHow ? 'primary' : (j ? 'danger' : 'primary')}
                 disabled=${!!(j && j.cancelled && !isHow)}

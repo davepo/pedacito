@@ -649,6 +649,27 @@ def _strict_task_error(args, tr) -> str:
     return ""
 
 
+def _refine_task_text(cfg, client, root: Path, text: str, mode: str) -> str:
+    """`--refine`: one Prompt/Spec Architect pass over a brief idea before it
+    drives any pipeline. Prints the expanded, sectioned spec (objective /
+    files / interface contracts / requirements / verification) to stderr and
+    returns it; the original text comes back untouched if even the architect's
+    deterministic fallback cannot run, so --refine never dead-ends a command."""
+    from . import spec as spec_mod
+    try:
+        got = spec_mod.refine_prompt(
+            text, root, cfg, roles_mod.client_for(cfg, "planner", client),
+            mode=mode)
+    except Exception as e:                       # must not lose the task
+        print(f"  [refine failed ({e}); using the original prompt]",
+              file=sys.stderr)
+        return text
+    print("  [prompt refined by the spec architect -- the run below uses "
+          "this spec]", file=sys.stderr)
+    print(got["refined"], file=sys.stderr)
+    return got["refined"]
+
+
 def _cmd_auto(args, cfg, client, idx, root: Path) -> int:
     """`pedacito auto`: generate a task list from a goal (or reuse a plan
     file), then implement every unchecked task in a fresh context window,
@@ -678,6 +699,8 @@ def _cmd_auto(args, cfg, client, idx, root: Path) -> int:
         spec = scaffold.load_spec(
             prompt=args.task, spec_file=args.spec,
             max_chars=cfg.max_spec_chars)
+        if getattr(args, "refine", False):
+            spec.text = _refine_task_text(cfg, client, root, spec.text, "auto")
         # The full spec travels with every task prompt so constraints dropped
         # from the title still bind the worker.
         spec_text = spec.text
@@ -1719,6 +1742,11 @@ def _main(argv=None) -> int:
                        help="never auto-plan this task")
     p_ask.add_argument("--review-plan", dest="review_plan", action="store_true",
                        help="show the plan and ask before running it")
+    p_ask.add_argument("--refine", action="store_true",
+                       help="expand the task into a repo-aware specification "
+                            "(objective, files, interface contracts, edge "
+                            "cases, verification) with the spec architect "
+                            "before running it")
 
     p_explain = sub.add_parser(
         "explain", help="answer questions about an indexed project's code")
@@ -1776,6 +1804,10 @@ def _main(argv=None) -> int:
     p_new.add_argument("--profile", metavar="NAME",
                        help="apply a [profiles.NAME] block from your config")
     p_new.add_argument("--no-review", dest="no_review", action="store_true")
+    p_new.add_argument("--refine", action="store_true",
+                       help="expand the project description into a concrete, "
+                            "sectioned spec (with interface contracts) before "
+                            "planning")
 
     p_auto = sub.add_parser(
         "auto", help="autonomous loop: plan a goal, then implement its tasks "
@@ -1801,6 +1833,10 @@ def _main(argv=None) -> int:
                         help="after each task, run the project's detected "
                              "linter/typechecker and feed findings into the "
                              "repair rounds (only when --verify is not set)")
+    p_auto.add_argument("--refine", action="store_true",
+                        help="expand the goal into a concrete, sectioned spec "
+                             "(objective, files, interface contracts, edge "
+                             "cases, verification) before planning tasks")
     p_auto.add_argument("--worktree", default="",
                         help="run the plan in an isolated git worktree "
                              ".pedacito/worktrees/NAME (created from --base, "
@@ -2296,6 +2332,9 @@ def _main(argv=None) -> int:
             spec = scaffold.load_spec(
                 prompt=args.task, spec_file=args.spec,
                 max_chars=cfg.max_spec_chars)
+            if getattr(args, "refine", False):
+                spec.text = _refine_task_text(cfg, client, root, spec.text,
+                                              "new")
             code = scaffold.run_new(
                 root, cfg, client, spec,
                 apply=args.apply, review=args.review,
@@ -2432,10 +2471,14 @@ def _main(argv=None) -> int:
                        "applied": bool(getattr(tr, "applied", False))})
 
         if args.cmd == "ask":
+            ask_task = args.task
+            if getattr(args, "refine", False):
+                ask_task = _refine_task_text(cfg, client, root, ask_task,
+                                             "ask")
             try:
-                run(args.task)
+                run(ask_task)
                 try:
-                    save_checkpoint(args.task)
+                    save_checkpoint(ask_task)
                 except (OSError, ValueError):
                     pass                 # checkpointing must not lose the task
             except KeyboardInterrupt:

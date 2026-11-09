@@ -457,6 +457,12 @@ class Config:
     auto_smoke_timeout: int = 20
     # Repair rounds for a failing runtime verification.
     auto_verify_rounds: int = 2
+    # Contract-first interface locking (`pedacito/spec.py`): every `auto` /
+    # `new --complex` task carries the project's exact public signatures, and
+    # a deterministic cross-file gate (local `from x import y` existence +
+    # call arity) runs after each edit, feeding violations into the repair
+    # round. Off = neither the map nor the gate.
+    interface_lock: bool = True
 
     # --- Reasoning models -----------------------------------------------------
     # Reasoning blocks (<think>, [THINK], <seed:think>, harmony channels) are
@@ -2133,6 +2139,7 @@ auto_install_deps = false
 auto_smoke = true
 auto_smoke_timeout = 20
 auto_verify_rounds = 2
+interface_lock = true
 
 # Project scaffolding (`pedacito new`).
 max_new_files = 24

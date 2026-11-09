@@ -684,6 +684,19 @@ def _existing_map(idx, plan: Plan, cfg, max_files: int = 12,
     return text[:max_chars]
 
 
+def _interface_map(idx, plan: Plan, cfg) -> str:
+    """The most accurate signature listing available for a build pass: the
+    spec module's contract extraction reading the tree directly (exact
+    `def foo(x, y=1)` / `class Bar: __init__(...)` text), falling back to the
+    index-derived `_existing_map`. This is New mode's interface lock."""
+    try:
+        from . import spec as _spec
+        got = _spec.extract_project_contracts(idx.root)
+    except Exception:
+        got = ""
+    return got or _existing_map(idx, plan, cfg)
+
+
 # Message prefix for a build_pass result that accepted an honest "this file
 # needs no edit" reply. build_project routes those files into a separate
 # summary bucket so a file the interface stage already finished is reported
@@ -779,7 +792,7 @@ def build_pass(client, cfg, idx, plan: Plan, target: PlannedFile,
             for f in plan.files),
         "",
         "PUBLIC API (signatures every file imports by)\n" +
-        (_existing_map(idx, plan, cfg) or "(nothing yet)"),
+        (_interface_map(idx, plan, cfg) or "(nothing yet)"),
         "",
         f"YOUR FILE: {target.path}",
         f"It currently contains this stubbed interface:\n```python\n{stub}\n```",
@@ -1011,16 +1024,31 @@ def fix_api_mismatches(client, cfg, idx: Index, plan: Plan, backup_dir,
     for _ in range(rounds):
         sources = _py_sources(idx.root, [f.path for f in plan.files])
         problems = apicheck.find_mismatches(sources)
-        if not problems:
+        drift: list[str] = []
+        if getattr(cfg, "interface_lock", True):
+            # apicheck only compares calls to definitions it can see in the
+            # same flat source map; the spec verifier adds what it misses --
+            # imports of names the target module never defines and cross-file
+            # arity drift that survives the per-file check.
+            try:
+                from . import spec as _spec
+                drift = _spec.verify_cross_file_contracts(idx.root)
+            except Exception:
+                drift = []
+        if not problems and not drift:
             break
         listing = "\n".join(f"- {p}" for p in problems[:40])
+        if drift:
+            listing += ("\n" if listing else "") + "\n".join(
+                f"- {d}" for d in drift[:20])
         files = "\n\n".join(
             f"### {rel}\n```python\n{text}\n```"
             for rel, text in sorted(sources.items()))
         user = (
             f"TASK\n{plan.project_name}: make every call match its definition.\n\n"
-            "These calls pass the wrong number of arguments and would crash at "
-            "runtime:\n" + listing + "\n\n"
+            "These calls pass the wrong number of arguments, or import names "
+            "their module never defines, and would crash at runtime:\n"
+            + listing + "\n\n"
             "CURRENT FILES\n" + files + "\n\n"
             "Emit search/replace blocks that fix each listed mismatch: either "
             "pass the missing argument(s) at the call site, or give the "
@@ -1401,12 +1429,21 @@ def _run_complex(root: Path, cfg, client, idx, plan: Plan, spec: Spec, *,
                       file=sys.stderr)
             problems = apicheck.find_mismatches(
                 _py_sources(root, [f.path for f in plan.files]))
-            if problems:
+            drift: list[str] = []
+            if getattr(cfg, "interface_lock", True):
+                try:
+                    from . import spec as _spec
+                    drift = _spec.verify_cross_file_contracts(root)
+                except Exception:
+                    drift = []
+            if problems or drift:
                 print("\n  [warning] call/signature mismatches remain:\n"
-                      + "\n".join(f"    {p}" for p in problems[:10]),
+                      + "\n".join(f"    {p}" for p in
+                                  [str(x) for x in problems[:10]] + drift[:10]),
                       file=sys.stderr)
+                first = (problems[0] if problems else drift[0])
                 workspace.log_event(root,
-                                    f"api mismatches remain: {problems[0]}",
+                                    f"api mismatches remain: {first}",
                                     "ERROR")
                 if code == 0:
                     code = 1

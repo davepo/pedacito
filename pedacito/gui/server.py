@@ -475,6 +475,43 @@ def _plan_save(q, body):
     return 200, {"ok": True}
 
 
+@post("/api/spec/refine")
+def _spec_refine(q, body):
+    """Prompt/Spec Architect: expand a brief composer prompt into a concrete,
+    repo-aware spec (objective / files / interface contracts / requirements /
+    edge cases / verification). Synchronous -- the server is threaded and no
+    run job is disturbed -- and `refine_prompt` always answers: if the model
+    is unreachable the deterministic architect shapes the same sections, so
+    the button never dead-ends."""
+    text = str(body.get("prompt", ""))
+    if not text.strip():
+        return 400, {"ok": False, "detail": "Type what to build first."}
+    mode = str(body.get("mode") or "auto")
+    profile = str(body.get("profile") or "")
+    with STATE.lock:
+        root, cfg, client = STATE.root, STATE.cfg, STATE.client
+    if root is None:
+        return 400, {"ok": False, "detail": "Open a project first."}
+    if profile and profile != getattr(STATE, "profile_request", ""):
+        # Refine with the chosen profile's model without re-opening the
+        # session: build a throwaway cfg+client for this one call.
+        try:
+            from .. import cli as cli_mod
+            from ..llm import LLMClient
+            from .core import args_for
+            cfg = cli_mod._config(args_for(str(root), profile))
+            client = LLMClient(cfg)
+        except Exception:
+            pass                       # keep the session's cfg+client
+    from .. import spec as spec_mod
+    try:
+        got = spec_mod.refine_prompt(text, root, cfg, client, mode=mode)
+    except Exception as e:
+        return 200, {"ok": False, "detail": f"refine failed: {e}"}
+    return 200, {"ok": True, "refined": got["refined"],
+                 "original": got["original"], "contracts": got["contracts"]}
+
+
 @post("/api/clear")
 def _clear(q, body):
     STATE.clear_messages()
