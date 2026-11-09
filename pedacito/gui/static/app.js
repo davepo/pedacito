@@ -210,6 +210,7 @@ const S = {
         diffMode: localStorage.getItem('pedacito_diff_mode') || 'split',
         view: 'chat', folds: {}, planEditing: false, pendingProfile: null },
   peek: null,
+  how: { query: '', answer: null, loading: false, error: '', useModel: true },
 };
 PDC.S = S;
 
@@ -297,9 +298,21 @@ const MODES = {
     ph: 'e.g. add CSV export to the report page, with tests' },
   'new': { label: 'New', send: 'Create',
     hint: 'Describe a project to start from scratch in a new folder.',
-    ph: 'e.g. a CLI todo manager with sqlite storage and a --json flag' }
+    ph: 'e.g. a CLI todo manager with sqlite storage and a --json flag' },
+  how: { label: 'How ?', send: 'Ask',
+    hint: 'Ask how to do anything in the CLI or where a setting/feature lives in the GUI. Answers stay out of your coding thread and work even before a model is configured.',
+    ph: 'e.g. how do I disable thinking?' }
 };
-const MODE_ORDER = ['explain', 'task', 'auto', 'new'];
+const MODE_ORDER = ['explain', 'task', 'auto', 'new', 'how'];
+const HOW_TOPICS = [
+  ['Switch or import models', 'How do I switch models or import a new model?'],
+  ['Tune settings for small models', 'How do I tune settings for small models?'],
+  ['Toggle reasoning / thinking', 'How do I disable model thinking or reasoning?'],
+  ['CLI vs GUI cheat sheet', 'Show me a CLI vs GUI cheat sheet'],
+  ['Undo / restore backups', 'How do I undo an Auto or Edit run and restore a backup?'],
+  ['Reset config to baseline', 'How do I reset my settings or config to the baseline?'],
+  ['Reference a file in chat', 'How do I reference a file in chat?']
+];
 const OPTS = {
   task: [
     { k: 'write', label: 'Writing', type: 'select', def: 'review', opts: [['review', 'Review before writing'], ['apply', 'Write directly (backup first)']] },
@@ -332,7 +345,8 @@ const OPTS = {
     { k: 'force', label: 'Allow a non-empty folder', type: 'check', def: false },
     { k: 'keep_going', label: 'Keep going after a failure', type: 'check', def: false },
     { k: 'auto_install', label: 'Pip-install missing modules', type: 'check', def: false }
-  ]
+  ],
+  how: []
 };
 if (!MODES[S.mode]) S.mode = 'task';
 function opt(mode, k) {
@@ -601,9 +615,59 @@ PDC.startRun = (payload) => PDC.api('/api/run', payload).then((j) => {
 });
 const stick = { current: true };          // chat auto-follow flag
 function stop() { PDC.api('/api/stop', {}).then(refreshState); }
+
+// ---- How / Help -------------------------------------------------------------
+function askHow(query) {
+  query = (query || '').trim();
+  if (!query) return;
+  S.how.query = query;
+  S.how.loading = true;
+  S.how.error = '';
+  S.how.answer = null;
+  emit();
+  PDC.api('/api/how', { query: query, use_model: !!S.how.useModel }).then((j) => {
+    S.how.loading = false;
+    if (j._status !== 200 || !j.ok) {
+      S.how.error = j.detail || 'Could not build a help answer.';
+    } else {
+      S.how.answer = j;
+    }
+    emit();
+  }, () => {
+    S.how.loading = false;
+    S.how.error = 'The GUI server did not answer.';
+    emit();
+  });
+}
+function copyText(text) {
+  const done = () => PDC.toast('Copied to the clipboard.');
+  if (navigator.clipboard && navigator.clipboard.writeText) {
+    navigator.clipboard.writeText(text).then(done, () => fallbackCopy(text, done));
+  } else fallbackCopy(text, done);
+}
+function fallbackCopy(text, done) {
+  const ta = h('textarea', { value: text, style: 'position:fixed;left:-9999px;top:0' });
+  document.body.appendChild(ta);
+  ta.select();
+  try { document.execCommand('copy'); done(); }
+  catch (e) { PDC.toast('Copy failed; select the command manually.', true); }
+  ta.remove();
+}
+function openSetting(name) {
+  if (name === 'default_profile') { callSettings({ tab: 'profiles' }); return; }
+  callSettings({ tab: 'all', search: name });
+}
+
 function send() {
   const s = S.status, j = s.job;
   const text = (S.drafts[S.mode] || '').trim();
+  if (S.mode === 'how') {
+    if (!text) { PDC.toast('Type a question first.', true); return; }
+    S.drafts.how = '';
+    if (inputEl) inputEl.value = '';
+    askHow(text);
+    return;
+  }
   if (j) {
     if (!text) return;
     if (j.kind === 'task' && s.allow_steering) {
@@ -1076,6 +1140,120 @@ function MenuItem(props) {
                        onClick=${() => { if (!props.disabled) props.action(); }}>${props.label}</button>`;
 }
 
+// ---------------------------------------------------------------- how tab ----
+function PathBadges(props) {
+  const parts = String(props.text || '').split(/\s*→\s*/);
+  return html`<span class="how-path">${parts.map((p, i) =>
+    html`<span key=${i} class="how-step">${p}</span>`)}</span>`;
+}
+
+function CopyBlock(props) {
+  return html`<div class=${'how-cmd' + (props.lang ? ' ' + props.lang : '')}>
+    <pre><code>${props.text}</code></pre>
+    <button class="ghost small" title="copy to the clipboard"
+            onClick=${() => copyText(props.text)}>Copy</button>
+  </div>`;
+}
+
+function HowFlags(props) {
+  const flags = props.flags || [];
+  const common = props.common || [];
+  if (!flags.length && !common.length) return null;
+  return html`<details class="how-flags">
+    <summary>Flags (${flags.length}${common.length ? ' + ' + common.length + ' common' : ''})</summary>
+    <ul>
+      ${flags.map((f, i) => html`<li key=${'f' + i}><code>${f.flag}</code> — ${f.help}</li>`)}
+      ${common.length ? html`<li class="muted"><b>Common project flags</b></li>` : null}
+      ${common.map((f, i) => html`<li key=${'c' + i}><code>${f.flag}</code> — ${f.help}</li>`)}
+    </ul>
+  </details>`;
+}
+
+function HowAnswer(props) {
+  const r = props.r || {};
+  const M = r.matches || {};
+  const gui = M.gui || [], cli = M.cli || [], settings = M.settings || [];
+  return html`<div class="how-answer">
+    <div class="how-meta">
+      <span class=${'tag ' + (r.used_model ? 'act' : '')}>${r.used_model ? 'model synthesis' : 'deterministic reference'}</span>
+      ${r.model_error ? html`<span class="muted small-text">model skipped: ${r.model_error}</span>` : null}
+    </div>
+    ${r.used_model && r.answer ? html`<div class="how-model md">${md(r.answer)}</div>` : null}
+    ${gui.length ? html`<section class="how-sec">
+      <h4>In the GUI</h4>
+      ${gui.map((item, i) => html`<div key=${'g' + i} class="how-card">
+        <div class="how-card-title">${item.title}</div>
+        <div class="how-desc">${item.summary}</div>
+        ${(item.steps || []).map((s, n) => html`<div key=${n} class="how-step-row">
+          <${PathBadges} text=${s} /></div>`)}
+      </div>`)}
+    </section>` : null}
+    ${cli.length ? html`<section class="how-sec">
+      <h4>In the Terminal (CLI)</h4>
+      ${cli.map((item, i) => html`<div key=${'c' + i} class="how-card">
+        <div class="how-card-title"><code>pedacito ${item.name}</code></div>
+        <div class="how-desc">${item.summary}</div>
+        <div class="muted small-text"><code>${item.usage}</code></div>
+        ${(item.examples || []).map((ex, n) => html`<${CopyBlock} key=${n} text=${ex} lang="sh" />`)}
+        <${HowFlags} flags=${item.flags} common=${item.common ? (r.common_flags || []) : []} />
+      </div>`)}
+    </section>` : null}
+    ${settings.length ? html`<section class="how-sec">
+      <h4>Relevant Settings (<code>config.toml</code>)</h4>
+      ${settings.map((item, i) => html`<div key=${'s' + i} class="how-card">
+        <div class="how-card-title"><code>${item.key}</code>
+          <span class="tag">${item.default_text}</span></div>
+        <div class="how-desc">${item.help}</div>
+        <div class="how-step-row"><${PathBadges} text=${item.gui} /></div>
+        <div class="row how-actions">
+          <button class="small" onClick=${() => openSetting(item.key)}>Open in Settings</button>
+          ${item.profile_gui ? html`<span class="muted small-text">${item.profile_gui}</span>` : null}
+        </div>
+        <${CopyBlock} text=${item.toml} lang="toml" />
+      </div>`)}
+    </section>` : null}
+    ${!gui.length && !cli.length && !settings.length ? html`
+      <div class="tip">No reference item matched that question. Try one of the
+      topic chips above, or ask about a command, a GUI panel, or a setting
+      name.</div>` : null}
+  </div>`;
+}
+
+function HowPane() {
+  const hw = S.how;
+  const ask = (q) => {
+    S.drafts.how = q;
+    if (inputEl) {
+      inputEl.value = q;
+      inputEl.focus();
+      inputEl.selectionStart = inputEl.selectionEnd = q.length;
+    }
+    askHow(q);
+  };
+  return html`<div id="howPane">
+    <div class="how-hero">
+      <h3>How / Help</h3>
+      <div class="how-lede">Ask how to do anything in the CLI, where a feature
+        lives in the GUI, or what a setting does. This pane never touches your
+        coding thread, and the reference answer works without a model.</div>
+      <div class="how-chips">
+        ${HOW_TOPICS.map((t, i) => html`<button key=${i} class="how-chip"
+          onClick=${() => ask(t[1])}>${t[0]}</button>`)}
+      </div>
+      <label class="chk how-model"><input type="checkbox" checked=${hw.useModel}
+        onchange=${(e) => { S.how.useModel = e.target.checked; emit(); }} />
+        Use model synthesis when a model server is reachable (falls back to the
+        built-in reference automatically)</label>
+    </div>
+    ${hw.query ? html`<div class="how-question"><span class="tag">question</span>
+      <b>${hw.query}</b></div>` : null}
+    ${hw.loading ? html`<div class="tip">Searching the CLI, GUI navigation and
+      settings reference…</div>` : null}
+    ${hw.error ? html`<div class="note-box err">${hw.error}</div>` : null}
+    ${hw.answer && !hw.loading ? html`<${HowAnswer} r=${hw.answer} />` : null}
+  </div>`;
+}
+
 // ------------------------------------------------------------------- chat ----
 function MessageList() {
   const listRef = useRef(null);
@@ -1087,6 +1265,7 @@ function MessageList() {
     const el = listRef.current;
     stick.current = !el || el.scrollHeight - el.scrollTop - el.clientHeight < 90;
   };
+  if (S.mode === 'how') return html`<${HowPane} />`;
   const msgs = S.msgs;
   return html`
     <div id="messages" ref=${listRef} onscroll=${onscroll}>
@@ -1106,6 +1285,7 @@ function Hello() {
         <li><b>Task/Edit</b> changes code and stages the diff beside the chat.</li>
         <li><b>Auto</b> plans a goal and works through the checklist.</li>
         <li><b>New</b> starts a project from scratch.</li>
+        <li><b>How ?</b> explains CLI commands, GUI paths and settings.</li>
       </ul>
       ${s.needs_setup
         ? html`<button class="primary" onClick=${() => callSettings()}>Set up your model server</button>`
@@ -1246,8 +1426,9 @@ function Composer() {
       inputEl = taRef.current;
     }
   }, [S.mode]);
-  const needIndex = s.root && !s.has_index && S.mode !== 'new';
+  const needIndex = s.root && !s.has_index && S.mode !== 'new' && S.mode !== 'how';
   const steerable = j && j.kind === 'task' && s.allow_steering;
+  const isHow = S.mode === 'how';
   const setMode = (k) => {
     if (taRef.current) S.drafts[S.mode] = taRef.current.value;
     S.mode = k;
@@ -1266,7 +1447,7 @@ function Composer() {
           <button key=${k} class=${k === S.mode ? 'on' : ''} onClick=${() => setMode(k)}>${MODES[k].label}</button>`)}
       </div>
       <p id="modeHint">
-        ${!s.root && S.mode !== 'new' ? 'Open a project first. ' : null}
+        ${!s.root && S.mode !== 'new' && S.mode !== 'how' ? 'Open a project first. ' : null}
         ${needIndex
           ? html`No index yet \u2014 build one to start:
               <button class="small primary" disabled=${!!j} onClick=${() => buildIndex(true)}>Build index</button>
@@ -1280,8 +1461,8 @@ function Composer() {
           </span>`)}
       </div>
       <textarea id="input" rows="3" spellcheck="true" ref=${taRef}
-                placeholder=${j ? (steerable ? 'Type a note to steer the model (Enter)\u2026' : 'Working\u2026 press Stop to cancel.') : m.ph}
-                disabled=${!!j && !steerable}
+                placeholder=${isHow ? m.ph : (j ? (steerable ? 'Type a note to steer the model (Enter)\u2026' : 'Working\u2026 press Stop to cancel.') : m.ph)}
+                disabled=${!!j && !steerable && !isHow}
                 oninput=${(e) => { S.drafts[S.mode] = e.target.value; }}
                 onkeydown=${(e) => { if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) { e.preventDefault(); send(); } }} />
       <div id="optsBox" key=${S.mode} hidden=${!S.ui.optsOpen}>
@@ -1290,14 +1471,17 @@ function Composer() {
       </div>
       <div id="composerBtns">
         <button id="attachBtn" title="attach a text file (or drop one here)"
+                hidden=${isHow}
                 disabled=${!!j} onClick=${() => $('filePick').click()}>\uD83D\uDCCE Attach</button>
         <button id="optsBtn" class="ghost" hidden=${!OPTS[S.mode].length}
                 onClick=${() => { S.ui.optsOpen = !S.ui.optsOpen; emit(); }}>Options \u25BE</button>
-        <span class="grow muted small-text" id="sendHint">${steerable ? 'delivered at the next lookup step' : ''}</span>
-        <button id="sendBtn" class=${j ? 'danger' : 'primary'} disabled=${!!(j && j.cancelled)}
-                onClick=${() => { if (j) stop(); else send(); }}>
-          ${j ? (j.cancelled ? 'Stopping\u2026' : 'Stop')
-              : (S.mode === 'auto' ? (opt('auto', 'plan_only') ? 'Plan only' : 'Apply & run') : m.send)}
+        <span class="grow muted small-text" id="sendHint">${isHow ? 'answers stay out of this chat thread' : (steerable ? 'delivered at the next lookup step' : '')}</span>
+        <button id="sendBtn" class=${isHow ? 'primary' : (j ? 'danger' : 'primary')}
+                disabled=${!!(j && j.cancelled && !isHow)}
+                onClick=${() => { if (isHow) send(); else if (j) stop(); else send(); }}>
+          ${isHow ? (S.how.loading ? 'Asking\u2026' : 'Ask')
+              : (j ? (j.cancelled ? 'Stopping\u2026' : 'Stop')
+              : (S.mode === 'auto' ? (opt('auto', 'plan_only') ? 'Plan only' : 'Apply & run') : m.send))}
         </button>
         <input type="file" id="filePick" multiple hidden
                onchange=${(e) => { attachFiles(e.target.files); e.target.value = ''; }} />
@@ -1764,9 +1948,10 @@ function App() {
       <main id="app" ref=${appRef} data-diff=${dm}>
         <section class="panel" id="chatPanel">
           <div class="panel-head">
-            <h2>Chat</h2>
+            <h2>${S.mode === 'how' ? 'How / Help' : 'Chat'}</h2>
             <span class="muted small-text grow" id="busyLbl">
               ${s.job ? (s.job.cancelled ? 'stopping\u2026' : s.job.title + '\u2026') : ''}</span>
+            ${S.mode === 'how' ? html`<span class="muted small-text">CLI commands \u00b7 GUI paths \u00b7 settings</span>` : null}
             ${dm === 'collapsed' ? html`
               <button class="small primary" id="diffPill" title="show the staged diff beside the chat"
                       onClick=${() => { S.ui.diffOpen = true; emit(); }}>
@@ -1814,9 +1999,9 @@ function App() {
 // PDC exists, so its Settings dialog stays available without a rewrite.
 let settingsReady = false;
 const settingsPromise = import('./settings.js').then(() => { settingsReady = true; }, () => {});
-function callSettings() {
-  if (settingsReady) { if (PDC.openSettings) PDC.openSettings(); }
-  else settingsPromise.then(() => { if (PDC.openSettings) PDC.openSettings(); });
+function callSettings(opts) {
+  if (settingsReady) { if (PDC.openSettings) PDC.openSettings(opts); }
+  else settingsPromise.then(() => { if (PDC.openSettings) PDC.openSettings(opts); });
 }
 
 // ------------------------------------------------------------------- boot ----

@@ -291,6 +291,50 @@ def _settings(q, body=None):
     return 200, settings_api.payload()
 
 
+def _how_config():
+    """The live config, or a harmless default when no project is open."""
+    from .. import config as config_mod
+    with STATE.lock:
+        root, cfg = STATE.root, STATE.cfg
+    if cfg is not None:
+        return cfg
+    try:
+        return config_mod.load(root=root or Path.cwd(),
+                               require_hardware=False, warn_budgets=False)
+    except ConfigError:
+        return config_mod.Config()
+
+
+def _how_reply(query: str, use_model: bool):
+    """Shared GET/POST implementation for the How / Help tab."""
+    from .. import how as how_mod
+    query = " ".join(str(query or "").split())
+    if not query:
+        return 400, {"ok": False, "detail": "Ask a question first."}
+    try:
+        return 200, how_mod.answer_structured(
+            query, cfg=_how_config(), use_model=use_model)
+    except how_mod.HowError as e:
+        return 400, {"ok": False, "detail": str(e)}
+
+
+@get("/api/how")
+def _how_get(q, body=None):
+    raw = q.get("use_model", ["0"])[0].lower()
+    return _how_reply(q.get("q", [""])[0],
+                      raw in ("1", "true", "yes", "on"))
+
+
+@post("/api/how")
+def _how_post(q, body):
+    raw = body.get("use_model", False)
+    if isinstance(raw, str):
+        use_model = raw.strip().lower() in ("1", "true", "yes", "on")
+    else:
+        use_model = bool(raw)
+    return _how_reply(str(body.get("query", "")), use_model)
+
+
 @post("/api/peek")
 def _peek(q, body):
     """Profile names for a folder, without opening it: reads the config files

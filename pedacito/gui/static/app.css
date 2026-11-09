@@ -837,6 +837,53 @@ details pre { background: var(--code-bg); border: 1px solid var(--line); border-
 .tune-table tr.same td:nth-child(2), .tune-table tr.same td:nth-child(3) { color: var(--muted); }
 .tune-table tr.diff td:nth-child(3) { color: var(--accent); font-weight: 700; }
 
+/* ------------------------------------------------------------- how / help -- */
+/* The How tab lives where the transcript normally is, so asking a help
+   question never inserts turns into the project's saved chat thread. */
+#howPane { flex: 1 1 auto; overflow-y: auto; padding: 14px;
+  display: flex; flex-direction: column; gap: 12px; }
+.how-hero { border: 1px solid var(--line); border-radius: 10px;
+  background: var(--panel2); padding: 13px 14px; display: flex;
+  flex-direction: column; gap: 8px; }
+.how-hero h3 { margin: 0; font-size: 16px; letter-spacing: .2px; }
+.how-lede { color: var(--muted); font-size: 12.5px; max-width: 76ch; }
+.how-chips { display: flex; flex-wrap: wrap; gap: 6px; }
+.how-chip { font-size: 12px; border: 1px solid var(--accent); color: var(--accent);
+  background: var(--accent-soft); border-radius: 999px; padding: 4px 11px; }
+.how-chip:hover { background: var(--accent); color: var(--accent-fg); }
+.how-model { font-size: 11.5px; color: var(--muted); }
+.how-question { display: flex; gap: 8px; align-items: center; font-size: 13px; }
+.how-answer { display: flex; flex-direction: column; gap: 10px; }
+.how-meta { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+.how-model.md { border-left: 3px solid var(--accent); padding: 2px 0 2px 12px; }
+.how-sec h4 { margin: 5px 0 8px; font-size: 11.5px; letter-spacing: .8px;
+  text-transform: uppercase; color: var(--accent); }
+.how-card { border: 1px solid var(--line); border-radius: 10px;
+  background: var(--panel2); padding: 10px 12px; margin-bottom: 9px; }
+.how-card-title { display: flex; align-items: center; flex-wrap: wrap; gap: 8px;
+  font-weight: 700; font-size: 13px; margin-bottom: 4px; }
+.how-desc { color: var(--muted); font-size: 12px; margin-bottom: 6px; }
+.how-step-row { margin: 4px 0; }
+.how-path { display: inline-flex; flex-wrap: wrap; gap: 4px; align-items: center; }
+.how-step { font-family: var(--mono); font-size: 11.5px; background: var(--soft);
+  border: 1px solid var(--line); border-radius: 6px; padding: 2px 7px; }
+.how-cmd { position: relative; margin: 6px 0; }
+.how-cmd pre { margin: 0; background: var(--code-bg); border: 1px solid var(--line);
+  border-radius: 7px; padding: 8px 76px 8px 10px; overflow: auto;
+  font-size: 11.5px; white-space: pre-wrap; }
+.how-cmd.toml pre { border-color: var(--line2); }
+.how-cmd > button { position: absolute; right: 6px; top: 6px; }
+.how-actions { align-items: center; margin: 6px 0; flex-wrap: wrap; }
+.how-actions .muted { font-size: 10.5px; }
+.how-flags { margin-top: 6px; font-size: 12px; }
+.how-flags summary { cursor: pointer; color: var(--muted); }
+.how-flags ul { margin: 6px 0 0 16px; padding: 0; }
+.how-flags li { margin: 2px 0; }
+@media (max-width: 980px) {
+  #howPane { padding: 10px; }
+  .how-chip { font-size: 11.5px; }
+}
+
 /* ------------------------------------------------------------ mobile tabs -- */
 #mobileTabs { display: none; }
 @media (max-width: 980px) {

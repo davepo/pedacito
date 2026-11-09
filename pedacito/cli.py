@@ -1639,6 +1639,13 @@ def _main(argv=None) -> int:
                        help="your question; omit for an interactive prompt")
     p_how.add_argument("-q", "--question", dest="question_opt", metavar="TEXT",
                        help="your question (alternative to the positional form)")
+    p_how.add_argument("--offline", "--no-model", "--fast", dest="offline",
+                       action="store_true",
+                       help="print the deterministic built-in reference only; "
+                            "no model server is needed or contacted")
+    p_how.add_argument("--json", action="store_true",
+                       help="print structured matches (GUI paths, CLI commands, "
+                            "settings) plus the formatted answer as JSON")
     p_how.add_argument("--url", "--server", dest="url",
                        help="server base url override for this help session")
     p_how.add_argument("--api-key", dest="api_key",

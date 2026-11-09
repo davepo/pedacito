@@ -114,8 +114,10 @@ going to hidden reasoning? — and saves a model card. Settings you left at
 their defaults (prompt pack, answer mode, verifier, best-of-N, the thinking
 switch) then follow the card; `pedacito config` shows it.
 
-Stuck on anything else? `pedacito how "how do I ...?"` answers from these docs
-and the source, using your config. It needs no project or index.
+Stuck on anything else? `pedacito how "how do I ...?"` answers from the built-in
+CLI/GUI/setting reference, using your config when a model is available. Add
+`--offline` for an instant answer with no model at all. It needs no project or
+index. The GUI also has a **How ?** tab with topic chips.
 
 ---
 

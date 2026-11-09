@@ -203,19 +203,25 @@ For model selection, VRAM sizing, thinking settings, and role routing, see the
 [model guide](MODEL_GUIDE.md). It has concrete starting points for 6, 8, 12, 16,
 24, and 32 GB GPUs.
 
-`pedacito how` answers questions about using Pedacito, drawing on this README,
-the [Quick Start](QUICKSTART.md), the [model guide](MODEL_GUIDE.md), and the
-source. It needs no project and no
-index, only a model connection, and it uses your config (never sending
-`api_key`) so answers reflect your setup:
+`pedacito how` answers questions about using Pedacito from a built-in
+**structured reference index**: every CLI command and flag, the exact GUI
+navigation path for each feature, and every config setting with its default,
+GUI location and `config.toml` form. It needs no project and no index. A model
+connection is optional: when a fast model server is reachable it rewrites the
+retrieved facts into a short answer; otherwise the deterministic GUI/CLI/setting
+cards print immediately.
 
 ```bash
-pedacito how "how do I undo an apply?"
-pedacito how                          # interactive
+pedacito how "how do I disable thinking?"       # model synthesis if available
+pedacito how --offline "how do I import models?" # instant, no model needed
+pedacito how --json "how do I reset my config?"  # structured matches + answer
+pedacito how                                      # interactive
 ```
 
 It accepts `--url`/`--server`, `--model`, `--api-key`, `--vram`/`--vram-gb`,
-`--config`, and `--profile`.
+`--config`, and `--profile`, plus `--offline`/`--fast` and `--json`. The GUI's
+**How ?** composer tab exposes the same reference with topic chips, copyable CLI
+commands and **Open in Settings** buttons.
 
 ---
 
@@ -495,7 +501,7 @@ identically.
 | Area | What it does |
 |---|---|
 | **Header** | Open a project (type a path, **Browse…** the machine's folders, or pick a recent one), choose its model profile, see the model server's status light and the session's token/cache/cost totals. |
-| **Chat** (left) | Four modes next to the box: **Task** (edit code; *review* or *write directly*, planning auto/always/never, max lookups), **Explain** (read-only questions, answer streams in), **Auto** (goal → plan → implement; plan-only or implement, verify command, repair rounds, task/minute caps, worktree, keep-going, pip-install; applying Auto accepts the tool trust boundary and enables write/run tools for the run), **New** (start a project from scratch in a folder: preview, build, build-then-review, skeleton only, and *complex* for the autonomous loop). **Attach** (or drag in) a text file as the task, question, or spec. While a task runs, type to **steer** the model, answer its clarifying questions inline, or **Stop** it. |
+| **Chat** (left) | Five modes next to the box: **Task** (edit code; *review* or *write directly*, planning auto/always/never, max lookups), **Explain** (read-only questions, answer streams in), **Auto** (goal → plan → implement; plan-only or implement, verify command, repair rounds, task/minute caps, worktree, keep-going, pip-install; applying Auto accepts the tool trust boundary and enables write/run tools for the run), **New** (start a project from scratch in a folder: preview, build, build-then-review, skeleton only, and *complex* for the autonomous loop), and **How ?** (the built-in CLI/GUI/setting reference with topic chips, copyable commands and *Open in Settings* links; answers stay out of the saved coding thread). **Attach** (or drag in) a text file as the task, question, or spec. While a task runs, type to **steer** the model, answer its clarifying questions inline, or **Stop** it. |
 | **Changes** (middle) | The proposed edits as *Old code | Updated code* side by side with word-level highlights. Accept or reject the whole set, untick files to accept only some, or **Edit updated** to hand-edit a file before accepting. Backups are made first and a file that changed on disk since the preview is refused. |
 | **Plan** (middle) | The `auto`/plan checklist with live progress; edit it, then **Run this plan**. |
 | **File** (middle) | Read-only viewer for any indexed file (click it in the tree). |

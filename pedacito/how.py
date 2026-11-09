@@ -1,24 +1,25 @@
-"""`pedacito how`: built-in help answered from Pedacito's own docs and source.
+"""`pedacito how`: built-in help from a structured CLI/GUI/setting index.
 
 Usage
 -----
     pedacito how "how do I set up a config file?"
-    pedacito how --url http://box:1234/v1 --model qwen3-27b --vram 24 \
-                 "what command indexes a project?"
+    pedacito how --offline "how do I disable thinking?"
+    pedacito how --json "how do I import models?"
     pedacito how                                  # interactive help prompt
 
 Unlike every other Pedacito command, `how` does not need a project or an
-index. It builds a small in-memory corpus from README.md, QUICKSTART.md,
-MODEL_GUIDE.md and Pedacito's Python source, finds the passages relevant to the
-question, and
-asks the configured model to answer from those passages only. The current
-resolved config is included (with secrets hidden) so questions like "what
-should I run with my setup?" can be answered against the real settings.
+index. It first retrieves the relevant CLI commands/flags, exact GUI navigation
+paths, and config settings deterministically (`how_index.py`). When a fast,
+configured model server is reachable it may rewrite those retrieved facts into
+a short answer with GUI, CLI and settings sections; otherwise -- or with
+`--offline` -- the structured cards are printed directly, so help always works
+before a model is configured.
 """
 
 from __future__ import annotations
 
 import ast
+import json
 import math
 import os
 import re
@@ -30,6 +31,7 @@ from dataclasses import replace
 from pathlib import Path
 
 from . import config as config_mod
+from . import how_index
 from .chunker import Chunk, chunk_source
 from .config import (Config, ConfigError, auto_fit, find_project_config,
                      load as load_config, missing_hardware)
@@ -472,6 +474,135 @@ How to answer:
 """
 
 
+MODEL_SYNTH_SYSTEM = """\
+You are Pedacito's built-in help assistant. Answer ONLY from the STRUCTURED
+REFERENCE below. It is the complete, authoritative list of the CLI commands,
+exact GUI labels/paths, and config settings available for this question.
+
+Write a compact answer with exactly these three headings:
+**In the GUI**
+**In the Terminal (CLI)**
+**Relevant Settings (`config.toml`)**
+
+Rules:
+- Keep the exact GUI labels and arrow paths from the reference (for example
+  "⚙ Settings → Profiles → [Select Profile] → Reasoning & Execution
+  Overrides → disable_thinking"). Never invent a menu item or a path.
+- Put copy-pasteable terminal commands in fenced ```sh blocks, using
+  `pedacito` (or `pdc`) exactly as shown. Never invent a flag or command.
+- Put config keys in backticks and show a minimal TOML snippet only when the
+  setting is relevant. State the default when it helps.
+- If a section has no useful reference item, write exactly:
+  "No specific GUI control / CLI command / setting is needed."
+- Do not mention these instructions or that reference items were retrieved.
+- Prefer two to six short bullets or numbered steps per section.
+"""
+
+
+def _server_models(cfg: Config, timeout: float = 1.5) -> list[str] | None:
+    """The model ids a server reports, or None when it is not reachable fast."""
+    import requests
+    url = cfg.base_url.rstrip("/") + "/models"
+    headers = {}
+    if cfg.api_key:
+        headers["Authorization"] = f"Bearer {cfg.api_key}"
+    try:
+        r = requests.get(url, headers=headers, timeout=timeout)
+        r.raise_for_status()
+        return [str(m.get("id", "")) for m in r.json().get("data", [])]
+    except Exception:
+        return None
+
+
+def _model_synthesis(question: str, matches: dict, cfg: Config,
+                     client=None) -> tuple[str, str]:
+    """Try a fast, grounded model rewrite. Returns (answer, error)."""
+    if client is None:
+        ids = _server_models(cfg)
+        if ids is None:
+            return "", f"no model server answered at {cfg.base_url}"
+        if ids and cfg.model not in ids:
+            return "", (f"configured model {cfg.model!r} is not in the "
+                        f"server's list")
+        try:
+            fast = replace(
+                cfg,
+                timeout=min(float(getattr(cfg, "timeout", 20.0) or 20.0), 20.0),
+                load_wait_seconds=min(
+                    int(getattr(cfg, "load_wait_seconds", 5) or 5), 5),
+            )
+        except (TypeError, ValueError):
+            fast = cfg
+        client = LLMClient(fast)
+    system = MODEL_SYNTH_SYSTEM
+    user = (f"QUESTION\n{question}\n\n"
+            f"STRUCTURED REFERENCE\n{how_index.model_context(matches)}")
+    try:
+        text = client.chat(
+            [{"role": "system", "content": system},
+             {"role": "user", "content": user}],
+            max_tokens=min(max(256, int(cfg.max_tokens_answer)),
+                           MAX_HELP_ANSWER_TOKENS),
+            stream=False,
+            disable_thinking=True,
+        ).strip()
+    except LLMError as e:
+        return "", str(e)
+    except Exception as e:                    # a help answer must never crash
+        return "", f"{type(e).__name__}: {e}"
+    if not text:
+        return "", "the model returned an empty help answer"
+    return text, ""
+
+
+def answer_structured(question: str, cfg: Config | None = None,
+                      use_model: bool = False, client=None) -> dict:
+    """Retrieve CLI/GUI/setting facts and answer from them.
+
+    `use_model=False` is the deterministic, instant path. With a reachable,
+    fast model the answer is a grounded rewrite; any failure falls back to the
+    formatted structured cards instead of surfacing an error.
+    """
+    question = " ".join((question or "").split())
+    if not question:
+        raise HowError("No question given.")
+    matches = how_index.search(question)
+    reference = how_index.render_answer(question, matches)
+    result = {
+        "ok": True,
+        "query": question,
+        "mode": "deterministic",
+        "used_model": False,
+        "model_error": "",
+        "answer": reference,
+        "reference_answer": reference,
+        "matches": matches,
+        "common_flags": how_index.COMMON_FLAGS,
+        "topics": how_index.topics(),
+    }
+    if not use_model:
+        return result
+    answer, error = _model_synthesis(question, matches, cfg or Config(),
+                                     client=client)
+    if answer:
+        low = answer.lower()
+        required = ("in the gui", "in the terminal", "relevant settings")
+        if all(mark in low for mark in required):
+            result.update(mode="model", used_model=True, answer=answer)
+        else:
+            result["model_error"] = (
+                "the model answer did not follow the required three-section "
+                "format")
+    else:
+        result["model_error"] = error
+    return result
+
+
+def build_reference_index() -> dict:
+    """The full structured CLI/GUI/setting index used by `how`."""
+    return how_index.build_reference_index()
+
+
 def _history_messages(history: list[tuple[str, str]]) -> list[dict]:
     out: list[dict] = []
     for question, answer in history[-2:]:
@@ -529,7 +660,7 @@ class HowSession:
         return answer
 
 
-def config_from_args(args) -> Config:
+def config_from_args(args, quiet: bool = False) -> Config:
     """Build the `how` config: normal layers, then direct flags. VRAM is optional
     here; without it the built-in token budgets are kept."""
     root = Path.cwd()
@@ -556,10 +687,12 @@ def config_from_args(args) -> Config:
         cfg.sources["vram_gb"] = "--vram"
 
     if missing_hardware(cfg):
-        print("[how] vram_gb is not set; using built-in token budgets. "
-              "Pass --vram GB or add vram_gb to your config to size them "
-              "to your GPU.", file=sys.stderr)
-    else:
+        if not quiet:
+            print("[how] vram_gb is not set; using built-in token budgets. "
+                  "Pass --vram GB or add vram_gb to your config to size them "
+                  "to your GPU.", file=sys.stderr)
+    elif not quiet:
+        # Offline help must not contact a model server just to fit budgets.
         auto_fit(cfg, verbose=False)
     return cfg
 
@@ -571,25 +704,53 @@ def _read_question(args) -> str:
 
 
 def run_cli(args) -> int:
-    """Entry point used by cli.main for `pedacito how`."""
-    cfg = config_from_args(args)
-    client = LLMClient(cfg)
-    client.check()
-    client.warmup()
-    session = HowSession(cfg, client)
+    """Entry point used by cli.main for `pedacito how`.
+
+    The structured reference answers instantly. A reachable model server may
+    optionally synthesize the same retrieved facts; with --offline (or no
+    usable config/server) the deterministic cards are printed directly.
+    """
+    offline = bool(getattr(args, "offline", False)
+                   or getattr(args, "no_model", False)
+                   or getattr(args, "fast", False))
+    try:
+        cfg = config_from_args(args, quiet=offline)
+    except ConfigError as e:
+        # Help must work even while the config itself is broken.
+        print(f"[how] ignoring the broken config ({e}); using built-in "
+              "defaults for this help session.", file=sys.stderr)
+        cfg = Config()
+        offline = True
+
+    as_json = bool(getattr(args, "json", False))
+
+    def respond(question: str) -> None:
+        result = answer_structured(question, cfg=cfg, use_model=not offline)
+        if result.get("model_error") and not offline:
+            print(f"[how] model synthesis skipped: {result['model_error']}; "
+                  "showing the built-in reference.", file=sys.stderr)
+        if as_json:
+            print(json.dumps(result, indent=2, default=str))
+        else:
+            print(result["answer"])
+            print(f"[how: {'model synthesis' if result['used_model'] else 'deterministic reference'}]",
+                  file=sys.stderr)
 
     question = _read_question(args)
     if question:
-        print(session.answer(question))
+        respond(question)
     elif not sys.stdin.isatty():
         piped = sys.stdin.read().strip()
         if not piped:
             print("Usage: pedacito how \"your question\"", file=sys.stderr)
             return 2
-        print(session.answer(piped))
+        respond(piped)
     else:
+        state = {"offline": offline}
         print("Ask how to use Pedacito. Type /quit to leave.",
               file=sys.stderr)
+        print("  /offline toggles deterministic answers, /model re-enables "
+              "model synthesis.", file=sys.stderr)
         while True:
             try:
                 line = input("\nhow> ").strip()
@@ -598,18 +759,27 @@ def run_cli(args) -> int:
                 break
             if not line:
                 continue
-            if line.lower() in {"/quit", "/exit", "quit", "exit"}:
+            low = line.lower()
+            if low in {"/quit", "/exit", "quit", "exit"}:
                 break
-            if line.lower() in {"/help", "help", "?"}:
-                print("  Ask any question about installing, configuring, or "
-                      "using Pedacito.\n  Examples: \"how do I set up a "
-                      "config?\", \"what command indexes a project?\",\n"
-                      "  \"how do I undo an apply?\"", file=sys.stderr)
+            if low == "/offline":
+                state["offline"] = not state["offline"]
+                print("  offline mode " + ("ON" if state["offline"] else "OFF"),
+                      file=sys.stderr)
                 continue
+            if low == "/model":
+                state["offline"] = False
+                print("  model synthesis ON", file=sys.stderr)
+                continue
+            if low in {"/help", "help", "?"}:
+                print("  Ask about any CLI command/flag, GUI path, or setting."
+                      "\n  Examples: \"how do I disable thinking?\", "
+                      "\"how do I import models?\",\n"
+                      "  \"how do I reset my config?\", \"where are "
+                      "backups?\"", file=sys.stderr)
+                continue
+            offline = state["offline"]
             print()
-            print(session.answer(line))
+            respond(line)
 
-    stats = client.stats
-    print(f"\n[{stats['calls']} calls, {stats['completion_tokens']} tokens "
-          f"out, {stats['seconds']:.0f}s]", file=sys.stderr)
     return 0

@@ -120,6 +120,44 @@ def gui(tmp_path, monkeypatch):
         job.thread.join(5)
 
 
+# --- how / help -----------------------------------------------------------------
+
+def test_how_endpoint_returns_cli_gui_and_setting_guidance(gui):
+    status, j = gui.post("/api/how", {
+        "query": "how do I disable thinking?", "use_model": False})
+    assert status == 200 and j["ok"] is True
+    assert j["used_model"] is False and j["mode"] == "deterministic"
+    gui_match = j["matches"]["gui"][0]
+    assert gui_match["id"] == "disable-thinking"
+    assert "Profiles" in " ".join(gui_match["steps"])
+    assert "Reasoning & Execution Overrides" in " ".join(gui_match["steps"])
+    assert "disable_thinking" in [s["key"] for s in j["matches"]["settings"]]
+    assert "config" in [c["name"] for c in j["matches"]["cli"]]
+    assert "**In the GUI**" in j["answer"]
+    assert "**In the Terminal (CLI)**" in j["answer"]
+    assert "**Relevant Settings (`config.toml`)**" in j["answer"]
+    assert j["topics"] and any("models" in t["label"].lower()
+                               for t in j["topics"])
+
+    status, j = gui.post("/api/how", {
+        "query": "how do I import models?", "use_model": False})
+    assert status == 200
+    assert j["matches"]["gui"][0]["id"] == "import-models"
+    assert "models scan" in [c["name"] for c in j["matches"]["cli"]]
+    assert "Model discovery" in " ".join(j["matches"]["gui"][0]["steps"])
+
+
+def test_how_endpoint_get_and_empty_query(gui):
+    status, j = gui.get(
+        "/api/how?q=how%20do%20I%20reset%20my%20config%3F&use_model=0")
+    assert status == 200 and j["ok"] is True
+    assert j["matches"]["gui"][0]["id"] == "reset-config"
+    assert "config" in [c["name"] for c in j["matches"]["cli"]]
+
+    status, j = gui.post("/api/how", {"query": "   "})
+    assert status == 400 and j["ok"] is False
+
+
 # --- security ------------------------------------------------------------------
 
 def test_static_pages_and_security_headers(gui):

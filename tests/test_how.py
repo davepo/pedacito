@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import socket
 import subprocess
@@ -114,11 +115,114 @@ def test_how_does_not_require_vram_for_local_help(monkeypatch, tmp_path,
     assert "vram_gb is not set" in capsys.readouterr().err
 
 
+def _names(matches, bucket):
+    return [item.get("name") or item.get("id") or item.get("key")
+            for item in matches[bucket]]
+
+
+def test_structured_index_covers_cli_gui_and_settings():
+    from pedacito import how_index
+    from pedacito.config import Config
+    from dataclasses import fields
+
+    cli = {c["name"] for c in how_index.CLI_COMMANDS}
+    for name in ("ask", "explain", "auto", "new", "index", "calibrate",
+                 "models scan", "profiles", "restore", "reset", "prune",
+                 "eval", "gui", "config", "chat", "how"):
+        assert name in cli
+    assert {"disable-thinking", "import-models", "reset-config", "undo-run",
+            "reference-file"} <= {t["id"] for t in how_index.GUI_TOPICS}
+    setting_keys = {s["key"] for s in how_index.settings_dictionary()}
+    for field in fields(Config):
+        if field.name in ("sources", "profiles", "active_profile",
+                          "active_tier", "model_size_bytes",
+                          "_hosted_server"):
+            continue
+        assert field.name in setting_keys
+
+
+@pytest.mark.parametrize("question,gui_words,cli_names,setting", [
+    ("how to disable thinking",
+     ("Settings", "Profiles", "Reasoning & Execution Overrides",
+      "disable_thinking"),
+     {"config"}, "disable_thinking"),
+    ("how to import models",
+     ("Model discovery", "Scan local servers", "Import Selected"),
+     {"models scan"}, "base_url"),
+    ("how to reset settings",
+     ("Raw file / reset", "Reset to baseline"),
+     {"reset", "config"}, "default_profile"),
+    ("how do I undo an Auto or Edit run?",
+     ("Workspace", "Backups", "Restore"),
+     {"restore"}, "backup"),
+    ("how do I reference a file in chat?",
+     ("Files tab", "@"),
+     {"chat", "files"}, "include_references"),
+])
+def test_offline_answers_include_gui_cli_and_settings(
+        question, gui_words, cli_names, setting):
+    result = how.answer_structured(question, use_model=False)
+    assert result["used_model"] is False
+    assert result["mode"] == "deterministic"
+    assert "**In the GUI**" in result["answer"]
+    assert "**In the Terminal (CLI)**" in result["answer"]
+    assert "**Relevant Settings (`config.toml`)**" in result["answer"]
+    gui_text = " ".join(
+        " ".join(item["steps"]) + " " + item["title"]
+        for item in result["matches"]["gui"])
+    for word in gui_words:
+        assert word in gui_text
+    assert cli_names <= set(_names(result["matches"], "cli"))
+    assert setting in _names(result["matches"], "settings")
+
+
+def test_cli_how_offline_needs_no_config_or_model(monkeypatch, tmp_path,
+                                                   capsys):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(config_mod, "USER_CONFIG", tmp_path / "missing.toml")
+    for key in list(os.environ):
+        if key.startswith("PEDACITO_"):
+            monkeypatch.delenv(key, raising=False)
+
+    code = main(["how", "--offline", "how do I import models?"])
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "In the GUI" in out and "In the Terminal (CLI)" in out
+    assert "Model discovery" in out
+    assert "pedacito models scan" in out
+    assert not (tmp_path / ".pedacito").exists()
+
+
+def test_cli_how_offline_json_is_structured(monkeypatch, tmp_path, capsys):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(config_mod, "USER_CONFIG", tmp_path / "missing.toml")
+    for key in list(os.environ):
+        if key.startswith("PEDACITO_"):
+            monkeypatch.delenv(key, raising=False)
+
+    code = main(["how", "--offline", "--json",
+                 "how do I reset my config?"])
+    assert code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["ok"] is True
+    assert payload["used_model"] is False
+    assert payload["query"] == "how do I reset my config?"
+    assert payload["matches"]["gui"][0]["id"] == "reset-config"
+    assert "Reset to baseline" in " ".join(
+        payload["matches"]["gui"][0]["steps"])
+    assert "config" in _names(payload["matches"], "cli")
+    assert "default_profile" in _names(payload["matches"], "settings")
+
+
 @pytest.mark.network
 def test_how_cli_runs_with_minimal_config_and_direct_flags(
         tmp_path, monkeypatch, capsys):
     port = _free_port()
-    reply = "Run `pedacito config --init` to write a starter config."
+    reply = (
+        "**In the GUI**\nOpen ⚙ Settings → Raw file / reset.\n\n"
+        "**In the Terminal (CLI)**\n"
+        "Run `pedacito config --init` to write a starter config.\n\n"
+        "**Relevant Settings (`config.toml`)**\n`base_url`, `model`.")
     env = dict(os.environ, FAKE_PORT=str(port), FAKE_REPLY=reply)
     env.pop("FAKE_ACTIONS", None)
     proc = subprocess.Popen([sys.executable, str(FAKE)], env=env,

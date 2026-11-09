@@ -25,8 +25,12 @@
   var TUNE = { hardware: 'hosted', model: 'medium', codebase: 'medium',
                priority: 'balanced', result: null, err: '', busy: false };
 
-  PDC.openSettings = function () {
-    X = { data: null, which: 'user', tab: 'discovery', profile: '', target: '', pending: {}, models: [], search: '' };
+  PDC.openSettings = function (opts) {
+    opts = opts || {};
+    X = { data: null, which: opts.which || 'user',
+          tab: opts.tab || 'discovery', profile: opts.profile || '',
+          target: opts.target || '', pending: {}, models: [],
+          search: opts.search || '', focusSearch: !!opts.search };
     X.modal = PDC.modal('Settings', h('div', { class: 'tip', text: 'Loading\u2026' }), [{ label: 'Close' }]);
     X.body = X.modal.body;
     PDC.api('/api/settings').then(function (d) { X.data = d; pickDefaults(); render(); });
@@ -702,6 +706,10 @@
     }
     search.addEventListener('input', function () { X.search = search.value; fill(); });
     fill();
+    if (X.focusSearch) {
+      X.focusSearch = false;
+      setTimeout(function () { search.focus(); search.select(); }, 30);
+    }
     return h('div', {}, h('div', { class: 'row', style: 'margin-bottom:8px' }, h('span', { class: 'muted', text: 'Apply to:' }), targetSel, search, saveBtn),
       h('div', { class: 'muted small-text', style: 'margin-bottom:6px', text: X.target
         ? 'A blank box means "not set here" \u2014 the profile inherits the universal value the control names (the badge on the right says where each value comes from). Clearing a box removes the override from the file.'
