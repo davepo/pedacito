@@ -274,3 +274,21 @@ def test_how_cli_runs_with_minimal_config_and_direct_flags(
     finally:
         proc.terminate()
         proc.wait(timeout=5)
+
+
+def test_how_index_covers_refine_permissions_ratchet_and_benchmarks():
+    from pedacito import how_index
+    cases = {
+        "how do I refine my prompt into a spec": "refine-prompt",
+        "what does the permission requested dialog want me to click": "permission-dialog",
+        "how do I allow web access fetch url": "web-access",
+        "how do I see an auto step that was rolled back": "green-ratchet",
+        "how do I run the pelican svg benchmark": "run-benchmarks",
+    }
+    for question, topic in cases.items():
+        ids = [m["id"] for m in how_index.search(question)["gui"]]
+        assert topic in ids, (question, ids)
+    flags = {f["flag"] for name in ("ask", "new", "auto")
+             for cmd in how_index.CLI_COMMANDS if cmd["name"] == name
+             for f in cmd["flags"]}
+    assert "--refine" in flags

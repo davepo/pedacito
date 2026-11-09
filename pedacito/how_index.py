@@ -226,6 +226,8 @@ CLI_COMMANDS = [
             {"flag": "--no-review",
              "help": "never open the reviewer, even if config enables it"},
             {"flag": "--reindex", "help": "force a fresh index first"},
+            {"flag": "--refine",
+             "help": "expand a one-line idea into a repo-aware spec first"},
             {"flag": "--continue",
              "help": "resume the newest ask checkpoint as context"},
             {"flag": "--plan",
@@ -287,6 +289,8 @@ CLI_COMMANDS = [
              "help": "pip-install a missing Python package and retry"},
             {"flag": "--force",
              "help": "regenerate the plan, discarding the existing one"},
+            {"flag": "--refine",
+             "help": "expand a one-line idea into a repo-aware spec first"},
         ],
         "common": True,
     },
@@ -307,6 +311,8 @@ CLI_COMMANDS = [
              "help": "new project directory (created; must be empty)"},
             {"flag": "-t, --task TEXT", "help": "one-line project description"},
             {"flag": "--spec FILE", "help": "larger spec (.md/.txt)"},
+            {"flag": "--refine",
+             "help": "expand a one-line idea into a repo-aware spec first"},
             {"flag": "--plan-only",
              "help": "stop after the plan and header skeleton"},
             {"flag": "--design",
@@ -996,7 +1002,7 @@ GUI_TOPICS = [
                    "accept or reject it there.",
         "steps": [
             "Composer → Task/Edit → Options → Writing: Review before writing",
-            "Run the task; the Chat header shows Review staged — expand (or "
+            "Run the task; the Chat header shows Review staged: expand (or "
             "the middle Changes pane opens)",
             "Untick files to accept only some; use ✎ Edit proposed or "
             "Side by side / Unified",
@@ -1344,6 +1350,114 @@ GUI_TOPICS = [
         "settings": [],
         "cli": ["gui", "ask", "explain", "auto", "index", "profiles",
                 "models scan", "restore", "config"],
+    },
+    {
+        "id": "refine-prompt",
+        "title": "Turn a one-sentence idea into a full spec (✦ Refine Prompt)",
+        "summary": "Refine Prompt rewrites a brief request into a repo-aware spec "
+                   "with locked file targets and interface signatures. Undo "
+                   "Refine restores your original text.",
+        "steps": [
+            "Type your idea in the composer (Task/Edit, Auto or New)",
+            "Click ✦ Refine Prompt. The composer now holds a spec: Objective, "
+            "Files to Create or Modify, Interface Contracts, Requirements and "
+            "Edge Cases, Verification",
+            "Drag the top edge of the composer to resize it, then review the "
+            "spec before you press Run",
+            "Click ↶ Undo Refine to put back the text you wrote",
+            "CLI: add --refine to pedacito ask, new or auto",
+        ],
+        "keywords": ["refine", "refine prompt", "spec", "architect", "expand idea",
+                     "one sentence", "undo refine", "brief", "idea", "prompt"],
+        "settings": [],
+        "cli": ["ask", "new", "auto"],
+    },
+    {
+        "id": "permission-dialog",
+        "title": "Approve or deny a Permission requested dialog",
+        "summary": "When the model asks for something gated (web access, a package "
+                   "install, an unapproved shell command or a sensitive file), the "
+                   "run pauses until you answer.",
+        "steps": [
+            "Read the badge, the action, the reason and the exact target shown in "
+            "the dialog",
+            "Allow Once: this single request only",
+            "Allow for This Run: no more prompts for this kind of request until "
+            "the run ends",
+            "Always Allow: never asks again for that request. It is saved to your "
+            "config when one exists. Web access flips enable_web, shell commands "
+            "flip allow_shell",
+            "Deny & Redirect: refuses the request. The model is told to continue "
+            "with local project files only. Stop, or letting the dialog time out, "
+            "also denies",
+            "The CLI has no dialog: a gated tool returns its 'disabled in config' "
+            "error unless the matching setting is on",
+        ],
+        "keywords": ["permission", "permissions", "allow", "deny", "approve",
+                     "approval", "always allow", "allow once", "popup", "dialog",
+                     "blocked", "waiting", "redirect"],
+        "settings": ["enable_web", "allow_shell", "allow_fetch"],
+        "cli": ["config"],
+    },
+    {
+        "id": "web-access",
+        "title": "Let the model read web pages and search (enable_web)",
+        "summary": "Web access is off by default. fetch_url and web_search run "
+                   "when enable_web is on, or when you approve each call in the "
+                   "permission dialog.",
+        "steps": [
+            "⚙ Settings → All settings → search enable_web → Apply to: Global → "
+            "on → Save",
+            "Or leave it off and approve calls one at a time in the Permission "
+            "requested dialog",
+            "Loopback, link-local and private-network addresses are refused unless "
+            "you list them in fetch_allowed_hosts",
+            "Config form: enable_web = true in config.toml",
+        ],
+        "keywords": ["web", "internet", "online", "fetch", "fetch url", "web search",
+                     "enable web", "url", "documentation", "browse", "download"],
+        "settings": ["enable_web", "fetch_allowed_hosts", "allow_fetch"],
+        "cli": ["config"],
+    },
+    {
+        "id": "green-ratchet",
+        "title": "See an Auto step rolled back (green ratchet)",
+        "summary": "Auto saves a snapshot before each step. A step that still fails "
+                   "after its repair rounds is undone, so the next step builds on "
+                   "the last passing state.",
+        "steps": [
+            "Nothing to click: it runs in every Auto run while auto_green_ratchet "
+            "is on",
+            "A rollback shows as ROLLED BACK in the Activity log and as a chat note "
+            "listing the restored and deleted files",
+            "Old snapshots are pruned when the run ends (auto_keep_checkpoints)",
+            "Turn it off in All settings (auto_green_ratchet) if you want failed "
+            "steps left on disk",
+        ],
+        "keywords": ["rollback", "roll back", "green ratchet", "checkpoint",
+                     "undo step", "failed step", "restore step", "auto rollback",
+                     "step failed", "revert step"],
+        "settings": ["auto_green_ratchet", "auto_keep_checkpoints",
+                     "auto_checkpoint_max_files", "auto_checkpoint_max_file_bytes"],
+        "cli": ["auto"],
+    },
+    {
+        "id": "run-benchmarks",
+        "title": "Compare models with the six diagnostic benchmarks",
+        "summary": "▦ Benchmarks builds one small project with the chosen profile and "
+                   "grades it with a hidden rubric. The pelican SVG benchmark also "
+                   "shows the drawing the model produced.",
+        "steps": [
+            "Top bar → ▦ Benchmarks",
+            "Pick a profile and one of the six benchmarks, then Run Benchmark",
+            "Read the holdout score, the shortcomings and the report. The pelican "
+            "benchmark shows its SVG inline",
+            "Open Generated Project keeps the folder on disk to inspect or run",
+        ],
+        "keywords": ["benchmark", "benchmarks", "score", "rubric", "compare models",
+                     "pelican", "svg", "bicycle", "holdout", "test model", "grade"],
+        "settings": [],
+        "cli": ["calibrate", "eval"],
     },
 ]
 
@@ -1811,7 +1925,7 @@ def render_answer(question: str, matches: dict) -> str:
     cli = matches.get("cli") or []
     settings = matches.get("settings") or []
     lines: list[str] = []
-    lines.append("**Built-in reference** — no model or project needed.")
+    lines.append("**Built-in reference**: no model or project needed.")
     lines.append("")
     best = (gui[0]["summary"] if gui else
             cli[0]["summary"] if cli else
@@ -1837,7 +1951,7 @@ def render_answer(question: str, matches: dict) -> str:
     lines.append("**In the Terminal (CLI)**")
     if cli:
         for item in cli[:2]:
-            lines.append(f"- **`pedacito {item['name']}`** — "
+            lines.append(f"- **`pedacito {item['name']}`**: "
                          f"{_first_sentence(item['summary'], 220)}")
             lines.append(f"  - Usage: `{item['usage']}`")
             examples = item.get("examples") or []
@@ -1868,7 +1982,7 @@ def render_answer(question: str, matches: dict) -> str:
     if settings:
         for item in settings[:4]:
             default = item.get("default_text", "")
-            lines.append(f"- **`{item['key']}`** (default: `{default}`) — "
+            lines.append(f"- **`{item['key']}`** (default: `{default}`): "
                          f"{_first_sentence(item.get('help', ''), 240)}")
             if item.get("gui"):
                 lines.append(f"  - Where: {item['gui']}")
@@ -1911,7 +2025,7 @@ def model_context(matches: dict) -> str:
             for example in (item.get("examples") or [])[:4]:
                 lines.append(f"  example: {example}")
             for flag in (item.get("flags") or [])[:20]:
-                lines.append(f"  flag: {flag['flag']} — {flag['help']}")
+                lines.append(f"  flag: {flag['flag']}: {flag['help']}")
             if item.get("common"):
                 lines.append("  also supports the common project flags: "
                              + ", ".join(f["flag"] for f in COMMON_FLAGS))

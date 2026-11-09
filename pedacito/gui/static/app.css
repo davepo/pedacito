@@ -982,6 +982,10 @@ details pre { background: var(--code-bg); border: 1px solid var(--line); border-
 .bench-short { margin: 4px 0 0 18px; padding: 0; font-size: 12px; }
 .bench-short li { margin: 3px 0; }
 .bench-actions { margin-top: 8px; }
+.bench-svg { margin: 10px 0 4px; padding: 8px; border: 1px solid var(--line);
+  border-radius: 8px; background: #fff; display: flex; flex-direction: column; gap: 4px; }
+.bench-svg img { display: block; width: 100%; max-height: 360px; object-fit: contain; }
+.bench-svg figcaption { color: #555; }
 .bench-path { word-break: break-all; }
 .bench-report { margin-top: 8px; border-top: 1px solid var(--line); padding-top: 6px; }
 .bench-report summary { cursor: pointer; color: var(--accent); font-weight: 600; }

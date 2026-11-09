@@ -155,6 +155,13 @@ explains when each setting helps.
 Pedacito backs up each file before it writes. If a file changed on disk after
 the preview, the write is refused, so your own edits are never overwritten.
 
+**Short on detail?** Type a one-line idea and click **✦ Refine Prompt** above the
+composer. Pedacito replaces the line with a full spec: an objective, the files to
+create or modify (using real paths from your project), interface contracts,
+requirements and edge cases, and verification. Read it, edit it if you like, then
+click **Run**. **↶ Undo Refine** puts your original text back. Drag the top edge of
+the composer to make it taller while you read.
+
 ### A6. Ask a question (Ask)
 
 Choose **Ask** to ask how the code works. The answer streams in and nothing is
@@ -174,7 +181,15 @@ page, with tests`.
 
 Auto writes files and runs commands without asking for each one. Starting an
 Auto run is your approval of those tools for that run, so use **Plan only** until
-you trust the project. A failed repair round is rolled back automatically.
+you trust the project. A repair round that makes things worse is rolled back
+automatically.
+
+Each step is also checked before the next one starts. Pedacito compares every
+function and class signature in the project with the calls and imports across
+files, and runs a fast check for undefined names, so a step that breaks a name is
+caught before its tests run. If a step still fails after its repair rounds, the
+green ratchet rolls it back to the last passing state. The Activity log then
+shows `ROLLED BACK`, with the files that were restored or deleted.
 
 ### A8. Start a new project (New)
 
@@ -192,11 +207,12 @@ model is configured.
 ### A10. Compare models with the benchmarks
 
 Click **▦ Benchmarks** in the top bar. Choose a profile, and optionally a folder
-for the output, then click **Run Benchmark**. Each run builds one of five small
+for the output, then click **Run Benchmark**. Each run builds one of six small
 projects with the normal Pedacito loop, then grades it with a hidden holdout
 rubric. The full report is `BENCHMARK_REPORT.md` in the new project folder. A
 run can take several minutes. [MODEL_GUIDE.md](MODEL_GUIDE.md#compare-models-with-the-diagnostic-benchmarks)
-describes the five projects and how to read the results.
+describes the six projects and how to read the results. The pelican benchmark
+also draws the SVG the model produced, inline in the scorecard.
 
 ### A11. Undo a write
 
@@ -204,7 +220,35 @@ In the right-hand panel, open the **Backups** tab. It lists the snapshots from
 Task/Edit and Auto writes. Choose one and click **Restore**. Files that changed
 since the snapshot are overwritten, and files created since then stay on disk.
 
-### A12. Other things to know
+### A12. Approve or deny a permission request
+
+Sometimes the model asks for something you have not allowed yet: web access, a
+package install, a shell command that is not on the allowlist, or a sensitive
+file such as a `.env`. The run pauses, and a **Permission requested** dialog
+shows what it wants, why, and the exact target.
+
+- **Allow Once** lets this one request through.
+- **Allow for This Run** stops the prompts for that kind of request until the run
+  ends.
+- **Always Allow** stops them from now on. For web access it turns on
+  `enable_web`, and for shell commands it turns on `allow_shell`.
+- **Deny & Redirect** refuses the request, and the model carries on with the local
+  project files.
+
+If you do not answer, the request is denied when the dialog times out or you press
+Stop. A denial never crashes the run. The CLI has no dialog, so there a gated tool
+reports that it is disabled in the config.
+
+### A13. Turn on web access (optional)
+
+Web access is off by default. Two built-in tools use it: `fetch_url` reads a web
+page, and `web_search` looks up documentation. To allow them without asking each
+time, open **⚙ Settings → All settings**, search for `enable_web`, set it to on
+for every profile, and save. Or leave it off and approve each call in the
+permission dialog. Loopback, link-local and private-network addresses are refused
+unless you list them in `fetch_allowed_hosts`.
+
+### A14. Other things to know
 
 - **Settings** edits your user config or the project's `.pedacito.toml`. Your
   comments survive, and every edit is checked before it is saved. The **Raw
@@ -428,9 +472,12 @@ it, and a run can be resumed. Useful flags:
   default.
 - `--strict` exits with status 1 if a task applied edits but left a failed edit or
   failing tests, which is useful in CI.
+- `--refine` expands a one-line goal into a full spec before planning.
 
 A repair round that makes the check worse is rolled back automatically, and that
-task is marked failed. An unattended run cannot compound the damage.
+task is marked failed. An unattended run cannot compound the damage. A step that
+still fails after its repair rounds is rolled back to the last passing checkpoint
+(`auto_green_ratchet`, on by default), so later steps never build on it.
 
 ### B10. Interactive session
 
@@ -445,7 +492,7 @@ again is the cheapest way to compare two models.
 
 ### B11. Benchmarks
 
-The five-project benchmark suite runs from the GUI (the **▦ Benchmarks** button in
+The six-project benchmark suite runs from the GUI (the **▦ Benchmarks** button in
 Part A10). There is no CLI command for it yet. The CLI measures a model with
 `pedacito calibrate` and `pedacito eval`, which are described in the
 [model guide](MODEL_GUIDE.md#how-to-measure).
@@ -519,6 +566,11 @@ the task text. Each requirement then gets its own fresh context window, and
 Pedacito tracks each one until it has evidence that it was done. Tasks that name
 five or more files are planned automatically.
 
+A one-line request can also be expanded first. In the GUI, click **✦ Refine
+Prompt**. On the command line, add `--refine` to `ask`, `new` or `auto`. The
+expanded spec names the real files and the function signatures, so each step has
+the same names to work from.
+
 ---
 
 ## When something looks wrong
@@ -563,7 +615,7 @@ only the map is stale.
 | `pedacito cost PROJ` | What indexing will cost. Free |
 | `pedacito index PROJ` | Build or refresh the index |
 | `pedacito map PROJ [-t "task"]` | Print the index, ranked for a task. No model needed |
-| `pedacito ask PROJ -t "..."` | One task. Dry run by default. Add `--review` or `--apply` |
+| `pedacito ask PROJ -t "..."` | One task. Dry run by default. Add `--review`, `--apply`, or `--refine` |
 | `pedacito explain PROJ -q "..."` | Answer a question about the code. No edits |
 | `pedacito chat PROJ` | Interactive session; the index stays warm |
 | `pedacito new DIR -t "..."` | Start a project from scratch (or `--spec FILE`) |

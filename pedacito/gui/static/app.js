@@ -1014,7 +1014,7 @@ function calibrateProfile(name) {
 }
 
 // ---------------------------------------------------------------- benchmarks ---
-// Model Benchmark Runner: pick a configured profile and one of the five
+// Model Benchmark Runner: pick a configured profile and one of the six
 // built-in diagnostic projects. The server runs generation + both verification
 // passes as a background job; this dialog polls /api/benchmarks and then shows
 // the scorecard, the report, and a one-click switch into the generated folder.
@@ -1074,6 +1074,11 @@ function openBenchmarks() {
     metric('Repairs', fmt(run.repair_rounds || 0));
     metric('Profile', run.profile || 'default');
     box.appendChild(grid);
+    if (run.svg_preview) {
+      box.appendChild(h('figure', { class: 'bench-svg' },
+        h('img', { src: run.svg_preview, alt: 'SVG drawing produced by the model' }),
+        h('figcaption', { class: 'muted small-text', text: 'Rendered from the generated SVG (sandboxed image, scripts disabled).' })));
+    }
     const shortcomings = run.shortcomings || [];
     if (shortcomings.length) {
       const list = h('ul', { class: 'bench-short' });
@@ -1530,9 +1535,9 @@ function HowFlags(props) {
   return html`<details class="how-flags">
     <summary>Flags (${flags.length}${common.length ? ' + ' + common.length + ' common' : ''})</summary>
     <ul>
-      ${flags.map((f, i) => html`<li key=${'f' + i}><code>${f.flag}</code> — ${f.help}</li>`)}
+      ${flags.map((f, i) => html`<li key=${'f' + i}><code>${f.flag}</code>: ${f.help}</li>`)}
       ${common.length ? html`<li class="muted"><b>Common project flags</b></li>` : null}
-      ${common.map((f, i) => html`<li key=${'c' + i}><code>${f.flag}</code> — ${f.help}</li>`)}
+      ${common.map((f, i) => html`<li key=${'c' + i}><code>${f.flag}</code>: ${f.help}</li>`)}
     </ul>
   </details>`;
 }

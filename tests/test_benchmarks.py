@@ -175,11 +175,11 @@ def _cfg(tmp_path: Path) -> Config:
 
 
 # ------------------------------------------------------------------ catalog ----
-def test_catalog_has_the_five_diagnostic_benchmarks():
+def test_catalog_has_the_six_diagnostic_benchmarks():
     catalog = benchmarks.list_benchmarks()
     assert [b["id"] for b in catalog] == [
         "rpn_expression_calc", "markdown_table_fmt", "ttl_lru_cache",
-        "log_anomaly_analyzer", "mini_kanban_html",
+        "log_anomaly_analyzer", "mini_kanban_html", "pelican_bicycle_svg",
     ]
     for item in catalog:
         assert item["title"] and item["category"] and item["description"]
@@ -411,7 +411,7 @@ def gui(tmp_path, monkeypatch):
 def test_benchmarks_endpoint_lists_catalog_and_profiles(gui):
     status, data = gui.get("/api/benchmarks")
     assert status == 200 and data["ok"] is True
-    assert len(data["benchmarks"]) == 5
+    assert len(data["benchmarks"]) == 6
     assert data["benchmarks"][0]["id"] == "rpn_expression_calc"
     assert "profiles" in data and "recent" in data
     assert data["default_base_dir"].endswith("benchmarks")
@@ -481,3 +481,160 @@ def test_benchmark_run_endpoint_can_wait_for_report(gui, monkeypatch):
     assert status == 200 and data["ok"] is True
     assert data["project_path"].endswith("waited")
     assert data["report"] == "# report"
+
+
+# ----------------------------------------------------- pelican SVG benchmark ----
+GOLDEN_PELICAN = r'''"""A parametric pelican riding a bicycle (golden test fixture)."""
+import math
+from pathlib import Path
+
+GROUND_Y = 440
+
+
+def _wheel(gid, cx):
+    spokes = "".join(
+        f'<line x1="{cx}" y1="{GROUND_Y}" x2="{cx + 78 * math.cos(a):.1f}" '
+        f'y2="{GROUND_Y + 78 * math.sin(a):.1f}" stroke="#999" stroke-width="2"/>'
+        for a in (i * math.pi / 4 for i in range(8)))
+    return (f'<g id="{gid}">'
+            f'<circle cx="{cx}" cy="{GROUND_Y}" r="90" fill="none" stroke="#222" stroke-width="10"/>'
+            f'<circle cx="{cx}" cy="{GROUND_Y}" r="78" fill="#f7f7f7" stroke="#999" stroke-width="3"/>'
+            f'{spokes}'
+            f'<circle cx="{cx}" cy="{GROUND_Y}" r="8" fill="#444"/></g>')
+
+
+def generate_pelican_svg() -> str:
+    frame = (
+        '<g id="bicycle-frame" stroke="#1f4e79" stroke-width="10" stroke-linecap="round">'
+        '<line x1="220" y1="440" x2="400" y2="440"/>'
+        '<line x1="400" y1="440" x2="350" y2="250"/>'
+        '<line x1="350" y1="250" x2="220" y2="440"/>'
+        '<line x1="350" y1="250" x2="540" y2="280"/>'
+        '<line x1="400" y1="440" x2="540" y2="290"/>'
+        '<line x1="540" y1="280" x2="580" y2="440"/>'
+        '<circle cx="400" cy="440" r="14" fill="#555" stroke="none"/>'
+        '<line x1="400" y1="440" x2="430" y2="470" stroke="#555"/>'
+        '<rect x="420" y="466" width="24" height="6" fill="#222" stroke="none"/>'
+        '</g>')
+    bars = ('<g id="handlebars" stroke="#333" stroke-width="6" fill="none" stroke-linecap="round">'
+            '<line x1="540" y1="280" x2="552" y2="246"/>'
+            '<path d="M 552 246 L 580 236 Q 592 234 588 248"/></g>')
+    body = ('<g id="pelican-body">'
+            '<path d="M 440 280 Q 470 220 490 200" fill="none" stroke="#f2f2f2" stroke-width="40" stroke-linecap="round"/>'
+            '<ellipse cx="360" cy="300" rx="110" ry="65" fill="#f2f2f2" stroke="#555" stroke-width="3"/>'
+            '<path d="M 300 280 Q 380 200 450 270 Q 380 290 300 330 Z" fill="#c9a227" stroke="#7a5d10" stroke-width="2"/>'
+            '<polygon points="250,300 200,330 232,340" fill="#e0b84a"/>'
+            '</g>')
+    head = ('<g id="pelican-head-beak">'
+            '<circle cx="500" cy="190" r="34" fill="#f2f2f2" stroke="#555" stroke-width="3"/>'
+            '<circle cx="512" cy="182" r="6" fill="#111"/>'
+            '<polygon points="530,190 600,205 530,215" fill="#f5a623" stroke="#b36b00" stroke-width="2"/>'
+            '<path d="M 532 214 Q 575 245 540 262 Q 515 255 520 214 Z" fill="#e8892b" stroke="#b35f10" stroke-width="2"/>'
+            '</g>')
+    legs = ('<g id="pelican-legs" stroke="#f5a623" stroke-width="9" fill="none" stroke-linecap="round">'
+            '<path d="M 345 358 L 380 410 L 420 462"/>'
+            '<path d="M 372 358 L 396 412 L 428 458" stroke="#d18a1a"/>'
+            '<polygon points="415,460 442,466 442,474 412,472" fill="#f5a623" stroke="none"/>'
+            '</g>')
+    return ('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 800 600" width="800" height="600">'
+            '<rect width="800" height="600" fill="#eaf6ff"/>'
+            f'{_wheel("rear-wheel", 220)}{_wheel("front-wheel", 580)}'
+            f'{frame}{bars}{body}{head}{legs}'
+            '</svg>')
+
+
+def main():
+    here = Path(__file__).resolve().parent
+    svg = generate_pelican_svg()
+    (here / "pelican_bicycle.svg").write_text(svg, encoding="utf-8")
+    (here / "preview.html").write_text(
+        "<!doctype html><meta charset='utf-8'><title>Pelican</title><body>"
+        + svg + "</body>", encoding="utf-8")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+'''
+
+GOLDEN_PELICAN_TEST = """\
+from pelican_bike import generate_pelican_svg
+
+
+def test_svg_has_root():
+    assert generate_pelican_svg().startswith("<svg")
+"""
+
+
+def _write_pelican(project: Path, source: str = GOLDEN_PELICAN) -> None:
+    project.mkdir(parents=True, exist_ok=True)
+    (project / "pelican_bike.py").write_text(source, encoding="utf-8")
+    (project / "test_pelican_bike.py").write_text(GOLDEN_PELICAN_TEST,
+                                                   encoding="utf-8")
+
+
+def test_pelican_rubric_scores_golden_drawing(tmp_path):
+    project = tmp_path / "pelican"
+    _write_pelican(project)
+    suite = benchmarks.run_holdout(project, "pelican_bicycle_svg")
+    failed = [(c.id, c.detail) for c in suite.checks if not c.passed]
+    assert suite.total == 10 and suite.passed == 10, failed
+    assert (project / "pelican_bicycle.svg").is_file()
+    assert (project / "preview.html").is_file()
+    assert benchmarks.run_model_tests(project).ok
+
+
+def test_pelican_rubric_flags_collapsed_wheels(tmp_path):
+    project = tmp_path / "collapsed"
+    _write_pelican(project, GOLDEN_PELICAN.replace(
+        '_wheel("front-wheel", 580)', '_wheel("front-wheel", 300)'))
+    suite = benchmarks.run_holdout(project, "pelican_bicycle_svg")
+    failed = {c.id for c in suite.checks if not c.passed}
+    assert "wheel_geometry" in failed
+    assert "pelican_script_runs" not in failed
+
+
+def test_pelican_rubric_flags_a_missing_group(tmp_path):
+    project = tmp_path / "nogroup"
+    _write_pelican(project, GOLDEN_PELICAN.replace(
+        '<g id="pelican-legs"', '<g id="legs-renamed"'))
+    suite = benchmarks.run_holdout(project, "pelican_bicycle_svg")
+    failed = {c.id for c in suite.checks if not c.passed}
+    assert "semantic_groups" in failed
+
+
+def test_sanitize_svg_strips_scripts_handlers_and_external_refs():
+    dirty = ('<svg xmlns="http://www.w3.org/2000/svg" onload="alert(1)">'
+             '<script>alert(2)</script>'
+             '<foreignObject><div>x</div></foreignObject>'
+             '<a href="javascript:alert(3)"><rect width="5" height="5" onclick="x()"/></a>'
+             '<image href="http://example.com/x.png"/>'
+             '<circle cx="5" cy="5" r="2" fill="#123456"/></svg>')
+    clean = benchmarks.sanitize_svg(dirty)
+    lowered = clean.lower()
+    assert clean.startswith("<") and "circle" in lowered
+    for banned in ("script", "foreignobject", "onload", "onclick",
+                   "javascript:", "http://example.com"):
+        assert banned not in lowered, banned
+    assert benchmarks.sanitize_svg("<!DOCTYPE svg [<!ENTITY a 'b'>]><svg/>") == ""
+    assert benchmarks.sanitize_svg("<html></html>") == ""
+    assert benchmarks.sanitize_svg("not xml at all") == ""
+
+
+def test_svg_preview_is_a_data_uri_for_the_pelican(tmp_path):
+    import base64
+    import importlib.util
+    project = tmp_path / "pelican"
+    _write_pelican(project)
+    assert benchmarks.svg_preview(project) == ""
+    spec = importlib.util.spec_from_file_location(
+        "golden_pelican", project / "pelican_bike.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    (project / "pelican_bicycle.svg").write_text(
+        mod.generate_pelican_svg(), encoding="utf-8")
+    uri = benchmarks.svg_preview(project)
+    prefix = "data:image/svg+xml;base64,"
+    assert uri.startswith(prefix)
+    markup = base64.b64decode(uri[len(prefix):]).decode("utf-8")
+    assert "pelican-body" in markup and "<script" not in markup

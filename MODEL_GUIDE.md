@@ -29,7 +29,7 @@ than raw parameter count.
 - **Use Q4_K_M as the default quantization.** Use Q5 or Q6 if the model still fits
   comfortably. Avoid Q2 and IQ2 for code editing.
 - **Calibrate every model once** with `pedacito calibrate`. Compare models on
-  your own hardware with the five built-in benchmarks, or with `pedacito eval`.
+  your own hardware with the six built-in benchmarks, or with `pedacito eval`.
 - **Do not pick a setup from the model name alone.**
 
 ---
@@ -324,14 +324,14 @@ run by default, so you get a card as you add models.
 
 ## Compare models with the diagnostic benchmarks
 
-Pedacito includes five small diagnostic projects. For each one, a model builds the
+Pedacito includes six small diagnostic projects. For each one, a model builds the
 project through the normal Pedacito loop, and the result is graded in two ways:
 
 1. **The model's own tests** (`pytest -q`, or the project's verification script).
 2. **A hidden holdout rubric**, written by Pedacito, that uses only the public
    API the task describes. It checks the things small models often get wrong.
 
-The five projects contain 61 holdout checks in total.
+The six projects contain 71 holdout checks in total.
 
 | Benchmark | What it asks for | What it catches |
 |---|---|---|
@@ -340,6 +340,11 @@ The five projects contain 61 holdout checks in total.
 | **Thread-Safe TTL + LRU Cache** (`ttl_lru_cache`, 13 checks) | A two-file cache with TTL, LRU eviction, a memoize decorator, and stats | Eviction order, expired items evicted before live ones, `functools.wraps`, cross-file imports, thread safety |
 | **Streaming Log Parser & JSON Report** (`log_anomaly_analyzer`, 11 checks) | Parse mixed logs, compute percentiles per service, flag 5xx spikes, and emit strict JSON | Regex accuracy, nearest-rank percentiles, rolling 60-second windows, JSON discipline |
 | **Single-File Interactive Kanban Board** (`mini_kanban_html`, 13 checks) | A zero-dependency HTML, CSS, and JavaScript board with filters, persistence, and import/export | DOM ids that match between HTML and JS, event wiring, localStorage, CSS layout, offline delivery |
+| **Pelican Riding a Bicycle (Parametric SVG & Geometry)** (`pelican_bicycle_svg`, 10 checks) | A Python script that writes a labelled SVG drawing of a pelican on a bicycle, a browser preview page, and geometry tests | 2D coordinate geometry, the seven required semantic groups, well-formed XML with `viewBox="0 0 800 600"`, two wheels on one ground line, a large beak, a body above the axle, and a minimum of visual detail |
+
+The pelican benchmark is the spatial one. Its wheel and body checks read the
+coordinates the model wrote, so a drawing made of two empty circles fails. Its
+visual checks also need at least 15 graphic primitives and four colours.
 
 ### Run a benchmark
 
@@ -365,6 +370,9 @@ The report has these sections:
   holdout results. The overall result is PASS only when both pass.
 - **Usage:** tokens and model calls for the run.
 - **Shortcomings detected:** the specific failures the harness found.
+- **SVG preview:** when the project contains an SVG (the pelican benchmark's
+  `pelican_bicycle.svg`), the GUI scorecard shows the drawing inline. It is
+  rendered as a sandboxed image, so nothing in the file can run.
 - **Harness holdout rubric:** each check, its description, and pass or fail.
 - **Requirement ledger:** each clause of the task and the state it reached.
 - **Model test output** and **Holdout rubric output:** the full pytest output.
@@ -533,7 +541,7 @@ names for quantization. Aim for the equivalent of about 4 bits per weight.
       planner or verifier.
 - [ ] At 24 GB, measure thinking on and off before making it the default.
 - [ ] Run `pedacito calibrate` once per model and quantization.
-- [ ] Compare candidate models with the five benchmarks, on the same hardware.
+- [ ] Compare candidate models with the six benchmarks, on the same hardware.
 - [ ] Run `pedacito eval` before and after a change, and use `--baseline` as a gate.
 - [ ] Judge by first-apply-clean and token and time numbers, not pass rate alone.
 - [ ] Keep role routing simple on a single GPU. Every model switch can reload.

@@ -93,7 +93,12 @@ Step-by-step versions, with what you should see at each point, are in
 | **Role routing** | Send planner, verifier, or escalation work to a different profile, per job or per project | [MODEL_GUIDE.md](MODEL_GUIDE.md#hybrid-local--cloud-role-routing) |
 | **Auto-Tune wizard** | Answer four questions about your hardware and codebase, preview the budgets, then apply them | [QUICKSTART.md](QUICKSTART.md#part-a-the-gui) |
 | **Per-profile thinking** | Turn reasoning on or off for each model profile, from the GUI or `disable_thinking` | [MODEL_GUIDE.md](MODEL_GUIDE.md#thinking-per-profile) |
-| **Model benchmarks** | Five small projects with a hidden holdout rubric, scored per profile, so you can compare models on your own hardware | [MODEL_GUIDE.md](MODEL_GUIDE.md#compare-models-with-the-diagnostic-benchmarks) |
+| **Model benchmarks** | Six small projects with a hidden holdout rubric, scored per profile, including a parametric SVG drawing test whose result is shown inline, so you can compare models on your own hardware | [MODEL_GUIDE.md](MODEL_GUIDE.md#compare-models-with-the-diagnostic-benchmarks) |
+| **Prompt architect** | `✦ Refine Prompt` turns a one-line idea into a repo-aware spec with locked file targets and interface signatures. `↶ Undo Refine` restores your text | [TECHNIQUES.md](TECHNIQUES.md#17-the-promptspec-architect) |
+| **Interface contracts** | Auto locks the project's public signatures into every step, and checks cross-file imports and call arity before the tests run | [TECHNIQUES.md](TECHNIQUES.md#18-contract-first-interface-locking--cross-file-verification) |
+| **Static gate** | A fast undefined-name and syntax check (`ruff` F821 and E999, with a pure-Python fallback) runs before any test subprocess | [TECHNIQUES.md](TECHNIQUES.md#19-the-static-analysis-gate-a-linter-shaped-repair-trigger-for-free) |
+| **Green ratchet** | Auto snapshots the project before each step and rolls a step that still fails back to the last passing state | [TECHNIQUES.md](TECHNIQUES.md#20-green-ratchet-step-checkpoints-for-the-autonomous-loop) |
+| **Permission broker** | Web access, package installs, unapproved shell commands and sensitive file reads pause the run for an Allow Once, Allow for This Run, Always Allow, or Deny & Redirect decision | [Safety and trust](#safety-and-trust) |
 | **Safe writes** | Dry run by default, side-by-side review, backups before every write, `pedacito restore` to undo | [Review page](#review-page) |
 
 ### The GUI workspace
@@ -109,11 +114,20 @@ dependencies, so it works offline. It runs the same engine as the commands.
 - **Five modes** next to the chat box: **Task/Edit** for changes, **Ask** for
   read-only questions, **Auto** for goal-to-checklist runs, **New** for starting
   a project, and **How ?** for the built-in reference.
+- **✦ Refine Prompt** above the composer turns a one-line idea into a full spec
+  in place: objective, files to create or modify, interface contracts,
+  requirements and edge cases, and verification. **↶ Undo Refine** puts your
+  original text back. Drag the composer's top edge to make it taller while you
+  read the spec.
 - **Changes** show proposed edits as old and new code side by side, with
   per-file accept, reject, or hand edits.
+- **Permission requested** dialogs pause a run when the model asks for web
+  access, a package install, an unapproved shell command, or a sensitive file.
+  See [Safety and trust](#safety-and-trust).
 - **Settings** edits your profiles, every setting, the Auto-Tune wizard, and the
   raw config file, without deleting your comments.
-- **Benchmarks** runs the five diagnostic projects against any profile.
+- **Benchmarks** runs the six diagnostic projects against any profile. The
+  pelican SVG result is drawn inline in its scorecard.
 
 Chat threads are saved with timestamps and can be renamed. The **Files** panel
 lists the indexed project files, and **Backups** lists snapshots you can
@@ -131,7 +145,7 @@ commands. Run `pedacito <command> --help` for every flag.
 | `pedacito config --check` | Test the connection and generation. `--doctor` also probes structured output. `--setup` runs first-time setup |
 | `pedacito calibrate` | Measure the active model and save a model card that tunes defaults |
 | `pedacito profiles [--recommend]` | List profiles with their scores, and suggest role routing |
-| `pedacito ask PROJ -t "..."` | Run one task. Dry run by default. Add `--review`, `--apply`, `--plan`, or `--jsonl` |
+| `pedacito ask PROJ -t "..."` | Run one task. Dry run by default. Add `--review`, `--apply`, `--plan`, `--refine`, or `--jsonl` |
 | `pedacito explain PROJ -q "..."` | Answer a question about the code. Never edits |
 | `pedacito auto PROJ -t "..."` | Turn a goal into a checklist, then implement it task by task |
 | `pedacito new DIR -t "..."` | Start a project from scratch |
@@ -328,8 +342,9 @@ For model selection, VRAM sizing, thinking settings, and role routing, see the
 
 `pedacito how` answers questions about using Pedacito from a built-in
 **structured reference index**: every CLI command and flag, the exact GUI
-navigation path for each feature, and every config setting with its default,
-GUI location and `config.toml` form. It needs no project and no index. A model
+navigation path for each feature (including ✦ Refine Prompt, the permission
+dialog, web access, green ratchet rollbacks and the benchmarks), and every
+config setting with its default, GUI location and `config.toml` form. It needs no project and no index. A model
 connection is optional: when a fast model server is reachable it rewrites the
 retrieved facts into a short answer; otherwise the deterministic GUI/CLI/setting
 cards print immediately.
@@ -385,6 +400,12 @@ pedacito ask PROJ -t "..." --reindex    # force a fresh index first
 pedacito ask PROJ -t "..." --plan       # split a multi-part task into steps
 pedacito ask PROJ -t "..." --jsonl      # one JSON event per line on stdout
 ```
+
+`--refine` runs one Prompt/Spec Architect pass first: a one-line idea becomes a
+five-section spec (objective, files, interface contracts, requirements, and
+verification) grounded in the real file tree, and the run uses that spec. If no
+model answers, a deterministic fallback writes the same sections, so the flag
+never stops the run. See [TECHNIQUES.md §17](TECHNIQUES.md#17-the-promptspec-architect).
 
 Other useful flags: `--steps N` (lookup limit), `--strict` (exit 1 when a task
 applied edits but left a failed edit block or impacted tests still failing
@@ -605,6 +626,26 @@ several edits gets a warning. `auto_allowlist = true` restricts each task's
 writes: existing files can only be modified, moved, or deleted when the task
 title names them or the lookup phase read them; creating new files is always
 allowed.
+
+Three more guards run without a model call:
+
+- **Interface lock** (`interface_lock`, on by default). Before each task, the
+  project's public signatures (`def parse_line(text, sep=',')`, class
+  constructors, JS/TS functions) are injected into the prompt under a
+  "do not break signatures" heading. After each applied task, every local
+  import and call is checked against those signatures. A mismatch fails the task
+  before any test runs, and the exact message goes into the repair prompt.
+- **Static gate** (`static_gate`, on by default). Changed Python files get a
+  fast check for undefined names and syntax errors (`ruff` rules F821, F822,
+  F823, F402, F404, with E999 for syntax). Ruff gets a 3-second ceiling
+  (`static_gate_timeout`), and a built-in checker takes over if ruff is missing or
+  slow. Only errors the project did not already have count.
+- **Green ratchet** (`auto_green_ratchet`, on by default). Before each step,
+  Pedacito snapshots the source files into `.pedacito/checkpoints/`. A step that
+  still fails after its repair rounds is rolled back to that snapshot, and the
+  files it created are removed. The next step starts from the last passing state,
+  and the Activity log says `ROLLED BACK`. See
+  [TECHNIQUES.md §18–§20](TECHNIQUES.md#18-contract-first-interface-locking--cross-file-verification).
 
 `--worktree NAME` runs in `.pedacito/worktrees/NAME` on a `pedacito/NAME`
 branch, leaving your checkout untouched. Manage worktrees directly with
@@ -943,6 +984,38 @@ you configured. Within that:
   `post_compact`, `notification`: a JSON event on stdin, an optional JSON
   decision on stdout, exit status 2 to deny a `pre_*` event. No shell, a
   timeout, the scrubbed environment; a failing hook is a warning.
+
+- **Workspace containment.** Every path a tool touches is resolved with its
+  symlinks and must stay inside the project. A `..` component, an absolute path
+  outside the project, or a symlink that leads out is refused, so a link inside
+  your repository cannot reach `~/.ssh` or another project.
+- **Credential guard.** `.env` files (except `.env.example`-style templates),
+  private keys, SSH and TLS material, `.npmrc`, `.pypirc`, `.netrc` and
+  `credentials.json` are never indexed. The model can read one only after you
+  approve that read in the permission dialog.
+- **Localhost CSRF checks.** The GUI server refuses a state-changing request whose
+  `Origin` or `Referer` is not a loopback address. A web page open in the same
+  browser cannot drive it, even if it guesses the port.
+- **Web access is off by default.** With `enable_web = false`, the built-in
+  `fetch_url` and `web_search` tools are offered only when a task names a URL or
+  web words, and each call asks first in the permission dialog. Set
+  `enable_web = true` to allow them without asking. Loopback, link-local
+  (including cloud metadata) and private-network addresses are refused unless you
+  list them in `fetch_allowed_hosts`.
+- **Permission requests.** Some actions pause the run until you decide. The
+  **Permission requested** dialog shows the category, the action, the reason and
+  the exact target, with four buttons:
+  - **Allow Once** approves this request only.
+  - **Allow for This Run** approves that kind of request until the run ends.
+  - **Always Allow** approves it from now on. For web access it sets
+    `enable_web`, and for shell commands it sets `allow_shell`. The choice is
+    saved to your config when one exists.
+  - **Deny & Redirect** refuses the request, and the model is told to continue
+    with local project files only.
+
+  A request you do not answer (the dialog times out, or you press Stop) is
+  denied. The CLI has no dialog, so there a gated tool reports that it is
+  disabled in the config.
 
 `browser` and MCP servers still execute unsandboxed on your machine (a server is
 a program you chose to run). The sandbox contains `run` and test commands; it is

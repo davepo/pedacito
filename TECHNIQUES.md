@@ -546,7 +546,8 @@ and `new --complex`:
   project's exact public surface -- `def parse_line(text, sep=',')`,
   `class TableParser: __init__(encoding='utf-8')`, JS/TS `function`
   signatures -- into a ~300-token block headed
-  `[PROJECT INTERFACE CONTRACTS — DO NOT BREAK SIGNATURES]` and injects it
+  a "project interface contracts, do not break signatures" banner (`CONTRACT_HEADER`
+  in `spec.py`) and injects it
   into the task prompt. Files touched by the last step sort first so the
   freshest contracts survive the cap; `new`'s build passes read the same map
   ("PUBLIC API"). Deterministic AST/regex parsing: zero model tokens, no
@@ -662,6 +663,37 @@ Pure file I/O -- zero model tokens, no subprocess. Ablation flag:
 `auto_green_ratchet = false`.
 
 ---
+
+### 21. Trust boundaries: deterministic guards and a human permission broker
+
+A small local model should not be trusted with the whole machine, and a web page
+it reads may contain instructions meant for it. Four deterministic guards run
+before any file, URL or command is touched, and one human gate covers the
+decisions the guards cannot make:
+
+- **Workspace containment** (`security.resolve_safe_path`). Every path a tool
+  touches is resolved with its symlinks. A `..` component, or a link that leaves
+  the project, is refused before any read or write.
+- **Credential guard** (`security.is_sensitive_path`). Secret-bearing files
+  (`.env` and its variants, keys, SSH and TLS material, package-registry tokens)
+  are never indexed, and a read of one needs approval through the broker.
+- **Localhost CSRF guard** (`security.post_origin_allowed`). A state-changing
+  request to the GUI server must come from a loopback page when it carries an
+  `Origin` or `Referer`, so another site open in the same browser cannot drive it.
+- **Outbound guard** (`security.ssrf_error`). The web tools accept only http(s)
+  URLs and refuse loopback, link-local and cloud-metadata addresses, and private
+  networks, unless the host is named in `fetch_allowed_hosts`.
+- **Permission broker** (`security.request_permission`). Web access, package
+  installs, unapproved shell commands and sensitive reads park the worker thread
+  until the GUI answers: **Allow Once**, **Allow for This Run**, **Always Allow**
+  (which flips the matching setting, such as `enable_web`), or **Deny & Redirect**.
+  A denial returns a message that keeps the run going. No answer (a timeout or
+  Stop) counts as a denial. Plain CLI runs have no broker, so a gated tool reports
+  that it is disabled in the config instead of waiting for a person who is not
+  there.
+
+The guards cost no model tokens. The broker costs only the human's time, and it is
+reached only for an action the deterministic checks could not settle.
 
 ## Techniques that exist but are not a good fit
 
