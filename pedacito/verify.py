@@ -184,6 +184,49 @@ def check_syntax(results) -> list[Finding]:
 syntax_findings = check_syntax
 
 
+def check_static(results) -> list[Finding]:
+    """New undefined-name / `__all__` / use-before-binding errors in the
+    dry-applied buffers, checked in-process with the pure-AST static gate
+    (TECHNIQUES.md #19) -- no model tokens, no linter subprocess.
+
+    Like the syntax gate this compares the `after` buffer against the file's
+    `before` buffer, so errors the file already had stay quiet and a repair
+    round is never spent on pre-existing problems. Only Python files are
+    considered; syntax errors belong to `check_syntax` (whose verdict also
+    makes any static verdict on the same buffer unreliable)."""
+    from . import spec as spec_mod
+    out: list[Finding] = []
+    for r in results or ():
+        if not getattr(r, "ok", False) or not getattr(r, "file", ""):
+            continue
+        if not str(r.file).lower().endswith(".py"):
+            continue
+        after = getattr(r, "after", None)
+        if after is None:
+            continue
+        before = getattr(r, "before", None) or ""
+        errs = [e for e in spec_mod.ast_static_errors(r.file, after)
+                if ": E999 " not in e]
+        if not errs:
+            continue
+        base_keys = {spec_mod.static_error_key(e)
+                     for e in spec_mod.ast_static_errors(r.file, before)}
+        new = [e for e in errs
+               if spec_mod.static_error_key(e) not in base_keys]
+        if not new:
+            continue
+        m = re.match(r"^.+?:(\d+):\d+: ", new[0])
+        line = int(m.group(1)) if m else 0
+        out.append(Finding(
+            "static", "error", r.file,
+            "this edit introduces names that do not exist at the point they "
+            "are used (a missing import, a typo, or a bad `__all__` entry); "
+            "no linter or test process was run. Fix these before anything "
+            "else:\n" + "\n".join(f"- {e}" for e in new[:15]),
+            line=line))
+    return out
+
+
 # ------------------------------------------------------------ placeholders
 _PLACEHOLDER_RES = (
     re.compile(r"\braise\s+NotImplementedError\b"),
@@ -1206,6 +1249,8 @@ def check(agent, task: str, reply: str, results, gathered: str = ""
     try:
         edits = parse_edits(reply)
         findings += check_syntax(results)
+        if getattr(getattr(agent, "cfg", None), "static_gate", True):
+            findings += check_static(results)
         findings += check_placeholders(task, edits)
         findings += check_unread(agent, edits, results)
         findings += check_stale_references(agent, results)

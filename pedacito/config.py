@@ -260,6 +260,17 @@ class Config:
     # repair_rounds fix rounds. On by default: unlike auto_diagnostics the
     # baseline keeps pre-existing issues out of the feedback.
     post_edit_check: bool = True
+    # Static analysis gate (TECHNIQUES.md #19): before any test/lint
+    # subprocess, check the changed Python files for undefined names, bad
+    # `__all__` entries, and import placement with ruff (five rules, no
+    # config), falling back to a pure-AST resolver when ruff is missing,
+    # fails, or exceeds the timeout. Only errors the task itself introduced
+    # (diffed against the project state from before the step) trigger the
+    # cheap repair microloop -- zero tokens spent on a missing import that
+    # seconds of subprocess time would also have found.
+    static_gate: bool = True
+    # Seconds to wait for one ruff run before falling back to the AST gate.
+    static_gate_timeout: float = 3.0
     # Restrict what one task may WRITE: existing files can only be modified,
     # moved or deleted when the task title names them or the lookup phase read
     # them; brand-new files are always allowed. Off by default.
@@ -440,6 +451,20 @@ class Config:
     auto_max_minutes: int = 0
     # Fix rounds per failing verification before a task is given up on.
     auto_repair_rounds: int = 2
+    # Green ratchet (TECHNIQUES.md #20): snapshot the project's source files
+    # before every `auto` step; when a step fails its check after all repair
+    # rounds, undo exactly that step -- restore the files it modified, delete
+    # the files it created -- so the workspace is provably back at the last
+    # verified-green state and later steps cannot build on wreckage.
+    auto_green_ratchet: bool = True
+    # Per-step snapshot bounds: a file larger than this is recorded but not
+    # copied (rollback leaves it alone); the walk stops after this many
+    # files, so one snapshot cannot fill the disk on a vendored monorepo.
+    auto_checkpoint_max_file_bytes: int = 1_000_000
+    auto_checkpoint_max_files: int = 1_500
+    # Verified-green step snapshots kept per project; older ones are pruned
+    # when the loop finishes.
+    auto_keep_checkpoints: int = 25
     # `new --complex` / `auto`: a source file whose scaffold stub is longer than
     # this is split into several tasks (one per group of top-level
     # definitions). 0 disables splitting.

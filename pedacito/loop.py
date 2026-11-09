@@ -30,6 +30,7 @@ from . import safety, workspace
 from . import index as index_mod
 from . import instructions as instructions_mod
 from . import proc as proc_mod
+from . import ratchet as ratchet_mod
 from . import review as review_mod
 from . import testsel
 from . import todo as todo_mod
@@ -1315,6 +1316,12 @@ class TaskResult:
     # (verification off / no test command), else True/False from the last
     # verification round. `ask --strict` exits nonzero on False.
     tests_ok: bool | None = None
+    # Green-ratchet bookkeeping (`auto` only): True when this task's step
+    # failed its check after all repair rounds and was UNDONE -- files
+    # restored from the step's snapshot, step-created files removed -- and
+    # `rollback_info` holds that rollback's report (restored/deleted/skipped).
+    rolled_back: bool = False
+    rollback_info: dict = field(default_factory=dict)
 
 
 def _snapshot_stats(client) -> dict:
@@ -1380,16 +1387,76 @@ def _merge_repair_results(results, new):
                     and fileio_norm(r.file) in replaced)] + new
 
 
+def _static_enabled(cfg) -> bool:
+    """The static gate is on unless explicitly ablated."""
+    return bool(getattr(cfg, "static_gate", True))
+
+
+def _static_errors(root, cfg, files: list[str]) -> list[str]:
+    """Fast static gate (ruff or AST fallback) over project-relative paths.
+    Returns [] when disabled; never raises -- a broken gate must not sink a
+    task it cannot check."""
+    if not _static_enabled(cfg) or not files:
+        return []
+    try:
+        from . import spec as spec_mod
+        return spec_mod.run_fast_static_gate(
+            root, [root / f for f in files],
+            timeout=float(getattr(cfg, "static_gate_timeout", 3.0)))
+    except Exception:
+        return []
+
+
+def _new_static_errors(root, cfg, files: list[str]) -> list[str]:
+    """Static gate errors MINUS the ones the project already had before this
+    step (`cfg._static_baseline`); with no baseline recorded every error is
+    treated as new -- the safe direction for a gate, since pre-existing
+    breakage in a file about to be tested wastes the subprocess anyway."""
+    errors = _static_errors(root, cfg, files)
+    if not errors:
+        return []
+    baseline = getattr(cfg, "_static_baseline", None)
+    if baseline is None:
+        return errors
+    try:
+        from . import spec as spec_mod
+        return [e for e in errors
+                if spec_mod.static_error_key(e) not in baseline]
+    except Exception:
+        return errors
+
+
+def _capture_static_baseline(root, cfg) -> None:
+    """Record the static errors the project ALREADY has (whole-tree scan), so
+    only problems the current step introduces can trigger the fast repair
+    microloop. Bounded and cheap on repeat steps: the gate caches results per
+    file mtime/size, so untouched files cost nothing from step 2 onward."""
+    if not _static_enabled(cfg):
+        cfg._static_baseline = None
+        return
+    try:
+        from . import spec as spec_mod
+        errors = spec_mod.run_fast_static_gate(
+            root, spec_mod.list_python_files(root),
+            timeout=float(getattr(cfg, "static_gate_timeout", 3.0)))
+        cfg._static_baseline = {spec_mod.static_error_key(e) for e in errors}
+    except Exception:
+        cfg._static_baseline = None
+
+
 def _post_edit_tests(root, cfg, agent, idx, task, results, reply, backup_dir,
                      baseline, edit_files):
     """After edits were written, run the impacted tests (`verify_tests`).
 
     Before every subprocess run the dry-applied buffers are parsed in-process:
     a NEW syntax error rejects the hunk immediately and only the parser
-    diagnostic + 10-line window goes to repair. Once the patch parses, failures
-    are diffed by stable test identity against the pre-edit baseline (`new` /
-    `fixed` / `pre-existing` / `still_failing`), and any `new` failure repairs
-    even when the total count did not rise. Repair receives a structured
+    diagnostic + 10-line window goes to repair. Once the patch parses, the
+    fast static gate (TECHNIQUES.md #19) scans the changed files on disk for
+    NEW undefined names / bad `__all__` entries / misplaced imports -- also
+    zero subprocess, zero tokens. Then failures are diffed by stable test
+    identity against the pre-edit baseline (`new` / `fixed` / `pre-existing` /
+    `still_failing`), and any `new` failure repairs even when the total count
+    did not rise. Repair receives a structured
     Traceback Repair Packet, not the raw output tail.
 
     Returns (results, reply, tests_ok); tests_ok is None when the tests did
@@ -1424,6 +1491,44 @@ def _post_edit_tests(root, cfg, agent, idx, task, results, reply, backup_dir,
             if round_ >= max_rounds:
                 break
             fixed = agent._repair_from_findings(task, reply, syntax, results)
+            if not fixed:
+                break
+            new = agent._apply_once(fixed, False, backup_dir)
+            if not any(r.ok for r in new):
+                break
+            results = _merge_repair_results(results, new)
+            reply = (reply.rstrip() + "\n\n" + fixed)
+            changed = sorted({fileio_norm(r.file) for r in results if r.ok})
+            continue
+
+        # Static gate (TECHNIQUES.md #19): a NEW undefined name / bad
+        # `__all__` / import-placement error costs a micro-repair round here
+        # instead of seconds of test subprocess -- and the subprocess never
+        # starts while the patch cannot even resolve its own names.
+        static = _new_static_errors(root, cfg, changed)
+        if static:
+            tests_ok = False
+            print(f"  [static gate: {len(static)} new undefined-name/import "
+                  f"error(s) -- tests/lint subprocess skipped until they "
+                  f"are fixed]", file=sys.stderr)
+            workspace.log_event(
+                root, "static gate rejected the patch; test/lint "
+                      "subprocess skipped", "ERROR")
+            events_mod.get(root, cfg).emit(
+                "tests", ok=False, score=len(static), baseline=base_score,
+                round=round_, static=True, new=len(static), fixed=0,
+                still_failing=0, pre_existing=len(base_failures))
+            if round_ >= max_rounds:
+                break
+            finding = verify_mod.Finding(
+                "static", "error", "",
+                "after your edits the changed files fail the fast static "
+                "gate: these names do not exist at the point they are used "
+                "(a missing import, a typo, or a bad `__all__` entry). No "
+                "test or lint process was run. Fix these first:\n"
+                + "\n".join(f"- {e}" for e in static[:20]))
+            fixed = agent._repair_from_findings(task, reply, [finding],
+                                                results)
             if not fixed:
                 break
             new = agent._apply_once(fixed, False, backup_dir)
@@ -1990,6 +2095,11 @@ def run_task(root: Path, cfg, client, agent, idx, task: str, *,
     edit is remembered (files looked at, why) so a similar later task is warned
     off the same dead end; a success clears the warning."""
     from . import memory as memory_mod
+    if not getattr(cfg, "_auto_step", 0):
+        # Standalone task (ask/chat/eval): no outer loop owns the static
+        # baseline, so drop any leftover one and let _run_task_once record a
+        # fresh snapshot for this task.
+        cfg._static_baseline = None
     tr = _run_ladder(root, cfg, client, agent, idx, task, apply=apply,
                      review=review, answer_system=answer_system)
     if answer_system is not None or review or not getattr(cfg, "use_memory", True):
@@ -2067,6 +2177,12 @@ def _run_task_once(root: Path, cfg, client, agent, idx, task: str, *,
     stubs rather than edit existing code)."""
     when = workspace.stamp()
     wants_write = apply or review
+    if (_static_enabled(cfg) and not getattr(cfg, "_auto_step", 0)
+            and getattr(cfg, "_static_baseline", None) is None):
+        # Standalone ask/chat/eval run: diff the gate against the project as
+        # it stands, so pre-existing undefined names are not blamed on this
+        # task (the `auto` loop records this per step instead).
+        _capture_static_baseline(root, cfg)
     backup_dir = (workspace.new_backup_dir(root, when, unique=True)
                   if wants_write and cfg.backup else None)
     t_started = time.time()
@@ -2496,12 +2612,14 @@ def run_loop(root: Path, cfg, client, idx, plan_path: Path, *,
     workspace.log_event(root, f"auto loop: plan={plan_path.name}"
                               f" verify={verify or '(none)'}")
     _lint_plan_titles(root, plan_path)
+    ratchet_skip: list[str] = []      # loop state the green ratchet must undo
     # The plan file is harness state: only the loop ticks its boxes, so the
     # model may not write it through any tool or edit block.
     try:
         plan_rel = plan_path.resolve().relative_to(Path(root).resolve()).as_posix()
         if plan_rel not in cfg.protected_paths:
             cfg.protected_paths = tuple(cfg.protected_paths) + (plan_rel,)
+        ratchet_skip.append(plan_rel)
     except (ValueError, OSError):
         pass
 
@@ -2514,6 +2632,90 @@ def run_loop(root: Path, cfg, client, idx, plan_path: Path, *,
     pending_check: list[str] = []     # check whose repair runs next (0 or 1)
     retried: dict[str, int] = {}      # task title -> corrective re-runs used
     retry_note: list[str] = []        # one-shot note for the next attempt
+
+    # Green ratchet (TECHNIQUES.md #20): every attempted step snapshots the
+    # project first; a step that fails its check after all repair rounds is
+    # undone to the last verified-green state. The plan file itself is loop
+    # state and must never be rolled back.
+    ratchet_on = apply and bool(getattr(cfg, "auto_green_ratchet", True))
+    step_no = 0
+    step_of: dict[int, int] = {}      # attempt -> ratchet step number
+    rolled_back = 0
+
+    def mark_green(attempt_key: int, task: str) -> int:
+        """Step *attempt_key* verified green: keep its snapshot as the
+        rollback target for everything after it. Returns the step number."""
+        k = step_of.pop(attempt_key, None)
+        if ratchet_on and k:
+            try:
+                ratchet_mod.green(root, k)
+                events_mod.get(root, cfg).emit("green_checkpoint", step=k,
+                                               task=task[:200])
+            except Exception:
+                pass
+        return k or 0
+
+    def undo_step(attempt_key: int, task: str, why: str,
+                  result) -> None:
+        """Roll a failed step back to the last verified-green state: restore
+        the files it modified, delete the files it created, re-index what
+        survived, and leave a context note so later tasks know the code they
+        are building on was NOT changed by this step. A step that changed
+        nothing (the worker never reached an edit) leaves an empty rollback:
+        quiet, not counted, nothing was undone."""
+        nonlocal rolled_back, idx
+        k = step_of.pop(attempt_key, None)
+        if not (ratchet_on and k):
+            return
+        try:
+            info = ratchet_mod.rollback(root, k)
+        except Exception as e:
+            workspace.log_event(root, f"green ratchet rollback failed: {e}",
+                                "ERROR")
+            return
+        if result is not None:
+            try:
+                result.rollback_info = info
+            except Exception:
+                pass
+        if info.get("error"):
+            workspace.log_event(root, f"green ratchet: {info['error']}",
+                                "WARN")
+        touched = list(info["restored"]) + list(info["deleted"])
+        if not touched and not info["skipped"]:
+            return                    # the step never touched a file
+        for rel in touched:
+            if rel in info["deleted"] and not (root / rel).exists():
+                continue    # a deleted file's stale entry dies on next refresh
+            try:
+                idx = index_mod.reindex_file(idx, rel, cfg)
+            except Exception:
+                pass
+        rolled_back += 1
+        if result is not None:
+            try:
+                result.rolled_back = True
+            except Exception:
+                pass
+        events_mod.get(root, cfg).emit(
+            "green_ratchet", step=k, task=task[:200],
+            restored=info["restored"], deleted=info["deleted"],
+            skipped=info["skipped"], reason=why[:200])
+        workspace.log_event(
+            root, f"green ratchet: step {k} rolled back to the last "
+                  f"verified-green state ({len(info['restored'])} restored, "
+                  f"{len(info['deleted'])} deleted): {why[:160]}", "WARN")
+        print(f"  [green ratchet: the step failed after all repair rounds; "
+              f"rolled back {len(info['restored'])} modified and deleted "
+              f"{len(info['deleted'])} created file(s) -- the workspace is "
+              f"back at the last verified-green checkpoint]", file=sys.stderr)
+        context_notes.append(
+            f"### ROLLED BACK: {task}\nThis step's changes were undone "
+            f"(restored: {', '.join(info['restored'][:12]) or 'nothing'}; "
+            f"deleted: {', '.join(info['deleted'][:12]) or 'nothing'}). The "
+            "workspace is at the last verified-green state -- re-read files "
+            "before building on them.")
+        _prune_notes(context_notes)
 
     def offer_remediation(task: str, tr, miss: str) -> bool:
         """Record a failed verification's report as a context note and insert
@@ -2600,6 +2802,30 @@ def run_loop(root: Path, cfg, client, idx, plan_path: Path, *,
         _, task = nxt
         attempted += 1
         print(f"\n=== task {attempted}: {task} ===", file=sys.stderr)
+        if ratchet_on:
+            step_no += 1
+            try:
+                snap = ratchet_mod.begin(
+                    root, step_no, task,
+                    max_file_bytes=int(getattr(
+                        cfg, "auto_checkpoint_max_file_bytes",
+                        ratchet_mod.DEFAULT_MAX_FILE_BYTES)),
+                    max_files=int(getattr(cfg, "auto_checkpoint_max_files",
+                                          ratchet_mod.DEFAULT_MAX_FILES)),
+                    skip=ratchet_skip)
+                if snap.get("truncated"):
+                    workspace.log_event(
+                        root, f"green checkpoint step {step_no} hit the "
+                              f"file cap; its rollback is partial", "WARN")
+            except Exception as e:
+                workspace.log_event(root, f"green checkpoint failed: {e}",
+                                    "WARN")
+            step_of[attempted] = step_no
+        # The static gate's baseline belongs to the STEP, not the task: it is
+        # taken here (before the worker's first write, and once per step so
+        # the step's own errors are repairable, not "pre-existing").
+        cfg._auto_step = attempted
+        _capture_static_baseline(root, cfg)
 
         investigate = _is_investigation_task(task)
         task_for_agent = task + _evidence_hint(task)
@@ -2642,6 +2868,7 @@ def run_loop(root: Path, cfg, client, idx, plan_path: Path, *,
         except LLMError as e:
             print(f"  task failed: {e}", file=sys.stderr)
             workspace.log_event(root, f"task failed: {e}", "ERROR")
+            undo_step(attempted, task, f"task failed: {e}", None)
             failed += 1
             if stop_on_fail:
                 break
@@ -2753,6 +2980,7 @@ def run_loop(root: Path, cfg, client, idx, plan_path: Path, *,
                     continue
                 context_notes.append(f"### {task}\n{_clip_report(tr.reply)}")
                 _prune_notes(context_notes)   # run anchor + latest two
+                mark_green(attempted, task)
                 mark_done(plan_path, task)
                 done += 1
                 workspace.log_event(root, "investigation done")
@@ -2835,6 +3063,7 @@ def run_loop(root: Path, cfg, client, idx, plan_path: Path, *,
                     # The repair refused to edit: remember that for the check
                     # that retries next.
                     repair_outcome[pending_check.pop()] = False
+                mark_green(attempted, task)
                 mark_done(plan_path, task)
                 done += 1
                 continue
@@ -2869,6 +3098,23 @@ def run_loop(root: Path, cfg, client, idx, plan_path: Path, *,
                 syntax = verify_mod.check_syntax(
                     getattr(result, "results", None))
                 if not syntax:
+                    static = _new_static_errors(
+                        root, cfg, getattr(result, "changed", None) or [])
+                    if static:
+                        workspace.log_event(
+                            root, "static gate rejected the step; verify "
+                                  "subprocess skipped", "ERROR")
+                        print(f"  [static gate: {len(static)} new "
+                              f"undefined-name/import error(s); "
+                              f"{check_label} subprocess skipped]",
+                              file=sys.stderr)
+                        return False, (
+                            "FAST STATIC GATE -- the changed files name "
+                            "things that do not exist at the point they are "
+                            "used (a missing import, a typo, or a bad "
+                            "`__all__` entry); no test or lint subprocess "
+                            "was run. Fix these first:\n"
+                            + "\n".join(f"- {e}" for e in static[:25]))
                     ok, out = run_check(result.changed)
                     if ok and spec_mod is not None:
                         try:
@@ -2994,6 +3240,8 @@ def run_loop(root: Path, cfg, client, idx, plan_path: Path, *,
                       file=sys.stderr)
                 workspace.log_event(
                     root, f"verify still failing: {check_label}", "ERROR")
+                undo_step(attempted, task,
+                          f"verification still failing: {check_label}", tr)
             failed += 1
             if stop_on_fail:
                 break
@@ -3054,12 +3302,24 @@ def run_loop(root: Path, cfg, client, idx, plan_path: Path, *,
             workspace.log_event(root, "strict: a task applied edits but left "
                                 "failed blocks or failing tests", "ERROR")
 
+        mark_green(attempted, task)
         mark_done(plan_path, task)
         done += 1
         workspace.log_event(root, f"task done ({done})")
         notify(task)
 
-    print(f"\n[{done} task(s) done, {failed} failed]", file=sys.stderr)
+    cfg._auto_step = 0
+    cfg._static_baseline = None
+    if ratchet_on:
+        try:
+            ratchet_mod.prune(
+                root, int(getattr(cfg, "auto_keep_checkpoints",
+                                  ratchet_mod.DEFAULT_KEEP)))
+        except Exception:
+            pass
+    print(f"\n[{done} task(s) done, {failed} failed"
+          + (f", {rolled_back} step(s) rolled back to the last green "
+             f"checkpoint" if rolled_back else "") + "]", file=sys.stderr)
     remaining = sum(1 for ln in read_plan(plan_path) if _is_unchecked(ln))
     if remaining:
         # Stopped with work outstanding (a cap, a time limit, or a failed
@@ -3070,8 +3330,12 @@ def run_loop(root: Path, cfg, client, idx, plan_path: Path, *,
                  if failed and stop_on_fail else "")
               + ".]", file=sys.stderr)
     workspace.log_event(root, f"auto loop finished: {done} done, "
-                              f"{failed} failed, {remaining} left",
+                              f"{failed} failed, {remaining} left"
+                              + (f", {rolled_back} rolled back"
+                                 if rolled_back else ""),
                         "ERROR" if failed else "INFO")
     _fire(cfg, root, "notification", message=f"pedacito auto finished: "
-          f"{done} done, {failed} failed, {remaining} left")
+          f"{done} done, {failed} failed, {remaining} left"
+          + (f", {rolled_back} step(s) rolled back to the last green "
+             f"checkpoint" if rolled_back else ""))
     return 0 if failed == 0 and not strict_bad else 1

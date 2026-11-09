@@ -16,17 +16,24 @@ names over a multi-step plan:
      AST gate checks every local ``from x import y`` and call arity across
      files, feeding the violation straight into the repair prompt.
 
-All checks here run in-process with ``ast`` and regexes: no model call, no
-subprocess, and deliberately conservative -- a false positive would send a
-working project into a repair round, so anything ambiguous is skipped rather
-than reported (the same rule `apicheck` follows).
+All checks here are deterministic and cost zero model tokens: the contract
+checks run in-process with ``ast`` and regexes, and the static analysis gate
+prefers a bounded, five-rule ``ruff`` subprocess with a pure-AST fallback when
+ruff cannot run. Same rule everywhere -- checks are deliberately conservative:
+a false positive would send a working project into a repair round, so anything
+ambiguous is skipped rather than reported (the same rule `apicheck` follows).
 """
 
 from __future__ import annotations
 
 import ast
+import builtins
 import re
+import shutil
+import subprocess
+import sys
 from pathlib import Path
+from typing import Iterable
 
 from . import fileio
 from .chunker import DEF_NODES, _signature
@@ -827,3 +834,720 @@ def refine_prompt(prompt: str, root, cfg, llm_client,
     refined = _render_refined(data, prompt, mode)
     return {"ok": True, "original": prompt, "refined": refined,
             "contracts": list(data["contracts"])}
+
+
+# ---------------------------------------------------------------------------
+# Fast static analysis gate (TECHNIQUES.md #19)
+# ---------------------------------------------------------------------------
+# The test subprocess is the most expensive way to learn that a line says
+# `json.dumps` in a file that never imports json: a full interpreter start,
+# collection, and often seconds of unrelated tests. This gate answers the
+# same question in milliseconds and zero model tokens -- `ruff check` with a
+# five-rule set when ruff is importable, a pure-stdlib scope resolver
+# (`ast_static_errors`) when it is not, errors out, or exceeds its timeout.
+# Callers diff the result against the project state from BEFORE the step
+# (see loop._capture_static_baseline), so only errors the step itself
+# introduced can trigger the cheap repair microloop.
+
+_STATIC_GATE_CODES = ("F821", "F822", "F823", "F402", "F404")
+# E999 was removed from selectable rules in recent ruff; syntax errors now
+# arrive as `invalid-syntax`, which we normalize back to the E999 label so
+# ruff and the AST fallback agree on the error key.
+_STATIC_SYNTAX_CODE = "E999"
+
+# The stdlib/typing names small models forget to import most often: the hint
+# turns a dead-end message into a one-glance fix.
+_COMMON_IMPORT_HINTS: dict[str, str] = {
+    "json": "import json", "re": "import re", "os": "import os",
+    "sys": "import sys", "math": "import math", "time": "import time",
+    "datetime": "import datetime", "collections": "import collections",
+    "itertools": "import itertools", "functools": "import functools",
+    "subprocess": "import subprocess", "shutil": "import shutil",
+    "tempfile": "import tempfile", "textwrap": "import textwrap",
+    "hashlib": "import hashlib", "random": "import random",
+    "pathlib": "import pathlib", "Path": "from pathlib import Path",
+    "typing": "import typing", "Optional": "from typing import Optional",
+    "Any": "from typing import Any", "Callable": "from typing import Callable",
+    "Dict": "from typing import Dict", "List": "from typing import List",
+    "Set": "from typing import Set", "Tuple": "from typing import Tuple",
+    "Union": "from typing import Union", "Iterable": "from typing import Iterable",
+    "Sequence": "from typing import Sequence", "Mapping": "from typing import Mapping",
+    "pytest": "import pytest", "yaml": "import yaml",
+    "argparse": "import argparse", "csv": "import csv",
+    "sqlite3": "import sqlite3", "base64": "import base64",
+    "urllib": "import urllib", "traceback": "import traceback",
+    "unicodedata": "import unicodedata", "copy": "import copy",
+    "warnings": "import warnings", "dataclass": "from dataclasses import dataclass",
+    "dataclasses": "import dataclasses", "enum": "import enum",
+    "annotations": "`from __future__ import annotations`",
+}
+
+_RUFF_TIMEOUT = 3.0
+_MAX_GATE_FILES = 80            # files per gate run (one subprocess)
+_MAX_FILE_ERRORS = 12           # errors per file in the AST fallback
+_MAX_TOTAL_ERRORS = 60          # runaway cap for any single gate run
+_AST_NODE_LIMIT = 40_000        # the AST fallback skips pathological files
+
+# One concise ruff line: "bad.py:2:12: F821 Undefined name `json`" or the
+# newer "broken.py:1:7: invalid-syntax: Expected a parameter...".
+_RUFF_LINE_RE = re.compile(
+    r"^(?P<file>.+?):(?P<line>\d+):(?P<col>\d+): "
+    r"(?:(?P<code>[A-Z][A-Z0-9]{1,4})\s|(?P<rule>[a-z][a-z0-9-]*):\s)"
+    r"(?P<msg>.*)$")
+
+_ruff_cmd: list[str] | None = None       # None = not probed; [] = unusable here
+
+
+def _ruff_command() -> list[str]:
+    """argv prefix for the ruff CLI, or [] when ruff cannot run here. Cached;
+    tests monkeypatch this to force either branch of the gate."""
+    global _ruff_cmd
+    if _ruff_cmd is not None:
+        return _ruff_cmd
+    exe = shutil.which("ruff")
+    if exe:
+        _ruff_cmd = [exe]
+        return _ruff_cmd
+    probe = [sys.executable, "-m", "ruff"]
+    try:
+        rc = subprocess.run([*probe, "--version"], capture_output=True,
+                            timeout=15).returncode
+    except (OSError, subprocess.TimeoutExpired):
+        rc = -1
+    _ruff_cmd = probe if rc == 0 else []
+    return _ruff_cmd
+
+
+def static_error_key(err: str) -> str:
+    """The identity of a gate error with the volatile line/column removed: a
+    name whose only change after a repair is its LINE is not a new error."""
+    m = re.match(r"^(?P<f>.+?):(?:\d+):(?:\d+): (?P<rest>.*)$", err)
+    if m:
+        return f"{m.group('f')}: {m.group('rest')}"
+    return err
+
+
+def _decorate(rel: str, line: int, col: int, code: str, msg: str) -> str:
+    """One gate error: `<file>:<line>:<col>: <CODE> <message> [hint]`. Same
+    shape and wording from ruff and from the AST fallback, so baseline keys
+    match whichever engine produced them."""
+    msg = msg.strip().rstrip(".")
+    if code in ("F821", "F822", "F823"):
+        m = re.search(r"`([^`]+)`|'([^']+)'", msg)
+        name = (m.group(1) or m.group(2)) if m else ""
+        if name:
+            if name in _COMMON_IMPORT_HINTS:
+                msg += f" -- did you forget `{_COMMON_IMPORT_HINTS[name]}`?"
+            elif code == "F823":
+                msg += " -- move the assignment above its use"
+            elif code == "F822":
+                msg += " -- export it in this file, or drop it from `__all__`"
+    return f"{rel}:{line}:{col}: {code} {msg}"
+
+
+def list_python_files(root: Path, cap: int = 400) -> list[Path]:
+    """Every scannable project ``.py`` file (bounded; never crossing into
+    vendored or hidden directories), for the per-step baseline scan."""
+    return [root / rel for rel in _iter_code_files(root, PY_EXTS, cap)]
+
+
+def run_fast_static_gate(
+    root: Path,
+    modified_files: Iterable[Path],
+    timeout: float = _RUFF_TIMEOUT,
+) -> list[str]:
+    """Gate the modified Python files: undefined names, bad ``__all__``
+    entries, use-before-binding, misplaced imports, and syntax errors -- in
+    milliseconds, zero model tokens.
+
+    Prefers ``ruff check --isolated`` with the five pyflakes codes; falls back
+    to the pure-AST resolver when ruff is missing, fails, or times out. Only
+    existing ``.py`` files are considered; non-Python and missing paths are
+    ignored. Returns ``<file>:<line>:<col>: <CODE> <message>`` strings; an
+    empty list means the gate found nothing, not that it could not run."""
+    files: list[Path] = []
+    seen: set[str] = set()
+    for f in modified_files:
+        p = Path(f) if not isinstance(f, Path) else f
+        if not p.is_absolute():
+            p = root / p
+        try:
+            if p.suffix.lower() != ".py" or not p.is_file():
+                continue
+            key = str(p)
+        except OSError:
+            continue
+        if key not in seen:
+            seen.add(key)
+            files.append(p)
+        if len(files) >= _MAX_GATE_FILES:
+            break
+    if not files:
+        return []
+    errors = _ruff_gate(root, files, timeout)
+    if errors is None:
+        errors = []
+        for p in files:
+            errors.extend(_ast_gate_file(root, p))
+            if len(errors) >= _MAX_TOTAL_ERRORS:
+                break
+    return errors[:_MAX_TOTAL_ERRORS]
+
+
+def _ruff_gate(root: Path, files: list[Path],
+               timeout: float) -> list[str] | None:
+    """Parsed ruff output, or None when the subprocess is unusable (missing,
+    timed out, unexpected exit): the caller then trusts the AST fallback."""
+    cmd = _ruff_command()
+    if not cmd:
+        return None
+    argv = [*cmd, "check", "--isolated", "--no-cache", "--quiet",
+            "--output-format", "concise",
+            "--select", ",".join(_STATIC_GATE_CODES), "--", *files]
+    try:
+        proc = subprocess.run(argv, capture_output=True, text=True,
+                              timeout=timeout, cwd=root)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if proc.returncode not in (0, 1):
+        return None
+    out: list[str] = []
+    raw = [ln for ln in (proc.stdout or "").splitlines() if ln.strip()]
+    matched = 0
+    for ln in raw:
+        m = _RUFF_LINE_RE.match(ln.strip())
+        if not m:
+            continue
+        matched += 1
+        code = m.group("code") or _STATIC_SYNTAX_CODE   # invalid-syntax -> E999
+        rel = _gate_label(root, m.group("file"))
+        out.append(_decorate(rel, int(m.group("line")), int(m.group("col")),
+                             code, m.group("msg")))
+    if raw and matched == 0:
+        return None          # output shaped unexpectedly: trust the AST instead
+    return out
+
+
+def _gate_label(root: Path, name: str) -> str:
+    """Project-relative label for any engine's path, so ruff and the AST
+    fallback (and the baseline) always agree on a key's file part."""
+    p = Path(name)
+    if not p.is_absolute():
+        p = root / p
+    try:
+        return p.resolve().relative_to(Path(root).resolve()).as_posix()
+    except (OSError, ValueError):
+        return p.as_posix()
+
+
+# --- the pure-AST fallback resolver ------------------------------------------
+# The subset of pyflakes that pays for a repair round: F821 (undefined name),
+# F822 (`__all__` entry missing at module level), F823 (local shadow used
+# before its binding), E999 (syntax error). House rule as everywhere in this
+# module: anything the resolver cannot decide with certainty is SKIPPED -- a
+# false positive would burn a repair round on working code.
+
+_BUILTIN_NAMES = frozenset(dir(builtins)) | {
+    "_", "__file__", "__name__", "__doc__", "__package__", "__spec__",
+    "__loader__", "__builtins__", "__debug__", "__path__", "__class__",
+    "__dict__", "__version__", "__annotations__",
+}
+
+_TYPE_ALIAS = getattr(ast, "TypeAlias", None)     # 3.12+; None on 3.11
+
+
+class _Scope:
+    """One lexical scope (module / class / function / lambda / comprehension):
+    the names it binds, and the Name-load nodes seen directly in it. Loads are
+    resolved in a second pass, once every binding anywhere has been
+    collected, so forward references inside function bodies stay quiet."""
+
+    __slots__ = ("kind", "parent", "bound", "uses", "bind_lines")
+
+    def __init__(self, kind: str, parent: "_Scope | None"):
+        self.kind = kind
+        self.parent = parent
+        self.bound: set[str] = set()
+        self.uses: list[ast.Name] = []
+        self.bind_lines: dict[str, int] = {}
+
+    def bind(self, name: str, line: int) -> None:
+        self.bound.add(name)
+        prev = self.bind_lines.get(name)
+        if prev is None or line < prev:
+            self.bind_lines[name] = line
+
+
+def ast_static_errors(rel: str, src: str) -> list[str]:
+    """Gate errors for one Python source string (used on file contents in the
+    fallback and on dry-applied buffers by ``verify.check_static``)."""
+    try:
+        tree = ast.parse(src)
+    except SyntaxError as exc:
+        line = max(int(exc.lineno or 1), 1)
+        col = max(int(exc.offset or 1), 1)
+        msg = (exc.msg or "invalid syntax").splitlines()[0].strip()
+        return [_decorate(rel, line, col, _STATIC_SYNTAX_CODE,
+                          f"invalid-syntax: {msg}")]
+    except (ValueError, RecursionError, MemoryError):
+        return []
+    if sum(1 for _ in ast.walk(tree)) > _AST_NODE_LIMIT:
+        return []
+    return _StaticResolver(rel).run(tree)
+
+
+class _StaticResolver:
+    def __init__(self, rel: str):
+        self.rel = rel
+        self.errors: list[str] = []
+        self.scopes: list[_Scope] = []
+        self.declared: set[str] = set()       # global/nonlocal: never guess
+        self.skip_all = False                 # star import / exec / eval seen
+        self.module: _Scope | None = None
+        self.all_node: ast.Assign | None = None
+        self.import_lines: dict[str, int] = {}    # module-level import alias
+        self.top_fors: list[ast.For] = []
+
+    def emit(self, node: ast.AST, code: str, msg: str) -> None:
+        if len(self.errors) >= _MAX_FILE_ERRORS:
+            return
+        line = max(int(getattr(node, "lineno", 1) or 1), 1)
+        col = max(int(getattr(node, "col_offset", 0) or 0) + 1, 1)
+        self.errors.append(_decorate(self.rel, line, col, code, msg))
+
+    # ---- pass 1: build the scope tree, collect bindings and uses ----------
+    def run(self, tree: ast.Module) -> list[str]:
+        mod = _Scope("module", None)
+        self.module = mod
+        self.all_node = self._find_all(tree.body)
+        self.future_annotations = any(
+            isinstance(s, ast.ImportFrom) and s.module == "__future__"
+            and any(a.name == "annotations" for a in s.names)
+            for s in tree.body)
+        self._stmts(tree.body, mod, top=True)
+        if not (self.skip_all or self._uses_dynamic_scope(tree)):
+            self._resolve_names()
+        self._check_all(mod)
+        if not (self.skip_all or self.declared):
+            self._check_f823()
+        self._check_f404(tree)
+        self._check_f402()
+        return self.errors
+
+    def _uses_dynamic_scope(self, tree: ast.Module) -> bool:
+        """exec()/eval()/locals() anywhere makes name availability opaque."""
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Name) and node.id in ("exec", "eval",
+                                                          "locals"):
+                return True
+            if isinstance(node, ast.Attribute) and node.attr in ("exec",
+                                                                 "eval"):
+                return True
+        return False
+
+    def _find_all(self, body: list[ast.stmt]) -> ast.Assign | None:
+        for stmt in body:
+            if (isinstance(stmt, ast.Assign)
+                    and any(isinstance(t, ast.Name) and t.id == "__all__"
+                            for t in stmt.targets)):
+                return stmt
+        return None
+
+    def _stmts(self, body: list[ast.stmt], scope: _Scope,
+               top: bool = False) -> None:
+        for stmt in body:
+            self._stmt(stmt, scope, top)
+
+    def _stmt(self, node: ast.stmt, scope: _Scope, top: bool) -> None:
+        k = type(node)
+        if k is ast.FunctionDef or k is ast.AsyncFunctionDef:
+            scope.bind(node.name, node.lineno)
+            parent = scope if scope.kind != "class" else self._func_parent(scope)
+            inner = _Scope("function", parent)
+            self.scopes.append(inner)
+            for d in node.decorator_list:
+                self._expr(d, scope)
+            a = node.args
+            for arg in [*a.posonlyargs, *a.args, *a.kwonlyargs]:
+                inner.bind(arg.arg, node.lineno)
+            if a.vararg is not None:
+                inner.bind(a.vararg.arg, node.lineno)
+            if a.kwarg is not None:
+                inner.bind(a.kwarg.arg, node.lineno)
+            for d in [*a.defaults, *[x for x in a.kw_defaults if x]]:
+                self._expr(d, scope)
+            for tp in getattr(node, "type_params", ()) or ():
+                inner.bind(tp.name, node.lineno)
+            self._stmts(node.body, inner)
+            if not self.future_annotations:
+                for ann in self._ann_exprs(node):
+                    self._expr(ann, scope)
+            return
+        if k is ast.ClassDef:
+            scope.bind(node.name, node.lineno)
+            for d in node.decorator_list:
+                self._expr(d, scope)
+            for b in [*node.bases, *node.keywords]:
+                self._expr(b, scope)
+            inner = _Scope("class", scope)
+            self.scopes.append(inner)
+            for tp in getattr(node, "type_params", ()) or ():
+                inner.bind(tp.name, node.lineno)
+            self._stmts(node.body, inner)
+            return
+        if k is ast.Assign:
+            for tgt in node.targets:
+                self._bind_target(tgt, scope)
+            self._expr(node.value, scope)
+            return
+        if k is ast.AnnAssign:
+            if node.value is not None and isinstance(node.target, ast.Name):
+                scope.bind(node.target.id, node.target.lineno)
+            if node.value is not None:
+                self._expr(node.value, scope)
+            if not self.future_annotations and isinstance(node.annotation,
+                                                          ast.AST):
+                self._expr(node.annotation, scope)
+            return
+        if k is ast.AugAssign:
+            if isinstance(node.target, ast.Name):
+                self._use(node.target, scope)
+            self._expr(node.value, scope)
+            return
+        if k is ast.Import:
+            for a in node.names:
+                name = (a.asname or a.name).split(".")[0]
+                scope.bind(name, node.lineno)
+                if top:
+                    self.import_lines.setdefault(name, node.lineno)
+            return
+        if k is ast.ImportFrom:
+            for a in node.names:
+                if a.name == "*":
+                    self.skip_all = True
+                    continue
+                name = a.asname or a.name
+                scope.bind(name, node.lineno)
+                if top:
+                    self.import_lines.setdefault(name, node.lineno)
+            return
+        if k in (ast.For, ast.AsyncFor):
+            if top and isinstance(node.target, ast.Name):
+                self.top_fors.append(node)
+            self._bind_target(node.target, scope)
+            self._expr(node.iter, scope)
+            self._stmts(node.body, scope)
+            self._stmts(node.orelse, scope)
+            return
+        if k in (ast.With, ast.AsyncWith):
+            for item in node.items:
+                self._expr(item.context_expr, scope)
+                if item.optional_vars is not None:
+                    self._bind_target(item.optional_vars, scope)
+            self._stmts(node.body, scope)
+            return
+        if k in (ast.Try, ast.TryStar):
+            self._stmts(node.body, scope)
+            for h in node.handlers:
+                if h.type is not None:
+                    self._expr(h.type, scope)
+                if h.name:
+                    scope.bind(h.name, node.lineno)
+                self._stmts(h.body, scope)
+            self._stmts(node.orelse, scope)
+            self._stmts(node.finalbody, scope)
+            return
+        if k in (ast.If, ast.While):
+            self._expr(node.test, scope)
+            self._stmts(node.body, scope)
+            self._stmts(node.orelse, scope)
+            return
+        if k is ast.Match:
+            self._expr(node.subject, scope)
+            for case in node.cases:
+                self._match_pattern(case.pattern, scope)
+                if case.guard is not None:
+                    self._expr(case.guard, scope)
+                self._stmts(case.body, scope)
+            return
+        if k is ast.Global:
+            self.declared.update(node.names)
+            if self.module is not None:
+                for n in node.names:
+                    self.module.bind(n, node.lineno)
+            return
+        if k is ast.Nonlocal:
+            self.declared.update(node.names)
+            return
+        if k is ast.Expr:
+            self._expr(node.value, scope)
+            return
+        if _TYPE_ALIAS is not None and k is _TYPE_ALIAS:   # 3.12+ only
+            if isinstance(node.name, ast.Name):
+                scope.bind(node.name.id, node.lineno)
+            self._expr(node.value, scope)
+            return
+        # Return / Raise / Assert / Delete: sweep the value-bearing fields.
+        for fld in ("test", "value", "msg", "exc", "cause"):
+            v = getattr(node, fld, None)
+            if isinstance(v, ast.AST):
+                self._expr(v, scope)
+
+    def _func_parent(self, scope: _Scope) -> _Scope:
+        """Functions never see class bodies: skip class scopes upward."""
+        s = scope
+        while s is not None and s.kind == "class":
+            s = s.parent
+        return s or self.module            # type: ignore[return-value]
+
+    def _ann_exprs(self, node) -> list[ast.AST]:
+        out = []
+        for a in [*node.args.posonlyargs, *node.args.args,
+                  *node.args.kwonlyargs,
+                  *([node.args.vararg] if node.args.vararg else []),
+                  *([node.args.kwarg] if node.args.kwarg else [])]:
+            if a.annotation is not None:
+                out.append(a.annotation)
+        if node.returns is not None:
+            out.append(node.returns)
+        return out
+
+    def _bind_target(self, tgt: ast.AST, scope: _Scope) -> None:
+        k = type(tgt)
+        if k is ast.Name:
+            scope.bind(tgt.id, tgt.lineno)
+        elif k in (ast.Tuple, ast.List):
+            for e in tgt.elts:
+                self._bind_target(e, scope)
+        elif k is ast.Starred:
+            self._bind_target(tgt.value, scope)
+        # Attribute / Subscript targets bind no new names.
+
+    def _match_pattern(self, p: ast.pattern, scope: _Scope) -> None:
+        k = type(p)
+        if k is ast.MatchAs:
+            if p.pattern is not None:
+                self._match_pattern(p.pattern, scope)
+            if p.name:
+                scope.bind(p.name, getattr(p, "lineno", 1) or 1)
+            return
+        if k is ast.MatchStar:
+            if p.name:
+                scope.bind(p.name, getattr(p, "lineno", 1) or 1)
+            return
+        if k is ast.MatchMapping:
+            if p.rest:
+                scope.bind(p.rest, getattr(p, "lineno", 1) or 1)
+            for v in p.keys:
+                self._expr(v, scope)
+            for v in p.patterns:
+                self._match_pattern(v, scope)
+            return
+        if k is ast.MatchValue:
+            self._expr(p.value, scope)
+            return
+        if k is ast.MatchSingleton:
+            return
+        for attr in ("cls", "patterns", "kwd"):
+            v = getattr(p, attr, None)
+            if isinstance(v, ast.AST):
+                self._expr(v, scope)
+            elif isinstance(v, list):
+                for x in v:
+                    if isinstance(x, ast.pattern):
+                        self._match_pattern(x, scope)
+                    elif isinstance(x, ast.AST):
+                        self._expr(x, scope)
+        if k is ast.MatchClass:
+            for x in p.kwd_patterns:
+                self._match_pattern(x, scope)
+
+    # ---- expressions: lambda and comprehension scopes own their names ------
+    def _expr(self, node: ast.AST | None, scope: _Scope) -> None:
+        if node is None:
+            return
+        k = type(node)
+        if k is ast.Name:
+            if isinstance(node.ctx, ast.Load):
+                self._use(node, scope)
+            return
+        if k is ast.Lambda:
+            inner = _Scope("lambda", scope)
+            self.scopes.append(inner)
+            a = node.args
+            for arg in [*a.posonlyargs, *a.args, *a.kwonlyargs]:
+                inner.bind(arg.arg, node.lineno)
+            if a.vararg is not None:
+                inner.bind(a.vararg.arg, node.lineno)
+            if a.kwarg is not None:
+                inner.bind(a.kwarg.arg, node.lineno)
+            for d in [*a.defaults, *[x for x in a.kw_defaults if x]]:
+                self._expr(d, scope)
+            self._expr(node.body, inner)
+            return
+        if k in (ast.ListComp, ast.SetComp, ast.GeneratorExp, ast.DictComp):
+            inner = _Scope("comprehension", scope)
+            self.scopes.append(inner)
+            for i, gen in enumerate(node.generators):
+                self._expr(gen.iter, scope if i == 0 else inner)
+                self._bind_target(gen.target, inner)
+                for cond in gen.ifs:
+                    self._expr(cond, inner)
+            if k is ast.DictComp:
+                self._expr(node.key, inner)
+                self._expr(node.value, inner)
+            else:
+                self._expr(node.elt, inner)
+            return
+        if k is ast.NamedExpr:                     # walrus binds in both
+            self._expr(node.value, scope)
+            if isinstance(node.target, ast.Name):
+                self._use(node.target, scope)
+                scope.bind(node.target.id, node.target.lineno)
+                if scope.kind in ("comprehension", "lambda"):
+                    leak = scope.parent
+                    while leak is not None and leak.kind in (
+                            "comprehension", "lambda"):
+                        leak = leak.parent
+                    if leak is not None:
+                        leak.bind(node.target.id, node.target.lineno)
+            return
+        if k is ast.Attribute:
+            self._expr(node.value, scope)
+            return
+        if k is ast.Constant or k is ast.arguments:
+            return
+        for _fld, v in ast.iter_fields(node):
+            if isinstance(v, ast.AST):
+                self._expr(v, scope)
+            elif isinstance(v, list):
+                for x in v:
+                    if isinstance(x, ast.AST):
+                        self._expr(x, scope)
+
+    def _use(self, node: ast.Name, scope: _Scope) -> None:
+        scope.uses.append(node)
+
+    # ---- pass 2: resolve uses ----------------------------------------------
+    def _chain(self, scope: _Scope) -> list[_Scope]:
+        out, s = [], scope
+        while s is not None:
+            out.append(s)
+            s = s.parent
+        return out
+
+    def _any_func_binding(self, name: str) -> bool:
+        """Bound inside some function/lambda/comprehension anywhere: a use
+        elsewhere cannot prove F821 -- a lazy import or a late binding may
+        still land first. ruff is exact here; the fallback errs silent.
+        CLASS scopes do not count: a class attribute is never visible to a
+        method at runtime, so that use is a genuine undefined name."""
+        return any(name in s.bound for s in self.scopes
+                   if s.kind in ("function", "lambda", "comprehension"))
+
+    def _resolve_names(self) -> None:
+        for scope in [self.module, *self.scopes]:
+            if scope is None:
+                continue
+            for node in scope.uses:
+                self._resolve(node, scope)
+
+    def _resolve(self, node: ast.Name, scope: _Scope) -> None:
+        name = node.id
+        if name in _BUILTIN_NAMES or name in self.declared:
+            return
+        for s in self._chain(scope):
+            if name in s.bound:
+                return
+        if self._any_func_binding(name):
+            return
+        self.emit(node, "F821", f"Undefined name `{name}`")
+
+    def _check_all(self, mod: _Scope) -> None:
+        if self.skip_all:
+            return                                # star import: names unknown
+        node = self.all_node
+        if node is None or not isinstance(node.value, (ast.List, ast.Tuple)):
+            return                                # built dynamically: opaque
+        elts = node.value.elts
+        for e in elts:
+            if not (isinstance(e, ast.Constant) and isinstance(e.value, str)):
+                return                            # not a plain name list
+        for e in elts:
+            if e.value not in mod.bound:
+                self.emit(node, "F822",
+                          f"Undefined name `{e.value}` in `__all__`")
+
+    def _check_f823(self) -> None:
+        """A name used in a function's own scope before its local binding,
+        while a module-level binding shadows the read: UnboundLocalError."""
+        mod = self.module
+        if mod is None:
+            return
+        for s in self.scopes:
+            if s.kind != "function":
+                continue
+            for node in s.uses:
+                name = node.id
+                if (name in _BUILTIN_NAMES or name not in s.bound
+                        or name not in mod.bound or name in self.declared):
+                    continue
+                bline = s.bind_lines.get(name, 0)
+                if bline and node.lineno < bline:
+                    self.emit(node, "F823",
+                              f"Local variable `{name}` referenced before "
+                              "assignment")
+
+    def _check_f404(self, tree: ast.Module) -> None:
+        seen_real = False
+        for i, stmt in enumerate(tree.body):
+            if isinstance(stmt, ast.ImportFrom) and stmt.module == "__future__":
+                if seen_real:
+                    self.emit(stmt, "F404",
+                              "`from __future__` imports must occur at the "
+                              "beginning of the file")
+                continue
+            if (isinstance(stmt, ast.Expr)
+                    and isinstance(stmt.value, ast.Constant)
+                    and isinstance(stmt.value.value, str) and i == 0):
+                continue                          # module docstring
+            if isinstance(stmt, (ast.Pass, ast.ImportFrom)):
+                continue
+            seen_real = True
+
+    def _check_f402(self) -> None:
+        """Module-level `import x`, then `for x in ...`: the loop variable
+        silently shadows the import for the rest of the file."""
+        for stmt in self.top_fors:
+            name = stmt.target.id
+            imp = self.import_lines.get(name)
+            if imp is not None and stmt.lineno > imp:
+                self.emit(stmt, "F402",
+                          f"Import `{name}` from line {imp} shadowed by "
+                          "loop variable")
+
+
+# Per-file cache for the fallback: (mtime_ns, size) -> errors. The gate runs
+# per repair round over the same changed files plus the whole-project
+# baseline; unchanged files then cost nothing.
+_AST_CACHE: dict[str, tuple[int, int, list[str]]] = {}
+
+
+def _ast_gate_file(root: Path, path: Path) -> list[str]:
+    try:
+        st = path.stat()
+    except OSError:
+        return []
+    key = str(path)
+    hit = _AST_CACHE.get(key)
+    if hit is not None and hit[0] == st.st_mtime_ns and hit[1] == st.st_size:
+        return list(hit[2])
+    try:
+        src = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return []
+    errs = ast_static_errors(_gate_label(root, key), src)
+    if len(_AST_CACHE) > 3000:
+        _AST_CACHE.clear()
+    _AST_CACHE[key] = (st.st_mtime_ns, st.st_size, errs)
+    return list(errs)

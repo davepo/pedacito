@@ -1040,7 +1040,8 @@ GUI_TOPICS = [
                      "verify", "worktree", "keep going"],
         "settings": ["auto_verify", "auto_repair_rounds", "auto_max_tasks",
                      "auto_max_minutes", "auto_install_deps",
-                     "auto_diagnostics", "auto_smoke"],
+                     "auto_diagnostics", "auto_smoke",
+                     "auto_green_ratchet"],
         "cli": ["auto", "worktree"],
     },
     {
@@ -1115,7 +1116,7 @@ GUI_TOPICS = [
                      "max_total_model_calls", "incremental_edit_loop",
                      "edit_plan_brief", "step_reasoning_first",
                      "dynamic_tool_pruning", "repair_rounds",
-                     "post_edit_check", "best_of"],
+                     "post_edit_check", "static_gate", "best_of"],
         "cli": ["calibrate", "profiles"],
     },
     {
@@ -1269,7 +1270,7 @@ GUI_TOPICS = [
                      "test command", "impacted tests", "after edits"],
         "settings": ["verify_tests", "test_command", "test_timeout",
                      "auto_verify", "auto_repair_rounds",
-                     "auto_diagnostics"],
+                     "auto_diagnostics", "static_gate"],
         "cli": ["auto", "tests", "ask"],
     },
     {
@@ -1482,6 +1483,17 @@ _SETTING_KEYWORDS = {
     "max_gathered_chars": ["gather budget", "context budget", "small window"],
     "max_total_model_calls": ["call cap", "model call budget"],
     "post_edit_check": ["syntax check", "lint after edit", "check edit"],
+    "static_gate": ["undefined name", "missing import", "ruff", "static "
+                    "analysis", "fast check", "syntax gate", "typo check"],
+    "static_gate_timeout": ["ruff timeout", "static analysis timeout"],
+    "auto_green_ratchet": ["rollback", "roll back", "green checkpoint",
+                           "undo failed step", "snapshot", "last good "
+                           "state", "auto safety"],
+    "auto_checkpoint_max_file_bytes": ["checkpoint size", "snapshot limit",
+                                       "big files"],
+    "auto_checkpoint_max_files": ["checkpoint file count", "snapshot limit"],
+    "auto_keep_checkpoints": ["checkpoint retention", "keep snapshots",
+                              "disk space"],
     "repair_rounds": ["edit repair", "retry matching", "fix edits"],
     "best_of": ["best of n", "sample answers", "candidates"],
     "verify_tests": ["run tests", "test after edit", "pytest"],

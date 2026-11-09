@@ -571,6 +571,96 @@ and `new --complex`:
 Together the two halves turn interfaces into a shared, checked fact of the
 plan rather than something each fresh context must rediscover.
 
+### 19. The static analysis gate: a linter-shaped repair trigger for free
+
+The inner loop already refuses to start a test subprocess when the dry-applied
+buffer will not parse (§ around `check_syntax`). The next-costliest class of
+small-model mistake survives parsing: a line that says `json.dumps(...)` in a
+file that never imported json, a typo'd name, an `__all__` entry that does not
+exist. Each one is a guaranteed crash -- and the harness only learns of it
+after a full interpreter start, collection, and often seconds of unrelated
+tests, or after a repair round trips through the model. `static_gate`
+(default on) inserts a zero-token gate between the two:
+
+- **Engine.** `spec.run_fast_static_gate` runs `ruff check --isolated
+  --select F821,F822,F823,F402,F404` over only the changed `.py` files --
+  five pyflakes rules, no project config, a `static_gate_timeout` (default
+  3 s) ceiling. When ruff cannot run at all, exits oddly, or exceeds the
+  timeout, a pure-stdlib fallback (`ast_static_errors`) resolves the same
+  questions with an two-pass scope walker: pass one builds the module/class/
+  function/lambda/comprehension scope tree and collects every binding and
+  every load; pass two resolves loads through the scope chain. Class scopes
+  are correctly invisible to methods (the classic `return attr` bug),
+  walrus/comprehension/global/nonlocal bindings are respected, and -- house
+  rule -- anything ambiguous is skipped: star-imports, `exec`/`eval`/`locals`
+  anywhere in the file, names bound in *any* function scope (a lazy import
+  may still land first), `global`/`nonlocal` declarations, pathological
+  files. ruff's newer `invalid-syntax` label is normalized to E999 so both
+  engines (and the baseline) share error keys; common forgotten imports get
+  a one-line hint appended (`-- did you forget `import json`?`) in either
+  engine's output.
+- **Baseline diffing.** A gate that blamed the project's pre-existing
+  breakage on every task would be noise, so the loop records the errors the
+  project *already had* before each step (`_capture_static_baseline`, cached
+  per file mtime/size) and only NEW keys -- identity without line numbers,
+  so a shifted line is not a new error -- can act. `ask`/`chat`/`eval` record
+  the same baseline once per task; `verify.check_static` compares the
+  dry-applied `after` buffer against the `before` buffer for the same file.
+- **Where it fires.** Inside `_post_edit_tests`, before the impacted-test
+  subprocess: the exact error lines go straight to `_repair_from_findings`,
+  the fix is applied, and only then does the (possibly saved) test run
+  start. Inside `run_loop`'s `_gated_check`, beside the syntax and contract
+  gates: a step that introduces an undefined name fails its check with the
+  exact lines, without ever spawning `--verify`. And through `verify.check`,
+  so `preflight`, `best_of` scoring, and the incremental per-hunk gate all
+  reject a hunk that breaks name resolution -- before it is ever written.
+
+Tokens spent: zero, unless the gate finds something, when it buys the
+cheapest possible repair prompt ("these names do not exist here") instead of
+a subprocess transcript the model must interpret. Ablation flag:
+`static_gate = false`.
+
+### 20. Green ratchet step checkpoints for the autonomous loop
+
+In `auto` mode every task builds on the previous one -- which means a late
+step that fails after exhausting its repair rounds used to leave the
+workspace holding its wreckage: modified files in a state that never passed
+any check, new files with no caller, and all later steps now writing code
+against a broken baseline. Repair rounds spent on that state were spent
+against the wrong code. `auto_green_ratchet` (default on) makes Auto mode
+monotonic:
+
+- **A snapshot per step.** Before each step's worker starts,
+  `ratchet.begin` copies every source-ish file (extension allowlist, dot
+  directories and vendored/state directories skipped, size and count caps via
+  `auto_checkpoint_max_file_bytes` / `auto_checkpoint_max_files`) into
+  `.pedacito/checkpoints/step_<k>/` with a `manifest.json` recording size
+  and skip-state. The plan file itself is on the never-snapshot list: the
+  loop ticks boxes mid-step and no rollback may un-tick them.
+- **The frontier.** When a step verifies green, `ratchet.green` advances a
+  pointer (`green_step.txt`) and its snapshot is kept as the restore point.
+  When a step fails its check -- after all `auto_repair_rounds` and any
+  worse-rollback guard -- `ratchet.rollback` undoes exactly that step:
+  files whose mtime/size prove the step modified them are restored from the
+  snapshot, current files absent from the snapshot are the step's creations
+  and are deleted (now-empty directories it created are pruned), the snapshot
+  is consumed. The workspace is provably back at the last verified-green
+  state; the next step inherits real work, not a poisoned tree.
+- **What the loop says.** A rollback is telemetry, not silence: the step
+  gets a `green_ratchet` event, an Activity Log line and a chat-facing
+  `### ROLLED BACK: <task>` context note (restored/deleted file lists) so a
+  later step knows the code it builds on was NOT changed by the failed one;
+  the run summary and the `notification` hook report the rollback count; the
+  step's TaskResult carries `rolled_back`/`rollback_info`. A step that never
+  touched a file (the worker died before editing) rolls back to nothing and
+  is reported as such. `auto_keep_checkpoints` prunes old green snapshots
+  when the run finishes; the two features compound: the static gate catches
+  a broken step faster, and the ratchet guarantees the next step never sees
+  its corpse.
+
+Pure file I/O -- zero model tokens, no subprocess. Ablation flag:
+`auto_green_ratchet = false`.
+
 ---
 
 ## Techniques that exist but are not a good fit
