@@ -791,10 +791,20 @@ details pre { background: var(--code-bg); border: 1px solid var(--line); border-
 .note-box { padding: 8px 10px; border: 1px solid var(--line); border-radius: 8px;
   background: var(--panel2); font-size: 12.5px; margin-bottom: 10px; }
 .note-box.err { border-color: var(--err); color: var(--err); white-space: pre-wrap; }
-/* quick-add hosted provider card (Sprint J) — sits above the local scanner */
-.cloud-card { border-color: var(--line2); }
-.cloud-card .form { grid-template-columns: 120px minmax(0, 1fr); gap: 6px 10px; margin-top: 8px; }
-.cloud-card .cc-foot { display: flex; align-items: center; gap: 10px; margin-top: 10px; flex-wrap: wrap; }
+/* Hosted-provider dialog: connect & verify live, then import model-named
+   profiles. Replaces the old inline quick-add card — the dialog is opened by
+   the "+ Add Hosted Provider…" buttons in Model discovery and Profiles. */
+.hp-form { grid-template-columns: 120px minmax(0, 1fr); gap: 6px 10px; margin-top: 4px; }
+.hp-foot { display: flex; align-items: center; gap: 10px; margin-top: 10px; flex-wrap: wrap; }
+.hp-badge { display: inline-flex; align-items: center; gap: 6px; margin-top: 10px;
+  padding: 3px 10px; border-radius: 999px; font-size: 12px; font-weight: 700;
+  color: var(--ok); border: 1px solid var(--ok);
+  background: color-mix(in srgb, var(--ok) 10%, transparent); }
+.hp-tools { display: flex; align-items: center; gap: 8px; margin: 12px 0 6px; flex-wrap: wrap; }
+.hp-search { max-width: 260px; }
+.hp-models { max-height: 46vh; overflow-y: auto; border: 1px solid var(--line); border-radius: 8px; }
+.hp-models .scan-table { font-size: 12px; }
+.hp-models .scan-table th { position: sticky; top: 0; background: var(--panel); }
 #rawText { width: 100%; height: 50vh; font: 12.5px/1.5 var(--mono); white-space: pre; }
 .setgrp > summary { cursor: pointer; font-weight: 700; padding: 4px 0; font-size: 13px; }
 

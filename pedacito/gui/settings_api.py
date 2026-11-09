@@ -884,7 +884,10 @@ def _preset_by_id(preset_id: str) -> dict:
 
 
 def provider_presets() -> dict:
-    """`GET /api/providers/presets`: the quick-add catalog for the UI."""
+    """`GET /api/providers/presets`: the quick-add catalog for the UI. The
+    route wraps this in `{"ok": True, ...}`. Every key here must exist on the
+    JS mirror `PDC.FALLBACK_PROVIDER_CATALOG` in static/app.js (and vice
+    versa): the UI seeds from the fallback and replaces it with this answer."""
     return {"presets": [dict(p) for p in CLOUD_PROVIDERS]}
 
 
@@ -925,7 +928,13 @@ def add_provider_preset(body: dict) -> dict:
 
     `body`: {preset_id, model?, profile_name?, api_key?, api_key_env?,
              set_default?, file?}. A pasted key wins over the env var name
-    (`api_key_env` beats `api_key` at request time, so only one is stored)."""
+    (`api_key_env` beats `api_key` at request time, so only one is stored).
+
+    The default profile name is derived from the MODEL (`_preset_profile_
+    suggestion`), never from the vendor alone; the hosted-provider dialog
+    passes an explicit model-id-based `profile_name` (step B of the probe
+    flow), so every profile the UI creates reads as `claude_sonnet_4_5`,
+    `deepseek_chat`, `gemini_2_5_flash`..."""
     body = body or {}
     preset = _preset_by_id(body.get("preset_id"))
     model = str(body.get("model") or "").strip() or preset["models"][0]
@@ -973,5 +982,226 @@ def add_provider_preset(body: dict) -> dict:
     out["added"] = name
     out["preset"] = preset["id"]
     out["model"] = model
+    out["uses_env"] = bool(api_key_env and not api_key)
+    return out
+
+
+# --- live provider probe and model-named multi-import --------------------------
+#
+# Pedacito stays local-first: the hosted-provider dialog never trusts a key it
+# has not used. `probe_provider` authenticates against the provider's own
+# `/models` endpoint from this machine (one GET, 8s timeout), and every model
+# the provider reports comes back with a profile name derived from the MODEL
+# id (`deepseek_chat`, `gemini_2_5_flash`), uniquified against the profiles
+# already in the config. On an auth or network failure the curated preset ids
+# stay importable, so the dialog works even while the key needs fixing.
+
+# Obvious non-chat model families: embeddings, speech, images, moderation.
+# Dropping them keeps a coding agent's model picker honest about its size.
+_NON_CHAT_HINTS = ("embedding", "whisper", "tts", "dall-e", "moderation",
+                   "audio", "speech", "transcribe", "imagen", "image")
+
+# Anthropic's OpenAI-compatible surface (and its native /v1/messages) take the
+# key as `x-api-key` with a version stamp; sending both spellings costs nothing
+# and lets either authentication path verify the key.
+_ANTHROPIC_VERSION = "2023-06-01"
+
+
+def _clean_model_id(raw) -> str:
+    """`models/gemini-2.5-flash` (how Google's OpenAI endpoint spells its ids)
+    becomes `gemini-2.5-flash`; everything else just trims."""
+    mid = str(raw or "").strip()
+    if mid.startswith("models/"):
+        mid = mid[len("models/"):].strip()
+    return mid
+
+
+def _probe_headers(preset_id: str, base_url: str, key: str) -> dict:
+    headers = {"Authorization": f"Bearer {key}", "Accept": "application/json"}
+    if preset_id == "anthropic" or "anthropic.com" in str(base_url or "").lower():
+        headers["x-api-key"] = key
+        headers["anthropic-version"] = _ANTHROPIC_VERSION
+    return headers
+
+
+def _existing_profile_index(which: str) -> tuple[set, set]:
+    """(profile names taken, imported (normalized URL, model) pairs) for one
+    config file -- the uniqueness and 'already imported' bookkeeping."""
+    try:
+        flat, profiles = settings.validate_text(_read_text(config_path(which)))
+    except (ConfigError, OSError):
+        return set(), set()
+    imported = {(_norm_url(b.get("base_url", flat.get("base_url", ""))),
+                 str(b.get("model") or "")) for b in profiles.values()}
+    return set(profiles), imported
+
+
+def _provider_rows(items, base_url: str, taken: set, imported: set) -> list:
+    """Probe payloads -> dialog rows: cleaned ids, obvious non-chat models
+    dropped, one row per id, each carrying a unique model-derived profile
+    name and whether this (server, model) pair is already configured."""
+    skey = _norm_url(base_url)
+    rows: list = []
+    seen: set = set()
+    for it in items or []:
+        if isinstance(it, str):
+            raw = it
+        elif isinstance(it, dict):
+            raw = it.get("id") or it.get("name") or ""
+        else:
+            raw = ""
+        mid = _clean_model_id(raw)
+        if not mid or mid in seen:
+            continue
+        if any(tok in mid.lower() for tok in _NON_CHAT_HINTS):
+            continue        # embeddings/audio/moderation never lead a picker
+        seen.add(mid)
+        rows.append({"id": mid,
+                     "suggested_profile_name": _suggest_profile_name(mid, taken),
+                     "already_imported": (skey, mid) in imported})
+    return rows
+
+
+def probe_provider(body: dict) -> dict:
+    """`POST /api/providers/probe`: verify a hosted provider key live against
+    `<base_url>/models` and return the model list the dialog imports from.
+
+    `body`: {preset_id?, base_url?, api_key?, api_key_env?, file?}. The
+    effective key is the pasted `api_key` when non-empty, else
+    `os.environ[api_key_env]` (the preset's own env var when none was named).
+    An unknown `preset_id` is refused; `custom` (or none) means "any
+    OpenAI-compatible URL". Success: {"ok": True, "verified": True, "models":
+    [{"id", "suggested_profile_name", "already_imported"}]}. Failure: {"ok":
+    False, "error": "...", "models": <curated preset ids>} so the user can
+    still pick a model and fix the key later."""
+    body = body or {}
+    pid = str(body.get("preset_id") or "").strip().lower()
+    preset = _preset_by_id(pid) if pid and pid != "custom" else None
+    base_url = str(body.get("base_url")
+                   or (preset or {}).get("base_url") or "").strip()
+    if not base_url:
+        raise ConfigError("Give the provider base URL first.")
+    api_key = str(body.get("api_key") or "").strip()
+    env = str(body.get("api_key_env") or "").strip() \
+        or str((preset or {}).get("api_key_env") or "")
+    key = api_key or os.environ.get(env, "")
+    which = "project" if str(body.get("file") or "user") == "project" else "user"
+    taken, imported = _existing_profile_index(which)
+    error = ""
+    items: list = []
+    try:
+        r = requests.get(base_url.rstrip("/") + "/models",
+                         headers=_probe_headers(pid, base_url, key), timeout=8)
+        r.raise_for_status()
+        payload = r.json()
+        if isinstance(payload, list):
+            items = payload
+        elif isinstance(payload, dict):
+            items = payload.get("data") or payload.get("models") or []
+        if not isinstance(items, list):
+            items = []
+    except Exception as e:
+        error = f"{type(e).__name__}: {str(e)[:200]}"
+    if error:
+        return {"ok": False, "verified": False, "error": error,
+                "base_url": base_url,
+                "models": _provider_rows([{"id": m} for m in
+                                          (preset or {}).get("models", [])],
+                                         base_url, taken, imported)}
+    return {"ok": True, "verified": True, "base_url": base_url, "preset": pid,
+            "models": _provider_rows(items, base_url, taken, imported)}
+
+
+def import_hosted_models(body: dict) -> dict:
+    """`POST /api/providers/import`: the hosted-provider dialog's "import N
+    models in one click". Every selected model becomes its own profile, named
+    after the MODEL (sanitized and uniquified against the file's profiles --
+    never after the vendor), all sharing the dialog's base URL and key (or
+    env var) and the preset's hosted budgets.
+
+    `body`: {preset_id?, base_url?, api_key?, api_key_env?, file?,
+             models: [{model, profile_name?, set_default?}]}. Names that
+    already exist are skipped, not duplicated."""
+    body = body or {}
+    pid = str(body.get("preset_id") or "").strip().lower()
+    preset = _preset_by_id(pid) if pid and pid != "custom" else None
+    base_url = str(body.get("base_url")
+                   or (preset or {}).get("base_url") or "").strip()
+    if not base_url:
+        raise ConfigError("Give the provider base URL first.")
+    sels = body.get("models")
+    if not isinstance(sels, list) or not sels:
+        raise ConfigError("Pick at least one model to import.")
+    api_key = str(body.get("api_key") or "").strip()
+    api_key_env = "" if api_key else (
+        str(body.get("api_key_env") or "").strip()
+        or str((preset or {}).get("api_key_env") or ""))
+    ctx = int((preset or {}).get("context_tokens") or 0)
+    which = "project" if str(body.get("file") or "user") == "project" else "user"
+    path = config_path(which)
+    text = _read_config_text(path)
+    known = set(config_editor.profile_names(text))
+    imported: list[str] = []
+    skipped: list[str] = []
+    default = ""
+    for sel in sels:
+        if not isinstance(sel, dict):
+            continue
+        mid = _clean_model_id(sel.get("model") or sel.get("model_id") or "")
+        if not mid:
+            raise ConfigError("Each imported model needs its exact model id.")
+        raw_name = str(sel.get("profile_name") or "").strip()
+        # The profile name defaults to the sanitized MODEL id; a name typed
+        # in the dialog's slug column wins, and collisions get `_2`, `_3`...
+        # (`_suggest_profile_name` consumes its `taken` set, so it gets a
+        # copy: the suggestion must not look "already taken" on the next
+        # line — `known` itself grows only through real imports below.)
+        name = _sanitize_profile_name(raw_name) if raw_name \
+            else _suggest_profile_name(mid, set(known))
+        if not name or not PROFILE_NAME_RE.fullmatch(name):
+            raise ConfigError(
+                f"profile name {raw_name!r} must use letters, digits, '-' and "
+                f"'_' (starting with a letter or digit, max "
+                f"{_MAX_PROFILE_NAME} characters)")
+        if name in known:
+            skipped.append(name)
+            if sel.get("set_default"):
+                default = default or name
+            continue
+        values: dict = {"base_url": base_url, "model": mid, "tier": "hosted",
+                        "json_mode": "object",
+                        "max_read_tokens": _CLOUD_READ_TOKENS}
+        if ctx > 0:
+            values["context_tokens"] = ctx
+        # The provider table wins where a surface deviates from the generic
+        # hosted default (Anthropic rejects json_object and cannot cache).
+        from .. import providers
+        values.update(providers.profile_overrides(base_url, mid))
+        if api_key:
+            values["api_key"] = api_key
+        elif api_key_env:
+            values["api_key_env"] = api_key_env
+        text = config_editor.add_profile(text, name, values)
+        known.add(name)
+        imported.append(name)
+        if sel.get("set_default"):
+            default = name
+    if not imported and not skipped:
+        raise ConfigError("Nothing to import: the selection was empty.")
+    if default:
+        if default not in config_editor.profile_names(text):
+            raise ConfigError(f"default profile '{default}' was not imported")
+        text = settings.set_values(text, {"default_profile": default})
+    write_config(path, text)
+    with STATE.lock:
+        requested = STATE.profile_request
+    # As with a one-click add: the dialog's chosen default wins, otherwise
+    # the profile the user was running stays selected.
+    out = reload_state_config(profile=default or requested or None)
+    out["imported"] = imported
+    out["skipped"] = skipped
+    out["default_profile"] = default or out["active_profile"]
+    out["preset"] = pid
+    out["base_url"] = base_url
     out["uses_env"] = bool(api_key_env and not api_key)
     return out

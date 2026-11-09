@@ -915,10 +915,18 @@ class LLMClient:
     def __init__(self, cfg):
         self.cfg = cfg
         self.url = cfg.base_url.rstrip("/") + "/chat/completions"
+        key = _api_key(cfg)
         self.headers = {
             "Content-Type": "application/json",
-            "Authorization": f"Bearer {_api_key(cfg)}",
+            "Authorization": f"Bearer {key}",
         }
+        # Anthropic authenticates its OpenAI-compatible surface (and its
+        # native /v1/messages API) with `x-api-key` + a version stamp. Send
+        # both spellings when the server is Anthropic's so either accepted
+        # auth path works; every other provider ignores these headers.
+        if key and "anthropic.com" in (urlparse(cfg.base_url).hostname or ""):
+            self.headers["x-api-key"] = key
+            self.headers["anthropic-version"] = "2023-06-01"
         self.stats = {"calls": 0, "prompt_tokens": 0, "completion_tokens": 0,
                       "cached_tokens": 0, "cache_write_tokens": 0,
                       "seconds": 0.0, "cost": 0.0, "by_site": {}}

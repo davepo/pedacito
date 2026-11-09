@@ -60,6 +60,41 @@ PDC.fmtTokens = (n) => {
   return n >= 10000 ? (n / 1000).toFixed(1) + 'k' : String(n);
 };
 
+// Built-in hosted-provider catalog. settings.js seeds its "Add Hosted
+// Provider" dialog from this immediately, so the provider selector renders
+// even before (or if) GET /api/providers/presets ever answers; the server's
+// reply replaces it when it arrives. Mirrors settings_api.CLOUD_PROVIDERS
+// exactly -- if a preset is added or renamed there, change it here too.
+// The dialog probes the chosen provider live (POST /api/providers/probe) and
+// imports each ticked model as a profile NAMED AFTER THE MODEL, not the
+// vendor (POST /api/providers/import).
+PDC.FALLBACK_PROVIDER_CATALOG = [
+  { id: 'anthropic', label: 'Claude (Anthropic)', provider: 'anthropic',
+    base_url: 'https://api.anthropic.com/v1', api_key_env: 'ANTHROPIC_API_KEY',
+    suggest: 'claude', context_tokens: 200000,
+    models: ['claude-sonnet-4-5', 'claude-haiku-4-5', 'claude-opus-4-5'] },
+  { id: 'openai', label: 'ChatGPT (OpenAI)', provider: 'openai',
+    base_url: 'https://api.openai.com/v1', api_key_env: 'OPENAI_API_KEY',
+    suggest: 'openai', context_tokens: 272000,
+    models: ['gpt-5.4', 'gpt-5.4-mini', 'o3-mini', 'gpt-4.1', 'gpt-4.1-mini'] },
+  { id: 'deepseek', label: 'DeepSeek', provider: 'openai',
+    base_url: 'https://api.deepseek.com/v1', api_key_env: 'DEEPSEEK_API_KEY',
+    suggest: 'deepseek', context_tokens: 128000,
+    models: ['deepseek-chat', 'deepseek-reasoner'] },
+  { id: 'qwen', label: 'Qwen (DashScope)', provider: 'openai',
+    base_url: 'https://dashscope-intl.aliyuncs.com/compatible-mode/v1',
+    api_key_env: 'DASHSCOPE_API_KEY', suggest: 'qwen', context_tokens: 256000,
+    models: ['qwen3-coder-plus', 'qwen-max', 'qwen-plus', 'qwen-flash'] },
+  { id: 'gemini', label: 'Google Gemini', provider: 'openai',
+    base_url: 'https://generativelanguage.googleapis.com/v1beta/openai',
+    api_key_env: 'GEMINI_API_KEY', suggest: 'gemini', context_tokens: 200000,
+    models: ['gemini-2.5-pro', 'gemini-2.5-flash'] },
+  { id: 'openrouter', label: 'OpenRouter', provider: 'openai',
+    base_url: 'https://openrouter.ai/api/v1', api_key_env: 'OPENROUTER_API_KEY',
+    suggest: 'openrouter', context_tokens: 200000,
+    models: ['deepseek/deepseek-chat', 'qwen/qwen3-coder', 'anthropic/claude-3.7-sonnet'] },
+];
+
 // ------------------------------------------------------------------- modal ---
 PDC.modal = (title, body, buttons, opts) => {
   opts = opts || {};

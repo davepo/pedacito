@@ -24,10 +24,16 @@
   // switching to another settings tab and back.
   var TUNE = { hardware: 'hosted', model: 'medium', codebase: 'medium',
                priority: 'balanced', result: null, err: '', busy: false };
-  // And for the quick-add hosted provider card (Sprint J): what was typed
-  // survives re-renders; the catalog itself is fetched once.
-  var CLOUD = { presets: null, preset: '', model: '', custom: false, name: '',
-                nameEdited: false, key: '', env: '', def: true, err: '', busy: false };
+  // And for the hosted-provider dialog: the catalog starts as the built-in
+  // fallback (always renders instantly) and is replaced once
+  // GET /api/providers/presets answers. HC holds the dialog's own state, so
+  // a half-finished connect/import survives re-renders and reopen.
+  var CLOUD = { presets: (PDC.FALLBACK_PROVIDER_CATALOG || []).slice(),
+                fetched: false };
+  var HC = { preset: '', base: '', key: '', env: '', busy: false,
+             probed: false, verified: false, err: '', models: [],
+             pick: {}, name: {}, def: '', search: '', importing: false,
+             modal: null, body: null };
 
   PDC.openSettings = function (opts) {
     opts = opts || {};
@@ -247,131 +253,228 @@
     if (s.length > 32) s = s.slice(0, 32).replace(/[-_]+$/, '');
     return s;
   }
-  // ----- quick-add hosted provider (Sprint J) ---------------------------------
-  // One card, one API key: the preset carries every public fact (base URL,
-  // curated models, env var, context budget); the server fills in the rest
-  // and reloads the live config, so the new profile is selectable right away.
-  function cloudPreset() {
+  // ----- hosted provider dialog: connect & verify, then model-named import ----
+  // Pedacito stays local-first: a hosted key is only trusted after it has been
+  // used from this machine. Step A POSTs /api/providers/probe (one live GET to
+  // the provider's own /models endpoint); step B ticks the models that came
+  // back and imports each as a profile NAMED AFTER THE MODEL (`deepseek_chat`,
+  // `gemini_2_5_flash`) — never after the vendor. A failed key still offers
+  // the curated preset list, so the dialog works while the key gets fixed.
+  function hcPreset() {
     var ps = CLOUD.presets || [];
-    for (var i = 0; i < ps.length; i++) if (ps[i].id === CLOUD.preset) return ps[i];
-    return ps[0] || null;
+    for (var i = 0; i < ps.length; i++) if (ps[i].id === HC.preset) return ps[i];
+    return null;                        // 'custom' — any OpenAI-compatible URL
+  }
+  function hcApplyPreset() {           // a provider switch starts a fresh connect
+    var p = hcPreset();
+    HC.err = ''; HC.probed = false; HC.verified = false; HC.models = [];
+    HC.pick = {}; HC.name = {}; HC.def = ''; HC.search = '';
+    HC.base = p ? p.base_url : '';     // editable: regional endpoints and proxies
+    HC.env = p ? p.api_key_env : '';
+  }
+  function hcSeed() {
+    if (HC.preset) return;             // the session keeps its last provider
+    var p = (CLOUD.presets || [])[0];
+    HC.preset = p ? p.id : 'custom';
+    hcApplyPreset();
   }
   function loadPresets() {
-    PDC.api('/api/providers/presets').then(function (j) {
-      if (!j.ok || !j.presets) return;
-      CLOUD.presets = j.presets;
-      if (!CLOUD.preset) {
-        var p = cloudPreset();
-        if (p) { CLOUD.preset = p.id; CLOUD.model = p.models[0]; CLOUD.env = p.api_key_env; }
-      }
-      render();
+    if (CLOUD.fetched) return;
+    CLOUD.fetched = true;                     // one attempt per session; the
+    PDC.api('/api/providers/presets').then(function (j) {   // fallback is live
+      // Accept every sane shape: a bare array, {presets: [...]}, or the
+      // {providers: [...]} spelling. No `ok` gate: a missing flag must not
+      // throw away a perfectly good catalog. An empty answer keeps the fallback.
+      var list = Array.isArray(j) ? j : ((j && (j.presets || j.providers)) || []);
+      if (!list.length) return;
+      CLOUD.presets = list;
+    }, function () {});                       // unreachable route: fallback stands
+  }
+  function hcVisible() {              // rows matching the step-B filter box
+    var flt = String(HC.search || '').trim().toLowerCase();
+    return HC.models.filter(function (m) {
+      return !flt || String(m.id).toLowerCase().indexOf(flt) >= 0;
     });
   }
-  // Mirrors `settings_api._preset_profile_suggestion`: the preset's family
-  // word plus up to two meaningful model-id tokens (vendor words, bare
-  // version digits and family-prefixed tokens add nothing).
-  var CLOUD_SKIP = { claude: 1, anthropic: 1, gpt: 1, chatgpt: 1, openai: 1, deepseek: 1,
-                     qwen: 1, gemini: 1, google: 1, dashscope: 1, openrouter: 1, o3: 1, o4: 1 };
-  function cloudSuggest(preset, model) {
-    var fam = String(preset.suggest || preset.id).toLowerCase(), tail = [];
-    String(model || '').split(/[^A-Za-z0-9]+/).forEach(function (tok) {
-      if (!tok || tail.length >= 2) return;
-      var low = tok.toLowerCase();
-      if (CLOUD_SKIP[low] || low === fam || /^\d+$/.test(low) ||
-          (low !== fam && low.indexOf(fam) === 0)) return;
-      tail.push(low);
-    });
-    if (!tail.length) tail = [String(model || '').toLowerCase().replace(/[^a-z0-9]+/g, '_')];
-    return sanitizeName([fam].concat(tail).join('_')) || sanitizeName(fam) || preset.id;
+  function hcPicked() {
+    return HC.models.filter(function (m) { return HC.pick[m.id] && !m.already_imported; });
   }
-  function addCloud(p) {
-    if (!p || CLOUD.busy) return;
-    if (!String(CLOUD.model || '').trim()) {
-      CLOUD.err = 'Pick a model (or type its exact id) first.';
-      render();
-      return;
+  function hcSetPicks(on) {
+    hcVisible().forEach(function (m) { if (!m.already_imported) HC.pick[m.id] = on; });
+    if (HC.def && !HC.pick[HC.def]) HC.def = '';
+    if (on && !HC.def) { var first = hcPicked()[0]; if (first) HC.def = first.id; }
+    hcRenderRows();
+  }
+  function hcProbe() {
+    if (HC.busy) return;
+    if (!String(HC.base || '').trim()) {
+      HC.err = 'Give the provider base URL first.'; hcRender(); return;
     }
-    CLOUD.err = ''; CLOUD.busy = true;
-    render();
-    var name = CLOUD.nameEdited ? CLOUD.name : (String(CLOUD.name || '').trim() || cloudSuggest(p, CLOUD.model));
-    PDC.api('/api/providers/add', {
-      preset_id: p.id, model: String(CLOUD.model).trim(), profile_name: name,
-      api_key: CLOUD.key, api_key_env: CLOUD.env, set_default: !!CLOUD.def
+    HC.busy = true; HC.err = ''; hcRender();
+    PDC.api('/api/providers/probe', {
+      preset_id: HC.preset, base_url: String(HC.base).trim(),
+      api_key: HC.key, api_key_env: HC.env, file: X ? X.which : 'user'
     }).then(function (j) {
-      CLOUD.busy = false;
-      if (!j.ok) { CLOUD.err = j.detail || 'could not add that provider'; render(); PDC.toast(CLOUD.err, true); return; }
-      CLOUD.key = ''; CLOUD.name = ''; CLOUD.nameEdited = false; CLOUD.custom = false;
-      CLOUD.model = p.models[0];
-      X.data = j; X.pending = {}; pickDefaults();
-      PDC.toast('Profile \u201c' + j.added + '\u201d added \u2014 pick it in the topbar any time.');
-      PDC.refreshState();
-      render();
+      HC.busy = false;
+      if (j._status === 400) {        // the server refused the request itself
+        HC.err = j.detail || 'the GUI server refused the probe'; hcRender(); return;
+      }
+      HC.probed = true;
+      HC.verified = !!j.ok;           // false: the list below is the curated one
+      HC.err = j.ok ? '' : (j.error || j.detail || 'the provider rejected the key');
+      HC.models = (j.models || []).map(function (m) {
+        if (typeof m === 'string') {
+          return { id: m, suggested_profile_name: sanitizeName(m.split('/').pop()) };
+        }
+        return m;
+      });
+      HC.pick = {}; HC.name = {}; HC.def = '';
+      HC.models.forEach(function (m) {
+        HC.pick[m.id] = !m.already_imported;
+        HC.name[m.id] = m.suggested_profile_name
+          || sanitizeName(String(m.id).split('/').pop());
+      });
+      var first = hcPicked()[0];
+      if (first) HC.def = first.id;   // the first ticked model is the default
+      hcRender();
     });
   }
-  function cloudCard() {
-    if (CLOUD.presets === null) loadPresets();
-    var box = h('div', { class: 'note-box cloud-card' });
-    if (!CLOUD.presets) { box.appendChild(h('span', { class: 'muted small-text', text: 'Loading the provider catalog\u2026' })); return box; }
-    var p = cloudPreset();
-    if (!p) { box.appendChild(h('span', { class: 'muted small-text', text: 'No provider presets available.' })); return box; }
-    if (!CLOUD.model) CLOUD.model = p.models[0];
-    if (!CLOUD.env) CLOUD.env = p.api_key_env;
-    box.appendChild(h('b', { text: 'Quick-add a hosted provider' }));
-    box.appendChild(h('div', { class: 'muted small-text', style: 'margin-top:2px',
-      text: 'Pick a provider, paste its API key (or name the environment variable that holds it) and add. The base URL, model and cloud-sized budgets are all set for you; only the key is needed.' }));
-    var psel = h('select', {}, CLOUD.presets.map(function (x) {
-      return h('option', { value: x.id, text: x.label });
-    }));
-    psel.value = p.id;
-    psel.addEventListener('change', function () {
-      CLOUD.preset = psel.value; CLOUD.custom = false; CLOUD.err = '';
-      var np = cloudPreset();
-      CLOUD.model = np.models[0]; CLOUD.env = np.api_key_env;
-      if (!CLOUD.nameEdited) CLOUD.name = cloudSuggest(np, CLOUD.model);
-      render();
+  function hcImport() {
+    if (HC.importing) return;
+    var sel = hcPicked();
+    if (!sel.length) return;
+    var list = sel.map(function (m) {
+      return { model: m.id,
+               profile_name: HC.name[m.id] || m.suggested_profile_name || '',
+               set_default: HC.def === m.id };
     });
-    var msel = h('select', {}, p.models.map(function (m) {
-      return h('option', { value: m, text: m });
-    }).concat([h('option', { value: '__custom__', text: 'Other\u2026 (type the exact id)' })]));
-    msel.value = p.models.indexOf(CLOUD.model) >= 0 ? CLOUD.model : '__custom__';
-    if (msel.value === '__custom__') CLOUD.custom = true;
-    msel.addEventListener('change', function () {
-      if (msel.value === '__custom__') { CLOUD.custom = true; CLOUD.model = ''; }
-      else { CLOUD.custom = false; CLOUD.model = msel.value; }
-      if (!CLOUD.nameEdited) CLOUD.name = cloudSuggest(p, CLOUD.model);
-      render();
+    var bad = list.filter(function (m) { return !/^[A-Za-z0-9][A-Za-z0-9_-]{0,31}$/.test(m.profile_name); });
+    if (bad.length) { PDC.toast('Profile names may use letters, digits, - and _: ' + bad.map(function (m) { return '"' + m.profile_name + '"'; }).join(', '), true); return; }
+    HC.importing = true; hcRenderRows();
+    PDC.api('/api/providers/import', {
+      preset_id: HC.preset, base_url: String(HC.base).trim(),
+      api_key: HC.key, api_key_env: HC.env, file: X ? X.which : 'user',
+      models: list
+    }).then(function (j) {
+      HC.importing = false;
+      if (!j.ok) {
+        HC.err = 'Import failed: ' + (j.detail || 'bad response');
+        hcRender(); PDC.toast(HC.err, true); return;
+      }
+      var done = {};
+      (j.imported || []).concat(j.skipped || []).forEach(function (nm) { done[nm] = 1; });
+      HC.models.forEach(function (m) {
+        if (done[HC.name[m.id] || m.suggested_profile_name]) {
+          m.already_imported = true; HC.pick[m.id] = false;
+          if (HC.def === m.id) HC.def = '';
+        }
+      });
+      if (X) { X.data = j; X.pending = {}; pickDefaults(); render(); }
+      PDC.toast((j.imported || []).length + ' model-named profile(s) added'
+        + ((j.skipped || []).length ? ', ' + j.skipped.length + ' already there' : '')
+        + (j.default_profile ? '; default is "' + j.default_profile + '"' : ''));
+      PDC.refreshState();
+      hcRenderRows();
     });
-    var mIn = h('input', { type: 'text', class: 'mono', value: CLOUD.model, autocomplete: 'off', spellcheck: false,
-      placeholder: 'exact model id, e.g. anthropic/claude-3.7-sonnet' });
-    var nIn = h('input', { type: 'text', class: 'mono', value: CLOUD.nameEdited ? CLOUD.name : cloudSuggest(p, CLOUD.model),
-      autocomplete: 'off', spellcheck: false, placeholder: 'profile name' });
-    mIn.addEventListener('input', function () {
-      CLOUD.model = mIn.value.trim();
-      if (!CLOUD.nameEdited) { CLOUD.name = cloudSuggest(p, CLOUD.model); nIn.value = CLOUD.name; }
+  }
+  function hcRenderRows() {              // rebuild only the model list: the
+    if (!HC.rows) return;                // filter box keeps focus and state
+    var box = PDC.clear(HC.rows);
+    var head = h('tr', {}, h('th', { text: 'import' }), h('th', { text: 'default' }),
+      h('th', { text: 'profile name' }), h('th', { text: 'model' }), h('th', { text: '' }));
+    var tbody = h('tbody', {});
+    hcVisible().forEach(function (m) {
+      var nm = HC.name[m.id] === undefined
+        ? (m.suggested_profile_name || sanitizeName(String(m.id).split('/').pop()))
+        : HC.name[m.id];
+      var name = h('input', { type: 'text', class: 'mono', value: nm, disabled: !!m.already_imported,
+        autocomplete: 'off', spellcheck: false });
+      name.addEventListener('input', function () {
+        var fixed = sanitizeName(name.value);
+        if (fixed !== name.value) name.value = fixed;   // "3.8" → "3_8" as you type
+        HC.name[m.id] = name.value;
+      });
+      var cb = h('input', { type: 'checkbox', checked: !!HC.pick[m.id], disabled: !!m.already_imported,
+        onchange: function (e) { HC.pick[m.id] = e.target.checked; if (!e.target.checked && HC.def === m.id) HC.def = ''; hcRenderRows(); } });
+      var rd = h('input', { type: 'radio', name: 'hcdefault', checked: HC.def === m.id, disabled: !!m.already_imported,
+        onchange: function () { HC.def = m.id; if (!HC.pick[m.id]) HC.pick[m.id] = true; hcRenderRows(); } });
+      tbody.appendChild(h('tr', { class: m.already_imported ? 'imp' : '' },
+        h('td', {}, cb), h('td', {}, rd), h('td', {}, name),
+        h('td', { class: 'mono small-text', text: m.id, title: m.id }),
+        h('td', {}, m.already_imported ? h('span', { class: 'tag', text: 'already imported' }) : null)));
     });
-    nIn.addEventListener('input', function () { CLOUD.nameEdited = true; CLOUD.name = nIn.value; });
-    var kIn = h('input', { type: 'password', class: 'mono', value: CLOUD.key, autocomplete: 'off',
-      placeholder: 'paste the API key \u2014 or leave blank to read it from the env var' });
-    kIn.addEventListener('input', function () { CLOUD.key = kIn.value; });
-    var eIn = h('input', { type: 'text', class: 'mono', value: CLOUD.env, autocomplete: 'off',
-      placeholder: p.api_key_env });
-    eIn.addEventListener('input', function () { CLOUD.env = eIn.value.trim(); });
-    var dIn = h('input', { type: 'checkbox', checked: CLOUD.def,
-      onchange: function (e) { CLOUD.def = e.target.checked; } });
-    box.appendChild(h('div', { class: 'form' },
-      h('label', { text: 'Provider' }), psel,
-      h('label', { text: 'Model' }), CLOUD.custom ? h('div', { class: 'row' }, mIn, msel) : msel,
-      h('label', { text: 'Profile name' }), nIn,
-      h('label', { text: 'API key' }), kIn,
-      h('label', { text: 'or env var' }), eIn,
-      h('label', { text: '' }), h('label', { class: 'chk' }, dIn, ' make it the default profile right away')));
-    box.appendChild(h('div', { class: 'cc-foot' },
-      h('button', { class: 'primary', text: CLOUD.busy ? 'Adding\u2026' : '+ Add provider',
-        disabled: CLOUD.busy, onclick: function () { addCloud(p); } }),
+    box.appendChild(h('div', { class: 'hp-models' },
+      h('table', { class: 'scan-table' }, h('thead', {}, head), tbody)));
+    var n = hcPicked().length;
+    box.appendChild(h('div', { class: 'hp-foot' },
+      h('button', { class: 'primary', text: HC.importing ? 'Importing\u2026' : 'Import Selected (' + n + ')',
+        disabled: !n || HC.importing, onclick: hcImport }),
       h('span', { class: 'muted small-text grow',
-        text: 'Saved to the user config and live at once: no restart, and the key never leaves this machine.' })));
-    if (CLOUD.err) box.appendChild(h('div', { class: 'note-box err', style: 'margin:8px 0 0', text: CLOUD.err }));
+        text: 'one profile per model, named after the model (the radio picks the default); an existing name gets \u201c_2\u201d' })));
+  }
+  function hcRender() {
+    if (!HC.body) return;
+    var box = PDC.clear(HC.body);
+    HC.rows = null;
+    // Step A: connect & verify — the key is tried live, nothing is saved yet.
+    var psel = h('select', {}, (CLOUD.presets || []).map(function (x) {
+      return h('option', { value: x.id, text: x.label });
+    }).concat([h('option', { value: 'custom', text: 'Custom OpenAI-Compatible\u2026' })]));
+    psel.value = HC.preset;
+    psel.addEventListener('change', function () {
+      HC.preset = psel.value; hcApplyPreset(); hcRender();
+    });
+    var bIn = h('input', { type: 'text', class: 'mono', value: HC.base, autocomplete: 'off',
+      spellcheck: false, placeholder: 'https://api.provider.com/v1' });
+    bIn.addEventListener('input', function () { HC.base = bIn.value; });
+    var kIn = h('input', { type: 'password', class: 'mono', value: HC.key, autocomplete: 'off',
+      placeholder: 'paste the API key \u2014 or leave blank to read it from the env var' });
+    kIn.addEventListener('input', function () { HC.key = kIn.value; });
+    var eIn = h('input', { type: 'text', class: 'mono', value: HC.env, autocomplete: 'off',
+      placeholder: 'env var holding the key, e.g. DEEPSEEK_API_KEY' });
+    eIn.addEventListener('input', function () { HC.env = eIn.value.trim(); });
+    box.appendChild(h('div', { class: 'form hp-form' },
+      h('label', { text: 'Provider' }), psel,
+      h('label', { text: 'Base URL' }), bIn,
+      h('label', { text: 'API key' }), kIn,
+      h('label', { text: 'or env var' }), eIn));
+    box.appendChild(h('div', { class: 'hp-foot' },
+      h('button', { class: 'primary', text: HC.busy ? 'Connecting\u2026' : 'Connect & Fetch Models',
+        disabled: HC.busy, onclick: hcProbe }),
+      h('span', { class: 'muted small-text grow',
+        text: HC.probed ? 'live model list from ' + HC.base.trim()
+                        : 'one GET to <base URL>/models (8s timeout) \u2014 nothing is written yet' })));
+    if (HC.err) box.appendChild(h('div', { class: 'note-box err',
+      text: HC.err + (HC.probed ? ' \u2014 the key could not be verified; the curated list below stays importable.' : '') }));
+    if (HC.verified) box.appendChild(h('div', { class: 'hp-badge ok',
+      text: '\u2713 Connected \u2014 ' + HC.models.length + ' model(s) available' }));
+    if (HC.busy) { box.appendChild(h('div', { class: 'tip', text: 'Asking the provider what it has\u2026' })); return box; }
+    if (!HC.probed) return box;
+    // Step B: tick models, edit slugs, import as model-named profiles.
+    if (!HC.models.length) {
+      box.appendChild(h('div', { class: 'tip', text: 'That server reported no chat models.' }));
+      return box;
+    }
+    var search = h('input', { type: 'text', class: 'grow hp-search', value: HC.search,
+      placeholder: 'filter models\u2026', spellcheck: false, autocomplete: 'off' });
+    search.addEventListener('input', function () { HC.search = search.value; hcRenderRows(); });
+    box.appendChild(h('div', { class: 'hp-tools' }, search,
+      h('button', { class: 'small ghost', text: 'Select All', onclick: function () { hcSetPicks(true); } }),
+      h('button', { class: 'small ghost', text: 'Unselect All', onclick: function () { hcSetPicks(false); } }),
+      h('span', { class: 'muted small-text', text: 'embedding / speech / moderation models are filtered out' })));
+    HC.rows = h('div', {});
+    box.appendChild(HC.rows);
+    hcRenderRows();
     return box;
+  }
+  function openHostedDialog() {
+    loadPresets();                            // at most one HTTP attempt; the
+    hcSeed();                                 // fallback catalog is live
+    HC.body = h('div', { class: 'hp-wrap' });
+    HC.modal = PDC.modal('Add Hosted Provider', HC.body, [{ label: 'Close' }], { wide: true });
+    hcRender();
+    var f = HC.modal.box && HC.modal.box.querySelector('.hp-search');
+    if (f) f.focus();
   }
 
   function rowKey(r) { return normUrl(r.server_url) + '::' + r.model_id; }
@@ -393,15 +496,16 @@
   function discoveryTab() {
     var f = file(), names = Object.keys(f.profiles || {}).sort();
     var box = h('div', {});
-    box.appendChild(cloudCard());
+    // Local-first: the tab leads with scanning this machine. Hosted providers
+    // are reachable through the dialog button below — never as a card that
+    // competes with the local scanner for attention.
     box.appendChild(h('div', { class: 'muted small-text', style: 'margin:0 0 6px',
       text: 'Local servers \u2014 scan the models running on this machine and import them:' }));
     box.appendChild(scanner());
     box.appendChild(h('div', { class: 'muted small-text', style: 'margin:14px 0 6px', text: 'Profiles in ' + (X.which === 'user' ? 'the user config' : 'this project') + ' \u2014 calibrate the ones you actually use:' }));
     if (!names.length) {
-      box.appendChild(h('div', { class: 'tip', text: 'No profiles yet. Scan a local server above and import the models you want to use.' }));
-      return box;
-    }
+      box.appendChild(h('div', { class: 'tip', text: 'No profiles yet. Scan a local server above, add a hosted provider below, or create one manually \u2014 then import the models you want to use.' }));
+    } else {
     var defName = (f.settings || {}).default_profile || '';
     names.forEach(function (n) {
       var p = f.profiles[n] || {};
@@ -423,8 +527,11 @@
           h('button', { class: 'small danger', text: 'Delete', onclick: function () { delProfileNamed(n); } })));
       box.appendChild(row);
     });
+    }
     box.appendChild(h('div', { class: 'row', style: 'margin-top:10px' },
       h('button', { class: 'small', text: '+ New profile', onclick: newProfile }),
+      h('button', { class: 'small', text: '+ Add Hosted Provider\u2026', onclick: openHostedDialog,
+        title: 'Connect a hosted API key, verify it live, and import its models as profiles' }),
       h('span', { class: 'muted small-text grow', text: 'Calibrating takes about a minute and streams to the Output tab.' })));
     return box;
   }
@@ -605,8 +712,16 @@
       h('button', { class: 'small', text: '+ New', onclick: newProfile }),
       h('button', { class: 'small', text: 'Duplicate', disabled: !X.profile, onclick: dupProfile }),
       h('button', { class: 'small', text: 'Rename', disabled: !X.profile, title: 'Rename this profile (the default-profile and role references follow it)', onclick: function () { renameProfileNamed(X.profile); } }),
-      h('button', { class: 'small danger', text: 'Delete', disabled: !X.profile, onclick: delProfile })));
-    return h('div', { class: 'set-layout' }, side, X.profile ? profileForm(f.profiles[X.profile] || {}) : h('div', { class: 'tip', text: 'Create a profile to point pedacito at a model.' }));
+      h('button', { class: 'small danger', text: 'Delete', disabled: !X.profile, onclick: delProfile }),
+      // The hosted-provider dialog lives right in this toolbar (it used to be
+      // a card on top of both tabs): whoever manages profiles can connect a
+      // hosted API and import its models without detouring anywhere.
+      h('button', { class: 'small', text: '+ Add Hosted Provider\u2026', onclick: openHostedDialog,
+        title: 'Connect a hosted API key, verify it live, and import its models as profiles' })));
+    return h('div', {},
+      h('div', { class: 'set-layout' }, side,
+        X.profile ? profileForm(f.profiles[X.profile] || {})
+          : h('div', { class: 'tip', text: 'Create a profile to point pedacito at a model.' })));
   }
   function askName(title, initial, then) {
     var inp = h('input', { type: 'text', value: initial || '', class: 'grow', placeholder: 'e.g. qwen-27b' });

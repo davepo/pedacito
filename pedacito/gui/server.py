@@ -687,8 +687,10 @@ def _profiles(q, body=None):
 @get("/api/providers/presets")
 def _provider_presets(q, body=None):
     """The quick-add catalog: major hosted providers with their base URLs,
-    env-var names and curated model ids (no secrets, no probing)."""
-    return 200, settings_api.provider_presets()
+    env-var names and curated model ids (no secrets, no probing). Carries
+    `ok` like the POST sibling: the UI treats a truthful `ok` as "the server
+    knows this endpoint" and replaces its built-in fallback catalog."""
+    return 200, {"ok": True, **settings_api.provider_presets()}
 
 
 @post("/api/providers/add")
@@ -699,6 +701,31 @@ def _provider_add(q, body):
     Profile dropdown can select it immediately."""
     try:
         return 200, {"ok": True, **settings_api.add_provider_preset(body)}
+    except ConfigError as e:
+        return 400, {"ok": False, "detail": str(e)}
+
+
+@post("/api/providers/probe")
+def _provider_probe(q, body):
+    """Verify a hosted provider key live: one GET to `<base_url>/models` with
+    the pasted key (or the env var that holds it), Anthropic headers included
+    for Claude. Returns the provider's real model list -- each id paired with
+    a profile name derived from the model -- or, when authentication/network
+    access fails, `{"ok": False, "error": ...}` plus the curated fallback so
+    the dialog stays usable. A probe reads nothing and writes nothing."""
+    try:
+        return 200, settings_api.probe_provider(body or {})
+    except ConfigError as e:
+        return 400, {"ok": False, "detail": str(e)}
+
+
+@post("/api/providers/import")
+def _provider_import(q, body):
+    """Import one or many models from the hosted-provider dialog: each becomes
+    its own profile named after the MODEL (never the vendor), sharing the
+    dialog's base URL and key/env var and the preset's hosted budgets."""
+    try:
+        return 200, {"ok": True, **settings_api.import_hosted_models(body or {})}
     except ConfigError as e:
         return 400, {"ok": False, "detail": str(e)}
 

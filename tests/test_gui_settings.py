@@ -584,10 +584,15 @@ def test_profile_reasoning_overrides_persist(gui):
 
 def test_provider_presets_endpoint_lists_the_major_clouds(gui):
     status, j = gui.get("/api/providers/presets")
-    assert status == 200
+    assert status == 200 and j["ok"] is True      # envelope the UI accepts
     assert [p["id"] for p in j["presets"]] == [
         "anthropic", "openai", "deepseek", "qwen", "gemini", "openrouter"]
     for p in j["presets"]:
+        # the keys static/app.js's PDC.FALLBACK_PROVIDER_CATALOG mirrors: the
+        # UI seeds from the fallback and merges this reply, so a key that
+        # appears on only one side silently breaks one of the two
+        assert {"id", "label", "provider", "base_url", "api_key_env",
+                "suggest", "context_tokens", "models"} <= set(p)
         assert p["base_url"].startswith("https://")           # real hosted endpoints
         assert p["api_key_env"].endswith("_API_KEY")          # env fallback named
         assert p["models"]                                    # curated ids, none empty
@@ -670,3 +675,296 @@ def test_add_preset_refuses_bad_requests_without_writing(gui):
     assert status == 400 and "already exists" in j["detail"]  # duplicate suggestion
     assert not gui.cfg_path.read_text(encoding="utf-8").count(
         "[profiles.openai_gpt_5_4]") > 1                      # the refusal wrote nothing
+
+
+def test_js_fallback_catalog_mirrors_the_python_one():
+    """The hosted-provider dialog renders from PDC.FALLBACK_PROVIDER_CATALOG
+    until (and unless) GET /api/providers/presets answers, so the two catalogs
+    must stay a byte-for-byte mirror: same ids in order, same labels/URLs/env
+    names, same curated model lists (the dialog's curated fallback when a
+    live probe cannot reach the provider)."""
+    js = (Path(__file__).resolve().parents[1] / "pedacito" / "gui" / "static"
+          / "app.js").read_text(encoding="utf-8")
+    start = js.index("PDC.FALLBACK_PROVIDER_CATALOG = [")
+    block = js[start:js.index("\n];", start)]
+    flat = re.sub(r"\s+", " ", block)
+    ids = re.findall(r"id: '([a-z_]+)'", block)
+    assert ids == [p["id"] for p in settings_api.CLOUD_PROVIDERS]
+    for p in settings_api.CLOUD_PROVIDERS:
+        quoted = ", ".join("'%s'" % m for m in p["models"])
+        for frag in ("id: '%s'" % p["id"], "label: '%s'" % p["label"],
+                    "provider: '%s'" % p["provider"],
+                    "base_url: '%s'" % p["base_url"],
+                    "api_key_env: '%s'" % p["api_key_env"],
+                    "suggest: '%s'" % p["suggest"],
+                    "context_tokens: %d" % p["context_tokens"],
+                    "models: [%s]" % quoted):
+            assert frag in flat, (p["id"], frag)
+
+
+
+# --- hosted-provider dialog: live probe + model-named import ------------------
+# The dialog never trusts a key it has not used: step A verifies it against
+# the provider's own /models, step B imports the LIVE model list and names
+# every profile after the model itself (`gpt-5_4`, `deepseek_chat`...), never
+# after the vendor. `/api/providers/probe` writes nothing; the writes are
+# `/api/providers/import`.
+
+def _hosted_server():
+    """A fake hosted API: requests mentioning 'sk-good' pass, the rest 401.
+
+    Answers the OpenAI/Anthropic shape (`{"data": [...]}` from GET /models),
+    includes the non-chat noise a real provider lists, and records headers so
+    the tests can assert how the probe authenticated.
+    """
+    import json as _json
+    import threading
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+
+    seen = []
+
+    class H(BaseHTTPRequestHandler):
+        def do_GET(self):
+            creds = (self.headers.get("Authorization") or "") + "|" + (
+                self.headers.get("x-api-key") or "")
+            seen.append({"path": self.path,
+                         "authorization": self.headers.get("Authorization"),
+                         "x_api_key": self.headers.get("x-api-key"),
+                         "anthropic_version": self.headers.get(
+                             "anthropic-version")})
+            body = _json.dumps({"data": [
+                {"id": "openai/gpt-5.4"},          # org path -> short name
+                {"id": "gpt-4o-mini"},
+                {"id": "gpt-4o-audio-preview"},    # not chat models: dropped
+                {"id": "text-embedding-3-small"},
+                {"id": "dall-e-3"},
+                {"id": "whisper-1"},
+            ]}).encode()
+            code = 200 if "sk-good" in creds else 401
+            self.send_response(code)
+            if code == 200:
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            if code == 200:
+                self.wfile.write(body)
+
+        def log_message(self, *a):  # keep pytest output clean
+            pass
+
+    srv = HTTPServer(("127.0.0.1", 0), H)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    return srv, seen
+
+
+def _dead_port():
+    import socket
+    s = socket.socket()
+    s.bind(("127.0.0.1", 0))
+    port = s.getsockname()[1]
+    s.close()
+    return port
+
+
+def test_probe_verifies_the_key_live_and_names_rows_after_models(gui):
+    srv, seen = _hosted_server()
+    try:
+        base = "http://127.0.0.1:%d/v1" % srv.server_address[1]
+        status, j = gui.post("/api/providers/probe", {
+            "preset_id": "openai", "base_url": base, "api_key": "sk-good"})
+        assert status == 200 and j["ok"] and j["verified"]
+        assert j["base_url"] == base and j["preset"] == "openai"
+        rows = {m["id"]: m for m in j["models"]}
+        assert set(rows) == {"openai/gpt-5.4", "gpt-4o-mini"}, \
+            "chat models only — embeddings/audio never lead a picker"
+        # one row per LIVE model id; the profile name derives from the model
+        assert rows["openai/gpt-5.4"]["suggested_profile_name"] == "gpt-5_4"
+        assert rows["gpt-4o-mini"]["suggested_profile_name"] == "gpt-4o-mini"
+        assert all(not m["already_imported"] for m in j["models"])
+        assert seen[0]["path"] == "/v1/models"
+        assert seen[0]["authorization"] == "Bearer sk-good"
+    finally:
+        srv.shutdown()
+
+
+def test_probe_reads_the_key_from_the_named_env_var(gui, monkeypatch):
+    srv, seen = _hosted_server()
+    monkeypatch.setenv("PROBE_TEST_KEY", "sk-good")
+    try:
+        base = "http://127.0.0.1:%d/v1" % srv.server_address[1]
+        status, j = gui.post("/api/providers/probe", {
+            "preset_id": "openai", "base_url": base,
+            "api_key_env": "PROBE_TEST_KEY"})
+        assert status == 200 and j["ok"]
+        assert seen[0]["authorization"] == "Bearer sk-good"
+        # a pasted key beats the env var — the dialog sends both, and the
+        # one the user is looking at is the one that gets tested
+        del seen[0]
+        status, j = gui.post("/api/providers/probe", {
+            "preset_id": "openai", "base_url": base,
+            "api_key": "sk-good", "api_key_env": "PROBE_TEST_KEY"})
+        assert j["ok"] and seen[0]["authorization"] == "Bearer sk-good"
+    finally:
+        srv.shutdown()
+
+
+def test_probe_speaks_anthropic_authentication(gui):
+    srv, seen = _hosted_server()
+    try:
+        base = "http://127.0.0.1:%d/v1" % srv.server_address[1]
+        status, j = gui.post("/api/providers/probe", {
+            "preset_id": "anthropic", "base_url": base, "api_key": "sk-good"})
+        assert status == 200 and j["ok"]
+        assert seen[0]["x_api_key"] == "sk-good"          # Claude's spelling
+        assert seen[0]["anthropic_version"] == "2023-06-01"
+    finally:
+        srv.shutdown()
+
+
+def test_probe_reports_failures_but_stays_importable(gui):
+    srv, _seen = _hosted_server()
+    try:
+        base = "http://127.0.0.1:%d/v1" % srv.server_address[1]
+        status, j = gui.post("/api/providers/probe", {
+            "preset_id": "openai", "base_url": base, "api_key": "sk-wrong"})
+        assert status == 200 and j["ok"] is False and j["verified"] is False
+        assert j["error"].startswith("HTTPError: 401")
+        # the curated preset list stays selectable while the key gets fixed
+        assert [m["id"] for m in j["models"]] == \
+            settings_api._preset_by_id("openai")["models"]
+        assert all(m["suggested_profile_name"] for m in j["models"])
+        status, j = gui.post("/api/providers/probe", {
+            "preset_id": "openai", "base_url": "http://127.0.0.1:%d/v1"
+            % _dead_port(), "api_key": "sk-good"})
+        assert status == 200 and j["ok"] is False and j["models"]
+        # unusable requests are the only errors that are 400s
+        status, j = gui.post("/api/providers/probe", {"preset_id": "nope"})
+        assert status == 400 and "unknown provider preset" in j["detail"]
+        status, j = gui.post("/api/providers/probe", {"file": "user"})
+        assert status == 400 and "base URL" in j["detail"]
+    finally:
+        srv.shutdown()
+
+
+def test_probe_flags_models_the_config_already_imports(gui):
+    srv, _seen = _hosted_server()
+    base = "http://127.0.0.1:%d/v1" % srv.server_address[1]
+    gui.cfg_path.parent.mkdir(parents=True, exist_ok=True)
+    gui.cfg_path.write_text(
+        '[profiles.gpt-4o-mini]\nmodel = "gpt-4o-mini"\nbase_url = "%s"\n'
+        % base, encoding="utf-8")
+    try:
+        status, j = gui.post("/api/providers/probe", {
+            "preset_id": "openai", "base_url": base, "api_key": "sk-good"})
+        flags = {m["id"]: m["already_imported"] for m in j["models"]}
+        assert flags == {"openai/gpt-5.4": False, "gpt-4o-mini": True}
+    finally:
+        srv.shutdown()
+
+
+def test_import_names_every_profile_after_its_model(gui):
+    preset = settings_api._preset_by_id("deepseek")
+    base = "http://127.0.0.1:9/v1"
+    status, j = gui.post("/api/providers/import", {
+        "preset_id": "deepseek", "base_url": base, "api_key": "sk-d",
+        "models": [
+            {"model": "deepseek-v4-flash", "profile_name": "deepseek_chat",
+             "set_default": True},
+            {"model": "DeepSeek-V4-Pro", "profile_name": "deepseek_v4_pro"},
+            {"model": "glm-5"}]})   # no name: the live model id names it
+    assert status == 200 and j["ok"]
+    assert j["imported"] == ["deepseek_chat", "deepseek_v4_pro", "glm-5"]
+    assert j["skipped"] == [] and j["default_profile"] == "deepseek_chat"
+    assert j["uses_env"] is False and j["preset"] == "deepseek"
+    body = tomllib.loads(gui.cfg_path.read_text(encoding="utf-8"))
+    assert body["default_profile"] == "deepseek_chat"
+    prof = body["profiles"]["deepseek_v4_pro"]
+    assert prof["model"] == "DeepSeek-V4-Pro"            # the exact live id
+    assert prof["base_url"] == base and prof["api_key"] == "sk-d"
+    assert "api_key_env" not in prof
+    assert prof["tier"] == "hosted" and prof["json_mode"] == "object"
+    assert prof["max_read_tokens"] == 3000               # cloud gather budgets
+    assert prof["context_tokens"] == preset["context_tokens"]
+    assert prof["prompt_cache"] == "implicit"            # generic-hosted default
+    assert body["profiles"]["glm-5"]["model"] == "glm-5"
+    assert "deepseek_v4_pro" in j["user"]["profiles"]
+    # selectable right away: STATE was reloaded
+    _status, st = gui.get("/api/state")
+    assert st["profile"] == "deepseek_chat" and st["model"] == "deepseek-v4-flash"
+    assert {"deepseek_chat", "deepseek_v4_pro", "glm-5"} <= set(st["profiles"])
+
+
+def test_import_never_renames_or_overwrites_existing_profiles(gui):
+    gui.cfg_path.parent.mkdir(parents=True, exist_ok=True)
+    gui.cfg_path.write_text(
+        'default_profile = "glm-5"\n\n[profiles.glm-5]\nmodel = "glm-5"\n'
+        'base_url = "http://a/v1"\n', encoding="utf-8")
+    # an explicit name already taken -> skipped, the old profile untouched
+    status, j = gui.post("/api/providers/import", {
+        "base_url": "http://b/v1", "api_key": "k",
+        "models": [{"model": "glm-5", "profile_name": "glm-5"}]})
+    assert status == 200 and j["imported"] == [] and j["skipped"] == ["glm-5"]
+    body = tomllib.loads(gui.cfg_path.read_text(encoding="utf-8"))
+    assert body["profiles"]["glm-5"]["base_url"] == "http://a/v1"
+    # no explicit name -> the model-derived suggestion collides and gets
+    # uniquified against the file instead of clobbering the existing profile
+    status, j = gui.post("/api/providers/import", {
+        "base_url": "http://b/v1", "api_key": "k",
+        "models": [{"model": "glm-5"}]})
+    assert status == 200 and j["imported"] == ["glm-5-2"]
+    body = tomllib.loads(gui.cfg_path.read_text(encoding="utf-8"))
+    assert body["profiles"]["glm-5-2"]["base_url"] == "http://b/v1"
+    assert body["profiles"]["glm-5"]["base_url"] == "http://a/v1"
+    assert body["default_profile"] == "glm-5"            # the add did not steal it
+
+
+def test_import_stores_the_key_or_the_env_var_that_holds_it(gui):
+    preset = settings_api._preset_by_id("openrouter")
+    # a pasted key wins and is what gets stored (the env var would shadow it
+    # at request time, so only one of the two may exist in the profile)
+    status, j = gui.post("/api/providers/import", {
+        "preset_id": "openrouter", "api_key": "sk-real",
+        "api_key_env": "SOMETHING_ELSE",
+        "models": [{"model": "qwen/qwen3-coder"}]})
+    assert status == 200 and j["uses_env"] is False
+    prof = tomllib.loads(gui.cfg_path.read_text(encoding="utf-8"))["profiles"]
+    assert prof["qwen3-coder"]["api_key"] == "sk-real"
+    assert "api_key_env" not in prof["qwen3-coder"]
+    assert prof["qwen3-coder"]["base_url"] == preset["base_url"]
+    # no key pasted: the profile points at the preset's env var
+    status, j = gui.post("/api/providers/import", {
+        "preset_id": "openrouter",
+        "models": [{"model": "x/y", "profile_name": "by_env"}]})
+    assert j["uses_env"] is True
+    prof = tomllib.loads(gui.cfg_path.read_text(encoding="utf-8"))["profiles"]
+    assert prof["by_env"]["api_key_env"] == "OPENROUTER_API_KEY"
+    assert "api_key" not in prof["by_env"]
+    # and importing to the open project's file writes that file, not the user's
+    from pedacito.gui import core
+    root = gui.tmp / "proj"
+    root.mkdir()
+    core.STATE.root = root
+    status, j = gui.post("/api/providers/import", {
+        "file": "project", "base_url": "http://h/v1",
+        "models": [{"model": "m", "profile_name": "in_project"}]})
+    assert status == 200
+    body = tomllib.loads((root / ".pedacito.toml").read_text(encoding="utf-8"))
+    assert body["profiles"]["in_project"]["base_url"] == "http://h/v1"
+    assert "in_project" not in tomllib.loads(
+        gui.cfg_path.read_text(encoding="utf-8"))["profiles"]
+
+
+def test_import_refuses_bad_requests_without_writing(gui):
+    status, j = gui.post("/api/providers/import", {"base_url": "http://h/v1",
+                                                   "models": []})
+    assert status == 400 and "at least one model" in j["detail"]
+    status, j = gui.post("/api/providers/import", {
+        "base_url": "http://h/v1", "models": [{"model": "  "}]})
+    assert status == 400 and "exact model id" in j["detail"]
+    status, j = gui.post("/api/providers/import", {
+        "base_url": "http://h/v1", "models": [{"model": "m",
+                                               "profile_name": "bad name/"}]})
+    assert status == 400 and "profile name" in j["detail"]
+    status, j = gui.post("/api/providers/import", {"preset_id": "nope"})
+    assert status == 400 and "unknown provider preset" in j["detail"]
+    assert not gui.cfg_path.exists()       # the refusals wrote nothing
