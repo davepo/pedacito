@@ -879,6 +879,7 @@ class State:
         Returns `(allowed, message for the model)`."""
         category = str(info.get("category") or "")
         key = str(info.get("key") or info.get("detail") or "")
+        setting_key = str(info.get("setting_key") or "")
         with self.lock:
             if (category, key) in self.run_allow \
                     or (category, key) in self.session_allow:
@@ -890,6 +891,7 @@ class State:
                    "detail": str(info.get("detail") or ""),
                    "risk_level": str(info.get("risk_level") or "medium"),
                    "reason": str(info.get("reason") or ""),
+                   "setting_key": setting_key,
                    "key": key, "created_at": time.time()}
             slot = {"event": threading.Event(), "decision": "", "req": req}
             self._perm_slots[pid] = slot
@@ -916,7 +918,7 @@ class State:
             self.bus.publish("status")
             return True, ""
         if decision == "allow_always":
-            self._always_allow(category, key)
+            self._always_allow(category, key, setting_key)
             self.bus.publish("status")
             return True, ""
         self.bus.publish("status")
@@ -928,15 +930,19 @@ class State:
                 kind="permission_timeout")
         return False, security.DENIED_MESSAGE
 
-    def _always_allow(self, category: str, key: str) -> None:
+    def _always_allow(self, category: str, key: str,
+                      setting_key: str = "") -> None:
         """Apply an "Always Allow" decision: flip the matching config knob on
         the live config (so this run never asks again) and persist it to the
-        user config when one exists. Categories without a knob (a specific
+        user config when one exists. A request may name its own knob through
+        `setting_key` (the web tools set `enable_web`); otherwise the knob
+        comes from the category table. Categories without a knob (a specific
         sensitive file) are remembered for the GUI session."""
-        setting = {security.CAT_WEB: "allow_fetch",
-                   security.CAT_SHELL: "allow_shell",
-                   security.CAT_PACKAGE_INSTALL: "auto_install_deps",
-                   }.get(category)
+        setting = setting_key or {security.CAT_WEB: "allow_fetch",
+                                  security.CAT_SHELL: "allow_shell",
+                                  security.CAT_PACKAGE_INSTALL:
+                                      "auto_install_deps",
+                                  }.get(category)
         with self.lock:
             cfg = self.cfg
         if cfg is not None and setting:

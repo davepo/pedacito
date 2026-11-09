@@ -169,6 +169,7 @@ def _step_schema(cfg, reasoning_first: bool = False):
     c = _copy.copy(cfg)
     c.allow_write = c.allow_shell = c.allow_browser = c.allow_screenshots = False
     c.allow_mcp = c.allow_subagents = c.allow_fetch = False
+    c.enable_web = False
     c.step_reasoning_first = reasoning_first
     return schema_for(c)
 

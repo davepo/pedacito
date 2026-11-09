@@ -12,6 +12,7 @@ import socket
 import sys
 import threading
 import time
+import urllib.request
 from pathlib import Path
 from typing import ClassVar
 
@@ -513,3 +514,252 @@ def test_uninstall_releases_any_parked_worker(bare_broker):
 def test_gui_status_reports_no_pending_permission_by_default(gui_broker):
     status, body = gui_broker.get("/api/state")
     assert status == 200 and body["pending_permission"] is None
+
+
+# ------------------------------------------------- built-in web tools (fetch_url /
+#                                                  web_search, enable_web) ---
+
+WEB_DENIED_EXACT = ("[PERMISSION DENIED BY USER: Do not retry fetching "
+                    "external URLs. Proceed using local project files only.]")
+FETCH_DESC = ("Fetch and read the text content of an external http/https "
+              "web page (harness tool; requires user permission when "
+              "enable_web is off)")
+SEARCH_DESC = ("Search the web for external documentation or information "
+               "(harness tool; requires user permission when enable_web is "
+               "off)")
+
+
+class _FakeResp:
+    """Enough of http.client.HTTPResponse for tools._web_open."""
+
+    def __init__(self, body, url, ctype="text/html; charset=utf-8", status=200):
+        self._body = body if isinstance(body, bytes) else body.encode()
+        self._url = url
+        self.status = status
+        self.headers = {"Content-Type": ctype}
+        self.closed = False
+
+    def read(self, n=-1):
+        return self._body if n is None or n < 0 else self._body[:n]
+
+    def geturl(self):
+        return self._url
+
+    def close(self):
+        self.closed = True
+
+
+def _serve(monkeypatch, resp_factory):
+    """Patch urllib.request.urlopen; records (url, timeout, user_agent)."""
+    seen = []
+
+    def fake_urlopen(req, timeout=None, **kw):
+        seen.append((req.full_url, timeout, req.get_header("User-agent")))
+        return resp_factory(req.full_url)
+
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+    return seen
+
+
+def _run_in_thread(st, fn):
+    box = {}
+    t = threading.Thread(target=lambda: box.setdefault("r", fn()), daemon=True)
+    t.start()
+    return t, box
+
+
+def test_enable_web_defaults_off_and_ships_in_template():
+    assert Config().enable_web is False
+    assert "enable_web = false" in config_mod.TEMPLATE
+
+
+def test_enable_web_gui_metadata_exact():
+    from pedacito.gui import settings
+    item = {i["name"]: i for i in settings.schema()}["enable_web"]
+    assert item["label"] == "Enable Web Fetch & Search"
+    assert item["help"] == (
+        "Allow the agent to fetch URLs or search documentation online. "
+        "When disabled, web tool attempts trigger an interactive "
+        "permission prompt.")
+
+
+def test_web_tools_enter_schema_only_when_enabled_or_prompt_reaches_web():
+    plain = tools.schema_for(Config())
+    assert "fetch_url" not in plain["properties"]["action"]["enum"]
+    assert "web_search" not in plain["properties"]["action"]["enum"]
+    assert "url" not in plain["properties"] and "query" not in plain["properties"]
+
+    cfg = Config()
+    cfg._task_text = "summarize https://apnews.com/world-news-council"
+    s = tools.schema_for(cfg)
+    assert "fetch_url" in s["properties"]["action"]["enum"]
+    assert "web_search" in s["properties"]["action"]["enum"]
+    assert "url" in s["properties"] and "query" in s["properties"]
+    assert "url" in s["required"] and "query" in s["required"]
+    keys = list(s["properties"])
+    assert keys.index("symbol") < keys.index("url") < keys.index("query") \
+        < keys.index("content")                                # order intact
+
+    on = Config()
+    on.enable_web = True
+    assert "fetch_url" in tools.schema_for(on)["properties"]["action"]["enum"]
+
+
+def test_prompt_states_exact_web_tool_descriptions():
+    from pedacito import prompts
+    bullets = dict(prompts._EXTRA_BULLETS)
+    assert FETCH_DESC in " ".join(bullets["fetch_url"].split())
+    assert SEARCH_DESC in " ".join(bullets["web_search"].split())
+    cfg = Config()
+    cfg.enable_web = True
+    compact = " ".join(prompts._compact_tool_help(cfg).split())
+    assert FETCH_DESC in compact and SEARCH_DESC in compact
+    assert FETCH_DESC in " ".join(tools.TOOL_HELP.split())
+
+
+def test_fetch_url_broker_denies_with_exact_redirect(bare_broker):
+    st = bare_broker
+    cfg = Config()
+    with st.lock:
+        st.cfg = cfg
+    url = "https://example.com/article"
+    t, box = _run_in_thread(st, lambda: tools.fetch_url(cfg, url))
+    pp = _wait_pending(st)
+    assert pp["category"] == "web_access"
+    assert pp["action_summary"] == f"Fetch external URL: {url}"
+    assert pp["detail"] == url and pp["key"] == url
+    assert pp["setting_key"] == "enable_web"
+    st.decide_permission(pp["id"], "deny")
+    t.join(15)
+    assert box["r"] == WEB_DENIED_EXACT
+
+
+def test_fetch_url_allow_once_fetches_strips_scripts(bare_broker, monkeypatch):
+    st = bare_broker
+    cfg = Config()
+    with st.lock:
+        st.cfg = cfg
+    html = ("<html><head><title>Example Article</title>"
+            "<script>SECRET_SCRIPT_LEAK()</script></head>"
+            "<body><h1>Hello World</h1><p>Body text here.</p>"
+            "<pre>  keep    indent</pre></body></html>")
+    seen = _serve(monkeypatch, lambda u: _FakeResp(html, u))
+    url = "https://example.com/article"
+
+    t, box = _run_in_thread(st, lambda: tools.fetch_url(cfg, url))
+    pp = _wait_pending(st)
+    st.decide_permission(pp["id"], "allow_once")
+    t.join(15)
+    out = box["r"]
+    assert seen == [(url, 8, "Pedacito/1.0")]
+    assert "EXTERNAL CONTENT from https://example.com/article" in out
+    assert "Title: Example Article" in out
+    assert "Hello World" in out and "Body text here." in out
+    assert "SECRET_SCRIPT_LEAK" not in out
+    assert "untrusted" in out.lower()
+
+
+def test_fetch_url_allow_always_flips_enable_web(bare_broker, monkeypatch):
+    st = bare_broker
+    cfg = Config()
+    with st.lock:
+        st.cfg = cfg
+    _serve(monkeypatch, lambda u: _FakeResp("<p>ok</p>", u))
+    url = "https://example.com/docs"
+    t, box = _run_in_thread(st, lambda: tools.fetch_url(cfg, url))
+    pp = _wait_pending(st)
+    st.decide_permission(pp["id"], "allow_always")
+    t.join(15)
+    assert cfg.enable_web is True
+    # the setting itself flipped: a second fetch never parks again
+    t2, box2 = _run_in_thread(st, lambda: tools.fetch_url(cfg, url))
+    t2.join(15)
+    assert "ok" in box2["r"]
+    with st.lock:
+        assert st.pending_permission is None
+
+
+def test_web_search_broker_then_top_results(bare_broker, monkeypatch):
+    st = bare_broker
+    cfg = Config()
+    with st.lock:
+        st.cfg = cfg
+    page = """
+    <div class="result">
+      <a class="result__a" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fdocs.pytest.org%2Fen%2Ffixtures&amp;rut=x">Pytest fixtures</a>
+      <td class="result__snippet">Explicit <b>fixtures</b> remove noise.</td>
+    </div>
+    <div class="result">
+      <a class="result__a" href="https://example.org/guide">A guide</a>
+      <td class="result__snippet">Second &amp; snippet.</td>
+    </div>"""
+    resp_url = ("https://html.duckduckgo.com/html/?q=pytest%20fixture"
+                "%20scopes")
+    _serve(monkeypatch, lambda u: _FakeResp(page, u))
+    q = "pytest fixture scopes"
+    t, box = _run_in_thread(st, lambda: tools.web_search(cfg, q))
+    pp = _wait_pending(st)
+    assert pp["category"] == "web_access"
+    assert pp["action_summary"] == f"Web search: {q}"
+    assert pp["setting_key"] == "enable_web"
+    st.decide_permission(pp["id"], "allow_once")
+    t.join(15)
+    out = box["r"]
+    assert "WEB SEARCH RESULTS for 'pytest fixture scopes'" in out
+    assert "https://docs.pytest.org/en/fixtures" in out   # uddg unwrapped
+    assert "https://example.org/guide" in out
+    assert "Second & snippet." in out
+
+
+def test_fetch_url_ssrf_refused_before_any_prompt(bare_broker, monkeypatch):
+    st = bare_broker
+    cfg = Config()
+    cfg.enable_web = True                     # even enabled: SSRF still holds
+    with st.lock:
+        st.cfg = cfg
+    seen = _serve(monkeypatch, lambda u: _FakeResp("<p>nope</p>", u))
+    for bad in ("http://127.0.0.1:8000/admin", "http://localhost/x",
+                "http://169.254.169.254/latest/meta-data/",
+                "http://[::1]/x", "http://10.0.0.5/internal",
+                "ftp://example.com/file"):
+        out = tools.fetch_url(cfg, bad)
+        assert out.startswith("ERROR:"), bad
+        assert st.status()["pending_permission"] is None
+    assert seen == []
+    # ... unless the user named that host in fetch_allowed_hosts
+    cfg.fetch_allowed_hosts = ("localhost",)
+    out = tools.fetch_url(cfg, "http://localhost:8000/devdocs")
+    assert "EXTERNAL CONTENT" in out
+
+
+def test_fetch_url_clips_to_max_read_tokens(bare_broker, monkeypatch):
+    st = bare_broker
+    cfg = Config()
+    cfg.enable_web = True
+    cfg.max_read_tokens = 100
+    with st.lock:
+        st.cfg = cfg
+    body = "<p>" + ("lorem ipsum dolor sit amet " * 300) + "</p>"
+    _serve(monkeypatch, lambda u: _FakeResp(body, u))
+    out = tools.fetch_url(cfg, "https://example.com/long")
+    assert "clipped at max_read_tokens" in out
+    page = out.split("\n\n", 1)[1].split("\n[... clipped")[0]
+    assert len(page) <= 400
+
+
+def test_dispatch_routes_web_actions_with_field_fallback():
+    cfg = Config()
+    cfg.enable_web = False
+    # no broker installed here: security falls back to a clean denial
+    assert tools.dispatch(None, cfg, {"action": "fetch_url",
+                                      "url": "https://example.com/x"}
+                          ) == WEB_DENIED_EXACT
+    assert tools.dispatch(None, cfg, {"action": "fetch_url",
+                                      "pattern": "https://example.com/x"}
+                          ) == WEB_DENIED_EXACT
+    assert tools.dispatch(None, cfg, {"action": "web_search",
+                                      "query": "docs"}
+                          ) == WEB_DENIED_EXACT
+    assert tools.dispatch(None, cfg, {"action": "web_search",
+                                      "pattern": "docs"}
+                          ) == WEB_DENIED_EXACT

@@ -1,6 +1,6 @@
 """Security hardening and the live human-in-the-loop Permission Broker.
 
-Three guards plus one broker:
+Four guards plus one broker:
 
 1. `resolve_safe_path(root, target)` -- strict workspace containment. Both the
    root and the candidate are fully resolved (symlinks included) and the
@@ -18,14 +18,22 @@ Three guards plus one broker:
    a loopback page. A website open in the same browser cannot drive the local
    server, even when it can guess the port.
 
-4. The Permission Broker -- `request_permission(...)` calls the hook installed
+4. `ssrf_error(url, allowed_hosts)` -- the web tools' SSRF guard: only full
+   http(s) URLs may be fetched, and loopback (`127.0.0.1`, `localhost`,
+   `::1`), link-local/cloud-metadata (`169.254.169.254`) and private LAN
+   ranges (RFC1918 / unique-local) are refused unless the host is named
+   explicitly. A prompt-injected URL can never probe the user's network.
+
+5. The Permission Broker -- `request_permission(...)` calls the hook installed
    by the GUI (`gui.core.install_permission_broker`) and blocks the calling
    worker thread until the user answers the modal: Allow Once / Allow for Run
-   / Always Allow / Deny & Redirect. With no hook installed (plain CLI runs)
-   the broker is inactive: tools keep their historical behaviour and return
-   their own "disabled in config" error instead of waiting on a human who is
-   not there. A denial always answers the model with `DENIED_MESSAGE`, a
-   redirect that keeps the run alive instead of crashing it.
+   / Always Allow / Deny & Redirect. `setting_key` names the config knob an
+   "Always Allow" should flip (e.g. `enable_web`). With no hook installed
+   (plain CLI runs) the broker is inactive: tools keep their historical
+   behaviour and return their own "disabled in config" error instead of
+   waiting on a human who is not there. A denial always answers the model with
+   `DENIED_MESSAGE`, a redirect that keeps the run alive instead of crashing
+   it.
 
 `is_install_command(argv)` recognises package-manager side quests (`pip
 install`, `npm install`, ...) so an otherwise-allowed shell command still
@@ -35,6 +43,7 @@ asks for its own elevated trust.
 from __future__ import annotations
 
 import fnmatch
+import ipaddress
 import threading
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from urllib.parse import urlparse
@@ -45,16 +54,19 @@ __all__ = [
     "CAT_SENSITIVE_FILE",
     "CAT_SHELL",
     "CAT_WEB",
+    "CAT_WEB_ACCESS",
     "DENIED_MESSAGE",
     "SecurityError",
     "install_permission_hook",
     "is_install_command",
+    "is_private_host",
     "is_sensitive_path",
     "is_sensitive_rel",
     "permission_broker_active",
     "post_origin_allowed",
     "request_permission",
     "resolve_safe_path",
+    "ssrf_error",
 ]
 
 
@@ -200,15 +212,76 @@ def post_origin_allowed(headers, bound_host: str = "127.0.0.1") -> bool:
     return True
 
 
-# --- 4. the live Permission Broker --------------------------------------------------
+# --- 4. SSRF guard for the web tools ------------------------------------------------
+
+def is_private_host(host: str) -> bool:
+    """True when `host` names the local machine, a LAN address or a
+    cloud-metadata endpoint: loopback (`127.0.0.1`, `::1`, `localhost`),
+    link-local (the 169.254.169.254 metadata IP lives here), RFC1918 /
+    unique-local LAN ranges, reserved, multicast or unspecified addresses, and
+    `*.local` names. Plain public hostnames are not private."""
+    host = str(host or "").strip().lower().strip("[]")
+    if not host:
+        return True
+    if host in ("localhost", "localhost.localdomain") or host.endswith(
+            (".local", ".localhost")):
+        return True
+    try:
+        ip = ipaddress.ip_address(host)
+    except ValueError:
+        return False
+    return (ip.is_private or ip.is_loopback or ip.is_link_local
+            or ip.is_reserved or ip.is_multicast or ip.is_unspecified)
+
+
+def host_named_explicitly(host: str, allowed_hosts) -> bool:
+    """True when `host` is named in `allowed_hosts` (exact or as a `.suffix`,
+    with `"*"` matching anything)."""
+    host = str(host or "").lower()
+    for a in (allowed_hosts or ()):
+        a = str(a).lower().strip()
+        if a == "*" or host == a or host.endswith("." + a):
+            return True
+    return False
+
+
+def ssrf_error(url: str, allowed_hosts=()) -> str:
+    """'' when `url` may be fetched, else a one-line refusal.
+
+    Only full http(s) URLs pass. Loopback/link-local/metadata/private hosts
+    are refused unless named explicitly in `allowed_hosts`, so a
+    prompt-injected URL cannot probe the user's network or the cloud metadata
+    endpoint."""
+    raw = str(url or "").strip().strip("`\"'")
+    try:
+        u = urlparse(raw)
+    except ValueError:
+        return f"{url!r} is not a parseable URL"
+    if u.scheme not in ("http", "https"):
+        return (f"{raw!r} is not an http(s) URL; the web tools fetch "
+                "http:// or https:// addresses only")
+    host = (u.hostname or "").lower().strip("[]")
+    if not host:
+        return f"{raw!r} has no hostname to fetch"
+    if is_private_host(host) and not host_named_explicitly(
+            host, allowed_hosts):
+        return (f"{host} is a loopback/link-local/private-network address; "
+                "web tools refuse it (SSRF guard) unless the host is named "
+                "explicitly in fetch_allowed_hosts")
+    return ""
+
+
+# --- 5. the live Permission Broker --------------------------------------------------
 
 CAT_WEB = "web"
+CAT_WEB_ACCESS = "web_access"
 CAT_PACKAGE_INSTALL = "package_install"
 CAT_SHELL = "shell"
 CAT_SENSITIVE_FILE = "sensitive_file"
 
 CATEGORY_LABELS = {
     CAT_WEB: "Web Access",
+    CAT_WEB_ACCESS: "Web Fetch & Search",
     CAT_PACKAGE_INSTALL: "Package Install",
     CAT_SHELL: "Shell Command",
     CAT_SENSITIVE_FILE: "Sensitive File Read",
@@ -241,8 +314,12 @@ def permission_broker_active() -> bool:
 
 def request_permission(category: str, action_summary: str, detail: str = "",
                        risk_level: str = "medium", reason: str = "",
-                       key: str = "") -> tuple[bool, str]:
+                       key: str = "", setting_key: str = "") -> tuple[bool, str]:
     """Ask the human. Returns `(allowed, message_for_model)`.
+
+    `setting_key` optionally names the Config field an "Always Allow" should
+    flip (e.g. `enable_web`), so one modal answer also makes the tool
+    standalone-configurable from then on.
 
     With no broker installed this answers `(False, DENIED_MESSAGE)` -- callers
     check `permission_broker_active()` first and keep their own historical
@@ -254,7 +331,8 @@ def request_permission(category: str, action_summary: str, detail: str = "",
             "detail": str(detail or "")[:4000],
             "risk_level": str(risk_level or "medium"),
             "reason": str(reason or ""),
-            "key": str(key or detail or "")[:500]}
+            "key": str(key or detail or "")[:500],
+            "setting_key": str(setting_key or "")}
     if hook is None:
         return False, DENIED_MESSAGE
     try:

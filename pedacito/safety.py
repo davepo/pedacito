@@ -105,6 +105,7 @@ _INJECTION_RE = re.compile(
 # Actions whose output comes from outside the repository's own source text:
 # command output, web pages, MCP servers, OCR. They are fenced explicitly.
 EXTERNAL_ACTIONS = frozenset({"run", "browser", "screenshot", "mcp", "fetch",
+                              "fetch_url", "web_search",
                               "diagnose", "git", "sessions", "memory"})
 
 

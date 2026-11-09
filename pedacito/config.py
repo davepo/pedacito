@@ -335,6 +335,15 @@ class Config:
     browser_headless: bool = True
     # Per-navigation/action timeout in seconds.
     browser_timeout_seconds: int = 20
+    # Built-in web tools: `fetch_url` (read an external page) and `web_search`
+    # (look up online documentation). Standard library only -- no Playwright,
+    # no extra install. Off by default: with it off, a web-tool attempt still
+    # reaches the GUI Permission Broker, so a human can allow or deny each
+    # call (and flip this setting from the modal). A task naming a URL or
+    # web-intent words offers the tools even while it stays off. Loopback,
+    # link-local/metadata and private-network hosts are refused outright
+    # unless named explicitly in fetch_allowed_hosts.
+    enable_web: bool = False
     # Multimodal model id (same server) used to describe a captured screenshot;
     # empty = pixel statistics and OCR text only.
     vision_model: str = ""
@@ -2132,6 +2141,9 @@ browser_wait_seconds = 3
 browser_server_wait_seconds = 15
 browser_headless = true
 browser_timeout_seconds = 20
+# Built-in web tools (`fetch_url` / `web_search`): off = every attempt asks
+# the GUI permission broker instead of fetching directly.
+enable_web = false
 vision_model = ""
 vision_max_tokens = 400
 allow_diff = true
@@ -2354,7 +2366,9 @@ REFERENCE_TEMPLATE = TEMPLATE + '''
 # catalog. allow_git adds a read-only `git` action; git_context adds a
 # branch/dirty/recent-commits line. allow_subagents adds the `task` action
 # (read-only helper; subagent_max_steps bounds it). allow_fetch +
-# fetch_allowed_hosts add `fetch`.
+# fetch_allowed_hosts add `fetch`. enable_web adds the built-in
+# `fetch_url`/`web_search` tools; with it off, a web-tool attempt asks the
+# GUI permission broker (Always Allow flips enable_web itself).
 # roles = { planner = "big", verifier = "big", summarizer = "tiny" } routes
 # those jobs to other profiles. hooks = { post_edit = ["ruff format {file}"] }
 # runs your commands at events (see the README); in a PROJECT config, hooks,

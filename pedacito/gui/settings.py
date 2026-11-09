@@ -5,6 +5,9 @@ Pure functions (no HTTP, no shared state), so they are unit-testable:
     schema()                          every setting: type, default, group, help
     resolved(cfg)                     effective value and origin per setting
 
+`FIELD_META` / `FieldMeta` carry curated label + description entries for
+settings that deserve more than the comment scraped from their `Config` line.
+
 The comment-preserving editor itself lives in `config_editor.py`, so the CLI can
 edit configs without importing the GUI package; those names are re-exported
 below (`validate_text`, `set_values`, `add_profile`, ...) for the settings page.
@@ -14,7 +17,7 @@ from __future__ import annotations
 
 import inspect
 import re
-from dataclasses import MISSING, fields
+from dataclasses import MISSING, dataclass, fields
 
 from .. import config as config_mod
 from ..config import Config
@@ -30,6 +33,26 @@ SECRET_KEYS = ("api_key",)
 # Not editable one-by-one here: tables (use the raw file), selectors handled by
 # the profile UI, and bookkeeping.
 HIDDEN_KEYS = {"active_tier", "default_profile"}
+
+
+@dataclass(frozen=True)
+class FieldMeta:
+    """GUI presentation for a setting shown in ⚙ Settings -> All settings and
+    the Profiles override editor: a human `label` and a `description` that
+    wins over the help text scraped from the Config source."""
+    label: str
+    description: str
+
+
+# Settings with curated GUI metadata. Keys absent here keep their name as the
+# label and the Config comment block as the description.
+FIELD_META: dict[str, FieldMeta] = {
+    "enable_web": FieldMeta(
+        label="Enable Web Fetch & Search",
+        description="Allow the agent to fetch URLs or search documentation "
+                    "online. When disabled, web tool attempts trigger an "
+                    "interactive permission prompt."),
+}
 
 _GROUP_RE = re.compile(r"^\s{4}#\s*---+\s*(.*?)\s*-+\s*$")
 _FIELD_RE = re.compile(r"^\s{4}([A-Za-z_]\w*)\s*:\s*[^=]+?(?:=.*)?$")
@@ -117,12 +140,14 @@ def schema() -> list[dict]:
             default = getattr(base, name, "")
         if isinstance(default, tuple):
             default = list(default)
+        meta = FIELD_META.get(name)
         out.append({
             "name": name,
+            "label": meta.label if meta else name,
             "type": _type_name(f.type),
             "default": default,
             "group": group_by.get(name, "General"),
-            "help": help_by.get(name, ""),
+            "help": meta.description if meta else help_by.get(name, ""),
             "choices": _choices(name),
             "secret": name in SECRET_KEYS,
         })

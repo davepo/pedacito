@@ -85,7 +85,7 @@ _DEDUP_STEP_ACTIONS = {"grep", "find", "outline", "usages", "callers",
 # index, the conversation and the working tree are unchanged.
 _CACHEABLE_ACTIONS = {"grep", "find", "outline", "usages", "callers",
                       "context", "git", "git_diff", "diagnose", "sessions",
-                      "fetch"}
+                      "fetch", "fetch_url", "web_search"}
 # Steps that can change what the cacheable ones return.
 _MUTATING = {"write", "append", "move", "delete", "undo", "rename", "run",
              "browser", "screenshot", "mcp", "task"}
