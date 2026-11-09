@@ -993,3 +993,27 @@ details pre { background: var(--code-bg); border: 1px solid var(--line); border-
 .bench-recent-title { flex: 1 1 auto; min-width: 0; white-space: nowrap;
   overflow: hidden; text-overflow: ellipsis; }
 @media (max-width: 700px) { .bench-form { grid-template-columns: 1fr; } }
+
+/* ------------------------------------------------- permission broker modal -- */
+/* The gated-action request (web fetch, package install, unapproved shell
+   command, sensitive file read): category badge, monospace target box, and
+   the four decision buttons. The run is parked server-side until answered. */
+.perm { display: flex; flex-direction: column; gap: 10px; }
+.perm-badge { align-self: flex-start; font-size: 10.5px; font-weight: 700;
+  text-transform: uppercase; letter-spacing: .7px; border-radius: 999px;
+  padding: 3px 10px; border: 1px solid var(--warn); color: var(--warn);
+  background: color-mix(in srgb, var(--warn) 12%, transparent); }
+.perm-badge.pb-web { border-color: var(--accent); color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 12%, transparent); }
+.perm-badge.pb-package_install { border-color: var(--rep); color: var(--rep);
+  background: color-mix(in srgb, var(--rep) 12%, transparent); }
+.perm-badge.pb-sensitive_file { border-color: var(--err); color: var(--err);
+  background: color-mix(in srgb, var(--err) 12%, transparent); }
+.perm-sum { margin: 0; font-weight: 600; }
+.perm-why { margin: 0; color: var(--muted); font-size: 12.5px; }
+.perm-detail { margin: 0; padding: 9px 11px; border-radius: 8px;
+  background: var(--code-bg); border: 1px solid var(--line2);
+  font-family: var(--mono); font-size: 12.5px; line-height: 1.45;
+  white-space: pre-wrap; word-break: break-all; max-height: 200px;
+  overflow: auto; user-select: text; }
+.perm-risk { margin: 0; color: var(--muted); font-size: 11.5px; }

@@ -1,5 +1,6 @@
 """Shared state for the GUI server: the event bus, terminal capture, the chat
-transcript, and the staged review.
+transcript, the staged review, and the live permission broker (a gated tool
+call pauses its worker until the browser modal answers).
 
 Locking: every read or write of `STATE` fields goes through `STATE.lock` (an
 RLock), held only around state mutations -- never around model or filesystem
@@ -26,7 +27,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from .. import review as review_mod
-from .. import workspace
+from .. import security, workspace
 from ..config import USER_CONFIG
 from ..events import cache_hit_ratio
 from ..index import INDEX_VERSION
@@ -36,6 +37,10 @@ MAX_RECENT = 8
 MAX_MESSAGES = 600
 MAX_TERM_CHARS = 200_000
 QUESTION_TIMEOUT = 900.0
+# How long a gated tool call waits for a human answer before the run is
+# allowed to continue with a clean denial (the modal never leaves a worker
+# hanging forever -- an unattended server must not freeze a job).
+PERMISSION_TIMEOUT = 120.0
 
 # Job kinds that drive the Engine V2 loop (and thus the activity telemetry).
 RUN_KINDS = ("task", "explain", "auto", "new")
@@ -368,6 +373,21 @@ class State:
         self.review: Review | None = None
         self._rid = 0
         self.apply_lock = threading.Lock()
+
+        # Live Permission Broker (Sprint L): a gated tool call (web fetch,
+        # pip install, unapproved shell command, sensitive file read) parks
+        # its worker thread here until the browser modal answers, the
+        # request matches an "Allow for Run" pattern, or it times out into a
+        # clean denial. `_perm_slots` maps request id -> waiter;
+        # `pending_permission` is the modal's payload (the oldest waiter).
+        self.pending_permission: dict | None = None
+        self._perm_slots: dict[str, dict] = {}
+        self._perm_seq = 0
+        # "Allow for Run" grants, cleared when a new job claims the slot.
+        self.run_allow: set[tuple[str, str]] = set()
+        # "Always Allow" for categories without a config knob (sensitive
+        # file paths): remembered for the life of this GUI process.
+        self.session_allow: set[tuple[str, str]] = set()
 
         self.steer_queue: queue.Queue[str] = queue.Queue()
         self._qid = 0
@@ -718,6 +738,15 @@ class State:
             self._job_counter += 1
             self.job = Job(self._job_counter, kind, title)
             self.error, self.note = "", ""
+            # "Allow for Run" grants are scoped to one run; a leftover modal
+            # from a cancelled job must never block the next one.
+            self.run_allow.clear()
+            stale = list(self._perm_slots)
+            for pid in stale:
+                slot = self._perm_slots.pop(pid)
+                slot["decision"] = "deny"
+                slot["event"].set()
+            self.pending_permission = None
             if kind in RUN_KINDS:      # a fresh run starts the telemetry afresh
                 self.phase = "gather"
                 self.gather_steps = 0
@@ -828,6 +857,138 @@ class State:
         return {"phase": phase, "steps": steps, "calls": stats.get("calls", 0),
                 "read_spans": read_spans,
                 "requirements": requirements[:8], "actions": actions}
+
+    # --- live permission broker (Sprint L) ---------------------------------------
+
+    def _refresh_pending_locked(self) -> None:
+        """`pending_permission` mirrors the oldest unanswered request (the
+        modal). Caller holds `self.lock`."""
+        if not self._perm_slots:
+            self.pending_permission = None
+            return
+        oldest = min(self._perm_slots.values(),
+                     key=lambda s: s["req"]["created_at"])
+        self.pending_permission = dict(oldest["req"])
+
+    def request_permission(self, info: dict) -> tuple[bool, str]:
+        """The broker hook (installed into `pedacito.security`). Blocks the
+        calling worker thread until the user answers the GUI modal.
+
+        Order of checks: the "Allow for Run" cache, then the live request to
+        the browser (timeout `PERMISSION_TIMEOUT`, interruptible by Stop).
+        Returns `(allowed, message for the model)`."""
+        category = str(info.get("category") or "")
+        key = str(info.get("key") or info.get("detail") or "")
+        with self.lock:
+            if (category, key) in self.run_allow \
+                    or (category, key) in self.session_allow:
+                return True, ""
+            self._perm_seq += 1
+            pid = f"perm-{self._perm_seq}"
+            req = {"id": pid, "category": category,
+                   "action_summary": str(info.get("action_summary") or ""),
+                   "detail": str(info.get("detail") or ""),
+                   "risk_level": str(info.get("risk_level") or "medium"),
+                   "reason": str(info.get("reason") or ""),
+                   "key": key, "created_at": time.time()}
+            slot = {"event": threading.Event(), "decision": "", "req": req}
+            self._perm_slots[pid] = slot
+            self._refresh_pending_locked()
+            job = self.job
+        self.bus.publish("permission", request=dict(req))
+        self.bus.publish("status")
+        deadline = time.time() + PERMISSION_TIMEOUT
+        # Short waits keep the thread interruptible by Stop (same rhythm as
+        # `ask_user`); a cancelled job is a clean denial, not a crash.
+        while not slot["event"].wait(0.5):
+            if time.time() > deadline or (job is not None and job.cancelled):
+                break
+        decision = slot["decision"]
+        with self.lock:
+            self._perm_slots.pop(pid, None)
+            self._refresh_pending_locked()
+        if decision == "allow_once":
+            self.bus.publish("status")
+            return True, ""
+        if decision == "allow_run":
+            with self.lock:
+                self.run_allow.add((category, key))
+            self.bus.publish("status")
+            return True, ""
+        if decision == "allow_always":
+            self._always_allow(category, key)
+            self.bus.publish("status")
+            return True, ""
+        self.bus.publish("status")
+        if not decision:               # timeout or Stop: deny in the safe direction
+            self.add_message(
+                "system",
+                f"Permission request ({security.CATEGORY_LABELS.get(category, category)}) "
+                "went unanswered and was denied; the run continues without it.",
+                kind="permission_timeout")
+        return False, security.DENIED_MESSAGE
+
+    def _always_allow(self, category: str, key: str) -> None:
+        """Apply an "Always Allow" decision: flip the matching config knob on
+        the live config (so this run never asks again) and persist it to the
+        user config when one exists. Categories without a knob (a specific
+        sensitive file) are remembered for the GUI session."""
+        setting = {security.CAT_WEB: "allow_fetch",
+                   security.CAT_SHELL: "allow_shell",
+                   security.CAT_PACKAGE_INSTALL: "auto_install_deps",
+                   }.get(category)
+        with self.lock:
+            cfg = self.cfg
+        if cfg is not None and setting:
+            try:
+                setattr(cfg, setting, True)
+                if category == security.CAT_WEB and key:
+                    hosts = tuple(getattr(cfg, "fetch_allowed_hosts", ()) or ())
+                    if "*" not in hosts and key not in hosts:
+                        cfg.fetch_allowed_hosts = tuple(hosts) + (key,)
+            except (TypeError, AttributeError):
+                pass
+        changes = {setting: True} if setting else {}
+        if category == security.CAT_WEB and key and cfg is not None:
+            hosts = tuple(getattr(cfg, "fetch_allowed_hosts", ()) or ())
+            if "*" not in hosts and key not in hosts:
+                changes["fetch_allowed_hosts"] = list(hosts) + [key]
+        if changes:
+            try:                                    # best effort: in-memory wins
+                from . import settings_api
+                settings_api.apply_changes("user", None, changes, [])
+            except Exception:
+                pass
+        with self.lock:
+            self.session_allow.add((category, key))
+
+    def decide_permission(self, pid: str, decision: str) -> tuple[bool, str]:
+        """Answer a pending request from the browser. Returns (ok, detail)."""
+        with self.lock:
+            slot = self._perm_slots.get(pid)
+            if slot is None:
+                return False, "This permission request is no longer pending."
+            slot["decision"] = decision
+            self._perm_slots.pop(pid, None)
+            self._refresh_pending_locked()
+        slot["event"].set()
+        self.bus.publish("permission_decided", id=pid, decision=decision)
+        self.bus.publish("status")
+        return True, ""
+
+    def deny_all_permissions(self, reason: str = "") -> int:
+        """Answer every open request with a denial (server shutdown, job
+        teardown). Returns how many waiters were released."""
+        with self.lock:
+            slots = list(self._perm_slots.values())
+            self._perm_slots.clear()
+            self._refresh_pending_locked()
+        for slot in slots:
+            slot["decision"] = "deny"
+            slot["event"].set()
+        if slots:
+            self.bus.publish("status")
+        return len(slots)
 
     # --- questions and steering -----------------------------------------------
 
@@ -1076,6 +1237,9 @@ class State:
                 "model_ok": self.model_ok,
                 "review": self.review_meta_brief(),
                 "question": bool(self.question_mid),
+                # live permission broker: the modal's payload (or null)
+                "pending_permission": (dict(self.pending_permission)
+                                        if self.pending_permission else None),
                 "recent": load_recent(),
                 # the chat thread currently open, plus the project's history
                 # (see `_load_threads`), so the page can offer "switch back"
@@ -1156,6 +1320,23 @@ def install_runner() -> None:
 
 def uninstall_runner() -> None:
     review_mod.RUNNER = None
+
+
+def install_permission_broker() -> None:
+    """Route gated tool calls (web fetch, package install, unapproved shell
+    command, sensitive file read) into the page: the worker thread parks in
+    `STATE.request_permission` until the modal answers. Installed alongside
+    the review runner while the GUI server serves; the CLI never installs a
+    hook, so headless runs keep their historical "disabled in config"
+    errors instead of waiting on a human who is not there."""
+    security.install_permission_hook(STATE.request_permission)
+
+
+def uninstall_permission_broker() -> None:
+    """Deactivate the broker and release any thread still waiting (a denied
+    run pivots on `DENIED_MESSAGE`; the job ends anyway during shutdown)."""
+    security.install_permission_hook(None)
+    STATE.deny_all_permissions("server shutting down")
 
 
 def install_tee() -> tuple:

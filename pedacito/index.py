@@ -1238,8 +1238,19 @@ def reindex_file(index: Index, rel: str, cfg, save: bool = True) -> Index:
     unit that has no cached summary keeps its OLD summary (matched by
     qualname) flagged stale until `refresh_summaries` replaces it, instead of
     going blank. Pass save=False when batching several reindexes and saving
-    once."""
+    once.
+
+    Secret/credential files (`security.is_sensitive_path`) are NEVER folded
+    in -- an explicitly approved read may show a file to the model for this
+    step, but its contents must not persist into `.pedacito/index.json`."""
     root = index.root
+    from . import security
+    if security.is_sensitive_path(Path(root) / rel):
+        if rel in index.files:            # an older index leaked one in: drop it
+            index.forget(rel)
+            if save:
+                index.save()
+        return index
     try:
         new, imports = _chunk_with_imports(rel, root / rel, cfg)
     except (SyntaxError, OSError) as e:

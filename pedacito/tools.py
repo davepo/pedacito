@@ -46,7 +46,7 @@ import time
 from datetime import datetime
 from pathlib import Path, PurePosixPath, PureWindowsPath
 
-from . import browser, fileio, proc, safety, sandbox, sessions, vision
+from . import browser, fileio, proc, safety, sandbox, security, sessions, vision
 from . import edits as edits_mod
 
 TOOL_HELP = """\
@@ -939,9 +939,13 @@ def _fresh_index(index, cfg, rel: str):
 
 def adopt_if_on_disk(index, cfg, file: str) -> str | None:
     """If `file` exists on disk inside the project but is missing from the
-    index, fold it in and return its indexed path; otherwise None."""
+    index, fold it in and return its indexed path; otherwise None. Sensitive
+    files (secrets, keys) are never adopted -- they must not land in
+    `.pedacito/index.json`."""
     cand = _root_rel(index, file)
     if not cand:
+        return None
+    if security.is_sensitive_path(Path(index.root) / cand):
         return None
     if not (Path(index.root) / cand).is_file():
         return None
@@ -1067,6 +1071,24 @@ def _skeleton_view(index, rel: str, head, total_lines: int) -> str:
     return text
 
 
+def _sensitive_read_gate(cfg, rel: str) -> str:
+    """'' when reading `rel` may proceed, else the text to hand the model.
+
+    Secret/credential files are never read into a prompt unasked: with the
+    live permission broker up (GUI), the human is asked and can approve this
+    read; otherwise the read is refused with an explanation."""
+    if security.permission_broker_active():
+        allowed, msg = security.request_permission(
+            category=security.CAT_SENSITIVE_FILE,
+            action_summary=f"Read sensitive file `{rel}`",
+            detail=rel, risk_level="high", key=rel)
+        return "" if allowed else msg
+    return (f"ERROR: `{rel}` is a sensitive file (secret/credential material "
+            "is never indexed or read into a prompt). In the GUI a run can "
+            "ask the user for a one-time approval; from the CLI, run the "
+            "read yourself and paste what matters as an attachment.")
+
+
 def tool_read(index, cfg, file: str, start: int, end: int,
               symbol: str = "") -> str:
     """Return exact, line-numbered source for `file` between `start` and `end`
@@ -1091,8 +1113,18 @@ def tool_read(index, cfg, file: str, start: int, end: int,
                 "code first.")
     rel = None
     if file.strip():
-        rel = index.resolve_file(file)
-        if rel is None:
+        cand = _root_rel(index, file)
+        if cand and security.is_sensitive_path(Path(index.root) / cand):
+            blocked = _sensitive_read_gate(cfg, cand)
+            if blocked:
+                return blocked
+            # User-approved: read straight from disk (a sensitive file is
+            # never in the index, so skip index/symbol resolution for it).
+            rel = cand
+            file = ""
+        else:
+            rel = index.resolve_file(file)
+        if file.strip() and rel is None:
             rel = adopt_if_on_disk(index, cfg, file)
         if rel is None and not symbol:
             # A symbol name in `file` is treated as a symbol read.
@@ -2103,11 +2135,23 @@ def tool_todo(index, cfg, content: str = "") -> str:
 
 def tool_diagnose(index, cfg, file: str = "") -> str:
     """Run the project's detected linter/typechecker (see diagnostics.py),
-    optionally on one file. Gated by allow_shell."""
+    optionally on one file. Gated by allow_shell (the GUI broker can grant
+    it for the run when the user answers the permission prompt)."""
     if not getattr(cfg, "allow_shell", False):
-        return ("ERROR: `diagnose` is disabled (config allow_shell = false). "
-                "Enable allow_shell to let Pedacito run the project's linter/"
-                "typechecker, or run the check yourself.")
+        if security.permission_broker_active():
+            allowed, msg = security.request_permission(
+                category=security.CAT_SHELL,
+                action_summary="Run the project's linter/typechecker (`diagnose`)",
+                detail=f"diagnose {_as_text(file).strip() or '(changed files)'}",
+                risk_level="medium",
+                reason="allow_shell is off; `diagnose` executes a check command",
+                key="diagnose")
+            if not allowed:
+                return msg
+        else:
+            return ("ERROR: `diagnose` is disabled (config allow_shell = false). "
+                    "Enable allow_shell to let Pedacito run the project's linter/"
+                    "typechecker, or run the check yourself.")
     from . import diagnostics
     rel = ""
     if _as_text(file).strip():
@@ -2759,8 +2803,16 @@ def tool_run(index, cfg, command: str) -> str:
     The command runs as an argv WITHOUT a shell (pipes and `&&` are inert);
     `shell_allowlist` restricts the executable; output and runtime are capped.
     `proc.run` stops a process that is silent for `shell_idle_seconds` (a
-    GUI or server), while test runners get the full `shell_timeout`."""
-    if not getattr(cfg, "allow_shell", False):
+    GUI or server), while test runners get the full `shell_timeout`.
+
+    With the live permission broker up (GUI), a disabled or unlisted command
+    -- and any package install (`pip install ...`), which fetches third-party
+    code even when the shell is allowed -- asks the user first instead of
+    failing: Allow Once/for Run/Always continue the command, Deny hands the
+    model a clean redirect."""
+    allow = bool(getattr(cfg, "allow_shell", False))
+    broker = security.permission_broker_active()
+    if not allow and not broker:
         return ("ERROR: `run` is disabled (config allow_shell = false). Enable "
                 "it to run tests or linters from the gather loop, or run the "
                 "command yourself.")
@@ -2775,6 +2827,33 @@ def tool_run(index, cfg, command: str) -> str:
         return "ERROR: run needs a `command`."
 
     denied = _allowlist_error(cfg, argv)
+    overridable = bool(denied) and broker and not _deny_error(cfg, argv)
+    if denied and not overridable:
+        return denied
+
+    if broker and (not allow or overridable
+                   or security.is_install_command(argv)):
+        install = security.is_install_command(argv)
+        summary = (f"Install packages: `{cmd[:120]}`" if install
+                   else f"Run command: `{cmd[:120]}`")
+        why = []
+        if install:
+            why.append("installs third-party code from a package index")
+        if not allow:
+            why.append("allow_shell is off in the config")
+        if overridable:
+            why.append("the executable is not in shell_allowlist")
+        allowed, msg = security.request_permission(
+            category=(security.CAT_PACKAGE_INSTALL if install
+                      else security.CAT_SHELL),
+            action_summary=summary,
+            detail=cmd,
+            risk_level="high",
+            reason="; ".join(why),
+            key=cmd)
+        if not allowed:
+            return msg
+        denied = ""               # the human approved this exact command
     if denied:
         return denied
 

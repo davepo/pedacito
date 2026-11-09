@@ -3,7 +3,10 @@
 The server binds to 127.0.0.1 only and refuses foreign Host/Origin headers
 (`review.request_allowed`), since it can write files. POSTs must be JSON, which
 a cross-site page cannot send without a CORS preflight that this server never
-grants.
+grants. State-mutating POSTs additionally pass `security.post_origin_allowed`:
+when a request carries an `Origin` or `Referer`, its hostname must be loopback
+(or the bound host), so a website open in the same browser cannot drive this
+server (CSRF).
 """
 
 from __future__ import annotations
@@ -19,12 +22,14 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
 from .. import review as review_mod
-from .. import workspace
+from .. import security, workspace
 from ..config import ConfigError
 from ..local_server import LocalHTTPServer
 from ..select import Matcher, is_venv_dir
 from . import jobs, settings_api
-from .core import STATE, install_runner, install_tee, uninstall_runner, uninstall_tee
+from .core import (STATE, install_permission_broker, install_runner,
+                   install_tee, uninstall_permission_broker,
+                   uninstall_runner, uninstall_tee)
 
 STATIC = Path(__file__).parent / "static"
 MAX_BODY = 12 * 1024 * 1024
@@ -51,12 +56,13 @@ _SERVER: LocalHTTPServer | None = None
 # --- helpers ------------------------------------------------------------------
 
 def _within(root: Path, rel: str) -> Path | None:
-    """`rel` resolved under `root`, or None when it escapes the project."""
+    """`rel` resolved under `root`, or None when it escapes the project.
+    Symlinks are resolved on both sides first (`security.resolve_safe_path`),
+    so a link inside the tree pointing at `/etc/passwd` is refused too, and a
+    literal `..` never survives the gate."""
     try:
-        p = (root / rel).resolve()
-        p.relative_to(root.resolve())
-        return p
-    except (ValueError, OSError):
+        return security.resolve_safe_path(root, rel)
+    except (security.SecurityError, OSError, ValueError):
         return None
 
 
@@ -436,6 +442,18 @@ def _answer(q, body):
                                str(body.get("text", "")))
     return (200, {"ok": True}) if ok else (409, {"ok": False,
                                                   "detail": "No open question."})
+
+
+@post("/api/permission/decide")
+def _permission_decide(q, body):
+    """Answer a live permission request: decision is one of allow_once,
+    allow_run, allow_always, deny. Unblocks the parked worker thread."""
+    pid = str(body.get("id") or "")
+    decision = str(body.get("decision") or "")
+    if decision not in ("allow_once", "allow_run", "allow_always", "deny"):
+        return 400, {"ok": False, "detail": f"unknown decision {decision!r}"}
+    ok, detail = STATE.decide_permission(pid, decision)
+    return (200 if ok else 409), {"ok": ok, "detail": detail}
 
 
 @post("/api/review/decide")
@@ -924,6 +942,15 @@ class _Handler(BaseHTTPRequestHandler):
         if not review_mod.request_allowed(self, post=True):
             self._json(403, {"ok": False})
             return
+        # CSRF: a browser-driven POST carries Origin/Referer -- both must name
+        # a loopback host (or this server's bound address). Foreign values
+        # mean some website is trying to drive the local agent: refuse.
+        bound = (getattr(self.server, "server_address", ("127.0.0.1", 0)) or
+                 ("127.0.0.1", 0))[0]
+        if not security.post_origin_allowed(self.headers, bound_host=bound):
+            self._json(403, {"ok": False,
+                             "detail": "Origin/Referer is not loopback"})
+            return
         url = urlparse(self.path)
         route = POST_ROUTES.get(url.path)
         if route is None:
@@ -1011,6 +1038,7 @@ def run(port: int = 0, open_browser: bool = True, project: str | None = None,
     print(f"pedacito gui running at {url}  (Ctrl-C to stop)", file=sys.stderr)
     originals = install_tee()
     install_runner()
+    install_permission_broker()
     if project:
         path = str(Path(project).expanduser().resolve())
         STATE.set_root(path)     # report any existing index before the open job
@@ -1026,6 +1054,7 @@ def run(port: int = 0, open_browser: bool = True, project: str | None = None,
     except KeyboardInterrupt:
         print(file=sys.stderr)
     finally:
+        uninstall_permission_broker()
         uninstall_runner()
         uninstall_tee(originals)
         STATE.bus.close()

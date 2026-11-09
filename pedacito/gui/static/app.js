@@ -168,6 +168,57 @@ PDC.browse = (opts) => {
   go(st.path);
 };
 
+// ------------------------------------------------ live permission broker ---
+// A gated action (web fetch, pip install, unapproved shell/test command,
+// sensitive file read) parks its worker thread server-side and surfaces here
+// as `status.pending_permission`. The modal is the only way forward: one of
+// the four buttons POSTs /api/permission/decide and the server releases the
+// waiting thread (Allow Once / Allow for This Run / Always Allow /
+// Deny & Redirect).
+const PERM_LABELS = {
+  web: 'Web Access', package_install: 'Package Install',
+  shell: 'Shell Command', sensitive_file: 'Sensitive File Read',
+};
+let permModal = null, permShownId = '';
+
+PDC.decidePermission = (id, decision) => {
+  if (permModal) { const m = permModal; permModal = null; permShownId = ''; m.close(); }
+  PDC.api('/api/permission/decide', { id: id, decision: decision }).then(() => refreshState());
+};
+
+function syncPermissionModal(s) {
+  const pp = s.pending_permission || null;
+  if (pp && pp.id !== permShownId) {          // a new request: open the modal
+    permShownId = pp.id;
+    showPermissionModal(pp);
+  } else if (!pp && permShownId) {            // answered/timed out: close it
+    permShownId = '';
+    if (permModal) { const m = permModal; permModal = null; m.close(); }
+  }
+}
+
+function showPermissionModal(pp) {
+  const label = PERM_LABELS[pp.category] || pp.category;
+  const body = h('div', { class: 'perm' },
+    h('div', { class: 'perm-badge pb-' + pp.category, text: label }),
+    h('p', { class: 'perm-sum', text: pp.action_summary || 'The model requests this action.' }),
+    pp.reason ? h('p', { class: 'perm-why' }, h('b', { text: 'Why: ' }), pp.reason) : null,
+    h('pre', { class: 'perm-detail', text: pp.detail || '(no target shown)' }),
+    h('p', { class: 'perm-risk', text: 'Risk: ' + (pp.risk_level || 'medium') +
+      ' \u00B7 the run is paused until you decide. Deny & Redirect tells the ' +
+      'model to proceed with local project files only.' }));
+  const btn = (label, decision, extra) => Object.assign(
+    { label: label, stay: true,
+      onclick: () => { PDC.decidePermission(pp.id, decision); return false; } },
+    extra || {});
+  permModal = PDC.modal('Permission requested', body, [
+    btn('Allow Once', 'allow_once', { primary: true }),
+    btn('Allow for This Run', 'allow_run', {}),
+    btn('Always Allow', 'allow_always', {}),
+    btn('Deny & Redirect', 'deny', { danger: true }),
+  ], { narrow: true, onClose: () => { permModal = null; permShownId = ''; } });
+}
+
 // ------------------------------------------------------- markdown to vnodes ---
 function inlineNodes(text) {
   const out = [];
@@ -407,6 +458,7 @@ PDC.refreshState = refreshState;
 function applyStatus(s) {
   const prev = S.status;
   S.status = s;
+  syncPermissionModal(s);               // live permission requests open the modal
   if (prev.active_thread_id && s.active_thread_id && s.active_thread_id !== prev.active_thread_id) {
     S.msgs = [];                       // a different conversation: the ids
     S.msgTick++;                       // restart, so merging would mix threads
@@ -523,6 +575,7 @@ function loadSnapshot() {
     S.msgs = (snap.messages || []).map((m) => ({ ...m, rev: 0 }));
     S.msgTick++;
     S.status = snap.status || {};
+    syncPermissionModal(S.status);
     lastJobId = S.status.job ? S.status.job.id : 0;
     lastReviewKey = S.status.review ? S.status.review.id + ':' + S.status.review.outcome : '';
     lastFilesSig = S.status.files_sig || '';
@@ -563,6 +616,8 @@ function connect(seq) {
   on('term_clear', () => { if (term) term.reset(''); });
   on('usage', () => refreshState());
   on('job', () => refreshState());
+  on('permission', () => refreshState());         // a gated action is waiting
+  on('permission_decided', () => refreshState()); // someone answered it
   ['status', 'review', 'review_done'].forEach((t) => on(t, () => refreshState()));
   stream.addEventListener('resync', () => { stream.close(); es = null; loadSnapshot(); });
 }

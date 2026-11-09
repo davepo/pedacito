@@ -22,6 +22,8 @@ from urllib.parse import urlparse
 
 import requests
 
+from . import security
+
 _MAX_BYTES = 600_000
 _TTL = 3600
 
@@ -99,16 +101,46 @@ def _is_private(host: str) -> bool:
 
 
 def tool_fetch(index, cfg, url: str) -> str:
-    """Fetch `url` and return labelled, truncated readable text."""
-    if not getattr(cfg, "allow_fetch", False):
+    """Fetch `url` and return labelled, truncated readable text.
+
+    With the live permission broker up (GUI), a disabled `fetch` or a host
+    outside `fetch_allowed_hosts` asks the user first; an approval covers
+    this exact host for the chosen scope. Loopback/private targets keep
+    their absolute refusal shape: the user may approve a named host, a
+    prompt-injected URL may never be fetched unasked."""
+    raw = (url or "").strip()
+    broker = security.permission_broker_active()
+    approved_host = ""
+    if broker:
+        probe = urlparse(raw)
+        host_l = (probe.hostname or "").lower()
+        if probe.scheme in ("http", "https") and host_l:
+            allowed_cfg = tuple(getattr(cfg, "fetch_allowed_hosts", ()) or ())
+            if (not getattr(cfg, "allow_fetch", False)
+                    or not _host_allowed(host_l, allowed_cfg)):
+                why = ("web access (`allow_fetch`) is off"
+                       if not getattr(cfg, "allow_fetch", False)
+                       else f"`{host_l}` is not in fetch_allowed_hosts")
+                ok, msg = security.request_permission(
+                    category=security.CAT_WEB,
+                    action_summary=f"Fetch {host_l}",
+                    detail=raw, risk_level="medium",
+                    reason=f"{why}; the model wants to read this page",
+                    key=host_l)
+                if not ok:
+                    return msg
+                approved_host = host_l
+    if not getattr(cfg, "allow_fetch", False) and not approved_host:
         return ("ERROR: `fetch` is disabled (config allow_fetch = false). "
                 "Enable it and list hosts in fetch_allowed_hosts.")
-    raw = (url or "").strip()
     u = urlparse(raw)
     if u.scheme not in ("http", "https") or not u.hostname:
         return "ERROR: fetch needs a full http(s) URL in `pattern`."
     host = (u.hostname or "").lower()
     allowed = tuple(getattr(cfg, "fetch_allowed_hosts", ()) or ())
+    if approved_host:
+        # The human named this host for this run: treat it as listed.
+        allowed = tuple(allowed) + (approved_host,)
     if not allowed:
         return ("ERROR: fetch_allowed_hosts is empty; name the hosts the model "
                 "may read (e.g. [\"docs.python.org\"]).")
