@@ -657,6 +657,11 @@ class Config:
     # Use the measured model card (`pedacito calibrate`) to pick defaults.
     use_model_card: bool = True
 
+    # --- Graphical interface --------------------------------------------------
+    # Colorscheme of `pedacito gui`. Purely cosmetic: applying it never
+    # reloads the project. Unknown names fall back to the built-in default.
+    gui_theme: str = "slate"
+
     # --- Telemetry and retention (local only) --------------------------------
     # One JSON line per significant action under .pedacito/events/.
     log_events: bool = True
@@ -787,6 +792,8 @@ _ENUM_FIELDS = {
     "verify_answer": ("off", "deterministic", "full"),
     "prompt_cache": ("auto", "implicit", "explicit", "off"),
     "prompt_cache_ttl": ("5m", "1h"),
+    "gui_theme": ("slate", "light", "daylight", "nord", "midnight",
+                  "jazz_solo", "trapper_keeper", "memphis_arcade", "windbreaker"),
 }
 _ENUM_EMPTY_OK = ("prompt_pack", "answer_mode")
 
@@ -2029,6 +2036,10 @@ open_browser = true
 review_timeout = 1800
 manage_gitignore = true
 create_ignore_file = true
+# gui_theme: colorscheme of `pedacito gui` (slate, light, daylight, nord,
+# midnight, jazz_solo, trapper_keeper, memphis_arcade, windbreaker). The GUI's
+# topbar picker writes this key; cosmetic only, never reloads the project.
+gui_theme = "slate"
 
 [indexing]
 # Chunking and retrieval. Oversized units split at statement boundaries.

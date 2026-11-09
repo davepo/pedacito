@@ -208,7 +208,7 @@ const S = {
   opts: (() => { try { return JSON.parse(localStorage.getItem('pedacito_opts') || '{}'); } catch (e) { return {}; } })(),
   ui: { diffOpen: false, wsCollapsed: false, termFollow: true, optsOpen: false,
         diffMode: localStorage.getItem('pedacito_diff_mode') || 'split',
-        view: 'chat', folds: {}, planEditing: false, pendingProfile: '' },
+        view: 'chat', folds: {}, planEditing: false, pendingProfile: null },
   peek: null,
 };
 PDC.S = S;
@@ -374,7 +374,19 @@ function applyStatus(s) {
     lastFilesSig = s.files_sig || '';
     if (S.ws.tab === 'files' && s.root) loadFiles();
   }
-  if (S.ui.pendingProfile && s.profile === S.ui.pendingProfile) S.ui.pendingProfile = '';
+  if (S.ui.pendingProfile !== null && s.profile === S.ui.pendingProfile) S.ui.pendingProfile = null;
+  // Colorscheme: config.toml (gui_theme) is the source of truth. On the
+  // first poll the server wins only over an untouched browser (a browser-
+  // local pick that could not be persisted \u2014 no user config file \u2014 must
+  // not be erased on every reload). Afterwards we follow the server only
+  // while nobody changed the theme here since the last known server value.
+  if (typeof s.gui_theme === 'string' && s.gui_theme && s.gui_theme !== lastServerTheme) {
+    let local = 'slate';
+    try { local = localStorage.getItem('pedacito_theme') || 'slate'; } catch (err) {}
+    const follow = lastServerTheme === null ? local === 'slate' : local === lastServerTheme;
+    if (follow) applyTheme(s.gui_theme, false);
+    lastServerTheme = s.gui_theme;
+  }
   if (s.needs_setup && !sessionStorage.getItem('pedacito_setup_shown')) {
     sessionStorage.setItem('pedacito_setup_shown', '1');
     callSettings();
@@ -531,7 +543,7 @@ function switchProfile(name) {
   emit();
   PDC.api('/api/profile', { profile: name }).then((j) => {
     if (!j.ok) {
-      S.ui.pendingProfile = '';
+      S.ui.pendingProfile = null;
       PDC.toast(j.detail || 'busy', true);
     }
     refreshState(); emit();
@@ -807,6 +819,42 @@ PDC.runPlan = function () {
 
 // ---- menu actions ----
 function checkModel() { PDC.api('/api/check_model', {}).then(refreshState); }
+
+// Quick-calibrate the profile shown in the header from the top bar. Same
+// endpoint and wording as the Settings -> Model discovery card button.
+function calibrateProfile(name) {
+  if (!name) { PDC.toast('No active profile to calibrate.', true); return; }
+  PDC.confirm('Calibrate \u201c' + name + '\u201d?\n\nA short probe: a few timed calls to measure how fast this model answers, how long a prompt it can actually hold, and how reliably it uses tools. The result is stored in its model card and the tuned limits are written to the profile.', 'Run it').then((ok) => {
+    if (!ok) return;
+    PDC.api('/api/models/calibrate', { profile: name, mode: 'quick' }).then((j) => {
+      if (!j.ok) { PDC.toast(j.detail || 'could not start the calibration', true); return; }
+      PDC.toast('Calibrating "' + name + '" \u2014 watch the Output tab.');
+      refreshState();
+    });
+  });
+}
+
+// The GUI colorscheme. The browser always gets it at once (localStorage, so
+// theme.js can apply it before first paint); `userPick` additionally persists
+// it as gui_theme in the user config through /api/settings/theme — purely
+// cosmetic, so the project is never reloaded for it. If the write fails (no
+// user config file yet, server gone), the choice stays browser-local.
+let lastServerTheme = null;
+function applyTheme(t, userPick) {
+  if (!t) return;
+  if (t === 'slate') document.documentElement.removeAttribute('data-theme');
+  else document.documentElement.setAttribute('data-theme', t);
+  try { localStorage.setItem('pedacito_theme', t); } catch (err) {}
+  const sel = $('theme');
+  if (sel && Array.prototype.some.call(sel.options, (o) => o.value === t)) sel.value = t;
+  if (!userPick) return;
+  PDC.api('/api/settings/theme', { gui_theme: t }).then((j) => {
+    if (j && j.ok) {
+      lastServerTheme = t;
+      if (!j.persisted) PDC.toast('Theme kept in this browser: create a user config to store it in config.toml.');
+    } else PDC.toast('Theme kept in this browser (config not written): ' + ((j && j.detail) || 'server error'), true);
+  }).catch(() => PDC.toast('Theme kept in this browser (server unreachable).', true));
+}
 function clearTerm() { PDC.api('/api/term_clear', {}); }
 function restoreDialog() {
   const snaps = S.status.snapshots || [];
@@ -873,7 +921,8 @@ function ProfileSelect(props) {           // header dropdown; uncontrolled
   const peek = props.peek;
   const profiles = peek ? peek.profiles : (s.profiles || []);
   const defName = peek ? peek.default : s.default_profile;
-  const active = S.ui.pendingProfile || (s.profile && s.profile !== defName ? s.profile : '');
+  const active = S.ui.pendingProfile !== null ? S.ui.pendingProfile
+    : (s.profile && s.profile !== defName ? s.profile : '');
   const ref = useRef(null);
   useEffect(() => {                       // sync only when it truly differs,
     const el = ref.current;                // and never while it is open/focused
@@ -902,87 +951,105 @@ function TopBar() {
     ? (s.index_time ? 'index from ' + new Date(s.index_time * 1000).toLocaleString() : 'index present')
     : 'no index yet -- click Index to build one (Shift-click for a quick, no-summaries index)';
   const open = () => openProject((pathRef.current && pathRef.current.value || '').trim(), S.ui.pendingProfile || '');
+  const pending = S.ui.pendingProfile;
+  const canSwitch = pending !== null && pending !== s.profile;
+  const activeProf = s.profile || s.default_profile || '';
   return html`
     <header id="topbar">
-      <div class="brand">pe<span>da</span>cito</div>
-      <div id="projectBar">
-        <input type="text" id="path" ref=${pathRef} placeholder="/path/to/your/project"
-               spellcheck="false" autocomplete="off"
-               oninput=${(e) => { S.peek = null; peeked = ''; peek(e.target.value.trim()); }}
-               onkeydown=${(e) => { if (e.key === 'Enter') open(); }} />
-        <button id="browseBtn" title="browse folders on this machine"
-                onClick=${() => PDC.browse({ title: 'Choose a project folder',
-                  start: ((pathRef.current && pathRef.current.value) || s.root || '').replace(/[\\/][^\\/]*[\\/]$/, ''),
-                  pickLabel: 'Open this folder',
-                  onPick: (p) => { if (pathRef.current) pathRef.current.value = p; openProject(p, S.ui.pendingProfile || ''); } })}>Browse…</button>
-        <select id="recent" title="recent projects"
-                onchange=${(e) => { const v = e.target.value; e.target.value = ''; if (v) { if (pathRef.current) pathRef.current.value = v; openProject(v, ''); } }}>
-          <option value="">recent\u2026</option>
-          ${(s.recent || []).map((r) => html`<option key=${r} value=${r}>${r}</option>`)}
-        </select>
-        <button class="primary" id="openBtn" disabled=${!!j} onClick=${open}>Open</button>
+      <div class="tb-row" id="tbRow1">
+        <div class="brand">pe<span>da</span>cito</div>
+        <div id="projectBar">
+          <input type="text" id="path" ref=${pathRef} placeholder="/path/to/your/project"
+                 spellcheck="false" autocomplete="off"
+                 oninput=${(e) => { S.peek = null; peeked = ''; peek(e.target.value.trim()); }}
+                 onkeydown=${(e) => { if (e.key === 'Enter') open(); }} />
+          <button id="browseBtn" title="browse folders on this machine"
+                  onClick=${() => PDC.browse({ title: 'Choose a project folder',
+                    start: ((pathRef.current && pathRef.current.value) || s.root || '').replace(/[\\/][^\\/]*[\\/]$/, ''),
+                    pickLabel: 'Open this folder',
+                    onPick: (p) => { if (pathRef.current) pathRef.current.value = p; openProject(p, S.ui.pendingProfile || ''); } })}>Browse…</button>
+          <select id="recent" title="recent projects"
+                  onchange=${(e) => { const v = e.target.value; e.target.value = ''; if (v) { if (pathRef.current) pathRef.current.value = v; openProject(v, ''); } }}>
+            <option value="">recent\u2026</option>
+            ${(s.recent || []).map((r) => html`<option key=${r} value=${r}>${r}</option>`)}
+          </select>
+          <button class="primary" id="openBtn" disabled=${!!j} onClick=${open}>Open</button>
+          <${Menu} button=${html`<button id="projMenuBtn" title="index, restore and other project actions">Project ▾</button>`}>
+            <${MenuItem} label="Check model (loads it)" disabled=${!!j || !s.root} action=${checkModel} />
+            <${MenuItem} label="Restore from a backup\u2026" disabled=${!!j || !(s.snapshots || []).length} action=${restoreDialog} />
+            <${MenuItem} label="Clear terminal" action=${clearTerm} />
+            <${MenuItem} label="Clear chat" action=${() => PDC.api('/api/clear', {})} />
+          <//>
+        </div>
+        <div id="topRight">
+          <select id="theme" title="color scheme (saved as gui_theme in config.toml)"
+                  onchange=${(e) => applyTheme(e.target.value, true)}>
+            <optgroup label="Light">
+              <option value="light">Light \u2014 GitHub</option>
+              <option value="daylight">Daylight \u2014 warm paper</option>
+            </optgroup>
+            <optgroup label="Dark">
+              <option value="slate">Slate \u2014 GitHub Dark</option>
+              <option value="nord">Nord \u2014 Catppuccin</option>
+              <option value="midnight">Midnight \u2014 high contrast</option>
+            </optgroup>
+            <optgroup label="1990s">
+              <option value="jazz_solo">Jazz Cup \u2014 '91 teal/purple</option>
+              <option value="trapper_keeper">Trapper Keeper \u2014 cobalt/coral</option>
+              <option value="memphis_arcade">Memphis Arcade \u2014 neon geometry</option>
+              <option value="windbreaker">Windbreaker \u2014 color-block nylon</option>
+            </optgroup>
+          </select>
+          <button id="settingsBtn" title="profiles and settings" onClick=${() => callSettings()}>\u2699 Settings</button>
+          <button class="danger" id="exitBtn" title="stop the pedacito gui server"
+                  onClick=${() => PDC.confirm('Stop the pedacito gui server? Run "pedacito gui" again to reopen it.', 'Stop server', true).then((ok) => {
+                    if (!ok) return;
+                    PDC.api('/api/shutdown', {}).catch(() => {}).then(() => {
+                      document.body.innerHTML = '<div style="padding:80px 20px;text-align:center;font:16px sans-serif;color:#8b91a0">pedacito gui has stopped. You can close this tab.</div>';
+                    });
+                  })}>Exit</button>
+        </div>
+      </div>
+      <div class="tb-row" id="tbRow2">
         <${ProfileSelect} busy=${j} peek=${peekOn ? S.peek : null}
-                          onChange=${(name) => (s.root ? switchProfile(name) : (S.ui.pendingProfile = name, emit()))} />
-      </div>
-      <div id="indexBox">
-        <span class="chip" id="indexChip" title=${idxTitle}>
-          <i class=${'dot ' + (indexed ? 'ok' : 'idle')}></i>
-          <b>${indexed ? 'indexed' : 'no index'}</b>
-          ${indexed ? html`<span class="muted small-text">${PDC.fmtInt(s.index_files)} files \u00B7 ${PDC.fmtInt(s.index_chunks)} units</span>` : null}
-        </span>
-        <button id="indexBtn" class="small" disabled=${!!j || !s.root}
-                onClick=${(e) => buildIndex(!e.shiftKey)}>Index</button>
-      </div>
-      <div id="topRight">
+                          onChange=${(name) => { S.ui.pendingProfile = name; emit(); }} />
+        <button id="switchBtn" class="small" disabled=${!!j || !s.root || !canSwitch}
+                title=${s.root ? 'switch the open project to the profile picked above'
+                               : 'remembered: applied when you open a project'}
+                onClick=${() => { if (s.root) switchProfile(pending === null ? '' : pending); }}>Switch</button>
+        <button id="calibrateBtn" class="small" disabled=${!!j || !activeProf}
+                title=${'quick-calibrate "' + (activeProf || '') + '" (measured scores and limits go into its model card; output streams to the terminal)'}
+                onClick=${() => calibrateProfile(activeProf)}>Calibrate</button>
         <span class="chip" id="modelChip"
               title=${(s.model_status || 'click to check the model server') + (s.base_url ? '\n' + s.base_url : '') + (s.context_tokens ? '\nwindow ' + PDC.fmtInt(s.context_tokens) + ' tokens (' + s.context_origin + ')' : '')}
               onClick=${() => { if (s.root && !j) checkModel(); }}>
           <i class=${'dot ' + (j ? 'busy' : s.model_ok === true ? 'ok' : s.model_ok === false ? 'bad' : 'idle')}></i>
           <b>${s.root ? (s.model || '\u2014') : 'no project'}</b>
+          ${s.root && s.model ? html`<span class="tag ${s.disable_thinking ? '' : 'act'}"
+            title=${s.disable_thinking ? 'thinking is disabled for this profile (disable_thinking = true)'
+                                       : 'thinking is allowed (disable_thinking = false) \u2014 turn it off in Settings \u2192 Profiles'}>${s.disable_thinking ? 'no-think' : 'thinking'}</span>` : null}
         </span>
-        ${(s.usage && s.usage.calls) ? html`
-          <span class="chip" id="usageChip" title=${'model usage this session (' + Math.round(s.usage.seconds) + 's)'}>
-            <b>${s.usage.calls + ' calls \u00B7 ' + PDC.fmtTokens(s.usage.tokens_in) + ' in / ' + PDC.fmtTokens(s.usage.tokens_out) + ' out'
-              + (s.usage.cache_hit ? ' \u00B7 cache ' + Math.round(s.usage.cache_hit * 100) + '%' : '')
-              + (s.usage.cost ? ' \u00B7 $' + Number(s.usage.cost).toFixed(4) : '')}</b>
+        <div class="tb-right">
+          <div id="indexBox">
+            <span class="chip" id="indexChip" title=${idxTitle}>
+              <i class=${'dot ' + (indexed ? 'ok' : 'idle')}></i>
+              <b>${indexed ? 'indexed' : 'no index'}</b>
+              ${indexed ? html`<span class="muted small-text">${PDC.fmtInt(s.index_files)} files \u00B7 ${PDC.fmtInt(s.index_chunks)} units</span>` : null}
+            </span>
+            <button id="indexBtn" class="small" disabled=${!!j || !s.root}
+                    onClick=${(e) => buildIndex(!e.shiftKey)}>Index</button>
+          </div>
+          ${s.root ? html`<span class="chip" id="threadChip"
+            title=${'active conversation: ' + (s.thread_title || '') + ' \u2014 switch threads in the Chat panel'}>
+            <b class="ellip">${s.thread_title || 'chat'}</b>
           </span>` : null}
-        <${Menu} button=${html`<button id="projMenuBtn" title="index, restore and other project actions">Project ▾</button>`}>
-          <${MenuItem} label="Check model (loads it)" disabled=${!!j || !s.root} action=${checkModel} />
-          <${MenuItem} label="Restore from a backup\u2026" disabled=${!!j || !(s.snapshots || []).length} action=${restoreDialog} />
-          <${MenuItem} label="Clear terminal" action=${clearTerm} />
-          <${MenuItem} label="Clear chat" action=${() => PDC.api('/api/clear', {})} />
-        <//>
-        <button id="settingsBtn" title="profiles and settings" onClick=${() => callSettings()}>\u2699 Settings</button>
-        <select id="theme" title="color scheme"
-                oninput=${(e) => {
-                  const v = e.target.value;
-                  if (v === 'slate') document.documentElement.removeAttribute('data-theme');
-                  else document.documentElement.setAttribute('data-theme', v);
-                  try { localStorage.setItem('pedacito_theme', v); } catch (err) {}
-                }}>
-          <optgroup label="Light">
-            <option value="light">Light \u2014 GitHub</option>
-            <option value="daylight">Daylight \u2014 warm paper</option>
-          </optgroup>
-          <optgroup label="Dark">
-            <option value="slate">Slate \u2014 GitHub Dark</option>
-            <option value="nord">Nord \u2014 Catppuccin</option>
-            <option value="midnight">Midnight \u2014 high contrast</option>
-          </optgroup>
-          <optgroup label="1990s">
-            <option value="jazz_solo">Jazz Cup \u2014 '91 teal/purple</option>
-            <option value="trapper_keeper">Trapper Keeper \u2014 cobalt/coral</option>
-            <option value="memphis_arcade">Memphis Arcade \u2014 neon geometry</option>
-            <option value="windbreaker">Windbreaker \u2014 color-block nylon</option>
-          </optgroup>
-        </select>
-        <button class="danger" id="exitBtn" title="stop the pedacito gui server"
-                onClick=${() => PDC.confirm('Stop the pedacito gui server? Run "pedacito gui" again to reopen it.', 'Stop server', true).then((ok) => {
-                  if (!ok) return;
-                  PDC.api('/api/shutdown', {}).catch(() => {}).then(() => {
-                    document.body.innerHTML = '<div style="padding:80px 20px;text-align:center;font:16px sans-serif;color:#8b91a0">pedacito gui has stopped. You can close this tab.</div>';
-                  });
-                })}>Exit</button>
+          ${(s.usage && s.usage.calls) ? html`
+            <span class="chip" id="usageChip" title=${'model usage this session (' + Math.round(s.usage.seconds) + 's)'}>
+              <b>${s.usage.calls + ' calls \u00B7 ' + PDC.fmtTokens(s.usage.tokens_in) + ' in / ' + PDC.fmtTokens(s.usage.tokens_out) + ' out'
+                + (s.usage.cache_hit ? ' \u00B7 cache ' + Math.round(s.usage.cache_hit * 100) + '%' : '')
+                + (s.usage.cost ? ' \u00B7 $' + Number(s.usage.cost).toFixed(4) : '')}</b>
+            </span>` : null}
+        </div>
       </div>
     </header>`;
 }

@@ -261,10 +261,15 @@ textarea { resize: none; background: var(--panel); }
 .placeholder b { color: var(--text); }
 
 /* ---------------------------------------------------------------- top bar -- */
+/* Two rows: row 1 is the project (open/menu) side by side with the global
+   actions (theme/settings/exit); row 2 is the running model state (profile,
+   model chip, calibrate) with index/thread/usage pushed right. */
 #topbar {
-  display: flex; align-items: center; gap: 10px; padding: 8px 12px;
-  background: var(--panel); border-bottom: 1px solid var(--line); flex-wrap: wrap;
+  display: flex; flex-direction: column; gap: 6px; padding: 8px 12px;
+  background: var(--panel); border-bottom: 1px solid var(--line);
 }
+.tb-row { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; min-width: 0; }
+#tbRow2 { row-gap: 4px; }
 .brand { font-size: 17px; font-weight: 700; letter-spacing: .5px; }
 .brand span { color: var(--accent); font-weight: 800; }
 #projectBar { display: flex; align-items: center; gap: 6px; flex: 1 1 420px; min-width: 260px; }
@@ -272,21 +277,25 @@ textarea { resize: none; background: var(--panel); }
 #path { flex: 1 1 160px; min-width: 120px; height: 26px; font-family: var(--mono); font-size: 12px; }
 #recent { max-width: 150px; height: 26px; }
 #profile { max-width: 240px; height: 26px; font-size: 12px; }
-#topRight { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+#topRight { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; margin-left: auto; }
+#tbRow2 .tb-right { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; margin-left: auto; }
 #theme { height: 26px; max-width: 120px; font-size: 12px; }
-#topRight button { height: 26px; }
+#topRight button, #tbRow2 button { height: 26px; }
 #settingsBtn { border-color: var(--line); }
+#switchBtn:not(:disabled) { border-color: var(--accent); color: var(--accent); }
 #exitBtn { border-color: var(--line); background: transparent; color: var(--err); }
 #exitBtn:hover { background: var(--err); color: var(--danger-fg); }
 
 .chip { display: inline-flex; align-items: center; gap: 6px; font-size: 12px;
   background: var(--panel2); border: 1px solid var(--line); border-radius: 999px;
   padding: 3px 10px; max-width: 420px; overflow: hidden; white-space: nowrap; }
-.chip b { font-weight: 600; }
+.chip b { font-weight: 600; min-width: 0; overflow: hidden; text-overflow: ellipsis; }
 .chip .small-text { margin-left: 2px; }
+.chip .tag { flex: none; }
 #indexBox { display: flex; align-items: center; gap: 6px; }
 #modelChip { cursor: pointer; }
 #modelChip:hover, #indexChip:hover, #usageChip:hover { border-color: var(--line2); }
+#threadChip { max-width: 200px; }
 
 .dot { width: 9px; height: 9px; border-radius: 50%; flex: none; display: inline-block; }
 .dot.idle { background: var(--muted); }
@@ -792,13 +801,41 @@ details pre { background: var(--code-bg); border: 1px solid var(--line); border-
 .scan-table tr.scan-server .sg-group button { flex: none; font-size: 10.5px; padding: 1px 7px; }
 .scan-table tr.imp { opacity: .55; }
 .scan-table input[type=text] { width: 172px; }
-.prow { display: flex; align-items: center; gap: 8px; padding: 7px 10px; min-width: 0;
+/* the VRAM box keeps its whole "VRAM (GB)" caption on screen: a bare
+   74px input clipped it to "VRAM (" at the default zoom */
+.scan-vram { display: inline-flex; align-items: center; gap: 6px; flex: none;
+  color: var(--muted); font-size: 12px; }
+.scan-vram input { min-width: 110px; height: 26px; }
+.scan-hint { margin-top: 6px; }
+/* Profile card: identity block on the left (name + pills over the model
+   line), actions on the right that never get squeezed or wrapped apart. */
+.prow { display: flex; align-items: center; justify-content: space-between;
+  gap: 16px; flex-wrap: wrap; padding: 7px 10px; min-width: 0;
   border: 1px solid var(--line); border-radius: 8px; margin-bottom: 6px; font-size: 12.5px; }
-.prow-actions { display: flex; align-items: center; gap: 6px; flex: none; }
+.prow-main { flex: 1 1 260px; min-width: 0; display: flex; flex-direction: column; gap: 2px; }
+.prow-head { display: flex; align-items: center; gap: 8px; min-width: 0; }
+.prow-name { font-size: 13px; max-width: 100%; }
+.prow-sub { color: var(--muted); font-size: 12px; max-width: 100%; }
+.prow-actions { display: flex; align-items: center; gap: 6px; flex: none; flex-shrink: 0; }
 .reset-box { margin-top: 16px; padding: 10px 12px; border: 1px solid var(--err);
   border-radius: 8px; background: color-mix(in srgb, var(--err) 8%, transparent);
   display: flex; flex-direction: column; gap: 6px; font-size: 12.5px; }
 .reset-box b { color: var(--err); }
+
+/* ------------------------------------------- profile overrides / auto-tune -- */
+/* The Profiles editor's grouped boxes: a titled, bordered set of form rows
+   so the reasoning/execution knobs read as one prominent decision block. */
+.ovr-group { margin: 0 0 14px; padding: 10px 12px; border: 1px solid var(--line2);
+  border-radius: 8px; background: color-mix(in srgb, var(--panel2) 55%, transparent); }
+.ovr-head { display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap;
+  margin-bottom: 8px; font-size: 13px; }
+.ovr-head b { letter-spacing: .2px; }
+.tune-table { width: 100%; border-collapse: collapse; font-size: 12.5px; }
+.tune-table th { text-align: left; color: var(--muted); font-weight: 600; font-size: 11px;
+  padding: 4px 8px; border-bottom: 1px solid var(--line); white-space: nowrap; }
+.tune-table td { padding: 4px 8px; border-bottom: 1px dashed var(--line); vertical-align: top; }
+.tune-table tr.same td:nth-child(2), .tune-table tr.same td:nth-child(3) { color: var(--muted); }
+.tune-table tr.diff td:nth-child(3) { color: var(--accent); font-weight: 700; }
 
 /* ------------------------------------------------------------ mobile tabs -- */
 #mobileTabs { display: none; }
@@ -810,12 +847,11 @@ details pre { background: var(--code-bg); border: 1px solid var(--line); border-
   #app { display: block; flex: 1 1 auto; min-height: 0; }
   #app > .splitter { display: none !important; }
   #app > .panel, #app > .panelcol { display: none !important; margin: 0; border-radius: 0;
-    border-left: none; border-right: none; height: calc(100vh - 158px); }
+    border-left: none; border-right: none; height: calc(100vh - 210px); }
   body[data-view="chat"] #chatPanel,
   body[data-view="diff"] #diffPanel,
   body[data-view="diff"] #app[data-diff="none"] #chatPanel,
-  body[data-view="right"] #rightPane { display: flex !important; }
-  #mobileTabs { display: flex; border-top: 1px solid var(--line); background: var(--panel); flex: none; }
+  body[data-view="right"] #rightPane { display: flex !important; }  #mobileTabs { display: flex; border-top: 1px solid var(--line); background: var(--panel); flex: none; }
   #mobileTabs button { flex: 1; border: none; border-radius: 0; padding: 10px; background: transparent; }
   #mobileTabs button.on { color: var(--accent); font-weight: 700;
     box-shadow: 0 2px 0 var(--accent) inset; }

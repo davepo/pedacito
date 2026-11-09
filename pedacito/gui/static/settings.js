@@ -5,13 +5,25 @@
   'use strict';
   var PDC = window.PDC, h = PDC.h;
 
-  var COMMON = ['base_url', 'api_key', 'model', 'tier', 'vram_gb', 'json_mode', 'tool_mode', 'timeout',
-    'context_tokens', 'allow_write', 'allow_shell', 'allow_browser', 'allow_screenshots', 'semantic_search', 'review'];
+  var COMMON = ['base_url', 'api_key', 'model', 'tier', 'vram_gb', 'json_mode', 'timeout',
+    'allow_write', 'allow_shell', 'allow_browser', 'allow_screenshots', 'semantic_search', 'review'];
+  // Profile overrides that the editor surfaces up front, in their own boxed
+  // group: how the model thinks, plans, and lands edits (see modelcard.choose
+  // \u2014 these are exactly the keys a calibration writes into a profile).
+  var REASONING = ['disable_thinking', 'thinking_suffix', 'step_reasoning_first',
+    'incremental_edit_loop', 'edit_plan_brief', 'dynamic_tool_pruning',
+    'prompt_pack', 'answer_mode', 'edit_style', 'tool_mode', 'best_of',
+    'fuzzy_match', 'temperature', 'temperature_answer',
+    'max_output_tokens', 'context_tokens'];
   var X = null;      // {data, which, tab, profile, target, pending, modal, body}
   // Model discovery lives outside X: its state survives switching tabs, and a
   // scan is read-only, so re-rendering must not throw the results away.
   var SCAN = { busy: false, rows: [], err: '', custom: '', vram: '',
                pick: {}, name: {}, def: '', importing: false };
+  // Same for the Auto-Tune wizard: the answers and the preview survive
+  // switching to another settings tab and back.
+  var TUNE = { hardware: 'hosted', model: 'medium', codebase: 'medium',
+               priority: 'balanced', result: null, err: '', busy: false };
 
   PDC.openSettings = function () {
     X = { data: null, which: 'user', tab: 'discovery', profile: '', target: '', pending: {}, models: [], search: '' };
@@ -136,13 +148,15 @@
         h('button', { class: 'small', text: 'Review & trust\u2026', onclick: trust })));
     }
     var tabs = h('div', { class: 'stabs' });
-    [['discovery', 'Model discovery'], ['profiles', 'Profiles'], ['all', 'All settings'], ['raw', 'Raw file / reset']].forEach(function (t) {
+    [['discovery', 'Model discovery'], ['profiles', 'Profiles'], ['all', 'All settings'],
+     ['autotune', 'Auto-Tune'], ['raw', 'Raw file / reset']].forEach(function (t) {
       tabs.appendChild(h('button', { class: X.tab === t[0] ? 'on' : '', text: t[1], onclick: function () { X.tab = t[0]; X.pending = {}; render(); } }));
     });
     body.appendChild(tabs);
     if (X.tab === 'discovery') body.appendChild(discoveryTab());
     else if (X.tab === 'profiles') body.appendChild(profilesTab());
     else if (X.tab === 'all') body.appendChild(allTab());
+    else if (X.tab === 'autotune') body.appendChild(autotuneTab());
     else body.appendChild(rawTab());
   }
   function radio(which, label, disabled) {
@@ -253,11 +267,16 @@
     var defName = (f.settings || {}).default_profile || '';
     names.forEach(function (n) {
       var p = f.profiles[n] || {};
+      var sub = (p.model || '(no model set)') + (p.base_url ? ' @ ' + p.base_url : '');
+      // Two-part card: the identity block (name + pills over the model line)
+      // shrinks and ellipsises; the action buttons never wrap mid-label.
       var row = h('div', { class: 'prow' },
-        h('span', { class: 'grow mono', text: n, title: 'open this profile', style: 'cursor:pointer', onclick: function () { gotoProfile(n); } }),
-        h('span', { class: 'muted small-text ellip', text: (p.model || '') + (p.base_url ? ' @ ' + p.base_url : '') }),
-        n === X.data.active_profile ? h('span', { class: 'tag act', text: 'active' }) : null,
-        n === defName ? h('span', { class: 'tag', text: 'default' }) : null,
+        h('div', { class: 'prow-main' },
+          h('div', { class: 'prow-head' },
+            h('b', { class: 'prow-name ellip', text: n, title: 'open this profile', style: 'cursor:pointer', onclick: function () { gotoProfile(n); } }),
+            n === X.data.active_profile ? h('span', { class: 'tag act', text: 'active' }) : null,
+            n === defName ? h('span', { class: 'tag', text: 'default' }) : null),
+          h('div', { class: 'prow-sub mono ellip', text: sub, title: sub })),
         h('span', { class: 'prow-actions' },
           h('button', { class: 'small', text: 'Calibrate', title: 'Measure this model and store the scores in its model card', onclick: function () { calibrate(n, 'quick'); } }),
           n === defName ? h('button', { class: 'small ghost', disabled: true, text: 'Default' })
@@ -275,14 +294,17 @@
     var box = h('div', {});
     var url = h('input', { type: 'text', class: 'grow mono', placeholder: 'another server URL (optional)', value: SCAN.custom });
     url.addEventListener('input', function () { SCAN.custom = url.value; });
-    var vram = h('input', { type: 'number', min: '1', step: '1', style: 'width:74px', placeholder: 'VRAM GB', value: SCAN.vram });
+    var vram = h('input', { type: 'number', min: '1', step: '1', placeholder: 'e.g. 12', value: SCAN.vram });
     vram.addEventListener('input', function () { SCAN.vram = vram.value; });
     box.appendChild(h('div', { class: 'note-box' },
       'Find the models your local servers have loaded, then import only the ones you want. A scan reads nothing: nothing is written to the config until you press Import.',
-      h('div', { class: 'row', style: 'margin-top:8px' },
+      h('div', { class: 'row scan-controls', style: 'margin-top:8px' },
         h('button', { class: 'primary', text: SCAN.busy ? 'Scanning\u2026' : (SCAN.rows.length ? 'Scan again' : 'Scan local servers'), disabled: SCAN.busy, onclick: doScan }),
-        url, vram,
-        h('span', { class: 'muted small-text grow', text: 'probes LM Studio, Ollama, llama.cpp and your existing profiles' }))));
+        url,
+        h('label', { class: 'scan-vram' }, 'VRAM (GB)', vram)),
+      // the hint gets its own line: inline in the row it competed with the
+      // controls for width and clipped to half a sentence
+      h('div', { class: 'muted small-text scan-hint', text: 'probes LM Studio, Ollama, llama.cpp and your existing profiles' })));
     if (SCAN.err) box.appendChild(h('div', { class: 'note-box err', text: SCAN.err }));
     if (SCAN.busy) { box.appendChild(h('div', { class: 'tip', text: 'Asking each server what it has\u2026' })); return box; }
     if (!SCAN.rows.length) return box;
@@ -483,22 +505,27 @@
     return save({ file: X.which, profile: profile || null, changes: changes, removes: removes }, '/api/settings/set');
   }
 
+  function profileControl(form, key, body) {
+    var item = schemaItem(key); if (!item) return;
+    var cur = key === 'api_key' ? undefined : body[key];
+    var el = control(item, cur, function (v) { setPending(key, v); }, placeholderFor(item), inheritLabel(item));
+    if (key === 'model') el.setAttribute('list', 'modelOptions');
+    form.appendChild(h('label', { text: key, title: item.help }));
+    form.appendChild(key === 'model' ? h('div', { class: 'row' }, h('div', { class: 'grow' }, el), h('datalist', { id: 'modelOptions' }, X.models.map(function (m) { return h('option', { value: m }); }))) : el);
+    if (item.help) form.appendChild(h('div', { class: 'help', text: item.help.length > 170 ? item.help.slice(0, 167) + '\u2026' : item.help }));
+  }
   function profileForm(body) {
-    var form = h('div', { class: 'form' });
     var name = X.profile;
-    var apiKeyEl;
-    COMMON.forEach(function (key) {
-      var item = schemaItem(key); if (!item) return;
-      var cur = key === 'api_key' ? undefined : body[key];
-      var el = control(item, cur, function (v) { setPending(key, v); }, placeholderFor(item), inheritLabel(item));
-      if (key === 'api_key') apiKeyEl = el;
-      if (key === 'model') el.setAttribute('list', 'modelOptions');
-      form.appendChild(h('label', { text: key, title: item.help }));
-      form.appendChild(key === 'model' ? h('div', { class: 'row' }, h('div', { class: 'grow' }, el), h('datalist', { id: 'modelOptions' }, X.models.map(function (m) { return h('option', { value: m }); }))) : el);
-      if (item.help) form.appendChild(h('div', { class: 'help', text: item.help.length > 170 ? item.help.slice(0, 167) + '\u2026' : item.help }));
-    });
+    // Reasoning & execution overrides go FIRST: on a small local model these
+    // decide the quality of every answer, and they are exactly what a
+    // calibration writes; the generic form lists the connection settings.
+    var ovr = h('div', { class: 'form' });
+    REASONING.forEach(function (key) { profileControl(ovr, key, body); });
+    var form = h('div', { class: 'form' });
+    COMMON.forEach(function (key) { profileControl(form, key, body); });
     var result = h('div', { class: 'muted small-text', style: 'margin-top:8px' });
-    var extras = Object.keys(body).filter(function (k) { return COMMON.indexOf(k) < 0 && k.charAt(0) !== '_'; });
+    var extras = Object.keys(body).filter(function (k) {
+      return COMMON.indexOf(k) < 0 && REASONING.indexOf(k) < 0 && k.charAt(0) !== '_'; });
     var adv = h('div', { style: 'margin-top:14px' });
     if (extras.length) {
       adv.appendChild(h('div', { class: 'muted small-text', text: 'Other overrides set in this profile:' }));
@@ -510,7 +537,16 @@
     }
     var mkDefault = h('button', { text: 'Make default', onclick: function () {
       save({ file: X.which, profile: null, changes: { default_profile: name } }, '/api/settings/set', '"' + name + '" is now the default profile.'); } });
-    return h('div', {}, form, adv, result,
+    return h('div', {},
+      h('div', { class: 'ovr-group' },
+        h('div', { class: 'ovr-head' },
+          h('b', { text: 'Reasoning & Execution Overrides' }),
+          h('span', { class: 'muted small-text', text: 'how this model thinks and lands edits \u2014 each box offers \u201c(inherit \u2014 universal: \u2026)\u201d to drop the override again' })),
+        ovr),
+      h('div', { class: 'ovr-group' },
+        h('div', { class: 'ovr-head' }, h('b', { text: 'Connection & Capabilities' })),
+        form),
+      adv, result,
       h('div', { class: 'row', style: 'margin-top:12px' },
         h('button', { id: 'savePending', class: 'primary', text: 'No changes', disabled: true, onclick: function () { commit(name); } }),
         h('button', { text: 'Test connection', onclick: function () {
@@ -528,6 +564,98 @@
           });
         } }),
         mkDefault));
+  }
+
+  // ----- auto-tune universal settings -------------------------------------------
+  // Four questions, one deterministic backend computation (no LLM call):
+  // /api/settings/autotune previews the recommendation, and only "Apply"
+  // writes the changes into the user config as [universal] values.
+  var TUNE_Q = [
+    ['hardware', 'Model hardware', [
+      ['lt8', '\u2264 8 GB VRAM \u2014 small GPU / iGPU / CPU-only'],
+      ['8to16', '8\u201316 GB VRAM \u2014 one mid GPU'],
+      ['16to24', '16\u201324 GB VRAM \u2014 strong single GPU'],
+      ['gt24', '> 24 GB VRAM \u2014 multi-GPU or server card'],
+      ['hosted', 'no local GPU \u2014 hosted API (token money, not VRAM)']]],
+    ['model', 'Model class', [
+      ['small', 'small (up to \u2248 8B) \u2014 format slips, needs guard rails'],
+      ['medium', 'mid-size (\u2248 9\u201330B) \u2014 solid with structure'],
+      ['large', 'large (\u2265 \u2248 70B) \u2014 holds whole patches unaided'],
+      ['hosted', 'frontier / hosted model']],
+    ],
+    ['codebase', 'Typical codebase', [
+      ['small', 'small \u2014 tens of files'],
+      ['medium', 'medium \u2014 hundreds of files'],
+      ['large', 'large \u2014 1000+ files, many packages']]],
+    ['priority', 'What should settings optimise for?', [
+      ['token_saver', 'token/latency savings \u2014 finish cheap and fast'],
+      ['balanced', 'balance \u2014 the recommended middle'],
+      ['thorough', 'answer quality \u2014 spend more model calls']]]
+  ];
+  function autotuneTab() {
+    var box = h('div', {});
+    box.appendChild(h('div', { class: 'note-box' },
+      h('b', { text: 'Auto-Tune Universal Settings' }),
+      h('div', { class: 'small-text', text: 'Answer four questions and pedacito computes the universal budgets and editing guard rails that fit that machine: read and gather sizes, step and call caps, answer verification, the incremental edit loop. Nothing is written until you press Apply, and the current file is kept as a .bak copy.' })));
+    var form = h('div', { class: 'form' });
+    TUNE_Q.forEach(function (q) {
+      var sel = h('select', {}, q[2].map(function (o) { return h('option', { value: o[0], text: o[1] }); }));
+      sel.value = TUNE[q[0]];
+      sel.addEventListener('change', function () { TUNE[q[0]] = sel.value; TUNE.result = null; });
+      form.appendChild(h('label', { text: q[1] }));
+      form.appendChild(sel);
+    });
+    var run = h('button', { class: 'primary', text: TUNE.busy ? 'Computing\u2026' : (TUNE.result ? 'Update preview' : 'Preview recommendation'), disabled: TUNE.busy, onclick: function () {
+      TUNE.busy = true; TUNE.err = ''; render();
+      PDC.api('/api/settings/autotune', { hardware: TUNE.hardware, model: TUNE.model, codebase: TUNE.codebase, priority: TUNE.priority })
+        .then(function (j) {
+          TUNE.busy = false;
+          if (!j.ok) { TUNE.err = j.detail || 'the server refused the request'; TUNE.result = null; }
+          else TUNE.result = j;
+          render();
+        });
+    } });
+    box.appendChild(form);
+    box.appendChild(h('div', { class: 'row', style: 'margin-top:10px' }, run,
+      h('span', { class: 'muted small-text grow', text: 'pure arithmetic \u2014 the preview costs no tokens and touches no file' })));
+    if (TUNE.err) box.appendChild(h('div', { class: 'note-box err', text: TUNE.err }));
+    if (!TUNE.result) return box;
+    var rows = TUNE.result.changes || [];
+    var changed = rows.filter(function (r) { return String(r.value) !== String(r.current); });
+    var table = h('table', { class: 'tune-table' },
+      h('thead', {}, h('tr', {}, h('th', { text: 'setting' }), h('th', { text: 'current' }),
+        h('th', { text: 'recommended' }), h('th', { text: 'why' }))),
+      h('tbody', {}, rows.map(function (r) {
+        var diff = String(r.value) !== String(r.current);
+        return h('tr', { class: diff ? 'diff' : 'same' },
+          h('td', { class: 'mono small-text', text: r.key }),
+          h('td', { class: 'mono small-text muted', text: String(r.current) }),
+          h('td', { class: 'mono small-text', text: String(r.value) }),
+          h('td', { class: 'small-text muted', text: r.reason }));
+      })));
+    box.appendChild(h('div', { class: 'muted small-text', style: 'margin:10px 0 4px',
+      text: changed.length ? changed.length + ' of ' + rows.length + ' settings would change:'
+                           : 'Your universal settings already match this recommendation.' }));
+    box.appendChild(table);
+    box.appendChild(h('div', { class: 'row', style: 'margin-top:12px' },
+      h('button', { class: 'primary', text: 'Apply Recommended Universal Settings', disabled: !changed.length, onclick: function () {
+        PDC.confirm('Write these ' + changed.length + ' universal settings into the user config?\n\nThe file as it stands is kept as config.toml.bak first. Profile-level overrides keep winning over these values.', 'Apply it').then(function (ok) {
+          if (!ok) return;
+          TUNE.busy = true; render();
+          PDC.api('/api/settings/autotune', { hardware: TUNE.hardware, model: TUNE.model, codebase: TUNE.codebase, priority: TUNE.priority, apply: true })
+            .then(function (j) {
+              TUNE.busy = false;
+              if (!j.ok) { TUNE.err = j.detail || 'the server refused the request'; render(); return; }
+              if (j.payload) { X.data = j.payload; X.pending = {}; }
+              TUNE.result = null;   // re-preview to confirm the new "current" column
+              render();
+              PDC.toast('Universal settings applied (' + (j.changes || []).length + ' written).');
+              PDC.refreshState();
+            });
+        });
+      } }),
+      h('span', { class: 'muted small-text grow', text: changed.length ? 'applies the rows above to [universal] in ' + (file().path || 'the user config') : 'nothing to apply' })));
+    return box;
   }
 
   // ----- all settings ----------------------------------------------------------------

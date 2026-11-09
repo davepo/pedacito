@@ -524,6 +524,29 @@ POST_ROUTES["/api/profiles/rename"] = _settings_write(
         str(b.get("new_name", ""))))
 
 
+@post("/api/settings/theme")
+def _theme(q, body):
+    """Persist the GUI colorscheme in the user config. Cosmetic only: no
+    project reload, no jobs touched."""
+    try:
+        return 200, {"ok": True, **settings_api.save_theme(
+            str(body.get("gui_theme", "")))}
+    except ConfigError as e:
+        return 400, {"ok": False, "detail": str(e)}
+
+
+@post("/api/settings/autotune")
+def _autotune(q, body):
+    """Auto-Tune Universal Settings: preview the recommendations for four
+    questions (writes nothing), or apply them to the user config when
+    `apply` is true (then the live config reloads in place)."""
+    try:
+        return 200, {"ok": True, **settings_api.autotune(
+            dict(body or {}), bool(body.get("apply")))}
+    except ConfigError as e:
+        return 400, {"ok": False, "detail": str(e)}
+
+
 @post("/api/settings/models")
 def _models(q, body):
     return 200, settings_api.probe_server(

@@ -1032,6 +1032,8 @@ class State:
                 "context_origin": (cfg.sources.get("context_tokens", "default")
                                    if cfg else ""),
                 "json_mode": cfg.json_mode if cfg else "",
+                "gui_theme": cfg.gui_theme if cfg else "slate",
+                "disable_thinking": bool(cfg.disable_thinking) if cfg else False,
                 "allow_steering": bool(cfg.allow_steering) if cfg else False,
                 "usage": {
                     "calls": stats.get("calls", 0),

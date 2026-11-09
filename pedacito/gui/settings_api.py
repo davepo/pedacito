@@ -376,6 +376,208 @@ def reset_to_baseline() -> dict:
     return out
 
 
+# --- GUI theme ------------------------------------------------------------------
+
+def save_theme(name: str) -> dict:
+    """Persist `gui_theme` in the user config and reflect it in the live
+    config. Purely cosmetic, so nothing is reloaded or restarted; when no
+    user config file exists yet the choice stays browser-local only and
+    `persisted` reports false (the first-run wizard still owns that file)."""
+    name = str(name or "").strip().lower()
+    themes = list(config_mod._ENUM_FIELDS["gui_theme"])
+    if name not in themes:
+        raise ConfigError(f"unknown theme {name!r}. Use one of: "
+                          + ", ".join(themes))
+    persisted = False
+    if USER_CONFIG.exists():
+        text = _read_text(USER_CONFIG)
+        write_config(USER_CONFIG, settings.set_values(text, {"gui_theme": name}))
+        # Re-read the user file so /api/state reports the new theme even when
+        # no project is open (STATE.cfg is None until one is). In-place and
+        # job-free — the whole point of a dedicated theme route — and the
+        # dropdown's explicit profile pick survives the reload.
+        with STATE.lock:
+            keep = STATE.profile_request or None
+        reload_state_config(profile=keep)
+        persisted = True
+    else:
+        with STATE.lock:
+            if STATE.cfg is not None:
+                STATE.cfg.gui_theme = name
+    return {"gui_theme": name, "themes": themes, "persisted": persisted}
+
+
+# --- Auto-Tune Universal Settings -----------------------------------------------
+
+# The wizard answers are closed vocabularies; anything else is refused.
+AUTOTUNE_QUESTIONS = {
+    "hardware": ("lt8", "8to16", "16to24", "gt24", "hosted"),
+    "model": ("small", "medium", "large", "hosted"),
+    "codebase": ("small", "medium", "large"),
+    "priority": ("token_saver", "balanced", "thorough"),
+}
+
+# Starting budgets per hardware tier: (max_read_tokens, max_gathered_chars,
+# max_total_model_calls, max_no_progress_steps). A small VRAM box pays for
+# every extra token with evictions and re-prefills, so gather stays lean.
+_HW_TIERS = {
+    "lt8": (800, 12000, 25, 3),
+    "8to16": (1000, 16000, 30, 3),
+    "16to24": (1400, 24000, 35, 4),
+    "gt24": (2000, 32000, 45, 5),
+    "hosted": (2000, 32000, 50, 5),
+}
+
+
+def _autotune_values(answers: dict) -> tuple[dict, dict]:
+    """Deterministic (values, reasons) for the four wizard answers."""
+    hw = answers["hardware"]
+    model = answers["model"]
+    code = answers["codebase"]
+    prio = answers["priority"]
+    read, gathered, calls, no_progress = _HW_TIERS[hw]
+    weak_model = model in ("small", "medium")
+    reasons: dict[str, str] = {}
+
+    # Codebase size moves the budgets before the priority trade-off does: a
+    # big repo needs bigger reads and more steps to map it, a small one is
+    # mostly context already.
+    if code == "large":
+        calls = int(calls * 1.2 + 0.5)
+        gathered = int(gathered * 1.25)
+        if hw != "lt8":
+            read = int(read * 1.15)
+        reason_size = "a large codebase needs more lookup steps"
+    elif code == "small":
+        gathered = int(gathered * 0.75)
+        reason_size = "a small codebase fits in fewer, smaller observations"
+    else:
+        reason_size = "a medium codebase sits at the tier defaults"
+
+    # The priority answer decides where the remaining headroom goes.
+    if prio == "token_saver":
+        calls = int(calls * 0.8 + 0.001)
+        no_progress = max(2, no_progress - 1)
+        gathered = int(gathered * 0.8)
+        verify = "off" if hw == "lt8" else "deterministic"
+        best_of = 1
+        reason_prio = "spending fewest tokens: tighter caps and no extra model rounds"
+    elif prio == "thorough":
+        calls = int(calls * 1.25 + 0.5)
+        no_progress += 1
+        verify = "full"
+        best_of = 2 if weak_model else 1
+        reason_prio = "quality first: more attempts, a verifier call, and two answer candidates on weaker models"
+    else:
+        verify = "deterministic"
+        best_of = 1
+        reason_prio = "balanced defaults for this tier"
+
+    values: dict = {
+        "max_read_tokens": read,
+        "max_gathered_chars": gathered,
+        "max_total_model_calls": calls,
+        "max_no_progress_steps": no_progress,
+        "verify_answer": verify,
+        "best_of": best_of,
+    }
+    # Structured, incremental editing is the single biggest help for weaker
+    # local models; big/hosted models hold a whole multi-file patch fine.
+    if weak_model:
+        values.update({
+            "incremental_edit_loop": True,
+            "step_reasoning_first": True,
+            "edit_plan_brief": True,
+            "dynamic_tool_pruning": True,
+            "repair_rounds": 3,
+            "post_edit_check": True,
+        })
+        reasons["incremental_edit_loop"] = (
+            "one symbol per verified micro-loop keeps a "
+            + ("small " if model == "small" else "mid-size ")
+            + "model from emitting a broken multi-file patch")
+        reasons["step_reasoning_first"] = (
+            "state the reason before the action: fewer pointless steps on a "
+            "model that does not plan ahead")
+        reasons["edit_plan_brief"] = (
+            "a 1-3 line plan before each edit block measurably improves block "
+            "matching on weaker models")
+        reasons["dynamic_tool_pruning"] = (
+            "drop tools the task will not use: a small context spends its "
+            "window on code, not on schema")
+        reasons["repair_rounds"] = (
+            "one more SEARCH/REPLACE retry round pays off when the model "
+            "copies search text imperfectly")
+        reasons["post_edit_check"] = (
+            "a cheap per-file syntax/lint gate catches a broken hunk right "
+            "after it lands, while the model still remembers the file")
+    else:
+        values["dynamic_tool_pruning"] = False
+        values["step_reasoning_first"] = True
+        reasons["dynamic_tool_pruning"] = (
+            "a strong model with room to spare: keep every tool visible "
+            "rather than pruning the list mid-task")
+        reasons["step_reasoning_first"] = (
+            "reasoning before the action still costs almost nothing and keeps "
+            "the transcript auditable")
+
+    reasons["max_read_tokens"] = (
+        f"{hw.upper() if hw != 'hosted' else 'hosted'} hardware: "
+        + (f"{read} tokens per gather read keeps one observation cheap"
+           if hw in ("lt8", "8to16") else
+           f"{read} tokens per gather read fits the window comfortably"))
+    reasons["max_gathered_chars"] = (
+        f"cap on what one task accumulates: {reason_size}")
+    reasons["max_total_model_calls"] = (
+        f"hard ceiling per task: {calls} calls, {reason_prio}")
+    reasons["max_no_progress_steps"] = (
+        f"end gather after {no_progress} fruitless steps, {reason_prio}")
+    reasons["verify_answer"] = (
+        f"check answers " + ("only with deterministic scans"
+                             if verify == "deterministic" else
+                             "with one verifier model call"
+                             if verify == "full" else
+                             "off: every extra round costs tokens"))
+    reasons["best_of"] = (
+        f"sample {best_of} candidate answer(s) and keep the best-scoring one")
+    if prio == "thorough":
+        reasons["max_read_tokens"] += "; thorough still caps one read"
+    return values, reasons
+
+
+def autotune(answers: dict, apply: bool = False) -> dict:
+    """The \"Auto-Tune Universal Settings\" wizard: deterministic, offline
+    recommendations for the universal budgets from four questions. Preview
+    (`apply` false) writes nothing; applying stores the changes in the user
+    config as `[universal]` values and reloads the live config."""
+    clean: dict = {}
+    for key, allowed in AUTOTUNE_QUESTIONS.items():
+        val = str((answers or {}).get(key) or "").strip().lower()
+        if val not in allowed:
+            raise ConfigError(
+                f"{key} must be one of: {', '.join(allowed)}")
+        clean[key] = val
+    values, reasons = _autotune_values(clean)
+    cfg = STATE.cfg if STATE.cfg is not None else config_mod.Config()
+    changes = [{"key": k, "value": v, "current": getattr(cfg, k),
+                "reason": reasons.get(k, "")}
+               for k, v in values.items()]
+    out = {"answers": clean, "changes": changes, "applied": False}
+    if not apply:
+        return out
+    path = config_path("user")
+    text = _read_text(path)
+    if not text and not path.exists():
+        raise ConfigError("No user config file yet. Use \u201cCreate config\u201d "
+                          "first.")
+    write_config(path, settings.set_values(text, dict(values)))
+    with STATE.lock:
+        keep = STATE.profile_request or None
+    out["payload"] = reload_state_config(profile=keep)
+    out["applied"] = True
+    return out
+
+
 # --- immediate STATE config reload --------------------------------------------
 
 def reload_state_config(profile: str | None = None) -> dict:

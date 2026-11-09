@@ -410,3 +410,168 @@ def test_import_auto_fixes_dotted_names(gui, dot_server):
         {"profile_name": "bad/name", "base_url": base, "model": "x"}]})
     assert status == 400 and "detail" in j
     assert gui.cfg_path.read_text(encoding="utf-8") == before
+
+
+# --- Sprint G: gui_theme persistence, Auto-Tune, profile reasoning overrides ----
+
+GUITHEMES = ["slate", "light", "daylight", "nord", "midnight", "jazz_solo",
+             "trapper_keeper", "memphis_arcade", "windbreaker"]
+
+
+def test_gui_theme_is_an_enum_setting():
+    items = {i["name"]: i for i in S.schema()}
+    it = items["gui_theme"]
+    assert it["type"] == "str" and it["group"] == "Graphical interface"
+    assert it["choices"] == GUITHEMES and it["default"] == "slate"
+    flat, _ = S.validate_text('gui_theme = "nord"\n')
+    assert flat["gui_theme"] == "nord"
+    with pytest.raises(ConfigError, match="gui_theme must be one of"):
+        S.validate_text('gui_theme = "vaporwave"\n')
+
+
+def test_reasoning_override_group_keys_exist_in_schema():
+    """Every key the Profiles editor renders in its Reasoning & Execution
+    Overrides box is a real setting with the control type the frontend
+    expects (bool selects, enum dropdowns, numeric boxes)."""
+    by = {i["name"]: i for i in S.schema()}
+    for key in ("disable_thinking", "thinking_suffix", "step_reasoning_first",
+                "incremental_edit_loop", "edit_plan_brief",
+                "dynamic_tool_pruning", "prompt_pack", "answer_mode",
+                "edit_style", "tool_mode", "best_of", "fuzzy_match",
+                "temperature", "temperature_answer", "max_output_tokens",
+                "context_tokens"):
+        assert key in by, key
+    assert by["disable_thinking"]["type"] == "bool"
+    assert by["step_reasoning_first"]["type"] == "bool"   # None = card decides
+    assert by["prompt_pack"]["choices"] == ["", "tiny", "small", "full"]
+    assert by["tool_mode"]["choices"] == ["grammar", "native"]
+    assert by["edit_style"]["choices"] == ["quote", "anchor"]
+
+
+def test_theme_endpoint_persists_in_user_config(gui):
+    _config(gui)
+    status, body = gui.post("/api/settings/theme", {"gui_theme": "nord"})
+    assert status == 200 and body["ok"] and body["persisted"] is True
+    assert "reloaded" not in body         # cosmetic: never re-opens the project
+    assert 'gui_theme = "nord"' in gui.cfg_path.read_text(encoding="utf-8")
+    _status, st = gui.get("/api/state")
+    assert st["gui_theme"] == "nord"
+    # a second pick replaces the key in place instead of duplicating it
+    assert gui.post("/api/settings/theme", {"gui_theme": "midnight"})[0] == 200
+    text = gui.cfg_path.read_text(encoding="utf-8")
+    assert _assigned(text, "gui_theme") == ['gui_theme = "midnight"']
+    for bad in ("vaporwave", ""):
+        status, j = gui.post("/api/settings/theme", {"gui_theme": bad})
+        assert status == 400 and not j["ok"], bad
+    _status, st = gui.get("/api/state")
+    assert st["gui_theme"] == "midnight"  # the rejected pick changed nothing
+
+
+def test_theme_endpoint_without_user_config_stays_browser_local(gui):
+    status, body = gui.post("/api/settings/theme", {"gui_theme": "jazz_solo"})
+    assert status == 200 and body["ok"] and body["persisted"] is False
+    assert not gui.cfg_path.exists()      # the first-run wizard still owns it
+    _status, st = gui.get("/api/state")
+    assert st["gui_theme"] == "slate"
+
+
+def _assigned(text, key):
+    """The real (non-commented) assignment lines for a key in config text.
+    The setup file is the documented template: it mentions most keys in
+    comments as well, so a plain count would lie."""
+    return [ln.strip() for ln in text.splitlines()
+            if re.match(rf"\s*{key}\s*=", ln) and not ln.strip().startswith("#")]
+
+
+def _tune(**over):
+    answers = {"hardware": "lt8", "model": "small", "codebase": "medium",
+               "priority": "balanced"}
+    answers.update(over)
+    return answers
+
+
+def test_autotune_endpoint_preview_is_deterministic(gui):
+    _config(gui)
+    before = gui.cfg_path.read_text(encoding="utf-8")
+    status, body = gui.post("/api/settings/autotune", _tune())
+    assert status == 200 and body["ok"] and body["applied"] is False
+    got = {c["key"]: c["value"] for c in body["changes"]}
+    assert got["max_read_tokens"] == 800
+    assert got["max_total_model_calls"] == 25
+    assert got["max_no_progress_steps"] == 3
+    assert got["incremental_edit_loop"] is True
+    assert got["step_reasoning_first"] is True
+    assert got["edit_plan_brief"] is True
+    assert got["dynamic_tool_pruning"] is True
+    assert got["best_of"] == 1
+    assert all(c["reason"] for c in body["changes"])       # every row explains
+    # the same answers produce the identical recommendation
+    _status, again = gui.post("/api/settings/autotune", _tune())
+    assert again["changes"] == body["changes"]
+    # the 16-24 GB balanced tier
+    _status, big = gui.post("/api/settings/autotune", _tune(hardware="16to24"))
+    gotb = {c["key"]: c["value"] for c in big["changes"]}
+    assert (gotb["max_read_tokens"], gotb["max_total_model_calls"],
+            gotb["max_no_progress_steps"]) == (1400, 35, 4)
+    # thorough on a small local model buys a second answer candidate
+    _status, th = gui.post("/api/settings/autotune", _tune(priority="thorough"))
+    assert {c["key"]: c["value"] for c in th["changes"]}["best_of"] == 2
+    # strong models keep every tool visible and skip the edit microloops
+    _status, strong = gui.post("/api/settings/autotune",
+                               _tune(hardware="hosted", model="large"))
+    got2 = {c["key"]: c["value"] for c in strong["changes"]}
+    assert "incremental_edit_loop" not in got2
+    assert got2["dynamic_tool_pruning"] is False
+    # any missing or unknown answer is refused
+    status, j = gui.post("/api/settings/autotune", _tune(hardware="solarpunk"))
+    assert status == 400 and "hardware must be one of" in j["detail"]
+    assert gui.post("/api/settings/autotune", {"model": "small"})[0] == 400
+    assert gui.cfg_path.read_text(encoding="utf-8") == before   # no writes
+
+
+def test_autotune_apply_writes_universal_settings(gui):
+    _config(gui)
+    status, body = gui.post("/api/settings/autotune", _tune(apply=True))
+    assert status == 200 and body["ok"] and body["applied"] is True
+    text = gui.cfg_path.read_text(encoding="utf-8")
+    assert "max_read_tokens = 800" in text
+    assert "max_total_model_calls = 25" in text
+    assert "incremental_edit_loop = true" in text
+    assert "[profiles.default]" in text   # the profiles themselves survive
+    S.validate_text(text)
+    # the live config sees the new budgets at once
+    _status, p = gui.get("/api/settings")
+    assert p["resolved"]["max_read_tokens"]["value"] == 800
+    assert p["resolved"]["max_no_progress_steps"]["value"] == 3
+    # applying a second tier replaces the keys instead of duplicating them
+    assert gui.post("/api/settings/autotune",
+                    _tune(hardware="16to24", apply=True))[0] == 200
+    text = gui.cfg_path.read_text(encoding="utf-8")
+    assert _assigned(text, "max_read_tokens") == ["max_read_tokens = 1400"]
+
+
+def test_profile_reasoning_overrides_persist(gui):
+    """What the Profiles editor's override box writes: thinking-mode and
+    edit-loop keys land inside [profiles.*], not the universal layer."""
+    _config(gui)
+    status, body = gui.post("/api/settings/set", {
+        "file": "user", "profile": "default",
+        "changes": {"disable_thinking": True, "step_reasoning_first": False,
+                    "prompt_pack": "tiny", "best_of": 2}})
+    assert status == 200 and body["ok"], body
+    text = gui.cfg_path.read_text(encoding="utf-8")
+    seg = text[text.index("[profiles.default]"):]
+    assert "disable_thinking = true" in seg
+    assert "step_reasoning_first = false" in seg
+    assert 'prompt_pack = "tiny"' in seg
+    assert "best_of = 2" in seg
+    _status, p = gui.get("/api/settings")
+    prof = p["user"]["profiles"]["default"]
+    assert prof["disable_thinking"] is True and prof["prompt_pack"] == "tiny"
+    # the universal layer kept its own value (the profile override wins)
+    assert p["user"]["settings"]["disable_thinking"] is False
+    # an invalid enum override is refused with the schema's own error
+    status, j = gui.post("/api/settings/set", {
+        "file": "user", "profile": "default",
+        "changes": {"prompt_pack": "giant"}})
+    assert status == 400 and "prompt_pack must be one of" in j["detail"]
