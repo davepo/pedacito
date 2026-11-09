@@ -362,6 +362,11 @@ class State:
         self.last_backup_dir: Path | None = None
         self.last_auto: dict = {}
         self.plan_path: Path | None = None
+        # Most recent built-in benchmark result (see pedacito.benchmarks and
+        # gui.jobs.run_benchmark). Kept in memory so the Benchmarks dialog can
+        # show the scorecard and the Open Generated Project button without a
+        # second model call.
+        self.benchmark: dict | None = None
 
         # Engine V2 telemetry for the ACTIVITY & PLAN panel (see
         # `note_event` and `engine`): the live phase, the last gather step

@@ -898,6 +898,201 @@ function calibrateProfile(name) {
   });
 }
 
+// ---------------------------------------------------------------- benchmarks ---
+// Model Benchmark Runner: pick a configured profile and one of the five
+// built-in diagnostic projects. The server runs generation + both verification
+// passes as a background job; this dialog polls /api/benchmarks and then shows
+// the scorecard, the report, and a one-click switch into the generated folder.
+function openBenchmarks() {
+  const st = { catalog: [], profiles: [], profileModels: {}, recent: [],
+               bench: '', profile: '', base: '', jobId: 0, timer: 0,
+               running: false, last: null };
+  const benchSel = h('select', { id: 'benchSelect' });
+  const profSel = h('select', { id: 'benchProfile' });
+  const baseIn = h('input', { type: 'text', class: 'mono grow', spellcheck: false,
+    placeholder: 'optional output parent (defaults to a benchmarks/ folder)' });
+  const desc = h('div', { class: 'bench-desc' });
+  const statusLine = h('div', { class: 'bench-status' });
+  const resultBox = h('div', { class: 'bench-result' });
+  const recentBox = h('div', { class: 'bench-recent' });
+  const runBtn = h('button', { class: 'primary', text: 'Run Benchmark' });
+  const browseBtn = h('button', { text: 'Browse\u2026', onclick: () => {
+    PDC.browse({ title: 'Choose an output parent folder', start: baseIn.value || st.base || '',
+      pickLabel: 'Use this folder', onPick: (p) => { baseIn.value = p; } });
+  } });
+
+  const currentBench = () => st.catalog.find((b) => b.id === benchSel.value) || st.catalog[0];
+  const refreshDesc = () => {
+    const b = currentBench();
+    clear(desc);
+    if (!b) return;
+    desc.appendChild(h('div', { class: 'bench-title' }, h('b', { text: b.title }),
+      h('span', { class: 'tag', text: b.category })));
+    desc.appendChild(h('div', { class: 'muted small-text', text: b.description }));
+    desc.appendChild(h('div', { class: 'bench-tests', text: 'Exposes: ' + b.what_it_tests }));
+    desc.appendChild(h('div', { class: 'muted small-text',
+      text: b.checks + ' hidden rubric checks \u00b7 deliverables: ' + (b.deliverables || []).join(', ') }));
+  };
+  const fmt = (n) => PDC.fmtInt(n);
+  const scorecard = (run) => {
+    clear(resultBox);
+    if (!run) return;
+    const rub = run.rubric || { passed: 0, total: 0 };
+    const mt = run.model_tests || { passed: 0, total: 0, ran: false, ok: false };
+    const ok = rub.passed === rub.total && mt.ok;
+    const warn = !ok && (rub.passed > 0 || mt.passed > 0);
+    const box = h('div', { class: 'bench-score ' + (ok ? 'ok' : warn ? 'warn' : 'bad') });
+    box.appendChild(h('div', { class: 'bench-score-head' },
+      h('span', { class: 'bench-big', text: rub.passed + '/' + rub.total }),
+      h('span', { class: 'muted', text: ' holdout rubric checks passed' }),
+      h('span', { class: 'tag ' + (ok ? 'ok' : warn ? 'act' : ''), text: ok ? 'PASS' : warn ? 'PARTIAL' : 'FAIL' })));
+    const grid = h('div', { class: 'bench-grid' });
+    const metric = (label, value) => {
+      grid.appendChild(h('div', { class: 'bench-metric' },
+        h('span', { class: 'muted small-text', text: label }),
+        h('b', { text: value })));
+    };
+    metric('Model tests', mt.ran ? (mt.passed + '/' + mt.total + (mt.ok ? ' passed' : ' failed')) : 'none generated');
+    metric('Duration', Number(run.duration || 0).toFixed(1) + 's');
+    metric('Tokens', fmt((run.stats || {}).total_tokens || 0));
+    metric('Calls', fmt((run.stats || {}).calls || 0));
+    metric('Repairs', fmt(run.repair_rounds || 0));
+    metric('Profile', run.profile || 'default');
+    box.appendChild(grid);
+    const shortcomings = run.shortcomings || [];
+    if (shortcomings.length) {
+      const list = h('ul', { class: 'bench-short' });
+      shortcomings.slice(0, 10).forEach((s) => list.appendChild(h('li', { text: s })));
+      box.appendChild(h('div', { class: 'bench-label', text: 'Shortcomings detected' }));
+      box.appendChild(list);
+    } else {
+      box.appendChild(h('div', { class: 'tip', text: 'No shortcomings: every model test and holdout check passed.' }));
+    }
+    const actions = h('div', { class: 'row gap bench-actions' },
+      h('button', { class: 'primary', text: 'Open Generated Project', onclick: () => {
+        m.close();
+        openProject(run.project_dir, run.profile || '');
+      } }),
+      h('button', { text: 'Copy project path', onclick: () => copyText(run.project_dir) }));
+    box.appendChild(actions);
+    box.appendChild(h('div', { class: 'muted small-text mono bench-path', text: run.project_dir || '' }));
+    if (run.report) {
+      const details = h('details', { class: 'bench-report' },
+        h('summary', { text: 'BENCHMARK_REPORT.md' }),
+        h('div', { class: 'md' }));
+      render(html`<div class="md">${md(run.report)}</div>`, details.lastChild);
+      box.appendChild(details);
+    }
+    resultBox.appendChild(box);
+  };
+  const showRecent = (runs) => {
+    clear(recentBox);
+    if (!runs || !runs.length) return;
+    recentBox.appendChild(h('div', { class: 'bench-label', text: 'Recent runs' }));
+    runs.slice(0, 8).forEach((r) => {
+      const row = h('div', { class: 'bench-recent-row' },
+        h('span', { class: 'tag', text: (r.rubric || {}).passed + '/' + (r.rubric || {}).total }),
+        h('span', { class: 'bench-recent-title', text: (r.title || r.benchmark_id || '') + ' \u00b7 ' + (r.profile || 'default') }),
+        h('span', { class: 'muted small-text', text: (r.started_at || '').replace('T', ' ').slice(0, 19) }));
+      row.addEventListener('click', () => { st.last = r; scorecard(r); });
+      recentBox.appendChild(row);
+    });
+  };
+  const finish = (run) => {
+    st.running = false;
+    st.jobId = 0;
+    runBtn.disabled = false;
+    runBtn.textContent = 'Run Benchmark';
+    st.last = run;
+    statusLine.textContent = 'Finished.';
+    scorecard(run);
+    PDC.api('/api/benchmarks').then((j) => { if (j.ok) showRecent(j.recent || []); });
+  };
+  const poll = () => {
+    clearTimeout(st.timer);
+    PDC.api('/api/benchmarks').then((j) => {
+      if (!j.ok) { statusLine.textContent = j.detail || 'Could not read benchmark status.'; return; }
+      if (j.last_run && st.jobId && j.last_run.job_id === st.jobId) { finish(j.last_run); return; }
+      if (!st.jobId) return;
+      if (!j.job || j.job.id !== st.jobId) {
+        st.running = false;
+        runBtn.disabled = false;
+        runBtn.textContent = 'Run Benchmark';
+        statusLine.textContent = 'The benchmark job ended without a report; see Activity/Chat for the error.';
+        return;
+      }
+      statusLine.textContent = 'Running\u2026 generation and verification can take a few minutes. Watch Activity/Chat for live progress.';
+      st.timer = setTimeout(poll, 1500);
+    }).catch(() => { st.timer = setTimeout(poll, 2500); });
+  };
+  const run = () => {
+    const b = currentBench();
+    if (!b) { PDC.toast('No benchmark selected.', true); return; }
+    if (st.running) return;
+    st.running = true;
+    st.last = null;
+    runBtn.disabled = true;
+    runBtn.textContent = 'Running\u2026';
+    clear(resultBox);
+    statusLine.textContent = 'Starting\u2026';
+    PDC.api('/api/benchmarks/run', {
+      profile: profSel.value, benchmark_id: b.id, base_dir: baseIn.value.trim(),
+    }).then((j) => {
+      if (!j.ok) {
+        st.running = false; runBtn.disabled = false; runBtn.textContent = 'Run Benchmark';
+        statusLine.textContent = j.detail || 'Could not start the benchmark.';
+        PDC.toast(j.detail || 'benchmark did not start', true);
+        return;
+      }
+      st.jobId = j.job;
+      statusLine.textContent = 'Running\u2026 watch Activity/Chat for live progress.';
+      poll();
+    }).catch((e) => {
+      st.running = false; runBtn.disabled = false; runBtn.textContent = 'Run Benchmark';
+      statusLine.textContent = 'Could not start the benchmark: ' + e;
+    });
+  };
+  benchSel.addEventListener('change', () => { refreshDesc(); emit(); });
+  runBtn.addEventListener('click', run);
+
+  const body = h('div', { class: 'bench-wrap' },
+    h('div', { class: 'bench-intro' },
+      h('h4', { text: 'Test a profile against a diagnostic mini-project' }),
+      h('div', { class: 'muted small-text', text: 'Pedacito generates the project with the selected profile, runs the model\u2019s own tests, then runs a hidden deterministic rubric. The generated folder is kept on disk.' })),
+    h('div', { class: 'bench-form' },
+      h('label', { class: 'bench-field' }, h('span', { text: 'Profile / model' }), profSel),
+      h('label', { class: 'bench-field' }, h('span', { text: 'Benchmark task' }), benchSel)),
+    desc,
+    h('label', { class: 'bench-field' }, h('span', { text: 'Output parent directory' }),
+      h('div', { class: 'row gap' }, baseIn, browseBtn)),
+    h('div', { class: 'row gap bench-runrow' }, runBtn, statusLine),
+    resultBox, recentBox);
+  const m = PDC.modal('Model Benchmark Runner', body, [{ label: 'Close' }], { wide: true });
+  PDC.api('/api/benchmarks').then((j) => {
+    if (!j.ok) { statusLine.textContent = j.detail || 'Could not load benchmarks.'; return; }
+    st.catalog = j.benchmarks || [];
+    st.profiles = j.profiles || [];
+    st.profileModels = S.status.profile_models || {};
+    st.base = j.default_base_dir || '';
+    baseIn.value = st.base;
+    clear(benchSel);
+    st.catalog.forEach((b) => benchSel.appendChild(h('option', { value: b.id, text: b.title })));
+    clear(profSel);
+    const active = S.status.profile || '';
+    const names = st.profiles;
+    profSel.appendChild(h('option', { value: '', text: '(default' + (S.status.default_profile ? ': ' + S.status.default_profile : '') + ')' }));
+    names.forEach((p) => profSel.appendChild(h('option', { value: p,
+      text: p + (st.profileModels[p] ? ' \u00b7 ' + st.profileModels[p] : '') })));
+    if (active && names.includes(active)) profSel.value = active;
+    if (!st.catalog.length) { statusLine.textContent = 'No benchmarks are available.'; return; }
+    benchSel.value = st.catalog[0].id;
+    refreshDesc();
+    showRecent(j.recent || []);
+    if (j.last_run) scorecard(j.last_run);
+  }).catch(() => { statusLine.textContent = 'Could not load the benchmark catalog.'; });
+}
+PDC.openBenchmarks = openBenchmarks;
+
 // The GUI colorscheme. The browser always gets it at once (localStorage, so
 // theme.js can apply it before first paint); `userPick` additionally persists
 // it as gui_theme in the user config through /api/settings/theme — purely
@@ -1064,6 +1259,7 @@ function TopBar() {
               <option value="windbreaker">Windbreaker \u2014 color-block nylon</option>
             </optgroup>
           </select>
+          <button id="benchBtn" title="run a diagnostic benchmark against a configured profile" onClick=${() => openBenchmarks()}>\u25A6 Benchmarks</button>
           <button id="settingsBtn" title="profiles and settings" onClick=${() => callSettings()}>\u2699 Settings</button>
           <button class="danger" id="exitBtn" title="stop the pedacito gui server"
                   onClick=${() => PDC.confirm('Stop the pedacito gui server? Run "pedacito gui" again to reopen it.', 'Stop server', true).then((ok) => {

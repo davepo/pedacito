@@ -670,6 +670,93 @@ def _profiles(q, body=None):
     return 200, settings_api.list_profiles()
 
 
+# --- built-in model benchmarks -------------------------------------------------
+
+@get("/api/benchmarks")
+def _benchmarks(q, body=None):
+    """The five built-in diagnostic benchmarks, the profiles that may be
+    tested, the default output root, recent on-disk runs, and the most recent
+    result from this GUI session (for scorecard polling)."""
+    from .. import benchmarks
+    with STATE.lock:
+        cfg, root, last = STATE.cfg, STATE.root, STATE.benchmark
+        job = STATE.job if STATE.job is not None and STATE.job.active else None
+        job_info = ({"id": job.id, "kind": job.kind, "title": job.title}
+                    if job else None)
+    base = benchmarks.default_benchmarks_root(cfg, current_root=root)
+    recent = benchmarks.recent_runs(base)
+    if last and last.get("project_dir"):
+        recent = [r for r in recent
+                  if str(r.get("project_dir")) != str(last["project_dir"])]
+        recent.insert(0, last)
+    catalog = benchmarks.list_benchmarks()
+    return 200, {
+        "ok": True,
+        "benchmarks": catalog,
+        "catalog": catalog,
+        "profiles": settings_api.known_profiles(),
+        "default_base_dir": str(base),
+        "recent": recent[:12],
+        "runs": recent[:12],
+        "recent_runs": recent[:12],
+        "last_run": last,
+        "job": job_info,
+    }
+
+
+@post("/api/benchmarks/run")
+def _benchmarks_run(q, body):
+    """Spawn one benchmark job. Poll GET /api/benchmarks: its `last_run`
+    carries the completed report and generated project path once the job
+    ends (progress streams to Activity/Chat meanwhile)."""
+    from .. import benchmarks
+    benchmark_id = str(body.get("benchmark_id") or "").strip()
+    profile = str(body.get("profile") or "").strip()
+    base_dir = str(body.get("base_dir") or "").strip()
+    try:
+        benchmarks.get_benchmark(benchmark_id)
+    except ConfigError as e:
+        return 400, {"ok": False, "detail": str(e)}
+    known = settings_api.known_profiles()
+    if profile and profile not in known:
+        return 400, {"ok": False,
+                     "detail": f"no profile named {profile!r} "
+                               f"(profiles: {', '.join(known) or 'none configured'})"}
+    if base_dir:
+        p = Path(base_dir).expanduser()
+        if p.exists() and not p.is_dir():
+            return 400, {"ok": False,
+                         "detail": f"output parent is not a directory: {p}"}
+        base_dir = str(p)
+    opts = {"profile": profile, "benchmark_id": benchmark_id,
+            "base_dir": base_dir}
+    job = jobs.spawn(
+        "benchmark", f"benchmark {benchmark_id} \u00b7 {profile or 'default'}",
+        lambda j: jobs.run_benchmark(j, opts))
+    if job is None:
+        return 409, {"ok": False,
+                     "detail": "Another job is running. Wait for it or stop it."}
+    # The page polls GET /api/benchmarks (so it can render progress while the
+    # job runs). API clients may send {"wait": true} to block until the report
+    # is ready and receive it directly in this response.
+    if body.get("wait"):
+        try:
+            timeout = float(body.get("timeout") or 1800)
+        except (TypeError, ValueError):
+            timeout = 1800.0
+        if job.thread is not None:
+            job.thread.join(max(1.0, timeout))
+        with STATE.lock:
+            result = STATE.benchmark
+        if result and result.get("job_id") == job.id:
+            return 200, {**result, "ok": True, "job": job.id}
+        return 202, {"ok": True, "job": job.id, "pending": True,
+                     "detail": "The benchmark is still running; poll "
+                               "/api/benchmarks for its last_run."}
+    return 202, {"ok": True, "job": job.id, "benchmark_id": benchmark_id,
+                 "profile": profile, "base_dir": base_dir}
+
+
 # --- the handler ------------------------------------------------------------------
 
 class _Handler(BaseHTTPRequestHandler):

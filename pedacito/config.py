@@ -661,6 +661,10 @@ class Config:
     # Colorscheme of `pedacito gui`. Purely cosmetic: applying it never
     # reloads the project. Unknown names fall back to the built-in default.
     gui_theme: str = "slate"
+    # Parent folder for the built-in model benchmark projects. Empty = a
+    # `benchmarks/` folder beside the currently open project (or ./benchmarks
+    # when no project is open). Each run gets its own generated subfolder.
+    benchmarks_dir: str = ""
 
     # --- Telemetry and retention (local only) --------------------------------
     # One JSON line per significant action under .pedacito/events/.

@@ -421,6 +421,73 @@ def run_calibrate(job: Job, opts: dict) -> None:
         + (f" Capabilities: {caps}." if caps else ""), kind="calibrated")
 
 
+def run_benchmark(job: Job, opts: dict) -> None:
+    """Run one built-in model benchmark as a background job.
+
+    Progress from the scaffold and the two verification passes is streamed
+    into one ACTIVITY message (and the terminal, because the scaffold prints
+    through the GUI's stderr tee). The finished result is stored on
+    ``STATE.benchmark`` for the Benchmarks dialog and summarised in chat.
+    """
+    from .. import benchmarks
+
+    profile = str(opts.get("profile") or "").strip()
+    benchmark_id = str(opts.get("benchmark_id") or "").strip()
+    base_dir = str(opts.get("base_dir") or "").strip() or None
+    with STATE.lock:
+        current_root = STATE.root
+        STATE.benchmark = None
+    activity = STATE.add_message(
+        "activity", f"Benchmark `{benchmark_id}` on profile "
+        f"'{profile or 'default'}' starting\u2026", job=job.id)
+    mid = activity["id"]
+
+    def log(line: str) -> None:
+        STATE.append_message(mid, "\n" + line.rstrip())
+
+    result = benchmarks.run_benchmark(
+        profile=profile or "", benchmark_id=benchmark_id,
+        base_dir=base_dir, config_root=current_root,
+        current_root=current_root, log=log, job_id=job.id)
+    data = result.to_dict()
+    with STATE.lock:
+        STATE.benchmark = data
+    level = ("ok" if result.rubric.ok and result.model_tests.ok else
+             "warn" if result.rubric.passed or result.model_tests.passed
+             else "error")
+    lines = [
+        f"Benchmark **{result.title}** finished for profile "
+        f"`{result.profile}`\u2009\u00b7\u2009`{result.model}`.",
+        "",
+        f"- **Holdout rubric:** {result.rubric.passed}/{result.rubric.total} "
+        f"checks passed",
+        f"- **Model's own tests:** {result.model_tests.passed}/"
+        f"{result.model_tests.total}"
+        + (" (none generated)" if not result.model_tests.ran else ""),
+        f"- **Duration:** {result.duration:.1f}s \u00b7 "
+        f"{int(result.stats.get('calls', 0))} calls \u00b7 "
+        f"{int(result.stats.get('total_tokens', 0)):,} tokens",
+        f"- **Project:** `{result.project_dir}`",
+        f"- **Report:** `{result.report_path}`",
+    ]
+    short = result.shortcomings
+    if short:
+        lines += ["", "**Shortcomings detected:**"]
+        lines += [f"- {item}" for item in short[:8]]
+        if len(short) > 8:
+            lines.append(f"- \u2026 and {len(short) - 8} more")
+    lines += ["", "Use **Benchmarks \u2192 Open Generated Project** to inspect "
+              "it, or open that folder from the project bar."]
+    STATE.add_message("assistant", "\n".join(lines), kind="benchmark",
+                      level=level, benchmark={
+                          "benchmark_id": result.benchmark_id,
+                          "profile": result.profile,
+                          "project_dir": str(result.project_dir),
+                          "score": result.score,
+                          "report_path": str(result.report_path or ""),
+                      })
+
+
 def build_index(job: Job, summarise: bool = True) -> None:
     """Build the index, like `pedacito index` (summaries cost one model call
     per unit, so it is an explicit action)."""

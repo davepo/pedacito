@@ -906,3 +906,48 @@ details pre { background: var(--code-bg); border: 1px solid var(--line); border-
   .set-layout { grid-template-columns: 1fr; }
   .msg { max-width: 92%; }
 }
+
+/* --------------------------------------------------------- benchmarks modal -- */
+.bench-wrap { display: flex; flex-direction: column; gap: 10px; }
+.bench-intro h4 { margin: 0 0 2px; font-size: 14px; }
+.bench-form { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+.bench-field { display: flex; flex-direction: column; gap: 4px; font-size: 11.5px;
+  color: var(--muted); }
+.bench-field > span { text-transform: uppercase; letter-spacing: .6px;
+  font-size: 10px; font-weight: 700; }
+.bench-field select, .bench-field input { width: 100%; }
+.bench-desc { border: 1px solid var(--line); border-radius: 8px; padding: 8px 10px;
+  background: var(--panel2); display: flex; flex-direction: column; gap: 4px; }
+.bench-title { display: flex; gap: 8px; align-items: baseline; flex-wrap: wrap; }
+.bench-tests { font-size: 12px; color: var(--text); }
+.bench-runrow { align-items: center; }
+.bench-status { color: var(--muted); font-size: 12px; }
+.bench-result { display: flex; flex-direction: column; gap: 8px; }
+.bench-score { border: 1px solid var(--line2); border-radius: 10px; padding: 10px 12px;
+  background: var(--panel); border-left-width: 4px; }
+.bench-score.ok { border-left-color: var(--ok); }
+.bench-score.warn { border-left-color: var(--warn); }
+.bench-score.bad { border-left-color: var(--err); }
+.bench-score-head { display: flex; gap: 8px; align-items: baseline; flex-wrap: wrap; }
+.bench-big { font-size: 24px; font-weight: 800; color: var(--accent); line-height: 1; }
+.bench-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
+  gap: 6px; margin: 10px 0 4px; }
+.bench-metric { display: flex; flex-direction: column; gap: 1px; padding: 5px 8px;
+  border: 1px solid var(--line); border-radius: 7px; background: var(--panel2); }
+.bench-metric b { font-size: 13px; }
+.bench-label { text-transform: uppercase; letter-spacing: .7px; font-size: 10px;
+  font-weight: 700; color: var(--muted); margin-top: 6px; }
+.bench-short { margin: 4px 0 0 18px; padding: 0; font-size: 12px; }
+.bench-short li { margin: 3px 0; }
+.bench-actions { margin-top: 8px; }
+.bench-path { word-break: break-all; }
+.bench-report { margin-top: 8px; border-top: 1px solid var(--line); padding-top: 6px; }
+.bench-report summary { cursor: pointer; color: var(--accent); font-weight: 600; }
+.bench-report .md { max-height: 380px; overflow: auto; padding: 4px 2px; }
+.bench-recent { display: flex; flex-direction: column; gap: 3px; }
+.bench-recent-row { display: flex; gap: 8px; align-items: baseline; padding: 5px 7px;
+  border: 1px solid var(--line); border-radius: 7px; cursor: pointer; font-size: 12px; }
+.bench-recent-row:hover { background: var(--panel2); border-color: var(--line2); }
+.bench-recent-title { flex: 1 1 auto; min-width: 0; white-space: nowrap;
+  overflow: hidden; text-overflow: ellipsis; }
+@media (max-width: 700px) { .bench-form { grid-template-columns: 1fr; } }
