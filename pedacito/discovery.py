@@ -28,6 +28,8 @@ from __future__ import annotations
 
 import os
 import re
+import socket
+from urllib.parse import urlparse
 
 import requests
 
@@ -158,9 +160,41 @@ def _ollama_entries(root: str, timeout: float, headers=None) -> list[dict] | Non
             if isinstance(m, dict) and m.get("name")]
 
 
+_LOCAL_HOSTS = frozenset(("localhost", "127.0.0.1", "0.0.0.0", "::1"))
+
+
+def _listening(root: str, timeout: float) -> bool:
+    """Whether a loopback server root accepts a TCP connection quickly.
+
+    Without this, a dead local port costs five or six HTTP timeouts (one per
+    fingerprint endpoint) before the probe gives up. On Windows a closed
+    local port can absorb the whole timeout, so a scan of the four default
+    ports exceeded the GUI request's budget. Remote candidates are left to
+    HTTP's own timeout: a hosted URL may be slow to connect and is not part
+    of the local-port scan."""
+    try:
+        parsed = urlparse(root)
+        host = (parsed.hostname or "").lower()
+        port = parsed.port or (443 if parsed.scheme == "https" else 80)
+    except ValueError:
+        return False
+    if not host:
+        return False
+    if host not in _LOCAL_HOSTS:
+        return True
+    limit = min(0.75, timeout)
+    try:
+        with socket.create_connection((host, port), timeout=limit):
+            return True
+    except OSError:
+        return False
+
+
 def _probe_root(root: str, timeout: float, headers=None):
     """Identify and list one server at `root`. Returns (label, base_url,
     [model ids]) or None when the root answers nothing."""
+    if not _listening(root, timeout):
+        return None
     label = _fingerprint(root, timeout, headers)
     v1 = _list_entries(root + "/v1/models", timeout, headers)
     api = _list_entries(root + "/api/v1/models", timeout, headers)

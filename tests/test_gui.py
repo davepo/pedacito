@@ -913,7 +913,10 @@ def test_auto_applies_by_default_backs_up_and_lists_changed_files(
         if ns.apply:
             snap = workspace.new_backup_dir(root, unique=True)
             fileio.backup_copy(app, snap / "app.py")   # pre-edit original
-            app.write_text(APP.replace("print", "return"))
+            # Write LF bytes explicitly: the file viewer returns the file's
+            # bytes verbatim, and Windows text mode would otherwise store
+            # CRLF and break the exact comparison below.
+            app.write_bytes(APP.replace("print", "return").encode("utf-8"))
         return 0
 
     monkeypatch.setattr(jobs.cli_mod, "_cmd_auto", fake_auto)

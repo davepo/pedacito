@@ -202,6 +202,25 @@ def test_one_server_three_spellings_answers_once(fake, monkeypatch):
     assert len(found) == 1 and len(probed) == 1
 
 
+def test_probe_root_does_not_http_probe_a_dead_port(monkeypatch):
+    """A closed local port must cost one short TCP check, not one HTTP timeout
+    per fingerprint endpoint. That multiplier made GUI scans exceed their
+    request budget on Windows."""
+    calls = []
+    monkeypatch.setattr(discovery, "_listening",
+                        lambda root, timeout: False)
+    monkeypatch.setattr(discovery, "_get",
+                        lambda *a, **k: calls.append((a, k)))
+    assert discovery._probe_root("http://127.0.0.1:9", 2.0) is None
+    assert calls == []
+
+
+def test_listening_is_true_for_a_live_server_and_false_for_a_dead_port(fake):
+    url = fake(_openai())
+    assert discovery._listening(url, 1.0) is True
+    assert discovery._listening("http://127.0.0.1:1", 0.5) is False
+
+
 def test_looks_embedding_from_type_or_name():
     assert discovery.looks_embedding({"id": "text-embedding-3-small"})
     assert discovery.looks_embedding({"type": "embeddings", "id": "x"})
