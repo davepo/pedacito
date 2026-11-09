@@ -216,8 +216,24 @@ def test_quick_findings_prefers_an_installed_linter(tmp_path, monkeypatch):
     monkeypatch.setattr(diagnostics.proc, "run", fake_run)
     (tmp_path / "app.py").write_text("x = 1\n", encoding="utf-8")
     found = diagnostics.quick_findings(tmp_path, ["app.py"])
-    assert calls == [["ruff", "check", "--output-format", "concise", "app.py"]]
+    assert calls == [["ruff", "check", "--quiet", "--output-format",
+                      "concise", "app.py"]]
     assert found["app.py"] == ["app.py:2:5: F821 undefined name 'y'"]
+
+
+def test_quick_findings_ignores_a_clean_linter_run(tmp_path, monkeypatch):
+    """`ruff check` prints 'All checks passed!' (exit 0); that banner must
+    never surface as a finding, or every newly created file triggers a
+    bogus post-edit repair round."""
+    monkeypatch.setattr(diagnostics.shutil, "which",
+                        lambda name: "/usr/bin/ruff" if name == "ruff" else "")
+
+    def fake_run(argv, **kw):
+        return 0, "All checks passed!\n", "", 0.1
+
+    monkeypatch.setattr(diagnostics.proc, "run", fake_run)
+    (tmp_path / "fresh.py").write_text("x = 1\n", encoding="utf-8")
+    assert diagnostics.quick_findings(tmp_path, ["fresh.py"])["fresh.py"] == []
 
 
 def test_quick_findings_js_uses_tree_sitter(tmp_path):

@@ -633,6 +633,13 @@ def run_task(task: EvalTask, client, cfg, workdir: Path | None = None) -> dict:
         c.log_sessions = False
         c.refresh_summaries = 0
         c.sources = dict(cfg.sources or {})
+        # Scoring must depend only on the model's replies: lint feedback runs
+        # whatever checker happens to be installed (ruff is a core dependency
+        # now), so it would change calls, repair rounds and taxonomy labels
+        # from machine to machine. The post-edit TEST loop stays available
+        # through verify_tests above.
+        c.post_edit_check = False
+        c.auto_diagnostics = False
         idx = index_mod.build([str(tmp)], c, client=None, summarise=False,
                               root=tmp, verbose=False)
         agent = Agent(idx, client, c)

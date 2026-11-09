@@ -447,16 +447,20 @@ def _quick_python(root: Path, rel: str) -> list[str]:
     """One Python file: the first installed linter run on just that file,
     else a plain ast.parse plus the conservative undefined-name pass.
     Finding lines keep their `rel:line:col:` prefix."""
-    for argv in (("ruff", "check", "--output-format", "concise"),
+    # --quiet suppresses ruff's "All checks passed!" banner: only diagnostics
+    # belong in the result, and a clean file must produce zero findings.
+    for argv in (("ruff", "check", "--quiet", "--output-format", "concise"),
                  ("pyflakes",),
                  ("flake8",)):
         if not _which(argv[0]):
             continue
-        _rc, out, stopped, _secs = proc.run(
+        rc, out, stopped, _secs = proc.run(
             [*argv, rel], cwd=root, timeout=_QUICK_TIMEOUT,
             idle_timeout=0, max_output=20000)
         if stopped in ("timeout", "error"):
             return []          # an unusable linter must not block edits
+        if rc == 0:
+            return []          # exit 0 means no violations, whatever it logged
         return [ln.strip() for ln in (out or "").splitlines() if ln.strip()]
     try:
         src = (root / rel).read_text(encoding="utf-8", errors="replace")
