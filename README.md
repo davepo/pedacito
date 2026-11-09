@@ -1,51 +1,161 @@
 # Pedacito
 
-**Pedacito lets a small local LLM work on a codebase bigger than its context
-window.** Models from 4B to 27B can't hold a real project in context.
-Instead of pasting your repo at the model, Pedacito builds a lookup index and
-lets the model request only the files, symbols, and snippets it needs
-(*pedacito* is Spanish for "little piece") until it can answer or edit. It
-targets the hardware most people actually have: one consumer GPU with 16–24 GB
-of VRAM.
+**Pedacito** is Spanish for *a little piece* or *a small chunk*. It is a coding
+agent built for the small local models that run on the GPU you already own,
+from 4B to 27B parameters.
 
-- Works with any server that exposes an OpenAI-compatible `/v1` API — tested
-  with **LM Studio, Ollama, and Lemonade** — on Windows, Linux, and macOS.
-  Hosted APIs (DeepSeek, OpenAI, and similar) work too.
-- Python is parsed with `ast`; JavaScript, TypeScript, TSX, Go, Rust, Java, C,
-  C++, C#, and Ruby with tree-sitter. Other useful text files are indexed
-  structurally.
-- The map is **ranked for the task**: files the task names, matches, imports,
-  or is tested by come first, so a small model's first lookup is usually the
-  right one. Import/call graph, BM25 search, and test links work in every
-  supported language.
-- Edits are search/replace blocks, validated before anything is written —
-  and checked first for the classic small-model mistakes (editing code it never
-  read, leaving a removed function's callers behind, `TODO` stubs).
-- It **measures** your model instead of guessing from its name
-  (`pedacito calibrate`), keeps the server's prompt cache warm (one fold point,
-  answer continues the lookup conversation), and reports tokens, cache-hit
-  ratio and cost per task.
-- Beyond `ask`, it can start a project from scratch (`new`) and run an
-  autonomous task loop (`auto`).
+Most coding agents assume you have a frontier model with a 200k-token window and
+an open cloud budget. Point one at a 9B model on a 12 GB card and it tends to
+stuff whole files into context until the model loses the thread, invents a
+function, or breaks a diff. Pedacito works the other way around. It cuts your
+codebase into small, precisely bounded pieces, so the model only reads and edits
+the exact lines that matter.
 
-The install provides two interchangeable commands: `pedacito` and `pdc`.
+It works with **LM Studio, Ollama, Lemonade Server, llama.cpp, vLLM**, and any
+other OpenAI-compatible server. When you want more power, it can route work to
+hosted models such as **Claude, ChatGPT, DeepSeek, Qwen, Google Gemini, and
+OpenRouter**, with a one-click provider preset for each. A common setup is a fast
+local model doing the edits and a larger model planning or verifying.
 
-### What this is (and isn't)
+## Why "Pedacito"?
 
-Pedacito was built by one person for one setup: local models over Tailscale on a
-single home GPU box, mostly for narrow, localized edits. It has had one user and
-one set of models exercising it, so edge cases outside that path may be rough.
+A large codebase is too much to hand a small model in one go, so Pedacito hands
+it over in pieces:
 
-If you can use a frontier hosted model, a tool built around those will do
-better: [opencode](https://opencode.ai),
+- **Chunks, not files.** Python is parsed with `ast`. JavaScript, TypeScript,
+  Go, Rust, Java, C, C++, C#, and Ruby are parsed with tree-sitter. Each function
+  or class is a unit with an exact line range.
+- **Skeletons, not dumps.** A 500-line class comes back as its signatures and
+  line pointers, so the model reads the one method it intends to change.
+- **Search before reading.** Ranked maps, lexical and hybrid search, an import
+  and call graph, and test links decide which pieces matter for this task.
+- **Budgets everywhere.** Reads, observations and answers are capped to token
+  budgets fitted to your model's real context window.
+
+## Who it is for
+
+- Developers with one consumer GPU, from a 6 GB laptop to a 24 GB desktop, who
+  want an agent that runs on their own machine.
+- People who want local models by default, and a hosted model only for the hard
+  parts, with a cap on what it can spend.
+- People who want to see what the model is doing. Every edit is a dry-run diff
+  until you apply it, and every write is snapshotted first.
+
+A fair warning: Pedacito was built by one person for one setup (local models on
+a single home GPU box), so edge cases outside that path may be rough. If you can
+use a frontier hosted model, [opencode](https://opencode.ai),
 [Qwen Code](https://github.com/QwenLM/qwen-code), and
-[Claude Code](https://claude.com/claude-code) are good options. Pedacito is for
-when you specifically want to stay local and small.
+[Claude Code](https://claude.com/claude-code) are good choices. Pedacito is for
+when you want to stay small and local, or you want to control exactly which
+model sees what.
 
-Getting a small model to do useful work takes a specific set of harness
-techniques — [TECHNIQUES.md](TECHNIQUES.md) walks through the ones Pedacito
-uses and the well-known ones it deliberately avoids, and why.
+## Quickstart in 60 seconds
 
+1. **Start a model server.** Load a model in LM Studio, Ollama, Lemonade, or
+   llama.cpp. A hosted API works too, if you have a key.
+2. **Install** from the repository folder (requires Python 3.11+):
+
+   ```bash
+   pip install -e .            # Windows: py -m pip install -e .
+   ```
+
+3. **Pick your way in.**
+
+   **In the browser:**
+
+   ```bash
+   pedacito gui ~/code/your-project
+   ```
+
+   Open **Settings → Model discovery**, click **Scan local servers**, tick the
+   models you want, and import them. Then ask for a change in **Task/Edit**.
+
+   **In the terminal:**
+
+   ```bash
+   pedacito models scan                       # find servers, write a profile per model, measure each one
+   pedacito ask ~/code/app -t "make the retry count configurable"   # dry run: shows a diff, writes nothing
+   pedacito ask ~/code/app -t "make the retry count configurable" --review   # side-by-side page, you sign off
+   ```
+
+Step-by-step versions, with what you should see at each point, are in
+[QUICKSTART.md](QUICKSTART.md).
+
+## What you get
+
+| Area | What it does | Read more |
+|---|---|---|
+| **Small-model techniques** | A harness-run retrieval loop, a requirement state machine (`UNLOCATED → LOCATED → READ → EDITED → VERIFIED`), symbol-anchored edit microloops, an AST syntax gate before any test runs, traceback repair packets, KV prompt-cache-friendly conversations, and exact-span rehydration | [TECHNIQUES.md](TECHNIQUES.md) |
+| **Engine V2 telemetry** | The GUI shows the live phase, the requirement ledger, and recent lookups as a task runs | [QUICKSTART.md](QUICKSTART.md#part-a-the-gui) |
+| **Repository memory** | Confirmed commands in `.pedacito/micro_facts.json`, with contradicted facts retired automatically. Unused tool schemas are pruned to save tokens | [TECHNIQUES.md](TECHNIQUES.md) §14 and §15 |
+| **Local server scanner** | Finds LM Studio, Ollama, Lemonade, and llama.cpp on any port, then imports only the models you tick | [Model server setup](#model-server-setup) |
+| **Hosted provider presets** | One-click setup for Claude, ChatGPT, DeepSeek, Qwen, Gemini, and OpenRouter. Keys can come from an environment variable instead of the config file | [Configure](#configure) |
+| **Role routing** | Send planner, verifier, or escalation work to a different profile, per job or per project | [MODEL_GUIDE.md](MODEL_GUIDE.md#hybrid-local--cloud-role-routing) |
+| **Auto-Tune wizard** | Answer four questions about your hardware and codebase, preview the budgets, then apply them | [QUICKSTART.md](QUICKSTART.md#part-a-the-gui) |
+| **Per-profile thinking** | Turn reasoning on or off for each model profile, from the GUI or `disable_thinking` | [MODEL_GUIDE.md](MODEL_GUIDE.md#thinking-per-profile) |
+| **Model benchmarks** | Five small projects with a hidden holdout rubric, scored per profile, so you can compare models on your own hardware | [MODEL_GUIDE.md](MODEL_GUIDE.md#compare-models-with-the-diagnostic-benchmarks) |
+| **Safe writes** | Dry run by default, side-by-side review, backups before every write, `pedacito restore` to undo | [Review page](#review-page) |
+
+### The GUI workspace
+
+`pedacito gui` serves a local page on `127.0.0.1` with no CDN and no extra
+dependencies, so it works offline. It runs the same engine as the commands.
+
+- A two-row toolbar with the project path, a live **profile and model** picker,
+  the server's status light, and session totals for tokens, cache hits, and cost.
+- **Nine color schemes** under the theme menu: GitHub Light and Dark, Daylight,
+  Nord, Midnight, and four 1990s themes (Jazz Cup, Trapper Keeper, Memphis
+  Arcade, Windbreaker).
+- **Five modes** next to the chat box: **Task/Edit** for changes, **Ask** for
+  read-only questions, **Auto** for goal-to-checklist runs, **New** for starting
+  a project, and **How ?** for the built-in reference.
+- **Changes** show proposed edits as old and new code side by side, with
+  per-file accept, reject, or hand edits.
+- **Settings** edits your profiles, every setting, the Auto-Tune wizard, and the
+  raw config file, without deleting your comments.
+- **Benchmarks** runs the five diagnostic projects against any profile.
+
+Chat threads are saved with timestamps and can be renamed. The **Files** panel
+lists the indexed project files, and **Backups** lists snapshots you can
+restore.
+
+### The CLI at a glance
+
+The package installs `pedacito` and a shorter alias, `pdc`. Both accept the same
+commands. Run `pedacito <command> --help` for every flag.
+
+| Command | What it does |
+|---|---|
+| `pedacito gui [PROJECT]` | Open the browser control panel |
+| `pedacito models scan` | Find local servers, pick models, write profiles, and measure them |
+| `pedacito config --check` | Test the connection and generation. `--doctor` also probes structured output. `--setup` runs first-time setup |
+| `pedacito calibrate` | Measure the active model and save a model card that tunes defaults |
+| `pedacito profiles [--recommend]` | List profiles with their scores, and suggest role routing |
+| `pedacito ask PROJ -t "..."` | Run one task. Dry run by default. Add `--review`, `--apply`, `--plan`, or `--jsonl` |
+| `pedacito explain PROJ -q "..."` | Answer a question about the code. Never edits |
+| `pedacito auto PROJ -t "..."` | Turn a goal into a checklist, then implement it task by task |
+| `pedacito new DIR -t "..."` | Start a project from scratch |
+| `pedacito chat PROJ` | Interactive session that keeps the index warm |
+| `pedacito how "..."` | Built-in help for the CLI, the GUI, and settings |
+| `pedacito restore PROJ` | Undo the last write |
+| `pedacito index`, `map`, `files`, `cost` | Build and inspect the index. These need no model call, except `index` summaries |
+| `pedacito eval` | Score the harness on fixture repositories. Use `--baseline` as a regression gate |
+| `pedacito memory`, `skills`, `prune`, `reset`, `trust`, `worktree`, `serve`, `procs`, `lsp`, `diagnose`, `tests`, `webcheck` | Upkeep and specialist tools |
+
+Benchmarks are in the GUI only, through the **Benchmarks** button.
+
+### Documentation map
+
+- **[QUICKSTART.md](QUICKSTART.md)** is the step-by-step guide for GUI users and
+  CLI users.
+- **[MODEL_GUIDE.md](MODEL_GUIDE.md)** covers choosing and tuning models by
+  hardware tier, thinking settings, calibration, and benchmarks.
+- **[TECHNIQUES.md](TECHNIQUES.md)** explains how Pedacito gets small models to
+  work well, and which popular techniques it deliberately leaves out.
+- The rest of this README is the full reference: install, configuration, every
+  mode and setting, safety, and known limits.
+
+---
 ---
 
 ## Install
@@ -57,13 +167,26 @@ cd /path/to/pedacito
 pip install -e .            # Windows: py -m pip install -e .
 ```
 
-This puts `pedacito` and `pdc` on your `PATH` and installs `requests` and
-`tree-sitter`. If the command isn't found (common with per-user installs on
-Windows), `python -m pedacito` (`py -m pedacito`) is identical.
+This puts `pedacito` and `pdc` on your `PATH` and installs the full core:
 
-Optional extras: `pip install -e ".[vision]"` (screenshots) and
-`pip install -e ".[browser]"` (headless browser; then run
-`python -m playwright install chromium`).
+- `tree-sitter` with the `tree-sitter-language-pack` grammars, which power AST
+  chunking and the exact syntax check that runs before an edit is written.
+- `pytest` and `ruff`, the verification tools. Pedacito runs `ruff check` for
+  diagnostics and post-edit checks, and `pytest` for the benchmark holdout
+  rubric and the tests an edit can break.
+- `requests`, the HTTP client for every model server and hosted API.
+
+You don't need a separate step for any of these. If the command isn't found
+(common with per-user installs on Windows), `python -m pedacito`
+(`py -m pedacito`) is identical.
+
+`pip install -r requirements.txt` installs the same core set without installing
+Pedacito itself. Use it when you only want the dependencies.
+
+Optional features: `pip install -e ".[full]"` adds screenshots (Pillow) and the
+headless browser (playwright). Or pick one: `pip install -e ".[vision]"` or
+`pip install -e ".[browser]"`. After installing the browser extra, run
+`python -m playwright install chromium`.
 
 Uninstall with `pip uninstall pedacito-local`. Your config and every project's
 `.pedacito/` folder are left untouched.
@@ -111,9 +234,9 @@ grammar support automatically gets a few-shot JSON example in the prompt on
 later runs.
 
 Once per model, run `pedacito calibrate`. It runs a scripted
-mini-suite — tool choice, JSON adherence, edit format, planted-injection and
+mini-suite, tool choice, JSON adherence, edit format, planted-injection and
 honesty checks, long-context retrieval, continuation, a thinking A/B,
-capabilities — and saves a **model card**. Each probe runs 3 times (1 with
+capabilities, and saves a **model card**. Each probe runs 3 times (1 with
 `--quick`; `--repeats N` overrides) and the card records the mean and spread,
 so the choices come from a mean, not one noisy sample; a card from before
 this (version 1) is shown with a re-calibrate note and is not applied. Settings you left at their defaults
@@ -134,8 +257,8 @@ pedacito config             # show every resolved setting and where it came from
 pedacito config --reference # print the full annotated template
 ```
 
-`config --setup` (and `models scan`) finds local model servers — LM Studio,
-Ollama, Lemonade, llama.cpp — **on any port**, identifies each by its replies
+`config --setup` (and `models scan`) finds local model servers, LM Studio,
+Ollama, Lemonade, llama.cpp, **on any port**, identifies each by its replies
 rather than its port (so two servers can share one machine), lists its models,
 and writes one identity-only profile per model, then sets a default. Pass
 `--url` to point at a server on another machine or a hosted API; `models scan
@@ -200,8 +323,8 @@ observed" is not "unsupported").
 ## Built-in help: `pedacito how`
 
 For model selection, VRAM sizing, thinking settings, and role routing, see the
-[model guide](MODEL_GUIDE.md). It has concrete starting points for 6, 8, 12, 16,
-24, and 32 GB GPUs.
+[model guide](MODEL_GUIDE.md). It has concrete starting points for under 8 GB,
+8 to 16 GB, and 24 GB of VRAM, plus hybrid local and cloud role routing.
 
 `pedacito how` answers questions about using Pedacito from a built-in
 **structured reference index**: every CLI command and flag, the exact GUI
@@ -245,10 +368,10 @@ automatically; edits you make in your editor are detected on the next run.
 
 Free inspection commands (no model needed):
 
-- `pedacito files PROJ` — every candidate file and why it was kept or skipped.
-- `pedacito cost PROJ` — estimated LLM calls and time for a first index
+- `pedacito files PROJ`, every candidate file and why it was kept or skipped.
+- `pedacito cost PROJ`, estimated LLM calls and time for a first index
   (`--tps` sets your tokens/second).
-- `pedacito map PROJ` — print the index (`--tier auto|flat|cards|dirs`).
+- `pedacito map PROJ`, print the index (`--tier auto|flat|cards|dirs`).
 
 ### `ask`
 
@@ -273,8 +396,8 @@ after the repair rounds), `--model`, `--url`, `--profile`,
 gets the first done, the second half done and the third forgotten. `--plan`
 (or `plan_threshold`, which a model card sets for weaker models) gives each
 change its own window, lookups, evidence checks and rollback. A task that
-names five or more files is planned even when `plan_threshold` is 0 — the
-default, and what a strong model's card picks — because width is a
+names five or more files is planned even when `plan_threshold` is 0, the
+default, and what a strong model's card picks, because width is a
 window-capacity problem, not a skill problem; an explicit `plan_threshold` in
 your config still governs, and `--no-plan` opts one task out. A task written as
 bullets or several clear requirements is split deterministically, with no model
@@ -319,7 +442,7 @@ The model works through a small set of actions:
 |---|---|
 | `read` | Numbered lines of a file, or a definition by symbol name. A mid-file read annotates the enclosing function/class and the module's imports, so the model always knows where it is. |
 | `grep` | Regex or literal search (project, file, directory, or glob), hits labelled with their enclosing symbol. Falls back to literal and case-insensitive matching, and suggests similar symbols on a miss. |
-| `find` | Search indexed definitions by name, signature, or summary — navigation by concept, where `grep` needs the exact source spelling. Substring hits first, then BM25 (so a multi-word concept like `retry backoff` works). One line per hit with exact line ranges; a miss suggests similar names. |
+| `find` | Search indexed definitions by name, signature, or summary, navigation by concept, where `grep` needs the exact source spelling. Substring hits first, then BM25 (so a multi-word concept like `retry backoff` works). One line per hit with exact line ranges; a miss suggests similar names. |
 | `callers` | Where a symbol is defined, what it calls, who calls it, and the files and tests a change to it can affect (transitive importers/callers, two hops). |
 | `context` | One reply instead of four: a definition's numbered source, its class header, the signatures it calls, its callers with call sites, its tests, and the likely blast radius. Also works on a file. |
 | `outline` | Every unit in a file (or the files in a directory/glob) with signatures and line ranges. |
@@ -349,7 +472,7 @@ do:
 |---|---|---|
 | `write` / `append` / `move` / `delete` | `allow_write = true` | Whole-file operations; `append` builds a file larger than one reply. |
 | `rename` | `allow_write = true` | Mechanically rename one definition and its references in the files that import it (strings and comments untouched, every file re-parsed, snapshotted). Refuses a name defined in several places and lists the references it left alone. |
-| `undo` | `allow_write = true` (+ `backup`, on by default) | Self-recovery mid-task: reverts what this task's `write`/`append`/`move`/`delete` actions did so far (or just one of their files) — pre-task snapshots come back, files the task created go away. |
+| `undo` | `allow_write = true` (+ `backup`, on by default) | Self-recovery mid-task: reverts what this task's `write`/`append`/`move`/`delete` actions did so far (or just one of their files), pre-task snapshots come back, files the task created go away. |
 | `run` | `allow_shell = true` | Run one command (e.g. `pytest -q`), without a shell. A quiet GUI/server is stopped after `shell_idle_seconds`. |
 | `serve` | `allow_serve = true` | Start, list, log, or stop a background dev server. The registry and logs live under `.pedacito/procs/`; also `pedacito serve` / `pedacito procs`. |
 | `diagnose` | `allow_shell = true` | Run the detected linter/type checker (`ruff`, `pyflakes`, `flake8`, `mypy`/`pyright` when configured, `npm lint`, `tsc`, `cargo check`, `go vet`, `rubocop`). Also available as `pedacito diagnose`. |
@@ -362,7 +485,7 @@ do:
 | semantic search | `semantic_search = true` | A `grep` with no hits falls back to the server's `/v1/embeddings` endpoint. |
 
 `run` and `mcp` execute model-chosen commands in your project. Treat them as a
-trust decision — but see [Safety](#safety-and-trust): `run` is sandboxed by
+trust decision, but see [Safety](#safety-and-trust): `run` is sandboxed by
 default where the OS allows, and the rest of the blast radius is limited too.
 
 ### Seeing a GUI or web page
@@ -385,7 +508,7 @@ browser  command="python main.py"  pattern="press Enter; wait 3"  start=4
 ```
 
 The `pattern` grammar also covers `hold ArrowUp 1.5` (a key kept DOWN for N
-seconds — an instant `press` can fall between two samples of a fixed-timestep
+seconds, an instant `press` can fall between two samples of a fixed-timestep
 game loop), `click #start`, `fill #name Ada`, `type hello`, and `eval` (JS in
 the page). This reliably catches black screens, blank pages, missing text, and
 console errors; it does not judge visual quality. PNGs are saved under
@@ -393,7 +516,7 @@ console errors; it does not judge visual quality. PNGs are saved under
 
 ### Memory, rules, and skills
 
-Pedacito can remember what earlier runs learned — as plain markdown you can
+Pedacito can remember what earlier runs learned, as plain markdown you can
 edit or delete:
 
 - **Memory** (`.pedacito/memory.md`, plus a user-level `memory.md` next to your
@@ -409,7 +532,7 @@ edit or delete:
 - **Skills** are named procedures (`.pedacito/skills/NAME/SKILL.md`, or
   `skills/NAME/SKILL.md` next to your config). The model sees a one-line
   catalog and loads a skill's text only when it needs it. Five starters ship
-  built in; `pedacito skills` lists them. Skills are prompt text — nothing in a
+  built in; `pedacito skills` lists them. Skills are prompt text, nothing in a
   skill folder is ever executed.
 
 ### Project instructions
@@ -425,7 +548,7 @@ capped by `max_instruction_chars` (2000) and disabled with
 
 ## More commands
 
-### `chat` — interactive session
+### `chat`: interactive session
 
 ```bash
 pedacito chat ~/code/anki [--apply | --review]
@@ -439,7 +562,7 @@ running task but keeps the session open.** Switching profile mid-session is the
 cheapest way to compare two models on one task; a failed switch leaves the
 session on the previous model.
 
-### `new` — start a project from scratch
+### `new`: start a project from scratch
 
 ```bash
 pedacito new my-app -t "a CLI todo manager with a sqlite backend" --apply
@@ -451,7 +574,7 @@ The model plans a file tree, the skeleton is written, then each file is filled
 in. Dry run by default. The target directory must be empty or new unless
 `--force`. `--complex` hands implementation to the `auto` loop.
 
-### `auto` — autonomous loop over a task list
+### `auto`: autonomous loop over a task list
 
 Breaks a goal into an ordered checklist and implements each task in a fresh
 context, with optional verification and repair:
@@ -471,13 +594,13 @@ and editable. There is no default cap on tasks, steps, or time; add one with
 rounds per failed verification, `--keep-going` continues past failed tasks, and
 `--auto-install` installs a missing Python package instead of reporting it.
 `--strict` exits 1 when a task applied edits but left a failed edit block or
-impacted tests still failing after the repair rounds — for CI and unattended
+impacted tests still failing after the repair rounds, for CI and unattended
 pipelines (without it both are reported and the run exits 0).
 
 Guards for unattended runs: a repair round that makes the check *worse* (more
 test failures, more findings) is rolled back from that round's own snapshot
 and the task is marked failed, instead of compounding the damage. Plan titles
-are linted at startup — one title should be one change, and a title bundling
+are linted at startup, one title should be one change, and a title bundling
 several edits gets a warning. `auto_allowlist = true` restricts each task's
 writes: existing files can only be modified, moved, or deleted when the task
 title names them or the lookup phase read them; creating new files is always
@@ -487,7 +610,7 @@ allowed.
 branch, leaving your checkout untouched. Manage worktrees directly with
 `pedacito worktree create|list|remove NAME`.
 
-### `gui` — browser control panel
+### `gui`: browser control panel
 
 ```bash
 pedacito gui [PROJECT] [--profile NAME] [--port N] [--no-open]
@@ -505,7 +628,7 @@ identically.
 | **Changes** (middle) | The proposed edits as *Old code | Updated code* side by side with word-level highlights. Accept or reject the whole set, untick files to accept only some, or **Edit updated** to hand-edit a file before accepting. Backups are made first and a file that changed on disk since the preview is refused. |
 | **Plan** (middle) | The `auto`/plan checklist with live progress; edit it, then **Run this plan**. |
 | **File** (middle) | Read-only viewer for any indexed file (click it in the tree). |
-| **Terminal** (bottom) | Everything pedacito prints, live, with ANSI colours — the same text the launching terminal shows. |
+| **Terminal** (bottom) | Everything pedacito prints, live, with ANSI colours, the same text the launching terminal shows. |
 | **Files** (right) | Filterable tree of the indexed files; files in the pending review are highlighted. |
 | **Settings** | See below. |
 
@@ -513,7 +636,7 @@ Panels resize (drag the dividers), the layout and colour scheme are
 remembered, and on a narrow window the panels become tabs.
 
 **Settings** edits the user config or the open project's `.pedacito.toml`
-without touching the rest of the file — comments survive, every edit is checked
+without touching the rest of the file, comments survive, every edit is checked
 with the same rules the loader uses before it is written, and the previous file
 is kept as `config.toml.bak`. Tabs: **Profiles** (create, duplicate, delete,
 make default; server URL, key, model with a *Test connection* that lists the
@@ -561,8 +684,8 @@ needed: DOM ids that exist in no HTML file, ESM syntax loaded through a classic
 `<script src>` (a silent SyntaxError), duplicate globals across classic
 scripts, `<script src>` files that do not exist, bare imports package.json
 never declared, and inline handlers calling members nothing defines. It is
-regex-level on purpose, so its results are notices — the command, the `new`
-scaffold summary, and a WARN after `auto` tasks that touched web files — never
+regex-level on purpose, so its results are notices, the command, the `new`
+scaffold summary, and a WARN after `auto` tasks that touched web files, never
 hard failures.
 
 `calibrate` also measures **native tool calls** against the JSON grammar on your
@@ -577,8 +700,8 @@ model that spends a tiny budget on `<think>` is not scored as failing the skill.
 The thinking A/B then asks the same short edit question at the real answer
 budget, once with thinking on and once off: a model that is only usable with
 thinking off gets `disable_thinking = true` persisted on the card, so later
-runs start in the winning mode instead of rediscovering it one empty reply —
-one wasted round-trip — at a time.
+runs start in the winning mode instead of rediscovering it one empty reply
+(one wasted round-trip) at a time.
 
 `--record` writes the ordered model responses to `.pedacito/replay/<stamp>.jsonl`
 (prompts as a hash and a short redacted preview, never in full); `--replay`
@@ -587,12 +710,12 @@ preflight, edit parsing, repair) deterministically and free. It reports which
 calls were asked a *different* prompt than when recorded: that is how you test a
 change to the harness rather than to the model.
 
-`pedacito eval` runs 15 tasks over four fixture repositories — a small Python
+`pedacito eval` runs 15 tasks over four fixture repositories, a small Python
 shop, a TypeScript app, a Go CLI, and a medium multi-file Python service with
-decoy modules — each with a gold file set, a substring check, a real test for
-Python, and planted prompt injections — and prints locate rate, first-apply
+decoy modules, each with a gold file set, a substring check, a real test for
+Python, and planted prompt injections, and prints locate rate, first-apply
 success, repair calls, tokens, cache-hit ratio, wall time and a failure
-taxonomy — for edits: wrong file, unread edit, format error, truncation,
+taxonomy, for edits: wrong file, unread edit, format error, truncation,
 refusal, hallucination, test regression, injection followed; for questions:
 retrieval miss (never read the gold file), ungrounded citation (a file or line
 the project does not have), invented behaviour (read it and still got it
@@ -601,7 +724,7 @@ kind (edit, question) separately, and the gate checks them separately. Use it to
 run it, change `prompt_pack` or `answer_mode`, run it again. With
 `--baseline base.json`, the new report is compared with the old one and the
 command exits nonzero on a quality regression, more followed injections, or
-token/time growth beyond the configured tolerances — a CI gate over a replay
+token/time growth beyond the configured tolerances, a CI gate over a replay
 or a live run. Rates are compared per task over the tasks both reports ran: a
 drop of up to one task-equivalent (one task, even across every repeat) is noise
 and only noted, a larger drop fails, and a failure label the baseline's taxonomy could not emit is reported
@@ -654,8 +777,8 @@ ranking only decides *what* to show when something has to be left out.
 (stack, entry points, test/lint/build commands, directory roles) sits above the
 map, built from your manifests with no model call.
 
-File cards carry blast radius — `imported by: 7 file(s)`, or a labelled
-"no importers or callers found (evidence, not proof)" — and cross-link modules
+File cards carry blast radius, `imported by: 7 file(s)`, or a labelled
+"no importers or callers found (evidence, not proof)", and cross-link modules
 with their tests (`tested by:` / `tests:`) for Python, JS/TS (`x.test.ts`,
 `__tests__/`), Go (`x_test.go`), Rust (`tests/`), Java/C# (`XTest`), and Ruby
 (`x_spec.rb`) when the match is unambiguous. `pedacito map PROJ -t "task"`
@@ -683,11 +806,11 @@ pruned before they are walked, and nested `.gitignore` files are honoured.
 ```
 
 A block matches the file exactly (ignoring trailing whitespace) or it fails
-cleanly — and a failure shows the closest matching window in the file right
+cleanly, and a failure shows the closest matching window in the file right
 now, with line numbers and a similarity score, so the retry re-anchors on real
 text instead of guessing. A FILE header can also pin a block from the start:
 `--- FILE: src/app.py LINES 40-60` replaces that exact range, and
-`SYMBOL is_leech` replaces that whole definition — useful when a snippet
+`SYMBOL is_leech` replaces that whole definition, useful when a snippet
 appears more than once or the text keeps shifting under the model.
 
 Before writing, Python is checked with `ast.parse` and tree-sitter
@@ -695,8 +818,8 @@ languages with their parsers: an edit that breaks a clean file is refused, while
 a file that was already broken is edited with a warning. A failed block's error
 goes back to the model for up to `repair_rounds` retries (default 2).
 
-After a write, `post_edit_check` (on by default) runs the cheap check — the
-detected linter, else a syntax parse — on the changed files and feeds back only
+After a write, `post_edit_check` (on by default) runs the cheap check, the
+detected linter, else a syntax parse, on the changed files and feeds back only
 findings that were *not* there before the task, giving the model up to
 `repair_rounds` fix rounds to clean up its own mess without chasing
 pre-existing issues.
@@ -711,27 +834,27 @@ failure instead of being silently dropped.
 
 A small model's usual failure is not bad syntax but a plausible edit to the
 wrong place. Before anything is written, `verify_answer = "deterministic"` (the
-default) dry-applies the blocks and runs free checks — no model call:
+default) dry-applies the blocks and runs free checks, no model call:
 
 | Check | Catches |
 |---|---|
 | unread | an edit to a file, or a region of one, the lookup phase never `read` |
 | placeholder | `TODO` / `NotImplementedError` / bare `pass` instead of working code (unless the task asks for a stub) |
-| stale references | a removed or renamed definition that is still referenced elsewhere — judged against what *all* of the reply's edits leave behind, so a correct multi-file rename passes |
+| stale references | a removed or renamed definition that is still referenced elsewhere, judged against what *all* of the reply's edits leave behind, so a correct multi-file rename passes |
 | moved imports | a moved file still imported by its old path |
 | citations | `file:line` claims about files never read |
-| coverage | a requirement from the task (it extracts up to five) no edit or sentence touches — a warning |
+| coverage | a requirement from the task (it extracts up to five) no edit or sentence touches, a warning |
 
 Errors cause one corrected re-ask that shows the model its own blocks and the
 findings; warnings are printed and logged. `verify_answer = "full"` adds one
 adversarial verifier call (on the `verifier` role, if you set one), and
 `best_of = 3` samples extra candidates at a higher temperature and keeps the
-best-scoring one — both cost model calls, and `pedacito calibrate` turns them
+best-scoring one, both cost model calls, and `pedacito calibrate` turns them
 on for models that measure weak.
 
 With `verify_tests = true` and `allow_shell = true`, the tests *impacted* by an
 edit (the tests named after the file, tests of its importers and callers) run
-after it is written; new failures — compared with a run before the edit — go
+after it is written; new failures, compared with a run before the edit, go
 back to the model for up to `repair_rounds` fix rounds. `test_command`
 overrides detection (`pytest`, `npm test`, `cargo test`, `go test ./...`,
 `make test`, ...).
@@ -780,7 +903,7 @@ you configured. Within that:
   ("ignore previous instructions...") is flagged in the observation.
   `pedacito eval` plants injections to measure this.
 - **Commands get a minimal environment.** A command the model chooses (and dev
-  servers it starts) sees `PATH`, `HOME`, locale and toolchain variables — not
+  servers it starts) sees `PATH`, `HOME`, locale and toolchain variables, not
   your API keys or tokens. Add what a project needs with `env_passthrough`
   (`["DATABASE_URL", "AWS_*"]`); `scrub_env = false` restores the old behaviour.
 - **Protected paths.** The model can never write `.git/`, `.pedacito/`,
@@ -1077,7 +1200,7 @@ working default and is documented in `pedacito config --reference`.
 ## Known limits
 
 - The call graph matches bare names, so two unrelated `run()` methods are
-  conflated — fine for locating code, not for automated refactoring. Import
+  conflated, fine for locating code, not for automated refactoring. Import
   edges are resolved per language (relative paths, packages, `crate::`), but an
   import it cannot tie to an indexed file is treated as external, and the
   "no importers" hint is evidence, not proof (dynamic loading, entry points).
@@ -1116,4 +1239,4 @@ setup this was built on. Please open an issue before a large PR.
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+MIT, see [LICENSE](LICENSE).

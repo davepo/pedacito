@@ -1,3 +1,19 @@
+# Core dependencies. Keep in sync with [project] dependencies in pyproject.toml.
+# `pip install -r requirements.txt` installs the same set that `pip install -e .`
+# does. Optional features (Pillow, playwright) live in the `full` extra.
+
+# HTTP client for model servers and hosted APIs.
 requests>=2.31
+
+# AST chunking and the exact syntax gate for edits. Stay below 0.26:
+# 0.26.0 segfaults CPython 3.12/3.14 (py-tree-sitter#472).
 tree-sitter>=0.23,<0.26
+
+# Grammars for JS/TS, Go, Rust, Java, C/C++, C#, Ruby, and more.
 tree-sitter-language-pack>=1.0
+
+# Runs the holdout rubric and generated projects' tests (`pytest -q`).
+pytest>=8
+
+# The `ruff check` linter used by diagnostics and post-edit checks.
+ruff>=0.5

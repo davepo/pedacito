@@ -1,221 +1,90 @@
 # Pedacito model guide
 
-Practical guidance for choosing and configuring a local model for Pedacito.
-It is model-agnostic: the examples name current popular families, but the
-reasoning applies to any OpenAI-compatible server (LM Studio, Ollama,
-Lemonade, llama.cpp, vLLM, SGLang, ...).
+This guide helps you choose a model for your hardware, set it up in Pedacito,
+and check that it is working. It applies to any OpenAI-compatible server (LM
+Studio, Ollama, Lemonade Server, llama.cpp, vLLM, and others) and to hosted APIs.
+Model names and quantization details change often. Treat the examples as
+starting points, and measure on your own machine.
 
-Pedacito is not a chat benchmark. It asks a model to do three different jobs:
+Pedacito is not a chat benchmark. It asks a model to do three jobs:
 
-1. **Choose lookups** through a JSON tool schema (read, grep, find, callers,
-   context, done).
-2. **Write or edit code** as exact search/replace blocks, against source it
-   has actually read.
-3. **Verify or explain** what it found, with a bounded prose answer.
+1. **Choose lookups** through a JSON tool schema (`read`, `grep`, `find`,
+   `callers`, `context`, `done`).
+2. **Write or edit code** as exact search/replace blocks, against source it has
+   actually read.
+3. **Verify or explain** what it found, in a short prose answer.
 
-The model that wins a chat benchmark is not always the model that wins here.
-Tool-call reliability, instruction following, edit-block accuracy, and token
-discipline matter more than raw parameter count.
+A model that wins a chat leaderboard is not always the model that wins here.
+Reliable tool calls, following the edit format, and token discipline matter more
+than raw parameter count.
 
 ---
 
 ## The short version
 
-- **Small local models: thinking off** for the worker profile. Pedacito already
-  disables thinking for gather/plan/scaffold calls; `disable_thinking` mainly
-  controls answer/edit, repair, verifier, and compaction calls, where reasoning
-  competes with the output budget.
-- **Medium/large local models: thinking off by default, measure before turning
-  it on.** A separate thinking-on profile for `planner`/`verifier` is often the
-  best compromise.
-- **Use the largest model that leaves 1.5–2.5 GB of VRAM** for the KV cache,
-  desktop compositor, and server overhead. A model that spills out of VRAM is
-  much slower than a smaller model that fits.
-- **Q4_K_M is the default quant.** Q5_K_M/Q6_K are worth it when the model
-  still fits; avoid Q2/IQ2 for code editing.
-- **Measure once per model/quant** with `pedacito calibrate`, and measure
-  changes with `pedacito eval --baseline`. Do not choose a setup from model name
-  alone.
+- **Pick the largest model that fits with 1.5 to 2.5 GB of VRAM to spare.** A
+  model that spills out of VRAM is much slower than a smaller one that fits.
+- **Start with thinking off** for your worker model. Turn it on only for a
+  planner or verifier profile, and only after measuring it.
+- **Use Q4_K_M as the default quantization.** Use Q5 or Q6 if the model still fits
+  comfortably. Avoid Q2 and IQ2 for code editing.
+- **Calibrate every model once** with `pedacito calibrate`. Compare models on
+  your own hardware with the five built-in benchmarks, or with `pedacito eval`.
+- **Do not pick a setup from the model name alone.**
 
 ---
 
-## How Pedacito uses a model
+## Hardware tiers
 
-Pedacito has several model call sites, and they do not all want the same
-settings:
+Find the row that matches the VRAM available to your model server. That is the
+GPU memory the server can use, not the card's total if other programs use it.
+On Apple Silicon or another unified-memory machine, count only the slice you
+give the model.
 
-| Phase | What the model does | Thinking in Pedacito |
-|---|---|---|
-| Planning / task splitting | JSON task list | **Forced off** |
-| Gather loop | JSON lookup actions | **Forced off** |
-| Scaffolding / interface stubs | JSON/source stubs | **Forced off** |
-| Answer / edit | Search/replace blocks or prose | Config (`disable_thinking=false` by default: thinking on if the model reasons) |
-| Repair | Correct failed edits | Config |
-| Verifier | Adversarial check | Config |
-| Compaction | Rewrite lookup digest | Config |
-| `explain` | Prose answer | Config |
-
-So `disable_thinking = true` does **not** change the lookup loop (it is already
-off). It changes the phases where a small model is most likely to burn its
-`max_tokens_answer` budget on reasoning instead of producing a usable edit.
-
-`thinking_suffix` is separate: it appends a prompt soft switch such as
-`/no_think`. Empty means auto when thinking is disabled (`/no_think` for
-Qwen3/SmolLM3 only). Use it only for a model whose template does not honour the
-hard switch.
-
-### Models with no off switch
-
-Some models always reason: R1 distills, LFM2.5-Thinking, LFM2.5-24B-A2B,
-GPT-OSS, Kimi K2.7/K3, and similar. Pedacito still strips their output blocks,
-but it cannot stop the token cost. For a small worker, prefer an **instruct** or
-**non-thinking** variant of the same family when one exists.
-
----
-
-## Sizing rules
-
-Pedacito's `auto_fit` uses:
-
-- `vram_gb`: the GPU memory available to the model server, not necessarily the
-  card's total. A desktop compositor, browser, or another model may already
-  use some. On Apple Silicon or another unified-memory system, set a
-  conservative slice of the shared memory, not the whole machine's RAM.
-- The model's weight file size, reported by the server.
-- `context_tokens`, `reserve_tokens`, and `k_cache_quant`/`v_cache_quant`.
-
-It keeps roughly 0.5 GB free and fits budgets to the window. Explicit values in
-a profile still win. If the server reports a stale context length, set
-`context_tokens` yourself.
-
-A rough budget:
-
-```
-weights (quantized) + KV cache (grows with context) + 1.5-2.5 GB overhead
-```
-
-**KV cache is the second knob after weights.** Doubling context roughly doubles
-the KV cost. If your runtime uses a quantized KV cache, set
-`k_cache_quant` and `v_cache_quant` (for example `"q8_0"`) so `auto_fit` does
-not overestimate. If the server runs with `--parallel` or a large batch, leave
-more headroom.
-
-### Quantization
-
-| Quant | Rough weights | Practical use |
-|---|---|---|
-| Q4_K_M | ~0.55–0.6 bytes/param | Default for most local setups; best size/quality trade-off |
-| Q5_K_M | ~0.7 bytes/param | Use when the model still fits comfortably |
-| Q6_K | ~0.8 bytes/param | Small models or extra VRAM; better than Q4 for edits |
-| Q8_0 | ~1.0 byte/param | Only when weights + context clearly fit; often not worth the VRAM |
-| Q3 / IQ3 | ~0.4 bytes/param | Last resort for very large models; avoid for code editing |
-| Q2 / IQ2 | ~0.3 bytes/param | Avoid for Pedacito work |
-
-A 7B model at Q4 is roughly 4–5 GB; 14B is roughly 9–10 GB; 24B is roughly
-14–16 GB; 32B is roughly 19–21 GB. These are only weights — add the KV cache
-and overhead. Exact sizes vary by architecture and tokenizer. MLX, EXL2, AWQ,
-and GPTQ use different quant names; aim for the equivalent ~4-bit size.
-
----
-
-## What fits at each VRAM size
-
-These are starting points, not guarantees. Actual file sizes vary by model,
-quantization, architecture, and server. Quantized weights below assume GGUF at
-Q4_K_M unless noted.
-
-| VRAM | Practical model class | Context target | Pedacito tier | Worker thinking | Roles |
+| Hardware | Model class | Examples (Q4_K_M unless noted) | Context | Pedacito tier | Worker thinking |
 |---|---|---|---|---|---|
-| **6 GB** | 3–4B Q4/Q5; 7–8B Q4 only at 4k and tight | 4k–8k | `tiny` | off | single model |
-| **8 GB** | 7–9B Q4; 12B Q4 only at 4k | 8k–16k | `small` | off | single model |
-| **12 GB** | 12–14B Q4/Q5, or 8B Q6/Q8 | 16k | `small` or `medium` | off for worker; think planner only if 16k+ | optional think profile |
-| **16 GB** | 14B Q6 (Q8 small context), or 24B Q4 | 16k–32k | `medium` | off worker; think planner/verifier | yes |
-| **24 GB** | 27–32B Q4 | 32k | `medium` or `large` | off or measured; think planner/verifier | yes |
-| **32 GB** | 32B Q5/Q6, or 27B Q8 | 32k–64k | `large` | off default; measure on/off | yes |
+| **Under 8 GB VRAM** | 4B to 7B | Qwen3-4B, Gemma 3 4B, Qwen2.5-Coder 7B (tight) | 4k to 8k | `tiny` or `small` | off |
+| **8 to 16 GB VRAM** | 8B to 14B | Qwen3-8B, Gemma 3 12B, Qwen3-14B (comfortable at 16 GB, tight at 12 GB) | 8k to 16k | `small` or `medium` | off. Planner or verifier profile may use thinking |
+| **24 GB VRAM** | 24B to 35B, dense or MoE | Mistral Small 24B, Gemma 3 27B, Qwen3-32B, Qwen3-30B-A3B (MoE) | 16k to 32k | `medium` or `large` | off by default. Measure before enabling |
+| **Hybrid local + cloud** | Any of the above, plus a hosted model | A local worker, with a hosted planner or verifier | Per profile | Per profile | Per profile |
 
-### 6 GB
+Sizes below are for the weights alone. Add the KV cache and about 1.5 to 2.5 GB of
+overhead.
 
-- **Safe:** 3B–4B at Q4_K_M/Q5_K_M. Examples: Qwen3-4B (Instruct or Thinking),
-  Nanbeige4.2-3B, Gemma 3 4B, LFM2.5-1.2B/2.6B.
-- **Possible but tight:** 7–8B Q4 at 4k context, no desktop apps using the GPU.
-  Expect slower generation and less map/source budget.
-- **Avoid:** 12B+; thinking on a 4B model for routine edits.
-- **Settings:** `tier = "tiny"`, `disable_thinking = true`, context 4k–8k.
-  Let `auto_fit` choose; set `context_tokens = 4096` only if detection is wrong.
+### Under 8 GB VRAM (4B to 7B)
 
-### 8 GB
-
-- **Safe:** 7–9B at Q4_K_M. Examples: Qwen3-8B, Llama 3.1 8B, Mistral 7B,
-  Phi-4-mini, LFM2.5-8B-A1B, Nanbeige4.2-3B at Q6/Q8.
-- **Possible:** Gemma 3 12B Q4 at 4k, or a 12B Q4 with a small window; not
-  comfortable.
-- **Avoid:** 14B+; thinking on the 8B worker.
-- **Settings:** `tier = "small"`, `disable_thinking = true`, context 8k–16k.
-  Use the model card to pick `tool_mode` (native vs grammar) after calibration.
-
-### 12 GB
-
-- **Safe:** 12–14B Q4/Q5. Examples: Qwen3-14B Q4, Gemma 3 12B Q5, Phi-4 14B
-  Q4, DeepSeek-R1-Distill-Qwen-14B Q4 (always thinks).
-- **Also good:** 8B Q6/Q8 if you value quality per parameter over raw size.
-- **Avoid:** 24B Q4; 14B thinking-on for every task.
-- **Settings:** `tier = "small"` or `"medium"` depending on window; context
-  16k; worker thinking off. A thinking-on planner profile is reasonable if it
-  fits at the same context.
-
-### 16 GB
-
-- **Safe:** 14B Q6, or 24B Q4. Examples: Qwen3-14B Q6, Gemma 3 12B Q6/Q8,
-  Mistral Small 24B Q4. A 14B Q8 fits only at a small context.
-- **Avoid:** 27B/32B Q4 on 16 GB; the weights alone leave too little for a
-  useful KV cache.
-- **Settings:** `tier = "medium"`, context 16k–32k; worker thinking off;
-  thinking-on planner/verifier if the same model fits. This is the first tier
-  where role routing is usually worth it.
-
-### 24 GB
-
-- **Safe:** 27–32B Q4. Examples: Qwen3-32B Q4, Gemma 3 27B Q4/Q5,
-  Nanbeige4.3-33B Q4, DeepSeek-R1-Distill-Qwen-32B Q4, Mistral Small 24B Q6.
-- **Avoid:** 70B at Q3; it may load, but editing quality and speed suffer.
-- **Settings:** `tier = "medium"` or `"large"`, context 32k; worker thinking off
-  by default, then measure on/off. Role routing for planner/verifier is useful.
-
-### 32 GB
-
-- **Safe:** 32B Q5/Q6, or 27B Q8 at a moderate context. Examples: Qwen3-32B
-  Q5/Q6, Gemma 3 27B Q6/Q8, Nanbeige4.3-33B Q5, Mistral Small 24B Q8.
-- **Possible:** 70B Q3/IQ3 at a small context; not recommended for code edits.
-  Use a hosted model for 70B-class work instead.
-- **Settings:** `tier = "large"`, context 32k–64k; worker thinking off default;
-  measure. Use `escalate`/`fallback` only if you also have a second model or
-  hosted profile.
-
-> **Rule of thumb:** if you are unsure, choose one size smaller and increase
-> context. Pedacito benefits more from a model that fits with a 16k–32k window
-> than from the largest weights that barely load at 4k.
-
----
-
-## Profile recipes
-
-`vram_gb` is a hardware setting and normally belongs in `[universal]`. A profile
-can override it when a model runs on a different GPU.
-
-### Minimal worker (6–8 GB)
+- **Good fits:** 3B to 4B models at Q4_K_M or Q5_K_M, such as Qwen3-4B or
+  Gemma 3 4B. A 7B coder model at Q4 works at 4k to 8k context with no other GPU
+  programs running.
+- **Expect:** a smaller map and less source per lookup, so tasks should be narrow.
+  Name the file in the task.
+- **Avoid:** models of 12B and up, and thinking on a 4B model for routine edits.
+- **Settings:** `tier = "tiny"` (4B and under) or `"small"` (up to 10B),
+  `disable_thinking = true`, and context 4k to 8k. Let `auto_fit` choose the
+  budgets. Set `context_tokens` only if the server reports the wrong window.
 
 ```toml
 [universal]
 vram_gb = 8
 
 [profiles.worker]
-model = "qwen3-8b"          # exact id/name your server reports
-tier = "small"
+model = "qwen3-4b"
+tier = "tiny"
 disable_thinking = true
-# context_tokens and token budgets are auto-fitted; set them only to override.
 ```
 
-### Worker + thinking planner/verifier (12–16 GB)
+### 8 to 16 GB VRAM (8B to 14B)
+
+- **Good fits:** 8B models at Q6 or Q8, a 12B model at Q4, and 14B models at Q4 to
+  Q6. A 14B model at Q4 needs about 9 GB for its weights, so it is comfortable on
+  16 GB and tight on 12 GB.
+- **Expect:** a 16k context to be practical on 12 GB or 16 GB. Lower it if the
+  server reports less free memory.
+- **Avoid:** 24B and larger at Q4 on this hardware. The weights leave too little
+  room for a useful KV cache.
+- **Settings:** `tier = "small"` or `"medium"`, `disable_thinking = true` for the
+  worker, and context 8k to 16k. This is the first tier where a thinking planner
+  profile is worth trying. See [Hybrid local + cloud role routing](#hybrid-local--cloud-role-routing).
 
 ```toml
 [universal]
@@ -231,28 +100,25 @@ disable_thinking = true
 model = "qwen3-14b"
 tier = "medium"
 disable_thinking = false
-max_tokens_answer = 8000     # leave room for reasoning + the edit
-context_tokens = 32768
+max_tokens_answer = 8000     # room for reasoning plus the edit
+context_tokens = 16384
 ```
 
-If the two profiles point at the same server and model, switching roles should
-not reload weights. If they point at different models on a single GPU, expect a
-model-load wait on every switch; keep roles simple.
+### 24 GB VRAM (24B to 35B, dense or MoE)
 
-| Role | Suggested setting |
-|---|---|
-| `worker` | The active model; thinking off for small models |
-| `planner` | Thinking on for 12 GB+ if it fits; same model or a stronger one |
-| `verifier` | Thinking on for 16 GB+; same model or a stronger one |
-| `repair` | Usually the worker; thinking on can help fix syntax/format failures |
-| `summarizer` | Worker or a tiny fast model; do not switch models on one GPU unless measured |
-| `escalate` | Optional larger local or hosted model, one retry after no edit landed |
-| `fallback` | Optional hosted/larger model when the worker errors out |
-
-Every role is optional. With one model, leave `roles` empty; the extra routing
-only adds value when a second profile is genuinely better at that job.
-
-### Larger worker, thinking only where it helps (24–32 GB)
+- **Good fits:** Mistral Small 24B at Q4 to Q6, Gemma 3 27B at Q4 or Q5,
+  Qwen3-32B at Q4, and Qwen3-30B-A3B. That last one is a mixture-of-experts model
+  with about 3B active parameters per token.
+- **MoE models:** VRAM holds the total weights, not just the active ones. A 30B
+  MoE at Q4 still needs roughly 18 GB for its weights. It generates faster than a
+  dense model of the same size, which makes it attractive on 24 GB. Size these by
+  the file size the server reports.
+- **Expect:** a 32k context at Q4 on a 24 GB card with nothing else on the GPU.
+- **Avoid:** 70B models at Q3 on this hardware. They may load, but editing quality
+  and speed suffer.
+- **Settings:** `tier = "medium"` or `"large"`, context 16k to 32k, and worker
+  thinking off until you have measured it. Role routing for the planner and
+  verifier is useful at this size.
 
 ```toml
 [universal]
@@ -272,90 +138,254 @@ max_tokens_answer = 12000
 context_tokens = 32768
 ```
 
-Do not route `summarizer` to a separate model on one GPU unless the extra
-quality is measurable; summary calls are frequent and model swaps are expensive.
+Do not route `summarizer` to a separate model on one GPU unless the extra quality
+is measurable. Summary calls are frequent, and reloading a model is slow.
 
-### Hosted fallback (optional)
+### Hybrid local + cloud role routing
 
-A hosted `fallback` or `escalate` role is useful when the local worker fails,
-but it changes the privacy and cost model:
+A local worker handles most of the work, and a hosted model takes the jobs where
+a stronger model makes the biggest difference: planning a large goal, verifying a
+change, or escalating after a failed attempt. Pedacito routes each job by role,
+and each role is optional.
 
 ```toml
 [universal]
-roles = { escalate = "hosted" }
+roles = { planner = "big", verifier = "big", summarizer = "tiny", escalate = "big" }
 
-[profiles.hosted]
-base_url = "https://api.example.com/v1"
-api_key = "sk-..."
-model = "your-hosted-model"
-tier = "hosted"
+[profiles.local]                  # the default worker: lookups and edits
+model = "qwen3-9b"
+
+[profiles.big]
+base_url = "https://api.deepseek.com/v1"
+api_key_env = "DEEPSEEK_API_KEY"  # read from the environment, not stored in the file
+model = "deepseek-chat"
+
+[profiles.tiny]
+model = "qwen3-1.7b"
 ```
 
-Pedacito tries the local worker first and only escalates when no edit landed.
+| Role | What it does | Suggested setting |
+|---|---|---|
+| `worker` | Lookups and edits, the active model | Local; thinking off for small models |
+| `planner` | Turns a goal into a checklist, and plan steps | A stronger local or hosted model, thinking on if it fits |
+| `verifier` | Adversarial check of an answer before it is written | Thinking on for 16 GB and up, or a hosted model |
+| `repair` | Fixes failed edits and test failures | Usually the worker. Thinking can help with format errors |
+| `summarizer` | One-line summaries and compaction | The worker, or a tiny local model if you measured the gain |
+| `escalate` | One more attempt on a larger model when a task applied no edit | A larger local or hosted model |
+| `fallback` | Takes over when the worker errors out | A hosted or larger model |
+
+Each escalation rung is used at most once per task, and only when configured, so
+a bad local run cannot quietly spend a hosted budget. Use `--role planner=big` to
+route one job for a single run. `pedacito profiles --recommend` suggests a
+profile for each role, using measured scores, and `--apply-roles` writes the
+choice after you confirm it.
+
+Hosted models receive the task text and the code excerpts the task needs. Pedacito
+warns before sending a task that appears to contain a secret. Cap spending with
+`max_total_tokens` or `max_cost`, and set `price_input_per_mtok` and the matching
+output price so the cost is counted.
 
 ---
 
-## Thinking / reasoning settings
+## Thinking per profile
 
-### Default recommendation by size
+Some models reason before they answer, in a separate thinking block. That helps
+on hard problems. On a small model it can also use up the answer budget, so the
+edit never arrives.
 
-| VRAM / class | Worker | Planner | Verifier | Notes |
-|---|---|---|---|---|
-| 6 GB (3–4B) | off | off | off | thinking is usually a net loss |
-| 8 GB (7–9B) | off | off | off | keep the answer budget for edits |
-| 12 GB (12–14B) | off | on if 16k+ | on if 16k+ | first useful thinking split |
-| 16 GB (14–24B) | off | on | on | measure worker on/off |
-| 24 GB (27–32B) | off default | on | on | measure; thinking can help hard tasks |
-| 32 GB (32B+) | off default | on | on | measure; use `eval` before keeping it on |
+### Turn it off or on for one profile
 
-Thinking-on profiles should raise `max_tokens_answer` by roughly 2k–4k and keep
-enough context for the prompt. Turning thinking on without raising the budget
-mostly produces truncation and retries.
+In the GUI, open **Settings → Profiles**, select the profile, and set
+`disable_thinking` under **Reasoning & Execution Overrides**. The chip in the top
+bar shows **no-think** or **thinking** for the active profile.
 
-### When thinking helps
+In the config file:
 
-- Hard debugging, cross-file tracing, architecture, or a task with several
-  interacting requirements.
-- A planner that must split a broad goal into non-overlapping tasks.
+```toml
+[profiles.worker]
+model = "qwen3-14b"
+disable_thinking = true      # no reasoning for answers, edits, repair, or verifier calls
+
+[profiles.think]
+model = "qwen3-14b"
+disable_thinking = false
+max_tokens_answer = 8000     # raise the budget when thinking is on
+```
+
+Pedacito already turns thinking off for its lookup loop, planning, and scaffolding
+calls, because those are JSON calls where reasoning only adds cost. The setting
+controls the answer, repair, verifier, and summary calls, where reasoning
+competes with the output budget.
+
+If a model has a prompt switch instead of an API switch, set `thinking_suffix`,
+such as `/no_think` for Qwen3. Leave it empty when the server already honors
+`disable_thinking`.
+
+### When to turn thinking on
+
+- Hard debugging, cross-file tracing, architecture questions, or a task with
+  several requirements that interact.
+- A planner that must split a broad goal into tasks that do not overlap.
 - A verifier that must catch a subtle logic error.
-- Models that are trained to use reasoning for code (some Qwen/GLM/Nanbeige/
-  Magistral variants), **if** they still follow the edit format.
 
-### When it hurts
+Raise `max_tokens_answer` by about 2,000 to 4,000 when thinking is on. Without
+the extra room, most runs end in truncation and retries.
 
-- Routine lookup selection and small localized edits.
-- 4k–8k windows, where reasoning competes with map and source.
-- Models that emit long reasoning but weak edits; the answer budget dies before
-  the search/replace block.
-- Any setup where `finish_reason = "length"` or “would not produce valid JSON”
-  appears regularly.
+### When to turn it off
 
-Pedacito has recovery paths for these (larger budgets, no-reasoning nudges,
-salvaging a truncated action), but prevention is cheaper.
+- Routine lookups and small, localized edits.
+- Windows of 4k to 8k, where reasoning competes with the map and the source.
+- Models that reason at length but write weak edits. The answer budget runs out
+  before the search/replace block.
+- Any setup where the logs show `finish_reason = "length"` or repeated "would not
+  produce valid JSON" errors.
 
-A hybrid model in non-thinking mode is not always identical to the family's
-dedicated instruct model. If both are available, calibrate/eval both; the
-instruct variant is often better at strict tool calling and edit formats.
+`pedacito calibrate` runs a thinking A/B test. If a model only works with
+thinking off, the model card records `disable_thinking = true`, so later runs
+start in that mode.
+
+### Models that always reason
+
+Some models have no off switch: R1-style distills, LFM2.5-Thinking,
+LFM2.5-24B-A2B, GPT-OSS, and Kimi K2.7 and K3. Pedacito strips their reasoning
+blocks from the output, but it cannot remove the token cost. For a small worker,
+prefer an instruct or non-thinking variant of the same family when one exists.
 
 ### Per-family notes
 
-These are examples; check the model card for the exact chat template.
+These are examples. Check the model card and chat template for the exact switch.
 
 | Family | What to expect |
 |---|---|
-| **Qwen3 / 3.5 / 3.8** | Hybrid thinking; `enable_thinking` and `/no_think`. Strong tool use. Good worker with thinking off; good planner with it on. |
-| **Gemma 3 / 4** | Gemma 3 has no thinking; Gemma 4 reasoning is off by default and opt-in. Good instruction following; check the exact template. |
-| **Nanbeige 4.x** | `enable_thinking` on by default; `<think>` output. Strong small models, but thinking is token-heavy; turn off for the worker. |
-| **LiquidAI LFM2.5 / LFM3** | Very small and fast. LFM2.5-Thinking and LFM2.5-24B-A2B always reason; LFM3 supports `enable_thinking`. Prefer an Instruct variant for routine editing. |
-| **DeepSeek R1 / V3.x distills** | R1-style models always think and can be slow; V3.1+ hybrids expose `thinking`. Budget accordingly, or use a non-thinking coding model for the worker. |
-| **GLM 4.x / 5** | Hybrid `enable_thinking`; strong tool use. Large variants need substantial VRAM. |
-| **GPT-OSS** | Harmony format, always reasons; `reasoning_effort` can lower it but not turn it off. Good tool use; 20B is the realistic local size. |
-| **Mistral / Magistral** | Magistral-style models use `[THINK]`/`reasoning_effort`; often always reason. Mistral Small 4 supports an effort toggle. |
-| **Granite** | 3.2/4.2 have thinking toggles; small and instruction-oriented. Check the version. |
-| **Phi-4 reasoning** | `<think>`-style output, prompt-imposed; no standard off switch. Small but can be slow on long reasoning. |
+| **Qwen3 / 3.5** | Hybrid thinking, switched with `enable_thinking` or `/no_think`. Strong tool use. A good worker with thinking off and a good planner with it on. |
+| **Gemma 3 / 4** | Gemma 3 has no thinking. Gemma 4 has reasoning off by default and opt-in. Good instruction following. |
+| **Nanbeige 4.x** | Thinking is on by default, and output includes `<think>` blocks. Strong for its size, but token-heavy. Turn it off for the worker. |
+| **LiquidAI LFM2.5 / LFM3** | Very small and fast. LFM2.5-Thinking and LFM2.5-24B-A2B always reason. LFM3 supports `enable_thinking`. Prefer an Instruct variant for routine editing. |
+| **DeepSeek R1 and V3.x** | R1-style models always think and can be slow. V3.1 and later hybrids expose a `thinking` switch. Budget for it, or use a non-thinking coding model as the worker. |
+| **GLM 4.x / 5** | Hybrid `enable_thinking` and strong tool use. Large variants need substantial VRAM. |
+| **GPT-OSS** | Always reasons. `reasoning_effort` lowers the cost but does not turn it off. Good tool use. The 20B size is the realistic local option. |
+| **Mistral / Magistral** | Magistral-style models use their own reasoning format and often always reason. Mistral Small 4 has an effort toggle. |
+| **Granite** | 3.2 and 4.2 have thinking toggles. Small and instruction-oriented. Check the version. |
+| **Phi-4 reasoning** | Reasoning is written in `<think>`-style tags, imposed by the prompt. No standard off switch. Can be slow on long reasoning. |
 
-Model names, quant availability, and template switches change. Confirm with your
-server's model list and a quick `pedacito calibrate`.
+---
+
+## Calibration: `pedacito calibrate`
+
+Calibration measures a model on the things Pedacito depends on, then saves the
+result as a **model card**. The card tunes Pedacito's defaults for that model. It
+does not replace your own measurements.
+
+```bash
+pedacito calibrate --profile worker          # full run, about a few minutes
+pedacito calibrate --quick --profile worker  # skip the long-context and capability probes
+pedacito calibrate --repeats 5               # run each probe five times
+pedacito calibrate --recalibrate             # measure again even with a fresh card
+```
+
+Calibration runs a scripted set of probes:
+
+- **Tool choice:** does the model pick the right lookup action?
+- **JSON adherence:** does it reply in the required structure?
+- **Edit format:** does it write valid search/replace blocks?
+- **Injection and honesty:** does it ignore a planted instruction in the source,
+  and does it admit what it has not read?
+- **Long-context retrieval:** can it find a needle in a long prompt?
+- **Continuation:** can it answer from a warm conversation?
+- **Thinking A/B:** does hidden reasoning eat the answer budget? Each question is
+  answered with thinking on and off.
+- **Native tool calls:** the same scenarios through the model's tool-call channel,
+  compared with the JSON grammar.
+
+Each probe runs three times by default, or once with `--quick`. The card records
+the mean and the spread, so the decisions come from an average, not one lucky
+reply.
+
+The card sets these values:
+
+- `prompt_pack`, which controls how much instruction text the model gets
+- `answer_mode`, whether the answer continues the lookup conversation
+- `verify_answer` and `best_of`, which add checks and extra samples for weaker models
+- `tool_mode`, `grammar` or `native`
+- `fuzzy_match` and `edit_style`
+- `disable_thinking`, when the thinking A/B shows the model needs it off
+
+Only settings you left at their defaults follow the card. Anything you set
+explicitly still wins. `pedacito config` shows the card and whether it is in use.
+
+Cards expire after 30 days, and a card from an older version is shown with a note
+and not applied. Calibrate again after you change the model, its quantization, or
+its chat template. In the GUI, each profile in **Settings → Profiles** has a
+**Calibrate** button that runs a quick measurement and streams the output to the
+terminal panel. `pedacito models scan` also calibrates each new model with a quick
+run by default, so you get a card as you add models.
+
+---
+
+## Compare models with the diagnostic benchmarks
+
+Pedacito includes five small diagnostic projects. For each one, a model builds the
+project through the normal Pedacito loop, and the result is graded in two ways:
+
+1. **The model's own tests** (`pytest -q`, or the project's verification script).
+2. **A hidden holdout rubric**, written by Pedacito, that uses only the public
+   API the task describes. It checks the things small models often get wrong.
+
+The five projects contain 61 holdout checks in total.
+
+| Benchmark | What it asks for | What it catches |
+|---|---|---|
+| **Stateful CLI Expression & RPN Calculator** (`rpn_expression_calc`, 12 checks) | An infix calculator with variables and an RPN mode, as a module and a CLI | Operator precedence, right-associative `**`, unary minus, variables across arguments, exit codes |
+| **Markdown Table & Box-Drawing Formatter** (`markdown_table_fmt`, 12 checks) | Parse Markdown and CSV tables, and write aligned Markdown or box-drawing output | Padding off by one, escaped pipes, wide CJK characters, alignment markers, truncation |
+| **Thread-Safe TTL + LRU Cache** (`ttl_lru_cache`, 13 checks) | A two-file cache with TTL, LRU eviction, a memoize decorator, and stats | Eviction order, expired items evicted before live ones, `functools.wraps`, cross-file imports, thread safety |
+| **Streaming Log Parser & JSON Report** (`log_anomaly_analyzer`, 11 checks) | Parse mixed logs, compute percentiles per service, flag 5xx spikes, and emit strict JSON | Regex accuracy, nearest-rank percentiles, rolling 60-second windows, JSON discipline |
+| **Single-File Interactive Kanban Board** (`mini_kanban_html`, 13 checks) | A zero-dependency HTML, CSS, and JavaScript board with filters, persistence, and import/export | DOM ids that match between HTML and JS, event wiring, localStorage, CSS layout, offline delivery |
+
+### Run a benchmark
+
+1. Click **▦ Benchmarks** in the GUI top bar.
+2. Choose the profile to test. Each model you want to compare needs its own
+   profile, so create one per model first.
+3. Optionally choose the folder for the output. By default it is a `benchmarks/`
+   folder beside the project you have open.
+4. Click **Run Benchmark**. The dialog shows progress, then the result.
+
+Each run creates a new folder named like `pedacito_bench_<benchmark>_<profile>_<time>`.
+Nothing is deleted, so you can open the project, run its tests yourself, and
+read the code.
+
+### Read the report
+
+Each run writes `BENCHMARK_REPORT.md` in its folder, along with `benchmark_run.json`.
+The report has these sections:
+
+- **Run:** the benchmark, profile, model, start time, duration, and whether
+  generation finished cleanly.
+- **Score:** an overall PASS or FAIL, with the model's test results and the
+  holdout results. The overall result is PASS only when both pass.
+- **Usage:** tokens and model calls for the run.
+- **Shortcomings detected:** the specific failures the harness found.
+- **Harness holdout rubric:** each check, its description, and pass or fail.
+- **Requirement ledger:** each clause of the task and the state it reached.
+- **Model test output** and **Holdout rubric output:** the full pytest output.
+- **Run it yourself** and **Generated files:** the commands to rerun the project.
+
+### Compare two models fairly
+
+1. Use the same hardware and the same Pedacito settings. Only the model should
+   change.
+2. Run the same benchmark with each model's profile. For a stronger comparison,
+   run each benchmark more than once, because a single run is noisy.
+3. Compare the holdout checks passed out of the total, then the overall PASS or
+   FAIL, then the model's own tests.
+4. Look at the time and tokens in **Usage**. A model that passes at twice the cost
+   may still be the wrong choice for your hardware.
+5. Read the **Shortcomings** section. A model that passes the rubric but leaves a
+   placeholder or an untested edge case tells you something the score does not.
+
+Benchmarks need a model that can build a small project from a spec in one run,
+so they say more about the whole loop than about a model's raw knowledge. Use
+them to compare candidate models on the same job, not as a leaderboard.
 
 ---
 
@@ -368,9 +398,9 @@ pedacito config --check --profile worker
 pedacito config --doctor --profile worker
 ```
 
-`--check` verifies the server/model and reports the real context window.
-`--doctor` probes structured-output modes, tokenizer rate, and server details.
-If the server reports a stale window, set `context_tokens` explicitly.
+`--check` verifies the server and the model, and reports the real context window.
+`--doctor` probes structured-output modes, the tokenizer rate, and server details.
+If the server reports a stale window, set `context_tokens` yourself.
 
 ### 2. Calibrate the model
 
@@ -378,20 +408,14 @@ If the server reports a stale window, set `context_tokens` explicitly.
 pedacito calibrate --profile worker
 ```
 
-This measures tool choice, JSON adherence, edit format, instruction following,
-honesty, long-context retrieval, and native-vs-grammar tool calling. The saved
-model card can set:
-
-- `prompt_pack`
-- `answer_mode`
-- `verify_answer`
-- `best_of`
-- `tool_mode`
-
-It does **not** decide thinking on/off; measure that separately. Re-run
-calibration after changing the model, quantization, or chat template.
+See [Calibration](#calibration-pedacito-calibrate) above.
 
 ### 3. Run the eval, then A/B it
+
+`pedacito eval` runs a fixed set of tasks over small fixture repositories (a
+Python shop, a TypeScript app, a Go CLI, and a larger Python service). Some tasks
+plant a prompt injection in the source, so the eval also checks whether the model
+follows instructions it finds in the code it reads.
 
 ```bash
 pedacito eval --profile worker --out worker-off.json
@@ -399,45 +423,89 @@ pedacito eval --profile worker-think --out worker-on.json \
   --baseline worker-off.json
 ```
 
-If the thinking-on profile regresses, the second command exits nonzero and
-prints the regressions:
+If the second run regresses, the command exits nonzero and lists what got worse:
 
-- pass rate, locate rate, first-apply-clean rate
-- followed prompt injections
-- prompt/completion tokens, calls, wall time
+- pass rate, locate rate, and first-apply-clean rate
+- prompt injections that were followed
+- prompt and completion tokens, calls, and wall time
 - new failure types
 
 Tune the gate with `--max-token-growth` and `--max-time-growth` if your hardware
-or model has a known cost profile.
+has a known cost profile. Use `--repeats 3 --seed 1` to see the spread across
+runs.
 
-Pass rate alone is not enough. Prefer a setup that also improves or preserves:
+Pass rate alone is not enough. Prefer a setup that also keeps or improves:
 
 - **first-apply-clean** (fewer repair calls)
-- **mean prompt/completion tokens**
-- **cache-hit ratio**
-- **wall time**
-- a lower rate of truncation/format failures
+- mean prompt and completion tokens
+- cache-hit ratio
+- wall time
+- the rate of truncation and format failures
 
-### 4. Test the real work
+### 4. Test it on real work
 
-The eval uses small fixture repos. Before trusting a new model or profile:
+The eval uses small fixtures. Before you trust a new model or profile, try it on
+your own code:
 
 ```bash
-pedacito ask PROJ -t "a real narrow task"          # dry run
-pedacito ask PROJ -t "..." --review                # inspect the diff
-pedacito ask PROJ -t "..." --apply                 # once confident
+pedacito ask PROJ -t "a real, narrow task"        # dry run
+pedacito ask PROJ -t "..." --review               # inspect the diff
+pedacito ask PROJ -t "..." --apply                # once you are confident
 ```
 
-Use `--record` on a run and `--replay` later; replay is for testing harness
-changes without a model, not for judging a model upgrade. Add `--strict-replay`
-in CI to fail when the harness asks a different prompt than the recording.
+`--record` on a run, and `--replay` later, test changes to Pedacito's own
+harness without a model. They do not measure a model upgrade. In CI, add
+`--strict-replay` to fail the build when the harness asks a different prompt
+than the recording.
 
 ### 5. Watch VRAM
 
-Use your GPU tool (`nvidia-smi`, `rocm-smi`, the server's own panel) while a
-task runs. If the model spills to system RAM, generation slows sharply and the
-run may look like a model-quality problem when it is a sizing problem. Lower
-`context_tokens`, use a smaller quant/model, or quantize the KV cache.
+Use your GPU tool (`nvidia-smi`, `rocm-smi`, or the server's own panel) while a
+task runs. If the model spills into system RAM, generation slows sharply, and the
+run looks like a model-quality problem when it is really a sizing problem. Lower
+`context_tokens`, use a smaller model or quantization, or quantize the KV cache.
+
+---
+
+## Sizing and quantization
+
+Pedacito's `auto_fit` fits its token budgets to the model's real window using:
+
+- `vram_gb`, the GPU memory available to the model server
+- the model's weight file size, reported by the server
+- `context_tokens`, `reserve_tokens`, and `k_cache_quant` / `v_cache_quant`
+
+It keeps about 0.5 GB free. Values you set explicitly in a profile always win.
+
+A rough budget:
+
+```
+weights (quantized) + KV cache (grows with context) + 1.5 to 2.5 GB overhead
+```
+
+The KV cache is the second knob after the weights. Doubling the context roughly
+doubles the KV cost. If your runtime quantizes the KV cache, set
+`k_cache_quant` and `v_cache_quant` (for example `"q8_0"`) so `auto_fit` does not
+overestimate. If the server runs with `--parallel` or a large batch, leave more
+headroom.
+
+| Quant | Rough size | Practical use |
+|---|---|---|
+| Q4_K_M | 0.55 to 0.6 bytes per parameter | The default. Best size-to-quality trade-off |
+| Q5_K_M | About 0.7 bytes per parameter | When the model still fits comfortably |
+| Q6_K | About 0.8 bytes per parameter | Small models, or spare VRAM. Better than Q4 for edits |
+| Q8_0 | About 1.0 byte per parameter | Only when weights and context clearly fit |
+| Q3 / IQ3 | About 0.4 bytes per parameter | A last resort for very large models. Avoid for editing |
+| Q2 / IQ2 | About 0.3 bytes per parameter | Avoid for Pedacito work |
+
+Rough weight sizes at Q4: a 7B model is about 4 to 5 GB, a 14B model about 9 to
+10 GB, a 24B model about 14 to 16 GB, and a 32B model about 19 to 21 GB. Exact
+sizes vary by architecture and tokenizer. MLX, EXL2, AWQ, and GPTQ use different
+names for quantization. Aim for the equivalent of about 4 bits per weight.
+
+> **Rule of thumb:** if you are unsure, pick a model one size smaller and give it
+> more context. Pedacito benefits more from a model that fits with a 16k to 32k
+> window than from the largest weights that barely load at 4k.
 
 ---
 
@@ -445,27 +513,28 @@ run may look like a model-quality problem when it is a sizing problem. Lower
 
 | Symptom | Likely cause | Fix |
 |---|---|---|
-| “kept running past the token limit” / no JSON | thinking on with a small answer budget | `disable_thinking = true` for the worker, or raise `max_tokens_answer` |
-| Empty streamed answer with hidden reasoning | thinking runaway | Pedacito retries with thinking off; set it off by default for small models |
-| “search block not found” | model copied line numbers, or the file shifted | narrow the task; Pedacito re-anchors; check the model’s edit-format calibration |
-| Answers vague / wrong file | map too compressed, or model weak at tool choice | raise `flat_map_token_budget`/context, or use a better tool-calling model |
-| Model ignores tools | grammar/native mismatch | run `pedacito calibrate` and compare `tool_mode = "grammar"` vs `"native"` |
-| Slow after a few minutes | model spilled out of VRAM or context is too large | lower context/quant; check GPU memory while running |
-| Role switches take a minute | different models on one GPU reload weights | use the same model for roles, or accept the load cost |
-| Good chat, bad edits | model is not edit-oriented | prefer a coding/instruct model; check first-apply-clean in eval |
+| "Kept running past the token limit", or no JSON | Thinking on with a small answer budget | Set `disable_thinking = true` for the worker, or raise `max_tokens_answer` |
+| Empty answer with hidden reasoning | Thinking runaway | Pedacito retries with thinking off. Set it off by default for small models |
+| "search block not found" | The model copied line numbers, or the file shifted | Narrow the task. Pedacito re-anchors. Check the model's edit-format score in calibration |
+| Answers are vague, or name the wrong file | The map is too compressed, or the model is weak at tool choice | Raise `flat_map_token_budget` or the context, or use a model that is better at tool calls |
+| The model ignores tools | Grammar and native mode do not match | Run `pedacito calibrate` and compare `tool_mode = "grammar"` with `"native"` |
+| Slow after a few minutes | The model spilled out of VRAM, or the context is too large | Lower the context or quantization. Watch GPU memory during a run |
+| Role switches take a minute | Different models on one GPU reload their weights | Use the same model for the roles, or accept the load cost |
+| Good chat, bad edits | The model is not edit-oriented | Prefer a coding or instruct model. Check first-apply-clean in `eval` |
 
 ---
 
 ## Quick checklist
 
 - [ ] Set `vram_gb` to the memory actually available to the server.
-- [ ] Start with Q4_K_M; leave 1.5–2.5 GB for KV cache and overhead.
-- [ ] On 6–8 GB, use a 3–9B instruct/non-thinking worker and keep thinking off.
-- [ ] On 12–16 GB, keep the worker off and try thinking only for
-  `planner`/`verifier`.
-- [ ] On 24–32 GB, measure thinking on/off before making it the default.
-- [ ] Run `pedacito calibrate` once per model/quant.
-- [ ] Run `pedacito eval` before and after a change; use `--baseline` as a gate.
-- [ ] Prefer first-apply-clean and token/time numbers over pass rate alone.
-- [ ] Keep role routing simple on a single GPU; every model switch can reload.
-- [ ] Do the first dozen real tasks without `--apply`, then use `--review`.
+- [ ] Start with Q4_K_M, and leave 1.5 to 2.5 GB for the KV cache and overhead.
+- [ ] Under 8 GB, use a 4B to 7B instruct or non-thinking worker, with thinking off.
+- [ ] At 8 to 16 GB, keep the worker non-thinking, and try thinking only for the
+      planner or verifier.
+- [ ] At 24 GB, measure thinking on and off before making it the default.
+- [ ] Run `pedacito calibrate` once per model and quantization.
+- [ ] Compare candidate models with the five benchmarks, on the same hardware.
+- [ ] Run `pedacito eval` before and after a change, and use `--baseline` as a gate.
+- [ ] Judge by first-apply-clean and token and time numbers, not pass rate alone.
+- [ ] Keep role routing simple on a single GPU. Every model switch can reload.
+- [ ] Do your first dozen real tasks without `--apply`, then use `--review`.

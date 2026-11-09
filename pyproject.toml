@@ -11,18 +11,30 @@ classifiers = [
     "Programming Language :: Python :: 3 :: Only",
 ]
 dependencies = [
+    # HTTP client for every model server and hosted API.
     "requests>=2.31",
-    # 0.26.0 regressed Node lifetime handling and segfaults CPython 3.12/3.14
-    # (py-tree-sitter#472). 0.25.2 is the last known-good release and ships
-    # cp314 wheels; keep the ceiling until upstream ships a fixed release.
+    # AST chunking and the exact syntax gate for edits. 0.26.0 regressed Node
+    # lifetime handling and segfaults CPython 3.12/3.14 (py-tree-sitter#472).
+    # 0.25.2 is the last known-good release and ships cp314 wheels; keep the
+    # ceiling until upstream ships a fixed release.
     "tree-sitter>=0.23,<0.26",
+    # Grammars for JS/TS, Go, Rust, Java, C/C++, C#, Ruby, and more, loaded
+    # through get_parser() in pedacito/chunker_ts.py.
     "tree-sitter-language-pack>=1.0",
+    # Runs the holdout rubric and the generated projects' tests (`pytest -q`
+    # in pedacito/benchmarks.py and the verify/repair loop).
+    "pytest>=8",
+    # The `ruff check` linter used by `pedacito diagnose`, post-edit checks,
+    # and the auto loop's --diagnostics.
+    "ruff>=0.5",
 ]
 
 [project.scripts]
 pedacito = "pedacito.cli:main"
 pdc = "pedacito.cli:main"
 
+# pytest and ruff are core dependencies now. `dev` remains so existing
+# `pip install -e ".[dev]"` commands (including CI) keep working.
 [project.optional-dependencies]
 dev = ["pytest>=8"]
 # Screenshot capture/pixel analysis for the opt-in `screenshot` action.
@@ -30,6 +42,8 @@ vision = ["Pillow>=10"]
 # Headless browser automation for the opt-in `browser` action. After
 # installing, run `python -m playwright install chromium` for the browser.
 browser = ["playwright>=1.40"]
+# Every optional feature in one step: vision + browser.
+full = ["Pillow>=10", "playwright>=1.40"]
 
 [tool.pytest.ini_options]
 markers = ["network: tests that spawn the fake LLM server (fast, local)"]

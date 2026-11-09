@@ -8,12 +8,12 @@ expensive, too slow, or actively harmful here.
 Everything below is judged on one question: **does it raise task success and
 answer faithfulness per token and per second?** A technique ships only when it
 wins that trade-off, and it is gated behind a config flag, a model card, or a
-measured win — never enabled on trust. This page lists what Pedacito actually
+measured win, never enabled on trust. This page lists what Pedacito actually
 does, and, at the end, the well-known techniques it deliberately does *not*.
 
-The reasons and measurement plan behind each choice live in
-[`loop_techniques_proposal.md`](loop_techniques_proposal.md) and the build
-order in [`upgrade_plan.md`](upgrade_plan.md).
+The reasons and measurement plan behind each choice were drafted as internal
+design notes. They are not part of this repository, so the rules below are
+the public record.
 
 ---
 
@@ -43,14 +43,14 @@ grammar-constrained JSON `{action, file, pattern, symbol, start, end, ...}`
 followed by a `RESULT:` observation, until the model says `done` or hits a
 budget. Because the schema constrains the *choice of action* (not just the
 format), a small model cannot wander into unsupported actions. Recovery nudges
-fire once each for the classic stalls — re-reading the same range, repeating a
+fire once each for the classic stalls, re-reading the same range, repeating a
 step, a run of errors, or a `[STUCK:]` on identical actions.
 
 Two action-independent global leases back-stop the loop when `max_steps = 0`
 removes the fixed lookup cap: `max_total_model_calls` (default 30) is a hard
 ceiling on LLM invocations per task, and `max_no_progress_steps` (default 4)
 bounds consecutive gather steps that neither add a new unread line span to
-the read ledger nor resolve a new symbol — a run of greps, a run of errors,
+the read ledger nor resolve a new symbol, a run of greps, a run of errors,
 and a run of identical steps all count alike. Whichever ceiling trips first
 ends gather cleanly with a harness note appended to the conversation, and the
 run moves on to the answer phase with what was gathered. One step before the
@@ -65,7 +65,7 @@ REPORTED`. Search, find, outline and caller results advance a clause to
 `LOCATED` only when their query/result names its terms; a displayed read span
 advances it to `READ`; a clean patch touching its file/terms advances it to
 `EDITED`; passing verification advances it to `VERIFIED` (prose that answers
-a read investigation reports it). No transition costs a model call — every
+a read investigation reports it). No transition costs a model call, every
 one is derived from a tool result or patch the harness already has.
 
 When the model says `done`, or gather stalls with budget left, the oldest
@@ -73,12 +73,12 @@ requirement still `UNLOCATED` or `LOCATED` gets the cheapest deterministic
 action: read a located anchor directly, otherwise `grep` its most specific
 term, then read the anchor that search located. The result is APPENDED at the
 conversation tail (never a rewrite of earlier turns), bounded to one assist
-per requirement, and only on multi-requirement tasks — a single clause still
+per requirement, and only on multi-requirement tasks, a single clause still
 uses the ordinary read nudge / prefetch path. Gather's SOURCE log itself stays
 append-only; packing evidence is a phase-boundary operation (section 4), so
 the prompt-prefix cache survives the whole lookup loop.
 
-Why it helps: the loop itself is the biggest intelligence win — a ranked map,
+Why it helps: the loop itself is the biggest intelligence win, a ranked map,
 symbol resolution, and bounded lookups get a 4B model to the right 300 lines of
 a 12,000-line project without it having to hold the whole thing in context.
 
@@ -115,7 +115,7 @@ extra cost:
 
 ### 3. Deterministic grounding and verification (free checks)
 
-Before any edit is written — and, in shadow mode, for prose answers too — a set
+Before any edit is written, and, in shadow mode, for prose answers too, a set
 of zero-call checks catches the specific ways small models go wrong:
 
 - **Unread edits.** A SEARCH block that quotes lines the model never `read` is
@@ -130,7 +130,7 @@ of zero-call checks catches the specific ways small models go wrong:
   otherwise, and truncates strictly at whole-line boundaries: the header is
   rewritten to the delivered range and a `Use next_start=… to continue
   reading.` hint tells the model where the cut landed. The ledger records
-  `(start, actual_end)` — not the requested range — so lines that were
+  `(start, actual_end)`, not the requested range, so lines that were
   clipped away are never falsely credited as read, and an edit quoting them
   stays flagged as an unread edit.
 - **Citations.** A `file:line` claim about a file (or line) the model never saw
@@ -147,7 +147,7 @@ of zero-call checks catches the specific ways small models go wrong:
   the post-edit tests/lint) `VERIFIED`. Coverage then warns about the clauses
   whose state never got there, with the state named in the message.
 - **Verdict filter.** When a model *verifier* reports a `DEFECT`, it only counts
-  as an error if the cited file resolves and the line is inside it — a
+  as an error if the cited file resolves and the line is inside it, a
   hallucinating small-model verifier can't feed the repair loop.
 - **Fuzzy-match warnings.** A block that anchored only approximately is flagged
   for review, never silently credited as clean.
@@ -155,7 +155,7 @@ of zero-call checks catches the specific ways small models go wrong:
   and identifier checks run and are *logged only*, never acted on, until they
   prove precise enough to promote.
 
-### 4. Harness initiative — save the model its most error-prone steps
+### 4. Harness initiative: save the model its most error-prone steps
 
 The harness already knows what the task names, so it can fetch it instead of
 making a small model hunt:
@@ -165,7 +165,7 @@ making a small model hunt:
   so the read ledger is populated and edits can quote real source.
 - **Post-gather prefetch** (a narrow P6 trigger). If the model finishes gather
   with named targets still unread, or never read any ranked top-3 file, the
-  harness does *one* extra bounded read before answering — a single expansion,
+  harness does *one* extra bounded read before answering, a single expansion,
   never a new loop.
 - **Requirement completion assist.** On a multi-requirement task, a `done` (or
   a stall exit) with the oldest clause still `UNLOCATED`/`LOCATED` gets one
@@ -201,7 +201,7 @@ The cheapest reliable feedback is the code itself:
   (typically under 5 ms), and repair receives only the parser diagnostic plus a
   single 10-line window around the error. The subprocess check is deferred
   until the patch parses. Because the gate compares before and after, a file
-  that was already broken can still be repaired — only a *new* syntax error
+  that was already broken can still be repaired, only a *new* syntax error
   trips it.
 - **Symbol-anchored incremental edit-verify microloops.** A multi-hunk answer
   is not one atomic gamble. The intent list names each `{file, symbol}` target;
@@ -211,12 +211,12 @@ The cheapest reliable feedback is the code itself:
   with `[EDITED file:symbol]` before the next target. A rejected hunk repairs
   only itself; it cannot poison the hunks that follow. Once every symbol has
   landed, the normal impacted-test and lint verification runs over the whole
-  changed set — so the final gate still judges the combined patch.
+  changed set, so the final gate still judges the combined patch.
 - **Failure-identity diffing.** Pytest's stable node ids (plus a normalized
   assertion signature when no id survives truncation) identify each failure
   across runs. The post-edit run is classified against the pre-edit baseline as
   `new`, `fixed`, `pre-existing`, or `still_failing`. A `new` failure triggers
-  repair even when the total failure count is unchanged or lower — the scalar
+  repair even when the total failure count is unchanged or lower, the scalar
   count cannot see "one old failure fixed, one new failure introduced".
 - **Traceback Repair Packets.** Instead of the last 1,800 characters of raw
   output, repair gets a structured packet: the failing test's node id and
@@ -249,13 +249,13 @@ file rather than a stale multi-file patch.
   stuck.
 - **Best-of-N** (`best_of`, off by default). A weak model may sample a second
   edit reply at higher temperature, both scored deterministically, keeping the
-  best. No majority voting — see below.
+  best. No majority voting, see below.
 
 ### 7. Adaptive defaults from a measured card
 
-`pedacito calibrate` runs a short scripted suite — tool choice, JSON adherence,
+`pedacito calibrate` runs a short scripted suite, tool choice, JSON adherence,
 edit format, planted-injection and honesty, long-context retrieval,
-continuation, a thinking A/B, and capabilities — and stores a per-model card.
+continuation, a thinking A/B, and capabilities, and stores a per-model card.
 The card then picks `prompt_pack`, `answer_mode`, `best_of`, `verify_answer`,
 `tool_mode`, `fuzzy_match`, and `edit_style` *only for settings the user left
 at their default*, with an explicit config value always winning. The direction
@@ -271,8 +271,8 @@ so the repeated re-sends of the gather prefix cost as little as possible.
 
 ### 9. Shallow failure memory
 
-A failed task is remembered as harness facts — what was tried, why, which files
-were touched — and injected (capped, cache-stable) into similar later tasks.
+A failed task is remembered as harness facts, what was tried, why, which files
+were touched, and injected (capped, cache-stable) into similar later tasks.
 The memory is *facts*, not model-written reflection, which a small model would
 get wrong.
 
@@ -280,21 +280,21 @@ get wrong.
 
 `pedacito models scan` + `pedacito profiles` find servers, calibrate models,
 and recommend which profile to use for each role. This matters for small models
-because the highest-leverage trick is often *routing* the hard job — the
-`verifier` or `planner` — to a larger local or hosted model, while the cheap
+because the highest-leverage trick is often *routing* the hard job, the
+`verifier` or `planner`, to a larger local or hosted model, while the cheap
 work stays on the small worker.
 
 ### 11. Content-addressed evidence and append-only rehydration
 
 Two moves that share one mechanism: the harness remembers the *exact bytes* it
-showed the model — hashed — and the only way source reaches the model after
+showed the model, hashed, and the only way source reaches the model after
 gather is by **appending** at the conversation tail.
 
 - **Evidence store.** Every `read`, `context` and prefetch observation is
   parsed *after* the token clip: the displayed lines, stripped of their
   `NNN | ` prefixes, are SHA-256'd and recorded as
   `EvidenceSpan(file, start, end, content_sha, exact_text, read_step)`. The
-  span is content-addressed — its hash pins exactly what the model saw — so
+  span is content-addressed, its hash pins exactly what the model saw, so
   the harness can later prove whether the file moved, instead of trusting the
   model's (or its own) memory of it. Clipped-away lines are never hashed or
   credited: the ledger and the store record the same delivered range.
@@ -309,7 +309,7 @@ gather is by **appending** at the conversation tail.
   0 disables the directive), a few spans per round.
 - **Implicit rehydration.** When the deterministic checks flag an
   unread-region edit or a fuzzy-matched anchor, and the flagged span is
-  covered by — or sits within ±30 lines of — text the store recorded as
+  covered by, or sits within ±30 lines of, text the store recorded as
   *displayed*, the repair prompt automatically gets that region's fresh exact
   bytes appended at its tail before the model is asked to fix the patch. The
   ledger credit means a corrected quote stops reading as a guess on the next
@@ -318,19 +318,19 @@ gather is by **appending** at the conversation tail.
   handed unseen code to copy from.
 
 Why it helps: this is Guiding Constraint #2 applied to the phases after
-gather. A reply that needs one more span gets it — instead of hallucinating a
-quote — and it arrives after the last cached byte, so every earlier byte of
+gather. A reply that needs one more span gets it, instead of hallucinating a
+quote, and it arrives after the last cached byte, so every earlier byte of
 the conversation still rides the server's prompt-prefix cache: the re-ask
 costs a cache hit, not a fresh prefill. It also makes the free checks
 (Constraint #4) self-repairing: an unread-edit finding near real evidence now
 comes with its ground truth instead of only a complaint. Token economy (#1)
-holds because the rehydrated payload is triple-bounded — spans not files,
+holds because the rehydrated payload is triple-bounded, spans not files,
 the read token budget, and round and span caps.
 
 ### 12. Index-driven retrieval: sidecars, candidate-first RRF, skeleton reads
 
 Three upgrades to the indexing layer (chunker / search / semantic / tools),
-each extending Guiding Constraints #1 and #4 — *deterministic first, bounded
+each extending Guiding Constraints #1 and #4, *deterministic first, bounded
 always*:
 
 - **Persisted lexical body sidecar.** BM25 (`search.py`) deliberately refused
@@ -338,25 +338,25 @@ always*:
   ranking that changed depending on whether a chunk happened to have been
   read from disk yet was a determinism bug, not a feature. Instead of giving
   up on body words, chunking (`chunker.py`) now extracts a **bounded lexical
-  sidecar** per unit — split identifier tokens, docstring/comment words,
+  sidecar** per unit, split identifier tokens, docstring/comment words,
   string-literal words (error messages, prompts, config values) and
   config/dict keys, categories capped separately so an identifier-heavy body
-  cannot evict the strings a query would actually look for — and it ships
+  cannot evict the strings a query would actually look for, and it ships
   inside `index.json`. `search.py` scores it as the body field at the
   existing low weight (0.3, behind name 3.0 / sig 1.5), and matched-term
   reasons now see it too. Consequence: `find`, the BM25 miss-suggestions, and
   file-level task ranking can hit an error string, a config key, or an
   internal call name even with `--no-summaries`, and the ranking is
-  **100% hydration-stable** — the sidecar travels with the record, so a
+  **100% hydration-stable**, the sidecar travels with the record, so a
   freshly built index and a reloaded one rank identically. Chunks indexed
   before the sidecar existed simply score no body terms; the next re-chunk
   fills them in.
 - **Candidate-first hybrid retrieval with RRF.** Embeddings used to be a
   last resort that either never fired (any free suggestion suppressed it) or
-  embedded *every* chunk on first use — one no-hit grep cost a pass over the
+  embedded *every* chunk on first use, one no-hit grep cost a pass over the
   whole project. Now a no-hit `grep` first builds a bounded top-K (K = 50)
-  candidate short-list from the *free* matchers — BM25 over names,
-  summaries and the sidecar, similar symbol names, call-graph hits — and
+  candidate short-list from the *free* matchers, BM25 over names,
+  summaries and the sidecar, similar symbol names, call-graph hits, and
   only the query plus those K units are hydrated and embedded. The lexical
   and embedding rankings are merged with **Reciprocal Rank Fusion**
   (`score = Σ 1/(60 + rank)` per list): RRF needs ranks, not comparable
@@ -367,7 +367,7 @@ always*:
   remember-the-permanent-failure behavior (a server without `--embeddings`
   is not retried within a run) are all unchanged. Candidates whose cosine
   falls below `semantic_min_score` are dropped rather than promoted by a
-  lexical vote alone — a pure-name miss is still better served by the free
+  lexical vote alone, a pure-name miss is still better served by the free
   suggestions.
 - **Hierarchical chunks and skeleton views.** Every chunk now persists its
   place in the tree: `parent` (the owning definition of a method), and
@@ -377,8 +377,8 @@ always*:
   whole merged span, so a model can never act on a function's head while
   its tail went unseen, and no extra read step is spent stitching parts.
   **Skeleton view:** when a class or module exceeds the read budget, `read`
-  returns a deterministic AST skeleton — signatures, first docstring lines,
-  and `[lines X-Y]` pointers with every body folded — instead of a truncated
+  returns a deterministic AST skeleton, signatures, first docstring lines,
+  and `[lines X-Y]` pointers with every body folded, instead of a truncated
   first page. The breadcrumb (file, unit, full span, module docstring) is
   printed exactly once and no parent/child source is duplicated. A
   500-line class arrives as ~35 lines of named ranges; the model then reads
@@ -386,7 +386,7 @@ always*:
   come from the index), bounded (row and char caps), and gated behind
   `read_skeleton` (on by default; `false` restores plain truncation).
 
-Why it helps: all three keep the retrieval contract small models depend on —
+Why it helps: all three keep the retrieval contract small models depend on:
 the same query must return the same ranking in the same run *and* across
 runs, every paid step must be bounded, and the output a model re-reads must
 be only what it needs. The sidecar buys body-word recall without importing
@@ -407,7 +407,7 @@ cannot see.
   no docstrings: `class Server [4-9]`, `def start(self) [5-6]`. A whole-class
   chunk is expanded from the Python AST so its methods still get exact ranges;
   a directory or glob keeps the existing file-card view. The output comes
-  entirely from the chunker/AST index — no model call, no source read — so a
+  entirely from the chunker/AST index, no model call, no source read, so a
   several-hundred-line file arrives as a short map that tells the model
   exactly which lines to `read` next.
 - **`usages` is one-step cross-reference.** Given a symbol, it joins the call
@@ -495,8 +495,8 @@ failing strategy forever. Pedacito already has the hard lease
 (`max_no_progress_steps`, §1); this adds its one-shot pre-lease redirect
 (`r = 1`):
 
-- When the no-progress streak reaches `max_no_progress_steps - 1` — one step
-  before hard termination — the harness appends a single high-salience
+- When the no-progress streak reaches `max_no_progress_steps - 1`, one step
+  before hard termination, the harness appends a single high-salience
   `[LOOP GUARD: …]` observation to the conversation. It names the number of
   unproductive steps, forbids repeating the previous search/lookup strategy,
   and suggests a different tool (`outline`/`usages`) on an unread requirement
@@ -515,13 +515,13 @@ failing strategy forever. Pedacito already has the hard lease
 
 These are real methods with real literature behind them. Pedacito rejects them
 not because they never work, but because they cost more than they return for a
-4B–27B model on one GPU — or because a cheaper deterministic substitute already
+4B–27B model on one GPU, or because a cheaper deterministic substitute already
 covers the need.
 
 | Technique | Why not, here |
 |---|---|
 | **Full Chain-of-Verification** (generate verification questions, answer them independently) | Adds calls without new information for *code*: correctness is checkable against source and tests, so the questions just re-derive what the deterministic checks already know. |
-| **Tree / Graph of Thoughts** (branch, score, backtrack) | Too many calls and too much context; a local window can't keep multiple branches alive. The one useful fragment — a second plan on failure — is a small deterministic lint + rescore, not a search tree. |
+| **Tree / Graph of Thoughts** (branch, score, backtrack) | Too many calls and too much context; a local window can't keep multiple branches alive. The one useful fragment, a second plan on failure, is a small deterministic lint + rescore, not a search tree. |
 | **Majority-vote self-consistency** (sample N, take the modal answer) | `best_of` already samples and re-ranks; voting over code *diffs* is brittle, and small-model errors are correlated, so "majority" doesn't buy independence. |
 | **Always-on model self-critique / Reflexion** (the model reviews its own full draft) | Small-model self-critique is unreliable, and re-sending the full draft/source costs tokens and can break the warm prefix. Deterministic checks + one bounded repair cover the same ground more cheaply. |
 | **Model-written reflection notes in memory** | Same unreliability; harness-fact records (what was tried, why) give the benefit without asking the model to write truthful prose about itself. |
@@ -531,5 +531,5 @@ covers the need.
 | **LSP default-on** | External language servers are slow to start and optional; the step-0 prefetch already recovers most of the "go to definition" value without one. |
 
 The through-line: **if a deterministic, harness-side check can answer the
-question, Pedacito uses that before paying for a model call — and it never
+question, Pedacito uses that before paying for a model call, and it never
 spends a call where a small model's own opinion is the weak link.**
