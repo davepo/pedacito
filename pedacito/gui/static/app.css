@@ -261,28 +261,37 @@ textarea { resize: none; background: var(--panel); }
 .placeholder b { color: var(--text); }
 
 /* ---------------------------------------------------------------- top bar -- */
-/* Two rows: row 1 is the project (open/menu) side by side with the global
-   actions (theme/settings/exit); row 2 is the running model state (profile,
-   model chip, calibrate) with index/thread/usage pushed right. */
+/* Two dense rows (Sprint J). Row 1: brand, a compact path box and the open
+   actions against the global ones (Benchmarks / Settings / theme / Exit);
+   its controls share a 30px height. Row 2 is a 28px tinted status strip
+   that only reports state (profile, model + thinking, index, usage, phase)
+   and scrolls sideways instead of wrapping, so it never grows taller. */
 #topbar {
-  display: flex; flex-direction: column; gap: 6px; padding: 8px 12px;
+  display: flex; flex-direction: column; gap: 0; padding: 6px 12px 0;
   background: var(--panel); border-bottom: 1px solid var(--line);
 }
-.tb-row { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; min-width: 0; }
-#tbRow2 { row-gap: 4px; }
-.brand { font-size: 17px; font-weight: 700; letter-spacing: .5px; }
+.tb-row { display: flex; align-items: center; gap: 8px; min-width: 0; }
+#tbRow1 { flex-wrap: wrap; row-gap: 6px; padding-bottom: 6px; }
+#tbRow1 button, #tbRow1 input, #tbRow1 select { height: 30px; }
+#tbRow2 { flex-wrap: nowrap; min-height: 28px; margin: 0 -12px; padding: 1px 12px 3px;
+  background: var(--panel2); border-top: 1px solid var(--line);
+  overflow-x: auto; overflow-y: hidden; scrollbar-width: thin; }
+#tbRow2 button, #tbRow2 select { height: 24px; flex: none; }
+.brand { flex: none; font-size: 16px; font-weight: 700; letter-spacing: .5px; }
 .brand span { color: var(--accent); font-weight: 800; }
-#projectBar { display: flex; align-items: center; gap: 6px; flex: 1 1 420px; min-width: 260px; }
+#projectBar { display: flex; align-items: center; gap: 8px; flex: 1 1 320px; min-width: 0; }
 #projectBar input, #projectBar select { border-color: var(--line); background: var(--panel2); }
-#path { flex: 1 1 160px; min-width: 120px; height: 26px; font-family: var(--mono); font-size: 12px; }
-#recent { max-width: 150px; height: 26px; }
-#profile { max-width: 240px; height: 26px; font-size: 12px; }
-#topRight { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; margin-left: auto; }
-#tbRow2 .tb-right { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; margin-left: auto; }
-#theme { height: 26px; max-width: 120px; font-size: 12px; }
-#topRight button, #tbRow2 button { height: 26px; }
+#path { flex: 0 1 280px; min-width: 140px; max-width: 360px; font-family: var(--mono); font-size: 12px; }
+#topRight { display: flex; align-items: center; gap: 8px; flex: none; margin-left: auto; }
+#tbRow2 .tb-right { display: flex; align-items: center; gap: 8px; flex: none; margin-left: auto; }
+#tbRow2 .chip { flex: none; }
+.tb-label { flex: none; font-size: 10.5px; font-weight: 700; letter-spacing: .5px;
+  text-transform: uppercase; color: var(--muted); }
+#profile { max-width: 220px; font-size: 12px; }
+/* min-width + padding-right keep long option labels ("Trapper Keeper — ...")
+   from clipping under the native dropdown arrow */
+#theme { font-size: 12px; width: auto; min-width: 155px; padding-right: 24px; }
 #settingsBtn { border-color: var(--line); }
-#switchBtn:not(:disabled) { border-color: var(--accent); color: var(--accent); }
 #exitBtn { border-color: var(--line); background: transparent; color: var(--err); }
 #exitBtn:hover { background: var(--err); color: var(--danger-fg); }
 
@@ -292,10 +301,12 @@ textarea { resize: none; background: var(--panel); }
 .chip b { font-weight: 600; min-width: 0; overflow: hidden; text-overflow: ellipsis; }
 .chip .small-text { margin-left: 2px; }
 .chip .tag { flex: none; }
-#indexBox { display: flex; align-items: center; gap: 6px; }
-#modelChip { cursor: pointer; }
-#modelChip:hover, #indexChip:hover, #usageChip:hover { border-color: var(--line2); }
-#threadChip { max-width: 200px; }
+#modelChip { cursor: pointer; max-width: 480px; }   /* long GGUF ids stay readable */
+#indexChip { cursor: pointer; }
+.reidx { font-style: normal; font-size: 13px; line-height: 1; opacity: .55; flex: none; }
+#indexChip:hover:not(:disabled) .reidx { opacity: 1; }
+#modelChip:hover, #indexChip:hover:not(:disabled), #usageChip:hover { border-color: var(--line2); }
+#phaseChip { letter-spacing: .5px; }
 
 .dot { width: 9px; height: 9px; border-radius: 50%; flex: none; display: inline-block; }
 .dot.idle { background: var(--muted); }
@@ -309,7 +320,7 @@ textarea { resize: none; background: var(--panel); }
 .menuwrap { position: relative; display: inline-flex; }
 .menubtn { display: inline-flex; }
 .dropdown { position: absolute; top: calc(100% + 4px); right: 0; z-index: 60;
-  min-width: 230px; background: var(--panel); border: 1px solid var(--line2);
+  min-width: 230px; max-width: min(460px, 86vw); background: var(--panel); border: 1px solid var(--line2);
   border-radius: 8px; box-shadow: var(--shadow); padding: 4px; }
 .menuitem { display: block; width: 100%; text-align: left; border: none;
   background: transparent; border-radius: 5px; padding: 6px 9px; font-size: 12.5px; }
@@ -780,6 +791,10 @@ details pre { background: var(--code-bg); border: 1px solid var(--line); border-
 .note-box { padding: 8px 10px; border: 1px solid var(--line); border-radius: 8px;
   background: var(--panel2); font-size: 12.5px; margin-bottom: 10px; }
 .note-box.err { border-color: var(--err); color: var(--err); white-space: pre-wrap; }
+/* quick-add hosted provider card (Sprint J) — sits above the local scanner */
+.cloud-card { border-color: var(--line2); }
+.cloud-card .form { grid-template-columns: 120px minmax(0, 1fr); gap: 6px 10px; margin-top: 8px; }
+.cloud-card .cc-foot { display: flex; align-items: center; gap: 10px; margin-top: 10px; flex-wrap: wrap; }
 #rawText { width: 100%; height: 50vh; font: 12.5px/1.5 var(--mono); white-space: pre; }
 .setgrp > summary { cursor: pointer; font-weight: 700; padding: 4px 0; font-size: 13px; }
 
@@ -888,9 +903,11 @@ details pre { background: var(--code-bg); border: 1px solid var(--line); border-
 #mobileTabs { display: none; }
 @media (max-width: 980px) {
   body { overflow: auto; }
-  #topbar { gap: 6px; padding: 7px 8px; }
+  #topbar { padding: 5px 8px 0; }
   #projectBar { flex: 1 1 100%; }
+  #path { flex: 1 1 180px; }
   #topRight { flex: 1 1 100%; justify-content: flex-end; }
+  #tbRow2 { margin: 0 -8px; padding: 1px 8px 3px; }
   #app { display: block; flex: 1 1 auto; min-height: 0; }
   #app > .splitter { display: none !important; }
   #app > .panel, #app > .panelcol { display: none !important; margin: 0; border-radius: 0;

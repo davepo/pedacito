@@ -1,14 +1,18 @@
-"""Sprint C: per-project chat threads.
+"""Sprint C: per-project chat threads. Sprint J: friendly default names.
 
 The transcript lives in `<project>/.pedacito/gui/threads/<id>.json` (one file
-per conversation, written atomically), is titled from the first user message,
-restored on restart, and switched from the Chat head via
-`/api/threads/new|select|delete`. No model and no server round-trip needed for
-the pure `core.State` tests; the endpoint tests reuse `gui` from test_gui."""
+per conversation, written atomically). A new chat opens named by the clock
+(`Nov 08, 09:20 PM`), takes its first user question as its title, and a manual
+rename (`title_custom`) is never overwritten again. Threads are restored on
+restart and switched from the Chat head via
+`/api/threads/new|select|delete|rename`. No model and no server round-trip
+needed for the pure `core.State` tests; the endpoint tests reuse `gui` from
+test_gui."""
 # `gui` below is test_gui's server fixture: pytest hands it to each test as a
 # parameter, which ruff otherwise reads as a redefinition.
 # ruff: noqa: F811
 import json
+import re
 import sys
 from pathlib import Path
 
@@ -45,11 +49,20 @@ def test_thread_is_written_per_message_and_titled_from_the_first_question(tmp_pa
 
 def test_thread_title_is_one_collapsed_short_line():
     assert core.thread_title_from("  do   this\n   then that  ") == "do this then that"
-    assert core.thread_title_from("") == core.DEFAULT_THREAD_TITLE
-    assert core.thread_title_from("   \n  ") == core.DEFAULT_THREAD_TITLE
+    # blank input yields "" -- the caller then keeps the timestamp title
+    assert core.thread_title_from("") == ""
+    assert core.thread_title_from("   \n  ") == ""
     long = core.thread_title_from("x" * 200)
     assert len(long) == core.THREAD_TITLE_CHARS + 1      # the ellipsis
     assert long.endswith("\u2026")
+
+
+def test_default_thread_title_is_a_friendly_timestamp():
+    # "Nov 08, 09:20 PM": month/day and 12-hour clock, no year, no seconds
+    from datetime import datetime
+    assert core.default_thread_title(datetime(2026, 11, 8, 21, 20)) == "Nov 08, 09:20 PM"
+    assert re.fullmatch(r"[A-Z][a-z]{2} \d{2}, \d{2}:\d{2} [AP]M",
+                        core.default_thread_title())
 
 
 def test_threads_survive_a_restart(tmp_path):
@@ -123,14 +136,70 @@ def test_new_select_and_delete_threads(tmp_path):
     st.delete_thread(fresh)
 
 
+def test_new_threads_are_timed_stamped_then_titled_then_renamed(tmp_path):
+    """Sprint J contract: timestamp -> first question -> hand-picked name.
+    A rename marks the thread custom and survives a full reload."""
+    from datetime import datetime
+    before = core.default_thread_title(datetime.now())
+    st = core.State()
+    st.set_root(tmp_path)
+    tid = st.thread_id
+    after = core.default_thread_title(datetime.now())
+    # (the two endpoints cover a minute rolling over between the calls)
+    assert st.threads[tid]["title"] in {before, after}
+    assert st.threads[tid]["title_custom"] is False
+    # the first user question becomes the title (still not "custom")
+    st.add_message("user", "why is the ci red?")
+    assert st.threads[tid]["title"] == "why is the ci red?"
+    assert st.threads[tid]["title_custom"] is False
+    # a manual rename collapses whitespace and sticks as custom
+    assert st.rename_thread(tid, "  login   bug \n hunt  ") == "login bug hunt"
+    assert st.threads[tid]["title_custom"] is True
+    # further messages never touch a custom title
+    st.add_message("assistant", "the lint job flakes")
+    assert st.threads[tid]["title"] == "login bug hunt"
+    # persisted to the thread file
+    data = json.loads(_file(tmp_path, tid).read_text(encoding="utf-8"))
+    assert data["title"] == "login bug hunt" and data["title_custom"] is True
+    # ... and survives a fresh State (a GUI restart)
+    fresh = core.State()
+    fresh.set_root(tmp_path)
+    assert fresh.threads[tid]["title"] == "login bug hunt"
+    assert fresh.threads[tid]["title_custom"] is True
+    # clear_messages resets a plain title to the timestamp, never a custom one
+    fresh.clear_messages()
+    assert fresh.threads[tid]["title"] == "login bug hunt"
+    # renames are capped and blanks are refused, for every existing thread too
+    long = st.rename_thread(tid, "y" * 300)
+    assert long == "y" * core.THREAD_RENAME_CHARS
+    assert st.rename_thread(tid, "   ") is None
+    assert st.rename_thread(tid, "login bug hunt") == "login bug hunt"
+    assert st.rename_thread("no-such-thread", "x") is None
+    # renaming another (inactive) thread works and persists as well
+    t2 = st.new_thread()
+    st.add_message("user", "second chat")
+    assert st.select_thread(tid)                         # back to the first one
+    assert st.rename_thread(t2, "quiet side conversation")
+    assert st.threads[t2]["title_custom"] is True
+    assert st.thread_id == tid                           # renaming did not switch
+    again = core.State()
+    again.set_root(tmp_path)
+    assert again.threads[t2]["title"] == "quiet side conversation"
+    st.delete_thread(tid)
+    st.delete_thread(t2)
+
+
 def test_clear_empties_the_thread_but_keeps_its_file(tmp_path):
     st = core.State()
     st.set_root(tmp_path)
     tid = st.thread_id
     st.add_message("user", "wipe me")
+    before = core.default_thread_title()
     st.clear_messages()
+    after = core.default_thread_title()
     assert st.messages == [] and st.thread_id == tid
-    assert st.threads[tid]["title"] == core.DEFAULT_THREAD_TITLE
+    # the question-derived title goes back to a fresh timestamp
+    assert st.threads[tid]["title"] in {before, after}
     assert _file(tmp_path, tid).exists()
     assert json.loads(_file(tmp_path, tid).read_text())["messages"] == []
     st.delete_thread(tid)
@@ -218,4 +287,34 @@ def test_clear_endpoint_keeps_working(gui):
     assert tid in core.STATE.threads               # same chat, blank slate
     _status, state = gui.get("/api/state")
     assert state["active_thread_id"] == tid
-    assert state["thread_title"] == core.DEFAULT_THREAD_TITLE
+    # "hi" is gone: the thread carries a fresh timestamp name again
+    assert re.fullmatch(r"[A-Z][a-z]{2} \d{2}, \d{2}:\d{2} [AP]M",
+                        state["thread_title"])
+    assert state["thread_title_custom"] is False
+
+
+def test_rename_endpoint_round_trip(gui):
+    st = core.STATE
+    st.set_root(gui.tmp)                           # threads need a project folder
+    tid = st.thread_id
+    st.add_message("user", "rename me properly")
+    status, j = gui.post("/api/threads/rename", {"id": tid, "title": "  sprint   J notes \n" })
+    assert status == 200 and j["ok"] and j["title"] == "sprint J notes"
+    assert st.threads[tid]["title_custom"] is True
+    assert any(t["id"] == tid and t["title_custom"] for t in j["threads"])
+    _status, state = gui.get("/api/state")
+    assert state["thread_title"] == "sprint J notes"
+    assert state["thread_title_custom"] is True
+    # persisted to the thread file itself
+    data = json.loads(_file(gui.tmp, tid).read_text(encoding="utf-8"))
+    assert data["title"] == "sprint J notes" and data["title_custom"] is True
+    # a later prompt cannot undo a custom name
+    st.add_message("user", "and check the tests")
+    assert st.threads[tid]["title"] == "sprint J notes"
+    # blanks and unknown ids are refused
+    status, j = gui.post("/api/threads/rename", {"id": tid, "title": "   "})
+    assert status == 400 and j["ok"] is False
+    status, j = gui.post("/api/threads/rename", {"id": "ghost", "title": "x"})
+    assert status == 400 and j["ok"] is False
+    assert st.threads[tid]["title"] == "sprint J notes"   # nothing changed
+    st.delete_thread(tid)

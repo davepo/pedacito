@@ -21,6 +21,7 @@ import threading
 import time
 import uuid
 from collections import deque
+from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -49,12 +50,17 @@ SITE_PHASE = {"gather": "gather", "compaction": "gather", "answer": "edit",
 
 # Chat threads live inside the project: <root>/.pedacito/gui/threads/<id>.json,
 # one readable file per conversation, kept so the GUI can restore the last chat
-# after a restart. Titles are generated locally from the first user message -
-# no extra model call, and the title stays honest because it is literally what
-# the user asked.
+# after a restart. A fresh thread opens under a friendly local timestamp
+# ("Nov 08, 09:20 PM"); once the first request lands, the title becomes that
+# request (one line, short) -- no extra model call, and the title stays honest
+# because it is literally what the user asked. A manual rename sets
+# `title_custom`, and then no automatic update ever touches the name again.
 THREADS_SUBPATH = Path(".pedacito") / "gui" / "threads"
-DEFAULT_THREAD_TITLE = "New conversation"
 THREAD_TITLE_CHARS = 48
+THREAD_TITLE_FORMAT = "%b %d, %I:%M %p"
+# A hand-typed rename is not truncated to a first-message title's 48 chars, but
+# it still gets a sane ceiling (the switcher and the file both stay readable).
+THREAD_RENAME_CHARS = 120
 # Only this many most-recent threads load into memory per project; older files
 # stay on disk untouched.
 MAX_THREADS = 100
@@ -66,11 +72,18 @@ def threads_dir(root) -> Path:
     return Path(root) / THREADS_SUBPATH
 
 
+def default_thread_title(when=None) -> str:
+    """The name a brand-new conversation carries until its first prompt (or a
+    rename): a clean local timestamp, like `Nov 08, 09:20 PM`."""
+    return (when or datetime.now()).strftime(THREAD_TITLE_FORMAT)
+
+
 def thread_title_from(text) -> str:
-    """The auto-title for a conversation: its first request, one line, short."""
+    """The auto-title for a conversation: its first request, one line, short.
+    "" for nothing usable -- the caller then keeps the timestamp title."""
     collapse = re.sub(r"\s+", " ", str(text or "")).strip()
     if not collapse:
-        return DEFAULT_THREAD_TITLE
+        return ""
     if len(collapse) <= THREAD_TITLE_CHARS:
         return collapse
     return collapse[:THREAD_TITLE_CHARS].rstrip() + "…"
@@ -113,9 +126,11 @@ def read_thread_file(path):
         updated = float(data.get("updated_at") or created or 0)
     except (TypeError, ValueError):
         created = updated = time.time()
-    title = str(data.get("title") or "").strip() or DEFAULT_THREAD_TITLE
+    title = str(data.get("title") or "").strip() or default_thread_title()
     return {"id": tid, "title": title, "created_at": created, "updated_at": updated,
-            "profile": str(data.get("profile") or ""), "messages": messages}
+            "profile": str(data.get("profile") or ""),
+            "title_custom": bool(data.get("title_custom")),
+            "messages": messages}
 
 
 def load_thread_records(root):
@@ -439,9 +454,11 @@ class State:
             snap = dict(msg)
             rec = self.threads.get(self.thread_id)
             if role == "user" and rec is not None and \
-                    rec["title"] == DEFAULT_THREAD_TITLE and \
+                    not rec.get("title_custom") and \
                     not any(m["role"] == "user" for m in self.messages[:-1]):
-                rec["title"] = thread_title_from(text)
+                title = thread_title_from(text)
+                if title:
+                    rec["title"] = title
         self.bus.publish("msg_new", msg=snap)
         # a whole new message is always worth persisting; only streaming
         # appends (`append_message`) ride the throttle
@@ -493,8 +510,8 @@ class State:
             self.messages.clear()
             self._mid = 0
             rec = self.threads.get(self.thread_id)
-            if rec is not None:
-                rec["title"] = DEFAULT_THREAD_TITLE
+            if rec is not None and not rec.get("title_custom"):
+                rec["title"] = default_thread_title()
         self.bus.publish("msgs_clear")
         self.save_active_thread(force=True)
         self.bus.publish("status")
@@ -504,9 +521,9 @@ class State:
     def _new_thread_locked(self, profile: str = "") -> dict:
         """Build a fresh unsaved thread record. Caller holds `self.lock`."""
         now = time.time()
-        return {"id": uuid.uuid4().hex, "title": DEFAULT_THREAD_TITLE,
+        return {"id": uuid.uuid4().hex, "title": default_thread_title(),
                 "created_at": now, "updated_at": now, "profile": profile,
-                "messages": []}
+                "title_custom": False, "messages": []}
 
     def _attach_thread(self, rec: dict) -> None:
         """Point the live transcript at a thread record. Caller holds `self.lock`."""
@@ -527,32 +544,27 @@ class State:
                 self.threads[rec["id"]] = rec
                 self._attach_thread(rec)
 
-    def save_active_thread(self, force: bool = False) -> None:
-        """Persist the active thread to `<root>/.pedacito/gui/threads/<id>.json`
-        (atomic write: temp file + rename, so a crash mid-save cannot truncate
-        a conversation). Streaming appends are throttled to ~1/s; the save on
-        job end is forced. The thread follows the project folder: switching to
-        another project never moves these files."""
-        rec = self.threads.get(self.thread_id)
-        if rec is None or not self.root:
+    def _thread_payload_locked(self, rec: dict) -> dict:
+        """The JSON file content for one thread record. Caller holds `lock`
+        (the active record's `messages` IS the live transcript list)."""
+        return {
+            "id": rec["id"],
+            "title": rec["title"],
+            "created_at": rec["created_at"],
+            "updated_at": rec["updated_at"],
+            "profile": rec.get("profile", ""),
+            "title_custom": bool(rec.get("title_custom")),
+            "messages": [{"role": m.get("role"),
+                          "content": str(m.get("text") or ""),
+                          "ts": m.get("time")}
+                         for m in rec["messages"]],
+        }
+
+    def _write_thread_file(self, payload: dict) -> None:
+        """Persist one thread payload atomically (temp file + rename, so a
+        crash mid-save cannot truncate a conversation)."""
+        if not self.root:
             return
-        now = time.monotonic()
-        if not force and (now - self._last_thread_save) < 1.0:
-            return
-        with self.lock:
-            self._last_thread_save = now
-            rec["updated_at"] = time.time()
-            payload = {
-                "id": rec["id"],
-                "title": rec["title"],
-                "created_at": rec["created_at"],
-                "updated_at": rec["updated_at"],
-                "profile": rec.get("profile", ""),
-                "messages": [{"role": m.get("role"),
-                              "content": str(m.get("text") or ""),
-                              "ts": m.get("time")}
-                             for m in self.messages],
-            }
         path = threads_dir(self.root) / (payload["id"] + ".json")
         with self._thread_io:            # serialize writers; never hold `lock` during I/O
             try:
@@ -564,6 +576,44 @@ class State:
             except OSError as exc:
                 sys.stderr.write("[gui] could not save thread %s: %s\n" % (path, exc))
 
+    def save_active_thread(self, force: bool = False) -> None:
+        """Persist the active thread to `<root>/.pedacito/gui/threads/<id>.json`.
+        Streaming appends are throttled to ~1/s; the save on job end is forced.
+        The thread follows the project folder: switching to another project
+        never moves these files."""
+        rec = self.threads.get(self.thread_id)
+        if rec is None or not self.root:
+            return
+        now = time.monotonic()
+        if not force and (now - self._last_thread_save) < 1.0:
+            return
+        with self.lock:
+            self._last_thread_save = now
+            rec["updated_at"] = time.time()
+            payload = self._thread_payload_locked(rec)
+        self._write_thread_file(payload)
+
+    def rename_thread(self, tid: str, title: str) -> str | None:
+        """Give a thread a hand-picked name and mark it `title_custom`, so no
+        automatic title update ever overwrites it again. Persists immediately
+        (also for a thread that is not the active chat). Returns the new title,
+        or None when the thread does not exist / the title is blank."""
+        title = re.sub(r"\s+", " ", str(title or "")).strip()
+        if len(title) > THREAD_RENAME_CHARS:
+            title = title[:THREAD_RENAME_CHARS].rstrip()
+        if not title:
+            return None
+        with self.lock:
+            rec = self.threads.get(tid)
+            if rec is None:
+                return None
+            rec["title"] = title
+            rec["title_custom"] = True
+            payload = self._thread_payload_locked(rec)
+        self._write_thread_file(payload)
+        self.bus.publish("status")
+        return title
+
     def _threads_summary_locked(self) -> list:
         """The project's threads for the switcher, newest updated first.
         Caller holds `self.lock`."""
@@ -571,6 +621,7 @@ class State:
             "id": rec["id"], "title": rec["title"],
             "created_at": rec["created_at"], "updated_at": rec["updated_at"],
             "profile": rec.get("profile", ""),
+            "title_custom": bool(rec.get("title_custom")),
             "message_count": len(rec["messages"]),
             "active": rec["id"] == self.thread_id,
         } for rec in self.threads.values()]
@@ -1030,7 +1081,9 @@ class State:
                 # (see `_load_threads`), so the page can offer "switch back"
                 "active_thread_id": self.thread_id,
                 "thread_title": (self.threads.get(self.thread_id) or {}).get(
-                    "title", DEFAULT_THREAD_TITLE),
+                    "title") or default_thread_title(),
+                "thread_title_custom": bool((self.threads.get(self.thread_id) or
+                                             {}).get("title_custom")),
                 "threads": self._threads_summary_locked(),
                 "needs_setup": not USER_CONFIG.exists(),
                 "context_tokens": cfg.context_tokens if cfg else 0,

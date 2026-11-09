@@ -812,3 +812,166 @@ def known_profiles() -> list[str]:
             _read_text(config_path("user"))))
     except (ConfigError, OSError):
         return []
+
+
+# --- pre-configured hosted provider profiles -------------------------------------
+
+# The major hosted providers, spelled the way Pedacito reaches them: every
+# entry is an OpenAI-compatible chat-completions server (`llm.py` speaks that
+# one protocol, and Anthropic publishes their API behind the same
+# `/v1/chat/completions` surface). `provider` names the vendor for the UI.
+# A preset carries only public facts -- base URL, the env var that holds the
+# key, curated model ids, and a generous context budget. Nothing secret.
+CLOUD_PROVIDERS: tuple[dict, ...] = (
+    {
+        "id": "anthropic", "label": "Claude (Anthropic)", "provider": "anthropic",
+        "base_url": "https://api.anthropic.com/v1",
+        "api_key_env": "ANTHROPIC_API_KEY", "suggest": "claude",
+        "context_tokens": 200000,
+        "models": ["claude-sonnet-4-5", "claude-haiku-4-5", "claude-opus-4-5"],
+    },
+    {
+        "id": "openai", "label": "ChatGPT (OpenAI)", "provider": "openai",
+        "base_url": "https://api.openai.com/v1",
+        "api_key_env": "OPENAI_API_KEY", "suggest": "openai",
+        "context_tokens": 272000,
+        "models": ["gpt-5.4", "gpt-5.4-mini", "o3-mini", "gpt-4.1",
+                   "gpt-4.1-mini"],
+    },
+    {
+        "id": "deepseek", "label": "DeepSeek", "provider": "openai",
+        "base_url": "https://api.deepseek.com/v1",
+        "api_key_env": "DEEPSEEK_API_KEY", "suggest": "deepseek",
+        "context_tokens": 128000,
+        "models": ["deepseek-chat", "deepseek-reasoner"],
+    },
+    {
+        "id": "qwen", "label": "Qwen (DashScope)", "provider": "openai",
+        "base_url": "https://dashscope-intl.aliyuncs.com/compatible-mode/v1",
+        "api_key_env": "DASHSCOPE_API_KEY", "suggest": "qwen",
+        "context_tokens": 256000,
+        "models": ["qwen3-coder-plus", "qwen-max", "qwen-plus", "qwen-flash"],
+    },
+    {
+        "id": "gemini", "label": "Google Gemini", "provider": "openai",
+        "base_url": "https://generativelanguage.googleapis.com/v1beta/openai",
+        "api_key_env": "GEMINI_API_KEY", "suggest": "gemini",
+        "context_tokens": 200000,
+        "models": ["gemini-2.5-pro", "gemini-2.5-flash"],
+    },
+    {
+        "id": "openrouter", "label": "OpenRouter", "provider": "openai",
+        "base_url": "https://openrouter.ai/api/v1",
+        "api_key_env": "OPENROUTER_API_KEY", "suggest": "openrouter",
+        "context_tokens": 200000,
+        "models": ["deepseek/deepseek-chat", "qwen/qwen3-coder",
+                   "anthropic/claude-3.7-sonnet"],
+    },
+)
+
+# Generous gather reads for cloud windows (the `hosted` tier's own budgets are
+# the floor; a pasted key should never have to fight tiny local-model caps).
+_CLOUD_READ_TOKENS = 3000
+
+
+def _preset_by_id(preset_id: str) -> dict:
+    pid = str(preset_id or "").strip().lower()
+    for p in CLOUD_PROVIDERS:
+        if p["id"] == pid:
+            return p
+    raise ConfigError(f"unknown provider preset {preset_id!r}. Use one of: "
+                      + ", ".join(p["id"] for p in CLOUD_PROVIDERS))
+
+
+def provider_presets() -> dict:
+    """`GET /api/providers/presets`: the quick-add catalog for the UI."""
+    return {"presets": [dict(p) for p in CLOUD_PROVIDERS]}
+
+
+# Tokens that add nothing to an auto-suggested profile name: the vendor's own
+# words (the preset's family prefix already says it) and pure version numbers.
+# Keep style words (sonnet, mini, reasoner...) -- `claude-sonnet-4-5` should
+# suggest `claude_sonnet`, not bare `claude`.
+_FAMILY_WORDS = {"claude", "anthropic", "gpt", "chatgpt", "openai",
+                 "deepseek", "qwen", "gemini", "google", "dashscope",
+                 "openrouter", "o3", "o4"}
+
+
+def _preset_profile_suggestion(preset: dict, model: str) -> str:
+    """`claude_sonnet`, `deepseek_chat`, `gemini_flash`...: the preset's short
+    family word plus up to two meaningful tokens of the model id (org paths
+    like `qwen/qwen3-coder` lose the path, version dots lose the numbers)."""
+    family = str(preset.get("suggest") or preset["id"])
+    tail: list[str] = []
+    for tok in re.split(r"[^A-Za-z0-9]+", model):
+        low = tok.lower()
+        if not tok or low in _FAMILY_WORDS or low == family or low.isdigit() \
+                or (low != family and low.startswith(family)):
+            continue
+        tail.append(low)
+        if len(tail) == 2:
+            break
+    if not tail:
+        tail = [re.sub(r"[^A-Za-z0-9]+", "_", model).lower()]
+    return _sanitize_profile_name("_".join([family] + tail)) or family
+
+
+def add_provider_preset(body: dict) -> dict:
+    """One-click hosted provider profile (Sprint J): the preset supplies the
+    base URL, tier, context budgets and provider quirks; the user supplies an
+    API key or the name of an environment variable that holds one. Writes the
+    profile into the config file, reloads STATE, and returns the fresh
+    settings payload so the topbar Profile dropdown can offer it immediately.
+
+    `body`: {preset_id, model?, profile_name?, api_key?, api_key_env?,
+             set_default?, file?}. A pasted key wins over the env var name
+    (`api_key_env` beats `api_key` at request time, so only one is stored)."""
+    body = body or {}
+    preset = _preset_by_id(body.get("preset_id"))
+    model = str(body.get("model") or "").strip() or preset["models"][0]
+    raw_name = str(body.get("profile_name") or "").strip()
+    name = _sanitize_profile_name(
+        raw_name or _preset_profile_suggestion(preset, model))
+    if not name or not PROFILE_NAME_RE.fullmatch(name):
+        raise ConfigError(
+            f"profile name {raw_name!r} must use letters, digits, '-' and "
+            "'_' (starting with a letter or digit, max "
+            f"{_MAX_PROFILE_NAME} characters)")
+    api_key = str(body.get("api_key") or "").strip()
+    api_key_env = str(body.get("api_key_env") or "").strip()
+    if not api_key:
+        api_key_env = api_key_env or preset["api_key_env"]
+    values: dict = {"base_url": preset["base_url"], "model": model,
+                    "tier": "hosted", "json_mode": "object",
+                    "context_tokens": int(preset.get("context_tokens") or 0),
+                    "max_read_tokens": _CLOUD_READ_TOKENS}
+    # The provider table wins for the endpoints whose compatibility differs
+    # from the generic hosted default (Anthropic's OpenAI-compatible surface
+    # rejects json_object and cannot cache).
+    from .. import providers
+    values.update(providers.profile_overrides(preset["base_url"], model))
+    if api_key:
+        values["api_key"] = api_key
+    elif api_key_env:
+        values["api_key_env"] = api_key_env
+    which = "project" if str(body.get("file") or "user") == "project" else "user"
+    path = config_path(which)
+    text = _read_config_text(path)
+    if name in config_editor.profile_names(text):
+        raise ConfigError(f"a profile named '{name}' already exists in {path}")
+    text = config_editor.add_profile(text, name, values)
+    set_default = bool(body.get("set_default"))
+    if set_default:
+        text = settings.set_values(text, {"default_profile": name})
+    write_config(path, text)
+    with STATE.lock:
+        requested = STATE.profile_request
+    # Selecting the new profile is the point of a one-click add only when it
+    # is made the default; otherwise keep the profile the user was running.
+    out = reload_state_config(profile=name if set_default
+                              else (requested or None))
+    out["added"] = name
+    out["preset"] = preset["id"]
+    out["model"] = model
+    out["uses_env"] = bool(api_key_env and not api_key)
+    return out

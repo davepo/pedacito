@@ -1,6 +1,7 @@
 """GUI config editing: schema, validation, and comment-preserving TOML patches."""
 import re
 import sys
+import tomllib
 from pathlib import Path
 
 import pytest
@@ -575,3 +576,97 @@ def test_profile_reasoning_overrides_persist(gui):
         "file": "user", "profile": "default",
         "changes": {"prompt_pack": "giant"}})
     assert status == 400 and "prompt_pack must be one of" in j["detail"]
+
+
+# --- Sprint J: pre-configured hosted provider profiles -------------------------
+# `/api/providers/add` turns one of the six catalog presets into a complete
+# profile; the user only supplies an API key or the env var that holds one.
+
+def test_provider_presets_endpoint_lists_the_major_clouds(gui):
+    status, j = gui.get("/api/providers/presets")
+    assert status == 200
+    assert [p["id"] for p in j["presets"]] == [
+        "anthropic", "openai", "deepseek", "qwen", "gemini", "openrouter"]
+    for p in j["presets"]:
+        assert p["base_url"].startswith("https://")           # real hosted endpoints
+        assert p["api_key_env"].endswith("_API_KEY")          # env fallback named
+        assert p["models"]                                    # curated ids, none empty
+        assert p["context_tokens"] >= 128000                  # generous cloud windows
+        assert "api_key" not in p                             # catalog never holds secrets
+    anthropic = [p for p in j["presets"] if p["id"] == "anthropic"][0]
+    assert anthropic["base_url"] == "https://api.anthropic.com/v1"
+    assert anthropic["models"][0] == "claude-sonnet-4-5"
+
+
+def test_add_preset_creates_a_ready_hosted_profile(gui):
+    status, j = gui.post("/api/providers/add", {
+        "preset_id": "anthropic", "model": "claude-sonnet-4-5",
+        "api_key": "sk-proxy-session-123", "set_default": True})
+    assert status == 200 and j["ok"] and j["added"] == "claude_sonnet"
+    assert j["uses_env"] is False and j["preset"] == "anthropic"
+    body = tomllib.loads(gui.cfg_path.read_text(encoding="utf-8"))
+    assert body["default_profile"] == "claude_sonnet"          # set_default honored
+    prof = body["profiles"]["claude_sonnet"]
+    assert prof["base_url"] == "https://api.anthropic.com/v1"
+    assert prof["model"] == "claude-sonnet-4-5"
+    assert prof["api_key"] == "sk-proxy-session-123"
+    assert "api_key_env" not in prof                           # a pasted key clears the env
+    assert prof["tier"] == "hosted"
+    assert prof["context_tokens"] == 200000
+    assert prof["max_read_tokens"] == 3000                     # cloud gather budgets
+    # Anthropic's OpenAI-compatible surface quirks come from the provider table
+    assert prof["json_mode"] == "schema"
+    assert prof["prompt_cache"] == "off"
+    assert prof["tool_mode"] == "grammar"
+    # STATE reloaded: the profile is selectable right away, no restart
+    _status, st = gui.get("/api/state")
+    assert st["profile"] == "claude_sonnet"
+    assert st["model"] == "claude-sonnet-4-5"
+    assert "claude_sonnet" in st["profiles"]
+    # the settings payload came back too (the modal refreshes from it)
+    assert "claude_sonnet" in j["user"]["profiles"]
+
+
+def test_add_preset_uses_env_var_and_suggests_a_friendly_name(gui):
+    # no key at all: the profile points at the preset's env var instead
+    status, j = gui.post("/api/providers/add", {
+        "preset_id": "openrouter", "model": "qwen/qwen3-coder"})
+    assert status == 200 and j["ok"] and j["uses_env"] is True
+    assert j["added"] == "openrouter_qwen3_coder"   # org path and vendor words drop
+    prof = tomllib.loads(gui.cfg_path.read_text(encoding="utf-8")
+                         )["profiles"]["openrouter_qwen3_coder"]
+    assert prof["api_key_env"] == "OPENROUTER_API_KEY" and "api_key" not in prof
+    assert prof["base_url"] == "https://openrouter.ai/api/v1"
+    assert prof["model"] == "qwen/qwen3-coder"
+    assert prof["json_mode"] == "object"          # generic hosted default stands
+    # an explicit name wins over the suggestion; a non-default add keeps the
+    # previously chosen profile
+    _config(gui)
+    status, j = gui.post("/api/providers/add", {
+        "preset_id": "openai", "profile_name": "gpt-main",
+        "model": "gpt-5.4", "api_key": "sk-openai", "set_default": True})
+    assert status == 200 and j["added"] == "gpt-main"
+    status, j = gui.post("/api/providers/add", {"preset_id": "deepseek", "api_key": "d"})
+    assert status == 200 and j["added"] == "deepseek_chat"
+    body = tomllib.loads(gui.cfg_path.read_text(encoding="utf-8"))
+    assert body["default_profile"] == "gpt-main"              # untouched by the add
+    assert body["profiles"]["deepseek_chat"]["model"] == "deepseek-chat"
+    assert body["profiles"]["deepseek_chat"]["api_key"] == "d"
+    _status, st = gui.get("/api/state")
+    assert st["profile"] == "gpt-main"
+
+
+def test_add_preset_refuses_bad_requests_without_writing(gui):
+    status, j = gui.post("/api/providers/add", {"preset_id": "bogus"})
+    assert status == 400 and j["ok"] is False
+    assert "unknown provider preset" in j["detail"] and "anthropic" in j["detail"]
+    status, j = gui.post("/api/providers/add", {
+        "preset_id": "openai", "profile_name": "!!!"})
+    assert status == 400 and j["ok"] is False
+    assert "profile name" in j["detail"]
+    status, j = gui.post("/api/providers/add", {"preset_id": "openai"})
+    assert status == 200 and j["added"] == "openai_gpt_5_4"   # first: passes
+    status, j = gui.post("/api/providers/add", {"preset_id": "openai"})
+    assert status == 400 and "already exists" in j["detail"]  # duplicate suggestion
+    assert not gui.cfg_path.read_text(encoding="utf-8").count(
+        "[profiles.openai_gpt_5_4]") > 1                      # the refusal wrote nothing

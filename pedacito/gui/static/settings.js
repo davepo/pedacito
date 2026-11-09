@@ -24,6 +24,10 @@
   // switching to another settings tab and back.
   var TUNE = { hardware: 'hosted', model: 'medium', codebase: 'medium',
                priority: 'balanced', result: null, err: '', busy: false };
+  // And for the quick-add hosted provider card (Sprint J): what was typed
+  // survives re-renders; the catalog itself is fetched once.
+  var CLOUD = { presets: null, preset: '', model: '', custom: false, name: '',
+                nameEdited: false, key: '', env: '', def: true, err: '', busy: false };
 
   PDC.openSettings = function (opts) {
     opts = opts || {};
@@ -243,6 +247,133 @@
     if (s.length > 32) s = s.slice(0, 32).replace(/[-_]+$/, '');
     return s;
   }
+  // ----- quick-add hosted provider (Sprint J) ---------------------------------
+  // One card, one API key: the preset carries every public fact (base URL,
+  // curated models, env var, context budget); the server fills in the rest
+  // and reloads the live config, so the new profile is selectable right away.
+  function cloudPreset() {
+    var ps = CLOUD.presets || [];
+    for (var i = 0; i < ps.length; i++) if (ps[i].id === CLOUD.preset) return ps[i];
+    return ps[0] || null;
+  }
+  function loadPresets() {
+    PDC.api('/api/providers/presets').then(function (j) {
+      if (!j.ok || !j.presets) return;
+      CLOUD.presets = j.presets;
+      if (!CLOUD.preset) {
+        var p = cloudPreset();
+        if (p) { CLOUD.preset = p.id; CLOUD.model = p.models[0]; CLOUD.env = p.api_key_env; }
+      }
+      render();
+    });
+  }
+  // Mirrors `settings_api._preset_profile_suggestion`: the preset's family
+  // word plus up to two meaningful model-id tokens (vendor words, bare
+  // version digits and family-prefixed tokens add nothing).
+  var CLOUD_SKIP = { claude: 1, anthropic: 1, gpt: 1, chatgpt: 1, openai: 1, deepseek: 1,
+                     qwen: 1, gemini: 1, google: 1, dashscope: 1, openrouter: 1, o3: 1, o4: 1 };
+  function cloudSuggest(preset, model) {
+    var fam = String(preset.suggest || preset.id).toLowerCase(), tail = [];
+    String(model || '').split(/[^A-Za-z0-9]+/).forEach(function (tok) {
+      if (!tok || tail.length >= 2) return;
+      var low = tok.toLowerCase();
+      if (CLOUD_SKIP[low] || low === fam || /^\d+$/.test(low) ||
+          (low !== fam && low.indexOf(fam) === 0)) return;
+      tail.push(low);
+    });
+    if (!tail.length) tail = [String(model || '').toLowerCase().replace(/[^a-z0-9]+/g, '_')];
+    return sanitizeName([fam].concat(tail).join('_')) || sanitizeName(fam) || preset.id;
+  }
+  function addCloud(p) {
+    if (!p || CLOUD.busy) return;
+    if (!String(CLOUD.model || '').trim()) {
+      CLOUD.err = 'Pick a model (or type its exact id) first.';
+      render();
+      return;
+    }
+    CLOUD.err = ''; CLOUD.busy = true;
+    render();
+    var name = CLOUD.nameEdited ? CLOUD.name : (String(CLOUD.name || '').trim() || cloudSuggest(p, CLOUD.model));
+    PDC.api('/api/providers/add', {
+      preset_id: p.id, model: String(CLOUD.model).trim(), profile_name: name,
+      api_key: CLOUD.key, api_key_env: CLOUD.env, set_default: !!CLOUD.def
+    }).then(function (j) {
+      CLOUD.busy = false;
+      if (!j.ok) { CLOUD.err = j.detail || 'could not add that provider'; render(); PDC.toast(CLOUD.err, true); return; }
+      CLOUD.key = ''; CLOUD.name = ''; CLOUD.nameEdited = false; CLOUD.custom = false;
+      CLOUD.model = p.models[0];
+      X.data = j; X.pending = {}; pickDefaults();
+      PDC.toast('Profile \u201c' + j.added + '\u201d added \u2014 pick it in the topbar any time.');
+      PDC.refreshState();
+      render();
+    });
+  }
+  function cloudCard() {
+    if (CLOUD.presets === null) loadPresets();
+    var box = h('div', { class: 'note-box cloud-card' });
+    if (!CLOUD.presets) { box.appendChild(h('span', { class: 'muted small-text', text: 'Loading the provider catalog\u2026' })); return box; }
+    var p = cloudPreset();
+    if (!p) { box.appendChild(h('span', { class: 'muted small-text', text: 'No provider presets available.' })); return box; }
+    if (!CLOUD.model) CLOUD.model = p.models[0];
+    if (!CLOUD.env) CLOUD.env = p.api_key_env;
+    box.appendChild(h('b', { text: 'Quick-add a hosted provider' }));
+    box.appendChild(h('div', { class: 'muted small-text', style: 'margin-top:2px',
+      text: 'Pick a provider, paste its API key (or name the environment variable that holds it) and add. The base URL, model and cloud-sized budgets are all set for you; only the key is needed.' }));
+    var psel = h('select', {}, CLOUD.presets.map(function (x) {
+      return h('option', { value: x.id, text: x.label });
+    }));
+    psel.value = p.id;
+    psel.addEventListener('change', function () {
+      CLOUD.preset = psel.value; CLOUD.custom = false; CLOUD.err = '';
+      var np = cloudPreset();
+      CLOUD.model = np.models[0]; CLOUD.env = np.api_key_env;
+      if (!CLOUD.nameEdited) CLOUD.name = cloudSuggest(np, CLOUD.model);
+      render();
+    });
+    var msel = h('select', {}, p.models.map(function (m) {
+      return h('option', { value: m, text: m });
+    }).concat([h('option', { value: '__custom__', text: 'Other\u2026 (type the exact id)' })]));
+    msel.value = p.models.indexOf(CLOUD.model) >= 0 ? CLOUD.model : '__custom__';
+    if (msel.value === '__custom__') CLOUD.custom = true;
+    msel.addEventListener('change', function () {
+      if (msel.value === '__custom__') { CLOUD.custom = true; CLOUD.model = ''; }
+      else { CLOUD.custom = false; CLOUD.model = msel.value; }
+      if (!CLOUD.nameEdited) CLOUD.name = cloudSuggest(p, CLOUD.model);
+      render();
+    });
+    var mIn = h('input', { type: 'text', class: 'mono', value: CLOUD.model, autocomplete: 'off', spellcheck: false,
+      placeholder: 'exact model id, e.g. anthropic/claude-3.7-sonnet' });
+    var nIn = h('input', { type: 'text', class: 'mono', value: CLOUD.nameEdited ? CLOUD.name : cloudSuggest(p, CLOUD.model),
+      autocomplete: 'off', spellcheck: false, placeholder: 'profile name' });
+    mIn.addEventListener('input', function () {
+      CLOUD.model = mIn.value.trim();
+      if (!CLOUD.nameEdited) { CLOUD.name = cloudSuggest(p, CLOUD.model); nIn.value = CLOUD.name; }
+    });
+    nIn.addEventListener('input', function () { CLOUD.nameEdited = true; CLOUD.name = nIn.value; });
+    var kIn = h('input', { type: 'password', class: 'mono', value: CLOUD.key, autocomplete: 'off',
+      placeholder: 'paste the API key \u2014 or leave blank to read it from the env var' });
+    kIn.addEventListener('input', function () { CLOUD.key = kIn.value; });
+    var eIn = h('input', { type: 'text', class: 'mono', value: CLOUD.env, autocomplete: 'off',
+      placeholder: p.api_key_env });
+    eIn.addEventListener('input', function () { CLOUD.env = eIn.value.trim(); });
+    var dIn = h('input', { type: 'checkbox', checked: CLOUD.def,
+      onchange: function (e) { CLOUD.def = e.target.checked; } });
+    box.appendChild(h('div', { class: 'form' },
+      h('label', { text: 'Provider' }), psel,
+      h('label', { text: 'Model' }), CLOUD.custom ? h('div', { class: 'row' }, mIn, msel) : msel,
+      h('label', { text: 'Profile name' }), nIn,
+      h('label', { text: 'API key' }), kIn,
+      h('label', { text: 'or env var' }), eIn,
+      h('label', { text: '' }), h('label', { class: 'chk' }, dIn, ' make it the default profile right away')));
+    box.appendChild(h('div', { class: 'cc-foot' },
+      h('button', { class: 'primary', text: CLOUD.busy ? 'Adding\u2026' : '+ Add provider',
+        disabled: CLOUD.busy, onclick: function () { addCloud(p); } }),
+      h('span', { class: 'muted small-text grow',
+        text: 'Saved to the user config and live at once: no restart, and the key never leaves this machine.' })));
+    if (CLOUD.err) box.appendChild(h('div', { class: 'note-box err', style: 'margin:8px 0 0', text: CLOUD.err }));
+    return box;
+  }
+
   function rowKey(r) { return normUrl(r.server_url) + '::' + r.model_id; }
   function pickedRows() { return SCAN.rows.filter(function (r) { return SCAN.pick[rowKey(r)]; }); }
   function groupRows(skey) { return SCAN.rows.filter(function (r) { return normUrl(r.server_url) === skey; }); }
@@ -262,6 +393,9 @@
   function discoveryTab() {
     var f = file(), names = Object.keys(f.profiles || {}).sort();
     var box = h('div', {});
+    box.appendChild(cloudCard());
+    box.appendChild(h('div', { class: 'muted small-text', style: 'margin:0 0 6px',
+      text: 'Local servers \u2014 scan the models running on this machine and import them:' }));
     box.appendChild(scanner());
     box.appendChild(h('div', { class: 'muted small-text', style: 'margin:14px 0 6px', text: 'Profiles in ' + (X.which === 'user' ? 'the user config' : 'this project') + ' \u2014 calibrate the ones you actually use:' }));
     if (!names.length) {

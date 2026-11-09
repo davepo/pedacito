@@ -508,6 +508,20 @@ def _thread_delete(q, body):
     return 200, {"ok": True, "id": STATE.thread_id}
 
 
+@post("/api/threads/rename")
+def _thread_rename(q, body):
+    """Give a thread a hand-picked title (marked custom, so the automatic
+    first-message title never overwrites it). Persisted to its thread file;
+    the response carries the refreshed thread list and full status."""
+    title = STATE.rename_thread(str(body.get("id") or ""),
+                                str(body.get("title") or ""))
+    if title is None:
+        return 400, {"ok": False,
+                     "detail": "No such thread (or the title was empty)."}
+    return 200, {"ok": True, "id": str(body.get("id") or ""), "title": title,
+                 "threads": STATE.threads_summary(), "status": STATE.status()}
+
+
 @post("/api/term_clear")
 def _term_clear(q, body):
     STATE.term_clear()
@@ -668,6 +682,25 @@ def _models_calibrate(q, body):
 @get("/api/profiles")
 def _profiles(q, body=None):
     return 200, settings_api.list_profiles()
+
+
+@get("/api/providers/presets")
+def _provider_presets(q, body=None):
+    """The quick-add catalog: major hosted providers with their base URLs,
+    env-var names and curated model ids (no secrets, no probing)."""
+    return 200, settings_api.provider_presets()
+
+
+@post("/api/providers/add")
+def _provider_add(q, body):
+    """Create one hosted provider profile from a preset: only an API key (or
+    the name of the env var holding it) is needed. Writes the profile, reloads
+    the live config, and returns the fresh settings payload -- the topbar
+    Profile dropdown can select it immediately."""
+    try:
+        return 200, {"ok": True, **settings_api.add_provider_preset(body)}
+    except ConfigError as e:
+        return 400, {"ok": False, "detail": str(e)}
 
 
 # --- built-in model benchmarks -------------------------------------------------

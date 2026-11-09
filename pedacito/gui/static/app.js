@@ -593,6 +593,30 @@ function selectThread(id) {
     swapTranscript();
   });
 }
+function renameThread() {
+  const s = S.status;
+  if (!s.active_thread_id) { PDC.toast('Open a project first.', true); return; }
+  const inp = h('input', { type: 'text', class: 'grow', value: s.thread_title || '',
+                            maxlength: '120', spellcheck: false, autocomplete: 'off',
+                            placeholder: 'a name for this conversation' });
+  const go = () => {
+    const t = (inp.value || '').trim();
+    if (!t) { PDC.toast('A conversation needs a name.', true); return; }
+    PDC.api('/api/threads/rename', { id: s.active_thread_id, title: t }).then((j) => {
+      if (!j.ok) { PDC.toast(j.detail || 'could not rename', true); return; }
+      PDC.toast('Conversation renamed to \u201c' + j.title + '\u201d.');
+      swapTranscript();                     // re-poll: list, status and titles refresh
+    });
+  };
+  const m = PDC.modal('Rename conversation', h('div', {},
+      inp,
+      h('div', { class: 'muted small-text', style: 'margin-top:8px',
+        text: 'Hand-picked names stick: neither the first message nor Clear chat will overwrite this one.' })),
+    [{ label: 'Cancel' }, { label: 'Rename', primary: true, onclick: go }],
+    { narrow: true });
+  inp.addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); m.close(); go(); } });
+  setTimeout(() => { inp.focus(); inp.select(); }, 30);
+}
 function deleteCurrentThread() {
   const s = S.status;
   PDC.confirm('Delete \u201c' + (s.thread_title || 'this conversation') +
@@ -1197,6 +1221,12 @@ function ProfileSelect(props) {           // header dropdown; uncontrolled
 }
 
 function TopBar() {
+  // Two dense rows (Sprint J): row 1 is the project side -- brand, a compact
+  // path box, Browse/Recent/Open and the Project menu -- against the global
+  // actions (Benchmarks, Settings, theme, Exit). Row 2 is a tinted status
+  // strip that only reports: profile picker, model + thinking, index, usage
+  // and the live engine phase. Everything that *does* something to the
+  // project lives in the Project menu, so the strip never needs a resize.
   const s = S.status, j = job();
   const pathRef = useRef(null);
   useEffect(() => {                       // mirror the open project into the
@@ -1207,12 +1237,15 @@ function TopBar() {
     pathRef.current.value.trim() !== s.root && !j;
   const indexed = s.indexed || s.has_index;
   const idxTitle = indexed
-    ? (s.index_time ? 'index from ' + new Date(s.index_time * 1000).toLocaleString() : 'index present')
-    : 'no index yet -- click Index to build one (Shift-click for a quick, no-summaries index)';
+    ? (s.index_time ? 'indexed ' + new Date(s.index_time * 1000).toLocaleString()
+                    : 'index present') + ' \u2014 Click to re-index project (Shift-click for a quick, no-summaries index)'
+    : 'no index yet \u2014 Click to index the project (Shift-click for a quick, no-summaries index)';
   const open = () => openProject((pathRef.current && pathRef.current.value || '').trim(), S.ui.pendingProfile || '');
-  const pending = S.ui.pendingProfile;
-  const canSwitch = pending !== null && pending !== s.profile;
   const activeProf = s.profile || s.default_profile || '';
+  const eng = s.engine || {};
+  const phase = eng.phase || (j ? 'gather' : 'idle');
+  const phaseName = { idle: 'Idle', gather: 'Gathering', edit: 'Editing',
+                      verify: 'Verifying', repair: 'Repairing', done: 'Done' }[phase] || 'Idle';
   return html`
     <header id="topbar">
       <div class="tb-row" id="tbRow1">
@@ -1226,21 +1259,29 @@ function TopBar() {
                   onClick=${() => PDC.browse({ title: 'Choose a project folder',
                     start: ((pathRef.current && pathRef.current.value) || s.root || '').replace(/[\\/][^\\/]*[\\/]$/, ''),
                     pickLabel: 'Open this folder',
-                    onPick: (p) => { if (pathRef.current) pathRef.current.value = p; openProject(p, S.ui.pendingProfile || ''); } })}>Browse…</button>
-          <select id="recent" title="recent projects"
-                  onchange=${(e) => { const v = e.target.value; e.target.value = ''; if (v) { if (pathRef.current) pathRef.current.value = v; openProject(v, ''); } }}>
-            <option value="">recent\u2026</option>
-            ${(s.recent || []).map((r) => html`<option key=${r} value=${r}>${r}</option>`)}
-          </select>
+                    onPick: (p) => { if (pathRef.current) pathRef.current.value = p; openProject(p, S.ui.pendingProfile || ''); } })}>Browse\u2026</button>
+          <${Menu} button=${html`<button id="recent" title="projects you opened here before">Recent \u25BE</button>`}>
+            ${(s.recent || []).length ? (s.recent || []).map((r) => html`
+              <button key=${r} class="menuitem ellip" title=${r}
+                      onClick=${() => { if (pathRef.current) pathRef.current.value = r; openProject(r, ''); }}>${r}</button>`)
+              : html`<button class="menuitem" disabled>no recent projects yet</button>`}
+          <//>
           <button class="primary" id="openBtn" disabled=${!!j} onClick=${open}>Open</button>
-          <${Menu} button=${html`<button id="projMenuBtn" title="index, restore and other project actions">Project ▾</button>`}>
+          <${Menu} button=${html`<button id="projMenuBtn" title="calibrate, index, restore and other project actions">Project \u25BE</button>`}>
+            <${MenuItem} label="Calibrate active profile" disabled=${!!j || !activeProf}
+                       action=${() => calibrateProfile(activeProf)} />
             <${MenuItem} label="Check model (loads it)" disabled=${!!j || !s.root} action=${checkModel} />
+            <${MenuItem} label="Index project (with summaries)" disabled=${!!j || !s.root} action=${() => buildIndex(true)} />
+            <${MenuItem} label="Quick index (no summaries)" disabled=${!!j || !s.root} action=${() => buildIndex(false)} />
             <${MenuItem} label="Restore from a backup\u2026" disabled=${!!j || !(s.snapshots || []).length} action=${restoreDialog} />
+            <${MenuItem} label="Provider settings\u2026" action=${() => callSettings()} />
             <${MenuItem} label="Clear terminal" action=${clearTerm} />
             <${MenuItem} label="Clear chat" action=${() => PDC.api('/api/clear', {})} />
           <//>
         </div>
         <div id="topRight">
+          <button id="benchBtn" title="run a diagnostic benchmark against a configured profile" onClick=${() => openBenchmarks()}>\u25A6 Benchmarks</button>
+          <button id="settingsBtn" title="profiles and settings" onClick=${() => callSettings()}>\u2699 Settings</button>
           <select id="theme" title="color scheme (saved as gui_theme in config.toml)"
                   onchange=${(e) => applyTheme(e.target.value, true)}>
             <optgroup label="Light">
@@ -1259,8 +1300,6 @@ function TopBar() {
               <option value="windbreaker">Windbreaker \u2014 color-block nylon</option>
             </optgroup>
           </select>
-          <button id="benchBtn" title="run a diagnostic benchmark against a configured profile" onClick=${() => openBenchmarks()}>\u25A6 Benchmarks</button>
-          <button id="settingsBtn" title="profiles and settings" onClick=${() => callSettings()}>\u2699 Settings</button>
           <button class="danger" id="exitBtn" title="stop the pedacito gui server"
                   onClick=${() => PDC.confirm('Stop the pedacito gui server? Run "pedacito gui" again to reopen it.', 'Stop server', true).then((ok) => {
                     if (!ok) return;
@@ -1271,15 +1310,12 @@ function TopBar() {
         </div>
       </div>
       <div class="tb-row" id="tbRow2">
+        <label class="tb-label" for="profile">Profile</label>
         <${ProfileSelect} busy=${j} peek=${peekOn ? S.peek : null}
-                          onChange=${(name) => { S.ui.pendingProfile = name; emit(); }} />
-        <button id="switchBtn" class="small" disabled=${!!j || !s.root || !canSwitch}
-                title=${s.root ? 'switch the open project to the profile picked above'
-                               : 'remembered: applied when you open a project'}
-                onClick=${() => { if (s.root) switchProfile(pending === null ? '' : pending); }}>Switch</button>
-        <button id="calibrateBtn" class="small" disabled=${!!j || !activeProf}
-                title=${'quick-calibrate "' + (activeProf || '') + '" (measured scores and limits go into its model card; output streams to the terminal)'}
-                onClick=${() => calibrateProfile(activeProf)}>Calibrate</button>
+                          onChange=${(name) => {          // one pick = switch now;
+                            if (s.root) switchProfile(name);   // no project: remembered for Open
+                            else { S.ui.pendingProfile = name; emit(); }
+                          }} />
         <span class="chip" id="modelChip"
               title=${(s.model_status || 'click to check the model server') + (s.base_url ? '\n' + s.base_url : '') + (s.context_tokens ? '\nwindow ' + PDC.fmtInt(s.context_tokens) + ' tokens (' + s.context_origin + ')' : '')}
               onClick=${() => { if (s.root && !j) checkModel(); }}>
@@ -1290,25 +1326,21 @@ function TopBar() {
                                        : 'thinking is allowed (disable_thinking = false) \u2014 turn it off in Settings \u2192 Profiles'}>${s.disable_thinking ? 'no-think' : 'thinking'}</span>` : null}
         </span>
         <div class="tb-right">
-          <div id="indexBox">
-            <span class="chip" id="indexChip" title=${idxTitle}>
-              <i class=${'dot ' + (indexed ? 'ok' : 'idle')}></i>
-              <b>${indexed ? 'indexed' : 'no index'}</b>
-              ${indexed ? html`<span class="muted small-text">${PDC.fmtInt(s.index_files)} files \u00B7 ${PDC.fmtInt(s.index_chunks)} units</span>` : null}
-            </span>
-            <button id="indexBtn" class="small" disabled=${!!j || !s.root}
-                    onClick=${(e) => buildIndex(!e.shiftKey)}>Index</button>
-          </div>
-          ${s.root ? html`<span class="chip" id="threadChip"
-            title=${'active conversation: ' + (s.thread_title || '') + ' \u2014 switch threads in the Chat panel'}>
-            <b class="ellip">${s.thread_title || 'chat'}</b>
-          </span>` : null}
+          <button class="chip" id="indexChip" title=${idxTitle} disabled=${!!j || !s.root}
+                  onClick=${(e) => { if (s.root && !j) buildIndex(!e.shiftKey); }}>
+            <i class=${'dot ' + (indexed ? 'ok' : 'idle')}></i>
+            <b>${indexed ? 'indexed' : 'no index'}</b>
+            ${indexed ? html`<span class="muted small-text">${PDC.fmtInt(s.index_files)} files \u00B7 ${PDC.fmtInt(s.index_chunks)} units</span>` : null}
+            <i class="reidx" aria-hidden="true">\u21BB</i>
+          </button>
           ${(s.usage && s.usage.calls) ? html`
             <span class="chip" id="usageChip" title=${'model usage this session (' + Math.round(s.usage.seconds) + 's)'}>
               <b>${s.usage.calls + ' calls \u00B7 ' + PDC.fmtTokens(s.usage.tokens_in) + ' in / ' + PDC.fmtTokens(s.usage.tokens_out) + ' out'
                 + (s.usage.cache_hit ? ' \u00B7 cache ' + Math.round(s.usage.cache_hit * 100) + '%' : '')
                 + (s.usage.cost ? ' \u00B7 $' + Number(s.usage.cost).toFixed(4) : '')}</b>
             </span>` : null}
+          <span class=${'phase ' + phase} id="phaseChip"
+                title=${'engine phase' + (j ? ' of the running job' : '')}>${phaseName}</span>
         </div>
       </div>
     </header>`;
@@ -2157,10 +2189,12 @@ function App() {
                     value=${s.active_thread_id || ''} disabled=${!!s.job}
                     onchange=${(e) => selectThread(e.target.value)}>
               ${(s.threads || []).map((t) => html`
-                <option key=${t.id} value=${t.id}>${t.title} \u00b7 ${t.message_count} msg${t.message_count === 1 ? '' : 's'}</option>`)}
+                <option key=${t.id} value=${t.id}>${t.title_custom ? '\u270E ' : ''}${t.title} \u00b7 ${t.message_count} msg${t.message_count === 1 ? '' : 's'}</option>`)}
             </select>
             <button class="ghost small" id="newThread" title="start a new conversation (this one stays saved in the project)"
                     disabled=${!!s.job} onClick=${newThread}>+ New</button>
+            <button class="ghost small" id="renameThreadBtn" title=${'rename \u201c' + (s.thread_title || 'this conversation') + '\u201d'}
+                    disabled=${!!s.job || !s.active_thread_id} onClick=${renameThread}>Rename</button>
             <button class="ghost small danger" id="delThread" title="delete this conversation and its saved thread"
                     disabled=${!!s.job} onClick=${deleteCurrentThread}>Delete</button>
             <button class="ghost small" id="clearChat" title="clear the conversation"
