@@ -784,9 +784,14 @@ decisions the guards cannot make:
   until the GUI answers: **Allow Once**, **Allow for This Run**, **Always Allow**
   (which flips the matching setting, such as `enable_web`), or **Deny & Redirect**.
   A denial returns a message that keeps the run going. No answer (a timeout or
-  Stop) counts as a denial. Plain CLI runs have no broker, so a gated tool reports
-  that it is disabled in the config instead of waiting for a person who is not
-  there.
+  Stop) counts as a denial. Two hosts install this broker: the GUI (its dialog
+  answers the parked worker) and `pedacito rpc` (§31), which turns the same four
+  answers into JSONL frames -- a `permission_request` event carries the
+  category, the action and a `request_id`, a `permission_reply` request decides
+  it, and **Always Allow** flips the matching setting for the live session only,
+  never persisted to the user's config. Plain one-shot CLI runs have no broker,
+  so a gated tool reports that it is disabled in the config instead of waiting
+  for a person who is not there.
 
 The guards cost no model tokens. The broker costs only the human's time, and it is
 reached only for an action the deterministic checks could not settle.
@@ -1078,13 +1083,28 @@ asked to do that no model needs to do at all.
   file that the rename would break refuses the whole run. A `before_write(rel,
   path)` hook lets a caller permission-gate or snapshot each file just before
   the write pass, which is how the tool layer's task allowlist and the CLI's
-  backups plug in.
-- **Name-based on purpose.** This renames an *identifier*, so a parameter in an
-  unrelated function that happens to share the name moves too; that is what a
-  project-wide rename means, and the diff preview shows it before anything is
-  written. It is deliberately distinct from the older index-aware `rename`
-  action, which resolves a single definition, refuses ambiguity, and rewrites
-  only that symbol's declaration and its known callers.
+  backups plug in. The guarantee also holds *during* the write pass: a failed
+  snapshot or an OSError (full disk, permission flip) part-way through restores
+  every file already written in that batch from the pre-rename text still held
+  in memory. The same undo ledger guards the multi-file edit path
+  (`edits.apply_edits`): block three of five failing to land never leaves a
+  half-applied tree, not even a file created and then abandoned.
+- **Name-based, or receiver-qualified.** The engine above renames an
+  *identifier*, so a parameter in an unrelated function that happens to share
+  the name moves too; that is what a project-wide rename means, and the diff
+  preview shows it before anything is written. The index-aware `rename` action
+  is the careful sibling: a bare name resolves only when exactly one definition
+  exists anywhere (methods included -- they are matched through their class
+  chunk's member list), and it can also take a qualified query, `Store.save`.
+  There the rename follows *types* through the AST: the definition, `self.save`
+  inside that class, static `Store.save`/`pkg.Store.save` access, and `x.save`
+  where `x` is deterministically bound to `Store` by constructor assignment or
+  annotation -- the same `_local_types` evidence the Sprint 4 call graph uses
+  (§12). A receiver typed to another class, an untyped one, or a bare name
+  outside the class is listed in the reply as deliberately *not renamed*, and
+  files that construct the class are pulled into scope even without importing
+  its module. Receiver tracking is Python-only: elsewhere the qualified query
+  warns and falls back to the whole-word pass.
 
 Three surfaces, one engine: the agent action `rename_symbol` (offered only when
 `allow_write` is on, and registered as a mutating action so the task loop's
@@ -1289,7 +1309,64 @@ listing budget per server, and one permission dialog per call to an
 untrusted server. The legacy command-list path is untouched and both formats
 coexist.
 
-## Quick reference: techniques 5, 11, 22 to 30
+---
+
+### 31. Bidirectional stdio JSONL-RPC: a warm engine an editor can drive
+
+`ask --jsonl` already proves the engine can narrate itself as events, but it is
+one-shot: every request pays for process start, index load, profile negotiation,
+and a cold session with no history. An editor plugin or a peer agent wants the
+opposite -- one long-lived process, machine-readable in and out, interruptible
+mid-task. `pedacito rpc [PROJECT]` (equivalently `pedacito chat --rpc`) is that
+transport, in `pedacito/rpc.py`.
+
+- **Two pure streams.** stdin takes one JSON request per line
+  (`{"id": ..., "method": ..., "params": {...}}`); stdout emits *only* JSONL
+  frames. `RpcOut` owns the real stdout, and the CLI immediately rebinds
+  `sys.stdout` to stderr, so any forgotten human-facing print lands on a
+  diagnostic channel instead of corrupting the protocol. A tee event line that
+  does not round-trip as JSON is dropped to stderr, never passed through raw.
+- **The tee is the transport.** `RpcOut` doubles as `EventLog.tee`: the engine
+  already writes its events as JSON lines, so the RPC layer re-parses them,
+  tags each with the active request's `req_id`, counts the engine's terminal
+  `result` frame, and adds its own compact summary only when the engine emitted
+  none. Every method closes with an `rpc_response` carrying both `id` and the
+  `ok`/`result`/`error` triple -- the stream never ends mid-task.
+- **Warm across requests.** The index, the model profiles and the session
+  ledger (and with them the prompt cache of §8) persist; `switch_profile`
+  rebuilds the client in place, re-attaches the event log, and answers with
+  the new model's label -- refused while a task runs, and rolled back on a bad
+  reference. The workspace run-lock is taken lazily at the first request that
+  would write (`ask` with `apply`), so read-only sessions never block a plain
+  `pedacito ask`.
+- **A busy session is still reachable.** Task methods run on a worker thread
+  while the main thread keeps reading stdin, so `steer`, `permission_reply` and
+  `cancel` land mid-task. Steering pushes into the same queue the loop drains at
+  a step boundary -- appended state, no history rewrite, cache-safe. `cancel`
+  stops the task and keeps the process (and everything warm in it) alive. One
+  task runs at a time; a second `ask` is refused with a `busy:` error, not a
+  deadlock.
+- **The permission broker, framed** (§21). The same hook the GUI dialog rides
+  is installed for stdio: a gated tool publishes a `permission_request` frame
+  (`request_id`, category, action, risk, `turn_id`) and parks in 0.5 s beats
+  until `permission_reply` answers `allow_once`, `allow_run`, `allow_always` or
+  `deny`. A session-scoped cache keyed by `(category, action-key)` makes
+  repeated identical tools silent; **Always Allow** flips the matching setting
+  (web → `allow_fetch`, shell → `allow_shell`, ...) on the live config only --
+  never persisted -- so a trusted run can go quiet without editing files. No
+  answer by `--permission-timeout` (default 120 s), a cancel, or stdin EOF
+  denies, exactly like the GUI's Stop.
+- **EOF is a flush, not an abort.** If the client hangs up mid-task, `serve()`
+  keeps the process alive until the worker's reply and its `rpc_response` have
+  been written (`EOF_JOIN_GRACE`), denying any permission the task parks on for
+  want of a responder and cancelling only a task that outstays the grace.
+
+Cost: no model calls, no new prompt shapes -- the price is transport discipline
+(one JSON object per line, stdout purity, injected closures for everything the
+CLI knows). That discipline is what makes the server unit-testable: the tests
+drive `RpcServer` with fakes over `io.StringIO` and never spawn a process.
+
+## Quick reference: techniques 5, 11, 22 to 31
 
 | Technique | Section | How to turn it off | Where you see it |
 |---|---|---|---|
@@ -1306,6 +1383,7 @@ coexist.
 | Scout/architect routing | §28 | `scout_profile = ""` | `scout_profile` in Settings. The top bar shows a `Scout: <profile>` badge |
 | Local payload acceleration | §29 | `enable_prompt_cache = false`, `enable_prompt_lookup = false` | Automatic on local endpoints only. `cache_prompt` / `prompt_lookup_num_tokens` appear in the request payload (`log_events` shows calls) |
 | Pruned MCP bridge (`mcp_call`) | §30 | `enable_mcp = false` | A gather action, offered only when a tool matches. `pedacito mcp list`. Permission dialog category **MCP Tool** |
+| Warm stdio JSONL-RPC (`pedacito rpc`) | §31 | None. Run `pedacito rpc PROJ` or `pedacito chat --rpc`; `--permission-timeout` paces the broker | One JSON request per line on stdin, pure JSONL on stdout, events tagged `req_id`. Protocol documented in `pedacito/rpc.py` |
 
 ## Techniques that exist but are not a good fit
 

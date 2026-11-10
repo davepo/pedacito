@@ -1161,6 +1161,20 @@ def apply_edits(root: Path, edits: list[Edit], backup: bool = True,
                     if n == rel and (root_resolved / o).is_file())
     }
 
+    results_before = len(results)   # rollback truncates Results back to here
+    undo: list = []                 # (rel, restore-fn) for EVERY mutation below
+
+    def _reverter(p: Path, data: bytes | None):
+        """Undo closure: put `p` back exactly as it was before a mutation --
+        rewrite the captured bytes, or remove a file that did not exist."""
+        def _undo():
+            if data is None:
+                if p.is_file():
+                    p.unlink()
+            else:
+                p.write_bytes(data)
+        return _undo
+
     def _finish(rel: str, path: Path, original: str | None, text: str, style,
                 note: str, fuzzy: bool = False,
                 renames_from: tuple[str, ...] = ()) -> Result:
@@ -1243,336 +1257,364 @@ def apply_edits(root: Path, edits: list[Edit], backup: bool = True,
             try:
                 if backup:
                     _backup(opath, old)
+                _pre = opath.read_bytes() if opath.is_file() else None
                 opath.unlink()
+                if _pre is not None:
+                    undo.append((old, _reverter(opath, _pre)))
             except FileNotFoundError:
                 pass
 
         path.parent.mkdir(parents=True, exist_ok=True)
+        _pre = path.read_bytes() if path.is_file() else None
         fileio.write(path, text, style)
+        undo.append((rel, _reverter(path, _pre)))
         return Result(True, rel, note, diff, moved_original, text, sha,
                       fuzzy=fuzzy, renames_from=renames_from)
 
-    for rel, group in by_file.items():
-        path = _resolve_inside(rel)
-        if path is None:
-            results.append(Result(False, rel, "refusing to edit outside project root"))
-            continue
-        if path.is_dir():
-            results.append(Result(False, rel, "this path is a directory, not a file"))
-            continue
+    try:
+        for rel, group in by_file.items():
+            path = _resolve_inside(rel)
+            if path is None:
+                results.append(Result(False, rel, "refusing to edit outside project root"))
+                continue
+            if path.is_dir():
+                results.append(Result(False, rel, "this path is a directory, not a file"))
+                continue
 
-        if rel in orphan_placeholders:
-            results.append(Result(False, rel, _ORPHAN_CREATE_MSG))
-            continue
-        if orphan_placeholders and all(not e.replace.strip() for e in group) \
-                and any(e.search.strip() for e in group):
-            # The other half of a refused placeholder pair: applying it would
-            # delete lines from the live source with no destination written.
-            results.append(Result(
-                False, rel,
-                "not applying this clearing block: it looks like the other "
-                "half of a rename whose new path was refused (placeholder "
-                "creation with no matching source). Emit the rename pair "
-                "again with both blocks -- the old path's SEARCH quoting a "
-                "few real lines, the new path's SEARCH empty."))
-            continue
+            if rel in orphan_placeholders:
+                results.append(Result(False, rel, _ORPHAN_CREATE_MSG))
+                continue
+            if orphan_placeholders and all(not e.replace.strip() for e in group) \
+                    and any(e.search.strip() for e in group):
+                # The other half of a refused placeholder pair: applying it would
+                # delete lines from the live source with no destination written.
+                results.append(Result(
+                    False, rel,
+                    "not applying this clearing block: it looks like the other "
+                    "half of a rename whose new path was refused (placeholder "
+                    "creation with no matching source). Emit the rename pair "
+                    "again with both blocks -- the old path's SEARCH quoting a "
+                    "few real lines, the new path's SEARCH empty."))
+                continue
 
-        # A rename source equal to the target itself would read the placeholder
-        # back as "moved content" and delete it.
-        srcs = tuple(o for o, n in renames.items() if n == rel and o != rel)
+            # A rename source equal to the target itself would read the placeholder
+            # back as "moved content" and delete it.
+            srcs = tuple(o for o, n in renames.items() if n == rel and o != rel)
 
-        # A group of only empty-SEARCH blocks is a creation or an overwrite
-        # (a path can be both a rename source and a creation target). Anchored
-        # blocks are line replacements and never part of this path.
-        creating = [e for e in group
-                    if not e.search.strip() and not _is_anchored(e)]
-        if creating and len(creating) == len(group):
-            original = None
-            if path.is_file():
-                original, _sty = fileio.read(path, errors="replace")
-            text = _creation_text(group)
-            note = f"created with {len(text.splitlines())} line(s)"
-            if original is not None:
-                note = f"replaced contents ({len(original.splitlines())} -> {len(text.splitlines())} line(s))"
-            # Claim only sources that still exist at apply time.
-            srcs_now = tuple(o for o in srcs if (root_resolved / o).is_file())
-            gone = [o for o in srcs if o not in srcs_now]
-            if original is not None and not srcs_now:
-                # Overwriting an existing file with model-composed whole-file
-                # content is the edit-path twin of the `write` action, so it
-                # gets the same fragment guard (a window re-quote from a
-                # partial read would silently erase the rest of the file).
-                # A rename target is exempt: its real content arrives from
-                # the moved source, not from the REPLACE text.
-                refusal = fragment_refusal(rel, original, text)
-                if refusal:
-                    results.append(Result(False, rel, refusal))
-                    continue
-            if srcs_now:
-                note += (" -- renamed from " + ", ".join(srcs_now) +
-                         " (the moved contents are appended after the new "
-                         "text; the old paths are removed)")
-            if gone:
-                note += (" [already absent, nothing to move: " +
-                         ", ".join(gone) + "]")
-            results.append(_finish(rel, path, original, text, None, note,
-                                   renames_from=srcs_now))
-            continue
+            # A group of only empty-SEARCH blocks is a creation or an overwrite
+            # (a path can be both a rename source and a creation target). Anchored
+            # blocks are line replacements and never part of this path.
+            creating = [e for e in group
+                        if not e.search.strip() and not _is_anchored(e)]
+            if creating and len(creating) == len(group):
+                original = None
+                if path.is_file():
+                    original, _sty = fileio.read(path, errors="replace")
+                text = _creation_text(group)
+                note = f"created with {len(text.splitlines())} line(s)"
+                if original is not None:
+                    note = f"replaced contents ({len(original.splitlines())} -> {len(text.splitlines())} line(s))"
+                # Claim only sources that still exist at apply time.
+                srcs_now = tuple(o for o in srcs if (root_resolved / o).is_file())
+                gone = [o for o in srcs if o not in srcs_now]
+                if original is not None and not srcs_now:
+                    # Overwriting an existing file with model-composed whole-file
+                    # content is the edit-path twin of the `write` action, so it
+                    # gets the same fragment guard (a window re-quote from a
+                    # partial read would silently erase the rest of the file).
+                    # A rename target is exempt: its real content arrives from
+                    # the moved source, not from the REPLACE text.
+                    refusal = fragment_refusal(rel, original, text)
+                    if refusal:
+                        results.append(Result(False, rel, refusal))
+                        continue
+                if srcs_now:
+                    note += (" -- renamed from " + ", ".join(srcs_now) +
+                             " (the moved contents are appended after the new "
+                             "text; the old paths are removed)")
+                if gone:
+                    note += (" [already absent, nothing to move: " +
+                             ", ".join(gone) + "]")
+                results.append(_finish(rel, path, original, text, None, note,
+                                       renames_from=srcs_now))
+                continue
 
-        if not path.exists():
-            # A missing file can only be created by empty-SEARCH blocks; a
-            # mix with real searches is a failed edit against a file that is
-            # not in the tree. The message must say so: "file not found"
-            # alone invites the model to answer by renaming files.
-            hint = ""
-            if path.parent.is_dir():
-                try:
-                    near = sorted(p.name for p in path.parent.iterdir()
-                                  if p.is_file())[:8]
-                except OSError:
-                    near = []
-                if near:
-                    hint = f" Files here: {', '.join(near)}."
-            results.append(Result(
-                False, rel,
-                "no edit matched: this path does not exist yet. To CREATE "
-                "the file, emit exactly one block for it with an EMPTY "
-                "SEARCH section (between <<<<<<< SEARCH and =======). "
-                "To RENAME a file into this path, also emit a block for "
-                "the old path whose SEARCH is its entire content and "
-                "whose REPLACE is empty -- Pedacito will move the real "
-                "contents and remove the old file." + hint))
-            continue
+            if not path.exists():
+                # A missing file can only be created by empty-SEARCH blocks; a
+                # mix with real searches is a failed edit against a file that is
+                # not in the tree. The message must say so: "file not found"
+                # alone invites the model to answer by renaming files.
+                hint = ""
+                if path.parent.is_dir():
+                    try:
+                        near = sorted(p.name for p in path.parent.iterdir()
+                                      if p.is_file())[:8]
+                    except OSError:
+                        near = []
+                    if near:
+                        hint = f" Files here: {', '.join(near)}."
+                results.append(Result(
+                    False, rel,
+                    "no edit matched: this path does not exist yet. To CREATE "
+                    "the file, emit exactly one block for it with an EMPTY "
+                    "SEARCH section (between <<<<<<< SEARCH and =======). "
+                    "To RENAME a file into this path, also emit a block for "
+                    "the old path whose SEARCH is its entire content and "
+                    "whose REPLACE is empty -- Pedacito will move the real "
+                    "contents and remove the old file." + hint))
+                continue
 
-        # The path's blocks apply IN ORDER, each anchored against the text the
-        # previous one produced; the file is written (or refused) once at the end.
-        try:
-            original, style = fileio.read(path, errors="strict")
-        except UnicodeDecodeError:
-            results.append(Result(False, rel, "file is not valid UTF-8; "
-                                  "refusing to edit it as text"))
-            continue
-        except OSError as e:
-            results.append(Result(False, rel, f"could not read file: {e}"))
-            continue
-        text = original
-        failed = False
-        fuzzy_blocks: list[int] = []
-        already: list[int] = []       # blocks whose REPLACE is already on disk
-        # Anchored blocks resolve to (a, b) here for failure messages, and
-        # are rewritten to exact-text needles taken from the ORIGINAL file,
-        # so an earlier block in the same group cannot shift their lines and
-        # an externally drifted file still matches via locate()/fuzzy.
-        anchored: dict[int, tuple[int, int]] = {}
-        for k, e in enumerate(group, 1):
-            if _is_anchored(e):
-                converted = False
-                if not e.lines and (e.symbol or e.insert_after):
-                    # Zero-anchor splice (or a SYMBOL header no index
-                    # resolved): locate the definition's exact span from the
-                    # AST/tree-sitter, right now, on the current bytes.
-                    sym = e.symbol or e.insert_after
-                    span = locate_symbol_span(path, sym)
-                    if span is None:
-                        results.append(Result(
-                            False, rel,
-                            f"block {k}: SYMBOL anchor '{sym}' could not be "
-                            "located in this file (missing, ambiguous, or the "
-                            "file does not parse); check the spelling against "
-                            "an `outline`, or `read` the symbol and emit the "
-                            "block with LINES <start>-<end> instead"))
-                        failed = True
-                        break
-                    s0, e0, base_ind = span
-                    body = normalise_symbol_indent(e.replace, base_ind)
-                    if e.insert_after:
-                        lspan = _line_span(original, s0, e0)
+            # The path's blocks apply IN ORDER, each anchored against the text the
+            # previous one produced; the file is written (or refused) once at the end.
+            try:
+                original, style = fileio.read(path, errors="strict")
+            except UnicodeDecodeError:
+                results.append(Result(False, rel, "file is not valid UTF-8; "
+                                      "refusing to edit it as text"))
+                continue
+            except OSError as e:
+                results.append(Result(False, rel, f"could not read file: {e}"))
+                continue
+            text = original
+            failed = False
+            fuzzy_blocks: list[int] = []
+            already: list[int] = []       # blocks whose REPLACE is already on disk
+            # Anchored blocks resolve to (a, b) here for failure messages, and
+            # are rewritten to exact-text needles taken from the ORIGINAL file,
+            # so an earlier block in the same group cannot shift their lines and
+            # an externally drifted file still matches via locate()/fuzzy.
+            anchored: dict[int, tuple[int, int]] = {}
+            for k, e in enumerate(group, 1):
+                if _is_anchored(e):
+                    converted = False
+                    if not e.lines and (e.symbol or e.insert_after):
+                        # Zero-anchor splice (or a SYMBOL header no index
+                        # resolved): locate the definition's exact span from the
+                        # AST/tree-sitter, right now, on the current bytes.
+                        sym = e.symbol or e.insert_after
+                        span = locate_symbol_span(path, sym)
+                        if span is None:
+                            results.append(Result(
+                                False, rel,
+                                f"block {k}: SYMBOL anchor '{sym}' could not be "
+                                "located in this file (missing, ambiguous, or the "
+                                "file does not parse); check the spelling against "
+                                "an `outline`, or `read` the symbol and emit the "
+                                "block with LINES <start>-<end> instead"))
+                            failed = True
+                            break
+                        s0, e0, base_ind = span
+                        body = normalise_symbol_indent(e.replace, base_ind)
+                        if e.insert_after:
+                            lspan = _line_span(original, s0, e0)
+                            if lspan is None:
+                                results.append(Result(
+                                    False, rel,
+                                    f"block {k}: symbol '{sym}' resolved to lines "
+                                    f"{s0}-{e0}, which are out of bounds in this "
+                                    "file; `read` it again"))
+                                failed = True
+                                break
+                            needle = original[lspan[0]:lspan[1]]
+                            if not needle.strip():
+                                results.append(Result(
+                                    False, rel,
+                                    f"block {k}: symbol '{sym}' spans only blank "
+                                    "lines; nothing to anchor an insert after"))
+                                failed = True
+                                break
+                            repl = needle
+                            if body.strip():
+                                if not repl.endswith("\n"):
+                                    repl += "\n"
+                                repl += body + "\n"
+                            anchored[k] = (s0, e0)
+                            e = Edit(e.file, needle, repl)
+                            converted = True
+                        else:
+                            e = Edit(e.file, e.search, body,
+                                     lines=(s0, e0), symbol=sym)
+                    if not converted:
+                        if not e.lines:
+                            results.append(Result(
+                                False, rel,
+                                f"block {k}: SYMBOL anchor '{e.symbol}' could not "
+                                "be resolved to a definition in this file; `read` "
+                                "the symbol and emit the block with "
+                                "LINES <start>-<end> instead"))
+                            failed = True
+                            break
+                        a, b = e.lines
+                        lspan = _line_span(original, a, b)
                         if lspan is None:
                             results.append(Result(
                                 False, rel,
-                                f"block {k}: symbol '{sym}' resolved to lines "
-                                f"{s0}-{e0}, which are out of bounds in this "
-                                "file; `read` it again"))
+                                f"block {k}: line range {a}-{b} is out of bounds "
+                                f"-- this file has {len(original.splitlines())} "
+                                "line(s); `read` it again and emit current line "
+                                "numbers"))
                             failed = True
                             break
+                        anchored[k] = (a, b)
                         needle = original[lspan[0]:lspan[1]]
                         if not needle.strip():
+                            # A blank-lines-only needle would fall into the
+                            # empty-SEARCH whole-text branch below; refuse instead.
                             results.append(Result(
                                 False, rel,
-                                f"block {k}: symbol '{sym}' spans only blank "
-                                "lines; nothing to anchor an insert after"))
+                                f"block {k}: line range {a}-{b} is only blank "
+                                "lines -- widen the anchored range to include "
+                                "real code so it can be located"))
                             failed = True
                             break
-                        repl = needle
-                        if body.strip():
-                            if not repl.endswith("\n"):
-                                repl += "\n"
-                            repl += body + "\n"
-                        anchored[k] = (s0, e0)
+                        repl = e.replace
+                        if e.symbol:
+                            # A SYMBOL-anchored body written at the wrong base
+                            # indent (the habitual column-0 `def` for a class
+                            # method) is re-aligned to the definition's real
+                            # indent; the range's first line is the target level.
+                            # Idempotent for a body already written at the right
+                            # depth.
+                            repl = normalise_symbol_indent(repl, _indent_of_line(
+                                original, a))
+                            # Decorators are part of the definition's identity:
+                            # carry them over when the new body does not re-echo
+                            # them, so forgetting `@staticmethod` cannot silently
+                            # change behaviour. An empty REPLACE deletes the whole
+                            # definition, decorators included.
+                            decs = _leading_decorators(original, a, b)
+                            if decs and repl.strip() \
+                                    and not repl.lstrip().startswith("@"):
+                                repl = "\n".join(decs) + "\n" + repl
+                        if repl and needle.endswith("\n") and not repl.endswith("\n"):
+                            repl += "\n"
+                        # A LINES range that covers the whole file is a whole-file
+                        # replacement, even though its SEARCH text is non-empty.
+                        # The fragment guard must cover this shape too: the model
+                        # can otherwise dodge it by sending `LINES 1-N` with an
+                        # empty replacement instead of an empty SEARCH (test_1a
+                        # O7: a 214-line src/main.js was reduced to 52 lines this
+                        # way after the `write` action had already refused the
+                        # same fragment).
+                        total_lines = len(original.splitlines())
+                        if a <= 1 and b >= total_lines:
+                            whole = repl if not repl or repl.endswith("\n") \
+                                else repl + "\n"
+                            refusal = fragment_refusal(rel, text, whole)
+                            if refusal:
+                                results.append(Result(False, rel,
+                                                      f"block {k}: {refusal}"))
+                                failed = True
+                                break
                         e = Edit(e.file, needle, repl)
-                        converted = True
+                if not e.search.strip():
+                    # An empty SEARCH mixed in with real edits replaces the WHOLE
+                    # text that later blocks anchor against. That replacement is
+                    # model-composed whole-file content, so it gets the same
+                    # fragment guard the `write` action applies.
+                    whole = e.replace if not e.replace or e.replace.endswith("\n") \
+                        else e.replace + "\n"
+                    refusal = fragment_refusal(rel, text, whole)
+                    if refusal:
+                        results.append(Result(False, rel, f"block {k}: {refusal}"))
+                        failed = True
+                        break
+                    text = whole
+                    continue
+                span = locate(text, e.search, cfg, replacement=e.replace)
+                if span is None:
+                    n = text.count(e.search)
+                    if n == 0 and _replace_already_present(
+                            text, e.replace, allow_single=bool(already)):
+                        # The block was already applied -- typically a gather
+                        # write landed it before the answer phase, so the SEARCH
+                        # no longer matches but the REPLACE content is on disk.
+                        # Score it clean instead of failing the whole file.
+                        already.append(k)
+                        continue
+                    if k in anchored:
+                        a, b = anchored[k]
+                        why = (f"anchored range LINES {a}-{b} cannot be applied: "
+                               + ("an earlier block in this reply already changed "
+                                  "those lines" if n == 0 else
+                                  f"its text appears {n} times in the file -- "
+                                  "widen the range until it is unique, or emit a "
+                                  "SEARCH block with more context"))
                     else:
-                        e = Edit(e.file, e.search, body,
-                                 lines=(s0, e0), symbol=sym)
-                if not converted:
-                    if not e.lines:
-                        results.append(Result(
-                            False, rel,
-                            f"block {k}: SYMBOL anchor '{e.symbol}' could not "
-                            "be resolved to a definition in this file; `read` "
-                            "the symbol and emit the block with "
-                            "LINES <start>-<end> instead"))
-                        failed = True
-                        break
-                    a, b = e.lines
-                    lspan = _line_span(original, a, b)
-                    if lspan is None:
-                        results.append(Result(
-                            False, rel,
-                            f"block {k}: line range {a}-{b} is out of bounds "
-                            f"-- this file has {len(original.splitlines())} "
-                            "line(s); `read` it again and emit current line "
-                            "numbers"))
-                        failed = True
-                        break
-                    anchored[k] = (a, b)
-                    needle = original[lspan[0]:lspan[1]]
-                    if not needle.strip():
-                        # A blank-lines-only needle would fall into the
-                        # empty-SEARCH whole-text branch below; refuse instead.
-                        results.append(Result(
-                            False, rel,
-                            f"block {k}: line range {a}-{b} is only blank "
-                            "lines -- widen the anchored range to include "
-                            "real code so it can be located"))
-                        failed = True
-                        break
-                    repl = e.replace
-                    if e.symbol:
-                        # A SYMBOL-anchored body written at the wrong base
-                        # indent (the habitual column-0 `def` for a class
-                        # method) is re-aligned to the definition's real
-                        # indent; the range's first line is the target level.
-                        # Idempotent for a body already written at the right
-                        # depth.
-                        repl = normalise_symbol_indent(repl, _indent_of_line(
-                            original, a))
-                        # Decorators are part of the definition's identity:
-                        # carry them over when the new body does not re-echo
-                        # them, so forgetting `@staticmethod` cannot silently
-                        # change behaviour. An empty REPLACE deletes the whole
-                        # definition, decorators included.
-                        decs = _leading_decorators(original, a, b)
-                        if decs and repl.strip() \
-                                and not repl.lstrip().startswith("@"):
-                            repl = "\n".join(decs) + "\n" + repl
-                    if repl and needle.endswith("\n") and not repl.endswith("\n"):
-                        repl += "\n"
-                    # A LINES range that covers the whole file is a whole-file
-                    # replacement, even though its SEARCH text is non-empty.
-                    # The fragment guard must cover this shape too: the model
-                    # can otherwise dodge it by sending `LINES 1-N` with an
-                    # empty replacement instead of an empty SEARCH (test_1a
-                    # O7: a 214-line src/main.js was reduced to 52 lines this
-                    # way after the `write` action had already refused the
-                    # same fragment).
-                    total_lines = len(original.splitlines())
-                    if a <= 1 and b >= total_lines:
-                        whole = repl if not repl or repl.endswith("\n") \
-                            else repl + "\n"
-                        refusal = fragment_refusal(rel, text, whole)
-                        if refusal:
-                            results.append(Result(False, rel,
-                                                  f"block {k}: {refusal}"))
-                            failed = True
-                            break
-                    e = Edit(e.file, needle, repl)
-            if not e.search.strip():
-                # An empty SEARCH mixed in with real edits replaces the WHOLE
-                # text that later blocks anchor against. That replacement is
-                # model-composed whole-file content, so it gets the same
-                # fragment guard the `write` action applies.
-                whole = e.replace if not e.replace or e.replace.endswith("\n") \
-                    else e.replace + "\n"
-                refusal = fragment_refusal(rel, text, whole)
-                if refusal:
-                    results.append(Result(False, rel, f"block {k}: {refusal}"))
+                        why = ("search block not found -- it must match the file "
+                               "exactly. If this block was meant to replace the "
+                               "WHOLE file, do not quote the old text at all: emit "
+                               "one block for the file with an EMPTY SEARCH section "
+                               "(nothing between <<<<<<< SEARCH and =======)"
+                               if n == 0 else
+                               f"search block appears {n} times -- include more "
+                               "surrounding lines")
+                        if n == 0:
+                            # Show where the text most nearly matches, with real
+                            # line numbers, so the re-anchor is copyable.
+                            why += _closest_hint(text, e.search, cfg)
+                    results.append(Result(False, rel, f"block {k}: {why}"))
                     failed = True
                     break
-                text = whole
-                continue
-            span = locate(text, e.search, cfg, replacement=e.replace)
-            if span is None:
-                n = text.count(e.search)
-                if n == 0 and _replace_already_present(
-                        text, e.replace, allow_single=bool(already)):
-                    # The block was already applied -- typically a gather
-                    # write landed it before the answer phase, so the SEARCH
-                    # no longer matches but the REPLACE content is on disk.
-                    # Score it clean instead of failing the whole file.
+                if _replace_already_present(text, e.replace, span.start):
+                    # The replacement already sits verbatim at the matched span:
+                    # a repair round re-emitted an append-style block whose
+                    # content landed in an earlier round. Applying again would
+                    # duplicate it (the triple-appended test pair), so score the
+                    # block as already applied.
                     already.append(k)
                     continue
-                if k in anchored:
-                    a, b = anchored[k]
-                    why = (f"anchored range LINES {a}-{b} cannot be applied: "
-                           + ("an earlier block in this reply already changed "
-                              "those lines" if n == 0 else
-                              f"its text appears {n} times in the file -- "
-                              "widen the range until it is unique, or emit a "
-                              "SEARCH block with more context"))
-                else:
-                    why = ("search block not found -- it must match the file "
-                           "exactly. If this block was meant to replace the "
-                           "WHOLE file, do not quote the old text at all: emit "
-                           "one block for the file with an EMPTY SEARCH section "
-                           "(nothing between <<<<<<< SEARCH and =======)"
-                           if n == 0 else
-                           f"search block appears {n} times -- include more "
-                           "surrounding lines")
-                    if n == 0:
-                        # Show where the text most nearly matches, with real
-                        # line numbers, so the re-anchor is copyable.
-                        why += _closest_hint(text, e.search, cfg)
-                results.append(Result(False, rel, f"block {k}: {why}"))
-                failed = True
-                break
-            if _replace_already_present(text, e.replace, span.start):
-                # The replacement already sits verbatim at the matched span:
-                # a repair round re-emitted an append-style block whose
-                # content landed in an earlier round. Applying again would
-                # duplicate it (the triple-appended test pair), so score the
-                # block as already applied.
-                already.append(k)
+                text = text[:span.start] + span.replacement + text[span.stop:]
+                if span.fuzzy:
+                    fuzzy_blocks.append(k)
+
+            if failed:
                 continue
-            text = text[:span.start] + span.replacement + text[span.stop:]
-            if span.fuzzy:
-                fuzzy_blocks.append(k)
 
-        if failed:
-            continue
+            if text == original and already:
+                # Every block was already applied: nothing to write. Rewriting
+                # the identical bytes would still count the file as changed
+                # (backup, reindex, post-edit hooks) for nothing.
+                results.append(Result(
+                    True, rel,
+                    "no change: block(s) "
+                    + ", ".join(str(b) for b in already)
+                    + " already applied -- their REPLACE content is present in "
+                      "the file"))
+                continue
 
-        if text == original and already:
-            # Every block was already applied: nothing to write. Rewriting
-            # the identical bytes would still count the file as changed
-            # (backup, reindex, post-edit hooks) for nothing.
-            results.append(Result(
-                True, rel,
-                "no change: block(s) "
-                + ", ".join(str(b) for b in already)
-                + " already applied -- their REPLACE content is present in "
-                  "the file"))
-            continue
+            note = f"applied {len(group)} block(s)"
+            if already:
+                note += (" [block(s) " + ", ".join(str(b) for b in already)
+                         + " already applied -- content present, left as-is]")
+            if fuzzy_blocks:
+                note += (" [matched approximately on block"
+                         + ("s " if len(fuzzy_blocks) > 1 else " ")
+                         + ", ".join(str(b) for b in fuzzy_blocks)
+                         + "; review the diff carefully]")
+            results.append(_finish(rel, path, original, text, style, note,
+                                   fuzzy=bool(fuzzy_blocks)))
 
-        note = f"applied {len(group)} block(s)"
-        if already:
-            note += (" [block(s) " + ", ".join(str(b) for b in already)
-                     + " already applied -- content present, left as-is]")
-        if fuzzy_blocks:
-            note += (" [matched approximately on block"
-                     + ("s " if len(fuzzy_blocks) > 1 else " ")
-                     + ", ".join(str(b) for b in fuzzy_blocks)
-                     + "; review the diff carefully]")
-        results.append(_finish(rel, path, original, text, style, note,
-                               fuzzy=bool(fuzzy_blocks)))
+    except OSError as exc:
+        # all-or-nothing batch: without this, a disk or permission failure
+        # mid-write left the files already written changed while the rest of
+        # the batch never ran -- a half-applied working tree. Undo every
+        # mutation this call made (newest first), then report ONE failed
+        # Result: the per-file outcomes above no longer describe the tree.
+        del results[results_before:]
+        total, undone = len(undo), 0
+        for _desc, fn in reversed(undo):
+            try:
+                fn()
+                undone += 1
+            except OSError:
+                pass
+        undo.clear()
+        msg = (f"write batch failed: {exc}; rolled back {undone} of {total} "
+               "file mutation(s) to their pre-batch state")
+        if undone != total:
+            msg += (f"; {total - undone} could not be restored -- run "
+                    "`pedacito restore`")
+        results.append(Result(False, "*", msg))
 
     return results

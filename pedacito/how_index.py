@@ -359,11 +359,51 @@ CLI_COMMANDS = [
             {"flag": "--no-review", "help": "never open the reviewer"},
             {"flag": "--resume",
              "help": "seed the first task with the newest chat checkpoint"},
+            {"flag": "--rpc", "help": "speak the JSONL-RPC protocol instead "
+                                      "of prose (see `pedacito rpc`)"},
         ],
         "notes": [
             "/profile NAME switches model profile; /model ID switches model",
             "/apply on|off toggles writes; /steps N sets the lookup cap",
             "/status, /cost, /memory, /skills, /profiles, /quit",
+            "--rpc turns the same warm session into a machine protocol",
+        ],
+        "common": True,
+    },
+    {
+        "name": "rpc",
+        "usage": "pedacito rpc [PROJECT] [--permission-timeout SECONDS]",
+        "summary": "Interactive JSONL-RPC over stdin/stdout for editors and "
+                   "other agents: one JSON request per line "
+                   '({"id":1,"method":"status"}), every stdout line is one '
+                   "JSON frame (human diagnostics go to stderr), and the "
+                   "index, the profiles and the session ledger stay warm "
+                   "across requests. Methods: ask (streams the task's "
+                   "events tagged with req_id), explain, steer (a note for "
+                   "the running task), permission_reply, cancel, "
+                   "switch_profile, status. `pedacito chat --rpc` runs the "
+                   "same protocol inside the chat command.",
+        "keywords": ["rpc", "jsonl", "json", "stdio", "stdin", "stdout",
+                     "editor", "machine client", "protocol", "integrate",
+                     "stream events", "permission request", "steer",
+                     "warm session"],
+        "examples": [
+            "pedacito rpc ~/code/app",
+            "echo '{\"id\":1,\"method\":\"status\"}' | pedacito rpc ~/code/app",
+            "pedacito chat ~/code/app --rpc",
+        ],
+        "flags": [
+            {"flag": "--permission-timeout SECONDS",
+             "help": "how long a gated tool waits for a permission_reply "
+                     "before it is denied (default 120)"},
+        ],
+        "notes": [
+            "stdout is 100% valid JSONL; nothing human-facing ever lands there",
+            "one task at a time: a second ask gets a busy: error, while "
+            "steer, cancel and permission_reply still reach the running one",
+            "stdin EOF flushes the active task's reply before the process "
+            "exits; cancel keeps the session warm",
+            "protocol details: pedacito/rpc.py; rationale: TECHNIQUES.md §31",
         ],
         "common": True,
     },

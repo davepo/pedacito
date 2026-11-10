@@ -78,6 +78,161 @@ def _rename_python(text: str, old: str, new: str) -> tuple[str, int]:
     return "\n".join(lines), len(hits)
 
 
+def _rename_python_receiver(text: str, old: str, new: str, class_path: str
+                            ) -> tuple[str, int, list[str]]:
+    """Receiver-aware Python rename for the qualified query `class_path.old`.
+
+    Renames only the sites that provably refer to THAT class's member:
+
+      * the definition (`def old(...)` inside the target class);
+      * `self.old` / `cls.old` / `this.old` within the target class body;
+      * static access through the class name (`Store.old`, `pkg.Store.old`);
+      * `x.old(...)` when `x` is deterministically bound to the class in an
+        enclosing scope (`x = Store(...)`, `x: Store`, `def f(x: Store)`) --
+        the same constructor/annotation evidence the Sprint 4 call graph uses.
+
+    Everything else -- a bare `old` outside the class, `y.old` on a receiver
+    typed to ANOTHER class, or an untyped/dynamic receiver -- is skipped and
+    described in the returned list instead of being renamed on a guess.
+    Returns `(new_text, count, skipped_descriptions)`; count -1 when the file
+    does not parse. String literals and comments can never be hit: the AST
+    does not contain them."""
+    import ast
+    from .chunker import _local_types
+
+    leaf = class_path.rsplit(".", 1)[-1]
+    target_def = f"{class_path}.{old}"
+    try:
+        tree = ast.parse(text)
+    except (SyntaxError, ValueError):
+        return text, -1, []
+    lines = text.split("\n")
+    hits: list[tuple[int, int, int]] = []          # (row, col0, col1)
+    skips: list[str] = []
+
+    def add_attr(a: ast.Attribute) -> None:
+        """Queue the attribute NAME token of `x.old` (right-aligned span)."""
+        row, col1 = a.end_lineno, a.end_col_offset
+        col0 = col1 - len(old)
+        ln = lines[row - 1]
+        if ln[col0:col1] == old and not (col0 > 0
+                                         and (ln[col0 - 1].isalnum()
+                                              or ln[col0 - 1] == "_")):
+            hits.append((row, col0, col1))
+
+    def add_def(fn) -> None:
+        row = fn.lineno
+        ln = lines[row - 1]
+        col = ln.find(old, fn.col_offset)
+        if col >= 0 and (ln[col + len(old):col + len(old) + 1]
+                         in ("", "(", " ", ":")):
+            hits.append((row, col, col + len(old)))
+
+    def expr_path(node) -> str:
+        """Dotted path of a pure Name/Attribute expression, else ''."""
+        parts = []
+        while isinstance(node, ast.Attribute):
+            parts.append(node.attr)
+            node = node.value
+        if not isinstance(node, ast.Name):
+            return ""
+        parts.append(node.id)
+        return ".".join(reversed(parts))
+
+    class Walk(ast.NodeVisitor):
+        def __init__(self):
+            self.cls: list[str] = []          # class qualname stack
+            self.vmaps: list[dict] = [_local_types(tree)]  # scope type maps
+
+        def in_target(self) -> bool:
+            return bool(self.cls) and self.cls[-1] == class_path
+
+        def lookup(self, name: str) -> str:
+            for m in reversed(self.vmaps):
+                if name in m:
+                    return m[name]
+            return ""
+
+        def visit_Attribute(self, node: ast.Attribute) -> None:
+            self.generic_visit(node)
+            if node.attr != old:
+                return
+            row = node.end_lineno
+            path = expr_path(node.value)
+            if path in ("self", "cls", "this"):
+                if self.in_target():
+                    add_attr(node)
+                else:
+                    skips.append(f"line {row}: `self.{old}` belongs to "
+                                 f"{self.cls[-1] or 'module level'}, not "
+                                 f"{class_path}")
+                return
+            if not path:
+                skips.append(f"line {row}: dynamic receiver `(...).{old}`")
+                return
+            segs = path.split(".")
+            if segs[-1] == leaf:
+                add_attr(node)              # static: Store.old / pkg.Store.old
+            elif len(segs) == 1:
+                t = self.lookup(segs[0])
+                if t == leaf:
+                    add_attr(node)          # x typed to the class by binding
+                elif t:
+                    skips.append(f"line {row}: `{segs[0]}.{old}` is on "
+                                 f"{t}, not {leaf}")
+                else:
+                    skips.append(f"line {row}: `{segs[0]}.{old}` has an "
+                                 "untyped receiver (name it `x: "
+                                 f"{leaf}` or rename with edit blocks)")
+            else:
+                skips.append(f"line {row}: `{path}.{old}` is not on "
+                             f"{class_path}")
+
+        def visit_Name(self, node: ast.Name) -> None:
+            if node.id == old:
+                if self.in_target():
+                    hits.append((node.lineno, node.col_offset,
+                                 node.col_offset + len(old)))
+                else:
+                    skips.append(f"line {node.lineno}: bare `{old}` outside "
+                                 f"{class_path} (it names something else)")
+            self.generic_visit(node)
+
+        def visit_ClassDef(self, node: ast.ClassDef) -> None:
+            self.cls.append((self.cls[-1] + "." if self.cls else "")
+                             + node.name)
+            self.vmaps.append(_local_types(node))
+            self.generic_visit(node)
+            self.cls.pop()
+            self.vmaps.pop()
+
+        def _fn(self, node) -> None:
+            if node.name == old:
+                qual = (self.cls[-1] + "." if self.cls else "") + node.name
+                if qual == target_def:
+                    add_def(node)
+                else:
+                    skips.append(f"line {node.lineno}: another `{old}` "
+                                 f"definition ({qual})")
+            self.vmaps.append(_local_types(node))
+            self.generic_visit(node)
+            self.vmaps.pop()
+
+        visit_FunctionDef = _fn
+        visit_AsyncFunctionDef = _fn
+
+    Walk().visit(tree)
+    n = 0
+    for row, c0, c1 in sorted(hits, reverse=True):
+        ln = lines[row - 1]
+        if ln[c0:c1] != old:
+            continue
+        lines[row - 1] = ln[:c0] + new + ln[c1:]
+        n += 1
+    return "\n".join(lines), n, skips
+
+
+
 _COMMENT_STARTS = {".py": "#", ".rb": "#", ".sh": "#"}
 
 
@@ -344,8 +499,24 @@ def rename_symbol_across_project(root, old_name: str, new_name: str,
                 return fail(f"{err}; nothing written.")
 
     if not dry_run:
-        for rel, (_before, after, _n, style) in changes.items():
-            fileio.write(root / rel, after, style)
+        written: list[str] = []
+        try:
+            for rel, (_before, after, _n, style) in changes.items():
+                fileio.write(root / rel, after, style)
+                written.append(rel)
+        except OSError as e:
+            restored = 0
+            for rel in written:
+                try:
+                    fileio.write(root / rel, changes[rel][0], changes[rel][3])
+                    restored += 1
+                except OSError:
+                    pass
+            return fail(f"write failed mid-rename ({e}); restored "
+                        f"{restored} of {len(written)} already-written "
+                        "file(s)"
+                        + ("" if restored == len(written)
+                           else " -- `pedacito restore` can finish the job"))
 
     return {"ok": True,
             "files_modified": sorted(changes),
@@ -432,33 +603,105 @@ def tool_rename(index, cfg, old: str, new: str, file: str = "") -> str:
         return f"ERROR: `{new}` is not a valid identifier."
     if base_old == base_new:
         return "ERROR: the old and new names are the same."
-    defs = [c for c in index.find_symbol(old)
-            if c.kind != "module" and c.qualname.split("#")[0].split(".")[-1] == base_old]
-    if file:
-        rel = index.resolve_file(file)
-        defs = [c for c in defs if c.file == rel]
-    if not defs:
-        return (f"ERROR: no definition named `{old}` in the index. `find` it "
-                "first.")
-    # every definition sharing the bare name, anywhere
-    same = [c for c in index.chunks if c.kind not in ("module", "reference")
-            and c.qualname.split("#")[0].split(".")[-1] == base_old
-            and c.qualname.split("#")[0] != "module"]
-    homes = {(c.file, c.qualname.split("#")[0]) for c in same}
-    if len(homes) > 1:
-        listing = ", ".join(f"{f}:{q}" for f, q in sorted(homes)[:6])
-        return (f"ERROR: `{base_old}` is defined in {len(homes)} places "
-                f"({listing}); a mechanical rename would touch the wrong "
-                "ones. Rename with edit blocks, or pass `file` ... and use "
-                "unique names.")
-    if any(c.qualname.split("#")[0].split(".")[-1] == base_new
-           for c in index.chunks if c.kind not in ("module", "reference")):
+    qualified = "." in old
+    class_path = old.rsplit(".", 1)[0] if qualified else ""
+    if qualified:
+        # the dotted query is a QUALNAME, and methods live in their class
+        # chunk's `members` (not as chunks of their own) -- the class homes
+        # resolved below supply `defs`.
+        defs: list = []
+    else:
+        defs = [c for c in index.find_symbol(old)
+                if c.kind != "module"
+                and c.qualname.split("#")[0].split(".")[-1] == base_old]
+        if file:
+            rel = index.resolve_file(file)
+            defs = [c for c in defs if c.file == rel]
+        if not defs:
+            return (f"ERROR: no definition named `{old}` in the index. "
+                    "`find` it first.")
+    warnings: list[str] = []
+    if qualified:
+        # a qualified query is disambiguated by RECEIVER, not by bare-name
+        # uniqueness: `Store.save` is unique even when `Other.save` exists,
+        # because the rename pass can tell the receivers apart. A module-
+        # prefixed query (`pkg.Store.save`) falls back to its class suffix.
+        for cp in ([class_path] +
+                   ([class_path.rsplit(".", 1)[-1]]
+                    if "." in class_path else [])):
+            homes_q = {(c.file, cp) for c in index.chunks
+                       if c.kind in ("class", "classheader")
+                       and c.qualname.split("#")[0] == cp
+                       and base_old in (getattr(c, "members", None) or [])}
+            if homes_q:
+                class_path = cp
+                break
+        else:
+            homes_q = set()
+        if len(homes_q) > 1:
+            listing = ", ".join(f"{f}:{q}" for f, q in sorted(homes_q)[:6])
+            return (f"ERROR: `{class_path}.{base_old}` is defined in "
+                    f"{len(homes_q)} places ({listing}); a mechanical rename "
+                    "would touch the wrong ones. Rename with edit blocks.")
+        if not homes_q:
+            return (f"ERROR: the index has no `{class_path}.{base_old}` "
+                    "definition to rename (is the class name spelled as the "
+                    "index sees it?).")
+        defs = [c for c in index.chunks
+                if c.kind in ("class", "classheader")
+                and (c.file, c.qualname.split("#")[0]) in homes_q]
+        if file:
+            rel = index.resolve_file(file)
+            defs = [c for c in defs if c.file == rel]
+    else:
+        # every definition sharing the bare name, anywhere -- methods count
+        # too, and they live in the class chunk's `members`, never as chunks
+        same = [c for c in index.chunks if c.kind not in ("module", "reference")
+                and c.qualname.split("#")[0].split(".")[-1] == base_old
+                and c.qualname.split("#")[0] != "module"]
+        homes = {(c.file, c.qualname.split("#")[0]) for c in same}
+        homes |= {(c.file, f"{c.qualname.split('#')[0]}.{base_old}")
+                  for c in index.chunks if c.kind in ("class", "classheader")
+                  and base_old in (getattr(c, "members", None) or [])}
+        if len(homes) > 1:
+            listing = ", ".join(f"{f}:{q}" for f, q in sorted(homes)[:6])
+            return (f"ERROR: `{base_old}` is defined in {len(homes)} places "
+                    f"({listing}); a mechanical rename would touch the wrong "
+                    "ones. Rename with edit blocks, or pass `file` ... and use "
+                    "unique names.")
+    taken = any(c.qualname.split("#")[0].split(".")[-1] == base_new
+                for c in index.chunks if c.kind not in ("module", "reference"))
+    if not qualified and not taken:
+        taken = any(base_new in (getattr(c, "members", None) or [])
+                    for c in index.chunks
+                    if c.kind in ("class", "classheader"))
+    if taken:
         return f"ERROR: `{base_new}` is already defined; pick an unused name."
+    if not defs:
+        return (f"ERROR: no definition named `{old}` in the index"
+                + (f" in `{file}`" if file else "") + ". `find` it first.")
     def_file = defs[0].file
     targets = [def_file] + [f for f in index.importers_of(def_file)
                             if f != def_file]
     root = Path(index.root).resolve()
+    if qualified and def_file.endswith(".py"):
+        # files that CONSTRUCT the class but never import its module still
+        # hold call sites the receiver pass can see; include those too
+        extra = []
+        cpat = re.compile(r"(?<![\w.])" + re.escape(class_path.rsplit(".", 1)[-1])
+                          + r"\s*\(")
+        for rel in index.files:
+            if rel in targets or not rel.endswith(".py"):
+                continue
+            try:
+                _t = fileio.read_text(root / rel)
+            except (OSError, UnicodeDecodeError):
+                continue
+            if cpat.search(_t):
+                extra.append(rel)
+        targets += extra
     changes: dict[str, tuple[str, str, int, object]] = {}
+    skipped_sites: list[str] = []
     for rel in targets:
         err = _protected_error(cfg, rel, "rename") \
             or _task_allowlist_error(index, cfg, rel, "rename")
@@ -469,9 +712,19 @@ def tool_rename(index, cfg, old: str, new: str, file: str = "") -> str:
             text, style = fileio.read(path, errors="strict")
         except (OSError, UnicodeDecodeError):
             continue
-        new_text, n = rename_text(rel, text, base_old, base_new)
-        if n < 0:
-            return f"ERROR: could not parse {rel}; rename it with edit blocks."
+        site_skips: list[str] = []
+        if qualified and rel.endswith(".py"):
+            new_text, n, site_skips = _rename_python_receiver(
+                text, base_old, base_new, class_path)
+            skipped_sites += [f"{rel}:{s}" for s in site_skips]
+        else:
+            new_text, n = rename_text(rel, text, base_old, base_new)
+            if n < 0:
+                return f"ERROR: could not parse {rel}; rename it with edit blocks."
+            if qualified and n > 0 and not rel.endswith(".py"):
+                warnings.append(f"{rel}: receiver tracking is Python-only; "
+                                f"`{base_old}` was renamed there by whole-"
+                                "word match -- verify it is the same member")
         if n == 0:
             continue
         bad = _validate(path, new_text)
@@ -479,7 +732,11 @@ def tool_rename(index, cfg, old: str, new: str, file: str = "") -> str:
             return f"ERROR: the rename would leave {rel} with {bad}; nothing written."
         changes[rel] = (text, new_text, n, style)
     if not changes:
-        return f"ERROR: found no occurrence of `{base_old}` to rename."
+        msg = f"ERROR: found no occurrence of `{base_old}` to rename."
+        if skipped_sites:
+            msg += (" every candidate site was ambiguous or bound to another "
+                    f"type: {'; '.join(skipped_sites[:6])}")
+        return msg
     # references we deliberately did not touch
     rx = re.compile(r"(?<![\w$])" + re.escape(base_old) + r"(?![\w$])")
     untouched: list[str] = []
@@ -500,11 +757,26 @@ def tool_rename(index, cfg, old: str, new: str, file: str = "") -> str:
             before.splitlines(keepends=True), after.splitlines(keepends=True),
             f"a/{rel}", f"b/{rel}", n=0))
         diffs.append(d[:1500])
-    for rel, (before, after, n, style) in changes.items():
-        err = _snapshot(index, cfg, rel, root / rel)
-        if err:
-            return err
-        fileio.write(root / rel, after, style)
+    written: list[str] = []
+    abort: str | None = None
+    try:
+        for rel, (before, after, n, style) in changes.items():
+            err = _snapshot(index, cfg, rel, root / rel)
+            if err:
+                abort = err
+                break
+            fileio.write(root / rel, after, style)
+            written.append(rel)
+    except OSError as e:
+        abort = f"could not write ({e})"
+    if abort is not None:
+        for rel in written:                     # all-or-nothing, always
+            try:
+                fileio.write(root / rel, changes[rel][0], changes[rel][3])
+            except OSError:
+                pass
+        return (f"ERROR: rename aborted: {abort}; rolled back {len(written)} "
+                "already-written file(s); nothing was renamed.")
     from . import index as index_mod
     for rel in changes:
         index_mod.reindex_file(index, rel, cfg, save=False)
@@ -515,6 +787,16 @@ def tool_rename(index, cfg, old: str, new: str, file: str = "") -> str:
            ("Backed up; `pedacito restore` undoes it."
             if getattr(cfg, "backup", False) else "Backups are OFF."),
            "".join(diffs)[:3000]]
+    if skipped_sites:
+        out.append("NOT renamed (ambiguous or foreign receivers): "
+                   + "; ".join(skipped_sites[:8])
+                   + (f", +{len(skipped_sites) - 8} more"
+                      if len(skipped_sites) > 8 else "")
+                   + " -- annotate those receivers (`x: "
+                   + class_path.rsplit(".", 1)[-1] + "`) or fix them with "
+                     "edit blocks.")
+    if warnings:
+        out.append("WARNINGS: " + "; ".join(warnings))
     if untouched:
         out.append(f"NOT changed (files that do not import the definition, or "
                    f"prose): {', '.join(untouched[:8])}"

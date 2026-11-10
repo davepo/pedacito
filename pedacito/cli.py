@@ -48,9 +48,12 @@ from .llm import LLMClient, LLMError, estimate_tokens
 from .select import CODE_EXTS, REFERENCE_EXTS, Matcher, is_venv_dir, select
 
 
-def _add_common(p):
-    """Register the flags shared by the project subcommands."""
-    p.add_argument("paths", nargs="+", help="files or directories to index")
+def _add_common(p, paths_nargs="+"):
+    """Register the flags shared by the project subcommands. `paths_nargs="?"`
+    lets a command run from the current directory with no argument (rpc)."""
+    p.add_argument("paths", nargs=paths_nargs,
+                   default=["."] if paths_nargs == "?" else None,
+                   help="files or directories to index")
     p.add_argument("--exclude", action="append", default=[], metavar="PATTERN",
                    help="gitignore-style pattern to skip; repeatable "
                         "(e.g. --exclude 'deprecated/' --exclude '*_old.py')")
@@ -131,7 +134,9 @@ def _config(args) -> Config:
                       require_hardware=(getattr(args, "cmd", "") != "config"))
     if getattr(args, "no_refs", False):
         cfg.include_references = False
-    if getattr(args, "jsonl", False):
+    if getattr(args, "jsonl", False) or getattr(args, "rpc", False) or \
+            getattr(args, "cmd", "") == "rpc":
+        # Event tee is the RPC transport itself; the log must be alive.
         cfg.log_events = True
     for spec in getattr(args, "role", None) or []:
         role, _eq, prof = spec.partition("=")
@@ -441,6 +446,47 @@ CHAT_HELP = """\
   Ctrl-C          cancel the running task (the session stays open)"""
 
 
+def _switch_profile(args, ref, arg: str, kind: str = "profile") -> str:
+    """Switch the live session to another profile/model WITHOUT rebuilding the
+    index - the whole point of `chat` and `rpc`. Mutates `ref` (cfg/client/
+    agent re-resolve, `idx` stays). Returns a human label of what is now in
+    use. Raises `ConfigError`/`LLMError` - having restored `args` and left
+    `ref` untouched - when the new profile does not work."""
+    cfg = ref["cfg"]
+    prev_profile, prev_model = args.profile, args.model
+    if kind == "profile":
+        args.profile, args.model = arg, None
+    else:
+        args.model = arg
+    try:
+        new_cfg = _config(args)
+    except ConfigError:
+        args.profile, args.model = prev_profile, prev_model
+        raise
+    new_client = LLMClient(new_cfg)
+    try:
+        new_client.check(warn=False)
+        new_client.warmup()
+    except LLMError:
+        args.profile, args.model = prev_profile, prev_model
+        raise
+    for keep in ("_interactive", "_ask_user", "_steer"):
+        if keep in cfg.__dict__:
+            new_cfg.__dict__[keep] = cfg.__dict__[keep]
+    ref["cfg"], ref["client"] = new_cfg, new_client
+    ref["agent"] = Agent(ref["idx"], new_client, new_cfg)
+    # the new client's per-call usage must reach the same event log (and, in
+    # rpc mode, the same stdout tee) as the old one's did
+    events_mod.attach(new_client, events_mod.get(_root(args), new_cfg))
+    label = ""
+    if new_cfg.active_profile:
+        label = f"profile {new_cfg.active_profile}"
+        if new_cfg.active_tier:
+            label += f" [{new_cfg.active_tier} limits]"
+        label += ", "
+    return f"{label}model {new_cfg.model}"
+
+
 def _chat_command(line: str, args, cfg, ref) -> bool:
     """Handle a /command typed in `pedacito chat`; returns False to end the
     session. Profile switching keeps the index warm between models."""
@@ -542,38 +588,17 @@ def _chat_command(line: str, args, cfg, ref) -> bool:
         if not arg:
             print(f"  Usage: /{cmd} NAME", file=sys.stderr)
             return True
-        prev_profile, prev_model = args.profile, args.model
-        if cmd == "profile":
-            args.profile, args.model = arg, None
-        else:
-            args.model = arg
         try:
-            new_cfg = _config(args)
+            label = _switch_profile(args, ref, arg,
+                                    "profile" if cmd == "profile" else "model")
         except ConfigError as e:
-            args.profile, args.model = prev_profile, prev_model
             print(f"  {e}", file=sys.stderr)
             return True
-        new_client = LLMClient(new_cfg)
-        try:
-            new_client.check(warn=False)
-            new_client.warmup()
         except LLMError as e:
-            args.profile, args.model = prev_profile, prev_model
             print(f"  Could not switch: {e}", file=sys.stderr)
             print(f"  Staying on {cfg.model}.", file=sys.stderr)
             return True
-        for keep in ("_interactive", "_ask_user"):
-            if keep in cfg.__dict__:
-                new_cfg.__dict__[keep] = cfg.__dict__[keep]
-        ref["cfg"], ref["client"] = new_cfg, new_client
-        ref["agent"] = Agent(ref["idx"], new_client, new_cfg)
-        label = ""
-        if new_cfg.active_profile:
-            label = f"profile {new_cfg.active_profile}"
-            if new_cfg.active_tier:
-                label += f" [{new_cfg.active_tier} limits]"
-            label += ", "
-        print(f"  now using {label}model {new_cfg.model}", file=sys.stderr)
+        print(f"  now using {label}", file=sys.stderr)
         return True
 
     print(f"  Unknown command '/{cmd}'. Try /help.", file=sys.stderr)
@@ -1676,6 +1701,134 @@ def _cmd_rename(args) -> int:
     return 0
 
 
+def _cmd_rpc(args, cfg, client, idx, root, locals_ref, run, save_checkpoint,
+             elog) -> int:
+    """`pedacito rpc` / `pedacito chat --rpc`: the bidirectional JSONL-RPC
+    loop over stdio (protocol in `pedacito/rpc.py`). The project index, the
+    model profiles and the session ledger stay warm between requests; every
+    stdout byte is one JSON event and every human-facing line goes to stderr,
+    so an editor or another agent can drive this process without parsing
+    prose. Clients can `ask`, `steer` a running task at its next step
+    boundary, answer `permission_request` events, `cancel` without killing
+    the session, and switch profiles in place."""
+    from . import explain as explain_mod
+    from . import rpc as rpc_mod
+    from . import security
+
+    server_box: dict = {}
+
+    def _tag():
+        s = server_box.get("s")
+        return s._tag_for(None) if s is not None else None
+
+    out = rpc_mod.RpcOut(sys.stdout, _tag)
+    elog.tee = out
+    sys.stdout = sys.stderr   # anything that forgets to say stderr still
+                              # cannot corrupt the JSONL stream
+
+    locked = {"done": False}
+
+    def _ensure_lock():
+        """Take the run lock the first time a request asks for writes, and
+        keep it until the process exits (same lock `ask --apply` uses)."""
+        if locked["done"]:
+            return
+        try:
+            workspace.acquire_lock(root)
+        except workspace.ProjectBusy as e:
+            raise SystemExit(str(e)) from e
+        locked["done"] = True
+        _LOCKED.append(root)
+
+    def _rpc_run(task, apply=False, refine=False, plan=None):
+        s = server_box["s"]
+        s.set_client(locals_ref["client"])
+        cur = locals_ref["cfg"]
+        # steer() pushes into the queue; the agent drains it at a step
+        # boundary, which never rewrites sent history -> prompt cache safe
+        cur._steer = s.steer_queue()
+        try:
+            return run(task, apply=apply, refine=refine, plan=plan)
+        finally:
+            cur.__dict__.pop("_steer", None)
+
+    def _rpc_explain(question):
+        server_box["s"].set_client(locals_ref["client"])
+        return explain_mod.answer(locals_ref["agent"], question)
+
+    def _rpc_status():
+        cur = locals_ref["cfg"]
+        c = locals_ref["client"]
+        now = locals_ref["idx"]
+        s = c.stats or {}
+        roles = dict(cur.roles or {})
+        return {
+            "profile": cur.active_profile or "(none)",
+            "model": cur.model,
+            "tier": cur.active_tier,
+            "scout": roles.get("scout") or cur.active_profile or "(main)",
+            "steps": cur.max_steps,
+            "writes": "per request (ask params.apply)",
+            "index": {"units": len(now.chunks), "files": len(now.files),
+                      "code_files": len(now.code_files),
+                      "reference_files": len(now.reference_files)},
+            "session": {k: s.get(k) for k in
+                        ("calls", "prompt_tokens", "completion_tokens",
+                         "cached_tokens", "cost", "seconds")},
+            "cache_hit": events_mod.cache_hit_ratio(s),
+        }
+
+    def _rpc_switch(ref, kind):
+        if kind == "scout":
+            cur = locals_ref["cfg"]
+            if ref not in (cur.profiles or {}):
+                have = ", ".join(sorted(cur.profiles or {})) or "none"
+                raise ConfigError(f"unknown profile {ref!r}; available: {have}")
+            cur.roles = {**(cur.roles or {}), "scout": ref}
+            return f"scout -> profile {ref}"
+        label = _switch_profile(args, locals_ref, ref, "profile")
+        server_box["s"].set_client(locals_ref["client"])
+        return label
+
+    def _always_apply(category, key, setting_key):
+        """The GUI's `_always_allow` behaviour, in-memory only: flip the
+        matching knob on the LIVE config so this session stops asking; never
+        persisted to the user's config file."""
+        cur = locals_ref["cfg"]
+        setting = setting_key or {
+            security.CAT_WEB: "allow_fetch",
+            security.CAT_SHELL: "allow_shell",
+            security.CAT_PACKAGE_INSTALL: "auto_install_deps",
+            security.CAT_TEST_EXECUTION: "enable_run_test_in_gather",
+        }.get(category)
+        if setting:
+            try:
+                setattr(cur, setting, True)
+            except (TypeError, AttributeError):
+                pass
+        if category == security.CAT_WEB and key:
+            hosts = tuple(getattr(cur, "fetch_allowed_hosts", ()) or ())
+            if "*" not in hosts and key not in hosts:
+                cur.fetch_allowed_hosts = hosts + (key,)
+
+    timeout = (getattr(args, "permission_timeout", None)
+               or rpc_mod.PERMISSION_TIMEOUT)
+    server = rpc_mod.RpcServer(
+        run=_rpc_run, explain=_rpc_explain, status=_rpc_status,
+        switch=_rpc_switch, ensure_lock=_ensure_lock,
+        save_checkpoint=save_checkpoint, always_apply=_always_apply,
+        permission_timeout=float(timeout), output=out, input_stream=sys.stdin)
+    server_box["s"] = server
+    server.set_client(client)
+    print("pedacito rpc: JSONL-RPC over stdin/stdout - one request per line "
+          "({\"id\":1,\"method\":\"status\"}), Ctrl-D to exit.",
+          file=sys.stderr)
+    try:
+        return server.serve()
+    finally:
+        elog.tee = None
+
+
 def _configure_stdio() -> None:
     """Make stdout/stderr UTF-8 with replacement so non-ASCII output cannot
     raise UnicodeEncodeError on Windows code pages. Streams without
@@ -1954,6 +2107,25 @@ def _main(argv=None) -> int:
     p_chat.add_argument("--resume", action="store_true",
                         help="seed the first task with the newest chat "
                              "checkpoint")
+    p_chat.add_argument("--rpc", action="store_true",
+                        help="drive the session over stdin/stdout as "
+                             "newline-delimited JSON (see `pedacito rpc`)")
+
+    p_rpc = sub.add_parser(
+        "rpc", help="interactive JSONL-RPC over stdio for editors and other "
+                    "machine clients (index and profiles stay warm)")
+    _add_common(p_rpc, paths_nargs="?")
+    from .rpc import PERMISSION_TIMEOUT as _PT
+    p_rpc.add_argument("--permission-timeout", type=float, default=None,
+                       metavar="SECONDS",
+                       help="how long a gated tool waits for a "
+                            "permission_reply before being denied "
+                            f"(default {_PT})")
+    # The RPC protocol carries these per-request; the defaults below only
+    # mirror `chat`: never write, never review, no terminal steering.
+    p_rpc.set_defaults(apply=False, review=False, no_review=True,
+                       refine=False, plan=False, no_plan=False,
+                       resume=False, jsonl=False, rpc=True)
 
     p_cal = sub.add_parser(
         "calibrate", help="measure the configured model (tool choice, edit "
@@ -2492,7 +2664,7 @@ def _main(argv=None) -> int:
         # Load the model here with a clear message rather than stalling
         # silently inside the first gather step.
         client.warmup()
-        if args.cmd in ("ask", "chat", "auto") and cfg.refresh_summaries:
+        if args.cmd in ("ask", "chat", "auto", "rpc") and cfg.refresh_summaries:
             index_mod.refresh_summaries(
                 idx, roles_mod.client_for(cfg, "summarizer", client), cfg,
                 limit=int(cfg.refresh_summaries))
@@ -2542,22 +2714,30 @@ def _main(argv=None) -> int:
         if args.cmd == "explain":
             return _cmd_explain(args, client, agent)
 
-        def run(task: str):
-            """Execute one task end to end through the shared inner loop."""
+        def run(task: str, apply=None, refine=None, plan=None):
+            """Execute one task end to end through the shared inner loop.
+            `apply`/`refine`/`plan` override the command-line defaults (the
+            `rpc` requests carry them per turn); None means "use the args"."""
             nonlocal idx, agent, cfg, client, resume_context
             cfg, client, agent = locals_ref["cfg"], locals_ref["client"], locals_ref["agent"]
             idx = locals_ref["idx"]
+            if refine:
+                task = _refine_task_text(cfg, client, root, task, "ask")
             if resume_context:
                 task = (resume_context + "\n\nNEW TASK\n" + task)
                 resume_context = ""
             locals_ref["last_result"] = None
+            want_apply = bool(args.apply) if apply is None else bool(apply)
             from . import plan as plan_mod
-            want_plan = getattr(args, "plan", False) or (
-                not getattr(args, "no_plan", False)
-                and plan_mod.should_plan(task, idx, cfg))
+            if plan is None:
+                want_plan = getattr(args, "plan", False) or (
+                    not getattr(args, "no_plan", False)
+                    and plan_mod.should_plan(task, idx, cfg))
+            else:
+                want_plan = bool(plan)
             if want_plan and not _wants_review(args, cfg):
                 code = plan_mod.run_planned(
-                    root, cfg, client, idx, task, apply=args.apply,
+                    root, cfg, client, idx, task, apply=want_apply,
                     confirm=_confirm_plan if getattr(args, "review_plan", False)
                     else None, strict=bool(getattr(args, "strict", False)))
                 fresh = index_mod.Index.load(root)
@@ -2565,13 +2745,23 @@ def _main(argv=None) -> int:
                     idx = fresh
                     agent.index = idx
                     locals_ref["idx"] = idx
+                if isinstance(code, int):
+                    # the planned path reports an exit code; give `rpc` a
+                    # result-shaped object so its summary frame is uniform
+                    from types import SimpleNamespace
+                    tr = SimpleNamespace(reply=None, applied=False, results=[],
+                                         steps=[], stats={}, tests_ok=None,
+                                         ok=(code == 0), idx=idx)
+                    locals_ref["last_result"] = tr
+                    return tr
                 return code
             tr = loop.run_task(root, cfg, client, agent, idx, task,
-                               apply=args.apply, review=_wants_review(args, cfg))
+                               apply=want_apply, review=_wants_review(args, cfg))
             locals_ref["last_result"] = tr
             idx = tr.idx
             agent.index = idx
             locals_ref["idx"] = idx
+            return tr
 
         def save_checkpoint(task: str):
             """Persist what the last task actually said, for --continue/--resume."""
@@ -2584,6 +2774,11 @@ def _main(argv=None) -> int:
                 getattr(tr, "reply", "") if tr is not None else "", cfg,
                 extra={"steps": list(getattr(tr, "steps", []) or [])[:60],
                        "applied": bool(getattr(tr, "applied", False))})
+
+        if args.cmd == "rpc" or getattr(args, "rpc", False):
+            # machine-client transport instead of the terminal REPL
+            return _cmd_rpc(args, cfg, client, idx, root, locals_ref,
+                            run, save_checkpoint, elog)
 
         if args.cmd == "ask":
             ask_task = args.task

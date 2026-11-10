@@ -159,7 +159,8 @@ commands. Run `pedacito <command> --help` for every flag.
 | `pedacito explain PROJ -q "..."` | Answer a question about the code. Never edits |
 | `pedacito auto PROJ -t "..."` | Turn a goal into a checklist, then implement it task by task |
 | `pedacito new DIR -t "..."` | Start a project from scratch |
-| `pedacito chat PROJ` | Interactive session that keeps the index warm |
+| `pedacito chat PROJ` | Interactive session that keeps the index warm (`--rpc` turns the session into a machine protocol) |
+| `pedacito rpc [PROJ]` | JSONL-RPC over stdin/stdout for editors and other agents: one request per line, streamed events, steering, permission prompts, cancel -- index, profiles and session warm the whole time |
 | `pedacito how "..."` | Built-in help for the CLI, the GUI, and settings |
 | `pedacito restore PROJ` | Undo the last write |
 | `pedacito rename OLD NEW` | Multi-file symbol rename through the AST and the tokenizer, no model call. `--file` scopes it, `--apply` writes (default: diff preview) |
@@ -747,6 +748,30 @@ site), `/memory`, `/skills`, `/profiles`, `/help`, `/quit`. **Ctrl-C cancels the
 running task but keeps the session open.** Switching profile mid-session is the
 cheapest way to compare two models on one task; a failed switch leaves the
 session on the previous model.
+
+With `--rpc` the same warm session speaks a machine protocol instead of prose:
+stdin takes one JSON request per line and stdout answers with JSONL events --
+see `pedacito rpc` below.
+
+### `rpc`: drive pedacito from an editor or another agent
+
+```bash
+pedacito rpc ~/code/anki          # or: pedacito chat ~/code/anki --rpc
+echo '{"id":1,"method":"status"}' | pedacito rpc ~/code/anki
+```
+
+Bidirectional JSONL-RPC over stdio, the same engine as `ask` and `chat`: each
+stdin line is `{"id": ..., "method": ..., "params": {...}}`; every stdout line
+is one JSON frame, so a client never parses prose. `ask` streams the task's
+events tagged with its `req_id` and ends with a `result` frame; `steer` pushes
+a note into the running task's queue; `permission_request` events arrive when
+a gated tool wants to act and are answered by `permission_reply` (`allow_once`,
+`allow_run`, `allow_always`, `deny`); `cancel` stops the task and keeps the
+process warm; `switch_profile` and `status` work mid-session too. The index,
+the profiles and the session ledger stay warm across requests -- that is the
+whole point. Human-facing diagnostics go to stderr; stdout stays pure JSONL.
+Protocol details in `pedacito/rpc.py`, rationale in
+[Techniques §31](TECHNIQUES.md#31-bidirectional-stdio-jsonl-rpc-a-warm-engine-an-editor-can-drive).
 
 ### `new`: start a project from scratch
 
@@ -1553,10 +1578,11 @@ working default and is documented in `pedacito config --reference`.
 ## Known limits
 
 - The call graph matches bare names, so two unrelated `run()` methods are
-  conflated, fine for locating code, not for automated refactoring. Import
-  edges are resolved per language (relative paths, packages, `crate::`), but an
-  import it cannot tie to an indexed file is treated as external, and the
-  "no importers" hint is evidence, not proof (dynamic loading, entry points).
+  conflated -- enough for locating code; refactoring needs the receiver-qualified
+  rename below to tell them apart. Import edges are resolved per language
+  (relative paths, packages, `crate::`), but an import it cannot tie to an
+  indexed file is treated as external, and the "no importers" hint is evidence,
+  not proof (dynamic loading, entry points).
 - `py-tree-sitter` 0.26 regressed Node lifetime handling and can segfault
   CPython 3.12/3.14 (upstream py-tree-sitter#472; reproducible without
   Pedacito). The dependency is pinned to `<0.26` (0.25.2 has cp314 wheels);
@@ -1567,16 +1593,26 @@ working default and is documented in `pedacito config --reference`.
   silent downgrade); `browser`, `fetch`, MCP, background `serve` processes and
   LSP servers are guarded (scrubbed environment, protected paths, allowlists,
   trust prompts), not sandboxed.
-- `rename` is mechanical and conservative: it follows imports, not types, so a
-  method renamed on a class used through another name is reported as "not
-  changed" rather than guessed. Several edit blocks across files are applied
-  per file unless `atomic_edits = true` (the snapshot and `pedacito restore` are
-  the safety net either way).
+- `rename` is mechanical and conservative. A bare name renames only when it has
+  exactly one definition anywhere, then follows imports, not types. The agent
+  tool additionally takes a receiver-qualified query (`Store.save`): Python call
+  sites are renamed when the receiver is deterministically bound to that class
+  (`x = Store()`, `s: Store`), and everything it cannot prove -- `y.save` on
+  another class, untyped receivers, files that never import the definition -- is
+  listed as "not renamed" rather than guessed; receiver tracking is
+  Python-only. Every multi-file write is transactional: a snapshot or disk
+  error partway rolls back the files already written in that batch, so no
+  half-renamed tree survives. Several edit blocks across files are still
+  applied per file unless `atomic_edits = true` (the snapshot and
+  `pedacito restore` are the safety net either way).
 - Languages: Python by AST; JS/TS, Ruby, Go, Rust, Java, C, C++, C#, PHP,
   Kotlin, Swift, Scala and Lua through tree-sitter (a grammar quirk can drop an
   occasional Swift call edge); everything else is searchable reference text.
-- Semantic search needs an embeddings endpoint; the first query embeds the whole
-  index once and caches it.
+- Semantic search needs an embeddings endpoint. It runs candidate-first: a
+  no-hit query embeds only the bounded lexical shortlist (top 50 units) and the
+  two rankings are merged with reciprocal-rank fusion -- never one pass over
+  the whole project. Vectors are cached by content hash and reused until the
+  unit changes or the embedding model is switched.
 - A text-only model can't see graphics; `screenshot` and `browser` give it text
   evidence, not visual judgement.
 - Broad, structural tasks ("modernize this codebase") are a poor fit for small
