@@ -65,6 +65,20 @@ FIELD_META: dict[str, FieldMeta] = {
                     "getElementById/querySelector('#id') selectors match the "
                     "ids defined in HTML, and that changed JS files parse. "
                     "Violations feed the repair loop."),
+    "enforce_json_schema": FieldMeta(
+        label="Engine-Enforced JSON Grammar",
+        description="Ask the inference server to constrain every gather "
+                    "step to the action grammar (response_format json_schema, "
+                    "strict). Servers that refuse the constraint fall back "
+                    "per model: json_object mode, then prompt-only. Keep on "
+                    "unless a server misbehaves on constrained sampling."),
+    "scout_profile": FieldMeta(
+        label="Scout Profile (fast gather model)",
+        description="Dual-model routing: the named profile answers gather's "
+                    "per-tool lookup steps while the active (architect) "
+                    "profile keeps planning, answers, and edits. Empty means "
+                    "no scout; pick one like 'scout' in the dropdown. The "
+                    "profile must already exist with its own base_url/model."),
 }
 
 _GROUP_RE = re.compile(r"^\s{4}#\s*---+\s*(.*?)\s*-+\s*$")

@@ -545,6 +545,84 @@ def _prune_descriptions(schema: dict, actions: list[str]) -> None:
         prop["description"] = desc
 
 
+def build_gather_json_schema(allowed_actions: list[str],
+                             step_reasoning_first: bool, *,
+                             compact: bool = False,
+                             drop: set | None = None) -> dict:
+    """A strict, compact JSON Schema for the gather tool loop (and plan
+    calls): the `action` enum lists EXACTLY the active tools -- the pruned
+    set schema_for computes per task -- so an engine-level grammar (llm.py's
+    response_format json_schema, strict) can only ever sample a well-formed
+    step whose action is currently allowed. Zero syntax retries.
+
+    Field order is load-bearing: grammar-constrained decoding emits keys in
+    schema order. The step's thought field (`reasoning`) is LAST by default,
+    so a reply cut off by the token limit loses only the trailing note. With
+    `step_reasoning_first` it moves FIRST: the model states what it needs
+    before committing to an action; a cut inside it leaves no action
+    (llm.chat_json re-asks) and a cut after it lands in an argument, which
+    llm._cut_field names so agent.gather refuses the step.
+
+    Flat + all-required keeps the grammar simple for small models; the
+    maxLength caps are load-bearing for agent.gather's cut-off refusal and
+    must stay below llm._BIG_FIELD_MIN for `content` (see STEP_SCHEMA).
+
+    `drop` overrides which argument fields are removed (schema_for passes the
+    set derived from the tool opt-ins, keeping default schemas byte-identical
+    for the server prompt cache). None derives it from `allowed_actions`:
+    no move/rename action drops `to`, and no command-taking action drops
+    `command`.
+    """
+    actions = list(allowed_actions or [])
+    enabled = set(actions)
+    schema = copy.deepcopy(STEP_SCHEMA)
+    schema["properties"]["action"]["enum"] = actions
+    if drop is None:
+        drop = set()
+        if not enabled & {"move", "rename", "rename_symbol"}:
+            drop.add("to")
+        if not enabled & {"run", "diagnose", "serve", "screenshot",
+                          "browser"}:
+            drop.add("command")
+    required = ["action", "file", "start", "end", "pattern", "symbol",
+                "reasoning"]
+    for key in drop:
+        schema["properties"].pop(key, None)
+    _prune_descriptions(schema, actions)
+    for key in ("content", "to", "command"):
+        if key not in drop:
+            required.append(key)
+    if compact:
+        # Experimental: only `action` and `reasoning` stay required, so empty
+        # unused fields may be omitted (saves ~20-40 output tokens per step).
+        required = ["action", "reasoning"]
+    ordered = ["action", "file", "start", "end", "pattern", "symbol",
+               "to", "command", "content", "reasoning"]
+    if FETCH_URL_ACTION in actions or WEB_SEARCH_ACTION in actions:
+        # `url`/`query` join the flat all-required field set only while a web
+        # action is actually in this schema; otherwise the properties filter
+        # below drops them and default schemas stay byte-identical.
+        ordered = ordered[:ordered.index("symbol") + 1] \
+            + ["url", "query"] + ordered[ordered.index("symbol") + 1:]
+        if not compact:
+            required += ["url", "query"]
+    if RUN_TEST_ACTION in actions:
+        # `target`/`filter` join the flat field set only while run_test is in
+        # this schema (same byte-identical-default rule as url/query).
+        ordered = ordered[:ordered.index("symbol") + 1] \
+            + ["target", "filter"] + ordered[ordered.index("symbol") + 1:]
+        if not compact:
+            required += ["target", "filter"]
+    if step_reasoning_first:
+        ordered = ["reasoning"] + [k for k in ordered if k != "reasoning"]
+        schema["properties"]["reasoning"]["description"] = (
+            "Under 20 words: what you need next and why this action.")
+    schema["properties"] = {k: schema["properties"][k] for k in ordered
+                            if k in schema["properties"]}
+    schema["required"] = [k for k in ordered if k in required]
+    return schema
+
+
 def schema_for(cfg) -> dict:
     """Return STEP_SCHEMA narrowed to the actions this run allows, so the
     model cannot pick a disabled action. Fields only a disabled action uses
@@ -606,55 +684,21 @@ def schema_for(cfg) -> dict:
     actions.append("done")
     actions = _prune_optional_actions(cfg, actions)
 
-    schema = copy.deepcopy(STEP_SCHEMA)
-    schema["properties"]["action"]["enum"] = actions
-    required = ["action", "file", "start", "end", "pattern", "symbol",
-                "reasoning"]
+    # Which fields no enabled action can use (computed from the tool opt-ins,
+    # exactly as before, so default schemas stay byte-identical for the warm
+    # prompt cache). `content` stays: the always-available todo action uses
+    # it. `to` is only ever used by move.
     drop = set()
     if not getattr(cfg, "allow_write", False):
-        # `content` stays: the always-available todo action uses it. `to` is
-        # only ever used by move.
         drop.add("to")
     if not (getattr(cfg, "allow_shell", False)
             or getattr(cfg, "allow_serve", False)
             or getattr(cfg, "allow_screenshots", False)
             or getattr(cfg, "allow_browser", False)):
         drop.add("command")
-    for key in drop:
-        schema["properties"].pop(key, None)
-    _prune_descriptions(schema, actions)
-    for key in ("content", "to", "command"):
-        if key not in drop:
-            required.append(key)
-    if getattr(cfg, "compact_step_schema", False):
-        # Experimental: only `action` and `reasoning` stay required, so empty
-        # unused fields may be omitted (saves ~20-40 output tokens per step).
-        required = ["action", "reasoning"]
-    ordered = ["action", "file", "start", "end", "pattern", "symbol",
-               "to", "command", "content", "reasoning"]
-    if FETCH_URL_ACTION in actions or WEB_SEARCH_ACTION in actions:
-        # `url`/`query` join the flat all-required field set only while a web
-        # action is actually in this schema; otherwise the properties filter
-        # below drops them and default schemas stay byte-identical.
-        ordered = ordered[:ordered.index("symbol") + 1] \
-            + ["url", "query"] + ordered[ordered.index("symbol") + 1:]
-        if not getattr(cfg, "compact_step_schema", False):
-            required += ["url", "query"]
-    if RUN_TEST_ACTION in actions:
-        # `target`/`filter` join the flat field set only while run_test is in
-        # this schema (same byte-identical-default rule as url/query).
-        ordered = ordered[:ordered.index("symbol") + 1] \
-            + ["target", "filter"] + ordered[ordered.index("symbol") + 1:]
-        if not getattr(cfg, "compact_step_schema", False):
-            required += ["target", "filter"]
-    if reasoning_first(cfg):
-        ordered = ["reasoning"] + [k for k in ordered if k != "reasoning"]
-        schema["properties"]["reasoning"]["description"] = (
-            "Under 20 words: what you need next and why this action.")
-    schema["properties"] = {k: schema["properties"][k] for k in ordered
-                            if k in schema["properties"]}
-    schema["required"] = [k for k in ordered if k in required]
-    return schema
+    return build_gather_json_schema(
+        actions, reasoning_first(cfg),
+        compact=bool(getattr(cfg, "compact_step_schema", False)), drop=drop)
 
 
 def _as_text(value) -> str:

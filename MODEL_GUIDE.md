@@ -31,6 +31,15 @@ than raw parameter count.
 - **Calibrate every model once** with `pedacito calibrate`. Compare models on
   your own hardware with the six built-in benchmarks, or with `pedacito eval`.
 - **Do not pick a setup from the model name alone.**
+- **Let the server hold the JSON grammar.** Pedacito asks the engine for a
+  strict JSON schema on every gather step and, per model, falls back to
+  json_object or plain prompting when a server refuses it
+  (`enforce_json_schema`, TECHNIQUES.md §27). Weak models stop failing on
+  syntax.
+- **Pair a fast scout with the architect.** `scout_profile = "<small
+  profile>"` runs the lookup steps of gather on a 3B to 7B model while the
+  big model keeps planning, answers and edits (TECHNIQUES.md §28). On one
+  GPU it keeps the architect's context free; on two it is the natural split.
 
 ---
 

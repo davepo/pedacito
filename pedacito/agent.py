@@ -1280,12 +1280,24 @@ class Agent:
         with self._phase_temp(setting, client):
             return client.chat(messages, **kw)
 
-    def _set_site(self, site: str) -> None:
+    def _set_site(self, site: str, client=None) -> None:
         """Label the client's current call site for usage accounting."""
         try:
-            self.client.site = site
+            (self.client if client is None else client).site = site
         except Exception:
             pass
+
+    def _gather_client(self):
+        """The client the gather loop runs its steps on (Sprint Q scout):
+        `cfg.scout_profile`'s client when configured and reachable, else the
+        active architect client. Resolution failures fall back softly."""
+        if not str(getattr(self.cfg, "scout_profile", "") or "").strip():
+            return self.client
+        from . import roles as roles_mod
+        try:
+            return roles_mod.scout_client(self.cfg, self.client)
+        except Exception:
+            return self.client
 
     def _map(self, task: str) -> tuple[str, str]:
         """(map text, tier) for `task`; index doubles that predate the
@@ -1312,16 +1324,17 @@ class Agent:
             pass
         return []
 
-    def _prime_fewshot(self) -> None:
+    def _prime_fewshot(self, client=None) -> None:
         """Worked step examples from THIS project for the client to show when
         the server cannot enforce a JSON grammar: a small model copies a
         concrete example far better than a dummy `{"action": "read", "file":
         ""}`. With `fewshot_steps` on, gather puts the same examples in the
         first user turn instead, so the client falls back to its one dummy
         example rather than repeating them."""
-        if not hasattr(self.client, "fewshot"):
+        client = self.client if client is None else client
+        if not hasattr(client, "fewshot"):
             return
-        self.client.fewshot = [] if fewshot_enabled(self.cfg) \
+        client.fewshot = [] if fewshot_enabled(self.cfg) \
             else self._fewshot_shots()
 
     def _lead_notes(self) -> str:
@@ -1627,14 +1640,15 @@ class Agent:
         return max(cfg.context_tokens - cfg.max_tokens_step
                    - cfg.reserve_tokens // 2, 512)
 
-    def _fit(self, messages: list[dict]) -> bool:
+    def _fit(self, messages: list[dict], client=None) -> bool:
         """Keep the live conversation inside the server's window. Only acts on
         REAL overflow: it folds the older band into one STATE digest (one
         cache break; see fold.py), and falls back to the legacy per-turn clip
         only if the recent tail alone is still too big. Returns True when it
         changed anything."""
         cfg = self.cfg
-        est = getattr(self.client, "estimate_tokens", None) or estimate_tokens
+        client = self.client if client is None else client
+        est = getattr(client, "estimate_tokens", None) or estimate_tokens
         room = self._room()
         if estimate_messages(messages, est) <= room:
             return False
@@ -1645,25 +1659,26 @@ class Agent:
             while True:
                 before = estimate_messages(messages, est)
                 if fold_mod.fold_middle(messages, keep, max_chars):
-                    self._after_fold(messages, est, before)
+                    self._after_fold(messages, est, before, client)
                     changed = True
                 if estimate_messages(messages, est) <= room or keep <= 1:
                     break
                 keep -= 1
         if estimate_messages(messages, est) > room:
-            if _evict_overflow_turns(messages, self.client, cfg):
+            if _evict_overflow_turns(messages, client, cfg):
                 self._lossy = True
                 changed = True
         return changed
 
-    def _after_fold(self, messages: list[dict], est, before: int) -> None:
+    def _after_fold(self, messages: list[dict], est, before: int,
+                    client=None) -> None:
         """Bookkeeping (and the optional model-written STATE) after a fold."""
         self.fold_count += 1
         self._lossy = True
         if getattr(self.cfg, "compaction", "") == "model" and len(messages) > 3:
             state = messages[3]["content"] if messages[3]["role"] == "user" \
                 else ""
-            better = self._model_state(state)
+            better = self._model_state(state, client)
             if better:
                 messages[3] = {"role": "user", "content": better}
         self._emit("fold", n=self.fold_count, tokens_before=before,
@@ -1672,17 +1687,18 @@ class Agent:
         print("[older lookups folded into a STATE digest to fit the model's "
               "context window]", file=sys.stderr)
 
-    def _model_state(self, state_msg: str) -> str:
+    def _model_state(self, state_msg: str, client=None) -> str:
         """One small call that rewrites the extractive STATE into goal /
         findings / next-step lines (cfg.compaction = "model"); '' on any
         failure so the deterministic digest stays."""
         from . import fold as fold_mod_
+        client = self.client if client is None else client
         body = state_msg[len(fold_mod_.STATE_HEAD):].strip()
         if not body:
             return ""
         try:
-            self._set_site("compaction")
-            text = self.client.chat(
+            self._set_site("compaction", client)
+            text = client.chat(
                 [{"role": "system", "content":
                   "You compress a coding assistant's lookup log. Reply with at "
                   "most 8 short lines: GOAL, FOUND (files and line ranges that "
@@ -1694,7 +1710,7 @@ class Agent:
         except Exception:
             return ""
         finally:
-            self._set_site("gather")
+            self._set_site("gather", client)
         text = (text or "").strip()
         return (fold_mod_.STATE_HEAD + "\n" + text[:1600]) if text else ""
 
@@ -1736,11 +1752,21 @@ class Agent:
             memory_mod.begin_tool_task(root, self.cfg)
         except Exception:
             pass
+        # Scout/architect split: gather's per-tool lookup steps run on
+        # cfg.scout_profile when it names another reachable profile; dispatch,
+        # subagents, and the answer phase stay on the architect client.
+        gclient = self._gather_client()
+        if verbose and gclient is not self.client:
+            print(f"  [scout: gather runs on profile "
+                  f"'{getattr(self.cfg, 'scout_profile', '')}']",
+                  file=sys.stderr)
         if self.events is None:
             self.events = events_mod.get(root, self.cfg)
             events_mod.attach(self.client, self.events)
-        self._set_site("gather")
-        self._prime_fewshot()
+        if gclient is not self.client:
+            events_mod.attach(gclient, self.events)
+        self._set_site("gather", gclient)
+        self._prime_fewshot(gclient)
         repo_map, tier = self._map(task)
         hint = {"flat": FLAT_HINT, "cards": CARDS_HINT,
                 "ranked": RANKED_HINT}.get(tier, DIRS_HINT)
@@ -1867,7 +1893,7 @@ class Agent:
         # max_steps.
         if getattr(self.cfg, "prefetch_targets", 0):
             budget = self._prefetch_step0(task, messages, gathered, spans,
-                                          budget, nudge, verbose)
+                                          budget, nudge, verbose, gclient)
 
         step = 0
         step_schema = schema_for(self.cfg)
@@ -2088,7 +2114,7 @@ class Agent:
                     print(f"  [steering delivered: {note[:70]}]", file=sys.stderr)
             model_calls += 1
             try:
-                stepjson = self.client.chat_json(messages, step_schema,
+                stepjson = gclient.chat_json(messages, step_schema,
                                                  self.cfg.max_tokens_step,
                                                  disable_thinking=True)
             except LLMError as e:
@@ -2134,8 +2160,8 @@ class Agent:
             # for a shorter or split payload.
             cut = ""
             note = ""
-            if getattr(self.client, "step_truncated", False):
-                tf = getattr(self.client, "truncated_field", "")
+            if getattr(gclient, "step_truncated", False):
+                tf = getattr(gclient, "truncated_field", "")
                 if tf and tf != "reasoning":
                     cut = tf
                     note = (f"your `{tf}` value was cut off by the reply "
@@ -2169,7 +2195,7 @@ class Agent:
                 messages.append({"role": "user",
                                  "content": f"{obs}\n\n{nudge(step + 1)}"})
                 budget -= len(obs)
-                self._fit(messages)
+                self._fit(messages, gclient)
                 if verbose:
                     print(f"  [step {step} discarded: `{cut}` payload cut "
                           f"off ({payload_cuts}/{_MAX_PAYLOAD_CUTS}); NOT "
@@ -2215,7 +2241,7 @@ class Agent:
                 at_limit = (not unlimited and step >= step_cap)
                 # A `done` salvaged from a reply cut off at the token limit may
                 # be a truncation artifact; ask once to confirm.
-                if getattr(self.client, "step_truncated", False) \
+                if getattr(gclient, "step_truncated", False) \
                         and not done_confirmed and not at_limit:
                     done_confirmed = True
                     messages.append({"role": "assistant",
@@ -2318,7 +2344,7 @@ class Agent:
                         print(f"  [recovery: the same `{action}` step was "
                               f"repeated; asking for a different move]",
                               file=sys.stderr)
-                    self._fit(messages)
+                    self._fit(messages, gclient)
                     if note_progress(False):
                         break
                     continue
@@ -2389,7 +2415,7 @@ class Agent:
                     mutations += 1
             # The cut almost always lands inside 'reasoning'; tell the model
             # so it stops writing essays.
-            if getattr(self.client, "step_truncated", False):
+            if getattr(gclient, "step_truncated", False):
                 obs += ("\n[Note: your previous reply hit the output token "
                         "limit before finishing its reasoning. Keep 'reasoning' "
                         "under 10 words -- long ones get cut off and wasted.]")
@@ -2469,7 +2495,7 @@ class Agent:
                 # Charge errors too, so a model repeating one failing step
                 # cannot loop forever at max_steps = 0.
                 budget -= len(obs)
-                self._fit(messages)
+                self._fit(messages, gclient)
                 if error_streak >= _MAX_CONSECUTIVE_ERRORS:
                     if recover_on and recoveries["errors"] < 1 and budget > 0:
                         recoveries["errors"] += 1
@@ -2574,7 +2600,7 @@ class Agent:
             # the char budget has room (some servers reject the request,
             # others silently drop the middle of the prompt): fold the older
             # band ONCE (see fold.py) instead of trimming turn by turn.
-            self._fit(messages)
+            self._fit(messages, gclient)
 
             if budget <= 0:
                 if verbose:
@@ -2772,7 +2798,8 @@ class Agent:
         return True
 
     def _prefetch_step0(self, task: str, messages: list, gathered: list,
-                        spans: dict, budget: int, nudge, verbose: bool) -> int:
+                        spans: dict, budget: int, nudge, verbose: bool,
+                        client=None) -> int:
         """Read up to `cfg.prefetch_targets` task-named files and symbols
         before the first model step, through the normal tool path so `spans`,
         `gathered` and `steps_log` update. Returns the remaining char budget.
@@ -2783,7 +2810,8 @@ class Agent:
             return budget
         from . import rank as rank_mod
         max_lines = max(1, int(getattr(self.cfg, "max_read_lines", 200) or 200))
-        est = getattr(self.client, "estimate_tokens", None) or estimate_tokens
+        est = getattr(self.client if client is None else client,
+                      "estimate_tokens", None) or estimate_tokens
         room = max(1, self._room()) // 4        # <= 25% of the observation room
 
         wanted = self._task_file_targets(task)

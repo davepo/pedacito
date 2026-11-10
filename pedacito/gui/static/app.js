@@ -1536,6 +1536,13 @@ function TopBar() {
             title=${s.disable_thinking ? 'thinking is disabled for this profile (disable_thinking = true)'
                                        : 'thinking is allowed (disable_thinking = false) \u2014 turn it off in Settings \u2192 Profiles'}>${s.disable_thinking ? 'no-think' : 'thinking'}</span>` : null}
         </span>
+        ${s.scout_profile ? html`<span class="chip" id="scoutChip"
+              title=${'Scout/architect split: lookup steps during gather run on profile \''
+                + s.scout_profile + '\' (a fast model); planning, answers and edits stay on \''
+                + (s.profile || 'active') + '\'. Click to change scout_profile.'}
+              onClick=${() => callSettings({ tab: 'all', search: 'scout_profile' })}>
+          <b>Scout: ${s.scout_profile}</b>
+        </span>` : null}
         <div class="tb-right">
           <button class="chip" id="indexChip" title=${idxTitle} disabled=${!!j || !s.root}
                   onClick=${(e) => { if (s.root && !j) buildIndex(!e.shiftKey); }}>

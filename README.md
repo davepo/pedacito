@@ -1082,6 +1082,18 @@ verifier, planner, summarizer) with a one-line reason, from the measured
 harness-fit and eval evidence; `--apply-roles` writes the roles after you
 confirm.
 
+Gather has one split that is not a role: `scout_profile = "tiny"` runs the
+lookup steps of the gather loop (grep, read, outline, symbol, `run_test`) on
+that profile's server while the active *architect* profile keeps planning,
+synthesis, answers and edits. A scout that is unknown or unreachable falls
+back to the architect with one warning, its usage still lands in the same
+session ledger, and the GUI shows an active scout as a `Scout: <profile>`
+badge beside the model chip. On one GPU it keeps the big model's context
+free during investigation; on two it is the natural division: cheap card for
+the chatty loop, expensive card loaded once for the answer. In Settings this
+is a dropdown over the configured profiles (or "None (use active
+profile)").
+
 A task that ends without a usable edit is also remembered in
 `.pedacito/attempts.json` (files looked at, why); a similar later task is told
 what was already tried. A success clears it.
@@ -1234,6 +1246,7 @@ config --reference` prints the annotated template. Key settings:
 | `context_tokens` | auto | Server-side context window; set when detection is wrong. |
 | `k_cache_quant` / `v_cache_quant` | `""` | KV-cache quantization the runtime uses. |
 | `json_mode` | `"schema"` | `"schema"` for local servers, `"object"` for hosted (auto-switched). |
+| `enforce_json_schema` | true | Ask the engine to constrain gather steps with `response_format` json_schema (strict); servers that refuse are downgraded to json_object, then plain prompting, per model. |
 | `tier` | `""` | Budget preset: `tiny`/`small`/`medium`/`large`/`hosted`; guessed from the model name when unset. |
 | `max_steps` | 0 | Lookup limit per task; 0 = none. |
 | `prefetch_targets` | 0 | Read up to this many task-named files/symbols through the normal tool path before the first lookup step (and once more after gather when a named target is still unread). Prefetch reads don't count toward `max_steps`. |
@@ -1257,6 +1270,7 @@ config --reference` prints the annotated template. Key settings:
 | `allow_diff` | true | Read-only `diff` action. |
 | `disable_thinking` | false | Ask for non-thinking mode using the model family's switch; output blocks are stripped regardless. |
 | `default_profile` | `""` | Profile used when `--profile` isn't given. |
+| `scout_profile` | `""` | Profile whose client runs gather's lookup steps while the active (architect) profile plans and edits; empty = no scout. |
 | `prompt_pack` | `""` | `tiny` / `small` / `full` instruction density; empty = model card, then tier. |
 | `answer_mode` | `""` | `rebuild` / `continue` / `auto`; empty = model card, then `auto` (hosted) or `rebuild` (local). |
 | `compaction` | `"deterministic"` | How folded lookups are summarised: `deterministic`, `model`, or `off` (legacy per-turn clipping). |

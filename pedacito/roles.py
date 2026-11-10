@@ -15,6 +15,11 @@ sleeping hosted API never blocks a local run.
 Roles: worker (default), planner, verifier, summarizer, repair, plus the
 recovery rungs `escalate` (one more attempt on this model when a task ends with
 no edit applied) and `fallback` (take over when the worker errors out).
+
+Sprint Q adds `scout_client`: the gather lookup loop may run on the profile
+named by `scout_profile` (a fast small model on a second GPU) while every
+other call site -- planning, answer synthesis, edits, repair -- stays on the
+worker (architect) client.
 """
 
 from __future__ import annotations
@@ -24,7 +29,6 @@ import sys
 
 ROLES = ("worker", "planner", "verifier", "summarizer", "repair",
          "escalate", "fallback")
-
 
 def derive_config(cfg, profile: str):
     """A copy of `cfg` with profile `profile`'s settings (and tier preset)
@@ -83,6 +87,45 @@ def client_for(cfg, role: str, default):
     if hasattr(default, "on_call"):
         client.on_call = default.on_call
     cache[role] = client
+    return client
+
+
+def scout_client(cfg, default):
+    """The gather-phase scout client named by `cfg.scout_profile`.
+
+    Dual-model scout/architect routing: a fast profile answers the per-tool
+    lookup steps (grep, outline, read, symbol, usages, run_test) while the
+    worker (architect) keeps planning, synthesis, and edits. Returns `default`
+    -- the worker client -- when no scout is configured, the name matches the
+    active profile, the profile does not exist, or its server is unreachable
+    (one warning, verdict cached on the config so it is asked once)."""
+    name = str(getattr(cfg, "scout_profile", "") or "").strip()
+    if not name or default is None or name == getattr(cfg, "active_profile", ""):
+        return default
+    cache = cfg.__dict__.setdefault("_scout_clients", {})
+    if name in cache:
+        return cache[name] or default
+    from .llm import LLMClient, LLMError
+    new_cfg = derive_config(cfg, name)
+    if new_cfg is None:
+        print(f"[scout] scout_profile names unknown profile '{name}'; gather "
+              "runs on the active profile", file=sys.stderr)
+        cache[name] = None
+        return default
+    try:
+        client = LLMClient(new_cfg)
+        client.check(warn=False)
+        client.warmup()
+    except LLMError as e:
+        print(f"[scout] scout profile '{name}' is unavailable "
+              f"({str(e).splitlines()[0][:100]}); gather runs on the active "
+              "profile", file=sys.stderr)
+        cache[name] = None
+        return default
+    # one usage ledger: the scout reports into the worker's sink
+    if hasattr(default, "on_call"):
+        client.on_call = default.on_call
+    cache[name] = client
     return client
 
 

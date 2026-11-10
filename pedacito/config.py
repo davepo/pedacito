@@ -92,6 +92,16 @@ class Config:
     # trained on tool calling). `pedacito calibrate` measures both on your model
     # and the card picks; set it here to force one.
     tool_mode: str = "grammar"
+    # Engine-level constrained JSON (Sprint Q). On (the default), every schema
+    # request -- the gather tool loop and plan calls -- is sent as
+    # response_format {"type": "json_schema", "strict": true} so OpenAI-compatible
+    # servers (llama.cpp, Lemonade `lemond`, LM Studio, Ollama /v1, vLLM, OpenAI,
+    # DeepSeek) constrain token sampling to valid tool-call JSON: zero syntax
+    # retries. A server that answers HTTP 400 for that mode is downgraded
+    # automatically (to json_object, then to plain JSON prompting) with the
+    # verdict cached per (base_url, model), so no call ever fails over schema
+    # support differences. false skips the engine grammar entirely.
+    enforce_json_schema: bool = True
     # Set by load() when the server is recognised as a hosted API (by URL or a
     # "deepseek" model name). Not a config key. Forces json_mode to "object"
     # unless the user set json_mode explicitly.
@@ -542,6 +552,15 @@ class Config:
     # set at the top level of the file, which `--setup` does; must exist in
     # [profiles.*].
     default_profile: str = ""
+    # Dual-model scout/architect routing (Sprint Q): the name of a profile in
+    # [profiles.*] whose (typically smaller, faster) model runs the gather
+    # lookup loop -- grep, outline, read, symbol, usages, run_test -- while
+    # planning, answer synthesis, and all code edits stay on the active
+    # (architect) profile. Built for two GPUs, e.g. a 24 GB card holding the
+    # 27B/32B architect and a 16 GB card serving a fast scout. "" = gather
+    # runs on the active profile too. An unknown or unreachable scout profile
+    # warns once and behaves like "".
+    scout_profile: str = ""
     # Preset tier ("tiny", "small", "medium", "large", "hosted") for a run
     # with no profile selected; profiles carry their own `tier` key.
     tier: str = ""
@@ -2055,6 +2074,12 @@ TEMPLATE = '''\
 
 default_profile = "default"
 
+# Dual-model scout/architect routing: name a [profiles.*] profile whose faster
+# model runs the gather lookup loop (grep/read/outline/symbol/usages) while
+# planning, answers, and edits stay on the active profile. A classic two-GPU
+# setup: a 27B architect on a 24 GB card, a fast 9B scout on a 16 GB card.
+# scout_profile = "scout"
+
 [universal]
 # Connection, generation, and shared hardware/workspace defaults. A profile
 # overrides any of these. See `pedacito config --reference` for the full list.
@@ -2063,6 +2088,10 @@ timeout = 600.0
 load_wait_seconds = 240
 max_consecutive_failures = 3
 json_mode = "schema"
+# Engine-level constrained JSON: schema requests (gather and plan) are sent as
+# response_format json_schema so the server constrains sampling to valid
+# tool-call JSON; a 400 downgrades that endpoint automatically.
+enforce_json_schema = true
 # tool_mode = "native"      # lookup steps via the model's tool-call channel
 #                           # ("grammar" = JSON schema); `pedacito calibrate` picks
 temperature = 0.2
@@ -2264,6 +2293,15 @@ REFERENCE_TEMPLATE = TEMPLATE + '''
 # profile when that model runs on a different GPU.
 # api_key is ignored by local servers; any string works.
 # json_mode: "schema" for llama.cpp/LM Studio, "object" for hosted APIs.
+# enforce_json_schema: on by default. With a "schema" request (the gather
+# tool loop and plan calls) pedacito sends response_format {"type":
+# "json_schema", "strict": true} so the inference engine itself constrains
+# token sampling to valid tool-call JSON -- zero syntax retries. llama.cpp,
+# Lemonade Server (lemond), LM Studio, Ollama /v1, vLLM, OpenAI and DeepSeek
+# all speak this; an endpoint that answers HTTP 400 is remembered per
+# (base_url, model) and immediately retried one tier down (json_object, then
+# plain JSON prompting), so a server that cannot do schemas never fails a
+# call for it. false turns engine schemas off everywhere.
 # timeout: seconds per request. load_wait_seconds: model load wait.
 # max_consecutive_failures: abort an indexing batch after N failures.
 # temperature: keep low for tool calls. temperature_answer / temperature_repair
@@ -2392,7 +2430,10 @@ REFERENCE_TEMPLATE = TEMPLATE + '''
 # `fetch_url`/`web_search` tools; with it off, a web-tool attempt asks the
 # GUI permission broker (Always Allow flips enable_web itself).
 # roles = { planner = "big", verifier = "big", summarizer = "tiny" } routes
-# those jobs to other profiles. hooks = { post_edit = ["ruff format {file}"] }
+# those jobs to other profiles. scout_profile = "scout" runs the gather lookup
+# loop on a faster profile (dual-GPU scout/architect routing) while planning,
+# answers, and edits stay on the active one.
+# hooks = { post_edit = ["ruff format {file}"] }
 # runs your commands at events (see the README); in a PROJECT config, hooks,
 # mcp_servers, auto_verify and test_command only apply after `pedacito trust`.
 # stuck_recovery gives a stuck model one targeted nudge; use_model_card lets a

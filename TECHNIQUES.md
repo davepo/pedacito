@@ -963,6 +963,87 @@ place so the next search does not answer from a stale symbol table.
 Cost: one tokenize or parse pass per file, no model, no repair rounds, and a
 guarantee a model cannot give -- a string literal is never a reference.
 
+### 27. Engine-enforced JSON grammar: the schema moves from the prompt into the sampler
+
+Everything before §1 only *asked* the model to answer in the step grammar:
+the schema travelled as text in the system prompt, and compliance was the
+model's good behaviour. Syntax retries, salvage passes and the truncation
+refusals exist because that ask sometimes fails. OpenAI-compatible engines
+with a grammar sampler (`llama.cpp`, vLLM, Ollama, hosted APIs) can instead
+be *told*: `response_format={"type": "json_schema", "strict": true, ...}`
+constrains sampling itself, so every emitted token is legal under the schema
+and an unparseable or out-of-set step becomes physically impossible.
+
+`tools.build_gather_json_schema(allowed_actions, step_reasoning_first)` is
+the engine-readable form of the gather grammar: flat, every property
+required, `additionalProperties` false, the `action` enum listing *exactly*
+the dynamically pruned tool set for this task (§15 pruning feeds it, so the
+grammar and the prompt never disagree), and field order load-bearing -- the
+sampler emits keys in schema order, so the reason-first ordering (§2)
+moves `reasoning` to the front for the servers that support it. `schema_for`
+now delegates to it and stays byte-identical, because the server's
+prompt-prefix cache reads that text too.
+
+`llm.py` requests the grammar for every schema'd call (gather steps and plan
+calls alike) and walks a three-rung ladder per `(base_url, model)` pair:
+strict `json_schema`, then `json_object` (any JSON, prompt still carries the
+shape), then plain prompting with the few-shot worked examples (§2) as
+the only discipline. A 400 that names `response_format` / `json_schema` /
+`json_object` flips the refused tier off in an in-process capability cache
+and re-sends *one rung lower immediately* -- the first call never fails over
+support, later calls skip the doomed tier outright. A 400 at the plain tier,
+or a 400 that is unrelated to structured output, raises normally, so a
+server that errors for some other reason cannot loop the downgrade. This
+cache learns from live traffic and is distinct from the probed, on-disk
+`server_modes.json` verdict; `cfg.enforce_json_schema = false` opts the
+ladder out down to prompt-only mode for servers that misbehave under
+constrained sampling.
+
+Cost: a strict schema adds a few hundred grammar bytes per request that
+cached prefixes absorb, and one extra round-trip the first time a server
+refuses a tier -- after which it never asks again. The payoff is the whole
+class of "model emitted prose instead of JSON" failures removed at the
+engine level, on exactly the calls (five to thirty per task) where it used
+to cost re-asks.
+
+### 28. Scout/architect routing: a fast model does the lookups, the big model does the thinking
+
+Investigation is a different job than judgement. During gather the model
+issues short, highly constrained steps -- grep this, read that range, outline
+this file -- whose only hard requirement is *tool-set literacy*; a 3B model
+answers those correctly all day, while the same tokens in the answer phase
+produce a mediocre patch. The classic single-profile loop pays the big
+model's latency thirty times for work a small model does in a tenth of the
+time, or starves the edit of the big model because the budget went to
+lookups.
+
+`cfg.scout_profile` names a second profile whose client runs *only* the
+gather loop. `roles.scout_client()` derives the scout's config the same way
+the role clients are derived (§10), warms it, and soft-falls back to the
+architect when the profile is unknown, unreachable, or merely a copy of the
+active one -- a scout outage degrades speed, never correctness. `Agent.gather`
+resolves it once per task: step calls, truncation flags, few-shot priming,
+context fitting and compaction digests ride the scout, while `dispatch()`
+(whose `task` subagent and edit tools plan real work), the answer phase and
+the repair loop stay on the architect. One usage ledger: the scout reports
+into the same event log, so the topbar's call/cost counters see both models.
+The verdict and the built client are cached on the config, so a long session
+asks about the scout server exactly once.
+
+On one GPU the win is KV-cache economics: the architect's 20k-token gather
+conversation is *not* resident while a tiny scout model answers the steps
+beside it; on two GPUs it is the obvious split entirely -- the scout keeps
+the chatty prefix-cache-hot loop on the cheap card and the architect loads
+once, for the answer. For the answer phase alone the loop still shows the
+scout's gathered material in one context, so routing cannot introduce a
+"second model misunderstood the task" failure mode: the architect sees the
+identical transcript.
+
+Cost: a second server (or a second model slot), a warm-up ping before the
+first step, and one more config surface -- the GUI shows an active scout as
+a `Scout: <profile>` badge next to the model chip so it is never invisible
+which answering brain a step came from.
+
 ## Techniques that exist but are not a good fit
 
 These are real methods with real literature behind them. Pedacito rejects them

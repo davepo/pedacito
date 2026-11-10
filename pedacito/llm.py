@@ -13,7 +13,12 @@ Usage
 Works against any server exposing an OpenAI-compatible /v1 surface (tested
 against LM Studio, Lemonade, and Ollama). The tool loop uses
 response_format={"type": "json_schema", ...}, which servers with grammar-
-constrained decoding enforce, so a small model cannot emit unparseable JSON.
+constrained decoding (llama.cpp, lemond, LM Studio, Ollama /v1, vLLM) enforce,
+so a small model cannot emit unparseable JSON. `cfg.enforce_json_schema` gates
+this engine-level enforcement (on by default); an endpoint that answers HTTP
+400 for that mode is downgraded on the spot (json_object, then plain JSON
+prompting) and the verdict is cached per (base_url, model), so no call ever
+fails because of a server's schema support.
 
 Also handles local-model failure modes: templates that reject certain message
 shapes, replies truncated at the token limit, reasoning models that wrap their
@@ -412,6 +417,36 @@ def _save_mode_cache(base_url: str, model: str, supported: bool) -> None:
         path.write_text(json.dumps(data, indent=1), encoding="utf-8")
     except OSError:
         pass
+
+
+# Sprint Q: engine-level JSON enforcement needs to know, per endpoint, which
+# structured-output tiers that endpoint actually accepts. A 400 naming
+# response_format flips the tier off for (base_url, model) for the rest of
+# the process, so the retry and every later call start at the highest tier
+# the server can honour: json_schema -> json_object -> plain prompt.
+# (server_modes.json above remembers the probed grammar verdict across runs;
+# this cache learns it mid-run, from live traffic, without any probe.)
+_JSON_CAPS: dict[tuple[str, str], dict[str, bool]] = {}
+_JSON_CAPS_LOCK = threading.Lock()
+
+
+def _json_cap_key(base_url: str, model: str) -> tuple[str, str]:
+    return (base_url.rstrip("/"), model)
+
+
+def _json_caps(base_url: str, model: str) -> dict[str, bool]:
+    """The mutable {schema: bool, object: bool} tier table for an endpoint."""
+    with _JSON_CAPS_LOCK:
+        return _JSON_CAPS.setdefault(
+            _json_cap_key(base_url, model), {"schema": True, "object": True})
+
+
+def _deny_json_cap(base_url: str, model: str, tier: str) -> None:
+    """Remember that this endpoint refused one structured-output tier."""
+    with _JSON_CAPS_LOCK:
+        _JSON_CAPS.setdefault(
+            _json_cap_key(base_url, model),
+            {"schema": True, "object": True})[tier] = False
 
 
 def _schema_example(schema: dict) -> str:
@@ -1226,8 +1261,14 @@ class LLMClient:
                 f"Unexpected vision response: {r.text[:300]}") from e
 
     def chat(self, messages: list[dict], max_tokens: int, schema: dict | None = None,
-             stream: bool = False, disable_thinking: bool | None = None) -> str:
+             stream: bool = False, disable_thinking: bool | None = None,
+             json_schema: dict | None = None) -> str:
         """Send a chat completion request and return the response text.
+
+        `json_schema` (Sprint Q) is the strict schema to attach as the
+        engine-level `response_format` (constrained sampling); it defaults to
+        `schema`, the shape the reply is parsed against. Servers that cannot
+        honour it are downgraded automatically (see _chat_once).
 
         Retries while the model is still loading (and, separately, while a
         provider rate-limits), lowers `max_tokens` so prompt + reply fit the
@@ -1267,7 +1308,7 @@ class LLMClient:
                     max_tokens = fit
             try:
                 text = self._chat_once(messages, max_tokens, schema, stream,
-                                       disable_thinking)
+                                       disable_thinking, json_schema)
             except ContextOverflowError as e:
                 # The server's window is smaller than our budgets assumed
                 # (stock LM Studio 8192 / Ollama 4096). Halve the reply budget
@@ -1485,10 +1526,19 @@ class LLMClient:
 
     def _chat_once(self, messages: list[dict], max_tokens: int,
                    schema: dict | None = None, stream: bool = False,
-                   disable_thinking: bool | None = None) -> str:
+                   disable_thinking: bool | None = None,
+                   json_schema: dict | None = None) -> str:
         """One HTTP request (no retry logic); returns the response text,
-        buffered or streamed (to `stream_callback`, else stdout)."""
+        buffered or streamed (to `stream_callback`, else stdout).
+
+        Structured output ladder (Sprint Q, `cfg.enforce_json_schema`): the
+        request asks the ENGINE to constrain sampling -- strict json_schema,
+        else json_object, else plain JSON prompting. A 400 that names
+        response_format flips the tried tier off for this (base_url, model)
+        and the request is re-sent one tier down immediately, so no call ever
+        fails over server schema support differences."""
         self._check_budget()
+        fmt_schema = json_schema if json_schema is not None else schema
         msgs = [dict(m) for m in messages]
         want_off = (disable_thinking if disable_thinking is not None
                     else self.cfg.disable_thinking)
@@ -1500,10 +1550,10 @@ class LLMClient:
             suffix = thinking_suffix_for(self.cfg)
         if suffix and msgs:
             msgs[-1]["content"] += "\n\n" + suffix
-        if schema is not None and self.cfg.json_mode == "object" and msgs:
+        if fmt_schema is not None and self.cfg.json_mode == "object" and msgs:
             # Hosted APIs require the word "json" in the prompt for
             # json_object mode; naming the fields improves compliance.
-            fields = ", ".join(schema.get("properties", {}).keys())
+            fields = ", ".join(fmt_schema.get("properties", {}).keys())
             msgs[-1]["content"] += (
                 f"\n\nReply with one JSON object only, no prose. "
                 f"Fields: {fields}.")
@@ -1565,36 +1615,51 @@ class LLMClient:
                 "parameters": schema}}]
             payload["tool_choice"] = {"type": "function",
                                       "function": {"name": "step"}}
-        elif schema is not None:
+        elif fmt_schema is not None:
+            # Structured-output ladder for THIS endpoint. The engine tier
+            # (`schema`) constrains sampling; `object` only asks for JSON;
+            # `plain` keeps discipline in the prompt (and in the few-shot
+            # examples the agent primed). A 400 rejection flips a tier off
+            # in _json_caps, so the downgrade re-send lands one rung lower.
+            caps = _json_caps(self.cfg.base_url, self.cfg.model)
             if self.cfg.json_mode == "object":
-                payload["response_format"] = {"type": "json_object"}
+                tier = "object" if caps.get("object", True) else "plain"
+            elif not bool(getattr(self.cfg, "enforce_json_schema", True)) \
+                    or self._schema_supported is False:
+                # Opt-out, or a probe found this server answers without
+                # advertising constrained JSON: plain prompting, no grammar.
+                tier = "plain"
+            elif caps.get("schema", True):
+                tier = "schema"
+            elif caps.get("object", True):
+                tier = "object"
             else:
-                # Send json_schema unless the warmup probe found the server
-                # answering without advertising support (LM Studio's
-                # /api/v0/models `supported_parameters`); Ollama and many
-                # hosted APIs 400 on it or answer in prose.
-                if self._schema_supported is False:
-                    fields = ", ".join(schema.get("properties", {}).keys())
-                    shots = self.fewshot if "action" in (
-                        schema.get("properties") or {}) else []
-                    if shots:
-                        examples = "\n".join(
-                            schema_example_with(schema, **s) for s in shots)
-                        msgs[-1]["content"] += (
-                            "\n\nReply with one JSON object only, no prose. "
-                            f"Fields: {fields}.\nWorked examples (for THIS "
-                            f"project; choose what the task needs):\n"
-                            + examples)
-                    else:
-                        msgs[-1]["content"] += (
-                            "\n\nReply with one JSON object only, no prose. "
-                            f"Fields: {fields}.\nExample of a well-formed "
-                            "reply:\n" + _schema_example(schema))
+                tier = "plain"
+            if tier == "schema":
+                payload["response_format"] = {
+                    "type": "json_schema",
+                    "json_schema": {"name": "pedacito_action", "strict": True,
+                                    "schema": fmt_schema},
+                }
+            elif tier == "object":
+                payload["response_format"] = {"type": "json_object"}
+            elif self.cfg.json_mode != "object":
+                fields = ", ".join(fmt_schema.get("properties", {}).keys())
+                shots = self.fewshot if "action" in (
+                    fmt_schema.get("properties") or {}) else []
+                if shots:
+                    examples = "\n".join(
+                        schema_example_with(fmt_schema, **s) for s in shots)
+                    msgs[-1]["content"] += (
+                        "\n\nReply with one JSON object only, no prose. "
+                        f"Fields: {fields}.\nWorked examples (for THIS "
+                        f"project; choose what the task needs):\n"
+                        + examples)
                 else:
-                    payload["response_format"] = {
-                        "type": "json_schema",
-                        "json_schema": {"name": "step", "strict": True, "schema": schema},
-                    }
+                    msgs[-1]["content"] += (
+                        "\n\nReply with one JSON object only, no prose. "
+                        f"Fields: {fields}.\nExample of a well-formed "
+                        "reply:\n" + _schema_example(fmt_schema))
         key = getattr(self.cfg, "prompt_cache_key", "") or ""
         if key:
             from .providers import cache_key, provider_for
@@ -1628,13 +1693,17 @@ class LLMClient:
                           "markers; falling back to implicit caching]",
                           file=sys.stderr)
                     return self._chat_once(messages, max_tokens, schema,
-                                           stream, disable_thinking)
+                                           stream, disable_thinking,
+                                           json_schema)
                 if native and self._tools_rejected(e):
                     self._native_ok = False
                     print("[this server rejected native tool calls; using the "
                           "JSON grammar instead]", file=sys.stderr)
                     return self._chat_once(messages, max_tokens, schema, stream,
-                                           disable_thinking)
+                                           disable_thinking, json_schema)
+                if self._downgrade_response_format(payload, e):
+                    return self._chat_once(messages, max_tokens, schema, stream,
+                                           disable_thinking, json_schema)
                 raise
             try:
                 data = r.json()
@@ -1674,7 +1743,10 @@ class LLMClient:
                 print("[this server rejected explicit cache_control markers; "
                       "falling back to implicit caching]", file=sys.stderr)
                 return self._chat_once(messages, max_tokens, schema, stream,
-                                       disable_thinking)
+                                       disable_thinking, json_schema)
+            if self._downgrade_response_format(payload, e):
+                return self._chat_once(messages, max_tokens, schema, stream,
+                                       disable_thinking, json_schema)
             low = str(e).lower()
             if "stream_options" in payload and (
                     "stream_options" in low or "include_usage" in low):
@@ -1789,6 +1861,45 @@ class LLMClient:
     def _cache_markers_rejected_by(err: Exception) -> bool:
         low = str(err).lower()
         return "cache_control" in low or "cache-control" in low
+
+    @staticmethod
+    def _response_format_rejected_by(err: Exception) -> bool:
+        """True when a 400 says the SERVER cannot honour the structured-output
+        request (not that our payload is otherwise malformed): llama.cpp-style
+        `response_format` complaints, OpenAI's "Invalid schema for
+        response_format", Ollama/vLLM "json_schema is not supported" or
+        "unknown field" errors naming one of the two modes."""
+        low = str(err).lower()
+        if "response_format" in low:
+            return True
+        return (("json_schema" in low or "json_object" in low)
+                and any(w in low for w in
+                        ("unsupported", "not supported", "unknown", "invalid",
+                         "unexpected", "unrecognized", "unrecognised",
+                         "rejected", "does not", "cannot", "unable")))
+
+    def _downgrade_response_format(self, payload: dict,
+                                   err: Exception) -> bool:
+        """Handle a structured-output 400 once: flip the tier this request
+        used off the per-(base_url, model) capability cache and report that a
+        lower tier exists, so the caller re-sends immediately. Tiers:
+        json_schema -> json_object -> plain prompt. A second 400 on the same
+        tier is a genuine error (the cache already says the tier is out),
+        which keeps a server that 400s for an unrelated reason from looping."""
+        rf = (payload.get("response_format") or {}).get("type") or ""
+        if not rf or not self._response_format_rejected_by(err):
+            return False
+        tier = "schema" if rf == "json_schema" else "object"
+        if not _json_caps(self.cfg.base_url, self.cfg.model).get(tier, True):
+            return False
+        _deny_json_cap(self.cfg.base_url, self.cfg.model, tier)
+        if tier == "schema":
+            print("[engine JSON mode: this server refused json_schema; "
+                  "retrying with json_object]", file=sys.stderr)
+        else:
+            print("[engine JSON mode: this server refused json_object; "
+                  "retrying with plain JSON prompting]", file=sys.stderr)
+        return True
 
     def _apply_cache_markers(self, msgs: list[dict]) -> bool:
         """In explicit prompt-cache mode, wrap the breakpoint messages' content

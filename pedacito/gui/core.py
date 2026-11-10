@@ -1224,6 +1224,15 @@ class State:
                 "profiles": sorted(cfg.profiles) if cfg else [],
                 "profile_models": profile_models,
                 "default_profile": cfg.default_profile if cfg else "",
+                # scout/architect split (Sprint Q): the gather-phase scout
+                # profile as the topbar badge should show it -- "" when unset,
+                # when it names no real profile, or when it equals the active
+                # profile (the architect then already runs gather itself).
+                "scout_profile": (cfg.scout_profile
+                                  if cfg and cfg.scout_profile
+                                  and cfg.scout_profile in (cfg.profiles or {})
+                                  and cfg.scout_profile != cfg.active_profile
+                                  else ""),
                 "model": cfg.model if cfg else "",
                 "base_url": cfg.base_url if cfg else "",
                 "review_default": bool(cfg.review) if cfg else True,
