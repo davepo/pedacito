@@ -953,7 +953,7 @@ asked to do that no model needs to do at all.
 Three surfaces, one engine: the agent action `rename_symbol` (offered only when
 `allow_write` is on, and registered as a mutating action so the task loop's
 mutation ledger, protection rules and snapshots apply, §21), the CLI
-`pedacito rename OLD NEW [--file F] [--apply]`, and `Project > Rename symbol...`
+`pedacito rename OLD NEW [--file F] [--apply]`, and `Project ▾ → Rename symbol…`
 in the GUI, backed by `POST /api/refactor/rename`. All three default to a
 preview with unified diffs; writing snapshots the originals under
 `.pedacito/backups/`, so `pedacito restore` (or the GUI's Restore dialog) undoes
@@ -1043,6 +1043,18 @@ Cost: a second server (or a second model slot), a warm-up ping before the
 first step, and one more config surface -- the GUI shows an active scout as
 a `Scout: <profile>` badge next to the model chip so it is never invisible
 which answering brain a step came from.
+
+## Quick reference: techniques 22 to 28
+
+| Technique | Section | How to turn it off | Where you see it |
+|---|---|---|---|
+| Live test introspection (`run_test`) | §22 | `enable_run_test_in_gather = false` (each run then asks first) | A gather action. Permission dialog category **Test Execution** |
+| Frontend contract checks (`verify_frontend_contracts`) | §23 | `frontend_contracts = false` | Automatic after applied edits. `pedacito webcheck` for an on-demand check |
+| Repair lesson ledger (anti-patterns) | §24 | `micro_facts = false` (also silences §14) | `.pedacito/micro_facts.json`, under `anti_patterns` |
+| Zero-anchor AST symbol splicing | §25 | No flag. Steer with `edit_style`; plain SEARCH/REPLACE still works | `<<<<<<< SYMBOL`, `AFTER_SYMBOL` edit blocks, and the `replace_symbol` payload |
+| Deterministic rename (`rename_symbol`) | §26 | None for the CLI and GUI. The agent action needs `allow_write = true` | `pedacito rename`, and **Project ▾ → Rename symbol…** |
+| Engine-enforced JSON schema | §27 | `enforce_json_schema = false` | Automatic on every structured call. `pedacito config --doctor` shows the tier |
+| Scout/architect routing | §28 | `scout_profile = ""` | `scout_profile` in Settings. The top bar shows a `Scout: <profile>` badge |
 
 ## Techniques that exist but are not a good fit
 

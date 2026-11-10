@@ -100,6 +100,11 @@ Step-by-step versions, with what you should see at each point, are in
 | **Green ratchet** | Auto snapshots the project before each step and rolls a step that still fails back to the last passing state | [TECHNIQUES.md](TECHNIQUES.md#20-green-ratchet-step-checkpoints-for-the-autonomous-loop) |
 | **Permission broker** | Web access, package installs, unapproved shell commands and sensitive file reads pause the run for an Allow Once, Allow for This Run, Always Allow, or Deny & Redirect decision | [Safety and trust](#safety-and-trust) |
 | **Safe writes** | Dry run by default, side-by-side review, backups before every write, `pedacito restore` to undo | [Review page](#review-page) |
+| **Live test introspection** | During investigation the model can run one scoped `pytest` check and read the live traceback before it writes a fix. On by default (`enable_run_test_in_gather`) | [Scoped test runs](#scoped-test-runs-during-investigation) |
+| **Frontend contract checks** | Before tests run, local `<script src>` and `<link href>` files must exist, and literal `getElementById` and `querySelector('#id')` lookups must match the HTML ids | [Frontend contract checks](#frontend-contract-checks) |
+| **Repair lessons** | A repair that fixes a failed check leaves a deduplicated, repo-specific lesson in `.pedacito/micro_facts.json` for future runs | [Repair lessons](#repair-lessons-and-repo-gotchas) |
+| **Symbol-level edits and rename** | Replace a whole function by name without echoing its old text, or rename a symbol across the project with no model call (`pedacito rename`) | [Editing](#editing-searchreplace-not-diffs) |
+| **Engine-enforced JSON and scout routing** | Lookup steps are constrained by the server's JSON schema support, and `scout_profile` sends the lookups to a fast model while the big model plans and edits | [Model guide](MODEL_GUIDE.md#dual-gpu--dual-model-scout--architect-routing-scout_profile) |
 
 ### The GUI workspace
 
@@ -128,6 +133,11 @@ dependencies, so it works offline. It runs the same engine as the commands.
   raw config file, without deleting your comments.
 - **Benchmarks** runs the six diagnostic projects against any profile. The
   pelican SVG result is drawn inline in its scorecard.
+- **Project ▾** holds project actions: **Rename symbol…** renames an identifier
+  across the project with no model call, and shows the per-file diffs before it
+  writes. **Restore from a backup…**, **Check model (loads it)** and **Clear
+  terminal** are also here. A `Scout: <profile>` badge appears beside the model
+  chip when a scout profile is active.
 
 Chat threads are saved with timestamps and can be renamed. The **Files** panel
 lists the indexed project files, and **Backups** lists snapshots you can
@@ -247,6 +257,13 @@ tree-sitter parsing is active (with its version, or why it is disabled).
 Verdicts are remembered per server and model for a week, so a server without
 grammar support automatically gets a few-shot JSON example in the prompt on
 later runs.
+
+Pedacito also asks the server to constrain every lookup step to the action JSON
+(`enforce_json_schema = true`, on by default). Servers that support a JSON schema
+enforce it while sampling, so a malformed step cannot be produced. A server that
+refuses the request is downgraded automatically, first to `json_object` and then
+to plain prompting, and the choice is remembered per model. How each server
+behaves is in [MODEL_GUIDE.md](MODEL_GUIDE.md#engine-enforced-json-by-server-enforce_json_schema).
 
 Once per model, run `pedacito calibrate`. It runs a scripted
 mini-suite, tool choice, JSON adherence, edit format, planted-injection and
@@ -475,6 +492,7 @@ The model works through a small set of actions:
 | `skill` | Load a named procedure from the skills list (`add-a-test`, `fix-a-failing-test`, ...). |
 | `todo` | Short `- [ ]` checklist saved to `.pedacito/todo.md` and shown in the answer prompt. |
 | `question` | Ask *you* one short question (interactive sessions only, at most twice a task). |
+| `run_test` | Run one scoped `pytest` check (a test file or node id) and read the condensed traceback. On by default; see [Scoped test runs](#scoped-test-runs-during-investigation) |
 | `done` | Stop gathering and answer. |
 
 Repeating a read-only lookup (even many steps later) that nothing has changed
@@ -509,6 +527,33 @@ do:
 `run` and `mcp` execute model-chosen commands in your project. Treat them as a
 trust decision, but see [Safety](#safety-and-trust): `run` is sandboxed by
 default where the OS allows, and the rest of the blast radius is limited too.
+
+### Scoped test runs during investigation
+
+A model that only reads code has to guess what a fix will do. `run_test` lets it
+check the guess first: it runs one scoped `pytest` check during investigation, so
+the live traceback is in front of the model before it writes the patch.
+
+```json
+{"action": "run_test", "target": "tests/test_app.py::test_save", "filter": "save or retry"}
+```
+
+- **Scoped.** `target` is a test file or a node id. `filter` is an optional `-k`
+  expression. The model never supplies a shell command line.
+- **Offered when useful.** It appears when the project has tests (`tests/`,
+  `test_*.py`, `*.test.js`) or the task names a failure (test, fail, bug, error,
+  traceback, reproduce, broken).
+- **Bounded.** Each run is capped at 15 seconds and at the same token budget as a
+  read. Output is a tally line plus up to four condensed failure tracebacks that
+  show only project frames. A green run is reported as green, so the model does
+  not re-run it to watch it pass again.
+- **Sandboxed.** It runs under the same sandbox as `run` (no network, writes only
+  inside the project), and the answer phase has no tools at all. The run is recorded as a repository fact, so a test command
+  that keeps working becomes a remembered command.
+
+It is on by default (`enable_run_test_in_gather = true`). Set it to `false` to make
+every run ask first in the **Permission requested** dialog under **Test Execution**.
+A plain CLI run has no dialog, so there the tool reports that it is disabled.
 
 ### Seeing a GUI or web page
 
@@ -556,6 +601,33 @@ edit or delete:
   catalog and loads a skill's text only when it needs it. Five starters ship
   built in; `pedacito skills` lists them. Skills are prompt text, nothing in a
   skill folder is ever executed.
+
+### Repair lessons and repo gotchas
+
+Every time a repair round fixes a failed check, Pedacito records what the failure
+was and that the fix worked. The lesson goes to `.pedacito/micro_facts.json` under
+`anti_patterns`, and later runs in that repository see it as a hint:
+
+```
+[REPO GOTCHAS & LESSONS] (repair lessons distilled from earlier runs; hints, not truth):
+- dom_id_mismatch: '#add-task-btn' was queried by JS but no rendered element carried that id
+```
+
+- **Only proven fixes.** A lesson is written only when a gate (syntax, static,
+  frontend contract) or a test went red during the task and is green again after
+  the task's own repair rounds. An unverified guess is never recorded.
+- **Plain text, no model prose.** Each lesson comes from a fixed template that
+  fills in the names from the failure, so it can be checked by the same tools.
+- **Bounded and self-cleaning.** At most eight lessons are kept. Repeats are merged
+  and counted, not added. A lesson about files that no longer exist is dropped.
+- **Hints, never truth.** The loop re-checks everything live, so a wrong lesson
+  costs a glance, not a wrong change.
+
+The file also holds the commands Pedacito confirmed in this repository (see
+[micro-facts](TECHNIQUES.md#14-repository-micro-facts-with-contradiction-retirement)).
+It is plain JSON. Read it, edit it, or delete it to forget everything it has
+learned. `micro_facts = false` turns recording and injection off, and
+`max_micro_fact_tokens` caps how much of it reaches the prompt.
 
 ### Project instructions
 
@@ -899,6 +971,34 @@ A block the model *started* but never finished (a missing `=======` or
 `>>>>>>> REPLACE`, a block with no `--- FILE:` header) is reported back as a
 failure instead of being silently dropped.
 
+### Renaming a symbol across the project
+
+A rename does not need a model, so Pedacito does it mechanically: every exact
+identifier is rewritten, and strings and comments are left alone.
+
+```bash
+pedacito rename apply_discount discounted_price                       # preview the diffs
+pedacito rename apply_discount discounted_price --file pkg/core.py    # that file and its importers
+pedacito rename apply_discount discounted_price --apply               # write it
+```
+
+The preview is the default, so no flag is needed to get one. `--apply` writes the
+change and snapshots the originals first, so `pedacito restore` undoes it.
+
+- **Identifiers only.** Python names move through `tokenize`. JavaScript,
+  TypeScript, Go and Rust move through their tree-sitter identifier nodes. A
+  string or comment that merely contains the old name is never touched.
+- **All or nothing.** Every changed file must pass the syntax check before any
+  file is written. If one would break, nothing is written.
+- **Name-based, on purpose.** A parameter in an unrelated function that shares the
+  name is renamed too. The preview shows it, so you can judge before writing.
+- **Also available to the model.** With `allow_write = true`, the gather loop has a
+  `rename_symbol` action that calls the same engine, and it goes through the same
+  permission and snapshot rules as other writes.
+
+In the GUI, **Project ▾ → Rename symbol…** takes the old name, the new name and an
+optional scope file. **Preview** shows the diffs, and **Rename** writes them.
+
 ### Checking an answer before it is written
 
 A small model's usual failure is not bad syntax but a plausible edit to the
@@ -927,6 +1027,37 @@ after it is written; new failures, compared with a run before the edit, go
 back to the model for up to `repair_rounds` fix rounds. `test_command`
 overrides detection (`pytest`, `npm test`, `cargo test`, `go test ./...`,
 `make test`, ...).
+
+### Frontend contract checks
+
+Passing tests do not prove that a web page loads. After an applied edit, and
+before the test command runs, Pedacito checks three things with no model call:
+
+- **Asset links.** Every local `<script src>` and `<link href>` in an HTML file
+  must point to a file that exists. External URLs, `data:` URIs and template
+  placeholders (`{{ }}`, `<%= %>`, `${...}`) are skipped, because their real path
+  cannot be known statically.
+- **DOM ids.** Every literal `getElementById('x')` and `querySelector('#x')` must
+  match an `id="x"` in some HTML file, or an id the JavaScript creates itself. A
+  lookup built from an interpolated id is not checked, since its value is not
+  known until runtime.
+- **Syntax.** Changed JavaScript must parse. `node --check` is used when Node is
+  installed, and the tree-sitter grammar otherwise.
+
+A finding is reported in the same shape as the other gates, for example:
+
+```
+FrontendContractError in app.js:42: queries DOM element '#add-task-btn',
+but index.html only defines ids ['board', 'new-task-btn', 'todo-col']
+```
+
+Only findings that are new for the current task block the edit, so existing
+problems elsewhere in the project do not stop unrelated work. If you edit an HTML
+file, the JavaScript that looks up its ids is checked again. The gate is on by
+default and is turned off with `frontend_contracts = false`. `pedacito webcheck PROJ`
+runs broader static web checks on demand (ESM syntax in classic scripts, duplicate
+globals, undeclared imports), and `auto` prints its findings as a warning after
+tasks that touch web files.
 
 ## How context is managed
 
@@ -1092,7 +1223,8 @@ badge beside the model chip. On one GPU it keeps the big model's context
 free during investigation; on two it is the natural division: cheap card for
 the chatty loop, expensive card loaded once for the answer. In Settings this
 is a dropdown over the configured profiles (or "None (use active
-profile)").
+profile)"). Pairing sizes and the one-GPU caveat are in
+[MODEL_GUIDE.md](MODEL_GUIDE.md#dual-gpu--dual-model-scout--architect-routing-scout_profile).
 
 A task that ends without a usable edit is also remembered in
 `.pedacito/attempts.json` (files looked at, why); a similar later task is told
@@ -1140,6 +1272,7 @@ screenshots/          captures (if enabled)
 procs/                background process records and logs
 design.json/.md       spec-driven design (interfaces, data, tests)
 memory.md             remembered facts (hints for the model)
+micro_facts.json      commands confirmed to work here, and repair lessons
 rules/*.md            path-scoped rules       skills/*/SKILL.md   your skills
 prompts/*.md          prompt overrides        fetch/              fetch cache
 todo.md               current task checklist
@@ -1247,6 +1380,9 @@ config --reference` prints the annotated template. Key settings:
 | `k_cache_quant` / `v_cache_quant` | `""` | KV-cache quantization the runtime uses. |
 | `json_mode` | `"schema"` | `"schema"` for local servers, `"object"` for hosted (auto-switched). |
 | `enforce_json_schema` | true | Ask the engine to constrain gather steps with `response_format` json_schema (strict); servers that refuse are downgraded to json_object, then plain prompting, per model. |
+| `enable_run_test_in_gather` | true | Let the gather loop run one scoped pytest check (a file or node id) to see live tracebacks. `false` makes each run ask the permission broker. |
+| `frontend_contracts` | true | Before tests run, check local script/stylesheet links, literal DOM id lookups and changed JavaScript syntax. |
+| `micro_facts` / `max_micro_fact_tokens` | true / 150 | Record confirmed commands and repair lessons in `.pedacito/micro_facts.json` and inject them as hints; the token cap applies to the injected block. |
 | `tier` | `""` | Budget preset: `tiny`/`small`/`medium`/`large`/`hosted`; guessed from the model name when unset. |
 | `max_steps` | 0 | Lookup limit per task; 0 = none. |
 | `prefetch_targets` | 0 | Read up to this many task-named files/symbols through the normal tool path before the first lookup step (and once more after gather when a named target is still unread). Prefetch reads don't count toward `max_steps`. |

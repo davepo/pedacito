@@ -1512,6 +1512,136 @@ GUI_TOPICS = [
         "settings": [],
         "cli": ["calibrate", "eval"],
     },
+    {
+        "id": "run-test-gather",
+        "title": "Let the model run one scoped test while it investigates",
+        "summary": "During gather the model can run a single pytest check (one test "
+                   "file or node id) and read the live traceback before it writes a "
+                   "fix. It is on by default and never runs a shell command line.",
+        "steps": [
+            "Nothing to click: the run_test action is offered when the project has "
+            "tests or the task names a failure",
+            "⚙ Settings → All settings → search enable_run_test_in_gather (on by default)",
+            "When it is off, each run_test request appears in the Permission "
+            "requested dialog under Test Execution",
+            "Allow Once or Allow for This Run lets that request through; Always "
+            "Allow turns the setting on",
+        ],
+        "keywords": ["run test", "run_test", "pytest", "traceback", "live test",
+                     "test in gather", "investigate", "failing test", "scoped test",
+                     "run tests during investigation"],
+        "settings": ["enable_run_test_in_gather"],
+        "cli": ["tests", "ask"],
+    },
+    {
+        "id": "frontend-contracts",
+        "title": "Catch broken page assets and DOM id mismatches",
+        "summary": "For HTML and JavaScript projects Pedacito checks, before the tests "
+                   "run, that every local script and stylesheet exists, that literal "
+                   "getElementById and querySelector('#id') lookups match an id in the "
+                   "HTML, and that changed JavaScript parses.",
+        "steps": [
+            "Nothing to click: it runs after each applied edit in Task/Edit and Auto",
+            "A finding is reported as a FrontendContractError that names the file, "
+            "the line and the missing id or asset; the repair round receives it",
+            "⚙ Settings → All settings → search frontend_contracts to turn it off "
+            "(on by default)",
+            "For an on-demand check of the whole project, run pedacito webcheck PROJECT",
+        ],
+        "keywords": ["dom", "html", "javascript", "js", "getelementbyid",
+                     "queryselector", "script src", "stylesheet", "asset",
+                     "broken link", "missing id", "frontend", "page does not load",
+                     "contract", "webcheck"],
+        "settings": ["frontend_contracts", "post_edit_check"],
+        "cli": ["webcheck", "auto"],
+    },
+    {
+        "id": "repair-lessons",
+        "title": "Repo gotchas and repair lessons (micro_facts.json)",
+        "summary": "When a repair round fixes a failed check (syntax, static, frontend "
+                   "or test), Pedacito writes one short lesson to "
+                   ".pedacito/micro_facts.json under anti_patterns. Later runs in that "
+                   "repository see the lessons as hints.",
+        "steps": [
+            "Nothing to click: a lesson is written only after the failing check "
+            "passes again in the same task",
+            "The file keeps at most eight lessons, de-duplicated; a lesson about a "
+            "file that was deleted is dropped",
+            "To read or forget them, open .pedacito/micro_facts.json in your editor; "
+            "deleting the file forgets everything it recorded",
+            "⚙ Settings → All settings → search micro_facts to turn recording and "
+            "injection off, or max_micro_fact_tokens to change the budget",
+        ],
+        "keywords": ["lessons", "gotchas", "anti patterns", "anti-patterns",
+                     "repair lesson", "micro facts", "micro_facts", "repo facts",
+                     "remember fix", "learned", "what it learned"],
+        "settings": ["micro_facts", "max_micro_fact_tokens"],
+        "cli": ["memory", "auto"],
+    },
+    {
+        "id": "scout-model",
+        "title": "Use a fast scout model for lookups (scout_profile)",
+        "summary": "The scout profile runs the gather lookups (grep, read, outline, find "
+                   "and similar) on a small, fast model while the active profile keeps "
+                   "planning, answering and editing. Built for two GPUs. A scout that is "
+                   "missing or unreachable falls back to the active profile.",
+        "steps": [
+            "⚙ Settings → Profiles: create or select a second profile for the small "
+            "model, with its own base_url and model",
+            "⚙ Settings → All settings → search scout_profile → choose that profile in "
+            "the dropdown, or None (use active profile) to turn it off",
+            "While it is active, the topbar shows a Scout: <profile> badge beside the "
+            "model chip",
+            "Keep the large model as the active profile so answers and edits stay on it",
+        ],
+        "keywords": ["scout", "scout profile", "scout model", "architect", "two gpus",
+                     "dual gpu", "second gpu", "fast model", "lookup model",
+                     "gather model", "split models", "small model for search"],
+        "settings": ["scout_profile", "default_profile"],
+        "cli": ["profiles", "config", "ask"],
+    },
+    {
+        "id": "json-schema-enforcement",
+        "title": "Engine-enforced JSON for lookup steps (enforce_json_schema)",
+        "summary": "Pedacito asks the model server to constrain every lookup step to the "
+                   "action JSON, so a malformed step cannot be produced. A server that "
+                   "refuses the request is downgraded automatically, per model.",
+        "steps": [
+            "Nothing to click: it is on by default, and it is best left on",
+            "⚙ Settings → All settings → search enforce_json_schema to change it; "
+            "false sends plain prompts only",
+            "If a server reports errors on structured output, run pedacito config "
+            "--doctor to see which modes it supports",
+            "Native tool calls (tool_mode = native) bypass this and use the model's "
+            "tool-call channel instead",
+        ],
+        "keywords": ["json", "json schema", "grammar", "structured output",
+                     "response_format", "malformed json", "json error", "json mode",
+                     "syntax retries", "constrained decoding", "llama.cpp", "lm studio",
+                     "ollama", "vllm", "lemonade"],
+        "settings": ["enforce_json_schema", "json_mode", "tool_mode"],
+        "cli": ["config"],
+    },
+    {
+        "id": "symbol-edits",
+        "title": "Replace or add a whole function or class without retyping it",
+        "summary": "An edit can name a definition, such as Order.total, and supply only "
+                   "the new body. Pedacito finds the exact lines with the file's own "
+                   "parser, so the old text is never copied and cannot drift.",
+        "steps": [
+            "Nothing to click: the model uses this edit shape by itself in Task/Edit "
+            "and Auto",
+            "Review the proposed code in the Changes pane (or with --review on the CLI) "
+            "before it is written",
+            "⚙ Settings → All settings → search edit_style to prefer symbol edits "
+            "(anchor) or search/replace edits (quote)",
+        ],
+        "keywords": ["symbol", "function edit", "replace function", "replace method",
+                     "splice", "surgical edit", "edit function", "edit method",
+                     "whole function", "ast edit", "after_symbol", "insert method"],
+        "settings": ["edit_style", "post_edit_check"],
+        "cli": ["ask"],
+    },
 ]
 
 TOPICS = [
@@ -1680,6 +1810,17 @@ _SETTING_KEYWORDS = {
     "use_model_card": ["model card", "calibrate", "tuned defaults"],
     "sandbox": ["sandbox", "bubblewrap", "safety", "isolated commands"],
     "auto_install_deps": ["pip install", "missing module", "dependency"],
+    "enable_run_test_in_gather": ["run tests in gather", "pytest during "
+                                  "investigation", "live traceback", "run_test"],
+    "frontend_contracts": ["dom check", "asset check", "script src",
+                           "getElementById", "frontend gate", "html js ids"],
+    "enforce_json_schema": ["json schema", "grammar", "structured output",
+                            "json grammar", "response_format"],
+    "scout_profile": ["scout", "two gpus", "fast lookup model", "architect"],
+    "micro_facts": ["lessons", "gotchas", "anti patterns", "repo facts",
+                    "remember commands", "micro facts"],
+    "max_micro_fact_tokens": ["lesson budget", "micro fact budget"],
+    "edit_style": ["symbol edit", "anchor edit", "splice", "search replace"],
 }
 
 

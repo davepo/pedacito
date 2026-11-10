@@ -196,6 +196,118 @@ output price so the cost is counted.
 
 ---
 
+## Dual-GPU / Dual-Model Scout & Architect Routing (`scout_profile`)
+
+Gather is the loop where the model looks things up before it edits. Its steps are
+short and tightly constrained: grep for this, read that range, outline this file.
+A small model does those well and quickly. Planning, the answer and the edits need
+the larger model. `scout_profile` gives each job to the right model:
+
+- **Scout (4B to 9B):** the lookup steps of gather. These are `read`, `grep`,
+  `find`, `outline`, `callers`, `context`, `usages`, `run_test` and the other
+  investigation actions. Put it on a second GPU, or on a lightweight endpoint.
+- **Architect (27B to 35B):** the active profile. It does the planning, the
+  answer, every edit, repair and verification.
+
+```toml
+[universal]
+scout_profile = "scout"             # the lookup model; must name a profile below
+
+[profiles.architect]                # the active profile: the big model
+base_url = "http://localhost:1234/v1"
+model    = "qwen3-32b"
+tier     = "large"
+vram_gb  = 24
+disable_thinking = true
+context_tokens = 32768
+
+[profiles.scout]                    # the second GPU, or a lightweight endpoint
+base_url = "http://192.168.1.50:11434/v1"
+model    = "qwen3-4b"
+tier     = "tiny"
+vram_gb  = 8
+disable_thinking = true
+```
+
+Set the profile's `vram_gb` to the memory of the machine that serves that model.
+Each profile is sized on its own, so the scout's 8 GB does not limit the architect.
+
+What to expect:
+
+- **Architect and scout are used in the same task.** The answer sees the same
+  gathered material whichever model ran the lookups, so routing does not add a
+  second opinion to the answer. Usage from both models appears in the same totals.
+- **A missing or unreachable scout is not an error.** Pedacito warns once and runs
+  the lookups on the architect. A scout set to the same profile as the architect is
+  ignored.
+- **The GUI shows which model is the scout.** While it is active, the top bar shows
+  a `Scout: <profile>` badge. In **⚙ Settings → All settings**, `scout_profile` is a
+  dropdown of your profiles, with **None (use active profile)** to turn it off.
+- **Hosted scouts send your code.** A hosted scout receives the lookup results,
+  which are excerpts of your code. The same warnings that apply to hosted roles
+  apply here.
+
+Check the scout before you rely on it. Its job is to pick the right lookup, so run
+`pedacito calibrate --profile scout` (tool choice is the probe that matters most)
+and compare `pedacito eval` before and after you add it.
+
+**On one GPU**, the benefit is smaller. Both models must fit in VRAM together, with
+room for the architect's KV cache. If they do not, every switch reloads a model,
+which is slower than running the lookups on the architect. The routing pays off most
+when the scout runs on its own card, or when the scout stays loaded next to the
+architect. The cost is a second server, a warm-up ping before the first lookup, and
+one more setting to keep in sync with your profiles.
+
+---
+
+## Engine-enforced JSON by server (`enforce_json_schema`)
+
+Each gather step is a JSON object with a fixed set of fields. With
+`enforce_json_schema = true` (the default), Pedacito sends the step schema to the
+server as `response_format`, so the server constrains sampling to valid JSON for
+that schema. A step that does not match the schema cannot be produced, so most of
+the retries that used to repair malformed replies are no longer needed.
+
+Pedacito walks down three tiers, one request at a time:
+
+| Tier | Request sent | What the server guarantees |
+|---|---|---|
+| `schema` | `json_schema`, `strict: true` | Valid JSON for the step schema, enforced while sampling |
+| `object` | `json_object` | Valid JSON, but any shape. The prompt lists the fields |
+| `plain` | nothing extra | Nothing from the server. The prompt and the few-shot examples keep the format |
+
+If a server answers HTTP 400 and the message names `response_format`,
+`json_schema` or `json_object`, that tier is switched off for this `base_url` and
+model, and the same request is sent one tier lower straight away. The first call
+pays for the refusal, and later calls skip the tier that was refused. The result is
+remembered for the session. `pedacito config --doctor` probes the modes up front and
+saves the answer in `server_modes.json`, so a server that refuses a tier is handled
+before the first task.
+
+Per server, this is what to expect. Server features change between releases, so
+treat this as a starting point and confirm with `pedacito config --doctor`.
+
+| Server | Structured output | What to expect |
+|---|---|---|
+| **llama.cpp** (`llama-server`) | `json_schema` is converted to a grammar | The `schema` tier on current builds. An older build that refuses `json_schema` falls to `object` |
+| **Lemonade Server** (`lemond`) | Its llama.cpp backend accepts `response_format` | The `schema` tier when the loaded backend accepts it. `--doctor` shows which tier it uses |
+| **LM Studio** | `json_schema` structured output | The `schema` tier on recent versions. Older versions fall to `object` |
+| **Ollama** (`/v1`) | `response_format` with `json_schema` | The `schema` tier on recent versions. Older versions fall to `object` |
+| **vLLM** | `response_format` with `json_schema` (guided decoding) | The `schema` tier when the structured-output backend is available in your build |
+| **Hosted APIs** (OpenAI, DeepSeek and others) | Pedacito defaults remote hosts to `json_mode = "object"`, which suits DeepSeek and most others | The `object` tier by default. Set `json_mode = "schema"` in a profile for an API that accepts `json_schema`, such as OpenAI, to use the `schema` tier |
+
+Two things to know:
+
+- **Native tool calls bypass this.** With `tool_mode = "native"`, the step is sent
+  through the model's tool-call channel, and `response_format` is not used. The
+  setting still applies to every other JSON call, such as planning.
+- **Turn it off only for a misbehaving server.** `enforce_json_schema = false` sends
+  plain prompts only. Use it when a server produces broken output under constrained
+  sampling. Keep it on otherwise, since it is the cheapest way to avoid malformed
+  steps.
+
+---
+
 ## Thinking per profile
 
 Some models reason before they answer, in a separate thinking block. That helps
@@ -555,3 +667,6 @@ names for quantization. Aim for the equivalent of about 4 bits per weight.
 - [ ] Judge by first-apply-clean and token and time numbers, not pass rate alone.
 - [ ] Keep role routing simple on a single GPU. Every model switch can reload.
 - [ ] Do your first dozen real tasks without `--apply`, then use `--review`.
+- [ ] Run `pedacito config --doctor` once per server to confirm its JSON tier.
+- [ ] With two GPUs, set `scout_profile` to a 4B to 9B profile, and keep the 27B to
+      35B model as the active architect.

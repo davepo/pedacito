@@ -15,6 +15,7 @@ Usage
     pedacito reset  ~/code/app               # wipe .pedacito/ state (code stays)
     pedacito new  my-app -t "todo CLI"       # start a project from scratch
     pedacito auto . -t "add retries" --apply # autonomous outer loop over tasks
+    pedacito rename old_name new_name        # rename a symbol across files, no model call
 
 Run as `pedacito <command> ...` or `python -m pedacito <command> ...`; `pdc`
 is a shorthand alias accepting the same commands. `main()` is the entry point.

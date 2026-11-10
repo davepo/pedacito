@@ -187,7 +187,9 @@ automatically.
 Each step is also checked before the next one starts. Pedacito compares every
 function and class signature in the project with the calls and imports across
 files, and runs a fast check for undefined names, so a step that breaks a name is
-caught before its tests run. If a step still fails after its repair rounds, the
+caught before its tests run. In a web project it also checks that every local script
+and stylesheet exists and that every DOM id a script looks up is in the page. If a
+step still fails after its repair rounds, the
 green ratchet rolls it back to the last passing state. The Activity log then
 shows `ROLLED BACK`, with the files that were restored or deleted.
 
@@ -260,6 +262,47 @@ unless you list them in `fetch_allowed_hosts`.
 - **Steer:** while a task runs, type a note to redirect the model. You can also
   answer its clarifying questions inline, or click **Stop**.
 - **Terminal:** the bottom panel shows everything Pedacito prints, live.
+
+### A15. Rename a symbol across the project
+
+Renaming a function or variable everywhere it is used does not need a model.
+
+1. Open **Project ▾** in the top bar and choose **Rename symbol…**.
+2. Type the current name in **Rename**, the new name in **To**, and optionally one
+   file in **Scope file** to limit the rename to that file and the files that import
+   it.
+3. Click **Preview**. The per-file diffs appear and nothing is written yet.
+4. Click **Rename** to write the change. The originals are backed up first, so you
+   can undo it from **Project ▾ → Restore from a backup…**.
+
+Strings and comments that happen to contain the old name are left alone. A parameter
+in an unrelated function that has the same name is renamed too, so read the preview.
+
+### A16. Let the model run one scoped test
+
+While it investigates, the model can run a single test file or test id with pytest
+and read the traceback before it writes a fix. This is on by default. Nothing is run
+through a shell, and each run is capped at 15 seconds.
+
+If you would rather approve each run, open **⚙ Settings → All settings**, search for
+`enable_run_test_in_gather`, set it to off, and save. Each test run then appears in
+the **Permission requested** dialog under **Test Execution**.
+
+### A17. Use a scout model for lookups (two GPUs)
+
+If you have a small model on a second GPU, or a lightweight server, let it do the
+lookups while the large model plans and edits.
+
+1. Add the small model as its own profile in **⚙ Settings → Profiles**, with its own
+   server address and model.
+2. Open **⚙ Settings → All settings**, search for `scout_profile`, and choose that
+   profile. Choose **None (use active profile)** to turn the scout off.
+3. Keep the large model as the active profile. The top bar then shows a
+   `Scout: <profile>` badge beside the model chip.
+
+If the scout cannot be reached, Pedacito falls back to the active model and shows a
+warning. The sizes to pair, and the one-GPU caveat, are in the
+[model guide](MODEL_GUIDE.md#dual-gpu--dual-model-scout--architect-routing-scout_profile).
 
 ---
 
@@ -497,6 +540,20 @@ Part A10). There is no CLI command for it yet. The CLI measures a model with
 `pedacito calibrate` and `pedacito eval`, which are described in the
 [model guide](MODEL_GUIDE.md#how-to-measure).
 
+### B12. Rename a symbol (no model call)
+
+```bash
+pedacito rename apply_discount discounted_price                        # preview the diffs
+pedacito rename apply_discount discounted_price --file pkg/core.py     # that file and its importers
+pedacito rename apply_discount discounted_price --apply                # write it
+pedacito restore ~/code/anki                                           # undo it, if needed
+```
+
+The preview is the default. With `--apply`, the originals are backed up first, so
+`pedacito restore` can undo the rename. Python, JavaScript, TypeScript, Go and Rust
+identifiers are renamed; a string or comment containing the old name is left alone.
+Every changed file must pass the syntax check, or nothing is written.
+
 ---
 
 ## Several models: profiles
@@ -545,6 +602,11 @@ Model names differ by server. LM Studio and Lemonade use the id that
 Switching models makes the server load the new one, which can take a minute or
 two. Pedacito waits for it (`load_wait_seconds`, default 240).
 
+To send only the lookup steps to a smaller profile, set `scout_profile` to its name,
+for example `scout_profile = "scout"` in `[universal]`. The active profile still
+plans, answers and edits. The [model guide](MODEL_GUIDE.md#dual-gpu--dual-model-scout--architect-routing-scout_profile)
+explains how to pair the sizes.
+
 ---
 
 ## Writing good tasks
@@ -588,6 +650,8 @@ the same names to work from.
 | Answers are vague | The map may have switched from a full listing to per-file cards. `pedacito map PROJ --tier auto` shows which. |
 | Stale or misleading summaries | A docstring replaces a generated summary. Set `summarise_documented = true` and re-index. |
 | No review page appeared | Nothing anchored, so there was nothing to review. Check the printed failures. |
+| `FrontendContractError` after an edit | A page script loads a file that does not exist, or a `getElementById` or `querySelector('#id')` looks for an id the HTML does not define. The message names the file, line and id. Render that element, or fix the selector. `pedacito webcheck PROJ` lists every such problem. |
+| The server rejects structured output, or steps keep failing to parse | Pedacito steps down to a simpler structured mode by itself. Run `pedacito config --doctor` to see which modes the server supports. Set `enforce_json_schema = false` only if the server misbehaves under constrained sampling. |
 | Everything is slow | The model has likely spilled out of VRAM. |
 
 To force a clean rebuild, run `pedacito reset PROJ --reindex`, or pass `--reindex`
@@ -621,6 +685,7 @@ only the map is stale.
 | `pedacito new DIR -t "..."` | Start a project from scratch (or `--spec FILE`) |
 | `pedacito auto PROJ -t "..."` | Plan a goal, then implement it task by task |
 | `pedacito restore PROJ` | Undo the last write |
+| `pedacito rename OLD NEW [--file F] [--apply]` | Rename a symbol across the project. No model call; preview by default |
 | `pedacito eval` | Score the harness on fixture repositories. Use `--baseline` as a gate |
 | `pedacito memory PROJ` | List, add, or forget remembered facts |
 | `pedacito skills PROJ` | List the available skills |
@@ -650,6 +715,9 @@ Per project, under `<project>/.pedacito/`:
 - `events/*.jsonl`: one JSON line per step, call, fold, and task, with tokens,
   cache hits, and latency.
 - `memory.md`, `reviews/` (saved review pages), and `log.txt` (event trace).
+- `micro_facts.json`: commands confirmed to work in this repository, and repair
+  lessons under `anti_patterns`. A lesson is written only after a fix is verified.
+  Safe to read, edit, or delete.
 
 Deleting the folder is always safe. You only pay for a re-index. `pedacito reset`
 clears it for you, and `pedacito prune` trims the old files.
