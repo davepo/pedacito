@@ -38,6 +38,44 @@ def max_depth(cfg) -> int:
     return 2 if is_hosted(cfg) else 1
 
 
+def _tier(cfg) -> str:
+    """Effective tier for the single-slot guard: an applied profile tier wins,
+    otherwise the same model/base-url guess config.py uses for profiles."""
+    tier = str(getattr(cfg, "active_tier", "")
+               or getattr(cfg, "tier", "") or "").strip().lower()
+    if tier:
+        return tier
+    try:
+        from .config import _guess_tier
+        return str(_guess_tier(
+            str(getattr(cfg, "active_profile", "") or ""),
+            {"model": getattr(cfg, "model", ""),
+             "base_url": getattr(cfg, "base_url", "")}) or "").lower()
+    except Exception:
+        return ""
+
+
+def _shared_prefix_eligible(cfg) -> bool:
+    """True when a child may fork the parent's prefix on a single-slot local
+    server: no separate scout, a local endpoint, and a tiny/small profile."""
+    if str(getattr(cfg, "scout_profile", "") or "").strip():
+        return False
+    try:
+        from .llm import _is_local_server
+        if not _is_local_server(cfg):
+            return False
+    except Exception:
+        return False
+    tier = _tier(cfg)
+    if tier:
+        return tier in ("tiny", "small")
+    try:
+        from .prompts import pack_for
+        return pack_for(cfg) in ("tiny", "small")
+    except Exception:
+        return False
+
+
 def child_config(cfg):
     """A read-only copy of `cfg` for a child agent."""
     child = copy.copy(cfg)
@@ -56,13 +94,20 @@ def child_config(cfg):
     child.__dict__.pop("_steer", None)
     child.log_events = getattr(cfg, "log_events", True)
     for scratch in ("_backup_dir", "_task_reads", "_task_allowlist",
-                    "_task_mutations"):
+                    "_task_mutations", "_agent"):
         child.__dict__.pop(scratch, None)
     return child
 
 
-def tool_task(index, cfg, client, brief: str) -> str:
-    """Run a child agent on `brief` and return its digest."""
+def tool_task(index, cfg, client, brief: str, parent=None) -> str:
+    """Run a child agent on `brief` and return its digest.
+
+    `parent`, when given, receives the child's best 1-2 content-addressed
+    `EvidenceSpan`s (hashed exact source the helper really read) in its own
+    evidence store and read ledger, plus matching requirement-state advances.
+    The digest observation is extended with the bounded numbered spans so the
+    parent can edit them without paying for a second `read`.
+    """
     if not getattr(cfg, "allow_subagents", False):
         return ("ERROR: `task` is disabled (config allow_subagents = false). "
                 "Research the question yourself with `read`/`grep`/`callers`.")
@@ -76,26 +121,70 @@ def tool_task(index, cfg, client, brief: str) -> str:
     from .agent import Agent
     from .explain import EXPLAIN_GATHER_BASE
 
+    # Scout routing: when a separate fast profile is configured and reachable,
+    # the child's gather (and its small digest) runs there, so the architect's
+    # KV cache is not evicted by helper lookups.
+    gather_client = client
+    scout_active = False
+    if str(getattr(cfg, "scout_profile", "") or "").strip():
+        try:
+            from . import roles
+            resolved = roles.scout_client(cfg, client)
+            if resolved is not None and resolved is not client:
+                gather_client = resolved
+                scout_active = True
+        except Exception:
+            gather_client = client
+
     child_cfg = child_config(cfg)
-    child = Agent(index, client, child_cfg)
-    prev_site = getattr(client, "site", "")
+    # Single-slot shared-prefix forking: with no scout on a local tiny/small
+    # profile, reuse the parent's System Prompt + First User Turn byte-for-byte
+    # and append the helper brief, instead of wiping the server's cached KV.
+    seed: list[dict] = []
+    if parent is not None and not scout_active and _shared_prefix_eligible(cfg):
+        parent_msgs = getattr(parent, "_messages", None) or []
+        if (len(parent_msgs) >= 2
+                and parent_msgs[0].get("role") == "system"
+                and parent_msgs[1].get("role") == "user"):
+            seed = [dict(m) for m in parent_msgs[:2]]
+
+    child = Agent(index, gather_client, child_cfg)
+    prev_site = getattr(gather_client, "site", "")
     try:
-        client.site = "subagent"
+        gather_client.site = "subagent"
         gathered = child.gather(brief, verbose=False,
                                 base=EXPLAIN_GATHER_BASE
-                                + "\n\n" + SUBAGENT_BASE_NOTE)
+                                + "\n\n" + SUBAGENT_BASE_NOTE,
+                                prefix_messages=seed or None)
         digest = child.answer(brief, gathered, system=DIGEST_SYSTEM,
                               include_edit_format=False, stream=False,
                               max_tokens=700)
     except Exception as e:                          # a child never kills the parent
         return f"ERROR: helper agent failed ({type(e).__name__}: {str(e)[:160]})."
     finally:
-        client.site = prev_site
+        gather_client.site = prev_site
+        # Drop the child's ephemeral turns: only its digest + evidence cross
+        # the boundary back to the parent.
+        try:
+            del child._messages[len(seed):]
+        except (AttributeError, TypeError):
+            pass
     digest = (digest or "").strip()
+    spans = []
+    if parent is not None and hasattr(parent, "absorb_subagent_evidence"):
+        try:
+            spans = parent.absorb_subagent_evidence(child)
+        except Exception:
+            spans = []
     if not digest:
         steps = "; ".join(getattr(child, "steps_log", [])[:6]) or "no steps"
         return f"HELPER RESULT: the helper produced no answer ({steps})."
     if len(digest) > DIGEST_MAX_CHARS:
         digest = digest[:DIGEST_MAX_CHARS].rsplit("\n", 1)[0] + "\n[digest clipped]"
+    if spans and hasattr(parent, "append_subagent_evidence"):
+        try:
+            digest = parent.append_subagent_evidence(digest, spans)
+        except Exception:
+            pass
     return ("HELPER RESULT (a read-only helper's digest; verify what you will "
             "rely on):\n" + digest)

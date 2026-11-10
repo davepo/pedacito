@@ -1222,6 +1222,13 @@ class Agent:
         self.index = index
         self.client = client
         self.cfg = cfg
+        # The tool dispatcher resolves a `task` subagent's parent through this
+        # back-reference (kept out of dispatch()'s call signature so existing
+        # monkeypatched dispatchers remain compatible).
+        try:
+            self.cfg._agent = self
+        except Exception:
+            pass
         # Set by gather(); _repair_source() falls back to it for files no
         # longer on disk.
         self.gathered_source = ""
@@ -1471,6 +1478,200 @@ class Agent:
                        step=span.read_step)
         return span
 
+    def _collapse_repair_turns(self, messages: list[dict], prefix_index: int,
+                               *, receipt: str = "",
+                               clean_reply: str = "") -> int:
+        """Pop failed drafts/diagnostics back to snapshot `prefix_index`.
+
+        The snapshot is taken immediately before asking for a hunk or entering
+        a repair loop. A successful repair leaves a clean state in the same
+        list -- a compact receipt (incremental mode) or the accepted reply --
+        so earlier cached bytes are reused instead of re-prefilling a broken
+        draft. An exhausted repair never calls this helper, keeping its final
+        failure visible to telemetry and shallow failure memory.
+        """
+        if not bool(getattr(self.cfg, "collapse_repair_turns", True)):
+            return 0
+        try:
+            prefix_index = int(prefix_index)
+        except (TypeError, ValueError):
+            return 0
+        if prefix_index < 0 or prefix_index > len(messages):
+            return 0
+        removed = len(messages) - prefix_index
+        if removed <= 0:
+            return 0
+        del messages[prefix_index:]
+        if receipt:
+            messages.append({"role": "user", "content": receipt})
+        elif clean_reply:
+            messages.append({"role": "assistant", "content": clean_reply})
+        self._emit("repair_collapse", messages=removed,
+                   prefix=prefix_index)
+        return removed
+
+    @staticmethod
+    def _span_matches_requirement(span: EvidenceSpan, req) -> bool:
+        """Whether one evidence span names or overlaps a requirement."""
+        rel = _norm_key(span.file)
+        text = f"{span.file}\n{span.exact_text}".lower()
+        for term in getattr(req, "terms", ()) or ():
+            term = str(term or "").strip().lower()
+            if term and term in text:
+                return True
+        for a_rel, a, b in (list(getattr(req, "anchors", ()) or ())
+                            + list(getattr(req, "read_spans", ()) or ())):
+            if _norm_key(a_rel) != rel:
+                continue
+            if b and not (int(b) < int(span.start)
+                          or int(a) > int(span.end)):
+                return True
+            if not b and int(span.start) <= int(a) <= int(span.end):
+                return True
+        return False
+
+    def _span_utility(self, span: EvidenceSpan, parent_reqs, child_reqs,
+                      pinned: set[tuple]) -> float:
+        """Deterministic utility rank for a subagent's read span."""
+        score = 0.0
+        for req in parent_reqs:
+            if self._span_matches_requirement(span, req):
+                score += 100.0
+                score += 5.0 * min(len(getattr(req, "terms", ()) or ()), 8)
+        for req in child_reqs:
+            if self._span_matches_requirement(span, req):
+                score += 10.0
+        if (_norm_key(span.file), int(span.start), int(span.end)) in pinned:
+            score += 25.0
+        # A larger exact span carries more reusable source, but never let size
+        # outrank a direct requirement match. Newer reads win ties.
+        score += min(max(0, int(span.end) - int(span.start) + 1), 120) * 0.1
+        score += max(0, int(getattr(span, "read_step", 0) or 0)) * 0.01
+        return score
+
+    def select_subagent_evidence(self, child, limit: int = 2
+                                 ) -> list[EvidenceSpan]:
+        """The 1-2 highest-utility spans the child actually read and pinned.
+
+        Requirement-matching spans win, then pinned child evidence, then span
+        size and recency. Identical file/range/hash records are de-duplicated
+        so the parent tail never repeats the same source twice.
+        """
+        store = getattr(child, "evidence", None)
+        spans = list(getattr(store, "spans", ()) or ())
+        if not spans:
+            return []
+        parent_reqs = list(getattr(getattr(self, "requirements", None),
+                                  "items", ()) or ())
+        child_tracker = getattr(child, "requirements", None)
+        child_reqs = list(getattr(child_tracker, "items", ()) or ())
+        pinned = {(_norm_key(rel), int(a), int(b))
+                  for rel, a, b in (getattr(child_tracker, "pinned_spans",
+                                            lambda: [])() or [])}
+        ranked: list[tuple[float, int, EvidenceSpan]] = []
+        seen: set[tuple] = set()
+        for order, span in enumerate(spans):
+            if (span is None or not getattr(span, "exact_text", None)
+                    or not hasattr(span, "file")):
+                continue
+            key = (_norm_key(span.file), int(span.start), int(span.end),
+                   getattr(span, "content_sha", ""))
+            if key in seen:
+                continue
+            seen.add(key)
+            ranked.append((self._span_utility(span, parent_reqs, child_reqs,
+                                              pinned), order, span))
+        ranked.sort(key=lambda row: (-row[0], -row[1]))
+        return [span for _score, _order, span in ranked[:max(1, int(limit))]]
+
+    def absorb_subagent_evidence(self, child, limit: int = 2
+                                 ) -> list[EvidenceSpan]:
+        """Copy a child's best spans into this agent's evidence + read ledger.
+
+        This is the read-only handoff that lets a parent edit lines the helper
+        displayed without paying for a second `read`: the spans are hashed,
+        credited to the same ledger `check_unread` consults, and used to move
+        matching requirement clauses to LOCATED/READ.
+        """
+        selected = self.select_subagent_evidence(child, limit=limit)
+        copied: list[EvidenceSpan] = []
+        if not isinstance(getattr(self, "_read_spans", None), dict):
+            self._read_spans = {}
+        for span in selected:
+            copy = self.evidence.record(span.file, span.start, span.end,
+                                        span.exact_text, span.read_step)
+            copied.append(copy)
+            key = _norm_key(copy.file)
+            ledger = self._read_spans.setdefault(key, [])
+            if (copy.start, copy.end) not in ledger:
+                ledger.append((copy.start, copy.end))
+            tracker = getattr(self, "requirements", None)
+            if tracker is not None and getattr(tracker, "task", ""):
+                try:
+                    tracker.observe_search(
+                        "read", {"file": copy.file},
+                        f"{copy.file}\n{copy.exact_text}", self.index)
+                    tracker.observe_read(
+                        copy.file, copy.start, copy.end,
+                        f"{copy.file}\n{copy.exact_text}", self.index)
+                except Exception:
+                    pass
+            self._emit("subagent_evidence", file=copy.file,
+                       start=copy.start, end=copy.end,
+                       sha=copy.content_sha[:12])
+        return copied
+
+    def _render_subagent_evidence(self,
+                                  spans: list[EvidenceSpan]) -> str:
+        """Numbered, token-bounded evidence block appended under the digest."""
+        if not spans:
+            return ""
+        budget = self._read_budget_chars()
+        used = 0
+        chunks: list[str] = []
+        for span in spans:
+            lines = str(span.exact_text or "").split("\n")
+            if not lines or not lines[0]:
+                continue
+            width = max(1, len(str(int(span.start) + len(lines) - 1)))
+            header = (f"{span.file} lines {int(span.start)}-"
+                      f"{int(span.start) + len(lines) - 1}:")
+            kept: list[str] = []
+            body_used = 0
+            for offset, line in enumerate(lines):
+                rendered = f"{int(span.start) + offset:>{width}} | {line}"
+                extra = len(rendered) + 1
+                if budget and kept and used + len(header) + 1 + body_used \
+                        + extra > budget:
+                    break
+                kept.append(rendered)
+                body_used += extra
+            if not kept:
+                break
+            if budget and used + len(header) + 1 + body_used > budget \
+                    and chunks:
+                break
+            end = int(span.start) + len(kept) - 1
+            header = f"{span.file} lines {int(span.start)}-{end}:"
+            chunk = header + "\n" + "\n".join(kept)
+            chunks.append(chunk)
+            used += len(chunk) + 1
+            if budget and used >= budget:
+                break
+        if not chunks:
+            return ""
+        return ("\n\nEXACT EVIDENCE ALREADY READ BY THE HELPER (numbered like "
+                "a `read`, hashed into this run's evidence store, and credited "
+                "to the read ledger -- use these lines directly; do not pay "
+                "for a second `read` of the same span):\n\n"
+                + "\n\n".join(chunks))
+
+    def append_subagent_evidence(self, digest: str,
+                                 spans: list[EvidenceSpan]) -> str:
+        """Append the promoted spans beneath a child digest for RESULT:."""
+        block = self._render_subagent_evidence(spans)
+        return ((digest or "").rstrip() + block) if block else (digest or "")
+
     def _rehydration_rounds_left(self) -> int:
         """Rounds the explicit NEED rehydration may still run (Guiding
         Constraint #3): cfg.max_rehydration_rounds, default 2; 0 disables."""
@@ -1717,7 +1918,8 @@ class Agent:
     # ------------------------------------------------------------------ phase 1
     def gather(self, task: str, verbose: bool = True,
                on_step=None, base: str | None = None,
-               backup_dir=None) -> str:
+               backup_dir=None,
+               prefix_messages: list[dict] | None = None) -> str:
         """Run the tool-calling loop until the model says `done`, the
         gathered-source budget is exhausted, or cfg.max_steps (0 = no limit)
         is reached.
@@ -1838,6 +2040,19 @@ class Agent:
             {"role": "system", "content": system},
             {"role": "user", "content": user0},
         ]
+        if prefix_messages:
+            # Single-slot local server (TECHNIQUES.md #28): fork the parent's
+            # stable cached prefix byte-for-byte instead of sending a fresh
+            # system prompt that would evict the architect's KV cache. The
+            # helper brief rides at the tail as a normal assistant/user pair.
+            messages = [dict(m) for m in prefix_messages]
+            messages.append({"role": "assistant", "content":
+                             "I will handle this bounded, read-only lookup."})
+            messages.append({"role": "user", "content":
+                             "HELPER TASK (read-only, bounded research for "
+                             "the parent agent)\n" + task +
+                             "\n\nRequest only the exact source you need, "
+                             "then choose done."})
         self._messages = messages
         self._lossy = False          # True once history was folded/evicted
         self.fold_count = 0
@@ -3121,10 +3336,11 @@ class Agent:
 
     @staticmethod
     def _incremental_receipt(rel: str, symbol: str, ok: bool,
-                             reason: str = "") -> str:
+                             reason: str = "", repairs: int = 0) -> str:
         name = f"{rel}:{symbol}" if symbol else rel
         if ok:
-            return f"[EDITED {name}]"
+            tail = f" (repaired {int(repairs)}x)" if repairs else ""
+            return f"[EDITED {name}{tail}]"
         tail = f" -- {reason}" if reason else ""
         return f"[FAILED {name}{tail}]"
 
@@ -3178,6 +3394,10 @@ class Agent:
             already = ("\n\nEDITS ALREADY VERIFIED (their source was removed "
                        "to save context):\n" + "\n".join(receipts)
                        if receipts else "")
+            # Snapshot P immediately before requesting this symbol's hunk: a
+            # successful repair collapses back here, so failed drafts and
+            # diagnostic turns never poison the next symbol.
+            prefix_index = len(history)
             target_msg = (
                 already + f"\n\nINCREMENTAL TARGET {n}/{total}\n"
                 f"file: {rel}\nsymbol: {symbol or '(whole file)'}\n"
@@ -3250,7 +3470,13 @@ class Agent:
                                            save=False)
                 except Exception:
                     pass
-                receipts.append(self._incremental_receipt(rel, symbol, True))
+                receipt = self._incremental_receipt(
+                    rel, symbol, True, repairs=max(0, attempt))
+                receipts.append(receipt)
+                # Collapse the target request and any rejected drafts back to
+                # P, leaving only the compact verified receipt in the tail.
+                self._collapse_repair_turns(msgs, prefix_index,
+                                            receipt=receipt)
                 self._emit("incremental_edit", target=n, of=total, ok=True,
                            attempt=attempt + 1)
                 if verbose:
@@ -3387,6 +3613,10 @@ class Agent:
                     "Blocks only after a one-line explanation."
                     + (_NEED_HINT if self._rehydration_rounds_left() else "")
                     + rehyd}]
+        # Snapshot P before the repair generation. A usable corrected reply
+        # collapses any NEED/rehydration turns _chat_needs appended, leaving
+        # one clean accepted reply; an exhausted repair keeps its failure.
+        repair_prefix = len(msgs)
         try:
             new = self._chat_needs(
                 lambda m: self._chat_at("temperature_repair", m, client=client,
@@ -3401,6 +3631,7 @@ class Agent:
             print("  [repair: re-ask produced no usable fix; failing checks "
                   "remain]", file=sys.stderr)
             return ""
+        self._collapse_repair_turns(msgs, repair_prefix, clean_reply=new)
         return new
 
     def _model_verify(self, task: str, reply: str, gathered: str):

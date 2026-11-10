@@ -749,7 +749,14 @@ def schema_for(cfg) -> dict:
         actions.append("remember")
     if pack == "full" and _skills_exist(cfg):
         actions.append("skill")
-    if getattr(cfg, "allow_subagents", False) and not tiny:
+    if getattr(cfg, "allow_subagents", False) and (
+            not tiny
+            or str(getattr(cfg, "scout_profile", "") or "").strip()
+            or _PRUNE_TRIGGERS["task"].search(
+                str(getattr(cfg, "_task_text", "") or ""))):
+        # A tiny profile gets `task` only when the task text asks for a
+        # subagent/delegate/research, unless a scout profile is available to
+        # absorb the child's lookups without touching the architect's slot.
         actions.append("task")
     if getattr(cfg, "allow_fetch", False) and not tiny:
         actions.append("fetch")
@@ -4182,10 +4189,13 @@ def web_search(cfg, query: str) -> str:
     return "\n".join(lines)
 
 
-def dispatch(index, cfg, step: dict, client=None) -> str:
+def dispatch(index, cfg, step: dict, client=None, agent=None,
+             parent=None) -> str:
     """Route one parsed agent step (matching STEP_SCHEMA) to its tool_*
     function and return the text observation. `client` is only needed for
-    semantic search, screenshot and browser vision descriptions."""
+    semantic search, screenshot and browser vision descriptions. `agent`/
+    `parent`, when supplied, is the parent Agent a `task` subagent hands its
+    evidence back to; otherwise the back-reference on `cfg` is used."""
     if not isinstance(step, dict):
         return f"ERROR: malformed step (expected an object, got {type(step).__name__})."
     action = _as_text(step.get("action")).strip()
@@ -4225,7 +4235,10 @@ def dispatch(index, cfg, step: dict, client=None) -> str:
         return skills.tool_skill(index, cfg, step.get("symbol", ""))
     if action == "task":
         from . import subagent
-        return subagent.tool_task(index, cfg, client, step.get("content", ""))
+        owner = parent if parent is not None else (
+            agent if agent is not None else getattr(cfg, "_agent", None))
+        return subagent.tool_task(index, cfg, client, step.get("content", ""),
+                                  parent=owner)
     if action == "question":
         return ("ERROR: `question` is only available in an interactive "
                 "session. State the ambiguity in your answer and take the "

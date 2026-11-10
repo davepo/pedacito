@@ -416,6 +416,12 @@ class Config:
     fuzzy_min_ratio: float = 0.85
     # Repair round-trips per apply when a search/replace block fails to match.
     repair_rounds: int = 2
+    # On a successful repair, pop the failed draft and its error-diagnostic
+    # turns from the conversation tail back to the snapshot taken before the
+    # hunk/repair request. The KV prefix at that earlier position is reused
+    # instead of carrying broken code into later hunks. Exhausted repairs keep
+    # their final failure state intact for telemetry and failure memory.
+    collapse_repair_turns: bool = True
     # Ask the model to open an edit reply with 1-3 lines naming the file, the
     # lines or symbol it will change, and why (and to put no other text between
     # or inside blocks). On by default. Set false to ablate it. A prompt
@@ -2184,6 +2190,7 @@ request_max_tokens_cap = 32768
 flat_map_token_budget = 4000
 file_card_line_ranges = true
 repair_rounds = 2
+collapse_repair_turns = true
 backup = true
 log_sessions = true
 review = false
