@@ -615,8 +615,10 @@ def test_cli_mcp_list(tmp_path, capsys, monkeypatch):
     user = tmp_path / "cfg.toml"
     user.write_text(
         '[server]\nbase_url = "http://127.0.0.1:1/v1"\nmodel = "m"\n'
-        f'[mcp_servers.fake]\ncommand = "{sys.executable}"\n'
-        f'args = ["{FAKE}"]\n')
+        # json.dumps gives a TOML basic string with backslashes escaped:
+        # a raw Windows path (C:\...) is invalid TOML ("Unescaped '\'").
+        f'[mcp_servers.fake]\ncommand = {json.dumps(sys.executable)}\n'
+        f'args = [{json.dumps(str(FAKE))}]\n')
     monkeypatch.setattr(config_mod, "USER_CONFIG", user)
     rc = main(["mcp", "list", "--root", str(tmp_path)])
     out = capsys.readouterr().out
