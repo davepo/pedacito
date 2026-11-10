@@ -299,11 +299,13 @@ def _write_json(path: Path, data) -> None:
 
 
 def _facts_doc(root) -> dict:
-    """The micro-fact document: {facts, pending, retired, anti_patterns}.
+    """The micro-fact document: {facts, pending, retired, anti_patterns,
+    promoted}.
 
     Rebuilt from a whitelist of keys on every read, so any writer sees the
-    same shape; `anti_patterns` (the repair lesson ledger) must be listed
-    here or another writer's round-trip would silently drop it."""
+    same shape; `anti_patterns` (the repair lesson ledger) and `promoted`
+    (lessons that graduated into auto-managed path-scoped rules) must be
+    listed here or another writer's round-trip would silently drop them."""
     raw = _read_json(micro_facts_file(root), {})
     facts = [f for f in raw.get("facts", ())
              if isinstance(f, dict) and f.get("fact_id") and f.get("text")]
@@ -313,10 +315,14 @@ def _facts_doc(root) -> dict:
                if isinstance(f, dict) and f.get("fact_id")]
     anti = [a for a in raw.get("anti_patterns", ())
             if isinstance(a, dict) and a.get("lesson_id") and a.get("text")]
+    promoted = [a for a in raw.get("promoted", ())
+                if isinstance(a, dict) and a.get("lesson_id") and a.get("text")
+                and str(a.get("promoted_to", "")).startswith(RULES_REL + "/")]
     return {"facts": facts[-_MAX_MICRO_FACTS:],
             "pending": pending[-_MAX_PENDING_FACTS:],
             "retired": retired[-_MAX_MICRO_FACTS:],
-            "anti_patterns": anti[-_MAX_ANTI_PATTERNS:]}
+            "anti_patterns": anti[-_MAX_ANTI_PATTERNS:],
+            "promoted": promoted[-_MAX_PROMOTED:]}
 
 
 # ------------------------------------------------- repair lesson ledger ---
@@ -328,10 +334,184 @@ def _facts_doc(root) -> dict:
 # lesson is ONE line, distilled mechanically from the check findings (never
 # from LLM prose: the distilled kind and file set are what make the line
 # trustworthy), capped at eight, and auto-retired once the files it names
-# are gone. These are hints injected under [REPO GOTCHAS & LESSONS], not
-# truth; the loop still re-checks everything live.
+# are gone. A lesson confirmed twice whose files all live under one
+# subdirectory graduates into an auto-managed path-scoped rule
+# (.pedacito/rules/auto_<scope>.md) and leaves the global ledger. These are
+# hints injected under [REPO GOTCHAS & LESSONS], not truth; the loop still
+# re-checks everything live.
 
 _MAX_ANTI_PATTERNS = 8
+_MAX_PROMOTED = 24                # promoted rows are bounded by rule files
+RULES_REL = ".pedacito/rules"     # where scoped rule files live
+_AUTO_RULE_PREFIX = "auto_"       # only these files are auto-managed
+_MAX_AUTO_RULE_LINES = 5          # lesson lines per auto rule file
+_PROMOTION_CONFIRMATIONS = 2      # a lesson must repeat before it graduates
+
+
+def _lesson_scope(files) -> str:
+    """The single subdirectory every lesson file lives under ('' when the
+    lesson names no files, names a repo-root file, or the files share no
+    parent directory -- root-scatter has no honest glob to scope it by)."""
+    dirs: list[list[str]] = []
+    for f in files or ():
+        rel = str(f).replace("\\", "/").strip().lstrip("/")
+        if rel.startswith("./"):
+            rel = rel[2:]
+        if not rel:
+            continue
+        parts = rel.split("/")
+        if len(parts) < 2:
+            return ""             # a file at the repository root
+        dirs.append(parts[:-1])
+    if not dirs:
+        return ""
+    common: list[str] = []
+    for segs in zip(*dirs):
+        if all(s == segs[0] for s in segs):
+            common.append(segs[0])
+        else:
+            break
+    return "/".join(common)
+
+
+def _sanitize_scope(scope: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "_", scope.lower()).strip("_") or "scope"
+
+
+def _is_auto_generated(meta: dict) -> bool:
+    return str(meta.get("auto_generated", "")).lower() in ("true", "yes", "1")
+
+
+def _auto_rule_body(scope: str, lines: list[str]) -> str:
+    """The deterministic full text of one auto-managed rule file."""
+    head = (f"# Repair lessons for `{scope}/` "
+            "(auto-promoted by Pedacito; edit or delete freely)\n")
+    return ("---\n"
+            f"paths: {scope}/*\n"
+            "auto_generated: true\n"
+            "---\n\n" + head + "\n".join(lines) + "\n")
+
+
+def _try_promote_lesson(root, row: dict, doc: dict) -> None:
+    """Graduate a twice-confirmed, directory-scoped lesson out of the global
+    8-slot ledger into `.pedacito/rules/auto_<scope>.md`.
+
+    The row moves to `doc["promoted"]` with a `promoted_to` pointer, so it is
+    no longer injected into the stable system prefix on unrelated tasks; it
+    reaches the model only appended to a `read`/`context` observation whose
+    file matches the rule's `paths:` glob (agent._scoped_rules). Never
+    raises: promotion is an optimization, and a lesson that cannot graduate
+    is still a lesson. A pre-existing rule file of the same name is touched
+    only when it carries `auto_generated: true`; a user-authored file with
+    that name wins, and the lesson stays global."""
+    try:
+        if int(row.get("confirmations", 1) or 1) < _PROMOTION_CONFIRMATIONS:
+            return
+        scope = _lesson_scope(row.get("files", ()))
+        if not scope:
+            return
+        name = _AUTO_RULE_PREFIX + _sanitize_scope(scope) + ".md"
+        rules_dir = Path(root) / RULES_REL
+        path = rules_dir / name
+        line = f"- {row.get('kind', 'note')}: {row['text']}"
+        if path.exists():
+            try:
+                meta, body = _frontmatter(
+                    path.read_text(encoding="utf-8"))
+            except OSError:
+                return
+            if not _is_auto_generated(meta):
+                return            # a user-authored file owns this name
+            lines = [l for l in body.splitlines() if l.startswith("- ")]
+            if line not in lines:
+                if len(lines) >= _MAX_AUTO_RULE_LINES:
+                    return        # scope file is full: lesson stays global
+                lines.append(line)
+                try:
+                    path.write_text(_auto_rule_body(scope, lines),
+                                    encoding="utf-8")
+                except OSError:
+                    return
+        else:
+            try:
+                rules_dir.mkdir(parents=True, exist_ok=True)
+                path.write_text(_auto_rule_body(scope, [line]),
+                                encoding="utf-8")
+            except OSError:
+                return
+        doc["anti_patterns"] = [a for a in doc["anti_patterns"]
+                                if a.get("lesson_id") != row["lesson_id"]]
+        row["promoted_to"] = f"{RULES_REL}/{name}"
+        doc["promoted"] = (list(doc.get("promoted", ())) + [row])[-_MAX_PROMOTED:]
+    except Exception:
+        pass
+
+
+def _drop_promoted_line(root, row: dict) -> bool:
+    """Remove one promoted lesson's bullet from its auto rule file. Only
+    ever touches `auto_*.md` files that still carry `auto_generated: true`
+    -- a user who edited or renamed the flag keeps their file byte-exact."""
+    rel = str(row.get("promoted_to") or "")
+    if not rel.startswith(RULES_REL + "/") \
+            or not Path(rel).name.startswith(_AUTO_RULE_PREFIX):
+        return False
+    p = Path(root) / rel
+    try:
+        text = p.read_text(encoding="utf-8")
+    except OSError:
+        return False
+    end = text.find("\n---", 3)
+    if end == -1:
+        return False
+    meta, _body = _frontmatter(text)
+    if not _is_auto_generated(meta):
+        return False
+    line = f"- {row.get('kind', 'note')}: {row['text']}"
+    tail = text[end + 4:]
+    kept = [l for l in tail.splitlines() if l.strip() != line]
+    if len(kept) == len(tail.splitlines()):
+        return False
+    try:
+        p.write_text(text[:end + 4] + "\n".join(kept) + "\n",
+                     encoding="utf-8")
+    except OSError:
+        return False
+    return True
+
+
+def _prune_promoted(root, doc: dict) -> bool:
+    """Self-cleaning mirror of the anti-pattern retirement: when every file
+    a promoted lesson names has been deleted, drop the lesson line from its
+    auto rule, and delete an auto rule that no longer carries any lesson.
+    Returns True when the document changed."""
+    changed = False
+    keep = []
+    for a in doc["promoted"]:
+        files = [str(f).replace("\\", "/") for f in a.get("files", ())
+                 if str(f).strip()]
+        if files and not any((root / f).exists() for f in files):
+            _drop_promoted_line(root, a)
+            changed = True
+            continue
+        keep.append(a)
+    doc["promoted"] = keep
+    rules_dir = root / RULES_REL
+    if rules_dir.is_dir():
+        for p in sorted(rules_dir.glob(_AUTO_RULE_PREFIX + "*.md")):
+            try:
+                meta, body = _frontmatter(p.read_text(encoding="utf-8"))
+            except OSError:
+                continue
+            if not _is_auto_generated(meta):
+                continue
+            if any(l.startswith("- ") for l in body.splitlines()):
+                continue
+            try:
+                p.unlink()        # empty auto rule: nothing left to teach
+                changed = True
+            except OSError:
+                pass
+    return changed
 
 
 def _lesson_identity(kind: str, text: str) -> str:
@@ -359,6 +539,17 @@ def record_anti_pattern(root, kind: str, text: str,
     lesson_id = _lesson_identity(kind, text)
     now = time.time()
     doc = _facts_doc(root)
+    promoted = next((a for a in doc["promoted"]
+                     if a.get("lesson_id") == lesson_id), None)
+    if promoted is not None:
+        # Already graduated into a path-scoped rule: refresh the row where it
+        # lives, never re-add it to the global ledger.
+        promoted["confirmations"] = int(promoted.get("confirmations", 1) or 1) + 1
+        promoted["last_seen"] = now
+        promoted["files"] = sorted({str(f) for f in (files or ())}
+                                   | {str(f) for f in promoted.get("files", ())})[:8]
+        _write_json(micro_facts_file(root), doc)
+        return promoted
     existing = next((a for a in doc["anti_patterns"]
                      if a.get("lesson_id") == lesson_id), None)
     if existing is not None:
@@ -366,13 +557,16 @@ def record_anti_pattern(root, kind: str, text: str,
         existing["last_seen"] = now
         existing["files"] = sorted({str(f) for f in (files or ())}
                                    | {str(f) for f in existing.get("files", ())})[:8]
-        _write_json(micro_facts_file(root), doc)
-        return existing
-    row = {"lesson_id": lesson_id, "kind": kind, "text": text,
-           "files": sorted({str(f) for f in (files or ())})[:8],
-           "confirmations": 1, "last_seen": now}
-    doc["anti_patterns"].append(row)
-    doc["anti_patterns"] = doc["anti_patterns"][-_MAX_ANTI_PATTERNS:]
+        row = existing
+    else:
+        row = {"lesson_id": lesson_id, "kind": kind, "text": text,
+               "files": sorted({str(f) for f in (files or ())})[:8],
+               "confirmations": 1, "last_seen": now}
+        doc["anti_patterns"].append(row)
+        doc["anti_patterns"] = doc["anti_patterns"][-_MAX_ANTI_PATTERNS:]
+    # A lesson that has now proven itself twice *and* names one directory
+    # graduates into a path-scoped rule and leaves the global prefix (§24).
+    _try_promote_lesson(root, row, doc)
     _write_json(micro_facts_file(root), doc)
     return row
 
@@ -380,7 +574,8 @@ def record_anti_pattern(root, kind: str, text: str,
 def load_anti_patterns(root, prune: bool = True) -> list[dict]:
     """Live lessons; entries whose every named file is gone are retired and
     dropped from the document (a lesson about a deleted component would
-    otherwise outlive the thing it warns about)."""
+    otherwise outlive the thing it warns about). Promoted lessons get the
+    same retirement, symmetrically cleaning their auto rule files."""
     root = Path(root) if root else None
     doc = _facts_doc(root)
     live, gone = [], []
@@ -391,10 +586,18 @@ def load_anti_patterns(root, prune: bool = True) -> list[dict]:
             gone.append(a)
         else:
             live.append(a)
-    if gone and root is not None:
+    cleaned = False
+    if prune and root is not None:
+        cleaned = _prune_promoted(root, doc)
+    if (gone or cleaned) and root is not None:
         doc["anti_patterns"] = live
         _write_json(micro_facts_file(root), doc)
     return live
+
+
+def load_promoted_lessons(root) -> list[dict]:
+    """Promoted lessons still carried by auto-managed rule files."""
+    return list(_facts_doc(root)["promoted"])
 
 
 def render_anti_patterns(root, cfg=None, limit: int | None = None) -> str:

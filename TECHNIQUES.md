@@ -226,6 +226,29 @@ The cheapest reliable feedback is the code itself:
   other environment directories are discarded, as are unrelated pre-existing
   failures, so the model sees the code that actually broke and not a
   transcript.
+- **Import auto-healing (`auto_heal_imports`).** NEW F821 findings from the
+  static gate (§19) are first healed by the harness itself, before the model
+  ever sees them: a stdlib top-level name gets the canonical
+  `import <name>`, and a project name exported by *exactly one* local module
+  gets `from <module> import <name>` inserted after the header block. Every
+  candidate insertion is validated with `ast.parse` plus the same AST scope
+  resolver the gate uses, and kept only when it resolves the undefined name
+  and introduces no new error key. Anything ambiguous is never guessed: star
+  imports, `exec`/`eval`/`locals` in the file, builtins, already-bound names,
+  and names two modules export all go to the model untouched. The gate then
+  re-runs on the healed files, so a repair round only pays for what
+  computation could not fix; each insertion leaves a one-line receipt in the
+  event log. Ablation flag: `auto_heal_imports = false`.
+- **Repair-trajectory surgical collapse (`collapse_repair_turns`).** The
+  conversation is snapshotted immediately before every hunk or repair ask.
+  When the repair succeeds, the failed drafts and their diagnostic turns are
+  surgically popped off the message list -- the list is truncated back to the
+  snapshot and a compact receipt (incremental mode) or the accepted reply
+  takes their place -- so every byte the server had already cached stays
+  cached and the next step is a prefix-cache hit instead of a re-prefill of a
+  broken trajectory. An exhausted repair never collapses: its final failure
+  stays visible to telemetry and shallow-failure memory. Ablation flag:
+  `collapse_repair_turns = false`.
 
 Why single-hunk generation prevents patch corruption on 4B–9B models: a large
 reply makes three failures correlated. The model must copy several SEARCH
@@ -316,6 +339,18 @@ gather is by **appending** at the conversation tail.
   check. Where no recorded evidence is anywhere near, nothing rehydrates: a
   model that never read a file should have `read` it during gather, not be
   handed unseen code to copy from.
+- **Subagent EvidenceSpan transfer.** When the gather loop delegates
+  research to the `task` helper, the child's *conversation* never crosses
+  the boundary: its ephemeral turns are dropped when it returns, and what
+  crosses back is its digest plus the 1-2 highest-utility spans it actually
+  read and pinned -- selected deterministically (requirement matches first,
+  then pinned child evidence, then span size and recency), deduplicated by
+  file/range/content hash so the parent tail never repeats the same source
+  twice, copied into the parent's evidence store *and* read ledger, and
+  appended to the parent's conversation tail under the same read-token
+  budget as a normal `read`. The parent may then edit lines the child
+  displayed: `check_unread` credits transferred spans, so re-`read`ing the
+  same bytes to satisfy the harness would cost tokens for nothing.
 
 Why it helps: this is Guiding Constraint #2 applied to the phases after
 gather. A reply that needs one more span gets it, instead of hallucinating a
@@ -552,6 +587,16 @@ and `new --complex`:
   freshest contracts survive the cap; `new`'s build passes read the same map
   ("PUBLIC API"). Deterministic AST/regex parsing: zero model tokens, no
   subprocess, re-run per task.
+- **Fixture signature locking.** `conftest.py` fixtures are part of the same
+  contract surface: `extract_pytest_fixtures` walks every discovered
+  conftest with `ast.parse` (zero subprocesses, zero model calls), captures
+  each `@pytest.fixture` function's exact signature, literal scope and a
+  one-line docstring/yield hint, and appends a bounded
+  `# pytest fixtures (conftest.py)` subsection to the contract block --
+  only when the repository has conftest files or the task mentions tests, so
+  a non-Python project pays nothing. A test-writing step can no longer
+  invent a fixture name or call one with parameters it does not accept:
+  the signature the test must use is quoted to it before it writes.
 - **The gate.** After every applied task, beside the existing syntax gate,
   `verify_cross_file_contracts` walks every local import and imported-name
   call in the project: a `from parser import parse_row` that references a
@@ -561,7 +606,13 @@ and `new --complex`:
   diagnostic (`ContractError in cli.py:18: imports 'parse_row' from
   parser.py, but parser.py only defines ['parse_line', 'TableParser']`) is
   fed straight into the repair prompt instead of letting the error propagate
-  through three more steps.
+  through three more steps. JS/TS ES modules run the same contract through
+  the same gate (`_js_cross_file_errors`): a relative `import ... from
+  './x.js'` must point at a file that exists and name exports the target
+  really has, and imported calls are arity-checked against the exporter's
+  scanned signature -- bare packages and dynamic imports are deliberately
+  out of scope. (§23's frontend gate reports the same findings scoped to
+  the touched files.)
 - **Deliberately conservative.** Unknown absolute imports are treated as
   third-party, star-imports and shadowed names are trusted, classes without
   an explicit `__init__` are never arity-checked: a false positive would
@@ -615,6 +666,14 @@ tests, or after a repair round trips through the model. `static_gate`
   exact lines, without ever spawning `--verify`. And through `verify.check`,
   so `preflight`, `best_of` scoring, and the incremental per-hunk gate all
   reject a hunk that breaks name resolution -- before it is ever written.
+- **Heal before asking (`auto_heal_imports`, §5).** In every one of those
+  seats, NEW F821 findings are offered to deterministic import auto-healing
+  first (`heal_static_gate_errors`): names with exactly one provable import
+  (stdlib top-level modules, or a project symbol exported by one module)
+  are fixed on disk, the gate re-runs, and only findings that survive reach
+  the model. A forgotten `import json` costs a file write and zero tokens;
+  the repair prompt sees exactly what it would have seen had the healing
+  feature not existed.
 
 Tokens spent: zero, unless the gate finds something, when it buys the
 cheapest possible repair prompt ("these names do not exist here") instead of
@@ -781,6 +840,16 @@ static gate) closes that gap with three mechanical checks:
   otherwise the tree-sitter grammar the indexer already uses reports the
   first ERROR node. With neither available the check stays silent -- no
   regex pretends to be a JS parser.
+- **ES module contracts.** A relative `import ... from './util.js'` must
+  resolve to a file that exists and name exports that file really has --
+  the exporter's surface is scanned with the indexer's tree-sitter grammar
+  (`export function/const/class`, `export {a, b}`, `export default`, and
+  `export ... from` re-exports) -- and a call to an imported function is
+  arity-checked against the exporter's real signature, the same
+  `ContractError` diagnostics and same conservative skips as §18's Python
+  gate (`_js_cross_file_errors` is shared by both). Bare package imports and
+  dynamic `import()` are deliberately absent: bundler territory, not
+  static-check territory.
 
 Errors share the shape the repair path already reads:
 
@@ -847,6 +916,36 @@ hints, not truth):
   just hidden -- because a warning about a component that no longer exists
   would teach the model to dodge a ghost. The render budget is the same
   `max_micro_fact_tokens` knob; overflow drops the oldest lines first.
+- **Path-scoped rule promotion.** A lesson that has proven itself twice
+  *and* whose named files all live under one subdirectory (`src/api/...`,
+  `frontend/...`) graduates out of the global ledger: the harness writes it
+  into a deterministic auto-managed rule file
+  `.pedacito/rules/auto_<scope>.md` --
+
+  ```markdown
+  ---
+  paths: src/api/*
+  auto_generated: true
+  ---
+  ```
+
+  holding at most five deduplicated one-line lessons for that directory --
+  and the JSON row moves to the document's `promoted` list with a
+  `promoted_to` pointer. A repo-root file in the set, or files with no
+  shared parent, disqualify the lesson: a glob of `*` is not a scope, and
+  such lessons stay global. Graduated lessons no longer spend the eight-slot
+  budget and no longer ride the stable system prefix on unrelated tasks;
+  they reach the model only appended to the tail of a `read` or `context`
+  observation whose file matches the rule's glob -- the same mechanism as
+  hand-authored scoped rules, so the system prompt is never mutated
+  mid-gather and the byte-pinned prefix cache stays intact. Cleaning is
+  symmetric with retirement: when every file a promoted lesson names has
+  been deleted, its line is dropped from the rule file; when a rule file
+  holds no lessons left, the file itself is deleted. Only files bearing
+  `auto_generated: true` are ever written or pruned -- a user-authored
+  `auto_*.md` with a colliding name wins, permanently, and the lesson stays
+  in the global ledger. Re-confirming a promoted lesson refreshes the row
+  in place; it never resurrects a second copy.
 - **Hint, never truth.** Like micro-facts and memory, the block is labelled
   and sits in the prompt only: the loop re-checks everything live, so a
   wrong lesson costs a glance, not a wrong decision.
@@ -1039,6 +1138,20 @@ scout's gathered material in one context, so routing cannot introduce a
 "second model misunderstood the task" failure mode: the architect sees the
 identical transcript.
 
+The same hardware-safety rule governs the `task` subagent on a single-slot
+local server -- a server that keeps exactly one model's KV prefix resident.
+Forking a helper with its own fresh system prompt would evict the architect's
+cached conversation and make the parent's very next step pay a full
+re-prefill, so the child never sends one: it forks the parent's stable
+prefix **byte-for-byte** (`prefix_messages`), and the helper brief rides at
+the tail as a normal assistant/user pair -- the identical append-only shape
+every other mid-gather payload uses (§11). The child reads and digests
+inside its own tail-appended turns; when it returns, only its digest and
+its best pinned EvidenceSpans cross back (§11), and the parent's cached
+prefix has not been disturbed at any point. Ablating the prefix fork would
+turn each delegated lookup into a cache miss for the whole rest of the
+gather.
+
 Cost: a second server (or a second model slot), a warm-up ping before the
 first step, and one more config surface -- the GUI shows an active scout as
 a `Scout: <profile>` badge next to the model chip so it is never invisible
@@ -1139,13 +1252,17 @@ listing budget per server, and one permission dialog per call to an
 untrusted server. The legacy command-list path is untouched and both formats
 coexist.
 
-## Quick reference: techniques 22 to 30
+## Quick reference: techniques 5, 11, 22 to 30
 
 | Technique | Section | How to turn it off | Where you see it |
 |---|---|---|---|
+| Import auto-healing (`auto_heal_imports`) | §5, §19 | `auto_heal_imports = false` | `[AUTO-HEALED: added 'import json' in x.py]` lines before repair rounds; "import auto-heal" in the event log |
+| Repair-trajectory collapse (`collapse_repair_turns`) | §5 | `collapse_repair_turns = false` | `repair_collapse` telemetry events; successful repairs leave a receipt, not the broken drafts |
+| Subagent EvidenceSpan transfer + single-slot prefix fork | §11, §28 | No flag (part of the `task` subagent) | `subagent_evidence` telemetry; promoted source appended under `HELPER RESULT` |
 | Live test introspection (`run_test`) | §22 | `enable_run_test_in_gather = false` (each run then asks first) | A gather action. Permission dialog category **Test Execution** |
-| Frontend contract checks (`verify_frontend_contracts`) | §23 | `frontend_contracts = false` | Automatic after applied edits. `pedacito webcheck` for an on-demand check |
+| Frontend contract checks (`verify_frontend_contracts`), incl. ESM export/arity | §23 | `frontend_contracts = false` | Automatic after applied edits. `pedacito webcheck` for an on-demand check |
 | Repair lesson ledger (anti-patterns) | §24 | `micro_facts = false` (also silences §14) | `.pedacito/micro_facts.json`, under `anti_patterns` |
+| Auto-promoted path-scoped rules | §24 | `micro_facts = false` (also silences §14/§24) | `.pedacito/rules/auto_*.md`, `auto_generated: true`; `promoted` rows in `micro_facts.json` |
 | Zero-anchor AST symbol splicing | §25 | No flag. Steer with `edit_style`; plain SEARCH/REPLACE still works | `<<<<<<< SYMBOL`, `AFTER_SYMBOL` edit blocks, and the `replace_symbol` payload |
 | Deterministic rename (`rename_symbol`) | §26 | None for the CLI and GUI. The agent action needs `allow_write = true` | `pedacito rename`, and **Project ▾ → Rename symbol…** |
 | Engine-enforced JSON schema | §27 | `enforce_json_schema = false` | Automatic on every structured call. `pedacito config --doctor` shows the tier |

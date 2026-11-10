@@ -102,7 +102,7 @@ Step-by-step versions, with what you should see at each point, are in
 | **Safe writes** | Dry run by default, side-by-side review, backups before every write, `pedacito restore` to undo | [Review page](#review-page) |
 | **Live test introspection** | During investigation the model can run one scoped `pytest` check and read the live traceback before it writes a fix. On by default (`enable_run_test_in_gather`) | [Scoped test runs](#scoped-test-runs-during-investigation) |
 | **Frontend contract checks** | Before tests run, local `<script src>` and `<link href>` files must exist, and literal `getElementById` and `querySelector('#id')` lookups must match the HTML ids | [Frontend contract checks](#frontend-contract-checks) |
-| **Repair lessons** | A repair that fixes a failed check leaves a deduplicated, repo-specific lesson in `.pedacito/micro_facts.json` for future runs | [Repair lessons](#repair-lessons-and-repo-gotchas) |
+| **Repair lessons** | A repair that fixes a failed check leaves a deduplicated, repo-specific lesson in `.pedacito/micro_facts.json`; a lesson a directory proves twice is promoted into an auto-managed path-scoped rule (`.pedacito/rules/auto_*.md`) that only shows up when the model reads that directory | [Repair lessons](#repair-lessons-and-repo-gotchas) |
 | **Symbol-level edits and rename** | Replace a whole function by name without echoing its old text, or rename a symbol across the project with no model call (`pedacito rename`) | [Editing](#editing-searchreplace-not-diffs) |
 | **Engine-enforced JSON and scout routing** | Lookup steps are constrained by the server's JSON schema support, and `scout_profile` sends the lookups to a fast model while the big model plans and edits | [Model guide](MODEL_GUIDE.md#dual-gpu--dual-model-scout--architect-routing-scout_profile) |
 
@@ -676,7 +676,10 @@ edit or delete:
   assistant is refused. It is shown to the model as *hints, not truth*.
 - **Rules** (`.pedacito/rules/*.md` with a `paths: src/api/*.py` frontmatter
   line, and nested `AGENTS.md`/`CLAUDE.md` files) are shown only when the model
-  reads a matching file.
+  reads a matching file. Pedacito also auto-manages `auto_*.md` rule files here
+  (repair lessons promoted from `micro_facts.json`; see
+  [Repair lessons](#repair-lessons-and-repo-gotchas)) -- anything without the
+  `auto_generated: true` frontmatter flag is never written or deleted by it.
 - **Skills** are named procedures (`.pedacito/skills/NAME/SKILL.md`, or
   `skills/NAME/SKILL.md` next to your config). The model sees a one-line
   catalog and loads a skill's text only when it needs it. Five starters ship
@@ -701,6 +704,14 @@ was and that the fix worked. The lesson goes to `.pedacito/micro_facts.json` und
   fills in the names from the failure, so it can be checked by the same tools.
 - **Bounded and self-cleaning.** At most eight lessons are kept. Repeats are merged
   and counted, not added. A lesson about files that no longer exist is dropped.
+- **Scoped, not shouted, when they repeat.** A lesson confirmed twice whose
+  files all live under one directory (`src/api/...`, `frontend/...`) is promoted
+  into an auto-managed path-scoped rule at `.pedacito/rules/auto_<dir>.md`
+  (`paths: <dir>/*`, `auto_generated: true`, up to five deduplicated lines). It
+  then shows up only when the model reads a file in that directory -- not in
+  every prompt of every task. When the files a promoted lesson names are all
+  deleted, its line is dropped and an empty auto rule is removed. Files without
+  the `auto_generated: true` flag are yours; Pedacito never edits or deletes them.
 - **Hints, never truth.** The loop re-checks everything live, so a wrong lesson
   costs a glance, not a wrong change.
 
@@ -786,14 +797,20 @@ Three more guards run without a model call:
 - **Interface lock** (`interface_lock`, on by default). Before each task, the
   project's public signatures (`def parse_line(text, sep=',')`, class
   constructors, JS/TS functions) are injected into the prompt under a
-  "do not break signatures" heading. After each applied task, every local
-  import and call is checked against those signatures. A mismatch fails the task
+  "do not break signatures" heading, together with a `conftest.py` fixtures
+  subsection (exact fixture signatures and scopes) whenever the repository
+  has fixtures or the task touches tests. After each applied task, every
+  local import and call -- Python and JS/TS ES-module exports alike -- is
+  checked against those signatures. A mismatch fails the task
   before any test runs, and the exact message goes into the repair prompt.
 - **Static gate** (`static_gate`, on by default). Changed Python files get a
   fast check for undefined names and syntax errors (`ruff` rules F821, F822,
   F823, F402, F404, with E999 for syntax). Ruff gets a 3-second ceiling
   (`static_gate_timeout`), and a built-in checker takes over if ruff is missing or
-  slow. Only errors the project did not already have count.
+  slow. Only errors the project did not already have count. And when a new
+  undefined name provably has exactly one import -- a standard-library module,
+  or a symbol only one local file exports -- Pedacito inserts that import
+  itself before the model is ever asked (`auto_heal_imports`, on by default).
 - **Green ratchet** (`auto_green_ratchet`, on by default). Before each step,
   Pedacito snapshots the source files into `.pedacito/checkpoints/`. A step that
   still fails after its repair rounds is rolled back to that snapshot, and the
@@ -1463,7 +1480,9 @@ config --reference` prints the annotated template. Key settings:
 | `enforce_json_schema` | true | Ask the engine to constrain gather steps with `response_format` json_schema (strict); servers that refuse are downgraded to json_object, then plain prompting, per model. |
 | `enable_run_test_in_gather` | true | Let the gather loop run one scoped pytest check (a file or node id) to see live tracebacks. `false` makes each run ask the permission broker. |
 | `frontend_contracts` | true | Before tests run, check local script/stylesheet links, literal DOM id lookups and changed JavaScript syntax. |
-| `micro_facts` / `max_micro_fact_tokens` | true / 150 | Record confirmed commands and repair lessons in `.pedacito/micro_facts.json` and inject them as hints; the token cap applies to the injected block. |
+| `auto_heal_imports` | true | Before a static-gate finding reaches the model, insert the one import that provably resolves it (stdlib name, or a symbol exactly one local module exports), verified by the AST checker; ambiguous names are never guessed. |
+| `collapse_repair_turns` | true | When a repair succeeds, drop the failed drafts from the conversation tail and keep a compact receipt, so the server's prompt-prefix cache is reused instead of re-prefilling the broken trajectory. |
+| `micro_facts` / `max_micro_fact_tokens` | true / 150 | Record confirmed commands and repair lessons in `.pedacito/micro_facts.json` and inject them as hints; the token cap applies to the injected block. A lesson confirmed twice for one directory is promoted into an auto-managed path-scoped rule in `.pedacito/rules/auto_*.md` instead of sitting in every prompt. |
 | `tier` | `""` | Budget preset: `tiny`/`small`/`medium`/`large`/`hosted`; guessed from the model name when unset. |
 | `max_steps` | 0 | Lookup limit per task; 0 = none. |
 | `prefetch_targets` | 0 | Read up to this many task-named files/symbols through the normal tool path before the first lookup step (and once more after gather when a named target is still unread). Prefetch reads don't count toward `max_steps`. |

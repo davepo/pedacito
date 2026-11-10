@@ -320,6 +320,8 @@ _MORE_TO_DO_RE = re.compile(
 )
 # First line of a successful tool_read observation: "prep/index.html lines 315-325:".
 _READ_HEAD_RX = re.compile(r"^(.+?) lines (\d+)-(\d+):")
+# File-mode `context` header (tools.tool_context): "FILE CONTEXT prep/app.js".
+_FILE_CTX_RX = re.compile(r"^FILE CONTEXT (\S+)", re.M)
 # A numbered source line in a read observation: "  42 | text".
 _NUMBERED_LINE_RX = re.compile(r"\s*(\d+) \|")
 _FILE_TOKEN_RX = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_./\-]*")
@@ -2684,8 +2686,18 @@ class Agent:
                 if not duplicate_read:
                     did_read = True
                     read_nudged = False     # progress re-arms the coverage nudge
+                    # Path-scoped rules ride the OBSERVATION TAIL only, never
+                    # the system prompt: mid-gather prompt edits would break
+                    # the byte-stable prefix the server cache pins.
                     if m:
                         obs += self._scoped_rules(m.group(1).strip())
+                    elif action == "context":
+                        rel = str(stepjson.get("file") or "").strip()
+                        if not rel:
+                            fm = _FILE_CTX_RX.search(obs)
+                            rel = fm.group(1) if fm else ""
+                        if rel:
+                            obs += self._scoped_rules(rel)
                 self._unread_files = self._compute_unread(self._targets_text)
             # Progress also means a lookup step RESOLVED a symbol the ledger
             # has never seen: naming a definition is information the answer

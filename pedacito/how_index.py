@@ -1586,6 +1586,9 @@ GUI_TOPICS = [
             "passes again in the same task",
             "The file keeps at most eight lessons, de-duplicated; a lesson about a "
             "file that was deleted is dropped",
+            "A lesson confirmed twice whose files share one directory is promoted "
+            "into an auto-managed path-scoped rule (.pedacito/rules/auto_<dir>.md) "
+            "shown only when the model reads a file in that directory",
             "To read or forget them, open .pedacito/micro_facts.json in your editor; "
             "deleting the file forgets everything it recorded",
             "⚙ Settings → All settings → search micro_facts to turn recording and "

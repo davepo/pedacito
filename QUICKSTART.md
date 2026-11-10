@@ -717,6 +717,9 @@ Per project, under `<project>/.pedacito/`:
 - `memory.md`, `reviews/` (saved review pages), and `log.txt` (event trace).
 - `micro_facts.json`: commands confirmed to work in this repository, and repair
   lessons under `anti_patterns`. A lesson is written only after a fix is verified.
+  A lesson confirmed twice whose files share one directory is promoted into an
+  auto-managed path-scoped rule (`rules/auto_*.md`) and leaves `anti_patterns`;
+  those files clean themselves up when the files they name are deleted.
   Safe to read, edit, or delete.
 
 Deleting the folder is always safe. You only pay for a re-index. `pedacito reset`
