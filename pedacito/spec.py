@@ -1588,14 +1588,31 @@ def _fe_js_syntax_problem(rel: str, text: str) -> str | None:
     node. No parser available: the check stays silent, never a guess."""
     node = shutil.which("node")
     if node:
+        payload = text.encode("utf-8", "replace")
+
+        def _check(*options: str) -> subprocess.CompletedProcess:
+            # `input` already wires stdin; passing `stdin=PIPE` too raises
+            # ValueError on every platform. The file may be a browser module
+            # (`import`/`export`) even though node checks stdin as CommonJS,
+            # so a script-mode failure is retried as an ES module.
+            return subprocess.run([node, *options, "--check", "-"],
+                                  input=payload, capture_output=True,
+                                  timeout=15)
+
         try:
-            proc = subprocess.run([node, "--check", "-"],
-                                  input=text.encode("utf-8", "replace"),
-                                  capture_output=True, timeout=15,
-                                  stdin=subprocess.PIPE)
+            proc = _check()
+            if proc.returncode != 0:
+                stderr = (proc.stderr or b"").decode("utf-8", "replace")
+                esm_only = ("Cannot use import statement outside a module"
+                            in stderr
+                            or "Unexpected token 'export'" in stderr
+                            or "Unexpected token 'import'" in stderr
+                            or "top level bodies of modules" in stderr)
+                if esm_only:
+                    proc = _check("--input-type=module")
+                    stderr = (proc.stderr or b"").decode("utf-8", "replace")
             if proc.returncode == 0:
                 return None
-            stderr = (proc.stderr or b"").decode("utf-8", "replace")
             line = 1
             msg = ""
             m = re.search(r"file\S*?:(\d+)", stderr)
