@@ -305,15 +305,279 @@ def _callee_name(fn) -> str:
     return ""
 
 
-def _walk_calls(node, out: set[str]) -> None:
+# Function-scope node types across the supported grammars: entering one
+# restarts the local-type map (parameter annotations only).
+_FUNC_SCOPE_NODES = {
+    "function_declaration", "generator_function_declaration",
+    "function_expression", "function", "arrow_function", "generator_function",
+    "method_definition", "method_declaration", "function_item",
+    "function_definition", "constructor_declaration", "closure_literal",
+    "func_literal", "init_declaration", "protocol_function_declaration",
+}
+
+
+# Binding statement node types whose local type a following call receiver
+# can pick up (`x = new Foo(); x.bar()`), per grammar.
+_BINDING_NODES = {
+    "variable_declarator", "assignment_expression", "assignment",
+    "let_declaration", "short_var_declaration", "var_spec", "const_spec",
+    "local_variable_declaration", "field_declaration",
+    "property_declaration",
+}
+
+
+def _text_id(node) -> str:
+    """Trimmed source text of a node ("" for None)."""
+    return node.text.decode("utf-8", "replace").strip() if node else ""
+
+
+_IDENT_RE = re.compile(r"[A-Za-z_$][\w$]*\Z")
+
+
+def _type_leaf(text: str) -> str:
+    """The class name an annotation/declared-type text carries: `*Server`,
+    `Server?`, `&Foo`, `Arc<Store>`-free simple names; "" for containers,
+    unions and generics (`Record<..>`, `Vec<Store>`, `A | B`)."""
+    t = text.strip().rstrip("?").lstrip("*&").strip()
+    if not t or "<" in t or "|" in t or "." in t or " " in t:
+        return ""
+    return t if _IDENT_RE.match(t) and t[:1].isupper() else ""
+
+
+def _node_type(node) -> str:
+    """Class name a type node carries, or ""."""
+    if node is None:
+        return ""
+    if node.type == "type_annotation":
+        inner = next((c for c in node.named_children
+                      if c.type != "predefined_type"), None)
+        return _node_type(inner) if inner is not None \
+            else _type_leaf(_text_id(node))
+    if node.type == "named_type":
+        nm = node.child_by_field_name("name")
+        if nm is not None:
+            return _type_leaf(_text_id(nm))
+    return _type_leaf(_text_id(node))
+
+
+def _ctor_type(value) -> str:
+    """Class name if the initializer node is constructor evidence
+    (`new Foo()`, `Foo()`, `Foo::new()`, `Foo {}`, `&Foo{}`), else ""."""
+    if value is None:
+        return ""
+    t = value.type
+    if t == "new_expression":
+        return _type_leaf(_callee_name(value.child_by_field_name("constructor")))
+    if t == "object_creation_expression":          # Java/C#/PHP `new Foo()`
+        return _type_leaf(_text_id(value.child_by_field_name("type")
+                                    or value.child_by_field_name("name")))
+    if t == "struct_expression":                   # Rust `Foo { .. }`
+        return _type_leaf(_text_id(value.child_by_field_name("type")
+                                   or value.child_by_field_name("name")))
+    if t == "composite_literal":                   # Go `Foo{..}` / `&Foo{..}`
+        return _type_leaf(_text_id(value.child_by_field_name("type")))
+    if t in ("call_expression", "invocation_expression",
+            "function_call_expression"):
+        fn = value.child_by_field_name("function")
+        if fn is None:
+            return ""
+        if fn.type in ("identifier", "type_identifier"):
+            return _type_leaf(_text_id(fn))
+        if fn.type in ("scoped_identifier", "generic_function"):
+            # `Foo::new()` / `Foo::default()` -- the conventional ctors
+            if _callee_name(fn) in ("new", "default"):
+                path = fn.child_by_field_name("path")
+                txt = _text_id(path).replace("::", ".")
+                return _type_leaf(txt.rsplit(".", 1)[-1]) if txt else ""
+        return ""
+    if t in ("member_expression", "selector_expression"):
+        return ""
+    return ""
+
+
+def _binding_types(node) -> dict[str, str]:
+    """{variable: ClassName} contributed by one binding/assignment statement:
+    `x = new Foo()`, `let x: Foo`, `x := &Foo{}`, `Foo x = new()`."""
+    out: dict[str, str] = {}
+    t = node.type
+
+    def bind(name_txt: str, cls: str) -> None:
+        if name_txt and cls and _IDENT_RE.match(name_txt):
+            out[name_txt] = cls
+
+    if t == "variable_declarator":                 # JS/TS/C# const/let/var
+        name = _text_id(node.child_by_field_name("name"))
+        ann = next((c for c in node.children if c.type == "type_annotation"),
+                   None)
+        val = node.child_by_field_name("value")
+        if val is None:                            # C# carries it unfielded
+            val = next((c for c in reversed(node.named_children)
+                        if c.type not in ("identifier", "type_annotation",
+                                          "explicit_type")), None)
+        bind(name, _node_type(ann) or _ctor_type(val))
+    elif t == "assignment_expression":             # JS `db = new Store()`
+        bind(_text_id(node.child_by_field_name("left")),
+             _ctor_type(node.child_by_field_name("right")))
+    elif t == "let_declaration":                   # Rust `let x: Foo` / ctor
+        pat = node.child_by_field_name("pattern")
+        ty = node.child_by_field_name("type")
+        val = node.child_by_field_name("value") or \
+            node.child_by_field_name("initializer")
+        bind(_text_id(pat), _node_type(ty) or _ctor_type(val))
+    elif t == "short_var_declaration":             # Go `x := &Foo{}`
+        left = node.child_by_field_name("left")
+        right = node.child_by_field_name("right")
+        names = _text_id(left) if left is not None else ""
+        ctor = _ctor_type(right) if right is not None else ""
+        if not ctor and right is not None:
+            m = re.match(r"&?([A-Z]\w*)\{", _text_id(right))
+            ctor = m.group(1) if m else ""
+        for nm in names.split(","):
+            bind(nm.strip().lstrip("*"), ctor)
+    elif t in ("local_variable_declaration", "field_declaration",
+                "property_declaration"):           # Java/C#/Kotlin
+        ty = node.child_by_field_name("type")
+        cls = _node_type(ty)
+        if not cls:
+            cls = _ctor_type(node.child_by_field_name("value"))
+        for c in node.named_children:
+            if c.type in ("variable_declarator", "variable_declarators",
+                          "declaration_specifiers"):
+                bind(_text_id(c.child_by_field_name("name") or c
+                              ).split("=")[0].strip(), cls)
+            elif c.type == "declarator":
+                bind(_text_id(c.child_by_field_name("declarator")), cls)
+            elif c.type in ("simple_identifier", "identifier"):
+                bind(_text_id(c), cls)
+    elif t in ("var_spec", "const_spec"):          # Go `var s Server` / `=`
+        bind(_text_id(node.child_by_field_name("name")),
+             _node_type(node.child_by_field_name("type"))
+             or _ctor_type(node.child_by_field_name("value")))
+    elif t == "assignment":                        # PHP `$store = new Store()`
+        m = re.match(r"\s*(\$?[A-Za-z_]\w*)\s*=\s*new\s+([A-Z]\w*)",
+                     _text_id(node))
+        if m:
+            bind(m.group(1), m.group(2))
+        else:
+            m = re.match(r"\s*(\$?[A-Za-z_]\w*)\s*=\s*([A-Z]\w*)::\s*"
+                         r"(?:new|create|getInstance)\b", _text_id(node))
+            if m:
+                bind(m.group(1), m.group(2))
+    return out
+
+
+def _param_types(node) -> dict[str, str]:
+    """{parameter: ClassName} from typed parameters of a function-like node
+    (`def f(store: Store)`, `fn(x Store)`, `void run(Store s)`)."""
+    out: dict[str, str] = {}
+    params = node.child_by_field_name("parameters") or \
+        node.child_by_field_name("parameter_bindings")
+    if params is None:
+        return out
+
+    def pair(p):
+        nm = p.child_by_field_name("name") or \
+            next((c for c in p.named_children
+                  if c.type in ("identifier", "simple_identifier")), None)
+        ty = p.child_by_field_name("type") or next(
+            (c for c in p.named_children
+             if c.type in ("type_annotation", "type_identifier", "generic_type",
+                           "named_type", "pointer_type", "reference_type",
+                           "trait_type")), None)
+        if nm is not None and ty is not None:
+            name = _text_id(nm)
+            cls = _node_type(ty)
+            if name and cls:
+                out[name] = cls
+
+    stack = list(params.named_children)
+    while stack:
+        c = stack.pop()
+        if c.type in ("parameter", "required_parameter", "optional_parameter",
+                      "typed_parameter", "parameter_declaration",
+                      "formal_parameter", "receiver", "typed_pattern"):
+            pair(c)
+        else:
+            stack.extend(c.named_children)
+    return out
+
+
+def _receiver_qual(fn, name, cls, self_ids, vars_) -> str:
+    """`ClassName.method` for a member-call callee node whose receiver is
+    decidable: a self-ref inside class context, a locally bound variable, or
+    a capitalized static receiver."""
+    recv = None
+    t = fn.type if fn is not None else ""
+    if t == "member_expression":                   # JS / C++ / Java field
+        recv = fn.child_by_field_name("object")
+    elif t == "selector_expression":               # Go `s.Stop()`
+        recv = fn.child_by_field_name("operand")
+    elif t == "field_expression":                  # Rust `store.load()`
+        recv = fn.child_by_field_name("value")
+    elif t in ("member_access_expression",):       # C# `Helper.Do()`
+        recv = fn.child_by_field_name("expression")
+    elif t in ("scoped_identifier",):              # Rust `Foo::new()`
+        recv = fn.child_by_field_name("path")
+    elif t in ("navigation_expression",):          # Kotlin/Swift `s.stop()`
+        kids = [c for c in fn.named_children
+                if c.type in ("simple_identifier", "navigation_suffix")]
+        if len(kids) >= 2:
+            last = kids[-1]
+            if last.type == "navigation_suffix":
+                inner = [c for c in last.named_children
+                         if c.type == "simple_identifier"]
+                if inner and _text_id(inner[-1]) == name:
+                    recv = kids[-2]
+    if recv is None:
+        return ""
+    return _qualify(_text_id(recv), name, cls, self_ids, vars_)
+
+
+def _qualify(recv: str, name: str, cls: str, self_ids, vars_) -> str:
+    """Class-qualify call `name` given its receiver text."""
+    if not recv:
+        return ""
+    if recv in self_ids and cls:
+        return f"{cls}.{name}"
+    if _IDENT_RE.match(recv) and recv in vars_:
+        return f"{vars_[recv]}.{name}"
+    if _IDENT_RE.match(recv) and recv[:1].isupper():
+        return f"{recv}.{name}"
+    return ""
+
+
+def _member_qual(sc, name, cls, self_ids, vars_) -> str:
+    """Same, for Java/C# method_invocation scopes; a dotted static scope
+    (`System.Console.WriteLine()`) qualifies by its last capitalized leaf."""
+    if sc is None:
+        return ""
+    txt = _text_id(sc)
+    q = _qualify(txt, name, cls, self_ids, vars_)
+    if q:
+        return q
+    leaf = txt.replace("::", ".").rstrip(".").rsplit(".", 1)[-1]
+    if leaf[:1].isupper() and _IDENT_RE.match(leaf):
+        return f"{leaf}.{name}"
+    return ""
+
+
+def _walk_calls(node, out: set[str], cls: str = "",
+                self_ids: tuple[str, ...] = (),
+                vmap: dict[str, str] | None = None) -> None:
     """Collect names invoked via call/new expressions under `node`. Member
     calls (obj.method()) reduce to the property name: the same bare-name
-    approximation chunker.py uses for Python. Iterative, so deeply nested
-    trees (minified JS) cannot hit the recursion limit."""
-    stack = [node]
+    approximation chunker.py uses for Python -- and, Sprint 4, the SAME
+    receiver-aware qualification: ``ClassName.method`` is recorded beside the
+    bare name when the receiver is decidable at chunk time (`cls` + a
+    self-receiver id from `self_ids`, a local bound by `x = new Foo()` /
+    `x: Foo` / `x := &Foo{}` / `Foo::new()`-style evidence, or a receiver
+    literally capitalized in the source). Iterative, so deeply nested trees
+    (minified JS) cannot hit the recursion limit."""
+    stack = [(node, cls, vmap if vmap is not None else {})]
     while stack:
-        node = stack.pop()
+        node, cls_ctx, vars_ = stack.pop()
         t = node.type
+        qual = ""
         if t in ("call_expression", "invocation_expression"):
             fn = node.child_by_field_name("function")
             if fn is None and node.named_children:
@@ -321,28 +585,41 @@ def _walk_calls(node, out: set[str]) -> None:
             name = _callee_name(fn) if fn is not None else ""
             if name:
                 out.add(name)
+                qual = _receiver_qual(fn, name, cls_ctx, self_ids, vars_)
         elif t in ("function_call_expression",):             # PHP
             fn = node.child_by_field_name("function")
             name = _callee_name(fn) if fn is not None else ""
             if name:
                 out.add(name)
+                qual = _receiver_qual(fn, name, cls_ctx, self_ids, vars_)
         elif t in ("member_call_expression", "scoped_call_expression",
                    "nullsafe_member_call_expression"):       # PHP
             nm = node.child_by_field_name("name")
             if nm is not None:
                 out.add(nm.text.decode())
+                obj = (node.child_by_field_name("object")
+                       or node.child_by_field_name("scope"))   # `Store::make()`
+                qual = _qualify(_text_id(obj), nm.text.decode(), cls_ctx,
+                                self_ids, vars_)
         elif t == "function_call":                           # Lua
             nm = node.child_by_field_name("name")
             if nm is not None:
-                out.add(nm.text.decode().replace(":", ".").split(".")[-1])
+                txt = nm.text.decode()
+                out.add(txt.replace(":", ".").split(".")[-1])
+                if cls_ctx and txt.startswith(("self.", "self:")):
+                    qual = f"{cls_ctx}.{txt.replace(':', '.').split('.')[-1]}"
         elif t == "new_expression":
             ctor = node.child_by_field_name("constructor")
             if ctor is not None and ctor.type == "identifier":
                 out.add(ctor.text.decode())
-        elif t == "method_invocation":
+        elif t == "method_invocation":                       # Java / C#
             nm = node.child_by_field_name("name")
             if nm is not None:
                 out.add(nm.text.decode())
+                sc = (node.child_by_field_name("scope")
+                      or node.child_by_field_name("object"))
+                qual = _member_qual(sc, nm.text.decode(), cls_ctx,
+                                    self_ids, vars_)
         elif t == "object_creation_expression":
             ty = node.child_by_field_name("type")
             if ty is not None:
@@ -351,7 +628,19 @@ def _walk_calls(node, out: set[str]) -> None:
             mac = node.child_by_field_name("macro")
             if mac is not None:
                 out.add(mac.text.decode().rstrip("!"))
-        stack.extend(node.children)
+        if qual:
+            out.add(qual)
+        nxt_cls, nxt_map = cls_ctx, vars_
+        if t in _FUNC_SCOPE_NODES:
+            # a new function body: locals restart with this signature's
+            # parameter types; the class context (`this`/`self`) survives --
+            # methods' nested functions/arrow functions still resolve it
+            nxt_map = dict(_param_types(node))
+        elif t in _BINDING_NODES:
+            # in place: statement siblings pushed with this same dict see the
+            # binding -- `x = new Foo(); x.bar()` qualifies like chunker.py
+            nxt_map.update(_binding_types(node))
+        stack.extend((ch, nxt_cls, nxt_map) for ch in reversed(node.children))
 
 
 def _module_chunks(rel_path: str, nodes: list, lines: list[str], first: int,
@@ -373,8 +662,9 @@ def _module_chunks(rel_path: str, nodes: list, lines: list[str], first: int,
         if not body.strip():
             return out
         calls: set[str] = set()
+        mv = {}
         for n in nodes:
-            _walk_calls(n, calls)
+            _walk_calls(n, calls, vmap=mv)
         out.append(Chunk(
             file=rel_path, qualname=base_name, kind="module", start=first,
             end=last, imports=imports if with_imports else [],
@@ -385,8 +675,9 @@ def _module_chunks(rel_path: str, nodes: list, lines: list[str], first: int,
         if not part_body.strip():
             continue
         calls = set()
+        mv = {}
         for n in part_nodes:
-            _walk_calls(n, calls)
+            _walk_calls(n, calls, vmap=mv)
         out.append(Chunk(
             file=rel_path, qualname=base_name if i == 1 else f"{base_name}#{i}",
             kind="module", start=ps, end=pe,
@@ -510,11 +801,12 @@ def chunk_source_ts(rel_path: str, src: str, language: str,
                                 max_unit_lines, max_unit_chars,
                                 max_unit_tokens, unit_overlap_lines)
             if parts:
+                fv = {}
                 for i, (ps, pe, nodes) in enumerate(parts, 1):
                     part_body = "\n".join(lines[ps - 1:pe])
                     p_calls: set[str] = set()
                     for n in nodes:
-                        _walk_calls(n, p_calls)
+                        _walk_calls(n, p_calls, vmap=fv)
                     chunks.append(Chunk(
                         file=rel_path,
                         qualname=name if i == 1 else f"{name}#{i}",
@@ -602,11 +894,13 @@ def chunk_source_ts(rel_path: str, src: str, language: str,
                                         max_unit_lines, max_unit_chars,
                                         max_unit_tokens, unit_overlap_lines)
                     if parts:
+                        mv = {}
                         for i, (ps, pe, nodes) in enumerate(parts, 1):
                             part_body = "\n".join(lines[ps - 1:pe])
                             p_calls: set[str] = set()
                             for n in nodes:
-                                _walk_calls(n, p_calls)
+                                _walk_calls(n, p_calls, cls=name,
+                                            self_ids=("this",), vmap=mv)
                             chunks.append(Chunk(
                                 file=rel_path,
                                 qualname=(f"{name}.{m_name}" if i == 1
@@ -620,7 +914,7 @@ def chunk_source_ts(rel_path: str, src: str, language: str,
                         continue
                     m_text = "\n".join(lines[m_start - 1:m_end])
                     calls: set[str] = set()
-                    _walk_calls(m, calls)
+                    _walk_calls(m, calls, cls=name, self_ids=("this",))
                     chunks.append(Chunk(
                         file=rel_path, qualname=f"{name}.{m_name}",
                         kind="method", start=m_start, end=m_end,
@@ -637,11 +931,12 @@ def chunk_source_ts(rel_path: str, src: str, language: str,
                                 max_unit_lines, max_unit_chars,
                                 max_unit_tokens, unit_overlap_lines)
             if parts:
+                fv = {}
                 for i, (ps, pe, nodes) in enumerate(parts, 1):
                     part_body = "\n".join(lines[ps - 1:pe])
                     p_calls: set[str] = set()
                     for n in nodes:
-                        _walk_calls(n, p_calls)
+                        _walk_calls(n, p_calls, vmap=fv)
                     chunks.append(Chunk(
                         file=rel_path,
                         qualname=name if i == 1 else f"{name}#{i}",
@@ -695,7 +990,7 @@ def chunk_source_ts(rel_path: str, src: str, language: str,
                 if nm is not None:
                     member_names.append(nm.text.decode())
             calls: set[str] = set()
-            _walk_calls(inner, calls)
+            _walk_calls(inner, calls, cls=name, self_ids=("this",))
             chunks.append(Chunk(
                 file=rel_path, qualname=name, kind="class",
                 start=start, end=end,
@@ -739,11 +1034,13 @@ def chunk_source_ts(rel_path: str, src: str, language: str,
                                 max_unit_lines, max_unit_chars,
                                 max_unit_tokens, unit_overlap_lines)
             if parts:
+                mv: dict[str, str] = {}
                 for i, (ps, pe, nodes) in enumerate(parts, 1):
                     part_body = "\n".join(lines[ps - 1:pe])
                     p_calls: set[str] = set()
                     for n in nodes:
-                        _walk_calls(n, p_calls)
+                        _walk_calls(n, p_calls, cls=name, self_ids=("this",),
+                                    vmap=mv)
                     chunks.append(Chunk(
                         file=rel_path,
                         qualname=(f"{name}.{m_name}" if i == 1
@@ -757,7 +1054,7 @@ def chunk_source_ts(rel_path: str, src: str, language: str,
                 continue
             m_body = "\n".join(lines[m_start - 1:m_end])
             m_calls: set[str] = set()
-            _walk_calls(m, m_calls)
+            _walk_calls(m, m_calls, cls=name, self_ids=("this",))
             chunks.append(Chunk(
                 file=rel_path, qualname=f"{name}.{m_name}", kind="method",
                 start=m_start, end=m_end, signature=m_sig,
@@ -1272,12 +1569,36 @@ def _walk_namespaces(nodes, spec):
 
 def _go_receiver(node, src: bytes) -> str:
     """Receiver type name of a Go method declaration ("" for functions)."""
+    return _go_receiver_pair(node, src)[0]
+
+
+def _go_receiver_pair(node, src: bytes) -> tuple[str, str]:
+    """(receiver type, receiver variable) of a Go method declaration; Go has
+    no `self` keyword -- the named receiver IS the self reference."""
     recv = node.child_by_field_name("receiver")
     if recv is None:
-        return ""
-    text = _text(recv, src)
-    m = re.search(r"\*?\s*([A-Za-z_]\w*)\s*(?:\[[^\]]*\])?\s*\)?\s*$", text.strip("() \t\n"))
-    return m.group(1) if m else ""
+        return "", ""
+    text = _text(recv, src).strip("() \t\n")
+    m = re.match(r"^([A-Za-z_]\w*)\s+\*?([A-Za-z_]\w*)$", text)
+    if m:
+        return m.group(2), m.group(1)
+    m = re.search(r"\*?\s*([A-Za-z_]\w*)\s*(?:\[[^\]]*\])?\s*\)?\s*$", text)
+    return (m.group(1) if m else ""), ""
+
+
+# The spelled self-reference of each generic language ("" where the receiver
+# is implicit: Kotlin/Swift `stop()` on self never needs a qualifier).
+_SELF_REFS = {
+    "rust": ("self",),
+    "java": ("this",),
+    "c": ("this",),
+    "cpp": ("this",),
+    "csharp": ("this",),
+    "php": ("$this",),
+    "kotlin": ("this",),
+    "swift": ("self",),
+    "scala": ("this",),
+}
 
 
 def _rust_impl_label(node, src: bytes, name: str) -> str:
@@ -1364,7 +1685,10 @@ def chunk_source_generic(rel_path: str, src: str, language: str,
 
     classify(root.named_children, "")
 
-    def emit_function(outer, inner, name, kind="function"):
+    self_refs = _SELF_REFS.get(language, ())
+
+    def emit_function(outer, inner, name, kind="function", cls="",
+                      self_ids=()):
         start, end = _line_span(outer)
         sig = _generic_signature(outer, src_bytes)
         body = inner.child_by_field_name("body")
@@ -1372,11 +1696,12 @@ def chunk_source_generic(rel_path: str, src: str, language: str,
                             max_unit_chars, max_unit_tokens,
                             unit_overlap_lines)
         if parts:
+            fv = {}
             for i, (ps, pe, nodes) in enumerate(parts, 1):
                 part_body = "\n".join(lines[ps - 1:pe])
                 calls: set[str] = set()
                 for n in nodes:
-                    _walk_calls(n, calls)
+                    _walk_calls(n, calls, cls=cls, self_ids=self_ids, vmap=fv)
                 chunks.append(Chunk(
                     file=rel_path,
                     qualname=name if i == 1 else f"{name}#{i}",
@@ -1387,7 +1712,7 @@ def chunk_source_generic(rel_path: str, src: str, language: str,
                 ))
             return
         calls: set[str] = set()
-        _walk_calls(inner, calls)
+        _walk_calls(inner, calls, cls=cls, self_ids=self_ids)
         body_text = "\n".join(lines[start - 1:end])
         chunks.append(Chunk(
             file=rel_path, qualname=name, kind=kind,
@@ -1397,8 +1722,11 @@ def chunk_source_generic(rel_path: str, src: str, language: str,
 
     def emit_container(outer, inner, name, label=None):
         """`name` qualifies member methods (`Foo.bar`); `label` is the
-        container chunk's own qualname (`impl Foo` for a Rust impl)."""
+        container chunk's own qualname (`impl Foo` for a Rust impl). The
+        language's self-reference resolves against `name` while walking."""
         label = label or name
+        cls_ctx = name
+        self_ids = self_refs
         start, end = _line_span(outer)
         sig = _generic_signature(outer, src_bytes)
         body = _generic_body(inner)
@@ -1414,7 +1742,7 @@ def chunk_source_generic(rel_path: str, src: str, language: str,
                         part_body = "\n".join(lines[ps - 1:pe])
                         calls: set[str] = set()
                         for n in nodes:
-                            _walk_calls(n, calls)
+                            _walk_calls(n, calls, cls=cls_ctx, self_ids=self_ids)
                         chunks.append(Chunk(
                             file=rel_path,
                             qualname=label if i == 1
@@ -1426,7 +1754,7 @@ def chunk_source_generic(rel_path: str, src: str, language: str,
                         ))
                     return
             calls: set[str] = set()
-            _walk_calls(inner, calls)
+            _walk_calls(inner, calls, cls=cls_ctx, self_ids=self_ids)
             body_text = "\n".join(lines[start - 1:end])
             chunks.append(Chunk(
                 file=rel_path, qualname=label, kind="class",
@@ -1449,7 +1777,7 @@ def chunk_source_generic(rel_path: str, src: str, language: str,
                 part_body = "\n".join(lines[ps - 1:pe])
                 calls: set[str] = set()
                 for n in nodes:
-                    _walk_calls(n, calls)
+                    _walk_calls(n, calls, cls=cls_ctx, self_ids=self_ids)
                 chunks.append(Chunk(
                     file=rel_path,
                     qualname=label if i == 1 else f"{label}#{i}",
@@ -1484,7 +1812,7 @@ def chunk_source_generic(rel_path: str, src: str, language: str,
                     part_body = "\n".join(lines[ps - 1:pe])
                     calls: set[str] = set()
                     for n in nodes:
-                        _walk_calls(n, calls)
+                        _walk_calls(n, calls, cls=cls_ctx, self_ids=self_ids)
                     chunks.append(Chunk(
                         file=rel_path,
                         qualname=(f"{name}.{m_name}" if i == 1
@@ -1497,7 +1825,7 @@ def chunk_source_generic(rel_path: str, src: str, language: str,
                 continue
             m_text = "\n".join(lines[m_start - 1:m_end])
             calls: set[str] = set()
-            _walk_calls(m, calls)
+            _walk_calls(m, calls, cls=cls_ctx, self_ids=self_ids)
             chunks.append(Chunk(
                 file=rel_path, qualname=f"{name}.{m_name}", kind="method",
                 start=m_start, end=m_end, signature=m_sig,
@@ -1539,11 +1867,13 @@ def chunk_source_generic(rel_path: str, src: str, language: str,
     for outer, inner, kind, prefix in scopes:
         name = _generic_name(inner, src_bytes)
         if kind == "function":
-            recv = _go_receiver(inner, src_bytes) \
-                if language == "go" and inner.type == "method_declaration" \
-                else ""
-            if recv:
-                emit_function(outer, inner, f"{recv}.{name}", "method")
+            if language == "go" and inner.type == "method_declaration":
+                rtype, rval = _go_receiver_pair(inner, src_bytes)
+                if rtype:
+                    emit_function(outer, inner, f"{rtype}.{name}", "method",
+                                  cls=rtype, self_ids=(rval,) if rval else ())
+                else:
+                    emit_function(outer, inner, name, "method")
             else:
                 emit_function(outer, inner, prefix + name)
         elif kind == "container":

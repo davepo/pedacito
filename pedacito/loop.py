@@ -1847,6 +1847,47 @@ def _post_edit_tests(root, cfg, agent, idx, task, results, reply, backup_dir,
             changed = sorted({fileio_norm(r.file) for r in results if r.ok})
             continue
 
+        # Cross-file contract gate (Sprint 4): a changed signature plus a
+        # test caller that still passes the old arity is proven broken here,
+        # statically -- running pytest only to watch it TypeError wastes the
+        # whole subprocess, so the gate vetoes the spawn like the frontend
+        # gate above does.
+        ce = _new_contract_errors(root, cfg, changed)
+        if ce:
+            tests_ok = False
+            if round_ < max_rounds:      # only a lesson if a repair can follow
+                _note_repair_failure(pending_lesson, "contract", "\n".join(ce))
+            print(f"  [contract gate: {len(ce)} new cross-file contract "
+                  f"violation(s) -- tests/lint subprocess skipped until they "
+                  f"are fixed]", file=sys.stderr)
+            workspace.log_event(
+                root, "interface contract gate rejected the patch; "
+                      "test/lint subprocess skipped", "ERROR")
+            events_mod.get(root, cfg).emit(
+                "tests", ok=False, score=len(ce), baseline=base_score,
+                round=round_, contract=True, new=len(ce), fixed=0,
+                still_failing=0, pre_existing=len(base_failures))
+            if round_ >= max_rounds:
+                break
+            finding = verify_mod.Finding(
+                "contract", "error", "",
+                "after your edits a call site cannot satisfy the real "
+                "signature in the module it imports from (a renamed, "
+                "missing or arity-changed interface; test callers included). "
+                "No test or lint process was run. Fix these first:\n"
+                + "\n".join(f"- {e}" for e in ce[:20]))
+            fixed = agent._repair_from_findings(task, reply, [finding],
+                                                results)
+            if not fixed:
+                break
+            new = agent._apply_once(fixed, False, backup_dir)
+            if not any(r.ok for r in new):
+                break
+            results = _merge_repair_results(results, new)
+            reply = (reply.rstrip() + "\n\n" + fixed)
+            changed = sorted({fileio_norm(r.file) for r in results if r.ok})
+            continue
+
         if pending_lesson:
             # Every gate this task tripped is green again (the deterministic
             # re-check above just passed): distill what the failure was into
@@ -3423,10 +3464,11 @@ def run_loop(root: Path, cfg, client, idx, plan_path: Path, *,
 
             def _gated_check(result):
                 """Parse the applied buffers before starting any subprocess;
-                a new syntax error is an immediate, structured failure. When
-                the runtime check passes, the cross-file contract gate gets
-                the same veto -- an import that cannot resolve is a failed
-                task even if the (possibly absent) test suite is green."""
+                a new syntax error is an immediate, structured failure. The
+                static, frontend and cross-file contract gates all get the
+                same veto -- and the contract gate runs BEFORE the verify
+                subprocess, so an import or test-call that cannot satisfy a
+                changed signature fails the step without paying for pytest."""
                 syntax = verify_mod.check_syntax(
                     getattr(result, "results", None))
                 if not syntax:
@@ -3464,20 +3506,27 @@ def run_loop(root: Path, cfg, client, idx, plan_path: Path, *,
                             "does not parse); no test or lint subprocess "
                             "was run. Fix these first:\n"
                             + "\n".join(f"- {e}" for e in fe[:25]))
-                    ok, out = run_check(result.changed)
-                    if ok and spec_mod is not None:
+                    bad: list[str] = []
+                    if spec_mod is not None:
                         bad = _new_contract_errors(
                             root, cfg, result.changed or [])
-                        if bad:
-                            return False, (
-                                "CROSS-FILE INTERFACE CONTRACT VIOLATIONS\n"
-                                "(the names below do not exist in the module "
-                                "they are imported from, the ES import/export "
-                                "surface does not agree, or the call cannot "
-                                "satisfy the real signature -- fix the "
-                                "exporter and every importer in one step; "
-                                "do not rename around the problem)\n\n"
-                                + "\n".join(f"- {e}" for e in bad))
+                    if bad:
+                        workspace.log_event(
+                            root, "contract gate rejected the step; verify "
+                                  "subprocess skipped", "ERROR")
+                        print(f"  [contract gate: {len(bad)} new cross-file "
+                              f"contract violation(s); {check_label} "
+                              f"subprocess skipped]", file=sys.stderr)
+                        return False, (
+                            "CROSS-FILE INTERFACE CONTRACT VIOLATIONS\n"
+                            "(the names below do not exist in the module "
+                            "they are imported from, the ES import/export "
+                            "surface does not agree, or the call cannot "
+                            "satisfy the real signature -- fix the "
+                            "exporter and every importer in one step; "
+                            "do not rename around the problem)\n\n"
+                            + "\n".join(f"- {e}" for e in bad))
+                    ok, out = run_check(result.changed)
                     return ok, out
                 print(f"  [syntax: {len(syntax)} new syntax error(s); "
                       f"{check_label} subprocess skipped until the patch "

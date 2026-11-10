@@ -56,7 +56,8 @@ def test_go_methods_are_qualified_by_receiver():
     assert rows["Server.Start"].kind == "method"
     assert rows["main"].kind == "function"
     assert (rows["Server.Start"].start, rows["Server.Start"].end) == (10, 10)
-    assert set(rows["Server.Start"].calls) == {"Do", "Println", "stop"}
+    assert set(rows["Server.Start"].calls) == {"Do", "Println", "stop",
+                                               "Server.stop"}
     assert "github.com/a/b/util" in rows["main"].imports
 
 

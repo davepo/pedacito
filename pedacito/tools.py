@@ -1757,19 +1757,49 @@ def tool_grep(index, pattern: str, scope: str = "", cfg=None,
     return _grep_result("\n".join(notes), hits)
 
 
-def _call_sites(index, chunk, base: str, limit: int = 2) -> list[str]:
+def _qual_site(stripped: str, base: str, cls: str, chunk_qual: str) -> str:
+    """Classify one `base(...)`-mentioning line for a class-qualified query
+    (Sprint 4): "qualified" when the receiver IS the queried class (`Store.
+    load()`, or `self.load()` inside a Store method), "other" when the
+    receiver is a DIFFERENT capitalized class (`Other.load()` -- definitely
+    not this symbol), "unqualified" when the receiver cannot resolve either
+    way (bare `load()`, lowercase `d.load()` -- keep, but say so)."""
+    m = re.search(r"([A-Za-z_$][\w$]*)\s*(?:\.|::|->)\s*"
+                  + re.escape(base) + r"\s*\(", stripped)
+    recv = m.group(1) if m else ""
+    leaf = cls.rsplit(".", 1)[-1]
+    if recv in ("self", "cls", "this", "$this"):
+        owner = chunk_qual.rsplit(".", 1)[0] if "." in chunk_qual else ""
+        if owner and (owner == cls or owner.endswith("." + leaf)
+                      or owner == leaf):
+            return "qualified"
+        return "unqualified"      # another class: might inherit -- keep
+    if not recv:
+        return "unqualified"
+    if recv == leaf or recv == cls:
+        return "qualified"
+    if recv[0:1].isupper():
+        return "other"
+    return "unqualified"
+
+
+def _call_sites(index, chunk, base: str, limit: int = 2, cls: str = ""
+                ) -> tuple[list[str], int]:
     """Up to `limit` source lines inside `chunk` that mention `base`, so the
-    model can pick a caller without reading each."""
+    model can pick a caller without reading each. With `cls` (a qualified
+    query) sites proven to call a DIFFERENT class are dropped, exact
+    `cls.base` matches are listed first, and ambiguous sites get the
+    `(unqualified match)` label; returns (lines, n_qualified)."""
     path = index.root / chunk.file
     try:
         lines = fileio.read_lines_cached(path)
     except OSError:
-        return []
+        return [], 0
     try:
         rx = re.compile(r"\b" + re.escape(base) + r"\b")
     except re.error:
-        return []
-    out: list[str] = []
+        return [], 0
+    hits: list[tuple[int, str]] = []
     for i in range(max(1, chunk.start), min(chunk.end, len(lines)) + 1):
         line = lines[i - 1]
         if not rx.search(line):
@@ -1777,10 +1807,21 @@ def _call_sites(index, chunk, base: str, limit: int = 2) -> list[str]:
         stripped = line.strip()
         if stripped.startswith(("def ", "async def ", "class ")):
             continue        # the definition itself, not a call
-        out.append(f"      L{i}: {stripped[:160]}")
-        if len(out) >= limit:
+        if cls:
+            verdict = _qual_site(stripped, base, cls, chunk.qualname)
+            if verdict == "other":
+                continue
+            hits.append((0 if verdict == "qualified" else 1,
+                         f"      L{i}: {stripped[:160]}"
+                         + ("   (unqualified match)" if verdict ==
+                            "unqualified" else "")))
+        else:
+            hits.append((0, f"      L{i}: {stripped[:160]}"))
+        if not cls and len(hits) >= limit:
             break
-    return out
+    hits.sort(key=lambda t: t[0])
+    nq = sum(1 for r, _t in hits if r == 0)
+    return [t for _r, t in hits[:limit]], nq
 
 
 def _indexed_callees(index, chunk, limit: int = 8) -> list[str]:
@@ -1804,12 +1845,31 @@ def _indexed_callees(index, chunk, limit: int = 8) -> list[str]:
 
 def tool_callers(index, symbol: str) -> str:
     """Report where a symbol is defined, what it calls, and which chunks appear
-    to call it (bare-name matching; see Index.callers_of), with call sites."""
+    to call it, with call sites. Names are resolved receiver-aware: exact
+    `Class.method` matches first, sites qualified to a DIFFERENT class
+    dropped, ambiguous bare-name sites labelled (unqualified match)."""
     symbol = _as_text(symbol).strip()
     if not symbol:
         return "ERROR: symbol is required."
     defs = index.find_symbol(symbol)
-    sure, approx = index.callers_ranked(symbol, defs[0].file if defs else None)
+    base = symbol.split(".")[-1]
+    cls = symbol.rsplit(".", 1)[0] if "." in symbol else ""
+    if not cls and defs:
+        d0 = defs[0]
+        if "." in d0.qualname and d0.kind in ("method", "function"):
+            cls = d0.qualname.split("#")[0].rsplit(".", 1)[0]
+        elif d0.kind == "class" and base in (d0.members or ()):
+            cls = d0.qualname                       # whole-class index
+    if cls and defs:
+        # a qualified query must not answer with the OTHER classes that
+        # happen to define a same-named member: keep only chunks that are the
+        # class itself or one of its members.
+        tight = [d for d in defs
+                 if d.qualname.split("#")[0] == cls
+                 or d.qualname.split("#")[0].startswith(cls + ".")]
+        defs = tight or defs
+    sure, approx = index.callers_ranked(
+        symbol if cls else base, defs[0].file if defs else None)
     callers = [c for c in sure if c not in defs]
     approx = [c for c in approx if c not in defs]
     out: list[str] = []
@@ -1821,14 +1881,28 @@ def tool_callers(index, symbol: str) -> str:
         if callees:
             out.append("Calls (indexed definitions):")
             out += callees
-    if callers:
+    if cls:
+        # exact-qualified call lines first; chunks whose every site proved to
+        # belong to a different class drop out entirely
+        scored: list[tuple[int, int, object]] = []
+        for order, c in enumerate(callers):
+            sites, nq = _call_sites(index, c, base, cls=cls)
+            if not sites:
+                continue
+            scored.append((0 if nq else 1, order, (c, sites)))
+        callers = [c for _r, _o, (c, _s) in scored]
+        if callers:
+            out.append("Called from:")
+            for _r, _o, (c, sites) in sorted(scored, key=lambda t: t[:2]):
+                out.append(f"  {c.file}:{c.start}-{c.end}  {c.qualname}")
+                out += sites[:20]
+    elif callers:
         out.append("Called from:")
-        base = symbol.split(".")[-1]
         for c in callers[:20]:
             out.append(f"  {c.file}:{c.start}-{c.end}  {c.qualname}")
-            out += _call_sites(index, c, base)
-        if len(callers) > 20:
-            out.append(f"  (+{len(callers) - 20} more callers)")
+            out += _call_sites(index, c, base)[0]
+    if len(callers) > 20 and not cls:
+        out.append(f"  (+{len(callers) - 20} more callers)")
     if approx and defs:
         out.append("Same name, but the file neither is nor imports the "
                    "definition's file (likely a different function -- "
@@ -1876,6 +1950,13 @@ def tool_usages(index, cfg, symbol: str) -> str:
                 "name (e.g. `Store.get`).")
     base = raw.split(".")[-1]
     defs = index.find_symbol(raw)
+    cls = raw.rsplit(".", 1)[0] if "." in raw else ""
+    if not cls and defs:
+        d0 = defs[0]
+        if "." in d0.qualname and d0.kind in ("method", "function"):
+            cls = d0.qualname.split("#")[0].rsplit(".", 1)[0]
+        elif d0.kind == "class" and base in (d0.members or ()):
+            cls = d0.qualname
     def_keys = {(c.file, c.start) for c in defs}
     def_files = sorted({c.file for c in defs})
     try:
@@ -1916,7 +1997,7 @@ def tool_usages(index, cfg, symbol: str) -> str:
     stems.discard("__init__")
 
     call_rx = re.compile(r"(?<![\w])" + re.escape(base) + r"\s*\(")
-    call_sites: list[tuple[str, int, str]] = []
+    call_sites: list[tuple[int, str, int, str]] = []
     imports: list[tuple[str, int, str]] = []
     seen_calls: set[tuple[str, int]] = set()
     seen_imports: set[tuple[str, int]] = set()
@@ -1942,7 +2023,15 @@ def tool_usages(index, cfg, symbol: str) -> str:
             if _definition_line(line, base):
                 continue
             if ((rel, n) not in seen_calls and call_rx.search(line)):
-                call_sites.append((rel, n, stripped[:180]))
+                rank = 0
+                extra = ""
+                if cls:
+                    verdict = _qual_site(stripped, base, cls, c.qualname)
+                    if verdict == "other":
+                        continue    # provably a call on a different class
+                    if verdict == "unqualified":
+                        rank, extra = 1, "   (unqualified match)"
+                call_sites.append((rank, rel, n, stripped[:180] + extra))
                 seen_calls.add((rel, n))
 
     for rel in sorted(import_files):
@@ -1959,7 +2048,7 @@ def tool_usages(index, cfg, symbol: str) -> str:
             imports.append((rel, n, line.strip()[:180]))
             seen_imports.add((rel, n))
 
-    call_sites.sort(key=lambda t: (t[0], t[1]))
+    call_sites.sort(key=lambda t: (t[0], t[1], t[2]))
     imports.sort(key=lambda t: (t[0], t[1]))
     if not defs and not call_sites and not imports:
         return (f"No definition, call site or import found for '{raw}' in the "
@@ -1973,7 +2062,7 @@ def tool_usages(index, cfg, symbol: str) -> str:
         out.append(f"Call sites ({len(call_sites)}"
                    + (f", showing {_USAGES_MAX_SITES}"
                       if len(call_sites) > _USAGES_MAX_SITES else "") + "):")
-        for rel, n, text in call_sites[:_USAGES_MAX_SITES]:
+        for _rank, rel, n, text in call_sites[:_USAGES_MAX_SITES]:
             out.append(f"  {rel}:{n}  {text}")
     else:
         out.append("Call sites: none found.")
@@ -2065,17 +2154,28 @@ def tool_context(index, cfg, symbol: str = "", file: str = "") -> str:
     if callees:
         related.append("calls (indexed definitions):")
         related += callees
-    base = c.qualname.split("#")[0].split(".")[-1]
-    sure, approx = index.callers_ranked(base, rel)
+    qual = c.qualname.split("#")[0]
+    if "." in qual:
+        base, ctx_cls = qual.split(".")[-1], qual.rsplit(".", 1)[0]
+    else:
+        base, ctx_cls = qual, ""
+    sure, approx = index.callers_ranked(qual if ctx_cls else base, rel)
     callers = [k for k in sure if k is not c
                and not (k.file == rel and k.qualname.split("#")[0] == c.qualname.split("#")[0])]
     if callers:
         related.append(f"called from ({len(callers)}):")
-        for k in callers[:6]:
+        shown = 0
+        for k in callers:
+            if shown >= 6:
+                break
+            sites = _call_sites(index, k, base, limit=1, cls=ctx_cls)[0]
+            if ctx_cls and not sites:
+                continue    # every site qualified to a different class
             related.append(f"  {k.file}:{k.start}-{k.end}  {k.qualname}")
-            related += _call_sites(index, k, base, limit=1)
-        if len(callers) > 6:
-            related.append(f"  (+{len(callers) - 6} more; `callers` lists all)")
+            related += sites
+            shown += 1
+        if len(callers) > shown:
+            related.append(f"  (+{len(callers) - shown} more; `callers` lists all)")
     else:
         related.append("called from: nothing found in the indexed files")
     if approx:

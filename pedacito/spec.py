@@ -1319,8 +1319,231 @@ def verify_cross_file_contracts(root: Path,
     for importer, _target, text in _js_cross_file_errors(root):
         emit(text, importer)
 
+    # Sprint 4: test files calling into (changed) source through dotted
+    # imports or bound instances -- the two spellings the from-import pass
+    # above never sees. Surfaced here, BEFORE the loop spawns pytest.
+    for rel, text in _incoming_test_caller_errors(root, mods):
+        emit(text, rel)
+
     out.sort(key=lambda t: (t[0], t[1]))
     return [t for _o, _i, t in out][:20]
+
+
+def _requires_text(sig) -> str:
+    """`requires ...` clause for an arity message: exact count, a range when
+    defaults pad the tail, or an open minimum when the def takes *args."""
+    from .apicheck import _sig as _  # noqa: F401  (kept for symmetry)
+    lo = len(sig.required)
+    hi = sig.max_pos
+    if hi is None:
+        return f"at least {lo} positional argument(s)" if lo else \
+            "any number of arguments"
+    if hi == lo:
+        return f"{lo} positional argument(s)"
+    return f"{lo}-{hi} positional argument(s)"
+
+
+def _test_arity_error(call: ast.Call, node: ast.AST, drop_self: bool):
+    """(shown_count, requires_text) when `call` violates the arity of
+    definition `node`, else None. apicheck's `_arity_error` decides whether
+    the call is impossible; the counts come from the signature."""
+    from .apicheck import _arity_error, _sig
+    if isinstance(node, DEF_NODES):
+        if getattr(node, "decorator_list", ()):
+            return None          # staticmethod/classmethod: binding unknown
+        sig = _sig(node.args, drop_self)
+    elif isinstance(node, ast.ClassDef):
+        got = _arity_sig(node)
+        if got is None:
+            return None
+        sig = got[0]
+    else:
+        return None
+    msg = _arity_error(sig, call)
+    if not msg:
+        return None
+    n = len(call.args) + len(call.keywords)
+    return n, _requires_text(sig)
+
+
+def _incoming_test_caller_errors(root: Path,
+                                 mods: dict[str, _Mod]) -> list[tuple[str, str]]:
+    """Arity violations at TEST-file call sites of project source: dotted
+    `import mod` + `mod.fn(...)`, `from pkg import submodule` + `sub.fn(...)`,
+    and instance-method calls on variables bound by constructor (`store =
+    Store()`) or annotation (`store: Store`).
+
+    The existing from-import pass already sees bare `from x import y; y(...)`;
+    these spellings -- how tests really call into changed code -- were
+    invisible until pytest ran. Now they surface as the same
+    `ContractError in file:line:` shape before the subprocess spawns.
+    Conservative like everything here: unresolved or shadowed receivers,
+    decorated defs, inherited methods and star-args calls are skipped."""
+    out: list[tuple[str, str]] = []
+    defs_by_rel = {info.rel: info.defs for info in mods.values()}
+    test_rel_set = {info.rel for info in mods.values() if _is_test_file(info.rel)}
+
+    def emit(rel: str, line: int, shown: str, src_file: str,
+             n_args: int, req: str) -> None:
+        if len(out) >= 40:
+            return
+        text = (f"ContractError in {rel}:{line}: calls '{shown}' "
+                f"with {n_args} arg(s), but updated signature in "
+                f"{src_file} requires {req}")
+        if any(t == text for _r, t in out):
+            return
+        out.append((rel, text))
+
+    from .chunker import _local_types
+
+    def assigned_names(fn: ast.AST) -> set[str]:
+        """Every name a function binds anywhere in its body: Python treats
+        all of them as function-locals, so an outer binding of the same name
+        is invisible under this scope (and must not qualify its calls)."""
+        got = set()
+        stack = list(ast.iter_child_nodes(fn))
+        while stack:
+            n = stack.pop()
+            if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                got.add(n.name)      # a nested def shadows any outer binding
+                continue             # its body is a separate scope
+            if isinstance(n, ast.ClassDef):
+                got.add(n.name)      # ditto for a class defined in here
+                continue
+            if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Store):
+                got.add(n.id)
+            elif isinstance(n, ast.arg):
+                got.add(n.arg)
+            elif isinstance(n, ast.ExceptHandler) and n.name:
+                got.add(n.name)
+            elif isinstance(n, (ast.Import, ast.ImportFrom)):
+                for a in n.names:
+                    got.add(a.asname or a.name.split(".")[0])
+            stack.extend(ast.iter_child_nodes(n))
+        return got
+
+    for _modname, info in sorted(mods.items()):
+        rel = info.rel
+        if not _is_test_file(rel):
+            continue
+        src = _read(rel, root)
+        if not src.strip():
+            continue
+        try:
+            tree = ast.parse(src)
+        except (SyntaxError, ValueError):
+            continue
+        pkg = _file_package(rel, mods)
+        class_imports: dict[str, tuple[str, ast.AST]] = {}   # alias -> (rel, class)
+        module_alias: dict[tuple[str, ...], str] = {}        # chain -> module rel
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ImportFrom):
+                base = node.module or ""
+                if node.level:
+                    if not pkg:
+                        continue
+                    depth = len(pkg.split(".")) - (node.level - 1)
+                    if depth < 1:
+                        continue
+                    prefix = ".".join(pkg.split(".")[:depth])
+                    target = f"{prefix}.{base}" if base else prefix
+                else:
+                    target = base
+                minfo = mods.get(target)
+                if minfo is None:
+                    continue
+                children = _package_children(mods, target)
+                for a in node.names:
+                    alias = a.asname or a.name
+                    defnode = minfo.defs.get(a.name)
+                    if isinstance(defnode, ast.ClassDef) \
+                            and minfo.rel not in test_rel_set:
+                        class_imports[alias] = (minfo.rel, defnode)
+                    elif a.name in children:
+                        sub = mods.get(f"{target}.{a.name}")
+                        if sub is not None and sub.rel not in test_rel_set:
+                            module_alias[(alias,)] = sub.rel
+            elif isinstance(node, ast.Import):
+                for a in node.names:
+                    minfo = mods.get(a.name)
+                    if minfo is None or minfo.rel in test_rel_set:
+                        continue
+                    if a.asname:
+                        module_alias[(a.asname,)] = minfo.rel
+                    else:
+                        module_alias[tuple(a.name.split("."))] = minfo.rel
+        if not module_alias and not class_imports:
+            continue
+
+        # every call, with the receiver-type map of its innermost scope:
+        # module bindings (s = Store()) plus the function's own parameters,
+        # annotations and constructor assigns; names rebound locally drop out
+        calls: list[tuple[ast.Call, dict[str, tuple[str, ast.AST]]]] = []
+
+        def walk_scope(n: ast.AST, vmap: dict) -> None:
+            stack = [(c, vmap) for c in ast.iter_child_nodes(n)]
+            while stack:
+                node, vm = stack.pop()
+                if isinstance(node, DEF_NODES):
+                    shadowed = assigned_names(node)   # incl. locally-defined
+                    inner = {k: v for k, v in vm.items()
+                             if k not in shadowed}    # classes/defs shadow
+                    for var, cname in _local_types(node).items():
+                        if cname in class_imports and cname not in shadowed:
+                            inner[var] = class_imports[cname]
+                    walk_scope(node, inner)
+                    continue
+                if isinstance(node, ast.ClassDef):
+                    walk_scope(node, vm)
+                    continue
+                if isinstance(node, ast.Call):
+                    calls.append((node, vm))
+                stack.extend((c, vm) for c in ast.iter_child_nodes(node))
+
+        base_map = {v: class_imports[c] for v, c in _local_types(tree).items()
+                    if c in class_imports}
+        walk_scope(tree, base_map)
+
+        for node, vmap in sorted(calls, key=lambda t: t[0].lineno):
+            f = node.func
+            if not isinstance(f, ast.Attribute):
+                continue          # bare from-import calls: existing pass
+            chain: list[str] = []
+            cur: ast.AST = f
+            while isinstance(cur, ast.Attribute):
+                chain.append(cur.attr)
+                cur = cur.value
+            if not isinstance(cur, ast.Name):
+                continue
+            chain.append(cur.id)
+            chain.reverse()
+            shown = ".".join(chain[-2:])
+            matched_module = False
+            if chain[0] in {k[0] for k in module_alias}:
+                # longest module-prefix of the chain, e.g. `pkg.sub.fn(...)`:
+                # only a direct module member call is checkable
+                i = len(chain) - 1
+                while i >= 1 and tuple(chain[:i]) not in module_alias:
+                    i -= 1
+                if i >= 1 and i == len(chain) - 1 \
+                        and tuple(chain[:i]) in module_alias:
+                    matched_module = True
+                    src_rel2 = module_alias[tuple(chain[:i])]
+                    defnode = defs_by_rel.get(src_rel2, {}).get(chain[-1])
+                    if defnode is not None:
+                        got = _test_arity_error(node, defnode, False)
+                        if got:
+                            emit(rel, node.lineno, shown, src_rel2, *got)
+            if not matched_module and len(chain) == 2 and chain[0] in vmap:
+                src_rel2, cnode = vmap[chain[0]]
+                m = next((x for x in cnode.body if isinstance(x, DEF_NODES)
+                          and x.name == chain[1]), None)
+                if m is None:
+                    continue      # inherited/dynamic: unknown
+                got = _test_arity_error(node, m, True)
+                if got:
+                    emit(rel, node.lineno, shown, src_rel2, *got)
+    return out
 
 
 # ------------------------------------------------------------- refinement ---

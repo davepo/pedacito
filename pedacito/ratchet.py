@@ -18,10 +18,21 @@ real work instead of wreckage.
 Zero LLM tokens — pure file I/O — and every operation is bounded and
 best-effort: a step that touched nothing rolls back to nothing, and snapshot
 failures never crash the loop.
+
+Snapshots are HARD LINKS when the filesystem allows it (same-device `os.link`
+— the common case), falling back to `copy2`. A hardlinked checkpoint costs
+one directory entry and zero bytes, so keeping 25 steps of history is free.
+The contract this relies on: nothing ever writes *through* a project file's
+inode. Every Pedacito write goes through `fileio.write`, an atomic
+temp-file + `os.replace` — which swaps the path onto a fresh inode and
+leaves the checkpointed inode pristine — and `rollback` restores the same
+way. An in-place `open(path, "wb")` would truncate every link sharing that
+inode, i.e. silently rewrite history.
 """
 from __future__ import annotations
 
 import json
+import os
 import shutil
 from datetime import datetime
 from pathlib import Path
@@ -144,6 +155,19 @@ def _iter_candidate_files(root: Path, max_files: int):
             yield (entry, False)
 
 
+def _link_or_copy(src: Path, dst: Path) -> None:
+    """Snapshot one file: a hard link when the filesystem permits it (same
+    device, links allowed) -- free, and byte-identical by construction --
+    else a full `copy2` preserving mtime (the unmodified-file fast path in
+    `rollback` compares timestamps)."""
+    try:
+        if dst.exists():
+            dst.unlink()          # a link cannot be created over an entry
+        os.link(src, dst)
+    except (OSError, NotImplementedError):     # EXDEV/EPERM/FAT... 
+        shutil.copy2(str(src), str(dst))
+
+
 def begin(
     root: Path,
     step: int,
@@ -199,7 +223,7 @@ def begin(
         payload = directory / rel
         try:
             payload.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(path, payload)
+            _link_or_copy(path, payload)
         except OSError:
             manifest[rel.as_posix()] = {"size": size, "skip": "unreadable"}
             continue
@@ -291,9 +315,10 @@ def rollback(root: Path, step: int) -> dict[str, Any]:
         snapshot_file = directory / rel
         if snapshot_file.is_file():
             try:
-                # copy2 preserved the snapshot's mtime: a file still matching
-                # it byte-size AND timestamp was never touched by the step,
-                # so re-copying it would only inflate the rollback report.
+                # (a hardlinked or copy2'd) snapshot carries the original
+                # mtime: a file still matching it byte-size AND timestamp was
+                # never touched by the step, so re-restoring it would only
+                # inflate the rollback report.
                 if (target.is_file() and not target.is_symlink()
                         and target.stat().st_size == snapshot_file.stat().st_size
                         and target.stat().st_mtime_ns
@@ -305,9 +330,20 @@ def rollback(root: Path, step: int) -> dict[str, Any]:
                 if target.is_symlink():
                     target.unlink()      # never write THROUGH a replaced link
                 target.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copy2(snapshot_file, target)
+                # restore by REPLACE, never by copy-into: `target` may share
+                # its inode with an OLDER step's snapshot (begin hardlinked
+                # it while unchanged); copy2 would truncate that shared inode
+                # and rewrite the checkpointed history it stands for.
+                tmp = target.parent / (target.name + ".pedacito-restore")
+                shutil.copy2(str(snapshot_file), str(tmp))
+                os.replace(tmp, target)
                 result["restored"].append(rel)
             except OSError as exc:
+                try:
+                    (target.parent / (target.name + ".pedacito-restore")
+                     ).unlink()
+                except OSError:
+                    pass
                 result["skipped"].append(rel)
                 result["error"] = f"could not restore {rel}: {exc}"
     # Delete what the step created: current candidates absent from the

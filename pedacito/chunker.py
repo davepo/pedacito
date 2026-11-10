@@ -158,20 +158,123 @@ def _docline(node: ast.AST) -> str:
     return doc.strip().splitlines()[0][:160]
 
 
-def _calls(*nodes: ast.AST) -> list[str]:
+def _local_types(scope: ast.AST) -> dict[str, str]:
+    """{variable: ClassName} for one scope: variables bound to a known class
+    by a constructor call (`x = ClassName(...)`) or an explicit annotation
+    (`x: ClassName`, `def f(store: Store)`). Never descends into nested
+    defs/classes -- a name bound there belongs to that inner scope."""
+    out: dict[str, str] = {}
+
+    def cls_name(ann: ast.AST) -> str:
+        """The class name of an annotation expression ("" when not one)."""
+        if isinstance(ann, ast.Name):
+            return ann.id if ann.id[:1].isupper() else ""
+        if isinstance(ann, ast.Subscript) and isinstance(ann.value, ast.Name):
+            # `x: Dict[str, int]` -- a known container, not a receiver class
+            return ""
+        return ""
+
+    def check(n: ast.AST) -> None:
+        if isinstance(n, ast.Assign):
+            v = n.value
+            if isinstance(v, ast.Call) and isinstance(v.func, ast.Name) \
+                    and v.func.id[:1].isupper():
+                for t in n.targets:
+                    if isinstance(t, ast.Name):
+                        out[t.id] = v.func.id
+        elif isinstance(n, ast.AnnAssign) and isinstance(n.target, ast.Name):
+            cname = cls_name(n.annotation)
+            if cname:
+                out[n.target.id] = cname
+
+    def visit(n: ast.AST) -> None:
+        if isinstance(n, (DEF_NODES, ast.ClassDef)):
+            return                      # inner scope: its names are not ours
+        check(n)
+        for ch in ast.iter_child_nodes(n):
+            visit(ch)
+
+    if isinstance(scope, DEF_NODES):
+        for a in (scope.args.posonlyargs + scope.args.args
+                  + scope.args.kwonlyargs):
+            if a.arg in ("self", "cls") or a.annotation is None:
+                continue
+            cname = cls_name(a.annotation)
+            if cname:
+                out[a.arg] = cname
+        for stmt in scope.body:
+            visit(stmt)
+    elif isinstance(scope, ast.ClassDef):
+        for stmt in scope.body:
+            visit(stmt)
+    else:
+        visit(scope)
+    return out
+
+
+def _calls(*nodes: ast.AST, owner: str = "") -> list[str]:
     """Collect names invoked via function calls inside the given nodes.
-    Attribute calls (obj.method()) reduce to just the attribute name; this is
-    an approximation sufficient to power a `callers` lookup without a full
-    name resolver."""
+
+    Every call keeps its bare name (`obj.method()` -> ``method``) so the old
+    name-based `callers` lookup keeps working unchanged, and receiver-aware
+    qualification (Sprint 4) additionally records ``ClassName.method`` beside
+    it when the receiver is decidable at chunk time:
+
+      * ``self.x()`` / ``cls.x()`` inside a method of class ``ClassName``
+        (``owner`` from the chunker, or the enclosing ClassDef we walked);
+      * a local bound to a known class by a constructor call or an explicit
+        annotation -- ``s = Store(); s.load()`` or ``def f(s: Store)``;
+      * an explicit static receiver literally in the source: ``Store.load()``.
+
+    The bare name recorded *alongside* the qualified one is what lets
+    `callers_of("Store.load")` rank exact matches, drop sites qualified to a
+    DIFFERENT class, and still surface ambiguous untyped ``d.load()`` as
+    unqualified matches. `owner` is the class qualname when the chunked node
+    is a method (or a fragment of one); nested defs and nested classes get
+    their own context as the walk descends.
+    """
     names: set[str] = set()
     for node in nodes:
-        for n in ast.walk(node):
+        stack: list[tuple[ast.AST, str, dict[str, str]]] = [(node, owner, {})]
+        while stack:
+            n, cls_ctx, vmap = stack.pop()
+            if isinstance(n, DEF_NODES):
+                params = n.args.posonlyargs + n.args.args
+                own = cls_ctx if (params and params[0].arg in ("self", "cls")
+                                  ) else ""
+                local = dict(vmap)
+                local.update(_local_types(n))
+                stack.extend((ch, own, local)
+                             for ch in reversed(list(ast.iter_child_nodes(n))))
+                continue
+            if isinstance(n, ast.ClassDef):
+                sub = n.name if n.name == cls_ctx else (
+                    f"{cls_ctx}.{n.name}" if cls_ctx else n.name)
+                stack.extend((ch, sub, vmap)
+                             for ch in reversed(list(ast.iter_child_nodes(n))))
+                continue
             if isinstance(n, ast.Call):
                 f = n.func
                 if isinstance(f, ast.Name):
                     names.add(f.id)
                 elif isinstance(f, ast.Attribute):
                     names.add(f.attr)
+                    recv = f.value
+                    if isinstance(recv, ast.Name):
+                        qual = ""
+                        if recv.id in ("self", "cls") and cls_ctx:
+                            qual = f"{cls_ctx}.{f.attr}"
+                        elif recv.id in vmap:
+                            qual = f"{vmap[recv.id]}.{f.attr}"
+                        elif recv.id[:1].isupper():
+                            qual = f"{recv.id}.{f.attr}"
+                        if qual:
+                            names.add(qual)
+            elif isinstance(n, (ast.Assign, ast.AnnAssign)):
+                # module-level / part-level `x = Foo()` feeds later `x.bar()`
+                vmap.update(_local_types(n))
+            stack.extend((ch, cls_ctx, vmap)
+                         for ch in reversed(list(ast.iter_child_nodes(n))))
     return sorted(names)
 
 
@@ -505,8 +608,14 @@ def chunk_source(rel_path: str, src: str, class_split_lines: int = 60,
                     source=body, sha=_sha(body),
                 ))
 
-    def add(node, qualname, kind, start=None, end=None, members=None, scope_end=0):
-        """Build and append one Chunk for a function/class/method node."""
+    def add(node, qualname, kind, start=None, end=None, members=None,
+            scope_end=0, owner=""):
+        """Build and append one Chunk for a function/class/method node.
+
+        `owner` is the class name for methods of a class split into per-method
+        chunks: the ClassDef is not part of the walked nodes then, so
+        `self.x()` qualification needs it passed down explicitly.
+        """
         s = start if start is not None else _first_line(node)
         e = end if end is not None else (node.end_lineno or s)
         if kind in ("function", "method") and isinstance(node, DEF_NODES):
@@ -524,7 +633,7 @@ def chunk_source(rel_path: str, src: str, class_split_lines: int = 60,
                         signature=_part_signature(sig, i, len(parts)),
                         decorators=_decorators(node) if i == 1 else [],
                         docline=_docline(node) if i == 1 else "",
-                        calls=_calls(*nodes), imports=imports,
+                        calls=_calls(*nodes, owner=owner), imports=imports,
                         source=part_body, sha=_sha(part_body),
                     ))
                 return
@@ -533,7 +642,8 @@ def chunk_source(rel_path: str, src: str, class_split_lines: int = 60,
             file=rel_path, qualname=qualname, kind=kind, start=s, end=e,
             scope_end=scope_end,
             signature=_signature(node), decorators=_decorators(node),
-            docline=_docline(node), calls=_calls(node), members=members or [],
+            docline=_docline(node), calls=_calls(node, owner=owner),
+            members=members or [],
             imports=imports, source=body, sha=_sha(body),
         ))
 
@@ -603,7 +713,7 @@ def chunk_source(rel_path: str, src: str, class_split_lines: int = 60,
             add(node, node.name, "classheader", start=start, end=header_end,
                 members=[m.name for m in methods], scope_end=end)
         for m in methods:
-            add(m, f"{node.name}.{m.name}", "method")
+            add(m, f"{node.name}.{m.name}", "method", owner=node.name)
 
     # trailing top-level code after the last scope (main guards, etc.)
     if top_scopes:

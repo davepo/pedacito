@@ -451,7 +451,16 @@ cannot see.
   handles methods (`Store.get`) and module-level names, caps the result, and
   marks the evidence as name-based so the model still reads before editing.
   One `usages` step replaces the several blind `grep` calls a small model
-  otherwise spends on the same question.
+  otherwise spends on the same question. Since Sprint 4 the chunkers also
+  record the *receiver-qualified* target next to the bare name (`self.stop()`
+  inside `Server` adds `Server.stop` as well as `stop`; same for `this.x()` in
+  JS/TS, Go receiver pairs and typed `var` bindings, Rust impls and
+  `Foo::new`, constructor- and annotation-bound locals in every grammar), so
+  `callers`/`usages` on a qualified query rank the chunks that recorded the
+  exact `Class.method` entry first, drop sites whose line proves they call a
+  DIFFERENT capitalized class (`K2.run()` cannot be `K1.run`), and label the
+  genuinely ambiguous ones `(unqualified match)` instead of silently mixing
+  them together.
 - **`git_diff` is read-only working-tree inspection.** It runs
   `git status --short` plus a bounded `git diff` (staged and unstaged, against
   `HEAD` when one exists) and caps the diff by `max_read_tokens`; an optional
@@ -613,6 +622,22 @@ and `new --complex`:
   scanned signature -- bare packages and dynamic imports are deliberately
   out of scope. (§23's frontend gate reports the same findings scoped to
   the touched files.)
+- **Incoming test callers are part of the contract (Sprint 4).** A changed
+  signature in `app/logic.py` breaks `tests/test_logic.py` even when the test
+  was not touched -- and the from-import pass above cannot see the two
+  spellings tests actually use: `import app.logic` + `app.logic.add(1)`, and
+  instance methods on a variable bound by constructor (`s = Server()`) or
+  annotation (`s: Server`). `_incoming_test_caller_errors` scans every test
+  file for exactly those receivers, arity-checks each call against the
+  source's real signature and emits the same
+  `ContractError in tests/test_logic.py:4: calls 'logic.add' with 1 arg(s),
+  but updated signature in app/logic.py requires 3 positional argument(s)`
+  line -- so the loop's contract gate vetoes the pytest spawn (both in
+  `_gated_check`, before the verify subprocess, and in `_post_edit_tests`,
+  before the test run) and the exact line goes to repair instead of minutes
+  of interpreter startup. Shadowed names (a local `class Srv` hiding the
+  import), decorated defs, inherited methods, star-args calls and non-test
+  files stay untouched: the same false-positive discipline as the lock.
 - **Deliberately conservative.** Unknown absolute imports are treated as
   third-party, star-imports and shadowed names are trusted, classes without
   an explicit `__init__` are never arity-checked: a false positive would
@@ -691,11 +716,23 @@ against the wrong code. `auto_green_ratchet` (default on) makes Auto mode
 monotonic:
 
 - **A snapshot per step.** Before each step's worker starts,
-  `ratchet.begin` copies every source-ish file (extension allowlist, dot
+  `ratchet.begin` checkpoints every source-ish file (extension allowlist, dot
   directories and vendored/state directories skipped, size and count caps via
   `auto_checkpoint_max_file_bytes` / `auto_checkpoint_max_files`) into
   `.pedacito/checkpoints/step_<k>/` with a `manifest.json` recording size
-  and skip-state. The plan file itself is on the never-snapshot list: the
+  and skip-state. Since Sprint 4 the checkpoint is a **hard link** where the
+  filesystem allows it (`os.link`, with a `shutil.copy2` fallback for
+  EXDEV/EPERM/FAT) -- free, byte-identical by construction, no copy of a
+  multi-megabyte tree per step. That buys the price of one invariant: every
+  write that can touch a snapshotted path must REPLACE the file, never
+  rewrite it in place, because `open(path, "wb")` truncates through the
+  shared inode and would silently corrupt history. `fileio.write` is exactly
+  that atomic replacement (mkstemp beside the target, mode preserved,
+  `os.replace`), every loop write path goes through it, and `rollback`
+  restores the same way (snapshot bytes into a temp file, `os.replace`), so
+  the fast path -- skip the restore when size+mtime already match, which is
+  the common case for a true hard link -- stays safe.
+  The plan file itself is on the never-snapshot list: the
   loop ticks boxes mid-step and no rollback may un-tick them.
 - **The frontier.** When a step verifies green, `ratchet.green` advances a
   pointer (`green_step.txt`) and its snapshot is kept as the restore point.

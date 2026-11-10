@@ -27,12 +27,19 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import pytest
 
-from pedacito import loop, ratchet, spec, verify
+from pedacito import fileio, loop, ratchet, spec, verify
 from pedacito.config import Config
 from pedacito.edits import Result
 
 BROKEN = "def total(n):\n    return jsonx.dumps(n)\n"
 GOOD = "import json\n\n\ndef total(n):\n    return json.dumps(n)\n"
+
+
+def _pw(path, text: str) -> None:
+    """Write a project file the way the loop does -- via fileio.write's
+    atomic replace, so a ratchet checkpoint hardlinked to the previous
+    inode keeps its bytes."""
+    fileio.write(Path(path), text, fileio.TextStyle())
 
 
 def _force_ast(monkeypatch):
@@ -296,17 +303,20 @@ def test_static_gate_off_skips_everything(tmp_path, monkeypatch):
 
 # ------------------------------------------------------------- ratchet core
 def test_ratchet_begin_green_rollback_roundtrip(tmp_path):
-    (tmp_path / "a.py").write_text("GOOD = 1\n")
+    # The loop writes through fileio.write (atomic replace), so snapshots
+    # -- hard links when the fs allows -- keep their own inode. Editing a.py
+    # must never truncate the checkpointed bytes.
+    _pw(tmp_path / "a.py", "GOOD = 1\n")
     info = ratchet.begin(tmp_path, 1, "step one")
     assert "a.py" in info["files"]
     # The step edits a.py and creates new.py:
-    (tmp_path / "a.py").write_text("BAD = jsonx\n")
+    _pw(tmp_path / "a.py", "BAD = jsonx\n")
     (tmp_path / "new.py").write_text("x = 1\n")
     ratchet.green(tmp_path, 1)
     assert ratchet.frontier(tmp_path) == 1
 
     info = ratchet.begin(tmp_path, 2, "step two")
-    (tmp_path / "a.py").write_text("WRECKED\n")
+    _pw(tmp_path / "a.py", "WRECKED\n")
     (tmp_path / "c.py").write_text("created in step two\n")
     back = ratchet.rollback(tmp_path, 2)
     assert back["restored"] == ["a.py"]
@@ -386,10 +396,10 @@ def test_run_loop_rolls_back_the_failed_step(tmp_path, monkeypatch):
                       review=False, answer_system=None):
         title = task.split("\n\n")[0]
         if title == "Build module one":
-            (root / "a.py").write_text("GOOD = 1\n")
+            _pw(root / "a.py", "GOOD = 1\n")
             changed = ["a.py"]
         else:
-            (root / "a.py").write_text("BAD = wrecked\n")
+            _pw(root / "a.py", "BAD = wrecked\n")
             (root / "new.py").write_text("orphan\n")
             changed = ["a.py", "new.py"]
         return loop.TaskResult([Result(True, "a.py", "applied")],
@@ -424,10 +434,10 @@ def test_run_loop_ratchet_off_leaves_the_wreckage(tmp_path, monkeypatch):
                       review=False, answer_system=None):
         title = task.split("\n\n")[0]
         if title == "Build module one":
-            (root / "a.py").write_text("GOOD = 1\n")
+            _pw(root / "a.py", "GOOD = 1\n")
             changed = ["a.py"]
         else:
-            (root / "a.py").write_text("BAD = wrecked\n")
+            _pw(root / "a.py", "BAD = wrecked\n")
             changed = ["a.py"]
         return loop.TaskResult([Result(True, "a.py", "applied")],
                                "done", True, changed, idx_)
@@ -449,7 +459,7 @@ def test_run_loop_keeps_checkpoints_when_checks_pass(tmp_path, monkeypatch):
 
     def fake_run_task(root, cfg_, client, agent, idx_, task, apply=True,
                       review=False, answer_system=None):
-        (root / "f.py").write_text(task.split("\n\n")[0] + "\n")
+        _pw(root / "f.py", task.split("\n\n")[0] + "\n")
         return loop.TaskResult([Result(True, "f.py", "applied")],
                                "done", True, ["f.py"], idx_)
 

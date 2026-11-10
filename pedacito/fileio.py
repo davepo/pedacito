@@ -13,7 +13,10 @@ LF text, and writes restore the original style.
 
 from __future__ import annotations
 
+import os
 import shutil
+import stat
+import tempfile
 from collections import OrderedDict
 from pathlib import Path
 
@@ -103,7 +106,13 @@ def read_lines_cached(path: Path) -> list[str]:
 
 
 def write(path: Path, text: str, style: TextStyle | None = None) -> None:
-    """Write LF-normalised text to disk, restoring the given encoding style."""
+    """Write LF-normalised text to disk, restoring the given encoding style.
+
+    Atomic replace (temp file + `os.replace`), never an in-place rewrite:
+    ratchet.py checkpoints are HARD LINKS to earlier inodes of the same
+    file, and `open(path, "wb")` truncates every link it shares -- that
+    would quietly corrupt history and make rollback restore the current
+    bytes. Replacement leaves the old inode (and its links) untouched."""
     style = style or TextStyle()
     out = text
     if style.newline != "\n":
@@ -111,7 +120,27 @@ def write(path: Path, text: str, style: TextStyle | None = None) -> None:
     data = out.encode("utf-8")
     if style.bom:
         data = b"\xef\xbb\xbf" + data
-    Path(path).write_bytes(data)
+    p = Path(path)
+    if p.is_symlink():
+        p = p.resolve()          # replace through the link, like write did
+    try:
+        mode = stat.S_IMODE(p.stat().st_mode)
+    except OSError:
+        mode = 0o644
+    p.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(prefix=p.name + ".", suffix=".pedacito-tmp",
+                               dir=str(p.parent))
+    try:
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(data)
+        os.chmod(tmp, mode)
+        os.replace(tmp, p)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
 
 
 def backup_copy(src: Path, dest: Path, keep_existing: bool = True) -> None:

@@ -326,9 +326,24 @@ class Index:
 
     def callers_of(self, symbol: str) -> list[Chunk]:
         """Chunks whose call list contains this symbol's bare name. An
-        approximate cross-reference (names, not resolved bindings)."""
-        base = symbol.split(".")[-1]
-        return list(self._by_call.get(base, []))
+        approximate cross-reference (names, not resolved bindings).
+
+        A qualified query (`Class.method`) ranks the chunks that recorded the
+        exact qualified entry first -- the ones where the receiver IS that
+        class (self/constructor/annotation/static evidence at chunk time) --
+        then the bare-name matches that carry no qualification either way.
+        Sites explicitly qualified to a DIFFERENT class still appear in the
+        bare list (the chunker keeps the bare name alongside, so unqualified
+        `d.load()` stays findable); `tools.callers` drops the different-class
+        ones after reading the actual call line."""
+        s = symbol.strip()
+        base = s.split(".")[-1]
+        bare = list(self._by_call.get(base, []))
+        if "." not in s:
+            return bare
+        exact = list(self._by_call.get(s, []))
+        seen = {id(c) for c in exact}
+        return exact + [c for c in bare if id(c) not in seen]
 
     # ------------------------------------------------- derived structures
     def imports_of(self, rel: str) -> list[str]:
