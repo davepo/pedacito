@@ -281,6 +281,12 @@ class Config:
     static_gate: bool = True
     # Seconds to wait for one ruff run before falling back to the AST gate.
     static_gate_timeout: float = 3.0
+    # Deterministic import auto-healing (TECHNIQUES.md #19): before a static
+    # F821 finding is sent to the model, insert the one import that provably
+    # fixes it -- a stdlib top-level module, or a public function/class defined
+    # in exactly one project file. Anything ambiguous falls through to the
+    # normal repair round untouched.
+    auto_heal_imports: bool = True
     # Frontend DOM contract gate (TECHNIQUES.md #23): for projects with
     # HTML/JS/CSS, a deterministic zero-token check before the test
     # subprocess -- every local <script src>/<link href> target must exist,

@@ -4039,6 +4039,16 @@ class Agent:
                 self._baseline_findings(baseline, parse_edits(fix))
                 reply = (reply.rstrip() + "\n\n" + fix) if reply.strip() else fix
                 results += self._apply_counted(fix, dry_run, backup_dir)
+        if not dry_run and getattr(self.cfg, "auto_heal_imports", True):
+            # Deterministic import auto-healing (TECHNIQUES.md #19): once the
+            # edits are on disk, an unambiguous missing import is a fact, not
+            # a model decision. Fix the buffer and the file here, before any
+            # test/lint subprocess or repair round can spend a call on it.
+            from . import verify as verify_mod
+            for receipt in verify_mod.auto_heal_static(
+                    results, root=self.index.root, cfg=self.cfg,
+                    persist=True):
+                print(f"  {receipt}", file=sys.stderr)
         tracker = getattr(self, "requirements", None)
         if tracker is not None and task and getattr(tracker, "task", "") == task:
             tracker.observe_edit(results)

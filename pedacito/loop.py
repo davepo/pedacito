@@ -1415,15 +1415,37 @@ def _new_static_errors(root, cfg, files: list[str]) -> list[str]:
     errors = _static_errors(root, cfg, files)
     if not errors:
         return []
+    from . import spec as spec_mod
     baseline = getattr(cfg, "_static_baseline", None)
-    if baseline is None:
-        return errors
-    try:
-        from . import spec as spec_mod
-        return [e for e in errors
-                if spec_mod.static_error_key(e) not in baseline]
-    except Exception:
-        return errors
+
+    def fresh(items):
+        if baseline is None:
+            return list(items)
+        try:
+            return [e for e in items
+                    if spec_mod.static_error_key(e) not in baseline]
+        except Exception:
+            return list(items)
+
+    new = fresh(errors)
+    if new and getattr(cfg, "auto_heal_imports", True):
+        # Deterministic import auto-healing: F821 names that provably have
+        # exactly one import are fixed on disk here, then the gate is re-run.
+        # Only what still fails reaches the model repair round.
+        try:
+            paths = [Path(f) if Path(f).is_absolute() else root / f
+                     for f in files]
+            after, receipts = spec_mod.heal_static_gate_errors(
+                root, paths, new, cfg)
+            for receipt in receipts:
+                print(f"  {receipt}", file=sys.stderr)
+            if receipts:
+                workspace.log_event(root, "import auto-heal: " +
+                                    "; ".join(receipts), "INFO")
+                new = fresh(after)
+        except Exception:
+            pass
+    return new
 
 
 def _capture_static_baseline(root, cfg) -> None:
@@ -1474,7 +1496,13 @@ def _new_frontend_errors(root, cfg, files: list[str]) -> list[str]:
     baseline = getattr(cfg, "_frontend_baseline", None)
     if baseline is None:
         return errors
-    return [e for e in errors if e not in baseline]
+    try:
+        from . import spec as spec_mod
+        keys = {spec_mod.contract_error_key(e) for e in baseline}
+        return [e for e in errors
+                if spec_mod.contract_error_key(e) not in keys]
+    except Exception:
+        return [e for e in errors if e not in baseline]
 
 
 def _capture_frontend_baseline(root, cfg) -> None:
@@ -1487,10 +1515,61 @@ def _capture_frontend_baseline(root, cfg) -> None:
         return
     try:
         from . import spec as spec_mod
-        cfg._frontend_baseline = set(
-            spec_mod.verify_frontend_contracts(root, None))
+        cfg._frontend_baseline = {
+            spec_mod.contract_error_key(e)
+            for e in spec_mod.verify_frontend_contracts(root, None)}
     except Exception:
         cfg._frontend_baseline = None
+
+
+def _contract_errors(root, cfg, files: list[str]) -> list[str]:
+    """Cross-file Python/JS contract violations for the touched files (the
+    scan itself covers the whole project, because an edit breaks importers)."""
+    if not getattr(cfg, "interface_lock", True):
+        return []
+    try:
+        from . import spec as spec_mod
+        return spec_mod.verify_cross_file_contracts(root, files)
+    except Exception:
+        return []
+
+
+def _new_contract_errors(root, cfg, files: list[str]) -> list[str]:
+    """Contract errors MINUS pre-existing rot elsewhere. Line numbers are
+    stripped from the identity, so a violation that merely shifted lines is
+    not blamed on the current task. A pre-existing violation inside a file
+    this task actually changed still reports: the task touched that file, and
+    leaving it broken is not something the baseline excuses."""
+    errors = _contract_errors(root, cfg, files)
+    if not errors:
+        return []
+    baseline = getattr(cfg, "_contract_baseline", None)
+    if baseline is None:
+        return errors
+    from . import fileio as fileio_mod
+    touched = {fileio_mod.normalise_rel(str(f)) for f in files or ()}
+    try:
+        from . import spec as spec_mod
+        return [e for e in errors
+                if spec_mod.contract_error_key(e) not in baseline
+                or spec_mod.contract_error_file(e) in touched]
+    except Exception:
+        return errors
+
+
+def _capture_contract_baseline(root, cfg) -> None:
+    """Record the cross-file contract errors already present before a task or
+    step, so baseline diffing ignores pre-existing rot elsewhere."""
+    if not getattr(cfg, "interface_lock", True):
+        cfg._contract_baseline = None
+        return
+    try:
+        from . import spec as spec_mod
+        cfg._contract_baseline = {
+            spec_mod.contract_error_key(e)
+            for e in spec_mod.verify_cross_file_contracts(root, None)}
+    except Exception:
+        cfg._contract_baseline = None
 
 
 # ------------------------------------------------ repair lesson distiller --
@@ -2338,10 +2417,11 @@ def run_task(root: Path, cfg, client, agent, idx, task: str, *,
     off the same dead end; a success clears the warning."""
     from . import memory as memory_mod
     if not getattr(cfg, "_auto_step", 0):
-        # Standalone task (ask/chat/eval): no outer loop owns the static
-        # baseline, so drop any leftover one and let _run_task_once record a
-        # fresh snapshot for this task.
+        # Standalone task (ask/chat/eval): no outer loop owns the static or
+        # contract baseline, so drop any leftover one and let _run_task_once
+        # record a fresh snapshot for this task.
         cfg._static_baseline = None
+        cfg._contract_baseline = None
     tr = _run_ladder(root, cfg, client, agent, idx, task, apply=apply,
                      review=review, answer_system=answer_system)
     if answer_system is not None or review or not getattr(cfg, "use_memory", True):
@@ -2428,6 +2508,10 @@ def _run_task_once(root: Path, cfg, client, agent, idx, task: str, *,
     if (_frontend_enabled(cfg) and not getattr(cfg, "_auto_step", 0)
             and getattr(cfg, "_frontend_baseline", None) is None):
         _capture_frontend_baseline(root, cfg)
+    if (getattr(cfg, "interface_lock", True)
+            and not getattr(cfg, "_auto_step", 0)
+            and getattr(cfg, "_contract_baseline", None) is None):
+        _capture_contract_baseline(root, cfg)
     backup_dir = (workspace.new_backup_dir(root, when, unique=True)
                   if wants_write and cfg.backup else None)
     t_started = time.time()
@@ -3072,6 +3156,7 @@ def run_loop(root: Path, cfg, client, idx, plan_path: Path, *,
         cfg._auto_step = attempted
         _capture_static_baseline(root, cfg)
         _capture_frontend_baseline(root, cfg)
+        _capture_contract_baseline(root, cfg)
 
         investigate = _is_investigation_task(task)
         task_for_agent = task + _evidence_hint(task)
@@ -3089,7 +3174,7 @@ def run_loop(root: Path, cfg, client, idx, plan_path: Path, *,
             # Interface lock: the live signature map rides ahead of the
             # retry note so no step can forget what an earlier step wrote.
             try:
-                cmap = spec_mod.contract_map_block(root)
+                cmap = spec_mod.contract_map_block(root, task=task)
             except Exception:
                 cmap = ""
             if cmap:
@@ -3381,16 +3466,14 @@ def run_loop(root: Path, cfg, client, idx, plan_path: Path, *,
                             + "\n".join(f"- {e}" for e in fe[:25]))
                     ok, out = run_check(result.changed)
                     if ok and spec_mod is not None:
-                        try:
-                            bad = spec_mod.verify_cross_file_contracts(
-                                root, result.changed or [])
-                        except Exception:
-                            bad = []
+                        bad = _new_contract_errors(
+                            root, cfg, result.changed or [])
                         if bad:
                             return False, (
                                 "CROSS-FILE INTERFACE CONTRACT VIOLATIONS\n"
                                 "(the names below do not exist in the module "
-                                "they are imported from, or the call cannot "
+                                "they are imported from, the ES import/export "
+                                "surface does not agree, or the call cannot "
                                 "satisfy the real signature -- fix the "
                                 "exporter and every importer in one step; "
                                 "do not rename around the problem)\n\n"
@@ -3582,6 +3665,7 @@ def run_loop(root: Path, cfg, client, idx, plan_path: Path, *,
 
     cfg._auto_step = 0
     cfg._static_baseline = None
+    cfg._contract_baseline = None
     if ratchet_on:
         try:
             ratchet_mod.prune(

@@ -46,6 +46,7 @@ import ast
 import difflib
 import re
 from dataclasses import dataclass, field
+from pathlib import Path
 
 from . import fileio
 from .edits import locate, parse_edits
@@ -184,17 +185,90 @@ def check_syntax(results) -> list[Finding]:
 syntax_findings = check_syntax
 
 
-def check_static(results) -> list[Finding]:
+def _new_static_errors(rel: str, after: str, before: str) -> list[str]:
+    """Static errors in `after` that were not already present in `before`."""
+    from . import spec as spec_mod
+    errs = [e for e in spec_mod.ast_static_errors(rel, after)
+            if ": E999 " not in e]
+    if not errs:
+        return []
+    base_keys = {spec_mod.static_error_key(e)
+                 for e in spec_mod.ast_static_errors(rel, before)}
+    return [e for e in errs if spec_mod.static_error_key(e) not in base_keys]
+
+
+def auto_heal_static(results, root=None, cfg=None,
+                     persist: bool = False) -> list[str]:
+    """Deterministically insert unambiguous missing imports into dry-applied
+    Python buffers (TECHNIQUES.md #19 / Sprint 1).
+
+    Only NEW F821 names are candidates -- the same `before`-vs-`after`
+    baseline `check_static` uses -- and `spec.auto_heal_source` re-parses and
+    re-runs the static resolver before accepting an insertion. Each result's
+    `after` buffer is updated in place, so the caller's checks see the healed
+    source. With `persist=True`, a buffer that is byte-identical to the file
+    on disk is written back (this is how `agent.apply` makes the fix real
+    after the edit has landed); otherwise nothing is written.
+
+    Returns the exact one-line receipts, or [] when nothing was healed."""
+    from . import spec as spec_mod
+    if not bool(getattr(cfg, "static_gate", True)) \
+            or not bool(getattr(cfg, "auto_heal_imports", True)):
+        return []
+    receipts: list[str] = []
+    for r in results or ():
+        if not getattr(r, "ok", False) or not getattr(r, "file", ""):
+            continue
+        if not str(r.file).lower().endswith(".py"):
+            continue
+        after = getattr(r, "after", None)
+        if after is None:
+            continue
+        before = getattr(r, "before", None) or ""
+        new = _new_static_errors(r.file, after, before)
+        names = spec_mod.f821_names(new)
+        if not names:
+            continue
+        healed, adds = spec_mod.auto_heal_source(
+            r.file, after, Path(root) if root is not None else None, cfg,
+            names=names)
+        if not adds:
+            continue
+        # Belt and braces: the healed buffer must resolve every name it
+        # touched and introduce no error the original buffer did not have.
+        remaining = _new_static_errors(r.file, healed, before)
+        if any(n in spec_mod.f821_names(remaining) for n in names):
+            continue
+        r.after = healed
+        receipts.extend(adds)
+        if persist and root is not None:
+            path = Path(root) / fileio.normalise_rel(r.file)
+            try:
+                current = fileio.read_text(path)
+            except OSError:
+                current = None
+            if current == after:          # disk is exactly the buffer we healed
+                try:
+                    _text, style = fileio.read(path)
+                    fileio.write(path, healed, style)
+                except OSError:
+                    pass
+    return receipts
+
+
+def check_static(results, root=None, cfg=None) -> list[Finding]:
     """New undefined-name / `__all__` / use-before-binding errors in the
     dry-applied buffers, checked in-process with the pure-AST static gate
     (TECHNIQUES.md #19) -- no model tokens, no linter subprocess.
 
     Like the syntax gate this compares the `after` buffer against the file's
     `before` buffer, so errors the file already had stay quiet and a repair
-    round is never spent on pre-existing problems. Only Python files are
-    considered; syntax errors belong to `check_syntax` (whose verdict also
-    makes any static verdict on the same buffer unreliable)."""
-    from . import spec as spec_mod
+    round is never spent on pre-existing problems. Before an F821 error is
+    returned, unambiguous missing imports are auto-healed in memory (see
+    `auto_heal_static`); only what remains reaches the model repair round.
+    Only Python files are considered; syntax errors belong to `check_syntax`
+    (whose verdict also makes any static verdict on the same buffer
+    unreliable)."""
     out: list[Finding] = []
     for r in results or ():
         if not getattr(r, "ok", False) or not getattr(r, "file", ""):
@@ -205,14 +279,14 @@ def check_static(results) -> list[Finding]:
         if after is None:
             continue
         before = getattr(r, "before", None) or ""
-        errs = [e for e in spec_mod.ast_static_errors(r.file, after)
-                if ": E999 " not in e]
-        if not errs:
+        new = _new_static_errors(r.file, after, before)
+        if not new:
             continue
-        base_keys = {spec_mod.static_error_key(e)
-                     for e in spec_mod.ast_static_errors(r.file, before)}
-        new = [e for e in errs
-               if spec_mod.static_error_key(e) not in base_keys]
+        receipts = auto_heal_static([r], root=root, cfg=cfg)
+        if receipts:
+            out.append(Finding("auto_heal", "warn", r.file,
+                               "\n".join(receipts)))
+            new = _new_static_errors(r.file, r.after, before)
         if not new:
             continue
         m = re.match(r"^.+?:(\d+):\d+: ", new[0])
@@ -1249,8 +1323,12 @@ def check(agent, task: str, reply: str, results, gathered: str = ""
     try:
         edits = parse_edits(reply)
         findings += check_syntax(results)
-        if getattr(getattr(agent, "cfg", None), "static_gate", True):
-            findings += check_static(results)
+        cfg = getattr(agent, "cfg", None)
+        if getattr(cfg, "static_gate", True):
+            findings += check_static(
+                results,
+                root=getattr(getattr(agent, "index", None), "root", None),
+                cfg=cfg)
         findings += check_placeholders(task, edits)
         findings += check_unread(agent, edits, results)
         findings += check_stale_references(agent, results)
@@ -1286,7 +1364,8 @@ def score_candidate(agent, task: str, reply: str, results, gathered: str = ""
     bad = sum(1 for r in results if not r.ok)
     score = 10.0 + 4.0 * ok - 6.0 * bad
     score -= 8.0 * sum(1 for f in findings if f.severity == "error")
-    score -= 2.0 * sum(1 for f in findings if f.severity == "warn")
+    score -= 2.0 * sum(1 for f in findings
+                       if f.severity == "warn" and f.kind != "auto_heal")
     return score, findings
 
 

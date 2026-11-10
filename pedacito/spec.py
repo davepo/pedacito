@@ -223,15 +223,147 @@ def _outline(rel: str, root: Path) -> list[str]:
 # contract_map_block) ahead of every Auto task so each step can see the
 # signatures the earlier steps wrote.
 
+_FIXTURE_DECORATOR_BASES = {"pytest", "pytest_asyncio"}
+_FIXTURE_HEADER = "# pytest fixtures (conftest.py)"
+
+
+def _fixture_decorator(node: ast.AST) -> tuple[bool, str]:
+    """(is_fixture, scope) for one decorator node.
+
+    Accepts `@fixture` and `@pytest.fixture` (plus the asyncio alias), with or
+    without a call. Scope is the literal keyword when present; anything more
+    elaborate is treated as unspecified rather than guessed."""
+    call = node if isinstance(node, ast.Call) else None
+    fn = call.func if call is not None else node
+    ok = False
+    if isinstance(fn, ast.Name):
+        ok = fn.id == "fixture"
+    elif isinstance(fn, ast.Attribute) and fn.attr == "fixture":
+        ok = (isinstance(fn.value, ast.Name)
+              and fn.value.id in _FIXTURE_DECORATOR_BASES)
+    if not ok:
+        return False, ""
+    scope = ""
+    if call is not None:
+        for kw in call.keywords:
+            if (kw.arg == "scope" and isinstance(kw.value, ast.Constant)
+                    and isinstance(kw.value.value, str)):
+                scope = kw.value.value
+                break
+    return True, scope
+
+
+def _fixture_hint(node: ast.AST) -> str:
+    """One truncated line describing a fixture: its docstring, else a yield
+    hint (`yields <expr>`) when it is a generator fixture."""
+    try:
+        doc = ast.get_docstring(node)
+    except Exception:
+        doc = None
+    if doc:
+        return " ".join(doc.strip().splitlines()[0].split())[:80]
+    for sub in ast.walk(node):
+        if isinstance(sub, (ast.Yield, ast.YieldFrom)):
+            value = getattr(sub, "value", None)
+            if value is not None:
+                try:
+                    expr = ast.unparse(value)
+                except Exception:
+                    expr = ""
+                if expr:
+                    return ("yields " + " ".join(expr.split()))[:80]
+            return "yields"
+    return ""
+
+
+def _conftest_files(root: Path, cap: int = 6) -> list[str]:
+    """Project-relative conftest.py paths, bounded, root-level first."""
+    rels = [rel for rel in _iter_code_files(root, PY_EXTS, cap=400)
+            if rel.rsplit("/", 1)[-1] == "conftest.py"]
+    rels.sort(key=lambda r: (r.count("/"), r))
+    return rels[:cap]
+
+
+def extract_pytest_fixtures(root: Path, max_fixtures: int = 8,
+                            max_chars: int = 700) -> str:
+    """Compact `# pytest fixtures (conftest.py)` subsection, or "".
+
+    Walks every discovered conftest.py with `ast.parse` (zero subprocesses,
+    zero model calls), captures each `@pytest.fixture` / `@fixture` function's
+    exact signature, literal scope, and a one-line docstring/yield hint. The
+    result is bounded and deterministic so it can ride inside CONTRACT_HEADER
+    without evicting the project's real public surface."""
+    root = Path(root)
+    rows: list[tuple[str, int, str]] = []
+    seen: set[tuple[str, str]] = set()
+    for rel in _conftest_files(root):
+        src = _read(rel, root)
+        if not src.strip():
+            continue
+        try:
+            tree = ast.parse(src)
+        except (SyntaxError, ValueError):
+            continue
+        for node in tree.body:
+            if not isinstance(node, DEF_NODES):
+                continue
+            fixture, scope = False, ""
+            for dec in node.decorator_list:
+                hit, dec_scope = _fixture_decorator(dec)
+                if hit:
+                    fixture = True
+                    scope = scope or dec_scope
+                    break
+            if not fixture:
+                continue
+            sig = _signature(node)
+            if not sig:
+                continue
+            key = (rel, sig)
+            if key in seen:
+                continue
+            seen.add(key)
+            hint = _fixture_hint(node)
+            line = f"- {rel}: {sig}"
+            if scope:
+                line += f" [scope={scope}]"
+            if hint:
+                line += f" -- {hint}"
+            rows.append((rel, node.lineno, line))
+    if not rows:
+        return ""
+    rows.sort(key=lambda r: (r[0], r[1]))
+    out: list[str] = [_FIXTURE_HEADER]
+    used = len(_FIXTURE_HEADER)
+    for _rel, _line, text in rows:
+        if len(out) - 1 >= max_fixtures or used + len(text) + 1 > max_chars:
+            break
+        out.append(text)
+        used += len(text) + 1
+    return "\n".join(out) if len(out) > 1 else ""
+
+
+def _task_mentions_tests(task: str) -> bool:
+    return bool(re.search(
+        r"(?i)\b(?:tests?|testing|pytest|fixtures?|conftest|test_[a-z0-9_]*|"
+        r"[a-z0-9_]+_test)\b", str(task or "")))
+
+
 def extract_project_contracts(root: Path, max_files: int = 25,
                               max_chars: int = 1400,
-                              modified: list[str] | None = None) -> str:
+                              modified: list[str] | None = None,
+                              task: str = "",
+                              include_fixtures: bool | None = None) -> str:
     """A compact map of the project's public signatures as
     `rel: def foo(x) -> y | class Bar` lines, capped near 300 tokens.
 
     `modified` (paths or rel strings, in any mix) sort those files first so
     the freshest contracts survive the cap; test files and unparsable files
-    are skipped. Returns "" when the project has nothing to lock."""
+    are skipped. When the repository has conftest.py files (or the task names
+    tests, and a conftest exists), a bounded `# pytest fixtures` subsection is
+    appended *inside* the same char budget so the model reuses real fixtures
+    instead of inventing or duplicating them. Returns "" when the project has
+    nothing to lock."""
     root = Path(root)
     rels = _iter_code_files(root, PY_EXTS | TS_EXTS, cap=120)
     want: set[str] = set()
@@ -251,11 +383,26 @@ def extract_project_contracts(root: Path, max_files: int = 25,
     order = {rel: i for i, rel in enumerate(rels)}
     rels.sort(key=lambda r: (0 if r in want else 1, order[r]))
 
+    # Fixtures are included when a conftest.py exists and the caller has not
+    # explicitly disabled them. A test-shaped task (or a modified test file)
+    # gets the fuller subsection; other tasks still see a compact one, because
+    # reusing a real fixture beats importing one nowhere.
+    fixture_block = ""
+    test_shaped = (_task_mentions_tests(task)
+                   or any(_is_test_file(r) for r in want))
+    if include_fixtures is not False and _conftest_files(root):
+        fixture_block = extract_pytest_fixtures(
+            root, max_fixtures=8 if test_shaped else 5,
+            max_chars=(min(700, max(200, max_chars // 2)) if test_shaped
+                       else min(420, max(160, max_chars // 3))))
+    fixture_cost = (len(fixture_block) + 1) if fixture_block else 0
+    map_budget = max(0, max_chars - fixture_cost)
+
     lines: list[str] = []
     used = 0
     files = 0
     for rel in rels:
-        if files >= max_files or used >= max_chars:
+        if files >= max_files or used >= map_budget:
             break
         if _is_test_file(rel):
             continue
@@ -265,11 +412,13 @@ def extract_project_contracts(root: Path, max_files: int = 25,
         entry = f"{rel}: " + "; ".join(sigs[:10])
         if len(entry) > 300:
             entry = entry[:297] + "..."
-        if used + len(entry) > max_chars and lines:
+        if used + len(entry) > map_budget and lines:
             break
         lines.append(entry)
         used += len(entry) + 1
         files += 1
+    if fixture_block:
+        lines.append(fixture_block)
     return "\n".join(lines)
 
 
@@ -277,10 +426,11 @@ CONTRACT_HEADER = ("[PROJECT INTERFACE CONTRACTS — DO NOT BREAK SIGNATURES]")
 CONTRACT_FOOTER = "[END INTERFACE CONTRACTS]"
 
 
-def contract_map_block(root: Path, modified: list[str] | None = None) -> str:
+def contract_map_block(root: Path, modified: list[str] | None = None,
+                       task: str = "") -> str:
     """The interface map as a ready-to-inject instruction block, or "" when
     the project exposes nothing yet (a near-empty tree gets no block)."""
-    cmap = extract_project_contracts(root, modified=modified)
+    cmap = extract_project_contracts(root, modified=modified, task=task)
     if not cmap:
         return ""
     return (CONTRACT_HEADER + "\n"
@@ -441,23 +591,609 @@ def _local_defs_names(info: _Mod) -> list[str]:
     return names[:6]
 
 
+# ------------------------------------------- JS/TS ES module contracts
+# The browser-side twin of the Python import/arity gate. The tree-sitter
+# grammar the indexer already ships parses both sides; relative ES imports
+# must resolve to a real project file and their named/default bindings must
+# exist in that file's exports, and a direct call of an imported local
+# function is checked against its known parameter range. Bare packages
+# (`react`, `alpinejs`), dynamic `import(...)`, namespace imports, `...rest`
+# parameters, functions that touch `arguments`, and any ambiguous shape are
+# skipped -- a false positive would cost a repair round on working code.
+
+_JS_FUNCTION_NODES = {
+    "function_declaration", "generator_function_declaration",
+    "function_expression", "arrow_function", "function",
+}
+_JS_DECL_NODES = {
+    "function_declaration", "generator_function_declaration",
+    "class_declaration", "abstract_class_declaration",
+    "interface_declaration", "type_alias_declaration",
+    "enum_declaration", "internal_module", "module",
+}
+_JS_IMPORT_EXTS = (".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".json")
+
+
+def _ts_text(node) -> str:
+    return node.text.decode("utf-8", "replace") if node is not None else ""
+
+
+def _walk_ts(node):
+    stack = [node]
+    while stack:
+        n = stack.pop()
+        yield n
+        stack.extend(reversed(n.named_children))
+
+
+def _ts_parser_for(suffix: str):
+    try:
+        from . import chunker_ts
+        language = chunker_ts.LANG_BY_EXT.get(suffix)
+        if not language or not chunker_ts.TS_AVAILABLE:
+            return None
+        return chunker_ts._get_parser(language)
+    except Exception:
+        return None
+
+
+def _ts_parse(text: str, suffix: str):
+    parser = _ts_parser_for(suffix)
+    if parser is None:
+        return None
+    try:
+        tree = parser.parse(text.encode("utf-8", "replace"))
+    except Exception:
+        return None
+    return tree.root_node if not tree.root_node.has_error else None
+
+
+def _js_pattern_names(node) -> set[str]:
+    """Identifiers bound by a JS/TS binding pattern (never default values)."""
+    if node is None:
+        return set()
+    k = node.type
+    if k in ("identifier", "shorthand_property_identifier_pattern"):
+        return {_ts_text(node)}
+    if k in ("rest_pattern",):
+        return _js_pattern_names(node.named_children[0]
+                                 if node.named_children else None)
+    if k in ("assignment_pattern", "required_parameter", "optional_parameter"):
+        target = node.child_by_field_name("pattern") \
+            or node.child_by_field_name("left") \
+            or (node.named_children[0] if node.named_children else None)
+        return _js_pattern_names(target)
+    if k in ("object_pattern", "array_pattern", "pair_pattern"):
+        out: set[str] = set()
+        for child in node.named_children:
+            if child.type == "pair_pattern":
+                out |= _js_pattern_names(
+                    child.child_by_field_name("value"))
+            elif child.type == "property_identifier":
+                continue
+            else:
+                out |= _js_pattern_names(child)
+        return out
+    return set()
+
+
+def _ts_param_count(params) -> tuple[int, int] | None:
+    """(min_required, max_args) for a parameter node, or None when arity
+    cannot be checked (rest parameter, unknown syntax)."""
+    if params is None:
+        return (0, 0)
+    if params.type == "identifier":
+        return (1, 1)
+    if params.type != "formal_parameters":
+        return None
+    required = 0
+    total = 0
+    for param in params.named_children:
+        if param.type == "comment":
+            continue
+        kind = param.type
+        if kind == "rest_pattern":
+            return None
+        if kind in ("required_parameter", "optional_parameter"):
+            pattern = param.child_by_field_name("pattern") or param
+            if _ts_text(pattern).strip() == "this":
+                continue
+            if any(n.type == "rest_pattern" for n in _walk_ts(pattern)):
+                return None
+            total += 1
+            defaulted = param.child_by_field_name("value") is not None
+            if not (defaulted or kind == "optional_parameter"):
+                required += 1
+        elif kind == "identifier":
+            total += 1
+            required += 1
+        elif kind == "assignment_pattern":
+            total += 1
+        elif kind in ("object_pattern", "array_pattern"):
+            total += 1
+            required += 1
+        else:
+            return None                  # unknown param shape: never guess
+    return (required, total)
+
+
+def _js_function_spec(node, name: str = ""):
+    """(min_args, max_args, shown_signature) for one function-like node, or
+    None when the parameter range cannot be proven."""
+    params = node.child_by_field_name("parameters")
+    if params is None and node.type == "arrow_function":
+        params = node.child_by_field_name("parameter")
+    body = node.child_by_field_name("body")
+    if body is not None and re.search(r"(?<![\w$.])arguments(?![\w$])",
+                                      _ts_text(body)):
+        return None                      # arguments[] makes arity opaque
+    count = _ts_param_count(params)
+    if count is None:
+        return None
+    param_text = _ts_text(params) if params is not None else "()"
+    if not param_text.startswith("("):
+        param_text = f"({param_text})"
+    if node.type == "arrow_function":
+        shown = f"const {name or '(anonymous)'} = {param_text} => {{...}}"
+    else:
+        shown = f"function {name or '(anonymous)'}{param_text}"
+    return (count[0], count[1], shown[:140])
+
+
+def _js_add_local(info: dict, node) -> set[str]:
+    """Record one top-level declaration in `info["locals"]`; returns names."""
+    added: set[str] = set()
+    if node is None:
+        return added
+    if node.type in ("function_declaration", "generator_function_declaration"):
+        name_node = node.child_by_field_name("name")
+        name = _ts_text(name_node)
+        if name:
+            info["locals"][name] = _js_function_spec(node, name)
+            added.add(name)
+        return added
+    if node.type in ("class_declaration", "abstract_class_declaration"):
+        name = _ts_text(node.child_by_field_name("name"))
+        if name:
+            info["locals"][name] = None
+            added.add(name)
+        return added
+    if node.type in ("interface_declaration", "type_alias_declaration",
+                     "enum_declaration", "internal_module", "module"):
+        name = _ts_text(node.child_by_field_name("name"))
+        if name:
+            info["locals"][name] = None
+            added.add(name)
+        return added
+    if node.type in ("function_signature", "method_signature"):
+        name = _ts_text(node.child_by_field_name("name"))
+        if name:
+            info["locals"][name] = _js_function_spec(node, name)
+            added.add(name)
+        return added
+    if node.type == "ambient_declaration":
+        for child in node.named_children:
+            added |= _js_add_local(info, child)
+        return added
+    if node.type in ("lexical_declaration", "variable_declaration"):
+        for child in node.named_children:
+            if child.type != "variable_declarator":
+                continue
+            names = _js_pattern_names(child.child_by_field_name("name"))
+            if not names:
+                continue
+            value = child.child_by_field_name("value")
+            spec = (_js_function_spec(value, next(iter(names)))
+                    if value is not None and value.type in _JS_FUNCTION_NODES
+                    and len(names) == 1 else None)
+            for name in names:
+                info["locals"][name] = spec
+                added.add(name)
+    return added
+
+
+def _js_add_export_info(info: dict, node, text: str) -> None:
+    """Update exports/opaque from one export_statement node."""
+    is_default = bool(re.match(r"^\s*export\s+default\b", text))
+    decl = node.child_by_field_name("declaration")
+    value = node.child_by_field_name("value")
+    source = node.child_by_field_name("source")
+    clause = next((c for c in node.named_children
+                   if c.type == "export_clause"), None)
+    namespace = next((c for c in node.named_children
+                      if c.type == "namespace_export"), None)
+
+    if is_default:
+        if decl is not None:
+            # `_js_add_local` also makes a named default declaration callable
+            # by a later `export { name }`; it is not a named export itself.
+            _js_add_local(info, decl)
+            if decl.type in ("function_declaration",
+                             "generator_function_declaration"):
+                info["exports"]["default"] = _js_function_spec(
+                    decl, _ts_text(decl.child_by_field_name("name")))
+            else:
+                info["exports"]["default"] = None
+        elif value is not None:
+            if value.type in _JS_FUNCTION_NODES:
+                info["exports"]["default"] = _js_function_spec(value)
+            elif value.type == "identifier":
+                info["exports"]["default"] = info["locals"].get(
+                    _ts_text(value))
+            else:
+                info["exports"]["default"] = None
+        else:
+            info["exports"]["default"] = None
+        return
+
+    if decl is not None:
+        before = set(info["locals"])
+        _js_add_local(info, decl)
+        for name in set(info["locals"]) - before:
+            info["exports"][name] = info["locals"][name]
+        return
+    if clause is not None:
+        for spec in clause.named_children:
+            if spec.type != "export_specifier":
+                continue
+            imported = _ts_text(spec.child_by_field_name("name"))
+            alias = _ts_text(spec.child_by_field_name("alias"))
+            exported = alias or imported
+            if not exported:
+                continue
+            # An export alias (especially in minified/vendored code) no
+            # longer proves the parameter list the caller sees: keep the
+            # export name for existence checks but never arity-check it.
+            if source is not None or (alias and alias != imported):
+                info["exports"][exported] = None
+            else:
+                info["exports"][exported] = info["locals"].get(imported)
+        return
+    if namespace is not None:
+        name = _ts_text(namespace.named_children[0]
+                        if namespace.named_children else None)
+        if name:
+            info["exports"][name] = None
+        return
+    if source is not None:
+        info["opaque"] = True             # `export * from` hides the surface
+        return
+    if re.match(r"^\s*export\s*(?:=|\bas\s+namespace\b)", text):
+        info["opaque"] = True             # CommonJS / UMD-shaped surface
+
+
+def _js_module_info(text: str, suffix: str) -> dict | None:
+    """Exports/locals/opaque/module facts for one JS/TS source, or None when
+    the parser cannot read it (the syntax gate owns that failure)."""
+    root = _ts_parse(text, suffix)
+    if root is None:
+        return None
+    info = {"exports": {}, "locals": {}, "opaque": False, "module": False}
+    for child in root.named_children:
+        if child.type == "import_statement":
+            info["module"] = True
+        elif child.type == "export_statement":
+            info["module"] = True
+            _js_add_export_info(info, child, _ts_text(child))
+        elif child.type in _JS_DECL_NODES or child.type in (
+                "lexical_declaration", "variable_declaration"):
+            _js_add_local(info, child)
+        elif child.type == "expression_statement":
+            for sub in child.named_children:
+                if sub.type != "assignment_expression":
+                    continue
+                left = sub.child_by_field_name("left")
+                if left is None or left.type != "member_expression":
+                    continue
+                obj = _ts_text(left.child_by_field_name("object"))
+                prop = _ts_text(left.child_by_field_name("property"))
+                if obj == "module" and prop == "exports" or obj == "exports":
+                    info["module"] = True
+                    info["opaque"] = True
+    return info
+
+
+def _js_imports_and_reexports(root) -> tuple[list[dict], list[dict]]:
+    """Relative import and `export ... from` statements with exact lines."""
+    imports: list[dict] = []
+    reexports: list[dict] = []
+    for node in root.named_children:
+        if node.type == "import_statement":
+            source = node.child_by_field_name("source")
+            spec = _ts_text(source).strip().strip("'\"")
+            if not spec:
+                continue
+            clause = next((c for c in node.named_children
+                           if c.type == "import_clause"), None)
+            default = ""
+            named: list[tuple[str, str]] = []
+            namespace = ""
+            if clause is not None:
+                for child in clause.children:
+                    if child.type == "identifier":
+                        default = _ts_text(child)
+                    elif child.type == "named_imports":
+                        for spec_node in child.named_children:
+                            if spec_node.type != "import_specifier":
+                                continue
+                            imported = _ts_text(
+                                spec_node.child_by_field_name("name"))
+                            alias = _ts_text(
+                                spec_node.child_by_field_name("alias"))
+                            if imported:
+                                named.append((alias or imported, imported))
+                    elif child.type == "namespace_import":
+                        ident = next((x for x in child.named_children
+                                      if x.type == "identifier"), None)
+                        namespace = _ts_text(ident)
+            imports.append({
+                "spec": spec, "line": node.start_point[0] + 1,
+                "default": default, "named": named, "namespace": namespace,
+                "type_only": bool(re.match(r"^\s*import\s+type\b",
+                                           _ts_text(node))),
+            })
+            continue
+        if node.type != "export_statement":
+            continue
+        source = node.child_by_field_name("source")
+        spec = _ts_text(source).strip().strip("'\"")
+        if not spec:
+            continue
+        clause = next((c for c in node.named_children
+                       if c.type == "export_clause"), None)
+        namespace = next((c for c in node.named_children
+                          if c.type == "namespace_export"), None)
+        entry = {"spec": spec, "line": node.start_point[0] + 1,
+                 "named": [], "star": False}
+        if clause is not None:
+            for spec_node in clause.named_children:
+                if spec_node.type != "export_specifier":
+                    continue
+                imported = _ts_text(spec_node.child_by_field_name("name"))
+                alias = _ts_text(spec_node.child_by_field_name("alias"))
+                if imported:
+                    entry["named"].append((alias or imported, imported))
+        elif namespace is not None:
+            entry["star"] = False          # existence-only, like a namespace
+        else:
+            entry["star"] = True
+        reexports.append(entry)
+    return imports, reexports
+
+
+def _js_resolve_import(root: Path, from_rel: str, spec: str) -> str:
+    """Project-relative path an ES specifier resolves to, or "" when it is
+    not a verifiable project-relative file."""
+    spec = (spec or "").strip()
+    if not spec.startswith(".") or spec in (".", ".."):
+        return ""
+    if any(ch in spec for ch in "?#\x00") or "\\" in spec:
+        return ""
+    root_res = root.resolve()
+    base = (root / from_rel).parent
+    try:
+        absolute = (base / spec).resolve()
+        absolute.relative_to(root_res)
+    except (OSError, ValueError):
+        return ""                           # escapes the project: not guessed
+    candidates: list[Path] = []
+    suffix = absolute.suffix.lower()
+    if suffix:
+        candidates.append(absolute)
+        if suffix in (".js", ".jsx", ".mjs", ".cjs"):
+            for alt in (".ts", ".tsx"):
+                candidates.append(absolute.with_suffix(alt))
+    else:
+        candidates.append(absolute)
+        candidates.extend(absolute.with_name(absolute.name + ext)
+                          for ext in _JS_IMPORT_EXTS)
+        candidates.extend(absolute / ("index" + ext)
+                          for ext in _JS_IMPORT_EXTS)
+    for cand in candidates:
+        try:
+            if cand.is_file():
+                return cand.relative_to(root_res).as_posix()
+        except (OSError, ValueError):
+            continue
+    return ""
+
+
+def _js_shadowed_names(root, imported: set[str]) -> set[str]:
+    """Imported locals that are redeclared anywhere in the importing file."""
+    shadowed: set[str] = set()
+
+    def visit(node) -> None:
+        if node.type == "import_statement":
+            return
+        if node.type in ("function_declaration",
+                         "generator_function_declaration",
+                         "class_declaration", "interface_declaration",
+                         "type_alias_declaration", "enum_declaration"):
+            name = _ts_text(node.child_by_field_name("name"))
+            if name in imported:
+                shadowed.add(name)
+        elif node.type == "variable_declarator":
+            names = _js_pattern_names(node.child_by_field_name("name"))
+            shadowed.update(names & imported)
+        elif node.type == "formal_parameters":
+            for param in node.named_children:
+                names = _js_pattern_names(param)
+                shadowed.update(names & imported)
+            return                         # defaults are uses, not bindings
+        elif node.type == "catch_clause":
+            for child in node.named_children:
+                if child.type in ("identifier", "object_pattern",
+                                  "array_pattern"):
+                    shadowed.update(_js_pattern_names(child) & imported)
+        elif node.type == "assignment_expression":
+            left = node.child_by_field_name("left")
+            if left is not None and left.type == "identifier":
+                name = _ts_text(left)
+                if name in imported:
+                    shadowed.add(name)
+        for child in node.named_children:
+            visit(child)
+
+    visit(root)
+    return shadowed
+
+
+def _js_export_label(exports) -> list[str]:
+    return sorted(exports)[:6]
+
+
+def _js_cross_file_errors(root: Path, cap: int = 60
+                          ) -> list[tuple[str, str, str]]:
+    """(importer_rel, target_rel, ContractError) for JS/TS module contracts.
+
+    Deterministic, in-process, and deliberately quiet on every shape a
+    static checker cannot decide (bare packages, dynamic imports, namespace
+    imports, `export *`, CommonJS, unparsable files, shadowed locals,
+    rest/arguments arity)."""
+    root = Path(root)
+    rels = _iter_code_files(root, TS_EXTS, cap=300)
+    if not rels:
+        return []
+    info_cache: dict[str, dict | None] = {}
+
+    def info_for(rel: str) -> dict | None:
+        if rel not in info_cache:
+            info_cache[rel] = _js_module_info(_read(rel, root),
+                                              "." + rel.rsplit(".", 1)[-1].lower())
+        return info_cache[rel]
+
+    out: list[tuple[str, str, str]] = []
+    seen: set[str] = set()
+
+    def emit(importer: str, target: str, text: str) -> None:
+        if text in seen or len(out) >= cap:
+            return
+        seen.add(text)
+        out.append((importer, target, text))
+
+    for rel in rels:
+        text = _read(rel, root)
+        if not text.strip():
+            continue
+        suffix = "." + rel.rsplit(".", 1)[-1].lower()
+        root_node = _ts_parse(text, suffix)
+        if root_node is None:
+            continue                       # syntax gate owns broken files
+        imports, reexports = _js_imports_and_reexports(root_node)
+        if not imports and not reexports:
+            continue
+        imported_funcs: dict[str, tuple[str, tuple[int, int, str]]] = {}
+        import_counts: dict[str, int] = {}
+        for item in imports:
+            for local, _imported in item["named"]:
+                import_counts[local] = import_counts.get(local, 0) + 1
+            if item["default"]:
+                import_counts[item["default"]] = \
+                    import_counts.get(item["default"], 0) + 1
+        for item in imports:
+            target = _js_resolve_import(root, rel, item["spec"])
+            if not target:
+                if item["spec"].startswith("."):
+                    emit(rel, "", f"ContractError in {rel}:{item['line']}: "
+                         f"imports '{item['spec']}', but no such file exists "
+                         f"in the project -- create it or fix the path")
+                continue
+            target_info = info_for(target)
+            if target_info is None or not target_info["module"] \
+                    or target_info["opaque"]:
+                continue                   # not provable: only existence above
+            exports = target_info["exports"]
+            if item["default"] and "default" not in exports:
+                emit(rel, target, f"ContractError in {rel}:{item['line']}: "
+                     f"imports the default export from {target}, but {target} "
+                     f"has no default export (exports: "
+                     f"{_js_export_label(exports)})")
+            for local, imported in item["named"]:
+                if imported not in exports:
+                    emit(rel, target, f"ContractError in {rel}:{item['line']}: "
+                         f"imports '{imported}' from {target}, but {target} "
+                         f"does not export it (exports: "
+                         f"{_js_export_label(exports)})")
+                    continue
+                spec = exports.get(imported)
+                if (spec is not None and not item["type_only"]
+                        and import_counts.get(local, 0) == 1):
+                    imported_funcs[local] = (target, spec)
+            if item["default"] and "default" in exports and not item["type_only"]:
+                spec = exports.get("default")
+                if (spec is not None
+                        and import_counts.get(item["default"], 0) == 1):
+                    imported_funcs[item["default"]] = (target, spec)
+
+        for item in reexports:
+            target = _js_resolve_import(root, rel, item["spec"])
+            if not target:
+                if item["spec"].startswith("."):
+                    emit(rel, "", f"ContractError in {rel}:{item['line']}: "
+                         f"re-exports '{item['spec']}', but no such file exists "
+                         f"in the project -- create it or fix the path")
+                continue
+            if item["star"]:
+                continue
+            target_info = info_for(target)
+            if target_info is None or not target_info["module"] \
+                    or target_info["opaque"]:
+                continue
+            for exported, imported in item["named"]:
+                if imported not in target_info["exports"]:
+                    emit(rel, target, f"ContractError in {rel}:{item['line']}: "
+                         f"re-exports '{imported}' from {target}, but {target} "
+                         f"does not export it (exports: "
+                         f"{_js_export_label(target_info['exports'])})")
+
+        if not imported_funcs:
+            continue
+        shadowed = _js_shadowed_names(root_node, set(imported_funcs))
+        for node in _walk_ts(root_node):
+            if node.type != "call_expression":
+                continue
+            fn = node.child_by_field_name("function")
+            if fn is None or fn.type != "identifier":
+                continue
+            local = _ts_text(fn)
+            if local in shadowed or local not in imported_funcs:
+                continue
+            target, (minimum, maximum, shown) = imported_funcs[local]
+            args = node.child_by_field_name("arguments")
+            if args is None:
+                continue
+            if any(c.type == "spread_element" for c in args.named_children):
+                continue                   # spread can satisfy any arity
+            argc = sum(1 for c in args.named_children if c.type != "comment")
+            if argc < minimum or argc > maximum:
+                line = node.start_point[0] + 1
+                want = (f"exactly {minimum}" if minimum == maximum
+                        else f"{minimum}..{maximum}")
+                emit(rel, target, f"ContractError in {rel}:{line}: calls "
+                     f"{local}(...) with {argc} argument(s) imported from "
+                     f"{target}, where the function is defined as {shown} and "
+                     f"expects {want} argument(s)")
+    out.sort(key=lambda t: (t[0], t[2]))
+    return out
+
+
 def verify_cross_file_contracts(root: Path,
                                 modified_files: list | None = None) -> list[str]:
-    """Cross-file import/arity violations in the project's Python files, as
-    `ContractError in <file>:<line>: <detail>` strings (empty = consistent).
+    """Cross-file import/arity violations in the project's Python and JS/TS
+    files, as `ContractError in <file>:<line>: <detail>` strings (empty =
+    consistent).
 
     Every local ``from <module> import <name>`` is checked against what
     <module> actually defines, and every direct call of such an imported name
-    is checked for argument-count compatibility. `modified_files` only
-    reorders diagnostics (files touched by the last step are reported first);
-    the scan always covers the whole project, since a change in one file
-    breaks contracts in its *importers*."""
+    is checked for argument-count compatibility. The same gate covers
+    relative ES module imports and exported-name/arity contracts in JS/TS.
+    `modified_files` only reorders diagnostics (files touched by the last step
+    are reported first); the scan always covers the whole project, since a
+    change in one file breaks contracts in its *importers*."""
     root = Path(root)
     if not root.is_dir():
         return []
     mods = _local_py_modules(root)
-    if not mods:
-        return []
     touched: set[str] = set()
     for m in modified_files or ():
         name = fileio.normalise_rel(str(m))
@@ -576,6 +1312,12 @@ def verify_cross_file_contracts(root: Path,
                 emit(f"ContractError in {rel}:{node.lineno}: calls {name}(...)"
                      f" ({msg}) imported from {src_rel}, where the {kind} is "
                      f"defined as {shown or name}", rel)
+
+    # JS/TS ES module contracts: relative import existence, exported names,
+    # and imported-function arity. Same diagnostic shape, same touched-first
+    # ordering, same conservative skips.
+    for importer, _target, text in _js_cross_file_errors(root):
+        emit(text, importer)
 
     out.sort(key=lambda t: (t[0], t[1]))
     return [t for _o, _i, t in out][:20]
@@ -882,6 +1624,299 @@ _COMMON_IMPORT_HINTS: dict[str, str] = {
     "annotations": "`from __future__ import annotations`",
 }
 
+# ------------------------------------------------- deterministic import heal
+# TECHNIQUES.md #19's cheapest repair is no repair at all: when an F821 names
+# a stdlib top-level module or a public symbol defined in exactly ONE project
+# file, the import is mechanically known. Insert it, re-run the same AST gate
+# in memory, and only keep the insertion when the target error disappears and
+# no new error appears. Everything ambiguous falls through untouched.
+
+_AUTO_HEAL_EXTRA_STDLIB = {"pytest"}
+_F821_NAME_RE = re.compile(r"`([^`]+)`")
+
+
+def _auto_heal_enabled(cfg) -> bool:
+    return bool(_get(cfg, "auto_heal_imports", True))
+
+
+def _stdlib_top_level_names() -> frozenset[str]:
+    names = set(getattr(sys, "stdlib_module_names", ())) or set()
+    names |= _AUTO_HEAL_EXTRA_STDLIB
+    # Builtins are handled by the resolver; `__future__`/`__main__` are not
+    # import targets for a bare name in normal code.
+    return frozenset(n for n in names
+                     if n and not n.startswith("_") and n != "__future__")
+
+
+def f821_names(errors) -> list[str]:
+    """Undefined names named by F821 gate errors, sorted and deduplicated."""
+    out: set[str] = set()
+    for err in errors or ():
+        text = str(err or "")
+        if ": F821 " not in text:
+            continue
+        m = _F821_NAME_RE.search(text)
+        if m:
+            name = m.group(1).strip()
+            if name.isidentifier():
+                out.add(name)
+    return sorted(out)
+
+
+def _bound_names(tree: ast.AST) -> set[str]:
+    """Every name the file binds anywhere. Used as a conservative shadow
+    check: if the name is bound at all, auto-healing is not attempted."""
+    out: set[str] = set()
+
+    def target(node) -> None:
+        if isinstance(node, ast.Name):
+            out.add(node.id)
+        elif isinstance(node, (ast.Tuple, ast.List)):
+            for elt in node.elts:
+                target(elt)
+        elif isinstance(node, ast.Starred):
+            target(node.value)
+
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef,
+                             ast.ClassDef)):
+            out.add(node.name)
+        elif isinstance(node, ast.arg):
+            out.add(node.arg)
+        elif isinstance(node, ast.alias):
+            out.add((node.asname or node.name).split(".")[0])
+        elif isinstance(node, ast.ExceptHandler) and node.name:
+            out.add(node.name)
+        elif isinstance(node, (ast.Global, ast.Nonlocal)):
+            out.update(node.names)
+        elif isinstance(node, ast.Name) and isinstance(
+                node.ctx, (ast.Store, ast.Del)):
+            out.add(node.id)
+        elif isinstance(node, (ast.Assign, ast.AnnAssign, ast.AugAssign)):
+            targets = (node.targets if isinstance(node, ast.Assign)
+                       else [node.target])
+            for t in targets:
+                target(t)
+        elif isinstance(node, (ast.For, ast.AsyncFor)):
+            target(node.target)
+        elif isinstance(node, ast.withitem) and node.optional_vars is not None:
+            target(node.optional_vars)
+        elif isinstance(node, ast.MatchAs) and node.name:
+            out.add(node.name)
+        elif isinstance(node, ast.MatchStar) and node.name:
+            out.add(node.name)
+        elif isinstance(node, ast.MatchMapping) and node.rest:
+            out.add(node.rest)
+        elif isinstance(node, ast.comprehension):
+            target(node.target)
+        for tp in getattr(node, "type_params", ()) or ():
+            out.add(getattr(tp, "name", ""))
+    return {n for n in out if n}
+
+
+def _insert_after_headers(src: str, tree: ast.AST) -> int:
+    """Zero-based line index where a new module import belongs: after the
+    shebang/coding cookie, module docstring, and every `from __future__`
+    import (in that order)."""
+    lines = src.split("\n")
+    index = 0
+    while index < len(lines):
+        line = lines[index]
+        if line.startswith("#!") or re.match(r"^#.*coding[:=]", line):
+            index += 1
+            continue
+        break
+    body = getattr(tree, "body", [])
+    if body and isinstance(body[0], ast.Expr) \
+            and isinstance(body[0].value, ast.Constant) \
+            and isinstance(body[0].value.value, str):
+        index = max(index, int(body[0].end_lineno or body[0].lineno or 1))
+    for stmt in body:
+        if isinstance(stmt, ast.ImportFrom) and stmt.module == "__future__":
+            index = max(index, int(stmt.end_lineno or stmt.lineno or 1))
+    return max(0, min(index, len(lines)))
+
+
+def _module_path(rel: str) -> str:
+    """Dotted import path for a project-relative .py file, or "" when a path
+    segment is not a valid Python identifier."""
+    name = rel[:-3] if rel.lower().endswith(".py") else rel
+    name = name.replace("\\", "/").strip("/")
+    if name.endswith("/__init__"):
+        name = name[: -len("/__init__")]
+    elif name == "__init__":
+        return ""
+    parts = name.split("/")
+    if not all(p.isidentifier() for p in parts):
+        return ""
+    return ".".join(parts)
+
+
+def _unique_project_symbols(root: Path | None, names: set[str],
+                            current_rel: str) -> dict[str, str]:
+    """{name: dotted module} for public top-level functions/classes defined
+    by exactly ONE non-test project file. Ambiguous names are omitted."""
+    if root is None or not names:
+        return {}
+    root = Path(root)
+    found: dict[str, list[str]] = {name: [] for name in names}
+    for rel in _iter_code_files(root, PY_EXTS, cap=400):
+        if rel == current_rel or _is_test_file(rel):
+            continue
+        src = _read(rel, root)
+        if not src.strip():
+            continue
+        try:
+            tree = ast.parse(src)
+        except (SyntaxError, ValueError):
+            continue
+        for node in tree.body:
+            if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef,
+                                     ast.ClassDef)):
+                continue
+            if node.name in found and not node.name.startswith("_"):
+                found[node.name].append(rel)
+    out: dict[str, str] = {}
+    for name, rels in found.items():
+        if len(rels) != 1:             # zero, or a duplicate definition
+            continue
+        module = _module_path(rels[0])
+        if module:
+            out[name] = module
+    return out
+
+
+def auto_heal_source(rel: str, src: str, root: Path | None = None,
+                     cfg=None, names=None) -> tuple[str, list[str]]:
+    """Insert imports that provably fix F821 names in one Python source.
+
+    Returns `(healed_source, receipts)`. `names` restricts healing to the
+    errors the caller already classified as NEW (so pre-existing breakage is
+    never laundered into the patch); with None every F821 in `src` is a
+    candidate. Each insertion is validated with `ast.parse` plus the same
+    AST static resolver before it is kept: exact, bounded, no model call."""
+    if not _auto_heal_enabled(cfg) or not src.strip():
+        return src, []
+    try:
+        tree = ast.parse(src)
+    except (SyntaxError, ValueError):
+        return src, []
+    # A star import or a dynamic scope makes the name set unknowable: never
+    # guess an import there (the same house rule the AST resolver follows).
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom) and any(
+                a.name == "*" for a in node.names):
+            return src, []
+        if isinstance(node, ast.Name) and node.id in ("exec", "eval",
+                                                      "locals"):
+            return src, []
+        if isinstance(node, ast.Attribute) and node.attr in ("exec", "eval"):
+            return src, []
+    bound = _bound_names(tree)
+    candidates = set(names) if names is not None else set(
+        f821_names(ast_static_errors(rel, src)))
+    candidates = {n for n in candidates
+                  if n.isidentifier() and n not in _BUILTIN_NAMES
+                  and n not in bound}
+    if not candidates:
+        return src, []
+    stdlib = _stdlib_top_level_names()
+    statements: list[tuple[str, str]] = []
+    for name in sorted(candidates):
+        if name in stdlib:
+            statements.append((name, f"import {name}"))
+    repo_names = {n for n in candidates if n not in stdlib}
+    unique = _unique_project_symbols(root, repo_names, rel)
+    for name in sorted(repo_names):
+        module = unique.get(name)
+        if module:
+            statements.append((name, f"from {module} import {name}"))
+    if not statements:
+        return src, []
+
+    keys = {static_error_key(e) for e in ast_static_errors(rel, src)}
+    healed = src
+    receipts: list[str] = []
+    inserted = 0
+    for name, stmt in statements:
+        try:
+            current_tree = ast.parse(healed)
+        except (SyntaxError, ValueError):
+            break
+        index = _insert_after_headers(healed, current_tree) + inserted
+        lines = healed.split("\n")
+        lines.insert(min(index, len(lines)), stmt)
+        trial = "\n".join(lines)
+        try:
+            ast.parse(trial)
+        except (SyntaxError, ValueError):
+            continue
+        trial_errors = ast_static_errors(rel, trial)
+        trial_keys = {static_error_key(e) for e in trial_errors}
+        if name in f821_names(trial_errors):
+            continue                    # the insertion did not resolve it
+        if trial_keys - keys:
+            continue                    # introduced a different error
+        healed = trial
+        keys = trial_keys
+        inserted += 1
+        receipts.append(f"[AUTO-HEALED: added '{stmt}' in {rel}]")
+    return healed, receipts
+
+
+def auto_heal_file(root: Path, rel: str, cfg=None,
+                   names=None) -> list[str]:
+    """Apply `auto_heal_source` to one file on disk; receipts or []."""
+    if not _auto_heal_enabled(cfg):
+        return []
+    root = Path(root)
+    path = root / fileio.normalise_rel(rel)
+    try:
+        src, style = fileio.read(path)
+    except OSError:
+        return []
+    healed, receipts = auto_heal_source(fileio.normalise_rel(rel), src, root,
+                                        cfg, names=names)
+    if receipts and healed != src:
+        try:
+            fileio.write(path, healed, style)
+        except OSError:
+            return []
+    return receipts
+
+
+def heal_static_gate_errors(root: Path, files, errors, cfg=None
+                            ) -> tuple[list[str], list[str]]:
+    """Heal NEW F821 gate errors on disk, then re-run the gate on `files`.
+
+    Returns `(errors_after, receipts)`. When nothing can be healed the
+    original error list is returned unchanged, so the normal repair path sees
+    exactly what it would have seen without this feature."""
+    if not _auto_heal_enabled(cfg) or not errors:
+        return list(errors or []), []
+    by_file: dict[str, set[str]] = {}
+    for err in errors:
+        text = str(err or "")
+        if ": F821 " not in text:
+            continue
+        m = re.match(r"^(?P<file>.+?):\d+:\d+: ", text)
+        name_m = _F821_NAME_RE.search(text)
+        if m and name_m:
+            by_file.setdefault(m.group("file"), set()).add(
+                name_m.group(1).strip())
+    receipts: list[str] = []
+    for rel, names in sorted(by_file.items()):
+        receipts.extend(auto_heal_file(root, rel, cfg, names=names))
+    if not receipts:
+        return list(errors or []), []
+    timeout = float(_get(cfg, "static_gate_timeout", _RUFF_TIMEOUT))
+    try:
+        after = run_fast_static_gate(root, files, timeout=timeout)
+    except Exception:
+        after = list(errors or [])
+    return after, receipts
+
+
 _RUFF_TIMEOUT = 3.0
 _MAX_GATE_FILES = 80            # files per gate run (one subprocess)
 _MAX_FILE_ERRORS = 12           # errors per file in the AST fallback
@@ -925,6 +1960,26 @@ def static_error_key(err: str) -> str:
     if m:
         return f"{m.group('f')}: {m.group('rest')}"
     return err
+
+
+_CONTRACT_ERR_RE = re.compile(
+    r"^(?P<kind>[A-Za-z]*ContractError) in "
+    r"(?P<file>.+?):(?:\d+): (?P<rest>.*)$")
+
+
+def contract_error_key(err: str) -> str:
+    """Contract-error identity without the line number, for baseline diffing.
+    A pre-existing violation that only shifted lines is still pre-existing."""
+    m = _CONTRACT_ERR_RE.match(str(err or ""))
+    if m:
+        return f"{m.group('kind')} in {m.group('file')}: {m.group('rest')}"
+    return str(err or "")
+
+
+def contract_error_file(err: str) -> str:
+    """The file part of a ContractError string ("" when unparseable)."""
+    m = _CONTRACT_ERR_RE.match(str(err or ""))
+    return m.group("file") if m else ""
 
 
 def _decorate(rel: str, line: int, col: int, code: str, msg: str) -> str:
@@ -1655,13 +2710,15 @@ def _fe_js_syntax_problem(rel: str, text: str) -> str | None:
 def verify_frontend_contracts(root: Path, modified_files=None) -> list[str]:
     """Deterministic DOM Contract verification of the HTML/JS in `root`.
 
-    Three checks, all mechanical: (1) every <script src> / stylesheet <link
+    Four checks, all mechanical: (1) every <script src> / stylesheet <link
     href> in every HTML file points at a file that exists; (2) every literal
     DOM query (getElementById('x') / querySelector('#x')) matches an id the
     HTML defines (or a literal id the JS itself creates); files whose ids are
     generated in template literals are exempt -- nothing is verified against
     a moving target; (3) every JS file parses, via `node --check` when node
-    is installed and tree-sitter otherwise.
+    is installed and tree-sitter otherwise; (4) relative ES module imports
+    resolve and name real exports, and imported calls satisfy the known
+    arity range (the same `ContractError` diagnostics as the Python gate).
 
     `modified_files` (root-relative paths, as the loop reports them) scopes
     the REPORT: only errors inside those files come back, so a pre-existing
@@ -1671,7 +2728,8 @@ def verify_frontend_contracts(root: Path, modified_files=None) -> list[str]:
     root = Path(root)
     html_rels = _iter_code_files(root, _FE_HTML_EXTS)
     js_rels = _iter_code_files(root, _FE_JS_EXTS)
-    if not html_rels and not js_rels:
+    module_rels = _iter_code_files(root, TS_EXTS)
+    if not html_rels and not js_rels and not module_rels:
         return []
     scope = None
     if modified_files:
@@ -1688,8 +2746,8 @@ def verify_frontend_contracts(root: Path, modified_files=None) -> list[str]:
     html_changed = scope is not None and any(
         rel in scope for rel in html_rels)
     if scope is not None and not html_changed \
-            and not any(rel in scope for rel in js_rels):
-        return []   # an edit to a non-frontend file cannot break a DOM contract
+            and not any(rel in scope for rel in js_rels + module_rels):
+        return []   # an edit to a non-frontend file cannot break the page
 
     def note(rel: str, line: int, msg: str, peer: bool = False) -> None:
         if scope is None or rel in scope:
@@ -1770,6 +2828,14 @@ def verify_frontend_contracts(root: Path, modified_files=None) -> list[str]:
             line, _, msg = problem.partition(": ")
             note(rel, int(line) if line.isdigit() else 1,
                  f"does not parse -- {msg[:220]}")
+
+    # 4. ES module contracts (Sprint 1): a relative import that points at no
+    # file or names an export the target does not have, and an imported call
+    # whose argument count cannot satisfy the real signature. Bare packages
+    # and dynamic imports are deliberately absent from the helper's output.
+    for importer, target, text in _js_cross_file_errors(root):
+        if scope is None or importer in scope or (target and target in scope):
+            errors.append(text)
     return sorted(set(errors))[:_FE_ERRORS_CAP]
 
 
