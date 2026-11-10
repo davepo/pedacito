@@ -87,7 +87,8 @@ _CACHEABLE_ACTIONS = {"grep", "find", "outline", "usages", "callers",
                       "context", "git", "git_diff", "diagnose", "sessions",
                       "fetch", "fetch_url", "web_search"}
 # Steps that can change what the cacheable ones return.
-_MUTATING = {"write", "append", "move", "delete", "undo", "rename", "run",
+_MUTATING = {"write", "append", "move", "delete", "undo", "rename",
+             "rename_symbol", "run",
              "run_test", "browser", "screenshot", "mcp", "task"}
 
 # Steps discarded for a cut-off payload before gather gives up.
@@ -683,6 +684,19 @@ Rules for edits:
   the FULL replacement text for that range in REPLACE; an empty REPLACE
   deletes the range. Prefer an anchor when quoting the old text exactly is
   risky, and widen a LINES range until it covers whole statements.
+- To replace a WHOLE function, method, or class without echoing any old
+  text, drop the SEARCH machinery entirely:
+
+      <<<<<<< SYMBOL path/to/file.py :: ClassName.method_name
+      def method_name(self, x):
+          return x + 1
+      >>>>>>> END_SYMBOL
+
+  No FILE header, no SEARCH, no line numbers: the AST locates the current
+  definition (decorators included), re-aligns your indentation to the file's,
+  and keeps the decorators if your new body does not repeat them. Use
+  `<<<<<<< AFTER_SYMBOL path :: symbol` (same closer) to insert your body
+  right AFTER that definition instead of replacing it.
 - Keep each block small and local. Use several blocks rather than one large one.
 - A single reply must stay short enough to finish: emit at most a few blocks
   per reply, never a whole large file in one REPLACE/SEARCH section. If the
@@ -2487,7 +2501,8 @@ class Agent:
                 continue
             error_streak = 0
             if self.requirements:
-                if action in ("write", "append", "move", "delete", "rename"):
+                if action in ("write", "append", "move", "delete", "rename",
+                              "rename_symbol"):
                     target = (stepjson.get("file") or stepjson.get("to") or "")
                     self.requirements.observe_patch(str(target), obs)
                 elif action not in ("read", "context"):
@@ -4158,7 +4173,10 @@ class Agent:
         """One parse-and-apply pass, with no repair round-trip. Duplicate FILE
         headers are not merged: apply_edits groups blocks by path and needs
         them separate to detect renames. SYMBOL anchors are resolved to line
-        ranges here: the agent owns the index, apply_edits does not."""
+        ranges here from the index when possible; anything the index misses is
+        resolved from the AST at apply time (`apply_edits` owns the fallback),
+        and zero-anchor SYMBOL/AFTER_SYMBOL blocks skip SEARCH quoting
+        entirely."""
         discards: list = []
         parsed = parse_edits(reply, discards=discards)
         failed, edits = self._resolve_symbol_anchors(parsed)
@@ -4221,10 +4239,12 @@ class Agent:
         return allowed
 
     def _resolve_symbol_anchors(self, edits: list) -> tuple[list, list]:
-        """Turn `SYMBOL name` anchors into LINES ranges via the index.
-        Returns (failure Results, edits left to apply). A file with a missing
-        or ambiguous symbol fails whole -- mirroring apply_edits' per-file
-        failure -- and the message feeds the repair loop."""
+        """Turn `SYMBOL name` anchors into LINES ranges via the index,
+        falling back to `chunker.locate_symbol_span` (AST / tree-sitter on the
+        current file bytes) when the index misses. Returns (failure Results,
+        edits left to apply). A file with a missing or ambiguous symbol fails
+        whole -- mirroring apply_edits' per-file failure -- and the message
+        feeds the repair loop."""
         results: list = []
         bad: set[str] = set()
         for e in edits:
@@ -4242,6 +4262,15 @@ class Agent:
                 c = exact[0]
                 # A classheader chunk stands for the whole class.
                 e.lines = (c.start, c.scope_end or c.end)
+                continue
+            # Sprint P fallback: the index missed it (a method inside a
+            # whole-class chunk, a file not indexed yet, a stale line map).
+            # Ask the AST (Python) or tree-sitter directly where the symbol
+            # sits in the CURRENT bytes before failing the whole file.
+            from .chunker import locate_symbol_span
+            disk = locate_symbol_span(self.index.root / e.file, e.symbol)
+            if disk is not None:
+                e.lines = (disk[0], disk[1])
                 continue
             bad.add(_norm_key(e.file))
             if not same:

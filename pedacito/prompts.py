@@ -107,6 +107,9 @@ def _compact_tool_help(cfg) -> str:
         "append": "append file content - add to the END of a file",
         "move": "move file to - rename a file",
         "rename": "rename symbol to - rename ONE definition + its references",
+        "rename_symbol": "rename_symbol symbol to [file] - deterministic "
+                         "multi-file identifier rename (strings/comments "
+                         "untouched, AST-gated)",
         "delete": "delete file - delete a file",
         "run": "run command - one command, no shell",
         "serve": "serve symbol command - start/list/log/stop a background server",
@@ -274,7 +277,10 @@ Rules:
   whole file. Small blocks, a few per reply; SEARCH must match exactly once.
 - Anchor instead of quoting: `--- FILE: path.py LINES 40-60` or
   `--- FILE: path.py SYMBOL Class.method` with EMPTY SEARCH and the full new
-  text in REPLACE (empty REPLACE deletes the range).
+  text in REPLACE (empty REPLACE deletes the range). To replace a whole
+  definition with no SEARCH at all: `<<<<<<< SYMBOL path.py :: Class.method`,
+  the full new definition, then `>>>>>>> END_SYMBOL` (the AST locates it and
+  fixes your indentation; `<<<<<<< AFTER_SYMBOL ...` inserts after it).
 - New file: ONE block with EMPTY SEARCH and the whole file in REPLACE.
 - Rename/move: two blocks -- the NEW path (empty SEARCH, one placeholder
   comment as REPLACE) and the OLD path (its first 3-5 lines as SEARCH, EMPTY
@@ -322,10 +328,14 @@ def plan_brief(text: str) -> str:
 # edit_style "anchor": SYMBOL anchors become the default for definitions (the
 # model writes a whole new definition instead of copying the old text exactly),
 # and SEARCH quoting is reserved for small edits outside a definition.
-ANCHOR_HINT = ("To change a function or method, use `--- FILE: path.py SYMBOL "
-               "name` with the FULL new definition in REPLACE (leave SEARCH "
-               "EMPTY). Use SEARCH blocks only for small edits outside a "
-               "definition.")
+ANCHOR_HINT = ("To change a function or method, splice the whole definition: "
+               "`<<<<<<< SYMBOL path.py :: Class.method`, the FULL new "
+               "definition, then `>>>>>>> END_SYMBOL` (no SEARCH block, no "
+               "line numbers: the AST locates the definition, decorators "
+               "included, re-aligns your indentation, and keeps decorators "
+               "your body does not repeat). The header form `--- FILE: "
+               "path.py SYMBOL name` with EMPTY SEARCH works too. Use "
+               "SEARCH blocks only for small edits outside a definition.")
 _ANCHOR_BRIEF_SWAPS = (
     # The full edit brief's anchor bullet ends by treating anchors as a
     # fallback for risky quotes; the anchor variant makes SYMBOL the default.

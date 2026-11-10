@@ -152,6 +152,7 @@ commands. Run `pedacito <command> --help` for every flag.
 | `pedacito chat PROJ` | Interactive session that keeps the index warm |
 | `pedacito how "..."` | Built-in help for the CLI, the GUI, and settings |
 | `pedacito restore PROJ` | Undo the last write |
+| `pedacito rename OLD NEW` | Multi-file symbol rename through the AST and the tokenizer, no model call. `--file` scopes it, `--apply` writes (default: diff preview) |
 | `pedacito index`, `map`, `files`, `cost` | Build and inspect the index. These need no model call, except `index` summaries |
 | `pedacito eval` | Score the harness on fixture repositories. Use `--baseline` as a regression gate |
 | `pedacito memory`, `skills`, `prune`, `reset`, `trust`, `worktree`, `serve`, `procs`, `lsp`, `diagnose`, `tests`, `webcheck` | Upkeep and specialist tools |
@@ -853,6 +854,33 @@ text instead of guessing. A FILE header can also pin a block from the start:
 `--- FILE: src/app.py LINES 40-60` replaces that exact range, and
 `SYMBOL is_leech` replaces that whole definition, useful when a snippet
 appears more than once or the text keeps shifting under the model.
+
+A definition can also be replaced *without* echoing its old text at all, which
+is what the model usually gets wrong. Name the symbol instead of searching for
+it, and write only the new body:
+
+```
+--- FILE: src/app.py
+<<<<<<< SYMBOL src/app.py :: Report.summarise
+    @staticmethod
+    def summarise(rows):
+        return sum(rows)
+>>>>>>> END_SYMBOL
+```
+
+The span comes from the file's own AST (`ast` for Python, tree-sitter for
+JavaScript/TypeScript/Go/Rust), decorators included, so a block cannot land in
+the middle of something. Indentation is normalised to the definition's real
+column, and leading decorators are carried over when the new body does not
+re-echo them. `<<<<<<< AFTER_SYMBOL file :: name` splices the body *after* that
+definition instead of replacing it (add a method without re-emitting the
+class). The same two operations exist as structured payloads for constrained
+sampling: `{"edit_action": "replace_symbol", "file": ..., "symbol": ...,
+"replacement": ...}` and `{"edit_action": "insert_after_symbol", ...}`. Plain
+SEARCH/REPLACE blocks are unaffected and both shapes may appear in one reply.
+The result faces the same syntax gate: a body that does not parse is refused,
+not written, and an unknown or ambiguous symbol name comes back with an
+instruction to `outline` the file or re-emit the block with `LINES a-b`.
 
 Before writing, Python is checked with `ast.parse` and tree-sitter
 languages with their parsers: an edit that breaks a clean file is refused, while

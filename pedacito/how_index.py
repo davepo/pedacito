@@ -491,6 +491,35 @@ CLI_COMMANDS = [
         ],
     },
     {
+        "name": "rename",
+        "usage": "pedacito rename OLD NEW [--file PATH] [--apply] [--root DIR]",
+        "summary": "Rename a symbol across the project without a model call: "
+                   "Python identifiers move through the real tokenizer, "
+                   "JavaScript/TypeScript/Go/Rust through tree-sitter "
+                   "identifier nodes, so strings and comments that merely "
+                   "contain the old name are never touched. Default is a "
+                   "dry-run diff preview; --apply writes and snapshots the "
+                   "originals, so restore undoes it.",
+        "keywords": ["rename", "refactor", "symbol", "identifier", "variable",
+                     "function name", "rename across files"],
+        "examples": [
+            "pedacito rename apply_discount discounted_price",
+            "pedacito rename apply_discount discounted_price --file pkg/core.py",
+            "pedacito rename apply_discount discounted_price --apply --root .",
+            "pedacito restore . --dry-run",
+        ],
+        "flags": [
+            {"flag": "OLD", "help": "the existing identifier"},
+            {"flag": "NEW", "help": "the new identifier"},
+            {"flag": "--file PATH",
+             "help": "scope: that file plus the files importing it "
+                     "(default: all indexed project source)"},
+            {"flag": "--apply",
+             "help": "write the rename (default: dry-run with diffs)"},
+            {"flag": "--root DIR", "help": "project root (default: cwd)"},
+        ],
+    },
+    {
         "name": "restore",
         "usage": "pedacito restore PROJECT [--list | --snapshot NAME] [--dry-run]",
         "summary": "Undo an --apply run by copying a backup snapshot back over "
@@ -961,6 +990,30 @@ GUI_TOPICS = [
                      "undo auto", "undo edit", "snapshot"],
         "settings": ["backup", "keep_backups"],
         "cli": ["restore", "prune"],
+    },
+    {
+        "id": "rename-symbol",
+        "title": "Rename a symbol across the project",
+        "summary": "Project ▾ → Rename symbol… renames every exact identifier "
+                   "deterministically (no model tokens): strings and comments "
+                   "that merely contain the old name are left alone.",
+        "steps": [
+            "Project ▾ → Rename symbol… (needs a project open and no run in "
+            "progress)",
+            "Type the current name, the new name, and optionally one scope file",
+            "Preview shows the per-file unified diffs; nothing is written yet",
+            "Rename writes the change and snapshots the originals to "
+            ".pedacito/backups/",
+            "Undo it with Project ▾ → Restore from a backup… (or the CLI "
+            "restore)",
+            "Without a scope file every indexed source file is considered; "
+            "with one, only that file and the files importing it",
+        ],
+        "keywords": ["rename", "refactor", "symbol", "identifier",
+                     "rename symbol", "variable", "function name",
+                     "rename across files"],
+        "settings": ["allow_write", "backup"],
+        "cli": ["rename", "restore"],
     },
     {
         "id": "reference-file",

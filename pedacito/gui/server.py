@@ -419,6 +419,54 @@ def _run(q, body):
         echo=lambda: jobs.echo_submission(mode, body)))
 
 
+@post("/api/refactor/rename")
+def _refactor_rename(q, body):
+    """Deterministic symbol rename (Sprint P): AST/tokenize, zero model tokens.
+
+    `{"old": ..., "new": ..., "file": ..., "apply": true|false}`. Without
+    `apply` this is a preview: per-file diffs, nothing written. Applying
+    snapshots each original first, so the Changes tab's Restore undoes it.
+    Refuses while an agent run owns the workspace."""
+    from .. import refactor as refactor_mod
+    old = str(body.get("old") or "").strip()
+    new = str(body.get("new") or "").strip()
+    if not old or not new:
+        return 400, {"ok": False, "detail": "Both `old` and `new` are required."}
+    root = STATE.root
+    if root is None:
+        return 409, {"ok": False, "detail": "Open a workspace first."}
+    if STATE.job is not None and STATE.job.active:
+        return 409, {"ok": False, "detail": "An agent run is active; stop it "
+                       "before renaming."}
+    scope = str(body.get("file") or "").strip() or None
+    if scope is not None and _within(root, scope) is None:
+        return 400, {"ok": False, "detail": f"`{scope}` escapes the workspace."}
+    apply_it = bool(body.get("apply"))
+    state = {"dir": None}
+
+    def _snapshot(rel: str, path: Path):
+        from .. import fileio
+        if state["dir"] is None:
+            state["dir"] = workspace.new_backup_dir(root, unique=True)
+        fileio.backup_copy(path, state["dir"] / rel)
+        return None
+
+    res = refactor_mod.rename_symbol_across_project(
+        root, old, new, scope_file=scope, dry_run=not apply_it,
+        before_write=_snapshot if apply_it else None)
+    if not res.get("ok"):
+        return 400, res
+    if state["dir"] is not None:
+        res["backup"] = str(state["dir"].relative_to(root))
+    if apply_it and res["files_modified"] and STATE.idx is not None:
+        # keep the GUI's index truthful after the rename (the next agent run
+        # rebuilds anyway; this only prevents stale search results)
+        from ..index import reindex_file
+        for rel in res["files_modified"]:
+            reindex_file(STATE.idx, rel, STATE.cfg, save=False)
+    return 200, res
+
+
 @post("/api/stop")
 def _stop(q, body):
     return 200, {"ok": jobs.stop_job()}

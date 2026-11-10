@@ -1585,6 +1585,62 @@ def _cmd_skills(args) -> int:
     return 0
 
 
+def _cmd_rename(args) -> int:
+    """`pedacito rename <old> <new>`: the deterministic Sprint P rename.
+    Zero LLM tokens: Python identifiers move through the real tokenizer,
+    tree-sitter languages through their identifier nodes (so a string literal
+    or comment that merely contains the old name survives), and every changed
+    file passes the AST syntax gate BEFORE anything is written. Default is a
+    dry-run diff preview; --apply writes, snapshotting the originals under
+    .pedacito/backups/ so `pedacito restore` can undo the run."""
+    from . import fileio, refactor
+    root = _root(args)
+    state = {"dir": None}
+
+    def _snapshot_before_write(rel: str, path: Path):
+        if state["dir"] is None:
+            state["dir"] = workspace.new_backup_dir(root, unique=True)
+        fileio.backup_copy(path, state["dir"] / rel)
+        return None
+
+    res = refactor.rename_symbol_across_project(
+        root, args.old, args.new, scope_file=args.file or None,
+        dry_run=not args.apply,
+        before_write=_snapshot_before_write if args.apply else None)
+    if not res["ok"]:
+        print(f"rename refused: {res.get('error', 'unknown failure')}",
+              file=sys.stderr)
+        return 2
+    if not res["files_modified"]:
+        print(f"no exact identifier `{args.old}` found in the "
+              f"{'scoped' if args.file else 'project'} source; nothing "
+              "renamed.")
+        if res.get("skipped"):
+            print("skipped: " + "; ".join(res["skipped"][:8]))
+        return 0
+    verb = "renamed" if args.apply else "would rename"
+    print(f"{verb} `{args.old}` -> `{args.new}`: "
+          f"{res['total_replacements']} occurrence(s) in "
+          f"{len(res['files_modified'])} file(s)")
+    for rel in res["files_modified"]:
+        print(f"  {rel}: {res['per_file'].get(rel, 0)} replacement(s)")
+    for w in res.get("warnings", []):
+        print(f"  warning: {w}")
+    for s in res.get("skipped", [])[:8]:
+        print(f"  not checked: {s}")
+    if not args.apply:
+        for rel in res["files_modified"]:
+            diff = res["diffs"].get(rel, "")
+            if diff:
+                print()
+                print(diff.rstrip())
+        print("\n(dry run: nothing written; add --apply to write)")
+    elif state["dir"] is not None:
+        print(f"\noriginals snapshotted under {state['dir']}; "
+              "`pedacito restore` undoes the rename.")
+    return 0
+
+
 def _configure_stdio() -> None:
     """Make stdout/stderr UTF-8 with replacement so non-ASCII output cannot
     raise UnicodeEncodeError on Windows code pages. Streams without
@@ -2043,6 +2099,20 @@ def _main(argv=None) -> int:
     p_skills.add_argument("--config", metavar="FILE")
     p_skills.add_argument("--profile", metavar="NAME")
 
+    p_rename = sub.add_parser(
+        "rename", help="deterministic multi-file symbol rename via the AST "
+                       "and the tokenizer (no LLM calls; strings and comments "
+                       "are never touched)")
+    p_rename.add_argument("old", help="the existing identifier")
+    p_rename.add_argument("new", help="the new identifier")
+    p_rename.add_argument("--file", default="", metavar="PATH",
+                          help="scope: one file and the files that import it "
+                               "(default: all indexed project source)")
+    p_rename.add_argument("--apply", action="store_true",
+                          help="write the rename (default: dry-run preview "
+                               "with unified diffs)")
+    p_rename.add_argument("--root", default=None)
+
     p_eval = sub.add_parser(
         "eval", help="score the harness on built-in fixture repos (locate "
                      "precision, edit success, tokens, cache hits)")
@@ -2123,6 +2193,7 @@ def _main(argv=None) -> int:
     light = {"prune": _cmd_prune, "reset": _cmd_reset, "memory": _cmd_memory,
              "trust": _cmd_trust, "tests": _cmd_tests,
              "webcheck": _cmd_webcheck, "skills": _cmd_skills,
+             "rename": _cmd_rename,
              "serve": _cmd_serve, "procs": _cmd_procs, "lsp": _cmd_lsp}
     if args.cmd in light:
         try:

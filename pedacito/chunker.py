@@ -28,6 +28,9 @@ import ast
 import hashlib
 import re
 from dataclasses import dataclass, field, asdict
+from pathlib import Path
+
+from . import fileio
 
 # AST node types treated as "scopes" worth chunking on their own.
 DEF_NODES = (ast.FunctionDef, ast.AsyncFunctionDef)
@@ -633,3 +636,135 @@ def chunk_source(rel_path: str, src: str, class_split_lines: int = 60,
     _attach_lex_and_lineage(chunks)
     chunks.sort(key=lambda c: c.start)
     return chunks
+
+
+# --------------------------------------------------------------------------
+# Surgical symbol spans (Sprint P: zero-anchor AST splicing)
+# --------------------------------------------------------------------------
+def _leading_indent(line: str) -> str:
+    """The leading whitespace of a source line ("" for column 0)."""
+    return line[: len(line) - len(line.lstrip())]
+
+
+def _py_symbol_spans(text: str) -> list[tuple[str, int, int]] | None:
+    """[(qualname, start_line, end_line)] for every def/class in a Python
+    file, from the real AST. Start lines COUNT DECORATORS (an `@` line above
+    the `def` belongs to the definition), matching `_first_line`."""
+    try:
+        tree = ast.parse(text)
+    except (SyntaxError, ValueError):
+        return None
+    out: list[tuple[str, int, int]] = []
+
+    def visit(body: list, prefix: str) -> None:
+        for node in body:
+            if isinstance(node, SCOPE_NODES):
+                qual = f"{prefix}.{node.name}" if prefix else node.name
+                start = _first_line(node)
+                out.append((qual, start, node.end_lineno or start))
+                if isinstance(node, ast.ClassDef):
+                    # methods and nested classes are addressable; functions
+                    # nested inside a function body are not spliced wholesale
+                    visit(node.body, qual)
+
+    visit(tree.body, "")
+    return out
+
+
+def _ts_symbol_spans(rel_name: str, text: str, suffix: str
+                     ) -> list[tuple[str, int, int]] | None:
+    """[(qualname, start_line, end_line)] for every definition tree-sitter
+    finds in a non-Python file. Reuses chunk_file_ts (same qualname grammar as
+    the index: "Class.method") with classes always split, then merges the
+    `name#2` continuation parts and folds classheader spans up to `scope_end`
+    so a class symbol means the WHOLE class. None when tree-sitter cannot
+    parse this file type."""
+    from . import chunker_ts
+    if suffix not in chunker_ts.LANG_BY_EXT or not chunker_ts.TS_AVAILABLE:
+        return None
+    try:
+        chunks = chunker_ts.chunk_file_ts(rel_name, text, suffix,
+                                          class_split_lines=1)
+    except Exception:
+        return None
+    merged: dict[str, tuple[int, int]] = {}
+    for c in chunks:
+        if c.kind in ("module", "reference") or not c.qualname:
+            continue
+        base = c.qualname.split("#")[0]
+        end = c.scope_end or c.end
+        prev = merged.get(base)
+        if prev is None:
+            merged[base] = (c.start, end)
+        else:
+            merged[base] = (min(prev[0], c.start), max(prev[1], end))
+    return [(q, s, e) for q, (s, e) in merged.items()]
+
+
+def _pick_symbol_span(spans: list[tuple[str, int, int]], symbol: str
+                      ) -> tuple[int, int] | None:
+    """(start, end) for `symbol` among [(qualname, start, end)], or None.
+
+    Resolution order mirrors the index's symbol lookup: an exact qualname
+    match wins; otherwise a definition whose qualname ENDS with ".symbol"
+    (so `parse_row` finds `TableParser.parse_row`, and `TableParser.parse_row`
+    finds it inside a nested class). Anything ambiguous or missing is None:
+    splicing the wrong definition silently is worse than refusing."""
+    exact = [sp for sp in spans if sp[0] == symbol]
+    if len(exact) == 1:
+        return exact[0][1], exact[0][2]
+    if len(exact) > 1:
+        return None
+    suffix = [sp for sp in spans if sp[0].endswith("." + symbol)]
+    if not suffix:
+        return None
+    if len({sp[0] for sp in suffix}) > 1:
+        return None
+    return (min(sp[1] for sp in suffix), max(sp[2] for sp in suffix))
+
+
+def locate_symbol_span(file_path, symbol_path: str
+                       ) -> tuple[int, int, str] | None:
+    """Exact current line span of one symbol in one file, plus the indent the
+    replacement must match: (start_line, end_line, base_indent), 1-based and
+    inclusive.
+
+    Python files go through the real `ast` (decorators included in the span);
+    JS/TS/Ruby/Go/Rust/... files through the tree-sitter chunker, so the
+    span grammar matches the index. `symbol_path` is dotted: a top-level
+    name ("parse_row", "TableParser") or a qualified one
+    ("TableParser.parse_row"). None when the file is missing, unparsable,
+    the symbol is unknown, or the name matches several definitions: the
+    caller must refuse rather than guess.
+
+    This is the deterministic half of zero-anchor surgical splicing: the
+    edit engine can replace a whole definition with no SEARCH block and no
+    line numbers, because the AST says exactly where the symbol lives.
+    """
+    path = Path(file_path)
+    symbol = (symbol_path or "").strip()
+    if not symbol:
+        return None
+    # "Class::method" (C++/Rust style) addresses the same definition
+    symbol = symbol.replace("::", ".").strip(".")
+    if not symbol or not path.is_file():
+        return None
+    try:
+        text = fileio.read_text(path)
+    except (OSError, UnicodeDecodeError):
+        return None
+    suffix = path.suffix.lower()
+    if suffix == ".py":
+        spans = _py_symbol_spans(text)
+    else:
+        spans = _ts_symbol_spans(path.name, text, suffix)
+    if not spans:
+        return None
+    hit = _pick_symbol_span(spans, symbol)
+    if hit is None:
+        return None
+    start, end = hit
+    lines = split_lines(text)
+    if start < 1 or end > len(lines) or end < start:
+        return None
+    return start, end, _leading_indent(lines[start - 1])

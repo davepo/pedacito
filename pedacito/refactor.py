@@ -1,6 +1,7 @@
 """Deterministic symbol rename: the multi-file edit small models get wrong.
 
     tool_rename(index, cfg, "apply_discount", "discounted_price")
+    rename_symbol_across_project(root, "old", "new", dry_run=True)
 
 Renaming across files is exactly where a small model drops one call site. This
 does it mechanically, and only where it is safe:
@@ -10,10 +11,18 @@ does it mechanically, and only where it is safe:
   * the new name must be a valid identifier that nothing else defines;
   * only the definition's file and the files that IMPORT it are rewritten --
     whole-word, outside string literals and comments (Python uses the real
-    tokenizer);
+    tokenizer; JS/TS/Go/Rust/... rename tree-sitter IDENTIFIER nodes, so
+    strings and comments can never be touched by construction);
   * every rewritten file must still parse (same check the edit path uses);
   * references it did NOT touch (files that do not import the definition,
     docs, strings) are listed so the model can handle them with edit blocks.
+
+`rename_symbol_across_project` is the pure engine: project-root scoped (or
+scoped to one file and its importers), zero LLM tokens, all-or-nothing, with
+a structured dict result ({ok, files_modified, total_replacements, diffs})
+shared by the agent tool, the `pedacito rename` CLI, and the GUI's Project
+menu. `tool_rename` is the older index-strict agent tool kept for its
+ambiguity refusal; `tool_rename_symbol` wraps the engine as an agent action.
 
 Gated by `allow_write`, snapshotted like every other write (undo with
 `pedacito restore`), and the index is refreshed afterwards.
@@ -24,13 +33,33 @@ from __future__ import annotations
 import difflib
 import io
 import keyword
+import os
 import re
 import tokenize
 from pathlib import Path
 
-from . import fileio
+from . import fileio, safety
 
 _IDENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+# Directories that never hold project source the rename should touch.
+_SKIP_DIR_NAMES = frozenset({
+    "node_modules", "__pycache__", "bower_components", "web_modules",
+    ".venv", "venv", "env", ".tox", ".nox", "dist", "build", "target",
+    "dist-packages", "site-packages", ".mypy_cache", ".pytest_cache",
+    ".ruff_cache", ".next", ".nuxt", ".svelte-kit", ".idea", ".vscode",
+    ".gradle", ".terraform", "vendor",
+})
+
+# tree-sitter node types that name an identifier (never a string or comment:
+# those are separate node types, so the walker cannot hit one).
+_TS_IDENT_TYPES = frozenset({
+    "identifier", "type_identifier", "field_identifier",
+    "property_identifier", "shorthand_property_identifier",
+    "namespace_identifier",
+})
+
+_MAX_RENAME_BYTES = 4_000_000
 
 
 def _rename_python(text: str, old: str, new: str) -> tuple[str, int]:
@@ -95,6 +124,291 @@ def rename_text(rel: str, text: str, old: str, new: str) -> tuple[str, int]:
     if rel.endswith(".py"):
         return _rename_python(text, old, new)
     return _rename_generic(text, old, new, Path(rel).suffix.lower())
+
+
+# --------------------------------------------------------------------------
+# Zero-token rename engine (Sprint P): no index, no LLM, no ambiguity games
+# --------------------------------------------------------------------------
+def _rename_treesitter(text: str, old: str, new: str, suffix: str
+                       ) -> tuple[str, int] | None:
+    """(new text, replacements) renaming every IDENTIFIER node equal to `old`
+    (JS/TS/Go/Rust/... via the same grammars the chunker uses). Strings and
+    comments are separate node types and can never be hit. None when no
+    grammar is available for this suffix (the caller falls back to the
+    quote-and-comment-aware word matcher)."""
+    from .chunker_ts import LANG_BY_EXT, TS_AVAILABLE, _get_parser
+
+    lang = LANG_BY_EXT.get(suffix)
+    if not (TS_AVAILABLE and lang):
+        return None
+    import gc
+    data = text.encode("utf-8")
+    needle = old.encode("utf-8")
+    was = gc.isenabled()
+    gc.disable()          # py-tree-sitter GC segfault guard (see chunker_ts)
+    try:
+        tree = _get_parser(lang).parse(data)
+        hits: list[tuple[int, int]] = []
+        stack = [tree.root_node]
+        while stack:
+            node = stack.pop()
+            if (node.type in _TS_IDENT_TYPES
+                    and data[node.start_byte:node.end_byte] == needle):
+                hits.append((node.start_byte, node.end_byte))
+            stack.extend(node.children)
+    except Exception:
+        return None
+    finally:
+        tree = None
+        if was:
+            gc.enable()
+    if not hits:
+        return text, 0
+    pieces: list[bytes] = []
+    prev = len(data)
+    replacement = new.encode("utf-8")
+    for s, e in sorted(hits, reverse=True):
+        pieces.append(data[e:prev])
+        pieces.append(replacement)
+        prev = s
+    pieces.append(data[:prev])
+    pieces.reverse()
+    return b"".join(pieces).decode("utf-8", "replace"), len(hits)
+
+
+def _iter_project_files(root: Path) -> list[str]:
+    """Project-relative source files the rename may consider: Python plus
+    every tree-sitter language, skipping VCS/tooling/dependency directories,
+    gitignore/.pedacitoignore-matched paths, and files too large to be
+    source."""
+    from .chunker_ts import LANG_BY_EXT
+    from .select import Matcher
+
+    exts = {".py"} | set(LANG_BY_EXT)
+    matcher = Matcher.from_files(root)
+    out: list[str] = []
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = sorted(
+            d for d in dirnames
+            if d not in _SKIP_DIR_NAMES and not d.startswith(".")
+            and not d.endswith(".egg-info")
+            and not matcher.excluded(
+                (Path(dirpath) / d).relative_to(root).as_posix() + "/"))
+        for f in sorted(filenames):
+            if Path(f).suffix.lower() not in exts:
+                continue
+            p = Path(dirpath) / f
+            rel = p.relative_to(root).as_posix()
+            if matcher.excluded(rel):
+                continue
+            try:
+                if p.stat().st_size > _MAX_RENAME_BYTES:
+                    continue
+            except OSError:
+                continue
+            out.append(rel)
+    return out
+
+
+def _scoped_files(root: Path, scope_file: str) -> list[str]:
+    """`scope_file` plus the files that import it: the resolved import graph
+    from a saved index when there is one, otherwise a textual scan of the
+    import statements for the module stem."""
+    rel = fileio.normalise_rel(scope_file)
+    if not (root / rel).is_file():
+        raise ValueError(f"scope file not found in the project: {rel}")
+    try:
+        from .index import Index
+        idx = Index.load(root)
+    except Exception:
+        idx = None
+    if idx is not None:
+        mapped = idx.resolve_file(rel) or rel
+        return [mapped] + [f for f in idx.importers_of(mapped)
+                           if f != mapped]
+    stem = Path(rel).stem
+    pat = re.compile(r"(?:from|import|require|include|use)[^\n]*"
+                     + re.escape(stem) + r"\b")
+    out = [rel]
+    for cand in _iter_project_files(root):
+        if cand == rel:
+            continue
+        try:
+            text = fileio.read_text(root / cand)
+        except (OSError, UnicodeDecodeError):
+            continue
+        if pat.search(text):
+            out.append(cand)
+    return out
+
+
+def rename_symbol_across_project(root, old_name: str, new_name: str,
+                                 scope_file: str | None = None,
+                                 dry_run: bool = False,
+                                 before_write=None) -> dict:
+    """Deterministic, zero-token multi-file symbol rename.
+
+    Replaces every EXACT identifier token `old_name` with `new_name` across
+    the indexed project source (or `scope_file` plus its importers): Python
+    through the real `tokenizer` and JS/TS/Go/Rust/... through tree-sitter
+    IDENTIFIER nodes, so string literals and comments that merely CONTAIN
+    the old name are never touched. Every candidate file is validated with
+    the same AST / tree-sitter syntax gate the edit path uses BEFORE
+    anything is written: one file that the rename would break refuses the
+    whole run (nothing lands).
+
+    Returns {ok, files_modified, total_replacements, diffs} plus dry_run /
+    skipped / warnings; with `dry_run` nothing is written. `before_write`
+    (rel, path) -> error-or-None lets a caller snapshot or permission-gate
+    each file just before the write pass.
+    """
+    from .edits import _validate
+
+    root = Path(root).resolve()
+    old_name = (old_name or "").strip()
+    new_name = (new_name or "").strip()
+    empty = {"ok": False, "files_modified": [], "total_replacements": 0,
+             "diffs": {}, "dry_run": bool(dry_run)}
+
+    def fail(msg: str) -> dict:
+        return {**empty, "error": msg}
+
+    if not old_name or not old_name.isidentifier():
+        return fail(f"`{old_name}` is not a valid identifier.")
+    if not new_name or not new_name.isidentifier():
+        return fail(f"`{new_name}` is not a valid identifier.")
+    if keyword.iskeyword(old_name) or keyword.iskeyword(new_name):
+        return fail("renaming a keyword is not a symbol rename; pick "
+                    "identifier names.")
+    if old_name == new_name:
+        return fail("the old and new names are the same; nothing to rename.")
+
+    try:
+        files = (_scoped_files(root, scope_file) if scope_file
+                 else _iter_project_files(root))
+    except ValueError as e:
+        return fail(str(e))
+
+    changes: dict[str, tuple[str, str, int, object]] = {}
+    skipped: list[str] = []
+    warnings: list[str] = []
+    for rel in files:
+        why = safety.is_protected(rel)
+        if why:
+            skipped.append(f"{rel} (protected: {why})")
+            continue
+        path = root / rel
+        try:
+            text, style = fileio.read(path, errors="strict")
+        except (OSError, UnicodeDecodeError):
+            skipped.append(f"{rel} (unreadable)")
+            continue
+        suffix = Path(rel).suffix.lower()
+        if suffix == ".py":
+            new_text, n = _rename_python(text, old_name, new_name)
+            if n < 0:
+                skipped.append(f"{rel} (could not be tokenized)")
+                continue
+        else:
+            res = _rename_treesitter(text, old_name, new_name, suffix)
+            if res is None:
+                new_text, n = _rename_generic(text, old_name, new_name,
+                                              suffix)
+                if n > 0:
+                    warnings.append(f"{rel}: renamed outside quotes and "
+                                    "comments by the word matcher (no "
+                                    "tree-sitter grammar available)")
+            else:
+                new_text, n = res
+        if n == 0:
+            continue
+        bad = _validate(path, new_text)
+        if bad and not _validate(path, text):
+            return fail(f"the rename would leave {rel} with {bad}; "
+                        "nothing written.")
+        if bad:
+            warnings.append(f"{rel} does not parse -- it did not parse "
+                            "before the rename either; the renamed text "
+                            "is kept as-is")
+        changes[rel] = (text, new_text, n, style)
+
+    diffs = {rel: "".join(difflib.unified_diff(
+        before.splitlines(keepends=True), after.splitlines(keepends=True),
+        f"a/{rel}", f"b/{rel}"))[:4000]
+        for rel, (before, after, _n, _s) in changes.items()}
+
+    if before_write is not None and not dry_run:
+        for rel in changes:
+            err = before_write(rel, root / rel)
+            if err:
+                return fail(f"{err}; nothing written.")
+
+    if not dry_run:
+        for rel, (_before, after, _n, style) in changes.items():
+            fileio.write(root / rel, after, style)
+
+    return {"ok": True,
+            "files_modified": sorted(changes),
+            "total_replacements": sum(n for _b, _a, n, _s
+                                      in changes.values()),
+            "diffs": diffs,
+            "dry_run": bool(dry_run),
+            "per_file": {rel: n for rel, (_b, _a, n, _s)
+                         in changes.items()},
+            "skipped": skipped,
+            "warnings": warnings}
+
+
+def tool_rename_symbol(index, cfg, old: str, new: str, file: str = "",
+                       dry_run: bool = False) -> str:
+    """Agent/GUI/CLI wrapper around `rename_symbol_across_project`: permission
+    gates, task snapshots, and an index refresh over the changed files."""
+    from .tools import (
+        _note_mutation,
+        _protected_error,
+        _snapshot,
+        _task_allowlist_error,
+    )
+
+    if not dry_run and not getattr(cfg, "allow_write", False):
+        return "ERROR: `rename_symbol` needs allow_write = true."
+    root = Path(index.root).resolve()
+
+    def _gate(rel: str, path: Path) -> str | None:
+        return (_protected_error(cfg, rel, "rename_symbol")
+                or _task_allowlist_error(index, cfg, rel, "rename_symbol")
+                or _snapshot(index, cfg, rel, path))
+
+    res = rename_symbol_across_project(
+        root, old, new, scope_file=(file or None), dry_run=dry_run,
+        before_write=_gate if not dry_run else None)
+    if not res["ok"]:
+        return "ERROR: " + str(res.get("error", "rename failed"))
+    if not res["files_modified"]:
+        return (f"NOTHING TO DO: no occurrence of `{old}` found in the "
+                f"{'scoped' if file else 'project'} source files"
+                + (f" (skipped: {'; '.join(res['skipped'])})"
+                   if res.get("skipped") else "") + ".")
+    head = (f"RENAME PREVIEW `{old}` -> `{new}`" if dry_run
+            else f"RENAMED `{old}` -> `{new}`")
+    out = [f"{head}: {res['total_replacements']} replacement(s) in "
+           f"{len(res['files_modified'])} file(s): "
+           + ", ".join(res["files_modified"]),
+           "".join(res["diffs"].values())[:3000]]
+    if res.get("warnings"):
+        out.append("WARNINGS: " + "; ".join(res["warnings"]))
+    if res.get("skipped"):
+        out.append("NOT checked: " + "; ".join(res["skipped"][:6]))
+    if dry_run:
+        out.append("(dry run: nothing was written)")
+    else:
+        out.append("Backed up; `pedacito restore` undoes it."
+                   if getattr(cfg, "backup", False) else "Backups are OFF.")
+        from . import index as index_mod
+        for rel in res["files_modified"]:
+            index_mod.reindex_file(index, rel, cfg, save=False)
+        _note_mutation(cfg, *res["files_modified"])
+    return "\n".join(x for x in out if x)
 
 
 def tool_rename(index, cfg, old: str, new: str, file: str = "") -> str:

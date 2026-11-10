@@ -116,6 +116,11 @@ lsp      - exact language-server symbols/diagnostics (opt-in). args: symbol
 rename   - mechanically rename ONE definition and its references in the
            files that import it (refuses ambiguous names). args: symbol (old
            name), to (new name)
+rename_symbol - deterministic multi-file rename: every exact identifier
+           token `old -> new` across project source (or the `file` and its
+           importers); strings and comments are never touched, every changed
+           file must still parse, nothing lands if one would break. args:
+           symbol (old name), to (new name), optional file (scope)
 write    - overwrite a whole file with text. args: file, content
 append   - add text to the END of a file.    args: file, content
 move     - rename/move one file.             args: file (old), to (new)
@@ -165,7 +170,8 @@ STEP_SCHEMA = {
             "enum": ["read", "grep", "find", "callers", "context", "outline",
                      "usages", "sessions", "diff", "git", "git_diff",
                      "diagnose", "write", "append",
-                     "move", "delete", "rename", "run", "run_test",
+                     "move", "delete", "rename", "rename_symbol", "run",
+                     "run_test",
                      "screenshot", "browser",
                      "todo",
                      "remember", "skill", "task", "fetch", "fetch_url",
@@ -204,7 +210,8 @@ STEP_SCHEMA = {
                     # refuses to dispatch a payload arriving at exactly its cap.
                     "maxLength": 2000},
         "symbol": {"type": "string",
-                   "description": "For callers/context/usages/rename (old "
+                   "description": "For callers/context/usages/rename/"
+                                  "rename_symbol (old "
                                   "name); or for read when file "
                                   "is empty (reads that definition). For "
                                   "skill: the skill name. For mcp: "
@@ -232,7 +239,8 @@ STEP_SCHEMA = {
                                   "otherwise.",
                    "maxLength": 120},
         "to": {"type": "string",
-               "description": "For move: the new path. For rename: the new "
+               "description": "For move: the new path. For rename or "
+                                "rename_symbol: the new "
                                 "name. Empty otherwise.",
                "maxLength": 200},
         "command": {"type": "string",
@@ -446,6 +454,9 @@ _FIELD_ACTION_FRAGMENTS = {
         (("read",), "For read."),
         (("write", "append", "move", "delete", "undo"),
          "For write/append/move/delete/undo."),
+        (("rename_symbol",),
+         "For rename_symbol, optionally one file to scope the rename to "
+         "(that file and the files importing it)."),
         (("outline",), "For outline, a file OR a directory/glob."),
         (("grep",), "For grep, optionally a file, directory, or glob."),
         (("diff",), "For diff, optionally one file."),
@@ -471,8 +482,8 @@ _FIELD_ACTION_FRAGMENTS = {
          "compact or aggregated JSON."),
     ],
     "symbol": [
-        (("callers", "context", "usages", "rename"),
-         "For callers/context/usages/rename (old name);"),
+        (("callers", "context", "usages", "rename", "rename_symbol"),
+         "For callers/context/usages/rename/rename_symbol (old name);"),
         (("read",), "or for read when file is empty (reads that definition)."),
         (("skill",), "For skill: the skill name."),
         (("mcp",), "For mcp: server/tool, or server to list its tools."),
@@ -562,7 +573,8 @@ def schema_for(cfg) -> dict:
     if getattr(cfg, "allow_serve", False):
         actions.append("serve")
     if getattr(cfg, "allow_write", False):
-        actions += ["write", "append", "move", "delete", "rename"]
+        actions += ["write", "append", "move", "delete", "rename",
+                    "rename_symbol"]
         if getattr(cfg, "backup", False):
             # `undo` can only work from the task's snapshot dir; offering it
             # with backups off would promise a recovery that cannot happen.
@@ -4081,6 +4093,11 @@ def dispatch(index, cfg, step: dict, client=None) -> str:
         from . import refactor
         return refactor.tool_rename(index, cfg, step.get("symbol", ""),
                                     step.get("to", ""), step.get("file", ""))
+    if action == "rename_symbol":
+        from . import refactor
+        return refactor.tool_rename_symbol(index, cfg, step.get("symbol", ""),
+                                           step.get("to", ""),
+                                           step.get("file", ""))
     if action in MUTATING_ACTIONS:
         if not getattr(cfg, "allow_write", False):
             return (f"ERROR: `{action}` is disabled (config allow_write = false). "

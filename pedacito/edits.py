@@ -28,7 +28,27 @@ The FILE header may carry an anchor instead of a SEARCH body:
 
 For an anchored block the REPLACE body overwrites that 1-based inclusive line
 range (LINES) or that definition (SYMBOL, resolved to a line range by the
-caller -- the agent, which owns the index), and SEARCH is ignored.
+caller -- the agent, which owns the index -- or, when no index resolved it,
+by `chunker.locate_symbol_span` straight from the AST), and SEARCH is ignored.
+
+Zero-anchor surgical splicing (Sprint P) needs no FILE header and no SEARCH
+body at all: the symbol's current span comes from the AST, and the block's
+indent is re-aligned to the target automatically:
+
+    <<<<<<< SYMBOL path/to/file.py :: ClassName.method_name
+    def method_name(self, x: int) -> int:
+        return x + 1
+    >>>>>>> END_SYMBOL
+
+`<<<<<<< AFTER_SYMBOL path :: symbol ... >>>>>>> END_SYMBOL` inserts the body
+directly AFTER that definition instead of replacing it. The same two edits
+exist as structured payloads (a JSON object in the reply):
+
+    {"edit_action": "replace_symbol", "file": "...", "symbol": "...",
+     "replacement": "..."}
+    {"edit_action": "insert_after_symbol", "file": "...", "symbol": "...",
+     "replacement": "..."}
+
 """
 
 from __future__ import annotations
@@ -36,12 +56,14 @@ from __future__ import annotations
 import ast
 import difflib
 import hashlib
+import json
 import re
 import sys
 from dataclasses import dataclass
 from pathlib import Path
 
 from . import fileio, safety
+from .chunker import locate_symbol_span
 from .chunker_ts import LANG_BY_EXT, TS_AVAILABLE, has_syntax_error
 
 # The `=======` separator must be a whole line, so a `/* ====` banner at the
@@ -66,11 +88,36 @@ _ANCHOR_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Zero-anchor symbol splice blocks (Sprint P). The header names the file and
+# the symbol; the body is the FULL new definition (replace) or the new text
+# (insert after); no SEARCH section, no line numbers:
+#
+#     <<<<<<< SYMBOL src/parser.py :: TableParser.parse_row
+#     def parse_row(self, line):
+#         ...
+#     >>>>>>> END_SYMBOL
+#
+# `AFTER_SYMBOL` / `INSERT_AFTER_SYMBOL` splice the body after the definition.
+SYMBOL_BLOCK_RE = re.compile(
+    r"^[ \t]*<{5,}[ \t]*(?P<kind>SYMBOL|AFTER_SYMBOL|INSERT_AFTER_SYMBOL)"
+    r"[ \t]+(?P<file>[^\n:]+?)[ \t]*::[ \t]*(?P<symbol>[^\s<>/][^\s<>/]*?)"
+    r"[ \t]*\n"
+    r"(?P<replace>.*?)"
+    r"^[ \t]*>{5,}[ \t]*(?:END_SYMBOL|INSERT_AFTER_SYMBOL|AFTER_SYMBOL"
+    r"|SYMBOL)[ \t]*$",
+    re.DOTALL | re.MULTILINE,
+)
+# A block that was started but never closed (for malformed_blocks reporting).
+_SYMBOL_MARK_RE = re.compile(
+    r"(?m)^[ \t]*<{5,}[ \t]*(?:AFTER_|INSERT_AFTER_)?SYMBOL[ \t]+(?P<file>[^\n]*)$")
+# Strips the `<<<<<<< SYMBOL ` lead off a captured mark line, leaving the path.
+_SYMBOL_MARK_LEAD_RE = re.compile(r"^\s*<{5,}\s*(?:AFTER_|INSERT_AFTER_)?SYMBOL\s+")
+
 
 def _is_anchored(e: "Edit") -> bool:
     """True for a LINES/SYMBOL-anchored block: a line-range replacement, never
     a creation, a rename half, or a no-op."""
-    return bool(e.lines or e.symbol)
+    return bool(e.lines or e.symbol or e.insert_after)
 
 # Conventional folders for dead/archived code: a basename-only move into one
 # of these counts as a rename without further proof.
@@ -89,10 +136,16 @@ class Edit:
     search: str
     replace: str
     # FILE-header anchors: `LINES a-b` (1-based inclusive) as parsed; a
-    # `SYMBOL name` anchor keeps the name here until the caller resolves it
-    # into `lines` (apply_edits has no index).
+    # `SYMBOL name` anchor keeps the name here until apply_edits resolves it
+    # into `lines` (via the caller's index when given one, otherwise straight
+    # from the file's AST with `locate_symbol_span`).
     lines: tuple[int, int] | None = None
     symbol: str = ""
+    # Zero-anchor splice fields: `insert_after` names the definition the body
+    # is spliced AFTER (from an AFTER_SYMBOL block or an
+    # {"edit_action": "insert_after_symbol"} payload); a plain symbol splice
+    # lands in `symbol`.
+    insert_after: str = ""
 
 
 @dataclass
@@ -166,23 +219,38 @@ def malformed_blocks(text: str, parsed: int) -> list[tuple[str, str]]:
     """[(file, hint)] for blocks the model STARTED but that did not parse:
     `<<<<<<< SEARCH` markers or `--- FILE:` headers with no complete block
     behind them (a missing `=======` or `>>>>>>> REPLACE`, a wrong header
-    spelling). Without this they are silently dropped and the model never
-    learns its edit was ignored. `parsed` is the number of blocks that did
-    parse, so a clean reply returns []."""
+    spelling), or `<<<<<<< SYMBOL file :: name` splice blocks without their
+    `>>>>>>> END_SYMBOL` closer. Without this they are silently dropped and
+    the model never learns its edit was ignored. `parsed` is the number of
+    blocks that did parse, so a clean reply returns []."""
     text = text.replace("\r\n", "\n")
     headers = _HEADER_LINE_RE.findall(text)
     searches = len(_SEARCH_MARK_RE.findall(text))
-    started = max(len(headers), searches)
+    symbols = _SYMBOL_MARK_RE.findall(text)
+    # A symbol splice block normally sits under its own `--- FILE:` header, so
+    # those headers are not search blocks that lost their markers.
+    plain_headers = max(len(headers) - len(symbols), 0)
+    started = max(plain_headers, searches) + len(symbols)
     if started <= parsed:
         return []
-    out: list[tuple[str, str]] = []
     missing = started - parsed
-    if searches > len(headers):
+    out: list[tuple[str, str]] = []
+    if searches > plain_headers:
         hint = ("a `<<<<<<< SEARCH` block has no `--- FILE: path` header "
                 "above it -- did you mean `--- FILE: relative/path.py`?")
         wrong = _WRONG_HEADER_RE.search(text)
         out.append(((wrong.group("file") or wrong.group("file2")).strip()
                     if wrong else "(unknown file)", hint))
+        missing -= 1
+    for line in symbols:
+        if missing <= 0:
+            break
+        head = _SYMBOL_MARK_LEAD_RE.sub("", line.split("::")[0]).strip()
+        out.append((head or "(unknown file)",
+                    "its symbol splice block is incomplete: after the "
+                    "`<<<<<<< SYMBOL path :: name` header it needs the full "
+                    "new definition and a `>>>>>>> END_SYMBOL` line on its "
+                    "own"))
         missing -= 1
     for f in headers:
         if missing <= 0:
@@ -195,18 +263,68 @@ def malformed_blocks(text: str, parsed: int) -> list[tuple[str, str]]:
     return out
 
 
+def parse_edit_actions(text: str) -> list[tuple[int, "Edit"]]:
+    """(position, Edit) for structured `{"edit_action": ...}` JSON payloads
+    embedded anywhere in a reply (with or around code fences). Supported
+    actions: `replace_symbol` and `insert_after_symbol`; unknown actions are
+    ignored so a future payload shape never corrupts an existing reply. A
+    malformed or incomplete object is skipped, never guessed at."""
+    if "edit_action" not in text:
+        return []
+    dec = json.JSONDecoder()
+    out: list[tuple[int, Edit]] = []
+    for m in re.finditer(r'"edit_action"\s*:\s*"(replace_symbol|insert_after_symbol)"',
+                         text):
+        obj = None
+        start = -1
+        # Walk every `{` before the key outward until one whole object
+        # decodes: the innermost brace opens a string fragment, not the payload.
+        probe = text.rfind("{", 0, m.start())
+        tries = 0
+        while probe >= 0 and tries < 64:
+            try:
+                cand, _end = dec.raw_decode(text[probe:])
+            except ValueError:
+                cand = None
+            if isinstance(cand, dict) and cand.get("edit_action") in (
+                    "replace_symbol", "insert_after_symbol"):
+                obj, start = cand, probe
+                break
+            probe = text.rfind("{", 0, probe)
+            tries += 1
+        if obj is None:
+            continue
+        rel = str(obj.get("file") or "").strip()
+        symbol = str(obj.get("symbol") or obj.get("name") or "").strip()
+        repl = obj.get("replacement")
+        if repl is None:
+            repl = obj.get("content")
+        if not isinstance(repl, str) or not rel or not symbol:
+            continue
+        repl = repl.replace("\r\n", "\n").replace("\r", "\n").removesuffix("\n")
+        e = Edit(fileio.normalise_rel(rel), "", repl,
+                 symbol=symbol if obj["edit_action"] == "replace_symbol" else "",
+                 insert_after=symbol
+                 if obj["edit_action"] == "insert_after_symbol" else "")
+        out.append((start, e))
+    return out
+
+
 def parse_edits(text: str, discards: list | None = None) -> list[Edit]:
-    """Extract every search/replace block from a model's reply text.
+    """Extract every search/replace and symbol-splice block from a model's
+    reply text, in reply order.
 
     Normalises line endings and strips the fences wrapping the blocks. A block
     whose SEARCH and REPLACE are identical changes nothing and is dropped; its
     file is appended to `discards` when given, so callers never count a null
-    edit as work."""
+    edit as work. Zero-anchor `<<<<<<< SYMBOL file :: name` blocks and
+    `{"edit_action": ...}` JSON payloads parse into anchored Edits (no SEARCH,
+    a symbol to resolve at apply time)."""
     text = text.replace("\r\n", "\n").replace("\r", "\n")
     cleaned = _strip_wrapping_fences(text)
     # A blanked fence line can leave a header glued to the line above it.
     cleaned = _HEADER_START_RE.sub(r"\n\1", cleaned)
-    edits = []
+    found: list[tuple[int, Edit]] = []
     for m in BLOCK_RE.finditer(cleaned):
         # Drop exactly one trailing newline: the separator/closer may sit on
         # the same line as the last body line, so an empty replacement must
@@ -233,9 +351,24 @@ def parse_edits(text: str, discards: list | None = None) -> list[Edit]:
             if discards is not None:
                 discards.append(fname)
             continue
-        edits.append(Edit(fname, search, replace,
-                          lines=lines_anchor, symbol=symbol_anchor))
-    return edits
+        found.append((m.start(), Edit(fname, search, replace,
+                                      lines=lines_anchor,
+                                      symbol=symbol_anchor)))
+    # Zero-anchor splice blocks: `<<<<<<< SYMBOL file :: name` (replace) and
+    # `<<<<<<< AFTER_SYMBOL file :: name` (insert after), closed by
+    # `>>>>>>> END_SYMBOL`. No SEARCH section exists to quote or mis-indent.
+    for m in SYMBOL_BLOCK_RE.finditer(cleaned):
+        kind = m.group("kind").upper()
+        fname = fileio.normalise_rel(m.group("file").strip())
+        body = m.group("replace").removesuffix("\n")
+        anchor = Edit(fname, "", body,
+                      symbol="" if kind != "SYMBOL" else m.group("symbol").strip(),
+                      insert_after=m.group("symbol").strip()
+                      if kind != "SYMBOL" else "")
+        found.append((m.start(), anchor))
+    found.extend(parse_edit_actions(cleaned))
+    found.sort(key=lambda t: t[0])
+    return [e for _pos, e in found]
 
 
 # --------------------------------------------------------------------------
@@ -431,6 +564,84 @@ def _locate(haystack: str, needle: str) -> tuple[int, int] | None:
     tail = len(seg[-1]) - len(seg[-1].rstrip("\r\n"))
     end = start + sum(len(x) for x in seg) - tail
     return start, end
+
+
+def _indent_of_line(text: str, lineno: int) -> str:
+    """Leading whitespace of a 1-based line ("" when out of range)."""
+    lines = text.split("\n")
+    if not 1 <= lineno <= len(lines):
+        return ""
+    ln = lines[lineno - 1]
+    return ln[: len(ln) - len(ln.lstrip())]
+
+
+def normalise_symbol_indent(body: str, base_indent: str) -> str:
+    """Shift a symbol replacement so its top-level lines sit at `base_indent`
+    (the target definition's real indent in the file).
+
+    A small model asked to rewrite `TableParser.parse_row` habitually emits
+
+        def parse_row(self, line):
+            return line
+
+    at column 0; the splice needs it at the method's 4 spaces. The body's own
+    first non-blank line defines its base level; every line is shifted by the
+    same amount, so relative structure inside the definition is preserved.
+    Already-correct bodies come back untouched (no churn, byte-stable diffs).
+    """
+    lines = body.split("\n")
+    cur = None
+    for ln in lines:
+        if ln.strip():
+            cur = ln[: len(ln) - len(ln.lstrip())]
+            break
+    if cur is None or cur == base_indent:
+        return body
+    cur_w = len(cur.expandtabs(4))
+    base_w = len(base_indent.expandtabs(4))
+    delta = base_w - cur_w
+    out = []
+    for ln in lines:
+        if not ln.strip():
+            out.append(ln)
+            continue
+        if delta >= 0:
+            pad = ("\t" * (delta // 4) if "\t" in base_indent and delta % 4 == 0
+                   else " " * delta)
+            out.append(pad + ln)
+        else:
+            drop = -delta
+            ind = ln[: len(ln) - len(ln.lstrip())]
+            j = 0
+            while j < len(ind) and drop > 0:
+                drop -= 4 if ind[j] == "\t" else 1
+                j += 1
+            if drop < 0:                     # would eat into the token itself
+                j -= 1
+                ind = ind[:j] + (" " * -drop)
+                out.append(ind + ln[len(ln) - len(ln.lstrip()):])
+                continue
+            out.append(ind[j:] + ln[len(ln) - len(ln.lstrip()):])
+    return "\n".join(out)
+
+
+def _leading_decorators(original: str, a: int, b: int) -> list[str]:
+    """The decorator lines at the head of the anchored span [a, b], exactly as
+    they sit in the file (already at the target indent), or [] when the
+    definition is bare. Small models rewrite a method and forget to re-echo
+    `@staticmethod`; dropping a decorator silently changes behaviour, so the
+    splice carries them over unless the new body starts with its own `@`."""
+    lines = original.split("\n")
+    out: list[str] = []
+    for i in range(a - 1, min(b, len(lines))):
+        s = lines[i].strip()
+        if s.startswith("@"):
+            out.append(lines[i].rstrip())
+        elif not s:
+            continue
+        else:
+            break
+    return out
 
 
 # --------------------------------------------------------------------------
@@ -1155,58 +1366,127 @@ def apply_edits(root: Path, edits: list[Edit], backup: bool = True,
         anchored: dict[int, tuple[int, int]] = {}
         for k, e in enumerate(group, 1):
             if _is_anchored(e):
-                if not e.lines:
-                    results.append(Result(
-                        False, rel,
-                        f"block {k}: SYMBOL anchor '{e.symbol}' could not be "
-                        "resolved to a definition in this file; `read` the "
-                        "symbol and emit the block with LINES <start>-<end> "
-                        "instead"))
-                    failed = True
-                    break
-                a, b = e.lines
-                lspan = _line_span(original, a, b)
-                if lspan is None:
-                    results.append(Result(
-                        False, rel,
-                        f"block {k}: line range {a}-{b} is out of bounds -- "
-                        f"this file has {len(original.splitlines())} line(s); "
-                        "`read` it again and emit current line numbers"))
-                    failed = True
-                    break
-                anchored[k] = (a, b)
-                needle = original[lspan[0]:lspan[1]]
-                if not needle.strip():
-                    # A blank-lines-only needle would fall into the
-                    # empty-SEARCH whole-text branch below; refuse instead.
-                    results.append(Result(
-                        False, rel,
-                        f"block {k}: line range {a}-{b} is only blank lines -- "
-                        "widen the anchored range to include real code so it "
-                        "can be located"))
-                    failed = True
-                    break
-                repl = e.replace
-                if repl and needle.endswith("\n") and not repl.endswith("\n"):
-                    repl += "\n"
-                # A LINES range that covers the whole file is a whole-file
-                # replacement, even though its SEARCH text is non-empty. The
-                # fragment guard must cover this shape too: the model can
-                # otherwise dodge it by sending `LINES 1-N` with an empty
-                # replacement instead of an empty SEARCH (test_1a O7: a
-                # 214-line src/main.js was reduced to 52 lines this way after
-                # the `write` action had already refused the same fragment).
-                total_lines = len(original.splitlines())
-                if a <= 1 and b >= total_lines:
-                    whole = repl if not repl or repl.endswith("\n") \
-                        else repl + "\n"
-                    refusal = fragment_refusal(rel, text, whole)
-                    if refusal:
-                        results.append(Result(False, rel,
-                                              f"block {k}: {refusal}"))
+                converted = False
+                if not e.lines and (e.symbol or e.insert_after):
+                    # Zero-anchor splice (or a SYMBOL header no index
+                    # resolved): locate the definition's exact span from the
+                    # AST/tree-sitter, right now, on the current bytes.
+                    sym = e.symbol or e.insert_after
+                    span = locate_symbol_span(path, sym)
+                    if span is None:
+                        results.append(Result(
+                            False, rel,
+                            f"block {k}: SYMBOL anchor '{sym}' could not be "
+                            "located in this file (missing, ambiguous, or the "
+                            "file does not parse); check the spelling against "
+                            "an `outline`, or `read` the symbol and emit the "
+                            "block with LINES <start>-<end> instead"))
                         failed = True
                         break
-                e = Edit(e.file, needle, repl)
+                    s0, e0, base_ind = span
+                    body = normalise_symbol_indent(e.replace, base_ind)
+                    if e.insert_after:
+                        lspan = _line_span(original, s0, e0)
+                        if lspan is None:
+                            results.append(Result(
+                                False, rel,
+                                f"block {k}: symbol '{sym}' resolved to lines "
+                                f"{s0}-{e0}, which are out of bounds in this "
+                                "file; `read` it again"))
+                            failed = True
+                            break
+                        needle = original[lspan[0]:lspan[1]]
+                        if not needle.strip():
+                            results.append(Result(
+                                False, rel,
+                                f"block {k}: symbol '{sym}' spans only blank "
+                                "lines; nothing to anchor an insert after"))
+                            failed = True
+                            break
+                        repl = needle
+                        if body.strip():
+                            if not repl.endswith("\n"):
+                                repl += "\n"
+                            repl += body + "\n"
+                        anchored[k] = (s0, e0)
+                        e = Edit(e.file, needle, repl)
+                        converted = True
+                    else:
+                        e = Edit(e.file, e.search, body,
+                                 lines=(s0, e0), symbol=sym)
+                if not converted:
+                    if not e.lines:
+                        results.append(Result(
+                            False, rel,
+                            f"block {k}: SYMBOL anchor '{e.symbol}' could not "
+                            "be resolved to a definition in this file; `read` "
+                            "the symbol and emit the block with "
+                            "LINES <start>-<end> instead"))
+                        failed = True
+                        break
+                    a, b = e.lines
+                    lspan = _line_span(original, a, b)
+                    if lspan is None:
+                        results.append(Result(
+                            False, rel,
+                            f"block {k}: line range {a}-{b} is out of bounds "
+                            f"-- this file has {len(original.splitlines())} "
+                            "line(s); `read` it again and emit current line "
+                            "numbers"))
+                        failed = True
+                        break
+                    anchored[k] = (a, b)
+                    needle = original[lspan[0]:lspan[1]]
+                    if not needle.strip():
+                        # A blank-lines-only needle would fall into the
+                        # empty-SEARCH whole-text branch below; refuse instead.
+                        results.append(Result(
+                            False, rel,
+                            f"block {k}: line range {a}-{b} is only blank "
+                            "lines -- widen the anchored range to include "
+                            "real code so it can be located"))
+                        failed = True
+                        break
+                    repl = e.replace
+                    if e.symbol:
+                        # A SYMBOL-anchored body written at the wrong base
+                        # indent (the habitual column-0 `def` for a class
+                        # method) is re-aligned to the definition's real
+                        # indent; the range's first line is the target level.
+                        # Idempotent for a body already written at the right
+                        # depth.
+                        repl = normalise_symbol_indent(repl, _indent_of_line(
+                            original, a))
+                        # Decorators are part of the definition's identity:
+                        # carry them over when the new body does not re-echo
+                        # them, so forgetting `@staticmethod` cannot silently
+                        # change behaviour. An empty REPLACE deletes the whole
+                        # definition, decorators included.
+                        decs = _leading_decorators(original, a, b)
+                        if decs and repl.strip() \
+                                and not repl.lstrip().startswith("@"):
+                            repl = "\n".join(decs) + "\n" + repl
+                    if repl and needle.endswith("\n") and not repl.endswith("\n"):
+                        repl += "\n"
+                    # A LINES range that covers the whole file is a whole-file
+                    # replacement, even though its SEARCH text is non-empty.
+                    # The fragment guard must cover this shape too: the model
+                    # can otherwise dodge it by sending `LINES 1-N` with an
+                    # empty replacement instead of an empty SEARCH (test_1a
+                    # O7: a 214-line src/main.js was reduced to 52 lines this
+                    # way after the `write` action had already refused the
+                    # same fragment).
+                    total_lines = len(original.splitlines())
+                    if a <= 1 and b >= total_lines:
+                        whole = repl if not repl or repl.endswith("\n") \
+                            else repl + "\n"
+                        refusal = fragment_refusal(rel, text, whole)
+                        if refusal:
+                            results.append(Result(False, rel,
+                                                  f"block {k}: {refusal}"))
+                            failed = True
+                            break
+                    e = Edit(e.file, needle, repl)
             if not e.search.strip():
                 # An empty SEARCH mixed in with real edits replaces the WHOLE
                 # text that later blocks anchor against. That replacement is

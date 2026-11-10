@@ -855,6 +855,114 @@ Zero model calls, zero subprocesses; one `sha1` and one small JSON rewrite
 per proven fix. Ablation flag: `micro_facts = false` silences recording and
 injection together with §14.
 
+### 25. Zero-anchor AST surgical splicing: replace a definition without echoing it
+
+A search/replace block asks a 7B model to reproduce, byte for byte, the *whole*
+body it wants to change: the docstring, the blank lines, the trailing comment.
+Small models are unreliable copyists, so a 40-line function edit usually lands
+with one character wrong, and the harness spends a repair round telling it so.
+The worse cost is the one nobody measures: the model re-reads the definition and
+then re-emits every line of it, so the tokens paid for a 3-line change are the
+tokens of a 40-line function.
+
+Pedacito now offers a splice. The model names the definition and writes only the
+new body:
+
+```
+--- FILE: src/orders.py
+<<<<<<< SYMBOL src/orders.py :: Order.total
+    def total(self, tax=0.0):
+        return sum(l.price for l in self.lines) * (1 + tax)
+>>>>>>> END_SYMBOL
+```
+
+No SEARCH half at all. `chunker.locate_symbol_span()` answers where the
+definition lives: `ast` for Python, and the same tree-sitter grammars the index
+already uses (§12) for JavaScript, TypeScript, Go and Rust, so `Class.method`
+qualifiers mean exactly what the index says they mean. The agent resolves the
+anchor through the index when it has one and falls back to the file's own AST
+when it does not, so the block works mid-run after earlier edits moved lines
+around. Concretely:
+
+- **Decorators belong to the definition.** The span starts at the first
+  `@decorator` line above a `def`, and if the replacement body does not re-echo
+  it, the harness carries the original decorators over. Forgetting
+  `@staticmethod` is a silent behaviour change, and this makes it a non-event.
+  An empty body deletes the definition, decorators included.
+- **Indentation is the harness's job.** A method body written at column 0 (the
+  habitual shape) is re-aligned to the definition's real column before it is
+  spliced, so the model never has to think about where the block sits.
+- **Insertion is the same trick.** `<<<<<<< AFTER_SYMBOL file :: name` (or
+  `{"edit_action": "insert_after_symbol"}`) splices a new sibling *after* that
+  definition, which is how a model adds a method to a class without re-emitting
+  the class.
+- **The grammar is additive, never breaking.** Classic
+  `<<<<<<< SEARCH / ======= / >>>>>>> REPLACE` blocks parse and apply exactly as
+  before, and one reply may mix both shapes; blocks apply in reply order. The
+  structured payload form `{"edit_action": "replace_symbol", "file": ...,
+  "symbol": ..., "replacement": ...}` exists for constrained sampling, and an
+  unknown or half-written payload is skipped rather than guessed at.
+- **Same gate, same honesty.** The spliced result goes through the identical
+  syntax check as every other edit, so a body that does not parse refuses the
+  write instead of landing. An unknown or ambiguous symbol name is refused with
+  a message that names the anchor and tells the model what to do instead:
+  `outline` the file, or re-emit the block with `LINES <start>-<end>`. An
+  unterminated splice block is reported as malformed, so an ignored edit is
+  never silent.
+
+Cost: the new body only. Nothing is re-read, nothing is re-echoed, and a wrong
+guess costs one observation line rather than a fuzzy-match repair round. The
+technique needs no flag: it is a shape the model may use, and the old shape
+still works.
+
+### 26. Deterministic multi-file symbol renaming: a refactor that costs zero tokens
+
+Asking a model to rename a symbol is asking it to be a compiler. It must find
+every reference, write every file's block from a re-read, and somehow avoid
+touching the log message and the SQL column that merely *contain* the same
+word. In a 12-file project that is twelve reads, twelve blocks, twelve chances
+to be wrong, and it is the single most expensive thing a small model can be
+asked to do that no model needs to do at all.
+
+`refactor.rename_symbol_across_project()` does it without a model call:
+
+- **Identifiers, not text.** Python is renamed through `tokenize`: every NAME
+  token equal to the old name is rewritten, every string and comment is not.
+  JavaScript, TypeScript, Go and Rust go through their tree-sitter identifier
+  nodes, for the same guarantee. A language with no grammar available falls
+  back to a word matcher that also skips quotes and comments, and says so in
+  `warnings` rather than quietly trusting it.
+- **Scoped by the import graph.** The default is the whole indexed source tree,
+  skipping venvs, `.pedacito/` state, generated egg-info, hidden directories,
+  unreadable or binary files and anything over 4 MB. Passing one file renames
+  that file plus the files that import it, using the index's `importers_of`
+  (§12) when the index exists and a textual importer scan when it does not.
+- **All-or-nothing, like the edit path.** Every candidate result is validated by
+  the same AST/tree-sitter gate (§19) *before* a single byte is written; one
+  file that the rename would break refuses the whole run. A `before_write(rel,
+  path)` hook lets a caller permission-gate or snapshot each file just before
+  the write pass, which is how the tool layer's task allowlist and the CLI's
+  backups plug in.
+- **Name-based on purpose.** This renames an *identifier*, so a parameter in an
+  unrelated function that happens to share the name moves too; that is what a
+  project-wide rename means, and the diff preview shows it before anything is
+  written. It is deliberately distinct from the older index-aware `rename`
+  action, which resolves a single definition, refuses ambiguity, and rewrites
+  only that symbol's declaration and its known callers.
+
+Three surfaces, one engine: the agent action `rename_symbol` (offered only when
+`allow_write` is on, and registered as a mutating action so the task loop's
+mutation ledger, protection rules and snapshots apply, §21), the CLI
+`pedacito rename OLD NEW [--file F] [--apply]`, and `Project > Rename symbol...`
+in the GUI, backed by `POST /api/refactor/rename`. All three default to a
+preview with unified diffs; writing snapshots the originals under
+`.pedacito/backups/`, so `pedacito restore` (or the GUI's Restore dialog) undoes
+a rename that turned out to be the wrong call. Applied files are re-indexed in
+place so the next search does not answer from a stale symbol table.
+
+Cost: one tokenize or parse pass per file, no model, no repair rounds, and a
+guarantee a model cannot give -- a string literal is never a reference.
+
 ## Techniques that exist but are not a good fit
 
 These are real methods with real literature behind them. Pedacito rejects them

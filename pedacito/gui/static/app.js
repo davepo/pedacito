@@ -1245,6 +1245,71 @@ function restoreDialog() {
     } }], { narrow: true });
 }
 
+// Deterministic symbol rename (Sprint P): the server moves every exact
+// identifier through the tokenizer / tree-sitter, so strings and comments that
+// merely contain the old name survive and no model tokens are spent. Preview
+// first (nothing written), then Rename (originals snapshotted, so "Restore
+// from a backup" undoes it).
+function renameSymbolDialog() {
+  if (!S.status.root) { PDC.toast('Open a project first.', true); return; }
+  const oldInp = h('input', { type: 'text', class: 'grow', spellcheck: false,
+    autocomplete: 'off', placeholder: 'current name, e.g. compute_total' });
+  const newInp = h('input', { type: 'text', class: 'grow', spellcheck: false,
+    autocomplete: 'off', placeholder: 'new name' });
+  const scopeInp = h('input', { type: 'text', class: 'grow', spellcheck: false,
+    autocomplete: 'off', placeholder: 'optional: src/orders.py (only it plus its importers)' });
+  const out = h('pre', { class: 'diffwrap', style: 'max-height:46vh;overflow:auto;margin:8px 0 0' });
+  const row = (label, input) => h('div', { style: 'display:flex;gap:8px;align-items:center;margin-bottom:6px' },
+    h('label', { class: 'muted small-text', style: 'min-width:88px', text: label }), input);
+  const body = h('div', {},
+    row('Rename', oldInp), row('To', newInp), row('Scope file', scopeInp),
+    h('div', { class: 'muted small-text', text: 'Exact identifier nodes only (definitions, imports, call sites). Strings and comments are never touched. Python, JavaScript/TypeScript, Go and Rust.' }),
+    out);
+  const payload = (apply) => {
+    const old = (oldInp.value || '').trim(), nw = (newInp.value || '').trim();
+    if (!old || !nw) { PDC.toast('Both names are required.', true); return null; }
+    if (old === nw) { PDC.toast('The new name equals the old one.', true); return null; }
+    const p = { old: old, new: nw, apply: apply };
+    const scope = (scopeInp.value || '').trim();
+    if (scope) p.file = scope;
+    return p;
+  };
+  const show = (j) => {
+    if (!j.ok) { out.textContent = j.detail || j.error || 'rename failed'; return; }
+    if (!(j.files_modified || []).length) {
+      out.textContent = 'No exact identifier occurrence found' +
+        (j.skipped && j.skipped.length ? '\nskipped: ' + j.skipped.slice(0, 8).join('\n') : '');
+      return;
+    }
+    const head = (j.dry_run ? 'would rename ' : 'renamed ') + j.total_replacements +
+      ' occurrence(s) in ' + j.files_modified.length + ' file(s)\n';
+    const diffs = j.files_modified.map((rel) => rel + ' (' + (j.per_file[rel] || 0) + ')\n' +
+      (j.diffs[rel] || '')).join('\n');
+    out.textContent = head + '\n' + diffs;
+  };
+  const m = PDC.modal('Rename a symbol across the project', body, [
+    { label: 'Cancel' },
+    { label: 'Preview', stay: true, onclick: () => {
+      const p = payload(false);
+      if (p) PDC.api('/api/refactor/rename', p).then(show).catch(() => PDC.toast('server unreachable', true));
+    } },
+    { label: 'Rename', danger: true, onclick: (close) => {
+      const p = payload(true);
+      if (!p) return false;
+      PDC.api('/api/refactor/rename', p).then((j) => {
+        show(j);
+        if (j.ok && (j.files_modified || []).length) {
+          PDC.toast(j.total_replacements + ' occurrence(s) renamed in ' + j.files_modified.length +
+            ' file(s)' + (j.backup ? '; backup: ' + j.backup : '') + '.');
+          refreshState();
+        } else if (!j.ok) PDC.toast(j.detail || j.error || 'rename refused', true);
+      }).catch(() => PDC.toast('server unreachable', true));
+      return false;                      // keep the dialog open to read the result
+    } }], { wide: true });
+  setTimeout(() => { oldInp.focus(); }, 30);
+  return m;
+}
+
 // ------------------------------------------------------------------ layout ----
 function setVar(name, px) { document.documentElement.style.setProperty(name, px + 'px'); }
 function startDrag(e, onMove) {
@@ -1419,6 +1484,7 @@ function TopBar() {
             <${MenuItem} label="Index project (with summaries)" disabled=${!!j || !s.root} action=${() => buildIndex(true)} />
             <${MenuItem} label="Quick index (no summaries)" disabled=${!!j || !s.root} action=${() => buildIndex(false)} />
             <${MenuItem} label="Restore from a backup\u2026" disabled=${!!j || !(s.snapshots || []).length} action=${restoreDialog} />
+            <${MenuItem} label="Rename symbol\u2026" disabled=${!!j || !s.root} action=${renameSymbolDialog} />
             <${MenuItem} label="Provider settings\u2026" action=${() => callSettings()} />
             <${MenuItem} label="Clear terminal" action=${clearTerm} />
             <${MenuItem} label="Clear chat" action=${() => PDC.api('/api/clear', {})} />
