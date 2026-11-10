@@ -10,8 +10,11 @@ dynamic pruning removes a stale optional tool; everything destructive
 or machine-visible is gated by config: `write`/`append`/`move`/`delete` need
 `allow_write`, `run`/`diagnose` need `allow_shell`, `screenshot` needs
 `allow_screenshots`, `browser` needs `allow_browser` (launching a command also
-needs `allow_shell`), `mcp` needs `allow_mcp`, and `diff` is dropped by
-`allow_diff = false`. `fetch_url`/`web_search` are the built-in web tools:
+needs `allow_shell`), `mcp` needs `allow_mcp`, `mcp_call` needs `enable_mcp`
+plus a named `[mcp_servers.<name>]` server whose tools match the current task
+(a server not marked `trusted` asks the human Permission Broker first), and
+`diff` is dropped by `allow_diff = false`. `fetch_url`/`web_search` are the
+built-in web tools:
 they enter the schema when `enable_web` is on OR the task text names a URL or
 web-intent words, and every call made while `enable_web` is off goes through
 the human Permission Broker first (`setting_key="enable_web"`, so "Always
@@ -175,7 +178,7 @@ STEP_SCHEMA = {
                      "screenshot", "browser",
                      "todo",
                      "remember", "skill", "task", "fetch", "fetch_url",
-                     "web_search", "question", "mcp",
+                     "web_search", "question", "mcp", "mcp_call",
                      "done"],
         },
         "file": {"type": "string",
@@ -226,6 +229,19 @@ STEP_SCHEMA = {
                   "description": "For web_search: the search query. Empty "
                                  "otherwise.",
                   "maxLength": 300},
+        "server": {"type": "string",
+                   "description": "For mcp_call: the configured MCP server "
+                                  "name, exactly as listed in MCP TOOLS. "
+                                  "Empty otherwise.",
+                   "maxLength": 100},
+        "tool": {"type": "string",
+                 "description": "For mcp_call: the tool name from the MCP "
+                                "TOOLS block. Empty otherwise.",
+                 "maxLength": 120},
+        "arguments": {"type": "string",
+                      "description": "For mcp_call: a JSON object of the "
+                                     "tool's arguments. Empty otherwise.",
+                      "maxLength": 4000},
         "target": {"type": "string",
                    "description": "For run_test: the pytest file (e.g. "
                                   "tests/test_app.py) or node id (e.g. "
@@ -291,6 +307,7 @@ USAGES_ACTION = "usages"
 DIAGNOSE_ACTION = "diagnose"
 TODO_ACTION = "todo"
 MCP_ACTION = "mcp"
+MCP_CALL_ACTION = "mcp_call"
 FETCH_URL_ACTION = "fetch_url"
 WEB_SEARCH_ACTION = "web_search"
 WRITE_ACTIONS = (WRITE_ACTION, APPEND_ACTION)
@@ -349,6 +366,8 @@ _PRUNE_TRIGGERS = {
     "question": re.compile(r"\b(question|clarify|ambiguous|ask the user)\b",
                            re.I),
     "mcp": re.compile(r"\b(mcp|external tool|model context protocol)\b", re.I),
+    MCP_CALL_ACTION: re.compile(r"\b(mcp|external tool|model context "
+                                r"protocol|plugin|connector)\b", re.I),
     "lsp": re.compile(r"\b(lsp|language server|go to definition|references|"
                       r"hover|diagnostics)\b", re.I),
     "screenshot": re.compile(r"\b(screenshot|screen capture|capture the "
@@ -382,6 +401,11 @@ def _prune_optional_actions(cfg, actions: list[str]) -> list[str]:
         if action == RUN_TEST_ACTION and _repo_has_tests(cfg):
             # The repository HAS tests: a stale usage counter must not hide
             # the one tool that turns a guess about a failure into evidence.
+            kept.append(action)
+            continue
+        if action == MCP_CALL_ACTION and _mcp_call_offered(cfg):
+            # The offer IS a per-task relevance match against the servers'
+            # real tool listings: a stale usage counter must not hide it.
             kept.append(action)
             continue
         if memory.tool_unused_tasks(root, action) < threshold:
@@ -435,6 +459,57 @@ def _run_test_offered(cfg) -> bool:
         return True
     return bool(_RUN_TEST_PROMPT_RE.search(
         str(getattr(cfg, "_task_text", "") or "")))
+
+
+def _mcp_relevant_tools(cfg) -> list[dict]:
+    """The named-server MCP tools that match the current task, capped by
+    dynamic tool pruning. The full listing is cached for the session inside
+    mcp.py; this only filters it against the task text (top 4). Servers that
+    are down contribute nothing (5s listing budget each, first time only)."""
+    if not getattr(cfg, "enable_mcp", True):
+        return []
+    from . import mcp
+    try:
+        if not mcp.named_servers(cfg):
+            return []
+        descriptors = mcp.list_mcp_tools(cfg)
+    except Exception:
+        return []
+    return mcp.relevant_tools(descriptors,
+                              str(getattr(cfg, "_task_text", "") or ""))
+
+
+def _mcp_call_offered(cfg) -> bool:
+    """`mcp_call` enters the schema only when the run has named MCP servers
+    AND at least one of their listed tools matches the current task: the
+    model never sees an external-tool channel the task cannot need. The
+    per-server listing is cached for the session, so a task change costs only
+    cheap text matching."""
+    if not getattr(cfg, "dynamic_tool_pruning", True):
+        # Pruning off: offer whenever named servers are configured.
+        if not getattr(cfg, "enable_mcp", True):
+            return False
+        from . import mcp
+        try:
+            return bool(mcp.named_servers(cfg))
+        except Exception:
+            return False
+    return bool(_mcp_relevant_tools(cfg))
+
+
+def mcp_injection(cfg) -> str:
+    """The compact MCP TOOLS block for the gather prompt: the relevant named
+    tools' one-line signatures (server.name(args) -- summary), or '' when
+    `mcp_call` is not offered. The model may only call what it is shown, so
+    this list IS the pruning: everything else on the server is invisible."""
+    descs = _mcp_relevant_tools(cfg)
+    if not descs:
+        return ""
+    from . import mcp
+    lines = ["MCP TOOLS (call with action=mcp_call, server=<server name>, "
+             "tool=<tool name>, arguments=<JSON object>):"]
+    lines += [mcp.compact_line(d) for d in descs]
+    return "\n".join(lines)
 
 
 def reasoning_first(cfg) -> bool:
@@ -613,6 +688,15 @@ def build_gather_json_schema(allowed_actions: list[str],
             + ["target", "filter"] + ordered[ordered.index("symbol") + 1:]
         if not compact:
             required += ["target", "filter"]
+    if MCP_CALL_ACTION in actions:
+        # `server`/`tool`/`arguments` join the flat field set only while the
+        # named-server `mcp_call` action is in this schema (same byte-
+        # identical-default rule as url/query and target/filter).
+        ordered = ordered[:ordered.index("symbol") + 1] \
+            + ["server", "tool", "arguments"] \
+            + ordered[ordered.index("symbol") + 1:]
+        if not compact:
+            required += ["server", "tool", "arguments"]
     if step_reasoning_first:
         ordered = ["reasoning"] + [k for k in ordered if k != "reasoning"]
         schema["properties"]["reasoning"]["description"] = (
@@ -679,6 +763,11 @@ def schema_for(cfg) -> dict:
         actions.append("question")
     if getattr(cfg, "allow_mcp", False):
         actions.append("mcp")
+    if _mcp_call_offered(cfg):
+        # The named-server path: offered only when at least one listed tool
+        # matches the task (see _mcp_relevant_tools). Calls on servers not
+        # marked `trusted` ask the permission broker first (tool_mcp_call).
+        actions.append(MCP_CALL_ACTION)
     if getattr(cfg, "allow_lsp", False):
         actions.append("lsp")
     actions.append("done")
@@ -2440,6 +2529,58 @@ def tool_mcp(index, cfg, symbol: str = "", content: str = "") -> str:
     return mcp.call(cfg, target, args)
 
 
+def tool_mcp_call(index, cfg, server: str, tool_name: str,
+                  arguments) -> str:
+    """Invoke one tool of a NAMED MCP server ([mcp_servers.<name>]).
+
+    Sprint R gate: a server whose table does not set `trusted = true` goes
+    through the human Permission Broker (category `mcp_tool`) before anything
+    starts or runs; a denial (or nobody to ask) answers with the fixed
+    redirect text so the model pivots back to local tools. Trusted servers
+    run directly. The result is token-bounded by `cfg.max_read_tokens` inside
+    mcp.call_mcp_tool."""
+    from . import mcp
+    if not getattr(cfg, "enable_mcp", True):
+        return "ERROR: MCP is disabled (config enable_mcp = false)."
+    servers = mcp.named_servers(cfg)
+    sname = _as_text(server).strip()
+    tname = _as_text(tool_name).strip()
+    if not sname or not tname:
+        return ("ERROR: mcp_call needs the server name and the tool name "
+                "from the MCP TOOLS block.")
+    spec = servers.get(sname)
+    if spec is None:
+        return (f"ERROR: MCP server '{sname[:100]}' is not configured "
+                "(check [mcp_servers.<name>]).")
+    args: dict = {}
+    if isinstance(arguments, dict):
+        args = arguments
+    else:
+        raw = _as_text(arguments).strip()
+        if raw:
+            try:
+                args = json.loads(raw)
+            except ValueError as e:
+                return f"ERROR: mcp_call arguments must be a JSON object ({e})."
+            if not isinstance(args, dict):
+                return "ERROR: mcp_call arguments must be a JSON object."
+    if not spec.get("trusted"):
+        allowed, _msg = security.request_permission(
+            category=security.CAT_MCP_TOOL,
+            action_summary=f"Run MCP tool {sname}.{tname}",
+            detail=json.dumps({"server": sname, "tool": tname,
+                               "arguments": args}, ensure_ascii=True)[:4000],
+            risk_level="medium",
+            reason=f"MCP server '{sname}' is not marked trusted",
+            key=f"{sname}.{tname}",
+            setting_key="enable_mcp")
+        if not allowed:
+            return security.MCP_DENIED_MESSAGE
+    return mcp.call_mcp_tool(cfg, sname, tname, args,
+                             timeout=float(getattr(cfg, "mcp_timeout", 15)
+                                           or 15))
+
+
 def _snapshot(index, cfg, rel: str, path: Path) -> str | None:
     """Byte-exact copy of `path` into the run's backup dir before a mutating
     action. Returns an error string if the copy failed; None on success or
@@ -4113,6 +4254,9 @@ def dispatch(index, cfg, step: dict, client=None) -> str:
     if action == MCP_ACTION:
         return tool_mcp(index, cfg, step.get("symbol", ""),
                         step.get("content", ""))
+    if action == MCP_CALL_ACTION:
+        return tool_mcp_call(index, cfg, step.get("server", ""),
+                             step.get("tool", ""), step.get("arguments", ""))
     if action == "serve":
         return tool_serve(index, cfg, step.get("symbol", ""),
                           step.get("command", ""), step.get("file", ""))

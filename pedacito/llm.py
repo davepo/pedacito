@@ -30,6 +30,7 @@ Only dependency is `requests`.
 from __future__ import annotations
 
 import base64
+import ipaddress
 import json
 import os
 import random
@@ -447,6 +448,84 @@ def _deny_json_cap(base_url: str, model: str, tier: str) -> None:
         _JSON_CAPS.setdefault(
             _json_cap_key(base_url, model),
             {"schema": True, "object": True})[tier] = False
+
+
+# Sprint R: local-inference payload acceleration. `cache_prompt` tells a
+# llama.cpp-style server to keep the prompt's KV prefix resident between the
+# step calls that replay an almost identical long gathering context, and
+# `prompt_lookup_num_tokens` switches on n-gram speculative decoding. Both are
+# top-level extension keys that only self-hosted endpoints understand; a 400/422
+# arriving with one of them attached flips that capability off for
+# (base_url, model) for the rest of the process and the request is re-sent
+# without it (same learn-from-live-traffic shape as _JSON_CAPS above).
+_ACCEL_CAPS: dict[tuple[str, str], dict[str, bool]] = {}
+_ACCEL_CAPS_LOCK = threading.Lock()
+
+# The two extension keys, and the capability name each one maps to.
+_ACCEL_CACHE_KEY = "cache_prompt"
+_ACCEL_LOOKUP_KEY = "prompt_lookup_num_tokens"
+
+
+def _accel_cap_key(base_url: str, model: str) -> tuple[str, str]:
+    return (base_url.rstrip("/"), model)
+
+
+def _accel_caps(base_url: str, model: str) -> dict[str, bool]:
+    """The mutable {cache: bool, lookup: bool} capability table for an endpoint."""
+    with _ACCEL_CAPS_LOCK:
+        return _ACCEL_CAPS.setdefault(
+            _accel_cap_key(base_url, model), {"cache": True, "lookup": True})
+
+
+def _deny_accel_cap(base_url: str, model: str, cap: str) -> None:
+    """Remember that this endpoint refused one acceleration key."""
+    with _ACCEL_CAPS_LOCK:
+        _ACCEL_CAPS.setdefault(
+            _accel_cap_key(base_url, model),
+            {"cache": True, "lookup": True})[cap] = False
+
+
+# Real self-host ranges: RFC1918 plus carrier-grade NAT (a homelab behind a
+# CGNAT gateway is still the user's box), and IPv6 unique-local addresses.
+_LAN_V4_NETS = tuple(ipaddress.ip_network(n) for n in
+                    ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16",
+                     "100.64.0.0/10"))
+_LAN_V6_NETS = (ipaddress.ip_network("fc00::/7"),)
+
+
+def _is_local_server(cfg) -> bool:
+    """True for endpoints the user self-hosts, where the acceleration keys make
+    sense: loopback or private-LAN addresses (the inverse of `_is_remote`, which
+    only knows the loopback spellings, plus RFC1918/carve-out ranges), or a
+    provider table entry that names a local runtime."""
+    try:
+        host = (urlparse(cfg.base_url).hostname or "").lower()
+    except ValueError:
+        return False
+    if host.endswith(".local"):        # mDNS names, the usual LAN spelling
+        return True
+    if host in ("localhost", "127.0.0.1", "0.0.0.0", "::1", ""):
+        return True
+    try:
+        addr = ipaddress.ip_address(host)
+    except ValueError:
+        pass
+    else:
+        # Real self-host ranges: RFC1918 plus carrier-grade NAT (a homelab
+        # behind a CGNAT gateway is still the user's box), loopback spellings,
+        # link-local, and IPv6 unique-local. `is_private` alone is too broad:
+        # the IANA carve-outs (203.0.113/24, 198.51.100/24, 192.0.2/24, ...)
+        # read as "private" to the stdlib but route nowhere a user self-hosts.
+        nets = (_LAN_V4_NETS if addr.version == 4 else _LAN_V6_NETS)
+        if addr.is_loopback or addr.is_link_local \
+                or any(addr in net for net in nets):
+            return True
+        # A numeric address outside every LAN range is only local if the
+        # user's provider entry says so: choosing "llamacpp" for a tunneled
+        # box is an explicit statement that the endpoint is self-hosted.
+    name = str(getattr(cfg, "provider", "") or "").lower().replace("_", "")
+    return any(w in name for w in ("local", "llamacpp", "llama.cpp", "lemond",
+                                   "vllm", "lmstudio", "ollama"))
 
 
 def _schema_example(schema: dict) -> str:
@@ -1668,6 +1747,7 @@ class LLMClient:
                                     self.cfg.model).cache_key_ok \
                     and _is_remote(self.cfg.base_url):
                 payload["prompt_cache_key"] = key
+        self._apply_acceleration(payload)
 
         prompt_est = estimate_messages(msgs, self.estimate_tokens)
         # Explicit prompt-cache markers go on AFTER the estimate and after the
@@ -1702,6 +1782,9 @@ class LLMClient:
                     return self._chat_once(messages, max_tokens, schema, stream,
                                            disable_thinking, json_schema)
                 if self._downgrade_response_format(payload, e):
+                    return self._chat_once(messages, max_tokens, schema, stream,
+                                           disable_thinking, json_schema)
+                if self._deny_accel_caps(payload, e):
                     return self._chat_once(messages, max_tokens, schema, stream,
                                            disable_thinking, json_schema)
                 raise
@@ -1745,6 +1828,9 @@ class LLMClient:
                 return self._chat_once(messages, max_tokens, schema, stream,
                                        disable_thinking, json_schema)
             if self._downgrade_response_format(payload, e):
+                return self._chat_once(messages, max_tokens, schema, stream,
+                                       disable_thinking, json_schema)
+            if self._deny_accel_caps(payload, e):
                 return self._chat_once(messages, max_tokens, schema, stream,
                                        disable_thinking, json_schema)
             low = str(e).lower()
@@ -1899,6 +1985,56 @@ class LLMClient:
         else:
             print("[engine JSON mode: this server refused json_object; "
                   "retrying with plain JSON prompting]", file=sys.stderr)
+        return True
+
+    def _apply_acceleration(self, payload: dict) -> None:
+        """Attach the Sprint R local-inference speed-up keys when this endpoint
+        is self-hosted, the settings ask for them, and a previous call has not
+        already seen this server refuse them. Keys a `[sampler]` table set by
+        hand win: the user's own spelling is left untouched."""
+        if not _is_local_server(self.cfg):
+            return
+        caps = _accel_caps(self.cfg.base_url, self.cfg.model)
+        if getattr(self.cfg, "enable_prompt_cache", True) \
+                and caps.get("cache", True) \
+                and _ACCEL_CACHE_KEY not in payload:
+            payload[_ACCEL_CACHE_KEY] = True
+        if getattr(self.cfg, "enable_prompt_lookup", False) \
+                and caps.get("lookup", True) \
+                and _ACCEL_LOOKUP_KEY not in payload:
+            n = getattr(self.cfg, "prompt_lookup_num_tokens", 10)
+            try:
+                n = int(n)
+            except (TypeError, ValueError):
+                n = 0
+            if n > 0:
+                payload[_ACCEL_LOOKUP_KEY] = n
+
+    def _deny_accel_caps(self, payload: dict, err: Exception) -> bool:
+        """Handle a status rejection that may be caused by the acceleration
+        keys: flip the attached-but-unproven ones off for this (base_url,
+        model) and report that the caller should re-send without them. Only
+        fires on 400/422 (an endpoint validating its request schema) while the
+        payload still carries at least one acceleration key this cache has not
+        yet refused; a second rejection of the same keys is a genuine error,
+        which keeps a server that 400s for an unrelated reason from looping."""
+        attached = [k for k in (_ACCEL_CACHE_KEY, _ACCEL_LOOKUP_KEY)
+                    if k in payload]
+        if not attached:
+            return False
+        low = str(err).lower()
+        if not any(low.startswith(f"server returned {code}")
+                   for code in ("400", "422")):
+            return False
+        caps = _accel_caps(self.cfg.base_url, self.cfg.model)
+        names = {_ACCEL_CACHE_KEY: "cache", _ACCEL_LOOKUP_KEY: "lookup"}
+        fresh = [k for k in attached if caps.get(names[k], True)]
+        if not fresh:
+            return False
+        for k in fresh:
+            _deny_accel_cap(self.cfg.base_url, self.cfg.model, names[k])
+        print(f"[local acceleration: this server refused "
+              f"{', '.join(fresh)}; retrying without it]", file=sys.stderr)
         return True
 
     def _apply_cache_markers(self, msgs: list[dict]) -> bool:

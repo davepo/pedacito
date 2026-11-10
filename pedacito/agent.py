@@ -61,7 +61,7 @@ from . import todo as todo_mod
 from .config import is_hosted
 from .edits import Result, apply_edits, locate, malformed_blocks, parse_edits
 from .llm import LLMError, estimate_messages, estimate_tokens
-from .tools import TOOL_HELP, dispatch, schema_for
+from .tools import TOOL_HELP, dispatch, mcp_injection, schema_for
 
 # Re-asks after a gather step reply dies at the output cap or has no salvageable
 # JSON, before giving up and answering from what was gathered.
@@ -89,7 +89,7 @@ _CACHEABLE_ACTIONS = {"grep", "find", "outline", "usages", "callers",
 # Steps that can change what the cacheable ones return.
 _MUTATING = {"write", "append", "move", "delete", "undo", "rename",
              "rename_symbol", "run",
-             "run_test", "browser", "screenshot", "mcp", "task"}
+             "run_test", "browser", "screenshot", "mcp", "mcp_call", "task"}
 
 # Steps discarded for a cut-off payload before gather gives up.
 _MAX_PAYLOAD_CUTS = 2
@@ -1799,10 +1799,14 @@ class Agent:
                 system += "\n\n" + skill_notes
         if todo_notes:
             system += "\n\n" + todo_notes
-        if getattr(self.cfg, "allow_mcp", False):
-            mcp_notes = mcp_mod.render(self.cfg)
-            if mcp_notes:
-                system += "\n\n" + mcp_notes
+        mcp_notes = (mcp_mod.render(self.cfg)
+                     if getattr(self.cfg, "allow_mcp", False) else "")
+        # Named-server path (Sprint R): only the handful of the servers'
+        # tools that match THIS task, each a compact one-line signature.
+        named_notes = mcp_injection(self.cfg)
+        mcp_notes = "\n\n".join(x for x in (mcp_notes, named_notes) if x)
+        if mcp_notes:
+            system += "\n\n" + mcp_notes
         if verbose:
             print(f"  [map: {tier}, ~{estimate_tokens(repo_map)} tokens, "
                   f"{len(self.index.files)} files]", file=sys.stderr)
@@ -3596,10 +3600,12 @@ class Agent:
             notes_prefix += lesson_notes + "\n\n"
         if todo_notes:
             notes_prefix += todo_notes + "\n\n"
-        if getattr(self.cfg, "allow_mcp", False):
-            mcp_notes = mcp_mod.render(self.cfg)
-            if mcp_notes:
-                notes_prefix += mcp_notes + "\n\n"
+        mcp_notes = (mcp_mod.render(self.cfg)
+                     if getattr(self.cfg, "allow_mcp", False) else "")
+        named_notes = mcp_injection(self.cfg)
+        mcp_notes = "\n\n".join(x for x in (mcp_notes, named_notes) if x)
+        if mcp_notes:
+            notes_prefix += mcp_notes + "\n\n"
         src = gathered or "(nothing was looked up)"
         need_hint = _NEED_HINT if self._rehydration_rounds_left() else ""
 

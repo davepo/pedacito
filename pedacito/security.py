@@ -50,6 +50,7 @@ from urllib.parse import urlparse
 
 __all__ = [
     "CATEGORY_LABELS",
+    "CAT_MCP_TOOL",
     "CAT_PACKAGE_INSTALL",
     "CAT_SENSITIVE_FILE",
     "CAT_SHELL",
@@ -57,6 +58,7 @@ __all__ = [
     "CAT_WEB",
     "CAT_WEB_ACCESS",
     "DENIED_MESSAGE",
+    "MCP_DENIED_MESSAGE",
     "SecurityError",
     "install_permission_hook",
     "is_install_command",
@@ -280,6 +282,7 @@ CAT_PACKAGE_INSTALL = "package_install"
 CAT_SHELL = "shell"
 CAT_SENSITIVE_FILE = "sensitive_file"
 CAT_TEST_EXECUTION = "test_execution"
+CAT_MCP_TOOL = "mcp_tool"
 
 CATEGORY_LABELS = {
     CAT_WEB: "Web Access",
@@ -288,6 +291,7 @@ CATEGORY_LABELS = {
     CAT_SHELL: "Shell Command",
     CAT_SENSITIVE_FILE: "Sensitive File Read",
     CAT_TEST_EXECUTION: "Test Execution",
+    CAT_MCP_TOOL: "MCP Tool",
 }
 
 # The exact text a gated tool returns when the human says no (or nobody is
@@ -296,6 +300,11 @@ CATEGORY_LABELS = {
 DENIED_MESSAGE = ("[PERMISSION DENIED BY USER: Do not retry this action. "
                   "Proceed using local project files and standard library "
                   "only.]")
+
+# The MCP variant: the decline steers back to the repository tools, not the
+# standard library (the declined thing was an external tool call anyway).
+MCP_DENIED_MESSAGE = ("[PERMISSION DENIED BY USER: MCP tool execution was "
+                      "declined. Proceed using local repository tools only.]")
 
 _hook = None
 _hook_lock = threading.Lock()

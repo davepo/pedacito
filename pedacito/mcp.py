@@ -20,6 +20,14 @@ or desynced session is dropped and the call retried once on a fresh server;
 `close_all()` (registered with atexit) reaps every session when the process
 ends, so no orphan server outlives the run. The catalog listing still uses
 one throwaway session per server, since it is fetched at most once.
+
+Sprint R adds a second, pruned path: named `[mcp_servers.<name>]` tables
+(command + args for a stdio server, or url for a Streamable HTTP one, plus
+env/enabled/trusted). `list_mcp_tools` returns descriptors,
+`call_mcp_tool` invokes one named tool and caps the result at
+`cfg.max_read_tokens` tokens, and the tools layer injects only the handful of
+tools that match the current task (`relevant_tools`), asking the permission
+broker first for servers not marked `trusted`. Everything here is stdlib only.
 """
 
 from __future__ import annotations
@@ -28,10 +36,13 @@ import atexit
 import json
 import os
 import queue
+import re
 import shlex
 import subprocess
 import threading
 import time
+import urllib.error
+import urllib.request
 from pathlib import Path
 
 from . import proc
@@ -96,15 +107,23 @@ def _split_command(cmd: str) -> list[str]:
 
 
 class _Session:
-    def __init__(self, command: str, timeout: int = 30):
+    def __init__(self, command: str, timeout: int = 30, *, argv=None,
+                 env: dict | None = None):
         self.command = command
         self.timeout = max(1, timeout)
         self._q: queue.Queue = queue.Queue()
         kwargs = {}
         if os.name != "nt":
             kwargs["start_new_session"] = True
+        if env:
+            child = dict(os.environ)
+            for k, v in env.items():
+                if str(k):
+                    child[str(k)] = str(v)
+            kwargs["env"] = child
         self.proc = subprocess.Popen(
-            _split_command(command), stdin=subprocess.PIPE,
+            list(argv) if argv else _split_command(command),
+            stdin=subprocess.PIPE,
             stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
             text=True, encoding="utf-8", errors="replace", bufsize=1,
             **kwargs)
@@ -232,6 +251,11 @@ def close_all() -> None:
     _COOLDOWN.clear()
     _EXTRA_CACHE.clear()
     _EXTRA_TIME.clear()
+    # Named (Sprint R) sessions and their tool listings.
+    for name in list(_NAMED_SESSIONS):
+        _drop_named_session(name)
+    _NAMED_TOOLS.clear()
+    _NAMED_TOOLS_TIME.clear()
 
 
 atexit.register(close_all)
@@ -240,8 +264,12 @@ atexit.register(close_all)
 def _servers(cfg) -> tuple[str, ...]:
     if not getattr(cfg, "allow_mcp", False):
         return ()
-    return tuple(str(c) for c in (getattr(cfg, "mcp_servers", ()) or ())
-                 if str(c).strip())
+    raw = getattr(cfg, "mcp_servers", ()) or ()
+    if isinstance(raw, dict):
+        # Named [mcp_servers.<name>] tables belong to the pruned `mcp_call`
+        # path (named_servers / list_mcp_tools), not the legacy catalog.
+        return ()
+    return tuple(str(c) for c in raw if str(c).strip())
 
 
 def catalog(cfg) -> list[tuple[str, str, str]]:
@@ -614,6 +642,332 @@ def call(cfg, target: str, args: dict | None = None) -> str:
     cap = max(500, int(getattr(cfg, "max_shell_output_chars", 8000) or 8000))
     if len(text) > cap:
         text = text[:cap] + f"\n[MCP result truncated at {cap} chars]"
+    if result.get("isError"):
+        return "ERROR: MCP tool reported failure:\n" + (text or "(no detail)")
+    return text or "(MCP tool returned no text content)"
+
+
+# ---------------------------------------------------------------------------
+# Sprint R: named servers, pruned injection, permission-gated calls
+# ---------------------------------------------------------------------------
+# The legacy path above exposes EVERY tool of EVERY server to the model at
+# once. The named-table path instead lists each configured server's tools
+# with a short (5s) budget, caches the listing for the session, and hands
+# the prompt layer a relevance filter so only the few tools matching the
+# current task are ever shown. A call runs through the same JSON-RPC plumbing
+# but routes by server name, and the result is capped at `max_read_tokens`
+# tokens so one verbose server cannot flood the gather context.
+
+_NAMED_SESSIONS: dict[str, "_Session | _HttpSession"] = {}
+_NAMED_TOOLS: dict[str, list[dict]] = {}
+_NAMED_TOOLS_TIME: dict[str, float] = {}
+_NAMED_LIST_TIMEOUT = 5.0      # seconds per server for a tools/list listing
+
+
+def named_servers(cfg) -> dict[str, dict]:
+    """{name: spec} for the `[mcp_servers.<name>]` table format. Returns {}
+    for the legacy list-of-commands format, for `enable_mcp = false`, and for
+    entries that are disabled or name no transport. Each spec is normalized to
+    command/args/url/env/enabled/trusted with defaults applied."""
+    if not getattr(cfg, "enable_mcp", True):
+        return {}
+    raw = getattr(cfg, "mcp_servers", None)
+    if not isinstance(raw, dict):
+        return {}
+    out: dict[str, dict] = {}
+    for name, body in raw.items():
+        if not isinstance(body, dict) or not str(name).strip():
+            continue
+        if not bool(body.get("enabled", True)):
+            continue
+        command = str(body.get("command") or "").strip()
+        url = str(body.get("url") or "").strip()
+        if not command and not url:
+            continue
+        args = body.get("args")
+        if isinstance(args, (list, tuple)):
+            args = [str(a) for a in args]
+        elif isinstance(args, str) and args.strip():
+            args = _split_command(args)
+        else:
+            args = []
+        env = body.get("env")
+        out[str(name)] = {
+            "command": command,
+            "args": args,
+            "url": url,
+            "env": dict(env) if isinstance(env, dict) else {},
+            "enabled": True,
+            "trusted": bool(body.get("trusted", False)),
+        }
+    return out
+
+
+class _HttpSession:
+    """MCP Streamable HTTP client on stdlib urllib: one JSON-RPC message per
+    POST, the server's `Mcp-Session-Id` echoed back on every later request,
+    and an SSE body reduced to the message carrying our request id."""
+
+    def __init__(self, url: str, timeout: int = 30, env: dict | None = None):
+        self.url = url
+        self.timeout = max(1, timeout)
+        self.env = env or {}
+        self._next_id = 1
+        self.session_id = ""
+
+    def _post(self, obj: dict, want_reply: bool):
+        headers = {"Content-Type": "application/json",
+                   "Accept": "application/json, text/event-stream"}
+        if self.session_id:
+            headers["Mcp-Session-Id"] = self.session_id
+        # A server table's env is the natural place for an auth token; the two
+        # conventional spellings become headers, everything else is ignored.
+        for k, v in self.env.items():
+            key = str(k)
+            if key.lower() in ("authorization", "x_api_key", "x-api-key"):
+                headers[key.replace("_", "-")] = str(v)
+        data = json.dumps(obj).encode("utf-8")
+        req = urllib.request.Request(self.url, data=data, headers=headers,
+                                     method="POST")
+        try:
+            with urllib.request.urlopen(req, timeout=self.timeout) as r:
+                raw = r.read().decode("utf-8", "replace")
+                sid = r.headers.get("Mcp-Session-Id") or ""
+                ctype = r.headers.get("Content-Type") or ""
+        except urllib.error.HTTPError as e:
+            detail = ""
+            try:
+                detail = e.read().decode("utf-8", "replace")[:300]
+            except Exception:
+                pass
+            raise MCPError(f"HTTP {e.code}: {detail or e.reason}") from e
+        except (urllib.error.URLError, OSError) as e:
+            raise MCPError(f"HTTP MCP server unreachable: {str(e)[:200]}") from e
+        if sid:
+            self.session_id = sid
+        if not want_reply:
+            return {}
+        return self._pick_reply(raw, ctype, obj.get("id"))
+
+    @staticmethod
+    def _pick_reply(raw: str, ctype: str, rid) -> dict:
+        if "text/event-stream" in ctype or raw.lstrip().startswith("event:"):
+            for line in raw.splitlines():
+                if not line.startswith("data:"):
+                    continue
+                try:
+                    msg = json.loads(line[5:].strip())
+                except ValueError:
+                    continue
+                if (isinstance(msg, dict) and msg.get("id") == rid
+                        and "method" not in msg):
+                    if "error" in msg:
+                        raise MCPError(str(msg["error"])[:400])
+                    return msg.get("result") or {}
+            raise MCPError("no matching reply in the SSE stream")
+        try:
+            msg = json.loads(raw or "{}")
+        except ValueError as e:
+            raise MCPError(f"malformed JSON reply: {str(e)[:200]}") from e
+        if not isinstance(msg, dict):
+            raise MCPError("unexpected JSON reply shape")
+        if "error" in msg:
+            raise MCPError(str(msg["error"])[:400])
+        return msg.get("result") or {}
+
+    def request(self, method: str, params: dict | None = None) -> dict:
+        rid = self._next_id
+        self._next_id += 1
+        return self._post({"jsonrpc": "2.0", "id": rid, "method": method,
+                           "params": params or {}}, want_reply=True)
+
+    def notify(self, method: str):
+        try:
+            self._post({"jsonrpc": "2.0", "method": method}, want_reply=False)
+        except MCPError:
+            pass       # notifications legitimately reply 202-empty
+
+    def initialize(self):
+        self.request("initialize", {
+            "protocolVersion": PROTOCOL_VERSION,
+            "capabilities": {},
+            "clientInfo": {"name": "pedacito", "version": "0.1"},
+        })
+        self.notify("notifications/initialized")
+
+    def close(self):
+        pass
+
+
+def _named_session_key(name: str, spec: dict) -> str:
+    """Identity of a server definition: changing command/args/url restarts the
+    cached session instead of reusing a stale one."""
+    return json.dumps([name, spec.get("command", ""), spec.get("args", []),
+                       spec.get("url", ""),
+                       sorted((str(k), str(v))
+                               for k, v in (spec.get("env") or {}).items())],
+                      sort_keys=True)
+
+
+def _named_session(name: str, spec: dict, timeout: int):
+    """The cached initialised session for one named server (stdio process or
+    HTTP endpoint), restarted when the cached process has exited."""
+    s = _NAMED_SESSIONS.get(name)
+    if s is not None:
+        if isinstance(s, _Session) and s.proc.poll() is not None:
+            s.close()
+            _NAMED_SESSIONS.pop(name, None)
+        else:
+            return s
+    if spec.get("url"):
+        s = _HttpSession(spec["url"], timeout, spec.get("env"))
+    else:
+        argv = [spec["command"], *spec.get("args", [])]
+        s = _Session(f"mcp:{name}", timeout, argv=argv, env=spec.get("env"))
+    try:
+        s.initialize()
+    except Exception:
+        s.close()
+        raise
+    _NAMED_SESSIONS[name] = s
+    return s
+
+
+def _drop_named_session(name: str) -> None:
+    """Close and forget one named server's session after a failure."""
+    s = _NAMED_SESSIONS.pop(name, None)
+    if s is not None:
+        s.close()
+
+
+def _named_tools(cfg, name: str, spec: dict) -> list[dict]:
+    """One server's tool listing [{name, description, input_schema}], cached
+    for the session; a down or slow server contributes nothing and is retried
+    after the same cool-down window as the legacy catalog."""
+    cached = _NAMED_TOOLS.get(name)
+    if cached is not None:
+        if cached or time.time() - _NAMED_TOOLS_TIME.get(name, 0.0) \
+                < _RETRY_UNAVAILABLE_AFTER:
+            return cached
+        _NAMED_TOOLS.pop(name, None)
+    out: list[dict] = []
+    try:
+        s = _named_session(name, spec, int(_NAMED_LIST_TIMEOUT))
+        result = s.request("tools/list")
+    except Exception:
+        _drop_named_session(name)
+        _NAMED_TOOLS[name] = []
+        _NAMED_TOOLS_TIME[name] = time.time()
+        return []
+    for tool in result.get("tools") or []:
+        if not isinstance(tool, dict):
+            continue
+        tname = str(tool.get("name") or "").strip()
+        if not tname:
+            continue
+        schema = tool.get("inputSchema")
+        out.append({"name": tname,
+                    "description": str(tool.get("description") or "").strip(),
+                    "input_schema": schema if isinstance(schema, dict) else {}})
+    _NAMED_TOOLS[name] = out
+    _NAMED_TOOLS_TIME[name] = time.time()
+    return out
+
+
+def list_mcp_tools(cfg) -> list[dict]:
+    """Descriptors {server, name, description, input_schema, trusted} for every
+    enabled named server. Tool listings run with a 5s budget per server and
+    are cached for the session; an unreachable server lists nothing."""
+    out: list[dict] = []
+    for name, spec in named_servers(cfg).items():
+        trusted = bool(spec.get("trusted"))
+        for tool in _named_tools(cfg, name, spec):
+            out.append({"server": name, "name": tool["name"],
+                        "description": tool["description"],
+                        "input_schema": tool["input_schema"],
+                        "trusted": trusted})
+    return out
+
+
+def relevant_tools(descriptors: list[dict], task: str,
+                   limit: int = 4) -> list[dict]:
+    """The few injected descriptors whose server/tool/description words
+    appear in the task text, most matches first; ties keep listing order. An
+    empty task or no matches returns nothing: the point of the prune is that
+    the model never sees a tool the task cannot need."""
+    words = {w for w in re.findall(r"[a-z0-9_]{4,}", (task or "").lower())}
+    if not words:
+        return []
+    scored: list[tuple[int, int, dict]] = []
+    for i, d in enumerate(descriptors):
+        hay = " ".join((str(d.get("server", "")), str(d.get("name", "")),
+                        str(d.get("description", "")))).lower()
+        toks = set(re.findall(r"[a-z0-9_]+", hay))
+        score = len(words & toks)
+        if score:
+            scored.append((-score, i, d))
+    scored.sort()
+    return [d for _, _, d in scored[:limit]]
+
+
+def compact_line(d: dict) -> str:
+    """One prompt line for an injected tool: `server.name(args) -- summary`."""
+    sig = signature(json.dumps(d.get("input_schema") or {}))
+    desc = re.sub(r"\s+", " ", str(d.get("description") or ""))[:120]
+    return f"  {d['server']}.{d['name']}{sig} -- {desc}"
+
+
+def call_mcp_tool(cfg, server_name: str, tool_name: str,
+                  arguments: dict | None = None,
+                  timeout: float = 15) -> str:
+    """Invoke one named server's tool and return its text result, capped at
+    roughly `cfg.max_read_tokens` tokens. The tool must be one the server
+    actually lists (the listing doubles as the argument check), a dead session
+    is restarted and the call retried once, and every failure comes back as an
+    ERROR string instead of an exception."""
+    servers = named_servers(cfg)
+    spec = servers.get((server_name or "").strip())
+    if spec is None:
+        return (f"ERROR: MCP server '{server_name}' is not configured "
+                "(check [mcp_servers.<name>] and enable_mcp).")
+    name = server_name.strip()
+    tools = {t["name"]: t for t in _named_tools(cfg, name, spec)}
+    tname = (tool_name or "").strip()
+    if not tname:
+        return (f"MCP tools on '{name}': "
+                + (", ".join(tools) if tools else "(none listed)"))
+    if tname not in tools:
+        return (f"ERROR: unknown MCP tool '{name}.{tname}'. Available: "
+                + (", ".join(tools) if tools else "(none listed)"))
+    args = arguments if isinstance(arguments, dict) else {}
+    bad = validate_args(json.dumps(tools[tname].get("input_schema") or {}),
+                        args)
+    if bad:
+        return bad
+    params = {"name": tname, "arguments": args}
+    result: dict = {}
+    t = max(1, int(timeout))
+    for attempt in (1, 2):
+        try:
+            s = _named_session(name, spec, t)
+            result = s.request("tools/call", params)
+            break
+        except Exception as e:
+            _drop_named_session(name)
+            if attempt == 2:
+                return f"ERROR: MCP call failed: {str(e)[:400]}"
+    bits = []
+    for item in result.get("content") or []:
+        if isinstance(item, dict) and item.get("type") == "text":
+            bits.append(str(item.get("text") or ""))
+        elif isinstance(item, dict):
+            bits.append(json.dumps(item, ensure_ascii=True)[:2000])
+    text = "\n".join(b for b in bits if b).strip()
+    tokens = max(200, int(getattr(cfg, "max_read_tokens", 1200) or 1200))
+    cap = int(tokens * 3.5)      # chars per token, as in the other tool caps
+    if len(text) > cap:
+        text = text[:cap] + (f"\n[MCP result capped at about {tokens} tokens;"
+                             f" {len(text) - cap} more characters dropped]")
     if result.get("isError"):
         return "ERROR: MCP tool reported failure:\n" + (text or "(no detail)")
     return text or "(MCP tool returned no text content)"

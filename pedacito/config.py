@@ -295,8 +295,15 @@ class Config:
     auto_allowlist: bool = False
     # Optional MCP client: exposes one `mcp` action plus a short tool catalog.
     allow_mcp: bool = False
-    mcp_servers: tuple[str, ...] = ()
+    # Server definitions, two formats: a list of legacy command strings (each
+    # one stdio server, used by the `mcp` action's catalog), or named
+    # [mcp_servers.<name>] tables carrying command/args (stdio) or url (HTTP),
+    # plus env, enabled (default true) and trusted (default false). The named
+    # tables feed the pruned, permission-gated `mcp_call` action.
+    mcp_servers: dict = field(default_factory=dict)
     mcp_timeout: int = 30
+    # Gate for the named-server `mcp_call` path, independent of allow_mcp.
+    enable_mcp: bool = True
     # Optional LSP: exact definition/references/hover/diagnostics through a
     # language server on PATH (or `lsp_servers` per extension). Off by default:
     # a server can use significant RAM and is another external process.
@@ -582,6 +589,17 @@ class Config:
     # Explicit-mode cache TTL: "5m" or "1h" (the provider must support it;
     # otherwise it is ignored with a one-time notice).
     prompt_cache_ttl: str = "5m"
+    # Local inference acceleration: `enable_prompt_cache` adds llama.cpp's
+    # `cache_prompt` so the KV prefix of the replayed gather context stays
+    # resident between steps; `enable_prompt_lookup` adds
+    # `prompt_lookup_num_tokens` to switch on n-gram speculative decoding.
+    # Both keys only reach self-hosted endpoints (loopback, private LAN, or a
+    # local runtime provider name), and an endpoint that answers 400/422 with
+    # one attached is downgraded on the spot and remembered per (base_url,
+    # model), the same way engine JSON mode learns response_format support.
+    enable_prompt_cache: bool = True
+    enable_prompt_lookup: bool = False
+    prompt_lookup_num_tokens: int = 10
     # Circuit breaker for repeated transport/server failures. After
     # `circuit_failures` consecutive failures (timeouts, dropped streams, 5xx;
     # not rate limits, context overflows, or 4xx requests) calls fail fast for
@@ -774,9 +792,11 @@ _SECTIONS = ("universal", "server", "lmstudio", "hardware", "generation",
 PROFILE_SECTION = "profiles"
 
 # Settings whose value is itself a table (never treated as a [section]), and
-# settings that are lists of strings (stored as tuples).
-_TABLE_FIELDS = ("sampler", "roles", "hooks", "lsp_servers")
-_TUPLE_FIELDS = ("extra_extensions", "shell_allowlist", "mcp_servers",
+# settings that are lists of strings (stored as tuples). `mcp_servers` is a
+# table when it uses the named [mcp_servers.<name>] format and a tuple when it
+# uses the legacy list-of-command-strings format, so it is coerced specially.
+_TABLE_FIELDS = ("sampler", "roles", "hooks", "lsp_servers", "mcp_servers")
+_TUPLE_FIELDS = ("extra_extensions", "shell_allowlist",
                  "env_passthrough", "protected_paths", "shell_deny",
                  "browser_eval_hosts", "fetch_allowed_hosts",
                  "sandbox_writable")
@@ -985,6 +1005,23 @@ def _coerce(name: str, value, path: Path | None = None):
                 f"{where}{name} should be a non-negative number (leave it out "
                 f"to use the global value), got {value!r}")
         return float(value)
+    if name == "mcp_servers":
+        # Two accepted formats: the legacy list of stdio command strings (kept
+        # as a tuple, so the `mcp` action's catalog path is unchanged), or the
+        # named [mcp_servers.<name>] server tables (kept as a dict of dicts).
+        if isinstance(value, dict):
+            out: dict = {}
+            for k, v in value.items():
+                if not isinstance(v, dict):
+                    raise ConfigError(
+                        f"{where}[mcp_servers.{k}] must be a table with "
+                        "command/args (stdio) or url (HTTP) keys")
+                out[str(k)] = dict(v)
+            return out
+        if isinstance(value, (list, tuple)):
+            return tuple(str(v) for v in value)
+        raise ConfigError(f"{where}{name} must be a list of command strings "
+                          "or [mcp_servers.<name>] tables")
     if name in _TUPLE_FIELDS:
         if not isinstance(value, (list, tuple)):
             example = ('["pytest", "python"]' if name == "shell_allowlist"
@@ -1810,6 +1847,23 @@ def _parse_env(name: str, raw: str):
         except ValueError as e:
             raise ConfigError(f"PEDACITO_{name.upper()}={raw!r} is not a valid "
                               "number (or 'auto')") from e
+    if name == "mcp_servers":
+        # PEDACITO_MCP_SERVERS: a JSON object of named server tables, or the
+        # legacy comma-separated list of stdio command strings.
+        text = raw.strip()
+        if text.startswith("{"):
+            try:
+                obj = json.loads(text)
+            except ValueError as e:
+                raise ConfigError(
+                    f"PEDACITO_MCP_SERVERS={raw!r} is not valid JSON: {e}") from e
+            if not isinstance(obj, dict):
+                raise ConfigError(
+                    f"PEDACITO_MCP_SERVERS={raw!r} must be a JSON object of "
+                    'named server tables, e.g. \'{"docs": {"command": '
+                    '"python", "args": ["server.py"]}}\'')
+            return obj
+        return tuple(x.strip() for x in raw.split(",") if x.strip())
     if name in _TUPLE_FIELDS:
         return tuple(x.strip() for x in raw.split(",") if x.strip())
     if name in ("k_cache_quant", "v_cache_quant"):
@@ -2098,6 +2152,14 @@ temperature = 0.2
 # sampler = { top_p = 0.95, top_k = 40, min_p = 0.05, repeat_penalty = 1.1 }
 disable_thinking = false
 thinking_suffix = ""
+# Local inference acceleration (self-hosted endpoints only; hosted servers
+# never see these keys). cache_prompt keeps the KV prefix of the replayed
+# gather context warm between steps; the lookup pair switches on n-gram
+# speculative decoding. An endpoint that answers 400/422 with either key
+# attached is downgraded on the spot and remembered per endpoint.
+enable_prompt_cache = true
+enable_prompt_lookup = false
+prompt_lookup_num_tokens = 10
 circuit_breaker = true
 circuit_failures = 4
 circuit_cooldown = 60.0
@@ -2210,8 +2272,18 @@ auto_allowlist = false
 diagnostics_timeout = 90
 max_diagnostics_chars = 8000
 allow_mcp = false
+# Legacy format: a list of stdio command strings for the `mcp` catalog action.
 mcp_servers = []
 mcp_timeout = 30
+# Named MCP servers (`mcp_call`, gated by enable_mcp): [mcp_servers.<name>]
+# tables with command + args (stdio) or url (HTTP), optional env, enabled
+# (default true) and trusted (default false; untrusted calls ask first).
+# enable_mcp = true
+# [mcp_servers.docs]
+# command = "python"
+# args = ["/path/to/server.py"]
+# env = {}
+# trusted = false
 allow_lsp = false
 # lsp_servers = { ".py" = "pyright-langserver --stdio" }
 lsp_timeout = 10.0
@@ -2382,7 +2454,12 @@ REFERENCE_TEMPLATE = TEMPLATE + '''
 # edited/moved/deleted if the task title names it or the lookup phase read it;
 # new files are always allowed. Off by default.
 # allow_mcp exposes one `mcp` action and a short tool catalog; mcp_servers is
-# a list of command strings such as ["python server.py"].
+# a list of command strings such as ["python server.py"]. Named
+# [mcp_servers.<name>] tables (command/args for stdio, url for HTTP, plus env,
+# enabled, trusted) instead feed the pruned `mcp_call` action: only the tools
+# that match the current task are listed to the model, and a server not marked
+# trusted goes through the permission broker before anything runs. enable_mcp
+# gates that path independently of allow_mcp.
 # allow_lsp exposes exact definition/references/hover/diagnostics through a
 # language server; lsp_servers maps extensions to commands, and PATH detection
 # covers pyright/pylsp/typescript-language-server/rust-analyzer/gopls.
@@ -2402,7 +2479,13 @@ REFERENCE_TEMPLATE = TEMPLATE + '''
 # rank_map orders the big-project map by relevance to the task; repo_brief adds
 # a deterministic stack/entry-point/commands block above the map.
 # stream_usage asks servers to report usage on streamed replies;
-# max_total_tokens / max_cost stop before the next call once spent, and
+# enable_prompt_cache adds llama.cpp's `cache_prompt` to requests sent to
+# self-hosted endpoints (the KV prefix of the replayed gather context stays
+# warm between steps) and enable_prompt_lookup adds
+# `prompt_lookup_num_tokens` for n-gram speculative decoding; a server that
+# answers 400/422 with either key attached is downgraded on the spot and
+# remembered per endpoint. max_total_tokens / max_cost stop before the next
+# call once spent, and
 # price_*_per_mtok (USD per million tokens) enable cost reporting.
 # summary_workers sets concurrent index summaries (0 = hosted 4, local 1);
 # refresh_summaries re-summarises that many changed units after each task;

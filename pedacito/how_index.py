@@ -816,6 +816,25 @@ CLI_COMMANDS = [
         ],
     },
     {
+        "name": "mcp",
+        "usage": "pedacito mcp [list]",
+        "summary": "List every tool the named MCP servers "
+                   "([mcp_servers.<name>] tables) expose, with the trust "
+                   "flag each call would ask about.",
+        "keywords": ["mcp", "model context protocol", "external tools",
+                     "mcp servers", "mcp tools"],
+        "examples": [
+            "pedacito mcp list",
+            "pedacito mcp list --root ~/projects/app",
+        ],
+        "flags": [
+            {"flag": "list", "help": "the only action (default)"},
+            {"flag": "--root DIR", "help": "project root"},
+            {"flag": "--config FILE", "help": "use this config file"},
+            {"flag": "--profile NAME", "help": "apply a profile block"},
+        ],
+    },
+    {
         "name": "memory",
         "usage": "pedacito memory PROJECT [--add TEXT | --forget TEXT]",
         "summary": "List, add or forget the facts Pedacito remembers about a "
@@ -1623,6 +1642,63 @@ GUI_TOPICS = [
         "cli": ["config"],
     },
     {
+        "id": "local-acceleration",
+        "title": "Speed up local servers: KV prompt cache and n-gram "
+                 "speculation (cache_prompt, prompt_lookup_num_tokens)",
+        "summary": "For self-hosted llama.cpp-style servers Pedacito adds "
+                   "cache_prompt to every request so the KV prefix of the "
+                   "replayed gather context stays warm between steps, and "
+                   "can switch on n-gram speculative decoding. A server "
+                   "that answers 400/422 with one of these keys is "
+                   "downgraded on the spot and remembered per model.",
+        "steps": [
+            "Nothing to click: cache_prompt is on by default for local "
+            "endpoints (loopback or a private network address)",
+            "⚙ Settings → All settings → Enable N-Gram Prompt Lookup "
+            "Speculation to also try prompt_lookup_num_tokens",
+            "⚙ Settings → All settings → Prompt Lookup Draft Tokens sets "
+            "the draft size (default 10)",
+            "Hosted APIs never receive these keys; no fallback config is "
+            "needed for them",
+        ],
+        "keywords": ["cache_prompt", "prompt lookup", "n-gram",
+                     "speculative decoding", "speculation", "kv cache",
+                     "local server speed", "llama.cpp", "lm studio",
+                     "ollama", "vllm", "faster gather", "prompt caching "
+                     "local"],
+        "settings": ["enable_prompt_cache", "enable_prompt_lookup",
+                     "prompt_lookup_num_tokens"],
+        "cli": ["config", "calibrate"],
+    },
+    {
+        "id": "named-mcp-servers",
+        "title": "Connect an MCP server and use its tools safely "
+                 "(mcp_call)",
+        "summary": "Named [mcp_servers.<name>] tables describe a stdio "
+                   "server (command + args) or a Streamable HTTP one (url). "
+                   "Gather shows the model only the tools matching the "
+                   "current task, and a server not marked trusted asks the "
+                   "permission broker before anything runs.",
+        "steps": [
+            "Add a table to the config: [mcp_servers.docs] with "
+            "command = \"python\" and args = [\"server.py\"] (or url = "
+            "\"http://localhost:8000/mcp\")",
+            "Set trusted = true only for a server you fully approve; "
+            "otherwise every call shows a permission dialog first",
+            "pedacito mcp list shows what each server exposes",
+            "In the GUI: the permission dialog arrives during the run; "
+            "GET /api/mcp/tools serves the same listing to the interface",
+            "The legacy allow_mcp + mcp_servers command list still works "
+            "for the old `mcp` catalog action",
+        ],
+        "keywords": ["mcp", "model context protocol", "external tool",
+                     "mcp server", "mcp_call", "mcp tools", "plugin",
+                     "connector", "stdio server", "http mcp"],
+        "settings": ["enable_mcp", "mcp_servers", "mcp_timeout",
+                     "allow_mcp"],
+        "cli": ["mcp", "trust", "config"],
+    },
+    {
         "id": "symbol-edits",
         "title": "Replace or add a whole function or class without retyping it",
         "summary": "An edit can name a definition, such as Order.total, and supply only "
@@ -1804,6 +1880,14 @@ _SETTING_KEYWORDS = {
     "keep_backups": ["retention", "old backups", "prune backups"],
     "keep_sessions": ["retention", "old sessions", "prune sessions"],
     "prompt_cache": ["prompt cache", "caching", "cache control"],
+    "enable_prompt_cache": ["cache_prompt", "kv cache", "local server "
+                            "cache", "llama.cpp cache", "faster local"],
+    "enable_prompt_lookup": ["prompt lookup", "n-gram", "speculative "
+                             "decoding", "speculation", "draft tokens"],
+    "prompt_lookup_num_tokens": ["lookup tokens", "draft tokens",
+                                 "speculation size"],
+    "enable_mcp": ["mcp", "model context protocol", "mcp_call",
+                   "external tools", "mcp servers"],
     "temperature": ["temperature", "sampling", "creativity"],
     "max_output_tokens": ["output limit", "reply cap", "hosted limit"],
     "context_tokens": ["context window", "window size", "context length"],

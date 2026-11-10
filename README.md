@@ -350,6 +350,85 @@ probes the active provider and reports the cache as *observed*, *not observed*,
 or *explicit-only* (DeepSeek-style caches persist asynchronously, so "not
 observed" is not "unsupported").
 
+## Local inference acceleration
+
+Hosted caching reuses a provider-side prefix; a self-hosted server can do the
+same thing locally, and Pedacito asks it to with two llama.cpp server keys
+(understood by LM Studio, llama.cpp server, Lemonade, vLLM, and Ollama's
+OpenAI surface):
+
+```toml
+[profiles.local]
+enable_prompt_cache = true      # send cache_prompt (default: true)
+enable_prompt_lookup = false    # send prompt_lookup_num_tokens (default)
+prompt_lookup_num_tokens = 10   # draft span length when speculation is on
+```
+
+`cache_prompt` keeps the KV prefix warm between gather steps, so the repeated
+conversation prefix is not re-prefilled on every lookup call.
+`prompt_lookup_num_tokens` turns on n-gram prompt-lookup decoding: the draft
+comes from the prompt itself, which pays off on copy-heavy output (SEARCH
+blocks quote source lines that are sitting right there in the context).
+
+Three safety properties hold: the keys are attached only to endpoints you
+self-host (loopback, a LAN address in RFC1918 / CGNAT / IPv6 unique-local
+range, a `.local` name, or a provider entry naming a local runtime), so a
+hosted API never sees them; a 400 or 422 that lands while either key is
+attached is treated as a refusal, the request is re-sent once without them,
+and the denial is remembered per server+model pair so later calls start
+stripped (one wasted request, ever, on servers that predate the keys); and a
+key you spell yourself in the profile's `[sampler]` table is the user's, not
+ours, and is left alone.
+
+---
+
+## Named MCP servers
+
+Beyond the legacy `mcp_servers = ["command", ...]` list behind the `mcp`
+action, Pedacito can reach **named** servers declared as tables, and hands
+them to the model through a single `mcp_call` action:
+
+```toml
+enable_mcp = true                       # the whole bridge; default true
+
+[mcp_servers.docs]
+command = "python"                      # stdio transport: argv, no shell
+args = ["-m", "docs_server"]
+env = "DOCS_DB=~/docs.db"               # or a JSON object { "K": "V" }
+trusted = false                         # true: calls run without asking
+enabled = true                          # false: park this server
+
+[mcp_servers.jira]
+url = "http://127.0.0.1:8000/mcp"       # Streamable HTTP instead of stdio
+```
+
+Everything is **pruned per task**. Once per session the bridge lists each
+enabled server's tools (a 5-second budget per server; a server that is down
+simply contributes nothing), scores tool names and descriptions against the
+task text, and injects at most four matches as one-line signatures into the
+gather prompt. `mcp_call` is offered in the action schema only when at least
+one tool matches, and the model may call only what it was shown: irrelevant
+tools on a busy server are invisible, and the default schema for people who
+configure nothing stays byte-identical.
+
+Everything is **permission-gated per call**. A server marked `trusted = true`
+runs silently; on any other server each call asks the permission broker with
+the server, tool, and exact arguments in the dialog (**MCP Tool** category),
+and a decline returns fixed text telling the model to proceed with local
+repository tools only. Returned text is capped at about `max_read_tokens`
+tokens with a truncation note. Project `.pedacito.toml` files may not define
+servers at all (the same trust gate as `hooks` and shell settings): named
+servers come from your user config, or from a project you explicitly trusted.
+
+```bash
+pedacito mcp list        # what the bridge sees for this project, pruned view
+```
+
+The GUI shows the same list at `GET /api/mcp/tools` and settings expose the
+acceleration and bridge switches. See
+[Techniques §30](TECHNIQUES.md#30-pruned-permission-gated-mcp-bridges-named-servers--mcp_call)
+for why the pruning is shaped this way.
+
 ---
 
 ## Built-in help: `pedacito how`
@@ -520,11 +599,13 @@ do:
 | `screenshot` | `allow_screenshots = true` | Capture the screen as text: size, brightness, blank-screen verdict, OCR, optional `vision_model` description. Needs the `vision` extra. |
 | `browser` | `allow_browser = true` | Headless browser: start a server command, open the page, click/type/hold keys, and report page text, canvas sizes, and console errors. Needs the `browser` extra. |
 | `mcp` | `allow_mcp = true` + `mcp_servers = [...]` | Call tools, prompts (`prompt:server/name`), or resources (`resource:server/uri`) from MCP servers. The catalog shows arguments, calls are validated, one live session per server is kept warm, and a server that was down at startup is retried. |
+| `mcp_call` | `enable_mcp = true` + `[mcp_servers.<name>]` | Call a tool on a *named* MCP server. Only the up-to-four tools whose names and descriptions match the task are ever shown, the action itself appears only when one matches, and untrusted servers ask the permission broker per call. See [Named MCP servers](#named-mcp-servers). |
 | `task` | `allow_subagents = true` | Hand a bounded, read-only research question to a helper agent with a fresh context window; only a short digest comes back. Depth is capped (1 local, 2 hosted). |
 | `fetch` | `allow_fetch = true` + `fetch_allowed_hosts` | URL → readable text, host-allowlisted, size-capped, cached, labelled untrusted. Private/loopback addresses are refused. |
 | semantic search | `semantic_search = true` | A `grep` with no hits falls back to the server's `/v1/embeddings` endpoint. |
 
-`run` and `mcp` execute model-chosen commands in your project. Treat them as a
+`run` and the two MCP actions execute model-chosen commands in your project.
+Treat them as a
 trust decision, but see [Safety](#safety-and-trust): `run` is sandboxed by
 default where the OS allows, and the rest of the blast radius is limited too.
 
@@ -1427,6 +1508,8 @@ config --reference` prints the annotated template. Key settings:
 | `max_total_tokens` / `max_cost` | 0 | Stop before the next call once spent (0 = no limit). |
 | `price_input_per_mtok` / `price_output_per_mtok` / `price_cached_per_mtok` / `price_cache_write_per_mtok` | 0 | USD per million tokens, for cost reporting; the write price covers explicit-cache creation tokens. |
 | `prompt_cache` / `prompt_cache_ttl` / `prompt_cache_key` | `auto` / `5m` / `""` | Hosted prompt caching (see [Hosted prompt caching](#hosted-prompt-caching)): `auto` lets the provider table decide, `implicit`/`explicit`/`off` override it, `prompt_cache_key = "auto"` derives a stable cache-affinity key. |
+| `enable_prompt_cache` / `enable_prompt_lookup` / `prompt_lookup_num_tokens` | true / false / 10 | Local server acceleration (see [Local inference acceleration](#local-inference-acceleration)): send `cache_prompt` and/or `prompt_lookup_num_tokens` to self-hosted endpoints only; a 400/422 refusal strips the key and is remembered per server+model. |
+| `enable_mcp` / `mcp_servers` | true / `{}` | The named-server MCP bridge (see [Named MCP servers](#named-mcp-servers)): `[mcp_servers.<name>]` tables with `command`/`args`/`url`/`env`/`enabled`/`trusted`; the legacy `mcp_servers = ["cmd", ...]` list keeps feeding the `mcp` action. Servers defined by an untrusted project's `.pedacito.toml` are ignored. |
 | `stuck_recovery` | true | One targeted recovery prompt before gather gives up. |
 | `use_model_card` | true | Let `pedacito calibrate`'s card fill unset settings. |
 | `log_events` / `keep_events` | true / 20 | Local JSONL telemetry under `.pedacito/events/`. |

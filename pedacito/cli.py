@@ -1482,6 +1482,40 @@ def _cmd_lsp(args) -> int:
     return 0
 
 
+def _cmd_mcp(args) -> int:
+    """`pedacito mcp list`: every tool the named MCP servers expose, with the
+    trust flag each call would show or skip."""
+    from . import mcp
+    cfg = _light_config(args)
+    if args.action != "list":
+        print(f"unknown mcp action: {args.action}", file=sys.stderr)
+        return 2
+    servers = mcp.named_servers(cfg)
+    if not servers:
+        if not getattr(cfg, "enable_mcp", True):
+            print("MCP is disabled (config enable_mcp = false).")
+            return 0
+        print("No named MCP servers. Add [mcp_servers.<name>] tables "
+              "(command + args for a stdio server, or url for a Streamable "
+              "HTTP one) to the config. A plain mcp_servers command list "
+              "serves the legacy `mcp` action instead.")
+        return 0
+    tools = mcp.list_mcp_tools(cfg)
+    if not tools:
+        print(f"No tools listed by {len(servers)} server(s): they are down, "
+              "slow, or expose none.")
+        return 1
+    for d in tools:
+        line = mcp.compact_line(d)
+        if not d["trusted"]:
+            line += "   [asks permission]"
+        print(line)
+    print(f"\n{len(tools)} tool(s) on {len(servers)} server(s). Gather "
+          "injects only the tools matching the current task; the model calls "
+          "them with the `mcp_call` action.")
+    return 0
+
+
 def _cmd_memory(args) -> int:
     """`pedacito memory`: list, add or forget remembered facts."""
     from . import memory
@@ -2055,6 +2089,14 @@ def _main(argv=None) -> int:
     p_lsp.add_argument("--config", metavar="FILE")
     p_lsp.add_argument("--profile", metavar="NAME")
 
+    p_mcp = sub.add_parser(
+        "mcp", help="inspect named MCP servers ([mcp_servers.<name>]): "
+                    "list the tools they expose and their trust flag")
+    p_mcp.add_argument("action", nargs="?", default="list", choices=["list"])
+    p_mcp.add_argument("--root", default=None)
+    p_mcp.add_argument("--config", metavar="FILE")
+    p_mcp.add_argument("--profile", metavar="NAME")
+
     p_mem = sub.add_parser(
         "memory", help="list, add or forget the facts Pedacito remembers")
     p_mem.add_argument("paths", nargs="*", default=["."])
@@ -2195,7 +2237,8 @@ def _main(argv=None) -> int:
              "trust": _cmd_trust, "tests": _cmd_tests,
              "webcheck": _cmd_webcheck, "skills": _cmd_skills,
              "rename": _cmd_rename,
-             "serve": _cmd_serve, "procs": _cmd_procs, "lsp": _cmd_lsp}
+             "serve": _cmd_serve, "procs": _cmd_procs, "lsp": _cmd_lsp,
+             "mcp": _cmd_mcp}
     if args.cmd in light:
         try:
             return light[args.cmd](args)

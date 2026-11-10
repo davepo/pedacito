@@ -297,6 +297,22 @@ def _settings(q, body=None):
     return 200, settings_api.payload()
 
 
+@get("/api/mcp/tools")
+def _mcp_tools(q, body=None):
+    """The named-MCP-server tool inventory for the GUI: every listed tool
+    with its input schema and trust flag. A down server lists nothing (5s
+    budget each); the `servers` key still names what is configured."""
+    from .. import mcp
+    cfg = _how_config()
+    servers = mcp.named_servers(cfg)
+    tools = mcp.list_mcp_tools(cfg)
+    return 200, {"enabled": bool(getattr(cfg, "enable_mcp", True)),
+                 "servers": sorted(servers),
+                 "trusted": {n: bool(s.get("trusted"))
+                             for n, s in servers.items()},
+                 "tools": tools}
+
+
 def _how_config():
     """The live config, or a harmless default when no project is open."""
     from .. import config as config_mod

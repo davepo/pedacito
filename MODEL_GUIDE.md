@@ -308,6 +308,50 @@ Two things to know:
 
 ---
 
+## Local inference acceleration (`enable_prompt_cache`)
+
+Gather is a loop of short calls that re-send a growing, mostly unchanged
+conversation. Self-hosted runtimes can make that cheaper with two request keys,
+and Pedacito adds them for you:
+
+- `cache_prompt: true` asks the server to keep the KV prefix of the identical
+  prompt start between calls, so step 12 does not re-prefill steps 1 through 11.
+  On by default (`enable_prompt_cache = true`).
+- `prompt_lookup_num_tokens: N` turns on n-gram prompt-lookup decoding: the
+  drafter copies continuations from the prompt itself. It is a strong fit for
+  this workload because the edit phase quotes source lines that are already
+  sitting in the context. Off by default (`enable_prompt_lookup = false`);
+  `prompt_lookup_num_tokens` sets the draft span (default 10).
+
+Per runtime, what to expect (confirm with `pedacito config --doctor`):
+
+| Server | `cache_prompt` | Prompt lookup |
+|---|---|---|
+| **llama.cpp** (`llama-server`) | Accepted; pairs with `--cache-reuse` on the server for best results | Accepted; enable `--lookup-ngram-draft` style flags on the server, or leave it and the refusal is learned |
+| **Lemonade Server** (`lemond`) | Its llama.cpp backend accepts the key | Same surface as llama.cpp |
+| **LM Studio** | Accepted on recent versions | Support varies by version |
+| **Ollama** (`/v1`) | Accepted | Not supported on older builds; the fallback below covers it |
+| **vLLM** | Accepted (`--enable-prefix-caching` is on by default in recent versions) | Not the same mechanism; expect the fallback |
+| **Hosted APIs** | Never sent | Never sent |
+
+Two safety properties matter. The keys are attached only to endpoints that are
+actually yours: loopback, a LAN address (RFC1918, CGNAT, IPv6 unique-local), a
+`.local` name, or a provider entry that names a local runtime. A hosted API
+never sees them. And a server that does not understand a key is not a broken
+setup: when a request answered by HTTP 400 or 422 still had either key
+attached, Pedacito strips the keys, re-sends that one request immediately, and
+remembers the refusal for this server and model, so later calls start clean.
+The cost of an unsupported key is one extra request per session, never a
+failing task. A key you spell yourself in a profile's `[sampler]` table always
+wins; the acceleration never overwrites the user's own setting.
+
+Rule of thumb: keep `enable_prompt_cache = true` on any local server. Turn on
+`enable_prompt_lookup = true` when edits dominate the run (SEARCH blocks,
+refactors) and the GPU is compute-bound; measure with `pedacito calibrate` or
+a side-by-side `chat` session if in doubt.
+
+---
+
 ## Thinking per profile
 
 Some models reason before they answer, in a separate thinking block. That helps

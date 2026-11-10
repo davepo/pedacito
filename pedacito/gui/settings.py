@@ -79,6 +79,34 @@ FIELD_META: dict[str, FieldMeta] = {
                     "profile keeps planning, answers, and edits. Empty means "
                     "no scout; pick one like 'scout' in the dropdown. The "
                     "profile must already exist with its own base_url/model."),
+    "enable_prompt_cache": FieldMeta(
+        label="Enable Local Server KV Prompt Caching (cache_prompt)",
+        description="On self-hosted llama.cpp-style servers, add the "
+                    "cache_prompt request key so the KV prefix of the "
+                    "replayed gather context stays resident between steps. "
+                    "Only local endpoints receive it; a server that answers "
+                    "400/422 with the key is downgraded automatically and "
+                    "remembered per model."),
+    "enable_prompt_lookup": FieldMeta(
+        label="Enable N-Gram Prompt Lookup Speculation",
+        description="On self-hosted llama.cpp-style servers, add "
+                    "prompt_lookup_num_tokens to switch on n-gram "
+                    "speculative decoding (draft tokens are matched from the "
+                    "prompt itself, no extra model). Off by default; a server "
+                    "that refuses the key is downgraded and remembered."),
+    "prompt_lookup_num_tokens": FieldMeta(
+        label="Prompt Lookup Draft Tokens",
+        description="How many n-gram tokens prompt_lookup_num_tokens asks the "
+                    "server to speculate per step. Higher drafts more per "
+                    "verification pass; typical values are 4 to 16."),
+    "enable_mcp": FieldMeta(
+        label="Enable Named MCP Servers (mcp_call)",
+        description="Expose the pruned, permission-gated `mcp_call` action "
+                    "for servers configured as [mcp_servers.<name>] tables "
+                    "(command/args for stdio or url for HTTP). Only the "
+                    "tools matching the current task are shown, and a server "
+                    "not marked trusted asks the permission broker first. "
+                    "Independent of the legacy allow_mcp catalog path."),
 }
 
 _GROUP_RE = re.compile(r"^\s{4}#\s*---+\s*(.*?)\s*-+\s*$")

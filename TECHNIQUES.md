@@ -1044,7 +1044,102 @@ first step, and one more config surface -- the GUI shows an active scout as
 a `Scout: <profile>` badge next to the model chip so it is never invisible
 which answering brain a step came from.
 
-## Quick reference: techniques 22 to 28
+### 29. Local inference payload acceleration: `cache_prompt` and prompt lookup
+
+Local servers get the same prefix problem §8 solves for hosted providers, but
+for a key the server itself holds: llama.cpp's OpenAI server re-prefills the
+whole conversation on every
+step unless the request says otherwise, and its n-gram lookup decoder only
+drafts when the request names a span. Gather is the worst case for both: the
+prompt grows one step at a time, every re-send repeats the system prompt, the
+interface contract, the map, and every earlier step verbatim, and the output
+(SEARCH blocks, file paths, signatures) is largely *copy* of text already in
+the prompt.
+
+Two request keys fix that, and `llm.py` attaches them to local endpoints only.
+`enable_prompt_cache` (on by default) adds `cache_prompt: true`, which keeps
+the server's KV prefix alive between calls so the stable opening of the gather
+conversation is prefilled once, not thirty times. `enable_prompt_lookup` (off
+by default) adds `prompt_lookup_num_tokens: N` (default 10), which turns on
+n-gram prompt-lookup decoding: the drafter finds the current suffix in the
+prompt and drafts forward from its match, at essentially zero model cost, and
+the verifier accepts what matches. Because lookup drafts *from the prompt*, it
+wins hardest exactly where small models spend their time here: quoting source
+lines into SEARCH blocks, repeating signatures, echoing paths.
+
+The guard is the interesting part, because a key a server does not know is a
+hard 400, not a shrug. Three layers keep the failure surface at zero. First,
+the keys are only ever attached when `_is_local_server` is true: a loopback or
+`.local` host, an address inside RFC1918, CGNAT, or IPv6 unique-local ranges
+(the IANA documentation carve-outs like 203.0.113/24 read as "private" to the
+stdlib and are deliberately excluded), or a provider entry that names a local
+runtime (`llamacpp`, `lemond`, `vllm`, `lmstudio`, `ollama`). A hosted API
+never sees them. Second, a 400 or 422 that lands while either key is attached
+is treated as a refusal of the keys, not of the request: the payload is
+stripped of both, the same request is re-sent once immediately, and the answer
+arrives normally. Third, the refusal is remembered per `(base_url, model)`
+pair, in the same engine-side cache that §27 uses for JSON tiers, so every
+later call starts stripped and the total cost of a server that predates the
+keys is one extra request per session. A refusal on a payload that had nothing
+left to strip re-raises; there is no retry loop. And a key spelled by the user
+in the profile's `[sampler]` table is the user's, not the engine's: presence
+of the key suppresses the accelerator entirely.
+
+Cost: two payload fields on local calls, a small capability cache, and one
+wasted request per (server, model) pair that refuses, once per session.
+
+### 30. Pruned, permission-gated MCP bridges (named servers + `mcp_call`)
+
+The legacy `mcp` action renders the full catalog of command-list servers
+into the prompt: every tool, every parameter, every time. That is fine for one
+server with five tools and ruinous for the common real shape: a docs server
+with forty, a tracker with sixty, a 4B model whose gather window cannot afford
+a hundred irrelevant signatures, and no story at all for "may this server
+*run* things".
+
+Named servers are declared as tables (`[mcp_servers.docs]` with `command`,
+`args`, `url`, `env`, `enabled`, `trusted`) and reach the model through one
+new action, `mcp_call {server, tool, arguments}`, under two disciplines.
+
+**Pruning.** Once per session the bridge lists each enabled server's tools (a
+5-second budget per server; an unreachable server contributes nothing and is
+not retried until the cache expires), and every gather step scores the task
+text against tool names and descriptions, injects at most four matches as
+one-line `server.name(args) -- summary` signatures, and *only then* offers
+`mcp_call` in the step schema. If nothing matches, the action is absent, the
+fields (`server`, `tool`, `arguments`) are absent, and the schema is
+byte-identical to a run with no MCP configured at all. The injected list IS
+the boundary: the model is told it may call only what it sees, so a task about
+documentation never gets an angle on the tracker's `delete_ticket`, even
+though it is one string away. The same relevance list decides the rebuild-phase
+injection, so the edit model sees exactly what the gather model saw.
+
+**Permission.** `trusted = true` on a server means the user vouched for it and
+its tools run without asking. Everything else routes through the human broker
+of §21 with category **MCP Tool**, a summary line (`Run MCP tool docs.search`),
+and a detail blob with the exact arguments, so the dialog shows what will
+actually run. A decline returns fixed text ("MCP tool execution was declined.
+Proceed using local repository tools only.") instead of an exception, because
+the productive outcome is the model falling back to `grep` and `read`, not
+another step burning tokens on a hostile server. Returned text is capped at
+about `max_read_tokens` tokens with an explicit truncation note, and malformed
+`arguments` JSON is refused locally, before any server is asked.
+
+The trust layers of §21 apply to the config itself: `mcp_servers` is an
+execution-bearing field, so an untrusted project's `.pedacito.toml` cannot
+define servers at all; named bridges come from the user config or a project
+the user explicitly trusted. Stdio servers are spawned from argv without a
+shell and inherit a scrubbed environment. Subagent children get the bridge
+disabled. `pedacito mcp list` and `GET /api/mcp/tools` show the same pruned
+view the model sees, so "why can't it use that tool" has an inspectable
+answer.
+
+Cost: a per-session tool listing (one `tools/list` per server), a 5-second
+listing budget per server, and one permission dialog per call to an
+untrusted server. The legacy command-list path is untouched and both formats
+coexist.
+
+## Quick reference: techniques 22 to 30
 
 | Technique | Section | How to turn it off | Where you see it |
 |---|---|---|---|
@@ -1055,6 +1150,8 @@ which answering brain a step came from.
 | Deterministic rename (`rename_symbol`) | §26 | None for the CLI and GUI. The agent action needs `allow_write = true` | `pedacito rename`, and **Project ▾ → Rename symbol…** |
 | Engine-enforced JSON schema | §27 | `enforce_json_schema = false` | Automatic on every structured call. `pedacito config --doctor` shows the tier |
 | Scout/architect routing | §28 | `scout_profile = ""` | `scout_profile` in Settings. The top bar shows a `Scout: <profile>` badge |
+| Local payload acceleration | §29 | `enable_prompt_cache = false`, `enable_prompt_lookup = false` | Automatic on local endpoints only. `cache_prompt` / `prompt_lookup_num_tokens` appear in the request payload (`log_events` shows calls) |
+| Pruned MCP bridge (`mcp_call`) | §30 | `enable_mcp = false` | A gather action, offered only when a tool matches. `pedacito mcp list`. Permission dialog category **MCP Tool** |
 
 ## Techniques that exist but are not a good fit
 

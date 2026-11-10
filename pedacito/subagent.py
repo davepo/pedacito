@@ -44,8 +44,8 @@ def child_config(cfg):
     depth = int(getattr(cfg, "_depth", 0) or 0) + 1
     child._depth = depth
     for flag in ("allow_write", "allow_shell", "allow_browser",
-                 "allow_screenshots", "allow_mcp", "allow_fetch",
-                 "enable_web",
+                 "allow_screenshots", "allow_mcp", "enable_mcp",
+                 "allow_fetch", "enable_web",
                  "semantic_search", "verify_tests", "auto_allowlist"):
         setattr(child, flag, False)
     child.allow_subagents = depth < max_depth(cfg)
