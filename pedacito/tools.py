@@ -126,6 +126,14 @@ undo     - revert what THIS task's write/append/move/delete actions did so
            (needs allow_write and backup)
 run      - run one command, no shell pipes.  args: command
            (a quiet GUI/server is stopped after shell_idle_seconds)
+run_test - run ONE scoped pytest check (argv only, no shell; sandboxed where
+           a backend exists; tight timeout; compact, token-bounded output).
+           args: target (a test file like tests/test_app.py, a node id like
+           tests/test_app.py::test_save, or empty for the whole suite),
+           filter (optional pytest -k expression selecting test names)
+           (use it during investigation to read the LIVE traceback before
+            writing an edit; needs enable_run_test_in_gather, or the user's
+            permission through the broker when that setting is off)
 screenshot - launch app, wait, capture screen; returns text analysis.
            args: command, start (seconds to wait), optional file (old shot)
            (needs allow_screenshots; launching a command also needs allow_shell)
@@ -157,7 +165,8 @@ STEP_SCHEMA = {
             "enum": ["read", "grep", "find", "callers", "context", "outline",
                      "usages", "sessions", "diff", "git", "git_diff",
                      "diagnose", "write", "append",
-                     "move", "delete", "rename", "run", "screenshot", "browser",
+                     "move", "delete", "rename", "run", "run_test",
+                     "screenshot", "browser",
                      "todo",
                      "remember", "skill", "task", "fetch", "fetch_url",
                      "web_search", "question", "mcp",
@@ -210,6 +219,18 @@ STEP_SCHEMA = {
                   "description": "For web_search: the search query. Empty "
                                  "otherwise.",
                   "maxLength": 300},
+        "target": {"type": "string",
+                   "description": "For run_test: the pytest file (e.g. "
+                                  "tests/test_app.py) or node id (e.g. "
+                                  "tests/test_app.py::test_save) to run; "
+                                  "empty runs the whole suite. Empty "
+                                  "otherwise.",
+                   "maxLength": 200},
+        "filter": {"type": "string",
+                   "description": "For run_test: an optional pytest -k "
+                                  "expression (e.g. 'save or retry'). Empty "
+                                  "otherwise.",
+                   "maxLength": 120},
         "to": {"type": "string",
                "description": "For move: the new path. For rename: the new "
                                 "name. Empty otherwise.",
@@ -253,6 +274,7 @@ MOVE_ACTION = "move"
 DELETE_ACTION = "delete"
 UNDO_ACTION = "undo"
 RUN_ACTION = "run"
+RUN_TEST_ACTION = "run_test"
 SCREENSHOT_ACTION = "screenshot"
 BROWSER_ACTION = "browser"
 DIFF_ACTION = "diff"
@@ -281,6 +303,14 @@ _WEB_PROMPT_RE = re.compile(r"(?:https?://|www\.)|\b(?:fetch|website|web|url|"
                             r"online|search|docs|documentation|summarize)\b",
                             re.I)
 
+# The scoped `run_test` action: offered whenever the repository has tests or
+# the task text reaches for one. The offer costs nothing; the safety lives in
+# the tool itself (no shell, workspace-validated target, tight timeout).
+_RUN_TEST_PROMPT_RE = re.compile(
+    r"\b(?:test|tests|testing|pytest|fail|fails|failed|failure|bug|bugs|"
+    r"fix|fixes|fixing|error|errors|traceback|tracebacks|reproduce|"
+    r"reproduction|broken|assert|assertion|regression|repro)\b", re.I)
+
 # Optional/specialized actions and the prompt words that justify keeping
 # them even when the repository's stats call them unused. Matching is
 # case-insensitive. An action absent here is never auto-pruned.
@@ -296,6 +326,7 @@ _PRUNE_TRIGGERS = {
                            r"diagnostic|ruff|mypy|pyflakes|flake8)\b", re.I),
     "run": re.compile(r"\b(run|test|tests|pytest|build|execute|command|"
                       r"make|npm|cargo|go test)\b", re.I),
+    RUN_TEST_ACTION: _RUN_TEST_PROMPT_RE,
     "serve": re.compile(r"\b(serve|server|port|localhost|dev server|"
                         r"background process)\b", re.I),
     "remember": re.compile(r"\b(remember|memory|convention|landmine|note)\b",
@@ -340,6 +371,11 @@ def _prune_optional_actions(cfg, actions: list[str]) -> list[str]:
         if action in CORE_ACTIONS or action not in _PRUNE_TRIGGERS:
             kept.append(action)
             continue
+        if action == RUN_TEST_ACTION and _repo_has_tests(cfg):
+            # The repository HAS tests: a stale usage counter must not hide
+            # the one tool that turns a guess about a failure into evidence.
+            kept.append(action)
+            continue
         if memory.tool_unused_tasks(root, action) < threshold:
             kept.append(action)
             continue
@@ -358,6 +394,39 @@ def _skills_exist(cfg) -> bool:
         return True            # bundled starters are always there
     from . import skills
     return bool(skills.names(root, cfg))
+
+
+def _repo_has_tests(cfg) -> bool:
+    """True when the project visibly has tests: a `tests/` or `test/`
+    directory, or a top-level `test_*.py` / `*_test.py` / `*.test.js` /
+    `*.spec.js` file. Cheap and bounded (no full walk); it only answers the
+    question "does run_test have anything to run?"."""
+    root = getattr(cfg, "_root", None)
+    if not root:
+        return False
+    try:
+        p = Path(str(root))
+        if (p / "tests").is_dir() or (p / "test").is_dir():
+            return True
+        for pat in ("test_*.py", "*_test.py", "*.test.js", "*.spec.js",
+                    "*.test.mjs", "tests/test_*.py"):
+            if next(p.glob(pat), None) is not None:
+                return True
+    except OSError:
+        return False
+    return False
+
+
+def _run_test_offered(cfg) -> bool:
+    """`run_test` enters the schema when the repo has tests OR the task text
+    reaches for one (a bug/fix/fail/error/traceback/reproduce/broken task).
+    Offering is not permission: at runtime the tool validates the target,
+    execs pytest with no shell, and routes through the permission broker
+    when enable_run_test_in_gather is off."""
+    if _repo_has_tests(cfg):
+        return True
+    return bool(_RUN_TEST_PROMPT_RE.search(
+        str(getattr(cfg, "_task_text", "") or "")))
 
 
 def reasoning_first(cfg) -> bool:
@@ -425,6 +494,16 @@ _FIELD_ACTION_FRAGMENTS = {
         (("task",), "For task: the question."),
         (("mcp",), "For mcp: a JSON object of tool arguments."),
     ],
+    "target": [
+        ((RUN_TEST_ACTION,),
+         "For run_test: the pytest file (tests/test_app.py) or node id "
+         "(tests/test_app.py::test_save) to run; empty runs the suite."),
+    ],
+    "filter": [
+        ((RUN_TEST_ACTION,),
+         "For run_test: an optional pytest -k expression selecting test "
+         "names (e.g. 'save or retry')."),
+    ],
 }
 _FIELD_DESCRIPTION_TAILS = {
     "file": "Empty otherwise.",
@@ -433,6 +512,8 @@ _FIELD_DESCRIPTION_TAILS = {
     "symbol": "Empty otherwise.",
     "command": "Empty otherwise.",
     "content": "Empty otherwise.",
+    "target": "Empty otherwise.",
+    "filter": "Empty otherwise.",
 }
 
 
@@ -472,6 +553,12 @@ def schema_for(cfg) -> dict:
         actions += ["git", GIT_DIFF_ACTION]
     if getattr(cfg, "allow_shell", False):
         actions += ["run", "diagnose"]
+    if _run_test_offered(cfg):
+        # Scoped, sandboxed pytest runner for the gather phase: offered when
+        # the repo has tests or the task text names a failure. Runtime gates
+        # (path validation, no shell, broker when the setting is off) live in
+        # tool_run_test itself.
+        actions.append(RUN_TEST_ACTION)
     if getattr(cfg, "allow_serve", False):
         actions.append("serve")
     if getattr(cfg, "allow_write", False):
@@ -541,6 +628,13 @@ def schema_for(cfg) -> dict:
             + ["url", "query"] + ordered[ordered.index("symbol") + 1:]
         if not getattr(cfg, "compact_step_schema", False):
             required += ["url", "query"]
+    if RUN_TEST_ACTION in actions:
+        # `target`/`filter` join the flat field set only while run_test is in
+        # this schema (same byte-identical-default rule as url/query).
+        ordered = ordered[:ordered.index("symbol") + 1] \
+            + ["target", "filter"] + ordered[ordered.index("symbol") + 1:]
+        if not getattr(cfg, "compact_step_schema", False):
+            required += ["target", "filter"]
     if reasoning_first(cfg):
         ordered = ["reasoning"] + [k for k in ordered if k != "reasoning"]
         schema["properties"]["reasoning"]["description"] = (
@@ -2991,6 +3085,288 @@ def _child_env(cfg=None) -> dict:
     return safety.child_env(cfg)
 
 
+# ------------------------------------------------------------ run_test ----
+# The gather phase's scoped test runner: ONE pytest invocation, argv-only
+# (NEVER a shell), a workspace-validated file/node target, a tight timeout,
+# and a token-bounded condensed traceback. It exists because a small model
+# that has SEEN the live failure writes a far better edit than one guessing
+# from a static read.
+
+_RUN_TEST_NODE_RE = re.compile(r"""^[\w.\-\[\],:='"]{1,160}$""")
+_RUN_TEST_TIMEOUT_CAP = 15
+_RUN_TEST_CHARS_PER_TOKEN = 3.5
+_PYTEST_TALLY_RE = re.compile(
+    r"\d+ (?:passed|failed|errors?|xfailed|xpassed|skipped|deselected)"
+    r"|no tests ran", re.I)
+
+
+_RUN_TEST_RUNNER_CACHE: dict[str, list[str]] = {}
+
+
+def _pytest_runner_ok(argv: list[str], root: Path, cfg) -> bool:
+    """Does this argv actually start pytest? Probed once per interpreter with
+    `--version` (a few milliseconds, capped and cached per root). A PATH
+    `python -m pytest` from the repo's detected test command often points at
+    a DIFFERENT interpreter than the one running pedacito -- typically a
+    system python with no pytest installed -- so nothing is trusted sight
+    unseen."""
+    key = str(Path(argv[0])) if argv else ""
+    hit = _RUN_TEST_RUNNER_CACHE.get(key)
+    if hit is not None:
+        return True
+    try:
+        rc, _out, stopped, _el = proc.run(argv + ["--version"], cwd=root,
+                                          timeout=15, max_output=4096,
+                                          env=_child_env(cfg))
+    except Exception:
+        return False
+    if rc == 0 and not stopped:
+        _RUN_TEST_RUNNER_CACHE[key] = argv
+        return True
+    return False
+
+
+def _run_test_runner(root: Path, cfg) -> list[str] | None:
+    """The project's pytest runner argv, never a shell string. Preference:
+    the interpreter running pedacito (`sys.executable -m pytest` -- it is the
+    one holding the installed packages), then the repo's own detected pytest
+    command with its interpreter rewritten to sys.executable when it is a
+    bare python, then `pytest` from PATH. Each candidate is proven with a
+    `--version` probe; none works: None (the caller explains that instead of
+    running a guaranteed crash)."""
+    candidates: list[list[str]] = [[sys.executable, "-m", "pytest"]]
+    det = ""
+    try:
+        from . import testsel
+        det = testsel.detect_test_command(root, cfg) or ""
+    except Exception:
+        det = ""
+    if det and "pytest" in det.lower():
+        try:
+            argv = _split_command(det)
+        except ValueError:
+            argv = []
+        if argv:
+            if Path(argv[0]).name.lower().rstrip(".exe") in ("python", "python3",
+                                                              "py"):
+                argv[0] = sys.executable
+            candidates.append(argv)
+    if shutil.which("pytest"):
+        candidates.append(["pytest"])
+    for argv in candidates:
+        if _pytest_runner_ok(argv, root, cfg):
+            return list(argv)
+    return None
+
+
+def _pytest_tally(out: str) -> str:
+    """pytest's own final count line ("3 passed, 1 failed in 0.42s"), or ''."""
+    for ln in reversed((out or "").splitlines()):
+        clean = ln.strip().strip("=").strip()
+        if clean and _PYTEST_TALLY_RE.search(clean):
+            return clean[:200]
+    return ""
+
+
+def _condense_failures(out: str, budget_chars: int) -> str:
+    """A compact failure digest instead of the raw transcript: loop.py's
+    failure identities when importable (the same condenser the repair
+    packets use: node id + assertion signature + the error lines of the
+    traceback block), else the assertion-ish tail of the output."""
+    condense = None
+    try:
+        from .loop import failure_identities as condense  # noqa: F811
+    except Exception:
+        condense = None
+    blocks: list[str] = []
+    if condense is not None:
+        try:
+            infos = list(condense(out).items())
+        except Exception:
+            infos = []
+        for fid, info in infos[:4]:
+            head = f"- {fid} ({getattr(info, 'kind', 'failed') or 'failed'})"
+            sig = str(getattr(info, "signature", "") or "").strip()
+            if sig:
+                head += f" -- {sig[:140]}"
+            chunk = [head]
+            block = str(getattr(info, "block", "") or "")
+            kept = [ln for ln in block.splitlines()
+                    if ln.startswith("E") or re.search(r"\b\w*Error\b", ln)]
+            for ln in (kept or block.splitlines())[-5:]:
+                chunk.append("  " + ln[:200])
+            blocks.append("\n".join(chunk))
+    if not blocks:
+        tail = [ln.rstrip() for ln in (out or "").splitlines() if ln.strip()]
+        kept = [ln for ln in tail
+                if ln.startswith("E") or re.search(
+                    r"\b\w*Error\b|assert", ln, re.I)]
+        for ln in (kept or tail)[-10:]:
+            blocks.append("  " + ln[:200])
+    text = "\n".join(blocks)
+    return text[:max(200, budget_chars)]
+
+
+def tool_run_test(index, cfg, target: str = "", k_filter: str = "") -> str:
+    """Run ONE scoped pytest check in the project root during gather and
+    return a compact pass/fail observation with the condensed traceback.
+
+    The signature is `{action: "run_test", target: <file or node id>,
+    filter: <pytest -k expr>}`; both arguments are optional. Safety rules,
+    in order:
+      * NO shell, ever: pytest is started as an argv list (`shell=False` by
+        construction through `proc.run`), so pipes, redirection and `;` are
+        inert arguments.
+      * `target` (its file portion before `::`) must resolve INSIDE the
+        project through `security.resolve_safe_path`; traversal, symlink
+        escape and non-existent paths are refused with a hint.
+      * the whole run gets `min(cfg.test_timeout, 15)` seconds.
+      * with `enable_run_test_in_gather` off the human Permission Broker
+        decides (category `test_execution`); no broker means no run.
+    Output is token-bounded (`cfg.max_read_tokens`): the tally line plus at
+    most four condensed failure blocks, using loop.py's traceback condenser
+    when it is importable."""
+    root = Path(index.root).resolve()
+    tgt = _as_text(target).strip().strip("`\"'")
+    filt = _as_text(k_filter).strip()[:160]
+    preview = (f"{tgt}" if tgt else "the whole suite") \
+        + (f" -k {filt}" if filt else "")
+    if not bool(getattr(cfg, "enable_run_test_in_gather", True)):
+        if not security.permission_broker_active():
+            return ("ERROR: `run_test` is disabled (config "
+                    "enable_run_test_in_gather = false) and no permission "
+                    "broker is listening. Investigate with `read`/`grep`, or "
+                    "ask the user to enable the setting.")
+        allowed, msg = security.request_permission(
+            category=security.CAT_TEST_EXECUTION,
+            action_summary=f"Run scoped tests: `{preview[:120]}`",
+            detail=f"pytest {preview}"[:4000],
+            risk_level="low",
+            reason="enable_run_test_in_gather is off in the config",
+            key=preview[:120],
+            setting_key="enable_run_test_in_gather")
+        if not allowed:
+            return msg
+
+    argv_target = ""
+    if tgt:
+        file_part, sep, node_part = tgt.partition("::")
+        try:
+            resolved = security.resolve_safe_path(root, file_part)
+        except security.SecurityError as e:
+            return f"ERROR: run_test refused the target: {e}"
+        if not resolved.exists():
+            return (f"ERROR: run_test target does not exist: "
+                    f"{file_part[:120]} -- use `find`/`grep` to locate the "
+                    "test file, then run it.")
+        if resolved.is_file() and resolved.suffix.lower() not in (".py", ""):
+            return (f"ERROR: run_test runs pytest only; {resolved.suffix} "
+                    "is outside its scope (use `run` with allow_shell for "
+                    "other runners).")
+        rel = resolved.relative_to(root).as_posix()
+        if sep:
+            node = node_part.strip()
+            if not node or not _RUN_TEST_NODE_RE.match(node):
+                return ("ERROR: unsupported pytest node id after '::': "
+                        f"{node_part[:60]!r} (letters, digits, _ . - [ ] , : "
+                        "and quotes only).")
+            argv_target = f"{rel}::{node}"
+        else:
+            argv_target = rel
+    if filt.startswith("-"):
+        return ("ERROR: the run_test `filter` cannot start with '-' (it "
+                "would read as an option). Use an expression like "
+                "'save or retry'.")
+    filt = " ".join(filt.split())          # newlines/tabs collapse to spaces
+
+    argv = _run_test_runner(root, cfg)
+    if argv is None:
+        return ("ERROR: no working pytest runner in this environment: neither "
+                "`python -m pytest --version` nor `pytest --version` succeeds "
+                "here. Install pytest in the interpreter running pedacito "
+                "(python -m pip install pytest); `run_test` only ever runs "
+                "pytest, so there is nothing else it can honestly execute.")
+    for flag in ("-q", "--tb=short", "--maxfail=3"):
+        if flag not in argv:
+            argv.append(flag)
+    if argv_target:
+        argv.append(argv_target)
+    if filt:
+        argv += ["-k", filt]
+    display = " ".join(argv)
+    if sys.executable and sys.executable in display:
+        display = display.replace(sys.executable, "python")
+    display = display[:200]
+
+    timeout = max(1, min(_as_int(getattr(cfg, "test_timeout", 300), 300),
+                         _RUN_TEST_TIMEOUT_CAP))
+    cap = max(2000, _as_int(getattr(cfg, "max_shell_output_chars", 8000),
+                             8000))
+    env = _child_env(cfg)
+    try:
+        run_argv, box = sandbox.wrap(argv, cfg, root)
+    except sandbox.SandboxRefused as e:
+        return f"ERROR: {e}"
+    rc, out, stopped, _elapsed = proc.run(
+        run_argv, cwd=root, timeout=timeout, idle_timeout=timeout,
+        max_output=cap, env=env)
+    if stopped == "error":
+        return f"ERROR: could not run pytest: {str(out)[:300]}"
+
+    # TokenEconomizer micro-facts: a finished scoped run is command evidence
+    # like any other (`run` records the same way).
+    try:
+        from . import memory
+        memory.observe_command(root, display, rc == 0 and stopped == "",
+                               cfg, kind="test")
+    except Exception:
+        pass
+
+    raw = (out or "").strip()
+    if stopped == "timeout":
+        return ("RUN TEST: {d}\nSTOPPED: timed out after {t}s (killed; a "
+                "scoped run keeps a tight ceiling).\nPARTIAL OUTPUT:\n{p}\n"
+                "[Narrow the scope with `target` or `filter`; do not re-run "
+                "the same whole suite.]").format(
+                    d=display, t=timeout,
+                    p=_condense_failures(raw, 1500) or "(no output)")
+
+    lines = [f"RUN TEST: {display}",
+             f"EXIT: {rc} ({'OK' if rc == 0 else 'FAILED'})"]
+    tally = _pytest_tally(raw)
+    if tally:
+        lines.append(f"SUMMARY: {tally}")
+    if "no module named pytest" in raw.lower():
+        lines.append("ERROR: pytest is not installed for this interpreter "
+                     "-- the project may need a different runner (config "
+                     "test_command), or install pytest and retry later.")
+    elif rc == 0:
+        lines.append("PASSED: this scope is green, so whatever is broken is "
+                     "NOT in these tests. Do not re-run to watch it pass "
+                     "again.")
+    else:
+        budget_tokens = max(200, _as_int(getattr(cfg, "max_read_tokens",
+                                                 1200), 1200))
+        condensed = _condense_failures(raw, int(budget_tokens
+                                                * _RUN_TEST_CHARS_PER_TOKEN))
+        if condensed:
+            lines.append("FAILURES (condensed traceback):")
+            lines.append(condensed)
+        lines.append("[Read the failing lines above, `read` the implicated "
+                     "source, and fix THAT -- with the live error now in "
+                     "front of you.]")
+        if box:
+            lines.append(f"[ran in a sandbox ({box}); a failure caused by a "
+                         "blocked write outside the project or by no "
+                         "network is the sandbox, not the code.]")
+    obs = "\n".join(lines)
+    hard_cap = int(max(200, _as_int(getattr(cfg, "max_read_tokens", 1200),
+                                    1200)) * _RUN_TEST_CHARS_PER_TOKEN) + 500
+    if len(obs) > hard_cap:
+        obs = obs[:hard_cap].rstrip() + "\n[observation capped]"
+    return obs
+
+
 def _stop_process(p) -> None:
     proc.terminate(p)
     try:
@@ -3690,6 +4066,10 @@ def dispatch(index, cfg, step: dict, client=None) -> str:
                         step.get("end", 0))
     if action == RUN_ACTION:
         return tool_run(index, cfg, step.get("command", ""))
+    if action == RUN_TEST_ACTION:
+        return tool_run_test(index, cfg,
+                             _as_text(step.get("target")) or _as_text(step.get("file")),
+                             _as_text(step.get("filter")) or _as_text(step.get("pattern")))
     if action == SCREENSHOT_ACTION:
         return tool_screenshot(index, cfg, client, step.get("command", ""),
                                step.get("file", ""), step.get("start", 0))

@@ -52,6 +52,19 @@ FIELD_META: dict[str, FieldMeta] = {
         description="Allow the agent to fetch URLs or search documentation "
                     "online. When disabled, web tool attempts trigger an "
                     "interactive permission prompt."),
+    "enable_run_test_in_gather": FieldMeta(
+        label="Scoped Test Runs in Gather",
+        description="Let the agent run one scoped pytest check (a test file "
+                    "or node id, never a shell command) during investigation "
+                    "to see live tracebacks before editing. When disabled, "
+                    "every attempt asks the permission broker."),
+    "frontend_contracts": FieldMeta(
+        label="Frontend DOM Contract Gate",
+        description="Before tests run, deterministically check that local "
+                    "<script src>/<link href> targets exist, that literal "
+                    "getElementById/querySelector('#id') selectors match the "
+                    "ids defined in HTML, and that changed JS files parse. "
+                    "Violations feed the repair loop."),
 }
 
 _GROUP_RE = re.compile(r"^\s{4}#\s*---+\s*(.*?)\s*-+\s*$")

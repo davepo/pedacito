@@ -271,6 +271,14 @@ class Config:
     static_gate: bool = True
     # Seconds to wait for one ruff run before falling back to the AST gate.
     static_gate_timeout: float = 3.0
+    # Frontend DOM contract gate (TECHNIQUES.md #23): for projects with
+    # HTML/JS/CSS, a deterministic zero-token check before the test
+    # subprocess -- every local <script src>/<link href> target must exist,
+    # every literal getElementById('#id')/querySelector('#id') must match an
+    # id the HTML defines (literal JS-created ids count; dynamic template
+    # ids suppress the check), and changed JS files must parse (`node
+    # --check` or tree-sitter). Violations feed the same cheap repair loop.
+    frontend_contracts: bool = True
     # Restrict what one task may WRITE: existing files can only be modified,
     # moved or deleted when the task title names them or the lookup phase read
     # them; brand-new files are always allowed. Off by default.
@@ -655,6 +663,13 @@ class Config:
     verify_tests: bool = False
     test_command: str = ""
     test_timeout: int = 300
+    # Gather-phase `run_test` (TECHNIQUES.md #22): let the model run ONE
+    # scoped pytest check (a test file or node id, never a shell command
+    # line) during investigation and read the live traceback before writing
+    # edits. Off = every attempt asks the GUI permission broker (category
+    # `test_execution`, "Always Allow" flips this knob); a plain CLI run
+    # with no broker reports the tool disabled instead of guessing.
+    enable_run_test_in_gather: bool = True
 
     # --- Memory, skills, sub-agents, git --------------------------------------
     # Push memory: `.pedacito/memory.md` (project) and the user-level
@@ -2134,6 +2149,9 @@ shell_timeout = 120
 shell_idle_seconds = 10
 shell_allowlist = []
 max_shell_output_chars = 8000
+# Gather-phase `run_test`: scoped pytest runs for live tracebacks. Off = the
+# GUI permission broker is asked per call (category test_execution).
+enable_run_test_in_gather = true
 allow_screenshots = false
 screenshot_wait_seconds = 5
 allow_browser = false
@@ -2155,6 +2173,10 @@ fuzzy_min_ratio = 0.85
 # Diagnostics and MCP are opt-in. MCP also needs mcp_servers configured.
 auto_diagnostics = false
 post_edit_check = true
+# Deterministic HTML/JS DOM contract gate (missing <script src>/<link href>
+# targets, getElementById/querySelector('#id') names with no matching HTML id,
+# unparseable JS). Set false to disable the gate.
+frontend_contracts = true
 auto_allowlist = false
 diagnostics_timeout = 90
 max_diagnostics_chars = 8000

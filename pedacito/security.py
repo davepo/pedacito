@@ -53,6 +53,7 @@ __all__ = [
     "CAT_PACKAGE_INSTALL",
     "CAT_SENSITIVE_FILE",
     "CAT_SHELL",
+    "CAT_TEST_EXECUTION",
     "CAT_WEB",
     "CAT_WEB_ACCESS",
     "DENIED_MESSAGE",
@@ -278,6 +279,7 @@ CAT_WEB_ACCESS = "web_access"
 CAT_PACKAGE_INSTALL = "package_install"
 CAT_SHELL = "shell"
 CAT_SENSITIVE_FILE = "sensitive_file"
+CAT_TEST_EXECUTION = "test_execution"
 
 CATEGORY_LABELS = {
     CAT_WEB: "Web Access",
@@ -285,6 +287,7 @@ CATEGORY_LABELS = {
     CAT_PACKAGE_INSTALL: "Package Install",
     CAT_SHELL: "Shell Command",
     CAT_SENSITIVE_FILE: "Sensitive File Read",
+    CAT_TEST_EXECUTION: "Test Execution",
 }
 
 # The exact text a gated tool returns when the human says no (or nobody is

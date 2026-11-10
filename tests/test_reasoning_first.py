@@ -58,8 +58,21 @@ def test_default_schema_is_reason_first():
 
 def test_default_gather_prompt_and_schema_are_reason_first(tmp_path):
     _a, client = gather(tmp_path, READ_THEN_GREP)
-    assert all(list(schema["properties"]) == NEW_ORDER
+    # Sprint O adds `target`/`filter` (run_test) when the task text names a
+    # bug -- the default gather task ("Fix bulk_discount") qualifies. The
+    # invariant under test is the REASON-FIRST ORDER: the base fields must
+    # keep their exact relative order with `reasoning` in front, no matter
+    # which optional action fields this task's schema also carries.
+    assert all(list(schema["properties"])[0] == "reasoning"
                for _msgs, schema in client.seen)
+    assert all([k for k in schema["properties"] if k in NEW_ORDER]
+               == NEW_ORDER for _msgs, schema in client.seen)
+    # and a task with no trigger word and no tests in the repo keeps the
+    # schema byte-identical to the plain reason-first order
+    _a2, client2 = gather(tmp_path / "b", READ_THEN_GREP,
+                          task="describe the pricing module")
+    assert all(list(schema["properties"]) == NEW_ORDER
+               for _msgs, schema in client2.seen)
 
 
 # ------------------------------------------------------------------- new path

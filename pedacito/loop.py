@@ -299,7 +299,7 @@ def _evidence_hint(task: str) -> str:
 # A steps_log entry looks like "4. browser python main.py [wait 3]  (reason)".
 # Anchor on the ACTION token: a `read` step whose reason mentions "run the
 # game" is not live evidence.
-_LIVE_STEP = re.compile(r"^\d+\.\s+(?:run|browser|screenshot)\b")
+_LIVE_STEP = re.compile(r"^\d+\.\s+(?:run(?:_test)?|browser|screenshot)\b")
 
 # Title words that promise live observation. Narrower than _EVIDENCE_WORDS:
 # paired with a verify word, such titles need evidence from the RUNNING app.
@@ -1444,6 +1444,182 @@ def _capture_static_baseline(root, cfg) -> None:
         cfg._static_baseline = None
 
 
+def _frontend_enabled(cfg) -> bool:
+    """The DOM contract gate is on unless explicitly ablated. It is also a
+    no-op for repos without HTML/JS, so enabling it by default is free
+    there -- verify_frontend_contracts returns [] before opening a file."""
+    return bool(getattr(cfg, "frontend_contracts", True))
+
+
+def _frontend_errors(root, cfg, files: list[str]) -> list[str]:
+    """Deterministic HTML/JS DOM contract check over the touched files
+    (asset links, DOM id queries, JS parse). Never raises: a broken gate
+    must not sink the task it cannot check."""
+    if not _frontend_enabled(cfg) or not files:
+        return []
+    try:
+        from . import spec as spec_mod
+        return spec_mod.verify_frontend_contracts(root, files)
+    except Exception:
+        return []
+
+
+def _new_frontend_errors(root, cfg, files: list[str]) -> list[str]:
+    """Frontend contract errors MINUS the ones the project already had
+    before this task (`cfg._frontend_baseline`); with no baseline recorded,
+    every error counts as new -- the safe direction for a gate."""
+    errors = _frontend_errors(root, cfg, files)
+    if not errors:
+        return []
+    baseline = getattr(cfg, "_frontend_baseline", None)
+    if baseline is None:
+        return errors
+    return [e for e in errors if e not in baseline]
+
+
+def _capture_frontend_baseline(root, cfg) -> None:
+    """Record the frontend contract errors the project ALREADY has (whole
+    tree scan), so only breakage the current task introduces can gate it.
+    Cheap: regexes over a handful of HTML/JS files, one `node --check` each
+    at most, and a repo without a frontend returns before any of it."""
+    if not _frontend_enabled(cfg):
+        cfg._frontend_baseline = None
+        return
+    try:
+        from . import spec as spec_mod
+        cfg._frontend_baseline = set(
+            spec_mod.verify_frontend_contracts(root, None))
+    except Exception:
+        cfg._frontend_baseline = None
+
+
+# ------------------------------------------------ repair lesson distiller --
+#
+# A repair round that went broken -> fixed is the cheapest lesson the
+# repository will ever produce, and it normally evaporates with the session.
+# The distiller below is deliberately mechanical: it recognizes the failure
+# SHAPES the gates and pytest actually print (a DOM query with no element, a
+# link to a missing asset, an undefined name, a signature mismatch) and turns
+# one into a single line for the ledger (`memory.record_anti_pattern`). No
+# LLM prose: an invented lesson would teach the next session a fiction.
+
+_LESSON_FILE_RE = re.compile(
+    r"[\w./\\-]+\.(?:py|js|mjs|cjs|jsx|ts|tsx|html|htm|css)\b")
+
+
+def distill_repair_lesson(failure_text: str, check_label: str = ""):
+    """Reduce one gate/test failure blob to (kind, one-line lesson, files),
+    or None when no known pattern explains it. `check_label` is the gate
+    name the loop uses ("frontend contract", "static gate", "tests", ...);
+    the first recognizable pattern wins, so findings text should put the
+    root failure first. Deterministic: same text, same lesson, forever."""
+    text = str(failure_text or "")
+    if not text.strip():
+        return None
+    files = sorted({m.group(0).lstrip("./")
+                    for m in _LESSON_FILE_RE.finditer(text)})[:6]
+
+    def row(kind, msg):
+        return (kind, " ".join(str(msg).split())[:200], files)
+
+    m = re.search(r"queries DOM element '([^']+)'", text)
+    if m:
+        return row("dom_id_mismatch",
+                   f"{m.group(1)} was queried by JS but no rendered element "
+                   f"carried that id -- add the id to the template or query "
+                   f"what exists ({', '.join(files[:3]) or 'see finding'})")
+    m = re.search(r"references missing (?:script|stylesheet) asset "
+                  r"'([^']+)'", text)
+    if m:
+        return row("asset_404",
+                   f"HTML linked '{m.group(1)}' which did not exist -- "
+                   f"create the file or fix the path before linking it")
+    if re.search(r"does not parse|syntax error near", text):
+        return row("js_syntax",
+                   "an edit left a JS file unparsable -- a browser aborts "
+                   "the whole file on one syntax error; re-check the parse "
+                   "before calling a JS edit done")
+    if re.search(r"SyntaxError", text):
+        return row("syntax_error",
+                   "an edit left a Python file unparsable -- the traceback "
+                   "points at the line; fix the exact spot, not the outline")
+    m = re.search(r"undefined name '([^']+)'|NameError: name '([^']+)'",
+                  text)
+    if m:
+        name = m.group(1) or m.group(2)
+        return row("avoid_missing_import",
+                   f"'{name}' was used without being imported or defined at "
+                   f"that point -- import it where it is used, do not patch "
+                   f"around the name later")
+    m = re.search(r"cannot import name '?([^'\s]+)'?"
+                  r"|No module named '?([\w.\-]+)'?", text)
+    if m:
+        name = m.group(1) or m.group(2)
+        return row("missing_export",
+                   f"'{name}' could not be imported from the module that was "
+                   f"expected to provide it -- check the exporter's real "
+                   f"names (and the installed packages) before importing")
+    m = re.search(r"unexpected keyword argument '?([^'\s]+)'?"
+                  r"|(?:takes|accepts) \d+ positional arguments?", text)
+    if m:
+        detail = (f"keyword {m.group(1)}" if m.group(1)
+                  else "the positional count")
+        return row("signature_contract",
+                   "a call site did not match the function's real signature "
+                   f"(the caller disagreed on {detail}) -- reconcile caller "
+                   f"and callee in one step, never by renaming around it")
+    m = re.search(r"has no attribute '?([^'\s:]+)'?", text)
+    if m:
+        return row("missing_symbol",
+                   f"the module had no attribute '{m.group(1)}' at runtime "
+                   f"-- grep the exporter for the real name before calling it")
+    m = re.search(r"(?:FAILED|ERROR) ([\w./]+\.py::[\w.\[\]\-:]+)", text)
+    if m:
+        return row("broke_a_test",
+                   f"the last change made {m.group(1)} fail -- read what it "
+                   f"pins before editing the code it guards")
+    if re.search(r"^FAILED |^E +assert", text, re.M):
+        return row("failing_assertion",
+                   "an assertion the task was supposed to satisfy still "
+                   "failed -- run the test after the edit, not just before")
+    return None
+
+
+def _note_repair_failure(pending: list, kind: str, text: str) -> None:
+    """Remember a gate/test failure for later lesson distillation; the first
+    entry per kind wins (root causes precede follow-on noise)."""
+    if any(k == kind for k, _ in pending):
+        return
+    pending.append((kind, str(text or "")[:6000]))
+
+
+def _record_repair_lesson(root, cfg, pending: list,
+                          only_kinds=None, skip_kinds=None) -> int:
+    """Distill each remembered failure whose kind is in scope into the
+    ledger and remove it from `pending`. Gate findings are in scope once the
+    deterministic re-check passes; test findings need a green test run.
+    Returns the number of lessons recorded."""
+    n = 0
+    keep = []
+    for kind, text in pending:
+        k = str(kind).strip().lower()
+        if (only_kinds is not None and k not in only_kinds
+                or skip_kinds is not None and k in skip_kinds):
+            keep.append((kind, text))
+            continue
+        lesson = distill_repair_lesson(text, k)
+        if lesson is not None:
+            try:
+                from . import memory
+                if memory.record_anti_pattern(root, lesson[0], lesson[1],
+                                              lesson[2], cfg) is not None:
+                    n += 1
+            except Exception:
+                pass
+    pending[:] = keep
+    return n
+
+
 def _post_edit_tests(root, cfg, agent, idx, task, results, reply, backup_dir,
                      baseline, edit_files):
     """After edits were written, run the impacted tests (`verify_tests`).
@@ -1474,10 +1650,15 @@ def _post_edit_tests(root, cfg, agent, idx, task, results, reply, backup_dir,
     base_score = _failure_score(base_out) if base_out else 0
     max_rounds = max(0, int(getattr(cfg, "repair_rounds", 2) or 0))
     tests_ok = None
+    pending_lesson: list = []      # (kind, text) this task broke and can mend
     for round_ in range(max_rounds + 1):
         syntax = verify_mod.check_syntax(results)
         if syntax:
             tests_ok = False
+            if round_ < max_rounds:
+                _note_repair_failure(pending_lesson, "syntax",
+                                     "\n".join(str(f.message)
+                                               for f in syntax))
             print(f"  [syntax: {len(syntax)} new syntax error(s) -- "
                   f"test/lint subprocess skipped until the patch parses]",
                   file=sys.stderr)
@@ -1508,6 +1689,9 @@ def _post_edit_tests(root, cfg, agent, idx, task, results, reply, backup_dir,
         static = _new_static_errors(root, cfg, changed)
         if static:
             tests_ok = False
+            if round_ < max_rounds:
+                _note_repair_failure(pending_lesson, "static",
+                                     "\n".join(static))
             print(f"  [static gate: {len(static)} new undefined-name/import "
                   f"error(s) -- tests/lint subprocess skipped until they "
                   f"are fixed]", file=sys.stderr)
@@ -1539,10 +1723,68 @@ def _post_edit_tests(root, cfg, agent, idx, task, results, reply, backup_dir,
             changed = sorted({fileio_norm(r.file) for r in results if r.ok})
             continue
 
+        # DOM contract gate (TECHNIQUES.md #23): a broken <script src>, a
+        # query for an id no template defines, or a JS file that does not
+        # parse never raises here -- the browser is the only thing that
+        # notices, and it is not watching. The verifier checks exactly what
+        # the browser would enforce at load, for free, before the
+        # subprocess: an asset that 404s or an id typo costs a micro-repair
+        # round now instead of an invisible runtime `null` later.
+        fe = _new_frontend_errors(root, cfg, changed)
+        if fe:
+            tests_ok = False
+            if round_ < max_rounds:      # only a lesson if a repair can follow
+                _note_repair_failure(pending_lesson, "frontend contract",
+                                     "\n".join(fe))
+            print(f"  [frontend gate: {len(fe)} new DOM contract violation(s)"
+                  f" -- tests/lint subprocess skipped until they are fixed]",
+                  file=sys.stderr)
+            workspace.log_event(
+                root, "frontend contract gate rejected the patch; "
+                      "test/lint subprocess skipped", "ERROR")
+            events_mod.get(root, cfg).emit(
+                "tests", ok=False, score=len(fe), baseline=base_score,
+                round=round_, frontend=True, new=len(fe), fixed=0,
+                still_failing=0, pre_existing=len(base_failures))
+            if round_ >= max_rounds:
+                break
+            finding = verify_mod.Finding(
+                "frontend", "error", "",
+                "after your edits the HTML/JS breaks a DOM contract the "
+                "browser enforces at page load (a missing asset, a query "
+                "for an element id that is never rendered, or JS that does "
+                "not parse). No test or lint process was run. Fix these "
+                "first:\n"
+                + "\n".join(f"- {e}" for e in fe[:20]))
+            fixed = agent._repair_from_findings(task, reply, [finding],
+                                                results)
+            if not fixed:
+                break
+            new = agent._apply_once(fixed, False, backup_dir)
+            if not any(r.ok for r in new):
+                break
+            results = _merge_repair_results(results, new)
+            reply = (reply.rstrip() + "\n\n" + fixed)
+            changed = sorted({fileio_norm(r.file) for r in results if r.ok})
+            continue
+
+        if pending_lesson:
+            # Every gate this task tripped is green again (the deterministic
+            # re-check above just passed): distill what the failure was into
+            # the lesson ledger while the evidence is fresh. Test failures
+            # wait for a green test run to be proven.
+            _record_repair_lesson(root, cfg, pending_lesson,
+                                  skip_kinds={"tests"})
         got = _run_tests(idx, cfg, changed)
         if got is None:
             return results, reply, tests_ok
         ok, out, desc = got
+        if not ok and round_ < max_rounds:
+            _note_repair_failure(pending_lesson, "tests", out)
+        elif ok and pending_lesson:
+            # fail -> pass, proven by this green run: distill what it was,
+            # including any gate finding that preceded the passing tests
+            _record_repair_lesson(root, cfg, pending_lesson)
         tests_ok = ok
         score = 0 if ok else _failure_score(out)
         current = failure_identities(out)
@@ -2183,6 +2425,9 @@ def _run_task_once(root: Path, cfg, client, agent, idx, task: str, *,
         # it stands, so pre-existing undefined names are not blamed on this
         # task (the `auto` loop records this per step instead).
         _capture_static_baseline(root, cfg)
+    if (_frontend_enabled(cfg) and not getattr(cfg, "_auto_step", 0)
+            and getattr(cfg, "_frontend_baseline", None) is None):
+        _capture_frontend_baseline(root, cfg)
     backup_dir = (workspace.new_backup_dir(root, when, unique=True)
                   if wants_write and cfg.backup else None)
     t_started = time.time()
@@ -2826,6 +3071,7 @@ def run_loop(root: Path, cfg, client, idx, plan_path: Path, *,
         # the step's own errors are repairable, not "pre-existing").
         cfg._auto_step = attempted
         _capture_static_baseline(root, cfg)
+        _capture_frontend_baseline(root, cfg)
 
         investigate = _is_investigation_task(task)
         task_for_agent = task + _evidence_hint(task)
@@ -3086,7 +3332,8 @@ def run_loop(root: Path, cfg, client, idx, plan_path: Path, *,
         # typechecker findings for the changed files play the same role.
         passed = True
         dep_blocked: list[str] = []
-        if verify or use_diag or spec_mod is not None:
+        if (verify or use_diag or spec_mod is not None
+                or _frontend_enabled(cfg)):
             from . import verify as verify_mod
 
             def _gated_check(result):
@@ -3115,6 +3362,23 @@ def run_loop(root: Path, cfg, client, idx, plan_path: Path, *,
                             "`__all__` entry); no test or lint subprocess "
                             "was run. Fix these first:\n"
                             + "\n".join(f"- {e}" for e in static[:25]))
+                    fe = _new_frontend_errors(
+                        root, cfg, getattr(result, "changed", None) or [])
+                    if fe:
+                        workspace.log_event(
+                            root, "frontend contract gate rejected the step; "
+                                  "verify subprocess skipped", "ERROR")
+                        print(f"  [frontend gate: {len(fe)} new DOM contract "
+                              f"violation(s); {check_label} subprocess "
+                              f"skipped]", file=sys.stderr)
+                        return False, (
+                            "FRONTEND DOM CONTRACT GATE -- the changed "
+                            "HTML/JS breaks a contract the browser enforces "
+                            "at page load (an asset that would 404, a query "
+                            "for an element id nothing renders, or JS that "
+                            "does not parse); no test or lint subprocess "
+                            "was run. Fix these first:\n"
+                            + "\n".join(f"- {e}" for e in fe[:25]))
                     ok, out = run_check(result.changed)
                     if ok and spec_mod is not None:
                         try:
@@ -3148,6 +3412,7 @@ def run_loop(root: Path, cfg, client, idx, plan_path: Path, *,
             # holds the state before that round's writes), keeping the
             # better earlier state, and repair stops.
             prev_score = None if passed else _failure_score(output, use_diag)
+            lesson_seen = "" if passed else str(output)[:6000]
             while not passed:
                 # A missing third-party package is NOT a code bug: editing
                 # source cannot add a dependency. Install it if the user opted
@@ -3229,6 +3494,13 @@ def run_loop(root: Path, cfg, client, idx, plan_path: Path, *,
                         break
                     prev_score = score
                 rounds -= 1
+
+            if passed and lesson_seen and rounds < repair_rounds:
+                # This task's own repair rounds turned a failing check green:
+                # distill what it was into the lesson ledger, while the
+                # evidence is fresh. One line, mechanical, no LLM prose.
+                _record_repair_lesson(root, cfg, [("verify", lesson_seen)])
+            lesson_seen = ""
 
         if not passed:
             if dep_blocked:

@@ -695,6 +695,166 @@ decisions the guards cannot make:
 The guards cost no model tokens. The broker costs only the human's time, and it is
 reached only for an action the deterministic checks could not settle.
 
+---
+
+### 22. `run_test`: a micro-dose of live evidence inside the gather phase
+
+The evidence rules (§3, §5) say a claim of "tested, all green" without a
+real test run is a lie the loop refuses. But during *investigation* the
+model has no execution tool at all: it guesses what a fix will do, writes
+it, and only then -- seconds and tokens later -- discovers it guessed
+wrong. `run_test` micro-doses execution into gather: one scoped pytest
+run, with the harness owning every parameter.
+
+```json
+{"action": "run_test", "target": "tests/test_app.py::test_save",
+ "filter": "save or retry"}
+```
+
+- **No shell, structurally.** The observation comes from an argv list
+  (`python -m pytest -q --tb=short --maxfail=3 ...`) through the same
+  sandbox wrapper as `run`, so pipes, semicolons and backticks are inert
+  characters in an argument -- nothing interprets them. The file portion of
+  `target` goes through `security.resolve_safe_path` (no traversal, no
+  symlink escape, must exist), which makes a `"tests; rm -rf /"` string a
+  nonexistent path, not a command; the node-id portion must match a
+  conservative charset; a `filter` starting with `-` is refused (it would
+  read as an option). There is no path from these fields to a shell.
+- **Cheap and bounded.** The timeout is `min(test_timeout, 15)` seconds with
+  the same idle kill; collection errors and the tail count as bounded as
+  well. The output is *not* the raw transcript: the harness renders a tally
+  line, then up to four condensed failure blocks (project frames only, the
+  traceback condenser from the repair path), and caps the whole observation
+  at `max_read_tokens`. A green run is reported as green with an explicit
+  "do not re-run to watch it pass again" line.
+- **Offered when it can help.** `run_test` joins the step schema when the
+  repository visibly has tests (`tests/`, `test_*.py`, `*.test.js`) or the
+  task text names a failure (test/fail/bug/fix/error/traceback/reproduce/
+  broken); dynamic pruning (§15) never hides it while the repo has tests --
+  a stale usage counter must not remove the one tool that turns a guess
+  into evidence. It is a step-phase tool: the final answer phase has no
+  tools at all, and the `done` action still ends gather with full honesty
+  rules unchanged.
+- **Still permissioned.** With `enable_run_test_in_gather = false` every
+  invocation parks at the permission broker under the *Test Execution*
+  category (Allow Once / Always Allow / Deny), the same as unapproved
+  shell; CLI runs without a broker report it as disabled instead of
+  pretending otherwise.
+- **It feeds the ledger too.** Each run is recorded through the
+  micro-facts observer (§14), so a suite command that works twice becomes a
+  confirmed repository fact; a contradiction retires it.
+
+The point is not to let the model run anything: it is that "read the live
+traceback before writing the edit" is now possible for zero configuration,
+and still cannot become a shell. Ablation flag: set
+`enable_run_test_in_gather = false` to gate every run through the human.
+
+---
+
+### 23. The DOM contract gate: what a browser would check at page load
+
+Import and signature contracts have a deterministic twin on the browser
+side, and nothing in the Python test stack can see it: a `<script
+src="app.js">` renamed on one side only, a `getElementById('save-btn')`
+against a template that renders `id="save-button"`, an `app.js` whose last
+edit left one brace open. Each of these is a *runtime* error in a browser
+and a *silent* one in the loop -- the task verifies green and ships a page
+that does not load. `verify_frontend_contracts` (in `spec.py`, beside the
+static gate) closes that gap with three mechanical checks:
+
+- **Asset link integrity.** Every `<script src>` and stylesheet `<link href>`
+  in every HTML file resolves against the file's own directory and the
+  project root; a missing target is an error. External URLs, `data:` URIs
+  and template placeholders (`{{ ... }}`, `<%= ... %>`, `${...}`) are
+  skipped -- static verification cannot see the real path of a routed
+  asset, and guessing is not verification.
+- **DOM id cross-reference.** Every *literal* query
+  (`getElementById('x')`, `querySelector('#x')`) must match an `id="x"` in
+  some HTML file -- or a literal id the JS itself creates (`.id = 'x'`,
+  `setAttribute('id', 'x')`, ids inside template strings). When a file
+  builds ids with interpolation (`id = \`row-${i}\``), its queries are
+  exempt: a moving target cannot be verified, and claiming otherwise would
+  block real code with fake errors. An id that exists in zero templates
+  without dynamic generation is the classic typo, and is reported against
+  the files that define the id space it missed.
+- **JS parses.** `node --check` is the ground truth when node is installed;
+  otherwise the tree-sitter grammar the indexer already uses reports the
+  first ERROR node. With neither available the check stays silent -- no
+  regex pretends to be a JS parser.
+
+Errors share the shape the repair path already reads:
+
+```
+FrontendContractError in app.js:42: queries DOM element '#add-task-btn',
+but index.html only defines ids ['board', 'new-task-btn', 'todo-col'] --
+render it, or fix the selector
+```
+
+- **Baseline-diffed like the static gate (§19).** The whole-tree scan runs
+  once per step/task (`_capture_frontend_baseline`); only errors that are
+  NEW for the current task block it. Pre-existing rot elsewhere in the
+  project cannot sink an unrelated change.
+- **Scoped like the contract gate.** With a touched-file list, only errors
+  in those files report -- plus one deliberate exception: when an HTML file
+  changed, every JS file's queries are re-verified against the moved id
+  registry, because that is exactly how an edit to a template silently
+  breaks a script.
+- **Where it fires.** In `_post_edit_tests` after the static gate and
+  before the test subprocess, and in `run_loop`'s `_gated_check` beside the
+  syntax and cross-file contract gates: findings go to `_repair_from_findings`,
+  the fix is applied, and the subprocess (which could never have caught
+  these anyway) is skipped until the page would load.
+
+A repo without HTML/JS exits before opening a file, so the gate is on by
+default and free there. Ablation flag: `frontend_contracts = false`.
+
+---
+
+### 24. The repair lesson ledger: distilled anti-patterns in micro_facts
+
+A round of `auto` that went broken -> fixed is the cheapest lesson a
+repository will ever produce -- the harness already knows what failed, what
+the repair was, and that it worked -- and today that knowledge evaporates
+with the session, so the next session pays the same tuition. The anti-pattern
+ledger keeps it: at most eight one-line lessons in
+`.pedacito/micro_facts.json` under `"anti_patterns"`, injected into the
+stable prefix right after the micro-facts (§14):
+
+```
+[REPO GOTCHAS & LESSONS] (repair lessons distilled from earlier runs;
+hints, not truth):
+- dom_id_mismatch: '#add-task-btn' was queried by JS but no rendered
+  element carried that id -- add the id to the template or query what exists
+```
+
+- **When it writes.** Only on a proven transition: a gate (syntax, static,
+  frontend contract) or a test run that went red *during this task* and is
+  green again after the task's own repair rounds, at round >= 1. A lesson
+  requires the evidence that the fix worked -- an unverified lesson is a
+  rumour.
+- **What it writes.** `distill_repair_lesson` recognizes the failure
+  *shapes* the gates and pytest actually print -- a DOM query with no
+  element, a link to a missing asset, an undefined name (F821/NameError),
+  an unsatisfiable signature, an import that cannot resolve, a module
+  attribute that does not exist, the first failing test id -- and renders
+  one line from a fixed template. No LLM prose: an invented lesson would
+  teach the next session a fiction, and a distilled one can be checked by
+  the same deterministic tools that produced it.
+- **Bounded and self-cleaning.** Eight rows max, deduplicated by hash of
+  kind + text; repeats bump `confirmations` and refresh `last_seen` instead
+  of growing the file. Lessons carry the files they name, and a lesson whose
+  files have all been deleted is retired -- dropped from the document, not
+  just hidden -- because a warning about a component that no longer exists
+  would teach the model to dodge a ghost. The render budget is the same
+  `max_micro_fact_tokens` knob; overflow drops the oldest lines first.
+- **Hint, never truth.** Like micro-facts and memory, the block is labelled
+  and sits in the prompt only: the loop re-checks everything live, so a
+  wrong lesson costs a glance, not a wrong decision.
+
+Zero model calls, zero subprocesses; one `sha1` and one small JSON rewrite
+per proven fix. Ablation flag: `micro_facts = false` silences recording and
+injection together with §14.
+
 ## Techniques that exist but are not a good fit
 
 These are real methods with real literature behind them. Pedacito rejects them

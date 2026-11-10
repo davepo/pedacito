@@ -1533,6 +1533,229 @@ class _StaticResolver:
 _AST_CACHE: dict[str, tuple[int, int, list[str]]] = {}
 
 
+# --------------------------------------------- frontend DOM contracts gate
+# The deterministic twin of the import/endpoint gate for the browser side.
+# An HTML+JS project drifts silently when an asset link rots, a script
+# queries a DOM id no template ever defines, or app.js stops parsing: none
+# of it raises until a human opens the page. Each check below is a regex or
+# a subprocess the harness runs itself, so it costs nothing and invents
+# nothing. Errors render in the same `...ContractError in <path>:<line>:
+# <what the two sides disagree on>` shape that verify_cross_file_contracts
+# uses, so the loop's repair path reads them unchanged.
+
+_FE_HTML_EXTS = {".html", ".htm"}
+_FE_JS_EXTS = {".js", ".mjs", ".cjs"}
+_FE_SCRIPT_SRC_RE = re.compile(
+    r"<script\b[^>]*\bsrc\s*=\s*[\"']([^\"']+)[\"']", re.I)
+_FE_LINK_RE = re.compile(r"<link\b[^>]*>", re.I)
+_FE_HREF_RE = re.compile(r"\bhref\s*=\s*[\"']([^\"']+)[\"']", re.I)
+_FE_REL_RE = re.compile(r"\brel\s*=\s*[\"']([^\"']*)[\"']", re.I)
+_FE_ID_ATTR_RE = re.compile(r"\bid\s*=\s*[\"']([A-Za-z][\w:.\-]*)[\"']")
+_FE_GETID_RE = re.compile(r"""getElementById\(\s*(['"])([^'"]+)\1\s*\)""")
+_FE_QS_ID_RE = re.compile(
+    r"""querySelector(?:All)?\(\s*(['"])#([A-Za-z][\w:.\-]*)\1\s*\)""")
+_FE_SETID_RE = re.compile(r"""\.id\s*=\s*(['"])([^'"]+)\1""")
+_FE_SETATTR_ID_RE = re.compile(
+    r"""setAttribute\(\s*(['"])id\1\s*,\s*(['"])([^'"]+)\2\s*\)""")
+# a template literal that INTERPOLATES a backtick-quoted id (` `#${x}-row` `)
+# means the id space is generated at runtime: no static query can be verified
+# against it, so the file's id queries are exempt rather than guessed at.
+_FE_TEMPLATE_INTERP_ID_RE = re.compile(
+    r"id\s*=\s*(?:\\?[\"'])?\s*\$\{|[\"'`]\s*(?:#)?\s*\$\{")
+# placeholders that mean "a server or template layer fills this in at render
+# time" -- static verification cannot see the real path, so skip it.
+_FE_TEMPLATE_REF_RE = re.compile(r"\{\{|\{%|<%[=.]?|\$\{")
+# a bare `#anchor` in a stylesheet link or script src is in-page, not a file
+_FE_ASSET_EXTS = (".js", ".mjs", ".cjs", ".css", ".html", ".htm")
+_FE_ERRORS_CAP = 20
+
+
+def _fe_line(text: str, pos: int) -> int:
+    return text.count("\n", 0, pos) + 1
+
+
+def _fe_external(ref: str) -> bool:
+    ref = ref.strip()
+    return (not ref or ref.startswith(("http://", "https://", "//", "data:",
+                                       "blob:", "mailto:", "#"))
+            or _FE_TEMPLATE_REF_RE.search(ref) is not None)
+
+
+def _fe_js_syntax_problem(rel: str, text: str) -> str | None:
+    """Return `line: message` when `rel` does not parse, else None.
+    `node --check` is the ground truth when node is installed; otherwise the
+    tree-sitter grammar the indexer already uses reports the first ERROR
+    node. No parser available: the check stays silent, never a guess."""
+    node = shutil.which("node")
+    if node:
+        try:
+            proc = subprocess.run([node, "--check", "-"],
+                                  input=text.encode("utf-8", "replace"),
+                                  capture_output=True, timeout=15,
+                                  stdin=subprocess.PIPE)
+            if proc.returncode == 0:
+                return None
+            stderr = (proc.stderr or b"").decode("utf-8", "replace")
+            line = 1
+            msg = ""
+            m = re.search(r"file\S*?:(\d+)", stderr)
+            if m:
+                line = int(m.group(1))
+            for ln in stderr.splitlines():
+                if ln.strip().endswith("Error: " + ln.strip()[ln.strip().find(":") + 1:]) \
+                        or "Error:" in ln:
+                    msg = ln.strip()
+                    break
+            return f"{line}: {msg[:200] or 'node --check failed'}"
+        except (OSError, subprocess.TimeoutExpired):
+            pass  # node unusable right now: fall through to tree-sitter
+    try:
+        from . import chunker_ts
+        parser = chunker_ts._get_parser("javascript")
+    except Exception:
+        parser = None
+    if parser is None:
+        return None
+    try:
+        tree = parser.parse(text.encode("utf-8", "replace"))
+    except Exception:
+        return None
+    root_node = tree.root_node
+    if not root_node.has_error:
+        return None
+    node = root_node
+    while True:
+        bad = next((c for c in node.children
+                    if c.type == "ERROR" or c.is_missing), None)
+        if bad is None:
+            break
+        node = bad
+    line = node.start_point[0] + 1
+    where = node.text.decode("utf-8", "replace")[:60].replace("\n", " ")
+    return f"{line}: syntax error near {where!r}"
+
+
+def verify_frontend_contracts(root: Path, modified_files=None) -> list[str]:
+    """Deterministic DOM Contract verification of the HTML/JS in `root`.
+
+    Three checks, all mechanical: (1) every <script src> / stylesheet <link
+    href> in every HTML file points at a file that exists; (2) every literal
+    DOM query (getElementById('x') / querySelector('#x')) matches an id the
+    HTML defines (or a literal id the JS itself creates); files whose ids are
+    generated in template literals are exempt -- nothing is verified against
+    a moving target; (3) every JS file parses, via `node --check` when node
+    is installed and tree-sitter otherwise.
+
+    `modified_files` (root-relative paths, as the loop reports them) scopes
+    the REPORT: only errors inside those files come back, so a pre-existing
+    rot elsewhere cannot block the current task. Pass None/empty to verify
+    the whole frontend (scaffold and one-shot audits). Returns plain strings,
+    sorted, capped -- deterministic, no LLM."""
+    root = Path(root)
+    html_rels = _iter_code_files(root, _FE_HTML_EXTS)
+    js_rels = _iter_code_files(root, _FE_JS_EXTS)
+    if not html_rels and not js_rels:
+        return []
+    scope = None
+    if modified_files:
+        scope = set()
+        for f in modified_files:
+            try:
+                scope.add(Path(str(f)).relative_to(root).as_posix())
+            except (ValueError, OSError, TypeError):
+                scope.add(str(f).replace("\\", "/"))
+    html_text = {rel: _read(rel, root) for rel in html_rels}
+    js_text = {rel: _read(rel, root) for rel in js_rels}
+    errors: list[str] = []
+
+    html_changed = scope is not None and any(
+        rel in scope for rel in html_rels)
+    if scope is not None and not html_changed \
+            and not any(rel in scope for rel in js_rels):
+        return []   # an edit to a non-frontend file cannot break a DOM contract
+
+    def note(rel: str, line: int, msg: str, peer: bool = False) -> None:
+        if scope is None or rel in scope:
+            errors.append(f"FrontendContractError in {rel}:{line}: {msg}")
+        elif peer and html_changed:
+            # the id registry moved: a query in UNTOUCHED JS can have been
+            # broken by the HTML edit, and that is this task's breakage
+            errors.append(f"FrontendContractError in {rel}:{line}: {msg}")
+
+    # 1. asset link integrity: html references a script/css path, file absent
+    for rel, text in html_text.items():
+        refs = []
+        for m in _FE_SCRIPT_SRC_RE.finditer(text):
+            refs.append((m.group(1), m.start(), "script"))
+        for m in _FE_LINK_RE.finditer(text):
+            tag = m.group(0)
+            if "stylesheet" not in (_FE_REL_RE.search(tag).group(1).lower()
+                                    if _FE_REL_RE.search(tag) else ""):
+                continue
+            hm = _FE_HREF_RE.search(tag)
+            if hm:
+                refs.append((hm.group(1), m.start(), "stylesheet"))
+        for ref, pos, kind in refs:
+            if _fe_external(ref):
+                continue
+            clean = ref.split("?")[0].split("#")[0]
+            if not clean or not clean.lower().endswith(_FE_ASSET_EXTS):
+                continue  # an extensionless ref is a route, not an asset file
+            base = (root / rel).parent
+            cand = [(base / clean), (root / clean.lstrip("/"))]
+            if not any(c.exists() for c in cand):
+                note(rel, _fe_line(text, pos),
+                     f"references missing {kind} asset '{ref}' -- create the "
+                     f"file or fix the path; the browser would 404 it")
+
+    # 2. DOM id cross-reference: JS queries vs ids the HTML/JS defines
+    defined_ids: set[str] = set()
+    html_names: list[str] = []
+    for rel, text in html_text.items():
+        found = set(_FE_ID_ATTR_RE.findall(text))
+        if found:
+            defined_ids |= found
+            html_names.append(rel)
+    dynamic_js = {rel for rel, text in js_text.items()
+                  if _FE_TEMPLATE_INTERP_ID_RE.search(text)}
+    if (html_text or defined_ids) and js_text:
+        for rel, text in js_text.items():
+            for m in _FE_SETID_RE.finditer(text):
+                defined_ids.add(m.group(2))
+            for m in _FE_SETATTR_ID_RE.finditer(text):
+                defined_ids.add(m.group(3))
+    for rel, text in js_text.items():
+        if rel in dynamic_js:
+            continue  # this file builds ids at runtime; nothing to verify
+        if scope is not None and rel not in scope and not html_changed:
+            continue  # neither this file nor the id registry was touched
+        queries = [(m.group(2), m.start()) for m in _FE_GETID_RE.finditer(text)]
+        queries += [(m.group(2), m.start())
+                    for m in _FE_QS_ID_RE.finditer(text)]
+        for ident, pos in sorted(set(queries), key=lambda t: t[1]):
+            if ident in defined_ids or "%" in ident:
+                continue
+            if not html_text:
+                break  # no templates at all: queries belong to a lib/test
+            known = sorted(defined_ids)[:5]
+            where = ", ".join(html_names[:3]) if html_names else "any script"
+            note(rel, _fe_line(text, pos),
+                 f"queries DOM element '#{ident}', but {where} only defines "
+                 f"ids {known or '[]'} -- render it, or fix the selector",
+                 peer=True)
+
+    # 3. JS syntax: the file must parse or the browser aborts it entirely
+    for rel, text in js_text.items():
+        if not text.strip():
+            continue
+        problem = _fe_js_syntax_problem(rel, text)
+        if problem:
+            line, _, msg = problem.partition(": ")
+            note(rel, int(line) if line.isdigit() else 1,
+                 f"does not parse -- {msg[:220]}")
+    return sorted(set(errors))[:_FE_ERRORS_CAP]
+
+
 def _ast_gate_file(root: Path, path: Path) -> list[str]:
     try:
         st = path.stat()

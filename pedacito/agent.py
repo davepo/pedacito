@@ -88,7 +88,7 @@ _CACHEABLE_ACTIONS = {"grep", "find", "outline", "usages", "callers",
                       "fetch", "fetch_url", "web_search"}
 # Steps that can change what the cacheable ones return.
 _MUTATING = {"write", "append", "move", "delete", "undo", "rename", "run",
-             "browser", "screenshot", "mcp", "task"}
+             "run_test", "browser", "screenshot", "mcp", "task"}
 
 # Steps discarded for a cut-off payload before gather gives up.
 _MAX_PAYLOAD_CUTS = 2
@@ -1747,6 +1747,12 @@ class Agent:
             micro_notes = ""
         if micro_notes:
             system += "\n\n" + micro_notes
+        try:
+            lesson_notes = memory_mod.render_anti_patterns(root, self.cfg)
+        except Exception:
+            lesson_notes = ""
+        if lesson_notes:
+            system += "\n\n" + lesson_notes
         if "skill" in schema_for(self.cfg)["properties"]["action"]["enum"]:
             skill_notes = skills_mod.catalog(root, self.cfg, task=task)
             if skill_notes:
@@ -2172,6 +2178,11 @@ class Agent:
                 detail = f"{stepjson.get('file')} -> {stepjson.get('to')}"
             elif action == "run":
                 detail = stepjson.get("command", "")
+            elif action == "run_test":
+                detail = ((stepjson.get("target")
+                           or stepjson.get("file") or "(whole suite)")
+                          + (f" -k {stepjson.get('filter')}"
+                             if stepjson.get("filter") else ""))
             elif action == "browser":
                 detail = ((stepjson.get("command") or "")
                           + (f" [{stepjson.get('pattern')}]"
@@ -2343,7 +2354,7 @@ class Agent:
                                           ok=not obs.startswith("ERROR"))
                         if post.context and not obs.startswith("ERROR"):
                             obs += f"\n[hook output: {post.context}]"
-                    if (action in ("run", "screenshot", "browser")
+                    if (action in ("run", "run_test", "screenshot", "browser")
                             and not obs.startswith("ERROR")):
                         self.live_evidence_ok = True
                 except Exception as e:
@@ -3526,6 +3537,11 @@ class Agent:
             micro_notes = memory_mod.render_micro_facts(self.index.root, self.cfg)
         except Exception:
             micro_notes = ""
+        try:
+            lesson_notes = memory_mod.render_anti_patterns(self.index.root,
+                                                           self.cfg)
+        except Exception:
+            lesson_notes = ""
         notes_prefix = ""
         if project_notes:
             notes_prefix += project_notes + "\n\n"
@@ -3533,6 +3549,8 @@ class Agent:
             notes_prefix += memory_notes + "\n\n"
         if micro_notes:
             notes_prefix += micro_notes + "\n\n"
+        if lesson_notes:
+            notes_prefix += lesson_notes + "\n\n"
         if todo_notes:
             notes_prefix += todo_notes + "\n\n"
         if getattr(self.cfg, "allow_mcp", False):

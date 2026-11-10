@@ -942,6 +942,8 @@ class State:
                                   security.CAT_SHELL: "allow_shell",
                                   security.CAT_PACKAGE_INSTALL:
                                       "auto_install_deps",
+                                  security.CAT_TEST_EXECUTION:
+                                      "enable_run_test_in_gather",
                                   }.get(category)
         with self.lock:
             cfg = self.cfg

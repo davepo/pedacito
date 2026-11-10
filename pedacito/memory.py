@@ -299,7 +299,11 @@ def _write_json(path: Path, data) -> None:
 
 
 def _facts_doc(root) -> dict:
-    """The micro-fact document: {facts, pending, retired}."""
+    """The micro-fact document: {facts, pending, retired, anti_patterns}.
+
+    Rebuilt from a whitelist of keys on every read, so any writer sees the
+    same shape; `anti_patterns` (the repair lesson ledger) must be listed
+    here or another writer's round-trip would silently drop it."""
     raw = _read_json(micro_facts_file(root), {})
     facts = [f for f in raw.get("facts", ())
              if isinstance(f, dict) and f.get("fact_id") and f.get("text")]
@@ -307,9 +311,110 @@ def _facts_doc(root) -> dict:
                if isinstance(f, dict) and f.get("fact_id") and f.get("text")]
     retired = [f for f in raw.get("retired", ())
                if isinstance(f, dict) and f.get("fact_id")]
+    anti = [a for a in raw.get("anti_patterns", ())
+            if isinstance(a, dict) and a.get("lesson_id") and a.get("text")]
     return {"facts": facts[-_MAX_MICRO_FACTS:],
             "pending": pending[-_MAX_PENDING_FACTS:],
-            "retired": retired[-_MAX_MICRO_FACTS:]}
+            "retired": retired[-_MAX_MICRO_FACTS:],
+            "anti_patterns": anti[-_MAX_ANTI_PATTERNS:]}
+
+
+# ------------------------------------------------- repair lesson ledger ---
+#
+# A round of the auto loop that went broken -> fixed is the cheapest lesson
+# the repository will ever produce: the tooling already knows what failed,
+# what the repair was, and that it worked. Most of that knowledge evaporates
+# when the session ends, so the next session pays the same tuition. Each
+# lesson is ONE line, distilled mechanically from the check findings (never
+# from LLM prose: the distilled kind and file set are what make the line
+# trustworthy), capped at eight, and auto-retired once the files it names
+# are gone. These are hints injected under [REPO GOTCHAS & LESSONS], not
+# truth; the loop still re-checks everything live.
+
+_MAX_ANTI_PATTERNS = 8
+
+
+def _lesson_identity(kind: str, text: str) -> str:
+    norm = " ".join(str(text or "").split()).lower()
+    digest = hashlib.sha1(norm.encode("utf-8", "replace")).hexdigest()
+    return f"ap:{str(kind or '').strip().lower()}:{digest[:12]}"
+
+
+def record_anti_pattern(root, kind: str, text: str,
+                        files=(), cfg=None) -> dict | None:
+    """Add one distilled repair lesson; duplicates bump `confirmations`
+    instead of growing the ledger. Oldest lessons are evicted past the cap.
+    Returns the stored row, or None when refused (feature off, empty or
+    injection-shaped text)."""
+    if cfg is not None and not getattr(cfg, "micro_facts", True):
+        return None
+    kind = str(kind or "").strip().lower()[:32]
+    text = " ".join(str(text or "").split())[:300]
+    if not kind or not text:
+        return None
+    # No injection screen here, unlike `remember`: lessons are distilled
+    # mechanically by loop.distill_repair_lesson from gate findings and test
+    # output, and its capture regexes (ids, names, module paths) admit no
+    # free text at all -- an instruction-shaped lesson cannot be produced.
+    lesson_id = _lesson_identity(kind, text)
+    now = time.time()
+    doc = _facts_doc(root)
+    existing = next((a for a in doc["anti_patterns"]
+                     if a.get("lesson_id") == lesson_id), None)
+    if existing is not None:
+        existing["confirmations"] = int(existing.get("confirmations", 1) or 1) + 1
+        existing["last_seen"] = now
+        existing["files"] = sorted({str(f) for f in (files or ())}
+                                   | {str(f) for f in existing.get("files", ())})[:8]
+        _write_json(micro_facts_file(root), doc)
+        return existing
+    row = {"lesson_id": lesson_id, "kind": kind, "text": text,
+           "files": sorted({str(f) for f in (files or ())})[:8],
+           "confirmations": 1, "last_seen": now}
+    doc["anti_patterns"].append(row)
+    doc["anti_patterns"] = doc["anti_patterns"][-_MAX_ANTI_PATTERNS:]
+    _write_json(micro_facts_file(root), doc)
+    return row
+
+
+def load_anti_patterns(root, prune: bool = True) -> list[dict]:
+    """Live lessons; entries whose every named file is gone are retired and
+    dropped from the document (a lesson about a deleted component would
+    otherwise outlive the thing it warns about)."""
+    root = Path(root) if root else None
+    doc = _facts_doc(root)
+    live, gone = [], []
+    for a in doc["anti_patterns"]:
+        files = [f for f in a.get("files", ()) if str(f).strip()]
+        if files and root is not None and prune \
+                and not any((root / str(f)).exists() for f in files):
+            gone.append(a)
+        else:
+            live.append(a)
+    if gone and root is not None:
+        doc["anti_patterns"] = live
+        _write_json(micro_facts_file(root), doc)
+    return live
+
+
+def render_anti_patterns(root, cfg=None, limit: int | None = None) -> str:
+    """The lesson ledger as a short stable-prefix block ('' when empty)."""
+    if cfg is not None and not getattr(cfg, "micro_facts", True):
+        return ""
+    rows = load_anti_patterns(root)
+    if not rows:
+        return ""
+    rows = sorted(rows, key=lambda a: (-float(a.get("last_seen", 0) or 0),
+                                       str(a.get("kind", ""))))
+    tokens = int(limit if limit is not None
+                 else getattr(cfg, "max_micro_fact_tokens", 150) or 150)
+    budget = max(160, tokens * 4)
+    head = ("[REPO GOTCHAS & LESSONS] (repair lessons distilled from earlier "
+            "runs; hints, not truth):")
+    lines = [f"- {a.get('kind', 'note')}: {a['text']}" for a in rows]
+    while lines and len(head) + 1 + sum(len(x) + 1 for x in lines) > budget:
+        lines.pop()                    # oldest lessons first to go
+    return head + "\n" + "\n".join(lines) if lines else ""
 
 
 def load_micro_facts(root, include_retired: bool = False) -> list[dict]:
