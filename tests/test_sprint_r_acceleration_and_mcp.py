@@ -1,4 +1,4 @@
-"""Sprint R: local-inference payload acceleration (cache_prompt +
+"""Local-inference payload acceleration (cache_prompt +
 prompt_lookup_num_tokens with a 400/422 strip-and-retry fallback) and the
 pruned, permission-gated named-server MCP bridge (`mcp_call`).
 

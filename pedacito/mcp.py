@@ -21,7 +21,7 @@ or desynced session is dropped and the call retried once on a fresh server;
 ends, so no orphan server outlives the run. The catalog listing still uses
 one throwaway session per server, since it is fetched at most once.
 
-Sprint R adds a second, pruned path: named `[mcp_servers.<name>]` tables
+A second, pruned path adds named `[mcp_servers.<name>]` tables
 (command + args for a stdio server, or url for a Streamable HTTP one, plus
 env/enabled/trusted). `list_mcp_tools` returns descriptors,
 `call_mcp_tool` invokes one named tool and caps the result at
@@ -251,7 +251,7 @@ def close_all() -> None:
     _COOLDOWN.clear()
     _EXTRA_CACHE.clear()
     _EXTRA_TIME.clear()
-    # Named (Sprint R) sessions and their tool listings.
+    # Named-server sessions and their tool listings.
     for name in list(_NAMED_SESSIONS):
         _drop_named_session(name)
     _NAMED_TOOLS.clear()
@@ -648,7 +648,7 @@ def call(cfg, target: str, args: dict | None = None) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Sprint R: named servers, pruned injection, permission-gated calls
+# Named servers, pruned injection, permission-gated calls
 # ---------------------------------------------------------------------------
 # The legacy path above exposes EVERY tool of EVERY server to the model at
 # once. The named-table path instead lists each configured server's tools

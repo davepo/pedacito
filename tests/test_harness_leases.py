@@ -1,4 +1,4 @@
-"""Sprint 1 global gather bounds (upgrade plan A/B):
+"""Global gather bounds:
 
 A. the action-independent no-progress lease and the model-call ceiling, which
    bound gather even when `max_steps = 0` removes the fixed lookup cap;

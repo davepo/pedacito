@@ -374,7 +374,7 @@ class State:
         self._rid = 0
         self.apply_lock = threading.Lock()
 
-        # Live Permission Broker (Sprint L): a gated tool call (web fetch,
+        # Live Permission Broker: a gated tool call (web fetch,
         # pip install, unapproved shell command, sensitive file read) parks
         # its worker thread here until the browser modal answers, the
         # request matches an "Allow for Run" pattern, or it times out into a
@@ -858,7 +858,7 @@ class State:
                 "read_spans": read_spans,
                 "requirements": requirements[:8], "actions": actions}
 
-    # --- live permission broker (Sprint L) ---------------------------------------
+    # --- live permission broker ----------------------------------------------
 
     def _refresh_pending_locked(self) -> None:
         """`pending_permission` mirrors the oldest unanswered request (the
@@ -1224,7 +1224,7 @@ class State:
                 "profiles": sorted(cfg.profiles) if cfg else [],
                 "profile_models": profile_models,
                 "default_profile": cfg.default_profile if cfg else "",
-                # scout/architect split (Sprint Q): the gather-phase scout
+                # scout/architect split: the gather-phase scout
                 # profile as the topbar badge should show it -- "" when unset,
                 # when it names no real profile, or when it equals the active
                 # profile (the architect then already runs gather itself).

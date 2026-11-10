@@ -28,6 +28,8 @@ from __future__ import annotations
 
 import ast
 import builtins
+import contextlib
+import functools
 import re
 import shutil
 import subprocess
@@ -36,7 +38,7 @@ from pathlib import Path
 from typing import Iterable
 
 from . import fileio
-from .chunker import DEF_NODES, _signature
+from .chunker import DEF_NODES, _docline, _signature
 
 # Directories no project check should ever walk into.
 SKIP_DIRS = {".git", ".pedacito", ".hg", ".svn", "node_modules", "__pycache__",
@@ -256,12 +258,9 @@ def _fixture_decorator(node: ast.AST) -> tuple[bool, str]:
 def _fixture_hint(node: ast.AST) -> str:
     """One truncated line describing a fixture: its docstring, else a yield
     hint (`yields <expr>`) when it is a generator fixture."""
-    try:
-        doc = ast.get_docstring(node)
-    except Exception:
-        doc = None
+    doc = _docline(node)
     if doc:
-        return " ".join(doc.strip().splitlines()[0].split())[:80]
+        return " ".join(doc.split())[:80]
     for sub in ast.walk(node):
         if isinstance(sub, (ast.Yield, ast.YieldFrom)):
             value = getattr(sub, "value", None)
@@ -637,15 +636,38 @@ def _ts_parser_for(suffix: str):
         return None
 
 
+def _ts_guard():
+    """The chunker's GC-pause guard, or a no-op when tree-sitter is absent."""
+    try:
+        from .chunker_ts import ts_nodes
+        return ts_nodes()
+    except Exception:
+        return contextlib.nullcontext()
+
+
+def _ts_guarded(fn):
+    """Keep the cyclic collector paused for a whole parse+traverse helper.
+
+    A tree-sitter Node is only safe while its tree is alive; returning a root
+    node and then walking it with the collector enabled would recreate the
+    py-tree-sitter#472 window inside the spec contract passes."""
+    @functools.wraps(fn)
+    def wrapped(*args, **kwargs):
+        with _ts_guard():
+            return fn(*args, **kwargs)
+    return wrapped
+
+
 def _ts_parse(text: str, suffix: str):
     parser = _ts_parser_for(suffix)
     if parser is None:
         return None
     try:
-        tree = parser.parse(text.encode("utf-8", "replace"))
+        with _ts_guard():
+            tree = parser.parse(text.encode("utf-8", "replace"))
+            return tree.root_node if not tree.root_node.has_error else None
     except Exception:
         return None
-    return tree.root_node if not tree.root_node.has_error else None
 
 
 def _js_pattern_names(node) -> set[str]:
@@ -862,6 +884,7 @@ def _js_add_export_info(info: dict, node, text: str) -> None:
         info["opaque"] = True             # CommonJS / UMD-shaped surface
 
 
+@_ts_guarded
 def _js_module_info(text: str, suffix: str) -> dict | None:
     """Exports/locals/opaque/module facts for one JS/TS source, or None when
     the parser cannot read it (the syntax gate owns that failure)."""
@@ -1042,6 +1065,7 @@ def _js_export_label(exports) -> list[str]:
     return sorted(exports)[:6]
 
 
+@_ts_guarded
 def _js_cross_file_errors(root: Path, cap: int = 60
                           ) -> list[tuple[str, str, str]]:
     """(importer_rel, target_rel, ContractError) for JS/TS module contracts.
@@ -1319,7 +1343,7 @@ def verify_cross_file_contracts(root: Path,
     for importer, _target, text in _js_cross_file_errors(root):
         emit(text, importer)
 
-    # Sprint 4: test files calling into (changed) source through dotted
+    # Test files calling into (changed) source through dotted
     # imports or bound instances -- the two spellings the from-import pass
     # above never sees. Surfaced here, BEFORE the loop spawns pytest.
     for rel, text in _incoming_test_caller_errors(root, mods):
@@ -1332,7 +1356,6 @@ def verify_cross_file_contracts(root: Path,
 def _requires_text(sig) -> str:
     """`requires ...` clause for an arity message: exact count, a range when
     defaults pad the tail, or an open minimum when the def takes *args."""
-    from .apicheck import _sig as _  # noqa: F401  (kept for symmetry)
     lo = len(sig.required)
     hi = sig.max_pos
     if hi is None:
@@ -2912,22 +2935,23 @@ def _fe_js_syntax_problem(rel: str, text: str) -> str | None:
     if parser is None:
         return None
     try:
-        tree = parser.parse(text.encode("utf-8", "replace"))
+        with _ts_guard():
+            tree = parser.parse(text.encode("utf-8", "replace"))
+            root_node = tree.root_node
+            if not root_node.has_error:
+                return None
+            node = root_node
+            while True:
+                bad = next((c for c in node.children
+                            if c.type == "ERROR" or c.is_missing), None)
+                if bad is None:
+                    break
+                node = bad
+            line = node.start_point[0] + 1
+            where = node.text.decode("utf-8", "replace")[:60].replace("\n", " ")
+            return f"{line}: syntax error near {where!r}"
     except Exception:
         return None
-    root_node = tree.root_node
-    if not root_node.has_error:
-        return None
-    node = root_node
-    while True:
-        bad = next((c for c in node.children
-                    if c.type == "ERROR" or c.is_missing), None)
-        if bad is None:
-            break
-        node = bad
-    line = node.start_point[0] + 1
-    where = node.text.decode("utf-8", "replace")[:60].replace("\n", " ")
-    return f"{line}: syntax error near {where!r}"
 
 
 def verify_frontend_contracts(root: Path, modified_files=None) -> list[str]:
@@ -3052,7 +3076,7 @@ def verify_frontend_contracts(root: Path, modified_files=None) -> list[str]:
             note(rel, int(line) if line.isdigit() else 1,
                  f"does not parse -- {msg[:220]}")
 
-    # 4. ES module contracts (Sprint 1): a relative import that points at no
+    # 4. ES module contracts: a relative import that points at no
     # file or names an export the target does not have, and an imported call
     # whose argument count cannot satisfy the real signature. Bare packages
     # and dynamic imports are deliberately absent from the helper's output.

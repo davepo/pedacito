@@ -1,4 +1,4 @@
-"""Sprint 1: deterministic verification upgrades.
+"""Deterministic verification upgrades.
 
 Three zero-model-token checks:
 

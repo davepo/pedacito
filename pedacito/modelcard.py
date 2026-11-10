@@ -338,9 +338,9 @@ _PROBE_BUDGET = 1500
 
 def _probe(client, messages, tokens: int) -> tuple[str, str]:
     """(reply, note) for a short probe. A reasoning model can spend a tiny
-    `max_tokens` entirely on its <think> block and return nothing, which would
-    be scored as a failure of the skill under test; so the budget is generous
-    and an empty or cut-off reply is retried once with thinking off."""
+    `max_tokens` entirely on its thinking block and return nothing, which
+    would be scored as a failure of the skill under test; so the budget is
+    generous and an empty or cut-off reply is retried once with thinking off."""
     reply = client.chat(messages, max_tokens=max(tokens, _PROBE_BUDGET))
     cut = getattr(client, "last_finish_reason", "") == "length"
     if (reply or "").strip() and not cut:

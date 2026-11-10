@@ -6,7 +6,6 @@ and promise detectors do not misread a plan line."""
 from __future__ import annotations
 
 import difflib
-import json
 import sys
 import types
 from pathlib import Path

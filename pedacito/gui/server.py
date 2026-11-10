@@ -437,7 +437,7 @@ def _run(q, body):
 
 @post("/api/refactor/rename")
 def _refactor_rename(q, body):
-    """Deterministic symbol rename (Sprint P): AST/tokenize, zero model tokens.
+    """Deterministic symbol rename: AST/tokenize, zero model tokens.
 
     `{"old": ..., "new": ..., "file": ..., "apply": true|false}`. Without
     `apply` this is a preview: per-file diffs, nothing written. Applying

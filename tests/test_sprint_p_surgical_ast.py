@@ -1,4 +1,4 @@
-"""Sprint P: zero-anchor AST surgical splicing and the deterministic
+"""Zero-anchor AST surgical splicing and the deterministic
 multi-file symbol rename engine.
 
 Two techniques, both without a SEARCH block and both without model tokens:
@@ -387,6 +387,7 @@ def test_rename_scope_limits_to_the_file_and_its_importers(tmp_path):
     root = _tree(tmp_path, PY_PKG)
     res = refactor.rename_symbol_across_project(root, "apply_discount",
                                                "off", scope_file="pkg/core.py")
+    assert res["ok"]
     assert "def off(price):" in (root / "pkg/core.py").read_text(encoding="utf-8")
     assert "from pkg.core import off" in (root / "pkg/shop.py").read_text(encoding="utf-8")
     # util.py has its own `apply_discount` parameter and does not import core
@@ -569,7 +570,7 @@ def test_gui_app_js_exposes_rename():
     assert 'label="Rename symbol\\u2026"' in src
     assert "/api/refactor/rename" in src
     # the new dialog's own copy must stay free of em-dashes (UI strings rule)
-    start = src.index("// Deterministic symbol rename (Sprint P)")
+    start = src.index("// Deterministic symbol rename")
     block = src[start:start + 4000]
     assert "\u2014" not in block
 

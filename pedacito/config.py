@@ -92,7 +92,7 @@ class Config:
     # trained on tool calling). `pedacito calibrate` measures both on your model
     # and the card picks; set it here to force one.
     tool_mode: str = "grammar"
-    # Engine-level constrained JSON (Sprint Q). On (the default), every schema
+    # Engine-level constrained JSON. On (the default), every schema
     # request -- the gather tool loop and plan calls -- is sent as
     # response_format {"type": "json_schema", "strict": true} so OpenAI-compatible
     # servers (llama.cpp, Lemonade `lemond`, LM Studio, Ollama /v1, vLLM, OpenAI,
@@ -536,8 +536,9 @@ class Config:
     interface_lock: bool = True
 
     # --- Reasoning models -----------------------------------------------------
-    # Reasoning blocks (<think>, [THINK], <seed:think>, harmony channels) are
-    # always stripped, but generating them costs tokens.
+    # Reasoning blocks (Qwen-style tags, Magistral's bracket markers,
+    # Seed-OSS tags, harmony channels) are always stripped, but generating
+    # them costs tokens.
     #   disable_thinking -> ask the model/server for non-thinking mode. Local
     #     servers get the common template switches (enable_thinking=false and
     #     thinking=false); known hosted providers get their own field
@@ -571,7 +572,7 @@ class Config:
     # set at the top level of the file, which `--setup` does; must exist in
     # [profiles.*].
     default_profile: str = ""
-    # Dual-model scout/architect routing (Sprint Q): the name of a profile in
+    # Dual-model scout/architect routing: the name of a profile in
     # [profiles.*] whose (typically smaller, faster) model runs the gather
     # lookup loop -- grep, outline, read, symbol, usages, run_test -- while
     # planning, answer synthesis, and all code edits stay on the active
@@ -2191,6 +2192,14 @@ flat_map_token_budget = 4000
 file_card_line_ranges = true
 repair_rounds = 2
 collapse_repair_turns = true
+# Static analysis gate: undefined names, bad __all__ entries and import
+# placement are checked in-process before any test/lint subprocess. Only
+# errors the task introduced are fed back.
+static_gate = true
+static_gate_timeout = 3.0
+# Insert the one unambiguous missing import (stdlib name, or a symbol exactly
+# one local module exports) before an F821 finding reaches the model.
+auto_heal_imports = true
 backup = true
 log_sessions = true
 review = false
@@ -2312,6 +2321,12 @@ auto_install_deps = false
 auto_smoke = true
 auto_smoke_timeout = 20
 auto_verify_rounds = 2
+# Green ratchet: snapshot each step and undo a step that fails its check after
+# every repair round, so later steps never build on a broken workspace.
+auto_green_ratchet = true
+auto_checkpoint_max_file_bytes = 1000000
+auto_checkpoint_max_files = 1500
+auto_keep_checkpoints = 25
 interface_lock = true
 
 # Project scaffolding (`pedacito new`).
@@ -2403,8 +2418,8 @@ REFERENCE_TEMPLATE = TEMPLATE + '''
 # hosted providers get their own spelling; an unknown hosted model gets no
 # field, so a strict API cannot reject it. thinking_suffix appends a prompt
 # soft switch and defaults to /no_think for Qwen3/SmolLM3. Output markers
-# (<think>, [THINK], <seed:think>, harmony analysis, Gemma 4 thought) are
-# stripped regardless.
+# (Qwen-style reasoning tags, bracket [THINK] markers, Seed-OSS tags, harmony
+# analysis, Gemma 4 thought) are stripped regardless.
 #
 # --- Reliability -------------------------------------------------------------
 # circuit_breaker fails fast after repeated transport/server failures instead

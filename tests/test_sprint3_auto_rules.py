@@ -1,4 +1,4 @@
-"""Sprint 3: path-scoped rule promotion from the anti-pattern ledger.
+"""Path-scoped rule promotion from the anti-pattern ledger.
 
 A repair lesson confirmed at least twice whose named files all live under
 one subdirectory graduates out of the global 8-slot `anti_patterns` array in

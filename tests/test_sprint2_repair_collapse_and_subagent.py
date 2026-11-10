@@ -1,4 +1,4 @@
-"""Sprint 2: repair-trajectory collapse and constrained subagent handoff.
+"""Repair-trajectory collapse and constrained subagent handoff.
 
 The first half proves a successful repair pops the failed draft/diagnostic
 turns back to the snapshot taken before the hunk request. The second half

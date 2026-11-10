@@ -1,4 +1,4 @@
-"""Sprint 4: immediate syntax gate and failure-identity repair packets."""
+"""Immediate syntax gate and failure-identity repair packets."""
 from __future__ import annotations
 
 import re

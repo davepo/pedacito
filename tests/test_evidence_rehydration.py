@@ -1,4 +1,4 @@
-"""Sprint 2: content-addressed evidence store and append-only exact-span
+"""Content-addressed evidence store and append-only exact-span
 rehydration (TECHNIQUES.md section 11).
 
 Invariants: every displayed read/context/prefetch span is hashed into

@@ -420,7 +420,7 @@ def _save_mode_cache(base_url: str, model: str, supported: bool) -> None:
         pass
 
 
-# Sprint Q: engine-level JSON enforcement needs to know, per endpoint, which
+# Engine-level JSON enforcement needs to know, per endpoint, which
 # structured-output tiers that endpoint actually accepts. A 400 naming
 # response_format flips the tier off for (base_url, model) for the rest of
 # the process, so the retry and every later call start at the highest tier
@@ -450,7 +450,7 @@ def _deny_json_cap(base_url: str, model: str, tier: str) -> None:
             {"schema": True, "object": True})[tier] = False
 
 
-# Sprint R: local-inference payload acceleration. `cache_prompt` tells a
+# Local-inference payload acceleration. `cache_prompt` tells a
 # llama.cpp-style server to keep the prompt's KV prefix resident between the
 # step calls that replay an almost identical long gathering context, and
 # `prompt_lookup_num_tokens` switches on n-gram speculative decoding. Both are
@@ -594,9 +594,9 @@ _TOKENIZER_SAMPLE = (
 # Reasoning models emit a thinking block before the answer. Some runtimes move
 # it to a separate field, some leave it inline in `content`; an unstripped
 # block breaks JSON parsing and lands in the answer text. Families spell the
-# block differently, so strip every known delimiter rather than assuming
-# Qwen's <think>:
-#   <think>...</think>             Qwen3, Phi-4-reasoning, distillations
+# block differently, so strip every known delimiter rather than assuming one
+# family's spelling:
+#   angle-bracket reasoning tags   Qwen3, Phi-4-reasoning, distillations
 #   <thinking> / <reasoning>       other ChatML templates
 #   [THINK]...[/THINK]             Magistral / Mistral Small 4
 #   <seed:think>...</seed:think>   Seed-OSS
@@ -651,8 +651,8 @@ _GEMMA_THOUGHT_OPEN_RE = re.compile(
 _GEMMA_ROLE_RE = re.compile(
     r"<\|turn>\s*(?:model|assistant|user|system)\s*", re.IGNORECASE)
 # Gemma's delimiters are <|turn>/<turn|>, <|channel>/<channel|>, and
-# <|think|>; do NOT use a generic <think> pattern here -- that is a separate,
-# fully paired reasoning tag handled later.
+# <|think|>; do NOT use a generic angle-tag reasoning pattern here -- that is
+# a separate, fully paired tag handled later.
 _GEMMA_TOKEN_RE = re.compile(
     r"<\|(?:turn|channel|think)\|?>"
     r"|<(?:turn|channel)\|>|<eos>|<bos>", re.IGNORECASE)
@@ -1344,7 +1344,7 @@ class LLMClient:
              json_schema: dict | None = None) -> str:
         """Send a chat completion request and return the response text.
 
-        `json_schema` (Sprint Q) is the strict schema to attach as the
+        `json_schema` is the strict schema to attach as the
         engine-level `response_format` (constrained sampling); it defaults to
         `schema`, the shape the reply is parsed against. Servers that cannot
         honour it are downgraded automatically (see _chat_once).
@@ -1610,7 +1610,7 @@ class LLMClient:
         """One HTTP request (no retry logic); returns the response text,
         buffered or streamed (to `stream_callback`, else stdout).
 
-        Structured output ladder (Sprint Q, `cfg.enforce_json_schema`): the
+        Structured output ladder (`cfg.enforce_json_schema`): the
         request asks the ENGINE to constrain sampling -- strict json_schema,
         else json_object, else plain JSON prompting. A 400 that names
         response_format flips the tried tier off for this (base_url, model)
@@ -1988,7 +1988,7 @@ class LLMClient:
         return True
 
     def _apply_acceleration(self, payload: dict) -> None:
-        """Attach the Sprint R local-inference speed-up keys when this endpoint
+        """Attach the local-inference speed-up keys when this endpoint
         is self-hosted, the settings ask for them, and a previous call has not
         already seen this server refuse them. Keys a `[sampler]` table set by
         hand win: the user's own spelling is left untouched."""

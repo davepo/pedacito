@@ -451,7 +451,7 @@ cannot see.
   handles methods (`Store.get`) and module-level names, caps the result, and
   marks the evidence as name-based so the model still reads before editing.
   One `usages` step replaces the several blind `grep` calls a small model
-  otherwise spends on the same question. Since Sprint 4 the chunkers also
+  otherwise spends on the same question. The chunkers also
   record the *receiver-qualified* target next to the bare name (`self.stop()`
   inside `Server` adds `Server.stop` as well as `stop`; same for `this.x()` in
   JS/TS, Go receiver pairs and typed `var` bindings, Rust impls and
@@ -622,7 +622,7 @@ and `new --complex`:
   scanned signature -- bare packages and dynamic imports are deliberately
   out of scope. (§23's frontend gate reports the same findings scoped to
   the touched files.)
-- **Incoming test callers are part of the contract (Sprint 4).** A changed
+- **Incoming test callers are part of the contract.** A changed
   signature in `app/logic.py` breaks `tests/test_logic.py` even when the test
   was not touched -- and the from-import pass above cannot see the two
   spellings tests actually use: `import app.logic` + `app.logic.add(1)`, and
@@ -720,7 +720,7 @@ monotonic:
   directories and vendored/state directories skipped, size and count caps via
   `auto_checkpoint_max_file_bytes` / `auto_checkpoint_max_files`) into
   `.pedacito/checkpoints/step_<k>/` with a `manifest.json` recording size
-  and skip-state. Since Sprint 4 the checkpoint is a **hard link** where the
+  and skip-state. The checkpoint is a **hard link** where the
   filesystem allows it (`os.link`, with a `shutil.copy2` fallback for
   EXDEV/EPERM/FAT) -- free, byte-identical by construction, no copy of a
   multi-megabyte tree per step. That buys the price of one invariant: every
@@ -1099,7 +1099,7 @@ asked to do that no model needs to do at all.
   There the rename follows *types* through the AST: the definition, `self.save`
   inside that class, static `Store.save`/`pkg.Store.save` access, and `x.save`
   where `x` is deterministically bound to `Store` by constructor assignment or
-  annotation -- the same `_local_types` evidence the Sprint 4 call graph uses
+  annotation -- the same `_local_types` evidence the call graph uses
   (§12). A receiver typed to another class, an untyped one, or a bare name
   outside the class is listed in the reply as deliberately *not renamed*, and
   files that construct the class are pulled into scope even without importing

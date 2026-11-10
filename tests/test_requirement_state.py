@@ -1,4 +1,4 @@
-"""Sprint 3: requirement evidence state machine + utility source packing.
+"""Requirement evidence state machine + utility source packing.
 
 The tracker is deterministic and free: search results locate a requirement,
 displayed reads make it READ, clean patches EDIT it, and passing verification

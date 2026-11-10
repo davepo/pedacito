@@ -20,6 +20,7 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
+from . import fileio
 from .index import BACKUP_DIR, SESSION_DIR, state_dir
 
 IGNORE_FILE = ".pedacitoignore"
@@ -226,8 +227,10 @@ def restore(root: Path, snapshot: Path, dry_run: bool = False) -> list[str]:
         dest = root / rel
         restored.append(rel)
         if not dry_run:
-            dest.parent.mkdir(parents=True, exist_ok=True)
-            dest.write_bytes(src.read_bytes())
+            # Atomic replacement, never a write into the current inode: a
+            # project file may be hardlinked to a ratchet checkpoint or an
+            # older backup, and an in-place restore would rewrite both.
+            fileio.copy_file_atomic(src, dest)
     return restored
 
 

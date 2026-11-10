@@ -1,4 +1,4 @@
-"""Sprint 5: symbol-anchored incremental edit-verify microloops.
+"""Symbol-anchored incremental edit-verify microloops.
 
 The harness plans `[{file, symbol, intended_change}]`, then takes ONE verified
 SEARCH/REPLACE hunk per symbol. Each hunk's exact source is appended at the

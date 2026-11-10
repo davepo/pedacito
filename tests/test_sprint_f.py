@@ -1,4 +1,4 @@
-"""Sprint F: deterministic gather tools + TokenEconomizer techniques.
+"""Deterministic gather tools + TokenEconomizer techniques.
 
 Covers the compact `outline` TOC, `usages` call/import lookup, `git_diff`,
 repository micro-facts (confirmation and contradiction retirement), dynamic

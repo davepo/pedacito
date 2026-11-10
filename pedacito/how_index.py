@@ -427,7 +427,7 @@ CLI_COMMANDS = [
         ],
         "flags": [
             {"flag": "--init",
-             "help": f"write a starter config to the user config path"},
+             "help": "write a starter config to the user config path"},
             {"flag": "--path FILE",
              "help": "with --init/--reference: use this file"},
             {"flag": "--force", "help": "overwrite an existing file"},

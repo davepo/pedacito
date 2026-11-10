@@ -1,4 +1,4 @@
-"""Sprint L: security hardening + the live human-in-the-loop Permission Broker.
+"""Security hardening and the live human-in-the-loop Permission Broker.
 
 Covers `pedacito/security.py` (workspace containment, sensitive-file guard,
 GUI CSRF origin guard) and the broker end to end: a gated tool call parks its
@@ -693,8 +693,6 @@ def test_web_search_broker_then_top_results(bare_broker, monkeypatch):
       <a class="result__a" href="https://example.org/guide">A guide</a>
       <td class="result__snippet">Second &amp; snippet.</td>
     </div>"""
-    resp_url = ("https://html.duckduckgo.com/html/?q=pytest%20fixture"
-                "%20scopes")
     _serve(monkeypatch, lambda u: _FakeResp(page, u))
     q = "pytest fixture scopes"
     t, box = _run_in_thread(st, lambda: tools.web_search(cfg, q))

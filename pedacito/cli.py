@@ -470,7 +470,11 @@ def _switch_profile(args, ref, arg: str, kind: str = "profile") -> str:
     except LLMError:
         args.profile, args.model = prev_profile, prev_model
         raise
-    for keep in ("_interactive", "_ask_user", "_steer"):
+    # Live session choices survive a model switch: terminal/steering hooks,
+    # the scout selection (independent of the active profile), role routing,
+    # and hosts a human allowed from the permission broker this session.
+    for keep in ("_interactive", "_ask_user", "_steer", "scout_profile",
+                 "roles", "fetch_allowed_hosts"):
         if keep in cfg.__dict__:
             new_cfg.__dict__[keep] = cfg.__dict__[keep]
     ref["cfg"], ref["client"] = new_cfg, new_client
@@ -1646,7 +1650,7 @@ def _cmd_skills(args) -> int:
 
 
 def _cmd_rename(args) -> int:
-    """`pedacito rename <old> <new>`: the deterministic Sprint P rename.
+    """`pedacito rename <old> <new>`: the deterministic symbol rename.
     Zero LLM tokens: Python identifiers move through the real tokenizer,
     tree-sitter languages through their identifier nodes (so a string literal
     or comment that merely contains the old name survives), and every changed
@@ -1721,7 +1725,8 @@ def _cmd_rpc(args, cfg, client, idx, root, locals_ref, run, save_checkpoint,
         s = server_box.get("s")
         return s._tag_for(None) if s is not None else None
 
-    out = rpc_mod.RpcOut(sys.stdout, _tag)
+    real_stdout = sys.stdout
+    out = rpc_mod.RpcOut(real_stdout, _tag)
     elog.tee = out
     sys.stdout = sys.stderr   # anything that forgets to say stderr still
                               # cannot corrupt the JSONL stream
@@ -1766,7 +1771,8 @@ def _cmd_rpc(args, cfg, client, idx, root, locals_ref, run, save_checkpoint,
             "profile": cur.active_profile or "(none)",
             "model": cur.model,
             "tier": cur.active_tier,
-            "scout": roles.get("scout") or cur.active_profile or "(main)",
+            "scout": (str(getattr(cur, "scout_profile", "") or "").strip()
+                      or roles.get("scout") or "(none)"),
             "steps": cur.max_steps,
             "writes": "per request (ask params.apply)",
             "index": {"units": len(now.chunks), "files": len(now.files),
@@ -1784,7 +1790,11 @@ def _cmd_rpc(args, cfg, client, idx, root, locals_ref, run, save_checkpoint,
             if ref not in (cur.profiles or {}):
                 have = ", ".join(sorted(cur.profiles or {})) or "none"
                 raise ConfigError(f"unknown profile {ref!r}; available: {have}")
-            cur.roles = {**(cur.roles or {}), "scout": ref}
+            # Gather routing reads `scout_profile` (roles.scout_client); a
+            # roles entry would be inert. Clear the cached reachability
+            # verdict so the next gather actually re-resolves the new one.
+            cur.scout_profile = ref
+            cur.__dict__.pop("_scout_clients", None)
             return f"scout -> profile {ref}"
         label = _switch_profile(args, locals_ref, ref, "profile")
         server_box["s"].set_client(locals_ref["client"])
@@ -1827,6 +1837,7 @@ def _cmd_rpc(args, cfg, client, idx, root, locals_ref, run, save_checkpoint,
         return server.serve()
     finally:
         elog.tee = None
+        sys.stdout = real_stdout
 
 
 def _configure_stdio() -> None:

@@ -1,6 +1,6 @@
-"""Sprint O introspection tests: scoped live evidence + DOM contracts + ledger.
+"""Introspection tests: scoped live evidence + DOM contracts + ledger.
 
-Sprint O gives the gather phase one honest tool (`run_test`: a sandboxed,
+The gather phase has one honest tool (`run_test`: a sandboxed,
 shell-free, token-bounded pytest run), gives the loop one more deterministic
 gate (`verify_frontend_contracts`: the checks a browser would run at page
 load), and gives the repository a memory of why repairs were needed (the
@@ -14,11 +14,9 @@ import sys
 import types
 from pathlib import Path
 
-import pytest
-
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from pedacito import config, loop, memory, security, spec, tools
+from pedacito import loop, memory, security, spec, tools
 from pedacito.config import Config
 from pedacito.edits import Result
 

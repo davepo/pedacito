@@ -89,7 +89,7 @@ def _rename_python_receiver(text: str, old: str, new: str, class_path: str
       * static access through the class name (`Store.old`, `pkg.Store.old`);
       * `x.old(...)` when `x` is deterministically bound to the class in an
         enclosing scope (`x = Store(...)`, `x: Store`, `def f(x: Store)`) --
-        the same constructor/annotation evidence the Sprint 4 call graph uses.
+        the same constructor/annotation evidence the call graph uses.
 
     Everything else -- a bare `old` outside the class, `y.old` on a receiver
     typed to ANOTHER class, or an untyped/dynamic receiver -- is skipped and
@@ -282,7 +282,7 @@ def rename_text(rel: str, text: str, old: str, new: str) -> tuple[str, int]:
 
 
 # --------------------------------------------------------------------------
-# Zero-token rename engine (Sprint P): no index, no LLM, no ambiguity games
+# Zero-token rename engine: no index, no LLM, no ambiguity games
 # --------------------------------------------------------------------------
 def _rename_treesitter(text: str, old: str, new: str, suffix: str
                        ) -> tuple[str, int] | None:
@@ -291,32 +291,26 @@ def _rename_treesitter(text: str, old: str, new: str, suffix: str
     comments are separate node types and can never be hit. None when no
     grammar is available for this suffix (the caller falls back to the
     quote-and-comment-aware word matcher)."""
-    from .chunker_ts import LANG_BY_EXT, TS_AVAILABLE, _get_parser
+    from .chunker_ts import LANG_BY_EXT, TS_AVAILABLE, _get_parser, ts_nodes
 
     lang = LANG_BY_EXT.get(suffix)
     if not (TS_AVAILABLE and lang):
         return None
-    import gc
     data = text.encode("utf-8")
     needle = old.encode("utf-8")
-    was = gc.isenabled()
-    gc.disable()          # py-tree-sitter GC segfault guard (see chunker_ts)
     try:
-        tree = _get_parser(lang).parse(data)
-        hits: list[tuple[int, int]] = []
-        stack = [tree.root_node]
-        while stack:
-            node = stack.pop()
-            if (node.type in _TS_IDENT_TYPES
-                    and data[node.start_byte:node.end_byte] == needle):
-                hits.append((node.start_byte, node.end_byte))
-            stack.extend(node.children)
+        with ts_nodes():
+            tree = _get_parser(lang).parse(data)
+            hits: list[tuple[int, int]] = []
+            stack = [tree.root_node]
+            while stack:
+                node = stack.pop()
+                if (node.type in _TS_IDENT_TYPES
+                        and data[node.start_byte:node.end_byte] == needle):
+                    hits.append((node.start_byte, node.end_byte))
+                stack.extend(node.children)
     except Exception:
         return None
-    finally:
-        tree = None
-        if was:
-            gc.enable()
     if not hits:
         return text, 0
     pieces: list[bytes] = []

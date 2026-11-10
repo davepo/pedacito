@@ -812,8 +812,9 @@ def build_pass(client, cfg, idx, plan: Plan, target: PlannedFile,
                         disable_thinking=True)
     discards: list[str] = []
     if not parse_edits(reply, discards=discards):
-        # A reasoning model may spend its whole budget on <think> (some quants
-        # ignore enable_thinking=false): nudge once, then report the failure.
+        # A reasoning model may spend its whole budget on a thinking block
+        # (some quants ignore enable_thinking=false): nudge once, then report
+        # the failure.
         # `thinking_suffix_for` supplies /no_think only for families trained on
         # it; other models just get the plain "output it now" instruction.
         suffix = thinking_suffix_for(cfg)

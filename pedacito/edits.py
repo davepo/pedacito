@@ -31,7 +31,7 @@ range (LINES) or that definition (SYMBOL, resolved to a line range by the
 caller -- the agent, which owns the index -- or, when no index resolved it,
 by `chunker.locate_symbol_span` straight from the AST), and SEARCH is ignored.
 
-Zero-anchor surgical splicing (Sprint P) needs no FILE header and no SEARCH
+Zero-anchor surgical splicing needs no FILE header and no SEARCH
 body at all: the symbol's current span comes from the AST, and the block's
 indent is re-aligned to the target automatically:
 
@@ -88,7 +88,7 @@ _ANCHOR_RE = re.compile(
     re.IGNORECASE,
 )
 
-# Zero-anchor symbol splice blocks (Sprint P). The header names the file and
+# Zero-anchor symbol splice blocks. The header names the file and
 # the symbol; the body is the FULL new definition (replace) or the new text
 # (insert after); no SEARCH section, no line numbers:
 #
@@ -1172,7 +1172,10 @@ def apply_edits(root: Path, edits: list[Edit], backup: bool = True,
                 if p.is_file():
                     p.unlink()
             else:
-                p.write_bytes(data)
+                # Atomic replace: the failed write already moved `p` onto a
+                # fresh inode, but a revert must still never mutate bytes in
+                # place (a user or the ratchet may link that inode).
+                fileio.write_bytes(p, data)
         return _undo
 
     def _finish(rel: str, path: Path, original: str | None, text: str, style,

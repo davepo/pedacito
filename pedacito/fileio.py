@@ -105,24 +105,17 @@ def read_lines_cached(path: Path) -> list[str]:
     return lines
 
 
-def write(path: Path, text: str, style: TextStyle | None = None) -> None:
-    """Write LF-normalised text to disk, restoring the given encoding style.
+def write_bytes(path: Path, data: bytes) -> None:
+    """Atomically replace `path` with `data`, never rewriting in place.
 
-    Atomic replace (temp file + `os.replace`), never an in-place rewrite:
-    ratchet.py checkpoints are HARD LINKS to earlier inodes of the same
-    file, and `open(path, "wb")` truncates every link it shares -- that
-    would quietly corrupt history and make rollback restore the current
-    bytes. Replacement leaves the old inode (and its links) untouched."""
-    style = style or TextStyle()
-    out = text
-    if style.newline != "\n":
-        out = out.replace("\n", style.newline)
-    data = out.encode("utf-8")
-    if style.bom:
-        data = b"\xef\xbb\xbf" + data
+    Ratchet checkpoints are HARD LINKS to earlier inodes of the same file.
+    An in-place `open(path, "wb")` truncates every link sharing that inode,
+    quietly rewriting checkpoint history. A temp file plus `os.replace`
+    swaps the path onto a fresh inode and leaves the old one (and its links)
+    untouched; the original permission bits are preserved."""
     p = Path(path)
     if p.is_symlink():
-        p = p.resolve()          # replace through the link, like write did
+        p = p.resolve()          # replace through the link, not the link itself
     try:
         mode = stat.S_IMODE(p.stat().st_mode)
     except OSError:
@@ -143,16 +136,57 @@ def write(path: Path, text: str, style: TextStyle | None = None) -> None:
         raise
 
 
+def write(path: Path, text: str, style: TextStyle | None = None) -> None:
+    """Write LF-normalised text to disk, restoring the given encoding style.
+
+    The actual replacement is `write_bytes`: an atomic temp-file + rename,
+    never an in-place rewrite, so a hardlinked checkpoint keeps its bytes."""
+    style = style or TextStyle()
+    out = text
+    if style.newline != "\n":
+        out = out.replace("\n", style.newline)
+    data = out.encode("utf-8")
+    if style.bom:
+        data = b"\xef\xbb\xbf" + data
+    write_bytes(path, data)
+
+
+def copy_file_atomic(src: Path, dest: Path) -> None:
+    """Copy `src` to `dest` through a temp file, preserving mode and mtime.
+
+    Restores (undo, `pedacito restore`) must never copy into an existing
+    inode: the destination may be hardlinked to a ratchet checkpoint, and an
+    in-place `shutil.copy2` would rewrite that checkpoint too."""
+    src = Path(src)
+    p = Path(dest)
+    if p.is_symlink():
+        p = p.resolve()          # replace through the link, not the link itself
+    p.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(prefix=p.name + ".", suffix=".pedacito-tmp",
+                               dir=str(p.parent))
+    os.close(fd)
+    try:
+        shutil.copy2(str(src), tmp)
+        os.replace(tmp, p)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
 def backup_copy(src: Path, dest: Path, keep_existing: bool = True) -> None:
     """Copy `src`'s exact bytes to `dest`, creating parent directories.
 
     With `keep_existing`, an existing `dest` is left alone: backup snapshot
     directories are shared by every write of a run, and the FIRST copy of a
-    file is the original that `restore` must bring back."""
+    file is the original that `restore` must bring back. Replacement is
+    atomic, so this is also safe for the reverse direction (`undo` restoring
+    a working file that may share an inode with a checkpoint)."""
     if keep_existing and Path(dest).exists():
         return
-    Path(dest).parent.mkdir(parents=True, exist_ok=True)
-    shutil.copy2(str(src), str(dest))
+    copy_file_atomic(src, dest)
 
 
 def created_manifest(backup_dir) -> Path:

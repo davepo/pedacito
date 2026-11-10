@@ -1759,7 +1759,7 @@ def tool_grep(index, pattern: str, scope: str = "", cfg=None,
 
 def _qual_site(stripped: str, base: str, cls: str, chunk_qual: str) -> str:
     """Classify one `base(...)`-mentioning line for a class-qualified query
-    (Sprint 4): "qualified" when the receiver IS the queried class (`Store.
+    "qualified" when the receiver IS the queried class (`Store.
     load()`, or `self.load()` inside a Store method), "other" when the
     receiver is a DIFFERENT capitalized class (`Other.load()` -- definitely
     not this symbol), "unqualified" when the receiver cannot resolve either
@@ -2054,7 +2054,7 @@ def tool_usages(index, cfg, symbol: str) -> str:
         return (f"No definition, call site or import found for '{raw}' in the "
                 f"indexed files. Try `grep` for the exact spelling or `find` "
                 f"for a shorter name fragment.")
-    out = [f"USAGES {raw}" + (f" -- defined at "
+    out = [f"USAGES {raw}" + (" -- defined at "
                               + ", ".join(f"{c.file}:{c.start}-{c.end}"
                                           for c in defs[:5])
                               if defs else " -- no indexed definition")]
@@ -2640,7 +2640,7 @@ def tool_mcp_call(index, cfg, server: str, tool_name: str,
                   arguments) -> str:
     """Invoke one tool of a NAMED MCP server ([mcp_servers.<name>]).
 
-    Sprint R gate: a server whose table does not set `trusted = true` goes
+    Named-server gate: a server whose table does not set `trusted = true` goes
     through the human Permission Broker (category `mcp_tool`) before anything
     starts or runs; a denial (or nobody to ask) answers with the fixed
     redirect text so the model pivots back to local tools. Trusted servers

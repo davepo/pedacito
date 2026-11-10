@@ -1,4 +1,4 @@
-"""Sprint N: the fast static analysis gate and the green-ratchet checkpoints.
+"""The fast static analysis gate and the green-ratchet checkpoints.
 
 Part 1 -- the static gate (`spec.run_fast_static_gate`, `verify.check_static`,
 `loop._post_edit_tests`, `loop._gated_check`): undefined names, bad

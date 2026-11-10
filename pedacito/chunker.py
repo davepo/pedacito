@@ -217,7 +217,7 @@ def _calls(*nodes: ast.AST, owner: str = "") -> list[str]:
 
     Every call keeps its bare name (`obj.method()` -> ``method``) so the old
     name-based `callers` lookup keeps working unchanged, and receiver-aware
-    qualification (Sprint 4) additionally records ``ClassName.method`` beside
+    qualification additionally records ``ClassName.method`` beside
     it when the receiver is decidable at chunk time:
 
       * ``self.x()`` / ``cls.x()`` inside a method of class ``ClassName``
@@ -749,7 +749,7 @@ def chunk_source(rel_path: str, src: str, class_split_lines: int = 60,
 
 
 # --------------------------------------------------------------------------
-# Surgical symbol spans (Sprint P: zero-anchor AST splicing)
+# Surgical symbol spans (zero-anchor AST splicing)
 # --------------------------------------------------------------------------
 def _leading_indent(line: str) -> str:
     """The leading whitespace of a source line ("" for column 0)."""

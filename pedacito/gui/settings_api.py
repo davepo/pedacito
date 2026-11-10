@@ -533,7 +533,7 @@ def _autotune_values(answers: dict) -> tuple[dict, dict]:
     reasons["max_no_progress_steps"] = (
         f"end gather after {no_progress} fruitless steps, {reason_prio}")
     reasons["verify_answer"] = (
-        f"check answers " + ("only with deterministic scans"
+        "check answers " + ("only with deterministic scans"
                              if verify == "deterministic" else
                              "with one verifier model call"
                              if verify == "full" else
@@ -920,7 +920,7 @@ def _preset_profile_suggestion(preset: dict, model: str) -> str:
 
 
 def add_provider_preset(body: dict) -> dict:
-    """One-click hosted provider profile (Sprint J): the preset supplies the
+    """One-click hosted provider profile: the preset supplies the
     base URL, tier, context budgets and provider quirks; the user supplies an
     API key or the name of an environment variable that holds one. Writes the
     profile into the config file, reloads STATE, and returns the fresh

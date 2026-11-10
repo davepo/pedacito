@@ -22,7 +22,7 @@ edit blocks, before anything is written:
                 also carries an evidence state (UNLOCATED -> LOCATED -> READ
                 -> EDITED -> VERIFIED, or READ -> REPORTED for investigations)
 
-Sprint 3 makes that coverage ledger a run-scoped state machine
+That coverage ledger is a run-scoped state machine
 (`RequirementTracker`): search results, displayed reads and clean patches move
 each clause forward, and the agent uses the oldest unmet clause to pick its
 next deterministic lookup. No transition costs a model call.
@@ -31,7 +31,7 @@ Errors feed one bounded repair round; warnings are shown and logged. A model
 verifier (`verify_answer = "full"`) is one extra call, used only when the
 deterministic pass found nothing to fix.
 
-Sprint 2 adds the two hooks the harness uses to hand source back WITHOUT ever
+Two hooks hand source back WITHOUT ever
 rewriting history (TECHNIQUES.md section 11): `find_needs` parses the
 explicit `NEED path/to/file.py:120-168` directive from an answer, repair or
 verifier reply, and `evidence_rehydrations` selects the unread / fuzzy
@@ -60,7 +60,7 @@ class Finding:
     message: str
     line: int = 0
     # The 1-based inclusive (start, end) region the finding flags, when the
-    # check knows one (unread regions, fuzzy-anchored blocks). Sprint 2B's
+    # check knows one (unread regions, fuzzy-anchored blocks). The
     # repair auto-rehydration re-fetches exactly these lines.
     lines: tuple = ()
 
@@ -200,7 +200,7 @@ def _new_static_errors(rel: str, after: str, before: str) -> list[str]:
 def auto_heal_static(results, root=None, cfg=None,
                      persist: bool = False) -> list[str]:
     """Deterministically insert unambiguous missing imports into dry-applied
-    Python buffers (TECHNIQUES.md #19 / Sprint 1).
+    Python buffers (TECHNIQUES.md #19).
 
     Only NEW F821 names are candidates -- the same `before`-vs-`after`
     baseline `check_static` uses -- and `spec.auto_heal_source` re-parses and
@@ -239,20 +239,31 @@ def auto_heal_static(results, root=None, cfg=None,
         remaining = _new_static_errors(r.file, healed, before)
         if any(n in spec_mod.f821_names(remaining) for n in names):
             continue
-        r.after = healed
-        receipts.extend(adds)
-        if persist and root is not None:
+        if persist:
+            # A persisted heal must describe bytes that are actually on disk.
+            # If the file moved under us, leave the buffer and the receipt
+            # untouched so the normal repair path still sees the real error.
+            if root is None:
+                continue
             path = Path(root) / fileio.normalise_rel(r.file)
             try:
                 current = fileio.read_text(path)
             except OSError:
-                current = None
-            if current == after:          # disk is exactly the buffer we healed
-                try:
-                    _text, style = fileio.read(path)
-                    fileio.write(path, healed, style)
-                except OSError:
-                    pass
+                continue
+            if current != after:          # disk is not the buffer we healed
+                continue
+            try:
+                _text, style = fileio.read(path)
+                fileio.write(path, healed, style)
+            except OSError:
+                continue
+        r.after = healed
+        if getattr(r, "diff", ""):
+            r.diff = "".join(difflib.unified_diff(
+                before.splitlines(keepends=True),
+                healed.splitlines(keepends=True),
+                fromfile=f"a/{r.file}", tofile=f"b/{r.file}"))
+        receipts.extend(adds)
     return receipts
 
 
@@ -634,7 +645,7 @@ _VERBS = {"add", "make", "fix", "update", "change", "remove", "rename", "create"
           "your", "our", "its", "are", "can", "get", "set", "new", "old"}
 _WORD_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]{3,}")
 
-# Sprint 3: requirement evidence state machine. An edit requirement has to
+# Requirement evidence state machine. An edit requirement has to
 # travel UNLOCATED -> LOCATED -> READ -> EDITED -> VERIFIED; an investigation /
 # explain requirement travels UNLOCATED -> (LOCATED) -> READ -> REPORTED. A
 # search/find/outline result supplies LOCATED evidence, a displayed read span
@@ -1206,7 +1217,7 @@ def check_fuzzy(results) -> list[Finding]:
     """A block anchored approximately (fuzzy_match) is a warning, not an
     error: it landed somewhere the SEARCH text did not exactly match, so the
     diff needs a human's eye before it is trusted. The finding carries the
-    region it anchored on (Sprint 2B: near recorded evidence, the repair
+    region it anchored on (near recorded evidence, the repair
     re-fetches exactly those lines)."""
     out: list[Finding] = []
     for r in (results or []):
@@ -1228,7 +1239,7 @@ def check_fuzzy(results) -> list[Finding]:
     return out
 
 
-# --------------------------------------------- Sprint 2: exact-span rehydration
+# ------------------------------------------------------ exact-span rehydration
 # `NEED shop/pricing.py:120-168` -- the model asks the harness for exactly
 # the lines it needs, and the harness APPENDS them at the conversation tail
 # so the prompt-prefix cache survives the round (TECHNIQUES.md #2). A plain

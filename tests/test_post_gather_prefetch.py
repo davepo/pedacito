@@ -9,7 +9,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from a1_support import Scripted, make_project
 from pedacito.agent import Agent
-from pedacito.config import Config
 
 
 def test_post_gather_prefetch_is_off_by_default(tmp_path):

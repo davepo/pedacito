@@ -1245,7 +1245,7 @@ function restoreDialog() {
     } }], { narrow: true });
 }
 
-// Deterministic symbol rename (Sprint P): the server moves every exact
+// Deterministic symbol rename: the server moves every exact
 // identifier through the tokenizer / tree-sitter, so strings and comments that
 // merely contain the old name survive and no model tokens are spent. Preview
 // first (nothing written), then Rename (originals snapshotted, so "Restore
@@ -1431,7 +1431,7 @@ function ProfileSelect(props) {           // header dropdown; uncontrolled
 }
 
 function TopBar() {
-  // Two dense rows (Sprint J): row 1 is the project side -- brand, a compact
+  // Two dense rows: row 1 is the project side -- brand, a compact
   // path box, Browse/Recent/Open and the Project menu -- against the global
   // actions (Benchmarks, Settings, theme, Exit). Row 2 is a tinted status
   // strip that only reports: profile picker, model + thinking, index, usage
@@ -2515,7 +2515,7 @@ function initThemeSelect() {
   const sel = $('theme');
   if (sel) {
     let t = localStorage.getItem('pedacito_theme') || 'slate';
-    // the Sprint-E legacy names (mocha/sage/parchment/clay/nightshade) no
+    // the legacy theme names (mocha/sage/parchment/clay/nightshade) no
     // longer exist: an unknown saved value falls back to the slate default
     if (!Array.prototype.some.call(sel.options, (o) => o.value === t)) t = 'slate';
     sel.value = t;

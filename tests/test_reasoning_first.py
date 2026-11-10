@@ -58,7 +58,7 @@ def test_default_schema_is_reason_first():
 
 def test_default_gather_prompt_and_schema_are_reason_first(tmp_path):
     _a, client = gather(tmp_path, READ_THEN_GREP)
-    # Sprint O adds `target`/`filter` (run_test) when the task text names a
+    # The run_test schema adds `target`/`filter` when the task text names a
     # bug -- the default gather task ("Fix bulk_discount") qualifies. The
     # invariant under test is the REASON-FIRST ORDER: the base fields must
     # keep their exact relative order with `reasoning` in front, no matter

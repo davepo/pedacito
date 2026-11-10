@@ -1,4 +1,4 @@
-"""Sprint Q: engine-enforced JSON grammar (response_format ladder with a
+"""Engine-enforced JSON grammar (response_format ladder with a
 per-endpoint downgrade) and dual-model scout/architect gather routing.
 
 Invariants: `build_gather_json_schema` is strict and tracks the dynamically

@@ -65,6 +65,24 @@ FIELD_META: dict[str, FieldMeta] = {
                     "getElementById/querySelector('#id') selectors match the "
                     "ids defined in HTML, and that changed JS files parse. "
                     "Violations feed the repair loop."),
+    "static_gate": FieldMeta(
+        label="Static Analysis Gate",
+        description="Check changed Python files for undefined names, bad "
+                    "`__all__` entries and import placement before any "
+                    "test/lint subprocess. Only errors the current task "
+                    "introduced trigger the cheap repair loop."),
+    "auto_heal_imports": FieldMeta(
+        label="Auto-Heal Unambiguous Imports",
+        description="Before an undefined-name finding reaches the model, "
+                    "insert the one import that provably fixes it (a stdlib "
+                    "module, or a symbol exactly one local module exports). "
+                    "Ambiguous names are never guessed."),
+    "auto_green_ratchet": FieldMeta(
+        label="Green Ratchet (Undo Failed Auto Steps)",
+        description="Snapshot the project before every Auto step and undo "
+                    "exactly that step when it still fails its check after "
+                    "the repair rounds. Later steps then build only on the "
+                    "last verified-green workspace."),
     "enforce_json_schema": FieldMeta(
         label="Engine-Enforced JSON Grammar",
         description="Ask the inference server to constrain every gather "

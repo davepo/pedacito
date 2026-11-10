@@ -98,7 +98,7 @@ html[data-theme="midnight"] {
 }
 
 /* ------------------------------------------------------------- 1990s -------
-   Four high-craft retro schemes (Sprint E). Each carries the complete
+   Four high-craft retro schemes. Each carries the complete
    variable palette so chat, code blocks, forms and the terminal stay at
    WCAG text contrast, plus a thin geometric accent band painted across the
    top bar's bottom border. Body text pairs: deep ink #161925 with muted
@@ -261,7 +261,7 @@ textarea { resize: none; background: var(--panel); }
 .placeholder b { color: var(--text); }
 
 /* ---------------------------------------------------------------- top bar -- */
-/* Two dense rows (Sprint J). Row 1: brand, a compact path box and the open
+/* Two dense rows. Row 1: brand, a compact path box and the open
    actions against the global ones (Benchmarks / Settings / theme / Exit);
    its controls share a 30px height. Row 2 is a 28px tinted status strip
    that only reports state (profile, model + thinking, index, usage, phase)

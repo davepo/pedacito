@@ -3118,11 +3118,13 @@ def test_run_loop_rolls_back_a_repair_that_made_verify_worse(tmp_path,
         tasks.append(task)
         if len(tasks) == 1:
             return loop.TaskResult([_ok()], "reply", True, ["a.py"], idx_)
-        # the repair: snapshots a.py first, then makes things worse
+        # The repair: snapshot a.py first, then make things worse through the
+        # same atomic write path production uses. An in-place write would
+        # mutate the ratchet checkpoint's shared inode instead of the file.
+        from pedacito import fileio
         snap = workspace.new_backup_dir(root)
         (snap / "a.py").write_bytes((root / "a.py").read_bytes())
-        (root / "a.py").write_text("GOOD = 1\nBAD = 2\nWORSE = 3\n",
-                                   encoding="utf-8")
+        fileio.write(root / "a.py", "GOOD = 1\nBAD = 2\nWORSE = 3\n")
         return loop.TaskResult([_ok()], "reply", True, ["a.py"], idx_,
                                backup_dir=snap)
 

@@ -1,4 +1,4 @@
-"""Sprint 5 rename upgrades: receiver-aware qualified renames, and the
+"""Rename upgrades: receiver-aware qualified renames, and the
 transactional guarantees -- a write failure anywhere in a multi-file batch
 restores every file this call touched (no half-applied tree)."""
 from __future__ import annotations

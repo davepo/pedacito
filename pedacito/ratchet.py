@@ -38,6 +38,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Iterable
 
+from . import fileio
+
 
 # --- configuration defaults (overridable through Config fields) ------------
 DEFAULT_MAX_FILE_BYTES = 1_000_000
@@ -123,7 +125,6 @@ def _iter_candidate_files(root: Path, max_files: int):
     final item's flag says whether the walk stopped at the cap (so more
     candidates exist that were never seen)."""
     count = 0
-    truncated = False
     stack = [root]
     while stack:
         current = stack.pop()
@@ -155,17 +156,19 @@ def _iter_candidate_files(root: Path, max_files: int):
             yield (entry, False)
 
 
-def _link_or_copy(src: Path, dst: Path) -> None:
+def _link_or_copy(src: Path, dst: Path) -> bool:
     """Snapshot one file: a hard link when the filesystem permits it (same
     device, links allowed) -- free, and byte-identical by construction --
     else a full `copy2` preserving mtime (the unmodified-file fast path in
-    `rollback` compares timestamps)."""
+    `rollback` compares timestamps). Returns True for a hard link."""
     try:
         if dst.exists():
             dst.unlink()          # a link cannot be created over an entry
         os.link(src, dst)
-    except (OSError, NotImplementedError):     # EXDEV/EPERM/FAT... 
+        return True
+    except (OSError, NotImplementedError):     # EXDEV/EPERM/FAT...
         shutil.copy2(str(src), str(dst))
+        return False
 
 
 def begin(
@@ -214,7 +217,8 @@ def begin(
         if any(part in SKIP_DIRS for part in rel.parts[:-1]):
             continue
         try:
-            size = path.stat().st_size
+            st = path.stat()
+            size, mtime_ns = st.st_size, st.st_mtime_ns
         except OSError:
             continue
         if size > max_file_bytes:
@@ -223,11 +227,12 @@ def begin(
         payload = directory / rel
         try:
             payload.parent.mkdir(parents=True, exist_ok=True)
-            _link_or_copy(path, payload)
+            linked = _link_or_copy(path, payload)
         except OSError:
             manifest[rel.as_posix()] = {"size": size, "skip": "unreadable"}
             continue
-        manifest[rel.as_posix()] = {"size": size}
+        manifest[rel.as_posix()] = {"size": size, "mtime_ns": mtime_ns,
+                                    "linked": linked}
     try:
         (directory / "manifest.json").write_text(
             json.dumps(
@@ -315,14 +320,35 @@ def rollback(root: Path, step: int) -> dict[str, Any]:
         snapshot_file = directory / rel
         if snapshot_file.is_file():
             try:
+                snap_stat = snapshot_file.stat()
+                # A snapshot is immutable by contract. If its size changed,
+                # or a hardlinked snapshot's mtime moved, an in-place writer
+                # violated the atomic-replace rule and the checkpoint no
+                # longer holds the pre-step bytes. Refuse to restore garbage
+                # and report it instead of silently rolling back to wreckage.
+                expected_size = entry.get("size") if isinstance(entry, dict) else None
+                corrupted = (expected_size is not None
+                             and snap_stat.st_size != int(expected_size))
+                expected_mtime = (entry.get("mtime_ns")
+                                  if isinstance(entry, dict) else None)
+                linked = bool(entry.get("linked")) \
+                    if isinstance(entry, dict) else False
+                if (not corrupted and linked and expected_mtime is not None):
+                    corrupted = (snap_stat.st_mtime_ns != int(expected_mtime))
+                if corrupted:
+                    result["skipped"].append(rel)
+                    result["error"] = (
+                        f"checkpoint for {rel} was modified in place; "
+                        "refusing to restore corrupted snapshot bytes")
+                    continue
                 # (a hardlinked or copy2'd) snapshot carries the original
                 # mtime: a file still matching it byte-size AND timestamp was
                 # never touched by the step, so re-restoring it would only
                 # inflate the rollback report.
                 if (target.is_file() and not target.is_symlink()
-                        and target.stat().st_size == snapshot_file.stat().st_size
+                        and target.stat().st_size == snap_stat.st_size
                         and target.stat().st_mtime_ns
-                        == snapshot_file.stat().st_mtime_ns):
+                        == snap_stat.st_mtime_ns):
                     continue
             except OSError:
                 pass
@@ -330,20 +356,15 @@ def rollback(root: Path, step: int) -> dict[str, Any]:
                 if target.is_symlink():
                     target.unlink()      # never write THROUGH a replaced link
                 target.parent.mkdir(parents=True, exist_ok=True)
-                # restore by REPLACE, never by copy-into: `target` may share
+                # Restore by REPLACE, never by copy-into: `target` may share
                 # its inode with an OLDER step's snapshot (begin hardlinked
-                # it while unchanged); copy2 would truncate that shared inode
-                # and rewrite the checkpointed history it stands for.
-                tmp = target.parent / (target.name + ".pedacito-restore")
-                shutil.copy2(str(snapshot_file), str(tmp))
-                os.replace(tmp, target)
+                # it while unchanged); an in-place copy would truncate that
+                # shared inode and rewrite the checkpointed history it stands
+                # for. `copy_file_atomic` also preserves the snapshot mtime,
+                # which the unchanged-file fast path above compares.
+                fileio.copy_file_atomic(snapshot_file, target)
                 result["restored"].append(rel)
             except OSError as exc:
-                try:
-                    (target.parent / (target.name + ".pedacito-restore")
-                     ).unlink()
-                except OSError:
-                    pass
                 result["skipped"].append(rel)
                 result["error"] = f"could not restore {rel}: {exc}"
     # Delete what the step created: current candidates absent from the

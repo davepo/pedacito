@@ -1847,7 +1847,7 @@ def _post_edit_tests(root, cfg, agent, idx, task, results, reply, backup_dir,
             changed = sorted({fileio_norm(r.file) for r in results if r.ok})
             continue
 
-        # Cross-file contract gate (Sprint 4): a changed signature plus a
+        # Cross-file contract gate: a changed signature plus a
         # test caller that still passes the old arity is proven broken here,
         # statically -- running pytest only to watch it TypeError wastes the
         # whole subprocess, so the gate vetoes the spawn like the frontend
@@ -1892,7 +1892,7 @@ def _post_edit_tests(root, cfg, agent, idx, task, results, reply, backup_dir,
             # Every gate this task tripped is green again (the deterministic
             # re-check above just passed): distill what the failure was into
             # the lesson ledger while the evidence is fresh. Test failures
-            # wait for a green test run to be proven.
+            # are deferred until a green test run proves the fix.
             _record_repair_lesson(root, cfg, pending_lesson,
                                   skip_kinds={"tests"})
         got = _run_tests(idx, cfg, changed)
@@ -2597,7 +2597,7 @@ def _run_task_once(root: Path, cfg, client, agent, idx, task: str, *,
                 "nothing was written.]")
 
     if incremental:
-        # Sprint 5: one symbol hunk at a time, each dry-applied and verified
+        # One symbol hunk at a time, each dry-applied and verified
         # before it is written. The full impacted-test/lint pass runs once,
         # after the last hunk, exactly like the ordinary apply path.
         edit_files = sorted({

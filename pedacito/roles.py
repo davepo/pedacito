@@ -16,7 +16,7 @@ Roles: worker (default), planner, verifier, summarizer, repair, plus the
 recovery rungs `escalate` (one more attempt on this model when a task ends with
 no edit applied) and `fallback` (take over when the worker errors out).
 
-Sprint Q adds `scout_client`: the gather lookup loop may run on the profile
+`scout_client` lets the gather lookup loop run on the profile
 named by `scout_profile` (a fast small model on a second GPU) while every
 other call site -- planning, answer synthesis, edits, repair -- stays on the
 worker (architect) client.

@@ -13,8 +13,13 @@ from pedacito import config
 from pedacito.config import ConfigError
 from pedacito.gui import settings as S
 from pedacito.gui import settings_api
-from test_gui import gui  # noqa: F401  (the shared server fixture)
+from test_gui import gui as _shared_gui  # noqa: F401  (pytest re-export)
 from test_models_scan import _lmstudio, _serve
+
+
+@pytest.fixture
+def gui(_shared_gui):  # noqa: F811  (re-export the fixture imported above)
+    return _shared_gui
 
 BASE = '''\
 # my config
@@ -208,7 +213,7 @@ def test_resolved_hides_secrets():
     assert res["vram_gb"]["source"] == "user config (x)"
 
 
-# --- Sprint D: profile renaming --------------------------------------------------
+# --- Profile renaming -----------------------------------------------------------
 
 def _config(gui):
     gui.post("/api/settings/setup",
@@ -303,7 +308,7 @@ def test_profiles_rename_endpoint_validation(gui):
     assert 'default_profile = "qwen3_8"' in text   # the reference followed it
 
 
-# --- Sprint D: universal settings are always concrete ----------------------------
+# --- Universal settings are always concrete -------------------------------------
 
 def test_settings_payload_resolves_concrete_universal_values(gui):
     """No project open and no user config yet: every universal setting still
@@ -413,7 +418,7 @@ def test_import_auto_fixes_dotted_names(gui, dot_server):
     assert gui.cfg_path.read_text(encoding="utf-8") == before
 
 
-# --- Sprint G: gui_theme persistence, Auto-Tune, profile reasoning overrides ----
+# --- gui_theme persistence, Auto-Tune, profile reasoning overrides --------------
 
 GUITHEMES = ["slate", "light", "daylight", "nord", "midnight", "jazz_solo",
              "trapper_keeper", "memphis_arcade", "windbreaker"]
@@ -578,7 +583,7 @@ def test_profile_reasoning_overrides_persist(gui):
     assert status == 400 and "prompt_pack must be one of" in j["detail"]
 
 
-# --- Sprint J: pre-configured hosted provider profiles -------------------------
+# --- Pre-configured hosted provider profiles -----------------------------------
 # `/api/providers/add` turns one of the six catalog presets into a complete
 # profile; the user only supplies an API key or the env var that holds one.
 

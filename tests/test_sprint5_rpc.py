@@ -1,4 +1,4 @@
-"""Sprint 5: JSONL-RPC over stdio -- dispatch, event tagging, the steer
+"""JSONL-RPC over stdio -- dispatch, event tagging, the steer
 queue, the permission broker, cancel, and stdout purity.
 
 The transport is the product under test: every call reaches the RpcServer
@@ -346,7 +346,7 @@ def test_cancel_denies_parked_permission_and_keeps_session_warm():
 
     h = Harness(run=run)
     h.inp.feed({"id": 1, "method": "ask", "params": {"task": "gate"}})
-    ev = h.wait(lambda f: f["kind"] == "permission_request", "perm")
+    h.wait(lambda f: f["kind"] == "permission_request", "perm")
     h.inp.feed({"id": 2, "method": "cancel"})
     assert h.respond(2)["result"]["active"] is True
     res = h.respond(1, timeout=10)

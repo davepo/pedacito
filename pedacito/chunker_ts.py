@@ -21,8 +21,10 @@ Needs `tree-sitter` + `tree-sitter-language-pack`. If they are not importable,
 
 from __future__ import annotations
 
+import functools
 import gc
 import re
+from contextlib import contextmanager
 from importlib.metadata import PackageNotFoundError, version as _dist_version
 
 from .chunker import (
@@ -46,6 +48,34 @@ def _tree_sitter_is_safe(version: str) -> bool:
     pin from crashing the whole process instead of using the fallback
     chunker."""
     return _version_tuple(version) < (0, 26)
+
+
+@contextmanager
+def ts_nodes():
+    """Pause the cyclic collector while tree-sitter nodes are alive.
+
+    py-tree-sitter 0.26 can segfault when a collection runs over a live Node
+    (upstream py-tree-sitter#472). The dependency is pinned below 0.26, and
+    `_tree_sitter_is_safe` disables it outright in a bad environment; this is
+    the third line of defence. Nodes are freed by reference counting when the
+    guarded block returns, so nothing accumulates. Nested uses only re-enable
+    the collector if the outermost block found it enabled."""
+    was_enabled = gc.isenabled()
+    gc.disable()
+    try:
+        yield
+    finally:
+        if was_enabled:
+            gc.enable()
+
+
+def ts_guarded(fn):
+    """Decorator form of `ts_nodes` for a whole parse-and-walk call."""
+    @functools.wraps(fn)
+    def wrapped(*args, **kwargs):
+        with ts_nodes():
+            return fn(*args, **kwargs)
+    return wrapped
 
 
 _TS_DISABLED_REASON = ""
@@ -566,7 +596,7 @@ def _walk_calls(node, out: set[str], cls: str = "",
                 vmap: dict[str, str] | None = None) -> None:
     """Collect names invoked via call/new expressions under `node`. Member
     calls (obj.method()) reduce to the property name: the same bare-name
-    approximation chunker.py uses for Python -- and, Sprint 4, the SAME
+    approximation chunker.py uses for Python -- and the SAME
     receiver-aware qualification: ``ClassName.method`` is recorded beside the
     bare name when the receiver is decidable at chunk time (`cls` + a
     self-receiver id from `self_ids`, a local bound by `x = new Foo()` /
@@ -718,6 +748,7 @@ def _imports(root, src: bytes) -> list[str]:
     return out
 
 
+@ts_guarded
 def chunk_source_ts(rel_path: str, src: str, language: str,
                      class_split_lines: int = 60,
                      max_unit_lines: int = 220,
@@ -1219,6 +1250,7 @@ def _ruby_container(node, qualname_prefix: str, rel_path: str, lines: list[str],
                              unit_overlap_lines, imports)
 
 
+@ts_guarded
 def chunk_source_ruby(rel_path: str, src: str, class_split_lines: int = 60,
                       max_unit_lines: int = 220,
                       max_unit_chars: int = 12000,
@@ -1632,6 +1664,7 @@ def _generic_imports(root, spec, src: bytes) -> list[str]:
     return out
 
 
+@ts_guarded
 def chunk_source_generic(rel_path: str, src: str, language: str,
                          class_split_lines: int = 60,
                          max_unit_lines: int = 220,
@@ -1934,6 +1967,7 @@ def chunk_source_generic(rel_path: str, src: str, language: str,
     return chunks
 
 
+@ts_guarded
 def chunk_file_ts(rel_path: str, src: str, ext: str,
                    class_split_lines: int = 60,
                    max_unit_lines: int = 220,
@@ -1943,32 +1977,24 @@ def chunk_file_ts(rel_path: str, src: str, ext: str,
     """Chunk one file with the tree-sitter chunker for its extension; the
     entry point index.py calls.
 
-    The cyclic garbage collector is paused while tree-sitter nodes are alive:
-    py-tree-sitter 0.26 can segfault when a collection runs over live Node
-    objects (upstream py-tree-sitter#472). The dependency is pinned to
-    `<0.26`; this is the second line of defence for an environment that still
-    has 0.26 installed. Nodes are freed by reference counting when the chunker
-    returns, so nothing accumulates."""
+    The cyclic garbage collector is paused by `ts_nodes` while the
+    tree-sitter nodes are alive (py-tree-sitter#472); nodes are freed by
+    reference counting when the call returns, so nothing accumulates."""
     lang = LANG_BY_EXT[ext.lower()]
-    was_enabled = gc.isenabled()
-    gc.disable()
-    try:
-        if lang == "ruby":
-            return chunk_source_ruby(rel_path, src, class_split_lines,
-                                     max_unit_lines, max_unit_chars,
-                                     max_unit_tokens, unit_overlap_lines)
-        if lang in GENERIC_SPECS:
-            return chunk_source_generic(rel_path, src, lang, class_split_lines,
-                                        max_unit_lines, max_unit_chars,
-                                        max_unit_tokens, unit_overlap_lines)
-        return chunk_source_ts(rel_path, src, lang, class_split_lines,
-                               max_unit_lines, max_unit_chars,
-                               max_unit_tokens, unit_overlap_lines)
-    finally:
-        if was_enabled:
-            gc.enable()
+    if lang == "ruby":
+        return chunk_source_ruby(rel_path, src, class_split_lines,
+                                 max_unit_lines, max_unit_chars,
+                                 max_unit_tokens, unit_overlap_lines)
+    if lang in GENERIC_SPECS:
+        return chunk_source_generic(rel_path, src, lang, class_split_lines,
+                                    max_unit_lines, max_unit_chars,
+                                    max_unit_tokens, unit_overlap_lines)
+    return chunk_source_ts(rel_path, src, lang, class_split_lines,
+                           max_unit_lines, max_unit_chars,
+                           max_unit_tokens, unit_overlap_lines)
 
 
+@ts_guarded
 def has_syntax_error(text: str, language: str) -> tuple[bool, int | None]:
     """Return (has_error, line) for `text` parsed as `language`; line is the
     1-based line of the first ERROR node, else None. edits.py's post-edit

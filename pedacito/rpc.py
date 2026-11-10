@@ -125,6 +125,7 @@ class RpcOut:
         self._tag = tag
         self._suppress = tuple(suppress)
         self._lock = threading.Lock()
+        self._buf_lock = threading.Lock()
         self._buf = ""
         self._closed = False
         self.results = 0  # `kind:"result"` events let through - see _task_worker
@@ -134,12 +135,19 @@ class RpcOut:
         if self._closed:
             return 0
         n = len(s)
-        self._buf += s
-        while True:
-            nl = self._buf.find("\n")
-            if nl < 0:
-                break
-            line, self._buf = self._buf[:nl], self._buf[nl + 1:]
+        # Buffer assembly is under its own lock so two producers cannot
+        # interleave byte fragments into a malformed JSON line; complete
+        # lines are emitted through the ordinary per-frame lock.
+        with self._buf_lock:
+            self._buf += s
+            lines: list[str] = []
+            while True:
+                nl = self._buf.find("\n")
+                if nl < 0:
+                    break
+                line, self._buf = self._buf[:nl], self._buf[nl + 1:]
+                lines.append(line)
+        for line in lines:
             self._emit_line(line)
         return n
 
@@ -329,16 +337,23 @@ class RpcServer:
         if method == "permission_reply":
             rid = str(params.get("request_id") or params.get("id") or "")
             decision = str(params.get("decision") or "")
-            with self._mu:
-                slot = self._perm.get(rid)
-            if slot is None:
-                return self._frame(req_id, method,
-                                   error=f"no pending permission request {rid!r}")
             if decision not in _DECISIONS:
+                # Validate before looking up the slot: an invalid decision
+                # must never consume a pending request.
                 return self._frame(req_id, method,
                                    error=f"decision must be one of {list(_DECISIONS)}")
-            slot["decision"] = decision
-            slot["event"].set()
+            with self._mu:
+                slot = self._perm.get(rid)
+                if slot is None:
+                    return self._frame(
+                        req_id, method,
+                        error=f"no pending permission request {rid!r}")
+                if slot["decision"]:
+                    return self._frame(
+                        req_id, method,
+                        error=f"permission request {rid!r} was already answered")
+                slot["decision"] = decision
+                slot["event"].set()
             return self._frame(req_id, method,
                                result={"request_id": rid, "decision": decision})
 
@@ -467,8 +482,15 @@ class RpcServer:
         stats = getattr(res, "stats", None) or {}
         applied = bool(getattr(res, "applied", False))
         results = getattr(res, "results", None) or []
-        changed = sorted({str(getattr(r, "path", "")) for r in results
-                          if getattr(r, "applied", False)}) if applied else []
+        # `edits.Result` spells the fields `file`/`ok`; test doubles and
+        # other result shapes use `path`/`applied`. Accept both so a real
+        # apply reports its changed files instead of an empty list.
+        changed = sorted({
+            str(getattr(r, "file", "") or getattr(r, "path", ""))
+            for r in results
+            if getattr(r, "ok", getattr(r, "applied", False))
+            and (getattr(r, "file", "") or getattr(r, "path", ""))
+        }) if applied else []
         return {
             "reply": getattr(res, "reply", None),
             "applied": applied,

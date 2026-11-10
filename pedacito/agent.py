@@ -25,10 +25,10 @@ search/replace blocks instead (see edits.py).
 The system message and repo map come first and stay constant within a gather
 loop, so the server's prefix cache hits on every turn.
 
-Sprint 2 adds a content-addressed evidence store: every source span the
-harness displays (`read`, prefetch, `context` -- post token-clip) is hashed
-and recorded on the Agent as an `EvidenceSpan`. Two rehydration paths hand a
-span back to the model without ever rewriting history: the explicit
+A content-addressed evidence store hashes every source span the harness
+displays (`read`, prefetch, `context` -- post token-clip) and records it on
+the Agent as an `EvidenceSpan`. Two rehydration paths hand a span back to the
+model without ever rewriting history: the explicit
 `NEED path:120-168` directive (answer, repair and verifier replies) and the
 implicit repair auto-rehydration for unread-region / fuzzy-match findings
 that touch recorded evidence. Both APPEND at the conversation tail, so the
@@ -99,7 +99,7 @@ _MAX_PAYLOAD_CUTS = 2
 # a calibrated `client.chars_per_token` measures instead.
 _READ_CHARS_PER_TOKEN = 3.5
 
-# --- Sprint 2: content-addressed evidence + append-only exact-span rehydration
+# --- content-addressed evidence + append-only exact-span rehydration
 # `NEED path:120-168` re-asks allowed per generation (Guiding Constraint #3:
 # a bounded loop). cfg.max_rehydration_rounds overrides.
 _MAX_REHYDRATION_ROUNDS = 2
@@ -735,7 +735,7 @@ source you asked to see. Complete the user's task.
 
 
 # ------------------------------------------------------------------------
-# Sprint 5: symbol-anchored incremental edit-verify microloops
+# Symbol-anchored incremental edit-verify microloops
 # ------------------------------------------------------------------------
 # A 4B-9B model can emit one small, exact hunk reliably; a multi-file patch is
 # where truncation, stale line numbers and cross-block contamination appear.
@@ -853,7 +853,7 @@ _ITEM_SPLIT = re.compile(r"\n\n(?=--- )")
 
 
 # ---------------------------------------------------- utility source packing
-# Sprint 3: at the gather -> answer/edit boundary the source is packed by
+# At the gather -> answer/edit boundary the source is packed by
 # evidence utility instead of FIFO. Gather itself stays append-only; only this
 # rendered copy is reordered/packed, so the live prompt prefix is untouched.
 _PACK_HEAD_RE = re.compile(r"^---\s+(\w+)\s*(.*)$")
@@ -1246,7 +1246,7 @@ class Agent:
         self.events = None
         # Gather conversation kept for answer continuation (see answer()).
         self._messages: list[dict] = []
-        # Content-addressed evidence store and the read ledger (Sprint 2A):
+        # Content-addressed evidence store and the read ledger:
         # every displayed span is hashed here; the ledger maps normalised
         # file -> (start, end) spans in display order. Both reset per run.
         self.evidence = EvidenceStore()
@@ -1254,7 +1254,7 @@ class Agent:
         # Explicit NEED / implicit repair rehydration rounds used this run
         # (telemetry; reset in gather).
         self.rehydration_rounds = 0
-        # Sprint 3: requirement evidence state machine and the diagnostics whose
+        # Requirement evidence state machine and the diagnostics whose
         # exact spans the answer packer must pin. Both reset per task.
         self.requirements = None
         self.active_diagnostics: dict = {}
@@ -1297,7 +1297,7 @@ class Agent:
             pass
 
     def _gather_client(self):
-        """The client the gather loop runs its steps on (Sprint Q scout):
+        """The client the gather loop runs its steps on (scout routing):
         `cfg.scout_profile`'s client when configured and reachable, else the
         active architect client. Resolution failures fall back softly."""
         if not str(getattr(self.cfg, "scout_profile", "") or "").strip():
@@ -1736,7 +1736,7 @@ class Agent:
 
     def _chat_needs(self, chat, msgs: list[dict]) -> str:
         """Generate with the explicit `NEED path/to/file.py:120-168`
-        directive honoured (Sprint 2B, explicit): one `chat(msgs)` pass, and
+        directive honoured (explicit): one `chat(msgs)` pass, and
         while the reply's prose carries NEED lines and rehydration rounds
         remain, fetch ONLY those exact spans and APPEND them as a fresh
         assistant+user turn pair at the tail -- history is never rewritten,
@@ -1778,7 +1778,7 @@ class Agent:
         return reply
 
     def _auto_rehydrate(self, findings) -> str:
-        """Implicit repair auto-rehydration (Sprint 2B): for unread-region
+        """Implicit repair auto-rehydration: for unread-region
         and fuzzy-match findings that touch recorded evidence, re-fetch the
         flagged spans fresh from disk and return a block to append at the
         TAIL of the repair prompt. The read ledger is credited, so a
@@ -2005,7 +2005,7 @@ class Agent:
             system += "\n\n" + todo_notes
         mcp_notes = (mcp_mod.render(self.cfg)
                      if getattr(self.cfg, "allow_mcp", False) else "")
-        # Named-server path (Sprint R): only the handful of the servers'
+        # Named-server path: only the handful of the servers'
         # tools that match THIS task, each a compact one-line signature.
         named_notes = mcp_injection(self.cfg)
         mcp_notes = "\n\n".join(x for x in (mcp_notes, named_notes) if x)
@@ -2064,7 +2064,7 @@ class Agent:
         # the ledger and backup dir below.
         self.evidence = EvidenceStore()
         self.rehydration_rounds = 0
-        # Sprint 3: one requirement tracker for this task. It advances only
+        # One requirement tracker for this task. It advances only
         # from tool results and patches, never from an extra model call.
         from . import verify as verify_mod
         self.requirements = verify_mod.RequirementTracker(task)
@@ -2191,7 +2191,7 @@ class Agent:
                       "moving to answer]", file=sys.stderr)
             return True
 
-        # --- Sprint 3: deterministic requirement completion gate -----------
+        # --- deterministic requirement completion gate ---------------------
         # One cheap harness action per unmet requirement (never a model call):
         # read a located anchor, or grep for a specific term. The model sees
         # the appended RESULT and gets the next turn; a stall cleanup variant
@@ -2506,7 +2506,7 @@ class Agent:
                         print("  (no source read yet; asking it to read before "
                               "answering)", file=sys.stderr)
                     continue
-                # Sprint 3: before accepting `done`, make sure every
+                # Before accepting `done`, make sure every
                 # requirement has at least LOCATED/READ evidence. The cheapest
                 # action is deterministic: read a located anchor, else grep a
                 # specific requirement term. One assist per requirement. The
@@ -2659,8 +2659,8 @@ class Agent:
                 # Tokenizer-aware hard budget (cfg.max_read_tokens) applied
                 # BEFORE the source is displayed and before the ledger sees
                 # it: a clipped read has its header rewritten to the range
-                # actually delivered, so the span recorded below credits
-                # only the lines the model was shown.
+                # that was actually delivered, so the span recorded below
+                # credits only the lines the model was shown.
                 obs = self._clip_read_to_token_budget(obs)
                 # A read is progress only when it shows lines not already in the
                 # span ledger; an exact duplicate is replaced by a compact note
@@ -2841,7 +2841,7 @@ class Agent:
             if note_progress(step_progress):
                 break
 
-        # Sprint 3: a stall exit on a multi-requirement task still gets one
+        # A stall exit on a multi-requirement task still gets one
         # deterministic requirement lookup while budget remains. It is appended
         # at the tail, never rewriting a cached prefix, and costs no model call.
         if (budget > 0 and self.requirements
@@ -3164,7 +3164,7 @@ class Agent:
         return reply
 
     # ------------------------------------------------- verify before applying
-    # ------------------------------------- Sprint 5: incremental edit microloop
+    # ----------------------------------------- incremental edit microloop
     def incremental_eligible(self, task: str) -> bool:
         """True when this task is multi-hunk/multi-file enough to use the
         symbol-anchored microloop. Single-target edits keep the ordinary
@@ -3603,7 +3603,7 @@ class Agent:
             rules = prompts_mod.test_rules(self.cfg)
             if rules not in system:
                 system += "\n\n" + rules
-        # Implicit rehydration (Sprint 2B): flagged regions the model WAS
+        # Implicit rehydration: flagged regions the model WAS
         # shown get their fresh exact bytes appended at the TAIL of this
         # repair prompt, and the read ledger is credited -- the corrected
         # quote can then land without re-flagging as an unread edit.
@@ -4288,10 +4288,22 @@ class Agent:
             # a model decision. Fix the buffer and the file here, before any
             # test/lint subprocess or repair round can spend a call on it.
             from . import verify as verify_mod
-            for receipt in verify_mod.auto_heal_static(
-                    results, root=self.index.root, cfg=self.cfg,
-                    persist=True):
+            receipts = verify_mod.auto_heal_static(
+                results, root=self.index.root, cfg=self.cfg, persist=True)
+            for receipt in receipts:
                 print(f"  {receipt}", file=sys.stderr)
+            if receipts:
+                # The inserted import shifts every line below it: refresh the
+                # index now so later ranges, receipts and checks name the
+                # bytes actually on disk, not the pre-heal offsets.
+                from . import index as index_mod
+                for rel in sorted({r.file for r in results
+                                   if getattr(r, "ok", False) and r.file}):
+                    try:
+                        index_mod.reindex_file(self.index, rel, self.cfg,
+                                               save=False)
+                    except Exception:
+                        pass
         tracker = getattr(self, "requirements", None)
         if tracker is not None and task and getattr(tracker, "task", "") == task:
             tracker.observe_edit(results)
@@ -4550,7 +4562,7 @@ class Agent:
                 # A classheader chunk stands for the whole class.
                 e.lines = (c.start, c.scope_end or c.end)
                 continue
-            # Sprint P fallback: the index missed it (a method inside a
+            # Symbol-splice fallback: the index missed it (a method inside a
             # whole-class chunk, a file not indexed yet, a stale line map).
             # Ask the AST (Python) or tree-sitter directly where the symbol
             # sits in the CURRENT bytes before failing the whole file.

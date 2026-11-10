@@ -1,4 +1,4 @@
-"""Sprint C: per-project chat threads. Sprint J: friendly default names.
+"""Per-project chat threads and friendly default names.
 
 The transcript lives in `<project>/.pedacito/gui/threads/<id>.json` (one file
 per conversation, written atomically). A new chat opens named by the clock
@@ -137,7 +137,7 @@ def test_new_select_and_delete_threads(tmp_path):
 
 
 def test_new_threads_are_timed_stamped_then_titled_then_renamed(tmp_path):
-    """Sprint J contract: timestamp -> first question -> hand-picked name.
+    """Thread naming contract: timestamp -> first question -> hand-picked name.
     A rename marks the thread custom and survives a full reload."""
     from datetime import datetime
     before = core.default_thread_title(datetime.now())
@@ -298,23 +298,23 @@ def test_rename_endpoint_round_trip(gui):
     st.set_root(gui.tmp)                           # threads need a project folder
     tid = st.thread_id
     st.add_message("user", "rename me properly")
-    status, j = gui.post("/api/threads/rename", {"id": tid, "title": "  sprint   J notes \n" })
-    assert status == 200 and j["ok"] and j["title"] == "sprint J notes"
+    status, j = gui.post("/api/threads/rename", {"id": tid, "title": "  gui   notes \n" })
+    assert status == 200 and j["ok"] and j["title"] == "gui notes"
     assert st.threads[tid]["title_custom"] is True
     assert any(t["id"] == tid and t["title_custom"] for t in j["threads"])
     _status, state = gui.get("/api/state")
-    assert state["thread_title"] == "sprint J notes"
+    assert state["thread_title"] == "gui notes"
     assert state["thread_title_custom"] is True
     # persisted to the thread file itself
     data = json.loads(_file(gui.tmp, tid).read_text(encoding="utf-8"))
-    assert data["title"] == "sprint J notes" and data["title_custom"] is True
+    assert data["title"] == "gui notes" and data["title_custom"] is True
     # a later prompt cannot undo a custom name
     st.add_message("user", "and check the tests")
-    assert st.threads[tid]["title"] == "sprint J notes"
+    assert st.threads[tid]["title"] == "gui notes"
     # blanks and unknown ids are refused
     status, j = gui.post("/api/threads/rename", {"id": tid, "title": "   "})
     assert status == 400 and j["ok"] is False
     status, j = gui.post("/api/threads/rename", {"id": "ghost", "title": "x"})
     assert status == 400 and j["ok"] is False
-    assert st.threads[tid]["title"] == "sprint J notes"   # nothing changed
+    assert st.threads[tid]["title"] == "gui notes"   # nothing changed
     st.delete_thread(tid)

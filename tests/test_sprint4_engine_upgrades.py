@@ -1,4 +1,4 @@
-"""Sprint 4 engine upgrades: receiver-aware qualified calls, incoming test-caller
+"""Engine upgrades: receiver-aware qualified calls, incoming test-caller
 arity gate, and hardlink fast-path ratchet checkpoints.
 
 Chunkers now record `ClassName.method` next to bare `method` for calls made
@@ -13,7 +13,6 @@ from __future__ import annotations
 
 import stat
 import types
-from pathlib import Path
 
 import pytest
 
@@ -54,7 +53,7 @@ def _calls_of(idx, rel):
 
 
 def _arity_errors(root):
-    """Only the Sprint-4 incoming-test-caller messages (the other passes have
+    """Only the incoming-test-caller messages (the other passes have
     their own, already-tested shapes)."""
     return [e for e in spec.verify_cross_file_contracts(root)
             if "but updated signature in" in e]
