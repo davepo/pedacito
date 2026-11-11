@@ -1366,10 +1366,14 @@ Cost: no model calls, no new prompt shapes -- the price is transport discipline
 CLI knows). That discipline is what makes the server unit-testable: the tests
 drive `RpcServer` with fakes over `io.StringIO` and never spawn a process.
 
-## Quick reference: techniques 5, 11, 22 to 31
+## Quick reference: techniques 5, 11, 17 to 31
 
 | Technique | Section | How to turn it off | Where you see it |
 |---|---|---|---|
+| Prompt/Spec architect | §17 | No flag. Skip per run with no `--refine` | `--refine` on `ask`, `auto`, `new`; **✦ Refine Prompt** in the GUI, `↶ Undo Refine` restores the text |
+| Interface lock + pre-pytest contract/arity gate (`interface_lock`), incl. conftest fixture signatures | §18 | `interface_lock = false` | The `do not break signatures` block in the prompt; `ContractError` messages before any test runs |
+| Static analysis gate (`static_gate`, F821/F822/F823/F402/F404 + E999) | §19 | `static_gate = false` | `static gate` findings in the repair prompt; baseline-diffed, so only new errors count |
+| Green ratchet (`auto_green_ratchet`), hard-link checkpoints | §20 | `auto_green_ratchet = false` | `.pedacito/checkpoints/step_<k>/`; the Activity log says `ROLLED BACK` |
 | Import auto-healing (`auto_heal_imports`) | §5, §19 | `auto_heal_imports = false` | `[AUTO-HEALED: added 'import json' in x.py]` lines before repair rounds; "import auto-heal" in the event log |
 | Repair-trajectory collapse (`collapse_repair_turns`) | §5 | `collapse_repair_turns = false` | `repair_collapse` telemetry events; successful repairs leave a receipt, not the broken drafts |
 | Subagent EvidenceSpan transfer + single-slot prefix fork | §11, §28 | No flag (part of the `task` subagent) | `subagent_evidence` telemetry; promoted source appended under `HELPER RESULT` |
@@ -1378,6 +1382,7 @@ drive `RpcServer` with fakes over `io.StringIO` and never spawn a process.
 | Repair lesson ledger (anti-patterns) | §24 | `micro_facts = false` (also silences §14) | `.pedacito/micro_facts.json`, under `anti_patterns` |
 | Auto-promoted path-scoped rules | §24 | `micro_facts = false` (also silences §14/§24) | `.pedacito/rules/auto_*.md`, `auto_generated: true`; `promoted` rows in `micro_facts.json` |
 | Zero-anchor AST symbol splicing | §25 | No flag. Steer with `edit_style`; plain SEARCH/REPLACE still works | `<<<<<<< SYMBOL`, `AFTER_SYMBOL` edit blocks, and the `replace_symbol` payload |
+| Receiver-qualified call graph (`Class.method`) | §13 | None (always on; the chunkers record qualified targets) | `callers` / `usages` on a qualified query: exact receiver matches first, `(unqualified match)` label for ambiguous ones |
 | Deterministic rename (`rename_symbol`) | §26 | None for the CLI and GUI. The agent action needs `allow_write = true` | `pedacito rename`, and **Project ▾ → Rename symbol…** |
 | Engine-enforced JSON schema | §27 | `enforce_json_schema = false` | Automatic on every structured call. `pedacito config --doctor` shows the tier |
 | Scout/architect routing | §28 | `scout_profile = ""` | `scout_profile` in Settings. The top bar shows a `Scout: <profile>` badge |

@@ -173,7 +173,7 @@ Choose **Auto**, then describe a goal, such as `add CSV export to the report
 page, with tests`.
 
 - Tick **Plan only** under the options to receive a checklist first. You can
-  edit it in the **Plan** panel, then click **Run this plan**.
+  edit it in the **Plan** panel (**Edit**, then **Save**), then click **Run**.
 - Without **Plan only**, Pedacito plans, then applies and verifies each task.
   Options include a verify command (for example `pytest -q`), repair rounds, a
   cap on tasks and minutes, a separate git worktree, and keep-going after a
@@ -682,6 +682,8 @@ only the map is stale.
 | `pedacito ask PROJ -t "..."` | One task. Dry run by default. Add `--review`, `--apply`, or `--refine` |
 | `pedacito explain PROJ -q "..."` | Answer a question about the code. No edits |
 | `pedacito chat PROJ` | Interactive session; the index stays warm |
+| `pedacito rpc [PROJ]` | JSONL-RPC over stdin/stdout for editors and agents; the index stays warm |
+| `pedacito mcp list` | Show the tools of the named MCP servers and their trust flags |
 | `pedacito new DIR -t "..."` | Start a project from scratch (or `--spec FILE`) |
 | `pedacito auto PROJ -t "..."` | Plan a goal, then implement it task by task |
 | `pedacito restore PROJ` | Undo the last write |

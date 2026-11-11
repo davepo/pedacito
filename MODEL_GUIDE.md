@@ -37,7 +37,7 @@ than raw parameter count.
   (`enforce_json_schema`, TECHNIQUES.md §27). Weak models stop failing on
   syntax.
 - **Pair a fast scout with the architect.** `scout_profile = "<small
-  profile>"` runs the lookup steps of gather on a 3B to 7B model while the
+  profile>"` runs the lookup steps of gather on a 4B to 9B model while the
   big model keeps planning, answers and edits (TECHNIQUES.md §28). On one
   GPU it keeps the architect's context free; on two it is the natural split.
 

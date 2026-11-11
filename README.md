@@ -23,7 +23,7 @@ A large codebase is too much to hand a small model in one go, so Pedacito hands
 it over in pieces:
 
 - **Chunks, not files.** Python is parsed with `ast`. JavaScript, TypeScript,
-  Go, Rust, Java, C, C++, C#, and Ruby are parsed with tree-sitter. Each function
+  Go, Rust, Java, C, C++, C#, Ruby, PHP, Kotlin, Swift, Scala, and Lua are parsed with tree-sitter. Each function
   or class is a unit with an exact line range.
 - **Skeletons, not dumps.** A 500-line class comes back as its signatures and
   line pointers, so the model reads the one method it intends to change.
@@ -166,7 +166,7 @@ commands. Run `pedacito <command> --help` for every flag.
 | `pedacito rename OLD NEW` | Multi-file symbol rename through the AST and the tokenizer, no model call. `--file` scopes it, `--apply` writes (default: diff preview) |
 | `pedacito index`, `map`, `files`, `cost` | Build and inspect the index. These need no model call, except `index` summaries |
 | `pedacito eval` | Score the harness on fixture repositories. Use `--baseline` as a regression gate |
-| `pedacito memory`, `skills`, `prune`, `reset`, `trust`, `worktree`, `serve`, `procs`, `lsp`, `diagnose`, `tests`, `webcheck` | Upkeep and specialist tools |
+| `pedacito memory`, `skills`, `prune`, `reset`, `trust`, `worktree`, `serve`, `procs`, `lsp`, `mcp`, `diagnose`, `tests`, `webcheck` | Upkeep and specialist tools. `mcp list` shows the named MCP servers' tools and trust flags |
 
 Benchmarks are in the GUI only, through the **Benchmarks** button.
 
@@ -181,7 +181,6 @@ Benchmarks are in the GUI only, through the **Benchmarks** button.
 - The rest of this README is the full reference: install, configuration, every
   mode and setting, safety, and known limits.
 
----
 ---
 
 ## Install
@@ -296,9 +295,7 @@ rather than its port (so two servers can share one machine), lists its models,
 and writes one identity-only profile per model, then sets a default. Pass
 `--url` to point at a server on another machine or a hosted API; `models scan
 --match PATTERN --calibrate quick|full|none` re-runs it. Prefer to edit by
-hand? The minimum:
-
-The file is `~/.config/pedacito/config.toml` (Linux/macOS) or
+hand? The file is `~/.config/pedacito/config.toml` (Linux/macOS) or
 `%APPDATA%\pedacito\config.toml` (Windows). The minimum:
 
 ```toml
@@ -484,7 +481,7 @@ Free inspection commands (no model needed):
 - `pedacito files PROJ`, every candidate file and why it was kept or skipped.
 - `pedacito cost PROJ`, estimated LLM calls and time for a first index
   (`--tps` sets your tokens/second).
-- `pedacito map PROJ`, print the index (`--tier auto|flat|cards|dirs`).
+- `pedacito map PROJ`, print the index (`--tier auto|flat|cards|dirs|ranked`).
 
 ### `ask`
 
@@ -861,12 +858,11 @@ identically.
 | Area | What it does |
 |---|---|
 | **Header** | Open a project (type a path, **Browse…** the machine's folders, or pick a recent one), choose its model profile, see the model server's status light and the session's token/cache/cost totals. |
-| **Chat** (left) | Five modes next to the box: **Task** (edit code; *review* or *write directly*, planning auto/always/never, max lookups), **Explain** (read-only questions, answer streams in), **Auto** (goal → plan → implement; plan-only or implement, verify command, repair rounds, task/minute caps, worktree, keep-going, pip-install; applying Auto accepts the tool trust boundary and enables write/run tools for the run), **New** (start a project from scratch in a folder: preview, build, build-then-review, skeleton only, and *complex* for the autonomous loop), and **How ?** (the built-in CLI/GUI/setting reference with topic chips, copyable commands and *Open in Settings* links; answers stay out of the saved coding thread). **Attach** (or drag in) a text file as the task, question, or spec. While a task runs, type to **steer** the model, answer its clarifying questions inline, or **Stop** it. |
+| **Chat** (left) | Five modes next to the box: **Task/Edit** (edit code; *review* or *write directly*, planning auto/always/never, max lookups), **Ask** (read-only questions, answer streams in), **Auto** (goal → plan → implement; plan-only or implement, verify command, repair rounds, task/minute caps, worktree, keep-going, pip-install; applying Auto accepts the tool trust boundary and enables write/run tools for the run), **New** (start a project from scratch in a folder: preview, build, build-then-review, skeleton only, and *complex* for the autonomous loop), and **How ?** (the built-in CLI/GUI/setting reference with topic chips, copyable commands and *Open in Settings* links; answers stay out of the saved coding thread). **Attach** (or drag in) a text file as the task, question, or spec. While a task runs, type to **steer** the model, answer its clarifying questions inline, or **Stop** it. |
 | **Changes** (middle) | The proposed edits as *Old code | Updated code* side by side with word-level highlights. Accept or reject the whole set, untick files to accept only some, or **Edit updated** to hand-edit a file before accepting. Backups are made first and a file that changed on disk since the preview is refused. |
-| **Plan** (middle) | The `auto`/plan checklist with live progress; edit it, then **Run this plan**. |
-| **File** (middle) | Read-only viewer for any indexed file (click it in the tree). |
-| **Terminal** (bottom) | Everything pedacito prints, live, with ANSI colours, the same text the launching terminal shows. |
-| **Files** (right) | Filterable tree of the indexed files; files in the pending review are highlighted. |
+| **Activity** and **Plan** (right, top) | Live phase and activity for the running task. The `auto`/plan checklist with progress; click **Edit** to change it, then **Run** to implement it. |
+| **Files**, **Backups**, **Logs** (right, bottom tabs) | Files: a filterable tree of the indexed files, with files in the pending review highlighted. Backups: restorable snapshots. Logs: the terminal, everything pedacito prints, live, with ANSI colours. |
+| **File preview** | Clicking a file in the Files tab opens a read-only preview modal. |
 | **Settings** | See below. |
 
 Panels resize (drag the dividers), the layout and colour scheme are
@@ -877,9 +873,9 @@ without touching the rest of the file, comments survive, every edit is checked
 with the same rules the loader uses before it is written, and the previous file
 is kept as `config.toml.bak`. Tabs: **Profiles** (create, duplicate, delete,
 make default; server URL, key, model with a *Test connection* that lists the
-server's models, tier, VRAM, JSON mode, and the common switches), **All
-settings** (every setting, searchable, with its help text and where its value
-comes from, applied globally or to one profile), and **Raw file**. With no
+server's models, tier, VRAM, JSON mode, and the common switches), **Model
+discovery**, **Auto-Tune**, **All settings** (every setting, searchable, with its help text and where its value
+comes from, applied globally or to one profile), and **Raw file / reset**. With no
 config at all, a first-run form (with *Find servers* for LM Studio/Ollama) builds
 one. A project config's execution settings stay ignored until you trust it
 (*Review & trust…*, the same as `pedacito trust`).
@@ -921,9 +917,8 @@ needed: DOM ids that exist in no HTML file, ESM syntax loaded through a classic
 `<script src>` (a silent SyntaxError), duplicate globals across classic
 scripts, `<script src>` files that do not exist, bare imports package.json
 never declared, and inline handlers calling members nothing defines. It is
-regex-level on purpose, so its results are notices, the command, the `new`
-scaffold summary, and a WARN after `auto` tasks that touched web files, never
-hard failures.
+regex-level on purpose, so its findings are warnings (printed by `auto` after
+tasks that touched web files, and in the `new` scaffold summary), never hard failures.
 
 `calibrate` also measures **native tool calls** against the JSON grammar on your
 model (same eight scenarios, both modes) and the card switches `tool_mode` to
@@ -1105,7 +1100,9 @@ pedacito rename apply_discount discounted_price --file pkg/core.py    # that fil
 pedacito rename apply_discount discounted_price --apply               # write it
 ```
 
-The preview is the default, so no flag is needed to get one. `--apply` writes the
+A qualified name narrows the rename to one class: `pedacito rename Store.save save_record`
+renames `Store.save` and the call sites whose receiver is provably a `Store` (Python),
+and lists the look-alikes it left alone. The preview is the default, so no flag is needed to get one. `--apply` writes the
 change and snapshots the originals first, so `pedacito restore` undoes it.
 
 - **Identifiers only.** Python names move through `tokenize`. JavaScript,
@@ -1257,9 +1254,9 @@ you configured. Within that:
   (`redact_secrets`); a task that appears to contain one warns before going to
   a hosted API.
 - **A repository cannot run commands behind your back.** A project's own
-  `.pedacito.toml` may not set `hooks`, `mcp_servers`, `auto_verify` or
-  `test_command` until you read it and run `pedacito trust`; editing the file
-  revokes the approval.
+  `.pedacito.toml` may not set `hooks`, `mcp_servers`, `auto_verify`, `test_command`,
+  `allow_serve`, `allow_lsp`, `lsp_servers`, or any sandbox setting until you read it
+  and run `pedacito trust`; editing the file revokes the approval.
 - **Hooks** (`hooks = { post_edit = ["ruff format {file}"], pre_edit = [...] }`)
   run your own program at `session_start`, `pre_task`/`post_task`,
   `pre_tool`/`post_tool`, `pre_run`/`post_run`, `pre_edit`/`post_edit`,
@@ -1337,7 +1334,7 @@ harness-fit and eval evidence; `--apply-roles` writes the roles after you
 confirm.
 
 Gather has one split that is not a role: `scout_profile = "tiny"` runs the
-lookup steps of the gather loop (grep, read, outline, symbol, `run_test`) on
+lookup steps of the gather loop (`read`, `grep`, `find`, `outline`, `callers`, `context`, `usages`, `run_test`) on
 that profile's server while the active *architect* profile keeps planning,
 synthesis, answers and edits. A scout that is unknown or unreachable falls
 back to the architect with one warning, its usage still lands in the same
@@ -1497,9 +1494,9 @@ config --reference` prints the annotated template. Key settings:
 |---|---|---|
 | `base_url` | `http://localhost:1234/v1` | Server address. |
 | `model` | `google/gemma-3-27b` | Exact id/name the server reports. |
-| `api_key` / `api_key_env` | `""` / `""` | For hosted APIs and secured servers. `api_key_env` stores the *name* of an environment variable holding the key, so the secret never lands in the config file. |
+| `api_key` / `api_key_env` | `"lm-studio"` / `""` | For hosted APIs and secured servers. `api_key_env` stores the *name* of an environment variable holding the key, so the secret never lands in the config file. |
 | `vram_gb` | *(required for local)* | GPU VRAM; set in `[universal]`, overridable per profile. |
-| `context_tokens` | auto | Server-side context window; set when detection is wrong. |
+| `context_tokens` | `8192` | Server-side context window. With `auto_detect_context` on (the default) the server's reported window replaces it; set it explicitly when detection is wrong. |
 | `k_cache_quant` / `v_cache_quant` | `""` | KV-cache quantization the runtime uses. |
 | `json_mode` | `"schema"` | `"schema"` for local servers, `"object"` for hosted (auto-switched). |
 | `enforce_json_schema` | true | Ask the engine to constrain gather steps with `response_format` json_schema (strict); servers that refuse are downgraded to json_object, then plain prompting, per model. |
@@ -1577,9 +1574,11 @@ working default and is documented in `pedacito config --reference`.
 
 ## Known limits
 
-- The call graph matches bare names, so two unrelated `run()` methods are
-  conflated -- enough for locating code; refactoring needs the receiver-qualified
-  rename below to tell them apart. Import edges are resolved per language
+- The call graph records receiver-qualified targets (`Store.get`, `this.x()`,
+  typed locals) where the receiver is provable, but an untyped call still matches
+  its bare name, so two unrelated `run()` methods can be conflated when the receiver
+  is unknown. Refactoring should use the receiver-qualified rename (see
+  [Renaming a symbol](#renaming-a-symbol-across-the-project)). Import edges are resolved per language
   (relative paths, packages, `crate::`), but an import it cannot tie to an
   indexed file is treated as external, and the "no importers" hint is evidence,
   not proof (dynamic loading, entry points).
