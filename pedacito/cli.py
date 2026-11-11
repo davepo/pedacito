@@ -29,6 +29,7 @@ import os
 import sys
 from pathlib import Path
 
+from . import config
 from . import config_editor
 from . import discovery
 from . import events as events_mod
@@ -507,8 +508,7 @@ def _chat_command(line: str, args, cfg, ref) -> bool:
 
     if cmd == "profiles":
         if not cfg.profiles:
-            print("  No profiles defined. Add [profiles.NAME] to your config.",
-                  file=sys.stderr)
+            print(_profiles_empty_note(), end="", file=sys.stderr)
         else:
             print(profiles_mod.render(profiles_mod.list_profiles(cfg)),
                   file=sys.stderr)
@@ -1237,6 +1237,18 @@ def _cmd_models_scan(args) -> int:
     return 0
 
 
+def _profiles_empty_note() -> str:
+    """Why the profile table is empty, when the reason is a config file
+    pedacito never opened: `XDG_CONFIG_HOME` replaces ~/.config, so the
+    profiles the user wrote can sit in a shadowed file. Nothing is shadowed
+    (or the file simply has no profiles): the plain where-to-write line."""
+    note = config.xdg_shadow_note()
+    if note:
+        return note + "\n"
+    return (f"  No profiles defined. Add [profiles.NAME] blocks to "
+            f"{USER_CONFIG} (or pass --config), then re-run.\n")
+
+
 def _cmd_profiles(args, cfg) -> int:
     """`pedacito profiles`: the shared table, optional recommendations, --json,
     and --apply-roles."""
@@ -1251,6 +1263,8 @@ def _cmd_profiles(args, cfg) -> int:
         return 0
     print(profiles_mod.render(
         rows, recs if getattr(args, "recommend", False) else None))
+    if not rows:
+        print(_profiles_empty_note(), end="", file=sys.stderr)
     if getattr(args, "apply_roles", False):
         return _cmd_profiles_apply(args, recs)
     return 0

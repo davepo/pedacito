@@ -595,6 +595,29 @@ def _header(rel: str, purpose: str) -> str:
     return f"{rel}\n{safe}\n"
 
 
+def _readme_run_command(plan: Plan) -> str:
+    """The `## Run` block's command, for the stack the plan actually names.
+
+    This was hard-coded `python main.py` for every project, so a browser game
+    shipped a README telling its reader to run a file the project did not
+    contain -- and, worse, no line anywhere saying the page has to be served
+    over HTTP. ES modules are refused by `file://`; without the server line a
+    working build looks broken to whoever opens it."""
+    paths = [f.path.lower() for f in plan.files]
+    has_py = any(p.endswith(".py") for p in paths)
+    entry = next((p for p in paths if p.endswith((".html", ".htm"))), "")
+    if entry and not has_py:
+        return (f"python -m http.server 8000   # then open "
+                f"http://localhost:8000/{entry}")
+    if entry:
+        return ("python main.py\n\n"
+                f"Serve the page over HTTP as well -- open it at "
+                f"http://localhost:8000/{entry} (`python -m http.server 8000` "
+                "in the project root). Double-clicking the file gives ES "
+                "modules a CORS error and nothing runs.")
+    return "python main.py"
+
+
 def apply_skeleton(root: Path, plan: Plan, dry_run: bool = False,
                    verbose: bool = True,
                    stubs: dict[str, str] | None = None) -> list[str]:
@@ -613,7 +636,7 @@ def apply_skeleton(root: Path, plan: Plan, dry_run: bool = False,
     if readme is None:
         wanted.setdefault("README.md",
                           f"# {plan.project_name}\n\n{plan.summary or ''}\n\n"
-                          "## Run\n\n```bash\npython main.py\n```\n")
+                          f"## Run\n\n```bash\n{_readme_run_command(plan)}\n```\n")
     if any(f.path.endswith(".py") for f in plan.files):
         # A starter pyproject belongs in a Python plan only: in a JS/HTML project
         # it would mislead the repo brief, the diagnostics, and the model about
@@ -999,6 +1022,83 @@ def fix_import_errors(client, cfg, idx: Index, plan: Plan, backup_dir,
     return fixed
 
 
+def web_contract_errors(root: Path) -> list[str]:
+    """Every frontend contract violation the deterministic gate sees, whole
+    tree (no scope): `[]` for a project with no HTML/JS at all."""
+    try:
+        from . import spec as _spec
+        return _spec.verify_frontend_contracts(Path(root))
+    except Exception:
+        return []
+
+
+def fix_web_contracts(client, cfg, idx: Index, plan: Plan, backup_dir,
+                      verbose: bool = True,
+                      rounds: int = 2) -> tuple[int, list[str]]:
+    """Repair the DOM/module contract violations a per-file build leaves.
+
+    Each file is written by its own call, so index.html invents one set of
+    element ids while main.js queries another, and a later file imports a name
+    its sibling never exported. Nothing in the per-file check can see that --
+    the files are individually valid, and only the browser links them. The
+    gate knows the shapes it will not tolerate (an asset that 404s, a query
+    for an id no template renders, a JS file that does not parse, a module
+    binding or import that cannot link); this loop hands the model exactly
+    those lines plus the current HTML/JS and asks for small blocks.
+
+    Returns (fix blocks applied, contract errors still standing)."""
+    from .agent import ANSWER_SYSTEM
+
+    fixed = 0
+    errors = web_contract_errors(idx.root)
+    for _ in range(rounds):
+        if not errors:
+            break
+        files: dict[str, str] = {}
+        for f in plan.files:
+            p = idx.root / f.path
+            if p.suffix.lower() not in (".html", ".htm", ".js", ".mjs"):
+                continue
+            if not p.is_file():
+                continue
+            text = fileio.read_text(p)
+            if len(text) > 20000:      # say so: a silent cut invites a fix
+                text = text[:20000] + "\n... (file truncated here)\n"
+            files[f.path] = text
+        listing = "\n\n".join(
+            f"### {rel}\n```\n{text}\n```" for rel, text in sorted(files.items()))
+        user = (
+            f"TASK\n{plan.project_name}: make the page actually run.\n\n"
+            "These files are each valid on their own, but together the page "
+            "cannot load. Fix every one of these:\n\n"
+            + "\n".join(f"- {e}" for e in errors[:20]) + "\n\n"
+            "CURRENT FILES\n" + listing + "\n\n"
+            "Emit search/replace blocks that reconcile the contract: give the "
+            "HTML the ids the JS queries (or change the queries to the ids "
+            "that exist), add or export the symbol an import expects, drop a "
+            "duplicate import of a name already bound, and point every "
+            "<script src> at a file that exists. Keep every block small -- "
+            "never re-quote a whole file.")
+        reply = client.chat(
+            [{"role": "system", "content": ANSWER_SYSTEM},
+             {"role": "user", "content": user}],
+            max_tokens=getattr(cfg, "max_tokens_answer", 4000),
+            stream=verbose, disable_thinking=True)
+        blocks = parse_edits(reply)
+        if not blocks:
+            break
+        results = apply_edits(idx.root, blocks, backup=cfg.backup,
+                              dry_run=False, cfg=cfg, backup_dir=backup_dir)
+        ok = [r for r in results if r.ok]
+        if not ok:
+            break
+        fixed += len(ok)
+        for r in ok:
+            idx = index_mod.reindex_file(idx, r.file, cfg)
+        errors = web_contract_errors(idx.root)
+    return fixed, errors
+
+
 def _py_sources(root: Path, rels) -> dict[str, str]:
     """Read every Python file in `rels` that exists, as rel -> text."""
     out: dict[str, str] = {}
@@ -1303,6 +1403,7 @@ def run_new(root: Path, cfg, client, spec: Spec, *, apply: bool = False,
                             backup_dir=backup_dir,
                             tests_first=True if design_doc else None)
     print("\n" + summarise_result(summary))
+    contract_failed = False
 
     # Files are built independently, so repair cross-file import mismatches.
     n_fixed = fix_import_errors(client, cfg, idx, plan, backup_dir,
@@ -1311,12 +1412,45 @@ def run_new(root: Path, cfg, client, spec: Spec, *, apply: bool = False,
         print(f"  fixed {n_fixed} import issue(s)", file=sys.stderr)
 
     if apply:
-        # Contract lint for browser projects (webcheck): a notice board on
-        # stderr, never a build failure -- the rc keys off `failed` alone.
+        # Browser projects are only proven by their contract: the per-file
+        # build writes index.html and main.js in separate calls, so the page
+        # can be committed with ids no script queries and imports no module
+        # answers. The gate knows; it now gets repair rounds and, if the
+        # contract still cannot hold, the build does not report success.
+        web_errors = web_contract_errors(root)
+        if web_errors:
+            if verbose:
+                print(f"\n--- {len(web_errors)} frontend contract violation(s): "
+                      "asking for a repair pass ---", file=sys.stderr)
+                for e in web_errors[:8]:
+                    print(f"  {e}", file=sys.stderr)
+            n, web_errors = fix_web_contracts(client, cfg, idx, plan,
+                                              backup_dir, verbose=verbose)
+            if verbose and n:
+                print(f"  {n} contract fix block(s) applied", file=sys.stderr)
+        # The rest of the webcheck vocabulary (classic/duplicate globals,
+        # bare specifiers, member calls on page globals) stays a notice board:
+        # heuristic checks do not get to veto a build they might get wrong.
         from . import webcheck
         if webcheck.notice(root):
             workspace.log_event(root, "webcheck reported contract findings "
                                 "after the build", "WARN")
+        if web_errors:
+            workspace.log_event(
+                root, f"build left {len(web_errors)} frontend contract "
+                      f"violation(s); the page cannot run as built", "ERROR")
+            print("\nBUILD INCOMPLETE: the page cannot run as built. "
+                  f"{len(web_errors)} frontend contract violation(s) remain:",
+                  file=sys.stderr)
+            for e in web_errors[:10]:
+                print(f"  {e}", file=sys.stderr)
+            print("\nFix them with:\n  pedacito ask . --apply --strict "
+                  "-t \"reconcile the DOM and ES module contracts listed "
+                  "above\"", file=sys.stderr)
+            if not summary["failed"]:
+                # Reported separately from a build step that failed: the
+                # summary dict keeps its shape, the exit code sees this.
+                contract_failed = True
 
     if review and summary["done"]:
         results = _review_build(root, plan, summary, cfg, backup_dir, when)
@@ -1326,7 +1460,7 @@ def run_new(root: Path, cfg, client, spec: Spec, *, apply: bool = False,
         p = workspace.write_session(root, f"new: {plan.project_name}",
                                     [], render_plan(plan), [], backup_dir, when)
         print(f"[session: {p.relative_to(root)}]", file=sys.stderr)
-    return 0 if not summary["failed"] else 1
+    return 1 if summary["failed"] or contract_failed else 0
 
 
 def _run_complex(root: Path, cfg, client, idx, plan: Plan, spec: Spec, *,

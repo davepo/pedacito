@@ -3423,6 +3423,21 @@ _RUN_TEST_CHARS_PER_TOKEN = 3.5
 _PYTEST_TALLY_RE = re.compile(
     r"\d+ (?:passed|failed|errors?|xfailed|xpassed|skipped|deselected)"
     r"|no tests ran", re.I)
+# `def test_x`, `async def test_x`, `class TestX`: what pytest collects.
+_PYTEST_COLLECT_RE = re.compile(r"^(?:async\s+)?def\s+test_|^class\s+Test\b",
+                                re.M)
+# pytest's own exit codes: 5 in particular is "I collected nothing", which is
+# not a verdict about the code and must not read like one.
+_PYTEST_EXIT_LABELS = {
+    1: "TESTS FAILED",
+    2: "INTERRUPTED (a test or conftest raised; the run stopped early)",
+    3: "PYTEST INTERNAL ERROR (the runner itself crashed: look at conftest.py"
+       " and installed plugins, not at the code under test)",
+    4: "USAGE ERROR (bad invocation: an unknown option, or a target path"
+       " pytest cannot parse)",
+    5: "NO TESTS COLLECTED -- nothing matched, so this says NOTHING about"
+       " whether the code works",
+}
 
 
 _RUN_TEST_RUNNER_CACHE: dict[str, list[str]] = {}
@@ -3449,6 +3464,20 @@ def _pytest_runner_ok(argv: list[str], root: Path, cfg) -> bool:
         _RUN_TEST_RUNNER_CACHE[key] = argv
         return True
     return False
+
+
+def _has_pytest_tests(path: Path) -> bool:
+    """True when a Python file holds anything pytest would collect as a test.
+
+    `pedacito new` writes verification scripts that run standalone (`def
+    check(...)`, `if __name__ == "__main__"`); pointed at one of those, pytest
+    collects nothing and exits 5 -- a code that reads like a failure, and sent
+    one real campaign renaming working functions to `test_*` to chase it."""
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return True                      # unreadable: leave the run to pytest
+    return bool(_PYTEST_COLLECT_RE.search(text))
 
 
 def _run_test_runner(root: Path, cfg) -> list[str] | None:
@@ -3598,6 +3627,18 @@ def tool_run_test(index, cfg, target: str = "", k_filter: str = "") -> str:
             argv_target = f"{rel}::{node}"
         else:
             argv_target = rel
+            if (resolved.is_file() and resolved.suffix.lower() == ".py"
+                    and not _has_pytest_tests(resolved)):
+                return (f"ERROR: {rel} declares no pytest tests -- no "
+                        "`def test_...` and no `class Test...` -- so pytest "
+                        "collects nothing there and exits 5 (`No tests ran`), "
+                        "which says nothing about whether the file works. "
+                        "If it is a standalone script, run it as one "
+                        f"(`run`/`python {rel}` with allow_shell) or read it; "
+                        "if it is meant to hold tests, that is the gap: write "
+                        "`def test_...` functions in it first. Do NOT rename "
+                        "or rewrite its existing functions to make an exit "
+                        "code 5 go away.")
     if filt.startswith("-"):
         return ("ERROR: the run_test `filter` cannot start with '-' (it "
                 "would read as an option). Use an expression like "
@@ -3656,11 +3697,22 @@ def tool_run_test(index, cfg, target: str = "", k_filter: str = "") -> str:
                     d=display, t=timeout,
                     p=_condense_failures(raw, 1500) or "(no output)")
 
-    lines = [f"RUN TEST: {display}",
-             f"EXIT: {rc} ({'OK' if rc == 0 else 'FAILED'})"]
+    verdict = "OK" if rc == 0 else ("NOT COLLECTED" if rc == 5 else "FAILED")
+    lines = [f"RUN TEST: {display}", f"EXIT: {rc} ({verdict})"]
+    label = _PYTEST_EXIT_LABELS.get(rc)
+    if rc and label:
+        lines.append(f"EXIT CODE MEANS: {label}")
     tally = _pytest_tally(raw)
     if tally:
         lines.append(f"SUMMARY: {tally}")
+    if rc == 5:
+        lines.append(
+            "NOTHING WAS COLLECTED: the target has no `def test_...` or "
+            "`class Test...` for pytest to find. That is not a failure of "
+            "the code under test and it is not a reason to rename anything: "
+            "run a standalone script as a script (`run` with the interpreter, "
+            "or read it and check its logic), or write the tests the target "
+            "is missing. Do NOT edit working code to chase this exit code.")
     if "no module named pytest" in raw.lower():
         lines.append("ERROR: pytest is not installed for this interpreter "
                      "-- the project may need a different runner (config "

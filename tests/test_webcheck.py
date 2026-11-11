@@ -299,3 +299,73 @@ def test_run_loop_skips_webcheck_for_non_web_changes(tmp_path, monkeypatch):
     monkeypatch.setattr(webcheck, "run",
                         lambda *a, **k: pytest.fail("must not run"))
     assert loop.run_loop(tmp_path, _cfg(), None, idx, plan, apply=True) == 0
+
+
+# ------------------------------------------------ blanks: what is not code --
+# Checks 6 and 7 read names out of a blanked copy of the file, so every false
+# positive they could produce is a bug in the blanker or in the binding pool.
+# All three shapes below came from running the checker over real code.
+
+def test_nested_template_literal_text_is_not_code(tmp_path):
+    """Lit-html nests a template inside an interpolation. A string regex stops
+    at the first inner backtick and hands the closing markup back as code --
+    which reads as `reachable (falls back`, a call to nothing."""
+    _w(tmp_path, "index.html",
+       '<!doctype html><script type="module" src="app.js"></script>')
+    _w(tmp_path, "app.js",
+       "import { html } from './lit.js';\n"
+       "export function panel(props) {\n"
+       "  return html`<div class=${props.cls}>\n"
+       "    ${props.open ? html`<span onClick=${() => props.toggle()}>x</span>`"
+       " : null}\n"
+       "    Use it when a server is reachable (falls back to the\n"
+       "    built-in reference automatically)</label>`;\n"
+       "}\n")
+    found = webcheck.run(tmp_path)
+    assert not _hit(found, needle="reachable"), [str(f) for f in found]
+    assert not _hit(found, needle="built"), [str(f) for f in found]
+
+
+def test_destructured_bindings_are_bound_names(tmp_path):
+    """`const [open, setOpen] = useState()` binds both names. Reading the
+    payload as one token reports `setOpen()` as an unreachable call."""
+    _w(tmp_path, "index.html",
+       '<!doctype html><script type="module" src="app.js"></script>')
+    _w(tmp_path, "app.js",
+       "import { useState } from './react.js';\n"
+       "const [open, setOpen] = useState(false);\n"
+       "const { draw, fill: doFill } = canvas;\n"
+       "export function use() { setOpen(!open); draw(); doFill(); }\n")
+    found = webcheck.run(tmp_path)
+    for name in ("setOpen", "draw", "doFill"):
+        assert not _hit(found, needle=name), [str(f) for f in found]
+
+
+def test_a_quote_in_a_regex_or_comment_does_not_swallow_the_file(tmp_path):
+    """/['"]/ and // don't must not open a string: once they do, the rest of
+    the file is blanked and a real ReferenceError goes unreported."""
+    _w(tmp_path, "index.html",
+       '<!doctype html><script type="module" src="app.js"></script>')
+    _w(tmp_path, "app.js",
+       "const QUOTE = /['\"]/;\n"                # a character class of quotes
+       "// don't treat this as a string either\n"
+       "export function go() { return spawnEnemy(3); }\n")
+    found = webcheck.run(tmp_path)
+    assert _hit(found, rel="app.js", needle="spawnEnemy"), \
+        [str(f) for f in found]
+
+
+def test_the_blanker_keeps_offsets_and_line_numbers(tmp_path):
+    """Findings are routed to a repair prompt by file:line; blanking that
+    shifts a line sends the repair to the wrong place."""
+    _w(tmp_path, "index.html",
+       '<!doctype html><script type="module" src="app.js"></script>')
+    src = ("import { a } from './x.js';\n"
+           "const text = `\n  multi\n  line\n`;\n"
+           "export function go() { return nope(); }\n")
+    _w(tmp_path, "app.js", src)
+    assert len(webcheck._js_code(src)) == len(src)
+    assert webcheck._js_code(src).count("\n") == src.count("\n")
+    found = webcheck.run(tmp_path)
+    assert _hit(found, rel="app.js", needle="nope", line=6), \
+        [str(f) for f in found]

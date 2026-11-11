@@ -1488,7 +1488,8 @@ class Agent:
 
     def _collapse_repair_turns(self, messages: list[dict], prefix_index: int,
                                *, receipt: str = "",
-                               clean_reply: str = "") -> int:
+                               clean_reply: str = "",
+                               reason: str = "") -> int:
         """Pop failed drafts/diagnostics back to snapshot `prefix_index`.
 
         The snapshot is taken immediately before asking for a hunk or entering
@@ -1497,7 +1498,12 @@ class Agent:
         so earlier cached bytes are reused instead of re-prefilling a broken
         draft. An exhausted repair never calls this helper, keeping its final
         failure visible to telemetry and shallow failure memory.
-        """
+
+        `reason` names what was wrong with the drafts being dropped. A run
+        that collapsed ten times in 137 seconds told its caller nothing: the
+        event carried a message count, and the failed block text lived only
+        in the transcript the collapse had just deleted. One line makes the
+        churn readable afterwards."""
         if not bool(getattr(self.cfg, "collapse_repair_turns", True)):
             return 0
         try:
@@ -1514,8 +1520,8 @@ class Agent:
             messages.append({"role": "user", "content": receipt})
         elif clean_reply:
             messages.append({"role": "assistant", "content": clean_reply})
-        self._emit("repair_collapse", messages=removed,
-                   prefix=prefix_index)
+        self._emit("repair_collapse", messages=removed, prefix=prefix_index,
+                   reason=(reason or "").replace("\n", " ")[:160])
         return removed
 
     @staticmethod
@@ -3349,6 +3355,18 @@ class Agent:
         return {"file": rel, "symbol": symbol, "start": start, "end": end,
                 "intended_change": change}, None
 
+    def _disk_line_count(self, rel: str) -> int:
+        """Lines of `rel` as it sits on disk, 0 when it is not there (a file
+        this hunk would create) or unreadable."""
+        try:
+            path = self.index.root / rel
+            if not path.is_file():
+                return 0
+            return len(path.read_text(encoding="utf-8",
+                                      errors="replace").splitlines())
+        except (OSError, ValueError):
+            return 0
+
     def _check_incremental_hunk(self, task: str, gathered: str, rel: str,
                                 symbol: str, reply: str):
         """Dry-apply ONE target hunk, then run verify.py and the AST gate."""
@@ -3378,6 +3396,27 @@ class Agent:
                 False, rel,
                 "an empty SEARCH without a SYMBOL/LINES anchor would replace "
                 f"the WHOLE file; target {symbol!r} with a SYMBOL header")], []
+        if symbol and not block.symbol and block.lines:
+            # `LINES 1-171` of a 171-line file is a whole-file rewrite wearing
+            # a range anchor: the symbol-sized target this loop asked for is
+            # gone, and the answer token cap cuts the copied file mid-definition
+            # -- which is how one run lost a class and a factory on a retry.
+            first, last = block.lines
+            total = self._disk_line_count(rel)
+            if (total >= 40 and first <= 2
+                    and (last - first + 1) * 4 >= total * 3):
+                return [Result(
+                    False, rel,
+                    f"this block replaces lines {first}-{last} of a {total}-"
+                    f"line file -- that is the WHOLE file, for one definition "
+                    f"({symbol!r}). Re-emit it anchored on the symbol, with "
+                    f"the full new definition as the body and no SEARCH "
+                    f"section at all:\n"
+                    f"<<<<<<< SYMBOL {rel} :: {symbol}\n"
+                    f"...the complete new {symbol}...\n"
+                    f">>>>>>> END_SYMBOL\n"
+                    f"Never copy a whole file into a reply: it runs past the "
+                    f"output limit and is cut off mid-line.")], []
         results = self._apply_once(reply, dry_run=True)
         # Run the syntax gate explicitly (verify.check also invokes it; the
         # duplicate is cheap and keeps this microloop's contract self-evident).
@@ -3467,6 +3506,7 @@ class Agent:
             msgs = history + [{"role": "user", "content": target_msg}]
             last_results: list = []
             last_findings: list = []
+            last_reason = ""               # why the last draft was rejected
             accepted = None
             for attempt in range(attempts):
                 try:
@@ -3505,6 +3545,7 @@ class Agent:
                 problems = verify_mod.render(errors) or "\n".join(
                     f"- {r.file}: {r.message}" for r in hunk_results
                     if not getattr(r, "ok", False))
+                last_reason = (problems or "").strip().split("\n")[0][:180]
                 msgs.append({"role": "assistant", "content": reply})
                 msgs.append({"role": "user", "content":
                     f"THE HUNK FOR {rel}:{symbol or '(file)'} WAS REJECTED "
@@ -3528,8 +3569,12 @@ class Agent:
                 receipts.append(receipt)
                 # Collapse the target request and any rejected drafts back to
                 # P, leaving only the compact verified receipt in the tail.
-                self._collapse_repair_turns(msgs, prefix_index,
-                                            receipt=receipt)
+                self._collapse_repair_turns(
+                    msgs, prefix_index, receipt=receipt,
+                    reason=(f"{rel}:{symbol or '(file)'} after "
+                            f"{max(0, attempt)} rejected draft(s): "
+                            + (last_reason or "re-anchored"))
+                    if attempt else "")
                 self._emit("incremental_edit", target=n, of=total, ok=True,
                            attempt=attempt + 1)
                 if verbose:
@@ -3556,6 +3601,29 @@ class Agent:
                                    for r in results_all):
                 tracker.observe_verified(
                     {r.file for r in results_all if r.file})
+        mixed = [r for r in results_all if not getattr(r, "ok", False)]
+        if results_all and mixed and len(mixed) < len(results_all):
+            # Half a feature is on disk and half is not. Nothing rolls back:
+            # every hunk that landed was verified landing, and silently
+            # reverting a user's working tree would be the worse surprise.
+            # What this batch owed was the honesty of its own shape -- the
+            # run that lost `MortarShell` to a rejected block reported the
+            # other ten targets as if the feature were complete.
+            names = ", ".join(sorted({r.file for r in mixed if r.file})[:6])
+            extra = (f" (+{len(mixed)} more)" if len(mixed) > 6 else "")
+            undo = (f" restore the pre-edit backup at {backup_dir}"
+                    if backup_dir else " undo the applied targets by hand")
+            self._emit("incremental_partial", applied=len(results_all)
+                       - len(mixed), failed=len(mixed), files=names)
+            if verbose:
+                print(f"\n[INCREMENTAL BATCH PARTIALLY APPLIED: "
+                      f"{len(results_all) - len(mixed)} of "
+                      f"{len(results_all)} block(s) landed; NOT applied: "
+                      f"{names}{extra}]\n"
+                      f"  The files already written stay written -- the "
+                      f"feature is half-implemented, and a later step reading "
+                      f"them sees the mix. To start over:{undo}.",
+                      file=sys.stderr)
         reply = ("Symbol-anchored incremental edits:\n" + "\n".join(receipts)
                  if receipts else "No symbol-anchored edits were applied.")
         return results_all, reply, findings_all
@@ -3684,7 +3752,10 @@ class Agent:
             print("  [repair: re-ask produced no usable fix; failing checks "
                   "remain]", file=sys.stderr)
             return ""
-        self._collapse_repair_turns(msgs, repair_prefix, clean_reply=new)
+        self._collapse_repair_turns(msgs, repair_prefix, clean_reply=new,
+                                    reason="repair accepted after "
+                                           f"{len(msgs) - repair_prefix} "
+                                           "diagnostic turn(s)")
         return new
 
     def _model_verify(self, task: str, reply: str, gathered: str):
@@ -4155,6 +4226,26 @@ class Agent:
                     "failed. Emit exactly one block for that file with an "
                     "EMPTY SEARCH section (nothing between <<<<<<< SEARCH "
                     "and =======) and the complete new content in REPLACE.")
+                # ... and the form that cannot miss: a line range, quoted
+                # from the numbers SOURCE already shows. Mojibake, a tab and
+                # a CRLF all break a SEARCH match while the same two lines
+                # addressed by number apply exactly.
+                extras.append(
+                    "SMALL FIXES (LINES ANCHOR): when the change touches a "
+                    "few lines, stop quoting them -- put the range in the "
+                    "header and it replaces exactly those lines, with the "
+                    "SEARCH section ignored:\n"
+                    "--- FILE: path/to/file.ext LINES 40-46\n"
+                    "<<<<<<< SEARCH\n=======\n"
+                    "the new lines here\n"
+                    ">>>>>>> REPLACE\n"
+                    "The SOURCE above is numbered (`  40| text` -- those are "
+                    "the real line numbers, and each header says how many "
+                    "lines the file has). Use it when the SEARCH text looks "
+                    "identical to the source yet will not match: something "
+                    "in those bytes (a mangled character, a tab, a CR) is "
+                    "not what it shows. Never re-emit a SEARCH that already "
+                    "failed unchanged.")
             extra = ("\n\n" + "\n\n".join(extras)) if extras else ""
             reply = self._chat_at(
                 "temperature_repair",

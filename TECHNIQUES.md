@@ -215,6 +215,24 @@ The cheapest reliable feedback is the code itself:
   only itself; it cannot poison the hunks that follow. Once every symbol has
   landed, the normal impacted-test and lint verification runs over the whole
   changed set, so the final gate still judges the combined patch.
+  Two things that loop used to get wrong are now refused or said out loud:
+  - *A range anchor that is really the whole file.* The loop asked for one
+    definition; `--- FILE: src/entities.js LINES 1-171` of a 171-line file is
+    a whole-file rewrite wearing a range anchor, and the answer cap cuts the
+    copied file mid-definition -- which is how one run lost `MortarShell` and
+    its factory. A symbol-targeted hunk whose range covers three quarters of
+    a file of 40+ lines from the top is rejected before it is written, with
+    the form that fits printed for it (`<<<<<<< SYMBOL file :: name`, full new
+    definition as the body, no SEARCH section), plus the standing rule: never
+    copy a whole file into a reply.
+  - *A batch that half-landed.* Nothing rolls back -- each written hunk was
+    verified on its own, and reverting them would undo proven work -- but the
+    run no longer describes a mixed tree as applied. When some targets land
+    and others do not, the batch emits an `incremental_partial` event
+    (applied/failed counts and the failing files) and a verbose
+    `[INCREMENTAL BATCH PARTIALLY APPLIED]` warning that names what is missing
+    and how to start over. A summary that reads "applied" is what let the next
+    step build on a feature that was never finished.
 - **Failure-identity diffing.** Pytest's stable node ids (plus a normalized
   assertion signature when no id survives truncation) identify each failure
   across runs. The post-edit run is classified against the pre-edit baseline as
@@ -250,8 +268,12 @@ The cheapest reliable feedback is the code itself:
   takes their place -- so every byte the server had already cached stays
   cached and the next step is a prefix-cache hit instead of a re-prefill of a
   broken trajectory. An exhausted repair never collapses: its final failure
-  stays visible to telemetry and shallow-failure memory. Ablation flag:
-  `collapse_repair_turns = false`.
+  stays visible to telemetry and shallow-failure memory. Each collapse
+  records *why* it happened (the gate or check that rejected the draft, in
+  one line) on the `repair_collapse` event, and the answer path keeps the
+  last reason on hand: a run that collapsed ten times in a row spent ~137 s
+  of retry churn and told its caller nothing but a count, which is a
+  diagnosis of none. Ablation flag: `collapse_repair_turns = false`.
 
 Why single-hunk generation prevents patch corruption on 4B–9B models: a large
 reply makes three failures correlated. The model must copy several SEARCH
@@ -266,6 +288,17 @@ before the cap, and verification either accepts it or rejects only that symbol.
 The one-line receipt preserves the *fact* of the edit without re-sending its
 source, so context stays small and later hunks start from the real post-edit
 file rather than a stale multi-file patch.
+
+The retry that re-anchors a failed block offers one form the model cannot
+get wrong: when the quoted SEARCH text does not match -- a line-number prefix
+copied in, a smart quote or mojibake the file never had, tabs, CRLF -- the
+answer may list the changed lines instead of quoting them. The retry prompt
+shows the numbered source window and says to use the range anchor
+(`--- FILE: path LINES 40-46`), whose needle is the file's own text for those
+lines: the quoted SEARCH section is ignored, so nothing left of the mismatch
+can miss twice. Copy-the-text-exactly was the only advice
+offered before, so a byte-level mismatch produced three identical doomed
+retries.
 
 ### 6. Sampling the right amount
 
@@ -654,6 +687,12 @@ and `new --complex`:
   waste a repair round on a working project, which the technique exists to
   prevent. The same drift listing also extends `new`'s `fix_api_mismatches`
   repair and its final consistency warning.
+- **JS linking is part of the contract too.** The `import`/`export` surface
+  of a project's ES modules is verified beside the Python import graph, here
+  and in §23's frontend gate -- which adds the two shapes a parse cannot see:
+  a name bound twice at module level, and a call to a name no module binds.
+  A Python project and a browser project are held to the same rule: a name a
+  file uses must exist where the file says it comes from.
 
 Together the two halves turn interfaces into a shared, checked fact of the
 plan rather than something each fresh context must rediscover.
@@ -714,6 +753,18 @@ Tokens spent: zero, unless the gate finds something, when it buys the
 cheapest possible repair prompt ("these names do not exist here") instead of
 a subprocess transcript the model must interpret. Ablation flag:
 `static_gate = false`.
+
+**The zero-subprocess gates are not gated on the shell.** Deciding whether to
+*check* an edit and deciding whether a *test command may run* are two
+different questions, and `_post_edit_tests` used to ask only the second one:
+`verify_tests` or `allow_shell` off skipped the syntax, static, frontend and
+contract gates along with pytest, so the default profile (`allow_shell =
+false`) vetted nothing at all, and an `ask` build could report "applied and
+verified" for a module graph that could not link. The chain is split in two
+now: `gates_wanted` (in-process, always asked) and `tests_wanted` (the
+subprocess, still honouring both flags), and every gate that ends a run red
+records its verdict as an unresolved finding, so the caller reports it
+instead of a clean summary.
 
 ### 20. Green ratchet step checkpoints for the autonomous loop
 
@@ -851,6 +902,19 @@ run, with the harness owning every parameter.
   category (Allow Once / Always Allow / Deny), the same as unapproved
   shell; CLI runs without a broker report it as disabled instead of
   pretending otherwise.
+- **An exit code is translated, not just reported.** `EXIT: 5` is not a
+  failure of the code under test; it means *nothing was collected*, and a
+  model that reads only the number fixes the number. So the verdict line
+  spells it out (`EXIT: 5 (NOT COLLECTED)`), the reply carries an `EXIT CODE
+  MEANS:` line for the codes that are easy to misread (2 = usage or a crash
+  in collection, 4 = no tests matched, 5 = nothing collected), and a `target`
+  naming a Python file with no `def test_...` / `class Test...` is refused
+  *before* pytest starts: it is probably a standalone verification script, so
+  the refusal names the working alternative (`run` it, or read it) and says
+  plainly not to rename working functions to chase the code. One campaign
+  called `run_test` on its own passing smoke script four times, read `no
+  tests ran`, and concluded the bug was that `main()` should have been called
+  `test_smoke()`.
 - **It feeds the ledger too.** Each run is recorded through the
   micro-facts observer (§14), so a suite command that works twice becomes a
   confirmed repository fact; a contradiction retires it.
@@ -868,10 +932,11 @@ Import and signature contracts have a deterministic twin on the browser
 side, and nothing in the Python test stack can see it: a `<script
 src="app.js">` renamed on one side only, a `getElementById('save-btn')`
 against a template that renders `id="save-button"`, an `app.js` whose last
-edit left one brace open. Each of these is a *runtime* error in a browser
-and a *silent* one in the loop -- the task verifies green and ships a page
-that does not load. `verify_frontend_contracts` (in `spec.py`, beside the
-static gate) closes that gap with three mechanical checks:
+edit left one brace open, and a module graph that parses but cannot link.
+Each of these is a *runtime* error in a browser and a *silent* one in the
+loop -- the task verifies green and ships a page that does not load.
+`verify_frontend_contracts` (in `spec.py`, beside the static gate) closes
+that gap with five mechanical checks:
 
 - **Asset link integrity.** Every `<script src>` and stylesheet `<link href>`
   in every HTML file resolves against the file's own directory and the
@@ -902,6 +967,25 @@ static gate) closes that gap with three mechanical checks:
   gate (`_js_cross_file_errors` is shared by both). Bare package imports and
   dynamic `import()` are deliberately absent: bundler territory, not
   static-check territory.
+- **A module-level name bound twice.** A parse accepts `import { WAYPOINTS }
+  from './a.js'` twice in one file -- tree-sitter builds a clean tree, and so
+  does every earlier gate. The browser does not: `SyntaxError: Identifier
+  'WAYPOINTS' has already been declared` kills that file and every module
+  importing it, which is the shape an *incremental* loop produces, because
+  each hunk adds its own import line without reading the ones already there.
+  The gate enumerates the module's top-level bindings with the grammar and
+  reports any name bound twice (`function`/`var` pairs excepted, since
+  re-declaration is legal there).
+- **A call to a name the module cannot reach.** ES modules see only what they
+  declare or import, so a free identifier is a `ReferenceError` on the first
+  line that runs it -- invisible to a parser, and the exact residue of a task
+  that edits the call site and forgets the import. Three buckets, because the
+  fix differs: another module *exports* the name (say which, and print the
+  import line), another module declares it *without exporting* it (say that
+  every module has its own scope), and nothing defines it at all. Names a
+  browser or a CDN `<script>` provides (`document`, `THREE`, `io`, `admin`)
+  are matched against a named vocabulary plus the page's own script tags, and
+  a classic script's top level is treated as the global scope it really is.
 
 Errors share the shape the repair path already reads:
 
@@ -926,8 +1010,60 @@ render it, or fix the selector
   the fix is applied, and the subprocess (which could never have caught
   these anyway) is skipped until the page would load.
 
+- **None of it is hostage to the shell.** Every check above reads files in
+  this process, so the gate vetoes with `allow_shell = false` and
+  `verify_tests = false` -- the default profile, and the one a browser build
+  with a broken module graph slipped through while still reporting
+  "applied and verified".
+- **The name vocabulary is shared.** The host/CDN/test-global list and the
+  "is this a member call or a definition" suppressions belong to
+  `webcheck.py`, and `spec.py` imports them, so the vetting gate and the
+  `pedacito webcheck` notices cannot disagree about what a name means; the
+  gate is grammar-based and vetoes, the regex checks are heuristic and only
+  advise. Two lists had already drifted apart once, and the gate's had grown
+  HTML *tag* names and misspelled interfaces (`Menu`, `Table`, `Form`,
+  `WriteableStream`) into what is supposed to be a list of things the browser
+  provides. That is not caution, it is blindness: a call to a `Menu()` no
+  file defines is the exact bug these checks exist to report, and under the
+  old list it was unspeakable. The merge kept every real Web API either list
+  knew (`addEventListener`, `alert`, `MessagePort`, `IndexedDB`, the audio
+  nodes) and dropped the rest -- one curated list, honest about what a host
+  actually provides.
+- **The regex reader has three rules about what it is reading.** They are the
+  difference between a notice and a nuisance, and each was learned from a file
+  that parses and runs fine:
+  - *Read uses out of blanked code, imports out of raw text.*
+    `_js_code()` blanks comments, strings and template literals;
+    `_js_no_comments()` blanks only comments, because an `import` statement
+    carries its specifier inside quotes and blanking the quotes erases the
+    import. Applying the aggressive blanker to the import sweep is how a
+    checker reports `./game-core.js` as a call to `core()`.
+  - *Blanking is a walk, not a regex.* Lit-html nests a template inside an
+    interpolation (`html`...${ok ? html`x` : null}...`), so a string pattern
+    that stops at the first inner backtick hands the closing markup back as
+    code -- prose like "when a model server is reachable (falls back to the"
+    becomes a call to `reachable()`. The scanner keeps a stack of quotes,
+    templates and `${ }` regions that are code again, skips regex literals so
+    `/['"]/` cannot open a string that never ends, recovers from an
+    unterminated quote at the line break instead of blanking the file, and
+    preserves every byte's position so a finding's line number is still the
+    line it came from.
+  - *A binding is a binding.* `const [open, setOpen] = useState(false)` binds
+    both names and `const {x, y: z}` binds `x` and `z`; reading the pattern as
+    one token reports `setOpen()` as unreachable. Names are pooled from the
+    grammar (gate) or split out of the destructuring head (advisor) -- never
+    from the raw text of the declaration line.
+
 A repo without HTML/JS exits before opening a file, so the gate is on by
 default and free there. Ablation flag: `frontend_contracts = false`.
+
+**It also gates a scaffold.** `pedacito new --apply` writes each file in its
+own call, so `index.html` invents one set of ids and `main.js` queries
+another, and the per-file pass calls both complete. `run_new` now runs the
+vetting half over the finished tree, feeds the violations back for repair
+rounds (`fix_web_contracts`), and if any survive, prints `BUILD INCOMPLETE`
+with the list and exits 1. A project that cannot load is not a finished
+project.
 
 ---
 
@@ -1340,7 +1476,15 @@ transport, in `pedacito/rpc.py`.
   already writes its events as JSON lines, so the RPC layer re-parses them,
   tags each with the active request's `req_id`, counts the engine's terminal
   `result` frame, and adds its own compact summary only when the engine emitted
-  none. Every method closes with an `rpc_response` carrying both `id` and the
+  none. That summary answers the only two questions a machine client has left:
+  did the edits land (`applied`, `changed`) and is the result known-good? The
+  second one is not `applied`, so the frame carries `blockers` as its own
+  field -- the error-severity gate findings the run ended on (frontend,
+  contract, static, syntax), capped and deduplicated. `applied: true` with a
+  non-empty `blockers` reads exactly as it means: the code is on disk and the
+  harness could not verify it clean. `applied` was never stretched to cover a
+  gate veto, so a caller built on the honest field still gets the honest field.
+  Every method closes with an `rpc_response` carrying both `id` and the
   `ok`/`result`/`error` triple -- the stream never ends mid-task.
 - **Warm across requests.** The index, the model profiles and the session
   ledger (and with them the prompt cache of §8) persist; `switch_profile`
@@ -1387,8 +1531,8 @@ drive `RpcServer` with fakes over `io.StringIO` and never spawn a process.
 | Import auto-healing (`auto_heal_imports`) | §5, §19 | `auto_heal_imports = false` | `[AUTO-HEALED: added 'import json' in x.py]` lines before repair rounds; "import auto-heal" in the event log |
 | Repair-trajectory collapse (`collapse_repair_turns`) | §5 | `collapse_repair_turns = false` | `repair_collapse` telemetry events; successful repairs leave a receipt, not the broken drafts |
 | Subagent EvidenceSpan transfer + single-slot prefix fork | §11, §28 | No flag (part of the `task` subagent) | `subagent_evidence` telemetry; promoted source appended under `HELPER RESULT` |
-| Live test introspection (`run_test`) | §22 | `enable_run_test_in_gather = false` (each run then asks first) | A gather action. Permission dialog category **Test Execution** |
-| Frontend contract checks (`verify_frontend_contracts`), incl. ESM export/arity | §23 | `frontend_contracts = false` | Automatic after applied edits. `pedacito webcheck` for an on-demand check |
+| Live test introspection (`run_test`), incl. translated pytest exit codes | §22 | `enable_run_test_in_gather = false` (each run then asks first) | A gather action: `EXIT: 5 (NOT COLLECTED)`, `EXIT CODE MEANS:` lines. Permission dialog category **Test Execution** |
+| Frontend contract checks (`verify_frontend_contracts`), incl. ESM export/arity, duplicate module bindings and unreachable calls; also gates `new --apply` | §23 | `frontend_contracts = false` | Automatic after applied edits; `BUILD INCOMPLETE` from `new`; `pedacito webcheck` for an on-demand check |
 | Repair lesson ledger (anti-patterns) | §24 | `micro_facts = false` (also silences §14) | `.pedacito/micro_facts.json`, under `anti_patterns` |
 | Auto-promoted path-scoped rules | §24 | `micro_facts = false` (also silences §14/§24) | `.pedacito/rules/auto_*.md`, `auto_generated: true`; `promoted` rows in `micro_facts.json` |
 | Zero-anchor AST symbol splicing | §25 | No flag. Steer with `edit_style`; plain SEARCH/REPLACE still works | `<<<<<<< SYMBOL`, `AFTER_SYMBOL` edit blocks, and the `replace_symbol` payload |

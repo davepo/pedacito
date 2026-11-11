@@ -16,7 +16,13 @@ somebody opens the page:
   - a JS file imports a bare specifier that package.json never declared --
     ``node --test`` dies with ERR_MODULE_NOT_FOUND before any assertion ran;
   - an inline handler calls ``Game.pasue()`` but ``pasue`` appears nowhere
-    in the one classic script that defines ``Game`` (TypeError).
+    in the one classic script that defines ``Game`` (TypeError);
+  - a module binds the same name twice -- the ``import { WAYPOINTS }`` an
+    incremental edit appends next to the import that already binds it
+    (``SyntaxError: Identifier 'WAYPOINTS' has already been declared``);
+  - a module calls a name it neither declares nor imports, while a sibling
+    module exports it or nothing in the project defines it at all
+    (``ReferenceError``, and the scene never renders).
 
 Every check is regex-level on purpose: no JS parser, no execution, no
 network, no dependencies. That trades recall for speed, so the results are
@@ -321,6 +327,636 @@ def _member_findings(rel, text, offset, single, texts):
     return out
 
 
+# --- ES module wiring: what a module had to declare to run at all -----------
+#
+# A `<script type="module">` is strict and file-scoped: every name it calls
+# has to be declared there or imported from a sibling module, and the browser
+# stays silent about it until the page loads -- then it shows one
+# `SyntaxError: Identifier 'X' has already been declared` or a bare
+# `ReferenceError: X is not defined` with no frame to point at. Both are
+# visible statically: a duplicate binding is a second declaration in the same
+# file, a missing one is a call site whose name exists in no scope the module
+# can see. `spec._js_module_link_errors` makes the same two checks veto; the
+# lists below are the vocabulary both share.
+
+# Names every script may use without declaring them: ECMAScript plus the
+# browser and Node hosts. A free identifier here is not a missing import.
+JS_GLOBAL_NAMES = frozenset("""
+    Array ArrayBuffer AsyncGenerator AsyncFunction Atomics BigInt
+    BigInt64Array BigUint64Array Boolean Buffer DataView Date Error EvalError
+    FinalizationRegistry Float16Array Float32Array Float64Array Function
+    Generator Infinity Intl JSON Map Math NaN Number Object Promise Proxy
+    RangeError ReferenceError Reflect RegExp Set SharedArrayBuffer String
+    Symbol SyntaxError TypeError Uint16Array Uint32Array Uint8Array
+    Uint8ClampedArray Uint8ClampedArray BigUint64Array URIError WeakMap
+    WeakRef WeakSet arguments console decodeURI decodeURIComponent encodeURI
+    encodeURIComponent escape global globalThis isFinite isNaN module exports
+    require parseFloat parseInt process unescape undefined
+    AbortController AbortSignal Audio AudioBuffer AudioBufferSourceNode
+    AudioChannelMerger AudioChannelSplitter AudioContext AudioData AudioNode
+    AudioParam AudioParamMap AudioScheduledSourceNode AudioWorklet
+    AudioWorkletNode BaseAudioContext BeforeUnloadEvent BiquadFilterNode Blob
+    BlobEvent BroadcastChannel ByteCounter CanInteractResult CanvasGradient
+    CanvasPattern CanvasRenderingContext2D Chromium CSS CSSContainerRule
+    CSSCounterStyleRule CSSFontFaceRule CSSGroupingRule CSSImportRule
+    CSSKeyframeRule CSSKeyframesRule CSSMediaRule CSSNamespaceRule CSSPageRule
+    CSSParser CSSRule CSSStyleDeclaration CSSStyleRule CSSStyleSheet
+    CSSSupportsRule Cache CacheStorage CaptionCue CharacterData Clipboard
+    ClipboardEvent CloseEvent Comment CompositionEvent ConstantSourceNode
+    ContainerCookieStore ContainerStorage CountQueuingStrategy Crypto CryptoKey
+    CustomElementRegistry DOMException DOMParser DOMStringMap DOMTokenList
+    DataTransfer DataTransferItem DataTransferItemList DelayNode
+    DeleteCookiesRequest DeviceMotionEvent DeviceOrientationEvent Document
+    DocumentFragment DocumentPictureInPicture DragEvent Element ElementInternals
+    EnterElementExitElement Event EventSource EventTarget ExtendableEvent
+    ExtendableMessageEvent External FetchEvent FieldSet File FileList
+    Filesystem FilesystemDirectoryEntry FilesystemEntry FilesystemFileEntry
+    FileSystem FileSystemDirectoryEntry FileSystemEntry FileSystemFileEntry
+    FileSystemHandle FocusEvent FontFace FontFaceSet
+    FontFaceSetLoadEvent FormData Gamepad GamepadButton GamepadEvent
+    Geolocation GeolocationPosition GeolocationPositionError GetReaderBySerial
+    GlobalThis HTMLAllCollection HTMLAnchorElement HTMLAreaElement
+    HTMLAudioElement HTMLBaseElement HTMLBodyElement HTMLBRElement
+    HTMLButtonElement HTMLCanvasElement HTMLCollection HTMLDataElement
+    HTMLDataListElement HTMLDetailsElement HTMLDialogElement HTMLDivElement
+    HTMLDListElement HTMLElement HTMLEmbedElement HTMLFieldSetElement
+    HTMLFormElement HTMLHeadElement HTMLHeadingElement HTMLHRElement
+    HTMLHtmlElement HTMLIFrameElement HTMLImageElement HTMLInputElement
+    HTMLLabelElement HTMLLegendElement HTMLLiElement HTMLLinkElement
+    HTMLMapElement HTMLMediaElement HTMLMenuElement HTMLMetaElement
+    HTMLMeterElement HTMLModElement HTMLObjectElement HTMLOListElement
+    HTMLOptGroupElement HTMLOptionElement HTMLOutputElement HTMLParagraphElement
+    HTMLParamElement HTMLPictureElement HTMLPreElement HTMLProgressElement
+    HTMLQuoteElement HTMLScriptElement HTMLSelectElement HTMLSlotElement
+    HTMLSourceElement HTMLSpanElement HTMLStyleElement HTMLTableCaptionElement
+    HTMLTableCellElement HTMLTableColElement HTMLTableElement HTMLTableRowElement
+    HTMLTableSectionElement HTMLTemplateElement HTMLTextAreaElement HTMLTimeElement
+    HTMLTitleElement HTMLTrackElement HTMLUListElement HTMLUnknownElement
+    HTMLVideoElement IDBCursor IDBCursorWithValue IDBDatabase IDBFactory IDBIndex
+    IDBKeyRange IDBObjectStore IDBOpenDBRequest IDBRequest IDBTransaction
+    IDBVersionChangeEvent Image ImageBitmap ImageData InputEvent
+    IntersectionObserver IntersectionObserverEntry KeyboardEvent Location
+    Lock LockManager MediaDevices MediaKeyStatusMap MediaList
+    MediaMetadata MediaQueryList MediaQueryListEvent MediaSource
+    MediaStream MediaStreamTrack Memory MIDIConnectionEvent MIDIInput
+    MIDIMessageEvent MIDIOutput MIDIPort MutationObserver MutationRecord
+    NamedNodeMap Navigator NavigatorUAData NetworkInformation Node NodeFilter
+    NodeIterator NodeList Notification OffscreenCanvas OffscreenCanvasRenderingContext2D
+    Option OscillatorNode OverconstrainedError PageTransitionEvent PannerNode
+    Path2D PaymentAddress Performance PerformanceEntry PerformanceMark
+    PerformanceMeasure PerformanceNavigation PerformanceNavigationTiming
+    PerformanceObserver PerformanceResourceTiming Permissions PermissionStatus
+    Plugin PluginArray Point3D PointerEvent PopStateEvent PortraitOrientation
+    PostMessageOptions Presentation Prefix PrerenderingChange Private
+    ProgressEvent PromiseRejectionEvent PushManager PushMessageData
+    RTCCertificate RTCDataChannel RTCDataChannelEvent RTCIceCandidate
+    RTCIceGatherer RTCIceTransport RTCPeerConnection RTCPeerConnectionIceEvent
+    RTCRtpContributingSource RTCRtpReceiver RTCRtpSender RTCSctpTransport
+    RTCStatsReport RTCTrackEvent RadioNodeList Range ReadableByteStreamController
+    ReadableStream ReadableStreamBYOBReader ReadableStreamBYOBRequest
+    ReadableStreamDefaultController ReadableStreamDefaultReader
+    RelativeIndexingMethod RemotePlayback Request ResizeEntry ResizeObserver
+    Resource Timing ResourceContentResourceTiming Response SVGAElement SVGAngle
+    SVGAnimatedAngle SVGAnimatedBoolean SVGAnimatedEnumeration SVGAnimatedInteger
+    SVGAnimatedLength SVGAnimatedLengthList SVGAnimatedNumber SVGAnimatedNumberList
+    SVGAnimatedPreserveAspectRatio SVGAnimatedRect SVGAnimatedString
+    SVGAnimatedTransformList SVGAnimateElement SVGAnimateMotionElement
+    SVGAnimateTransformElement SVGAnimationElement SVGCircleElement
+    SVGClipPathElement SVGComponentTransferFunctionElement SVGDefsElement
+    SVGDescElement SVGDiscardElement SVGElement SVGEllipseElement
+    SVGFEBlendElement SVGFEColorMatrixElement SVGFEComponentTransferElement
+    SVGFECompositeElement SVGFEConvolveMatrixElement SVGFEDiffuseLightingElement
+    SVGFEDisplacementMapElement SVGFEDistantLightingElement SVGFEDropShadowElement
+    SVGFEFloodElement SVGFEFuncAElement SVGFEFuncBElement SVGFEFuncGElement
+    SVGFEFuncRElement SVGFEGaussianBlurElement SVGFEImageElement
+    SVGFEMergeElement SVGFEMergeNodeElement SVGFEMorphologyElement
+    SVGFEOffsetElement SVGFEPointLightElement SVGFESpecularLightingElement
+    SVGFESpotLightElement SVGFETileElement SVGFETurbulenceElement
+    SVGFilterElement SVGFilterPrimitiveStandardAttributes SVGFitToViewBox
+    SVGFontElement SVGFontFaceElement SVGForeignObjectElement SVGGElement
+    SVGGeometryElement SVGGradientElement SVGGraphicsElement SVGImageElement
+    SVGLength SVGLengthList SVGLinearGradientElement SVGLineElement
+    SVGMarkerElement SVGMaskElement SVGMatrix SVGMetadataElement
+    SVGMPathElement SVGNumber SVGNumberList SVGPathElement SVGPatternElement
+    SVGPoint SVGPointList SVGPolygonElement SVGPolylineElement
+    SVGPreserveAspectRatio SVGRadialGradientElement SVGRect SVGRectElement
+    SVGScriptElement SVGSetElement SVGStopElement SVGStringList SVGStyleElement
+    SVGSVGElement SVGSwitchElement SVGSymbolElement SVGTextContentElement
+    SVGTextElement SVGTextPathElement SVGTextPositioningElement SVGTitleElement
+    SVGTransform SVGTSpansList SVGURIReference SVGUnitTypes SVGUseElement
+    SVGViewElement Screen ScreenAvailQuota ScreenOrientation ScrollTimeline
+    ScrollY Serialization Session ServiceWorker ServiceWorkerContainer
+    ServiceWorkerRegistration SharedWorker ShadowRoot SpeechSynthesis
+    SpeechSynthesisEvent SpeechSynthesisUtterance SpeechSynthesisVoice StaticRange
+    Storage StorageManager Stream Stub StyleMedia StyleSheet CSSStyleSheet2
+    SubtleCrypto Text TextDecoder TextEncoder TextMetrics TextTrack
+    TextTrackCue TextTrackCueList TextTrackList TimeRanges Touch TouchEvent
+    TouchList TrackEvent TransitionEvent TreeWalker UIEvent URL URLSearchParams
+    Uint8Array UTF8Decoder UTF8Encoder UserActivation VTTCue ValidityState
+    VideoFrame View Transitions WaveShaperNode WebGLActiveInfo WebGLBuffer
+    WebGLContextEvent WebGLFramebuffer WebGLProgram WebGLQuery
+    WebGLRenderbuffer WebGLRenderingContext WebGLSampler WebGLShader
+    WebGLShaderPrecisionFormat WebGLSync WebGLTexture WebGLTransformFeedback
+    WebGLUniformLocation WebGLVertexArrayObject WebSocket WebSocketStream
+    Widget Window WindowControlsOverwrite Worker Worklet WorkletGlobalScope
+    WritableStream WritableStreamDefaultController WritableStreamDefaultWriter
+    XMLDocument XmlHttpRequest XMLHttpRequest XMLHttpRequestEventTarget
+    XMLHttpRequestUpload XSLTProcessor atob btoa createImageBitmap crypto
+    customElements devicePixelRatio document fetch frameElement frames
+    getComputedStyle history innerHeight innerWidth indexedDB localStorage
+    location matchMedia name navigator onafterprint onbeforeprint
+    onbeforeunload onerror onhashchange onlanguagechange onload onmessage
+    onoffline ononline onpagehide onpageshow onpopstate onrejectionhandled
+    onresize onstorage onunhandledrejection onunload open outerHeight
+    outerWidth parent performance postMessage print prompt queueMicrotask
+    registerProtocolHandler releaseEvents reportError requestAnimationFrame
+    cancelAnimationFrame screen screenX screenY scroll scrollBy scrollTo
+    self sessionStorage setTimeout setInterval clearTimeout clearInterval
+    setImmediate clearImmediate structuredClone top trustedTypes visualViewport
+    window worker localStorage
+""".split())
+
+# The second browser dump above is broad but not complete, and the frontend
+# gate carried its own shorter list before this one became the only source.
+# Merging it here added the Web API classes and window methods it had and the
+# dump missed. What did NOT survive the merge were its HTML *tag* names and
+# invented spellings (`Menu`, `Table`, `Form`, `Title`, `Data`, `Slot`,
+# `WriteableStream`, `WebGLShaderPrecisionStatus`): they belong to no scope at
+# all, so a call to one of them is precisely the bug these checks exist to
+# find -- a helper the page was supposed to define and nobody did.
+JS_GLOBAL_NAMES = JS_GLOBAL_NAMES | frozenset("""
+    ByteLengthQueuingStrategy ChannelMergerNode ChannelSplitterNode CookieStore
+    ErrorEvent FileReader GainNode History IndexedDB MessageChannel
+    MessageEvent MessagePort OfflineAudioContext Selection SourceBuffer
+    SourceBufferList StereoPannerNode StyleSheetList VisualViewport
+    addEventListener alert close confirm dispatchEvent removeEventListener
+""".split())
+
+# Identifier shapes that are host globals by naming convention.
+JS_GLOBAL_PREFIXES = ("HTML", "SVG", "MathMLElement", "WebGL", "OES_",
+                      "ANGLE_", "EXT_", "KHR_", "DOM", "IDB", "RTC", "CSS",
+                      "AudioWorklet", "Canvas", "TextTrack", "ServiceWorker")
+
+# Reserved words and self-references: they look like names, never are ones.
+JS_NON_NAMES = frozenset("""
+    if else for while do return throw new typeof instanceof in of void delete
+    function class const let var this super break continue switch case default
+    try catch finally await async yield null true false get set static import
+    export from as with debugger extends constructor keyof readonly declare
+""".split())
+
+# Names the usual CDN bundles put on the page as classic globals. A project
+# that loads one of these can legitimately call into it from a module without
+# an import, so the checks below refuse to guess about them.
+JS_LIBRARY_GLOBALS = frozenset("""
+    THREE Phaser PIXI Pixi GSAP TweenMax TimelineMax TimelineLite Power0
+    Power1 Power2 Power3 Power4 Back Bounce Elastic Expo Circ Sine Quint
+    SlowMo SteppedEase RoughEase EasePack CustomEase CustomWiggle
+    CustomBounce ScrollTrigger Draggable ThrowPropsPlugin InertiaPlugin
+    MorphSVGPlugin DrawSVGPlugin SplitText TextPlugin Flip gsap d3 jQuery $
+    Chart chartjs moment dayjs marked showdown turndown hljs Prism Matter
+    MatterJS Planck planck Tone ToneJS Howler Howl _ lodash underscore
+    immutai Immutable React ReactDOM Vue Vuex Pinia Alpine animejs anime
+    AOS Sortable SortableJS Dropzone dropzone p5 P5 ml5 babylon BJS
+    CANNON cannon Ammo ammo Box2D box2d SocketIO io socket am4core am4charts
+    am4maps am4plugins highcharts Highcharts Hammer Hammerjs fabric Fabric
+    Kontra kontra Kha phaser PixiJS PixiGL three BabylonJS gl mat4 mat3 mat2
+    vec4 vec3 vec2 quat quat2 glMatrix random Random seedrandom SimplexNoise
+    noise ToneJS Howl Tone jsyt SpeechRecognition System SystemJS
+    requirejs define modernizr Modernizr L Leaflet leaflet topojson
+    turf d3scale chroma chromajs N3 RDFStore $
+""".split())
+
+# Same merge as the host list above: the analytics and loader bundles the gate
+# also suppressed. The gate's list carried a few module members and one-off
+# names as if they were globals (`createApp`, `ref`, `computed`, `charts`,
+# `core`, `Note`, `mersenneTwister`); a file that calls one of those has
+# either imported it or is broken, so they were left out on purpose.
+JS_LIBRARY_GLOBALS = JS_LIBRARY_GLOBALS | frozenset("""
+    Intercom dataLayer fbq google googleapis gtag
+""".split())
+
+# Test runners inject these into every test file's scope.
+JS_TEST_GLOBALS = frozenset("""
+    after afterEach afterAll before beforeEach beforeAll context describe it
+    test expect assert chai jest mocha sinon should suite suiteSetup
+    suiteTeardown teardown vi vitest xdescribe xit xtest step Given When Then
+    assertStrictEquals assertDeepEqual fail pending skip only
+""".split())
+
+# import ... from './x.js' / export { a } from './y.js' (never `import(`).
+_ESM_IMPORT_RE = re.compile(
+    r"""^[ \t]*import(?!\s*[(.])(?P<clause>[^'"]*?)"""
+    r"""(?:from\s*)?['"](?P<spec>[^'"]+)['"]""", re.M)
+_BRACE_GROUP_RE = re.compile(r"\{(?P<body>[^{}]*)\}", re.S)
+_NS_IMPORT_RE = re.compile(r"\*\s+as\s+([A-Za-z_$][\w$]*)")
+_ESM_EXPORT_DECL_RE = re.compile(
+    r"^[ \t]*export\s+(?:(?:default|async)\s+)?"
+    r"(?:function\s*\*?\s*([A-Za-z_$][\w$]*)|class\s+([A-Za-z_$][\w$]*)"
+    r"|(?:const|let|var)\s+([A-Za-z_$][\w$]*))", re.M)
+_ESM_EXPORT_LIST_RE = re.compile(r"^[ \t]*export\s*\{(?P<body>[^{}]*\}?"
+                                 r")", re.M | re.S)
+
+# Anything that looks like a definition, at any depth: the generous "this name
+# does get bound somewhere in this file" pool. Over-inclusive on purpose --
+# skipping a real reference costs a finding, flagging a bound one costs trust.
+_JS_DEF_ANYWHERE_RE = re.compile(
+    r"\b(?:function|class)\s*\*?\s*([A-Za-z_$][\w$]*)"
+    r"|\b(?:const|let|var)\s+([A-Za-z_$][\w$]*)"
+    r"|\b(?:const|let|var)\s*[\[{]([^}\]]*)[\]}]"
+    r"|\b([A-Za-z_$][\w$]*)\s*=(?![=>])"
+    r"|\b(?:window|globalThis|self|global)\s*(?:\.\s*|\[\s*['\"])([A-Za-z_$][\w$]*)",
+)
+# `spawnBurst(x, y) {` -- a method definition, in a class or an object literal.
+_JS_METHOD_DEF_RE = re.compile(
+    r"\b([A-Za-z_$][\w$]*)\s*\([^()]*\)\s*\{")
+
+# Comments, strings and template literals: code a checker must not read.
+# Blanking them (with the newlines kept, so line numbers stay honest) is what
+# keeps `// Distant mountains (parallax 0.1)` and `'./game-core.js'` from
+# being reported as calls to `mountains()` and `core()`.
+_JS_COMMENT_RE = re.compile(r"//[^\n]*|/\*.*?\*/", re.S)
+
+# What may stand before a `/` for it to open a regex literal instead of
+# division. Skipping a regex body is not decoration: `/['"]/` would otherwise
+# start a string that never ends and blank the rest of the file.
+_JS_REGEX_PRECEDERS = "(,=:[!&|?{};+-*%~^<>\n"
+_JS_STRING_OPENERS = ("'", '"', "`")
+
+
+def _blank(m) -> str:
+    body = m.group(0)
+    if "\n" in body:                # keep the line count identical
+        return "".join("\n" if ch == "\n" else " " for ch in body)
+    return " " * len(body)
+
+
+def _js_no_comments(text: str) -> str:
+    """`text` with comments blanked, strings intact: an `import` statement
+    still has to be readable, so its specifier stays in the text."""
+    return _JS_COMMENT_RE.sub(_blank, text)
+
+
+def _js_code(text: str) -> str:
+    """`text` with comments, strings and template literals blanked to spaces.
+
+    One regex pass cannot do this job. Lit-html-style code nests templates
+    inside interpolations (`html`...${ok ? html`x` : null}...`), and a scanner
+    that stops at the first inner backtick hands the rest of the markup back as
+    code -- which is how the prose "when a model server is reachable (falls
+    back to the ...)" was reported as a call to `reachable()` on a file that
+    parses and runs fine. So the walk keeps a stack instead: quotes, templates,
+    and the `${ }` regions that are code again, with regex literals skipped so a
+    character class cannot open a string. Length and every newline are
+    preserved, so an offset handed to `_line_of` still names its own line, and
+    an unterminated quote recovers at the line break rather than blanking the
+    rest of the file.
+    """
+    out: list[str] = []
+    stack: list[list[str]] = []       # ["'" | \" | `], or ["${", brace depth]
+    i, n = 0, len(text)
+    prev = ""                         # last character still in code position
+    while i < n:
+        ch = text[i]
+        top = stack[-1] if stack else None
+        if top is not None and top[0] in ('\'', '"', "`"):
+            quote = top[0]
+            if ch == "\\":
+                out.append(" ")
+                if i + 1 < n:
+                    out.append("\n" if text[i + 1] == "\n" else " ")
+                    i += 1
+                i += 1
+                continue
+            if ch == quote:
+                stack.pop()
+                out.append(" ")
+                prev = quote
+                i += 1
+                continue
+            if quote != "`" and ch == "\n":
+                stack.pop()           # unterminated: recover, do not swallow
+                out.append("\n")
+                prev = "\n"
+                i += 1
+                continue
+            if quote == "`" and ch == "$" and i + 1 < n and text[i + 1] == "{":
+                stack.append(["${", "0"])
+                out.append("  ")
+                i += 2
+                continue
+            out.append("\n" if ch == "\n" else " ")
+            i += 1
+            continue
+        if top is not None and top[0] == "${":
+            if ch == "{":
+                top[1] = str(int(top[1]) + 1)
+                out.append("{")
+                prev = ch
+                i += 1
+                continue
+            if ch == "}":
+                if int(top[1]) > 0:
+                    top[1] = str(int(top[1]) - 1)
+                    out.append("}")
+                else:
+                    stack.pop()       # back into the template body
+                    out.append(" ")
+                prev = ch
+                i += 1
+                continue
+        if ch == "/" and i + 1 < n and text[i + 1] == "/":
+            j = text.find("\n", i)
+            j = n if j < 0 else j
+            out.append(" " * (j - i))
+            i = j
+            continue
+        if ch == "/" and i + 1 < n and text[i + 1] == "*":
+            j = text.find("*/", i + 2)
+            j = n if j < 0 else j + 2
+            body = text[i:j]
+            out.append("".join("\n" if c == "\n" else " " for c in body))
+            i = j
+            prev = "*"
+            continue
+        if ch == "/" and (not prev or prev in _JS_REGEX_PRECEDERS):
+            j, cls, i2 = i + 1, False, i + 1
+            while i2 < n:
+                c = text[i2]
+                if c == "\\":
+                    i2 += 2
+                    continue
+                if c == "\n":
+                    break             # not a regex after all: leave it alone
+                if cls:
+                    if c == "]":
+                        cls = False
+                elif c == "[":
+                    cls = True
+                elif c == "/":
+                    j = i2 + 1
+                    break
+                i2 += 1
+            if j > i + 1:
+                out.append(" " * (j - i))
+                prev = ")"
+                i = j
+                continue
+        if ch in _JS_STRING_OPENERS:
+            stack.append([ch])
+            out.append(" ")
+            prev = ch
+            i += 1
+            continue
+        out.append(ch)
+        if not ch.isspace():
+            prev = ch
+        i += 1
+    return "".join(out)
+
+
+# A destructuring head binds every name inside it (`const [a, b] =`,
+# `const {x, y: z} =`), and a checker that reads the payload as one token
+# reports `b` and `z` as unreachable calls.
+_JS_BIND_TOKEN_RE = re.compile(r"[A-Za-z_$][\w$]*")
+
+
+def _js_def_names(m) -> set[str]:
+    """Every name one `_JS_DEF_ANYWHERE_RE` match binds."""
+    groups = m.groups()
+    if groups[2]:                     # `const|let|var [..]` / `{..}` payload
+        return {t for t in _JS_BIND_TOKEN_RE.findall(groups[2])
+                if t not in ("let", "const", "var")}
+    for g in groups:
+        if g:
+            return {g}
+    return set()
+
+
+# Parameters: `(e) => ...`, `function f(a, b)`, `catch (err)`, `m(x) {`.
+# Every short paren group in the file is read as a parameter list -- grossly
+# over-inclusive (`if (ready)` binds `ready`), which is the right direction:
+# an extra local name only ever costs a finding, never a false one.
+_JS_PAREN_GROUP_RE = re.compile(r"\(([^()]*)\)")
+
+
+def _js_paren_bound(text: str) -> set[str]:
+    """Identifiers bound by parameter and catch lists anywhere in `text`."""
+    names: set[str] = set()
+    for m in _JS_PAREN_GROUP_RE.finditer(text):
+        for part in m.group(1).split(","):
+            part = part.strip().lstrip("{[").rstrip("}]").strip()
+            if not part:
+                continue
+            head = re.split(r"[=:?]", part, maxsplit=1)[0].strip()
+            for token in re.findall(r"[A-Za-z_$][\w$]*", head):
+                if token not in ("let", "const", "var"):
+                    names.add(token)
+        for token in re.findall(r"[A-Za-z_$][\w$]*", m.group(1)):
+            if "{" in m.group(1) and token not in ("let", "const", "var"):
+                names.add(token)      # destructuring: every key is a binding
+    return names
+
+
+# The call form of a name: `NAME(...)`, `new NAME(...)`, `NAME.member(...)`.
+# The lookbehind keeps member reads (`a.NAME(`) out of it: the base is the
+# only part a module scope has to provide.
+_JS_CALL_FORM_RE = re.compile(
+    r"(?<![\w$.])(?:new\s+)?([A-Za-z_$][\w$]*)\s*(?:\(|\.[A-Za-z_$])")
+
+
+def _js_is_host_name(name: str) -> bool:
+    """True when a bare `name` needs no declaration: host, library, keyword."""
+    if (name in JS_GLOBAL_NAMES or name in JS_LIBRARY_GLOBALS
+            or name in JS_TEST_GLOBALS or name in JS_NON_NAMES):
+        return True
+    return any(name.startswith(p) for p in JS_GLOBAL_PREFIXES)
+
+
+def _js_import_names(clause: str) -> set[str]:
+    """Locals one `import ... from '...'` statement binds."""
+    names: set[str] = set()
+    body, brace_pos = (clause.split("{", 1)[0], clause.find("{"))
+    head = body.replace("from", "").strip()
+    for part in head.split(","):
+        part = part.strip().rstrip("*").strip()
+        if part and re.fullmatch(r"(?:type\s+)?[A-Za-z_$][\w$]*", part or ""):
+            names.add(part.split()[-1])
+    if brace_pos >= 0:
+        braces = _BRACE_GROUP_RE.search("{" + clause[brace_pos:])
+        if braces:
+            for item in braces.group("body").split(","):
+                item = item.strip()
+                if not item or item in ("type", "*"):
+                    continue
+                names.add(item.split()[-1] if " as " in item
+                          else item.replace("type ", "").strip())
+    for m in _NS_IMPORT_RE.finditer(clause):
+        names.add(m.group(1))
+    return {n for n in names if n and n not in JS_NON_NAMES}
+
+
+def _js_exported_names(text: str) -> set[str]:
+    """Names an ES module puts on its public surface (not `default`)."""
+    exported: set[str] = set()
+    text = _js_no_comments(text)
+    for m in _ESM_EXPORT_DECL_RE.finditer(text):
+        exported.add(_first_group(m))
+    for m in _ESM_EXPORT_LIST_RE.finditer(text):
+        for item in m.group("body").split(","):
+            item = item.strip().rstrip(";").strip()
+            if not item or item == "default":
+                continue
+            if " as " in item:
+                exported.add(item.split(" as ")[1].strip())
+            elif item != "*":
+                exported.add(item.replace("type ", "").strip())
+    return {n for n in exported if n and re.fullmatch(r"[A-Za-z_$][\w$]*", n)}
+
+
+def _js_module_links(htmls, jss, scopes, texts, root):
+    """Checks 6 and 7: duplicate module bindings and unreachable call targets."""
+    module_rels = {sc.rel for sc in scopes if sc.module and not sc.inline}
+    classic_top: set[str] = set()
+    exported_by: dict[str, list[str]] = {}
+    declared_in: dict[str, list[str]] = {}
+    defined_anywhere: set[str] = set()
+    for rel, text in jss:
+        for m in _JS_DEF_ANYWHERE_RE.finditer(text):
+            defined_anywhere.update(_js_def_names(m))
+        for m in _JS_METHOD_DEF_RE.finditer(text):
+            defined_anywhere.add(m.group(1))
+    for rel, text in htmls:
+        for m in _JS_DEF_ANYWHERE_RE.finditer(text):
+            defined_anywhere.update(_js_def_names(m))
+        for m in _JS_METHOD_DEF_RE.finditer(text):
+            defined_anywhere.add(m.group(1))
+    exports_of: dict[str, set[str]] = {}
+    declared_by: dict[str, set[str]] = {}
+    for rel, text in jss:
+        if rel not in module_rels:
+            classic_top.update(m.group(1) or _first_group(m)
+                               for m in _TOPLEVEL_RE.finditer(text))
+            continue
+        exported = _js_exported_names(text)
+        exports_of[rel] = exported
+        for name in exported:
+            exported_by.setdefault(name, []).append(rel)
+        bound = {m.group(1) or _first_group(m) for m in
+                 _TOPLEVEL_RE.finditer(text)} | _js_bound_by_imports(text)
+        for name in bound - exported:
+            declared_in.setdefault(name, []).append(rel)
+        declared_by[rel] = bound | exported
+    declared_in.pop("default", None)
+    externals = any(
+        _resolve_src(root, rel, _first_group(sm))[1]
+        for rel, text in htmls for sm in _SRC_ATTR_RE.finditer(text))
+
+    findings: list[Finding] = []
+    told: set[tuple[str, str]] = set()
+    for rel, text in jss:
+        if rel not in module_rels:
+            continue
+        # 6: a name bound twice at module level. `var`/`function` may repeat;
+        # a lexical binding, a class or an import may not, and mixing the two
+        # is the same SyntaxError.
+        seen: dict[str, tuple[int, str]] = {}
+        code = _js_code(text)
+        stmts = _js_no_comments(text)
+        for m in _TOPLEVEL_RE.finditer(code):
+            g = m.groups()
+            name = g[0] or g[1] or g[3] or g[4]
+            kind = ("function" if g[0] else
+                    "lexical" if (g[1] or g[3]) else "hoisted")
+            _report_duplicate(findings, seen, name,
+                              _line_of(text, m.start()), kind, rel)
+        for m in _ESM_IMPORT_RE.finditer(stmts):
+            line = _line_of(stmts, m.start())
+            for name in sorted(_js_import_names(m.group("clause"))):
+                _report_duplicate(findings, seen, name, line, "import", rel)
+        # 7: calls to names this module cannot reach. Uses are read out of the
+        # code (`_js_code`), bindings out of the raw file -- a name defined in
+        # a string or comment was never a definition, an over-wide parameter
+        # sweep only ever skips a reference.
+        code = _js_code(text)
+        bound = ({n for m in _JS_DEF_ANYWHERE_RE.finditer(text)
+                  for n in _js_def_names(m)}
+                 | {m.group(1) for m in _JS_METHOD_DEF_RE.finditer(text)}
+                 | _js_paren_bound(code) | _js_bound_by_imports(stmts))
+        for m in _JS_CALL_FORM_RE.finditer(code):
+            name = m.group(1)
+            if (name in bound or (rel, name) in told
+                    or _js_is_host_name(name)):
+                continue
+            told.add((rel, name))
+            line = _line_of(text, m.start())
+            holders = [h for h in exported_by.get(name, []) if h != rel]
+            if holders:
+                findings.append(Finding(
+                    rel, line,
+                    f"calls {name}() but this module never imports it -- "
+                    f"{holders[0]} exports it and a module only sees names it "
+                    f"declares or imports, so this line is a ReferenceError "
+                    f"(add `import {{ {name} }} from "
+                    f"'{_sibling_spec(rel, holders[0])}'`)",
+                    peer=holders[0]))
+                continue
+            hidden = [h for h in declared_in.get(name, []) if h != rel]
+            if hidden and name not in classic_top:
+                findings.append(Finding(
+                    rel, line,
+                    f"calls {name}(), which {hidden[0]} declares but never "
+                    f"exports -- modules do not share a scope, so this file "
+                    f"cannot reach it (export it in {hidden[0]} and import it "
+                    f"here)", peer=hidden[0]))
+                continue
+            if name in defined_anywhere or name in classic_top or externals:
+                continue   # a page global, or a CDN bundle: not provable
+            findings.append(Finding(
+                rel, line,
+                f"calls {name}() but nothing in the project defines it and no "
+                "module exports it -- the ReferenceError stops this file the "
+                "first time the line runs (declare it here, import it from "
+                "the file that should own it, or remove the call)"))
+    return findings
+
+
+def _js_bound_by_imports(text: str) -> set[str]:
+    names: set[str] = set()
+    for m in _ESM_IMPORT_RE.finditer(_js_no_comments(text)):
+        names |= _js_import_names(m.group("clause"))
+    return names
+
+
+def _report_duplicate(findings, seen, name, line, kind, rel) -> None:
+    """One finding per re-bound module-level name, worded for the second one."""
+    prev = seen.get(name)
+    if prev is None:
+        seen[name] = (line, kind)
+        return
+    if kind in ("hoisted", "function") and prev[1] in ("hoisted", "function"):
+        return               # two `function f`s are one function
+    this = {"import": "imported again here", "lexical": "declared again here",
+            "function": "defined again here", "hoisted": "defined again here"}
+    that = {"import": f"imported at line {prev[0]}",
+            "lexical": f"declared at line {prev[0]}",
+            "function": f"defined at line {prev[0]}",
+            "hoisted": f"defined at line {prev[0]}"}
+    findings.append(Finding(
+        rel, line,
+        f"'{name}' is {this[kind]}, but it is already {that[prev[1]]} -- both "
+        f"live in this module's own scope, so the browser refuses the file "
+        f"with `SyntaxError: Identifier '{name}' has already been declared` "
+        f"and none of its exports exist; keep exactly one binding for it"))
+
+
+def _sibling_spec(from_rel: str, target_rel: str) -> str:
+    """The ES specifier `from_rel` writes to reach `target_rel`."""
+    import posixpath
+    spec = posixpath.relpath(target_rel, posixpath.dirname(from_rel) or ".")
+    return spec if spec.startswith((".", "/")) else "./" + spec
+
+
 def run(root, files: list[str] | None = None) -> list[Finding]:
     """Every contract finding for the project under `root`, sorted by file
     and line. With `files`, only findings whose own file OR whose contract
@@ -504,6 +1140,10 @@ def run(root, files: list[str] | None = None) -> list[Finding]:
             findings.extend(_member_findings(
                 rel, _first_group(m), _line_of(text, m.start()) - 1, single,
                 texts))
+
+    # --- checks 6+7: module bindings and module links ----------------------
+    # (regex twins of spec._js_module_link_errors, which is the vetoing gate)
+    findings.extend(_js_module_links(htmls, jss, scopes, texts, root))
 
     # --- dedupe, filter, sort ----------------------------------------------
     uniq: list[Finding] = []

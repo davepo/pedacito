@@ -630,6 +630,13 @@ the live traceback is in front of the model before it writes the patch.
 - **Sandboxed.** It runs under the same sandbox as `run` (no network, writes only
   inside the project), and the answer phase has no tools at all. The run is recorded as a repository fact, so a test command
   that keeps working becomes a remembered command.
+- **Honest about what an exit code means.** The reply names the verdict in
+  words -- `EXIT: 5 (NOT COLLECTED)` -- and explains it: 5 means nothing was
+  collected, which says nothing about whether the code works. A `target` that
+  declares no `def test_...` and no `class Test...` is refused before pytest
+  starts, with the working alternative spelled out (`run` it as a script),
+  because a bare `no tests ran` once sent a model rewriting a passing
+  standalone smoke script's functions to `test_*` to make the number go away.
 
 It is on by default (`enable_run_test_in_gather = true`). Set it to `false` to make
 every run ask first in the **Permission requested** dialog under **Test Execution**.
@@ -761,7 +768,10 @@ echo '{"id":1,"method":"status"}' | pedacito rpc ~/code/anki
 Bidirectional JSONL-RPC over stdio, the same engine as `ask` and `chat`: each
 stdin line is `{"id": ..., "method": ..., "params": {...}}`; every stdout line
 is one JSON frame, so a client never parses prose. `ask` streams the task's
-events tagged with its `req_id` and ends with a `result` frame; `steer` pushes
+events tagged with its `req_id` and ends with a `result` frame (`applied`,
+`changed`, `ok`, cost, and `blockers`: the gate findings the run ended on --
+`applied: true` beside non-empty `blockers` means the code landed and was not
+verified clean, which is the difference a calling agent needs); `steer` pushes
 a note into the running task's queue; `permission_request` events arrive when
 a gated tool wants to act and are answered by `permission_reply` (`allow_once`,
 `allow_run`, `allow_always`, `deny`); `cancel` stops the task and keeps the
@@ -782,6 +792,14 @@ pedacito new my-app -t "..." --plan-only --apply     # skeleton only
 The model plans a file tree, the skeleton is written, then each file is filled
 in. Dry run by default. The target directory must be empty or new unless
 `--force`. `--complex` hands implementation to the `auto` loop.
+
+Each file is written by its own call, so the finished tree is checked as a
+whole before the build reports success: a browser scaffold whose scripts cannot
+link, or whose `getElementById` names an id no template renders, gets repair
+rounds and then prints `BUILD INCOMPLETE` and exits 1. A web project's generated
+`README` also says how to actually start it -- ES modules are refused over
+`file://`, so it names `python -m http.server 8000` and the URL to open instead
+of a `python main.py` line for a file the project does not contain.
 
 ### `auto`: autonomous loop over a task list
 
@@ -924,9 +942,13 @@ pedacito lsp --root PROJ --file src/a.py --line 12 --op definition
 needed: DOM ids that exist in no HTML file, ESM syntax loaded through a classic
 `<script src>` (a silent SyntaxError), duplicate globals across classic
 scripts, `<script src>` files that do not exist, bare imports package.json
-never declared, and inline handlers calling members nothing defines. It is
+never declared, inline handlers calling members nothing defines, a module-level
+name bound twice (`Identifier 'X' has already been declared`, which kills the
+whole module graph), and a call whose callee no module in the graph binds. It is
 regex-level on purpose, so its findings are warnings (printed by `auto` after
-tasks that touched web files, and in the `new` scaffold summary), never hard failures.
+tasks that touched web files, and in the `new` scaffold summary), never hard
+failures. Those last two shapes are also enforced by the vetting frontend gate,
+which reads the same names through the tree-sitter grammar instead of regexes.
 
 `calibrate` also measures **native tool calls** against the JSON grammar on your
 model (same eight scenarios, both modes) and the card switches `tool_mode` to
@@ -1154,12 +1176,16 @@ edit (the tests named after the file, tests of its importers and callers) run
 after it is written; new failures, compared with a run before the edit, go
 back to the model for up to `repair_rounds` fix rounds. `test_command`
 overrides detection (`pytest`, `npm test`, `cargo test`, `go test ./...`,
-`make test`, ...).
+`make test`, ...). Those two flags only ever switch the **subprocess** checks
+off. The syntax, static, frontend and cross-file contract gates read files in
+this process, so they vet every applied edit even in the default
+`allow_shell = false` profile: a run that cannot execute tests still cannot
+ship a module graph that would not link.
 
 ### Frontend contract checks
 
 Passing tests do not prove that a web page loads. After an applied edit, and
-before the test command runs, Pedacito checks three things with no model call:
+before the test command runs, Pedacito checks five things with no model call:
 
 - **Asset links.** Every local `<script src>` and `<link href>` in an HTML file
   must point to a file that exists. External URLs, `data:` URIs and template
@@ -1170,7 +1196,20 @@ before the test command runs, Pedacito checks three things with no model call:
   lookup built from an interpolated id is not checked, since its value is not
   known until runtime.
 - **Syntax.** Changed JavaScript must parse. `node --check` is used when Node is
-  installed, and the tree-sitter grammar otherwise.
+  installed, and the tree-sitter grammar otherwise. Parsing is not linking: a
+  file can parse and still be dead on arrival, so two more shapes are checked
+  against the grammar.
+- **Module bindings.** A name bound twice at module level -- the second
+  `import { WAYPOINTS }` an incremental edit appends to a file that already
+  imports it -- is a `SyntaxError` the browser refuses the whole graph for.
+  Every ES module's top level is scanned for it, `var`/`function` pairs excepted
+  because those are legal re-declarations.
+- **Unreachable calls.** A module sees only the names it declares or imports. A
+  call to a name no module binds is a `ReferenceError` the moment the line
+  runs, and the finding says which fix applies: the sibling that exports it
+  (add the import), the file that declares it without exporting it (add the
+  `export`), or nothing at all (define it or drop the call). Browser globals,
+  CDN bundles and classic-script globals are never reported.
 
 A finding is reported in the same shape as the other gates, for example:
 
@@ -1183,9 +1222,13 @@ Only findings that are new for the current task block the edit, so existing
 problems elsewhere in the project do not stop unrelated work. If you edit an HTML
 file, the JavaScript that looks up its ids is checked again. The gate is on by
 default and is turned off with `frontend_contracts = false`. `pedacito webcheck PROJ`
-runs broader static web checks on demand (ESM syntax in classic scripts, duplicate
-globals, undeclared imports), and `auto` prints its findings as a warning after
-tasks that touch web files.
+runs the same vocabulary plus the heuristic checks (ESM syntax in classic scripts,
+duplicate globals, undeclared imports, member calls on page globals) on demand,
+as warnings only, and `auto` prints its findings after tasks that touch web
+files. `pedacito new --apply` runs the vetting half over the finished tree:
+a scaffold whose page cannot link gets repair rounds, and if the violations
+survive them the build prints `BUILD INCOMPLETE` and exits 1 instead of
+reporting a project that cannot start.
 
 ## How context is managed
 

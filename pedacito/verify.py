@@ -828,6 +828,28 @@ def _clause_kind(clause: str, default: str) -> str:
     return default
 
 
+def _clip_clause(p: str, limit: int = 140) -> str:
+    """A requirement line a step can actually read: clipped on a word
+    boundary, never mid-token.
+
+    The old `p[:140]` cut wherever the count landed, so a plan step inherited
+    a title ending "...the restart button must ma" and one 27B run concluded
+    from it that the contract was already satisfied. A clause longer than the
+    limit is a clause the splitter should have opened: keep whole words and
+    mark the cut, so what remains is still a sentence."""
+    if len(p) <= limit:
+        return p
+    head = p[:limit]
+    if " " in head[40:]:                    # only clip when there is a word
+        cut = head.rfind(" ", 40, limit)    # boundary to fall back on
+    else:
+        cut = len(head)
+    clipped = head[:cut].rstrip(" ,;:.-\t")
+    if not clipped:
+        return p[:limit]
+    return clipped + " ..."
+
+
 def _requirements_from_task(task: str, limit: int = 5) -> list[Requirement]:
     text = (task or "").split("\nTASK\n")[-1].strip()
     if not text:

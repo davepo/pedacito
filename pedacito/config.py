@@ -48,6 +48,26 @@ USER_CONFIG = _user_config_dir() / "config.toml"
 PROJECT_CONFIG_NAMES = (".pedacito.toml", "pedacito.toml")
 
 
+def xdg_shadow_note() -> str:
+    """A line naming the user config `XDG_CONFIG_HOME` made pedacito ignore.
+
+    The XDG spec says `$XDG_CONFIG_HOME` REPLACES `~/.config`, so setting it
+    moves the whole tree -- and a user who edits `~/.config/pedacito/
+    config.toml` after that is editing a file pedacito never opens. `profiles`
+    then prints an empty table with no reason, which reads as "my config is
+    broken" rather than "the config lives somewhere else now". Empty when
+    nothing is shadowed."""
+    if os.name == "nt" or not os.environ.get("XDG_CONFIG_HOME"):
+        return ""
+    home_cfg = Path.home() / ".config" / "pedacito" / "config.toml"
+    if home_cfg == USER_CONFIG or not home_cfg.exists():
+        return ""
+    return (f"  note: {home_cfg} exists but is NOT read -- XDG_CONFIG_HOME is "
+            f"set to {os.environ.get('XDG_CONFIG_HOME')!r}, and by the XDG "
+            f"spec that replaces ~/.config. Profiles belong in "
+            f"{USER_CONFIG}.")
+
+
 @dataclass
 class Config:
     """All Pedacito settings with their defaults; see `load()` for assembly."""
@@ -1248,14 +1268,7 @@ def load(root: Path | None = None, explicit: Path | None = None,
             # And when it shadowed a config that DOES exist under ~/.config,
             # name that file: the reported confusion was editing a config
             # pedacito never reads.
-            ignored = ""
-            if os.name != "nt" and os.environ.get("XDG_CONFIG_HOME"):
-                home_cfg = (Path.home() / ".config" / "pedacito"
-                            / "config.toml")
-                if home_cfg.exists() and home_cfg != USER_CONFIG:
-                    ignored = (f"  (ignoring {home_cfg}: XDG_CONFIG_HOME is "
-                               f"set, and by the XDG spec it replaces "
-                               f"~/.config)\n")
+            ignored = xdg_shadow_note()
             hint = ("Define it in your config, or clear `default_profile`. "
                     "Run `pedacito config --setup` to build both interactively."
                     if origin == "default_profile" and not profiles else "")

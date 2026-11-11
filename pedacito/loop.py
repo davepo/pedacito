@@ -1822,7 +1822,7 @@ def _record_repair_lesson(root, cfg, pending: list,
 
 
 def _post_edit_tests(root, cfg, agent, idx, task, results, reply, backup_dir,
-                     baseline, edit_files):
+                     baseline, edit_files, collect=None):
     """After edits were written, run the impacted tests (`verify_tests`).
 
     Before every subprocess run the dry-applied buffers are parsed in-process:
@@ -1839,11 +1839,36 @@ def _post_edit_tests(root, cfg, agent, idx, task, results, reply, backup_dir,
     Returns (results, reply, tests_ok); tests_ok is None when the tests did
     not run (verification off, or no test command), else the last run's
     pass/fail -- surfaced as TaskResult.tests_ok for `ask --strict` and the
-    eval scorer."""
-    if not (getattr(cfg, "verify_tests", False)
-            and getattr(cfg, "allow_shell", False)):
+    eval scorer. `collect`, when given, receives every gate finding the run
+    could NOT repair: the edits still landed, so `applied` stays true, and a
+    caller that reports the task finished has to be told the last gate verdict
+    was red (one RPC `ask` answered `applied: true` for a module graph that
+    could not link).
+
+    The in-process gates are NOT gated on `allow_shell`: they parse and
+    scan files in this process (TECHNIQUES.md #19/#23), and the only
+    subprocess they would have protected -- pytest -- already declines to
+    run without the flags. A config that disabled the shell used to disable
+    every check too, so an `ask` build could report "applied and verified"
+    while its ES module graph could not even link; now the gates always
+    vet, and only the test subprocess honours the flags.
+    """
+    tests_wanted = bool(getattr(cfg, "verify_tests", False)) \
+        and bool(getattr(cfg, "allow_shell", False))
+    gates_wanted = (_static_enabled(cfg) or _frontend_enabled(cfg)
+                    or bool(getattr(cfg, "interface_lock", True)))
+    if not (tests_wanted or gates_wanted):
         return results, reply, None
     from . import verify as verify_mod
+
+    def unresolved(kind: str, errors) -> None:
+        """Hand the caller the gate errors this run ended on."""
+        if collect is None:
+            return
+        for e in list(errors)[:20]:
+            text = getattr(e, "message", None) or str(e)
+            collect.append(verify_mod.Finding(kind, "error", "", str(text)))
+
     changed = sorted({r.file for r in results if r.ok and r.file}) or edit_files
     base_out = (baseline[1] if baseline is not None and not baseline[0]
                 else "")
@@ -1871,6 +1896,7 @@ def _post_edit_tests(root, cfg, agent, idx, task, results, reply, backup_dir,
                 round=round_, syntax=True, new=len(syntax), fixed=0,
                 still_failing=0, pre_existing=len(base_failures))
             if round_ >= max_rounds:
+                unresolved('syntax', syntax)
                 break
             fixed = agent._repair_from_findings(task, reply, syntax, results)
             if not fixed:
@@ -1904,6 +1930,7 @@ def _post_edit_tests(root, cfg, agent, idx, task, results, reply, backup_dir,
                 round=round_, static=True, new=len(static), fixed=0,
                 still_failing=0, pre_existing=len(base_failures))
             if round_ >= max_rounds:
+                unresolved('static', static)
                 break
             finding = verify_mod.Finding(
                 "static", "error", "",
@@ -1948,6 +1975,7 @@ def _post_edit_tests(root, cfg, agent, idx, task, results, reply, backup_dir,
                 round=round_, frontend=True, new=len(fe), fixed=0,
                 still_failing=0, pre_existing=len(base_failures))
             if round_ >= max_rounds:
+                unresolved('frontend', fe)
                 break
             finding = verify_mod.Finding(
                 "frontend", "error", "",
@@ -1990,6 +2018,7 @@ def _post_edit_tests(root, cfg, agent, idx, task, results, reply, backup_dir,
                 round=round_, contract=True, new=len(ce), fixed=0,
                 still_failing=0, pre_existing=len(base_failures))
             if round_ >= max_rounds:
+                unresolved('contract', ce)
                 break
             finding = verify_mod.Finding(
                 "contract", "error", "",
@@ -2017,6 +2046,12 @@ def _post_edit_tests(root, cfg, agent, idx, task, results, reply, backup_dir,
             # are deferred until a green test run proves the fix.
             _record_repair_lesson(root, cfg, pending_lesson,
                                   skip_kinds={"tests"})
+        if not tests_wanted:
+            # Every in-process gate is green; the test subprocess is not
+            # configured to run (verify_tests/allow_shell off). Report
+            # honestly that no tests executed rather than pretending the
+            # green gates are tests.
+            return results, reply, tests_ok
         got = _run_tests(idx, cfg, changed)
         if got is None:
             return results, reply, tests_ok
@@ -2747,6 +2782,17 @@ def _run_task_once(root: Path, cfg, client, agent, idx, task: str, *,
                 task, gathered, intents, backup_dir=backup_dir,
                 verbose=True)
             raw_reply = reply
+            landed = sum(1 for r in results if r.ok)
+            if results and landed and landed < len(results):
+                # The same mixed state the model was told about, in the
+                # session log: a later reader of this run must not take
+                # "11 of 12 applied" for a finished feature.
+                missing = ", ".join(sorted({r.file for r in results
+                                            if not r.ok})[:8])
+                workspace.log_event(
+                    root, f"incremental batch PARTIALLY applied: {landed} of "
+                          f"{len(results)} block(s) landed; not applied: "
+                          f"{missing}", "WARN")
             for f in findings:
                 workspace.log_event(root, f"verify: {f.render()}",
                                     "WARN" if f.severity == "warn" else "ERROR")
@@ -2757,7 +2803,8 @@ def _run_task_once(root: Path, cfg, client, agent, idx, task: str, *,
                 results, reply, tests_ok = _post_edit_tests(
                     root, cfg, agent, idx, task, results, reply,
                     backup_dir, baseline_tests,
-                    sorted(set(edit_files) | set(gather_mut)))
+                    sorted(set(edit_files) | set(gather_mut)),
+                    collect=findings)
                 results, reply = _post_edit_lint_incremental(
                     root, cfg, agent, task, results, reply, backup_dir,
                     lint_baseline)
@@ -2833,7 +2880,8 @@ def _run_task_once(root: Path, cfg, client, agent, idx, task: str, *,
                     results, reply, tests_ok = _post_edit_tests(
                         root, cfg, agent, idx, task, results, reply,
                         backup_dir, baseline_tests,
-                        sorted(set(edit_files) | set(gather_mut)))
+                        sorted(set(edit_files) | set(gather_mut)),
+                        collect=findings)
             if not results and getattr(agent, "noop_discards", None):
                 # The reply's only blocks were null edits (SEARCH == REPLACE)
                 # dropped by parse_edits: the model had concluded no edit was
@@ -2870,7 +2918,8 @@ def _run_task_once(root: Path, cfg, client, agent, idx, task: str, *,
                     results, reply, tests_ok = _post_edit_tests(
                         root, cfg, agent, idx, task, results, reply,
                         backup_dir, None,
-                        sorted({e.file for e in parse_edits(reply)}))
+                        sorted({e.file for e in parse_edits(reply)}),
+                        collect=findings)
             else:
                 # The "No changes:" declaration is now the reply (run_loop
                 # keys its refusal path off _is_noop(tr.reply)).

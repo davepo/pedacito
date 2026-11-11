@@ -644,8 +644,10 @@ the same names to work from.
 |---|---|
 | `Cannot reach the server` | The server is not running, the port is wrong, or (remote) it is not listening on the network. See "A model server" above. |
 | Model is listed but will not load or generate | Usually VRAM. Another model is loaded. Unload it, or lower the context length. |
-| `search block not found` | The model copied line-number prefixes, or the file changed under it. The failure shows the closest matching text with current line numbers, and the model retries (twice) anchored on that text. If it keeps failing, narrow the task. |
+| `search block not found` | The model copied line-number prefixes, or the file changed under it -- or its text carries bytes the file does not (a smart quote, mojibake, a tab, CRLF). The failure shows the closest matching text with current line numbers, and the retry is offered the range anchor (`--- FILE: path LINES 40-46`), which ignores the quoted text entirely and applies by number. If it keeps failing, narrow the task. |
 | Model says a function does not exist | It is not indexed. Check `pedacito files`. An ignore rule may be too broad. |
+| `EXIT: 5` / `no tests ran` from `run_test` | Nothing was collected: not a failing test, and the code may be fine. The target is probably a standalone script (`def main()`, `if __name__ == "__main__"`). Run it with `run` instead, or write real `def test_...` functions if it was meant to hold tests. Renaming working functions to chase the exit code is the wrong fix, and the tool says so. |
+| A new browser project's page is blank when opened by double-clicking | ES modules are refused over `file://` (the console shows a CORS error). Serve the folder: `python -m http.server 8000`, then open `http://localhost:8000/index.html`. The generated README's `## Run` block says so. |
 | `Model would not produce valid JSON` | Usually a truncated reply. Pedacito retries with more room. If it persists, raise `max_tokens_step`. A thinking model that spends its whole budget reasoning returns no JSON, so turn thinking off for that profile. |
 | Every request fails, or "kept hitting limits" | The request is bigger than the server's context window. Check the `[auto-fit]` line printed at startup. If the server reports a stale window, set `context_tokens` (and `k_cache_quant` / `v_cache_quant` for a quantized cache). |
 | The answer is nonsense on a local server | Some servers (Ollama) silently truncate an oversized prompt. Raise the server's context length. |
@@ -653,7 +655,7 @@ the same names to work from.
 | Answers are vague | The map may have switched from a full listing to per-file cards. `pedacito map PROJ --tier auto` shows which. |
 | Stale or misleading summaries | A docstring replaces a generated summary. Set `summarise_documented = true` and re-index. |
 | No review page appeared | Nothing anchored, so there was nothing to review. Check the printed failures. |
-| `FrontendContractError` after an edit | A page script loads a file that does not exist, or a `getElementById` or `querySelector('#id')` looks for an id the HTML does not define. The message names the file, line and id. Render that element, or fix the selector. `pedacito webcheck PROJ` lists every such problem. |
+| `FrontendContractError` after an edit | The page cannot load as written: a script or stylesheet path that does not exist, a `getElementById` or `querySelector('#id')` for an id no HTML defines, JavaScript that does not parse, a module-level name bound twice (a second `import { X }` on a file that already imports it), or a call to a name no module declares or imports. The message names the file, line and the exact fix. `pedacito webcheck PROJ` lists every such problem. |
 | The server rejects structured output, or steps keep failing to parse | Pedacito steps down to a simpler structured mode by itself. Run `pedacito config --doctor` to see which modes the server supports. Set `enforce_json_schema = false` only if the server misbehaves under constrained sampling. |
 | Everything is slow | The model has likely spilled out of VRAM. |
 
@@ -695,7 +697,7 @@ only the map is stale.
 | `pedacito memory PROJ` | List, add, or forget remembered facts |
 | `pedacito skills PROJ` | List the available skills |
 | `pedacito tests PROJ --files F` | Detected test command, and the tests an edit to F can break |
-| `pedacito webcheck PROJ` | Static checks for web files: DOM ids, script loading, missing scripts |
+| `pedacito webcheck PROJ` | Static checks for web files: DOM ids, script loading, missing scripts, ES module bindings and links |
 | `pedacito diagnose` | Run the project's linter or type checker |
 | `pedacito prune PROJ` | Delete old sessions, backups, and events |
 | `pedacito reset PROJ [--reindex]` | Wipe `.pedacito/` runtime state. Code and config stay |

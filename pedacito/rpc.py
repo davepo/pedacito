@@ -26,7 +26,8 @@ Every stdout line is a JSON event. Events streamed while a task runs carry
 terminal ``{"kind": "rpc_response", "id": ...}`` frame. ``ask`` additionally
 streams the engine's live events and ends with a compact
 ``{"kind": "result", "req_id": ...}`` summary frame (reply, applied files,
-steps, cost) before its ``rpc_response``.
+steps, cost, and any `blockers:` gate findings the run ended on) before its
+``rpc_response``.
 
 Methods:
 
@@ -491,10 +492,24 @@ class RpcServer:
             if getattr(r, "ok", getattr(r, "applied", False))
             and (getattr(r, "file", "") or getattr(r, "path", ""))
         }) if applied else []
+        # Gate findings the run ended on: the edits landed, so `applied` is
+        # honestly true, but "applied" alone let one RPC `ask` answer a
+        # feature whose module graph could not link. A caller that only reads
+        # `applied` cannot tell delivered from broken; these lines can.
+        blocks = []
+        for f in (getattr(res, "findings", None) or []):
+            if getattr(f, "severity", "error") != "error":
+                continue
+            kind = str(getattr(f, "kind", "finding") or "finding")
+            text = str(getattr(f, "message", f) or "").strip()
+            where = str(getattr(f, "file", "") or "")
+            blocks.append(f"{kind}: {where}: {text}"[:400] if where
+                          else f"{kind}: {text}"[:400])
         return {
             "reply": getattr(res, "reply", None),
             "applied": applied,
             "changed": changed,
+            "blockers": sorted(set(blocks))[:20],
             "ok": bool(getattr(res, "ok", True)),
             "steps": getattr(res, "steps", None),
             "tests_ok": getattr(res, "tests_ok", None),

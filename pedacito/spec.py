@@ -37,7 +37,7 @@ import sys
 from pathlib import Path
 from typing import Iterable
 
-from . import fileio
+from . import fileio, webcheck
 from .chunker import DEF_NODES, _docline, _signature
 
 # Directories no project check should ever walk into.
@@ -1201,6 +1201,403 @@ def _js_cross_file_errors(root: Path, cap: int = 60
     return out
 
 
+# The name vocabulary lives in `webcheck`: one list of what the host, a CDN
+# bundle or a test runner provides, shared by the regex advisor and this gate.
+# Two lists drifted once, and the two readers disagreed about whether a bare
+# name needed an import, so there is only one now and it cannot drift again.
+# It is a suppression list, so the merge was curated rather than unioned:
+# every real Web API either side knew went in, and what was never a global at
+# all stayed out -- HTML tag names (`Menu`, `Table`, `Form`, `Title`) and
+# misspelled interfaces. A call to a `Menu()` nobody defined is exactly the
+# finding this check exists to make, and the old list had made it unspeakable.
+_JS_GLOBAL_NAMES = webcheck.JS_GLOBAL_NAMES
+_JS_GLOBAL_PREFIXES = webcheck.JS_GLOBAL_PREFIXES
+_JS_NON_NAMES = webcheck.JS_NON_NAMES
+_JS_LIBRARY_GLOBALS = webcheck.JS_LIBRARY_GLOBALS
+_JS_TEST_GLOBALS = webcheck.JS_TEST_GLOBALS
+
+# A name only ever defined inside another file's function body is not a global;
+# this is the generous "does this word get defined ANYWHERE in the project"
+# pool that keeps the undefined-name check from guessing.
+_JS_ANY_DEF_RE = re.compile(
+    r"\b(?:function|class)\s*\*?\s*([A-Za-z_$][\w$]*)"
+    r"|\b(?:const|let|var)\s+([A-Za-z_$][\w$]*)"
+    r"|\b(?:window|globalThis|self|global)\s*(?:\.\s*|\[\s*['\"])([A-Za-z_$][\w$]*)"
+    r"|\b([A-Za-z_$][\w$]*)\s*=\s*(?:async\s+)?(?:function\b|\([^()]*\)\s*=>|[A-Za-z_$][\w$]*\s*=>)"
+)
+
+
+def _js_top_level_bindings(root_node) -> list[tuple[str, int, str]]:
+    """(name, line, kind) for every binding a file's *top level* introduces.
+
+    Only program children: a declaration inside a block or a class body is a
+    different scope and cannot collide with anything here. `kind` is `import`,
+    `lexical` (const/let/class -- the ones that refuse a second binding) or
+    `hoisted` (var/function -- legal to repeat, but not next to a lexical)."""
+    out: list[tuple[str, int, str]] = []
+
+    def declarator_names(node) -> list[str]:
+        names: list[str] = []
+        for child in node.named_children:
+            if child.type != "variable_declarator":
+                continue
+            names += sorted(_js_pattern_names(child.child_by_field_name("name")))
+        return names
+
+    def add(name: str, node, kind: str) -> None:
+        if name and name not in _JS_NON_NAMES:
+            out.append((name, node.start_point[0] + 1, kind))
+
+    for child in root_node.named_children:
+        k = child.type
+        if k == "import_statement":
+            clause = next((c for c in child.named_children
+                           if c.type == "import_clause"), None)
+            if clause is None:
+                continue
+            for spec in clause.children:
+                if spec.type == "identifier":
+                    add(_ts_text(spec), child, "import")
+                elif spec.type == "named_imports":
+                    for node in spec.named_children:
+                        if node.type != "import_specifier":
+                            continue
+                        alias = _ts_text(node.child_by_field_name("alias"))
+                        add(alias or _ts_text(
+                            node.child_by_field_name("name")),
+                            node, "import")
+                elif spec.type == "namespace_import":
+                    ident = next((x for x in spec.named_children
+                                  if x.type == "identifier"), None)
+                    add(_ts_text(ident), child, "import")
+        elif k in ("lexical_declaration", "variable_declaration"):
+            kind = "lexical" if re.match(r"^\s*(?:const|let)\b",
+                                         _ts_text(child)) else "hoisted"
+            for name in declarator_names(child):
+                add(name, child, kind)
+        elif k in ("function_declaration", "generator_function_declaration",
+                   "class_declaration", "abstract_class_declaration"):
+            add(_ts_text(child.child_by_field_name("name")), child,
+                "lexical" if "class" in k else "hoisted")
+        elif k == "export_statement":
+            decl = child.child_by_field_name("declaration")
+            if decl is None:
+                continue
+            if decl.type in ("lexical_declaration", "variable_declaration"):
+                kind = "lexical" if re.match(r"^\s*(?:const|let)\b",
+                                             _ts_text(decl)) else "hoisted"
+                for name in declarator_names(decl):
+                    add(name, decl, kind)
+            elif decl.type in ("function_declaration",
+                               "generator_function_declaration"):
+                add(_ts_text(decl.child_by_field_name("name")), decl, "hoisted")
+            elif decl.type in ("class_declaration", "abstract_class_declaration"):
+                add(_ts_text(decl.child_by_field_name("name")), decl, "lexical")
+    return out
+
+
+def _js_bound_names(root_node) -> set[str]:
+    """Every identifier this file itself binds, at any depth.
+
+    A reference to a name in this set is resolved locally, however deeply
+    nested; the free-identifier check only ever looks at the rest."""
+    bound: set[str] = set()
+
+    def visit(node) -> None:
+        k = node.type
+        if k == "import_statement":
+            clause = next((c for c in node.named_children
+                           if c.type == "import_clause"), None)
+            for child in (clause.children if clause is not None else []):
+                if child.type == "identifier":
+                    bound.add(_ts_text(child))
+                elif child.type == "named_imports":
+                    for spec in child.named_children:
+                        if spec.type != "import_specifier":
+                            continue
+                        alias = _ts_text(spec.child_by_field_name("alias"))
+                        bound.add(alias or _ts_text(
+                            spec.child_by_field_name("name")))
+                elif child.type == "namespace_import":
+                    ident = next((x for x in child.named_children
+                                  if x.type == "identifier"), None)
+                    bound.add(_ts_text(ident))
+            return
+        if k in ("formal_parameters", "catch_clause"):
+            for param in node.named_children:
+                bound.update(_js_pattern_names(param))
+            return
+        if k == "variable_declarator":
+            bound.update(_js_pattern_names(node.child_by_field_name("name")))
+        elif k in _JS_DECL_NODES:
+            bound.add(_ts_text(node.child_by_field_name("name")))
+        elif k == "assignment_expression":
+            left = node.child_by_field_name("left")
+            if left is not None and left.type == "identifier":
+                bound.add(_ts_text(left))
+        elif k in ("member_expression", "subscript_expression"):
+            # `window.NAME = ...` / `globalThis.NAME = ...` create a global
+            # that later lines of this very file may call.
+            obj = _ts_text(node.child_by_field_name("object"))
+            if obj in ("window", "globalThis", "self", "global"):
+                prop = node.child_by_field_name("property")
+                if prop is not None and prop.type == "property_identifier":
+                    bound.add(_ts_text(prop))
+                elif (prop is not None and prop.type == "string"
+                      and prop.text):
+                    raw = prop.text.decode("utf-8", "replace").strip("'\"")
+                    if re.fullmatch(r"[A-Za-z_$][\w$]*", raw):
+                        bound.add(raw)
+        elif k == "labeled_statement":
+            label = node.child_by_field_name("label")
+            bound.add(_ts_text(label))
+        for child in node.named_children:
+            visit(child)
+
+    visit(root_node)
+    bound.discard("")
+    return bound
+
+
+def _js_called_names(root_node) -> list[tuple[str, int]]:
+    """(base identifier, line) for every call the file makes.
+
+    `fn(...)`, `new fn(...)` and `fn.member(...)` are the forms a missing
+    binding turns into a ReferenceError or a "cannot read property of
+    undefined"; a member chain is judged on its leftmost name only."""
+    out: list[tuple[str, int]] = []
+    for node in _walk_ts(root_node):
+        if node.type == "call_expression":
+            callee = node.child_by_field_name("function")
+        elif node.type == "new_expression":
+            callee = node.child_by_field_name("constructor")
+        else:
+            continue
+        if callee is None or callee.type not in ("identifier",
+                                                 "member_expression"):
+            continue
+        while callee.type == "member_expression":
+            inner = callee.child_by_field_name("object")
+            if inner is None:
+                break
+            callee = inner
+        if callee.type != "identifier":
+            continue
+        name = _ts_text(callee)
+        if not name or name in _JS_NON_NAMES:
+            continue
+        ancestor = node.parent
+        for _ in range(3):                  # `@Injectable()` is not a reference
+            if ancestor is None:
+                break
+            if "decorator" in ancestor.type:
+                name = ""
+                break
+            ancestor = ancestor.parent
+        if not name:
+            continue
+        out.append((name, node.start_point[0] + 1))
+    return out
+
+
+def _js_sibling_spec(from_rel: str, target_rel: str) -> str:
+    """The ES specifier `from_rel` must write to reach `target_rel`."""
+    import posixpath
+    spec = posixpath.relpath(target_rel, posixpath.dirname(from_rel) or ".")
+    return spec if spec.startswith((".", "/")) else "./" + spec
+
+
+def _js_is_host_name(name: str) -> bool:
+    if (name in _JS_GLOBAL_NAMES or name in _JS_LIBRARY_GLOBALS
+            or name in _JS_TEST_GLOBALS):
+        return True
+    if name in _JS_NON_NAMES:
+        return True
+    return any(name.startswith(p) for p in _JS_GLOBAL_PREFIXES)
+
+
+def _js_page_externals(root: Path) -> bool:
+    """True when some HTML page loads a script from outside the project.
+
+    A CDN bundle (three.js, gsap, phaser) puts names in the global scope that
+    no file in the tree defines, so the "nothing defines this name" check has
+    no business guessing about it; it is skipped in that project."""
+    for rel in _iter_code_files(root, _FE_HTML_EXTS):
+        text = _read(rel, root)
+        for m in _FE_SCRIPT_SRC_RE.finditer(text):
+            if _fe_external(m.group(1)):
+                return True
+    return False
+
+
+@_ts_guarded
+def _js_module_link_errors(root: Path, cap: int = 40
+                           ) -> list[tuple[str, str, str]]:
+    """(rel, peer, ContractError) for ES module wiring a parse cannot see.
+
+    Two deterministic failures, both silent to `has_syntax_error` and both
+    fatal to the whole module graph in the browser:
+
+      - a name bound twice at module level (the second `import { WAYPOINTS }`
+        an incremental edit appends): `Identifier 'WAYPOINTS' has already been
+        declared`, the file never evaluates;
+      - a call whose callee is bound nowhere -- not in this file, not imported,
+        not a host global. When another module exports the name the fix is the
+        missing import; when it only declares it, the name is unreachable from
+        this scope; when nothing in the project defines it at all, the call is
+        a ReferenceError the moment the line runs.
+
+    Names an import statement already binds are left to
+    `_js_cross_file_errors`, which owns the import-vs-export contract, and
+    anything the project might be loading from a CDN stays unreported."""
+    root = Path(root)
+    rels = _iter_code_files(root, TS_EXTS, cap=300)
+    if not rels:
+        return []
+    parsed: dict[str, object] = {}
+    info_cache: dict[str, dict | None] = {}
+
+    def text_for(rel: str) -> str:
+        return _read(rel, root)
+
+    def tree_for(rel: str):
+        if rel not in parsed:
+            suffix = "." + rel.rsplit(".", 1)[-1].lower()
+            try:
+                parsed[rel] = _ts_parse(text_for(rel), suffix)
+            except Exception:
+                parsed[rel] = None
+        return parsed[rel]
+
+    def info_for(rel: str) -> dict | None:
+        if rel not in info_cache:
+            suffix = "." + rel.rsplit(".", 1)[-1].lower()
+            try:
+                info_cache[rel] = _js_module_info(text_for(rel), suffix)
+            except Exception:
+                info_cache[rel] = None
+        return info_cache[rel]
+
+    # --- the project-wide pools the free-identifier check reasons over -----
+    exported_by: dict[str, list[str]] = {}     # name -> module files exporting it
+    classic_top: set[str] = set()              # names a classic script exposes
+    declared_in: dict[str, list[str]] = {}     # name -> module files hiding it
+    defined_anywhere: set[str] = set()         # any project file, any depth
+    html_defined: set[str] = set()
+    for rel in rels:
+        text = text_for(rel)
+        if not text.strip():
+            continue
+        for m in _JS_ANY_DEF_RE.finditer(text):
+            defined_anywhere.add(next(g for g in m.groups() if g))
+        info = info_for(rel)
+        if info is None:
+            continue
+        if not info["module"]:
+            # a classic script's top level really is the page's global scope
+            classic_top.update(info["locals"])
+            continue
+        for name in info["exports"]:
+            if name != "default":
+                exported_by.setdefault(name, []).append(rel)
+        for name in info["locals"]:
+            if name not in info["exports"]:
+                declared_in.setdefault(name, []).append(rel)
+    for rel in _iter_code_files(root, _FE_HTML_EXTS):
+        text = text_for(rel)
+        for m in _JS_ANY_DEF_RE.finditer(text):
+            html_defined.add(next(g for g in m.groups() if g))
+    defined_anywhere |= html_defined
+    externals = _js_page_externals(root)
+
+    out: list[tuple[str, str, str]] = []
+    seen: set[str] = set()
+
+    def emit(rel: str, peer: str, text: str) -> None:
+        if text in seen or len(out) >= cap:
+            return
+        seen.add(text)
+        out.append((rel, peer, text))
+
+    for rel in rels:
+        node = tree_for(rel)
+        if node is None:
+            continue                       # the syntax gate owns broken files
+        # 1. a module-level name bound twice: one SyntaxError, whole file dead
+        first: dict[str, tuple[int, str]] = {}
+        for name, line, kind in _js_top_level_bindings(node):
+            prev = first.get(name)
+            if prev is None:
+                first[name] = (line, kind)
+                continue
+            if kind == "hoisted" and prev[1] == "hoisted":
+                continue                   # two `function f`s are one function
+            if prev[1] == "import":
+                where = f"imported at line {prev[0]}"
+            elif prev[1] == "lexical":
+                where = f"declared at line {prev[0]}"
+            else:
+                where = f"defined at line {prev[0]}"
+            if kind == "import":
+                this = "imported again here"
+            elif kind == "lexical":
+                this = "declared again here"
+            else:
+                this = "defined again here"
+            emit(rel, "", f"ContractError in {rel}:{line}: '{name}' is "
+                 f"{this}, and it is already {where} -- the browser refuses "
+                 f"the file with `SyntaxError: Identifier '{name}' has "
+                 f"already been declared`, so none of its exports exist and "
+                 f"every module that imports it fails to load; keep exactly "
+                 f"one binding for '{name}'")
+            first[name] = (line, kind)     # report each name once
+
+        # 2. calls to a name this module never binds
+        info = info_for(rel)
+        if info is None:
+            continue
+        bound = _js_bound_names(node) | set(info["locals"])
+        told: set[str] = set()
+        for name, line in _js_called_names(node):
+            if name in bound or name in told:
+                continue
+            if _js_is_host_name(name):
+                continue
+            holders = exported_by.get(name)
+            if holders:
+                told.add(name)
+                holder = holders[0]
+                where = ", ".join(sorted(set(holders))[:3])
+                hint = ("add `import { " + name + " } from '"
+                        + _js_sibling_spec(rel, holder) + "'`")
+                emit(rel, holder, f"ContractError in {rel}:{line}: calls "
+                     f"{name}() but this module never imports it -- {where} "
+                     f"exports {name}, and an ES module only sees names it "
+                     f"declares or imports, so the call is a ReferenceError "
+                     f"the moment this line runs (" + hint + ")")
+                continue
+            hidden = declared_in.get(name)
+            if hidden and name not in classic_top:
+                told.add(name)
+                emit(rel, hidden[0], f"ContractError in {rel}:{line}: calls "
+                     f"{name}(), which {hidden[0]} declares at its top level "
+                     f"but never exports -- every module has its own scope, "
+                     f"so this file cannot reach it (add `export` before it "
+                     f"in {hidden[0]} and import it here)")
+                continue
+            if name in defined_anywhere or externals:
+                continue  # a classic script's global, or a CDN bundle: not provable
+            told.add(name)
+            emit(rel, "", f"ContractError in {rel}:{line}: calls {name}() but "
+                 f"nothing in the project defines it and no file in the "
+                 f"module graph exports it -- the ReferenceError stops this "
+                 f"module the first time the line runs (define it here, "
+                 f"import it from the file that should own it, or remove the "
+                 f"call)")
+    out.sort(key=lambda t: (t[0], t[2]))
+    return out
+
+
 def verify_cross_file_contracts(root: Path,
                                 modified_files: list | None = None) -> list[str]:
     """Cross-file import/arity violations in the project's Python and JS/TS
@@ -1341,6 +1738,11 @@ def verify_cross_file_contracts(root: Path,
     # and imported-function arity. Same diagnostic shape, same touched-first
     # ordering, same conservative skips.
     for importer, _target, text in _js_cross_file_errors(root):
+        emit(text, importer)
+
+    # ... and the wiring a parse cannot see: a name bound twice at module
+    # level, a call whose exporter was never imported.
+    for importer, _target, text in _js_module_link_errors(root):
         emit(text, importer)
 
     # Test files calling into (changed) source through dotted
@@ -1668,6 +2070,50 @@ def _norm_refined(raw: dict, prompt: str) -> dict:
     }
 
 
+def _edge_case_fallback(data: dict) -> list[str]:
+    """EDGE CASES for a spec nobody wrote them into: phrased for the stack the
+    file list actually names.
+
+    The one generic line this used to print -- "handle empty input, missing
+    files and wrong types with a clear error" -- was written for Python and
+    landed on browser games, where it asked for a traceback in a project with
+    no tracebacks, and said nothing about the failure every web build really
+    hits: a DOM node that is not there, a first frame before any input, a
+    canvas that does not fit the window."""
+    paths = [str(f.get("path") or "") if isinstance(f, dict) else str(f)
+             for f in (data.get("files") or ())]
+    exts = {p.rsplit(".", 1)[-1] for p in paths if "." in p}
+    web = exts & {"html", "htm", "css", "js", "mjs", "cjs", "jsx", "ts", "tsx"}
+    py = exts & {"py", "pyw"}
+    if not paths:
+        return ["Empty or missing input fails with a clear message, not a "
+                "traceback."]
+    out: list[str] = []
+    if web:
+        out += [
+            "A DOM node or canvas context the code expects is missing or "
+            "null (the element is not in the page, or the query runs before "
+            "it is created): guard for it, never dereference it.",
+            "First load, before any input: empty state, zero score, no "
+            "selection, nothing chosen -- the page must render and the loop "
+            "must run without a click having happened.",
+            "A viewport smaller than the designed size, a window resize, and "
+            "a devicePixelRatio other than 1: content stays reachable and "
+            "drawn inside its canvas.",
+        ]
+    if py:
+        out += [
+            "Empty or missing input, an absent file and a wrong type all "
+            "fail with a clear message, not a traceback.",
+            "The state is reloaded after a crash or a restart: no orphaned "
+            "file, no half-written record.",
+        ]
+    if not out:
+        out.append("Empty or missing input fails with a clear message, not a "
+                   "traceback.")
+    return out[:4]
+
+
 def _render_refined(data: dict, original: str, mode: str) -> str:
     """The one shared text shape for a refined spec (model or fallback)."""
     lines = ["OBJECTIVE",
@@ -1692,11 +2138,8 @@ def _render_refined(data: dict, original: str, mode: str) -> str:
         lines.append("1. Implement exactly the objective above; add nothing "
                      "it does not ask for.")
     lines += ["", "EDGE CASES"]
-    if data["edge_cases"]:
-        lines += [f"{i}. {e}" for i, e in enumerate(data["edge_cases"], 1)]
-    else:
-        lines.append("1. Handle empty input, missing files, and wrong types "
-                     "with a clear error, never a crash.")
+    cases = data["edge_cases"] or _edge_case_fallback(data)
+    lines += [f"{i}. {e}" for i, e in enumerate(cases, 1)]
     lines += ["", "VERIFICATION",
               data["verification"] or "Run the project's tests (or its entry "
               "point) and confirm the objective's observable end state."]
@@ -1737,12 +2180,12 @@ def _fallback_spec(prompt: str, snapshot: str, mode: str) -> dict:
             "Any new public function or class must be given one exact "
             "signature here before a later step calls it.",
         ],
-        "edge_cases": ["Empty or missing input fails with a clear message, "
-                       "not a traceback."],
+        "edge_cases": [],
         "verification": ("Run the project's test suite (or import/run the "
                          "entry point) after the change and confirm the "
                          "objective's observable end state."),
     }
+    data["edge_cases"] = _edge_case_fallback(data)
     return data
 
 
@@ -2957,7 +3400,7 @@ def _fe_js_syntax_problem(rel: str, text: str) -> str | None:
 def verify_frontend_contracts(root: Path, modified_files=None) -> list[str]:
     """Deterministic DOM Contract verification of the HTML/JS in `root`.
 
-    Four checks, all mechanical: (1) every <script src> / stylesheet <link
+    Five checks, all mechanical: (1) every <script src> / stylesheet <link
     href> in every HTML file points at a file that exists; (2) every literal
     DOM query (getElementById('x') / querySelector('#x')) matches an id the
     HTML defines (or a literal id the JS itself creates); files whose ids are
@@ -2965,7 +3408,9 @@ def verify_frontend_contracts(root: Path, modified_files=None) -> list[str]:
     a moving target; (3) every JS file parses, via `node --check` when node
     is installed and tree-sitter otherwise; (4) relative ES module imports
     resolve and name real exports, and imported calls satisfy the known
-    arity range (the same `ContractError` diagnostics as the Python gate).
+    arity range (the same `ContractError` diagnostics as the Python gate);
+    (5) every module binds each name once and declares or imports each name
+    it calls.
 
     `modified_files` (root-relative paths, as the loop reports them) scopes
     the REPORT: only errors inside those files come back, so a pre-existing
@@ -3081,6 +3526,16 @@ def verify_frontend_contracts(root: Path, modified_files=None) -> list[str]:
     # whose argument count cannot satisfy the real signature. Bare packages
     # and dynamic imports are deliberately absent from the helper's output.
     for importer, target, text in _js_cross_file_errors(root):
+        if scope is None or importer in scope or (target and target in scope):
+            errors.append(text)
+
+    # 5. ES module WIRING: the two failures a parse accepts and the browser
+    # aborts on -- a module-level name bound twice (`import { WAYPOINTS }`
+    # appended by an incremental edit next to the import that already binds
+    # it) and a call to a name this module neither declares nor imports.
+    # Neither is visible to `has_syntax_error` or to the DOM checks above, and
+    # both kill the whole module graph before a single line runs.
+    for importer, target, text in _js_module_link_errors(root):
         if scope is None or importer in scope or (target and target in scope):
             errors.append(text)
     return sorted(set(errors))[:_FE_ERRORS_CAP]
