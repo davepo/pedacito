@@ -296,7 +296,8 @@ and writes one identity-only profile per model, then sets a default. Pass
 `--url` to point at a server on another machine or a hosted API; `models scan
 --match PATTERN --calibrate quick|full|none` re-runs it. Prefer to edit by
 hand? The file is `~/.config/pedacito/config.toml` (Linux/macOS) or
-`%APPDATA%\pedacito\config.toml` (Windows). The minimum:
+`%APPDATA%\pedacito\config.toml` (Windows); a set `XDG_CONFIG_HOME` replaces
+`~/.config`. The minimum:
 
 ```toml
 [universal]
@@ -590,7 +591,7 @@ do:
 | `write` / `append` / `move` / `delete` | `allow_write = true` | Whole-file operations; `append` builds a file larger than one reply. |
 | `rename` | `allow_write = true` | Mechanically rename one definition and its references in the files that import it (strings and comments untouched, every file re-parsed, snapshotted). Refuses a name defined in several places and lists the references it left alone. |
 | `undo` | `allow_write = true` (+ `backup`, on by default) | Self-recovery mid-task: reverts what this task's `write`/`append`/`move`/`delete` actions did so far (or just one of their files), pre-task snapshots come back, files the task created go away. |
-| `run` | `allow_shell = true` | Run one command (e.g. `pytest -q`), without a shell. A quiet GUI/server is stopped after `shell_idle_seconds`. |
+| `run` | `allow_shell = true` | Run one command (e.g. `pytest -q`), without a shell, so `&` and `nohup` are rejected and long-lived processes go to `serve`. A quiet GUI/server is stopped after `shell_idle_seconds`. |
 | `serve` | `allow_serve = true` | Start, list, log, or stop a background dev server. The registry and logs live under `.pedacito/procs/`; also `pedacito serve` / `pedacito procs`. |
 | `diagnose` | `allow_shell = true` | Run the detected linter/type checker (`ruff`, `pyflakes`, `flake8`, `mypy`/`pyright` when configured, `npm lint`, `tsc`, `cargo check`, `go vet`, `rubocop`). Also available as `pedacito diagnose`. |
 | `lsp` | `allow_lsp = true` | Exact definition/references/hover/diagnostics through pyright/pylsp/typescript-language-server/rust-analyzer/gopls, or commands in `lsp_servers`. Also `pedacito lsp`. |
@@ -791,19 +792,26 @@ context, with optional verification and repair:
 pedacito auto . -t "add retry logic to the sync client"      # plan only
 pedacito auto . -t "..." --apply                             # plan, then implement
 pedacito auto . --apply --verify "pytest -q"                 # verify and repair each task
+pedacito auto . --apply --verify "pytest -q" --verify-final  # one whole-goal check at the end
 pedacito auto . --apply --diagnostics                        # lint/typecheck each task
 pedacito auto . --apply --worktree refactor                  # run in an isolated git worktree
 pedacito auto . --apply --plan TODO.md                       # use an existing checklist
 ```
 
 The plan is a markdown checklist (`PLAN.md` by default), so a run is resumable
-and editable. There is no default cap on tasks, steps, or time; add one with
-`--max-tasks N`, `--max-minutes N`, or `--steps N`. `--repair N` sets repair
+and editable; the file also keeps the full goal (a `Goal:` line with `> `
+continuation lines), which a resumed run hands back to each task. There is
+no default cap on tasks, steps, or time; add one with `--max-tasks N`,
+`--max-minutes N`, or `--steps N`. `--repair N` sets repair
 rounds per failed verification, `--keep-going` continues past failed tasks, and
 `--auto-install` installs a missing Python package instead of reporting it.
-`--strict` exits 1 when a task applied edits but left a failed edit block or
-impacted tests still failing after the repair rounds, for CI and unattended
-pipelines (without it both are reported and the run exits 0).
+`--verify-final` runs the `--verify` command once, after the last unchecked
+task, instead of after every task: a whole-goal check cannot pass mid-plan, so
+the per-task runs would roll back valid partial fixes (`auto_verify_final`,
+off by default). `--strict` exits 1 when a task applied edits but left a
+failed edit block or impacted tests still failing after the repair rounds,
+for CI and unattended pipelines (without it both are reported and the run
+exits 0).
 
 Guards for unattended runs: a repair round that makes the check *worse* (more
 test failures, more findings) is rolled back from that round's own snapshot

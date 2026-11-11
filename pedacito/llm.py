@@ -664,6 +664,43 @@ _NATIVE_TOOL_OPEN_RE = re.compile(
     r"<(?:tool_call|invoke|read)\b|<function\s*=", re.IGNORECASE)
 _MAX_STREAM_TOOL_OPENS = 6
 
+# Degenerate answer loops repeat a whole paragraph verbatim until the context
+# dies (the reported "same answer over and over" defect). A KMP period test on
+# the whitespace-collapsed stream tail catches it while the reply is still
+# cheap to discard. The 80-char cycle floor keeps legitimate short refrains
+# (list markers, repeated JSON keys) out; the pacing bounds the cost.
+_STREAM_REPEAT_WINDOW = 4000        # chars of tail the cycle test inspects
+_STREAM_REPEAT_MIN_CYCLE = 80       # shorter repeats may be real style
+_STREAM_REPEAT_MIN_TIMES = 3        # 2 copies is quoting; 3 is a loop
+_STREAM_REPEAT_CHECK_CHARS = 512    # re-test only after this much new text
+
+
+def _repeat_run(text: str) -> tuple[int, int]:
+    """(cycle, copies) when the whitespace-collapsed tail of `text` is one
+    exact cycle repeated >= ``_STREAM_REPEAT_MIN_TIMES`` times back to back;
+    (0, 0) otherwise.
+
+    The cycle length is the KMP failure-function period of the whole tail
+    window, so varied prose (even verbose prose) reports no run: only a
+    loop that has FILLED the window trips the guard.
+    """
+    s = " ".join(text.split())[-_STREAM_REPEAT_WINDOW:]
+    n = len(s)
+    if n < _STREAM_REPEAT_MIN_CYCLE * _STREAM_REPEAT_MIN_TIMES:
+        return 0, 0
+    pi = [0] * n
+    for i in range(1, n):
+        j = pi[i - 1]
+        while j and s[i] != s[j]:
+            j = pi[j - 1]
+        if s[i] == s[j]:
+            j += 1
+        pi[i] = j
+    cycle = n - pi[-1]
+    if cycle < _STREAM_REPEAT_MIN_CYCLE or cycle > n // _STREAM_REPEAT_MIN_TIMES:
+        return 0, 0
+    return cycle, n // cycle
+
 
 def _strip_harmony(text: str) -> str:
     """Text of the last `final` harmony channel, or "" when the reply contains
@@ -1089,6 +1126,9 @@ class LLMClient:
         # Truncation signal for streamed replies (finish_reason arrives on the
         # final SSE chunk); cleared per _chat_once call, sticky within it.
         self.stream_truncated = False
+        # True when the degenerate-loop guard cut a repeating stream (see
+        # _repeat_run); companion of stream_truncated for reports/telemetry.
+        self.stream_repetition = False
         # Chars of hidden reasoning in the last streamed attempt. chat()'s
         # empty-completion retry uses it to tell an instant-EOS flake (retry
         # identical) from a thinking runaway (retry with thinking disabled).
@@ -1760,6 +1800,9 @@ class LLMClient:
         # cannot trigger apply()'s continuation loop.
         self.stream_truncated = False
         self.partial_text = ""
+        # Cleared per attempt with stream_truncated: True when the repetition
+        # guard stopped a degenerate answer loop.
+        self.stream_repetition = False
         if stream:
             self._cancel.clear()
 
@@ -1812,6 +1855,8 @@ class LLMClient:
         out: list[str] = []
         tool_opens = 0
         probe_tail = ""
+        rep_acc = ""          # content tail for the repetition test
+        rep_since = 0         # new chars since the last repetition test
         reasoning_chars = 0
         usage: dict = {}
         timings: dict | None = None
@@ -1909,6 +1954,24 @@ class LLMClient:
                               "tool-call syntax instead of answering; no tools "
                               "can run in this phase]", file=sys.stderr)
                         break
+                    # Verbatim-repetition guard (degenerate answer loop): pace
+                    # the KMP period test so ordinary streams pay nothing extra.
+                    rep_acc += delta
+                    rep_since += len(delta)
+                    if rep_since >= _STREAM_REPEAT_CHECK_CHARS:
+                        rep_since = 0
+                        rep_acc = rep_acc[-_STREAM_REPEAT_WINDOW:]
+                        if _repeat_run(rep_acc)[0]:
+                            self.stream_repetition = True
+                            # The reply is cut off: flag it like a dropped
+                            # stream so the existing continuation/re-ask
+                            # machinery handles the rest of the phase.
+                            self.stream_truncated = True
+                            print("\n[stopped the reply: the model is "
+                                  "repeating the same text verbatim -- a "
+                                  "degenerate loop; treating the answer as "
+                                  "cut off]", file=sys.stderr)
+                            break
         except requests.exceptions.RequestException as e:
             dropped = e
         finally:

@@ -2921,6 +2921,17 @@ class Agent:
                 + "\n".join(lines))[:2000]
 
     # ------------------------------------------------------ coverage bookkeeping
+    @staticmethod
+    def _file_token_match(r: str, w: str) -> bool:
+        """True when the normalised task token `w` names the normalised index
+        path `r`: exactly, or as the path's trailing segment (a bare `app.py`
+        naming `web/app.py`). The REVERSE was the reported misread: a task
+        naming `web/app.py` also matched a root `app.py`, so an unrelated
+        same-named file was forced-read and the "not yet read" nudge never
+        cleared after the real target was read in full.
+        """
+        return r == w or r.endswith("/" + w)
+
     def _task_file_targets(self, task: str) -> set[str]:
         """Normalised paths mentioned in the task text. Only tokens containing
         a slash or a dot-extension count, so prose words are ignored."""
@@ -2942,7 +2953,7 @@ class Agent:
         for rel in self.index.files:
             r = _norm_key(rel)
             for w in wanted:
-                if r == w or r.endswith("/" + w) or w.endswith("/" + r):
+                if self._file_token_match(r, w):
                     matched[r] = rel
         if not matched:
             return []
@@ -2989,7 +3000,7 @@ class Agent:
         wanted = self._task_file_targets(task)
         for rel in sorted(self.index.files):
             r = _norm_key(rel)
-            if any(r == w or r.endswith("/" + w) or w.endswith("/" + r)
+            if any(self._file_token_match(r, w)
                    for w in wanted) and not self._read_spans.get(r):
                 n = lines_of(rel)
                 if n:
@@ -3058,7 +3069,7 @@ class Agent:
         for rel in self.index.files:
             r = _norm_key(rel)
             for w in wanted:
-                if r == w or r.endswith("/" + w) or w.endswith("/" + r):
+                if self._file_token_match(r, w):
                     named[r] = rel
 
         def lines_of(rel: str) -> int:
@@ -3303,6 +3314,28 @@ class Agent:
         elif len(same) == 1:
             c = same[0]                    # a method inside a whole-class chunk
         else:
+            if path.is_file():
+                # No index chunk for the symbol (definitions nested inside a
+                # function, an IIFE or a closure are deliberately not indexed)
+                # or several match in this file. The symbol-anchored hunk
+                # cannot be positioned -- but failing the whole intent here
+                # would strand work the planner already scoped. Fall back to
+                # the WHOLE-FILE target: the model gets the file verbatim and
+                # emits a plain quoted SEARCH/REPLACE block for it.
+                self._emit("incremental_edit_fallback", file=rel,
+                           symbol=symbol,
+                           reason=("no definition by that name in this file"
+                                   if not same else
+                                   f"{len(same)} definitions match"))
+                try:
+                    lines = fileio.read_lines(path)
+                except OSError as e:
+                    return None, Result(False, rel, f"cannot read file: {e}")
+                end = len(lines)
+                if lines and lines[-1] == "" and len(lines) > 1:
+                    end -= 1
+                return {"file": rel, "symbol": "", "start": 1, "end": end,
+                        "intended_change": change}, None
             if not same:
                 why = "no definition by that name in this file"
             else:

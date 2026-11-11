@@ -3243,6 +3243,13 @@ def _allowlist_error(cfg, argv: list[str]) -> str:
             f"({', '.join(allow)}).")
 
 
+# Commands that only mean something to a shell. `run` executes argv directly
+# (no shell), so these never background anything -- they either hand `&` to the
+# program as a literal argument or leave a silent process to the idle-kill.
+# `serve` (registered processes under .pedacito/procs) is the supported path.
+_ADHOC_BG_HEADS = frozenset({"nohup", "setsid", "disown", "bg"})
+
+
 def tool_run(index, cfg, command: str) -> str:
     """Run one command in the project root and return its output. Gated by
     `allow_shell`.
@@ -3272,6 +3279,20 @@ def tool_run(index, cfg, command: str) -> str:
         return f"ERROR: could not parse command ({e})."
     if not argv:
         return "ERROR: run needs a `command`."
+
+    # `run` executes argv WITHOUT a shell: `&` reaches the program as a
+    # literal argument, and `nohup`-style wrappers do not detach -- a quiet
+    # server started this way just idles until the idle-kill stops it. Long
+    # lives belong to the registered-process flow, not ad-hoc backgrounding.
+    if (Path(argv[0]).name in _ADHOC_BG_HEADS
+            or any(t in ("&", "&&", "||") for t in argv)):
+        return ("ERROR: `run` executes argv without a shell: `&` is passed to "
+                "the program as a literal argument, and `nohup`/`setsid` do "
+                "not background it here (a silent server is then stopped by "
+                "the idle-output kill). To start a dev server or any "
+                "long-lived process, use the `serve` action instead -- it "
+                "registers under .pedacito/procs, stays alive across steps, "
+                "and is listed/stopped via `pedacito procs`.")
 
     denied = _allowlist_error(cfg, argv)
     overridable = bool(denied) and broker and not _deny_error(cfg, argv)

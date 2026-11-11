@@ -26,8 +26,8 @@ from pathlib import Path
 from . import safety
 from .llm import LLMError
 
-_FLAGS = ("step_truncated", "stream_truncated", "partial_text",
-          "truncated_field")
+_FLAGS = ("step_truncated", "stream_truncated", "stream_repetition",
+          "partial_text", "truncated_field")
 
 
 def _digest(messages) -> str:
@@ -100,6 +100,7 @@ class Replayer:
 
     step_truncated = False
     stream_truncated = False
+    stream_repetition = False
     partial_text = ""
     truncated_field = ""
 

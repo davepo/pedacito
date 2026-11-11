@@ -745,7 +745,10 @@ def _cmd_auto(args, cfg, client, idx, root: Path) -> int:
             titles = loop.generate_tasks(
                 spec.text, roles_mod.client_for(cfg, "planner", client), cfg,
                 root=root)
-            loop.write_plan(plan_path, spec.title, titles)
+            # Persist the FULL spec, not just the title: a later `auto` resume
+            # without -t/--spec reads the goal back from the plan file
+            # (read_plan_goal) so workers still see every constraint.
+            loop.write_plan(plan_path, spec.text, titles)
         if not args.apply:
             print(plan_path.read_text(encoding="utf-8"), file=sys.stderr)
             print(f"Plan: {plan_path}", file=sys.stderr)
@@ -754,16 +757,21 @@ def _cmd_auto(args, cfg, client, idx, root: Path) -> int:
                   file=sys.stderr)
             return 0
     else:
-        spec_text = ""
         if not plan_path.exists():
             print(f"No plan file at {plan_path}.\n"
                   "  Give -t \"goal\" or --spec FILE to generate one, or\n"
                   "  --plan FILE to point at an existing task checklist.",
                   file=sys.stderr)
             return 2
+        # Resume of an existing plan with no fresh -t/--spec: the workers must
+        # still see the ORIGINAL goal, or every constraint that was never
+        # repeated in a task title is silently lost on the resumed run.
+        spec_text = loop.read_plan_goal(plan_path)
 
     verify = args.verify if getattr(args, "verify", None) is not None \
         else cfg.auto_verify
+    verify_final = bool(getattr(args, "verify_final", False)
+                        or getattr(cfg, "auto_verify_final", False))
     repair = args.repair if getattr(args, "repair", None) is not None \
         else cfg.auto_repair_rounds
     max_tasks = args.max_tasks if getattr(args, "max_tasks", None) is not None \
@@ -781,7 +789,8 @@ def _cmd_auto(args, cfg, client, idx, root: Path) -> int:
                          max_tasks=max_tasks, max_minutes=max_minutes,
                          stop_on_fail=not args.keep_going,
                          auto_install=auto_install, goal=spec_text,
-                         strict=bool(getattr(args, "strict", False)))
+                         strict=bool(getattr(args, "strict", False)),
+                         verify_final=verify_final)
 
     # Post-run verification: exercise the project once (--verify and/or a smoke
     # run of main.py) and feed a failure back for repair.
@@ -2082,6 +2091,12 @@ def _main(argv=None) -> int:
     p_auto.add_argument("--verify", default=None,
                         help="shell command to run after each task, e.g. "
                              "'pytest -q'; a failure feeds back for repair")
+    p_auto.add_argument("--verify-final", action="store_true",
+                        help="with --verify, run the command once after the "
+                             "LAST unchecked task instead of after every "
+                             "task: a whole-goal check cannot pass mid-plan, "
+                             "so per-task runs roll back valid partial fixes "
+                             "(cheap gates still run every step)")
     p_auto.add_argument("--repair", type=int, default=None,
                         help="how many fix rounds a failing verification gets")
     p_auto.add_argument("--diagnostics", action="store_true",

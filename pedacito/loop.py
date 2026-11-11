@@ -581,13 +581,51 @@ def _prune_notes(notes: list[str]) -> None:
 
 
 def write_plan(path: Path, goal: str, titles: list[str]) -> None:
-    """Write a fresh plan file: a goal line plus one unchecked task per title."""
+    """Write a fresh plan file: the goal text plus one unchecked task per
+    title.
+
+    A multi-line goal is persisted WHOLE: the first line rides the `Goal:`
+    line, continuation lines get a `> ` quote prefix so they can never parse
+    as task lines. The resume path reads it back with ``read_plan_goal`` --
+    workers on a resumed run otherwise see no goal at all.
+    """
     body = [PLAN_HEADER.rstrip()]
-    if goal:
-        body += ["", f"Goal: {goal}"]
+    gl = (goal or "").strip()
+    if gl:
+        first, *rest = gl.splitlines()
+        body += ["", f"Goal: {first}"]
+        body += [f"> {ln}" if ln else ">" for ln in rest]
     body += ["", *(f"- [ ] {t}" for t in titles)]
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text("\n".join(body) + "\n", encoding="utf-8")
+
+
+def read_plan_goal(path: Path) -> str:
+    """The full goal text stored in a plan file, or "" when absent/legacy.
+
+    Continuation lines are the `> `-prefixed lines that follow `Goal:`; the
+    first task line (or any other content) ends the block. Quote-prefixed
+    lines never match `_TASK_LINE`, so ticking boxes is unaffected.
+    """
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except (OSError, UnicodeDecodeError):
+        return ""
+    out: list[str] = []
+    seen = False
+    for ln in lines:
+        if not seen:
+            if ln.startswith("Goal: "):
+                out.append(ln[len("Goal: "):])
+                seen = True
+            continue
+        if ln.startswith("> "):
+            out.append(ln[2:])
+        elif ln == ">":
+            out.append("")
+        else:
+            break
+    return "\n".join(out).strip() if seen else ""
 
 
 TASK_SCHEMA = {
@@ -3016,7 +3054,8 @@ def run_loop(root: Path, cfg, client, idx, plan_path: Path, *,
              max_tasks: int = 0, max_minutes: int = 0,
              stop_on_fail: bool = True,
              answer_system: str | None = None, auto_install: bool = False,
-             goal: str = "", on_task=None, strict: bool = False) -> int:
+             goal: str = "", on_task=None, strict: bool = False,
+             verify_final: bool = False) -> int:
     """Run the Ralph loop until the plan is empty (or a cap/stop is hit).
 
     Each iteration: read the plan, take the first unchecked task, run it in a
@@ -3066,6 +3105,13 @@ def run_loop(root: Path, cfg, client, idx, plan_path: Path, *,
     - ``strict`` exits 1 when a task landed edits but left a failed edit
       block (a partial application) or impacted tests still failing after
       the repair rounds; without it both are reported but the run exits 0.
+    - ``verify_final`` runs the shell ``verify`` command ONCE, after the
+      plan's last unchecked task, instead of after every task. A whole-goal
+      check cannot pass mid-plan by definition, and the per-task gate then
+      rolls back perfectly valid partial fixes; the cheap gates (syntax,
+      static, frontend, contract) still veto every single step. If the run
+      stops before the last task (cap, time limit, early failure) the check
+      is still paid for once, for the record, after the loop.
     """
     from .agent import Agent
 
@@ -3073,6 +3119,10 @@ def run_loop(root: Path, cfg, client, idx, plan_path: Path, *,
     done = 0
     failed = 0
     strict_bad = False
+    # Tasks that ticked done with SOME of their blocks not applied: each is
+    # reported at the moment it happens and in the finish line -- a partial
+    # edit is by design, silence about it was the defect.
+    partial_tasks: list[tuple[str, int, int]] = []
     started_at = time.monotonic()
     # Reports/edit summaries carried into later task prompts so a fresh
     # context still benefits from earlier findings.
@@ -3264,12 +3314,32 @@ def run_loop(root: Path, cfg, client, idx, plan_path: Path, *,
         from . import spec as _spec_mod
         spec_mod = _spec_mod
 
+    def _open_task_count() -> int:
+        return sum(1 for ln in read_plan(plan_path) if _is_unchecked(ln))
+
+    final_state = {"ran": False}     # did the real shell check ever run?
+    if verify and verify_final:
+        print(f"  [final-only verification: `{verify}` runs once, after the "
+              f"last unchecked task; the syntax/static/frontend/contract "
+              f"gates still run every step]", file=sys.stderr)
+        workspace.log_event(
+            root, "final-only verification: the shell check is deferred to "
+                  "the last unchecked task (a whole-goal check is expected "
+                  "to fail mid-plan; do not roll back valid partial fixes "
+                  "for it)", "INFO")
+
     def run_check(changed):
         if verify:
+            if verify_final and _open_task_count() > 1:
+                # More unchecked tasks follow this one: the whole-goal check
+                # is not due yet. Return as passed; the cheap gates inside
+                # _gated_check still vetoed this step before we got here.
+                return True, ""
             # Call positionally: existing callers (and tests) monkeypatch
             # run_verify with a two-argument callable. Record the outcome here,
             # where cfg is available, rather than threading it into the call.
             ok, out = run_verify(root, verify)
+            final_state["ran"] = True
             try:
                 from . import memory
                 memory.observe_command(root, verify, ok, cfg, kind="test")
@@ -3860,6 +3930,21 @@ def run_loop(root: Path, cfg, client, idx, plan_path: Path, *,
                     print(f"  [webcheck] {note}", file=sys.stderr)
                     workspace.log_event(root, f"webcheck: {note}", "WARN")
 
+        bad_blocks = [r for r in tr.results if not r.ok]
+        if bad_blocks and (ok_edits or tr.changed):
+            # A partial application: the task stays ticked (by design), but
+            # the unapplied half is named here, in the run log, and again in
+            # the finish line -- never silently.
+            where = ", ".join(sorted({r.file for r in bad_blocks}))
+            total = len(ok_edits) + len(bad_blocks)
+            partial_tasks.append((task, len(ok_edits), len(bad_blocks)))
+            print(f"  [partial edit: {len(bad_blocks)} of {total} block(s) "
+                  f"did not apply ({where}) -- the task is still ticked "
+                  f"done]", file=sys.stderr)
+            workspace.log_event(
+                root, f"partial edit on task '{task[:60]}': {len(bad_blocks)}"
+                      f" of {total} block(s) did not apply ({where})", "WARN")
+
         if strict and (tr.tests_ok is False
                        or any(not r.ok for r in tr.results)):
             # The work landed but is not clean: a failed edit block (a
@@ -3874,6 +3959,22 @@ def run_loop(root: Path, cfg, client, idx, plan_path: Path, *,
         done += 1
         workspace.log_event(root, f"task done ({done})")
         notify(task)
+
+    if verify and verify_final and not final_state["ran"] and attempted:
+        # The run stopped before the last unchecked task (a cap, a time
+        # limit, an early failure): the whole-goal check never came due
+        # inside the loop, so pay for it once now, for the record. Repair
+        # and exit-code responsibility after the loop stays with the
+        # caller (auto's post-run verification pass).
+        ok, out = run_verify(root, verify)
+        print(f"  [final-only check was not reached inside the loop; running "
+              f"`{verify}` once for the record: "
+              f"{'passed' if ok else 'FAILED'}]", file=sys.stderr)
+        workspace.log_event(
+            root, f"final-only verification for the record (the run stopped "
+                  f"before the last task): "
+                  f"{'passed' if ok else 'FAILED'}",
+            "INFO" if ok else "ERROR")
 
     cfg._auto_step = 0
     cfg._static_baseline = None
@@ -3902,6 +4003,15 @@ def run_loop(root: Path, cfg, client, idx, plan_path: Path, *,
                               + (f", {rolled_back} rolled back"
                                  if rolled_back else ""),
                         "ERROR" if failed else "INFO")
+    if partial_tasks:
+        # The reported defect was silence: say it plainly at the end too.
+        print(f"  [{len(partial_tasks)} task(s) ticked done with blocks that "
+              f"did not apply -- see the 'partial edit' lines above and in "
+              f"{workspace.run_log_path(root).name} (run log)]",
+              file=sys.stderr)
+        workspace.log_event(root, f"auto loop finished with "
+                                  f"{len(partial_tasks)} partially applied "
+                                  f"task(s)", "WARN")
     _fire(cfg, root, "notification", message=f"pedacito auto finished: "
           f"{done} done, {failed} failed, {remaining} left"
           + (f", {rolled_back} step(s) rolled back to the last green "

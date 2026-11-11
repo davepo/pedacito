@@ -125,7 +125,7 @@ def run_planned(root: Path, cfg, client, idx, task: str, *, apply: bool,
     titles, how = make_plan(task, idx, client, cfg, root)
     stamp = workspace.stamp()
     plan_path = Path(root) / ".pedacito" / "plans" / f"{stamp}.md"
-    loop.write_plan(plan_path, task[:300], titles)
+    loop.write_plan(plan_path, task, titles)
     print(f"\n--- plan ({how}; {len(titles)} step(s)) -> "
           f"{plan_path.relative_to(root)} ---", file=sys.stderr)
     for i, t in enumerate(titles, 1):

@@ -490,6 +490,12 @@ class Config:
     # Shell command run after every task; a failure feeds its output back for
     # repair. Empty = no verification.
     auto_verify: str = ""
+    # True: run the auto_verify command ONCE, after the plan's last unchecked
+    # task, instead of after every task. A whole-goal check cannot pass
+    # mid-plan, so the per-task gate rolls back valid partial fixes; this
+    # opt-in defers it (the cheap syntax/static/contract gates still veto
+    # every step). CLI: `auto --verify-final`.
+    auto_verify_final: bool = False
     # Cap on tasks per `auto` run; 0 = no cap.
     auto_max_tasks: int = 0
     # Wall-clock cap per `auto` run in minutes; 0 = no cap. Checked between
@@ -1239,6 +1245,17 @@ def load(root: Path | None = None, explicit: Path | None = None,
             # which files were actually searched.
             searched = "; ".join(f"{label}: {path}" for label, path in layers) \
                 or f"no config file found (expected: {USER_CONFIG})"
+            # And when it shadowed a config that DOES exist under ~/.config,
+            # name that file: the reported confusion was editing a config
+            # pedacito never reads.
+            ignored = ""
+            if os.name != "nt" and os.environ.get("XDG_CONFIG_HOME"):
+                home_cfg = (Path.home() / ".config" / "pedacito"
+                            / "config.toml")
+                if home_cfg.exists() and home_cfg != USER_CONFIG:
+                    ignored = (f"  (ignoring {home_cfg}: XDG_CONFIG_HOME is "
+                               f"set, and by the XDG spec it replaces "
+                               f"~/.config)\n")
             hint = ("Define it in your config, or clear `default_profile`. "
                     "Run `pedacito config --setup` to build both interactively."
                     if origin == "default_profile" and not profiles else "")
@@ -1246,6 +1263,7 @@ def load(root: Path | None = None, explicit: Path | None = None,
                 f"No profile named '{profile}' (from {origin}). "
                 f"Defined profiles: {known}\n"
                 f"Looked in: {searched}\n"
+                + ignored
                 + (hint + "\n" if hint else "") +
                 "Add one to your config:\n\n"
                 f"  [profiles.{profile}]\n  model = \"...\"")
@@ -2313,6 +2331,10 @@ lsp_timeout = 10.0
 # Autonomous loop (`pedacito auto`).
 auto_plan_file = "PLAN.md"
 auto_verify = ""
+# true = run auto_verify once after the LAST unchecked task (whole-goal
+# mode) instead of after every task, so mid-plan partial fixes are not
+# rolled back by a check that cannot pass yet. CLI: auto --verify-final.
+auto_verify_final = false
 auto_max_tasks = 0
 auto_max_minutes = 0
 auto_repair_rounds = 2

@@ -105,9 +105,12 @@ extra cost:
   `temperature_answer=0`. It dry-applies the hunk, runs `verify.py` and the
   AST/tree-sitter syntax gate, writes it only if clean, then replaces the
   temporary source with a one-line `[EDITED file:symbol]` receipt before
-  moving to the next symbol. The full impacted-test and lint pass still runs
-  once after the last hunk. Section 5 covers why the single-hunk boundary is
-  the reliability win.
+  moving to the next symbol. A symbol that cannot be resolved in a file that
+  already exists does not lose the intent: the microloop falls back to the
+  whole file as the anchor and records `incremental_edit_fallback`, while an
+  unresolved symbol in an absent file still fails hard. The full impacted-test
+  and lint pass still runs once after the last hunk. Section 5 covers why the
+  single-hunk boundary is the reliability win.
 - **Worked examples** (`fewshot_steps`, off by default). Three short worked
   steps from the project itself (grep a symbol, read it, done) shown once in the
   first user turn, so grammar/native mode also teaches *good action choice*,
@@ -552,6 +555,13 @@ failing strategy forever. Pedacito already has the hard lease
 - The redirect does not weaken the bound: if the next step still adds no new
   source line and resolves no new symbol, the normal no-progress note fires
   and the run moves to the answer phase with what it already gathered.
+
+The same anti-loop principle covers the output stream. A reply that emits
+tool-call syntax verbatim, or cycles the same text, is stopped mid-generation:
+the harness watches the stream tail for a repeating block and breaks at the
+third identical copy, marks the answer `stream_repetition` (with
+`stream_truncated`) and says so on stderr. Stopping early costs the model
+nothing and leaves a usable truncated answer instead of a lost one.
 
 ### 17. The Prompt/Spec Architect
 

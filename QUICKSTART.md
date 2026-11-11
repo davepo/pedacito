@@ -504,9 +504,12 @@ pedacito auto . -t "add retry logic to the sync client" --apply  # plan, then im
 ```
 
 The plan is a markdown checklist in `PLAN.md`. You can edit it before you apply
-it, and a run can be resumed. Useful flags:
+it, and a run can be resumed; the file also stores the full goal, which a
+resumed run hands back to each task. Useful flags:
 
 - `--verify "pytest -q"` checks and repairs each task.
+- `--verify-final` runs that check once, after the last unchecked task, instead
+  of after every one.
 - `--diagnostics` runs the project's linter and type checker on each task.
 - `--worktree NAME` works in an isolated git worktree and leaves your checkout
   alone.
@@ -728,10 +731,11 @@ Deleting the folder is always safe. You only pay for a re-index. `pedacito reset
 clears it for you, and `pedacito prune` trims the old files.
 
 Your settings live in `~/.config/pedacito/config.toml` (`%APPDATA%\pedacito\` on
-Windows). `pedacito config` shows every resolved value and which file or profile
-set it. Settings resolve in layers: built-in defaults, then that file, then the
-project's `.pedacito.toml`, then `--config FILE`, then `--profile`, then
-command-line flags. Next to the config file, the GUI remembers recent projects in
+Windows; a set `XDG_CONFIG_HOME` replaces `~/.config`). `pedacito config` shows
+every resolved value and which file or profile set it. Settings resolve in
+layers: built-in defaults, then that file, then the project's `.pedacito.toml`,
+then `--config FILE`, then `--profile`, then command-line flags. Next to the
+config file, the GUI remembers recent projects in
 `gui_recent.json`. `server_modes.json` stores what each server and model supports
 (JSON modes and tokenizer rate, refreshed by `--doctor`). `model_cards.json` holds
 the `pedacito calibrate` results. All of these are safe to delete.
