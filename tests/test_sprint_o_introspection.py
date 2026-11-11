@@ -368,6 +368,34 @@ def test_distill_repair_lesson_shapes():
         is None
 
 
+def test_repair_lesson_keeps_dot_file_names(tmp_path):
+    """`str.lstrip("./")` strips CHARACTERS, so `.eslintrc.js` became
+    `eslintrc.js`: the lesson was recorded under a name that does not exist and
+    retired on the very next load. The leading dot (and the case) must survive
+    into the ledger, and distinct dot-files must not compare equal."""
+    _k, _line, files = loop.distill_repair_lesson(
+        "undefined name 'x' in .eslintrc.js", "static")
+    assert files == [".eslintrc.js"]
+    _k2, _l2, mixed = loop.distill_repair_lesson(
+        "FrontendContractError in ./src/MyComponent.tsx:1: queries DOM element "
+        "'#x', but index.html only defines ids", "frontend")
+    assert mixed == ["index.html", "src/MyComponent.tsx"]
+    assert not loop._same_rel(".env.py", "env.py")
+    assert not loop._same_rel("pkg/mod.py", ".mod.py")
+    assert loop._same_rel("./pkg/a.py", "pkg/a.py")
+    # end to end: a lesson about a dot-file survives the existence prune
+    (tmp_path / ".eslintrc.js").write_text("module.exports = {};\n",
+                                          encoding="utf-8")
+    facts = memory.micro_facts_file(tmp_path)
+    facts.parent.mkdir(parents=True, exist_ok=True)
+    facts.write_text(json.dumps({"anti_patterns": [
+        {"lesson_id": "L1", "kind": "avoid_missing_import",
+         "text": "import x where it is used", "files": files,
+         "last_seen": 1}]}), encoding="utf-8")
+    live = memory.load_anti_patterns(tmp_path)
+    assert [a["lesson_id"] for a in live] == ["L1"]
+
+
 def test_post_edit_frontend_gate_repairs_then_learns(tmp_path, monkeypatch):
     """Full wiring: a broken DOM id blocks the test subprocess, the repair
     lands, and the fail -> pass transition writes one lesson to the ledger."""

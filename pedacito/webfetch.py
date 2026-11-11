@@ -13,12 +13,11 @@ it: see safety.frame). Cached per URL for an hour under `.pedacito/fetch/`.
 from __future__ import annotations
 
 import hashlib
-import ipaddress
 import re
 import time
 from html.parser import HTMLParser
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import urljoin, urlparse
 
 import requests
 
@@ -90,14 +89,10 @@ def _host_allowed(host: str, allowed) -> bool:
 
 
 def _is_private(host: str) -> bool:
-    if host in ("localhost", "localhost.localdomain") or host.endswith(".local"):
-        return True
-    try:
-        ip = ipaddress.ip_address(host)
-    except ValueError:
-        return False
-    return (ip.is_private or ip.is_loopback or ip.is_link_local
-            or ip.is_reserved or ip.is_unspecified)
+    # One guard, one definition of "private": the SSRF helper also normalises
+    # legacy numeric spellings (127.1, 0x7f000001, ...) that the OS resolver
+    # still maps to loopback.
+    return security.is_private_host(host)
 
 
 def tool_fetch(index, cfg, url: str) -> str:
@@ -160,8 +155,28 @@ def tool_fetch(index, cfg, url: str) -> str:
     except OSError:
         pass
     try:
-        r = requests.get(raw, timeout=15, stream=True, allow_redirects=True,
-                         headers={"User-Agent": "pedacito-fetch/1.0"})
+        url = raw
+        for _hop in range(7):           # the page itself + at most 6 redirects
+            r = requests.get(url, timeout=15, stream=True, allow_redirects=False,
+                             headers={"User-Agent": "pedacito-fetch/1.0"})
+            if r.status_code not in (301, 302, 303, 307, 308):
+                break
+            nxt = urljoin(url, (r.headers.get("Location") or "").strip())
+            nu = urlparse(nxt)
+            nh = (nu.hostname or "").lower()
+            # Judge the hop before requesting it: an auto-followed redirect
+            # would already have hit the private host by the time we check.
+            if (nu.scheme not in ("http", "https") or not nh
+                    or (nh != host and (not _host_allowed(nh, allowed) or (
+                        _is_private(nh)
+                        and not any(a.lower() == nh for a in allowed))))):
+                r.close()
+                return (f"ERROR: redirected to {nh or nxt or '(no location)'}, "
+                        "which is not allowed.")
+            r.close()
+            url = nxt
+        else:
+            return "ERROR: fetch gave up after 6 redirects."
     except requests.exceptions.RequestException as e:
         return f"ERROR: fetch failed ({type(e).__name__}: {str(e)[:160]})."
     try:

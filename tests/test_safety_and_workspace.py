@@ -79,13 +79,15 @@ def test_child_env_scrubs_ambient_secrets(monkeypatch):
     for k, v in {"OPENAI_API_KEY": "sk-secret", "GITHUB_TOKEN": "t",
                  "AWS_SECRET_ACCESS_KEY": "s", "DATABASE_URL": "pg://x",
                  "PATH": "/usr/bin", "HOME": "/home/u", "LC_ALL": "C",
-                 "NODE_AUTH_TOKEN": "n", "PIP_INDEX_URL": "https://t@x"}.items():
+                 "NODE_AUTH_TOKEN": "n", "PIP_INDEX_URL": "https://t@x",
+                 "PIP_EXTRA_INDEX_URL": "https://t@y"}.items():
         monkeypatch.setenv(k, v)
     env = safety.child_env(Config())
     assert env["PATH"] == "/usr/bin" and env["HOME"] == "/home/u"
     assert env["NO_COLOR"] == "1" and env["TERM"] == "dumb"
     for secret in ("OPENAI_API_KEY", "GITHUB_TOKEN", "AWS_SECRET_ACCESS_KEY",
-                   "DATABASE_URL", "NODE_AUTH_TOKEN"):
+                   "DATABASE_URL", "NODE_AUTH_TOKEN",
+                   "PIP_INDEX_URL", "PIP_EXTRA_INDEX_URL"):
         assert secret not in env
     cfg = Config()
     cfg.env_passthrough = ("DATABASE_URL", "OPENAI_*")

@@ -138,3 +138,43 @@ def test_gui_settings_reexports_the_editor():
     assert S.add_profile is E.add_profile
     assert S.validate_text is E.validate_text
     assert S.upsert_profiles is E.upsert_profiles
+
+
+# --- multi-line string scanning ----------------------------------------------
+
+def test_triple_toggles_scans_characters_not_counts():
+    T = E._triple_toggles
+    # a comment or a single-line string may quote the delimiter freely
+    assert T('# see the """ docs', "") == ""
+    assert T("key = 'literal with \"\"\" inside'", "") == ""
+    assert T('key = "basic with \'\'\' inside"', "") == ""
+    # real multi-line strings still open and close
+    assert T('key = """open', "") == '"""'
+    assert T("still inside # not a comment", '"""') == '"""'
+    assert T('close""" # done', '"""') == ""
+    assert T("key = '''one'''", "") == ""
+    assert T("key = '''open", "") == "'''"
+    assert T("end''' and '''again'''", "'''") == ""
+    # an escaped quote does not close a multi-line basic string
+    assert T('escaped \\""" still open', '"""') == '"""'
+
+
+def test_comment_quoting_triple_delimiter_does_not_swallow_tables():
+    """A '#' comment mentioning `\"\"\"` used to flip the scanner into
+    'inside a multi-line string', hiding every later table header:
+    profile_names lost the profiles and set_values appended a duplicate
+    table that the loader then rejected."""
+    text = (
+        '# the old prompt used """ triple quotes\n'
+        "[profiles.one]\n"
+        'model = "a"\n'
+        "\n"
+        "[profiles.two]\n"
+        'model = "b"\n'
+    )
+    assert E.profile_names(text) == ["one", "two"]
+    out = E.set_values(text, {"model": "c"}, profile="two")
+    E.validate_text(out)
+    assert out.count("[profiles.two]") == 1
+    assert 'model = "c"' in out
+    assert 'model = "a"' in out

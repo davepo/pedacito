@@ -222,7 +222,7 @@ def _probe_root(root: str, timeout: float, headers=None):
             # once Lemonade (which also serves /api/v1) is ruled out.
             label = "LM Studio"
 
-    ids = [mid for m in entries if (mid := _model_id(m))]
+    ids = [mid for m in (entries or []) if (mid := _model_id(m))]
     return (label or "OpenAI-compatible", base_url or (root + "/v1"), ids)
 
 

@@ -26,6 +26,7 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 from . import diagnostics, events as events_mod, hooks as hooks_mod
+from . import fileio
 from . import safety, workspace
 from . import index as index_mod
 from . import instructions as instructions_mod
@@ -658,7 +659,9 @@ TASK_SCHEMA = {
 import copy as _copy
 PLAN_SCHEMA = _copy.deepcopy(TASK_SCHEMA)
 PLAN_SCHEMA["properties"]["tasks"]["items"]["properties"]["depends_on"] = {
-    "type": "array", "items": {"type": "integer"}}
+    "type": "array", "items": {"type": "integer"},
+    "description": "1-based numbers of EARLIER tasks this one depends on "
+                   "(task 1 is the first); omit when none"}
 
 PLAN_SYSTEM = """\
 You break a software goal into a small, ordered list of single-focus
@@ -724,7 +727,8 @@ Rules:
 
 def deps_from(raw, n: int) -> list[list[int]]:
     """Per-task `depends_on` lists (0-based indexes of EARLIER tasks), aligned
-    with `_titles_from(raw)`; [] entries where none were given."""
+    with `_titles_from(raw)`; [] entries where none were given. The plan's
+    `depends_on` values are 1-based task numbers, converted to indexes here."""
     entries = raw.get("tasks") if isinstance(raw, dict) else raw
     out: list[list[int]] = []
     for i, entry in enumerate(entries or []):
@@ -1211,10 +1215,9 @@ def _project_rel(root: Path, name: str) -> str:
 
 
 def _same_rel(a: str, b: str) -> bool:
-    a = str(a or "").replace("\\", "/").lstrip("./")
-    b = str(b or "").replace("\\", "/").lstrip("./")
-    return bool(a and b and (a == b or a.endswith("/" + b)
-                             or b.endswith("/" + a)))
+    ka, kb = fileio.path_key(a or ""), fileio.path_key(b or "")
+    return bool(ka and kb and (ka == kb or ka.endswith("/" + kb)
+                               or kb.endswith("/" + ka)))
 
 
 def _source_window(root: Path, rel: str, line: int,
@@ -1708,6 +1711,17 @@ _LESSON_FILE_RE = re.compile(
     r"[\w./\\-]+\.(?:py|js|mjs|cjs|jsx|ts|tsx|html|htm|css)\b")
 
 
+def _lesson_file(name: str) -> str:
+    """A lesson's file path: forward slashes and leading `./` segments removed,
+    case preserved (the ledger retires a lesson only when its file is gone, so
+    the name must still match the file on disk). `str.lstrip("./")` would strip
+    the leading dot of `.eslintrc.js` and lose the file."""
+    p = fileio.normalise_rel(name)
+    while p.startswith("./"):
+        p = p[2:]
+    return p
+
+
 def distill_repair_lesson(failure_text: str, check_label: str = ""):
     """Reduce one gate/test failure blob to (kind, one-line lesson, files),
     or None when no known pattern explains it. `check_label` is the gate
@@ -1717,7 +1731,7 @@ def distill_repair_lesson(failure_text: str, check_label: str = ""):
     text = str(failure_text or "")
     if not text.strip():
         return None
-    files = sorted({m.group(0).lstrip("./")
+    files = sorted({_lesson_file(m.group(0))
                     for m in _LESSON_FILE_RE.finditer(text)})[:6]
 
     def row(kind, msg):

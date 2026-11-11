@@ -38,7 +38,7 @@ import time
 from pathlib import Path
 
 from . import edits as edits_mod
-from .llm import LLMError, estimate_tokens
+from .llm import LLMError, _api_key, estimate_tokens
 
 CARD_VERSION = 2
 CARD_TTL_DAYS = 30
@@ -541,8 +541,10 @@ def _t_capabilities(client, cfg) -> dict:
     caps: dict = {"native_tools": None, "images": None, "embeddings": None}
     import requests
     base = cfg.base_url.rstrip("/")
-    headers = {"Authorization": f"Bearer {cfg.api_key}",
-               "Content-Type": "application/json"}
+    headers = {"Content-Type": "application/json"}
+    key = _api_key(cfg)          # api_key_env beats api_key, as everywhere else
+    if key:
+        headers["Authorization"] = f"Bearer {key}"
     try:
         r = requests.post(base + "/chat/completions", headers=headers, timeout=60,
                           json={"model": cfg.model, "max_tokens": 60,

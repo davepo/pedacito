@@ -1101,7 +1101,10 @@ def apply_edits(root: Path, edits: list[Edit], backup: bool = True,
             clears = [e for e in groups.get(old, []) if not e.replace.strip()]
             return bool(clears) and all(not e.search.strip() for e in clears)
 
-        # Pass 1: same-directory pairs first -- they are unambiguous.
+        # Pass 1: same-directory pairs first, ranked by name affinity. With a
+        # single candidate the pairing is unambiguous; with several, the
+        # alphabetical first is not necessarily the intended target, so score
+        # them exactly as pass 2 does instead of taking `min(cand)`.
         for old in rem_list:
             if not _source_is_real(old):
                 continue
@@ -1111,9 +1114,10 @@ def apply_edits(root: Path, edits: list[Edit], backup: bool = True,
                     and Path(n).parent == Path(old).parent
                     and not (_placeholder_target(n) and _explicit_wipe_only(old))]
             if cand:
-                new = min(cand)
-                renames[old] = new
-                used.add(new)
+                new = _pair(old, cand)
+                if new:
+                    renames[old] = new
+                    used.add(new)
         # Pass 2: remaining sources pair with remaining targets by score.
         for old in rem_list:
             if old in renames or not _source_is_real(old):

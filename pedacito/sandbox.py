@@ -81,6 +81,13 @@ def _bwrap_args(root: Path, network: bool, extra_rw: list[Path]) -> list[str]:
     args = ["bwrap", "--die-with-parent", "--new-session", "--unshare-pid",
             "--ro-bind", "/", "/", "--dev", "/dev", "--proc", "/proc",
             "--tmpfs", "/tmp"]
+    # The tmpfs hides any interpreter installed under /tmp (a venv, a
+    # standalone build): re-bind its prefixes read-only so it still starts.
+    tmp = Path("/tmp").resolve()
+    for prefix in dict.fromkeys((sys.prefix, sys.base_prefix)):
+        p = Path(prefix).resolve()
+        if p != tmp and _under(p, tmp):
+            args += ["--ro-bind", str(p), str(p)]
     if not network:
         args.append("--unshare-net")
     dirs, files = _existing_secrets(root)

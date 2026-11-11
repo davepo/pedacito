@@ -974,8 +974,10 @@ that gap with five mechanical checks:
   importing it, which is the shape an *incremental* loop produces, because
   each hunk adds its own import line without reading the ones already there.
   The gate enumerates the module's top-level bindings with the grammar and
-  reports any name bound twice (`function`/`var` pairs excepted, since
-  re-declaration is legal there).
+  reports any name bound twice. The one repeat an ES module allows is two
+  `var`s of one name; repeated `function`s and `var`/`function` mixes are the
+  same SyntaxError there (a classic script does allow them, last one wins,
+  and the gate keeps that distinction).
 - **A call to a name the module cannot reach.** ES modules see only what they
   declare or import, so a free identifier is a `ReferenceError` on the first
   line that runs it -- invisible to a parser, and the exact residue of a task

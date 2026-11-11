@@ -177,6 +177,32 @@ def test_scan_collapses_url_spellings_into_one_server_and_row(gui, fake_local):
     assert len(same) == 1 and same[0]["base_url"] == base
 
 
+def test_scan_reads_profiles_from_the_gui_config_not_the_cli_global(
+        gui, fake_local, monkeypatch, tmp_path):
+    """The scan's profile URLs come from the GUI's own config path. A stray
+    cli-level config global (the real user config on a dev machine, with its
+    remote servers) must not leak extra candidates into the probe list."""
+    from pedacito import cli as cli_mod
+    from pedacito import discovery
+    base = fake_local(MODELS)
+    _write(gui, DIRTY.replace("http://localhost:1234/v1", base))
+    stray = tmp_path / "stray-config.toml"
+    stray.write_text('[profiles.stray]\nbase_url = "http://stray.invalid/v1"\n'
+                     'model = "stray-model"\n', encoding="utf-8")
+    monkeypatch.setattr(cli_mod, "USER_CONFIG", stray)
+    seen = {}
+
+    def spy(*a, **k):
+        seen.update(k)
+        return []
+
+    monkeypatch.setattr(discovery, "discover_servers", spy)
+    status, j = gui.post("/api/models/scan", {"urls": [base], "vram_gb": 16})
+    assert status == 200 and j["ok"]
+    assert seen["urls"] == [base]
+    assert seen["profile_urls"] == [base]      # the stray server is not probed
+
+
 def test_scan_dedups_even_when_discovery_repeats_a_server(gui, fake_local,
                                                           monkeypatch):
     """Belt and braces at the display layer: if discovery ever hands the same

@@ -3609,8 +3609,10 @@ class Agent:
             # What this batch owed was the honesty of its own shape -- the
             # run that lost `MortarShell` to a rejected block reported the
             # other ten targets as if the feature were complete.
-            names = ", ".join(sorted({r.file for r in mixed if r.file})[:6])
-            extra = (f" (+{len(mixed)} more)" if len(mixed) > 6 else "")
+            failed_files = sorted({r.file for r in mixed if r.file})
+            names = ", ".join(failed_files[:6])
+            extra = (f" (+{len(failed_files) - 6} more)"
+                     if len(failed_files) > 6 else "")
             undo = (f" restore the pre-edit backup at {backup_dir}"
                     if backup_dir else " undo the applied targets by hand")
             self._emit("incremental_partial", applied=len(results_all)

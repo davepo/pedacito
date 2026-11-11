@@ -108,6 +108,17 @@ def test_ollama_is_fingerprinted(fake):
     assert found[0][1] == url + "/v1"
 
 
+def test_ollama_with_zero_models_is_still_a_server(fake):
+    """A fresh Ollama answers /api/tags with an empty model list. The probe
+    must report the server with no models, not crash iterating None."""
+    url = fake({
+        "/api/version": (200, {"version": "0.5.0"}),
+        "/api/tags": (200, {"models": []}),
+    })
+    found = discovery.discover_servers(urls=[url], ports=())
+    assert found == [("Ollama", url + "/v1", [])]
+
+
 def test_openai_shape_is_generic(fake):
     url = fake(_openai())
     found = discovery.discover_servers(urls=[url], ports=())

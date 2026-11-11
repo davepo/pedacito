@@ -50,6 +50,7 @@ import shutil
 import subprocess
 import sys
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 from datetime import datetime
@@ -4186,11 +4187,36 @@ def _web_page_to_text(html: str) -> tuple[str, str]:
         return "", ""
 
 
-def _web_open(url: str):
-    """One GET with our UA and a hard timeout. Attribute lookup at call time
-    so tests (and the sandbox story) can stand in for `urlopen`."""
-    req = urllib.request.Request(url, headers={"User-Agent": _WEB_USER_AGENT})
-    return urllib.request.urlopen(req, timeout=_WEB_TIMEOUT_SECONDS)
+class _NoAutoRedirect(urllib.request.HTTPRedirectHandler):
+    """Surface 3xx responses as HTTPError instead of following them blind."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+def _web_open(url: str, allowed_hosts=()):
+    """One GET with our UA and a hard timeout, following redirects by hand so
+    every hop passes the SSRF guard before it is requested. Attribute lookup
+    at call time so tests (and the sandbox story) can stand in for the opener."""
+    opener = urllib.request.build_opener(_NoAutoRedirect)
+    current = url
+    hops = 0
+    while True:
+        req = urllib.request.Request(current,
+                                     headers={"User-Agent": _WEB_USER_AGENT})
+        try:
+            return opener.open(req, timeout=_WEB_TIMEOUT_SECONDS)
+        except urllib.error.HTTPError as exc:
+            if exc.code not in (301, 302, 303, 307, 308) or hops >= 6:
+                raise
+            nxt = urllib.parse.urljoin(
+                current, (exc.headers.get("Location") or "").strip())
+            blocked = security.ssrf_error(nxt, allowed_hosts)
+            exc.close()
+            if blocked:
+                raise ValueError(f"redirect to a refused address: {blocked}")
+            current = nxt
+            hops += 1
 
 
 def _web_body(resp) -> str:
@@ -4233,9 +4259,10 @@ def fetch_url(cfg, url: str) -> str:
 
     Order: shape/SSRF validation first (a refused URL never even asks the
     user), then the permission broker when `enable_web` is off, then the
-    network. The redirect target is re-checked (SSRF via redirect is the
-    classic bypass). Page text is untrusted data: clipped to the read budget
-    and labeled so a prompt-injected page cannot masquerade as instructions.
+    network. Every redirect hop is re-checked before it is requested (SSRF
+    via redirect is the classic bypass). Page text is untrusted data: clipped
+    to the read budget and labeled so a prompt-injected page cannot
+    masquerade as instructions.
     """
     raw = str(url or "").strip().strip("`\"'")
     if not raw:
@@ -4248,7 +4275,7 @@ def fetch_url(cfg, url: str) -> str:
             and not _web_ask_broker(f"Fetch external URL: {raw}", raw):
         return WEB_DENIED_MESSAGE
     try:
-        resp = _web_open(raw)
+        resp = _web_open(raw, allowed_hosts)
     except Exception as exc:
         return f"ERROR: fetch_url could not reach {raw}: {exc}"
     try:
@@ -4258,6 +4285,9 @@ def fetch_url(cfg, url: str) -> str:
             final = str(resp.geturl() or raw)
         except Exception:
             pass
+        blocked = security.ssrf_error(final, allowed_hosts)
+        if blocked:
+            return (f"ERROR: {raw} redirected to a refused address: {blocked}")
         body = _web_body(resp)
     except Exception as exc:
         return f"ERROR: fetch_url failed reading {raw}: {exc}"
@@ -4268,9 +4298,6 @@ def fetch_url(cfg, url: str) -> str:
             pass
     if status >= 400:
         return f"ERROR: fetch_url got HTTP {status} for {final}."
-    blocked = security.ssrf_error(final, allowed_hosts)
-    if blocked:
-        return (f"ERROR: {raw} redirected to a refused address: {blocked}")
     parse_title, page_text = _web_page_to_text(body)
     if not page_text:
         page_text = "\n".join(
@@ -4337,8 +4364,10 @@ def web_search(cfg, query: str) -> str:
     if not getattr(cfg, "enable_web", False) \
             and not _web_ask_broker(f"Web search: {q}", q):
         return WEB_DENIED_MESSAGE
+    allowed_hosts = tuple(getattr(cfg, "fetch_allowed_hosts", ()) or ())
     try:
-        resp = _web_open(_WEB_SEARCH_ENGINE + urllib.parse.quote(q))
+        resp = _web_open(_WEB_SEARCH_ENGINE + urllib.parse.quote(q),
+                         allowed_hosts)
     except Exception as exc:
         return f"ERROR: web_search could not reach the search engine: {exc}"
     try:

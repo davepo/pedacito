@@ -130,3 +130,36 @@ def test_review_build_writer_returns_ok_tuple(tmp_path, monkeypatch):
     assert out == []
     ok, _detail = seen["res"]
     assert ok
+
+
+def test_empty_partial_selection_keeps_the_review_applicable():
+    """An apply with no files selected must be refused without touching the
+    staged diffs: truncating them first left the review permanently
+    un-approvable (every retry saw an empty selection)."""
+    from types import SimpleNamespace
+
+    from pedacito.gui import core
+
+    st = core.State()                       # no root: fully in-memory
+    writes = []
+
+    def writer():
+        writes.append(1)
+        return True, "ok"
+
+    diffs = [SimpleNamespace(rel="a.py", removed_source=False, after_text="x\n"),
+             SimpleNamespace(rel="b.py", removed_source=False, after_text="y\n"),
+             SimpleNamespace(rel="old.py", removed_source=True, after_text="")]
+    rv = core.Review(1, "task", diffs, writer, partial_ok=True)
+    st.review = rv
+
+    ok, detail = st.decide_review(1, "apply", [])
+    assert not ok
+    assert detail == "Select at least one file to accept."
+    assert [d.rel for d in rv.diffs] == ["a.py", "b.py", "old.py"]
+    assert rv.outcome == "" and writes == []
+
+    ok, detail = st.decide_review(1, "apply", ["a.py"])
+    assert ok and detail == "ok"
+    assert [d.rel for d in rv.diffs] == ["a.py", "old.py"]
+    assert rv.outcome == "applied" and writes == [1]

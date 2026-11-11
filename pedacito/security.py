@@ -44,6 +44,7 @@ from __future__ import annotations
 
 import fnmatch
 import ipaddress
+import socket
 import threading
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from urllib.parse import urlparse
@@ -229,10 +230,17 @@ def is_private_host(host: str) -> bool:
     if host in ("localhost", "localhost.localdomain") or host.endswith(
             (".local", ".localhost")):
         return True
+    host = host.partition("%")[0]      # an IPv6 zone id is not part of the IP
     try:
         ip = ipaddress.ip_address(host)
     except ValueError:
-        return False
+        # Legacy numeric spellings (`2130706433`, `127.1`, `0x7f000001`,
+        # `0177.0.0.1`) are not valid ipaddress input, but the OS resolver
+        # still turns them into 127.0.0.1 -- normalise before judging.
+        try:
+            ip = ipaddress.ip_address(socket.inet_ntoa(socket.inet_aton(host)))
+        except (OSError, ValueError):
+            return False
     return (ip.is_private or ip.is_loopback or ip.is_link_local
             or ip.is_reserved or ip.is_multicast or ip.is_unspecified)
 

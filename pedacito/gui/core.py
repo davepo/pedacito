@@ -1132,13 +1132,14 @@ class State:
             if rv.partial_ok and files is not None:
                 keep = set(files)
                 with self.lock:
-                    rv.diffs[:] = [d for d in rv.diffs
-                                   if d.removed_source or d.rel in keep]
+                    kept = [d for d in rv.diffs
+                            if d.removed_source or d.rel in keep]
+                    if not any(not d.removed_source for d in kept):
+                        return False, "Select at least one file to accept."
+                    rv.diffs[:] = kept
                     for d in rv.diffs:
                         if d.rel in rv.edits:
                             d.after_text = rv.edits[d.rel]
-                if not any(not d.removed_source for d in rv.diffs):
-                    return False, "Select at least one file to accept."
             elif rv.edits:
                 for d in rv.diffs:
                     if d.rel in rv.edits:

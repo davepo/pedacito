@@ -472,3 +472,18 @@ def test_rpc_out_rejects_unparseable_lines_to_stderr(capsys):
     out.close()
     out.write('{"kind":"late"}\n')             # closed: silent drop
     assert len(buf.getvalue().splitlines()) == 2
+
+
+def test_turn_id_resolves_every_documented_prefix():
+    """The docstring promises ``r11`` and ``req11`` both resolve. With ``r``
+    tried first, ``req11`` lost only its ``r`` and int('eq11') failed, so a
+    permission event could not name its turn."""
+    assert rpc._turn_id(11) == 11
+    assert rpc._turn_id("11") == 11
+    assert rpc._turn_id("r11") == 11
+    assert rpc._turn_id("req11") == 11
+    assert rpc._turn_id("turn11") == 11
+    assert rpc._turn_id("  req11  ") == 11
+    assert rpc._turn_id(True) is None
+    assert rpc._turn_id("req") is None
+    assert rpc._turn_id("nope") is None

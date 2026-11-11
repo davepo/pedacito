@@ -304,6 +304,30 @@ def test_call_mcp_tool_caps_at_max_read_tokens():
     assert len(out) < 20_000
 
 
+def test_call_mcp_tool_gives_the_cached_session_its_own_timeout():
+    """The session is cached at the 5s listing budget; a tool call must run
+    with its own timeout, not the listing's. A tool slower than the listing
+    budget used to time out, get dropped, and execute a second time."""
+    cfg = _named_cfg()
+    mcp.list_mcp_tools(cfg)
+    s = mcp._NAMED_SESSIONS["fake"]
+    assert s.timeout == int(mcp._NAMED_LIST_TIMEOUT)
+    out = mcp.call_mcp_tool(cfg, "fake", "echo", {"x": "hi"}, timeout=42)
+    assert out.startswith("echo:")
+    assert mcp._NAMED_SESSIONS["fake"] is s      # reused, not restarted
+    assert s.timeout == 42
+
+
+def test_close_all_clears_the_legacy_catalog_cache():
+    """close_all is the reset tests (and atexit) rely on; a cached legacy
+    catalog listing must not survive it."""
+    key = ("python x.py",)
+    mcp._CATALOG_CACHE[key] = [("x/t", "d", "{}")]
+    mcp._CATALOG_TIME[key] = 123.0
+    mcp.close_all()
+    assert not mcp._CATALOG_CACHE and not mcp._CATALOG_TIME
+
+
 # -------------------------------------------------------------- relevance
 def _descs():
     return [

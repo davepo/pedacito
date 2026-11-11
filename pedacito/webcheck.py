@@ -857,9 +857,9 @@ def _js_module_links(htmls, jss, scopes, texts, root):
     for rel, text in jss:
         if rel not in module_rels:
             continue
-        # 6: a name bound twice at module level. `var`/`function` may repeat;
-        # a lexical binding, a class or an import may not, and mixing the two
-        # is the same SyntaxError.
+        # 6: a name bound twice at module level. Only `var` may repeat; a
+        # function, a lexical binding, a class or an import may not, and any
+        # mix of the two is the same SyntaxError.
         seen: dict[str, tuple[int, str]] = {}
         code = _js_code(text)
         stmts = _js_no_comments(text)
@@ -934,8 +934,9 @@ def _report_duplicate(findings, seen, name, line, kind, rel) -> None:
     if prev is None:
         seen[name] = (line, kind)
         return
-    if kind in ("hoisted", "function") and prev[1] in ("hoisted", "function"):
-        return               # two `function f`s are one function
+    if kind == "hoisted" and prev[1] == "hoisted":
+        return               # two `var f`s are one binding; a module refuses
+                             # repeated functions and var/function mixes
     this = {"import": "imported again here", "lexical": "declared again here",
             "function": "defined again here", "hoisted": "defined again here"}
     that = {"import": f"imported at line {prev[0]}",

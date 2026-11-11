@@ -43,6 +43,7 @@ those exact lines from disk at its tail.
 from __future__ import annotations
 
 import ast
+import copy
 import difflib
 import re
 from dataclasses import dataclass, field
@@ -870,7 +871,7 @@ def _requirements_from_task(task: str, limit: int = 5) -> list[Requirement]:
         terms += re.findall(r"[\"'`]([^\"'`]{2,40})[\"'`]", p)
         if terms:
             reqs.append(Requirement(
-                p[:140], list(dict.fromkeys(terms))[:8],
+                _clip_clause(p), list(dict.fromkeys(terms))[:8],
                 _clause_kind(p, task_kind)))
     return reqs[:limit]
 
@@ -1192,6 +1193,11 @@ def check_coverage(task: str, reply: str, edits,
     supplied, its states are authoritative for what counts as addressed."""
     if tracker is None or tracker.task != task:
         tracker = RequirementTracker(task)
+    else:
+        # A dry-run or candidate-scoring pass must not advance the run's
+        # authoritative evidence: only an applied edit does that (the agent
+        # calls observe_edit itself once the blocks land).
+        tracker = copy.deepcopy(tracker)
     reqs = tracker.items
     if len(reqs) < 2:
         return []

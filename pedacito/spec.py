@@ -1232,8 +1232,9 @@ def _js_top_level_bindings(root_node) -> list[tuple[str, int, str]]:
 
     Only program children: a declaration inside a block or a class body is a
     different scope and cannot collide with anything here. `kind` is `import`,
-    `lexical` (const/let/class -- the ones that refuse a second binding) or
-    `hoisted` (var/function -- legal to repeat, but not next to a lexical)."""
+    `lexical` (const/let/class), `function` or `hoisted` (var). A classic
+    script lets `function` and `hoisted` repeat; an ES module only lets two
+    `hoisted` bindings of one name coexist."""
     out: list[tuple[str, int, str]] = []
 
     def declarator_names(node) -> list[str]:
@@ -1278,7 +1279,7 @@ def _js_top_level_bindings(root_node) -> list[tuple[str, int, str]]:
         elif k in ("function_declaration", "generator_function_declaration",
                    "class_declaration", "abstract_class_declaration"):
             add(_ts_text(child.child_by_field_name("name")), child,
-                "lexical" if "class" in k else "hoisted")
+                "lexical" if "class" in k else "function")
         elif k == "export_statement":
             decl = child.child_by_field_name("declaration")
             if decl is None:
@@ -1290,7 +1291,7 @@ def _js_top_level_bindings(root_node) -> list[tuple[str, int, str]]:
                     add(name, decl, kind)
             elif decl.type in ("function_declaration",
                                "generator_function_declaration"):
-                add(_ts_text(decl.child_by_field_name("name")), decl, "hoisted")
+                add(_ts_text(decl.child_by_field_name("name")), decl, "function")
             elif decl.type in ("class_declaration", "abstract_class_declaration"):
                 add(_ts_text(decl.child_by_field_name("name")), decl, "lexical")
     return out
@@ -1523,15 +1524,20 @@ def _js_module_link_errors(root: Path, cap: int = 40
         node = tree_for(rel)
         if node is None:
             continue                       # the syntax gate owns broken files
-        # 1. a module-level name bound twice: one SyntaxError, whole file dead
+        info = info_for(rel)
+        # 1. a module-level name bound twice: one SyntaxError, whole file dead.
+        # An ES module only lets `var` repeat; a classic script also allows
+        # repeated functions and var/function mixes (last one wins).
+        esm = bool(info and info["module"] and not info["opaque"])
+        repeatable = ("hoisted",) if esm else ("hoisted", "function")
         first: dict[str, tuple[int, str]] = {}
         for name, line, kind in _js_top_level_bindings(node):
             prev = first.get(name)
             if prev is None:
                 first[name] = (line, kind)
                 continue
-            if kind == "hoisted" and prev[1] == "hoisted":
-                continue                   # two `function f`s are one function
+            if kind in repeatable and prev[1] in repeatable:
+                continue                   # two `var f`s are one binding
             if prev[1] == "import":
                 where = f"imported at line {prev[0]}"
             elif prev[1] == "lexical":
@@ -1553,7 +1559,6 @@ def _js_module_link_errors(root: Path, cap: int = 40
             first[name] = (line, kind)     # report each name once
 
         # 2. calls to a name this module never binds
-        info = info_for(rel)
         if info is None:
             continue
         bound = _js_bound_names(node) | set(info["locals"])

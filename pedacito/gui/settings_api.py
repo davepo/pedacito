@@ -669,23 +669,27 @@ def scan_models(urls=(), vram_gb=0) -> dict:
     trailing `/v1`, a trailing slash), so every server is keyed by its
     normalized URL: one server probes once, and the returned list holds one
     row per (normalized server URL, model id) -- never a duplicate."""
-    from .. import cli as cli_mod
     from .. import discovery
     explicit = [str(u).strip() for u in (urls or ()) if str(u).strip()]
-    try:
-        profile_urls = cli_mod._profile_base_urls()
-    except Exception:
-        profile_urls = []
     try:
         vram = int(vram_gb or 0)
     except (TypeError, ValueError):
         vram = 0
-    found = discovery.discover_servers(timeout=2.0, urls=explicit,
-                                       profile_urls=profile_urls)
     try:
         flat, existing = settings.validate_text(_read_text(config_path("user")))
     except ConfigError:
         flat, existing = {}, {}
+    # Re-find servers on custom ports from the same config the import reads:
+    # one source of truth, not the CLI's own config global.
+    profile_urls = []
+    if flat.get("base_url"):
+        profile_urls.append(flat["base_url"])
+    for body in existing.values():
+        if body.get("base_url"):
+            profile_urls.append(body["base_url"])
+    profile_urls = list(dict.fromkeys(profile_urls))
+    found = discovery.discover_servers(timeout=2.0, urls=explicit,
+                                       profile_urls=profile_urls)
     imported = {(_norm_url(b.get("base_url", flat.get("base_url", ""))),
                  str(b.get("model") or "")) for b in existing.values()}
     taken = set(existing)

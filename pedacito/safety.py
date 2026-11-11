@@ -173,7 +173,7 @@ _ENV_ALLOW = (
 # allow them (`PIP_INDEX_URL` with a token in it, `NODE_AUTH_TOKEN`, ...).
 _ENV_SECRETISH = re.compile(
     r"(?i)(?:key|token|secret|passw|credential|auth|cookie|session|private|"
-    r"_pat$|^pat_)")
+    r"index_url|_pat$|^pat_)")
 
 
 def _env_match(name: str, patterns) -> bool:

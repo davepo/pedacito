@@ -140,7 +140,8 @@ def _manifest_facts(root: Path) -> tuple[list[str], list[str], list[str]]:
 
 def build_brief(index, cfg=None, max_tokens: int = 500) -> str:
     """The repo brief text ('' when the project is empty), within roughly
-    `max_tokens` (trimmed by dropping the layout lines last-first)."""
+    `max_tokens` (trimmed by dropping whole lines from the end: layout first,
+    then commands, entry points, stack notes)."""
     # Identity by content, not `id(index)`: a garbage-collected index can hand
     # its address to a new one, and a stale brief would leak across projects.
     key = (str(index.root), index.generation, tuple(index.files), max_tokens,

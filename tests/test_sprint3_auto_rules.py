@@ -313,3 +313,11 @@ def test_context_file_mode_gets_the_rule_tail_too(tmp_path):
     assert any("FILE CONTEXT src/api/users.py" in u for u in users)
     assert any("project rule from .pedacito/rules/auto_src_api.md" in u
                and "signature_contract" in u for u in users)
+
+
+def test_lesson_ledger_is_empty_without_a_project_root():
+    # A session with no project root (root=None) still renders the stable
+    # prefix; the ledger must answer "no lessons", not raise on Path(None).
+    assert memory.load_anti_patterns(None) == []
+    assert memory.render_anti_patterns(None) == ""
+    assert memory.render_anti_patterns(None, _cfg()) == ""

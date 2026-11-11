@@ -577,6 +577,8 @@ def load_anti_patterns(root, prune: bool = True) -> list[dict]:
     otherwise outlive the thing it warns about). Promoted lessons get the
     same retirement, symmetrically cleaning their auto rule files."""
     root = Path(root) if root else None
+    if root is None:
+        return []
     doc = _facts_doc(root)
     live, gone = [], []
     for a in doc["anti_patterns"]:
@@ -784,7 +786,7 @@ def record_tool_use(root, action: str, cfg=None) -> None:
 
 
 def tool_unused_tasks(root, action: str) -> int:
-    """Tasks since `action` was last used (0 when never used)."""
+    """Tasks since `action` was last used (all tasks so far when never used)."""
     doc = _tool_stats_doc(root)
     return max(0, doc["tasks"] - int(doc["last_task"].get(action, 0) or 0))
 

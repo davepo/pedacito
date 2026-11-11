@@ -577,6 +577,48 @@ def test_sandbox_really_blocks_writes_when_a_backend_works(tmp_path):
         outside.unlink(missing_ok=True)
 
 
+def test_sandbox_rebinds_an_interpreter_living_under_tmp(tmp_path, monkeypatch):
+    from pedacito import sandbox
+    prefix = f"/tmp/pdc-sbx-prefix-{os.getpid()}"
+    monkeypatch.setattr(sys, "prefix", prefix)
+    monkeypatch.setattr(sys, "base_prefix", prefix)
+    args = sandbox._bwrap_args(tmp_path, False, [])
+    i = args.index("--tmpfs")
+    assert args[i + 1] == "/tmp"
+    # the re-bind must come after the tmpfs, or the tmpfs hides it again
+    j = args.index("--ro-bind", i + 2)
+    assert args[j + 1] == args[j + 2] == prefix
+    # an interpreter outside /tmp needs no re-bind
+    monkeypatch.setattr(sys, "prefix", "/usr")
+    monkeypatch.setattr(sys, "base_prefix", "/usr")
+    assert prefix not in sandbox._bwrap_args(tmp_path, False, [])
+
+
+def test_sandbox_runs_an_interpreter_installed_under_tmp(tmp_path, monkeypatch):
+    import shutil
+    import subprocess as sp
+    import venv
+    from pedacito import sandbox
+    cfg = Config()
+    if sandbox.status(cfg)[0] != "active":
+        pytest.skip("no working sandbox backend on this machine")
+    if sandbox.backend_name() != "bwrap":
+        pytest.skip("the /tmp tmpfs is bwrap-specific")
+    venv_dir = Path("/tmp") / f"pdc-sbx-venv-{os.getpid()}"
+    venv.create(venv_dir, with_pip=False)
+    try:
+        python = venv_dir / "bin" / "python"
+        # commands run with pedacito's own interpreter: simulate pedacito
+        # itself installed in the /tmp venv
+        monkeypatch.setattr(sys, "prefix", str(venv_dir))
+        argv, _ = sandbox.wrap([str(python), "-c", "print('ok')"], cfg, tmp_path)
+        r = sp.run(argv, cwd=tmp_path, capture_output=True, timeout=60)
+        assert r.returncode == 0, r.stderr.decode("utf-8", "replace")
+        assert b"ok" in r.stdout
+    finally:
+        shutil.rmtree(venv_dir, ignore_errors=True)
+
+
 def test_atomic_edits_write_nothing_when_one_file_fails(tmp_path):
     reply = ("--- FILE: a.py\n<<<<<<< SEARCH\nX = 1\n=======\nX = 2\n>>>>>>> REPLACE\n"
              "--- FILE: b.py\n<<<<<<< SEARCH\nnot there\n=======\nY = 2\n>>>>>>> REPLACE\n")

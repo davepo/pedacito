@@ -246,6 +246,41 @@ def test_rename_pair_applies(tmp_path):
     assert 'print("hi")' in (tmp_path / "new_name.py").read_text()
 
 
+def test_rename_pairs_by_name_affinity_not_alphabet(tmp_path):
+    """With several same-directory candidates the alphabetical first is not
+    necessarily the intended target: x.py must move to b_x.py (name
+    affinity), not to a.py just because 'a' sorts first. Pass 1 used
+    min(cand), silently moving the real bytes into the wrong file."""
+    _write(tmp_path / "x.py", "print('real content')\n")
+    reply = (
+        "--- FILE: a.py\n"
+        "<<<<<<< SEARCH\n"
+        "=======\n"
+        "print('unrelated module')\n"
+        ">>>>>>> REPLACE\n\n"
+        "--- FILE: b_x.py\n"
+        "<<<<<<< SEARCH\n"
+        "=======\n"
+        "# moved from x.py\n"
+        ">>>>>>> REPLACE\n\n"
+        "--- FILE: x.py\n"
+        "<<<<<<< SEARCH\n"
+        "print('real content')\n"
+        "=======\n"
+        ">>>>>>> REPLACE\n"
+    )
+    blocks = edits.parse_edits(reply)
+    results = edits.apply_edits(tmp_path, blocks, backup=False, dry_run=True)
+    by_file = {r.file: r for r in results}
+    assert by_file["b_x.py"].renames_from == ("x.py",), \
+        "pass-1 pairing must rank by name affinity, not alphabetically"
+    results = edits.apply_edits(tmp_path, blocks, backup=False, dry_run=False)
+    assert all(r.ok for r in results), [r.message for r in results]
+    assert "real content" in (tmp_path / "b_x.py").read_text()
+    assert not (tmp_path / "x.py").exists()
+    assert "real content" not in (tmp_path / "a.py").read_text()
+
+
 def test_rename_with_opening_lines_search(tmp_path):
     """The answer prompt tells the model to quote only the FIRST few lines of
     the old file in the clearing block, never the whole file. That opening-

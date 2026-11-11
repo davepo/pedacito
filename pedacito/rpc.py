@@ -99,7 +99,7 @@ def _turn_id(value: Any) -> Optional[int]:
     if isinstance(value, int):
         return value
     s = str(value).strip()
-    for prefix in ("r", "req", "turn"):
+    for prefix in ("req", "turn", "r"):
         if s.startswith(prefix):
             s = s[len(prefix):]
             break

@@ -228,6 +228,46 @@ def test_fetch_is_opt_in_allowlisted_and_never_touches_private_hosts(tmp_path, m
     assert "redirected to evil.com" in webfetch.tool_fetch(idx, cfg, "https://docs.python.org/other")
 
 
+def test_fetch_checks_each_redirect_hop_before_requesting_it(tmp_path, monkeypatch):
+    idx = index_mod.Index(tmp_path, [])
+    cfg = Config()
+    cfg.allow_fetch = True
+    cfg.fetch_allowed_hosts = ("python.org",)
+    calls = []
+
+    def fake_get(url, **kw):
+        calls.append(url)
+        assert kw.get("allow_redirects") is False
+        page = _Page("", status=302)
+        page.headers["Location"] = "http://169.254.169.254/latest/meta-data/"
+        return page
+
+    monkeypatch.setattr(webfetch.requests, "get", fake_get)
+    out = webfetch.tool_fetch(idx, cfg, "https://docs.python.org/3/")
+    assert "redirected to 169.254.169.254" in out
+    assert calls == ["https://docs.python.org/3/"]   # private hop never ran
+
+    # an allowlisted hop chain is followed to the end
+    calls.clear()
+    chain = {"https://docs.python.org/3/": "https://www.python.org/doc",
+             "https://www.python.org/doc": None}
+
+    def chain_get(url, **kw):
+        calls.append(url)
+        nxt = chain[url]
+        if nxt is None:
+            return _Page("<p>docs</p>", url=url)
+        page = _Page("", status=302)
+        page.headers["Location"] = nxt
+        return page
+
+    monkeypatch.setattr(webfetch.requests, "get", chain_get)
+    out = webfetch.tool_fetch(idx, cfg, "https://docs.python.org/3/")
+    assert out.startswith("EXTERNAL CONTENT")
+    assert "docs" in out
+    assert calls == ["https://docs.python.org/3/", "https://www.python.org/doc"]
+
+
 # ------------------------------------------------------------------------ roles
 def test_roles_resolve_profiles_and_fall_back_to_the_worker(tmp_path, monkeypatch):
     class Fake:

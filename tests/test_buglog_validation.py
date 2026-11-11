@@ -79,14 +79,63 @@ def test_gate_flags_an_import_that_rebinds_a_local(tmp_path):
 
 
 def test_two_hoisted_functions_are_one_function(tmp_path):
-    """Re-declaring `function f` is legal (the last wins) -- the gate that
-    reports a SyntaxError here would be a false positive on working code."""
+    """In a CLASSIC SCRIPT re-declaring `function f` is legal (the last wins)
+    -- the gate that reports a SyntaxError here would be a false positive on
+    working code. (In an ES module the same pair is a SyntaxError; see the
+    module tests below.)"""
+    _w(tmp_path, "index.html",
+       '<!doctype html><script src="a.js"></script>')
+    _w(tmp_path, "a.js",
+       "function f() { return 1; }\nfunction f() { return 2; }\nf();\n")
+    assert spec.verify_frontend_contracts(tmp_path, None) == []
+
+
+def _no_node(monkeypatch):
+    """Hide node so the binding gate is exercised without `node --check`
+    (which would report the same SyntaxError first and mask the gate)."""
+    import shutil
+    real = shutil.which
+    monkeypatch.setattr(shutil, "which",
+                        lambda name, *a, **k: None if name == "node"
+                        else real(name, *a, **k))
+
+
+def test_module_refuses_two_functions_with_one_name(tmp_path, monkeypatch):
+    """An ES module may not re-declare `function f`: V8 raises SyntaxError and
+    the whole module graph dies. The binding gate must catch it even when
+    node is not installed."""
+    _no_node(monkeypatch)
     _w(tmp_path, "index.html",
        '<!doctype html><script type="module" src="a.js"></script>')
     _w(tmp_path, "a.js",
        "function f() { return 1; }\nfunction f() { return 2; }\n"
-       "export { f };\nf();\n")
+       "export { f };\n")
+    errs = spec.verify_frontend_contracts(tmp_path, None)
+    assert any("f" in e and "already" in e for e in errs), errs
+    found = webcheck.run(tmp_path)
+    assert any("'f'" in f.message and "already" in f.message for f in found), found
+
+
+def test_module_refuses_a_function_next_to_a_var(tmp_path, monkeypatch):
+    """`function f` + `var f` is legal in a script but a SyntaxError in a
+    module, in either order."""
+    _no_node(monkeypatch)
+    _w(tmp_path, "index.html",
+       '<!doctype html><script type="module" src="a.js"></script>')
+    _w(tmp_path, "a.js",
+       "var f = 1;\nfunction f() { return 2; }\nexport { f };\n")
+    errs = spec.verify_frontend_contracts(tmp_path, None)
+    assert any("f" in e and "already" in e for e in errs), errs
+
+
+def test_module_allows_two_vars_with_one_name(tmp_path, monkeypatch):
+    """`var f; var f;` is the one repeat an ES module allows -- no finding."""
+    _no_node(monkeypatch)
+    _w(tmp_path, "index.html",
+       '<!doctype html><script type="module" src="a.js"></script>')
+    _w(tmp_path, "a.js", "var f = 1;\nvar f = 2;\nexport { f };\n")
     assert spec.verify_frontend_contracts(tmp_path, None) == []
+    assert webcheck.run(tmp_path) == []
 
 
 # ---------------------------------- BUG-009/010/018: unreachable call -------
@@ -337,6 +386,20 @@ def test_clip_clause_survives_a_first_word_longer_than_the_limit():
     assert out == "x" * 140 + " ..."
 
 
+def test_requirement_ledger_uses_the_word_boundary_clip():
+    """The clip helper existed, but the ledger still cut with `p[:140]`, so a
+    plan step inherited a requirement title ending mid-word."""
+    clause = ("The restart button must map to the state machine's reset "
+              "transition and clear the score before the first frame draws "
+              "anything at all on the canvas")
+    reqs = verify.requirement_ledger(clause)
+    assert reqs, "the clause must survive splitting"
+    text = reqs[0][0]
+    assert text == verify._clip_clause(clause)
+    assert text.endswith(" ...")
+    assert " ".join(text[:-4].split()) in clause   # a real prefix, whole words
+
+
 # --------------------------------------------------- BUG-019: run_test scope --
 
 def test_run_test_refuses_a_standalone_script_with_guidance(tmp_path):
@@ -455,6 +518,37 @@ def test_partial_incremental_batch_says_what_is_on_disk(tmp_path):
     part = [e[1] for e in events if e[0] == "incremental_partial"][0]
     assert part["applied"] == 1 and part["failed"] == 1
     assert "ghost.py" in part["files"]
+
+
+def test_partial_batch_overflow_counts_files_not_blocks(tmp_path, capsys):
+    """The banner lists at most six failed FILES; the '(+N more)' overflow
+    must count the files it did not list, not the failed blocks. Eight ghost
+    targets in eight files used to print '(+8 more)' after six names."""
+    agent, cfg, idx = _files(tmp_path, {"a.py": "def f():\n    return 1\n"})
+    good = ("--- FILE: a.py SYMBOL f\n<<<<<<< SEARCH\n"
+            "def f():\n    return 1\n=======\n"
+            "def f():\n    return 2\n>>>>>>> REPLACE\n")
+    replies = [good]
+
+    class Scripted:
+        stats = {}
+        stream_truncated = False
+
+        def chat(self, *a, **k):
+            return replies.pop(0) if replies else ""
+
+    agent.client = Scripted()
+    intents = [{"file": "a.py", "symbol": "f", "intended_change": "x"}]
+    intents += [{"file": f"ghost{i}.py", "symbol": "gone",
+                 "intended_change": "y"} for i in range(8)]
+    results, _reply, _findings = agent.apply_edit_intents(
+        "task", "", intents, verbose=True)
+    assert sum(1 for r in results if r.ok) == 1
+    assert sum(1 for r in results if not r.ok) == 8
+    err = capsys.readouterr().err
+    assert "PARTIALLY APPLIED" in err
+    assert "(+2 more)" in err, err
+    assert "(+8 more)" not in err, err
 
 
 # ------------------------------------------------------------- BUG-017: why --

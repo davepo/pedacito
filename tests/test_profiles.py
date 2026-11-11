@@ -147,3 +147,44 @@ def test_profiles_cli_json(tmp_path, monkeypatch, capsys):
     payload = json.loads(capsys.readouterr().out)
     assert payload["profiles"][0]["name"] == "qwen"
     assert payload["profiles"][0]["fit"] == 0.82
+
+
+def test_capability_probe_authenticates_with_api_key_env(monkeypatch):
+    """The raw capability probes must authenticate like every other request:
+    api_key_env beats api_key. With only api_key_env set they used to send an
+    empty 'Bearer ', so a hosted model recorded native_tools/images as
+    unsupported. No key configured means no Authorization header at all."""
+    import requests
+    cfg = Config()
+    cfg.base_url = "http://localhost:11434/v1"
+    cfg.model = "m"
+    cfg.api_key = ""
+    cfg.api_key_env = "PDC_CAP_TEST_KEY"
+    monkeypatch.setenv("PDC_CAP_TEST_KEY", "secret-123")
+    seen = []
+
+    class Resp:
+        status_code = 200
+
+        def json(self):
+            return {"choices": [{"message": {"tool_calls": [{"id": "1"}]}}]}
+
+    def fake_post(url, headers=None, timeout=None, json=None):
+        seen.append(dict(headers or {}))
+        return Resp()
+
+    monkeypatch.setattr(requests, "post", fake_post)
+
+    class Client:
+        def embed(self, texts):
+            raise RuntimeError("no embeddings")
+
+    caps = modelcard._t_capabilities(Client(), cfg)
+    assert seen, "the probes never ran"
+    assert all(h.get("Authorization") == "Bearer secret-123" for h in seen)
+    assert caps["native_tools"] is True and caps["images"] is True
+
+    seen.clear()
+    cfg.api_key_env = ""
+    modelcard._t_capabilities(Client(), cfg)
+    assert seen and all("Authorization" not in h for h in seen)

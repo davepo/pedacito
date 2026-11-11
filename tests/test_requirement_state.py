@@ -80,6 +80,28 @@ def test_report_requirement_walks_located_read_reported():
     assert req.state == verify.REQ_REPORTED and req.final
 
 
+def test_coverage_dry_run_does_not_advance_the_live_tracker():
+    """check_coverage judges dry-applied drafts and scored candidates; it
+    must not promote the run's authoritative evidence. A rejected draft used
+    to mark its requirements EDITED, and the next coverage check then skipped
+    them as addressed. Only the agent's post-apply observe_edit advances the
+    live tracker."""
+    task = "Fix the retry logic in client.py and update README.md"
+    tracker = verify.RequirementTracker(task)
+    before = tracker.states()
+    reply = ("--- FILE: client.py\n<<<<<<< SEARCH\n"
+             "def retry_request():\n=======\n"
+             "def retry_request():  # fixed\n>>>>>>> REPLACE\n")
+    edits = verify.parse_edits(reply)
+    findings = verify.check_coverage(task, reply, edits, tracker=tracker)
+    assert tracker.states() == before, "a dry run advanced the live tracker"
+    # the judgement itself is unchanged: README is still unaddressed
+    assert any("README" in f.message for f in findings), findings
+    # and the tracker still advances when the edit really lands
+    tracker.observe_edit(edits)
+    assert tracker.items[0].state == verify.REQ_EDITED
+
+
 def test_oldest_unmet_requirement_selects_read_then_search():
     tracker = verify.RequirementTracker(
         "Fix the retry logic in client.py and update README.md")

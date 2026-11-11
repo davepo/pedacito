@@ -251,6 +251,8 @@ def close_all() -> None:
     _COOLDOWN.clear()
     _EXTRA_CACHE.clear()
     _EXTRA_TIME.clear()
+    _CATALOG_CACHE.clear()
+    _CATALOG_TIME.clear()
     # Named-server sessions and their tool listings.
     for name in list(_NAMED_SESSIONS):
         _drop_named_session(name)
@@ -799,16 +801,6 @@ class _HttpSession:
         pass
 
 
-def _named_session_key(name: str, spec: dict) -> str:
-    """Identity of a server definition: changing command/args/url restarts the
-    cached session instead of reusing a stale one."""
-    return json.dumps([name, spec.get("command", ""), spec.get("args", []),
-                       spec.get("url", ""),
-                       sorted((str(k), str(v))
-                               for k, v in (spec.get("env") or {}).items())],
-                      sort_keys=True)
-
-
 def _named_session(name: str, spec: dict, timeout: int):
     """The cached initialised session for one named server (stdio process or
     HTTP endpoint), restarted when the cached process has exited."""
@@ -818,6 +810,9 @@ def _named_session(name: str, spec: dict, timeout: int):
             s.close()
             _NAMED_SESSIONS.pop(name, None)
         else:
+            # The cached session was built for the 5s listing budget; a tool
+            # call gets its own (larger) timeout, not the listing's.
+            s.timeout = max(1, timeout)
             return s
     if spec.get("url"):
         s = _HttpSession(spec["url"], timeout, spec.get("env"))

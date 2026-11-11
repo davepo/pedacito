@@ -108,7 +108,7 @@ def start(root, command, *, name: str = "", cfg=None,
     registry record.
 
     The record is written even when the command exits immediately; `status`
-    then reads `exited`. A name already used by a live process is suffixed.
+    then reads `exited`. A name already used by an existing record is suffixed.
     """
     root = Path(root).resolve()
     if isinstance(command, (list, tuple)):

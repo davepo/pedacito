@@ -85,13 +85,45 @@ def table_name(*parts: str) -> str:
 
 
 def _triple_toggles(line: str, state: str) -> str:
-    """Track whether a line leaves us inside a multi-line string."""
-    for q in ('"""', "'''"):
-        count = line.count(q)
-        if state == q and count % 2 == 1:
-            state = ""
-        elif not state and count % 2 == 1:
-            state = q
+    """Track whether a line leaves us inside a multi-line string.
+
+    A character scan, not a count: a '#' comment or a single-line string can
+    quote the triple delimiter without opening anything, and counting those
+    occurrences swallowed every later table header as 'inside a string'."""
+    i, n = 0, len(line)
+    while i < n:
+        if state:
+            if state == '"""' and line[i] == "\\":
+                i += 2
+                continue
+            if line.startswith(state, i):
+                state = ""
+                i += 3
+                continue
+            i += 1
+            continue
+        ch = line[i]
+        if ch == "#":
+            break
+        if line.startswith(('"""', "'''"), i):
+            q = line[i:i + 3]
+            end = line.find(q, i + 3)
+            if end == -1:
+                return q
+            i = end + 3
+            continue
+        if ch in "\"'":
+            i += 1
+            while i < n:
+                if ch == '"' and line[i] == "\\":
+                    i += 2
+                    continue
+                if line[i] == ch:
+                    i += 1
+                    break
+                i += 1
+            continue
+        i += 1
     return state
 
 

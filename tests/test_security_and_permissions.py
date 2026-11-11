@@ -12,6 +12,7 @@ import socket
 import sys
 import threading
 import time
+import urllib.error
 import urllib.request
 from pathlib import Path
 from typing import ClassVar
@@ -550,14 +551,14 @@ class _FakeResp:
 
 
 def _serve(monkeypatch, resp_factory):
-    """Patch urllib.request.urlopen; records (url, timeout, user_agent)."""
+    """Patch the opener tools._web_open uses; records (url, timeout, user_agent)."""
     seen = []
 
-    def fake_urlopen(req, timeout=None, **kw):
+    def fake_open(self, req, timeout=None, **kw):
         seen.append((req.full_url, timeout, req.get_header("User-agent")))
         return resp_factory(req.full_url)
 
-    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(urllib.request.OpenerDirector, "open", fake_open)
     return seen
 
 
@@ -728,6 +729,58 @@ def test_fetch_url_ssrf_refused_before_any_prompt(bare_broker, monkeypatch):
     cfg.fetch_allowed_hosts = ("localhost",)
     out = tools.fetch_url(cfg, "http://localhost:8000/devdocs")
     assert "EXTERNAL CONTENT" in out
+
+
+def test_fetch_url_validates_every_redirect_hop_before_requesting_it(
+        bare_broker, monkeypatch):
+    st = bare_broker
+    cfg = Config()
+    cfg.enable_web = True
+    with st.lock:
+        st.cfg = cfg
+    seen = []
+
+    def fake_open(self, req, timeout=None, **kw):
+        seen.append(req.full_url)
+        if req.full_url.endswith("/start"):
+            raise urllib.error.HTTPError(
+                req.full_url, 302, "Found",
+                {"Location": "http://169.254.169.254/latest/meta-data/"}, None)
+        if req.full_url.endswith("/hop"):
+            raise urllib.error.HTTPError(
+                req.full_url, 302, "Found", {"Location": "/final"}, None)
+        return _FakeResp("<p>landed</p>", req.full_url)
+
+    monkeypatch.setattr(urllib.request.OpenerDirector, "open", fake_open)
+    out = tools.fetch_url(cfg, "https://example.com/start")
+    assert out.startswith("ERROR:")
+    assert "refused address" in out
+    assert seen == ["https://example.com/start"]   # the metadata hop never ran
+    # an allowed hop (relative Location included) is followed to the end
+    out = tools.fetch_url(cfg, "https://example.com/hop")
+    assert "EXTERNAL CONTENT from https://example.com/final" in out
+    assert seen[-2:] == ["https://example.com/hop", "https://example.com/final"]
+
+
+def test_ssrf_guard_sees_legacy_numeric_loopback_spellings():
+    """The OS resolver maps `2130706433`, `127.1`, `0x7f000001` and
+    `0177.0.0.1` to 127.0.0.1, but `ipaddress.ip_address` rejects them, so the
+    old guard waved them through. Every spelling that resolves to loopback /
+    metadata / LAN must be refused, and a public address must still pass."""
+    for host in ("2130706433", "127.1", "0x7f000001", "0177.0.0.1",
+                 "127.0.1", "0", "0x7f.1",
+                 "2130706433", "0251.0376.0251.0376"):   # 169.254.169.254
+        assert security.is_private_host(host), host
+        assert security.ssrf_error(f"http://{host}/x"), host
+    # an IPv6 zone id is not part of the address
+    assert security.is_private_host("fe80::1%eth0")
+    # public addresses stay fetchable
+    assert not security.is_private_host("8.8.8.8")
+    assert not security.is_private_host("example.com")
+    assert security.ssrf_error("https://example.com/x") == ""
+    # the fetch tool shares the one guard
+    assert webfetch._is_private("127.1")
+    assert not webfetch._is_private("8.8.8.8")
 
 
 def test_fetch_url_clips_to_max_read_tokens(bare_broker, monkeypatch):
