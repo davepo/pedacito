@@ -77,6 +77,30 @@ def test_investigation_tasks_are_recognised():
         "Run the build and update the changelog")
 
 
+def test_hyphenated_compound_nouns_do_not_make_a_title_an_edit_task():
+    """`\\b` treats a hyphen as a word boundary, so "add-on",
+    "create-react-app", "wire-frame" and "patch-notes" used to read as edit
+    verbs: a verification title built around one went down the edit path,
+    where no evidence gate runs and a zero-edit "already correct" ticks it
+    done. A LEADING hyphen keeps its edit meaning -- "re-add the guard"
+    really does ask for a change."""
+    assert loop._is_investigation_task(
+        "Verify the add-on panel renders in the browser")
+    assert loop._is_investigation_task(
+        "Check the create-react-app scaffold starts")
+    assert loop._is_investigation_task("Confirm the wire-frame matches")
+    assert loop._is_investigation_task("Investigate the change-over animation")
+    assert loop._is_investigation_task("Verify the patch-notes screen loads")
+    assert not loop._is_investigation_task(
+        "Investigate the crash and re-add the null check")
+    assert not loop._is_investigation_task(
+        "Reproduce the hang, then re-write the poller")
+    assert not loop._is_investigation_task("Run the build and update the docs")
+    assert loop._EDIT_WORDS_RE.findall("verify the add-on loads") == []
+    assert loop._EDIT_WORDS_RE.findall("re-add the guard") == ["add"]
+    assert loop._EDIT_WORDS_RE.findall("fix the crash") == ["fix"]
+
+
 def test_verification_tasks_are_recognised():
     assert loop._is_verification_task(
         "Run the game and verify the snake renders taller")
@@ -358,6 +382,66 @@ def test_live_evidence_gate_is_objective():
     assert loop._used_live_evidence(["3. run pytest -q  (Tests.)"])
     assert not loop._used_live_evidence(
         ["1. read main.py L1-10  (Need to know how to run the game.)"])
+
+
+def test_a_run_that_only_started_the_process_is_not_visual_evidence():
+    """Any successful `run` used to flip live_evidence_ok, so `run npm start`
+    satisfied a gate asking what the PAGE shows: the server came up, nobody
+    opened it, and the check was ticked done. Titles that ask about the
+    rendered artifact now need a browser/screenshot observation; titles that
+    only ask the app to run do not."""
+    assert loop._needs_visual_evidence(
+        "Start the server and verify the page shows the score")
+    assert loop._needs_visual_evidence(
+        "Run the app and verify the canvas is 480x360")
+    assert loop._needs_visual_evidence(
+        "Launch the game and confirm the layout in the browser")
+    assert not loop._needs_visual_evidence(
+        "Run the game and verify the snake is twice as tall")
+    assert not loop._needs_visual_evidence(
+        "Run the tests and confirm they all pass")
+
+    title = "Start the server and verify the page shows the score"
+    launched = loop.TaskResult(
+        [], "The page shows the score.", True, [], None,
+        steps=["1. run npm start  (Bring the server up.)"],
+        live_ok=True, live_kinds=("run",))
+    assert "never OBSERVED the app" in loop._evidence_failure(title, launched)
+    # The gap is procedural: the check was never performed, so it re-runs
+    # instead of sending a repair task after a product nobody measured.
+    assert loop._evidence_miss_is_procedural(title, launched)
+    opened = loop.TaskResult(
+        [], "The page shows the score: 12 points, canvas 480x360.", True, [],
+        None,
+        steps=["1. run npm start  (Bring the server up.)",
+               "2. browser http://127.0.0.1:8000/  (Look at the page.)"],
+        live_ok=True, live_kinds=("run", "browser"))
+    assert loop._evidence_failure(title, opened) == ""
+    assert not loop._evidence_miss_is_procedural(title, opened)
+    # A desktop window counts as an observation too.
+    shot = loop.TaskResult(
+        [], "The window shows the score: 12 points.", True, [], None,
+        steps=["1. screenshot python main.py  (Look at the window.)"],
+        live_ok=True, live_kinds=("screenshot",))
+    assert loop._evidence_failure(title, shot) == ""
+
+
+def test_visual_evidence_falls_back_to_the_steps_log():
+    """Callers and tests predating `live_kinds` still get the gate: the steps
+    log names the action that produced the observation."""
+    title = "Run the game and verify the canvas is 480x360"
+    shot = loop.TaskResult(
+        [], "The canvas is 480x360.", True, [], None,
+        steps=["1. run python main.py  (Start.)",
+               "2. screenshot python main.py  (Look.)"], live_ok=True)
+    assert shot.live_kinds is None
+    assert loop._observed_the_app(shot)
+    assert loop._evidence_failure(title, shot) == ""
+    launched = loop.TaskResult(
+        [], "The canvas is 480x360.", True, [], None,
+        steps=["1. run python main.py  (Start.)"], live_ok=True)
+    assert not loop._observed_the_app(launched)
+    assert "never OBSERVED the app" in loop._evidence_failure(title, launched)
 
 
 def test_plan_system_requires_live_checkpoints():
@@ -1716,6 +1800,144 @@ def test_run_loop_treats_noop_reply_as_done(tmp_path, monkeypatch):
     text = plan.read_text()
     assert "- [x] already done" in text
     assert "- [x] real work" in text
+
+
+def test_run_loop_does_not_tick_a_verification_task_done_on_a_noop_reply(
+        tmp_path, monkeypatch):
+    """The edit path's zero-edit branch marked the task done on `_is_noop`
+    BEFORE any gate ran, so "Update the palette and verify in the browser"
+    could be closed by prose alone ("No changes are needed; it is already
+    correct") -- while the same title WITH an edit applied went through
+    `_evidence_failure` and could fail. A no-op reply is still a claim about
+    live behavior, so it goes through the same gate: procedural gaps re-run
+    the check once and then retire it, never a silent tick."""
+    plan = tmp_path / "PLAN.md"
+    title = "Update the palette and verify in the browser"
+    loop.write_plan(plan, "", [title])
+    idx = types.SimpleNamespace(root=tmp_path)
+    calls = []
+    NOOP = "No changes are needed; the palette is already correct."
+
+    def fake_run_task(root, cfg, client, agent, idx_, task, apply=True,
+                      review=False, answer_system=None):
+        calls.append(task)
+        return loop.TaskResult([], NOOP, True, [], idx_)
+
+    monkeypatch.setattr(loop, "run_task", fake_run_task)
+    assert loop._is_noop(NOOP)                 # the phrase that used to win
+    assert not loop._is_investigation_task(title)
+    code = loop.run_loop(tmp_path, _cfg(), None, idx, plan, apply=True,
+                         stop_on_fail=False)
+    assert code == 1
+    assert len(calls) == 2               # one procedural re-run, then a verdict
+    assert "NEVER RAN THE CHECK" in calls[1]
+    text = plan.read_text()
+    assert f"- [x] {title}" not in text
+    assert "- [!] Update the palette" in text
+    from pedacito import workspace
+    assert "no-op verification rejected" not in workspace.run_log_path(
+        tmp_path).read_text()      # retired as procedural, not as a product bug
+
+
+def test_run_loop_fails_a_noop_verification_that_admits_it_could_not_check(
+        tmp_path, monkeypatch):
+    """The gap is not always procedural: a reply that DID open the page and
+    then admits it could not confirm the claim is a real evidence failure, and
+    a zero-edit "already correct" must not close the task on it."""
+    plan = tmp_path / "PLAN.md"
+    title = "Update the palette and verify in the browser"
+    loop.write_plan(plan, "", [title])
+    idx = types.SimpleNamespace(root=tmp_path)
+    REPLY = ("No changes are needed: the palette is already correct, though "
+             "I could not verify the score bar colour in the time available.")
+
+    def fake_run_task(root, cfg, client, agent, idx_, task, apply=True,
+                      review=False, answer_system=None):
+        return loop.TaskResult(
+            [], REPLY, True, [], idx_,
+            steps=["1. browser http://127.0.0.1:8000/  (Look at the page.)"],
+            live_ok=True, live_kinds=("browser",))
+
+    monkeypatch.setattr(loop, "run_task", fake_run_task)
+    assert loop._is_noop(REPLY)
+    code = loop.run_loop(tmp_path, _cfg(), None, idx, plan, apply=True,
+                         stop_on_fail=False, repair_rounds=0)
+    assert code == 1
+    assert "- [!] Update the palette" in plan.read_text()
+    from pedacito import workspace
+    assert "no-op verification rejected" in workspace.run_log_path(
+        tmp_path).read_text()
+
+
+def test_run_loop_ticks_a_noop_verification_task_that_did_observe(
+        tmp_path, monkeypatch):
+    """The gate is about evidence, not about edits: a zero-edit reply that
+    really opened the page and quotes what it saw still closes the task, so
+    the fix above cannot strand an honest "already correct"."""
+    plan = tmp_path / "PLAN.md"
+    title = "Update the palette and verify in the browser"
+    loop.write_plan(plan, "", [title])
+    idx = types.SimpleNamespace(root=tmp_path)
+
+    def fake_run_task(root, cfg, client, agent, idx_, task, apply=True,
+                      review=False, answer_system=None):
+        return loop.TaskResult(
+            [], "No changes are needed: the palette is already correct -- the "
+                "browser shows #ff8800 on the score bar.", True, [], idx_,
+            steps=["1. browser http://127.0.0.1:8000/  (Look at the page.)"],
+            live_ok=True, live_kinds=("browser",))
+
+    monkeypatch.setattr(loop, "run_task", fake_run_task)
+    code = loop.run_loop(tmp_path, _cfg(), None, idx, plan, apply=True)
+    assert code == 0
+    assert f"- [x] {title}" in plan.read_text()
+
+
+def test_plan_exhausted_with_failures_is_not_reported_as_complete(
+        tmp_path, monkeypatch, capsys):
+    """With --keep-going a failed task is marked [!] and is no longer
+    "unchecked", so the loop eventually finds nothing left to do -- and used
+    to print "All tasks complete." over a plan that had failures in it."""
+    plan = tmp_path / "PLAN.md"
+    loop.write_plan(plan, "", ["doomed", "next"])
+    idx = types.SimpleNamespace(root=tmp_path)
+
+    def fake_run_task(root, cfg, client, agent, idx_, task, apply=True,
+                      review=False, answer_system=None):
+        if task.startswith("doomed"):
+            return loop.TaskResult([], "I gave up.", False, [], idx_)
+        return _result(idx_)
+
+    monkeypatch.setattr(loop, "run_task", fake_run_task)
+    code = loop.run_loop(tmp_path, _cfg(), None, idx, plan, apply=True,
+                         stop_on_fail=False)
+    err = capsys.readouterr().err
+    assert code == 1
+    assert "All tasks complete" not in err
+    assert "Plan exhausted" in err and "FAILED" in err
+    assert "- [x] next" in plan.read_text()
+    from pedacito import workspace
+    assert "plan exhausted with 1 failed task(s)" in workspace.run_log_path(
+        tmp_path).read_text()
+
+
+def test_all_tasks_complete_is_still_logged_for_a_clean_finish(
+        tmp_path, monkeypatch, capsys):
+    plan = tmp_path / "PLAN.md"
+    loop.write_plan(plan, "", ["a", "b"])
+    idx = types.SimpleNamespace(root=tmp_path)
+
+    def fake_run_task(root, cfg, client, agent, idx_, task, apply=True,
+                      review=False, answer_system=None):
+        return _result(idx_)
+
+    monkeypatch.setattr(loop, "run_task", fake_run_task)
+    assert loop.run_loop(tmp_path, _cfg(), None, idx, plan, apply=True) == 0
+    err = capsys.readouterr().err
+    assert "All tasks complete" in err
+    assert "Plan exhausted" not in err
+    from pedacito import workspace
+    assert "all tasks complete" in workspace.run_log_path(tmp_path).read_text()
 
 
 def test_run_loop_retries_a_fabricated_noop_task_instead_of_ticking_it(

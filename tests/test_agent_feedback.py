@@ -246,6 +246,7 @@ def test_gather_tracks_only_successful_live_steps(tmp_path, monkeypatch):
     agent = _agent(tmp_path, Scripted())
     agent.gather("run the game and verify it", verbose=False)
     assert agent.live_evidence_ok is False
+    assert agent.live_evidence_kinds == set()
     assert agent.steps_log                 # attempted step is still logged
 
     class ScriptedOk(Scripted):
@@ -262,6 +263,54 @@ def test_gather_tracks_only_successful_live_steps(tmp_path, monkeypatch):
     agent = _agent(tmp_path, ScriptedOk())
     agent.gather("run the game and verify it", verbose=False)
     assert agent.live_evidence_ok is True
+    assert agent.live_evidence_kinds == {"browser"}
+
+
+def test_gather_records_which_kind_of_live_step_succeeded(tmp_path,
+                                                          monkeypatch):
+    """The outer loop's gate asks two different questions: did the check drive
+    the app at all, and did anything OBSERVE it. A `run` that started the
+    server answers only the first, so the agent records which actions produced
+    the observation, not just that one did."""
+    import pedacito.agent as agent_mod
+
+    class Scripted:
+        step_truncated = False
+
+        def __init__(self, actions):
+            self.n = 0
+            self.actions = actions
+
+        def chat_json(self, messages, schema, max_tokens, **kw):
+            if self.n < len(self.actions):
+                action, arg = self.actions[self.n]
+                self.n += 1
+                return {"action": action, "command": arg,
+                        "reasoning": "drive it"}
+            return {"action": "done", "reasoning": "finished"}
+
+    def dispatch(index, cfg, step, client=None):
+        action = step.get("action")
+        if action == "screenshot":
+            return "ERROR: no display available"
+        return f"{action.upper()}: ok"
+
+    monkeypatch.setattr(agent_mod, "dispatch", dispatch)
+    agent = _agent(tmp_path, Scripted(
+        [("run", "npm start"), ("browser", "http://127.0.0.1:9/"),
+         ("screenshot", "")]))
+    agent.gather("run the app and verify the page", verbose=False)
+    assert agent.live_evidence_ok is True
+    assert agent.live_evidence_kinds == {"run", "browser"}
+    from pedacito import loop
+    kinds = loop._live_kinds_of(agent)
+    assert kinds == ("browser", "run")
+    tr = loop.TaskResult([], "The page shows the score.", True, [], None,
+                         steps=agent.steps_log, live_ok=True,
+                         live_kinds=kinds)
+    assert loop._observed_the_app(tr)
+    assert loop._evidence_failure(
+        "Run the app and verify the page shows the score", tr) == ""
 
 
 def test_gather_arms_allowlist_ledgers_and_digests_reads(tmp_path):

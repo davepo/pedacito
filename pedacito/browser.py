@@ -266,8 +266,9 @@ def run(url: str, *, actions: str = "", wait: float = 3.0, out=None,
         timeout: int = 20, headless: bool = True) -> tuple[bool, dict | str]:
     """Open `url`, perform `actions`, wait, and capture a screenshot.
 
-    Returns (True, info) where info has url/title/text/console/canvas/method
-    on success, or (False, error_text). The caller formats the observation.
+    Returns (True, info) where info has url/title/text/console/
+    network_errors/canvas/method on success, or (False, error_text). The
+    caller formats the observation.
     """
     url = normalise_url(url)
     out = Path(out) if out is not None else None
@@ -393,6 +394,7 @@ def _run_playwright(url: str, *, actions: str, wait: float, out,
         return False, install_hint()
 
     console: list[str] = []
+    net_errors: list[str] = []
     action_log: list[str] = []
     action_errors: list[str] = []
     try:
@@ -407,9 +409,37 @@ def _run_playwright(url: str, *, actions: str, wait: float, out,
                     if msg.type in ("error", "warning"):
                         console.append(f"{msg.type}: {msg.text}"[:240])
 
+                def on_response(resp):
+                    # A 404/500 on a script, stylesheet or image is exactly
+                    # what a browser capture exists to catch: the page still
+                    # "loads", the console may stay quiet, and the missing
+                    # asset only shows up as a feature that never appeared.
+                    try:
+                        if resp.status >= 400:
+                            net_errors.append(
+                                f"{resp.status} {resp.request.method} "
+                                f"{resp.url}"[:240])
+                    except Exception:
+                        pass
+
+                def on_request_failed(req):
+                    # net::ERR_* -- refused, aborted, name not resolved,
+                    # blocked by an extension or a CSP: no response at all.
+                    try:
+                        why = getattr(req, "failure", "") or ""
+                        kind = getattr(req, "resource_type", "") or ""
+                        line = (f"FAILED {req.method} {req.url}"
+                                + (f" [{kind}]" if kind else "")
+                                + (f" -- {why}" if why else ""))
+                        net_errors.append(line[:240])
+                    except Exception:
+                        pass
+
                 page.on("console", on_console)
                 page.on("pageerror",
                         lambda exc: console.append(f"pageerror: {exc}"[:240]))
+                page.on("response", on_response)
+                page.on("requestfailed", on_request_failed)
                 page.goto(url, wait_until="domcontentloaded",
                           timeout=max(1, timeout) * 1000)
 
@@ -472,6 +502,9 @@ def _run_playwright(url: str, *, actions: str, wait: float, out,
                     "text": _page_text(page),
                     "canvas": _canvas_info(page),
                     "console": console[-10:],
+                    # Requests that failed outright or answered >= 400,
+                    # deduped (a missing asset is often requested per frame).
+                    "network_errors": list(dict.fromkeys(net_errors))[:10],
                     "actions": action_log,
                     "action_errors": action_errors,
                 }
@@ -515,6 +548,7 @@ def _run_chrome(exe: str, url: str, *, wait: float, out,
                 "text": "",
                 "canvas": "",
                 "console": [],
+                "network_errors": [],
                 "actions": [],
                 "action_errors": [],
             }

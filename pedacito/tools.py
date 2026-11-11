@@ -3854,7 +3854,8 @@ def tool_browser(index, cfg, client, command: str = "", pattern: str = "",
     instant press is invisible to fixed-timestep game loops), `eval`
     consumes the rest of the pattern and its result is clipped at 2,000
     chars. `start` is the wait before capture. Reports the page's text,
-    canvas sizes, console errors and an optional vision description.
+    canvas sizes, console errors, failed network requests (a 404 asset, a
+    refused load) and an optional vision description.
 
     Gated by `allow_browser`; launching a command also needs `allow_shell`.
     """
@@ -3980,6 +3981,10 @@ def tool_browser(index, cfg, client, command: str = "", pattern: str = "",
     if info.get("console"):
         bits.append("CONSOLE:\n" + "\n".join(
             f"- {e}" for e in info["console"][-8:]))
+    if info.get("network_errors"):
+        bits.append("NETWORK ERRORS (requests that failed or answered "
+                    ">= 400 -- a missing asset, a dead API route):\n"
+                    + "\n".join(f"- {e}" for e in info["network_errors"]))
     if prev is not None:
         bits.append("COMPARED WITH: " + _rel_or_abs(root, prev))
     bits.append("ANALYSIS:\n" + report)

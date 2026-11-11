@@ -286,14 +286,25 @@ _EVIDENCE_WORDS = re.compile(
 
 def _evidence_hint(task: str) -> str:
     """A task-text addendum for live-evidence tasks; empty for code tasks."""
-    if not _EVIDENCE_WORDS.search((task or "").lower()):
+    low = (task or "").lower()
+    if not _EVIDENCE_WORDS.search(low):
         return ""
-    return ("\n\nEVIDENCE: this task is about live behavior. The `run`, "
+    hint = ("\n\nEVIDENCE: this task is about live behavior. The `run`, "
             "`screenshot`, and `browser` tools exist ONLY in the lookup "
             "phase; the final answer phase has no tools. Launch the app and "
             "capture the evidence while gathering, before you answer -- a "
             "verification postponed to the answer phase cannot happen, and "
             "reporting the task done without that evidence fails it.")
+    if _VISUAL_TITLE.search(low):
+        # The gate below demands an OBSERVATION for these titles, so say so
+        # up front: models otherwise start the server with `run`, see it come
+        # up, and report the page verified.
+        hint += (" This title asks what the page/canvas SHOWED, so a `run` "
+                 "that only starts the process is not the evidence: open the "
+                 "URL with `browser` (or `screenshot` a desktop window) and "
+                 "quote what it returned -- page text, canvas size, console "
+                 "or network errors.")
+    return hint
 
 
 # A steps_log entry looks like "4. browser python main.py [wait 3]  (reason)".
@@ -322,13 +333,60 @@ def _used_live_evidence(steps) -> bool:
     return any(_LIVE_STEP.match(s or "") for s in (steps or ()))
 
 
+# Steps that OBSERVED the app rather than merely executing it. Starting a
+# server with `run` proves the process came up; it says nothing about what the
+# page or canvas showed.
+_VISUAL_STEP = re.compile(r"^\d+\.\s+(?:browser|screenshot)\b")
+_VISUAL_ACTIONS = ("browser", "screenshot")
+
+# Title words that ask about the rendered artifact itself. Only consulted for
+# titles that already promise live observation (_needs_live_evidence), so
+# "verify the template renders the report" -- no run/launch/browser promise --
+# is unaffected. Deliberately NOT here: "render", "display", "screen", "html"
+# and "css", which a terminal, a report or a source file can also satisfy.
+_VISUAL_TITLE = re.compile(
+    r"\b(browser|page|pages|webpage|ui|visual|visually|screenshot|"
+    r"screenshots|dom|canvas|viewport|layout)\b")
+
+
+def _needs_visual_evidence(task: str) -> bool:
+    """True when the title asks what the running UI SHOWED, so a `run` that
+    only launched the process is not evidence."""
+    return _needs_live_evidence(task) and bool(
+        _VISUAL_TITLE.search((task or "").lower()))
+
+
+def _used_visual_evidence(steps) -> bool:
+    """True when a browser/screenshot step appears in the steps log."""
+    return any(_VISUAL_STEP.match(s or "") for s in (steps or ()))
+
+
+def _observed_the_app(tr) -> bool:
+    """True when a browser/screenshot step produced an observation. Prefers
+    the action kinds the Agent recorded; falls back to the steps log for
+    callers and tests predating that field."""
+    kinds = getattr(tr, "live_kinds", None)
+    if kinds is None:
+        return _used_visual_evidence(getattr(tr, "steps", ()))
+    return bool(set(_VISUAL_ACTIONS) & set(kinds))
+
+
+def _live_kinds_of(agent):
+    """The agent's successful live-action kinds as a tuple, or None when it
+    does not track them (a test double): the gate then reads the steps log."""
+    kinds = getattr(agent, "live_evidence_kinds", None)
+    return None if kinds is None else tuple(sorted(kinds))
+
+
 def _evidence_failure(task: str, tr) -> str:
     """A reason string when a verification checkpoint lacks evidence, else "".
 
     Pessimistic on ties. Checks, in order: the report is a real report (not
     the steps-log stand-in); its own VERDICT line is not FAILED; the prose
-    does not say the verification did not succeed; and, for titles promising
-    live observation, a run/browser/screenshot step actually happened."""
+    does not say the verification did not succeed; for titles promising live
+    observation, a run/browser/screenshot step actually happened; and, for
+    titles asking what the UI SHOWED, that step was a browser/screenshot
+    observation rather than a command that only launched the process."""
     if not _is_verification_task(task):
         return ""
     if (tr.reply or "").startswith("No prose report was produced"):
@@ -354,7 +412,21 @@ def _evidence_failure(task: str, tr) -> str:
         return ("it never successfully drove the app (no run/browser/"
                 "screenshot step produced an observation); reading source "
                 "or a failed launch attempt is not live evidence")
+    if live_ok and _needs_visual_evidence(task) and not _observed_the_app(tr):
+        return ("it never OBSERVED the app: the title asks what the page/"
+                "canvas showed, and only a `browser` or `screenshot` step "
+                "does that -- a `run` that started the process (a server, a "
+                "build, a test) proves it came up, not what it displayed")
     return ""
+
+
+def _evidence_miss_is_procedural(task: str, tr) -> bool:
+    """True when the missing evidence says HOW the check was run (nobody drove
+    the app, or nobody opened it) rather than what the product did. Such a
+    miss re-runs the check with the toolset spelled out; it must never send a
+    repair task after a product nobody measured."""
+    return (not _used_live_evidence(getattr(tr, "steps", ()))
+            or (_needs_visual_evidence(task) and not _observed_the_app(tr)))
 
 
 # Titles starting with one of these verbs are checkpoints answered in prose,
@@ -369,12 +441,18 @@ _INVESTIGATE_START = (
     "list", "enumerate",
 )
 # Any of these anywhere in the title keeps it on the edit path ("Reproduce and
-# fix the crash", "Run the build and update the docs").
-_EDIT_WORDS_RE = re.compile(r"\b(?:" + "|".join((
+# fix the crash", "Run the build and update the docs"). The right-hand bound
+# excludes a hyphen on purpose: the first half of a compound NOUN ("add-on",
+# "create-react-app", "wire-frame", "patch-notes", "fix-up") names a thing, it
+# does not ask for an edit, and a verification title built around one must
+# keep its evidence gate instead of being routed to the edit path. A LEADING
+# hyphen still counts ("re-add the null check"), so a title that really wants
+# an edit is never misrouted the other way.
+_EDIT_WORDS_RE = re.compile(r"(?<!\w)(?:" + "|".join((
     "fix", "implement", "add", "remove", "delete", "rename", "move",
     "update", "change", "refactor", "write", "replace", "create", "patch",
     "correct", "repair", "build", "wire", "integrate", "migrate",
-)) + r")\b")
+)) + r")(?![\w-])")
 
 
 def _is_investigation_task(task: str) -> bool:
@@ -1308,6 +1386,12 @@ class TaskResult:
     # steps log is then used as the fallback. A merely ATTEMPTED live step
     # (bad URL, missing server) is not evidence.
     live_ok: bool | None = None
+    # WHICH live actions produced an observation ("run", "run_test",
+    # "browser", "screenshot"). A title that asks what the page/canvas showed
+    # is not satisfied by a `run` that only started the process, so the gate
+    # reads the kinds, not just the flag. None means the caller predates the
+    # field; the steps log is then used as the fallback.
+    live_kinds: tuple[str, ...] | None = None
     # Deterministic/verifier findings on the proposed edits (verify.Finding).
     findings: list = field(default_factory=list)
     # Per-task usage: tokens, cache-hit ratio, seconds, cost (see _task_stats).
@@ -2447,7 +2531,8 @@ def run_investigation_task(root: Path, cfg, agent, idx, task: str, *,
                                           [], None, when)
         print(f"[session: {session.relative_to(root)}]", file=sys.stderr)
     return TaskResult([], reply, True, [], idx, session, steps_log,
-                      live_ok=getattr(agent, "live_evidence_ok", None))
+                      live_ok=getattr(agent, "live_evidence_ok", None),
+                      live_kinds=_live_kinds_of(agent))
 
 
 def run_task(root: Path, cfg, client, agent, idx, task: str, *,
@@ -2845,6 +2930,7 @@ def _run_task_once(root: Path, cfg, client, agent, idx, task: str, *,
                       steps_log, fabricated=fabricated_only,
                       backup_dir=backup_dir,
                       live_ok=getattr(agent, "live_evidence_ok", None),
+                      live_kinds=_live_kinds_of(agent),
                       findings=findings, stats=stats, tests_ok=tests_ok)
 
 
@@ -2863,6 +2949,18 @@ _VERIFY_RETRY_NOTE = (
     "`browser`, capture the evidence, and only then write the report with "
     "its VERDICT line. If a tool itself fails, quote the exact error "
     "output in the report.")
+
+_VISUAL_RETRY_NOTE = (
+    "### RETRY -- THE PREVIOUS ATTEMPT RAN THE APP BUT NEVER LOOKED AT IT\n"
+    "This exact verification was already attempted: a `run` step executed, "
+    "but no `browser` or `screenshot` step ever observed the result. "
+    "Starting a server, a build or a test proves the process came up -- it "
+    "says nothing about what the page or canvas displayed, which is what this "
+    "task asks about. Open it: point the `browser` tool at the served URL "
+    "(or take a `screenshot` for a desktop window), with actions that reach "
+    "the state in question, and read the page text / canvas / console / "
+    "network evidence it returns. Only then write the report with its VERDICT "
+    "line. If the observation tool itself fails, quote its exact error.")
 
 # An empty report over gathered evidence is a report-writer flake (e.g. a
 # thinking runaway), not a product verdict.
@@ -3119,6 +3217,41 @@ def run_loop(root: Path, cfg, client, idx, plan_path: Path, *,
                                   f"remediation task inserted", "WARN")
         return True
 
+    def procedural_rerun(task: str, tr, miss: str) -> str:
+        """Handle an evidence gap that is about HOW the check ran -- nobody
+        drove the app, or somebody ran it and never looked at it -- rather
+        than about what the product did: re-run the check once with the
+        missing tool spelled out, then retire it as unverified (never a
+        repair round; there is no measured defect to repair).
+
+        Returns "rerun" when the caller must `continue` and let the loop pick
+        the same, still-unchecked task up again, "retire" when the caller must
+        count and mark the failure, and "" when the miss is NOT procedural
+        and the normal remediation/failure path applies."""
+        if not _evidence_miss_is_procedural(task, tr):
+            return ""
+        drove = _used_live_evidence(tr.steps)
+        gap = ("it ran the app but never observed it" if drove
+               else "it never drove the app")
+        tries = retried.get(task, 0)
+        if tries < _MAX_TASK_RETRIES:
+            retried[task] = tries + 1
+            retry_note[:] = [_VISUAL_RETRY_NOTE if drove
+                             else _VERIFY_RETRY_NOTE]
+            print(f"  [verification task failed: {miss} -- but {gap}, so the "
+                  f"failure describes the check run, not the product; "
+                  f"re-running it once]", file=sys.stderr)
+            workspace.log_event(
+                root, f"verification ended without live evidence ({gap}); "
+                      f"re-running once, no remediation", "WARN")
+            return "rerun"
+        print(f"  [verification could not be executed: two attempts ended "
+              f"with {gap} -- retiring the check as unverified (not a product "
+              f"failure) and continuing]", file=sys.stderr)
+        workspace.log_event(root, f"verification check retired: two attempts "
+                                  f"ended with {gap}", "ERROR")
+        return "retire"
+
     use_diag = (not verify) and bool(getattr(cfg, "auto_diagnostics", False))
     check_label = (f"$ {verify}" if verify else
                    "project diagnostics" if use_diag
@@ -3157,8 +3290,21 @@ def run_loop(root: Path, cfg, client, idx, plan_path: Path, *,
     while max_tasks == 0 or attempted < max_tasks:
         nxt = next_task(read_plan(plan_path))
         if nxt is None:
-            print("\nAll tasks complete.", file=sys.stderr)
-            workspace.log_event(root, "all tasks complete")
+            if failed:
+                # Nothing unchecked is left, but the plan is NOT finished in
+                # the sense a reader assumes: --keep-going ran past failures,
+                # and those tasks sit marked [!]. Saying "all tasks complete"
+                # here reads as a clean finish in the log and the terminal.
+                print(f"\nPlan exhausted: no unchecked tasks remain, but "
+                      f"{failed} task(s) FAILED and are marked [!] in "
+                      f"{plan_path.name} -- this is not a clean finish.",
+                      file=sys.stderr)
+                workspace.log_event(
+                    root, f"plan exhausted with {failed} failed task(s); "
+                          f"not a clean finish", "ERROR")
+            else:
+                print("\nAll tasks complete.", file=sys.stderr)
+                workspace.log_event(root, "all tasks complete")
             break
         if max_minutes and \
                 time.monotonic() - started_at >= max_minutes * 60:
@@ -3254,34 +3400,14 @@ def run_loop(root: Path, cfg, client, idx, plan_path: Path, *,
             if (tr.reply or "").strip():
                 miss = _evidence_failure(task, tr)
                 if miss:
-                    if not _used_live_evidence(tr.steps):
-                        # A check nobody executed says nothing about the
-                        # product: re-run it once with the toolset spelled
-                        # out, and only retire it (never remediate it) when
-                        # the re-run stays source-only too.
-                        tries = retried.get(task, 0)
-                        if tries < _MAX_TASK_RETRIES:
-                            retried[task] = tries + 1
-                            retry_note[:] = [_VERIFY_RETRY_NOTE]
-                            print(f"  [verification task failed: {miss} -- "
-                                  f"but it never drove the app, so the "
-                                  f"failure describes the check run, not "
-                                  f"the product; re-running it once]",
-                                  file=sys.stderr)
-                            workspace.log_event(
-                                root, "verification ended without driving "
-                                      "the app (procedural failure); "
-                                      "re-running once, no remediation",
-                                "WARN")
-                            continue
-                        print("  [verification could not be executed: two "
-                              "attempts ended without driving the app -- "
-                              "retiring the check as unverified (not a "
-                              "product failure) and continuing]",
-                              file=sys.stderr)
-                        workspace.log_event(
-                            root, "verification check retired: two attempts "
-                                  "never drove the app", "ERROR")
+                    # A check nobody executed -- or nobody OPENED -- says
+                    # nothing about the product: re-run it once with the
+                    # toolset spelled out, and only retire it (never remediate
+                    # it) when the re-run stays source-only too.
+                    outcome = procedural_rerun(task, tr, miss)
+                    if outcome == "rerun":
+                        continue
+                    if outcome == "retire":
                         failed += 1
                         mark_failed(plan_path, task)
                         repair_outcome.pop(task, None)
@@ -3427,6 +3553,43 @@ def run_loop(root: Path, cfg, client, idx, plan_path: Path, *,
                     break
                 mark_failed(plan_path, task)
                 continue
+            if (_is_noop(tr.reply) and task != _REMEDIATION_TITLE
+                    and _is_verification_task(task)):
+                # "Nothing to change" is still a CLAIM about live behavior,
+                # and this branch used to tick it done before any gate ran:
+                # the same title with an edit applied goes through
+                # _evidence_failure below. Gate the zero-edit reply the same
+                # way, or a verification checkpoint can be closed by prose
+                # alone. Repair tasks stay exempt -- refusing to edit is
+                # their sanctioned conflict report, and the check that
+                # retries after them does the observing.
+                miss = _evidence_failure(task, tr)
+                if miss:
+                    outcome = procedural_rerun(task, tr, miss)
+                    if outcome == "rerun":
+                        continue
+                    if outcome == "retire":
+                        # The check was never performed, so it says nothing
+                        # about the product: counted and marked exactly like
+                        # the investigation path, and the plan carries on.
+                        failed += 1
+                        mark_failed(plan_path, task)
+                        repair_outcome.pop(task, None)
+                        continue
+                    if offer_remediation(task, tr, miss):
+                        continue        # a repair was inserted; the check
+                                        # stays unchecked and retries after it
+                    print(f"  [verification task reported 'already complete' "
+                          f"with no edits and no evidence: {miss} -- "
+                          f"{'stopping' if stop_on_fail else 'skipping'}]",
+                          file=sys.stderr)
+                    workspace.log_event(
+                        root, f"no-op verification rejected: {miss}", "ERROR")
+                    failed += 1
+                    if stop_on_fail:
+                        break
+                    mark_failed(plan_path, task)
+                    continue
             if _is_noop(tr.reply):
                 print("  [model reports the task is already complete; "
                       "marking it done]", file=sys.stderr)

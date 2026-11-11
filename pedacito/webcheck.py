@@ -221,6 +221,68 @@ def _bare_spec(spec: str) -> str | None:
     return parts[0] or None
 
 
+# A DOM lookup whose null result the surrounding code handles. Regex-level
+# like every check here, and used ONLY to word a finding: an id no HTML file
+# renders is a broken contract either way, but telling the model "the next
+# property access throws" at a call site that reads `... || fallback` or
+# `if (!el) return` is a claim it can disprove by looking -- and a notice
+# caught lying once gets ignored everywhere else.
+_GUARD_TAIL_RE = re.compile(
+    r"\s*(?:\|\||&&|\?\.|\?|!?={2,3}\s*(?:null|undefined))")
+# `const el = ` / `el = ` immediately before the lookup (receiver stripped).
+_ASSIGN_HEAD_RE = re.compile(
+    r"(?:\b(?:const|let|var)\s+)?([A-Za-z_$][\w$]*)\s*=\s*$")
+# The lookup is itself the condition: `if (document.getElementById('x'))`.
+_TEST_HEAD_RE = re.compile(
+    r"(?:\b(?:if|while)\s*\(\s*!?|\bBoolean\s*\(\s*|!)\s*$")
+# `document.` / `window.document.` between the assignment and the call.
+_RECEIVER_TAIL_RE = re.compile(r"(?:[A-Za-z_$][\w$]*\s*\.\s*)+$")
+
+
+def _call_end(text: str, m) -> int:
+    """Position just past the lookup's closing paren. `_GET_BY_ID_RE` already
+    consumes it; `_QS_ID_RE` stops at the id, so the guard scan has to look
+    past the `')` that follows."""
+    if text[m.end() - 1:m.end()] == ")":
+        return m.end()
+    close = text.find(")", m.end())
+    return close + 1 if 0 <= close <= m.end() + 60 else m.end()
+
+
+def _null_guarded(text: str, m) -> bool:
+    """True when the code around a DOM lookup handles the null result: a
+    fallback / optional chain / ternary right after the call, the call used as
+    a condition, or an `if (!el)` style check on the variable it was assigned
+    to within the next couple of statements."""
+    head = _RECEIVER_TAIL_RE.sub(
+        "", text[max(0, m.start() - 80):m.start()])
+    if _TEST_HEAD_RE.search(head):
+        return True
+    if _GUARD_TAIL_RE.match(text, _call_end(text, m)):
+        return True
+    am = _ASSIGN_HEAD_RE.search(head)
+    if not am:
+        return False
+    var = re.escape(am.group(1))
+    tail = text[_call_end(text, m):][:200]
+    return bool(re.search(
+        rf"\b(?:if|while)\s*\(\s*!?\s*{var}\b"
+        rf"|\b{var}\s*(?:\?|&&|\|\|)"
+        rf"|\b{var}\s*!?={2,3}\s*(?:null|undefined)", tail))
+
+
+def _null_consequence(text, m, method: str) -> str:
+    """What a missing id does AT THIS call site: an unguarded lookup throws on
+    the next property access; a guarded one silently takes the fallback, so
+    the code it feeds never runs."""
+    if _null_guarded(text, m):
+        return (f"{method} returns null here; this call site handles the null "
+                f"(a fallback or a guard), so nothing throws -- but whatever "
+                f"the lookup feeds can only run if the id is created "
+                f"dynamically at runtime")
+    return f"{method} returns null and the next property access throws"
+
+
 def _id_findings(rel, text, offset, ids, peer):
     """Check 1: DOM id references that no HTML file in the project has."""
     out = []
@@ -235,7 +297,7 @@ def _id_findings(rel, text, offset, ids, peer):
             out.append(Finding(
                 rel, offset + _line_of(text, m.start()),
                 f"no element with id '{name}' exists in any HTML file -- "
-                f"{method} returns null and the next property access throws",
+                + _null_consequence(text, m, method),
                 peer=peer))
     return out
 

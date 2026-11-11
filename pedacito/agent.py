@@ -547,8 +547,9 @@ Rules:
   runs script in the page and reports the value back -- use it to force state
   no interaction can reach (a grown player, a late level) before the capture;
   put it LAST: everything after `eval` is one expression, semicolons allowed.
-  It returns the page URL/title/text, canvas sizes, console errors, and a
-  screenshot.
+  It returns the page URL/title/text, canvas sizes, console errors, failed
+  network requests (a 404 asset or a refused load shows up here even when
+  the console stays quiet), and a screenshot.
   Use it for anything served over HTTP. A desktop `screenshot` cannot see a
   web page that no browser opened. Needs allow_browser; launching a server
   command also needs allow_shell.
@@ -1242,6 +1243,11 @@ class Agent:
         # outer loop's evidence gate reads this: an attempted-but-failed
         # browser launch is not live evidence.
         self.live_evidence_ok = False
+        # WHICH live actions succeeded ("run", "run_test", "browser",
+        # "screenshot"). A title asking what the page/canvas SHOWED is not
+        # satisfied by a `run` that only started the process, so the gate
+        # reads the kinds, not just the flag.
+        self.live_evidence_kinds: set[str] = set()
         # Telemetry sink (events.EventLog); bound on first gather.
         self.events = None
         # Gather conversation kept for answer continuation (see answer()).
@@ -2072,6 +2078,7 @@ class Agent:
         gathered: list[str] = []
         self.steps_log: list[str] = []
         self.live_evidence_ok = False
+        self.live_evidence_kinds = set()
         did_read = False
         read_nudged = False
         # Successful reads only, per normalised file as (start, end) spans in
@@ -2618,6 +2625,7 @@ class Agent:
                     if (action in ("run", "run_test", "screenshot", "browser")
                             and not obs.startswith("ERROR")):
                         self.live_evidence_ok = True
+                        self.live_evidence_kinds.add(action)
                 except Exception as e:
                     # A tool failure becomes an ERROR observation, not a crash.
                     print(f"  [{action} tool failed: "

@@ -1487,6 +1487,154 @@ def test_browser_eval_action_runs_and_reports_its_value(tmp_path, monkeypatch):
     assert info["action_errors"] == []
 
 
+def test_browser_reports_failed_network_requests(tmp_path, monkeypatch):
+    """A 404 on a script, stylesheet or image leaves the page "loaded" and the
+    console quiet: the capture reported url/title/text/canvas only, so a
+    browser verification could pass over an asset that never arrived. Failed
+    requests (net::ERR_*) and >= 400 responses are now collected structurally,
+    deduped, and surfaced next to the console."""
+    import sys
+    import types as pytypes
+    from pedacito import browser
+
+    class FakeRequest:
+        method = "GET"
+        url = "http://127.0.0.1:5000/missing.js"
+        resource_type = "script"
+        failure = "net::ERR_ABORTED"
+
+    class FakeResponse:
+        status = 404
+        url = "http://127.0.0.1:5000/gone.png"
+        request = FakeRequest()
+
+    class FakeKeyboard:
+        def press(self, key):
+            pass
+
+        def down(self, key):
+            pass
+
+        def up(self, key):
+            pass
+
+        def type(self, text):
+            pass
+
+    class FakePage:
+        url = "http://127.0.0.1:5000/"
+
+        def __init__(self):
+            self.handlers = {}
+            self.keyboard = FakeKeyboard()
+
+        def set_default_timeout(self, ms):
+            pass
+
+        def on(self, event, handler):
+            self.handlers[event] = handler
+
+        def goto(self, url, wait_until=None, timeout=None):
+            # What a real navigation does: assets answer (or do not).
+            self.handlers["response"](FakeResponse())
+            self.handlers["requestfailed"](FakeRequest())
+            self.handlers["requestfailed"](FakeRequest())   # deduped below
+
+        def evaluate(self, expr):
+            return []
+
+        def wait_for_timeout(self, ms):
+            pass
+
+        def inner_text(self, sel):
+            return "Score: 0"
+
+        def title(self):
+            return "Game"
+
+    class FakeBrowser:
+        def __init__(self, page):
+            self._page = page
+
+        def new_page(self, viewport=None):
+            return self._page
+
+        def close(self):
+            pass
+
+    class FakeChromium:
+        def __init__(self, page):
+            self._page = page
+
+        def launch(self, headless=True):
+            return FakeBrowser(self._page)
+
+    class FakePW:
+        def __init__(self, page):
+            self.chromium = FakeChromium(page)
+
+    class FakeCM:
+        def __init__(self, pw):
+            self._pw = pw
+
+        def __enter__(self):
+            return self._pw
+
+        def __exit__(self, *exc):
+            return False
+
+    page = FakePage()
+    fake_sync = pytypes.ModuleType("playwright.sync_api")
+    fake_sync.sync_playwright = lambda: FakeCM(FakePW(page))
+    fake_root = pytypes.ModuleType("playwright")
+    fake_root.sync_api = fake_sync
+    monkeypatch.setitem(sys.modules, "playwright", fake_root)
+    monkeypatch.setitem(sys.modules, "playwright.sync_api", fake_sync)
+    monkeypatch.setattr(browser, "available", lambda: True)
+
+    ok, info = browser.run("http://127.0.0.1:5000/", wait=0)
+    assert ok, info
+    assert set(page.handlers) >= {"console", "pageerror", "response",
+                                  "requestfailed"}
+    assert info["network_errors"] == [
+        "404 GET http://127.0.0.1:5000/gone.png",
+        "FAILED GET http://127.0.0.1:5000/missing.js [script] "
+        "-- net::ERR_ABORTED",
+    ]
+
+
+def test_browser_observation_includes_the_network_section(tmp_path,
+                                                          monkeypatch):
+    """The collected failures have to reach the model: the observation is what
+    a verification report can quote."""
+    idx = _index(tmp_path)
+    cfg = Config()
+    cfg.allow_browser = True
+    cfg.allow_shell = False
+    monkeypatch.setattr(tools.browser, "run", lambda *a, **k: (
+        True, {"url": "http://127.0.0.1:8000/", "title": "t", "text": "hi",
+               "canvas": "", "console": [], "actions": [],
+               "action_errors": [], "method": "fake",
+               "network_errors": [
+                   "404 GET http://127.0.0.1:8000/game.js",
+                   "FAILED GET http://127.0.0.1:8000/sprite.png [image] "
+                   "-- net::ERR_CONNECTION_REFUSED"]}))
+    monkeypatch.setattr(tools.vision, "analyze",
+                        lambda path, previous=None: "ANALYSIS")
+    monkeypatch.setattr(tools.vision, "describe", lambda *a, **k: "")
+    obs = tools.tool_browser(idx, cfg, None, "http://127.0.0.1:8000/")
+    assert "NETWORK ERRORS" in obs
+    assert "404 GET http://127.0.0.1:8000/game.js" in obs
+    assert "net::ERR_CONNECTION_REFUSED" in obs
+    # A capture with a clean network stays quiet about it.
+    monkeypatch.setattr(tools.browser, "run", lambda *a, **k: (
+        True, {"url": "http://127.0.0.1:8000/", "title": "t", "text": "hi",
+               "canvas": "", "console": [], "actions": [],
+               "action_errors": [], "method": "fake", "network_errors": []}))
+    assert "NETWORK ERRORS" not in tools.tool_browser(
+        idx, cfg, None, "http://127.0.0.1:8000/")
+
+
 def test_browser_hold_action_keeps_the_key_down(tmp_path, monkeypatch):
     """P7: `hold` must produce a down/wait/up sequence instead of one
     instant press -- a fixed-timestep game loop samples the keyboard once

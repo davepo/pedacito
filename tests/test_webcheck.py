@@ -62,6 +62,42 @@ def test_ids_built_by_js_count_as_existing(tmp_path):
     assert webcheck.run(tmp_path) == []
 
 
+def test_a_guarded_lookup_is_not_reported_as_a_throw(tmp_path):
+    """Every missing id used to be reported as "returns null and the next
+    property access throws" -- including `getElementById('x') || fallback`,
+    `?.` and `if (!el) return`, where nothing throws. The finding stays (the
+    id is still rendered nowhere, so the branch it feeds is dead), but the
+    consequence is worded for the call site in front of the model: a notice
+    caught overstating once gets ignored everywhere else."""
+    _w(tmp_path, "index.html",
+       '<body>\n<div id="app"></div>\n<script src="game.js"></script>\n'
+       "</body>\n")
+    _w(tmp_path, "game.js",
+       'const bare = document.getElementById("bare");\n'      # 1 unguarded
+       'bare.textContent = "x";\n'                            # 2
+       'const fb = document.getElementById("fb") || '
+       'document.querySelector(".fallback");\n'                # 3 fallback
+       'const opt = document.getElementById("opt")?.textContent;\n'   # 4 ?.
+       'const guarded = document.getElementById("guarded");\n'  # 5 assigned
+       'if (!guarded) { return; }\n'                          # 6 ...then checked
+       'if (document.getElementById("cond")) { go(); }\n'      # 7 condition
+       'const q = document.querySelector("#qs");\n'            # 8 unguarded
+       'q.style.color = "red";\n'
+       'const t = document.querySelector("#tern");\n'          # 10 assigned
+       'const label = t ? t.textContent : "";\n')              # 11 ...ternary
+    found = webcheck.run(tmp_path)
+    for name in ("bare", "fb", "opt", "guarded", "cond", "qs", "tern"):
+        assert _hit(found, "game.js", f"'{name}'"), name
+    assert len(found) == 7
+    for line in (1, 8):                      # nothing handles the null
+        assert _hit(found, "game.js", "next property access throws",
+                    line=line), line
+    for line in (3, 4, 5, 7, 10):            # a fallback, ?., or a null check
+        assert _hit(found, "game.js", "handles the null", line=line), line
+        assert not _hit(found, "game.js", "next property access throws",
+                        line=line), line
+
+
 # ---------------------------------------------------- ESM behind a classic
 def test_esm_file_needs_type_module_on_the_script_tag(tmp_path):
     _w(tmp_path, "util.js", "export const x = 1;\n")
