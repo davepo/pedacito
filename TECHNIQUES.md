@@ -148,7 +148,10 @@ of zero-call checks catches the specific ways small models go wrong:
   enough to be useful: a search can only supply `LOCATED`, a displayed read
   `READ`, a dry-applied patch `EDITED`, and a patch accepted by the checks (or
   the post-edit tests/lint) `VERIFIED`. Coverage then warns about the clauses
-  whose state never got there, with the state named in the message.
+  whose state never got there, with the state named in the message. In the
+  incremental edit loop, unaddressed *edit* clauses also seed one bounded
+  follow-up pass (§35), and each clause carries a stable id (`R1`, `R2`, ...)
+  that the review page shows as a per-file badge (§39).
 - **Verdict filter.** When a model *verifier* reports a `DEFECT`, it only counts
   as an error if the cited file resolves and the line is inside it, a
   hallucinating small-model verifier can't feed the repair loop.
@@ -195,7 +198,9 @@ The cheapest reliable feedback is the code itself:
   corrects against concrete, quoted problems rather than a vague "try again".
 - **Post-edit tests and lint.** After an edit, impacted tests run and
   linter/type-checker output is diffed against a pre-edit baseline, and
-  failures feed the repair rounds. An applied edit that breaks tests is an
+  failures feed the repair rounds. A failure the command ledger already
+  recorded before this run is labelled pre-existing and is not fed to repair
+  as edit-caused (§33). An applied edit that breaks tests is an
   objective signal no model self-critique can fake.
 - **Immediate AST syntax gate.** Before any linter or pytest subprocess starts,
   the dry-applied in-memory buffers are parsed in-process: `ast.parse` for
@@ -338,7 +343,9 @@ get wrong.
 ### 10. Discovery and role routing
 
 `pedacito models scan` + `pedacito profiles` find servers, calibrate models,
-and recommend which profile to use for each role. This matters for small models
+and recommend which profile to use for each role. The GUI's scan runs under a
+wall-clock budget and returns the partial results gathered so far when it is
+spent (§34). This matters for small models
 because the highest-leverage trick is often *routing* the hard job, the
 `verifier` or `planner`, to a larger local or hosted model, while the cheap
 work stays on the small worker.
@@ -837,9 +844,12 @@ decisions the guards cannot make:
 - **Localhost CSRF guard** (`security.post_origin_allowed`). A state-changing
   request to the GUI server must come from a loopback page when it carries an
   `Origin` or `Referer`, so another site open in the same browser cannot drive it.
-- **Outbound guard** (`security.ssrf_error`). The web tools accept only http(s)
-  URLs and refuse loopback, link-local and cloud-metadata addresses, and private
-  networks, unless the host is named in `fetch_allowed_hosts`.
+- **Outbound guard** (`security.ssrf_error` + `resolve_checked`). The web tools
+  accept only http(s) URLs and refuse loopback, link-local and cloud-metadata
+  addresses, and private networks, unless the host is named in
+  `fetch_allowed_hosts`. The check runs on every IP the name resolves to, and
+  the connection is pinned to the validated address, so a public name cannot
+  rebind to a private one mid-request (§32).
 - **Permission broker** (`security.request_permission`). Web access, package
   installs, unapproved shell commands and sensitive reads park the worker thread
   until the GUI answers: **Allow Once**, **Allow for This Run**, **Always Allow**
@@ -1104,7 +1114,10 @@ hints, not truth):
   of growing the file. Lessons carry the files they name, and a lesson whose
   files have all been deleted is retired -- dropped from the document, not
   just hidden -- because a warning about a component that no longer exists
-  would teach the model to dodge a ghost. The render budget is the same
+  would teach the model to dodge a ghost. Ineffectiveness retires a lesson
+  too: harness-fact `runs` / `recurred` / `avoided` counters, and a lesson
+  that never avoids its failure kind across five observed runs moves to
+  `retired_lessons` (§36). The render budget is the same
   `max_micro_fact_tokens` knob; overflow drops the oldest lines first.
 - **Path-scoped rule promotion.** A lesson that has proven itself twice
   *and* whose named files all live under one subdirectory (`src/api/...`,
@@ -1522,7 +1535,113 @@ Cost: no model calls, no new prompt shapes -- the price is transport discipline
 CLI knows). That discipline is what makes the server unit-testable: the tests
 drive `RpcServer` with fakes over `io.StringIO` and never spawn a process.
 
-## Quick reference: techniques 5, 11, 17 to 31
+---
+
+## Audit hardening (R1–R8)
+
+A follow-up audit checked the promises above against the code and found six
+places where the behaviour fell short of the doc, plus two guardrails worth
+adding. Each item below closes one gap. They extend the existing techniques
+rather than replace them, and none is a rejected method in disguise: every one
+is a deterministic, harness-side check or a bounded pass, in the spirit of the
+through-line. The two test-only guardrails (§37, §38) cost nothing at run time.
+
+### 32. Resolution-pinned, rebinding-proof fetch (extends §21)
+
+The outbound guard used to judge the hostname *as written*, so a public name
+that resolves to a private address (DNS rebinding) slipped past it. Now
+`security.resolve_checked(host, allowed_hosts)` resolves the name once with
+`getaddrinfo`, runs the private-address check on **every** returned IP, and
+refuses if any is private -- a wildcard allow-list entry never exempts a
+private range. The connection is then **pinned** to the validated IP: the
+socket connects by address while `Host`, SNI and the certificate check keep the
+original name, so a second DNS answer cannot swap in a private address
+mid-request. Redirects are followed by hand and re-resolved at every hop
+(§21's per-hop check), and the opener disables automatic redirects so no
+unvalidated hop can execute. Cost: one DNS lookup per hop, no model tokens.
+Tests monkeypatch `socket.getaddrinfo` to map a public name to `127.0.0.1` and
+assert refusal with no request issued.
+
+### 33. Baseline-aware test verdicts (extends §5, §22)
+
+`run_impacted` used to report *any* failure as edit-caused, sending the repair
+loop chasing errors a repo already had. The command ledger now records a
+`last_ok` flag per observed command, and `memory.command_was_failing` answers
+whether the same narrowed command was already failing before this run. When it
+was, the verdict is labelled "pre-existing failure (recorded before this run)"
+and is not fed to repair as edit-caused -- unless this run captured its own
+baseline, which supersedes the history. Zero model calls; it reuses facts the
+ledger already keeps.
+
+### 34. Wall-clock budget for discovery (extends §10)
+
+`scan_models` probes each candidate with a per-request timeout but had no
+overall deadline, so a config full of remote profile URLs could block the GUI
+well past a reasonable wait. A monotonic deadline is now threaded through
+discovery: `scan_models(budget=20.0)` reserves half the budget for finding
+servers and the rest for describing them, so one slow server cannot starve the
+model rows, and it returns the partial results gathered so far when the budget
+is spent. Deterministic to test with a local server that sleeps past the budget.
+
+### 35. Coverage-seeded second-pass intents (extends §1, §3)
+
+`check_coverage` warned about unaddressed task clauses but nothing acted on the
+warning, so a half-answered multi-clause task could end with a note instead of a
+second pass. The unaddressed-clause core is now shared (`verify._unaddressed`),
+and `coverage_seeds` returns the unaddressed **edit** clauses (report clauses
+are left to the answer prose). After a batch, the incremental planner seeds up
+to three follow-up intents from those clauses' anchors, read spans and terms --
+a located definition, else a symbol search, else the whole file -- and runs
+**one** bounded follow-up pass under the same per-target retry ceiling, emitting
+a `coverage_followup` event and a receipt. This is a deterministic trigger from
+the requirement state machine, not self-critique or a search tree: the model is
+never asked to grade its own draft.
+
+### 36. Lesson effectiveness counters (extends §24)
+
+Lessons were injected and retired by file existence alone, so an ineffective
+lesson persisted forever. Each live lesson now carries harness-fact counters --
+`runs`, `recurred`, `avoided` -- updated by `memory.note_lesson_run` once per
+observed check run. A lesson that has been seen for `_LESSON_RETIRE_RUNS` (5)
+runs without ever avoiding its failure kind is retired into `retired_lessons`;
+auto-promoted path-scoped rules are exempt, and lessons born mid-run are not
+judged against runs that preceded them. The loop emits a `lesson_retired` event.
+These are records of what happened, explicitly **not** the rejected
+"model-written reflection notes": the model never writes prose about itself.
+
+### 37. CLI / how-index drift guard (test-only)
+
+`test_how.py` asserted coverage against a hardcoded list of CLI names, so a new
+subcommand could ship without a how-card and the test stayed green. The parser
+is now built by `cli.build_parser()`, and the test derives the expected command
+set from the actual argparse subparsers (mapping `models` to its `models scan`
+card) and checks every action choice is documented. Adding a subcommand without
+a card now fails the test. Static and deterministic; no run-time cost.
+
+### 38. Config-editor round-trip property test (test-only)
+
+The textual config patcher is guarded by a seeded generative test, not just one
+regression. It generates comment/string/table shapes -- including the FIX-011
+class of comments quoting triple delimiters, literal strings and multi-line
+values -- and asserts `set_values` / `remove_profile` / `add_profile` always
+yield text `validate_text` accepts, never duplicate a table, and never drop an
+unrelated key or comment. Writing it surfaced two real scanner bugs (an escaped
+quote inside a multi-line basic string ended the value early in `_value_end`,
+and a naive closing-delimiter search in `_triple_toggles` hid later table
+headers); both are fixed and covered. Deterministic seeds, no model.
+
+### 39. Review hunk provenance (extends §3)
+
+A reviewer could accept some files and reject others without seeing which task
+clause each file served. Every requirement clause now carries a stable id
+(`R1`, `R2`, ...), the tracker maps files to the clauses whose patches touched
+them (`clause_map`), and each `FileDiff` carries those ids. The review page and
+the GUI show a clause badge per file (titled with the clause text), and a
+partial accept flags any clause none of whose files was accepted
+(`unaccepted`), recording it in the sign-off detail and the chat. Provenance is
+computed from the same deterministic edit evidence the tracker already gathers.
+
+## Quick reference: techniques 5, 11, 17 to 39
 
 | Technique | Section | How to turn it off | Where you see it |
 |---|---|---|---|
@@ -1545,6 +1664,14 @@ drive `RpcServer` with fakes over `io.StringIO` and never spawn a process.
 | Local payload acceleration | §29 | `enable_prompt_cache = false`, `enable_prompt_lookup = false` | Automatic on local endpoints only. `cache_prompt` / `prompt_lookup_num_tokens` appear in the request payload (`log_events` shows calls) |
 | Pruned MCP bridge (`mcp_call`) | §30 | `enable_mcp = false` | A gather action, offered only when a tool matches. `pedacito mcp list`. Permission dialog category **MCP Tool** |
 | Warm stdio JSONL-RPC (`pedacito rpc`) | §31 | None. Run `pedacito rpc PROJ` or `pedacito chat --rpc`; `--permission-timeout` paces the broker | One JSON request per line on stdin, pure JSONL on stdout, events tagged `req_id`. Protocol documented in `pedacito/rpc.py` |
+| Resolution-pinned fetch (`resolve_checked`), DNS-rebinding-proof | §32 | None (always on; it is the outbound guard itself) | `web_fetch` / MCP fetch refuse a public name that resolves to any private IP; the socket is pinned to the validated address and every redirect hop is re-resolved |
+| Baseline-aware test verdicts (`command_was_failing`) | §33 | `micro_facts = false` (no ledger: every failure stays edit-caused) | Impacted-test verdicts labelled `pre-existing failure (recorded before this run)`; repair is not triggered by them |
+| Wall-clock budget for model discovery | §34 | None in the GUI scan (fixed 20 s cap, half reserved for discovery) | **Models ▾ → Scan** returns the rows gathered so far when the budget is spent instead of blocking |
+| Coverage-seeded follow-up pass | §35 | No flag. Fires only when the requirement tracker holds unaddressed edit clauses | `coverage_followup` event; a "Coverage follow-up" receipt appended to the incremental-edit reply (one bounded pass, ≤3 seeds) |
+| Lesson effectiveness counters + retirement | §36 | `micro_facts = false` (also silences §14/§24) | `runs` / `recurred` / `avoided` and `retired_lessons` in `.pedacito/micro_facts.json`; `lesson_retired` event |
+| CLI / how-index drift guard | §37 | Test-only; no run-time cost | `tests/test_how.py` derives the command set from `cli.build_parser()`; a subcommand without a how-card fails the suite |
+| Config-editor round-trip property test | §38 | Test-only; no run-time cost | Seeded generative shapes in `tests/test_config_editor.py` (comments, strings, tables); guards `set_values` / `remove_profile` / `add_profile` |
+| Review hunk provenance (clause badges) | §39 | No flag | `R1`, `R2`, … badges per file on the review page and in the GUI; a partial accept flags clauses whose files were all rejected |
 
 ## Techniques that exist but are not a good fit
 

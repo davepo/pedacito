@@ -660,7 +660,7 @@ def _suggest_profile_name(model_id: str, taken: set, label: str = "") -> str:
     return name
 
 
-def scan_models(urls=(), vram_gb=0) -> dict:
+def scan_models(urls=(), vram_gb=0, budget=20.0) -> dict:
     """`pedacito models scan`'s discovery pass WITHOUT the writes: probe the
     well-known local ports, every configured profile's server, and `urls`;
     return one selectable row per model. Nothing is written to the config.
@@ -668,8 +668,19 @@ def scan_models(urls=(), vram_gb=0) -> dict:
     Candidates arrive spelled many ways (`localhost` vs `127.0.0.1`, a
     trailing `/v1`, a trailing slash), so every server is keyed by its
     normalized URL: one server probes once, and the returned list holds one
-    row per (normalized server URL, model id) -- never a duplicate."""
+    row per (normalized server URL, model id) -- never a duplicate.
+
+    `budget` (seconds) is a wall-clock cap on the WHOLE scan, shared by the
+    discovery pass and every per-server description: a config with many slow
+    remote profile URLs returns the servers/models found so far instead of
+    blocking the GUI request past a reasonable budget."""
     from .. import discovery
+    budget = max(0.0, float(budget))
+    deadline = time.monotonic() + budget
+    # Discovery is the cheap pass; reserve half the budget for describing the
+    # servers it finds, so one slow candidate cannot spend the whole allowance
+    # probing and starve the useful output (the found servers' model rows).
+    discovery_deadline = time.monotonic() + budget * 0.5
     explicit = [str(u).strip() for u in (urls or ()) if str(u).strip()]
     try:
         vram = int(vram_gb or 0)
@@ -689,7 +700,8 @@ def scan_models(urls=(), vram_gb=0) -> dict:
             profile_urls.append(body["base_url"])
     profile_urls = list(dict.fromkeys(profile_urls))
     found = discovery.discover_servers(timeout=2.0, urls=explicit,
-                                       profile_urls=profile_urls)
+                                       profile_urls=profile_urls,
+                                       deadline=discovery_deadline)
     imported = {(_norm_url(b.get("base_url", flat.get("base_url", ""))),
                  str(b.get("model") or "")) for b in existing.values()}
     taken = set(existing)
@@ -697,12 +709,15 @@ def scan_models(urls=(), vram_gb=0) -> dict:
     seen_servers: set[str] = set()
     seen_models: set[tuple[str, str]] = set()
     for label, base_url, _ids in found:
+        if time.monotonic() >= deadline:
+            break                       # budget spent: keep the servers so far
         skey = _norm_url(base_url)
         if skey and skey in seen_servers:
             continue        # the same server spelled another way: probe once
         seen_servers.add(skey)
         try:
-            recs = discovery.describe_models(base_url, vram_gb=vram)
+            recs = discovery.describe_models(base_url, vram_gb=vram,
+                                             deadline=deadline)
         except Exception:
             recs = []
         rows = []

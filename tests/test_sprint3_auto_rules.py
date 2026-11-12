@@ -321,3 +321,105 @@ def test_lesson_ledger_is_empty_without_a_project_root():
     assert memory.load_anti_patterns(None) == []
     assert memory.render_anti_patterns(None) == ""
     assert memory.render_anti_patterns(None, _cfg()) == ""
+
+
+# ------------------------------------------- effectiveness counters (R5) ----
+
+def _seed_lesson(root, cfg, kind="js_syntax", text="an edit left a file unparsable",
+                 files=("a.js",)):
+    _touch(root, *files)
+    return memory.record_anti_pattern(root, kind, text, list(files), cfg)
+
+
+def test_run_counters_track_recurrence_and_avoidance(tmp_path):
+    cfg = _cfg()
+    row = _seed_lesson(tmp_path, cfg)
+    memory.note_lesson_run(tmp_path, {"js_syntax"}, cfg)
+    memory.note_lesson_run(tmp_path, set(), cfg)
+    memory.note_lesson_run(tmp_path, {"asset_404"}, cfg)
+    live = memory.load_anti_patterns(tmp_path)
+    assert len(live) == 1
+    got = live[0]
+    assert got["lesson_id"] == row["lesson_id"]
+    assert got["runs"] == 3
+    assert got["recurred"] == 1      # only the first run tripped its kind
+    assert got["avoided"] == 2       # a clean run and an unrelated failure
+
+
+def test_ineffective_lesson_retires_after_the_threshold(tmp_path):
+    cfg = _cfg()
+    row = _seed_lesson(tmp_path, cfg)
+    for i in range(memory._LESSON_RETIRE_RUNS - 1):
+        out = memory.note_lesson_run(tmp_path, {"js_syntax"}, cfg)
+        assert out["retired"] == []
+        assert len(memory.load_anti_patterns(tmp_path)) == 1
+    out = memory.note_lesson_run(tmp_path, {"js_syntax"}, cfg)
+    assert out["retired"] == [row["lesson_id"]]
+    assert memory.load_anti_patterns(tmp_path) == []
+    assert memory.render_anti_patterns(tmp_path, cfg) == ""
+    retired = memory.load_retired_lessons(tmp_path)
+    assert len(retired) == 1
+    assert retired[0]["lesson_id"] == row["lesson_id"]
+    assert retired[0]["runs"] == memory._LESSON_RETIRE_RUNS
+    assert retired[0]["recurred"] == memory._LESSON_RETIRE_RUNS
+    assert retired[0]["avoided"] == 0
+    assert retired[0]["retired_at"] > 0
+    # the retirement survives another writer's document round-trip
+    memory.record_anti_pattern(tmp_path, "asset_404", "another lesson",
+                               ["a.js"], cfg)
+    assert len(memory.load_retired_lessons(tmp_path)) == 1
+
+
+def test_one_avoided_run_keeps_a_lesson_past_the_threshold(tmp_path):
+    cfg = _cfg()
+    _seed_lesson(tmp_path, cfg)
+    for _ in range(memory._LESSON_RETIRE_RUNS - 1):
+        memory.note_lesson_run(tmp_path, {"js_syntax"}, cfg)
+    memory.note_lesson_run(tmp_path, set(), cfg)      # one clean run
+    for _ in range(memory._LESSON_RETIRE_RUNS):
+        out = memory.note_lesson_run(tmp_path, {"js_syntax"}, cfg)
+        assert out["retired"] == []
+    live = memory.load_anti_patterns(tmp_path)
+    assert len(live) == 1
+    assert live[0]["avoided"] == 1
+    assert live[0]["runs"] == 2 * memory._LESSON_RETIRE_RUNS
+
+
+def test_promoted_lessons_are_exempt_from_effectiveness_retirement(tmp_path):
+    cfg = _cfg()
+    _touch(tmp_path, "src/api/users.py", "src/api/auth.py")
+    for _ in range(2):
+        memory.record_anti_pattern(
+            tmp_path, "signature_contract",
+            "caller and callee disagreed on the argument count",
+            ["src/api/users.py"], cfg)
+    assert memory.load_anti_patterns(tmp_path) == []   # promoted
+    for _ in range(memory._LESSON_RETIRE_RUNS + 2):
+        out = memory.note_lesson_run(tmp_path, {"signature_contract"}, cfg)
+        assert out["retired"] == []
+    assert len(memory.load_promoted_lessons(tmp_path)) == 1
+    assert memory.load_retired_lessons(tmp_path) == []
+
+
+def test_only_injected_lessons_are_counted(tmp_path):
+    cfg = _cfg()
+    old = _seed_lesson(tmp_path, cfg, text="the older injected lesson")
+    # a lesson distilled mid-run was not in the run's prompt
+    fresh = memory.record_anti_pattern(
+        tmp_path, "asset_404", "born during this run", ["a.js"], cfg)
+    out = memory.note_lesson_run(tmp_path, {"js_syntax", "asset_404"}, cfg,
+                                 injected={old["lesson_id"]})
+    assert out["counted"] == 1
+    rows = {r["lesson_id"]: r for r in memory.load_anti_patterns(tmp_path)}
+    assert rows[old["lesson_id"]]["runs"] == 1
+    assert rows[fresh["lesson_id"]]["runs"] == 0
+
+
+def test_note_lesson_run_respects_the_off_switch_and_missing_root(tmp_path):
+    cfg = _cfg(micro_facts=False)
+    _seed_lesson(tmp_path, _cfg())
+    assert memory.note_lesson_run(tmp_path, {"js_syntax"}, cfg) == {
+        "counted": 0, "retired": []}
+    assert memory.note_lesson_run(None, {"js_syntax"}, _cfg()) == {
+        "counted": 0, "retired": []}
+    assert memory.load_anti_patterns(tmp_path)[0]["runs"] == 0

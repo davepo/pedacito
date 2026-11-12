@@ -297,7 +297,7 @@ class Review:
     review step); a deferred review has no waiter and applies directly."""
 
     def __init__(self, rid: int, task: str, diffs: list, writer,
-                 on_discard=None, partial_ok: bool = True):
+                 on_discard=None, partial_ok: bool = True, clause_texts=None):
         self.id = rid
         self.task = task
         self.diffs = diffs
@@ -310,6 +310,10 @@ class Review:
         self.edits: dict[str, str] = {}
         self.mid = 0                # the chat message announcing this review
         self.created = time.time()
+        # R8 provenance: clause id -> text for the legend, and the clause ids
+        # a partial accept left unaccepted (filled by decide_review).
+        self.clause_texts: dict[str, str] = dict(clause_texts or {})
+        self.unaccepted: list[str] = []
 
 
 def before_text(fd) -> str:
@@ -1069,11 +1073,14 @@ class State:
                 "id": rv.id, "task": rv.task, "outcome": rv.outcome,
                 "detail": rv.detail, "partial_ok": rv.partial_ok,
                 "pending": not rv.outcome,
+                "clause_texts": rv.clause_texts,
+                "unaccepted": rv.unaccepted,
                 "files": [{
                     "rel": d.rel, "added": d.added, "removed": d.removed,
                     "message": d.message, "source": d.removed_source,
                     "renames_from": list(d.renames_from),
                     "edited": d.rel in rv.edits,
+                    "clauses": list(getattr(d, "clauses", ())),
                 } for d in rv.diffs],
             }
 
@@ -1132,10 +1139,17 @@ class State:
             if rv.partial_ok and files is not None:
                 keep = set(files)
                 with self.lock:
+                    all_clauses = {c for d in rv.diffs if not d.removed_source
+                                   for c in getattr(d, "clauses", ())}
                     kept = [d for d in rv.diffs
                             if d.removed_source or d.rel in keep]
                     if not any(not d.removed_source for d in kept):
                         return False, "Select at least one file to accept."
+                    kept_clauses = {c for d in kept if not d.removed_source
+                                    for c in getattr(d, "clauses", ())}
+                    # R8: a clause none of whose files was accepted stays
+                    # flagged, so the sign-off records what is still open.
+                    rv.unaccepted = sorted(all_clauses - kept_clauses)
                     rv.diffs[:] = kept
                     for d in rv.diffs:
                         if d.rel in rv.edits:
@@ -1147,12 +1161,22 @@ class State:
             ok, detail = rv.writer()
             if not ok:
                 return False, detail
+            if rv.unaccepted:
+                detail += ("; clause(s) left unaccepted: "
+                           + ", ".join(rv.unaccepted))
             self._finish_review(rv, "applied", detail)
             written = [d.rel for d in rv.diffs if not d.removed_source]
             self.add_message("assistant",
                              f"Applied changes to {len(written)} file(s)",
                              kind="review_applied", review_id=rv.id,
                              files=written)
+            if rv.unaccepted:
+                self.add_message(
+                    "assistant",
+                    "Clause(s) " + ", ".join(rv.unaccepted)
+                    + " left unaccepted by the partial review.",
+                    kind="review_clauses_unaccepted", review_id=rv.id,
+                    clauses=list(rv.unaccepted))
             self.reindex_written(written)
             return True, detail
 
@@ -1301,9 +1325,12 @@ class State:
             return None
         return {"id": rv.id, "pending": not rv.outcome, "outcome": rv.outcome,
                 "task": rv.task, "partial_ok": rv.partial_ok,
+                "clause_texts": rv.clause_texts, "unaccepted": rv.unaccepted,
                 "files": [{"rel": d.rel, "added": d.added, "removed": d.removed,
                            "source": d.removed_source,
-                           "edited": d.rel in rv.edits} for d in rv.diffs]}
+                           "edited": d.rel in rv.edits,
+                           "clauses": list(getattr(d, "clauses", ()))}
+                          for d in rv.diffs]}
 
 
 STATE = State()
@@ -1312,11 +1339,13 @@ STATE = State()
 def install_runner() -> None:
     """Route reviews opened by the loop/scaffold code into the page, blocking
     the job thread until the user decides."""
-    def runner(*, page, nonce, writer, timeout, on_discard, diffs, task):
+    def runner(*, page, nonce, writer, timeout, on_discard, diffs, task,
+               clause_texts=None):
         diffs = diffs if diffs is not None else []
         rv = STATE.stage_review({
             "task": task, "diffs": diffs, "writer": writer,
-            "on_discard": on_discard, "partial_ok": on_discard is None})
+            "on_discard": on_discard, "partial_ok": on_discard is None,
+            "clause_texts": clause_texts})
         job = STATE.job
         deadline = time.time() + float(timeout or 1800)
         while not rv.done.wait(0.5):

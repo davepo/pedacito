@@ -1,6 +1,8 @@
 """B2: profile naming (`short_name`) and the idempotent profile writer."""
 from __future__ import annotations
 
+import random
+import re
 import sys
 from pathlib import Path
 
@@ -178,3 +180,290 @@ def test_comment_quoting_triple_delimiter_does_not_swallow_tables():
     assert out.count("[profiles.two]") == 1
     assert 'model = "c"' in out
     assert 'model = "a"' in out
+
+
+# --- R7: seeded round-trip properties -----------------------------------------
+#
+# Deterministic generative guard over the whole textual-patch invariant: for
+# any comment/string/table shape, set_values / remove_profile / add_profile
+# must yield text the loader accepts, never duplicate a table, and never lose
+# an unrelated key or comment. No model, no randomness at run time beyond the
+# fixed seeds.
+
+# Keys with unambiguous types, safe to generate in any scope.
+_SAFE_KEYS = ("model", "base_url", "api_key_env", "vram_gb", "max_steps",
+              "temperature", "disable_thinking")
+
+
+def _safe_value(r, key):
+    if key == "vram_gb":
+        return r.randrange(1, 96)
+    if key == "max_steps":
+        return r.randrange(0, 60)
+    if key == "temperature":
+        return round(r.uniform(0.0, 1.5), 2)
+    if key == "disable_thinking":
+        return r.choice([True, False])
+    if key == "base_url":
+        return f"http://localhost:{r.randrange(1024, 65536)}/v1"
+    if key == "api_key_env":
+        return f"KEY_{r.randrange(100)}"
+    return f"model-{r.randrange(1000)}"
+
+
+def _string_shape(r, nl):
+    """The FIX-011 class: quotes that look like triple delimiters, literal
+    strings, and multi-line values hiding comment/table lookalikes. Only the
+    name 'ghost' ever appears inside a string, so real profile headers can be
+    counted without false positives."""
+    return r.choice([
+        '"basic \\"escaped\\" quotes"',
+        "'literal with \"\"\" inside'",
+        '"basic with \'\'\' inside"',
+        '"""first # not a comment' + nl + '[profiles.ghost]' + nl + 'last"""',
+        "'''first \"\"\" inside" + nl + "[profiles.ghost]" + nl + "last'''",
+        '"""escaped \\""" still one value"""',
+    ])
+
+
+def _comment(r):
+    return r.choice([
+        "# plain note",
+        '# the old prompt used """ triple quotes',
+        "# ''' triple single quotes too",
+        "# [profiles.ghost] is not a real table",
+        '# "basic" and \'literal\' quotes',
+        "# key = value lookalike",
+    ])
+
+
+def _gen_config(r):
+    """A random but valid config: (text, profile names, regions). Each region
+    records its full-line comments so a removal can be checked precisely.
+    A comment emitted just before a header belongs to the previous region,
+    matching what remove_profile actually deletes (header line onward)."""
+    nl = "\r\n" if r.random() < 0.3 else "\n"
+    regions = [{"header": "", "comments": []}]
+    lines = []
+    used_global = set()
+
+    def region(header):
+        regions.append({"header": header, "comments": []})
+        lines.append(header)
+
+    def comment():
+        c = _comment(r)
+        lines.append(c)
+        regions[-1]["comments"].append(c)
+
+    def keys(n, global_scope=False):
+        for key in r.sample(_SAFE_KEYS, n):
+            if global_scope:
+                if key in used_global:
+                    continue
+                used_global.add(key)
+            value = _safe_value(r, key)
+            lit = E.literal(value)
+            if key in ("model", "base_url", "api_key_env") and r.random() < 0.5:
+                lit = _string_shape(r, nl)
+            tail = r.choice(["", "  # note", '  # see """ docs'])
+            lines.extend((f"{key} = {lit}{tail}").split(nl))
+
+    if r.random() < 0.5:
+        comment()
+    keys(r.randrange(0, 3), global_scope=True)
+    if r.random() < 0.7:
+        lines.append("")
+        region("[universal]")
+        keys(r.randrange(1, 4), global_scope=True)
+        if r.random() < 0.25:
+            lines.extend([
+                "shell_allowlist = [",
+                '  "pytest",  # inside an array',
+                '  "python",',
+                "]",
+            ])
+    names = []
+    for i in range(r.randrange(1, 4)):
+        name = f"p{i}"
+        names.append(name)
+        lines.append("")
+        if r.random() < 0.6:
+            comment()           # FIX-011: comment right before a header
+        region(f"[profiles.{name}]")
+        keys(r.randrange(1, 4))
+        if r.random() < 0.3:
+            region(f"[profiles.{name}.sampler]")
+            lines.append(f"seed = {r.randrange(100)}")
+    text = nl.join(lines) + nl
+    return text, names, regions
+
+
+def _comment_lines(text):
+    return [ln.strip() for ln in text.replace("\r\n", "\n").split("\n")
+            if ln.lstrip().startswith("#")]
+
+
+def _no_duplicate_tables(text, names):
+    flat = text.replace("\r\n", "\n")
+    for name in names:
+        for header in (f"[profiles.{name}]", f"[profiles.{name}.sampler]"):
+            hits = re.findall(r"^\s*" + re.escape(header) + r"\s*(?:#.*)?$",
+                              flat, re.M)
+            assert len(hits) <= 1, header
+
+
+def _check(out, flat, profiles, names):
+    f2, p2 = E.validate_text(out)
+    assert f2 == flat, (f2, flat)
+    assert p2 == profiles, (p2, profiles)
+    assert sorted(E.profile_names(out)) == sorted(names)
+    _no_duplicate_tables(out, names)
+
+
+def test_roundtrip_single_ops_seeded():
+    for seed in range(75):
+        r = random.Random(seed)
+        text, names, regions = _gen_config(r)
+        flat0, prof0 = E.validate_text(text)      # generator sanity
+        comments = _comment_lines(text)
+        key = r.choice(_SAFE_KEYS)
+        val = _safe_value(r, key)
+
+        # global set: only the key changes, every comment survives
+        out = E.set_values(text, {key: val})
+        _check(out, {**flat0, key: val}, prof0, names)
+        assert _comment_lines(out) == comments
+
+        # set inside an existing profile
+        p = names[0]
+        out = E.set_values(text, {key: val}, profile=p)
+        want = {**prof0, p: {**prof0.get(p, {}), key: val}}
+        _check(out, flat0, want, names)
+        assert _comment_lines(out) == comments
+
+        # set inside a profile that does not exist yet: it is created
+        out = E.set_values(text, {key: val}, profile="fresh")
+        _check(out, flat0, {**prof0, "fresh": {key: val}}, names + ["fresh"])
+        assert _comment_lines(out) == comments
+
+        # global remove of a key that is present
+        if flat0:
+            k = r.choice(sorted(flat0))
+            out = E.set_values(text, removes=[k])
+            _check(out, {a: b for a, b in flat0.items() if a != k},
+                   prof0, names)
+            assert _comment_lines(out) == comments
+
+        # remove each profile: its regions' comments go, all others stay
+        for p in names:
+            out = E.remove_profile(text, p)
+            want = {a: b for a, b in prof0.items() if a != p}
+            _check(out, flat0, want, [n for n in names if n != p])
+            kept = [c for reg in regions
+                    if reg["header"] != f"[profiles.{p}]"
+                    and not reg["header"].startswith(f"[profiles.{p}.")
+                    for c in reg["comments"]]
+            assert _comment_lines(out) == kept
+
+        # add a brand-new profile
+        vals = {"model": "added-model",
+                "base_url": "http://localhost:1234/v1"}
+        out = E.add_profile(text, "added", vals)
+        _check(out, flat0, {**prof0, "added": vals}, names + ["added"])
+        assert _comment_lines(out) == comments
+
+
+def test_roundtrip_chained_seeded():
+    for seed in range(40):
+        r = random.Random(1000 + seed)
+        text, names, _regions = _gen_config(r)
+        flat, prof = E.validate_text(text)
+        n_comments = len(_comment_lines(text))
+        added = 0
+        for _ in range(5):
+            op = r.randrange(4)
+            key = r.choice(_SAFE_KEYS)
+            val = _safe_value(r, key)
+            removed = False
+            if op == 0:
+                text = E.set_values(text, {key: val})
+                flat = {**flat, key: val}
+            elif op == 1 and names:
+                p = r.choice(names)
+                text = E.set_values(text, {key: val}, profile=p)
+                prof = {**prof, p: {**prof.get(p, {}), key: val}}
+            elif op == 2:
+                added += 1
+                name = f"added{added}"
+                vals = {"model": f"m{added}", "vram_gb": 8}
+                text = E.add_profile(text, name, vals)
+                prof = {**prof, name: vals}
+                names = names + [name]
+            elif op == 3 and names:
+                p = r.choice(names)
+                text = E.remove_profile(text, p)
+                prof = {a: b for a, b in prof.items() if a != p}
+                names = [n for n in names if n != p]
+                removed = True
+            f2, p2 = E.validate_text(text)
+            assert f2 == flat, (seed, f2, flat)
+            assert p2 == prof, (seed, p2, prof)
+            assert sorted(E.profile_names(text)) == sorted(names)
+            _no_duplicate_tables(text, names)
+            n = len(_comment_lines(text))
+            assert n <= n_comments
+            if not removed:
+                assert n == n_comments
+            n_comments = n
+
+
+def test_roundtrip_over_the_starter_template_seeded():
+    for seed in range(15):
+        r = random.Random(2000 + seed)
+        text = config_mod.TEMPLATE
+        if seed % 3 == 0:
+            text = text.replace("\n", "\r\n")
+        flat0, prof0 = E.validate_text(text)
+        names = E.profile_names(text)
+        key = r.choice(_SAFE_KEYS)
+        val = _safe_value(r, key)
+        out = E.set_values(text, {key: val})
+        f2, p2 = E.validate_text(out)
+        assert p2 == prof0
+        assert f2[key] == val
+        _no_duplicate_tables(out, names)
+        out = E.set_values(out, {key: val}, profile="default")
+        _f3, p3 = E.validate_text(out)
+        assert p3["default"][key] == val
+        out = E.add_profile(out, "extra", {"model": "m"})
+        E.validate_text(out)
+        assert "extra" in E.profile_names(out)
+        out = E.remove_profile(out, "extra")
+        _f4, p4 = E.validate_text(out)
+        assert "extra" not in p4
+        _no_duplicate_tables(out, names)
+
+
+def test_roundtrip_empty_and_comment_only_bases():
+    for text in ("", "# only a comment\n", "# '''\n", '# """\n'):
+        out = E.set_values(text, {"vram_gb": 8})
+        flat, _prof = E.validate_text(out)
+        assert flat["vram_gb"] == 8
+        out = E.add_profile(out, "first", {"model": "m"})
+        _flat, prof = E.validate_text(out)
+        assert prof["first"] == {"model": "m"}
+        out = E.remove_profile(out, "first")
+        E.validate_text(out)
+        assert E.profile_names(out) == []
+
+
+def test_set_value_keeps_tail_after_escaped_triple_quote():
+    """An escaped quote inside a multi-line basic string (\\\"\"\") must not
+    end the value early: the trailing comment and the next key survive."""
+    text = ('model = """escaped \\""" still one value"""  # keep me\n'
+            'vram_gb = 8\n')
+    out = E.set_values(text, {"model": "replaced"})
+    E.validate_text(out)
+    assert "# keep me" in out
+    assert "vram_gb = 8" in out

@@ -106,11 +106,10 @@ def _triple_toggles(line: str, state: str) -> str:
         if ch == "#":
             break
         if line.startswith(('"""', "'''"), i):
-            q = line[i:i + 3]
-            end = line.find(q, i + 3)
-            if end == -1:
-                return q
-            i = end + 3
+            # Let the in-string branch above find the close: it honours
+            # backslash escapes, a naive find() does not (\""" is content).
+            state = line[i:i + 3]
+            i += 3
             continue
         if ch in "\"'":
             i += 1
@@ -165,6 +164,9 @@ def _value_end(lines: list[str], i: int, col: int) -> tuple[int, int]:
             ch = line[k]
             if quote:
                 if quote in ('"""', "'''"):
+                    if quote == '"""' and ch == "\\":
+                        k += 2
+                        continue
                     if line.startswith(quote, k):
                         quote, k = "", k + 3
                         continue

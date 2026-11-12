@@ -983,7 +983,8 @@ GUI_TOPICS = [
         "steps": [
             "Topbar → ⚙ Settings → Model discovery",
             "Click Scan local servers (or type another server URL and its "
-            "VRAM GB)",
+            "VRAM GB); the scan is capped at 20 s and returns what it found "
+            "when the budget is spent",
             "Tick the models to import, optionally choose a default radio, "
             "then Import Selected (N)",
             "Edit the new entries under ⚙ Settings → Profiles",
@@ -1118,6 +1119,9 @@ GUI_TOPICS = [
             "the middle Changes pane opens)",
             "Untick files to accept only some; use ✎ Edit proposed or "
             "Side by side / Unified",
+            "Each file shows clause badges (R1, R2, ...) for the parts of the "
+            "task it serves; accepting only some files flags any clause left "
+            "unaccepted",
             "Click Accept (or Accept N of M) / Reject",
         ],
         "keywords": ["review", "diff", "accept", "reject", "staged changes",
@@ -1383,6 +1387,8 @@ GUI_TOPICS = [
             "test_command if detection guesses wrong",
             "CLI: pedacito auto ... --apply --verify \"pytest -q\"; "
             "pedacito tests . --files src/app.py shows impacted tests",
+            "A failure the command ledger already recorded before this run is "
+            "labelled pre-existing and does not trigger repair",
         ],
         "keywords": ["run tests", "verify", "pytest", "verification",
                      "test command", "impacted tests", "after edits"],
@@ -1524,6 +1530,8 @@ GUI_TOPICS = [
             "requested dialog",
             "Loopback, link-local and private-network addresses are refused unless "
             "you list them in fetch_allowed_hosts",
+            "A public name that resolves to a private address is refused too "
+            "(DNS rebinding); the connection is pinned to the checked IP",
             "Config form: enable_web = true in config.toml",
         ],
         "keywords": ["web", "internet", "online", "fetch", "fetch url", "web search",
@@ -1626,6 +1634,9 @@ GUI_TOPICS = [
             "passes again in the same task",
             "The file keeps at most eight lessons, de-duplicated; a lesson about a "
             "file that was deleted is dropped",
+            "Lessons carry runs/recurred/avoided counters from observed checks; one "
+            "that never avoids its failure kind across five runs moves to "
+            "retired_lessons",
             "A lesson confirmed twice whose files share one directory is promoted "
             "into an auto-managed path-scoped rule (.pedacito/rules/auto_<dir>.md) "
             "shown only when the model reads a file in that directory",

@@ -86,7 +86,9 @@ You can add models two ways. Both write profiles to your config, so you only do
 this once per model.
 
 **From a local server.** Open **Settings** (the gear) and go to **Model
-discovery**. Click **Scan local servers**. Pedacito asks how much GPU memory the
+discovery**. Click **Scan local servers**. The scan is capped at 20 seconds and
+returns whatever it found when the budget is spent, so a slow server cannot
+block it. Pedacito asks how much GPU memory the
 machine running the server has, in GB. Then tick only the models you want. The
 name box lets you rename a profile. Click **Import Selected**. Each model becomes a
 profile named after it, and one is set as the default. Each profile in the list
@@ -150,7 +152,9 @@ explains when each setting helps.
 5. When the run finishes, the **Changes** panel shows each file's old code and
    new code side by side, with the changed words highlighted. You can accept or
    reject the whole set, untick individual files, or click **Edit updated** to
-   change the new version by hand before accepting.
+   change the new version by hand before accepting. Each file shows clause
+   badges (`R1`, `R2`, ...) for the parts of your request it serves; accepting
+   only some files flags any clause left unaccepted.
 
 Pedacito backs up each file before it writes. If a file changed on disk after
 the preview, the write is refused, so your own edits are never overwritten.
@@ -248,7 +252,9 @@ page, and `web_search` looks up documentation. To allow them without asking each
 time, open **⚙ Settings → All settings**, search for `enable_web`, set it to on
 for every profile, and save. Or leave it off and approve each call in the
 permission dialog. Loopback, link-local and private-network addresses are refused
-unless you list them in `fetch_allowed_hosts`.
+unless you list them in `fetch_allowed_hosts`. A public name that *resolves* to a
+private address is refused too (DNS rebinding), and the connection is pinned to
+the checked IP so a second DNS answer cannot swap it mid-request.
 
 ### A14. Other things to know
 
@@ -726,7 +732,9 @@ Per project, under `<project>/.pedacito/`:
   lessons under `anti_patterns`. A lesson is written only after a fix is verified.
   A lesson confirmed twice whose files share one directory is promoted into an
   auto-managed path-scoped rule (`rules/auto_*.md`) and leaves `anti_patterns`;
-  those files clean themselves up when the files they name are deleted.
+  those files clean themselves up when the files they name are deleted. Lessons
+  carry `runs` / `recurred` / `avoided` counters; one that never avoids its
+  failure kind across five observed runs moves to `retired_lessons`.
   Safe to read, edit, or delete.
 
 Deleting the folder is always safe. You only pay for a re-index. `pedacito reset`

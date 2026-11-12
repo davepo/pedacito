@@ -42,11 +42,13 @@ import ast
 import copy
 import difflib
 import fnmatch
+import http.client
 import json
 import os
 import re
 import shlex
 import shutil
+import socket
 import subprocess
 import sys
 import time
@@ -4194,14 +4196,116 @@ class _NoAutoRedirect(urllib.request.HTTPRedirectHandler):
         return None
 
 
+def _pin_port(host: str):
+    """Port of a request netloc (`name:port`, `[v6]:port`), else None."""
+    if host.startswith("["):
+        _, _, tail = host.partition("]")
+        return int(tail[1:]) if tail.startswith(":") else None
+    _, sep, port = host.rpartition(":")
+    return int(port) if sep and port.isdigit() else None
+
+
+def _pin_host_header(u) -> str:
+    """The Host header for a pinned request: the original name (with port),
+    never the IP and never any userinfo the URL carried."""
+    name = (u.hostname or "").lower()
+    if ":" in name:                              # an IPv6 literal keeps []
+        name = f"[{name}]"
+    return f"{name}:{u.port}" if u.port else name
+
+
+class _PinHostHeader:
+    """Host keeps the original name while TCP goes to the pinned IP."""
+
+    def putrequest(self, method, url, skip_host=False,
+                   skip_accept_encoding=False):
+        super().putrequest(method, url, skip_host=True,
+                           skip_accept_encoding=skip_accept_encoding)
+        self.putheader("Host", self._pin_host)
+
+
+class _PinnedHTTPConnection(_PinHostHeader, http.client.HTTPConnection):
+    """TCP to the SSRF-validated IP instead of re-resolving the name."""
+
+    def __init__(self, host, *, pin_ip, pin_host, **kw):
+        super().__init__(pin_ip, _pin_port(host), **kw)
+        self._pin_host = pin_host
+
+
+class _PinnedHTTPSConnection(_PinHostHeader, http.client.HTTPSConnection):
+    """Same pin, plus TLS: SNI and the certificate check use the NAME even
+    though the socket connects to the validated IP."""
+
+    def __init__(self, host, *, pin_ip, pin_host, pin_name, context=None, **kw):
+        super().__init__(pin_ip, _pin_port(host), context=context, **kw)
+        self._pin_host = pin_host
+        self._pin_name = pin_name
+
+    def connect(self):
+        # http.client's connect, with server_hostname pinned to the name.
+        # Direct connections only (the opener carries ProxyHandler({})), so
+        # there is no tunnel branch to mirror.
+        sock = socket.create_connection((self.host, self.port),
+                                        self.timeout, self.source_address)
+        try:
+            server_hostname = (self._pin_name
+                               if self._context.check_hostname else None)
+            self.sock = self._context.wrap_socket(
+                sock, server_hostname=server_hostname)
+        except BaseException:
+            sock.close()
+            raise
+
+
+class _PinnedHTTPHandler(urllib.request.HTTPHandler):
+    def __init__(self, ip, host_header):
+        super().__init__()
+        self._pin_ip = ip
+        self._pin_host = host_header
+
+    def http_open(self, req):
+        def factory(host, **kw):
+            return _PinnedHTTPConnection(
+                host, pin_ip=self._pin_ip, pin_host=self._pin_host, **kw)
+        return self.do_open(factory, req)
+
+
+class _PinnedHTTPSHandler(urllib.request.HTTPSHandler):
+    def __init__(self, name, ip, host_header):
+        super().__init__()
+        self._pin_name = name
+        self._pin_ip = ip
+        self._pin_host = host_header
+
+    def https_open(self, req):
+        def factory(host, **kw):
+            return _PinnedHTTPSConnection(
+                host, pin_ip=self._pin_ip, pin_host=self._pin_host,
+                pin_name=self._pin_name, context=self._context, **kw)
+        return self.do_open(factory, req)
+
+
 def _web_open(url: str, allowed_hosts=()):
     """One GET with our UA and a hard timeout, following redirects by hand so
-    every hop passes the SSRF guard before it is requested. Attribute lookup
-    at call time so tests (and the sandbox story) can stand in for the opener."""
-    opener = urllib.request.build_opener(_NoAutoRedirect)
+    every hop passes the SSRF guard before it is requested. Each hop is also
+    resolved once and pinned to a validated IP (Host/SNI keep the name), so a
+    public name that resolves to a private IP -- DNS rebinding -- is refused,
+    and a second DNS answer cannot swap addresses mid-request. Direct
+    connections only: ProxyHandler({}) ignores ambient proxies, which would
+    resolve the name again on their own. Attribute lookup at call time so
+    tests (and the sandbox story) can stand in for the opener."""
     current = url
     hops = 0
     while True:
+        u = urllib.parse.urlparse(current)
+        host = (u.hostname or "").lower()
+        err, ips = security.resolve_checked(host, allowed_hosts)
+        if err:
+            raise ValueError(err)
+        opener = urllib.request.build_opener(
+            _NoAutoRedirect, urllib.request.ProxyHandler({}),
+            _PinnedHTTPHandler(ips[0], _pin_host_header(u)),
+            _PinnedHTTPSHandler(host, ips[0], _pin_host_header(u)))
         req = urllib.request.Request(current,
                                      headers={"User-Agent": _WEB_USER_AGENT})
         try:

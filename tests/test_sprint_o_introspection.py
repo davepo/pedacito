@@ -442,6 +442,82 @@ def test_post_edit_frontend_gate_repairs_then_learns(tmp_path, monkeypatch):
     assert "nope" in rows[0]["text"] or "getElementById" in rows[0]["text"]
 
 
+def test_post_edit_run_counts_a_recurred_lesson_kind(tmp_path, monkeypatch):
+    """R5 wiring: a lesson injected before the run whose failure kind the run
+    trips again gets `recurred` bumped -- the effectiveness signal the ledger
+    retires on. The lesson distilled from this run's own repair is NOT counted
+    (it was not in the run's prompt)."""
+    (tmp_path / "index.html").write_text(
+        '<html><body><div id="board"></div><script src="app.js"></script>'
+        "</body></html>", encoding="utf-8")
+    (tmp_path / "app.js").write_text(
+        "document.getElementById('nope');\n", encoding="utf-8")
+    cfg = _cfg(verify_tests=True, allow_shell=True, repair_rounds=1,
+               sandbox=False)
+    cfg._frontend_baseline = set()
+    seeded = memory.record_anti_pattern(
+        tmp_path, "dom_id_mismatch",
+        "an earlier run queried an id no template renders", ["app.js"], cfg)
+    FIXED = "document.getElementById('board');\n"
+
+    class FakeAgent:
+        def _repair_from_findings(self, task, reply, findings, results):
+            return "REPAIR"
+
+        def _apply_once(self, reply, dry_run, backup_dir):
+            (tmp_path / "app.js").write_text(FIXED)
+            return [Result(True, "app.js", "applied",
+                            before="document.getElementById('nope');\n",
+                            after=FIXED)]
+
+    monkeypatch.setattr(loop, "_run_tests",
+                        lambda idx, cfg_, files: (True, "1 passed", "pytest"))
+    results = [Result(True, "app.js", "applied",
+                      before="", after="document.getElementById('nope');\n")]
+    loop._post_edit_tests(
+        tmp_path, cfg, FakeAgent(), types.SimpleNamespace(root=tmp_path),
+        "task", results, "reply", None, None, ["app.js"])
+
+    rows = {r["lesson_id"]: r for r in memory.load_anti_patterns(tmp_path)}
+    assert rows[seeded["lesson_id"]]["runs"] == 1
+    assert rows[seeded["lesson_id"]]["recurred"] == 1
+    assert rows[seeded["lesson_id"]]["avoided"] == 0
+    fresh = [r for lid, r in rows.items() if lid != seeded["lesson_id"]]
+    assert len(fresh) == 1 and fresh[0]["runs"] == 0
+
+
+def test_post_edit_clean_run_counts_lesson_avoided(tmp_path, monkeypatch):
+    """R5 wiring: a run whose gates and tests stay clear of a lesson's kind
+    counts as `avoided` -- the signal that keeps an effective lesson alive."""
+    cfg = _cfg(verify_tests=True, allow_shell=True, repair_rounds=1)
+    before = "x = 1\n"
+    (tmp_path / "mod.py").write_text(before, encoding="utf-8")
+    seeded = memory.record_anti_pattern(
+        tmp_path, "dom_id_mismatch",
+        "an earlier run queried an id no template renders", ["mod.py"], cfg)
+
+    class FakeAgent:
+        def _repair_from_findings(self, *a):
+            raise AssertionError("a clean run must not repair")
+
+        def _apply_once(self, *a):
+            raise AssertionError("a clean run must not repair")
+
+    monkeypatch.setattr(loop, "_run_tests",
+                        lambda idx, cfg_, files: (True, "1 passed", "pytest"))
+    loop._post_edit_tests(
+        tmp_path, cfg, FakeAgent(), object(), "task",
+        [Result(True, "mod.py", "applied", before=before, after=before)],
+        "reply", None, None, ["mod.py"])
+
+    rows = memory.load_anti_patterns(tmp_path)
+    assert len(rows) == 1
+    assert rows[0]["lesson_id"] == seeded["lesson_id"]
+    assert rows[0]["runs"] == 1
+    assert rows[0]["avoided"] == 1
+    assert rows[0]["recurred"] == 0
+
+
 def test_frontend_gate_ablation_skips_check(tmp_path, monkeypatch):
     (tmp_path / "index.html").write_text(
         '<html><script src="gone.js"></script></body></html>',

@@ -3436,15 +3436,78 @@ class Agent:
         tail = f" -- {reason}" if reason else ""
         return f"[FAILED {name}{tail}]"
 
+    def _coverage_intents(self, reqs) -> list[dict]:
+        """Deterministic follow-up intents for unaddressed edit clauses: no
+        planner call. Each requirement's located anchors, its most specific
+        symbol term, then its file terms are resolved against the index --
+        first hit wins. A clause that resolves to nothing seeds nothing (its
+        coverage warning stays advisory)."""
+        intents: list[dict] = []
+        seen: set[tuple[str, str]] = set()
+
+        def add(rel: str, symbol: str, change: str) -> None:
+            key = (fileio.path_key(rel), fileio.path_key(symbol))
+            if rel and key not in seen:
+                seen.add(key)
+                intents.append({"file": rel, "symbol": symbol,
+                                "intended_change": change})
+
+        for req in reqs:
+            before = len(intents)
+            # 1. A located anchor or displayed read names an exact span: the
+            #    smallest definition covering it is the follow-up target.
+            for rel, a, _b in req.anchors + req.read_spans:
+                units = [c for c in self.index.in_file(rel)
+                         if c.kind not in ("module", "reference")
+                         and c.start <= a <= (c.scope_end or c.end)]
+                if units:
+                    unit = min(units, key=lambda c: c.nlines)
+                    add(rel, unit.qualname, req.text)
+                else:
+                    add(rel, "", req.text)
+                break
+            if len(intents) > before:
+                continue
+            # 2. The clause's most specific term resolves to one definition.
+            term = req.search_term()
+            if term:
+                hits = self.index.find_symbol(term)
+                files = {c.file for c in hits if c.file}
+                if len(files) == 1:
+                    unit = min(hits, key=lambda c: c.nlines)
+                    add(unit.file, unit.qualname, req.text)
+                    continue
+            # 3. A term names a file (exact reference or unique stem match):
+            #    the whole file is the target, so a brand-new symbol can land.
+            for t in req.terms:
+                rel = self.index.resolve_file(t)
+                if not rel:
+                    low = t.lower()
+                    matches = [f for f in self.index.files
+                               if f.rsplit("/", 1)[-1]
+                               .rpartition(".")[0].lower() == low]
+                    rel = matches[0] if len(matches) == 1 else None
+                if rel:
+                    add(rel, "", req.text)
+                    break
+        return intents
+
     def apply_edit_intents(self, task: str, gathered: str, intents: list[dict],
-                           backup_dir=None, verbose: bool = False):
+                           backup_dir=None, verbose: bool = False,
+                           _followup: bool = False):
         """Apply a planned intent list one symbol at a time.
 
         Each target is resolved against the CURRENT index/disk, its exact source
         is appended at the prompt tail, and the model emits exactly one hunk.
         The hunk is dry-applied and checked before anything is written; after a
         success the temporary source is gone from the next prompt (only a
-        one-line receipt remains). Returns (results, reply, findings)."""
+        one-line receipt remains). Returns (results, reply, findings).
+
+        After the batch, unaddressed edit clauses from the requirement ledger
+        seed ONE bounded follow-up pass (`_followup` marks that pass so it never
+        recurses again); each follow-up hunk pays the same dry-apply/verify gate
+        and the same per-target retry ceiling, and a spent token budget stops
+        it like any other call."""
         from . import verify as verify_mod
         self._set_site("answer")
         system = self._answer_sys(task) + (
@@ -3601,6 +3664,31 @@ class Agent:
                                    for r in results_all):
                 tracker.observe_verified(
                     {r.file for r in results_all if r.file})
+        reply = ("Symbol-anchored incremental edits:\n" + "\n".join(receipts)
+                 if receipts else "No symbol-anchored edits were applied.")
+        if not _followup:
+            # A half-answered multi-clause task used to end with an advisory
+            # coverage warning. The requirement state machine now seeds one
+            # bounded follow-up pass from the clauses no hunk addressed.
+            seeds = verify_mod.coverage_seeds(task, reply, results_all,
+                                              tracker=tracker)
+            followup = self._coverage_intents(seeds) if seeds else []
+            if followup:
+                self._emit("coverage_followup",
+                           clauses=[r.text for r in seeds],
+                           targets=len(followup))
+                if verbose:
+                    print(f"  [coverage follow-up: {len(followup)} target(s) "
+                          f"for {len(seeds)} unaddressed clause(s)]",
+                          file=sys.stderr)
+                more_results, more_reply, more_findings = \
+                    self.apply_edit_intents(
+                        task, gathered, followup, backup_dir=backup_dir,
+                        verbose=verbose, _followup=True)
+                results_all.extend(more_results)
+                findings_all.extend(more_findings)
+                reply += ("\n\nCoverage follow-up (unaddressed task clauses):"
+                          "\n" + "\n".join(more_reply.splitlines()[1:]))
         mixed = [r for r in results_all if not getattr(r, "ok", False)]
         if results_all and mixed and len(mixed) < len(results_all):
             # Half a feature is on disk and half is not. Nothing rolls back:
@@ -3626,8 +3714,6 @@ class Agent:
                       f"feature is half-implemented, and a later step reading "
                       f"them sees the mix. To start over:{undo}.",
                       file=sys.stderr)
-        reply = ("Symbol-anchored incremental edits:\n" + "\n".join(receipts)
-                 if receipts else "No symbol-anchored edits were applied.")
         return results_all, reply, findings_all
 
     def incremental_edit(self, task: str, gathered: str, backup_dir=None,

@@ -70,6 +70,9 @@ class FileDiff:
     # Display-only row for a rename's source ("removed (renamed to X)"); never
     # written on sign-off, the rename-removal pass deletes the source instead.
     removed_source: bool = False
+    # Requirement clause ids ("R1", ...) this file's edits serve (R8); empty
+    # when no tracker evidence is available (e.g. diffs rebuilt from backups).
+    clauses: tuple[str, ...] = ()
 
 
 def _sha(text: str) -> str:
@@ -155,19 +158,24 @@ def build_rows(before: str, after: str) -> tuple[list[Row], int, int]:
     return rows, added, removed
 
 
-def diffs_from_results(results, root=None) -> list[FileDiff]:
+def diffs_from_results(results, root=None, clauses=None) -> list[FileDiff]:
     """Convert edits.Result objects (from apply_edits(dry_run=True)) into
     FileDiffs. Only successful results with computed before/after text count.
 
     `root` is only consulted for renames, where each source file's real
-    contents are shown as a deletion."""
+    contents are shown as a deletion. `clauses` is an optional file -> [clause
+    ids] map (from the requirement tracker) attached to each FileDiff so the
+    review can show which task clause a file serves (R8)."""
+    clauses = clauses or {}
     out: list[FileDiff] = []
     for r in results:
         if not r.ok or not r.sha:
             continue
         rows, added, removed = build_rows(r.before, r.after)
+        ids = tuple(clauses.get(r.file, ()))
         out.append(FileDiff(r.file, rows, added, removed, r.sha, r.after,
-                            r.message, renames_from=tuple(r.renames_from)))
+                            r.message, renames_from=tuple(r.renames_from),
+                            clauses=ids))
         if root is None:
             continue
         for old in r.renames_from:
@@ -178,7 +186,7 @@ def diffs_from_results(results, root=None) -> list[FileDiff]:
             orows, oa, om = build_rows(otext, "")
             out.append(FileDiff(old, orows, oa, om, _sha(otext), "",
                                 "removed (renamed to " + r.file + ")",
-                                removed_source=True))
+                                removed_source=True, clauses=ids))
     return out
 
 
@@ -287,6 +295,11 @@ thead th.right { border-left: 2px solid var(--rule); }
 .tally { margin-left: auto; font-size: 12.5px; letter-spacing: 0.02em; }
 .tally .p { color: var(--set); }
 .tally .m { color: var(--cut); }
+.clause {
+  font: 500 11px/1 "Segoe UI", system-ui, sans-serif; color: var(--ink-2);
+  background: var(--band); border: 1px solid var(--hair);
+  padding: 2px 6px; border-radius: 2px; letter-spacing: 0.04em;
+}
 
 table { width: 100%; border-collapse: collapse; table-layout: fixed; }
 col.n { width: 3.6em; }
@@ -502,15 +515,22 @@ def _rows_html(fd: FileDiff, fid: int) -> str:
 
 
 def build_page(diffs: list[FileDiff], task: str, model: str, profile: str,
-               nonce: str, interactive: bool, stamp: str) -> str:
+               nonce: str, interactive: bool, stamp: str,
+               clause_texts: dict | None = None) -> str:
     """Assemble the self-contained review page. `interactive` adds the sign-off
     checkbox and Apply/Discard buttons wired to `nonce`; otherwise the page is a
-    read-only preview."""
+    read-only preview. `clause_texts` (clause id -> text) titles the per-file
+    clause badges so a reviewer sees which task clause each file serves."""
+    clause_texts = clause_texts or {}
     files_html = []
     for i, fd in enumerate(diffs):
+        badges = "".join(
+            f'<span class="clause" title="{html.escape(clause_texts.get(c, c))}">'
+            f'{html.escape(c)}</span>' for c in fd.clauses)
         files_html.append(f"""
 <section class="file">
   <h2>{html.escape(fd.rel)}
+    {badges}
     <span class="tally"><span class="p">+{fd.added}</span>
       &nbsp;<span class="m">&minus;{fd.removed}</span></span>
   </h2>
@@ -815,23 +835,25 @@ def save(root: Path, page: str, stamp: str) -> Path:
 
 # When set (the GUI does), `run` hands the review to this callable instead of
 # opening a second browser window. It receives the same inputs as keyword
-# arguments, plus `diffs` and `task`, and returns the same (outcome, detail).
-# A runner may drop entries from `diffs` in place before calling `writer()`
-# (per-file accept); callers therefore re-read `diffs` afterwards.
+# arguments, plus `diffs`, `task` and `clause_texts`, and returns the same
+# (outcome, detail). A runner may drop entries from `diffs` in place before
+# calling `writer()` (per-file accept); callers therefore re-read `diffs`
+# afterwards.
 RUNNER = None
 
 
 def run(page: str, nonce: str, writer, port: int = 0, open_browser: bool = True,
         timeout: float = 1800.0, on_url=None, on_discard=None,
-        diffs=None, task: str = ""):
+        diffs=None, task: str = "", clause_texts=None):
     """Serve the page on 127.0.0.1 and block until Apply/Discard or `timeout`
     seconds. `writer()` -> (ok, detail) is called on Apply; `on_discard()` on
     Discard, for flows whose files are already on disk (`new --review`).
     Returns (outcome, detail); outcome is "applied", "cancelled" or "timeout".
-    `diffs` and `task` are only used by an installed `RUNNER`."""
+    `diffs`, `task` and `clause_texts` are only used by an installed `RUNNER`."""
     if RUNNER is not None:
         return RUNNER(page=page, nonce=nonce, writer=writer, timeout=timeout,
-                      on_discard=on_discard, diffs=diffs, task=task)
+                      on_discard=on_discard, diffs=diffs, task=task,
+                      clause_texts=clause_texts)
     srv = LocalHTTPServer(("127.0.0.1", port), _Handler)
     srv.page = page
     srv.nonce = nonce

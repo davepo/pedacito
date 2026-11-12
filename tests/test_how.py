@@ -122,14 +122,36 @@ def _names(matches, bucket):
 
 def test_structured_index_covers_cli_gui_and_settings():
     from pedacito import how_index
+    from pedacito.cli import build_parser
     from pedacito.config import Config
     from dataclasses import fields
 
-    cli = {c["name"] for c in how_index.CLI_COMMANDS}
-    for name in ("ask", "explain", "auto", "new", "index", "calibrate",
-                 "models scan", "profiles", "restore", "reset", "prune",
-                 "eval", "gui", "config", "chat", "how"):
-        assert name in cli
+    # Drift guard: the expected command set is derived from the real
+    # argparse subparsers, so adding a subcommand without a how-card
+    # fails here instead of silently shipping undocumented.
+    parser = build_parser()
+    sub = next(a for a in parser._actions
+               if isinstance(a, argparse._SubParsersAction))
+    cards = {c["name"]: c for c in how_index.CLI_COMMANDS}
+    for name, p in sub.choices.items():
+        action_arg = next((a for a in p._actions
+                           if a.dest == "action" and a.choices), None)
+        if name == "models":
+            # `models` is only usable with an action; its card is named
+            # after the action ("models scan").
+            assert action_arg is not None
+            expected = {f"{name} {act}" for act in action_arg.choices}
+        else:
+            expected = {name}
+        assert expected <= set(cards), \
+            f"CLI command {name!r} has no how-card"
+        if action_arg is not None and name != "models":
+            # Every action choice must be documented in the card.
+            card = cards[name]
+            doc = card["usage"] + " " + " ".join(
+                f["flag"] + " " + f["help"] for f in card["flags"])
+            for act in action_arg.choices:
+                assert act in doc, (name, act)
     assert {"disable-thinking", "import-models", "reset-config", "undo-run",
             "reference-file"} <= {t["id"] for t in how_index.GUI_TOPICS}
     setting_keys = {s["key"] for s in how_index.settings_dictionary()}

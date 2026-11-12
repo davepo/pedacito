@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import sys
 import threading
+import time
 from http.server import BaseHTTPRequestHandler
 from pathlib import Path
 
@@ -219,7 +220,7 @@ def test_probe_root_does_not_http_probe_a_dead_port(monkeypatch):
     request budget on Windows."""
     calls = []
     monkeypatch.setattr(discovery, "_listening",
-                        lambda root, timeout: False)
+                        lambda root, timeout, deadline=None: False)
     monkeypatch.setattr(discovery, "_get",
                         lambda *a, **k: calls.append((a, k)))
     assert discovery._probe_root("http://127.0.0.1:9", 2.0) is None
@@ -276,3 +277,73 @@ def test_model_info_takes_an_explicit_model_id(monkeypatch):
     assert client.model_info()["size_bytes"] == 1_000_000
     assert client.model_info("model-b")["size_bytes"] == 2_000_000
     assert client.model_info("model-b")["context_length"] == 8192
+
+
+# ------------------------------------------------- R3: wall-clock scan budget
+def _serve_sleeping(delay, port=0):
+    """A server that accepts connections promptly but sleeps `delay` seconds
+    before answering any request -- a slow remote profile URL in miniature."""
+
+    class H(BaseHTTPRequestHandler):
+        def log_message(self, *a):
+            pass
+
+        def do_GET(self):
+            time.sleep(delay)
+            try:
+                body = b'{"data": [{"id": "slow-model"}]}'
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+            except OSError:
+                pass                    # the client gave up on the budget
+
+    srv = LocalHTTPServer(("127.0.0.1", port), H)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    return srv
+
+
+def test_discovery_returns_partial_results_within_the_budget(fake):
+    """R3: a fast server plus one that sleeps far past the budget. The scan
+    must return within ~budget carrying the fast server, not hang on the slow
+    one (the GUI request used to block on every remote profile URL)."""
+    fast = fake(_openai())
+    slow_srv = _serve_sleeping(5.0)
+    slow = f"http://127.0.0.1:{slow_srv.server_address[1]}"
+    try:
+        t0 = time.monotonic()
+        found = discovery.discover_servers(urls=[fast, slow], ports=(),
+                                           budget=0.6)
+        elapsed = time.monotonic() - t0
+        assert elapsed < 2.5, f"scan blew its budget: {elapsed:.2f}s"
+        bases = [b for _l, b, _ids in found]
+        assert fast + "/v1" in bases          # the fast server was probed
+        assert slow + "/v1" not in bases      # the slow one was cut off
+    finally:
+        slow_srv.shutdown()
+        slow_srv.server_close()
+
+
+def test_discovery_without_a_budget_still_probes_everything(fake):
+    """The budget is opt-in: with none, a slow-but-answering server is still
+    found (behaviour unchanged for callers that pass no budget)."""
+    slow_srv = _serve_sleeping(0.05)
+    slow = f"http://127.0.0.1:{slow_srv.server_address[1]}"
+    try:
+        found = discovery.discover_servers(urls=[slow], ports=())
+        assert [b for _l, b, _ids in found] == [slow + "/v1"]
+    finally:
+        slow_srv.shutdown()
+        slow_srv.server_close()
+
+
+def test_slice_caps_the_timeout_by_the_remaining_budget():
+    """_slice bounds a request by the time left, and answers 0 once spent."""
+    assert discovery._slice(2.0, None) == 2.0
+    now = time.monotonic()
+    assert discovery._slice(2.0, now + 0.5) <= 0.5
+    assert discovery._slice(2.0, now - 1.0) == 0.0
+    # a short per-request timeout still wins over a large remaining budget
+    assert discovery._slice(0.2, now + 10.0) == 0.2

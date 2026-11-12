@@ -2136,6 +2136,10 @@ function DiffPane() {
         <b id="reviewTitle" title=${R.task || ''}>${R.task || 'Proposed changes'}</b>
         ${!pending ? html`<span class=${'badge-out ' + R.outcome}>
             ${R.outcome === 'applied' ? 'accepted' : R.outcome === 'cancelled' ? 'rejected' : R.outcome}</span>` : null}
+        ${!pending && (R.unaccepted || []).length ? html`
+          <span class="badge-out unaccepted"
+                title=${R.unaccepted.map((c) => c + ': ' + ((R.clause_texts || {})[c] || '')).join('\n')}>
+            clause(s) left open: ${R.unaccepted.join(', ')}</span>` : null}
         <div id="reviewActions">
           <button class="ghost small" title="collapse the diff (Chat stays full-width)"
                   onClick=${() => { S.ui.diffOpen = false; emit(); }}>\u29C9 Collapse</button>
@@ -2161,6 +2165,8 @@ function DiffPane() {
                      onclick=${(e) => e.stopPropagation()}
                      onchange=${(e) => { S.sel[f.rel] = e.target.checked; emit(); }} />` : null}
             <span>${f.rel}</span>
+            ${(f.clauses || []).map((c) => html`
+              <span key=${c} class="clause" title=${(R.clause_texts || {})[c] || c}>${c}</span>`)}
             ${f.edited ? html`<span class="muted">(edited)</span>` : null}
             <span class="a">+${f.added}</span><span class="r">\u2212${f.removed}</span>
             ${pending && !f.source && R.partial_ok ? html`

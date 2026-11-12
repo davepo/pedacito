@@ -102,6 +102,34 @@ def test_coverage_dry_run_does_not_advance_the_live_tracker():
     assert tracker.items[0].state == verify.REQ_EDITED
 
 
+def test_coverage_seeds_only_edit_clauses_and_stays_a_dry_run():
+    """R4: the follow-up trigger is the same judgement check_coverage renders,
+    narrowed to edit clauses (a report clause is answered by prose, not another
+    hunk) -- and like check_coverage it never advances the live tracker."""
+    task = "Add apply_discount in pricing.py; explain how bulk_discount works"
+    tracker = verify.RequirementTracker(task)
+    assert [r.kind for r in tracker.items] == ["edit", "report"]
+    reply = ("--- FILE: pricing.py SYMBOL apply_discount\n<<<<<<< SEARCH\n"
+             "=======\ndef apply_discount(price, pct):\n"
+             "    return round(price * (1 - pct), 2)\n>>>>>>> REPLACE\n")
+    edits = verify.parse_edits(reply)
+    before = tracker.states()
+
+    seeds = verify.coverage_seeds(task, reply, edits, tracker=tracker)
+    assert seeds == [] or all(r.is_edit for r in seeds)
+    # the edit clause is addressed by the patch; the report clause is not,
+    # but it must not seed an edit intent
+    findings = verify.check_coverage(task, reply, edits, tracker=tracker)
+    assert any("bulk_discount" in f.message for f in findings), findings
+    assert all(r.is_edit for r in seeds)
+    assert tracker.states() == before, "a seed pass advanced the live tracker"
+
+    # with nothing applied, the edit clause IS a seed
+    seeds = verify.coverage_seeds(task, "", [], tracker=tracker)
+    assert [r.text for r in seeds] == [tracker.items[0].text]
+    assert tracker.states() == before
+
+
 def test_oldest_unmet_requirement_selects_read_then_search():
     tracker = verify.RequirementTracker(
         "Fix the retry logic in client.py and update README.md")

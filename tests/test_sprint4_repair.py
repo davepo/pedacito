@@ -217,3 +217,96 @@ def test_post_edit_tests_repairs_new_failure_even_when_total_is_flat(
     assert "TRACEBACK REPAIR PACKET" in packet
     assert "tests/test_c.py::test_new" in packet
     assert "tests/test_a.py::test_old" in packet
+
+
+def test_post_edit_suppresses_repair_for_a_recorded_pre_existing_failure(
+        tmp_path, monkeypatch):
+    """R2: with no in-run baseline (the recovery path), the cross-run command
+    history is the only baseline there is. When run_impacted labelled the
+    failure pre-existing, the repair loop must not chase it."""
+    import types
+
+    from pedacito import testsel
+
+    cfg = Config()
+    cfg.verify_tests = True
+    cfg.allow_shell = True
+    cfg.repair_rounds = 2
+    cfg.log_events = False
+    cfg.static_gate = False
+    cfg.frontend_contracts = False
+    cfg.interface_lock = False
+
+    failing = ("FAILED tests/test_x.py::test_a - assert 0\n"
+               "1 failed in 0.10s")
+    desc = f"`pytest -q` -- {testsel.PRE_EXISTING_LABEL}"
+    runs = []
+    monkeypatch.setattr(loop, "_run_tests",
+                        lambda idx, cfg_, files: (runs.append(1)
+                                                  or (False, failing, desc)))
+
+    class FakeAgent:
+        def __init__(self):
+            self.calls = []
+
+        def _repair_from_findings(self, task, reply, errors, results):
+            self.calls.append([e.kind for e in errors])
+            return "REPAIR"
+
+        def _apply_once(self, reply, dry_run, backup_dir=None):
+            return []
+
+    agent = FakeAgent()
+    results = [_result("x = 1\n", "x = 2\n", "a.py")]
+    out, reply, tests_ok = loop._post_edit_tests(
+        tmp_path, cfg, agent, types.SimpleNamespace(root=tmp_path),
+        "task", results, "reply", None, None, ["a.py"])
+
+    assert tests_ok is False             # the suite is honestly still red
+    assert agent.calls == []             # ...but the failure pre-dates the edit
+    assert len(runs) == 1                # no repair round re-ran the tests
+
+
+def test_post_edit_still_repairs_when_an_in_run_baseline_shows_a_new_failure(
+        tmp_path, monkeypatch):
+    """R2 guard-rail: an in-run baseline stays authoritative. Even if the
+    description carries the pre-existing label, a baseline diff that proves a
+    NEW failure must still repair (the label only suppresses when there is no
+    baseline to diff against)."""
+    import types
+
+    from pedacito import testsel
+
+    cfg = Config()
+    cfg.verify_tests = True
+    cfg.allow_shell = True
+    cfg.repair_rounds = 1
+    cfg.log_events = False
+    cfg.static_gate = False
+    cfg.frontend_contracts = False
+    cfg.interface_lock = False
+
+    desc = f"`pytest -q` -- {testsel.PRE_EXISTING_LABEL}"
+    runs = [(False, CURRENT, desc), (True, "2 passed", desc)]
+    monkeypatch.setattr(loop, "_run_tests",
+                        lambda idx, cfg_, files: runs.pop(0))
+
+    class FakeAgent:
+        def __init__(self):
+            self.errors = None
+
+        def _repair_from_findings(self, task, reply, errors, results):
+            self.errors = list(errors)
+            return "REPAIR"
+
+        def _apply_once(self, reply, dry_run, backup_dir=None):
+            return [_result("x = 1\n", "x = 2\n", "a.py")]
+
+    agent = FakeAgent()
+    results = [_result("x = 1\n", "x = 1\n", "a.py")]
+    out, reply, tests_ok = loop._post_edit_tests(
+        tmp_path, cfg, agent, types.SimpleNamespace(root=tmp_path),
+        "task", results, "reply", None, (False, BASELINE, "pytest"), ["a.py"])
+
+    assert tests_ok is True
+    assert agent.errors, "the baseline diff proves a new failure: repair it"

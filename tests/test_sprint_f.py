@@ -172,6 +172,23 @@ def test_micro_fact_promotes_after_two_successful_runs(tmp_path):
     assert command in memory.render_micro_facts(tmp_path, cfg)
 
 
+def test_command_was_failing_tracks_the_last_recorded_outcome(tmp_path):
+    """R2: the baseline-aware verdict reads the command's most recent recorded
+    outcome across pending, live and retired rows -- before running it again."""
+    cfg = Config()
+    cmd = "python -m pytest -q tests/test_x.py"
+    assert not memory.command_was_failing(tmp_path, cmd)      # no history yet
+    memory.observe_command(tmp_path, cmd, False, cfg, kind="test")
+    assert memory.command_was_failing(tmp_path, cmd)          # pending failure
+    memory.observe_command(tmp_path, cmd, True, cfg, kind="test")
+    assert not memory.command_was_failing(tmp_path, cmd)      # promoted, green
+    memory.observe_command(tmp_path, cmd, False, cfg, kind="test")
+    assert memory.command_was_failing(tmp_path, cmd)          # retired, red
+    # a different command has no history; no root answers False
+    assert not memory.command_was_failing(tmp_path, "pytest -q other.py")
+    assert not memory.command_was_failing(None, cmd)
+
+
 def test_micro_facts_respect_the_token_cap(tmp_path):
     cfg = Config()
     cfg.max_micro_fact_tokens = 20

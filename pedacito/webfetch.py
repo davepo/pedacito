@@ -5,7 +5,10 @@
 Off unless `allow_fetch = true`. Only hosts in `fetch_allowed_hosts` (suffix
 match; `"*"` = any public host) can be fetched; loopback and private-network
 addresses are refused unless named explicitly, so a prompt-injected URL cannot
-probe the user's LAN. Responses are size-capped, HTML is reduced to text, and
+probe the user's LAN. Every hop is also resolved once and judged IP-by-IP, and
+the connection is pinned to a validated address (Host/SNI keep the name), so a
+public name that resolves to a private IP -- DNS rebinding -- is refused too.
+Responses are size-capped, HTML is reduced to text, and
 every result is labelled external, untrusted content (the harness also fences
 it: see safety.frame). Cached per URL for an hour under `.pedacito/fetch/`.
 """
@@ -95,6 +98,55 @@ def _is_private(host: str) -> bool:
     return security.is_private_host(host)
 
 
+class _PinnedAdapter(requests.adapters.HTTPAdapter):
+    """Connect to the SSRF-validated IP; Host, SNI and the certificate check
+    keep the original name.
+
+    The connection pool is keyed by the pinned IP, so urllib3's connect-time
+    resolution can only ever use the address `security.resolve_checked`
+    approved -- a second DNS answer (rebinding) never enters the request."""
+
+    def __init__(self, name: str, ip: str):
+        super().__init__()
+        self._pin_name = name
+        self._pin_ip = ip
+
+    def send(self, request, **kwargs):
+        u = urlparse(request.url)
+        name = u.hostname or ""
+        if ":" in name:                          # an IPv6 literal keeps []
+            name = f"[{name}]"
+        if u.port:
+            name = f"{name}:{u.port}"
+        request.headers["Host"] = name
+        return super().send(request, **kwargs)
+
+    def get_connection_with_tls_context(self, request, verify, proxies=None,
+                                        cert=None):
+        host_params, pool_kwargs = self.build_connection_pool_key_attributes(
+            request, verify, cert)
+        host_params["host"] = self._pin_ip
+        if host_params.get("scheme") == "https":
+            # TLS identity stays the NAME even though TCP goes to the IP.
+            pool_kwargs["assert_hostname"] = self._pin_name
+            pool_kwargs["server_hostname"] = self._pin_name
+        return self.poolmanager.connection_from_host(
+            **host_params, pool_kwargs=pool_kwargs)
+
+
+def _pinned_get(url: str, host: str, ip: str):
+    """One GET pinned to `ip` (the validated address for `host`). Direct
+    connections only: `trust_env = False` ignores ambient proxy settings,
+    because a proxy would resolve the name again on its own."""
+    session = requests.Session()
+    session.trust_env = False
+    adapter = _PinnedAdapter(host, ip)
+    session.mount("http://", adapter)
+    session.mount("https://", adapter)
+    return session.get(url, timeout=15, stream=True, allow_redirects=False,
+                       headers={"User-Agent": "pedacito-fetch/1.0"})
+
+
 def tool_fetch(index, cfg, url: str) -> str:
     """Fetch `url` and return labelled, truncated readable text.
 
@@ -157,8 +209,17 @@ def tool_fetch(index, cfg, url: str) -> str:
     try:
         url = raw
         for _hop in range(7):           # the page itself + at most 6 redirects
-            r = requests.get(url, timeout=15, stream=True, allow_redirects=False,
-                             headers={"User-Agent": "pedacito-fetch/1.0"})
+            hop_host = (urlparse(url).hostname or "").lower()
+            # Resolve once and judge EVERY returned IP, then pin the
+            # connection to a validated address: a public name that
+            # resolves to a private IP (DNS rebinding) is refused here,
+            # and a second DNS answer cannot swap addresses mid-request.
+            named = tuple(a for a in allowed
+                          if str(a).lower().strip() == hop_host)
+            err, ips = security.resolve_checked(hop_host, named)
+            if err:
+                return f"ERROR: {err}"
+            r = _pinned_get(url, host=hop_host, ip=ips[0])
             if r.status_code not in (301, 302, 303, 307, 308):
                 break
             nxt = urljoin(url, (r.headers.get("Location") or "").strip())

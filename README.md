@@ -600,7 +600,7 @@ do:
 | `mcp` | `allow_mcp = true` + `mcp_servers = [...]` | Call tools, prompts (`prompt:server/name`), or resources (`resource:server/uri`) from MCP servers. The catalog shows arguments, calls are validated, one live session per server is kept warm, and a server that was down at startup is retried. |
 | `mcp_call` | `enable_mcp = true` + `[mcp_servers.<name>]` | Call a tool on a *named* MCP server. Only the up-to-four tools whose names and descriptions match the task are ever shown, the action itself appears only when one matches, and untrusted servers ask the permission broker per call. See [Named MCP servers](#named-mcp-servers). |
 | `task` | `allow_subagents = true` | Hand a bounded, read-only research question to a helper agent with a fresh context window; only a short digest comes back. Depth is capped (1 local, 2 hosted). |
-| `fetch` | `allow_fetch = true` + `fetch_allowed_hosts` | URL → readable text, host-allowlisted, size-capped, cached, labelled untrusted. Private/loopback addresses are refused. |
+| `fetch` | `allow_fetch = true` + `fetch_allowed_hosts` | URL → readable text, host-allowlisted, size-capped, cached, labelled untrusted. Private/loopback addresses are refused, including public names that *resolve* to them; the connection is pinned to the checked IP. |
 | semantic search | `semantic_search = true` | A `grep` with no hits falls back to the server's `/v1/embeddings` endpoint. |
 
 `run` and the two MCP actions execute model-chosen commands in your project.
@@ -710,6 +710,10 @@ was and that the fix worked. The lesson goes to `.pedacito/micro_facts.json` und
   fills in the names from the failure, so it can be checked by the same tools.
 - **Bounded and self-cleaning.** At most eight lessons are kept. Repeats are merged
   and counted, not added. A lesson about files that no longer exist is dropped.
+  Each lesson also carries `runs` / `recurred` / `avoided` counters from observed
+  check runs: one that faced five runs without ever avoiding its failure kind is
+  retired into `retired_lessons` (auto-promoted rules are exempt). These are
+  harness facts, never model-written reflection.
 - **Scoped, not shouted, when they repeat.** A lesson confirmed twice whose
   files all live under one directory (`src/api/...`, `frontend/...`) is promoted
   into an auto-managed path-scoped rule at `.pedacito/rules/auto_<dir>.md`
@@ -885,7 +889,7 @@ identically.
 |---|---|
 | **Header** | Open a project (type a path, **Browse…** the machine's folders, or pick a recent one), choose its model profile, see the model server's status light and the session's token/cache/cost totals. |
 | **Chat** (left) | Five modes next to the box: **Task/Edit** (edit code; *review* or *write directly*, planning auto/always/never, max lookups), **Ask** (read-only questions, answer streams in), **Auto** (goal → plan → implement; plan-only or implement, verify command, repair rounds, task/minute caps, worktree, keep-going, pip-install; applying Auto accepts the tool trust boundary and enables write/run tools for the run), **New** (start a project from scratch in a folder: preview, build, build-then-review, skeleton only, and *complex* for the autonomous loop), and **How ?** (the built-in CLI/GUI/setting reference with topic chips, copyable commands and *Open in Settings* links; answers stay out of the saved coding thread). **Attach** (or drag in) a text file as the task, question, or spec. While a task runs, type to **steer** the model, answer its clarifying questions inline, or **Stop** it. |
-| **Changes** (middle) | The proposed edits as *Old code | Updated code* side by side with word-level highlights. Accept or reject the whole set, untick files to accept only some, or **Edit updated** to hand-edit a file before accepting. Backups are made first and a file that changed on disk since the preview is refused. |
+| **Changes** (middle) | The proposed edits as *Old code | Updated code* side by side with word-level highlights. Accept or reject the whole set, untick files to accept only some, or **Edit updated** to hand-edit a file before accepting. Files carry clause badges (`R1`, `R2`, ...) showing which part of the task they serve; a partial accept flags clauses left unaccepted. Backups are made first and a file that changed on disk since the preview is refused. |
 | **Activity** and **Plan** (right, top) | Live phase and activity for the running task. The `auto`/plan checklist with progress; click **Edit** to change it, then **Run** to implement it. |
 | **Files**, **Backups**, **Logs** (right, bottom tabs) | Files: a filterable tree of the indexed files, with files in the pending review highlighted. Backups: restorable snapshots. Logs: the terminal, everything pedacito prints, live, with ANSI colours. |
 | **File preview** | Clicking a file in the Files tab opens a read-only preview modal. |
@@ -1162,7 +1166,7 @@ default) dry-applies the blocks and runs free checks, no model call:
 | stale references | a removed or renamed definition that is still referenced elsewhere, judged against what *all* of the reply's edits leave behind, so a correct multi-file rename passes |
 | moved imports | a moved file still imported by its old path |
 | citations | `file:line` claims about files never read |
-| coverage | a requirement from the task (it extracts up to five) no edit or sentence touches, a warning |
+| coverage | a requirement from the task (it extracts up to five) no edit or sentence touches; a warning, and in the incremental edit loop it seeds one bounded follow-up pass |
 
 Errors cause one corrected re-ask that shows the model its own blocks and the
 findings; warnings are printed and logged. `verify_answer = "full"` adds one
@@ -1174,7 +1178,10 @@ on for models that measure weak.
 With `verify_tests = true` and `allow_shell = true`, the tests *impacted* by an
 edit (the tests named after the file, tests of its importers and callers) run
 after it is written; new failures, compared with a run before the edit, go
-back to the model for up to `repair_rounds` fix rounds. `test_command`
+back to the model for up to `repair_rounds` fix rounds. A failure the command
+ledger already recorded before this run is labelled *pre-existing failure
+(recorded before this run)* and does not trigger repair -- unless this run
+captured its own baseline, which supersedes the history. `test_command`
 overrides detection (`pytest`, `npm test`, `cargo test`, `go test ./...`,
 `make test`, ...). Those two flags only ever switch the **subprocess** checks
 off. The syntax, static, frontend and cross-file contract gates read files in
@@ -1331,7 +1338,11 @@ you configured. Within that:
   web words, and each call asks first in the permission dialog. Set
   `enable_web = true` to allow them without asking. Loopback, link-local
   (including cloud metadata) and private-network addresses are refused unless you
-  list them in `fetch_allowed_hosts`.
+  list them in `fetch_allowed_hosts`. The check also runs on the *resolved*
+  addresses: a public name that resolves to a private IP (DNS rebinding) is
+  refused, and the connection is pinned to the validated address so a second DNS
+  answer cannot swap it mid-request. Redirects are re-checked at every hop, and a
+  wildcard allow-list entry never exempts a private range.
 - **Permission requests.** Some actions pause the run until you decide. The
   **Permission requested** dialog shows the category, the action, the reason and
   the exact target, with four buttons:
@@ -1411,6 +1422,12 @@ The page records each file's SHA-256 when built, and applying re-checks it: if
 you edit a file in the meantime, the write is refused instead of overwriting
 your change. The server binds to `127.0.0.1` only and rejects foreign `Host`
 and `Origin` headers.
+
+When the run tracked requirement clauses, each file carries a badge (`R1`,
+`R2`, ...) naming the clauses its edits served; the badge's title is the clause
+text. If you accept only some files, any clause whose files were all rejected
+is flagged as unaccepted in the sign-off detail, so a partial accept cannot
+silently drop half the task.
 
 ## Undo and workspace layout
 

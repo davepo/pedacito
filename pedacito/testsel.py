@@ -26,6 +26,11 @@ from . import proc, safety, sandbox, testlinks
 
 _NPM_PLACEHOLDER = re.compile(r"no test specified", re.IGNORECASE)
 
+# Appended to a failing run's description when the command's recorded history
+# shows it already failed before this run (baseline-aware verdicts, R2). The
+# repair loop reads this marker to avoid chasing pre-existing breakage.
+PRE_EXISTING_LABEL = "pre-existing failure (recorded before this run)"
+
 
 def _has(root: Path, *names: str) -> bool:
     return any((root / n).exists() for n in names)
@@ -236,5 +241,22 @@ def run_impacted(index, cfg, changed: list[str]) -> tuple[bool, str, str]:
     why = ", ".join(f"{t} ({w})" for t, w in picked[:4])
     desc = (f"`{cmd}` -- impacted tests: {why}" if narrowed
             else f"`{cmd}` (full suite; could not narrow)")
+    # Consult the recorded history BEFORE running: run_command updates the
+    # ledger with this run's outcome, which would otherwise erase the very
+    # baseline we are trying to compare against.
+    was_failing = _was_already_failing(index.root, cmd)
     ok, out = run_command(index.root, cfg, cmd)
+    if not ok and was_failing:
+        desc += f" -- {PRE_EXISTING_LABEL}"
     return ok, out, desc
+
+
+def _was_already_failing(root, cmd: str) -> bool:
+    """The command's recorded history said it failed before this run. A
+    missing ledger or an unreadable root must never mask a real failure, so
+    any error answers False (the verdict stays edit-caused)."""
+    try:
+        from . import memory
+        return memory.command_was_failing(root, cmd)
+    except Exception:
+        return False

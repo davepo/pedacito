@@ -697,6 +697,9 @@ class Requirement:
     anchors: list[tuple] = field(default_factory=list)    # (file, start, end)
     read_spans: list[tuple] = field(default_factory=list)
     edit_spans: list[tuple] = field(default_factory=list)
+    # Stable clause id ("R1", "R2", ...) assigned by the task splitter; the
+    # review page uses it to show which clause each file serves (R8).
+    req_id: str = ""
 
     def __post_init__(self):
         if self.kind not in ("edit", "report"):
@@ -872,7 +875,8 @@ def _requirements_from_task(task: str, limit: int = 5) -> list[Requirement]:
         if terms:
             reqs.append(Requirement(
                 _clip_clause(p), list(dict.fromkeys(terms))[:8],
-                _clause_kind(p, task_kind)))
+                _clause_kind(p, task_kind),
+                req_id=f"R{len(reqs) + 1}"))
     return reqs[:limit]
 
 
@@ -1085,6 +1089,25 @@ class RequirementTracker:
         changed += self.observe_report(reply)
         return changed
 
+    # ---- review provenance (R8)
+    def clause_map(self) -> dict[str, list[str]]:
+        """file -> [clause ids] for the edit clauses whose patches touched it.
+        The review page attaches these to each FileDiff so a partial accept
+        can show which clause a file serves."""
+        out: dict[str, list[str]] = {}
+        for req in self.items:
+            if not req.is_edit or not req.req_id:
+                continue
+            for rel, _a, _b in req.edit_spans:
+                ids = out.setdefault(rel, [])
+                if req.req_id not in ids:
+                    ids.append(req.req_id)
+        return out
+
+    def clause_texts(self) -> dict[str, str]:
+        """clause id -> the clause text, for the review page's legend."""
+        return {req.req_id: req.text for req in self.items if req.req_id}
+
     # ---- gather completion / packing helpers
     def next_action(self, index=None) -> tuple[dict | None, Requirement | None]:
         """The cheapest deterministic action for the oldest requirement that
@@ -1185,12 +1208,14 @@ def _spans_overlap(a1: int, b1: int, a2: int, b2: int) -> bool:
     return not (b1 < a2 or b2 < a1)
 
 
-def check_coverage(task: str, reply: str, edits,
-                   tracker: RequirementTracker | None = None) -> list[Finding]:
-    """Requirements whose key terms appear nowhere in the edits, their file
-    names, or the reply's prose. Runs for prose-only replies too (P1a), not
-    only when edit blocks are present. When a live RequirementTracker is
-    supplied, its states are authoritative for what counts as addressed."""
+def _unaddressed(task: str, reply: str, edits,
+                 tracker: RequirementTracker | None = None) -> list[Requirement]:
+    """The requirement clauses no edit or sentence addresses: their key terms
+    appear nowhere in the edits, the edits' file names, or the reply's prose,
+    and the evidence state machine has not promoted them past READ. Shared by
+    `check_coverage` (which renders them as findings) and `coverage_seeds`
+    (which turns the edit ones into follow-up intents). Runs for prose-only
+    replies too (P1a), not only when edit blocks are present."""
     if tracker is None or tracker.task != task:
         tracker = RequirementTracker(task)
     else:
@@ -1203,8 +1228,12 @@ def check_coverage(task: str, reply: str, edits,
         return []
     tracker.observe_edit(edits)
     tracker.observe_report(reply)
-    haystack = "\n".join([_prose(reply)] + [f"{e.file}\n{e.replace}\n{e.search}"
-                                            for e in edits]).lower()
+    haystack = "\n".join(
+        [_prose(reply)] +
+        [f"{getattr(e, 'file', '')}\n"
+         f"{getattr(e, 'replace', '') or getattr(e, 'after', '')}\n"
+         f"{getattr(e, 'search', '') or getattr(e, 'before', '')}"
+         for e in edits]).lower()
     out = []
     for req in reqs:
         text, terms = req.text, req.terms
@@ -1215,10 +1244,28 @@ def check_coverage(task: str, reply: str, edits,
         if req.state in (REQ_EDITED, REQ_VERIFIED, REQ_REPORTED):
             continue
         if hit == 0:
-            out.append(Finding(
-                "coverage", "warn", "", f"no edit or sentence addresses: "
-                f"'{text}' (still {req.state})"))
+            out.append(req)
     return out[:3]
+
+
+def check_coverage(task: str, reply: str, edits,
+                   tracker: RequirementTracker | None = None) -> list[Finding]:
+    """Requirements whose key terms appear nowhere in the edits, their file
+    names, or the reply's prose. When a live RequirementTracker is supplied,
+    its states are authoritative for what counts as addressed."""
+    return [Finding("coverage", "warn", "",
+                    f"no edit or sentence addresses: '{req.text}' "
+                    f"(still {req.state})")
+            for req in _unaddressed(task, reply, edits, tracker)]
+
+
+def coverage_seeds(task: str, reply: str, edits,
+                   tracker: RequirementTracker | None = None) -> list[Requirement]:
+    """The unaddressed EDIT clauses of `task` after a batch: the deterministic
+    trigger for one coverage-seeded follow-up pass. Report clauses are left to
+    the answer prose; only edit clauses can seed another edit intent."""
+    return [req for req in _unaddressed(task, reply, edits, tracker)
+            if req.is_edit]
 
 
 

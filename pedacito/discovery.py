@@ -29,6 +29,7 @@ from __future__ import annotations
 import os
 import re
 import socket
+import time
 from urllib.parse import urlparse
 
 import requests
@@ -85,9 +86,23 @@ def _root(base_url: str) -> str:
     return base
 
 
-def _get(url: str, timeout: float, headers=None):
+def _slice(timeout: float, deadline) -> float:
+    """The per-request timeout, capped by the time left in the scan budget.
+    `deadline` is a monotonic timestamp (None = no budget). A spent budget
+    answers 0 so the caller skips the request entirely."""
+    if deadline is None:
+        return timeout
+    return max(0.0, min(timeout, deadline - time.monotonic()))
+
+
+def _get(url: str, timeout: float, headers=None, deadline=None):
     """A 200 response from `url`, or None on any failure (wrong status, JSON
-    error, timeout, refusal). Every probe is best-effort."""
+    error, timeout, refusal). Every probe is best-effort. With a `deadline`,
+    the request is bounded by the remaining scan budget and skipped once the
+    budget is spent."""
+    timeout = _slice(timeout, deadline)
+    if timeout <= 0:
+        return None
     try:
         r = requests.get(url, headers=headers, timeout=timeout)
     except Exception:
@@ -115,8 +130,9 @@ def _entries_from(data) -> list[dict] | None:
     return entries or None
 
 
-def _list_entries(url: str, timeout: float, headers=None) -> list[dict] | None:
-    resp = _get(url, timeout, headers)
+def _list_entries(url: str, timeout: float, headers=None,
+                  deadline=None) -> list[dict] | None:
+    resp = _get(url, timeout, headers, deadline)
     return _entries_from(_data(resp)) if resp else None
 
 
@@ -132,26 +148,27 @@ def _is_lemonade(entries: list[dict]) -> bool:
     return any(str(m.get("owned_by", "")).lower() == "lemonade" for m in entries)
 
 
-def _fingerprint(root: str, timeout: float, headers=None) -> str:
+def _fingerprint(root: str, timeout: float, headers=None, deadline=None) -> str:
     """Label a server at `root` from its native endpoints; "" when none of the
     server-specific endpoints answer (a bare OpenAI-compatible server)."""
     # Lemonade owns /api/v1/health, so it wins even on a port another server
     # historically used (e.g. Lemonade on 11434 must not read "Ollama").
-    if _get(root + "/api/v1/health", timeout, headers):
+    if _get(root + "/api/v1/health", timeout, headers, deadline):
         return "Lemonade"
-    if _get(root + "/api/v0/models", timeout, headers):
+    if _get(root + "/api/v0/models", timeout, headers, deadline):
         return "LM Studio"
-    if _get(root + "/api/version", timeout, headers) and \
-            _get(root + "/api/tags", timeout, headers):
+    if _get(root + "/api/version", timeout, headers, deadline) and \
+            _get(root + "/api/tags", timeout, headers, deadline):
         return "Ollama"
-    if _get(root + "/props", timeout, headers):
+    if _get(root + "/props", timeout, headers, deadline):
         return "llama.cpp"
     return ""
 
 
-def _ollama_entries(root: str, timeout: float, headers=None) -> list[dict] | None:
+def _ollama_entries(root: str, timeout: float, headers=None,
+                    deadline=None) -> list[dict] | None:
     """Ollama's native listing (`/api/tags`) spells models as `name`."""
-    resp = _get(root + "/api/tags", timeout, headers)
+    resp = _get(root + "/api/tags", timeout, headers, deadline)
     data = _data(resp) if resp else None
     models = (data or {}).get("models") if isinstance(data, dict) else None
     if not models:
@@ -163,7 +180,7 @@ def _ollama_entries(root: str, timeout: float, headers=None) -> list[dict] | Non
 _LOCAL_HOSTS = frozenset(("localhost", "127.0.0.1", "0.0.0.0", "::1"))
 
 
-def _listening(root: str, timeout: float) -> bool:
+def _listening(root: str, timeout: float, deadline=None) -> bool:
     """Whether a loopback server root accepts a TCP connection quickly.
 
     Without this, a dead local port costs five or six HTTP timeouts (one per
@@ -182,7 +199,9 @@ def _listening(root: str, timeout: float) -> bool:
         return False
     if host not in _LOCAL_HOSTS:
         return True
-    limit = min(0.75, timeout)
+    limit = min(0.75, _slice(timeout, deadline))
+    if limit <= 0:
+        return False
     try:
         with socket.create_connection((host, port), timeout=limit):
             return True
@@ -190,14 +209,14 @@ def _listening(root: str, timeout: float) -> bool:
         return False
 
 
-def _probe_root(root: str, timeout: float, headers=None):
+def _probe_root(root: str, timeout: float, headers=None, deadline=None):
     """Identify and list one server at `root`. Returns (label, base_url,
     [model ids]) or None when the root answers nothing."""
-    if not _listening(root, timeout):
+    if not _listening(root, timeout, deadline):
         return None
-    label = _fingerprint(root, timeout, headers)
-    v1 = _list_entries(root + "/v1/models", timeout, headers)
-    api = _list_entries(root + "/api/v1/models", timeout, headers)
+    label = _fingerprint(root, timeout, headers, deadline)
+    v1 = _list_entries(root + "/v1/models", timeout, headers, deadline)
+    api = _list_entries(root + "/api/v1/models", timeout, headers, deadline)
     entries = v1 if v1 is not None else api
     base_url = (root + "/v1") if v1 is not None else \
                (root + "/api/v1") if api is not None else ""
@@ -205,10 +224,11 @@ def _probe_root(root: str, timeout: float, headers=None):
     # Native listings when the OpenAI shim is absent.
     if entries is None:
         if label == "Ollama":
-            entries = _ollama_entries(root, timeout, headers)
+            entries = _ollama_entries(root, timeout, headers, deadline)
             base_url = root + "/v1"
         elif label == "LM Studio":
-            entries = _list_entries(root + "/api/v0/models", timeout, headers)
+            entries = _list_entries(root + "/api/v0/models", timeout, headers,
+                                    deadline)
             base_url = root + "/v1"
 
     if entries is None and label == "":
@@ -251,22 +271,34 @@ def _candidate_roots(urls, profile_urls, ports) -> list[str]:
 
 
 def discover_servers(timeout: float = 2.0, urls=(), ports=None,
-                     profile_urls=(), headers=None) -> list[tuple[str, str, list[str]]]:
+                     profile_urls=(), headers=None, budget=None,
+                     deadline=None) -> list[tuple[str, str, list[str]]]:
     """Probe candidates for local model servers.
 
     Returns `[(label, base_url, [model ids])]` for each server that answers,
     deduplicated by normalized server root (`normalize_url`). `ports=None`
     means the well-known local ports; pass `ports=()` to probe only the
-    explicit `urls` / `profile_urls`."""
+    explicit `urls` / `profile_urls`.
+
+    `budget` (seconds) caps the WHOLE discovery pass on a monotonic deadline:
+    each probe is bounded by the time left, and once the budget is spent the
+    loop stops and returns the servers found so far (partial results beat a
+    GUI request that hangs on a slow remote URL). `deadline`, when given, is
+    an already-computed monotonic timestamp shared with a caller's wider
+    budget (it wins over `budget`)."""
+    if deadline is None and budget is not None:
+        deadline = time.monotonic() + max(0.0, float(budget))
     roots = _candidate_roots(urls, profile_urls,
                              DEFAULT_PORTS if ports is None else ports)
     found: list[tuple[str, str, list[str]]] = []
     seen: set[str] = set()
     for root in roots:
+        if deadline is not None and time.monotonic() >= deadline:
+            break                       # budget spent: keep what we have
         key = normalize_url(root)
         if key in seen:
             continue
-        result = _probe_root(root, timeout, headers)
+        result = _probe_root(root, timeout, headers, deadline)
         if result is not None:
             seen.add(key)
             found.append(result)
@@ -296,7 +328,7 @@ def list_models(base_url: str, timeout: float = 5.0, headers=None) -> list[str]:
 
 
 def describe_models(base_url: str, timeout: float = 5.0, headers=None,
-                    vram_gb: int = 0) -> list[dict]:
+                    vram_gb: int = 0, deadline=None) -> list[dict]:
     """The scan's per-model view of one server.
 
     Lists the server's models, attaches the metadata the scan needs
@@ -305,23 +337,28 @@ def describe_models(base_url: str, timeout: float = 5.0, headers=None,
     `False` not loaded, `None` unknown). Embedding models and models too big
     for `vram_gb` (0 = no filter) are dropped. Each record carries `id`,
     `base_url`, `loaded`.
-    """
+
+    `deadline` (a monotonic timestamp) bounds the listing probes and stops the
+    per-model metadata walk once the shared scan budget is spent, returning
+    the models described so far."""
     from .config import Config
     from .llm import LLMClient
 
     root = _root(base_url)
     entries = None
     for prefix in ("/v1", "/api/v1"):
-        got = _list_entries(root + prefix + "/models", timeout, headers)
+        got = _list_entries(root + prefix + "/models", timeout, headers,
+                            deadline)
         if got is not None:
             entries = got
             break
     if entries is None:
-        label = _fingerprint(root, timeout, headers)
+        label = _fingerprint(root, timeout, headers, deadline)
         if label == "Ollama":
-            entries = _ollama_entries(root, timeout, headers)
+            entries = _ollama_entries(root, timeout, headers, deadline)
         elif label == "LM Studio":
-            entries = _list_entries(root + "/api/v0/models", timeout, headers)
+            entries = _list_entries(root + "/api/v0/models", timeout, headers,
+                                    deadline)
     entries = entries or []
 
     cfg = Config()
@@ -331,6 +368,8 @@ def describe_models(base_url: str, timeout: float = 5.0, headers=None,
 
     out: list[dict] = []
     for entry in entries:
+        if deadline is not None and time.monotonic() >= deadline:
+            break                       # budget spent: keep the models so far
         mid = _model_id(entry)
         if not mid or looks_embedding(entry):
             continue

@@ -536,6 +536,8 @@ details pre { background: var(--code-bg); border: 1px solid var(--line); border-
 .badge-out.applied { background: var(--add-bg); color: #fff; }
 .badge-out.rejected, .badge-out.cancelled { background: var(--del-bg); color: #fff; }
 .badge-out.timeout { background: var(--warn); color: #221a00; }
+.badge-out.unaccepted { background: transparent; color: var(--warn);
+  border: 1px solid var(--warn); text-transform: none; letter-spacing: .2px; }
 
 #fileStrip { display: flex; flex-wrap: wrap; gap: 6px; flex: none;
   overflow-y: auto; max-height: 96px; }
@@ -547,6 +549,9 @@ details pre { background: var(--code-bg); border: 1px solid var(--line); border-
 .fileitem.source { opacity: .6; font-style: italic; }
 .fileitem .a { color: var(--ok); }
 .fileitem .r { color: var(--err); }
+.fileitem .clause { font-size: 10px; font-weight: 700; letter-spacing: .3px;
+  color: var(--accent); border: 1px solid var(--line2); border-radius: 4px;
+  padding: 0 4px; background: var(--panel2); }
 
 #panes { display: grid; grid-template-columns: 1fr 1fr; gap: 8px;
   flex: 1 1 auto; min-height: 0; }

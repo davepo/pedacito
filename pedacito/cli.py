@@ -1888,8 +1888,9 @@ def main(argv=None) -> int:
             workspace.release_lock(_LOCKED.pop())
 
 
-def _main(argv=None) -> int:
-    _configure_stdio()
+def build_parser() -> argparse.ArgumentParser:
+    """The full CLI parser, split out from dispatch so tests can enumerate
+    the real subcommand set (the `how` index drift guard)."""
     ap = argparse.ArgumentParser(prog="pedacito", description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -2408,7 +2409,12 @@ def _main(argv=None) -> int:
     p_gui.add_argument("--port", type=int, default=0)
     p_gui.add_argument("--no-open", dest="open_browser", action="store_false")
 
-    args = ap.parse_args(argv)
+    return ap
+
+
+def _main(argv=None) -> int:
+    _configure_stdio()
+    args = build_parser().parse_args(argv)
 
     # `config --setup` repairs a broken config, so it runs before _config().
     if args.cmd == "config" and getattr(args, "setup", False):

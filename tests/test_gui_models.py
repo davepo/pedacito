@@ -220,6 +220,32 @@ def test_scan_dedups_even_when_discovery_repeats_a_server(gui, fake_local,
     assert j["models"][0]["server_url"] == base
 
 
+def test_scan_honours_a_wall_clock_budget(gui, fake_local):
+    """R3: the whole scan (discovery + per-server description) shares one
+    monotonic deadline. A slow server past the budget is dropped and the scan
+    returns promptly with the fast server's models."""
+    import time
+
+    from pedacito.gui import settings_api
+    from test_discovery import _serve_sleeping
+
+    base = fake_local(MODELS)
+    slow_srv = _serve_sleeping(5.0)
+    slow = f"http://127.0.0.1:{slow_srv.server_address[1]}/v1"
+    try:
+        t0 = time.monotonic()
+        out = settings_api.scan_models(urls=[base, slow], vram_gb=16,
+                                       budget=0.8)
+        elapsed = time.monotonic() - t0
+        assert elapsed < 3.0, f"scan blew its budget: {elapsed:.2f}s"
+        assert [m["model_id"] for m in _rows(out, base)] == \
+            ["lmstudio-ai/qwen3-8b"]
+        assert _rows(out, slow) == []       # the slow server was cut off
+    finally:
+        slow_srv.shutdown()
+        slow_srv.server_close()
+
+
 # ---------------------------------------------------------------- selective import
 
 def _sel(base, name, model, default=False, ctx=40960, vram=16):

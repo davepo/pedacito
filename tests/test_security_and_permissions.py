@@ -473,8 +473,10 @@ def test_fetch_disabled_asks_the_broker(bare_broker, tmp_path):
         calls.append(url)
         return _Resp()
 
-    orig = webfetch.requests.get
-    webfetch.requests.get = fake_get
+    orig = webfetch._pinned_get
+    webfetch._pinned_get = fake_get
+    orig_resolve = socket.getaddrinfo
+    socket.getaddrinfo = _fake_getaddrinfo
     try:
         t2 = threading.Thread(target=work, daemon=True)
         t2.start()
@@ -484,7 +486,8 @@ def test_fetch_disabled_asks_the_broker(bare_broker, tmp_path):
         assert "EXTERNAL CONTENT from https://docs.example.org/json" in results["obs"]
         assert calls == ["https://docs.example.org/json"]
     finally:
-        webfetch.requests.get = orig
+        webfetch._pinned_get = orig
+        socket.getaddrinfo = orig_resolve
 
 
 def test_install_command_detection():
@@ -550,8 +553,19 @@ class _FakeResp:
         self.closed = True
 
 
+def _fake_getaddrinfo(host, port, *args, **kwargs):
+    """Hermetic resolver for the fetch seams: every name answers with one
+    public IP (localhost keeps its loopback answer), so `resolve_checked`
+    runs for real without touching the network."""
+    ip = ("127.0.0.1" if str(host).lower() in ("localhost",
+                                               "localhost.localdomain")
+          else "93.184.216.34")
+    return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", (ip, port or 0))]
+
+
 def _serve(monkeypatch, resp_factory):
-    """Patch the opener tools._web_open uses; records (url, timeout, user_agent)."""
+    """Patch the opener tools._web_open uses; records (url, timeout, user_agent).
+    Also pins DNS to the hermetic resolver: _web_open resolves every hop."""
     seen = []
 
     def fake_open(self, req, timeout=None, **kw):
@@ -559,6 +573,7 @@ def _serve(monkeypatch, resp_factory):
         return resp_factory(req.full_url)
 
     monkeypatch.setattr(urllib.request.OpenerDirector, "open", fake_open)
+    monkeypatch.setattr(socket, "getaddrinfo", _fake_getaddrinfo)
     return seen
 
 
@@ -752,6 +767,7 @@ def test_fetch_url_validates_every_redirect_hop_before_requesting_it(
         return _FakeResp("<p>landed</p>", req.full_url)
 
     monkeypatch.setattr(urllib.request.OpenerDirector, "open", fake_open)
+    monkeypatch.setattr(socket, "getaddrinfo", _fake_getaddrinfo)
     out = tools.fetch_url(cfg, "https://example.com/start")
     assert out.startswith("ERROR:")
     assert "refused address" in out
@@ -781,6 +797,147 @@ def test_ssrf_guard_sees_legacy_numeric_loopback_spellings():
     # the fetch tool shares the one guard
     assert webfetch._is_private("127.1")
     assert not webfetch._is_private("8.8.8.8")
+
+
+def test_resolve_checked_judges_every_resolved_ip(monkeypatch):
+    """R1: the literal guard cannot see DNS rebinding; resolve_checked
+    resolves once and judges EVERY returned IP, failing closed on errors."""
+    def resolver(mapping):
+        def fake(host, port, *a, **kw):
+            if host not in mapping:
+                raise socket.gaierror(f"no answer for {host}")
+            return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", (ip, 0))
+                    for ip in mapping[host]]
+        return fake
+
+    # a public name that resolves to loopback is refused
+    monkeypatch.setattr(socket, "getaddrinfo",
+                        resolver({"evil.example": ["127.0.0.1"]}))
+    err, ips = security.resolve_checked("evil.example", ("*",))
+    assert err and ips == [] and "127.0.0.1" in err
+    # one private answer among public ones is enough to refuse
+    monkeypatch.setattr(socket, "getaddrinfo", resolver(
+        {"mixed.example": ["93.184.216.34", "169.254.169.254"]}))
+    err, ips = security.resolve_checked("mixed.example", ("*",))
+    assert err and ips == []
+    # a fully public answer passes, IPv4 first
+    monkeypatch.setattr(socket, "getaddrinfo", resolver(
+        {"good.example": ["2606:2800:220:1:248:1893:25c8:1946",
+                          "93.184.216.34"]}))
+    err, ips = security.resolve_checked("good.example", ("*",))
+    assert err == "" and ips == ["93.184.216.34",
+                                 "2606:2800:220:1:248:1893:25c8:1946"]
+    # an explicitly named host may resolve private (the user asked for it)
+    monkeypatch.setattr(socket, "getaddrinfo",
+                        resolver({"dev.example": ["127.0.0.1"]}))
+    err, ips = security.resolve_checked("dev.example", ("dev.example",))
+    assert err == "" and ips == ["127.0.0.1"]
+    # DNS failure fails closed
+    err, ips = security.resolve_checked("nx.example", ("*",))
+    assert err and ips == []
+    # IP literals need no resolver at all
+    def boom(*a, **kw):
+        raise AssertionError("IP literals must not hit the resolver")
+    monkeypatch.setattr(socket, "getaddrinfo", boom)
+    assert security.resolve_checked("8.8.8.8", ()) == ("", ["8.8.8.8"])
+    err, ips = security.resolve_checked("127.0.0.1", ())
+    assert err and ips == []
+
+
+def test_fetch_url_refuses_a_name_that_resolves_private(bare_broker, monkeypatch):
+    """R1 end to end: evil.example is public as written but resolves to
+    loopback; the refusal must land BEFORE any request is issued."""
+    st = bare_broker
+    cfg = Config()
+    cfg.enable_web = True
+    cfg.fetch_allowed_hosts = ("*",)
+    with st.lock:
+        st.cfg = cfg
+    seen = _serve(monkeypatch, lambda u: _FakeResp("<p>nope</p>", u))
+
+    def rebinding(host, port, *a, **kw):
+        ip = "127.0.0.1" if host == "evil.example" else "93.184.216.34"
+        return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", (ip, port or 0))]
+
+    monkeypatch.setattr(socket, "getaddrinfo", rebinding)
+    out = tools.fetch_url(cfg, "http://evil.example/admin")
+    assert out.startswith("ERROR:") and "127.0.0.1" in out
+    assert seen == []                            # nothing was requested
+    # a redirect whose target resolves private is refused the same way
+    def hop_open(self, req, timeout=None, **kw):
+        seen.append(req.full_url)
+        raise urllib.error.HTTPError(
+            req.full_url, 302, "Found", {"Location": "http://evil.example/x"},
+            None)
+    monkeypatch.setattr(urllib.request.OpenerDirector, "open", hop_open)
+    out = tools.fetch_url(cfg, "https://example.com/start")
+    assert out.startswith("ERROR:") and "127.0.0.1" in out
+    assert seen == ["https://example.com/start"]
+
+
+def test_fetch_refuses_a_name_that_resolves_private(tmp_path, monkeypatch):
+    """R1 for the opt-in fetch action: same rebinding refusal, no request."""
+    idx = index_mod.Index(tmp_path, [])
+    cfg = Config()
+    cfg.allow_fetch = True
+    cfg.fetch_allowed_hosts = ("*",)
+    calls = []
+    monkeypatch.setattr(webfetch, "_pinned_get",
+                        lambda url, **kw: calls.append(url))
+
+    def rebinding(host, port, *a, **kw):
+        ip = "127.0.0.1" if host == "evil.example" else "93.184.216.34"
+        return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", (ip, port or 0))]
+
+    monkeypatch.setattr(socket, "getaddrinfo", rebinding)
+    out = webfetch.tool_fetch(idx, cfg, "http://evil.example/admin")
+    assert out.startswith("ERROR:") and "127.0.0.1" in out
+    assert calls == []
+
+
+def test_pinned_fetch_connects_by_ip_and_keeps_the_name(tmp_path):
+    """R1 transport proof against a real local server: the TCP connection
+    goes to the validated IP while the Host header keeps the original name
+    (an explicitly allowed loopback host, so no fake resolver is needed)."""
+    import http.server
+
+    seen_hosts = []
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            seen_hosts.append(self.headers.get("Host", ""))
+            body = b"<p>pinned ok</p>"
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *a):
+            pass
+
+    srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    port = srv.server_address[1]
+    t = threading.Thread(target=srv.serve_forever, daemon=True)
+    t.start()
+    try:
+        cfg = Config()
+        cfg.enable_web = True
+        cfg.fetch_allowed_hosts = ("localhost",)
+        out = tools.fetch_url(cfg, f"http://localhost:{port}/page")
+        assert "pinned ok" in out
+        assert seen_hosts == [f"localhost:{port}"]
+
+        idx = index_mod.Index(tmp_path, [])
+        cfg2 = Config()
+        cfg2.allow_fetch = True
+        cfg2.fetch_allowed_hosts = ("localhost",)
+        out = webfetch.tool_fetch(idx, cfg2, f"http://localhost:{port}/page2")
+        assert "pinned ok" in out
+        assert seen_hosts[-1] == f"localhost:{port}"
+    finally:
+        srv.shutdown()
+        srv.server_close()
 
 
 def test_fetch_url_clips_to_max_read_tokens(bare_broker, monkeypatch):

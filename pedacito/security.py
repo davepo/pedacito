@@ -23,6 +23,11 @@ Four guards plus one broker:
    `::1`), link-local/cloud-metadata (`169.254.169.254`) and private LAN
    ranges (RFC1918 / unique-local) are refused unless the host is named
    explicitly. A prompt-injected URL can never probe the user's network.
+   `resolve_checked(host, allowed_hosts)` closes the DNS-rebinding hole the
+   literal check leaves: it resolves the name once, judges EVERY returned
+   IP, and hands back the validated addresses so the fetch can pin its
+   connection to one of them (a second DNS answer cannot swap in a private
+   address mid-request).
 
 5. The Permission Broker -- `request_permission(...)` calls the hook installed
    by the GUI (`gui.core.install_permission_broker`) and blocks the calling
@@ -69,6 +74,7 @@ __all__ = [
     "permission_broker_active",
     "post_origin_allowed",
     "request_permission",
+    "resolve_checked",
     "resolve_safe_path",
     "ssrf_error",
 ]
@@ -280,6 +286,59 @@ def ssrf_error(url: str, allowed_hosts=()) -> str:
                 "web tools refuse it (SSRF guard) unless the host is named "
                 "explicitly in fetch_allowed_hosts")
     return ""
+
+
+def resolve_checked(host: str, allowed_hosts=()) -> tuple[str, list[str]]:
+    """`(error, ips)`: resolve `host` ONCE and judge every address it names.
+
+    `ssrf_error` judges the hostname as written, so a public name that
+    *resolves* to a private IP (DNS rebinding) slips past it. This resolves
+    the name with a single `getaddrinfo`, runs `is_private_host` on every
+    returned IP, and refuses when any is private unless the host is named
+    explicitly in `allowed_hosts`. The caller then pins its connection to
+    one of the returned IPs, so a second DNS answer cannot swap in a
+    private address mid-request.
+
+    IP literals need no resolution. A name that fails to resolve fails
+    closed (an error, no addresses). IPv4 sorts first: it is the address
+    the pinned connection should prefer. A `"*"` allowlist entry means
+    "any PUBLIC host": it never exempts a private address, only a host
+    named explicitly (exact or suffix) does."""
+    host = str(host or "").strip().lower().strip("[]")
+    if not host:
+        return "no hostname to resolve", []
+    named = tuple(a for a in (allowed_hosts or ())
+                  if str(a).strip() != "*")
+    try:
+        ipaddress.ip_address(host)
+    except ValueError:
+        pass                                    # a name: resolve it below
+    else:
+        if is_private_host(host) and not host_named_explicitly(host, named):
+            return (f"{host} is a loopback/link-local/private-network "
+                    "address; web tools refuse it (SSRF guard) unless the "
+                    "host is named explicitly in fetch_allowed_hosts"), []
+        return "", [host]
+    try:
+        infos = socket.getaddrinfo(host, None)
+    except (OSError, ValueError) as exc:
+        return (f"{host} could not be resolved ({exc}); the web tools "
+                "fail closed rather than guess an address"), []
+    ips: list[str] = []
+    for info in infos:
+        ip = str(info[4][0]).partition("%")[0]   # drop any IPv6 zone id
+        if ip and ip not in ips:
+            ips.append(ip)
+    if not ips:
+        return f"{host} resolved to no addresses", []
+    for ip in ips:
+        if is_private_host(ip) and not host_named_explicitly(host, named):
+            return (f"{host} resolves to {ip}, a loopback/link-local/"
+                    "private-network address; web tools refuse it (SSRF "
+                    "guard) unless the host is named explicitly in "
+                    "fetch_allowed_hosts"), []
+    ips.sort(key=lambda ip: ":" in ip)           # prefer IPv4 for the pin
+    return "", ips
 
 
 # --- 5. the live Permission Broker --------------------------------------------------

@@ -1800,12 +1800,49 @@ def distill_repair_lesson(failure_text: str, check_label: str = ""):
     return None
 
 
-def _note_repair_failure(pending: list, kind: str, text: str) -> None:
+def _note_repair_failure(pending: list, kind: str, text: str,
+                         seen: set | None = None,
+                         recordable: bool = True) -> None:
     """Remember a gate/test failure for later lesson distillation; the first
-    entry per kind wins (root causes precede follow-on noise)."""
+    entry per kind wins (root causes precede follow-on noise). `seen`, when
+    given, collects the distilled failure kind even when no repair can follow
+    (`recordable` false): the lesson-effectiveness counters (R5) count every
+    failure a run observed, not only the ones it could mend."""
+    if seen is not None:
+        lesson = distill_repair_lesson(text, kind)
+        if lesson is not None:
+            seen.add(lesson[0])
+    if not recordable:
+        return
     if any(k == kind for k, _ in pending):
         return
     pending.append((kind, str(text or "")[:6000]))
+
+
+def _note_lesson_run(root, cfg, kinds, injected=None) -> None:
+    """One observed check run against the lesson ledger's effectiveness
+    counters (R5); a retirement is surfaced as an event, and nothing here may
+    raise into the loop."""
+    try:
+        from . import memory
+        out = memory.note_lesson_run(root, kinds, cfg, injected=injected)
+        if out.get("retired"):
+            events_mod.get(root, cfg).emit(
+                "lesson_retired", lessons=out["retired"],
+                reason="no avoided failure in "
+                       f"{memory._LESSON_RETIRE_RUNS} observed runs")
+    except Exception:
+        pass
+
+
+def _injected_lessons(root) -> set | None:
+    """The lesson ids a run's prompt carries: the live ledger at run start.
+    None when the ledger cannot be read (count every live lesson then)."""
+    try:
+        from . import memory
+        return {r.get("lesson_id") for r in memory.load_anti_patterns(root)}
+    except Exception:
+        return None
 
 
 def _record_repair_lesson(root, cfg, pending: list,
@@ -1891,14 +1928,16 @@ def _post_edit_tests(root, cfg, agent, idx, task, results, reply, backup_dir,
     max_rounds = max(0, int(getattr(cfg, "repair_rounds", 2) or 0))
     tests_ok = None
     pending_lesson: list = []      # (kind, text) this task broke and can mend
+    lesson_kinds: set = set()      # every distilled failure kind this run saw
+    injected = _injected_lessons(root)   # lessons this run's prompt carried
     for round_ in range(max_rounds + 1):
         syntax = verify_mod.check_syntax(results)
         if syntax:
             tests_ok = False
-            if round_ < max_rounds:
-                _note_repair_failure(pending_lesson, "syntax",
-                                     "\n".join(str(f.message)
-                                               for f in syntax))
+            _note_repair_failure(pending_lesson, "syntax",
+                                 "\n".join(str(f.message) for f in syntax),
+                                 seen=lesson_kinds,
+                                 recordable=round_ < max_rounds)
             print(f"  [syntax: {len(syntax)} new syntax error(s) -- "
                   f"test/lint subprocess skipped until the patch parses]",
                   file=sys.stderr)
@@ -1930,9 +1969,9 @@ def _post_edit_tests(root, cfg, agent, idx, task, results, reply, backup_dir,
         static = _new_static_errors(root, cfg, changed)
         if static:
             tests_ok = False
-            if round_ < max_rounds:
-                _note_repair_failure(pending_lesson, "static",
-                                     "\n".join(static))
+            _note_repair_failure(pending_lesson, "static",
+                                 "\n".join(static), seen=lesson_kinds,
+                                 recordable=round_ < max_rounds)
             print(f"  [static gate: {len(static)} new undefined-name/import "
                   f"error(s) -- tests/lint subprocess skipped until they "
                   f"are fixed]", file=sys.stderr)
@@ -1975,9 +2014,10 @@ def _post_edit_tests(root, cfg, agent, idx, task, results, reply, backup_dir,
         fe = _new_frontend_errors(root, cfg, changed)
         if fe:
             tests_ok = False
-            if round_ < max_rounds:      # only a lesson if a repair can follow
-                _note_repair_failure(pending_lesson, "frontend contract",
-                                     "\n".join(fe))
+            # a lesson only when a repair can follow; the kind still counts
+            _note_repair_failure(pending_lesson, "frontend contract",
+                                 "\n".join(fe), seen=lesson_kinds,
+                                 recordable=round_ < max_rounds)
             print(f"  [frontend gate: {len(fe)} new DOM contract violation(s)"
                   f" -- tests/lint subprocess skipped until they are fixed]",
                   file=sys.stderr)
@@ -2019,8 +2059,10 @@ def _post_edit_tests(root, cfg, agent, idx, task, results, reply, backup_dir,
         ce = _new_contract_errors(root, cfg, changed)
         if ce:
             tests_ok = False
-            if round_ < max_rounds:      # only a lesson if a repair can follow
-                _note_repair_failure(pending_lesson, "contract", "\n".join(ce))
+            # a lesson only when a repair can follow; the kind still counts
+            _note_repair_failure(pending_lesson, "contract", "\n".join(ce),
+                                 seen=lesson_kinds,
+                                 recordable=round_ < max_rounds)
             print(f"  [contract gate: {len(ce)} new cross-file contract "
                   f"violation(s) -- tests/lint subprocess skipped until they "
                   f"are fixed]", file=sys.stderr)
@@ -2065,14 +2107,18 @@ def _post_edit_tests(root, cfg, agent, idx, task, results, reply, backup_dir,
             # configured to run (verify_tests/allow_shell off). Report
             # honestly that no tests executed rather than pretending the
             # green gates are tests.
+            _note_lesson_run(root, cfg, lesson_kinds, injected)
             return results, reply, tests_ok
         got = _run_tests(idx, cfg, changed)
         if got is None:
+            _note_lesson_run(root, cfg, lesson_kinds, injected)
             return results, reply, tests_ok
         ok, out, desc = got
-        if not ok and round_ < max_rounds:
-            _note_repair_failure(pending_lesson, "tests", out)
-        elif ok and pending_lesson:
+        if not ok:
+            _note_repair_failure(pending_lesson, "tests", out,
+                                 seen=lesson_kinds,
+                                 recordable=round_ < max_rounds)
+        elif pending_lesson:
             # fail -> pass, proven by this green run: distill what it was,
             # including any gate finding that preceded the passing tests
             _record_repair_lesson(root, cfg, pending_lesson)
@@ -2099,6 +2145,17 @@ def _post_edit_tests(root, cfg, agent, idx, task, results, reply, backup_dir,
         # a genuinely worse count (including output with no parseable ids)
         # keeps the old score-based guard.
         should_repair = bool(diff.new) or score > base_score
+        # Baseline-aware verdict (R2): with no in-run baseline to diff
+        # against, the cross-run command history is the only baseline there
+        # is. When it recorded this exact command failing before the run,
+        # the failure pre-dates the edit -- do not spend a repair round on
+        # it. An in-run baseline stays authoritative: classify_failures then
+        # separates new from pre-existing identities precisely.
+        if should_repair and not base_out \
+                and testsel.PRE_EXISTING_LABEL in desc:
+            should_repair = False
+            print("  [tests: failure pre-dates this run (recorded command "
+                  "history); not auto-repaired]", file=sys.stderr)
         if not should_repair:
             if not ok and score > 0:
                 # Honest exit: the suite is still red, but every remaining
@@ -2125,6 +2182,7 @@ def _post_edit_tests(root, cfg, agent, idx, task, results, reply, backup_dir,
         results = _merge_repair_results(results, new)
         reply = (reply.rstrip() + "\n\n" + fixed)
         changed = sorted({fileio_norm(r.file) for r in results if r.ok})
+    _note_lesson_run(root, cfg, lesson_kinds, injected)
     return results, reply, tests_ok
 
 
@@ -2387,17 +2445,21 @@ def _recover_no_edit_reply(root: Path, agent, task: str, gathered: str,
     return None
 
 
-def _review(root: Path, results, task: str, cfg, backup_dir, stamp: str) -> list:
+def _review(root: Path, results, task: str, cfg, backup_dir, stamp: str,
+            clauses=None, clause_texts=None) -> list:
     """Serve the side-by-side review page and return the results as they
-    finally stand (the page writes on Apply, so this re-stamps each result)."""
-    diffs = review_mod.diffs_from_results(results, root)
+    finally stand (the page writes on Apply, so this re-stamps each result).
+    `clauses` (file -> clause ids) and `clause_texts` come from the requirement
+    tracker so each file shows the task clause it serves (R8)."""
+    diffs = review_mod.diffs_from_results(results, root, clauses=clauses)
     if not diffs:
         print("\n  No review page: no edit block applied cleanly.", file=sys.stderr)
         _report(results, dry_run=True)
         return results
     nonce = review_mod.new_nonce()
     page = review_mod.build_page(diffs, task, cfg.model, cfg.active_profile,
-                                 nonce, interactive=True, stamp=stamp)
+                                 nonce, interactive=True, stamp=stamp,
+                                 clause_texts=clause_texts)
     saved = review_mod.save(root, page, stamp)
 
     def writer():
@@ -2408,7 +2470,7 @@ def _review(root: Path, results, task: str, cfg, backup_dir, stamp: str) -> list
         page, nonce, writer, port=cfg.review_port,
         open_browser=cfg.open_browser, timeout=cfg.review_timeout,
         on_url=lambda u: print(f"  waiting for sign-off at {u}", file=sys.stderr),
-        diffs=diffs, task=task)
+        diffs=diffs, task=task, clause_texts=clause_texts)
 
     if outcome == "applied":
         print(f"  {detail}", file=sys.stderr)
@@ -2962,7 +3024,13 @@ def _run_task_once(root: Path, cfg, client, agent, idx, task: str, *,
     if review:
         if not parse_edits(reply):
             print("\n  The model proposed no edits.", file=sys.stderr)
-        results = _review(root, results, task, cfg, backup_dir, when)
+        tracker = getattr(agent, "requirements", None)
+        clauses = clause_texts = None
+        if tracker is not None and getattr(tracker, "task", "") == task:
+            clauses = tracker.clause_map()
+            clause_texts = tracker.clause_texts()
+        results = _review(root, results, task, cfg, backup_dir, when,
+                          clauses=clauses, clause_texts=clause_texts)
         applied = any(r.ok and "applied" in r.message for r in results)
     else:
         _report(results, dry_run=not apply)
@@ -3508,6 +3576,7 @@ def run_loop(root: Path, cfg, client, idx, plan_path: Path, *,
             # Forced reads are mined from the clean title only: prior reports
             # mention files descriptively and would bloat the must-read list.
             agent.task_targets = task
+            task_lessons = _injected_lessons(root)
             if investigate:
                 tr = run_investigation_task(
                     root, cfg, agent, idx,
@@ -3754,6 +3823,7 @@ def run_loop(root: Path, cfg, client, idx, plan_path: Path, *,
         # typechecker findings for the changed files play the same role.
         passed = True
         dep_blocked: list[str] = []
+        verify_failures: list[str] = []   # failure blobs this task's check saw
         if (verify or use_diag or spec_mod is not None
                 or _frontend_enabled(cfg)):
             from . import verify as verify_mod
@@ -3833,6 +3903,8 @@ def run_loop(root: Path, cfg, client, idx, plan_path: Path, *,
                 return False, verify_mod.render(syntax)
 
             passed, output = _gated_check(tr)
+            if not passed:
+                verify_failures.append(str(output)[:6000])
             rounds = repair_rounds
             installed: set[str] = set()
             # Rollback-if-worse: the current failure's severity. A repair
@@ -3861,6 +3933,8 @@ def run_loop(root: Path, cfg, client, idx, plan_path: Path, *,
                             "INFO" if ok else "ERROR")
                         if ok:
                             passed, output = _gated_check(tr)
+                            if not passed:
+                                verify_failures.append(str(output)[:6000])
                             continue          # a dependency is not a repair round
                     elif auto_install:
                         print(f"  [verify still reports missing dependencies "
@@ -3900,6 +3974,8 @@ def run_loop(root: Path, cfg, client, idx, plan_path: Path, *,
                     break
                 idx = tr2.idx
                 passed, output = _gated_check(tr2)
+                if not passed:
+                    verify_failures.append(str(output)[:6000])
                 if not passed and prev_score is not None:
                     score = _failure_score(output, use_diag)
                     if score > prev_score and tr2.backup_dir \
@@ -3929,6 +4005,15 @@ def run_loop(root: Path, cfg, client, idx, plan_path: Path, *,
                 # evidence is fresh. One line, mechanical, no LLM prose.
                 _record_repair_lesson(root, cfg, [("verify", lesson_seen)])
             lesson_seen = ""
+            # One observed run against the lesson effectiveness counters
+            # (R5): a clean check counts as "avoided" for every live lesson,
+            # a recurring failure kind as "recurred".
+            kinds = set()
+            for blob in verify_failures:
+                lesson = distill_repair_lesson(blob, "verify")
+                if lesson is not None:
+                    kinds.add(lesson[0])
+            _note_lesson_run(root, cfg, kinds, task_lessons)
 
         if not passed:
             if dep_blocked:

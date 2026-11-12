@@ -194,3 +194,103 @@ def test_loop_runs_tests_and_lint_after_all_symbol_hunks(tmp_path, monkeypatch):
     assert test_runs[-1][1:] == (True, True)
     assert lint_runs[0][1:] == (False, False)
     assert lint_runs[-1][1:] == (True, True)
+
+
+# ------------------------------------------- coverage-seeded second pass (R4)
+TWO_CLAUSE_TASK = ("Add apply_discount in pricing.py and add compute_shipping "
+                   "in shipping.py")
+HUNK_DISCOUNT = (
+    "--- FILE: pricing.py SYMBOL apply_discount\n<<<<<<< SEARCH\n=======\n"
+    "def apply_discount(price, pct):\n"
+    "    return round(price * (1 - pct), 2)\n>>>>>>> REPLACE\n")
+HUNK_SHIPPING = (
+    "--- FILE: shipping.py SYMBOL compute_shipping\n<<<<<<< SEARCH\n=======\n"
+    "def compute_shipping(weight):\n"
+    "    return round(weight * 0.5, 2)\n>>>>>>> REPLACE\n")
+INTENT_DISCOUNT = [{"file": "pricing.py", "symbol": "apply_discount",
+                    "intended_change": "add the discount helper"}]
+
+
+def _two_clause_project(tmp_path, **cfg_attrs):
+    root, idx, cfg = make_project(tmp_path, **cfg_attrs)
+    (root / "pricing.py").write_text(
+        (root / "pricing.py").read_text(encoding="utf-8")
+        + "\ndef apply_discount(price, pct):\n    return price\n",
+        encoding="utf-8")
+    (root / "shipping.py").write_text(
+        "def compute_shipping(weight):\n    return weight\n",
+        encoding="utf-8")
+    idx = index_mod.reindex_file(idx, "pricing.py", cfg, save=False)
+    idx = index_mod.reindex_file(idx, "shipping.py", cfg, save=False)
+    return root, idx, cfg
+
+
+def test_unaddressed_clause_seeds_one_bounded_followup_pass(tmp_path):
+    """The first batch answers only clause one; the requirement ledger flags
+    clause two and seeds a second pass whose intent names it -- no planner
+    call, no third pass."""
+    root, idx, cfg = _two_clause_project(tmp_path)
+    client = SeqModel([HUNK_DISCOUNT, HUNK_SHIPPING])
+    agent = Agent(idx, client, cfg)
+    events = []
+    agent._emit = lambda name, **kw: events.append((name, kw))
+
+    results, reply, findings = agent.apply_edit_intents(
+        TWO_CLAUSE_TASK, "gathered source", INTENT_DISCOUNT, verbose=False)
+
+    assert [r.ok for r in results] == [True, True]
+    assert not [f for f in findings if f.severity == "error"]
+    assert "def apply_discount" in (root / "pricing.py").read_text()
+    assert "def compute_shipping" in (root / "shipping.py").read_text()
+    assert "Coverage follow-up" in reply
+    assert "[EDITED shipping.py:compute_shipping]" in reply
+    # Exactly one follow-up pass, and its target message names clause two.
+    followups = [kw for name, kw in events if name == "coverage_followup"]
+    assert len(followups) == 1
+    assert any("compute_shipping" in c for c in followups[0]["clauses"])
+    assert len(client.chat_calls) == 2
+    second = client.chat_calls[1][-1]["content"]
+    assert "shipping.py" in second
+    assert "compute_shipping" in second
+
+
+def test_followup_pass_does_not_recurse(tmp_path):
+    """Even when the follow-up hunk never lands, the pass is bounded: one
+    follow-up with its usual retry ceiling, then the batch ends -- no third
+    pass, and the failed target is reported as failed."""
+    root, idx, cfg = _two_clause_project(tmp_path)
+    bad = HUNK_SHIPPING.replace("    return round(weight * 0.5, 2)\n",
+                                "    return round(weight * 0.5, 2\n")
+    client = SeqModel([HUNK_DISCOUNT, bad, bad, bad])
+    agent = Agent(idx, client, cfg)
+    events = []
+    agent._emit = lambda name, **kw: events.append((name, kw))
+
+    results, reply, _findings = agent.apply_edit_intents(
+        TWO_CLAUSE_TASK, "", INTENT_DISCOUNT, verbose=False)
+
+    assert [r.ok for r in results] == [True, False]
+    assert "return weight" in (root / "shipping.py").read_text()
+    assert sum(1 for name, _ in events if name == "coverage_followup") == 1
+    # one hunk for clause one, then the follow-up's three bounded attempts
+    assert len(client.chat_calls) == 4
+    assert "[FAILED shipping.py:compute_shipping" in reply
+
+
+def test_no_followup_when_every_clause_is_addressed(tmp_path):
+    root, idx, cfg = _two_clause_project(tmp_path)
+    client = SeqModel([HUNK_DISCOUNT, HUNK_SHIPPING])
+    agent = Agent(idx, client, cfg)
+    events = []
+    agent._emit = lambda name, **kw: events.append((name, kw))
+    intents = INTENT_DISCOUNT + [
+        {"file": "shipping.py", "symbol": "compute_shipping",
+         "intended_change": "add the shipping helper"}]
+
+    results, reply, _findings = agent.apply_edit_intents(
+        TWO_CLAUSE_TASK, "", intents, verbose=False)
+
+    assert [r.ok for r in results] == [True, True]
+    assert not [name for name, _ in events if name == "coverage_followup"]
+    assert "Coverage follow-up" not in reply
+    assert len(client.chat_calls) == 2

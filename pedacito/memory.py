@@ -300,11 +300,12 @@ def _write_json(path: Path, data) -> None:
 
 def _facts_doc(root) -> dict:
     """The micro-fact document: {facts, pending, retired, anti_patterns,
-    promoted}.
+    promoted, retired_lessons}.
 
     Rebuilt from a whitelist of keys on every read, so any writer sees the
-    same shape; `anti_patterns` (the repair lesson ledger) and `promoted`
-    (lessons that graduated into auto-managed path-scoped rules) must be
+    same shape; `anti_patterns` (the repair lesson ledger), `promoted`
+    (lessons that graduated into auto-managed path-scoped rules) and
+    `retired_lessons` (lessons retired for zero measured effect) must be
     listed here or another writer's round-trip would silently drop them."""
     raw = _read_json(micro_facts_file(root), {})
     facts = [f for f in raw.get("facts", ())
@@ -318,11 +319,15 @@ def _facts_doc(root) -> dict:
     promoted = [a for a in raw.get("promoted", ())
                 if isinstance(a, dict) and a.get("lesson_id") and a.get("text")
                 and str(a.get("promoted_to", "")).startswith(RULES_REL + "/")]
+    retired_lessons = [a for a in raw.get("retired_lessons", ())
+                       if isinstance(a, dict) and a.get("lesson_id")
+                       and a.get("text")]
     return {"facts": facts[-_MAX_MICRO_FACTS:],
             "pending": pending[-_MAX_PENDING_FACTS:],
             "retired": retired[-_MAX_MICRO_FACTS:],
             "anti_patterns": anti[-_MAX_ANTI_PATTERNS:],
-            "promoted": promoted[-_MAX_PROMOTED:]}
+            "promoted": promoted[-_MAX_PROMOTED:],
+            "retired_lessons": retired_lessons[-_MAX_MICRO_FACTS:]}
 
 
 # ------------------------------------------------- repair lesson ledger ---
@@ -346,6 +351,7 @@ RULES_REL = ".pedacito/rules"     # where scoped rule files live
 _AUTO_RULE_PREFIX = "auto_"       # only these files are auto-managed
 _MAX_AUTO_RULE_LINES = 5          # lesson lines per auto rule file
 _PROMOTION_CONFIRMATIONS = 2      # a lesson must repeat before it graduates
+_LESSON_RETIRE_RUNS = 5           # observed runs before a zero-effect lesson retires
 
 
 def _lesson_scope(files) -> str:
@@ -561,7 +567,8 @@ def record_anti_pattern(root, kind: str, text: str,
     else:
         row = {"lesson_id": lesson_id, "kind": kind, "text": text,
                "files": sorted({str(f) for f in (files or ())})[:8],
-               "confirmations": 1, "last_seen": now}
+               "confirmations": 1, "last_seen": now,
+               "runs": 0, "recurred": 0, "avoided": 0}
         doc["anti_patterns"].append(row)
         doc["anti_patterns"] = doc["anti_patterns"][-_MAX_ANTI_PATTERNS:]
     # A lesson that has now proven itself twice *and* names one directory
@@ -600,6 +607,62 @@ def load_anti_patterns(root, prune: bool = True) -> list[dict]:
 def load_promoted_lessons(root) -> list[dict]:
     """Promoted lessons still carried by auto-managed rule files."""
     return list(_facts_doc(root)["promoted"])
+
+
+def note_lesson_run(root, failed_kinds, cfg=None, injected=None) -> dict:
+    """Record one observed check run against every live lesson's effectiveness
+    counters (R5). `runs` counts the runs observed since the lesson landed,
+    `recurred` the runs whose failures included the lesson's kind, `avoided`
+    the runs that stayed clear of it. A lesson that faced _LESSON_RETIRE_RUNS
+    runs and never once saw its kind avoided -- the failure kept recurring
+    despite the hint -- retires into `retired_lessons`. Harness facts only:
+    the counters come from the gate/test failure kinds the loop already
+    distills, never from model-written reflection. `injected`, when given, is
+    the set of lesson ids the run's prompt actually carried (a lesson distilled
+    mid-run was not injected into it and is not counted). Promoted lessons are
+    exempt (graduating into a path-scoped rule already proved them), and a run
+    that observed no gates at all should not call this. Returns
+    {"counted": lessons updated, "retired": [lesson_id, ...]}."""
+    empty = {"counted": 0, "retired": []}
+    if cfg is not None and not getattr(cfg, "micro_facts", True):
+        return empty
+    if not root:
+        return empty
+    kinds = {str(k or "").strip().lower() for k in (failed_kinds or ())}
+    kinds.discard("")
+    doc = _facts_doc(root)
+    if not doc["anti_patterns"]:
+        return empty
+    live, retired_now = [], []
+    counted = 0
+    for row in doc["anti_patterns"]:
+        if injected is not None and row.get("lesson_id") not in injected:
+            live.append(row)      # born after this run's prompt was built
+            continue
+        counted += 1
+        row["runs"] = int(row.get("runs", 0) or 0) + 1
+        if str(row.get("kind", "")).strip().lower() in kinds:
+            row["recurred"] = int(row.get("recurred", 0) or 0) + 1
+        else:
+            row["avoided"] = int(row.get("avoided", 0) or 0) + 1
+        if row["runs"] >= _LESSON_RETIRE_RUNS \
+                and int(row.get("avoided", 0) or 0) == 0:
+            row["retired_at"] = time.time()
+            retired_now.append(row)
+        else:
+            live.append(row)
+    if retired_now:
+        doc["anti_patterns"] = live
+        doc["retired_lessons"] = (doc["retired_lessons"]
+                                  + retired_now)[-_MAX_MICRO_FACTS:]
+    _write_json(micro_facts_file(root), doc)
+    return {"counted": counted,
+            "retired": [str(r.get("lesson_id", "")) for r in retired_now]}
+
+
+def load_retired_lessons(root) -> list[dict]:
+    """Lessons retired for zero measured effect (inspection and tests)."""
+    return list(_facts_doc(root)["retired_lessons"])
 
 
 def render_anti_patterns(root, cfg=None, limit: int | None = None) -> str:
@@ -672,6 +735,7 @@ def observe_command(root, command: str, ok: bool, cfg=None,
         if ok:
             fact["confirmations"] = confirmations + 1
             fact["last_seen"] = now
+            fact["last_ok"] = True
             fact["text"] = _fact_text(command, fact.get("kind", kind),
                                       fact["confirmations"])
             _write_json(micro_facts_file(root), doc)
@@ -680,6 +744,7 @@ def observe_command(root, command: str, ok: bool, cfg=None,
         # at once -- a stale environment fact is worse than none.
         fact["contradictions"] = int(fact.get("contradictions", 0) or 0) + 1
         fact["last_seen"] = now
+        fact["last_ok"] = False
         doc["facts"].remove(fact)
         doc["retired"] = (doc["retired"] + [fact])[-_MAX_MICRO_FACTS:]
         _write_json(micro_facts_file(root), doc)
@@ -693,6 +758,7 @@ def observe_command(root, command: str, ok: bool, cfg=None,
                    "kind": kind}
         doc["pending"].append(pending)
     pending["last_seen"] = now
+    pending["last_ok"] = bool(ok)
     if ok:
         pending["successes"] = int(pending.get("successes", 0) or 0) + 1
     else:
@@ -706,6 +772,7 @@ def observe_command(root, command: str, ok: bool, cfg=None,
             "confirmations": pending["successes"],
             "contradictions": 0,
             "last_seen": now,
+            "last_ok": True,
             "kind": kind,
         }
         doc["facts"].append(promoted)
@@ -714,6 +781,26 @@ def observe_command(root, command: str, ok: bool, cfg=None,
     doc["pending"] = doc["pending"][-_MAX_PENDING_FACTS:]
     _write_json(micro_facts_file(root), doc)
     return promoted
+
+
+def command_was_failing(root, command: str) -> bool:
+    """True when the recorded history shows this exact command's most recent
+    run FAILED -- consulted BEFORE running it again, so a failure the repo
+    already had is not attributed to the current edit (baseline-aware test
+    verdicts). Looks across pending, live and retired rows: a command that
+    never earned a fact still leaves a pending failure trail. No history (or
+    no root) answers False -- the first failure is always treated as news."""
+    if not root:
+        return False
+    command, fact_id = _command_identity(command)
+    if not command:
+        return False
+    doc = _facts_doc(root)
+    for rows in (doc["pending"], doc["facts"], doc["retired"]):
+        for row in rows:
+            if row.get("fact_id") == fact_id:
+                return row.get("last_ok") is False
+    return False
 
 
 def render_micro_facts(root, cfg=None, limit: int | None = None) -> str:
