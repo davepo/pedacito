@@ -22,6 +22,7 @@ answer system prompt and the tool schema.
 
 from __future__ import annotations
 
+import re
 import subprocess
 import sys
 from dataclasses import dataclass, field
@@ -795,10 +796,13 @@ def _stub_is_implemented(rel: str, purpose: str, text: str) -> bool:
 
 def build_pass(client, cfg, idx, plan: Plan, target: PlannedFile,
                done: list[str], verbose: bool = True,
-               backup_dir=None) -> tuple[list, str]:
+               backup_dir=None, repair_note: str = "") -> tuple[list, str]:
     """Generate one file's implementation and apply it through the normal edit
     path, against its interface stub. The prompt holds the spec, the plan, every
-    file's known signatures and the target's full stub. Returns (results, reply)."""
+    file's known signatures and the target's full stub. `repair_note`, when
+    given, is the one-shot failed-build brief (BUG-201): the previous attempt's
+    rejection diagnostics, appended last so the model reads them freshest.
+    Returns (results, reply)."""
     from .agent import ANSWER_SYSTEM
 
     stub = fileio.read_text(idx.root / target.path, errors="replace")
@@ -825,6 +829,9 @@ def build_pass(client, cfg, idx, plan: Plan, target: PlannedFile,
     ]
     if done:
         ctx.insert(-2, "DONE SO FAR: " + ", ".join(done) + "\n")
+    if repair_note:
+        ctx.append("")
+        ctx.append(repair_note)
     messages = [
         {"role": "system", "content": BUILD_SYSTEM + "\n\n" + ANSWER_SYSTEM},
         {"role": "user", "content": "\n".join(ctx)},
@@ -877,6 +884,33 @@ def build_pass(client, cfg, idx, plan: Plan, target: PlannedFile,
     return results, reply
 
 
+def _build_repair_note(target: PlannedFile, bad: list, root: Path) -> str:
+    """The one-shot failed-build brief (BUG-201): each rejected block's
+    diagnostic plus a 10-line window of the file as it now stands, so the
+    re-ask repairs the actual failure instead of regenerating blind."""
+    parts = [
+        "REPAIR -- YOUR PREVIOUS ATTEMPT AT THIS FILE WAS REJECTED.",
+        "Nothing was written for the failed block(s); the current file "
+        "content is shown above. Fix exactly these problems and emit the "
+        "corrected search/replace block(s):",
+    ]
+    try:
+        lines = fileio.read_text(root / target.path,
+                                 errors="replace").splitlines()
+    except OSError:
+        lines = []
+    for r in bad[:4]:
+        parts.append(f"- {r.file}: {r.message}")
+        m = re.search(r"line (\d+)", r.message or "")
+        if m and lines:
+            ln = int(m.group(1))
+            a, b = max(0, ln - 6), min(len(lines), ln + 4)
+            if a < b:
+                window = "\n".join(f"{i + 1}: {lines[i]}" for i in range(a, b))
+                parts.append(f"  current file around line {ln}:\n{window}")
+    return "\n".join(parts)
+
+
 def build_project(client, cfg, idx, plan: Plan, verbose: bool = True,
                   on_file=None, backup_dir=None,
                   tests_first: bool | None = None) -> dict:
@@ -905,28 +939,50 @@ def build_project(client, cfg, idx, plan: Plan, verbose: bool = True,
             continue
         if verbose:
             print(f"\n--- building {t.path} ---", file=sys.stderr)
-        try:
-            results, _reply = build_pass(client, cfg, idx, plan, t,
-                                         done + noop, verbose,
-                                         backup_dir=backup_dir)
-        except LLMError as e:
-            print(f"  stopped: {e}", file=sys.stderr)
-            failed.append((t.path, "server error"))
-            skipped.extend(x.path for x in targets
-                           if x.path not in done and x.path not in noop
-                           and x.path != t.path)
+        bad: list = []
+        stopped = False
+        repair_note = ""
+        for attempt in range(2):
+            try:
+                results, _reply = build_pass(client, cfg, idx, plan, t,
+                                             done + noop, verbose,
+                                             backup_dir=backup_dir,
+                                             repair_note=repair_note)
+            except LLMError as e:
+                print(f"  stopped: {e}", file=sys.stderr)
+                failed.append((t.path, "server error"))
+                skipped.extend(x.path for x in targets
+                               if x.path not in done and x.path not in noop
+                               and x.path != t.path)
+                stopped = True
+                break
+            ok = [r for r in results if r.ok]
+            bad = [r for r in results if not r.ok]
+            if ok:
+                if t.path not in done and t.path not in noop:
+                    if all(r.message.startswith(_NOOP_MSG) for r in ok):
+                        noop.append(t.path)
+                    else:
+                        done.append(t.path)
+                for r in ok:
+                    idx = index_mod.reindex_file(idx, r.file, cfg)
+                if on_file is not None:
+                    on_file(t.path, idx)
+            if not bad or attempt:
+                break
+            # BUG-201: a failed build pass gets ONE repair re-ask (the
+            # diagnostic + a window of the file) before it is reported
+            # failed -- parity with the web-contract repair pass, instead
+            # of leaving a stub behind with no second chance.
+            repair_note = _build_repair_note(t, bad, idx.root)
+            if verbose:
+                print("  [build pass rejected; re-asking once with the "
+                      "diagnostic]", file=sys.stderr)
+            workspace.log_event(
+                idx.root, f"build pass for {t.path} rejected; one repair "
+                          f"re-ask", "WARN")
+        if stopped:
             break
-        ok = [r for r in results if r.ok]
-        bad = [r for r in results if not r.ok]
-        if ok:
-            if all(r.message.startswith(_NOOP_MSG) for r in ok):
-                noop.append(t.path)
-            else:
-                done.append(t.path)
-            for r in ok:
-                idx = index_mod.reindex_file(idx, r.file, cfg)
-            if on_file is not None:
-                on_file(t.path, idx)
         if bad:
             failed.append((t.path, "; ".join(r.message for r in bad)[:200]))
             if verbose:

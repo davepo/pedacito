@@ -3525,6 +3525,153 @@ def _pytest_tally(out: str) -> str:
     return ""
 
 
+# `node --test` prints a TAP/spec summary: `ℹ tests 11`, `# pass 8`, ...
+_NODE_TALLY_RE = re.compile(
+    r"^(?:[#ℹ]\s*)?(tests|suites|pass|fail|cancelled|skipped|todo)\s+(\d+)",
+    re.M)
+
+
+def _node_tally(out: str) -> str:
+    """Node's own summary counts ("tests 11, pass 8, fail 3"), or ''."""
+    counts: dict[str, str] = {}
+    for m in _NODE_TALLY_RE.finditer(out or ""):
+        counts.setdefault(m.group(1), m.group(2))
+    if "tests" not in counts:
+        return ""
+    order = ("tests", "pass", "fail", "cancelled", "skipped", "todo")
+    return ", ".join(f"{k} {counts[k]}" for k in order if k in counts)[:200]
+
+
+def _maybe_run_test_node(root: Path, cfg, tgt: str, filt: str):
+    """Run the project's Node tests when the runner is Node, else return None
+    so the caller falls through to pytest (BUG-203). `run_test` used to be
+    pytest-only, which made a `node --test` suite invisible to gather
+    introspection: a task could name `node --test tests/x.test.js` and the
+    action would refuse it, so the run never saw the failing tests.
+
+    Same safety contract as the pytest path: the target resolves INSIDE the
+    project, the run is an argv list (no shell), the timeout is capped, and
+    the sandbox wraps it. Node's exit code is the verdict (0 pass, non-zero
+    fail); unlike pytest there is no distinct "collected nothing" code."""
+    from . import testsel
+    try:
+        det = testsel.detect_test_command(root, cfg) or ""
+    except Exception:
+        det = ""
+    low = det.lower()
+    is_node_cmd = (low.startswith("node --test") or low == "node -t"
+                   or low.startswith(("npm test", "pnpm test", "yarn test")))
+
+    js_target = ""
+    if tgt:
+        file_part = tgt.partition("::")[0]
+        try:
+            resolved = security.resolve_safe_path(root, file_part)
+        except security.SecurityError as e:
+            return f"ERROR: run_test refused the target: {e}"
+        if not resolved.exists():
+            return (f"ERROR: run_test target does not exist: "
+                    f"{file_part[:120]} -- use `find`/`grep` to locate the "
+                    "test file, then run it.")
+        if resolved.is_file():
+            if resolved.suffix.lower() in (".js", ".mjs", ".cjs"):
+                js_target = resolved.relative_to(root).as_posix()
+            else:
+                return None        # a .py (or other) target is pytest's job
+    if not is_node_cmd and not js_target:
+        return None                # not a Node project: the pytest path owns it
+    if not shutil.which("node"):
+        return ("ERROR: this project's tests run under Node, but no `node` "
+                "binary is on PATH here. Install Node, or point the config "
+                "test_command at a runner that exists in this environment.")
+
+    if js_target:
+        cmd = (testsel.narrow_command(det, [js_target])[0] if is_node_cmd
+               else f"node --test {js_target}")
+    else:
+        cmd = det if is_node_cmd else "node --test"
+    try:
+        argv = _split_command(cmd)
+    except ValueError:
+        argv = cmd.split()
+    if not argv:
+        return None
+    # `filter` is a pytest -k expression; the honest Node equivalent is a
+    # test-name pattern, and only a direct `node --test` invocation takes it.
+    if filt and Path(argv[0]).name.lower() in ("node", "node.exe") \
+            and "--test" in argv:
+        if filt.startswith("-"):
+            return ("ERROR: the run_test `filter` cannot start with '-' (it "
+                    "would read as an option). Use a name pattern like "
+                    "'save or retry'.")
+        argv += ["--test-name-pattern", filt]
+    display = " ".join(argv)[:200]
+
+    timeout = max(1, min(_as_int(getattr(cfg, "test_timeout", 300), 300),
+                         _RUN_TEST_TIMEOUT_CAP))
+    cap = max(2000, _as_int(getattr(cfg, "max_shell_output_chars", 8000),
+                             8000))
+    env = _child_env(cfg)
+    try:
+        run_argv, box = sandbox.wrap(argv, cfg, root)
+    except sandbox.SandboxRefused as e:
+        return f"ERROR: {e}"
+    rc, out, stopped, _elapsed = proc.run(
+        run_argv, cwd=root, timeout=timeout, idle_timeout=timeout,
+        max_output=cap, env=env)
+    if stopped == "error":
+        return f"ERROR: could not run the Node tests: {str(out)[:300]}"
+    try:
+        from . import memory
+        memory.observe_command(root, display, rc == 0 and stopped == "",
+                               cfg, kind="test")
+    except Exception:
+        pass
+
+    raw = (out or "").strip()
+    if stopped == "timeout":
+        return ("RUN TEST: {d}\nSTOPPED: timed out after {t}s (killed; a "
+                "scoped run keeps a tight ceiling).\nPARTIAL OUTPUT:\n{p}\n"
+                "[Narrow the scope with `target`; do not re-run the same "
+                "whole suite.]").format(
+                    d=display, t=timeout,
+                    p=_condense_failures(raw, 1500) or "(no output)")
+
+    verdict = "OK" if rc == 0 else "FAILED"
+    lines = [f"RUN TEST: {display}", f"EXIT: {rc} ({verdict})"]
+    tally = _node_tally(raw)
+    if tally:
+        lines.append(f"SUMMARY: {tally}")
+    if rc == 0:
+        lines.append("PASSED: this scope is green, so whatever is broken is "
+                     "NOT in these tests. Do not re-run to watch it pass "
+                     "again.")
+    else:
+        if "could not find" in raw.lower():
+            lines.append("The runner could not find the target file -- check "
+                         "the path with `find`/`grep` before running again.")
+        budget_tokens = max(200, _as_int(getattr(cfg, "max_read_tokens",
+                                                 1200), 1200))
+        condensed = _condense_failures(raw, int(budget_tokens
+                                                * _RUN_TEST_CHARS_PER_TOKEN))
+        if condensed:
+            lines.append("FAILURES (condensed):")
+            lines.append(condensed)
+        lines.append("[Read the failing lines above, `read` the implicated "
+                     "source, and fix THAT -- with the live error now in "
+                     "front of you.]")
+        if box:
+            lines.append(f"[ran in a sandbox ({box}); a failure caused by a "
+                         "blocked write outside the project or by no "
+                         "network is the sandbox, not the code.]")
+    obs = "\n".join(lines)
+    hard_cap = int(max(200, _as_int(getattr(cfg, "max_read_tokens", 1200),
+                                    1200)) * _RUN_TEST_CHARS_PER_TOKEN) + 500
+    if len(obs) > hard_cap:
+        obs = obs[:hard_cap].rstrip() + "\n[observation capped]"
+    return obs
+
+
 def _condense_failures(out: str, budget_chars: int) -> str:
     """A compact failure digest instead of the raw transcript: loop.py's
     failure identities when importable (the same condenser the repair
@@ -3565,24 +3712,29 @@ def _condense_failures(out: str, budget_chars: int) -> str:
 
 
 def tool_run_test(index, cfg, target: str = "", k_filter: str = "") -> str:
-    """Run ONE scoped pytest check in the project root during gather and
-    return a compact pass/fail observation with the condensed traceback.
+    """Run ONE scoped test check in the project root during gather and return
+    a compact pass/fail observation with the condensed failure output.
+
+    The runner follows the project: pytest for a Python suite, Node's test
+    runner (`node --test` / `npm test`) for a JS one (BUG-203) -- so a task
+    that names `node --test tests/x.test.js` is visible to gather instead of
+    being refused as "pytest only".
 
     The signature is `{action: "run_test", target: <file or node id>,
-    filter: <pytest -k expr>}`; both arguments are optional. Safety rules,
-    in order:
-      * NO shell, ever: pytest is started as an argv list (`shell=False` by
-        construction through `proc.run`), so pipes, redirection and `;` are
-        inert arguments.
+    filter: <pytest -k expr / node --test-name-pattern>}`; both arguments are
+    optional. Safety rules, in order:
+      * NO shell, ever: the runner is started as an argv list (`shell=False`
+        by construction through `proc.run`), so pipes, redirection and `;`
+        are inert arguments.
       * `target` (its file portion before `::`) must resolve INSIDE the
         project through `security.resolve_safe_path`; traversal, symlink
         escape and non-existent paths are refused with a hint.
       * the whole run gets `min(cfg.test_timeout, 15)` seconds.
       * with `enable_run_test_in_gather` off the human Permission Broker
         decides (category `test_execution`); no broker means no run.
-    Output is token-bounded (`cfg.max_read_tokens`): the tally line plus at
-    most four condensed failure blocks, using loop.py's traceback condenser
-    when it is importable."""
+    Output is token-bounded (`cfg.max_read_tokens`): the tally line plus a
+    condensed failure digest, using loop.py's traceback condenser when it is
+    importable."""
     root = Path(index.root).resolve()
     tgt = _as_text(target).strip().strip("`\"'")
     filt = _as_text(k_filter).strip()[:160]
@@ -3605,6 +3757,12 @@ def tool_run_test(index, cfg, target: str = "", k_filter: str = "") -> str:
         if not allowed:
             return msg
 
+    # BUG-203: a Node project's suite is a first-class run_test target too.
+    # Returns None when this is not a Node run, falling through to pytest.
+    node_obs = _maybe_run_test_node(root, cfg, tgt, filt)
+    if node_obs is not None:
+        return node_obs
+
     argv_target = ""
     if tgt:
         file_part, sep, node_part = tgt.partition("::")
@@ -3617,9 +3775,9 @@ def tool_run_test(index, cfg, target: str = "", k_filter: str = "") -> str:
                     f"{file_part[:120]} -- use `find`/`grep` to locate the "
                     "test file, then run it.")
         if resolved.is_file() and resolved.suffix.lower() not in (".py", ""):
-            return (f"ERROR: run_test runs pytest only; {resolved.suffix} "
-                    "is outside its scope (use `run` with allow_shell for "
-                    "other runners).")
+            return (f"ERROR: run_test runs pytest or Node's test runner; "
+                    f"{resolved.suffix} is outside their scope (use `run` "
+                    "with allow_shell for other runners).")
         rel = resolved.relative_to(root).as_posix()
         if sep:
             node = node_part.strip()
@@ -3653,8 +3811,8 @@ def tool_run_test(index, cfg, target: str = "", k_filter: str = "") -> str:
         return ("ERROR: no working pytest runner in this environment: neither "
                 "`python -m pytest --version` nor `pytest --version` succeeds "
                 "here. Install pytest in the interpreter running pedacito "
-                "(python -m pip install pytest); `run_test` only ever runs "
-                "pytest, so there is nothing else it can honestly execute.")
+                "(python -m pip install pytest). (This is a Python target; a "
+                "JS test file would run under Node's test runner instead.)")
     for flag in ("-q", "--tb=short", "--maxfail=3"):
         if flag not in argv:
             argv.append(flag)

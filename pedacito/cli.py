@@ -1661,6 +1661,46 @@ def _cmd_webcheck(args) -> int:
     return 1
 
 
+def _cmd_domcheck(args) -> int:
+    """`pedacito domcheck`: the headless DOM smoke check. Loads the entry
+    page in headless Chromium (Playwright), proves the module graph mounts,
+    and reports page errors, failed loads, and unbound controls. With
+    --baseline it also diffs the mounted surface against an earlier
+    --snapshot (the BUG-216 regression shape). Explicit invocation is the
+    consent to run project code; the in-run gate needs verify_dom AND
+    allow_shell. Exit: 0 clean, 1 error findings, 2 could not run."""
+    from . import domcheck
+    root = _root(args)
+    cfg = _light_config(args)
+    entry = args.entry or getattr(cfg, "dom_entry", "") or ""
+    timeout = args.timeout or int(getattr(cfg, "dom_timeout", 45) or 45)
+    baseline = None
+    if args.baseline:
+        baseline = domcheck.load_snapshot(args.baseline)
+        if baseline is None:
+            print(f"domcheck: cannot read baseline snapshot {args.baseline}",
+                  file=sys.stderr)
+            return 2
+    res = domcheck.check(root, entry=entry, timeout=timeout, baseline=baseline)
+    if res.error:
+        print(f"domcheck: {res.error}", file=sys.stderr)
+        return 2
+    print(f"entry: {res.entry}")
+    if args.snapshot:
+        domcheck.save_snapshot(args.snapshot, res.snapshot or {})
+        print(f"snapshot saved: {args.snapshot}")
+    if not res.findings:
+        print("no DOM problems found (page loaded, module graph mounted, "
+              "controls bound)")
+        return 0
+    for f in res.findings:
+        print(f)
+    errs = sum(1 for f in res.findings if f.severity == "error")
+    print(f"{len(res.findings)} finding(s), {errs} error(s); "
+          "re-run after fixing to confirm")
+    return 1 if errs else 0
+
+
 def _cmd_skills(args) -> int:
     from . import skills
     root = _root(args)
@@ -2026,6 +2066,14 @@ def build_parser() -> argparse.ArgumentParser:
                             "(objective, files, interface contracts, edge "
                             "cases, verification) with the spec architect "
                             "before running it")
+    p_ask.add_argument("--max-minutes", type=int, default=None,
+                       help="per-task wall-clock cap: stop the task once this "
+                            "many minutes have elapsed (0 = no limit; default "
+                            "comes from max_task_seconds)")
+    p_ask.add_argument("--verify-dom", dest="verify_dom", action="store_true",
+                       help="after applied web edits, run the headless DOM "
+                            "smoke check (needs allow_shell and Playwright); "
+                            "flips verify_dom for this run")
 
     p_explain = sub.add_parser(
         "explain", help="answer questions about an indexed project's code")
@@ -2349,6 +2397,26 @@ def build_parser() -> argparse.ArgumentParser:
     p_web.add_argument("--config", metavar="FILE")
     p_web.add_argument("--profile", metavar="NAME")
 
+    p_dom = sub.add_parser(
+        "domcheck", help="headless DOM smoke check: load the entry page in "
+                         "Chromium, prove the module graph mounts, report "
+                         "page errors, failed loads and unbound controls "
+                         "(needs Playwright)")
+    p_dom.add_argument("paths", nargs="*", default=["."])
+    p_dom.add_argument("--entry", default="", metavar="FILE",
+                       help="entry HTML to load (default: detected index "
+                            "page, or dom_entry from config)")
+    p_dom.add_argument("--timeout", type=int, default=0, metavar="SECONDS",
+                       help="cap one page load (default: dom_timeout, 45)")
+    p_dom.add_argument("--snapshot", metavar="FILE",
+                       help="save the mounted-DOM snapshot here")
+    p_dom.add_argument("--baseline", metavar="FILE",
+                       help="diff the mounted surface against this earlier "
+                            "snapshot (regression check)")
+    p_dom.add_argument("--root", default=None)
+    p_dom.add_argument("--config", metavar="FILE")
+    p_dom.add_argument("--profile", metavar="NAME")
+
     p_skills = sub.add_parser("skills", help="list the available skills")
     p_skills.add_argument("paths", nargs="*", default=["."])
     p_skills.add_argument("--root", default=None)
@@ -2453,7 +2521,8 @@ def _main(argv=None) -> int:
             return 2
     light = {"prune": _cmd_prune, "reset": _cmd_reset, "memory": _cmd_memory,
              "trust": _cmd_trust, "tests": _cmd_tests,
-             "webcheck": _cmd_webcheck, "skills": _cmd_skills,
+             "webcheck": _cmd_webcheck, "domcheck": _cmd_domcheck,
+             "skills": _cmd_skills,
              "rename": _cmd_rename,
              "serve": _cmd_serve, "procs": _cmd_procs, "lsp": _cmd_lsp,
              "mcp": _cmd_mcp}
@@ -2828,6 +2897,12 @@ def _main(argv=None) -> int:
 
         if args.cmd == "ask":
             ask_task = args.task
+            if getattr(args, "max_minutes", None) is not None:
+                # BUG-218: a per-task wall-clock cap the caller can set
+                # without editing config (0 = no limit).
+                cfg.max_task_seconds = max(0, args.max_minutes) * 60
+            if getattr(args, "verify_dom", False):
+                cfg.verify_dom = True
             if getattr(args, "refine", False):
                 ask_task = _refine_task_text(cfg, client, root, ask_task,
                                              "ask")
@@ -2845,13 +2920,40 @@ def _main(argv=None) -> int:
             print("\n" + _usage_line(client), file=sys.stderr)
             from . import replay as replay_mod
             replay_mod.report(client)
+            tr = locals_ref.get("last_result")
             strict = (_strict_replay_error(args, client)
-                      or _strict_task_error(args,
-                                            locals_ref.get("last_result")))
+                      or _strict_task_error(args, tr))
             if strict:
                 print(f"ERROR: {strict}", file=sys.stderr)
                 elog.emit("exit", code=1)
                 return 1
+            # BUG-212: reserve exit 0 for runs that landed work. An --apply
+            # run whose every edit block failed used to exit 0 with only
+            # [FAIL] lines as the signal; an autonomous caller had no cheap
+            # verdict. An honest "No changes:" declaration still passes,
+            # report-only tasks have no unaccepted edit clauses, and review
+            # sign-off stays a human decision, not a CI failure.
+            if tr is not None and not _wants_review(args, cfg):
+                if getattr(tr, "ok", None) is False:
+                    print("ERROR: the planned run reported failed tasks",
+                          file=sys.stderr)
+                    elog.emit("exit", code=1)
+                    return 1
+                if (getattr(args, "apply", False)
+                        and not getattr(tr, "applied", False)
+                        and not loop._is_noop(getattr(tr, "reply", "") or "")):
+                    results = getattr(tr, "results", []) or []
+                    if results:
+                        print(f"ERROR: NOTHING APPLIED: {len(results)}/"
+                              f"{len(results)} edit block(s) failed; zero "
+                              "files were changed", file=sys.stderr)
+                        elog.emit("exit", code=1)
+                        return 1
+                    if getattr(tr, "unaccepted", None):
+                        print("ERROR: NOTHING APPLIED: no task clause was "
+                              "addressed by an edit", file=sys.stderr)
+                        elog.emit("exit", code=1)
+                        return 1
             elog.emit("exit", code=0)
             return 0
 

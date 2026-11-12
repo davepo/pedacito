@@ -42,6 +42,7 @@ import hashlib
 import json
 import re
 import sys
+import time
 from dataclasses import dataclass, field
 
 from . import diagnostics as diagnostics_mod
@@ -1264,6 +1265,14 @@ class Agent:
         # exact spans the answer packer must pin. Both reset per task.
         self.requirements = None
         self.active_diagnostics: dict = {}
+        # Task-level budget guard (BUG-218): wall-clock and output-token
+        # snapshot taken at gather start; every later phase checks the delta
+        # before spending another model call. 0 means no task is running
+        # (scaffold builds never gather, so they are not budgeted here).
+        self._task_t0 = 0.0
+        self._task_tokens0 = 0
+        self._task_clients: list = []
+        self._task_budget_hit = ""
         self._lossy = False
         self.fold_count = 0
         self.answer_mode_used = "rebuild"
@@ -1301,6 +1310,51 @@ class Agent:
             (self.client if client is None else client).site = site
         except Exception:
             pass
+
+    def _task_budget_spent(self) -> tuple[float, int]:
+        """(seconds, completion tokens) this task has spent since gather
+        started, across every client the task uses (scout included)."""
+        secs = time.time() - self._task_t0 if self._task_t0 else 0.0
+        toks = 0
+        for c in self._task_clients or [self.client]:
+            st = getattr(c, "stats", None) or {}
+            try:
+                toks += int(st.get("completion_tokens", 0) or 0)
+            except (TypeError, ValueError):
+                pass
+        return secs, max(0, toks - self._task_tokens0)
+
+    def _task_budget_exceeded(self, phase: str) -> bool:
+        """True when this task spent its wall-clock or output-token ceiling
+        (cfg.max_task_seconds / max_task_completion_tokens, BUG-218). The
+        caller stops re-asking and reports what landed; the verdict is
+        printed and emitted exactly once per task."""
+        if not self._task_t0:
+            return False            # no task snapshot (e.g. scaffold builds)
+        if self._task_budget_hit:
+            return True
+        cap_t = float(getattr(self.cfg, "max_task_seconds", 0) or 0)
+        cap_k = int(getattr(self.cfg, "max_task_completion_tokens", 0) or 0)
+        if cap_t <= 0 and cap_k <= 0:
+            return False
+        secs, toks = self._task_budget_spent()
+        why = ""
+        if cap_t > 0 and secs >= cap_t:
+            why = f"{secs:.0f}s wall clock >= max_task_seconds={cap_t:.0f}"
+        elif cap_k > 0 and toks >= cap_k:
+            why = (f"{toks:,} output tokens >= "
+                   f"max_task_completion_tokens={cap_k:,}")
+        if not why:
+            return False
+        self._task_budget_hit = why
+        print(f"\n[task budget exhausted ({why}); stopping the {phase} "
+              "phase -- no more model calls for this task]", file=sys.stderr)
+        try:
+            self._emit("task_budget", phase=phase, reason=why,
+                       seconds=round(secs, 1), completion_tokens=toks)
+        except Exception:
+            pass
+        return True
 
     def _gather_client(self):
         """The client the gather loop runs its steps on (scout routing):
@@ -1385,6 +1439,27 @@ class Agent:
     def _emit(self, kind: str, **fields) -> None:
         if self.events is not None:
             self.events.emit(kind, **fields)
+
+    def _note_lease_strike(self, task: str) -> None:
+        """A no-progress lease spent on this task. TWO leases on one task
+        (across its attempts) are an escalation signal: the profile is not
+        going to unstick itself, so suggest the `escalate` rung instead of
+        spending a third lease on the same profile. A success clears the
+        task's strikes (loop.run_task)."""
+        strikes = self.cfg.__dict__.setdefault("_lease_strikes", {})
+        key = " ".join((task or "").split())[:200]
+        n = int(strikes.get(key, 0)) + 1
+        strikes[key] = n
+        if len(strikes) > 64:                      # bound the ledger
+            for k in list(strikes)[:len(strikes) - 64]:
+                strikes.pop(k, None)
+        if n >= 2 and not getattr(self.cfg, "_task_escalation_reason", ""):
+            reason = (f"{n} consecutive no-progress leases on one task; "
+                      "the profile keeps stalling on the same evidence")
+            self.cfg._task_escalation_reason = reason
+            self._emit("escalation_suggested", reason=reason,
+                       profile=getattr(self.cfg, "active_profile", "") or "")
+            print(f"  [escalation suggested: {reason}]", file=sys.stderr)
 
     def _hook(self, event: str, **fields):
         """Fire a user hook (hooks.py) when one is configured for `event`."""
@@ -1972,6 +2047,17 @@ class Agent:
         # cfg.scout_profile when it names another reachable profile; dispatch,
         # subagents, and the answer phase stay on the architect client.
         gclient = self._gather_client()
+        # Task-level budget guard (BUG-218): snapshot the wall clock and the
+        # cumulative output tokens at task start; gather, answer and every
+        # repair loop check the delta before spending another call.
+        self._task_t0 = time.time()
+        self._task_clients = [self.client] + (
+            [gclient] if gclient is not self.client else [])
+        self._task_tokens0 = sum(
+            int((getattr(c, "stats", None) or {}).get("completion_tokens", 0)
+                or 0)
+            for c in self._task_clients)
+        self._task_budget_hit = ""
         if verbose and gclient is not self.client:
             print(f"  [scout: gather runs on profile "
                   f"'{getattr(self.cfg, 'scout_profile', '')}']",
@@ -2199,6 +2285,7 @@ class Agent:
                          "to the read ledger and resolved no new symbol. "
                          "Answer from what was already gathered.]")
             self._emit("recovery", signal="no_progress", step=step)
+            self._note_lease_strike(task)
             if verbose:
                 print("  [gather stopped: the no-progress lease ran out; "
                       "moving to answer]", file=sys.stderr)
@@ -2335,6 +2422,11 @@ class Agent:
                     print(f"  [gather stopped: {model_calls} model calls "
                           f"(cfg.max_total_model_calls); moving to answer]",
                           file=sys.stderr)
+                break
+            if self._task_budget_exceeded("gather"):
+                harness_note("[Harness: gather stopped -- the task budget "
+                             "ran out. Answer from what was already "
+                             "gathered.]")
                 break
             step += 1
             # Steering: lines the user typed mid-run join the turn that has
@@ -2572,6 +2664,17 @@ class Agent:
                                      "content": _compact(stepjson)})
                     messages.append({"role": "user",
                                      "content": f"{note}\n\n{nudge(step + 1)}"})
+                    # A prompt-only redirect left small models repeating the
+                    # same step until the lease ran out (BUG-208). Take the
+                    # deterministic requirement assist NOW: its observation
+                    # rides with this user turn and moves the oldest unmet
+                    # clause forward, so the next turn has new evidence to
+                    # act on instead of the same empty choice.
+                    if self.requirements and _requirement_assist(tail=True):
+                        if verbose:
+                            print("  [recovery: harness fetched the cheapest "
+                                  "lookup for the oldest unmet requirement]",
+                                  file=sys.stderr)
                     repeated, last_sig = 0, None
                     self._emit("recovery", signal="repeat", step=step)
                     if verbose:
@@ -2588,7 +2691,12 @@ class Agent:
                           f"answer]", file=sys.stderr)
                 break
 
-            dedup_step = is_repeat and action in _DEDUP_STEP_ACTIONS
+            # Suppress an identical read-only step outright after the first
+            # repeat: its result cannot change, and a small model meeting an
+            # unchanged action space re-picks it until the lease dies
+            # (BUG-208's five identical reads). Mutating steps stay
+            # dispatchable -- a re-run after a change is legitimate work.
+            dedup_step = is_repeat and action not in _MUTATING
             earlier = ran.get(sig) if action in _CACHEABLE_ACTIONS else None
             if earlier is not None and (earlier[1] != self.index.generation
                                         or earlier[2] != self.fold_count
@@ -3169,6 +3277,11 @@ class Agent:
                 system: str | None, max_tokens: int | None,
                 include_edit_format: bool) -> str:
         self._set_site("answer")
+        if self._task_budget_exceeded("answer"):
+            # A clear no-edit verdict, not another 24k-token draft: the
+            # outer loop reads the marker as a refusal to edit.
+            return ("[No changes: the task budget ran out before the answer "
+                    "could be generated; nothing was written.]")
         brief = self._answer_brief(system, include_edit_format, task)
         mode = self._answer_mode()
         if mode in ("continue", "auto") and self._can_continue(task, brief,
@@ -3237,6 +3350,8 @@ class Agent:
         One small greedy call. An empty/unparseable reply returns [] so the
         caller can fall back to the ordinary answer path; no failure here can
         block a task."""
+        if self._task_budget_exceeded("edit-intent plan"):
+            return []
         try:
             repo_map, _tier = self._map(task)
         except Exception:
@@ -3369,61 +3484,74 @@ class Agent:
 
     def _check_incremental_hunk(self, task: str, gathered: str, rel: str,
                                 symbol: str, reply: str):
-        """Dry-apply ONE target hunk, then run verify.py and the AST gate."""
+        """Dry-apply ONE target's hunks, then run verify.py and the AST gate.
+
+        Several blocks for the SAME file are applied in order (the apply
+        path already sequences them against the evolving buffer): appending
+        tests is the commonest two-block shape, and rejecting it outright
+        stranded the feature half-implemented (BUG-206). Blocks for any
+        OTHER file still refuse -- the microloop owns one target at a time."""
         from . import verify as verify_mod
         parsed = parse_edits(reply)
-        if len(parsed) != 1:
+        mine = [b for b in parsed if _same_rel(b.file, rel)]
+        others = [b for b in parsed if not _same_rel(b.file, rel)]
+        if not mine:
+            got = ", ".join(sorted({b.file for b in parsed})) or "none"
             return [Result(
                 False, rel,
-                f"incremental edit must contain exactly ONE block for "
-                f"{rel}:{symbol or '(file)'}; got {len(parsed)}")], []
-        block = parsed[0]
-        if not _same_rel(block.file, rel):
+                f"incremental edit must contain at least one block for "
+                f"{rel}:{symbol or '(file)'}; got blocks for: {got}")], []
+        if others:
             return [Result(
                 False, rel,
-                f"incremental edit targeted {block.file!r}, but the current "
-                f"symbol is in {rel}")], []
-        if symbol and block.symbol:
-            bw, tw = fileio.path_key(block.symbol), fileio.path_key(symbol)
-            if not (bw == tw or bw.endswith("." + tw) or tw.endswith("." + bw)):
+                f"incremental edit targeted {others[0].file!r}, but the "
+                f"current symbol is in {rel}")], []
+        for block in mine:
+            if symbol and block.symbol:
+                bw, tw = fileio.path_key(block.symbol), fileio.path_key(symbol)
+                if not (bw == tw or bw.endswith("." + tw) or tw.endswith("." + bw)):
+                    return [Result(
+                        False, rel,
+                        f"incremental edit anchored {block.symbol!r}, but the "
+                        f"current target is {symbol!r}")], []
+            if symbol and not block.symbol and not block.lines \
+                    and not block.search.strip():
                 return [Result(
                     False, rel,
-                    f"incremental edit anchored {block.symbol!r}, but the "
-                    f"current target is {symbol!r}")], []
-        if symbol and not block.symbol and not block.lines \
-                and not block.search.strip():
-            return [Result(
-                False, rel,
-                "an empty SEARCH without a SYMBOL/LINES anchor would replace "
-                f"the WHOLE file; target {symbol!r} with a SYMBOL header")], []
-        if symbol and not block.symbol and block.lines:
-            # `LINES 1-171` of a 171-line file is a whole-file rewrite wearing
-            # a range anchor: the symbol-sized target this loop asked for is
-            # gone, and the answer token cap cuts the copied file mid-definition
-            # -- which is how one run lost a class and a factory on a retry.
-            first, last = block.lines
-            total = self._disk_line_count(rel)
-            if (total >= 40 and first <= 2
-                    and (last - first + 1) * 4 >= total * 3):
-                return [Result(
-                    False, rel,
-                    f"this block replaces lines {first}-{last} of a {total}-"
-                    f"line file -- that is the WHOLE file, for one definition "
-                    f"({symbol!r}). Re-emit it anchored on the symbol, with "
-                    f"the full new definition as the body and no SEARCH "
-                    f"section at all:\n"
-                    f"<<<<<<< SYMBOL {rel} :: {symbol}\n"
-                    f"...the complete new {symbol}...\n"
-                    f">>>>>>> END_SYMBOL\n"
-                    f"Never copy a whole file into a reply: it runs past the "
-                    f"output limit and is cut off mid-line.")], []
+                    "an empty SEARCH without a SYMBOL/LINES anchor would replace "
+                    f"the WHOLE file; target {symbol!r} with a SYMBOL header")], []
+            if symbol and not block.symbol and block.lines:
+                # `LINES 1-171` of a 171-line file is a whole-file rewrite wearing
+                # a range anchor: the symbol-sized target this loop asked for is
+                # gone, and the answer token cap cuts the copied file mid-definition
+                # -- which is how one run lost a class and a factory on a retry.
+                first, last = block.lines
+                total = self._disk_line_count(rel)
+                if (total >= 40 and first <= 2
+                        and (last - first + 1) * 4 >= total * 3):
+                    return [Result(
+                        False, rel,
+                        f"this block replaces lines {first}-{last} of a {total}-"
+                        f"line file -- that is the WHOLE file, for one definition "
+                        f"({symbol!r}). Re-emit it anchored on the symbol, with "
+                        f"the full new definition as the body and no SEARCH "
+                        f"section at all:\n"
+                        f"<<<<<<< SYMBOL {rel} :: {symbol}\n"
+                        f"...the complete new {symbol}...\n"
+                        f">>>>>>> END_SYMBOL\n"
+                        f"Never copy a whole file into a reply: it runs past the "
+                        f"output limit and is cut off mid-line.")], []
         results = self._apply_once(reply, dry_run=True)
         # Run the syntax gate explicitly (verify.check also invokes it; the
         # duplicate is cheap and keeps this microloop's contract self-evident).
+        # Coverage is a BATCH verdict: mid-batch, every clause the later
+        # targets still owe looks unaddressed, so per-hunk coverage findings
+        # are noise (and doubled the ledger, BUG-207). apply_edit_intents
+        # checks coverage once, against the whole batch's edit evidence.
         syntax = verify_mod.check_syntax(results)
         findings = syntax + [
             f for f in verify_mod.check(self, task, reply, results, gathered)
-            if getattr(f, "kind", "") != "syntax"]
+            if getattr(f, "kind", "") not in ("syntax", "coverage")]
         return results, findings
 
     @staticmethod
@@ -3454,6 +3582,12 @@ class Agent:
 
         for req in reqs:
             before = len(intents)
+            # A clause the answer DESCRIBED but no edit implements gets the
+            # gap named in the intent itself, so the hunk prompt says exactly
+            # what is owed instead of a generic clause repeat.
+            change = (f"you described this in prose but no edit implements "
+                      f"it: {req.text}"
+                      if getattr(req, "prose_only", False) else req.text)
             # 1. A located anchor or displayed read names an exact span: the
             #    smallest definition covering it is the follow-up target.
             for rel, a, _b in req.anchors + req.read_spans:
@@ -3462,9 +3596,9 @@ class Agent:
                          and c.start <= a <= (c.scope_end or c.end)]
                 if units:
                     unit = min(units, key=lambda c: c.nlines)
-                    add(rel, unit.qualname, req.text)
+                    add(rel, unit.qualname, change)
                 else:
-                    add(rel, "", req.text)
+                    add(rel, "", change)
                 break
             if len(intents) > before:
                 continue
@@ -3475,7 +3609,7 @@ class Agent:
                 files = {c.file for c in hits if c.file}
                 if len(files) == 1:
                     unit = min(hits, key=lambda c: c.nlines)
-                    add(unit.file, unit.qualname, req.text)
+                    add(unit.file, unit.qualname, change)
                     continue
             # 3. A term names a file (exact reference or unique stem match):
             #    the whole file is the target, so a brand-new symbol can land.
@@ -3488,7 +3622,7 @@ class Agent:
                                .rpartition(".")[0].lower() == low]
                     rel = matches[0] if len(matches) == 1 else None
                 if rel:
-                    add(rel, "", req.text)
+                    add(rel, "", change)
                     break
         return intents
 
@@ -3525,6 +3659,12 @@ class Agent:
         receipts: list[str] = []
         attempts = 1 + max(0, min(int(getattr(self.cfg, "repair_rounds", 2)
                                            or 0), 3))
+        # A rejected hunk already spent its budget once: every re-ask gets a
+        # smaller one (the repair-round discipline, BUG-218), so a model
+        # re-emitting the same failing draft cannot burn the full cap each
+        # attempt. Floor 2048 keeps one real block possible.
+        full_answer = max(512, int(getattr(self.cfg, "max_tokens_answer",
+                                           40000) or 40000))
         total = len(intents)
         for n, intent in enumerate(intents, 1):
             target, failure = self._resolve_edit_intent(intent)
@@ -3572,10 +3712,17 @@ class Agent:
             last_reason = ""               # why the last draft was rejected
             accepted = None
             for attempt in range(attempts):
+                if self._task_budget_exceeded("incremental edit"):
+                    last_results = [Result(
+                        False, rel, "task budget exhausted before this hunk "
+                                    "was generated")]
+                    break
+                hunk_tokens = full_answer if attempt == 0 else \
+                    max(2048, full_answer // (2 * attempt))
                 try:
                     reply = self._chat_at(
                         "temperature_answer", msgs,
-                        max_tokens=self.cfg.max_tokens_answer, stream=False)
+                        max_tokens=hunk_tokens, stream=False)
                 except LLMError as e:
                     last_results = [Result(
                         False, rel, f"edit generation failed: {type(e).__name__}")]
@@ -3667,28 +3814,44 @@ class Agent:
         reply = ("Symbol-anchored incremental edits:\n" + "\n".join(receipts)
                  if receipts else "No symbol-anchored edits were applied.")
         if not _followup:
+            # One coverage verdict for the whole batch, from the SAME edit
+            # evidence the seeds below use (results_all, not the receipts
+            # reply): check_coverage and coverage_seeds must describe the
+            # same edit set (BUG-205).
+            findings_all.extend(verify_mod.check_coverage(
+                task, reply, results_all, tracker=tracker))
             # A half-answered multi-clause task used to end with an advisory
             # coverage warning. The requirement state machine now seeds one
             # bounded follow-up pass from the clauses no hunk addressed.
             seeds = verify_mod.coverage_seeds(task, reply, results_all,
                                               tracker=tracker)
-            followup = self._coverage_intents(seeds) if seeds else []
-            if followup:
+            if seeds:
+                followup = self._coverage_intents(seeds)
+                # The receipt fires even when no clause resolves to a target:
+                # a silent skip is indistinguishable from "nothing was owed"
+                # (BUG-205).
                 self._emit("coverage_followup",
                            clauses=[r.text for r in seeds],
                            targets=len(followup))
                 if verbose:
-                    print(f"  [coverage follow-up: {len(followup)} target(s) "
-                          f"for {len(seeds)} unaddressed clause(s)]",
-                          file=sys.stderr)
-                more_results, more_reply, more_findings = \
-                    self.apply_edit_intents(
-                        task, gathered, followup, backup_dir=backup_dir,
-                        verbose=verbose, _followup=True)
-                results_all.extend(more_results)
-                findings_all.extend(more_findings)
-                reply += ("\n\nCoverage follow-up (unaddressed task clauses):"
-                          "\n" + "\n".join(more_reply.splitlines()[1:]))
+                    if followup:
+                        print(f"  [coverage follow-up: {len(followup)} "
+                              f"target(s) for {len(seeds)} unaddressed "
+                              f"clause(s)]", file=sys.stderr)
+                    else:
+                        print(f"  [coverage follow-up: {len(seeds)} "
+                              "unaddressed clause(s), but none resolved to "
+                              "an edit target; the coverage warnings stand]",
+                              file=sys.stderr)
+                if followup:
+                    more_results, more_reply, more_findings = \
+                        self.apply_edit_intents(
+                            task, gathered, followup, backup_dir=backup_dir,
+                            verbose=verbose, _followup=True)
+                    results_all.extend(more_results)
+                    findings_all.extend(more_findings)
+                    reply += ("\n\nCoverage follow-up (unaddressed task clauses):"
+                              "\n" + "\n".join(more_reply.splitlines()[1:]))
         mixed = [r for r in results_all if not getattr(r, "ok", False)]
         if results_all and mixed and len(mixed) < len(results_all):
             # Half a feature is on disk and half is not. Nothing rolls back:
@@ -3714,7 +3877,7 @@ class Agent:
                       f"feature is half-implemented, and a later step reading "
                       f"them sees the mix. To start over:{undo}.",
                       file=sys.stderr)
-        return results_all, reply, findings_all
+        return results_all, reply, verify_mod.dedupe_findings(findings_all)
 
     def incremental_edit(self, task: str, gathered: str, backup_dir=None,
                          verbose: bool = False):
@@ -3779,6 +3942,8 @@ class Agent:
         severities) additionally enables the implicit rehydration for fuzzy
         WARNINGS; `errors` alone still drives the repair."""
         from . import verify as verify_mod
+        if self._task_budget_exceeded("gate repair"):
+            return ""
 
         class _F:
             def __init__(self, file):
@@ -3931,8 +4096,36 @@ class Agent:
     # ---- answer helpers
     def _answer_sys(self, task: str = "") -> str:
         """The default answer-phase system prompt (pack-aware, overridable;
-        a test-shaped `task` adds the value-bound test rules)."""
-        return prompts_mod.answer_system(self.cfg, EDIT_FORMAT, task)
+        a test-shaped `task` adds the value-bound test rules). A small-window
+        profile also gets the context-pressure edit discipline, naming the
+        task's files already over the whole-file ceiling."""
+        text = prompts_mod.answer_system(self.cfg, EDIT_FORMAT, task)
+        note = prompts_mod.small_window_note(
+            self.cfg, self._large_target_files(task))
+        if note:
+            text += "\n\n" + note
+        return text
+
+    def _large_target_files(self, task: str) -> list[str]:
+        """Task-named files whose on-disk size exceeds the small-window
+        whole-file ceiling ([] when the window is not small)."""
+        small = int(getattr(self.cfg, "small_context_tokens", 0) or 0)
+        window = int(getattr(self.cfg, "context_tokens", 0) or 0)
+        if small <= 0 or window <= 0 or window > small or not task:
+            return []
+        cap = max(20, int(getattr(self.cfg, "max_whole_file_lines", 120)
+                          or 120))
+        wanted = self._task_file_targets(task)
+        if not wanted:
+            return []
+        out: list[str] = []
+        for rel in sorted(self.index.files):
+            r = _norm_key(rel)
+            if not any(self._file_token_match(r, w) for w in wanted):
+                continue
+            if self._disk_line_count(rel) > cap:
+                out.append(rel)
+        return out
 
     def _answer_brief(self, system: str | None, include_edit_format: bool,
                       task: str = "") -> str:
@@ -4172,7 +4365,8 @@ class Agent:
                                + cont_source[-limit:])
             cont_source = f"SOURCE YOU REQUESTED\n\n{cont_source}\n\n"
         while getattr(self.client, "stream_truncated", False) \
-                and cont_budget > 0:
+                and cont_budget > 0 \
+                and not self._task_budget_exceeded("continuation"):
             cont_rounds += 1
             if cont_cap and cont_rounds > cont_cap:
                 print(f"\n[continuation loop reached its {cont_cap}"
@@ -4272,10 +4466,19 @@ class Agent:
         delivered = {_norm_key(b.file) for b in parse_edits(reply)}
         deferred = bool(_MORE_TO_DO_RE.search(reply))
 
+        # A rejected draft already spent the full answer budget once; each
+        # repair re-ask gets a smaller one (BUG-218), so a model that keeps
+        # re-emitting the same failing whole-file draft cannot burn the full
+        # cap every round. Floor 2048 keeps one real block possible.
+        full_answer = max(512, int(getattr(self.cfg, "max_tokens_answer",
+                                           40000) or 40000))
         for _round in range(repair_rounds):
             failures = [r for r in results if not r.ok]
             if not failures:
                 break
+            if self._task_budget_exceeded("repair"):
+                break
+            repair_tokens = max(2048, full_answer // (2 * (_round + 1)))
             print(f"\n[{len(failures)} block(s) failed; asking the model to re-anchor]", file=sys.stderr)
             fb = "\n".join(f"- {r.file}: {r.message}" for r in failures)
             # Ground the repair prompt in the files on disk (the region around
@@ -4353,7 +4556,7 @@ class Agent:
                         "not ask for more context -- the source you need is "
                         "provided."},
                 ],
-                max_tokens=self.cfg.max_tokens_answer,
+                max_tokens=repair_tokens,
                 stream=True,
             )
             if getattr(self.client, "stream_truncated", False):
@@ -4381,7 +4584,7 @@ class Agent:
                             "re-type the old content. Blocks only, no "
                             "explanation."},
                     ],
-                    max_tokens=self.cfg.max_tokens_answer,
+                    max_tokens=repair_tokens,
                     stream=True,
                 )
                 if getattr(self.client, "stream_truncated", False):
@@ -4408,7 +4611,8 @@ class Agent:
         if not dry_run and deferred:
             rounds_done = 0
             while (completion_cap <= 0 or rounds_done < completion_cap) \
-                    and completion_budget > 0:
+                    and completion_budget > 0 \
+                    and not self._task_budget_exceeded("completion"):
                 rounds_done += 1
                 src = (gathered or "").strip()
                 more = self._chat_at(
@@ -4452,6 +4656,8 @@ class Agent:
         # applying blocks at all, this one is about what they did.
         if post_check:
             for _round in range(max(0, int(repair_rounds or 0))):
+                if self._task_budget_exceeded("post-edit check"):
+                    break
                 changed = sorted({fileio.normalise_rel(r.file)
                                   for r in results if r.ok and r.file})
                 if not changed:

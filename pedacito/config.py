@@ -221,6 +221,15 @@ class Config:
     # harness note and the run moves on to the answer phase. 0 = off.
     max_total_model_calls: int = 30
     max_no_progress_steps: int = 4
+    # Task-level budget guard (BUG-218): ceilings on ONE task's total
+    # completion tokens and wall-clock seconds, gather + answer + repair
+    # together. max_total_model_calls bounds gather only; without these a
+    # small model can regenerate rejected drafts until the per-call answer
+    # budget is spent many times over (one 4B run: 74k output tokens, 836 s,
+    # zero edits). When a ceiling is hit the task stops re-asking and reports
+    # what landed. 0 = off. `ask --max-minutes N` sets max_task_seconds.
+    max_task_completion_tokens: int = 60000
+    max_task_seconds: int = 900
     # Dynamic tool schema pruning: keep the core navigation actions always
     # available, but omit an enabled optional/specialized action from the
     # prompt schema once the repository's tool-use stats show it has gone
@@ -678,6 +687,13 @@ class Config:
     # no model call), "model" (one small JSON call), or "off" (legacy
     # per-turn eviction only).
     compaction: str = "deterministic"
+    # Context-pressure edit discipline: an effective window at or below this
+    # many tokens is "small" -- the answer brief then demands chunked/anchored
+    # edits, and a whole-file rewrite of a file larger than
+    # max_whole_file_lines is refused before it can land (unless the task
+    # explicitly asks to rewrite that very file). 0 = off.
+    small_context_tokens: int = 16384
+    max_whole_file_lines: int = 120
 
     # --- Retrieval ------------------------------------------------------------
     # Rank the project map by task relevance, import-graph importance, and
@@ -739,6 +755,16 @@ class Config:
     verify_tests: bool = False
     test_command: str = ""
     test_timeout: int = 300
+    # Headless DOM smoke check after applied web edits (`pedacito domcheck`):
+    # load the entry page in headless Chromium, prove the module graph mounts,
+    # report page errors and unbound controls, and diff the mounted surface
+    # against the pre-edit snapshot (the BUG-216 regression shape). Executes
+    # project code, so it needs allow_shell plus the optional Playwright
+    # install; `ask --verify-dom` flips it per run. dom_entry overrides the
+    # detected entry HTML; dom_timeout caps one page load (seconds).
+    verify_dom: bool = False
+    dom_entry: str = ""
+    dom_timeout: int = 45
     # Gather-phase `run_test` (TECHNIQUES.md #22): let the model run ONE
     # scoped pytest check (a test file or node id, never a shell command
     # line) during investigation and read the live traceback before writing
@@ -766,6 +792,16 @@ class Config:
     # Per-role profiles, e.g. roles = { planner = "big", summarizer = "tiny" }.
     # Roles: planner, worker, verifier, summarizer, repair.
     roles: dict = field(default_factory=dict)
+    # Automatic profile escalation: a task that ends in a semantic repair
+    # failure (TypeError / infinite loop / failing assertions after the repair
+    # rounds), two no-progress leases, or repeated zero-edit runs on the active
+    # profile is re-run ONCE on the `escalate` role's model when that role is
+    # configured. An `escalation_suggested` event carries the reason either
+    # way, so an unconfigured role still surfaces the signal.
+    auto_escalate: bool = True
+    # Zero-edit runs recorded for one profile before escalation is suggested
+    # (the per-profile failure statistic). 0 = off.
+    escalation_zero_edit_runs: int = 3
     # Hook commands per event, e.g. hooks = { post_edit = ["ruff format {file}"] }
     # -- run without a shell, JSON event on stdin.
     hooks: dict = field(default_factory=dict)
@@ -1619,10 +1655,30 @@ def auto_fit(cfg: Config, verbose: bool = True) -> list[str]:
                 kv_hint = (f"; KV cache K={cfg.k_cache_quant or 'f16'}, "
                            f"V={cfg.v_cache_quant or 'f16'}")
             if hw_ctx <= 0:
-                notes.append(
-                    f"memory: model is {size_gb:.1f} GB and {mem} leaves no "
-                    f"room after the 0.5 GB system reserve; keeping the "
-                    f"configured/fallback window ({ctx:,} tokens){kv_hint}")
+                # No VRAM headroom: the fallback window is a guess, not a
+                # measurement. When the server reports a real window, clamp
+                # to it (BUG-209) -- deriving 200k-char source budgets from a
+                # 262k fallback the hardware cannot hold produces oversized
+                # prompts. Budgets below are derived from the clamped value.
+                try:
+                    det = int(detected) if detected else 0
+                except (TypeError, ValueError):
+                    det = 0
+                if 0 < det < ctx:
+                    notes.append(
+                        f"memory: model is {size_gb:.1f} GB and {mem} leaves "
+                        f"no room after the 0.5 GB system reserve; clamping "
+                        f"the fallback window {ctx:,} -> {det:,} (server-"
+                        f"reported) so the budgets stay honest{kv_hint}")
+                    ctx = det
+                    cfg.context_tokens = ctx
+                    cfg.sources["context_tokens"] = (
+                        "auto-fit (no VRAM headroom; server window)")
+                else:
+                    notes.append(
+                        f"memory: model is {size_gb:.1f} GB and {mem} leaves no "
+                        f"room after the 0.5 GB system reserve; keeping the "
+                        f"configured/fallback window ({ctx:,} tokens){kv_hint}")
             else:
                 notes.append(
                     f"memory: model {size_gb:.1f} GB on {mem} leaves about "
@@ -2539,6 +2595,11 @@ REFERENCE_TEMPLATE = TEMPLATE + '''
 # compaction: when the window fills, older lookups fold into ONE STATE digest
 # ("deterministic", or "model" for a model-written one); "off" keeps the old
 # turn-by-turn clipping. fold_tail_steps keeps the last N steps verbatim.
+# small_context_tokens: an effective window at or below this many tokens is
+# "small" -- the answer brief then demands chunked/anchored edits, and a
+# whole-file rewrite of a file bigger than max_whole_file_lines is refused
+# before it can land (unless the task explicitly asks to rewrite that file).
+# 0 = off. This is the context-pressure edit discipline (TECHNIQUES.md #41).
 # rank_map orders the big-project map by relevance to the task; repo_brief adds
 # a deterministic stack/entry-point/commands block above the map.
 # stream_usage asks servers to report usage on streamed replies;
@@ -2560,14 +2621,29 @@ REFERENCE_TEMPLATE = TEMPLATE + '''
 # is set here explicitly); max_replans bounds the
 # planner's revisions after a failed step; allow_steering delivers lines typed
 # mid-task in `chat`. roles also accept `escalate` (one retry on a stronger
-# model when no edit landed) and `fallback` (when the worker errors out).
+# model) and `fallback` (when the worker errors out). auto_escalate (on by
+# default) widens that retry beyond "no edit landed": a task that ends in a
+# semantic repair failure (TypeError / failed assertion / infinite loop after
+# the repair rounds), two no-progress leases, or repeated zero-edit runs is
+# re-run ONCE on the escalate model even if edits applied. An
+# `escalation_suggested` event carries the reason either way, so an
+# unconfigured role still surfaces the signal. escalation_zero_edit_runs is
+# how many zero-edit runs one profile accumulates before that suggestion
+# (the per-profile failure statistic, .pedacito/profile_stats.json); 0 = off.
 #
 # --- Verification, memory, helpers ------------------------------------------
 # verify_answer: "deterministic" checks edits before they are written (unread
 # code, placeholders, stale references, unaddressed requirements); "full" adds
 # one verifier model call; "off" disables. best_of > 1 samples candidates and
 # keeps the best-scoring one. verify_tests runs the tests an edit can break
-# (needs allow_shell; test_command overrides detection).
+# (needs allow_shell; test_command overrides detection). verify_dom is the
+# headless DOM smoke check (TECHNIQUES.md #45): after applied web edits it
+# loads the entry page in headless Chromium, proves the module graph mounts,
+# and diffs the mounted surface against a pre-edit snapshot (the BUG-216
+# regression shape). It runs project code, so it needs allow_shell AND the
+# optional Playwright install; `ask --verify-dom` flips it per run, and
+# `pedacito domcheck` runs it on demand. dom_entry overrides the detected
+# entry HTML; dom_timeout caps one page load (seconds). Off by default.
 # use_memory / use_skills push .pedacito/memory.md, rules and the skills
 # catalog. allow_git adds a read-only `git` action; git_context adds a
 # branch/dirty/recent-commits line. allow_subagents adds the `task` action

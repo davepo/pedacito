@@ -942,6 +942,33 @@ CLI_COMMANDS = [
         ],
     },
     {
+        "name": "domcheck",
+        "usage": "pedacito domcheck PROJECT [--entry FILE] [--snapshot FILE] "
+                 "[--baseline FILE]",
+        "summary": "Headless DOM smoke check: load the entry page in "
+                   "Chromium, prove the module graph mounts, report page "
+                   "errors, failed loads and unbound controls; --baseline "
+                   "diffs the mounted surface against an earlier --snapshot. "
+                   "Needs Playwright (pip install playwright; playwright "
+                   "install chromium).",
+        "keywords": ["web", "dom", "headless", "browser", "playwright",
+                     "mount", "smoke check", "runtime"],
+        "examples": [
+            "pedacito domcheck .",
+            "pedacito domcheck . --snapshot /tmp/before.json",
+            "pedacito domcheck . --baseline /tmp/before.json",
+        ],
+        "flags": [
+            {"flag": "--entry FILE", "help": "entry HTML to load"},
+            {"flag": "--timeout SECONDS", "help": "cap one page load"},
+            {"flag": "--snapshot FILE", "help": "save the mounted-DOM snapshot"},
+            {"flag": "--baseline FILE", "help": "diff against an earlier snapshot"},
+            {"flag": "--root DIR", "help": "project root"},
+            {"flag": "--config FILE", "help": "use this config file"},
+            {"flag": "--profile NAME", "help": "apply a profile block"},
+        ],
+    },
+    {
         "name": "skills",
         "usage": "pedacito skills PROJECT",
         "summary": "List the available skills (project, user and bundled "
@@ -1614,13 +1641,17 @@ GUI_TOPICS = [
             "⚙ Settings → All settings → search frontend_contracts to turn it off "
             "(on by default)",
             "For an on-demand check of the whole project, run pedacito webcheck PROJECT",
+            "webcheck is static (regex, notice-level). To prove the page actually "
+            "MOUNTS, run pedacito domcheck PROJECT (headless Chromium; needs "
+            "Playwright), or set verify_dom = true with allow_shell to gate edits on it",
         ],
         "keywords": ["dom", "html", "javascript", "js", "getelementbyid",
                      "queryselector", "script src", "stylesheet", "asset",
                      "broken link", "missing id", "frontend", "page does not load",
-                     "contract", "webcheck"],
-        "settings": ["frontend_contracts", "post_edit_check"],
-        "cli": ["webcheck", "auto"],
+                     "contract", "webcheck", "domcheck", "mount", "headless"],
+        "settings": ["frontend_contracts", "post_edit_check", "verify_dom",
+                     "dom_entry", "dom_timeout"],
+        "cli": ["webcheck", "domcheck", "auto"],
     },
     {
         "id": "repair-lessons",

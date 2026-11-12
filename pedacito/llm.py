@@ -1286,6 +1286,11 @@ class LLMClient:
             raise LLMError(
                 f"Request to {self.cfg.base_url} failed: "
                 f"{type(e).__name__}: {str(e)[:200]}") from e
+        # Model output is UTF-8 end to end (BUG-204): requests defaults a
+        # charset-less text/event-stream (and JSON) to ISO-8859-1, which
+        # turns ▶ into "â¶" before any write path sees it. Force the
+        # decoding here, at the source, for streamed and buffered replies.
+        r.encoding = "utf-8"
         if r.status_code >= 400:
             try:
                 body = r.text[:800]
@@ -1898,8 +1903,8 @@ class LLMClient:
                     break
                 if not raw:
                     continue
-                # requests only decodes when the response declares a charset,
-                # and text/event-stream often doesn't.
+                # _post forces UTF-8, so decode_unicode already yields str;
+                # the bytes branch is belt-and-braces for a custom session.
                 if isinstance(raw, bytes):
                     raw = raw.decode("utf-8", "replace")
                 if raw.startswith(":"):

@@ -1223,7 +1223,7 @@ def test_build_project_counts_noop_separately(tmp_path, monkeypatch):
     idx = scaffold.skeleton_index(root, plan, Config())
 
     def fake_build_pass(client, cfg, idx_, plan_, target, done, verbose=True,
-                        backup_dir=None):
+                        backup_dir=None, repair_note=""):
         if target.path == "b.py":
             assert "a.py" in done        # finished files feed the context
             return [scaffold.Result(True, "b.py",

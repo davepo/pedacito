@@ -427,6 +427,31 @@ def answer_system(cfg, full_edit_format: str, task: str = "") -> str:
     return text
 
 
+def small_window_note(cfg, large_files: list[str] | None = None) -> str:
+    """Context-pressure edit discipline for small-window profiles ('' when
+    the window is not small): whole-file drafts of large files are how a
+    context-pressed model loses working wiring, so the brief demands the
+    forms that fit -- small blocks, SYMBOL anchors, append chunks -- and
+    names the task's files already over the ceiling. The deterministic twin
+    is verify.check_oversized_rewrite, which refuses what slips through."""
+    small = int(getattr(cfg, "small_context_tokens", 0) or 0)
+    window = int(getattr(cfg, "context_tokens", 0) or 0)
+    if small <= 0 or window <= 0 or window > small:
+        return ""
+    cap = max(20, int(getattr(cfg, "max_whole_file_lines", 120) or 120))
+    text = (f"CONTEXT PRESSURE: this model's context window is small "
+            f"({window:,} tokens). Never re-emit a whole file larger than "
+            f"~{cap} lines in one REPLACE -- the harness refuses it, and a "
+            "draft that size gets cut off mid-file and drops working code. "
+            "Use small SEARCH/REPLACE blocks, a SYMBOL anchor with the full "
+            "new definition, or build large files in successive append "
+            "chunks.")
+    if large_files:
+        text += (" Files already over that ceiling: "
+                 + ", ".join(large_files[:6]) + ".")
+    return text
+
+
 # --------------------------------------------------------------------------
 # Overrides
 # --------------------------------------------------------------------------

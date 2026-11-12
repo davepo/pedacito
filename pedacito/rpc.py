@@ -505,10 +505,30 @@ class RpcServer:
             where = str(getattr(f, "file", "") or "")
             blocks.append(f"{kind}: {where}: {text}"[:400] if where
                           else f"{kind}: {text}"[:400])
+        # R8 provenance (BUG-215): the clause map, its legend, and the edit
+        # clauses no patch evidenced used to reach only the review page and
+        # the JSONL result frame. Carry them in the RPC summary too, so a
+        # machine client can show which requirement each edit serves and
+        # which requirements went unaccepted -- not just bare changed files.
+        from . import fileio
+        clauses = getattr(res, "clauses", None) or {}
+        edits = []
+        for r in results:
+            f = str(getattr(r, "file", "") or getattr(r, "path", ""))
+            if not f:
+                continue
+            edits.append({
+                "file": f,
+                "ok": bool(getattr(r, "ok", getattr(r, "applied", False))),
+                "clauses": list(clauses.get(fileio.normalise_rel(f), ())),
+            })
         return {
             "reply": getattr(res, "reply", None),
             "applied": applied,
             "changed": changed,
+            "edits": edits,
+            "clause_texts": getattr(res, "clause_texts", None) or {},
+            "unaccepted": list(getattr(res, "unaccepted", None) or []),
             "blockers": sorted(set(blocks))[:20],
             "ok": bool(getattr(res, "ok", True)),
             "steps": getattr(res, "steps", None),

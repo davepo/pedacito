@@ -256,6 +256,57 @@ def attempts_note(root, task: str, cfg=None) -> str:
     return "\n".join(lines)
 
 
+# ------------------------------------------- per-profile failure statistics
+#
+# A profile that keeps ending tasks with zero edits is not going to unstick
+# itself: the count is kept per profile so the outer loop can suggest the
+# `escalate` rung (a stronger model) instead of spending a fourth run on the
+# same one. Only harness-observed outcomes are counted -- never model text --
+# and a task that lands an edit clears the profile's counter.
+
+PROFILE_STATS_FILE = "profile_stats.json"
+
+
+def profile_stats_file(root) -> Path:
+    return Path(root) / ".pedacito" / PROFILE_STATS_FILE
+
+
+def _profile_key(cfg) -> str:
+    return (getattr(cfg, "active_profile", "") or "").strip() or "(default)"
+
+
+def note_zero_edit(root, cfg) -> int:
+    """Record one zero-edit run for the active profile; return the new count."""
+    path = profile_stats_file(root)
+    data = _read_json(path, {})
+    key = _profile_key(cfg)
+    row = data.get(key)
+    if not isinstance(row, dict):
+        row = {}
+    n = int(row.get("zero_edit_runs", 0)) + 1
+    row["zero_edit_runs"] = n
+    data[key] = row
+    _write_json(path, data)
+    return n
+
+
+def clear_zero_edit(root, cfg) -> None:
+    """A landed edit proves the profile can do the work: reset its counter."""
+    path = profile_stats_file(root)
+    data = _read_json(path, {})
+    row = data.get(_profile_key(cfg))
+    if isinstance(row, dict) and row.get("zero_edit_runs"):
+        row["zero_edit_runs"] = 0
+        data[_profile_key(cfg)] = row
+        _write_json(path, data)
+
+
+def zero_edit_runs(root, cfg) -> int:
+    data = _read_json(profile_stats_file(root), {})
+    row = data.get(_profile_key(cfg))
+    return int(row.get("zero_edit_runs", 0)) if isinstance(row, dict) else 0
+
+
 # ------------------------------------------------- repository micro-facts
 #
 # TokenEconomizer's Micro-Skills are zero-LLM-call facts a session derives
@@ -708,6 +759,23 @@ def _fact_text(command: str, kind: str, confirmations: int) -> str:
     return f"`{command}` works here ({confirmations} {runs})."
 
 
+def _pending_fact_text(command: str, kind: str, successes: int,
+                       failures: int) -> str:
+    """A pending row must not assert the command works (BUG-217): it has no
+    confirmation yet, and a failure streak is the opposite of evidence.
+    Say unconfirmed, and name the failures instead of hiding them."""
+    tail = "as the test command here" if kind == "test" else "here"
+    if successes <= 0:
+        if failures > 0:
+            times = "time" if failures == 1 else "times"
+            return (f"`{command}` is unconfirmed {tail} "
+                    f"(failed {failures} {times}, no successful run yet).")
+        return f"`{command}` is unconfirmed {tail} (0 runs)."
+    runs = "run" if successes == 1 else "runs"
+    return (f"`{command}` may work {tail} "
+            f"({successes} successful {runs}; not yet confirmed).")
+
+
 def observe_command(root, command: str, ok: bool, cfg=None,
                     kind: str = "command") -> dict | None:
     """Record one executed command outcome and promote/retire a micro-fact.
@@ -753,7 +821,8 @@ def observe_command(root, command: str, ok: bool, cfg=None,
     pending = next((p for p in doc["pending"]
                     if p.get("fact_id") == fact_id), None)
     if pending is None:
-        pending = {"fact_id": fact_id, "text": _fact_text(command, kind, 0),
+        pending = {"fact_id": fact_id,
+                   "text": _pending_fact_text(command, kind, 0, 0),
                    "successes": 0, "failures": 0, "last_seen": now,
                    "kind": kind}
         doc["pending"].append(pending)
@@ -763,6 +832,9 @@ def observe_command(root, command: str, ok: bool, cfg=None,
         pending["successes"] = int(pending.get("successes", 0) or 0) + 1
     else:
         pending["failures"] = int(pending.get("failures", 0) or 0) + 1
+    pending["text"] = _pending_fact_text(command, kind,
+                                         pending["successes"],
+                                         pending["failures"])
 
     promoted = None
     if ok and (pending["successes"] >= 2 or pending["failures"] >= 1):

@@ -166,6 +166,10 @@ class Result:
     # For a creation detected as a rename: the old paths whose real contents
     # were moved into this file (and removed by apply).
     renames_from: tuple[str, ...] = ()
+    # The edit replaced the WHOLE existing file (empty-SEARCH overwrite or a
+    # LINES range covering every line). The context-pressure gate reads this
+    # to refuse oversized whole-file drafts on small-window profiles.
+    whole_file: bool = False
 
 
 # --------------------------------------------------------------------------
@@ -467,6 +471,11 @@ def _line_span(text: str, start: int, end: int) -> tuple[int, int] | None:
     off = sum(len(x) for x in lines[:start - 1])
     return off, off + sum(len(x) for x in lines[start - 1:end])
 
+
+# A SEARCH body that is nothing but a line number: the model quoted the
+# read's `  4| text` prefix instead of the text. Auto-reanchored to LINES n-n
+# when the number does not occur literally in the file (see apply_edits).
+_NUMERIC_SEARCH_RE = re.compile(r"[0-9]{1,6}")
 
 # Closest-window hint on a failed block: a lower similarity floor than fuzzy
 # application (this only REPORTS a location, never edits) and a hard cap on the
@@ -1184,7 +1193,8 @@ def apply_edits(root: Path, edits: list[Edit], backup: bool = True,
 
     def _finish(rel: str, path: Path, original: str | None, text: str, style,
                 note: str, fuzzy: bool = False,
-                renames_from: tuple[str, ...] = ()) -> Result:
+                renames_from: tuple[str, ...] = (),
+                whole_file: bool = False) -> Result:
         """Validate, diff, back up, and write one finished file's content."""
         # Rename sources move their REAL bytes into the new path; the model's
         # creation REPLACE was only a placeholder. `moved_original` is what the
@@ -1243,7 +1253,8 @@ def apply_edits(root: Path, edits: list[Edit], backup: bool = True,
         sha = hashlib.sha256(moved_original.encode("utf-8")).hexdigest()
         if dry_run:
             return Result(True, rel, note + " (dry run)", diff, moved_original,
-                          text, sha, fuzzy=fuzzy, renames_from=renames_from)
+                          text, sha, fuzzy=fuzzy, renames_from=renames_from,
+                          whole_file=whole_file)
 
         def _backup(src: Path, old_rel: str) -> None:
             if backup_dir is not None:
@@ -1276,7 +1287,8 @@ def apply_edits(root: Path, edits: list[Edit], backup: bool = True,
         fileio.write(path, text, style)
         undo.append((rel, _reverter(path, _pre)))
         return Result(True, rel, note, diff, moved_original, text, sha,
-                      fuzzy=fuzzy, renames_from=renames_from)
+                      fuzzy=fuzzy, renames_from=renames_from,
+                      whole_file=whole_file)
 
     try:
         for rel, group in by_file.items():
@@ -1343,7 +1355,9 @@ def apply_edits(root: Path, edits: list[Edit], backup: bool = True,
                     note += (" [already absent, nothing to move: " +
                              ", ".join(gone) + "]")
                 results.append(_finish(rel, path, original, text, None, note,
-                                       renames_from=srcs_now))
+                                       renames_from=srcs_now,
+                                       whole_file=original is not None
+                                       and not srcs_now))
                 continue
 
             if not path.exists():
@@ -1386,6 +1400,8 @@ def apply_edits(root: Path, edits: list[Edit], backup: bool = True,
             failed = False
             fuzzy_blocks: list[int] = []
             already: list[int] = []       # blocks whose REPLACE is already on disk
+            reanchored: list[tuple[int, int]] = []  # numeric SEARCH -> LINES n-n
+            whole_file = False            # a block replaced the entire file
             # Anchored blocks resolve to (a, b) here for failure messages, and
             # are rewritten to exact-text needles taken from the ORIGINAL file,
             # so an earlier block in the same group cannot shift their lines and
@@ -1505,6 +1521,7 @@ def apply_edits(root: Path, edits: list[Edit], backup: bool = True,
                         # same fragment).
                         total_lines = len(original.splitlines())
                         if a <= 1 and b >= total_lines:
+                            whole_file = True
                             whole = repl if not repl or repl.endswith("\n") \
                                 else repl + "\n"
                             refusal = fragment_refusal(rel, text, whole)
@@ -1519,6 +1536,7 @@ def apply_edits(root: Path, edits: list[Edit], backup: bool = True,
                     # text that later blocks anchor against. That replacement is
                     # model-composed whole-file content, so it gets the same
                     # fragment guard the `write` action applies.
+                    whole_file = True
                     whole = e.replace if not e.replace or e.replace.endswith("\n") \
                         else e.replace + "\n"
                     refusal = fragment_refusal(rel, text, whole)
@@ -1539,6 +1557,40 @@ def apply_edits(root: Path, edits: list[Edit], backup: bool = True,
                         # Score it clean instead of failing the whole file.
                         already.append(k)
                         continue
+                    if n == 0 and not (k in anchored):
+                        # Numeric-SEARCH auto-reanchor: a SEARCH body that is
+                        # just a line number ("4") is the tiny-profile slip of
+                        # quoting the read's line-number prefix instead of the
+                        # line's text. Interpret it as LINES n-n and apply the
+                        # replacement to that exact line -- deterministic, and
+                        # one whole retry round saved. A number that DOES occur
+                        # literally in the file keeps the normal match semantics.
+                        num = _NUMERIC_SEARCH_RE.fullmatch(e.search.strip())
+                        if num:
+                            lineno = int(num.group(0))
+                            total = len(text.splitlines())
+                            lspan = _line_span(text, lineno, lineno)
+                            if lspan is not None:
+                                seg = text[lspan[0]:lspan[1]]
+                                repl = e.replace
+                                if repl and seg.endswith("\n") \
+                                        and not repl.endswith("\n"):
+                                    repl += "\n"
+                                text = (text[:lspan[0]] + repl
+                                        + text[lspan[1]:])
+                                reanchored.append((k, lineno))
+                                continue
+                            results.append(Result(
+                                False, rel,
+                                f"block {k}: the SEARCH body is just the "
+                                f"number {lineno}, read as a line number, but "
+                                f"this file has {total} line(s). `read` it "
+                                "again and anchor the block with "
+                                f"`--- FILE: {rel} LINES <start>-<end>` using "
+                                "the real line numbers, or quote the line's "
+                                "exact text in SEARCH."))
+                            failed = True
+                            break
                     if k in anchored:
                         a, b = anchored[k]
                         why = (f"anchored range LINES {a}-{b} cannot be applied: "
@@ -1594,13 +1646,19 @@ def apply_edits(root: Path, edits: list[Edit], backup: bool = True,
             if already:
                 note += (" [block(s) " + ", ".join(str(b) for b in already)
                          + " already applied -- content present, left as-is]")
+            if reanchored:
+                note += (" [numeric SEARCH auto-reanchored to LINES "
+                         + ", ".join(f"{ln}-{ln} on block {b}"
+                                     for b, ln in reanchored)
+                         + "; the number was read as a line number, not text]")
             if fuzzy_blocks:
                 note += (" [matched approximately on block"
                          + ("s " if len(fuzzy_blocks) > 1 else " ")
                          + ", ".join(str(b) for b in fuzzy_blocks)
                          + "; review the diff carefully]")
             results.append(_finish(rel, path, original, text, style, note,
-                                   fuzzy=bool(fuzzy_blocks)))
+                                   fuzzy=bool(fuzzy_blocks),
+                                   whole_file=whole_file))
 
     except OSError as exc:
         # all-or-nothing batch: without this, a disk or permission failure

@@ -22,7 +22,13 @@ somebody opens the page:
     (``SyntaxError: Identifier 'WAYPOINTS' has already been declared``);
   - a module calls a name it neither declares nor imports, while a sibling
     module exports it or nothing in the project defines it at all
-    (``ReferenceError``, and the scene never renders).
+    (``ReferenceError``, and the scene never renders);
+  - a ``const`` binding is reassigned later -- parses clean, then throws
+    ``TypeError: Assignment to constant variable`` the first time the line
+    runs;
+  - a handler calls ``engine.setBpm(...)`` on a ``new SynthEngine()``
+    instance but the class defines no ``setBpm`` (``TypeError: ... is not a
+    function`` on the first slider move).
 
 Every check is regex-level on purpose: no JS parser, no execution, no
 network, no dependencies. That trades recall for speed, so the results are
@@ -921,6 +927,291 @@ def _js_module_links(htmls, jss, scopes, texts, root):
     return findings
 
 
+# --- checks 8+9: runtime-fatal JS that parses clean -------------------------
+# Regex twins of spec._js_const_reassign_errors / _js_instance_method_errors
+# (the tree-sitter gates behind `verify_frontend_contracts`). Same
+# conservatism: anything shadowed, redeclared, reassigned or unreadable stays
+# quiet -- a missed notice costs nothing, a false one costs trust.
+
+_JS_CONST_DECL_RE = re.compile(r"\bconst\s+([A-Za-z_$][\w$]*)\s*(?:=|\bof\b|\bin\b)")
+_JS_REDECL_RE = re.compile(r"\b(?:let|var|function|class)\s+([A-Za-z_$][\w$]*)")
+# `x =`, `x +=`, `x++` -- but not `x ==`, `x ===`, `x =>`, `a.x =`
+_JS_ASSIGN_RE = re.compile(
+    r"(?<![\w$.])([A-Za-z_$][\w$]*)\s*(?:[+\-*/%&|^]?=(?!=|>)|\+\+|--)")
+# Parameter lists only: `function f(a) {`, `m(a) {`, `catch (e) {`,
+# `(a, b) =>`, `e =>`. Deliberately narrower than `_js_paren_bound`, which
+# reads every paren group as parameters: a const reassignment usually sits
+# inside a callback body, and counting the callback's own argument list
+# would hide exactly the bug check 8 exists for.
+_JS_PARAM_LIST_RE = re.compile(
+    r"(?:\bfunction\s*[A-Za-z_$\w]*\s*|\bcatch\s*"
+    r"|(?<![\w$.])(?!(?:if|for|while|switch|with)\b)[A-Za-z_$][\w$]*\s*)"
+    r"\(([^()]*)\)(?=\s*(?:\{|=>))"
+    r"|\(([^()]*)\)\s*=>"
+    r"|(?<![\w$.])([A-Za-z_$][\w$]*)\s*=>")
+
+
+def _js_param_names(code: str) -> set[str]:
+    """Names bound as a parameter or catch variable anywhere in `code`."""
+    names: set[str] = set()
+    for m in _JS_PARAM_LIST_RE.finditer(code):
+        if m.group(3):
+            names.add(m.group(3))
+            continue
+        payload = m.group(1) if m.group(1) is not None else m.group(2)
+        for part in (payload or "").split(","):
+            part = part.strip().lstrip("{[").rstrip("}]").strip()
+            if not part:
+                continue
+            head = re.split(r"[=:?]", part, maxsplit=1)[0].strip()
+            for token in re.findall(r"[A-Za-z_$][\w$]*", head):
+                if token not in ("let", "const", "var"):
+                    names.add(token)
+    return names
+
+
+def _const_reassign_findings(scopes) -> list:
+    """`const x` followed by an assignment to x: parses clean, then throws
+    `TypeError: Assignment to constant variable` the first time the line
+    runs (BUG-210)."""
+    findings: list[Finding] = []
+    for sc in scopes:
+        code = _js_code(sc.text)
+        decls: dict[str, int] = {}
+        for m in _JS_CONST_DECL_RE.finditer(code):
+            decls.setdefault(m.group(1),
+                             _line_of(sc.text, m.start()) + sc.offset)
+        if not decls:
+            continue
+        redeclared = set(_JS_REDECL_RE.findall(code))
+        params = _js_param_names(code)
+        for m in _JS_ASSIGN_RE.finditer(code):
+            name = m.group(1)
+            line = _line_of(sc.text, m.start()) + sc.offset
+            if name not in decls or line < decls[name]:
+                continue
+            if name in redeclared or name in params:
+                continue
+            # a declaration in the same statement (`const x = 1, y = 2`,
+            # `const x = 1; x = 2` -- only the first is a binding)
+            start = max(code.rfind("\n", 0, m.start()),
+                        code.rfind(";", 0, m.start()),
+                        code.rfind("{", 0, m.start()),
+                        code.rfind("}", 0, m.start()))
+            if re.search(r"\b(?:const|let|var)\b", code[start + 1:m.start()]):
+                continue
+            findings.append(Finding(
+                sc.rel, line,
+                f"'{name}' is declared const (line {decls[name]}) and then "
+                f"reassigned here -- JavaScript raises `TypeError: Assignment "
+                f"to constant variable` the moment this line runs; declare "
+                f"'{name}' with let if its value must change"))
+    return findings
+
+
+_JS_CLASS_HEAD_RE = re.compile(r"\bclass\s+([A-Za-z_$][\w$]*)")
+# One member head: `m(`, `get m(`, `static async m(`, `*gen(`, `#priv(`,
+# or a field `f =`. Matched at a member boundary, never inside a body.
+_JS_MEMBER_RE = re.compile(
+    r"(?:static\s+)?(?:(?:get|set)\s+)?(?:async\s+)?(?:\*\s*)?"
+    r"(#?[A-Za-z_$][\w$]*)\s*(\(|=)")
+_JS_NEW_INST_RE = re.compile(
+    r"\bconst\s+([A-Za-z_$][\w$]*)\s*=\s*new\s+([A-Za-z_$][\w$]*)\s*\(")
+_JS_THIS_NEW_RE = re.compile(
+    r"\bthis\.([A-Za-z_$][\w$]*)\s*=\s*new\s+([A-Za-z_$][\w$]*)\s*\(")
+_JS_THIS_ASSIGN_RE = re.compile(
+    r"\bthis\.([A-Za-z_$][\w$]*)\s*(?:[+\-*/%&|^]?=(?!=|>)|\+\+|--)")
+_JS_MEMBER_CALL_RE = re.compile(
+    r"(?<![\w$.])([A-Za-z_$][\w$]*)\s*\.\s*([A-Za-z_$][\w$]*)\s*\(")
+_JS_THIS_CALL_RE = re.compile(
+    r"\bthis\.([A-Za-z_$][\w$]*)\s*\.\s*([A-Za-z_$][\w$]*)\s*\(")
+_JS_METHOD_KEYWORDS = {
+    "if", "for", "while", "switch", "catch", "return", "function", "new",
+    "typeof", "do", "else", "with", "await", "yield", "case", "delete",
+    "void", "in", "of", "instanceof", "constructor",
+}
+# Every object answers these, whatever its class defines (twin of
+# spec._JS_OBJECT_PROTO; kept local so webcheck never imports spec).
+_JS_OBJECT_PROTO = {
+    "constructor", "hasOwnProperty", "isPrototypeOf", "propertyIsEnumerable",
+    "toLocaleString", "toString", "valueOf", "__defineGetter__",
+    "__defineSetter__", "__lookupGetter__", "__lookupSetter__", "__proto__",
+}
+
+
+def _js_class_bodies(code: str):
+    """(name, body_start, body_end) for each parentless class declaration,
+    brace-scanned on string/comment-blanked code. A class with `extends`
+    is skipped: the parent could define any method the child lacks."""
+    out = []
+    for m in _JS_CLASS_HEAD_RE.finditer(code):
+        i, depth = m.end(), 0
+        while i < len(code):
+            c = code[i]
+            if c == "(":
+                depth += 1
+            elif c == ")":
+                depth = max(0, depth - 1)
+            elif c == "{" and depth == 0:
+                break
+            i += 1
+        else:
+            continue
+        if re.search(r"\bextends\b", code[m.end():i]):
+            continue
+        j, d = i + 1, 1
+        while j < len(code) and d:
+            if code[j] == "{":
+                d += 1
+            elif code[j] == "}":
+                d -= 1
+            j += 1
+        out.append((m.group(1), i + 1, j - 1))
+    return out
+
+
+def _js_class_surface(code: str, start: int, end: int):
+    """(member names, opaque) for one class body: method and field heads at
+    brace depth 0, outside any parameter list. A computed member, a
+    decorator or an unreadable member shape makes the surface unprovable,
+    exactly as in spec._js_class_surface."""
+    methods: set[str] = set()
+    depth = parens = 0
+    member_start = True
+    i = start
+    while i < end:
+        c = code[i]
+        if c == "(":
+            parens += 1
+        elif c == ")":
+            parens = max(0, parens - 1)
+        elif c == "{":
+            depth += 1
+            member_start = False
+        elif c == "}":
+            depth -= 1
+            member_start = depth == 0 and parens == 0
+        elif depth == 0 and parens == 0:
+            if c.isspace():
+                pass
+            elif c == ";":
+                member_start = True
+            elif member_start:
+                if c in "[@":
+                    return methods, True
+                if re.match(r"static\s*\{", code[i:end]):
+                    member_start = False   # static block: shapes the class,
+                    i += 1                 # not the instance surface
+                    continue
+                m = _JS_MEMBER_RE.match(code, i)
+                if m is None:
+                    return methods, True   # unexpected member: never guess
+                if m.group(1) not in _JS_METHOD_KEYWORDS:
+                    methods.add(m.group(1))
+                member_start = False
+        i += 1
+    return methods, False
+
+
+def _instance_method_findings(scopes) -> list:
+    """`x.method()` where x is a provable project-class instance and the
+    class defines no such method: `TypeError: x.method is not a function`
+    on the first call (BUG-211). Only the shapes spec.py proves are
+    reported: a top-level `const x = new Class()` whose binding is never
+    shadowed or reassigned, or `this.x = new Class()` inside a parentless
+    class. Calls through a parameter (`wireTransport(el, engine)`) are a
+    dataflow question the regex level cannot answer and stay quiet."""
+    classes: dict[str, tuple] = {}     # name -> (rel, methods)
+    ambiguous: set[str] = set()
+    bodies: list[list] = []            # per scope: [(name, start, end)]
+    codes: list[str] = []
+    for sc in scopes:
+        code = _js_code(sc.text)
+        codes.append(code)
+        found = _js_class_bodies(code)
+        bodies.append(found)
+        for name, start, end in found:
+            methods, opaque = _js_class_surface(code, start, end)
+            if opaque or name in classes:
+                ambiguous.add(name)
+                continue
+            classes[name] = (sc.rel, methods)
+    for name in ambiguous:
+        classes.pop(name, None)
+
+    findings: list[Finding] = []
+    for idx, sc in enumerate(scopes):
+        code = codes[idx]
+        params = _js_param_names(code)
+        redeclared = set(_JS_REDECL_RE.findall(code))
+        # top-level `const x = new Class()`: brace depth 0 at the declaration
+        instances: dict[str, tuple] = {}   # x -> (class, decl name pos)
+        new_matches = {m.start(): m for m in _JS_NEW_INST_RE.finditer(code)}
+        depth = 0
+        top: dict[int, object] = {}
+        for i, c in enumerate(code):
+            if i in new_matches and depth == 0:
+                top[i] = new_matches[i]
+            if c == "{":
+                depth += 1
+            elif c == "}":
+                depth -= 1
+        unstable: set[str] = set()
+        for m in top.values():
+            x, cname = m.group(1), m.group(2)
+            if cname not in classes:
+                continue
+            if x in params or x in redeclared or x in instances:
+                unstable.add(x)
+                continue
+            instances[x] = (cname, m.start(1))
+        for m in _JS_ASSIGN_RE.finditer(code):
+            x = m.group(1)
+            if x in instances and m.start() != instances[x][1]:
+                unstable.add(x)
+        for x in unstable:
+            instances.pop(x, None)
+
+        def emit(receiver: str, method: str, cname: str, pos: int):
+            if method in _JS_OBJECT_PROTO or method in _BUILTIN_MEMBERS:
+                return
+            def_rel, methods = classes[cname]
+            if method in methods:
+                return
+            shown = ", ".join(sorted(methods)[:8]) or "(none)"
+            findings.append(Finding(
+                sc.rel, _line_of(sc.text, pos) + sc.offset,
+                f"calls {receiver}.{method}(...), but class {cname} "
+                f"({def_rel}) defines no such method (it defines: {shown}) "
+                f"-- `TypeError: {receiver}.{method} is not a function` the "
+                f"first time this line runs; add {method} to {cname} or call "
+                f"a method it defines", peer=def_rel))
+
+        for m in _JS_MEMBER_CALL_RE.finditer(code):
+            x, method = m.group(1), m.group(2)
+            if x in instances:
+                emit(x, method, instances[x][0], m.start())
+        # this.x instances, per parentless class body
+        for cname, start, end in bodies[idx]:
+            body = code[start:end]
+            this_inst: dict[str, str] = {}
+            this_bad: set[str] = set()
+            for m in _JS_THIS_ASSIGN_RE.finditer(body):
+                x = m.group(1)
+                nm = _JS_THIS_NEW_RE.match(body, m.start())
+                if nm is None or nm.group(2) not in classes:
+                    this_bad.add(x)
+                elif x in this_inst and this_inst[x] != nm.group(2):
+                    this_bad.add(x)
+                else:
+                    this_inst[x] = nm.group(2)
+            for m in _JS_THIS_CALL_RE.finditer(body):
+                x, method = m.group(1), m.group(2)
+                if x in this_inst and x not in this_bad:
+                    emit("this." + x, method, this_inst[x], start + m.start())
+    return findings
+
+
 def _js_bound_by_imports(text: str) -> set[str]:
     names: set[str] = set()
     for m in _ESM_IMPORT_RE.finditer(_js_no_comments(text)):
@@ -1145,6 +1436,12 @@ def run(root, files: list[str] | None = None) -> list[Finding]:
     # --- checks 6+7: module bindings and module links ----------------------
     # (regex twins of spec._js_module_link_errors, which is the vetoing gate)
     findings.extend(_js_module_links(htmls, jss, scopes, texts, root))
+
+    # --- checks 8+9: const reassignment and missing instance methods -------
+    # (regex twins of spec._js_const_reassign_errors /
+    #  _js_instance_method_errors -- runtime-fatal, parse-cleans JS)
+    findings.extend(_const_reassign_findings(scopes))
+    findings.extend(_instance_method_findings(scopes))
 
     # --- dedupe, filter, sort ----------------------------------------------
     uniq: list[Finding] = []

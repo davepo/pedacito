@@ -166,7 +166,7 @@ commands. Run `pedacito <command> --help` for every flag.
 | `pedacito rename OLD NEW` | Multi-file symbol rename through the AST and the tokenizer, no model call. `--file` scopes it, `--apply` writes (default: diff preview) |
 | `pedacito index`, `map`, `files`, `cost` | Build and inspect the index. These need no model call, except `index` summaries |
 | `pedacito eval` | Score the harness on fixture repositories. Use `--baseline` as a regression gate |
-| `pedacito memory`, `skills`, `prune`, `reset`, `trust`, `worktree`, `serve`, `procs`, `lsp`, `mcp`, `diagnose`, `tests`, `webcheck` | Upkeep and specialist tools. `mcp list` shows the named MCP servers' tools and trust flags |
+| `pedacito memory`, `skills`, `prune`, `reset`, `trust`, `worktree`, `serve`, `procs`, `lsp`, `mcp`, `diagnose`, `tests`, `webcheck`, `domcheck` | Upkeep and specialist tools. `mcp list` shows the named MCP servers' tools and trust flags |
 
 Benchmarks are in the GUI only, through the **Benchmarks** button.
 
@@ -925,6 +925,7 @@ pedacito eval [--task ID] [--out report.json]   # score the harness on fixtures
 pedacito map PROJ -t "fix X"       # see the map a task would get (ranked)
 pedacito tests PROJ --files src/a.py   # detected test command + impacted tests
 pedacito webcheck PROJ             # static contract checks for web files
+pedacito domcheck PROJ             # headless DOM smoke check (needs Playwright)
 pedacito memory PROJ [--add T | --forget T]
 pedacito skills PROJ
 pedacito prune PROJ --keep-sessions 50 --keep-backups 20 [--dry-run]
@@ -953,6 +954,19 @@ regex-level on purpose, so its findings are warnings (printed by `auto` after
 tasks that touched web files, and in the `new` scaffold summary), never hard
 failures. Those last two shapes are also enforced by the vetting frontend gate,
 which reads the same names through the tree-sitter grammar instead of regexes.
+
+`domcheck` is the runtime half `webcheck` cannot be: it serves the project on a
+loopback HTTP server and loads the entry page in headless Chromium (Playwright),
+proving the module graph actually MOUNTS. It reports uncaught page errors,
+failed same-origin loads, and unbound controls (conservatively -- any delegated
+or inline handler suppresses the finding), and it can diff the mounted surface
+against an earlier snapshot (`--snapshot before.json`, then `--baseline
+before.json`) to catch the BUG-216 shape where a replaced entry module silently
+stops rendering. It needs `pip install playwright && playwright install
+chromium`; when that is missing it says so instead of pretending the page is
+fine. Running project code is an execution decision, so the in-run gate needs
+`verify_dom = true` AND `allow_shell = true` (or `ask --verify-dom`); an explicit
+`pedacito domcheck` invocation is itself the consent. See TECHNIQUES.md #45.
 
 `calibrate` also measures **native tool calls** against the JSON grammar on your
 model (same eight scenarios, both modes) and the card switches `tool_mode` to
@@ -1237,6 +1251,24 @@ a scaffold whose page cannot link gets repair rounds, and if the violations
 survive them the build prints `BUILD INCOMPLETE` and exits 1 instead of
 reporting a project that cannot start.
 
+### Headless DOM smoke check (opt-in)
+
+The frontend gate proves the contracts a browser enforces at *load*; it cannot
+prove the page actually *mounts*. With `verify_dom = true` AND `allow_shell =
+true` (or `ask --verify-dom`), Pedacito also loads the entry page in headless
+Chromium after applied web edits and diffs the mounted surface against a
+snapshot taken before the edit. A replaced entry module that silently stops
+rendering -- named elements or controls gone, visible text collapsed -- is a
+`dom` gate finding that feeds a repair round, alongside uncaught page errors and
+assets/modules that no longer load. Pre-existing page errors are not blamed on
+the task. It needs the optional Playwright install (`pip install playwright &&
+playwright install chromium`); without it the check reports an install hint and
+the gate steps aside. `dom_entry` overrides the detected entry page and
+`dom_timeout` caps one load. `pedacito domcheck PROJ` runs it on demand (that
+invocation is the consent to run project code); `--snapshot`/`--baseline` diff
+two runs. Unlike `webcheck`'s notice-level regex findings, this tool's errors
+can drive repair. See TECHNIQUES.md #45.
+
 ## How context is managed
 
 A small window is spent three ways: the prompt's fixed text, the map, and the
@@ -1383,12 +1415,26 @@ model = "qwen3-1.7b"
 Roles are `planner` (turns a goal into the `auto` checklist and plan-mode
 steps), `verifier`, `summarizer` (the index's one-line summaries and
 compaction), and `repair`, plus two recovery rungs: `escalate` (one more
-attempt on that model when a task ends with no edit applied) and `fallback`
-(takes over when the worker errors out). Each rung is used at most once per
-task and only when configured, so a local model's bad day cannot silently burn
-a hosted budget. An unset role uses the active model; a role whose server is
-unreachable falls back to it with one warning. Usage is counted per call site
-either way. `--role planner=big` sets one for a single run.
+attempt on that model) and `fallback` (takes over when the worker errors
+out). Each rung is used at most once per task and only when configured, so a
+local model's bad day cannot silently burn a hosted budget. An unset role
+uses the active model; a role whose server is unreachable falls back to it
+with one warning. Usage is counted per call site either way. `--role
+planner=big` sets one for a single run.
+
+`escalate` fires on a recorded reason, not just on a missing edit
+(`auto_escalate`, on by default): a task that ends with no edit applied, two
+no-progress leases on one task, tests still failing with runtime/semantic
+errors (a TypeError, a failed assertion, a loop that never ends) after the
+repair rounds, or `escalation_zero_edit_runs` consecutive zero-edit runs on
+the active profile (default 3, counted per profile in
+`.pedacito/profile_stats.json`; 0 disables the statistic). A reason earns the
+retry even when edits DID land -- a patch that applies but does not work is
+still a failed task -- and the first attempt is kept only when it was green
+and the escalated one came back red. Every reason also emits an
+`escalation_suggested` event, so the signal reaches a human or an outer
+orchestrator even when no `escalate` role is configured. A success clears the
+profile's zero-edit count and any queued suggestion.
 
 `pedacito profiles --recommend` suggests a profile per role (worker, escalate,
 verifier, planner, summarizer) with a one-line reason, from the measured
@@ -1410,7 +1456,9 @@ profile)"). Pairing sizes and the one-GPU caveat are in
 
 A task that ends without a usable edit is also remembered in
 `.pedacito/attempts.json` (files looked at, why); a similar later task is told
-what was already tried. A success clears it.
+what was already tried. A success clears it. The same runs are counted per
+profile in `.pedacito/profile_stats.json`, which feeds the escalation
+statistic above.
 
 ## Review page
 
@@ -1565,6 +1613,7 @@ config --reference` prints the annotated template. Key settings:
 | `api_key` / `api_key_env` | `"lm-studio"` / `""` | For hosted APIs and secured servers. `api_key_env` stores the *name* of an environment variable holding the key, so the secret never lands in the config file. |
 | `vram_gb` | *(required for local)* | GPU VRAM; set in `[universal]`, overridable per profile. |
 | `context_tokens` | `8192` | Server-side context window. With `auto_detect_context` on (the default) the server's reported window replaces it; set it explicitly when detection is wrong. |
+| `small_context_tokens` / `max_whole_file_lines` | 16384 / 120 | A window at or below `small_context_tokens` counts as "small": the answer brief then demands chunked/anchored edits, and a whole-file rewrite of a file bigger than `max_whole_file_lines` is refused before it lands (unless the task explicitly asks to rewrite that file). `small_context_tokens = 0` turns the discipline off. |
 | `k_cache_quant` / `v_cache_quant` | `""` | KV-cache quantization the runtime uses. |
 | `json_mode` | `"schema"` | `"schema"` for local servers, `"object"` for hosted (auto-switched). |
 | `enforce_json_schema` | true | Ask the engine to constrain gather steps with `response_format` json_schema (strict); servers that refuse are downgraded to json_object, then plain prompting, per model. |
@@ -1605,11 +1654,13 @@ config --reference` prints the annotated template. Key settings:
 | `verify_answer` | `"deterministic"` | `off` / `deterministic` / `full`: check edits before writing them. |
 | `best_of` | 1 | Sample N candidate edit replies and keep the best-scoring one. |
 | `verify_tests` / `test_command` | false / `""` | Run impacted tests after applied edits (needs `allow_shell`). |
+| `verify_dom` / `dom_entry` / `dom_timeout` | false / `""` / 45 | Headless DOM smoke check after applied web edits (needs `allow_shell` and the optional Playwright install): load the entry page in headless Chromium, prove the module graph mounts, and diff the mounted surface against a pre-edit snapshot. `dom_entry` overrides the detected entry HTML; `dom_timeout` caps one page load in seconds. `ask --verify-dom` flips it per run; `pedacito domcheck` runs it on demand. |
 | `use_memory` / `use_skills` | true | Push memory, rules, and the skills catalog. |
 | `allow_git` / `git_context` | true | Read-only `git` action; branch/dirty/recent-commits preamble. |
 | `allow_subagents` | false | The `task` action (read-only helper with a fresh window). |
 | `allow_fetch` / `fetch_allowed_hosts` | false / `[]` | The `fetch` action and the hosts it may read. |
 | `roles` | `{}` | Per-job profiles: `planner`, `verifier`, `summarizer`, `repair`. |
+| `auto_escalate` / `escalation_zero_edit_runs` | true / 3 | Widen the `escalate` retry beyond "no edit landed": a semantic repair failure, two no-progress leases, or this many consecutive zero-edit runs on one profile earn one retry even when edits applied. Every reason emits an `escalation_suggested` event even without a configured role; 0 disables the zero-edit statistic. |
 | `hooks` | `{}` | Your commands at events (project-level hooks need `pedacito trust`). |
 | `scrub_env` / `env_passthrough` | true / `[]` | Minimal environment for model-chosen commands. |
 | `protected_paths` / `shell_deny` | `[]` | Paths the model may not write; command patterns `run` refuses. |

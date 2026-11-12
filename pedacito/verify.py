@@ -16,6 +16,8 @@ edit blocks, before anything is written:
                 read: it is guessing, not editing
   stale refs    a definition was removed or renamed but is still referenced
   moved import  a moved file is still imported by its old path
+  lost wiring   a whole-file replacement dropped imported-and-called names
+                that are still defined in the project
   citations     the prose cites `file:line` in files that were never read
   coverage      requirements extracted from the task that no edit or sentence
                 of the reply touches (a warning: heuristic); each requirement
@@ -55,7 +57,7 @@ from .edits import locate, parse_edits
 
 @dataclass
 class Finding:
-    kind: str                  # placeholder | unread | stale | import | citation | coverage | model
+    kind: str                  # placeholder | unread | stale | import | lost_wiring | citation | coverage | model
     severity: str              # "error" (fed to repair) | "warn"
     file: str
     message: str
@@ -533,6 +535,125 @@ def check_moved_imports(agent, results) -> list[Finding]:
     return out
 
 
+# --------------------------------------------------------------- lost wiring
+_JS_IMPORT_RE = re.compile(
+    r"(?m)^[ \t]*import\s+(?:\{([^}]*)\}|([A-Za-z_$][\w$]*))\s+from\s+"
+    r"['\"][^'\"]+['\"]")
+_PY_IMPORT_RE = re.compile(r"(?m)^[ \t]*from\s+[.\w]+\s+import\s+([^\n]+)")
+_REWRITE_RE = re.compile(
+    r"\b(?:rewrite|re-?write|rebuild|recreate|overhaul)\b|"
+    r"\breplace\s+(?:the\s+)?(?:whole|entire|full)\s+file\b|"
+    r"\breplace\s+the\s+contents\b", re.IGNORECASE)
+
+
+def _imported_names(text: str) -> set[str]:
+    """Binding names introduced by ES-module or Python import lines."""
+    names: set[str] = set()
+    for m in _JS_IMPORT_RE.finditer(text or ""):
+        if m.group(1) is not None:
+            for part in m.group(1).split(","):
+                part = re.split(r"\s+as\s+", part.strip())[-1].strip()
+                if re.fullmatch(r"[A-Za-z_$][\w$]*", part):
+                    names.add(part)
+        elif m.group(2):
+            names.add(m.group(2))
+    for m in _PY_IMPORT_RE.finditer(text or ""):
+        for part in m.group(1).split(","):
+            part = re.split(r"\s+as\s+", part.strip().strip("()"))[-1].strip()
+            if part and part != "*" and re.fullmatch(r"[A-Za-z_]\w*", part):
+                names.add(part)
+    return names
+
+
+def _asks_file_rewrite(task: str, rel: str) -> bool:
+    """True when the task names this file AND asks for a rewrite/replacement
+    of it: the only sanctioned reason to drop its existing wiring."""
+    low = (task or "").lower()
+    name = (rel or "").rsplit("/", 1)[-1].lower()
+    return bool(name and name in low and _REWRITE_RE.search(low))
+
+
+def check_lost_wiring(agent, results, task: str = "") -> list[Finding]:
+    """A whole-file replacement that drops imported-and-called names still
+    defined elsewhere in the project deletes working wiring (BUG-216): the
+    removed helpers have no callers left to trip `check_stale_references`,
+    and the new module graph validates in isolation while the page quietly
+    loses its grid/transport/scope. Error by default; a warn when the task
+    explicitly asks to rewrite that very file."""
+    out: list[Finding] = []
+    index = getattr(agent, "index", None)
+    for r in results:
+        if not r.ok or not r.file or not r.before:
+            continue
+        if not (r.message or "").startswith("replaced contents"):
+            continue
+        before, after = r.before, r.after or ""
+        dropped: list[str] = []
+        for name in sorted(_imported_names(before)):
+            rx = re.compile(r"(?<![\w$])" + re.escape(name) + r"(?![\w$])")
+            # called/used in the original beyond its own import line?
+            if not any(rx.search(ln) for ln in before.splitlines()
+                       if not ln.lstrip().startswith(("import ", "from "))):
+                continue
+            if rx.search(after):
+                continue          # still imported or defined: wiring kept
+            try:
+                still_defined = bool(index and index.find_symbol(name))
+            except Exception:
+                still_defined = False
+            if still_defined:
+                dropped.append(name)
+        if not dropped:
+            continue
+        out.append(Finding(
+            "lost_wiring",
+            "warn" if _asks_file_rewrite(task, r.file) else "error",
+            r.file,
+            "the whole-file replacement dropped "
+            + ", ".join(f"`{n}`" for n in dropped[:6])
+            + ": imported and called in the original, still defined in the "
+              "project, and absent from the new text. Keep the existing "
+              "wiring unless the task asks to remove it"))
+    return out
+
+
+def check_oversized_rewrite(agent, results, task: str = "") -> list[Finding]:
+    """Context-pressure guard: on a small-window profile, a whole-file draft
+    of a large file is how a context-pressed model deletes working wiring
+    (the GLM-4.7-Flash Phase-5a shape). Refuse it BEFORE it lands -- error by
+    default, warn only when the task explicitly asks to rewrite that very
+    file -- and name the forms that fit a small window instead."""
+    cfg = getattr(agent, "cfg", None)
+    small = int(getattr(cfg, "small_context_tokens", 0) or 0)
+    if small <= 0:
+        return []
+    window = int(getattr(cfg, "context_tokens", 0) or 0)
+    if window <= 0 or window > small:
+        return []
+    cap = max(20, int(getattr(cfg, "max_whole_file_lines", 120) or 120))
+    out: list[Finding] = []
+    for r in results:
+        if not r.ok or not r.file or not getattr(r, "whole_file", False):
+            continue
+        if getattr(r, "renames_from", ()):
+            continue          # a rename moves real bytes, not a fresh draft
+        lines = len((r.before or "").splitlines())
+        if lines <= cap:
+            continue
+        out.append(Finding(
+            "oversized_rewrite",
+            "warn" if _asks_file_rewrite(task, r.file) else "error",
+            r.file,
+            f"this reply replaces the WHOLE {lines}-line file, but the "
+            f"profile's context window is small ({window:,} tokens) and the "
+            f"whole-file ceiling is {cap} lines: a draft this size gets cut "
+            "off mid-file and drops working wiring. Re-emit the change as "
+            "small SEARCH/REPLACE blocks, a SYMBOL anchor with the full new "
+            "definition, or successive append chunks -- never the whole "
+            "file in one REPLACE"))
+    return out
+
+
 # ------------------------------------------------------------------ citations
 _CITE_RES = (
     re.compile(r"(?<![\w/.-])([\w./\\-]+\.[A-Za-z]{1,5}):(\d+)"),
@@ -637,6 +758,57 @@ _REQ_SPLIT_RE = re.compile(
     r",?\s+and\s+(?=(?:also\s+)?(?:add|make|fix|update|change|remove|rename|"
     r"create|write|ensure|check|handle|support|use|return|move|delete|"
     r"implement|show|print|log)\b)|,?\s+then\s+)", re.IGNORECASE)
+
+
+def _split_clauses(text: str) -> list[tuple[str, bool]]:
+    """Split task text at clause boundaries that sit at bracket depth zero,
+    returning ``(clause, hard)`` pairs.
+
+    The old `_REQ_SPLIT_RE.split` cut at every `;` -- including one inside a
+    parenthetical ("(sharps allowed; return null for bad input)"), which
+    became two plan tasks and a phantom coverage clause (BUG-202). Track
+    ()/[]/{} depth and double/back quotes so a boundary inside them is text,
+    not a split point. Single quotes are left alone: apostrophes in prose
+    ("the model's output") are far commoner than single-quoted strings.
+
+    `hard` marks a clause that begins at an explicit bullet/numbered marker
+    (or the very first clause). A bulleted list is the author saying "these
+    are separate requirements", so a hard clause is never merged into the one
+    before it even when its verb is not in our list ("document it in the
+    README"). Only soft-boundary fragments (a `;`, a `.`, an `and then`) are
+    candidates for the verbless-continuation merge."""
+    parts: list[tuple[str, bool]] = []
+    depth = 0
+    quote = ""
+    start = i = 0
+    n = len(text)
+    hard = True                       # the first clause stands on its own
+    while i < n:
+        ch = text[i]
+        if quote:
+            if ch == "\\":
+                i += 2
+                continue
+            if ch == quote:
+                quote = ""
+            i += 1
+            continue
+        if ch in "\"`":
+            quote = ch
+        elif ch in "([{":
+            depth += 1
+        elif ch in ")]}":
+            depth = max(0, depth - 1)
+        elif depth == 0:
+            m = _REQ_SPLIT_RE.match(text, i)
+            if m is not None and m.end() > i:
+                parts.append((text[start:m.start()], hard))
+                hard = bool(re.match(r"\n\s*(?:[-*]|\d+[.)])\s+", m.group(0)))
+                i = start = m.end()
+                continue
+        i += 1
+    parts.append((text[start:], hard))
+    return parts
 _VERBS = {"add", "make", "fix", "update", "change", "remove", "rename", "create",
           "write", "ensure", "check", "handle", "support", "use", "return",
           "move", "delete", "implement", "show", "print", "log", "should",
@@ -700,6 +872,10 @@ class Requirement:
     # Stable clause id ("R1", "R2", ...) assigned by the task splitter; the
     # review page uses it to show which clause each file serves (R8).
     req_id: str = ""
+    # Transient verdict of the last coverage pass: the reply's PROSE addresses
+    # this edit clause but no edit implements it (description is not
+    # implementation). The repair prompt names the gap explicitly.
+    prose_only: bool = False
 
     def __post_init__(self):
         if self.kind not in ("edit", "report"):
@@ -858,11 +1034,28 @@ def _requirements_from_task(task: str, limit: int = 5) -> list[Requirement]:
     text = (task or "").split("\nTASK\n")[-1].strip()
     if not text:
         return []
-    parts = [p.strip(" \t\n.,;") for p in _REQ_SPLIT_RE.split(text) if p]
+    parts = [(p.strip(" \t\n.,;"), hard)
+             for p, hard in _split_clauses(text) if p.strip(" \t\n.,;")]
+    # A fragment with no verb of its own is a continuation of the clause
+    # before it ("... with sharps allowed"), not a requirement of its own:
+    # merge it back instead of letting it become a nonsense plan step. A
+    # hard clause (an explicit bullet/numbered item) is never merged: the
+    # author listed it as a separate requirement even if its verb ("document")
+    # is not one we recognise.
+    merged: list[str] = []
+    for p, hard in parts:
+        p = re.sub(r"^(?:[-*]|\d+[.)])\s+", "", p)   # drop the bullet marker
+        if not p:
+            continue
+        if merged and not hard and not (
+                _REQ_EDIT_RE.search(p) or _REQ_REPORT_RE.search(p)):
+            merged[-1] = merged[-1] + " " + p
+        else:
+            merged.append(p)
     task_kind = "edit" if _REQ_EDIT_RE.search(text) else (
         "report" if _REQ_REPORT_RE.search(text) else "edit")
     reqs: list[Requirement] = []
-    for p in parts:
+    for p in merged:
         if len(p) < 8:
             continue
         terms = []
@@ -1036,6 +1229,12 @@ class RequirementTracker:
             for req in self.items:
                 if not req.is_edit or req.final:
                     continue
+                if _is_test_author_clause(req.text) \
+                        and not _TEST_DECL_RE.search(after or ""):
+                    # "Add unit tests for X" is not evidenced by an
+                    # import-only hunk to a test file (BUG-205): only a
+                    # declaration-bearing edit promotes it.
+                    continue
                 hit = _match_score(req.terms, text)
                 overlap = any(
                     _same_file(rel, a_rel)
@@ -1208,14 +1407,42 @@ def _spans_overlap(a1: int, b1: int, a2: int, b2: int) -> bool:
     return not (b1 < a2 or b2 < a1)
 
 
+def _edit_evidence_text(e) -> str:
+    """One edit's file name plus its new and old text, for term matching."""
+    return (f"{getattr(e, 'file', '')}\n"
+            f"{getattr(e, 'replace', '') or getattr(e, 'after', '')}\n"
+            f"{getattr(e, 'search', '') or getattr(e, 'before', '')}")
+
+
+# A test DECLARATION, not merely the word "test" in a file name or an import
+# line: the test-clause exemption below must not fire for an import-only edit
+# to a test file (BUG-205).
+_TEST_DECL_RE = re.compile(
+    r"\b(?:test|it|describe)\s*\(\s*['\"`]|\bdef\s+test_|\bassert\b|"
+    r"\b(?:pytest|unittest)\b|node:test|\b(?:expect|should)\s*\(",
+    re.IGNORECASE)
+# A clause that asks for tests to be WRITTEN ("Add unit tests for ..."), as
+# opposed to made to pass ("make node --test ... pass"): only the former
+# demands declaration-bearing test edits as evidence.
+_TEST_AUTHOR_RE = re.compile(
+    r"\b(?:add|write|create|append|implement|include|new)\b[^.\n]{0,60}?"
+    r"\btests?\b", re.IGNORECASE)
+
+
+def _is_test_author_clause(text: str) -> bool:
+    low = (text or "").lower()
+    return "test" in low and bool(_TEST_AUTHOR_RE.search(low))
+
+
 def _unaddressed(task: str, reply: str, edits,
                  tracker: RequirementTracker | None = None) -> list[Requirement]:
     """The requirement clauses no edit or sentence addresses: their key terms
-    appear nowhere in the edits, the edits' file names, or the reply's prose,
-    and the evidence state machine has not promoted them past READ. Shared by
-    `check_coverage` (which renders them as findings) and `coverage_seeds`
-    (which turns the edit ones into follow-up intents). Runs for prose-only
-    replies too (P1a), not only when edit blocks are present."""
+    appear nowhere in the edits, the edits' file names, or (for report
+    clauses) the reply's prose, and the evidence state machine has not
+    promoted them past READ. Shared by `check_coverage` (which renders them
+    as findings) and `coverage_seeds` (which turns the edit ones into
+    follow-up intents). Runs for prose-only replies too (P1a), not only when
+    edit blocks are present."""
     if tracker is None or tracker.task != task:
         tracker = RequirementTracker(task)
     else:
@@ -1228,22 +1455,47 @@ def _unaddressed(task: str, reply: str, edits,
         return []
     tracker.observe_edit(edits)
     tracker.observe_report(reply)
-    haystack = "\n".join(
-        [_prose(reply)] +
-        [f"{getattr(e, 'file', '')}\n"
-         f"{getattr(e, 'replace', '') or getattr(e, 'after', '')}\n"
-         f"{getattr(e, 'search', '') or getattr(e, 'before', '')}"
-         for e in edits]).lower()
+    edit_hay = "\n".join(_edit_evidence_text(e) for e in edits).lower()
+    # Only content-bearing test edits can address a test clause: an
+    # import-only hunk to a test file mentions the symbol but adds no tests
+    # (BUG-205), so its text is not evidence for one.
+    test_hay = "\n".join(
+        _edit_evidence_text(e) for e in edits
+        if getattr(e, "ok", True) and _TEST_DECL_RE.search(
+            getattr(e, "replace", "") or getattr(e, "after", "") or "")
+    ).lower()
+    prose_hay = _prose(reply).lower()
     out = []
     for req in reqs:
         text, terms = req.text, req.terms
-        hit = sum(1 for t in terms if t.lower() in haystack
-                  or t.lower().rstrip("s") in haystack)
-        if "test" in text.lower() and any("test" in e.file.lower() for e in edits):
+        is_test_clause = "test" in text.lower()
+        # An EDIT clause is addressed by edit evidence only: prose that
+        # merely describes the feature is not implementation (BUG-214).
+        # Report clauses keep the prose haystack.
+        if req.is_edit:
+            hay = test_hay if _is_test_author_clause(text) else edit_hay
+        else:
+            hay = prose_hay + "\n" + edit_hay
+        hit = sum(1 for t in terms if t.lower() in hay
+                  or t.lower().rstrip("s") in hay)
+        if is_test_clause and any(
+                getattr(e, "ok", True)
+                and "test" in (getattr(e, "file", "") or "").lower()
+                and _TEST_DECL_RE.search(
+                    getattr(e, "replace", "") or getattr(e, "after", "")
+                    or "")
+                for e in edits):
             continue
         if req.state in (REQ_EDITED, REQ_VERIFIED, REQ_REPORTED):
             continue
         if hit == 0:
+            # Name the prose-vs-edit gap: a clause whose terms appear in the
+            # answer's prose but in no edit was DESCRIBED, not implemented.
+            # The repair prompt and the follow-up intents say so explicitly
+            # instead of a generic "unaddressed".
+            req.prose_only = bool(req.is_edit) and any(
+                t.lower() in prose_hay or t.lower().rstrip("s") in prose_hay
+                for t in terms)
             out.append(req)
     return out[:3]
 
@@ -1253,10 +1505,20 @@ def check_coverage(task: str, reply: str, edits,
     """Requirements whose key terms appear nowhere in the edits, their file
     names, or the reply's prose. When a live RequirementTracker is supplied,
     its states are authoritative for what counts as addressed."""
-    return [Finding("coverage", "warn", "",
-                    f"no edit or sentence addresses: '{req.text}' "
-                    f"(still {req.state})")
-            for req in _unaddressed(task, reply, edits, tracker)]
+    out: list[Finding] = []
+    for req in _unaddressed(task, reply, edits, tracker):
+        if getattr(req, "prose_only", False):
+            out.append(Finding(
+                "coverage", "warn", "",
+                f"you described '{req.text}' in prose but no edit implements "
+                f"it (still {req.state}); description is not implementation "
+                "-- emit the edit for it"))
+        else:
+            out.append(Finding(
+                "coverage", "warn", "",
+                f"no edit or sentence addresses: '{req.text}' "
+                f"(still {req.state})"))
+    return out
 
 
 def coverage_seeds(task: str, reply: str, edits,
@@ -1402,6 +1664,23 @@ def evidence_rehydrations(agent, findings) -> list[tuple[str, int, int]]:
 
 
 # --------------------------------------------------------------- entry points
+def dedupe_findings(findings) -> list:
+    """Stable de-duplication by (kind, file, message): the same coverage
+    clause used to surface once per hunk and again at the final gate,
+    doubling the ledger's apparent damage (BUG-207). First occurrence wins;
+    order is preserved."""
+    seen: set[tuple] = set()
+    out = []
+    for f in findings or ():
+        key = (getattr(f, "kind", ""), getattr(f, "file", ""),
+               getattr(f, "message", ""))
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(f)
+    return out
+
+
 def check(agent, task: str, reply: str, results, gathered: str = ""
           ) -> list[Finding]:
     """All deterministic findings for a proposed reply (never raises)."""
@@ -1419,6 +1698,8 @@ def check(agent, task: str, reply: str, results, gathered: str = ""
         findings += check_unread(agent, edits, results)
         findings += check_stale_references(agent, results)
         findings += check_moved_imports(agent, results)
+        findings += check_lost_wiring(agent, results, task)
+        findings += check_oversized_rewrite(agent, results, task)
         findings += check_citations(agent, reply)
         tracker = getattr(agent, "requirements", None)
         if tracker is not None and getattr(tracker, "task", "") != task:
@@ -1428,7 +1709,7 @@ def check(agent, task: str, reply: str, results, gathered: str = ""
     except Exception as e:                  # a checker bug must not block a task
         findings.append(Finding("model", "warn", "",
                                 f"verification skipped ({type(e).__name__})"))
-    return findings
+    return dedupe_findings(findings)
 
 
 def render(findings, severity: str | None = None) -> str:

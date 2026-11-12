@@ -1603,6 +1603,555 @@ def _js_module_link_errors(root: Path, cap: int = 40
     return out
 
 
+# --- runtime-fatal shapes a parse accepts (BUG-210 / BUG-211) --------------
+# `const x = 1; x = 2;` and `engine.setBpm(...)` on a class that never defines
+# setBpm both parse clean, pass every import/DOM check, and throw a TypeError
+# the first time the line runs. Like the rest of the gate, these only report
+# what the project's own sources prove; every ambiguous shape stays quiet.
+
+_JS_SCOPE_NODES = {
+    "program", "statement_block", "static_block",
+    "function_declaration", "generator_function_declaration",
+    "function_expression", "generator_function", "arrow_function",
+    "function", "method_definition",
+    "for_statement", "for_in_statement", "catch_clause",
+}
+
+
+def _js_scope_of(node):
+    """The nearest ancestor (or the node itself) that introduces a scope."""
+    while node is not None and node.type not in _JS_SCOPE_NODES:
+        node = node.parent
+    return node
+
+
+def _js_scope_bindings(scope) -> dict[str, tuple[str, int]]:
+    """name -> (kind, line) for the bindings DIRECTLY inside one scope node
+    (const/let/var/param/function/class/import/catch). Nested scopes are not
+    descended into: their bindings belong to them, not to this scope."""
+    out: dict[str, tuple[str, int]] = {}
+
+    def add(names, kind, node) -> None:
+        for name in names:
+            if name and name not in out:
+                out[name] = (kind, node.start_point[0] + 1)
+
+    def visit(node) -> None:
+        k = node.type
+        # Node wrappers are not identity-stable: compare the underlying id.
+        if k in _JS_SCOPE_NODES and node.id != scope.id:
+            return                       # a nested scope owns its bindings
+        if k == "lexical_declaration":
+            kind = ("const" if re.match(r"^\s*const\b", _ts_text(node))
+                    else "let")
+            for child in node.named_children:
+                if child.type == "variable_declarator":
+                    add(_js_pattern_names(child.child_by_field_name("name")),
+                        kind, child)
+        elif k == "variable_declaration":
+            for child in node.named_children:
+                if child.type == "variable_declarator":
+                    add(_js_pattern_names(child.child_by_field_name("name")),
+                        "var", child)
+        elif k in ("function_declaration", "generator_function_declaration"):
+            add({_ts_text(node.child_by_field_name("name"))}, "function", node)
+        elif k in ("class_declaration", "abstract_class_declaration"):
+            add({_ts_text(node.child_by_field_name("name"))}, "class", node)
+        elif k == "import_statement":
+            clause = next((c for c in node.named_children
+                           if c.type == "import_clause"), None)
+            for child in (clause.children if clause is not None else []):
+                if child.type == "identifier":
+                    add({_ts_text(child)}, "import", child)
+                elif child.type == "named_imports":
+                    for spec in child.named_children:
+                        if spec.type != "import_specifier":
+                            continue
+                        alias = _ts_text(spec.child_by_field_name("alias"))
+                        add({alias or _ts_text(
+                            spec.child_by_field_name("name"))}, "import", spec)
+                elif child.type == "namespace_import":
+                    ident = next((x for x in child.named_children
+                                  if x.type == "identifier"), None)
+                    add({_ts_text(ident)}, "import", node)
+        elif k == "formal_parameters":
+            for param in node.named_children:
+                add(_js_pattern_names(param), "param", param)
+        elif k == "arrow_function":
+            param = node.child_by_field_name("parameter")
+            if param is not None and param.type != "formal_parameters":
+                add(_js_pattern_names(param), "param", param)
+        elif k == "catch_clause":
+            param = node.child_by_field_name("parameter")
+            if param is not None:
+                add(_js_pattern_names(param), "catch", param)
+        elif k == "for_in_statement":
+            # `for (const y of ys)`: some grammar versions keep the keyword
+            # as an unnamed child and the left a bare identifier.
+            left = node.child_by_field_name("left")
+            kw = next((c.type for c in node.children
+                       if c.type in ("const", "let", "var")), "")
+            if left is not None and left.type == "identifier" and kw:
+                add({_ts_text(left)},
+                    "const" if kw == "const" else
+                    "let" if kw == "let" else "var", left)
+        for child in node.named_children:
+            visit(child)
+
+    if scope is not None:
+        visit(scope)
+    return out
+
+
+def _js_assignment_targets(root_node):
+    """(name, node) for every write to a bare identifier: `x = ...`,
+    `x += ...`, `x++`, `for (x of ...)`. Member writes (`obj.x = ...`) are a
+    different contract and stay out."""
+    for node in _walk_ts(root_node):
+        k = node.type
+        if k in ("assignment_expression", "augmented_assignment_expression"):
+            left = node.child_by_field_name("left")
+            if left is None:
+                continue
+            if left.type == "identifier":
+                yield _ts_text(left), node
+            elif left.type in ("object_pattern", "array_pattern"):
+                for name in sorted(_js_pattern_names(left)):
+                    yield name, node
+        elif k == "update_expression":
+            arg = node.child_by_field_name("argument")
+            if arg is not None and arg.type == "identifier":
+                yield _ts_text(arg), node
+        elif k == "for_in_statement":
+            left = node.child_by_field_name("left")
+            declared = any(c.type in ("const", "let", "var")
+                           for c in node.children)
+            if left is not None and left.type == "identifier" and not declared:
+                yield _ts_text(left), node   # `for (y of xs)` writes y
+
+
+@_ts_guarded
+def _js_const_reassign_errors(root: Path, cap: int = 40
+                              ) -> list[tuple[str, str, str]]:
+    """(rel, '', ContractError) for writes to a const or imported binding.
+
+    `const spaces = steps - pulses; ... spaces -= remainder;` parses clean
+    and raises `TypeError: Assignment to constant variable` the first time
+    the line runs (BUG-210). The NEAREST binding decides, so a shadowing
+    let/param in an inner scope is never blamed on an outer const."""
+    root = Path(root)
+    rels = _iter_code_files(root, TS_EXTS, cap=300)
+    out: list[tuple[str, str, str]] = []
+    seen: set[str] = set()
+    for rel in rels:
+        if len(out) >= cap:
+            break
+        text = _read(rel, root)
+        if not text.strip():
+            continue
+        suffix = "." + rel.rsplit(".", 1)[-1].lower()
+        node = _ts_parse(text, suffix)
+        if node is None:
+            continue                     # the syntax gate owns broken files
+        scopes: dict[int, dict] = {}
+
+        def bindings(scope) -> dict:
+            key = scope.id
+            if key not in scopes:
+                scopes[key] = _js_scope_bindings(scope)
+            return scopes[key]
+
+        for name, anode in _js_assignment_targets(node):
+            if not name or name in _JS_NON_NAMES:
+                continue
+            # A write inside the declarator's own initializer is a TDZ
+            # question, not a reassignment of an established binding.
+            p = anode.parent
+            own_init = False
+            while p is not None and p.type not in _JS_SCOPE_NODES:
+                if p.type == "variable_declarator" and name in \
+                        _js_pattern_names(p.child_by_field_name("name")):
+                    own_init = True
+                    break
+                p = p.parent
+            if own_init:
+                continue
+            scope = _js_scope_of(anode)
+            found = None
+            while scope is not None:
+                hit = bindings(scope).get(name)
+                if hit is not None:
+                    found = hit
+                    break
+                scope = _js_scope_of(scope.parent)
+            if found is None or found[0] not in ("const", "import"):
+                continue
+            kind, dline = found
+            line = anode.start_point[0] + 1
+            what = ("an imported binding" if kind == "import"
+                    else "a const binding")
+            fix = ("import a mutable holder or restructure the code"
+                   if kind == "import" else
+                   f"declare '{name}' with let if its value must change")
+            err = (f"ContractError in {rel}:{line}: assigns to '{name}', "
+                   f"which is {what} (declared at line {dline}) -- JavaScript "
+                   f"raises `TypeError: Assignment to constant variable` the "
+                   f"moment this line runs; {fix}")
+            if err in seen:
+                continue
+            seen.add(err)
+            out.append((rel, "", err))
+    out.sort(key=lambda t: (t[0], t[2]))
+    return out
+
+
+# Every object answers these, whatever its class defines.
+_JS_OBJECT_PROTO = {
+    "constructor", "hasOwnProperty", "isPrototypeOf", "propertyIsEnumerable",
+    "toLocaleString", "toString", "valueOf", "__defineGetter__",
+    "__defineSetter__", "__lookupGetter__", "__lookupSetter__", "__proto__",
+}
+
+
+def _js_class_parent(class_node) -> str:
+    """The parent class name in `class X extends Y`, or '' (grammar-version
+    proof: read the header text up to the body, not a field name)."""
+    body = class_node.child_by_field_name("body")
+    header = _ts_text(class_node)
+    if body is not None:
+        header = header[:body.start_byte - class_node.start_byte]
+    m = re.search(r"\bextends\s+([A-Za-z_$][\w$]*)", header)
+    return m.group(1) if m else ""
+
+
+def _js_class_surface(class_node) -> tuple[set[str], bool]:
+    """(instance member names, opaque) for one class node. Opaque when the
+    surface cannot be proven: a computed member name, an index signature,
+    a decorator, or a body the parser could not read."""
+    methods: set[str] = set()
+    body = class_node.child_by_field_name("body")
+    if body is None or body.has_error:
+        return methods, True
+    opaque = False
+    for child in body.named_children:
+        k = child.type
+        if k in ("method_definition", "method_signature",
+                 "abstract_method_signature", "public_field_definition",
+                 "field_definition"):
+            if any(c.type == "decorator" for c in child.named_children):
+                opaque = True
+            name = child.child_by_field_name("name")
+            if name is None:
+                # some grammar versions expose the member name as the first
+                # named child instead of a `name` field (class fields)
+                name = next((x for x in child.named_children
+                             if x.type in ("property_identifier",
+                                           "private_property_identifier",
+                                           "computed_property_name",
+                                           "string", "number")), None)
+            if name is None:
+                continue
+            if name.type in ("computed_property_name", "string",
+                             "number"):
+                if name.type == "computed_property_name":
+                    opaque = True        # [expr]() could be anything
+                continue
+            methods.add(_ts_text(name))
+        elif k == "index_signature":
+            opaque = True
+        elif k in ("comment", "static_block"):
+            continue                     # static blocks shape the class, not
+                                         # the instance surface
+        else:
+            opaque = True                # unexpected member: never guess
+    return methods, opaque
+
+
+@_ts_guarded
+def _js_instance_method_errors(root: Path, cap: int = 40
+                               ) -> list[tuple[str, str, str]]:
+    """(rel, def_rel, ContractError) for `x.method()` where x is a project
+    class instance and the class defines no such method (BUG-211).
+
+    Only proven shapes are reported: `const x = new Class()` at module level
+    (or `this.x = new Class()` inside the class itself), where Class is
+    defined in the project, has a fully readable member surface, and x is
+    never reassigned or shadowed between the binding and the call. Anything
+    ambiguous -- an unknown parent, a computed member, a second binding of
+    the name -- stays quiet."""
+    root = Path(root)
+    rels = _iter_code_files(root, TS_EXTS, cap=300)
+    if not rels:
+        return []
+    parsed: dict[str, object] = {}
+
+    def tree_for(rel: str):
+        if rel not in parsed:
+            suffix = "." + rel.rsplit(".", 1)[-1].lower()
+            try:
+                parsed[rel] = _ts_parse(_read(rel, root), suffix)
+            except Exception:
+                parsed[rel] = None
+        return parsed[rel]
+
+    # --- 1. every project class: name -> [(rel, methods, opaque, parent)] --
+    classes: dict[str, list] = {}
+    default_class: dict[str, tuple] = {}   # rel -> entry of `export default class`
+
+    def register(name: str, entry: tuple, rel: str, node) -> None:
+        classes.setdefault(name, []).append(entry)
+        parent = node.parent
+        if parent is not None and parent.type == "export_statement" \
+                and re.match(r"^\s*export\s+default\b", _ts_text(parent)):
+            default_class[rel] = entry
+
+    for rel in rels:
+        node = tree_for(rel)
+        if node is None:
+            continue
+        for c in _walk_ts(node):
+            if c.type in ("class_declaration", "abstract_class_declaration"):
+                name = _ts_text(c.child_by_field_name("name"))
+                if not name:
+                    continue
+                methods, opaque = _js_class_surface(c)
+                register(name, (rel, methods, opaque, _js_class_parent(c)),
+                         rel, c)
+            elif c.type == "variable_declarator":
+                value = c.child_by_field_name("value")
+                name_node = c.child_by_field_name("name")
+                if value is None or value.type != "class" \
+                        or name_node is None \
+                        or name_node.type != "identifier":
+                    continue
+                methods, opaque = _js_class_surface(value)
+                register(_ts_text(name_node),
+                         (rel, methods, opaque, _js_class_parent(value)),
+                         rel, c)
+
+    surface_cache: dict[int, set | None] = {}
+
+    def surface(entry: tuple, stack: tuple = ()) -> set | None:
+        """The full instance surface incl. project parents, or None when it
+        cannot be proven (unknown/ambiguous parent, opaque member)."""
+        key = id(entry)
+        if key in surface_cache:
+            return surface_cache[key]
+        rel_c, methods, opaque, parent = entry
+        result: set | None = None
+        if not opaque:
+            if not parent:
+                result = set(methods)
+            elif parent not in stack:
+                cands = [e for e in classes.get(parent, [])
+                         if e[0] == rel_c] or classes.get(parent, [])
+                if len(cands) == 1:
+                    ps = surface(cands[0], stack + (parent,))
+                    if ps is not None:
+                        result = set(methods) | ps
+        surface_cache[key] = result
+        return result
+
+    out: list[tuple[str, str, str]] = []
+    seen: set[str] = set()
+
+    def emit(rel: str, peer: str, text: str) -> None:
+        if text in seen or len(out) >= cap:
+            return
+        seen.add(text)
+        out.append((rel, peer, text))
+
+    # --- 2. per file: instances, then the calls on them --------------------
+    for rel in rels:
+        if len(out) >= cap:
+            break
+        node = tree_for(rel)
+        if node is None:
+            continue
+        imports, _reexports = _js_imports_and_reexports(node)
+        imported_from: dict[str, tuple[str, str]] = {}
+        for item in imports:
+            target = _js_resolve_import(root, rel, item["spec"])
+            if not target:
+                continue
+            for local, imported in item["named"]:
+                imported_from[local] = (target, imported)
+            if item["default"]:
+                imported_from[item["default"]] = (target, "default")
+
+        def lookup(cname: str) -> tuple | None:
+            """The one class entry `new cname()` provably constructs here."""
+            local = [e for e in classes.get(cname, []) if e[0] == rel]
+            if len(local) == 1:
+                return local[0]
+            if local or cname not in imported_from:
+                return None              # ambiguous or not a project class
+            target, imported = imported_from[cname]
+            if imported == "default":
+                return default_class.get(target)
+            hits = [e for e in classes.get(imported, []) if e[0] == target]
+            return hits[0] if len(hits) == 1 else None
+
+        # module-level instances: name -> (entry, declarator line)
+        instances: dict[str, tuple] = {}
+        ambiguous: set[str] = set()
+        for c in node.named_children:
+            decls = []
+            if c.type in ("lexical_declaration", "variable_declaration"):
+                decls = [d for d in c.named_children
+                         if d.type == "variable_declarator"]
+            elif c.type == "export_statement":
+                d = c.child_by_field_name("declaration")
+                if d is not None and d.type in ("lexical_declaration",
+                                                "variable_declaration"):
+                    decls = [x for x in d.named_children
+                             if x.type == "variable_declarator"]
+            for d in decls:
+                name_node = d.child_by_field_name("name")
+                value = d.child_by_field_name("value")
+                if name_node is None or name_node.type != "identifier":
+                    continue
+                vname = _ts_text(name_node)
+                if value is None or value.type != "new_expression":
+                    continue
+                ctor = value.child_by_field_name("constructor")
+                if ctor is None or ctor.type != "identifier":
+                    continue
+                entry = lookup(_ts_text(ctor))
+                if entry is None:
+                    continue
+                if vname in instances:
+                    ambiguous.add(vname)
+                instances[vname] = (entry, d.start_point[0] + 1)
+        # a name re-assigned anywhere is not a stable instance
+        for name, _anode in _js_assignment_targets(node):
+            if name in instances:
+                ambiguous.add(name)
+
+        scopes: dict[int, dict] = {}
+
+        def bindings(scope) -> dict:
+            key = scope.id
+            if key not in scopes:
+                scopes[key] = _js_scope_bindings(scope)
+            return scopes[key]
+
+        def nearest(name: str, from_node):
+            scope = _js_scope_of(from_node)
+            while scope is not None:
+                hit = bindings(scope).get(name)
+                if hit is not None:
+                    return hit, scope
+                scope = _js_scope_of(scope.parent)
+            return None, None
+
+        # this.x instances, per class body (only when the class has no
+        # parent: a parent constructor could assign this.x too)
+        this_inst: dict[tuple[int, str], tuple] = {}
+        this_bad: set[tuple[int, str]] = set()
+        for c in _walk_ts(node):
+            if c.type not in ("class_declaration",
+                              "abstract_class_declaration", "class"):
+                continue
+            if _js_class_parent(c):
+                continue
+            for n in _walk_ts(c):
+                if n.type not in ("assignment_expression",
+                                  "augmented_assignment_expression"):
+                    continue
+                left = n.child_by_field_name("left")
+                if left is None or left.type != "member_expression":
+                    continue
+                obj = left.child_by_field_name("object")
+                prop = left.child_by_field_name("property")
+                if obj is None or obj.type != "this" or prop is None \
+                        or prop.type != "property_identifier":
+                    continue
+                key = (c.id, _ts_text(prop))
+                value = n.child_by_field_name("right")
+                entry = None
+                if value is not None and value.type == "new_expression":
+                    ctor = value.child_by_field_name("constructor")
+                    if ctor is not None and ctor.type == "identifier":
+                        entry = lookup(_ts_text(ctor))
+                if entry is None:
+                    this_bad.add(key)    # assigned something unprovable
+                elif key in this_inst and this_inst[key][0] is not entry:
+                    this_bad.add(key)    # two different classes
+                else:
+                    this_inst[key] = (entry, n.start_point[0] + 1)
+
+        def class_of(from_node):
+            p = from_node.parent
+            while p is not None:
+                if p.type in ("class_declaration",
+                              "abstract_class_declaration", "class"):
+                    return p
+                p = p.parent
+            return None
+
+        for n in _walk_ts(node):
+            if n.type != "call_expression":
+                continue
+            fn = n.child_by_field_name("function")
+            if fn is None or fn.type != "member_expression":
+                continue
+            obj = fn.child_by_field_name("object")
+            prop = fn.child_by_field_name("property")
+            if obj is None or prop is None \
+                    or prop.type != "property_identifier":
+                continue
+            method = _ts_text(prop)
+            if not method or method in _JS_OBJECT_PROTO:
+                continue
+            entry = None
+            receiver = ""
+            if obj.type == "identifier":
+                x = _ts_text(obj)
+                if x in ambiguous or x not in instances:
+                    continue
+                hit, scope = nearest(x, n)
+                # only the module-level binding itself proves the receiver
+                if hit is None or scope.id != node.id \
+                        or hit[1] != instances[x][1]:
+                    continue
+                entry, _line = instances[x]
+                receiver = x
+            elif obj.type == "member_expression":
+                o2 = obj.child_by_field_name("object")
+                p2 = obj.child_by_field_name("property")
+                if o2 is None or o2.type != "this" or p2 is None \
+                        or p2.type != "property_identifier":
+                    continue
+                cls = class_of(n)
+                if cls is None:
+                    continue
+                key = (cls.id, _ts_text(p2))
+                if key in this_bad or key not in this_inst:
+                    continue
+                entry, _line = this_inst[key]
+                receiver = "this." + _ts_text(p2)
+            if entry is None:
+                continue
+            methods = surface(entry)
+            if methods is None or method in methods:
+                continue
+            def_rel = entry[0]
+            cname = next((nm for nm, es in classes.items()
+                          if entry in es), "the class")
+            shown = ", ".join(sorted(methods)[:8]) or "(none)"
+            line = n.start_point[0] + 1
+            emit(rel, def_rel,
+                 f"ContractError in {rel}:{line}: calls {receiver}.{method}"
+                 f"(...), but class {cname} ({def_rel}) defines no such "
+                 f"method (it defines: {shown}) -- `TypeError: "
+                 f"{receiver}.{method} is not a function` the first time "
+                 f"this line runs; add {method} to {cname} or call a method "
+                 f"it defines")
+    out.sort(key=lambda t: (t[0], t[2]))
+    return out
+
+
 def verify_cross_file_contracts(root: Path,
                                 modified_files: list | None = None) -> list[str]:
     """Cross-file import/arity violations in the project's Python and JS/TS
@@ -3405,7 +3954,7 @@ def _fe_js_syntax_problem(rel: str, text: str) -> str | None:
 def verify_frontend_contracts(root: Path, modified_files=None) -> list[str]:
     """Deterministic DOM Contract verification of the HTML/JS in `root`.
 
-    Five checks, all mechanical: (1) every <script src> / stylesheet <link
+    Seven checks, all mechanical: (1) every <script src> / stylesheet <link
     href> in every HTML file points at a file that exists; (2) every literal
     DOM query (getElementById('x') / querySelector('#x')) matches an id the
     HTML defines (or a literal id the JS itself creates); files whose ids are
@@ -3415,7 +3964,9 @@ def verify_frontend_contracts(root: Path, modified_files=None) -> list[str]:
     resolve and name real exports, and imported calls satisfy the known
     arity range (the same `ContractError` diagnostics as the Python gate);
     (5) every module binds each name once and declares or imports each name
-    it calls.
+    it calls; (6) no assignment targets a const/import binding (a parse-clean
+    TypeError at runtime); (7) every `x.method()` on a provable project-class
+    instance names a method the class actually defines.
 
     `modified_files` (root-relative paths, as the loop reports them) scopes
     the REPORT: only errors inside those files come back, so a pre-existing
@@ -3542,6 +4093,19 @@ def verify_frontend_contracts(root: Path, modified_files=None) -> list[str]:
     # both kill the whole module graph before a single line runs.
     for importer, target, text in _js_module_link_errors(root):
         if scope is None or importer in scope or (target and target in scope):
+            errors.append(text)
+
+    # 6. runtime-fatal assignments: a write to a const/import binding parses
+    # clean and throws TypeError the first time the line runs (BUG-210).
+    for rel, _peer, text in _js_const_reassign_errors(root):
+        if scope is None or rel in scope:
+            errors.append(text)
+
+    # 7. instance-method contracts: `engine.setBpm(...)` on a project class
+    # that defines no setBpm is a TypeError on the first slider move, and no
+    # import/DOM check sees it (BUG-211).
+    for rel, peer, text in _js_instance_method_errors(root):
+        if scope is None or rel in scope or (peer and peer in scope):
             errors.append(text)
     return sorted(set(errors))[:_FE_ERRORS_CAP]
 

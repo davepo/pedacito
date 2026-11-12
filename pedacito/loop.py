@@ -1435,6 +1435,13 @@ class TaskResult:
     live_kinds: tuple[str, ...] | None = None
     # Deterministic/verifier findings on the proposed edits (verify.Finding).
     findings: list = field(default_factory=list)
+    # R8 provenance (BUG-215): file -> clause ids each result's patch serves,
+    # the clause id -> text legend, and the edit clauses no patch evidenced
+    # ("unaccepted"). The JSONL result frame and the RPC summary carry these
+    # so machine clients can show what the review page shows.
+    clauses: dict = field(default_factory=dict)
+    clause_texts: dict = field(default_factory=dict)
+    unaccepted: list = field(default_factory=list)
     # Per-task usage: tokens, cache-hit ratio, seconds, cost (see _task_stats).
     stats: dict = field(default_factory=dict)
     # The post-edit impacted-tests verdict: None when the tests did not run
@@ -1499,6 +1506,37 @@ def _run_tests(idx, cfg, files: list[str]):
     if desc == "no test command detected":
         return None
     return ok, out, desc
+
+
+# A test command the TASK ITSELF names ("make node --test tests/x.test.js
+# pass", "npm test", "pytest ..."): its guarantee is part of the task, so a
+# run that never executed it must say so instead of ending silent (BUG-203).
+_TASK_TEST_RE = re.compile(
+    r"\bnode\s+--test(?:\s+[\w.*./-]+)*|\bnpm\s+(?:run\s+)?test\b|"
+    r"\bpython\s+-m\s+pytest\b|\bpytest\b|\bmake\s+test\b|"
+    r"\byarn\s+test\b|\bnpx\s+(?:jest|vitest|mocha)\b|"
+    r"\b(?:jest|vitest|mocha)\b", re.IGNORECASE)
+
+
+def _task_named_tests(task: str) -> str:
+    """The test command/file the task text names, '' when it names none."""
+    m = _TASK_TEST_RE.search(task or "")
+    return " ".join(m.group(0).split()) if m else ""
+
+
+def _note_tests_not_run(root, cfg, task: str) -> None:
+    """The honest verdict for a task that named a test command while the
+    test subprocess was switched off: no test evidence was gathered."""
+    named = _task_named_tests(task)
+    if not named:
+        return
+    print(f"  [tests: NOT RUN -- the task names '{named}' but "
+          "verify_tests/allow_shell is off; this run gathered no test "
+          "evidence for it]", file=sys.stderr)
+    workspace.log_event(
+        root, f"tests not run although the task names '{named}' "
+              "(verify_tests/allow_shell off)", "WARN")
+    events_mod.get(root, cfg).emit("tests_not_run", named=named)
 
 
 def _merge_repair_results(results, new):
@@ -1645,6 +1683,83 @@ def _capture_frontend_baseline(root, cfg) -> None:
             for e in spec_mod.verify_frontend_contracts(root, None)}
     except Exception:
         cfg._frontend_baseline = None
+
+
+_DOM_EXT = (".html", ".htm", ".js", ".mjs", ".cjs", ".css")
+
+
+def _dom_wanted(cfg) -> bool:
+    """The headless DOM smoke gate is opt-in twice over: `verify_dom` says
+    the project wants it, `allow_shell` grants the execution boundary (the
+    check runs project code in a browser, like the test subprocess)."""
+    return bool(getattr(cfg, "verify_dom", False)) \
+        and bool(getattr(cfg, "allow_shell", False))
+
+
+def _web_files(files: list[str]) -> bool:
+    return any(str(f).lower().endswith(_DOM_EXT) for f in files or ())
+
+
+def _capture_dom_baseline(root, cfg, edit_files: list[str]) -> None:
+    """Snapshot the mounted DOM BEFORE this task's edits, so the gate can
+    diff the surface the entry module used to mount (the BUG-216 shape).
+    Also remembers which page errors already existed, so pre-existing rot
+    is not blamed on the task. No-op unless the gate is on and web files
+    are in play; a check that cannot run leaves no baseline (every error
+    then counts as new -- the safe direction for a gate)."""
+    cfg._dom_baseline = None
+    if not _dom_wanted(cfg) or not _web_files(edit_files):
+        return
+    try:
+        from . import domcheck
+        ok, hint = domcheck.available()
+        if not ok:
+            print(f"  [domcheck: skipped -- {hint.splitlines()[0]}]",
+                  file=sys.stderr)
+            return
+        res = domcheck.check(
+            root, entry=getattr(cfg, "dom_entry", "") or "",
+            timeout=int(getattr(cfg, "dom_timeout", 45) or 45))
+        if res.error:
+            print(f"  [domcheck baseline: {res.error.splitlines()[0]}]",
+                  file=sys.stderr)
+            return
+        cfg._dom_baseline = {
+            "snapshot": res.snapshot,
+            "errors": {f.key for f in res.findings if f.severity == "error"},
+        }
+    except Exception:
+        cfg._dom_baseline = None
+
+
+def _new_dom_errors(root, cfg, files: list[str]) -> list[str]:
+    """Headless DOM smoke errors MINUS the ones the page already had before
+    this task. Never raises: a broken gate must not sink the task."""
+    if not _dom_wanted(cfg) or not _web_files(files):
+        return []
+    try:
+        from . import domcheck
+        ok, hint = domcheck.available()
+        if not ok:
+            if not getattr(cfg, "_dom_hint_shown", False):
+                cfg._dom_hint_shown = True
+                print(f"  [domcheck: skipped -- {hint.splitlines()[0]}]",
+                      file=sys.stderr)
+            return []
+        base = getattr(cfg, "_dom_baseline", None) or {}
+        res = domcheck.check(
+            root, entry=getattr(cfg, "dom_entry", "") or "",
+            timeout=int(getattr(cfg, "dom_timeout", 45) or 45),
+            baseline=base.get("snapshot"))
+        if res.error:
+            print(f"  [domcheck: {res.error.splitlines()[0]}]",
+                  file=sys.stderr)
+            return []
+        base_keys = base.get("errors", set())
+        return [f.message for f in res.findings
+                if f.severity == "error" and f.key not in base_keys]
+    except Exception:
+        return []
 
 
 def _contract_errors(root, cfg, files: list[str]) -> list[str]:
@@ -1835,6 +1950,23 @@ def _note_lesson_run(root, cfg, kinds, injected=None) -> None:
         pass
 
 
+def _note_baseline_lesson_run(root, cfg, baseline) -> None:
+    """The pre-edit baseline is an observed check run too (BUG-213): count it
+    against the lesson ledger even when the task later applies nothing and
+    the post-edit path never runs. Kinds come from the same distillation the
+    post-edit gates use; `injected` is the ledger as it stood before the run,
+    so a lesson distilled mid-run is not counted against its own baseline."""
+    if baseline is None:
+        return
+    ok, out, _desc = baseline
+    kinds: set = set()
+    if not ok:
+        lesson = distill_repair_lesson(out, "tests")
+        if lesson is not None:
+            kinds.add(lesson[0])
+    _note_lesson_run(root, cfg, kinds, _injected_lessons(root))
+
+
 def _injected_lessons(root) -> set | None:
     """The lesson ids a run's prompt carries: the live ledger at run start.
     None when the ledger cannot be read (count every live lesson then)."""
@@ -1907,8 +2039,10 @@ def _post_edit_tests(root, cfg, agent, idx, task, results, reply, backup_dir,
     tests_wanted = bool(getattr(cfg, "verify_tests", False)) \
         and bool(getattr(cfg, "allow_shell", False))
     gates_wanted = (_static_enabled(cfg) or _frontend_enabled(cfg)
-                    or bool(getattr(cfg, "interface_lock", True)))
+                    or bool(getattr(cfg, "interface_lock", True))
+                    or _dom_wanted(cfg))
     if not (tests_wanted or gates_wanted):
+        _note_tests_not_run(root, cfg, task)
         return results, reply, None
     from . import verify as verify_mod
 
@@ -1927,6 +2061,8 @@ def _post_edit_tests(root, cfg, agent, idx, task, results, reply, backup_dir,
     base_score = _failure_score(base_out) if base_out else 0
     max_rounds = max(0, int(getattr(cfg, "repair_rounds", 2) or 0))
     tests_ok = None
+    last_out = ""                  # the final test subprocess output, if any
+    last_worse = False             # ...and whether THIS task made it worse
     pending_lesson: list = []      # (kind, text) this task broke and can mend
     lesson_kinds: set = set()      # every distilled failure kind this run saw
     injected = _injected_lessons(root)   # lessons this run's prompt carried
@@ -2095,6 +2231,52 @@ def _post_edit_tests(root, cfg, agent, idx, task, results, reply, backup_dir,
             changed = sorted({fileio_norm(r.file) for r in results if r.ok})
             continue
 
+        # Headless DOM smoke gate (TECHNIQUES.md #45, opt-in): the static
+        # gates above prove the contracts the browser enforces at LOAD;
+        # this one proves the page actually MOUNTS. It runs the entry page
+        # in headless Chromium and diffs the mounted surface against the
+        # pre-edit snapshot, so a replaced entry module that silently stops
+        # rendering (BUG-216) costs a micro-repair round here instead of
+        # shipping an empty page. Behind verify_dom AND allow_shell.
+        de = _new_dom_errors(root, cfg, changed)
+        if de:
+            tests_ok = False
+            _note_repair_failure(pending_lesson, "dom", "\n".join(de),
+                                 seen=lesson_kinds,
+                                 recordable=round_ < max_rounds)
+            print(f"  [dom gate: {len(de)} headless DOM error(s) -- "
+                  f"tests/lint subprocess skipped until they are fixed]",
+                  file=sys.stderr)
+            workspace.log_event(
+                root, "headless DOM gate rejected the patch; test/lint "
+                      "subprocess skipped", "ERROR")
+            events_mod.get(root, cfg).emit(
+                "tests", ok=False, score=len(de), baseline=base_score,
+                round=round_, dom=True, new=len(de), fixed=0,
+                still_failing=0, pre_existing=len(base_failures))
+            if round_ >= max_rounds:
+                unresolved('dom', de)
+                break
+            finding = verify_mod.Finding(
+                "dom", "error", "",
+                "after your edits the entry page fails the headless DOM "
+                "smoke check (an uncaught page error, an asset/module that "
+                "no longer loads, or UI that was mounted before the edit "
+                "is now gone). No test or lint process was run. Fix these "
+                "first:\n"
+                + "\n".join(f"- {e}" for e in de[:20]))
+            fixed = agent._repair_from_findings(task, reply, [finding],
+                                                results)
+            if not fixed:
+                break
+            new = agent._apply_once(fixed, False, backup_dir)
+            if not any(r.ok for r in new):
+                break
+            results = _merge_repair_results(results, new)
+            reply = (reply.rstrip() + "\n\n" + fixed)
+            changed = sorted({fileio_norm(r.file) for r in results if r.ok})
+            continue
+
         if pending_lesson:
             # Every gate this task tripped is green again (the deterministic
             # re-check above just passed): distill what the failure was into
@@ -2108,12 +2290,15 @@ def _post_edit_tests(root, cfg, agent, idx, task, results, reply, backup_dir,
             # honestly that no tests executed rather than pretending the
             # green gates are tests.
             _note_lesson_run(root, cfg, lesson_kinds, injected)
+            _note_tests_not_run(root, cfg, task)
             return results, reply, tests_ok
         got = _run_tests(idx, cfg, changed)
         if got is None:
             _note_lesson_run(root, cfg, lesson_kinds, injected)
+            _note_tests_not_run(root, cfg, task)
             return results, reply, tests_ok
         ok, out, desc = got
+        last_out = out
         if not ok:
             _note_repair_failure(pending_lesson, "tests", out,
                                  seen=lesson_kinds,
@@ -2145,6 +2330,7 @@ def _post_edit_tests(root, cfg, agent, idx, task, results, reply, backup_dir,
         # a genuinely worse count (including output with no parseable ids)
         # keeps the old score-based guard.
         should_repair = bool(diff.new) or score > base_score
+        last_worse = should_repair
         # Baseline-aware verdict (R2): with no in-run baseline to diff
         # against, the cross-run command history is the only baseline there
         # is. When it recorded this exact command failing before the run,
@@ -2182,6 +2368,15 @@ def _post_edit_tests(root, cfg, agent, idx, task, results, reply, backup_dir,
         results = _merge_repair_results(results, new)
         reply = (reply.rstrip() + "\n\n" + fixed)
         changed = sorted({fileio_norm(r.file) for r in results if r.ok})
+    if tests_ok is False and last_worse and last_out \
+            and _SEMANTIC_FAILURE_RE.search(last_out):
+        # The patch parses but does not WORK, and the repair rounds could not
+        # mend it: a stronger model is the next rung, not a third local retry.
+        _suggest_escalation(
+            root, cfg,
+            "tests still fail with runtime/semantic errors (a TypeError, a "
+            "failed assertion, or a loop that never ends) after the repair "
+            "rounds; the edits apply but the code does not work")
     _note_lesson_run(root, cfg, lesson_kinds, injected)
     return results, reply, tests_ok
 
@@ -2684,12 +2879,43 @@ def run_investigation_task(root: Path, cfg, agent, idx, task: str, *,
                       live_kinds=_live_kinds_of(agent))
 
 
+def _suggest_escalation(root, cfg, reason: str, *, pending: bool = False) -> None:
+    """Record ONE escalation reason (the first wins) and surface it as an
+    `escalation_suggested` event even when no `escalate` role is configured --
+    the signal is useful to a human or an outer orchestrator either way.
+    `pending` stores the reason for the NEXT task (the per-profile zero-edit
+    statistic is only known after this task's ladder has finished)."""
+    slot = "_pending_escalation_reason" if pending else "_task_escalation_reason"
+    if getattr(cfg, slot, ""):
+        return
+    setattr(cfg, slot, reason)
+    try:
+        events_mod.get(root, cfg).emit(
+            "escalation_suggested", reason=reason,
+            profile=getattr(cfg, "active_profile", "") or "")
+    except Exception:
+        pass
+    print(f"  [escalation suggested: {reason}]", file=sys.stderr)
+
+
+# Runtime/semantic failure shapes in test output: the patch PARSES but does
+# not WORK (wrong types, missing names, failed assertions, a loop that never
+# ends). SyntaxError is deliberately absent -- that is the syntax gate's job,
+# and a parse failure is a different repair skill, not a stronger-model case.
+_SEMANTIC_FAILURE_RE = re.compile(
+    r"\bTypeError\b|\bReferenceError\b|\bRangeError\b|\bRecursionError\b"
+    r"|\bAssertionError\b|\bassertion failed\b|\binfinite loop\b"
+    r"|\bmaximum call stack\b|\bstack overflow\b", re.IGNORECASE)
+
+
 def run_task(root: Path, cfg, client, agent, idx, task: str, *,
              apply: bool = True, review: bool = False,
              answer_system: str | None = None) -> TaskResult:
     """`_run_ladder`, plus failure memory: a task that ends without a usable
     edit is remembered (files looked at, why) so a similar later task is warned
-    off the same dead end; a success clears the warning."""
+    off the same dead end; a success clears the warning. Zero-edit runs are
+    also counted per profile: once `escalation_zero_edit_runs` accumulate, the
+    next task carries an escalation suggestion into its ladder."""
     from . import memory as memory_mod
     if not getattr(cfg, "_auto_step", 0):
         # Standalone task (ask/chat/eval): no outer loop owns the static or
@@ -2697,6 +2923,7 @@ def run_task(root: Path, cfg, client, agent, idx, task: str, *,
         # record a fresh snapshot for this task.
         cfg._static_baseline = None
         cfg._contract_baseline = None
+        cfg._dom_baseline = None
     tr = _run_ladder(root, cfg, client, agent, idx, task, apply=apply,
                      review=review, answer_system=answer_system)
     if answer_system is not None or review or not getattr(cfg, "use_memory", True):
@@ -2704,12 +2931,31 @@ def run_task(root: Path, cfg, client, agent, idx, task: str, *,
     try:
         if any(r.ok for r in tr.results) or tr.changed or _is_noop(tr.reply):
             memory_mod.clear_attempts(root, task)
+            memory_mod.clear_zero_edit(root, cfg)
+            # The profile un-stuck itself: drop this task's lease strikes and
+            # any escalation suggestion its earlier failures queued up.
+            strikes = getattr(cfg, "_lease_strikes", None)
+            if strikes:
+                strikes.pop(" ".join((task or "").split())[:200], None)
+            if getattr(cfg, "_pending_escalation_reason", ""):
+                cfg._pending_escalation_reason = ""
         else:
             looked = [ln.split(None, 2)[-1][:60] for ln in tr.steps
                       if " read " in f" {ln} "][:4]
             why = ("fabricated edits" if tr.fabricated
                    else "no valid edit was produced")
             memory_mod.note_attempt(root, task, why, looked)
+            threshold = int(getattr(cfg, "escalation_zero_edit_runs", 3) or 0)
+            if threshold > 0:
+                n = memory_mod.note_zero_edit(root, cfg)
+                if n >= threshold:
+                    profile = getattr(cfg, "active_profile", "") or "(default)"
+                    _suggest_escalation(
+                        root, cfg,
+                        f"{n} consecutive zero-edit runs on profile "
+                        f"'{profile}'; a stronger model may succeed where "
+                        "this one keeps producing no usable edit",
+                        pending=True)
     except Exception:
         pass
     return tr
@@ -2721,12 +2967,20 @@ def _run_ladder(root: Path, cfg, client, agent, idx, task: str, *,
     """`_run_task_once`, plus the bounded recovery ladder: an unreachable or
     failing worker falls over to the `fallback` role's model, and a task that
     ends with NO edit applied gets one more attempt on the `escalate` role's
-    (stronger) model. Each rung is used at most once per task, and only when
-    that role is configured, so a local model's bad day cannot silently burn a
-    hosted budget."""
+    (stronger) model. A recorded escalation reason (two no-progress leases, a
+    semantic test failure that outlived the repair rounds, or the per-profile
+    zero-edit statistic) earns the same retry even when edits DID land -- a
+    patch that applies but does not work is still a failed task. Each rung is
+    used at most once per task, and only when that role is configured, so a
+    local model's bad day cannot silently burn a hosted budget."""
     from . import roles as roles_mod
     from .llm import BudgetExceeded, CancelledError
     cfg._task_mutations = []      # a fresh gather-mutation ledger per task
+    # A reason queued by the previous task's failure memory (the zero-edit
+    # statistic) carries into this task; reasons recorded DURING this task
+    # (lease strikes, semantic failures) join it, first reason wins.
+    cfg._task_escalation_reason = getattr(cfg, "_pending_escalation_reason", "")
+    cfg._pending_escalation_reason = ""
     kw = dict(apply=apply, review=review, answer_system=answer_system)
     try:
         tr = _run_task_once(root, cfg, client, agent, idx, task, **kw)
@@ -2744,7 +2998,29 @@ def _run_ladder(root: Path, cfg, client, agent, idx, task: str, *,
                               **kw)
     if answer_system is not None or review:
         return tr
+    if not getattr(cfg, "auto_escalate", True):
+        return tr
     esc = roles_mod.client_for(cfg, "escalate", client)
+    reason = getattr(cfg, "_task_escalation_reason", "")
+    if reason and apply and esc is not client:
+        print(f"\n[escalation suggested ({reason}); one more attempt on the "
+              "`escalate` role's model]", file=sys.stderr)
+        workspace.log_event(root, f"escalating task to the escalate role: "
+                                  f"{reason}", "WARN")
+        from .agent import Agent
+        tr2 = _run_task_once(root, cfg, esc, Agent(tr.idx, esc, cfg), tr.idx,
+                             task, **kw)
+        landed2 = any(r.ok for r in tr2.results) or bool(tr2.changed)
+        if not landed2:
+            return tr
+        landed1 = tr.applied and (any(r.ok for r in tr.results) or tr.changed)
+        # Keep the first attempt only when it landed a GREEN result and the
+        # escalated one came back red; otherwise the stronger model's work
+        # wins (it was asked precisely because the first verdict was broken).
+        if landed1 and getattr(tr, "tests_ok", None) is True \
+                and getattr(tr2, "tests_ok", None) is False:
+            return tr
+        return tr2
     if esc is client or (tr.applied
                          and (any(r.ok for r in tr.results) or tr.changed)):
         return tr
@@ -2803,6 +3079,7 @@ def _run_task_once(root: Path, cfg, client, agent, idx, task: str, *,
     gather_mut = list(getattr(cfg, "_task_mutations", None) or ())
     tests_ok = None
     print("--- answering ---\n", file=sys.stderr)
+    from . import verify as verify_mod
     findings: list = []
     truncated = False
     refusal = ""
@@ -2841,6 +3118,8 @@ def _run_task_once(root: Path, cfg, client, agent, idx, task: str, *,
         if edit_files and getattr(cfg, "verify_tests", False) \
                 and getattr(cfg, "allow_shell", False):
             baseline_tests = _run_tests(idx, cfg, edit_files)
+            _note_baseline_lesson_run(root, cfg, baseline_tests)
+        _capture_dom_baseline(root, cfg, edit_files)
         lint_baseline: dict = {}
         if getattr(cfg, "post_edit_check", True):
             try:
@@ -2869,6 +3148,7 @@ def _run_task_once(root: Path, cfg, client, agent, idx, task: str, *,
                     root, f"incremental batch PARTIALLY applied: {landed} of "
                           f"{len(results)} block(s) landed; not applied: "
                           f"{missing}", "WARN")
+            findings = verify_mod.dedupe_findings(findings)
             for f in findings:
                 workspace.log_event(root, f"verify: {f.render()}",
                                     "WARN" if f.severity == "warn" else "ERROR")
@@ -2896,6 +3176,7 @@ def _run_task_once(root: Path, cfg, client, agent, idx, task: str, *,
             # placeholders, stale references, unaddressed requirements.
             if hasattr(agent, "preflight"):
                 raw_reply, findings = agent.preflight(task, raw_reply, gathered)
+                findings = verify_mod.dedupe_findings(findings)
                 for f in findings:
                     workspace.log_event(root, f"verify: {f.render()}",
                                         "WARN" if f.severity == "warn"
@@ -2936,6 +3217,9 @@ def _run_task_once(root: Path, cfg, client, agent, idx, task: str, *,
                     cfg, "verify_tests", False) \
                     and getattr(cfg, "allow_shell", False):
                 baseline_tests = _run_tests(idx, cfg, edit_files)
+                _note_baseline_lesson_run(root, cfg, baseline_tests)
+            if apply and not review:
+                _capture_dom_baseline(root, cfg, edit_files)
             if pre.denied:
                 print(f"  [edits blocked by a pre_edit hook: {pre.message}]",
                       file=sys.stderr)
@@ -3020,21 +3304,40 @@ def _run_task_once(root: Path, cfg, client, agent, idx, task: str, *,
             workspace.log_event(
                 root, f"{'applied' if r.ok else 'FAILED'} {r.file}: {r.message}",
                 "ERROR" if not r.ok else "INFO")
+    # R8 provenance for the result frame (BUG-215): the tracker's clause map
+    # used to reach only the review page; JSONL/RPC clients got bare edits.
+    tracker = getattr(agent, "requirements", None)
+    clauses: dict = {}
+    clause_texts: dict = {}
+    unaccepted: list = []
+    if tracker is not None and getattr(tracker, "task", "") == task:
+        clauses = tracker.clause_map()
+        clause_texts = tracker.clause_texts()
+        unaccepted = [req.req_id or req.text for req in tracker
+                      if req.is_edit and req.state in (
+                          verify_mod.REQ_UNLOCATED, verify_mod.REQ_LOCATED,
+                          verify_mod.REQ_READ)]
+    # One finding per clause, not per gate that re-checked it (BUG-207).
+    findings = verify_mod.dedupe_findings(findings)
     applied = False
     if review:
         if not parse_edits(reply):
             print("\n  The model proposed no edits.", file=sys.stderr)
-        tracker = getattr(agent, "requirements", None)
-        clauses = clause_texts = None
-        if tracker is not None and getattr(tracker, "task", "") == task:
-            clauses = tracker.clause_map()
-            clause_texts = tracker.clause_texts()
         results = _review(root, results, task, cfg, backup_dir, when,
                           clauses=clauses, clause_texts=clause_texts)
         applied = any(r.ok and "applied" in r.message for r in results)
     else:
         _report(results, dry_run=not apply)
-        applied = apply
+        # `applied` means "at least one edit landed", not "apply mode was
+        # on": a run whose every block failed wrote nothing (BUG-212).
+        # Gather-phase mutations count as landed work too.
+        applied = bool(apply and (any(r.ok for r in results) or gather_mut))
+        if apply and results and not applied:
+            print(f"\n[NOTHING APPLIED: all {len(results)} edit target(s) "
+                  "failed; zero files were changed]", file=sys.stderr)
+            workspace.log_event(
+                root, f"NOTHING APPLIED: all {len(results)} edit target(s) "
+                      "failed", "ERROR")
 
     changed: list[str] = []
     if applied:
@@ -3084,7 +3387,10 @@ def _run_task_once(root: Path, cfg, client, agent, idx, task: str, *,
     events_mod.get(root, cfg).emit(
         "result", _full=True, task=task[:200], reply=reply, applied=applied,
         edits=[{"file": r.file, "ok": r.ok, "message": r.message,
-                "diff": r.diff} for r in results])
+                "diff": r.diff,
+                "clauses": list(clauses.get(fileio_norm(r.file), ()))}
+               for r in results],
+        clause_texts=clause_texts, unaccepted=unaccepted)
     if stats.get("calls"):
         print(f"[task: {stats['calls']} calls, {stats['prompt_tokens']:,} "
               f"in / {stats['completion_tokens']:,} out tokens, cache hit "
@@ -3100,7 +3406,9 @@ def _run_task_once(root: Path, cfg, client, agent, idx, task: str, *,
                       backup_dir=backup_dir,
                       live_ok=getattr(agent, "live_evidence_ok", None),
                       live_kinds=_live_kinds_of(agent),
-                      findings=findings, stats=stats, tests_ok=tests_ok)
+                      findings=findings, stats=stats, tests_ok=tests_ok,
+                      clauses=clauses, clause_texts=clause_texts,
+                      unaccepted=unaccepted)
 
 
 # Corrective re-runs are one-shot: a second identical failure is a verdict,
@@ -3178,6 +3486,17 @@ _NOOP_EDIT_RETRY_NOTE_MOVE = (
     "Never retype the file's contents. If the task is genuinely already "
     "complete, write exactly `No changes: <reason>` as your first line and "
     "emit no blocks.")
+
+_NOOP_EVIDENCE_RETRY_NOTE = (
+    "### RETRY -- THE PREVIOUS ATTEMPT CLAIMED 'ALREADY COMPLETE' WITH NO "
+    "EVIDENCE\n"
+    "This exact task was already attempted and answered that the work was "
+    "already done -- without editing anything AND without reading the code "
+    "the task names. A completion claim is only as good as the evidence "
+    "behind it. Look up the task's actual targets now (read the file or "
+    "function it names), then either do the work or -- only if the code you "
+    "READ proves it -- write exactly `No changes: <reason>` as your first "
+    "line, citing what you read.")
 
 
 def run_loop(root: Path, cfg, client, idx, plan_path: Path, *,
@@ -3793,6 +4112,42 @@ def run_loop(root: Path, cfg, client, idx, plan_path: Path, *,
                     mark_failed(plan_path, task)
                     continue
             if _is_noop(tr.reply):
+                # "Already complete" is a CLAIM about the code, and prose
+                # alone is not evidence (BUG-202): a broken task title once
+                # let "the function is already correct" tick a step whose
+                # function was wrong. Demand at least one edit clause the
+                # run actually READ before ticking it done. Report-only
+                # tasks have no edit clauses; repairs stay exempt because
+                # the check that retries after them does the observing.
+                from . import verify as verify_mod
+                tracker = getattr(agent, "requirements", None)
+                edit_reqs = [r for r in (tracker or ()) if r.is_edit]
+                read_states = (verify_mod.REQ_READ, verify_mod.REQ_EDITED,
+                               verify_mod.REQ_VERIFIED, verify_mod.REQ_REPORTED)
+                if (task != _REMEDIATION_TITLE and edit_reqs
+                        and not any(r.state in read_states for r in edit_reqs)):
+                    tries = retried.get(task, 0)
+                    if tries < _MAX_TASK_RETRIES:
+                        retried[task] = tries + 1
+                        retry_note[:] = [_NOOP_EVIDENCE_RETRY_NOTE]
+                        print("  [no-op claim with no read evidence -- "
+                              "retrying it once]", file=sys.stderr)
+                        workspace.log_event(
+                            root, "no-op claim lacked requirement evidence; "
+                                  "retrying once", "WARN")
+                        continue
+                    print(f"  [no-op claim with no read evidence twice; "
+                          f"marking it failed -- "
+                          f"{'stopping' if stop_on_fail else 'continuing'}]",
+                          file=sys.stderr)
+                    workspace.log_event(
+                        root, "no-op claim lacked requirement evidence on "
+                              "retry; marking failed", "ERROR")
+                    failed += 1
+                    if stop_on_fail:
+                        break
+                    mark_failed(plan_path, task)
+                    continue
                 print("  [model reports the task is already complete; "
                       "marking it done]", file=sys.stderr)
                 workspace.log_event(root, "task already complete (no-op)")

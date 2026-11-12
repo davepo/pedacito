@@ -180,7 +180,7 @@ model = "qwen3-1.7b"
 | `verifier` | Adversarial check of an answer before it is written | Thinking on for 16 GB and up, or a hosted model |
 | `repair` | Fixes failed edits and test failures | Usually the worker. Thinking can help with format errors |
 | `summarizer` | One-line summaries and compaction | The worker, or a tiny local model if you measured the gain |
-| `escalate` | One more attempt on a larger model when a task applied no edit | A larger local or hosted model |
+| `escalate` | One more attempt on a larger model when a task failed: no edit landed, a semantic test failure outlived repair, two no-progress leases, or repeated zero-edit runs | A larger local or hosted model |
 | `fallback` | Takes over when the worker errors out | A hosted or larger model |
 
 Each escalation rung is used at most once per task, and only when configured, so
@@ -188,6 +188,19 @@ a bad local run cannot quietly spend a hosted budget. Use `--role planner=big` t
 route one job for a single run. `pedacito profiles --recommend` suggests a
 profile for each role, using measured scores, and `--apply-roles` writes the
 choice after you confirm it.
+
+Escalation is reason-based (`auto_escalate`, on by default): a patch that
+applies but does not work earns the retry too. The reasons are tests still
+failing with runtime/semantic errors (a TypeError, a failed assertion, an
+infinite loop) after the repair rounds, two no-progress leases on one task,
+and `escalation_zero_edit_runs` consecutive zero-edit runs on the active
+profile (default 3; counted per profile in `.pedacito/profile_stats.json`,
+0 disables the statistic). Every reason emits an `escalation_suggested`
+event even when no `escalate` role is configured, so watch for it before
+spending on a hosted rung: it names WHICH failure shape keeps recurring. A
+profile that keeps suggesting escalation on zero-edit runs usually wants a
+better prompt pack or a larger worker, not more retries -- the rung still
+fires at most once per task, and a success clears the profile's count.
 
 Hosted models receive the task text and the code excerpts the task needs. Pedacito
 warns before sending a task that appears to contain a secret. Cap spending with

@@ -1641,7 +1641,128 @@ partial accept flags any clause none of whose files was accepted
 (`unaccepted`), recording it in the sign-off detail and the chat. Provenance is
 computed from the same deterministic edit evidence the tracker already gathers.
 
-## Quick reference: techniques 5, 11, 17 to 39
+## Upgrade paths (validation report 2)
+
+The second validation pass (`PEDACITO_VALIDATION_REPORT_2.md`) named six
+outstanding upgrade paths. Each is implemented as a deterministic, harness-side
+mechanism -- no extra model calls -- and each is covered by
+`tests/test_upgrade_paths.py` (U1–U5) and `tests/test_domcheck.py` (U6).
+
+### 40. Escalation policy: know when a profile will not unstick itself (U1)
+
+A small model can stall in ways that retrying on the *same* profile will not
+fix: it re-picks an identical read-only step until the lease dies, spends lease
+after lease with no progress, produces edits that apply but fail at runtime, or
+ends run after run with zero edits. The harness now recognises each shape and
+suggests the `escalate` rung instead of burning a third local attempt:
+
+- **Repeat suppression.** An identical read-only step is skipped outright after
+  the first repeat (its result cannot change); mutating steps stay dispatchable.
+- **Two-lease strikes.** Two no-progress leases on one task (across its
+  attempts) are an escalation signal; a success clears the task's strikes.
+- **Semantic-failure signal.** Test output that still fails after the repair
+  rounds with a runtime shape -- `TypeError`, `ReferenceError`, `RangeError`,
+  `RecursionError`, a failed assertion, an infinite loop / max call stack -- and
+  that this task made worse, is an escalation signal. `SyntaxError` is
+  deliberately excluded: a parse failure is the syntax gate's repair skill, not
+  a stronger-model case.
+- **Per-profile zero-edit statistic.** `.pedacito/profile_stats.json` counts
+  zero-edit runs per profile; `escalation_zero_edit_runs` (default 3) in a row
+  queues the suggestion for the next task. A landed edit clears the counter.
+
+One `escalation_suggested` event is emitted per task (the first reason wins)
+even when no `escalate` role is configured, so a human or an outer orchestrator
+still sees the signal. When the role IS configured and `auto_escalate` is on,
+the ladder re-runs the task ONCE on the stronger model -- even if edits landed,
+because a patch that applies but does not work is still a failed task. It keeps
+the first attempt only when that one was green and the escalated one came back
+red. Turn it off with `auto_escalate = false` (and
+`escalation_zero_edit_runs = 0` for the statistic alone).
+
+### 41. Context-pressure edit discipline (U2)
+
+On a small window, a model asked to change a large file re-emits the WHOLE file;
+the draft is cut off mid-file and drops working wiring (the GLM-4.7-Flash
+Phase-5a shape, the static half of BUG-216). Two deterministic guards close it:
+
+- **The brief.** When the effective window is at or below `small_context_tokens`
+  (default 16384), the answer brief demands the forms that fit -- small
+  SEARCH/REPLACE blocks, a SYMBOL anchor with the full new definition, or
+  successive append chunks -- and names the task's files already over the
+  ceiling (`prompts.small_window_note`).
+- **The gate.** `Result.whole_file` marks an empty-SEARCH overwrite or a LINES
+  range covering every line. `verify.check_oversized_rewrite` refuses a
+  whole-file draft larger than `max_whole_file_lines` (default 120) BEFORE it can
+  land -- error by default, warn only when the task explicitly asks to rewrite
+  that very file. It runs in preflight and in the incremental dry-apply veto, so
+  the oversized draft never reaches disk.
+
+Turn it off with `small_context_tokens = 0`.
+
+### 42. Numeric-SEARCH auto-reanchor (U3)
+
+A tiny-profile slip is to quote the `read`'s line-number prefix (`4`) as the
+SEARCH body instead of the line's text. The block then matches nothing and
+burns a whole retry round. When a SEARCH body is digits only AND does not occur
+literally in the file, the harness reads it as `LINES n-n` and applies the
+replacement to that exact line, noting the reanchor in the receipt. A number
+that DOES occur literally keeps normal text-match semantics, and an
+out-of-range number is refused with a teaching message that shows the real line
+count. Deterministic; saves the retry. Well-formed blocks are unaffected.
+
+### 43. Naming the prose-vs-edit gap (U4, extends §35)
+
+A model can describe a feature in prose ("I will add `compute_tax`...") and emit
+no edit for it; a generic "unaddressed" finding does not tell it that
+description is not implementation. `Requirement.prose_only` now marks an edit
+clause whose terms appear in the answer's prose but in no edit, and
+`check_coverage` renders it explicitly: "you described 'X' in prose but no edit
+implements it -- description is not implementation, emit the edit for it."
+`coverage_seeds` carries the same wording into the follow-up intent's
+`intended_change`, so the second pass is aimed at the gap rather than a vague
+"finish the task". A clause absent from both prose and edits keeps the generic
+wording.
+
+### 44. Shrinking micro-loop retry budgets (U5)
+
+In the incremental edit loop a rejected hunk used to be re-asked at the full
+answer cap, so a model re-emitting the same failing draft burned the whole
+budget on every attempt. Now the first attempt gets the full answer budget and
+each re-ask halves it, with a floor of 2048 so one real block still fits:
+attempt `k` gets `max(2048, full // (2*k))`. It is the same discipline as the
+repair rounds, applied per hunk, and it bounds the cost of a stuck micro-loop
+without reducing the number of attempts (`repair_rounds` still sets that).
+
+### 45. The headless DOM smoke check (U6)
+
+`webcheck` (§23) proves the STATIC contracts a browser enforces at load; it
+cannot prove the page actually MOUNTS. A replaced entry module can leave the
+page silently unmounted -- the runtime half of BUG-216 -- and no regex notices.
+`pedacito domcheck` is the separate, heavier runtime tool:
+
+- It serves the project over a loopback-only HTTP server (ES modules refuse
+  `file://`, so the page needs a real origin) and loads the entry page in
+  headless Chromium via Playwright.
+- It reports uncaught page errors and failed same-origin loads (a module that
+  404s takes the whole graph down), and flags interactive controls with no
+  listener, inline handler, or delegation -- conservatively: any binding on the
+  control, an ancestor, or `document`/`window` suppresses the finding.
+- It snapshots the mounted surface (element identities, controls, text volume)
+  and can diff it against a pre-edit snapshot (`--snapshot` then `--baseline`),
+  catching the regression shape where named elements / controls disappear or
+  the visible text collapses.
+
+In-run, `verify_dom` AND `allow_shell` gate applied web edits on it: a pre-edit
+baseline is captured, and only NEW errors / lost mounted UI feed a micro-repair
+round (pre-existing page errors are not blamed on the task). It is opt-in and
+permission-gated because it executes project code -- the same boundary as the
+test subprocess; an explicit `pedacito domcheck` invocation is itself the
+consent. A missing Playwright install reports an honest install hint, never a
+false green. `webcheck` stays regex-only and notice-level; this tool's errors
+can drive repair. Off by default (`verify_dom = false`); `ask --verify-dom`
+flips it per run, `dom_entry` / `dom_timeout` tune it.
+
+## Quick reference: techniques 5, 11, 17 to 45
 
 | Technique | Section | How to turn it off | Where you see it |
 |---|---|---|---|
@@ -1672,6 +1793,12 @@ computed from the same deterministic edit evidence the tracker already gathers.
 | CLI / how-index drift guard | §37 | Test-only; no run-time cost | `tests/test_how.py` derives the command set from `cli.build_parser()`; a subcommand without a how-card fails the suite |
 | Config-editor round-trip property test | §38 | Test-only; no run-time cost | Seeded generative shapes in `tests/test_config_editor.py` (comments, strings, tables); guards `set_values` / `remove_profile` / `add_profile` |
 | Review hunk provenance (clause badges) | §39 | No flag | `R1`, `R2`, … badges per file on the review page and in the GUI; a partial accept flags clauses whose files were all rejected |
+| Escalation policy (repeat suppression, lease strikes, semantic signal, zero-edit statistic) | §40 | `auto_escalate = false`; `escalation_zero_edit_runs = 0` for the statistic | `escalation_suggested` events; `.pedacito/profile_stats.json`; one retry on the `escalate` role's model |
+| Context-pressure edit discipline (whole-file ceiling) | §41 | `small_context_tokens = 0` | The `CONTEXT PRESSURE` answer brief; `oversized_rewrite` findings before an oversized whole-file draft can land |
+| Numeric-SEARCH auto-reanchor | §42 | No flag (a recovery; well-formed blocks are unaffected) | A `numeric SEARCH auto-reanchored to LINES n-n` receipt note |
+| Prose-vs-edit gap naming | §43 | No flag (wording refinement of the coverage check) | "you described 'X' in prose but no edit implements it" coverage findings and follow-up intents |
+| Shrinking micro-loop retry budgets | §44 | No flag (a budget bound; `repair_rounds` still sets attempts) | Each rejected incremental hunk is re-asked at half the previous token cap (floor 2048) |
+| Headless DOM smoke check (`domcheck`) | §45 | `verify_dom = false` (default); the CLI is explicit consent | `pedacito domcheck`; `dom gate` findings after applied web edits; `--snapshot`/`--baseline` mounted-surface diff |
 
 ## Techniques that exist but are not a good fit
 
