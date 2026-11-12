@@ -393,7 +393,7 @@ def test_run_loop_rolls_back_the_failed_step(tmp_path, monkeypatch):
     cfg.static_gate = False
 
     def fake_run_task(root, cfg_, client, agent, idx_, task, apply=True,
-                      review=False, answer_system=None):
+                      review=False, answer_system=None, is_repair=False):
         title = task.split("\n\n")[0]
         if title == "Build module one":
             _pw(root / "a.py", "GOOD = 1\n")
@@ -431,7 +431,7 @@ def test_run_loop_ratchet_off_leaves_the_wreckage(tmp_path, monkeypatch):
     cfg.auto_green_ratchet = False
 
     def fake_run_task(root, cfg_, client, agent, idx_, task, apply=True,
-                      review=False, answer_system=None):
+                      review=False, answer_system=None, is_repair=False):
         title = task.split("\n\n")[0]
         if title == "Build module one":
             _pw(root / "a.py", "GOOD = 1\n")
@@ -458,7 +458,7 @@ def test_run_loop_keeps_checkpoints_when_checks_pass(tmp_path, monkeypatch):
     cfg.static_gate = False
 
     def fake_run_task(root, cfg_, client, agent, idx_, task, apply=True,
-                      review=False, answer_system=None):
+                      review=False, answer_system=None, is_repair=False):
         _pw(root / "f.py", task.split("\n\n")[0] + "\n")
         return loop.TaskResult([Result(True, "f.py", "applied")],
                                "done", True, ["f.py"], idx_)
@@ -484,7 +484,7 @@ def test_run_loop_step_static_gate_blocks_the_verify_subprocess(
     _force_ast(monkeypatch)
 
     def fake_run_task(root, cfg_, client, agent, idx_, task, apply=True,
-                      review=False, answer_system=None):
+                      review=False, answer_system=None, is_repair=False):
         (root / "h.py").write_text(BROKEN)
         return loop.TaskResult([Result(True, "h.py", "applied")],
                                "done", True, ["h.py"], idx_)

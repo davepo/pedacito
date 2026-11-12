@@ -53,7 +53,7 @@ def test_partial_edit_reported_at_task_and_run_level(tmp_path, monkeypatch,
     cfg = _cfg()
 
     def fake_run_task(root, cfg_, client, agent, idx_, task, apply=True,
-                      review=False, answer_system=None):
+                      review=False, answer_system=None, is_repair=False):
         _pw(root / "a.py", "GOOD = 1\n")
         return loop.TaskResult(
             [Result(True, "a.py", "applied"),
@@ -80,7 +80,7 @@ def test_partial_edit_final_summary_mentions_partial_tasks(tmp_path,
     cfg = _cfg()
 
     def fake_run_task(root, cfg_, client, agent, idx_, task, apply=True,
-                      review=False, answer_system=None):
+                      review=False, answer_system=None, is_repair=False):
         _pw(root / "a.py", "GOOD = 1\n")
         return loop.TaskResult(
             [Result(True, "a.py", "applied"),
@@ -107,7 +107,7 @@ def _two_task_ratchet(tmp_path, monkeypatch):
     cfg = _cfg()
 
     def fake_run_task(root, cfg_, client, agent, idx_, task, apply=True,
-                      review=False, answer_system=None):
+                      review=False, answer_system=None, is_repair=False):
         title = task.split("\n\n")[0]
         if title == "Fix module one":
             _pw(root / "a.py", "OK\n")
@@ -169,7 +169,7 @@ def test_verify_final_rolls_back_only_the_last_step_when_it_fails(tmp_path,
     cfg = _cfg()
 
     def fake_run_task(root, cfg_, client, agent, idx_, task, apply=True,
-                      review=False, answer_system=None):
+                      review=False, answer_system=None, is_repair=False):
         title = task.split("\n\n")[0]
         if title == "Fix module one":
             _pw(root / "a.py", "GOOD = 1\n")

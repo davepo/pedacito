@@ -303,8 +303,14 @@ def _is_effort_model(model: str) -> bool:
 def _always_thinks(model: str) -> bool:
     """Families with no off switch. Hosted Kimi K2.7/K3 reject a disabled
     thinking object; LFM2.5-24B-A2B and GPT-OSS still reason at low effort."""
-    return _has(model, "kimi-k2.7", "kimi-k3", "kimi-k2-thinking",
-                "lfm2.5-24b-a2b", "gpt-oss", "gptoss")
+    if _has(model, "kimi-k2.7", "kimi-k3", "kimi-k2-thinking",
+            "gpt-oss", "gptoss"):
+        return True
+    # LFM2.5-24B-A2B: servers spell the version with a dot, a hyphen or an
+    # underscore (lfm2.5 / lfm2-5 / lfm-2.5), in any case. Canonicalise so
+    # every spelling of the same always-reasoning model is recognised
+    # (BUG-316).
+    return "lfm2524ba2b" in re.sub(r"[.\-_]", "", (model or "").lower())
 
 
 def thinking_suffix_for(cfg) -> str:
@@ -632,6 +638,17 @@ _SEED_REFLECT_PAIR_RE = re.compile(
 _SEED_REFLECT_CLOSE_RE = re.compile(
     r"</seed:cot_budget_reflect>", re.IGNORECASE)
 
+# Some chat templates (LFM2.5 on Lemonade) emit a tool-call attempt as plain
+# text wrapped in pipe sentinels: <|tool_call_start|>[read(...)]<|tool_call_end|>.
+# It is neither an answer nor an edit block; left in, it is stored and echoed
+# as the assistant reply and fed into the next turn (BUG-317). Drop the whole
+# span, then an unterminated start (cut mid-call), then any stray sentinel.
+_TOOL_CALL_BLOCK_RE = re.compile(
+    r"<\|tool_call_start\|>.*?<\|tool_call_end\|>", re.DOTALL | re.IGNORECASE)
+_TOOL_CALL_UNCLOSED_RE = re.compile(
+    r"<\|tool_call_start\|>.*", re.DOTALL | re.IGNORECASE)
+_TOOL_CALL_SENTINEL_RE = re.compile(r"<\|tool_call_[a-z_]*\|>", re.IGNORECASE)
+
 # GPT-OSS harmony: <|channel|>analysis<|message|>...<|end|>. Servers with a
 # reasoning parser move the analysis channel to reasoning_content; a raw
 # llama.cpp stream leaves it in content, so pull out the final channel.
@@ -741,6 +758,9 @@ def strip_reasoning(text: str) -> str:
     out = _SEED_THINK_UNCLOSED_RE.sub("", out)
     out = _SEED_REFLECT_PAIR_RE.sub("", out)
     out = _SEED_REFLECT_CLOSE_RE.sub("", out)
+    out = _TOOL_CALL_BLOCK_RE.sub("", out)
+    out = _TOOL_CALL_UNCLOSED_RE.sub("", out)
+    out = _TOOL_CALL_SENTINEL_RE.sub("", out)
     return out.strip()
 
 
@@ -1555,12 +1575,49 @@ class LLMClient:
             # answer. Retry up to twice here, then hand the "" back to the
             # callers' own fallbacks.
             empty_streak += 1
+            always = _always_thinks(_model_name(self.cfg))
             if empty_streak > 2:
+                if always and self.last_reasoning_chars:
+                    raise LLMError(self._always_thinks_fit_error(max_tokens))
                 return text
             effective_thinking_off = (disable_thinking
                                       if disable_thinking is not None
                                       else self.cfg.disable_thinking)
-            if self.last_reasoning_chars and not effective_thinking_off:
+            if always and self.last_reasoning_chars:
+                # BUG-316: this family has no thinking off switch -- the server
+                # ignores disable_thinking, so re-rolling "with thinking
+                # disabled" is the identical call and burns the run. The empty
+                # answer is a budget runaway: give the reply more room so
+                # reasoning can finish AND an answer emit. The ceiling is the
+                # smaller of the answer-budget cap and the window's reply
+                # headroom (the loop top re-fits to that headroom every pass,
+                # so escalating past it would just be lowered again). When no
+                # room is left, report a model-fit error instead of retrying a
+                # known-futile call.
+                from .config import is_hosted
+                if is_hosted(self.cfg):
+                    mot = int(getattr(self.cfg, "max_output_tokens", 0) or 0)
+                    cap = (max(mot, max_tokens) if mot > 0 else
+                           max(65536, self.cfg.max_tokens_answer,
+                               max_tokens * 8))
+                else:
+                    usable = self.cfg.context_tokens - self.cfg.reserve_tokens
+                    cap = min(max(2048, self.cfg.reserve_tokens,
+                                  self.cfg.max_tokens_answer, max_tokens * 4),
+                              max(usable, max_tokens))
+                window = self.cfg.context_tokens
+                if window > 0 and not _is_remote(self.cfg.base_url):
+                    total = estimate_messages(messages, self.estimate_tokens)
+                    cap = min(cap, max(256, window - total - 32))
+                cap = max(cap, max_tokens)
+                nxt = min(max_tokens * 2, cap)
+                if nxt > max_tokens:
+                    max_tokens = nxt
+                    how = (f" with a larger budget (max_tokens={max_tokens}; "
+                           "this model always reasons)")
+                else:
+                    raise LLMError(self._always_thinks_fit_error(max_tokens))
+            elif self.last_reasoning_chars and not effective_thinking_off:
                 # Thinking runaway: re-rolling would think again; switch
                 # thinking off instead.
                 disable_thinking = True
@@ -1572,6 +1629,20 @@ class LLMClient:
                   f"finish '{self.last_finish_reason or 'stop'}'); "
                   f"retrying{how}]", file=sys.stderr)
             time.sleep(1.0)
+
+    def _always_thinks_fit_error(self, max_tokens: int) -> str:
+        """The model-fit message for an always-reasoning model that spent its
+        whole reply budget on hidden reasoning without emitting an answer
+        (BUG-316). Disabling thinking cannot help this family."""
+        return (
+            f"'{self.cfg.model}' always reasons (it has no thinking off "
+            f"switch) and spent the whole {max_tokens}-token reply budget on "
+            f"hidden reasoning (~{self.last_reasoning_chars:,} chars) without "
+            f"emitting an answer.\n"
+            "  The context window is too small for this model. Raise "
+            "context_tokens / reserve_tokens / max_tokens_answer in its "
+            "profile, or pick a model with a larger window or a working "
+            "thinking off switch.")
 
     def _check_budget(self) -> None:
         """Raise BudgetExceeded before a call when a configured token/cost

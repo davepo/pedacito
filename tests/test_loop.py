@@ -772,7 +772,7 @@ def test_run_loop_marks_investigation_task_done_without_edits(tmp_path,
             "no output.", True, [], idx_)
 
     def fake_run_task(root, cfg, client, agent, idx_, task, apply=True,
-                      review=False, answer_system=None):
+                      review=False, answer_system=None, is_repair=False):
         calls.append(("edit", task))
         return _result(idx_)
 
@@ -806,7 +806,7 @@ def test_run_loop_fails_verify_task_that_gathered_no_evidence(tmp_path,
     calls = []
 
     def fake_run_task(root, cfg, client, agent, idx_, task, apply=True,
-                      review=False, answer_system=None):
+                      review=False, answer_system=None, is_repair=False):
         calls.append(("edit", task))
         return _result(idx_)
 
@@ -852,7 +852,7 @@ def test_run_loop_procedural_verify_retry_can_pass(tmp_path, monkeypatch):
     calls = []
 
     def fake_run_task(root, cfg, client, agent, idx_, task, apply=True,
-                      review=False, answer_system=None):
+                      review=False, answer_system=None, is_repair=False):
         calls.append(("edit", task))
         return _result(idx_)
 
@@ -898,7 +898,7 @@ def test_run_loop_edit_task_needs_evidence_when_title_says_verify(tmp_path,
     idx = types.SimpleNamespace(root=tmp_path)
 
     def fake_run_task(root, cfg, client, agent, idx_, task, apply=True,
-                      review=False, answer_system=None):
+                      review=False, answer_system=None, is_repair=False):
         return loop.TaskResult(
             [_ok()], "Applied the palette edit. I can't launch the browser "
                      "in this final phase, so I can't produce a live visual "
@@ -1059,7 +1059,7 @@ def test_run_loop_inserts_remediation_after_failed_verify(tmp_path, monkeypatch)
             steps=["1. browser python main.py [wait 3]  (Look again.)"])
 
     def fake_run_task(root, cfg, client, agent, idx_, task, apply=True,
-                      review=False, answer_system=None):
+                      review=False, answer_system=None, is_repair=False):
         repairs.append(task)
         return loop.TaskResult([_ok()], "Replaced the duplicated rows.",
                                True, ["a.py"], idx_,
@@ -1106,7 +1106,7 @@ def test_run_loop_remediation_rounds_are_bounded(tmp_path, monkeypatch):
             steps=["1. browser python main.py [wait 3]  (Look.)"])
 
     def fake_run_task(root, cfg, client, agent, idx_, task, apply=True,
-                      review=False, answer_system=None):
+                      review=False, answer_system=None, is_repair=False):
         return loop.TaskResult([_ok()], "Tried a fix.", True, ["a.py"],
                                idx_, steps=["1. read a.py L1-5  (Rows.)"])
 
@@ -1151,7 +1151,7 @@ def test_run_loop_retires_a_check_whose_repair_refused_to_edit(tmp_path,
             steps=["1. browser python main.py [wait 3]  (Look.)"])
 
     def fake_run_task(root, cfg, client, agent, idx_, task, apply=True,
-                      review=False, answer_system=None):
+                      review=False, answer_system=None, is_repair=False):
         if task.startswith("Repair the defect"):
             repairs.append(task)
             return loop.TaskResult(
@@ -1274,7 +1274,7 @@ def test_run_loop_edit_verify_task_needs_live_step(tmp_path, monkeypatch):
     idx = types.SimpleNamespace(root=tmp_path)
 
     def fake_run_task(root, cfg, client, agent, idx_, task, apply=True,
-                      review=False, answer_system=None):
+                      review=False, answer_system=None, is_repair=False):
         return loop.TaskResult([_ok()], "Applied the new palette.", True,
                                ["a.py"], idx_,
                                steps=["1. read a.py L1-5  (Palette.)"])
@@ -1299,7 +1299,7 @@ def test_run_loop_carries_goal_into_task_prompt(tmp_path, monkeypatch):
     seen = {}
 
     def fake_run_task(root, cfg, client, agent, idx_, task, apply=True,
-                      review=False, answer_system=None):
+                      review=False, answer_system=None, is_repair=False):
         seen["task"] = task
         seen["targets"] = getattr(agent, "task_targets", None)
         return loop.TaskResult([_ok()], "reply", True, ["a.py"], idx_)
@@ -1327,7 +1327,7 @@ def test_run_loop_flags_stale_notes_after_edits(tmp_path, monkeypatch):
     seen = {}
 
     def fake_run_task(root, cfg, client, agent, idx_, task, apply=True,
-                      review=False, answer_system=None):
+                      review=False, answer_system=None, is_repair=False):
         seen["task"] = task
         return loop.TaskResult([_ok()], "Removed the middle rows.", True,
                                ["static/js/main.js"], idx_)
@@ -1485,7 +1485,7 @@ def test_context_notes_carry_report_tail(tmp_path, monkeypatch):
         return loop.TaskResult([], report, True, [], idx_)
 
     def fake_run_task(root, cfg, client, agent, idx_, task, apply=True,
-                      review=False, answer_system=None):
+                      review=False, answer_system=None, is_repair=False):
         calls.append(("edit", task))
         return _result(idx_)
 
@@ -1689,7 +1689,7 @@ def test_run_loop_implements_each_task_in_order(tmp_path, monkeypatch):
     idx = types.SimpleNamespace(root=tmp_path)
     calls = []
 
-    def fake_run_task(root, cfg, client, agent, idx_, task, apply=True, review=False, answer_system=None):
+    def fake_run_task(root, cfg, client, agent, idx_, task, apply=True, review=False, answer_system=None, is_repair=False):
         calls.append(task)
         return _result(idx_)
 
@@ -1708,7 +1708,7 @@ def test_run_loop_respects_max_tasks(tmp_path, monkeypatch):
     idx = types.SimpleNamespace(root=tmp_path)
     calls = []
 
-    def fake_run_task(root, cfg, client, agent, idx_, task, apply=True, review=False, answer_system=None):
+    def fake_run_task(root, cfg, client, agent, idx_, task, apply=True, review=False, answer_system=None, is_repair=False):
         calls.append(task)
         return _result(idx_)
 
@@ -1725,7 +1725,7 @@ def test_run_loop_respects_max_minutes_between_tasks(tmp_path, monkeypatch):
     calls = []
 
     def fake_run_task(root, cfg, client, agent, idx_, task, apply=True,
-                      review=False, answer_system=None):
+                      review=False, answer_system=None, is_repair=False):
         calls.append(task)
         return _result(idx_)
 
@@ -1747,7 +1747,7 @@ def test_run_loop_stops_on_failed_task(tmp_path, monkeypatch):
     loop.write_plan(plan, "", ["broken", "never reached"])
     idx = types.SimpleNamespace(root=tmp_path)
 
-    def fake_run_task(root, cfg, client, agent, idx_, task, apply=True, review=False, answer_system=None):
+    def fake_run_task(root, cfg, client, agent, idx_, task, apply=True, review=False, answer_system=None, is_repair=False):
         return _result(idx_, ok=False)            # no applied edits
 
     monkeypatch.setattr(loop, "run_task", fake_run_task)
@@ -1762,7 +1762,7 @@ def test_run_loop_keep_going_flags_and_continues(tmp_path, monkeypatch):
     idx = types.SimpleNamespace(root=tmp_path)
     calls = []
 
-    def fake_run_task(root, cfg, client, agent, idx_, task, apply=True, review=False, answer_system=None):
+    def fake_run_task(root, cfg, client, agent, idx_, task, apply=True, review=False, answer_system=None, is_repair=False):
         calls.append(task)
         return _result(idx_, ok=(task != "broken"))
 
@@ -1785,7 +1785,7 @@ def test_run_loop_treats_noop_reply_as_done(tmp_path, monkeypatch):
     idx = types.SimpleNamespace(root=tmp_path)
     calls = []
 
-    def fake_run_task(root, cfg, client, agent, idx_, task, apply=True, review=False, answer_system=None):
+    def fake_run_task(root, cfg, client, agent, idx_, task, apply=True, review=False, answer_system=None, is_repair=False):
         calls.append(task)
         if task == "already done":
             return loop.TaskResult(
@@ -1819,7 +1819,7 @@ def test_run_loop_does_not_tick_a_verification_task_done_on_a_noop_reply(
     NOOP = "No changes are needed; the palette is already correct."
 
     def fake_run_task(root, cfg, client, agent, idx_, task, apply=True,
-                      review=False, answer_system=None):
+                      review=False, answer_system=None, is_repair=False):
         calls.append(task)
         return loop.TaskResult([], NOOP, True, [], idx_)
 
@@ -1852,7 +1852,7 @@ def test_run_loop_fails_a_noop_verification_that_admits_it_could_not_check(
              "I could not verify the score bar colour in the time available.")
 
     def fake_run_task(root, cfg, client, agent, idx_, task, apply=True,
-                      review=False, answer_system=None):
+                      review=False, answer_system=None, is_repair=False):
         return loop.TaskResult(
             [], REPLY, True, [], idx_,
             steps=["1. browser http://127.0.0.1:8000/  (Look at the page.)"],
@@ -1880,7 +1880,7 @@ def test_run_loop_ticks_a_noop_verification_task_that_did_observe(
     idx = types.SimpleNamespace(root=tmp_path)
 
     def fake_run_task(root, cfg, client, agent, idx_, task, apply=True,
-                      review=False, answer_system=None):
+                      review=False, answer_system=None, is_repair=False):
         return loop.TaskResult(
             [], "No changes are needed: the palette is already correct -- the "
                 "browser shows #ff8800 on the score bar.", True, [], idx_,
@@ -1903,7 +1903,7 @@ def test_plan_exhausted_with_failures_is_not_reported_as_complete(
     idx = types.SimpleNamespace(root=tmp_path)
 
     def fake_run_task(root, cfg, client, agent, idx_, task, apply=True,
-                      review=False, answer_system=None):
+                      review=False, answer_system=None, is_repair=False):
         if task.startswith("doomed"):
             return loop.TaskResult([], "I gave up.", False, [], idx_)
         return _result(idx_)
@@ -1928,7 +1928,7 @@ def test_all_tasks_complete_is_still_logged_for_a_clean_finish(
     idx = types.SimpleNamespace(root=tmp_path)
 
     def fake_run_task(root, cfg, client, agent, idx_, task, apply=True,
-                      review=False, answer_system=None):
+                      review=False, answer_system=None, is_repair=False):
         return _result(idx_)
 
     monkeypatch.setattr(loop, "run_task", fake_run_task)
@@ -1953,7 +1953,7 @@ def test_run_loop_retries_a_fabricated_noop_task_instead_of_ticking_it(
     notes = []
 
     def fake_run_task(root, cfg, client, agent, idx_, task, apply=True,
-                      review=False, answer_system=None):
+                      review=False, answer_system=None, is_repair=False):
         calls.append(task)
         notes.append(task)
         if len(calls) == 1:
@@ -1981,7 +1981,7 @@ def test_run_loop_marks_a_twice_fabricated_noop_task_failed(tmp_path,
     calls = []
 
     def fake_run_task(root, cfg, client, agent, idx_, task, apply=True,
-                      review=False, answer_system=None):
+                      review=False, answer_system=None, is_repair=False):
         calls.append(task)
         return loop.TaskResult(
             [], "I'll first read the file.\n\n[No changes: every edit block "
@@ -2022,7 +2022,7 @@ def test_run_loop_reruns_an_empty_report_once_then_retires_the_check(
             ["1. browser python main.py [wait 1]  (Measure.)"])
 
     def fake_run_task(root, cfg, client, agent, idx_, task, apply=True,
-                      review=False, answer_system=None):
+                      review=False, answer_system=None, is_repair=False):
         calls.append(task)
         return _result(idx_)
 
@@ -2090,7 +2090,7 @@ def test_run_loop_incomplete_move_task_is_not_a_noop(tmp_path, monkeypatch):
         "graveyard/ has already been created by the earlier task.")
 
     def fake_run_task(root, cfg, client, agent, idx_, task, apply=True,
-                      review=False, answer_system=None):
+                      review=False, answer_system=None, is_repair=False):
         calls.append(task)
         if "Move each file" in task:
             return loop.TaskResult([], DEFERRAL, True, [], idx_)
@@ -2117,7 +2117,7 @@ def test_run_loop_verification_repair_round_trip(tmp_path, monkeypatch):
     tasks = []
     verifies = []
 
-    def fake_run_task(root, cfg, client, agent, idx_, task, apply=True, review=False, answer_system=None):
+    def fake_run_task(root, cfg, client, agent, idx_, task, apply=True, review=False, answer_system=None, is_repair=False):
         tasks.append(task)
         return _result(idx_)
 
@@ -2150,7 +2150,7 @@ def test_run_loop_auto_diagnostics_feeds_repair_rounds(tmp_path, monkeypatch):
     checks = []
 
     def fake_run_task(root, cfg, client, agent, idx_, task, apply=True,
-                      review=False, answer_system=None):
+                      review=False, answer_system=None, is_repair=False):
         tasks.append(task)
         return _result(idx_)
 
@@ -2176,7 +2176,7 @@ def test_run_loop_verification_exhausts_repair_rounds(tmp_path, monkeypatch):
     idx = types.SimpleNamespace(root=tmp_path)
     tasks = []
 
-    def fake_run_task(root, cfg, client, agent, idx_, task, apply=True, review=False, answer_system=None):
+    def fake_run_task(root, cfg, client, agent, idx_, task, apply=True, review=False, answer_system=None, is_repair=False):
         tasks.append(task)
         return _result(idx_)
 
@@ -2195,7 +2195,7 @@ def test_run_loop_stops_when_no_tasks(tmp_path, monkeypatch):
     idx = types.SimpleNamespace(root=tmp_path)
     calls = []
 
-    def fake_run_task(root, cfg, client, agent, idx_, task, apply=True, review=False, answer_system=None):
+    def fake_run_task(root, cfg, client, agent, idx_, task, apply=True, review=False, answer_system=None, is_repair=False):
         calls.append(task)
         return _result(idx_)
 
@@ -2226,7 +2226,7 @@ def test_run_loop_does_not_code_repair_missing_dependency(tmp_path, monkeypatch)
     idx = types.SimpleNamespace(root=tmp_path)
     tasks = []
 
-    def fake_run_task(root, cfg, client, agent, idx_, task, apply=True, review=False, answer_system=None):
+    def fake_run_task(root, cfg, client, agent, idx_, task, apply=True, review=False, answer_system=None, is_repair=False):
         tasks.append(task)
         return _result(idx_)
 
@@ -2777,7 +2777,7 @@ def test_run_loop_accepts_gather_only_progress(tmp_path, monkeypatch):
     idx = types.SimpleNamespace(root=tmp_path)
 
     def fake_run_task(root, cfg, client, agent, idx_, task, apply=True,
-                      review=False, answer_system=None):
+                      review=False, answer_system=None, is_repair=False):
         return loop.TaskResult([], "Done via the rename action.", True,
                                ["pkg/core.py"], idx_)
 
@@ -3336,7 +3336,7 @@ def test_run_loop_rolls_back_a_repair_that_made_verify_worse(tmp_path,
     tasks = []
 
     def fake_run_task(root, cfg, client, agent, idx_, task, apply=True,
-                      review=False, answer_system=None):
+                      review=False, answer_system=None, is_repair=False):
         tasks.append(task)
         if len(tasks) == 1:
             return loop.TaskResult([_ok()], "reply", True, ["a.py"], idx_)
@@ -3373,7 +3373,7 @@ def test_run_loop_keeps_repairing_while_the_score_does_not_rise(tmp_path,
     tasks = []
 
     def fake_run_task(root, cfg, client, agent, idx_, task, apply=True,
-                      review=False, answer_system=None):
+                      review=False, answer_system=None, is_repair=False):
         tasks.append(task)
         return loop.TaskResult([_ok()], "reply", True, ["a.py"], idx_)
 

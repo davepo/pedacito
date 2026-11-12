@@ -178,6 +178,30 @@ Rules:
   you need to know what it exposes.
 - Finish the named work completely; do not wander into other functions or files."""
 
+DOCS_SYSTEM = """\
+You are writing one documentation file for a project whose code has already
+been built. Describe what was ACTUALLY built. Do not invent features,
+frameworks, libraries, or commands the project does not have.
+
+Output exactly one search/replace block with an EMPTY SEARCH section and the
+COMPLETE documentation file in REPLACE, in this format and nothing else after
+it:
+
+--- FILE: relative/path.md
+<<<<<<< SEARCH
+=======
+(the full documentation, in Markdown)
+>>>>>>> REPLACE
+
+Rules:
+- Ground every claim in the project name, the file tree, and the public API
+  shown below. Never name a framework or a run/test command that is not in the
+  spec or the code.
+- A README covers what the project is, how to install and run it, and how to
+  use it, based on the real entry point. A docs page covers its stated purpose.
+- Concise and accurate. No TODOs, no placeholder text, no marketing filler.
+- Do not write any other file, and do not explain yourself."""
+
 
 @dataclass
 class Spec:
@@ -991,6 +1015,110 @@ def build_project(client, cfg, idx, plan: Plan, verbose: bool = True,
     return {"done": done, "noop": noop, "failed": failed, "skipped": skipped}
 
 
+def build_docs(client, cfg, idx, plan: Plan, verbose: bool = True,
+               backup_dir=None) -> dict:
+    """Write the planned Markdown docs against the code that was actually
+    built (BUG-302). `Plan.sources` excludes `.md`, so `build_project` never
+    targets them and the skeleton's three-line header is all they ever get --
+    a planned README ships as a stub the summary cannot even report. This pass
+    runs after the sources exist, describes the real project, and returns the
+    same {done, noop, failed, skipped} shape so its results merge into the
+    build summary and reach the exit code. A doc that comes back with no edit
+    block is a failure (the file is still a stub), not an honest no-op."""
+    from .agent import ANSWER_SYSTEM
+
+    docs = [f for f in plan.files
+            if f.path.lower().endswith((".md", ".markdown"))]
+    done: list[str] = []
+    noop: list[str] = []
+    failed: list[tuple[str, str]] = []
+    skipped: list[str] = []
+    if not docs:
+        return {"done": done, "noop": noop, "failed": failed, "skipped": skipped}
+
+    spec = plan.spec.text if plan.spec else ""
+    budget = getattr(cfg, "max_spec_chars", MAX_SPEC_CHARS) // 2
+    tree = "\n".join(
+        f"  {f.path}" + (f"  -- {f.purpose}" if f.purpose else "")
+        for f in plan.files)
+    api = _interface_map(idx, plan, cfg) or "(nothing yet)"
+    max_tokens = getattr(cfg, "max_tokens_build", 8000)
+
+    for t in docs:
+        path = idx.root / t.path
+        if not path.is_file():
+            skipped.append(t.path)
+            continue
+        if verbose:
+            print(f"\n--- documenting {t.path} ---", file=sys.stderr)
+        stub = fileio.read_text(path, errors="replace")
+        messages = [
+            {"role": "system", "content": DOCS_SYSTEM + "\n\n" + ANSWER_SYSTEM},
+            {"role": "user", "content": "\n".join([
+                f"PROJECT: {plan.project_name}",
+                "",
+                f"SPECIFICATION\n{spec[:budget]}",
+                "",
+                "FILE TREE\n" + tree,
+                "",
+                "PUBLIC API (what the code actually exposes)\n" + api,
+                "",
+                f"YOUR FILE: {t.path}",
+                f"Purpose: {t.purpose or 'project documentation'}",
+                f"It currently contains only this placeholder:\n```\n{stub}\n```",
+                "",
+                "Write the complete documentation now, describing what was "
+                "actually built. One search/replace block, empty SEARCH, the "
+                "full file in REPLACE.",
+            ])},
+        ]
+        try:
+            reply = client.chat(messages, max_tokens=max_tokens, stream=verbose,
+                                disable_thinking=True)
+            discards: list[str] = []
+            if not parse_edits(reply, discards=discards):
+                # A reasoning model may spend its budget on a thinking block:
+                # nudge once (with the family's /no_think suffix when it has
+                # one), then report the failure.
+                suffix = thinking_suffix_for(cfg)
+                messages[-1]["content"] += (
+                    (f"\n\n{suffix}" if suffix else "")
+                    + "\nOutput the complete documentation file NOW as one "
+                    "search/replace block with an empty SEARCH section, and "
+                    "nothing else. Do not explain.")
+                reply = client.chat(messages, max_tokens=max_tokens,
+                                    stream=verbose, disable_thinking=True)
+            edits = parse_edits(reply, discards=discards)
+            if not edits:
+                failed.append((t.path, "model returned no edit block for the "
+                                       "documentation file"))
+                if verbose:
+                    print(f"  FAILED {t.path}: no documentation block",
+                          file=sys.stderr)
+                continue
+            results = apply_edits(idx.root, edits, backup=cfg.backup,
+                                  dry_run=False, cfg=cfg, backup_dir=backup_dir)
+        except LLMError as e:
+            print(f"  stopped: {e}", file=sys.stderr)
+            failed.append((t.path, "server error"))
+            skipped.extend(x.path for x in docs
+                           if x.path not in done and x.path not in noop
+                           and x.path != t.path)
+            break
+        ok = [r for r in results if r.ok]
+        bad = [r for r in results if not r.ok]
+        if ok:
+            done.append(t.path)
+            # Docs are not code: they contribute no chunks to the index, so
+            # there is nothing to reindex (and .md is not a chunkable ext).
+        if bad:
+            failed.append((t.path, "; ".join(r.message for r in bad)[:200]))
+            if verbose:
+                for r in bad:
+                    print(f"  FAILED {r.file}: {r.message}", file=sys.stderr)
+    return {"done": done, "noop": noop, "failed": failed, "skipped": skipped}
+
+
 def summarise_result(summary: dict, verbose: bool = True) -> str:
     """One-paragraph report of a build run, printed at the end of `new`."""
     bits = [f"{len(summary['done'])} file(s) written"]
@@ -1374,6 +1502,18 @@ def run_new(root: Path, cfg, client, spec: Spec, *, apply: bool = False,
             return 2
 
     wants_skeleton = plan_only or apply or review
+    # BUG-303: the `new` path never attached an EventLog, so the most expensive
+    # operation in a hunt left no per-call record (tokens, cache hits, finish
+    # reason) and no gate events -- only `ask`/`chat` streamed. Attach on the
+    # write path, before the first LLM call, so plan/interface/build usage all
+    # land in .pedacito/events/. A dry run stays silent (nothing is written).
+    if wants_skeleton:
+        from . import events as events_mod
+        elog = events_mod.get(root, cfg)
+        events_mod.attach(client, elog)
+        elog.emit("session_start", cmd="new", model=getattr(cfg, "model", ""),
+                  apply=bool(apply), review=bool(review),
+                  plan_only=bool(plan_only), complex=bool(complex))
     design_doc = None
     if design:
         from . import design as design_mod
@@ -1458,14 +1598,28 @@ def run_new(root: Path, cfg, client, spec: Spec, *, apply: bool = False,
     summary = build_project(client, cfg, idx, plan, verbose=verbose,
                             backup_dir=backup_dir,
                             tests_first=True if design_doc else None)
-    print("\n" + summarise_result(summary))
     contract_failed = False
+    tests_failed = False
 
     # Files are built independently, so repair cross-file import mismatches.
     n_fixed = fix_import_errors(client, cfg, idx, plan, backup_dir,
                                 verbose=verbose)
     if n_fixed and verbose:
         print(f"  fixed {n_fixed} import issue(s)", file=sys.stderr)
+
+    # BUG-302: planned Markdown files are excluded from Plan.sources, so the
+    # build never wrote them and the summary hid the stub. Now that the code
+    # exists, describe the real project and fold the docs into the summary so
+    # the counts and the exit code see them too.
+    docs_summary = build_docs(client, cfg, idx, plan, verbose=verbose,
+                              backup_dir=backup_dir)
+    for key in ("done", "noop", "skipped"):
+        summary[key].extend(docs_summary[key])
+    summary["failed"].extend(docs_summary["failed"])
+    if docs_summary["done"] and verbose:
+        print(f"  documented {len(docs_summary['done'])} file(s)",
+              file=sys.stderr)
+    print("\n" + summarise_result(summary))
 
     if apply:
         # Browser projects are only proven by their contract: the per-file
@@ -1508,6 +1662,45 @@ def run_new(root: Path, cfg, client, spec: Spec, *, apply: bool = False,
                 # summary dict keeps its shape, the exit code sees this.
                 contract_failed = True
 
+        # BUG-301: a green build is not a green project. The plain path
+        # wrote a test suite and never ran it, so `new` exited 0 over
+        # failing tests. Run the generated suite (or the explicit --verify
+        # command) with repair rounds, and let a red verdict reach the
+        # exit code instead of surfacing only when the user runs it.
+        check_cmd = (verify or "").strip()
+        if not check_cmd:
+            from . import testsel
+            check_cmd = testsel.detect_test_command(root, cfg)
+        if check_cmd:
+            if verbose:
+                print(f"\n--- verifying the build: {check_cmd} ---",
+                      file=sys.stderr)
+            rounds = int(repair_rounds if repair_rounds is not None
+                         else getattr(cfg, "auto_repair_rounds", 2) or 0)
+            v_ok, v_out = verify_and_fix(
+                client, cfg, idx, [f.path for f in plan.files],
+                plan.project_name, backup_dir, explicit_cmd=check_cmd,
+                rounds=rounds, smoke=False, verbose=verbose)
+            if v_ok and v_out.startswith("could not verify"):
+                print(f"  [warning] {v_out}", file=sys.stderr)
+                workspace.log_event(root, f"new: {v_out}", "WARN")
+            elif v_ok:
+                print(f"  tests: passed ({check_cmd})", file=sys.stderr)
+                workspace.log_event(root, f"new: tests passed ({check_cmd})")
+            else:
+                workspace.log_event(
+                    root, f"new: the generated tests do not pass "
+                          f"({check_cmd}): {v_out[:200]}", "ERROR")
+                print("\nBUILD INCOMPLETE: the generated tests do not pass "
+                      f"(`{check_cmd}`).", file=sys.stderr)
+                for ln in (v_out or "").splitlines()[:12]:
+                    print(f"  {ln}", file=sys.stderr)
+                print("\nFix them with:\n  pedacito ask . --apply --strict "
+                      "-t \"make the failing tests pass without weakening "
+                      "them\"", file=sys.stderr)
+                if not summary["failed"]:
+                    tests_failed = True
+
     if review and summary["done"]:
         results = _review_build(root, plan, summary, cfg, backup_dir, when)
         if results is None:
@@ -1516,7 +1709,7 @@ def run_new(root: Path, cfg, client, spec: Spec, *, apply: bool = False,
         p = workspace.write_session(root, f"new: {plan.project_name}",
                                     [], render_plan(plan), [], backup_dir, when)
         print(f"[session: {p.relative_to(root)}]", file=sys.stderr)
-    return 1 if summary["failed"] or contract_failed else 0
+    return 1 if summary["failed"] or contract_failed or tests_failed else 0
 
 
 def _run_complex(root: Path, cfg, client, idx, plan: Plan, spec: Spec, *,

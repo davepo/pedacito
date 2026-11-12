@@ -387,18 +387,23 @@ def test_clip_clause_survives_a_first_word_longer_than_the_limit():
     assert out == "x" * 140 + " ..."
 
 
-def test_requirement_ledger_uses_the_word_boundary_clip():
-    """The clip helper existed, but the ledger still cut with `p[:140]`, so a
-    plan step inherited a requirement title ending mid-word."""
+def test_requirement_ledger_keeps_the_full_clause_tail():
+    """BUG-005 fixed the mid-token cut; BUG-328 then removed the cut from the
+    ledger entirely. The ledger must keep the FULL clause so the tail of a long
+    compound requirement stays visible to coverage; the word-boundary clip is a
+    display concern (plan titles), not a loss of evidence."""
     clause = ("The restart button must map to the state machine's reset "
               "transition and clear the score before the first frame draws "
               "anything at all on the canvas")
     reqs = verify.requirement_ledger(clause)
     assert reqs, "the clause must survive splitting"
     text = reqs[0][0]
-    assert text == verify._clip_clause(clause)
-    assert text.endswith(" ...")
-    assert " ".join(text[:-4].split()) in clause   # a real prefix, whole words
+    assert text == clause                       # full text, tail preserved
+    assert text.endswith("on the canvas")
+    # the display helper still clips on a word boundary when a title needs it
+    clipped = verify._clip_clause(clause)
+    assert clipped.endswith(" ...")
+    assert " ".join(clipped[:-4].split()) in clause
 
 
 # --------------------------------------------------- BUG-019: run_test scope --

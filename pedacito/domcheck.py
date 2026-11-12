@@ -186,15 +186,37 @@ _INIT_SCRIPT = """
     } catch (e) {}
     return 'other';
   };
+  const refs = [];
   const orig = EventTarget.prototype.addEventListener;
   EventTarget.prototype.addEventListener = function (type, fn, opts) {
     try {
-      if (bindings.length < 2000)
+      // BUG-325: addEventListener(type, undefined) is a no-op -- the browser
+      // binds nothing, yet the wrapper used to record a binding anyway, so a
+      // dead control looked bound. Only a callable listener (or an object with
+      // a handleEvent method) is a real binding.
+      const real = typeof fn === 'function' ||
+                   (fn && typeof fn.handleEvent === 'function');
+      if (real && bindings.length < 2000) {
         bindings.push({ type: String(type), target: desc(this) });
+        refs.push(this);
+      }
     } catch (e) {}
     return orig.call(this, type, fn, opts);
   };
   window.__pdcBindings = bindings;
+  // BUG-325: a listener registered on a node that is later removed (e.g.
+  // innerHTML = '') is dead. Report only targets still in the document (or
+  // window/document themselves), so a detached node cannot mask an unbound
+  // control. Element refs live in `refs`, never in the serialized bindings.
+  window.__pdcBoundTargets = () => {
+    const out = [];
+    for (let i = 0; i < refs.length; i++) {
+      const t = refs[i];
+      if (t === window || t === document || (t && t.isConnected))
+        out.push(bindings[i].target);
+    }
+    return out;
+  };
 })();
 """
 
@@ -350,6 +372,8 @@ def check(root, *, entry: str = "", timeout: int = 45,
                 page.wait_for_timeout(250)
                 snap = page.evaluate(_SNAPSHOT_JS)
                 bindings = page.evaluate("window.__pdcBindings || []")
+                bound_targets = page.evaluate(
+                    "window.__pdcBoundTargets ? window.__pdcBoundTargets() : []")
             finally:
                 browser.close()
     except Exception as e:
@@ -373,7 +397,10 @@ def check(root, *, entry: str = "", timeout: int = 45,
 
     # Unbound controls: conservative. A binding on the control itself, any
     # ancestor (delegation), document/window, or an inline handler all count.
-    targets = {b.get("target", "") for b in bindings}
+    # BUG-325: count only REAL listeners on still-CONNECTED targets -- the init
+    # script drops no-op (undefined) handlers and nodes removed after binding,
+    # so neither can mask a dead control.
+    targets = set(bound_targets or [])
     delegation = bool(targets & {"document", "window"})
     n_unbound = 0
     for c in snap.get("controls", []):

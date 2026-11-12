@@ -1756,6 +1756,13 @@ def _cmd_rename(args) -> int:
         print(f"  warning: {w}")
     for s in res.get("skipped", [])[:8]:
         print(f"  not checked: {s}")
+    if res.get("string_matches"):
+        print(f"  note: {len(res['string_matches'])} string literal(s) still "
+              f"name `{args.old}` (test labels, docs); the rename leaves "
+              "strings untouched by design -- update them if they name the "
+              "API:")
+        for sm in res["string_matches"][:8]:
+            print(f"    {sm}")
     if not args.apply:
         for rel in res["files_modified"]:
             diff = res["diffs"].get(rel, "")
@@ -2936,8 +2943,13 @@ def _main(argv=None) -> int:
             # sign-off stays a human decision, not a CI failure.
             if tr is not None and not _wants_review(args, cfg):
                 if getattr(tr, "ok", None) is False:
-                    print("ERROR: the planned run reported failed tasks",
-                          file=sys.stderr)
+                    # BUG-313: the planned path can exit 1 with ZERO failed
+                    # tasks when --strict rejects a task's edits/tests; the
+                    # old "reported failed tasks" text contradicted the
+                    # loop's own "[N done, 0 failed]" summary.
+                    print("ERROR: the planned run did not finish cleanly "
+                          "(failed tasks, or --strict rejected a task's "
+                          "edits/tests)", file=sys.stderr)
                     elog.emit("exit", code=1)
                     return 1
                 if (getattr(args, "apply", False)

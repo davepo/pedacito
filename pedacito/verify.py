@@ -47,6 +47,7 @@ from __future__ import annotations
 import ast
 import copy
 import difflib
+import json
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -312,6 +313,177 @@ def check_static(results, root=None, cfg=None) -> list[Finding]:
             "no linter or test process was run. Fix these before anything "
             "else:\n" + "\n".join(f"- {e}" for e in new[:15]),
             line=line))
+    return out
+
+
+# ------------------------------------------- JS lost-import gate (BUG-310)
+# The Python static gate above has no JS analogue, so a hunk that deleted a
+# file's `node:test` / `node:assert` imports while still calling describe /
+# test / strictEqual passed "applied and verified" and only died at load time.
+# This cheap, deterministic check compares the import bindings of the before
+# and after buffers: a name that was imported, is no longer imported, and is
+# still referenced (and not re-declared) in the after buffer is an undefined
+# name the edit just introduced. No scope analysis, no subprocess.
+_JS_EXTS = (".js", ".mjs", ".cjs", ".jsx")
+_JS_NAMED_IMPORT_RE = re.compile(r"import\s*\{([^}]*)\}\s*from", re.S)
+_JS_DEFAULT_IMPORT_RE = re.compile(
+    r"import\s+([\w$]+)\s*(?:,\s*\{[^}]*\})?\s*from", re.S)
+_JS_NS_IMPORT_RE = re.compile(r"import\s*\*\s*as\s+([\w$]+)\s+from", re.S)
+_JS_NAMED_REQUIRE_RE = re.compile(
+    r"(?:const|let|var)\s*\{([^}]*)\}\s*=\s*require\s*\(", re.S)
+_JS_DEFAULT_REQUIRE_RE = re.compile(
+    r"(?:const|let|var)\s+([\w$]+)\s*=\s*require\s*\(", re.S)
+
+
+def _js_binding_names(part: str) -> list[str]:
+    out = []
+    for piece in (part or "").split(","):
+        piece = piece.strip()
+        if not piece:
+            continue
+        if piece.startswith("type "):
+            piece = piece[5:].strip()
+        if " as " in piece:
+            piece = piece.split(" as ")[-1].strip()
+        m = re.match(r"[\w$]+", piece)
+        if m:
+            out.append(m.group(0))
+    return out
+
+
+def _js_imported_names(text: str) -> set[str]:
+    names: set[str] = set()
+    for m in _JS_NAMED_IMPORT_RE.finditer(text or ""):
+        names.update(_js_binding_names(m.group(1)))
+    for m in _JS_DEFAULT_IMPORT_RE.finditer(text or ""):
+        names.add(m.group(1))
+    for m in _JS_NS_IMPORT_RE.finditer(text or ""):
+        names.add(m.group(1))
+    for m in _JS_NAMED_REQUIRE_RE.finditer(text or ""):
+        names.update(_js_binding_names(m.group(1)))
+    for m in _JS_DEFAULT_REQUIRE_RE.finditer(text or ""):
+        names.add(m.group(1))
+    return names
+
+
+def check_static_js(results) -> list[Finding]:
+    """New undefined names from a JS edit that dropped an import it still uses
+    (BUG-310). Compares before/after import bindings; only names still used and
+    not re-declared in the after buffer are reported."""
+    out: list[Finding] = []
+    for r in results or ():
+        if not getattr(r, "ok", False) or not getattr(r, "file", ""):
+            continue
+        if not str(r.file).lower().endswith(_JS_EXTS):
+            continue
+        after = getattr(r, "after", None)
+        before = getattr(r, "before", None)
+        if after is None or before is None or before == after:
+            continue
+        lost = _js_imported_names(before) - _js_imported_names(after)
+        if not lost:
+            continue
+        flagged = []
+        for name in sorted(lost):
+            use = re.search(r"(?<![\w$])" + re.escape(name) + r"(?![\w$])",
+                            after)
+            if not use:
+                continue
+            if re.search(r"\b(?:function|class)\s+" + re.escape(name) + r"\b",
+                         after) or re.search(
+                r"\b(?:const|let|var)\s+" + re.escape(name) + r"\b", after):
+                continue
+            line = after.count("\n", 0, use.start()) + 1
+            flagged.append((name, line))
+        if not flagged:
+            continue
+        first_line = min(ln for _n, ln in flagged)
+        out.append(Finding(
+            "static", "error", r.file,
+            "this edit removes import(s) whose names are still used, so they "
+            "are now undefined at runtime (no linter or test process was "
+            "run). Restore the import or remove the usage:\n"
+            + "\n".join(f"- `{n}` (used near line {ln})"
+                        for n, ln in flagged[:15]),
+            line=first_line))
+    return out
+
+
+# ------------------------------------------- README grounding (BUG-307)
+# A generated README is a reference file, so no static/import gate reads it.
+# One run shipped "# Pedacito" claiming "Tests are written in Jest" while
+# package.json said `node --test` and the project was PulseForge-16. This cheap
+# check compares an edited README against the project manifest: a title that
+# shares nothing with the package name, or a test framework that contradicts
+# scripts.test, is a warning (never an error -- prose is heuristic).
+_RUNNER_WORDS = {
+    "node": ("node --test", "node:test"),
+    "jest": ("jest",),
+    "mocha": ("mocha",),
+    "vitest": ("vitest",),
+    "pytest": ("pytest", "py.test"),
+    "ava": ("ava",),
+}
+
+
+def _norm_name(s: str) -> str:
+    return re.sub(r"[^a-z0-9]", "", (s or "").lower())
+
+
+def check_doc_grounding(agent, results) -> list[Finding]:
+    root = getattr(getattr(agent, "index", None), "root", None)
+    if root is None:
+        return []
+    try:
+        pkg = json.loads((Path(root) / "package.json").read_text(
+            encoding="utf-8"))
+    except (OSError, ValueError):
+        return []
+    if not isinstance(pkg, dict):
+        return []
+    name = str(pkg.get("name") or "")
+    scripts = pkg.get("scripts") or {}
+    test_cmd = str(scripts.get("test") or "") if isinstance(scripts, dict) else ""
+    actual = next((k for k, words in _RUNNER_WORDS.items()
+                   if any(w in test_cmd for w in words)), "")
+    out: list[Finding] = []
+    for r in results or ():
+        if not getattr(r, "ok", False):
+            continue
+        rel = str(getattr(r, "file", "") or "")
+        if rel.rsplit("/", 1)[-1].lower() not in ("readme.md", "readme.rst",
+                                                  "readme.txt", "readme"):
+            continue
+        after = getattr(r, "after", None)
+        if not after:
+            continue
+        problems = []
+        m = re.search(r"(?m)^#\s+(.+?)\s*$", after)
+        if m and name:
+            title = _norm_name(m.group(1))
+            want = _norm_name(name)
+            if title and want and want not in title and title not in want:
+                problems.append(
+                    f"the title '{m.group(1)}' does not match the package "
+                    f"name '{name}'")
+        if actual:
+            low = after.lower()
+            mentions_actual = any(w in low for w in _RUNNER_WORDS[actual])
+            for other, words in _RUNNER_WORDS.items():
+                if other == actual or mentions_actual:
+                    continue
+                if any(re.search(r"(?<![\w])" + re.escape(w) + r"(?![\w])",
+                                 low) for w in words):
+                    problems.append(
+                        f"it names the '{other}' test framework but "
+                        f"package.json scripts.test uses '{actual}' "
+                        f"({test_cmd})")
+                    break
+        if problems:
+            out.append(Finding(
+                "grounding", "warn", rel,
+                "the README contradicts the project manifest: "
+                + "; ".join(problems)))
     return out
 
 
@@ -817,6 +989,21 @@ _VERBS = {"add", "make", "fix", "update", "change", "remove", "rename", "create"
           "each", "every", "not", "does", "will", "would", "then", "than",
           "your", "our", "its", "are", "can", "get", "set", "new", "old"}
 _WORD_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]{3,}")
+# An identifier-like term (snake_case, dotted/path, a digit, or camelCase) is
+# the distinctive evidence a clause is about; plain prose words are not. Used
+# to keep the tail of a long compound clause in the ledger (BUG-328) and to
+# attribute a hunk to the clause it actually serves (BUG-305/330).
+_IDENT_TERM_RE = re.compile(r"[_./]|\d|[a-z][A-Z]")
+# Generic words that match almost any edit and must not, on their own, tie a
+# hunk to a clause (the all-to-all provenance of BUG-305/330).
+_GENERIC_TERMS = frozenset({
+    "test", "tests", "testing", "public", "private", "code", "file", "files",
+    "function", "functions", "method", "methods", "class", "classes", "module",
+    "modules", "import", "imports", "export", "exports", "return", "returns",
+    "value", "values", "data", "node", "nodes", "name", "names", "type",
+    "types", "line", "lines", "page", "app", "application", "project",
+    "signature", "signatures", "unit", "units", "npm", "pass", "fail",
+})
 
 # Requirement evidence state machine. An edit requirement has to
 # travel UNLOCATED -> LOCATED -> READ -> EDITED -> VERIFIED; an investigation /
@@ -864,7 +1051,7 @@ class Requirement:
     """One task clause plus the evidence the harness has gathered for it."""
     text: str
     terms: list[str]
-    kind: str = "edit"                 # edit | report
+    kind: str = "edit"                 # edit | report | constraint
     state: str = REQ_UNLOCATED
     anchors: list[tuple] = field(default_factory=list)    # (file, start, end)
     read_spans: list[tuple] = field(default_factory=list)
@@ -878,9 +1065,14 @@ class Requirement:
     prose_only: bool = False
 
     def __post_init__(self):
-        if self.kind not in ("edit", "report"):
+        if self.kind not in ("edit", "report", "constraint"):
             self.kind = "edit"
-        if self.state not in _REQ_ORDER:
+        if self.kind == "constraint":
+            # A prohibition has nothing to locate, read or implement; it is
+            # satisfied by not violating it. Park it in a final state so the
+            # gather gate and next_action never chase it (BUG-306).
+            self.state = REQ_REPORTED
+        elif self.state not in _REQ_ORDER:
             self.state = REQ_UNLOCATED
         self.terms = list(dict.fromkeys(self.terms))
 
@@ -890,6 +1082,8 @@ class Requirement:
 
     @property
     def final(self) -> bool:
+        if self.kind == "constraint":
+            return True
         return self.state == (REQ_VERIFIED if self.is_edit else REQ_REPORTED)
 
     @property
@@ -962,6 +1156,49 @@ def _match_score(terms, text: str) -> int:
     return sum(1 for t in terms or () if _term_in(t, text))
 
 
+def _specific_terms(terms) -> list[str]:
+    """The distinctive terms of a clause: identifier-like or long words, minus
+    generic vocabulary that matches almost any edit. Provenance must rest on
+    these, not on words like `tests`/`public`/`npm` (BUG-305/330)."""
+    out = []
+    for t in terms or ():
+        low = t.lower()
+        if low in _GENERIC_TERMS:
+            continue
+        if _IDENT_TERM_RE.search(t) or len(t) >= 6:
+            out.append(t)
+    return out
+
+
+def _clause_names_file(text: str, rel: str) -> bool:
+    """Whether the clause explicitly names this file (path or base name)."""
+    if not rel:
+        return False
+    base = rel.rsplit("/", 1)[-1]
+    for name in {rel, base}:
+        if name and re.search(r"(?<![\w])" + re.escape(name) + r"(?![\w])",
+                              text or ""):
+            return True
+    return False
+
+
+# A file-like token ("src/ui.js", "package.json"): the clause scopes itself to
+# named files. The extension must start with a letter so version numbers
+# ("Qwen3.5") are not mistaken for paths.
+_FILE_TOKEN_RE = re.compile(
+    r"(?<![\w])(?:[\w.-]+/)*[\w.-]+\.[A-Za-z][A-Za-z0-9]{0,7}(?![\w])")
+
+
+# Prose/reference documents are indexed for grep, but a generic term matching
+# one must not pull it into the gather context as an auto-read (BUG-329).
+_REFERENCE_DOC_EXTS = frozenset({".md", ".rst", ".txt", ".adoc", ".org"})
+
+
+def _is_reference_doc(rel: str) -> bool:
+    return "." in (rel or "") and \
+        rel[rel.rfind("."):].lower() in _REFERENCE_DOC_EXTS
+
+
 def _resolve_rel(name: str, index=None) -> str:
     name = (name or "").strip().strip("`'\"")
     if not name:
@@ -1006,6 +1243,38 @@ def _clause_kind(clause: str, default: str) -> str:
     if _REQ_REPORT_RE.search(clause or ""):
         return "report"
     return default
+
+
+# A prohibition / preservation clause ("Change nothing else", "do not weaken
+# unrelated tests", "Keep every public signature ...") binds the model but can
+# never produce positive edit evidence. Treating it as an edit requirement made
+# coverage warn that it was "unaddressed" and let R4 seed a pointless follow-up
+# from it (BUG-306). Such clauses are tracked as `constraint`: always final,
+# never a plan step, never a coverage seed, never a provenance badge.
+_CONSTRAINT_HEAD_RE = re.compile(
+    r"^\s*(?:do not|don't|dont|never|avoid|change nothing|no other|"
+    r"without\s+(?:changing|modifying|touching|altering|breaking))\b",
+    re.IGNORECASE)
+_CONSTRAINT_PHRASE_RE = re.compile(
+    r"\b(?:change nothing else|nothing else|leave (?:everything|it|them|the "
+    r"rest) (?:unchanged|alone|untouched|as-is|as is))\b", re.IGNORECASE)
+_CONSTRAINT_KEEP_RE = re.compile(
+    r"^\s*(?:keep|preserve|maintain|leave)\b", re.IGNORECASE)
+_CONSTRAINT_KEEP_MARK_RE = re.compile(
+    r"\b(?:do not|don't|unchanged|untouched|intact|as-is|as is|the same|"
+    r"unmodified|not weaken|no weaker|without (?:changing|weakening))\b",
+    re.IGNORECASE)
+
+
+def _is_constraint_clause(clause: str) -> bool:
+    t = clause or ""
+    if _CONSTRAINT_HEAD_RE.search(t) or _CONSTRAINT_PHRASE_RE.search(t):
+        return True
+    if _CONSTRAINT_KEEP_RE.search(t):
+        rest = _CONSTRAINT_KEEP_RE.sub("", t, count=1)
+        if _CONSTRAINT_KEEP_MARK_RE.search(rest):
+            return True
+    return False
 
 
 def _clip_clause(p: str, limit: int = 140) -> str:
@@ -1058,18 +1327,23 @@ def _requirements_from_task(task: str, limit: int = 5) -> list[Requirement]:
     for p in merged:
         if len(p) < 8:
             continue
-        terms = []
-        for w in _WORD_RE.findall(p):
-            if w.lower() in _VERBS:
-                continue
-            terms.append(w)
-        terms += re.findall(r"\b\d+\b", p)
-        terms += re.findall(r"[\"'`]([^\"'`]{2,40})[\"'`]", p)
+        words = [w for w in _WORD_RE.findall(p) if w.lower() not in _VERBS]
+        words += re.findall(r"\b\d+\b", p)
+        words += re.findall(r"[\"'`]([^\"'`]{2,40})[\"'`]", p)
+        # BUG-328: the clause used to be clipped to 140 chars and its terms
+        # capped at the first 8 in occurrence order, so the tail of a long
+        # compound clause (handler names, the `presets:` argument, the
+        # preset-change behaviour) vanished from the ledger and coverage could
+        # never see it. Keep the FULL clause text and rank identifier-like
+        # terms first so the distinctive tail survives the cap.
+        ident = [w for w in words if _IDENT_TERM_RE.search(w)]
+        plain = [w for w in words if not _IDENT_TERM_RE.search(w)]
+        terms = list(dict.fromkeys(ident + plain))[:16]
         if terms:
+            kind = ("constraint" if _is_constraint_clause(p)
+                    else _clause_kind(p, task_kind))
             reqs.append(Requirement(
-                _clip_clause(p), list(dict.fromkeys(terms))[:8],
-                _clause_kind(p, task_kind),
-                req_id=f"R{len(reqs) + 1}"))
+                p, terms, kind, req_id=f"R{len(reqs) + 1}"))
     return reqs[:limit]
 
 
@@ -1077,8 +1351,10 @@ def requirement_ledger(task: str, limit: int = 5) -> list[tuple[str, list[str]]]
     """[(requirement text, key terms)] for up to `limit` clauses of the task.
     Heuristic and free: split on sentence/bullet/`and add ...` boundaries, keep
     each clause's distinctive words (identifiers, file names, numbers,
-    quoted text)."""
-    return [(r.text, r.terms) for r in _requirements_from_task(task, limit)]
+    quoted text). Constraint clauses ("change nothing else") are excluded: they
+    bind the model but are not steps to implement (BUG-306)."""
+    return [(r.text, r.terms) for r in _requirements_from_task(task, limit)
+            if r.kind != "constraint"]
 
 
 class RequirementTracker:
@@ -1225,7 +1501,13 @@ class RequirementTracker:
             if not good or not rel:
                 continue
             rel = _resolve_rel(rel)
-            text = f"{rel}\n{before}\n{after}"
+            # BUG-305/330: a hunk used to be evidence for EVERY clause whose
+            # generic terms matched the file path, or whose anchors/read spans
+            # merely touched the file -- so each file was tagged with every
+            # clause in the run. Attribute a hunk only to a clause that names
+            # the file, or whose DISTINCTIVE terms appear in the hunk's own
+            # search/replace text (not the path, not a read overlap).
+            body = f"{before}\n{after}"
             for req in self.items:
                 if not req.is_edit or req.final:
                     continue
@@ -1235,12 +1517,19 @@ class RequirementTracker:
                     # import-only hunk to a test file (BUG-205): only a
                     # declaration-bearing edit promotes it.
                     continue
-                hit = _match_score(req.terms, text)
-                overlap = any(
-                    _same_file(rel, a_rel)
-                    for a_rel, _a, _b in req.anchors + req.read_spans)
-                if not (hit or overlap):
-                    continue
+                names_file = _clause_names_file(req.text, rel)
+                if not names_file:
+                    specific = _specific_terms(req.terms)
+                    if _FILE_TOKEN_RE.search(req.text):
+                        # The clause scopes itself to named file(s): a hunk
+                        # in ANOTHER file serves it only through an
+                        # identifier the clause names. A shared prose word
+                        # ("pattern", "preset") is not evidence -- that was
+                        # the residual all-to-all of BUG-305/330.
+                        specific = [t for t in specific
+                                    if _IDENT_TERM_RE.search(t)]
+                    if not _match_score(specific, body):
+                        continue
                 req.add_edit(rel)
                 if self._advance(req, REQ_EDITED):
                     changed.append(req)
@@ -1319,6 +1608,12 @@ class RequirementTracker:
                 for rel, a, b in req.anchors:
                     if any(_same_file(rel, r) and _spans_overlap(a, b or a, x, y)
                            for r, x, y in req.read_spans):
+                        continue
+                    # BUG-329: a generic term can locate a clause in an
+                    # unrelated prose/reference doc (a bug log, a README).
+                    # Never auto-read such a file unless the task names it.
+                    if _is_reference_doc(rel) \
+                            and not _clause_names_file(self.task, rel):
                         continue
                     start, end = max(1, a), max(0, b)
                     # A grep hit names a line; when it lands inside an indexed
@@ -1455,7 +1750,12 @@ def _unaddressed(task: str, reply: str, edits,
         return []
     tracker.observe_edit(edits)
     tracker.observe_report(reply)
-    edit_hay = "\n".join(_edit_evidence_text(e) for e in edits).lower()
+    # Only APPLIED edits are evidence. A rejected hunk (ok=False) still carries
+    # the model's attempted `replace` text, which mentions every symbol the
+    # clause names; counting it let a failed edit satisfy the clause and defeat
+    # the R4 coverage follow-up in exactly the case it exists for (BUG-308).
+    edit_hay = "\n".join(_edit_evidence_text(e) for e in edits
+                         if getattr(e, "ok", True)).lower()
     # Only content-bearing test edits can address a test clause: an
     # import-only hunk to a test file mentions the symbol but adds no tests
     # (BUG-205), so its text is not evidence for one.
@@ -1467,6 +1767,10 @@ def _unaddressed(task: str, reply: str, edits,
     prose_hay = _prose(reply).lower()
     out = []
     for req in reqs:
+        if req.kind == "constraint":
+            # A prohibition has no positive evidence to find; it is never
+            # "unaddressed" and never seeds a follow-up (BUG-306).
+            continue
         text, terms = req.text, req.terms
         is_test_clause = "test" in text.lower()
         # An EDIT clause is addressed by edit evidence only: prose that
@@ -1694,6 +1998,7 @@ def check(agent, task: str, reply: str, results, gathered: str = ""
                 results,
                 root=getattr(getattr(agent, "index", None), "root", None),
                 cfg=cfg)
+            findings += check_static_js(results)
         findings += check_placeholders(task, edits)
         findings += check_unread(agent, edits, results)
         findings += check_stale_references(agent, results)
@@ -1701,10 +2006,14 @@ def check(agent, task: str, reply: str, results, gathered: str = ""
         findings += check_lost_wiring(agent, results, task)
         findings += check_oversized_rewrite(agent, results, task)
         findings += check_citations(agent, reply)
+        findings += check_doc_grounding(agent, results)
         tracker = getattr(agent, "requirements", None)
         if tracker is not None and getattr(tracker, "task", "") != task:
             tracker = None
-        findings += check_coverage(task, reply, edits, tracker=tracker)
+        if not getattr(agent, "_is_repair", False):
+            # A repair prompt is harness diagnostic text, not a user brief:
+            # its "clauses" are gate output and instructions (BUG-314).
+            findings += check_coverage(task, reply, edits, tracker=tracker)
         findings += check_fuzzy(results)
     except Exception as e:                  # a checker bug must not block a task
         findings.append(Finding("model", "warn", "",

@@ -61,6 +61,29 @@ _TS_IDENT_TYPES = frozenset({
 
 _MAX_RENAME_BYTES = 4_000_000
 
+# BUG-319: the rename deliberately leaves string literals alone, so a test
+# label like describe('pattern: toggleStep') keeps naming the old symbol and
+# the test report lies about the API. These quoted-span matchers find such
+# leftovers so the run can REPORT them (never rewrite them -- that stays the
+# model's/user's call). Comments are not quoted spans, so they are excluded.
+_STRING_SPAN_RE = re.compile(
+    r"\"(?:[^\"\\\n]|\\.)*\"|'(?:[^'\\\n]|\\.)*'|`(?:[^`\\]|\\.)*`", re.S)
+
+
+def _string_mentions(text: str, old: str, cap: int = 8) -> list[tuple[int, str]]:
+    """(line, snippet) for each string literal in `text` that still contains
+    `old` as a whole word. A notice, not a write: regex-level and capped."""
+    word = re.compile(rf"\b{re.escape(old)}\b")
+    out: list[tuple[int, str]] = []
+    for m in _STRING_SPAN_RE.finditer(text):
+        if word.search(m.group(0)):
+            line = text.count("\n", 0, m.start()) + 1
+            snippet = " ".join(m.group(0).split())[:80]
+            out.append((line, snippet))
+            if len(out) >= cap:
+                break
+    return out
+
 
 def _rename_python(text: str, old: str, new: str) -> tuple[str, int]:
     """Replace NAME tokens equal to `old` (strings and comments untouched)."""
@@ -441,6 +464,7 @@ def rename_symbol_across_project(root, old_name: str, new_name: str,
     changes: dict[str, tuple[str, str, int, object]] = {}
     skipped: list[str] = []
     warnings: list[str] = []
+    string_matches: list[str] = []
     for rel in files:
         why = safety.is_protected(rel)
         if why:
@@ -469,6 +493,14 @@ def rename_symbol_across_project(root, old_name: str, new_name: str,
                                     "tree-sitter grammar available)")
             else:
                 new_text, n = res
+        # BUG-319: note string literals that still name the old symbol (test
+        # labels, docs) so the caller can surface them. Scan the post-rename
+        # text so the identifiers just renamed do not count as leftovers.
+        if len(string_matches) < 20:
+            for line, snippet in _string_mentions(new_text, old_name):
+                string_matches.append(f"{rel}:{line}: {snippet}")
+                if len(string_matches) >= 20:
+                    break
         if n == 0:
             continue
         bad = _validate(path, new_text)
@@ -521,7 +553,8 @@ def rename_symbol_across_project(root, old_name: str, new_name: str,
             "per_file": {rel: n for rel, (_b, _a, n, _s)
                          in changes.items()},
             "skipped": skipped,
-            "warnings": warnings}
+            "warnings": warnings,
+            "string_matches": string_matches}
 
 
 def tool_rename_symbol(index, cfg, old: str, new: str, file: str = "",
@@ -564,6 +597,12 @@ def tool_rename_symbol(index, cfg, old: str, new: str, file: str = "",
         out.append("WARNINGS: " + "; ".join(res["warnings"]))
     if res.get("skipped"):
         out.append("NOT checked: " + "; ".join(res["skipped"][:6]))
+    if res.get("string_matches"):
+        out.append(
+            f"NOTE: {len(res['string_matches'])} string literal(s) still name "
+            f"`{old}` (test labels, docs). The rename leaves strings untouched "
+            "by design; update them if they name the API:\n  "
+            + "\n  ".join(res["string_matches"][:8]))
     if dry_run:
         out.append("(dry run: nothing was written)")
     else:

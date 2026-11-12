@@ -42,9 +42,24 @@ WIDE_TASK_FILES = 5
 
 
 def requirement_titles(task: str, limit: int = 6) -> list[str]:
-    """One step per clearly separate requirement, '' when it is one change."""
-    reqs = verify.requirement_ledger(task, limit=limit)
-    return [text for text, _terms in reqs] if len(reqs) >= 2 else []
+    """One step per clearly separate requirement, '' when it is one change.
+
+    A leading goal-summary clause with no verb of its own ("Bring the
+    feature to a working, tested state") is not a step: as step 1 it is
+    free to implement the whole plan, and every later step becomes a no-op
+    (BUG-312). Drop it when concrete clauses follow; the full goal still
+    rides along as background context for every step."""
+    # One extra slot: the umbrella clause must not eat a concrete step's
+    # place under the cap (the src/main.js step lost to it in BUG-312).
+    reqs = verify.requirement_ledger(task, limit=limit + 1)
+    if len(reqs) >= 2:
+        first = reqs[0][0]
+        if not (verify._REQ_EDIT_RE.search(first)
+                or verify._REQ_REPORT_RE.search(first)):
+            reqs = reqs[1:]
+    if len(reqs) < 2:
+        return []
+    return [text for text, _terms in reqs][:limit]
 
 
 def should_plan(task: str, idx, cfg) -> bool:
@@ -129,7 +144,9 @@ def run_planned(root: Path, cfg, client, idx, task: str, *, apply: bool,
     print(f"\n--- plan ({how}; {len(titles)} step(s)) -> "
           f"{plan_path.relative_to(root)} ---", file=sys.stderr)
     for i, t in enumerate(titles, 1):
-        print(f"  {i}. {t}", file=sys.stderr)
+        # Display-only clip: the plan file and the step's task text keep the
+        # FULL clause (its tail is the requirement, BUG-328).
+        print(f"  {i}. {verify._clip_clause(t)}", file=sys.stderr)
     workspace.log_event(root, f"plan mode: {len(titles)} step(s) via {how}")
     if not apply:
         print("\nDry run: the steps above would each run in a fresh context "

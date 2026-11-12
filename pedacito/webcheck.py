@@ -79,6 +79,16 @@ _HANDLER_ATTR_RE = re.compile(r"""\bon[a-z]+\s*=\s*(?:"([^"]*)"|'([^']*)')""",
                               re.I)
 _ID_ATTR_RE = re.compile(r"""\bid\s*=\s*(?:"([^"]*)"|'([^']*)')""", re.I)
 
+# A <select> and its body, and an <option> tag (BUG-324: an empty dropdown is a
+# dead control). _OPTION_POPULATION_RE is evidence that JS builds options at
+# runtime -- when it fires anywhere, an empty <select> may be filled dynamically
+# and the finding is suppressed (webcheck stays conservative).
+_SELECT_TAG_RE = re.compile(r"<select\b([^>]*)>(.*?)</select\s*>", re.I | re.S)
+_OPTION_TAG_RE = re.compile(r"<option\b", re.I)
+_OPTION_POPULATION_RE = re.compile(
+    r"new\s+Option\s*\(|createElement\s*\(\s*[\"']option|<option\b"
+    r"|\.options\s*\.\s*add\s*\(", re.I)
+
 # ``import``/``export`` statements (never the dynamic ``import(``, which is
 # legal in classic scripts). Only horizontal space before the keyword, so
 # the match starts on the keyword's own line (line numbers stay honest).
@@ -311,6 +321,39 @@ def _id_findings(rel, text, offset, ids, peer):
                 f"no element with id '{name}' exists in any HTML file -- "
                 + _null_consequence(text, m, method),
                 peer=peer))
+    return out
+
+
+def _empty_select_findings(htmls, jss) -> list[Finding]:
+    """BUG-324: a <select> with no <option> children is a dead control -- the
+    user can open the dropdown but choose nothing, so the feature it feeds is
+    unusable even though every id and module binding checks out. Flag empty
+    selects unless some script builds options at runtime (then the markup may
+    be filled dynamically and we cannot prove it is dead). Regex-level and
+    conservative, like every webcheck notice."""
+    # Population evidence lives in JS only -- searching the HTML markup would
+    # match the selects' own <option> tags and suppress everything. Gather the
+    # standalone JS plus every inline <script> body.
+    js_texts = [text for _rel, text in jss]
+    for _rel, text in htmls:
+        for sm in _SCRIPT_TAG_RE.finditer(text):
+            js_texts.append(sm.group(2))
+    if any(_OPTION_POPULATION_RE.search(t) for t in js_texts):
+        return []
+    out: list[Finding] = []
+    for rel, text in htmls:
+        for m in _SELECT_TAG_RE.finditer(text):
+            attrs, body = m.group(1), m.group(2)
+            if _OPTION_TAG_RE.search(body):
+                continue
+            idm = _ID_ATTR_RE.search(attrs)
+            name = _first_group(idm) if idm else ""
+            ident = f"#{name}" if name else "<select>"
+            out.append(Finding(
+                rel, _line_of(text, m.start()),
+                f"{ident} has no <option> children and no script builds any "
+                "-- the dropdown is empty, so the feature it feeds cannot be "
+                "used"))
     return out
 
 
@@ -1391,6 +1434,9 @@ def run(root, files: list[str] | None = None) -> list[Finding]:
             findings.extend(_id_findings(rel, _first_group(m),
                                          _line_of(text, m.start()) - 1, ids,
                                          rel))
+
+    # --- check 10: empty <select> controls (BUG-324) ------------------------
+    findings.extend(_empty_select_findings(htmls, jss))
 
     # --- check 4: bare imports vs package.json ------------------------------
     deps = _pkg_deps(root)

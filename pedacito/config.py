@@ -1261,7 +1261,14 @@ def load(root: Path | None = None, explicit: Path | None = None,
             settings = _drop_untrusted(path, settings, root)
             found = {n: _drop_untrusted(path, b, root, quiet=True)
                      for n, b in found.items()}
-        profiles.update(found)
+        # BUG-326: merge each profile per key over the earlier layers instead
+        # of replacing it wholesale. A partial `[profiles.X]` in --config (say
+        # only repair_rounds) used to drop the user profile's base_url/model,
+        # silently falling back to [universal] and failing with a generic
+        # "cannot reach the server". Later layers still win on the keys they
+        # actually set.
+        for name, body in found.items():
+            profiles[name] = {**profiles.get(name, {}), **body}
         for key, value in settings.items():
             setattr(cfg, key, _coerce(key, value, path))
             cfg.sources[key] = f"{label} ({path})"

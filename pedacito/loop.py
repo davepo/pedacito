@@ -906,6 +906,9 @@ def _failure_score(output: str, diag: bool = False) -> int:
         score = int(m.group(1))
         e = re.search(r"(\d+) errors?", text)
         return score + (int(e.group(1)) if e else 0)
+    nm = _NODE_FAIL_COUNT_RE.search(text)   # Node `# fail N` / `ℹ fail N`
+    if nm:
+        return int(nm.group(1) or nm.group(2))
     if diag:
         return sum(1 for ln in text.splitlines()
                    if re.match(r"^\S+?:\d+(?::\d+)?:", ln)) or 1
@@ -934,6 +937,15 @@ _PYTEST_FRAME_RE = re.compile(
 _TRACEBACK_EXC_RE = re.compile(
     r"(?m)^(?P<exc>[A-Za-z_][\w.]*(?:Error|Exception|Failure|Exit))\b"
     r"(?::\s*(?P<msg>.*))?$")
+# Node `--test` output (BUG-322): the TAP reporter prints `not ok N - name`
+# with an indented YAML detail block; the default spec reporter prints a
+# `✖ name` line with an indented AssertionError + stack. Neither matches the
+# pytest regexes, so without these every Node failure classified as 0/0/0/0.
+_NODE_TAP_NOTOK_RE = re.compile(r"^\s*not ok\s+\d+\s+-\s+(?P<name>.+?)\s*$")
+_NODE_SPEC_FAIL_RE = re.compile(
+    r"^\s*(?:✖|✗|×)\s+(?P<name>.+?)\s*(?:\(\d[\d.]*\s*ms\))?\s*$")
+_NODE_FAIL_COUNT_RE = re.compile(
+    r"(?m)^(?:#\s*fail\s+(\d+)|ℹ\s*fail\s+(\d+))\s*$")
 
 
 @dataclass
@@ -1104,8 +1116,57 @@ def _block_match(node_id: str, blocks: list[tuple[str, str]],
     return None
 
 
+def _node_failure_identities(text: str) -> dict[str, FailureIdentity]:
+    """Failing-test identities from Node `--test` output (TAP or spec reporter,
+    BUG-322). Each `not ok N - name` / `✖ name` line plus its indented detail
+    block becomes one identity keyed by the test name, with the assertion
+    signature and source location parsed out of the block."""
+    infos: dict[str, FailureIdentity] = {}
+    lines = (text or "").splitlines()
+    i, n = 0, len(lines)
+    while i < n:
+        m = (_NODE_TAP_NOTOK_RE.match(lines[i])
+             or _NODE_SPEC_FAIL_RE.match(lines[i]))
+        if not m:
+            i += 1
+            continue
+        name = re.sub(r"\s+", " ", m.group("name").strip())
+        j = i + 1
+        block: list[str] = []
+        while j < n and (lines[j][:1] in (" ", "\t") or not lines[j].strip()):
+            if lines[j].strip():
+                block.append(lines[j].strip())
+            j += 1
+        btext = "\n".join(block)
+        sig = ""
+        em = re.search(r"error:\s*(.+)", btext)
+        if em:
+            sig = em.group(1).strip().strip("'\"")
+        else:
+            for bl in block:
+                if re.search(r"\b\w*(?:Error|Exception)\b", bl):
+                    sig = bl
+                    break
+        signature = _normalise_failure_signature(sig or name)
+        file, lineno = "", 0
+        lm = re.search(r"location:\s*'?([^':\n]+):(\d+)", btext)
+        if lm:
+            file, lineno = lm.group(1), int(lm.group(2))
+        else:
+            fm = re.search(r"at\s+[^\n(]*\(?([^()\s]+):(\d+):\d+\)?", btext)
+            if fm:
+                file, lineno = fm.group(1), int(fm.group(2))
+        info = FailureIdentity("node::" + name, signature, "failed")
+        info.file, info.line = file, lineno
+        info.block = btext
+        infos[info.test_id] = info
+        i = j
+    return infos
+
+
 def failure_identities(output: str) -> dict[str, FailureIdentity]:
-    """Stable failing-test identities from a pytest run, keyed by node id.
+    """Stable failing-test identities from a pytest or Node `--test` run, keyed
+    by node id / test name.
 
     The short summary supplies ids and reasons; the FAILURES/ERRORS blocks
     add the source location and project traceback frames. When a run has no
@@ -1141,6 +1202,10 @@ def failure_identities(output: str) -> dict[str, FailureIdentity]:
                 old.signature = info.signature
         else:
             infos[info.test_id] = info
+    if not infos:
+        # Node `--test` (TAP / spec) before the bare-traceback fallback, so a
+        # red Node suite classifies by identity instead of 0/0/0/0 (BUG-322).
+        infos = _node_failure_identities(text)
     if not infos:
         frames = [(m.group("file"), int(m.group("line")),
                    m.group("func").strip())
@@ -2054,6 +2119,25 @@ def _post_edit_tests(root, cfg, agent, idx, task, results, reply, backup_dir,
             text = getattr(e, "message", None) or str(e)
             collect.append(verify_mod.Finding(kind, "error", "", str(text)))
 
+    def unresolved_tests(severity, diff, score, out) -> None:
+        """Record a red suite as a finding so task.findings / RPC blockers name
+        it even without --strict (BUG-323). A purely pre-existing failure is a
+        warning (R2: it predates this task); a new failure is an error."""
+        if collect is None:
+            return
+        if diff.new:
+            msg = (f"{len(diff.new)} new test failure(s) introduced by this "
+                   f"task; {len(diff.still_failing)} still failing")
+        elif score > 0:
+            msg = (f"the test suite is still red: {score} failure(s), "
+                   f"{len(diff.pre_existing)} pre-existing")
+        else:
+            msg = "the test suite is still failing after this task"
+        tail = [ln for ln in (out or "").strip().splitlines() if ln.strip()][-6:]
+        if tail:
+            msg += "\n" + "\n".join(tail)
+        collect.append(verify_mod.Finding("tests", severity, "", msg))
+
     changed = sorted({r.file for r in results if r.ok and r.file}) or edit_files
     base_out = (baseline[1] if baseline is not None and not baseline[0]
                 else "")
@@ -2083,15 +2167,18 @@ def _post_edit_tests(root, cfg, agent, idx, task, results, reply, backup_dir,
             events_mod.get(root, cfg).emit(
                 "tests", ok=False, score=len(syntax), baseline=base_score,
                 round=round_, syntax=True, new=len(syntax), fixed=0,
-                still_failing=0, pre_existing=len(base_failures))
+                still_failing=0, pre_existing=len(base_failures),
+                violations=[str(f.message)[:200] for f in syntax[:10]])
             if round_ >= max_rounds:
                 unresolved('syntax', syntax)
                 break
             fixed = agent._repair_from_findings(task, reply, syntax, results)
             if not fixed:
+                unresolved('syntax', syntax)   # BUG-311: keep the blocker
                 break
             new = agent._apply_once(fixed, False, backup_dir)
             if not any(r.ok for r in new):
+                unresolved('syntax', syntax)
                 break
             results = _merge_repair_results(results, new)
             reply = (reply.rstrip() + "\n\n" + fixed)
@@ -2131,9 +2218,11 @@ def _post_edit_tests(root, cfg, agent, idx, task, results, reply, backup_dir,
             fixed = agent._repair_from_findings(task, reply, [finding],
                                                 results)
             if not fixed:
+                unresolved('static', static)    # BUG-311: keep the blocker
                 break
             new = agent._apply_once(fixed, False, backup_dir)
             if not any(r.ok for r in new):
+                unresolved('static', static)
                 break
             results = _merge_repair_results(results, new)
             reply = (reply.rstrip() + "\n\n" + fixed)
@@ -2160,10 +2249,17 @@ def _post_edit_tests(root, cfg, agent, idx, task, results, reply, backup_dir,
             workspace.log_event(
                 root, "frontend contract gate rejected the patch; "
                       "test/lint subprocess skipped", "ERROR")
+            # BUG-318: name the violations, not just their count, so the run
+            # log and event stream record what was rejected even when the
+            # repair produces nothing.
+            for v in fe[:10]:
+                workspace.log_event(
+                    root, f"frontend contract: {str(v)[:200]}", "ERROR")
             events_mod.get(root, cfg).emit(
                 "tests", ok=False, score=len(fe), baseline=base_score,
                 round=round_, frontend=True, new=len(fe), fixed=0,
-                still_failing=0, pre_existing=len(base_failures))
+                still_failing=0, pre_existing=len(base_failures),
+                violations=[str(e)[:200] for e in fe[:10]])
             if round_ >= max_rounds:
                 unresolved('frontend', fe)
                 break
@@ -2178,9 +2274,11 @@ def _post_edit_tests(root, cfg, agent, idx, task, results, reply, backup_dir,
             fixed = agent._repair_from_findings(task, reply, [finding],
                                                 results)
             if not fixed:
+                unresolved('frontend', fe)      # BUG-311: keep the blocker
                 break
             new = agent._apply_once(fixed, False, backup_dir)
             if not any(r.ok for r in new):
+                unresolved('frontend', fe)
                 break
             results = _merge_repair_results(results, new)
             reply = (reply.rstrip() + "\n\n" + fixed)
@@ -2208,7 +2306,8 @@ def _post_edit_tests(root, cfg, agent, idx, task, results, reply, backup_dir,
             events_mod.get(root, cfg).emit(
                 "tests", ok=False, score=len(ce), baseline=base_score,
                 round=round_, contract=True, new=len(ce), fixed=0,
-                still_failing=0, pre_existing=len(base_failures))
+                still_failing=0, pre_existing=len(base_failures),
+                violations=[str(e)[:200] for e in ce[:10]])
             if round_ >= max_rounds:
                 unresolved('contract', ce)
                 break
@@ -2222,9 +2321,11 @@ def _post_edit_tests(root, cfg, agent, idx, task, results, reply, backup_dir,
             fixed = agent._repair_from_findings(task, reply, [finding],
                                                 results)
             if not fixed:
+                unresolved('contract', ce)      # BUG-311: keep the blocker
                 break
             new = agent._apply_once(fixed, False, backup_dir)
             if not any(r.ok for r in new):
+                unresolved('contract', ce)
                 break
             results = _merge_repair_results(results, new)
             reply = (reply.rstrip() + "\n\n" + fixed)
@@ -2253,7 +2354,8 @@ def _post_edit_tests(root, cfg, agent, idx, task, results, reply, backup_dir,
             events_mod.get(root, cfg).emit(
                 "tests", ok=False, score=len(de), baseline=base_score,
                 round=round_, dom=True, new=len(de), fixed=0,
-                still_failing=0, pre_existing=len(base_failures))
+                still_failing=0, pre_existing=len(base_failures),
+                violations=[str(e)[:200] for e in de[:10]])
             if round_ >= max_rounds:
                 unresolved('dom', de)
                 break
@@ -2268,9 +2370,11 @@ def _post_edit_tests(root, cfg, agent, idx, task, results, reply, backup_dir,
             fixed = agent._repair_from_findings(task, reply, [finding],
                                                 results)
             if not fixed:
+                unresolved('dom', de)           # BUG-311: keep the blocker
                 break
             new = agent._apply_once(fixed, False, backup_dir)
             if not any(r.ok for r in new):
+                unresolved('dom', de)
                 break
             results = _merge_repair_results(results, new)
             reply = (reply.rstrip() + "\n\n" + fixed)
@@ -2351,8 +2455,10 @@ def _post_edit_tests(root, cfg, agent, idx, task, results, reply, backup_dir,
                 print(f"  [tests: {score} failure(s) remain; the suite "
                       f"already had {base_score} before this task, so they "
                       "predate it and were not auto-repaired]", file=sys.stderr)
+            unresolved_tests("warn", diff, score, last_out)   # BUG-323
             break
         if round_ >= max_rounds:
+            unresolved_tests("error", diff, score, last_out)  # BUG-323
             break
         packet = traceback_repair_packet(root, diff, current=current)
         intro = ("after your edits these tests fail (they did not before):\n"
@@ -2361,9 +2467,11 @@ def _post_edit_tests(root, cfg, agent, idx, task, results, reply, backup_dir,
         finding = verify_mod.Finding("tests", "error", "", intro + packet)
         fixed = agent._repair_from_findings(task, reply, [finding], results)
         if not fixed:
+            unresolved_tests("error", diff, score, last_out)  # BUG-323
             break
         new = agent._apply_once(fixed, False, backup_dir)
         if not any(r.ok for r in new):
+            unresolved_tests("error", diff, score, last_out)  # BUG-323
             break
         results = _merge_repair_results(results, new)
         reply = (reply.rstrip() + "\n\n" + fixed)
@@ -2913,7 +3021,8 @@ _SEMANTIC_FAILURE_RE = re.compile(
 
 def run_task(root: Path, cfg, client, agent, idx, task: str, *,
              apply: bool = True, review: bool = False,
-             answer_system: str | None = None) -> TaskResult:
+             answer_system: str | None = None,
+             is_repair: bool = False) -> TaskResult:
     """`_run_ladder`, plus failure memory: a task that ends without a usable
     edit is remembered (files looked at, why) so a similar later task is warned
     off the same dead end; a success clears the warning. Zero-edit runs are
@@ -2928,7 +3037,8 @@ def run_task(root: Path, cfg, client, agent, idx, task: str, *,
         cfg._contract_baseline = None
         cfg._dom_baseline = None
     tr = _run_ladder(root, cfg, client, agent, idx, task, apply=apply,
-                     review=review, answer_system=answer_system)
+                     review=review, answer_system=answer_system,
+                     is_repair=is_repair)
     if answer_system is not None or review or not getattr(cfg, "use_memory", True):
         return tr
     try:
@@ -2966,7 +3076,8 @@ def run_task(root: Path, cfg, client, agent, idx, task: str, *,
 
 def _run_ladder(root: Path, cfg, client, agent, idx, task: str, *,
                 apply: bool = True, review: bool = False,
-                answer_system: str | None = None) -> TaskResult:
+                answer_system: str | None = None,
+                is_repair: bool = False) -> TaskResult:
     """`_run_task_once`, plus the bounded recovery ladder: an unreachable or
     failing worker falls over to the `fallback` role's model, and a task that
     ends with NO edit applied gets one more attempt on the `escalate` role's
@@ -2991,7 +3102,8 @@ def _run_ladder(root: Path, cfg, client, agent, idx, task: str, *,
     # (lease strikes, semantic failures) join it, first reason wins.
     cfg._task_escalation_reason = getattr(cfg, "_pending_escalation_reason", "")
     cfg._pending_escalation_reason = ""
-    kw = dict(apply=apply, review=review, answer_system=answer_system)
+    kw = dict(apply=apply, review=review, answer_system=answer_system,
+              is_repair=is_repair)
     try:
         tr = _run_task_once(root, cfg, client, agent, idx, task, **kw)
     except (BudgetExceeded, CancelledError):
@@ -3084,7 +3196,8 @@ def _run_ladder(root: Path, cfg, client, agent, idx, task: str, *,
 
 def _run_task_once(root: Path, cfg, client, agent, idx, task: str, *,
                    apply: bool = True, review: bool = False,
-                   answer_system: str | None = None) -> TaskResult:
+                   answer_system: str | None = None,
+                   is_repair: bool = False) -> TaskResult:
     """Run ONE task through the inner loop: gather source, answer (or edit),
     apply or review, re-index the touched files, and write a session log.
 
@@ -3115,7 +3228,7 @@ def _run_task_once(root: Path, cfg, client, agent, idx, task: str, *,
     todo_mod.clear(root)          # a fresh checklist per task; auto has PLAN.md
     _fire(cfg, root, "pre_task", task=task[:500])
     print("\n--- looking things up ---", file=sys.stderr)
-    gathered = agent.gather(task, backup_dir=backup_dir)
+    gathered = agent.gather(task, backup_dir=backup_dir, is_repair=is_repair)
     # Files a gather-phase action wrote/moved/deleted (write/append/move/
     # delete/rename). A worker that finishes the job with gather actions --
     # the deepclitest pattern -- produces no answer-phase edit blocks, and
@@ -3228,13 +3341,16 @@ def _run_task_once(root: Path, cfg, client, agent, idx, task: str, *,
         elif answer_system is None and not parse_edits(raw_reply):
             # P1a shadow mode: a no-edit reply gets the grounded-prose checks
             # logged (citations, ungrounded identifiers, unaddressed
-            # requirements), never acted on.
-            try:
-                from . import verify as verify_mod
-                for f in verify_mod.prose_shadow(agent, task, raw_reply):
-                    workspace.log_event(root, f"prose: {f.render()}", "WARN")
-            except Exception:
-                pass
+            # requirements), never acted on. A repair prompt is harness
+            # diagnostic text, not user requirements: mining it produced
+            # coverage clauses like 'Fix these first:' (BUG-314).
+            if not is_repair:
+                try:
+                    from . import verify as verify_mod
+                    for f in verify_mod.prose_shadow(agent, task, raw_reply):
+                        workspace.log_event(root, f"prose: {f.render()}", "WARN")
+                except Exception:
+                    pass
         truncated = bool(getattr(client, "stream_truncated", False))
         if truncated:
             workspace.log_event(root, "answer reply truncated at the output "
@@ -3866,6 +3982,16 @@ def run_loop(root: Path, cfg, client, idx, plan_path: Path, *,
                 workspace.log_event(
                     root, f"plan exhausted with {failed} failed task(s); "
                           f"not a clean finish", "ERROR")
+            elif strict_bad:
+                # BUG-313: every box is ticked, but --strict rejected at
+                # least one task's edits/tests. "All tasks complete." read
+                # as a clean finish while the exit code said 1.
+                print("\nAll tasks are ticked, but the run is NOT clean "
+                      "under --strict: at least one task left failed edit "
+                      "blocks or failing tests (exit 1).", file=sys.stderr)
+                workspace.log_event(
+                    root, "all tasks ticked but --strict flagged unclean "
+                          "task(s); not a clean finish", "ERROR")
             else:
                 print("\nAll tasks complete.", file=sys.stderr)
                 workspace.log_event(root, "all tasks complete")
@@ -4366,7 +4492,7 @@ def run_loop(root: Path, cfg, client, idx, plan_path: Path, *,
                 try:
                     tr2 = run_task(root, cfg, client, Agent(idx, client, cfg),
                                    idx, fix_task, apply=apply, review=False,
-                                   answer_system=answer_system)
+                                   answer_system=answer_system, is_repair=True)
                 except LLMError as e:
                     print(f"  repair failed: {e}", file=sys.stderr)
                     workspace.log_event(root, f"repair failed: {e}", "ERROR")
@@ -4535,7 +4661,10 @@ def run_loop(root: Path, cfg, client, idx, plan_path: Path, *,
             pass
     print(f"\n[{done} task(s) done, {failed} failed"
           + (f", {rolled_back} step(s) rolled back to the last green "
-             f"checkpoint" if rolled_back else "") + "]", file=sys.stderr)
+             f"checkpoint" if rolled_back else "")
+          + (", --strict: task(s) ticked done with failed blocks or "
+             "failing tests -- NOT a clean finish" if strict_bad else "")
+          + "]", file=sys.stderr)
     remaining = sum(1 for ln in read_plan(plan_path) if _is_unchecked(ln))
     if remaining:
         # Stopped with work outstanding (a cap, a time limit, or a failed
@@ -4548,8 +4677,10 @@ def run_loop(root: Path, cfg, client, idx, plan_path: Path, *,
     workspace.log_event(root, f"auto loop finished: {done} done, "
                               f"{failed} failed, {remaining} left"
                               + (f", {rolled_back} rolled back"
-                                 if rolled_back else ""),
-                        "ERROR" if failed else "INFO")
+                                 if rolled_back else "")
+                              + (", strict: unclean task(s)" if strict_bad
+                                 else ""),
+                        "ERROR" if failed or strict_bad else "INFO")
     if partial_tasks:
         # The reported defect was silence: say it plainly at the end too.
         print(f"  [{len(partial_tasks)} task(s) ticked done with blocks that "

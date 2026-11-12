@@ -238,7 +238,7 @@ def test_run_loop_injects_contract_map(tmp_path, monkeypatch):
     calls = []
 
     def fake_run_task(root, cfg, client, agent, idx_, task, apply=True,
-                      review=False, answer_system=None):
+                      review=False, answer_system=None, is_repair=False):
         calls.append(task)
         return _result(idx_, ["lib.py"])
 
@@ -263,7 +263,7 @@ def test_run_loop_injection_off_when_interface_lock_false(tmp_path,
     calls = []
 
     def fake_run_task(root, cfg, client, agent, idx_, task, apply=True,
-                      review=False, answer_system=None):
+                      review=False, answer_system=None, is_repair=False):
         calls.append(task)
         return _result(idx_, ["lib.py"])
 
@@ -285,7 +285,7 @@ def test_run_loop_gate_feeds_contract_errors_into_repair(tmp_path,
     seen = []
 
     def fake_run_task(root, cfg, client, agent, idx_, task, apply=True,
-                      review=False, answer_system=None):
+                      review=False, answer_system=None, is_repair=False):
         seen.append(task)
         return _result(idx_, ["app.py"])
 
@@ -306,7 +306,7 @@ def test_run_loop_gate_passes_clean_project(tmp_path, monkeypatch):
     idx = types.SimpleNamespace(root=tmp_path)
 
     def fake_run_task(root, cfg, client, agent, idx_, task, apply=True,
-                      review=False, answer_system=None):
+                      review=False, answer_system=None, is_repair=False):
         return _result(idx_, ["app.py"])
 
     monkeypatch.setattr(loop, "run_task", fake_run_task)

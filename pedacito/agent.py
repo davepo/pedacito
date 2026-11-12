@@ -444,6 +444,29 @@ def _read_has_new_lines(obs: str, prior_spans: list[tuple[int, int]]) -> bool:
     return False
 
 
+def _delivered_end(obs: str, start: int) -> int:
+    """The last numbered source line a (possibly cut) read observation
+    actually shows, or ``start - 1`` when none survived. The span ledger
+    must credit only delivered lines: a range recorded for lines a budget
+    cut removed turns every later read of them into a false "already read"
+    note (BUG-309)."""
+    if not _READ_HEAD_RX.match(obs):
+        return start - 1
+    _, body = _split_read_obs(obs)
+    end = start - 1
+    for ln in body.split("\n"):
+        pm = _NUMBERED_LINE_RX.match(ln)
+        if pm:
+            end = max(end, int(pm.group(1)))
+    if "[truncated: context budget" in body and end >= start:
+        # The char cut can land mid-line: the last numbered line may be only
+        # a prefix. The evidence store drops it (a half line is not
+        # addressable source); the ledger must agree, or the two credit
+        # different ranges for the same read.
+        end -= 1
+    return end
+
+
 def _evict_duplicate_reads(messages: list[dict], gathered: list[str],
                            spans: dict[str, list[tuple[int, int]]]) -> list[str]:
     """Rewrite duplicate source out of the conversation and the SOURCE block.
@@ -1713,9 +1736,14 @@ class Agent:
         copied: list[EvidenceSpan] = []
         if not isinstance(getattr(self, "_read_spans", None), dict):
             self._read_spans = {}
-        for span in selected:
-            copy = self.evidence.record(span.file, span.start, span.end,
-                                        span.exact_text, span.read_step)
+        # BUG-309: the evidence block is token-bounded -- a span it clips or
+        # drops was never shown to the parent, so the ledger and the evidence
+        # store must credit only the lines the render actually delivers.
+        for span, delivered_end in self._clip_subagent_spans(selected):
+            kept_text = "\n".join(str(span.exact_text or "").split("\n")
+                                  [:delivered_end - int(span.start) + 1])
+            copy = self.evidence.record(span.file, span.start, delivered_end,
+                                        kept_text, span.read_step)
             copied.append(copy)
             key = _norm_key(copy.file)
             ledger = self._read_spans.setdefault(key, [])
@@ -1737,14 +1765,15 @@ class Agent:
                        sha=copy.content_sha[:12])
         return copied
 
-    def _render_subagent_evidence(self,
-                                  spans: list[EvidenceSpan]) -> str:
-        """Numbered, token-bounded evidence block appended under the digest."""
-        if not spans:
-            return ""
+    def _clip_subagent_spans(self, spans: list[EvidenceSpan]
+                             ) -> list[tuple[EvidenceSpan, int]]:
+        """(span, delivered_end) pairs the token-bounded evidence block will
+        actually show: a clipped span credits only its kept lines, and a span
+        that does not fit at all is dropped. Shared by the render and the
+        ledger credit so the two can never disagree (BUG-309)."""
         budget = self._read_budget_chars()
         used = 0
-        chunks: list[str] = []
+        out: list[tuple[EvidenceSpan, int]] = []
         for span in spans:
             lines = str(span.exact_text or "").split("\n")
             if not lines or not lines[0]:
@@ -1752,7 +1781,7 @@ class Agent:
             width = max(1, len(str(int(span.start) + len(lines) - 1)))
             header = (f"{span.file} lines {int(span.start)}-"
                       f"{int(span.start) + len(lines) - 1}:")
-            kept: list[str] = []
+            kept = 0
             body_used = 0
             for offset, line in enumerate(lines):
                 rendered = f"{int(span.start) + offset:>{width}} | {line}"
@@ -1760,20 +1789,33 @@ class Agent:
                 if budget and kept and used + len(header) + 1 + body_used \
                         + extra > budget:
                     break
-                kept.append(rendered)
+                kept += 1
                 body_used += extra
             if not kept:
                 break
             if budget and used + len(header) + 1 + body_used > budget \
-                    and chunks:
+                    and out:
                 break
-            end = int(span.start) + len(kept) - 1
-            header = f"{span.file} lines {int(span.start)}-{end}:"
-            chunk = header + "\n" + "\n".join(kept)
-            chunks.append(chunk)
-            used += len(chunk) + 1
+            out.append((span, int(span.start) + kept - 1))
+            used += len(header) + 1 + body_used
             if budget and used >= budget:
                 break
+        return out
+
+    def _render_subagent_evidence(self,
+                                  spans: list[EvidenceSpan]) -> str:
+        """Numbered, token-bounded evidence block appended under the digest."""
+        if not spans:
+            return ""
+        chunks: list[str] = []
+        for span, end in self._clip_subagent_spans(spans):
+            lines = str(span.exact_text or "").split("\n")
+            width = max(1, len(str(int(span.start) + len(lines) - 1)))
+            kept = [f"{int(span.start) + offset:>{width}} | {line}"
+                    for offset, line in enumerate(
+                        lines[:end - int(span.start) + 1])]
+            header = f"{span.file} lines {int(span.start)}-{end}:"
+            chunks.append(header + "\n" + "\n".join(kept))
         if not chunks:
             return ""
         return ("\n\nEXACT EVIDENCE ALREADY READ BY THE HELPER (numbered like "
@@ -2035,7 +2077,8 @@ class Agent:
     def gather(self, task: str, verbose: bool = True,
                on_step=None, base: str | None = None,
                backup_dir=None,
-               prefix_messages: list[dict] | None = None) -> str:
+               prefix_messages: list[dict] | None = None,
+               is_repair: bool = False) -> str:
         """Run the tool-calling loop until the model says `done`, the
         gathered-source budget is exhausted, or cfg.max_steps (0 = no limit)
         is reached.
@@ -2056,6 +2099,10 @@ class Agent:
 
         `self.task_targets`, when set, replaces `task` as the text mined for
         the forced-read coverage check.
+
+        `is_repair` marks a harness-generated repair prompt (diagnostic text
+        plus "fix this"): it is NOT a user requirement, so no requirement
+        clauses are mined from it and coverage stays silent (BUG-314).
         """
         # A fresh run: drop any backup directory left by a previous task.
         self.cfg._backup_dir = backup_dir
@@ -2191,8 +2238,13 @@ class Agent:
         self.rehydration_rounds = 0
         # One requirement tracker for this task. It advances only
         # from tool results and patches, never from an extra model call.
+        # A repair prompt is harness diagnostic text, not a user brief:
+        # mining it turned 'Your last change failed this check: ...' and
+        # 'Fix these first:' into coverage clauses (BUG-314).
         from . import verify as verify_mod
-        self.requirements = verify_mod.RequirementTracker(task)
+        self._is_repair = bool(is_repair)
+        self.requirements = verify_mod.RequirementTracker(
+            "" if is_repair else task)
         self.active_diagnostics = {}
         # A fresh task never inherits a repair lock from the previous one
         # (chat reuses one agent across tasks).
@@ -2261,6 +2313,12 @@ class Agent:
         recoveries = {"repeat": 0, "errors": 0, "dup": 0}
         questions = 0            # clarifying questions asked so far
         ran: dict = {}           # step signature -> (step, index gen, folds, mutations)
+        # BUG-320: identical FAILING read-only steps used to be exempt from
+        # repeat suppression (errors are not cached, and the consecutive-step
+        # guard misses non-adjacent repeats), so one bad read ran to the
+        # no-progress lease. Remember each failure's signature; a repeat with
+        # an unchanged world is redirected, not dispatched again.
+        seen_failures: dict = {}
         mutations = 0            # bumps when something that can change results ran
         recover_on = bool(getattr(self.cfg, "stuck_recovery", True))
         # Action-independent global leases: they bound gather even when
@@ -2363,11 +2421,23 @@ class Agent:
                     key = _norm_key(m.group(1))
                     s_, e_ = int(m.group(2)), int(m.group(3))
                     prior = list(spans.get(key, []))
-                    new_lines = _read_has_new_lines(obs, prior)
                     delta = _delta_len(obs, prior)
-                    spans.setdefault(key, []).append((s_, e_))
-                    self.requirements.observe_read(
-                        m.group(1).strip(), s_, e_, obs, self.index)
+                    if delta > budget:
+                        obs = (obs[:budget] +
+                               "\n[truncated: context budget reached]")
+                        budget = 0
+                    else:
+                        budget -= delta
+                    # BUG-309: credit only the lines that survived the cut.
+                    # The old order appended the full requested span BEFORE
+                    # the budget cut, so lines never shown counted as read
+                    # and every later read of them became a duplicate note.
+                    e_ = _delivered_end(obs, s_)
+                    new_lines = _read_has_new_lines(obs, prior)
+                    if e_ >= s_:
+                        spans.setdefault(key, []).append((s_, e_))
+                        self.requirements.observe_read(
+                            m.group(1).strip(), s_, e_, obs, self.index)
                     self._unread_files = self._compute_unread(
                         self._targets_text)
                     if new_lines:
@@ -2378,12 +2448,6 @@ class Agent:
                             f"--- read {payload.get('file') or m.group(1).strip()}"
                             f"\n{obs}")
                         changed = True
-                    if delta > budget:
-                        obs = (obs[:budget] +
-                               "\n[truncated: context budget reached]")
-                        budget = 0
-                    else:
-                        budget -= delta
                 else:
                     budget -= len(obs)
                     self.requirements.observe_search(
@@ -2499,6 +2563,11 @@ class Agent:
                 print(f"  [gather step was {type(stepjson).__name__}, not an "
                       f"action object; moving to answer]", file=sys.stderr)
                 break
+            # BUG-321: the step grammar allows null fields. Drop them so a
+            # null `file` is the SAME step as a missing one -- signature,
+            # dispatch defaults and the log line agree -- instead of the
+            # literal string "None" reaching the tools and the step log.
+            stepjson = {k: v for k, v in stepjson.items() if v is not None}
             action = str(stepjson.get("action") or "").strip()
             why = str(stepjson.get("reasoning") or "").strip()
             sig = _step_signature(stepjson)
@@ -2570,9 +2639,11 @@ class Agent:
             detail = (stepjson.get("file") or stepjson.get("pattern")
                       or stepjson.get("symbol") or stepjson.get("command") or "")
             if action == "read":
-                detail = f"{stepjson.get('file')} L{stepjson.get('start')}-{stepjson.get('end')}"
+                detail = (f"{stepjson.get('file') or stepjson.get('symbol') or '(no file)'} "
+                          f"L{stepjson.get('start', 1)}-{stepjson.get('end', 'end')}")
             elif action == "move":
-                detail = f"{stepjson.get('file')} -> {stepjson.get('to')}"
+                detail = (f"{stepjson.get('file') or '(no file)'} -> "
+                          f"{stepjson.get('to') or '(no destination)'}")
             elif action == "run":
                 detail = stepjson.get("command", "")
             elif action == "run_test":
@@ -2733,6 +2804,15 @@ class Agent:
                                         or earlier[2] != self.fold_count
                                         or earlier[3] != mutations):
                 earlier = None       # the world or the conversation changed
+            failed_earlier = (seen_failures.get(sig)
+                              if action not in _MUTATING else None)
+            if failed_earlier is not None and (
+                    failed_earlier[1] != self.index.generation
+                    or failed_earlier[2] != self.fold_count
+                    or failed_earlier[3] != mutations):
+                # A mutation may have created the missing file or fixed the
+                # cause: the same step is legitimate work again.
+                failed_earlier = None
             if dedup_step:
                 # Identical to the previous (read-only) step: skip the dispatch.
                 obs = (f"[This exact `{action}` step already ran and its "
@@ -2747,6 +2827,16 @@ class Agent:
                        "earlier in this conversation. Use it, or choose a "
                        "different query.]")
                 self._emit("cached_step", action=action, first=earlier[0])
+            elif failed_earlier is not None:
+                # BUG-320: the same step already FAILED and nothing changed
+                # since -- dispatching it again can only repeat the error.
+                obs = (f"[This exact `{action}` step already failed at step "
+                       f"{failed_earlier[0]} and nothing changed since. "
+                       "Repeating it cannot succeed -- check the path/range "
+                       "against the PROJECT MAP, choose a different query, "
+                       "or say done.]")
+                self._emit("cached_failure", action=action,
+                           first=failed_earlier[0])
             else:
                 try:
                     hk = self._hook("pre_tool", action=action,
@@ -2785,6 +2875,10 @@ class Agent:
                 if action in _CACHEABLE_ACTIONS and not obs.startswith("ERROR"):
                     ran[sig] = (step, self.index.generation, self.fold_count,
                                 mutations)
+                if action not in _MUTATING and obs.startswith("ERROR"):
+                    seen_failures.setdefault(
+                        sig, (step, self.index.generation, self.fold_count,
+                              mutations))
                 if action in _MUTATING:
                     mutations += 1
             # The cut almost always lands inside 'reasoning'; tell the model
@@ -2924,6 +3018,17 @@ class Agent:
                 if read_delta > budget:
                     obs = obs[:budget] + "\n[truncated: context budget reached]"
                     budget = 0
+                    # BUG-309: the span ledger already credited the header's
+                    # range; the cut just removed lines the model never saw.
+                    # Shrink the entry to the delivered lines so a later read
+                    # of them is not a false "already read" duplicate.
+                    seq = spans.get(key)
+                    if seq:
+                        end_ = _delivered_end(obs, s_)
+                        if end_ >= s_:
+                            seq[-1] = (s_, end_)
+                        else:
+                            seq.pop()
                 else:
                     budget -= read_delta
             else:
@@ -3697,6 +3802,13 @@ class Agent:
         full_answer = max(512, int(getattr(self.cfg, "max_tokens_answer",
                                            40000) or 40000))
         total = len(intents)
+        # BUG-304: distinct intents can resolve to the SAME target -- three
+        # describe() titles that are not definitions each fall back to the
+        # whole file. Re-asking a target an earlier hunk already wrote burns
+        # calls, and the empty re-ask failed the whole batch ("3 of 4")
+        # although every intended test was green. A resolved target already
+        # applied in this batch is covered, not owed again.
+        applied_targets: set[tuple[str, str]] = set()
         for n, intent in enumerate(intents, 1):
             target, failure = self._resolve_edit_intent(intent)
             if target is None:
@@ -3711,6 +3823,17 @@ class Agent:
                 continue
             rel = target["file"]
             symbol = target["symbol"]
+            target_key = (fileio.path_key(rel), fileio.path_key(symbol))
+            if target_key in applied_targets:
+                receipt = self._incremental_receipt(rel, symbol, True)
+                receipts.append(receipt)
+                self._emit("incremental_edit", target=n, of=total, ok=True,
+                           dedup=True)
+                if verbose:
+                    print(f"  [incremental {n}/{total}: {rel}:"
+                          f"{symbol or '(file)'} already covered by an "
+                          "earlier hunk in this batch]", file=sys.stderr)
+                continue
             start, end = target["start"], target["end"]
             source = self._fetch_exact_span(rel, start, end) if end >= start \
                 else ""
@@ -3799,6 +3922,7 @@ class Agent:
                 applied, hunk_findings, _reply, attempt = accepted
                 results_all.extend(applied)
                 findings_all.extend(hunk_findings)
+                applied_targets.add(target_key)
                 try:
                     from . import index as index_mod
                     index_mod.reindex_file(self.index, rel, self.cfg,
@@ -3844,11 +3968,13 @@ class Agent:
                     {r.file for r in results_all if r.file})
         reply = ("Symbol-anchored incremental edits:\n" + "\n".join(receipts)
                  if receipts else "No symbol-anchored edits were applied.")
-        if not _followup:
+        if not _followup and not getattr(self, "_is_repair", False):
             # One coverage verdict for the whole batch, from the SAME edit
             # evidence the seeds below use (results_all, not the receipts
             # reply): check_coverage and coverage_seeds must describe the
-            # same edit set (BUG-205).
+            # same edit set (BUG-205). A repair prompt carries no user
+            # requirements, so it gets no coverage verdict or follow-up
+            # (BUG-314).
             findings_all.extend(verify_mod.check_coverage(
                 task, reply, results_all, tracker=tracker))
             # A half-answered multi-clause task used to end with an advisory

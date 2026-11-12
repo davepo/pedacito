@@ -1490,6 +1490,24 @@ def apply_edits(root: Path, edits: list[Edit], backup: bool = True,
                                 "real code so it can be located"))
                             failed = True
                             break
+                        # BUG-315: a LINES block that also quotes a SEARCH body
+                        # carries the model's real anchor text. When the line
+                        # numbers have drifted (an earlier hunk grew the file),
+                        # the range-extracted needle points at the wrong lines
+                        # and an append lands mid-file, unbalancing braces --
+                        # the run rejects a reply the quoted text alone applies
+                        # cleanly. Prefer the quoted SEARCH when it locates
+                        # uniquely (exactly or whitespace-tolerantly) and
+                        # relocate the anchor to it; the line range stays the
+                        # fallback when the SEARCH is empty or unfindable.
+                        if e.search.strip() and e.search != needle:
+                            s_span = locate(original, e.search, cfg,
+                                            replacement=e.replace)
+                            if s_span is not None and not s_span.fuzzy:
+                                needle = original[s_span.start:s_span.stop]
+                                a = original[:s_span.start].count("\n") + 1
+                                b = a + len(needle.splitlines()) - 1
+                                anchored[k] = (a, b)
                         repl = e.replace
                         if e.symbol:
                             # A SYMBOL-anchored body written at the wrong base
