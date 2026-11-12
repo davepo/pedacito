@@ -406,6 +406,44 @@ def wants_tests(task: str) -> bool:
     return bool(_TEST_TASK_RE.search(task or ""))
 
 
+# A task that explicitly asks to CHANGE tests -- strictly narrower than
+# wants_tests. "make the tests pass" / "run the tests" mention tests but ask
+# for the CODE to satisfy them: that is exactly the assertion-weakening trap
+# the repair-phase test lock (TECHNIQUES.md #46) guards against, so those
+# tasks stay locked. A change verb aimed at tests, or a test file named by
+# path, is an explicit request and exempts the task from the lock.
+_TEST_CHANGE_VERBS = (
+    r"add|write|create|update|fix|repair|correct|modify|edit|change|extend|"
+    r"improve|adjust|rewrite|delete|remove|rename|skip|unskip|disable|enable|"
+    r"weaken|strengthen|tighten|loosen|mark|xfail|parametrize|parameterize|"
+    r"modernize|migrate|port")
+_TEST_CHANGE_RE = re.compile(
+    r"(?i)\b(?:" + _TEST_CHANGE_VERBS + r")\b"
+    r"(?:\s+[\w'`-]+){0,2}\s+(?:tests?|pytest|unittest|jest|vitest|rspec)\b")
+# "update the code and tests": the change verb reaches the tests through a
+# coordination, still within one clause.
+_TEST_CHANGE_COORD_RE = re.compile(
+    r"(?i)\b(?:" + _TEST_CHANGE_VERBS + r")\b[^.!?\n]{0,40}?"
+    r"\b(?:and|plus|also)\s+(?:the\s+|their\s+|its\s+)?tests?\b")
+_TEST_PATH_RE = re.compile(r"[A-Za-z0-9_./\\-]+\.[A-Za-z0-9]{1,8}")
+
+
+def wants_test_changes(task: str) -> bool:
+    """True when the task EXPLICITLY asks to change test files: a change verb
+    aimed at tests ("add a regression test", "fix the failing test"), a
+    coordination ("update the code and tests"), or a test file named by path
+    ("update tests/test_cart.py"). Stricter than `wants_tests`: "run the
+    tests" and "make the tests pass" are NOT test-change requests."""
+    text = task or ""
+    if _TEST_CHANGE_RE.search(text) or _TEST_CHANGE_COORD_RE.search(text):
+        return True
+    from . import testlinks
+    for tok in _TEST_PATH_RE.findall(text):
+        if testlinks.classify(tok.replace("\\", "/"))[0]:
+            return True
+    return False
+
+
 def test_rules(cfg) -> str:
     """The value-bound test rules at this run's density."""
     return _TINY_TEST_RULES if pack_for(cfg) == "tiny" else TEST_RULES

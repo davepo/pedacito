@@ -311,6 +311,29 @@ def _norm_key(path: str) -> str:
     return fileio.path_key(path)
 
 
+# A `path:line` location inside a gate finding's message (the harness's own
+# formats: "ContractError in rel:12: ..." and ruff-style "rel:12:5: F821").
+_PATH_LINE_RE = re.compile(r"([A-Za-z0-9_./\\-]+\.[A-Za-z0-9]{1,8}):\d+")
+
+
+def _gate_flagged_files(errors) -> set:
+    """Files a deterministic gate finding names as broken: its `.file` field
+    plus any `path:line` location in the message. Test-FAILURE findings are
+    excluded -- a failing assertion is not proof the TEST is wrong, and
+    exempting the failing test would defeat the repair test-lock (#46)."""
+    out: set = set()
+    for f in errors or ():
+        if getattr(f, "kind", "") == "tests":
+            continue
+        path = getattr(f, "file", "") or ""
+        if path:
+            out.add(fileio.path_key(path))
+        msg = getattr(f, "message", "") or str(f)
+        for m in _PATH_LINE_RE.finditer(msg):
+            out.add(fileio.path_key(m.group(1)))
+    return out
+
+
 # Spots deferral language ("the next turn continues") in a cleanly finished
 # reply so it triggers another answer turn; a false positive costs one
 # "NOTHING MORE" round-trip.
@@ -1265,6 +1288,10 @@ class Agent:
         # exact spans the answer packer must pin. Both reset per task.
         self.requirements = None
         self.active_diagnostics: dict = {}
+        # One-shot repair test-lock (TECHNIQUES.md #46): armed by a gate
+        # repair re-ask, consumed by the next REAL apply. None = no lock.
+        self._repair_lock_task: str | None = None
+        self._repair_lock_exempt: set = set()
         # Task-level budget guard (BUG-218): wall-clock and output-token
         # snapshot taken at gather start; every later phase checks the delta
         # before spending another model call. 0 means no task is running
@@ -2167,6 +2194,10 @@ class Agent:
         from . import verify as verify_mod
         self.requirements = verify_mod.RequirementTracker(task)
         self.active_diagnostics = {}
+        # A fresh task never inherits a repair lock from the previous one
+        # (chat reuses one agent across tasks).
+        self._repair_lock_task = None
+        self._repair_lock_exempt = set()
         gathered: list[str] = []
         self.steps_log: list[str] = []
         self.live_evidence_ok = False
@@ -3921,7 +3952,8 @@ class Agent:
                 for f in errors[:4]:
                     print("  " + f.render(), file=sys.stderr)
             fixed = self._repair_from_findings(task, reply, errors, results,
-                                               findings=findings)
+                                               findings=findings,
+                                               test_lock=False)
             if not fixed:
                 break
             reply = fixed
@@ -3935,12 +3967,15 @@ class Agent:
         return reply, findings
 
     def _repair_from_findings(self, task: str, reply: str, errors,
-                              results, findings=None) -> str:
+                              results, findings=None, *, test_lock=True) -> str:
         """One re-ask that shows the model its own edits plus the check's
         findings; '' when it produced no usable blocks -- said out loud, so
         a give-up mid-repair never reads as a clean run. `findings` (all
         severities) additionally enables the implicit rehydration for fuzzy
-        WARNINGS; `errors` alone still drives the repair."""
+        WARNINGS; `errors` alone still drives the repair. `test_lock` arms
+        the repair test-lock (#46) on the corrected reply: post-edit gate
+        repairs may not rewrite pre-existing tests; preflight (which repairs
+        the task's own DRAFT, before any test ran) passes False."""
         from . import verify as verify_mod
         if self._task_budget_exceeded("gate repair"):
             return ""
@@ -4009,7 +4044,62 @@ class Agent:
                                     reason="repair accepted after "
                                            f"{len(msgs) - repair_prefix} "
                                            "diagnostic turn(s)")
+        if test_lock:
+            # The corrected reply is a gate REPAIR: lock pre-existing test
+            # files against assertion-weakening (#46). One-shot -- the next
+            # real _apply_once consumes it. Files the gate itself flagged as
+            # broken are exempt: that is deterministic proof the file
+            # contradicts the current code, not a red assertion to game.
+            self._arm_repair_test_lock(task, _gate_flagged_files(errors))
         return new
+
+    def _arm_repair_test_lock(self, task: str, exempt=()) -> None:
+        """Arm the one-shot repair test-lock (TECHNIQUES.md #46): the next
+        REAL apply of a repair reply vets writes to pre-existing test files.
+        `exempt` names files the deterministic gate proved broken."""
+        self._repair_lock_task = task
+        self._repair_lock_exempt = {fileio.path_key(f) for f in exempt}
+
+    def _filter_repair_test_edits(self, edits: list, task: str):
+        """(kept edits, refused Results) for a repair reply. A pre-existing
+        test file is locked against assertion-weakening during gate repair
+        (TECHNIQUES.md #46); the prose TEST_RULES alone did not stop small
+        models from turning a red test green by deleting the assertion.
+        Exempt: the task (or one of its edit requirements) explicitly asks
+        for test changes; test files this task itself created; files a
+        deterministic gate flagged as broken."""
+        from . import testlinks
+        if prompts_mod.wants_test_changes(task):
+            return edits, []
+        tracker = getattr(self, "requirements", None)
+        if tracker is not None and getattr(tracker, "task", "") == task:
+            if any(r.is_edit and prompts_mod.wants_test_changes(r.text)
+                   for r in tracker):
+                return edits, []
+        preexisting = getattr(self.cfg, "_task_preexisting", None)
+        if preexisting is None:
+            preexisting = {fileio.path_key(f) for f in self.index.files}
+        kept, refused = [], []
+        for e in edits:
+            rel = fileio.normalise_rel(e.file)
+            key = fileio.path_key(e.file)
+            if not testlinks.classify(rel)[0] or key not in preexisting \
+                    or key in self._repair_lock_exempt:
+                kept.append(e)
+                continue
+            refused.append(Result(
+                False, e.file,
+                "refused: a repair may not change a pre-existing test file "
+                "-- fix the CODE the test exercises, not the test. Weakening "
+                "or deleting an assertion to turn a red test green is not a "
+                "fix. Change a test only when the task explicitly asks for "
+                "test changes."))
+        if refused:
+            files = ", ".join(dict.fromkeys(r.file for r in refused))
+            print(f"  [repair: refused {len(refused)} edit block(s) to "
+                   f"pre-existing test file(s) ({files}); the task does not "
+                   "ask for test changes]", file=sys.stderr)
+        return kept, refused
 
     def _model_verify(self, task: str, reply: str, gathered: str):
         """The optional adversarial verifier call (verify_answer = "full")."""
@@ -4905,6 +4995,22 @@ class Agent:
         discards: list = []
         parsed = parse_edits(reply, discards=discards)
         failed, edits = self._resolve_symbol_anchors(parsed)
+        # Repair test-lock (TECHNIQUES.md #46): a gate-repair reply may not
+        # rewrite pre-existing test files unless the task asks for test
+        # changes. One-shot: armed by the repair re-ask, consumed by the
+        # first REAL apply. Dry runs filter too (so a preflight dry-apply
+        # sees exactly what the write will do) but keep the lock armed.
+        if self._repair_lock_task is not None:
+            if not dry_run:
+                lock_task = self._repair_lock_task
+                edits, locked = self._filter_repair_test_edits(edits, lock_task)
+                self._repair_lock_task = None
+                self._repair_lock_exempt = set()
+                failed.extend(locked)
+            else:
+                edits, locked = self._filter_repair_test_edits(
+                    edits, self._repair_lock_task)
+                failed.extend(locked)
         # A block the model started but never finished is not silently
         # ignored: it becomes a failed result the repair loop reports back.
         if not getattr(self.client, "stream_truncated", False):

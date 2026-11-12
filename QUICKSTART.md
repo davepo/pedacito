@@ -527,7 +527,10 @@ resumed run hands back to each task. Useful flags:
 - `--refine` expands a one-line goal into a full spec before planning.
 
 A repair round that makes the check worse is rolled back automatically, and that
-task is marked failed. An unattended run cannot compound the damage. A step that
+task is marked failed. An unattended run cannot compound the damage. A repair
+also cannot "fix" a failing check by editing a pre-existing test file -- those
+edits are refused and aimed at the code under test instead (a task that asks
+for test changes is exempt). A step that
 still fails after its repair rounds is rolled back to the last passing checkpoint
 (`auto_green_ratchet`, on by default), so later steps never build on it.
 

@@ -1433,7 +1433,11 @@ retry even when edits DID land -- a patch that applies but does not work is
 still a failed task -- and the first attempt is kept only when it was green
 and the escalated one came back red. Every reason also emits an
 `escalation_suggested` event, so the signal reaches a human or an outer
-orchestrator even when no `escalate` role is configured. A success clears the
+orchestrator even when no `escalate` role is configured. When no distinct
+`escalate` role exists, a fired reason buys ONE same-model retry with the edit
+style flipped (anchor <-> quote, unset -> anchor) instead of nothing -- a
+`strategy_shift` event marks it, green runs are never retried, and
+`auto_escalate = false` disables it. A success clears the
 profile's zero-edit count and any queued suggestion.
 
 `pedacito profiles --recommend` suggests a profile per role (worker, escalate,

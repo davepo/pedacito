@@ -200,7 +200,11 @@ event even when no `escalate` role is configured, so watch for it before
 spending on a hosted rung: it names WHICH failure shape keeps recurring. A
 profile that keeps suggesting escalation on zero-edit runs usually wants a
 better prompt pack or a larger worker, not more retries -- the rung still
-fires at most once per task, and a success clears the profile's count.
+fires at most once per task, and a success clears the profile's count. When
+no distinct `escalate` role is configured, a fired reason buys ONE same-model
+retry with the edit style flipped (anchor <-> quote, unset -> anchor) instead
+of nothing -- a `strategy_shift` event marks it. Green runs are never retried,
+and `auto_escalate = false` disables the shift along with the rest.
 
 Hosted models receive the task text and the code excerpts the task needs. Pedacito
 warns before sending a task that appears to contain a secret. Cap spending with

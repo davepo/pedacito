@@ -94,7 +94,7 @@ def child_config(cfg):
     child.__dict__.pop("_steer", None)
     child.log_events = getattr(cfg, "log_events", True)
     for scratch in ("_backup_dir", "_task_reads", "_task_allowlist",
-                    "_task_mutations", "_agent"):
+                    "_task_mutations", "_task_preexisting", "_agent"):
         child.__dict__.pop(scratch, None)
     return child
 

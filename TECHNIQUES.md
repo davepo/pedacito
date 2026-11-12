@@ -1762,7 +1762,76 @@ false green. `webcheck` stays regex-only and notice-level; this tool's errors
 can drive repair. Off by default (`verify_dom = false`); `ask --verify-dom`
 flips it per run, `dom_entry` / `dom_timeout` tune it.
 
-## Quick reference: techniques 5, 11, 17 to 45
+## Upgrade paths (harness leaderboard)
+
+A gatekeeper audit of five candidate upgrades (C1–C5) against the existing
+mechanisms shipped four of them; the fifth (environment/config hardening) was
+already covered by `PEDACITO_<KEY>` overrides, `api_key_env`, the default-off
+`allow_shell`/`allow_fetch`, and `scrub_env`. Each shipped item is a
+deterministic, harness-side mechanism -- no extra model calls on the green
+path, no new config keys -- and each has a dedicated test file. The full
+evaluation lives in `upgrades/HARNESS_LEADERBOARD_UPGRADES.md`.
+
+### 46. The repair-phase test-file lock (C1)
+
+A repair loop pointed at a red test can "fix" it by weakening the test --
+deleting the assertion, widening the tolerance, skipping the case. That games
+the verdict instead of earning it. Post-edit gate repairs (the findings-driven
+repair seat and the incremental-lint seat) now arm a per-task lock: an edit to
+a PRE-EXISTING test file is refused with a teaching message ("a repair may
+not change a pre-existing test file -- fix the code under test"). Pre-existing
+means present in the index snapshot taken at task start, so a test file the
+task itself creates stays editable. Exemptions are explicit: a task that asks
+for test changes (`prompts.wants_test_changes`), an edit-kind requirement that
+matches it, and files the gate itself flagged -- except `tests`-kind findings,
+because a red assertion is not proof the test is wrong. Preflight repair is
+unlocked: it repairs the task's own draft before any verdict exists. The lock
+costs nothing on a green run and never blocks a legitimate test-writing task.
+Covered by `tests/test_repair_test_lock.py`.
+
+### 47. Shell mutations feed the task ledger (C2)
+
+A worker that finishes the job with `run` commands produces no answer-phase
+edit blocks, and its disk changes used to bypass post-edit verification
+entirely. `tool_run` already computes `index.stale()` to refresh the index
+after a command; the same result now feeds the gather-mutation ledger
+(`_note_mutation`), so hooks, impacted tests, and lint see shell-rewritten
+files exactly like write/move/delete actions. Recorded whatever the exit code:
+the ledger tracks disk state, not command success -- a failed command that
+rewrote files still needs verification. Zero added cost (one reused `stale()`
+result). Known limit: `stale()` sees indexed files only, so a brand-new file a
+command creates is invisible here; model-driven creation uses the write tools,
+which already record. Covered by `tests/test_run_mutation_ledger.py`.
+
+### 48. Cargo test narrowing, bounded to provably-safe cases (C3)
+
+`narrow_command` now accepts the task's `changed` files, and the post-edit
+hook narrows `cargo test` to `cargo test --test NAME...` when -- and only when
+-- every changed file is a top-level integration test (`tests/*.rs`). Each
+integration test is its own crate, so no other target can be affected and the
+changed targets ARE the whole change. Any `src/` change (its unit tests would
+be skipped), manifest or helper-module change, nested target, unknown changed
+set, or a command that already selects targets keeps the full suite. The
+`pedacito tests` CLI reports the same narrowing. The audit rejected the
+candidate's Go/Rust spec-gate half: toolchain subprocesses with false-positive
+risk against spec.py's conservative rule. Covered by
+`tests/test_cargo_narrow.py`.
+
+### 49. One strategy shift when escalation has nowhere to go (C4)
+
+When an escalation reason fires (§40) but NO distinct `escalate` role is
+configured, the ladder used to give up. Now the task gets ONE more attempt on
+the SAME client and budgets with the edit style flipped -- `anchor` <-> `quote`,
+unset -> `anchor` -- because a model stuck on exact-quote SEARCH blocks often
+succeeds with SYMBOL splices, and vice versa. The gate is strict: a reason must
+have fired, the run must be an applying run with `auto_escalate` on, and the
+first attempt must not be green (a green result, a landing with no red verdict,
+and a coherent "nothing to change" all stand). The retry must land to win;
+when both attempts are proven red the first is kept. `edit_style` is restored
+afterwards, a `strategy_shift` event is logged, and the shift never recurses.
+Zero impact on green runs. Covered by `tests/test_strategy_shift.py`.
+
+## Quick reference: techniques 5, 11, 17 to 49
 
 | Technique | Section | How to turn it off | Where you see it |
 |---|---|---|---|
@@ -1799,6 +1868,10 @@ flips it per run, `dom_entry` / `dom_timeout` tune it.
 | Prose-vs-edit gap naming | §43 | No flag (wording refinement of the coverage check) | "you described 'X' in prose but no edit implements it" coverage findings and follow-up intents |
 | Shrinking micro-loop retry budgets | §44 | No flag (a budget bound; `repair_rounds` still sets attempts) | Each rejected incremental hunk is re-asked at half the previous token cap (floor 2048) |
 | Headless DOM smoke check (`domcheck`) | §45 | `verify_dom = false` (default); the CLI is explicit consent | `pedacito domcheck`; `dom gate` findings after applied web edits; `--snapshot`/`--baseline` mounted-surface diff |
+| Repair-phase test-file lock | §46 | No flag (a repair invariant); tasks that ask for test changes are exempt | `refused: a repair may not change a pre-existing test file` receipts when a gate repair aims at an existing test |
+| Shell mutations feed the task ledger | §47 | No flag (part of the gather-mutation ledger) | Post-edit hooks/impacted tests/lint run after a shell-only task; `[run] index refreshed` lines |
+| Cargo test narrowing (integration-only changes) | §48 | No flag; fires only when provably safe (`test_command` wins) | `cargo test --test NAME` in the post-edit hook and `pedacito tests` output |
+| Strategy shift when no `escalate` role exists | §49 | `auto_escalate = false` | `strategy_shift` event; one same-model retry with the edit style flipped after an escalation reason |
 
 ## Techniques that exist but are not a good fit
 

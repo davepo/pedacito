@@ -159,9 +159,11 @@ def impacted_tests(index, changed: list[str], limit: int = 12) -> list[tuple[str
     return list(out.items())[:limit]
 
 
-def narrow_command(command: str, tests: list[str]) -> tuple[str, bool]:
+def narrow_command(command: str, tests: list[str],
+                   changed: list[str] | None = None) -> tuple[str, bool]:
     """(command, narrowed) -- `command` restricted to `tests` when the runner
-    supports it; unchanged otherwise."""
+    supports it; unchanged otherwise. `changed` (the files the task actually
+    touched) is what makes cargo narrowing safe; see the cargo branch."""
     if not tests:
         return command, False
     low = command.lower()
@@ -183,6 +185,29 @@ def narrow_command(command: str, tests: list[str]) -> tuple[str, bool]:
                        else "." for t in tests if t.endswith(".go")})
         if dirs:
             return "go test " + " ".join(d + "/..." if d != "." else "." for d in dirs), True
+    if low.startswith("cargo test"):
+        # #48: `cargo test --test NAME` runs ONLY that integration target --
+        # the src unit tests and every other target are skipped. Narrowing is
+        # sound only when the change is confined to top-level integration
+        # tests (tests/*.rs): each is its own crate, so no other target can
+        # be affected and the changed targets ARE the whole change. Unknown
+        # `changed` (None), any src/manifest/helper change, or a command that
+        # already selects targets keeps the full suite.
+        if not changed:
+            return command, False
+        if re.search(r"--(?:test|lib|bins?|doc|examples?|bench(?:es)?|all-targets)"
+                     r"(?:[\s=]|$)", command):
+            return command, False
+        stems = set()
+        for f in changed:
+            f = f.replace("\\", "/")
+            if f.endswith(".rs") and posixpath.dirname(f) == "tests":
+                stems.add(posixpath.basename(f)[:-3])
+            else:
+                return command, False
+        return (command + " "
+                + " ".join(f"--test {shlex.quote(s)}" for s in sorted(stems)),
+                True)
     if low.startswith("bundle exec rspec"):
         return f"{command} {files}", True
     return command, False
@@ -237,7 +262,7 @@ def run_impacted(index, cfg, changed: list[str]) -> tuple[bool, str, str]:
         return True, "", "no test command detected"
     picked = impacted_tests(index, changed)
     files = [t for t, _why in picked]
-    cmd, narrowed = narrow_command(base, files)
+    cmd, narrowed = narrow_command(base, files, changed=changed)
     why = ", ".join(f"{t} ({w})" for t, w in picked[:4])
     desc = (f"`{cmd}` -- impacted tests: {why}" if narrowed
             else f"`{cmd}` (full suite; could not narrow)")

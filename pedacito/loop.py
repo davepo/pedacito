@@ -2440,6 +2440,9 @@ def _post_edit_lint_incremental(root, cfg, agent, task, results, reply,
                 baseline.update(diagnostics.quick_findings(root, fresh))
             except Exception:
                 pass
+        # A lint repair is a gate repair too: lock pre-existing test files
+        # (#46), exempting the files the lint itself proved broken.
+        agent._arm_repair_test_lock(task, found)
         new = agent._apply_once(fix, False, backup_dir)
         results = _merge_repair_results(results, new)
         if not any(r.ok for r in new):
@@ -2972,10 +2975,17 @@ def _run_ladder(root: Path, cfg, client, agent, idx, task: str, *,
     zero-edit statistic) earns the same retry even when edits DID land -- a
     patch that applies but does not work is still a failed task. Each rung is
     used at most once per task, and only when that role is configured, so a
-    local model's bad day cannot silently burn a hosted budget."""
+    local model's bad day cannot silently burn a hosted budget. When no
+    distinct `escalate` role exists, a fired reason earns ONE same-model
+    retry with the edit style flipped (#49) instead of nothing."""
     from . import roles as roles_mod
     from .llm import BudgetExceeded, CancelledError
     cfg._task_mutations = []      # a fresh gather-mutation ledger per task
+    # Files that exist BEFORE this task's gather: the repair test-lock (#46)
+    # protects exactly these test files, never ones the task itself creates.
+    _files = getattr(idx, "files", None)
+    cfg._task_preexisting = ({fileio.path_key(f) for f in _files}
+                             if _files is not None else None)
     # A reason queued by the previous task's failure memory (the zero-edit
     # statistic) carries into this task; reasons recorded DURING this task
     # (lease strikes, semantic failures) join it, first reason wins.
@@ -3020,6 +3030,40 @@ def _run_ladder(root: Path, cfg, client, agent, idx, task: str, *,
         if landed1 and getattr(tr, "tests_ok", None) is True \
                 and getattr(tr2, "tests_ok", None) is False:
             return tr
+        return tr2
+    if reason and apply and esc is client:
+        # #49: a reason fired but there is no distinct escalate profile.
+        # Instead of dropping the reason, give the task ONE more attempt on
+        # the SAME client and budgets with the edit style flipped: a model
+        # stuck on exact-quote SEARCH blocks often lands SYMBOL splices, and
+        # vice versa. Green runs never reach this branch.
+        landed1 = tr.applied and (any(r.ok for r in tr.results) or tr.changed)
+        if getattr(tr, "tests_ok", None) is True:
+            return tr                     # green: nothing to recover
+        if landed1 and getattr(tr, "tests_ok", None) is not False:
+            return tr                     # landed, no red verdict: leave it
+        if not landed1 and _is_noop(tr.reply):
+            return tr                     # a coherent "nothing to change"
+        style = getattr(cfg, "edit_style", None)
+        flipped = "quote" if style == "anchor" else "anchor"
+        print(f"\n[escalation suggested ({reason}); no `escalate` role -- one "
+              f"retry with the {flipped} edit style on the same model]",
+              file=sys.stderr)
+        workspace.log_event(root, f"strategy_shift: edit_style {style} -> "
+                                  f"{flipped}: {reason}", "WARN")
+        from .agent import Agent
+        cfg.edit_style = flipped
+        try:
+            tr2 = _run_task_once(root, cfg, client, Agent(tr.idx, client, cfg),
+                                 tr.idx, task, **kw)
+        finally:
+            cfg.edit_style = style
+        landed2 = tr2.applied and (any(r.ok for r in tr2.results) or tr2.changed)
+        if not landed2:
+            return tr                     # the retry landed nothing: keep first
+        if getattr(tr, "tests_ok", None) is False \
+                and getattr(tr2, "tests_ok", None) is False:
+            return tr                     # both proven red: keep the first
         return tr2
     if esc is client or (tr.applied
                          and (any(r.ok for r in tr.results) or tr.changed)):

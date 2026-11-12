@@ -1635,7 +1635,8 @@ def _cmd_tests(args) -> int:
             print("no linked tests found")
         for t, why in picked:
             print(f"  {t}  ({why})")
-        narrowed, did = testsel.narrow_command(cmd, [t for t, _ in picked]) \
+        narrowed, did = testsel.narrow_command(cmd, [t for t, _ in picked],
+                                               changed=rels) \
             if cmd else ("", False)
         if cmd and did:
             print(f"narrowed: {narrowed}")

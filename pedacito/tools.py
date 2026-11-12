@@ -3361,6 +3361,13 @@ def tool_run(index, cfg, command: str) -> str:
     try:
         from . import index as index_mod
         changed, missing = index.stale()
+        # #47: the same stale() result feeds the task's mutation ledger, so a
+        # shell-only worker's disk changes still get post-edit verification
+        # when the answer phase produces no edit blocks. Recorded whatever
+        # the exit code: the ledger tracks disk state, not command success.
+        # (stale() sees indexed files only; brand-new files a command creates
+        # are invisible here -- model-driven creation uses the write tools.)
+        _note_mutation(cfg, *changed, *missing)
         for rel in missing:
             index.forget(rel)
         for rel in changed:
