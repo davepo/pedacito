@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import inspect
 import json
+import os
 import sys
 import types
 from pathlib import Path
@@ -519,6 +520,9 @@ def test_need_line_in_answer_refetches_from_disk(tmp_path):
 
 
 # -------------------------------------------------- bug 9a: XDG config hint
+@pytest.mark.skipif(
+    os.name == "nt",
+    reason="XDG_CONFIG_HOME is POSIX-only; Windows uses %APPDATA%")
 def test_profile_error_names_xdg_ignored_config(tmp_path, monkeypatch):
     """With XDG_CONFIG_HOME set, ~/.config/pedacito/config.toml exists but is
     ignored -- the error must say so, or the user edits a dead file."""

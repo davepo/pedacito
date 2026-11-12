@@ -577,6 +577,10 @@ def test_sandbox_really_blocks_writes_when_a_backend_works(tmp_path):
         outside.unlink(missing_ok=True)
 
 
+@pytest.mark.skipif(
+    not sys.platform.startswith("linux"),
+    reason="the /tmp tmpfs re-bind is bwrap-specific (Linux only); macOS uses "
+           "seatbelt, Windows has no sandbox")
 def test_sandbox_rebinds_an_interpreter_living_under_tmp(tmp_path, monkeypatch):
     from pedacito import sandbox
     prefix = f"/tmp/pdc-sbx-prefix-{os.getpid()}"
@@ -587,11 +591,12 @@ def test_sandbox_rebinds_an_interpreter_living_under_tmp(tmp_path, monkeypatch):
     assert args[i + 1] == "/tmp"
     # the re-bind must come after the tmpfs, or the tmpfs hides it again
     j = args.index("--ro-bind", i + 2)
-    assert args[j + 1] == args[j + 2] == prefix
+    resolved = str(Path(prefix).resolve())   # /tmp itself may be a symlink
+    assert args[j + 1] == args[j + 2] == resolved
     # an interpreter outside /tmp needs no re-bind
     monkeypatch.setattr(sys, "prefix", "/usr")
     monkeypatch.setattr(sys, "base_prefix", "/usr")
-    assert prefix not in sandbox._bwrap_args(tmp_path, False, [])
+    assert resolved not in sandbox._bwrap_args(tmp_path, False, [])
 
 
 def test_sandbox_runs_an_interpreter_installed_under_tmp(tmp_path, monkeypatch):

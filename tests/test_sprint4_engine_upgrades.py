@@ -420,10 +420,13 @@ def test_fileio_write_is_atomic(tmp_path):
     f.write_text("v1", encoding="utf-8")
     f.chmod(0o640)
     inode_before = f.stat().st_ino
+    # Windows only honours the read-only bit, so 0o640 reads back as 0o666;
+    # the invariant is that write_bytes preserves the mode the platform reports.
+    mode_before = stat.S_IMODE(f.stat().st_mode)
     fileio.write(f, "v2")
     assert f.read_text() == "v2"
     assert f.stat().st_ino != inode_before          # fresh inode, not mutated
-    assert stat.S_IMODE(f.stat().st_mode) == 0o640  # permissions preserved
+    assert stat.S_IMODE(f.stat().st_mode) == mode_before  # permissions preserved
     assert not list(tmp_path.glob("*.pedacito-tmp"))
 
 

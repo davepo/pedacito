@@ -9,6 +9,7 @@ outstanding rather than dressing them up as tests.
 """
 from __future__ import annotations
 
+import os
 import sys
 import types
 from pathlib import Path
@@ -812,6 +813,9 @@ def test_skeleton_writes_the_serve_hint(tmp_path):
 
 # --------------------------------------------------------- BUG-001: shadowed --
 
+@pytest.mark.skipif(
+    os.name == "nt",
+    reason="XDG_CONFIG_HOME is POSIX-only; Windows uses %APPDATA%")
 def test_xdg_shadow_note_names_the_ignored_file(tmp_path, monkeypatch):
     home, xdg = tmp_path / "home", tmp_path / "xdg"
     (home / ".config" / "pedacito").mkdir(parents=True)
@@ -832,6 +836,9 @@ def test_xdg_shadow_note_names_the_ignored_file(tmp_path, monkeypatch):
     assert config_mod.xdg_shadow_note() == ""      # nothing shadowed
 
 
+@pytest.mark.skipif(
+    os.name == "nt",
+    reason="XDG_CONFIG_HOME is POSIX-only; Windows uses %APPDATA%")
 def test_profiles_empty_note_explains_a_shadowed_config(tmp_path, monkeypatch):
     home, xdg = tmp_path / "home", tmp_path / "xdg"
     (home / ".config" / "pedacito").mkdir(parents=True)
