@@ -947,12 +947,15 @@ CLI_COMMANDS = [
                  "[--baseline FILE]",
         "summary": "Headless DOM smoke check: load the entry page in "
                    "Chromium, prove the module graph mounts, report page "
-                   "errors, failed loads and unbound controls; --baseline "
-                   "diffs the mounted surface against an earlier --snapshot. "
-                   "Needs Playwright (pip install playwright; playwright "
-                   "install chromium).",
+                   "errors, failed loads, unbound controls and silent Web "
+                   "Audio failures (never-resumed context, disconnected "
+                   "graph, dead transport, zeroed gains, invalid param "
+                   "automation); --baseline diffs the mounted surface "
+                   "against an earlier --snapshot. Needs Playwright (pip "
+                   "install playwright; playwright install chromium).",
         "keywords": ["web", "dom", "headless", "browser", "playwright",
-                     "mount", "smoke check", "runtime"],
+                     "mount", "smoke check", "runtime", "audio", "webaudio",
+                     "sound", "silent", "synth", "sequencer"],
         "examples": [
             "pedacito domcheck .",
             "pedacito domcheck . --snapshot /tmp/before.json",

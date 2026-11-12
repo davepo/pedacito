@@ -962,11 +962,18 @@ failed same-origin loads, and unbound controls (conservatively -- any delegated
 or inline handler suppresses the finding), and it can diff the mounted surface
 against an earlier snapshot (`--snapshot before.json`, then `--baseline
 before.json`) to catch the BUG-216 shape where a replaced entry module silently
-stops rendering. It needs `pip install playwright && playwright install
-chromium`; when that is missing it says so instead of pretending the page is
-fine. Running project code is an execution decision, so the in-run gate needs
-`verify_dom = true` AND `allow_shell = true` (or `ask --verify-dom`); an explicit
-`pedacito domcheck` invocation is itself the consent. See TECHNIQUES.md #45.
+stops rendering. It also catches SILENT Web Audio failures: it instruments the
+API (contexts, resume calls, the connect graph, source starts, gain envelopes,
+invalid AudioParam automation), then enables a step if the grid is empty, clicks
+Play, and sweeps the sliders -- flagging a graph that never reaches
+`ctx.destination`, a context never resumed inside a user gesture, a Play button
+that starts zero sources, gains pinned at zero, and NaN/non-positive automation.
+Pages that never touch Web Audio get zero audio findings. It needs `pip install
+playwright && playwright install chromium`; when that is missing it says so
+instead of pretending the page is fine. Running project code is an execution
+decision, so the in-run gate needs `verify_dom = true` AND `allow_shell = true`
+(or `ask --verify-dom`); an explicit `pedacito domcheck` invocation is itself the
+consent. See TECHNIQUES.md #45.
 
 `calibrate` also measures **native tool calls** against the JSON grammar on your
 model (same eight scenarios, both modes) and the card switches `tool_mode` to
@@ -1260,14 +1267,21 @@ Chromium after applied web edits and diffs the mounted surface against a
 snapshot taken before the edit. A replaced entry module that silently stops
 rendering -- named elements or controls gone, visible text collapsed -- is a
 `dom` gate finding that feeds a repair round, alongside uncaught page errors and
-assets/modules that no longer load. Pre-existing page errors are not blamed on
-the task. It needs the optional Playwright install (`pip install playwright &&
-playwright install chromium`); without it the check reports an install hint and
-the gate steps aside. `dom_entry` overrides the detected entry page and
-`dom_timeout` caps one load. `pedacito domcheck PROJ` runs it on demand (that
-invocation is the consent to run project code); `--snapshot`/`--baseline` diff
-two runs. Unlike `webcheck`'s notice-level regex findings, this tool's errors
-can drive repair. See TECHNIQUES.md #45.
+assets/modules that no longer load. The same check catches silent Web Audio
+failures: an init script records contexts, resume calls, the connect graph,
+source starts, and gain automation; a smoke probe enables a step if the grid is
+empty, clicks Play, and sweeps the sliders. A never-resumed context, a graph
+that never reaches `ctx.destination`, a Play button that starts zero sources,
+gains pinned at zero, or invalid AudioParam automation are `dom` gate errors
+too -- Web Audio fails without console errors, so nothing else sees them.
+Non-audio pages stay dormant (zero audio findings). Pre-existing page errors
+are not blamed on the task. It needs the optional Playwright install (`pip
+install playwright && playwright install chromium`); without it the check
+reports an install hint and the gate steps aside. `dom_entry` overrides the
+detected entry page and `dom_timeout` caps one load. `pedacito domcheck PROJ`
+runs it on demand (that invocation is the consent to run project code);
+`--snapshot`/`--baseline` diff two runs. Unlike `webcheck`'s notice-level regex
+findings, this tool's errors can drive repair. See TECHNIQUES.md #45.
 
 ## How context is managed
 

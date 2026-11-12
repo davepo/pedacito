@@ -1751,6 +1751,31 @@ page silently unmounted -- the runtime half of BUG-216 -- and no regex notices.
   and can diff it against a pre-edit snapshot (`--snapshot` then `--baseline`),
   catching the regression shape where named elements / controls disappear or
   the visible text collapses.
+- It catches SILENT Web Audio failures -- the kind that pass every static gate
+  and every unit test while producing no sound. An init script instruments the
+  API (`window.__pdcAudio`): context construction (inside/outside a user
+  gesture), `resume()` calls, the connect/disconnect graph, source `start()`s,
+  gain values/envelopes, and invalid AudioParam automation (recorded BEFORE
+  the native call, so a swallowed TypeError still leaves evidence). A transport
+  smoke probe then enables a step if the grid is empty, clicks Play with a
+  trusted click, waits a scheduler tick, and sweeps the sliders. Five error
+  kinds: `audio_param_invalid`, `audio_graph_disconnected`,
+  `audio_context_suspended`, `audio_dead_transport`, `audio_gain_zeroed`.
+
+The suspended-context gate is BEHAVIORAL, not state-based: headless Chromium
+does not reliably enforce the autoplay policy (contexts report "running" where
+a real browser would suspend them), so the finding is "realtime context created
+outside a gesture handler + `resume()` never called + playback attempted".
+Gesture detection reads `window.event` (set during any handler -- listener,
+`onclick` property, inline attribute, delegation -- and undefined inside
+timers), so no listener wrapping is needed. A context whose `resume()` only
+ran outside a gesture is flagged only when the probe's Play click leaves it
+suspended -- games that unlock audio on the first interaction (no Play button)
+are exempt. Pages that never touch Web Audio
+stay dormant: the probe runs only on runtime activity or a static API
+reference, and non-audio pages get zero audio findings. Finding messages name
+the shape, not shifting ids/counts, so `DomFinding.key` stays digit-free and
+baseline diffing feeds only NEW audio errors to the repair loop.
 
 In-run, `verify_dom` AND `allow_shell` gate applied web edits on it: a pre-edit
 baseline is captured, and only NEW errors / lost mounted UI feed a micro-repair

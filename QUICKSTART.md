@@ -666,6 +666,7 @@ the same names to work from.
 | No review page appeared | Nothing anchored, so there was nothing to review. Check the printed failures. |
 | `FrontendContractError` after an edit | The page cannot load as written: a script or stylesheet path that does not exist, a `getElementById` or `querySelector('#id')` for an id no HTML defines, JavaScript that does not parse, a module-level name bound twice (a second `import { X }` on a file that already imports it), or a call to a name no module declares or imports. The message names the file, line and the exact fix. `pedacito webcheck PROJ` lists every such problem. |
 | The page passes `webcheck` but stays blank after an edit | Static checks cannot see runtime failures (a module that throws on load, a mount that never happens). `pedacito domcheck PROJ` loads the entry page in headless Chromium and reports page errors, mount regressions and unbound controls; it needs the optional Playwright install (`pip install playwright && playwright install chromium`). To run it after every applied web edit, set `verify_dom = true` and `allow_shell = true`, or pass `ask --verify-dom`. |
+| A sequencer/synth passes every check but plays no sound | Web Audio fails silently: a context never resumed inside a user gesture, a graph that never reaches `ctx.destination`, oscillators never `start()`ed, gains pinned at 0, NaN automation. `pedacito domcheck PROJ` instruments the audio API, clicks Play and sweeps the sliders, and reports these as errors (non-audio pages are unaffected). |
 | The server rejects structured output, or steps keep failing to parse | Pedacito steps down to a simpler structured mode by itself. Run `pedacito config --doctor` to see which modes the server supports. Set `enforce_json_schema = false` only if the server misbehaves under constrained sampling. |
 | Everything is slow | The model has likely spilled out of VRAM. |
 
@@ -708,7 +709,7 @@ only the map is stale.
 | `pedacito skills PROJ` | List the available skills |
 | `pedacito tests PROJ --files F` | Detected test command, and the tests an edit to F can break |
 | `pedacito webcheck PROJ` | Static checks for web files: DOM ids, script loading, missing scripts, ES module bindings and links |
-| `pedacito domcheck PROJ` | Headless DOM smoke check: load the entry page in headless Chromium, prove the module graph mounts, report console errors and unbound controls (needs Playwright) |
+| `pedacito domcheck PROJ` | Headless DOM smoke check: load the entry page in headless Chromium, prove the module graph mounts, report console errors, unbound controls and silent Web Audio failures (needs Playwright) |
 | `pedacito diagnose` | Run the project's linter or type checker |
 | `pedacito prune PROJ` | Delete old sessions, backups, and events |
 | `pedacito reset PROJ [--reindex]` | Wipe `.pedacito/` runtime state. Code and config stay |
