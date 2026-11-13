@@ -787,6 +787,7 @@ def _js_def_names(m) -> set[str]:
 # over-inclusive (`if (ready)` binds `ready`), which is the right direction:
 # an extra local name only ever costs a finding, never a false one.
 _JS_PAREN_GROUP_RE = re.compile(r"\(([^()]*)\)")
+_JS_ARROW_PARAM_RE = re.compile(r"(?<![\w$.])([A-Za-z_$][\w$]*)\s*=>")
 
 
 def _js_paren_bound(text: str) -> set[str]:
@@ -804,6 +805,11 @@ def _js_paren_bound(text: str) -> set[str]:
         for token in re.findall(r"[A-Za-z_$][\w$]*", m.group(1)):
             if "{" in m.group(1) and token not in ("let", "const", "var"):
                 names.add(token)      # destructuring: every key is a binding
+    # A single-parameter arrow (`m => ...`) has no paren group, and the call
+    # form matches `m.name` too: without this, every `rows.forEach(m => ...)`
+    # callback using `m.something` was reported as calling an undefined `m()`.
+    for m in _JS_ARROW_PARAM_RE.finditer(text):
+        names.add(m.group(1))
     return names
 
 

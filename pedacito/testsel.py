@@ -48,6 +48,48 @@ def _has_js_tests(root: Path) -> bool:
     return False
 
 
+def _has_py_tests(root: Path) -> bool:
+    """True when the tree has Python test files pytest can collect."""
+    return (any(root.glob("tests/test_*.py")) or any(root.glob("test_*.py"))
+            or any(root.glob("tests/**/test_*.py")))
+
+
+_JS_SUFFIXES = frozenset({".js", ".mjs", ".cjs", ".jsx", ".ts", ".mts",
+                          ".cts", ".tsx"})
+
+
+def _one_language(changed: list[str]) -> str:
+    """'py', 'js', or '' when the change is mixed or has no clear language."""
+    if not changed:
+        return ""
+    exts = {Path(f).suffix.lower() for f in changed}
+    if exts == {".py"}:
+        return "py"
+    if exts and exts <= _JS_SUFFIXES:
+        return "js"
+    return ""
+
+
+def _language_base(root: Path, changed: list[str], cfg, base: str) -> str:
+    """The detected runner for the language the change actually belongs to.
+
+    `detect_test_command` returns one command, and a package.json test script
+    wins over pytest. In a mixed tree that meant a Python-only change was
+    declared tested by `npm test`, which never sees the Python suite (and the
+    receipt even named the .py file among the "impacted tests"). An explicit
+    `test_command` remains the user's decision and is never overridden.
+    """
+    if (getattr(cfg, "test_command", "") or "").strip():
+        return base
+    lang = _one_language(changed)
+    low = base.lower()
+    if lang == "py" and "pytest" not in low and _has_py_tests(root):
+        return "pytest -q" if shutil.which("pytest") else "python -m pytest -q"
+    if lang == "js" and "pytest" in low and _has_js_tests(root):
+        return "node --test"
+    return base
+
+
 def detect_test_command(root, cfg=None) -> str:
     """The project's test command, or '' when none is evident. A configured
     `test_command` always wins."""
@@ -286,7 +328,14 @@ def run_impacted(index, cfg, changed: list[str]) -> tuple[bool, str, str]:
         return True, "", "no test command detected"
     picked = impacted_tests(index, changed)
     files = [t for t, _why in picked]
-    cmd, narrowed = narrow_command(base, files, changed=changed)
+    base = _language_base(Path(index.root), changed, cfg, base)
+    kept = files
+    if "pytest" in base.lower():
+        kept = [f for f in files if f.lower().endswith(".py")]
+    elif base.lower().startswith(("node --test", "npm test", "pnpm test",
+                                 "yarn test")):
+        kept = _js_tests(files)
+    cmd, narrowed = narrow_command(base, kept, changed=changed)
     why = ", ".join(f"{t} ({w})" for t, w in picked[:4])
     desc = (f"`{cmd}` -- impacted tests: {why}" if narrowed
             else f"`{cmd}` (full suite; could not narrow)")

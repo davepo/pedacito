@@ -1540,11 +1540,14 @@ def verify_and_fix(client, cfg, idx: Index, py_rels, project_name: str,
 # repository `git init` made before the first run. Their presence says nothing
 # about whether the folder already holds a PROJECT, so they must not trip the
 # fresh-directory guard below; a real source file still does.
-HARNESS_OWNED = (".git", ".pedacito", ".pedacitoignore", *PROJECT_CONFIG_NAMES)
+HARNESS_OWNED = (".git", ".gitignore", ".pedacito", ".pedacitoignore",
+                 *PROJECT_CONFIG_NAMES)
 
 
 def is_harness_owned(name: str) -> bool:
-    """Whether a top-level entry came from Pedacito rather than the project."""
+    """Whether a top-level entry came from Pedacito rather than the project.
+    `.gitignore` is here because `workspace.ensure` creates it in a repo and
+    appends Pedacito's entries to it."""
     return name in HARNESS_OWNED
 
 
@@ -1682,9 +1685,11 @@ def run_new(root: Path, cfg, client, spec: Spec, *, apply: bool = False,
             print(f"  [dry run] {len(created)} skeleton file(s) would be "
                   f"created: {preview}", file=sys.stderr)
         if complex:
-            print(f"  [dry run] --complex would hand these {len(plan_tasks(plan))} "
+            # Same task list the real run builds (BUG-903: tests included).
+            tasks = plan_tasks(plan, include_tests=True)
+            print(f"  [dry run] --complex would hand these {len(tasks)} "
                   f"task(s) to the autonomous loop:", file=sys.stderr)
-            for t in plan_tasks(plan):
+            for t in tasks:
                 print(f"      - {t}", file=sys.stderr)
         print("  Nothing was written. Re-run with --apply to build the "
               "project (or --complex --apply for the autonomous loop), "
@@ -1805,6 +1810,21 @@ def run_new(root: Path, cfg, client, spec: Spec, *, apply: bool = False,
     return 1 if summary["failed"] or contract_failed or tests_failed else 0
 
 
+def verify_receipt(root: Path, explicit_cmd: str, smoke: bool,
+                   ok: bool, out: str) -> tuple[str, bool]:
+    """The honest post-run verification line: whether a check actually ran,
+    and what it was. With no `--verify` and no `main.py` to smoke-run,
+    nothing was verified -- and the line says so instead of "passed"."""
+    if explicit_cmd:
+        note = "verify: " + ("passed" if ok else "failed")
+        return (note + (f" ({out})" if out else "")), True
+    if smoke and (Path(root) / "main.py").is_file():
+        note = "verify: smoke " + ("passed" if ok else "failed")
+        return (note + (" (python main.py)" if ok else ""), True)
+    return ("verify: not run (no --verify command and no main.py to "
+            "smoke-run)", False)
+
+
 def _run_complex(root: Path, cfg, client, idx, plan: Plan, spec: Spec, *,
                  verify: str = "", repair_rounds: int | None = None,
                  max_tasks: int | None = None,
@@ -1828,7 +1848,7 @@ def _run_complex(root: Path, cfg, client, idx, plan: Plan, spec: Spec, *,
     plan_file = root / getattr(cfg, "auto_plan_file", "PLAN.md")
     split_lines = int(getattr(cfg, "auto_split_lines", 0) or 0)
     titles = plan_tasks(plan, idx=idx, max_lines=split_lines,
-                        include_tests=design, tests_first=design)
+                        include_tests=True, tests_first=design)
     loop.write_plan(plan_file, plan.project_name or spec.title, titles)
 
     print(f"\n--- auto: implementing {len(titles)} task(s) in fresh contexts "
@@ -1951,9 +1971,10 @@ def _run_complex(root: Path, cfg, client, idx, plan: Plan, spec: Spec, *,
                     rounds=rounds, smoke=do_smoke,
                     smoke_timeout=smoke_timeout, verbose=verbose)
                 if v_ok:
-                    vnote = "verify: passed" + (f" ({v_out})" if v_out else "")
+                    vnote, ran = verify_receipt(root, vf, do_smoke, v_ok, v_out)
                     print(f"  {vnote}", file=sys.stderr)
-                    workspace.log_event(root, vnote)
+                    workspace.log_event(root, vnote,
+                                        "INFO" if ran else "WARN")
                 else:
                     print("\n  [warning] runtime verification failed after "
                           "repair:\n"

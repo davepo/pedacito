@@ -795,9 +795,10 @@ pedacito new my-app -t "..." --plan-only --apply     # skeleton only
 
 The model plans a file tree, the skeleton is written, then each file is filled
 in. Dry run by default. The target directory must be empty or new, or hold
-nothing but Pedacito's own files (`.git`, `.pedacito/`, `.pedacito.toml`,
-`.pedacitoignore`), unless `--force`. `--complex` hands implementation to the
-`auto` loop.
+nothing but Pedacito's own files (`.git`, `.gitignore`, `.pedacito/`,
+`.pedacito.toml`, `.pedacitoignore`), unless `--force`. `--complex` hands
+implementation to the `auto` loop, one task per planned file: test files are
+implemented after the sources, so each is written against the real API.
 
 Each file is written by its own call, so the finished tree is checked as a
 whole before the build reports success: a browser scaffold whose scripts cannot
@@ -826,7 +827,10 @@ The plan is a markdown checklist (`PLAN.md` by default), so a run is resumable
 and editable; the file also keeps the full goal (a `Goal:` line with `> `
 continuation lines), which a resumed run hands back to each task. There is
 no default cap on tasks, steps, or time; add one with `--max-tasks N`,
-`--max-minutes N`, or `--steps N`. `--repair N` sets repair
+`--max-minutes N`, or `--steps N`. `--max-minutes` bounds the loop's own clock:
+planning, scaffolding and per-step gate subprocesses run outside it, so a
+caller that needs a wall-clock ceiling should keep its own margin.
+`--repair N` sets repair
 rounds per failed verification, `--keep-going` continues past failed tasks, and
 `--auto-install` installs a missing Python package instead of reporting it.
 `--verify-final` runs the `--verify` command once, after the last unchecked
@@ -834,9 +838,10 @@ task, instead of after every task: a whole-goal check cannot pass mid-plan, so
 the per-task runs would roll back valid partial fixes (`auto_verify_final`,
 off by default). After the last task, `--apply` also exercises the project
 once (`auto_smoke`, on by default): the Python entry points are exec'd and
-the receipt prints `verify: passed` -- that proves the project BOOTS, not
+the receipt says `verify: smoke passed` -- that proves the project BOOTS, not
 that the suite is green, so a plan should end with a run-the-tests task or
-you should pass `--verify "pytest -q"`. `--strict` exits 1 when a task applied edits but left a
+you should pass `--verify "pytest -q"`. With no `--verify` and no `main.py`
+to smoke-run, the receipt says `verify: not run` instead of claiming a pass. `--strict` exits 1 when a task applied edits but left a
 failed edit block or impacted tests still failing after the repair rounds,
 for CI and unattended pipelines (without it both are reported and the run
 exits 0 -- "reported" means the red verdict is named where you read the
@@ -1215,7 +1220,10 @@ ledger already recorded before this run is labelled *pre-existing failure
 captured its own baseline, which supersedes the history. `test_command`
 overrides detection (`pytest`, `npm test`, `cargo test`, `go test ./...`,
 `make test`, ...). Those two flags only ever switch the **subprocess** checks
-off. The syntax, static, frontend and cross-file contract gates read files in
+off. In a mixed tree (Python tests beside `*.test.js`), the runner follows the
+language of the change: a Python-only edit runs `pytest` even when a
+`package.json` test script would otherwise win detection, and a JavaScript
+edit runs the JS runner. An explicit `test_command` is never overridden. The syntax, static, frontend and cross-file contract gates read files in
 this process, so they vet every applied edit even in the default
 `allow_shell = false` profile: a run that cannot execute tests still cannot
 ship a module graph that would not link.
@@ -1247,7 +1255,9 @@ before the test command runs, Pedacito checks five things with no model call:
   runs, and the finding says which fix applies: the sibling that exports it
   (add the import), the file that declares it without exporting it (add the
   `export`), or nothing at all (define it or drop the call). Browser globals,
-  CDN bundles and classic-script globals are never reported.
+  CDN bundles and classic-script globals are never reported. An arrow
+  callback's own parameter counts as bound, so `rows.forEach(m => m.name)`
+  is not a call to an undefined `m`.
 
 A finding is reported in the same shape as the other gates, for example:
 
@@ -1292,7 +1302,9 @@ install playwright && playwright install chromium`); without it the check
 reports an install hint and the gate steps aside. `dom_entry` overrides the
 detected entry page and `dom_timeout` caps one load. `pedacito domcheck PROJ`
 runs it on demand (that invocation is the consent to run project code);
-`--snapshot`/`--baseline` diff two runs. Unlike `webcheck`'s notice-level regex
+`--snapshot`/`--baseline` diff two runs. The session runs in a child process
+with a wall-clock bound, so a page whose script never yields is stopped and
+reported as *not verified* instead of blocking the run. Unlike `webcheck`'s notice-level regex
 findings, this tool's errors can drive repair. See TECHNIQUES.md #45.
 
 ## How context is managed
@@ -1376,7 +1388,9 @@ you configured. Within that:
   `allow_screenshots`) until you read it
   and run `pedacito trust`; editing the file revokes the approval. Harmless
   settings from the same file still apply, and the toggles stay honoured from
-  your user config, from `--config FILE` and from `PEDACITO_*`.
+  your user config, from `--config FILE` and from `PEDACITO_*`. The starter
+  written by `config --init --path <project>/.pedacito.toml` keeps those lines
+  commented, so trusting it neither warns nor revokes what you granted.
 - **Hooks** (`hooks = { post_edit = ["ruff format {file}"], pre_edit = [...] }`)
   run your own program at `session_start`, `pre_task`/`post_task`,
   `pre_tool`/`post_tool`, `pre_run`/`post_run`, `pre_edit`/`post_edit`,

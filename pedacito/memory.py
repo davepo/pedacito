@@ -410,7 +410,7 @@ def _lesson_scope(files) -> str:
     lesson names no files, names a repo-root file, or the files share no
     parent directory -- root-scatter has no honest glob to scope it by)."""
     dirs: list[list[str]] = []
-    for f in files or ():
+    for f in _normalised_files(files):
         rel = str(f).replace("\\", "/").strip().lstrip("/")
         if rel.startswith("./"):
             rel = rel[2:]
@@ -429,6 +429,37 @@ def _lesson_scope(files) -> str:
         else:
             break
     return "/".join(common)
+
+
+def _normalised_files(files) -> list[str]:
+    """Canonical project-relative names for a lesson's files.
+
+    Failure text names one file several ways: `../src/combat.js` from a
+    traceback relative to `tests/`, `src/combat.js` from a gate finding, and
+    `combat.js` from a prose message ("imports combat.js"). Keeping all three
+    made a single-directory lesson look root-scattered and blocked its
+    promotion, so leading `../`/`./` segments are removed and a bare basename
+    yields to the qualified path for the same file."""
+    items: list[str] = []
+    for f in files or ():
+        rel = str(f).replace("\\", "/").strip()
+        while rel.startswith("../"):
+            rel = rel[3:]
+        while rel.startswith("./"):
+            rel = rel[2:]
+        if rel:
+            items.append(rel)
+    qualified = [f for f in items if "/" in f]
+    out: list[str] = []
+    seen: set[str] = set()
+    for rel in items:
+        if "/" not in rel and any(q.endswith("/" + rel) for q in qualified):
+            continue
+        if rel in seen:
+            continue
+        seen.add(rel)
+        out.append(rel)
+    return out
 
 
 def _sanitize_scope(scope: str) -> str:

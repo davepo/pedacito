@@ -2685,6 +2685,26 @@ def fileio_norm(name: str) -> str:
     return fileio.normalise_rel(name)
 
 
+# A task that forbids edits ("report only", "do not edit any file") has
+# already been answered by prose; re-asking for edit blocks spends a model
+# call the task explicitly ruled out. The phrases must read as task-level
+# directives, not mentions: an edit task may legitimately add a "read-only
+# mode" or change one file "without editing" another, and skipping the
+# recovery there would strand it with a prose answer. A false negative only
+# costs the old re-ask (the model then declares "No changes"); a false
+# positive loses edits.
+_NO_EDIT_TASK_RE = re.compile(
+    r"(?im)\bdo not\s+(?:write|edit|modify|change)"
+    r"(?:\s+or\s+(?:write|edit|modify|change))?\s+any\s+(?:file|files|"
+    r"anything)(?=\s*(?:$|[.,;:!?\n]))"
+    r"|\bwithout\s+(?:editing|writing|changing)\s+(?:any\s+)?"
+    r"(?:files?|anything)\b"
+    r"|\bno\s+edits?\s+to\s+(?:any\s+)?(?:files?|anything)\b"
+    r"|(?:^|[.,;:\n])\s*(?:no\s+edits?|read[- ]only|report\s+only)"
+    r"(?=\s*(?:$|[.,;:!?\n]))"
+    r"|\band\s+report\s+only(?=\s*(?:$|[.,;:!?\n]))")
+
+
 def _report(results, dry_run: bool):
     """Print each edit Result to stderr, with its unified diff in dry-run mode."""
     if not results:
@@ -2827,7 +2847,13 @@ def _recover_no_edit_reply(root: Path, agent, task: str, gathered: str,
     the reads from disk and re-ask with that source; otherwise re-ask with an
     explicit 'no tools here, emit edit blocks' instruction. Returns
     (results, reply) from the first re-ask that produces blocks or declares
-    "No changes", or None when every round came back empty."""
+    "No changes", or None when every round came back empty.
+
+    A task that asks for no edits at all ("report only", "do not edit") is
+    already answered: one more model call cannot produce blocks it forbade,
+    so the recovery is skipped and the prose answer stands."""
+    if _NO_EDIT_TASK_RE.search(task or ""):
+        return None
     asked = _read_requests(reply)
     for _round in range(_MAX_RECOVERY_ROUNDS):
         extra = _honour_reads(root, asked) if asked else ""

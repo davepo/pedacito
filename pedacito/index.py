@@ -78,6 +78,10 @@ def state_dir(root: Path, *parts: str) -> Path:
 def infer_root(paths: list[str]) -> Path:
     """Project root when --root wasn't given: the common ancestor of the
     given paths (so `pedacito ask ~/code/anki` doesn't use the cwd)."""
+    if isinstance(paths, str):
+        # A command whose positional is optional (`rpc`) hands one string;
+        # iterating it as a sequence of characters resolved the root to `/`.
+        paths = [paths]
     resolved = []
     for p in paths:
         q = Path(p).resolve()

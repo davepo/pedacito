@@ -2923,8 +2923,11 @@ _PROJECT_HEADER = """\
 # Settings that run something are ignored until you read this file and run
 # `pedacito trust`: hooks, mcp_servers, auto_verify, test_command, allow_serve,
 # allow_lsp, lsp_servers, the sandbox settings, and the capability toggles
-# allow_shell, allow_write, allow_browser and allow_screenshots. Everything
-# else in this file applies immediately.
+# allow_shell, allow_write, allow_browser and allow_screenshots. They are
+# shown commented out here: active defaults would warn on every load, and
+# once trusted they would overrule the capabilities you granted at user scope.
+# Uncomment only the ones this repository genuinely needs. Everything else in
+# this file applies immediately.
 #
 """
 
@@ -2943,12 +2946,24 @@ def is_project_config_path(path: Path) -> bool:
     return False
 
 
+def _is_exec_line(line: str) -> bool:
+    """Whether a starter line assigns an EXEC_FIELDS setting."""
+    if "=" not in line:
+        return False
+    return line.split("=", 1)[0].strip() in EXEC_FIELDS
+
+
 def project_template() -> str:
-    """`TEMPLATE` with the user-scope keys commented out and a project header,
-    for writing a per-project starter."""
+    """`TEMPLATE` with the user-scope and execution-capable keys commented out
+    and a project header, for writing a per-project starter. An active
+    execution field at its default would warn on every load while untrusted,
+    and would revoke a user-granted capability once the file is trusted."""
     out: list[str] = []
     for line in TEMPLATE.splitlines():
-        out.append("# " + line if line.strip() in _USER_SCOPE_KEYS else line)
+        if line.strip() in _USER_SCOPE_KEYS or _is_exec_line(line):
+            out.append("# " + line)
+        else:
+            out.append(line)
     return _PROJECT_HEADER + "\n".join(out) + "\n"
 
 

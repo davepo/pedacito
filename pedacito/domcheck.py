@@ -35,6 +35,7 @@ import functools
 import json
 import os
 import re
+import sys
 import threading
 from collections import Counter
 from contextlib import contextmanager
@@ -949,11 +950,90 @@ def check(root, *, entry: str = "", timeout: int = 45,
           baseline: dict | None = None) -> DomResult:
     """Load the entry page headless and report what the browser sees. Never
     raises: a check that cannot run returns `error` with the reason (missing
-    install, no entry page, launch failure) instead of a false green."""
+    install, no entry page, launch failure) instead of a false green.
+
+    The Playwright session runs in a child process: `page.evaluate()` has no
+    timeout, so a page script that loops forever would block the caller
+    forever (a `new --complex` task stalled for eleven minutes before the
+    driver was killed). `timeout` bounds navigation; the child gets a short
+    grace for launch and reporting, then its whole process group is stopped.
+    """
     root = Path(root)
     ok, hint = available()
     if not ok:
         return DomResult(entry="", error=hint)
+    rel = find_entry(root, entry)
+    if not rel:
+        return DomResult(entry="", error=(
+            "no HTML entry page found (set dom_entry to the page to load)"))
+    timeout = max(5, int(timeout or 45))
+    from . import proc
+
+    cmd = [sys.executable, "-m", "pedacito.domcheck", "--worker",
+           str(root), "--entry", rel, "--timeout", str(timeout)]
+    cap = timeout + 10
+    rc, out, stopped, _secs = proc.run(cmd, cwd=root, timeout=cap,
+                                       max_output=400_000)
+    if stopped == "timeout":
+        return DomResult(entry=rel, error=(
+            f"the headless DOM check did not finish within {cap}s; a page "
+            "script may be looping, so the browser was stopped. The page is "
+            "NOT verified."))
+    if stopped == "error":
+        return DomResult(entry=rel, error=(
+            f"headless DOM check could not run: {out.strip()[:300]}"))
+    payload = None
+    for line in (out or "").splitlines():
+        if line.startswith(_WORKER_MARK):
+            try:
+                payload = json.loads(line[len(_WORKER_MARK):])
+            except ValueError:
+                payload = None
+    if payload is None:
+        tail = " | ".join((out or "").strip().splitlines()[-4:])[:600]
+        return DomResult(entry=rel, error=(
+            "headless DOM check ended without a result "
+            f"(exit {rc}): {tail}"))
+    findings = [DomFinding(**f) for f in payload.get("findings") or []
+                if isinstance(f, dict)]
+    snap = payload.get("snapshot")
+    if isinstance(snap, dict) and baseline:
+        findings.extend(_diff_mounted(baseline, snap))
+    return DomResult(entry=payload.get("entry") or rel, findings=findings,
+                     snapshot=snap if isinstance(snap, dict) else None,
+                     error=payload.get("error") or "")
+
+
+_WORKER_MARK = "__PEDACITO_DOM_JSON__"
+
+
+def _worker_main(argv: list[str]) -> int:
+    """Child entry: run the Playwright session and print one JSON line."""
+    import argparse
+
+    ap = argparse.ArgumentParser(add_help=False)
+    ap.add_argument("--worker", action="store_true")
+    ap.add_argument("root")
+    ap.add_argument("--entry", default="")
+    ap.add_argument("--timeout", type=int, default=45)
+    a = ap.parse_args(argv)
+    res = _check_inproc(a.root, entry=a.entry, timeout=a.timeout)
+    payload = {
+        "entry": res.entry,
+        "error": res.error,
+        "findings": [{"kind": f.kind, "severity": f.severity,
+                      "message": f.message} for f in res.findings],
+        "snapshot": res.snapshot,
+    }
+    print(_WORKER_MARK + json.dumps(payload))
+    return 0
+
+
+def _check_inproc(root, *, entry: str = "", timeout: int = 45,
+                  baseline: dict | None = None) -> DomResult:
+    """The actual Playwright session, called by the worker child (and by
+    tests that want to observe it directly)."""
+    root = Path(root)
     rel = find_entry(root, entry)
     if not rel:
         return DomResult(entry="", error=(
@@ -1083,3 +1163,7 @@ def load_snapshot(path) -> dict | None:
         return data if isinstance(data, dict) else None
     except (OSError, ValueError):
         return None
+
+
+if __name__ == "__main__":
+    sys.exit(_worker_main(sys.argv[1:]))

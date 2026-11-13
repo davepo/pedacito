@@ -201,7 +201,11 @@ The cheapest reliable feedback is the code itself:
   failures feed the repair rounds. A failure the command ledger already
   recorded before this run is labelled pre-existing and is not fed to repair
   as edit-caused (§33). An applied edit that breaks tests is an
-  objective signal no model self-critique can fake.
+  objective signal no model self-critique can fake. One detected command is
+  not always enough: in a tree with both Python and JavaScript tests, a
+  package.json script wins detection, so a Python-only change now runs the
+  Python runner (`testsel._language_base`). An explicit `test_command` still
+  wins, unchanged.
 - **Immediate AST syntax gate.** Before any linter or pytest subprocess starts,
   the dry-applied in-memory buffers are parsed in-process: `ast.parse` for
   Python, the existing tree-sitter grammar for every other supported language.
@@ -877,6 +881,13 @@ nothing from that list, and the digest of the approved file is rechecked every
 load, so editing it revokes the approval. The rest of the settings in the same
 file still apply, because a layout or a budget cannot run anything.
 
+`config --init --path <project>/.pedacito.toml` writes that starter with every
+`EXEC_FIELDS` line commented out. A starter that assigned the defaults
+actively would warn about being ignored on every load while untrusted, and
+would revoke a user-granted capability once trusted, since an explicit `false`
+layers over the user's `true`. Commented lines keep the setting discoverable
+without either effect.
+
 ---
 
 ### 22. `run_test`: a micro-dose of live evidence inside the gather phase
@@ -1074,7 +1085,11 @@ render it, or fix the selector
     both names and `const {x, y: z}` binds `x` and `z`; reading the pattern as
     one token reports `setOpen()` as unreachable. Names are pooled from the
     grammar (gate) or split out of the destructuring head (advisor) -- never
-    from the raw text of the declaration line.
+    from the raw text of the declaration line. A single-parameter arrow
+    (`rows.forEach(m => ...)`) has no parentheses to read, and `m.name` looks
+    exactly like the `engine.member` call shape the check hunts; its parameter
+    is therefore collected from the arrow itself, or every such callback was
+    reported as calling an undefined `m()`.
 
 A repo without HTML/JS exits before opening a file, so the gate is on by
 default and free there. Ablation flag: `frontend_contracts = false`.
@@ -1814,6 +1829,13 @@ consent. A missing Playwright install reports an honest install hint, never a
 false green. `webcheck` stays regex-only and notice-level; this tool's errors
 can drive repair. Off by default (`verify_dom = false`); `ask --verify-dom`
 flips it per run, `dom_entry` / `dom_timeout` tune it.
+
+The Playwright session runs in a child process under a wall-clock bound
+(`dom_timeout` plus a short launch grace). `page.evaluate()` has no timeout of
+its own, so a page whose script loops forever used to block the caller
+indefinitely -- an eleven-minute stall inside `new --complex`. A check that
+overruns is stopped with its whole process group and reported as *not
+verified* (`error`), so it can never read as a green page.
 
 ## Upgrade paths (harness leaderboard)
 

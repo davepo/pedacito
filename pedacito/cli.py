@@ -864,9 +864,9 @@ def _cmd_auto(args, cfg, client, idx, root: Path) -> int:
             smoke_timeout=int(cfg.auto_smoke_timeout or 20),
             verbose=True)
         if v_ok:
-            note = "verify: passed" + (f" ({v_out})" if v_out else "")
+            note, ran = scaffold.verify_receipt(root, verify, smoke, v_ok, v_out)
             print(f"  {note}", file=sys.stderr)
-            workspace.log_event(root, note)
+            workspace.log_event(root, note, "INFO" if ran else "WARN")
         else:
             print("\n  [warning] runtime verification failed after repair:\n"
                   + "\n".join(f"    {ln}" for ln in v_out.splitlines()[:10]),
@@ -2556,6 +2556,10 @@ def build_parser() -> argparse.ArgumentParser:
 def _main(argv=None) -> int:
     _configure_stdio()
     args = build_parser().parse_args(argv)
+    # A command whose positional is optional (`rpc`) parses it as one string;
+    # every consumer below expects a list of paths.
+    if isinstance(getattr(args, "paths", None), str):
+        args.paths = [args.paths]
 
     # `config --setup` repairs a broken config, so it runs before _config().
     if args.cmd == "config" and getattr(args, "setup", False):
