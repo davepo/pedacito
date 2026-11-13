@@ -627,7 +627,7 @@ def test_gates_run_without_a_shell(tmp_path):
                frontend_contracts=True, interface_lock=False, repair_rounds=0)
     idx = types.SimpleNamespace(root=tmp_path)
     collected: list = []
-    _results, _reply, tests_ok = loop._post_edit_tests(
+    _results, _reply, tests_ok, _preexisting = loop._post_edit_tests(
         tmp_path, cfg, None, idx, "wire the modules",
         [Result(True, "main.js", "applied")], "reply", None, None,
         ["main.js"], collect=collected)

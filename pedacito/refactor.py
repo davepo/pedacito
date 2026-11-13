@@ -85,6 +85,107 @@ def _string_mentions(text: str, old: str, cap: int = 8) -> list[tuple[int, str]]
     return out
 
 
+# BUG-219: the opt-in `--strings` follow-up rewrites whole-word occurrences
+# INSIDE string literals (test labels, docs) -- never comments, never code.
+# Python spans come from the real tokenizer, tree-sitter languages from their
+# string nodes; the quoted-span regex above is the fallback. The new name is
+# a plain identifier, so it can never introduce a quote or an escape, and the
+# engine's syntax gate still vets the result before anything is written.
+_TS_STRING_TYPES = frozenset({
+    "string", "template_string", "string_literal", "raw_string_literal",
+    "interpreted_string_literal", "verbatim_string_literal",
+    "encapsed_string", "heredoc", "nowdoc", "heredoc_body",
+})
+
+
+def _py_string_spans(text: str) -> list[tuple[int, int]] | None:
+    """Character spans of the STRING tokens (plus f-string literal middles
+    on 3.12+, whose expression NAMEs the identifier pass already renamed);
+    None when the file does not tokenize."""
+    starts = [0] + [m.end() for m in re.finditer("\n", text)]
+
+    def off(pos: tuple[int, int]) -> int:
+        row, col = pos
+        return starts[row - 1] + col
+
+    fmiddle = getattr(tokenize, "FSTRING_MIDDLE", None)
+    spans: list[tuple[int, int]] = []
+    try:
+        for tok in tokenize.generate_tokens(io.StringIO(text).readline):
+            if tok.type == tokenize.STRING or (
+                    fmiddle is not None and tok.type == fmiddle):
+                spans.append((off(tok.start), off(tok.end)))
+    except (tokenize.TokenError, IndentationError, SyntaxError):
+        return None
+    return spans
+
+
+def _ts_string_spans(text: str, suffix: str) -> list[tuple[int, int]] | None:
+    """Character spans of the string-literal nodes, or None when no grammar
+    is available (the caller falls back to the quoted-span regex)."""
+    from .chunker_ts import LANG_BY_EXT, TS_AVAILABLE, _get_parser, ts_nodes
+
+    lang = LANG_BY_EXT.get(suffix)
+    if not (TS_AVAILABLE and lang):
+        return None
+    data = text.encode("utf-8")
+    try:
+        with ts_nodes():
+            tree = _get_parser(lang).parse(data)
+            spans: list[tuple[int, int]] = []
+            stack = [tree.root_node]
+            while stack:
+                node = stack.pop()
+                if node.type in _TS_STRING_TYPES:
+                    spans.append((node.start_byte, node.end_byte))
+                    continue        # fragments inside belong to the span
+                stack.extend(node.children)
+    except Exception:
+        return None
+    # Byte offsets -> character offsets, walking the sorted disjoint spans.
+    out: list[tuple[int, int]] = []
+    pos_b = pos_c = 0
+    for s, e in sorted(spans):
+        if s < pos_b:
+            continue
+        pos_c += len(data[pos_b:s].decode("utf-8", "replace"))
+        seg = len(data[s:e].decode("utf-8", "replace"))
+        out.append((pos_c, pos_c + seg))
+        pos_b, pos_c = e, pos_c + seg
+    return out
+
+
+def _rename_in_strings(text: str, old: str, new: str, suffix: str
+                       ) -> tuple[str, int]:
+    """(new text, replacements) for whole-word `old` -> `new` INSIDE string
+    literals only; comments and code are untouched. (text, 0) when the file
+    cannot be spanned."""
+    word = re.compile(r"(?<![\w$])" + re.escape(old) + r"(?![\w$])")
+    if suffix == ".py":
+        spans = _py_string_spans(text)
+        if spans is None:
+            return text, 0
+    else:
+        spans = _ts_string_spans(text, suffix)
+        if spans is None:
+            spans = [(m.start(), m.end())
+                     for m in _STRING_SPAN_RE.finditer(text)]
+    if not spans:
+        return text, 0
+    out: list[str] = []
+    prev = n = 0
+    for s, e in sorted(spans):
+        if s < prev:            # overlapping fallback spans: first one wins
+            continue
+        seg, k = word.subn(new, text[s:e])
+        out.append(text[prev:s])
+        out.append(seg)
+        n += k
+        prev = e
+    out.append(text[prev:])
+    return "".join(out), n
+
+
 def _rename_python(text: str, old: str, new: str) -> tuple[str, int]:
     """Replace NAME tokens equal to `old` (strings and comments untouched)."""
     lines = text.split("\n")
@@ -417,17 +518,21 @@ def _scoped_files(root: Path, scope_file: str) -> list[str]:
 def rename_symbol_across_project(root, old_name: str, new_name: str,
                                  scope_file: str | None = None,
                                  dry_run: bool = False,
-                                 before_write=None) -> dict:
+                                 before_write=None,
+                                 include_strings: bool = False) -> dict:
     """Deterministic, zero-token multi-file symbol rename.
 
     Replaces every EXACT identifier token `old_name` with `new_name` across
     the indexed project source (or `scope_file` plus its importers): Python
     through the real `tokenizer` and JS/TS/Go/Rust/... through tree-sitter
     IDENTIFIER nodes, so string literals and comments that merely CONTAIN
-    the old name are never touched. Every candidate file is validated with
-    the same AST / tree-sitter syntax gate the edit path uses BEFORE
-    anything is written: one file that the rename would break refuses the
-    whole run (nothing lands).
+    the old name are never touched. `include_strings` (the CLI's --strings)
+    additionally rewrites whole-word occurrences INSIDE string literals --
+    test labels and docs that name the API (BUG-219); comments stay untouched
+    either way. Every candidate file is validated with the same AST /
+    tree-sitter syntax gate the edit path uses BEFORE anything is written:
+    one file that the rename would break refuses the whole run (nothing
+    lands).
 
     Returns {ok, files_modified, total_replacements, diffs} plus dry_run /
     skipped / warnings; with `dry_run` nothing is written. `before_write`
@@ -465,6 +570,7 @@ def rename_symbol_across_project(root, old_name: str, new_name: str,
     skipped: list[str] = []
     warnings: list[str] = []
     string_matches: list[str] = []
+    string_total = 0
     for rel in files:
         why = safety.is_protected(rel)
         if why:
@@ -493,6 +599,13 @@ def rename_symbol_across_project(root, old_name: str, new_name: str,
                                     "tree-sitter grammar available)")
             else:
                 new_text, n = res
+        if include_strings:
+            # BUG-219 opt-in: whole-word occurrences INSIDE string literals
+            # (test labels, docs) move too; comments never do.
+            new_text, ns = _rename_in_strings(new_text, old_name, new_name,
+                                              suffix)
+            n += ns
+            string_total += ns
         # BUG-319: note string literals that still name the old symbol (test
         # labels, docs) so the caller can surface them. Scan the post-rename
         # text so the identifiers just renamed do not count as leftovers.
@@ -548,6 +661,7 @@ def rename_symbol_across_project(root, old_name: str, new_name: str,
             "files_modified": sorted(changes),
             "total_replacements": sum(n for _b, _a, n, _s
                                       in changes.values()),
+            "string_replacements": string_total,
             "diffs": diffs,
             "dry_run": bool(dry_run),
             "per_file": {rel: n for rel, (_b, _a, n, _s)

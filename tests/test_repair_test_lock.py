@@ -221,7 +221,7 @@ def test_post_edit_repair_seat_cannot_weaken_the_test(tmp_path, monkeypatch):
     agent = _agent(tmp_path, client, FILES)
     results = [Result(True, "pkg/core.py", "edit applied",
                       before=CORE, after=broken)]
-    out, reply, tests_ok = loop._post_edit_tests(
+    out, reply, tests_ok, _preexisting = loop._post_edit_tests(
         tmp_path, cfg, agent, agent.index, TASK, results, "original reply",
         None, None, ["pkg/core.py"])
     assert tests_ok is True

@@ -88,7 +88,7 @@ def test_post_edit_syntax_gate_skips_subprocess_until_the_patch_parses(
             return [_result(before, before)]
 
     agent = FakeAgent()
-    results, reply, tests_ok = loop._post_edit_tests(
+    results, reply, tests_ok, _preexisting = loop._post_edit_tests(
         tmp_path, cfg, agent, object(), "fix the syntax", [_result(before, broken)],
         "old reply", None, None, ["mod.py"])
 
@@ -206,7 +206,7 @@ def test_post_edit_tests_repairs_new_failure_even_when_total_is_flat(
 
     agent = FakeAgent()
     results = [_result("x = 1\n", "x = 1\n", "a.py")]
-    out, reply, tests_ok = loop._post_edit_tests(
+    out, reply, tests_ok, _preexisting = loop._post_edit_tests(
         tmp_path, cfg, agent, object(), "make tests pass", results, "old reply",
         None, (False, BASELINE, "pytest"), ["a.py"])
 
@@ -258,7 +258,7 @@ def test_post_edit_suppresses_repair_for_a_recorded_pre_existing_failure(
 
     agent = FakeAgent()
     results = [_result("x = 1\n", "x = 2\n", "a.py")]
-    out, reply, tests_ok = loop._post_edit_tests(
+    out, reply, tests_ok, _preexisting = loop._post_edit_tests(
         tmp_path, cfg, agent, types.SimpleNamespace(root=tmp_path),
         "task", results, "reply", None, None, ["a.py"])
 
@@ -304,7 +304,7 @@ def test_post_edit_still_repairs_when_an_in_run_baseline_shows_a_new_failure(
 
     agent = FakeAgent()
     results = [_result("x = 1\n", "x = 1\n", "a.py")]
-    out, reply, tests_ok = loop._post_edit_tests(
+    out, reply, tests_ok, _preexisting = loop._post_edit_tests(
         tmp_path, cfg, agent, types.SimpleNamespace(root=tmp_path),
         "task", results, "reply", None, (False, BASELINE, "pytest"), ["a.py"])
 

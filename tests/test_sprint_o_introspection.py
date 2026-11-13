@@ -431,7 +431,7 @@ def test_post_edit_frontend_gate_repairs_then_learns(tmp_path, monkeypatch):
     agent = FakeAgent()
     results = [Result(True, "app.js", "applied",
                       before="", after="document.getElementById('nope');\n")]
-    out_results, reply, tests_ok = loop._post_edit_tests(
+    out_results, reply, tests_ok, _preexisting = loop._post_edit_tests(
         tmp_path, cfg, agent, types.SimpleNamespace(root=tmp_path), "task",
         results, "reply", None, None, ["app.js"])
     assert FakeAgent.calls == [["frontend"]]       # gate fired first, once

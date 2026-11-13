@@ -260,7 +260,7 @@ def test_post_edit_static_repairs_before_any_test_subprocess(tmp_path,
                         lambda idx, cfg_, files: (runs.append(list(files))
                                                   or (True, "ok", "pytest")))
     results = [Result(True, "m.py", "applied", before="", after=BROKEN)]
-    out_results, reply, tests_ok = loop._post_edit_tests(
+    out_results, reply, tests_ok, _preexisting = loop._post_edit_tests(
         tmp_path, cfg, agent, types.SimpleNamespace(root=tmp_path), "task",
         results, "reply", None, None, ["m.py"])
     # The static error went to repair first; the test subprocess ran exactly

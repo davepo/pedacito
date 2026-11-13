@@ -394,7 +394,7 @@ JS_GLOBAL_NAMES = frozenset("""
     Array ArrayBuffer AsyncGenerator AsyncFunction Atomics BigInt
     BigInt64Array BigUint64Array Boolean Buffer DataView Date Error EvalError
     FinalizationRegistry Float16Array Float32Array Float64Array Function
-    Generator Infinity Intl JSON Map Math NaN Number Object Promise Proxy
+    Generator Infinity Int16Array Int32Array Int8Array Intl JSON Map Math NaN Number Object Promise Proxy
     RangeError ReferenceError Reflect RegExp Set SharedArrayBuffer String
     Symbol SyntaxError TypeError Uint16Array Uint32Array Uint8Array
     Uint8ClampedArray Uint8ClampedArray BigUint64Array URIError WeakMap

@@ -2636,6 +2636,37 @@ class Agent:
                     break
                 continue
 
+            # BUG-209: a `read` with neither a file nor a symbol names nothing
+            # to fetch. Dispatching it only produces an ERROR observation the
+            # model re-picks ("read (no file) L1-end" three times in a row)
+            # until the no-progress lease dies. Reject it before dispatch, as
+            # a failed step: the failure cache redirects repeats and the
+            # error streak bounds the stall, without spending a live lookup.
+            if action == "read" and not str(stepjson.get("file") or "").strip() \
+                    and not str(stepjson.get("symbol") or "").strip():
+                obs = ("ERROR: `read` needs a `file` (or a `symbol`) to read. "
+                       "Pick an exact path from the PROJECT MAP, or use "
+                       "`find`/`outline` to locate one first.")
+                seen_failures.setdefault(
+                    sig, (step, self.index.generation, self.fold_count,
+                          mutations))
+                self.steps_log.append(
+                    f"{step}. read (rejected: no file or symbol given)")
+                self._emit("step", n=step, action=action, detail="(no file)",
+                           obs_chars=len(obs), error=True)
+                messages.append({"role": "assistant",
+                                 "content": _compact(stepjson)})
+                messages.append({"role": "user",
+                                 "content": f"{obs}\n\n{nudge(step + 1)}"})
+                budget -= len(obs)
+                self._fit(messages, gclient)
+                if verbose:
+                    print("  [step rejected: `read` (no file) -- no file or "
+                          "symbol given]", file=sys.stderr)
+                if note_progress(False):
+                    break
+                continue
+
             detail = (stepjson.get("file") or stepjson.get("pattern")
                       or stepjson.get("symbol") or stepjson.get("command") or "")
             if action == "read":
@@ -3618,6 +3649,41 @@ class Agent:
         except (OSError, ValueError):
             return 0
 
+    def _shell_satisfied(self, rel: str, reply: str) -> bool:
+        """BUG-207: True when a gather-phase shell mutation already made this
+        target's edit and the model CONFIRMS it by emitting only no-op blocks
+        (SEARCH == REPLACE) for this file. `tool_run` feeds the mutation ledger
+        (cfg._task_mutations) and refreshes the index, so the file on disk is
+        already correct; a no-op block is the model saying "it matches". Honor
+        that instead of failing the target for "no usable block". A reply with
+        any real block is not a confirmation and takes the normal path."""
+        muts = getattr(self.cfg, "_task_mutations", None) or ()
+        if not any(_same_rel(m, rel) for m in muts):
+            return False
+        discards: list = []
+        if parse_edits(reply, discards=discards):
+            return False
+        return any(_same_rel(d, rel) for d in discards)
+
+    def _top_level_names(self, rel: str) -> set:
+        """BUG-208: the definition names a file currently exposes (qualified
+        and bare). Used to reconcile that a whole-file append survives the
+        later hunks that edit the same file -- the per-hunk gate verifies the
+        hunk, not the final file contract."""
+        try:
+            units = self.index.in_file(rel)
+        except Exception:
+            return set()
+        names: set = set()
+        for c in units:
+            if c.kind in ("module", "reference"):
+                continue
+            q = getattr(c, "qualname", "") or ""
+            if q:
+                names.add(q)
+                names.add(q.rsplit(".", 1)[-1])
+        return names
+
     def _check_incremental_hunk(self, task: str, gathered: str, rel: str,
                                 symbol: str, reply: str):
         """Dry-apply ONE target's hunks, then run verify.py and the AST gate.
@@ -3809,6 +3875,11 @@ class Agent:
         # although every intended test was green. A resolved target already
         # applied in this batch is covered, not owed again.
         applied_targets: set[tuple[str, str]] = set()
+        # BUG-208: definition names a whole-file hunk appended, per file. Every
+        # later hunk on that file must keep them; one that drops them is
+        # rejected and re-asked, so the batch cannot silently lose the append
+        # (the per-hunk gate verifies the hunk, not the final file contract).
+        appended: dict[str, set] = {}
         for n, intent in enumerate(intents, 1):
             target, failure = self._resolve_edit_intent(intent)
             if target is None:
@@ -3865,6 +3936,7 @@ class Agent:
             last_findings: list = []
             last_reason = ""               # why the last draft was rejected
             accepted = None
+            shell_done = False             # BUG-207: satisfied by a shell edit
             for attempt in range(attempts):
                 if self._task_budget_exceeded("incremental edit"):
                     last_results = [Result(
@@ -3881,6 +3953,18 @@ class Agent:
                     last_results = [Result(
                         False, rel, f"edit generation failed: {type(e).__name__}")]
                     break
+                # BUG-207: a gather-phase shell mutation may already have made
+                # this edit; the model's no-op block confirms the file matches.
+                # Accept the target without writing anything instead of failing
+                # it for "no usable block".
+                if self._shell_satisfied(rel, reply):
+                    shell_done = True
+                    accepted = ([Result(
+                        True, rel,
+                        "already satisfied by a shell mutation during gather; "
+                        "the no-op block confirms the file matches")],
+                        [], reply, attempt)
+                    break
                 hunk_results, hunk_findings = self._check_incremental_hunk(
                     task, gathered, rel, symbol, reply)
                 errors = [f for f in hunk_findings if f.severity == "error"]
@@ -3892,12 +3976,57 @@ class Agent:
                         False, rel, "the incremental hunk was truncated at the "
                                     "output limit")]
                 if clean:
+                    # BUG-208: snapshot the file and its definition names before
+                    # writing, so a hunk that clobbers an earlier whole-file
+                    # append is rejected and re-asked instead of silently
+                    # landing a file that lost the appended symbol.
+                    from . import index as index_mod
+                    rel_key = fileio.path_key(rel)
+                    pre_names = self._top_level_names(rel)
+                    try:
+                        pre_bytes = (self.index.root / rel).read_bytes()
+                    except OSError:
+                        pre_bytes = None
                     applied = self._apply_once(reply, False, backup_dir)
                     if applied and all(getattr(r, "ok", False) for r in applied):
-                        accepted = (applied, hunk_findings, reply, attempt)
-                        break
-                    hunk_results = applied or hunk_results
-                    errors = []
+                        try:
+                            index_mod.reindex_file(self.index, rel, self.cfg,
+                                                   save=False)
+                        except Exception:
+                            pass
+                        post_names = self._top_level_names(rel)
+                        lost = appended.get(rel_key, set()) - post_names
+                        if lost:
+                            # This hunk removed definitions an earlier whole-
+                            # file hunk appended. Restore the pre-hunk file and
+                            # reject so the retry keeps them intact.
+                            if pre_bytes is not None:
+                                try:
+                                    fileio.write_bytes(self.index.root / rel,
+                                                       pre_bytes)
+                                    index_mod.reindex_file(self.index, rel,
+                                                           self.cfg, save=False)
+                                except Exception:
+                                    pass
+                            hunk_results = [Result(
+                                False, rel,
+                                "this hunk removed " + ", ".join(sorted(lost))
+                                + " that an earlier hunk appended to this "
+                                "file; re-emit it keeping those definitions "
+                                "intact")]
+                            hunk_findings = []
+                            errors = []
+                        else:
+                            if not symbol:
+                                added = post_names - pre_names
+                                if added:
+                                    appended[rel_key] = \
+                                        appended.get(rel_key, set()) | added
+                            accepted = (applied, hunk_findings, reply, attempt)
+                            break
+                    else:
+                        hunk_results = applied or hunk_results
+                        errors = []
                 last_results, last_findings = hunk_results, hunk_findings
                 self._emit("incremental_edit", target=n, of=total, ok=False,
                            attempt=attempt + 1,
@@ -3929,8 +4058,10 @@ class Agent:
                                            save=False)
                 except Exception:
                     pass
-                receipt = self._incremental_receipt(
-                    rel, symbol, True, repairs=max(0, attempt))
+                receipt = (f"[ALREADY DONE {rel}:{symbol or '(file)'} "
+                           "(shell mutation during gather)]" if shell_done
+                           else self._incremental_receipt(
+                               rel, symbol, True, repairs=max(0, attempt)))
                 receipts.append(receipt)
                 # Collapse the target request and any rejected drafts back to
                 # P, leaving only the compact verified receipt in the tail.
@@ -3944,7 +4075,9 @@ class Agent:
                            attempt=attempt + 1)
                 if verbose:
                     print(f"  [incremental {n}/{total}: {rel}:{symbol or '(file)'}"
-                          " applied and verified]", file=sys.stderr)
+                          + (" already satisfied by a shell mutation]"
+                             if shell_done else " applied and verified]"),
+                          file=sys.stderr)
             else:
                 if not last_results:
                     last_results = [Result(
@@ -3974,41 +4107,10 @@ class Agent:
             # reply): check_coverage and coverage_seeds must describe the
             # same edit set (BUG-205). A repair prompt carries no user
             # requirements, so it gets no coverage verdict or follow-up
-            # (BUG-314).
-            findings_all.extend(verify_mod.check_coverage(
-                task, reply, results_all, tracker=tracker))
-            # A half-answered multi-clause task used to end with an advisory
-            # coverage warning. The requirement state machine now seeds one
-            # bounded follow-up pass from the clauses no hunk addressed.
-            seeds = verify_mod.coverage_seeds(task, reply, results_all,
-                                              tracker=tracker)
-            if seeds:
-                followup = self._coverage_intents(seeds)
-                # The receipt fires even when no clause resolves to a target:
-                # a silent skip is indistinguishable from "nothing was owed"
-                # (BUG-205).
-                self._emit("coverage_followup",
-                           clauses=[r.text for r in seeds],
-                           targets=len(followup))
-                if verbose:
-                    if followup:
-                        print(f"  [coverage follow-up: {len(followup)} "
-                              f"target(s) for {len(seeds)} unaddressed "
-                              f"clause(s)]", file=sys.stderr)
-                    else:
-                        print(f"  [coverage follow-up: {len(seeds)} "
-                              "unaddressed clause(s), but none resolved to "
-                              "an edit target; the coverage warnings stand]",
-                              file=sys.stderr)
-                if followup:
-                    more_results, more_reply, more_findings = \
-                        self.apply_edit_intents(
-                            task, gathered, followup, backup_dir=backup_dir,
-                            verbose=verbose, _followup=True)
-                    results_all.extend(more_results)
-                    findings_all.extend(more_findings)
-                    reply += ("\n\nCoverage follow-up (unaddressed task clauses):"
-                              "\n" + "\n".join(more_reply.splitlines()[1:]))
+            # (BUG-314). The ordinary answer path runs the same pass (BUG-213).
+            results_all, reply, findings_all = self._coverage_pass(
+                task, gathered, results_all, reply, findings_all,
+                backup_dir=backup_dir, verbose=verbose)
         mixed = [r for r in results_all if not getattr(r, "ok", False)]
         if results_all and mixed and len(mixed) < len(results_all):
             # Half a feature is on disk and half is not. Nothing rolls back:
@@ -4035,6 +4137,54 @@ class Agent:
                       f"them sees the mix. To start over:{undo}.",
                       file=sys.stderr)
         return results_all, reply, verify_mod.dedupe_findings(findings_all)
+
+    def _coverage_pass(self, task: str, gathered: str, results: list,
+                       reply: str, findings: list, backup_dir=None,
+                       verbose: bool = False):
+        """One batch-level coverage verdict plus ONE bounded follow-up pass,
+        shared by the incremental microloop and the ordinary answer path
+        (BUG-213): a zero-intent answer run used to skip the coverage verdict
+        entirely because it never entered apply_edit_intents. check_coverage
+        and coverage_seeds see the SAME edit evidence (results, not the prose
+        reply). The follow-up hunks pay the same dry-apply/verify gate via
+        apply_edit_intents(_followup=True), which never recurses again.
+        Returns (results, reply, findings)."""
+        from . import verify as verify_mod
+        tracker = getattr(self, "requirements", None)
+        findings.extend(verify_mod.check_coverage(
+            task, reply, results, tracker=tracker))
+        # A half-answered multi-clause task used to end with an advisory
+        # coverage warning. The requirement state machine seeds one bounded
+        # follow-up pass from the clauses no edit addressed.
+        seeds = verify_mod.coverage_seeds(task, reply, results, tracker=tracker)
+        if seeds:
+            followup = self._coverage_intents(seeds)
+            # The receipt fires even when no clause resolves to a target: a
+            # silent skip is indistinguishable from "nothing was owed"
+            # (BUG-205).
+            self._emit("coverage_followup",
+                       clauses=[r.text for r in seeds],
+                       targets=len(followup))
+            if verbose:
+                if followup:
+                    print(f"  [coverage follow-up: {len(followup)} "
+                          f"target(s) for {len(seeds)} unaddressed "
+                          f"clause(s)]", file=sys.stderr)
+                else:
+                    print(f"  [coverage follow-up: {len(seeds)} "
+                          "unaddressed clause(s), but none resolved to "
+                          "an edit target; the coverage warnings stand]",
+                          file=sys.stderr)
+            if followup:
+                more_results, more_reply, more_findings = \
+                    self.apply_edit_intents(
+                        task, gathered, followup, backup_dir=backup_dir,
+                        verbose=verbose, _followup=True)
+                results.extend(more_results)
+                findings.extend(more_findings)
+                reply += ("\n\nCoverage follow-up (unaddressed task clauses):"
+                          "\n" + "\n".join(more_reply.splitlines()[1:]))
+        return results, reply, findings
 
     def incremental_edit(self, task: str, gathered: str, backup_dir=None,
                          verbose: bool = False):

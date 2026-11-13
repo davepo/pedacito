@@ -1116,11 +1116,83 @@ def _block_match(node_id: str, blocks: list[tuple[str, str]],
     return None
 
 
+# A file-level TAP wrapper (`not ok N - tests/foo.test.js`) aggregates the
+# file's subtests; the real failing identities are the subtests inside it
+# (BUG-221). Recognise the wrapper by its test-file name.
+_NODE_TEST_FILE_RE = re.compile(r"\.(?:test|spec)\.[cm]?[jt]s$")
+# The spec reporter's `✖ failing tests:` line introduces the summary re-list,
+# not a test of its own; counting it inflated every red suite by one and
+# invented a spurious new/fixed identity when the baseline used TAP (BUG-221).
+_NODE_SPEC_HEADER_RE = re.compile(r"^failing tests:?$", re.IGNORECASE)
+
+
+def _node_error_message(block: list[str]) -> str:
+    """The assertion message from a TAP detail block. A quoted/plain
+    `error: '...'` value is taken as-is; a YAML block scalar (`error: |-` /
+    `>-`) carries its message on the following lines, so the literal `|-`
+    indicator must not become the signature (BUG-221)."""
+    for k, bl in enumerate(block):
+        em = re.match(r"error:\s*(.*)$", bl)
+        if not em:
+            continue
+        val = em.group(1).strip()
+        if re.fullmatch(r"[|>][+-]?", val):
+            msg: list[str] = []
+            for nxt in block[k + 1:]:
+                if re.match(r"^[A-Za-z_][A-Za-z0-9_]*:(?:\s|$)", nxt) \
+                        or nxt == "...":
+                    break
+                if nxt:
+                    msg.append(nxt)
+            return " ".join(msg).strip()
+        return val.strip("'\"")
+    return ""
+
+
+def _node_subtests_from_block(btext: str) -> list[FailureIdentity]:
+    """The nested `not ok` subtests inside a file-level wrapper's detail block,
+    as identities keyed by the subtest name (BUG-221). The block's lines are
+    already de-indented, so each subtest runs from its `not ok` line to the
+    next one."""
+    lines = btext.splitlines()
+    marks = [i for i, ln in enumerate(lines) if _NODE_TAP_NOTOK_RE.match(ln)]
+    out: list[FailureIdentity] = []
+    for k, i in enumerate(marks):
+        m = _NODE_TAP_NOTOK_RE.match(lines[i])
+        name = re.sub(r"\s+", " ", m.group("name").strip())
+        end = marks[k + 1] if k + 1 < len(marks) else len(lines)
+        sub = [ln.strip() for ln in lines[i + 1:end] if ln.strip()]
+        stext = "\n".join(sub)
+        sig = _node_error_message(sub)
+        if not sig:
+            for bl in sub:
+                if re.search(r"\b\w*(?:Error|Exception)\b", bl):
+                    sig = bl
+                    break
+        file, lineno = "", 0
+        lm = re.search(r"location:\s*'?([^':\n]+):(\d+)", stext)
+        if lm:
+            file, lineno = lm.group(1), int(lm.group(2))
+        info = FailureIdentity("node::" + name,
+                               _normalise_failure_signature(sig or name),
+                               "failed")
+        info.file, info.line = file, lineno
+        info.block = stext
+        out.append(info)
+    return out
+
+
 def _node_failure_identities(text: str) -> dict[str, FailureIdentity]:
     """Failing-test identities from Node `--test` output (TAP or spec reporter,
     BUG-322). Each `not ok N - name` / `✖ name` line plus its indented detail
     block becomes one identity keyed by the test name, with the assertion
-    signature and source location parsed out of the block."""
+    signature and source location parsed out of the block.
+
+    BUG-221: the spec reporter's `✖ failing tests:` summary header is not a
+    test, and a file-level TAP wrapper (`not ok N - tests/foo.test.js`) is an
+    aggregate of its subtests, not a failure of its own. Counting either
+    inflated the totals and invented spurious new/fixed identities when the
+    baseline and the current run used different reporter/command shapes."""
     infos: dict[str, FailureIdentity] = {}
     lines = (text or "").splitlines()
     i, n = 0, len(lines)
@@ -1131,6 +1203,9 @@ def _node_failure_identities(text: str) -> dict[str, FailureIdentity]:
             i += 1
             continue
         name = re.sub(r"\s+", " ", m.group("name").strip())
+        if _NODE_SPEC_HEADER_RE.match(name):
+            i += 1
+            continue
         j = i + 1
         block: list[str] = []
         while j < n and (lines[j][:1] in (" ", "\t") or not lines[j].strip()):
@@ -1138,11 +1213,18 @@ def _node_failure_identities(text: str) -> dict[str, FailureIdentity]:
                 block.append(lines[j].strip())
             j += 1
         btext = "\n".join(block)
-        sig = ""
-        em = re.search(r"error:\s*(.+)", btext)
-        if em:
-            sig = em.group(1).strip().strip("'\"")
-        else:
+        # A file-level wrapper stands for its subtests: emit those instead so
+        # the identity is the actual test, stable across reporter shapes. A
+        # wrapper with no subtests (a module-link failure) stays one identity.
+        if _NODE_TEST_FILE_RE.search(name):
+            subs = _node_subtests_from_block(btext)
+            if subs:
+                for info in subs:
+                    infos[info.test_id] = info
+                i = j
+                continue
+        sig = _node_error_message(block)
+        if not sig:
             for bl in block:
                 if re.search(r"\b\w*(?:Error|Exception)\b", bl):
                     sig = bl
@@ -1513,6 +1595,11 @@ class TaskResult:
     # (verification off / no test command), else True/False from the last
     # verification round. `ask --strict` exits nonzero on False.
     tests_ok: bool | None = None
+    # True when the impacted suite is red but EVERY remaining failure predates
+    # this task (R2): no new identity and no worse count. `ask --strict` then
+    # treats the run as clean -- a recorded pre-existing failure is not a task
+    # failure (BUG-220). False whenever a gate or a new test failure is red.
+    tests_preexisting_only: bool = False
     # Green-ratchet bookkeeping (`auto` only): True when this task's step
     # failed its check after all repair rounds and was UNDONE -- files
     # restored from the step's snapshot, step-created files removed -- and
@@ -1602,6 +1689,34 @@ def _note_tests_not_run(root, cfg, task: str) -> None:
         root, f"tests not run although the task names '{named}' "
               "(verify_tests/allow_shell off)", "WARN")
     events_mod.get(root, cfg).emit("tests_not_run", named=named)
+
+
+# A task that NAMES its verification has made that check part of its
+# guarantee: "run npm test" with verify_tests off ended green without any
+# test evidence (BUG-211), and "run domcheck" with verify_dom off shipped
+# page errors (BUG-216). Enable the named check for the run; the execution
+# boundary (allow_shell) is still the user's to grant, and a run that cannot
+# execute keeps the honest tests_not_run verdict above.
+_TASK_DOM_RE = re.compile(r"\bdom\s*check\b", re.IGNORECASE)
+
+
+def _infer_task_checks(root, cfg, task: str) -> None:
+    """Turn on verify_tests/verify_dom when the task text names them."""
+    named = _task_named_tests(task)
+    if named and not getattr(cfg, "verify_tests", False):
+        cfg.verify_tests = True
+        print(f"  [task names '{named}'; enabling verify_tests for this run]",
+              file=sys.stderr)
+        workspace.log_event(root, f"verify_tests enabled: the task names "
+                                  f"'{named}'", "INFO")
+    m = _TASK_DOM_RE.search(task or "")
+    if m and not getattr(cfg, "verify_dom", False):
+        cfg.verify_dom = True
+        dom_named = " ".join(m.group(0).split())
+        print(f"  [task names '{dom_named}'; enabling verify_dom for this "
+              "run]", file=sys.stderr)
+        workspace.log_event(root, f"verify_dom enabled: the task names "
+                                  f"'{dom_named}'", "INFO")
 
 
 def _merge_repair_results(results, new):
@@ -2108,7 +2223,7 @@ def _post_edit_tests(root, cfg, agent, idx, task, results, reply, backup_dir,
                     or _dom_wanted(cfg))
     if not (tests_wanted or gates_wanted):
         _note_tests_not_run(root, cfg, task)
-        return results, reply, None
+        return results, reply, None, False
     from . import verify as verify_mod
 
     def unresolved(kind: str, errors) -> None:
@@ -2145,6 +2260,7 @@ def _post_edit_tests(root, cfg, agent, idx, task, results, reply, backup_dir,
     base_score = _failure_score(base_out) if base_out else 0
     max_rounds = max(0, int(getattr(cfg, "repair_rounds", 2) or 0))
     tests_ok = None
+    preexisting_only = False       # the red suite is entirely pre-existing (R2)
     last_out = ""                  # the final test subprocess output, if any
     last_worse = False             # ...and whether THIS task made it worse
     pending_lesson: list = []      # (kind, text) this task broke and can mend
@@ -2246,9 +2362,13 @@ def _post_edit_tests(root, cfg, agent, idx, task, results, reply, backup_dir,
             print(f"  [frontend gate: {len(fe)} new DOM contract violation(s)"
                   f" -- tests/lint subprocess skipped until they are fixed]",
                   file=sys.stderr)
+            # BUG-218: this gate runs AFTER the write (post-write gate +
+            # repair, BUG-323): "rejected the patch" read as if nothing had
+            # landed while the violating file sat on disk. Say what is true.
             workspace.log_event(
-                root, "frontend contract gate rejected the patch; "
-                      "test/lint subprocess skipped", "ERROR")
+                root, "frontend contract gate found violations in the "
+                      "applied edits; test/lint subprocess skipped (the "
+                      "files stay written pending repair)", "ERROR")
             # BUG-318: name the violations, not just their count, so the run
             # log and event stream record what was rejected even when the
             # repair produces nothing.
@@ -2395,12 +2515,12 @@ def _post_edit_tests(root, cfg, agent, idx, task, results, reply, backup_dir,
             # green gates are tests.
             _note_lesson_run(root, cfg, lesson_kinds, injected)
             _note_tests_not_run(root, cfg, task)
-            return results, reply, tests_ok
+            return results, reply, tests_ok, False
         got = _run_tests(idx, cfg, changed)
         if got is None:
             _note_lesson_run(root, cfg, lesson_kinds, injected)
             _note_tests_not_run(root, cfg, task)
-            return results, reply, tests_ok
+            return results, reply, tests_ok, False
         ok, out, desc = got
         last_out = out
         if not ok:
@@ -2447,6 +2567,7 @@ def _post_edit_tests(root, cfg, agent, idx, task, results, reply, backup_dir,
             print("  [tests: failure pre-dates this run (recorded command "
                   "history); not auto-repaired]", file=sys.stderr)
         if not should_repair:
+            preexisting_only = not ok
             if not ok and score > 0:
                 # Honest exit: the suite is still red, but every remaining
                 # failure predates this task (or no identity could be parsed
@@ -2486,7 +2607,7 @@ def _post_edit_tests(root, cfg, agent, idx, task, results, reply, backup_dir,
             "failed assertion, or a loop that never ends) after the repair "
             "rounds; the edits apply but the code does not work")
     _note_lesson_run(root, cfg, lesson_kinds, injected)
-    return results, reply, tests_ok
+    return results, reply, tests_ok, preexisting_only
 
 
 def _post_edit_lint_incremental(root, cfg, agent, task, results, reply,
@@ -3092,6 +3213,10 @@ def _run_ladder(root: Path, cfg, client, agent, idx, task: str, *,
     from . import roles as roles_mod
     from .llm import BudgetExceeded, CancelledError
     cfg._task_mutations = []      # a fresh gather-mutation ledger per task
+    if apply and not review and not is_repair:
+        # BUG-211/216: a task that names its test/DOM command owes that
+        # check; repair prompts are harness diagnostics, not user text.
+        _infer_task_checks(root, cfg, task)
     # Files that exist BEFORE this task's gather: the repair test-lock (#46)
     # protects exactly these test files, never ones the task itself creates.
     _files = getattr(idx, "files", None)
@@ -3235,6 +3360,7 @@ def _run_task_once(root: Path, cfg, client, agent, idx, task: str, *,
     # its mutations used to bypass post-edit verification entirely.
     gather_mut = list(getattr(cfg, "_task_mutations", None) or ())
     tests_ok = None
+    tests_preexisting_only = False
     print("--- answering ---\n", file=sys.stderr)
     from . import verify as verify_mod
     findings: list = []
@@ -3313,7 +3439,7 @@ def _run_task_once(root: Path, cfg, client, agent, idx, task: str, *,
                 _fire(cfg, root, "post_edit",
                       files=sorted({r.file for r in results if r.ok}
                                    | set(gather_mut)))
-                results, reply, tests_ok = _post_edit_tests(
+                results, reply, tests_ok, tests_preexisting_only = _post_edit_tests(
                     root, cfg, agent, idx, task, results, reply,
                     backup_dir, baseline_tests,
                     sorted(set(edit_files) | set(gather_mut)),
@@ -3392,12 +3518,35 @@ def _run_task_once(root: Path, cfg, client, agent, idx, task: str, *,
                     raw_reply, dry_run=review or not apply, task=task,
                     gathered=gathered,
                     backup_dir=None if review else backup_dir)
+                if apply and not review and answer_system is None \
+                        and not is_repair and results:
+                    # BUG-213: the ordinary answer path owes the same
+                    # batch-level coverage verdict and ONE bounded follow-up
+                    # the incremental microloop runs; a zero-intent answer
+                    # run used to skip both because it never entered
+                    # apply_edit_intents. Preflight findings were already
+                    # logged above: only the new ones reach the log here.
+                    logged = {(f.kind, f.file, f.message) for f in findings}
+                    results, reply, findings = agent._coverage_pass(
+                        task, gathered, results, reply, findings,
+                        backup_dir=backup_dir, verbose=True)
+                    findings = verify_mod.dedupe_findings(findings)
+                    for f in findings:
+                        key = (f.kind, f.file, f.message)
+                        if key in logged:
+                            continue
+                        logged.add(key)
+                        workspace.log_event(
+                            root, f"verify: {f.render()}",
+                            "WARN" if f.severity == "warn" else "ERROR")
+                    edit_files = sorted(
+                        set(edit_files) | {r.file for r in results if r.file})
                 if apply and not review and (
                         any(r.ok for r in results) or gather_mut):
                     _fire(cfg, root, "post_edit",
                           files=sorted({r.file for r in results if r.ok}
                                        | set(gather_mut)))
-                    results, reply, tests_ok = _post_edit_tests(
+                    results, reply, tests_ok, tests_preexisting_only = _post_edit_tests(
                         root, cfg, agent, idx, task, results, reply,
                         backup_dir, baseline_tests,
                         sorted(set(edit_files) | set(gather_mut)),
@@ -3435,7 +3584,7 @@ def _run_task_once(root: Path, cfg, client, agent, idx, task: str, *,
                     # the same post-edit test evidence the main apply gets.
                     _fire(cfg, root, "post_edit",
                           files=sorted({r.file for r in results if r.ok}))
-                    results, reply, tests_ok = _post_edit_tests(
+                    results, reply, tests_ok, tests_preexisting_only = _post_edit_tests(
                         root, cfg, agent, idx, task, results, reply,
                         backup_dir, None,
                         sorted({e.file for e in parse_edits(reply)}),
@@ -3567,6 +3716,7 @@ def _run_task_once(root: Path, cfg, client, agent, idx, task: str, *,
                       live_ok=getattr(agent, "live_evidence_ok", None),
                       live_kinds=_live_kinds_of(agent),
                       findings=findings, stats=stats, tests_ok=tests_ok,
+                      tests_preexisting_only=tests_preexisting_only,
                       clauses=clauses, clause_texts=clause_texts,
                       unaccepted=unaccepted)
 
@@ -4383,9 +4533,13 @@ def run_loop(root: Path, cfg, client, idx, plan_path: Path, *,
                     fe = _new_frontend_errors(
                         root, cfg, getattr(result, "changed", None) or [])
                     if fe:
+                        # BUG-218: the step's edits are already on disk; the
+                        # gate fails the step, it does not unwrite the files.
                         workspace.log_event(
-                            root, "frontend contract gate rejected the step; "
-                                  "verify subprocess skipped", "ERROR")
+                            root, "frontend contract gate found violations "
+                                  "in the applied edits; verify subprocess "
+                                  "skipped (the files stay written pending "
+                                  "repair)", "ERROR")
                         print(f"  [frontend gate: {len(fe)} new DOM contract "
                               f"violation(s); {check_label} subprocess "
                               f"skipped]", file=sys.stderr)
@@ -4618,11 +4772,13 @@ def run_loop(root: Path, cfg, client, idx, plan_path: Path, *,
                 root, f"partial edit on task '{task[:60]}': {len(bad_blocks)}"
                       f" of {total} block(s) did not apply ({where})", "WARN")
 
-        if strict and (tr.tests_ok is False
+        if strict and ((tr.tests_ok is False and not tr.tests_preexisting_only)
                        or any(not r.ok for r in tr.results)):
             # The work landed but is not clean: a failed edit block (a
             # partial application) or impacted tests still red after the
-            # repair rounds. Without --strict this stays a run-log note.
+            # repair rounds. A purely pre-existing red suite (R2, BUG-220) is
+            # not a task failure and stays a run-log note. Without --strict
+            # this stays a run-log note.
             strict_bad = True
             workspace.log_event(root, "strict: a task applied edits but left "
                                 "failed blocks or failing tests", "ERROR")

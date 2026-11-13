@@ -751,7 +751,9 @@ class Config:
     # deterministic score wins. Costs (N-1) extra answer calls.
     best_of: int = 1
     # Run the project's tests after applied edits, impacted tests first.
-    # Needs allow_shell. `test_command` overrides detection.
+    # Needs allow_shell. `test_command` overrides detection. A task whose
+    # text names a test command ("run npm test") enables this for the run
+    # (BUG-211); allow_shell stays the user's boundary.
     verify_tests: bool = False
     test_command: str = ""
     test_timeout: int = 300
@@ -760,7 +762,8 @@ class Config:
     # report page errors and unbound controls, and diff the mounted surface
     # against the pre-edit snapshot (the BUG-216 regression shape). Executes
     # project code, so it needs allow_shell plus the optional Playwright
-    # install; `ask --verify-dom` flips it per run. dom_entry overrides the
+    # install; `ask --verify-dom` flips it per run, and a task naming
+    # "domcheck" enables it for the run (BUG-216). dom_entry overrides the
     # detected entry HTML; dom_timeout caps one page load (seconds).
     verify_dom: bool = False
     dom_entry: str = ""

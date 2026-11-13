@@ -369,7 +369,7 @@ def test_contract_gate_blocks_pytest_spawn(tmp_path, monkeypatch):
     agent = _Agent()
     results = [Result(True, "app/logic.py", "applied", before="",
                       after="def add(a, b, c=0):\n    return a + b + c\n")]
-    out_results, reply, tests_ok = loop._post_edit_tests(
+    out_results, reply, tests_ok, _preexisting = loop._post_edit_tests(
         root, cfg, agent, types.SimpleNamespace(root=root), "task",
         results, "reply", None, None, ["app/logic.py"])
     assert runs == []                        # pytest never spawned

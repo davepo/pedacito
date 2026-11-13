@@ -123,6 +123,11 @@ def impacted_tests(index, changed: list[str], limit: int = 12) -> list[tuple[str
 
     def add(t: str, why: str) -> None:
         if t in all_tests and t not in out:
+            # A deleted test file still rides in `changed` (and the stale
+            # index); narrowing to it runs zero tests and exits 0 -- a false
+            # green (BUG-222). Select only files that exist on disk.
+            if not (Path(index.root) / t).is_file():
+                return
             out[t] = why
 
     for f in changed:
@@ -270,6 +275,12 @@ def run_impacted(index, cfg, changed: list[str]) -> tuple[bool, str, str]:
     # ledger with this run's outcome, which would otherwise erase the very
     # baseline we are trying to compare against.
     was_failing = _was_already_failing(index.root, cmd)
+    if was_failing and any(f in files for f in changed):
+        # The narrowed command names a test file THIS run rewrote: the
+        # recorded baseline describes the old contents, so its failures
+        # cannot be assumed pre-existing (BUG-206). Keep the verdict
+        # edit-caused so repair sees the failures this run created.
+        was_failing = False
     ok, out = run_command(index.root, cfg, cmd)
     if not ok and was_failing:
         desc += f" -- {PRE_EXISTING_LABEL}"

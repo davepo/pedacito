@@ -66,7 +66,10 @@ plan only: every file that should exist, each with a one-sentence purpose.
 Rules:
 - Paths are relative to the project root, forward slashes, no leading "./".
 - Include source files, tests, a README, and packaging/config if the spec
-  implies them. Do not include lock files, binaries, or directories.
+  implies them. Do not include lock files, binaries, or directories. If the
+  spec explicitly forbids extra files ("no README", "do not add extra files",
+  "exactly these N files"), plan ONLY the files it names -- no README,
+  packaging, or config it did not ask for.
 - If the spec describes a runnable program or command-line tool, include a
   `main.py` at the project root with a `main()` function and an
   `if __name__ == "__main__": main()` guard, so it runs as `python main.py`
@@ -285,6 +288,10 @@ class Plan:
     summary: str
     files: list[PlannedFile] = field(default_factory=list)
     spec: Spec | None = None
+    # The spec explicitly forbids files beyond the named list ("no README or
+    # extra files", "exactly these 10 files"): apply_skeleton then adds no
+    # starter README/.gitignore/packaging (BUG-210).
+    no_extras: bool = False
 
     @property
     def sources(self) -> list[PlannedFile]:
@@ -325,6 +332,21 @@ def _safe_rel(path: str, root: Path) -> str | None:
     return rel
 
 
+_NO_EXTRAS_RE = re.compile(
+    r"\b(?:no|without|omit|never add|don't add|do not add)\s+(?:a\s+|any\s+)?"
+    r"(?:readme|extra files?|additional files?|other files?|bonus files?)\b"
+    r"|\b(?:exactly|only)\s+(?:these|the following|those)\s+(?:\d+\s+)?files?\b"
+    r"|\bexactly\s+\d+\s+files?\b",
+    re.IGNORECASE)
+
+
+def _spec_forbids_extras(text: str) -> bool:
+    """True when the spec explicitly forbids files beyond the named list
+    ("Do not add README or extra files", "Create EXACTLY these 10 files"):
+    the starter README/.gitignore/packaging must then stay out (BUG-210)."""
+    return bool(_NO_EXTRAS_RE.search(text or ""))
+
+
 def build_plan(spec: Spec, client, cfg, root: Path, verbose: bool = True,
                design: dict | None = None) -> Plan:
     """Ask the model for a file plan, then sanitise it: dedupe paths, drop
@@ -334,11 +356,17 @@ def build_plan(spec: Spec, client, cfg, root: Path, verbose: bool = True,
     limit = getattr(cfg, "max_new_files", 24)
     budget = getattr(cfg, "max_spec_chars", MAX_SPEC_CHARS)
     body = spec.text[:budget]
+    no_extras = _spec_forbids_extras(spec.text)
     extra = ""
     if design:
         from . import design as design_mod
         extra = "\n\n" + design_mod.planner_context(design)
-    user = (f"SPECIFICATION ({spec.origin})\n\n{body}{extra}\n\n"
+    constraint = ""
+    if no_extras:
+        constraint = ("\n\nThe spec forbids extra files: plan ONLY the files "
+                      "it names. Do NOT add a README, .gitignore, packaging, "
+                      "or any file the spec did not ask for.")
+    user = (f"SPECIFICATION ({spec.origin})\n\n{body}{extra}{constraint}\n\n"
             f"Plan at most {limit} files for this project.")
     messages = [{"role": "system", "content": PLAN_SYSTEM},
                 {"role": "user", "content": user}]
@@ -378,7 +406,7 @@ def build_plan(spec: Spec, client, cfg, root: Path, verbose: bool = True,
 
     plan = Plan(project_name=str(raw.get("project_name") or spec.title)[:80],
                 summary=str(raw.get("summary") or "").strip(),
-                files=files, spec=spec)
+                files=files, spec=spec, no_extras=no_extras)
     if verbose:
         print(f"  plan: {len(files)} file(s)"
               + (f", {dropped} unusable entr{'y' if dropped == 1 else 'ies'} dropped"
@@ -658,11 +686,11 @@ def apply_skeleton(root: Path, plan: Plan, dry_run: bool = False,
 
     readme = next((f.path for f in plan.files
                    if f.path.lower() in ("readme.md", "docs/readme.md")), None)
-    if readme is None:
+    if readme is None and not plan.no_extras:
         wanted.setdefault("README.md",
                           f"# {plan.project_name}\n\n{plan.summary or ''}\n\n"
                           f"## Run\n\n```bash\n{_readme_run_command(plan)}\n```\n")
-    if any(f.path.endswith(".py") for f in plan.files):
+    if any(f.path.endswith(".py") for f in plan.files) and not plan.no_extras:
         # A starter pyproject belongs in a Python plan only: in a JS/HTML project
         # it would mislead the repo brief, the diagnostics, and the model about
         # what stack and test command the project has.
@@ -671,7 +699,8 @@ def apply_skeleton(root: Path, plan: Plan, dry_run: bool = False,
         wanted.setdefault("pyproject.toml",
                           STARTER_PYPROJECT.format(name=name,
                                                    summary=(plan.summary or name)[:120]))
-    wanted.setdefault(".gitignore", STARTER_GITIGNORE)
+    if not plan.no_extras:
+        wanted.setdefault(".gitignore", STARTER_GITIGNORE)
 
     for rel, text in sorted(wanted.items()):
         path = root / rel
@@ -1230,11 +1259,15 @@ def fix_web_contracts(client, cfg, idx: Index, plan: Plan, backup_dir,
     binding or import that cannot link); this loop hands the model exactly
     those lines plus the current HTML/JS and asks for small blocks.
 
-    Returns (fix blocks applied, contract errors still standing)."""
+    Returns (files fixed, contract errors still standing). The count is of
+    distinct files whose edits landed and were not reverted, not of accepted
+    block rows: a degenerate reply repeating one no-op block must not inflate
+    it (BUG-201)."""
     from .agent import ANSWER_SYSTEM
 
     fixed = 0
     errors = web_contract_errors(idx.root)
+    seen: set = set()
     for _ in range(rounds):
         if not errors:
             break
@@ -1269,17 +1302,50 @@ def fix_web_contracts(client, cfg, idx: Index, plan: Plan, backup_dir,
             max_tokens=getattr(cfg, "max_tokens_answer", 4000),
             stream=verbose, disable_thinking=True)
         blocks = parse_edits(reply)
-        if not blocks:
+        # BUG-201: a degenerate reply repeats the same no-op block dozens of
+        # times; apply each distinct block once, never the repeats.
+        uniq = []
+        for b in blocks:
+            key = (b.file, b.search, b.replace, b.symbol, b.lines,
+                   b.insert_after)
+            if key in seen:
+                continue
+            seen.add(key)
+            uniq.append(b)
+        if not uniq:
             break
-        results = apply_edits(idx.root, blocks, backup=cfg.backup,
+        before = set(errors)
+        results = apply_edits(idx.root, uniq, backup=cfg.backup,
                               dry_run=False, cfg=cfg, backup_dir=backup_dir)
         ok = [r for r in results if r.ok]
         if not ok:
             break
-        fixed += len(ok)
         for r in ok:
             idx = index_mod.reindex_file(idx, r.file, cfg)
         errors = web_contract_errors(idx.root)
+        # BUG-202: a "fix" block can DELETE a required export (an empty
+        # REPLACE over the real functions). The contract is now worse for
+        # that file; restore its pre-edit bytes instead of shipping a module
+        # graph that cannot link, and do not count the reverted block.
+        added = set(errors) - before
+        reverted: set = set()
+        for r in ok:
+            if not r.before or r.file in reverted:
+                continue
+            base = r.file.rsplit("/", 1)[-1]
+            if not any(r.file in e or base in e for e in added):
+                continue
+            fileio.write_bytes(idx.root / r.file, r.before.encode("utf-8"))
+            idx = index_mod.reindex_file(idx, r.file, cfg)
+            reverted.add(r.file)
+        if reverted:
+            errors = web_contract_errors(idx.root)
+        landed = [r for r in ok if r.file not in reverted]
+        fixed += len({r.file for r in landed})
+        # BUG-201: no contract error was resolved this round -- another pass
+        # would repeat the same blocks. Stop instead of spinning.
+        if not (before - set(errors)):
+            break
     return fixed, errors
 
 
@@ -1637,7 +1703,7 @@ def run_new(root: Path, cfg, client, spec: Spec, *, apply: bool = False,
             n, web_errors = fix_web_contracts(client, cfg, idx, plan,
                                               backup_dir, verbose=verbose)
             if verbose and n:
-                print(f"  {n} contract fix block(s) applied", file=sys.stderr)
+                print(f"  {n} contract fix file(s) applied", file=sys.stderr)
         # The rest of the webcheck vocabulary (classic/duplicate globals,
         # bare specifiers, member calls on page globals) stays a notice board:
         # heuristic checks do not get to veto a build they might get wrong.

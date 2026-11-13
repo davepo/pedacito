@@ -1718,8 +1718,10 @@ def _cmd_rename(args) -> int:
     Zero LLM tokens: Python identifiers move through the real tokenizer,
     tree-sitter languages through their identifier nodes (so a string literal
     or comment that merely contains the old name survives), and every changed
-    file passes the AST syntax gate BEFORE anything is written. Default is a
-    dry-run diff preview; --apply writes, snapshotting the originals under
+    file passes the AST syntax gate BEFORE anything is written. --strings
+    additionally moves whole-word occurrences inside string literals (test
+    labels, docs); comments are never touched. Default is a dry-run diff
+    preview; --apply writes, snapshotting the originals under
     .pedacito/backups/ so `pedacito restore` can undo the run."""
     from . import fileio, refactor
     root = _root(args)
@@ -1734,7 +1736,8 @@ def _cmd_rename(args) -> int:
     res = refactor.rename_symbol_across_project(
         root, args.old, args.new, scope_file=args.file or None,
         dry_run=not args.apply,
-        before_write=_snapshot_before_write if args.apply else None)
+        before_write=_snapshot_before_write if args.apply else None,
+        include_strings=bool(getattr(args, "strings", False)))
     if not res["ok"]:
         print(f"rename refused: {res.get('error', 'unknown failure')}",
               file=sys.stderr)
@@ -1747,8 +1750,12 @@ def _cmd_rename(args) -> int:
             print("skipped: " + "; ".join(res["skipped"][:8]))
         return 0
     verb = "renamed" if args.apply else "would rename"
+    strings_note = ""
+    if getattr(args, "strings", False) and res.get("string_replacements"):
+        strings_note = (f" ({res['string_replacements']} inside string "
+                        "literals)")
     print(f"{verb} `{args.old}` -> `{args.new}`: "
-          f"{res['total_replacements']} occurrence(s) in "
+          f"{res['total_replacements']}{strings_note} occurrence(s) in "
           f"{len(res['files_modified'])} file(s)")
     for rel in res["files_modified"]:
         print(f"  {rel}: {res['per_file'].get(rel, 0)} replacement(s)")
@@ -1757,10 +1764,15 @@ def _cmd_rename(args) -> int:
     for s in res.get("skipped", [])[:8]:
         print(f"  not checked: {s}")
     if res.get("string_matches"):
-        print(f"  note: {len(res['string_matches'])} string literal(s) still "
-              f"name `{args.old}` (test labels, docs); the rename leaves "
-              "strings untouched by design -- update them if they name the "
-              "API:")
+        if getattr(args, "strings", False):
+            print(f"  note: {len(res['string_matches'])} string literal(s) "
+                  f"still name `{args.old}` (skipped files or non-whole-word "
+                  "matches):")
+        else:
+            print(f"  note: {len(res['string_matches'])} string literal(s) "
+                  f"still name `{args.old}` (test labels, docs); the rename "
+                  "leaves strings untouched by default -- update them if "
+                  "they name the API, or rerun with --strings:")
         for sm in res["string_matches"][:8]:
             print(f"    {sm}")
     if not args.apply:
@@ -2433,13 +2445,17 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_rename = sub.add_parser(
         "rename", help="deterministic multi-file symbol rename via the AST "
-                       "and the tokenizer (no LLM calls; strings and comments "
-                       "are never touched)")
+                       "and the tokenizer (no LLM calls; comments are never "
+                       "touched, strings only with --strings)")
     p_rename.add_argument("old", help="the existing identifier")
     p_rename.add_argument("new", help="the new identifier")
     p_rename.add_argument("--file", default="", metavar="PATH",
                           help="scope: one file and the files that import it "
                                "(default: all indexed project source)")
+    p_rename.add_argument("--strings", action="store_true",
+                          help="also rename whole-word occurrences inside "
+                               "string literals (test labels, docs that name "
+                               "the API); comments stay untouched")
     p_rename.add_argument("--apply", action="store_true",
                           help="write the rename (default: dry-run preview "
                                "with unified diffs)")

@@ -711,6 +711,11 @@ def check_moved_imports(agent, results) -> list[Finding]:
 _JS_IMPORT_RE = re.compile(
     r"(?m)^[ \t]*import\s+(?:\{([^}]*)\}|([A-Za-z_$][\w$]*))\s+from\s+"
     r"['\"][^'\"]+['\"]")
+# Same shape, but the module source is captured (group 3) so a check can tell
+# WHICH file an import pulls a name from (BUG-214).
+_JS_IMPORT_FROM_RE = re.compile(
+    r"(?m)^[ \t]*import\s+(?:\{([^}]*)\}|([A-Za-z_$][\w$]*))\s+from\s+"
+    r"['\"]([^'\"]+)['\"]")
 _PY_IMPORT_RE = re.compile(r"(?m)^[ \t]*from\s+[.\w]+\s+import\s+([^\n]+)")
 _REWRITE_RE = re.compile(
     r"\b(?:rewrite|re-?write|rebuild|recreate|overhaul)\b|"
@@ -786,6 +791,69 @@ def check_lost_wiring(agent, results, task: str = "") -> list[Finding]:
             + ": imported and called in the original, still defined in the "
               "project, and absent from the new text. Keep the existing "
               "wiring unless the task asks to remove it"))
+    return out
+
+
+def check_lost_exports(agent, results, task: str = "") -> list[Finding]:
+    """A whole-file replacement that drops an export another project file still
+    imports breaks the module graph (BUG-214): the new file validates on its
+    own, but every importer fails to link at load (`does not provide an export
+    named X`). `check_lost_wiring` only catches imported-and-CALLED names that
+    live elsewhere; a file's OWN dropped exports have no such caller to trip
+    it. Error by default; warn when the task explicitly asks to rewrite that
+    very file."""
+    from . import webcheck
+    out: list[Finding] = []
+    index = getattr(agent, "index", None)
+    if index is None:
+        return out
+    for r in results:
+        if not r.ok or not r.file or not r.before:
+            continue
+        if not (r.message or "").startswith("replaced contents"):
+            continue
+        if not r.file.lower().endswith((".js", ".mjs", ".cjs")):
+            continue
+        dropped = (webcheck._js_exported_names(r.before)
+                   - webcheck._js_exported_names(r.after or ""))
+        if not dropped:
+            continue
+        try:
+            importers = index.importers_of(r.file)
+        except Exception:
+            importers = []
+        base = r.file.rsplit("/", 1)[-1]
+        lost: set[str] = set()
+        for rel in importers:
+            if rel == r.file:
+                continue
+            try:
+                text = fileio.read_text(Path(index.root) / rel)
+            except OSError:
+                continue
+            for m in _JS_IMPORT_FROM_RE.finditer(text):
+                if m.group(3).rsplit("/", 1)[-1] != base:
+                    continue        # the import points at a different module
+                names: set[str] = set()
+                if m.group(1) is not None:
+                    for part in m.group(1).split(","):
+                        part = re.split(r"\s+as\s+", part.strip())[-1].strip()
+                        if re.fullmatch(r"[A-Za-z_$][\w$]*", part):
+                            names.add(part)
+                elif m.group(2):
+                    names.add(m.group(2))
+                lost |= dropped & names
+        if not lost:
+            continue
+        out.append(Finding(
+            "lost_exports",
+            "warn" if _asks_file_rewrite(task, r.file) else "error",
+            r.file,
+            "the whole-file replacement dropped "
+            + ", ".join(f"`{n}`" for n in sorted(lost)[:6])
+            + ": still imported by other project files, which fail to link "
+              "at load (`does not provide an export named ...`). Keep these "
+              "exports unless the task asks to remove them"))
     return out
 
 
@@ -1159,11 +1227,19 @@ def _match_score(terms, text: str) -> int:
 def _specific_terms(terms) -> list[str]:
     """The distinctive terms of a clause: identifier-like or long words, minus
     generic vocabulary that matches almost any edit. Provenance must rest on
-    these, not on words like `tests`/`public`/`npm` (BUG-305/330)."""
+    these, not on words like `tests`/`public`/`npm` (BUG-305/330).
+
+    A bare number ("4", "16") is NOT distinctive even though `_IDENT_TERM_RE`
+    matches its digit: almost every hunk body contains some number, so letting
+    one tie a hunk to a clause re-created the all-to-all provenance of
+    BUG-204/223 (a theory.js patch claimed the pattern clauses because both
+    mentioned `16`). A term must carry at least one letter to be evidence."""
     out = []
     for t in terms or ():
         low = t.lower()
         if low in _GENERIC_TERMS:
+            continue
+        if not re.search(r"[A-Za-z]", t):
             continue
         if _IDENT_TERM_RE.search(t) or len(t) >= 6:
             out.append(t)
@@ -1299,7 +1375,7 @@ def _clip_clause(p: str, limit: int = 140) -> str:
     return clipped + " ..."
 
 
-def _requirements_from_task(task: str, limit: int = 5) -> list[Requirement]:
+def _requirements_from_task(task: str, limit: int = 12) -> list[Requirement]:
     text = (task or "").split("\nTASK\n")[-1].strip()
     if not text:
         return []
@@ -1321,6 +1397,12 @@ def _requirements_from_task(task: str, limit: int = 5) -> list[Requirement]:
             merged[-1] = merged[-1] + " " + p
         else:
             merged.append(p)
+    # A clause that ends in ":" is a list introduction ("Required final public
+    # API and behavior:"), not a requirement of its own: it became R1 and ate a
+    # slot the concrete clauses needed (BUG-203/205). Drop it when concrete
+    # clauses follow; the full goal still rides along as the task background.
+    if len(merged) > 1:
+        merged = [p for p in merged if not p.rstrip().endswith(":")]
     task_kind = "edit" if _REQ_EDIT_RE.search(text) else (
         "report" if _REQ_REPORT_RE.search(text) else "edit")
     reqs: list[Requirement] = []
@@ -1344,10 +1426,15 @@ def _requirements_from_task(task: str, limit: int = 5) -> list[Requirement]:
                     else _clause_kind(p, task_kind))
             reqs.append(Requirement(
                 p, terms, kind, req_id=f"R{len(reqs) + 1}"))
+    # BUG-203/212/223: the old default cap of five silently truncated a six-
+    # bullet repair (and a three-clause task the splitter expanded to eleven
+    # sentences), so the tail clauses never existed for coverage or provenance
+    # to see and the run exited 0 after addressing only the head. Twelve slots
+    # hold a realistic multi-file brief; the cap still bounds a runaway split.
     return reqs[:limit]
 
 
-def requirement_ledger(task: str, limit: int = 5) -> list[tuple[str, list[str]]]:
+def requirement_ledger(task: str, limit: int = 12) -> list[tuple[str, list[str]]]:
     """[(requirement text, key terms)] for up to `limit` clauses of the task.
     Heuristic and free: split on sentence/bullet/`and add ...` boundaries, keep
     each clause's distinctive words (identifiers, file names, numbers,
@@ -1366,7 +1453,7 @@ class RequirementTracker:
     requirement) and the answer-phase source packer (pinned located spans).
     """
 
-    def __init__(self, task: str = "", limit: int = 5):
+    def __init__(self, task: str = "", limit: int = 12):
         self.task = task or ""
         self.items = _requirements_from_task(self.task, limit)
 
@@ -1682,7 +1769,7 @@ class RequirementTracker:
         return out
 
 
-def requirement_tracker(task: str, limit: int = 5) -> RequirementTracker:
+def requirement_tracker(task: str, limit: int = 12) -> RequirementTracker:
     """Convenience constructor for the run-scoped state machine."""
     return RequirementTracker(task, limit)
 
@@ -2004,6 +2091,7 @@ def check(agent, task: str, reply: str, results, gathered: str = ""
         findings += check_stale_references(agent, results)
         findings += check_moved_imports(agent, results)
         findings += check_lost_wiring(agent, results, task)
+        findings += check_lost_exports(agent, results, task)
         findings += check_oversized_rewrite(agent, results, task)
         findings += check_citations(agent, reply)
         findings += check_doc_grounding(agent, results)

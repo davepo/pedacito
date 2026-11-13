@@ -41,20 +41,29 @@ from . import loop, rank, verify, workspace
 WIDE_TASK_FILES = 5
 
 
-def requirement_titles(task: str, limit: int = 6) -> list[str]:
+def requirement_titles(task: str, limit: int = 12) -> list[str]:
     """One step per clearly separate requirement, '' when it is one change.
 
     A leading goal-summary clause with no verb of its own ("Bring the
     feature to a working, tested state") is not a step: as step 1 it is
     free to implement the whole plan, and every later step becomes a no-op
     (BUG-312). Drop it when concrete clauses follow; the full goal still
-    rides along as background context for every step."""
+    rides along as background context for every step.
+
+    The cap matches the requirement ledger's (BUG-203/205/212): a six-step
+    ceiling truncated a five-file repair to its head clauses and marked the
+    dropped tail done. Twelve slots hold a realistic multi-file brief."""
     # One extra slot: the umbrella clause must not eat a concrete step's
     # place under the cap (the src/main.js step lost to it in BUG-312).
     reqs = verify.requirement_ledger(task, limit=limit + 1)
     if len(reqs) >= 2:
         first = reqs[0][0]
-        if not (verify._REQ_EDIT_RE.search(first)
+        # A list introduction ("Use these exact contracts:") is an umbrella
+        # even when it carries an edit verb ("Repair ... contracts:"): it
+        # names no file of its own and the concrete clauses follow it
+        # (BUG-205). Drop it like the verb-less goal summary above.
+        if first.rstrip().endswith(":") or not (
+                verify._REQ_EDIT_RE.search(first)
                 or verify._REQ_REPORT_RE.search(first)):
             reqs = reqs[1:]
     if len(reqs) < 2:

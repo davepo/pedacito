@@ -691,6 +691,22 @@ _STREAM_REPEAT_MIN_CYCLE = 80       # shorter repeats may be real style
 _STREAM_REPEAT_MIN_TIMES = 3        # 2 copies is quoting; 3 is a loop
 _STREAM_REPEAT_CHECK_CHARS = 512    # re-test only after this much new text
 
+# Degenerate edit loops re-emit the SAME completed edit block under changing
+# `--- FILE: ... L<n>-<m>` headers, so the verbatim tail test never trips
+# (BUG-215): census the completed SEARCH/REPLACE and SYMBOL blocks in the
+# stream tail and stop once one substantial block has been delivered three
+# times. Short blocks are exempt -- the same one-line import landing in three
+# files is a legitimate refactor, not a loop.
+_STREAM_BLOCK_WINDOW = 24000        # chars of tail kept for the block census
+_STREAM_BLOCK_MIN_CHARS = 80        # normalized body floor; short blocks may repeat
+_MAX_STREAM_DUP_BLOCKS = 3          # 2 copies can be real; 3 is a loop
+_STREAM_BLOCK_DONE_RE = re.compile(
+    r"<{5,}[ \t]*SEARCH\b.*?^[ \t]*>{5,}[ \t]*REPLACE"
+    r"|<{5,}[ \t]*(?:AFTER_|INSERT_AFTER_)?SYMBOL\b.*?"
+    r"^[ \t]*>{5,}[ \t]*(?:END_SYMBOL|INSERT_AFTER_SYMBOL|AFTER_SYMBOL|SYMBOL)",
+    re.DOTALL | re.MULTILINE,
+)
+
 
 def _repeat_run(text: str) -> tuple[int, int]:
     """(cycle, copies) when the whitespace-collapsed tail of `text` is one
@@ -1933,6 +1949,8 @@ class LLMClient:
         probe_tail = ""
         rep_acc = ""          # content tail for the repetition test
         rep_since = 0         # new chars since the last repetition test
+        block_acc = ""        # content tail for the duplicate-block census
+        block_tail = ""       # overlap so a split closing marker still scans
         reasoning_chars = 0
         usage: dict = {}
         timings: dict | None = None
@@ -2047,6 +2065,32 @@ class LLMClient:
                                   "repeating the same text verbatim -- a "
                                   "degenerate loop; treating the answer as "
                                   "cut off]", file=sys.stderr)
+                            break
+                    # Duplicate-block guard (BUG-215): the same completed edit
+                    # block re-emitted under changing FILE headers is a loop
+                    # the verbatim tail test cannot see. Scan only when a
+                    # closing marker may have just completed; the overlap
+                    # catches a marker split across chunks.
+                    block_acc += delta
+                    if len(block_acc) > _STREAM_BLOCK_WINDOW:
+                        block_acc = block_acc[-_STREAM_BLOCK_WINDOW:]
+                    block_probe = block_tail + delta
+                    block_tail = block_probe[-20:]
+                    if ">>>>>" in block_probe:
+                        counts: dict[str, int] = {}
+                        for m in _STREAM_BLOCK_DONE_RE.finditer(block_acc):
+                            body = " ".join(m.group(0).split())
+                            if len(body) < _STREAM_BLOCK_MIN_CHARS:
+                                continue
+                            counts[body] = counts.get(body, 0) + 1
+                        if max(counts.values(), default=0) \
+                                >= _MAX_STREAM_DUP_BLOCKS:
+                            self.stream_repetition = True
+                            self.stream_truncated = True
+                            print("\n[stopped the reply: the model is "
+                                  "re-emitting the same edit block over and "
+                                  "over -- a degenerate loop; treating the "
+                                  "answer as cut off]", file=sys.stderr)
                             break
         except requests.exceptions.RequestException as e:
             dropped = e
