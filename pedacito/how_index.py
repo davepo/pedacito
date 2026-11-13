@@ -1395,6 +1395,9 @@ GUI_TOPICS = [
             "Apply to: Global (every profile), choose on, then Save",
             "Review the safety companions too: shell_allowlist, shell_deny, "
             "sandbox, sandbox_network",
+            "In a project's own .pedacito.toml these toggles stay ignored "
+            "until you read that file and run pedacito trust PROJ; your user "
+            "config and --config FILE need no approval",
         ],
         "keywords": ["allow shell", "run commands", "allow write", "browser",
                      "screenshots", "permissions", "tools", "sandbox", "mcp",

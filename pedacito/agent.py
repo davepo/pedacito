@@ -191,6 +191,26 @@ def sha256_text(text: str) -> str:
     return hashlib.sha256((text or "").encode("utf-8", "replace")).hexdigest()
 
 
+# Prose documents: a task's own words usually appear in them verbatim (the
+# plan, a bug report, notes), so phrase matching cannot tell "this clause is
+# about this document" from "this document merely quotes the clause".
+_PROSE_DOC_EXTS = {".md", ".rst", ".txt"}
+
+
+def _is_prose_doc(rel: str) -> bool:
+    ext = rel.lower().rpartition(".")[2]
+    return f".{ext}" in _PROSE_DOC_EXTS if ext != rel.lower() else False
+
+
+def _clause_names_file(rel: str, clause: str) -> bool:
+    """Whether the clause text names this file (full path or basename with
+    its extension): 'update README.md' owes a README.md edit; 'reduced-motion
+    behavior' does not owe an edit to whichever note quotes that phrase."""
+    low = clause.lower()
+    name = rel.rsplit("/", 1)[-1].lower()
+    return rel.lower() in low or name in low
+
+
 @dataclass
 class EvidenceStore:
     """Append-only, content-addressed record of the source spans displayed.
@@ -3775,7 +3795,17 @@ class Agent:
         intents: list[dict] = []
         seen: set[tuple[str, str]] = set()
 
-        def add(rel: str, symbol: str, change: str) -> None:
+        def add(rel: str, symbol: str, change: str, clause: str) -> None:
+            # A code clause must not be "fixed" by editing a prose document.
+            # A .md/.rst/.txt file that merely QUOTES the task text (a plan,
+            # a report, notes) anchors greps and indexes its headings as
+            # qualnames, so every resolution step can hand it to the repair
+            # prompt -- which then rewrites the user's own prose to look like
+            # an implementation (BUG-807, live: a CSS clause edited the
+            # session's bug report). Only a clause that names the document
+            # itself owes a document edit.
+            if _is_prose_doc(rel) and not _clause_names_file(rel, clause):
+                return
             key = (fileio.path_key(rel), fileio.path_key(symbol))
             if rel and key not in seen:
                 seen.add(key)
@@ -3798,9 +3828,9 @@ class Agent:
                          and c.start <= a <= (c.scope_end or c.end)]
                 if units:
                     unit = min(units, key=lambda c: c.nlines)
-                    add(rel, unit.qualname, change)
+                    add(rel, unit.qualname, change, req.text)
                 else:
-                    add(rel, "", change)
+                    add(rel, "", change, req.text)
                 break
             if len(intents) > before:
                 continue
@@ -3811,7 +3841,7 @@ class Agent:
                 files = {c.file for c in hits if c.file}
                 if len(files) == 1:
                     unit = min(hits, key=lambda c: c.nlines)
-                    add(unit.file, unit.qualname, change)
+                    add(unit.file, unit.qualname, change, req.text)
                     continue
             # 3. A term names a file (exact reference or unique stem match):
             #    the whole file is the target, so a brand-new symbol can land.
@@ -3824,7 +3854,7 @@ class Agent:
                                .rpartition(".")[0].lower() == low]
                     rel = matches[0] if len(matches) == 1 else None
                 if rel:
-                    add(rel, "", change)
+                    add(rel, "", change, req.text)
                     break
         return intents
 

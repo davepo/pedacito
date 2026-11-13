@@ -164,6 +164,14 @@ def impacted_tests(index, changed: list[str], limit: int = 12) -> list[tuple[str
     return list(out.items())[:limit]
 
 
+_JS_TEST_SUFFIXES = (".js", ".mjs", ".cjs", ".ts", ".mts", ".cts")
+
+
+def _js_tests(tests: list[str]) -> list[str]:
+    """The entries in `tests` a JavaScript runner can actually execute."""
+    return [t for t in tests if t.lower().endswith(_JS_TEST_SUFFIXES)]
+
+
 def narrow_command(command: str, tests: list[str],
                    changed: list[str] | None = None) -> tuple[str, bool]:
     """(command, narrowed) -- `command` restricted to `tests` when the runner
@@ -178,13 +186,24 @@ def narrow_command(command: str, tests: list[str],
     if low.startswith("node --test") or low == "node -t":
         # `node --test FILE...` runs exactly those files; non-JS entries in
         # `tests` (a mixed tree) would make the runner error, so filter.
-        js = [t for t in tests if t.lower().endswith((".js", ".mjs", ".cjs"))]
+        js = _js_tests(tests)
         if js:
             return f"{command} " + " ".join(shlex.quote(t) for t in js), True
         return command, False
     if low.startswith(("npm test", "pnpm test", "yarn test")):
+        # What runs behind `npm test` is whatever package.json declares, and
+        # for a JS project that is a JS runner. Forwarding a Python or Rust
+        # test path does not select anything: the runner cannot parse it, so
+        # it reports that FILE as one more failing test and a green suite
+        # turns red over a file it has no business running (BUG-805). Narrow
+        # only with entries a JS runner can execute, and when none are left
+        # keep the full suite rather than inventing failures.
+        js = _js_tests(tests)
+        if not js:
+            return command, False
         sep = "" if low.startswith("yarn") else " --"
-        return f"{command}{sep} {files}", True
+        return (f"{command}{sep} "
+                + " ".join(shlex.quote(t) for t in js), True)
     if low.startswith("go test"):
         dirs = sorted({"./" + posixpath.dirname(t) if posixpath.dirname(t)
                        else "." for t in tests if t.endswith(".go")})

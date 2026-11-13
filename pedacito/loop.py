@@ -3883,6 +3883,7 @@ def run_loop(root: Path, cfg, client, idx, plan_path: Path, *,
     # reported at the moment it happens and in the finish line -- a partial
     # edit is by design, silence about it was the defect.
     partial_tasks: list[tuple[str, int, int]] = []
+    red_tasks: list[str] = []   # BUG-808: ticked done while the gate was red
     started_at = time.monotonic()
     # Reports/edit summaries carried into later task prompts so a fresh
     # context still benefits from earlier findings.
@@ -4783,6 +4784,21 @@ def run_loop(root: Path, cfg, client, idx, plan_path: Path, *,
             workspace.log_event(root, "strict: a task applied edits but left "
                                 "failed blocks or failing tests", "ERROR")
 
+        if not strict and (tr.tests_ok is False
+                           and not tr.tests_preexisting_only):
+            # BUG-808: without --strict this task still ticks done and the
+            # run still exits 0 -- but "All tasks complete. [8 done, 0
+            # failed]" after "tests/lint subprocess skipped until they are
+            # fixed" read as if the fix had happened. Name it, like the
+            # partial-edit precedent above: never silently.
+            red_tasks.append(task)
+            print(f"  [verification red: this task ticked done while the "
+                  f"last gate round was RED -- the files stay written, the "
+                  f"checks did not pass]", file=sys.stderr)
+            workspace.log_event(
+                root, f"verification red on task '{task[:60]}': ticked done "
+                      f"with the last gate round red", "WARN")
+
         mark_green(attempted, task)
         mark_done(plan_path, task)
         done += 1
@@ -4845,6 +4861,17 @@ def run_loop(root: Path, cfg, client, idx, plan_path: Path, *,
               file=sys.stderr)
         workspace.log_event(root, f"auto loop finished with "
                                   f"{len(partial_tasks)} partially applied "
+                                  f"task(s)", "WARN")
+    if red_tasks:
+        # BUG-808: the finish line must be as loud about a red gate as it
+        # is about a partial application -- a run that exits 0 after the
+        # last verification round said "skipped until they are fixed" has
+        # to say whether anything ever fixed them.
+        print(f"  [{len(red_tasks)} task(s) ticked done while the last "
+              f"verification gate was RED -- the checks did not pass; rerun "
+              f"the same command to keep repairing]", file=sys.stderr)
+        workspace.log_event(root, f"auto loop finished with "
+                                  f"{len(red_tasks)} verification-red "
                                   f"task(s)", "WARN")
     _fire(cfg, root, "notification", message=f"pedacito auto finished: "
           f"{done} done, {failed} failed, {remaining} left"

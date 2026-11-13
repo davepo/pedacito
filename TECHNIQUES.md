@@ -867,6 +867,16 @@ decisions the guards cannot make:
 The guards cost no model tokens. The broker costs only the human's time, and it is
 reached only for an action the deterministic checks could not settle.
 
+A project's own `.pedacito.toml` is a fifth input the guards inspect:
+`config.EXEC_FIELDS` lists the settings that make Pedacito execute something or
+write outside the reviewed edit path (`hooks`, `mcp_servers`, `auto_verify`,
+`test_command`, `allow_serve`, `allow_lsp`, `lsp_servers`, the `sandbox_*`
+family, and the capability toggles `allow_shell`, `allow_write`,
+`allow_browser`, `allow_screenshots`). An untrusted project file contributes
+nothing from that list, and the digest of the approved file is rechecked every
+load, so editing it revokes the approval. The rest of the settings in the same
+file still apply, because a layout or a budget cannot run anything.
+
 ---
 
 ### 22. `run_test`: a micro-dose of live evidence inside the gather phase
@@ -1573,6 +1583,20 @@ and is not fed to repair as edit-caused -- unless this run captured its own
 baseline, which supersedes the history. Zero model calls; it reuses facts the
 ledger already keeps.
 
+The complement is equally loud (Bug Hunt #8, BUG-808): when the last gate
+round of a run ended RED -- DOM-contract violations standing, the test
+subprocess never spawned -- the non-strict caller still got exit 0 and
+"[N done, 0 failed]", reading as clean after the gate lines said the checks
+were "skipped until they are fixed". Nothing ever said whether they were.
+Now the verdict that the strict and RPC paths already carried is echoed in
+plain prose on both non-planned faces: `ask --apply` closes with a
+`[verification: RED ...]` note naming the blockers the repair could not
+clear (warnings and purely inherited failures excluded, so the note never
+lies), and the `auto` finish line counts the tasks that ticked done with a
+red gate, exactly as it already names partial applications. The documented
+non-strict exit contract is unchanged -- the fix kills the silence, not the
+zero.
+
 ### 34. Wall-clock budget for discovery (extends §10)
 
 `scan_models` probes each candidate with a per-request timeout but had no
@@ -1595,7 +1619,11 @@ a located definition, else a symbol search, else the whole file -- and runs
 **one** bounded follow-up pass under the same per-target retry ceiling, emitting
 a `coverage_followup` event and a receipt. This is a deterministic trigger from
 the requirement state machine, not self-critique or a search tree: the model is
-never asked to grade its own draft.
+never asked to grade its own draft. Prose documents (`md`/`rst`/`txt`) are
+excluded targets unless the clause itself names the file: plans, reports and
+notes quote task text verbatim, so clause location and heading indexing can
+make any of them look like an implementation site -- and a code clause must
+never be "satisfied" by rewriting the user's own prose.
 
 ### 36. Lesson effectiveness counters (extends §24)
 

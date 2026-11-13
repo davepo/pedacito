@@ -1163,14 +1163,20 @@ def _hostname(base_url: str) -> str:
         return ""
 
 
-# Settings that make Pedacito EXECUTE something (a command, a server, a hook).
-# A repository's own `.pedacito.toml` must not be able to set them behind the
-# user's back: cloning a project and running `pedacito auto` would otherwise
-# run whatever its author wrote. They are honoured from a project config only
-# after `pedacito trust`, and trust lapses when that file changes.
+# Settings that make Pedacito EXECUTE something (a command, a server, a hook)
+# or WRITE outside the reviewed edit path. A repository's own `.pedacito.toml`
+# must not be able to set them behind the user's back: cloning a project and
+# running `pedacito auto` would otherwise run whatever its author wrote. They
+# are honoured from a project config only after `pedacito trust`, and trust
+# lapses when that file changes. The capability toggles belong here for the
+# same reason as the commands they unlock: `allow_shell` is what lets `run`
+# and `diagnose` execute project-supplied programs, `verify_tests`/`verify_dom`
+# then point them at the repository's own test and page code.
 EXEC_FIELDS = ("hooks", "mcp_servers", "auto_verify", "test_command",
                "allow_serve", "allow_lsp", "lsp_servers", "sandbox",
-               "sandbox_network", "sandbox_writable", "sandbox_strict")
+               "sandbox_network", "sandbox_writable", "sandbox_strict",
+               "allow_shell", "allow_write", "allow_browser",
+               "allow_screenshots")
 TRUST_FILE = "trusted_projects.json"
 
 
@@ -2349,6 +2355,9 @@ read_context_hint = true
 read_skeleton = true
 
 # Opt-in tool capabilities. Flip these only when the model should use them.
+# In a project's own .pedacito.toml these four are ignored until `pedacito
+# trust PROJ`, because they unlock commands, writes and capture of code that
+# file came with. Your user config and --config FILE need no approval.
 allow_write = false
 max_write_chars = 200000
 max_write_lines = 120
@@ -2894,12 +2903,70 @@ model    = "google/gemma-3-27b"
     return p
 
 
+# Keys that belong to the USER's machine: which model server to reach, which
+# model to send it, how much VRAM it has, and which profile answers for every
+# project. They are mandatory in the user starter, and wrong in a project file.
+_USER_SCOPE_KEYS = ('default_profile = "default"',
+                    'base_url = "http://localhost:1234/v1"',
+                    'model    = "google/gemma-3-27b"',
+                    "vram_gb = 8")
+
+_PROJECT_HEADER = """\
+# Pedacito project configuration.
+#
+# This file layers OVER the user config, so it only needs the settings that
+# differ for this repository. The server, model, vram_gb and default_profile
+# lines below are commented out on purpose: a project file that names them
+# silently replaces the model the user picked, and its placeholder profile
+# points at a server that does not exist here.
+#
+# Settings that run something are ignored until you read this file and run
+# `pedacito trust`: hooks, mcp_servers, auto_verify, test_command, allow_serve,
+# allow_lsp, lsp_servers, the sandbox settings, and the capability toggles
+# allow_shell, allow_write, allow_browser and allow_screenshots. Everything
+# else in this file applies immediately.
+#
+"""
+
+
+def is_project_config_path(path: Path) -> bool:
+    """Whether `path` is where `load` would read a PROJECT config: one of the
+    PROJECT_CONFIG_NAMES, or a `<proj>/.pedacito/config.toml` state-dir file.
+    The user's own config.toml is compared against (not excluded by) the
+    state-dir shape, so it keeps the user starter even if the user config
+    dir were ever named `.pedacito`."""
+    p = Path(path)
+    if p.name in PROJECT_CONFIG_NAMES:
+        return True
+    if p.parent.name == ".pedacito":
+        return p.resolve() != (_user_config_dir() / "config.toml").resolve()
+    return False
+
+
+def project_template() -> str:
+    """`TEMPLATE` with the user-scope keys commented out and a project header,
+    for writing a per-project starter."""
+    out: list[str] = []
+    for line in TEMPLATE.splitlines():
+        out.append("# " + line if line.strip() in _USER_SCOPE_KEYS else line)
+    return _PROJECT_HEADER + "\n".join(out) + "\n"
+
+
 def write_template(path: Path | None = None, force: bool = False) -> Path:
     """Write the starter template to `path` (default: USER_CONFIG); refuses to
-    overwrite an existing file unless `force`."""
+    overwrite an existing file unless `force`. A project-scoped path gets the
+    overrides-only form, never the user starter's server and profile."""
     p = path or USER_CONFIG
     if p.exists() and not force:
         raise ConfigError(f"{p} already exists; pass --force to overwrite")
+    text = TEMPLATE
+    if is_project_config_path(p):
+        text = project_template()
+        if USER_CONFIG.exists():
+            print(f"[config] {p} is a project config: it overrides "
+                  f"{USER_CONFIG}, so the server, model and profile lines are "
+                  "left commented. Uncomment them only when this repository "
+                  "truly needs its own model.", file=sys.stderr)
     p.parent.mkdir(parents=True, exist_ok=True)
-    p.write_text(TEMPLATE, encoding="utf-8")
+    p.write_text(text, encoding="utf-8")
     return p

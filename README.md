@@ -794,8 +794,10 @@ pedacito new my-app -t "..." --plan-only --apply     # skeleton only
 ```
 
 The model plans a file tree, the skeleton is written, then each file is filled
-in. Dry run by default. The target directory must be empty or new unless
-`--force`. `--complex` hands implementation to the `auto` loop.
+in. Dry run by default. The target directory must be empty or new, or hold
+nothing but Pedacito's own files (`.git`, `.pedacito/`, `.pedacito.toml`,
+`.pedacitoignore`), unless `--force`. `--complex` hands implementation to the
+`auto` loop.
 
 Each file is written by its own call, so the finished tree is checked as a
 whole before the build reports success: a browser scaffold whose scripts cannot
@@ -830,10 +832,18 @@ rounds per failed verification, `--keep-going` continues past failed tasks, and
 `--verify-final` runs the `--verify` command once, after the last unchecked
 task, instead of after every task: a whole-goal check cannot pass mid-plan, so
 the per-task runs would roll back valid partial fixes (`auto_verify_final`,
-off by default). `--strict` exits 1 when a task applied edits but left a
+off by default). After the last task, `--apply` also exercises the project
+once (`auto_smoke`, on by default): the Python entry points are exec'd and
+the receipt prints `verify: passed` -- that proves the project BOOTS, not
+that the suite is green, so a plan should end with a run-the-tests task or
+you should pass `--verify "pytest -q"`. `--strict` exits 1 when a task applied edits but left a
 failed edit block or impacted tests still failing after the repair rounds,
 for CI and unattended pipelines (without it both are reported and the run
-exits 0).
+exits 0 -- "reported" means the red verdict is named where you read the
+result: an `ask` closes with a `[verification: RED ...]` note listing the
+blockers the repair did not clear, and the `auto` finish line counts the
+tasks that ticked done while the last gate round was red, the way it
+counts partial applications; TECHNIQUES.md §33).
 
 Guards for unattended runs: a repair round that makes the check *worse* (more
 test failures, more findings) is rolled back from that round's own snapshot
@@ -1253,7 +1263,9 @@ default and is turned off with `frontend_contracts = false`. `pedacito webcheck 
 runs the same vocabulary plus the heuristic checks (ESM syntax in classic scripts,
 duplicate globals, undeclared imports, member calls on page globals) on demand,
 as warnings only, and `auto` prints its findings after tasks that touch web
-files. `pedacito new --apply` runs the vetting half over the finished tree:
+files. Both `pedacito new --apply` and `pedacito new --complex` run the vetting
+half over the finished tree -- the autonomous loop most of all, since each of
+its tasks writes one file in a fresh context and never sees the whole page:
 a scaffold whose page cannot link gets repair rounds, and if the violations
 survive them the build prints `BUILD INCOMPLETE` and exits 1 instead of
 reporting a project that cannot start.
@@ -1359,8 +1371,12 @@ you configured. Within that:
   a hosted API.
 - **A repository cannot run commands behind your back.** A project's own
   `.pedacito.toml` may not set `hooks`, `mcp_servers`, `auto_verify`, `test_command`,
-  `allow_serve`, `allow_lsp`, `lsp_servers`, or any sandbox setting until you read it
-  and run `pedacito trust`; editing the file revokes the approval.
+  `allow_serve`, `allow_lsp`, `lsp_servers`, any sandbox setting, or the capability
+  toggles that unlock those tools (`allow_shell`, `allow_write`, `allow_browser`,
+  `allow_screenshots`) until you read it
+  and run `pedacito trust`; editing the file revokes the approval. Harmless
+  settings from the same file still apply, and the toggles stay honoured from
+  your user config, from `--config FILE` and from `PEDACITO_*`.
 - **Hooks** (`hooks = { post_edit = ["ruff format {file}"], pre_edit = [...] }`)
   run your own program at `session_start`, `pre_task`/`post_task`,
   `pre_tool`/`post_tool`, `pre_run`/`post_run`, `pre_edit`/`post_edit`,
@@ -1652,11 +1668,11 @@ config --reference` prints the annotated template. Key settings:
 | `edit_style` | unset | `quote` (default brief) or `anchor` (prefer `SYMBOL` + full definition, SEARCH only for small edits); unset lets the model card decide. |
 | `post_edit_check` | true | After applied edits, feed back only NEW linter/syntax findings on the changed files. |
 | `auto_allowlist` | false | Restrict `auto` task writes to files the title names or the lookup read (new files always allowed). |
-| `allow_write` | false | Whole-file write/append/move/delete during gathering. |
-| `allow_shell` | false | `run` and `diagnose`. |
+| `allow_write` | false | Whole-file write/append/move/delete during gathering. From a project's own config: ignored until `pedacito trust`. |
+| `allow_shell` | false | `run` and `diagnose`. From a project's own config: ignored until `pedacito trust`. |
 | `allow_serve` / `serve_wait` | false / 3.0 | Background dev servers (`serve` action, `pedacito serve`); seconds to wait for a printed URL. |
 | `allow_lsp` / `lsp_servers` / `lsp_timeout` | false / `{}` / 10 | Exact definition/references/hover/diagnostics via a language server; per-extension commands override PATH detection. |
-| `allow_screenshots` / `allow_browser` | false | Screen and headless-browser capture. |
+| `allow_screenshots` / `allow_browser` | false | Screen and headless-browser capture. From a project's own config: ignored until `pedacito trust`. |
 | `vision_model` | `""` | Multimodal model used to describe captures. |
 | `semantic_search` | false | Embeddings fallback for `grep`. |
 | `circuit_breaker` / `circuit_failures` / `circuit_cooldown` | true / 4 / 60 | Fail fast after repeated transport/server failures; rate limits, context overflows and 4xx errors do not trip it. |
@@ -1673,6 +1689,7 @@ config --reference` prints the annotated template. Key settings:
 | `best_of` | 1 | Sample N candidate edit replies and keep the best-scoring one. |
 | `verify_tests` / `test_command` | false / `""` | Run impacted tests after applied edits (needs `allow_shell`). |
 | `verify_dom` / `dom_entry` / `dom_timeout` | false / `""` / 45 | Headless DOM smoke check after applied web edits (needs `allow_shell` and the optional Playwright install): load the entry page in headless Chromium, prove the module graph mounts, and diff the mounted surface against a pre-edit snapshot. `dom_entry` overrides the detected entry HTML; `dom_timeout` caps one page load in seconds. `ask --verify-dom` flips it per run; `pedacito domcheck` runs it on demand. |
+| `auto_smoke` / `auto_smoke_timeout` | true / 20 | After an `auto --apply` run, exercise the project once (the `--verify` command and/or a boot of its Python entry points) and feed a failure back for repair. `verify: passed` proves the project BOOTS -- it is not the test suite; end plans with a run-the-tests task or pass `--verify`. |
 | `use_memory` / `use_skills` | true | Push memory, rules, and the skills catalog. |
 | `allow_git` / `git_context` | true | Read-only `git` action; branch/dirty/recent-commits preamble. |
 | `allow_subagents` | false | The `task` action (read-only helper with a fresh window). |

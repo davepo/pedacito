@@ -1422,7 +1422,23 @@ def _requirements_from_task(task: str, limit: int = 12) -> list[Requirement]:
         plain = [w for w in words if not _IDENT_TERM_RE.search(w)]
         terms = list(dict.fromkeys(ident + plain))[:16]
         if terms:
-            kind = ("constraint" if _is_constraint_clause(p)
+            # BUG-809: a protective tail merged into its edit clause by the
+            # fragment merger ("Change index.html. Touch nothing else." ->
+            # one clause) still carries the edit verb and the file name: that
+            # clause IS the task, and classifying it as a pure constraint
+            # silently dropped the whole requirement — an edit task then had
+            # zero tracked edit clauses, so the review provenance map, the
+            # coverage seeds and the unaccepted-change guard all went blind.
+            # A prohibition that LEADS its clause ("Do not modify game.js.",
+            # "Keep index.html unchanged.") is still a pure constraint and
+            # outranks the edit words it contains (BUG-306); only a trailing
+            # phrase absorbed by the merger is overruled.
+            edit_outranks = bool(
+                _REQ_EDIT_RE.search(p) and _FILE_TOKEN_RE.search(p)
+                and not _CONSTRAINT_HEAD_RE.search(p)
+                and not _CONSTRAINT_KEEP_RE.search(p))
+            constraint = _is_constraint_clause(p) and not edit_outranks
+            kind = ("constraint" if constraint
                     else _clause_kind(p, task_kind))
             reqs.append(Requirement(
                 p, terms, kind, req_id=f"R{len(reqs) + 1}"))

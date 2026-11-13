@@ -31,7 +31,7 @@ from pathlib import Path
 from . import apicheck, fileio, workspace
 from . import index as index_mod
 from .chunker import Chunk
-from .config import ConfigError
+from .config import PROJECT_CONFIG_NAMES, ConfigError
 from .edits import Result, apply_edits, parse_edits
 from .index import Index, file_hash
 from .llm import LLMError, thinking_suffix_for
@@ -1535,6 +1535,64 @@ def verify_and_fix(client, cfg, idx: Index, py_rels, project_name: str,
     return False, last
 
 
+# Top-level entries that Pedacito itself puts in a project folder: its state
+# directory, its two config names, the ignore file `files` writes, and the git
+# repository `git init` made before the first run. Their presence says nothing
+# about whether the folder already holds a PROJECT, so they must not trip the
+# fresh-directory guard below; a real source file still does.
+HARNESS_OWNED = (".git", ".pedacito", ".pedacitoignore", *PROJECT_CONFIG_NAMES)
+
+
+def is_harness_owned(name: str) -> bool:
+    """Whether a top-level entry came from Pedacito rather than the project."""
+    return name in HARNESS_OWNED
+
+
+def _web_contract_gate(root: Path, cfg, client, idx, plan: Plan,
+                       backup_dir, *, verbose: bool = True) -> list[str]:
+    """Prove the page against its contract after a build, and repair what the
+    per-file passes left broken. Returns the violations that still stand.
+
+    Browser projects are only proven by their contract: the build writes
+    index.html and main.js in separate calls, so the page can be committed
+    with ids no script queries and imports no module answers. The gate knows;
+    it gets repair rounds here and, if the contract still cannot hold, the
+    build must not report success. Shared by `new --apply` and `new
+    --complex` (BUG-806): the autonomous loop needs it most, because each of
+    its tasks ran in a fresh context and never saw the whole page."""
+    web_errors = web_contract_errors(root)
+    if web_errors:
+        if verbose:
+            print(f"\n--- {len(web_errors)} frontend contract violation(s): "
+                  "asking for a repair pass ---", file=sys.stderr)
+            for e in web_errors[:8]:
+                print(f"  {e}", file=sys.stderr)
+        n, web_errors = fix_web_contracts(client, cfg, idx, plan,
+                                          backup_dir, verbose=verbose)
+        if verbose and n:
+            print(f"  {n} contract fix file(s) applied", file=sys.stderr)
+    # The rest of the webcheck vocabulary (classic/duplicate globals,
+    # bare specifiers, member calls on page globals) stays a notice board:
+    # heuristic checks do not get to veto a build they might get wrong.
+    from . import webcheck
+    if webcheck.notice(root):
+        workspace.log_event(root, "webcheck reported contract findings "
+                            "after the build", "WARN")
+    if web_errors:
+        workspace.log_event(
+            root, f"build left {len(web_errors)} frontend contract "
+                  f"violation(s); the page cannot run as built", "ERROR")
+        print("\nBUILD INCOMPLETE: the page cannot run as built. "
+              f"{len(web_errors)} frontend contract violation(s) remain:",
+              file=sys.stderr)
+        for e in web_errors[:10]:
+            print(f"  {e}", file=sys.stderr)
+        print("\nFix them with:\n  pedacito ask . --apply --strict "
+              "-t \"reconcile the DOM and ES module contracts listed "
+              "above\"", file=sys.stderr)
+    return web_errors
+
+
 def run_new(root: Path, cfg, client, spec: Spec, *, apply: bool = False,
             review: bool = False, plan_only: bool = False, force: bool = False,
             verbose: bool = True, complex: bool = False, verify: str = "",
@@ -1555,13 +1613,15 @@ def run_new(root: Path, cfg, client, spec: Spec, *, apply: bool = False,
                    (`pedacito auto`): one task per source file in a fresh
                    context, resumable via auto_plan_file.
 
-    A non-empty directory is refused unless `force`."""
-    if not force and any(root.glob("*")):
-        existing = sorted(p.name for p in root.iterdir()
-                          if p.name not in (".git", ".pedacito"))[:8]
+    A directory that already holds project files is refused unless `force`; one
+    that holds only Pedacito's own files is still fresh."""
+    if not force:
+        entries = [p.name for p in root.iterdir()
+                   if not is_harness_owned(p.name)] if root.is_dir() else []
+        existing = sorted(entries)[:8]
         if existing:
-            print(f"ERROR: {root} is not empty ({', '.join(existing)}"
-                  f"{'...' if len(list(root.iterdir())) > 8 else ''}).\n"
+            more = f" (+{len(entries) - 8} more)" if len(entries) > 8 else ""
+            print(f"ERROR: {root} is not empty ({', '.join(existing)}{more}).\n"
                   "  New projects start in a fresh directory. Pick another path,\n"
                   "  or pass --force to scaffold among those files anyway.",
                   file=sys.stderr)
@@ -1688,45 +1748,12 @@ def run_new(root: Path, cfg, client, spec: Spec, *, apply: bool = False,
     print("\n" + summarise_result(summary))
 
     if apply:
-        # Browser projects are only proven by their contract: the per-file
-        # build writes index.html and main.js in separate calls, so the page
-        # can be committed with ids no script queries and imports no module
-        # answers. The gate knows; it now gets repair rounds and, if the
-        # contract still cannot hold, the build does not report success.
-        web_errors = web_contract_errors(root)
-        if web_errors:
-            if verbose:
-                print(f"\n--- {len(web_errors)} frontend contract violation(s): "
-                      "asking for a repair pass ---", file=sys.stderr)
-                for e in web_errors[:8]:
-                    print(f"  {e}", file=sys.stderr)
-            n, web_errors = fix_web_contracts(client, cfg, idx, plan,
-                                              backup_dir, verbose=verbose)
-            if verbose and n:
-                print(f"  {n} contract fix file(s) applied", file=sys.stderr)
-        # The rest of the webcheck vocabulary (classic/duplicate globals,
-        # bare specifiers, member calls on page globals) stays a notice board:
-        # heuristic checks do not get to veto a build they might get wrong.
-        from . import webcheck
-        if webcheck.notice(root):
-            workspace.log_event(root, "webcheck reported contract findings "
-                                "after the build", "WARN")
-        if web_errors:
-            workspace.log_event(
-                root, f"build left {len(web_errors)} frontend contract "
-                      f"violation(s); the page cannot run as built", "ERROR")
-            print("\nBUILD INCOMPLETE: the page cannot run as built. "
-                  f"{len(web_errors)} frontend contract violation(s) remain:",
-                  file=sys.stderr)
-            for e in web_errors[:10]:
-                print(f"  {e}", file=sys.stderr)
-            print("\nFix them with:\n  pedacito ask . --apply --strict "
-                  "-t \"reconcile the DOM and ES module contracts listed "
-                  "above\"", file=sys.stderr)
-            if not summary["failed"]:
-                # Reported separately from a build step that failed: the
-                # summary dict keeps its shape, the exit code sees this.
-                contract_failed = True
+        web_errors = _web_contract_gate(root, cfg, client, idx, plan,
+                                        backup_dir, verbose=verbose)
+        if web_errors and not summary["failed"]:
+            # Reported separately from a build step that failed: the
+            # summary dict keeps its shape, the exit code sees this.
+            contract_failed = True
 
         # BUG-301: a green build is not a green project. The plain path
         # wrote a test suite and never ran it, so `new` exited 0 over
@@ -1818,6 +1845,16 @@ def _run_complex(root: Path, cfg, client, idx, plan: Plan, spec: Spec, *,
         answer_system=AUTO_IMPLEMENT_SYSTEM,
         auto_install=auto_install,
     )
+
+    # BUG-806: fresh contexts are exactly why this gate is needed here, not
+    # a reason to skip it. One task wrote index.html, another wrote main.js,
+    # and neither saw the other's side of the contract.
+    web_backup = (workspace.new_backup_dir(root, workspace.stamp())
+                  if cfg.backup else None)
+    if _web_contract_gate(root, cfg, client, idx, plan, web_backup,
+                          verbose=verbose):
+        if code == 0:
+            code = 1
 
     # Cross-file repair after the loop (fresh contexts can disagree on names).
     # Missing third-party packages are handled first: editing source cannot

@@ -43,7 +43,8 @@ from . import workspace
 from .agent import Agent
 from .config import (Config, ConfigError, REFERENCE_TEMPLATE, TEMPLATE,
                      USER_CONFIG, _ask, _guess_tier, auto_fit,
-                     find_project_config, interactive_setup, load as load_config,
+                     find_project_config, interactive_setup,
+                     is_project_config_path, load as load_config,
                      write_template)
 from .llm import LLMClient, LLMError, estimate_tokens
 from .select import CODE_EXTS, REFERENCE_EXTS, Matcher, is_venv_dir, select
@@ -287,12 +288,28 @@ def _cmd_config(args, cfg) -> int:
             print(e, file=sys.stderr)
             return 2
         print(f"Wrote {path}", file=sys.stderr)
-        print("Mandatory settings: base_url, model and vram_gb in "
-              "[profiles.default].\n"
-              "Everything else has a working default -- see\n"
-              "`pedacito config --reference` for the annotated full list, or run\n"
-              "`pedacito config --setup` to have it built and tested interactively.\n"
-              "Then: pedacito config --check", file=sys.stderr)
+        if is_project_config_path(path):
+            # `pedacito trust` resolves the file through find_project_config
+            # on the PROJECT dir, so the state-dir shape (<proj>/.pedacito/
+            # config.toml) must name the project, not the state dir.
+            proj = (path.parent.parent if path.parent.name == ".pedacito"
+                    else path.parent)
+            print("Project scope: this file overrides "
+                  f"{USER_CONFIG}. Server, model, vram_gb and default_profile\n"
+                  "are left commented -- uncomment them only if this "
+                  "repository needs its own model.\n"
+                  "Settings that run something are ignored until you approve "
+                  "the file:\n"
+                  f"Then: pedacito trust {proj}\n"
+                  "And: pedacito config --check", file=sys.stderr)
+        else:
+            print("Mandatory settings: base_url, model and vram_gb in "
+                  "[profiles.default].\n"
+                  "Everything else has a working default -- see\n"
+                  "`pedacito config --reference` for the annotated full list, "
+                  "or run\n`pedacito config --setup` to have it built and "
+                  "tested interactively.\n"
+                  "Then: pedacito config --check", file=sys.stderr)
         return 0
 
     root = _root(args)
@@ -677,6 +694,38 @@ def _strict_task_error(args, tr) -> str:
     if getattr(tr, "tests_ok", None) is False:
         return "strict: impacted tests still fail after the repair rounds"
     return ""
+
+
+def _red_verdict_note(args, tr) -> str:
+    """BUG-808: without --strict, an `ask --apply` that ended with the last
+    verification gate RED exits 0 by contract -- but silence made the run
+    read as clean while the page could not even link. The gate lines above
+    said "skipped until they are fixed"; nothing ever said whether they were
+    fixed. Say what the last round ended on, naming the blockers the repair
+    could not clear (the same honesty RPC got via findings in BUG-322/323).
+    A purely pre-existing red suite is not this task's verdict (BUG-220),
+    and --strict already fails the exit code with its own ERROR line."""
+    if getattr(args, "strict", False) or tr is None:
+        return ""
+    if getattr(tr, "tests_ok", None) is not False:
+        return ""
+    if getattr(tr, "tests_preexisting_only", False):
+        return ""
+    errs = [f for f in (getattr(tr, "findings", None) or [])
+            if getattr(f, "severity", "error") == "error"]
+    parts = []
+    for f in errs[:3]:
+        head = str(getattr(f, "message", f)).strip().splitlines()
+        kind = getattr(f, "kind", "") or "check"
+        parts.append(f"{kind}: {head[0][:160] if head else ''}")
+    more = f" (+{len(errs) - 3} more blocker(s))" if len(errs) > 3 else ""
+    detail = f" What the run ended on -- {'; '.join(parts)}{more}." if parts \
+        else " No test or gate subprocess reported green."
+    return ("[verification: RED -- the last gate round ended red. Without "
+            "--strict this does not fail the exit code, but the task is NOT "
+            "verified clean and the edits stand as written." + detail +
+            " Re-run the same ask to keep repairing, or `pedacito domcheck`"
+            " / the project's own tests to see the current state.]")
 
 
 def _refine_task_text(cfg, client, root: Path, text: str, mode: str) -> str:
@@ -2945,6 +2994,9 @@ def _main(argv=None) -> int:
             from . import replay as replay_mod
             replay_mod.report(client)
             tr = locals_ref.get("last_result")
+            note = _red_verdict_note(args, tr)
+            if note:
+                print("\n" + note, file=sys.stderr)
             strict = (_strict_replay_error(args, client)
                       or _strict_task_error(args, tr))
             if strict:

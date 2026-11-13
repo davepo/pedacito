@@ -713,7 +713,7 @@ only the map is stale.
 | `pedacito diagnose` | Run the project's linter or type checker |
 | `pedacito prune PROJ` | Delete old sessions, backups, and events |
 | `pedacito reset PROJ [--reindex]` | Wipe `.pedacito/` runtime state. Code and config stay |
-| `pedacito trust PROJ` | Approve a project's `.pedacito.toml` |
+| `pedacito trust PROJ` | Approve a project's `.pedacito.toml` so its execution settings and capability toggles apply |
 | `pedacito worktree create\|list\|remove NAME` | Manage isolated git worktrees |
 
 Flags available on most commands: `--exclude 'pattern'`, `--include 'pattern'`,
