@@ -1190,12 +1190,14 @@ def _hostname(base_url: str) -> str:
 # lapses when that file changes. The capability toggles belong here for the
 # same reason as the commands they unlock: `allow_shell` is what lets `run`
 # and `diagnose` execute project-supplied programs, `verify_tests`/`verify_dom`
-# then point them at the repository's own test and page code.
+# then point them at the repository's own test and page code, and
+# `enable_mcp`/`allow_mcp` unlock the external-tool channels that
+# `mcp_servers` populates.
 EXEC_FIELDS = ("hooks", "mcp_servers", "auto_verify", "test_command",
                "allow_serve", "allow_lsp", "lsp_servers", "sandbox",
                "sandbox_network", "sandbox_writable", "sandbox_strict",
                "allow_shell", "allow_write", "allow_browser",
-               "allow_screenshots")
+               "allow_screenshots", "enable_mcp", "allow_mcp")
 TRUST_FILE = "trusted_projects.json"
 
 
@@ -3149,9 +3151,10 @@ _PROJECT_HEADER = """\
 # Settings that run something are ignored until you read this file and run
 # `pedacito trust`: hooks, mcp_servers, auto_verify, test_command, allow_serve,
 # allow_lsp, lsp_servers, the sandbox settings, and the capability toggles
-# allow_shell, allow_write, allow_browser and allow_screenshots. They are
-# shown commented out here: active defaults would warn on every load, and
-# once trusted they would overrule the capabilities you granted at user scope.
+# allow_shell, allow_write, allow_browser, allow_screenshots, enable_mcp and
+# allow_mcp. They are shown commented out here: active defaults would warn on
+# every load, and once trusted they would overrule the capabilities you granted
+# at user scope.
 # Uncomment only the ones this repository genuinely needs. Everything else in
 # this file applies immediately.
 #

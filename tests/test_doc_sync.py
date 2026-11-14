@@ -1,0 +1,177 @@
+"""Documentation drift guards (Pass B).
+
+The docs and the built-in `how` index must keep pace with the code:
+
+* every CLI subcommand the parser accepts is mentioned in README and
+  QUICKSTART (a new subcommand cannot ship undocumented);
+* stale claims (the old "no CLI command for it yet" benchmark wording)
+  stay gone;
+* every bundled skill is valid and loadable, and the README names them;
+* the flags and GUI features added with the security pass (--strings,
+  config --upgrade, the masked Raw file tab, the MCP Servers tab, the
+  Scout + Architect pairing form, the Project ▾ upkeep dialogs) are
+  documented in the user-facing docs and in the how-cards.
+"""
+from __future__ import annotations
+
+import argparse
+import re
+import sys
+from pathlib import Path
+
+import pytest
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from pedacito import how_index, skills
+from pedacito.cli import build_parser
+
+ROOT = Path(__file__).resolve().parents[1]
+README = (ROOT / "README.md").read_text(encoding="utf-8")
+QUICKSTART = (ROOT / "QUICKSTART.md").read_text(encoding="utf-8")
+MODEL_GUIDE = (ROOT / "MODEL_GUIDE.md").read_text(encoding="utf-8")
+
+STALE_PHRASE = "There is no CLI command for it yet"
+
+# The Project ▾ upkeep dialogs, exactly as the GUI labels them.
+PROJECT_MENU_LABELS = (
+    "Memory & repo lessons…",
+    "Background servers…",
+    "Run project checks…",
+    "Prune old sessions/backups…",
+    "Reset project state…",
+)
+
+
+def _subcommand_names() -> list[str]:
+    parser = build_parser()
+    sub = next(a for a in parser._actions
+               if isinstance(a, argparse._SubParsersAction))
+    return sorted(sub.choices)
+
+
+def _mentioned(text: str, name: str) -> bool:
+    """`pedacito NAME` anywhere, or a bare backticked `NAME` (the README
+    groups some commands as `pedacito index`, `map`, `files`, `cost`)."""
+    return (re.search(rf"\bpedacito\s+{re.escape(name)}\b", text) is not None
+            or re.search(rf"`{re.escape(name)}[`|\s]", text) is not None)
+
+
+def _norm(text: str) -> str:
+    return " ".join(text.split())
+
+
+@pytest.mark.parametrize("doc_name", ["README.md", "QUICKSTART.md"])
+def test_every_cli_subcommand_is_documented(doc_name):
+    text = (ROOT / doc_name).read_text(encoding="utf-8")
+    missing = [name for name in _subcommand_names()
+               if not _mentioned(text, name)]
+    assert not missing, f"{doc_name} does not mention: {missing}"
+
+
+@pytest.mark.parametrize("rel", [
+    "README.md", "QUICKSTART.md", "MODEL_GUIDE.md", "TECHNIQUES.md",
+    "pedacito/how.py", "pedacito/how_index.py",
+])
+def test_stale_benchmark_phrase_is_gone(rel):
+    assert STALE_PHRASE not in (ROOT / rel).read_text(encoding="utf-8")
+
+
+def test_stale_benchmark_phrase_is_gone_from_gui_scripts():
+    for path in sorted((ROOT / "pedacito" / "gui" / "static").glob("*.js")):
+        assert STALE_PHRASE not in path.read_text(encoding="utf-8"), path
+
+
+def test_bundled_skills_are_valid_and_loadable(tmp_path):
+    assert len(skills.BUNDLED) == 8
+    for name, (desc, body) in skills.BUNDLED.items():
+        assert skills._NAME_RE.match(name), name
+        assert desc.strip(), name
+        assert body.strip(), name
+        assert len(body) <= skills.MAX_SKILL_CHARS, \
+            f"{name} would be truncated by load()"
+        text, info = skills.load(tmp_path, None, name)
+        assert info is not None and info["source"] == "bundled"
+        assert text.startswith(f"SKILL {name} (bundled):")
+        assert body.strip() in text
+    # An empty project still sees the whole bundled catalog.
+    catalog = skills.catalog(tmp_path, None, limit=10000)
+    for name in skills.BUNDLED:
+        assert f"- {name}:" in catalog
+
+
+def test_readme_names_every_bundled_skill():
+    assert "Eight starters" in README
+    for name in skills.BUNDLED:
+        assert f"`{name}`" in README, f"README does not name skill {name}"
+
+
+# (doc, needle) pairs for the features synced in the security pass.
+# Needles are matched on whitespace-normalized text so line wraps in the
+# markdown do not matter.
+FEATURE_NEEDLES = [
+    ("--strings", "rename --strings"),
+    ("--upgrade", "config --upgrade"),
+    ("--dry-run", "config --upgrade --dry-run"),
+    ("***REDACTED***", "masked Raw file tab"),
+    ("MCP Servers", "Settings MCP Servers tab"),
+    ("Dual-GPU / Scout + Architect Pairing", "Profiles pairing form"),
+    ("Create starter Scout & pair…", "Auto-Tune dual-GPU pairing"),
+] + [(label, "Project ▾ upkeep dialog") for label in PROJECT_MENU_LABELS]
+
+
+@pytest.mark.parametrize("doc_name", ["README.md", "QUICKSTART.md"])
+@pytest.mark.parametrize("needle,feature", FEATURE_NEEDLES)
+def test_new_features_are_documented(doc_name, needle, feature):
+    text = _norm((ROOT / doc_name).read_text(encoding="utf-8"))
+    assert needle in text, f"{doc_name} missing {feature}: {needle!r}"
+
+
+@pytest.mark.parametrize("needle", [
+    "Dual-GPU / Scout + Architect Pairing",
+    "Create starter Scout & pair…",
+])
+def test_model_guide_documents_the_pairing_paths(needle):
+    assert needle in _norm(MODEL_GUIDE)
+
+
+def test_how_cards_cover_the_new_features():
+    cards = {c["name"]: c for c in how_index.CLI_COMMANDS}
+    rename = cards["rename"]
+    assert "--strings" in rename["usage"]
+    assert any(f["flag"] == "--strings" for f in rename["flags"])
+
+    topics = {t["id"]: t for t in how_index.GUI_TOPICS}
+    mcp_steps = " ".join(topics["named-mcp-servers"]["steps"])
+    assert "MCP Servers" in mcp_steps
+    scout_steps = " ".join(topics["scout-model"]["steps"])
+    assert "Pairing" in scout_steps
+    assert "Auto-Tune" in scout_steps
+    upkeep_steps = " ".join(topics["project-upkeep"]["steps"])
+    for label in PROJECT_MENU_LABELS:
+        assert label in upkeep_steps
+    gather = topics["run-test-gather"]["summary"]
+    assert "Vitest" in gather and "cargo" in gather
+    key_steps = " ".join(topics["api-key-hosted"]["steps"])
+    assert "***REDACTED***" in key_steps
+
+
+def test_how_topic_references_resolve():
+    """Every GUI topic's cli/settings cross-references must exist."""
+    cli_names = {c["name"] for c in how_index.CLI_COMMANDS}
+    setting_keys = {s["key"] for s in how_index.settings_dictionary()}
+    for topic in how_index.GUI_TOPICS:
+        for name in topic.get("cli", []):
+            assert name in cli_names, (topic["id"], name)
+        for key in topic.get("settings", []):
+            assert key in setting_keys, (topic["id"], key)
+
+
+@pytest.mark.parametrize("question,topic", [
+    ("how do I add an mcp server in the gui?", "named-mcp-servers"),
+    ("how do I pair a scout with the architect?", "scout-model"),
+    ("how do I reset the project state?", "project-upkeep"),
+])
+def test_new_topics_are_retrievable(question, topic):
+    ids = [m["id"] for m in how_index.search(question)["gui"]]
+    assert topic in ids, (question, ids)

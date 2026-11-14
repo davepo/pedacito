@@ -129,15 +129,18 @@ dependencies, so it works offline. It runs the same engine as the commands.
 - **Permission requested** dialogs pause a run when the model asks for web
   access, a package install, an unapproved shell command, or a sensitive file.
   See [Safety and trust](#safety-and-trust).
-- **Settings** edits your profiles, every setting, the Auto-Tune wizard, and the
-  raw config file, without deleting your comments.
+- **Settings** edits your profiles, every setting, the Auto-Tune wizard, named
+  MCP servers, and the raw config file, without deleting your comments.
 - **Benchmarks** runs the six diagnostic projects against any profile. The
   pelican SVG result is drawn inline in its scorecard.
 - **Project ▾** holds project actions: **Rename symbol…** renames an identifier
   across the project with no model call, and shows the per-file diffs before it
   writes. **Restore from a backup…**, **Check model (loads it)** and **Clear
-  terminal** are also here. A `Scout: <profile>` badge appears beside the model
-  chip when a scout profile is active.
+  terminal** are also here, plus the upkeep dialogs: **Memory & repo lessons…**,
+  **Background servers…**, **Run project checks…**, **Prune old
+  sessions/backups…** and **Reset project state…** (prune and reset preview
+  before they write). A `Scout: <profile>` badge appears beside the model chip
+  when a scout profile is active.
 
 Chat threads are saved with timestamps and can be renamed. With no project
 open they are kept in `~/.local/state/pedacito/threads/global/` (see the
@@ -154,7 +157,7 @@ commands. Run `pedacito <command> --help` for every flag.
 |---|---|
 | `pedacito gui [PROJECT]` | Open the browser control panel |
 | `pedacito models scan` | Find local servers, pick models, write profiles, and measure them |
-| `pedacito config --check` | Test the connection and generation. `--doctor` also probes structured output. `--setup` runs first-time setup |
+| `pedacito config --check` | Test the connection and generation. `--doctor` also probes structured output. `--setup` runs first-time setup; `--upgrade [--dry-run]` adds newly documented options to your file |
 | `pedacito calibrate` | Measure the active model and save a model card that tunes defaults |
 | `pedacito profiles [--recommend]` | List profiles with their scores, and suggest role routing |
 | `pedacito ask PROJ -t "..."` | Run one task. Dry run by default. Add `--review`, `--apply`, `--plan`, `--refine`, or `--jsonl` |
@@ -165,7 +168,7 @@ commands. Run `pedacito <command> --help` for every flag.
 | `pedacito rpc [PROJ]` | JSONL-RPC over stdin/stdout for editors and other agents: one request per line, streamed events, steering, permission prompts, cancel -- index, profiles and session warm the whole time |
 | `pedacito how "..."` | Built-in help for the CLI, the GUI, and settings |
 | `pedacito restore PROJ` | Undo the last write |
-| `pedacito rename OLD NEW` | Multi-file symbol rename through the AST and the tokenizer, no model call. `--file` scopes it, `--apply` writes (default: diff preview) |
+| `pedacito rename OLD NEW` | Multi-file symbol rename through the AST and the tokenizer, no model call. `--file` scopes it, `--strings` also renames whole-word string literals, `--apply` writes (default: diff preview) |
 | `pedacito index`, `map`, `files`, `cost` | Build and inspect the index. These need no model call, except `index` summaries |
 | `pedacito eval` | Score the harness on fixture repositories. Use `--baseline` as a regression gate |
 | `pedacito bench [BENCHMARK\|all]` | Run the six-project diagnostic benchmark suite and hidden holdout rubric. `--list` and `--recent` need no model; `--json` and `--strict` fit CI |
@@ -291,7 +294,13 @@ pedacito profiles           # see scores and role recommendations
 pedacito config --init      # or write a commented starter file
 pedacito config             # show every resolved setting and where it came from
 pedacito config --reference # print the full annotated template
+pedacito config --upgrade   # add newly documented options, commented out
+pedacito config --upgrade --dry-run  # preview what would be added
 ```
+
+`config --upgrade` appends options that a newer Pedacito documents but your
+file lacks, commented out, keeping every existing setting and comment;
+`--dry-run` lists them without writing.
 
 `config --setup` (and `models scan`) finds local model servers, LM Studio,
 Ollama, Lemonade, llama.cpp, **on any port**, identifies each by its replies
@@ -427,8 +436,10 @@ servers come from your user config, or from a project you explicitly trusted.
 pedacito mcp list        # what the bridge sees for this project, pruned view
 ```
 
-The GUI shows the same list at `GET /api/mcp/tools` and settings expose the
-acceleration and bridge switches. See
+In the GUI, **⚙ Settings → MCP Servers** adds, edits, tests, enables, trusts
+and deletes named servers without hand-editing TOML; they are written to your
+user config (a project file needs trust first). The same tool listing is
+served at `GET /api/mcp/tools`. See
 [Techniques §30](TECHNIQUES.md#30-pruned-permission-gated-mcp-bridges-named-servers--mcp_call)
 for why the pruning is shaped this way.
 
@@ -699,8 +710,11 @@ edit or delete:
 - **Skills** are named procedures (`.pedacito/skills/NAME/SKILL.md`, or
   `skills/NAME/SKILL.md` next to your config). The model sees a one-line
   catalog and loads a skill's text only when it needs it. Eight starters ship
-  built in; `pedacito skills` lists them. Skills are prompt text, nothing in a
-  skill folder is ever executed.
+  built in: `add-a-test`, `fix-a-failing-test`, `refactor-safely`,
+  `review-my-diff`, `find-dead-code`, `surgical-symbol-edit`,
+  `frontend-dom-audio-debug` and `safe-multi-file-rename`; `pedacito skills`
+  lists them. Skills are prompt text, nothing in a skill folder is ever
+  executed.
 
 ### Repair lessons and repo gotchas
 
@@ -928,18 +942,27 @@ without touching the rest of the file, comments survive, every edit is checked
 with the same rules the loader uses before it is written, and the previous file
 is kept as `config.toml.bak`. Tabs: **Profiles** (create, duplicate, delete,
 make default; server URL, key, model with a *Test connection* that lists the
-server's models, tier, VRAM, JSON mode, and the common switches), **Model
-discovery**, **Auto-Tune**, **All settings** (every setting, searchable, with its help text and where its value
-comes from, applied globally or to one profile), and **Raw file / reset**. With no
-config at all, a first-run form (with *Find servers* for LM Studio/Ollama) builds
-one. A project config's execution settings stay ignored until you trust it
-(*Review & trust…*, the same as `pedacito trust`).
+server's models, tier, VRAM, JSON mode, and the common switches; a **Dual-GPU /
+Scout + Architect Pairing** form writes `default_profile` + `scout_profile` in
+one comment-preserving edit and can create a starter scout profile for the
+second GPU), **Model discovery**, **Auto-Tune** (hardware, model class,
+codebase size, priority and a dual-GPU question; a dual-GPU answer recommends
+a scout and offers *Create starter Scout & pair…*), **All settings** (every
+setting, searchable, with its help text and where its value comes from,
+applied globally or to one profile), **MCP Servers** (add, edit, test, enable,
+trust and delete named `[mcp_servers.<name>]` servers), and **Raw file /
+reset**. With no config at all, a first-run form (with *Find servers* for LM
+Studio/Ollama) builds one. A project config's execution settings stay ignored
+until you trust it (*Review & trust…*, the same as `pedacito trust`).
 
 How it stays safe: it refuses requests with a foreign `Host`/`Origin`, accepts
 only JSON `POST`s, sends a strict Content-Security-Policy, and serves a project's
 files only from inside that project. API keys are never shown in the profile
-forms (leave the box blank to keep one); the **Raw file** tab does show the file
-as written, key included. Only one job runs at a time, and jobs that write directly take the
+forms (leave the box blank to keep one), and the **Raw file** tab masks every
+stored secret as `***REDACTED***`: saving the mask unchanged restores the
+stored value, while a mask for a key the file does not have is refused.
+Sensitive files (`.env*`, keys, credentials) are refused in the file preview
+too. Only one job runs at a time, and jobs that write directly take the
 same project lock as the command line.
 
 ### Measurement and upkeep
@@ -1172,11 +1195,13 @@ failure instead of being silently dropped.
 ### Renaming a symbol across the project
 
 A rename does not need a model, so Pedacito does it mechanically: every exact
-identifier is rewritten, and strings and comments are left alone.
+identifier is rewritten, and comments are left alone. String literals are
+left alone too unless you pass `--strings`.
 
 ```bash
 pedacito rename apply_discount discounted_price                       # preview the diffs
 pedacito rename apply_discount discounted_price --file pkg/core.py    # that file and its importers
+pedacito rename apply_discount discounted_price --strings             # also whole-word string literals
 pedacito rename apply_discount discounted_price --apply               # write it
 ```
 
@@ -1185,9 +1210,12 @@ renames `Store.save` and the call sites whose receiver is provably a `Store` (Py
 and lists the look-alikes it left alone. The preview is the default, so no flag is needed to get one. `--apply` writes the
 change and snapshots the originals first, so `pedacito restore` undoes it.
 
-- **Identifiers only.** Python names move through `tokenize`. JavaScript,
+- **Identifiers first.** Python names move through `tokenize`. JavaScript,
   TypeScript, Go and Rust move through their tree-sitter identifier nodes. A
-  string or comment that merely contains the old name is never touched.
+  string or comment that merely contains the old name is never touched by
+  default; `--strings` additionally renames whole-word occurrences inside
+  string literals (test labels, docs that name the API), while comments stay
+  untouched.
 - **All or nothing.** Every changed file must pass the syntax check before any
   file is written. If one would break, nothing is written.
 - **Name-based, on purpose.** A parameter in an unrelated function that shares the
@@ -1198,6 +1226,7 @@ change and snapshots the originals first, so `pedacito restore` undoes it.
 
 In the GUI, **Project ▾ → Rename symbol…** takes the old name, the new name and an
 optional scope file. **Preview** shows the diffs, and **Rename** writes them.
+The dialog renames identifiers only; `--strings` is a CLI flag.
 
 ### Checking an answer before it is written
 

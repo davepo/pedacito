@@ -540,19 +540,24 @@ CLI_COMMANDS = [
     },
     {
         "name": "rename",
-        "usage": "pedacito rename OLD NEW [--file PATH] [--apply] [--root DIR]",
+        "usage": "pedacito rename OLD NEW [--file PATH] [--strings] [--apply] "
+                 "[--root DIR]",
         "summary": "Rename a symbol across the project without a model call: "
                    "Python identifiers move through the real tokenizer, "
                    "JavaScript/TypeScript/Go/Rust through tree-sitter "
                    "identifier nodes, so strings and comments that merely "
-                   "contain the old name are never touched. Default is a "
+                   "contain the old name are never touched by default. "
+                   "--strings also renames whole-word occurrences inside "
+                   "string literals (comments stay untouched). Default is a "
                    "dry-run diff preview; --apply writes and snapshots the "
                    "originals, so restore undoes it.",
         "keywords": ["rename", "refactor", "symbol", "identifier", "variable",
-                     "function name", "rename across files"],
+                     "function name", "rename across files", "rename strings",
+                     "string literals"],
         "examples": [
             "pedacito rename apply_discount discounted_price",
             "pedacito rename apply_discount discounted_price --file pkg/core.py",
+            "pedacito rename apply_discount discounted_price --strings",
             "pedacito rename apply_discount discounted_price --apply --root .",
             "pedacito restore . --dry-run",
         ],
@@ -562,6 +567,10 @@ CLI_COMMANDS = [
             {"flag": "--file PATH",
              "help": "scope: that file plus the files importing it "
                      "(default: all indexed project source)"},
+            {"flag": "--strings",
+             "help": "also rename whole-word occurrences inside string "
+                     "literals (test labels, docs that name the API); "
+                     "comments stay untouched"},
             {"flag": "--apply",
              "help": "write the rename (default: dry-run with diffs)"},
             {"flag": "--root DIR", "help": "project root (default: cwd)"},
@@ -1302,7 +1311,9 @@ GUI_TOPICS = [
                    "Overrides.",
         "steps": [
             "⚙ Settings → Auto-Tune → answer hardware, model class, codebase "
-            "size and priority → Preview recommendation → Apply",
+            "size, priority and the dual-GPU question → Preview recommendation "
+            "→ Apply; a dual-GPU answer also offers Create starter Scout & "
+            "pair… to split lookups onto a second card",
             "⚙ Settings → Profiles → select the small model → Reasoning & "
             "Execution Overrides: incremental_edit_loop, edit_plan_brief, "
             "step_reasoning_first, dynamic_tool_pruning, repair_rounds",
@@ -1346,6 +1357,9 @@ GUI_TOPICS = [
             "connection to list models",
             "For env-var secrets: ⚙ Settings → All settings → Apply to: "
             "Profile: NAME → api_key_env → Save",
+            "The Raw file / reset tab never shows a stored key: it is masked "
+            "as ***REDACTED***, and saving the mask unchanged keeps the stored "
+            "value (a mask for a key the file does not have is refused)",
             "Set json_mode = object for hosted APIs that reject json_schema",
         ],
         "keywords": ["api key", "hosted", "openai", "deepseek", "anthropic",
@@ -1362,7 +1376,8 @@ GUI_TOPICS = [
         "steps": [
             "Bottom-right Workspace panel → Logs tab",
             "Use follow to auto-scroll; Clear empties the visible terminal",
-            "Project ▾ → Clear terminal does the same from the topbar",
+            "Project ▾ → Clear terminal does the same from the topbar; "
+            "Project ▾ → Background servers… tails a dev server's own log",
             "CLI: session records are .pedacito/sessions/*.md; log.txt has the "
             "event trace",
         ],
@@ -1387,6 +1402,41 @@ GUI_TOPICS = [
                      "undo"],
         "settings": ["backup", "keep_backups"],
         "cli": ["restore", "prune"],
+    },
+    {
+        "id": "project-upkeep",
+        "title": "Project ▾ upkeep: memory, background servers, checks, "
+                 "prune, reset state",
+        "summary": "The Project ▾ menu holds the upkeep dialogs: remembered "
+                   "facts and repo lessons, background dev servers, on-demand "
+                   "project checks, pruning old sessions/backups, and a "
+                   "previewed reset of the project's runtime state.",
+        "steps": [
+            "Project ▾ → Memory & repo lessons…: list, add or forget "
+            "remembered facts (this project or all projects) and read the "
+            "repair lessons; the same store as pedacito memory",
+            "Project ▾ → Background servers…: start a named dev server "
+            "(e.g. npm run dev), tail its logs, stop it; the same engine as "
+            "pedacito serve / pedacito procs",
+            "Project ▾ → Run project checks…: run diagnose (the project's "
+            "linter/typecheck), webcheck (static web contracts) or domcheck "
+            "(headless DOM smoke, needs Playwright) on demand",
+            "Project ▾ → Prune old sessions/backups…: Preview then Prune the "
+            "oldest sessions/backups beyond the keep limits (pedacito prune)",
+            "Project ▾ → Reset project state…: preview, then wipe "
+            ".pedacito/ runtime state with Keep remembered facts / Keep "
+            "authored rules, skills & prompts checkboxes and an optional "
+            "reindex; source code and .pedacito.toml are never touched "
+            "(pedacito reset)",
+        ],
+        "keywords": ["project menu", "upkeep", "memory dialog",
+                     "background servers", "dev server", "project checks",
+                     "run checks", "prune sessions", "prune backups",
+                     "reset project", "reset project state", "wipe state",
+                     "repo lessons"],
+        "settings": ["keep_sessions", "keep_backups", "micro_facts"],
+        "cli": ["memory", "serve", "procs", "diagnose", "webcheck",
+                "domcheck", "prune", "reset"],
     },
     {
         "id": "conversation-threads",
@@ -1663,12 +1713,19 @@ GUI_TOPICS = [
     {
         "id": "run-test-gather",
         "title": "Let the model run one scoped test while it investigates",
-        "summary": "During gather the model can run a single pytest check (one test "
+        "summary": "During gather the model can run a single scoped test (one test "
                    "file or node id) and read the live traceback before it writes a "
-                   "fix. It is on by default and never runs a shell command line.",
+                   "fix. Python runs under pytest; *.test.* / *.spec.* files under "
+                   "Vitest or Node's runner, *_test.go under go test, tests/*.rs "
+                   "under cargo test. It is on by default and never runs a shell "
+                   "command line.",
         "steps": [
             "Nothing to click: the run_test action is offered when the project has "
             "tests or the task names a failure",
+            "The runner follows the target: pytest for Python, Vitest (else "
+            "node --test) for *.test.* / *.spec.*, go test for *_test.go, "
+            "cargo test --test NAME for tests/*.rs; every branch is argv-only, "
+            "workspace-contained and capped at 15 seconds",
             "⚙ Settings → All settings → search enable_run_test_in_gather (on by default)",
             "When it is off, each run_test request appears in the Permission "
             "requested dialog under Test Execution",
@@ -1677,7 +1734,8 @@ GUI_TOPICS = [
         ],
         "keywords": ["run test", "run_test", "pytest", "traceback", "live test",
                      "test in gather", "investigate", "failing test", "scoped test",
-                     "run tests during investigation"],
+                     "run tests during investigation", "vitest", "node test",
+                     "go test", "cargo test"],
         "settings": ["enable_run_test_in_gather"],
         "cli": ["tests", "ask"],
     },
@@ -1725,8 +1783,9 @@ GUI_TOPICS = [
             "A lesson confirmed twice whose files share one directory is promoted "
             "into an auto-managed path-scoped rule (.pedacito/rules/auto_<dir>.md) "
             "shown only when the model reads a file in that directory",
-            "To read or forget them, open .pedacito/micro_facts.json in your editor; "
-            "deleting the file forgets everything it recorded",
+            "To read or forget them: Project ▾ → Memory & repo lessons…, or "
+            "open .pedacito/micro_facts.json in your editor; deleting the file "
+            "forgets everything it recorded",
             "⚙ Settings → All settings → search micro_facts to turn recording and "
             "injection off, or max_micro_fact_tokens to change the budget",
         ],
@@ -1744,8 +1803,15 @@ GUI_TOPICS = [
                    "planning, answering and editing. Built for two GPUs. A scout that is "
                    "missing or unreachable falls back to the active profile.",
         "steps": [
-            "⚙ Settings → Profiles: create or select a second profile for the small "
-            "model, with its own base_url and model",
+            "Quick path: ⚙ Settings → Profiles → Dual-GPU / Scout + Architect "
+            "Pairing → pick the Architect (planner/editor) and a Scout, or "
+            "➕ Create a starter Scout profile… (second server URL, model id, "
+            "VRAM, tier) → Save pairing; it writes default_profile + "
+            "scout_profile in one comment-preserving edit",
+            "⚙ Settings → Auto-Tune → answer the dual-GPU question; when a "
+            "second card fits, the preview offers Create starter Scout & pair…",
+            "Manual path: ⚙ Settings → Profiles: create or select a second "
+            "profile for the small model, with its own base_url and model",
             "⚙ Settings → All settings → search scout_profile → choose that profile in "
             "the dropdown, or None (use active profile) to turn it off",
             "While it is active, the topbar shows a Scout: <profile> badge beside the "
@@ -1754,7 +1820,8 @@ GUI_TOPICS = [
         ],
         "keywords": ["scout", "scout profile", "scout model", "architect", "two gpus",
                      "dual gpu", "second gpu", "fast model", "lookup model",
-                     "gather model", "split models", "small model for search"],
+                     "gather model", "split models", "small model for search",
+                     "pairing", "scout pairing", "architect pairing"],
         "settings": ["scout_profile", "default_profile"],
         "cli": ["profiles", "config", "ask"],
     },
@@ -1819,20 +1886,25 @@ GUI_TOPICS = [
                    "current task, and a server not marked trusted asks the "
                    "permission broker before anything runs.",
         "steps": [
-            "Add a table to the config: [mcp_servers.docs] with "
+            "In the GUI: ⚙ Settings → MCP Servers → add a server (stdio "
+            "command + args, or an http(s) url), Test it, then enable or "
+            "trust it; servers are written to the user config, and edit or "
+            "delete them from the same tab",
+            "Or add a table to the config: [mcp_servers.docs] with "
             "command = \"python\" and args = [\"server.py\"] (or url = "
             "\"http://localhost:8000/mcp\")",
             "Set trusted = true only for a server you fully approve; "
             "otherwise every call shows a permission dialog first",
             "pedacito mcp list shows what each server exposes",
-            "In the GUI: the permission dialog arrives during the run; "
+            "During a run the permission dialog arrives in the chat; "
             "GET /api/mcp/tools serves the same listing to the interface",
             "The legacy allow_mcp + mcp_servers command list still works "
             "for the old `mcp` catalog action",
         ],
         "keywords": ["mcp", "model context protocol", "external tool",
                      "mcp server", "mcp_call", "mcp tools", "plugin",
-                     "connector", "stdio server", "http mcp"],
+                     "connector", "stdio server", "http mcp",
+                     "mcp servers tab", "add mcp server"],
         "settings": ["enable_mcp", "mcp_servers", "mcp_timeout",
                      "allow_mcp"],
         "cli": ["mcp", "trust", "config"],

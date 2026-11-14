@@ -3213,12 +3213,31 @@ def _split_command(cmd: str) -> list[str]:
 
 def _deny_error(cfg, argv: list[str]) -> str:
     """Error when the command line matches a `shell_deny` pattern (fnmatch on
-    the whole line, case-insensitive), else ''."""
-    line = " ".join(argv).lower()
-    for pat in tuple(getattr(cfg, "shell_deny", ()) or ()):
-        if fnmatch.fnmatchcase(line, pat.lower()):
-            return (f"ERROR: `{' '.join(argv)[:80]}` matches the shell_deny "
-                    f"rule `{pat}`.")
+    the whole line, case-insensitive), else ''.
+
+    The match runs on the joined line AND on normalised variants, so the
+    obvious evasions fail too: extra whitespace between arguments, and a
+    path-qualified executable (`./rm`, `/bin/rm`, `rm.exe`) against a rule
+    written for the bare name (`rm *`)."""
+    pats = tuple(getattr(cfg, "shell_deny", ()) or ())
+    if not pats or not argv:
+        return ""
+    argv = [str(a) for a in argv]
+    joined = " ".join(argv)
+    head = str(argv[0])
+    base = (PureWindowsPath(head) if "\\" in head
+            else PurePosixPath(head)).name
+    if base.lower().endswith(".exe"):
+        base = base[:-4]
+    rebased = " ".join([base, *argv[1:]])
+    lines = {joined, " ".join(joined.split()),
+             rebased, " ".join(rebased.split())}
+    for pat in pats:
+        pl = str(pat).lower()
+        for line in lines:
+            if fnmatch.fnmatchcase(line.lower(), pl):
+                return (f"ERROR: `{joined[:80]}` matches the shell_deny "
+                        f"rule `{pat}`.")
     return ""
 
 

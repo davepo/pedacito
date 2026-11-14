@@ -260,7 +260,15 @@ the checked IP so a second DNS answer cannot swap it mid-request.
 
 - **Settings** edits your user config or the project's `.pedacito.toml`. Your
   comments survive, and every edit is checked before it is saved. The **Raw
-  file / reset** tab shows the file as written.
+  file / reset** tab shows the file with every stored secret masked as
+  `***REDACTED***`; save the mask unchanged and the stored key is kept.
+- **MCP servers:** **⚙ Settings → MCP Servers** adds and manages named
+  `[mcp_servers.<name>]` tool servers (test, enable, trust, delete) without
+  hand-editing TOML.
+- **Project ▾** also holds the upkeep dialogs: **Memory & repo lessons…**,
+  **Background servers…**, **Run project checks…**, **Prune old
+  sessions/backups…** and **Reset project state…** (prune and reset preview
+  before they write).
 - **Themes:** pick a color scheme from the theme menu in the top bar. There are
   nine. The choice is saved to your config as `gui_theme`.
 - **Attach** a text file, or drag it into the chat box, to use it as the task, a
@@ -283,12 +291,16 @@ Renaming a function or variable everywhere it is used does not need a model.
 
 Strings and comments that happen to contain the old name are left alone. A parameter
 in an unrelated function that has the same name is renamed too, so read the preview.
+On the CLI, `pedacito rename OLD NEW --strings` also renames whole-word occurrences
+inside string literals (comments stay untouched); the GUI dialog has no such option.
 
 ### A16. Let the model run one scoped test
 
-While it investigates, the model can run a single test file or test id with pytest
-and read the traceback before it writes a fix. This is on by default. Nothing is run
-through a shell, and each run is capped at 15 seconds.
+While it investigates, the model can run a single scoped test and read the live
+traceback before it writes a fix. Python targets run under pytest; `*.test.*` /
+`*.spec.*` files run under Vitest (or Node's built-in runner), `*_test.go` under
+`go test`, and `tests/*.rs` under `cargo test`. This is on by default. Nothing is
+run through a shell, and each run is capped at 15 seconds.
 
 If you would rather approve each run, open **⚙ Settings → All settings**, search for
 `enable_run_test_in_gather`, set it to off, and save. Each test run then appears in
@@ -298,6 +310,15 @@ the **Permission requested** dialog under **Test Execution**.
 
 If you have a small model on a second GPU, or a lightweight server, let it do the
 lookups while the large model plans and edits.
+
+The quick path: **⚙ Settings → Profiles → Dual-GPU / Scout + Architect Pairing**.
+Pick the architect (your planner/editor profile) and a scout, or choose
+**➕ Create a starter Scout profile…** and give the second server's URL, model id,
+VRAM and tier. **Save pairing** writes `default_profile` + `scout_profile` in one
+comment-preserving edit. **⚙ Settings → Auto-Tune** also asks a dual-GPU question
+and, when a second card fits, offers **Create starter Scout & pair…**.
+
+The manual path:
 
 1. Add the small model as its own profile in **⚙ Settings → Profiles**, with its own
    server address and model.
@@ -352,6 +373,11 @@ pedacito config --doctor
 It repeats the check, then probes which structured-output modes the server
 supports, recommends a `json_mode`, reports the real context window, and checks
 whether tree-sitter is active. The answers are remembered for a week.
+
+After upgrading Pedacito, `pedacito config --upgrade` appends any newly
+documented options to your config, commented out, without touching your
+existing settings or comments. `pedacito config --upgrade --dry-run` lists
+what would be added without writing.
 
 ### B2. Find models and measure them
 
@@ -573,14 +599,17 @@ which are described in the [model guide](MODEL_GUIDE.md#how-to-measure).
 ```bash
 pedacito rename apply_discount discounted_price                        # preview the diffs
 pedacito rename apply_discount discounted_price --file pkg/core.py     # that file and its importers
+pedacito rename apply_discount discounted_price --strings              # also whole-word string literals
 pedacito rename apply_discount discounted_price --apply                # write it
 pedacito restore ~/code/anki                                           # undo it, if needed
 ```
 
 The preview is the default. With `--apply`, the originals are backed up first, so
 `pedacito restore` can undo the rename. Python, JavaScript, TypeScript, Go and Rust
-identifiers are renamed; a string or comment containing the old name is left alone.
-Every changed file must pass the syntax check, or nothing is written.
+identifiers are renamed; a string or comment containing the old name is left alone
+unless you pass `--strings`, which also renames whole-word occurrences inside
+string literals (comments still stay). Every changed file must pass the syntax
+check, or nothing is written.
 
 ---
 
@@ -703,6 +732,7 @@ only the map is stale.
 | `pedacito config --setup` | First-time setup: find servers and write profiles |
 | `pedacito config --check` | Is the server up, and does the model work? |
 | `pedacito config --doctor` | Also probe structured output, context window, tokenizer, and sandbox |
+| `pedacito config --upgrade [--dry-run]` | Add newly documented options to your config, commented out; `--dry-run` only lists them |
 | `pedacito models scan` | Find local servers or a hosted API, pick models, write profiles, measure them |
 | `pedacito calibrate` | Measure the model and save a model card that tunes defaults |
 | `pedacito profiles [--recommend]` | List profiles and their scores; suggest roles |
@@ -719,7 +749,7 @@ only the map is stale.
 | `pedacito new DIR -t "..."` | Start a project from scratch (or `--spec FILE`) |
 | `pedacito auto PROJ -t "..."` | Plan a goal, then implement it task by task |
 | `pedacito restore PROJ` | Undo the last write |
-| `pedacito rename OLD NEW [--file F] [--apply]` | Rename a symbol across the project. No model call; preview by default |
+| `pedacito rename OLD NEW [--file F] [--strings] [--apply]` | Rename a symbol across the project. No model call; preview by default; `--strings` also renames whole-word string literals |
 | `pedacito eval` | Score the harness on fixture repositories. Use `--baseline` as a gate |
 | `pedacito bench [BENCHMARK\|all]` | Run the six diagnostic benchmarks and holdout rubric. `--list`/`--recent` are free; `--json`/`--strict` for CI |
 | `pedacito memory PROJ` | List, add, or forget remembered facts |
@@ -732,6 +762,9 @@ only the map is stale.
 | `pedacito reset PROJ [--reindex]` | Wipe `.pedacito/` runtime state. Code and config stay |
 | `pedacito trust PROJ` | Approve a project's `.pedacito.toml` so its execution settings and capability toggles apply |
 | `pedacito worktree create\|list\|remove NAME` | Manage isolated git worktrees |
+| `pedacito serve --root PROJ --name web -- npm run dev` | Start a named background server for the project |
+| `pedacito procs --root PROJ [logs\|stop NAME]` | List, tail or stop the project's background servers |
+| `pedacito lsp --root PROJ --file F --line N --op definition` | Ask the project's language server for definitions, references or hover |
 
 Flags available on most commands: `--exclude 'pattern'`, `--include 'pattern'`,
 `--ext .kt`, `--steps N`, `--model ID`, `--url URL`, `--profile NAME`,

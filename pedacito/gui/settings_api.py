@@ -74,8 +74,8 @@ def file_info(which: str) -> dict:
         return {"which": which, "available": False, "error": str(e)}
     text = _read_text(path)
     info = {"which": which, "available": True, "path": str(path),
-            "exists": path.exists(), "text": text, "profiles": {},
-            "settings": {}, "error": ""}
+            "exists": path.exists(), "text": settings.redact_secrets(text),
+            "profiles": {}, "settings": {}, "error": ""}
     if text.strip():
         try:
             flat, profiles = settings.validate_text(text, str(path))
@@ -191,7 +191,13 @@ def rename_profile(which: str, old_name: str, new_name: str) -> dict:
 
 
 def save_raw(which: str, text: str) -> dict:
-    write_config(config_path(which), text)
+    """Save the raw editor's text. The view ships secrets masked as
+    `***REDACTED***`; a save that still carries the sentinel restores the
+    stored key (like the profile form's empty secret field), so editing any
+    other line never wipes -- or leaks -- the API key."""
+    path = config_path(which)
+    text = settings.restore_secrets(text, _read_text(path))
+    write_config(path, text)
     return payload()
 
 

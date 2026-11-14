@@ -20,7 +20,7 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
-from . import fileio
+from . import fileio, security
 from .index import BACKUP_DIR, SESSION_DIR, state_dir
 from .sessions import session_dir
 
@@ -222,9 +222,19 @@ def restore(root: Path, snapshot: Path, dry_run: bool = False) -> list[str]:
     root = Path(root).resolve()
     restored: list[str] = []
     for src in sorted(snapshot.rglob("*")):
-        if not src.is_file():
+        if not src.is_file() or src.is_symlink():
+            # A hand-edited snapshot must not smuggle a link to outside data
+            # into the tree (backups themselves store plain file bytes).
             continue
         rel = src.relative_to(snapshot).as_posix()
+        # Containment BEFORE the write: a directory (or the file itself) on
+        # the destination path may be a symlink aiming outside the project,
+        # and copy_file_atomic replaces through links. resolve_safe_path
+        # follows them first and refuses the escape.
+        try:
+            security.resolve_safe_path(root, rel)
+        except (security.SecurityError, OSError, ValueError, RuntimeError):
+            continue
         dest = root / rel
         restored.append(rel)
         if not dry_run:

@@ -260,6 +260,10 @@ What to expect:
 - **The GUI shows which model is the scout.** While it is active, the top bar shows
   a `Scout: <profile>` badge. In **⚙ Settings → All settings**, `scout_profile` is a
   dropdown of your profiles, with **None (use active profile)** to turn it off.
+  **⚙ Settings → Profiles → Dual-GPU / Scout + Architect Pairing** writes the pair
+  in one comment-preserving edit (and can create a starter scout profile for the
+  second server), and **Auto-Tune**'s dual-GPU answer offers
+  **Create starter Scout & pair…**.
 - **Hosted scouts send your code.** A hosted scout receives the lookup results,
   which are excerpts of your code. The same warnings that apply to hosted roles
   apply here.

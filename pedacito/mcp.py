@@ -28,6 +28,12 @@ env/enabled/trusted). `list_mcp_tools` returns descriptors,
 `cfg.max_read_tokens` tokens, and the tools layer injects only the handful of
 tools that match the current task (`relevant_tools`), asking the permission
 broker first for servers not marked `trusted`. Everything here is stdlib only.
+
+Servers are untrusted third-party code and their listings are untrusted text:
+a stdio server runs argv-only (`shell=False`) in the scrubbed `safety.child_env`
+plus ONLY its explicit `env` keys, an HTTP url must be http(s) (never file://,
+javascript: or data:), and every tool name/description is screened
+(`clean_description`) before it can reach a prompt.
 """
 
 from __future__ import annotations
@@ -44,8 +50,9 @@ import time
 import urllib.error
 import urllib.request
 from pathlib import Path
+from urllib.parse import urlparse
 
-from . import proc
+from . import proc, safety
 
 PROTOCOL_VERSION = "2024-11-05"
 _CATALOG_CACHE: dict[tuple[str, ...], list[tuple[str, str, str]]] = {}
@@ -115,18 +122,17 @@ class _Session:
         kwargs = {}
         if os.name != "nt":
             kwargs["start_new_session"] = True
-        if env:
-            child = dict(os.environ)
-            for k, v in env.items():
-                if str(k):
-                    child[str(k)] = str(v)
-            kwargs["env"] = child
+        # An MCP server is third-party code: it gets the same scrubbed
+        # environment as a model-chosen command (ambient API keys and tokens
+        # never leak into it), plus ONLY the explicit per-server `env` keys.
+        extra = {str(k): str(v) for k, v in (env or {}).items() if str(k)}
+        kwargs["env"] = safety.child_env(extra=extra)
         self.proc = subprocess.Popen(
             list(argv) if argv else _split_command(command),
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
             text=True, encoding="utf-8", errors="replace", bufsize=1,
-            **kwargs)
+            shell=False, **kwargs)
         self._next_id = 1
         threading.Thread(target=self._pump, daemon=True).start()
 
@@ -299,10 +305,10 @@ def catalog(cfg) -> list[tuple[str, str, str]]:
             s.initialize()
             result = s.request("tools/list")
             for tool in result.get("tools") or []:
-                tname = str(tool.get("name") or "").strip()
+                tname = _clean_tool_name(tool.get("name"))
                 if not tname:
                     continue
-                desc = str(tool.get("description") or "").strip()
+                desc = clean_description(tool.get("description"), limit=160)
                 schema = json.dumps(tool.get("inputSchema") or {},
                                     ensure_ascii=True)
                 out.append((f"{name}/{tname}", desc, schema))
@@ -430,10 +436,10 @@ def prompts(cfg) -> list[tuple[str, str, str]]:
         for p in (result or {}).get("prompts") or []:
             if not isinstance(p, dict):
                 continue
-            name = str(p.get("name") or "").strip()
+            name = _clean_tool_name(p.get("name"))
             if name:
                 out.append((f"{server}/{name}",
-                            str(p.get("description") or "").strip(),
+                            clean_description(p.get("description"), limit=160),
                             json.dumps(p.get("arguments") or [],
                                        ensure_ascii=True)))
         return out
@@ -447,9 +453,10 @@ def resources(cfg) -> list[tuple[str, str, str]]:
         for r in (result or {}).get("resources") or []:
             if not isinstance(r, dict):
                 continue
-            uri = str(r.get("uri") or "").strip()
+            uri = safety.strip_control(str(r.get("uri") or "")).strip()
             if uri:
-                desc = str(r.get("description") or r.get("name") or "").strip()
+                desc = clean_description(r.get("description") or r.get("name"),
+                                         limit=160)
                 out.append((f"{server}/{uri}", desc,
                             str(r.get("mimeType") or "").strip()))
         return out
@@ -686,15 +693,64 @@ def named_servers(cfg) -> dict[str, dict]:
     return out
 
 
+def http_url_error(url: str) -> str:
+    """'' when `url` is an http(s) MCP endpoint, else a one-line refusal.
+    `file://`, `javascript:`, `data:` and every other scheme must never reach
+    urllib: an MCP url is a network endpoint, not a local-file or script
+    loader, and a project config is untrusted input until `pedacito trust`."""
+    raw = str(url or "").strip()
+    try:
+        scheme = urlparse(raw).scheme.lower()
+    except ValueError:
+        return f"{raw!r} is not a parseable URL"
+    if scheme not in ("http", "https"):
+        return (f"MCP HTTP servers need an http:// or https:// url "
+                f"(got {raw!r})")
+    return ""
+
+
+# Role/markup tags an injected description could use to fake a prompt turn.
+_DESC_ROLE_TAG_RE = re.compile(
+    r"(?i)<\s*/?\s*(?:system|assistant|user|tool|instructions?|prompt)\s*>")
+_DESC_NAME_MAX = 100
+
+
+def clean_description(text: str, limit: int = 200) -> str:
+    """Screen a server-supplied tool description before it enters a prompt:
+    control characters and ANSI escapes out, whitespace collapsed, role tags
+    and instruction-like wording ('ignore previous instructions', ...)
+    defanged, and the whole line capped. A description is DATA about a tool,
+    never a channel for instructions."""
+    cleaned = safety.strip_control(str(text or ""))
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    cleaned = _DESC_ROLE_TAG_RE.sub("[filtered]", cleaned)
+    cleaned = safety.neutralize_injection(cleaned)
+    if len(cleaned) > limit:
+        cleaned = cleaned[:limit].rstrip() + "..."
+    return cleaned
+
+
+def _clean_tool_name(name: str) -> str:
+    """A tool name safe to print on one prompt line: no control characters,
+    no embedded newlines, no role tags, bounded length. A name is server-
+    supplied DATA too -- `<system>` in a name must not fake a prompt turn."""
+    cleaned = re.sub(r"\s+", " ", safety.strip_control(str(name or ""))).strip()
+    cleaned = _DESC_ROLE_TAG_RE.sub("[filtered]", cleaned)
+    return cleaned[:_DESC_NAME_MAX]
+
+
 def normalise_named_spec(body: dict) -> dict | None:
     """One raw `[mcp_servers.<name>]` body -> the runtime spec, or None when
-    it is disabled or names no transport. The GUI's add/edit dialog and the
-    one-server test probe feed unsaved bodies through the same rule, so what a
-    test shows is exactly what a run would use."""
+    it is disabled, names no transport, or names a url that is not http(s).
+    The GUI's add/edit dialog and the one-server test probe feed unsaved
+    bodies through the same rule, so what a test shows is exactly what a run
+    would use."""
     if not isinstance(body, dict) or not bool(body.get("enabled", True)):
         return None
     command = str(body.get("command") or "").strip()
     url = str(body.get("url") or "").strip()
+    if url and http_url_error(url):
+        return None
     if not command and not url:
         return None
     args = body.get("args")
@@ -721,6 +777,9 @@ class _HttpSession:
     and an SSE body reduced to the message carrying our request id."""
 
     def __init__(self, url: str, timeout: int = 30, env: dict | None = None):
+        bad = http_url_error(url)
+        if bad:
+            raise MCPError(bad)
         self.url = url
         self.timeout = max(1, timeout)
         self.env = env or {}
@@ -867,12 +926,12 @@ def _named_tools(cfg, name: str, spec: dict) -> list[dict]:
     for tool in result.get("tools") or []:
         if not isinstance(tool, dict):
             continue
-        tname = str(tool.get("name") or "").strip()
+        tname = _clean_tool_name(tool.get("name"))
         if not tname:
             continue
         schema = tool.get("inputSchema")
         out.append({"name": tname,
-                    "description": str(tool.get("description") or "").strip(),
+                    "description": clean_description(tool.get("description")),
                     "input_schema": schema if isinstance(schema, dict) else {}})
     _NAMED_TOOLS[name] = out
     _NAMED_TOOLS_TIME[name] = time.time()
@@ -914,8 +973,10 @@ def probe_named_server(name: str, body: dict,
     out = {"name": str(name), "transport": "http" if spec and spec["url"]
            else "stdio", "tools": [], "error": "", "budget": budget}
     if spec is None:
-        out["error"] = ("the server is disabled or names no transport "
-                        "(set a command or a url)")
+        bad_url = (http_url_error(body.get("url"))
+                   if isinstance(body, dict) else "")
+        out["error"] = bad_url or ("the server is disabled or names no "
+                                   "transport (set a command or a url)")
         return out
     name = str(name or "test")
     forget_server(name)
@@ -967,10 +1028,15 @@ def relevant_tools(descriptors: list[dict], task: str,
 
 
 def compact_line(d: dict) -> str:
-    """One prompt line for an injected tool: `server.name(args) -- summary`."""
+    """One prompt line for an injected tool: `server.name(args) -- summary`.
+    The description is screened again here (control chars, injection wording,
+    length): this line goes straight into the gather prompt, and a descriptor
+    may come from a cache or a caller that never ran `_named_tools`."""
     sig = signature(json.dumps(d.get("input_schema") or {}))
-    desc = re.sub(r"\s+", " ", str(d.get("description") or ""))[:120]
-    return f"  {d['server']}.{d['name']}{sig} -- {desc}"
+    desc = clean_description(d.get("description"), limit=120)
+    server = _clean_tool_name(d.get("server"))
+    name = _clean_tool_name(d.get("name"))
+    return f"  {server}.{name}{sig} -- {desc}"
 
 
 def call_mcp_tool(cfg, server_name: str, tool_name: str,

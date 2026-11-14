@@ -5,6 +5,8 @@ CLI can use them without importing the GUI package:
 
     validate_text(text)               parse + check a config file's text
     set_values(text, changes, ...)    change keys in place, keeping comments
+    redact_secrets / restore_secrets  mask API keys for the raw editor, and
+                                      restore them on an unchanged save
     remove_profile / add_profile      whole-profile edits
     rename_profile(text, old, new)    rename a table and its references
     short_name(model_id, ...)         derive a profile name from a model id
@@ -722,6 +724,105 @@ def profile_body(text: str, name: str) -> dict:
     """The raw settings written under `[profiles.NAME]` in this text."""
     _flat, profiles = validate_text(text)
     return dict(profiles.get(name, {}))
+
+
+# --- secret masking for the raw-text editor -------------------------------------
+#
+# The GUI's raw config view must never ship a literal API key to the browser.
+# Every secret assignment is shown as REDACTED_SECRET instead, and a save that
+# still carries the sentinel restores the stored value (the same "unchanged"
+# convention the profile form uses with an empty secret field).
+
+REDACTED_SECRET = "***REDACTED***"
+SECRET_KEYS = ("api_key",)
+
+
+def _secret_lines(text: str) -> tuple[list[str], str, bool]:
+    nl = "\r\n" if "\r\n" in text else "\n"
+    lines = text.replace("\r\n", "\n").split("\n")
+    trailing_nl = text.endswith("\n")
+    if trailing_nl and lines and lines[-1] == "":
+        lines.pop()
+    return lines, nl, trailing_nl
+
+
+def _secret_hits(lines: list[str], keys: tuple[str, ...]) -> list[tuple]:
+    """(region_name, key, (line, vstart, end_line, end_col)) for every
+    uncommented assignment of a secret key, in any table."""
+    hits = []
+    for region in _regions(lines):
+        for key in keys:
+            hit = _find_key(lines, region, key)
+            if hit:
+                hits.append((region["name"], key, hit))
+    return hits
+
+
+def _is_masked(lines: list[str], hit: tuple) -> bool:
+    i, vs, j, ec = hit
+    if j != i:
+        return False
+    value = lines[i][vs:ec]
+    return value in (literal(REDACTED_SECRET), "'" + REDACTED_SECRET + "'")
+
+
+def redact_secrets(text: str, keys: tuple[str, ...] = SECRET_KEYS) -> str:
+    """`text` with every secret value replaced by the REDACTED_SECRET
+    sentinel. Comments, key order and every other byte survive; an already
+    masked value is left alone, so the round trip is idempotent."""
+    lines, nl, trailing_nl = _secret_lines(text)
+    hits = _secret_hits(lines, keys)
+    if not hits:
+        return text
+    sentinel = literal(REDACTED_SECRET)
+    for _name, _key, (i, vs, j, ec) in sorted(
+            hits, key=lambda h: h[2], reverse=True):
+        if _is_masked(lines, (i, vs, j, ec)):
+            continue
+        tail = lines[j][ec:]
+        lines[i:j + 1] = [lines[i][:vs] + sentinel + tail]
+    out = nl.join(lines)
+    return out + nl if (trailing_nl or not out) else out
+
+
+def restore_secrets(text: str, old_text: str,
+                    keys: tuple[str, ...] = SECRET_KEYS) -> str:
+    """Undo `redact_secrets` for a save: every sentinel still present in
+    `text` gets the secret stored at the SAME scope (top level, profile,
+    ...) in `old_text`. A sentinel with no stored counterpart is refused --
+    the mask itself must never be written to disk as a real key. Text with
+    no sentinel is returned unchanged, even when `old_text` is unreadable."""
+    lines, nl, trailing_nl = _secret_lines(text)
+    hits = [(name, key, hit) for name, key, hit in _secret_hits(lines, keys)
+            if _is_masked(lines, hit)]
+    if not hits:
+        return text
+    try:
+        stored = tomllib.loads(old_text)
+    except (tomllib.TOMLDecodeError, TypeError):
+        stored = {}
+
+    def lookup(region_name: str, key: str):
+        table = stored
+        for part in region_name.split(SEP) if region_name else ():
+            if not isinstance(table, dict):
+                return None
+            table = table.get(part)
+        return table.get(key) if isinstance(table, dict) else None
+
+    for name, key, (i, vs, j, ec) in sorted(
+            hits, key=lambda h: h[2], reverse=True):
+        value = lookup(name, key)
+        if value in (None, ""):
+            where = f" in [{name.replace(SEP, '.')}]" if name else ""
+            raise ConfigError(
+                f"`{key}`{where} is masked as {REDACTED_SECRET} but this file "
+                f"has no stored {key} to restore. Enter a real value or "
+                "remove the line.")
+        tail = lines[j][ec:]
+        lines[i:j + 1] = [lines[i][:vs] + literal(value) + tail]
+    out = nl.join(lines)
+    return out + nl if (trailing_nl or not out) else out
 
 
 def _retarget_roles(lines: list[str], old_name: str, new_name: str) -> None:

@@ -133,6 +133,20 @@ def read_project_file(rel: str) -> dict:
     p = _within(root, rel)
     if p is None or not p.is_file():
         raise ConfigError(f"No such file in the project: {rel}")
+    if security.is_sensitive_path(p):
+        # Same gate as the model's `read` tool: secret/credential material
+        # only reaches a viewer after an explicit human approval.
+        if security.permission_broker_active():
+            allowed, msg = security.request_permission(
+                category=security.CAT_SENSITIVE_FILE,
+                action_summary=f"Read sensitive file `{rel}`",
+                detail=rel, risk_level="high", key=rel)
+            if not allowed:
+                raise ConfigError(msg)
+        else:
+            raise ConfigError(
+                f"`{rel}` is a sensitive file (secret/credential material is "
+                "never previewed without an explicit approval).")
     size = p.stat().st_size
     data = p.read_bytes()[:MAX_VIEW_BYTES]
     if b"\x00" in data[:4096]:
