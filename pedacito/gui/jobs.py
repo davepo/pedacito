@@ -185,6 +185,13 @@ class _Feed:
             self.activity("degraded: " + "; ".join(map(str, f.get("notices", []))))
         elif kind == "tests":
             self.activity(f"tests: {'passed' if f.get('ok') else 'failed'}")
+        elif kind == "specialist_routed":
+            self.activity(f"specialist router: {f.get('profile', '?')} "
+                          f"({f.get('model', '?')}) for "
+                          f"'{f.get('specialty', '?')}'")
+        elif kind == "model_swap":
+            self.activity(f"model swap: {f.get('unloaded') or '-'} -> "
+                          f"{f.get('loaded', '?')} ({f.get('elapsed_s', 0)}s)")
         elif kind == "call":
             STATE.bus.publish("usage", usage=STATE.status()["usage"])
 

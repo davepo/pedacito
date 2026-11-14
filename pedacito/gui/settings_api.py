@@ -93,9 +93,45 @@ def file_info(which: str) -> dict:
     return info
 
 
+def _specialty_hints(cfg, out: dict) -> dict:
+    """Per-profile specialty tags for the profile form: what the config sets
+    explicitly, and what the model card / name heuristics detect. Profiles
+    that only exist in a file (no project open) are covered too: their file
+    bodies are layered over the live config's profiles for the detection,
+    so a file-only profile is tagged by ITS model, not the default one."""
+    import copy
+
+    from .. import roles
+    base = cfg if cfg is not None else config_mod.Config()
+    file_profiles: dict = {}
+    for which in ("user", "project"):      # project layer wins, per key
+        for name, b in ((out.get(which) or {}).get("profiles") or {}).items():
+            file_profiles.setdefault(name, {}).update(b or {})
+    names = set(base.profiles or {}) | set(file_profiles)
+    view = copy.copy(base)
+    view.profiles = {n: dict((base.profiles or {}).get(n) or {})
+                     for n in names}
+    for n, b in file_profiles.items():
+        view.profiles[n].update(b)
+    hints: dict = {}
+    for name in sorted(names):
+        body = view.profiles.get(name) or {}
+        try:
+            explicit = list(config_mod._coerce("specialties",
+                                               body.get("specialties") or []))
+        except ConfigError:
+            explicit = []
+        try:
+            detected = list(roles.detected_specialties(view, name))
+        except Exception:
+            detected = []
+        hints[name] = {"explicit": explicit, "detected": detected}
+    return hints
+
+
 def payload() -> dict:
     cfg = STATE.cfg
-    return {
+    out = {
         "schema": settings.schema(),
         # Universal settings must always carry a concrete effective value:
         # the open project's resolved one when there is a config, else the
@@ -109,7 +145,11 @@ def payload() -> dict:
         "project": file_info("project"),
         "user_config_path": str(USER_CONFIG),
         "project_open": STATE.root is not None,
+        "specialty_tags": [{"tag": t, "label": m["label"]}
+                           for t, m in config_mod.SPECIALTIES.items()],
     }
+    out["specialty_hints"] = _specialty_hints(cfg, out)
+    return out
 
 
 def _changes_clean(changes: dict) -> dict:

@@ -660,6 +660,15 @@ function buildIndex(summarise) {
     refreshState();
   });
 }
+function setAutoRoute(on) {           // topbar toggle -> user config + reload
+  PDC.api('/api/settings/set', { file: 'user', changes: { auto_route_specialties: !!on } })
+    .then((j) => {
+      if (!j.ok) { PDC.toast(j.detail || 'could not change auto-route', true); return; }
+      PDC.toast(on ? 'Specialist auto-routing on: tasks switch to the profile whose specialty fits.'
+                   : 'Specialist auto-routing off: every task stays on the active profile.');
+      refreshState();
+    });
+}
 
 // ---- chat threads (the project's saved conversations) ----
 // Threads live in `.pedacito/gui/threads/`; the switcher in the Chat head
@@ -1815,6 +1824,22 @@ function TopBar() {
               onClick=${() => callSettings({ tab: 'all', search: 'scout_profile' })}>
           <b>Scout: ${s.scout_profile}</b>
         </span>` : null}
+        ${s.root ? html`<label class="chip" id="autoRouteChip"
+              title=${'Specialist auto-routing (auto_route_specialties): each task runs on the profile'
+                + ' whose specialty tags fit it best (model-card tags, or explicit specialties in'
+                + ' Settings \u2192 Profiles). Switches happen at task boundaries only, with a clean'
+                + ' VRAM handoff when the profiles share one local server.'}>
+          <input type="checkbox" checked=${!!s.auto_route_specialties}
+                 onChange=${(e) => setAutoRoute(e.target.checked)} />
+          <b>\u2726 Auto-route</b>
+        </label>` : null}
+        ${eng.specialist && eng.specialist.profile ? html`<span class="chip" id="specialistChip"
+              title=${'Specialist routed: profile \'' + eng.specialist.profile + '\' ('
+                + (eng.specialist.model || '?') + ') for specialty \''
+                + (eng.specialist.specialty || '?') + '\''}>
+          <b>\u2726 ${eng.specialist.profile}</b>
+          <span class="tag act">${eng.specialist.specialty}</span>
+        </span>` : null}
         <div class="tb-right">
           <button class="chip" id="indexChip" title=${idxTitle} disabled=${!!j || !s.root}
                   onClick=${(e) => { if (s.root && !j) buildIndex(!e.shiftKey); }}>
@@ -2534,6 +2559,11 @@ function ActivityPane() {
             <b>${PDC.fmtInt(eng.steps || 0)}</b></span>
           <span class="estat" title="read spans recorded in the ledger">read spans
             <b>${PDC.fmtInt(eng.read_spans || 0)}</b></span>
+          ${eng.specialist && eng.specialist.profile ? html`
+            <span class="estat" title=${'specialist routed: ' + eng.specialist.profile
+              + ' (' + (eng.specialist.model || '?') + ') for specialty \''
+              + (eng.specialist.specialty || '?') + '\''}>specialist
+              <b>${eng.specialist.profile}</b></span>` : null}
         </div>
         ${reqs.length ? html`
           <div class="eng-sec"><b>Requirement ledger</b><ol class="reqs">

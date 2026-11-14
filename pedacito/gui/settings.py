@@ -118,6 +118,22 @@ FIELD_META: dict[str, FieldMeta] = {
         description="How many n-gram tokens prompt_lookup_num_tokens asks the "
                     "server to speculate per step. Higher drafts more per "
                     "verification pass; typical values are 4 to 16."),
+    "specialties": FieldMeta(
+        label="Specialties (routing tags)",
+        description="What this profile's model is good at: toggle the "
+                    "canonical tags or add a custom lowercase slug. Empty "
+                    "lets the model card detect them (pedacito calibrate); "
+                    "an explicit list always wins. With Auto-route on, each "
+                    "task goes to the best-matching specialist at task "
+                    "boundaries."),
+    "auto_route_specialties": FieldMeta(
+        label="Auto-Route Tasks to Specialists",
+        description="Route each task to the profile whose specialties tags "
+                    "match it best, at task boundaries only (never "
+                    "mid-gather, so the KV prefix cache survives). On one "
+                    "local server the outgoing model is unloaded before the "
+                    "specialist loads; separate servers stay warm together. "
+                    "An unreachable specialist falls back to the worker."),
     "enable_mcp": FieldMeta(
         label="Enable Named MCP Servers (mcp_call)",
         description="Expose the pruned, permission-gated `mcp_call` action "

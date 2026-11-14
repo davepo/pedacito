@@ -126,6 +126,9 @@ def replan(task: str, plan_path: Path, client, cfg, failed: str,
             + "\nREMAINING (as planned)\n" + ("\n".join(left) or "(none)")
             + "\n\nWrite the revised remaining steps now.")
     from . import roles
+    specialty_note = roles.specialty_planner_note(cfg)
+    if specialty_note:
+        user += "\n\n" + specialty_note
     try:
         raw = roles.client_for(cfg, "planner", client).chat_json(
             [{"role": "system", "content": REPLAN_SYSTEM},

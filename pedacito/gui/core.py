@@ -430,6 +430,10 @@ class State:
         self.phase = ""
         self.gather_steps = 0
         self.actions: deque[dict] = deque(maxlen=60)
+        # Specialist routing (#50): the profile/model/tag of the most recent
+        # `specialist_routed` event; cleared when a model swap hands the card
+        # back to the worker's own model.
+        self.specialist: dict = {}
 
     # --- project & index auto-detect --------------------------------------------
 
@@ -876,6 +880,18 @@ class State:
             action = {"tool": "tests",
                       "detail": "passed" if f.get("ok") else "failed",
                       "ok": bool(f.get("ok"))}
+        elif kind == "specialist_routed":
+            action = {"tool": "specialist",
+                      "detail": f"{f.get('profile', '?')} "
+                                f"({f.get('model', '?')}) <- "
+                                f"{f.get('specialty', '?')}",
+                      "ok": True}
+        elif kind == "model_swap":
+            action = {"tool": "model-swap",
+                      "detail": f"{f.get('unloaded') or '-'} -> "
+                                f"{f.get('loaded', '?')} "
+                                f"({f.get('elapsed_s', 0)}s)",
+                      "ok": True}
         ping = kind in EVENT_PHASE or action is not None
         with self.lock:
             if kind in EVENT_PHASE:
@@ -887,6 +903,14 @@ class State:
                     pass
             if action is not None:
                 self.actions.append(action)
+            if kind == "specialist_routed":
+                self.specialist = {
+                    "profile": str(f.get("profile") or ""),
+                    "model": str(f.get("model") or ""),
+                    "specialty": str(f.get("specialty") or "")}
+            elif kind == "model_swap" and self.cfg is not None \
+                    and str(f.get("loaded") or "") == str(self.cfg.model or ""):
+                self.specialist = {}   # the worker got its card back
         if ping:
             self.bus.publish("status")
 
@@ -901,6 +925,7 @@ class State:
             job = self.job if self.job is not None and self.job.active else None
             actions = [dict(a) for a in self.actions][-12:]
             steps = self.gather_steps
+            specialist = dict(self.specialist)
             stats = dict(client.stats) if client is not None else {}
             if job is None:
                 phase = self.phase or "idle"
@@ -931,7 +956,8 @@ class State:
             pass
         return {"phase": phase, "steps": steps, "calls": stats.get("calls", 0),
                 "read_spans": read_spans,
-                "requirements": requirements[:8], "actions": actions}
+                "requirements": requirements[:8], "actions": actions,
+                "specialist": specialist}
 
     # --- live permission broker ----------------------------------------------
 
@@ -1378,6 +1404,9 @@ class State:
                 "gui_theme": theme,
                 "disable_thinking": bool(cfg.disable_thinking) if cfg else False,
                 "allow_steering": bool(cfg.allow_steering) if cfg else False,
+                # specialist routing (#50): the topbar toggle's state
+                "auto_route_specialties": (bool(cfg.auto_route_specialties)
+                                           if cfg else False),
                 "usage": {
                     "calls": stats.get("calls", 0),
                     "tokens_in": stats.get("prompt_tokens", 0),

@@ -822,6 +822,10 @@ def generate_tasks(spec_text: str, client, cfg,
                  "Break this into an ordered task list. Each task title must be "
                  "a single imperative sentence a coding agent can implement and "
                  "verify in isolation.")
+    from . import roles as roles_mod
+    specialty_note = roles_mod.specialty_planner_note(cfg)
+    if specialty_note:
+        base_user += "\n\n" + specialty_note
     raw = client.chat_json(
         [{"role": "system", "content": plan_system},
          {"role": "user", "content": base_user}],
@@ -3278,6 +3282,69 @@ _SEMANTIC_FAILURE_RE = re.compile(
     r"|\bmaximum call stack\b|\bstack overflow\b", re.IGNORECASE)
 
 
+def _emit_model_swap(root, cfg, swap: dict) -> None:
+    try:
+        events_mod.get(root, cfg).emit("model_swap", **swap)
+    except Exception:
+        pass
+
+
+def _specialist_route(root, cfg, client, agent, idx, task, is_repair=False):
+    """Task-boundary specialist routing (TECHNIQUES.md #50): pick the
+    profile whose specialty tags fit the task, hand the VRAM over cleanly,
+    and return the (possibly new) client and agent. Never raises: routing
+    is an optimization, and any failure keeps the worker. `agent` may be
+    None (run_loop builds it after routing); a replaced agent keeps its
+    forced-read targets."""
+    from . import roles as roles_mod
+    try:
+        if is_repair or not getattr(cfg, "auto_route_specialties", False):
+            return client, agent
+        resident = set()
+        try:
+            state = client.loaded_models() or {}
+            resident = {m for m, st in state.items() if st == "loaded"}
+        except Exception:
+            pass
+        resident.add(str(getattr(cfg, "model", "") or ""))
+        name, tag = roles_mod.select_specialist_profile(
+            task, idx, cfg, resident=resident)
+        if not name:
+            # No specialist for this task: give the card back to the worker
+            # when a previous specialist still holds it.
+            swap = roles_mod.restore_worker_client(cfg, client)
+            if swap:
+                _emit_model_swap(root, cfg, swap)
+            return client, agent
+        new_client = roles_mod.switch_specialist_client(cfg, client, name)
+        if new_client is client:
+            return client, agent
+        model = str(getattr(new_client.cfg, "model", "") or "")
+        print(f"\n[specialist router: switching worker to profile '{name}' "
+              f"({model}) for specialty '{tag}']", file=sys.stderr)
+        workspace.log_event(root, f"specialist router: profile '{name}' "
+                                  f"({model}) for specialty '{tag}'")
+        try:
+            events_mod.get(root, cfg).emit(
+                "specialist_routed", profile=name, model=model, specialty=tag)
+        except Exception:
+            pass
+        swap = getattr(new_client, "_swap_info", None)
+        if swap:
+            new_client._swap_info = None
+            _emit_model_swap(root, cfg, swap)
+        if agent is not None:
+            from .agent import Agent
+            fresh = Agent(idx, new_client, cfg)
+            fresh.task_targets = getattr(agent, "task_targets", None)
+            agent = fresh
+        return new_client, agent
+    except Exception as e:
+        print(f"  [specialist routing skipped: {str(e)[:100]}]",
+              file=sys.stderr)
+        return client, agent
+
+
 def run_task(root: Path, cfg, client, agent, idx, task: str, *,
              apply: bool = True, review: bool = False,
              answer_system: str | None = None,
@@ -3295,6 +3362,10 @@ def run_task(root: Path, cfg, client, agent, idx, task: str, *,
         cfg._static_baseline = None
         cfg._contract_baseline = None
         cfg._dom_baseline = None
+        # Standalone tasks route here; run_loop routes before it builds the
+        # agent (its _auto_step marker is set), so there is no double switch.
+        client, agent = _specialist_route(root, cfg, client, agent, idx,
+                                          task, is_repair)
     tr = _run_ladder(root, cfg, client, agent, idx, task, apply=apply,
                      review=review, answer_system=answer_system,
                      is_repair=is_repair)
@@ -4352,7 +4423,13 @@ def run_loop(root: Path, cfg, client, idx, plan_path: Path, *,
             # worker reads) and popped so it cannot leak into another task.
             task_for_agent += "\n\n" + retry_note.pop()
         try:
-            agent = Agent(idx, client, cfg)
+            # Specialist routing at the task boundary (#50): `client` stays
+            # the worker for the next task; this task may run on a
+            # specialist instead. Scored on the clean title, before the
+            # goal/context blocks are layered on.
+            task_client, _ = _specialist_route(root, cfg, client, None, idx,
+                                               task)
+            agent = Agent(idx, task_client, cfg)
             # Forced reads are mined from the clean title only: prior reports
             # mention files descriptively and would bloat the must-read list.
             agent.task_targets = task
@@ -4362,7 +4439,7 @@ def run_loop(root: Path, cfg, client, idx, plan_path: Path, *,
                     root, cfg, agent, idx,
                     task_for_agent, answer_system=answer_system)
             else:
-                tr = run_task(root, cfg, client, agent, idx,
+                tr = run_task(root, cfg, task_client, agent, idx,
                               task_for_agent, apply=apply, review=False,
                               answer_system=answer_system)
         except LLMError as e:

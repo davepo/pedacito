@@ -19,6 +19,9 @@ The suite is ~20 short, scripted calls against the configured server:
   continuation     after a lookup transcript, does it ANSWER (not emit more JSON)?
   thinking A/B     does hidden reasoning eat the whole answer budget -- and
                    does switching it off produce a usable reply?
+  specialties      three micro-probes (SVG/UI, math, translation) plus the
+                   name heuristics tag what the model is good at, for
+                   specialist profile routing (auto_route_specialties)
   capabilities     native tool calls, image input, embeddings, chars/token
 
 The result is a versioned card per `url|model` in `<config dir>/model_cards.json`
@@ -35,6 +38,7 @@ import re
 import statistics
 import sys
 import time
+import xml.etree.ElementTree as ElementTree
 from pathlib import Path
 
 from . import edits as edits_mod
@@ -118,6 +122,11 @@ def apply(cfg) -> dict | None:
         if name in ch and unset(name):
             setattr(cfg, name, ch[name])
             sources[name] = "model card"
+    # Specialty tags fill the same way: an explicit list always wins, the
+    # card only tags a profile the user left untagged.
+    if "specialties" in ch and unset("specialties"):
+        cfg.specialties = tuple(str(t) for t in ch["specialties"])
+        sources["specialties"] = "model card"
     if "chars_per_token" in (card.get("measured") or {}):
         cfg._card_cpt = card["measured"]["chars_per_token"]
     # P3 (A4.1): the capability probe records whether the server serves
@@ -581,6 +590,136 @@ def _t_capabilities(client, cfg) -> dict:
     return caps
 
 
+# ------------------------------------------------------- specialty tagging
+# Specialist routing (TECHNIQUES.md #50) needs to know what each profile's
+# model is good at. Two cheap signals, combined: the model's NAME (families
+# advertise their specialty) and three micro-probes -- one tiny call each,
+# thinking off, small caps, well under three seconds total on a local box.
+# An explicit `specialties = [...]` in the config always beats both.
+
+_SPECIALTY_THRESHOLD = 0.67
+
+
+def infer_name_specialties(model_id: str) -> list[str]:
+    """Specialty tags implied by a model's name; ["general"] when nothing
+    matches. Coder families also get testing_qa: writing code and writing
+    its tests are the same skill family."""
+    name = str(model_id or "").lower()
+    tags: list[str] = []
+    if any(w in name for w in ("coder", "codestral", "starcoder", "devstral",
+                               "code")):
+        tags += ["coding", "testing_qa"]
+    if any(w in name for w in ("math", "qwq", "r1", "reasoning")):
+        tags.append("math_algorithms")
+    if any(w in name for w in ("-vl", "vision", "pixtral", "llava", "gemma-3")):
+        tags += ["frontend_ui", "3d_graphics_svg"]
+    return tags or ["general"]
+
+
+def _score_svg(text: str) -> float:
+    """0.4 for a parseable <svg>, +0.3 for the exact viewBox, +0.3 for the
+    wheel circle's exact attributes."""
+    m = re.search(r"<svg\b.*?</svg>", text or "", re.DOTALL | re.IGNORECASE)
+    if not m:
+        return 0.0
+    try:
+        root = ElementTree.fromstring(m.group(0))
+    except ElementTree.ParseError:
+        return 0.0
+    score = 0.4
+    if root.get("viewBox") == "0 0 200 100":
+        score += 0.3
+    for el in root.iter():
+        if el.tag.split("}")[-1] != "circle":
+            continue
+        if (el.get("id") == "wheel" and el.get("cx") == "50"
+                and el.get("cy") == "50" and el.get("r") == "20"):
+            score += 0.3
+            break
+    return score
+
+
+def _t_svg_ui(client, cfg) -> tuple[float, list[str]]:
+    """Emit a small well-formed SVG with exact attributes: the shape of
+    frontend/graphics work (precise structure, not prose)."""
+    try:
+        reply = client.chat(
+            [{"role": "user", "content":
+              "Write an SVG image: an <svg> element with "
+              'viewBox="0 0 200 100" containing one '
+              '<circle id="wheel" cx="50" cy="50" r="20"/>. '
+              "Reply with the SVG only, no prose."}],
+            max_tokens=200, disable_thinking=True)
+    except LLMError as e:
+        return 0.0, [f"svg probe call failed: {str(e)[:60]}"]
+    score = _score_svg(reply or "")
+    return score, [] if score >= _SPECIALTY_THRESHOLD else \
+        ["svg probe: no well-formed SVG with the requested attributes"]
+
+
+def _t_math_algo(client, cfg) -> tuple[float, list[str]]:
+    """One exact integer computation (operator precedence + modulo)."""
+    try:
+        reply = client.chat(
+            [{"role": "user", "content":
+              "Compute (2 ** 3 ** 2) % 100 + 17 in Python. "
+              "Reply with the number only."}],
+            max_tokens=40, disable_thinking=True)
+    except LLMError as e:
+        return 0.0, [f"math probe call failed: {str(e)[:60]}"]
+    if re.search(r"\b29\b", reply or ""):
+        return 1.0, []
+    return 0.0, ["math probe: wrong answer (wanted 29)"]
+
+
+def _t_translation(client, cfg) -> tuple[float, list[str]]:
+    """Translate one sentence to Spanish, keeping the {name}/{count}
+    placeholders intact: i18n work is exactly this discipline."""
+    try:
+        reply = client.chat(
+            [{"role": "user", "content":
+              "Translate this sentence into Spanish. Keep the placeholders "
+              "{name} and {count} exactly as they are. Reply with the "
+              'translation only.\n\n"Hello {name}, your file has {count} '
+              'errors."'}],
+            max_tokens=120, disable_thinking=True)
+    except LLMError as e:
+        return 0.0, [f"translation probe call failed: {str(e)[:60]}"]
+    text = reply or ""
+    score = 0.0
+    if "{name}" in text and "{count}" in text:
+        score += 0.5
+    if "archivo" in text.lower() or "fichero" in text.lower():
+        score += 0.25
+    if "errores" in text.lower():
+        score += 0.25
+    return score, [] if score >= _SPECIALTY_THRESHOLD else \
+        ["translation probe: placeholders or Spanish wording lost"]
+
+
+def specialty_tags_from_measurements(model_id: str, measured: dict) -> list[str]:
+    """Combine name heuristics with the micro-probe scores and the harness
+    skills: edit_format AND tool_choice >= 0.75 earn coding+testing_qa, a
+    weak edit_format (< 0.5) strips coding again. `general` drops out as
+    soon as any specific tag is earned. Canonical order."""
+    from .config import SPECIALTIES
+    tags = set(infer_name_specialties(model_id))
+    if measured.get("svg_ui", 0.0) >= _SPECIALTY_THRESHOLD:
+        tags.update(("frontend_ui", "3d_graphics_svg"))
+    if measured.get("math_algo", 0.0) >= _SPECIALTY_THRESHOLD:
+        tags.add("math_algorithms")
+    if measured.get("translation", 0.0) >= _SPECIALTY_THRESHOLD:
+        tags.add("translation_i18n")
+    ed = measured.get("edit_format", 0.0)
+    if ed >= 0.75 and measured.get("tool_choice", 0.0) >= 0.75:
+        tags.update(("coding", "testing_qa"))
+    if ed < 0.5:
+        tags.discard("coding")
+    if tags - {"general"}:
+        tags.discard("general")
+    return [t for t in SPECIALTIES if t in tags] or ["general"]
+
+
 _ARM_GAIN = 0.1
 
 
@@ -651,6 +790,10 @@ def choose(measured: dict, hosted: bool) -> dict:
     ch["verify_answer"] = "full" if overall < 0.6 else "deterministic"
     # weaker models do better on one change per context window
     ch["plan_threshold"] = 2 if overall < 0.55 else 3 if overall < 0.8 else 0
+    # Specialty tags for specialist routing, computed by calibrate() from
+    # the name heuristics + the three micro-probes.
+    if measured.get("specialties"):
+        ch["specialties"] = list(measured["specialties"])
     return ch
 
 
@@ -757,6 +900,16 @@ def calibrate(client, cfg, verbose: bool = True, quick: bool = False,
     _store(measured, "edit_format_anchor", cols[0])
     notes += [f"edit-anchor: {x}" for x in n[:3]]
     say(f"  edit format, anchor-first  {measured['edit_format_anchor']:>4.0%}")
+    # Specialty micro-probes: three tiny calls, run ONCE (not repeated) so
+    # they stay under ~3s total; the tags ride on the card for routing.
+    for probe, key in ((_t_svg_ui, "svg_ui"), (_t_math_algo, "math_algo"),
+                       (_t_translation, "translation")):
+        score, pn = probe(client, cfg)
+        measured[key] = round(score, 2)
+        notes += pn
+    measured["specialties"] = specialty_tags_from_measurements(cfg.model,
+                                                               measured)
+    say("  specialties      " + ", ".join(measured["specialties"]))
     cols, n = _repeat(_t_instructions, repeats, client, cfg)
     _store(measured, "instructions", cols[0])
     notes += n
@@ -822,6 +975,9 @@ def render(card: dict) -> str:
     if card.get("_needs_recalibrate"):
         lines.append("  (v1 card: re-calibrate to record per-probe means)")
     lines.append("  choices: " + ", ".join(f"{k}={v}" for k, v in c.items()))
+    tags = m.get("specialties") or c.get("specialties")
+    if tags:
+        lines.append("  specialties: " + ", ".join(tags))
     for n in card.get("notes", [])[:6]:
         lines.append(f"  note: {n}")
     return "\n".join(lines)

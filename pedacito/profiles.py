@@ -38,6 +38,7 @@ def list_profiles(cfg) -> list[dict]:
     """One record per profile, in config order: identity plus the card-derived
     score. The card is matched on (base_url, model), exactly as `calibrate`
     keys it."""
+    from . import roles
     from .config import _guess_tier, hardware_context_tokens
     from .evalrun import eval_reports as _eval_reports
 
@@ -53,6 +54,7 @@ def list_profiles(cfg) -> list[dict]:
             "server": base_url,
             "tier": body.get("tier") or _guess_tier(name, body) or "",
             "active": name == cfg.active_profile,
+            "specialties": roles.specialties_for(cfg, name),
         }
         key = f"{(base_url or '').rstrip('/')}|{model}"
         rep = reports.get(key) if model else None
@@ -198,8 +200,8 @@ def apply_roles(text: str, recs: dict) -> str:
 def render(profiles: list[dict], recommend_rows=None) -> str:
     """The shared table. `recommend_rows` is `recommend(profiles)` when the
     caller wants the per-role suggestions appended."""
-    header = ("name", "model", "tier", "harness-fit", "eval", "tok/s",
-              "context", "status")
+    header = ("name", "model", "tier", "specialties", "harness-fit", "eval",
+              "tok/s", "context", "status")
     rows = []
     for p in profiles:
         fit = f"{p['fit']:.2f}" if p.get("fit") is not None else "-"
@@ -213,8 +215,9 @@ def render(profiles: list[dict], recommend_rows=None) -> str:
         if status == "ok":
             status = f"ok ({p['age_days']:.0f}d)"
         name = ("* " if p["active"] else "  ") + p["name"]
-        rows.append((name, p["model"] or "-", p["tier"] or "-", fit, ev, tok,
-                     ctx, status))
+        tags = ", ".join(p.get("specialties") or ()) or "-"
+        rows.append((name, p["model"] or "-", p["tier"] or "-", tags, fit, ev,
+                     tok, ctx, status))
     width = [len(h) for h in header]
     for r in rows:
         for i, cell in enumerate(r):

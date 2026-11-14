@@ -87,6 +87,13 @@ def _add_common(p, paths_nargs="+"):
                         "--role planner=big --role summarizer=tiny; repeatable "
                         "(roles: worker planner verifier summarizer repair "
                         "escalate fallback)")
+    p.add_argument("--auto-route", dest="auto_route", action="store_true",
+                   help="route each task to the specialist profile whose "
+                        "specialties tags match it best (task boundaries "
+                        "only; clean VRAM handoff on one local server)")
+    p.add_argument("--no-auto-route", dest="no_auto_route", action="store_true",
+                   help="keep every task on the active profile, even when "
+                        "auto_route_specialties is on in the config")
     p.add_argument("--record", action="store_true",
                    help="save this run's model responses to "
                         ".pedacito/replay/<stamp>.jsonl")
@@ -152,6 +159,12 @@ def _config(args) -> Config:
             raise ConfigError(f"--role {spec!r}: use ROLE=PROFILE with ROLE "
                               f"one of {', '.join(roles_mod.ROLES)}")
         cfg.roles = {**(cfg.roles or {}), role.strip(): prof.strip()}
+    if getattr(args, "auto_route", False):
+        cfg.auto_route_specialties = True
+        cfg.sources["auto_route_specialties"] = "--auto-route"
+    if getattr(args, "no_auto_route", False):
+        cfg.auto_route_specialties = False
+        cfg.sources["auto_route_specialties"] = "--no-auto-route"
     if getattr(args, "ext", None):
         cfg.extra_extensions = tuple(args.ext)
     if getattr(args, "url", None):
@@ -2421,6 +2434,13 @@ def build_parser() -> argparse.ArgumentParser:
     p_new.add_argument("--profile", metavar="NAME",
                        help="apply a [profiles.NAME] block from your config")
     p_new.add_argument("--no-review", dest="no_review", action="store_true")
+    p_new.add_argument("--auto-route", dest="auto_route", action="store_true",
+                       help="(with --complex) route each task to the "
+                            "best-matching specialist profile")
+    p_new.add_argument("--no-auto-route", dest="no_auto_route",
+                       action="store_true",
+                       help="(with --complex) keep every task on the active "
+                            "profile")
     p_new.add_argument("--refine", action="store_true",
                        help="expand the project description into a concrete, "
                             "sectioned spec (with interface contracts) before "

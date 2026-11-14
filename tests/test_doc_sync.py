@@ -10,7 +10,9 @@ The docs and the built-in `how` index must keep pace with the code:
 * the flags and GUI features added with the security pass (--strings,
   config --upgrade, the masked Raw file tab, the MCP Servers tab, the
   Scout + Architect pairing form, the Project ▾ upkeep dialogs) are
-  documented in the user-facing docs and in the how-cards.
+  documented in the user-facing docs and in the how-cards;
+* the specialist auto-routing pass (--auto-route, the ✦ Auto-route
+  topbar toggle, the specialist-routing how-card) stays documented.
 """
 from __future__ import annotations
 
@@ -117,6 +119,8 @@ FEATURE_NEEDLES = [
     ("MCP Servers", "Settings MCP Servers tab"),
     ("Dual-GPU / Scout + Architect Pairing", "Profiles pairing form"),
     ("Create starter Scout & pair…", "Auto-Tune dual-GPU pairing"),
+    ("--auto-route", "specialist auto-routing flag"),
+    ("✦ Auto-route", "Auto-route topbar toggle"),
 ] + [(label, "Project ▾ upkeep dialog") for label in PROJECT_MENU_LABELS]
 
 
@@ -154,6 +158,13 @@ def test_how_cards_cover_the_new_features():
     assert "Vitest" in gather and "cargo" in gather
     key_steps = " ".join(topics["api-key-hosted"]["steps"])
     assert "***REDACTED***" in key_steps
+    specialist = topics["specialist-routing"]
+    spec_steps = " ".join(specialist["steps"])
+    assert "✦ Auto-route" in spec_steps
+    assert "--auto-route" in spec_steps
+    assert "[specialty: TAG]" in spec_steps
+    assert "auto_route_specialties" in specialist["settings"]
+    assert "specialties" in specialist["settings"]
 
 
 def test_how_topic_references_resolve():
@@ -171,6 +182,7 @@ def test_how_topic_references_resolve():
     ("how do I add an mcp server in the gui?", "named-mcp-servers"),
     ("how do I pair a scout with the architect?", "scout-model"),
     ("how do I reset the project state?", "project-upkeep"),
+    ("how do I route tasks to specialist profiles?", "specialist-routing"),
 ])
 def test_new_topics_are_retrievable(question, topic):
     ids = [m["id"] for m in how_index.search(question)["gui"]]

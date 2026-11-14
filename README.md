@@ -105,6 +105,7 @@ Step-by-step versions, with what you should see at each point, are in
 | **Repair lessons** | A repair that fixes a failed check leaves a deduplicated, repo-specific lesson in `.pedacito/micro_facts.json`; a lesson a directory proves twice is promoted into an auto-managed path-scoped rule (`.pedacito/rules/auto_*.md`) that only shows up when the model reads that directory | [Repair lessons](#repair-lessons-and-repo-gotchas) |
 | **Symbol-level edits and rename** | Replace a whole function by name without echoing its old text, or rename a symbol across the project with no model call (`pedacito rename`) | [Editing](#editing-searchreplace-not-diffs) |
 | **Engine-enforced JSON and scout routing** | Lookup steps are constrained by the server's JSON schema support, and `scout_profile` sends the lookups to a fast model while the big model plans and edits | [Model guide](MODEL_GUIDE.md#dual-gpu--dual-model-scout--architect-routing-scout_profile) |
+| **Specialist auto-routing** | `auto_route_specialties` sends each task to the profile whose specialty tags fit it best (coder, UI/SVG, math, ...), at task boundaries only, with a clean VRAM handoff on one local server; `pedacito calibrate` detects the tags | [Specialist routing](#specialist-auto-routing) |
 
 ### The GUI workspace
 
@@ -522,6 +523,8 @@ Other useful flags: `--steps N` (lookup limit), `--strict` (exit 1 when a task
 applied edits but left a failed edit block or impacted tests still failing
 after the repair rounds), `--model`, `--url`, `--profile`,
 `--role planner=big` (route one job to another profile for this run),
+`--auto-route` / `--no-auto-route` (specialist routing per run; see
+[Specialist auto-routing](#specialist-auto-routing)),
 `--config`, `--root`, `--exclude`, `--include`, `--ext`.
 
 **Plan mode.** A task that changes three things in one context window usually
@@ -1541,6 +1544,46 @@ is a dropdown over the configured profiles (or "None (use active
 profile)"). Pairing sizes and the one-GPU caveat are in
 [MODEL_GUIDE.md](MODEL_GUIDE.md#dual-gpu--dual-model-scout--architect-routing-scout_profile).
 
+### Specialist auto-routing
+
+Roles split one task by *job*; specialist routing splits a run by *task*.
+With `auto_route_specialties = true` (the topbar's **✦ Auto-route** checkbox,
+or `--auto-route` per run; `--no-auto-route` overrides the config), each task
+goes to the profile whose `specialties` tags fit it best: a coder model for
+"refactor the parser", a vision model for "fix the button layout in
+styles.css", a reasoner for "optimize the sorting algorithm". Tasks are
+scored by keyword and by the extensions of the files they name; a
+`[specialty: TAG]` prefix in a task title forces the tag, and the planner is
+told to group same-specialty tasks so dependencies allow it.
+
+Tags come from two places, and an explicit list always wins:
+
+- `specialties = ["coding", "testing_qa"]` in a profile (in the GUI: the tag
+  pills under **⚙ Settings → Profiles → Connection & Capabilities**, plus a
+  custom-slug input). Canonical tags: `general`, `coding`, `frontend_ui`,
+  `3d_graphics_svg`, `math_algorithms`, `testing_qa`, `sql_data`,
+  `translation_i18n`; any lowercase slug (`[a-z0-9_-]+`) works too.
+- `pedacito calibrate` detects them: model-name heuristics (coder families,
+  `-vl`/vision models, `r1`/QwQ reasoners) plus three micro-probes — a
+  well-formed SVG with exact attributes, one integer computation, and a
+  placeholder-preserving Spanish translation — each one tiny call with
+  thinking off. The tags land on the card (`measured.specialties`), show in
+  `pedacito profiles` and the card render, and fill a profile's unset
+  `specialties` exactly like `prompt_pack` does.
+
+Switches happen **at task boundaries only** — never mid-gather — so the
+gather conversation's KV prefix stays cacheable on whichever server owns it
+(TECHNIQUES.md §2 and §50). On one local server the handoff is clean: the
+outgoing model is unloaded first (Ollama `keep_alive: 0`, LM Studio
+best-effort) so the specialist fits in VRAM, then loaded and warmed; profiles
+on different servers (two GPUs, or a hosted specialist) stay warm together
+with no unload. Every switch emits `specialist_routed` and `model_swap`
+events, the specialist's tokens and cost merge into the main session ledger,
+and an unreachable specialist falls back to the worker with one warning. A
+task that matches nothing — or whose winning tag the active profile already
+carries — stays put; when a previous specialist still holds the card, it is
+handed back to the worker first.
+
 A task that ends without a usable edit is also remembered in
 `.pedacito/attempts.json` (files looked at, why); a similar later task is told
 what was already tried. A success clears it. The same runs are counted per
@@ -1750,6 +1793,8 @@ config --reference` prints the annotated template. Key settings:
 | `disable_thinking` | false | Ask for non-thinking mode using the model family's switch; output blocks are stripped regardless. |
 | `default_profile` | `""` | Profile used when `--profile` isn't given. |
 | `scout_profile` | `""` | Profile whose client runs gather's lookup steps while the active (architect) profile plans and edits; empty = no scout. |
+| `specialties` | `()` | What this profile's model is good at, e.g. `["coding", "testing_qa"]`; empty = the model card detects them (name heuristics + three micro-probes). An explicit list always beats the card. See [Specialist auto-routing](#specialist-auto-routing). |
+| `auto_route_specialties` | false | Route each task to the best-matching specialist profile at task boundaries (clean VRAM handoff on one local server); `--auto-route` / `--no-auto-route` flip it per run. |
 | `prompt_pack` | `""` | `tiny` / `small` / `full` instruction density; empty = model card, then tier. |
 | `answer_mode` | `""` | `rebuild` / `continue` / `auto`; empty = model card, then `auto` (hosted) or `rebuild` (local). |
 | `compaction` | `"deterministic"` | How folded lookups are summarised: `deterministic`, `model`, or `off` (legacy per-turn clipping). |

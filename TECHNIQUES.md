@@ -1923,7 +1923,84 @@ when both attempts are proven red the first is kept. `edit_style` is restored
 afterwards, a `strategy_shift` event is logged, and the shift never recurses.
 Zero impact on green runs. Covered by `tests/test_strategy_shift.py`.
 
-## Quick reference: techniques 5, 11, 17 to 49
+### 50. Specialist auto-routing: the right model per task, with a clean VRAM handoff
+
+The scout (§28) splits one task by phase; a multi-profile setup can also split a
+run by *task*. A coder model edits better than a generalist, a vision model
+draws better SVG, a reasoning model handles the algorithm task -- but only if
+each task actually reaches that model. `auto_route_specialties` makes the
+assignment deterministic: every task is scored against the profiles' specialty
+tags, and the best fit runs it.
+
+**Tags come from three layers, explicit first.** A profile body's
+`specialties = [...]` always wins (canonical slugs from `config.SPECIALTIES` --
+`coding`, `frontend_ui`, `3d_graphics_svg`, `math_algorithms`, `testing_qa`,
+`sql_data`, `translation_i18n`, `general` -- plus any custom `[a-z0-9_-]+`
+slug). With no explicit list, the model card's measured tags stand in; with no
+card, name heuristics (`coder`/`codestral`/`starcoder`/`devstral` → coding +
+testing, `math`/`qwq`/`r1`/`reasoning` → math, `-vl`/`vision`/`pixtral`/`llava`/
+`gemma-3` → frontend + graphics). Calibration earns the measured tags with
+three micro-probes run ONCE with thinking off and small caps (under ~3 s
+total): emit an SVG with an exact `viewBox` and wheel-circle attributes
+(parsed with ElementTree, 0.4 + 0.3 + 0.3), compute `(2 ** 3 ** 2) % 100 + 17`
+(must answer 29), and translate one sentence to Spanish keeping `{name}` and
+`{count}` intact. A probe score ≥ 0.67 earns its tags; `edit_format` AND
+`tool_choice` ≥ 0.75 earn coding + testing_qa, and `edit_format` < 0.5 strips
+coding again -- a model that cannot write a valid SEARCH/REPLACE block is not
+a coding specialist, whatever its name says. The tags land in
+`card["measured"]["specialties"]` and `card["choices"]["specialties"]`, and
+`apply` fills `cfg.specialties` only when it is still the default `()`, the
+same explicit-wins rule as `prompt_pack` and `answer_mode`.
+
+**Routing happens only at task boundaries.** `loop.run_task`, `loop.run_loop`
+and the planned-run path call `roles.select_specialist_profile()` on the clean
+task title BEFORE the agent is built; a repair attempt never re-routes. That
+placement is the whole cache argument of §2 and §8: a gather conversation is an
+append-only prefix whose KV cache lives on one server, and swapping the model
+mid-gather would make every remaining step pay a full re-prefill. At a boundary
+the next task starts a fresh conversation anyway, so the swap costs nothing the
+task was not already going to pay. Scoring is deterministic: word-boundary
+keyword hits (+1 per canonical keyword list), file extensions resolved through
+`rank.task_files` with a raw-token fallback (+1), and test-file shapes
+(`test_*`, `*_test.py`, `.spec.`, `conftest.py`, +1.5 to testing_qa). A
+`[specialty: TAG]` prefix in the title forces the tag. `general` scores zero
+and never wins; no positive score, or a winning tag the active profile already
+carries, keeps the task where it is. Ties prefer a resident model, then a
+profile on a different `base_url` (no handoff needed), then the highest card
+overall.
+
+**The clean handoff.** When the chosen specialist shares the worker's LOCAL
+server, two models cannot hold the card at once: `roles.switch_specialist_client`
+unloads whoever holds it -- the worker, or the previous specialist, tracked in
+`_specialist_on_worker_server` -- via `llm.unload_model` (Ollama: POST
+`/api/generate` with `keep_alive: 0`; LM Studio: best-effort
+`/api/v0/models/unload`; 2 s timeout, failures ignored), then warms the new
+model. The handoff runs on EVERY switch, not just the first, so bouncing
+between two specialists on one card never stacks them. Profiles on different
+servers keep both models warm -- no unload, each prefix cache stays hot. A task
+that does not route while a specialist holds the worker's server triggers
+`restore_worker_client`: unload the specialist, re-warm the worker, so the next
+task starts on the model it expects. An unreachable or failing specialist
+falls back to the worker with one warning, the same soft-fail contract as the
+scout and the roles (§10); the verdict is cached on the config. One usage
+ledger: the specialist's `stats` dict, lock and `on_call` sink are shared with
+the worker BEFORE warm-up, so its tokens and cost -- warm-up included -- merge
+into the main totals.
+
+**The planner is swap-aware.** With routing on, `generate_tasks`/`replan`
+append `roles.specialty_planner_note`: the specialist list, an invitation to
+prefix titles with `[specialty: TAG]`, and a request to group same-specialty
+tasks together where dependencies allow -- every switch on one server is an
+unload/load, so clustering is throughput, but a task never moves before its
+dependencies. Each switch emits `specialist_routed` and `model_swap`
+(unloaded/loaded/elapsed_s) events plus a `[specialist router: ...]` telemetry
+line; the GUI shows the active specialist in the top bar and Activity panel
+and offers the toggle as **✦ Auto-route**, with per-profile tag pills in
+Settings → Profiles. `pedacito profiles` lists the effective tags. Covered by
+`tests/test_specialist_routing.py` (tagging, probes, scoring, handoff vs.
+dual-server, fallback, GUI endpoints).
+
+## Quick reference: techniques 5, 11, 17 to 50
 
 | Technique | Section | How to turn it off | Where you see it |
 |---|---|---|---|
@@ -1964,6 +2041,7 @@ Zero impact on green runs. Covered by `tests/test_strategy_shift.py`.
 | Shell mutations feed the task ledger | §47 | No flag (part of the gather-mutation ledger) | Post-edit hooks/impacted tests/lint run after a shell-only task; `[run] index refreshed` lines |
 | Cargo test narrowing (integration-only changes) | §48 | No flag; fires only when provably safe (`test_command` wins) | `cargo test --test NAME` in the post-edit hook and `pedacito tests` output |
 | Strategy shift when no `escalate` role exists | §49 | `auto_escalate = false` | `strategy_shift` event; one same-model retry with the edit style flipped after an escalation reason |
+| Specialist auto-routing + clean VRAM handoff | §50 | `auto_route_specialties = false` (default), or `--no-auto-route` per run | `specialist_routed` / `model_swap` events; **✦ Auto-route** in the GUI top bar; Specialties column in `pedacito profiles` |
 
 ## Techniques that exist but are not a good fit
 

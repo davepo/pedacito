@@ -635,6 +635,22 @@ class Config:
     # runs on the active profile too. An unknown or unreachable scout profile
     # warns once and behaves like "".
     scout_profile: str = ""
+    # What this profile's model is good at, e.g. ["coding", "testing_qa"].
+    # Canonical tags: general, coding, frontend_ui, 3d_graphics_svg,
+    # math_algorithms, testing_qa, sql_data, translation_i18n; custom
+    # lowercase slugs ([a-z0-9_-]+) are allowed too. Empty = let the model
+    # card detect them (`pedacito calibrate` combines name heuristics with
+    # three micro-probes); an explicit list always wins over the card. With
+    # auto_route_specialties on, each task goes to the profile whose tags
+    # best match it, at task boundaries only.
+    specialties: tuple[str, ...] = ()
+    # Route each task to the best-matching specialist profile (by the tags
+    # above) at task boundaries -- never mid-gather, so the server's KV
+    # prefix cache survives. On one local server the outgoing model is
+    # unloaded before the specialist loads (clean VRAM handoff); profiles on
+    # different servers stay warm together. Off by default; `--auto-route`
+    # flips it per run.
+    auto_route_specialties: bool = False
     # Preset tier ("tiny", "small", "medium", "large", "hosted") for a run
     # with no profile selected; profiles carry their own `tier` key.
     tier: str = ""
@@ -896,7 +912,7 @@ _TABLE_FIELDS = ("sampler", "roles", "hooks", "lsp_servers", "mcp_servers")
 _TUPLE_FIELDS = ("extra_extensions", "shell_allowlist",
                  "env_passthrough", "protected_paths", "shell_deny",
                  "browser_eval_hosts", "fetch_allowed_hosts",
-                 "sandbox_writable")
+                 "sandbox_writable", "specialties")
 
 # Settings that are a bool or a number, or None when the model card (or the
 # global value) decides. TOML has no null, so a key that is absent stays None.
@@ -995,6 +1011,85 @@ _ENUM_EMPTY_OK = ("prompt_pack", "answer_mode")
 
 class ConfigError(RuntimeError):
     """Invalid TOML, an unknown setting, a wrong type, or an unknown profile."""
+
+
+# Canonical specialty tags for specialist profile routing (TECHNIQUES.md #50).
+# Each tag carries a display label, the task keywords that score toward it,
+# and the file extensions that do the same. `general` is the catch-all label
+# for an unspecialized model: routing prefers specific tags, and a task that
+# matches nothing stays on the active profile. Custom tags are allowed too
+# (lowercase slugs); they route by an explicit `[specialty: tag]` prefix or
+# a profile's own list.
+SPECIALTIES: dict[str, dict] = {
+    "general": {
+        "label": "General",
+        "keywords": (),
+        "extensions": (),
+    },
+    "coding": {
+        "label": "Coding",
+        "keywords": ("implement", "refactor", "debug", "bug", "function",
+                     "class", "module", "code", "patch", "backend", "api"),
+        "extensions": (".py", ".js", ".ts", ".rs", ".go", ".java", ".c",
+                       ".cpp", ".h", ".cs", ".rb", ".php", ".kt", ".swift"),
+    },
+    "frontend_ui": {
+        "label": "Frontend / UI",
+        "keywords": ("ui", "frontend", "css", "html", "layout", "component",
+                     "button", "page", "responsive", "style", "styles",
+                     "dom", "react", "vue", "svelte", "tailwind"),
+        "extensions": (".html", ".css", ".scss", ".jsx", ".tsx", ".vue",
+                       ".svelte"),
+    },
+    "3d_graphics_svg": {
+        "label": "3D / graphics / SVG",
+        "keywords": ("svg", "3d", "canvas", "webgl", "shader", "render",
+                     "animation", "graphics", "sprite", "texture"),
+        "extensions": (".svg", ".glsl", ".frag", ".vert"),
+    },
+    "math_algorithms": {
+        "label": "Math / algorithms",
+        "keywords": ("algorithm", "math", "optimize", "optimization",
+                     "complexity", "recursion", "sorting", "numeric",
+                     "equation", "probability", "matrix"),
+        "extensions": (),
+    },
+    "testing_qa": {
+        "label": "Testing / QA",
+        "keywords": ("test", "tests", "testing", "pytest", "unittest",
+                     "coverage", "assert", "regression", "qa", "fixture"),
+        "extensions": (),
+    },
+    "sql_data": {
+        "label": "SQL / data",
+        "keywords": ("sql", "query", "database", "schema", "migration",
+                     "csv", "dataframe", "pandas", "etl", "postgres",
+                     "sqlite", "mysql"),
+        "extensions": (".sql", ".csv", ".parquet"),
+    },
+    "translation_i18n": {
+        "label": "Translation / i18n",
+        "keywords": ("translate", "translation", "localize", "localization",
+                     "i18n", "l10n", "locale", "locales", "spanish",
+                     "french", "german", "japanese", "multilingual"),
+        "extensions": (".po", ".pot"),
+    },
+}
+
+_SPECIALTY_SLUG_RE = re.compile(r"[a-z0-9_-]+")
+
+
+def normalize_specialty(tag, where: str = "") -> str:
+    """The canonical lowercase slug for a specialty tag ('' when empty).
+    Raises ConfigError for anything that is not [a-z0-9_-]+."""
+    slug = str(tag or "").strip().lower().replace(" ", "_")
+    if not slug:
+        return ""
+    if not _SPECIALTY_SLUG_RE.fullmatch(slug):
+        raise ConfigError(
+            f"{where}specialty tag {tag!r} must be a lowercase slug "
+            "([a-z0-9_-]+), e.g. 'coding' or 'my_custom_tag'")
+    return slug
 
 
 def _flatten(data: dict, path: Path) -> tuple[dict, dict]:
@@ -1119,6 +1214,16 @@ def _coerce(name: str, value, path: Path | None = None):
             return tuple(str(v) for v in value)
         raise ConfigError(f"{where}{name} must be a list of command strings "
                           "or [mcp_servers.<name>] tables")
+    if name == "specialties":
+        if not isinstance(value, (list, tuple)):
+            raise ConfigError(f"{where}{name} must be a list of tags, e.g. "
+                              '["coding", "testing_qa"]')
+        out: list[str] = []
+        for v in value:
+            slug = normalize_specialty(v, where)
+            if slug and slug not in out:
+                out.append(slug)
+        return tuple(out)
     if name in _TUPLE_FIELDS:
         if not isinstance(value, (list, tuple)):
             example = ('["pytest", "python"]' if name == "shell_allowlist"
@@ -2031,6 +2136,8 @@ def _parse_env(name: str, raw: str):
                     '"python", "args": ["server.py"]}}\'')
             return obj
         return tuple(x.strip() for x in raw.split(",") if x.strip())
+    if name == "specialties":
+        return _coerce(name, raw.split(","))
     if name in _TUPLE_FIELDS:
         return tuple(x.strip() for x in raw.split(",") if x.strip())
     if name in ("k_cache_quant", "v_cache_quant"):
@@ -2475,6 +2582,12 @@ TEMPLATE = '''\
 # setup: a 27B architect on a 24 GB card, a fast 9B scout on a 16 GB card.
 # scout_profile = ""    # e.g. scout_profile = "scout"
 
+# Specialist routing: tag each profile with `specialties = ["coding", ...]`
+# (or let `pedacito calibrate` detect them), then set auto_route_specialties
+# or pass --auto-route: every task goes to the best-matching specialist at
+# task boundaries, with a clean VRAM handoff on a single local server.
+# auto_route_specialties = false
+
 [universal]
 # Connection, generation, and shared hardware/workspace defaults. A profile
 # overrides any of these. See `pedacito config --reference` for the full list.
@@ -2899,6 +3012,19 @@ REFERENCE_TEMPLATE = TEMPLATE + '''
 # those jobs to other profiles. scout_profile = "scout" runs the gather lookup
 # loop on a faster profile (dual-GPU scout/architect routing) while planning,
 # answers, and edits stay on the active one.
+# specialties = ["coding", "testing_qa"] tags a profile's model with what it
+# is good at. Canonical tags: general, coding, frontend_ui, 3d_graphics_svg,
+# math_algorithms, testing_qa, sql_data, translation_i18n; custom lowercase
+# slugs ([a-z0-9_-]+) work too. Empty = the model card detects them:
+# `pedacito calibrate` combines model-name heuristics with three micro-probes
+# (SVG/UI, math, translation) and saves the tags on the card. An explicit
+# list always wins over the card. auto_route_specialties = true (or
+# --auto-route) sends each task to the best-matching specialist profile at
+# task boundaries only -- never mid-gather, so the KV prefix cache survives
+# (TECHNIQUES.md #50). A task may force a tag with a "[specialty: TAG]"
+# prefix. On one local server the outgoing model is unloaded before the
+# specialist loads (clean VRAM handoff); profiles on different servers stay
+# warm together, and an unreachable specialist falls back to the worker.
 # hooks = { post_edit = ["ruff format {file}"] }
 # runs your commands at events (see the README); in a PROJECT config, hooks,
 # mcp_servers, auto_verify and test_command only apply after `pedacito trust`.

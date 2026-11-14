@@ -331,6 +331,29 @@ If the scout cannot be reached, Pedacito falls back to the active model and show
 warning. The sizes to pair, and the one-GPU caveat, are in the
 [model guide](MODEL_GUIDE.md#dual-gpu--dual-model-scout--architect-routing-scout_profile).
 
+### A18. Route each task to a specialist model
+
+A scout splits one task by *job*; specialist routing splits a run by *task*: the
+coder profile takes "refactor the parser", the vision profile takes "fix the button
+layout", the reasoner takes "optimize the sorting algorithm".
+
+1. Tag your profiles: **⚙ Settings → Profiles → [select one] → Connection &
+   Capabilities → specialties** — toggle the tag pills (Coding, Frontend / UI,
+   3D / graphics / SVG, Math / algorithms, Testing / QA, SQL / data,
+   Translation / i18n), or type a custom lowercase tag and press Enter. Leave it
+   empty to let the model card decide: `pedacito calibrate` detects tags from the
+   model name plus three micro-probes (SVG, math, translation), and the form shows
+   what it detected.
+2. Turn routing on with the **✦ Auto-route** checkbox in the topbar (or
+   `auto_route_specialties = true` in the config).
+
+Switches happen between tasks, never mid-investigation. On one GPU the outgoing
+model is unloaded before the specialist loads, so both fit in VRAM one after the
+other; on two GPUs (or with a hosted specialist) both stay loaded. The Activity
+panel shows which specialist is running, and an unreachable one falls back to the
+active model with a warning. On the CLI: `--auto-route` per run, `--no-auto-route`
+to override the config.
+
 ---
 
 ## Part B: the CLI
@@ -389,7 +412,10 @@ This finds local servers on any port, lets you pick models, writes one profile
 per model, and measures each one with a quick calibration. The calibration
 probes tool choice, JSON output, edit format, resistance to planted prompt
 injections, honesty about what was read, long-context retrieval, and whether
-hidden reasoning eats the answer budget. The result is saved as a model card.
+hidden reasoning eats the answer budget. It also detects the model's
+**specialties** (name heuristics plus three micro-probes: SVG/UI, math,
+translation) for specialist routing — see A18. The result is saved as a model
+card.
 
 Useful flags:
 
@@ -663,6 +689,14 @@ To send only the lookup steps to a smaller profile, set `scout_profile` to its n
 for example `scout_profile = "scout"` in `[universal]`. The active profile still
 plans, answers and edits. The [model guide](MODEL_GUIDE.md#dual-gpu--dual-model-scout--architect-routing-scout_profile)
 explains how to pair the sizes.
+
+To send whole *tasks* to specialist profiles instead, tag each profile with
+`specialties = ["coding", ...]` (or let `pedacito calibrate` detect the tags) and
+set `auto_route_specialties = true`, or pass `--auto-route` to `ask`, `auto` or
+`new --complex`. Each task then runs on the best-matching profile, switching only
+at task boundaries; on one local server the previous model is unloaded first so
+the next one fits in VRAM. `--no-auto-route` keeps everything on the active
+profile. A task title prefixed `[specialty: TAG]` forces that specialty.
 
 ---
 

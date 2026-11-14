@@ -171,6 +171,12 @@ COMMON_FLAGS = [
      "help": "stop before the next call at N prompt+completion tokens"},
     {"flag": "--role ROLE=PROFILE",
      "help": "route one job to another profile; repeatable"},
+    {"flag": "--auto-route",
+     "help": "route each task to the specialist profile whose specialties "
+             "tags match it best (task boundaries only)"},
+    {"flag": "--no-auto-route",
+     "help": "keep every task on the active profile, even when "
+             "auto_route_specialties is on in the config"},
     {"flag": "--record",
      "help": "save model responses to .pedacito/replay/<stamp>.jsonl"},
     {"flag": "--replay FILE",
@@ -1826,6 +1832,42 @@ GUI_TOPICS = [
         "cli": ["profiles", "config", "ask"],
     },
     {
+        "id": "specialist-routing",
+        "title": "Route tasks to specialist profiles (auto_route_specialties)",
+        "summary": "With auto-routing on, each task runs on the profile whose "
+                   "specialty tags fit it best: a coder model for code tasks, a "
+                   "vision model for UI/SVG work, a reasoner for math. Tags come "
+                   "from the model card (calibrate probes) or an explicit "
+                   "specialties list, which always wins. Switches happen at task "
+                   "boundaries only -- never mid-gather -- and on one local "
+                   "server the outgoing model is unloaded first so the "
+                   "specialist fits in VRAM. Profiles on different servers stay "
+                   "warm together.",
+        "steps": [
+            "Tag your profiles: ⚙ Settings → Profiles → [Select Profile] → "
+            "Connection & Capabilities → specialties → toggle the tag pills "
+            "(or type a custom lowercase slug and press Enter)",
+            "Or let pedacito calibrate detect the tags: three micro-probes "
+            "(SVG/UI, math, translation) plus the model name; the card shows "
+            "them under specialties",
+            "Turn routing on: the ✦ Auto-route checkbox in the topbar, or "
+            "auto_route_specialties = true in config.toml, or --auto-route "
+            "per run (--no-auto-route overrides the config)",
+            "Plans can prefix a task with [specialty: TAG] to force a "
+            "specialist; the planner groups same-specialty tasks to avoid "
+            "extra VRAM swaps",
+            "The Activity panel and the topbar show which specialist is "
+            "running; an unreachable specialist falls back to the worker "
+            "with one warning",
+        ],
+        "keywords": ["specialist", "specialties", "auto route", "auto-route",
+                     "specialty routing", "route tasks", "coder model",
+                     "model per task", "vram handoff", "model swap",
+                     "unload model", "task routing"],
+        "settings": ["auto_route_specialties", "specialties", "use_model_card"],
+        "cli": ["profiles", "calibrate", "ask", "auto"],
+    },
+    {
         "id": "json-schema-enforcement",
         "title": "Engine-enforced JSON for lookup steps (enforce_json_schema)",
         "summary": "Pedacito asks the model server to constrain every lookup step to the "
@@ -1983,6 +2025,10 @@ _SETTING_GUI = {
     "review": "⚙ Settings → Profiles → [Select Profile] → Connection & "
               "Capabilities → review",
     "default_profile": "⚙ Settings → Profiles → [Select Profile] → Make default",
+    "specialties": "⚙ Settings → Profiles → [Select Profile] → Connection & "
+                   "Capabilities → specialties (tag pills + custom tag)",
+    "auto_route_specialties": "Topbar → ✦ Auto-route checkbox, or ⚙ Settings "
+                              "→ All settings → search auto_route_specialties",
     "gui_theme": "Topbar → theme dropdown, or ⚙ Settings → All settings → "
                  "Graphical interface → gui_theme",
     "disable_thinking": "⚙ Settings → Profiles → [Select Profile] → Reasoning "
@@ -2112,6 +2158,11 @@ _SETTING_KEYWORDS = {
     "enforce_json_schema": ["json schema", "grammar", "structured output",
                             "json grammar", "response_format"],
     "scout_profile": ["scout", "two gpus", "fast lookup model", "architect"],
+    "specialties": ["specialty", "specialist", "tags", "coding model",
+                    "what is this model good at", "model tags"],
+    "auto_route_specialties": ["auto route", "auto-route", "specialist routing",
+                               "route tasks", "model per task", "vram handoff",
+                               "model swap"],
     "micro_facts": ["lessons", "gotchas", "anti patterns", "repo facts",
                     "remember commands", "micro facts"],
     "max_micro_fact_tokens": ["lesson budget", "micro fact budget"],

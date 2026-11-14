@@ -281,6 +281,80 @@ one more setting to keep in sync with your profiles.
 
 ---
 
+## Specialist auto-routing (`auto_route_specialties`)
+
+Where the scout splits one task by *phase* (lookups vs. judgement), specialist
+routing splits a run by *task*: each task goes to the profile whose specialty
+tags fit it best. A coder model takes the implementation tasks, a vision model
+takes the SVG/layout tasks, a reasoning model takes the algorithm tasks. Turn it
+on with `auto_route_specialties = true`, or `--auto-route` on `ask`, `auto` and
+`new` (`--no-auto-route` forces it off for one run). The GUI has a **✦ Auto-route**
+checkbox in the top bar.
+
+Routing needs at least two profiles. Each profile carries specialty tags, from
+three sources, in this order of precedence:
+
+1. **Explicit:** `specialties = ["coding", "testing_qa"]` in the profile body
+   always wins. Tags are lowercase slugs; besides the canonical set
+   (`general`, `coding`, `frontend_ui`, `3d_graphics_svg`, `math_algorithms`,
+   `testing_qa`, `sql_data`, `translation_i18n`) you may use custom ones
+   (`[a-z0-9_-]+`).
+2. **Measured:** the model card's specialty tags, from calibration (below).
+3. **Name heuristics:** with no card, the model name stands in — `coder`,
+   `codestral`, `starcoder`, `devstral` imply coding + testing; `math`, `qwq`,
+   `r1`, `reasoning` imply math/algorithms; `-vl`, `vision`, `pixtral`, `llava`,
+   `gemma-3` imply frontend + graphics. Everything else is `general`.
+
+`pedacito profiles` shows the effective tags in its **Specialties** column, and
+in the GUI, **Settings → Profiles** lets you toggle the canonical tags, add a
+custom one, and see what the card detected for each profile.
+
+How a task is matched: a `[specialty: TAG]` prefix in the task title forces the
+tag (the planner is told to use it). Otherwise the title is scored on keywords
+("refactor", "svg", "translate", …) and on the file extensions it names
+(`.css` → frontend, `.sql` → data, a `test_*.py` shape → testing). The profile
+with a winning tag takes the task; ties prefer a model already loaded, then a
+profile on a different server, then the higher card score. A task with no
+positive match — and any task whose winning tag the active profile already
+carries — stays where it is. `general` never wins a match.
+
+What to expect:
+
+- **Switches happen only at task boundaries**, never inside a gather
+  conversation. The gather transcript keeps its prefix cache on whichever
+  server owns it (TECHNIQUES.md §2 and §8); routing cannot make a task pay a
+  mid-conversation re-prefill.
+- **One local server: a clean VRAM handoff.** When the specialist shares the
+  worker's local `base_url`, Pedacito unloads the outgoing model first (Ollama
+  gets `keep_alive: 0`; LM Studio a best-effort unload), then warms the new one,
+  so the two models never fight for the same VRAM. The Activity log and the
+  event stream record a `model_swap` with what was unloaded, what loaded, and
+  how long it took. When the next task routes back to the worker, the worker is
+  re-warmed the same way.
+- **Different servers: both stay warm.** Profiles on separate `base_url`s (a
+  second GPU, or a hosted endpoint) need no handoff; each keeps its own cache.
+- **An unreachable specialist is not an error.** The router warns once and runs
+  the task on the worker, exactly like the scout and the other roles.
+- **One usage ledger.** The specialist's tokens and cost — warm-up included —
+  merge into the same totals as the worker's. The GUI's top bar and Activity
+  panel show which specialist is active.
+- **Hosted specialists send your code.** The same warnings that apply to hosted
+  roles apply here.
+
+The planner sees the specialist list when routing is on, and is asked to prefix
+tasks with `[specialty: TAG]` and to group same-specialty tasks together where
+dependencies allow — every switch on a single server costs an unload/load, so
+fewer switches is a faster run.
+
+On one GPU, measure before you rely on it: each switch pays a model reload, so
+routing pays off when tasks cluster by specialty (a batch of UI tasks, then a
+batch of test tasks), not when they alternate. With a second server the switches
+are free and the split is the natural one. Calibrate each specialist
+(`pedacito calibrate --profile <name>`) so its tags come from measurements, and
+compare `pedacito eval` before and after turning routing on.
+
+---
+
 ## Engine-enforced JSON by server (`enforce_json_schema`)
 
 Each gather step is a JSON object with a fixed set of fields. With
@@ -482,10 +556,18 @@ Calibration runs a scripted set of probes:
   answered with thinking on and off.
 - **Native tool calls:** the same scenarios through the model's tool-call channel,
   compared with the JSON grammar.
+- **Specialty micro-probes:** three tiny checks, run once with thinking off —
+  emit a well-formed SVG with exact attributes (frontend/graphics), compute one
+  exact integer expression (math/algorithms), and translate a sentence to
+  Spanish without touching its `{name}`/`{count}` placeholders (i18n). A score
+  of 0.67 or better earns the matching tags; strong edit-format and tool-choice
+  scores (both ≥ 0.75) earn coding + testing, and a weak edit format (< 0.5)
+  takes coding away. Together with the name heuristics they become the card's
+  `specialties`, which specialist auto-routing uses (above).
 
-Each probe runs three times by default, or once with `--quick`. The card records
-the mean and the spread, so the decisions come from an average, not one lucky
-reply.
+Each probe runs three times by default, or once with `--quick` (the specialty
+micro-probes always run once, to stay under a few seconds). The card records the
+mean and the spread, so the decisions come from an average, not one lucky reply.
 
 The card sets these values:
 
@@ -495,6 +577,7 @@ The card sets these values:
 - `tool_mode`, `grammar` or `native`
 - `fuzzy_match` and `edit_style`
 - `disable_thinking`, when the thinking A/B shows the model needs it off
+- `specialties`, the tags specialist auto-routing matches tasks against
 
 Only settings you left at their defaults follow the card. Anything you set
 explicitly still wins. `pedacito config` shows the card and whether it is in use.

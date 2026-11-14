@@ -7,7 +7,7 @@
 
   var COMMON = ['base_url', 'api_key', 'model', 'tier', 'vram_gb', 'json_mode', 'timeout',
     'allow_write', 'allow_shell', 'allow_browser', 'allow_screenshots', 'semantic_search', 'review',
-    'scout_profile', 'enforce_json_schema'];
+    'scout_profile', 'specialties', 'enforce_json_schema'];
   // Profile overrides that the editor surfaces up front, in their own boxed
   // group: how the model thinks, plans, and lands edits (see modelcard.choose
   // \u2014 these are exactly the keys a calibration writes into a profile).
@@ -103,6 +103,50 @@
         onchange(el.value === '__inherit__' ? null : el.value);
       });
       return el;
+    }
+    if (item.name === 'specialties') {
+      // Specialty routing tags: toggle the canonical pills, type a custom
+      // slug. No tags selected -> null drops the key, so the model card
+      // detects them again (an explicit list always beats the card).
+      var canon = (X.data && X.data.specialty_tags) || [];
+      var sel = (value === undefined || value === null) ? [] : (value || []).slice();
+      var wrap = h('div', { class: 'spec-tags' });
+      function emit() { onchange(sel.length ? sel.slice() : null); }
+      function pill(tag, label) {
+        var b = h('button', { type: 'button', title: tag,
+          class: 'spec-pill' + (sel.indexOf(tag) >= 0 ? ' on' : ''), text: label });
+        b.addEventListener('click', function () {
+          var i = sel.indexOf(tag);
+          if (i >= 0) sel.splice(i, 1); else sel.push(tag);
+          b.classList.toggle('on', i < 0);
+          emit();
+        });
+        return b;
+      }
+      canon.forEach(function (t) { wrap.appendChild(pill(t.tag, t.label)); });
+      sel.forEach(function (t) {
+        if (!canon.some(function (c) { return c.tag === t; })) wrap.appendChild(pill(t, t));
+      });
+      var custom = h('input', { type: 'text', class: 'small', spellcheck: false,
+        placeholder: 'custom tag \u2014 lowercase slug, then Enter' });
+      custom.addEventListener('keydown', function (ev) {
+        if (ev.key !== 'Enter') return;
+        ev.preventDefault();
+        var t = custom.value.trim().toLowerCase().replace(/\s+/g, '_');
+        if (!t) return;
+        if (!/^[a-z0-9_-]+$/.test(t)) { PDC.toast('Tags use lowercase letters, digits, - and _', true); return; }
+        if (sel.indexOf(t) < 0) { sel.push(t); wrap.appendChild(pill(t, t)); emit(); }
+        custom.value = '';
+      });
+      var out = h('div', {}, wrap, h('div', { style: 'margin-top:6px' }, custom));
+      if (inheritLabel) {
+        var hint = ((X.data && X.data.specialty_hints) || {})[X.profile];
+        var det = (hint && hint.detected) || [];
+        out.appendChild(h('div', { class: 'help',
+          text: det.length ? 'Card-detected: ' + det.join(', ') + ' \u2014 applies while no tags are set here.'
+                           : 'No tags set: the model card (or the model name) decides.' }));
+      }
+      return out;
     }
     if (t === 'bool' || item.choices) {
       var opts = t === 'bool' ? [['true', 'on'], ['false', 'off']]

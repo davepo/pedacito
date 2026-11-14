@@ -534,6 +534,37 @@ def _is_local_server(cfg) -> bool:
                                    "vllm", "lmstudio", "ollama"))
 
 
+def unload_model(client) -> str:
+    """Ask a LOCAL server to evict `client`'s model from VRAM, so the next
+    model can load on the same card (the clean handoff of specialist
+    routing, TECHNIQUES.md #50). Returns the model id when the server
+    acknowledged the unload, else "" -- the caller proceeds to warmup()
+    either way, which loads the new model and surfaces any real failure.
+
+    Ollama: POST /api/generate {"model": ..., "keep_alive": 0} is the
+    documented unload. LM Studio: POST /api/v0/models/unload, best-effort.
+    Lemonade and other runtimes have no unload endpoint: "" and the load
+    itself does the eviction. Hosted APIs are never touched."""
+    cfg = getattr(client, "cfg", None)
+    if cfg is None or not _is_local_server(cfg):
+        return ""
+    model = str(getattr(cfg, "model", "") or "")
+    if not model:
+        return ""
+    root = _server_root(cfg.base_url)
+    headers = getattr(client, "headers", None) or {}
+    for url, payload in (
+            (root + "/api/generate", {"model": model, "keep_alive": 0}),
+            (root + "/api/v0/models/unload", {"model": model})):
+        try:
+            r = requests.post(url, headers=headers, json=payload, timeout=2)
+        except Exception:
+            continue
+        if r.status_code == 200:
+            return model
+    return ""
+
+
 def _schema_example(schema: dict) -> str:
     """One well-formed dummy object for `schema`: the few-shot example shown
     when structured output degrades to plain JSON prompting."""
