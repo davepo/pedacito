@@ -27,6 +27,7 @@ import argparse
 import fnmatch
 import os
 import sys
+import time
 from pathlib import Path
 
 from . import config
@@ -134,6 +135,11 @@ def _config(args) -> Config:
     cfg = load_config(root=_root(args), explicit=getattr(args, "config", None),
                       profile=getattr(args, "profile", None),
                       require_hardware=(getattr(args, "cmd", "") != "config"))
+    # BUG-1007: "pre-existing" means "red before THIS run started" — a
+    # failure the run itself just wrote into the ledger must never come back
+    # labelled a baseline. Process start, not config-load time, so an
+    # in-chat config reload cannot launder the run's own fresh failures.
+    cfg._run_started = _PROCESS_START
     if getattr(args, "no_refs", False):
         cfg.include_references = False
     if getattr(args, "jsonl", False) or getattr(args, "rpc", False) or \
@@ -2163,6 +2169,7 @@ def _configure_stdio() -> None:
             pass
 
 
+_PROCESS_START = time.time()   # BUG-1007: "pre-existing" = red before this
 _LOCKED: list = []        # project roots this process holds the run lock for
 
 

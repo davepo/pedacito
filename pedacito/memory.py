@@ -844,6 +844,7 @@ def observe_command(root, command: str, ok: bool, cfg=None,
         fact["contradictions"] = int(fact.get("contradictions", 0) or 0) + 1
         fact["last_seen"] = now
         fact["last_ok"] = False
+        fact.setdefault("first_fail_seen", now)   # BUG-1007
         doc["facts"].remove(fact)
         doc["retired"] = (doc["retired"] + [fact])[-_MAX_MICRO_FACTS:]
         _write_json(micro_facts_file(root), doc)
@@ -863,6 +864,10 @@ def observe_command(root, command: str, ok: bool, cfg=None,
         pending["successes"] = int(pending.get("successes", 0) or 0) + 1
     else:
         pending["failures"] = int(pending.get("failures", 0) or 0) + 1
+        # BUG-1007: when the failure FIRST happened, not just when it was
+        # last seen. A command that went red during the current run has no
+        # right to be called "pre-existing" by that same run's second try.
+        pending.setdefault("first_fail_seen", now)
     pending["text"] = _pending_fact_text(command, kind,
                                          pending["successes"],
                                          pending["failures"])
@@ -886,24 +891,43 @@ def observe_command(root, command: str, ok: bool, cfg=None,
     return promoted
 
 
-def command_was_failing(root, command: str) -> bool:
+def command_was_failing(root, command: str,
+                        before: float | None = None) -> bool:
     """True when the recorded history shows this exact command's most recent
     run FAILED -- consulted BEFORE running it again, so a failure the repo
     already had is not attributed to the current edit (baseline-aware test
     verdicts). Looks across pending, live and retired rows: a command that
     never earned a fact still leaves a pending failure trail. No history (or
-    no root) answers False -- the first failure is always treated as news."""
+    no root) answers False -- the first failure is always treated as news.
+
+    BUG-1007: with `before` (the current run's start), a failure whose FIRST
+    red outcome was recorded during this run does not count as pre-existing.
+    Run 3 of the chiptune build proved the laundering: attempt 1 ran the
+    worker-invented `make test`, recorded a failure, and the very next repair
+    round called its own fresh failure "pre-existing (recorded before this
+    run)" and skipped repairing it. Rows without a first-fail stamp (older
+    ledgers) fall back to `last_seen`, conservatively keeping the old answer."""
     if not root:
         return False
     command, fact_id = _command_identity(command)
     if not command:
         return False
     doc = _facts_doc(root)
+    latest = None
     for rows in (doc["pending"], doc["facts"], doc["retired"]):
         for row in rows:
             if row.get("fact_id") == fact_id:
-                return row.get("last_ok") is False
-    return False
+                if (latest is None
+                        or float(row.get("last_seen", 0))
+                        >= float(latest.get("last_seen", 0))):
+                    latest = row
+    if latest is None or latest.get("last_ok") is not False:
+        return False
+    if before is not None:
+        ts = latest.get("first_fail_seen", latest.get("last_seen", 0))
+        if ts >= before:
+            return False
+    return True
 
 
 def render_micro_facts(root, cfg=None, limit: int | None = None) -> str:

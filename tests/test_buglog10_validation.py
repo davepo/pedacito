@@ -249,3 +249,143 @@ def test_auto_cli_stamps_test_consent(tmp_path, monkeypatch):
     args.verify = "make build"
     cli._cmd_auto(args, _cfg(), None, idx, tmp_path)
     assert seen.get("consent", False) is False
+
+
+# -- BUG-1007: a run's own fresh failures are not a baseline ------------------
+
+
+def test_command_was_failing_scoped_to_run_start(tmp_path):
+    import time as _time
+
+    from pedacito import memory
+    cmd = "make test"
+    run_start = _time.time()
+    memory.observe_command(tmp_path, cmd, False, _cfg(micro_facts=True),
+                           kind="test")
+    # The red outcome was recorded DURING this run: not pre-existing.
+    assert not memory.command_was_failing(tmp_path, cmd, before=run_start)
+    # The next run legitimately inherits it as a baseline.
+    assert memory.command_was_failing(tmp_path, cmd,
+                                      before=_time.time() + 1)
+    # Unscoped reads keep the old contract (eval, legacy callers).
+    assert memory.command_was_failing(tmp_path, cmd)
+
+
+def test_second_failure_in_same_run_not_laundered(tmp_path, monkeypatch):
+    """Chiptune run 3, task 1: attempt 2 ran the worker-invented `make test`
+    once (red), then called the SAME red outcome "pre-existing (recorded
+    before this run)" and skipped repairing it -- the task's own failure
+    laundered into a baseline by the run's own ledger write."""
+    import time as _time
+
+    from pedacito import memory, testsel
+
+    idx = types.SimpleNamespace(root=tmp_path)
+    cfg = _cfg(micro_facts=True, test_command="pytest -q")
+    cfg._run_started = _time.time()
+    monkeypatch.setattr(testsel, "impacted_tests", lambda i, ch: [])
+    monkeypatch.setattr(testsel, "narrow_command",
+                        lambda *a, **k: ("pytest -q", False))
+
+    def fake_run(root, cfg_, command):
+        memory.observe_command(root, command, False, cfg_, kind="test")
+        return False, "1 failed"
+
+    monkeypatch.setattr(testsel, "run_command", fake_run)
+    _ok1, _out1, desc1 = testsel.run_impacted(idx, cfg, ["app.py"])
+    ok2, _out2, desc2 = testsel.run_impacted(idx, cfg, ["app.py"])
+    assert ok2 is False
+    assert "pre-existing" not in desc1 and "pre-existing" not in desc2
+    # Without a run stamp (eval flows) the old baseline reading survives.
+    cfg2 = _cfg(micro_facts=True, test_command="pytest -q")
+    _ok3, _out3, desc3 = testsel.run_impacted(idx, cfg2, ["app.py"])
+    assert "pre-existing" in desc3
+
+
+# -- BUG-1008: "NOT RUN" must blame the knob that is actually missing ---------
+
+
+def test_granted_but_undetected_command_says_so(tmp_path, monkeypatch,
+                                                capsys):
+    from pedacito import testsel
+
+    monkeypatch.setattr(testsel, "detect_test_command",
+                        lambda root, cfg=None: "")
+    agent = types.SimpleNamespace(_repair_from_findings=lambda *a, **k: "")
+    loop._post_edit_tests(
+        tmp_path, _cfg(verify_tests=True, allow_shell=False,
+                       test_command="pytest -q"), agent,
+        types.SimpleNamespace(root=tmp_path), "make pytest pass",
+        [], "", None, None, [])
+    err = capsys.readouterr().err
+    assert "tests: NOT RUN" in err and "no test command was detected" in err
+    assert "allow_shell is off" not in err
+
+
+# -- BUG-1009: an unlaunchable check is retired, not repaired ------------------
+
+
+def test_run_loop_retires_unlaunchable_verify(tmp_path, monkeypatch, capsys):
+    """`auto --verify "pytest -q"` run OUTSIDE the venv: `/bin/sh: line 1:
+    pytest: command not found` reached the repair ladder, burned model repair
+    rounds per task, and the ratchet rolled valid steps back over a PATH
+    problem no edit can fix (run 3, task 1 -- the model itself proposed the
+    right answer: the binary is missing)."""
+    plan = tmp_path / "PLAN.md"
+    loop.write_plan(plan, "build it", ["Add helper", "Add second module"])
+    idx = types.SimpleNamespace(root=tmp_path)
+
+    def fake_run_task(root, cfg, client, agent, idx_, task, apply=True,
+                      review=False, answer_system=None, is_repair=False):
+        (tmp_path / "helper2.py").write_text("x = 1\n", encoding="utf-8")
+        return loop.TaskResult(
+            [types.SimpleNamespace(ok=True, file="helper2.py")],
+            "reply", True, ["helper2.py"], idx_)
+
+    monkeypatch.setattr(loop, "run_task", fake_run_task)
+    calls: list = []
+
+    def fake_verify(root, cmd, *a, **kw):
+        calls.append(cmd)
+        return False, "/bin/sh: line 1: pytest: command not found"
+
+    monkeypatch.setattr(loop, "run_verify", fake_verify)
+    code = loop.run_loop(tmp_path, _cfg(), None, idx, plan, apply=True,
+                         verify="pytest -q", repair_rounds=2)
+    err = capsys.readouterr().err
+    assert code == 0
+    assert "verification check retired" in err
+    assert len(calls) == 1                      # not re-broken per task
+    assert (tmp_path / "helper2.py").exists()   # step NOT rolled back
+
+
+def test_scaffold_command_not_found_is_environment(tmp_path):
+    from pedacito import scaffold
+    assert scaffold._environment_issue(
+        "/bin/sh: line 1: pytest: command not found")
+    assert scaffold._environment_issue(
+        "'pytest' is not recognized as an internal or external command")
+    assert not scaffold._environment_issue("AssertionError: 1 == 2")
+
+
+# -- BUG-1010: a named-cause 400 is not an acceleration rejection -------------
+
+
+def test_accel_denial_respects_the_named_cause():
+    """`test_unrelated_400_on_plain_does_not_loop` passed only when another
+    test had warmed the endpoint-keyed denial cache: standalone, the plain
+    rung's 400 -- whose body named `response_format`, not `cache_prompt` --
+    was charged to the acceleration keys, flipped the cap and re-sent the
+    request (4 calls, not the documented 3)."""
+    from pedacito.config import Config
+    from pedacito.llm import LLMClient
+
+    cfg = Config()
+    cfg.model = "bug1010-isolated"
+    c = LLMClient(cfg)
+    named = RuntimeError('server returned 400: {"error": "response_format '
+                         'is not valid here"}')
+    assert not c._deny_accel_caps({"cache_prompt": True}, named)
+    ours = RuntimeError('server returned 400: {"error": "unexpected key '
+                        'cache_prompt"}')
+    assert c._deny_accel_caps({"cache_prompt": True}, ours)

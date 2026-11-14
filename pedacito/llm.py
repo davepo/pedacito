@@ -2193,6 +2193,16 @@ class LLMClient:
             if n > 0:
                 payload[_ACCEL_LOOKUP_KEY] = n
 
+    # BUG-1010: a 400 that NAMES a different optional feature was rejected
+    # for that feature, not for the acceleration keys. Charging it to
+    # cache_prompt flipped the cap, re-sent the request, and turned the
+    # documented "unrelated 400 raises as-is" rung into a fourth call --
+    # hidden in full-suite runs by the process-global denial cache the
+    # preceding tests warm up, visible the moment one runs standalone.
+    _ACCEL_FOREIGN_HINTS = (
+        "response_format", "json_schema", "json_object", "tools",
+        "tool_choice", "messages", "temperature", "grammar")
+
     def _deny_accel_caps(self, payload: dict, err: Exception) -> bool:
         """Handle a status rejection that may be caused by the acceleration
         keys: flip the attached-but-unproven ones off for this (base_url,
@@ -2209,6 +2219,10 @@ class LLMClient:
         if not any(low.startswith(f"server returned {code}")
                    for code in ("400", "422")):
             return False
+        if (any(h in low for h in self._ACCEL_FOREIGN_HINTS)
+                and not any(k in low for k in (_ACCEL_CACHE_KEY,
+                                               _ACCEL_LOOKUP_KEY))):
+            return False     # the server told us what it actually disliked
         caps = _accel_caps(self.cfg.base_url, self.cfg.model)
         names = {_ACCEL_CACHE_KEY: "cache", _ACCEL_LOOKUP_KEY: "lookup"}
         fresh = [k for k in attached if caps.get(names[k], True)]

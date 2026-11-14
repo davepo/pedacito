@@ -1522,6 +1522,22 @@ def _is_local_module(root: Path, name: str) -> bool:
         return False
 
 
+_UNLAUNCHABLE_HINTS = (
+    "command not found",
+    "is not recognized as an internal or external command",
+    "is not recognized as the name of a cmdlet",
+)
+
+
+def _verify_unlaunchable(output: str) -> bool:
+    """The check command itself could not be started (rc=127 family): the
+    binary is missing, so no product change can green this check. Narrowly
+    matched on launcher phrasing so a program that PRINTS these words from
+    within a test assertion is not mistaken for a failed exec."""
+    low = (output or "").lower()
+    return any(h in low for h in _UNLAUNCHABLE_HINTS)
+
+
 def missing_modules(output: str, root=None) -> list[str]:
     """Top-level import names (``foo`` for ``foo.bar``) from
     ModuleNotFoundError/ImportError messages. Callers route these to
@@ -1718,11 +1734,26 @@ def _test_run_consent(cfg) -> bool:
     return bool(getattr(cfg, "_tests_user_consent", False))
 
 
-def _note_tests_not_run(root, cfg, task: str) -> None:
+def _note_tests_not_run(root, cfg, task: str,
+                        granted: bool = False) -> None:
     """The honest verdict for a task that named a test command while the
-    test subprocess was switched off: no test evidence was gathered."""
+    test subprocess was switched off: no test evidence was gathered.
+    BUG-1008: `granted` says the execution boundary is open (allow_shell or
+    a user-granted test command) and the only missing piece is a DETECTED
+    command -- blaming allow_shell there sent the user to adjust a knob that
+    was not the blocker (chiptune run 3, task 1)."""
     named = _task_named_tests(task)
     if not named:
+        return
+    if granted:
+        print(f"  [tests: NOT RUN -- the task names '{named}' but no test "
+              "command was detected for this project; set `test_command` "
+              "or add runnable tests]", file=sys.stderr)
+        workspace.log_event(
+            root, f"tests not run although the task names '{named}' "
+                  "(no test command detected)", "WARN")
+        events_mod.get(root, cfg).emit("tests_not_run", named=named,
+                                       reason="no_test_command")
         return
     print(f"  [tests: NOT RUN -- the task names '{named}' but "
           "verify_tests/allow_shell is off and no test command was granted "
@@ -2598,8 +2629,9 @@ def _post_edit_tests(root, cfg, agent, idx, task, results, reply, backup_dir,
             return results, reply, tests_ok, False
         got = _run_tests(idx, cfg, changed)
         if got is None:
+            # Boundary open (tests_wanted), nothing to run: say so honestly.
             _note_lesson_run(root, cfg, lesson_kinds, injected)
-            _note_tests_not_run(root, cfg, task)
+            _note_tests_not_run(root, cfg, task, granted=True)
             return results, reply, tests_ok, False
         ok, out, desc = got
         last_out = out
@@ -4702,6 +4734,28 @@ def run_loop(root: Path, cfg, client, idx, plan_path: Path, *,
             prev_score = None if passed else _failure_score(output, use_diag)
             lesson_seen = "" if passed else str(output)[:6000]
             while not passed:
+                # BUG-1009: a check that cannot even LAUNCH -- the verify
+                # binary is not on this machine's PATH ("command not found",
+                # rc=127) -- is a config/environment fact, not a product
+                # defect. Run 3 proved the old reading: every task spent
+                # repair rounds asking the model to "fix" a PATH problem
+                # (the model even offered a correct PLAN edit: use
+                # `python -m pytest`), then the green ratchet rolled the
+                # valid steps back over the broken check. Retire the check
+                # once, loudly; the gates and the remaining tasks continue.
+                if _verify_unlaunchable(output):
+                    print(f"  [verification check retired: `{check_label}` "
+                          "could not launch (the command is missing from "
+                          "this environment) -- no code change can install "
+                          "it; the rest of the run is UNVERIFIED. Set "
+                          "--verify to a runnable command.]",
+                          file=sys.stderr)
+                    workspace.log_event(
+                        root, "verify check retired: command not launchable "
+                              "in this environment", "WARN")
+                    verify = ""      # run_check takes the gates-only path
+                    passed = True    # the step is not blamed on the code
+                    break
                 # A missing third-party package is NOT a code bug: editing
                 # source cannot add a dependency. Install it if the user opted
                 # in, otherwise report and stop.

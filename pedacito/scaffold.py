@@ -1430,6 +1430,14 @@ _ENV_ISSUE_HINTS = (
     "no display name", "cannot open display", "could not connect to display",
     "unable to open display", "tclerror: no display", "no x11 display",
     "xdg_runtime_dir is not set",
+    # BUG-1009: the verify binary itself missing (rc=127 family). Run 3 of
+    # the chiptune build ran `pytest -q` outside the venv, got
+    # "/bin/sh: line 1: pytest: command not found", and pedacito sent the
+    # failure to the MODEL to "repair" -- rounds of tokens spent teaching a
+    # 27B worker to edit code to fix a PATH problem the workspace cannot
+    # touch. An unlaunchable command is the environment's, always.
+    "command not found",
+    "is not recognized as an internal or external command",
 )
 
 
