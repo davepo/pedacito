@@ -884,20 +884,31 @@ def list_mcp_tools(cfg) -> list[dict]:
     return out
 
 
+def _relevance_tokens(text: str) -> set[str]:
+    """Lowercase word tokens plus their underscore-split parts, so a task
+    mentioning `encode frame` matches a tool named `encode_frame` and a task
+    saying `encode_frame` still matches a tool described with plain words."""
+    out: set[str] = set()
+    for tok in re.findall(r"[a-z0-9_]+", (text or "").lower()):
+        out.add(tok)
+        out.update(p for p in tok.split("_") if p)
+    return out
+
+
 def relevant_tools(descriptors: list[dict], task: str,
                    limit: int = 4) -> list[dict]:
     """The few injected descriptors whose server/tool/description words
     appear in the task text, most matches first; ties keep listing order. An
     empty task or no matches returns nothing: the point of the prune is that
     the model never sees a tool the task cannot need."""
-    words = {w for w in re.findall(r"[a-z0-9_]{4,}", (task or "").lower())}
+    words = {w for w in _relevance_tokens(task) if len(w) >= 4}
     if not words:
         return []
     scored: list[tuple[int, int, dict]] = []
     for i, d in enumerate(descriptors):
         hay = " ".join((str(d.get("server", "")), str(d.get("name", "")),
                         str(d.get("description", "")))).lower()
-        toks = set(re.findall(r"[a-z0-9_]+", hay))
+        toks = _relevance_tokens(hay)
         score = len(words & toks)
         if score:
             scored.append((-score, i, d))

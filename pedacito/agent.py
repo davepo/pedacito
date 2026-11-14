@@ -2715,6 +2715,15 @@ class Agent:
                 detail = ((stepjson.get("command") or "")
                           + (f" [{stepjson.get('pattern')}]"
                              if stepjson.get("pattern") else ""))
+            elif action == "mcp_call":
+                # BUG-1103: the generic file/pattern/symbol fallback is empty
+                # for mcp_call; name the server.tool so the step log and the
+                # events file can answer "which tool ran at step N".
+                detail = (f"{stepjson.get('server') or '(no server)'}."
+                          f"{stepjson.get('tool') or '(no tool)'}")
+            elif action == "lsp":
+                detail = (f"{stepjson.get('symbol') or 'definition'} "
+                          f"{stepjson.get('file') or '(no file)'}")
             self.steps_log.append(f"{step}. {action} {detail}  ({why})")
             if on_step is not None:
                 try:
