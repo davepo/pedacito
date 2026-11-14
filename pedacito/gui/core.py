@@ -1070,10 +1070,14 @@ class State:
     # --- review -------------------------------------------------------------
 
     def stage_review(self, rv_args: dict) -> Review:
+        # Publish the transcript before exposing `self.review`. A polling
+        # client treats "review is pending" as "the transcript already says
+        # so": if the review became visible first, `/api/state` could return
+        # the card without the "Staged changes..." line (the two are read by
+        # separate calls in the state handler).
         with self.lock:
             self._rid += 1
             rv = Review(self._rid, **rv_args)
-            self.review = rv
         n = len([d for d in rv.diffs if not d.removed_source])
         msg = self.add_message("review", rv.task, review_id=rv.id, files=n,
                                outcome="")
@@ -1083,6 +1087,8 @@ class State:
         self.add_message("assistant",
                          f"Staged changes across {n} file(s) for review.",
                          kind="review_staged", review_id=rv.id, files=n)
+        with self.lock:
+            self.review = rv
         self.bus.publish("review", id=rv.id)
         return rv
 

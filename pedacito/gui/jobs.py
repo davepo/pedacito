@@ -89,7 +89,8 @@ def spawn(kind: str, title: str, fn, *, echo=None) -> Job | None:
             # just saw, including anything the throttled saves held back
             STATE.save_active_thread(force=True)
 
-    job.thread = threading.Thread(target=worker, daemon=True)
+    job.thread = threading.Thread(target=worker, daemon=True,
+                                  name=f"pedacito-gui-job-{job.id}")
     job.thread.start()
     return job
 

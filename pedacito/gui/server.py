@@ -649,7 +649,8 @@ def _term_clear(q, body):
 
 @post("/api/shutdown")
 def _shutdown(q, body):
-    threading.Thread(target=shutdown_server, daemon=True).start()
+    threading.Thread(target=shutdown_server, daemon=True,
+                     name="pedacito-gui-shutdown").start()
     return 200, {"ok": True}
 
 

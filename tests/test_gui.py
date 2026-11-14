@@ -4,7 +4,9 @@ the fake OpenAI-compatible server (no model or GPU needed)."""
 import http.client
 import json
 import os
+import random
 import re
+import shutil
 import socket
 import subprocess
 import sys
@@ -91,6 +93,73 @@ class Client:
         return None
 
 
+GUI_THREAD_PREFIX = "pedacito-gui-"
+
+
+def _live_gui_threads():
+    """Daemon workers this fixture started that are still running."""
+    current = threading.current_thread()
+    return [t for t in threading.enumerate()
+            if t is not current and t.is_alive()
+            and t.name.startswith(GUI_THREAD_PREFIX)]
+
+
+def _stop_gui_job(timeout=5):
+    """Cancel a job left by a test, release a parked review, and join both."""
+    with core.STATE.lock:
+        job = core.STATE.job
+        rv = core.STATE.review
+    if rv is not None:
+        rv.done.set()              # unblock a runner parked on the review
+    if job is not None:
+        try:
+            jobs.stop_job()        # raises KeyboardInterrupt in a spinning job
+        except Exception:
+            pass
+        job.cancelled = True
+        thread = job.thread
+        if thread is not None and thread is not threading.current_thread():
+            thread.join(timeout)
+    for thread in _live_gui_threads():
+        thread.join(timeout)
+
+
+def _clear_thread_store(tmp_path):
+    """Remove saved chats for the project-less scope and this test's root."""
+    dirs = [core.threads_dir(None)]
+    with core.STATE.lock:
+        root = core.STATE.root
+    if root is not None:
+        try:
+            if Path(root).resolve().is_relative_to(Path(tmp_path).resolve()):
+                dirs.append(core.threads_dir(root))
+        except (OSError, ValueError):
+            pass
+    for path in dirs:
+        shutil.rmtree(path, ignore_errors=True)
+
+
+def _reset_gui_state(tmp_path, *, teardown=False):
+    """Stop workers and replace STATE; on teardown also leave it empty."""
+    _stop_gui_job()
+    try:
+        core.STATE.bus.close()
+    except Exception:
+        pass
+    _clear_thread_store(tmp_path)
+    core.STATE.__init__()          # fresh bus, transcript, review and job slot
+    if teardown:
+        with core.STATE.lock:
+            core.STATE.job = None
+            core.STATE.review = None
+            core.STATE.messages = []
+            core.STATE._mid = 0
+            core.STATE.threads = {}
+            core.STATE.thread_id = ""
+        core.STATE.bus.close()
+        _clear_thread_store(tmp_path)
+
+
 @pytest.fixture
 def gui(tmp_path, monkeypatch):
     """A fresh GUI server on a free port with an isolated config directory."""
@@ -101,9 +170,10 @@ def gui(tmp_path, monkeypatch):
     monkeypatch.setattr(core, "RECENT_FILE", tmp_path / "cfg" / "gui_recent.json")
     for var in [k for k in os.environ if k.startswith("PEDACITO_")]:
         monkeypatch.delenv(var)
-    core.STATE.__init__()
+    _reset_gui_state(tmp_path)
     srv = server.create_server(0)
-    thread = threading.Thread(target=srv.serve_forever, daemon=True)
+    thread = threading.Thread(target=srv.serve_forever, daemon=True,
+                              name=GUI_THREAD_PREFIX + "server")
     thread.start()
     core.install_runner()
     c = Client(srv.server_address[1])
@@ -114,10 +184,11 @@ def gui(tmp_path, monkeypatch):
     srv.shutdown()
     srv.server_close()
     core.uninstall_runner()
-    # let any job thread notice the shutdown before the next test resets STATE
-    job = core.STATE.job
-    if job is not None and job.thread is not None:
-        job.thread.join(5)
+    thread.join(5)
+    _reset_gui_state(tmp_path, teardown=True)
+    # A test that leaked a daemon worker must fail here, not in the next test.
+    assert not thread.is_alive()
+    assert not _live_gui_threads(), [t.name for t in _live_gui_threads()]
 
 
 # --- how / help -----------------------------------------------------------------
@@ -384,7 +455,7 @@ def test_steer_requires_a_running_job(gui):
 
 def _staged(gui, applied):
     root = gui.tmp / "r"
-    root.mkdir()
+    root.mkdir(exist_ok=True)       # a test may stage twice in a row
     (root / "a.txt").write_text("one\ntwo\n", encoding="utf-8")
     (root / "b.txt").write_text("alpha\n", encoding="utf-8")
     from pedacito import edits
@@ -483,6 +554,105 @@ def test_a_staged_review_is_broadcast_with_its_diff_in_the_state(gui):
     assert (root / "a.txt").read_text(encoding="utf-8") == "ONE\ntwo\n"
     assert "Applied changes to 1 file(s)" in [m["text"] for m in
                                               gui.get("/api/state")[1]["messages"]]
+
+
+def test_staged_review_survives_dirty_global_state_and_repeated_polls(gui, monkeypatch):
+    """A pending review must carry its transcript line even when earlier tests
+    left a job and saved threads behind, config loading auto-syncs the file,
+    and /api/state is polled while staging is still in progress."""
+    announcement = "Staged changes across 2 file(s) for review."
+    real_add = core.STATE.add_message
+    gate = {"on": False, "started": threading.Event(),
+            "release": threading.Event()}
+
+    def gated_add(role, text="", **extra):
+        # Hold the announcement back, so a poll can reach the moment the old
+        # code exposed `review` before this line existed in the transcript.
+        if gate["on"] and text.startswith("Staged changes across"):
+            gate["started"].set()
+            assert gate["release"].wait(10), "announcement was never released"
+        return real_add(role, text, **extra)
+
+    monkeypatch.setattr(core.STATE, "add_message", gated_add)
+
+    def stale_thread():
+        directory = core.threads_dir(core.STATE.root)
+        directory.mkdir(parents=True, exist_ok=True)
+        tid = "%032x" % random.randrange(1 << 128)
+        (directory / f"{tid}.json").write_text(json.dumps({
+            "id": tid, "title": "stale test chat", "created_at": 0,
+            "updated_at": 0, "profile": "", "title_custom": False,
+            "messages": [{"role": "assistant", "content": "stale",
+                          "ts": 0}]}), encoding="utf-8")
+
+    def auto_sync_config():
+        gui.cfg_path.parent.mkdir(parents=True, exist_ok=True)
+        gui.cfg_path.write_text("[universal]\nvram_gb = 8\n", encoding="utf-8")
+        config_mod.load(root=gui.tmp, use_env=False, require_hardware=False,
+                        warn_budgets=False)
+
+    def pollute(seed):
+        steps = [
+            lambda: core.STATE.add_message("assistant", "stale transcript"),
+            lambda: core.STATE.new_thread(),
+            stale_thread,
+            auto_sync_config,
+            lambda: [gui.get("/api/state") for _ in range(3)],
+        ]
+        if seed is not None:
+            random.Random(seed).shuffle(steps)
+        core.STATE.job = core.Job(900 + (seed or 0), "task", "stale job")
+        for step in steps:
+            step()
+
+    def run_once(seed):
+        pollute(seed)
+        gate["on"] = True
+        gate["started"].clear()
+        gate["release"].clear()
+        result = {}
+
+        def stage():
+            try:
+                result["staged"] = _staged(gui, [])
+            except BaseException as exc:       # surface it on the test thread
+                result["error"] = exc
+
+        worker = threading.Thread(target=stage, daemon=True)
+        worker.start()
+        try:
+            assert gate["started"].wait(10), "staging never announced the review"
+            during = gui.get("/api/state")[1]
+        finally:
+            gate["release"].set()
+        worker.join(10)
+        gate["on"] = False
+        if "error" in result:
+            raise result["error"]
+        assert not worker.is_alive()
+        # The state seen while the announcement was held back must not claim a
+        # pending review without also showing its transcript line.
+        if during["review"] and during["review"]["pending"]:
+            assert announcement in [m["text"] for m in during["messages"]]
+        _root, thread, out = result["staged"]
+        try:
+            for _ in range(10):
+                state = gui.get("/api/state")[1]
+                assert state["review"] and state["review"]["pending"]
+                assert announcement in [m["text"] for m in state["messages"]]
+            rid = gui.get("/api/review")[1]["review"]["id"]
+            assert gui.post("/api/review/decide",
+                            {"id": rid, "action": "reject"})[0] == 200
+        finally:
+            thread.join(10)
+        assert out["res"][0] == "cancelled"
+        assert announcement in [m["text"] for m in
+                                gui.get("/api/state")[1]["messages"]]
+
+    # Twice in a row (the CI sequence), then with the dirty-state events in
+    # several deterministic shuffled orders, like neighbouring test files.
+    for seed in (None, None, 0, 1, 2):
+        run_once(seed)
 
 
 def test_a_rejected_review_says_so_and_writes_nothing(gui):
