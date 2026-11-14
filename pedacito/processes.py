@@ -9,9 +9,10 @@
 
 The registry lives under `.pedacito/procs/`: one JSON record per process and a
 `.log` file with its combined stdout/stderr. PIDs are process-group leaders, so
-`stop` reaps descendants too. This is deliberately a small, local-first manager:
-no daemon, no sockets -- just enough to start a server, find its printed URL,
-read its log, and stop it later.
+`stop` reaps descendants too; on Windows, which has no process groups, the child
+is put in a named job object that plays the same role (see `_job_wrap`). This is
+deliberately a small, local-first manager: no daemon, no sockets -- just enough
+to start a server, find its printed URL, read its log, and stop it later.
 """
 
 from __future__ import annotations
@@ -23,6 +24,7 @@ import shlex
 import signal
 import subprocess
 import time
+import uuid
 from pathlib import Path
 
 from . import browser, proc, safety
@@ -30,6 +32,10 @@ from .index import state_dir
 
 PROC_DIR = "procs"
 _NAME_RE = re.compile(r"[^A-Za-z0-9_.-]+")
+# How much of the log a URL re-scan reads: enough for a banner printed long
+# after `serve_wait` expired, bounded so a server that has been chatty for
+# hours is never slurped whole by a GUI that polls the registry.
+_LOG_TAIL_BYTES = 16384
 
 
 def _dir(root) -> Path:
@@ -153,14 +159,17 @@ def start(root, command, *, name: str = "", cfg=None,
                            stdout=fh, stderr=subprocess.STDOUT)
     except (OSError, ValueError) as e:
         rec = {"name": name, "command": command_text, "pid": 0,
-               "cwd": str(root), "log": str(log), "url": "",
+               "cwd": str(root), "log": str(log), "url": "", "job": "",
                "started": time.time(), "status": "error",
                "error": str(e)[:400]}
         _write_record(root, rec)
         return rec
     _CHILDREN[p.pid] = p
+    # On Windows this must happen before the child can spawn anything: a
+    # descendant created later inherits job membership (see `_job_wrap`).
+    job = _job_wrap(p.pid, name)
     rec = {"name": name, "command": command_text, "pid": p.pid,
-           "cwd": str(root), "log": str(log), "url": "",
+           "cwd": str(root), "log": str(log), "url": "", "job": job,
            "started": time.time(), "status": "running"}
     # Give a dev server a moment to print its URL. Never block a run for long:
     # `wait` is a ceiling, and a command that exits is reported immediately.
@@ -171,10 +180,7 @@ def start(root, command, *, name: str = "", cfg=None,
             rec["returncode"] = p.returncode
             _forget_child(p.pid)
             break
-        try:
-            text = log.read_text(encoding="utf-8", errors="replace")[-16000:]
-        except OSError:
-            text = ""
+        text = _log_tail(rec)
         url = browser.find_server_url(text)
         if url:
             rec["url"] = url
@@ -182,6 +188,38 @@ def start(root, command, *, name: str = "", cfg=None,
         time.sleep(0.1)
     _write_record(root, rec)
     return rec
+
+
+def _log_tail(rec: dict) -> str:
+    """The last few kilobytes of a record's log, without reading the whole file."""
+    path = Path(str(rec.get("log") or ""))
+    try:
+        with path.open("rb") as fh:
+            fh.seek(0, os.SEEK_END)
+            fh.seek(max(0, fh.tell() - _LOG_TAIL_BYTES))
+            data = fh.read()
+    except (OSError, ValueError):
+        return ""
+    return data.decode("utf-8", errors="replace")
+
+
+def _refresh_url(rec: dict) -> bool:
+    """Recover a URL the server printed after `start` stopped waiting.
+
+    `serve_wait` bounds how long a run may block, not how long the server has
+    to boot: `npm run dev` on a cold cache (or a dev server held up by a slow
+    reverse-DNS lookup inside its own framework) happily prints its URL after
+    the budget is gone. The record used to stay url-less forever, so the
+    registry, the GUI and the `serve` observation all kept saying nothing even
+    though the address was sitting in the log. Find it on the next look.
+    """
+    if rec.get("url") or rec.get("status") == "error":
+        return False
+    url = browser.find_server_url(_log_tail(rec))
+    if not url:
+        return False
+    rec["url"] = url
+    return True
 
 
 def list_procs(root) -> list[dict]:
@@ -192,8 +230,13 @@ def list_procs(root) -> list[dict]:
         rec = _read_record(path)
         if not rec:
             continue
+        stale = False
         if rec.get("status") == "running" and not _alive(int(rec.get("pid") or 0)):
             rec["status"] = "exited"
+            stale = True
+        if _refresh_url(rec):
+            stale = True
+        if stale:
             _write_record(root, rec)
         out.append(rec)
     out.sort(key=lambda r: float(r.get("started") or 0), reverse=True)
@@ -247,15 +290,134 @@ def _group_alive(pgid: int) -> bool:
     return True
 
 
-def _terminate_pid(pid: int) -> None:
-    if pid <= 0:
-        return
-    if os.name == "nt":
+# --- Windows: a job object is the process group we do not have --------------
+# POSIX spawns each server as a session leader, so `killpg` reaches every
+# descendant -- including one whose leader already exited. Windows has no such
+# id: `taskkill /T` walks a LIVE parent-child chain, so a launcher that exits
+# first (`npm run dev` spawning the real server, a wrapper script, a re-exec)
+# leaves its child holding the port forever while `stop` reports success. A
+# named kernel job object fixes exactly that: every process the server later
+# spawns inherits membership, and TerminateJobObject reaps them all -- from any
+# pedacito process, because the object lives as long as it has members.
+_JOB_TERMINATE = 0x0008
+_SYNCHRONIZE = 0x00100000
+_PROCESS_SET_QUOTA = 0x0100
+_PROCESS_TERMINATE = 0x0001
+
+_K32: object | None = None
+_K32_STATE = "unloaded"
+
+
+def _kernel32():
+    """kernel32's job-object entry points, wired up once; None off Windows.
+
+    Behind a function (not a module-level WinDLL) so this file stays importable
+    and testable on POSIX, and so tests can substitute a fake.
+    """
+    global _K32, _K32_STATE
+    if os.name != "nt":
+        return None
+    if _K32_STATE == "unloaded":
+        _K32_STATE = "failed"
         try:
-            subprocess.run(["taskkill", "/F", "/T", "/PID", str(pid)],
-                           capture_output=True, timeout=10, check=False)
-        except (OSError, subprocess.SubprocessError):
-            pass
+            import ctypes
+            from ctypes import wintypes
+
+            k = ctypes.WinDLL("kernel32", use_last_error=True)
+            k.CreateJobObjectW.argtypes = [ctypes.c_void_p, wintypes.LPCWSTR]
+            k.CreateJobObjectW.restype = wintypes.HANDLE
+            k.OpenJobObjectW.argtypes = [wintypes.DWORD, wintypes.BOOL,
+                                         wintypes.LPCWSTR]
+            k.OpenJobObjectW.restype = wintypes.HANDLE
+            k.AssignProcessToJobObject.argtypes = [wintypes.HANDLE,
+                                                   wintypes.HANDLE]
+            k.AssignProcessToJobObject.restype = wintypes.BOOL
+            k.TerminateJobObject.argtypes = [wintypes.HANDLE, wintypes.UINT]
+            k.TerminateJobObject.restype = wintypes.BOOL
+            k.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL,
+                                      wintypes.DWORD]
+            k.OpenProcess.restype = wintypes.HANDLE
+            k.CloseHandle.argtypes = [wintypes.HANDLE]
+            k.CloseHandle.restype = wintypes.BOOL
+            _K32, _K32_STATE = k, "loaded"
+        except Exception:                   # pragma: no cover - no WinDLL
+            _K32 = None
+    return _K32
+
+
+def _close_handle(k, handle) -> None:
+    try:
+        if handle:
+            k.CloseHandle(handle)
+    except Exception:                       # pragma: no cover - best effort
+        pass
+
+
+def _job_wrap(pid: int, name: str) -> str:
+    """Put the just-spawned child in its own named job; '' when that failed.
+
+    Every step is best effort: without a job, `stop` still gets `taskkill /T`,
+    which reaps the tree whenever the leader is still alive.
+    """
+    k = _kernel32()
+    if k is None or pid <= 0:
+        return ""
+    # Local\ rather than Global\: the global namespace needs a privilege we may
+    # not hold, and a server started in one logon session is only ever stopped
+    # from that same session.
+    job = f"Local\\pedacito-{_safe_name(name)}-{pid}-{uuid.uuid4().hex[:8]}"
+    hjob = hproc = None
+    try:
+        hjob = k.CreateJobObjectW(None, job)
+        if not hjob:
+            return ""
+        hproc = k.OpenProcess(_PROCESS_SET_QUOTA | _PROCESS_TERMINATE,
+                              False, pid)
+        if not hproc:
+            return ""                       # it already exited: nothing to reap
+        if not k.AssignProcessToJobObject(hjob, hproc):
+            return ""
+        return job
+    except Exception:                       # pragma: no cover - best effort
+        return ""
+    finally:
+        # Dropping our own handles is safe: membership alone keeps the kernel
+        # object (and its name) alive, and the leader is a member by now.
+        _close_handle(k, hproc)
+        _close_handle(k, hjob)
+
+
+def _job_kill(job: str) -> bool:
+    """Terminate every member of a job object created by `_job_wrap`."""
+    k = _kernel32()
+    if k is None or not job:
+        return False
+    handle = None
+    try:
+        handle = k.OpenJobObjectW(_JOB_TERMINATE | _SYNCHRONIZE, False, job)
+        if not handle:
+            return False            # gone with its last member, or other session
+        return bool(k.TerminateJobObject(handle, 1))
+    except Exception:                   # pragma: no cover - best effort
+        return False
+    finally:
+        _close_handle(k, handle)
+
+
+def _terminate_pid(pid: int, job: str = "") -> None:
+    if os.name == "nt":
+        # The job reaches the descendants its leader already orphaned; taskkill
+        # is the fallback for records written without one.
+        if job and _job_kill(job):
+            return
+        if pid > 0:
+            try:
+                subprocess.run(["taskkill", "/F", "/T", "/PID", str(pid)],
+                               capture_output=True, timeout=10, check=False)
+            except (OSError, subprocess.SubprocessError):
+                pass
+        return
+    if pid <= 0:
         return
     # `proc.spawn` makes the child a session/group leader, so its pid IS the
     # pgid. If the leader already exited, `getpgid(pid)` fails but orphaned
@@ -294,7 +456,7 @@ def stop(root, name: str) -> str:
         known = ", ".join(str(r.get("name")) for r in list_procs(root)) or "(none)"
         return f"ERROR: no background process named '{name}'. Known: {known}"
     pid = int(rec.get("pid") or 0)
-    _terminate_pid(pid)
+    _terminate_pid(pid, str(rec.get("job") or ""))
     _forget_child(pid)
     rec["status"] = "stopped"
     rec["stopped"] = time.time()

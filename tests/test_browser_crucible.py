@@ -11,7 +11,7 @@ import json
 import re
 import sys
 import threading
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from http.server import BaseHTTPRequestHandler
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -20,6 +20,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from pedacito import browser, tools
+from pedacito.local_server import LocalHTTPServer
 from pedacito.config import Config
 from pedacito.index import Index
 
@@ -207,7 +208,7 @@ class _DashHandler(BaseHTTPRequestHandler):
 
 @pytest.fixture()
 def live_page():
-    httpd = ThreadingHTTPServer(("127.0.0.1", 0), _DashHandler)
+    httpd = LocalHTTPServer(("127.0.0.1", 0), _DashHandler)
     thread = threading.Thread(target=httpd.serve_forever, daemon=True)
     thread.start()
     try:

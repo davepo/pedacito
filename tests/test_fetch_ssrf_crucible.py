@@ -10,7 +10,7 @@ from __future__ import annotations
 import socket
 import sys
 import threading
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from http.server import BaseHTTPRequestHandler
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -19,6 +19,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from pedacito import security, tools, webfetch
+from pedacito.local_server import LocalHTTPServer
 from pedacito.config import Config
 from pedacito.index import Index
 
@@ -151,7 +152,7 @@ class _Redirector(BaseHTTPRequestHandler):
 @pytest.fixture()
 def redirector():
     _Redirector.hits = []
-    httpd = ThreadingHTTPServer(("127.0.0.1", 0), _Redirector)
+    httpd = LocalHTTPServer(("127.0.0.1", 0), _Redirector)
     thread = threading.Thread(target=httpd.serve_forever, daemon=True)
     thread.start()
     try:
@@ -173,7 +174,7 @@ class _RebindRedirector(_Redirector):
 @pytest.fixture()
 def rebinding_redirector():
     _Redirector.hits = []
-    httpd = ThreadingHTTPServer(("127.0.0.1", 0), _RebindRedirector)
+    httpd = LocalHTTPServer(("127.0.0.1", 0), _RebindRedirector)
     thread = threading.Thread(target=httpd.serve_forever, daemon=True)
     thread.start()
     try:
@@ -261,7 +262,7 @@ def test_explicitly_named_private_host_is_fetchable():
         def log_message(self, *args):
             pass
 
-    httpd = ThreadingHTTPServer(("127.0.0.1", 0), OK)
+    httpd = LocalHTTPServer(("127.0.0.1", 0), OK)
     thread = threading.Thread(target=httpd.serve_forever, daemon=True)
     thread.start()
     try:

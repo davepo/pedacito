@@ -125,13 +125,21 @@ def gui(tmp_path, monkeypatch):
 @pytest.fixture
 def project(gui, tmp_path):
     """An open workspace (STATE.root only -- no index/job machinery needed
-    for the file-preview, rename-scope and sensitive-read gates)."""
+    for the file-preview, rename-scope and sensitive-read gates).
+
+    Every file is written with `newline="\\n"`: Path.write_text() translates
+    "\\n" to os.linesep, so on Windows the fixture silently produced
+    "API_KEY=\\r\\n" and the exact-text assertions below failed there while
+    passing everywhere else.
+    """
     root = tmp_path / "proj"
     root.mkdir()
     (root / "app.py").write_text('def greet(name):\n    return "hi " + name\n',
-                                 encoding="utf-8")
-    (root / ".env").write_text("API_KEY=super-secret\n", encoding="utf-8")
-    (root / ".env.example").write_text("API_KEY=\n", encoding="utf-8")
+                                 encoding="utf-8", newline="\n")
+    (root / ".env").write_text("API_KEY=super-secret\n", encoding="utf-8",
+                               newline="\n")
+    (root / ".env.example").write_text("API_KEY=\n", encoding="utf-8",
+                                       newline="\n")
     with core.STATE.lock:
         core.STATE.root = root
     return root
@@ -716,6 +724,12 @@ def test_gui_preview_gates_sensitive_files(project):
     # ordinary files and templates stay readable without any broker
     assert "greet" in server.read_project_file("app.py")["text"]
     assert server.read_project_file(".env.example")["text"] == "API_KEY=\n"
+    # and what it returns is the file's own bytes, not a normalised copy: a
+    # CRLF template must not arrive with its \r quietly eaten, or the preview
+    # shows (and a later save would write) something other than what is there
+    (project / ".env.sample").write_text("API_KEY=\r\n", encoding="utf-8",
+                                         newline="")
+    assert server.read_project_file(".env.sample")["text"] == "API_KEY=\r\n"
 
 
 def test_gui_preview_broker_deny_and_allow(project):

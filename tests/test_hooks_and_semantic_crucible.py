@@ -12,7 +12,7 @@ import json
 import shlex
 import sys
 import threading
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from http.server import BaseHTTPRequestHandler
 from pathlib import Path
 
 import pytest
@@ -20,6 +20,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from pedacito import config, hooks, index, llm, semantic, tools
+from pedacito.local_server import LocalHTTPServer
 from pedacito.config import Config
 
 
@@ -201,7 +202,7 @@ def _embed_server(state: _EmbedState):
         def log_message(self, *args):
             pass
 
-    httpd = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    httpd = LocalHTTPServer(("127.0.0.1", 0), Handler)
     thread = threading.Thread(target=httpd.serve_forever, daemon=True)
     thread.start()
     return httpd, thread

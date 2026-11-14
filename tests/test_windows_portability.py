@@ -30,6 +30,7 @@ from pedacito import (  # noqa: E402
     edits,
     fileio,
     proc,
+    processes,
     ratchet,
     sandbox,
     spec,
@@ -594,6 +595,170 @@ def test_proc_kill_tree_uses_taskkill_on_windows(monkeypatch):
     assert calls, "taskkill was not invoked"
     assert calls[0][:5] == ["taskkill", "/F", "/T", "/PID", "4242"]
     assert child.killed
+
+
+# --- the background-server registry: a job object is its process group ------
+# `taskkill /T` can only walk a LIVE parent-child chain. When a launcher exits
+# first (`npm run dev` spawning the real server) the child survives `stop` and
+# keeps the port. The crucible test that proves this needs a Windows runner;
+# these tests pin the Win32 call sequence here, so a wrong argument or a leaked
+# handle fails on the first Linux job instead of on the runner.
+class _FakeKernel32:
+    """The job-object entry points `processes` uses, recording every call."""
+
+    def __init__(self, *, create_ok=True, assign_ok=True, open_ok=True):
+        self.calls: list[tuple] = []
+        self.create_ok = create_ok
+        self.assign_ok = assign_ok
+        self.open_ok = open_ok
+        self._next = 100
+        self.opened: list[int] = []
+        self.closed: list[int] = []
+
+    @property
+    def leaked(self) -> list[int]:
+        """Handles opened and never closed: a leak that outlives the server."""
+        return [h for h in self.opened if h not in self.closed]
+
+    def _handle(self, ok: bool) -> int:
+        if not ok:
+            return 0                    # the Win32 failure return
+        self._next += 1
+        self.opened.append(self._next)
+        return self._next
+
+    def CreateJobObjectW(self, _attrs, name):
+        handle = self._handle(self.create_ok)
+        self.calls.append(("create", handle, name))
+        return handle
+
+    def OpenProcess(self, access, _inherit, pid):
+        handle = self._handle(self.create_ok)
+        self.calls.append(("open_process", handle, access, pid))
+        return handle
+
+    def AssignProcessToJobObject(self, hjob, hproc):
+        ok = 1 if self.assign_ok else 0
+        self.calls.append(("assign", hjob, hproc, ok))
+        return ok
+
+    def OpenJobObjectW(self, access, _inherit, name):
+        handle = self._handle(self.open_ok)
+        self.calls.append(("open_job", handle, access, name))
+        return handle
+
+    def TerminateJobObject(self, hjob, code):
+        self.calls.append(("terminate", hjob, code))
+        return 1
+
+    def CloseHandle(self, handle):
+        self.calls.append(("close", handle))
+        self.closed.append(handle)
+        return 1
+
+
+def _pretend_windows(monkeypatch, k32):
+    monkeypatch.setattr(processes.os, "name", "nt")
+    monkeypatch.setattr(processes, "_kernel32", lambda: k32)
+    runs: list[list[str]] = []
+
+    def fake_run(argv, **_kw):
+        runs.append(list(argv))
+        return type("R", (), {"returncode": 0})()
+
+    monkeypatch.setattr(processes.subprocess, "run", fake_run)
+    return runs
+
+
+def test_job_wrap_assigns_the_leader_and_leaves_no_handles_behind(monkeypatch):
+    k32 = _FakeKernel32()
+    _pretend_windows(monkeypatch, k32)
+
+    job = processes._job_wrap(4242, "web")
+
+    assert job.startswith("Local\\pedacito-web-4242-"), job
+    assert [c[0] for c in k32.calls] == [
+        "create", "open_process", "assign", "close", "close"], k32.calls
+    # OpenProcess asks for exactly SET_QUOTA|TERMINATE, the rights
+    # AssignProcessToJobObject requires; anything less fails on the runner.
+    access = [c for c in k32.calls if c[0] == "open_process"][0][2]
+    assert access == processes._PROCESS_SET_QUOTA | processes._PROCESS_TERMINATE
+    assert not k32.leaked, "job/process handles were not closed"
+
+
+def test_job_wrap_is_a_no_op_when_the_api_refuses(monkeypatch):
+    for kwargs in ({"create_ok": False},          # name already taken
+                   {"assign_ok": False}):         # child already exited
+        k32 = _FakeKernel32(**kwargs)
+        _pretend_windows(monkeypatch, k32)
+        assert processes._job_wrap(4242, "web") == "", kwargs
+        assert not k32.leaked, kwargs
+    # POSIX never loads kernel32 at all: `_kernel32()` returns None there.
+    monkeypatch.setattr(processes.os, "name", "posix")
+    monkeypatch.setattr(processes, "_kernel32", lambda: None)
+    assert processes._job_wrap(4242, "web") == ""
+
+
+def test_stop_reaps_the_orphaned_tree_through_the_job_on_windows(monkeypatch):
+    """The failure the crucible test saw: leader gone, server alive.
+
+    `stop` must prefer the job object. Taskkill /T on a pid whose children have
+    been reparented kills nothing at all, and the registry still reports
+    success -- which is how a dev server ends up holding a port across runs.
+    """
+    k32 = _FakeKernel32()
+    runs = _pretend_windows(monkeypatch, k32)
+
+    processes._terminate_pid(4242, "Local\\pedacito-web-4242-abcd1234")
+
+    opened = [c for c in k32.calls if c[0] == "open_job"][0]
+    assert opened[3] == "Local\\pedacito-web-4242-abcd1234"
+    assert opened[2] == processes._JOB_TERMINATE | processes._SYNCHRONIZE
+    terminated = [c for c in k32.calls if c[0] == "terminate"][0]
+    assert terminated[1] == opened[1], terminated      # the job we just opened
+    assert terminated[2] == 1, terminated              # nonzero exit code
+    assert not runs, "taskkill ran even though the job was reaped"
+    assert not k32.leaked
+
+
+def test_stop_falls_back_to_taskkill_without_a_job(monkeypatch):
+    """Records from before job objects (or a foreign logon session)."""
+    k32 = _FakeKernel32(open_ok=False)       # OpenJobObjectW: ERROR_FILE_NOT_FOUND
+    runs = _pretend_windows(monkeypatch, k32)
+
+    processes._terminate_pid(4242, "Local\\pedacito-web-4242-abcd1234")
+    assert runs == [["taskkill", "/F", "/T", "/PID", "4242"]], runs
+    processes._terminate_pid(4242, "")       # a record with no job at all
+    assert len(runs) == 2, runs
+    assert not k32.leaked
+
+
+def test_stop_uses_the_job_recorded_for_the_process(monkeypatch, tmp_path):
+    """`stop` must hand the record's job to the terminator, not just the pid.
+
+    The pid-only call is what shipped first and what the Windows runner
+    rejected: the leader was already gone, so a pid alone could not reach the
+    surviving server. A record written by any pedacito process carries the job
+    name, which is the whole point of naming the kernel object.
+    """
+    seen: list[tuple] = []
+    monkeypatch.setattr(processes, "_terminate_pid",
+                        lambda pid, job="": seen.append((pid, job)))
+    monkeypatch.setattr(processes, "_alive", lambda _pid: False)  # leader exited
+    root = tmp_path / "proj"
+    root.mkdir()
+    processes._write_record(root, {
+        "name": "web", "command": "npm run dev", "pid": 4242,
+        "cwd": str(root), "log": str(root / "web.log"), "url": "",
+        "job": "Local\\pedacito-web-4242-abcd1234",
+        "started": 1.0, "status": "running"})
+
+    out = processes.stop(root, "web")
+
+    assert out.startswith("stopped web"), out
+    assert seen == [(4242, "Local\\pedacito-web-4242-abcd1234")], seen
+    stopped = processes._read_record(root / ".pedacito" / "procs" / "web.json")
+    assert stopped["status"] == "stopped"
 
 
 def test_browser_resolves_a_mocked_windows_chrome_path(tmp_path, monkeypatch):

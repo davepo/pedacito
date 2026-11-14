@@ -901,6 +901,8 @@ def test_pinned_fetch_connects_by_ip_and_keeps_the_name(tmp_path):
     (an explicitly allowed loopback host, so no fake resolver is needed)."""
     import http.server
 
+    from pedacito.local_server import LocalHTTPServer
+
     seen_hosts = []
 
     class Handler(http.server.BaseHTTPRequestHandler):
@@ -916,7 +918,7 @@ def test_pinned_fetch_connects_by_ip_and_keeps_the_name(tmp_path):
         def log_message(self, *a):
             pass
 
-    srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    srv = LocalHTTPServer(("127.0.0.1", 0), Handler)
     port = srv.server_address[1]
     t = threading.Thread(target=srv.serve_forever, daemon=True)
     t.start()

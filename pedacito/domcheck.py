@@ -40,9 +40,11 @@ import threading
 from collections import Counter
 from contextlib import contextmanager
 from dataclasses import dataclass, field
-from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
+from http.server import SimpleHTTPRequestHandler
 from pathlib import Path
 from urllib.parse import quote
+
+from .local_server import LocalHTTPServer
 
 __all__ = ["DomFinding", "DomResult", "available", "check", "find_entry",
            "load_snapshot", "save_snapshot"]
@@ -169,7 +171,7 @@ def _local_server(root: Path):
     to load from file://, so the page needs a real http origin. Port 0 lets
     the OS pick a free one; the thread dies with the process."""
     handler = functools.partial(_QuietHandler, directory=str(root))
-    httpd = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+    httpd = LocalHTTPServer(("127.0.0.1", 0), handler)
     threading.Thread(target=httpd.serve_forever, daemon=True).start()
     try:
         yield f"http://127.0.0.1:{httpd.server_port}"

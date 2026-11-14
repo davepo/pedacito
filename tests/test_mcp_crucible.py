@@ -21,7 +21,7 @@ from __future__ import annotations
 import json
 import sys
 import threading
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from http.server import BaseHTTPRequestHandler
 from pathlib import Path
 
 import pytest
@@ -30,6 +30,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from pedacito import config as config_mod
 from pedacito import mcp, safety, security, tools
+from pedacito.local_server import LocalHTTPServer
 from pedacito.config import Config
 
 # The crucible catalog: 2 domain tools, 1 oversized, 7 decoys. Descriptions
@@ -361,7 +362,7 @@ class _HttpMCP(BaseHTTPRequestHandler):
 
 
 def test_http_named_server_end_to_end(broker):
-    server = ThreadingHTTPServer(("127.0.0.1", 0), _HttpMCP)
+    server = LocalHTTPServer(("127.0.0.1", 0), _HttpMCP)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     mcp.close_all()

@@ -1740,7 +1740,7 @@ config --reference` prints the annotated template. Key settings:
 | `auto_allowlist` | false | Restrict `auto` task writes to files the title names or the lookup read (new files always allowed). |
 | `allow_write` | false | Whole-file write/append/move/delete during gathering. From a project's own config: ignored until `pedacito trust`. |
 | `allow_shell` | false | `run` and `diagnose`. From a project's own config: ignored until `pedacito trust`. |
-| `allow_serve` / `serve_wait` | false / 3.0 | Background dev servers (`serve` action, `pedacito serve`); seconds to wait for a printed URL. |
+| `allow_serve` / `serve_wait` | false / 3.0 | Background dev servers (`serve` action, `pedacito serve`); seconds to wait for a printed URL. A server that prints one later still gets it recorded, on the next `procs`/`logs` look. |
 | `allow_lsp` / `lsp_servers` / `lsp_timeout` | false / `{}` / 10 | Exact definition/references/hover/diagnostics via a language server; per-extension commands override PATH detection. |
 | `allow_screenshots` / `allow_browser` | false | Screen and headless-browser capture. From a project's own config: ignored until `pedacito trust`. |
 | `vision_model` | `""` | Multimodal model used to describe captures. |

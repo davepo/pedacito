@@ -733,7 +733,9 @@ def _hosted_server():
     """
     import json as _json
     import threading
-    from http.server import BaseHTTPRequestHandler, HTTPServer
+    from http.server import BaseHTTPRequestHandler
+
+    from pedacito.local_server import LocalHTTPServer
 
     seen = []
 
@@ -766,7 +768,7 @@ def _hosted_server():
         def log_message(self, *a):  # keep pytest output clean
             pass
 
-    srv = HTTPServer(("127.0.0.1", 0), H)
+    srv = LocalHTTPServer(("127.0.0.1", 0), H)
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     return srv, seen
 
