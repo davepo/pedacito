@@ -49,6 +49,7 @@ import copy
 import difflib
 import json
 import re
+import textwrap
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -494,15 +495,56 @@ _PLACEHOLDER_RES = (
     re.compile(r"\btodo!\s*\(|\bunimplemented!\s*\("),
     re.compile(r"(?i)(?:#|//|/\*|--)\s*(?:TODO|FIXME|implement me|to be implemented)\b"),
     re.compile(r"(?m)^\s*\.\.\.\s*$"),
-    re.compile(r"(?m)^\s*pass\s*(?:#.*)?$"),
 )
+_PASS_RE = re.compile(r"(?m)^\s*pass\s*(?:#.*)?$")
+_DEF_RE = re.compile(r"(?m)^\s*(?:async\s+)?(?:def|class)\s+[A-Za-z_]")
 _STUB_OK_RE = re.compile(
     r"(?i)\b(stub|placeholder|skeleton|scaffold|todo|not implemented|"
     r"unimplemented|abstract|interface|protocol)\b")
 
 
+def _pass_stub_count(text: str) -> int:
+    """Bare `pass` bodies that are the WHOLE body of a definition.
+
+    A `pass` is not automatically a stub: `BaseHTTPRequestHandler.log_message`
+    is deliberately a no-op, and `except OSError: pass` is a common best-effort
+    cleanup. Counting every `pass` line refused an otherwise complete dev
+    server for its four-line `log_message` override. When the added text
+    parses, only a definition whose body is exactly `pass` counts; when it is
+    a fragment, the old ratio applies. Either way one no-op among implemented
+    definitions is not a stub -- at least half of the definitions must be
+    pass-only for the text to read as scaffolding.
+    """
+    text = text or ""
+    try:
+        tree = ast.parse(textwrap.dedent(text))
+    except (SyntaxError, ValueError):
+        passes = len(_PASS_RE.findall(text))
+        defs = len(_DEF_RE.findall(text))
+        return passes if passes and passes * 2 >= max(1, defs) else 0
+    defs = 0
+    stubs = 0
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef,
+                                 ast.ClassDef)):
+            continue
+        defs += 1
+        body = list(node.body)
+        if body and isinstance(body[0], ast.Expr) \
+                and isinstance(getattr(body[0], "value", None), ast.Constant) \
+                and isinstance(body[0].value.value, str):
+            body = body[1:]                 # drop the docstring
+        if len(body) == 1 and isinstance(body[0], ast.Pass):
+            stubs += 1
+    if stubs and stubs * 2 >= max(1, defs):
+        return stubs
+    return 0
+
+
 def _count(text: str) -> int:
-    return sum(len(rx.findall(text or "")) for rx in _PLACEHOLDER_RES)
+    text = text or ""
+    return (sum(len(rx.findall(text)) for rx in _PLACEHOLDER_RES)
+            + _pass_stub_count(text))
 
 
 def check_placeholders(task: str, edits) -> list[Finding]:

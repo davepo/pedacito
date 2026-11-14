@@ -252,8 +252,10 @@ def is_private_host(host: str) -> bool:
 
 
 def host_named_explicitly(host: str, allowed_hosts) -> bool:
-    """True when `host` is named in `allowed_hosts` (exact or as a `.suffix`,
-    with `"*"` matching anything)."""
+    """True when `host` is named in `allowed_hosts` (exact or as a `.suffix`),
+    with `"*"` matching anything. `ssrf_error`/`resolve_checked` strip the
+    wildcard first: it means "any PUBLIC host", never an exemption for a
+    private address."""
     host = str(host or "").lower()
     for a in (allowed_hosts or ()):
         a = str(a).lower().strip()
@@ -268,7 +270,8 @@ def ssrf_error(url: str, allowed_hosts=()) -> str:
     Only full http(s) URLs pass. Loopback/link-local/metadata/private hosts
     are refused unless named explicitly in `allowed_hosts`, so a
     prompt-injected URL cannot probe the user's network or the cloud metadata
-    endpoint."""
+    endpoint. A `"*"` entry means "any public host": it never exempts a
+    private address (TECHNIQUES.md §32)."""
     raw = str(url or "").strip().strip("`\"'")
     try:
         u = urlparse(raw)
@@ -280,8 +283,8 @@ def ssrf_error(url: str, allowed_hosts=()) -> str:
     host = (u.hostname or "").lower().strip("[]")
     if not host:
         return f"{raw!r} has no hostname to fetch"
-    if is_private_host(host) and not host_named_explicitly(
-            host, allowed_hosts):
+    named = tuple(a for a in (allowed_hosts or ()) if str(a).strip() != "*")
+    if is_private_host(host) and not host_named_explicitly(host, named):
         return (f"{host} is a loopback/link-local/private-network address; "
                 "web tools refuse it (SSRF guard) unless the host is named "
                 "explicitly in fetch_allowed_hosts")

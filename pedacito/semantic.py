@@ -66,7 +66,11 @@ def _permanent_embedding_failure(message: str) -> bool:
     m = re.search(r"embeddings request failed \((\d{3})\)", low)
     if m:
         code = int(m.group(1))
-        return 400 <= code < 500 or code == 501
+        # 408/425/429 are retryable (timeout, too early, rate limit): a later
+        # grep may succeed. Everything else in 4xx means the request/model is
+        # wrong, and 501 means the endpoint has no embeddings support.
+        return (400 <= code < 500 and code not in (408, 425, 429)) \
+            or code == 501
     return False
 
 

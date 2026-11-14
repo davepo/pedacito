@@ -74,9 +74,31 @@ def _write_record(root: Path, rec: dict) -> None:
     tmp.replace(path)
 
 
+# Popen objects for children THIS process started. Retaining them is what lets
+# `stop` reap the child: `os.kill(pid, 0)` reports a zombie as alive, so a
+# killed server stayed "running" in the registry (and `stop` burned its full
+# 3-second grace period) until an unrelated Popen happened to clean up. A
+# server started by one CLI process and stopped by another has no entry here;
+# its parent exits, so the OS reparents and reaps it instead.
+_CHILDREN: dict[int, subprocess.Popen] = {}
+
+
+def _forget_child(pid: int) -> None:
+    _CHILDREN.pop(int(pid or 0), None)
+
+
 def _alive(pid: int) -> bool:
+    pid = int(pid or 0)
+    child = _CHILDREN.get(pid)
+    if child is not None:
+        try:
+            if child.poll() is not None:      # reaps the zombie
+                _CHILDREN.pop(pid, None)
+                return False
+        except (OSError, ValueError):
+            pass
     from .workspace import _pid_alive
-    return _pid_alive(int(pid or 0))
+    return _pid_alive(pid)
 
 
 def _argv(command: str) -> list[str]:
@@ -136,6 +158,7 @@ def start(root, command, *, name: str = "", cfg=None,
                "error": str(e)[:400]}
         _write_record(root, rec)
         return rec
+    _CHILDREN[p.pid] = p
     rec = {"name": name, "command": command_text, "pid": p.pid,
            "cwd": str(root), "log": str(log), "url": "",
            "started": time.time(), "status": "running"}
@@ -146,6 +169,7 @@ def start(root, command, *, name: str = "", cfg=None,
         if p.poll() is not None:
             rec["status"] = "exited"
             rec["returncode"] = p.returncode
+            _forget_child(p.pid)
             break
         try:
             text = log.read_text(encoding="utf-8", errors="replace")[-16000:]
@@ -208,6 +232,21 @@ def logs(root, name: str, tail: int = 4000) -> str:
     return head + "\n" + (text.strip() or "(no output yet)")
 
 
+def _group_alive(pgid: int) -> bool:
+    """True while a POSIX process group still has members."""
+    if pgid <= 0 or os.name == "nt":
+        return False
+    try:
+        os.killpg(pgid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+    return True
+
+
 def _terminate_pid(pid: int) -> None:
     if pid <= 0:
         return
@@ -218,20 +257,28 @@ def _terminate_pid(pid: int) -> None:
         except (OSError, subprocess.SubprocessError):
             pass
         return
+    # `proc.spawn` makes the child a session/group leader, so its pid IS the
+    # pgid. If the leader already exited, `getpgid(pid)` fails but orphaned
+    # descendants still belong to that group: signal the group by the id we
+    # started it with instead of giving up on the whole tree.
     try:
-        os.killpg(os.getpgid(pid), signal.SIGTERM)
+        pgid = os.getpgid(pid)
+    except (ProcessLookupError, PermissionError, OSError):
+        pgid = pid
+    try:
+        os.killpg(pgid, signal.SIGTERM)
     except (ProcessLookupError, PermissionError, OSError):
         try:
             os.kill(pid, signal.SIGTERM)
         except OSError:
-            return
+            pass
     deadline = time.monotonic() + 3.0
     while time.monotonic() < deadline:
-        if not _alive(pid):
+        if not _alive(pid) and not _group_alive(pgid):
             return
         time.sleep(0.05)
     try:
-        os.killpg(os.getpgid(pid), signal.SIGKILL)
+        os.killpg(pgid, signal.SIGKILL)
     except (ProcessLookupError, PermissionError, OSError):
         try:
             os.kill(pid, signal.SIGKILL)
@@ -248,6 +295,7 @@ def stop(root, name: str) -> str:
         return f"ERROR: no background process named '{name}'. Known: {known}"
     pid = int(rec.get("pid") or 0)
     _terminate_pid(pid)
+    _forget_child(pid)
     rec["status"] = "stopped"
     rec["stopped"] = time.time()
     _write_record(root, rec)

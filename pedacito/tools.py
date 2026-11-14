@@ -2597,7 +2597,11 @@ def tool_serve(index, cfg, symbol: str = "", command: str = "",
     if op in ("list", "ls"):
         return processes.render_list(index.root)
     if op in ("logs", "log"):
-        return processes.logs(index.root, name or cmd)
+        # Dev-server stdout is external, untrusted text (and usually ANSI
+        # coloured): fence it exactly like `run` output so a prompt-injected
+        # log line is data, not an instruction.
+        return safety.frame("serve", processes.logs(index.root, name or cmd),
+                            cfg)
     if op in ("stop", "kill"):
         return processes.stop(index.root, name or cmd)
     if op in ("start", "up", "serve"):
