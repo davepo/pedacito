@@ -100,7 +100,7 @@ Step-by-step versions, with what you should see at each point, are in
 | **Green ratchet** | Auto snapshots the project before each step and rolls a step that still fails back to the last passing state | [TECHNIQUES.md](TECHNIQUES.md#20-green-ratchet-step-checkpoints-for-the-autonomous-loop) |
 | **Permission broker** | Web access, package installs, unapproved shell commands and sensitive file reads pause the run for an Allow Once, Allow for This Run, Always Allow, or Deny & Redirect decision | [Safety and trust](#safety-and-trust) |
 | **Safe writes** | Dry run by default, side-by-side review, backups before every write, `pedacito restore` to undo | [Review page](#review-page) |
-| **Live test introspection** | During investigation the model can run one scoped `pytest` check and read the live traceback before it writes a fix. On by default (`enable_run_test_in_gather`) | [Scoped test runs](#scoped-test-runs-during-investigation) |
+| **Live test introspection** | During investigation the model can run one scoped test check (pytest, Node/Vitest, Go, or Cargo) and read the live traceback before it writes a fix. On by default (`enable_run_test_in_gather`) | [Scoped test runs](#scoped-test-runs-during-investigation) |
 | **Frontend contract checks** | Before tests run, local `<script src>` and `<link href>` files must exist, and literal `getElementById` and `querySelector('#id')` lookups must match the HTML ids | [Frontend contract checks](#frontend-contract-checks) |
 | **Repair lessons** | A repair that fixes a failed check leaves a deduplicated, repo-specific lesson in `.pedacito/micro_facts.json`; a lesson a directory proves twice is promoted into an auto-managed path-scoped rule (`.pedacito/rules/auto_*.md`) that only shows up when the model reads that directory | [Repair lessons](#repair-lessons-and-repo-gotchas) |
 | **Symbol-level edits and rename** | Replace a whole function by name without echoing its old text, or rename a symbol across the project with no model call (`pedacito rename`) | [Editing](#editing-searchreplace-not-diffs) |
@@ -168,9 +168,11 @@ commands. Run `pedacito <command> --help` for every flag.
 | `pedacito rename OLD NEW` | Multi-file symbol rename through the AST and the tokenizer, no model call. `--file` scopes it, `--apply` writes (default: diff preview) |
 | `pedacito index`, `map`, `files`, `cost` | Build and inspect the index. These need no model call, except `index` summaries |
 | `pedacito eval` | Score the harness on fixture repositories. Use `--baseline` as a regression gate |
+| `pedacito bench [BENCHMARK\|all]` | Run the six-project diagnostic benchmark suite and hidden holdout rubric. `--list` and `--recent` need no model; `--json` and `--strict` fit CI |
 | `pedacito memory`, `skills`, `prune`, `reset`, `trust`, `worktree`, `serve`, `procs`, `lsp`, `mcp`, `diagnose`, `tests`, `webcheck`, `domcheck` | Upkeep and specialist tools. `mcp list` shows the named MCP servers' tools and trust flags |
 
-Benchmarks are in the GUI only, through the **Benchmarks** button.
+Benchmarks also run from the GUI through the **Benchmarks** button; the CLI
+command builds the same projects and writes the same reports.
 
 ### Documentation map
 
@@ -572,7 +574,7 @@ The model works through a small set of actions:
 | `skill` | Load a named procedure from the skills list (`add-a-test`, `fix-a-failing-test`, ...). |
 | `todo` | Short `- [ ]` checklist saved to `.pedacito/todo.md` and shown in the answer prompt. |
 | `question` | Ask *you* one short question (interactive sessions only, at most twice a task). |
-| `run_test` | Run one scoped `pytest` check (a test file or node id) and read the condensed traceback. On by default; see [Scoped test runs](#scoped-test-runs-during-investigation) |
+| `run_test` | Run one scoped test check (pytest, Node/Vitest, Go, or Cargo, chosen from the target) and read the condensed traceback. On by default; see [Scoped test runs](#scoped-test-runs-during-investigation) |
 | `done` | Stop gathering and answer. |
 
 Repeating a read-only lookup (even many steps later) that nothing has changed
@@ -613,15 +615,21 @@ default where the OS allows, and the rest of the blast radius is limited too.
 ### Scoped test runs during investigation
 
 A model that only reads code has to guess what a fix will do. `run_test` lets it
-check the guess first: it runs one scoped `pytest` check during investigation, so
+check the guess first: it runs one scoped test check during investigation, so
 the live traceback is in front of the model before it writes the patch.
 
 ```json
 {"action": "run_test", "target": "tests/test_app.py::test_save", "filter": "save or retry"}
 ```
 
-- **Scoped.** `target` is a test file or a node id. `filter` is an optional `-k`
-  expression. The model never supplies a shell command line.
+- **Scoped.** `target` is a test file, a node id, or a directory. `filter` is an
+  optional `-k` expression (a name pattern for the other runners). The model
+  never supplies a shell command line.
+- **Follows the project's runner.** Python targets use pytest. A
+  `*.test.js`/`*.spec.js`/`*.test.ts`/`*.spec.ts` file uses Vitest when the
+  package or detected command names it, otherwise Node's built-in `node --test`.
+  `*_test.go` (or a directory holding one) uses `go test ./dir`, and
+  `tests/*.rs` uses `cargo test --test NAME`.
 - **Offered when useful.** It appears when the project has tests (`tests/`,
   `test_*.py`, `*.test.js`) or the task names a failure (test, fail, bug, error,
   traceback, reproduce, broken).
@@ -690,7 +698,7 @@ edit or delete:
   `auto_generated: true` frontmatter flag is never written or deleted by it.
 - **Skills** are named procedures (`.pedacito/skills/NAME/SKILL.md`, or
   `skills/NAME/SKILL.md` next to your config). The model sees a one-line
-  catalog and loads a skill's text only when it needs it. Five starters ship
+  catalog and loads a skill's text only when it needs it. Eight starters ship
   built in; `pedacito skills` lists them. Skills are prompt text, nothing in a
   skill folder is ever executed.
 
@@ -1684,7 +1692,7 @@ config --reference` prints the annotated template. Key settings:
 | `k_cache_quant` / `v_cache_quant` | `""` | KV-cache quantization the runtime uses. |
 | `json_mode` | `"schema"` | `"schema"` for local servers, `"object"` for hosted (auto-switched). |
 | `enforce_json_schema` | true | Ask the engine to constrain gather steps with `response_format` json_schema (strict); servers that refuse are downgraded to json_object, then plain prompting, per model. |
-| `enable_run_test_in_gather` | true | Let the gather loop run one scoped pytest check (a file or node id) to see live tracebacks. `false` makes each run ask the permission broker. |
+| `enable_run_test_in_gather` | true | Let the gather loop run one scoped test check (pytest, Node/Vitest, Go, or Cargo, chosen from the target) to see live tracebacks. `false` makes each run ask the permission broker. |
 | `frontend_contracts` | true | Before tests run, check local script/stylesheet links, literal DOM id lookups and changed JavaScript syntax. |
 | `auto_heal_imports` | true | Before a static-gate finding reaches the model, insert the one import that provably resolves it (stdlib name, or a symbol exactly one local module exports), verified by the AST checker; ambiguous names are never guessed. |
 | `collapse_repair_turns` | true | When a repair succeeds, drop the failed drafts from the conversation tail and keep a compact receipt, so the server's prompt-prefix cache is reused instead of re-prefilling the broken trajectory. |

@@ -548,9 +548,25 @@ again is the cheapest way to compare two models.
 ### B11. Benchmarks
 
 The six-project benchmark suite runs from the GUI (the **▦ Benchmarks** button in
-Part A10). There is no CLI command for it yet. The CLI measures a model with
-`pedacito calibrate` and `pedacito eval`, which are described in the
-[model guide](MODEL_GUIDE.md#how-to-measure).
+Part A10) or from the CLI:
+
+```bash
+pedacito bench --list                                  # ids, checks, deliverables
+pedacito bench --recent                                # past runs, no model needed
+pedacito bench rpn_expression_calc                     # one benchmark
+pedacito bench all --json --strict                     # all six, CI-friendly
+pedacito bench rpn_expression_calc --dir ~/benchmarks  # choose the output root
+```
+
+Each run builds the project through the normal Pedacito loop, then grades the
+model's own tests and the hidden holdout rubric. Progress streams to stderr; the
+scorecard (tests passed, rubric checks, tokens, duration and report path) goes to
+stdout. `--json` prints a structured result for scripts, and `--strict` exits 1
+unless both the model tests and the holdout rubric pass. `--list` and `--recent`
+need no model server or `vram_gb`.
+
+The CLI also measures a model with `pedacito calibrate` and `pedacito eval`,
+which are described in the [model guide](MODEL_GUIDE.md#how-to-measure).
 
 ### B12. Rename a symbol (no model call)
 
@@ -705,6 +721,7 @@ only the map is stale.
 | `pedacito restore PROJ` | Undo the last write |
 | `pedacito rename OLD NEW [--file F] [--apply]` | Rename a symbol across the project. No model call; preview by default |
 | `pedacito eval` | Score the harness on fixture repositories. Use `--baseline` as a gate |
+| `pedacito bench [BENCHMARK\|all]` | Run the six diagnostic benchmarks and holdout rubric. `--list`/`--recent` are free; `--json`/`--strict` for CI |
 | `pedacito memory PROJ` | List, add, or forget remembered facts |
 | `pedacito skills PROJ` | List the available skills |
 | `pedacito tests PROJ --files F` | Detected test command, and the tests an edit to F can break |

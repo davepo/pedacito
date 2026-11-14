@@ -72,14 +72,16 @@ def test_run_records_deleted_indexed_files(tmp_path):
     assert "f.py" not in idx.files          # the index forgot it too
 
 
-def test_new_unindexed_files_are_not_recorded(tmp_path):
-    # documented limitation: stale() sees indexed files only; a command that
-    # creates a brand-new file is invisible to the ledger (model-driven
-    # creation is covered by the write tools)
+def test_new_files_created_by_run_are_indexed_and_recorded(tmp_path):
+    # #47: stale() sees indexed files only, so tool_run also scans for new
+    # indexable files, indexes them, and feeds them to the task ledger.
     idx, cfg = _indexed(tmp_path, {"f.py": "x = 1\n"})
     tools.tool_run(idx, cfg, _py(
-        "from pathlib import Path; Path('brand_new.py').write_text('z = 3\\n')"))
-    assert not getattr(cfg, "_task_mutations", [])
+        "from pathlib import Path; Path('src').mkdir(exist_ok=True); "
+        "Path('src/new_helper.py').write_text('z = 3\\n')"))
+    assert "src/new_helper.py" in idx.files
+    assert cfg._task_mutations == ["src/new_helper.py"]
+    assert (tmp_path / ".pedacito" / "index.json").is_file()
 
 
 def test_ledger_is_duplicate_free_across_runs(tmp_path):

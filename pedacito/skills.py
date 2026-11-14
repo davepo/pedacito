@@ -72,6 +72,62 @@ BUNDLED: dict[str, tuple[str, str]] = {
         "plugin registries, config files (`grep` them).\n"
         "3. Confirm the program's entry point does or does not load it.\n"
         "4. Report evidence, not certainty: 'no references found in N files'."),
+    "surgical-symbol-edit": (
+        ("Replace or insert functions and methods in large files using "
+         "zero-anchor SYMBOL splices or LINES ranges without echoing old "
+         "code."),
+        ("1. `outline` the file first. Copy the EXACT symbol names and line "
+        "ranges it prints; do not guess them from memory.\n"
+        "2. For a >120-line file, or whenever an exact SEARCH block fails to "
+        "match, do NOT paste the old code back. Use a splice instead.\n"
+        "3. Replace or insert one definition with a zero-anchor SYMBOL "
+        "splice: `<<<<<<< SYMBOL path/to/file.py :: Class.method`, the new "
+        "body, then `>>>>>>> END_SYMBOL`.\n"
+        "4. Insert immediately after a definition with "
+        "`<<<<<<< AFTER_SYMBOL path/to/file.py :: symbol` ... "
+        "`>>>>>>> END_SYMBOL`.\n"
+        "5. As a last resort use a line-range whole-file block: "
+        "`--- FILE: path LINES a-b` with an EMPTY `SEARCH` section and the "
+        "replacement text in `REPLACE`. Take a-b from `outline`.\n"
+        "6. Keep edits minimal: one symbol or one range per block. Re-read "
+        "the changed region only to confirm, not to re-quote the whole "
+        "file.")),
+    "frontend-dom-audio-debug": (
+        ("Verify and fix web UIs, HTML/JS module contracts, canvas "
+         "rendering, and silent Web Audio failures."),
+        ("1. DOM contract: list every `getElementById(\"...\")` and "
+        "`querySelector(\"#...\")` in the JS, then check each id exists "
+        "exactly once in the HTML. Fix the mismatch where it is cheapest; "
+        "never duplicate an id to make two lookups pass.\n"
+        "2. ES modules: import each symbol once per module. A duplicate "
+        "top-level import (or a second `type=\"module\"` script re-declaring "
+        "the same name) throws at load and leaves the page dead.\n"
+        "3. Reproduce with `browser`: load the page, then use "
+        "`hold <Key> <seconds>` for a fixed-timestep game loop and `eval` to "
+        "return numbers -- element bounding boxes, computed styles, canvas "
+        "pixel values or state counters. Quote the numbers as evidence.\n"
+        "4. Web Audio: create/resume the `AudioContext` inside a real user "
+        "gesture (click/keydown), connect the source through gain to "
+        "`ctx.destination`, and assert gain is finite and greater than 0. "
+        "`NaN`, 0 gain, a suspended context or a missing connection is "
+        "silent -- check those four before changing the sound code.\n"
+        "5. Re-run the browser check after the fix and report the observed "
+        "numbers, not 'it should work now'.")),
+    "safe-multi-file-rename": (
+        ("Rename a function, class, method, or variable across the project "
+         "deterministically without manual multi-file edits."),
+        ("1. `usages` the old name first: it lists every reference and "
+        "importer, so you can see the true scope before touching anything.\n"
+        "2. If `allow_write` is enabled, call `rename` (or `rename_symbol`) "
+        "with the old and new names instead of editing files by hand. For a "
+        "Python method, use the receiver-qualified form `ClassName.method` "
+        "so same-named methods on other classes are left alone.\n"
+        "3. Preview first when unsure; apply only after the scope matches "
+        "the `usages` list.\n"
+        "4. Do not hand-edit strings or comments containing the old name; "
+        "the deterministic rename already leaves them untouched.\n"
+        "5. Verify with `run_test` (or the impacted tests the harness names) "
+        "and `grep` for the old identifier to prove nothing was missed.")),
 }
 
 
@@ -118,7 +174,7 @@ def catalog(root, cfg=None, limit: int | None = None, task: str = "") -> str:
     capped to `max_skill_catalog_chars`."""
     if cfg is not None and not getattr(cfg, "use_skills", True):
         return ""
-    limit = int(limit or getattr(cfg, "max_skill_catalog_chars", 700) or 700)
+    limit = int(limit or getattr(cfg, "max_skill_catalog_chars", 900) or 900)
     found = _scan(root, cfg)
     if not found:
         return ""

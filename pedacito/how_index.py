@@ -972,6 +972,46 @@ CLI_COMMANDS = [
         ],
     },
     {
+        "name": "bench",
+        "usage": "pedacito bench [BENCHMARK|all] [--list | --recent] "
+                 "[--dir DIR] [--json] [--strict]",
+        "summary": "Run the six-project diagnostic benchmark suite with its "
+                   "hidden holdout rubric, or list the benchmarks and recent "
+                   "runs. A run builds the project through the normal loop, "
+                   "then grades the model's own tests and 71 holdout checks.",
+        "keywords": ["benchmark", "bench", "suite", "holdout", "rubric",
+                     "score", "compare models", "recent runs"],
+        "examples": [
+            "pedacito bench --list",
+            "pedacito bench --recent",
+            "pedacito bench rpn_expression_calc",
+            "pedacito bench all --json --strict",
+            "pedacito bench rpn_expression_calc --dir ~/benchmarks --json",
+        ],
+        "flags": [
+            {"flag": "BENCHMARK",
+             "help": "one benchmark id, or 'all' for all six (default: all)"},
+            {"flag": "--list", "help": "list the six benchmarks and exit"},
+            {"flag": "--recent",
+             "help": "list recent runs under the benchmarks root and exit"},
+            {"flag": "--dir DIR / --out-dir DIR",
+             "help": "base directory for benchmark project folders"},
+            {"flag": "--json",
+             "help": "print structured JSON on stdout for CI"},
+            {"flag": "--strict",
+             "help": "exit 1 unless model tests and holdout rubric both pass"},
+            {"flag": "--model-timeout SEC",
+             "help": "timeout for the generated project's own tests"},
+            {"flag": "--holdout-timeout SEC",
+             "help": "timeout for the hidden holdout rubric"},
+            {"flag": "--url URL", "help": "server URL"},
+            {"flag": "--model ID", "help": "model id"},
+            {"flag": "--config FILE", "help": "use this config file"},
+            {"flag": "--profile NAME", "help": "apply a profile block"},
+            {"flag": "--root DIR", "help": "project root"},
+        ],
+    },
+    {
         "name": "skills",
         "usage": "pedacito skills PROJECT",
         "summary": "List the available skills (project, user and bundled "

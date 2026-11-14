@@ -530,12 +530,27 @@ visual checks also need at least 15 graphic primitives and four colours.
 
 ### Run a benchmark
 
+From the GUI:
+
 1. Click **▦ Benchmarks** in the GUI top bar.
 2. Choose the profile to test. Each model you want to compare needs its own
    profile, so create one per model first.
 3. Optionally choose the folder for the output. By default it is a `benchmarks/`
    folder beside the project you have open.
 4. Click **Run Benchmark**. The dialog shows progress, then the result.
+
+From the CLI:
+
+```bash
+pedacito bench --list                      # the six ids and their checks
+pedacito bench rpn_expression_calc         # one benchmark
+pedacito bench all --json --strict         # all six, CI-friendly
+pedacito bench --recent                    # earlier runs, no model needed
+```
+
+`--dir DIR` chooses the output root. Progress goes to stderr, the scorecard to
+stdout, and `--strict` exits 1 unless both the model's tests and the holdout
+rubric pass.
 
 Each run creates a new folder named like `pedacito_bench_<benchmark>_<profile>_<time>`.
 Nothing is deleted, so you can open the project, run its tests yourself, and

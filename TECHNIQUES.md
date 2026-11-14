@@ -950,6 +950,16 @@ run, with the harness owning every parameter.
   micro-facts observer (§14), so a suite command that works twice becomes a
   confirmed repository fact; a contradiction retires it.
 
+A non-Python test file is not refused for being outside pytest's scope. The
+same validated target dispatches by test-file naming and project manifest:
+`*.test.*`/`*.spec.*` runs under Vitest (`npx --no-install vitest run`) when
+the package or detected command names it, else Node's built-in runner
+(`node --test`); `*_test.go` (or a directory containing one) runs
+`go test ./dir`; and `tests/*.rs` runs `cargo test --test NAME`. Every branch
+uses an argv list, refuses a `-`-leading filter, resolves the target inside the
+workspace, gets the same 15-second cap and scrubbed environment, and records
+the outcome as command evidence.
+
 The point is not to let the model run anything: it is that "read the live
 traceback before writing the edit" is now possible for zero configuration,
 and still cannot become a shell. Ablation flag: set
@@ -1873,10 +1883,17 @@ after a command; the same result now feeds the gather-mutation ledger
 (`_note_mutation`), so hooks, impacted tests, and lint see shell-rewritten
 files exactly like write/move/delete actions. Recorded whatever the exit code:
 the ledger tracks disk state, not command success -- a failed command that
-rewrote files still needs verification. Zero added cost (one reused `stale()`
-result). Known limit: `stale()` sees indexed files only, so a brand-new file a
-command creates is invisible here; model-driven creation uses the write tools,
-which already record. Covered by `tests/test_run_mutation_ledger.py`.
+rewrote files still needs verification.
+
+`stale()` sees indexed files only, so a command that creates a brand-new source
+file used to be invisible to both the index and the ledger. `tool_run` now
+follows the `stale()` pass with one workspace scan using the same selection
+rules the index uses (active extensions plus `.pedacitoignore`/`.gitignore`),
+finds files absent from `index.files`, indexes each in place with
+`reindex_file`, records it as task-created for backups, and feeds it into
+`_note_mutation`. Post-edit hooks, static/contract/frontend gates and impacted
+tests therefore see a file a shell command created exactly like one the write
+tools created. Covered by `tests/test_run_mutation_ledger.py`.
 
 ### 48. Cargo test narrowing, bounded to provably-safe cases (C3)
 

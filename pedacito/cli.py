@@ -1692,6 +1692,145 @@ def _cmd_tests(args) -> int:
     return 0
 
 
+def _bench_current_root(args) -> Path:
+    """The project whose sibling `benchmarks/` folder is the default."""
+    if getattr(args, "root", None):
+        return Path(args.root).expanduser().resolve()
+    return Path.cwd().resolve()
+
+
+def _bench_result_ok(result) -> bool:
+    return bool(result.rubric.ok and result.model_tests.ok)
+
+
+def _bench_summary(result) -> str:
+    """A clean scorecard for one finished benchmark run."""
+    ok = _bench_result_ok(result)
+    tokens = int(result.stats.get("total_tokens", 0) or 0)
+    calls = int(result.stats.get("calls", 0) or 0)
+    lines = [
+        f"BENCHMARK: {result.benchmark_id} -- {result.title}",
+        f"  profile: {result.profile}   model: {result.model or '(unset)'}",
+        (f"  model tests: {result.model_tests.passed}/"
+         f"{result.model_tests.total}"
+         + ("" if result.model_tests.ran else " (none generated)")),
+        (f"  holdout rubric: {result.rubric.passed}/"
+         f"{result.rubric.total} checks"),
+        (f"  tokens: {tokens:,}   calls: {calls}   "
+         f"duration: {result.duration:.1f}s"),
+        f"  project: {result.project_dir}",
+        f"  report: {result.report_path}",
+        f"  RESULT: {'PASS' if ok else 'FAIL'}",
+    ]
+    short = result.shortcomings
+    if short:
+        lines.append("  shortcomings:")
+        lines += [f"    - {item}" for item in short[:8]]
+        if len(short) > 8:
+            lines.append(f"    - ... and {len(short) - 8} more")
+    return "\n".join(lines)
+
+
+def _cmd_bench(args) -> int:
+    """`pedacito bench`: run the built-in diagnostic benchmarks and holdout."""
+    import json
+
+    from . import benchmarks
+
+    if args.list:
+        rows = benchmarks.list_benchmarks()
+        if args.json:
+            print(json.dumps({"benchmarks": rows}, indent=2,
+                             ensure_ascii=False))
+        else:
+            for row in rows:
+                print(f"{row['id']}  [{row['checks']} checks]  "
+                      f"{row['category']}")
+                print(f"  {row['title']}")
+                print("  deliverables: " + ", ".join(row["deliverables"]))
+        return 0
+
+    if args.recent:
+        cfg = _light_config(args)
+        base = (Path(args.out_dir).expanduser() if args.out_dir else
+                benchmarks.default_benchmarks_root(
+                    cfg, current_root=_bench_current_root(args)))
+        runs = benchmarks.recent_runs(base)
+        if args.json:
+            print(json.dumps({"base_dir": str(base), "recent": runs},
+                             indent=2, ensure_ascii=False, default=str))
+        elif not runs:
+            print(f"No benchmark runs under {base}.")
+        else:
+            print(f"Recent benchmark runs under {base}:")
+            for run in runs:
+                stamp = str(run.get("started_at") or "")[:19]
+                score = str(run.get("score") or "")
+                print(f"  {stamp}  {run.get('benchmark_id', '')}  "
+                      f"profile={run.get('profile', '')}  {score}")
+                print(f"    report: {run.get('report_path', '')}")
+        return 0
+
+    cfg = _config(args)
+    current_root = _bench_current_root(args)
+    base = (Path(args.out_dir).expanduser() if args.out_dir else
+            benchmarks.default_benchmarks_root(cfg, current_root=current_root))
+    wanted = str(args.benchmark or "").strip()
+    if wanted in ("", "all"):
+        ids = list(benchmarks.BENCHMARKS)
+    else:
+        ids = [wanted]
+    limit = max(1, int(getattr(args, "model_timeout", 180) or 180))
+    holdout = max(1, int(getattr(args, "holdout_timeout", 180) or 180))
+
+    def log(line: str) -> None:
+        print(line, file=sys.stderr, flush=True)
+
+    results = []
+    for i, benchmark_id in enumerate(ids, 1):
+        if len(ids) > 1:
+            log(f"=== Benchmark {i}/{len(ids)}: {benchmark_id} ===")
+        results.append(benchmarks.run_benchmark(
+            profile=getattr(args, "profile", "") or "",
+            benchmark_id=benchmark_id, base_dir=base, cfg=cfg,
+            current_root=current_root,
+            model_timeout=limit, holdout_timeout=holdout, log=log))
+
+    if args.json:
+        runs = []
+        for result in results:
+            data = result.to_dict(include_report=False)
+            data["ok"] = _bench_result_ok(result)
+            runs.append(data)
+        if len(ids) == 1:
+            print(json.dumps(runs[0], indent=2, ensure_ascii=False,
+                             default=str))
+        else:
+            passed = sum(1 for row in runs if row["ok"])
+            print(json.dumps({
+                "benchmark": "all",
+                "ok": passed == len(runs),
+                "count": len(runs),
+                "passed": passed,
+                "failed": len(runs) - passed,
+                "runs": runs,
+            }, indent=2, ensure_ascii=False, default=str))
+    else:
+        for n, result in enumerate(results):
+            if n:
+                print()
+            print(_bench_summary(result))
+        if len(results) > 1:
+            passed = sum(1 for r in results if _bench_result_ok(r))
+            verdict = "PASS" if passed == len(results) else "FAIL"
+            print(f"\nOVERALL: {passed}/{len(results)} benchmarks PASS "
+                  f"({verdict})")
+
+    if args.strict and not all(_bench_result_ok(r) for r in results):
+        return 1
+    return 0
+
+
 def _cmd_webcheck(args) -> int:
     """`pedacito webcheck`: static cross-file contract checks for web
     projects (DOM ids, ESM behind classic scripts, duplicate globals,
@@ -2542,6 +2681,41 @@ def build_parser() -> argparse.ArgumentParser:
     p_eval.add_argument("--root", default=None)
     p_eval.add_argument("paths", nargs="*", default=["."], help=argparse.SUPPRESS)
 
+    p_bench = sub.add_parser(
+        "bench", help="run the built-in 6-project diagnostic benchmark suite "
+                      "and holdout rubric")
+    p_bench.add_argument(
+        "benchmark", nargs="?", default="",
+        help="benchmark id to run, or 'all' to run all six sequentially "
+             "(default: all)")
+    p_bench.add_argument("--list", action="store_true",
+                         help="list the six benchmarks and exit")
+    p_bench.add_argument("--recent", action="store_true",
+                         help="list recent runs under the benchmarks root and "
+                              "exit (no model server needed)")
+    p_bench.add_argument("--dir", "--out-dir", dest="out_dir", default=None,
+                         metavar="DIR",
+                         help="base directory for benchmark project folders "
+                              "(default: config benchmarks_dir, else a "
+                              "benchmarks/ folder beside the project)")
+    p_bench.add_argument("--json", action="store_true",
+                         help="print structured JSON on stdout for CI "
+                              "(progress stays on stderr)")
+    p_bench.add_argument("--strict", action="store_true",
+                         help="exit 1 unless every run's overall result is "
+                              "PASS (model tests and holdout rubric both)")
+    p_bench.add_argument("--model-timeout", type=int, default=180,
+                         metavar="SEC",
+                         help="timeout for the generated project's own tests "
+                              "(default 180)")
+    p_bench.add_argument("--holdout-timeout", type=int, default=180,
+                         metavar="SEC",
+                         help="timeout for the hidden holdout rubric "
+                              "(default 180)")
+    for flag in ("--url", "--model", "--config", "--profile"):
+        p_bench.add_argument(flag)
+    p_bench.add_argument("--root", default=None)
+
     p_gui = sub.add_parser("gui", help="open the browser control panel")
     p_gui.add_argument("project", nargs="?", default=None,
                        help="project folder to open at startup")
@@ -2621,6 +2795,18 @@ def _main(argv=None) -> int:
         except LLMError as e:
             print(f"\nERROR: {e}", file=sys.stderr)
             return 1
+        except KeyboardInterrupt:
+            print("\nCancelled.", file=sys.stderr)
+            return 130
+
+    # `bench --list`/`--recent` need no model or vram; a real run loads the
+    # full config (and therefore the server settings) inside _cmd_bench.
+    if args.cmd == "bench":
+        try:
+            return _cmd_bench(args)
+        except ConfigError as e:
+            print(f"Config error: {e}", file=sys.stderr)
+            return 2
         except KeyboardInterrupt:
             print("\nCancelled.", file=sys.stderr)
             return 130

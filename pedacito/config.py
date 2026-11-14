@@ -796,7 +796,7 @@ class Config:
     # Skills: `.pedacito/skills/*/SKILL.md`, `~/.config/pedacito/skills/*`
     # and the bundled starters; a catalog is listed, text loads on demand.
     use_skills: bool = True
-    max_skill_catalog_chars: int = 700
+    max_skill_catalog_chars: int = 900
     # `task` action: a child agent with a fresh window and read-only tools
     # researches a question and returns a short digest.
     allow_subagents: bool = False

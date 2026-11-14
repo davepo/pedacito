@@ -3360,22 +3360,56 @@ def tool_run(index, cfg, command: str) -> str:
     # A command can rewrite source; refresh the index so line ranges stay valid.
     try:
         from . import index as index_mod
+        from . import select as select_mod
         changed, missing = index.stale()
         # #47: the same stale() result feeds the task's mutation ledger, so a
         # shell-only worker's disk changes still get post-edit verification
         # when the answer phase produces no edit blocks. Recorded whatever
         # the exit code: the ledger tracks disk state, not command success.
-        # (stale() sees indexed files only; brand-new files a command creates
-        # are invisible here -- model-driven creation uses the write tools.)
         _note_mutation(cfg, *changed, *missing)
         for rel in missing:
             index.forget(rel)
         for rel in changed:
             fresh = index_mod.reindex_file(index, rel, cfg, save=False)
             index.__dict__.update(fresh.__dict__)
-        if changed or missing:
-            print(f"[run] index refreshed ({len(changed)} changed, "
-                  f"{len(missing)} removed)", file=sys.stderr)
+
+        # stale() only sees already-indexed files. A command that CREATES a
+        # source file used to leave it invisible to the index, the ledger and
+        # every post-edit gate. Walk the workspace with the same selection
+        # rules the index uses, then reindex and record each new file.
+        exts = set(select_mod.CODE_EXTS)
+        if getattr(cfg, "include_references", True):
+            exts |= set(select_mod.REFERENCE_EXTS)
+        exts |= {e if e.startswith(".") else "." + e
+                 for e in getattr(cfg, "extra_extensions", ())}
+        matcher = select_mod.Matcher.from_files(index.root)
+        known = set(index.files)
+        added: list[str] = []
+        for f in select_mod.select([str(index.root)], index.root, matcher,
+                                    exts):
+            try:
+                rel = f.resolve().relative_to(index.root).as_posix()
+            except ValueError:
+                continue
+            if rel not in known:
+                added.append(rel)
+        for rel in added:
+            _note_created(index, cfg, rel)
+            fresh = index_mod.reindex_file(index, rel, cfg, save=False)
+            index.__dict__.update(fresh.__dict__)
+        if added:
+            _note_mutation(cfg, *added)
+        if changed or missing or added:
+            index.save()
+            bits = []
+            if changed:
+                bits.append(f"{len(changed)} changed")
+            if missing:
+                bits.append(f"{len(missing)} removed")
+            if added:
+                bits.append(f"{len(added)} new")
+            print(f"[run] index refreshed ({', '.join(bits)})",
+                  file=sys.stderr)
     except Exception as e:                     # stale index is not fatal
         print(f"[run] index refresh skipped: {e}", file=sys.stderr)
 
@@ -3679,6 +3713,166 @@ def _maybe_run_test_node(root: Path, cfg, tgt: str, filt: str):
     return obs
 
 
+# JS/TS test-file naming used by both Node's built-in runner and Vitest.
+_JS_TEST_FILE_RE = re.compile(
+    r"\.(?:test|spec)\.(?:[cm]?[jt]sx?)$", re.IGNORECASE)
+
+
+def _js_uses_vitest(root: Path, cfg) -> bool:
+    """True when package.json or the detected test command names Vitest."""
+    pkg = root / "package.json"
+    if pkg.is_file():
+        try:
+            if "vitest" in pkg.read_text(encoding="utf-8",
+                                         errors="replace").lower():
+                return True
+        except OSError:
+            pass
+    try:
+        from . import testsel
+        det = testsel.detect_test_command(root, cfg) or ""
+    except Exception:  # noqa: BLE001 - detection is best-effort
+        det = ""
+    return "vitest" in det.lower()
+
+
+def _polyglot_test_argv(root: Path, cfg, target: str,
+                        k_filter: str) -> tuple[list[str], str] | str | None:
+    """Argv for a non-Python test target, or None to fall through to pytest.
+
+    Exactly the same contract as the pytest/Node paths: the target resolves
+    INSIDE the project, the result is an argv list (never a shell string), a
+    filter starting with `-` is refused as an option, and the argv is built
+    only from project-relative paths. A string return is a refusal message.
+    """
+    if not target:
+        return None
+    file_part = target.partition("::")[0]
+    try:
+        resolved = security.resolve_safe_path(root, file_part)
+    except security.SecurityError as e:
+        return f"ERROR: run_test refused the target: {e}"
+    if not resolved.exists():
+        return (f"ERROR: run_test target does not exist: "
+                f"{file_part[:120]} -- use `find`/`grep` to locate the "
+                "test file, then run it.")
+    if k_filter.startswith("-"):
+        return ("ERROR: the run_test `filter` cannot start with '-' (it "
+                "would read as an option). Use a name pattern like "
+                "'save or retry'.")
+
+    rel = resolved.relative_to(root).as_posix()
+    suffix = resolved.suffix.lower()
+
+    if resolved.is_file() and _JS_TEST_FILE_RE.search(resolved.name):
+        if _js_uses_vitest(root, cfg):
+            argv = ["npx", "--no-install", "vitest", "run", rel]
+            if k_filter:
+                argv += ["-t", k_filter]
+            return argv, "js"
+        argv = ["node", "--test", rel]
+        if k_filter:
+            argv += ["--test-name-pattern", k_filter]
+        return argv, "js"
+
+    if resolved.is_file() and resolved.name.endswith("_test.go"):
+        rel_dir = PurePosixPath(rel).parent.as_posix()
+        package = "." if rel_dir in ("", ".") else "./" + rel_dir
+        argv = ["go", "test", package]
+        if k_filter:
+            argv += ["-run", k_filter]
+        return argv, "go"
+
+    if resolved.is_dir():
+        try:
+            has_go_tests = next(resolved.glob("*_test.go"), None) is not None
+        except OSError:
+            has_go_tests = False
+        if has_go_tests:
+            package = "." if rel in ("", ".") else "./" + rel
+            argv = ["go", "test", package]
+            if k_filter:
+                argv += ["-run", k_filter]
+            return argv, "go"
+
+    if (resolved.is_file() and suffix == ".rs"
+            and PurePosixPath(rel).parent.as_posix() == "tests"):
+        argv = ["cargo", "test", "--test", resolved.stem]
+        if k_filter:
+            argv.append(k_filter)
+        return argv, "rust"
+
+    return None
+
+
+def _run_polyglot_test(root: Path, cfg, argv: list[str], kind: str,
+                       display: str) -> str:
+    """Execute one non-Python scoped test argv with the shared safety net:
+    sandbox wrapper, `min(test_timeout, 15)` ceiling, scrubbed environment,
+    token-capped output, and the micro-facts observer."""
+    timeout = max(1, min(_as_int(getattr(cfg, "test_timeout", 300), 300),
+                         _RUN_TEST_TIMEOUT_CAP))
+    cap = max(2000, _as_int(getattr(cfg, "max_shell_output_chars", 8000),
+                             8000))
+    env = _child_env(cfg)
+    try:
+        run_argv, box = sandbox.wrap(argv, cfg, root)
+    except sandbox.SandboxRefused as e:
+        return f"ERROR: {e}"
+    rc, out, stopped, _elapsed = proc.run(
+        run_argv, cwd=root, timeout=timeout, idle_timeout=timeout,
+        max_output=cap, env=env)
+    if stopped == "error":
+        return f"ERROR: could not run the tests: {str(out)[:300]}"
+    try:
+        from . import memory
+        memory.observe_command(root, display, rc == 0 and stopped == "",
+                               cfg, kind="test")
+    except Exception:  # noqa: BLE001, S110 - evidence is best-effort
+        pass
+
+    raw = (out or "").strip()
+    if stopped == "timeout":
+        return ("RUN TEST: {d}\nSTOPPED: timed out after {t}s (killed; a "
+                "scoped run keeps a tight ceiling).\nPARTIAL OUTPUT:\n{p}\n"
+                "[Narrow the scope with `target`; do not re-run the same "
+                "whole suite.]").format(
+                    d=display, t=timeout,
+                    p=_condense_failures(raw, 1500) or "(no output)")
+
+    verdict = "OK" if rc == 0 else "FAILED"
+    lines = [f"RUN TEST: {display}", f"EXIT: {rc} ({verdict})"]
+    if kind == "js":
+        tally = _node_tally(raw)
+        if tally:
+            lines.append(f"SUMMARY: {tally}")
+    if rc == 0:
+        lines.append("PASSED: this scope is green, so whatever is broken is "
+                     "NOT in these tests. Do not re-run to watch it pass "
+                     "again.")
+    else:
+        budget_tokens = max(200, _as_int(getattr(cfg, "max_read_tokens",
+                                                 1200), 1200))
+        condensed = _condense_failures(
+            raw, int(budget_tokens * _RUN_TEST_CHARS_PER_TOKEN))
+        if condensed:
+            lines.append("FAILURES (condensed):")
+            lines.append(condensed)
+        lines.append("[Read the failing lines above, `read` the implicated "
+                     "source, and fix THAT -- with the live error now in "
+                     "front of you.]")
+        if box:
+            lines.append(f"[ran in a sandbox ({box}); a failure caused by a "
+                         "blocked write outside the project or by no "
+                         "network is the sandbox, not the code.]")
+    obs = "\n".join(lines)
+    hard_cap = int(max(200, _as_int(getattr(cfg, "max_read_tokens", 1200),
+                                    1200)) * _RUN_TEST_CHARS_PER_TOKEN) + 500
+    if len(obs) > hard_cap:
+        obs = obs[:hard_cap].rstrip() + "\n[observation capped]"
+    return obs
+
+
 def _condense_failures(out: str, budget_chars: int) -> str:
     """A compact failure digest instead of the raw transcript: loop.py's
     failure identities when importable (the same condenser the repair
@@ -3763,6 +3957,15 @@ def tool_run_test(index, cfg, target: str = "", k_filter: str = "") -> str:
             setting_key="enable_run_test_in_gather")
         if not allowed:
             return msg
+
+    # Non-Python test files dispatch to their own runner (JS/TS, Go, Rust).
+    # Returns None for a Python target, falling through to pytest.
+    poly = _polyglot_test_argv(root, cfg, tgt, filt)
+    if isinstance(poly, str):
+        return poly
+    if poly is not None:
+        argv, kind = poly
+        return _run_polyglot_test(root, cfg, argv, kind, " ".join(argv)[:200])
 
     # BUG-203: a Node project's suite is a first-class run_test target too.
     # Returns None when this is not a Node run, falling through to pytest.
