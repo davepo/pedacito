@@ -44,7 +44,19 @@ def _user_config_dir() -> Path:
     return Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config") / "pedacito"
 
 
+def _user_state_dir() -> Path:
+    """Per-user state that is not tied to a project (session logs and chat
+    threads opened with no folder): $XDG_STATE_HOME/pedacito on Linux/macOS
+    (or ~/.local/state/pedacito), %LOCALAPPDATA%\\pedacito on Windows."""
+    if os.name == "nt":
+        base = os.environ.get("LOCALAPPDATA") or (Path.home() / "AppData" / "Local")
+        return Path(base) / "pedacito"
+    return Path(os.environ.get("XDG_STATE_HOME")
+                or Path.home() / ".local" / "state") / "pedacito"
+
+
 USER_CONFIG = _user_config_dir() / "config.toml"
+USER_STATE_DIR = _user_state_dir()
 PROJECT_CONFIG_NAMES = (".pedacito.toml", "pedacito.toml")
 
 

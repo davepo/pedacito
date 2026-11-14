@@ -19,8 +19,10 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from pedacito.gui import core  # noqa: E402
 from test_gui import gui  # noqa: F401  (the shared server fixture)
+
+from pedacito import config as config_mod
+from pedacito.gui import core
 
 
 def _file(root, tid):
@@ -100,6 +102,54 @@ def test_threads_are_per_project(tmp_path):
     assert st.thread_id == tid_a
     assert [m["text"] for m in st.messages] == ["in project a"]
     st.delete_thread(tid_a)
+
+
+def test_project_less_threads_live_in_the_user_state_dir():
+    """A chat opened with no project is saved under
+    <USER_STATE_DIR>/threads/global/ and restored on the next start, instead
+    of living only in memory."""
+    st = core.State()
+    tid = st.thread_id
+    st.add_message("user", "how do I disable thinking?")
+    path = core.threads_dir(None) / (tid + ".json")
+    assert path == (config_mod.USER_STATE_DIR / "threads" / "global"
+                    / (tid + ".json"))
+    assert path.exists()
+    fresh = core.State()                            # a GUI restart
+    assert fresh.thread_id == tid
+    assert [m["text"] for m in fresh.messages] == ["how do I disable thinking?"]
+    assert fresh.delete_thread(tid)
+    assert not path.exists()
+
+
+def test_opening_a_project_flushes_the_project_less_chat(tmp_path):
+    """The global chat keeps its file when a project opens, and comes back
+    when the scope returns to no project. It is never copied into the
+    project's own thread folder."""
+    st = core.State()
+    tid = st.thread_id
+    st.add_message("user", "scratch question")
+    proj = tmp_path / "proj"
+    proj.mkdir()
+    st.set_root(proj)
+    assert st.thread_id != tid
+    assert (core.threads_dir(None) / (tid + ".json")).exists()
+    assert not (core.threads_dir(proj) / (tid + ".json")).exists()
+    st.add_message("user", "project chat")
+    st.set_root(None)
+    assert st.thread_id == tid
+    assert [m["text"] for m in st.messages] == ["scratch question"]
+
+
+def test_opening_a_project_does_not_persist_an_empty_global_chat(tmp_path):
+    """Only a chat with something in it is flushed to the state folder:
+    merely opening a project must not litter it with empty conversations."""
+    st = core.State()
+    tid = st.thread_id
+    proj = tmp_path / "proj"
+    proj.mkdir()
+    st.set_root(proj)
+    assert not (core.threads_dir(None) / (tid + ".json")).exists()
 
 
 def test_reopening_the_same_root_keeps_the_current_thread(tmp_path):

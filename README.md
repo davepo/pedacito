@@ -139,9 +139,11 @@ dependencies, so it works offline. It runs the same engine as the commands.
   terminal** are also here. A `Scout: <profile>` badge appears beside the model
   chip when a scout profile is active.
 
-Chat threads are saved with timestamps and can be renamed. The **Files** panel
-lists the indexed project files, and **Backups** lists snapshots you can
-restore.
+Chat threads are saved with timestamps and can be renamed. With no project
+open they are kept in `~/.local/state/pedacito/threads/global/` (see the
+`.pedacito/` layout below); once a project is open they live inside that
+project. The **Files** panel lists the indexed project files, and **Backups**
+lists snapshots you can restore.
 
 ### The CLI at a glance
 
@@ -1564,7 +1566,24 @@ log.txt               timestamped event trace
 ```
 
 `sessions/` is the place to look when an edit turns out wrong days later;
-`log.txt` shows where a failure happened. On first run Pedacito creates a
+`log.txt` shows where a failure happened. With no project open, the GUI's
+project-less modes (How and New) have no `.pedacito/` folder, so their chats
+and session logs go to a per-user state folder instead:
+
+```
+~/.local/state/pedacito/            Linux/macOS ($XDG_STATE_HOME replaces
+                                    ~/.local/state)
+  threads/global/<id>.json          chats opened with no project
+  sessions/global/<stamp>.md        task logs written with no project
+%LOCALAPPDATA%\pedacito\            Windows
+```
+
+Opening a project switches to that project's own threads under
+`<project>/.pedacito/`; the project-less chat stays in the state folder and
+comes back when the scope returns to no project. Nothing is copied between
+the two.
+
+On first run Pedacito creates a
 commented `.pedacitoignore` and adds its entries to `.gitignore` (switch off
 with `create_ignore_file = false` / `manage_gitignore = false`). Deleting
 `.pedacito/` is always safe; it only costs a re-index. `pedacito reset PROJ`

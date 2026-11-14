@@ -10,7 +10,10 @@ Usage
 
 Logs live in `<root>/.pedacito/sessions/*.md` (written by
 `workspace.write_session`) and are not in the code index, so this module is the
-agent's read-only view of what previous runs asked, read, and changed.
+agent's read-only view of what previous runs asked, read, and changed. A run
+with no project root (the GUI's project-less mode, and anything else that
+passes `root=None`) keeps its logs in the per-user state folder instead:
+`sessions/global/` under `config.USER_STATE_DIR`.
 """
 
 from __future__ import annotations
@@ -18,15 +21,21 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
+from . import config as config_mod
 from .index import SESSION_DIR, state_dir
 
+# Project-less session logs: <user state>/sessions/global/*.md.
+GLOBAL_SESSIONS_SUBDIR = Path("sessions") / "global"
 MAX_LIST = 10
 MAX_HITS = 20
 MAX_READ_LINES = 200
 
 
 def session_dir(root) -> Path:
-    """Path of the project's session directory."""
+    """Path of the session directory: the project's, or the shared per-user
+    one when a run has no project root."""
+    if root is None:
+        return config_mod.USER_STATE_DIR / GLOBAL_SESSIONS_SUBDIR
     return state_dir(Path(root), SESSION_DIR)
 
 

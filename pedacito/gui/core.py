@@ -26,6 +26,7 @@ from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
 
+from .. import config as config_mod
 from .. import review as review_mod
 from .. import security, workspace
 from ..config import USER_CONFIG
@@ -55,12 +56,16 @@ SITE_PHASE = {"gather": "gather", "compaction": "gather", "answer": "edit",
 
 # Chat threads live inside the project: <root>/.pedacito/gui/threads/<id>.json,
 # one readable file per conversation, kept so the GUI can restore the last chat
-# after a restart. A fresh thread opens under a friendly local timestamp
-# ("Nov 08, 09:20 PM"); once the first request lands, the title becomes that
-# request (one line, short) -- no extra model call, and the title stays honest
-# because it is literally what the user asked. A manual rename sets
-# `title_custom`, and then no automatic update ever touches the name again.
+# after a restart. A chat opened with no project (the How and New modes) lives
+# in the per-user state folder instead: <USER_STATE_DIR>/threads/global/<id>.json
+# (see config.USER_STATE_DIR). A fresh thread opens under a friendly local
+# timestamp ("Nov 08, 09:20 PM"); once the first request lands, the title
+# becomes that request (one line, short) -- no extra model call, and the title
+# stays honest because it is literally what the user asked. A manual rename
+# sets `title_custom`, and then no automatic update ever touches the name
+# again.
 THREADS_SUBPATH = Path(".pedacito") / "gui" / "threads"
+GLOBAL_THREADS_SUBDIR = Path("threads") / "global"
 THREAD_TITLE_CHARS = 48
 THREAD_TITLE_FORMAT = "%b %d, %I:%M %p"
 # A hand-typed rename is not truncated to a first-message title's 48 chars, but
@@ -74,6 +79,11 @@ _THREAD_ID_RE = re.compile(r"\A[A-Za-z0-9_-]{1,64}\Z")
 
 
 def threads_dir(root) -> Path:
+    """Where this chat scope keeps its thread files: the project's
+    `.pedacito/gui/threads/`, or the per-user `threads/global/` folder when
+    no project is open (root is None)."""
+    if root is None:
+        return config_mod.USER_STATE_DIR / GLOBAL_THREADS_SUBDIR
     return Path(root) / THREADS_SUBPATH
 
 
@@ -139,7 +149,8 @@ def read_thread_file(path):
 
 
 def load_thread_records(root):
-    """The project's saved threads, newest first, capped at MAX_THREADS."""
+    """The scope's saved threads, newest first, capped at MAX_THREADS. `root`
+    None means the per-user project-less folder."""
     try:
         paths = list(threads_dir(root).glob("*.json"))
     except OSError:
@@ -365,9 +376,11 @@ class State:
         self._mid = 0
         self.term = ""
 
-        # Per-project chat threads (see `save_active_thread`). `messages` IS
-        # the active record's list while a thread is attached, so every turn
-        # that lands in the transcript lands in the thread too.
+        # Per-scope chat threads (see `save_active_thread`): the open project's
+        # `.pedacito/gui/threads/`, or the per-user global folder while no
+        # project is open. `messages` IS the active record's list while a
+        # thread is attached, so every turn that lands in the transcript lands
+        # in the thread too.
         self.threads: dict[str, dict] = {}
         self.thread_id = ""
         self._thread_io = threading.Lock()
@@ -426,14 +439,21 @@ class State:
         Chat threads follow the project: the outgoing thread is flushed to
         the folder being left, then that folder's saved threads are loaded
         and the most recently updated one becomes the active chat. Opening
-        the same root again (a profile switch) keeps the current thread."""
+        the same root again (a profile switch) keeps the current thread.
+        `None` switches to the project-less scope in the per-user state
+        folder (`threads/global/`)."""
         meta = detect_index_meta(root)
         new_root = Path(root) if root is not None else None
         with self.lock:
             same_root = new_root == self.root
+            rec = self.threads.get(self.thread_id)
         if not same_root:
-            self.save_active_thread(force=True)   # flush to the folder being left
-        records = load_thread_records(new_root) if new_root else []
+            # Flush to the scope being left. An untouched project-less chat
+            # stays unpersisted: opening a project must not litter the state
+            # folder with empty conversations.
+            if self.root is not None or (rec is not None and rec.get("messages")):
+                self.save_active_thread(force=True)
+        records = load_thread_records(new_root)
         with self.lock:
             self.root = new_root
             self.index_meta = meta
@@ -540,7 +560,7 @@ class State:
         self.save_active_thread(force=True)
         self.bus.publish("status")
 
-    # --- chat threads (per-project persistence) --------------------------------
+    # --- chat threads (per-project, with a project-less global scope) ----------
 
     def _new_thread_locked(self, profile: str = "") -> dict:
         """Build a fresh unsaved thread record. Caller holds `self.lock`."""
@@ -556,9 +576,10 @@ class State:
         self._mid = max((m.get("id", 0) for m in self.messages), default=0)
 
     def _load_threads(self) -> None:
-        """Restore the project's saved threads (used at startup); falls back
-        to one fresh in-memory thread when there is nothing to load."""
-        records = load_thread_records(self.root) if self.root else []
+        """Restore the current scope's saved threads (used at startup);
+        falls back to one fresh in-memory thread when there is nothing to
+        load. With no project open the scope is the per-user global folder."""
+        records = load_thread_records(self.root)
         with self.lock:
             self.threads = {r["id"]: r for r in records}
             if records:
@@ -586,9 +607,9 @@ class State:
 
     def _write_thread_file(self, payload: dict) -> None:
         """Persist one thread payload atomically (temp file + rename, so a
-        crash mid-save cannot truncate a conversation)."""
-        if not self.root:
-            return
+        crash mid-save cannot truncate a conversation). Writes to the scope
+        that is current at call time: the project's folder, or the per-user
+        `threads/global/` when no project is open."""
         path = threads_dir(self.root) / (payload["id"] + ".json")
         with self._thread_io:            # serialize writers; never hold `lock` during I/O
             try:
@@ -601,12 +622,13 @@ class State:
                 sys.stderr.write("[gui] could not save thread %s: %s\n" % (path, exc))
 
     def save_active_thread(self, force: bool = False) -> None:
-        """Persist the active thread to `<root>/.pedacito/gui/threads/<id>.json`.
+        """Persist the active thread to `<root>/.pedacito/gui/threads/<id>.json`,
+        or to the per-user `threads/global/` folder while no project is open.
         Streaming appends are throttled to ~1/s; the save on job end is forced.
-        The thread follows the project folder: switching to another project
-        never moves these files."""
+        The thread follows the scope: switching projects, or opening one from
+        the project-less scope, never moves these files."""
         rec = self.threads.get(self.thread_id)
-        if rec is None or not self.root:
+        if rec is None:
             return
         now = time.monotonic()
         if not force and (now - self._last_thread_save) < 1.0:
@@ -686,15 +708,15 @@ class State:
         return True
 
     def delete_thread(self, tid: str) -> bool:
-        """Forget a thread and remove its file. Deleting the active one opens
-        the most recent survivor, or a fresh chat when nothing is left."""
+        """Forget a thread and remove its file (project or project-less).
+        Deleting the active one opens the most recent survivor, or a fresh
+        chat when nothing is left."""
         path = None
         with self.lock:
             rec = self.threads.pop(tid, None)
             if rec is None:
                 return False
-            if self.root:
-                path = threads_dir(self.root) / (tid + ".json")
+            path = threads_dir(self.root) / (tid + ".json")
             was_active = tid == self.thread_id
             if was_active:
                 if self.threads:

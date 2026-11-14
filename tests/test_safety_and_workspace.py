@@ -13,7 +13,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from pedacito import config as config_mod
-from pedacito import events, hooks, safety, tools, workspace
+from pedacito import events, hooks, safety, sessions, tools, workspace
 from pedacito import index as index_mod
 from pedacito.config import Config
 from pedacito.edits import Edit, apply_edits
@@ -335,6 +335,27 @@ def test_backup_dirs_and_sessions_never_merge_within_a_second(tmp_path):
     s1 = workspace.write_session(tmp_path, "t1", [], "r", [], None, "20260101-000000")
     s2 = workspace.write_session(tmp_path, "t2", [], "r", [], None, "20260101-000000")
     assert s1 != s2 and "t1" in s1.read_text() and "t2" in s2.read_text()
+
+
+def test_project_less_sessions_use_the_user_state_dir():
+    """A run with no project root writes its session log to
+    <USER_STATE_DIR>/sessions/global/, not into the current directory."""
+    p = workspace.write_session(None, "global task", [], "reply", [], None,
+                                "20260101-000000")
+    assert p == (config_mod.USER_STATE_DIR / "sessions" / "global"
+                 / "20260101-000000.md")
+    assert p.exists() and "global task" in p.read_text()
+    assert sessions.session_dir(None) == p.parent
+    assert [q.name for q in sessions.paths(None)] == ["20260101-000000.md"]
+    assert "global task" in sessions.recent(None)
+
+
+def test_user_state_dir_follows_the_platform_location(tmp_path, monkeypatch):
+    if os.name == "nt":
+        monkeypatch.setenv("LOCALAPPDATA", str(tmp_path))
+    else:
+        monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path))
+    assert config_mod._user_state_dir() == tmp_path / "pedacito"
 
 
 def test_prune_keeps_the_newest_and_trims_the_log(tmp_path):

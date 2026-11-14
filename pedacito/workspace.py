@@ -22,6 +22,7 @@ from pathlib import Path
 
 from . import fileio
 from .index import BACKUP_DIR, SESSION_DIR, state_dir
+from .sessions import session_dir
 
 IGNORE_FILE = ".pedacitoignore"
 
@@ -234,13 +235,14 @@ def restore(root: Path, snapshot: Path, dry_run: bool = False) -> list[str]:
     return restored
 
 
-def write_session(root: Path, task: str, steps: list[str], reply: str,
+def write_session(root: Path | None, task: str, steps: list[str], reply: str,
                   results, backup: Path | None, when: str | None = None,
                   raw_reply: str | None = None) -> Path:
     """Write a Markdown record of one task (request, lookups, reply, edits)
-    to .pedacito/sessions/<timestamp>.md. `raw_reply`, when given, is the
-    reply as the model emitted it, before trimming or continuation rounds."""
-    d = state_dir(root, SESSION_DIR)
+    to `.pedacito/sessions/<timestamp>.md`, or to the per-user
+    `sessions/global/` folder when `root` is None. `raw_reply`, when given, is
+    the reply as the model emitted it, before trimming or continuation rounds."""
+    d = session_dir(root)
     d.mkdir(parents=True, exist_ok=True)
     when = when or stamp()
     lines = [
@@ -256,7 +258,8 @@ def write_session(root: Path, task: str, steps: list[str], reply: str,
             lines.append(f"- {'applied' if r.ok else 'FAILED'} `{r.file}`: {r.message}")
     else:
         lines.append("- none")
-    if backup is not None and backup.exists() and any(backup.rglob("*")):
+    if backup is not None and root is not None and backup.exists() \
+            and any(backup.rglob("*")):
         lines += ["", f"Originals saved to `{backup.relative_to(root)}`.",
                   f"Restore with `pedacito restore {root} --snapshot {backup.name}`."]
     p = d / f"{when}.md"
