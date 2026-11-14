@@ -854,6 +854,12 @@ def _cmd_auto(args, cfg, client, idx, root: Path) -> int:
 
     verify = args.verify if getattr(args, "verify", None) is not None \
         else cfg.auto_verify
+    if verify and loop._task_named_tests(verify):
+        # BUG-1006: a test command the user typed at the CLI (or kept in
+        # trusted config) is consent to EXECUTE it -- the final gate already
+        # runs it every task; the per-step ladder must not claim "no test
+        # evidence" while the same pytest runs two sections away.
+        cfg._tests_user_consent = True
     verify_final = bool(getattr(args, "verify_final", False)
                         or getattr(cfg, "auto_verify_final", False))
     repair = args.repair if getattr(args, "repair", None) is not None \
@@ -3049,13 +3055,18 @@ def _main(argv=None) -> int:
             if getattr(args, "refine", False):
                 spec.text = _refine_task_text(cfg, client, root, spec.text,
                                               "new")
+            _new_verify = (args.verify
+                           if getattr(args, "verify", None) is not None
+                           else cfg.auto_verify)
+            if _new_verify and loop._task_named_tests(_new_verify):
+                # BUG-1006: same consent stamp as `auto` above.
+                cfg._tests_user_consent = True
             code = scaffold.run_new(
                 root, cfg, client, spec,
                 apply=args.apply, review=args.review,
                 plan_only=args.plan_only, force=args.force,
                 verbose=True, complex=args.complex,
-                verify=args.verify if getattr(args, "verify", None) is not None
-                else cfg.auto_verify,
+                verify=_new_verify,
                 repair_rounds=args.repair if getattr(args, "repair", None) is not None
                 else cfg.auto_repair_rounds,
                 max_tasks=args.max_tasks if getattr(args, "max_tasks", None) is not None

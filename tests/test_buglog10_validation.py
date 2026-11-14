@@ -155,3 +155,97 @@ def test_run_loop_dep_blocked_verify_rolls_back_ratchet(tmp_path, monkeypatch,
     # and its consumed checkpoint left no restore point behind.
     assert not (tmp_path / "helper.py").exists()
     assert not (tmp_path / ".pedacito" / "checkpoints" / "step_1").exists()
+
+
+# -- BUG-1006: a user-granted test command is consent to RUN it ---------------
+
+
+def test_test_run_consent_from_granted_commands_only():
+    """allow_shell remains the boundary for commands inferred from TASK
+    text; but a test command the user granted -- `test_command`, or the
+    `--verify` stamp the CLI sets -- is consent too. The chiptune run proved
+    the old reading wrong: `auto --apply --verify "pytest -q"` executed that
+    pytest from the step gate and recorded it in the ledger, while the same
+    ladder printed "no test evidence for it" minutes earlier."""
+    assert not loop._test_run_consent(_cfg(allow_shell=False))
+    assert loop._test_run_consent(_cfg(test_command="pytest -q"))
+    assert loop._test_run_consent(_cfg(test_command="  ")) is False
+    c = _cfg()
+    c._tests_user_consent = True          # what `auto --verify pytest` sets
+    assert loop._test_run_consent(c)
+
+
+def test_infer_task_checks_enablement_with_granted_test_command(
+        tmp_path, capsys):
+    cfg = _cfg(allow_shell=False, verify_tests=False,
+               test_command="pytest -q")
+    loop._infer_task_checks(tmp_path, cfg, "make pytest pass")
+    err = capsys.readouterr().err
+    assert "enabling verify_tests for this run" in err
+    assert "needs allow_shell" not in err
+
+
+def test_post_edit_tests_runs_granted_suite_without_allow_shell(
+        tmp_path, monkeypatch):
+    from pedacito import testsel
+
+    calls: list = []
+
+    def fake_impacted(index, cfg, changed):
+        calls.append(testsel.detect_test_command(index.root, cfg))
+        return True, "1 passed in 0.01s", "`pytest -q` (fake)"
+
+    monkeypatch.setattr(testsel, "detect_test_command",
+                        lambda root, cfg=None: "pytest -q")
+    monkeypatch.setattr(testsel, "run_impacted", fake_impacted)
+    agent = types.SimpleNamespace(_repair_from_findings=lambda *a, **k: "")
+
+    refused = loop._post_edit_tests(
+        tmp_path, _cfg(verify_tests=True, allow_shell=False), agent,
+        types.SimpleNamespace(root=tmp_path), "make pytest pass",
+        [], "", None, None, [])
+    assert calls == []                             # boundary still holds
+    assert refused[2] is None                      # no test verdict
+
+    granted = loop._post_edit_tests(
+        tmp_path, _cfg(verify_tests=True, allow_shell=False,
+                       test_command="pytest -q"), agent,
+        types.SimpleNamespace(root=tmp_path), "make pytest pass",
+        [], "", None, None, [])
+    assert calls == ["pytest -q"]                  # user command: consented
+    assert granted[2] is True                      # ... and it has a verdict
+
+
+def test_auto_cli_stamps_test_consent(tmp_path, monkeypatch):
+    """`pedacito auto --verify "pytest -q"` must reach the loop with the
+    consent stamp; a `--verify` that names no test command must not smuggle
+    any (that would make `--verify "rm -rf"` imply test consent)."""
+    from pedacito import cli
+
+    (tmp_path / "PLAN.md").write_text("Goal\n\n- [ ] Add helper\n",
+                                      encoding="utf-8")
+    seen: dict = {}
+
+    def spy(root, cfg, *a, **kw):
+        seen["consent"] = getattr(cfg, "_tests_user_consent", False)
+        return 0
+
+    monkeypatch.setattr(loop, "run_loop", spy)
+    from pedacito import scaffold
+    # The post-run smoke/verify stage drives the model; this test pins the
+    # consent stamp that reaches the loop, so stub the stage out.
+    monkeypatch.setattr(scaffold, "verify_and_fix",
+                        lambda *a, **k: (True, ""))
+    idx = types.SimpleNamespace(root=tmp_path)
+    args = types.SimpleNamespace(
+        task=None, spec=None, plan=None, force=False, apply=True,
+        refine=False, verify="pytest -q", verify_final=False, repair=None,
+        max_tasks=None, max_minutes=None, auto_install=False,
+        keep_going=False, diagnostics=False, worktree="")
+    cli._cmd_auto(args, _cfg(), None, idx, tmp_path)
+    assert seen.get("consent") is True
+
+    seen.clear()
+    args.verify = "make build"
+    cli._cmd_auto(args, _cfg(), None, idx, tmp_path)
+    assert seen.get("consent", False) is False

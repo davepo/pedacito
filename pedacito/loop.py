@@ -1700,6 +1700,24 @@ def _task_named_tests(task: str) -> str:
     return " ".join(m.group(0).split()) if m else ""
 
 
+def _test_run_consent(cfg) -> bool:
+    """Did the USER name a test command for this run -- via `test_command`
+    or a `--verify` that is itself a test command?
+
+    BUG-1006: `allow_shell` is the general execution boundary, but the
+    session/step final gate (`run_check` -> `run_verify`) already executes a
+    user-typed `--verify "pytest -q"` on every task and records it in the
+    ledger as kind="test" evidence, and the interface-lock checks run the
+    same pytest binary -- while `_post_edit_tests` ANDed its test subprocess
+    with `allow_shell` and printed "no test evidence gathered" mid-run. One
+    command, two contradictory verdicts. A command the user typed at the CLI
+    (or configured in trusted config) carries its own consent; task text,
+    which a worker may have written, does not."""
+    if bool((getattr(cfg, "test_command", "") or "").strip()):
+        return True
+    return bool(getattr(cfg, "_tests_user_consent", False))
+
+
 def _note_tests_not_run(root, cfg, task: str) -> None:
     """The honest verdict for a task that named a test command while the
     test subprocess was switched off: no test evidence was gathered."""
@@ -1707,7 +1725,8 @@ def _note_tests_not_run(root, cfg, task: str) -> None:
     if not named:
         return
     print(f"  [tests: NOT RUN -- the task names '{named}' but "
-          "verify_tests/allow_shell is off; this run gathered no test "
+          "verify_tests/allow_shell is off and no test command was granted "
+          "(--verify or test_command); this run gathers no test "
           "evidence for it]", file=sys.stderr)
     workspace.log_event(
         root, f"tests not run although the task names '{named}' "
@@ -1737,14 +1756,15 @@ def _infer_task_checks(root, cfg, task: str) -> None:
     named = _task_named_tests(task)
     if named and not getattr(cfg, "verify_tests", False):
         cfg.verify_tests = True
-        if shell:
+        if shell or _test_run_consent(cfg):
             print(f"  [task names '{named}'; enabling verify_tests for this "
                   "run]", file=sys.stderr)
             workspace.log_event(root, f"verify_tests enabled: the task names "
                                       f"'{named}'", "INFO")
         else:
             print(f"  [task names '{named}'; verify_tests is on but the test "
-                  "subprocess also needs allow_shell -- this run will report "
+                  "subprocess also needs allow_shell or a granted test "
+                  "command (--verify/test_command) -- this run will report "
                   "no test evidence]", file=sys.stderr)
             workspace.log_event(root, f"verify_tests enabled but blocked: "
                                       f"'{named}' named, allow_shell off",
@@ -2269,10 +2289,15 @@ def _post_edit_tests(root, cfg, agent, idx, task, results, reply, backup_dir,
     run without the flags. A config that disabled the shell used to disable
     every check too, so an `ask` build could report "applied and verified"
     while its ES module graph could not even link; now the gates always
-    vet, and only the test subprocess honours the flags.
+    vet, and only the test subprocess honours the flags. BUG-1006 amended
+    that last sentence: a test command the USER granted (`--verify` naming
+    one, or `test_command`) carries its own consent -- the final gate and
+    the ledger already run and record exactly that command every task, so
+    the ladder may too.
     """
     tests_wanted = bool(getattr(cfg, "verify_tests", False)) \
-        and bool(getattr(cfg, "allow_shell", False))
+        and (bool(getattr(cfg, "allow_shell", False))
+             or _test_run_consent(cfg))
     gates_wanted = (_static_enabled(cfg) or _frontend_enabled(cfg)
                     or bool(getattr(cfg, "interface_lock", True))
                     or _dom_wanted(cfg))
@@ -3480,7 +3505,8 @@ def _run_task_once(root: Path, cfg, client, agent, idx, task: str, *,
         pre = _fire(cfg, root, "pre_edit", files=edit_files, task=task[:300])
         baseline_tests = None
         if edit_files and getattr(cfg, "verify_tests", False) \
-                and getattr(cfg, "allow_shell", False):
+                and (getattr(cfg, "allow_shell", False)
+                     or _test_run_consent(cfg)):
             baseline_tests = _run_tests(idx, cfg, edit_files)
             _note_baseline_lesson_run(root, cfg, baseline_tests)
         _capture_dom_baseline(root, cfg, edit_files)
@@ -3582,7 +3608,8 @@ def _run_task_once(root: Path, cfg, client, agent, idx, task: str, *,
             baseline_tests = None
             if apply and not review and edit_files and getattr(
                     cfg, "verify_tests", False) \
-                    and getattr(cfg, "allow_shell", False):
+                    and (getattr(cfg, "allow_shell", False)
+                         or _test_run_consent(cfg)):
                 baseline_tests = _run_tests(idx, cfg, edit_files)
                 _note_baseline_lesson_run(root, cfg, baseline_tests)
             if apply and not review:
