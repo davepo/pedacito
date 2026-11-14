@@ -4,12 +4,14 @@ from __future__ import annotations
 import random
 import re
 import sys
+from dataclasses import fields
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from pedacito import config as config_mod
 from pedacito import config_editor as E
+from pedacito.cli import main
 
 
 # --- short_name ---------------------------------------------------------------
@@ -327,6 +329,15 @@ def test_roundtrip_single_ops_seeded():
         text, names, regions = _gen_config(r)
         flat0, prof0 = E.validate_text(text)      # generator sanity
         comments = _comment_lines(text)
+
+        # The additive upgrader may only append commented options: the active
+        # settings and profiles before and after must be byte-for-byte equal
+        # once parsed, and a second pass must be a no-op.
+        upgraded, _added_keys = E.upgrade_config_text(text)
+        up_flat, up_prof = E.validate_text(upgraded)
+        assert up_flat == flat0 and up_prof == prof0, (seed, up_flat, flat0)
+        assert E.upgrade_config_text(upgraded) == (upgraded, [])
+
         key = r.choice(_SAFE_KEYS)
         val = _safe_value(r, key)
 
@@ -467,3 +478,195 @@ def test_set_value_keeps_tail_after_escaped_triple_quote():
     E.validate_text(out)
     assert "# keep me" in out
     assert "vram_gb = 8" in out
+
+
+# --- additive config upgrade --------------------------------------------------
+
+_OLD_CONFIG = '''\
+# my laptop config -- don't touch these comments
+vram_gb = 24
+scout_profile = "fast"
+
+[universal]
+timeout = 120.0
+# keep my temperature low for code
+temperature = 0.1
+
+[profiles.worker]
+base_url = "http://localhost:1234/v1"
+model = "qwen3:14b"
+
+[profiles.fast]
+model = "gemma3:4b"
+
+[mcp_servers.docs]
+command = "python"
+args = ["docs.py"]
+'''
+
+
+def test_upgrade_config_preserves_all_user_settings_and_profiles():
+    old_text = _OLD_CONFIG
+    flat0, prof0 = E.validate_text(old_text)
+
+    new_text, added = E.upgrade_config_text(old_text)
+
+    for key in ("verify_dom", "enable_prompt_cache", "auto_escalate"):
+        assert key in added
+    # A key the file already sets is never appended, active or commented.
+    assert "vram_gb" not in added and "scout_profile" not in added
+
+    # Zero active settings or profiles changed: the appended lines are all
+    # comments.
+    flat1, prof1 = E.validate_text(new_text)
+    assert flat1 == flat0
+    assert prof1 == prof0
+    assert prof1["worker"]["model"] == "qwen3:14b"
+
+    # Every user comment and profile table survives verbatim.
+    for line in ("# my laptop config -- don't touch these comments",
+                 "# keep my temperature low for code",
+                 "[profiles.worker]", "[profiles.fast]",
+                 "[mcp_servers.docs]",
+                 'model = "gemma3:4b"'):
+        assert line in new_text
+    # Everything before the insertion point is untouched, byte for byte.
+    assert new_text.startswith(
+        old_text.split("[profiles.worker]")[0].rstrip("\n"))
+
+
+def test_upgrade_config_is_idempotent():
+    new_text, added = E.upgrade_config_text(_OLD_CONFIG)
+    assert added
+
+    text2, added2 = E.upgrade_config_text(new_text)
+    assert added2 == []
+    assert text2 == new_text
+
+    # The reference template already documents every canonical option.
+    reference_text, reference_added = E.upgrade_config_text(
+        config_mod.REFERENCE_TEMPLATE)
+    assert reference_added == []
+    assert reference_text == config_mod.REFERENCE_TEMPLATE
+
+
+def test_upgrade_config_respects_commented_out_user_keys():
+    text = ('# verify_dom = true  # I turned this on locally\n'
+            'vram_gb = 24\n')
+    out, added = E.upgrade_config_text(text)
+    assert "verify_dom" not in added
+    assert out.count("# verify_dom") == 1
+    assert "# verify_dom = false" not in out
+    E.validate_text(out)
+
+
+def test_cli_config_upgrade_and_auto_sync(tmp_path, monkeypatch, capsys):
+    cfg_path = tmp_path / "config.toml"
+    cfg_path.write_text(_OLD_CONFIG, encoding="utf-8")
+
+    assert main(["config", "--upgrade", "--dry-run",
+                 "--path", str(cfg_path)]) == 0
+    dry_out = capsys.readouterr().out
+    assert "would be added" in dry_out
+    assert cfg_path.read_text(encoding="utf-8") == _OLD_CONFIG
+    assert not cfg_path.with_name("config.toml.bak").exists()
+
+    assert main(["config", "--upgrade", "--path", str(cfg_path)]) == 0
+    out = capsys.readouterr().out
+    assert "added" in out and "verify_dom" in out
+    backup = cfg_path.with_name("config.toml.bak")
+    assert backup.read_text(encoding="utf-8") == _OLD_CONFIG
+    upgraded = cfg_path.read_text(encoding="utf-8")
+    assert "# verify_dom = false" in upgraded
+
+    # A subsequent load() sees the user's custom values untouched.
+    monkeypatch.setattr(config_mod, "USER_CONFIG", cfg_path)
+    cfg = config_mod.load(use_env=False, require_hardware=False,
+                          warn_budgets=False)
+    assert cfg.vram_gb == 24
+    assert cfg.scout_profile == "fast"
+    assert cfg.temperature == 0.1
+    assert cfg.profiles["worker"]["model"] == "qwen3:14b"
+    assert cfg.sources["vram_gb"] == f"user config ({cfg_path})"
+
+    # Auto-sync on load: an installed user config gains the missing options,
+    # commented, with one notice, and a second load is silent.
+    auto_path = tmp_path / "auto.toml"
+    auto_path.write_text(_OLD_CONFIG, encoding="utf-8")
+    monkeypatch.setattr(config_mod, "USER_CONFIG", auto_path)
+    config_mod.load(use_env=False, require_hardware=False, warn_budgets=True)
+    err = capsys.readouterr().err
+    assert "[config: added" in err and "verify_dom" in err
+    assert "# verify_dom = false" in auto_path.read_text(encoding="utf-8")
+    assert auto_path.with_name("auto.toml.bak").exists()
+    config_mod.load(use_env=False, require_hardware=False, warn_budgets=True)
+    assert "[config: added" not in capsys.readouterr().err
+
+
+# --- config schema / GUI metadata drift guard ---------------------------------
+
+# Runtime bookkeeping, not user-configurable settings.
+_NON_SETTING_FIELDS = {"sources", "profiles", "active_profile", "active_tier",
+                       "model_size_bytes", "_hosted_server"}
+
+
+def _user_config_fields() -> list[str]:
+    return [f.name for f in fields(config_mod.Config)
+            if f.name not in _NON_SETTING_FIELDS
+            and not f.name.startswith("_")]
+
+
+def test_config_schema_and_gui_drift_guard():
+    """Adding a Config field must show up in every user-facing surface.
+
+    Guards the four places a new setting can silently go missing:
+    REFERENCE_TEMPLATE (`config --reference` / `config --upgrade`), the GUI's
+    All settings help, the documented built-in default, and the `how` index.
+    """
+    user_fields = _user_config_fields()
+    assert user_fields
+
+    # 1. REFERENCE_TEMPLATE parity, in both directions.
+    blocks = E.reference_option_blocks()
+    by_key = {b["key"]: b for b in blocks}
+    assert set(by_key) == set(user_fields), (
+        "missing from REFERENCE_TEMPLATE: "
+        f"{sorted(set(user_fields) - set(by_key))}; "
+        "not a Config field: "
+        f"{sorted(set(by_key) - set(user_fields))}")
+    assert set(by_key) <= set(config_mod._FIELDS)
+    for block in blocks:
+        # New options are appended commented out, never active.
+        assert block["block"][-1].lstrip().startswith("#"), block["key"]
+
+    # 2. Non-empty help in the reference and in the GUI's All settings payload.
+    ref_help = E.reference_setting_help()
+    from pedacito.gui import settings as gui_settings
+    schema = {item["name"]: item for item in gui_settings.schema()}
+    for name in user_fields:
+        assert ref_help.get(name, "").strip(), f"{name}: no REFERENCE help"
+        assert name in schema, f"{name}: missing from the GUI settings schema"
+        assert schema[name]["help"].strip(), f"{name}: no GUI help text"
+
+    # 3. The documented default matches Config(), so a stale reference default
+    #    cannot ship. vram_gb is hardware-mandatory (the starter uses 8); the
+    #    "unset" TOML samples legitimately stand for None.
+    defaults = E.reference_setting_defaults()
+    annotations = E.reference_annotations()
+    base = config_mod.Config()
+    for name in user_fields:
+        assert name in defaults, f"{name}: no documented default"
+        want = getattr(base, name)
+        if annotations[name]["unset"]:
+            assert want is None, name
+            continue
+        if name == "vram_gb":
+            continue
+        assert config_mod._coerce(name, defaults[name]) == want, name
+
+    # 4. The `how` settings reference indexes every setting.
+    from pedacito import how_index
+    indexed = {item["key"] for item in how_index.settings_dictionary()}
+    assert set(user_fields) <= indexed, (
+        f"missing from the how settings index: "
+        f"{sorted(set(user_fields) - indexed)}")

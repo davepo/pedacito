@@ -410,11 +410,11 @@ CLI_COMMANDS = [
     {
         "name": "config",
         "usage": "pedacito config [--init | --setup | --check | --doctor | "
-                 "--reference]",
+                 "--upgrade [--dry-run] | --reference]",
         "summary": "Show every resolved setting and where it came from; create, "
-                   "test or print the config.",
+                   "test, print, or add newly documented options to the config.",
         "keywords": ["config file", "config.toml", "setup", "check", "doctor",
-                     "reference", "settings"],
+                     "reference", "settings", "upgrade", "up to date"],
         "examples": [
             "pedacito config",
             "pedacito config --init",
@@ -422,6 +422,8 @@ CLI_COMMANDS = [
             "pedacito config --setup",
             "pedacito config --check",
             "pedacito config --doctor",
+            "pedacito config --upgrade",
+            "pedacito config --upgrade --dry-run",
             "pedacito config --reference",
             "pedacito config --profile big",
         ],
@@ -429,7 +431,7 @@ CLI_COMMANDS = [
             {"flag": "--init",
              "help": "write a starter config to the user config path"},
             {"flag": "--path FILE",
-             "help": "with --init/--reference: use this file"},
+             "help": "with --init/--reference/--upgrade: use this file"},
             {"flag": "--force", "help": "overwrite an existing file"},
             {"flag": "--check",
              "help": "connect to the server and verify the model loads"},
@@ -437,6 +439,12 @@ CLI_COMMANDS = [
              "help": "like --check plus structured-output and context probes"},
             {"flag": "--setup",
              "help": "interactive first-run setup"},
+            {"flag": "--upgrade",
+             "help": "append newly documented options commented out, keeping "
+                     "every existing setting and comment"},
+            {"flag": "--dry-run",
+             "help": "with --upgrade: list the options that would be added "
+                     "without writing the file"},
             {"flag": "--reference",
              "help": "print (or write with --path) the annotated template"},
             {"flag": "--root DIR", "help": "project root"},
@@ -2042,6 +2050,8 @@ _SETTING_KEYWORDS = {
 def _fallback_schema() -> list[dict]:
     """A minimal schema when the GUI package cannot be imported."""
     from dataclasses import MISSING, fields
+    from . import config_editor
+    help_by = config_editor.reference_setting_help()
     out = []
     base = Config()
     for field in fields(Config):
@@ -2056,8 +2066,8 @@ def _fallback_schema() -> list[dict]:
         if isinstance(default, tuple):
             default = list(default)
         out.append({"name": field.name, "type": "str", "default": default,
-                    "group": "General", "help": "", "choices": None,
-                    "secret": False})
+                    "group": "General", "help": help_by.get(field.name, ""),
+                    "choices": None, "secret": False})
     return out
 
 

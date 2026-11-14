@@ -25,10 +25,12 @@ Unknown keys are reported rather than ignored.
 from __future__ import annotations
 
 import difflib
+import inspect
 import json
 import os
 import re
 import sys
+import textwrap
 import tomllib
 from dataclasses import MISSING, dataclass, field, fields
 from pathlib import Path
@@ -1255,10 +1257,16 @@ def _drop_untrusted(path: Path, settings: dict, root, quiet: bool = False
 
 def load(root: Path | None = None, explicit: Path | None = None,
          use_env: bool = True, profile: str | None = None,
-         require_hardware: bool = True, warn_budgets: bool = True) -> Config:
+         require_hardware: bool = True, warn_budgets: bool = True,
+         upgrade_user_config: bool = True) -> Config:
     """Build a Config by layering defaults, user config, project config, an
     explicit --config file, the selected profile, then PEDACITO_* environment
     variables. `cfg.sources` records which layer set each field.
+
+    `upgrade_user_config` (default on) appends options a new release documents
+    that the installed user config lacks, commented out. The GUI's own
+    post-write reloads pass False: they are reflecting a file they just wrote,
+    not converging an installed config.
 
     `vram_gb` is mandatory for local servers (auto-fit needs it); hosted APIs
     never need it. `pedacito config` passes require_hardware=False so it can
@@ -1270,6 +1278,21 @@ def load(root: Path | None = None, explicit: Path | None = None,
 
     layers: list[tuple[str, Path]] = []
     if USER_CONFIG.exists():
+        # Additive schema upgrade: a new release may document settings this
+        # file has never seen. They are appended COMMENTED OUT, so existing
+        # values, profiles and comments survive and the new keys do not
+        # become "user"-sourced (which would block auto_fit/model cards).
+        # Read-only homes and sandboxes must never break loading.
+        if upgrade_user_config:
+            try:
+                from . import config_editor
+                added = config_editor.upgrade_config_file(USER_CONFIG)
+            except (OSError, ConfigError):
+                added = []
+            if added and warn_budgets:
+                print(f"[config: added {len(added)} new default option(s) to "
+                      f"{USER_CONFIG} (commented out; your settings were "
+                      f"untouched): {', '.join(added)}]", file=sys.stderr)
         layers.append(("user config", USER_CONFIG))
     if root is not None:
         proj = find_project_config(Path(root))
@@ -2206,6 +2229,180 @@ def _toml_literal(value) -> str:
     return json.dumps(str(value))
 
 
+# Help for fields whose `Config` declaration has no comment block of its own
+# (adjacent fields share a paragraph, or the comment sits on the group header).
+# The per-setting reference section, the GUI's All settings tab, and the `how`
+# index all read the merged text from REFERENCE_TEMPLATE, so one entry here
+# documents the key everywhere.
+_EXTRA_FIELD_HELP = {
+    "base_url": "Base URL of the OpenAI-compatible model server (or hosted "
+                "API), including the /v1 suffix.",
+    "api_key": "API key sent to the server. Local servers ignore it, so any "
+               "string works; prefer api_key_env for hosted APIs.",
+    "model": "Model id exactly as the server reports it.",
+    "timeout": "Seconds to wait for one request before failing.",
+    "temperature": "Sampling temperature for gather steps; keep it low for "
+                   "reliable tool calls. The answer phase uses "
+                   "temperature_answer.",
+    "temperature_repair": "Temperature for repair re-asks; unset uses the "
+                          "global temperature.",
+    "max_tokens_summary": "Output-token budget for one indexing summary call.",
+    "max_tokens_answer": "Output-token budget for the answer phase.",
+    "max_tokens_build": "Output-token budget for the scaffold build call.",
+    "max_unit_chars": "Split a function, method or preamble larger than this "
+                      "many characters into name#2, name#3, ... parts.",
+    "summarise_documented": "Also summarise units that already have a "
+                            "docstring.",
+    "summarise_references": "Summarise reference files (markdown, JSON, ...) "
+                            "instead of listing only their structure.",
+    "max_instruction_chars": "Cap on project instruction text included in "
+                             "every prompt.",
+    "max_no_progress_steps": "Consecutive gather steps that add no new code "
+                             "or symbol before gather ends cleanly.",
+    "max_task_seconds": "Wall-clock ceiling for one task; 0 disables it.",
+    "max_read_lines": "Maximum lines returned by one `read` call.",
+    "diagnostics_timeout": "Seconds allowed for one auto-diagnostics "
+                            "linter/typechecker run.",
+    "max_diagnostics_chars": "Cap on diagnostics text fed back into repair.",
+    "mcp_timeout": "Seconds allowed for one MCP server request.",
+    "lsp_servers": "Map file extensions to language-server commands, e.g. "
+                   '{ ".py" = "pyright-langserver --stdio" }.',
+    "lsp_timeout": "Seconds allowed for one language-server request.",
+    "serve_wait": "Seconds to wait for a background server to print its "
+                  "localhost URL.",
+    "browser_headless": "Run the browser action headless (no visible window).",
+    "vision_max_tokens": "Output-token cap for the vision model's screenshot "
+                         "description.",
+    "semantic_top_k": "Number of nearest indexed units semantic search reports.",
+    "fuzzy_min_ratio": "Minimum similarity for a fuzzy edit anchor; below "
+                       "this the edit fails instead of guessing.",
+    "auto_checkpoint_max_files": "Maximum files recorded in one auto-step "
+                                 "snapshot; the walk stops there.",
+    "auto_smoke_timeout": "Seconds allowed for the post-build smoke run.",
+    "thinking_suffix": "Soft no-thinking suffix appended to the last message "
+                       "(e.g. /no_think); empty picks one for Qwen3/SmolLM3.",
+    "review_port": "Port for the review page; 0 lets the OS choose a free "
+                   "one.",
+    "open_browser": "Open the review page in a browser automatically.",
+    "review_timeout": "Seconds before an unanswered review page expires.",
+    "enable_prompt_lookup": "Add prompt_lookup_num_tokens to self-hosted "
+                            "endpoints to enable n-gram speculative decoding.",
+    "prompt_lookup_num_tokens": "Draft tokens requested per step for n-gram "
+                                "prompt lookup.",
+    "circuit_failures": "Consecutive transport/server failures before the "
+                        "circuit opens.",
+    "circuit_cooldown": "Seconds the circuit stays open before one probe is "
+                        "allowed.",
+    "price_output_per_mtok": "USD per million output tokens, used for cost "
+                             "reporting and max_cost.",
+    "price_cached_per_mtok": "USD per million cache-read tokens, used for "
+                             "cost reporting.",
+    "max_whole_file_lines": "Refuse a whole-file rewrite larger than this many "
+                            "lines in a small context.",
+    "max_brief_tokens": "Token cap for the deterministic repository brief.",
+    "test_command": "Shell command used to run tests; empty auto-detects "
+                    "pytest, npm test and similar.",
+    "test_timeout": "Seconds allowed for one test-command run.",
+    "dom_entry": "Entry HTML page for the DOM smoke check; empty auto-detects "
+                 "it.",
+    "dom_timeout": "Seconds allowed for one DOM page load.",
+    "max_memory_chars": "Cap on project and user memory text included in "
+                        "prompts.",
+    "max_skill_catalog_chars": "Cap on the skills catalog block in prompts.",
+    "subagent_max_steps": "Lookup-step limit for one `task` subagent.",
+    "git_context": "Include branch, dirty state and recent commits in the "
+                   "prompt.",
+    "hook_timeout": "Seconds allowed for one hook command.",
+    "fetch_allowed_hosts": "Hosts the `fetch` action may contact; empty means "
+                           "none.",
+    "max_fetch_chars": "Cap on fetched page text fed back to the model.",
+    "keep_backups": "Backups kept by `pedacito prune`; 0 keeps everything.",
+    "keep_events": "Event files kept by `pedacito prune`; 0 keeps everything.",
+    "log_max_bytes": "Rotate the event log after this many bytes.",
+    "v_cache_quant": "V-cache quantization the server was loaded with (f16, "
+                     "bf16, q8_0, q5_1, q5_0, q4_1, q4_0, iq4_nl, iq4_xs); "
+                     "empty means 16-bit.",
+}
+
+
+def _config_field_help() -> dict[str, str]:
+    """{field: help text} from the `Config` dataclass's own comment blocks,
+    with `_EXTRA_FIELD_HELP` filling fields that share a paragraph."""
+    help_by: dict[str, str] = {}
+    try:
+        source = inspect.getsource(Config)
+    except (OSError, TypeError):
+        return dict(_EXTRA_FIELD_HELP)
+    comment: list[str] = []
+    group_re = re.compile(r"^\s{4}#\s*---+\s*(.*?)\s*-+\s*$")
+    comment_re = re.compile(r"^\s{4}#\s?(.*)$")
+    field_re = re.compile(r"^\s{4}([A-Za-z_]\w*)\s*:\s*[^=]+?(?:=.*)?$")
+    for line in source.splitlines():
+        if not line.strip():
+            comment = []
+            continue
+        if group_re.match(line):
+            comment = []
+            continue
+        c = comment_re.match(line)
+        if c:
+            comment.append(c.group(1).rstrip())
+            continue
+        f = field_re.match(line)
+        if f:
+            if comment:
+                text = " ".join(t for t in comment if t).strip()
+                if text:
+                    help_by[f.group(1)] = text
+            comment = []
+            continue
+        comment = []
+    for name, text in _EXTRA_FIELD_HELP.items():
+        help_by.setdefault(name, text)
+    return help_by
+
+
+# Marks the generated, per-setting annotation section at the end of
+# REFERENCE_TEMPLATE. config_editor parses this section for GUI help and for
+# the drift guard's default-value comparison.
+REFERENCE_ANNOTATION_HEADER = "# --- Per-setting defaults and help ---"
+
+
+def _reference_setting_annotations() -> str:
+    """A comment block for every user-facing setting: its help text and its
+    exact built-in default (or an 'unset by default' sample when TOML has no
+    null). Generated from `Config` so `--reference`, the GUI and the upgrader
+    all carry the same documentation."""
+    help_by = _config_field_help()
+    base = Config()
+    out = ["", "", REFERENCE_ANNOTATION_HEADER,
+           "#",
+           "# Every user-facing setting with its built-in default and a",
+           "# description. A line marked \"unset by default\" has no TOML",
+           "# representation (null); the sample shows the shape the key accepts."]
+    for name in _FIELDS:
+        if name == "active_tier":       # bookkeeping, not a user setting
+            continue
+        out.append("")
+        text = help_by.get(name, "").strip() or f"The `{name}` setting."
+        for chunk in textwrap.wrap(text, width=78):
+            out.append("# " + chunk)
+        value = getattr(base, name)
+        if value is None:
+            if _OPTIONAL_TYPES.get(name) is bool:
+                sample = "true"
+            elif name == "edit_style":
+                sample = '""'
+            else:
+                sample = "0.0"
+            out.append(f"# {name} = {sample}   # unset by default: the model "
+                       "card or the global value decides")
+        else:
+            out.append(f"# {name} = {_toml_literal(value)}")
+    return "\n".join(out)
+
+
+
 _PROFILE_FIELD_EXCLUDE = {
     "base_url", "model", "vram_gb", "default_profile", "tier", "active_tier",
 }
@@ -2231,7 +2428,7 @@ def _profile_override_comments() -> str:
             out.append(f"# {name} = {sample}   # unset: {unset}")
             continue
         if name == "edit_style":
-            out.append('# edit_style = "anchor"   # unset: the model card decides')
+            out.append('# edit_style = ""   # unset: the model card decides')
             continue
         out.append(f"# {name} = {_toml_literal(value)}")
     return "\n".join(out)
@@ -2259,13 +2456,13 @@ TEMPLATE = '''\
 # Precedence: built-ins < this file < project .pedacito.toml < --config FILE
 #             < --profile NAME < CLI flags.
 
-default_profile = "default"
+# default_profile = ""
 
 # Dual-model scout/architect routing: name a [profiles.*] profile whose faster
 # model runs the gather lookup loop (grep/read/outline/symbol/usages) while
 # planning, answers, and edits stay on the active profile. A classic two-GPU
 # setup: a 27B architect on a 24 GB card, a fast 9B scout on a 16 GB card.
-# scout_profile = "scout"
+# scout_profile = ""    # e.g. scout_profile = "scout"
 
 [universal]
 # Connection, generation, and shared hardware/workspace defaults. A profile
@@ -2279,10 +2476,9 @@ json_mode = "schema"
 # response_format json_schema so the server constrains sampling to valid
 # tool-call JSON; a 400 downgrades that endpoint automatically.
 enforce_json_schema = true
-# tool_mode = "native"      # lookup steps via the model's tool-call channel
-#                           # ("grammar" = JSON schema); `pedacito calibrate` picks
+# tool_mode = "grammar"     # "native" = the model's tool-call channel
 temperature = 0.2
-# sampler = { top_p = 0.95, top_k = 40, min_p = 0.05, repeat_penalty = 1.1 }
+# sampler = {}              # e.g. { top_p = 0.95, top_k = 40, min_p = 0.05 }
 disable_thinking = false
 thinking_suffix = ""
 # Local inference acceleration (self-hosted endpoints only; hosted servers
@@ -2417,8 +2613,9 @@ auto_allowlist = false
 diagnostics_timeout = 90
 max_diagnostics_chars = 8000
 allow_mcp = false
-# Legacy format: a list of stdio command strings for the `mcp` catalog action.
-mcp_servers = []
+# Legacy format: an empty table here means "none defined"; the catalog action
+# also accepts a list of stdio command strings, e.g. ["python server.py"].
+mcp_servers = {}
 mcp_timeout = 30
 # Named MCP servers (`mcp_call`, gated by enable_mcp): [mcp_servers.<name>]
 # tables with command + args (stdio) or url (HTTP), optional env, enabled
@@ -2430,7 +2627,7 @@ mcp_timeout = 30
 # env = {}
 # trusted = false
 allow_lsp = false
-# lsp_servers = { ".py" = "pyright-langserver --stdio" }
+# lsp_servers = {}          # e.g. { ".py" = "pyright-langserver --stdio" }
 lsp_timeout = 10.0
 
 # Autonomous loop (`pedacito auto`).
@@ -2471,7 +2668,7 @@ model    = "google/gemma-3-27b"
 # Uncomment only the keys this profile needs; a profile beats [universal],
 # [indexing], and [agent].
 # vram_gb = 8                   # optional per-model hardware override
-# tier = "medium"               # tiny | small | medium | large | hosted
+# tier = ""                     # tiny | small | medium | large | hosted
 ''' + _profile_override_comments() + '''
 
 # --- Local model example (Qwen) --------------------------------------------
@@ -2727,7 +2924,7 @@ REFERENCE_TEMPLATE = TEMPLATE + '''
 # `tier` is a shortcut that applies a preset (tiny, small, medium, large,
 # hosted) underneath the keys you write explicitly. Without `tier`, Pedacito
 # guesses from the model name; set tier = "" to disable guessing.
-'''
+''' + _reference_setting_annotations()
 
 
 # Server discovery lives in `discovery.py`, which labels servers by fingerprint
@@ -2872,6 +3069,10 @@ model    = "google/gemma-3-27b"
 ''',
         "[profiles.default]\n" + "\n".join(lines[3:]) + "\n")
     body = body.replace("vram_gb = 8\n", f"vram_gb = {vram_gb}\n", 1)
+    # The starter selects the generated default profile explicitly; the
+    # reference template documents "" (the built-in default) instead.
+    body = body.replace('# default_profile = ""',
+                        'default_profile = "default"', 1)
     # Fallback if the template shape changes: still write a valid file.
     if body == TEMPLATE:
         body = "\n".join(lines) + f"\n\n[universal]\nvram_gb = {vram_gb}\n"
@@ -2923,8 +3124,7 @@ model    = "google/gemma-3-27b"
 # Keys that belong to the USER's machine: which model server to reach, which
 # model to send it, how much VRAM it has, and which profile answers for every
 # project. They are mandatory in the user starter, and wrong in a project file.
-_USER_SCOPE_KEYS = ('default_profile = "default"',
-                    'base_url = "http://localhost:1234/v1"',
+_USER_SCOPE_KEYS = ('base_url = "http://localhost:1234/v1"',
                     'model    = "google/gemma-3-27b"',
                     "vram_gb = 8")
 

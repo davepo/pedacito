@@ -9,6 +9,8 @@ CLI can use them without importing the GUI package:
     rename_profile(text, old, new)    rename a table and its references
     short_name(model_id, ...)         derive a profile name from a model id
     upsert_profiles(text, found)      append identity-only profiles idempotently
+    upgrade_config_text(text)         append newly documented options commented
+    upgrade_config_file(path)         the same, with a backup, as a file edit
 
 Edits are textual patches rather than a parse-and-rewrite, so the comments in
 the starter template survive. Every edit is validated with the same code the
@@ -17,6 +19,7 @@ loader uses before anything is written.
 
 from __future__ import annotations
 
+import os
 import re
 import tomllib
 from datetime import date
@@ -52,6 +55,7 @@ def validate_text(text: str, label: str = "config") -> tuple[dict, dict]:
 SEP = "\x1f"
 _HEADER_RE = re.compile(r"^\s*(\[\[?)\s*(.+?)\s*\]\]?\s*(?:#.*)?$")
 _ASSIGN_RE = re.compile(r"^(\s*)([A-Za-z0-9_-]+|\"[^\"]*\"|'[^']*')\s*=\s*(.*)$")
+_COMMENT_ASSIGN_RE = re.compile(r"^\s*#\s*([a-z][a-z0-9_]*)\s*=")
 
 
 def _split_dotted(name: str) -> list[str]:
@@ -225,6 +229,25 @@ def _find_key(lines: list[str], region: dict, key: str):
     return None
 
 
+def _find_commented_key(lines: list[str], region: dict, key: str):
+    """(line, indent) of a commented-out `# key = ...` in the region, or None."""
+    pattern = re.compile(r"^(\s*)#\s*" + re.escape(key) + r"\s*=")
+    state = ""
+    i = region["start"]
+    while i < region["end"]:
+        line = lines[i]
+        if state:
+            state = _triple_toggles(line, state)
+            i += 1
+            continue
+        m = pattern.match(line)
+        if m:
+            return i, len(m.group(1))
+        state = _triple_toggles(line, state)
+        i += 1
+    return None
+
+
 def _last_assignment_end(lines: list[str], region: dict) -> int:
     """Line index after which a new key can be inserted: the end of the last
     uncommented assignment, else the header line itself."""
@@ -321,6 +344,23 @@ def set_values(text: str, changes: dict | None = None,
             else:
                 lines.insert(_last_assignment_end(lines, r) + 1, new_line)
         else:
+            # `default_profile` belongs at the top level, not in [universal]:
+            # a commented reference line is activated in place, and a config
+            # with no such line gets one before the first table.
+            if key == "default_profile":
+                root = region_for("")
+                found = _find_commented_key(lines, root, key) \
+                    if root is not None else None
+                if found is not None:
+                    i, indent = found
+                    lines[i] = " " * indent + new_line
+                    continue
+                if root is not None:
+                    at = root["end"]
+                    while at > root["start"] and not lines[at - 1].strip():
+                        at -= 1
+                    lines.insert(at, new_line)
+                    continue
             r = region_for("universal")
             if r is None:
                 if lines and lines[-1].strip():
@@ -331,6 +371,314 @@ def set_values(text: str, changes: dict | None = None,
 
     out = nl.join(lines)
     return out + nl if (trailing_nl or not out) else out
+
+
+# --- additive config upgrade ---------------------------------------------------
+#
+# A new Pedacito release can document settings an installed config.toml has
+# never seen. Rewriting the file would discard the user's values, profiles and
+# comments, and writing the new keys ACTIVE would mark them "user" in
+# cfg.sources, blocking auto_fit / model cards from tuning them (and tripping
+# the EXEC_FIELDS trust gate in a project file). So the upgrader only APPENDS
+# the missing keys as commented-out defaults, with the reference template's
+# explanatory comments, at the end of [universal].
+
+_UPGRADE_HEADER = "# --- Added by pedacito config upgrade ---"
+
+
+def _prose_above(lines: list[str], i: int) -> list[str]:
+    """The contiguous comment lines directly above `lines[i]` that are prose:
+    stop at an assignment, a section header, or a divider."""
+    prefix: list[str] = []
+    j = i - 1
+    while j >= 0:
+        prev = lines[j]
+        stripped = prev.strip()
+        if not stripped.startswith("#"):
+            break
+        if _COMMENT_ASSIGN_RE.match(prev):
+            break
+        body = stripped.lstrip("#").strip()
+        if body.startswith("[") or body.startswith("---"):
+            break
+        prefix.insert(0, prev.rstrip())
+        j -= 1
+    return prefix
+
+
+def _normalised_setting(lines: list[str], i: int) -> str:
+    """The setting line at `lines[i]`, active or commented, forced to a
+    commented-out assignment so an appended option can never take effect."""
+    line = lines[i].strip()
+    active = _ASSIGN_RE.match(lines[i])
+    if active and not lines[i].lstrip().startswith("#"):
+        line = "# " + line
+    return line
+
+
+def _setting_lines(lines: list[str]):
+    """Yield (index, key, is_active) for every config-key assignment, skipping
+    multi-line strings so a '# key =' inside one is never mistaken for one."""
+    state = ""
+    for i, line in enumerate(lines):
+        if state:
+            state = _triple_toggles(line, state)
+            continue
+        active = _ASSIGN_RE.match(line)
+        commented = _COMMENT_ASSIGN_RE.match(line)
+        key = ""
+        if active and not line.lstrip().startswith("#"):
+            key = active.group(2).strip("\"'")
+        elif commented:
+            key = commented.group(1)
+        if key and key in config_mod._FIELDS:
+            yield i, key, bool(active and not line.lstrip().startswith("#"))
+        state = _triple_toggles(line, state)
+
+
+def _annotation_help_above(lines: list[str], i: int) -> list[str]:
+    """The contiguous comment lines above a per-setting annotation entry.
+    Unlike `_prose_above`, this does not reject lines that merely look like a
+    commented assignment or a section header: wrapped help text legitimately
+    can start with `key = ...` or `[section]`."""
+    prefix: list[str] = []
+    j = i - 1
+    while j >= 0:
+        prev = lines[j]
+        stripped = prev.strip()
+        if not stripped.startswith("#"):
+            break
+        if stripped.startswith("# ---"):
+            break
+        if config_mod.REFERENCE_ANNOTATION_HEADER in prev:
+            break
+        prefix.insert(0, prev.rstrip())
+        j -= 1
+    return prefix
+
+
+def reference_annotations(reference_text: str =
+                          config_mod.REFERENCE_TEMPLATE) -> dict[str, dict]:
+    """Parse the generated per-setting annotation section of a reference text.
+
+    Returns {key: {"help", "help_lines", "value", "unset"}}. `value` is the
+    documented TOML default; `unset` marks fields with no TOML null, whose
+    sample value only shows the accepted shape. Empty when the text has no
+    annotation section (a caller-supplied template)."""
+    lines = reference_text.replace("\r\n", "\n").split("\n")
+    try:
+        start = lines.index(config_mod.REFERENCE_ANNOTATION_HEADER)
+    except ValueError:
+        return {}
+    out: dict[str, dict] = {}
+    for i, key, _active in _setting_lines(lines):
+        if i <= start or key in out:
+            continue
+        prefix = _annotation_help_above(lines, i)
+        help_lines = ["# " + ln.strip().lstrip("#").strip()
+                      for ln in prefix if ln.strip().lstrip("#").strip()]
+        text_line = lines[i]
+        body = text_line.strip()
+        if body.startswith("#"):
+            body = body[1:].lstrip()
+        try:
+            value = tomllib.loads(body)[key]
+        except (tomllib.TOMLDecodeError, KeyError):
+            value = None
+        out[key] = {
+            "help": " ".join(ln.lstrip("# ").strip() for ln in help_lines),
+            "help_lines": help_lines,
+            "value": value,
+            "unset": "unset by default" in text_line,
+        }
+    return out
+
+
+def reference_setting_help(reference_text: str =
+                           config_mod.REFERENCE_TEMPLATE) -> dict[str, str]:
+    """{key: human help} for every setting documented in `reference_text`,
+    including the generated per-setting section (the GUI's All settings tab
+    and the `how` index read this)."""
+    ann = reference_annotations(reference_text)
+    if ann:
+        return {k: v["help"] for k, v in ann.items()}
+    blocks = reference_option_blocks(reference_text)
+    return {b["key"]: " ".join(ln.lstrip("# ").strip()
+                               for ln in b["block"][:-1])
+            for b in blocks}
+
+
+def reference_setting_defaults(reference_text: str =
+                               config_mod.REFERENCE_TEMPLATE) -> dict[str, object]:
+    """{key: documented built-in default}; None marks an "unset by default"
+    sample, which has no TOML null representation."""
+    return {k: (None if v["unset"] else v["value"])
+            for k, v in reference_annotations(reference_text).items()}
+
+
+def reference_option_blocks(reference_text: str =
+                            config_mod.REFERENCE_TEMPLATE) -> list[dict]:
+    """Every documented config option in `reference_text`, in file order.
+
+    Each entry is {"key": name, "block": [lines]}, where `block` holds the
+    contiguous prose comments immediately above the setting plus the setting
+    itself, normalised to a commented-out assignment (`# key = default`). A
+    key documented more than once (the profile-override block repeats most
+    settings) keeps its first position; when that occurrence had no prose, the
+    per-setting section's help is prepended so updater output stays explained.
+    """
+    lines = reference_text.replace("\r\n", "\n").split("\n")
+    blocks: list[dict] = []
+    seen: set[str] = set()
+    for i, key, _active in _setting_lines(lines):
+        if key in seen:
+            continue
+        blocks.append({"key": key,
+                       "block": _prose_above(lines, i)
+                       + [_normalised_setting(lines, i)]})
+        seen.add(key)
+    ann = reference_annotations(reference_text)
+    for block in blocks:
+        if len(block["block"]) == 1:
+            help_lines = ann.get(block["key"], {}).get("help_lines") or []
+            if help_lines:
+                block["block"] = list(help_lines) + block["block"]
+    return blocks
+
+
+def present_config_keys(text: str) -> set[str]:
+    """Known config keys `text` already mentions, active OR commented out.
+
+    Active assignments count only at the root and in the documented sections
+    (a `[profiles.foo]` key does not document a top-level default). A
+    commented assignment or a `# key = value` note anywhere counts: the user
+    has already written about that key and must never get a duplicate.
+    """
+    lines = text.replace("\r\n", "\n").split("\n")
+    present: set[str] = set()
+    for region in _regions(lines):
+        name = region["name"]
+        if name and name not in config_mod._SECTIONS:
+            continue
+        i = region["start"]
+        state = ""
+        while i < region["end"]:
+            line = lines[i]
+            if state:
+                state = _triple_toggles(line, state)
+                i += 1
+                continue
+            m = _ASSIGN_RE.match(line)
+            if m:
+                key = m.group(2).strip("\"'")
+                if key in config_mod._FIELDS:
+                    present.add(key)
+                j, _end = _value_end(lines, i, m.start(3))
+                i = j + 1
+                continue
+            state = _triple_toggles(line, state)
+            i += 1
+    state = ""
+    for line in lines:
+        if state:
+            state = _triple_toggles(line, state)
+            continue
+        m = _COMMENT_ASSIGN_RE.match(line)
+        if m and m.group(1) in config_mod._FIELDS:
+            present.add(m.group(1))
+        state = _triple_toggles(line, state)
+    return present
+
+
+def _upgrade_insert_at(lines: list[str]) -> int:
+    """Line index where new commented options belong: the end of the
+    [universal] region, else just before the first profile/server table, else
+    EOF. Trailing blank lines at that point are excluded."""
+    regions = _regions(lines)
+    at = len(lines)
+    universal = next((r for r in regions if r["name"] == "universal"), None)
+    if universal is not None:
+        at = universal["end"]
+    else:
+        for r in regions:
+            if _is_profile(r["name"]) or r["name"].startswith(
+                    "mcp_servers" + SEP):
+                at = r["line"]
+                break
+    while at > 0 and not lines[at - 1].strip():
+        at -= 1
+    return at
+
+
+def upgrade_config_text(text: str, reference_text: str =
+                        config_mod.REFERENCE_TEMPLATE) -> tuple[str, list[str]]:
+    """Append documented options `text` lacks, commented, without touching a
+    single existing line. Returns (new_text, added_keys); no missing option
+    means the exact `text` object is returned with an empty list.
+    """
+    blocks = reference_option_blocks(reference_text)
+    present = present_config_keys(text)
+    missing = [b for b in blocks if b["key"] not in present]
+    if not missing:
+        return text, []
+
+    nl = "\r\n" if "\r\n" in text else "\n"
+    trailing_nl = text.endswith("\n")
+    flat = text.replace("\r\n", "\n")
+    if trailing_nl:
+        flat = flat[:-1]
+    lines = flat.split("\n") if flat else []
+    at = _upgrade_insert_at(lines)
+
+    payload: list[str] = []
+    if at > 0 and lines[at - 1].strip():
+        payload.append("")
+    if _UPGRADE_HEADER not in lines:
+        payload.append(_UPGRADE_HEADER)
+    for n, block in enumerate(missing):
+        if n:
+            payload.append("")
+        payload.extend(block["block"])
+    if at < len(lines) and lines[at].strip():
+        payload.append("")
+    lines[at:at] = payload
+
+    new_text = nl.join(lines)
+    if trailing_nl or not text:
+        new_text += nl
+    validate_text(new_text)
+    return new_text, [b["key"] for b in missing]
+
+
+def upgrade_config_file(path: Path, dry_run: bool = False) -> list[str]:
+    """Upgrade the config file at `path` in place; the added keys, or [] when
+    the file is absent/empty or already documents every option.
+
+    The previous contents go to `<path>.bak` and the write is atomic (a `.tmp`
+    sibling plus os.replace). Nothing is written for a dry run."""
+    p = Path(path)
+    if not p.is_file() or p.stat().st_size == 0:
+        return []
+    with p.open("r", encoding="utf-8", newline="") as fh:
+        old_text = fh.read()
+    new_text, added = upgrade_config_text(old_text)
+    if not added or dry_run:
+        return added
+    backup = p.with_name(p.name + ".bak")
+    with p.open("rb") as fh:
+        old_bytes = fh.read()
+    tmp = p.with_name(p.name + ".tmp")
+    try:
+        with tmp.open("w", encoding="utf-8", newline="") as fh:
+            fh.write(new_text)
+        backup.write_bytes(old_bytes)
+        os.replace(tmp, p)
+    finally:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+    return added
 
 
 def profile_names(text: str) -> list[str]:
@@ -465,6 +813,9 @@ def new_user_config(base_url: str, model: str, vram_gb: int | None) -> str:
     text = set_values(text, values, profile="default")
     if vram_gb:
         text = set_values(text, {"vram_gb": int(vram_gb)})
+    # The starter picks the generated profile explicitly; the reference
+    # template documents the built-in "" default instead.
+    text = set_values(text, {"default_profile": "default"})
     return text
 
 

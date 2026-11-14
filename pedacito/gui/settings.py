@@ -25,14 +25,14 @@ from ..config import Config
 # The comment-preserving editor, moved out of gui/ so the CLI can use it.
 from ..config_editor import (  # noqa: F401
     add_profile, literal, new_user_config, profile_body, profile_names,
-    remove_profile, rename_profile, set_values, table_name, upsert_profiles,
-    validate_text,
+    reference_setting_help, remove_profile, rename_profile, set_values,
+    table_name, upsert_profiles, validate_text,
 )
 
 SECRET_KEYS = ("api_key",)
-# Not editable one-by-one here: tables (use the raw file), selectors handled by
-# the profile UI, and bookkeeping.
-HIDDEN_KEYS = {"active_tier", "default_profile"}
+# Not editable one-by-one here: bookkeeping. `default_profile` is editable (it
+# is a real config key) even though the profile UI also offers Make default.
+HIDDEN_KEYS = {"active_tier"}
 
 
 @dataclass(frozen=True)
@@ -199,6 +199,7 @@ def schema() -> list[dict]:
             continue
         comment = []
     base = Config()
+    ref_help = reference_setting_help()
     out: list[dict] = []
     for f in fields(Config):
         name = f.name
@@ -220,7 +221,8 @@ def schema() -> list[dict]:
             "type": _type_name(f.type),
             "default": default,
             "group": group_by.get(name, "General"),
-            "help": meta.description if meta else help_by.get(name, ""),
+            "help": meta.description if meta else
+                    (ref_help.get(name) or help_by.get(name, "")),
             "choices": _choices(name),
             "secret": name in SECRET_KEYS,
         })

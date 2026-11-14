@@ -267,6 +267,41 @@ def _cmd_config(args, cfg) -> int:
     else show each resolved setting and its origin; --check also tests the
     server connection and model, --doctor additionally probes which
     structured-output modes the server supports."""
+    if getattr(args, "upgrade", False):
+        target = (Path(args.path) if getattr(args, "path", None)
+                  else Path(args.config) if getattr(args, "config", None)
+                  else config.USER_CONFIG)
+        dry_run = bool(getattr(args, "dry_run", False))
+        if not target.is_file():
+            print(f"No config file at {target}.\n"
+                  "Create one with `pedacito config --init` (starter) or\n"
+                  "`pedacito config --setup` (interactive), then re-run "
+                  "`pedacito config --upgrade`.", file=sys.stderr)
+            return 1
+        try:
+            added = config_editor.upgrade_config_file(target, dry_run=dry_run)
+        except (OSError, ConfigError) as e:
+            print(f"Could not upgrade {target}: {e}", file=sys.stderr)
+            return 2
+        total = len(config_editor.reference_option_blocks())
+        if not added:
+            print(f"{target} is already up to date (all {total} config "
+                  "options present).")
+            return 0
+        if dry_run:
+            print(f"{target}: {len(added)} new option(s) would be added "
+                  "(commented out):")
+            for key in added:
+                print(f"  {key}")
+            print("No file was written (--dry-run).")
+            return 0
+        print(f"{target}: added {len(added)} new option(s) (commented out):")
+        for key in added:
+            print(f"  {key}")
+        print(f"Backup written to {target}.bak; your existing settings, "
+              "profiles and comments are untouched.")
+        return 0
+
     if getattr(args, "reference", False):
         target = Path(args.path) if args.path else None
         if target is not None:
@@ -2178,6 +2213,13 @@ def build_parser() -> argparse.ArgumentParser:
     p_conf.add_argument("--reference", action="store_true",
                         help="print (or with --path, write) the full annotated "
                              "config template")
+    p_conf.add_argument("--upgrade", action="store_true",
+                        help="add any new config options from the current "
+                             "version to your config file (commented out) "
+                             "without overwriting existing settings")
+    p_conf.add_argument("--dry-run", action="store_true",
+                        help="with --upgrade: show which new options would be "
+                             "added without writing")
     p_conf.add_argument("--root", default=None)
     p_conf.add_argument("--profile", metavar="NAME")
     p_conf.add_argument("paths", nargs="*", default=["."], help=argparse.SUPPRESS)
@@ -2825,6 +2867,13 @@ def _main(argv=None) -> int:
                 f"  2. then run: pedacito explain {root} -q \"your question\"\n",
                 file=sys.stderr)
             return 0
+
+    # `config --upgrade` edits one file and needs no model, hardware or even a
+    # parseable existing config (it validates and reports that itself). Run it
+    # before `_config` so a missing --config/--path gets a helpful message
+    # instead of the loader's "does not exist" error.
+    if args.cmd == "config" and getattr(args, "upgrade", False):
+        return _cmd_config(args, None)
 
     try:
         cfg = _config(args)

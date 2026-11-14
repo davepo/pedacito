@@ -594,7 +594,8 @@ def reload_state_config(profile: str | None = None) -> dict:
         root = STATE.root
     try:
         cfg = config_mod.load(root=root, profile=profile,
-                              require_hardware=False, warn_budgets=False)
+                              require_hardware=False, warn_budgets=False,
+                              upgrade_user_config=False)
     except ConfigError:
         cfg = None
     with STATE.lock:
