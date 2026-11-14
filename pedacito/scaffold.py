@@ -1515,9 +1515,11 @@ def verify_and_fix(client, cfg, idx: Index, py_rels, project_name: str,
         if not failures:
             return True, ""
         env = [(l, o) for l, o in failures if _environment_issue(o)]
-        deps = [(l, o) for l, o in failures if loop.missing_modules(o)]
+        deps = [(l, o) for l, o in failures
+                if loop.missing_modules(o, root=idx.root)]
         code_fails = [(l, o) for l, o in failures
-                      if not _environment_issue(o) and not loop.missing_modules(o)]
+                      if not _environment_issue(o)
+                      and not loop.missing_modules(o, root=idx.root)]
         if not code_fails:
             if deps:
                 return False, deps[0][1]           # report as a dependency
@@ -1884,7 +1886,7 @@ def _run_complex(root: Path, cfg, client, idx, plan: Plan, spec: Spec, *,
         when = workspace.stamp()
         fix_backup = workspace.new_backup_dir(root, when) if cfg.backup else None
         err = _first_import_error(root, plan)
-        missing = loop.missing_modules(err or "")
+        missing = loop.missing_modules(err or "", root=root)
         if missing:
             dists = ", ".join(loop.pip_name(m) for m in missing)
             if auto_install:
@@ -1895,7 +1897,7 @@ def _run_complex(root: Path, cfg, client, idx, plan: Plan, spec: Spec, *,
                 workspace.log_event(root, f"pip install {'ok' if ok else 'FAILED'}: "
                                           f"{dists}", "INFO" if ok else "ERROR")
                 err = _first_import_error(root, plan)
-                missing = loop.missing_modules(err or "")
+                missing = loop.missing_modules(err or "", root=root)
             else:
                 print(f"  [import check blocked by missing dependencies: "
                       f"{dists}. Install with `pip install {dists}`, or rerun "
@@ -1908,7 +1910,7 @@ def _run_complex(root: Path, cfg, client, idx, plan: Plan, spec: Spec, *,
             if n_fixed and verbose:
                 print(f"  fixed {n_fixed} import issue(s)", file=sys.stderr)
             err = _first_import_error(root, plan)
-            missing = loop.missing_modules(err or "")
+            missing = loop.missing_modules(err or "", root=root)
         if err:
             if missing:
                 dists = ", ".join(loop.pip_name(m) for m in missing)

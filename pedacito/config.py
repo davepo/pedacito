@@ -1375,6 +1375,15 @@ def load(root: Path | None = None, explicit: Path | None = None,
         explicit = set(profiles[profile])
         body, tier = _apply_preset(profile, profiles[profile], origin)
         for key, value in body.items():
+            # BUG-1001: a tier preset is an adaptive default, not a setting --
+            # the same rule as the top-level `tier` preset above and §7's
+            # "anything you set explicitly still wins". Keys the user wrote in
+            # the profile are explicit limits and always apply; preset-derived
+            # keys reach only fields still at their built-in default, so an
+            # explicit `max_steps = 15` in a project file is never silently
+            # squashed by a tier guessed from the model name.
+            if key not in explicit and cfg.sources.get(key, "default") != "default":
+                continue
             setattr(cfg, key, _coerce(key, value))
             # Preset-derived values may be replaced by auto_fit; keys the user
             # wrote in the profile are explicit limits.

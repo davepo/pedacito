@@ -1509,15 +1509,39 @@ _PIP_NAMES = {
 }
 
 
-def missing_modules(output: str) -> list[str]:
+def _is_local_module(root: Path, name: str) -> bool:
+    """True when `name` resolves to this project's own source: a top-level
+    module file or a package directory. Deliberately narrow -- a dotted or
+    odd-cased name is not an import root and is not checked."""
+    if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name):
+        return False
+    try:
+        return (root / f"{name}.py").is_file() \
+            or (root / name / "__init__.py").is_file()
+    except OSError:
+        return False
+
+
+def missing_modules(output: str, root=None) -> list[str]:
     """Top-level import names (``foo`` for ``foo.bar``) from
     ModuleNotFoundError/ImportError messages. Callers route these to
-    dependency handling instead of the code-repair loop."""
+    dependency handling instead of the code-repair loop.
+
+    With `root` given, names that resolve to the project's OWN source are
+    excluded (BUG-1002): an auto-built project whose test imports a sibling
+    module under a plain `pytest` invocation reported
+    `pip install pattern_store` -- a module sitting right there on disk --
+    and with --auto-install would have installed (and imported) whatever
+    distribution holds that name upstream. A local name is a broken import
+    path the repair loop can fix; it is never a missing dependency."""
     out: list[str] = []
     for m in _MISSING_MODULE_RE.finditer(output or ""):
         name = m.group(1).split(".")[0].strip()
-        if name and name not in out:
-            out.append(name)
+        if not name or name in out:
+            continue
+        if root is not None and _is_local_module(Path(root), name):
+            continue
+        out.append(name)
     return out
 
 
@@ -1701,22 +1725,47 @@ _TASK_DOM_RE = re.compile(r"\bdom\s*check\b", re.IGNORECASE)
 
 
 def _infer_task_checks(root, cfg, task: str) -> None:
-    """Turn on verify_tests/verify_dom when the task text names them."""
+    """Turn on verify_tests/verify_dom when the task text names them.
+
+    BUG-1003: both flags are ANDed with `allow_shell` at their consumers, so
+    on a shell-less run this assignment changed nothing -- yet the harness
+    printed "enabling verify_tests for this run" and minutes later retracted
+    it with "verify_tests/allow_shell is off". Enable honestly: announce a
+    real enablement as one, and announce the boundary block as the boundary
+    block it is."""
+    shell = bool(getattr(cfg, "allow_shell", False))
     named = _task_named_tests(task)
     if named and not getattr(cfg, "verify_tests", False):
         cfg.verify_tests = True
-        print(f"  [task names '{named}'; enabling verify_tests for this run]",
-              file=sys.stderr)
-        workspace.log_event(root, f"verify_tests enabled: the task names "
-                                  f"'{named}'", "INFO")
+        if shell:
+            print(f"  [task names '{named}'; enabling verify_tests for this "
+                  "run]", file=sys.stderr)
+            workspace.log_event(root, f"verify_tests enabled: the task names "
+                                      f"'{named}'", "INFO")
+        else:
+            print(f"  [task names '{named}'; verify_tests is on but the test "
+                  "subprocess also needs allow_shell -- this run will report "
+                  "no test evidence]", file=sys.stderr)
+            workspace.log_event(root, f"verify_tests enabled but blocked: "
+                                      f"'{named}' named, allow_shell off",
+                                "WARN")
     m = _TASK_DOM_RE.search(task or "")
     if m and not getattr(cfg, "verify_dom", False):
         cfg.verify_dom = True
         dom_named = " ".join(m.group(0).split())
-        print(f"  [task names '{dom_named}'; enabling verify_dom for this "
-              "run]", file=sys.stderr)
-        workspace.log_event(root, f"verify_dom enabled: the task names "
-                                  f"'{dom_named}'", "INFO")
+        if shell or getattr(cfg, "_dom_user_consent", False):
+            print(f"  [task names '{dom_named}'; enabling verify_dom for this "
+                  "run]", file=sys.stderr)
+            workspace.log_event(root, f"verify_dom enabled: the task names "
+                                      f"'{dom_named}'", "INFO")
+        else:
+            print(f"  [task names '{dom_named}'; verify_dom is on but the "
+                  "headless check also needs allow_shell (or ask "
+                  "--verify-dom) -- this run will not load the page]",
+                  file=sys.stderr)
+            workspace.log_event(root, f"verify_dom enabled but blocked: "
+                                      f"'{dom_named}' named, allow_shell off",
+                                "WARN")
 
 
 def _merge_repair_results(results, new):
@@ -1869,11 +1918,17 @@ _DOM_EXT = (".html", ".htm", ".js", ".mjs", ".cjs", ".css")
 
 
 def _dom_wanted(cfg) -> bool:
-    """The headless DOM smoke gate is opt-in twice over: `verify_dom` says
-    the project wants it, `allow_shell` grants the execution boundary (the
-    check runs project code in a browser, like the test subprocess)."""
-    return bool(getattr(cfg, "verify_dom", False)) \
-        and bool(getattr(cfg, "allow_shell", False))
+    """The headless DOM smoke check is opt-in: `verify_dom` says the project
+    wants it, `allow_shell` grants the execution boundary (the check runs
+    project code in a browser, like the test subprocess). One exception
+    (BUG-1004): an explicit `ask --verify-dom` is per-run *user* consent to
+    this one gate -- README/QUICKSTART both document the flag as sufficient
+    ("or `ask --verify-dom`"), the same way a bare `pedacito domcheck`
+    invocation is consent on its own -- so the CLI marks it on cfg."""
+    if not bool(getattr(cfg, "verify_dom", False)):
+        return False
+    return bool(getattr(cfg, "allow_shell", False)) \
+        or bool(getattr(cfg, "_dom_user_consent", False))
 
 
 def _web_files(files: list[str]) -> bool:
@@ -4623,7 +4678,7 @@ def run_loop(root: Path, cfg, client, idx, plan_path: Path, *,
                 # A missing third-party package is NOT a code bug: editing
                 # source cannot add a dependency. Install it if the user opted
                 # in, otherwise report and stop.
-                missing = missing_modules(output)
+                missing = missing_modules(output, root=root)
                 if missing:
                     dists = ", ".join(pip_name(m) for m in missing)
                     if auto_install and not installed.issuperset(missing):
@@ -4726,13 +4781,24 @@ def run_loop(root: Path, cfg, client, idx, plan_path: Path, *,
                 dists = ", ".join(pip_name(m) for m in dep_blocked)
                 print(f"  [verification blocked by missing dependencies: "
                       f"{dists}]", file=sys.stderr)
+                workspace.log_event(
+                    root, f"verify still failing (missing deps: {dists}): "
+                          f"{check_label}", "ERROR")
             else:
                 print(f"  [verification still failing: {check_label}]",
                       file=sys.stderr)
                 workspace.log_event(
                     root, f"verify still failing: {check_label}", "ERROR")
-                undo_step(attempted, task,
-                          f"verification still failing: {check_label}", tr)
+            # BUG-1005: this undo_step used to live only in the else branch,
+            # so a step that failed verify on a missing third-party package
+            # skipped the green ratchet and left its wreckage in the tree --
+            # exactly the poisoned baseline #20 exists to prevent. A step
+            # that never verified is a failed step whatever blocked it.
+            undo_step(attempted, task,
+                      (f"verification blocked by missing dependencies: "
+                       f"{', '.join(pip_name(m) for m in dep_blocked)}"
+                       if dep_blocked else
+                       f"verification still failing: {check_label}"), tr)
             failed += 1
             if stop_on_fail:
                 break

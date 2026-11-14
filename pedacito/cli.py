@@ -3215,6 +3215,11 @@ def _main(argv=None) -> int:
                 cfg.max_task_seconds = max(0, args.max_minutes) * 60
             if getattr(args, "verify_dom", False):
                 cfg.verify_dom = True
+                # BUG-1004: the flag is the user's per-run consent to load
+                # this project's page in the headless browser (the docs sell
+                # `ask --verify-dom` as standing alone); allow_shell stays the
+                # boundary for gates armed by config or task text instead.
+                cfg._dom_user_consent = True
             if getattr(args, "refine", False):
                 ask_task = _refine_task_text(cfg, client, root, ask_task,
                                              "ask")

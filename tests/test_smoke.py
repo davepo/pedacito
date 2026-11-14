@@ -137,6 +137,38 @@ def test_tier_preset_applies_without_profiles(tmp_path):
     assert "tier 'small' preset" in cfg.sources["max_steps"]
 
 
+def test_profile_tier_preset_never_clobbers_explicit_settings(tmp_path,
+                                                              monkeypatch):
+    """BUG-1001: the top-level `tier` preset applies only to fields still at
+    their built-in default, but the same preset reached through a profile
+    overwrote EVERYTHING -- an explicit `max_steps = 15` in the project's
+    .pedacito.toml was silently squashed to the tier's 0, and the source line
+    said 'tier preset' so the user could not even see which layer lied. Keys
+    the profile itself spells out still win (it is a higher layer); only
+    preset-derived keys must yield to an explicit file value."""
+    user = tmp_path / "user.toml"
+    user.write_text(
+        'default_profile = "mymodel"\n\n'
+        '[profiles.mymodel]\n'
+        'base_url = "http://localhost:1234/v1"\n'
+        'model = "qwen3-8b-thing"\nvram_gb = 12\n', encoding="utf-8")
+    monkeypatch.setattr(config_mod, "USER_CONFIG", user)
+    proj = tmp_path / "proj"
+    proj.mkdir()
+    (proj / ".pedacito.toml").write_text(
+        "max_steps = 15\nrepair_rounds = 4\n", encoding="utf-8")
+
+    cfg = config_mod.load(root=proj, use_env=False, warn_budgets=False)
+    assert cfg.active_tier == "small"          # tier still guessed, still reported
+    # Explicit project values survive the preset...
+    assert cfg.max_steps == 15
+    assert cfg.sources["max_steps"].startswith("project config")
+    assert cfg.repair_rounds == 4
+    # ...and fields left at their default still follow the preset.
+    assert cfg.max_tokens_answer == config_mod.PRESETS["small"]["max_tokens_answer"]
+    assert "tier preset" in cfg.sources["max_tokens_answer"]
+
+
 def test_bad_tier_fails_loudly(tmp_path):
     p = tmp_path / "bad.toml"
     p.write_text('tier = "huge"\n', encoding="utf-8")
