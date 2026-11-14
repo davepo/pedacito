@@ -96,6 +96,129 @@ _SYNONYMS = {
 }
 
 _WORD_RE = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_.\-]*")
+# "what does collapse_repair_turns do?", "what is small_context_tokens?",
+# "explain auto_green_ratchet": the named identifier right after the question
+# verb is the setting the user means.
+_SETTING_QUERY_RE = re.compile(
+    r"\b(?:what(?:'s| is| does)|explain|describe|tell me about|"
+    r"meaning of|document(?:ation for|ed)?)\s+`?([A-Za-z_][A-Za-z0-9_]*)",
+    re.I)
+
+
+def named_setting(question: str) -> dict | None:
+    """The exact setting a question names, or None.
+
+    A setting is only pinned when the user names it unambiguously: after a
+    "what is/does/explain" verb, as a snake_case key anywhere, or as the
+    whole (trimmed) question. A generic word such as `model` inside "how do I
+    import models?" is not a setting lookup and keeps the procedural cards.
+    """
+    keys = {item["key"]: item for item in how_index.settings_dictionary()}
+    low = " ".join((question or "").lower().split())
+    match = _SETTING_QUERY_RE.search(low)
+    if match and match.group(1) in keys:
+        return keys[match.group(1)]
+    tokens = set(re.findall(r"[A-Za-z_][A-Za-z0-9_]*", low))
+    exact = [name for name in keys if name in tokens]
+    if not exact:
+        return None
+    underscored = [name for name in exact if "_" in name]
+    if underscored:
+        return keys[max(underscored, key=len)]
+    if len(exact) == 1:
+        extra = tokens - set(_STOP) - {
+            exact[0], "setting", "option", "config", "toml", "value",
+            "default", "mean", "means", "meaning", "change", "set", "use",
+            "please", "about",
+        }
+        if not extra:
+            return keys[exact[0]]
+    return None
+
+
+def _pin_named_setting(question: str, matches: dict) -> dict | None:
+    """Force a named setting to rank #1 (retrieval is deterministic)."""
+    item = named_setting(question)
+    if item is None:
+        return None
+    others = [s for s in (matches.get("settings") or [])
+              if s.get("key") != item["key"]]
+    pinned = {"score": 999.0, **item}
+    matches["settings"] = [pinned] + others[:4]
+    return pinned
+
+
+_WHEN_MARKERS = (
+    "off by default", "on by default", "0 = off", "keep on", "unless",
+    "only if", "raise", "lower", "turn it on", "when you", "for servers",
+    "for a ", "use it when",
+)
+
+
+def _setting_when(item: dict) -> str:
+    """A deterministic "why/when to change it" line from the setting's own
+    documentation, with a type-aware fallback."""
+    help_text = " ".join(str(item.get("help") or "").split())
+    for sentence in re.split(r"(?<=[.!?])\s+", help_text):
+        if sentence and any(mark in sentence.lower() for mark in _WHEN_MARKERS):
+            return sentence
+    choices = item.get("choices")
+    if choices:
+        shown = ", ".join(f"`{c}`" for c in choices if c != "")
+        return ("Choose the value that matches this project; leave the "
+                f"default unless you specifically need one of {shown}.")
+    kind = item.get("type")
+    if kind == "bool":
+        return ("Leave it on unless the behaviour costs you time or tokens; "
+                "turn it off when the default path is more predictable for "
+                "this project.")
+    if kind in ("int", "float"):
+        return ("Raise it when a task needs more headroom; lower it to spend "
+                "fewer tokens/time. The built-in default suits most projects.")
+    return ("Change it when the built-in default does not match this "
+            "project's server, hardware or workflow; otherwise leave it "
+            "unset.")
+
+
+def render_setting_answer(question: str, item: dict,
+                          matches: dict | None = None) -> str:
+    """A direct setting card: what it does, when to change it, the default,
+    the exact config.toml syntax and the GUI path (the GUI's How tab renders
+    the same item with its Open in Settings button)."""
+    key = item["key"]
+    help_text = " ".join(str(item.get("help") or "").split())
+    lines = [
+        f"**`{key}`** \u2014 {item.get('group') or 'setting'}",
+        "",
+        "**What it does**",
+        help_text or "No documentation text is available for this setting.",
+        "",
+        "**Why / when to change it**",
+        _setting_when(item),
+        "",
+        f"**Default:** `{item.get('default_text', '')}` "
+        f"(type: {item.get('type', 'str')})",
+        "",
+        "**In the GUI**",
+        f"- {item.get('gui', '⚙ Settings → All settings')}",
+        f"- Open in Settings: {item.get('gui', '⚙ Settings → All settings')}",
+        "",
+        "**In the Terminal (CLI)**",
+        "- Add the line below to `config.toml`, then run "
+        "`pedacito config --check` to validate it.",
+        "",
+        "**Relevant Settings (`config.toml`)**",
+        "",
+        "```toml",
+        str(item.get("toml") or f"{key} = ..."),
+        "```",
+    ]
+    if item.get("profile_gui"):
+        lines += ["", f"In a profile: {item['profile_gui']}"]
+    lines += ["", "_Deterministic setting reference; no model needed. In the "
+                  "GUI, open **How ?** and the same card carries an "
+                  "**Open in Settings** button._"]
+    return "\n".join(lines).rstrip() + "\n"
 
 
 class HowError(RuntimeError):
@@ -567,7 +690,9 @@ def answer_structured(question: str, cfg: Config | None = None,
     if not question:
         raise HowError("No question given.")
     matches = how_index.search(question)
-    reference = how_index.render_answer(question, matches)
+    pinned = _pin_named_setting(question, matches)
+    reference = (render_setting_answer(question, pinned, matches) if pinned
+                 else how_index.render_answer(question, matches))
     result = {
         "ok": True,
         "query": question,
@@ -576,6 +701,7 @@ def answer_structured(question: str, cfg: Config | None = None,
         "model_error": "",
         "answer": reference,
         "reference_answer": reference,
+        "setting": pinned,
         "matches": matches,
         "common_flags": how_index.COMMON_FLAGS,
         "topics": how_index.topics(),

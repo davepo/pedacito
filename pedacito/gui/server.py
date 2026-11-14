@@ -66,6 +66,25 @@ def _within(root: Path, rel: str) -> Path | None:
         return None
 
 
+def index_html(data: bytes) -> bytes:
+    """The page HTML with the saved theme already on <html>, so a reload
+    with no project open paints in the user's colorscheme instead of
+    flashing the default until /api/state answers. theme.js still lets a
+    browser-local pick override it."""
+    theme = STATE.user_theme()
+    if not theme or theme == "slate":
+        return data
+    text = data.decode("utf-8", errors="replace")
+    marker = '<html lang="en">'
+    if marker not in text:
+        return data
+    # `theme` is a closed enum from config.py; still escape defensively.
+    safe = (str(theme).replace("&", "&amp;").replace('"', "&quot;")
+            .replace("<", "&lt;").replace(">", "&gt;"))
+    text = text.replace(marker, f'<html lang="en" data-theme="{safe}">', 1)
+    return text.encode("utf-8")
+
+
 def list_dir(path: str, show_files: bool, hidden: bool) -> dict:
     """One directory for the folder browser."""
     home = Path.home()
@@ -357,6 +376,39 @@ def _how_post(q, body):
     return _how_reply(str(body.get("query", "")), use_model)
 
 
+# --- named MCP servers ---------------------------------------------------------
+
+@get("/api/mcp/servers")
+def _mcp_servers(q, body=None):
+    """Every configured [mcp_servers.<name>] entry plus its live tools."""
+    return 200, {"ok": True, **settings_api.mcp_servers_payload()}
+
+
+@post("/api/mcp/servers")
+def _mcp_server_save(q, body):
+    try:
+        return 200, {"ok": True, **settings_api.save_mcp_server(body)}
+    except ConfigError as e:
+        return 400, {"ok": False, "detail": str(e)}
+
+
+@post("/api/mcp/servers/delete")
+def _mcp_server_delete(q, body):
+    try:
+        return 200, {"ok": True, **settings_api.delete_mcp_server(body)}
+    except ConfigError as e:
+        return 400, {"ok": False, "detail": str(e)}
+
+
+@post("/api/mcp/servers/test")
+def _mcp_server_test(q, body):
+    try:
+        result = settings_api.test_mcp_server(body)
+    except ConfigError as e:
+        return 400, {"ok": False, "detail": str(e)}
+    return 200, {"ok": True, **result}
+
+
 @post("/api/peek")
 def _peek(q, body):
     """Profile names for a folder, without opening it: reads the config files
@@ -382,6 +434,282 @@ def _project(q, body):
     return _busy_reply(jobs.spawn(
         "project", "opening project",
         lambda job: jobs.open_project(path, profile)))
+
+
+# --- project reset, memory, background servers and on-demand checks ------------
+
+def _project_root():
+    with STATE.lock:
+        return STATE.root
+
+
+@post("/api/project/reset")
+def _project_reset(q, body):
+    """Wipe this project's `.pedacito/` state exactly like `pedacito reset`:
+    running background servers are stopped first, code and `.pedacito.toml`
+    are untouched, and `reindex` rebuilds the index afterwards as a job."""
+    from .. import processes
+    root = _project_root()
+    if root is None:
+        return 409, {"ok": False, "detail": "Open a project first."}
+    with STATE.lock:
+        busy = STATE.job is not None and STATE.job.active
+    if busy:
+        return 409, {"ok": False, "detail": "A job is running. Stop it before "
+                                            "resetting the project state."}
+    dry_run = bool(body.get("dry_run"))
+    keep_memory = bool(body.get("keep_memory"))
+    keep_config = bool(body.get("keep_config"))
+    running = [str(r.get("name")) for r in processes.list_procs(root)
+               if r.get("status") == "running"]
+    stopped: list[str] = []
+    lock_held = False
+    if not dry_run:
+        try:
+            workspace.acquire_lock(root)
+            lock_held = True
+        except workspace.ProjectBusy as e:
+            return 409, {"ok": False, "detail": str(e)}
+    try:
+        if not dry_run:
+            for name in running:
+                try:
+                    processes.stop(root, name)
+                    stopped.append(name)
+                except Exception:
+                    pass
+        try:
+            plan = workspace.reset(root, keep_memory=keep_memory,
+                                   keep_config=keep_config, dry_run=dry_run)
+        except OSError as e:
+            return 400, {"ok": False, "detail": str(e)}
+    finally:
+        if lock_held:
+            workspace.release_lock(root)
+    out = {"ok": True, "dry_run": dry_run, "path": str(plan.get("path", "")),
+           "removed": list(plan.get("removed") or []),
+           "kept": list(plan.get("kept") or []),
+           "files": int(plan.get("files") or 0),
+           "bytes": int(plan.get("bytes") or 0),
+           "running": running, "stopped": stopped}
+    if dry_run:
+        out["would_stop"] = running
+        return 200, out
+    with STATE.lock:
+        STATE.idx = None
+        STATE.plan_path = None
+        STATE.last_backup_dir = None
+    STATE.apply_index(None)
+    STATE.reset_threads()
+    out["reindex_started"] = False
+    if body.get("reindex"):
+        job = jobs.spawn("index", "rebuilding index after reset",
+                         lambda j: jobs.build_index(j, True))
+        out["reindex_started"] = job is not None
+        if job is not None:
+            out["job"] = job.id
+    return 200, out
+
+
+def _memory_payload(root) -> dict:
+    from .. import memory
+    entries = [{"scope": sc, "category": cat, "text": text}
+               for sc, cat, text in memory.entries(root)]
+    return {
+        "ok": True,
+        "entries": entries,
+        "facts": memory.load_micro_facts(root),
+        "lessons": memory.load_anti_patterns(root, prune=False),
+        "promoted": memory.load_promoted_lessons(root),
+        "retired": memory.load_retired_lessons(root),
+        "project_file": str(memory.project_file(root)),
+    }
+
+
+@get("/api/memory")
+def _memory_get(q, body=None):
+    root = _project_root()
+    if root is None:
+        return 409, {"ok": False, "detail": "Open a project first."}
+    return 200, _memory_payload(root)
+
+
+@post("/api/memory")
+def _memory_post(q, body):
+    from .. import memory
+    root = _project_root()
+    if root is None:
+        return 409, {"ok": False, "detail": "Open a project first."}
+    action = str(body.get("action") or "add").strip().lower()
+    out: dict = {"ok": True}
+    if action == "add":
+        stored, msg = memory.remember(
+            root, str(body.get("text") or ""),
+            category=str(body.get("category") or ""),
+            scope=str(body.get("scope") or "project"))
+        out.update(stored=stored, detail=msg)
+        if not stored:
+            out["ok"] = False
+    elif action == "forget":
+        needle = str(body.get("text") or body.get("needle") or "").strip()
+        if not needle:
+            return 400, {"ok": False, "detail": "Say which fact to forget."}
+        out["forgot"] = memory.forget(root, needle,
+                                      scope=str(body.get("scope")
+                                                or "project"))
+    elif action in ("forget_lesson", "delete_lesson"):
+        lesson_id = str(body.get("id") or body.get("lesson_id") or "").strip()
+        if not lesson_id:
+            return 400, {"ok": False, "detail": "Name the lesson to delete."}
+        out["forgot"] = memory.forget_lesson(root, lesson_id)
+    else:
+        return 400, {"ok": False, "detail": f"unknown memory action {action!r}"}
+    ok = bool(out.get("ok", True))
+    out.update(_memory_payload(root))
+    out["ok"] = ok
+    return 200, out
+
+
+@get("/api/procs")
+def _procs_get(q, body=None):
+    from .. import processes
+    root = _project_root()
+    if root is None:
+        return 200, {"ok": True, "processes": []}
+    return 200, {"ok": True, "processes": processes.list_procs(root)}
+
+
+@post("/api/procs")
+def _procs_post(q, body):
+    from .. import processes
+    root = _project_root()
+    if root is None:
+        return 409, {"ok": False, "detail": "Open a project first."}
+    action = str(body.get("action") or "list").strip().lower()
+    if action == "start":
+        command = body.get("command") or ""
+        with STATE.lock:
+            cfg = STATE.cfg
+        try:
+            rec = processes.start(
+                root, command, name=str(body.get("name") or ""), cfg=cfg,
+                wait=float(getattr(cfg, "serve_wait", 3.0) or 3.0))
+        except (OSError, ValueError) as e:
+            return 400, {"ok": False, "detail": str(e)}
+        return 200, {"ok": True, "process": rec,
+                     "processes": processes.list_procs(root)}
+    if action == "stop":
+        name = str(body.get("name") or "").strip()
+        if not name:
+            return 400, {"ok": False, "detail": "Name the process to stop."}
+        detail = processes.stop(root, name)
+        return 200, {"ok": not detail.startswith("ERROR"), "detail": detail,
+                     "processes": processes.list_procs(root)}
+    if action == "logs":
+        name = str(body.get("name") or "").strip()
+        if not name:
+            return 400, {"ok": False, "detail": "Name the process for logs."}
+        try:
+            tail = int(body.get("tail") or 4000)
+        except (TypeError, ValueError):
+            tail = 4000
+        return 200, {"ok": True, "name": name,
+                     "logs": processes.logs(root, name, tail=tail)}
+    if action == "list":
+        return 200, {"ok": True, "processes": processes.list_procs(root)}
+    return 400, {"ok": False, "detail": f"unknown procs action {action!r}"}
+
+
+@post("/api/project/check")
+def _project_check(q, body):
+    """Run one on-demand project check: diagnose, webcheck or domcheck."""
+    from .. import domcheck, diagnostics, webcheck
+    root = _project_root()
+    if root is None:
+        return 409, {"ok": False, "detail": "Open a project first."}
+    kind = str(body.get("kind") or "").strip().lower()
+    with STATE.lock:
+        cfg = STATE.cfg
+    cfg = cfg if cfg is not None else _how_config()
+    if kind == "diagnose":
+        passed, report = diagnostics.run(root, cfg)
+        return 200, {"ok": True, "kind": kind, "passed": bool(passed),
+                     "report": report, "findings": []}
+    if kind == "webcheck":
+        files = body.get("files")
+        found = webcheck.run(root, files=list(files)
+                             if isinstance(files, list) and files else None)
+        rows = [{"rel": f.rel, "line": f.line, "message": f.message,
+                 "peer": f.peer} for f in found[:500]]
+        report = "\n".join(str(f) for f in found[:500])
+        if len(found) > 500:
+            report += f"\n[... {len(found) - 500} more finding(s)]"
+        if not report:
+            report = ("no web contract problems found (looked at every "
+                      ".html/.js outside node_modules and friends)")
+        return 200, {"ok": True, "kind": kind, "passed": not found,
+                     "report": report, "findings": rows,
+                     "count": len(found)}
+    if kind == "domcheck":
+        entry = str(body.get("entry") or getattr(cfg, "dom_entry", "") or "")
+        try:
+            timeout = int(body.get("timeout")
+                          or getattr(cfg, "dom_timeout", 45) or 45)
+        except (TypeError, ValueError):
+            timeout = 45
+        res = domcheck.check(root, entry=entry, timeout=timeout)
+        rows = [{"kind": f.kind, "severity": f.severity,
+                 "message": f.message} for f in res.findings]
+        report = (res.error
+                  or "\n".join(str(f) for f in res.findings)
+                  or "no DOM problems found (page loaded, module graph "
+                     "mounted, controls bound)")
+        return 200, {"ok": True, "kind": kind, "passed": bool(res.ok),
+                     "entry": res.entry, "error": res.error,
+                     "report": report, "findings": rows}
+    return 400, {"ok": False, "detail":
+                 "kind must be diagnose, webcheck or domcheck"}
+
+
+@post("/api/project/prune")
+def _project_prune(q, body):
+    """Retention for sessions, backups, events and log.txt."""
+    root = _project_root()
+    if root is None:
+        return 409, {"ok": False, "detail": "Open a project first."}
+    with STATE.lock:
+        cfg = STATE.cfg
+    cfg = cfg if cfg is not None else _how_config()
+
+    def _int(key, fallback):
+        raw = body.get(key)
+        if raw in (None, ""):
+            return int(getattr(cfg, key, fallback) or 0)
+        try:
+            value = int(raw)
+        except (TypeError, ValueError):
+            raise ConfigError(f"{key} must be a whole number")
+        if value < 0:
+            raise ConfigError(f"{key} must be zero or greater")
+        return value
+
+    keep_sessions = _int("keep_sessions", 0)
+    keep_backups = _int("keep_backups", 0)
+    dry_run = bool(body.get("dry_run"))
+    removed = workspace.prune(
+        root, keep_sessions, keep_backups,
+        int(getattr(cfg, "keep_events", 20) or 0),
+        int(getattr(cfg, "log_max_bytes", 2_000_000) or 0),
+        dry_run=dry_run)
+    verb = "would remove" if dry_run else "removed"
+    return 200, {
+        "ok": True, "dry_run": dry_run, "removed": removed,
+        "keep_sessions": keep_sessions, "keep_backups": keep_backups,
+        "summary": (f"{verb}: {removed['sessions']} session(s), "
+                    f"{removed['backups']} backup snapshot(s), "
+                    f"{removed['events']} event file(s), "
+                    f"{removed['log_bytes']:,} byte(s) of log.txt"),
+    }
 
 
 @post("/api/profile")
@@ -700,6 +1028,8 @@ POST_ROUTES["/api/profiles/rename"] = _settings_write(
     lambda b: settings_api.rename_profile(
         b.get("file", "user"), str(b.get("old_name", "")),
         str(b.get("new_name", ""))))
+POST_ROUTES["/api/settings/scout"] = _settings_write(
+    lambda b: settings_api.configure_scout(dict(b or {})))
 
 
 @post("/api/settings/theme")
@@ -982,7 +1312,10 @@ class _Handler(BaseHTTPRequestHandler):
                  or "application/octet-stream")
         if ctype.startswith("text/") or ctype.endswith("javascript"):
             ctype += "; charset=utf-8"
-        self._send(200, p.read_bytes(), ctype)
+        data = p.read_bytes()
+        if name == "index.html":
+            data = index_html(data)
+        self._send(200, data, ctype)
 
     def do_GET(self):
         if not review_mod.request_allowed(self, post=False):

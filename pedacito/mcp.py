@@ -680,29 +680,39 @@ def named_servers(cfg) -> dict[str, dict]:
     for name, body in raw.items():
         if not isinstance(body, dict) or not str(name).strip():
             continue
-        if not bool(body.get("enabled", True)):
-            continue
-        command = str(body.get("command") or "").strip()
-        url = str(body.get("url") or "").strip()
-        if not command and not url:
-            continue
-        args = body.get("args")
-        if isinstance(args, (list, tuple)):
-            args = [str(a) for a in args]
-        elif isinstance(args, str) and args.strip():
-            args = _split_command(args)
-        else:
-            args = []
-        env = body.get("env")
-        out[str(name)] = {
-            "command": command,
-            "args": args,
-            "url": url,
-            "env": dict(env) if isinstance(env, dict) else {},
-            "enabled": True,
-            "trusted": bool(body.get("trusted", False)),
-        }
+        spec = normalise_named_spec(body)
+        if spec is not None:
+            out[str(name)] = spec
     return out
+
+
+def normalise_named_spec(body: dict) -> dict | None:
+    """One raw `[mcp_servers.<name>]` body -> the runtime spec, or None when
+    it is disabled or names no transport. The GUI's add/edit dialog and the
+    one-server test probe feed unsaved bodies through the same rule, so what a
+    test shows is exactly what a run would use."""
+    if not isinstance(body, dict) or not bool(body.get("enabled", True)):
+        return None
+    command = str(body.get("command") or "").strip()
+    url = str(body.get("url") or "").strip()
+    if not command and not url:
+        return None
+    args = body.get("args")
+    if isinstance(args, (list, tuple)):
+        args = [str(a) for a in args]
+    elif isinstance(args, str) and args.strip():
+        args = _split_command(args)
+    else:
+        args = []
+    env = body.get("env")
+    return {
+        "command": command,
+        "args": args,
+        "url": url,
+        "env": dict(env) if isinstance(env, dict) else {},
+        "enabled": True,
+        "trusted": bool(body.get("trusted", False)),
+    }
 
 
 class _HttpSession:
@@ -881,6 +891,46 @@ def list_mcp_tools(cfg) -> list[dict]:
                         "description": tool["description"],
                         "input_schema": tool["input_schema"],
                         "trusted": trusted})
+    return out
+
+
+def forget_server(name: str) -> None:
+    """Drop one named server's cached session and tool listing. Settings edits
+    and deletes call this so the next listing reflects the saved file."""
+    _drop_named_session(name)
+    _NAMED_TOOLS.pop(name, None)
+    _NAMED_TOOLS_TIME.pop(name, None)
+
+
+def probe_named_server(name: str, body: dict,
+                       budget: float = _NAMED_LIST_TIMEOUT) -> dict:
+    """Start one server just long enough to list its tools, then reap it.
+
+    `body` is the raw [mcp_servers.<name>] table (saved or unsaved). A down,
+    slow or empty server returns an empty list rather than raising: the GUI's
+    "Test" button must always answer. `budget` is the whole listing window
+    (5 seconds by default, matching the gather-time listing)."""
+    spec = normalise_named_spec(body)
+    out = {"name": str(name), "transport": "http" if spec and spec["url"]
+           else "stdio", "tools": [], "error": "", "budget": budget}
+    if spec is None:
+        out["error"] = ("the server is disabled or names no transport "
+                        "(set a command or a url)")
+        return out
+    name = str(name or "test")
+    forget_server(name)
+    try:
+        tools = _named_tools(None, name, spec)
+        out["tools"] = [{"name": t["name"],
+                         "description": t["description"],
+                         "input_schema": t["input_schema"]} for t in tools]
+        if not tools:
+            out["error"] = ("no tools listed within the budget: the server "
+                            "may be down, slow, or expose no tools")
+    except Exception as e:                       # never fail the test button
+        out["error"] = f"{type(e).__name__}: {str(e)[:300]}"
+    finally:
+        forget_server(name)
     return out
 
 

@@ -777,6 +777,35 @@ def load_micro_facts(root, include_retired: bool = False) -> list[dict]:
     return rows
 
 
+def forget_lesson(root, lesson_id: str) -> int:
+    """Delete one repair lesson (by `lesson_id`) from micro_facts.json.
+
+    Covers the live ledger, promoted rows and retired lessons. Returns how
+    many records were removed; unknown keys and the other fact records are
+    left untouched."""
+    lesson_id = str(lesson_id or "").strip()
+    if not lesson_id:
+        return 0
+    path = micro_facts_file(root)
+    raw = _read_json(path, {})
+    if not isinstance(raw, dict):
+        return 0
+    removed = 0
+    for key in ("anti_patterns", "promoted", "retired_lessons"):
+        rows = raw.get(key)
+        if not isinstance(rows, list):
+            continue
+        keep = [r for r in rows
+                if not (isinstance(r, dict)
+                        and str(r.get("lesson_id") or "") == lesson_id)]
+        removed += len(rows) - len(keep)
+        if key in raw:
+            raw[key] = keep
+    if removed:
+        _write_json(path, raw)
+    return removed
+
+
 def _command_identity(command: str) -> tuple[str, str]:
     norm = " ".join(str(command or "").split())
     digest = hashlib.sha1(norm.lower().encode("utf-8", "replace")).hexdigest()

@@ -473,12 +473,21 @@ def test_theme_endpoint_persists_in_user_config(gui):
     assert st["gui_theme"] == "midnight"  # the rejected pick changed nothing
 
 
-def test_theme_endpoint_without_user_config_stays_browser_local(gui):
+def test_theme_endpoint_creates_a_user_config_when_none_exists(gui):
+    """A project-less GUI still remembers the pick: the first theme change
+    creates USER_CONFIG from the starter template and persists gui_theme."""
     status, body = gui.post("/api/settings/theme", {"gui_theme": "jazz_solo"})
-    assert status == 200 and body["ok"] and body["persisted"] is False
-    assert not gui.cfg_path.exists()      # the first-run wizard still owns it
+    assert status == 200 and body["ok"] and body["persisted"] is True
+    assert body["created"] is True
+    assert gui.cfg_path.exists()
+    assert 'gui_theme = "jazz_solo"' in gui.cfg_path.read_text(encoding="utf-8")
     _status, st = gui.get("/api/state")
-    assert st["gui_theme"] == "slate"
+    assert st["gui_theme"] == "jazz_solo"
+    # a second pick replaces it in place, no duplicate key
+    assert gui.post("/api/settings/theme",
+                    {"gui_theme": "midnight"})[0] == 200
+    assert _assigned(gui.cfg_path.read_text(encoding="utf-8"),
+                     "gui_theme") == ['gui_theme = "midnight"']
 
 
 def _assigned(text, key):

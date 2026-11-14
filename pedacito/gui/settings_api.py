@@ -380,31 +380,294 @@ def reset_to_baseline() -> dict:
 
 def save_theme(name: str) -> dict:
     """Persist `gui_theme` in the user config and reflect it in the live
-    config. Purely cosmetic, so nothing is reloaded or restarted; when no
-    user config file exists yet the choice stays browser-local only and
-    `persisted` reports false (the first-run wizard still owns that file)."""
+    config. Purely cosmetic, so nothing is reloaded or restarted. When no
+    user config exists yet it is created from the starter template first, so
+    a project-less GUI session still remembers the choice."""
     name = str(name or "").strip().lower()
     themes = list(config_mod._ENUM_FIELDS["gui_theme"])
     if name not in themes:
         raise ConfigError(f"unknown theme {name!r}. Use one of: "
                           + ", ".join(themes))
-    persisted = False
-    if USER_CONFIG.exists():
-        text = _read_text(USER_CONFIG)
-        write_config(USER_CONFIG, settings.set_values(text, {"gui_theme": name}))
-        # Re-read the user file so /api/state reports the new theme even when
-        # no project is open (STATE.cfg is None until one is). In-place and
-        # job-free — the whole point of a dedicated theme route — and the
-        # dropdown's explicit profile pick survives the reload.
-        with STATE.lock:
-            keep = STATE.profile_request or None
-        reload_state_config(profile=keep)
-        persisted = True
+    created = not USER_CONFIG.exists()
+    text = _read_text(USER_CONFIG) if not created else config_mod.TEMPLATE
+    write_config(USER_CONFIG, settings.set_values(text, {"gui_theme": name}))
+    # Re-read the user file so /api/state reports the new theme even when no
+    # project is open (STATE.cfg is None until one is). In-place and job-free
+    # -- the whole point of a dedicated theme route -- and the dropdown's
+    # explicit profile pick survives the reload.
+    with STATE.lock:
+        keep = STATE.profile_request or None
+    reload_state_config(profile=keep)
+    return {"gui_theme": name, "themes": themes, "persisted": True,
+            "created": created}
+
+
+# --- dual-GPU Scout + Architect pairing ---------------------------------------
+
+def configure_scout(body: dict) -> dict:
+    """Save a Scout + Architect pairing through `configure_scout_architect`.
+
+    `body`: {architect, scout?, architect_spec?, scout_spec?, create_scout?,
+    scout_base_url?, scout_model?, scout_vram_gb?, scout_tier?}. With
+    `create_scout` and no existing scout profile, a starter table on a
+    secondary port is written so the pairing works on a one-GPU machine too.
+    """
+    body = body or {}
+    with STATE.lock:
+        cfg = STATE.cfg
+    architect = str(body.get("architect")
+                    or body.get("architect_profile") or "").strip()
+    if not architect and cfg is not None:
+        architect = str(cfg.active_profile or cfg.default_profile or "")
+    scout = str(body.get("scout") or body.get("scout_profile") or "").strip()
+    path = config_path("user")
+    text = _read_config_text(path)
+    known = config_editor.profile_names(text)
+
+    architect_spec = body.get("architect_spec")
+    if not isinstance(architect_spec, dict):
+        architect_spec = None
+    scout_spec = body.get("scout_spec")
+    if not isinstance(scout_spec, dict):
+        scout_spec = None
+    if body.get("create_scout") and scout and scout not in known \
+            and scout_spec is None:
+        try:
+            vram = int(body.get("scout_vram_gb") or 8)
+        except (TypeError, ValueError):
+            vram = 8
+        scout_spec = {
+            "base_url": str(body.get("scout_base_url")
+                            or "http://localhost:11434/v1").strip(),
+            "model": str(body.get("scout_model") or "qwen3:4b").strip(),
+            "vram_gb": max(1, vram),
+            "tier": str(body.get("scout_tier") or "small").strip(),
+        }
+    if not architect:
+        raise ConfigError("Pick the architect profile (the planner/editor "
+                          "model) first.")
+    if not scout:
+        raise ConfigError("Pick the scout profile (the fast gather model) or "
+                          "create a starter one.")
+    new = config_editor.configure_scout_architect(
+        text, architect_profile=architect, scout_profile=scout,
+        architect_spec=architect_spec, scout_spec=scout_spec)
+    write_config(path, new)
+    reload_state_config(profile=architect)
+    out = payload()
+    out["scout"] = {"architect": architect, "scout": scout,
+                    "path": str(path)}
+    out["status"] = STATE.status()
+    return out
+
+
+# --- named MCP servers ---------------------------------------------------------
+
+def _mcp_specs(path: Path) -> dict[str, dict]:
+    """The `[mcp_servers.<name>]` tables in one config file (never raises:
+    the settings panel must render even while a hand edit is broken)."""
+    text = _read_text(path)
+    if not text.strip():
+        return {}
+    try:
+        flat, _profiles = settings.validate_text(text, str(path))
+    except ConfigError:
+        return {}
+    raw = flat.get("mcp_servers")
+    if not isinstance(raw, dict):
+        return {}
+    return {str(k): dict(v) for k, v in raw.items() if isinstance(v, dict)}
+
+
+def _mcp_config():
+    """The live config, or the user config when no project is open."""
+    with STATE.lock:
+        cfg = STATE.cfg
+    if cfg is not None:
+        return cfg
+    try:
+        return config_mod.load(root=None, require_hardware=False,
+                               warn_budgets=False, upgrade_user_config=False)
+    except ConfigError:
+        return config_mod.Config()
+
+
+def mcp_servers_payload() -> dict:
+    """Every named MCP server plus the tools each enabled one exposes.
+
+    The user config is the primary list. A trusted project file may add
+    servers (it layers over the user config), and the live tool listing comes
+    from `mcp.list_mcp_tools`: a down server lists nothing but is still shown.
+    """
+    from .. import mcp
+    user_path = USER_CONFIG
+    specs: dict[str, dict] = {}
+    sources: dict[str, str] = {}
+    for name, body in _mcp_specs(user_path).items():
+        specs[name] = body
+        sources[name] = "user"
+    project_path = None
+    try:
+        project_path = config_path("project")
+    except ConfigError:
+        project_path = None
+    if project_path is not None and project_path.exists() \
+            and config_mod.is_trusted(project_path):
+        for name, body in _mcp_specs(project_path).items():
+            specs[name] = body
+            sources[name] = "project"
+    cfg = _mcp_config()
+    tools = mcp.list_mcp_tools(cfg)
+    out = []
+    for name in sorted(specs):
+        body = specs[name]
+        spec = mcp.normalise_named_spec(body) or {}
+        out.append({
+            "name": name,
+            "source": sources.get(name, "user"),
+            "transport": "http" if str(body.get("url") or "").strip()
+            else "stdio",
+            "command": str(body.get("command") or ""),
+            "args": [str(a) for a in (body.get("args") or [])]
+            if isinstance(body.get("args"), (list, tuple)) else [],
+            "url": str(body.get("url") or ""),
+            "env": dict(body.get("env") or {})
+            if isinstance(body.get("env"), dict) else {},
+            "enabled": bool(body.get("enabled", True)),
+            "trusted": bool(body.get("trusted", False)),
+            "tools": [{"name": t["name"], "description": t["description"]}
+                      for t in tools if t.get("server") == name],
+            "live": bool(spec),
+        })
+    return {"servers": out, "tools": tools,
+            "user_config": str(user_path),
+            "project_config": str(project_path) if project_path else "",
+            "enabled": bool(getattr(cfg, "enable_mcp", True))}
+
+
+def _mcp_write_target(body: dict) -> tuple[Path, str]:
+    """(path, which) for an MCP edit, enforcing the §21 trust boundary."""
+    which = str(body.get("file") or "user").strip().lower()
+    if which not in ("user", "project"):
+        raise ConfigError(f"unknown config file {which!r}")
+    if which == "user":
+        return USER_CONFIG, "user"
+    path = config_path("project")
+    if not path.exists():
+        raise ConfigError(
+            f"{path} does not exist yet; create and trust it before adding "
+            "execution-capable MCP servers there")
+    if not config_mod.is_trusted(path):
+        raise ConfigError(
+            f"Refusing to write MCP servers to {path}: the project config is "
+            "not trusted. Approve it in Settings, or save the server in the "
+            "user config instead (the project file can run commands).")
+    return path, "project"
+
+
+def _mcp_body_from_request(body: dict) -> tuple[str, str, dict]:
+    name = str(body.get("name") or "").strip()
+    if not name:
+        raise ConfigError("Give the MCP server a name.")
+    transport = str(body.get("transport") or "").strip().lower()
+    if transport not in ("stdio", "http"):
+        transport = "http" if str(body.get("url") or "").strip() else "stdio"
+    spec: dict = {"enabled": bool(body.get("enabled", True)),
+                  "trusted": bool(body.get("trusted", False))}
+    if transport == "http":
+        url = str(body.get("url") or "").strip()
+        if not url:
+            raise ConfigError("An HTTP MCP server needs a url.")
+        spec.update({"url": url, "command": None, "args": None})
     else:
-        with STATE.lock:
-            if STATE.cfg is not None:
-                STATE.cfg.gui_theme = name
-    return {"gui_theme": name, "themes": themes, "persisted": persisted}
+        command = str(body.get("command") or "").strip()
+        if not command:
+            raise ConfigError(
+                "A stdio MCP server needs a command (the executable to start).")
+        args = body.get("args")
+        if args is None:
+            args = []
+        spec.update({"command": command, "args": args, "url": None})
+    if "env" in body:
+        spec["env"] = body.get("env")
+    return name, transport, spec
+
+
+def save_mcp_server(body: dict) -> dict:
+    """Add or update one named server. Writes USER_CONFIG, or a project file
+    only when it is trusted; every write is validated and backed up."""
+    from .. import mcp
+    body = body or {}
+    name, _transport, spec = _mcp_body_from_request(body)
+    path, which = _mcp_write_target(body)
+    text = _read_config_text(path)
+    new = config_editor.upsert_mcp_server(text, name, spec)
+    write_config(path, new)
+    if which == "project":
+        # The user just approved this exact edit; re-mark it so the server is
+        # live immediately instead of lapsed by the write's own hash change.
+        config_mod.trust_project(path)
+    mcp.forget_server(name)
+    with STATE.lock:
+        keep = STATE.profile_request or None
+    reload_state_config(profile=keep)
+    out = mcp_servers_payload()
+    out["saved"] = name
+    out["path"] = str(path)
+    return out
+
+
+def delete_mcp_server(body: dict) -> dict:
+    """Remove one named server from the chosen config file."""
+    from .. import mcp
+    body = body or {}
+    name = str(body.get("name") or "").strip()
+    if not name:
+        raise ConfigError("Name the MCP server to remove.")
+    path, which = _mcp_write_target(body)
+    text = _read_config_text(path)
+    new = config_editor.remove_mcp_server(text, name)
+    write_config(path, new)
+    if which == "project":
+        config_mod.trust_project(path)
+    mcp.forget_server(name)
+    with STATE.lock:
+        keep = STATE.profile_request or None
+    reload_state_config(profile=keep)
+    out = mcp_servers_payload()
+    out["deleted"] = name
+    out["path"] = str(path)
+    return out
+
+
+def test_mcp_server(body: dict) -> dict:
+    """Probe one server (saved or as edited in the dialog) for 5 seconds."""
+    from .. import mcp
+    body = body or {}
+    name = str(body.get("name") or "").strip() or "test"
+    if body.get("command") or body.get("url") or body.get("transport"):
+        raw = {"command": body.get("command"),
+               "args": body.get("args") or [],
+               "url": body.get("url"),
+               "env": body.get("env") or {},
+               "enabled": bool(body.get("enabled", True)),
+               "trusted": bool(body.get("trusted", False))}
+    else:
+        raw = {}
+        for path in (USER_CONFIG,):
+            raw = _mcp_specs(path).get(name) or {}
+            if raw:
+                break
+        if not raw:
+            try:
+                pp = config_path("project")
+            except ConfigError:
+                pp = None
+            if pp is not None and pp.exists() and config_mod.is_trusted(pp):
+                raw = _mcp_specs(pp).get(name) or {}
+        if not raw:
+            raise ConfigError(f"no MCP server named '{name}'")
+    return mcp.probe_named_server(name, raw, budget=5.0)
 
 
 # --- Auto-Tune Universal Settings -----------------------------------------------
@@ -415,6 +678,10 @@ AUTOTUNE_QUESTIONS = {
     "model": ("small", "medium", "large", "hosted"),
     "codebase": ("small", "medium", "large"),
     "priority": ("token_saver", "balanced", "thorough"),
+    # Optional fifth answer for a two-GPU box. A scout handles the gather
+    # lookup loop on the second card, so the architect can spend its window
+    # on planning and edits. "none" keeps the single-GPU recommendation.
+    "dual_gpu": ("none", "dual24_8", "dual24_16"),
 }
 
 # Starting budgets per hardware tier: (max_read_tokens, max_gathered_chars,
@@ -430,12 +697,19 @@ _HW_TIERS = {
 
 
 def _autotune_values(answers: dict) -> tuple[dict, dict]:
-    """Deterministic (values, reasons) for the four wizard answers."""
+    """Deterministic (values, reasons) for the wizard answers."""
     hw = answers["hardware"]
     model = answers["model"]
     code = answers["codebase"]
     prio = answers["priority"]
+    dual = answers.get("dual_gpu") or "none"
     read, gathered, calls, no_progress = _HW_TIERS[hw]
+    if dual != "none":
+        # The architect owns the big card; the scout does the reading. These
+        # are the architect-side budgets, sized for a 24 GB planner.
+        read, gathered, calls, no_progress = (
+            (1200, 18000, 40, 4) if dual == "dual24_8"
+            else (1600, 24000, 45, 5))
     weak_model = model in ("small", "medium")
     reasons: dict[str, str] = {}
 
@@ -522,14 +796,21 @@ def _autotune_values(answers: dict) -> tuple[dict, dict]:
             "the transcript auditable")
 
     reasons["max_read_tokens"] = (
-        f"{hw.upper() if hw != 'hosted' else 'hosted'} hardware: "
-        + (f"{read} tokens per gather read keeps one observation cheap"
-           if hw in ("lt8", "8to16") else
-           f"{read} tokens per gather read fits the window comfortably"))
+        (f"Dual-GPU scout/architect: {read} tokens per architect gather read; "
+         "the scout's own lookups stay on its card"
+         if dual != "none" else
+         f"{hw.upper() if hw != 'hosted' else 'hosted'} hardware: "
+         + (f"{read} tokens per gather read keeps one observation cheap"
+            if hw in ("lt8", "8to16") else
+            f"{read} tokens per gather read fits the window comfortably")))
     reasons["max_gathered_chars"] = (
-        f"cap on what one task accumulates: {reason_size}")
+        f"cap on what one task accumulates: {reason_size}"
+        + ("; the scout keeps lookup detail out of the architect's window"
+           if dual != "none" else ""))
     reasons["max_total_model_calls"] = (
-        f"hard ceiling per task: {calls} calls, {reason_prio}")
+        f"hard ceiling per task: {calls} calls, {reason_prio}"
+        + (" (architect-side; scout lookups have their own budget)"
+           if dual != "none" else ""))
     reasons["max_no_progress_steps"] = (
         f"end gather after {no_progress} fruitless steps, {reason_prio}")
     reasons["verify_answer"] = (
@@ -553,6 +834,8 @@ def autotune(answers: dict, apply: bool = False) -> dict:
     clean: dict = {}
     for key, allowed in AUTOTUNE_QUESTIONS.items():
         val = str((answers or {}).get(key) or "").strip().lower()
+        if key == "dual_gpu" and not val:
+            val = "none"
         if val not in allowed:
             raise ConfigError(
                 f"{key} must be one of: {', '.join(allowed)}")
@@ -563,6 +846,31 @@ def autotune(answers: dict, apply: bool = False) -> dict:
                 "reason": reasons.get(k, "")}
                for k, v in values.items()]
     out = {"answers": clean, "changes": changes, "applied": False}
+    dual = clean.get("dual_gpu") or "none"
+    if dual != "none":
+        # The pairing itself is a separate one-click write (the scout profile
+        # must exist first), so the preview recommends it without silently
+        # creating a profile from a budget calculation.
+        scout_gb = 8 if dual == "dual24_8" else 16
+        scout_tier = "tiny" if scout_gb <= 8 else "small"
+        out["dual_gpu"] = {
+            "layout": dual,
+            "architect_vram_gb": 24,
+            "scout_vram_gb": scout_gb,
+            "scout_tier": scout_tier,
+            "suggested_scout_name": "scout",
+            "scout_spec": {
+                "base_url": "http://localhost:11434/v1",
+                "model": "qwen3:4b" if scout_gb <= 8 else "qwen3:8b",
+                "vram_gb": scout_gb,
+                "tier": scout_tier,
+            },
+            "reason": (
+                "Dual-GPU: keep the 24 GB card for planning, answers and "
+                f"edits; a {scout_gb} GB scout serves the gather lookup loop "
+                "on its own port so its reads never evict the architect's "
+                "prefix."),
+        }
     if not apply:
         return out
     path = config_path("user")

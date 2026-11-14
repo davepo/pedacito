@@ -819,6 +819,277 @@ def new_user_config(base_url: str, model: str, vram_gb: int | None) -> str:
     return text
 
 
+# --- dual-GPU Scout + Architect pairing ---------------------------------------
+#
+# A two-GPU box runs a planner/editor on the big card and a fast lookup model
+# on the small one (TECHNIQUES.md #28). The pairing is two real profile tables
+# plus two selectors: `default_profile` (the architect, i.e. the active
+# profile) and `scout_profile` (gather's fast model). Everything here is the
+# same textual patcher as set_values, so comments and unrelated keys survive.
+
+_PROFILE_NAME_RE = re.compile(r"[A-Za-z0-9_.\- ]+")
+
+
+def _check_profile_name(name: str, label: str) -> str:
+    name = str(name or "").strip()
+    if not name or not _PROFILE_NAME_RE.fullmatch(name):
+        raise ConfigError(f"{label} profile name must use letters, digits, "
+                          "'-', '_' and '.'")
+    return name
+
+
+def configure_scout_architect(text: str, *, architect_profile: str,
+                              scout_profile: str,
+                              architect_spec: dict | None = None,
+                              scout_spec: dict | None = None) -> str:
+    """Pair a Scout + Architect setup in one comment-preserving edit.
+
+    `architect_profile` becomes the default (active) profile and the
+    `scout_profile` selector names the fast gather model. When a `*_spec`
+    dict is given its keys are upserted into that profile's table (created
+    when absent; existing keys are replaced in place). An empty
+    `scout_profile` clears the selector, which turns dual-model routing off.
+
+    Returns the new config text, validated with `validate_text`.
+    """
+    architect = _check_profile_name(architect_profile, "architect")
+    scout = str(scout_profile or "").strip()
+    if scout:
+        scout = _check_profile_name(scout, "scout")
+        if scout == architect:
+            raise ConfigError("the scout and architect must be two different "
+                              "profiles (a split needs a second model)")
+    names = profile_names(text)
+    if architect not in names and not architect_spec:
+        raise ConfigError(
+            f"no profile named '{architect}' in this config (pass an "
+            "architect_spec to create it)")
+    if scout and scout not in names and not scout_spec:
+        raise ConfigError(
+            f"no profile named '{scout}' in this config (pass a scout_spec "
+            "to create it)")
+
+    for name, spec in ((architect, architect_spec), (scout, scout_spec)):
+        if not name or not spec:
+            continue
+        if not isinstance(spec, dict):
+            raise ConfigError("a profile spec must be a table of settings")
+        text = set_values(text, dict(spec), profile=name)
+
+    changes = {"default_profile": architect}
+    removes: list[str] = []
+    if scout:
+        changes["scout_profile"] = scout
+    else:
+        removes.append("scout_profile")
+    text = set_values(text, changes, removes)
+    validate_text(text)
+    return text
+
+
+# --- named MCP server tables ---------------------------------------------------
+#
+# The named-server form is [mcp_servers.<name>] with command/args (stdio) or
+# url (HTTP), plus env, enabled and trusted. These helpers patch that table
+# only: every other table, comment and blank line stays byte for byte. The
+# caller owns the trust boundary (the GUI writes the user config, or a
+# project file only after `pedacito trust`).
+
+MCP_SERVER_KEYS = ("command", "args", "url", "env", "trusted", "enabled")
+_MCP_NAME_RE = re.compile(r"[A-Za-z0-9_.\-]+")
+
+
+def mcp_server_names(text: str) -> list[str]:
+    """The named `[mcp_servers.<name>]` tables present in `text`."""
+    out: list[str] = []
+    for r in _regions(text.replace("\r\n", "\n").split("\n")):
+        parts = r["name"].split(SEP)
+        if len(parts) == 2 and parts[0] == "mcp_servers":
+            out.append(parts[1])
+    return out
+
+
+def _set_table_values(text: str, parts: tuple[str, ...], changes: dict,
+                      removes: tuple[str, ...] = ()) -> str:
+    """Set/remove keys inside one table, creating it at EOF when absent."""
+    nl = "\r\n" if "\r\n" in text else "\n"
+    lines = text.replace("\r\n", "\n").split("\n")
+    trailing_nl = text.endswith("\n")
+    if trailing_nl and lines and lines[-1] == "":
+        lines.pop()
+    target = SEP.join(parts)
+
+    for key in removes:
+        region = next((r for r in _regions(lines) if r["name"] == target),
+                      None)
+        if region is None:
+            break
+        hit = _find_key(lines, region, key)
+        if hit:
+            i, _vs, j, _ec = hit
+            del lines[i:j + 1]
+
+    for key, value in changes.items():
+        region = next((r for r in _regions(lines) if r["name"] == target),
+                      None)
+        new_line = f"{key} = {literal(value)}"
+        if region is None:
+            if lines and lines[-1].strip():
+                lines.append("")
+            lines.extend([f"[{table_name(*parts)}]", new_line])
+            continue
+        hit = _find_key(lines, region, key)
+        if hit:
+            i, vs, j, ec = hit
+            tail = lines[j][ec:]
+            lines[i:j + 1] = [lines[i][:vs] + literal(value) + tail]
+        else:
+            lines.insert(_last_assignment_end(lines, region) + 1, new_line)
+
+    out = nl.join(lines)
+    return out + nl if (trailing_nl or not out) else out
+
+
+def _normalise_mcp_args(value):
+    if value is None:
+        return None
+    if isinstance(value, str):
+        if not value.strip():
+            return []
+        import shlex
+        return shlex.split(value)
+    if isinstance(value, (list, tuple)):
+        return [str(v) for v in value]
+    raise ConfigError("mcp server args must be a list of strings")
+
+
+def _normalise_mcp_env(value):
+    if value is None:
+        return None
+    if isinstance(value, dict):
+        return {str(k): str(v) for k, v in value.items()}
+    if isinstance(value, str):
+        env: dict[str, str] = {}
+        for line in value.splitlines():
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            key, sep, val = line.partition("=")
+            if not sep or not key.strip():
+                raise ConfigError(
+                    f"mcp server env line {line!r} must be KEY=VALUE")
+            env[key.strip()] = val.strip()
+        return env
+    raise ConfigError("mcp server env must be a table of KEY = \"VALUE\"")
+
+
+def upsert_mcp_server(text: str, name: str, spec: dict) -> str:
+    """Create or update one `[mcp_servers.<name>]` table in place.
+
+    `spec` may carry `command`, `args`, `url`, `env`, `trusted` and `enabled`.
+    A key whose value is None is removed from the table (the GUI uses that to
+    drop the opposite transport's keys). Comments, other servers and every
+    other table survive. Raises ConfigError when the name is invalid, when no
+    transport is left, or when the merged file would not load.
+    """
+    name = str(name or "").strip()
+    if not name or not _MCP_NAME_RE.fullmatch(name):
+        raise ConfigError("MCP server names use letters, digits, '-', '_' "
+                          "and '.'")
+    if not isinstance(spec, dict) or not spec:
+        raise ConfigError("an MCP server needs at least one setting")
+
+    values: dict = {}
+    removes: list[str] = []
+    for key in MCP_SERVER_KEYS:
+        if key not in spec:
+            continue
+        raw = spec[key]
+        if key == "args":
+            raw = _normalise_mcp_args(raw)
+        elif key == "env":
+            raw = _normalise_mcp_env(raw)
+        elif key in ("trusted", "enabled") and raw is not None:
+            raw = bool(raw)
+        elif key in ("command", "url") and raw is not None:
+            raw = str(raw).strip()
+        if raw is None:
+            removes.append(key)
+        elif key in ("command", "url") and not raw:
+            removes.append(key)
+        else:
+            values[key] = raw
+
+    current: dict = {}
+    try:
+        flat, _profiles = validate_text(text)
+        raw_servers = flat.get("mcp_servers")
+        if isinstance(raw_servers, dict):
+            current = dict(raw_servers.get(name) or {})
+    except ConfigError:
+        current = {}                  # validate_text below reports it loudly
+    merged = {k: v for k, v in current.items() if k not in removes}
+    merged.update(values)
+    if not merged.get("command") and not merged.get("url"):
+        raise ConfigError(
+            f"MCP server '{name}' needs a command (stdio) or a url (HTTP)")
+
+    lines = text.replace("\r\n", "\n").split("\n")
+    existing = any(r["name"] == SEP.join(("mcp_servers", name))
+                   for r in _regions(lines))
+    if not existing:
+        # A root-level `mcp_servers = {}` cannot be extended by a
+        # [mcp_servers.<name>] table (TOML forbids it). An empty inline table
+        # carries no data, so drop that one harmless line; a non-empty one is
+        # real configuration and is refused rather than rewritten.
+        root = next((r for r in _regions(lines) if r["name"] == ""), None)
+        hit = _find_key(lines, root, "mcp_servers") if root else None
+        if hit:
+            i, vs, j, ec = hit
+            if j == i:
+                value_parts = [lines[i][vs:ec]]
+            else:
+                value_parts = ([lines[i][vs:]] + lines[i + 1:j]
+                               + [lines[j][:ec]])
+            value_text = "\n".join(value_parts).strip()
+            if value_text.replace(" ", "") != "{}":
+                raise ConfigError(
+                    "this config defines `mcp_servers` as an inline table at "
+                    "the top level; remove that line (or convert it to "
+                    "[mcp_servers.<name>] tables) before adding a named "
+                    "server from the GUI")
+            del lines[i:j + 1]
+            text = "\n".join(lines) + ("\n" if text.endswith("\n") else "")
+
+    out = _set_table_values(text, ("mcp_servers", name), values, tuple(removes))
+    validate_text(out)
+    return out
+
+
+def remove_mcp_server(text: str, name: str) -> str:
+    """Delete `[mcp_servers.<name>]` (and any sub-tables) from `text`."""
+    name = str(name or "").strip()
+    if not name or not _MCP_NAME_RE.fullmatch(name):
+        raise ConfigError("MCP server names use letters, digits, '-', '_' "
+                          "and '.'")
+    nl = "\r\n" if "\r\n" in text else "\n"
+    lines = text.replace("\r\n", "\n").split("\n")
+    target = SEP.join(("mcp_servers", name))
+    drop: list[tuple[int, int]] = []
+    for r in _regions(lines):
+        if r["name"] == target or r["name"].startswith(target + SEP):
+            drop.append((r["line"], r["end"]))
+    if not drop:
+        raise ConfigError(f"no MCP server named '{name}' in this file")
+    for a, b in sorted(drop, reverse=True):
+        del lines[a:b]
+    while lines and not lines[-1].strip():
+        lines.pop()
+    out = nl.join(lines) + nl
+    validate_text(out)
+    return out
+
+
 # --- profile naming and the scan writer ----------------------------------------
 
 def short_name(model_id: str, taken=None, server_label: str = "") -> str:

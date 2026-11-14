@@ -24,7 +24,15 @@
   // Same for the Auto-Tune wizard: the answers and the preview survive
   // switching to another settings tab and back.
   var TUNE = { hardware: 'hosted', model: 'medium', codebase: 'medium',
-               priority: 'balanced', result: null, err: '', busy: false };
+               priority: 'balanced', dual_gpu: 'none',
+               result: null, err: '', busy: false };
+  // Dual-GPU Scout + Architect pairing form state (Profiles tab).
+  var PAIR = { architect: '', scout: '', starter: false, newName: 'scout',
+               base: 'http://localhost:11434/v1', model: 'qwen3:4b',
+               vram: '8', tier: 'small', busy: false, msg: '' };
+  // Named MCP servers tab: the server list and its live tool inventory are
+  // loaded on first open and refreshed after every write.
+  var MCP = { data: null, loading: false, err: '', test: {}, testing: {} };
   // And for the hosted-provider dialog: the catalog starts as the built-in
   // fallback (always renders instantly) and is replaced once
   // GET /api/providers/presets answers. HC holds the dialog's own state, so
@@ -185,7 +193,7 @@
     }
     var tabs = h('div', { class: 'stabs' });
     [['discovery', 'Model discovery'], ['profiles', 'Profiles'], ['all', 'All settings'],
-     ['autotune', 'Auto-Tune'], ['raw', 'Raw file / reset']].forEach(function (t) {
+     ['autotune', 'Auto-Tune'], ['mcp', 'MCP Servers'], ['raw', 'Raw file / reset']].forEach(function (t) {
       tabs.appendChild(h('button', { class: X.tab === t[0] ? 'on' : '', text: t[1], onclick: function () { X.tab = t[0]; X.pending = {}; render(); } }));
     });
     body.appendChild(tabs);
@@ -193,6 +201,7 @@
     else if (X.tab === 'profiles') body.appendChild(profilesTab());
     else if (X.tab === 'all') body.appendChild(allTab());
     else if (X.tab === 'autotune') body.appendChild(autotuneTab());
+    else if (X.tab === 'mcp') body.appendChild(mcpTab());
     else body.appendChild(rawTab());
   }
   function radio(which, label, disabled) {
@@ -719,6 +728,105 @@
   function gotoProfile(name) { X.profile = name; X.pending = {}; X.tab = 'profiles'; render(); }
 
   // ----- profiles ----------------------------------------------------------------------
+  // Dual-GPU / Scout + Architect pairing. TECHNIQUES.md #28: a 24 GB card
+  // holds the planner/editor while a small model on a second port does the
+  // gather lookup loop. The write is one comment-preserving config patch
+  // (POST /api/settings/scout), so it works on a one-GPU machine today too.
+  function scoutSection(f) {
+    var names = Object.keys(f.profiles || {}).sort();
+    var current = (f.settings || {});
+    if (!PAIR.architect || names.indexOf(PAIR.architect) < 0) {
+      PAIR.architect = (X.data.active_profile && names.indexOf(X.data.active_profile) >= 0)
+        ? X.data.active_profile
+        : (current.default_profile && names.indexOf(current.default_profile) >= 0
+           ? current.default_profile : (names[0] || ''));
+    }
+    if (!PAIR.scout) {
+      PAIR.scout = (current.scout_profile && names.indexOf(current.scout_profile) >= 0)
+        ? current.scout_profile : '__new__';
+      PAIR.starter = PAIR.scout === '__new__';
+    } else if (PAIR.scout !== '__new__' && names.indexOf(PAIR.scout) < 0) {
+      // the selected file changed under us (user <-> project)
+      PAIR.scout = (current.scout_profile && names.indexOf(current.scout_profile) >= 0)
+        ? current.scout_profile : '__new__';
+    }
+    var archSel = h('select', {}, names.map(function (n) {
+      return h('option', { value: n, text: n });
+    }));
+    archSel.value = PAIR.architect;
+    archSel.addEventListener('change', function () { PAIR.architect = archSel.value; });
+    var scoutOpts = names.map(function (n) { return [n, n]; });
+    scoutOpts.push(['__new__', '\u2795 Create a starter Scout profile\u2026']);
+    var scoutSel = h('select', {}, scoutOpts.map(function (o) {
+      return h('option', { value: o[0], text: o[1] });
+    }));
+    scoutSel.value = PAIR.scout;
+    var starter = h('div', {});
+    function paintStarter() {
+      PDC.clear(starter);
+      if (scoutSel.value !== '__new__') return;
+      var nm = h('input', { type: 'text', value: PAIR.newName, placeholder: 'scout' });
+      nm.addEventListener('input', function () { PAIR.newName = nm.value; });
+      var base = h('input', { type: 'text', value: PAIR.base, class: 'grow', spellcheck: false });
+      base.addEventListener('input', function () { PAIR.base = base.value; });
+      var model = h('input', { type: 'text', value: PAIR.model, class: 'grow', spellcheck: false, placeholder: 'model id on the second server' });
+      model.addEventListener('input', function () { PAIR.model = model.value; });
+      var vram = h('input', { type: 'number', value: PAIR.vram, min: 1, placeholder: 'GB' });
+      vram.addEventListener('input', function () { PAIR.vram = vram.value; });
+      var tier = h('select', {}, ['tiny', 'small', 'medium'].map(function (t) {
+        return h('option', { value: t, text: t });
+      }));
+      tier.value = PAIR.tier;
+      tier.addEventListener('change', function () { PAIR.tier = tier.value; });
+      starter.appendChild(h('div', { class: 'form' },
+        h('label', { text: 'Scout profile name' }), nm,
+        h('label', { text: 'Second server base URL' }), base,
+        h('label', { text: 'Scout model id' }), model,
+        h('label', { text: 'VRAM (GB)' }), vram,
+        h('label', { text: 'Tier' }), tier));
+      starter.appendChild(h('div', { class: 'muted small-text',
+        text: 'Starter default: http://localhost:11434/v1 (Ollama) or :1235/v1 for a second llama.cpp. The endpoint is never probed here, so an offline second GPU can be configured now.' }));
+    }
+    scoutSel.addEventListener('change', function () { PAIR.scout = scoutSel.value; paintStarter(); });
+    paintStarter();
+    var msg = h('div', { class: 'muted small-text', text: PAIR.msg || '' });
+    var saveBtn = h('button', { class: 'primary', text: PAIR.busy ? 'Saving\u2026' : 'Save pairing',
+      disabled: PAIR.busy || !names.length || X.which !== 'user', onclick: function () {
+        var scout = scoutSel.value === '__new__' ? PAIR.newName.trim() : scoutSel.value;
+        if (!PAIR.architect || !scout) { PDC.toast('Pick an architect and a scout.', true); return; }
+        var payload = { architect: PAIR.architect, scout: scout };
+        if (scoutSel.value === '__new__') {
+          payload.create_scout = true;
+          payload.scout_base_url = PAIR.base;
+          payload.scout_model = PAIR.model;
+          payload.scout_vram_gb = PAIR.vram;
+          payload.scout_tier = PAIR.tier;
+        }
+        PAIR.busy = true; PAIR.msg = ''; render();
+        PDC.api('/api/settings/scout', payload).then(function (j) {
+          PAIR.busy = false;
+          if (!j.ok) { PAIR.msg = j.detail || 'could not save the pairing'; render(); return; }
+          X.data = j;
+          PAIR.msg = 'Paired ' + j.scout.architect + ' (architect) + ' + j.scout.scout + ' (scout).';
+          PAIR.scout = j.scout.scout;
+          PDC.toast('Scout + Architect pairing saved.');
+          PDC.refreshState();             // the topbar Scout badge follows
+          render();
+        }, function () {
+          PAIR.busy = false; PAIR.msg = 'The GUI server did not answer.'; render();
+        });
+      } });
+    return h('div', { class: 'note-box', style: 'margin-bottom:12px' },
+      h('b', { text: 'Dual-GPU / Scout + Architect Pairing' }),
+      h('div', { class: 'small-text',
+        text: 'The architect is the active planner/editor profile (typically a 24B-35B model on the 24 GB card). The scout is a 4B-9B model on a second GPU/port that answers gather lookup steps, so its reads never evict the architect\u2019s prefix. Saving writes default_profile + scout_profile in one comment-preserving edit and updates the topbar Scout badge.' }),
+      h('div', { class: 'row', style: 'margin-top:8px' },
+        h('label', { text: 'Architect' }), archSel,
+        h('label', { text: 'Scout' }), scoutSel, saveBtn),
+      X.which !== 'user' ? h('div', { class: 'muted small-text', text: 'The pairing is saved in the user config; switch Editing to User config to change it.' }) : null,
+      starter, msg);
+  }
+
   function profilesTab() {
     var f = file(), names = Object.keys(f.profiles || {}).sort();
     var defName = (f.settings || {}).default_profile || '';
@@ -741,6 +849,7 @@
       h('button', { class: 'small', text: '+ Add Hosted Provider\u2026', onclick: openHostedDialog,
         title: 'Connect a hosted API key, verify it live, and import its models as profiles' })));
     return h('div', {},
+      scoutSection(f),
       h('div', { class: 'set-layout' }, side,
         X.profile ? profileForm(f.profiles[X.profile] || {})
           : h('div', { class: 'tip', text: 'Create a profile to point pedacito at a model.' })));
@@ -841,6 +950,225 @@
         mkDefault));
   }
 
+  // ----- named MCP servers -----------------------------------------------------------
+  // [mcp_servers.<name>] tables (command/args for stdio, url for HTTP, plus
+  // env/enabled/trusted). Every write goes to the user config; a project
+  // file is accepted only after it is trusted (the server enforces §21).
+  function loadMcp() {
+    if (MCP.loading) return;
+    MCP.loading = true; MCP.err = '';
+    PDC.api('/api/mcp/servers').then(function (j) {
+      MCP.loading = false;
+      if (j && j.ok) MCP.data = j;
+      else MCP.err = (j && j.detail) || 'could not read the MCP servers';
+      render();
+    }, function () {
+      MCP.loading = false; MCP.err = 'The GUI server did not answer.'; render();
+    });
+  }
+  function mcpPayload(s, over) {
+    return { name: s.name, transport: s.transport, command: s.command,
+             args: s.args || [], url: s.url, env: s.env || {},
+             trusted: !!s.trusted, enabled: !!s.enabled,
+             file: s.source || 'user' };
+  }
+  function saveMcp(payload, okMsg) {
+    return PDC.api('/api/mcp/servers', payload).then(function (j) {
+      if (!j.ok) { PDC.toast(j.detail || 'could not save the MCP server', true); return j; }
+      MCP.data = j; MCP.test = {};
+      PDC.toast(okMsg || ('MCP server "' + (j.saved || payload.name) + '" saved.'));
+      PDC.refreshState();
+      render();
+      return j;
+    });
+  }
+  function testMcp(s) {
+    MCP.testing[s.name] = true; render();
+    PDC.api('/api/mcp/servers/test', mcpPayload(s)).then(function (j) {
+      MCP.testing[s.name] = false;
+      MCP.test[s.name] = j.ok ? j : { error: j.detail || 'test failed', tools: [] };
+      render();
+    }, function () {
+      MCP.testing[s.name] = false;
+      MCP.test[s.name] = { error: 'The GUI server did not answer.', tools: [] };
+      render();
+    });
+  }
+  function deleteMcp(s) {
+    PDC.confirm('Delete MCP server "' + s.name + '" from the ' + (s.source === 'project' ? 'project' : 'user') + ' config?\n\nThe list of tools it exposes disappears with it; a .bak copy of the file is kept.', 'Delete it', true).then(function (ok) {
+      if (!ok) return;
+      PDC.api('/api/mcp/servers/delete', { name: s.name, file: s.source || 'user' }).then(function (j) {
+        if (!j.ok) { PDC.toast(j.detail || 'could not delete it', true); return; }
+        MCP.data = j; PDC.toast('MCP server "' + s.name + '" deleted.');
+        PDC.refreshState(); render();
+      });
+    });
+  }
+  function openMcpEditor(existing) {
+    var isNew = !existing;
+    var s = existing || { name: '', transport: 'stdio', command: '',
+                          args: [], url: '', env: {}, trusted: false,
+                          enabled: true };
+    var name = h('input', { type: 'text', value: s.name, disabled: !isNew,
+      placeholder: 'e.g. docs', spellcheck: false });
+    var transport = h('select', {}, [
+      h('option', { value: 'stdio', text: 'stdio \u2014 command + args' }),
+      h('option', { value: 'http', text: 'http \u2014 Streamable HTTP url' })]);
+    transport.value = s.transport || 'stdio';
+    var command = h('input', { type: 'text', value: s.command || '',
+      class: 'grow', spellcheck: false, placeholder: 'e.g. python or npx' });
+    var args = h('textarea', { spellcheck: false,
+      placeholder: 'one argument per line, e.g.\n/path/to/server.py\n--stdio' });
+    args.value = (s.args || []).join('\n');
+    var url = h('input', { type: 'text', value: s.url || '', class: 'grow',
+      spellcheck: false, placeholder: 'http://127.0.0.1:PORT/mcp' });
+    var env = h('textarea', { spellcheck: false,
+      placeholder: 'one per line:\nDOCS_TOKEN=...' });
+    env.value = Object.keys(s.env || {}).map(function (k) {
+      return k + '=' + s.env[k];
+    }).join('\n');
+    var trusted = h('input', { type: 'checkbox', checked: !!s.trusted });
+    var enabled = h('input', { type: 'checkbox', checked: s.enabled !== false });
+    var stdioBox = h('div', { class: 'form' },
+      h('label', { text: 'Command' }), command,
+      h('label', { text: 'Arguments (one per line)' }), args);
+    var httpBox = h('div', { class: 'form' }, h('label', { text: 'URL' }), url);
+    function paintTransport() {
+      stdioBox.style.display = transport.value === 'stdio' ? '' : 'none';
+      httpBox.style.display = transport.value === 'http' ? '' : 'none';
+    }
+    transport.addEventListener('change', paintTransport);
+    paintTransport();
+    var out = h('div', { class: 'note-box', style: 'margin-top:8px' });
+    function parseEnv() {
+      var obj = {};
+      env.value.split(/\r?\n/).forEach(function (line) {
+        line = line.trim();
+        if (!line || line.charAt(0) === '#') return;
+        var at = line.indexOf('=');
+        if (at < 0) { obj[line] = ''; return; }
+        obj[line.slice(0, at).trim()] = line.slice(at + 1).trim();
+      });
+      return obj;
+    }
+    function payload() {
+      return { name: name.value.trim(), transport: transport.value,
+               command: command.value.trim(),
+               args: args.value.split(/\r?\n/).map(function (a) { return a.trim(); })
+                 .filter(function (a) { return a; }),
+               url: url.value.trim(), env: parseEnv(),
+               trusted: trusted.checked, enabled: enabled.checked,
+               file: s.source || 'user' };
+    }
+    var modal = null;
+    var footer = [
+      { label: 'Cancel' },
+      { label: 'Test', onclick: function () {
+        out.className = 'note-box';
+        out.textContent = 'Starting the server and listing tools (5s budget)\u2026';
+        PDC.api('/api/mcp/servers/test', payload()).then(function (j) {
+          if (!j.ok) { out.className = 'note-box err'; out.textContent = j.detail || 'test failed'; return; }
+          out.className = 'note-box';
+          PDC.clear(out);
+          out.appendChild(h('b', { text: j.tools && j.tools.length
+            ? '\u2713 ' + j.tools.length + ' tool(s) from ' + j.name
+            : '\u2717 no tools listed' }));
+          (j.tools || []).forEach(function (t) {
+            out.appendChild(h('div', { class: 'small-text' }, h('code', { text: t.name }),
+              ' \u2014 ' + (t.description || '')));
+          });
+          if (j.error) out.appendChild(h('div', { class: 'muted small-text', text: j.error }));
+        });
+        return false;                    // keep the dialog open for the result
+      } },
+      { label: isNew ? 'Add server' : 'Save changes', primary: true,
+        onclick: function () {
+          var body = payload();
+          if (!body.name) { PDC.toast('Give the server a name.', true); return false; }
+          saveMcp(body, 'MCP server "' + body.name + '" saved.').then(function (j) {
+            if (j.ok && modal) modal.close();
+          });
+          return false;
+        } },
+    ];
+    var body = h('div', {},
+      h('div', { class: 'form' },
+        h('label', { text: 'Name' }), name,
+        h('label', { text: 'Transport' }), transport),
+      stdioBox, httpBox,
+      h('div', { class: 'form' },
+        h('label', { text: 'Environment (KEY=VALUE per line)' }), env,
+        h('label', { class: 'chk' }, enabled, ' Enabled (disabled servers are not offered to the model)'),
+        h('label', { class: 'chk' }, trusted,
+          ' Trusted (when off, every tool call asks the permission broker first)')),
+      h('div', { class: 'note-box small-text', style: 'margin-top:8px',
+        text: 'Security: an MCP server is another program with its own privileges. trusted = false is the safe default \u2014 pedacito parks each tool call in the permission dialog until you allow it. The user config is written for new servers; a project .pedacito.toml is only accepted after you trust it.' }),
+      out);
+    modal = PDC.modal(isNew ? 'Add MCP Server' : 'Edit MCP Server \u2014 ' + s.name,
+                      body, footer, { wide: true });
+    setTimeout(function () { if (isNew) name.focus(); }, 30);
+  }
+  function mcpTab() {
+    if (!MCP.data && !MCP.loading) loadMcp();
+    var box = h('div', {});
+    box.appendChild(h('div', { class: 'note-box' },
+      h('b', { text: 'Named MCP servers' }),
+      h('div', { class: 'small-text',
+        text: 'Each [mcp_servers.<name>] table adds one external tool server. Gather injects only the tools that match the current task, and every call goes through the mcp_call action. Servers are written to the user config; a project file needs trust first.' })));
+    if (MCP.err) box.appendChild(h('div', { class: 'note-box err', text: MCP.err }));
+    if (MCP.loading || !MCP.data) {
+      box.appendChild(h('div', { class: 'tip', text: 'Loading the MCP servers\u2026' }));
+      return box;
+    }
+    var servers = MCP.data.servers || [];
+    box.appendChild(h('div', { class: 'row', style: 'margin:10px 0' },
+      h('button', { class: 'primary', text: '+ Add MCP server\u2026', onclick: function () { openMcpEditor(null); } }),
+      h('button', { class: 'small', text: 'Refresh tools', onclick: function () { MCP.data = null; MCP.loading = false; loadMcp(); } }),
+      h('span', { class: 'muted small-text grow',
+        text: MCP.data.enabled ? (servers.length + ' server(s) configured') : 'enable_mcp = false: named servers are off' }),
+      h('span', { class: 'mono muted small-text', text: MCP.data.user_config || '' })));
+    if (!servers.length) {
+      box.appendChild(h('div', { class: 'tip', text: 'No named MCP servers yet. Add one above; a stdio server needs a command and args, an HTTP server needs its url.' }));
+      return box;
+    }
+    servers.forEach(function (s) {
+      var tools = (s.tools || []);
+      var test = MCP.test[s.name];
+      var card = h('div', { class: 'note-box', style: 'margin-bottom:10px' });
+      card.appendChild(h('div', { class: 'row' },
+        h('b', { text: s.name }),
+        h('span', { class: 'tag', text: s.transport }),
+        h('span', { class: 'tag' + (s.trusted ? ' act' : ''), text: s.trusted ? 'trusted' : 'asks permission' }),
+        h('span', { class: 'tag', text: s.source === 'project' ? 'project config' : 'user config' }),
+        h('span', { class: 'grow' }),
+        h('button', { class: 'small', text: 'Edit', onclick: function () { openMcpEditor(s); } }),
+        h('button', { class: 'small', text: MCP.testing[s.name] ? 'Testing\u2026' : 'Test', disabled: !!MCP.testing[s.name], onclick: function () { testMcp(s); } }),
+        h('button', { class: 'small danger', text: 'Delete', onclick: function () { deleteMcp(s); } })));
+      card.appendChild(h('div', { class: 'mono small-text', style: 'margin-top:4px',
+        text: s.transport === 'http' ? ('url: ' + s.url)
+          : ('command: ' + s.command + (s.args && s.args.length ? ' ' + s.args.join(' ') : '')) }));
+      if (s.env && Object.keys(s.env).length) {
+        card.appendChild(h('div', { class: 'muted small-text',
+          text: 'env: ' + Object.keys(s.env).join(', ') }));
+      }
+      card.appendChild(h('div', { class: 'row', style: 'margin-top:6px' },
+        h('label', { class: 'chk' }, h('input', { type: 'checkbox', checked: !!s.enabled,
+          onchange: function (e) { saveMcp(mcpPayload(s, { enabled: e.target.checked }), 'MCP server ' + s.name + ' ' + (e.target.checked ? 'enabled' : 'disabled') + '.'); } }), 'enabled'),
+        h('label', { class: 'chk' }, h('input', { type: 'checkbox', checked: !!s.trusted,
+          onchange: function (e) { saveMcp(mcpPayload(s, { trusted: e.target.checked }), 'MCP server ' + s.name + ' ' + (e.target.checked ? 'trusted' : 'now asks permission for every call') + '.'); } }),
+          'trusted \u2014 untrusted servers prompt for permission on every tool call')));
+      card.appendChild(h('div', { class: 'small-text', style: 'margin-top:6px' },
+        tools.length ? ('Tools: ' + tools.map(function (t) { return t.name; }).join(', '))
+                     : 'No tools listed (the server may be down, slow, or expose none).'));
+      if (test) {
+        card.appendChild(h('div', { class: 'small-text' + (test.error ? ' err' : ''), style: 'margin-top:4px',
+          text: (test.tools && test.tools.length ? '\u2713 ' + test.tools.length + ' tool(s): ' + test.tools.map(function (t) { return t.name; }).join(', ') : '\u2717 ' + (test.error || 'no tools')) }));
+      }
+      box.appendChild(card);
+    });
+    return box;
+  }
+
   // ----- auto-tune universal settings -------------------------------------------
   // Four questions, one deterministic backend computation (no LLM call):
   // /api/settings/autotune previews the recommendation, and only "Apply"
@@ -865,8 +1193,39 @@
     ['priority', 'What should settings optimise for?', [
       ['token_saver', 'token/latency savings \u2014 finish cheap and fast'],
       ['balanced', 'balance \u2014 the recommended middle'],
-      ['thorough', 'answer quality \u2014 spend more model calls']]]
+      ['thorough', 'answer quality \u2014 spend more model calls']]],
+    ['dual_gpu', 'GPU layout (optional)', [
+      ['none', 'single GPU (or hosted) \u2014 one model does everything'],
+      ['dual24_8', 'Dual-GPU \u2014 24 GB architect + 8 GB Scout on a second port'],
+      ['dual24_16', 'Dual-GPU \u2014 24 GB architect + 16 GB Scout on a second port']]]
   ];
+
+  function tunePayload(extra) {
+    return { hardware: TUNE.hardware, model: TUNE.model,
+             codebase: TUNE.codebase, priority: TUNE.priority,
+             dual_gpu: TUNE.dual_gpu, ...(extra || {}) };
+  }
+
+  function pairFromAutotune(rec) {
+    var current = (file().settings || {});
+    var names = Object.keys(file().profiles || {});
+    var architect = (X.data.active_profile && names.indexOf(X.data.active_profile) >= 0)
+      ? X.data.active_profile : (current.default_profile || '');
+    if (!architect) { PDC.toast('Pick an architect profile first.', true); return; }
+    var spec = rec.scout_spec || {};
+    PDC.api('/api/settings/scout', {
+      architect: architect, scout: rec.suggested_scout_name || 'scout',
+      create_scout: true, scout_base_url: spec.base_url,
+      scout_model: spec.model, scout_vram_gb: spec.vram_gb,
+      scout_tier: spec.tier
+    }).then(function (j) {
+      if (!j.ok) { PDC.toast(j.detail || 'could not create the scout', true); return; }
+      X.data = j; PAIR.msg = 'Paired ' + j.scout.architect + ' + ' + j.scout.scout + '.';
+      PDC.toast('Scout + Architect pairing saved.');
+      PDC.refreshState(); render();
+    });
+  }
+
   function autotuneTab() {
     var box = h('div', {});
     box.appendChild(h('div', { class: 'note-box' },
@@ -882,7 +1241,7 @@
     });
     var run = h('button', { class: 'primary', text: TUNE.busy ? 'Computing\u2026' : (TUNE.result ? 'Update preview' : 'Preview recommendation'), disabled: TUNE.busy, onclick: function () {
       TUNE.busy = true; TUNE.err = ''; render();
-      PDC.api('/api/settings/autotune', { hardware: TUNE.hardware, model: TUNE.model, codebase: TUNE.codebase, priority: TUNE.priority })
+      PDC.api('/api/settings/autotune', tunePayload())
         .then(function (j) {
           TUNE.busy = false;
           if (!j.ok) { TUNE.err = j.detail || 'the server refused the request'; TUNE.result = null; }
@@ -917,7 +1276,7 @@
         PDC.confirm('Write these ' + changed.length + ' universal settings into the user config?\n\nThe file as it stands is kept as config.toml.bak first. Profile-level overrides keep winning over these values.', 'Apply it').then(function (ok) {
           if (!ok) return;
           TUNE.busy = true; render();
-          PDC.api('/api/settings/autotune', { hardware: TUNE.hardware, model: TUNE.model, codebase: TUNE.codebase, priority: TUNE.priority, apply: true })
+          PDC.api('/api/settings/autotune', tunePayload({ apply: true }))
             .then(function (j) {
               TUNE.busy = false;
               if (!j.ok) { TUNE.err = j.detail || 'the server refused the request'; render(); return; }
@@ -930,6 +1289,16 @@
         });
       } }),
       h('span', { class: 'muted small-text grow', text: changed.length ? 'applies the rows above to [universal] in ' + (file().path || 'the user config') : 'nothing to apply' })));
+    if (TUNE.result.dual_gpu) {
+      var rec = TUNE.result.dual_gpu;
+      box.appendChild(h('div', { class: 'note-box', style: 'margin-top:12px' },
+        h('b', { text: 'Dual-GPU pairing recommended: 24 GB architect + ' + rec.scout_vram_gb + ' GB Scout' }),
+        h('div', { class: 'small-text', text: rec.reason }),
+        h('div', { class: 'row', style: 'margin-top:8px' },
+          h('button', { class: 'primary', text: 'Create starter Scout & pair\u2026', onclick: function () { pairFromAutotune(rec); } }),
+          h('span', { class: 'muted small-text grow',
+            text: 'writes [profiles.' + (rec.suggested_scout_name || 'scout') + '] on ' + (rec.scout_spec || {}).base_url + ' and sets default_profile + scout_profile in one edit' }))));
+    }
     return box;
   }
 

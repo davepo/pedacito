@@ -314,3 +314,68 @@ def test_how_index_covers_refine_permissions_ratchet_and_benchmarks():
              for cmd in how_index.CLI_COMMANDS if cmd["name"] == name
              for f in cmd["flags"]}
     assert "--refine" in flags
+
+
+# --- setting lookups: "what does <key> do?" -----------------------------------
+
+@pytest.mark.parametrize("query,key,default,syntax", [
+    ("what does collapse_repair_turns do?", "collapse_repair_turns",
+     "true", "collapse_repair_turns = true"),
+    ("what is small_context_tokens?", "small_context_tokens",
+     "16384", "small_context_tokens = 16384"),
+    ("explain auto_green_ratchet", "auto_green_ratchet",
+     "true", "auto_green_ratchet = true"),
+    ("what does max_whole_file_lines do?", "max_whole_file_lines",
+     "120", "max_whole_file_lines = 120"),
+    ("enable_prompt_lookup", "enable_prompt_lookup",
+     "false", "enable_prompt_lookup = false"),
+    ("what is escalation_zero_edit_runs?", "escalation_zero_edit_runs",
+     "3", "escalation_zero_edit_runs = 3"),
+    ("scout_profile", "scout_profile", '""', 'scout_profile = ""'),
+    ("verify_dom", "verify_dom", "false", "verify_dom = false"),
+])
+def test_named_setting_queries_rank_first_and_explain_themselves(
+        query, key, default, syntax):
+    result = how.answer_structured(query, use_model=False)
+    assert result["used_model"] is False
+    assert result["setting"]["key"] == key
+    assert result["matches"]["settings"][0]["key"] == key
+    answer = result["answer"]
+    # A direct explanation, not a procedural card.
+    assert f"**`{key}`**" in answer
+    assert "**What it does**" in answer
+    assert "**Why / when to change it**" in answer
+    assert f"**Default:** `{default}`" in answer
+    assert "```toml" in answer and syntax in answer
+    assert "Open in Settings" in answer
+    assert result["setting"]["gui"].startswith("⚙ Settings")
+
+
+def test_generic_setting_words_keep_procedural_answers():
+    # "model" is a setting key, but "how do I import models?" is a procedure:
+    # the named-setting pin must not hijack it.
+    result = how.answer_structured("how do I import models?", use_model=False)
+    assert result["setting"] is None
+    assert result["matches"]["gui"][0]["id"] == "import-models"
+    assert "**In the Terminal (CLI)**" in result["answer"]
+
+
+def test_setting_index_has_a_card_for_every_config_key():
+    """`how` explains every setting in Config: key, default, type, help, a
+    config.toml example and an exact GUI location."""
+    from dataclasses import fields
+    from pedacito import how_index
+    from pedacito.config import Config
+    skip = {"sources", "profiles", "active_profile", "active_tier",
+            "model_size_bytes", "_hosted_server"}
+    cards = {c["key"]: c for c in how_index.settings_dictionary()}
+    for field in fields(Config):
+        if field.name in skip or field.name.startswith("_"):
+            continue
+        card = cards[field.name]
+        assert card["title"] == field.name.replace("_", " ")
+        assert card["default_text"] != ""
+        assert card["type"]
+        assert card["help"].strip()
+        assert card["toml"].strip()
+        assert "Settings" in card["gui"]

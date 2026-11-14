@@ -1310,6 +1310,273 @@ function renameSymbolDialog() {
   return m;
 }
 
+// ------------------------------------------------------------------ project dialogs ---
+function _needRoot() {
+  if (!S.status.root) { PDC.toast('Open a project first.', true); return false; }
+  return true;
+}
+function _bytesText(n) {
+  n = Number(n || 0);
+  return n >= 1048576 ? (n / 1048576).toFixed(1) + ' MB'
+    : n >= 1024 ? (n / 1024).toFixed(1) + ' KB' : n + ' B';
+}
+
+// Project memory (`.pedacito/memory.md`) plus the auto-learned repair lessons
+// in `micro_facts.json`. Adding and forgetting are the same operations the CLI
+// exposes; deleting a lesson only removes that one ledger row.
+function memoryDialog() {
+  if (!_needRoot()) return;
+  const body = h('div', {});
+  const list = h('div', {});
+  const note = h('div', { class: 'muted small-text' });
+  const text = h('input', { type: 'text', class: 'grow', spellcheck: false,
+    placeholder: 'a fact about this repo, e.g. tests run with pytest -q' });
+  const scope = h('select', {}, [
+    h('option', { value: 'project', text: 'this project' }),
+    h('option', { value: 'global', text: 'all projects' })]);
+  const add = h('button', { class: 'primary', text: 'Remember', onclick: () => {
+    const t = (text.value || '').trim();
+    if (!t) { PDC.toast('Type a fact first.', true); return; }
+    PDC.api('/api/memory', { action: 'add', text: t, scope: scope.value }).then((j) => {
+      if (!j.ok && !j.stored) PDC.toast(j.detail || 'not stored', true);
+      else PDC.toast('Remembered.');
+      text.value = '';
+      paint(j);
+    });
+  } });
+  function facts(rows) {
+    const box = h('div', {});
+    if (!rows.length) { box.appendChild(h('div', { class: 'tip', text: 'No remembered facts yet.' })); return box; }
+    rows.forEach((e) => {
+      box.appendChild(h('div', { class: 'row small-text', style: 'padding:2px 0' },
+        h('span', { class: 'tag', text: e.scope + '/' + e.category }),
+        h('span', { class: 'grow', text: e.text }),
+        h('button', { class: 'ghost small danger', text: 'Forget', onclick: () => {
+          PDC.api('/api/memory', { action: 'forget', text: e.text, scope: e.scope })
+            .then((j) => { PDC.toast('Forgot ' + (j.forgot || 0) + ' fact(s).'); paint(j); });
+        } })));
+    });
+    return box;
+  }
+  function lessons(rows, label) {
+    const box = h('div', {});
+    if (!rows.length) return box;
+    box.appendChild(h('div', { class: 'muted small-text', style: 'margin-top:8px', text: label }));
+    rows.forEach((l) => {
+      const id = l.lesson_id || '';
+      box.appendChild(h('div', { class: 'row small-text', style: 'padding:2px 0' },
+        h('span', { class: 'tag', text: l.kind || 'lesson' }),
+        h('span', { class: 'grow', text: l.text || '' }),
+        id ? h('button', { class: 'ghost small danger', text: 'Delete', onclick: () => {
+          PDC.api('/api/memory', { action: 'forget_lesson', id: id })
+            .then((j) => { PDC.toast('Lesson deleted.'); paint(j); });
+        } }) : null));
+    });
+    return box;
+  }
+  function paint(j) {
+    PDC.clear(list);
+    if (!j || !j.ok) { note.textContent = (j && j.detail) || 'Could not load project memory.'; return; }
+    list.appendChild(h('b', { text: 'Remembered facts' }));
+    list.appendChild(facts(j.entries || []));
+    list.appendChild(h('b', { text: 'Auto-learned repair lessons', style: 'display:block;margin-top:12px' }));
+    list.appendChild(h('div', { class: 'muted small-text',
+      text: 'Distilled from broken -> fixed runs. Hints, not truth; delete one that no longer applies.' }));
+    list.appendChild(lessons(j.lessons || [], 'Live lessons'));
+    list.appendChild(lessons(j.promoted || [], 'Promoted into path-scoped rules'));
+    list.appendChild(lessons(j.retired || [], 'Retired (zero measured effect)'));
+    note.textContent = j.project_file || '';
+  }
+  body.appendChild(h('div', { class: 'row', style: 'margin-bottom:10px' },
+    text, scope, add));
+  body.appendChild(note);
+  body.appendChild(list);
+  PDC.modal('Project memory & repo lessons', body, [{ label: 'Close' }], { wide: true });
+  PDC.api('/api/memory').then(paint, () => {
+    note.textContent = 'The GUI server did not answer.';
+  });
+}
+
+// Background dev servers: the `.pedacito/procs/` registry, with a live log
+// tail and a Stop button, and the same start form `pedacito serve` uses.
+function procsDialog() {
+  if (!_needRoot()) return;
+  const body = h('div', {});
+  const list = h('div', {});
+  const logs = h('pre', { class: 'diffwrap', style: 'max-height:32vh;overflow:auto;margin:10px 0 0' });
+  const command = h('input', { type: 'text', class: 'grow', spellcheck: false,
+    placeholder: 'npm run dev  (or: python -m http.server 8000)' });
+  const name = h('input', { type: 'text', placeholder: 'name (optional)', style: 'width:150px' });
+  const status = h('span', { class: 'muted small-text grow' });
+  const start = h('button', { class: 'primary', text: 'Start server', onclick: () => {
+    const cmd = (command.value || '').trim();
+    if (!cmd) { PDC.toast('Type a command first.', true); return; }
+    start.disabled = true; status.textContent = 'Starting\u2026';
+    PDC.api('/api/procs', { action: 'start', command: cmd, name: (name.value || '').trim() })
+      .then((j) => {
+        start.disabled = false;
+        if (!j.ok) { status.textContent = j.detail || 'could not start it'; return; }
+        command.value = '';
+        status.textContent = j.process.name + ' [' + j.process.status + ']'
+          + (j.process.url ? '  ' + j.process.url : '');
+        paint(j);
+      });
+  } });
+  function paint(j) {
+    PDC.clear(list);
+    if (!j || !j.ok) { status.textContent = (j && j.detail) || 'Could not read the registry.'; return; }
+    const rows = j.processes || [];
+    if (!rows.length) { list.appendChild(h('div', { class: 'tip', text: 'No background servers. Start one above.' })); return; }
+    rows.forEach((p) => {
+      const live = p.status === 'running';
+      list.appendChild(h('div', { class: 'note-box', style: 'margin-bottom:8px' },
+        h('div', { class: 'row' },
+          h('b', { text: p.name }),
+          h('span', { class: 'tag' + (live ? ' act' : ''), text: p.status || '?' }),
+          h('span', { class: 'muted small-text', text: 'pid ' + (p.pid || 0) }),
+          p.url ? h('span', { class: 'tag', text: p.url }) : null,
+          h('span', { class: 'grow' }),
+          h('button', { class: 'small', text: 'Logs', onclick: () => {
+            PDC.api('/api/procs', { action: 'logs', name: p.name, tail: 6000 })
+              .then((x) => { logs.textContent = x.logs || x.detail || '(no output)'; });
+          } }),
+          h('button', { class: 'small danger', text: 'Stop', disabled: !live, onclick: () => {
+            PDC.api('/api/procs', { action: 'stop', name: p.name }).then((x) => {
+              PDC.toast(x.detail || 'stopped'); paint(x);
+            });
+          } })),
+        h('div', { class: 'mono small-text', style: 'margin-top:4px', text: p.command || '' })));
+    });
+  }
+  body.appendChild(h('div', { class: 'row', style: 'margin-bottom:8px' }, command, name, start));
+  body.appendChild(status);
+  body.appendChild(list);
+  body.appendChild(logs);
+  PDC.modal('Background servers', body, [{ label: 'Close' }], { wide: true });
+  PDC.api('/api/procs').then(paint, () => { status.textContent = 'The GUI server did not answer.'; });
+}
+
+// On-demand project checks: diagnose (linter/typecheck), webcheck (static web
+// contracts) and domcheck (headless DOM smoke). The server runs the check
+// synchronously and returns its report.
+function checksDialog() {
+  if (!_needRoot()) return;
+  const out = h('pre', { class: 'diffwrap', style: 'max-height:52vh;overflow:auto;margin:8px 0 0' });
+  const status = h('div', { class: 'muted small-text' });
+  const buttons = h('div', { class: 'row', style: 'margin-bottom:8px' });
+  const kinds = [
+    ['diagnose', 'Linter / Typecheck (diagnose)', 'Runs the project\u2019s own ruff/pyflakes/mypy/tsc/cargo/... checks.'],
+    ['webcheck', 'Static Web Contracts (webcheck)', 'Missing <script src> targets, DOM ids, ESM behind classic scripts, undeclared imports.'],
+    ['domcheck', 'Headless DOM Smoke Check (domcheck)', 'Loads the entry page in headless Chromium and proves the module graph mounts (needs Playwright).'],
+  ];
+  function run(kind, label) {
+    status.textContent = 'Running ' + label + '\u2026';
+    out.textContent = '';
+    PDC.api('/api/project/check', { kind: kind }).then((j) => {
+      if (!j.ok) { status.textContent = j.detail || 'the check could not run'; return; }
+      status.textContent = (j.passed ? '\u2713 PASS' : '\u2717 findings') + ' \u2014 ' + kind
+        + (j.count !== undefined ? ' (' + j.count + ' finding(s))' : '');
+      out.textContent = j.report || '(no output)';
+      PDC.refreshState();
+    }, () => { status.textContent = 'The GUI server did not answer.'; });
+  }
+  kinds.forEach((k) => {
+    buttons.appendChild(h('button', { class: 'small', text: k[1], title: k[2],
+      onclick: () => run(k[0], k[1]) }));
+  });
+  PDC.modal('Run project checks', h('div', {}, buttons, status, out),
+    [{ label: 'Close' }], { wide: true });
+}
+
+// Retention for sessions, backups, events and log.txt (same as `pedacito prune`).
+function pruneDialog() {
+  if (!_needRoot()) return;
+  const sessions = h('input', { type: 'number', min: 0, placeholder: 'keep newest N' });
+  const backups = h('input', { type: 'number', min: 0, placeholder: 'keep newest N' });
+  const out = h('div', { class: 'note-box', style: 'margin-top:10px' });
+  const m = PDC.modal('Prune old sessions/backups', h('div', {},
+    h('p', { class: 'small-text', text: 'Blank means the config\u2019s keep_sessions / keep_backups value (0 leaves that kind alone). Backups are the undo path: only the oldest beyond the limit go.' }),
+    h('div', { class: 'row' },
+      h('label', { text: 'Keep sessions' }), sessions,
+      h('label', { text: 'Keep backups' }), backups),
+    out), [
+    { label: 'Cancel' },
+    { label: 'Preview', onclick: () => {
+      PDC.api('/api/project/prune', { keep_sessions: sessions.value || undefined,
+        keep_backups: backups.value || undefined, dry_run: true })
+        .then((j) => { out.className = 'note-box'; out.textContent = j.ok ? j.summary : (j.detail || 'failed'); });
+      return false;
+    } },
+    { label: 'Prune', danger: true, onclick: () => {
+      PDC.api('/api/project/prune', { keep_sessions: sessions.value || undefined,
+        keep_backups: backups.value || undefined })
+        .then((j) => {
+          out.className = 'note-box';
+          out.textContent = j.ok ? j.summary : (j.detail || 'failed');
+          if (j.ok) { PDC.toast(j.summary); refreshState(); }
+        });
+      return false;
+    } }], { wide: true });
+  return m;
+}
+
+// `pedacito reset` from the GUI: preview first (files/KB and servers that would
+// stop), then execute with the authored-state checkboxes.
+function resetDialog() {
+  if (!_needRoot()) return;
+  const keepMemory = h('input', { type: 'checkbox', checked: true });
+  const keepConfig = h('input', { type: 'checkbox', checked: true });
+  const reindex = h('input', { type: 'checkbox', checked: false });
+  const out = h('div', { class: 'note-box', style: 'margin-top:10px' });
+  const confirm = h('input', { type: 'checkbox' });
+  const body = h('div', {},
+    h('p', { class: 'small-text', text: 'Deletes this project\u2019s .pedacito/ runtime state (index, sessions, backups, events, memory unless kept, generated rules without the authored checkbox). Source code and .pedacito.toml are never touched. Running background servers are stopped first.' }),
+    h('div', { class: 'form' },
+      h('label', { class: 'chk' }, keepMemory, ' Keep remembered facts (memory.md)'),
+      h('label', { class: 'chk' }, keepConfig, ' Keep authored rules, skills & prompts'),
+      h('label', { class: 'chk' }, reindex, ' Rebuild the static index after reset'),
+      h('label', { class: 'chk' }, confirm, ' I understand the index and backups will be removed')),
+    out);
+  const options = () => ({ keep_memory: keepMemory.checked,
+                           keep_config: keepConfig.checked,
+                           reindex: reindex.checked });
+  const show = (j, dry) => {
+    if (!j.ok) { out.className = 'note-box err'; out.textContent = j.detail || 'reset failed'; return; }
+    out.className = 'note-box';
+    PDC.clear(out);
+    out.appendChild(h('b', { text: dry ? 'Preview (nothing deleted)' : 'Reset complete' }));
+    out.appendChild(h('div', { class: 'small-text',
+      text: (j.files || 0) + ' file(s), ' + _bytesText(j.bytes)
+        + ' under .pedacito/ ' + (dry ? 'would be cleared.' : 'were cleared.') }));
+    if ((j.running || []).length) {
+      out.appendChild(h('div', { class: 'small-text',
+        text: (dry ? 'Would stop' : 'Stopped') + ' background server(s): '
+          + (dry ? j.running : j.stopped).join(', ') }));
+    }
+    out.appendChild(h('div', { class: 'small-text',
+      text: 'Kept: ' + ((j.kept || []).join(', ') || '(nothing)') }));
+    out.appendChild(h('div', { class: 'small-text',
+      text: 'Removed: ' + ((j.removed || []).join(', ') || '(nothing)') }));
+    if (j.reindex_started) out.appendChild(h('div', { class: 'small-text', text: 'Index rebuild started.' }));
+  };
+  PDC.modal('Reset project state', body, [
+    { label: 'Cancel' },
+    { label: 'Preview (Dry Run)', onclick: () => {
+      PDC.api('/api/project/reset', { ...options(), dry_run: true })
+        .then((j) => show(j, true));
+      return false;
+    } },
+    { label: 'Reset State', danger: true, onclick: () => {
+      if (!confirm.checked) { PDC.toast('Tick the confirmation first.', true); return false; }
+      PDC.api('/api/project/reset', options()).then((j) => {
+        show(j, false);
+        if (j.ok) { PDC.toast('Project state reset.'); refreshState(); }
+      });
+      return false;
+    } }], { wide: true });
+}
+
+
 // ------------------------------------------------------------------ layout ----
 function setVar(name, px) { document.documentElement.style.setProperty(name, px + 'px'); }
 function startDrag(e, onMove) {
@@ -1485,6 +1752,11 @@ function TopBar() {
             <${MenuItem} label="Quick index (no summaries)" disabled=${!!j || !s.root} action=${() => buildIndex(false)} />
             <${MenuItem} label="Restore from a backup\u2026" disabled=${!!j || !(s.snapshots || []).length} action=${restoreDialog} />
             <${MenuItem} label="Rename symbol\u2026" disabled=${!!j || !s.root} action=${renameSymbolDialog} />
+            <${MenuItem} label="Memory & repo lessons\u2026" disabled=${!s.root} action=${memoryDialog} />
+            <${MenuItem} label="Background servers\u2026" disabled=${!s.root} action=${procsDialog} />
+            <${MenuItem} label="Run project checks\u2026" disabled=${!s.root} action=${checksDialog} />
+            <${MenuItem} label="Prune old sessions/backups\u2026" disabled=${!s.root} action=${pruneDialog} />
+            <${MenuItem} label="Reset project state\u2026" disabled=${!s.root || !!j} action=${resetDialog} />
             <${MenuItem} label="Provider settings\u2026" action=${() => callSettings()} />
             <${MenuItem} label="Clear terminal" action=${clearTerm} />
             <${MenuItem} label="Clear chat" action=${() => PDC.api('/api/clear', {})} />

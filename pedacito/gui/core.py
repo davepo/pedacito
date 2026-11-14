@@ -354,6 +354,10 @@ class State:
         self.root: Path | None = None
         self.args: SimpleNamespace | None = None
         self.cfg = None
+        # Theme fallback for a project-less session: the user config, cached
+        # by (mtime, size) so a polling /api/state does not re-read the file.
+        self._user_cfg = None
+        self._user_cfg_stamp = None
         self.client = None
         self.idx = None
         self.agent = None
@@ -486,6 +490,40 @@ class State:
         with self.lock:
             self.index_meta = meta
 
+    def user_theme(self) -> str:
+        """The saved `gui_theme`, even with no project open.
+
+        A project-less GUI has no cfg until something loads one, and the
+        topbar picker used to reset to the built-in default on every reload.
+        Load USER_CONFIG (no hardware probe, no budget warnings, no additive
+        upgrade write) and cache it by (mtime, size); `gui_theme` is purely
+        cosmetic, so this never touches STATE.cfg or a running job.
+        """
+        with self.lock:
+            cfg = self.cfg
+        if cfg is not None:
+            return str(getattr(cfg, "gui_theme", "") or "slate")
+        try:
+            st = USER_CONFIG.stat()
+            stamp = (st.st_mtime_ns, st.st_size)
+        except OSError:
+            return "slate"
+        with self.lock:
+            if self._user_cfg is not None and self._user_cfg_stamp == stamp:
+                return str(getattr(self._user_cfg, "gui_theme",
+                                   "") or "slate")
+        try:
+            cfg = config_mod.load(root=None, require_hardware=False,
+                                  warn_budgets=False,
+                                  upgrade_user_config=False)
+        except (config_mod.ConfigError, OSError):
+            cfg = None
+        with self.lock:
+            self._user_cfg = cfg
+            self._user_cfg_stamp = stamp
+        return str(getattr(cfg, "gui_theme", "") or "slate") if cfg \
+            else "slate"
+
     # --- chat transcript ----------------------------------------------------
 
     def add_message(self, role: str, text: str = "", **extra) -> dict:
@@ -558,6 +596,17 @@ class State:
                 rec["title"] = default_thread_title()
         self.bus.publish("msgs_clear")
         self.save_active_thread(force=True)
+        self.bus.publish("status")
+
+    def reset_threads(self) -> None:
+        """Forget every in-memory chat after `pedacito reset` deleted
+        `.pedacito/`. A single fresh thread opens; nothing is written until
+        the next message, so the reset leaves the state folder clean."""
+        with self.lock:
+            rec = self._new_thread_locked()
+            self.threads = {rec["id"]: rec}
+            self._attach_thread(rec)
+        self.bus.publish("msgs_clear")
         self.bus.publish("status")
 
     # --- chat threads (per-project, with a project-less global scope) ----------
@@ -1248,10 +1297,11 @@ class State:
     # --- snapshots for the browser ---------------------------------------------
 
     def snapshot(self) -> dict:
+        status = self.status()          # resolves the project-less theme first
         with self.lock:
             return {"seq": self.bus.seq,
                     "messages": self.messages_snapshot(),
-                    "term": self.term, "status": self.status()}
+                    "term": self.term, "status": status}
 
     def files_signature(self) -> str:
         with self.lock:
@@ -1260,6 +1310,7 @@ class State:
 
     def status(self) -> dict:
         """The JSON payload the page polls to update itself."""
+        theme = self.user_theme()       # disk read/cache outside the lock
         with self.lock:
             cfg, client, idx = self.cfg, self.client, self.idx
             meta = self.index_meta
@@ -1324,7 +1375,7 @@ class State:
                 "context_origin": (cfg.sources.get("context_tokens", "default")
                                    if cfg else ""),
                 "json_mode": cfg.json_mode if cfg else "",
-                "gui_theme": cfg.gui_theme if cfg else "slate",
+                "gui_theme": theme,
                 "disable_thinking": bool(cfg.disable_thinking) if cfg else False,
                 "allow_steering": bool(cfg.allow_steering) if cfg else False,
                 "usage": {

@@ -7,6 +7,8 @@ import sys
 from dataclasses import fields
 from pathlib import Path
 
+import pytest
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from pedacito import config as config_mod
@@ -670,3 +672,119 @@ def test_config_schema_and_gui_drift_guard():
     assert set(user_fields) <= indexed, (
         f"missing from the how settings index: "
         f"{sorted(set(user_fields) - indexed)}")
+
+
+# --- dual-GPU Scout + Architect pairing ---------------------------------------
+
+def test_configure_scout_architect_upserts_both_profiles_and_selectors():
+    text = ("# my project config\n"
+            + config_mod.TEMPLATE
+            + "\n# a note at the end\n")
+    out = E.configure_scout_architect(
+        text, architect_profile="architect", scout_profile="scout",
+        architect_spec={"base_url": "http://127.0.0.1:1234/v1",
+                        "model": "arch-27b", "vram_gb": 24,
+                        "tier": "medium"},
+        scout_spec={"base_url": "http://127.0.0.1:11434/v1",
+                    "model": "scout-4b", "vram_gb": 8, "tier": "tiny"})
+    assert "# my project config" in out
+    assert "# a note at the end" in out
+    assert "[profiles.architect]" in out
+    assert "[profiles.scout]" in out
+    flat, profiles = E.validate_text(out)
+    assert flat["default_profile"] == "architect"
+    assert flat["scout_profile"] == "scout"
+    assert profiles["architect"]["model"] == "arch-27b"
+    assert profiles["scout"]["vram_gb"] == 8
+    assert profiles["scout"]["tier"] == "tiny"
+
+    # Updating an existing pairing replaces the given keys in place: no
+    # duplicated table, no duplicated selector, and the comments survive.
+    again = E.configure_scout_architect(
+        out, architect_profile="architect", scout_profile="scout",
+        scout_spec={"model": "scout-9b", "vram_gb": 16})
+    assert again.count("[profiles.scout]") == 1
+    assert 'model = "scout-9b"' in again
+    assert again.count("\nscout_profile = \"scout\"") == 1
+    assert "# my project config" in again
+    flat2, profiles2 = E.validate_text(again)
+    assert flat2["scout_profile"] == "scout"
+    assert profiles2["scout"]["vram_gb"] == 16
+
+
+def test_configure_scout_architect_requires_real_or_specified_profiles():
+    text = "[universal]\nvram_gb = 8\n"
+    with pytest.raises(config_mod.ConfigError, match="no profile named"):
+        E.configure_scout_architect(text, architect_profile="ghost",
+                                    scout_profile="scout",
+                                    scout_spec={"model": "tiny"})
+    with pytest.raises(config_mod.ConfigError, match="different profiles"):
+        E.configure_scout_architect(
+            text, architect_profile="same", scout_profile="same",
+            architect_spec={"model": "one"})
+    # An empty scout clears the selector instead of writing a bogus profile.
+    out = E.configure_scout_architect(
+        text, architect_profile="arch", scout_profile="",
+        architect_spec={"model": "arch"})
+    flat, _profiles = E.validate_text(out)
+    assert flat["default_profile"] == "arch"
+    assert flat.get("scout_profile", "") == ""
+
+
+# --- named MCP server tables ---------------------------------------------------
+
+def test_upsert_mcp_server_creates_updates_and_removes_without_touching_other_tables():
+    text = ("# my config\n"
+            "[universal]\n"
+            "vram_gb = 24   # the big card\n"
+            "\n[profiles.default]\n"
+            "model = \"m\"\n")
+    out = E.upsert_mcp_server(text, "docs", {
+        "command": sys.executable, "args": ["server.py", "--stdio"],
+        "env": {"DOCS_TOKEN": "x"}, "trusted": False, "enabled": True})
+    assert "# my config" in out
+    assert "vram_gb = 24   # the big card" in out
+    assert '[profiles.default]' in out
+    assert E.mcp_server_names(out) == ["docs"]
+    flat, _profiles = E.validate_text(out)
+    docs = flat["mcp_servers"]["docs"]
+    assert docs["command"] == sys.executable
+    assert docs["args"] == ["server.py", "--stdio"]
+    assert docs["env"] == {"DOCS_TOKEN": "x"}
+    assert docs["trusted"] is False and docs["enabled"] is True
+
+    # Update in place, switching transport drops the stdio keys.
+    out2 = E.upsert_mcp_server(out, "docs", {
+        "url": "http://127.0.0.1:9999/mcp", "command": None,
+        "args": None, "trusted": True})
+    assert out2.count("[mcp_servers.docs]") == 1
+    flat2, _ = E.validate_text(out2)
+    docs2 = flat2["mcp_servers"]["docs"]
+    assert docs2["url"] == "http://127.0.0.1:9999/mcp"
+    assert "command" not in docs2 and "args" not in docs2
+    assert docs2["trusted"] is True
+
+    # A second server is appended, then the first is deleted cleanly.
+    out3 = E.upsert_mcp_server(out2, "web", {
+        "command": "node", "args": ["mcp.js"], "enabled": False})
+    assert E.mcp_server_names(out3) == ["docs", "web"]
+    out4 = E.remove_mcp_server(out3, "docs")
+    assert E.mcp_server_names(out4) == ["web"]
+    assert "# my config" in out4 and "[profiles.default]" in out4
+    flat4, _ = E.validate_text(out4)
+    assert set(flat4["mcp_servers"]) == {"web"}
+
+    with pytest.raises(config_mod.ConfigError, match="needs a command"):
+        E.upsert_mcp_server(text, "broken", {"trusted": True})
+    with pytest.raises(config_mod.ConfigError, match="no MCP server named"):
+        E.remove_mcp_server(out4, "ghost")
+
+
+def test_upsert_mcp_server_handles_an_empty_root_inline_table():
+    # A top-level `mcp_servers = {}` cannot be extended by a sub-table; the
+    # harmless empty declaration is dropped so the named table can exist.
+    text = "mcp_servers = {}   # no named servers yet\n[universal]\nvram_gb = 8\n"
+    out = E.upsert_mcp_server(text, "docs", {"command": "python"})
+    assert "mcp_servers = {}" not in out
+    flat, _ = E.validate_text(out)
+    assert flat["mcp_servers"]["docs"]["command"] == "python"

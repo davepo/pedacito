@@ -1117,3 +1117,352 @@ def test_auto_applies_by_default_backs_up_and_lists_changed_files(
     plan = [m for m in core.STATE.messages
             if m.get("kind") == "plan_ready"][-1]
     assert "Plan ready" in plan["text"]
+
+
+# --- dual-GPU Scout + Architect (settings) ----------------------------------------
+
+def test_dual_gpu_scout_architect_pairing_updates_the_topbar_badge(gui):
+    _config(gui)                     # a user config with [profiles.default]
+    assert gui.post("/api/settings/profile", {
+        "file": "user", "action": "create", "name": "architect",
+        "values": {"base_url": "http://127.0.0.1:1/v1", "model": "arch-27b",
+                   "vram_gb": 24, "tier": "medium"}})[0] == 200
+    # The scout endpoint points at a dead port on purpose: pairing is a
+    # deterministic config write, never a liveness probe, so one GPU (or an
+    # offline second card) can be configured today and used tomorrow.
+    status, body = gui.post("/api/settings/scout", {
+        "architect": "architect", "scout": "scout",
+        "scout_spec": {"base_url": "http://127.0.0.1:9/v1",
+                       "model": "scout-4b", "vram_gb": 8, "tier": "tiny"}})
+    assert status == 200 and body["ok"], body
+    assert body["scout"]["architect"] == "architect"
+    assert body["scout"]["scout"] == "scout"
+    assert "[profiles.scout]" in gui.cfg_path.read_text(encoding="utf-8")
+    flat, profiles = config_mod._read(gui.cfg_path)
+    assert flat["default_profile"] == "architect"
+    assert flat["scout_profile"] == "scout"
+    assert profiles["scout"]["vram_gb"] == 8
+    assert profiles["scout"]["tier"] == "tiny"
+    state = gui.get("/api/state")[1]
+    assert state["profile"] == "architect"
+    assert state["scout_profile"] == "scout"      # the topbar badge payload
+    # Offline scout fallback: gather's client resolver returns the architect
+    # client when the second server refuses the connection, without raising.
+    from pedacito import roles
+    cfg = config_mod.load(root=None, profile="architect",
+                          require_hardware=False, warn_budgets=False)
+    sentinel = object()
+    assert roles.scout_client(cfg, sentinel) is sentinel
+    # Re-saving without a spec keeps the two tables and the selectors.
+    assert gui.post("/api/settings/scout", {
+        "architect": "architect", "scout": "scout"})[0] == 200
+    text = gui.cfg_path.read_text(encoding="utf-8")
+    assert text.count("[profiles.scout]") == 1
+    assert [ln for ln in text.splitlines()
+            if ln.strip().startswith("scout_profile =")] == [
+                'scout_profile = "scout"']
+    # A missing profile is refused with guidance rather than half-written.
+    status, bad = gui.post("/api/settings/scout", {
+        "architect": "ghost", "scout": "scout"})
+    assert status == 400 and "no profile named" in bad["detail"]
+
+
+def test_autotune_offers_a_dual_gpu_architect_and_scout_split(gui):
+    _config(gui)
+    answers = {"hardware": "lt8", "model": "small", "codebase": "medium",
+               "priority": "balanced"}
+    answers["dual_gpu"] = "dual24_8"
+    status, body = gui.post("/api/settings/autotune", answers)
+    assert status == 200 and body["ok"]
+    got = {c["key"]: c["value"] for c in body["changes"]}
+    assert got["max_read_tokens"] == 1200
+    assert got["max_total_model_calls"] == 40
+    dual = body["dual_gpu"]
+    assert dual["architect_vram_gb"] == 24 and dual["scout_vram_gb"] == 8
+    assert dual["scout_tier"] == "tiny"
+    assert dual["suggested_scout_name"] == "scout"
+    assert "scout" in dual["reason"].lower()
+    # The 16 GB scout option recommends a small tier and its own port.
+    _status, big = gui.post("/api/settings/autotune",
+                            {**answers, "dual_gpu": "dual24_16"})
+    assert big["dual_gpu"]["scout_vram_gb"] == 16
+    assert big["dual_gpu"]["scout_tier"] == "small"
+    assert big["dual_gpu"]["scout_spec"]["base_url"].startswith(
+        "http://localhost:")
+    # The default single-GPU recommendation is unchanged.
+    _status, plain = gui.post("/api/settings/autotune",
+                              {k: v for k, v in answers.items()
+                               if k != "dual_gpu"})
+    assert "dual_gpu" not in plain
+
+
+# --- MCP servers: CRUD, probe and the trust boundary ------------------------------
+
+def test_mcp_servers_crud_probe_and_project_trust_boundary(gui, tmp_path):
+    fake = Path(__file__).resolve().parent / "fake_mcp.py"
+    spec = {"name": "fake", "transport": "stdio",
+            "command": sys.executable, "args": [str(fake)],
+            "env": {"FAKE_TOKEN": "x"}, "trusted": True, "enabled": True}
+    status, body = gui.post("/api/mcp/servers", spec)
+    assert status == 200 and body["ok"], body
+    assert gui.cfg_path.exists()                 # created from TEMPLATE
+    text = gui.cfg_path.read_text(encoding="utf-8")
+    assert "[mcp_servers.fake]" in text
+    assert 'command = ' in text and 'FAKE_TOKEN' in text
+    row = next(s for s in body["servers"] if s["name"] == "fake")
+    assert row["transport"] == "stdio" and row["trusted"] is True
+    assert [t["name"] for t in row["tools"]] == ["echo"]
+
+    # GET reflects the saved server and its live tools.
+    status, got = gui.get("/api/mcp/servers")
+    assert status == 200 and got["ok"]
+    row = next(s for s in got["servers"] if s["name"] == "fake")
+    assert [t["name"] for t in row["tools"]] == ["echo"]
+    assert got["user_config"] == str(gui.cfg_path)
+
+    # The test endpoint probes an unsaved body with the same normalisation.
+    status, probe = gui.post("/api/mcp/servers/test", {
+        "name": "probe", "transport": "stdio", "command": sys.executable,
+        "args": [str(fake)]})
+    assert status == 200 and probe["ok"], probe
+    assert probe["transport"] == "stdio"
+    assert [t["name"] for t in probe["tools"]] == ["echo"]
+
+    # A trusted toggle keeps one table (no duplicate server).
+    status, body = gui.post("/api/mcp/servers",
+                            {**spec, "trusted": False})
+    assert status == 200
+    text = gui.cfg_path.read_text(encoding="utf-8")
+    assert text.count("[mcp_servers.fake]") == 1
+    assert "trusted = false" in text
+    row = next(s for s in body["servers"] if s["name"] == "fake")
+    assert row["trusted"] is False
+
+    # §21: a project file may host execution-capable MCP servers only after
+    # `pedacito trust`. Before that the write is refused and nothing changes.
+    root = tmp_path / "mcp-proj"
+    root.mkdir()
+    project_cfg = root / ".pedacito.toml"
+    project_cfg.write_text("[agent]\nmax_steps = 3\n", encoding="utf-8")
+    core.STATE.root = root
+    status, refused = gui.post("/api/mcp/servers",
+                               {**spec, "name": "proj", "file": "project"})
+    assert status == 400
+    assert "not trusted" in refused["detail"]
+    assert "[mcp_servers.proj]" not in project_cfg.read_text(encoding="utf-8")
+    config_mod.trust_project(project_cfg)
+    status, body = gui.post("/api/mcp/servers",
+                            {**spec, "name": "proj", "file": "project"})
+    assert status == 200, body
+    assert "[mcp_servers.proj]" in project_cfg.read_text(encoding="utf-8")
+    assert any(s["name"] == "proj" and s["source"] == "project"
+               for s in body["servers"])
+
+    # Delete removes the user table and its tools from the listing.
+    status, body = gui.post("/api/mcp/servers/delete",
+                            {"name": "fake", "file": "user"})
+    assert status == 200 and body["deleted"] == "fake"
+    assert "fake" not in [s["name"] for s in body["servers"]]
+    assert "[mcp_servers.fake]" not in gui.cfg_path.read_text(encoding="utf-8")
+
+
+# --- project memory and repair lessons -------------------------------------------
+
+def test_memory_api_lists_adds_forgets_and_deletes_repair_lessons(gui, tmp_path):
+    root = tmp_path / "memproj"
+    root.mkdir()
+    core.STATE.root = root
+    status, body = gui.post("/api/memory", {
+        "action": "add", "text": "tests run with pytest -q",
+        "scope": "project"})
+    assert status == 200 and body["stored"] is True
+    assert any(e["text"] == "tests run with pytest -q"
+               for e in body["entries"])
+    assert (root / ".pedacito" / "memory.md").exists()
+    # A duplicate is reported, not stored twice.
+    status, dup = gui.post("/api/memory", {
+        "action": "add", "text": "tests run with pytest -q"})
+    assert dup["ok"] is False and dup["stored"] is False
+    status, body = gui.get("/api/memory")
+    assert status == 200 and any(e["text"].startswith("tests run")
+                                 for e in body["entries"])
+    status, body = gui.post("/api/memory", {
+        "action": "forget", "text": "pytest"})
+    assert body["forgot"] == 1
+    assert not any(e["text"].startswith("tests run") for e in body["entries"])
+
+    facts = root / ".pedacito" / "micro_facts.json"
+    facts.write_text(json.dumps({
+        "anti_patterns": [{"lesson_id": "L1", "kind": "import",
+                           "text": "the package export was missing"}],
+        "promoted": [{"lesson_id": "L2", "kind": "lint",
+                      "text": "unused import in src/web",
+                      "promoted_to": ".pedacito/rules/auto_src.md"}],
+    }), encoding="utf-8")
+    status, body = gui.get("/api/memory")
+    assert any(x["lesson_id"] == "L1" for x in body["lessons"])
+    assert any(x["lesson_id"] == "L2" for x in body["promoted"])
+    status, body = gui.post("/api/memory",
+                            {"action": "forget_lesson", "id": "L1"})
+    assert body["forgot"] == 1
+    assert not any(x.get("lesson_id") == "L1" for x in body["lessons"])
+
+
+# --- background dev servers -------------------------------------------------------
+
+def test_procs_api_starts_lists_logs_and_stops_a_server(gui, tmp_path):
+    from pedacito import processes
+    root = tmp_path / "serveproj"
+    root.mkdir()
+    core.STATE.root = root
+    cfg = config_mod.Config()
+    cfg.serve_wait = 0.2
+    core.STATE.cfg = cfg
+    status, body = gui.post("/api/procs", {
+        "action": "start", "name": "demo",
+        "command": [sys.executable, "-u", "-c",
+                    "import time; print('server ready'); time.sleep(30)"]})
+    assert status == 200 and body["ok"], body
+    name = body["process"]["name"]
+    try:
+        status, listed = gui.get("/api/procs")
+        assert status == 200
+        assert any(p["name"] == name for p in listed["processes"])
+        status, logs = gui.post("/api/procs",
+                                {"action": "logs", "name": name})
+        assert status == 200 and "server ready" in logs["logs"]
+        status, stopped = gui.post("/api/procs",
+                                   {"action": "stop", "name": name})
+        assert status == 200 and stopped["ok"], stopped
+        assert not any(p["name"] == name and p["status"] == "running"
+                       for p in stopped["processes"])
+    finally:
+        try:
+            processes.stop(root, name)
+        except Exception:
+            pass
+
+
+# --- project reset ---------------------------------------------------------------
+
+def test_project_reset_dry_run_preview_then_stop_and_keep_authored_state(
+        gui, tmp_path):
+    from pedacito import processes, workspace
+    root = tmp_path / "resetproj"
+    root.mkdir()
+    state = workspace.state_dir(root)
+    state.mkdir(parents=True, exist_ok=True)
+    (state / "memory.md").write_text("# memory\n- a fact\n", encoding="utf-8")
+    (state / "rules").mkdir()
+    (state / "rules" / "a.md").write_text("a rule\n", encoding="utf-8")
+    (state / "sessions").mkdir()
+    (state / "sessions" / "s.md").write_text("session\n", encoding="utf-8")
+    (state / "index.json").write_text("{}\n", encoding="utf-8")
+    rec = processes.start(root, [sys.executable, "-c",
+                                 "import time; time.sleep(60)"], wait=0.2)
+    core.STATE.root = root
+    try:
+        status, preview = gui.post("/api/project/reset", {
+            "dry_run": True, "keep_memory": True, "keep_config": True})
+        assert status == 200 and preview["ok"] and preview["dry_run"]
+        assert "memory.md" in preview["kept"]
+        assert "rules" in preview["kept"]
+        assert "sessions" in preview["removed"]
+        assert preview["files"] >= 2
+        assert rec["name"] in preview["would_stop"]
+        # A preview changes nothing.
+        assert (state / "sessions" / "s.md").exists()
+        assert any(p["name"] == rec["name"] and p["status"] == "running"
+                   for p in processes.list_procs(root))
+
+        status, done = gui.post("/api/project/reset", {
+            "keep_memory": True, "keep_config": True})
+        assert status == 200 and done["ok"], done
+        assert rec["name"] in done["stopped"]
+        assert (state / "memory.md").exists()
+        assert (state / "rules" / "a.md").exists()
+        assert not (state / "sessions").exists()
+        assert not (state / "index.json").exists()
+        assert (root / ".pedacito").is_dir()      # recreated, empty-ish
+        assert processes.list_procs(root) == []   # registry was cleared
+    finally:
+        try:
+            processes.stop(root, rec["name"])
+        except Exception:
+            pass
+
+
+# --- on-demand checks and prune ----------------------------------------------------
+
+def test_project_check_and_prune_endpoints(gui, tmp_path, monkeypatch):
+    from pedacito import domcheck, workspace
+    root = tmp_path / "checkproj"
+    root.mkdir()
+    core.STATE.root = root
+    (root / "index.html").write_text(
+        '<!doctype html><script src="missing.js"></script>\n',
+        encoding="utf-8")
+    status, web = gui.post("/api/project/check", {"kind": "webcheck"})
+    assert status == 200 and web["ok"] and web["kind"] == "webcheck"
+    assert web["passed"] is False and web["findings"]
+    assert "missing.js" in web["report"]
+
+    status, diag = gui.post("/api/project/check", {"kind": "diagnose"})
+    assert status == 200 and diag["ok"] and diag["kind"] == "diagnose"
+    assert isinstance(diag["passed"], bool) and diag["report"]
+
+    monkeypatch.setattr(
+        domcheck, "check",
+        lambda root, entry="", timeout=45, baseline=None:
+        domcheck.DomResult(entry="index.html", findings=[], snapshot={}))
+    status, dom = gui.post("/api/project/check", {"kind": "domcheck"})
+    assert status == 200 and dom["ok"] and dom["passed"] is True
+    assert dom["entry"] == "index.html"
+    status, bad = gui.post("/api/project/check", {"kind": "nope"})
+    assert status == 400 and not bad["ok"]
+
+    sessions = workspace.state_dir(root, "sessions")
+    sessions.mkdir(parents=True)
+    for name in ("20260101.md", "20260102.md", "20260103.md"):
+        (sessions / name).write_text("x\n", encoding="utf-8")
+    workspace.new_backup_dir(root, when="20260101-000000", unique=True)
+    workspace.new_backup_dir(root, when="20260102-000000", unique=True)
+    status, preview = gui.post("/api/project/prune", {
+        "keep_sessions": 1, "keep_backups": 1, "dry_run": True})
+    assert status == 200 and preview["dry_run"]
+    assert preview["removed"]["sessions"] == 2
+    assert preview["removed"]["backups"] == 1
+    assert len(list(sessions.glob("*.md"))) == 3        # preview only
+    status, done = gui.post("/api/project/prune", {
+        "keep_sessions": 1, "keep_backups": 1})
+    assert status == 200 and not done["dry_run"]
+    assert done["removed"]["sessions"] == 2
+    assert len(list(sessions.glob("*.md"))) == 1
+    assert len(workspace.list_backups(root)) == 1
+
+
+# --- saved theme with no project open ---------------------------------------------
+
+def test_theme_persists_and_loads_with_no_project_open(gui):
+    assert core.STATE.root is None
+    status, body = gui.post("/api/settings/theme", {"gui_theme": "jazz_solo"})
+    assert status == 200 and body["ok"] and body["persisted"] is True
+    assert body["created"] is True
+    assert 'gui_theme = "jazz_solo"' in gui.cfg_path.read_text(encoding="utf-8")
+    # Simulate a fresh GUI process: no live project config, no theme cache.
+    core.STATE.cfg = None
+    core.STATE._user_cfg = None
+    core.STATE._user_cfg_stamp = None
+    _status, st = gui.get("/api/state")
+    assert st["gui_theme"] == "jazz_solo"
+    # The initial HTML already carries the saved theme (no first-paint flash).
+    status, _headers, html = gui.req("GET", "/")
+    assert status == 200 and b'data-theme="jazz_solo"' in html
+    # A later pick persists in place and is what the next load reports.
+    assert gui.post("/api/settings/theme",
+                    {"gui_theme": "trapper_keeper"})[0] == 200
+    core.STATE.cfg = None
+    core.STATE._user_cfg = None
+    core.STATE._user_cfg_stamp = None
+    assert gui.get("/api/state")[1]["gui_theme"] == "trapper_keeper"
+    assert 'data-theme="trapper_keeper"' in gui.req("GET", "/")[2].decode()
