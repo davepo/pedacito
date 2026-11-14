@@ -389,3 +389,124 @@ def test_accel_denial_respects_the_named_cause():
     ours = RuntimeError('server returned 400: {"error": "unexpected key '
                         'cache_prompt"}')
     assert c._deny_accel_caps({"cache_prompt": True}, ours)
+
+
+# -- BUG-1011: the config upgrader's own backup is not project content -------
+
+
+def test_config_upgrade_backup_is_harness_owned():
+    """`pedacito config --upgrade --path .pedacito.toml` writes
+    `.pedacito.toml.bak` (documented, expected), and the next documented step
+    `pedacito new .` refused the directory as "not empty
+    (.pedacito.toml.bak)". The freshness guard asks whether the folder holds a
+    PROJECT; a backup of harness config is not one."""
+    from pedacito import scaffold
+
+    assert scaffold.is_harness_owned(".pedacito.toml")
+    assert scaffold.is_harness_owned(".pedacito.toml.bak")
+    assert scaffold.is_harness_owned(".pedacito.toml.bak-20261114-071300")
+    assert scaffold.is_harness_owned("pedacito.toml.bak")
+    assert not scaffold.is_harness_owned("index.html")
+    assert not scaffold.is_harness_owned("main.py.bak")
+
+
+# -- BUG-1014: the documented qualified rename works from the CLI ------------
+
+
+def test_rename_accepts_qualified_query_and_follows_receivers(tmp_path):
+    """README's "Renaming a symbol across the project" documents
+    `pedacito rename Store.save save_record`; the CLI rejected every dotted
+    name as "not a valid identifier" before reaching the engine. The engine
+    now takes the qualified spelling and renames only that class's member:
+    another class's `save`, an untyped receiver and string text stay put."""
+    from pedacito import refactor
+
+    (tmp_path / "pkg").mkdir()
+    (tmp_path / "pkg/__init__.py").write_text("", encoding="utf-8")
+    (tmp_path / "pkg/store.py").write_text(
+        "class Store:\n"
+        "    def save(self, item):\n"
+        "        return self.save(item)\n"
+        "\n"
+        "class Other:\n"
+        "    def save(self, item):\n"
+        "        return item\n", encoding="utf-8")
+    (tmp_path / "pkg/app.py").write_text(
+        "from pkg.store import Other, Store\n"
+        "\n"
+        "def run(z):\n"
+        "    x = Store()\n"
+        "    y = Other()\n"
+        "    return x.save(1 if 'save' else 0), y.save(2), z.save(3)\n",
+        encoding="utf-8")
+
+    res = refactor.rename_symbol_across_project(
+        tmp_path, "Store.save", "save_record", dry_run=True)
+    assert res["ok"], res
+    assert res["per_file"] == {"pkg/store.py": 2, "pkg/app.py": 1}, res
+    assert any("untyped receiver" in s for s in res["not_renamed"]), \
+        res["not_renamed"]
+
+    res = refactor.rename_symbol_across_project(
+        tmp_path, "Store.save", "save_record")
+    assert res["ok"], res
+    store = (tmp_path / "pkg/store.py").read_text(encoding="utf-8")
+    app = (tmp_path / "pkg/app.py").read_text(encoding="utf-8")
+    assert "def save_record(self, item)" in store
+    assert "self.save_record(item)" in store
+    assert "class Other:\n    def save(self" in store   # foreign member
+    assert "x.save_record(1" in app
+    assert "y.save(2)" in app and "z.save(3)" in app
+    assert "'save'" in app                              # string untouched
+
+
+def test_cli_rename_refreshes_the_index_in_place(tmp_path):
+    """TECHNIQUES.md #26 promises the applied files are re-indexed so the next
+    search does not answer from a stale symbol table; the CLI wrote the files
+    and returned, leaving the old identifier in `.pedacito/index.json`."""
+    import argparse
+
+    from pedacito import cli, index as index_mod
+
+    (tmp_path / "app.py").write_text(
+        "def load(x):\n    return x\n\n\ndef use():\n    return load(1)\n",
+        encoding="utf-8")
+    cfg = _cfg()
+    idx = index_mod.build([str(tmp_path)], cfg, client=None, root=tmp_path,
+                          summarise=False)
+    assert any(c.qualname.split(".")[-1] == "load" for c in idx.chunks)
+
+    args = argparse.Namespace(old="load", new="read_all", file=None,
+                              strings=False, apply=True, root=str(tmp_path),
+                              config=None, profile=None, paths=[],
+                              no_gitignore=False, exclude=[], include=[])
+    assert cli._cmd_rename(args) == 0
+    assert "read_all(1)" in (tmp_path / "app.py").read_text(encoding="utf-8")
+
+    fresh = index_mod.Index.load(tmp_path)
+    names = {c.qualname.split(".")[-1] for c in fresh.chunks}
+    assert "read_all" in names and "load" not in names
+
+
+# -- BUG-1012: the post-edit suite must use an interpreter that HAS pytest ---
+
+
+def test_detected_pytest_uses_the_pedacito_interpreter(tmp_path, monkeypatch):
+    """A fresh project has `tests/` but no installed pytest for the PATH
+    `python`. Detection emitted `python -m pytest -q` anyway, so every
+    post-edit gate recorded `tests: FAILED` with ModuleNotFoundError while the
+    user's `--verify "/venv/python -m pytest -q"` on the same suite passed --
+    two commands, two verdicts. With no `pytest` on PATH, name the interpreter
+    that runs Pedacito (pytest is a core dependency)."""
+    import shlex
+    import sys
+
+    from pedacito import testsel
+
+    (tmp_path / "tests").mkdir()
+    (tmp_path / "tests/test_app.py").write_text(
+        "def test_ok():\n    assert True\n", encoding="utf-8")
+    monkeypatch.setattr(testsel.shutil, "which", lambda name: None)
+    cmd = testsel.detect_test_command(tmp_path, _cfg())
+    assert cmd == f"{shlex.quote(sys.executable)} -m pytest -q"
+    assert testsel.narrow_command(cmd, ["tests/test_app.py"])[1] is True

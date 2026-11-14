@@ -461,6 +461,35 @@ def test_working_audio_page_passes(tmp_path):
 
 
 @requires_pw
+def test_source_that_disconnects_onended_is_not_a_broken_graph(tmp_path):
+    """BUG-1013: a short note that cleans up after itself (`onended =
+    () => osc.disconnect()`) had ended by the time the probe read the graph,
+    so its edges were gone and a WORKING synth was reported as
+    `audio_graph_disconnected`. Starting and then cleaning up is correct; a
+    source that never connected is still detected (test_disconnected_graph)."""
+    _project(tmp_path, (
+        "const app = document.getElementById('app');\n"
+        "const b = document.createElement('button');\n"
+        "b.id = 'play'; b.textContent = 'Play';\n"
+        "b.addEventListener('click', () => {\n"
+        "  const ctx = new AudioContext();\n"
+        "  ctx.resume();\n"
+        "  const osc = ctx.createOscillator();\n"
+        "  const g = ctx.createGain();\n"
+        "  g.gain.value = 0.2;\n"
+        "  osc.connect(g); g.connect(ctx.destination);\n"
+        "  osc.onended = () => osc.disconnect();\n"
+        "  osc.start(); osc.stop(ctx.currentTime + 0.05);\n"
+        "});\n"
+        "app.appendChild(b);\n"))
+    res = domcheck.check(tmp_path)
+    assert not res.error, res.error
+    assert not any(f.kind.startswith("audio_") for f in res.findings), \
+        [str(f) for f in res.findings]
+    assert res.snapshot["audio"]["sources_started"] >= 1
+
+
+@requires_pw
 def test_scene1_shape_unstarted_voices_and_dead_scheduler(tmp_path):
     # bug_hunting_2: context at load (never resumed), voices wired but never
     # start()ed, and the scheduler reads a pattern that was never assigned.

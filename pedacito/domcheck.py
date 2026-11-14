@@ -412,17 +412,28 @@ _AUDIO_INIT_SCRIPT = """
     try {
       const from = nodeIds.get(this);
       if (from !== undefined) {
+        // A source that STARTED keeps its outgoing edges as historical
+        // evidence. The common healthy pattern is `osc.onended = () =>
+        // osc.disconnect()`: the probe checks the graph 300-500ms later, by
+        // which time a short note has ended and cleaned itself up. Dropping
+        // those edges made a working synth look like a graph that never
+        // reached ctx.destination (BUG-1013). A source that never connected
+        // before start() still has no edge and is still reported.
+        const rec = nodeById.get(from);
+        const keep = !!(rec && rec.started);
         const t = arguments[0];
         if (arguments.length === 0) {
-          A.edges = A.edges.filter(e => e.from !== from);
+          A.edges = A.edges.filter(e => e.from !== from || keep);
         } else if (t instanceof AudioNode) {
           const to = nodeIds.get(t);
-          A.edges = A.edges.filter(e => !(e.from === from && e.to === to));
+          if (!keep)
+            A.edges = A.edges.filter(e => !(e.from === from && e.to === to));
         } else if (typeof AudioParam !== 'undefined' &&
                    t instanceof AudioParam) {
           const to = paramOwner.get(t);
-          A.edges = A.edges.filter(e => !(e.from === from && e.to === to &&
-                                          e.param));
+          if (!keep)
+            A.edges = A.edges.filter(e => !(e.from === from && e.to === to &&
+                                            e.param));
         }
         // disconnect(outputIndex): per-output edges are not tracked; keep
         // them (under-removal cannot fake a disconnection finding).

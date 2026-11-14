@@ -550,14 +550,28 @@ def rename_symbol_across_project(root, old_name: str, new_name: str,
     def fail(msg: str) -> dict:
         return {**empty, "error": msg}
 
-    if not old_name or not old_name.isidentifier():
-        return fail(f"`{old_name}` is not a valid identifier.")
-    if not new_name or not new_name.isidentifier():
-        return fail(f"`{new_name}` is not a valid identifier.")
-    if keyword.iskeyword(old_name) or keyword.iskeyword(new_name):
+    # A qualified query (`Store.save`, README "Renaming a symbol") is the
+    # receiver-aware form: only that class's definition, self/cls/static
+    # access and provably typed receivers move; same-named members of other
+    # classes are left alone. A bare name keeps the historical whole-project
+    # identifier pass. The old CLI rejected the documented qualified spelling
+    # before reaching the engine (BUG-1014).
+    qualified = "." in old_name
+    class_path = old_name.rsplit(".", 1)[0] if qualified else ""
+    base_old = old_name.rsplit(".", 1)[-1] if qualified else old_name
+    base_new = new_name.rsplit(".", 1)[-1] if "." in new_name else new_name
+    if qualified and (not class_path
+                      or any(not part.isidentifier()
+                             for part in class_path.split("."))):
+        return fail(f"`{old_name}` is not a valid qualified identifier.")
+    if not base_old or not base_old.isidentifier() or not base_new \
+            or not base_new.isidentifier():
+        return fail(f"`{old_name}` -> `{new_name}` is not a valid identifier "
+                    "rename.")
+    if keyword.iskeyword(base_old) or keyword.iskeyword(base_new):
         return fail("renaming a keyword is not a symbol rename; pick "
                     "identifier names.")
-    if old_name == new_name:
+    if base_old == base_new:
         return fail("the old and new names are the same; nothing to rename.")
 
     try:
@@ -569,6 +583,7 @@ def rename_symbol_across_project(root, old_name: str, new_name: str,
     changes: dict[str, tuple[str, str, int, object]] = {}
     skipped: list[str] = []
     warnings: list[str] = []
+    not_renamed: list[str] = []
     string_matches: list[str] = []
     string_total = 0
     for rel in files:
@@ -583,15 +598,25 @@ def rename_symbol_across_project(root, old_name: str, new_name: str,
             skipped.append(f"{rel} (unreadable)")
             continue
         suffix = Path(rel).suffix.lower()
+        site_skips: list[str] = []
         if suffix == ".py":
-            new_text, n = _rename_python(text, old_name, new_name)
-            if n < 0:
-                skipped.append(f"{rel} (could not be tokenized)")
-                continue
+            if qualified:
+                new_text, n, site_skips = _rename_python_receiver(
+                    text, base_old, base_new, class_path)
+                if n < 0:
+                    skipped.append(f"{rel} (could not be parsed)")
+                    continue
+            else:
+                new_text, n = _rename_python(text, base_old, base_new)
+                if n < 0:
+                    skipped.append(f"{rel} (could not be tokenized)")
+                    continue
         else:
-            res = _rename_treesitter(text, old_name, new_name, suffix)
+            token_old = base_old
+            token_new = base_new
+            res = _rename_treesitter(text, token_old, token_new, suffix)
             if res is None:
-                new_text, n = _rename_generic(text, old_name, new_name,
+                new_text, n = _rename_generic(text, token_old, token_new,
                                               suffix)
                 if n > 0:
                     warnings.append(f"{rel}: renamed outside quotes and "
@@ -599,10 +624,16 @@ def rename_symbol_across_project(root, old_name: str, new_name: str,
                                     "tree-sitter grammar available)")
             else:
                 new_text, n = res
+            if qualified and n > 0:
+                warnings.append(
+                    f"{rel}: receiver tracking is Python-only; "
+                    f"`{base_old}` was renamed there by whole-word match -- "
+                    "verify it is the same member")
+        not_renamed += [f"{rel}:{s}" for s in site_skips]
         if include_strings:
             # BUG-219 opt-in: whole-word occurrences INSIDE string literals
             # (test labels, docs) move too; comments never do.
-            new_text, ns = _rename_in_strings(new_text, old_name, new_name,
+            new_text, ns = _rename_in_strings(new_text, base_old, base_new,
                                               suffix)
             n += ns
             string_total += ns
@@ -610,7 +641,7 @@ def rename_symbol_across_project(root, old_name: str, new_name: str,
         # labels, docs) so the caller can surface them. Scan the post-rename
         # text so the identifiers just renamed do not count as leftovers.
         if len(string_matches) < 20:
-            for line, snippet in _string_mentions(new_text, old_name):
+            for line, snippet in _string_mentions(new_text, base_old):
                 string_matches.append(f"{rel}:{line}: {snippet}")
                 if len(string_matches) >= 20:
                     break
@@ -668,6 +699,7 @@ def rename_symbol_across_project(root, old_name: str, new_name: str,
                          in changes.items()},
             "skipped": skipped,
             "warnings": warnings,
+            "not_renamed": not_renamed,
             "string_matches": string_matches}
 
 

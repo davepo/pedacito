@@ -1557,8 +1557,14 @@ HARNESS_OWNED = (".git", ".gitignore", ".pedacito", ".pedacitoignore",
 def is_harness_owned(name: str) -> bool:
     """Whether a top-level entry came from Pedacito rather than the project.
     `.gitignore` is here because `workspace.ensure` creates it in a repo and
-    appends Pedacito's entries to it."""
-    return name in HARNESS_OWNED
+    appends Pedacito's entries to it. A project config's backup is Pedacito's
+    too: `pedacito config --upgrade` (and `--init --force`) writes
+    `<config>.bak` beside it, and the documented "configure, then `new .`"
+    flow must not then be refused as a non-empty directory (BUG-1011)."""
+    if name in HARNESS_OWNED:
+        return True
+    return any(name == cfg + ".bak" or name.startswith(cfg + ".bak-")
+               for cfg in PROJECT_CONFIG_NAMES)
 
 
 def _web_contract_gate(root: Path, cfg, client, idx, plan: Plan,

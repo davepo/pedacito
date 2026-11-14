@@ -1998,6 +1998,12 @@ def _cmd_rename(args) -> int:
         print(f"  warning: {w}")
     for s in res.get("skipped", [])[:8]:
         print(f"  not checked: {s}")
+    if res.get("not_renamed"):
+        listed = "; ".join(res["not_renamed"][:8])
+        more = f", +{len(res['not_renamed']) - 8} more" \
+            if len(res["not_renamed"]) > 8 else ""
+        print(f"  not renamed (ambiguous or bound to another type): "
+              f"{listed}{more}")
     if res.get("string_matches"):
         if getattr(args, "strings", False):
             print(f"  note: {len(res['string_matches'])} string literal(s) "
@@ -2017,9 +2023,30 @@ def _cmd_rename(args) -> int:
                 print()
                 print(diff.rstrip())
         print("\n(dry run: nothing written; add --apply to write)")
-    elif state["dir"] is not None:
-        print(f"\noriginals snapshotted under {state['dir']}; "
-              "`pedacito restore` undoes the rename.")
+    else:
+        # TECHNIQUES.md #26: applied files are re-indexed in place so the next
+        # search does not answer from a stale symbol table. The CLI rename path
+        # wrote the files and stopped, leaving the index naming the old
+        # identifier until some later `ask` happened to refresh it (BUG-1015).
+        # No model and no rebuild: one re-chunk per changed file.
+        try:
+            from . import index as index_mod
+            from .config import Config
+            idx = index_mod.Index.load(root)
+            if idx is not None:
+                cfg = Config()
+                cfg.log_events = False
+                cfg.log_sessions = False
+                for rel in res["files_modified"]:
+                    index_mod.reindex_file(idx, rel, cfg, save=False)
+                idx.save()
+                print(f"index refreshed in place: {len(res['files_modified'])} "
+                      "file(s)")
+        except Exception as e:                 # a stale index is not fatal
+            print(f"index refresh skipped: {e}", file=sys.stderr)
+        if state["dir"] is not None:
+            print(f"\noriginals snapshotted under {state['dir']}; "
+                  "`pedacito restore` undoes the rename.")
     return 0
 
 

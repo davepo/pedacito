@@ -126,7 +126,17 @@ def detect_test_command(root, cfg=None) -> str:
     has_py_tests = any(root.glob("tests/test_*.py")) or any(root.glob("test_*.py")) \
         or any(root.glob("tests/**/test_*.py"))
     if has_py_tests or (py_markers and (root / "tests").is_dir()):
-        return "python -m pytest -q" if not shutil.which("pytest") else "pytest -q"
+        # A PATH `python` is not necessarily the interpreter running Pedacito:
+        # on a fresh project it is often the system python with no pytest,
+        # while the harness's own interpreter has it as a core dependency.
+        # `run_test` already probes and prefers sys.executable for exactly
+        # this reason; the post-edit gate did not, so it recorded a red suite
+        # whose only "failure" was ModuleNotFoundError: No module named
+        # pytest, while the user's --verify on the same suite was green
+        # (BUG-1012).
+        if shutil.which("pytest"):
+            return "pytest -q"
+        return f"{shlex.quote(sys.executable)} -m pytest -q"
     if _has(root, "Makefile", "makefile", "GNUmakefile"):
         for name in ("Makefile", "makefile", "GNUmakefile"):
             mk = root / name
