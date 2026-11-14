@@ -105,9 +105,9 @@ def test_repair_refuses_weakening_a_pre_existing_test(tmp_path):
     assert not by_file["tests/test_core.py"].ok
     assert "refused" in by_file["tests/test_core.py"].message
     # the code fix landed; the assertion is untouched on disk
-    assert "round" in (tmp_path / "pkg/core.py").read_text()
+    assert "round" in (tmp_path / "pkg/core.py").read_text(encoding="utf-8")
     assert "assert discount(100) == 90.0" in \
-        (tmp_path / "tests/test_core.py").read_text()
+        (tmp_path / "tests/test_core.py").read_text(encoding="utf-8")
 
 
 def test_lock_is_one_shot(tmp_path):
@@ -126,7 +126,7 @@ def test_dry_run_filters_without_consuming_the_lock(tmp_path):
     real = agent._apply_once(TEST_WEAKEN, dry_run=False)
     assert not real[0].ok
     assert "assert discount(100) == 90.0" in \
-        (tmp_path / "tests/test_core.py").read_text()
+        (tmp_path / "tests/test_core.py").read_text(encoding="utf-8")
 
 
 def test_task_asking_for_test_changes_is_exempt(tmp_path):
@@ -229,5 +229,5 @@ def test_post_edit_repair_seat_cannot_weaken_the_test(tmp_path, monkeypatch):
     assert not by_file["tests/test_core.py"].ok
     assert "refused" in by_file["tests/test_core.py"].message
     assert "assert discount(100) == 90.0" in \
-        (tmp_path / "tests/test_core.py").read_text()
-    assert "round" in (tmp_path / "pkg/core.py").read_text()
+        (tmp_path / "tests/test_core.py").read_text(encoding="utf-8")
+    assert "round" in (tmp_path / "pkg/core.py").read_text(encoding="utf-8")

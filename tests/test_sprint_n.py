@@ -155,7 +155,7 @@ def test_ast_fallback_finds_no_false_positives_in_pedacito_itself():
 def test_gate_uses_ruff_when_available(tmp_path):
     if not spec._ruff_command():
         pytest.skip("ruff not installed here")
-    (tmp_path / "m.py").write_text(BROKEN)
+    (tmp_path / "m.py").write_text(BROKEN, encoding="utf-8")
     errs = spec.run_fast_static_gate(tmp_path, [tmp_path / "m.py"])
     assert any("F821" in e and "jsonx" in e for e in errs), errs
     assert errs[0].startswith("m.py:")
@@ -163,7 +163,7 @@ def test_gate_uses_ruff_when_available(tmp_path):
 
 def test_gate_falls_back_to_ast_without_ruff(tmp_path, monkeypatch):
     _force_ast(monkeypatch)
-    (tmp_path / "m.py").write_text(BROKEN)
+    (tmp_path / "m.py").write_text(BROKEN, encoding="utf-8")
     errs = spec.run_fast_static_gate(tmp_path, [tmp_path / "m.py"])
     assert any("F821" in e for e in errs), errs
 
@@ -172,7 +172,7 @@ def test_gate_falls_back_when_ruff_times_out(tmp_path, monkeypatch):
     monkeypatch.setattr(
         spec, "_ruff_command",
         lambda: [sys.executable, "-c", "import time; time.sleep(30)"])
-    (tmp_path / "m.py").write_text(BROKEN)
+    (tmp_path / "m.py").write_text(BROKEN, encoding="utf-8")
     errs = spec.run_fast_static_gate(tmp_path, [tmp_path / "m.py"],
                                      timeout=0.4)
     assert any("F821" in e for e in errs), errs
@@ -180,7 +180,7 @@ def test_gate_falls_back_when_ruff_times_out(tmp_path, monkeypatch):
 
 def test_gate_ignores_missing_and_non_python(tmp_path, monkeypatch):
     _force_ast(monkeypatch)
-    (tmp_path / "notes.md").write_text("anything here")
+    (tmp_path / "notes.md").write_text("anything here", encoding="utf-8")
     errs = spec.run_fast_static_gate(
         tmp_path, [tmp_path / "nope.py", tmp_path / "notes.md"])
     assert errs == []
@@ -239,7 +239,7 @@ class _FakeAgent:
 
     def _apply_once(self, reply, dry_run, backup_dir):
         # The repair lands: rewrite the real file and return its Result.
-        (Path(".") / "m.py").write_text(self.fixed_src)
+        (Path(".") / "m.py").write_text(self.fixed_src, encoding="utf-8")
         return [Result(True, "m.py", "applied", before=BROKEN,
                        after=self.fixed_src)]
 
@@ -252,7 +252,7 @@ def test_post_edit_static_repairs_before_any_test_subprocess(tmp_path,
     cfg.repair_rounds = 1
     cfg._static_baseline = set()
     _force_ast(monkeypatch)
-    (tmp_path / "m.py").write_text(BROKEN)
+    (tmp_path / "m.py").write_text(BROKEN, encoding="utf-8")
     monkeypatch.chdir(tmp_path)
     agent = _FakeAgent(GOOD)
     runs = []
@@ -279,7 +279,7 @@ def test_post_edit_preexisting_static_errors_do_not_fire(tmp_path, monkeypatch):
     from pedacito import spec as sp
     cfg._static_baseline = {sp.static_error_key(e)
                             for e in sp.ast_static_errors("m.py", BROKEN)}
-    (tmp_path / "m.py").write_text(BROKEN)
+    (tmp_path / "m.py").write_text(BROKEN, encoding="utf-8")
     agent = _FakeAgent(GOOD)
     runs = []
     monkeypatch.setattr(loop, "_run_tests",
@@ -295,7 +295,7 @@ def test_post_edit_preexisting_static_errors_do_not_fire(tmp_path, monkeypatch):
 def test_static_gate_off_skips_everything(tmp_path, monkeypatch):
     cfg = Config()
     cfg.static_gate = False
-    (tmp_path / "m.py").write_text(BROKEN)
+    (tmp_path / "m.py").write_text(BROKEN, encoding="utf-8")
     assert loop._new_static_errors(tmp_path, cfg, ["m.py"]) == []
     cfg._static_baseline = None
     assert loop._static_errors(tmp_path, cfg, ["m.py"]) == []
@@ -311,17 +311,17 @@ def test_ratchet_begin_green_rollback_roundtrip(tmp_path):
     assert "a.py" in info["files"]
     # The step edits a.py and creates new.py:
     _pw(tmp_path / "a.py", "BAD = jsonx\n")
-    (tmp_path / "new.py").write_text("x = 1\n")
+    (tmp_path / "new.py").write_text("x = 1\n", encoding="utf-8")
     ratchet.green(tmp_path, 1)
     assert ratchet.frontier(tmp_path) == 1
 
     info = ratchet.begin(tmp_path, 2, "step two")
     _pw(tmp_path / "a.py", "WRECKED\n")
-    (tmp_path / "c.py").write_text("created in step two\n")
+    (tmp_path / "c.py").write_text("created in step two\n", encoding="utf-8")
     back = ratchet.rollback(tmp_path, 2)
     assert back["restored"] == ["a.py"]
     assert back["deleted"] == ["c.py"]
-    assert (tmp_path / "a.py").read_text() == "BAD = jsonx\n"
+    assert (tmp_path / "a.py").read_text(encoding="utf-8") == "BAD = jsonx\n"
     assert not (tmp_path / "c.py").exists()
     assert ratchet.frontier(tmp_path) == 1     # green target still stands
     # The failed step's snapshot is consumed:
@@ -329,9 +329,9 @@ def test_ratchet_begin_green_rollback_roundtrip(tmp_path):
 
 
 def test_ratchet_rollback_skips_untouched_files(tmp_path):
-    (tmp_path / "a.py").write_text("GOOD = 1\n")
+    (tmp_path / "a.py").write_text("GOOD = 1\n", encoding="utf-8")
     ratchet.begin(tmp_path, 1)
-    (tmp_path / "b.py").write_text("new\n")
+    (tmp_path / "b.py").write_text("new\n", encoding="utf-8")
     back = ratchet.rollback(tmp_path, 1)
     assert back["restored"] == []
     assert back["deleted"] == ["b.py"]
@@ -339,11 +339,11 @@ def test_ratchet_rollback_skips_untouched_files(tmp_path):
 
 def test_ratchet_rollback_never_undoes_the_plan_file(tmp_path):
     plan = tmp_path / "PLAN.md"
-    plan.write_text("- [ ] work\n")
+    plan.write_text("- [ ] work\n", encoding="utf-8")
     ratchet.begin(tmp_path, 1, skip=["PLAN.md"])
-    plan.write_text("- [x] work\n")           # the loop ticks it mid-step
+    plan.write_text("- [x] work\n", encoding="utf-8")           # the loop ticks it mid-step
     back = ratchet.rollback(tmp_path, 1)
-    assert plan.read_text() == "- [x] work\n"
+    assert plan.read_text(encoding="utf-8") == "- [x] work\n"
     assert back["restored"] == [] and back["deleted"] == []
 
 
@@ -354,11 +354,11 @@ def test_ratchet_rollback_without_checkpoint_reports_error(tmp_path):
 
 def test_ratchet_skips_state_and_huge_files(tmp_path):
     (tmp_path / ".pedacito").mkdir()
-    (tmp_path / ".pedacito" / "state.json").write_text("{}")
+    (tmp_path / ".pedacito" / "state.json").write_text("{}", encoding="utf-8")
     (tmp_path / "node_modules").mkdir()
-    (tmp_path / "node_modules" / "junk.py").write_text("x\n")
+    (tmp_path / "node_modules" / "junk.py").write_text("x\n", encoding="utf-8")
     big = tmp_path / "big.py"
-    big.write_text("x = 1\n" + "# pad\n" * 2000)
+    big.write_text("x = 1\n" + "# pad\n" * 2000, encoding="utf-8")
     info = ratchet.begin(tmp_path, 1, max_file_bytes=50)
     assert not any(f.startswith(".pedacito") for f in info["files"])
     assert not any("node_modules" in f for f in info["files"])
@@ -400,7 +400,7 @@ def test_run_loop_rolls_back_the_failed_step(tmp_path, monkeypatch):
             changed = ["a.py"]
         else:
             _pw(root / "a.py", "BAD = wrecked\n")
-            (root / "new.py").write_text("orphan\n")
+            (root / "new.py").write_text("orphan\n", encoding="utf-8")
             changed = ["a.py", "new.py"]
         return loop.TaskResult([Result(True, "a.py", "applied")],
                                "done the work", True, changed, idx_)
@@ -414,9 +414,9 @@ def test_run_loop_rolls_back_the_failed_step(tmp_path, monkeypatch):
                          verify="pytest -q", repair_rounds=0,
                          stop_on_fail=False)
     assert code == 1
-    assert (tmp_path / "a.py").read_text() == "GOOD = 1\n"   # restored
+    assert (tmp_path / "a.py").read_text(encoding="utf-8") == "GOOD = 1\n"   # restored
     assert not (tmp_path / "new.py").exists()                # deleted
-    text = plan.read_text()
+    text = plan.read_text(encoding="utf-8")
     assert "- [x] Build module one" in text
     assert "- [!] Build module two" in text
     assert ratchet.frontier(tmp_path) == 1     # step 1 is still the target
@@ -446,7 +446,7 @@ def test_run_loop_ratchet_off_leaves_the_wreckage(tmp_path, monkeypatch):
     monkeypatch.setattr(loop, "run_verify", lambda root, cmd: (False, "boom"))
     loop.run_loop(tmp_path, cfg, None, idx, plan, apply=True,
                   verify="pytest -q", repair_rounds=0, stop_on_fail=False)
-    assert (tmp_path / "a.py").read_text() == "BAD = wrecked\n"
+    assert (tmp_path / "a.py").read_text(encoding="utf-8") == "BAD = wrecked\n"
     assert ratchet.frontier(tmp_path) == 0
 
 
@@ -485,7 +485,7 @@ def test_run_loop_step_static_gate_blocks_the_verify_subprocess(
 
     def fake_run_task(root, cfg_, client, agent, idx_, task, apply=True,
                       review=False, answer_system=None, is_repair=False):
-        (root / "h.py").write_text(BROKEN)
+        (root / "h.py").write_text(BROKEN, encoding="utf-8")
         return loop.TaskResult([Result(True, "h.py", "applied")],
                                "done", True, ["h.py"], idx_)
 

@@ -99,7 +99,7 @@ def test_summary_batching_makes_fewer_requests(tmp_path):
                 if n > 1 else "Does a thing."
 
     body = "".join(f"def f{i}(x):\n    a = x + {i}\n    b = a * 2\n    c = b - 1\n    return c\n\n\n" for i in range(8))
-    (tmp_path / "m.py").write_text(body)
+    (tmp_path / "m.py").write_text(body, encoding="utf-8")
     cfg = Config()
     cfg.log_events = False
     cfg.summary_batch = 4
@@ -129,7 +129,7 @@ def test_replace_unchecked_keeps_finished_steps(tmp_path):
     loop.mark_done(p, "one")
     loop.mark_failed(p, "two")
     loop.replace_unchecked(p, ["three-a", "three-b"])
-    text = p.read_text()
+    text = p.read_text(encoding="utf-8")
     assert "[x] one" in text and "[!] two" in text
     assert "[ ] three-a" in text and "[ ] three-b" in text and "three\n" not in text
 
@@ -238,8 +238,8 @@ def test_rename_touches_definition_and_importers_only(tmp_path):
     agent = _agent(tmp_path, Scripted(), SRC, allow_write=True)
     out = refactor.tool_rename(agent.index, agent.cfg, "apply_discount", "discounted")
     assert out.startswith("RENAMED")
-    core = (tmp_path / "pkg/core.py").read_text()
-    shop = (tmp_path / "pkg/shop.py").read_text()
+    core = (tmp_path / "pkg/core.py").read_text(encoding="utf-8")
+    shop = (tmp_path / "pkg/shop.py").read_text(encoding="utf-8")
     assert "def discounted(" in core
     assert "import discounted" in shop and "return discounted(p)" in shop
     assert "# apply_discount here" in shop and "'apply_discount'" in shop
@@ -251,7 +251,7 @@ def test_rename_refuses_ambiguous_and_taken_names(tmp_path):
     agent = _agent(tmp_path, Scripted(), files, allow_write=True)
     out = refactor.tool_rename(agent.index, agent.cfg, "apply_discount", "d")
     assert out.startswith("ERROR") and "defined in 2 places" in out
-    assert (tmp_path / "pkg/core.py").read_text() == SRC["pkg/core.py"]
+    assert (tmp_path / "pkg/core.py").read_text(encoding="utf-8") == SRC["pkg/core.py"]
     agent2 = _agent(tmp_path / "b", Scripted(), SRC, allow_write=True)
     assert "already defined" in refactor.tool_rename(
         agent2.index, agent2.cfg, "apply_discount", "checkout")
@@ -304,8 +304,8 @@ def test_undo_reverts_every_mutation_of_the_task(tmp_path):
     out = tools.tool_undo(agent.index, cfg, "")
     assert "UNDONE (pre-task contents restored)" in out
     assert "REMOVED (created by this task" in out
-    assert (tmp_path / "pkg/core.py").read_text() == SRC["pkg/core.py"]
-    assert (tmp_path / "pkg/shop.py").read_text() == SRC["pkg/shop.py"]
+    assert (tmp_path / "pkg/core.py").read_text(encoding="utf-8") == SRC["pkg/core.py"]
+    assert (tmp_path / "pkg/shop.py").read_text(encoding="utf-8") == SRC["pkg/shop.py"]
     assert not (tmp_path / "pkg/notes.md").exists()
     assert not (tmp_path / "pkg/store.py").exists()
     # the index sees the restored world again
@@ -324,8 +324,8 @@ def test_undo_one_file_leaves_the_other_mutations_alone(tmp_path):
     tools.tool_write(agent.index, cfg, "pkg/core.py", "BROKEN = True\n")
     tools.tool_write(agent.index, cfg, "pkg/other.py", "BROKEN = True\n")
     out = tools.tool_undo(agent.index, cfg, "pkg/core.py")
-    assert (tmp_path / "pkg/core.py").read_text() == SRC["pkg/core.py"]
-    assert (tmp_path / "pkg/other.py").read_text() == "BROKEN = True\n"
+    assert (tmp_path / "pkg/core.py").read_text(encoding="utf-8") == SRC["pkg/core.py"]
+    assert (tmp_path / "pkg/other.py").read_text(encoding="utf-8") == "BROKEN = True\n"
     assert "pkg/core.py" in out and "pkg/other.py" not in out
     # a name the ledger does not know lists what the task actually touched
     out = tools.tool_undo(agent.index, cfg, "pkg/nope.py")
@@ -358,7 +358,7 @@ def test_undo_is_offered_and_dispatched_only_when_it_can_work(tmp_path):
                                       "content": "BROKEN = True\n"})
     out = tools.dispatch(agent.index, cfg, {"action": "undo", "file": ""})
     assert "UNDONE" in out
-    assert (tmp_path / "pkg/core.py").read_text() == SRC["pkg/core.py"]
+    assert (tmp_path / "pkg/core.py").read_text(encoding="utf-8") == SRC["pkg/core.py"]
     # without write permission the generic mutation gate refuses undo too
     ro_agent = _agent(tmp_path / "ro", Scripted(), SRC, allow_write=False,
                       backup=True)
@@ -403,7 +403,7 @@ def test_run_lock_blocks_a_live_holder_and_takes_over_a_stale_one(tmp_path):
     lock = tmp_path / ".pedacito" / "run.lock"
     sleeper = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
     try:
-        lock.write_text(f"{sleeper.pid}\n")
+        lock.write_text(f"{sleeper.pid}\n", encoding="utf-8")
         try:
             workspace.acquire_lock(tmp_path)
             raise AssertionError("expected ProjectBusy")
@@ -414,7 +414,7 @@ def test_run_lock_blocks_a_live_holder_and_takes_over_a_stale_one(tmp_path):
         sleeper.kill()
         sleeper.wait()
     workspace.acquire_lock(tmp_path)            # holder is dead: taken over
-    assert lock.read_text().strip() == str(os.getpid())
+    assert lock.read_text(encoding="utf-8").strip() == str(os.getpid())
     workspace.release_lock(tmp_path)
     assert not lock.exists()
 
@@ -434,10 +434,10 @@ def test_mypy_detected_only_when_configured(tmp_path, monkeypatch):
     from pedacito import diagnostics
     monkeypatch.setattr(diagnostics, "_which",
                         lambda n: f"/usr/bin/{n}" if n in ("ruff", "mypy") else "")
-    (tmp_path / "pyproject.toml").write_text("[project]\nname='x'\n")
+    (tmp_path / "pyproject.toml").write_text("[project]\nname='x'\n", encoding="utf-8")
     labels = [c.label for c in diagnostics.detect(tmp_path, ["a.py"])]
     assert labels == ["ruff"]
-    (tmp_path / "pyproject.toml").write_text("[tool.mypy]\nstrict = true\n")
+    (tmp_path / "pyproject.toml").write_text("[tool.mypy]\nstrict = true\n", encoding="utf-8")
     labels = [c.label for c in diagnostics.detect(tmp_path, ["a.py"])]
     assert labels == ["ruff", "mypy"]
 
@@ -630,11 +630,11 @@ def test_atomic_edits_write_nothing_when_one_file_fails(tmp_path):
     files = {"a.py": "X = 1\n", "b.py": "Y = 1\n"}
     agent = _agent(tmp_path / "off", Scripted(), files, allow_write=True)
     results, _ = agent.apply(reply, dry_run=False, task="t", gathered="")
-    assert (tmp_path / "off" / "a.py").read_text() == "X = 2\n"        # partial, as before
+    assert (tmp_path / "off" / "a.py").read_text(encoding="utf-8") == "X = 2\n"        # partial, as before
     agent = _agent(tmp_path / "on", Scripted(), files, allow_write=True,
                    atomic_edits=True)
     results, _ = agent.apply(reply, dry_run=False, task="t", gathered="")
-    assert (tmp_path / "on" / "a.py").read_text() == "X = 1\n"
+    assert (tmp_path / "on" / "a.py").read_text(encoding="utf-8") == "X = 1\n"
     held = [r for r in results if r.file == "a.py"]
     assert held and not held[0].ok and "atomic_edits" in held[0].message
     assert any(r.file == "b.py" and not r.ok for r in results)
@@ -643,7 +643,7 @@ def test_atomic_edits_write_nothing_when_one_file_fails(tmp_path):
 def test_restore_delete_created_removes_only_files_the_run_made(tmp_path):
     from pedacito import workspace
     from pedacito.edits import apply_edits, parse_edits
-    (tmp_path / "keep.py").write_text("A = 1\n")
+    (tmp_path / "keep.py").write_text("A = 1\n", encoding="utf-8")
     reply = ("--- FILE: keep.py\n<<<<<<< SEARCH\nA = 1\n=======\nA = 2\n>>>>>>> REPLACE\n"
              "--- FILE: pkg/new.py\n<<<<<<< SEARCH\n=======\nB = 1\n>>>>>>> REPLACE\n")
     bdir = workspace.new_backup_dir(tmp_path)
@@ -651,7 +651,7 @@ def test_restore_delete_created_removes_only_files_the_run_made(tmp_path):
     assert all(r.ok for r in res) and (tmp_path / "pkg/new.py").exists()
     assert workspace.list_backups(tmp_path) == [bdir]          # manifest is not a snapshot
     assert workspace.restore(tmp_path, bdir) == ["keep.py"]
-    assert (tmp_path / "keep.py").read_text() == "A = 1\n"
+    assert (tmp_path / "keep.py").read_text(encoding="utf-8") == "A = 1\n"
     assert workspace.created_files(tmp_path, bdir) == ["pkg/new.py"]
     assert workspace.delete_created(tmp_path, bdir, dry_run=True) == ["pkg/new.py"]
     assert (tmp_path / "pkg/new.py").exists()

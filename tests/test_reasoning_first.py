@@ -318,7 +318,7 @@ def test_reason_first_does_not_change_the_replay_digest(tmp_path):
         rec_path = sub / "rec.jsonl"
         rec = replay.Recorder(Scripted(READ_THEN_GREP), rec_path)
         Agent(idx, rec, cfg).gather("Fix bulk_discount", verbose=False)
-        lines = [json.loads(ln) for ln in rec_path.read_text().splitlines()]
+        lines = [json.loads(ln) for ln in rec_path.read_text(encoding="utf-8").splitlines()]
         digests[flag] = [r["digest"] for r in lines if r["kind"] == "chat_json"]
         rep = replay.Replayer(rec_path)
         Agent(idx, rep, cfg).gather("Fix bulk_discount", verbose=False)

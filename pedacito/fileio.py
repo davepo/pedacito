@@ -212,8 +212,12 @@ def note_created(backup_dir, rel: str) -> None:
 
 def normalise_rel(name: str) -> str:
     """Turn a user- or model-typed path (backslashes, quotes, backticks) into
-    the forward-slash relative path the index stores."""
-    return (name or "").strip().strip("`\"'").replace("\\", "/")
+    the forward-slash relative path the index stores. Leading `./` segments
+    are dropped, so `./src/a.py`, `.\\src\\a.py`, and `src/a.py` are one key."""
+    p = (name or "").strip().strip("`\"'").replace("\\", "/")
+    while p.startswith("./"):
+        p = p[2:]
+    return p
 
 
 def path_key(name: str) -> str:

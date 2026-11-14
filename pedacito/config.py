@@ -35,10 +35,15 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 
+def _is_windows() -> bool:
+    """True on Windows, including a Linux test that simulates win32."""
+    return os.name == "nt" or sys.platform == "win32"
+
+
 def _user_config_dir() -> Path:
     """%APPDATA%\\pedacito on Windows, $XDG_CONFIG_HOME/pedacito (or
     ~/.config/pedacito) elsewhere."""
-    if os.name == "nt":
+    if _is_windows():
         base = os.environ.get("APPDATA") or (Path.home() / "AppData" / "Roaming")
         return Path(base) / "pedacito"
     return Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config") / "pedacito"
@@ -48,7 +53,7 @@ def _user_state_dir() -> Path:
     """Per-user state that is not tied to a project (session logs and chat
     threads opened with no folder): $XDG_STATE_HOME/pedacito on Linux/macOS
     (or ~/.local/state/pedacito), %LOCALAPPDATA%\\pedacito on Windows."""
-    if os.name == "nt":
+    if _is_windows():
         base = os.environ.get("LOCALAPPDATA") or (Path.home() / "AppData" / "Local")
         return Path(base) / "pedacito"
     return Path(os.environ.get("XDG_STATE_HOME")

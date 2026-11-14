@@ -51,7 +51,7 @@ def test_remember_dedupes_caps_redacts_and_refuses_instructions(tmp_path, home):
     assert not ok and "instruction" in msg
     ok, _ = memory.remember(root, "deploy token is sk-abcdefghijklmnopqrstuvwxyz0123456789")
     assert ok
-    text = memory.project_file(root).read_text()
+    text = memory.project_file(root).read_text(encoding="utf-8")
     assert "sk-abcdef" not in text and "[REDACTED]" in text
     assert "## Commands" in text and "## Landmines" in text
     for i in range(40):
@@ -79,9 +79,9 @@ def test_path_scoped_rules_and_nested_instruction_files(tmp_path, home):
     root = tmp_path / "p"
     (root / ".pedacito" / "rules").mkdir(parents=True)
     (root / ".pedacito" / "rules" / "api.md").write_text(
-        "---\npaths: src/api/*.py, *.sql\n---\nHandlers must be async.\n")
+        "---\npaths: src/api/*.py, *.sql\n---\nHandlers must be async.\n", encoding="utf-8")
     (root / "src" / "api").mkdir(parents=True)
-    (root / "src" / "api" / "AGENTS.md").write_text("Use the shared client.\n")
+    (root / "src" / "api" / "AGENTS.md").write_text("Use the shared client.\n", encoding="utf-8")
     got = memory.rules_for(root, "src/api/users.py")
     assert [s for s, _t in got][0] == ".pedacito/rules/api.md"
     assert any(s == "src/api/AGENTS.md" and "shared client" in t for s, t in got)
@@ -94,10 +94,10 @@ def test_skills_catalog_load_override_and_cap(tmp_path, home):
     root = tmp_path / "p"
     (root / ".pedacito" / "skills" / "deploy").mkdir(parents=True)
     (root / ".pedacito" / "skills" / "deploy" / "SKILL.md").write_text(
-        "---\nname: deploy\ndescription: Ship a release\n---\n1. tag\n2. push\n")
+        "---\nname: deploy\ndescription: Ship a release\n---\n1. tag\n2. push\n", encoding="utf-8")
     (root / ".pedacito" / "skills" / "add-a-test").mkdir(parents=True)
     (root / ".pedacito" / "skills" / "add-a-test" / "SKILL.md").write_text(
-        "---\nname: add-a-test\ndescription: Project-specific test recipe\n---\nuse ward\n")
+        "---\nname: add-a-test\ndescription: Project-specific test recipe\n---\nuse ward\n", encoding="utf-8")
     cat = skills.catalog(root, Config(), task="please deploy a release")
     assert cat.startswith("SKILLS")
     assert cat.index("- deploy:") < cat.index("- find-dead-code:")      # relevant first
@@ -127,10 +127,10 @@ def test_git_tool_context_and_cochange(tmp_path):
     _git(root, "init", "-q")
     _git(root, "add", "-A")
     _git(root, "commit", "-qm", "first commit")
-    (root / "a.py").write_text("def a():\n    return 2\n")
-    (root / "b.py").write_text("x = 2\n")
+    (root / "a.py").write_text("def a():\n    return 2\n", encoding="utf-8")
+    (root / "b.py").write_text("x = 2\n", encoding="utf-8")
     _git(root, "commit", "-qam", "touch both")
-    (root / "a.py").write_text("def a():\n    return 3\n")
+    (root / "a.py").write_text("def a():\n    return 3\n", encoding="utf-8")
     cfg = Config()
     assert "uncommitted: a.py" in gitinfo.preamble(root, cfg)
     assert "touch both" in gitinfo.preamble(root, cfg)
@@ -162,10 +162,10 @@ def test_git_conflict_detection(tmp_path):
     _git(root, "add", "-A")
     _git(root, "commit", "-qm", "base")
     _git(root, "checkout", "-qb", "side")
-    (root / "a.py").write_text("x = 2\n")
+    (root / "a.py").write_text("x = 2\n", encoding="utf-8")
     _git(root, "commit", "-qam", "side")
     _git(root, "checkout", "-q", "main")
-    (root / "a.py").write_text("x = 3\n")
+    (root / "a.py").write_text("x = 3\n", encoding="utf-8")
     _git(root, "commit", "-qam", "main")
     subprocess.run(["git", "-C", str(root), "merge", "side"], capture_output=True)
     assert gitinfo.has_conflicts(root) and gitinfo.has_conflicts(root, "a.py")
@@ -384,13 +384,13 @@ def test_prompt_overrides_are_loaded_and_fingerprinted(tmp_path, home):
     cfg._root = str(tmp_path)
     base = prompts.fingerprint(cfg)
     (tmp_path / ".pedacito" / "prompts").mkdir(parents=True)
-    (tmp_path / ".pedacito" / "prompts" / "gather.md").write_text("CUSTOM GATHER BRIEF")
-    (tmp_path / ".pedacito" / "prompts" / "edit_format.md").write_text("CUSTOM EDIT FORMAT")
+    (tmp_path / ".pedacito" / "prompts" / "gather.md").write_text("CUSTOM GATHER BRIEF", encoding="utf-8")
+    (tmp_path / ".pedacito" / "prompts" / "edit_format.md").write_text("CUSTOM EDIT FORMAT", encoding="utf-8")
     assert prompts.gather_system(cfg, GATHER_BASE, TOOL_HELP) == "CUSTOM GATHER BRIEF"
     assert prompts.edit_format(cfg, EDIT_FORMAT) == "CUSTOM EDIT FORMAT"
     assert "CUSTOM EDIT FORMAT" in prompts.answer_system(cfg, EDIT_FORMAT)
     # an answer override replaces the WHOLE brief -- test rules included
-    (tmp_path / ".pedacito" / "prompts" / "answer.md").write_text("CUSTOM ANSWER BRIEF")
+    (tmp_path / ".pedacito" / "prompts" / "answer.md").write_text("CUSTOM ANSWER BRIEF", encoding="utf-8")
     assert prompts.answer_system(cfg, EDIT_FORMAT,
                                  task="write tests") == "CUSTOM ANSWER BRIEF"
     assert prompts.fingerprint(cfg) != base
@@ -412,7 +412,7 @@ def test_test_command_detection(tmp_path, files, cmd):
     for rel, text in files.items():
         p = tmp_path / rel
         p.parent.mkdir(parents=True, exist_ok=True)
-        p.write_text(text)
+        p.write_text(text, encoding="utf-8")
     got = testsel.detect_test_command(tmp_path, Config())
     assert (cmd in got) if cmd else got == ""
 
@@ -497,7 +497,7 @@ def test_impacted_tests_includes_a_new_test_file_not_indexed_yet(tmp_path):
         "tests/test_core.py": "def test_core():\n    assert True\n",
     })
     new_test = root / "tests" / "test_core_tables.py"
-    new_test.write_text("def test_table():\n    assert True\n")
+    new_test.write_text("def test_table():\n    assert True\n", encoding="utf-8")
     picked = [t for t, _w in testsel.impacted_tests(
         idx, ["tests/test_core_tables.py"])]
     assert picked == ["tests/test_core_tables.py"]
@@ -526,7 +526,7 @@ def test_node_test_detection_and_narrowing(tmp_path):
     """Zero-dependency Node projects get `node --test` without a fabricated
     package.json, and narrowing filters non-JS entries out."""
     (tmp_path / "tests").mkdir()
-    (tmp_path / "tests" / "game.test.js").write_text("// t\n")
+    (tmp_path / "tests" / "game.test.js").write_text("// t\n", encoding="utf-8")
     assert testsel.detect_test_command(tmp_path, Config()) == "node --test"
     assert testsel.narrow_command(
         "node --test", ["tests/game.test.js", "notes.md"]) \
@@ -535,7 +535,7 @@ def test_node_test_detection_and_narrowing(tmp_path):
         == ("node --test", False)
     # A declared package.json test script still wins over the bare runner.
     (tmp_path / "package.json").write_text(
-        '{"scripts": {"test": "vitest run"}}')
+        '{"scripts": {"test": "vitest run"}}', encoding="utf-8")
     assert testsel.detect_test_command(tmp_path, Config()) == "npm test"
 
 
@@ -631,9 +631,9 @@ def test_cards_persist_expire_and_only_fill_unset_settings(home, monkeypatch):
     off = Config()
     off.use_model_card = False
     assert modelcard.apply(off) is None
-    stale = json.loads(modelcard._path().read_text())
+    stale = json.loads(modelcard._path().read_text(encoding="utf-8"))
     stale[modelcard.card_key(cfg)]["ts"] -= 40 * 86400
-    modelcard._path().write_text(json.dumps(stale))
+    modelcard._path().write_text(json.dumps(stale), encoding="utf-8")
     assert modelcard.load(cfg) is None and modelcard.load(cfg, allow_stale=True)
 
 
@@ -962,7 +962,7 @@ def test_recovered_edits_also_run_the_post_edit_test_loop(tmp_path, monkeypatch)
     client = Stub()
     tr = loop.run_task(root, cfg, client, Agent(idx, client, cfg), idx,
                        "bump player", apply=True, review=False)
-    assert tr.applied and "x = 2" in (root / "player.py").read_text()
+    assert tr.applied and "x = 2" in (root / "player.py").read_text(encoding="utf-8")
     assert any("player.py" in " ".join(f) for f in ran), \
         "the recovered edit ran no post-edit tests"
 
@@ -1036,8 +1036,8 @@ def test_cli_memory_prune_tests_skills_and_trust(tmp_path, home, capsys):
     root = tmp_path / "p"
     (root / "tests").mkdir(parents=True)
     (root / "pkg").mkdir()
-    (root / "pkg" / "core.py").write_text("def core():\n    return 1\n")
-    (root / "tests" / "test_core.py").write_text("from pkg.core import core\n")
+    (root / "pkg" / "core.py").write_text("def core():\n    return 1\n", encoding="utf-8")
+    (root / "tests" / "test_core.py").write_text("from pkg.core import core\n", encoding="utf-8")
     code, out, _ = _run(["memory", str(root), "--add", "command: run pytest -q"], capsys)
     assert code == 0 and "remembered under commands" in out
     code, out, _ = _run(["memory", str(root)], capsys)
@@ -1056,7 +1056,7 @@ def test_cli_memory_prune_tests_skills_and_trust(tmp_path, home, capsys):
         workspace.write_session(root, f"t{i}", [], "r", [], None, f"2026010{i}-000000")
     code, out, _ = _run(["prune", str(root), "--keep-sessions", "2", "--dry-run"], capsys)
     assert "would remove: 2 session(s)" in out
-    (root / ".pedacito.toml").write_text('auto_verify = "echo hi"\n')
+    (root / ".pedacito.toml").write_text('auto_verify = "echo hi"\n', encoding="utf-8")
     code, out, _ = _run(["trust", str(root), "--yes"], capsys)
     assert code == 0 and "Trusted" in out and config_mod.is_trusted(root / ".pedacito.toml")
 
@@ -1070,7 +1070,7 @@ def test_cli_eval_list_and_map_task(tmp_path, home, capsys, monkeypatch):
     files["core/sched.py"] = "def is_leech(n):\n    return n >= 8\n"
     for rel, text in files.items():
         (root / rel).parent.mkdir(parents=True, exist_ok=True)
-        (root / rel).write_text(text)
+        (root / rel).write_text(text, encoding="utf-8")
     index_mod.build([str(root)], Config(), client=None, summarise=False, root=root,
                     verbose=False)
     code, out, err = _run(["map", str(root), "--tier", "ranked", "-t",
@@ -1133,12 +1133,12 @@ def test_plan_sources_and_tests_use_cross_language_conventions(tmp_path):
     assert [f.path for f in plan.tests] == ["tests/test_app.py", "web/app.test.js",
                                             "store/store_test.go"]
     (tmp_path / "web").mkdir()
-    (tmp_path / "web" / "app.js").write_text("function a() { return 1; }\n")
+    (tmp_path / "web" / "app.js").write_text("function a() { return 1; }\n", encoding="utf-8")
     (tmp_path / "src").mkdir()
-    (tmp_path / "src" / "app.py").write_text("def f():\n    return 1\n")
+    (tmp_path / "src" / "app.py").write_text("def f():\n    return 1\n", encoding="utf-8")
     p2 = Plan("demo", "s", [PlannedFile("web/app.js"), PlannedFile("src/app.py"),
                             PlannedFile("README.md")])
-    (tmp_path / "README.md").write_text("# hi\n")
+    (tmp_path / "README.md").write_text("# hi\n", encoding="utf-8")
     idx = skeleton_index(tmp_path, p2, Config())
     assert {c.qualname for c in idx.chunks} >= {"a", "f"}      # the JS file is chunked too
     assert "README.md" not in idx.files

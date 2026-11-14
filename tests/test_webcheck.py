@@ -284,8 +284,8 @@ def test_run_loop_notices_webcheck_findings(tmp_path, monkeypatch, capsys):
     assert seen_files == [["index.html"]]  # scoped to the changed files
     err = capsys.readouterr().err
     assert "[webcheck]" in err and "boom" in err
-    assert "webcheck:" in workspace.run_log_path(tmp_path).read_text()
-    assert "- [x] Add the score display" in plan.read_text()
+    assert "webcheck:" in workspace.run_log_path(tmp_path).read_text(encoding="utf-8")
+    assert "- [x] Add the score display" in plan.read_text(encoding="utf-8")
 
 
 def test_run_loop_skips_webcheck_for_non_web_changes(tmp_path, monkeypatch):

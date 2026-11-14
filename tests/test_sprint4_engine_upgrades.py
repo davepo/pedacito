@@ -392,7 +392,7 @@ def test_ratchet_begin_links_then_rollback_restores(tmp_path):
         pytest.skip("filesystem forbids hard links (copy2 fallback)")
     (tmp_path / "a.py").unlink()             # simulate a step that deleted it
     report = ratchet.rollback(tmp_path, 1)
-    assert (tmp_path / "a.py").read_text() == "orig\n"
+    assert (tmp_path / "a.py").read_text(encoding="utf-8") == "orig\n"
     assert "a.py" in report["restored"]
 
 
@@ -400,17 +400,17 @@ def test_ratchet_snapshot_survives_later_edits(tmp_path):
     _pw(tmp_path / "a.py", "v1\n")
     ratchet.begin(tmp_path, 1)
     fileio.write(tmp_path / "a.py", "v2\n")  # atomic replace: snapshot holds v1
-    assert (ratchet.step_dir(tmp_path, 1) / "a.py").read_text() == "v1\n"
-    assert (tmp_path / "a.py").read_text() == "v2\n"
+    assert (ratchet.step_dir(tmp_path, 1) / "a.py").read_text(encoding="utf-8") == "v1\n"
+    assert (tmp_path / "a.py").read_text(encoding="utf-8") == "v2\n"
     report = ratchet.rollback(tmp_path, 1)
-    assert (tmp_path / "a.py").read_text() == "v1\n"
+    assert (tmp_path / "a.py").read_text(encoding="utf-8") == "v1\n"
     assert "a.py" in report["restored"]
 
 
 def test_ratchet_rollback_deletes_step_creations(tmp_path):
     _pw(tmp_path / "a.py", "v1\n")
     ratchet.begin(tmp_path, 1)
-    (tmp_path / "new.py").write_text("x = 1\n")
+    (tmp_path / "new.py").write_text("x = 1\n", encoding="utf-8")
     ratchet.rollback(tmp_path, 1)
     assert not (tmp_path / "new.py").exists()
 
@@ -424,7 +424,7 @@ def test_fileio_write_is_atomic(tmp_path):
     # the invariant is that write_bytes preserves the mode the platform reports.
     mode_before = stat.S_IMODE(f.stat().st_mode)
     fileio.write(f, "v2")
-    assert f.read_text() == "v2"
+    assert f.read_text(encoding="utf-8") == "v2"
     assert f.stat().st_ino != inode_before          # fresh inode, not mutated
     assert stat.S_IMODE(f.stat().st_mode) == mode_before  # permissions preserved
     assert not list(tmp_path.glob("*.pedacito-tmp"))
@@ -436,5 +436,5 @@ def test_fileio_write_through_symlink_updates_target(tmp_path):
     link = tmp_path / "link.txt"
     link.symlink_to(target)
     fileio.write(link, "v2")
-    assert target.read_text() == "v2"
+    assert target.read_text(encoding="utf-8") == "v2"
     assert link.is_symlink()

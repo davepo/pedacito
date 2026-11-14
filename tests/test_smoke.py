@@ -243,7 +243,7 @@ def test_rename_pair_applies(tmp_path):
     assert all(r.ok for r in results), [r.message for r in results]
     assert (tmp_path / "new_name.py").is_file()
     assert not (tmp_path / "old_name.py").exists()
-    assert 'print("hi")' in (tmp_path / "new_name.py").read_text()
+    assert 'print("hi")' in (tmp_path / "new_name.py").read_text(encoding="utf-8")
 
 
 def test_rename_pairs_by_name_affinity_not_alphabet(tmp_path):
@@ -276,9 +276,9 @@ def test_rename_pairs_by_name_affinity_not_alphabet(tmp_path):
         "pass-1 pairing must rank by name affinity, not alphabetically"
     results = edits.apply_edits(tmp_path, blocks, backup=False, dry_run=False)
     assert all(r.ok for r in results), [r.message for r in results]
-    assert "real content" in (tmp_path / "b_x.py").read_text()
+    assert "real content" in (tmp_path / "b_x.py").read_text(encoding="utf-8")
     assert not (tmp_path / "x.py").exists()
-    assert "real content" not in (tmp_path / "a.py").read_text()
+    assert "real content" not in (tmp_path / "a.py").read_text(encoding="utf-8")
 
 
 def test_rename_with_opening_lines_search(tmp_path):
@@ -305,7 +305,7 @@ def test_rename_with_opening_lines_search(tmp_path):
     assert all(r.ok for r in results), [r.message for r in results]
     assert (tmp_path / "new_name.py").is_file()
     assert not (tmp_path / "old_name.py").exists()
-    assert "line5" in (tmp_path / "new_name.py").read_text()
+    assert "line5" in (tmp_path / "new_name.py").read_text(encoding="utf-8")
 
 
 def test_rename_with_midfile_clear_block(tmp_path):
@@ -334,7 +334,7 @@ def test_rename_with_midfile_clear_block(tmp_path):
     assert all(r.ok for r in results), [r.message for r in results]
     assert (tmp_path / "renamed.html").is_file()
     assert not (tmp_path / "index.html").exists()
-    assert "real body content" in (tmp_path / "renamed.html").read_text()
+    assert "real body content" in (tmp_path / "renamed.html").read_text(encoding="utf-8")
 
 
 def test_rename_placeholder_already_a_comment(tmp_path):
@@ -365,7 +365,7 @@ def test_rename_placeholder_already_a_comment(tmp_path):
     assert all(r.ok for r in results), [r.message for r in results]
     assert (tmp_path / "subjuntivo-imperativo.js").is_file()
     assert not (tmp_path / "sentences.js").exists()
-    body = (tmp_path / "subjuntivo-imperativo.js").read_text()
+    body = (tmp_path / "subjuntivo-imperativo.js").read_text(encoding="utf-8")
     assert "/* placeholder" in body
     assert "var s = ['uno'];" in body
 
@@ -406,7 +406,7 @@ def test_rename_into_graveyard_moves_full_content(tmp_path):
         [r.message for r in results]
     assert not (tmp_path / "dead.py").exists(), \
         "source was not removed -- this is the copy-instead-of-move bug"
-    body = (tmp_path / "graveyard/dead.py").read_text()
+    body = (tmp_path / "graveyard/dead.py").read_text(encoding="utf-8")
     assert "# Moved from dead.py" in body
     assert "def helper():" in body and "return math.pi" in body
 
@@ -433,7 +433,7 @@ def test_rename_nested_source_into_graveyard(tmp_path):
     assert by_file["graveyard/game/enemies.py"].renames_from == \
         ("game/enemies.py",), [r.message for r in results]
     assert not (tmp_path / "game" / "enemies.py").exists()
-    assert "class Enemy:" in (tmp_path / "graveyard/game/enemies.py").read_text()
+    assert "class Enemy:" in (tmp_path / "graveyard/game/enemies.py").read_text(encoding="utf-8")
 
 
 def test_orphan_placeholder_never_truncates_the_live_source(tmp_path):
@@ -459,7 +459,7 @@ def test_orphan_placeholder_never_truncates_the_live_source(tmp_path):
                                 backup=False, dry_run=False)
     assert results and not any(r.ok for r in results), \
         [r.message for r in results]
-    assert (tmp_path / "notes.md").read_text() == original
+    assert (tmp_path / "notes.md").read_text(encoding="utf-8") == original
     assert not (tmp_path / "docs" / "notes.md").exists()
 
 
@@ -501,7 +501,7 @@ def test_search_block_matches_at_eof_with_newline_tail(tmp_path):
     results = edits.apply_edits(tmp_path, edits.parse_edits(reply),
                                 backup=False, dry_run=False)
     assert results[0].ok, results[0].message
-    assert (tmp_path / "a.py").read_text() == "x = 2\n"
+    assert (tmp_path / "a.py").read_text(encoding="utf-8") == "x = 2\n"
 
 
 def test_empty_search_overwrites_existing_file(tmp_path):
@@ -521,8 +521,8 @@ def test_empty_search_overwrites_existing_file(tmp_path):
     results = edits.apply_edits(tmp_path, edits.parse_edits(reply),
                                 backup=False, dry_run=False)
     assert results[0].ok, results[0].message
-    assert "return 42" in (tmp_path / "assets.py").read_text()
-    assert "raise NotImplementedError" not in (tmp_path / "assets.py").read_text()
+    assert "return 42" in (tmp_path / "assets.py").read_text(encoding="utf-8")
+    assert "raise NotImplementedError" not in (tmp_path / "assets.py").read_text(encoding="utf-8")
 
 
 def test_multiple_blocks_same_file_apply_sequentially(tmp_path):
@@ -550,7 +550,7 @@ def test_multiple_blocks_same_file_apply_sequentially(tmp_path):
     assert len(results) == 1, [r.message for r in results]
     assert results[0].ok, results[0].message
     assert "3 block(s)" in results[0].message
-    body = (tmp_path / "m.py").read_text()
+    body = (tmp_path / "m.py").read_text(encoding="utf-8")
     assert "import math" in body
     assert "x = 10" in body and "y = 20" in body
 
@@ -569,7 +569,7 @@ def test_later_block_anchors_on_earlier_replacement(tmp_path):
                                 backup=False, dry_run=False)
     assert len(results) == 1
     assert results[0].ok, results[0].message
-    assert (tmp_path / "s.py").read_text() == "value = 2\nfinal = False\n"
+    assert (tmp_path / "s.py").read_text(encoding="utf-8") == "value = 2\nfinal = False\n"
 
 
 def test_multiblock_dry_run_yields_one_cumulative_result(tmp_path):
@@ -606,7 +606,7 @@ def test_chunked_creation_still_concatenates_parts(tmp_path):
                                 backup=False, dry_run=False)
     assert len(results) == 1
     assert results[0].ok, results[0].message
-    assert (tmp_path / "new.py").read_text() == "import os\n\nx = 1\n"
+    assert (tmp_path / "new.py").read_text(encoding="utf-8") == "import os\n\nx = 1\n"
 
 
 def test_empty_search_in_mixed_group_replaces_whole_file(tmp_path):
@@ -625,7 +625,7 @@ def test_empty_search_in_mixed_group_replaces_whole_file(tmp_path):
                                 backup=False, dry_run=False)
     assert len(results) == 1
     assert results[0].ok, results[0].message
-    assert (tmp_path / "stub.py").read_text() == "def f():\n    return 1\n\n\ng = 3\n"
+    assert (tmp_path / "stub.py").read_text(encoding="utf-8") == "def f():\n    return 1\n\n\ng = 3\n"
 
 
 def test_edit_of_already_broken_file_applies_with_warning(tmp_path):
@@ -644,7 +644,7 @@ def test_edit_of_already_broken_file_applies_with_warning(tmp_path):
     assert results[0].ok, results[0].message
     assert "WARNING" in results[0].message
     assert "does not parse" in results[0].message
-    assert (tmp_path / "broken.py").read_text() == "def f(::\n    pass\n"
+    assert (tmp_path / "broken.py").read_text(encoding="utf-8") == "def f(::\n    pass\n"
 
     # A CLEAN file broken by the edit is still refused and left untouched.
     _write(tmp_path / "clean.py", "x = 1\n")
@@ -654,7 +654,7 @@ def test_edit_of_already_broken_file_applies_with_warning(tmp_path):
                                 backup=False, dry_run=False)
     assert not results[0].ok
     assert "not written" in results[0].message
-    assert (tmp_path / "clean.py").read_text() == "x = 1\n"
+    assert (tmp_path / "clean.py").read_text(encoding="utf-8") == "x = 1\n"
 
     # A creation that does not parse is still aborted outright.
     reply = ("--- FILE: new.py\n<<<<<<< SEARCH\n=======\ndef f(:\n"
@@ -788,7 +788,7 @@ def test_apply_reasks_when_truncated_before_any_block(tmp_path):
     results, _ = agent.apply(reply, dry_run=False,
                              task="implement a.py", gathered="")
     assert all(r.ok for r in results), [r.message for r in results]
-    assert "return 42" in (tmp_path / "a.py").read_text()
+    assert "return 42" in (tmp_path / "a.py").read_text(encoding="utf-8")
     assert client.prompts, "a cut-off reply with no complete block must re-ask"
     assert "CUT OFF" in client.prompts[0]
 
@@ -866,7 +866,7 @@ def test_truncated_repair_reply_gets_one_reask(tmp_path):
     assert len(client.prompts) == 2, "truncated repair did not trigger a re-ask"
     assert "CUT OFF" in client.prompts[1]
     assert any(r.ok for r in results), [r.message for r in results]
-    assert "return 42" in (tmp_path / "stub.js").read_text()
+    assert "return 42" in (tmp_path / "stub.js").read_text(encoding="utf-8")
 
 
 def test_repair_prose_give_up_is_announced(tmp_path, capsys):
@@ -981,7 +981,7 @@ def test_window_rewrite_guard(tmp_path):
     obs = tools_mod.tool_write(idx, cfg, "big.js", excerpt)
     assert obs.startswith("ERROR"), obs
     assert "PARTIAL read" in obs or "lost fragment" in obs
-    assert len((tmp_path / "big.js").read_text().splitlines()) == 200, \
+    assert len((tmp_path / "big.js").read_text(encoding="utf-8").splitlines()) == 200, \
         "refused overwrite must not touch the file"
 
     # Re-quoting the whole file minus one line: not a >2x shrink, allowed.
@@ -1004,7 +1004,7 @@ def test_window_rewrite_guard(tmp_path):
                                "\n".join(small_lines[:3]))
     assert obs.startswith("ERROR"), obs
     assert "lost" in obs.lower() or "fragment" in obs.lower()
-    assert (tmp_path / "small.js").read_text() == \
+    assert (tmp_path / "small.js").read_text(encoding="utf-8") == \
         "\n".join(small_lines) + "\n"
     assert tools_mod.tool_write(
         idx, cfg, "small.js",
@@ -1040,7 +1040,7 @@ def test_write_guard_refuses_lost_head_fragment(tmp_path):
         "    return 0",
     ]
     original = "\n".join(python_lines) + "\n"
-    (tmp_path / "reporting.py").write_text(original)
+    (tmp_path / "reporting.py").write_text(original, encoding="utf-8")
     fragment = "\n".join([
         "    return 0",
         "",
@@ -1051,7 +1051,7 @@ def test_write_guard_refuses_lost_head_fragment(tmp_path):
     obs = tools_mod.tool_write(idx, cfg, "reporting.py", fragment)
     assert obs.startswith("ERROR"), obs
     assert "lost fragment" in obs or "beginning or end" in obs
-    assert (tmp_path / "reporting.py").read_text() == original, \
+    assert (tmp_path / "reporting.py").read_text(encoding="utf-8") == original, \
         "refused fragment overwrite must not touch the file"
 
     # A genuine rewrite that copies no original line is still allowed.
@@ -1080,14 +1080,14 @@ def test_write_guard_refuses_chunked_tail_loss(tmp_path):
     idx = FakeIndex()
     lines = [f"def helper_{i}(): return {i}" for i in range(40)]
     original = "\n".join(lines) + "\n"
-    (tmp_path / "core.py").write_text(original)
+    (tmp_path / "core.py").write_text(original, encoding="utf-8")
 
     # First 25 of 40 lines: not a tiny fragment, not a >half shrink.
     chunk = "\n".join(lines[:25])
     obs = tools_mod.tool_write(idx, cfg, "core.py", chunk)
     assert obs.startswith("ERROR"), obs
     assert "lost fragment" in obs or "drops top-level" in obs
-    assert (tmp_path / "core.py").read_text() == original
+    assert (tmp_path / "core.py").read_text(encoding="utf-8") == original
 
     # A genuine rewrite with invented content still applies.
     fresh = "\n".join(f"def brand_new_{i}(): return {i}" for i in range(12))
@@ -1117,24 +1117,24 @@ def test_write_refuses_tiny_fragment_and_invalid_syntax(tmp_path):
         + [f"def helper_{i}(): return {i}" for i in range(20)]
         + ["def cmd_report(args):", "    return 0"]
     ) + "\n"
-    (tmp_path / "reporting.py").write_text(original)
+    (tmp_path / "reporting.py").write_text(original, encoding="utf-8")
 
     # 2-line fragment (also invalid syntax) -> refused, file intact.
     obs = tools_mod.tool_write(
         idx, cfg, "reporting.py",
         'def format_seconds(value)\n    return f"{value}s"')
     assert obs.startswith("ERROR"), obs
-    assert (tmp_path / "reporting.py").read_text() == original
+    assert (tmp_path / "reporting.py").read_text(encoding="utf-8") == original
 
     # Full-size rewrite with a syntax error -> refused by the syntax gate.
     big_broken = "\n".join(f"def brand_new_{i}(:" for i in range(20))
     obs = tools_mod.tool_write(idx, cfg, "reporting.py", big_broken)
     assert obs.startswith("ERROR"), obs
     assert "syntax" in obs.lower()
-    assert (tmp_path / "reporting.py").read_text() == original
+    assert (tmp_path / "reporting.py").read_text(encoding="utf-8") == original
 
     # A broken file may still be repaired by a write.
-    (tmp_path / "reporting.py").write_text("def broken(:\n")
+    (tmp_path / "reporting.py").write_text("def broken(:\n", encoding="utf-8")
     assert tools_mod.tool_write(
         idx, cfg, "reporting.py",
         "\n".join(f"def fixed_{i}(): return {i}" for i in range(12))
@@ -1148,7 +1148,7 @@ def test_empty_search_overwrite_gets_the_write_guard(tmp_path):
     erase everything outside the quoted window through the edit path."""
     original = "\n".join(f"def helper_{i}(): return {i}"
                          for i in range(40)) + "\n"
-    (tmp_path / "mod.py").write_text(original)
+    (tmp_path / "mod.py").write_text(original, encoding="utf-8")
 
     # A verbatim 10-line window over a 40-line file: refused, file untouched.
     window = "\n".join(f"def helper_{i}(): return {i}" for i in range(10, 20))
@@ -1159,7 +1159,7 @@ def test_empty_search_overwrite_gets_the_write_guard(tmp_path):
     assert len(results) == 1 and not results[0].ok
     assert ("PARTIAL read" in results[0].message
             or "lost fragment" in results[0].message)
-    assert (tmp_path / "mod.py").read_text() == original
+    assert (tmp_path / "mod.py").read_text(encoding="utf-8") == original
 
     # The same guard covers an empty-SEARCH block mixed with a real edit.
     reply = ("--- FILE: mod.py\n<<<<<<< SEARCH\ndef helper_0(): return 0\n"
@@ -1169,7 +1169,7 @@ def test_empty_search_overwrite_gets_the_write_guard(tmp_path):
     results = edits.apply_edits(tmp_path, edits.parse_edits(reply),
                                 backup=False)
     assert any(not r.ok for r in results)
-    assert (tmp_path / "mod.py").read_text() == original
+    assert (tmp_path / "mod.py").read_text(encoding="utf-8") == original
 
     # A genuine whole-file rewrite (invented content) still applies.
     fresh = "\n".join(f"def brand_new_{i}(): return {i}" for i in range(12))
@@ -1178,7 +1178,7 @@ def test_empty_search_overwrite_gets_the_write_guard(tmp_path):
     results = edits.apply_edits(tmp_path, edits.parse_edits(reply),
                                 backup=False)
     assert len(results) == 1 and results[0].ok
-    assert (tmp_path / "mod.py").read_text().startswith("def brand_new_0")
+    assert (tmp_path / "mod.py").read_text(encoding="utf-8").startswith("def brand_new_0")
 
 
 def test_single_line_reapply_after_earlier_landed_block(tmp_path):
@@ -1192,7 +1192,7 @@ def test_single_line_reapply_after_earlier_landed_block(tmp_path):
         "def clamp(v, lo, hi):\n"
         "    return max(lo, min(hi, v))\n"
         "\n"
-        "WIDTH = 10\n")
+        "WIDTH = 10\n", encoding="utf-8")
     reply = (
         "--- FILE: gen.py\n<<<<<<< SEARCH\n"
         "def clamp(v, lo, hi):\n    return v\n"
@@ -1204,14 +1204,14 @@ def test_single_line_reapply_after_earlier_landed_block(tmp_path):
                                 backup=False)
     assert len(results) == 1 and results[0].ok, results
     assert "already applied" in results[0].message
-    assert (tmp_path / "gen.py").read_text() == (
+    assert (tmp_path / "gen.py").read_text(encoding="utf-8") == (
         "def clamp(v, lo, hi):\n"
         "    return max(lo, min(hi, v))\n"
         "\n"
         "WIDTH = 10\n")
 
     # Without an earlier landed block the single-line miss stays a failure.
-    (tmp_path / "flag.py").write_text("FLAG = True\nOTHER = 1\n")
+    (tmp_path / "flag.py").write_text("FLAG = True\nOTHER = 1\n", encoding="utf-8")
     reply = ("--- FILE: flag.py\n<<<<<<< SEARCH\nFLAG = False\n=======\n"
              "FLAG = True\n>>>>>>> REPLACE\n")
     res = edits.apply_edits(tmp_path, edits.parse_edits(reply), backup=False)
@@ -1227,7 +1227,7 @@ def test_anchored_whole_file_replacement_gets_the_write_guard(tmp_path):
     the same content."""
     original = "\n".join(f"def helper_{i}(): return {i}"
                          for i in range(40)) + "\n"
-    (tmp_path / "mod.py").write_text(original)
+    (tmp_path / "mod.py").write_text(original, encoding="utf-8")
 
     window = "\n".join(f"def helper_{i}(): return {i}" for i in range(10, 20))
     reply = ("--- FILE: mod.py LINES 1-40\n<<<<<<< SEARCH\n=======\n"
@@ -1237,7 +1237,7 @@ def test_anchored_whole_file_replacement_gets_the_write_guard(tmp_path):
     assert len(results) == 1 and not results[0].ok
     assert ("PARTIAL read" in results[0].message
             or "lost fragment" in results[0].message)
-    assert (tmp_path / "mod.py").read_text() == original
+    assert (tmp_path / "mod.py").read_text(encoding="utf-8") == original
 
     # A genuine whole-file rewrite (invented content) still applies.
     fresh = "\n".join(f"def brand_new_{i}(): return {i}" for i in range(12))
@@ -1246,7 +1246,7 @@ def test_anchored_whole_file_replacement_gets_the_write_guard(tmp_path):
     results = edits.apply_edits(tmp_path, edits.parse_edits(reply),
                                 backup=False)
     assert len(results) == 1 and results[0].ok
-    assert (tmp_path / "mod.py").read_text().startswith("def brand_new_0")
+    assert (tmp_path / "mod.py").read_text(encoding="utf-8").startswith("def brand_new_0")
 
 
 def test_reapplied_block_scores_already_applied(tmp_path):
@@ -1254,21 +1254,21 @@ def test_reapplied_block_scores_already_applied(tmp_path):
     already landed (a gather write mutated the file before the answer phase)
     used to fail the whole file; it now scores as a clean 'already applied'
     and leaves the bytes alone."""
-    (tmp_path / "mod.py").write_text("def f():\n    return 1\n")
+    (tmp_path / "mod.py").write_text("def f():\n    return 1\n", encoding="utf-8")
     reply = ("--- FILE: mod.py\n<<<<<<< SEARCH\ndef f():\n    return 1\n"
              "=======\ndef f():\n    return 2\n>>>>>>> REPLACE\n")
     first = edits.apply_edits(tmp_path, edits.parse_edits(reply), backup=False)
     assert first[0].ok
-    assert (tmp_path / "mod.py").read_text() == "def f():\n    return 2\n"
+    assert (tmp_path / "mod.py").read_text(encoding="utf-8") == "def f():\n    return 2\n"
 
     again = edits.apply_edits(tmp_path, edits.parse_edits(reply), backup=False)
     assert len(again) == 1 and again[0].ok
     assert "already applied" in again[0].message
-    assert (tmp_path / "mod.py").read_text() == "def f():\n    return 2\n"
+    assert (tmp_path / "mod.py").read_text(encoding="utf-8") == "def f():\n    return 2\n"
 
     # A single-line REPLACE is never treated as already-applied: too
     # ambiguous, so the miss stays a real failure.
-    (tmp_path / "flag.py").write_text("FLAG = True\nOTHER = 1\n")
+    (tmp_path / "flag.py").write_text("FLAG = True\nOTHER = 1\n", encoding="utf-8")
     reply = ("--- FILE: flag.py\n<<<<<<< SEARCH\nFLAG = False\n=======\n"
              "FLAG = True\n>>>>>>> REPLACE\n")
     res = edits.apply_edits(tmp_path, edits.parse_edits(reply), backup=False)
@@ -1282,21 +1282,21 @@ def test_repeat_append_block_is_not_duplicated(tmp_path):
     again -- the suite ended with the same test pair three times. Once the
     REPLACE content sits verbatim at the matched span, the block scores as
     already applied instead of duplicating it."""
-    (tmp_path / "test_app.py").write_text("def test_a():\n    assert True\n")
+    (tmp_path / "test_app.py").write_text("def test_a():\n    assert True\n", encoding="utf-8")
     reply = ("--- FILE: test_app.py\n"
              "<<<<<<< SEARCH\ndef test_a():\n    assert True\n=======\n"
              "def test_a():\n    assert True\n\n\n"
              "def test_b():\n    assert not False\n>>>>>>> REPLACE\n")
     first = edits.apply_edits(tmp_path, edits.parse_edits(reply), backup=False)
     assert first[0].ok
-    once = (tmp_path / "test_app.py").read_text()
+    once = (tmp_path / "test_app.py").read_text(encoding="utf-8")
     assert once.count("def test_b") == 1
 
     for _ in range(2):                       # two repair rounds re-emit it
         again = edits.apply_edits(tmp_path, edits.parse_edits(reply),
                                   backup=False)
         assert again[0].ok and "already applied" in again[0].message
-    assert (tmp_path / "test_app.py").read_text() == once
+    assert (tmp_path / "test_app.py").read_text(encoding="utf-8") == once
 
 
 # ------------------------------------------------------------------ budgets
@@ -2057,13 +2057,14 @@ def test_hosted_configs_are_never_clamped_or_warned():
     (context - reserve). This is the regression test for deepseek runs that
     died at 'tried up to max_tokens=9600, ceiling 16384'.
     """
-    import pathlib, tempfile
+    import pathlib
+    import tempfile
     from pedacito.config import load, auto_fit, budget_warnings, is_hosted, PRESETS
 
     def mk(text):
         p = pathlib.Path(tempfile.mkdtemp()) / "c.toml"
         p.write_text(text + '\n[hardware]\n'
-                     'vram_gb = 8\n')
+                     'vram_gb = 8\n', encoding="utf-8")
         return load(explicit=p)
 
     cfg = mk('tier = "hosted"\nbase_url = "https://api.deepseek.com/v1"'
@@ -2099,7 +2100,8 @@ def test_write_step_budget_and_chunking():
     pre-flight guard, tool_write's post-write chunk note, and llm.repair_truncated_json
     salvaging an action from a mid-string-truncated reply.
     """
-    import pathlib, tempfile
+    import pathlib
+    import tempfile
     from pedacito.config import load, PRESETS
     from pedacito import tools
     from pedacito.llm import repair_truncated_json
@@ -2107,7 +2109,7 @@ def test_write_step_budget_and_chunking():
     def mk(text):
         p = pathlib.Path(tempfile.mkdtemp()) / "c.toml"
         p.write_text(text + '\n[hardware]\n'
-                     'vram_gb = 8\n')
+                     'vram_gb = 8\n', encoding="utf-8")
         return load(explicit=p)
 
     cfg = mk('tier = "hosted"\nbase_url = "https://api.deepseek.com/v1"'
@@ -2423,9 +2425,9 @@ def test_first_import_error_detects_cross_file_mismatch(tmp_path):
     pkg = tmp_path / "md2html"
     pkg.mkdir()
     (tmp_path / "main.py").write_text(
-        "from md2html.parser import parse_markdown\n")
-    (pkg / "__init__.py").write_text("from .parser import parse_markdown\n")
-    (pkg / "parser.py").write_text("def parse(text):\n    return text\n")
+        "from md2html.parser import parse_markdown\n", encoding="utf-8")
+    (pkg / "__init__.py").write_text("from .parser import parse_markdown\n", encoding="utf-8")
+    (pkg / "parser.py").write_text("def parse(text):\n    return text\n", encoding="utf-8")
     plan = scaffold.Plan("md2html", "y", files=[
         scaffold.PlannedFile("main.py", ""),
         scaffold.PlannedFile("md2html/__init__.py", ""),
@@ -2463,7 +2465,7 @@ def test_build_interface_fixes_contract_in_one_call(tmp_path):
     # Those stubs are what the skeleton writes for source files.
     scaffold.apply_skeleton(tmp_path, plan, dry_run=False,
                             verbose=False, stubs=stubs)
-    assert "parse_markdown" in (tmp_path / "parser.py").read_text()
+    assert "parse_markdown" in (tmp_path / "parser.py").read_text(encoding="utf-8")
 
 
 def test_stub_language_error_flags_wrong_language():

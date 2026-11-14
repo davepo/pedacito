@@ -81,7 +81,7 @@ def test_threads_survive_a_restart(tmp_path):
     # and ids keep counting up from the restored transcript, no collisions
     m = fresh.add_message("user", "still here")
     assert m["id"] == 2
-    assert len(json.loads(_file(tmp_path, tid).read_text())["messages"]) == 2
+    assert len(json.loads(_file(tmp_path, tid).read_text(encoding="utf-8"))["messages"]) == 2
     fresh.delete_thread(tid)
 
 
@@ -251,7 +251,7 @@ def test_clear_empties_the_thread_but_keeps_its_file(tmp_path):
     # the question-derived title goes back to a fresh timestamp
     assert st.threads[tid]["title"] in {before, after}
     assert _file(tmp_path, tid).exists()
-    assert json.loads(_file(tmp_path, tid).read_text())["messages"] == []
+    assert json.loads(_file(tmp_path, tid).read_text(encoding="utf-8"))["messages"] == []
     st.delete_thread(tid)
 
 

@@ -110,10 +110,10 @@ def _wait_pending(st, timeout=5.0):
 def test_resolve_safe_path_blocks_traversal_and_symlink_escape(tmp_path):
     root = tmp_path / "proj"
     (root / "src").mkdir(parents=True)
-    (root / "src" / "app.py").write_text("x = 1\n")
+    (root / "src" / "app.py").write_text("x = 1\n", encoding="utf-8")
     outside = tmp_path / "outside"
     outside.mkdir()
-    (outside / "passwd").write_text("root:x:0:0\n")
+    (outside / "passwd").write_text("root:x:0:0\n", encoding="utf-8")
 
     ok = security.resolve_safe_path(root, "src/app.py")
     assert ok == (root / "src" / "app.py").resolve()
@@ -157,8 +157,8 @@ def test_is_sensitive_path_allows_ordinary_files(name):
 
 
 def test_sensitive_file_never_indexed(tmp_path):
-    (tmp_path / ".env").write_text("API_KEY=super-secret\n")
-    (tmp_path / "app.py").write_text("x = 1\n")
+    (tmp_path / ".env").write_text("API_KEY=super-secret\n", encoding="utf-8")
+    (tmp_path / "app.py").write_text("x = 1\n", encoding="utf-8")
     idx = index_mod.Index(tmp_path, [])
     index_mod.reindex_file(idx, ".env", Config(), save=False)
     assert ".env" not in idx.files
@@ -414,7 +414,7 @@ def test_tool_run_without_broker_keeps_legacy_errors(tmp_path):
 
 def test_sensitive_read_blocked_without_broker(tmp_path):
     security.install_permission_hook(None)
-    (tmp_path / ".env").write_text("API_KEY=super-secret\n")
+    (tmp_path / ".env").write_text("API_KEY=super-secret\n", encoding="utf-8")
     cfg = Config()
     cfg.allow_shell = True
     obs = tools.tool_read(index_mod.Index(tmp_path, []), cfg, ".env", 1, 0)
@@ -424,7 +424,7 @@ def test_sensitive_read_blocked_without_broker(tmp_path):
 
 def test_sensitive_read_with_broker_allow_once(bare_broker, tmp_path):
     st = bare_broker
-    (tmp_path / ".env").write_text("API_KEY=super-secret\n")
+    (tmp_path / ".env").write_text("API_KEY=super-secret\n", encoding="utf-8")
     cfg = Config()
     results = {}
 

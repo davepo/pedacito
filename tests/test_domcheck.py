@@ -24,20 +24,20 @@ requires_pw = pytest.mark.skipif(
 
 def test_find_entry_prefers_root_index(tmp_path):
     (tmp_path / "sub").mkdir()
-    (tmp_path / "sub" / "index.html").write_text("<html></html>")
-    (tmp_path / "index.html").write_text("<html></html>")
+    (tmp_path / "sub" / "index.html").write_text("<html></html>", encoding="utf-8")
+    (tmp_path / "index.html").write_text("<html></html>", encoding="utf-8")
     assert domcheck.find_entry(tmp_path) == "index.html"
 
 
 def test_find_entry_prefers_module_page_over_plain(tmp_path):
-    (tmp_path / "about.html").write_text("<html><body>hi</body></html>")
+    (tmp_path / "about.html").write_text("<html><body>hi</body></html>", encoding="utf-8")
     (tmp_path / "app.html").write_text(
-        "<html><script type=\"module\" src=\"a.js\"></script></html>")
+        "<html><script type=\"module\" src=\"a.js\"></script></html>", encoding="utf-8")
     assert domcheck.find_entry(tmp_path) == "app.html"
 
 
 def test_find_entry_override_and_missing(tmp_path):
-    (tmp_path / "page.html").write_text("<html></html>")
+    (tmp_path / "page.html").write_text("<html></html>", encoding="utf-8")
     assert domcheck.find_entry(tmp_path, "page.html") == "page.html"
     assert domcheck.find_entry(tmp_path, "nope.html") == ""
     assert domcheck.find_entry(tmp_path) == "page.html"
@@ -118,8 +118,8 @@ INDEX = ('<!doctype html><html><head><title>t</title></head>'
 
 
 def _project(tmp_path, app_js):
-    (tmp_path / "index.html").write_text(INDEX)
-    (tmp_path / "app.js").write_text(app_js)
+    (tmp_path / "index.html").write_text(INDEX, encoding="utf-8")
+    (tmp_path / "app.js").write_text(app_js, encoding="utf-8")
     return tmp_path
 
 
@@ -151,7 +151,7 @@ def test_uncaught_page_error_is_reported(tmp_path):
 def test_missing_module_is_a_load_error(tmp_path):
     (tmp_path / "index.html").write_text(
         '<!doctype html><html><body><div id="app"></div>'
-        '<script type="module" src="missing.js"></script></body></html>')
+        '<script type="module" src="missing.js"></script></body></html>', encoding="utf-8")
     res = domcheck.check(tmp_path)
     assert not res.error
     assert any(f.kind == "load_error" for f in res.findings), \
@@ -164,7 +164,7 @@ def test_unbound_control_is_a_warning_and_delegation_suppresses_it(tmp_path):
     # a lone button with no listener anywhere -> unbound (warn, not error)
     (tmp_path / "index.html").write_text(
         '<!doctype html><html><body><button id="lonely">x</button>'
-        '</body></html>')
+        '</body></html>', encoding="utf-8")
     res = domcheck.check(tmp_path)
     assert not res.error
     assert any(f.kind == "unbound_control" and f.severity == "warn"
@@ -175,7 +175,7 @@ def test_unbound_control_is_a_warning_and_delegation_suppresses_it(tmp_path):
     (tmp_path / "index.html").write_text(
         '<!doctype html><html><body><button id="lonely">x</button>'
         '<script>document.addEventListener("click", () => {});</script>'
-        '</body></html>')
+        '</body></html>', encoding="utf-8")
     res = domcheck.check(tmp_path)
     assert not any(f.kind == "unbound_control" for f in res.findings), \
         [str(f) for f in res.findings]
@@ -193,7 +193,7 @@ def test_snapshot_diff_catches_a_replaced_entry_module(tmp_path):
     before = domcheck.check(tmp_path)
     assert before.ok and before.snapshot
     # replace the entry module with one that no longer mounts the UI
-    (tmp_path / "app.js").write_text("// replaced module: mounts nothing\n")
+    (tmp_path / "app.js").write_text("// replaced module: mounts nothing\n", encoding="utf-8")
     after = domcheck.check(tmp_path, baseline=before.snapshot)
     assert any(f.kind == "mount_regression" and f.severity == "error"
                for f in after.findings), [str(f) for f in after.findings]
@@ -417,20 +417,20 @@ def test_audio_finding_keys_are_digit_free_and_ignore_shifting_ids():
 
 
 def test_audio_static_presence(tmp_path):
-    (tmp_path / "app.js").write_text("const c = new AudioContext();")
+    (tmp_path / "app.js").write_text("const c = new AudioContext();", encoding="utf-8")
     assert domcheck._audio_static_presence(tmp_path)
-    (tmp_path / "app.js").write_text("document.title = 'hi';")
+    (tmp_path / "app.js").write_text("document.title = 'hi';", encoding="utf-8")
     assert not domcheck._audio_static_presence(tmp_path)
     # a lazy context referenced only in inline HTML still counts
-    (tmp_path / "lazy.html").write_text("<script>ctx.createOscillator()</script>")
+    (tmp_path / "lazy.html").write_text("<script>ctx.createOscillator()</script>", encoding="utf-8")
     assert domcheck._audio_static_presence(tmp_path)
 
 
 def test_audio_static_presence_skips_vendor_and_backups(tmp_path):
     (tmp_path / "node_modules").mkdir()
-    (tmp_path / "node_modules" / "lib.js").write_text("new AudioContext()")
+    (tmp_path / "node_modules" / "lib.js").write_text("new AudioContext()", encoding="utf-8")
     (tmp_path / ".pedacito").mkdir()
-    (tmp_path / ".pedacito" / "old.js").write_text("new AudioContext()")
+    (tmp_path / ".pedacito" / "old.js").write_text("new AudioContext()", encoding="utf-8")
     assert not domcheck._audio_static_presence(tmp_path)
 
 

@@ -1575,7 +1575,7 @@ def apply_edits(root: Path, edits: list[Edit], backup: bool = True,
                         # Score it clean instead of failing the whole file.
                         already.append(k)
                         continue
-                    if n == 0 and not (k in anchored):
+                    if n == 0 and k not in anchored:
                         # Numeric-SEARCH auto-reanchor: a SEARCH body that is
                         # just a line number ("4") is the tiny-profile slip of
                         # quoting the read's line-number prefix instead of the

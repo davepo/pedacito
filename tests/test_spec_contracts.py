@@ -25,11 +25,11 @@ def test_extract_project_contracts_lists_exact_signatures(tmp_path):
         "def parse_line(text, sep=','):\n    return text.split(sep)\n\n"
         "class TableParser:\n    def __init__(self, encoding='utf-8'):\n"
         "        self.encoding = encoding\n"
-        "    def feed(self, rows):\n        return len(rows)\n")
+        "    def feed(self, rows):\n        return len(rows)\n", encoding="utf-8")
     (tmp_path / "ui.js").write_text(
-        "function renderTable(rows, opts = {}) {\n  return rows.length\n}\n")
+        "function renderTable(rows, opts = {}) {\n  return rows.length\n}\n", encoding="utf-8")
     (tmp_path / "test_parser.py").write_text(
-        "def test_nothing():\n    assert True\n")
+        "def test_nothing():\n    assert True\n", encoding="utf-8")
     got = spec.extract_project_contracts(tmp_path)
     assert "def parse_line(text, sep=',')" in got
     assert "class TableParser" in got and "__init__(encoding='utf-8')" in got
@@ -38,7 +38,7 @@ def test_extract_project_contracts_lists_exact_signatures(tmp_path):
 
 
 def test_contract_map_block_wraps_map_in_lock_header(tmp_path):
-    (tmp_path / "a.py").write_text("def one(x):\n    return x\n")
+    (tmp_path / "a.py").write_text("def one(x):\n    return x\n", encoding="utf-8")
     block = spec.contract_map_block(tmp_path)
     assert block.startswith(spec.CONTRACT_HEADER)
     assert block.endswith(spec.CONTRACT_FOOTER)
@@ -54,8 +54,8 @@ def test_contract_map_block_wraps_map_in_lock_header(tmp_path):
 def test_map_caps_size_and_prefers_modified(tmp_path):
     for i in range(60):
         (tmp_path / f"mod{i:02d}.py").write_text(
-            f"def fn_{i}(a, b, c, d, e, f, g):\n    return a\n")
-    (tmp_path / "mod59.py").write_text("def touched_symbol(z):\n    return z\n")
+            f"def fn_{i}(a, b, c, d, e, f, g):\n    return a\n", encoding="utf-8")
+    (tmp_path / "mod59.py").write_text("def touched_symbol(z):\n    return z\n", encoding="utf-8")
     block = spec.contract_map_block(tmp_path, modified=["mod59.py"])
     assert "touched_symbol" in block          # freshest contracts survive
     assert len(block) < 4000                  # ~300 tokens, never a dump
@@ -67,7 +67,7 @@ def test_verify_flags_missing_symbol_and_bad_arity(tmp_path):
     (tmp_path / "parser.py").write_text(
         "def parse_line(text, sep=','):\n    return text\n\n"
         "class TableParser:\n    def __init__(self, encoding='utf-8'):\n"
-        "        pass\n")
+        "        pass\n", encoding="utf-8")
     (tmp_path / "cli.py").write_text(
         "from parser import parse_line, TableParser\n"
         "from parser import missing_fn\n"
@@ -76,7 +76,7 @@ def test_verify_flags_missing_symbol_and_bad_arity(tmp_path):
         "def main():\n"
         "    TableParser('utf-8', 'extra')\n"
         "    parse_line('a')\n"
-        "    json.loads('{}')\n")
+        "    json.loads('{}')\n", encoding="utf-8")
     errs = spec.verify_cross_file_contracts(tmp_path)
     assert any("missing_fn" in e and "only defines" in e and
                "parse_line" in e for e in errs)
@@ -86,21 +86,21 @@ def test_verify_flags_missing_symbol_and_bad_arity(tmp_path):
 
 
 def test_verify_clean_project_reports_nothing(tmp_path):
-    (tmp_path / "a.py").write_text("def f(x, y=1):\n    return x + y\n")
-    (tmp_path / "b.py").write_text("from a import f\nprint(f(1), f(2, 3))\n")
+    (tmp_path / "a.py").write_text("def f(x, y=1):\n    return x + y\n", encoding="utf-8")
+    (tmp_path / "b.py").write_text("from a import f\nprint(f(1), f(2, 3))\n", encoding="utf-8")
     assert spec.verify_cross_file_contracts(tmp_path) == []
 
 
 def test_verify_relative_imports(tmp_path):
     pkg = tmp_path / "mypkg"
     pkg.mkdir()
-    (pkg / "__init__.py").write_text("def boot():\n    return 1\n")
-    (pkg / "m2.py").write_text("def go(a):\n    return a\n")
+    (pkg / "__init__.py").write_text("def boot():\n    return 1\n", encoding="utf-8")
+    (pkg / "m2.py").write_text("def go(a):\n    return a\n", encoding="utf-8")
     (pkg / "main.py").write_text(
         "from . import m2, boot, missing\n"
         "from .m2 import gone\n"
         "from .m2 import go\n"
-        "m2.boot()\ngo(1)\n")
+        "m2.boot()\ngo(1)\n", encoding="utf-8")
     errs = spec.verify_cross_file_contracts(tmp_path)
     assert any("missing" in e for e in errs)
     assert any("gone" in e for e in errs)
@@ -111,31 +111,31 @@ def test_verify_relative_imports(tmp_path):
 def test_verify_packages_and_reexports(tmp_path):
     pkg = tmp_path / "pkg"
     pkg.mkdir()
-    (pkg / "__init__.py").write_text("from .core import Engine\n")
+    (pkg / "__init__.py").write_text("from .core import Engine\n", encoding="utf-8")
     (pkg / "core.py").write_text("class Engine:\n    def run(self):\n"
-                                 "        return 'vroom'\n")
+                                 "        return 'vroom'\n", encoding="utf-8")
     (tmp_path / "use.py").write_text(
         "from pkg import Engine\nfrom pkg import absent\n"
-        "Engine().run()\n")
+        "Engine().run()\n", encoding="utf-8")
     errs = spec.verify_cross_file_contracts(tmp_path)
     assert any("absent" in e for e in errs)
     assert not any("imports 'Engine'" in e for e in errs)
 
 
 def test_verify_trusts_ambiguous_imports(tmp_path):
-    (tmp_path / "a.py").write_text("def f(x):\n    return x\n")
+    (tmp_path / "a.py").write_text("def f(x):\n    return x\n", encoding="utf-8")
     (tmp_path / "b.py").write_text(
         "from a import *          # star: unknown surface, skip\n"
         "import numpy as np       # third party: never guessed\n"
         "from sklearn import model_selection\n"
-        "f(np, model_selection)\n")
+        "f(np, model_selection)\n", encoding="utf-8")
     assert spec.verify_cross_file_contracts(tmp_path) == []
 
 
 def test_verify_shadowed_names_are_trusted(tmp_path):
-    (tmp_path / "a.py").write_text("def f(x):\n    return x\n")
+    (tmp_path / "a.py").write_text("def f(x):\n    return x\n", encoding="utf-8")
     (tmp_path / "b.py").write_text(
-        "from a import f\n\ndef f(x, y, z):\n    return x\n\nf(1, 2, 3)\n")
+        "from a import f\n\ndef f(x, y, z):\n    return x\n\nf(1, 2, 3)\n", encoding="utf-8")
     assert spec.verify_cross_file_contracts(tmp_path) == []
 
 
@@ -158,7 +158,7 @@ class _Boom:
 
 
 def test_refine_prompt_fallback_shape(tmp_path):
-    (tmp_path / "parser.py").write_text("def parse_line(t):\n    return t\n")
+    (tmp_path / "parser.py").write_text("def parse_line(t):\n    return t\n", encoding="utf-8")
     got = spec.refine_prompt("add a CSV export", tmp_path, None, None)
     assert got["ok"] is True
     assert got["original"] == "add a CSV export"
@@ -231,7 +231,7 @@ def _result(idx, changed):
 
 
 def test_run_loop_injects_contract_map(tmp_path, monkeypatch):
-    (tmp_path / "lib.py").write_text("def helper(a, b=1):\n    return a\n")
+    (tmp_path / "lib.py").write_text("def helper(a, b=1):\n    return a\n", encoding="utf-8")
     plan = tmp_path / "PLAN.md"
     loop.write_plan(plan, "goal", ["task A", "task B"])
     idx = types.SimpleNamespace(root=tmp_path)
@@ -256,7 +256,7 @@ def test_run_loop_injects_contract_map(tmp_path, monkeypatch):
 
 def test_run_loop_injection_off_when_interface_lock_false(tmp_path,
                                                           monkeypatch):
-    (tmp_path / "lib.py").write_text("def helper(a):\n    return a\n")
+    (tmp_path / "lib.py").write_text("def helper(a):\n    return a\n", encoding="utf-8")
     plan = tmp_path / "PLAN.md"
     loop.write_plan(plan, "goal", ["task A"])
     idx = types.SimpleNamespace(root=tmp_path)
@@ -276,9 +276,9 @@ def test_run_loop_injection_off_when_interface_lock_false(tmp_path,
 
 def test_run_loop_gate_feeds_contract_errors_into_repair(tmp_path,
                                                          monkeypatch):
-    (tmp_path / "lib.py").write_text("def helper(a):\n    return a\n")
+    (tmp_path / "lib.py").write_text("def helper(a):\n    return a\n", encoding="utf-8")
     (tmp_path / "app.py").write_text("from lib import helper, vanished\n"
-                                     "helper(1)\n")
+                                     "helper(1)\n", encoding="utf-8")
     plan = tmp_path / "PLAN.md"
     loop.write_plan(plan, "goal", ["task A"])
     idx = types.SimpleNamespace(root=tmp_path)
@@ -299,8 +299,8 @@ def test_run_loop_gate_feeds_contract_errors_into_repair(tmp_path,
 
 
 def test_run_loop_gate_passes_clean_project(tmp_path, monkeypatch):
-    (tmp_path / "lib.py").write_text("def helper(a):\n    return a\n")
-    (tmp_path / "app.py").write_text("from lib import helper\nhelper(1)\n")
+    (tmp_path / "lib.py").write_text("def helper(a):\n    return a\n", encoding="utf-8")
+    (tmp_path / "app.py").write_text("from lib import helper\nhelper(1)\n", encoding="utf-8")
     plan = tmp_path / "PLAN.md"
     loop.write_plan(plan, "goal", ["task A"])
     idx = types.SimpleNamespace(root=tmp_path)
@@ -323,7 +323,7 @@ def test_gui_refine_route(tmp_path, monkeypatch):
     monkeypatch.setattr(core.STATE, "client", None)   # offline: fallback
     route = server.POST_ROUTES["/api/spec/refine"]
 
-    (tmp_path / "svc.py").write_text("def run(cfg): \n    return cfg\n")
+    (tmp_path / "svc.py").write_text("def run(cfg): \n    return cfg\n", encoding="utf-8")
     status, j = route({}, {"prompt": "add a health endpoint to svc.py"})
     assert status == 200 and j["ok"] is True
     assert "OBJECTIVE" in j["refined"]

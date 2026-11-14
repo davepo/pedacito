@@ -16,7 +16,9 @@ The action cursor resets whenever a NON-schema request arrives, i.e. when the
 agent moves from its gather loop to the answer phase, so every test's gather
 loop starts from action 0 even though the module-scoped server is reused.
 """
-import json, os, sys
+import json
+import os
+import sys
 from http.server import BaseHTTPRequestHandler
 from pathlib import Path
 

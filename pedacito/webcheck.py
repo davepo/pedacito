@@ -692,28 +692,12 @@ def _js_code(text: str) -> str:
             if quote == "`" and ch == "$" and i + 1 < n and text[i + 1] == "{":
                 stack.append(["${", "0"])
                 out.append("  ")
+                prev = "{"          # the interpolation opens in code position
                 i += 2
                 continue
             out.append("\n" if ch == "\n" else " ")
             i += 1
             continue
-        if top is not None and top[0] == "${":
-            if ch == "{":
-                top[1] = str(int(top[1]) + 1)
-                out.append("{")
-                prev = ch
-                i += 1
-                continue
-            if ch == "}":
-                if int(top[1]) > 0:
-                    top[1] = str(int(top[1]) - 1)
-                    out.append("}")
-                else:
-                    stack.pop()       # back into the template body
-                    out.append(" ")
-                prev = ch
-                i += 1
-                continue
         if ch == "/" and i + 1 < n and text[i + 1] == "/":
             j = text.find("\n", i)
             j = n if j < 0 else j
@@ -757,6 +741,28 @@ def _js_code(text: str) -> str:
             prev = ch
             i += 1
             continue
+        # A `${ }` region is code again, so its own braces nest -- but only
+        # once strings, comments and regex literals above have claimed their
+        # characters. Counting `}` inside `/[}]/` or `// }` as the closing
+        # brace ended the interpolation early and blanked every later real
+        # call in it, hiding the ReferenceError this pass exists to catch.
+        if top is not None and top[0] == "${":
+            if ch == "{":
+                top[1] = str(int(top[1]) + 1)
+                out.append("{")
+                prev = ch
+                i += 1
+                continue
+            if ch == "}":
+                if int(top[1]) > 0:
+                    top[1] = str(int(top[1]) - 1)
+                    out.append("}")
+                else:
+                    stack.pop()       # back into the template body
+                    out.append(" ")
+                prev = ch
+                i += 1
+                continue
         out.append(ch)
         if not ch.isspace():
             prev = ch

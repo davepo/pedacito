@@ -73,7 +73,7 @@ def test_review_server_survives_non_object_body():
 
 
 def test_write_files_keeps_first_backup_on_repeat_apply(tmp_path):
-    (tmp_path / "a.txt").write_text("one\n")
+    (tmp_path / "a.txt").write_text("one\n", encoding="utf-8")
     from pedacito import edits
     reply = ("--- FILE: a.txt\n<<<<<<< SEARCH\none\n=======\ntwo\n"
              ">>>>>>> REPLACE\n")
@@ -84,8 +84,8 @@ def test_write_files_keeps_first_backup_on_repeat_apply(tmp_path):
     bak.mkdir()
     assert review.write_files(tmp_path, diffs, bak)[0]
     assert review.write_files(tmp_path, diffs, bak)[0]
-    assert (bak / "a.txt").read_text() == "one\n"
-    assert (tmp_path / "a.txt").read_text() == "two\n"
+    assert (bak / "a.txt").read_text(encoding="utf-8") == "one\n"
+    assert (tmp_path / "a.txt").read_text(encoding="utf-8") == "two\n"
 
 
 def test_gui_handler_guards_and_stale_review_ids():
@@ -113,8 +113,8 @@ def test_review_build_writer_returns_ok_tuple(tmp_path, monkeypatch):
 
     from pedacito import scaffold
     (tmp_path / "bak").mkdir()
-    (tmp_path / "bak" / "a.py").write_text("x = 1\n")
-    (tmp_path / "a.py").write_text("x = 2\n")
+    (tmp_path / "bak" / "a.py").write_text("x = 1\n", encoding="utf-8")
+    (tmp_path / "a.py").write_text("x = 2\n", encoding="utf-8")
     cfg = SimpleNamespace(model="m", active_profile="", review_port=0,
                           open_browser=False, review_timeout=1)
     seen = {}

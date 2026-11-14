@@ -155,7 +155,7 @@ def test_verify_final_defers_the_shell_check_to_the_last_task(tmp_path,
     assert calls == ["pytest -q"]                    # ran once, on the last task
     assert code == 0
     assert (tmp_path / "a.py").is_file() and (tmp_path / "b.py").is_file()
-    text = plan.read_text()
+    text = plan.read_text(encoding="utf-8")
     assert "- [x] Fix module one" in text and "- [x] Fix module two" in text
     err = capsys.readouterr().err
     assert "final-only" in err                       # the deferral is announced
@@ -194,9 +194,9 @@ def test_verify_final_rolls_back_only_the_last_step_when_it_fails(tmp_path,
                          stop_on_fail=False, verify_final=True)
     assert calls == ["pytest -q"]                    # only the real final check
     assert code == 1
-    assert (tmp_path / "a.py").read_text() == "GOOD = 1\n"   # step 1 survives
+    assert (tmp_path / "a.py").read_text(encoding="utf-8") == "GOOD = 1\n"   # step 1 survives
     assert not (tmp_path / "b.py").exists()                   # step 2 rolled back
-    text = plan.read_text()
+    text = plan.read_text(encoding="utf-8")
     assert "- [x] Fix module one" in text
     assert "- [!] Break module two" in text
 
@@ -206,9 +206,9 @@ def test_verify_final_runs_the_check_for_the_record_on_early_stop(tmp_path,
     """max_tasks stopped the loop before the last task: the whole-goal check
     must still be paid for ONCE, and reported (no silent green exit)."""
     plan, idx, cfg, calls = _two_task_ratchet(tmp_path, monkeypatch)
-    code = loop.run_loop(tmp_path, cfg, None, idx, plan, apply=True,
-                         verify="pytest -q", max_tasks=1,
-                         stop_on_fail=False, verify_final=True)
+    loop.run_loop(tmp_path, cfg, None, idx, plan, apply=True,
+                  verify="pytest -q", max_tasks=1,
+                  stop_on_fail=False, verify_final=True)
     assert len(calls) == 1        # deferred mid-run, then once for the record
     log = workspace.run_log_path(tmp_path).read_text(encoding="utf-8")
     assert "final-only" in log    # and the log says why it ran there
@@ -332,7 +332,7 @@ _GOAL = ("Build a report generator.\n\n"
 def test_write_plan_persists_the_full_goal(tmp_path):
     plan = tmp_path / "PLAN.md"
     loop.write_plan(plan, _GOAL, ["Task one", "Task two"])
-    text = plan.read_text()
+    text = plan.read_text(encoding="utf-8")
     assert "Export CSV and JSON." in text          # nothing truncated
     # continuation lines never parse as tasks:
     unchecked = loop.next_task(loop.read_plan(plan))

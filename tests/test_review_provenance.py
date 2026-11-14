@@ -72,8 +72,8 @@ def test_requirements_carry_stable_clause_ids():
 
 
 def test_clause_map_and_diffs_carry_clause_ids(tmp_path):
-    (tmp_path / "pricing.py").write_text(PRICING)
-    (tmp_path / "shipping.py").write_text(SHIPPING)
+    (tmp_path / "pricing.py").write_text(PRICING, encoding="utf-8")
+    (tmp_path / "shipping.py").write_text(SHIPPING, encoding="utf-8")
     results = edits.apply_edits(tmp_path, edits.parse_edits(REPLY),
                                 backup=False, dry_run=True)
     assert all(r.ok for r in results)
@@ -90,8 +90,8 @@ def test_clause_map_and_diffs_carry_clause_ids(tmp_path):
 
 
 def test_build_page_renders_clause_badges(tmp_path):
-    (tmp_path / "pricing.py").write_text(PRICING)
-    (tmp_path / "shipping.py").write_text(SHIPPING)
+    (tmp_path / "pricing.py").write_text(PRICING, encoding="utf-8")
+    (tmp_path / "shipping.py").write_text(SHIPPING, encoding="utf-8")
     results = edits.apply_edits(tmp_path, edits.parse_edits(REPLY),
                                 backup=False, dry_run=True)
     t = _tracker_with_edits()
@@ -257,8 +257,8 @@ def test_two_clause_review_carries_ids_and_partial_accept_flags(gui, fake_port):
               "model": "fake-model", "vram_gb": "8"})
     root = gui.tmp / "proj"
     root.mkdir()
-    (root / "pricing.py").write_text(PRICING)
-    (root / "shipping.py").write_text(SHIPPING)
+    (root / "pricing.py").write_text(PRICING, encoding="utf-8")
+    (root / "shipping.py").write_text(SHIPPING, encoding="utf-8")
     assert gui.post("/api/project", {"path": str(root), "profile": ""})[0] == 202
     assert gui.wait_idle(30)
     assert gui.post("/api/index", {"summarise": False})[0] == 202
@@ -273,8 +273,8 @@ def test_two_clause_review_carries_ids_and_partial_accept_flags(gui, fake_port):
             lambda s: s if s["review"] and s["review"]["pending"] else None, 30)
         assert state, core.STATE.messages
         # nothing written yet
-        assert (root / "pricing.py").read_text() == PRICING
-        assert (root / "shipping.py").read_text() == SHIPPING
+        assert (root / "pricing.py").read_text(encoding="utf-8") == PRICING
+        assert (root / "shipping.py").read_text(encoding="utf-8") == SHIPPING
 
         meta = gui.get("/api/review")[1]["review"]
         by_rel = {f["rel"]: f for f in meta["files"]}
@@ -291,8 +291,8 @@ def test_two_clause_review_carries_ids_and_partial_accept_flags(gui, fake_port):
                                  "files": ["pricing.py"]})
         assert status == 200 and body["ok"]
         assert gui.wait_idle(30)
-        assert "pct = max(0, min(pct, 1))" in (root / "pricing.py").read_text()
-        assert (root / "shipping.py").read_text() == SHIPPING
+        assert "pct = max(0, min(pct, 1))" in (root / "pricing.py").read_text(encoding="utf-8")
+        assert (root / "shipping.py").read_text(encoding="utf-8") == SHIPPING
 
         after = gui.get("/api/review")[1]["review"]
         assert after["outcome"] == "applied"

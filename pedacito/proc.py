@@ -61,6 +61,11 @@ def terminate(proc: subprocess.Popen) -> None:
             pass
 
 
+def kill_tree(proc: subprocess.Popen) -> None:
+    """Alias for terminate(): kill a spawned process and its whole tree."""
+    terminate(proc)
+
+
 def run(command, *, cwd, timeout: float | None = None,
         idle_timeout: float = 0, shell: bool = False,
         max_output: int = 8000, env: dict | None = None,

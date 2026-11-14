@@ -72,11 +72,11 @@ def test_qualified_rename_follows_bound_receivers(tmp_path):
     out = refactor.tool_rename(agent.index, agent.cfg, "Store.save", "persist")
     assert out.startswith("RENAMED")
 
-    store = (tmp_path / "pkg/store.py").read_text()
+    store = (tmp_path / "pkg/store.py").read_text(encoding="utf-8")
     assert "def persist(self" in store and "self.persist('all')" in store
     assert "class Other:\n    def save(self" in store        # foreign def kept
 
-    app = (tmp_path / "pkg/app.py").read_text()
+    app = (tmp_path / "pkg/app.py").read_text(encoding="utf-8")
     assert "x.persist(1)" in app                            # ctor-bound receiver
     assert "Store.persist" in app                            # static access
     assert "s.persist(8)" in app                             # annotated param
@@ -85,15 +85,15 @@ def test_qualified_rename_follows_bound_receivers(tmp_path):
     assert "NOT renamed (ambiguous or foreign receivers)" in out
     assert "untyped receiver" in out
     assert "another `save` definition (Other.save)" in out
-    assert "def persist(blob)" not in (tmp_path / "pkg/helpers.py").read_text()
-    assert "def save(blob)" in (tmp_path / "pkg/helpers.py").read_text()
+    assert "def persist(blob)" not in (tmp_path / "pkg/helpers.py").read_text(encoding="utf-8")
+    assert "def save(blob)" in (tmp_path / "pkg/helpers.py").read_text(encoding="utf-8")
 
 
 def test_qualified_rename_is_the_only_way_past_the_ambiguity(tmp_path):
     agent = _agent(tmp_path, Scripted(), CLS_SRC, allow_write=True)
     bare = refactor.tool_rename(agent.index, agent.cfg, "save", "persist")
     assert bare.startswith("ERROR") and "defined in" in bare
-    assert (tmp_path / "pkg/store.py").read_text() == CLS_SRC["pkg/store.py"]
+    assert (tmp_path / "pkg/store.py").read_text(encoding="utf-8") == CLS_SRC["pkg/store.py"]
 
 
 def test_qualified_rename_accepts_module_prefix(tmp_path):
@@ -101,16 +101,16 @@ def test_qualified_rename_accepts_module_prefix(tmp_path):
     out = refactor.tool_rename(agent.index, agent.cfg, "pkg.Store.save",
                                "persist")
     assert out.startswith("RENAMED")
-    assert "def persist(self" in (tmp_path / "pkg/store.py").read_text()
+    assert "def persist(self" in (tmp_path / "pkg/store.py").read_text(encoding="utf-8")
 
 
 def test_qualified_rename_of_the_other_class_leaves_store_alone(tmp_path):
     agent = _agent(tmp_path, Scripted(), CLS_SRC, allow_write=True)
     out = refactor.tool_rename(agent.index, agent.cfg, "Other.save", "keep")
     assert out.startswith("RENAMED")
-    app = (tmp_path / "pkg/app.py").read_text()
+    app = (tmp_path / "pkg/app.py").read_text(encoding="utf-8")
     assert "y.keep(2)" in app and "x.save(1)" in app
-    store = (tmp_path / "pkg/store.py").read_text()
+    store = (tmp_path / "pkg/store.py").read_text(encoding="utf-8")
     assert "class Other:\n    def keep(self" in store
     assert "def save(self" in store        # Store.save untouched
 
@@ -124,9 +124,9 @@ def test_qualified_rename_unknown_class_is_reported(tmp_path):
 # --------------------------------------- transactional multi-file rollback
 
 def test_engine_write_failure_restores_every_written_file(tmp_path, monkeypatch):
-    (tmp_path / "a.py").write_text("def apply_discount(p):\n    return p\n")
+    (tmp_path / "a.py").write_text("def apply_discount(p):\n    return p\n", encoding="utf-8")
     (tmp_path / "b.py").write_text("from a import apply_discount\n"
-                                   "X = apply_discount(1)\n")
+                                   "X = apply_discount(1)\n", encoding="utf-8")
     real = refactor.fileio.write
 
     def boom(path, text, style=None):
@@ -140,9 +140,9 @@ def test_engine_write_failure_restores_every_written_file(tmp_path, monkeypatch)
     assert not res["ok"]
     assert "write failed mid-rename" in res["error"]
     assert "restored 1 of 1" in res["error"]
-    assert (tmp_path / "a.py").read_text() == \
+    assert (tmp_path / "a.py").read_text(encoding="utf-8") == \
         "def apply_discount(p):\n    return p\n"
-    assert (tmp_path / "b.py").read_text() == \
+    assert (tmp_path / "b.py").read_text(encoding="utf-8") == \
         "from a import apply_discount\nX = apply_discount(1)\n"
 
 
@@ -165,8 +165,8 @@ def test_tool_rename_write_failure_rolls_back_written_files(tmp_path,
     monkeypatch.setattr(refactor.fileio, "write", boom)
     out = refactor.tool_rename(agent.index, agent.cfg, "apply_discount", "d")
     assert "rename aborted" in out and "rolled back 1" in out
-    assert (tmp_path / "pkg/core.py").read_text() == files["pkg/core.py"]
-    assert (tmp_path / "pkg/shop.py").read_text() == files["pkg/shop.py"]
+    assert (tmp_path / "pkg/core.py").read_text(encoding="utf-8") == files["pkg/core.py"]
+    assert (tmp_path / "pkg/shop.py").read_text(encoding="utf-8") == files["pkg/shop.py"]
 
 
 def test_snapshot_failure_aborts_before_writing_anything(tmp_path, monkeypatch):
@@ -182,13 +182,13 @@ def test_snapshot_failure_aborts_before_writing_anything(tmp_path, monkeypatch):
                         lambda *a, **k: "cannot snapshot (disk locked)")
     out = refactor.tool_rename(agent.index, agent.cfg, "apply_discount", "d")
     assert "rename aborted" in out and "rolled back 0" in out
-    assert (tmp_path / "pkg/core.py").read_text() == files["pkg/core.py"]
+    assert (tmp_path / "pkg/core.py").read_text(encoding="utf-8") == files["pkg/core.py"]
 
 
 def test_apply_edits_oserror_restores_writes_and_created_files(tmp_path,
                                                                monkeypatch):
-    (tmp_path / "a.py").write_text("X = 1\n")
-    (tmp_path / "b.py").write_text("Y = 1\n")
+    (tmp_path / "a.py").write_text("X = 1\n", encoding="utf-8")
+    (tmp_path / "b.py").write_text("Y = 1\n", encoding="utf-8")
     reply = (
         "--- FILE: a.py\n<<<<<<< SEARCH\nX = 1\n=======\nX = 2\n>>>>>>> REPLACE\n"
         "--- FILE: new.py\n<<<<<<< SEARCH\n=======\nB = 1\n>>>>>>> REPLACE\n"
@@ -207,6 +207,6 @@ def test_apply_edits_oserror_restores_writes_and_created_files(tmp_path,
     assert len(res) == 1 and not res[0].ok and res[0].file == "*"
     assert "write batch failed" in res[0].message
     assert "rolled back 2 of 2" in res[0].message
-    assert (tmp_path / "a.py").read_text() == "X = 1\n"
+    assert (tmp_path / "a.py").read_text(encoding="utf-8") == "X = 1\n"
     assert not (tmp_path / "new.py").exists()
-    assert (tmp_path / "b.py").read_text() == "Y = 1\n"
+    assert (tmp_path / "b.py").read_text(encoding="utf-8") == "Y = 1\n"

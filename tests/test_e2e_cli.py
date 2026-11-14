@@ -70,7 +70,7 @@ def test_ask_apply_runs_the_whole_pipeline_and_logs_events(fake_port, env, capsy
     code = cli.main(_args(fake_port, env, "--apply"))
     err = capsys.readouterr().err
     assert code == 0
-    assert "LIMIT = 25" in (env / "app.py").read_text()
+    assert "LIMIT = 25" in (env / "app.py").read_text(encoding="utf-8")
     assert "[task:" in err and "cache hit" in err           # per-task usage line
     log = events.load(env)
     kinds = [e["kind"] for e in log]
@@ -86,7 +86,7 @@ def test_ask_apply_runs_the_whole_pipeline_and_logs_events(fake_port, env, capsy
 @pytest.mark.network
 def test_dry_run_writes_nothing(fake_port, env, capsys):
     assert cli.main(_args(fake_port, env)) == 0
-    assert "LIMIT = 10" in (env / "app.py").read_text()
+    assert "LIMIT = 10" in (env / "app.py").read_text(encoding="utf-8")
     assert "dry run" in capsys.readouterr().err
 
 
@@ -95,7 +95,7 @@ def test_token_budget_stops_the_run_cleanly(fake_port, env, capsys):
     code = cli.main(_args(fake_port, env, "--apply", "--max-tokens-budget", "1"))
     err = capsys.readouterr().err
     assert code == 1 and "Token budget spent" in err
-    assert "LIMIT = 10" in (env / "app.py").read_text()
+    assert "LIMIT = 10" in (env / "app.py").read_text(encoding="utf-8")
 
 
 @pytest.mark.network
@@ -117,7 +117,7 @@ def test_chat_survives_ctrl_c_during_a_task(fake_port, env, monkeypatch, capsys)
     err = capsys.readouterr().err
     assert code == 0 and calls["n"] == 2
     assert "cancelled; the session is still open" in err
-    assert "LIMIT = 25" in (env / "app.py").read_text()
+    assert "LIMIT = 25" in (env / "app.py").read_text(encoding="utf-8")
 
 
 @pytest.mark.network
@@ -142,7 +142,7 @@ def test_jsonl_streams_events_on_stdout_only(fake_port, env, capsys):
     assert kinds[0] == "session_start" and kinds[-1] == "exit"
     res = next(r for r in recs if r["kind"] == "result")
     assert "LIMIT = 25" in res["edits"][0]["diff"] and res["reply"]
-    assert "LIMIT = 10" in (env / "app.py").read_text()      # still a dry run
+    assert "LIMIT = 10" in (env / "app.py").read_text(encoding="utf-8")      # still a dry run
 
 
 @pytest.mark.network
@@ -153,7 +153,7 @@ def test_plan_mode_dry_run_lists_one_step_per_requirement(fake_port, env, capsys
     assert cli.main(args) == 0
     err = capsys.readouterr().err
     assert "plan (requirements; 2 step(s))" in err and "1. " in err and "2. " in err
-    assert "LIMIT = 10" in (env / "app.py").read_text()
+    assert "LIMIT = 10" in (env / "app.py").read_text(encoding="utf-8")
     assert list((env / ".pedacito" / "plans").glob("*.md"))
 
 
@@ -162,11 +162,11 @@ def test_record_then_replay_reproduces_the_run_without_a_server(fake_port, env, 
     assert cli.main(_args(fake_port, env, "--apply", "--record")) == 0
     capsys.readouterr()
     rec = next((env / ".pedacito" / "replay").glob("*.jsonl"))
-    assert "LIMIT = 25" in (env / "app.py").read_text()
-    (env / "app.py").write_text("LIMIT = 10\n\n\ndef check(n):\n    return n < LIMIT\n")
+    assert "LIMIT = 25" in (env / "app.py").read_text(encoding="utf-8")
+    (env / "app.py").write_text("LIMIT = 10\n\n\ndef check(n):\n    return n < LIMIT\n", encoding="utf-8")
     # a dead port proves no server is contacted
     dead = _free_port()
     assert cli.main(_args(dead, env, "--apply", "--replay", str(rec))) == 0
     err = capsys.readouterr().err
     assert "every prompt matched the recording" in err
-    assert "LIMIT = 25" in (env / "app.py").read_text()
+    assert "LIMIT = 25" in (env / "app.py").read_text(encoding="utf-8")

@@ -46,7 +46,6 @@ BUG-808: a verification gate that ends a run RED -- DOM contract
 """
 
 import inspect
-import textwrap
 import types
 
 import pytest

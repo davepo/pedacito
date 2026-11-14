@@ -19,7 +19,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from pedacito import (config as config_mod, domcheck, edits, events,  # noqa: E402
+from pedacito import (config as config_mod, domcheck, events,  # noqa: E402
                       llm, loop, memory, plan, refactor, scaffold, testsel,
                       verify, webcheck)
 from pedacito import index as index_mod  # noqa: E402
@@ -291,7 +291,7 @@ def test_duplicate_resolved_targets_are_covered_not_reasked(tmp_path):
     assert all(r.ok for r in results)
     assert not [f for f in findings if f.severity == "error"]
     assert receipts.count("[EDITED suite.py]") == 3
-    assert (tmp_path / "suite.py").read_text().count("return 2") == 1
+    assert (tmp_path / "suite.py").read_text(encoding="utf-8").count("return 2") == 1
 
 
 # ------------------------------------- BUG-305/330: all-to-all provenance --
@@ -1101,8 +1101,8 @@ _DOM_INDEX = ('<!doctype html><html><head><title>t</title></head>'
 
 
 def _dom_project(tmp_path, app_js):
-    (tmp_path / "index.html").write_text(_DOM_INDEX)
-    (tmp_path / "app.js").write_text(app_js)
+    (tmp_path / "index.html").write_text(_DOM_INDEX, encoding="utf-8")
+    (tmp_path / "app.js").write_text(app_js, encoding="utf-8")
     return tmp_path
 
 

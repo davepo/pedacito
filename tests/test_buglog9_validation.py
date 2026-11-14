@@ -228,7 +228,7 @@ def test_complex_mode_still_runs_tests_after_sources(tmp_path, monkeypatch):
 # --------------------------------------------------------------------------
 
 def test_domcheck_returns_a_result_for_a_quiet_page(tmp_path):
-    pw = pytest.importorskip("playwright.sync_api")
+    pytest.importorskip("playwright.sync_api")
     from pedacito import domcheck
     ok, hint = domcheck.available()
     if not ok:

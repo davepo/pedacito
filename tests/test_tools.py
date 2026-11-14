@@ -425,7 +425,7 @@ def test_append_creates_then_grows_a_file(tmp_path):
     second = tools.dispatch(idx, cfg, {"action": "append", "file": "new.py",
                                        "content": "c = 3\nd = 4"})
     assert second.startswith("APPENDED 2 line(s)")
-    assert (tmp_path / "new.py").read_text() == "a = 1\nb = 2\nc = 3\nd = 4\n"
+    assert (tmp_path / "new.py").read_text(encoding="utf-8") == "a = 1\nb = 2\nc = 3\nd = 4\n"
 
 
 def test_oversized_append_is_told_to_split_the_append(tmp_path):
@@ -510,7 +510,7 @@ def test_move_refuses_to_overwrite(tmp_path):
                                     "to": "other.py"})
     assert obs.startswith("ERROR") and "already exists" in obs
     assert (tmp_path / "pkg/app.py").is_file()
-    assert (tmp_path / "other.py").read_text() == "x = 1\n"
+    assert (tmp_path / "other.py").read_text(encoding="utf-8") == "x = 1\n"
 
 
 # -------------------------------------------------------------------- run
@@ -574,7 +574,7 @@ def test_proc_stops_the_whole_process_tree(tmp_path):
     _, _, stopped, _ = proc.run([sys.executable, str(script)], cwd=tmp_path,
                                 timeout=20, idle_timeout=1)
     assert stopped == "idle"
-    pid = int(marker.read_text())
+    pid = int(marker.read_text(encoding="utf-8"))
     deadline = time.time() + 10
     while time.time() < deadline:
         try:
@@ -586,7 +586,8 @@ def test_proc_stops_the_whole_process_tree(tmp_path):
         try:
             stat = subprocess.run(
                 ["ps", "-o", "stat=", "-p", str(pid)],
-                capture_output=True, text=True, timeout=5).stdout.strip()
+                capture_output=True, text=True, timeout=5,
+                encoding="utf-8", errors="replace").stdout.strip()
         except OSError:
             stat = ""
         if not stat or stat.startswith("Z"):
@@ -1207,7 +1208,7 @@ def test_absolute_path_inside_root_is_stored_relative(tmp_path):
                                     "content": "def helper():\n    return 9\n"})
     assert obs.startswith("WROTE pkg/app.py"), obs
     assert (cfg._backup_dir / "pkg" / "app.py").is_file()
-    assert (tmp_path / "pkg" / "app.py").read_text().endswith("return 9\n")
+    assert (tmp_path / "pkg" / "app.py").read_text(encoding="utf-8").endswith("return 9\n")
 
 
 def test_write_refuses_non_utf8_files_without_crashing(tmp_path):
@@ -1278,7 +1279,7 @@ def test_gather_write_snapshots_into_backups_not_a_bak_beside_source(tmp_path):
             return {"action": "done", "reasoning": "ok"}
 
     Agent(idx, Writer(), cfg).gather("change the app", verbose=False)
-    assert (tmp_path / "pkg" / "app.py").read_text() == "x = 1\n"
+    assert (tmp_path / "pkg" / "app.py").read_text(encoding="utf-8") == "x = 1\n"
     assert not (tmp_path / "pkg" / "app.py.bak").exists()
     backups = list((tmp_path / ".pedacito" / "backups").rglob("pkg/app.py"))
     assert backups, "gather write did not snapshot into .pedacito/backups"
@@ -2296,7 +2297,7 @@ def test_auto_allowlist_blocks_writes_to_unread_files(tmp_path):
                                         "file": "pkg/other.py",
                                         "content": "x = 2\n"})
     assert blocked.startswith("ERROR") and "task write allowlist" in blocked
-    assert (tmp_path / "pkg/other.py").read_text() == "x = 1\n"
+    assert (tmp_path / "pkg/other.py").read_text(encoding="utf-8") == "x = 1\n"
 
     allowed = tools.dispatch(idx, cfg, {"action": "write",
                                         "file": "pkg/app.py",

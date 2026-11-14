@@ -288,7 +288,7 @@ def test_folder_browser_lists_dirs_hides_dotfiles_and_flags_projects(tmp_path):
     (tmp_path / "proj" / ".git").mkdir(parents=True)
     (tmp_path / "plain").mkdir()
     (tmp_path / ".hidden").mkdir()
-    (tmp_path / "f.txt").write_text("x")
+    (tmp_path / "f.txt").write_text("x", encoding="utf-8")
     out = server.list_dir(str(tmp_path), show_files=False, hidden=False)
     names = {e["name"]: e for e in out["entries"]}
     assert set(names) == {"proj", "plain"}
@@ -307,7 +307,7 @@ def test_file_viewer_stays_inside_the_project(gui):
     # Windows' text-mode newline translation does not turn this into CRLF.
     (root / "a.py").write_bytes(b"x = 1\n")
     (root / "b.bin").write_bytes(b"\x00\x01\x02")
-    (gui.tmp / "secret.txt").write_text("nope")
+    (gui.tmp / "secret.txt").write_text("nope", encoding="utf-8")
     core.STATE.root = root
     assert gui.get("/api/file?path=a.py")[1]["text"] == "x = 1\n"
     assert gui.get("/api/file?path=b.bin")[1]["binary"] is True
@@ -385,8 +385,8 @@ def test_steer_requires_a_running_job(gui):
 def _staged(gui, applied):
     root = gui.tmp / "r"
     root.mkdir()
-    (root / "a.txt").write_text("one\ntwo\n")
-    (root / "b.txt").write_text("alpha\n")
+    (root / "a.txt").write_text("one\ntwo\n", encoding="utf-8")
+    (root / "b.txt").write_text("alpha\n", encoding="utf-8")
     from pedacito import edits
     reply = ("--- FILE: a.txt\n<<<<<<< SEARCH\none\n=======\nONE\n>>>>>>> REPLACE\n"
              "--- FILE: b.txt\n<<<<<<< SEARCH\nalpha\n=======\nBETA\n>>>>>>> REPLACE\n")
@@ -428,8 +428,8 @@ def test_review_partial_accept_writes_only_selected_files_and_honours_edits(gui)
     thread.join(10)
     assert status == 200 and body["ok"]
     assert out["res"][0] == "applied"
-    assert (root / "a.txt").read_text() == "uno\ntwo\n"      # edited text
-    assert (root / "b.txt").read_text() == "alpha\n"         # left out
+    assert (root / "a.txt").read_text(encoding="utf-8") == "uno\ntwo\n"      # edited text
+    assert (root / "b.txt").read_text(encoding="utf-8") == "alpha\n"         # left out
     assert applied == [["a.txt"]]
     # deciding twice is refused
     assert gui.post("/api/review/decide", {"id": rid, "action": "reject"})[0] == 409
@@ -444,7 +444,7 @@ def test_review_reject_changes_nothing_and_unblocks_the_job(gui):
     assert gui.post("/api/review/decide", {"id": rid, "action": "reject"})[0] == 200
     thread.join(10)
     assert out["res"][0] == "cancelled"
-    assert (root / "a.txt").read_text() == "one\ntwo\n"
+    assert (root / "a.txt").read_text(encoding="utf-8") == "one\ntwo\n"
 
 
 def test_review_apply_with_no_files_selected_is_refused(gui):
@@ -480,7 +480,7 @@ def test_a_staged_review_is_broadcast_with_its_diff_in_the_state(gui):
     rv = gui.get("/api/state")[1]["review"]
     assert not rv["pending"] and rv["outcome"] == "applied"
     assert not any(f["source"] for f in rv["files"])
-    assert (root / "a.txt").read_text() == "ONE\ntwo\n"
+    assert (root / "a.txt").read_text(encoding="utf-8") == "ONE\ntwo\n"
     assert "Applied changes to 1 file(s)" in [m["text"] for m in
                                               gui.get("/api/state")[1]["messages"]]
 
@@ -492,8 +492,8 @@ def test_a_rejected_review_says_so_and_writes_nothing(gui):
     assert gui.post("/api/review/decide", {"id": rid, "action": "reject"})[0] == 200
     thread.join(10)
     assert out["res"][0] == "cancelled"
-    assert (root / "a.txt").read_text() == "one\ntwo\n"
-    assert (root / "b.txt").read_text() == "alpha\n"
+    assert (root / "a.txt").read_text(encoding="utf-8") == "one\ntwo\n"
+    assert (root / "b.txt").read_text(encoding="utf-8") == "alpha\n"
     state = gui.get("/api/state")[1]
     texts = [m["text"] for m in state["messages"]]
     assert "Rejected staged changes" in texts
@@ -510,13 +510,13 @@ def test_files_api_scans_the_workspace_and_honours_the_ignore_file(gui, tmp_path
     seen: new files included, `.pedacitoignore` and the state dir excluded."""
     root = tmp_path / "scanproj"
     (root / "src").mkdir(parents=True)
-    (root / "src" / "a.py").write_text("1\n")
-    (root / "notes.md").write_text("1\n")
-    (root / "fresh.txt").write_text("1\n")            # never indexed
-    (root / "ignored.txt").write_text("1\n")
-    (root / ".pedacitoignore").write_text("ignored.txt\n")
+    (root / "src" / "a.py").write_text("1\n", encoding="utf-8")
+    (root / "notes.md").write_text("1\n", encoding="utf-8")
+    (root / "fresh.txt").write_text("1\n", encoding="utf-8")            # never indexed
+    (root / "ignored.txt").write_text("1\n", encoding="utf-8")
+    (root / ".pedacitoignore").write_text("ignored.txt\n", encoding="utf-8")
     (root / ".pedacito").mkdir()
-    (root / ".pedacito" / "settings.toml").write_text("")
+    (root / ".pedacito" / "settings.toml").write_text("", encoding="utf-8")
     monkeypatch.setattr(core.STATE, "root", root)
     monkeypatch.setattr(core.STATE, "idx", None)
     out = gui.get("/api/files")[1]
@@ -531,8 +531,8 @@ def test_files_api_marks_the_indexed_ones_and_keeps_the_signature(gui, tmp_path,
             self.files = {"app.py": [], "new.py": []}
     root = tmp_path / "idxproj"
     root.mkdir()
-    (root / "app.py").write_text("1\n")
-    (root / "new.py").write_text("1\n")
+    (root / "app.py").write_text("1\n", encoding="utf-8")
+    (root / "new.py").write_text("1\n", encoding="utf-8")
     monkeypatch.setattr(core.STATE, "root", root)
     monkeypatch.setattr(core.STATE, "idx", _Idx())
     out = gui.get("/api/files")[1]
@@ -547,10 +547,10 @@ def test_backups_api_lists_snapshots_newest_first(gui):
     root.mkdir()
     assert gui.get("/api/backups")[1]["backups"] == []      # nothing yet
     old = workspace.new_backup_dir(root, when="20260101-000000", unique=True)
-    (old / "a.txt").write_text("one\n")
+    (old / "a.txt").write_text("one\n", encoding="utf-8")
     new = workspace.new_backup_dir(root, when="20260102-000000", unique=True)
-    (new / "a.txt").write_text("one\n")
-    (new / "b.txt").write_text("two\n")
+    (new / "a.txt").write_text("one\n", encoding="utf-8")
+    (new / "b.txt").write_text("two\n", encoding="utf-8")
     snaps = gui.get("/api/backups")[1]["backups"]
     assert [s["name"] for s in snaps] == [new.name, old.name]
     assert [s["files"] for s in snaps] == [2, 1]
@@ -563,16 +563,16 @@ def test_restore_endpoint_puts_the_last_backup_back(gui, tmp_path, monkeypatch):
     from pedacito import workspace
     root = tmp_path / "rsp"
     root.mkdir()
-    (root / "a.txt").write_text("one\n")
+    (root / "a.txt").write_text("one\n", encoding="utf-8")
     snap = workspace.new_backup_dir(root, unique=True)
-    (snap / "a.txt").write_text("one\n")
-    (root / "a.txt").write_text("TWO\n")                   # the edit to undo
+    (snap / "a.txt").write_text("one\n", encoding="utf-8")
+    (root / "a.txt").write_text("TWO\n", encoding="utf-8")                   # the edit to undo
     monkeypatch.setattr(core.STATE, "root", root)
     monkeypatch.setattr(core.STATE, "cfg", None)
     monkeypatch.setattr(core.STATE, "idx", None)
     status, body = gui.post("/api/restore", {})
     assert status == 200 and body["ok"], body
-    assert (root / "a.txt").read_text() == "one\n"
+    assert (root / "a.txt").read_text(encoding="utf-8") == "one\n"
     assert any("restor" in m["text"].lower() for m in core.STATE.messages)
 
 
@@ -604,16 +604,16 @@ def _config(gui):
 
 def test_settings_set_profile_edits_keep_comments_and_make_a_backup(gui):
     _config(gui)
-    before = gui.cfg_path.read_text()
+    before = gui.cfg_path.read_text(encoding="utf-8")
     status, body = gui.post("/api/settings/set", {
         "file": "user", "profile": "default",
         "changes": {"model": "bigger", "tier": "medium", "api_key": "sk-secret"}})
     assert status == 200
-    text = gui.cfg_path.read_text()
+    text = gui.cfg_path.read_text(encoding="utf-8")
     assert re.search(r'^model\s*= "bigger"', text, re.M)
     assert 'tier = "medium"' in text
     assert "# Pedacito configuration." in text
-    assert Path(str(gui.cfg_path) + ".bak").read_text() == before
+    assert Path(str(gui.cfg_path) + ".bak").read_text(encoding="utf-8") == before
     prof = body["user"]["profiles"]["default"]
     assert prof["api_key"] == "" and "api_key" in prof["_secret_set"]   # masked
     # the structured views never carry it; only the raw editor shows the file
@@ -623,12 +623,12 @@ def test_settings_set_profile_edits_keep_comments_and_make_a_backup(gui):
     # a blank secret means "unchanged"
     gui.post("/api/settings/set", {"file": "user", "profile": "default",
                                    "changes": {"api_key": ""}})
-    assert 'api_key = "sk-secret"' in gui.cfg_path.read_text()
+    assert 'api_key = "sk-secret"' in gui.cfg_path.read_text(encoding="utf-8")
 
 
 def test_settings_invalid_values_are_rejected_and_the_file_is_untouched(gui):
     _config(gui)
-    before = gui.cfg_path.read_text()
+    before = gui.cfg_path.read_text(encoding="utf-8")
     status, body = gui.post("/api/settings/set", {
         "file": "user", "changes": {"vram_gb": -4}})
     assert status == 400 and "positive whole number" in body["detail"]
@@ -640,7 +640,7 @@ def test_settings_invalid_values_are_rejected_and_the_file_is_untouched(gui):
     assert status == 400 and "temprature" in body["detail"]
     status, body = gui.post("/api/settings/raw", {"file": "user", "text": "[oops"})
     assert status == 400 and "invalid TOML" in body["detail"]
-    assert gui.cfg_path.read_text() == before
+    assert gui.cfg_path.read_text(encoding="utf-8") == before
 
 
 def test_settings_profile_lifecycle(gui):
@@ -674,9 +674,9 @@ def test_peek_lists_profiles_without_opening_the_project(gui):
 
 def test_settings_raw_save_and_project_file_needs_a_project(gui):
     _config(gui)
-    text = gui.cfg_path.read_text() + "\n# a note\n"
+    text = gui.cfg_path.read_text(encoding="utf-8") + "\n# a note\n"
     assert gui.post("/api/settings/raw", {"file": "user", "text": text})[0] == 200
-    assert gui.cfg_path.read_text().endswith("# a note\n")
+    assert gui.cfg_path.read_text(encoding="utf-8").endswith("# a note\n")
     status, p = gui.get("/api/settings")
     assert p["project"]["available"] is False
     root = gui.tmp / "proj"
@@ -685,7 +685,7 @@ def test_settings_raw_save_and_project_file_needs_a_project(gui):
     status, body = gui.post("/api/settings/set", {
         "file": "project", "changes": {"max_steps": 6}})
     assert status == 200
-    assert (root / ".pedacito.toml").read_text().strip().endswith("max_steps = 6")
+    assert (root / ".pedacito.toml").read_text(encoding="utf-8").strip().endswith("max_steps = 6")
     assert body["project"]["exists"]
 
 
@@ -729,7 +729,7 @@ def project(gui, fake_port):
                                      "model": "fake-model", "vram_gb": "8"})
     root = gui.tmp / "proj"
     root.mkdir()
-    (root / "app.py").write_text(APP)
+    (root / "app.py").write_text(APP, encoding="utf-8")
     status, body = gui.post("/api/project", {"path": str(root), "profile": ""})
     assert status == 202
     assert gui.wait_idle(30)
@@ -771,7 +771,7 @@ def _review_accept_flow(project):
     assert status == 202
     state = project.wait_for(_review_pending, 30)
     assert state, core.STATE.messages
-    assert (project.root / "app.py").read_text() == APP       # nothing written yet
+    assert (project.root / "app.py").read_text(encoding="utf-8") == APP       # nothing written yet
     # the staged diff reaches a polling page as part of the state payload, and
     # the chat says a review is waiting
     assert [f["rel"] for f in state["review"]["files"]] == ["app.py"]
@@ -789,7 +789,7 @@ def _review_accept_flow(project):
                                  "files": ["app.py"]})
     assert status == 200 and body["ok"]
     assert project.wait_idle(30)
-    assert 'return f"hello {name}"' in (project.root / "app.py").read_text()
+    assert 'return f"hello {name}"' in (project.root / "app.py").read_text(encoding="utf-8")
     assert "Applied changes to 1 file(s)" in [
         m["text"] for m in project.get("/api/state")[1]["messages"]]
     result = [m for m in core.STATE.messages if m.get("kind") == "result"][-1]
@@ -810,7 +810,7 @@ def test_task_review_reject_leaves_the_file_alone(project):
     assert project.post("/api/review/decide",
                         {"id": rid, "action": "reject"})[0] == 200
     assert project.wait_idle(30)
-    assert (project.root / "app.py").read_text() == APP
+    assert (project.root / "app.py").read_text(encoding="utf-8") == APP
     card = [m for m in core.STATE.messages if m["role"] == "review"][-1]
     assert card["outcome"] == "cancelled"
     assert "Rejected staged changes" in [
@@ -823,13 +823,13 @@ def test_direct_write_then_restore_from_the_backup(project):
         "mode": "task", "text": "make greet return its greeting",
         "write": "apply", "plan": "never"})
     assert status == 202 and project.wait_idle(30)
-    assert 'return f"hello {name}"' in (project.root / "app.py").read_text()
+    assert 'return f"hello {name}"' in (project.root / "app.py").read_text(encoding="utf-8")
     assert not (project.root / ".pedacito" / "run.lock").exists()   # released
     snaps = project.get("/api/state")[1]["snapshots"]
     assert snaps
     status, body = project.post("/api/restore", {"snapshot": snaps[0]})
     assert status == 200 and body["ok"]
-    assert (project.root / "app.py").read_text() == APP
+    assert (project.root / "app.py").read_text(encoding="utf-8") == APP
     assert project.post("/api/restore", {"snapshot": "nope"})[0] == 400
 
 
@@ -840,7 +840,7 @@ def test_explain_streams_into_the_chat_as_an_answer(project):
     assert status == 202 and project.wait_idle(30)
     answer = [m for m in core.STATE.messages if m.get("kind") == "answer"][-1]
     assert answer["role"] == "assistant" and answer["text"].strip()
-    assert (project.root / "app.py").read_text() == APP      # read-only
+    assert (project.root / "app.py").read_text(encoding="utf-8") == APP      # read-only
 
 
 @pytest.mark.network
@@ -870,7 +870,7 @@ def test_running_without_an_index_is_refused_with_guidance(gui, fake_port):
                                      "model": "fake-model", "vram_gb": "8"})
     root = gui.tmp / "p2"
     root.mkdir()
-    (root / "a.py").write_text("x = 1\n")
+    (root / "a.py").write_text("x = 1\n", encoding="utf-8")
     gui.post("/api/project", {"path": str(root), "profile": ""})
     assert gui.wait_idle(30)
     gui.post("/api/run", {"mode": "task", "text": "do it"})
@@ -920,7 +920,7 @@ def test_auto_applies_by_default_backs_up_and_lists_changed_files(
         return 0
 
     monkeypatch.setattr(jobs.cli_mod, "_cmd_auto", fake_auto)
-    (project.root / "PLAN.md").write_text("# Plan\n\n- [x] change greet\n")
+    (project.root / "PLAN.md").write_text("# Plan\n\n- [x] change greet\n", encoding="utf-8")
     status, _ = project.post("/api/run", {"mode": "auto",
                                           "text": "make greet return"})
     assert status == 202 and project.wait_idle(30)

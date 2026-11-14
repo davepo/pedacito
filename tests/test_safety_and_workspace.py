@@ -139,11 +139,11 @@ def test_tools_and_edit_blocks_refuse_protected_files(tmp_path):
                lambda: tools.tool_move(idx, cfg, "a.py", ".pedacito/a.py"),
                lambda: tools.tool_write(idx, cfg, ".git/hooks/post-commit", "rm -rf /")):
         assert fn().startswith("ERROR:") and "refused" in fn()
-    assert (tmp_path / "PLAN.md").read_text() == "- [ ] task\n"
+    assert (tmp_path / "PLAN.md").read_text(encoding="utf-8") == "- [ ] task\n"
     res = apply_edits(tmp_path, [Edit("PLAN.md", "- [ ] task", "- [x] task")],
                       backup=False, cfg=cfg)
     assert not res[0].ok and "plan file" in res[0].message
-    assert (tmp_path / "PLAN.md").read_text() == "- [ ] task\n"
+    assert (tmp_path / "PLAN.md").read_text(encoding="utf-8") == "- [ ] task\n"
     ok = apply_edits(tmp_path, [Edit("a.py", "x = 1", "x = 2")], backup=False, cfg=cfg)
     assert ok[0].ok
 
@@ -257,13 +257,13 @@ def test_event_log_writes_redacted_jsonl_and_prunes(tmp_path):
     log.emit("step", action="read", file="a.py",
              note="token sk-abcdefghijklmnopqrstuvwxyz0123456789")
     log.emit("call", prompt_tokens=10, cached_tokens=5)
-    rows = [json.loads(ln) for ln in log.path.read_text().splitlines()]
+    rows = [json.loads(ln) for ln in log.path.read_text(encoding="utf-8").splitlines()]
     assert [r["kind"] for r in rows] == ["step", "call"]
-    assert "sk-abcdef" not in log.path.read_text()
+    assert "sk-abcdef" not in log.path.read_text(encoding="utf-8")
     assert log.count("step") == 1
     d = tmp_path / ".pedacito" / "events"
     for i in range(5):
-        (d / f"2020010{i}-000000-1.jsonl").write_text("{}\n")
+        (d / f"2020010{i}-000000-1.jsonl").write_text("{}\n", encoding="utf-8")
     assert events.prune(tmp_path, 2, current=log.path) == 4
     assert events.load(tmp_path)
     assert events.cache_hit_ratio({"prompt_tokens": 200, "cached_tokens": 150}) == 0.75
@@ -327,14 +327,14 @@ def test_broken_and_slow_hooks_are_warnings_not_failures(tmp_path, capsys):
 # -------------------------------------------------------------------- workspace
 def test_backup_dirs_and_sessions_never_merge_within_a_second(tmp_path):
     a = workspace.new_backup_dir(tmp_path, "20260101-000000", unique=True)
-    (a / "f.txt").write_text("one")
+    (a / "f.txt").write_text("one", encoding="utf-8")
     b = workspace.new_backup_dir(tmp_path, "20260101-000000", unique=True)
     assert a != b and b.name == "20260101-000000-2"
     # the shared (non-unique) form is unchanged: one run, one directory
     assert workspace.new_backup_dir(tmp_path, "20260101-000000") == a
     s1 = workspace.write_session(tmp_path, "t1", [], "r", [], None, "20260101-000000")
     s2 = workspace.write_session(tmp_path, "t2", [], "r", [], None, "20260101-000000")
-    assert s1 != s2 and "t1" in s1.read_text() and "t2" in s2.read_text()
+    assert s1 != s2 and "t1" in s1.read_text(encoding="utf-8") and "t2" in s2.read_text(encoding="utf-8")
 
 
 def test_project_less_sessions_use_the_user_state_dir():
@@ -344,7 +344,7 @@ def test_project_less_sessions_use_the_user_state_dir():
                                 "20260101-000000")
     assert p == (config_mod.USER_STATE_DIR / "sessions" / "global"
                  / "20260101-000000.md")
-    assert p.exists() and "global task" in p.read_text()
+    assert p.exists() and "global task" in p.read_text(encoding="utf-8")
     assert sessions.session_dir(None) == p.parent
     assert [q.name for q in sessions.paths(None)] == ["20260101-000000.md"]
     assert "global task" in sessions.recent(None)
@@ -362,7 +362,7 @@ def test_prune_keeps_the_newest_and_trims_the_log(tmp_path):
     for i in range(6):
         workspace.write_session(tmp_path, f"t{i}", [], "r", [], None, f"2026010{i}-000000")
         d = workspace.new_backup_dir(tmp_path, f"2026010{i}-000000")
-        (d / "x").write_text("x")
+        (d / "x").write_text("x", encoding="utf-8")
     for i in range(30):
         workspace.log_event(tmp_path, "line " + "x" * 40 + str(i))
     dry = workspace.prune(tmp_path, 2, 3, log_max_bytes=500, dry_run=True)

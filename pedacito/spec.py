@@ -3304,7 +3304,8 @@ def _ruff_gate(root: Path, files: list[Path],
             "--select", ",".join(_STATIC_GATE_CODES), "--", *files]
     try:
         proc = subprocess.run(argv, capture_output=True, text=True,
-                              timeout=timeout, cwd=root)
+                              timeout=timeout, cwd=root,
+                              encoding="utf-8", errors="replace")
     except (OSError, subprocess.TimeoutExpired):
         return None
     if proc.returncode not in (0, 1):
@@ -3328,10 +3329,16 @@ def _ruff_gate(root: Path, files: list[Path],
 
 def _gate_label(root: Path, name: str) -> str:
     """Project-relative label for any engine's path, so ruff and the AST
-    fallback (and the baseline) always agree on a key's file part."""
+    fallback (and the baseline) always agree on a key's file part.
+
+    Windows-formatted diagnostics use backslashes; normalise them before
+    Path() so `src\\app.py` and `src/app.py` produce the same key on every
+    platform (on POSIX, `Path` would otherwise treat the backslashes as part
+    of one filename)."""
+    name = fileio.normalise_rel(name)
     p = Path(name)
     if not p.is_absolute():
-        p = root / p
+        p = root / name
     try:
         return p.resolve().relative_to(Path(root).resolve()).as_posix()
     except (OSError, ValueError):

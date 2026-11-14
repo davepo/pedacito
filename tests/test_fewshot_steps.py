@@ -71,7 +71,7 @@ def test_three_examples_sit_between_the_map_and_the_task(tmp_path):
     # a real definition of this project, with a range inside the file
     assert shots[0]["pattern"] == "add_tax"
     assert shots[1]["file"] == "pricing.py"
-    n_lines = len(Path(agent.index.root, "pricing.py").read_text().splitlines())
+    n_lines = len(Path(agent.index.root, "pricing.py").read_text(encoding="utf-8").splitlines())
     assert 1 <= shots[1]["start"] <= shots[1]["end"] <= n_lines
     # unused fields are left out; reasoning is present in each
     assert all("reasoning" in s and "content" not in s for s in shots)
@@ -195,7 +195,7 @@ def test_a_project_without_code_gets_no_block(tmp_path):
     from pedacito import index as index_mod
     root = tmp_path / "docs"
     root.mkdir()
-    (root / "notes.txt").write_text("hello\n")
+    (root / "notes.txt").write_text("hello\n", encoding="utf-8")
     cfg = Config()
     cfg.log_events = False
     cfg.log_sessions = False

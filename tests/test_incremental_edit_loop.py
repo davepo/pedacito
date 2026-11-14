@@ -110,8 +110,8 @@ def test_symbols_are_edited_one_hunk_at_a_time_with_source_popped(tmp_path):
 
     assert [r.ok for r in results] == [True, True]
     assert not [f for f in findings if f.severity == "error"]
-    assert "rate), 3" in (root / "pricing.py").read_text()
-    assert "sum(items) + 1" in (root / "cart.py").read_text()
+    assert "rate), 3" in (root / "pricing.py").read_text(encoding="utf-8")
+    assert "sum(items) + 1" in (root / "cart.py").read_text(encoding="utf-8")
     assert reply.splitlines()[1:] == [
         "[EDITED pricing.py:add_tax]", "[EDITED cart.py:total]"]
 
@@ -138,7 +138,7 @@ def test_an_invalid_hunk_is_rejected_before_the_next_symbol(tmp_path):
 
     assert [r.ok for r in results] == [True, True]
     # The bad syntax never reached disk; the repaired hunk did.
-    assert "rate), 3" in (root / "pricing.py").read_text()
+    assert "rate), 3" in (root / "pricing.py").read_text(encoding="utf-8")
     assert len(client.chat_calls) == 3
     assert "WAS REJECTED" in client.chat_calls[1][-1]["content"]
     assert "syntax error" in client.chat_calls[1][-1]["content"]
@@ -166,8 +166,8 @@ def test_loop_runs_tests_and_lint_after_all_symbol_hunks(tmp_path, monkeypatch):
     def fake_impacted(_idx, _cfg, files):
         test_runs.append((
             list(files),
-            "rate), 3" in (root / "pricing.py").read_text(),
-            "sum(items) + 1" in (root / "cart.py").read_text()))
+            "rate), 3" in (root / "pricing.py").read_text(encoding="utf-8"),
+            "sum(items) + 1" in (root / "cart.py").read_text(encoding="utf-8")))
         return True, "", "fake impacted tests"
 
     lint_runs: list[tuple[list[str], bool, bool]] = []
@@ -175,8 +175,8 @@ def test_loop_runs_tests_and_lint_after_all_symbol_hunks(tmp_path, monkeypatch):
     def fake_quick(_root, files):
         lint_runs.append((
             list(files),
-            "rate), 3" in (root / "pricing.py").read_text(),
-            "sum(items) + 1" in (root / "cart.py").read_text()))
+            "rate), 3" in (root / "pricing.py").read_text(encoding="utf-8"),
+            "sum(items) + 1" in (root / "cart.py").read_text(encoding="utf-8")))
         return {}
 
     monkeypatch.setattr(testsel, "run_impacted", fake_impacted)
@@ -240,8 +240,8 @@ def test_unaddressed_clause_seeds_one_bounded_followup_pass(tmp_path):
 
     assert [r.ok for r in results] == [True, True]
     assert not [f for f in findings if f.severity == "error"]
-    assert "def apply_discount" in (root / "pricing.py").read_text()
-    assert "def compute_shipping" in (root / "shipping.py").read_text()
+    assert "def apply_discount" in (root / "pricing.py").read_text(encoding="utf-8")
+    assert "def compute_shipping" in (root / "shipping.py").read_text(encoding="utf-8")
     assert "Coverage follow-up" in reply
     assert "[EDITED shipping.py:compute_shipping]" in reply
     # Exactly one follow-up pass, and its target message names clause two.
@@ -270,7 +270,7 @@ def test_followup_pass_does_not_recurse(tmp_path):
         TWO_CLAUSE_TASK, "", INTENT_DISCOUNT, verbose=False)
 
     assert [r.ok for r in results] == [True, False]
-    assert "return weight" in (root / "shipping.py").read_text()
+    assert "return weight" in (root / "shipping.py").read_text(encoding="utf-8")
     assert sum(1 for name, _ in events if name == "coverage_followup") == 1
     # one hunk for clause one, then the follow-up's three bounded attempts
     assert len(client.chat_calls) == 4

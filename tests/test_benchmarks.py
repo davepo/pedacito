@@ -282,7 +282,7 @@ def test_run_benchmark_writes_report_and_keeps_project(tmp_path):
                    "12/12", "Run It Yourself", "Requirement Ledger"):
         assert needle in text
     assert (result.project_dir / "BENCHMARK_TASK.md").is_file()
-    meta = json.loads((result.project_dir / "benchmark_run.json").read_text())
+    meta = json.loads((result.project_dir / "benchmark_run.json").read_text(encoding="utf-8"))
     assert meta["report_path"] == str(report)
     assert meta["project_path"] == str(result.project_dir)
     assert not any(result.project_dir.rglob("__pycache__"))

@@ -14,17 +14,14 @@ import sys
 import types
 from pathlib import Path
 
-import pytest
-
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from pedacito import (config as config_mod, edits, events,  # noqa: E402
-                      llm, loop, plan, refactor, scaffold, testsel,
-                      verify, webcheck)
+from pedacito import (  # noqa: E402
+    llm, loop, plan, refactor, scaffold, testsel, verify, webcheck)
 from pedacito import index as index_mod  # noqa: E402
 from pedacito.agent import Agent  # noqa: E402
 from pedacito.config import Config  # noqa: E402
-from pedacito.edits import Result, parse_edits  # noqa: E402
+from pedacito.edits import Result  # noqa: E402
 from pedacito.llm import LLMClient  # noqa: E402
 
 
@@ -151,7 +148,7 @@ def test_contract_fix_reverts_an_export_deleting_fix(tmp_path):
                    "document.getElementById('board');\nhelper();\n",
         "util.js": "export function helper() { return 1; }\n",
     })
-    util_before = (tmp_path / "util.js").read_text()
+    util_before = (tmp_path / "util.js").read_text(encoding="utf-8")
     # The "fix" replaces util.js wholesale and drops the `helper` export the
     # importer still needs: a NEW contract error naming util.js.
     reply = ("--- FILE: util.js\n<<<<<<< SEARCH\n=======\n"
@@ -160,7 +157,7 @@ def test_contract_fix_reverts_an_export_deleting_fix(tmp_path):
     fixed, errors = scaffold.fix_web_contracts(
         client, cfg, idx, pl, None, verbose=False, rounds=2)
     assert fixed == 0                                   # reverted, not counted
-    assert (tmp_path / "util.js").read_text() == util_before  # bytes restored
+    assert (tmp_path / "util.js").read_text(encoding="utf-8") == util_before  # bytes restored
 
 
 # --------------------------------------------------------------------------
@@ -305,7 +302,7 @@ def test_later_hunk_cannot_drop_an_earlier_append(tmp_path):
         "Add helper to a.js and tweak keep.", "", intents, verbose=False)
     assert client.calls == 3                    # the clobber was re-asked
     assert all(r.ok for r in results)
-    final = (tmp_path / "a.js").read_text()
+    final = (tmp_path / "a.js").read_text(encoding="utf-8")
     assert "export function helper()" in final  # the append survived
     assert "return 9" in final                  # the tweak landed too
     # The re-ask named the lost definition so the model could keep it.
@@ -429,7 +426,7 @@ def test_lost_export_gate_flags_a_dropped_imported_export(tmp_path):
         "src/main.js": "import { TRACK_IDS } from './pattern.js';\n"
                        "console.log(TRACK_IDS);\n",
     })
-    before = (tmp_path / "src/pattern.js").read_text()
+    before = (tmp_path / "src/pattern.js").read_text(encoding="utf-8")
     after = "export function generateEuclidean() { return 1; }\n"
     r = Result(True, "src/pattern.js", "replaced contents (2 -> 1 line(s))",
                before=before, after=after, whole_file=True)
@@ -443,7 +440,7 @@ def test_lost_export_gate_quiet_when_no_importer_needs_it(tmp_path):
         "src/pattern.js": "export const TRACK_IDS = [1];\n",
         "src/main.js": "console.log('hi');\n",
     })
-    before = (tmp_path / "src/pattern.js").read_text()
+    before = (tmp_path / "src/pattern.js").read_text(encoding="utf-8")
     r = Result(True, "src/pattern.js", "replaced contents (1 -> 1 line(s))",
                before=before, after="export const OTHER = [2];\n",
                whole_file=True)
@@ -572,7 +569,7 @@ def test_frontend_gate_wording_is_honest_about_the_write(tmp_path):
         [Result(True, "main.js", "applied")], "reply", None, None,
         ["main.js"], collect=[])
     log = (tmp_path / ".pedacito" / "events.jsonl")
-    text = log.read_text() if log.exists() else ""
+    text = log.read_text(encoding="utf-8") if log.exists() else ""
     if text:
         assert "found violations in the applied edits" in text
         assert "rejected the patch" not in text
@@ -611,8 +608,8 @@ def test_rename_strings_moves_labels_not_comments(tmp_path):
     assert res["ok"]
     assert res["string_replacements"] >= 2
     assert not res["string_matches"]
-    py = (tmp_path / "src/t.py").read_text()
-    js = (tmp_path / "tests/t.test.js").read_text()
+    py = (tmp_path / "src/t.py").read_text(encoding="utf-8")
+    js = (tmp_path / "tests/t.test.js").read_text(encoding="utf-8")
     assert 'LABEL = "toggleStepAt adds step"' in py
     assert '"toggleStepify is unrelated"' in py      # whole-word only
     assert "# toggleStep comment stays" in py        # comments untouched
@@ -628,7 +625,7 @@ def test_rename_strings_handles_fstring(tmp_path):
         tmp_path, "toggleStep", "toggleStepAt", dry_run=False,
         include_strings=True)
     assert res["ok"]
-    out = (tmp_path / "m.py").read_text()
+    out = (tmp_path / "m.py").read_text(encoding="utf-8")
     assert 'f"call {toggleStepAt} now: toggleStepAt label"' in out
 
 

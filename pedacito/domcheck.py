@@ -1074,7 +1074,6 @@ def _check_inproc(root, *, entry: str = "", timeout: int = 45,
                     pass
                 page.wait_for_timeout(250)
                 snap = page.evaluate(_SNAPSHOT_JS)
-                bindings = page.evaluate("window.__pdcBindings || []")
                 bound_targets = page.evaluate(
                     "window.__pdcBoundTargets ? window.__pdcBoundTargets() : []")
                 # Web Audio: probe only when the page touches the API --

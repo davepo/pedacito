@@ -4818,9 +4818,9 @@ def run_loop(root: Path, cfg, client, idx, plan_path: Path, *,
             # fixed" read as if the fix had happened. Name it, like the
             # partial-edit precedent above: never silently.
             red_tasks.append(task)
-            print(f"  [verification red: this task ticked done while the "
-                  f"last gate round was RED -- the files stay written, the "
-                  f"checks did not pass]", file=sys.stderr)
+            print("  [verification red: this task ticked done while the "
+                  "last gate round was RED -- the files stay written, the "
+                  "checks did not pass]", file=sys.stderr)
             workspace.log_event(
                 root, f"verification red on task '{task[:60]}': ticked done "
                       f"with the last gate round red", "WARN")

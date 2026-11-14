@@ -18,7 +18,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from pedacito import agent as agent_mod, cli, config as config_mod, rpc  # noqa: E402
+from pedacito import cli, config as config_mod, rpc  # noqa: E402
 from pedacito import scaffold, spec, tools, verify, webcheck  # noqa: E402
 from pedacito.agent import Agent  # noqa: E402
 from pedacito.config import Config  # noqa: E402

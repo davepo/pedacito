@@ -333,7 +333,10 @@ def _norm_key(path: str) -> str:
 
 # A `path:line` location inside a gate finding's message (the harness's own
 # formats: "ContractError in rel:12: ..." and ruff-style "rel:12:5: F821").
-_PATH_LINE_RE = re.compile(r"([A-Za-z0-9_./\\-]+\.[A-Za-z0-9]{1,8}):\d+")
+# The optional drive prefix keeps `C:\...\app.py:42` whole instead of starting
+# the match after the colon and dropping the drive letter.
+_PATH_LINE_RE = re.compile(
+    r"((?:[A-Za-z]:)?[A-Za-z0-9_./\\-]+\.[A-Za-z0-9]{1,8}):\d+")
 
 
 def _gate_flagged_files(errors) -> set:
@@ -478,7 +481,13 @@ def _delivered_end(obs: str, start: int) -> int:
         pm = _NUMBERED_LINE_RX.match(ln)
         if pm:
             end = max(end, int(pm.group(1)))
-    if "[truncated: context budget" in body and end >= start:
+    # Only the trailing marker line means a mid-line char cut. Checking for
+    # the phrase ANYWHERE in the body also matched a numbered source line
+    # whose own text happens to contain it, dropping a delivered line the
+    # evidence store kept (BUG-309 parity).
+    lines = body.split("\n")
+    if lines and lines[-1].startswith("[truncated: context budget") \
+            and end >= start:
         # The char cut can land mid-line: the last numbered line may be only
         # a prefix. The evidence store drops it (a half line is not
         # addressable source); the ledger must agree, or the two credit

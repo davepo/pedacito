@@ -124,12 +124,12 @@ def test_prompt_overrides_bypass_the_flag(tmp_path):
     root = tmp_path / "proj"
     (root / ".pedacito" / "prompts").mkdir(parents=True)
     (root / ".pedacito" / "prompts" / "edit_format.md").write_text(
-        "MY OWN FORMAT: nothing else around them.")
+        "MY OWN FORMAT: nothing else around them.", encoding="utf-8")
     cfg = _cfg(edit_plan_brief=True)
     cfg._root = str(root)
     assert prompts.edit_format(cfg, EDIT_FORMAT) == \
         "MY OWN FORMAT: nothing else around them."
-    (root / ".pedacito" / "prompts" / "answer.md").write_text("MY ANSWER BRIEF")
+    (root / ".pedacito" / "prompts" / "answer.md").write_text("MY ANSWER BRIEF", encoding="utf-8")
     assert prompts.answer_system(cfg, EDIT_FORMAT, "t") == "MY ANSWER BRIEF"
 
 

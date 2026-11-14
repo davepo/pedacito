@@ -1991,7 +1991,7 @@ def check_fuzzy(results) -> list[Finding]:
 # `:` or space before the line numbers.
 _NEED_RE = re.compile(
     r"(?im)^[ \t]*(?:[-*]|\d+[.)])?[ \t]*NEED[ \t]+[`'\"]?[ \t]*"
-    r"([\w./\\-]+\.[A-Za-z][A-Za-z0-9]{0,7})"
+    r"((?:[A-Za-z]:)?[\w./\\-]+\.[A-Za-z][A-Za-z0-9]{0,7})"
     r"(?:[ \t]*:[ \t]*|[ \t]+)"
     r"(\d+)(?:[ \t]*(?:-|\u2013|[ \t]to)[ \t]*(\d+))?[ \t]*[`'\"]?[ \t]*$")
 
@@ -2004,7 +2004,7 @@ def find_needs(reply: str) -> list[tuple[str, int, int]]:
     out: list[tuple[str, int, int]] = []
     seen: set[tuple[str, int, int]] = set()
     for m in _NEED_RE.finditer(reply or ""):
-        name = m.group(1).strip()
+        name = fileio.normalise_rel(m.group(1).strip())
         a = int(m.group(2))
         b = int(m.group(3)) if m.group(3) else a
         if a > b:

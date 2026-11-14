@@ -18,8 +18,6 @@ import sys
 from pathlib import Path
 from types import SimpleNamespace
 
-import pytest
-
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
@@ -44,39 +42,39 @@ def _block(rel, search, replace, header=""):
 # --- U3: numeric-SEARCH auto-reanchor ----------------------------------------
 
 def test_numeric_search_reanchors_to_the_line(tmp_path):
-    (tmp_path / "f.txt").write_text("alpha\nbeta\ngamma\ndelta\n")
+    (tmp_path / "f.txt").write_text("alpha\nbeta\ngamma\ndelta\n", encoding="utf-8")
     reply = _block("f.txt", "3", "GAMMA")
     res = edits.apply_edits(tmp_path, edits.parse_edits(reply), backup=False)
     assert res[0].ok, res[0].message
-    assert (tmp_path / "f.txt").read_text() == "alpha\nbeta\nGAMMA\ndelta\n"
+    assert (tmp_path / "f.txt").read_text(encoding="utf-8") == "alpha\nbeta\nGAMMA\ndelta\n"
     assert "auto-reanchored" in res[0].message
 
 
 def test_numeric_search_that_occurs_lit_keeps_text_semantics(tmp_path):
-    (tmp_path / "f.txt").write_text("version 3\nother\n")
+    (tmp_path / "f.txt").write_text("version 3\nother\n", encoding="utf-8")
     reply = _block("f.txt", "3", "4")
     res = edits.apply_edits(tmp_path, edits.parse_edits(reply), backup=False)
     assert res[0].ok, res[0].message
     # matched the literal "3" inside "version 3", NOT line 3
-    assert (tmp_path / "f.txt").read_text() == "version 4\nother\n"
+    assert (tmp_path / "f.txt").read_text(encoding="utf-8") == "version 4\nother\n"
     assert "auto-reanchored" not in res[0].message
 
 
 def test_numeric_search_out_of_range_refuses_with_teaching(tmp_path):
-    (tmp_path / "f.txt").write_text("alpha\nbeta\n")
+    (tmp_path / "f.txt").write_text("alpha\nbeta\n", encoding="utf-8")
     reply = _block("f.txt", "99", "X")
     res = edits.apply_edits(tmp_path, edits.parse_edits(reply), backup=False)
     assert not res[0].ok
     assert "99" in res[0].message and "line number" in res[0].message
     # nothing was written
-    assert (tmp_path / "f.txt").read_text() == "alpha\nbeta\n"
+    assert (tmp_path / "f.txt").read_text(encoding="utf-8") == "alpha\nbeta\n"
 
 
 # --- U2: context-window edit discipline --------------------------------------
 
 def test_empty_search_overwrite_marks_whole_file(tmp_path):
     big = "\n".join(f"line{i}" for i in range(200)) + "\n"
-    (tmp_path / "big.txt").write_text(big)
+    (tmp_path / "big.txt").write_text(big, encoding="utf-8")
     # a genuine same-size rewrite (no copied lines) passes the shrink guard
     fresh = "\n".join(f"newline{i}" for i in range(200)) + "\n"
     reply = _block("big.txt", "", fresh)

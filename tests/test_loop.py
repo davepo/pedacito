@@ -22,7 +22,7 @@ from pedacito.config import Config
 def test_write_and_read_plan_roundtrip(tmp_path):
     plan = tmp_path / "PLAN.md"
     loop.write_plan(plan, "build a todo CLI", ["task one", "task two"])
-    text = plan.read_text()
+    text = plan.read_text(encoding="utf-8")
     assert "# Plan" in text and "Goal: build a todo CLI" in text
     assert "- [ ] task one" in text and "- [ ] task two" in text
     assert loop.read_plan(plan) == text.split("\n")
@@ -38,7 +38,7 @@ def test_next_task_and_mark_done(tmp_path):
     idx, task = loop.next_task(loop.read_plan(plan))
     assert task == "second"
     # A task already done is never re-picked, and [x] boxes are not unchecked.
-    assert "- [x] first" in plan.read_text()
+    assert "- [x] first" in plan.read_text(encoding="utf-8")
 
 
 def test_mark_failed_is_skipped_not_retried(tmp_path):
@@ -47,7 +47,7 @@ def test_mark_failed_is_skipped_not_retried(tmp_path):
     assert loop.mark_failed(plan, "doomed")
     idx, task = loop.next_task(loop.read_plan(plan))
     assert task == "next", "a failed task must not be re-picked by the loop"
-    assert "- [!] doomed" in plan.read_text()
+    assert "- [!] doomed" in plan.read_text(encoding="utf-8")
 
 
 def test_mark_unknown_task_returns_false(tmp_path):
@@ -618,7 +618,7 @@ def test_run_investigation_task_retries_an_empty_answer(tmp_path):
     # model flake from a harness bug after the fact. Both the retry and
     # the stand-in synthesis must land in the event log.
     from pedacito import workspace
-    log = workspace.run_log_path(tmp_path).read_text()
+    log = workspace.run_log_path(tmp_path).read_text(encoding="utf-8")
     assert "retrying once" in log
     assert "synthesized a steps-log stand-in" in log
 
@@ -737,7 +737,7 @@ def test_run_investigation_task_regenerates_a_collapsed_answer(tmp_path):
     assert len(calls) == 2
     assert tr.reply == CLEAN
     from pedacito import workspace
-    assert "collapsed" in workspace.run_log_path(tmp_path).read_text()
+    assert "collapsed" in workspace.run_log_path(tmp_path).read_text(encoding="utf-8")
 
     class AlwaysCollapsed(FakeAgent):
         def answer(self, task, gathered, **kw):
@@ -784,8 +784,8 @@ def test_run_loop_marks_investigation_task_done_without_edits(tmp_path,
     fix_task = calls[1][1]
     assert "CONTEXT FROM PRIOR INVESTIGATION" in fix_task
     assert "window opens black" in fix_task
-    assert "- [x] Reproduce the black screen" in plan.read_text()
-    assert "- [x] Fix the rendering bug" in plan.read_text()
+    assert "- [x] Reproduce the black screen" in plan.read_text(encoding="utf-8")
+    assert "- [x] Fix the rendering bug" in plan.read_text(encoding="utf-8")
 
 
 def test_run_loop_fails_verify_task_that_gathered_no_evidence(tmp_path,
@@ -832,7 +832,7 @@ def test_run_loop_fails_verify_task_that_gathered_no_evidence(tmp_path,
     # does not, and no remediation task was ever inserted.
     assert "RETRY" in calls[2][1]
     assert "RETRY" not in calls[1][1]
-    text = plan.read_text()
+    text = plan.read_text(encoding="utf-8")
     assert "- [x] Fix the snake colors" in text
     assert "- [x] Run the game" not in text
     assert "- [!]" in text                  # retired as unverified
@@ -882,7 +882,7 @@ def test_run_loop_procedural_verify_retry_can_pass(tmp_path, monkeypatch):
     # The re-run carries the procedural corrective note, and only it does.
     assert "NEVER RAN THE CHECK" in calls[2][1]
     assert "RETRY" not in calls[1][1]
-    text = plan.read_text()
+    text = plan.read_text(encoding="utf-8")
     assert "- [x] Run the game" in text     # the check passed on attempt 2
     assert "- [!]" not in text
     assert "Repair the defect" not in text  # never remediated
@@ -909,7 +909,7 @@ def test_run_loop_edit_task_needs_evidence_when_title_says_verify(tmp_path,
                          repair_rounds=0)   # isolate the gate; remediation
                                             # has its own tests
     assert code == 1
-    assert "- [x]" not in plan.read_text()
+    assert "- [x]" not in plan.read_text(encoding="utf-8")
 
 
 def test_run_loop_live_verify_needs_a_live_step(tmp_path, monkeypatch):
@@ -933,7 +933,7 @@ def test_run_loop_live_verify_needs_a_live_step(tmp_path, monkeypatch):
                          repair_rounds=0)   # isolate the gate; remediation
                                             # has its own tests
     assert code == 1
-    assert "- [x]" not in plan.read_text()
+    assert "- [x]" not in plan.read_text(encoding="utf-8")
 
 
 def test_failed_live_steps_do_not_satisfy_the_evidence_gate():
@@ -994,7 +994,7 @@ def test_run_loop_live_verify_passes_with_browser_step(tmp_path, monkeypatch):
     monkeypatch.setattr(loop, "run_investigation_task", fake_investigate)
     code = loop.run_loop(tmp_path, _cfg(), None, idx, plan, apply=True)
     assert code == 0
-    assert "- [x] Run the game" in plan.read_text()
+    assert "- [x] Run the game" in plan.read_text(encoding="utf-8")
 
 
 def test_insert_task_before_keeps_the_failed_check_unchecked(tmp_path):
@@ -1006,7 +1006,7 @@ def test_insert_task_before_keeps_the_failed_check_unchecked(tmp_path):
     loop.mark_done(plan, "Fix the sprite rows")
     assert loop.insert_task_before(plan, "Run the game and verify one head",
                                    loop._REMEDIATION_TITLE)
-    lines = [ln for ln in plan.read_text().splitlines()
+    lines = [ln for ln in plan.read_text(encoding="utf-8").splitlines()
              if ln.startswith("- [")]
     assert lines == ["- [x] Fix the sprite rows",
                      f"- [ ] {loop._REMEDIATION_TITLE}",
@@ -1082,7 +1082,7 @@ def test_run_loop_inserts_remediation_after_failed_verify(tmp_path, monkeypatch)
     # the goal's frozen spawn timing.
     assert "only a hypothesis" in repairs[0]
     assert "freezes" in repairs[0]
-    text = plan.read_text()
+    text = plan.read_text(encoding="utf-8")
     assert text.count("- [x]") == 2    # repair + retried check
     assert "- [ ]" not in text
 
@@ -1116,7 +1116,7 @@ def test_run_loop_remediation_rounds_are_bounded(tmp_path, monkeypatch):
                          repair_rounds=2)
     assert code == 1
     assert len(verifies) == 3          # initial + two post-repair retries
-    text = plan.read_text()
+    text = plan.read_text(encoding="utf-8")
     assert text.count("- [x] Repair") == 2
     assert "- [ ] Run the game and verify" in text
 
@@ -1169,7 +1169,7 @@ def test_run_loop_retires_a_check_whose_repair_refused_to_edit(tmp_path,
     assert len(verifies) == 2            # original + one retry, no more
     assert len(repairs) == 1             # one repair, then retired
     assert len(fixes) == 1               # the DOWNSTREAM task still ran
-    text = plan.read_text()
+    text = plan.read_text(encoding="utf-8")
     assert "- [!] Run the game and verify the delay" in text
     assert "- [x] Fix the sprite rows" in text
 
@@ -1206,7 +1206,7 @@ def test_run_loop_empty_report_gets_no_remediation(tmp_path, monkeypatch):
     monkeypatch.setattr(loop, "run_investigation_task", fake_investigate)
     code = loop.run_loop(tmp_path, _cfg(), None, idx, plan, apply=True)
     assert code == 1
-    assert "Repair the defect" not in plan.read_text()
+    assert "Repair the defect" not in plan.read_text(encoding="utf-8")
 
 
 def test_run_loop_fails_verify_task_reporting_a_failed_verification(
@@ -1234,7 +1234,7 @@ def test_run_loop_fails_verify_task_reporting_a_failed_verification(
                          repair_rounds=0)   # isolate the gate; remediation
                                             # has its own tests
     assert code == 1
-    assert "- [x]" not in plan.read_text()
+    assert "- [x]" not in plan.read_text(encoding="utf-8")
 
 
 def test_run_loop_fails_verify_task_with_no_prose_report(tmp_path, monkeypatch):
@@ -1261,7 +1261,7 @@ def test_run_loop_fails_verify_task_with_no_prose_report(tmp_path, monkeypatch):
                          repair_rounds=0)   # isolate the gate; remediation
                                             # has its own tests
     assert code == 1
-    assert "- [x]" not in plan.read_text()
+    assert "- [x]" not in plan.read_text(encoding="utf-8")
 
 
 def test_run_loop_edit_verify_task_needs_live_step(tmp_path, monkeypatch):
@@ -1284,7 +1284,7 @@ def test_run_loop_edit_verify_task_needs_live_step(tmp_path, monkeypatch):
                          repair_rounds=0)   # isolate the gate; remediation
                                             # has its own tests
     assert code == 1
-    assert "- [x]" not in plan.read_text()
+    assert "- [x]" not in plan.read_text(encoding="utf-8")
 
 
 def test_run_loop_carries_goal_into_task_prompt(tmp_path, monkeypatch):
@@ -1698,7 +1698,7 @@ def test_run_loop_implements_each_task_in_order(tmp_path, monkeypatch):
     assert code == 0
     # Titles only: tasks after an applied edit also carry the staleness note.
     assert [c.split("\n\n")[0] for c in calls] == ["task A", "task B", "task C"]
-    text = plan.read_text()
+    text = plan.read_text(encoding="utf-8")
     assert "- [x] task A" in text and "- [x] task B" in text and "- [x] task C" in text
 
 
@@ -1715,7 +1715,7 @@ def test_run_loop_respects_max_tasks(tmp_path, monkeypatch):
     monkeypatch.setattr(loop, "run_task", fake_run_task)
     loop.run_loop(tmp_path, _cfg(), None, idx, plan, apply=True, max_tasks=2)
     assert [c.split("\n\n")[0] for c in calls] == ["a", "b"]
-    assert "- [ ] c" in plan.read_text()          # never reached
+    assert "- [ ] c" in plan.read_text(encoding="utf-8")          # never reached
 
 
 def test_run_loop_respects_max_minutes_between_tasks(tmp_path, monkeypatch):
@@ -1737,7 +1737,7 @@ def test_run_loop_respects_max_minutes_between_tasks(tmp_path, monkeypatch):
                          max_minutes=1)
     assert code == 0
     assert calls == ["a"]
-    text = plan.read_text()
+    text = plan.read_text(encoding="utf-8")
     assert "- [x] a" in text
     assert "- [ ] b" in text              # not started after the time limit
 
@@ -1753,7 +1753,7 @@ def test_run_loop_stops_on_failed_task(tmp_path, monkeypatch):
     monkeypatch.setattr(loop, "run_task", fake_run_task)
     code = loop.run_loop(tmp_path, _cfg(), None, idx, plan, apply=True)
     assert code == 1
-    assert "- [ ] broken" in plan.read_text()     # not marked (we stopped)
+    assert "- [ ] broken" in plan.read_text(encoding="utf-8")     # not marked (we stopped)
 
 
 def test_run_loop_keep_going_flags_and_continues(tmp_path, monkeypatch):
@@ -1771,7 +1771,7 @@ def test_run_loop_keep_going_flags_and_continues(tmp_path, monkeypatch):
                          stop_on_fail=False)
     assert calls == ["broken", "good"]
     assert code == 1
-    text = plan.read_text()
+    text = plan.read_text(encoding="utf-8")
     assert "- [!] broken" in text                 # flagged, never re-picked
     assert "- [x] good" in text
 
@@ -1797,7 +1797,7 @@ def test_run_loop_treats_noop_reply_as_done(tmp_path, monkeypatch):
     code = loop.run_loop(tmp_path, _cfg(), None, idx, plan, apply=True)
     assert code == 0
     assert calls == ["already done", "real work"]
-    text = plan.read_text()
+    text = plan.read_text(encoding="utf-8")
     assert "- [x] already done" in text
     assert "- [x] real work" in text
 
@@ -1831,12 +1831,12 @@ def test_run_loop_does_not_tick_a_verification_task_done_on_a_noop_reply(
     assert code == 1
     assert len(calls) == 2               # one procedural re-run, then a verdict
     assert "NEVER RAN THE CHECK" in calls[1]
-    text = plan.read_text()
+    text = plan.read_text(encoding="utf-8")
     assert f"- [x] {title}" not in text
     assert "- [!] Update the palette" in text
     from pedacito import workspace
     assert "no-op verification rejected" not in workspace.run_log_path(
-        tmp_path).read_text()      # retired as procedural, not as a product bug
+        tmp_path).read_text(encoding="utf-8")      # retired as procedural, not as a product bug
 
 
 def test_run_loop_fails_a_noop_verification_that_admits_it_could_not_check(
@@ -1863,10 +1863,10 @@ def test_run_loop_fails_a_noop_verification_that_admits_it_could_not_check(
     code = loop.run_loop(tmp_path, _cfg(), None, idx, plan, apply=True,
                          stop_on_fail=False, repair_rounds=0)
     assert code == 1
-    assert "- [!] Update the palette" in plan.read_text()
+    assert "- [!] Update the palette" in plan.read_text(encoding="utf-8")
     from pedacito import workspace
     assert "no-op verification rejected" in workspace.run_log_path(
-        tmp_path).read_text()
+        tmp_path).read_text(encoding="utf-8")
 
 
 def test_run_loop_ticks_a_noop_verification_task_that_did_observe(
@@ -1890,7 +1890,7 @@ def test_run_loop_ticks_a_noop_verification_task_that_did_observe(
     monkeypatch.setattr(loop, "run_task", fake_run_task)
     code = loop.run_loop(tmp_path, _cfg(), None, idx, plan, apply=True)
     assert code == 0
-    assert f"- [x] {title}" in plan.read_text()
+    assert f"- [x] {title}" in plan.read_text(encoding="utf-8")
 
 
 def test_plan_exhausted_with_failures_is_not_reported_as_complete(
@@ -1915,10 +1915,10 @@ def test_plan_exhausted_with_failures_is_not_reported_as_complete(
     assert code == 1
     assert "All tasks complete" not in err
     assert "Plan exhausted" in err and "FAILED" in err
-    assert "- [x] next" in plan.read_text()
+    assert "- [x] next" in plan.read_text(encoding="utf-8")
     from pedacito import workspace
     assert "plan exhausted with 1 failed task(s)" in workspace.run_log_path(
-        tmp_path).read_text()
+        tmp_path).read_text(encoding="utf-8")
 
 
 def test_all_tasks_complete_is_still_logged_for_a_clean_finish(
@@ -1937,7 +1937,7 @@ def test_all_tasks_complete_is_still_logged_for_a_clean_finish(
     assert "All tasks complete" in err
     assert "Plan exhausted" not in err
     from pedacito import workspace
-    assert "all tasks complete" in workspace.run_log_path(tmp_path).read_text()
+    assert "all tasks complete" in workspace.run_log_path(tmp_path).read_text(encoding="utf-8")
 
 
 def test_run_loop_retries_a_fabricated_noop_task_instead_of_ticking_it(
@@ -1970,7 +1970,7 @@ def test_run_loop_retries_a_fabricated_noop_task_instead_of_ticking_it(
     assert calls[0] == "move the dead file"
     assert calls[1].startswith("move the dead file")
     assert "NO-OPS" in calls[1]            # the retry carries the corrective note
-    assert "- [x] move the dead file" in plan.read_text()
+    assert "- [x] move the dead file" in plan.read_text(encoding="utf-8")
 
 
 def test_run_loop_marks_a_twice_fabricated_noop_task_failed(tmp_path,
@@ -1992,7 +1992,7 @@ def test_run_loop_marks_a_twice_fabricated_noop_task_failed(tmp_path,
                          stop_on_fail=False)
     assert code == 1
     assert len(calls) == 2                 # one retry, then a verdict
-    assert "- [!] move the dead file" in plan.read_text()
+    assert "- [!] move the dead file" in plan.read_text(encoding="utf-8")
 
 
 def test_run_loop_reruns_an_empty_report_once_then_retires_the_check(
@@ -2035,11 +2035,11 @@ def test_run_loop_reruns_an_empty_report_once_then_retires_the_check(
     assert ("RETRY -- THE PREVIOUS ATTEMPT'S REPORT CAME BACK EMPTY"
             in calls[1])
     assert calls[2] == "real work"          # the plan CONTINUED
-    text = plan.read_text()
+    text = plan.read_text(encoding="utf-8")
     assert "- [!] Verify the frog sprite" in text
     assert "- [x] real work" in text
     from pedacito import workspace
-    log = workspace.run_log_path(tmp_path).read_text()
+    log = workspace.run_log_path(tmp_path).read_text(encoding="utf-8")
     assert "re-running once, no remediation" in log
     assert "produced no prose on two attempts" in log
 
@@ -2104,7 +2104,7 @@ def test_run_loop_incomplete_move_task_is_not_a_noop(tmp_path, monkeypatch):
     assert "Move each file" in calls[0] and "RETRY" not in calls[0]
     assert "Move each file" in calls[1] and "DID NOT DO THE WORK" in calls[1]
     assert "Update the manifest" in calls[2]
-    text = plan.read_text()
+    text = plan.read_text(encoding="utf-8")
     assert "- [x] Move each file" not in text   # the fake-done never ticks
     assert "- [!] Move each file" in text       # failed loudly instead
     assert "- [x] Update the manifest" in text  # the plan carries on
@@ -2134,7 +2134,7 @@ def test_run_loop_verification_repair_round_trip(tmp_path, monkeypatch):
     assert len(tasks) == 2                         # original + one repair
     assert tasks[0] == "needs tests"
     assert "failed this check" in tasks[1]
-    assert "- [x] needs tests" in plan.read_text()
+    assert "- [x] needs tests" in plan.read_text(encoding="utf-8")
 
 
 def test_run_loop_auto_diagnostics_feeds_repair_rounds(tmp_path, monkeypatch):
@@ -2186,7 +2186,7 @@ def test_run_loop_verification_exhausts_repair_rounds(tmp_path, monkeypatch):
                          verify="pytest -q", repair_rounds=2)
     assert code == 1
     assert len(tasks) == 3                         # initial + two repairs
-    assert "- [ ] always failing" in plan.read_text()   # never marked done
+    assert "- [ ] always failing" in plan.read_text(encoding="utf-8")   # never marked done
 
 
 def test_run_loop_stops_when_no_tasks(tmp_path, monkeypatch):
@@ -2238,7 +2238,7 @@ def test_run_loop_does_not_code_repair_missing_dependency(tmp_path, monkeypatch)
                          auto_install=False)
     assert code == 1
     assert tasks == ["implement main"], "must not spawn code-repair tasks"
-    assert "- [ ] implement main" in plan.read_text()
+    assert "- [ ] implement main" in plan.read_text(encoding="utf-8")
 
 
 def test_run_loop_auto_installs_missing_dependency(tmp_path, monkeypatch):
@@ -2264,7 +2264,7 @@ def test_run_loop_auto_installs_missing_dependency(tmp_path, monkeypatch):
                          verify="python main.py", auto_install=True)
     assert code == 0
     assert installs == [["pygame"]]
-    assert "- [x] implement main" in plan.read_text()
+    assert "- [x] implement main" in plan.read_text(encoding="utf-8")
 
 
 def test_run_loop_auto_install_does_not_loop_when_module_stays_missing(
@@ -2361,10 +2361,10 @@ def test_run_task_applies_edits_and_reindexes(tmp_path):
     assert "new_name.py" in tr.changed           # reindexed after the write
     assert (tmp_path / "new_name.py").is_file()
     assert not (tmp_path / "old_name.py").exists()
-    assert 'print("hi")' in (tmp_path / "new_name.py").read_text()
+    assert 'print("hi")' in (tmp_path / "new_name.py").read_text(encoding="utf-8")
     # The operational run log records the task and its result.
     from pedacito import workspace
-    log = workspace.run_log_path(tmp_path).read_text()
+    log = workspace.run_log_path(tmp_path).read_text(encoding="utf-8")
     assert "task: rename old_name.py to new_name.py" in log
     assert "applied new_name.py" in log
 
@@ -2444,7 +2444,7 @@ def test_run_task_recovers_after_tool_call_reply(tmp_path):
     tr = loop.run_task(tmp_path, cfg, client, Agent(idx, client, cfg), idx,
                        "implement player.py", apply=True, review=False)
     assert tr.applied, "recovery did not apply the re-asked edit"
-    assert "def update()" in (tmp_path / "player.py").read_text()
+    assert "def update()" in (tmp_path / "player.py").read_text(encoding="utf-8")
     assert client.answers == 2
 
 
@@ -2514,10 +2514,10 @@ def test_run_task_discards_edit_blocks_that_contradict_a_refusal(tmp_path):
     assert agent.apply_calls == 0          # blocks never touched the disk
     assert tr.results == []
     assert tr.reply == REPLY               # the refusal stays the record
-    assert (tmp_path / "index.html").read_text() == \
+    assert (tmp_path / "index.html").read_text(encoding="utf-8") == \
         '<script src="/static/js/main.js"></script>\n'
     from pedacito import workspace
-    log = workspace.run_log_path(tmp_path).read_text()
+    log = workspace.run_log_path(tmp_path).read_text(encoding="utf-8")
     assert "blocks discarded" in log
     # The generic no-blocks ERROR is suppressed: this is a decision the
     # harness honored, not a parse failure.
@@ -2603,9 +2603,9 @@ def test_run_task_treats_fabricated_noop_blocks_as_a_refusal(tmp_path):
     assert tr.results == []
     assert "[No changes:" in tr.reply
     assert loop._is_noop(tr.reply)             # the outer loop sees refusal
-    assert (tmp_path / "main.js").read_text() == "window.__game = state;\n"
+    assert (tmp_path / "main.js").read_text(encoding="utf-8") == "window.__game = state;\n"
     from pedacito import workspace
-    log = workspace.run_log_path(tmp_path).read_text()
+    log = workspace.run_log_path(tmp_path).read_text(encoding="utf-8")
     assert "treated as a refusal" in log
     # Suppressed: a fabricated null edit is a decision the harness honored,
     # not a parse failure.
@@ -2702,7 +2702,7 @@ def test_run_task_propagates_a_reask_no_changes_reply(tmp_path):
     assert tr.reply.startswith("No changes:")
     assert loop._is_noop(tr.reply)       # the outer loop sees the refusal
     from pedacito import workspace
-    log = workspace.run_log_path(tmp_path).read_text()
+    log = workspace.run_log_path(tmp_path).read_text(encoding="utf-8")
     assert "no edit blocks parsed" not in log
     assert "honored as a refusal" in log
 
@@ -2764,7 +2764,7 @@ def test_gather_only_run_is_verified_not_escalated(tmp_path, monkeypatch):
     assert tr.results == [] and not tr.fabricated
     assert noted == []                     # work landed: no failure memory
     from pedacito import workspace
-    log = workspace.run_log_path(tmp_path).read_text()
+    log = workspace.run_log_path(tmp_path).read_text(encoding="utf-8")
     assert "no edit blocks parsed" not in log
 
 
@@ -2784,7 +2784,7 @@ def test_run_loop_accepts_gather_only_progress(tmp_path, monkeypatch):
     monkeypatch.setattr(loop, "run_task", fake_run_task)
     code = loop.run_loop(tmp_path, _cfg(), None, idx, plan, apply=True)
     assert code == 0
-    assert "- [x] Rename the helper everywhere" in plan.read_text()
+    assert "- [x] Rename the helper everywhere" in plan.read_text(encoding="utf-8")
 
 
 def test_run_loop_strict_flags_unclean_tasks(tmp_path, monkeypatch):
@@ -2809,7 +2809,7 @@ def test_run_loop_strict_flags_unclean_tasks(tmp_path, monkeypatch):
                              strict=strict)
         # the task is still ticked done: strict changes the exit code, not
         # the plan's bookkeeping
-        assert "- [x] Fix the discount" in plan.read_text()
+        assert "- [x] Fix the discount" in plan.read_text(encoding="utf-8")
         return code
 
     partial = loop.TaskResult([ok_block, bad_block], "done", True,
@@ -2840,7 +2840,7 @@ def test_run_log_records_events(tmp_path):
     from pedacito import workspace
     workspace.log_event(tmp_path, "hello", "INFO")
     workspace.log_event(tmp_path, "boom", "ERROR")
-    log = workspace.run_log_path(tmp_path).read_text()
+    log = workspace.run_log_path(tmp_path).read_text(encoding="utf-8")
     assert "hello" in log and "boom" in log
     assert "INFO" in log and "ERROR" in log
     # one line per event, with a timestamp and a padded kind column
@@ -2868,7 +2868,7 @@ def test_auto_regenerates_when_plan_is_complete(tmp_path):
                                  repair=None, max_tasks=None, keep_going=False)
     code = cli._cmd_auto(args, Config(), Stub(), None, tmp_path)
     assert code == 0
-    text = plan.read_text()
+    text = plan.read_text(encoding="utf-8")
     assert "- [ ] fix the bug" in text
     assert "- [ ] add a test" in text
     assert "old task" not in text
@@ -2891,7 +2891,7 @@ def test_auto_resumes_plan_with_open_tasks(tmp_path):
                                  repair=None, max_tasks=None, keep_going=False)
     code = cli._cmd_auto(args, Config(), Stub(), None, tmp_path)
     assert code == 0
-    text = plan.read_text()
+    text = plan.read_text(encoding="utf-8")
     assert "- [x] done task" in text
     assert "- [ ] open task" in text
 
@@ -3003,7 +3003,7 @@ def test_new_complex_chains_to_auto_loop(tmp_path, monkeypatch):
     assert "Implement parser.py -- parse" in text
     # The skeleton (interface stubs) is on disk before the loop runs.
     assert (tmp_path / "main.py").is_file()
-    assert "def parse(text)" in (tmp_path / "parser.py").read_text()
+    assert "def parse(text)" in (tmp_path / "parser.py").read_text(encoding="utf-8")
 
 
 def test_new_complex_dry_run_writes_nothing(tmp_path, monkeypatch):
@@ -3160,7 +3160,7 @@ def test_fix_api_mismatches_repairs_a_call(tmp_path):
     n = scaffold.fix_api_mismatches(Stub(), Config(), idx, plan, None,
                                     verbose=False)
     assert n == 1
-    assert "Game(1)" in (tmp_path / "main.py").read_text()
+    assert "Game(1)" in (tmp_path / "main.py").read_text(encoding="utf-8")
     from pedacito import apicheck
     assert apicheck.find_mismatches(
         scaffold._py_sources(tmp_path, ["main.py", "core.py"])) == []
@@ -3359,8 +3359,8 @@ def test_run_loop_rolls_back_a_repair_that_made_verify_worse(tmp_path,
     assert code == 1
     assert len(tasks) == 2                       # gave up after the rollback
     assert "failed this check" in tasks[1]
-    assert (tmp_path / "a.py").read_text() == "GOOD = 1\n"
-    assert "- [!] needs tests" in plan.read_text()
+    assert (tmp_path / "a.py").read_text(encoding="utf-8") == "GOOD = 1\n"
+    assert "- [!] needs tests" in plan.read_text(encoding="utf-8")
 
 
 def test_run_loop_keeps_repairing_while_the_score_does_not_rise(tmp_path,

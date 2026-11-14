@@ -77,7 +77,7 @@ def test_post_edit_check_asks_for_a_fix_and_applies_it(tmp_path, monkeypatch):
     results, final = agent.apply(_BROKEN_REPLY, dry_run=False,
                                  repair_rounds=2, task="break it")
     assert all(r.ok for r in results)
-    assert "FIXED = 1" in (tmp_path / "app.py").read_text()
+    assert "FIXED = 1" in (tmp_path / "app.py").read_text(encoding="utf-8")
     assert len(client.prompts) == 1
     prompt = client.prompts[0]
     assert "NEW problems" in prompt
@@ -93,7 +93,7 @@ def test_post_edit_check_stops_on_nothing_more(tmp_path, monkeypatch):
     results, _final = agent.apply(_BROKEN_REPLY, dry_run=False,
                                   repair_rounds=3, task="t")
     assert all(r.ok for r in results)
-    assert "BROKEN" in (tmp_path / "app.py").read_text()
+    assert "BROKEN" in (tmp_path / "app.py").read_text(encoding="utf-8")
     assert len(client.prompts) == 1        # the loop did not re-ask
 
 
@@ -105,7 +105,7 @@ def test_post_edit_check_can_be_disabled(tmp_path, monkeypatch):
                                   repair_rounds=2, task="t")
     assert all(r.ok for r in results)
     assert client.prompts == []
-    assert "BROKEN" in (tmp_path / "app.py").read_text()
+    assert "BROKEN" in (tmp_path / "app.py").read_text(encoding="utf-8")
 
 
 def test_post_edit_check_never_rebaselines_its_own_damage(tmp_path,
@@ -119,7 +119,7 @@ def test_post_edit_check_never_rebaselines_its_own_damage(tmp_path,
     agent = _agent(tmp_path, client)
     agent.apply(_BROKEN_REPLY, dry_run=False, repair_rounds=2, task="t")
     assert len(client.prompts) == 2
-    assert "BROKEN = 111" in (tmp_path / "app.py").read_text()
+    assert "BROKEN = 111" in (tmp_path / "app.py").read_text(encoding="utf-8")
 
 
 def test_post_edit_check_skips_dry_runs(tmp_path, monkeypatch):
@@ -128,7 +128,7 @@ def test_post_edit_check_skips_dry_runs(tmp_path, monkeypatch):
     agent = _agent(tmp_path, client)
     agent.apply(_BROKEN_REPLY, dry_run=True, repair_rounds=2, task="t")
     assert client.prompts == []
-    assert "BROKEN" not in (tmp_path / "app.py").read_text()
+    assert "BROKEN" not in (tmp_path / "app.py").read_text(encoding="utf-8")
 
 
 # ----------------------------------------------------- fix-prompt sourcing

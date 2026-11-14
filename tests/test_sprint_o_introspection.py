@@ -306,7 +306,7 @@ def test_anti_pattern_roundtrip_dedupe_and_cap(tmp_path):
     rows = memory.load_anti_patterns(tmp_path)
     assert len(rows) <= 8
     doc = json.loads((tmp_path / ".pedacito" / "micro_facts.json")
-                     .read_text())
+                     .read_text(encoding="utf-8"))
     assert len(doc["anti_patterns"]) <= 8
 
 
@@ -319,7 +319,7 @@ def test_anti_patterns_retire_with_their_files(tmp_path):
     (tmp_path / "app.js").unlink()
     assert memory.load_anti_patterns(tmp_path) == []
     doc = json.loads((tmp_path / ".pedacito" / "micro_facts.json")
-                     .read_text())
+                     .read_text(encoding="utf-8"))
     assert doc["anti_patterns"] == []          # retired on disk too
 
 
@@ -331,7 +331,7 @@ def test_observed_writes_preserve_the_ledger(tmp_path):
         memory.observe_command(tmp_path, "python -m pytest -q", True, cfg,
                                kind="test")
     doc = json.loads((tmp_path / ".pedacito" / "micro_facts.json")
-                     .read_text())
+                     .read_text(encoding="utf-8"))
     assert len(doc["anti_patterns"]) == 1
     assert len(doc["facts"]) == 1
 
@@ -418,7 +418,7 @@ def test_post_edit_frontend_gate_repairs_then_learns(tmp_path, monkeypatch):
             return "REPAIR"
 
         def _apply_once(self, reply, dry_run, backup_dir):
-            (tmp_path / "app.js").write_text(FIXED)
+            (tmp_path / "app.js").write_text(FIXED, encoding="utf-8")
             return [Result(True, "app.js", "applied",
                             before="document.getElementById('nope');\n",
                             after=FIXED)]
@@ -465,7 +465,7 @@ def test_post_edit_run_counts_a_recurred_lesson_kind(tmp_path, monkeypatch):
             return "REPAIR"
 
         def _apply_once(self, reply, dry_run, backup_dir):
-            (tmp_path / "app.js").write_text(FIXED)
+            (tmp_path / "app.js").write_text(FIXED, encoding="utf-8")
             return [Result(True, "app.js", "applied",
                             before="document.getElementById('nope');\n",
                             after=FIXED)]

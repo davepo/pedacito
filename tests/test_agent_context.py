@@ -294,7 +294,7 @@ def test_context_counts_as_a_read_for_the_ledger_but_is_never_replaced(tmp_path)
 def test_path_scoped_rules_appear_once_when_a_matching_file_is_read(tmp_path):
     rules = tmp_path / ".pedacito" / "rules"
     rules.mkdir(parents=True)
-    (rules / "svc.md").write_text("---\npaths: svc/*.py\n---\nAlways keep Store.get O(1).\n")
+    (rules / "svc.md").write_text("---\npaths: svc/*.py\n---\nAlways keep Store.get O(1).\n", encoding="utf-8")
     client = Scripted([_read("svc/core.py", 1, 5), _read("svc/core.py", 6, 8), {"action": "done"}])
     agent = _agent(tmp_path, client, SVC, stuck_recovery=False)
     agent.gather("tweak svc/core.py", verbose=False)
@@ -590,7 +590,7 @@ def test_impacted_tests_run_after_an_edit_and_new_failures_are_repaired(tmp_path
                    refresh_summaries=0, log_sessions=False)
     tr = loop.run_task(tmp_path, agent.cfg, client, agent, agent.index,
                        "make add work on two numbers", apply=True)
-    assert "a + b  # fixed" in (tmp_path / "calc.py").read_text()
+    assert "a + b  # fixed" in (tmp_path / "calc.py").read_text(encoding="utf-8")
     assert tr.applied and len(client.chat_calls) == 2        # answer + one repair
     prompt = client.chat_calls[1][1]["content"]
     assert "these tests fail (they did not before)" in prompt

@@ -88,8 +88,8 @@ def test_apply_lines_anchor_replaces_exact_range(tmp_path):
              ">>>>>>> REPLACE\n")
     results = apply_edits(tmp_path, parse_edits(reply), backup=False)
     assert [r.ok for r in results] == [True]
-    assert "return 22" in (tmp_path / "app.py").read_text()
-    assert "return 1" in (tmp_path / "app.py").read_text()   # rest untouched
+    assert "return 22" in (tmp_path / "app.py").read_text(encoding="utf-8")
+    assert "return 1" in (tmp_path / "app.py").read_text(encoding="utf-8")   # rest untouched
 
 
 def test_apply_lines_anchor_empty_replace_deletes_range(tmp_path):
@@ -98,7 +98,7 @@ def test_apply_lines_anchor_empty_replace_deletes_range(tmp_path):
              "<<<<<<< SEARCH\n=======\n>>>>>>> REPLACE\n")
     results = apply_edits(tmp_path, parse_edits(reply), backup=False)
     assert [r.ok for r in results] == [True]
-    text = (tmp_path / "app.py").read_text()
+    text = (tmp_path / "app.py").read_text(encoding="utf-8")
     assert "def beta" not in text
     assert "def alpha():" in text and "class Gamma:" in text
 

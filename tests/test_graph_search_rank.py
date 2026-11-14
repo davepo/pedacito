@@ -328,16 +328,16 @@ def test_index_file_is_versioned_atomic_and_tolerates_bad_data(tmp_path, capsys)
     p = idx.save()
     assert not (p.parent / "index.json.tmp").exists()
     import json
-    data = json.loads(p.read_text())
+    data = json.loads(p.read_text(encoding="utf-8"))
     assert data["version"] == index_mod.INDEX_VERSION
     data["version"] = 999
-    p.write_text(json.dumps(data))
+    p.write_text(json.dumps(data), encoding="utf-8")
     assert index_mod.Index.load(tmp_path) is None
-    p.write_text("{not json")
+    p.write_text("{not json", encoding="utf-8")
     assert index_mod.Index.load(tmp_path) is None
     data["version"] = 2
     data["chunks"][0]["field_from_the_future"] = 1
-    p.write_text(json.dumps(data))
+    p.write_text(json.dumps(data), encoding="utf-8")
     assert index_mod.Index.load(tmp_path) is not None     # unknown fields ignored
 
 

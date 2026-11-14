@@ -129,7 +129,7 @@ def test_agent_rename_end_to_end(tmp_path, fake_port):
     assert all(r.ok for r in results), [r.message for r in results]
     assert (root / "new_name.py").is_file()
     assert not (root / "old_name.py").exists()
-    assert 'print("hi")' in (root / "new_name.py").read_text()
+    assert 'print("hi")' in (root / "new_name.py").read_text(encoding="utf-8")
 
 
 @pytest.mark.network

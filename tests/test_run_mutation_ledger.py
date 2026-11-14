@@ -113,6 +113,6 @@ def test_shell_only_task_counts_as_landed_work(tmp_path):
                        "fix f.py by running the script")
     assert tr.applied is True
     assert tr.changed == ["f.py"]
-    assert (tmp_path / "f.py").read_text() == "x = 2\n"
+    assert (tmp_path / "f.py").read_text(encoding="utf-8") == "x = 2\n"
     # one answer call only: no zero-edit recovery re-ask was spent
     assert len(client.chat_calls) == 1
