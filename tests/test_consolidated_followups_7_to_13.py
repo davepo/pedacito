@@ -366,19 +366,24 @@ def test_item2_generic_terms_do_not_prove_provenance():
 
 
 def test_item14_venv_bin_dirs_order(tmp_path):
-    (tmp_path / ".venv" / "bin").mkdir(parents=True)
-    (tmp_path / "venv" / "bin").mkdir(parents=True)
+    # A venv's scripts live in Scripts/ on Windows, not bin/ (CI caught the
+    # POSIX-shaped fixture: the dirs never existed, so the interpreter's own
+    # dir came first).
+    bin_dir = "Scripts" if os.name == "nt" else "bin"
+    (tmp_path / ".venv" / bin_dir).mkdir(parents=True)
+    (tmp_path / "venv" / bin_dir).mkdir(parents=True)
     dirs = proc.venv_bin_dirs(tmp_path)
-    assert dirs[0] == str(tmp_path / ".venv" / "bin")
-    assert dirs[1] == str(tmp_path / "venv" / "bin")
+    assert dirs[0] == str(tmp_path / ".venv" / bin_dir)
+    assert dirs[1] == str(tmp_path / "venv" / bin_dir)
     assert str(Path(sys.executable).parent) in dirs
 
 
 def test_item14_with_venv_path_prepends_and_copies(tmp_path):
-    (tmp_path / ".venv" / "bin").mkdir(parents=True)
+    bin_dir = "Scripts" if os.name == "nt" else "bin"
+    (tmp_path / ".venv" / bin_dir).mkdir(parents=True)
     env = {"PATH": "/usr/bin", "OTHER": "keep"}
     out = proc.with_venv_path(env, tmp_path)
-    assert out["PATH"].split(os.pathsep)[0] == str(tmp_path / ".venv" / "bin")
+    assert out["PATH"].split(os.pathsep)[0] == str(tmp_path / ".venv" / bin_dir)
     assert out["OTHER"] == "keep"
     assert env["PATH"] == "/usr/bin"         # the caller's dict is untouched
 

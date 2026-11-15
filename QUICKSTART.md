@@ -687,7 +687,7 @@ footer; and the `pdc tui (profile) >` prompt.
 The footer is live: the **Context Meter** turns green below 70%, amber from
 70–85% and red above 85%, next to `Turn: +in/+out`, session totals,
 `Speed: 44.2 tok/s (avg 41.8 tok/s)`, KV cache, folds and the active
-model/role. The token burn rate and the sidebar follow every `read`/`grep`/`mcp_call` step,
+model/role. The **Burn Rate** (token burn rate) and the sidebar follow every `read`/`grep`/`mcp_call` step,
 `model_swap`, verification receipt and `PLAN.md` checkbox while a task runs.
 
 Keys work inside the TUI instead of echoing escape codes: **PgUp/PgDn** scroll

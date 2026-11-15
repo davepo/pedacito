@@ -384,11 +384,12 @@ CLI_COMMANDS = [
                  "[--headless]",
         "summary": "Split-screen terminal UI: a transcript pane, a live "
                    "activity/plan sidebar, a two-row telemetry footer with "
-                   "the Context Meter, token burn rate and tok/s, plus "
-                   "PgUp/PgDn and mouse-wheel scrollback with native "
-                   "text selection.",
+                   "the Context Meter, Burn Rate (token burn rate) and "
+                   "tok/s, plus PgUp/PgDn and mouse-wheel scrollback with "
+                   "native text selection.",
         "keywords": ["tui", "terminal ui", "split screen", "context meter",
-                     "telemetry", "token burn", "tok/s", "sidebar", "plan",
+                     "telemetry", "burn rate", "token burn", "tok/s",
+                     "sidebar", "plan",
                      "slash commands", "live activity", "scroll", "pgup",
                      "pgdn", "mouse wheel", "keybindings", "tab completion",
                      "command history"],

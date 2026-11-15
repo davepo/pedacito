@@ -23,7 +23,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from pedacito import cli, memory, rpc, skills, workspace
+from pedacito import cli, memory, rpc, sessions, skills, workspace
 from pedacito import config as config_mod
 from pedacito import llm as llm_mod
 from pedacito.config import Config, ConfigError
@@ -358,6 +358,22 @@ def _write_transcripts(root):
     for i in range(3):
         workspace.write_session(root, f"task number {i}", ["read app.py"],
                                 reply, results, None, f"2026010{i}-000000")
+
+
+def test_session_task_skips_the_auto_goal_preamble():
+    """`auto` writes a two-line Task field; the listing and the handoff must
+    show the goal's own heading, not the harness preamble."""
+    text = ("# 20260101-000000\n\n"
+            "**Task:** ORIGINAL USER GOAL (background -- the CURRENT TASK "
+            "below is the step to do now; every constraint in the goal still "
+            "binds it):\n"
+            "# sensor_vault - 4-task specification\n\n## Lookups\n")
+    assert sessions._task(text) == "# sensor_vault - 4-task specification"
+    # an ordinary one-line task is untouched, even one ending in ':'
+    plain = "**Task:** fix the login timeout\n"
+    assert sessions._task(plain) == "fix the login timeout"
+    colon = "**Task:** reproduce the failure:\n\n## Lookups\n"
+    assert sessions._task(colon) == "reproduce the failure:"
 
 
 def test_consolidate_from_transcripts(proj, home):

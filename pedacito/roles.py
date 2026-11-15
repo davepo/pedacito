@@ -323,27 +323,43 @@ def select_specialist_profile(task: str, idx, cfg, explicit_tag: str = "",
         m = _SPECIALTY_TAG_RE.search(task or "")
         if m:
             tag = m.group(1).lower()
-    if tag:
+    if tag in profiles:
+        # A planner asked for a PROFILE by name, not a specialty: the prefix
+        # is malformed (a profile name is not a tag). Ignore it and score the
+        # task's own words instead of forcing a tag no card carries, which
+        # used to leave the orchestrator holding specialist work.
+        tag = ""
+    if not tag:
+        scores = _task_specialty_scores(task, idx)
+    else:
         scores = {t: (1.0 if t == tag else 0.0) for t in SPECIALTIES}
         scores.setdefault(tag, 1.0)      # custom slugs route too
-    else:
-        scores = _task_specialty_scores(task, idx)
-    best = max(scores.values()) if scores else 0.0
-    if best <= 0:
-        return "", ""
-    winning = [t for t, s in scores.items() if s == best]
     active = getattr(cfg, "active_profile", "") or ""
     active_tags = set(specialties_for(cfg, active))
-    candidates = []
     allow_hosted = bool(getattr(cfg, "auto_route_allow_hosted", False))
-    for name in profiles:
-        if not allow_hosted and profile_is_hosted(cfg, name):
-            # Local-only pool (the default): never jump to a paid cloud API
-            # just because it carries a matching tag.
-            continue
-        hit = [t for t in winning if t in set(specialties_for(cfg, name))]
-        if hit:
-            candidates.append((name, hit[0]))
+
+    def _candidates(score_set):
+        best = max(score_set.values()) if score_set else 0.0
+        if best <= 0:
+            return [], []
+        winners = [t for t, s in score_set.items() if s == best]
+        rows = []
+        for name in profiles:
+            if not allow_hosted and profile_is_hosted(cfg, name):
+                # Local-only pool (the default): never jump to a paid cloud
+                # API just because it carries a matching tag.
+                continue
+            hit = [t for t in winners if t in set(specialties_for(cfg, name))]
+            if hit:
+                rows.append((name, hit[0]))
+        return winners, rows
+
+    winning, candidates = _candidates(scores)
+    if tag and not candidates:
+        # A forced tag no local card carries (a custom slug only the user
+        # knows, or a mistyped one): fall back to the task's measured
+        # keyword score so the task still leaves an orchestrator.
+        winning, candidates = _candidates(_task_specialty_scores(task, idx))
     if not candidates:
         return "", ""
     if active_tags.intersection(winning):
@@ -510,12 +526,18 @@ def specialty_planner_note(cfg) -> str:
              "specialty tags match it best. Specialists:"]
     for name, tags in tagged.items():
         lines.append(f"- {name}: {', '.join(tags)}")
+    vocabulary = sorted({t for tags in tagged.values() for t in tags
+                         if t != "general"})
+    if vocabulary:
+        lines.append("TAG vocabulary (the ONLY values allowed after "
+                     "'[specialty: '): " + ", ".join(vocabulary) + ".")
     lines.append(
         "Prefix a task title with [specialty: TAG] when one specialty "
-        "clearly fits (TAG from the lists above). When dependencies allow "
-        "it, group tasks that use the same specialist next to each other: "
-        "every switch between specialists on one server costs a model "
-        "unload/load. Never move a task before the tasks it depends on.")
+        "clearly fits; TAG must come from that vocabulary -- never a "
+        "profile name. When dependencies allow it, group tasks that use "
+        "the same specialist next to each other: every switch between "
+        "specialists on one server costs a model unload/load. Never move a "
+        "task before the tasks it depends on.")
     return "\n".join(lines)
 
 

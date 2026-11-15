@@ -292,7 +292,11 @@ def _skill_files(d: Path) -> list[Path]:
 def _parse_triggers(raw: str) -> list[str]:
     out: list[str] = []
     for part in str(raw or "").split(","):
-        t = part.strip().strip("\"'").lower()
+        # A trigger is one frontmatter VALUE: an embedded newline/control
+        # character could inject another metadata key (`x\nname: builtin`)
+        # and let a saved skill claim a different (even built-in) name.
+        t = re.sub(r"[\x00-\x1f\x7f]+", " ", part)
+        t = " ".join(t.strip().strip("\"'").lower().split())
         if t and t not in out:
             out.append(t)
     return out
@@ -332,8 +336,15 @@ def _scope_of(info: dict, root) -> str:
     source = str(info.get("source") or "")
     if source == "bundled":
         return "bundled"
-    if root is not None and source.startswith(str(Path(root)) + "/"):
-        return "project"
+    if root is not None:
+        # Path containment, not a string prefix: on Windows `str(Path)`
+        # uses backslashes, so `source.startswith(root + "/")` labelled every
+        # project skill "user" there.
+        try:
+            Path(source).resolve().relative_to(Path(root).resolve())
+            return "project"
+        except (ValueError, OSError):
+            pass
     return "user"
 
 

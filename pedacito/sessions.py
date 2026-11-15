@@ -68,10 +68,25 @@ def _resolve(root, name: str) -> Path | None:
 
 
 def _task(text: str) -> str:
-    """The `**Task:**` line from a session log, or a placeholder."""
-    for line in text.splitlines()[:40]:
-        if line.startswith("**Task:**"):
-            return line[len("**Task:**"):].strip()
+    """The `**Task:**` line from a session log, or a placeholder.
+
+    An `auto`/`new --complex` goal is written as a two-line Task field: the
+    harness's "ORIGINAL USER GOAL (background ...)" preamble, then the goal's
+    own first heading. Returning only the preamble lost the real goal in
+    session listings and in the consolidation handoff, so skip it and take
+    the next non-empty line.
+    """
+    lines = text.splitlines()
+    for i, line in enumerate(lines[:40]):
+        if not line.startswith("**Task:**"):
+            continue
+        task = line[len("**Task:**"):].strip()
+        if task.startswith("ORIGINAL USER GOAL"):
+            for nxt in lines[i + 1:]:
+                if nxt.strip() and not nxt.startswith("**"):
+                    task = nxt.strip()
+                    break
+        return task
     return "(no task recorded)"
 
 

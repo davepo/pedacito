@@ -889,8 +889,8 @@ place the hardware cursor inside `pdc tui (profile) > ...`.
 
 The footer updates after every model call and event: a green/amber/red
 **Context Meter** (`Ctx: [████████░░░░░░░░] 6,420 / 32,768 (19.6%)`), turn and
-session token burn rate, `Speed: 44.2 tok/s (avg 41.8 tok/s)`, KV cache hit
-rate, fold count, and `Active: <profile> [<role>/<specialty>]` with `$cost`
+session **Burn Rate** (token burn rate), `Speed: 44.2 tok/s (avg 41.8 tok/s)`,
+KV cache hit rate, fold count, and `Active: <profile> [<role>/<specialty>]` with `$cost`
 when priced. `pedacito tui` registers the live permission broker, so an untrusted
 MCP tool, sensitive file read or shell command asks in the prompt bar:
 `y` allows once, `a` allows that key for the session, `n` denies.

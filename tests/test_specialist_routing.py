@@ -506,6 +506,33 @@ def test_math_probe_retries_once_after_a_truncated_reasoning_reply():
     assert len(bad.probe_calls("Compute")) == 1
 
 
+def test_routing_ignores_a_profile_name_in_the_specialty_prefix():
+    """Regression: the planner used to copy a PROFILE name into
+    `[specialty: <profile>]`. That slug matched no card, so routing returned
+    ("", "") and the orchestrator kept specialist work. A profile name is not
+    a tag: fall back to the task's own keywords and leave the orchestrator."""
+    cfg = _routed_cfg()
+    cfg.active_profile = "orchestrator"
+    cfg.model = "nemotron-orchestrator-8b"
+    cfg.profiles["orchestrator"] = {"model": "nemotron-orchestrator-8b"}
+    # the audit's real shape: a profile name inside the prefix
+    assert roles.select_specialist_profile(
+        "[specialty: coder] refactor the parser in app.py", None, cfg) == \
+        ("coder", "coding")
+    # an unknown custom tag also falls back to keyword scoring
+    assert roles.select_specialist_profile(
+        "[specialty: nosuchtag] fix the button layout in styles.css",
+        None, cfg) == ("ui", "frontend_ui")
+
+
+def test_planner_note_lists_the_tag_vocabulary_not_profile_names():
+    cfg = _routed_cfg()
+    note = roles.specialty_planner_note(cfg)
+    assert "TAG vocabulary" in note
+    assert "never a profile name" in note
+    assert "math_algorithms" in note and "frontend_ui" in note
+
+
 def test_routing_explicit_prefix_and_tag_override_keywords():
     cfg = _routed_cfg()
     task = "[specialty: math_algorithms] fix the button layout in styles.css"

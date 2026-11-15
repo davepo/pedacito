@@ -381,6 +381,25 @@ def test_escape_sequence_and_mouse_wheel_parser():
     assert parse_escape_sequence("\x1b[") == ("", 0)      # incomplete
 
 
+def test_alternate_scroll_mode_sequence_and_wheel_burst():
+    """The terminal enables ?1007h (alternate scroll) so a wheel becomes an
+    arrow-key burst. The parser must swallow the mode CSI whole -- never leak
+    '[' / '1' / '0' into the prompt -- and still read the burst as WHEEL."""
+    assert parse_escape_sequence("\x1b[?1007h") == ("UNKNOWN", 8)
+    assert parse_escape_sequence("\x1b[?1007l") == ("UNKNOWN", 8)
+    # one drain: mode set + wheel burst, then a real key after it
+    buf = "\x1b[?1007h\x1b[A\x1b[A\x1b[Aq"
+    key, used = parse_escape_sequence(buf)
+    assert key == "UNKNOWN" and used == 8
+    key, used2 = parse_escape_sequence(buf[used:])
+    assert key == "WHEEL_UP" and used2 == 9
+    assert buf[used + used2] == "q"
+    # a single arrow stays a history key, not a wheel event
+    assert parse_escape_sequence("\x1b[A") == ("UP", 3)
+    assert parse_escape_sequence("\x1b[<64;15;10M") == ("WHEEL_UP", 12)
+    assert parse_escape_sequence("\x1b[<65;15;10M") == ("WHEEL_DOWN", 12)
+
+
 def test_viewport_scrollback_pgup_pgdn_and_stationary_lock(tmp_path):
     cfg = _cfg()
     session = TuiSession(tmp_path, cfg, client=FakeClient(), headless=True,
