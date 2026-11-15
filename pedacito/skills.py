@@ -33,6 +33,7 @@ import json
 import re
 from pathlib import Path
 
+from . import security
 from .memory import _frontmatter
 
 _NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,40}$")
@@ -302,15 +303,36 @@ def _parse_triggers(raw: str) -> list[str]:
     return out
 
 
+def _readable_skill(d: Path, p: Path, contained: bool) -> Path | None:
+    """`p` when its body may be read into a prompt, else None. A project's
+    skill folder is a repository, so a symlink that leads out of it (or into
+    credential material) is refused; the user's own skill folder may link
+    elsewhere but never to a secret file."""
+    if security.is_sensitive_path(p):
+        return None
+    try:
+        real = (security.resolve_safe_path(d, p) if contained
+                else p.resolve())
+    except (security.SecurityError, OSError, ValueError):
+        return None
+    return None if security.is_sensitive_path(real) else real
+
+
 def _scan(root, cfg) -> dict[str, dict]:
     """name -> {description, body, meta, source, triggers}, earlier sources win."""
     found: dict[str, dict] = {}
+    project_dir = (Path(root) / ".pedacito" / "skills"
+                   if root is not None else None)
     for d in _dirs(root, cfg):
         if not d.is_dir():
             continue
+        contained = project_dir is not None and d == project_dir
         for p in _skill_files(d):
+            real = _readable_skill(d, p, contained)
+            if real is None:
+                continue
             try:
-                meta, body = _frontmatter(p.read_text(encoding="utf-8"))
+                meta, body = _frontmatter(real.read_text(encoding="utf-8"))
             except OSError:
                 continue
             fallback = p.parent.name if p.name == "SKILL.md" else p.stem

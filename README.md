@@ -41,13 +41,67 @@ it over in pieces:
 - People who want to see what the model is doing. Every edit is a dry-run diff
   until you apply it, and every write is snapshotted first.
 
-A fair warning: Pedacito was built by one person for one setup (local models on
-a single home GPU box), so edge cases outside that path may be rough. If you can
-use a frontier hosted model, [opencode](https://opencode.ai),
-[Qwen Code](https://github.com/QwenLM/qwen-code), and
-[Claude Code](https://claude.com/claude-code) are good choices. Pedacito is for
-when you want to stay small and local, or you want to control exactly which
-model sees what.
+Pedacito is **local-first and hybrid-ready**. It runs entirely on your own model
+server by default, and it can bring in a hosted model for the parts that need
+one: as a planner, as a verifier, or as an escalation target, with a spend cap.
+Every mode is described in [Why Pedacito?](#why-pedacito-how-it-differs-from-cloud-first-harnesses).
+
+It was built and tested by one person on one home GPU box, so edge cases on other
+hardware may be rough. Bug reports with a repro are very welcome.
+
+## Why Pedacito? (How It Differs from Cloud-First Harnesses)
+
+**Why cloud-first harnesses struggle on local GPUs.** Coding agents built for
+200k-token cloud APIs send 15k+ tokens of static tool schemas on every request,
+and many rewrite earlier turns each step (re-summarising, reordering, or editing
+the system prompt). A cloud API absorbs that. A single-slot local server does not:
+`llama.cpp`, Ollama, and LM Studio reuse their KV cache only while the prompt
+prefix stays byte-identical. Mutate the prefix and the server re-evaluates the
+whole prompt on every turn, so the GPU spends its time re-reading context instead
+of generating.
+
+**How Pedacito solves it:**
+
+1. **Byte-identical KV-cache prefix (`fold_middle`).** Middle turns fold
+   deterministically into hash-pinned `EvidenceStore` span receipts. The first two
+   messages (`messages[0:2]`) are never touched, so your server's KV cache stays
+   hot. The GUI footer shows the result as **KV Cache Hit %**.
+2. **Deterministic gates before any LLM call.** Static checks (`verify`,
+   `webcheck`, `domcheck`, `apicheck`), automatic missing-import healing, and
+   impacted-test selection catch many mistakes in milliseconds, without spending
+   model tokens.
+3. **A small dependency set.** The harness needs Python 3.11+ and installs
+   `requests` and tree-sitter; there is no Node.js requirement for the harness
+   itself. Playwright (browser checks) and LSP servers are optional, used only
+   when you have them installed.
+4. **Zero phone-home.** "Telemetry" in Pedacito means *your* local Context Meter,
+   Burn Rate, and `tok/s` speed figures, written to `.pedacito/events/` in your
+   project. Pedacito sends no analytics, no update checks, and no crash reports.
+   The network is used only for the model servers and hosted APIs you configure,
+   and for web tools you turn on.
+
+### Local-first, hybrid-ready architecture
+
+Pedacito gives you four modes. Use the first alone, or add the others as your
+hardware and budget allow.
+
+1. **100% local.** Run fully offline against `llama.cpp`, Lemonade Server,
+   LM Studio, Ollama, or vLLM, with no cloud dependency.
+2. **Specialist auto-routing (`--auto-route`).** A fast orchestrator model (for
+   example, an 8B-class model) plans the work and dispatches each task to the
+   best calibrated local specialist: coding, math, SVG/3D, SQL, or i18n. Between
+   tasks, the server unloads one model and loads the next, so VRAM stays clean.
+   See [Specialist auto-routing](#specialist-auto-routing).
+3. **Dual-GPU scout + architect (`scout_profile`).** A fast 4B-9B scout on a
+   second GPU or port gathers files and indexes at high speed, while a 24B-35B
+   architect does the planning and editing. The architect's KV cache is not
+   disturbed by the lookups.
+4. **Hybrid escalation and role routing (`planner`, `verifier`, `escalate`).**
+   Pair a free local worker with a hosted frontier model (DeepSeek, Qwen, OpenAI,
+   or Anthropic) for upfront planning, for verification, or for automatic
+   escalation when a small local model stalls. Keep cloud spend small with
+   **Session Consolidation** (`/consolidate`) and the **`--max-cost`** budget cap.
+   See [Role routing](#roles-a-different-model-per-job).
 
 ## Quickstart in 60 seconds
 
@@ -238,6 +292,19 @@ Uninstall with `pip uninstall pedacito-local`. Your config and every project's
 `.pedacito/` folder are left untouched.
 
 ---
+
+## Which model fits your GPU?
+
+| VRAM | Pedacito tier | Models (Q4 to Q8) | What it is best at |
+|---|---|---|---|
+| **6–8 GB** | `tiny` / `small` | 4B to 8B | Single-file surgical edits with `pedacito ask`, a fast `scout_profile`, or the local worker paired with a larger `planner` or `escalate` model |
+| **12–16 GB** | `medium` | 9B to 14B | Multi-file tasks, test authoring, and `pedacito auto` workflows with a 16k–32k context window |
+| **24 GB+** (e.g. RX 7900 XTX, RTX 3090, RTX 4090) | `large` | 24B to 35B | Autonomous multi-file scaffolding, specialist auto-routing across 24B–30B specialists, and 32k context windows |
+| **Two GPUs or two servers** | scout + architect | 4B–9B scout, 24B–35B architect | Zero-swap `scout_profile` pairing across separate ports |
+
+Sizes are for the weights alone; add the KV cache and about 1.5 to 2.5 GB of
+overhead. The full table, with examples and per-tier thinking advice, is in
+[MODEL_GUIDE.md](MODEL_GUIDE.md#hardware-tiers).
 
 ## Model server setup
 
@@ -869,7 +936,11 @@ The TUI keeps the index warm like `chat`, but paints four zones instead of a
 scrolling REPL: a header (project, profile/model, calibration badge,
 Auto-Route, Scout, git branch/dirty state), a main transcript pane beside a
 collapsible **Activity & Plan** sidebar, a two-row telemetry footer, and the
-`pdc tui (profile) >` prompt bar. The sidebar appears at 100+ columns and
+`pdc tui (profile) >` prompt bar. The telemetry footer repaints live: a 150 ms
+watcher tails the project's event log while each task runs on a worker thread.
+Text from repo files, logs and tool results is stripped of terminal escape
+sequences before it is painted, so a file cannot retitle your terminal or write
+to your clipboard. The sidebar appears at 100+ columns and
 toggles with `/sidebar`; it shows `PLAN.md` checkboxes, live `read`/`grep`/
 `mcp_call`/`task` steps, specialist `model_swap` routing, and the files this
 session changed.
@@ -1575,9 +1646,13 @@ you configured. Within that:
   `.pedacito.toml` may not set `hooks`, `mcp_servers`, `auto_verify`, `test_command`,
   `allow_serve`, `allow_lsp`, `lsp_servers`, any sandbox setting, or the capability
   toggles that unlock those tools (`allow_shell`, `allow_write`, `allow_browser`,
-  `allow_screenshots`) until you read it
-  and run `pedacito trust`; editing the file revokes the approval. Harmless
-  settings from the same file still apply, and the toggles stay honoured from
+  `allow_screenshots`, `allow_fetch`), until you read it and run `pedacito trust`.
+  It also may not redirect the model endpoint (`base_url`, `api_key`,
+  `api_key_env`), weaken the environment scrub (`scrub_env`, `env_passthrough`),
+  or widen what runs or where data can go (`verify_tests`, `verify_dom`,
+  `dom_entry`, `shell_allowlist`, `browser_eval_hosts`, `fetch_allowed_hosts`).
+  Editing the file revokes the approval. Harmless
+  settings from the same file still apply, and these fields stay honoured from
   your user config, from `--config FILE` and from `PEDACITO_*`. The starter
   written by `config --init --path <project>/.pedacito.toml` keeps those lines
   commented, so trusting it neither warns nor revokes what you granted.
@@ -1997,6 +2072,15 @@ working default and is documented in `pedacito config --reference`.
 
 ## Known limits
 
+These are the real boundaries. Missing harness features are not on this list:
+the TUI, `pedacito bench`, MCP, LSP, subagents, and multi-file projects are all
+shipped.
+
+- **Model size sets the ceiling, not the harness.** A 4B to 8B model is an
+  excellent scout and a reliable single-file editor. Multi-file architecture work
+  is where 14B to 30B+ local models, or a hybrid `planner`, earn their keep. Broad
+  structural tasks such as "modernize this codebase" strain every small model, so
+  split them into narrow steps (`pedacito auto` is built for exactly that).
 - The call graph records receiver-qualified targets (`Store.get`, `this.x()`,
   typed locals) where the receiver is provable, but an untyped call still matches
   its bare name, so two unrelated `run()` methods can be conflated when the receiver
@@ -2037,8 +2121,8 @@ working default and is documented in `pedacito config --reference`.
   unit changes or the embedding model is switched.
 - A text-only model can't see graphics; `screenshot` and `browser` give it text
   evidence, not visual judgement.
-- Broad, structural tasks ("modernize this codebase") are a poor fit for small
-  models. Narrow, localized tasks are where this works well.
+- Narrow, localized tasks are where small models work best. Start there, then
+  widen the scope as your model size and hardware allow.
 
 ---
 

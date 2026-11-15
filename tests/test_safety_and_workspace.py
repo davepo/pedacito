@@ -239,6 +239,9 @@ def test_new_settings_validate_and_roundtrip(trust_home):
     proj.mkdir()
     _project_cfg(proj, 'answer_mode = "AUTO"\nverify_answer = "full"\n'
                        'env_passthrough = ["A", "B*"]\n')
+    # env_passthrough widens what reaches model-chosen commands, so a project
+    # file only applies it after `pedacito trust` (see config.EXEC_FIELDS).
+    config_mod.trust_project(proj / ".pedacito.toml")
     cfg = config_mod.load(root=proj, use_env=False, require_hardware=False,
                           warn_budgets=False)
     assert cfg.answer_mode == "auto" and cfg.verify_answer == "full"

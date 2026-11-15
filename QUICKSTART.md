@@ -41,6 +41,11 @@ Pedacito talks to any server with an OpenAI-compatible `/v1` API.
 Ports are defaults, not rules. The scanner identifies each server by its replies,
 so two servers can run on one machine.
 
+Not sure which model size to load? The [VRAM quick reference](README.md#which-model-fits-your-gpu)
+maps 6–8 GB, 12–16 GB, and 24 GB+ cards to the model sizes that work best on
+each. Start with one local model; add a hosted planner or verifier later if you
+want one, and it is optional.
+
 ### 2. Install
 
 Requires Python 3.11 or newer.
@@ -506,6 +511,12 @@ roles.
 After each task the CLI prints a one-line telemetry ribbon on stderr — context
 bar, turn tokens, speed, cache hit. Set `show_telemetry = false` to hide it;
 `--jsonl` and rpc modes never print it.
+
+Two more things help when a hosted model is in the loop. `--max-cost USD` on a
+task command stops before the next model call once the estimated spend reaches
+that cap (it needs `price_*_per_mtok` set for the model). In the GUI footer,
+**KV Cache Hit %** shows how much of the prompt your local server reused, which
+is the number to watch if a long session starts feeling slow.
 
 ### B3. See what would be indexed
 

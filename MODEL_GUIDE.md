@@ -54,7 +54,8 @@ give the model.
 |---|---|---|---|---|---|
 | **Under 8 GB VRAM** | 4B to 7B | Qwen3-4B, Gemma 3 4B, Qwen2.5-Coder 7B (tight) | 4k to 8k | `tiny` or `small` | off |
 | **8 to 16 GB VRAM** | 8B to 14B | Qwen3-8B, Gemma 3 12B, Qwen3-14B (comfortable at 16 GB, tight at 12 GB) | 8k to 16k | `small` or `medium` | off. Planner or verifier profile may use thinking |
-| **24 GB VRAM** | 24B to 35B, dense or MoE | Mistral Small 24B, Gemma 3 27B, Qwen3-32B, Qwen3-30B-A3B (MoE) | 16k to 32k | `medium` or `large` | off by default. Measure before enabling |
+| **24 GB+ VRAM** (RX 7900 XTX, RTX 3090, RTX 4090) | 24B to 35B, dense or MoE | Mistral Small 24B, Gemma 3 27B, Qwen3-32B, Qwen3-30B-A3B (MoE) | 16k to 32k | `medium` or `large` | off by default. Measure before enabling |
+| **Two GPUs or two servers** | Scout 4B to 9B, architect 24B to 35B | See [scout + architect routing](#dual-gpu--dual-model-scout--architect-routing-scout_profile) | Scout: 8k to 16k; architect: 16k to 32k | `scout_profile` pairing | Per profile |
 | **Hybrid local + cloud** | Any of the above, plus a hosted model | A local worker, with a hosted planner or verifier | Per profile | Per profile | Per profile |
 
 Sizes below are for the weights alone. Add the KV cache and about 1.5 to 2.5 GB of

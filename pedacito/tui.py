@@ -81,6 +81,24 @@ _HIDE_CURSOR = "\x1b[?25l"
 _SHOW_CURSOR = "\x1b[?25h"
 
 _ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
+# Everything a repo file, log line or tool result could smuggle into the
+# terminal: OSC (window/tab title, hyperlinks, clipboard), DCS/SOS/PM/APC
+# strings, CSI, and bare two-byte escapes. Styling is applied at render time,
+# never stored in the transcript, so stripping these is lossless for the UI.
+_TERM_ESCAPE_RE = re.compile(
+    r"\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)?"
+    r"|\x1b[PX^_][^\x1b]*(?:\x1b\\)?"
+    r"|\x1b\[[0-?]*[ -/]*[@-~]"
+    r"|\x1b[@-Z\\-_]"
+    r"|\x1b")
+_TERM_CONTROL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]")
+
+
+def _untrusted_text(text) -> str:
+    """`text` with terminal escape sequences and control characters removed
+    (tabs and newlines kept), so repo or log content cannot retitle the window,
+    write to the clipboard or move the cursor outside the pane it was given."""
+    return _TERM_CONTROL_RE.sub("", _TERM_ESCAPE_RE.sub("", str(text or "")))
 _SGR_MOUSE_RE = re.compile(r"^\x1b\[<(\d+);(\d+);(\d+)([Mm])")
 _PLAN_RE = re.compile(r"^\s*[-*]\s*\[([ xX])\]\s*(.*)$")
 _SWAP_ARROW = "\u2192"
@@ -1090,7 +1108,7 @@ class TuiSession:
         self._dirty = False
 
     def _append(self, text: str, kind: str = "system") -> None:
-        body = str(text or "")
+        body = _untrusted_text(text)
         if len(body) > 12000:
             body = body[:12000] + "\n[truncated in the transcript view]"
         lines = body.splitlines() or [""]
@@ -1122,7 +1140,7 @@ class TuiSession:
         self._append(text, kind)
 
     def _set_banner(self, text: str) -> None:
-        self._prompt_banner = str(text or "")
+        self._prompt_banner = _untrusted_text(text)
 
     # --------------------------------------------------------------- events
     def _init_event_tail(self) -> None:
@@ -2664,11 +2682,12 @@ class TuiSession:
             self._write(_MOUSE_SGR_ON)
 
     def _restore_terminal(self) -> None:
-        if not self._terminal_ready:
-            return
-        self._terminal_ready = False
-        self._write(_ALT_SCREEN_OFF)
-        self._restore_raw_mode()
+        if self._terminal_ready:
+            self._terminal_ready = False
+            self._write(_ALT_SCREEN_OFF)
+            self._restore_raw_mode()
+        # Signal handlers are restored even when setup failed part-way, so an
+        # exception during _prepare_terminal never leaves SIGINT rerouted.
         for sig, handler in list(self._old_signals.items()):
             try:
                 signal.signal(sig, handler)

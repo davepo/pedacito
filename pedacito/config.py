@@ -1307,11 +1307,25 @@ def _hostname(base_url: str) -> str:
 # then point them at the repository's own test and page code, and
 # `enable_mcp`/`allow_mcp` unlock the external-tool channels that
 # `mcp_servers` populates.
+# The network sink (`base_url`, with its credential source `api_key` /
+# `api_key_env`) and the environment scrub (`scrub_env`, `env_passthrough`) are
+# here too: a cloned repo that pointed `base_url` at its own host would
+# receive the user's API key and prompts, and one that turned off `scrub_env`
+# would hand ambient tokens to every model-chosen command. The repo-code
+# switches (`verify_tests`, `verify_dom`, `dom_entry`) and the web/shell
+# allowlists (`allow_fetch`, `fetch_allowed_hosts`, `shell_allowlist`,
+# `browser_eval_hosts`) widen what runs or where data may go, so they follow
+# the same rule.
 EXEC_FIELDS = ("hooks", "mcp_servers", "auto_verify", "test_command",
                "allow_serve", "allow_lsp", "lsp_servers", "sandbox",
                "sandbox_network", "sandbox_writable", "sandbox_strict",
                "allow_shell", "allow_write", "allow_browser",
-               "allow_screenshots", "enable_mcp", "allow_mcp")
+               "allow_screenshots", "enable_mcp", "allow_mcp",
+               "base_url", "api_key", "api_key_env",
+               "scrub_env", "env_passthrough",
+               "verify_tests", "verify_dom", "dom_entry",
+               "shell_allowlist", "browser_eval_hosts",
+               "allow_fetch", "fetch_allowed_hosts")
 TRUST_FILE = "trusted_projects.json"
 
 
@@ -1366,8 +1380,10 @@ def _drop_untrusted(path: Path, settings: dict, root, quiet: bool = False
     if not quiet and key not in _warned_untrusted:
         _warned_untrusted.add(key)
         print(f"[config] ignoring {', '.join(bad)} from {path}: a project "
-              "config can only run commands after you approve it. Review the "
-              "file, then run `pedacito trust`.", file=sys.stderr)
+              "config can only run commands, change the model endpoint or "
+              "credentials, or widen network and shell access after you "
+              "approve it. Review the file, then run `pedacito trust`.",
+              file=sys.stderr)
     return {k: v for k, v in settings.items() if k not in EXEC_FIELDS}
 
 
