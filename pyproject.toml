@@ -1,6 +1,6 @@
 [project]
 name = "pedacito-local"
-version = "0.1.0"
+version = "0.2.0"
 description = "Index-and-lookup intermediary for coding with a local LLM"
 requires-python = ">=3.11"   # tomllib
 license = {file = "LICENSE"}

@@ -3438,6 +3438,76 @@ def _specialist_route(root, cfg, client, agent, idx, task, is_repair=False):
         return client, agent
 
 
+def _specialist_zero_edit_fallback(root, cfg, client, idx, task, tr, kw):
+    """Retry a routed specialist's zero-edit task on the top coding specialist.
+
+    BUG_HUNT #14 Finding #5: a specialist card (LFM2.5-24B-A2B for
+    ``math_algorithms``) streamed unbounded hidden reasoning on a local server
+    and finished Task 2 with 0 applied edits / 0 files written. The task then
+    failed even though a strong coding specialist (Devstral-Small-2-24B,
+    Qwen3-Coder-30B) was configured and idle. When the run was routed to a
+    specialist profile and produced no edit at all, hand the task ONCE to the
+    top-scoring local coding specialist that clears the ``edit_format``
+    competence gate, then let the caller's normal failure path decide.
+
+    Returns the original ``tr`` when routing did not happen, the task is not
+    an edit task, the specialist did land edits, no coding fallback exists, or
+    the fallback also produced nothing. Never raises."""
+    from . import roles as roles_mod
+    try:
+        role = getattr(client, "active_model_role", None)
+        if not isinstance(role, dict) or role.get("role") != "specialist":
+            return tr
+        if not (kw.get("apply") and not kw.get("review")
+                and not kw.get("is_repair")
+                and kw.get("answer_system") is None):
+            return tr
+        if any(r.ok for r in tr.results) or tr.changed:
+            return tr
+        if _is_noop(tr.reply) or task.strip() == _REMEDIATION_TITLE:
+            # A coherent "nothing to change" and a repair's sanctioned
+            # conflict report are not stalls: the loop's own no-op paths judge
+            # their evidence, and overriding a deliberate refusal would be
+            # worse than the fallback.
+            return tr
+        failed = str(role.get("profile") or "")
+        fallback = roles_mod.select_coding_fallback(
+            cfg, exclude=(failed,) if failed else ())
+        if not fallback or fallback == failed:
+            return tr
+        fb = roles_mod.switch_specialist_client(cfg, client, fallback)
+        if fb is client:
+            return tr
+        model = str(getattr(fb.cfg, "model", "") or "")
+        print(f"\n[specialist router: profile '{failed}' finished with 0 "
+              f"applied edits / 0 files written; retrying the task once on "
+              f"the top-scoring coding specialist '{fallback}' ({model})]",
+              file=sys.stderr)
+        workspace.log_event(
+            root, f"specialist zero-edit fallback: '{failed}' -> "
+                  f"'{fallback}' ({model})", "WARN")
+        try:
+            events_mod.get(root, cfg).emit(
+                "specialist_fallback", failed_profile=failed,
+                profile=fallback, model=model)
+        except Exception:
+            pass
+        swap = getattr(fb, "_swap_info", None)
+        if swap:
+            fb._swap_info = None
+            _emit_model_swap(root, cfg, swap)
+        from .agent import Agent
+        tr2 = _run_ladder(root, cfg, fb, Agent(idx, fb, cfg), idx, task, **kw)
+        if any(r.ok for r in tr2.results) or tr2.changed:
+            return tr2
+        print(f"  [coding-specialist fallback '{fallback}' produced no "
+              f"applied edits either]", file=sys.stderr)
+    except Exception as e:
+        print(f"  [specialist zero-edit fallback skipped: {str(e)[:100]}]",
+              file=sys.stderr)
+    return tr
+
+
 def run_task(root: Path, cfg, client, agent, idx, task: str, *,
              apply: bool = True, review: bool = False,
              answer_system: str | None = None,
@@ -3462,6 +3532,10 @@ def run_task(root: Path, cfg, client, agent, idx, task: str, *,
     tr = _run_ladder(root, cfg, client, agent, idx, task, apply=apply,
                      review=review, answer_system=answer_system,
                      is_repair=is_repair)
+    tr = _specialist_zero_edit_fallback(
+        root, cfg, client, idx, task, tr,
+        dict(apply=apply, review=review, answer_system=answer_system,
+             is_repair=is_repair))
     if answer_system is not None or review or not getattr(cfg, "use_memory", True):
         return tr
     try:

@@ -835,6 +835,51 @@ def test_loop_route_never_raises_on_a_broken_router(tmp_path, monkeypatch):
     assert client is worker                      # graceful fallback
 
 
+def test_specialist_zero_edit_falls_back_to_top_coding_specialist(
+        tmp_path, monkeypatch, home, capsys):
+    """BUG_HUNT #14 Finding #5: a routed math specialist (LFM2.5-24B-A2B)
+    streamed unbounded reasoning and wrote 0 files. Rather than fail the task,
+    retry it once on the top-scoring local coding specialist."""
+    from pedacito.edits import Result
+
+    cfg, worker, factory, unloaded = _handoff_setup(
+        monkeypatch,
+        profiles={"worker": {"model": "worker-m"},
+                  "math": {"model": "math-m",
+                           "specialties": ["math_algorithms"]},
+                  "coder": {"model": "coder-m",
+                            "specialties": ["coding"]}})
+    cfg.auto_route_specialties = True
+    for model, tag, overall in (("math-m", "math_algorithms", 0.9),
+                                ("coder-m", "coding", 1.0)):
+        card = _card(model, overall=overall, specialties=[tag])
+        card["measured"].update({"edit_format": 1.0, "tool_choice": 1.0})
+        modelcard.save_card(card)
+
+    calls = []
+
+    def fake_ladder(root, cfg_, client, agent, idx_, task, **kw):
+        calls.append(client.cfg.model)
+        if client.cfg.model == "math-m":
+            return loop.TaskResult([], "", False, [], idx_)   # 0 edits
+        return loop.TaskResult([Result(True, "math_utils.py", "applied")],
+                               "done", True, ["math_utils.py"], idx_)
+
+    monkeypatch.setattr(loop, "_run_ladder", fake_ladder)
+    idx = SimpleNamespace(root=tmp_path, files=[])
+    tr = loop.run_task(tmp_path, cfg, worker, None, idx,
+                       "optimize the sorting algorithm", apply=True)
+
+    assert calls == ["math-m", "coder-m"]       # specialist, then the coder
+    assert tr.applied and tr.changed == ["math_utils.py"]
+    err = capsys.readouterr().err
+    assert "top-scoring coding specialist 'coder'" in err
+    # the failed math card was handed off cleanly before the coder loaded
+    assert unloaded == ["worker-m", "math-m"]
+    assert roles.select_coding_fallback(
+        cfg, exclude=("math",)) == "coder"
+
+
 def test_planner_note_lists_specialists_only_when_routing_is_on():
     cfg = _routed_cfg()
     note = roles.specialty_planner_note(cfg)

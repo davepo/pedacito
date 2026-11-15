@@ -280,6 +280,13 @@ _TIER_BONUS = {"tiny": 0.0, "small": 0.01, "medium": 0.02,
 # composite skill beats it by at least this much (item 16).
 _INERTIA_MARGIN = 0.08
 
+# A fallback worker must at least hold the edit format: a specialist that
+# streamed unbounded hidden reasoning and wrote nothing must hand the task to
+# a profile measured above the same competence gate the specialty tags use
+# (item 15). A top edit-format card (1.0) also qualifies as a math/algorithm
+# worker when no math specialist can finish the task.
+_CODING_FALLBACK_MIN_EDIT = 0.65
+
 
 def _specialist_skill(cfg, profiles: dict, name: str, tag: str) -> float:
     """Composite skill of one profile for one tag (item 16):
@@ -394,6 +401,59 @@ def select_specialist_profile(task: str, idx, cfg, explicit_tag: str = "",
     if name == active:
         return "", ""
     return name, won
+
+
+def select_coding_fallback(cfg, exclude=()) -> str:
+    """Top-scoring LOCAL coding specialist for a zero-edit retry, or "".
+
+    BUG_HUNT #14 Finding #5: a card can carry a specialty (e.g.
+    ``math_algorithms``) yet burn its whole answer on hidden reasoning and
+    write no files. The specialist router then leaves the task marked failed
+    even though a capable coder sits idle. This picks the replacement worker:
+
+    - local profiles only unless ``auto_route_allow_hosted`` is on;
+    - ``exclude`` skips the specialist that just failed;
+    - a measured card must clear ``_CODING_FALLBACK_MIN_EDIT`` (the same
+      ``edit_format >= 0.65`` competence gate the specialty tags use);
+    - a profile carrying the ``coding`` tag wins over a card that merely has
+      a top edit-format score. The latter stays eligible so a top coding card
+      (``edit_format == 1.0``) can take over math/algorithm work when the
+      math specialist stalls.
+
+    Ties go to the higher composite coding skill (edit format, overall,
+    tier). Returns "" when routing is off or no candidate qualifies."""
+    if not getattr(cfg, "auto_route_specialties", False):
+        return ""
+    profiles = getattr(cfg, "profiles", None) or {}
+    exclude = {str(n) for n in (exclude or ()) if n}
+    allow_hosted = bool(getattr(cfg, "auto_route_allow_hosted", False))
+    rows: list[tuple[int, float, str]] = []
+    for name in profiles:
+        if name in exclude:
+            continue
+        if not allow_hosted and profile_is_hosted(cfg, name):
+            continue
+        card = _profile_card(cfg, name) or {}
+        measured = card.get("measured") or {}
+        ed = float(measured.get("edit_format", 0.0) or 0.0)
+        tags = set(specialties_for(cfg, name))
+        if measured and ed < _CODING_FALLBACK_MIN_EDIT:
+            continue
+        if "coding" in tags:
+            rank = 0
+        elif measured and ed >= _CODING_FALLBACK_MIN_EDIT:
+            # No coding tag, but a measured top edit format: eligible as the
+            # math/algorithm worker the failing specialist could not be.
+            rank = 1
+        else:
+            continue
+        rows.append((rank,
+                     -_specialist_skill(cfg, profiles, name, "coding"),
+                     name))
+    if not rows:
+        return ""
+    rows.sort()
+    return rows[0][2]
 
 
 def _share_ledger(default, client) -> None:
