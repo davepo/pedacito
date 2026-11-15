@@ -5,6 +5,7 @@ Usage
     pedacito how "how do I set up a config file?"
     pedacito how --offline "how do I disable thinking?"
     pedacito how --json "how do I import models?"
+    pedacito how "how do I scroll back in pedacito tui?"
     pedacito how                                  # interactive help prompt
 
 Unlike every other Pedacito command, `how` does not need a project or an
@@ -13,7 +14,9 @@ paths, and config settings deterministically (`how_index.py`). When a fast,
 configured model server is reachable it may rewrite those retrieved facts into
 a short answer with GUI, CLI and settings sections; otherwise -- or with
 `--offline` -- the structured cards are printed directly, so help always works
-before a model is configured.
+before a model is configured. The `tui` card also covers PgUp/PgDn scrolling,
+mouse-wheel modes (`?1007h` native selection vs. optional SGR), F2, Tab
+completion and command history.
 """
 
 from __future__ import annotations

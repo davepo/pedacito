@@ -690,11 +690,23 @@ The footer is live: the **Context Meter** turns green below 70%, amber from
 model/role. The token burn rate and the sidebar follow every `read`/`grep`/`mcp_call` step,
 `model_swap`, verification receipt and `PLAN.md` checkbox while a task runs.
 
-Type a task as usual, or use `/help`, `/status`, `/auto GOAL`, `/plan`,
-`/consolidate`, `/profile`, `/auto-route`, `/think`, `/apply`, `/skills`,
-`/memory`, `/procs`, `/diff`, `/undo`, `/reset`, `/sidebar`, `/clear` and
-`/quit`. Permission prompts appear in the prompt bar (`y` once, `a` for the
-session, `n` deny).
+Keys work inside the TUI instead of echoing escape codes: **PgUp/PgDn** scroll
+the transcript half a page, **Shift+Up/Down** scroll three lines,
+**Alt+PgUp/PgDn** scroll the Activity/Plan sidebar, and the **mouse wheel**
+scrolls three lines. The default wheel mode (`?1007h` Alternate Scroll) keeps
+native left-click selection and OS copy/paste; **F2** or `/mouse on` enables
+optional SGR wheel capture, and `/mouse off` restores native selection.
+**Up/Down** recall command history, **Left/Right/Home/End** edit the prompt,
+**Tab** completes slash commands and profile names, and **Esc/End** jump to the
+live bottom. A scrolled-back view shows `[ ↑ Scrolled back N lines ... ]` and
+stays stationary as new log lines arrive.
+
+Type a task as usual, or use `/help`, `/keys`, `/status`, `/auto GOAL`,
+`/plan`, `/consolidate`, `/profile`, `/auto-route`, `/think`, `/apply`,
+`/skills`, `/memory`, `/procs`, `/diff`, `/undo`, `/reset`, `/sidebar`,
+`/scroll up|down|top|bottom|N`, `/mouse [on|off]`, `/clear` and `/quit`.
+Permission prompts appear in the prompt bar (`y` once, `a` for the session,
+`n` deny).
 
 ### B11. Benchmarks
 

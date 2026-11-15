@@ -383,11 +383,15 @@ CLI_COMMANDS = [
         "usage": "pedacito tui [PROJECT] [-t \"task\"] [--no-apply] "
                  "[--headless]",
         "summary": "Split-screen terminal UI: a transcript pane, a live "
-                   "activity/plan sidebar, and a two-row telemetry footer "
-                   "with the Context Meter, token burn rate and tok/s.",
+                   "activity/plan sidebar, a two-row telemetry footer with "
+                   "the Context Meter, token burn rate and tok/s, plus "
+                   "PgUp/PgDn and mouse-wheel scrollback with native "
+                   "text selection.",
         "keywords": ["tui", "terminal ui", "split screen", "context meter",
                      "telemetry", "token burn", "tok/s", "sidebar", "plan",
-                     "slash commands", "live activity"],
+                     "slash commands", "live activity", "scroll", "pgup",
+                     "pgdn", "mouse wheel", "keybindings", "tab completion",
+                     "command history"],
         "examples": [
             "pedacito tui .",
             "pedacito tui ~/code/anki --apply",
@@ -417,10 +421,25 @@ CLI_COMMANDS = [
             "The footer shows Ctx: 6,420 / 32,768 (19.6%) with a green/amber/"
             "red bar, Turn: +in/+out, Session totals, Speed/avg tok/s, KV "
             "cache, folds and Active model/role",
-            "Slash commands: /help, /status (/telemetry), /auto GOAL, /plan, "
-            "/consolidate (/compact), /profile, /model ID, /auto-route, "
-            "/think, /apply, /skills, /memory, /procs, /diff, /undo, /reset, "
-            "/sidebar, /clear, /quit",
+            "Slash commands: /help, /keys, /status (/telemetry), /auto GOAL, "
+            "/plan, /consolidate (/compact), /profile, /model ID, "
+            "/auto-route, /think, /apply, /skills, /memory, /procs, /diff, "
+            "/undo, /reset, /sidebar, /scroll, /mouse, /clear, /quit",
+            "Keys: PgUp/PgDn scroll the transcript, Shift+Up/Down scroll 3 "
+            "lines, Alt+PgUp/PgDn scroll the sidebar, Up/Down recall command "
+            "history, Left/Right/Home/End edit the prompt, and Tab completes "
+            "slash commands and profile names",
+            "Mouse wheel scrolls 3 lines by default through xterm Alternate "
+            "Scroll (?1007h), preserving native left-click selection and OS "
+            "copy/paste; /mouse on (or F2) enables optional SGR wheel capture "
+            "(?1000h/?1006h) and /mouse off restores native selection",
+            "Scrolled-back views stay stationary as new log lines arrive; "
+            "the transcript shows '[ ↑ Scrolled back N lines ... ]' and "
+            "Esc/End or /scroll bottom jumps to the live bottom",
+            "Interactive input is a cbreak/msvcrt raw reader with a prompt "
+            "buffer and synchronized DEC 2026 repaints, so PgUp and arrows "
+            "never echo as ^[[5~ and telemetry repaints keep the cursor in "
+            "place",
             "The right sidebar appears at 100+ columns and toggles with "
             "/sidebar; it shows PLAN.md checkboxes, gather steps, specialist "
             "swaps and modified files",

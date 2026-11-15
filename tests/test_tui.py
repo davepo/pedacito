@@ -7,6 +7,7 @@ input stream. The same tests run on POSIX and Windows CI.
 from __future__ import annotations
 
 import io
+import re
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -18,7 +19,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from pedacito import cli, events, security, workspace
 from pedacito import tui as tui_mod
 from pedacito.config import Config
-from pedacito.tui import TuiSession, run_tui
+from pedacito.tui import TuiSession, parse_escape_sequence, run_tui
 
 
 class FakeClient:
@@ -114,7 +115,9 @@ def test_tui_frame_and_telemetry_bar_rendering(tmp_path):
         assert "KV Cache: 86%" in wide
         # Zone 4: the prompt bar.
         assert "pdc tui (default) >" in wide
-        assert "/help: commands" in wide
+        assert "PgUp/PgDn/Wheel: scroll" in wide
+        assert "Tab: complete" in wide
+        assert "/help | /quit" in wide
 
         narrow = session.render_frame(78, 24)
         assert len(narrow.splitlines()) == 24
@@ -350,3 +353,223 @@ def test_context_meter_thresholds(pct, color, state):
     bar, got_color, got_state = tui_mod._meter(pct)
     assert got_color == color and got_state == state
     assert len(bar) == 16
+
+
+def test_escape_sequence_and_mouse_wheel_parser():
+    assert parse_escape_sequence("\x1b[5~") == ("PAGE_UP", 4)
+    assert parse_escape_sequence("\x1b[6~") == ("PAGE_DOWN", 4)
+    assert parse_escape_sequence("\x1b[1;2A") == ("SHIFT_UP", 6)
+    assert parse_escape_sequence("\x1b[1;2B") == ("SHIFT_DOWN", 6)
+    assert parse_escape_sequence("\x1b[5;3~") == ("ALT_PAGE_UP", 6)
+    assert parse_escape_sequence("\x1b[6;3~") == ("ALT_PAGE_DOWN", 6)
+    assert parse_escape_sequence("\x1b[H") == ("HOME", 3)
+    assert parse_escape_sequence("\x1b[1~") == ("HOME", 4)
+    assert parse_escape_sequence("\x1b[F") == ("END", 3)
+    assert parse_escape_sequence("\x1b[4~") == ("END", 4)
+    assert parse_escape_sequence("\x1b[3~") == ("DELETE", 4)
+    assert parse_escape_sequence("\x1b[<64;20;10M") == ("WHEEL_UP", 12)
+    assert parse_escape_sequence("\x1b[<65;20;10M") == ("WHEEL_DOWN", 12)
+    assert parse_escape_sequence("\x1b[A") == ("UP", 3)
+    assert parse_escape_sequence("\x1b[B") == ("DOWN", 3)
+    assert parse_escape_sequence("\x1b[A\x1b[A\x1b[A") == ("WHEEL_UP", 9)
+    assert parse_escape_sequence("\x1b[B\x1b[B") == ("WHEEL_DOWN", 6)
+    assert parse_escape_sequence("\x00I") == ("PAGE_UP", 2)
+    assert parse_escape_sequence("\xe0Q") == ("PAGE_DOWN", 2)
+    assert parse_escape_sequence("\x1bOQ") == ("F2", 3)
+    assert parse_escape_sequence("\x7f") == ("BACKSPACE", 1)
+    assert parse_escape_sequence("\x17") == ("CTRL_W", 1)
+    assert parse_escape_sequence("\x1b[") == ("", 0)      # incomplete
+
+
+def test_viewport_scrollback_pgup_pgdn_and_stationary_lock(tmp_path):
+    cfg = _cfg()
+    session = TuiSession(tmp_path, cfg, client=FakeClient(), headless=True,
+                         width=100, height=24, stdout=io.StringIO())
+    try:
+        for i in range(1, 101):
+            session.append(f"line {i:03d}", "system")
+        bottom = session.render_frame()
+        assert "line 100" in bottom
+        assert "Scrolled back" not in bottom
+
+        session.handle_key("PAGE_UP")
+        assert session.scroll_offset > 0
+        page = session.render_frame()
+        assert "Scrolled back" in page
+        assert "PgDn / End / Esc" in page
+        numbers = [int(m.group(1)) for m in
+                   re.finditer(r"line (\d{3})", page)]
+        assert numbers and max(numbers) < 100
+
+        before = session.scroll_offset
+        session.handle_key("WHEEL_UP")
+        assert session.scroll_offset == before + 3
+        before_text = session.render_frame()
+        first_line = next(ln for ln in before_text.splitlines()
+                          if "line " in ln)
+        # New background output must not yank the reader back to the bottom.
+        session.append("line 101 new background output", "system")
+        session.append("line 102 more background output", "system")
+        after_text = session.render_frame()
+        first_after = next(ln for ln in after_text.splitlines()
+                           if "line " in ln)
+        assert first_after == first_line
+        assert session.scroll_offset > before
+
+        # END, ESC and /scroll bottom all snap back to the live bottom.
+        session.handle_key("END")
+        assert session.scroll_offset == 0
+        session.handle_key("PAGE_UP")
+        assert session.scroll_offset > 0
+        session.handle_key("ESC")
+        assert session.scroll_offset == 0
+        session.handle_key("PAGE_UP")
+        session.handle_line("/scroll bottom")
+        assert session.scroll_offset == 0
+
+        # /scroll top/N are deterministic scriptable drivers too.
+        session.handle_line("/scroll top")
+        top = session.render_frame()
+        assert "line 001" in top
+        session.handle_line("/scroll 5")
+        assert session.scroll_offset == 5
+    finally:
+        session.close()
+
+
+def test_input_buffer_editing_history_and_tab_completion(tmp_path):
+    cfg = _cfg()
+    cfg.profiles = {"default": {}, "fast": {}}
+    session = TuiSession(tmp_path, cfg, client=FakeClient(), headless=True,
+                         width=100, height=24, stdout=io.StringIO())
+    try:
+        session.feed_keys("hello world")
+        assert session.input_buf == "hello world"
+        assert session.cursor_pos == 11
+        for _ in range(5):
+            session.handle_key("LEFT")
+        assert session.cursor_pos == 6
+        session.handle_key("CTRL_W")
+        assert session.input_buf == "world"
+        assert session.cursor_pos == 0
+
+        session.command_history.append("previous task")
+        session._history_pos = len(session.command_history)
+        session.handle_key("UP")
+        assert session.input_buf == "previous task"
+        assert session.cursor_pos == len("previous task")
+        session.handle_key("DOWN")
+        assert session.input_buf == "world"
+
+        session.input_buf = ""
+        session.cursor_pos = 0
+        session.feed_keys("/con")
+        session.handle_key("TAB")
+        assert session.input_buf == "/consolidate "
+        assert session.cursor_pos == len("/consolidate ")
+
+        session.input_buf = ""
+        session.cursor_pos = 0
+        session.feed_keys("/pro")
+        session.handle_key("TAB")
+        assert session.input_buf == "/profile "
+
+        session.input_buf = ""
+        session.cursor_pos = 0
+        session.feed_keys("/aut")
+        session.handle_key("TAB")
+        assert session.input_buf == "/auto-route "
+
+        # Profile-name completion after the command.
+        session.input_buf = "/profile fa"
+        session.cursor_pos = len(session.input_buf)
+        session.handle_key("TAB")
+        assert session.input_buf == "/profile fast "
+
+        # Home/End and Delete follow cursor_pos exactly.
+        session.input_buf = "abcd"
+        session.cursor_pos = 4
+        session.handle_key("HOME")
+        assert session.cursor_pos == 0
+        session.handle_key("DELETE")
+        assert session.input_buf == "bcd"
+        session.handle_key("END")
+        assert session.cursor_pos == 3
+    finally:
+        session.close()
+
+
+def test_vt_enter_and_exit_restores_mode_1007_and_1049(tmp_path):
+    class TtyInput(io.StringIO):
+        def isatty(self):
+            return True
+
+    class TtyOutput(io.StringIO):
+        def isatty(self):
+            return True
+
+    cfg = _cfg()
+    out = TtyOutput()
+    session = TuiSession(tmp_path, cfg, client=FakeClient(),
+                         stdin=TtyInput("/quit\n"), stdout=out)
+    assert session.run() == 0
+    text = out.getvalue()
+    assert "\x1b[?1049h" in text
+    assert "\x1b[?1007h" in text
+    assert "\x1b[?1000h" not in text          # native selection default
+    assert "\x1b[?1007l" in text
+    assert "\x1b[?1000l" in text
+    assert "\x1b[?1006l" in text
+    assert "\x1b[?1049l" in text
+    assert "\x1b[?2026h" in text              # synchronized output
+    assert "\x1b[?2026l" in text
+
+
+def test_mouse_toggle_and_sidebar_wheel_scrolling(tmp_path):
+    cfg = _cfg()
+    session = TuiSession(tmp_path, cfg, client=FakeClient(), headless=True,
+                         width=120, height=32, stdout=io.StringIO())
+    try:
+        for i in range(60):
+            session.activity.append(f"activity {i}")
+        session.handle_key("WHEEL_UP", col=110)   # over the right sidebar
+        assert session.scroll_offset == 0
+        assert session.sidebar_scroll_offset == 3
+        session.handle_key("ALT_PAGE_DOWN")
+        assert session.sidebar_scroll_offset == 0
+        assert session.mouse_sgr is False
+        session.handle_key("F2")
+        assert session.mouse_sgr is True
+        session.handle_line("/mouse off")
+        assert session.mouse_sgr is False
+        frame = session.render_frame()
+        assert "pdc tui (default) >" in frame
+    finally:
+        session.close()
+
+
+def test_synchronized_redraw_keeps_partial_prompt_and_cursor(tmp_path):
+    class TtyInput(io.StringIO):
+        def isatty(self):
+            return True
+
+    class TtyOutput(io.StringIO):
+        def isatty(self):
+            return True
+
+    cfg = _cfg()
+    out = TtyOutput()
+    session = TuiSession(tmp_path, cfg, client=FakeClient(),
+                         stdin=TtyInput(""), stdout=out, width=80, height=24)
+    try:
+        session._prepare_terminal()
+        session.input_buf = "partial"
+        session.cursor_pos = 3
+        session._redraw(force=True)
+        text = out.getvalue()
+        assert "\x1b[?2026h" in text and "\x1b[?2026l" in text
+        assert "partial" in text
+        # prefix "pdc tui (default) > " + cursor 3 -> column 24, last row 24
+        assert "\x1b[24;24H" in text
+    finally:
+        session.close()

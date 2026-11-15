@@ -874,6 +874,19 @@ toggles with `/sidebar`; it shows `PLAN.md` checkboxes, live `read`/`grep`/
 `mcp_call`/`task` steps, specialist `model_swap` routing, and the files this
 session changed.
 
+Interactive input is a cbreak/`msvcrt` raw reader, so navigation keys edit the
+prompt instead of echoing `^[[5~`: `PgUp`/`PgDn` scroll the transcript half a
+page, `Shift+Up`/`Shift+Down` scroll three lines, `Alt+PgUp`/`Alt+PgDn` scroll
+the Activity/Plan sidebar, and the mouse wheel scrolls three lines. The wheel
+uses xterm Alternate Scroll (`?1007h`) by default, so left-click-drag selection
+and the OS copy/paste keep working; `/mouse on` (or `F2`) enables optional SGR
+wheel capture and `/mouse off` restores native selection. `Up`/`Down` recall
+command history, `Left`/`Right`/`Home`/`End` edit the prompt, `Tab` completes
+slash commands and profile names, and `Esc`/`End` jump back to the live bottom.
+A scrolled-back transcript ([ ↑ Scrolled back N lines ... ]) stays stationary
+while background log lines arrive. Repaints use DEC synchronized output and
+place the hardware cursor inside `pdc tui (profile) > ...`.
+
 The footer updates after every model call and event: a green/amber/red
 **Context Meter** (`Ctx: [████████░░░░░░░░] 6,420 / 32,768 (19.6%)`), turn and
 session token burn rate, `Speed: 44.2 tok/s (avg 41.8 tok/s)`, KV cache hit
@@ -882,12 +895,12 @@ when priced. `pedacito tui` registers the live permission broker, so an untruste
 MCP tool, sensitive file read or shell command asks in the prompt bar:
 `y` allows once, `a` allows that key for the session, `n` denies.
 
-Slash commands: `/help`, `/status` (`/telemetry`), `/auto GOAL`, `/plan
-[GOAL]`, `/consolidate` (`/compact`), `/profile [NAME]`, `/model ID`,
+Slash commands: `/help`, `/keys`, `/status` (`/telemetry`), `/auto GOAL`,
+`/plan [GOAL]`, `/consolidate` (`/compact`), `/profile [NAME]`, `/model ID`,
 `/auto-route [on|off]`, `/think [on|off]`, `/apply [on|off]`, `/skills`,
-`/memory`, `/procs`, `/diff`, `/undo`, `/reset`, `/sidebar`, `/clear`,
-`/quit`. A plain line is a task and runs through the normal
-gather/edit/verify loop.
+`/memory`, `/procs`, `/diff`, `/undo`, `/reset`, `/sidebar`, `/scroll
+up|down|top|bottom|N`, `/mouse [on|off]`, `/clear`, `/quit`. A plain line is a
+task and runs through the normal gather/edit/verify loop.
 
 ### `rpc`: drive pedacito from an editor or another agent
 

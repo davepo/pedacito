@@ -30,6 +30,7 @@ Slash commands mirror `pedacito chat` and add the TUI-specific panes:
 
 from __future__ import annotations
 
+import codecs
 import copy
 import json
 import os
@@ -58,23 +59,78 @@ from .agent import Agent
 from .config import Config
 from .llm import LLMClient, LLMError
 
-__all__ = ["TuiSession", "enable_vt_mode", "run_tui", "HELP_TEXT"]
+__all__ = ["TuiSession", "enable_vt_mode", "parse_escape_sequence",
+           "run_tui", "HELP_TEXT", "KEYS_TEXT"]
 
 # ANSI sequences. They are emitted only for a real interactive TTY; headless
 # frames stay plain text so CI logs and StringIO assertions are deterministic.
-_ALT_SCREEN_ON = "\x1b[?1049h\x1b[?25l\x1b[2J\x1b[H"
-_ALT_SCREEN_OFF = "\x1b[?1049l\x1b[r\x1b[?25h"
+# ?1007h is xterm Alternate Scroll: the wheel becomes Up/Down key bursts while
+# left-click-drag selection and the OS copy/paste stay native. ?1000h/?1006h
+# (SGR click capture) stay OFF by default; /mouse on or F2 enables them.
+_ALT_SCREEN_ON = ("\x1b[?1049h\x1b[?1007h\x1b[?1000l\x1b[?1006l"
+                  "\x1b[?25l\x1b[2J\x1b[H")
+_ALT_SCREEN_OFF = ("\x1b[?1007l\x1b[?1000l\x1b[?1006l"
+                   "\x1b[?1049l\x1b[r\x1b[?25h")
+_MOUSE_SGR_ON = "\x1b[?1007l\x1b[?1000h\x1b[?1006h"
+_MOUSE_SGR_OFF = "\x1b[?1000l\x1b[?1006l\x1b[?1007h"
+_SYNC_ON = "\x1b[?2026h"
+_SYNC_OFF = "\x1b[?2026l"
 _CLEAR = "\x1b[2J\x1b[H"
 _HOME = "\x1b[H"
+_HIDE_CURSOR = "\x1b[?25l"
+_SHOW_CURSOR = "\x1b[?25h"
 
 _ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
+_SGR_MOUSE_RE = re.compile(r"^\x1b\[<(\d+);(\d+);(\d+)([Mm])")
 _PLAN_RE = re.compile(r"^\s*[-*]\s*\[([ xX])\]\s*(.*)$")
 _SWAP_ARROW = "\u2192"
 
+# Prefix completions explicitly requested by the TUI keybinding contract.
+_TAB_PREFIX = {
+    "/con": "/consolidate ",
+    "/pro": "/profile ",
+    "/aut": "/auto-route ",
+}
+_SLASH_COMMANDS = [
+    "/help", "/keys", "/status", "/telemetry", "/auto", "/plan",
+    "/consolidate", "/compact", "/profile", "/profiles", "/model",
+    "/auto-route", "/think", "/apply", "/skills", "/memory", "/procs",
+    "/diff", "/undo", "/reset", "/sidebar", "/scroll", "/mouse", "/clear",
+    "/quit", "/exit",
+]
+_KNOWN_KEYS = {
+    "ENTER", "TAB", "BACKSPACE", "DELETE", "INSERT", "ESC",
+    "UP", "DOWN", "LEFT", "RIGHT", "HOME", "END",
+    "PAGE_UP", "PAGE_DOWN", "SHIFT_UP", "SHIFT_DOWN",
+    "SHIFT_LEFT", "SHIFT_RIGHT", "ALT_PAGE_UP", "ALT_PAGE_DOWN",
+    "WHEEL_UP", "WHEEL_DOWN", "CTRL_C", "CTRL_D", "CTRL_K", "CTRL_L",
+    "CTRL_U", "CTRL_W", "F2", "SHIFT_TAB",
+}
+
 # Commands shown by /help and in the prompt bar's hint line.
+KEYS_TEXT = """\
+Pedacito TUI keybindings
+  Enter                 send the task or slash command
+  PgUp / PgDn           transcript half a page up / down
+  Shift+Up / Shift+Down transcript 3 lines up / down
+  Ctrl+U / Ctrl+D       half-page scroll when the prompt is empty
+  Alt+PgUp / Alt+PgDn   scroll the Activity / Plan sidebar
+  Mouse wheel           transcript 3 lines, or the sidebar under pointer
+  Up / Down             command history (or scroll when scrolled back)
+  Left / Right          move the prompt cursor
+  Home / End            start / end of the prompt (End returns to live)
+  Esc                   jump to the live bottom
+  Backspace / Delete    edit the prompt; Ctrl+W deletes a word
+  Ctrl+K / Ctrl+L       kill to end / force a full repaint
+  Tab                   complete slash commands and profile names
+  F2                    toggle SGR mouse mode (native selection default)
+  Ctrl+C                cancel the running task
+  /quit or /exit        leave and restore the terminal"""
+
 HELP_TEXT = """\
 Pedacito TUI commands
   /help                     this list and the keyboard shortcuts
+  /keys                     detailed keybindings and mouse modes
   /status  /telemetry       full telemetry table and per-call-site tokens
   /auto GOAL                plan GOAL, then run every task with live updates
   /plan [GOAL]              show PLAN.md, or generate it from GOAL
@@ -91,11 +147,125 @@ Pedacito TUI commands
   /undo                     restore the newest .pedacito/backups snapshot
   /reset                    wipe .pedacito state (keeps memory and config)
   /sidebar                  toggle the activity / plan pane
+  /scroll up|down|top|bottom|N
+                            scroll the transcript (also works in --headless)
+  /mouse [on|off]           SGR mouse wheel capture (F2); off keeps native
+                            text selection and OS copy/paste
   /clear                    clear the transcript pane
   /quit  /exit              leave and restore the terminal
 
-Keyboard: Enter sends, Ctrl-C cancels the running task, Ctrl-D leaves.
+Enter: send | PgUp/PgDn/Wheel: scroll | Up/Down: history | Tab: complete
+F2: mouse mode | Esc/End: live bottom | Ctrl+C: cancel | /help | /quit
 Plain text is a task: it runs through the normal gather/edit/verify loop."""
+
+
+def _windows_key_sequence(code: str) -> str:
+    """msvcrt's second byte -> the equivalent VT escape sequence."""
+    return {
+        "H": "\x1b[A", "P": "\x1b[B", "K": "\x1b[D", "M": "\x1b[C",
+        "G": "\x1b[H", "O": "\x1b[F", "S": "\x1b[3~",
+        "I": "\x1b[5~", "Q": "\x1b[6~",
+        "<": "\x1bOQ",           # F2 on the Windows console
+        "R": "\x1b[2~",          # Insert (recognised as UNKNOWN)
+    }.get(code, "")
+
+
+def parse_escape_sequence(buf: str) -> tuple[str, int]:
+    """Parse the first key event in `buf`; return `(key_name, consumed)`.
+
+    `key_name` is one of the named navigation/editing keys, a single printable
+    character, or `""` when the buffer holds an incomplete sequence (the raw
+    reader then waits for more bytes). Bursts of two or more Up/Down arrows in
+    the same drain window are classified as WHEEL_UP/WHEEL_DOWN: that is the
+    `?1007h` Alternate Scroll contract terminals use for the mouse wheel.
+    """
+    if not buf:
+        return "", 0
+
+    # SGR mouse wheel, before the generic CSI checks.
+    match = _SGR_MOUSE_RE.match(buf)
+    if match:
+        button = int(match.group(1))
+        key = {64: "WHEEL_UP", 65: "WHEEL_DOWN"}.get(button)
+        return (key, match.end()) if key else ("UNKNOWN", match.end())
+
+    # Alternate-scroll bursts. Count repeated sequences so one drain returns
+    # WHEEL rather than leaking N history events into the prompt.
+    for seq, key in (("\x1b[A", "UP"), ("\x1b[B", "DOWN"),
+                     ("\xe0H", "UP"), ("\xe0P", "DOWN")):
+        if buf.startswith(seq):
+            count = 0
+            pos = 0
+            while buf.startswith(seq, pos):
+                count += 1
+                pos += len(seq)
+            if count >= 2:
+                return ("WHEEL_UP" if key == "UP" else "WHEEL_DOWN", pos)
+            return key, len(seq)
+
+    exact = {
+        "\x1b[5~": "PAGE_UP",
+        "\x1b[6~": "PAGE_DOWN",
+        "\x1b[5;3~": "ALT_PAGE_UP",
+        "\x1b[6;3~": "ALT_PAGE_DOWN",
+        "\x1b[1;2A": "SHIFT_UP",
+        "\x1b[1;2B": "SHIFT_DOWN",
+        "\x1b[1;2C": "SHIFT_RIGHT",
+        "\x1b[1;2D": "SHIFT_LEFT",
+        "\x1b[3~": "DELETE",
+        "\x1b[2~": "INSERT",
+        "\x1b[H": "HOME",
+        "\x1b[F": "END",
+        "\x1b[1~": "HOME",
+        "\x1b[4~": "END",
+        "\x1b[7~": "HOME",
+        "\x1b[8~": "END",
+        "\x1bOQ": "F2",
+        "\x1b[12~": "F2",
+        "\x1b[Z": "SHIFT_TAB",
+        "\x00I": "PAGE_UP", "\xe0I": "PAGE_UP",
+        "\x00Q": "PAGE_DOWN", "\xe0Q": "PAGE_DOWN",
+        "\x00G": "HOME", "\xe0G": "HOME",
+        "\x00O": "END", "\xe0O": "END",
+        "\x00S": "DELETE", "\xe0S": "DELETE",
+        "\x00<": "F2", "\xe0<": "F2",
+    }
+    for seq, key in exact.items():
+        if buf.startswith(seq):
+            return key, len(seq)
+
+    # Remaining SS3 sequences (F1-F4 and friends): consume one final byte.
+    if buf.startswith("\x1bO"):
+        if len(buf) < 3:
+            return "", 0
+        return "UNKNOWN", 3
+
+    # Generic CSI sequence. Incomplete prefixes wait for more bytes.
+    if buf.startswith("\x1b["):
+        match = re.match(r"\x1b\[[0-9;?]*[A-Za-z~]", buf)
+        if match:
+            return "UNKNOWN", match.end()
+        return "", 0
+
+    # A lone ESC: the reader gives it a short drain grace before returning it,
+    # so Alt+key sequences are not mistaken for Escape.
+    if buf.startswith("\x1b"):
+        if len(buf) == 1:
+            return "ESC", 1
+        return "ALT_" + buf[1].upper(), 2
+
+    char = buf[0]
+    controls = {
+        "\r": "ENTER", "\n": "ENTER", "\t": "TAB",
+        "\x7f": "BACKSPACE", "\x08": "BACKSPACE",
+        "\x01": "HOME", "\x05": "END",
+        "\x03": "CTRL_C", "\x04": "CTRL_D",
+        "\x0b": "CTRL_K", "\x0c": "CTRL_L",
+        "\x15": "CTRL_U", "\x17": "CTRL_W",
+    }
+    if char in controls:
+        return controls[char], 1
+    return char, 1
 
 
 def enable_vt_mode(stream=None) -> bool:
@@ -276,6 +446,25 @@ class TuiSession:
         self.transcript: list[tuple[str, str]] = []
         self.activity: list[str] = []
         self.modified: list[str] = []
+        # Prompt editing and viewport state. scroll_offset == 0 is pinned to
+        # the live bottom; positive values mean "N wrapped lines back".
+        self.input_buf = ""
+        self.cursor_pos = 0
+        self.command_history: list[str] = []
+        self._history_pos = 0
+        self._history_draft = ""
+        self.scroll_offset = 0
+        self.sidebar_scroll_offset = 0
+        self.mouse_sgr = False
+        self._last_mouse_col = 0
+        self._prompt_view_start = 0
+        self._raw_buf = ""
+        self._decoder = codecs.getincrementaldecoder("utf-8")("replace")
+        self._old_termios = None
+        self._raw_mode = False
+        self._last_render_scroll_total = 0
+        self._scroll_seen_total = 0
+        self._scroll_seen_width = 0
         self.folds = 0
         self.resume_context = ""
         self.last_telemetry: dict = {}
@@ -567,49 +756,76 @@ class TuiSession:
                             match.group(2).strip()))
         return out
 
-    def _sidebar_lines(self, width: int, height: int) -> list[str]:
+    def _all_sidebar_rows(self, width: int) -> list[str]:
         width = max(20, width)
         rows: list[str] = ["ACTIVITY & PLAN"]
         items = self.plan_items()
         rows.append(f"PLAN: {self._plan_path().name}")
         if items:
-            room = max(2, height // 3)
-            for checked, text in items[:room]:
+            for checked, text in items:
                 mark = "x" if checked else " "
                 rows.append(f"[{mark}] {text}")
-            if len(items) > room:
-                rows.append(f"    (+{len(items) - room} more)")
         else:
             rows.append("[ ] (no PLAN.md tasks yet)")
         rows.append("")
         rows.append("LIVE ACTIVITY / ROUTING")
         if self.activity:
-            room = max(3, height // 3)
-            for row in self.activity[-room:]:
+            for row in self.activity:
                 rows.append(row if row.startswith("\u00b7 ") else f"\u00b7 {row}")
         else:
             rows.append("\u00b7 (waiting for a task)")
         rows.append("")
         rows.append("MODIFIED FILES")
         if self.modified:
-            for rel in self.modified[-max(2, height // 5):]:
+            for rel in self.modified:
                 rows.append(f"~ {rel}")
         else:
             rows.append("~ (none yet)")
-        return rows[:height]
+        return rows
+
+    def _sidebar_lines(self, width: int, height: int) -> list[str]:
+        rows = self._all_sidebar_rows(width)
+        viewport = max(1, height)
+        total = len(rows)
+        limit = max(0, total - viewport)
+        self.sidebar_scroll_offset = max(
+            0, min(int(self.sidebar_scroll_offset), limit))
+        offset = int(self.sidebar_scroll_offset)
+        end = max(0, total - offset)
+        start = max(0, end - viewport)
+        visible = rows[start:end]
+        if offset > 0:
+            pill = f"[ \u2191 sidebar {offset} lines \u2014 Alt+PgDn ]"
+            if visible:
+                visible[-1] = pill
+            else:
+                visible = [pill]
+        return visible
 
     # ------------------------------------------------------------- painting
-    def _transcript_rows(self, width: int, height: int) -> list[str]:
-        if not self.transcript:
-            intro = [
-                ("system", f"Pedacito TUI \u2014 {self.root}"),
-                ("system", "Type a coding task, or /help for commands."),
-                ("system", "Telemetry updates after every model call."),
-            ]
-            source = intro
-        else:
-            source = self.transcript
-        rows: list[str] = []
+    def _show_sidebar(self, width: int | None = None) -> bool:
+        width = width if width is not None else self._size()[0]
+        return bool(self.sidebar and width >= 100)
+
+    def _transcript_width(self, width: int | None = None) -> int:
+        width = width if width is not None else self._size()[0]
+        if self._show_sidebar(width):
+            side_width = min(46, max(32, width // 3))
+            left_width = width - side_width - 1
+            return max(1, left_width - 1)
+        return max(1, width - 1)
+
+    def _body_height(self, height: int | None = None) -> int:
+        height = height if height is not None else self._size()[1]
+        header = 2
+        footer = 2
+        return max(4, height - header - footer - 2)
+
+    def _transcript_viewport_height(self, height: int | None = None) -> int:
+        return max(1, self._body_height(height) - 1)
+
+    def _wrap_transcript_line(self, kind: str, text: str,
+                             width: int) -> list[str]:
         prefixes = {
             "user": "\u00bb ",
             "assistant": "\u25c6 ",
@@ -619,17 +835,156 @@ class TuiSession:
             "diff": "  ",
             "error": "! ",
         }
-        for kind, text in source[-300:]:
-            prefix = prefixes.get(kind, "  ")
-            body = str(text)
-            for raw in body.splitlines() or [""]:
-                chunks = textwrap.wrap(
-                    prefix + raw, width=max(1, width),
-                    replace_whitespace=False, drop_whitespace=False,
-                    break_long_words=True, break_on_hyphens=False) or [prefix]
-                rows.extend(chunks)
-                prefix = "  "
-        return rows[-max(1, height):]
+        prefix = prefixes.get(kind, "  ")
+        body = str(text)
+        chunks: list[str] = []
+        for raw in body.splitlines() or [""]:
+            chunks.extend(textwrap.wrap(
+                prefix + raw, width=max(1, width),
+                replace_whitespace=False, drop_whitespace=False,
+                break_long_words=True, break_on_hyphens=False) or [prefix])
+            prefix = "  "
+        return chunks
+
+    def _all_transcript_rows(self, width: int | None = None) -> list[str]:
+        width = width if width is not None else self._transcript_width()
+        if not self.transcript:
+            source = [
+                ("system", f"Pedacito TUI \u2014 {self.root}"),
+                ("system", "Type a coding task, or /help for commands."),
+                ("system", "PgUp/PgDn or the mouse wheel scrolls the log."),
+            ]
+        else:
+            source = self.transcript
+        rows: list[str] = []
+        for kind, text in source:
+            rows.extend(self._wrap_transcript_line(kind, text, width))
+        return rows
+
+    def max_scroll(self) -> int:
+        """Largest useful transcript scroll_offset for the current size."""
+        width, height = self._size()
+        total = len(self._all_transcript_rows(self._transcript_width(width)))
+        return max(0, total - self._transcript_viewport_height(height))
+
+    def sidebar_max_scroll(self) -> int:
+        width, height = self._size()
+        if not self._show_sidebar(width):
+            return 0
+        side_width = min(46, max(32, width // 3))
+        total = len(self._all_sidebar_rows(max(20, side_width - 1)))
+        return max(0, total - self._body_height(height))
+
+    def _sync_scroll_baseline(self) -> int:
+        """Record the current wrapped-line total before changing the offset."""
+        width = self._transcript_width()
+        total = len(self._all_transcript_rows(width))
+        self._scroll_seen_width = width
+        self._scroll_seen_total = total
+        return total
+
+    def _clamp_scroll(self, width: int | None = None,
+                      height: int | None = None) -> None:
+        width = width if width is not None else self._size()[0]
+        height = height if height is not None else self._size()[1]
+        total = len(self._all_transcript_rows(self._transcript_width(width)))
+        # Direct transcript appends (or event listeners from another thread)
+        # are not required to call _append. If the wrapped total grew while
+        # the user was scrolled back, preserve the text under their eyes.
+        if self._scroll_seen_width == width:
+            if self.scroll_offset > 0 and total > self._scroll_seen_total:
+                self.scroll_offset += total - self._scroll_seen_total
+        self._scroll_seen_width = width
+        self._scroll_seen_total = total
+        limit = max(0, total - self._transcript_viewport_height(height))
+        self.scroll_offset = max(0, min(int(self.scroll_offset), limit))
+        if self._show_sidebar(width):
+            side_width = min(46, max(32, width // 3))
+            side_total = len(self._all_sidebar_rows(max(20, side_width - 1)))
+            side_limit = max(0, side_total - self._body_height(height))
+            self.sidebar_scroll_offset = max(
+                0, min(int(self.sidebar_scroll_offset), side_limit))
+        else:
+            self.sidebar_scroll_offset = 0
+
+    def scroll_transcript(self, delta: int) -> int:
+        """Positive = up/back, negative = down/toward live. Returns offset."""
+        self._sync_scroll_baseline()
+        self.scroll_offset = max(
+            0, min(self.max_scroll(), int(self.scroll_offset) + int(delta)))
+        self._dirty = True
+        return self.scroll_offset
+
+    def scroll_sidebar(self, delta: int) -> int:
+        self.sidebar_scroll_offset = max(
+            0, min(self.sidebar_max_scroll(),
+                   int(self.sidebar_scroll_offset) + int(delta)))
+        self._dirty = True
+        return self.sidebar_scroll_offset
+
+    def scroll_to_top(self) -> int:
+        self._sync_scroll_baseline()
+        self.scroll_offset = self.max_scroll()
+        self._dirty = True
+        return self.scroll_offset
+
+    def scroll_to_bottom(self) -> int:
+        self.scroll_offset = 0
+        self._dirty = True
+        return self.scroll_offset
+
+    def _transcript_rows(self, width: int, height: int) -> list[str]:
+        rows = self._all_transcript_rows(width)
+        viewport = max(1, height)
+        total = len(rows)
+        limit = max(0, total - viewport)
+        self.scroll_offset = max(0, min(int(self.scroll_offset), limit))
+        offset = int(self.scroll_offset)
+        end = max(0, total - offset)
+        start = max(0, end - viewport)
+        visible = rows[start:end]
+        if offset > 0:
+            pill = (f"[ \u2191 Scrolled back {offset} lines \u2014 press "
+                    "PgDn / End / Esc to jump to live bottom ]")
+            if visible:
+                visible[-1] = pill
+            else:
+                visible = [pill]
+        self._last_render_scroll_total = total
+        return visible
+
+    def _prompt_prefix(self) -> str:
+        return f"pdc tui ({self.profile}) > "
+
+    def _prompt_visible(self, width: int) -> tuple[str, int]:
+        """Prompt line plus the cursor's 0-based column inside it.
+
+        When the typed line is wider than the terminal, the visible window
+        follows the cursor so editing never runs off-screen.
+        """
+        prefix = self._prompt_prefix()
+        if self._prompt_banner:
+            prefix = f"{self._prompt_banner} "
+        avail = max(1, int(width) - len(prefix))
+        buf = self.input_buf
+        cursor = max(0, min(int(self.cursor_pos), len(buf)))
+        if len(buf) <= avail:
+            start = 0
+            shown = buf
+        else:
+            start = max(0, cursor - avail + 1)
+            start = min(start, max(0, len(buf) - avail))
+            shown = buf[start:start + avail]
+        self._prompt_view_start = start
+        line = prefix + shown
+        col = min(max(0, len(prefix) + (cursor - start)), max(0, width - 1))
+        return line, col
+
+    def _cursor_screen_position(self, width: int,
+                                height: int) -> tuple[int, int]:
+        _line, col = self._prompt_visible(width)
+        # The prompt is the final frame row; terminal coordinates are 1-based.
+        return max(1, int(height)), max(1, min(int(width), col + 1))
 
     def render_frame(self, width: int | None = None,
                      height: int | None = None,
@@ -641,16 +996,15 @@ class TuiSession:
             default_w, default_h = self._size()
             width, height = width or default_w, height or default_h
         width, height = max(40, width), max(12, height)
+        self._clamp_scroll(width, height)
         show_sidebar = self.sidebar if sidebar is None else bool(sidebar)
         show_sidebar = show_sidebar and width >= 100
 
         header = self.header_lines(width)
         footer = self.telemetry_lines(width)
-        hint = ("Enter: send | /help: commands | /consolidate: compact | "
-                "/quit: exit")
-        prompt_text = f"pdc tui ({self.profile}) > "
-        if self._prompt_banner:
-            prompt_text = f"{self._prompt_banner} "
+        hint = ("Enter: send | PgUp/PgDn/Wheel: scroll | \u2191/\u2193: history | "
+                "Tab: complete | F2: mouse mode | /help | /quit")
+        prompt_text, _cursor_col = self._prompt_visible(width)
         body_height = max(4, height - len(header) - len(footer) - 2)
 
         if show_sidebar:
@@ -727,7 +1081,10 @@ class TuiSession:
                     self._write("\n" + "\n".join(chunks) + "\n")
         with self._write_lock:
             if self.interactive:
-                self._write(_HOME + frame + "\x1b[J")
+                row, col = self._cursor_screen_position(width, height)
+                self._write(_SYNC_ON + _HOME + frame + "\x1b[J"
+                            + _HIDE_CURSOR + f"\x1b[{row};{col}H"
+                            + _SHOW_CURSOR + _SYNC_OFF)
             else:
                 self._write(frame + "\n")
         self._dirty = False
@@ -736,9 +1093,30 @@ class TuiSession:
         body = str(text or "")
         if len(body) > 12000:
             body = body[:12000] + "\n[truncated in the transcript view]"
-        for line in body.splitlines() or [""]:
+        lines = body.splitlines() or [""]
+        width = self._transcript_width()
+        added = sum(len(self._wrap_transcript_line(kind, line, width))
+                    for line in lines)
+        if self.scroll_offset > 0:
+            # Keep the line the user is reading stationary: the viewport grew
+            # by exactly this many wrapped rows, so offset grows with it.
+            self.scroll_offset += max(0, added)
+        same_width = self._scroll_seen_width == width
+        for line in lines:
             self.transcript.append((kind, line))
+        if same_width:
+            self._scroll_seen_total += max(0, added)
+        else:
+            self._scroll_seen_width = width
+            self._scroll_seen_total = len(self._all_transcript_rows(width))
         self._dirty = True
+
+    def append(self, text: str, kind: str = "system") -> None:
+        """Public log append (keeps a scrolled-back viewport stationary)."""
+        self._append(text, kind)
+
+    def log(self, text: str, kind: str = "system") -> None:
+        self._append(text, kind)
 
     def _append_many(self, text: str, kind: str = "system") -> None:
         self._append(text, kind)
@@ -960,7 +1338,9 @@ class TuiSession:
         self._set_banner(banner)
         self._append(banner, "activity")
         self._redraw(force=True)
-        answer = self._readline()
+        answer = self._read_answer_line()
+        self.input_buf = ""
+        self.cursor_pos = 0
         self._set_banner("")
         text = (answer or "").strip().lower()
         first = text.split()[0] if text else "n"
@@ -980,7 +1360,7 @@ class TuiSession:
 
     # --------------------------------------------------------------- input
     def _readline(self) -> str | None:
-        """One line, or None at EOF. Permission prompts use the same stream."""
+        """One line, or None at EOF. Headless scripts use this stream reader."""
         with self._input_lock:
             stream = self.stdin
             if stream is None:
@@ -999,6 +1379,453 @@ class TuiSession:
             if raw == "" or raw is None:
                 return None
             return str(raw).rstrip("\r\n")
+
+    # ------------------------------------------------------- raw key input
+    def _enter_raw_mode(self) -> None:
+        """cbreak on POSIX (signals still work); msvcrt needs no mode."""
+        if os.name == "nt":
+            return
+        try:
+            import termios
+            import tty
+            fd = self.stdin.fileno()
+            self._old_termios = termios.tcgetattr(fd)
+            tty.setcbreak(fd)
+            self._raw_mode = True
+        except (AttributeError, ImportError, OSError, ValueError):
+            self._old_termios = None
+            self._raw_mode = False
+
+    def _restore_raw_mode(self) -> None:
+        if not self._raw_mode:
+            return
+        self._raw_mode = False
+        attrs = self._old_termios
+        self._old_termios = None
+        if attrs is None or os.name == "nt":
+            return
+        try:
+            import termios
+            fd = self.stdin.fileno()
+            termios.tcsetattr(fd, termios.TCSADRAIN, attrs)
+        except (AttributeError, ImportError, OSError, ValueError):
+            pass
+
+    def _read_raw_chunk(self, wait: float) -> bool:
+        """Read available bytes/keys into `self._raw_buf`; False on timeout."""
+        wait = max(0.0, float(wait))
+        fd = None
+        try:
+            fd = self.stdin.fileno()
+        except (AttributeError, OSError, ValueError):
+            fd = None
+        # StringIO/fake TTY tests (and redirected stdin) use the deterministic
+        # line-backed fallback on every platform, including Windows CI.
+        if fd is None:
+            return self._read_fake_chunk(wait)
+        if os.name == "nt":
+            return self._read_windows_chunk(wait)
+        try:
+            import select
+            ready, _w, _x = select.select([fd], [], [], wait)
+        except (ImportError, OSError, ValueError):
+            return False
+        if not ready:
+            return False
+        try:
+            chunk = os.read(fd, 4096)
+        except OSError:
+            return False
+        if not chunk:
+            return False
+        self._raw_buf += self._decoder.decode(chunk)
+        return True
+
+    def _read_windows_chunk(self, wait: float) -> bool:
+        try:
+            import msvcrt
+        except ImportError:
+            return False
+        deadline = time.monotonic() + wait
+        while not msvcrt.kbhit():
+            if time.monotonic() >= deadline:
+                return False
+            time.sleep(0.005)
+        text = ""
+        while msvcrt.kbhit():
+            char = msvcrt.getwch()
+            if char in ("\x00", "\xe0"):
+                code = msvcrt.getwch() if msvcrt.kbhit() else ""
+                text += _windows_key_sequence(code)
+            else:
+                text += char
+        if not text:
+            return False
+        self._raw_buf += text
+        return True
+
+    def _read_fake_chunk(self, wait: float) -> bool:
+        """Deterministic fallback for StringIO/fake TTY tests."""
+        if self._raw_buf:
+            return True
+        line = self._readline()
+        if line is None:
+            return False
+        self._raw_buf += line + "\n"
+        return True
+
+    def read_key_event(self, timeout: float = 0.05) -> str | None:
+        """Read one parsed key event, or None when `timeout` expires.
+
+        POSIX uses cbreak + `select`; Windows uses `msvcrt.kbhit`/`getwch`.
+        After the first bytes arrive, a 12 ms drain window catches wheel
+        bursts from `?1007h` terminls and complete escape sequences.
+        """
+        if not self.interactive:
+            return None
+        deadline = time.monotonic() + max(0.0, float(timeout))
+        if not self._raw_buf:
+            while not self._raw_buf:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return None
+                self._read_raw_chunk(min(0.02, remaining))
+        # A wheel notch arrives as a rapid burst of arrows. Wait 12 ms once
+        # data is present, without extending a tiny explicit timeout.
+        drain_until = time.monotonic() + 0.012
+        stop = min(deadline, drain_until) if timeout < 0.012 else drain_until
+        while time.monotonic() < stop:
+            remaining = stop - time.monotonic()
+            if not self._read_raw_chunk(max(0.0, remaining)):
+                break
+        while True:
+            key, used = parse_escape_sequence(self._raw_buf)
+            if key:
+                # A lone ESC might be the start of Alt+key or a CSI sequence.
+                if key == "ESC" and len(self._raw_buf) == 1:
+                    if self._read_raw_chunk(0.012):
+                        continue
+                if key in ("WHEEL_UP", "WHEEL_DOWN"):
+                    match = _SGR_MOUSE_RE.match(self._raw_buf)
+                    if match:
+                        self._last_mouse_col = int(match.group(2))
+                    else:
+                        self._last_mouse_col = 0
+                self._raw_buf = self._raw_buf[used:]
+                return key
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return None
+            if not self._read_raw_chunk(min(0.02, remaining)):
+                return None
+
+    # ----------------------------------------------------- prompt editing
+    def _insert_text(self, text: str) -> None:
+        pos = max(0, min(int(self.cursor_pos), len(self.input_buf)))
+        self.input_buf = (self.input_buf[:pos] + text
+                          + self.input_buf[pos:])
+        self.cursor_pos = pos + len(text)
+        self._dirty = True
+
+    def _history_prev(self) -> None:
+        if not self.command_history:
+            return
+        # A caller may seed command_history directly; treat a mismatched
+        # position as "at the draft" so the typed text is saved and restored.
+        if (self._history_pos >= len(self.command_history)
+                or (self._history_pos == 0 and self.input_buf
+                    and not self._history_draft
+                    and self.input_buf != self.command_history[0])):
+            self._history_draft = self.input_buf
+            self._history_pos = len(self.command_history)
+        self._history_pos = max(0, self._history_pos - 1)
+        self.input_buf = self.command_history[self._history_pos]
+        self.cursor_pos = len(self.input_buf)
+        self._dirty = True
+
+    def _history_next(self) -> None:
+        if not self.command_history:
+            return
+        if self._history_pos < len(self.command_history) - 1:
+            self._history_pos += 1
+            self.input_buf = self.command_history[self._history_pos]
+        else:
+            self._history_pos = len(self.command_history)
+            self.input_buf = self._history_draft
+        self.cursor_pos = len(self.input_buf)
+        self._dirty = True
+
+    def _submit_input(self) -> bool:
+        line = self.input_buf.strip()
+        self.input_buf = ""
+        self.cursor_pos = 0
+        self.scroll_offset = 0
+        self.sidebar_scroll_offset = 0
+        self._history_pos = len(self.command_history)
+        self._history_draft = ""
+        if not line:
+            self._dirty = True
+            return not self._quit
+        if not self.command_history or self.command_history[-1] != line:
+            self.command_history.append(line)
+        self._history_pos = len(self.command_history)
+        result = self.handle_line(line)
+        self._dirty = True
+        return result
+
+    def _complete(self) -> None:
+        text = self.input_buf
+        pos = max(0, min(int(self.cursor_pos), len(text)))
+        pre, post = text[:pos], text[pos:]
+        stripped = pre.lstrip()
+        if not stripped.startswith("/"):
+            return
+        # A slash command name with no argument yet.
+        if " " not in stripped:
+            completion = _TAB_PREFIX.get(stripped)
+            if completion is None:
+                matches = [cmd for cmd in _SLASH_COMMANDS
+                           if cmd.startswith(stripped)]
+                if len(matches) == 1:
+                    completion = matches[0] + " "
+                elif len(matches) > 1:
+                    common = os.path.commonprefix(matches)
+                    if len(common) > len(stripped):
+                        completion = common
+            if completion and completion != stripped:
+                self.input_buf = completion + post
+                self.cursor_pos = len(completion)
+                self._dirty = True
+            return
+        # Profile-name completion after /profile or /profiles.
+        head, _sep, tail = stripped.partition(" ")
+        if head not in ("/profile", "/profiles"):
+            return
+        token = tail.split()[-1] if tail.split() else ""
+        names = sorted(str(n) for n in (getattr(self.cfg, "profiles", None)
+                                        or {}))
+        matches = [name for name in names if name.startswith(token)]
+        if not matches:
+            return
+        completed = os.path.commonprefix(matches)
+        if len(matches) == 1:
+            completed += " "
+        self.input_buf = f"{head} {completed}" + (
+            post if post and not post.startswith(" ") else "")
+        self.cursor_pos = len(self.input_buf)
+        self._dirty = True
+
+    def _sidebar_column(self, col: int) -> bool:
+        width, _height = self._size()
+        if not self._show_sidebar(width):
+            return False
+        side_width = min(46, max(32, width // 3))
+        left_width = width - side_width - 1
+        return int(col) >= left_width + 2
+
+    def _toggle_mouse(self, on: bool | None = None) -> bool:
+        self.mouse_sgr = (not self.mouse_sgr) if on is None else bool(on)
+        if self.interactive and self._terminal_ready:
+            self._write(_MOUSE_SGR_ON if self.mouse_sgr else _MOUSE_SGR_OFF)
+        described = "SGR wheel capture ON (click capture on; use F2 to restore "\
+                    "native selection)" if self.mouse_sgr else \
+                    "native selection ON (?1007h wheel-to-arrow; SGR mouse off)"
+        self._append(f"Mouse mode: {described}", "system")
+        self._dirty = True
+        return self.mouse_sgr
+
+    def handle_key(self, key: str, *, col: int | None = None) -> bool:
+        """Apply one parsed key event to the prompt or viewport."""
+        key = str(key)
+        width, height = self._size()
+        half = max(1, self._transcript_viewport_height(height) // 2)
+        side_half = max(1, self._body_height(height) // 2)
+        handled = True
+
+        if key == "F2":
+            self._toggle_mouse()
+        elif key == "PAGE_UP":
+            self.scroll_transcript(half)
+        elif key == "PAGE_DOWN":
+            self.scroll_transcript(-half)
+        elif key == "SHIFT_UP":
+            self.scroll_transcript(3)
+        elif key == "SHIFT_DOWN":
+            self.scroll_transcript(-3)
+        elif key == "ALT_PAGE_UP":
+            self.scroll_sidebar(side_half)
+        elif key == "ALT_PAGE_DOWN":
+            self.scroll_sidebar(-side_half)
+        elif key in ("WHEEL_UP", "WHEEL_DOWN"):
+            delta = 3 if key == "WHEEL_UP" else -3
+            use_col = self._last_mouse_col if col is None else int(col)
+            if use_col and self._sidebar_column(use_col):
+                self.scroll_sidebar(delta)
+            else:
+                self.scroll_transcript(delta)
+        elif key == "CTRL_U":
+            if self.input_buf:
+                self.input_buf = self.input_buf[self.cursor_pos:]
+                self.cursor_pos = 0
+                self._dirty = True
+            else:
+                self.scroll_transcript(half)
+        elif key == "CTRL_D":
+            if self.input_buf:
+                pos = self.cursor_pos
+                self.input_buf = self.input_buf[:pos] + self.input_buf[pos + 1:]
+                self._dirty = True
+            else:
+                self.scroll_transcript(-half)
+        elif key == "CTRL_K":
+            self.input_buf = self.input_buf[:self.cursor_pos]
+            self._dirty = True
+        elif key == "CTRL_L":
+            self._dirty = True
+            self._redraw(force=True)
+        elif key == "CTRL_W":
+            pos = self.cursor_pos
+            start = pos
+            while start > 0 and self.input_buf[start - 1].isspace():
+                start -= 1
+            while start > 0 and not self.input_buf[start - 1].isspace():
+                start -= 1
+            self.input_buf = self.input_buf[:start] + self.input_buf[pos:]
+            self.cursor_pos = start
+            self._dirty = True
+        elif key == "ENTER":
+            self._submit_input()
+        elif key == "TAB":
+            self._complete()
+        elif key == "ESC":
+            if self.input_buf:
+                self._dirty = True
+            else:
+                self.scroll_to_bottom()
+                self.sidebar_scroll_offset = 0
+        elif key == "UP":
+            if not self.input_buf and self.scroll_offset > 0:
+                self.scroll_transcript(1)
+            else:
+                self._history_prev()
+        elif key == "DOWN":
+            if not self.input_buf and self.scroll_offset > 0:
+                self.scroll_transcript(-1)
+            else:
+                self._history_next()
+        elif key == "LEFT":
+            self.cursor_pos = max(0, self.cursor_pos - 1)
+            self._dirty = True
+        elif key == "RIGHT":
+            self.cursor_pos = min(len(self.input_buf), self.cursor_pos + 1)
+            self._dirty = True
+        elif key == "HOME":
+            self.cursor_pos = 0
+            self._dirty = True
+        elif key == "END":
+            self.cursor_pos = len(self.input_buf)
+            self.scroll_offset = 0
+            self.sidebar_scroll_offset = 0
+            self._dirty = True
+        elif key == "BACKSPACE":
+            if self.cursor_pos > 0:
+                pos = self.cursor_pos
+                self.input_buf = self.input_buf[:pos - 1] + self.input_buf[pos:]
+                self.cursor_pos = pos - 1
+                self._dirty = True
+        elif key == "DELETE":
+            pos = self.cursor_pos
+            if pos < len(self.input_buf):
+                self.input_buf = self.input_buf[:pos] + self.input_buf[pos + 1:]
+                self._dirty = True
+        elif key == "CTRL_C":
+            if self.input_buf:
+                self.input_buf = ""
+                self.cursor_pos = 0
+                self._dirty = True
+        elif len(key) == 1 and key >= " ":
+            self._insert_text(key)
+        else:
+            handled = False
+        if handled:
+            self._dirty = True
+        return handled
+
+    def feed_key_event(self, key: str, *, col: int | None = None) -> bool:
+        return self.handle_key(key, col=col)
+
+    def feed_key(self, key: str, *, col: int | None = None) -> bool:
+        return self.handle_key(key, col=col)
+
+    def handle_key_event(self, key: str, *, col: int | None = None) -> bool:
+        """Alias used by programmatic drivers and tests."""
+        return self.handle_key(key, col=col)
+
+    def feed_keys(self, keys, *, col: int | None = None) -> str:
+        """Apply key names, raw escape sequences or literal text in order."""
+        if isinstance(keys, str):
+            if keys in _KNOWN_KEYS or keys.startswith("ALT_"):
+                keys = [keys]
+            else:
+                keys = list(keys)
+        for item in keys:
+            item = str(item)
+            if item in _KNOWN_KEYS or item.startswith("ALT_") or len(item) <= 1:
+                self.handle_key(item, col=col)
+            elif item.startswith("\x1b") or item.startswith("\x00") \
+                    or item.startswith("\xe0"):
+                raw = item
+                while raw:
+                    mouse = _SGR_MOUSE_RE.match(raw)
+                    key, used = parse_escape_sequence(raw)
+                    if not key or used <= 0:
+                        break
+                    self.handle_key(
+                        key, col=(int(mouse.group(2)) if mouse else col))
+                    raw = raw[used:]
+            else:
+                for char in item:
+                    self.handle_key(char)
+        return self.input_buf
+
+    def type_text(self, text: str) -> str:
+        """Insert literal text at the cursor (tests and scripted drivers)."""
+        self._insert_text(str(text))
+        return self.input_buf
+
+    def feed_key_events(self, keys, *, col: int | None = None) -> str:
+        """Alias for `feed_keys` used by deterministic key-event tests."""
+        return self.feed_keys(keys, col=col)
+
+    def _read_answer_line(self) -> str | None:
+        """Permission/confirmation input: raw keystrokes when interactive."""
+        if not self.interactive:
+            return self._readline()
+        buf = ""
+        self.input_buf = ""
+        self.cursor_pos = 0
+        while True:
+            key = self.read_key_event(0.05)
+            if key is None:
+                self._poll_events()
+                if self._dirty:
+                    self._redraw()
+                continue
+            if key == "ENTER":
+                self.input_buf = ""
+                self.cursor_pos = 0
+                return buf
+            if key in ("CTRL_C", "ESC"):
+                self.input_buf = ""
+                self.cursor_pos = 0
+                return ""
+            if key in ("BACKSPACE", "DELETE"):
+                buf = buf[:-1] if buf else ""
+            elif len(key) == 1 and key >= " ":
+                buf += key
+            self.input_buf = buf
+            self.cursor_pos = len(buf)
+            self._redraw(force=True)
 
     # ---------------------------------------------------------- backend lazily
     def _ensure_client(self):
@@ -1281,6 +2108,15 @@ class TuiSession:
         if cmd in ("help", "h", "?"):
             self._append(HELP_TEXT, "system")
             return
+        if cmd == "keys":
+            self._append(KEYS_TEXT, "system")
+            return
+        if cmd == "scroll":
+            self._scroll_command(arg)
+            return
+        if cmd == "mouse":
+            self._mouse_command(arg)
+            return
         if cmd in ("status", "telemetry"):
             self._append(self.status_report(), "system")
             return
@@ -1352,6 +2188,9 @@ class TuiSession:
         if cmd == "clear":
             self.transcript = []
             self._headless_sent = 0
+            self.scroll_offset = 0
+            self._scroll_seen_total = 0
+            self._scroll_seen_width = 0
             self._append("Transcript cleared.", "system")
             self._dirty = True
             return
@@ -1507,6 +2346,66 @@ class TuiSession:
         self._attach_runtime()
         self._sync_telemetry()
         self._append(f"now using model {arg}", "system")
+
+    def _scroll_command(self, arg: str) -> None:
+        parts = arg.split()
+        action = parts[0].lower() if parts else ""
+        try:
+            amount = int(parts[1]) if len(parts) > 1 else None
+        except ValueError:
+            amount = None
+        height = self._size()[1]
+        half = max(1, self._transcript_viewport_height(height) // 2)
+        side_half = max(1, self._body_height(height) // 2)
+        if action in ("", "status"):
+            self._append(
+                f"scroll: {self.scroll_offset} line(s) back; "
+                f"sidebar {self.sidebar_scroll_offset} line(s); "
+                f"max {self.max_scroll()}", "system")
+            return
+        target = self.scroll_offset
+        if action in ("up", "back"):
+            target = self.scroll_transcript(
+                amount if amount is not None else half)
+        elif action in ("down", "forward"):
+            target = self.scroll_transcript(
+                -(amount if amount is not None else half))
+        elif action == "top":
+            target = self.scroll_to_top()
+        elif action in ("bottom", "live"):
+            target = self.scroll_to_bottom()
+            self.sidebar_scroll_offset = 0
+        elif action == "sidebar-up":
+            self.scroll_sidebar(amount if amount is not None else side_half)
+        elif action == "sidebar-down":
+            self.scroll_sidebar(-(amount if amount is not None else side_half))
+        else:
+            try:
+                target = max(0, min(self.max_scroll(), int(action)))
+                self.scroll_offset = target
+            except ValueError:
+                self._append("Usage: /scroll up|down|top|bottom|N", "error")
+                return
+        self._append(f"scroll: {target} line(s) back "
+                     f"(live bottom = 0)", "system")
+        # The receipt itself must not perturb the requested scripted position.
+        if action == "top":
+            self.scroll_offset = self.max_scroll()
+        elif action in ("bottom", "live"):
+            self.scroll_offset = 0
+        elif action not in ("sidebar-up", "sidebar-down"):
+            self.scroll_offset = max(0, min(self.max_scroll(), int(target)))
+
+    def _mouse_command(self, arg: str) -> None:
+        value = arg.strip().lower()
+        if value in ("", "toggle"):
+            self._toggle_mouse()
+        elif value in ("on", "true", "yes", "1", "sgr"):
+            self._toggle_mouse(True)
+        elif value in ("off", "false", "no", "0", "native"):
+            self._toggle_mouse(False)
+        else:
+            self._append("Usage: /mouse [on|off]", "error")
 
     def _toggle(self, attr: str, arg: str, label: str) -> None:
         value = arg.strip().lower()
@@ -1707,7 +2606,9 @@ class TuiSession:
         self._set_banner(question)
         self._append(question, "activity")
         self._redraw(force=True)
-        answer = self._readline()
+        answer = self._read_answer_line()
+        self.input_buf = ""
+        self.cursor_pos = 0
         self._set_banner("")
         text = (answer or "").strip().lower()
         return text in ("y", "yes")
@@ -1726,6 +2627,10 @@ class TuiSession:
         self.transcript = []
         self.activity = []
         self.modified = []
+        self.scroll_offset = 0
+        self.sidebar_scroll_offset = 0
+        self._scroll_seen_total = 0
+        self._scroll_seen_width = 0
         self.idx = None
         self.agent = None
         self._append(f"reset: removed {result['files']} file(s), kept "
@@ -1734,7 +2639,9 @@ class TuiSession:
 
     # --------------------------------------------------------------- terminal
     def _signal_handler(self, _signum, _frame):
-        self._restore_terminal()
+        # The run loop / task joiner catches KeyboardInterrupt and the
+        # try/finally restores the terminal; restoring here would leave the
+        # session alive with cbreak/alternate-screen already torn down.
         raise KeyboardInterrupt
 
     def _prepare_terminal(self) -> None:
@@ -1750,14 +2657,18 @@ class TuiSession:
                 signal.signal(sig, self._signal_handler)
             except (ValueError, OSError, RuntimeError):
                 pass
+        self._enter_raw_mode()
         self._terminal_ready = True
         self._write(_ALT_SCREEN_ON)
+        if self.mouse_sgr:
+            self._write(_MOUSE_SGR_ON)
 
     def _restore_terminal(self) -> None:
         if not self._terminal_ready:
             return
         self._terminal_ready = False
         self._write(_ALT_SCREEN_OFF)
+        self._restore_raw_mode()
         for sig, handler in list(self._old_signals.items()):
             try:
                 signal.signal(sig, handler)
@@ -1783,8 +2694,69 @@ class TuiSession:
             security.set_permission_handler(self._prev_permission_hook)
         self._set_banner("")
         self._restore_terminal()
+        self._restore_raw_mode()
 
     # ------------------------------------------------------------------ run
+    def _idle_tick(self) -> None:
+        """Poll events/telemetry and repaint while no key is available."""
+        self._poll_events()
+        snapshot = self.telemetry()
+        key = (snapshot["last_prompt_tokens"],
+               snapshot["last_completion_tokens"],
+               snapshot["last_tok_per_s"],
+               snapshot["avg_tok_per_s"],
+               snapshot["context_utilization_pct"],
+               snapshot["cache_hit_pct"],
+               snapshot["session_prompt_tokens"],
+               snapshot["session_completion_tokens"],
+               snapshot["folds"])
+        if key != self._last_telemetry_key:
+            self.last_telemetry = snapshot
+            self._last_telemetry_key = key
+            self._dirty = True
+        if self._dirty:
+            self._redraw()
+
+    def _run_interactive(self) -> int:
+        """Raw-key loop: every repaint keeps the prompt and cursor intact."""
+        while not self._quit:
+            key = self.read_key_event(0.05)
+            if key is None:
+                self._idle_tick()
+                continue
+            if key == "CTRL_C":
+                if self.input_buf:
+                    self.input_buf = ""
+                    self.cursor_pos = 0
+                    self._dirty = True
+                else:
+                    self._append("cancelled (the session stays open)", "error")
+                if self._dirty:
+                    self._redraw()
+                continue
+            # Ctrl+D scrolls down when there is scrollback to consume; at the
+            # live bottom with an empty prompt it keeps its old "leave" role.
+            if key == "CTRL_D" and not self.input_buf \
+                    and self.scroll_offset == 0:
+                break
+            self.handle_key(key)
+            if self._quit:
+                break
+            if self._dirty:
+                self._redraw()
+        return 0
+
+    def _run_headless(self) -> int:
+        while not self._quit:
+            line = self._readline()
+            if line is None:
+                break
+            if not line.strip():
+                continue
+            self.handle_line(line)
+            self._redraw(force=True)
+        return 0
+
     def run(self, initial_task: str = "") -> int:
         """Paint the session and read commands until EOF or /quit."""
         self._running = True
@@ -1794,24 +2766,17 @@ class TuiSession:
             task = initial_task or self.initial_task
             if task:
                 self.handle_line(task)
-                if self.headless:
-                    self._redraw(force=True)
-            while not self._quit:
-                line = self._readline()
-                if line is None:
-                    break
-                if not line.strip():
-                    continue
-                self.handle_line(line)
-                if self.headless:
-                    self._redraw(force=True)
-                elif self._dirty:
-                    self._redraw()
+                self._redraw(force=True)
+            if self.interactive:
+                return self._run_interactive()
+            return self._run_headless()
         except KeyboardInterrupt:
             if self.headless:
                 self._append("interrupted", "error")
-            else:
-                self._write("\n")
+                try:
+                    self._redraw(force=True)
+                except Exception:
+                    pass
         finally:
             self.close()
         return 0
