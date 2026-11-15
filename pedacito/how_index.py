@@ -379,6 +379,59 @@ CLI_COMMANDS = [
         "common": True,
     },
     {
+        "name": "tui",
+        "usage": "pedacito tui [PROJECT] [-t \"task\"] [--no-apply] "
+                 "[--headless]",
+        "summary": "Split-screen terminal UI: a transcript pane, a live "
+                   "activity/plan sidebar, and a two-row telemetry footer "
+                   "with the Context Meter, token burn rate and tok/s.",
+        "keywords": ["tui", "terminal ui", "split screen", "context meter",
+                     "telemetry", "token burn", "tok/s", "sidebar", "plan",
+                     "slash commands", "live activity"],
+        "examples": [
+            "pedacito tui .",
+            "pedacito tui ~/code/anki --apply",
+            "pedacito tui . -t \"add retries to the sync client\"",
+            "pedacito tui . --headless < commands.txt",
+        ],
+        "flags": [
+            {"flag": "-t, --task TASK",
+             "help": "run this task immediately after the screen opens"},
+            {"flag": "--no-apply",
+             "help": "start in dry-run mode; the TUI defaults to writing with "
+                     "an undo backup"},
+            {"flag": "--headless",
+             "help": "scriptable mode: read commands from stdin and write "
+                     "plain-text frames (also automatic when stdin is not a "
+                     "TTY)"},
+            {"flag": "--width COLS", "help": "frame width for headless runs"},
+            {"flag": "--height ROWS", "help": "frame height for headless runs"},
+            {"flag": "--profile NAME", "help": "apply a profile block"},
+            {"flag": "--auto-route", "help": "turn specialist routing on"},
+            {"flag": "--no-think", "help": "start with thinking disabled"},
+        ],
+        "notes": [
+            "Zones: header (project/profile/model/calibration/Auto-Route/"
+            "Scout/git), transcript + activity/plan split, telemetry footer, "
+            "prompt bar",
+            "The footer shows Ctx: 6,420 / 32,768 (19.6%) with a green/amber/"
+            "red bar, Turn: +in/+out, Session totals, Speed/avg tok/s, KV "
+            "cache, folds and Active model/role",
+            "Slash commands: /help, /status (/telemetry), /auto GOAL, /plan, "
+            "/consolidate (/compact), /profile, /model ID, /auto-route, "
+            "/think, /apply, /skills, /memory, /procs, /diff, /undo, /reset, "
+            "/sidebar, /clear, /quit",
+            "The right sidebar appears at 100+ columns and toggles with "
+            "/sidebar; it shows PLAN.md checkboxes, gather steps, specialist "
+            "swaps and modified files",
+            "Permission prompts appear in the prompt bar: y = once, "
+            "a = session, n = deny",
+            "--headless is deterministic for CI: no PTY, no model server and "
+            "explicit UTF-8 streams",
+        ],
+        "common": True,
+    },
+    {
         "name": "rpc",
         "usage": "pedacito rpc [PROJECT] [--permission-timeout SECONDS]",
         "summary": "Interactive JSONL-RPC over stdin/stdout for editors and "

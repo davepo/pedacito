@@ -54,11 +54,16 @@ from .llm import LLMClient, LLMError, estimate_tokens
 from .select import CODE_EXTS, REFERENCE_EXTS, Matcher, is_venv_dir, select
 
 
-def _add_common(p, paths_nargs="+"):
+def _add_common(p, paths_nargs="+", dest="paths"):
     """Register the flags shared by the project subcommands. `paths_nargs="?"`
-    lets a command run from the current directory with no argument (rpc)."""
-    p.add_argument("paths", nargs=paths_nargs,
-                   default=["."] if paths_nargs == "?" else None,
+    lets a command run from the current directory with no argument (rpc); the
+    `tui` command uses `dest="project"` so its positional reads naturally."""
+    if paths_nargs == "?":
+        default = "." if dest != "paths" else ["."]
+    else:
+        default = None
+    p.add_argument(dest, nargs=paths_nargs,
+                   default=default,
                    help="files or directories to index")
     p.add_argument("--exclude", action="append", default=[], metavar="PATTERN",
                    help="gitignore-style pattern to skip; repeatable "
@@ -125,7 +130,11 @@ def _root(args) -> Path:
     """--root if given, otherwise inferred from the paths."""
     if getattr(args, "root", None):
         return Path(args.root).resolve()
-    return index_mod.infer_root(getattr(args, "paths", []) or ["."])
+    paths = getattr(args, "paths", None) or getattr(args, "project", None) \
+        or ["."]
+    if isinstance(paths, str):
+        paths = [paths]
+    return index_mod.infer_root(list(paths))
 
 
 def _matcher(args, root: Path) -> Matcher:
@@ -144,7 +153,8 @@ def _config(args) -> Config:
     # `config` must be able to inspect a file that lacks the mandatory vram_gb.
     cfg = load_config(root=_root(args), explicit=getattr(args, "config", None),
                       profile=getattr(args, "profile", None),
-                      require_hardware=(getattr(args, "cmd", "") != "config"))
+                      require_hardware=(getattr(args, "cmd", "") not in
+                                        ("config", "tui")))
     # BUG-1007: "pre-existing" means "red before THIS run started" — a
     # failure the run itself just wrote into the ledger must never come back
     # labelled a baseline. Process start, not config-load time, so an
@@ -193,14 +203,17 @@ def _config(args) -> Config:
         if blind:
             print(f"[config warning] {blind}", file=sys.stderr)
     # Fit token budgets to the server's real context window before any request;
-    # `config` skips this so it reports the true sources.
-    if getattr(args, "cmd", "") != "config":
+    # `config` skips this so it reports the true sources. `tui` starts before
+    # any model connection and fits lazily when its first task runs.
+    if getattr(args, "cmd", "") not in ("config", "tui"):
         auto_fit(cfg, verbose=True)
     # A measured model card (`pedacito calibrate`) fills settings the user
     # left at their defaults; explicit values always win.
     if getattr(args, "cmd", "") not in ("config", "calibrate"):
         modelcard.apply(cfg)
-    cfg._root = str(_root(args)) if getattr(args, "paths", None) else ""
+    cfg._root = str(_root(args)) \
+        if (getattr(args, "paths", None) or getattr(args, "project", None)) \
+        else ""
     return cfg
 
 
@@ -2790,6 +2803,30 @@ def build_parser() -> argparse.ArgumentParser:
                         help="drive the session over stdin/stdout as "
                              "newline-delimited JSON (see `pedacito rpc`)")
 
+    p_tui = sub.add_parser(
+        "tui", help="split-screen terminal UI with live activity, plan and "
+                    "telemetry panes")
+    _add_common(p_tui, paths_nargs="?", dest="project")
+    p_tui.add_argument("-t", "--task", default="",
+                       help="run this task immediately after the screen opens")
+    p_tui.add_argument("--no-apply", dest="apply", action="store_false",
+                       default=True,
+                       help="start in dry-run mode (edits are previewed only; "
+                            "the default in the TUI is apply-on with undo "
+                            "backup)")
+    p_tui.add_argument("--no-think", dest="no_think", action="store_true",
+                       help="start with disable_thinking on")
+    p_tui.add_argument("--headless", action="store_true",
+                       help="scriptable mode: read commands from stdin and "
+                            "write plain-text frames to stdout (also selected "
+                            "automatically when stdin is not a TTY)")
+    p_tui.add_argument("--width", type=int, default=None, metavar="COLS",
+                       help="frame width for scripted/headless runs "
+                            "(default: the real terminal size)")
+    p_tui.add_argument("--height", type=int, default=None, metavar="ROWS",
+                       help="frame height for scripted/headless runs "
+                            "(default: the real terminal size)")
+
     p_rpc = sub.add_parser(
         "rpc", help="interactive JSONL-RPC over stdio for editors and other "
                     "machine clients (index and profiles stay warm)")
@@ -3147,6 +3184,12 @@ def _main(argv=None) -> int:
     # every consumer below expects a list of paths.
     if isinstance(getattr(args, "paths", None), str):
         args.paths = [args.paths]
+    if getattr(args, "cmd", "") == "tui":
+        project = getattr(args, "project", ".") or "."
+        if isinstance(project, (list, tuple)):
+            project = next((str(p) for p in project if p), ".")
+        args.project = str(project)
+        args.paths = [args.project]
 
     # `config --setup` repairs a broken config, so it runs before _config().
     if args.cmd == "config" and getattr(args, "setup", False):
@@ -3255,6 +3298,34 @@ def _main(argv=None) -> int:
     try:
         if args.cmd == "config":
             return _cmd_config(args, cfg)
+
+        if args.cmd == "tui":
+            from . import tui as tui_mod
+            root = _root(args)
+            if getattr(args, "no_think", False):
+                cfg.disable_thinking = True
+                cfg.sources["disable_thinking"] = "--no-think"
+            if getattr(args, "apply", True):
+                try:
+                    workspace.acquire_lock(root)
+                except workspace.ProjectBusy as e:
+                    print(f"ERROR: {e}", file=sys.stderr)
+                    return 2
+                _LOCKED.append(root)
+            headless = bool(getattr(args, "headless", False)) \
+                or not sys.stdin.isatty()
+            width = getattr(args, "width", None)
+            height = getattr(args, "height", None)
+            if width or height:
+                session = tui_mod.TuiSession(
+                    root, cfg, headless=headless, stdin=sys.stdin,
+                    stdout=sys.stdout, apply=bool(getattr(args, "apply", True)),
+                    initial_task=str(getattr(args, "task", "") or ""),
+                    width=width, height=height)
+                return session.run()
+            return tui_mod.run_tui(
+                root, cfg, initial_task=str(getattr(args, "task", "") or ""),
+                headless=headless, stdin=sys.stdin, stdout=sys.stdout)
 
         if args.cmd == "calibrate":
             return _cmd_calibrate(args, cfg)

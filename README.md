@@ -178,6 +178,7 @@ commands. Run `pedacito <command> --help` for every flag.
 | `pedacito auto PROJ -t "..."` | Turn a goal into a checklist, then implement it task by task |
 | `pedacito new DIR -t "..."` | Start a project from scratch |
 | `pedacito chat PROJ` | Interactive session that keeps the index warm (`--rpc` turns the session into a machine protocol) |
+| `pedacito tui PROJ` | Split-screen terminal UI: transcript, live activity/plan sidebar, and a Context Meter / token burn / tok/s telemetry footer. Full slash-command suite; `--headless` is scriptable |
 | `pedacito rpc [PROJ]` | JSONL-RPC over stdin/stdout for editors and other agents: one request per line, streamed events, steering, permission prompts, cancel -- index, profiles and session warm the whole time |
 | `pedacito how "..."` | Built-in help for the CLI, the GUI, and settings |
 | `pedacito restore PROJ` | Undo the last write |
@@ -854,6 +855,39 @@ session on the previous model.
 With `--rpc` the same warm session speaks a machine protocol instead of prose:
 stdin takes one JSON request per line and stdout answers with JSONL events --
 see `pedacito rpc` below.
+
+### `tui`: split-screen terminal session
+
+```bash
+pedacito tui ~/code/anki                 # apply-on by default, with undo backup
+pedacito tui . --no-apply                # preview edits only
+pedacito tui . -t "add retries to the sync client"
+pedacito tui . --headless < commands.txt  # scriptable CI mode, no PTY
+```
+
+The TUI keeps the index warm like `chat`, but paints four zones instead of a
+scrolling REPL: a header (project, profile/model, calibration badge,
+Auto-Route, Scout, git branch/dirty state), a main transcript pane beside a
+collapsible **Activity & Plan** sidebar, a two-row telemetry footer, and the
+`pdc tui (profile) >` prompt bar. The sidebar appears at 100+ columns and
+toggles with `/sidebar`; it shows `PLAN.md` checkboxes, live `read`/`grep`/
+`mcp_call`/`task` steps, specialist `model_swap` routing, and the files this
+session changed.
+
+The footer updates after every model call and event: a green/amber/red
+**Context Meter** (`Ctx: [████████░░░░░░░░] 6,420 / 32,768 (19.6%)`), turn and
+session token burn rate, `Speed: 44.2 tok/s (avg 41.8 tok/s)`, KV cache hit
+rate, fold count, and `Active: <profile> [<role>/<specialty>]` with `$cost`
+when priced. `pedacito tui` registers the live permission broker, so an untrusted
+MCP tool, sensitive file read or shell command asks in the prompt bar:
+`y` allows once, `a` allows that key for the session, `n` denies.
+
+Slash commands: `/help`, `/status` (`/telemetry`), `/auto GOAL`, `/plan
+[GOAL]`, `/consolidate` (`/compact`), `/profile [NAME]`, `/model ID`,
+`/auto-route [on|off]`, `/think [on|off]`, `/apply [on|off]`, `/skills`,
+`/memory`, `/procs`, `/diff`, `/undo`, `/reset`, `/sidebar`, `/clear`,
+`/quit`. A plain line is a task and runs through the normal
+gather/edit/verify loop.
 
 ### `rpc`: drive pedacito from an editor or another agent
 

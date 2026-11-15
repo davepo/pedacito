@@ -72,10 +72,12 @@ __all__ = [
     "is_sensitive_path",
     "is_sensitive_rel",
     "permission_broker_active",
+    "permission_handler",
     "post_origin_allowed",
     "request_permission",
     "resolve_checked",
     "resolve_safe_path",
+    "set_permission_handler",
     "ssrf_error",
 ]
 
@@ -387,6 +389,18 @@ def install_permission_hook(hook) -> None:
     global _hook
     with _hook_lock:
         _hook = hook
+
+
+def set_permission_handler(hook) -> None:
+    """Alias for `install_permission_hook`: install (or with None, remove) the
+    live human-in-the-loop handler. The TUI registers its prompt-bar handler
+    here and restores the previous hook on exit."""
+    install_permission_hook(hook)
+
+
+def permission_handler():
+    """The currently installed broker hook, or None."""
+    return _hook
 
 
 def permission_broker_active() -> bool:

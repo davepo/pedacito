@@ -670,6 +670,32 @@ the next task starts from that handoff alone (A20). Ctrl-C cancels the running
 task and keeps the session open. Switching profiles and running the same task
 again is the cheapest way to compare two models.
 
+### B10b. Split-screen session (`pedacito tui`)
+
+```bash
+pedacito tui ~/code/anki                  # apply-on, with an undo backup
+pedacito tui . --no-apply                 # preview edits only
+pedacito tui . --headless < commands.txt  # scripted/CI mode, no PTY
+```
+
+`pedacito tui` keeps the index warm and splits the terminal into four zones:
+a header with the project, profile/model, calibration badge, Auto-Route,
+Scout and git state; a transcript pane beside a collapsible **Activity &
+Plan** sidebar (100+ columns, `/sidebar` toggles it); a two-row telemetry
+footer; and the `pdc tui (profile) >` prompt.
+
+The footer is live: the **Context Meter** turns green below 70%, amber from
+70–85% and red above 85%, next to `Turn: +in/+out`, session totals,
+`Speed: 44.2 tok/s (avg 41.8 tok/s)`, KV cache, folds and the active
+model/role. The token burn rate and the sidebar follow every `read`/`grep`/`mcp_call` step,
+`model_swap`, verification receipt and `PLAN.md` checkbox while a task runs.
+
+Type a task as usual, or use `/help`, `/status`, `/auto GOAL`, `/plan`,
+`/consolidate`, `/profile`, `/auto-route`, `/think`, `/apply`, `/skills`,
+`/memory`, `/procs`, `/diff`, `/undo`, `/reset`, `/sidebar`, `/clear` and
+`/quit`. Permission prompts appear in the prompt bar (`y` once, `a` for the
+session, `n` deny).
+
 ### B11. Benchmarks
 
 The six-project benchmark suite runs from the GUI (the **▦ Benchmarks** button in
@@ -886,6 +912,7 @@ only the map is stale.
 | `pedacito ask PROJ -t "..."` | One task. Dry run by default. Add `--review`, `--apply`, or `--refine` |
 | `pedacito explain PROJ -q "..."` | Answer a question about the code. No edits |
 | `pedacito chat PROJ` | Interactive session; the index stays warm |
+| `pedacito tui PROJ` | Split-screen terminal UI: transcript + activity/plan sidebar + Context Meter, token burn and tok/s telemetry. `/help` lists the slash commands; `--headless` is scriptable |
 | `pedacito rpc [PROJ]` | JSONL-RPC over stdin/stdout for editors and agents; the index stays warm |
 | `pedacito mcp list` | Show the tools of the named MCP servers and their trust flags |
 | `pedacito new DIR -t "..."` | Start a project from scratch (or `--spec FILE`) |
