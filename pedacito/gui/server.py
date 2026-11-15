@@ -1494,6 +1494,32 @@ class _Handler(BaseHTTPRequestHandler):
             data = index_html(data)
         self._send(200, data, ctype)
 
+    def _discard_request_body(self) -> None:
+        """Consume a POST body we refuse before parsing it.
+
+        A handler that answers and closes while the client is still sending a
+        body makes Windows abort the connection (WinError 10053) before the
+        client reads the 403/404/413 response. Draining the body first keeps
+        the refusal graceful on every platform; the cap matches MAX_BODY so a
+        hostile Content-Length cannot make us read forever."""
+        try:
+            n = max(0, int(self.headers.get("Content-Length") or 0))
+        except ValueError:
+            return
+        if (self.headers.get("Expect") or "").lower() == "100-continue":
+            # The client is waiting for a 100 before sending; closing with the
+            # refusal is already graceful and reading here would block.
+            return
+        remaining = min(n, MAX_BODY)
+        while remaining > 0:
+            try:
+                chunk = self.rfile.read(min(65536, remaining))
+            except OSError:
+                return
+            if not chunk:
+                return
+            remaining -= len(chunk)
+
     def do_GET(self):
         if not review_mod.request_allowed(self, post=False):
             self._json(403, {"ok": False})
@@ -1515,6 +1541,7 @@ class _Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         if not review_mod.request_allowed(self, post=True):
+            self._discard_request_body()
             self._json(403, {"ok": False})
             return
         # CSRF: a browser-driven POST carries Origin/Referer -- both must name
@@ -1523,12 +1550,14 @@ class _Handler(BaseHTTPRequestHandler):
         bound = (getattr(self.server, "server_address", ("127.0.0.1", 0)) or
                  ("127.0.0.1", 0))[0]
         if not security.post_origin_allowed(self.headers, bound_host=bound):
+            self._discard_request_body()
             self._json(403, {"ok": False,
                              "detail": "Origin/Referer is not loopback"})
             return
         url = urlparse(self.path)
         route = POST_ROUTES.get(url.path)
         if route is None:
+            self._discard_request_body()
             self._json(404, {"ok": False})
             return
         try:
@@ -1536,6 +1565,7 @@ class _Handler(BaseHTTPRequestHandler):
         except ValueError:
             n = 0
         if n > MAX_BODY:
+            self._discard_request_body()
             self._json(413, {"ok": False, "detail": "Request too large."})
             return
         try:
