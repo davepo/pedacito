@@ -434,6 +434,9 @@ class State:
         # `specialist_routed` event; cleared when a model swap hands the card
         # back to the worker's own model.
         self.specialist: dict = {}
+        # Context folds in the current run (the telemetry footer's counter);
+        # reset when a fresh run claims the job slot.
+        self.folds = 0
 
     # --- project & index auto-detect --------------------------------------------
 
@@ -830,6 +833,7 @@ class State:
                 self.phase = "gather"
                 self.gather_steps = 0
                 self.actions.clear()
+                self.folds = 0
             job = self.job
         self.bus.publish("job", job=job.id, state="start", kind=kind,
                          title=title)
@@ -894,6 +898,8 @@ class State:
                       "ok": True}
         ping = kind in EVENT_PHASE or action is not None
         with self.lock:
+            if kind == "fold":
+                self.folds += 1
             if kind in EVENT_PHASE:
                 self.phase = EVENT_PHASE[kind]
             if step_n is not None:
@@ -1343,6 +1349,42 @@ class State:
             indexed = idx is not None or meta["indexed"]
             job = self.job if self.job is not None and self.job.active else None
             stats = dict(client.stats) if client is not None else {}
+            # Live telemetry for the footer: the worker client's snapshot,
+            # overridden by the specialist's own last-call numbers while a
+            # specialist holds the card (the shared ledger keeps the session
+            # totals identical either way).
+            telemetry: dict = {}
+            if client is not None and hasattr(client, "telemetry"):
+                try:
+                    telemetry = client.telemetry()
+                except Exception:
+                    telemetry = {}
+                spec_name = str((self.specialist or {}).get("profile") or "")
+                spec = None
+                if cfg is not None and spec_name:
+                    spec = (cfg.__dict__.get("_specialist_clients") or {}) \
+                        .get(spec_name)
+                if spec is not None and hasattr(spec, "telemetry"):
+                    try:
+                        st = spec.telemetry()
+                        for k in ("last_prompt_tokens",
+                                  "last_completion_tokens", "last_elapsed_s",
+                                  "last_tok_per_s", "context_tokens",
+                                  "context_utilization_pct",
+                                  "active_model_role"):
+                            telemetry[k] = st[k]
+                    except Exception:
+                        pass
+            calibration: dict = {}
+            if cfg is not None:
+                try:
+                    from .. import modelcard
+                    calibration = modelcard.calibration_map(cfg)
+                    active = cfg.active_profile or ""
+                    if active not in calibration:
+                        calibration[active] = modelcard.profile_calibration(cfg)
+                except Exception:
+                    calibration = {}
             profile_models = {}
             if cfg:
                 for name, body in (cfg.profiles or {}).items():
@@ -1415,6 +1457,14 @@ class State:
                     "cost": stats.get("cost", 0.0),
                     "seconds": stats.get("seconds", 0.0),
                 },
+                # telemetry footer + drawer, calibration badges, and the
+                # planner profile the topbar's orchestrator badge names
+                "telemetry": telemetry,
+                "calibration": calibration,
+                "folds": self.folds,
+                "planner_profile": (str((getattr(cfg, "roles", None) or {})
+                                        .get("planner") or "")
+                                    if cfg else ""),
                 "snapshots": [p.name for p in
                               (workspace.list_backups(self.root)[:8]
                                if self.root else [])],

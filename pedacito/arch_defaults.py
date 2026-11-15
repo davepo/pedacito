@@ -1,0 +1,148 @@
+"""Base-architecture recommended settings for local models.
+
+`pedacito calibrate` measures what a model can do; this library records what
+its architecture family is known to want -- the sampler temperature, the
+context window it was trained for, and the specialty tags it advertises.
+Calibration merges these into the model card's `choices` (only for LOCAL
+models, and `apply()` only fills settings the user left at their defaults),
+so a freshly imported Qwen-coder or Gemma starts from sensible numbers
+instead of the generic tier preset.
+
+Matching is by model-id substring, case-insensitive, with `-`/`_` folded to
+`.` on both sides so `Qwen2.5-Coder-32B`, `qwen2_5_coder` and
+`qwen2.5-coder` all land on the same entry. The library is ordered
+specific-first: the coder variants precede the base family they contain.
+"""
+
+from __future__ import annotations
+
+# Each entry: the id fragments that select it, the recommended sampler and
+# window, and the specialty tags the family is good at. `family` is the
+# human-readable label recorded on the card as `arch_family`.
+ARCH_LIBRARY: tuple[dict, ...] = (
+    {
+        "family": "qwen2.5-coder",
+        "patterns": ("qwen2.5-coder", "qwen3-coder"),
+        "temperature": 0.1, "temperature_answer": 0.0,
+        "sampler": {"top_p": 0.8, "top_k": 20, "repeat_penalty": 1.05},
+        "context_tokens": 32768,
+        "specialties": ("coding", "testing_qa"),
+    },
+    {
+        "family": "qwen3",
+        "patterns": ("qwen3", "qwen3.5"),
+        "temperature": 0.2, "temperature_answer": 0.0,
+        "sampler": {"top_p": 0.8, "top_k": 20},
+        "context_tokens": 32768,
+        "specialties": ("general", "coding"),
+    },
+    {
+        "family": "deepseek-coder",
+        "patterns": ("deepseek-coder",),
+        "temperature": 0.1, "temperature_answer": 0.0,
+        "sampler": {"top_p": 0.95},
+        "context_tokens": 32768,
+        "specialties": ("coding", "testing_qa"),
+    },
+    {
+        "family": "deepseek-r1",
+        "patterns": ("deepseek-r1", "qwq"),
+        "temperature": 0.5, "temperature_answer": 0.1,
+        "sampler": {"top_p": 0.95},
+        "context_tokens": 32768,
+        "specialties": ("math_algorithms",),
+    },
+    {
+        "family": "nemotron",
+        "patterns": ("nemotron",),
+        "temperature": 0.2, "temperature_answer": 0.0,
+        "sampler": {"top_p": 0.9},
+        "context_tokens": 32768,
+        "specialties": ("general",),
+    },
+    {
+        "family": "gemma",
+        "patterns": ("gemma-3", "gemma-4"),
+        "temperature": 0.2, "temperature_answer": 0.0,
+        "sampler": {"top_p": 0.95, "top_k": 64},
+        "context_tokens": 32768,
+        "specialties": ("general", "frontend_ui", "3d_graphics_svg",
+                        "translation_i18n"),
+    },
+    {
+        "family": "mistral",
+        "patterns": ("codestral", "devstral", "mistral"),
+        "temperature": 0.15, "temperature_answer": 0.0,
+        "sampler": {"top_p": 0.9},
+        "context_tokens": 32768,
+        "specialties": ("coding", "general"),
+    },
+    {
+        "family": "granite",
+        "patterns": ("granite",),
+        "temperature": 0.1, "temperature_answer": 0.0,
+        "sampler": {"top_p": 0.9},
+        "context_tokens": 16384,
+        "specialties": ("coding", "sql_data"),
+    },
+    {
+        "family": "phi-4",
+        "patterns": ("phi-4",),
+        "temperature": 0.2, "temperature_answer": 0.0,
+        "sampler": {"top_p": 0.9},
+        "context_tokens": 16384,
+        "specialties": ("math_algorithms", "coding"),
+    },
+    {
+        "family": "llama-3",
+        "patterns": ("llama-3",),
+        "temperature": 0.2, "temperature_answer": 0.0,
+        "sampler": {"top_p": 0.9},
+        "context_tokens": 32768,
+        "specialties": ("general", "coding"),
+    },
+)
+
+
+def _norm(text: str) -> str:
+    return str(text or "").lower().replace("_", ".").replace("-", ".")
+
+
+def match_arch(model_id: str) -> dict | None:
+    """The library entry whose id fragment appears in `model_id`, or None.
+    Specific-first: `qwen3-coder` matches the coder entry, not base qwen3."""
+    name = _norm(model_id)
+    if not name:
+        return None
+    for entry in ARCH_LIBRARY:
+        if any(_norm(p) in name for p in entry["patterns"]):
+            return entry
+    return None
+
+
+def arch_context_tokens(entry: dict, info: dict, vram_gb: int = 0,
+                        size_bytes: int = 0) -> int:
+    """The recommended window capped by what the machine can actually hold:
+    the server's reported context length and the VRAM KV-cache estimate
+    (the same `auto_fit` window). A missing signal simply does not cap."""
+    from .config import hardware_context_tokens
+    ctx = int(entry.get("context_tokens") or 8192)
+    server = int((info or {}).get("context_length")
+                 or (info or {}).get("max_context_length") or 0)
+    if server > 0:
+        ctx = min(ctx, server)
+    if vram_gb and size_bytes:
+        fits = hardware_context_tokens(int(vram_gb), int(size_bytes))
+        if fits > 0:
+            ctx = min(ctx, fits)
+    return max(1024, ctx)
+
+
+def needle_step_down(window: int) -> int | None:
+    """The next smaller window to retry the long-context needle at after a
+    miss (>16k -> 16384, then -> 8192); None when there is nothing smaller."""
+    if window > 16384:
+        return 16384
+    if window > 8192:
+        return 8192
+    return None

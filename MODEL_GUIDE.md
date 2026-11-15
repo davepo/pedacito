@@ -541,7 +541,15 @@ pedacito calibrate --profile worker          # full run, about a few minutes
 pedacito calibrate --quick --profile worker  # skip the long-context and capability probes
 pedacito calibrate --repeats 5               # run each probe five times
 pedacito calibrate --recalibrate             # measure again even with a fresh card
+pedacito calibrate --all -y                  # every local profile in turn, no confirmation
 ```
+
+Calibration is for **local models only**. A hosted provider profile is refused
+(the CLI exits 2, the GUI button is disabled) because hosted models use
+provider-table defaults automatically; `models scan` never calibrates hosted
+imports either. `--all` walks the local profiles sequentially, unloading each
+model before the next loads, and skips profiles with a fresh card unless
+`--recalibrate` is given.
 
 Calibration runs a scripted set of probes:
 
@@ -556,13 +564,18 @@ Calibration runs a scripted set of probes:
   answered with thinking on and off.
 - **Native tool calls:** the same scenarios through the model's tool-call channel,
   compared with the JSON grammar.
-- **Specialty micro-probes:** three tiny checks, run once with thinking off —
+- **Specialty micro-probes:** six tiny checks, run once with thinking off —
   emit a well-formed SVG with exact attributes (frontend/graphics), compute one
-  exact integer expression (math/algorithms), and translate a sentence to
-  Spanish without touching its `{name}`/`{count}` placeholders (i18n). A score
-  of 0.67 or better earns the matching tags; strong edit-format and tool-choice
-  scores (both ≥ 0.75) earn coding + testing, and a weak edit format (< 0.5)
-  takes coding away. Together with the name heuristics they become the card's
+  exact integer expression (math/algorithms), translate a sentence to
+  Spanish without touching its `{name}`/`{count}` placeholders (i18n), write a
+  SQL join that is graded by executing it against a fixture SQLite database
+  (sql/data), answer what `avg([])` raises as the strict JSON object
+  `{"empty_raises": "ZeroDivisionError"}` (testing/QA), and order a three-step
+  plan parser → CLI → tests (planning; scores the orchestrator, earns no tag).
+  A score of 0.67 or better earns the matching tags; strong edit-format and
+  tool-choice scores (both ≥ 0.75) earn coding + testing, and a weak edit
+  format (< 0.5) takes coding away. Together with the name heuristics and the
+  architecture library's recommended tags they become the card's
   `specialties`, which specialist auto-routing uses (above).
 
 Each probe runs three times by default, or once with `--quick` (the specialty
@@ -578,6 +591,13 @@ The card sets these values:
 - `fuzzy_match` and `edit_style`
 - `disable_thinking`, when the thinking A/B shows the model needs it off
 - `specialties`, the tags specialist auto-routing matches tasks against
+- for local models, **architecture defaults**: the built-in library's
+  recommended `temperature`, `temperature_answer`, sampler (`top_p`, `top_k`,
+  `repeat_penalty`) and `context_tokens` for the model's family (Qwen coder,
+  Qwen3, DeepSeek coder/R1, Nemotron, Gemma, Mistral, Granite, Phi-4,
+  Llama-3). The window is capped by the server's reported context length and
+  your VRAM, and a missed long-context needle steps it down (16384, then
+  8192) before the card records it.
 
 Only settings you left at their defaults follow the card. Anything you set
 explicitly still wins. `pedacito config` shows the card and whether it is in use.
@@ -586,8 +606,11 @@ Cards expire after 30 days, and a card from an older version is shown with a not
 and not applied. Calibrate again after you change the model, its quantization, or
 its chat template. In the GUI, each profile in **Settings → Profiles** has a
 **Calibrate** button that runs a quick measurement and streams the output to the
-terminal panel. `pedacito models scan` also calibrates each new model with a quick
-run by default, so you get a card as you add models.
+terminal panel, plus a badge: ✓ Calibrated (with the date and score),
+⚠ Calibration stale, ○ Not calibrated yet, or ☁ Hosted API (button disabled).
+**Project ▾ → Calibrate All Local Models…** runs the whole local pool as one
+background job. `pedacito models scan` also calibrates each new local model with
+a quick run by default, so you get a card as you add models.
 
 ---
 

@@ -1939,18 +1939,44 @@ tags, and the best fit runs it.
 slug). With no explicit list, the model card's measured tags stand in; with no
 card, name heuristics (`coder`/`codestral`/`starcoder`/`devstral` → coding +
 testing, `math`/`qwq`/`r1`/`reasoning` → math, `-vl`/`vision`/`pixtral`/`llava`/
-`gemma-3` → frontend + graphics). Calibration earns the measured tags with
-three micro-probes run ONCE with thinking off and small caps (under ~3 s
-total): emit an SVG with an exact `viewBox` and wheel-circle attributes
-(parsed with ElementTree, 0.4 + 0.3 + 0.3), compute `(2 ** 3 ** 2) % 100 + 17`
-(must answer 29), and translate one sentence to Spanish keeping `{name}` and
-`{count}` intact. A probe score ≥ 0.67 earns its tags; `edit_format` AND
-`tool_choice` ≥ 0.75 earn coding + testing_qa, and `edit_format` < 0.5 strips
-coding again -- a model that cannot write a valid SEARCH/REPLACE block is not
-a coding specialist, whatever its name says. The tags land in
+`gemma-3` → frontend + graphics) and the architecture library's recommended
+tags (`arch_defaults.py`, below) union in. Calibration earns the measured tags
+with six micro-probes run ONCE with thinking off and small caps: emit an SVG
+with an exact `viewBox` and wheel-circle attributes (parsed with ElementTree,
+0.4 + 0.3 + 0.3), compute `(2 ** 3 ** 2) % 100 + 17` (must answer 29),
+translate one sentence to Spanish keeping `{name}` and `{count}` intact,
+write one SQLite join+aggregate SELECT that is graded by EXECUTING it against
+a four-user in-memory fixture (only the rows ana=110, cy=200 pass), name the
+exception `avg([])` raises as the strict JSON object
+`{"empty_raises": "ZeroDivisionError"}`, and emit a 3-step JSON plan ordered
+parser → CLI → tests last (the orchestrator shape; it scores planning but
+earns no specialty tag). A probe score ≥ 0.67 earns its tags; `edit_format`
+AND `tool_choice` ≥ 0.75 earn coding + testing_qa, and `edit_format` < 0.5
+strips coding again -- a model that cannot write a valid SEARCH/REPLACE block
+is not a coding specialist, whatever its name says. The tags land in
 `card["measured"]["specialties"]` and `card["choices"]["specialties"]`, and
 `apply` fills `cfg.specialties` only when it is still the default `()`, the
 same explicit-wins rule as `prompt_pack` and `answer_mode`.
+
+**Architecture defaults for local models.** `arch_defaults.ARCH_LIBRARY`
+holds one recommended entry per family -- qwen2.5-coder/qwen3-coder, qwen3,
+deepseek-coder, deepseek-r1/qwq, nemotron, gemma-3/gemma-4, codestral/
+devstral/mistral, granite, phi-4, llama-3 -- matched case-insensitively with
+`-`/`_` normalized to `.`, specific patterns first. Each entry carries
+`temperature`, `temperature_answer`, a sampler (`top_p`, `top_k`,
+`repeat_penalty`), a context window and recommended specialty tags.
+`calibrate` records them on the card (`choices.arch_family`, ...); the window
+is capped by the server's reported context length and the same VRAM KV-cache
+estimate `auto_fit` uses, and a missed needle steps it down (>16k → 16384 →
+8192) before it is recorded. `apply()` fills ONLY settings still at their
+defaults -- an explicit user value always wins, and machine fallbacks
+(auto-fit/auto-detected windows) yield to the card. Hosted models skip the
+library entirely: they use provider-table defaults, and calibration itself is
+refused for them (CLI exit 2, GUI disabled, `models scan` never calibrates a
+hosted import). `calibrate --all` walks every local profile sequentially
+(confirmation unless `-y`; fresh cards skipped unless `--recalibrate`),
+unloading each model before the next loads and saving each card immediately;
+the GUI's **Calibrate All Local Models…** runs the same batch as one job.
 
 **Routing happens only at task boundaries.** `loop.run_task`, `loop.run_loop`
 and the planned-run path call `roles.select_specialist_profile()` on the clean

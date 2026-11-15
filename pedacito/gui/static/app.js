@@ -1010,8 +1010,15 @@ function checkModel() { PDC.api('/api/check_model', {}).then(refreshState); }
 
 // Quick-calibrate the profile shown in the header from the top bar. Same
 // endpoint and wording as the Settings -> Model discovery card button.
+// Hosted provider profiles are refused: calibration is local-only.
 function calibrateProfile(name) {
   if (!name) { PDC.toast('No active profile to calibrate.', true); return; }
+  const cal = (S.status.calibration || {})[name] || {};
+  if (cal.is_hosted) {
+    const model = (S.status.profile_models || {})[name] || S.status.model || '';
+    PDC.toast('Calibration is only for local models. Profile \'' + name + '\' (' + model + ') is a hosted provider model and uses provider-table defaults automatically.', true);
+    return;
+  }
   PDC.confirm('Calibrate \u201c' + name + '\u201d?\n\nA short probe: a few timed calls to measure how fast this model answers, how long a prompt it can actually hold, and how reliably it uses tools. The result is stored in its model card and the tuned limits are written to the profile.', 'Run it').then((ok) => {
     if (!ok) return;
     PDC.api('/api/models/calibrate', { profile: name, mode: 'quick' }).then((j) => {
@@ -1020,6 +1027,13 @@ function calibrateProfile(name) {
       refreshState();
     });
   });
+}
+
+// Calibrate All lives in settings.js (it owns the settings payload); load
+// that module on demand, exactly like the Settings dialog itself.
+function calibrateAllProfiles() {
+  if (PDC.calibrateAll) { PDC.calibrateAll(); return; }
+  settingsPromise.then(() => { if (PDC.calibrateAll) PDC.calibrateAll(); });
 }
 
 // ---------------------------------------------------------------- benchmarks ---
@@ -1706,6 +1720,100 @@ function ProfileSelect(props) {           // header dropdown; uncontrolled
     </select>`;
 }
 
+// ------------------------------------------------- calibration & telemetry ---
+// The toolbar badge for the active profile's model card: green when fresh,
+// amber when stale, muted when absent, cloud for hosted APIs (which never
+// calibrate). Clicking opens Settings -> Model discovery, where the
+// Calibrate buttons live.
+function calChoicesTip(ch) {
+  if (!ch) return '';
+  const keys = ['arch_family', 'prompt_pack', 'answer_mode', 'best_of',
+                'temperature', 'temperature_answer', 'context_tokens'];
+  const bits = keys.filter((k) => ch[k] !== undefined && ch[k] !== null)
+                   .map((k) => k + ': ' + ch[k]);
+  return bits.length ? '\n' + bits.join('\n') : '';
+}
+function CalibrationBadge(props) {
+  const s = S.status;
+  if (!s.root) return null;
+  const name = props.name || '';
+  const cal = (s.calibration || {})[name] || {};
+  const openProfiles = () => callSettings({ tab: 'discovery' });
+  if (cal.is_hosted) {
+    return html`<span class="chip cal-chip hosted" id="calChip"
+      title=${'Hosted provider model \u2014 uses provider-table defaults automatically.\nCalibration disabled for hosted models.'}>
+      <b>\u2601 Hosted API</b></span>`;
+  }
+  if (cal.calibrated && !cal.calibrated_stale) {
+    const age = cal.calibrated_age_days || 0;
+    const ago = age <= 0 ? 'today' : age + 'd ago';
+    return html`<span class="chip cal-chip ok" id="calChip" onClick=${openProfiles}
+      title=${'Calibrated ' + (cal.calibrated_at || '') + '\nscore: '
+        + Number(cal.card_score || 0).toFixed(2) + calChoicesTip(cal.card_choices)
+        + '\nClick to open Settings \u2192 Model discovery'}>
+      <b>\u2713 Calibrated (${ago})</b></span>`;
+  }
+  if (cal.calibrated && cal.calibrated_stale) {
+    return html`<span class="chip cal-chip stale" id="calChip" onClick=${openProfiles}
+      title=${'The model card is older than 30 days (or from an older calibrate version).\nRe-calibrate to refresh the tuned defaults.\nClick to open Settings \u2192 Model discovery'}>
+      <b>\u26A0 Calibration stale (${(cal.calibrated_age_days || 0) + 'd ago'})</b></span>`;
+  }
+  return html`<span class="chip cal-chip none" id="calChip" onClick=${openProfiles}
+    title=${'No model card yet \u2014 calibrate to measure this model and tune its defaults.\nClick to open Settings \u2192 Model discovery'}>
+    <b>\u25CB Not calibrated</b></span>`;
+}
+
+// The live telemetry footer: context window fill, last turn and session
+// tokens, generation speed, KV cache hit, folds, and who is answering.
+// Click it to unfold the drawer with the full breakdown.
+function TelemetryBar() {
+  const s = S.status;
+  const [open, setOpen] = useState(false);
+  const t = s.telemetry || {};
+  if (!s.root || !t.context_tokens) return null;
+  const pct = Number(t.context_utilization_pct || 0);
+  const heat = pct > 85 ? 'hot' : pct >= 70 ? 'warm' : 'cool';
+  const role = t.active_model_role || {};
+  const activeName = role.profile || role.model || s.model || '\u2014';
+  const activeTag = role.specialty || role.role || 'worker';
+  const u = s.usage || {};
+  const fmt1 = (n) => Number(n || 0).toFixed(1);
+  const drawer = open ? html`
+    <div class="tele-drawer" id="teleDrawer">
+      <div class="tele-grid">
+        <div><span class="muted">Last turn</span><b>${PDC.fmtInt(t.last_prompt_tokens)} in / ${PDC.fmtInt(t.last_completion_tokens)} out</b></div>
+        <div><span class="muted">Latency</span><b>${fmt1(t.last_elapsed_s)} s</b></div>
+        <div><span class="muted">Speed (last / avg)</span><b>${fmt1(t.last_tok_per_s)} / ${fmt1(t.avg_tok_per_s)} tok/s</b></div>
+        <div><span class="muted">Context window</span><b>${PDC.fmtInt(t.context_tokens)} tokens (${s.context_origin || 'default'})</b></div>
+        <div><span class="muted">Session</span><b>${PDC.fmtInt(u.calls)} calls \u00B7 ${PDC.fmtTokens(u.tokens_in)} in / ${PDC.fmtTokens(u.tokens_out)} out \u00B7 ${Math.round(u.seconds || 0)}s</b></div>
+        <div><span class="muted">KV cache hit</span><b>${fmt1(t.cache_hit_pct)}%</b></div>
+        <div><span class="muted">Context folds</span><b>${s.folds || 0}</b></div>
+        <div><span class="muted">Cost</span><b>${u.cost ? '$' + Number(u.cost).toFixed(4) : '\u2014'}</b></div>
+        <div><span class="muted">Active model</span><b>${activeName} (${activeTag})</b></div>
+        <div><span class="muted">Orchestrator</span><b>${s.planner_profile || '\u2014'}</b></div>
+        ${s.scout_profile ? html`<div><span class="muted">Scout</span><b>${s.scout_profile}</b></div>` : null}
+      </div>
+    </div>` : null;
+  return html`
+    <footer id="telemetryBar" class=${open ? 'open' : ''}>
+      ${drawer}
+      <div class="tele-row" onClick=${() => setOpen(!open)}
+           title=${'Live model telemetry \u2014 click to ' + (open ? 'collapse' : 'expand')}>
+        <span class=${'tele-bar ' + heat} title=${'context utilization ' + pct + '%'}>
+          <i style=${'width:' + Math.max(0, Math.min(100, pct)) + '%'}></i>
+        </span>
+        <span class="tele-item">Context: <b>${PDC.fmtInt(t.last_prompt_tokens)} / ${PDC.fmtInt(t.context_tokens)}</b> (${pct}%)</span>
+        <span class="tele-item">Turn: <b>${PDC.fmtInt(t.last_prompt_tokens)} in / ${PDC.fmtInt(t.last_completion_tokens)} out</b></span>
+        <span class="tele-item">Session: <b>${PDC.fmtTokens(t.session_prompt_tokens)} in / ${PDC.fmtTokens(t.session_completion_tokens)} out</b></span>
+        <span class="tele-item">Speed: <b>${fmt1(t.last_tok_per_s)} tok/s</b> (avg ${fmt1(t.avg_tok_per_s)} tok/s) \u00B7 ${fmt1(t.last_elapsed_s)}s</span>
+        <span class="tele-item">KV Cache Hit: <b>${Math.round(t.cache_hit_pct || 0)}%</b> | Folds: <b>${s.folds || 0}</b></span>
+        <span class="tele-item">Active: <b>${activeName}</b> (${activeTag})</span>
+        ${s.planner_profile ? html`<span class="tele-item">Orchestrator: <b>${s.planner_profile}</b></span>` : null}
+        <i class="tele-caret">${open ? '\u25BE' : '\u25B4'}</i>
+      </div>
+    </footer>`;
+}
+
 function TopBar() {
   // Two dense rows: row 1 is the project side -- brand, a compact
   // path box, Browse/Recent/Open and the Project menu -- against the global
@@ -1728,6 +1836,8 @@ function TopBar() {
     : 'no index yet \u2014 Click to index the project (Shift-click for a quick, no-summaries index)';
   const open = () => openProject((pathRef.current && pathRef.current.value || '').trim(), S.ui.pendingProfile || '');
   const activeProf = s.profile || s.default_profile || '';
+  const activeCal = (s.calibration || {})[activeProf] || {};
+  const activeHosted = !!activeCal.is_hosted;
   const eng = s.engine || {};
   const phase = eng.phase || (j ? 'gather' : 'idle');
   const phaseName = { idle: 'Idle', gather: 'Gathering', edit: 'Editing',
@@ -1754,8 +1864,12 @@ function TopBar() {
           <//>
           <button class="primary" id="openBtn" disabled=${!!j} onClick=${open}>Open</button>
           <${Menu} button=${html`<button id="projMenuBtn" title="calibrate, index, restore and other project actions">Project \u25BE</button>`}>
-            <${MenuItem} label="Calibrate active profile" disabled=${!!j || !activeProf}
+            <${MenuItem} label="Calibrate active profile" disabled=${!!j || !activeProf || activeHosted}
+                       title=${activeHosted ? 'Calibration disabled for hosted models' : ''}
                        action=${() => calibrateProfile(activeProf)} />
+            <${MenuItem} label="Calibrate All Local Models\u2026" disabled=${!!j}
+                       title="Calibrate every local profile in turn (hosted models are skipped)"
+                       action=${calibrateAllProfiles} />
             <${MenuItem} label="Check model (loads it)" disabled=${!!j || !s.root} action=${checkModel} />
             <${MenuItem} label="Index project (with summaries)" disabled=${!!j || !s.root} action=${() => buildIndex(true)} />
             <${MenuItem} label="Quick index (no summaries)" disabled=${!!j || !s.root} action=${() => buildIndex(false)} />
@@ -1817,6 +1931,7 @@ function TopBar() {
             title=${s.disable_thinking ? 'thinking is disabled for this profile (disable_thinking = true)'
                                        : 'thinking is allowed (disable_thinking = false) \u2014 turn it off in Settings \u2192 Profiles'}>${s.disable_thinking ? 'no-think' : 'thinking'}</span>` : null}
         </span>
+        <${CalibrationBadge} name=${activeProf} />
         ${s.scout_profile ? html`<span class="chip" id="scoutChip"
               title=${'Scout/architect split: lookup steps during gather run on profile \''
                 + s.scout_profile + '\' (a fast model); planning, answers and edits stay on \''
@@ -1879,7 +1994,7 @@ function Menu(props) {
     </span>`;
 }
 function MenuItem(props) {
-  return html`<button class="menuitem" disabled=${!!props.disabled}
+  return html`<button class="menuitem" disabled=${!!props.disabled} title=${props.title || ''}
                        onClick=${() => { if (!props.disabled) props.action(); }}>${props.label}</button>`;
 }
 
@@ -2799,6 +2914,7 @@ function App() {
           <${WorkspacePane} />
         </aside>
       </main>
+      <${TelemetryBar} />
       <nav id="mobileTabs">
         <button data-view="chat" class=${S.ui.view === 'chat' ? 'on' : ''} onClick=${() => setView('chat')}>Chat</button>
         <button data-view="diff" class=${S.ui.view === 'diff' ? 'on' : ''}

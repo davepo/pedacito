@@ -585,6 +585,8 @@
     names.forEach(function (n) {
       var p = f.profiles[n] || {};
       var sub = (p.model || '(no model set)') + (p.base_url ? ' @ ' + p.base_url : '');
+      var cal = ((X.data && X.data.calibration) || {})[n] || {};
+      var hosted = !!cal.is_hosted;
       // Two-part card: the identity block (name + pills over the model line)
       // shrinks and ellipsises; the action buttons never wrap mid-label.
       var row = h('div', { class: 'prow' },
@@ -592,10 +594,16 @@
           h('div', { class: 'prow-head' },
             h('b', { class: 'prow-name ellip', text: n, title: 'open this profile', style: 'cursor:pointer', onclick: function () { gotoProfile(n); } }),
             n === X.data.active_profile ? h('span', { class: 'tag act', text: 'active' }) : null,
-            n === defName ? h('span', { class: 'tag', text: 'default' }) : null),
-          h('div', { class: 'prow-sub mono ellip', text: sub, title: sub })),
+            n === defName ? h('span', { class: 'tag', text: 'default' }) : null,
+            hosted ? h('span', { class: 'tag hosted', text: '\u2601 hosted' }) : null),
+          h('div', { class: 'prow-sub mono ellip', text: sub, title: sub }),
+          h('div', { class: 'prow-cal small-text ' + (hosted ? 'muted' : cal.calibrated ? (cal.calibrated_stale ? 'stale' : 'ok') : 'muted'),
+            text: calLine(cal), title: calTitle(cal) })),
         h('span', { class: 'prow-actions' },
-          h('button', { class: 'small', text: 'Calibrate', title: 'Measure this model and store the scores in its model card', onclick: function () { calibrate(n, 'quick'); } }),
+          h('button', { class: 'small', text: 'Calibrate', disabled: hosted,
+            title: hosted ? 'Calibration disabled for hosted models'
+                          : 'Measure this model and store the scores in its model card',
+            onclick: function () { calibrate(n, 'quick'); } }),
           n === defName ? h('button', { class: 'small ghost', disabled: true, text: 'Default' })
             : h('button', { class: 'small', text: 'Set default', onclick: function () { setDefaultProfile(n); } }),
           h('button', { class: 'small', text: 'Rename', title: 'Rename this profile (the default-profile and role references follow it)', onclick: function () { renameProfileNamed(n); } }),
@@ -607,8 +615,35 @@
       h('button', { class: 'small', text: '+ New profile', onclick: newProfile }),
       h('button', { class: 'small', text: '+ Add Hosted Provider\u2026', onclick: openHostedDialog,
         title: 'Connect a hosted API key, verify it live, and import its models as profiles' }),
+      h('button', { class: 'small', text: 'Calibrate All Local Models\u2026', onclick: calibrateAll,
+        title: 'Calibrate every local profile in turn (hosted models are skipped)' }),
       h('span', { class: 'muted small-text grow', text: 'Calibrating takes about a minute and streams to the Output tab.' })));
     return box;
+  }
+  // The calibration line under each profile row: when it was measured, the
+  // score and the specialties the card tagged -- or the honest empty state.
+  function calLine(cal) {
+    if (cal.is_hosted) return '\u2601 Hosted API \u2014 uses provider-table defaults automatically';
+    if (!cal.calibrated) return 'Not calibrated yet';
+    var line = 'Calibrated on ' + cal.calibrated_at + ' (score: ' + Number(cal.card_score || 0).toFixed(2);
+    var tags = cal.specialties || [];
+    if (tags.length) line += ', specialties: ' + tags.join(', ');
+    line += ')';
+    if (cal.calibrated_stale) line += ' \u2014 stale, re-calibrate';
+    return line;
+  }
+  function calTitle(cal) {
+    if (cal.is_hosted) return 'Calibration disabled for hosted models';
+    if (!cal.calibrated) return 'Run Calibrate to measure this model and tune its defaults';
+    var bits = ['score ' + Number(cal.card_score || 0).toFixed(2),
+                'measured ' + cal.calibrated_at + ' (' + cal.calibrated_age_days + 'd ago)'];
+    var ch = cal.card_choices || {};
+    Object.keys(ch).forEach(function (k) {
+      var v = ch[k];
+      if (v === null || v === undefined || typeof v === 'object') return;
+      bits.push(k + ': ' + v);
+    });
+    return bits.join('\n');
   }
   function scanner() {
     var box = h('div', {});
@@ -734,6 +769,12 @@
     });
   }
   function calibrate(name, mode) {
+    var cal = ((X.data && X.data.calibration) || {})[name] || {};
+    if (cal.is_hosted) {
+      var p = ((file().profiles || {})[name]) || {};
+      PDC.toast('Calibration is only for local models. Profile \'' + name + '\' (' + (p.model || '') + ') is a hosted provider model and uses provider-table defaults automatically.', true);
+      return;
+    }
     PDC.confirm('Calibrate \u201c' + name + '\u201d?\n\n' + (mode === 'quick'
       ? 'A short probe: a few timed calls to measure how fast this model answers, how long a prompt it can actually hold, and how reliably it uses tools. The result is stored in its model card and the tuned limits are written to the profile.'
       : 'The full suite \u2014 slower and more calls, but it also checks tool calls that must happen in order.'), 'Run it').then(function (ok) {
@@ -745,6 +786,109 @@
       });
     });
   }
+  // Calibrate All Local Models: one background job walks every LOCAL profile
+  // in turn (hosted ones use provider-table defaults and never calibrate).
+  // The modal lists the profiles, offers re-calibrating fresh cards, then
+  // polls /api/state: the job title names the profile in flight and each
+  // card's new timestamp ticks its row to done.
+  function calibrateAll() {
+    PDC.api('/api/settings').then(function (d) {
+      var cal = d.calibration || {};
+      var names = {};
+      ['user', 'project'].forEach(function (w) {
+        Object.keys((d[w] || {}).profiles || {}).forEach(function (n) { names[n] = 1; });
+      });
+      var all = Object.keys(names).sort();
+      var local = all.filter(function (n) { return !(cal[n] || {}).is_hosted; });
+      var hostedCount = all.length - local.length;
+      if (!local.length) {
+        PDC.toast('No local model profiles to calibrate' + (hostedCount ? ' \u2014 ' + hostedCount + ' hosted profile(s) use provider-table defaults automatically.' : '.'), true);
+        return;
+      }
+      var before = {};
+      local.forEach(function (n) { before[n] = (cal[n] || {}).calibrated_at || ''; });
+      var rows = {};
+      var list = h('div', { class: 'calall-list' });
+      local.forEach(function (n) {
+        var meta = cal[n] || {};
+        var body = ((d.project || {}).profiles || {})[n] || ((d.user || {}).profiles || {})[n] || {};
+        var state = h('span', { class: 'calall-state muted',
+          text: meta.calibrated ? (meta.calibrated_stale ? 'stale card' : 'fresh card') : 'not calibrated' });
+        var row = h('div', { class: 'calall-row' },
+          h('b', { class: 'calall-name', text: n }),
+          h('span', { class: 'muted small-text mono ellip', text: body.model || '', title: body.model || '' }),
+          state);
+        rows[n] = { state: state, row: row };
+        list.appendChild(row);
+      });
+      var reChk = h('input', { type: 'checkbox' });
+      var progress = h('div', { class: 'calall-progress muted small-text' });
+      var body = h('div', {},
+        h('p', { style: 'margin:0 0 8px', text: 'This loads each model in turn and may take several minutes. Each card is saved as soon as it finishes; progress streams to the Output tab.' }),
+        list,
+        h('label', { class: 'chk', style: 'margin-top:8px' }, reChk,
+          'Re-calibrate models that already have a fresh card'),
+        hostedCount ? h('div', { class: 'muted small-text', style: 'margin-top:6px',
+          text: hostedCount + ' hosted profile(s) excluded \u2014 hosted provider models use provider-table defaults automatically.' }) : null,
+        progress);
+      var modal = PDC.modal('Calibrate All Local Models', body, [
+        { label: 'Cancel' },
+        { label: 'Calibrate ' + local.length + ' profile(s)', primary: true, stay: true,
+          onclick: function () { start(); } }
+      ], { onClose: function () { if (timer) clearTimeout(timer); } });
+      var foot = modal.box.querySelector('.modal-foot');
+      var timer = 0, started = false;
+      function setState(n, text, cls) {
+        rows[n].state.textContent = text;
+        rows[n].state.className = 'calall-state ' + (cls || 'muted');
+        rows[n].row.classList.toggle('done', cls === 'ok');
+      }
+      function poll() {
+        PDC.api('/api/state').then(function (st) {
+          var cmap = st.calibration || {};
+          var done = 0;
+          local.forEach(function (n) {
+            var meta = cmap[n] || {};
+            if (meta.calibrated && meta.calibrated_at && meta.calibrated_at !== before[n]) {
+              setState(n, '\u2713 calibrated', 'ok'); done++;
+            }
+          });
+          var j = st.job;
+          if (j && j.kind === 'calibrate') {
+            progress.textContent = (j.title || 'calibrating\u2026') + ' \u2014 ' + done + '/' + local.length + ' card(s) saved';
+            timer = setTimeout(poll, 2000);
+            return;
+          }
+          // job ended: fresh cards that were skipped keep their old stamp
+          local.forEach(function (n) {
+            var meta = cmap[n] || {};
+            if (meta.calibrated && meta.calibrated_at && meta.calibrated_at !== before[n]) return;
+            setState(n, before[n] && !meta.calibrated_stale ? 'skipped (fresh card)'
+              : (meta.calibrated ? 'stale card' : 'not calibrated'), 'muted');
+          });
+          progress.textContent = 'Finished \u2014 ' + done + ' card(s) saved.';
+          if (foot) foot.innerHTML = '';
+          setTimeout(function () { modal.close(); PDC.refreshState(); }, 1600);
+        }, function () { timer = setTimeout(poll, 3000); });
+      }
+      function start() {
+        if (started) return;
+        started = true;
+        PDC.api('/api/calibrate/all', { recalibrate: reChk.checked, mode: 'quick' }).then(function (j) {
+          if (!j.ok) {
+            PDC.toast(j.detail || 'could not start the calibration', true);
+            started = false;
+            return;
+          }
+          if (foot) foot.innerHTML = '';
+          progress.textContent = 'Starting\u2026';
+          reChk.disabled = true;
+          poll();
+        });
+      }
+    });
+  }
+  PDC.calibrateAll = calibrateAll;
   function setDefaultProfile(name) {
     save({ file: X.which, profile: null, changes: { default_profile: name } }, '/api/settings/set', '"' + name + '" is now the default profile.');
   }

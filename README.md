@@ -106,6 +106,7 @@ Step-by-step versions, with what you should see at each point, are in
 | **Symbol-level edits and rename** | Replace a whole function by name without echoing its old text, or rename a symbol across the project with no model call (`pedacito rename`) | [Editing](#editing-searchreplace-not-diffs) |
 | **Engine-enforced JSON and scout routing** | Lookup steps are constrained by the server's JSON schema support, and `scout_profile` sends the lookups to a fast model while the big model plans and edits | [Model guide](MODEL_GUIDE.md#dual-gpu--dual-model-scout--architect-routing-scout_profile) |
 | **Specialist auto-routing** | `auto_route_specialties` sends each task to the profile whose specialty tags fit it best (coder, UI/SVG, math, ...), at task boundaries only, with a clean VRAM handoff on one local server; `pedacito calibrate` detects the tags | [Specialist routing](#specialist-auto-routing) |
+| **Calibration badges & live telemetry** | Profiles show ✓ Calibrated / ⚠ stale / ○ Not calibrated / ☁ Hosted badges; `calibrate --all` measures every local model in turn; a GUI footer and a CLI ribbon track context use, tokens, speed and cache hits live | [Measurement and upkeep](#measurement-and-upkeep) |
 
 ### The GUI workspace
 
@@ -113,7 +114,13 @@ Step-by-step versions, with what you should see at each point, are in
 dependencies, so it works offline. It runs the same engine as the commands.
 
 - A two-row toolbar with the project path, a live **profile and model** picker,
-  the server's status light, and session totals for tokens, cache hits, and cost.
+  the server's status light, a calibration badge for the active profile
+  (✓ Calibrated, ⚠ stale, ○ Not calibrated, or ☁ Hosted API), and session totals
+  for tokens, cache hits, and cost.
+- A **telemetry footer** under the workspace: the context window in use with a
+  green / amber / red bar, turn and session tokens, generation speed, KV cache
+  hits and folds, and which model holds the card. Click it to expand the full
+  drawer.
 - **Nine color schemes** under the theme menu: GitHub Light and Dark, Daylight,
   Nord, Midnight, and four 1990s themes (Jazz Cup, Trapper Keeper, Memphis
   Arcade, Windbreaker).
@@ -136,8 +143,10 @@ dependencies, so it works offline. It runs the same engine as the commands.
   pelican SVG result is drawn inline in its scorecard.
 - **Project ▾** holds project actions: **Rename symbol…** renames an identifier
   across the project with no model call, and shows the per-file diffs before it
-  writes. **Restore from a backup…**, **Check model (loads it)** and **Clear
-  terminal** are also here, plus the upkeep dialogs: **Memory & repo lessons…**,
+  writes. **Calibrate All Local Models…** measures every local profile in turn
+  (hosted profiles are excluded; fresh cards are skipped unless you tick
+  re-calibrate). **Restore from a backup…**, **Check model (loads it)** and
+  **Clear terminal** are also here, plus the upkeep dialogs: **Memory & repo lessons…**,
   **Background servers…**, **Run project checks…**, **Prune old
   sessions/backups…** and **Reset project state…** (prune and reset preview
   before they write). A `Scout: <profile>` badge appears beside the model chip
@@ -159,7 +168,7 @@ commands. Run `pedacito <command> --help` for every flag.
 | `pedacito gui [PROJECT]` | Open the browser control panel |
 | `pedacito models scan` | Find local servers, pick models, write profiles, and measure them |
 | `pedacito config --check` | Test the connection and generation. `--doctor` also probes structured output. `--setup` runs first-time setup; `--upgrade [--dry-run]` adds newly documented options to your file |
-| `pedacito calibrate` | Measure the active model and save a model card that tunes defaults |
+| `pedacito calibrate` | Measure the active model (or `--all` local profiles) and save a model card that tunes defaults. Hosted models are refused |
 | `pedacito profiles [--recommend]` | List profiles with their scores, and suggest role routing |
 | `pedacito ask PROJ -t "..."` | Run one task. Dry run by default. Add `--review`, `--apply`, `--plan`, `--refine`, or `--jsonl` |
 | `pedacito explain PROJ -q "..."` | Answer a question about the code. Never edits |
@@ -283,6 +292,22 @@ this (version 1) is shown with a re-calibrate note and is not applied. Settings 
 then follow the card (prompt pack, answer mode, verifier, best-of-N, fold
 depth, the thinking switch); anything you set explicitly still wins.
 `pedacito config` shows the card.
+
+Calibration is for **local models only**: a hosted provider profile is refused
+(CLI exit 2, GUI button disabled) because hosted models use provider-table
+defaults automatically, and `models scan` never calibrates hosted imports.
+For local models the card also records **architecture defaults** from a
+built-in library — recommended temperature, sampler and context window per
+family (Qwen coder, Qwen3, DeepSeek coder/R1, Nemotron, Gemma, Mistral,
+Granite, Phi-4, Llama-3) — capped by the server's reported window and your
+VRAM, with the long-context needle stepping the window down (16384, then
+8192) when it misses. `pedacito calibrate --all` walks every local profile in
+turn, unloading each model before the next loads; `-y` skips the confirmation
+and fresh cards are skipped unless `--recalibrate` is given. In the GUI the
+same batch lives under **Project ▾ → Calibrate All Local Models…**, and every
+profile row carries a calibration badge: ✓ Calibrated (with the date),
+⚠ Calibration stale (older than 30 days or an old card version),
+○ Not calibrated, or ☁ Hosted API.
 
 ---
 
@@ -972,6 +997,7 @@ same project lock as the command line.
 
 ```bash
 pedacito calibrate [--quick] [--repeats N]   # measure the model; save a model card
+pedacito calibrate --all [-y] [--recalibrate]  # every local profile, one after another
 pedacito eval [--task ID] [--out report.json]   # score the harness on fixtures
 pedacito map PROJ -t "fix X"       # see the map a task would get (ranked)
 pedacito tests PROJ --files src/a.py   # detected test command + impacted tests
@@ -1040,6 +1066,29 @@ budget, once with thinking on and once off: a model that is only usable with
 thinking off gets `disable_thinking = true` persisted on the card, so later
 runs start in the winning mode instead of rediscovering it one empty reply
 (one wasted round-trip) at a time.
+
+### Live telemetry
+
+While a task runs, the GUI's **telemetry footer** shows the context window in
+use — `Context: 6,420 / 32,768 (19.6%)` with a bar that is green under 70%,
+amber from 70–85%, red above — plus turn and session tokens, generation speed
+(`Speed: 44.2 tok/s (avg 41.8 tok/s)`), KV cache hit rate and fold count, and
+the active model with its specialty (`Active: deepseek-coder (coding)`) and
+the orchestrator profile. Click the footer to expand a drawer with the full
+per-call numbers. While a specialist holds the card, the last-call numbers
+are the specialist's; session totals stay the shared ledger's.
+
+The CLI prints the same picture as a one-line ribbon on stderr after each
+task:
+
+```
+[telemetry | ctx: ████░░░░░░ 38% (6,210/16,384) | turn: 6,210 in / 185 out | 43.5 tok/s | cache: 82%]
+```
+
+`show_telemetry = false` hides it; `--jsonl` and rpc modes never print it, so
+machine consumers see clean streams. In `chat`, `/status` and `/cost` include
+the context bar and speeds, and the rpc `status` reply carries
+`context_utilization_pct`, `last_tok_per_s` and `avg_tok_per_s`.
 
 `--record` writes the ordered model responses to `.pedacito/replay/<stamp>.jsonl`
 (prompts as a hash and a short redacted preview, never in full); `--replay`
@@ -1564,12 +1613,15 @@ Tags come from two places, and an explicit list always wins:
   `3d_graphics_svg`, `math_algorithms`, `testing_qa`, `sql_data`,
   `translation_i18n`; any lowercase slug (`[a-z0-9_-]+`) works too.
 - `pedacito calibrate` detects them: model-name heuristics (coder families,
-  `-vl`/vision models, `r1`/QwQ reasoners) plus three micro-probes — a
-  well-formed SVG with exact attributes, one integer computation, and a
-  placeholder-preserving Spanish translation — each one tiny call with
-  thinking off. The tags land on the card (`measured.specialties`), show in
-  `pedacito profiles` and the card render, and fill a profile's unset
-  `specialties` exactly like `prompt_pack` does.
+  `-vl`/vision models, `r1`/QwQ reasoners), the architecture library's
+  recommended tags, plus six micro-probes — a well-formed SVG with exact
+  attributes, one integer computation, a placeholder-preserving Spanish
+  translation, a SQL join graded by executing it against a fixture database,
+  a testing/QA question answered as strict JSON (`avg([])` raises
+  `ZeroDivisionError`), and a three-step plan that must order parser → CLI →
+  tests — each one tiny call with thinking off. The tags land on the card
+  (`measured.specialties`), show in `pedacito profiles` and the card render,
+  and fill a profile's unset `specialties` exactly like `prompt_pack` does.
 
 Switches happen **at task boundaries only** — never mid-gather — so the
 gather conversation's KV prefix stays cacheable on whichever server owns it
@@ -1793,7 +1845,7 @@ config --reference` prints the annotated template. Key settings:
 | `disable_thinking` | false | Ask for non-thinking mode using the model family's switch; output blocks are stripped regardless. |
 | `default_profile` | `""` | Profile used when `--profile` isn't given. |
 | `scout_profile` | `""` | Profile whose client runs gather's lookup steps while the active (architect) profile plans and edits; empty = no scout. |
-| `specialties` | `()` | What this profile's model is good at, e.g. `["coding", "testing_qa"]`; empty = the model card detects them (name heuristics + three micro-probes). An explicit list always beats the card. See [Specialist auto-routing](#specialist-auto-routing). |
+| `specialties` | `()` | What this profile's model is good at, e.g. `["coding", "testing_qa"]`; empty = the model card detects them (name heuristics + architecture library + six micro-probes). An explicit list always beats the card. See [Specialist auto-routing](#specialist-auto-routing). |
 | `auto_route_specialties` | false | Route each task to the best-matching specialist profile at task boundaries (clean VRAM handoff on one local server); `--auto-route` / `--no-auto-route` flip it per run. |
 | `prompt_pack` | `""` | `tiny` / `small` / `full` instruction density; empty = model card, then tier. |
 | `answer_mode` | `""` | `rebuild` / `continue` / `auto`; empty = model card, then `auto` (hosted) or `rebuild` (local). |
@@ -1822,6 +1874,7 @@ config --reference` prints the annotated template. Key settings:
 | `enable_mcp` / `mcp_servers` | true / `{}` | The named-server MCP bridge (see [Named MCP servers](#named-mcp-servers)): `[mcp_servers.<name>]` tables with `command`/`args`/`url`/`env`/`enabled`/`trusted`; the legacy `mcp_servers = ["cmd", ...]` list keeps feeding the `mcp` action. Servers defined by an untrusted project's `.pedacito.toml` are ignored. |
 | `stuck_recovery` | true | One targeted recovery prompt before gather gives up. |
 | `use_model_card` | true | Let `pedacito calibrate`'s card fill unset settings. |
+| `show_telemetry` | true | One-line telemetry ribbon on stderr after each task (context bar, turn tokens, speed, cache hit); never shown in `--jsonl` / rpc modes. See [Live telemetry](#live-telemetry). |
 | `log_events` / `keep_events` | true / 20 | Local JSONL telemetry under `.pedacito/events/`. |
 | `summary_workers` / `refresh_summaries` | 0 / 12 | Concurrent summaries (0 = auto: hosted 4, local 1); units re-summarised after a task. |
 | `summary_batch` | 1 | Short units summarised N per request while indexing (fewer round-trips; unparsed lines fall back to single requests). |

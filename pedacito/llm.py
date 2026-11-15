@@ -1211,6 +1211,68 @@ class LLMClient:
         self._failures = 0
         self._circuit_until = 0.0
         self.circuit_trips = 0
+        # Live telemetry (GUI footer, CLI ribbon): the LAST call's token
+        # counts, wall time and speed, set in `_account`; session averages
+        # come from the shared stats ledger. `active_model_role` labels who
+        # is answering: worker / planner / verifier / scout / specialist,
+        # with the profile, model and routing specialty when one applies.
+        self.last_prompt_tokens = 0
+        self.last_completion_tokens = 0
+        self.last_elapsed_s = 0.0
+        self.last_tok_per_s = 0.0
+        self.active_model_role = {
+            "profile": str(getattr(cfg, "active_profile", "") or ""),
+            "model": str(cfg.model or ""),
+            "role": "worker",
+            "specialty": "",
+        }
+
+    @property
+    def context_tokens(self) -> int:
+        """The configured prompt window this client's model runs with."""
+        return int(getattr(self.cfg, "context_tokens", 0) or 0)
+
+    @property
+    def context_utilization_pct(self) -> float:
+        """The last call's prompt tokens as a percentage of the window."""
+        ctx = self.context_tokens
+        if not ctx:
+            return 0.0
+        return round(self.last_prompt_tokens / ctx * 100, 1)
+
+    @property
+    def avg_tok_per_s(self) -> float:
+        """Session-wide generation speed: completion tokens per generation
+        second. Role/specialist clients share the worker's ledger, so this
+        is the whole session's average, not one model's."""
+        with self._stats_lock:
+            ct = self.stats.get("completion_tokens", 0)
+            seconds = self.stats.get("seconds", 0.0)
+        return ct / seconds if seconds > 0 else 0.0
+
+    def telemetry(self) -> dict:
+        """One snapshot for the GUI footer / CLI ribbon / `/status`: the
+        last call, the session totals, the context window and who is
+        answering. Cheap enough to poll."""
+        with self._stats_lock:
+            stats = dict(self.stats)
+        cached = stats.get("cached_tokens", 0)
+        pt_total = stats.get("prompt_tokens", 0)
+        return {
+            "last_prompt_tokens": self.last_prompt_tokens,
+            "last_completion_tokens": self.last_completion_tokens,
+            "last_elapsed_s": round(self.last_elapsed_s, 3),
+            "last_tok_per_s": round(self.last_tok_per_s, 1),
+            "avg_tok_per_s": round(self.avg_tok_per_s, 1),
+            "context_tokens": self.context_tokens,
+            "context_utilization_pct": self.context_utilization_pct,
+            "session_prompt_tokens": pt_total,
+            "session_completion_tokens": stats.get("completion_tokens", 0),
+            "session_seconds": round(stats.get("seconds", 0.0), 1),
+            "cache_hit_pct": round(cached / pt_total * 100, 1)
+            if pt_total else 0.0,
+            "active_model_role": dict(self.active_model_role),
+        }
 
     def _native_for(self, schema: dict | None, stream: bool) -> bool:
         """Whether this request should use the model's native tool-call channel
@@ -1751,6 +1813,13 @@ class LLMClient:
             self.stats["cache_write_tokens"] += written
             self.stats["seconds"] += seconds
             self.stats["cost"] += cost
+            # per-call telemetry for the footer/ribbon: the last call's
+            # tokens and generation speed (estimates included, so a server
+            # that reports no usage still moves the needle).
+            self.last_prompt_tokens = pt
+            self.last_completion_tokens = ct
+            self.last_elapsed_s = float(seconds or 0.0)
+            self.last_tok_per_s = ct / seconds if seconds > 0 else 0.0
             row = self.stats["by_site"].setdefault(
                 site, {"calls": 0, "prompt_tokens": 0, "completion_tokens": 0,
                        "cached_tokens": 0, "cache_write_tokens": 0})

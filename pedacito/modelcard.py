@@ -19,8 +19,9 @@ The suite is ~20 short, scripted calls against the configured server:
   continuation     after a lookup transcript, does it ANSWER (not emit more JSON)?
   thinking A/B     does hidden reasoning eat the whole answer budget -- and
                    does switching it off produce a usable reply?
-  specialties      three micro-probes (SVG/UI, math, translation) plus the
-                   name heuristics tag what the model is good at, for
+  specialties      six micro-probes (SVG/UI, math, translation, SQL, testing,
+                   orchestrator planning) plus the name heuristics and the
+                   architecture library tag what the model is good at, for
                    specialist profile routing (auto_route_specialties)
   capabilities     native tool calls, image input, embeddings, chars/token
 
@@ -41,11 +42,21 @@ import time
 import xml.etree.ElementTree as ElementTree
 from pathlib import Path
 
+from . import arch_defaults
 from . import edits as edits_mod
 from .llm import LLMError, _api_key, estimate_tokens
 
 CARD_VERSION = 2
 CARD_TTL_DAYS = 30
+
+
+def hosted_calibration_error(name: str, model: str) -> str:
+    """The exact refusal for calibrating a hosted provider profile. One
+    source of truth: the CLI, the GUI endpoint, and the batch job all print
+    this same sentence."""
+    return ("Calibration is only for local models. Profile "
+            f"'{name}' ({model}) is a hosted provider model and uses "
+            "provider-table defaults automatically.")
 
 
 def _path() -> Path:
@@ -76,6 +87,25 @@ def save_card(card: dict) -> Path:
     return p
 
 
+def card_meta(card: dict | None) -> dict:
+    """Calibration-badge metadata for one saved card (or None): whether it is
+    calibrated, when ("YYYY-MM-DD HH:MM"), its age in whole days, whether it
+    is stale (older than the TTL or from an old card version), and the overall
+    score. An absent card yields the all-empty/zero form."""
+    if not isinstance(card, dict):
+        return {"calibrated": False, "calibrated_at": "",
+                "calibrated_age_days": 0, "calibrated_stale": False,
+                "card_score": 0.0, "card_choices": {}}
+    ts = float(card.get("ts", 0) or 0)
+    age_days = int((time.time() - ts) / 86400) if ts else 0
+    at = time.strftime("%Y-%m-%d %H:%M", time.localtime(ts)) if ts else ""
+    stale = age_days > CARD_TTL_DAYS or card.get("version") != CARD_VERSION
+    score = float((card.get("measured") or {}).get("overall") or 0.0)
+    return {"calibrated": True, "calibrated_at": at,
+            "calibrated_age_days": age_days, "calibrated_stale": stale,
+            "card_score": score, "card_choices": card.get("choices") or {}}
+
+
 def load(cfg, allow_stale: bool = False) -> dict | None:
     """The saved card for the configured server+model, or None when there is
     none, it is from an unknown card version, or it has expired. A v1 card is
@@ -88,7 +118,47 @@ def load(cfg, allow_stale: bool = False) -> dict | None:
     age_days = (time.time() - float(card.get("ts", 0))) / 86400
     if age_days > CARD_TTL_DAYS and not allow_stale:
         return None
+    card.update(card_meta(card))
     return card
+
+
+def profile_calibration(cfg) -> dict:
+    """Badge metadata for the configured server+model: `card_meta` plus
+    `is_hosted`. Reads the RAW card so an expired one still reports as stale
+    (not uncalibrated). Hosted-ness is endpoint-based, like specialist
+    routing, so a local GGUF with a hosted-sounding name stays local."""
+    from . import roles
+    card = _load_all().get(card_key(cfg))
+    meta = card_meta(card if isinstance(card, dict) else None)
+    try:
+        meta["is_hosted"] = roles.profile_is_hosted(
+            cfg, getattr(cfg, "active_profile", "") or "")
+    except Exception:
+        meta["is_hosted"] = False
+    return meta
+
+
+def calibration_map(cfg) -> dict:
+    """Per-profile badge metadata for every profile in `cfg.profiles`,
+    keyed by profile name: `card_meta` of the raw card plus endpoint-based
+    `is_hosted`. One card-file read for the whole map; shared by the GUI
+    state poll and the settings payload."""
+    from . import roles
+    cards = _load_all()
+    out: dict = {}
+    for name, body in (getattr(cfg, "profiles", None) or {}).items():
+        body = body if isinstance(body, dict) else {}
+        model = body.get("model") or getattr(cfg, "model", "")
+        base_url = body.get("base_url") or getattr(cfg, "base_url", "")
+        key = f"{(base_url or '').rstrip('/')}|{model}"
+        card = cards.get(key) if model else None
+        meta = card_meta(card if isinstance(card, dict) else None)
+        try:
+            meta["is_hosted"] = roles.profile_is_hosted(cfg, name)
+        except Exception:
+            meta["is_hosted"] = False
+        out[name] = meta
+    return out
 
 
 def apply(cfg) -> dict | None:
@@ -127,6 +197,23 @@ def apply(cfg) -> dict | None:
     if "specialties" in ch and unset("specialties"):
         cfg.specialties = tuple(str(t) for t in ch["specialties"])
         sources["specialties"] = "model card"
+    # Architecture-library sampler and window (local cards only): fill the
+    # settings the user left at their defaults. The temperature gates are
+    # strict; the context window also yields to an earlier auto-detected /
+    # auto-fit value, since those are machine-derived fallbacks rather than
+    # user choices. Budgets re-fit to the new window on the next run.
+    for name in ("temperature", "temperature_answer"):
+        if name in ch and unset(name):
+            setattr(cfg, name, ch[name])
+            sources[name] = "model card"
+    if "sampler" in ch and unset("sampler"):
+        cfg.sampler = dict(ch["sampler"])
+        sources["sampler"] = "model card"
+    if "context_tokens" in ch:
+        src = sources.get("context_tokens", "default")
+        if src == "default" or src.startswith(("auto-detected", "auto-fit")):
+            cfg.context_tokens = int(ch["context_tokens"])
+            sources["context_tokens"] = "model card"
     if "chars_per_token" in (card.get("measured") or {}):
         cfg._card_cpt = card["measured"]["chars_per_token"]
     # P3 (A4.1): the capability probe records whether the server serves
@@ -592,10 +679,10 @@ def _t_capabilities(client, cfg) -> dict:
 
 # ------------------------------------------------------- specialty tagging
 # Specialist routing (TECHNIQUES.md #50) needs to know what each profile's
-# model is good at. Two cheap signals, combined: the model's NAME (families
-# advertise their specialty) and three micro-probes -- one tiny call each,
-# thinking off, small caps, well under three seconds total on a local box.
-# An explicit `specialties = [...]` in the config always beats both.
+# model is good at. Cheap signals, combined: the model's NAME (families
+# advertise their specialty), the architecture library's recommended tags,
+# and six micro-probes -- one tiny call each, thinking off, small caps.
+# An explicit `specialties = [...]` in the config always beats all of them.
 
 _SPECIALTY_THRESHOLD = 0.67
 
@@ -709,19 +796,151 @@ def _t_translation(client, cfg) -> tuple[float, list[str]]:
         ["translation probe: placeholders or Spanish wording lost"]
 
 
-def specialty_tags_from_measurements(model_id: str, measured: dict) -> list[str]:
-    """Combine name heuristics with the micro-probe scores and the harness
-    skills: edit_format AND tool_choice >= 0.75 earn coding+testing_qa, a
-    weak edit_format (< 0.5) strips coding again. `general` drops out as
-    soon as any specific tag is earned. Canonical order."""
+# A four-user fixture graded with the stdlib sqlite3 engine: the model writes
+# one SELECT, we run it and compare the rows. ana=110 and cy=200 clear the
+# >100 threshold; bo=100 and di=10 do not.
+_SQL_USERS = [(1, "ana"), (2, "bo"), (3, "cy"), (4, "di")]
+_SQL_ORDERS = [(1, 60), (1, 50), (2, 100), (3, 200), (4, 10)]
+_SQL_EXPECTED = [("ana", 110), ("cy", 200)]
+
+
+def _extract_sql(text: str) -> str:
+    """The SQL statement from a reply: drop a code fence, cut at the first
+    semicolon, trim."""
+    t = (text or "").strip()
+    m = re.search(r"```(?:sql)?\s*(.*?)```", t, re.DOTALL | re.IGNORECASE)
+    if m:
+        t = m.group(1).strip()
+    return t.split(";", 1)[0].strip()
+
+
+def _grade_sql(sql: str) -> bool:
+    """Run `sql` against the in-memory fixture; True only when it returns
+    exactly the expected rows."""
+    import sqlite3
+    if not sql:
+        return False
+    try:
+        con = sqlite3.connect(":memory:")
+        try:
+            con.execute("CREATE TABLE users (id INTEGER, name TEXT)")
+            con.execute("CREATE TABLE orders (user_id INTEGER, amount INTEGER)")
+            con.executemany("INSERT INTO users VALUES (?, ?)", _SQL_USERS)
+            con.executemany("INSERT INTO orders VALUES (?, ?)", _SQL_ORDERS)
+            rows = [tuple(r) for r in con.execute(sql).fetchall()]
+        finally:
+            con.close()
+    except Exception:
+        return False
+    return rows == _SQL_EXPECTED
+
+
+def _t_sql_data(client, cfg) -> tuple[float, list[str]]:
+    """Write one SQLite join+aggregate query; graded by executing it against
+    a tiny fixture, so only a correct query scores."""
+    try:
+        reply = client.chat(
+            [{"role": "user", "content":
+              "Write one SQLite SELECT statement. Tables: users(id, name) "
+              "and orders(user_id, amount). Return each user's name and the "
+              "total of their order amounts, only for users whose total is "
+              "greater than 100, ordered by name. Reply with the SQL only, "
+              "no prose."}],
+            max_tokens=200, disable_thinking=True)
+    except LLMError as e:
+        return 0.0, [f"sql probe call failed: {str(e)[:60]}"]
+    if _grade_sql(_extract_sql(reply or "")):
+        return 1.0, []
+    return 0.0, ["sql probe: query did not return the expected rows"]
+
+
+def _t_testing_qa(client, cfg) -> tuple[float, list[str]]:
+    """Name the exception an empty-list average raises, as one JSON object:
+    the discipline of writing a test that pins the exact failure."""
+    try:
+        reply = client.chat(
+            [{"role": "user", "content":
+              "A function avg(values) returns sum(values) / len(values). "
+              "What exception does avg([]) raise? Reply with one JSON object "
+              'only, no prose: {"empty_raises": "<ExceptionName>"}.'}],
+            max_tokens=120, disable_thinking=True)
+    except LLMError as e:
+        return 0.0, [f"testing_qa probe call failed: {str(e)[:60]}"]
+    m = re.search(r"\{.*\}", reply or "", re.DOTALL)
+    if m:
+        try:
+            obj = json.loads(m.group(0))
+        except ValueError:
+            obj = None
+        if isinstance(obj, dict) and obj.get("empty_raises") == "ZeroDivisionError":
+            return 1.0, []
+    return 0.0, ["testing_qa probe: did not name ZeroDivisionError"]
+
+
+def _grade_plan(steps) -> bool:
+    """True for a 3-string plan ordered parser -> cli -> tests, tests last."""
+    if not isinstance(steps, list) or len(steps) != 3 \
+            or not all(isinstance(s, str) for s in steps):
+        return False
+    low = [s.lower() for s in steps]
+
+    def first(word: str):
+        for i, s in enumerate(low):
+            if word in s:
+                return i
+        return None
+
+    p, c, t = first("parser"), first("cli"), first("test")
+    return p is not None and c is not None and t is not None \
+        and p < c < t and t == 2
+
+
+def _t_orchestrator_plan(client, cfg) -> tuple[float, list[str]]:
+    """Emit a 3-step JSON plan for a CLI calculator in dependency order
+    (parser, CLI wiring, tests last): the shape of orchestrator work."""
+    try:
+        reply = client.chat(
+            [{"role": "user", "content":
+              "Plan building a small CLI calculator in exactly 3 steps. "
+              "Reply with one JSON array of 3 short step-title strings, no "
+              "prose. Order them so the parser comes first, the CLI wiring "
+              "second, and the tests last."}],
+            max_tokens=200, disable_thinking=True)
+    except LLMError as e:
+        return 0.0, [f"orchestrator probe call failed: {str(e)[:60]}"]
+    m = re.search(r"\[.*\]", reply or "", re.DOTALL)
+    steps = None
+    if m:
+        try:
+            steps = json.loads(m.group(0))
+        except ValueError:
+            steps = None
+    if _grade_plan(steps):
+        return 1.0, []
+    return 0.0, ["orchestrator probe: plan was not 3 ordered steps "
+                 "(parser, cli, tests last)"]
+
+
+def specialty_tags_from_measurements(model_id: str, measured: dict,
+                                     arch_tags=()) -> list[str]:
+    """Combine name heuristics, the architecture library's recommended tags,
+    the micro-probe scores and the harness skills: edit_format AND
+    tool_choice >= 0.75 earn coding+testing_qa, a weak edit_format (< 0.5)
+    strips coding again. `general` drops out as soon as any specific tag is
+    earned. Canonical order."""
     from .config import SPECIALTIES
     tags = set(infer_name_specialties(model_id))
+    tags.update(str(t) for t in (arch_tags or ()))
     if measured.get("svg_ui", 0.0) >= _SPECIALTY_THRESHOLD:
         tags.update(("frontend_ui", "3d_graphics_svg"))
     if measured.get("math_algo", 0.0) >= _SPECIALTY_THRESHOLD:
         tags.add("math_algorithms")
     if measured.get("translation", 0.0) >= _SPECIALTY_THRESHOLD:
         tags.add("translation_i18n")
+    if measured.get("sql_data", 0.0) >= _SPECIALTY_THRESHOLD:
+        tags.add("sql_data")
+    if measured.get("testing_qa", 0.0) >= _SPECIALTY_THRESHOLD:
+        tags.add("testing_qa")
     ed = measured.get("edit_format", 0.0)
     if ed >= 0.75 and measured.get("tool_choice", 0.0) >= 0.75:
         tags.update(("coding", "testing_qa"))
@@ -803,7 +1022,7 @@ def choose(measured: dict, hosted: bool) -> dict:
     # weaker models do better on one change per context window
     ch["plan_threshold"] = 2 if overall < 0.55 else 3 if overall < 0.8 else 0
     # Specialty tags for specialist routing, computed by calibrate() from
-    # the name heuristics + the three micro-probes.
+    # the name heuristics, the architecture library and the micro-probes.
     if measured.get("specialties"):
         ch["specialties"] = list(measured["specialties"])
     return ch
@@ -868,6 +1087,25 @@ def calibrate(client, cfg, verbose: bool = True, quick: bool = False,
     if repeats > 1:
         say(f"  ({repeats} repeats per probe; recording the mean and spread)")
 
+    # Server metadata once, up front: it caps the architecture library's
+    # recommended window and feeds the size/context fields below. A fake or
+    # unreachable client simply yields {} (best-effort, never fatal).
+    try:
+        info = client.model_info() or {}
+    except Exception:
+        info = {}
+    hosted = is_hosted(cfg)
+    # The base-architecture recommendation applies to LOCAL models only; a
+    # hosted API keeps its provider-table defaults.
+    arch = None if hosted else arch_defaults.match_arch(cfg.model)
+    arch_ctx = 0
+    if arch is not None:
+        arch_ctx = arch_defaults.arch_context_tokens(
+            arch, info, int(getattr(cfg, "vram_gb", 0) or 0),
+            int(info.get("size_bytes") or 0))
+        say(f"  architecture     {arch['family']} "
+            f"(recommended window {arch_ctx:,})")
+
     cols, n = _repeat(_t_tool_choice, repeats, client, cfg)
     _store(measured, "tool_choice", cols[0])
     _store(measured, "json_ok", cols[1])
@@ -912,15 +1150,20 @@ def calibrate(client, cfg, verbose: bool = True, quick: bool = False,
     _store(measured, "edit_format_anchor", cols[0])
     notes += [f"edit-anchor: {x}" for x in n[:3]]
     say(f"  edit format, anchor-first  {measured['edit_format_anchor']:>4.0%}")
-    # Specialty micro-probes: three tiny calls, run ONCE (not repeated) so
-    # they stay under ~3s total; the tags ride on the card for routing.
+    # Specialty micro-probes: six tiny calls, run ONCE (not repeated) so they
+    # stay cheap; the tags ride on the card for routing. The architecture
+    # library's recommended tags join the name heuristics and probe scores.
     for probe, key in ((_t_svg_ui, "svg_ui"), (_t_math_algo, "math_algo"),
-                       (_t_translation, "translation")):
+                       (_t_translation, "translation"),
+                       (_t_sql_data, "sql_data"),
+                       (_t_testing_qa, "testing_qa"),
+                       (_t_orchestrator_plan, "orchestrator_plan")):
         score, pn = probe(client, cfg)
         measured[key] = round(score, 2)
         notes += pn
-    measured["specialties"] = specialty_tags_from_measurements(cfg.model,
-                                                               measured)
+    measured["specialties"] = specialty_tags_from_measurements(
+        cfg.model, measured,
+        arch_tags=arch["specialties"] if arch is not None else ())
     say("  specialties      " + ", ".join(measured["specialties"]))
     cols, n = _repeat(_t_instructions, repeats, client, cfg)
     _store(measured, "instructions", cols[0])
@@ -940,11 +1183,34 @@ def calibrate(client, cfg, verbose: bool = True, quick: bool = False,
     notes += n
     say(f"  thinking A/B     on: {measured['thinking_on_ok']:.0%} usable, "
         f"off: {measured['thinking_off_ok']:.0%} usable")
+    final_ctx = arch_ctx
     if not quick:
-        cols, n = _repeat(_t_needle, repeats, client, cfg)
-        _store(measured, "needle", cols[0])
-        notes += n
-        say(f"  long context     {measured['needle']:>4.0%}")
+        # The needle runs at the architecture's recommended window; a miss
+        # steps the window down (16384, then 8192) and re-measures, so the
+        # card records a context the model can actually hold. The config's
+        # own window is restored afterwards either way.
+        saved_ctx = int(getattr(cfg, "context_tokens", 8192) or 8192)
+        try:
+            window = arch_ctx if arch is not None else saved_ctx
+            while True:
+                if arch is not None:
+                    cfg.context_tokens = window
+                cols, n = _repeat(_t_needle, repeats, client, cfg)
+                _store(measured, "needle", cols[0])
+                notes += n
+                say(f"  long context     {measured['needle']:>4.0%} "
+                    f"(window {window:,})")
+                if arch is None or measured["needle"] >= 1.0:
+                    break
+                nxt = arch_defaults.needle_step_down(window)
+                if nxt is None:
+                    break
+                say(f"  long context     needle missed at {window:,}; "
+                    f"retrying at {nxt:,}")
+                window = nxt
+            final_ctx = window
+        finally:
+            cfg.context_tokens = saved_ctx
         caps = _t_capabilities(client, cfg)
         measured.update({f"cap_{k}": v for k, v in caps.items()})
         say("  capabilities     " + ", ".join(
@@ -953,10 +1219,6 @@ def calibrate(client, cfg, verbose: bool = True, quick: bool = False,
     else:
         measured["needle"] = 1.0
     # Size and context are metadata, not probes: a --quick card carries them too.
-    try:
-        info = client.model_info() or {}
-    except Exception:
-        info = {}
     if info.get("size_bytes"):
         measured["size_bytes"] = int(info["size_bytes"])
     if info.get("context_length"):
@@ -970,7 +1232,15 @@ def calibrate(client, cfg, verbose: bool = True, quick: bool = False,
     gen_secs = after.get("seconds", 0.0) - before.get("seconds", 0.0)
     if gen_secs:
         measured["tok_per_s"] = round(comp_tokens / gen_secs, 1)
-    choices = choose(measured, is_hosted(cfg))
+    choices = choose(measured, hosted)
+    if arch is not None:
+        # The architecture library's recommended sampler and window join the
+        # measured choices; `apply()` only fills settings left at defaults.
+        choices["arch_family"] = arch["family"]
+        choices["temperature"] = arch["temperature"]
+        choices["temperature_answer"] = arch["temperature_answer"]
+        choices["sampler"] = dict(arch["sampler"])
+        choices["context_tokens"] = final_ctx
     card = {"version": CARD_VERSION, "key": card_key(cfg), "ts": time.time(),
             "model": cfg.model, "url": cfg.base_url, "measured": measured,
             "choices": choices, "notes": notes[:12], "repeats": repeats,

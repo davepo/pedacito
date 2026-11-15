@@ -3320,6 +3320,9 @@ def _specialist_route(root, cfg, client, agent, idx, task, is_repair=False):
         if new_client is client:
             return client, agent
         model = str(getattr(new_client.cfg, "model", "") or "")
+        role = getattr(new_client, "active_model_role", None)
+        if isinstance(role, dict):
+            role["specialty"] = str(tag or "")
         print(f"\n[specialist router: switching worker to profile '{name}' "
               f"({model}) for specialty '{tag}']", file=sys.stderr)
         workspace.log_event(root, f"specialist router: profile '{name}' "

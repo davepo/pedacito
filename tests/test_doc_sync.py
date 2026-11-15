@@ -12,7 +12,10 @@ The docs and the built-in `how` index must keep pace with the code:
   Scout + Architect pairing form, the Project ▾ upkeep dialogs) are
   documented in the user-facing docs and in the how-cards;
 * the specialist auto-routing pass (--auto-route, the ✦ Auto-route
-  topbar toggle, the specialist-routing how-card) stays documented.
+  topbar toggle, the specialist-routing how-card) stays documented;
+* the calibration/telemetry pass (calibrate --all, the hosted lockout,
+  the architecture library, the telemetry ribbon and GUI footer) stays
+  documented.
 """
 from __future__ import annotations
 
@@ -121,6 +124,11 @@ FEATURE_NEEDLES = [
     ("Create starter Scout & pair…", "Auto-Tune dual-GPU pairing"),
     ("--auto-route", "specialist auto-routing flag"),
     ("✦ Auto-route", "Auto-route topbar toggle"),
+    ("calibrate --all", "calibrate --all batch"),
+    ("Calibrate All Local Models", "Calibrate All menu item"),
+    ("provider-table defaults", "hosted calibration lockout"),
+    ("six micro-probes", "the six specialty micro-probes"),
+    ("show_telemetry", "telemetry ribbon setting"),
 ] + [(label, "Project ▾ upkeep dialog") for label in PROJECT_MENU_LABELS]
 
 
@@ -165,6 +173,16 @@ def test_how_cards_cover_the_new_features():
     assert "[specialty: TAG]" in spec_steps
     assert "auto_route_specialties" in specialist["settings"]
     assert "specialties" in specialist["settings"]
+    cal = cards["calibrate"]
+    assert "--all" in cal["usage"]
+    assert any(f["flag"] == "--all" for f in cal["flags"])
+    assert any(f["flag"] == "-y, --yes" for f in cal["flags"])
+    cal_steps = " ".join(topics["calibrate-model"]["steps"])
+    assert "Calibrate All Local Models" in cal_steps
+    assert "provider-table defaults" in topics["calibrate-model"]["summary"]
+    tele = topics["live-telemetry"]
+    assert "show_telemetry" in tele["settings"]
+    assert "█" in " ".join(tele["steps"])      # the ribbon example
 
 
 def test_how_topic_references_resolve():
@@ -183,6 +201,8 @@ def test_how_topic_references_resolve():
     ("how do I pair a scout with the architect?", "scout-model"),
     ("how do I reset the project state?", "project-upkeep"),
     ("how do I route tasks to specialist profiles?", "specialist-routing"),
+    ("how do I see tokens per second in the gui?", "live-telemetry"),
+    ("how do I calibrate all my local models?", "calibrate-model"),
 ])
 def test_new_topics_are_retrievable(question, topic):
     ids = [m["id"] for m in how_index.search(question)["gui"]]

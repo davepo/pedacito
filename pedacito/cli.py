@@ -29,6 +29,7 @@ import os
 import sys
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 from . import config
 from . import config_editor
@@ -36,6 +37,7 @@ from . import discovery
 from . import events as events_mod
 from . import hooks as hooks_mod
 from . import index as index_mod
+from . import llm as llm_mod
 from . import loop
 from . import modelcard
 from . import profiles as profiles_mod
@@ -598,6 +600,16 @@ def _chat_command(line: str, args, cfg, ref) -> bool:
         print(f"  window  : {cfg.context_tokens:,} tokens "
               f"(map budget {cfg.flat_map_token_budget:,}, gathered source "
               f"{cfg.max_gathered_chars:,} chars)", file=sys.stderr)
+        c = ref["client"]
+        if hasattr(c, "telemetry"):
+            t = c.telemetry()
+            print(f"  context : {_ascii_bar(t['context_utilization_pct'])} "
+                  f"{t['context_utilization_pct']}% "
+                  f"({t['last_prompt_tokens']:,}/{t['context_tokens']:,})",
+                  file=sys.stderr)
+            print(f"  speed   : {t['last_tok_per_s']:.1f} tok/s last turn, "
+                  f"{t['avg_tok_per_s']:.1f} tok/s session avg",
+                  file=sys.stderr)
         card = getattr(cfg, "_card", None)
         print(f"  card    : {'calibrated ' + format(card['measured'].get('overall', '?')) if card else 'none (run `pedacito calibrate`)'}",
               file=sys.stderr)
@@ -609,6 +621,13 @@ def _chat_command(line: str, args, cfg, ref) -> bool:
     if cmd == "cost":
         c = ref["client"]
         print("  " + _usage_line(c), file=sys.stderr)
+        if hasattr(c, "telemetry"):
+            t = c.telemetry()
+            print(f"  context : {_ascii_bar(t['context_utilization_pct'])} "
+                  f"{t['context_utilization_pct']}% "
+                  f"({t['last_prompt_tokens']:,}/{t['context_tokens']:,})"
+                  f"  |  speed: {t['last_tok_per_s']:.1f} tok/s last, "
+                  f"{t['avg_tok_per_s']:.1f} tok/s avg", file=sys.stderr)
         for site, row in sorted(c.stats.get("by_site", {}).items()):
             print(f"    {site:<12} {row['calls']:>3} calls  "
                   f"{row['prompt_tokens']:>8,} in  "
@@ -705,6 +724,48 @@ def _usage_line(client) -> str:
         bits.append(f"${s['cost']:.4f}")
     bits.append(f"{s['seconds']:.0f}s")
     return "[" + ", ".join(bits) + "]"
+
+
+def _ascii_bar(pct: float, width: int = 10) -> str:
+    """ASCII context-utilization bar for `/status` and rpc: [####------]."""
+    filled = max(0, min(width, int(round(float(pct) / 100 * width))))
+    return "[" + "#" * filled + "-" * (width - filled) + "]"
+
+
+def _telemetry_ribbon(client) -> str:
+    """The one-line stderr ribbon printed after each task: context bar,
+    turn tokens, generation speed, session cache hit."""
+    t = client.telemetry()
+    pct = t["context_utilization_pct"]
+    filled = max(0, min(10, int(round(pct / 10))))
+    bar = "\u2588" * filled + "\u2591" * (10 - filled)
+    return (f"[telemetry | ctx: {bar} {pct:.0f}% "
+            f"({t['last_prompt_tokens']:,}/{t['context_tokens']:,}) | turn: "
+            f"{t['last_prompt_tokens']:,} in / "
+            f"{t['last_completion_tokens']:,} out | "
+            f"{t['last_tok_per_s']:.1f} tok/s | "
+            f"cache: {t['cache_hit_pct']:.0f}%]")
+
+
+def _print_telemetry_ribbon(args, locals_ref: dict) -> None:
+    """Print the ribbon unless the user turned it off (`show_telemetry`)
+    or the transport is machine-facing (--jsonl / rpc). Never raises:
+    telemetry must not break a finished task."""
+    try:
+        cfg = locals_ref.get("cfg")
+        client = locals_ref.get("client")
+        if cfg is None or client is None:
+            return
+        if not getattr(cfg, "show_telemetry", True):
+            return
+        if getattr(args, "jsonl", False) or getattr(args, "rpc", False) \
+                or getattr(args, "cmd", "") == "rpc":
+            return
+        if not hasattr(client, "telemetry"):
+            return
+        print(_telemetry_ribbon(client), file=sys.stderr)
+    except Exception:
+        pass
 
 
 def _confirm_plan(plan_path) -> bool:
@@ -1038,6 +1099,12 @@ def _light_config(args) -> Config:
 def _cmd_calibrate(args, cfg) -> int:
     """`pedacito calibrate`: run the scripted mini-suite against the configured
     model and save its model card."""
+    if getattr(args, "all", False):
+        return _calibrate_all(args)
+    if not llm_mod._is_local_server(cfg):
+        print(modelcard.hosted_calibration_error(
+            cfg.active_profile or "(default)", cfg.model), file=sys.stderr)
+        return 2
     existing = modelcard.load(cfg)
     if existing and not args.recalibrate:
         print(modelcard.render(existing))
@@ -1054,6 +1121,71 @@ def _cmd_calibrate(args, cfg) -> int:
     print(f"\nSaved to {path}. Settings you left at their defaults now follow "
           "the card (prompt pack, answer mode, verifier, best-of-N); explicit "
           "config values still win.")
+    return 0
+
+
+def _calibrate_all(args) -> int:
+    """`pedacito calibrate --all`: every LOCAL profile in turn. Hosted
+    profiles are skipped (provider-table defaults), fresh cards are skipped
+    unless --recalibrate, each card is saved as soon as it finishes, and the
+    model is unloaded between profiles so one card's VRAM fits the next."""
+    base = _light_config(args)
+    all_names = list(base.profiles or {})
+    names = [n for n in all_names
+             if not roles_mod.profile_is_hosted(base, n)]
+    skipped_hosted = len(all_names) - len(names)
+    if skipped_hosted:
+        print(f"Skipping {skipped_hosted} hosted profile(s): hosted provider "
+              "models use provider-table defaults automatically.",
+              file=sys.stderr)
+    todo: list[tuple[str, Config]] = []
+    for n in names:
+        cfg = load_config(root=_root(args),
+                          explicit=getattr(args, "config", None),
+                          profile=n, require_hardware=False,
+                          warn_budgets=False)
+        if modelcard.load(cfg) and not getattr(args, "recalibrate", False):
+            continue
+        todo.append((n, cfg))
+    if not todo:
+        print("No local model profiles need calibration"
+              + (" (all fresh cards exist; pass --recalibrate to measure "
+                 "again)" if names else "") + ".")
+        return 0
+    if not getattr(args, "yes", False) and sys.stdin.isatty():
+        prompt = (f"Calibrate {len(todo)} local model profile(s) "
+                  f"({', '.join(n for n, _ in todo)})? This loads each model "
+                  "in turn and may take several minutes. [y/N]")
+        ans = input(prompt + " ")
+        if ans.strip().lower() not in ("y", "yes"):
+            print("Cancelled.")
+            return 0
+    done = 0
+    try:
+        for n, cfg in todo:
+            print(f"\n=== calibrating profile '{n}' ({cfg.model}) ===",
+                  file=sys.stderr)
+            client = LLMClient(cfg)
+            try:
+                client.check()
+                client.warmup()
+                card = modelcard.calibrate(
+                    client, cfg, verbose=True, quick=args.quick,
+                    repeats=getattr(args, "repeats", None))
+                path = modelcard.save_card(card)
+                done += 1
+                score = (card.get("measured") or {}).get("overall")
+                print(f"Saved card for '{n}'"
+                      + (f" (score {score:.2f})" if score is not None else "")
+                      + f" to {path}")
+            finally:
+                llm_mod.unload_model(client)
+    except KeyboardInterrupt:
+        print(f"\nInterrupted: kept the {done} card(s) finished so far.")
+    except LLMError as e:
+        print(f"\nCalibration stopped: {e}", file=sys.stderr)
+        return 1
+    print(f"\nCalibrated {done} of {len(todo)} local profile(s).")
     return 0
 
 
@@ -1255,18 +1387,6 @@ def _scan_hosted(args, urls: list[str]) -> list[dict]:
     return out
 
 
-def _hosted_calibrate(models: list[dict], quick: bool) -> None:
-    """Calibration for hosted models is opt-in: print a token estimate and
-    confirm before spending."""
-    est = len(models) * (60_000 if quick else 120_000)
-    print(f"\nCalibrating hosted model(s) costs roughly {est:,} tokens.")
-    ans = _ask("Proceed with hosted calibration? [y/N]", "n")
-    if ans.lower() not in ("y", "yes"):
-        print("Skipped hosted calibration.")
-        return
-    _scan_calibrate(models, quick=quick)
-
-
 def _to_scan_entry(m: dict) -> dict:
     """The keys `upsert_profiles` writes for one scanned model."""
     entry: dict = {"model": m["id"], "base_url": m["base_url"],
@@ -1333,16 +1453,21 @@ def _cmd_models_scan(args) -> int:
         _write_config_backup(target, new)
         print(f"Wrote {len(entries)} profile(s) to {target}")
 
-    # Calibration: local defaults to quick; hosted is opt-in (only when
-    # --calibrate is given explicitly).
+    # Calibration: local only. Hosted provider models are never calibrated
+    # -- they use the provider-table defaults automatically.
     calibrate = getattr(args, "calibrate", None)
     if calibrate != "none":
-        local = [m for m in selected if m.get("tier") != "hosted"]
-        hosted_models = [m for m in selected if m.get("tier") == "hosted"]
+        local = [m for m in selected
+                 if llm_mod._is_local_server(
+                     SimpleNamespace(base_url=m.get("base_url", "")))]
+        hosted_models = [m for m in selected if m not in local]
         if local:
             _scan_calibrate(local, quick=(calibrate or "quick") != "full")
-        if hosted_models and calibrate:
-            _hosted_calibrate(hosted_models, quick=calibrate != "full")
+        if hosted_models:
+            print(f"\nSkipped calibration for {len(hosted_models)} hosted "
+                  "model(s): calibration is only for local models; hosted "
+                  "provider models use provider-table defaults "
+                  "automatically.", file=sys.stderr)
     return 0
 
 
@@ -2125,7 +2250,7 @@ def _cmd_rpc(args, cfg, client, idx, root, locals_ref, run, save_checkpoint,
         now = locals_ref["idx"]
         s = c.stats or {}
         roles = dict(cur.roles or {})
-        return {
+        out = {
             "profile": cur.active_profile or "(none)",
             "model": cur.model,
             "tier": cur.active_tier,
@@ -2141,6 +2266,13 @@ def _cmd_rpc(args, cfg, client, idx, root, locals_ref, run, save_checkpoint,
                          "cached_tokens", "cost", "seconds")},
             "cache_hit": events_mod.cache_hit_ratio(s),
         }
+        if hasattr(c, "telemetry"):
+            t = c.telemetry()
+            out["context_utilization_pct"] = t["context_utilization_pct"]
+            out["context_bar"] = _ascii_bar(t["context_utilization_pct"])
+            out["last_tok_per_s"] = t["last_tok_per_s"]
+            out["avg_tok_per_s"] = t["avg_tok_per_s"]
+        return out
 
     def _rpc_switch(ref, kind):
         if kind == "scout":
@@ -2532,6 +2664,12 @@ def build_parser() -> argparse.ArgumentParser:
                           "model card that tunes the defaults")
     p_cal.add_argument("--recalibrate", action="store_true",
                        help="measure again even if a fresh card exists")
+    p_cal.add_argument("--all", action="store_true",
+                       help="calibrate every LOCAL profile in turn (hosted "
+                            "profiles are skipped; fresh cards are skipped "
+                            "unless --recalibrate)")
+    p_cal.add_argument("-y", "--yes", action="store_true",
+                       help="skip the confirmation prompt (with --all)")
     p_cal.add_argument("--quick", action="store_true",
                        help="skip the long-context and capability probes")
     p_cal.add_argument("--repeats", type=int, default=None,
@@ -3206,7 +3344,7 @@ def _main(argv=None) -> int:
         if args.cmd == "explain":
             return _cmd_explain(args, client, agent)
 
-        def run(task: str, apply=None, refine=None, plan=None):
+        def _run_task_inner(task: str, apply=None, refine=None, plan=None):
             """Execute one task end to end through the shared inner loop.
             `apply`/`refine`/`plan` override the command-line defaults (the
             `rpc` requests carry them per turn); None means "use the args"."""
@@ -3254,6 +3392,15 @@ def _main(argv=None) -> int:
             agent.index = idx
             locals_ref["idx"] = idx
             return tr
+
+        def run(task: str, apply=None, refine=None, plan=None):
+            """One task end to end, then the telemetry ribbon on stderr
+            (config `show_telemetry`; suppressed in --jsonl / rpc modes)."""
+            try:
+                return _run_task_inner(task, apply=apply, refine=refine,
+                                       plan=plan)
+            finally:
+                _print_telemetry_ribbon(args, locals_ref)
 
         def save_checkpoint(task: str):
             """Persist what the last task actually said, for --continue/--resume."""

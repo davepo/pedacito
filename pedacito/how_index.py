@@ -460,20 +460,34 @@ CLI_COMMANDS = [
     },
     {
         "name": "calibrate",
-        "usage": "pedacito calibrate [--quick] [--recalibrate] [--repeats N]",
+        "usage": "pedacito calibrate [--quick] [--recalibrate] [--repeats N] "
+                 "| --all [-y]",
         "summary": "Measure the configured model (tool choice, edit format, "
-                   "honesty, long context) and save a model card that tunes the "
-                   "defaults.",
-        "keywords": ["model card", "measure", "benchmark", "tune", "quick"],
+                   "honesty, long context, six specialty micro-probes) and save "
+                   "a model card that tunes the defaults, including the "
+                   "architecture library's recommended sampler and window for "
+                   "local models. Hosted provider models are refused: they use "
+                   "provider-table defaults automatically. --all walks every "
+                   "local profile in turn.",
+        "keywords": ["model card", "measure", "benchmark", "tune", "quick",
+                     "calibrate all", "hosted", "architecture defaults",
+                     "calibration badge", "stale"],
         "examples": [
             "pedacito calibrate",
             "pedacito calibrate --quick",
             "pedacito calibrate --recalibrate --repeats 3",
             "pedacito calibrate --profile big",
+            "pedacito calibrate --all -y",
         ],
         "flags": [
             {"flag": "--recalibrate",
              "help": "measure again even if a fresh card exists"},
+            {"flag": "--all",
+             "help": "calibrate every LOCAL profile in turn (hosted profiles "
+                     "are skipped; fresh cards are skipped unless "
+                     "--recalibrate)"},
+            {"flag": "-y, --yes",
+             "help": "skip the confirmation prompt (with --all)"},
             {"flag": "--quick",
              "help": "skip the long-context and capability probes"},
             {"flag": "--repeats N",
@@ -491,7 +505,8 @@ CLI_COMMANDS = [
                  "[--calibrate none|quick|full]",
         "summary": "Discover local model servers and/or probe a hosted API, "
                    "write one profile per selected model, then optionally "
-                   "calibrate them.",
+                   "calibrate the local ones. Hosted imports are never "
+                   "calibrated: they use provider-table defaults automatically.",
         "keywords": ["import models", "model discovery", "profiles", "scan",
                      "lm studio", "ollama", "hosted"],
         "examples": [
@@ -511,7 +526,8 @@ CLI_COMMANDS = [
             {"flag": "--all", "help": "include models the server has not loaded"},
             {"flag": "--loaded", "help": "only models the server reports loaded"},
             {"flag": "--calibrate none|quick|full",
-             "help": "calibrate selected models (local default: quick)"},
+             "help": "calibrate selected LOCAL models (default: quick); "
+                     "hosted models are skipped with a note"},
             {"flag": "-y, --yes",
              "help": "non-interactive: select all matching models"},
             {"flag": "--vram-gb GB",
@@ -1297,17 +1313,66 @@ GUI_TOPICS = [
         "id": "calibrate-model",
         "title": "Calibrate a model / save its model card",
         "summary": "Calibrate from the topbar or Settings; progress streams to "
-                   "the Logs tab.",
+                   "the Logs tab. Every profile carries a calibration badge "
+                   "(✓ Calibrated, ⚠ stale, ○ Not calibrated, ☁ Hosted API). "
+                   "Calibration is only for local models: hosted buttons are "
+                   "disabled because hosted models use provider-table defaults "
+                   "automatically. Calibrate All Local Models… measures the "
+                   "whole local pool as one job.",
         "steps": [
-            "Topbar Row 2 → Calibrate (uses the active profile)",
-            "Or ⚙ Settings → Model discovery / Profiles → Calibrate",
+            "Topbar Row 2 → Calibrate (uses the active profile); the badge "
+            "beside the picker shows its calibration state, and clicking "
+            "○ Not calibrated opens Settings → Model discovery, where the "
+            "Calibrate buttons live",
+            "Or ⚙ Settings → Model discovery / Profiles → Calibrate; the "
+            "profile row says Calibrated on DATE (score, specialties) or Not "
+            "calibrated yet",
+            "Project ▾ → Calibrate All Local Models… (or the button in Model "
+            "discovery): confirm the listed local profiles, optionally tick "
+            "Re-calibrate models that already have a fresh card, and watch "
+            "the rows tick off as each card is saved; hosted profiles are "
+            "excluded",
             "Watch Bottom-right Workspace → Logs; the model card tunes the "
-            "remaining defaults",
+            "remaining defaults, including the architecture library's "
+            "recommended temperature, sampler and context window for local "
+            "models",
         ],
         "keywords": ["calibrate", "model card", "measure model", "tune model",
-                     "benchmark"],
+                     "benchmark", "calibrate all", "calibration badge",
+                     "stale card", "hosted calibration", "architecture "
+                     "defaults"],
         "settings": ["use_model_card"],
         "cli": ["calibrate", "models scan", "profiles"],
+    },
+    {
+        "id": "live-telemetry",
+        "title": "Read the live telemetry footer / CLI ribbon",
+        "summary": "A footer under the GUI workspace tracks the context window, "
+                   "turn and session tokens, generation speed, KV cache hits "
+                   "and folds while a task runs; the CLI prints the same "
+                   "numbers as a one-line ribbon on stderr after each task.",
+        "steps": [
+            "GUI: the telemetry footer shows Context: used / window (percent) "
+            "with a green (<70%), amber (70-85%) or red (>85%) bar, turn and "
+            "session tokens, tok/s (last call and session average), KV cache "
+            "hit %, fold count, and the active model with its specialty plus "
+            "the orchestrator profile",
+            "Click the footer to expand the drawer with the full per-call "
+            "numbers; while a specialist holds the card the last-call numbers "
+            "are the specialist's",
+            "CLI: after each task a ribbon prints on stderr, e.g. [telemetry "
+            "| ctx: ████░░░░░░ 38% (6,210/16,384) | turn: 6,210 in / 185 out "
+            "| 43.5 tok/s | cache: 82%]; show_telemetry = false hides it, and "
+            "--jsonl / rpc modes never print it",
+            "In chat, /status and /cost show the same context bar and speeds; "
+            "the rpc status reply carries context_utilization_pct, "
+            "last_tok_per_s and avg_tok_per_s",
+        ],
+        "keywords": ["telemetry", "context bar", "context usage", "tokens per "
+                     "second", "tok/s", "speed", "cache hit", "footer",
+                     "ribbon", "folds", "show_telemetry"],
+        "settings": ["show_telemetry", "context_tokens"],
+        "cli": ["ask", "chat", "rpc"],
     },
     {
         "id": "tune-small-models",
@@ -1850,9 +1915,9 @@ GUI_TOPICS = [
             "Tag your profiles: ⚙ Settings → Profiles → [Select Profile] → "
             "Connection & Capabilities → specialties → toggle the tag pills "
             "(or type a custom lowercase slug and press Enter)",
-            "Or let pedacito calibrate detect the tags: three micro-probes "
-            "(SVG/UI, math, translation) plus the model name; the card shows "
-            "them under specialties",
+            "Or let pedacito calibrate detect the tags: six micro-probes "
+            "(SVG/UI, math, translation, SQL, testing, planning) plus the "
+            "model name; the card shows them under specialties",
             "Turn routing on: the ✦ Auto-route checkbox in the topbar, or "
             "auto_route_specialties = true in config.toml, or --auto-route "
             "per run (--no-auto-route overrides the config)",

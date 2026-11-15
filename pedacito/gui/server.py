@@ -1127,7 +1127,8 @@ def _models_import(q, body):
 @post("/api/models/calibrate")
 def _models_calibrate(q, body):
     """Run `pedacito calibrate`'s suite against one profile as a background
-    job (it takes about a minute; progress streams to the terminal pane)."""
+    job (it takes about a minute; progress streams to the terminal pane).
+    Hosted provider profiles are refused: calibration is local-only."""
     name = str(body.get("profile", "")).strip()
     mode = "full" if str(body.get("mode", "")) == "full" else "quick"
     if not name:
@@ -1137,9 +1138,29 @@ def _models_calibrate(q, body):
         hint = ", ".join(known) if known else "none configured yet"
         return 400, {"ok": False,
                      "detail": f"no profile named {name!r} (profiles: {hint})"}
+    hosted_err = settings_api.hosted_profile_error(name)
+    if hosted_err:
+        return 400, {"ok": False, "detail": hosted_err}
     job = jobs.spawn("calibrate", f"calibrating profile {name}",
                      lambda j: jobs.run_calibrate(j, {"profile": name,
                                                       "mode": mode}))
+    return _busy_reply(job)
+
+
+# The settings modal posts the shorter spelling; same handler.
+POST_ROUTES["/api/calibrate"] = _models_calibrate
+
+
+@post("/api/calibrate/all")
+def _calibrate_all(q, body):
+    """Calibrate every LOCAL profile in turn as one background job. Hosted
+    profiles are excluded; `recalibrate` re-measures fresh cards too. The
+    modal polls /api/state's `calibration` map for per-profile progress."""
+    recalibrate = bool(body.get("recalibrate"))
+    mode = "full" if str(body.get("mode", "")) == "full" else "quick"
+    job = jobs.spawn("calibrate", "calibrating all local profiles",
+                     lambda j: jobs.run_calibrate_all(
+                         j, {"recalibrate": recalibrate, "mode": mode}))
     return _busy_reply(job)
 
 

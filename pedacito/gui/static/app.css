@@ -1041,3 +1041,64 @@ details pre { background: var(--code-bg); border: 1px solid var(--line); border-
   white-space: pre-wrap; word-break: break-all; max-height: 200px;
   overflow: auto; user-select: text; }
 .perm-risk { margin: 0; color: var(--muted); font-size: 11.5px; }
+
+/* ------------------------------------ calibration badges & telemetry footer -- */
+/* Toolbar badge for the active profile's model card (green fresh / amber
+   stale / muted absent / cloud hosted). Colors ride the theme's own
+   ok/warn/muted tokens so every theme stays legible. */
+.cal-chip { cursor: pointer; }
+.cal-chip:hover { border-color: var(--line2); }
+.cal-chip.ok b { color: var(--ok); }
+.cal-chip.ok { border-color: color-mix(in srgb, var(--ok) 45%, var(--line)); }
+.cal-chip.stale b { color: var(--warn); }
+.cal-chip.stale { border-color: color-mix(in srgb, var(--warn) 45%, var(--line)); }
+.cal-chip.none b { color: var(--muted); font-weight: 500; }
+.cal-chip.hosted { cursor: default; }
+.cal-chip.hosted b { color: var(--muted); font-weight: 500; }
+.tag.hosted { color: var(--muted); border-style: dashed; }
+/* Settings -> Profiles: the calibration line under each profile row. */
+.prow-cal { font-size: 11.5px; max-width: 100%; }
+.prow-cal.ok { color: var(--ok); }
+.prow-cal.stale { color: var(--warn); }
+
+/* The live telemetry footer: one dense row under the workspace, click to
+   unfold the drawer. The context bar fills green -> amber -> red. */
+#telemetryBar { flex: none; border-top: 1px solid var(--line);
+  background: var(--panel); font-size: 11.5px; }
+.tele-row { display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
+  padding: 4px 12px; cursor: pointer; user-select: none; }
+.tele-row:hover { background: var(--panel2); }
+.tele-item { white-space: nowrap; color: var(--muted); }
+.tele-item b { color: var(--text); font-weight: 600; }
+.tele-caret { margin-left: auto; font-style: normal; color: var(--muted); flex: none; }
+.tele-bar { flex: none; width: 72px; height: 8px; border-radius: 999px;
+  border: 1px solid var(--line2); background: var(--panel2); overflow: hidden; }
+.tele-bar i { display: block; height: 100%; border-radius: 999px;
+  background: var(--ok); transition: width .4s ease; }
+.tele-bar.warm i { background: var(--warn); }
+.tele-bar.hot i { background: var(--err); }
+.tele-drawer { border-bottom: 1px solid var(--line); background: var(--panel2);
+  padding: 8px 12px; }
+.tele-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(210px, 1fr));
+  gap: 6px 18px; }
+.tele-grid > div { display: flex; flex-direction: column; min-width: 0; }
+.tele-grid span { font-size: 10.5px; text-transform: uppercase; letter-spacing: .4px; }
+.tele-grid b { font-weight: 600; font-size: 12px; overflow: hidden;
+  text-overflow: ellipsis; white-space: nowrap; }
+@media (max-width: 980px) {
+  .tele-item:nth-child(n+6) { display: none; }   /* keep the row to one line on phones */
+  .tele-row { flex-wrap: nowrap; overflow-x: auto; }
+}
+
+/* Calibrate All modal: one row per local profile, a state pill that ticks
+   to a green check as each card lands. */
+.calall-list { display: flex; flex-direction: column; gap: 4px;
+  max-height: 260px; overflow-y: auto; }
+.calall-row { display: flex; align-items: center; gap: 10px; padding: 5px 9px;
+  border: 1px solid var(--line); border-radius: 6px; font-size: 12.5px; }
+.calall-row.done { border-color: color-mix(in srgb, var(--ok) 50%, var(--line)); }
+.calall-name { flex: none; max-width: 160px; overflow: hidden; text-overflow: ellipsis; }
+.calall-row .ellip { flex: 1 1 auto; min-width: 0; }
+.calall-state { flex: none; font-size: 11.5px; }
+.calall-state.ok { color: var(--ok); font-weight: 600; }
+.calall-progress { margin-top: 8px; }

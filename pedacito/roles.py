@@ -91,6 +91,8 @@ def client_for(cfg, role: str, default):
               file=sys.stderr)
         cache[role] = None
         return default
+    client.active_model_role = {"profile": str(name), "model": new_cfg.model,
+                                "role": str(role), "specialty": ""}
     # one usage ledger: the dedicated client reports into the worker's sink
     if hasattr(default, "on_call"):
         client.on_call = default.on_call
@@ -130,6 +132,8 @@ def scout_client(cfg, default):
               "profile", file=sys.stderr)
         cache[name] = None
         return default
+    client.active_model_role = {"profile": str(name), "model": new_cfg.model,
+                                "role": "scout", "specialty": ""}
     # one usage ledger: the scout reports into the worker's sink
     if hasattr(default, "on_call"):
         client.on_call = default.on_call
@@ -399,6 +403,8 @@ def switch_specialist_client(cfg, default, name: str):
                   f"({str(e).splitlines()[0][:100]}); using the worker model",
                   file=sys.stderr)
             return default
+    client.active_model_role = {"profile": str(name), "model": new_cfg.model,
+                                "role": "specialist", "specialty": ""}
     if handoff:
         cfg.__dict__["_specialist_on_worker_server"] = name
         client._swap_info = {"unloaded": unloaded, "loaded": new_cfg.model,

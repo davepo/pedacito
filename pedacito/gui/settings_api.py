@@ -93,15 +93,14 @@ def file_info(which: str) -> dict:
     return info
 
 
-def _specialty_hints(cfg, out: dict) -> dict:
-    """Per-profile specialty tags for the profile form: what the config sets
-    explicitly, and what the model card / name heuristics detect. Profiles
-    that only exist in a file (no project open) are covered too: their file
-    bodies are layered over the live config's profiles for the detection,
-    so a file-only profile is tagged by ITS model, not the default one."""
+def _merged_profile_view(cfg, out: dict):
+    """The live config with every file-only profile layered in: the file
+    bodies (project over user, per key) merged over the live profiles, so a
+    profile that only exists in a file is judged by ITS model/base_url, not
+    the default one. Shared by the specialty hints, the calibration badges,
+    and the hosted-model checks."""
     import copy
 
-    from .. import roles
     base = cfg if cfg is not None else config_mod.Config()
     file_profiles: dict = {}
     for which in ("user", "project"):      # project layer wins, per key
@@ -113,8 +112,16 @@ def _specialty_hints(cfg, out: dict) -> dict:
                      for n in names}
     for n, b in file_profiles.items():
         view.profiles[n].update(b)
+    return view
+
+
+def _specialty_hints(cfg, out: dict) -> dict:
+    """Per-profile specialty tags for the profile form: what the config sets
+    explicitly, and what the model card / name heuristics detect."""
+    from .. import roles
+    view = _merged_profile_view(cfg, out)
     hints: dict = {}
-    for name in sorted(names):
+    for name in sorted(view.profiles):
         body = view.profiles.get(name) or {}
         try:
             explicit = list(config_mod._coerce("specialties",
@@ -127,6 +134,39 @@ def _specialty_hints(cfg, out: dict) -> dict:
             detected = []
         hints[name] = {"explicit": explicit, "detected": detected}
     return hints
+
+
+def _calibration_map(cfg, out: dict) -> dict:
+    """Per-profile calibration badges for Settings -> Profiles: the raw
+    card's stamp (an expired card still reports stale) plus endpoint-based
+    hosted-ness, so the row can say `Calibrated on ... (score: ...)` or
+    `Not calibrated yet`, and hosted rows show the cloud badge instead."""
+    from .. import modelcard
+    view = _merged_profile_view(cfg, out)
+    cal = modelcard.calibration_map(view)
+    for name, meta in cal.items():
+        body = view.profiles.get(name) or {}
+        meta["specialties"] = [str(t) for t in (body.get("specialties") or [])]
+    return cal
+
+
+def hosted_profile_error(name: str) -> str:
+    """The exact refusal text when `name` is a hosted provider profile,
+    else "". Shared by the calibrate endpoint and the batch job so CLI and
+    GUI refuse identically. The merged view covers file-only profiles."""
+    from .. import modelcard, roles
+    cfg = STATE.cfg
+    view = _merged_profile_view(cfg, {"user": file_info("user"),
+                                      "project": file_info("project")})
+    try:
+        hosted = roles.profile_is_hosted(view, name)
+    except Exception:
+        hosted = False
+    if not hosted:
+        return ""
+    body = view.profiles.get(name) or {}
+    model = body.get("model") or view.model or ""
+    return modelcard.hosted_calibration_error(name, model)
 
 
 def payload() -> dict:
@@ -149,6 +189,7 @@ def payload() -> dict:
                            for t, m in config_mod.SPECIALTIES.items()],
     }
     out["specialty_hints"] = _specialty_hints(cfg, out)
+    out["calibration"] = _calibration_map(cfg, out)
     return out
 
 

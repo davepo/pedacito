@@ -92,7 +92,11 @@ block it. Pedacito asks how much GPU memory the
 machine running the server has, in GB. Then tick only the models you want. The
 name box lets you rename a profile. Click **Import Selected**. Each model becomes a
 profile named after it, and one is set as the default. Each profile in the list
-has a **Calibrate** button that runs a quick measurement of that model.
+has a **Calibrate** button that runs a quick measurement of that model, and a
+calibration badge: ✓ Calibrated (with the date), ⚠ stale, or ○ Not calibrated.
+Hosted provider profiles show ☁ Hosted instead, and their Calibrate button is
+disabled — calibration is only for local models; hosted models use
+provider-table defaults automatically.
 
 **From a hosted provider.** In the same tab, click **+ Add Hosted Provider**.
 Choose a preset: **Claude (Anthropic)**, **ChatGPT (OpenAI)**, **DeepSeek**,
@@ -102,7 +106,14 @@ lists its models, and imports the ones you tick, one profile each.
 
 Back in the top bar, the profile picker switches the model for the next task.
 Its status light shows whether the server is reachable. The **no-think** or
-**thinking** chip next to it shows whether reasoning is allowed for that profile.
+**thinking** chip next to it shows whether reasoning is allowed for that profile,
+and a calibration badge shows whether the active model has a fresh model card.
+
+To measure every local model at once, open **Project ▾ → Calibrate All Local
+Models…** (also in **Settings → Model discovery**). A confirmation lists the
+local profiles — hosted ones are excluded — and one background job then loads
+and measures each in turn, ticking them off as their cards are saved. Tick
+**Re-calibrate models that already have a fresh card** to redo them all.
 
 ### A3. Run the Auto-Tune wizard
 
@@ -265,10 +276,15 @@ the checked IP so a second DNS answer cannot swap it mid-request.
 - **MCP servers:** **⚙ Settings → MCP Servers** adds and manages named
   `[mcp_servers.<name>]` tool servers (test, enable, trust, delete) without
   hand-editing TOML.
-- **Project ▾** also holds the upkeep dialogs: **Memory & repo lessons…**,
-  **Background servers…**, **Run project checks…**, **Prune old
-  sessions/backups…** and **Reset project state…** (prune and reset preview
-  before they write).
+- **Project ▾** also holds **Calibrate All Local Models…** and the upkeep
+  dialogs: **Memory & repo lessons…**, **Background servers…**, **Run project
+  checks…**, **Prune old sessions/backups…** and **Reset project state…**
+  (prune and reset preview before they write).
+- **Telemetry footer:** under the workspace, a live bar shows the context
+  window in use (green under 70%, amber to 85%, red above), turn and session
+  tokens, generation speed, KV cache hits and folds, and the active model.
+  Click it to expand the full drawer. The CLI prints the same numbers as a
+  one-line ribbon after each task; `show_telemetry = false` hides it.
 - **Themes:** pick a color scheme from the theme menu in the top bar. There are
   nine. The choice is saved to your config as `gui_theme`.
 - **Attach** a text file, or drag it into the chat box, to use it as the task, a
@@ -342,8 +358,8 @@ layout", the reasoner takes "optimize the sorting algorithm".
    3D / graphics / SVG, Math / algorithms, Testing / QA, SQL / data,
    Translation / i18n), or type a custom lowercase tag and press Enter. Leave it
    empty to let the model card decide: `pedacito calibrate` detects tags from the
-   model name plus three micro-probes (SVG, math, translation), and the form shows
-   what it detected.
+   model name, the architecture library, and six micro-probes (SVG, math,
+   translation, SQL, testing/QA, planning), and the form shows what it detected.
 2. Turn routing on with the **✦ Auto-route** checkbox in the topbar (or
    `auto_route_specialties = true` in the config).
 
@@ -413,9 +429,10 @@ per model, and measures each one with a quick calibration. The calibration
 probes tool choice, JSON output, edit format, resistance to planted prompt
 injections, honesty about what was read, long-context retrieval, and whether
 hidden reasoning eats the answer budget. It also detects the model's
-**specialties** (name heuristics plus three micro-probes: SVG/UI, math,
-translation) for specialist routing — see A18. The result is saved as a model
-card.
+**specialties** (name heuristics, the architecture library, plus six
+micro-probes: SVG/UI, math, translation, SQL, testing/QA, planning) for
+specialist routing — see A18. The result is saved as a model card. Hosted
+imports are never calibrated: they use provider-table defaults automatically.
 
 Useful flags:
 
@@ -432,9 +449,17 @@ pedacito models scan --url https://api.deepseek.com/v1 \
   --api-key-env DEEPSEEK_API_KEY --match 'deepseek-chat'
 ```
 
-To measure a model again later, run `pedacito calibrate`. To see the results side
+To measure a model again later, run `pedacito calibrate`. To measure every local
+profile in one go, run `pedacito calibrate --all` — it asks first (`-y` skips the
+question), loads each model in turn, unloads it before the next, and skips
+profiles with a fresh card unless you add `--recalibrate`. Hosted profiles are
+refused: calibration is only for local models. To see the results side
 by side, run `pedacito profiles`, or `pedacito profiles --recommend` for suggested
 roles.
+
+After each task the CLI prints a one-line telemetry ribbon on stderr — context
+bar, turn tokens, speed, cache hit. Set `show_telemetry = false` to hide it;
+`--jsonl` and rpc modes never print it.
 
 ### B3. See what would be indexed
 
@@ -768,7 +793,7 @@ only the map is stale.
 | `pedacito config --doctor` | Also probe structured output, context window, tokenizer, and sandbox |
 | `pedacito config --upgrade [--dry-run]` | Add newly documented options to your config, commented out; `--dry-run` only lists them |
 | `pedacito models scan` | Find local servers or a hosted API, pick models, write profiles, measure them |
-| `pedacito calibrate` | Measure the model and save a model card that tunes defaults |
+| `pedacito calibrate` | Measure the model and save a model card that tunes defaults; `--all` walks every local profile (hosted models are refused) |
 | `pedacito profiles [--recommend]` | List profiles and their scores; suggest roles |
 | `pedacito how "..."` | Ask how to use Pedacito. No project needed |
 | `pedacito files PROJ` | What would be indexed, and why. Free |

@@ -399,11 +399,16 @@ def run_calibrate(job: Job, opts: dict) -> None:
     """`pedacito calibrate` for one profile: run the scripted mini-suite
     against its model and save the measured card. The suite's progress prints
     to stdout, which the GUI tee streams into the terminal pane; the score
-    lands in the chat when it finishes."""
+    lands in the chat when it finishes. Hosted profiles are refused (the
+    endpoint checks too; this keeps a direct job call honest)."""
     from .. import config as config_mod
     from .. import modelcard
+    from . import settings_api
     name = str(opts.get("profile") or "").strip()
     quick = str(opts.get("mode") or "quick") != "full"
+    hosted_err = settings_api.hosted_profile_error(name) if name else ""
+    if hosted_err:
+        raise ConfigError(hosted_err)
     with STATE.lock:
         root = STATE.root
     cfg = config_mod.load(root=root, profile=name or None,
@@ -427,6 +432,73 @@ def run_calibrate(job: Job, opts: dict) -> None:
         f"overall score {m.get('overall', '?')} "
         f"in {card.get('seconds', '?')} s. Card saved to {path}."
         + (f" Capabilities: {caps}." if caps else ""), kind="calibrated")
+
+
+def run_calibrate_all(job: Job, opts: dict) -> None:
+    """`pedacito calibrate --all` for the GUI: every LOCAL profile in turn,
+    hosted profiles excluded, fresh cards skipped unless `recalibrate`.
+    Each card is saved as soon as it finishes and the model is unloaded
+    between profiles; `job.title` names the profile in flight so the modal
+    (polling /api/state) can show live progress, and the `calibration` map
+    marks each profile done."""
+    from .. import config as config_mod
+    from .. import llm as llm_mod
+    from .. import modelcard, roles
+    quick = str(opts.get("mode") or "quick") != "full"
+    recalibrate = bool(opts.get("recalibrate"))
+    with STATE.lock:
+        root = STATE.root
+    base = config_mod.load(root=root, require_hardware=False,
+                           warn_budgets=False)
+    names = [n for n in (base.profiles or {})
+             if not roles.profile_is_hosted(base, n)]
+    todo: list[tuple[str, object]] = []
+    for n in names:
+        cfg = config_mod.load(root=root, profile=n, require_hardware=False,
+                              warn_budgets=False)
+        if modelcard.load(cfg) and not recalibrate:
+            continue
+        todo.append((n, cfg))
+    if not todo:
+        STATE.add_message(
+            "system", "No local profiles need calibration"
+            + (" \u2014 every local profile already has a fresh card. Tick "
+               "\u201cRe-calibrate\u201d to measure again." if names else
+               " \u2014 no local profiles are configured (hosted provider "
+               "models use provider-table defaults)."), kind="calibrated")
+        return
+    STATE.add_message(
+        "system", f"Calibrating {len(todo)} local profile(s): "
+        f"{', '.join(n for n, _ in todo)}. Each model loads in turn; "
+        "progress streams to the TERMINAL tab.", kind="calibrating")
+    done = 0
+    try:
+        for n, cfg in todo:
+            if job.cancelled:
+                break
+            with STATE.lock:
+                job.title = (f"calibrating {n} "
+                             f"({done + 1}/{len(todo)})")
+            client = LLMClient(cfg)
+            try:
+                client.check(warn=False)
+                client.warmup()
+                card = modelcard.calibrate(client, cfg, verbose=True,
+                                           quick=quick)
+                path = modelcard.save_card(card)
+                done += 1
+                m = card.get("measured") or {}
+                STATE.add_message(
+                    "system", f"Calibration of '{n}' finished \u2014 "
+                    f"overall score {m.get('overall', '?')}. "
+                    f"Card saved to {path}.", kind="calibrated")
+            finally:
+                llm_mod.unload_model(client)
+    except KeyboardInterrupt:
+        pass                    # spawn's handler reports the stop
+    STATE.add_message(
+        "system", f"Calibrate-all finished: {done} of {len(todo)} local "
+        "profile(s) calibrated.", kind="calibrated")
 
 
 def run_benchmark(job: Job, opts: dict) -> None:

@@ -55,6 +55,10 @@ def list_profiles(cfg) -> list[dict]:
             "tier": body.get("tier") or _guess_tier(name, body) or "",
             "active": name == cfg.active_profile,
             "specialties": roles.specialties_for(cfg, name),
+            # Badge metadata: endpoint-based hosted-ness (routing's rule,
+            # not the name-heuristic tier) plus the raw card's calibration
+            # stamp, so an expired card still reads as stale, not absent.
+            "is_hosted": roles.profile_is_hosted(cfg, name),
         }
         key = f"{(base_url or '').rstrip('/')}|{model}"
         rep = reports.get(key) if model else None
@@ -84,6 +88,7 @@ def list_profiles(cfg) -> list[dict]:
             rec["size_bytes"] = None
             rec["age_days"] = None
             rec["status"] = "uncalibrated"
+        rec.update(modelcard.card_meta(card if isinstance(card, dict) else None))
         vram = body.get("vram_gb", getattr(cfg, "vram_gb", 0))
         if rec["size_bytes"] and vram and rec["tier"] != "hosted":
             rec["context_fits"] = hardware_context_tokens(

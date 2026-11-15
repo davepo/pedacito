@@ -640,7 +640,7 @@ class Config:
     # math_algorithms, testing_qa, sql_data, translation_i18n; custom
     # lowercase slugs ([a-z0-9_-]+) are allowed too. Empty = let the model
     # card detect them (`pedacito calibrate` combines name heuristics with
-    # three micro-probes); an explicit list always wins over the card. With
+    # six micro-probes); an explicit list always wins over the card. With
     # auto_route_specialties on, each task goes to the profile whose tags
     # best match it, at task boundaries only.
     specialties: tuple[str, ...] = ()
@@ -878,6 +878,9 @@ class Config:
     benchmarks_dir: str = ""
 
     # --- Telemetry and retention (local only) --------------------------------
+    # One-line telemetry ribbon on stderr after each task (context bar,
+    # turn tokens, speed, cache hit). Never shown in --jsonl / rpc modes.
+    show_telemetry: bool = True
     # One JSON line per significant action under .pedacito/events/.
     log_events: bool = True
     # `pedacito prune` defaults (0 = keep everything).
@@ -3048,8 +3051,9 @@ REFERENCE_TEMPLATE = TEMPLATE + '''
 # is good at. Canonical tags: general, coding, frontend_ui, 3d_graphics_svg,
 # math_algorithms, testing_qa, sql_data, translation_i18n; custom lowercase
 # slugs ([a-z0-9_-]+) work too. Empty = the model card detects them:
-# `pedacito calibrate` combines model-name heuristics with three micro-probes
-# (SVG/UI, math, translation) and saves the tags on the card. An explicit
+# `pedacito calibrate` combines model-name heuristics with six micro-probes
+# (SVG/UI, math, translation, SQL, testing, planning) and saves the tags on
+# the card. An explicit
 # list always wins over the card. auto_route_specialties = true (or
 # --auto-route) sends each task to the best-matching specialist profile at
 # task boundaries only -- never mid-gather, so the KV prefix cache survives
