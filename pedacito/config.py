@@ -1550,6 +1550,11 @@ def load(root: Path | None = None, explicit: Path | None = None,
                 f"provider table ({host or cfg.model}); "
                 "set tool_mode explicitly to override")
 
+    # Approximate list prices for known hosted endpoints, so cost reporting
+    # and --max-cost mean something without manual setup. Only defaults are
+    # filled; any explicit price_* wins. Local servers stay at 0.
+    fill_default_prices(cfg)
+
     if (remote or deepseek) and cfg.sources.get("json_mode") == "default":
         cfg.json_mode = "object"
         cfg._hosted_server = True
@@ -1597,7 +1602,52 @@ def load(root: Path | None = None, explicit: Path | None = None,
     if warn_budgets:
         for warning in budget_warnings(cfg):
             print(f"[config warning] {warning}", file=sys.stderr)
+        blind = cost_blind_warning(cfg)
+        if blind:
+            print(f"[config warning] {blind}", file=sys.stderr)
     return cfg
+
+
+_PRICE_FIELDS = ("price_input_per_mtok", "price_output_per_mtok",
+                 "price_cached_per_mtok", "price_cache_write_per_mtok")
+
+
+def fill_default_prices(cfg: Config) -> None:
+    """Fill the price_* fields from the provider price table for known hosted
+    endpoints (approximate USD list prices per million tokens). Only touched
+    when every price field is still at its built-in default and the endpoint
+    is remote; any explicit price wins, and local servers stay at 0."""
+    if any(cfg.sources.get(k, "default") != "default" for k in _PRICE_FIELDS):
+        return
+    if _hostname(cfg.base_url) in _LOCAL_HOSTS:
+        return
+    try:
+        from . import providers as providers_mod
+        prices = providers_mod.default_prices(cfg.base_url, cfg.model)
+    except Exception:
+        return
+    host = _hostname(cfg.base_url)
+    for key, value in prices.items():
+        setattr(cfg, key, float(value))
+        cfg.sources[key] = (
+            f"provider price table ({host or cfg.model}); "
+            "set price_* explicitly to override")
+
+
+def cost_blind_warning(cfg: Config) -> str:
+    """A max_cost budget with no prices can never trigger: every call
+    estimates $0. Name it instead of silently ignoring the budget. (Kept out
+    of budget_warnings, which early-returns for hosted APIs -- exactly where
+    cost budgets matter.)"""
+    if float(getattr(cfg, "max_cost", 0) or 0) <= 0:
+        return ""
+    if (float(getattr(cfg, "price_input_per_mtok", 0) or 0)
+            or float(getattr(cfg, "price_output_per_mtok", 0) or 0)):
+        return ""
+    return ("max_cost is set but price_input_per_mtok and "
+            "price_output_per_mtok are both 0: spend estimates stay $0 and "
+            "the budget can never trigger. Set the price_* fields (USD per "
+            "million tokens) for this model, or drop --max-cost.")
 
 
 def budget_warnings(cfg: Config) -> list[str]:

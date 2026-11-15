@@ -36,6 +36,7 @@ import time
 import uuid
 from ctypes import wintypes
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from . import browser, proc, safety
 from .index import state_dir
@@ -720,15 +721,71 @@ def stop(root, name: str) -> str:
     return f"stopped {rec.get('name')} (pid {pid})"
 
 
-def render_list(root) -> str:
-    """One line per registered process, or a hint when there are none."""
+_BASE_SUFFIX_RE = re.compile(r"-\d+$")
+
+
+def _proc_base_name(rec: dict) -> str:
+    """Registry name without the `-2`/`-3` collision suffix `_unique_name` adds."""
+    return _BASE_SUFFIX_RE.sub("", str(rec.get("name") or ""))
+
+
+_LOOPBACK_HOSTS = {"localhost", "127.0.0.1", "::1", "0.0.0.0"}
+
+
+def _url_key(url: str) -> tuple[str, int] | None:
+    try:
+        parts = urlsplit(url)
+    except ValueError:
+        return None
+    host = parts.hostname
+    if not host:
+        return None
+    # A restart may print a different loopback spelling of the same server.
+    if host in _LOOPBACK_HOSTS:
+        host = "localhost"
+    port = parts.port or (443 if parts.scheme == "https" else 80)
+    return (host, port)
+
+
+def _same_server(a: dict, b: dict) -> bool:
+    """Whether two registry records look like the same server: an identical
+    command, the same host:port URL, or the same base registry name."""
+    ca = " ".join(str(a.get("command") or "").split())
+    cb = " ".join(str(b.get("command") or "").split())
+    if ca and ca == cb:
+        return True
+    ka, kb = _url_key(str(a.get("url") or "")), _url_key(str(b.get("url") or ""))
+    if ka and ka == kb:
+        return True
+    na, nb = _proc_base_name(a), _proc_base_name(b)
+    return bool(na) and na == nb
+
+
+def render_list(root, all: bool = False) -> str:
+    """One line per registered process, or a hint when there are none.
+
+    A stopped entry that a newer running instance of the same server
+    supersedes is restart history, not live state: it is collapsed by
+    default and counted in a footer. `all=True` shows every record.
+    """
     recs = list_procs(root)
     if not recs:
         return ("No background processes. Start one with "
                 "`pedacito serve PROJECT -- COMMAND`.")
-    lines = []
+    running = [r for r in recs if r.get("status") == "running"]
+    lines, hidden = [], 0
     for rec in recs:
+        if (not all and rec.get("status") == "stopped"
+                and any(_same_server(rec, r)
+                        and float(r.get("started") or 0)
+                        >= float(rec.get("started") or 0)
+                        for r in running)):
+            hidden += 1
+            continue
         extra = f"  {rec['url']}" if rec.get("url") else ""
         lines.append(f"{rec.get('name'):<20} [{rec.get('status', '?')}] "
                      f"pid {rec.get('pid')}{extra}  {rec.get('command', '')}")
+    if hidden:
+        lines.append(f"+ {hidden} superseded stopped entry(s) hidden "
+                     "(use `pedacito procs --all` to show)")
     return "\n".join(lines)

@@ -294,24 +294,33 @@ def test_specialty_probes_survive_a_dead_server():
 
 def test_tags_from_measurements_combine_name_probes_and_harness_skills():
     f = modelcard.specialty_tags_from_measurements
-    # a plain name earns tags purely from the probes
+    # a plain name earns tags purely from the probes -- when the edit-skill
+    # gate passes (item 15: edit_format >= 0.65 AND tool_choice >= 0.5)
     assert f("mystery-7b", {"svg_ui": 1.0, "math_algo": 1.0,
-                            "translation": 1.0}) == \
+                            "translation": 1.0,
+                            "edit_format": 0.7, "tool_choice": 0.6}) == \
         ["frontend_ui", "3d_graphics_svg", "math_algorithms",
          "translation_i18n"]
+    # without measured edit skill the editing tags are gated away;
+    # translation is prose, not editing, and survives
+    assert f("mystery-7b", {"svg_ui": 1.0, "math_algo": 1.0,
+                            "translation": 1.0}) == ["translation_i18n"]
     # edit_format AND tool_choice >= 0.75 earn coding + testing_qa
     assert "coding" in f("mystery-7b", {"edit_format": 0.8,
                                         "tool_choice": 0.8})
     assert "coding" not in f("mystery-7b", {"edit_format": 0.8,
                                             "tool_choice": 0.6})
-    # a weak edit format strips coding even from a coder family
+    # a weak edit format strips the coder family's tags (item 15 gate)
     tags = f("qwen2.5-coder-14b", {"edit_format": 0.4})
-    assert "coding" not in tags and "testing_qa" in tags
+    assert "coding" not in tags and "testing_qa" not in tags
     # general drops out as soon as anything specific is earned
-    assert f("llama3.1-8b", {"math_algo": 1.0}) == ["math_algorithms"]
+    assert f("llama3.1-8b", {"math_algo": 1.0, "edit_format": 0.7,
+                             "tool_choice": 0.6}) == ["math_algorithms"]
     assert f("llama3.1-8b", {}) == ["general"]
     # below threshold: nothing earned
-    assert f("llama3.1-8b", {"svg_ui": 0.66, "math_algo": 0.5}) == ["general"]
+    assert f("llama3.1-8b", {"svg_ui": 0.66, "math_algo": 0.5,
+                             "edit_format": 0.7,
+                             "tool_choice": 0.6}) == ["general"]
 
 
 def test_calibrate_records_specialties_once(home):
@@ -323,9 +332,9 @@ def test_calibrate_records_specialties_once(home):
     m = card["measured"]
     assert m["svg_ui"] == 1.0 and m["math_algo"] == 1.0
     assert m["translation"] == 1.0
-    # the scripted client cannot edit: coding is stripped, probes still tag
-    assert m["specialties"] == ["frontend_ui", "3d_graphics_svg",
-                                "math_algorithms", "translation_i18n"]
+    # the scripted client cannot edit: the edit-skill gate (item 15) strips
+    # every editing tag; translation is prose and survives
+    assert m["specialties"] == ["translation_i18n"]
     assert card["choices"]["specialties"] == m["specialties"]
     # each micro-probe ran exactly ONCE (not repeated like the skill probes)
     assert len(probe.probe_calls("SVG image")) == 1
@@ -365,8 +374,14 @@ def test_detected_specialties_prefer_the_card_then_the_name(home):
     # no card: name heuristics stand in
     assert roles.detected_specialties(cfg, "coder") == ("coding",
                                                         "testing_qa")
-    _card("qwen2.5-coder-14b", specialties=["sql_data"])
-    assert roles.detected_specialties(cfg, "coder") == ("sql_data",)
+    card = _card("qwen2.5-coder-14b", specialties=["sql_data"])
+    # item 15: saved tags are re-derived under the edit-skill gate, so the
+    # card must carry the measurements that earn them
+    card["measured"].update({"edit_format": 0.9, "tool_choice": 0.9,
+                             "sql_data": 1.0})
+    modelcard.save_card(card)
+    assert roles.detected_specialties(cfg, "coder") == ("coding", "testing_qa",
+                                                        "sql_data")
     cfg.use_model_card = False
     assert roles.detected_specialties(cfg, "coder") == ("coding",
                                                         "testing_qa")

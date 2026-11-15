@@ -2581,8 +2581,18 @@ Rules:
   Reuse existing signatures from the repo snapshot verbatim.
 - requirements: numbered, concrete, testable behavioral rules. Every number,
   format, flag name, and default the idea implies must appear explicitly.
+  Only what the idea asks for: never invent domain restrictions (offline
+  only, no external libraries, a fixed canvas size, ...) the user did not
+  state.
 - edge_cases: the empty/missing/wrong-type/limit situations a test will force.
-- verification: the command(s) and the observable pass criteria.
+- verification: the command(s) and the observable pass criteria. The
+  context's TEST RUNNER line is detected from the repo -- use it verbatim;
+  never invent a different runner (no `npm test` when it says `node --test`).
+  When it says none detected, describe the observable check instead of
+  fabricating a command.
+- files: reuse the existing css/script/asset paths the snapshot and the
+  TOP-LEVEL ENTRIES line show -- link them, never plan a duplicate
+  stylesheet or script beside them.
 - Never write code bodies; never add options the idea did not ask for. Keep
   the whole spec under 45 lines."""
 
@@ -2709,6 +2719,7 @@ def _fallback_spec(prompt: str, snapshot: str, mode: str) -> dict:
     as the model path so downstream stages always get a structure."""
     first = next((ln.strip() for ln in prompt.splitlines() if ln.strip()), "")
     files: list[str] = []
+    runner = ""
     in_files = False
     for ln in snapshot.splitlines():
         s = ln.strip()
@@ -2716,8 +2727,18 @@ def _fallback_spec(prompt: str, snapshot: str, mode: str) -> dict:
             in_files = True
         elif s.startswith("OUTLINE"):
             in_files = False
+        elif s.startswith("TEST RUNNER:"):
+            runner = s[len("TEST RUNNER:"):].strip()
         elif in_files and s and not s.startswith("("):
             files.append(s)
+    if runner and runner != "(none detected)":
+        verification = (f"Run `{runner}` after the change and confirm every "
+                        "test passes, plus the objective's observable end "
+                        "state.")
+    else:
+        verification = ("Run the project's test suite (or import/run the "
+                        "entry point) after the change and confirm the "
+                        "objective's observable end state.")
     data = {
         "objective": (f"Deliver exactly this request, repo-aware: {first}"
                       if first else "Deliver the request stated below."),
@@ -2735,9 +2756,7 @@ def _fallback_spec(prompt: str, snapshot: str, mode: str) -> dict:
             "signature here before a later step calls it.",
         ],
         "edge_cases": [],
-        "verification": ("Run the project's test suite (or import/run the "
-                         "entry point) after the change and confirm the "
-                         "objective's observable end state."),
+        "verification": verification,
     }
     data["edge_cases"] = _edge_case_fallback(data)
     return data
@@ -2789,7 +2808,25 @@ def refine_prompt(prompt: str, root, cfg, llm_client,
         snap_lines.append(f"OUTLINE {rel}:")
         snap_lines += [f"  {s}" for s in sigs[:12]]
         outlined += 1
-    snapshot = "\n".join(snap_lines)[:6000]
+    # Facts the architect must not guess (item 12): the repo's real test
+    # runner and its top-level entries, so a web spec reuses the existing
+    # css/js instead of planning duplicates and verification names the
+    # runner that actually exists. First lines, so the cap cannot cut them.
+    try:
+        from . import testsel as testsel_mod
+        runner = testsel_mod.detect_test_command(root, cfg)
+    except Exception:
+        runner = ""
+    facts = ["TEST RUNNER: " + (runner or "(none detected)")]
+    try:
+        top = sorted(p.name + ("/" if p.is_dir() else "")
+                     for p in root.iterdir()
+                     if not p.name.startswith("."))[:40]
+    except OSError:
+        top = []
+    if top:
+        facts.append("TOP-LEVEL ENTRIES: " + ", ".join(top))
+    snapshot = "\n".join(facts + snap_lines)[:6000]
 
     # 2. one schema-constrained model call ----------------------------------
     data = None

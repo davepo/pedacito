@@ -178,7 +178,7 @@ commands. Run `pedacito <command> --help` for every flag.
 | `pedacito rpc [PROJ]` | JSONL-RPC over stdin/stdout for editors and other agents: one request per line, streamed events, steering, permission prompts, cancel -- index, profiles and session warm the whole time |
 | `pedacito how "..."` | Built-in help for the CLI, the GUI, and settings |
 | `pedacito restore PROJ` | Undo the last write |
-| `pedacito rename OLD NEW` | Multi-file symbol rename through the AST and the tokenizer, no model call. `--file` scopes it, `--strings` also renames whole-word string literals, `--apply` writes (default: diff preview) |
+| `pedacito rename OLD NEW` | Multi-file symbol rename through the AST and the tokenizer, no model call. `--file` scopes it, `--strings` also renames whole-word string literals, `--include-labels` only test-label strings, `--apply` writes (default: diff preview) |
 | `pedacito index`, `map`, `files`, `cost` | Build and inspect the index. These need no model call, except `index` summaries |
 | `pedacito eval` | Score the harness on fixture repositories. Use `--baseline` as a regression gate |
 | `pedacito bench [BENCHMARK\|all]` | Run the six-project diagnostic benchmark suite and hidden holdout rubric. `--list` and `--recent` need no model; `--json` and `--strict` fit CI |
@@ -635,7 +635,7 @@ do:
 | `rename` | `allow_write = true` | Mechanically rename one definition and its references in the files that import it (strings and comments untouched, every file re-parsed, snapshotted). Refuses a name defined in several places and lists the references it left alone. |
 | `undo` | `allow_write = true` (+ `backup`, on by default) | Self-recovery mid-task: reverts what this task's `write`/`append`/`move`/`delete` actions did so far (or just one of their files), pre-task snapshots come back, files the task created go away. |
 | `run` | `allow_shell = true` | Run one command (e.g. `pytest -q`), without a shell, so `&` and `nohup` are rejected and long-lived processes go to `serve`. A quiet GUI/server is stopped after `shell_idle_seconds`. |
-| `serve` | `allow_serve = true` | Start, list, log, or stop a background dev server. The registry and logs live under `.pedacito/procs/`; also `pedacito serve` / `pedacito procs`. |
+| `serve` | `allow_serve = true` | Start, list, log, or stop a background dev server. The registry and logs live under `.pedacito/procs/`; also `pedacito serve` / `pedacito procs`. The list collapses superseded stopped entries (restart history) behind a count; `procs --all` shows them. |
 | `diagnose` | `allow_shell = true` | Run the detected linter/type checker (`ruff`, `pyflakes`, `flake8`, `mypy`/`pyright` when configured, `npm lint`, `tsc`, `cargo check`, `go vet`, `rubocop`). Also available as `pedacito diagnose`. |
 | `lsp` | `allow_lsp = true` | Exact definition/references/hover/diagnostics through pyright/pylsp/typescript-language-server/rust-analyzer/gopls, or commands in `lsp_servers`. Also `pedacito lsp`. |
 | `screenshot` | `allow_screenshots = true` | Capture the screen as text: size, brightness, blank-screen verdict, OCR, optional `vision_model` description. Needs the `vision` extra. |
@@ -643,7 +643,7 @@ do:
 | `mcp` | `allow_mcp = true` + `mcp_servers = [...]` | Call tools, prompts (`prompt:server/name`), or resources (`resource:server/uri`) from MCP servers. The catalog shows arguments, calls are validated, one live session per server is kept warm, and a server that was down at startup is retried. |
 | `mcp_call` | `enable_mcp = true` + `[mcp_servers.<name>]` | Call a tool on a *named* MCP server. Only the up-to-four tools whose names and descriptions match the task are ever shown, the action itself appears only when one matches, and untrusted servers ask the permission broker per call. See [Named MCP servers](#named-mcp-servers). |
 | `task` | `allow_subagents = true` | Hand a bounded, read-only research question to a helper agent with a fresh context window; only a short digest comes back. Depth is capped (1 local, 2 hosted). |
-| `fetch` | `allow_fetch = true` + `fetch_allowed_hosts` | URL → readable text, host-allowlisted, size-capped, cached, labelled untrusted. Private/loopback addresses are refused, including public names that *resolve* to them; the connection is pinned to the checked IP. |
+| `fetch` | `allow_fetch = true` + `fetch_allowed_hosts` | URL → readable text, host-allowlisted, size-capped, cached, labelled untrusted. Private/loopback addresses are refused — including public names that *resolve* to them — unless you name them explicitly, e.g. `fetch_allowed_hosts = ["127.0.0.1", "localhost"]` to read your own dev server; the connection is pinned to the checked IP. |
 | semantic search | `semantic_search = true` | A `grep` with no hits falls back to the server's `/v1/embeddings` endpoint. |
 
 `run` and the two MCP actions execute model-chosen commands in your project.
@@ -1016,7 +1016,7 @@ pedacito eval --out new.json --baseline base.json         # CI A/B regression ga
 pedacito eval --repeats 3 --seed 1 --out new.json   # 3 seeded runs: pass counts, mean ± spread
 pedacito new app -t "..." --design           # interfaces/data/tests before code
 pedacito serve --root PROJ --name web -- npm run dev
-pedacito procs --root PROJ [logs|stop NAME]
+pedacito procs --root PROJ [logs|stop NAME] [--all]
 pedacito lsp --root PROJ --file src/a.py --line 12 --op definition
 ```
 
@@ -1248,12 +1248,14 @@ failure instead of being silently dropped.
 
 A rename does not need a model, so Pedacito does it mechanically: every exact
 identifier is rewritten, and comments are left alone. String literals are
-left alone too unless you pass `--strings`.
+left alone too unless you pass `--strings` (all of them) or `--include-labels`
+(test-label strings only).
 
 ```bash
 pedacito rename apply_discount discounted_price                       # preview the diffs
 pedacito rename apply_discount discounted_price --file pkg/core.py    # that file and its importers
 pedacito rename apply_discount discounted_price --strings             # also whole-word string literals
+pedacito rename toggleStep flipStep --include-labels                  # also test/it/describe/suite labels only
 pedacito rename apply_discount discounted_price --apply               # write it
 ```
 
@@ -1267,7 +1269,9 @@ change and snapshots the originals first, so `pedacito restore` undoes it.
   string or comment that merely contains the old name is never touched by
   default; `--strings` additionally renames whole-word occurrences inside
   string literals (test labels, docs that name the API), while comments stay
-  untouched.
+  untouched. `--include-labels` is the narrow middle option: only string
+  literals that are test labels (the first argument of `test`/`it`/`describe`/
+  `suite`, `.only`/`.skip` included) move; every other string stays.
 - **All or nothing.** Every changed file must pass the syntax check before any
   file is written. If one would break, nothing is written.
 - **Name-based, on purpose.** A parameter in an unrelated function that shares the

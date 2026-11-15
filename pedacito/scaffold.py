@@ -289,8 +289,8 @@ class Plan:
     files: list[PlannedFile] = field(default_factory=list)
     spec: Spec | None = None
     # The spec explicitly forbids files beyond the named list ("no README or
-    # extra files", "exactly these 10 files"): apply_skeleton then adds no
-    # starter README/.gitignore/packaging (BUG-210).
+    # extra files", "exactly these 10 files", "only create main.js"):
+    # apply_skeleton then adds no starter README/.gitignore/packaging (BUG-210).
     no_extras: bool = False
 
     @property
@@ -333,17 +333,27 @@ def _safe_rel(path: str, root: Path) -> str | None:
 
 
 _NO_EXTRAS_RE = re.compile(
-    r"\b(?:no|without|omit|never add|don't add|do not add)\s+(?:a\s+|any\s+)?"
-    r"(?:readme|extra files?|additional files?|other files?|bonus files?)\b"
+    r"\b(?:no|without|omit|avoid|never|don't|do not)\s+"
+    r"(?:(?:add|adding|create|creating|make|making|generate|include|write|"
+    r"ship|produce)\s+)?"
+    r"(?:a\s+|an\s+|any\s+|the\s+)?"
+    r"(?:readme|extra files?|additional files?|other files?|bonus files?|"
+    r"unnecessary files?)\b"
     r"|\b(?:exactly|only)\s+(?:these|the following|those)\s+(?:\d+\s+)?files?\b"
-    r"|\bexactly\s+\d+\s+files?\b",
+    r"|\bexactly\s+\d+\s+files?\b"
+    # Imperative "only create X" / "create only X": a constraint on the file
+    # set. The bare infinitive matters -- "only creates" (descriptive) does
+    # not match, so a spec describing a function is not mistaken for one.
+    r"|\bonly\s+(?:create|make|generate|write|add|include)\b"
+    r"|\bcreate\s+only\b",
     re.IGNORECASE)
 
 
 def _spec_forbids_extras(text: str) -> bool:
     """True when the spec explicitly forbids files beyond the named list
-    ("Do not add README or extra files", "Create EXACTLY these 10 files"):
-    the starter README/.gitignore/packaging must then stay out (BUG-210)."""
+    ("Do not add README or extra files", "Create EXACTLY these 10 files",
+    "do not create README", "only create main.js"): the starter
+    README/.gitignore/packaging must then stay out (BUG-210)."""
     return bool(_NO_EXTRAS_RE.search(text or ""))
 
 
@@ -1259,10 +1269,11 @@ def fix_web_contracts(client, cfg, idx: Index, plan: Plan, backup_dir,
     binding or import that cannot link); this loop hands the model exactly
     those lines plus the current HTML/JS and asks for small blocks.
 
-    Returns (files fixed, contract errors still standing). The count is of
-    distinct files whose edits landed and were not reverted, not of accepted
-    block rows: a degenerate reply repeating one no-op block must not inflate
-    it (BUG-201)."""
+    Returns (violations resolved, contract errors still standing). The count
+    is of distinct contract violations this loop actually cleared, not of
+    accepted block rows nor of files touched: a degenerate reply repeating one
+    no-op block must not inflate it, and a block that lands but resolves
+    nothing is not a fix (BUG-201)."""
     from .agent import ANSWER_SYSTEM
 
     fixed = 0
@@ -1340,8 +1351,10 @@ def fix_web_contracts(client, cfg, idx: Index, plan: Plan, backup_dir,
             reverted.add(r.file)
         if reverted:
             errors = web_contract_errors(idx.root)
-        landed = [r for r in ok if r.file not in reverted]
-        fixed += len({r.file for r in landed})
+        # Count the violations this round actually cleared (net of reverts),
+        # not the files touched: a block that lands but resolves nothing is
+        # not a fix, and two blocks in one file clearing one violation are one.
+        fixed += len(before - set(errors))
         # BUG-201: no contract error was resolved this round -- another pass
         # would repeat the same blocks. Stop instead of spinning.
         if not (before - set(errors)):
@@ -1589,7 +1602,8 @@ def _web_contract_gate(root: Path, cfg, client, idx, plan: Plan,
         n, web_errors = fix_web_contracts(client, cfg, idx, plan,
                                           backup_dir, verbose=verbose)
         if verbose and n:
-            print(f"  {n} contract fix file(s) applied", file=sys.stderr)
+            print(f"  {n} frontend contract violation(s) resolved",
+                  file=sys.stderr)
     # The rest of the webcheck vocabulary (classic/duplicate globals,
     # bare specifiers, member calls on page globals) stays a notice board:
     # heuristic checks do not get to veto a build they might get wrong.

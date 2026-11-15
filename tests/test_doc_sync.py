@@ -116,6 +116,8 @@ def test_readme_names_every_bundled_skill():
 # markdown do not matter.
 FEATURE_NEEDLES = [
     ("--strings", "rename --strings"),
+    ("--include-labels", "rename --include-labels"),
+    ("superseded stopped", "procs collapsed restart history"),
     ("--upgrade", "config --upgrade"),
     ("--dry-run", "config --upgrade --dry-run"),
     ("***REDACTED***", "masked Raw file tab"),
@@ -147,11 +149,29 @@ def test_model_guide_documents_the_pairing_paths(needle):
     assert needle in _norm(MODEL_GUIDE)
 
 
+@pytest.mark.parametrize("needle", [
+    "edit_format >= 0.65",
+    "4B limits",
+    "does not reserve VRAM",
+])
+def test_model_guide_documents_the_hardening_notes(needle):
+    assert needle in _norm(MODEL_GUIDE)
+
+
+def test_readme_fetch_row_names_the_loopback_allowlist():
+    assert 'fetch_allowed_hosts = ["127.0.0.1", "localhost"]' in _norm(README)
+
+
 def test_how_cards_cover_the_new_features():
     cards = {c["name"]: c for c in how_index.CLI_COMMANDS}
     rename = cards["rename"]
     assert "--strings" in rename["usage"]
     assert any(f["flag"] == "--strings" for f in rename["flags"])
+    assert "--include-labels" in rename["usage"]
+    assert any(f["flag"] == "--include-labels" for f in rename["flags"])
+    procs = cards["procs"]
+    assert "--all" in procs["usage"]
+    assert any(f["flag"] == "--all" for f in procs["flags"])
 
     topics = {t["id"]: t for t in how_index.GUI_TOPICS}
     mcp_steps = " ".join(topics["named-mcp-servers"]["steps"])

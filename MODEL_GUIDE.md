@@ -67,6 +67,11 @@ overhead.
   programs running.
 - **Expect:** a smaller map and less source per lookup, so tasks should be narrow.
   Name the file in the task.
+- **4B limits:** structured tool calls and multi-file edits are the first things
+  to degrade at 4B — expect malformed steps, and edits that fix one file while
+  breaking another. Keep each task to one file and one concern, and prefer the
+  scout split (a 4B doing lookups, a larger model judging) over asking the 4B to
+  do both.
 - **Avoid:** models of 12B and up, and thinking on a 4B model for routine edits.
 - **Settings:** `tier = "tiny"` (4B and under) or `"small"` (up to 10B),
   `disable_thinking = true`, and context 4k to 8k. Let `auto_fit` choose the
@@ -308,6 +313,14 @@ three sources, in this order of precedence:
 `pedacito profiles` shows the effective tags in its **Specialties** column, and
 in the GUI, **Settings → Profiles** lets you toggle the canonical tags, add a
 custom one, and see what the card detected for each profile.
+
+Measured tags are gated on the edit-format probe: every editing specialty
+(`coding`, `frontend_ui`, `3d_graphics_svg`, `math_algorithms`, `testing_qa`,
+`sql_data`) needs `edit_format >= 0.65` and `tool_choice >= 0.5` on the card,
+however well the model answers a one-shot probe — a model that cannot hold the
+edit format is not an editing specialist. `translation_i18n` is prose work and
+stays ungated. Names that say OCR, router, orchestrator or embedder never earn
+editing tags.
 
 How a task is matched: a `[specialty: TAG]` prefix in the task title forces the
 tag (the planner is told to use it). Otherwise the title is scored on keywords
@@ -791,6 +804,16 @@ Pedacito's `auto_fit` fits its token budgets to the model's real window using:
 - `context_tokens`, `reserve_tokens`, and `k_cache_quant` / `v_cache_quant`
 
 It keeps about 0.5 GB free. Values you set explicitly in a profile always win.
+
+`context_tokens` declares the window Pedacito plans against; it does not
+reserve VRAM. The KV cache for that window is allocated by the model server,
+and `auto_fit` only estimates whether it fits alongside the weights (from
+`vram_gb` and the weight file size): a server-reported or user-set window is
+authoritative, and the estimate warns when it is too large rather than
+silently shrinking your budgets. Setting a big `context_tokens` on a small GPU
+therefore does not buy memory — it buys a spill into system RAM (slow) or a
+server that refuses to load. Set the window the server actually runs, and let
+`auto_fit` fit the budgets to it.
 
 A rough budget:
 

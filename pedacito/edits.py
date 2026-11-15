@@ -753,6 +753,30 @@ def _defined_names(text: str) -> set[str]:
     return set(_DEF_NAME_RE.findall(text))
 
 
+# The public surface of a JS/TS module in its three idioms: ESM `export`,
+# CommonJS `module.exports` / `exports.x`, and classic-script `window.x` /
+# `globalThis.x` globals. A whole-file rewrite that drops ALL of them breaks
+# every importer and every page script that reads the global.
+_EXPORT_FORM_RE = re.compile(
+    r"\bexport\s+(?:default|const|let|var|function|class|async|type|"
+    r"interface|enum|\{|\*)"
+    r"|\bmodule\.exports\s*[.=]"
+    r"|\bexports\.[A-Za-z_$][\w$]*\s*=(?!=)"
+    r"|\b(?:window|globalThis)\.[A-Za-z_$][\w$]*\s*=(?!=)"
+    r"|\b(?:window|globalThis)\[\s*['\"][A-Za-z_$][\w$]*['\"]\s*\]\s*=(?!=)")
+_JS_FAMILY_EXT = (".js", ".mjs", ".cjs", ".ts", ".tsx", ".jsx", ".mts",
+                  ".cts")
+
+
+def _wipe_refusal(rel: str) -> str:
+    """The shared refusal for a whole-file replacement to nothing."""
+    return (f"ERROR: refusing to overwrite {rel}: the replacement is empty, "
+            "which would erase the whole file -- every definition, export "
+            "and comment in it. An empty REPLACE is not how a file is "
+            "emptied: use the `delete` action to remove it, or keep the "
+            "file and make targeted search/replace edits.")
+
+
 def fragment_refusal(rel: str, original: str, new_text: str) -> str | None:
     """Why replacing `original` with `new_text` looks like a fragment of a
     partial read rather than a whole-file rewrite, or None when it is safe.
@@ -771,9 +795,29 @@ def fragment_refusal(rel: str, original: str, new_text: str) -> str | None:
 
     A genuine rewrite (no copied lines) still goes through, as does a full
     re-quote that only deletes a line or two. Below the floor a shrink is
-    ordinary small-file editing and stays allowed."""
+    ordinary small-file editing and stays allowed. Two wipe forms are
+    refused at any size: a replacement with no content at all, and a JS/TS
+    rewrite that drops the file's entire export surface."""
     old_ls = [l.strip() for l in original.splitlines() if l.strip()]
     new_ls = [l.strip() for l in new_text.splitlines() if l.strip()]
+    # Every shrinking rule below is gated on `new_ls`, so an empty (or
+    # whitespace-only) replacement used to pass them all and wipe the file.
+    # A whole-file replacement to nothing is never an edit.
+    if old_ls and not new_ls:
+        return _wipe_refusal(rel)
+    # A JS/TS module whose replacement keeps content but drops EVERY export
+    # form breaks each importer (`does not provide an export named ...`)
+    # and each classic script reading the global. Targeted edits can still
+    # remove exports one at a time when the task really asks for it.
+    if (new_ls and rel.lower().endswith(_JS_FAMILY_EXT)
+            and _EXPORT_FORM_RE.search(original)
+            and not _EXPORT_FORM_RE.search(new_text)):
+        return (f"ERROR: refusing to overwrite {rel}: the file exports "
+                "symbols (export / module.exports / window.*) but the "
+                "replacement has no exports at all -- every importer and "
+                "page script using them would break. Keep the export "
+                "surface in the rewrite, or remove individual exports "
+                "with targeted search/replace edits.")
     # A chunked write that stops early keeps most of the file's text but
     # drops the definitions that lived in the tail (test_1a: a 182-line
     # module written back as its first 120 lines passed the >half-shrink
@@ -1641,11 +1685,23 @@ def apply_edits(root: Path, edits: list[Edit], backup: bool = True,
                     # block as already applied.
                     already.append(k)
                     continue
+                if span.start == 0 and span.stop == len(text):
+                    # A SEARCH quoting the ENTIRE file is a whole-file rewrite
+                    # just like an empty SEARCH: mark it so the lost-export and
+                    # context-pressure gates see this shape too.
+                    whole_file = True
                 text = text[:span.start] + span.replacement + text[span.stop:]
                 if span.fuzzy:
                     fuzzy_blocks.append(k)
 
             if failed:
+                continue
+
+            if original.strip() and not text.strip():
+                # The blocks deleted every line (a SEARCH quoting the whole
+                # file with an empty REPLACE): the same wipe the empty-SEARCH
+                # guard refuses, reached through the anchored path.
+                results.append(Result(False, rel, _wipe_refusal(rel)))
                 continue
 
             if text == original and already:

@@ -26,6 +26,11 @@ from . import proc, safety, sandbox, testlinks
 
 _NPM_PLACEHOLDER = re.compile(r"no test specified", re.IGNORECASE)
 
+# `node --test` exits 0 when it ran zero tests (a test file with no cases):
+# green, but nothing was verified (item 10). TAP prints `# tests 0`, the
+# spec reporter `ℹ tests 0`.
+_NODE_ZERO_TESTS_RE = re.compile(r"(?m)^\s*(?:#|ℹ)\s*tests\s+0\s*$")
+
 # Appended to a failing run's description when the command's recorded history
 # shows it already failed before this run (baseline-aware verdicts, R2). The
 # repair loop reads this marker to avoid chasing pre-existing breakage.
@@ -364,6 +369,9 @@ def run_impacted(index, cfg, changed: list[str]) -> tuple[bool, str, str]:
     ok, out = run_command(index.root, cfg, cmd)
     if not ok and was_failing:
         desc += f" -- {PRE_EXISTING_LABEL}"
+    if ok and "node --test" in cmd and _NODE_ZERO_TESTS_RE.search(out or ""):
+        desc += (" -- note: the runner reported 0 tests; an empty test file "
+                 "passes without verifying anything")
     return ok, out, desc
 
 

@@ -41,7 +41,7 @@ from . import loop, rank, verify, workspace
 WIDE_TASK_FILES = 5
 
 
-def requirement_titles(task: str, limit: int = 12) -> list[str]:
+def requirement_titles(task: str, limit: int = 16) -> list[str]:
     """One step per clearly separate requirement, '' when it is one change.
 
     A leading goal-summary clause with no verb of its own ("Bring the
@@ -52,7 +52,7 @@ def requirement_titles(task: str, limit: int = 12) -> list[str]:
 
     The cap matches the requirement ledger's (BUG-203/205/212): a six-step
     ceiling truncated a five-file repair to its head clauses and marked the
-    dropped tail done. Twelve slots hold a realistic multi-file brief."""
+    dropped tail done. Sixteen slots hold a realistic multi-file brief."""
     # One extra slot: the umbrella clause must not eat a concrete step's
     # place under the cap (the src/main.js step lost to it in BUG-312).
     reqs = verify.requirement_ledger(task, limit=limit + 1)

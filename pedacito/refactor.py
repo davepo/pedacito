@@ -186,6 +186,51 @@ def _rename_in_strings(text: str, old: str, new: str, suffix: str
     return "".join(out), n
 
 
+# Item 18: `--include-labels` is the narrow opt-in between "identifiers only"
+# and --strings: only string literals that ARE test labels move -- the span
+# must sit right after a test/it/describe/suite call opener (`.only`/`.skip`
+# variants included). Docs, messages and every other string stay untouched.
+_LABEL_PREFIX_RE = re.compile(
+    r"(?<![\w$.])(?:test|it|describe|suite)"
+    r"(?:\.(?:only|skip|todo|concurrent))*\s*\(\s*$")
+
+
+def _rename_in_test_labels(text: str, old: str, new: str, suffix: str
+                           ) -> tuple[str, int]:
+    """(new text, replacements) for whole-word `old` -> `new` inside string
+    literals that are test labels only. (text, 0) when the file cannot be
+    spanned. Same span sources as `_rename_in_strings` (tokenizer /
+    tree-sitter / quoted-span fallback)."""
+    word = re.compile(r"(?<![\w$])" + re.escape(old) + r"(?![\w$])")
+    if suffix == ".py":
+        spans = _py_string_spans(text)
+        if spans is None:
+            return text, 0
+    else:
+        spans = _ts_string_spans(text, suffix)
+        if spans is None:
+            spans = [(m.start(), m.end())
+                     for m in _STRING_SPAN_RE.finditer(text)]
+    if not spans:
+        return text, 0
+    out: list[str] = []
+    prev = n = 0
+    for s, e in sorted(spans):
+        if s < prev:            # overlapping fallback spans: first one wins
+            continue
+        prefix = text[max(0, s - 120):s]
+        if _LABEL_PREFIX_RE.search(prefix):
+            seg, k = word.subn(new, text[s:e])
+            n += k
+        else:
+            seg = text[s:e]
+        out.append(text[prev:s])
+        out.append(seg)
+        prev = e
+    out.append(text[prev:])
+    return "".join(out), n
+
+
 def _rename_python(text: str, old: str, new: str) -> tuple[str, int]:
     """Replace NAME tokens equal to `old` (strings and comments untouched)."""
     lines = text.split("\n")
@@ -519,7 +564,8 @@ def rename_symbol_across_project(root, old_name: str, new_name: str,
                                  scope_file: str | None = None,
                                  dry_run: bool = False,
                                  before_write=None,
-                                 include_strings: bool = False) -> dict:
+                                 include_strings: bool = False,
+                                 include_labels: bool = False) -> dict:
     """Deterministic, zero-token multi-file symbol rename.
 
     Replaces every EXACT identifier token `old_name` with `new_name` across
@@ -529,10 +575,13 @@ def rename_symbol_across_project(root, old_name: str, new_name: str,
     the old name are never touched. `include_strings` (the CLI's --strings)
     additionally rewrites whole-word occurrences INSIDE string literals --
     test labels and docs that name the API (BUG-219); comments stay untouched
-    either way. Every candidate file is validated with the same AST /
-    tree-sitter syntax gate the edit path uses BEFORE anything is written:
-    one file that the rename would break refuses the whole run (nothing
-    lands).
+    either way. `include_labels` (the CLI's --include-labels) is the narrow
+    middle opt-in: only string literals that ARE test labels (the first
+    argument of test/it/describe/suite, `.only`/`.skip` included) move, every
+    other string stays (item 18). Every candidate file is validated with the
+    same AST / tree-sitter syntax gate the edit path uses BEFORE anything is
+    written: one file that the rename would break refuses the whole run
+    (nothing lands).
 
     Returns {ok, files_modified, total_replacements, diffs} plus dry_run /
     skipped / warnings; with `dry_run` nothing is written. `before_write`
@@ -586,6 +635,7 @@ def rename_symbol_across_project(root, old_name: str, new_name: str,
     not_renamed: list[str] = []
     string_matches: list[str] = []
     string_total = 0
+    label_total = 0
     for rel in files:
         why = safety.is_protected(rel)
         if why:
@@ -637,6 +687,13 @@ def rename_symbol_across_project(root, old_name: str, new_name: str,
                                               suffix)
             n += ns
             string_total += ns
+        if include_labels:
+            # Item 18 opt-in: only test-label strings move (a subset of
+            # --strings; after --strings there is nothing left to find).
+            new_text, nl = _rename_in_test_labels(new_text, base_old,
+                                                  base_new, suffix)
+            n += nl
+            label_total += nl
         # BUG-319: note string literals that still name the old symbol (test
         # labels, docs) so the caller can surface them. Scan the post-rename
         # text so the identifiers just renamed do not count as leftovers.
@@ -693,6 +750,7 @@ def rename_symbol_across_project(root, old_name: str, new_name: str,
             "total_replacements": sum(n for _b, _a, n, _s
                                       in changes.values()),
             "string_replacements": string_total,
+            "label_replacements": label_total,
             "diffs": diffs,
             "dry_run": bool(dry_run),
             "per_file": {rel: n for rel, (_b, _a, n, _s)

@@ -406,10 +406,11 @@ def test_calibrate_records_arch_choices_local_only(home):
     assert ch["temperature_answer"] == 0.0
     assert ch["sampler"] == {"top_p": 0.8, "top_k": 20, "repeat_penalty": 1.05}
     assert ch["context_tokens"] == 32768
-    assert "testing_qa" in ch["specialties"]
-    # the scripted client cannot edit: the pinned weak-edit_format rule
-    # (< 0.5) strips the architecture's `coding` recommendation again
+    assert "translation_i18n" in ch["specialties"]
+    # the scripted client cannot edit: the edit-skill gate (item 15) strips
+    # the architecture's coding/testing_qa recommendations again
     assert "coding" not in ch["specialties"]
+    assert "testing_qa" not in ch["specialties"]
     # hosted models keep provider-table defaults: no arch recommendation
     hosted_cfg = _cfg(model="Qwen2.5-Coder-14B", url=HOSTED)
     hcard = modelcard.calibrate(_ArchProbeClient(), hosted_cfg,
@@ -537,20 +538,32 @@ def test_orchestrator_plan_probe_orders_parser_cli_tests():
 
 def test_new_probe_tags_join_specialties():
     f = modelcard.specialty_tags_from_measurements
+    # probe tags join when the edit-skill gate passes (item 15)
     tags = f("mystery-7b", {"sql_data": 1.0, "testing_qa": 1.0,
-                            "orchestrator_plan": 1.0})
+                            "orchestrator_plan": 1.0,
+                            "edit_format": 0.9, "tool_choice": 0.9})
     assert "sql_data" in tags and "testing_qa" in tags
     # the orchestrator probe scores planning, not a specialty tag
     assert "orchestrator_plan" not in tags
+    # without measured edit skill the same probes earn nothing (item 15)
+    assert f("mystery-7b", {"sql_data": 1.0, "testing_qa": 1.0,
+                            "orchestrator_plan": 1.0}) == ["general"]
     # below threshold: nothing earned
-    assert f("mystery-7b", {"sql_data": 0.5, "testing_qa": 0.0}) == ["general"]
+    assert f("mystery-7b", {"sql_data": 0.5, "testing_qa": 0.0,
+                            "edit_format": 0.7,
+                            "tool_choice": 0.6}) == ["general"]
     # the architecture library's tags union with the probe scores...
-    tags = f("granite-8b", {"sql_data": 1.0},
+    tags = f("granite-8b", {"sql_data": 1.0, "edit_format": 0.7,
+                            "tool_choice": 0.6},
              arch_tags=("coding", "sql_data"))
-    assert "sql_data" in tags
-    # ...but the pinned edit-format rule still strips coding without the skill
-    assert "coding" not in tags
-    tags = f("granite-8b", {"sql_data": 1.0, "edit_format": 1.0},
+    assert "sql_data" in tags and "coding" in tags
+    # ...but the edit-skill gate still strips them without the skill
+    tags = f("granite-8b", {"sql_data": 1.0, "edit_format": 0.4,
+                            "tool_choice": 0.9},
+             arch_tags=("coding", "sql_data"))
+    assert "coding" not in tags and "sql_data" not in tags
+    tags = f("granite-8b", {"sql_data": 1.0, "edit_format": 1.0,
+                            "tool_choice": 0.9},
              arch_tags=("coding", "sql_data"))
     assert "coding" in tags and "sql_data" in tags
 
@@ -563,8 +576,11 @@ def test_calibrate_runs_all_six_micro_probes_once(home):
     assert m["sql_data"] == 1.0
     assert m["testing_qa"] == 1.0
     assert m["orchestrator_plan"] == 1.0
-    assert "sql_data" in m["specialties"]
-    assert "testing_qa" in m["specialties"]
+    # the scripted client cannot edit: the probes ran, but the edit-skill
+    # gate (item 15) keeps their editing tags off the card
+    assert "sql_data" not in m["specialties"]
+    assert "testing_qa" not in m["specialties"]
+    assert m["specialties"] == ["translation_i18n"]
 
 
 # ------------------------------------------- D1: badge metadata everywhere

@@ -308,7 +308,8 @@ Renaming a function or variable everywhere it is used does not need a model.
 Strings and comments that happen to contain the old name are left alone. A parameter
 in an unrelated function that has the same name is renamed too, so read the preview.
 On the CLI, `pedacito rename OLD NEW --strings` also renames whole-word occurrences
-inside string literals (comments stay untouched); the GUI dialog has no such option.
+inside string literals (comments stay untouched), and `--include-labels` moves only
+test-label strings (`test`/`it`/`describe`/`suite`); the GUI dialog has no such option.
 
 ### A16. Let the model run one scoped test
 
@@ -651,6 +652,7 @@ which are described in the [model guide](MODEL_GUIDE.md#how-to-measure).
 pedacito rename apply_discount discounted_price                        # preview the diffs
 pedacito rename apply_discount discounted_price --file pkg/core.py     # that file and its importers
 pedacito rename apply_discount discounted_price --strings              # also whole-word string literals
+pedacito rename toggleStep flipStep --include-labels                   # also test-label strings only
 pedacito rename apply_discount discounted_price --apply                # write it
 pedacito restore ~/code/anki                                           # undo it, if needed
 ```
@@ -659,8 +661,9 @@ The preview is the default. With `--apply`, the originals are backed up first, s
 `pedacito restore` can undo the rename. Python, JavaScript, TypeScript, Go and Rust
 identifiers are renamed; a string or comment containing the old name is left alone
 unless you pass `--strings`, which also renames whole-word occurrences inside
-string literals (comments still stay). Every changed file must pass the syntax
-check, or nothing is written.
+string literals (comments still stay), or `--include-labels`, which moves only
+test-label strings (the first argument of `test`/`it`/`describe`/`suite`). Every
+changed file must pass the syntax check, or nothing is written.
 
 ---
 
@@ -808,7 +811,7 @@ only the map is stale.
 | `pedacito new DIR -t "..."` | Start a project from scratch (or `--spec FILE`) |
 | `pedacito auto PROJ -t "..."` | Plan a goal, then implement it task by task |
 | `pedacito restore PROJ` | Undo the last write |
-| `pedacito rename OLD NEW [--file F] [--strings] [--apply]` | Rename a symbol across the project. No model call; preview by default; `--strings` also renames whole-word string literals |
+| `pedacito rename OLD NEW [--file F] [--strings] [--include-labels] [--apply]` | Rename a symbol across the project. No model call; preview by default; `--strings` also renames whole-word string literals, `--include-labels` only test-label strings |
 | `pedacito eval` | Score the harness on fixture repositories. Use `--baseline` as a gate |
 | `pedacito bench [BENCHMARK\|all]` | Run the six diagnostic benchmarks and holdout rubric. `--list`/`--recent` are free; `--json`/`--strict` for CI |
 | `pedacito memory PROJ` | List, add, or forget remembered facts |
@@ -822,7 +825,7 @@ only the map is stale.
 | `pedacito trust PROJ` | Approve a project's `.pedacito.toml` so its execution settings and capability toggles apply |
 | `pedacito worktree create\|list\|remove NAME` | Manage isolated git worktrees |
 | `pedacito serve --root PROJ --name web -- npm run dev` | Start a named background server for the project |
-| `pedacito procs --root PROJ [logs\|stop NAME]` | List, tail or stop the project's background servers |
+| `pedacito procs --root PROJ [logs\|stop NAME] [--all]` | List, tail or stop the project's background servers. The list hides superseded stopped entries; `--all` shows them |
 | `pedacito lsp --root PROJ --file F --line N --op definition` | Ask the project's language server for definitions, references or hover |
 
 Flags available on most commands: `--exclude 'pattern'`, `--include 'pattern'`,

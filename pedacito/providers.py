@@ -109,6 +109,49 @@ def cache_key(cfg) -> str:
     return h.hexdigest()[:32]
 
 
+# Approximate USD list prices per million tokens: (input, cache read, output).
+# Matched by substring on the lower-cased model name, most specific first;
+# these are defaults for cost reporting / --max-cost, never a bill -- an
+# explicit price_* setting always wins.
+_MODEL_PRICES: tuple[tuple[str, float, float, float], ...] = (
+    ("deepseek-reasoner", 0.55, 0.14, 2.19),
+    ("deepseek-chat", 0.27, 0.07, 1.10),
+    ("qwen-max", 2.40, 0.48, 9.60),
+    ("gpt-4o", 2.50, 1.25, 10.00),
+)
+
+# Per-host fallback for models the table does not name (gateways, aliases):
+# the provider's flagship list price, clearly approximate.
+_HOST_PRICES: dict[str, tuple[float, float, float]] = {
+    "api.deepseek.com": (0.27, 0.07, 1.10),
+    "dashscope": (2.40, 0.48, 9.60),
+    "api.openai.com": (2.50, 1.25, 10.00),
+}
+
+
+def default_prices(base_url: str, model: str = "") -> dict:
+    """Approximate price_* defaults for a hosted endpoint, keyed by the config
+    field names; {} when nothing is known (local servers stay at 0)."""
+    m = (model or "").lower()
+    prices = None
+    for needle, p_in, p_cached, p_out in _MODEL_PRICES:
+        if needle in m:
+            prices = (p_in, p_cached, p_out)
+            break
+    if prices is None:
+        host = _host(base_url)
+        for key, fallback in _HOST_PRICES.items():
+            if key in host:
+                prices = fallback
+                break
+    if prices is None:
+        return {}
+    p_in, p_cached, p_out = prices
+    return {"price_input_per_mtok": p_in,
+            "price_cached_per_mtok": p_cached,
+            "price_output_per_mtok": p_out}
+
+
 def profile_overrides(base_url: str, model: str = "") -> dict:
     """The profile keys a hosted scan should write for this provider, so the
     profile carries the table's caching and compatibility choices (and the user

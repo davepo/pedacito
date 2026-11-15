@@ -410,6 +410,60 @@ def check_static_js(results) -> list[Finding]:
     return out
 
 
+# ------------------------------------------- empty JS test files (item 10)
+# `node --test` exits 0 on a file that defines no test cases: a "test" file
+# of helpers, constants or commented-out cases reads as a green suite while
+# verifying nothing. Count real invocations only -- `function test(` is a
+# helper declaration and `regex.test(` a method call, neither is a case.
+_JS_TEST_EXTS = (".js", ".mjs", ".cjs", ".jsx", ".ts", ".mts", ".cts", ".tsx")
+_JS_TEST_CALL_RE = re.compile(
+    r"(?<![\w$.])(?:test|it|describe|suite)"
+    r"(?:\.(?:only|skip|todo|concurrent))*\s*\(")
+_JS_TEST_DECL_RE = re.compile(r"\bfunction\s+(?:test|it|describe|suite)\s*\(")
+
+
+def _is_js_test_file(rel: str) -> bool:
+    """A JS/TS file named or placed like a test (`*.test.js`, `*.spec.ts`,
+    or under a test/tests/__tests__ directory)."""
+    low = str(rel or "").replace("\\", "/").lower()
+    if not low.endswith(_JS_TEST_EXTS):
+        return False
+    base = low.rsplit("/", 1)[-1]
+    stem = base.rsplit(".", 1)[0]
+    if stem.endswith((".test", ".spec")):
+        return True
+    return any(p in ("test", "tests", "__tests__")
+               for p in low.split("/")[:-1])
+
+
+def check_empty_js_tests(results) -> list[Finding]:
+    """Warn on an edited JS/TS test file whose new content defines zero test
+    cases: the runner reports 0 tests and passes, so the file verifies
+    nothing. A warning, not an error -- naming conventions are heuristic."""
+    out: list[Finding] = []
+    for r in results or ():
+        if not getattr(r, "ok", False) or not getattr(r, "file", ""):
+            continue
+        if not _is_js_test_file(r.file):
+            continue
+        after = getattr(r, "after", None)
+        before = getattr(r, "before", None)
+        if after is None or before == after:
+            continue
+        body = re.sub(r"/\*.*?\*/", " ", after, flags=re.S)
+        body = re.sub(r"//[^\n]*", " ", body)
+        body = _JS_TEST_DECL_RE.sub(" ", body)
+        if _JS_TEST_CALL_RE.search(body):
+            continue
+        out.append(Finding(
+            "empty_tests", "warn", r.file,
+            "this test file defines no test cases (no `test(`/`it(`/"
+            "`describe(`/`suite(` invocation): `node --test` reports 0 "
+            "tests and exits 0, so it verifies nothing. Add real test "
+            "cases for the behavior it names."))
+    return out
+
+
 # ------------------------------------------- README grounding (BUG-307)
 # A generated README is a reference file, so no static/import gate reads it.
 # One run shipped "# Pedacito" claiming "Tests are written in Jest" while
@@ -836,13 +890,144 @@ def check_lost_wiring(agent, results, task: str = "") -> list[Finding]:
     return out
 
 
+_JS_RESULT_EXTS = (".js", ".mjs", ".cjs", ".ts", ".tsx", ".jsx", ".mts",
+                   ".cts")
+_JS_READER_EXTS = _JS_RESULT_EXTS + (".html", ".htm")
+# CommonJS named surface: `exports.name =` / `module.exports.name =` and the
+# keys of a `module.exports = { ... }` object literal.
+_CJS_EXPORT_DOT_RE = re.compile(
+    r"\b(?:module\.)?exports\.([A-Za-z_$][\w$]*)\s*=(?!=)")
+_CJS_EXPORT_OBJ_RE = re.compile(r"\bmodule\.exports\s*=\s*\{")
+# Classic-script globals: `window.name =` / `globalThis.name =` (dot or
+# bracket spelling), the surface a page's other scripts read.
+_WINDOW_ASSIGN_RE = re.compile(
+    r"\b(?:window|globalThis)\.([A-Za-z_$][\w$]*)\s*=(?!=)"
+    r"|\b(?:window|globalThis)\[\s*['\"]([A-Za-z_$][\w$]*)['\"]\s*\]\s*=(?!=)")
+_REQUIRE_RE = re.compile(r"\brequire\(\s*['\"]([^'\"]+)['\"]\s*\)")
+_HTML_COMMENT_RE = re.compile(r"<!--.*?-->", re.S)
+
+
+def _cjs_exported_names(text: str) -> set[str]:
+    """Names a CommonJS module puts on `module.exports` / `exports.x`."""
+    from . import webcheck
+    text = webcheck._js_no_comments(text)
+    names = {m.group(1) for m in _CJS_EXPORT_DOT_RE.finditer(text)}
+    for m in _CJS_EXPORT_OBJ_RE.finditer(text):
+        # Top-level keys of the object literal: walk the braces so a nested
+        # value object does not donate its keys to the export surface.
+        depth, i, n = 1, m.end(), len(text)
+        seg_start = i
+        segs: list[str] = []
+        while i < n and depth:
+            c = text[i]
+            if c in "'\"`":
+                i += 1
+                while i < n and text[i] != c:
+                    i += 2 if text[i] == "\\" else 1
+            elif c == "{":
+                depth += 1
+            elif c == "}":
+                depth -= 1
+                if depth == 0:
+                    segs.append(text[seg_start:i])
+                    break
+            elif c == "," and depth == 1:
+                segs.append(text[seg_start:i])
+                seg_start = i + 1
+            i += 1
+        for seg in segs:
+            km = re.match(r"['\"]?([A-Za-z_$][\w$]*)['\"]?\s*(?::|$)",
+                          seg.strip())
+            if km:
+                names.add(km.group(1))
+    return names
+
+
+def _window_assigned_names(text: str) -> set[str]:
+    """Globals a classic script assigns onto `window` / `globalThis`."""
+    from . import webcheck
+    text = webcheck._js_no_comments(text)
+    return {m.group(1) or m.group(2)
+            for m in _WINDOW_ASSIGN_RE.finditer(text)}
+
+
+def _lost_cjs_names(index, rel: str, base: str,
+                    dropped: set[str]) -> set[str]:
+    """Dropped CommonJS names that another project file still reads through
+    its `require()` of this module (destructured, bound, or direct)."""
+    lost: set[str] = set()
+    for other in index.files:
+        if other == rel or not other.lower().endswith(_JS_RESULT_EXTS):
+            continue
+        try:
+            text = fileio.read_text(Path(index.root) / other)
+        except OSError:
+            continue
+        if base not in text:
+            continue
+        for m in _REQUIRE_RE.finditer(text):
+            if m.group(1).rsplit("/", 1)[-1] != base:
+                continue
+            pre = text[max(0, m.start() - 200):m.start()]
+            dm = re.search(r"(?:const|let|var)\s*\{([^{}]*)\}\s*=\s*$", pre)
+            if dm:
+                for part in dm.group(1).split(","):
+                    name = part.split(":")[0].strip()
+                    if name in dropped:
+                        lost.add(name)
+            bm = re.search(
+                r"(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*$", pre)
+            if bm:
+                bind = re.escape(bm.group(1))
+                for name in dropped:
+                    if re.search(r"\b" + bind + r"\s*\.\s*"
+                                 + re.escape(name) + r"\b", text):
+                        lost.add(name)
+            post = text[m.end():m.end() + 120]
+            pm = re.match(r"\s*\.\s*([A-Za-z_$][\w$]*)", post)
+            if pm and pm.group(1) in dropped:
+                lost.add(pm.group(1))
+    return lost
+
+
+def _lost_window_names(index, rel: str, dropped: set[str]) -> set[str]:
+    """Dropped window globals that another project file still reads."""
+    from . import webcheck
+    lost: set[str] = set()
+    pats = {
+        n: re.compile(r"\b(?:window|globalThis)\s*\.\s*" + re.escape(n)
+                      + r"\b|\b(?:window|globalThis)\[\s*['\"]"
+                      + re.escape(n) + r"['\"]\s*\]")
+        for n in dropped}
+    for other in index.files:
+        if other == rel or not other.lower().endswith(_JS_READER_EXTS):
+            continue
+        try:
+            text = fileio.read_text(Path(index.root) / other)
+        except OSError:
+            continue
+        if not any(n in text for n in dropped):
+            continue
+        if other.lower().endswith((".html", ".htm")):
+            text = _HTML_COMMENT_RE.sub("", text)
+        else:
+            text = webcheck._js_no_comments(text)
+        for n, pat in pats.items():
+            if n not in lost and pat.search(text):
+                lost.add(n)
+    return lost
+
+
 def check_lost_exports(agent, results, task: str = "") -> list[Finding]:
     """A whole-file replacement that drops an export another project file still
     imports breaks the module graph (BUG-214): the new file validates on its
     own, but every importer fails to link at load (`does not provide an export
     named X`). `check_lost_wiring` only catches imported-and-CALLED names that
     live elsewhere; a file's OWN dropped exports have no such caller to trip
-    it. Error by default; warn when the task explicitly asks to rewrite that
+    it. Covers every whole-file shape (empty-SEARCH overwrite, a LINES range
+    covering the file, a SEARCH quoting all of it) and all three export
+    idioms: ESM `export`, CommonJS `module.exports`, and `window.*` globals.
+    Error by default; warn when the task explicitly asks to rewrite that
     very file."""
     from . import webcheck
     out: list[Finding] = []
@@ -852,39 +1037,52 @@ def check_lost_exports(agent, results, task: str = "") -> list[Finding]:
     for r in results:
         if not r.ok or not r.file or not r.before:
             continue
-        if not (r.message or "").startswith("replaced contents"):
+        whole = ((r.message or "").startswith("replaced contents")
+                 or getattr(r, "whole_file", False))
+        if not whole:
             continue
-        if not r.file.lower().endswith((".js", ".mjs", ".cjs")):
+        if not r.file.lower().endswith(_JS_RESULT_EXTS):
             continue
-        dropped = (webcheck._js_exported_names(r.before)
-                   - webcheck._js_exported_names(r.after or ""))
-        if not dropped:
+        after = r.after or ""
+        esm_dropped = (webcheck._js_exported_names(r.before)
+                       - webcheck._js_exported_names(after))
+        cjs_dropped = (_cjs_exported_names(r.before)
+                       - _cjs_exported_names(after))
+        win_dropped = (_window_assigned_names(r.before)
+                       - _window_assigned_names(after))
+        if not (esm_dropped or cjs_dropped or win_dropped):
             continue
-        try:
-            importers = index.importers_of(r.file)
-        except Exception:
-            importers = []
         base = r.file.rsplit("/", 1)[-1]
         lost: set[str] = set()
-        for rel in importers:
-            if rel == r.file:
-                continue
+        if esm_dropped:
             try:
-                text = fileio.read_text(Path(index.root) / rel)
-            except OSError:
-                continue
-            for m in _JS_IMPORT_FROM_RE.finditer(text):
-                if m.group(3).rsplit("/", 1)[-1] != base:
-                    continue        # the import points at a different module
-                names: set[str] = set()
-                if m.group(1) is not None:
-                    for part in m.group(1).split(","):
-                        part = re.split(r"\s+as\s+", part.strip())[-1].strip()
-                        if re.fullmatch(r"[A-Za-z_$][\w$]*", part):
-                            names.add(part)
-                elif m.group(2):
-                    names.add(m.group(2))
-                lost |= dropped & names
+                importers = index.importers_of(r.file)
+            except Exception:
+                importers = []
+            for rel in importers:
+                if rel == r.file:
+                    continue
+                try:
+                    text = fileio.read_text(Path(index.root) / rel)
+                except OSError:
+                    continue
+                for m in _JS_IMPORT_FROM_RE.finditer(text):
+                    if m.group(3).rsplit("/", 1)[-1] != base:
+                        continue    # the import points at a different module
+                    names: set[str] = set()
+                    if m.group(1) is not None:
+                        for part in m.group(1).split(","):
+                            part = re.split(r"\s+as\s+",
+                                            part.strip())[-1].strip()
+                            if re.fullmatch(r"[A-Za-z_$][\w$]*", part):
+                                names.add(part)
+                    elif m.group(2):
+                        names.add(m.group(2))
+                    lost |= esm_dropped & names
+        if cjs_dropped:
+            lost |= _lost_cjs_names(index, r.file, base, cjs_dropped)
+        if win_dropped:
+            lost |= _lost_window_names(index, r.file, win_dropped)
         if not lost:
             continue
         out.append(Finding(
@@ -1041,6 +1239,50 @@ _REQ_SPLIT_RE = re.compile(
     r"create|write|ensure|check|handle|support|use|return|move|delete|"
     r"implement|show|print|log)\b)|,?\s+then\s+)", re.IGNORECASE)
 
+# A lead-in preamble introduces the list of requirements; it is not R1. The
+# colon-terminated forms were already dropped, but "please implement the
+# following" / "you need to update the app so that" without a colon still ate
+# the first slot and shifted every R-number (consolidated follow-up, item 2).
+# Both a lead-in head AND an introduction tail are required so a real clause
+# ("Fix the button below") is never mistaken for a preamble.
+_PREAMBLE_HEAD_RE = re.compile(
+    r"^(?:in this (?:repository|repo|project|codebase)\b[,:-]?\s*"
+    r"|(?:please|kindly)\b\s*"
+    r"|you (?:need|have|must|should|want) to\b\s*"
+    r"|your task is to\b\s*"
+    r"|(?:we|i) (?:need|want) you to\b\s*)", re.IGNORECASE)
+_PREAMBLE_TAIL_RE = re.compile(
+    r"\b(?:the following|as follows|so that|"
+    r"these (?:changes|requirements|items|steps|tasks))\s*:?\s*$",
+    re.IGNORECASE)
+_PREAMBLE_BARE_RE = re.compile(
+    r"^(?:please\s+|kindly\s+)?(?:implement|do|perform|complete|carry out|"
+    r"make|apply)\s+(?:the following|all of the following|these)\b",
+    re.IGNORECASE)
+
+
+def _strip_lead_preamble(clauses: list[str]) -> list[str]:
+    """Drop leading list-introduction clauses before R-numbering. Only when
+    concrete clauses follow: a lone introduction IS the task."""
+    out = list(clauses)
+    while len(out) > 1:
+        head = out[0].strip()
+        intro = (_PREAMBLE_HEAD_RE.match(head)
+                 and _PREAMBLE_TAIL_RE.search(head)) \
+            or _PREAMBLE_BARE_RE.match(head)
+        if not intro:
+            break
+        out.pop(0)
+    return out
+# A sentence-boundary dot that actually belongs to an abbreviation ("e.g.",
+# "i.e.", "etc.") is not a clause boundary: "handle errors, i.e. Check the
+# inputs" used to split into "...i.e" + "Check the inputs" (consolidated
+# sweep, BUG-204/212). The trailing dot is part of the match, so the prefix
+# up to and including it must end in one of these.
+_REQ_ABBREV_RE = re.compile(
+    r"\b(?:e\.g|i\.e|etc|vs|cf|viz|ibid|Mr|Mrs|Ms|Dr|Prof|approx|No)\.$",
+    re.IGNORECASE)
+
 
 def _split_clauses(text: str) -> list[tuple[str, bool]]:
     """Split task text at clause boundaries that sit at bracket depth zero,
@@ -1084,6 +1326,10 @@ def _split_clauses(text: str) -> list[tuple[str, bool]]:
         elif depth == 0:
             m = _REQ_SPLIT_RE.match(text, i)
             if m is not None and m.end() > i:
+                if m.group(0).startswith(".") and \
+                        _REQ_ABBREV_RE.search(text[:m.start() + 1]):
+                    i += 1          # "e.g." / "i.e." -- text, not a boundary
+                    continue
                 parts.append((text[start:m.start()], hard))
                 hard = bool(re.match(r"\n\s*(?:[-*]|\d+[.)])\s+", m.group(0)))
                 i = start = m.end()
@@ -1113,6 +1359,11 @@ _GENERIC_TERMS = frozenset({
     "value", "values", "data", "node", "nodes", "name", "names", "type",
     "types", "line", "lines", "page", "app", "application", "project",
     "signature", "signatures", "unit", "units", "npm", "pass", "fail",
+    # Common edit verbs and failure nouns match almost any hunk; on their own
+    # they are not provenance evidence (consolidated sweep, BUG-203/223).
+    "update", "updates", "error", "errors", "fix", "fixes", "change",
+    "changes", "ensure", "ensures", "handle", "handles", "support",
+    "supports", "using", "work", "works", "working",
 })
 
 # Requirement evidence state machine. An edit requirement has to
@@ -1417,7 +1668,7 @@ def _clip_clause(p: str, limit: int = 140) -> str:
     return clipped + " ..."
 
 
-def _requirements_from_task(task: str, limit: int = 12) -> list[Requirement]:
+def _requirements_from_task(task: str, limit: int = 16) -> list[Requirement]:
     text = (task or "").split("\nTASK\n")[-1].strip()
     if not text:
         return []
@@ -1445,6 +1696,10 @@ def _requirements_from_task(task: str, limit: int = 12) -> list[Requirement]:
     # clauses follow; the full goal still rides along as the task background.
     if len(merged) > 1:
         merged = [p for p in merged if not p.rstrip().endswith(":")]
+        # The same introduction without its colon ("In this repository,
+        # please implement the following", "You need to update the app so
+        # that") is still a preamble, not R1 (consolidated sweep, item 2).
+        merged = _strip_lead_preamble(merged)
     task_kind = "edit" if _REQ_EDIT_RE.search(text) else (
         "report" if _REQ_REPORT_RE.search(text) else "edit")
     reqs: list[Requirement] = []
@@ -1487,12 +1742,13 @@ def _requirements_from_task(task: str, limit: int = 12) -> list[Requirement]:
     # BUG-203/212/223: the old default cap of five silently truncated a six-
     # bullet repair (and a three-clause task the splitter expanded to eleven
     # sentences), so the tail clauses never existed for coverage or provenance
-    # to see and the run exited 0 after addressing only the head. Twelve slots
-    # hold a realistic multi-file brief; the cap still bounds a runaway split.
+    # to see and the run exited 0 after addressing only the head. Sixteen slots
+    # hold a realistic multi-file brief (R6+ survived hunts #8-#12's twelve);
+    # the cap still bounds a runaway split.
     return reqs[:limit]
 
 
-def requirement_ledger(task: str, limit: int = 12) -> list[tuple[str, list[str]]]:
+def requirement_ledger(task: str, limit: int = 16) -> list[tuple[str, list[str]]]:
     """[(requirement text, key terms)] for up to `limit` clauses of the task.
     Heuristic and free: split on sentence/bullet/`and add ...` boundaries, keep
     each clause's distinctive words (identifiers, file names, numbers,
@@ -1511,7 +1767,7 @@ class RequirementTracker:
     requirement) and the answer-phase source packer (pinned located spans).
     """
 
-    def __init__(self, task: str = "", limit: int = 12):
+    def __init__(self, task: str = "", limit: int = 16):
         self.task = task or ""
         self.items = _requirements_from_task(self.task, limit)
 
@@ -1827,7 +2083,7 @@ class RequirementTracker:
         return out
 
 
-def requirement_tracker(task: str, limit: int = 12) -> RequirementTracker:
+def requirement_tracker(task: str, limit: int = 16) -> RequirementTracker:
     """Convenience constructor for the run-scoped state machine."""
     return RequirementTracker(task, limit)
 
@@ -2161,6 +2417,7 @@ def check(agent, task: str, reply: str, results, gathered: str = ""
             # its "clauses" are gate output and instructions (BUG-314).
             findings += check_coverage(task, reply, edits, tracker=tracker)
         findings += check_fuzzy(results)
+        findings += check_empty_js_tests(results)
     except Exception as e:                  # a checker bug must not block a task
         findings.append(Finding("model", "warn", "",
                                 f"verification skipped ({type(e).__name__})"))

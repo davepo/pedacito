@@ -17,6 +17,7 @@ import json
 import re
 import shutil
 import subprocess
+import sys
 import threading
 import time
 import urllib.error
@@ -388,6 +389,100 @@ def _eval_syntax_error(arg: str, msg: str) -> str:
 
 def _run_playwright(url: str, *, actions: str, wait: float, out,
                     timeout: int, headless: bool) -> tuple[bool, dict | str]:
+    """Run the Playwright session in a bounded worker subprocess.
+
+    `page.evaluate()` has no timeout, and a synchronous infinite loop in page
+    code starves even the in-page race timer: the session would block the
+    gather loop forever. The child gets `timeout` plus the scripted wait/hold
+    dwell plus a launch/report grace, then its whole process group is stopped
+    and the caller gets an honest failure -- the page is NOT verified.
+
+    A test-injected fake `playwright` module (no `__file__`) runs in-process
+    so the injected page stays observable.
+    """
+    try:
+        import playwright
+    except Exception:
+        return False, install_hint()
+    if getattr(playwright, "__file__", None) is None:
+        return _playwright_inproc(url, actions=actions, wait=wait, out=out,
+                                  timeout=timeout, headless=headless)
+
+    dwell = max(0.0, float(wait or 0))
+    for kind, arg in parse_actions(actions):
+        if kind == "wait":
+            dwell += float(arg)
+        elif kind == "hold":
+            dwell += float(arg[1])
+    cap = int(max(1, timeout) + dwell + 15)
+    cmd = [sys.executable, "-m", "pedacito.browser", "--worker",
+           "--url", url, "--actions", actions or "",
+           "--wait", str(wait or 0), "--timeout", str(max(1, int(timeout)))]
+    if out is not None:
+        cmd += ["--out", str(Path(out).resolve())]
+    if not headless:
+        cmd.append("--headed")
+    # The package's own parent dir: `-m pedacito.browser` resolves from a
+    # source checkout as well as an installed wheel.
+    cwd = Path(__file__).resolve().parent.parent
+    rc, text, stopped, _secs = proc.run(cmd, cwd=cwd, timeout=cap,
+                                        max_output=400_000)
+    if stopped == "timeout":
+        return False, (
+            f"the headless browser did not finish within {cap}s; a page "
+            "script may be looping, so the browser was stopped. The page is "
+            "NOT verified.")
+    if stopped == "error":
+        return False, f"headless browser could not run: {text.strip()[:300]}"
+    payload = None
+    for line in (text or "").splitlines():
+        if line.startswith(_WORKER_MARK):
+            try:
+                payload = json.loads(line[len(_WORKER_MARK):])
+            except ValueError:
+                payload = None
+    if payload is None:
+        tail = " | ".join((text or "").strip().splitlines()[-4:])[:600]
+        return False, ("headless browser ended without a result "
+                       f"(exit {rc}): {tail}")
+    if payload.get("ok"):
+        info = payload.get("info")
+        if isinstance(info, dict):
+            return True, info
+        return False, "headless browser returned an empty result"
+    return False, str(payload.get("error") or "headless browser failed")
+
+
+_WORKER_MARK = "__PEDACITO_BROWSER_JSON__"
+
+
+def _worker_main(argv: list[str]) -> int:
+    """Child entry: run the Playwright session and print one JSON line."""
+    import argparse
+
+    ap = argparse.ArgumentParser(add_help=False)
+    ap.add_argument("--worker", action="store_true")
+    ap.add_argument("--url", required=True)
+    ap.add_argument("--actions", default="")
+    ap.add_argument("--wait", type=float, default=3.0)
+    ap.add_argument("--out", default="")
+    ap.add_argument("--timeout", type=int, default=20)
+    ap.add_argument("--headed", action="store_true")
+    a = ap.parse_args(argv)
+    ok, info = _playwright_inproc(
+        a.url, actions=a.actions, wait=a.wait,
+        out=Path(a.out) if a.out else None,
+        timeout=a.timeout, headless=not a.headed)
+    payload = {"ok": True, "info": info} if ok else {"ok": False,
+                                                     "error": info}
+    print(_WORKER_MARK + json.dumps(payload))
+    return 0
+
+
+def _playwright_inproc(url: str, *, actions: str, wait: float, out,
+                       timeout: int, headless: bool) -> tuple[bool, dict | str]:
+    """The actual Playwright session, called by the worker child (and in
+    process when a test injects a fake playwright module)."""
     try:
         from playwright.sync_api import sync_playwright
     except Exception:
@@ -555,3 +650,7 @@ def _run_chrome(exe: str, url: str, *, wait: float, out,
         detail = ((p.stdout or "") + (p.stderr or "")).strip()
     return False, ("Chrome did not produce a screenshot: "
                    + (detail[:400] or "no output"))
+
+
+if __name__ == "__main__":
+    sys.exit(_worker_main(sys.argv[1:]))

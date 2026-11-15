@@ -562,24 +562,27 @@ CLI_COMMANDS = [
     },
     {
         "name": "rename",
-        "usage": "pedacito rename OLD NEW [--file PATH] [--strings] [--apply] "
-                 "[--root DIR]",
+        "usage": "pedacito rename OLD NEW [--file PATH] [--strings] "
+                 "[--include-labels] [--apply] [--root DIR]",
         "summary": "Rename a symbol across the project without a model call: "
                    "Python identifiers move through the real tokenizer, "
                    "JavaScript/TypeScript/Go/Rust through tree-sitter "
                    "identifier nodes, so strings and comments that merely "
                    "contain the old name are never touched by default. "
                    "--strings also renames whole-word occurrences inside "
-                   "string literals (comments stay untouched). Default is a "
-                   "dry-run diff preview; --apply writes and snapshots the "
-                   "originals, so restore undoes it.",
+                   "string literals (comments stay untouched); "
+                   "--include-labels is the narrow middle option that moves "
+                   "only test-label strings (test/it/describe/suite). Default "
+                   "is a dry-run diff preview; --apply writes and snapshots "
+                   "the originals, so restore undoes it.",
         "keywords": ["rename", "refactor", "symbol", "identifier", "variable",
                      "function name", "rename across files", "rename strings",
-                     "string literals"],
+                     "string literals", "test labels"],
         "examples": [
             "pedacito rename apply_discount discounted_price",
             "pedacito rename apply_discount discounted_price --file pkg/core.py",
             "pedacito rename apply_discount discounted_price --strings",
+            "pedacito rename toggleStep flipStep --include-labels",
             "pedacito rename apply_discount discounted_price --apply --root .",
             "pedacito restore . --dry-run",
         ],
@@ -593,6 +596,10 @@ CLI_COMMANDS = [
              "help": "also rename whole-word occurrences inside string "
                      "literals (test labels, docs that name the API); "
                      "comments stay untouched"},
+            {"flag": "--include-labels",
+             "help": "also rename test-label strings only (the first "
+                     "argument of test/it/describe/suite); every other "
+                     "string literal stays untouched"},
             {"flag": "--apply",
              "help": "write the rename (default: dry-run with diffs)"},
             {"flag": "--root DIR", "help": "project root (default: cwd)"},
@@ -854,12 +861,16 @@ CLI_COMMANDS = [
     },
     {
         "name": "procs",
-        "usage": "pedacito procs [list | logs NAME | stop NAME] [--tail N]",
+        "usage": "pedacito procs [list | logs NAME | stop NAME] [--tail N] "
+                 "[--all]",
         "summary": "List, show logs from, or stop background servers started "
-                   "with serve or the model's `serve` action.",
+                   "with serve or the model's `serve` action. The list hides "
+                   "stopped entries superseded by a newer running instance "
+                   "of the same server; --all shows them.",
         "keywords": ["background processes", "server logs", "stop server"],
         "examples": [
             "pedacito procs",
+            "pedacito procs --all",
             "pedacito procs logs web --tail 2000",
             "pedacito procs stop web",
         ],
@@ -868,6 +879,8 @@ CLI_COMMANDS = [
             {"flag": "NAME", "help": "registry name"},
             {"flag": "--tail N",
              "help": "with logs: last N characters (default 4000)"},
+            {"flag": "--all",
+             "help": "with list: also show superseded stopped entries"},
             {"flag": "--root DIR", "help": "project root"},
             {"flag": "--config FILE", "help": "use this config file"},
             {"flag": "--profile NAME", "help": "apply a profile block"},

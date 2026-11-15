@@ -259,14 +259,54 @@ def _task_specialty_scores(task: str, idx=None) -> dict[str, float]:
     return scores
 
 
+# Which measured micro-probe speaks for each specialty tag (item 16): the
+# domain probe, not the name, is the evidence that a profile can do the work.
+_DOMAIN_PROBES = {
+    "frontend_ui": "svg_ui",
+    "3d_graphics_svg": "svg_ui",
+    "math_algorithms": "math_algo",
+    "sql_data": "sql_data",
+    "testing_qa": "testing_qa",
+    "coding": "edit_format",
+    "translation_i18n": "translation",
+}
+
+# A larger preset tier is a small tie-break bonus, never enough to outvote a
+# measured skill difference (item 16).
+_TIER_BONUS = {"tiny": 0.0, "small": 0.01, "medium": 0.02,
+               "large": 0.03, "hosted": 0.03}
+
+# The active profile keeps a task it already fits unless a candidate's
+# composite skill beats it by at least this much (item 16).
+_INERTIA_MARGIN = 0.08
+
+
+def _specialist_skill(cfg, profiles: dict, name: str, tag: str) -> float:
+    """Composite skill of one profile for one tag (item 16):
+    0.40 * the tag's domain probe + 0.35 * edit_format + 0.25 * overall,
+    plus a small tier bonus. An uncalibrated profile scores only its tier."""
+    card = _profile_card(cfg, name) or {}
+    m = card.get("measured") or {}
+    probe = _DOMAIN_PROBES.get(tag, "")
+    domain = float(m.get(probe, 0.0) or 0.0) if probe else 0.0
+    ed = float(m.get("edit_format", 0.0) or 0.0)
+    overall = float(m.get("overall", 0.0) or 0.0)
+    tier = str((profiles.get(name) or {}).get("tier") or "")
+    return (0.40 * domain + 0.35 * ed + 0.25 * overall
+            + _TIER_BONUS.get(tier, 0.0))
+
+
 def select_specialist_profile(task: str, idx, cfg, explicit_tag: str = "",
                               resident=None) -> tuple[str, str]:
     """(profile_name, matched_tag) for the specialist that best fits `task`,
     or ("", "") when the worker should keep it: routing off, fewer than two
     profiles, no positive score, or the active profile already carries a
-    winning tag. A "[specialty: TAG]" prefix in the task (or `explicit_tag`)
-    forces the tag. Ties prefer a resident model, then a separate server
-    (no VRAM handoff needed), then the highest card overall."""
+    winning tag AND no candidate measurably outskills it (item 16: a
+    composite lead of >= 0.08, or an active model named like a router /
+    orchestrator, overrides the inertia). A "[specialty: TAG]" prefix in the
+    task (or `explicit_tag`) forces the tag. Ties prefer a resident model,
+    then a separate server (no VRAM handoff needed), then the highest
+    composite card skill (domain probe, edit format, overall, tier)."""
     from .config import SPECIALTIES, normalize_specialty
     if not getattr(cfg, "auto_route_specialties", False):
         return "", ""
@@ -294,8 +334,6 @@ def select_specialist_profile(task: str, idx, cfg, explicit_tag: str = "",
     winning = [t for t, s in scores.items() if s == best]
     active = getattr(cfg, "active_profile", "") or ""
     active_tags = set(specialties_for(cfg, active))
-    if active_tags.intersection(winning):
-        return "", ""
     candidates = []
     allow_hosted = bool(getattr(cfg, "auto_route_allow_hosted", False))
     for name in profiles:
@@ -308,19 +346,32 @@ def select_specialist_profile(task: str, idx, cfg, explicit_tag: str = "",
             candidates.append((name, hit[0]))
     if not candidates:
         return "", ""
+    if active_tags.intersection(winning):
+        # Inertia: a profile that already fits keeps the task -- but not at
+        # any cost (item 16). A candidate whose composite skill leads by
+        # _INERTIA_MARGIN takes it, and a model named like a router /
+        # orchestrator never hoards specialist work it cannot do itself.
+        active_model = str((profiles.get(active) or {}).get("model")
+                           or cfg.model or "").lower()
+        hoarding = any(w in active_model for w in ("orchestrator", "router"))
+        if not hoarding:
+            active_tag = next(t for t in winning if t in active_tags)
+            active_skill = _specialist_skill(cfg, profiles, active, active_tag)
+            best_skill = max(_specialist_skill(cfg, profiles, n, t)
+                             for n, t in candidates)
+            if best_skill < active_skill + _INERTIA_MARGIN:
+                return "", ""
     resident = set(resident or ())
     worker_base = str(cfg.base_url or "").rstrip("/")
 
     def sort_key(item):
-        name, _tag = item
+        name, tag = item
         body = profiles.get(name) or {}
         model = str(body.get("model") or cfg.model or "")
         base = str(body.get("base_url") or cfg.base_url or "").rstrip("/")
-        card = _profile_card(cfg, name)
-        overall = float((card or {}).get("measured", {}).get("overall") or 0.0)
         return (0 if model in resident else 1,
                 0 if base != worker_base else 1,
-                -overall)
+                -_specialist_skill(cfg, profiles, name, tag))
 
     candidates.sort(key=sort_key)
     name, won = candidates[0]

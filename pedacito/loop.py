@@ -1775,7 +1775,15 @@ def _note_tests_not_run(root, cfg, task: str,
 # page errors (BUG-216). Enable the named check for the run; the execution
 # boundary (allow_shell) is still the user's to grant, and a run that cannot
 # execute keeps the honest tests_not_run verdict above.
-_TASK_DOM_RE = re.compile(r"\bdom\s*check\b", re.IGNORECASE)
+_TASK_DOM_RE = re.compile(
+    r"\bdom\s*check\b"
+    r"|\bheadless\s+browser\b"
+    r"|\bbrowser\s+(?:check|test|verification)\b"
+    # "verify/test/load ... in a (headless) browser": a verb of checking,
+    # then a short span, then "in [a/the] [headless] browser".
+    r"|\b(?:verify|test|check|load|open|run|validate|confirm)\b"
+    r"[^.\n]{0,40}?\bin\s+(?:a\s+|an\s+|the\s+)?(?:headless\s+)?browser\b",
+    re.IGNORECASE)
 
 
 def _infer_task_checks(root, cfg, task: str) -> None:
@@ -2294,6 +2302,61 @@ def _record_repair_lesson(root, cfg, pending: list,
     return n
 
 
+def _restore_rejected_files(root, backup_dir, rels, idx, cfg):
+    """BUG-218: put the files a failed gate rejected back to their pre-task
+    bytes, so an unrepairable violation is not left sitting in the tree.
+
+    A file the task MODIFIED is restored from the snapshot (first copy wins,
+    so these are the pre-task bytes); a file the task CREATED has no snapshot
+    copy and is removed instead. Returns (restored, deleted, idx). A None
+    backup_dir (review/dry runs, or a caller with no snapshot) is a graceful
+    no-op. Never raises: a rollback that cannot run must not sink the report
+    of the failure that triggered it."""
+    restored: list[str] = []
+    deleted: list[str] = []
+    if backup_dir is None:
+        return restored, deleted, idx
+    from . import security
+    backup_dir = Path(backup_dir)
+    root = Path(root)
+    try:
+        created = set(fileio.created_manifest(backup_dir).read_text(
+            encoding="utf-8").splitlines())
+    except OSError:
+        created = set()
+    for rel in dict.fromkeys(rels):
+        rel = fileio.normalise_rel(rel)
+        if not rel:
+            continue
+        try:
+            dest = security.resolve_safe_path(root, rel)
+        except Exception:
+            continue
+        src = backup_dir / rel
+        if src.is_file():
+            try:
+                fileio.copy_file_atomic(src, dest)
+                restored.append(rel)
+            except OSError:
+                continue
+        elif rel in created and dest.is_file():
+            try:
+                dest.unlink()
+                deleted.append(rel)
+            except OSError:
+                continue
+            # A deleted file's stale index entry dies on the next refresh;
+            # re-indexing a path that no longer exists only logs a warning.
+            continue
+        else:
+            continue
+        try:
+            idx = index_mod.reindex_file(idx, rel, cfg)
+        except Exception:
+            pass
+    return restored, deleted, idx
+
+
 def _post_edit_tests(root, cfg, agent, idx, task, results, reply, backup_dir,
                      baseline, edit_files, collect=None):
     """After edits were written, run the impacted tests (`verify_tests`).
@@ -2367,6 +2430,30 @@ def _post_edit_tests(root, cfg, agent, idx, task, results, reply, backup_dir,
         if tail:
             msg += "\n" + "\n".join(tail)
         collect.append(verify_mod.Finding("tests", severity, "", msg))
+
+    def rollback_frontend(errors) -> None:
+        """BUG-218: the frontend gate ended unresolved -- restore the files it
+        rejected to their pre-task bytes so a broken module graph is not left
+        in the tree. The wording above stays honest (the edits DID land); this
+        is the cleanup at the failure exit, not a claim the write was refused.
+        """
+        nonlocal idx
+        from . import spec as spec_mod
+        rels = [spec_mod.contract_error_file(e) for e in errors]
+        rels = [r for r in rels if r]
+        if not rels:
+            return
+        restored, deleted, idx = _restore_rejected_files(
+            root, backup_dir, rels, idx, cfg)
+        if restored or deleted:
+            workspace.log_event(
+                root, "frontend gate unresolved: restored "
+                      f"{len(restored)} rejected file(s) to their pre-task "
+                      f"bytes and removed {len(deleted)} created file(s) so "
+                      "the broken contract is not left in the tree", "WARN")
+            print(f"  [frontend gate: could not repair; rolled back "
+                  f"{len(restored)} modified and removed {len(deleted)} "
+                  "created file(s) to the pre-task state]", file=sys.stderr)
 
     changed = sorted({r.file for r in results if r.ok and r.file}) or edit_files
     base_out = (baseline[1] if baseline is not None and not baseline[0]
@@ -2497,6 +2584,7 @@ def _post_edit_tests(root, cfg, agent, idx, task, results, reply, backup_dir,
                 violations=[str(e)[:200] for e in fe[:10]])
             if round_ >= max_rounds:
                 unresolved('frontend', fe)
+                rollback_frontend(fe)
                 break
             finding = verify_mod.Finding(
                 "frontend", "error", "",
@@ -2510,10 +2598,12 @@ def _post_edit_tests(root, cfg, agent, idx, task, results, reply, backup_dir,
                                                 results)
             if not fixed:
                 unresolved('frontend', fe)      # BUG-311: keep the blocker
+                rollback_frontend(fe)
                 break
             new = agent._apply_once(fixed, False, backup_dir)
             if not any(r.ok for r in new):
                 unresolved('frontend', fe)
+                rollback_frontend(fe)
                 break
             results = _merge_repair_results(results, new)
             reply = (reply.rstrip() + "\n\n" + fixed)
@@ -3733,12 +3823,14 @@ def _run_task_once(root: Path, cfg, client, agent, idx, task: str, *,
                     gathered=gathered,
                     backup_dir=None if review else backup_dir)
                 if apply and not review and answer_system is None \
-                        and not is_repair and results:
+                        and not is_repair and hasattr(agent, "_coverage_pass"):
                     # BUG-213: the ordinary answer path owes the same
                     # batch-level coverage verdict and ONE bounded follow-up
                     # the incremental microloop runs; a zero-intent answer
                     # run used to skip both because it never entered
-                    # apply_edit_intents. Preflight findings were already
+                    # apply_edit_intents. The guard must NOT require results:
+                    # a zero-edit answer is exactly the case that owes the
+                    # coverage verdict. Preflight findings were already
                     # logged above: only the new ones reach the log here.
                     logged = {(f.kind, f.file, f.message) for f in findings}
                     results, reply, findings = agent._coverage_pass(

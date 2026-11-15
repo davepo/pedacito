@@ -106,11 +106,55 @@ def card_meta(card: dict | None) -> dict:
             "card_score": score, "card_choices": card.get("choices") or {}}
 
 
+def _refilter_saved_cards() -> None:
+    """Re-derive the specialty tags of every saved card under the current
+    rules (item 15): cards calibrated before the edit-skill gate could tag a
+    model that cannot hold the edit format as a coding specialist, and
+    routing reads those tags. Persists only when a card actually changes; an
+    explicit config `specialties` list still overrides in `apply()`."""
+    data = _load_all()
+    if not data:
+        return
+    changed = False
+    for key, card in data.items():
+        if not isinstance(card, dict):
+            continue
+        measured = card.get("measured")
+        if not isinstance(measured, dict) or "specialties" not in measured:
+            continue
+        model_id = str(card.get("model") or str(key).rsplit("|", 1)[-1])
+        try:
+            arch = arch_defaults.match_arch(model_id)
+        except Exception:
+            arch = None
+        tags = specialty_tags_from_measurements(
+            model_id, measured,
+            arch_tags=arch["specialties"] if arch is not None else ())
+        if tags == list(measured.get("specialties") or []):
+            continue
+        measured["specialties"] = tags
+        ch = card.get("choices")
+        if isinstance(ch, dict) and "specialties" in ch:
+            ch["specialties"] = list(tags)
+        changed = True
+    if not changed:
+        return
+    try:
+        p = _path()
+        p.parent.mkdir(parents=True, exist_ok=True)
+        tmp = p.with_suffix(".tmp")
+        tmp.write_text(json.dumps(data, indent=1), encoding="utf-8")
+        tmp.replace(p)
+    except OSError:
+        pass                      # a read-only config dir must not break runs
+
+
 def load(cfg, allow_stale: bool = False) -> dict | None:
     """The saved card for the configured server+model, or None when there is
     none, it is from an unknown card version, or it has expired. A v1 card is
     returned for display but marked `_needs_recalibrate`: its measurements are
     single-run, so `apply` does not use it and the render says so."""
+    _refilter_saved_cards()
     card = _load_all().get(card_key(cfg))
     if not isinstance(card, dict) or card.get("version") not in (1, CARD_VERSION):
         return None
@@ -921,14 +965,29 @@ def _t_orchestrator_plan(client, cfg) -> tuple[float, list[str]]:
                  "(parser, cli, tests last)"]
 
 
+# Specialties that mean "can drive the edit loop": a probe answered once does
+# not earn them unless the model also holds the edit format and picks the
+# right action (item 15). translation_i18n is prose, not editing, and stays
+# ungated.
+_EDIT_SPECIALTIES = frozenset({"coding", "frontend_ui", "3d_graphics_svg",
+                               "math_algorithms", "testing_qa", "sql_data"})
+
+
 def specialty_tags_from_measurements(model_id: str, measured: dict,
                                      arch_tags=()) -> list[str]:
     """Combine name heuristics, the architecture library's recommended tags,
-    the micro-probe scores and the harness skills: edit_format AND
-    tool_choice >= 0.75 earn coding+testing_qa, a weak edit_format (< 0.5)
-    strips coding again. `general` drops out as soon as any specific tag is
-    earned. Canonical order."""
+    the micro-probe scores and the harness skills. Every editing specialty
+    additionally needs measured edit_format >= 0.65 AND tool_choice >= 0.5:
+    a model that cannot hold the edit format is not a coding/frontend/math/
+    testing/sql specialist however it answers a one-shot probe (item 15).
+    edit_format AND tool_choice >= 0.75 earn coding+testing_qa, a weak
+    edit_format (< 0.5) strips coding again. Names that say OCR, router,
+    orchestrator or embedder are never editing specialists. `general` drops
+    out as soon as any specific tag is earned. Canonical order."""
     from .config import SPECIALTIES
+    name = str(model_id or "").lower()
+    if any(w in name for w in ("ocr", "router", "orchestrator", "embed")):
+        return ["general"]
     tags = set(infer_name_specialties(model_id))
     tags.update(str(t) for t in (arch_tags or ()))
     if measured.get("svg_ui", 0.0) >= _SPECIALTY_THRESHOLD:
@@ -942,8 +1001,11 @@ def specialty_tags_from_measurements(model_id: str, measured: dict,
     if measured.get("testing_qa", 0.0) >= _SPECIALTY_THRESHOLD:
         tags.add("testing_qa")
     ed = measured.get("edit_format", 0.0)
-    if ed >= 0.75 and measured.get("tool_choice", 0.0) >= 0.75:
+    tc = measured.get("tool_choice", 0.0)
+    if ed >= 0.75 and tc >= 0.75:
         tags.update(("coding", "testing_qa"))
+    if ed < 0.65 or tc < 0.5:
+        tags -= _EDIT_SPECIALTIES
     if ed < 0.5:
         tags.discard("coding")
     if tags - {"general"}:

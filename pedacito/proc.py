@@ -20,13 +20,53 @@ from __future__ import annotations
 import os
 import signal
 import subprocess
+import sys
 import threading
 import time
+from pathlib import Path
 
 # Win32 CREATE_SUSPENDED. subprocess does not export it (it only names the
 # console/process-group flags), so spell the flag out: the child is created
 # frozen and the caller resumes it after wrapping it in a job object.
 _CREATE_SUSPENDED = 0x00000004
+
+
+def venv_bin_dirs(root) -> list[str]:
+    """The project's virtualenv bin directories that exist on disk, plus the
+    running interpreter's own directory (Hunt #12 §5). `bin_dir` is `Scripts`
+    on Windows and `bin` on POSIX. Order: .venv, venv, then the interpreter."""
+    bin_dir = "Scripts" if os.name == "nt" else "bin"
+    out: list[str] = []
+    try:
+        base = Path(root) if root is not None else None
+    except (TypeError, ValueError):
+        base = None
+    if base is not None:
+        for name in (".venv", "venv"):
+            d = base / name / bin_dir
+            if d.is_dir():
+                out.append(str(d))
+    exe_dir = str(Path(sys.executable).parent)
+    if exe_dir and exe_dir not in out:
+        out.append(exe_dir)
+    return out
+
+
+def with_venv_path(env: dict | None, root) -> dict:
+    """The child environment with the project's venv bin dirs prepended to
+    PATH, so a bare `pytest -q` / `ruff check .` resolves when the tool lives
+    in `.venv/bin` (or Pedacito's own venv) rather than the global PATH.
+    Everything else passes through untouched; an explicit env stays explicit
+    (a copy, never the caller's dict)."""
+    base = dict(os.environ if env is None else env)
+    dirs = venv_bin_dirs(root)
+    if dirs:
+        path = base.get("PATH") or os.environ.get("PATH", "")
+        parts = path.split(os.pathsep) if path else []
+        prepend = [d for d in dirs if d not in parts]
+        if prepend:
+            base["PATH"] = os.pathsep.join(prepend + parts)
+    return base
 
 
 def spawn(command, *, cwd, env: dict | None = None,
@@ -48,7 +88,7 @@ def spawn(command, *, cwd, env: dict | None = None,
         kwargs["creationflags"] = _CREATE_SUSPENDED
     return subprocess.Popen(
         command, cwd=str(cwd), stdin=subprocess.DEVNULL,
-        stdout=stdout, stderr=stderr, env=env, **kwargs)
+        stdout=stdout, stderr=stderr, env=with_venv_path(env, cwd), **kwargs)
 
 
 def terminate(proc: subprocess.Popen) -> None:
@@ -106,7 +146,7 @@ def run(command, *, cwd, timeout: float | None = None,
             command, cwd=str(cwd),
             stdin=subprocess.DEVNULL if stdin_text is None else subprocess.PIPE,
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-            shell=shell, env=env, **kwargs)
+            shell=shell, env=with_venv_path(env, cwd), **kwargs)
     except (OSError, ValueError) as e:
         return None, str(e), "error", time.monotonic() - started
     if stdin_text is not None and p.stdin is not None:

@@ -46,6 +46,7 @@ from . import workspace
 from .agent import Agent
 from .config import (Config, ConfigError, REFERENCE_TEMPLATE, TEMPLATE,
                      USER_CONFIG, _ask, _guess_tier, auto_fit,
+                     cost_blind_warning, fill_default_prices,
                      find_project_config, interactive_setup,
                      is_project_config_path, load as load_config,
                      write_template)
@@ -175,6 +176,10 @@ def _config(args) -> Config:
     if getattr(args, "model", None):
         cfg.model = args.model
         cfg.sources["model"] = "--model"
+    if getattr(args, "url", None) or getattr(args, "model", None):
+        # load() priced the config file's endpoint; --url/--model may point
+        # somewhere else. Defaults only -- explicit prices still win.
+        fill_default_prices(cfg)
     if getattr(args, "steps", None) is not None:
         cfg.max_steps = args.steps
         cfg.sources["max_steps"] = "--steps"
@@ -184,6 +189,9 @@ def _config(args) -> Config:
     if getattr(args, "max_cost", None) is not None:
         cfg.max_cost = args.max_cost
         cfg.sources["max_cost"] = "--max-cost"
+        blind = cost_blind_warning(cfg)
+        if blind:
+            print(f"[config warning] {blind}", file=sys.stderr)
     # Fit token budgets to the server's real context window before any request;
     # `config` skips this so it reports the true sources.
     if getattr(args, "cmd", "") != "config":
@@ -799,14 +807,17 @@ def _strict_replay_error(args, client) -> str:
 def _strict_task_error(args, tr) -> str:
     """The --strict failure text for one task result, or '' when the gate
     passes or is disabled: a failed edit block (a partial application) or
-    impacted tests still red after the repair rounds."""
+    impacted tests still red after the repair rounds. A purely pre-existing
+    red suite (R2, BUG-220) is not this task's failure -- same exemption the
+    loop's own strict gate uses."""
     if not getattr(args, "strict", False) or tr is None:
         return ""
     bad = [r for r in getattr(tr, "results", []) if not r.ok]
     if bad:
         detail = "; ".join(f"{r.file}: {r.message}" for r in bad)
         return f"strict: {len(bad)} edit block(s) failed: {detail[:300]}"
-    if getattr(tr, "tests_ok", None) is False:
+    if (getattr(tr, "tests_ok", None) is False
+            and not getattr(tr, "tests_preexisting_only", False)):
         return "strict: impacted tests still fail after the repair rounds"
     return ""
 
@@ -1738,7 +1749,7 @@ def _cmd_procs(args) -> int:
     action = getattr(args, "action", "list") or "list"
     name = getattr(args, "name", "") or ""
     if action == "list":
-        print(processes.render_list(root))
+        print(processes.render_list(root, all=getattr(args, "all", False)))
         return 0
     if not name:
         print(f"procs {action} needs a process NAME", file=sys.stderr)
@@ -2093,9 +2104,10 @@ def _cmd_rename(args) -> int:
     or comment that merely contains the old name survives), and every changed
     file passes the AST syntax gate BEFORE anything is written. --strings
     additionally moves whole-word occurrences inside string literals (test
-    labels, docs); comments are never touched. Default is a dry-run diff
-    preview; --apply writes, snapshotting the originals under
-    .pedacito/backups/ so `pedacito restore` can undo the run."""
+    labels, docs); --include-labels moves only test-label strings; comments
+    are never touched. Default is a dry-run diff preview; --apply writes,
+    snapshotting the originals under .pedacito/backups/ so `pedacito restore`
+    can undo the run."""
     from . import fileio, refactor
     root = _root(args)
     state = {"dir": None}
@@ -2110,7 +2122,8 @@ def _cmd_rename(args) -> int:
         root, args.old, args.new, scope_file=args.file or None,
         dry_run=not args.apply,
         before_write=_snapshot_before_write if args.apply else None,
-        include_strings=bool(getattr(args, "strings", False)))
+        include_strings=bool(getattr(args, "strings", False)),
+        include_labels=bool(getattr(args, "include_labels", False)))
     if not res["ok"]:
         print(f"rename refused: {res.get('error', 'unknown failure')}",
               file=sys.stderr)
@@ -2127,6 +2140,10 @@ def _cmd_rename(args) -> int:
     if getattr(args, "strings", False) and res.get("string_replacements"):
         strings_note = (f" ({res['string_replacements']} inside string "
                         "literals)")
+    elif getattr(args, "include_labels", False) \
+            and res.get("label_replacements"):
+        strings_note = (f" ({res['label_replacements']} inside test-label "
+                        "strings)")
     print(f"{verb} `{args.old}` -> `{args.new}`: "
           f"{res['total_replacements']}{strings_note} occurrence(s) in "
           f"{len(res['files_modified'])} file(s)")
@@ -2151,7 +2168,8 @@ def _cmd_rename(args) -> int:
             print(f"  note: {len(res['string_matches'])} string literal(s) "
                   f"still name `{args.old}` (test labels, docs); the rename "
                   "leaves strings untouched by default -- update them if "
-                  "they name the API, or rerun with --strings:")
+                  "they name the API, or rerun with --include-labels (test "
+                  "labels only) / --strings (all strings):")
         for sm in res["string_matches"][:8]:
             print(f"    {sm}")
     if not args.apply:
@@ -2781,6 +2799,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_procs.add_argument("name", nargs="?", default="")
     p_procs.add_argument("--tail", type=int, default=4000,
                          help="with logs: last N characters (default 4000)")
+    p_procs.add_argument("--all", action="store_true",
+                         help="with list: also show superseded stopped entries")
     p_procs.add_argument("--root", default=None)
     p_procs.add_argument("--config", metavar="FILE")
     p_procs.add_argument("--profile", metavar="NAME")
@@ -2884,6 +2904,10 @@ def build_parser() -> argparse.ArgumentParser:
                           help="also rename whole-word occurrences inside "
                                "string literals (test labels, docs that name "
                                "the API); comments stay untouched")
+    p_rename.add_argument("--include-labels", action="store_true",
+                          help="also rename test-label strings only (the "
+                               "first argument of test/it/describe/suite); "
+                               "every other string literal stays untouched")
     p_rename.add_argument("--apply", action="store_true",
                           help="write the rename (default: dry-run preview "
                                "with unified diffs)")

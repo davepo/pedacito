@@ -95,6 +95,11 @@ _MUTATING = {"write", "append", "move", "delete", "undo", "rename",
 # Steps discarded for a cut-off payload before gather gives up.
 _MAX_PAYLOAD_CUTS = 2
 
+# Consecutive malformed steps (rejected before dispatch, so they never reach
+# the dispatched-error streak) before gather gives up and answers with what
+# it has (BUG-209).
+_MAX_MALFORMED_STEPS = 3
+
 # Chars-per-token heuristic for the `read`/`context` token budget
 # (cfg.max_read_tokens) when the server has no calibrated tokenizer;
 # a calibrated `client.chars_per_token` measures instead.
@@ -2336,6 +2341,7 @@ class Agent:
         last_sig = None          # previous step's action+args, for loops
         repeated = 0
         payload_cuts = 0         # steps discarded for a cut-off payload
+        malformed_streak = 0     # consecutive steps rejected before dispatch
         # One targeted recovery prompt per distress signal before gather gives
         # up (cfg.stuck_recovery): a small model often escapes a loop when
         # told, specifically, what it is doing.
@@ -2673,9 +2679,19 @@ class Agent:
             # error streak bounds the stall, without spending a live lookup.
             if action == "read" and not str(stepjson.get("file") or "").strip() \
                     and not str(stepjson.get("symbol") or "").strip():
+                # Name a concrete, copyable example -- a real path from the
+                # index when there is one -- instead of only saying what is
+                # missing: small models repeat the empty read when the
+                # correction stays abstract.
+                example = ""
+                indexed = getattr(self.index, "files", None) or []
+                if indexed:
+                    example = (' Example: {"action":"read","file":'
+                               + json.dumps(indexed[0])
+                               + ',"start":1,"end":100}')
                 obs = ("ERROR: `read` needs a `file` (or a `symbol`) to read. "
                        "Pick an exact path from the PROJECT MAP, or use "
-                       "`find`/`outline` to locate one first.")
+                       "`find`/`outline` to locate one first." + example)
                 seen_failures.setdefault(
                     sig, (step, self.index.generation, self.fold_count,
                           mutations))
@@ -2689,12 +2705,23 @@ class Agent:
                                  "content": f"{obs}\n\n{nudge(step + 1)}"})
                 budget -= len(obs)
                 self._fit(messages, gclient)
+                malformed_streak += 1
                 if verbose:
                     print("  [step rejected: `read` (no file) -- no file or "
-                          "symbol given]", file=sys.stderr)
+                          f"symbol given ({malformed_streak}/"
+                          f"{_MAX_MALFORMED_STEPS})]", file=sys.stderr)
+                # This path never dispatches, so the ERROR streak below
+                # cannot see it: bound the stall here too.
+                if malformed_streak >= _MAX_MALFORMED_STEPS:
+                    if verbose:
+                        print(f"  [gather stopped after {malformed_streak} "
+                              "consecutive malformed steps; moving to answer]",
+                              file=sys.stderr)
+                    break
                 if note_progress(False):
                     break
                 continue
+            malformed_streak = 0
 
             detail = (stepjson.get("file") or stepjson.get("pattern")
                       or stepjson.get("symbol") or stepjson.get("command") or "")
