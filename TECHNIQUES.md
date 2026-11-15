@@ -2000,7 +2000,54 @@ Settings → Profiles. `pedacito profiles` lists the effective tags. Covered by
 `tests/test_specialist_routing.py` (tagging, probes, scoring, handoff vs.
 dual-server, fallback, GUI endpoints).
 
-## Quick reference: techniques 5, 11, 17 to 50
+### 51. Windows dev-server cleanup: a job the child can't escape, and a walk that outlives the leader
+
+The background registry keeps a dev server alive across tasks and must stop the
+whole tree on `stop`. POSIX has process groups: `proc.spawn` makes the child a
+session leader and `stop` signals the group by the pid it started with, so even
+orphaned descendants die. Windows has no process groups, and `taskkill /T` walks
+only a LIVE parent-child chain -- a launcher that spawns the real server and
+exits (`npm run dev`, a wrapper script, a re-exec) leaves its child holding the
+port while `stop` reports success. The crucible test
+`test_stop_reaps_an_orphaned_grandchild_after_the_leader_exits` exists to catch
+exactly that, and it went red on the Windows runner.
+
+**The runner is the hostile case.** GitHub Actions wraps every Windows step in a
+job object that refuses breakaway. A child spawned from the step already belongs
+to that job, and real Windows can refuse `AssignProcessToJobObject` for a nested
+job -- so the registry's own job silently failed to create, `stop` fell back to
+`taskkill /T`, and the dead leader's orphan survived. Wine is too permissive to
+reproduce the refusal (it allows the nesting), which is why the bug only showed
+on the runner.
+
+**The fix has three parts.** *Spawn suspended, wrap, resume:* on Windows the
+child is created with `CREATE_SUSPENDED` (0x4 -- subprocess does not export the
+flag), put in a named job, then its initial thread resumed via a toolhelp
+snapshot (Popen drops the thread handle). Job membership is inherited only at
+CREATION, so a child that runs before assignment can spawn descendants that
+escape the job forever; freezing it closes that race. If the resume fails the
+child is killed and respawned running, never left frozen. *An orphan-aware
+fallback:* when no job could be created, `stop` walks the process snapshot by
+`ParentProcessId` -- which Windows keeps after the parent dies, unlike taskkill's
+live chain -- and kills each descendant; a creation-time guard
+(`GetProcessTimes` vs the leader's recorded birth) rejects PID reuse, since a
+"child" created before its parent is a stranger wearing the same pid.
+*Diagnostics, not silence:* `_job_wrap` returns `(job, note)` and the record
+carries `job_note` (the Win32 error, naming the runner's error-5 refusal) and
+`born` (the leader's creation time), so a stop that cannot reap the tree says why.
+
+**Prevention.** The Win32 sequence is pinned by fake-kernel32 tests that run on
+every platform (`tests/test_windows_portability.py`): refusal + error note, the
+orphan walk with a reuse trap, resume-only-own-threads, spawn-wrap-resume order,
+and respawn-on-resume-failure. A Windows-only crucible test puts the test process
+itself inside a job (the runner's shape) and runs the orphan scenario. Two
+portability traps the fakes cannot see, caught only by running on a real `nt`
+interpreter (Wine): `subprocess.CREATE_SUSPENDED` does not exist, and the
+thread-snapshot API is `Thread32First`/`Thread32Next` -- there is NO wide variant
+(only the process snapshots have `W`). Covered by
+`tests/test_processes_crucible.py` and `tests/test_windows_portability.py`.
+
+## Quick reference: techniques 5, 11, 17 to 51
 
 | Technique | Section | How to turn it off | Where you see it |
 |---|---|---|---|
@@ -2042,6 +2089,7 @@ dual-server, fallback, GUI endpoints).
 | Cargo test narrowing (integration-only changes) | §48 | No flag; fires only when provably safe (`test_command` wins) | `cargo test --test NAME` in the post-edit hook and `pedacito tests` output |
 | Strategy shift when no `escalate` role exists | §49 | `auto_escalate = false` | `strategy_shift` event; one same-model retry with the edit style flipped after an escalation reason |
 | Specialist auto-routing + clean VRAM handoff | §50 | `auto_route_specialties = false` (default), or `--no-auto-route` per run | `specialist_routed` / `model_swap` events; **✦ Auto-route** in the GUI top bar; Specialties column in `pedacito profiles` |
+| Windows process-tree reaping (suspended job wrap + orphan walk) | §51 | None (always on; it is the Windows `stop` path) | `job_note` / `born` in `.pedacito/procs/*.json`; the orphan crucible + fake-kernel32 portability tests |
 
 ## Techniques that exist but are not a good fit
 

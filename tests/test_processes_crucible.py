@@ -16,10 +16,13 @@ readiness waits that quote the child's log when they run out.
 from __future__ import annotations
 
 import json
+import os
 import shlex
 import sys
 import time
 from pathlib import Path
+
+import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -216,7 +219,8 @@ def test_stop_kills_the_whole_process_tree(tmp_path):
     assert _wait_dead(parent_pid), "parent survived stop"
     assert _wait_dead(grandchild_pid), (
         "grandchild survived stop: the registry killed the leader but not "
-        "its process group")
+        "its process group "
+        f"(job={rec.get('job')!r}, job_note={rec.get('job_note')!r})")
 
 
 _ORPHAN = r'''
@@ -238,13 +242,105 @@ def test_stop_reaps_an_orphaned_grandchild_after_the_leader_exits(tmp_path):
     grandchild_pid = int(_wait_file(
         root / "grandchild.pid",
         log=processes._log_path(root, "orphan")).strip())
-    assert _wait_dead(int(rec["pid"]), 3.0)
-    assert processes._alive(grandchild_pid)
+    try:
+        assert _wait_dead(int(rec["pid"]), 3.0)
+        assert processes._alive(grandchild_pid)
 
-    out = processes.stop(root, "orphan")
-    assert out.startswith("stopped orphan")
-    assert _wait_dead(grandchild_pid), (
-        "the leader was gone, but stop failed to signal its process group")
+        out = processes.stop(root, "orphan")
+        assert out.startswith("stopped orphan")
+        assert _wait_dead(grandchild_pid), (
+            "the leader was gone, but stop failed to signal its process group "
+            f"(job={rec.get('job')!r}, job_note={rec.get('job_note')!r})")
+    finally:
+        if processes._alive(grandchild_pid):
+            processes._terminate_pid(grandchild_pid)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="job objects are Windows-only")
+def test_stop_reaps_the_orphan_even_inside_a_runner_style_job(tmp_path):
+    """The CI failure's exact shape: the test process itself sits in a job.
+
+    GitHub Actions wraps every Windows step in a job object; a child spawned
+    from it already belongs to a job, and real Windows can refuse the
+    registry's nested assignment. Put THIS process in a job first -- no
+    limits, and no KILL_ON_JOB_CLOSE, so closing the handle cannot take the
+    test runner down -- then run the orphan scenario. Whether the nested wrap
+    succeeds (permissive Windows) or is refused (the runner), `stop` must
+    reap the grandchild. On a real runner the assignment below is refused
+    because we are already in ITS job -- which is precisely the case under
+    test, so the refusal is ignored, not asserted away.
+    """
+    import ctypes
+    k = processes._kernel32()
+    assert k is not None
+    outer = k.CreateJobObjectW(None, None)      # anonymous, no limits set
+    assert outer, f"CreateJobObjectW failed: {ctypes.get_last_error()}"
+    hself = k.OpenProcess(
+        processes._PROCESS_SET_QUOTA | processes._PROCESS_TERMINATE,
+        False, os.getpid())
+    try:
+        if hself:
+            k.AssignProcessToJobObject(outer, hself)   # best effort, see above
+        root = tmp_path / "proj"
+        root.mkdir()
+        script = _write(root, "orphan.py", _ORPHAN)
+        rec = processes.start(root, _cmd(script), name="injob", wait=5)
+        grandchild_pid = int(_wait_file(
+            root / "grandchild.pid",
+            log=processes._log_path(root, "injob")).strip())
+        try:
+            assert _wait_dead(int(rec["pid"]), 3.0)
+            assert processes._alive(grandchild_pid)
+            out = processes.stop(root, "injob")
+            assert out.startswith("stopped injob")
+            assert _wait_dead(grandchild_pid), (
+                "inside a runner-style job, stop left the orphan alive "
+                f"(job={rec.get('job')!r}, job_note={rec.get('job_note')!r})")
+        finally:
+            if processes._alive(grandchild_pid):
+                processes._terminate_pid(grandchild_pid)
+    finally:
+        if hself:
+            k.CloseHandle(hself)
+        # Members outlive the handle: without KILL_ON_JOB_CLOSE this only
+        # drops our reference. The process stays in the (harmless, empty)
+        # job for the rest of the session -- Windows has no un-assign.
+        k.CloseHandle(outer)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="job objects are Windows-only")
+def test_stop_walk_reaps_orphans_when_no_job_could_be_created(tmp_path):
+    """Force the fallback the runner actually needs: no job, leader gone.
+
+    On a permissive Windows the wrap succeeds and `stop` reaps via the job, so
+    the snapshot walk would never run. Clear the job from the record to model
+    the runner's refusal, then stop: the walk must reach the orphan through the
+    REAL Process32/GetProcessTimes APIs (the fakes pin the logic, but only a
+    real nt run proves the struct layouts and entry points).
+    """
+    root = tmp_path / "proj"
+    root.mkdir()
+    script = _write(root, "orphan.py", _ORPHAN)
+    rec = processes.start(root, _cmd(script), name="walk", wait=5)
+    grandchild_pid = int(_wait_file(
+        root / "grandchild.pid",
+        log=processes._log_path(root, "walk")).strip())
+    try:
+        assert _wait_dead(int(rec["pid"]), 3.0)
+        assert processes._alive(grandchild_pid)
+        # Model the refused wrap: the record carries no job, only the birth
+        # time the walk uses to tell family from pid reuse.
+        rec["job"] = ""
+        processes._write_record(root, rec)
+
+        out = processes.stop(root, "walk")
+        assert out.startswith("stopped walk")
+        assert _wait_dead(grandchild_pid), (
+            "with no job, the snapshot walk left the orphan alive "
+            f"(born={rec.get('born')!r})")
+    finally:
+        if processes._alive(grandchild_pid):
+            processes._terminate_pid(grandchild_pid)
 
 
 _CRASH = r'''

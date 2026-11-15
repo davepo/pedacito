@@ -10,13 +10,22 @@
 The registry lives under `.pedacito/procs/`: one JSON record per process and a
 `.log` file with its combined stdout/stderr. PIDs are process-group leaders, so
 `stop` reaps descendants too; on Windows, which has no process groups, the child
-is put in a named job object that plays the same role (see `_job_wrap`). This is
-deliberately a small, local-first manager: no daemon, no sockets -- just enough
-to start a server, find its printed URL, read its log, and stop it later.
+is spawned SUSPENDED and put in a named job object before it runs (see
+`_job_wrap`), so every descendant it later spawns inherits membership. When a
+job cannot be created -- CI runners wrap every step in a job that refuses
+nested assignment, and older Windows refuses it outright -- `stop` falls back
+to `taskkill /T` plus a process-snapshot walk that reaches descendants even
+after their leader exited (`_windows_descendants`). This is deliberately a
+small, local-first manager: no daemon, no sockets -- just enough to start a
+server, find its printed URL, read its log, and stop it later.
 """
 
 from __future__ import annotations
 
+# ctypes at module level, NOT lazily inside the Windows helpers: importing it
+# while a test has patched os.name to "nt" would run ctypes' own Windows
+# branch on Linux. Only the WinDLL itself stays lazy (see `_kernel32`).
+import ctypes
 import json
 import os
 import re
@@ -25,6 +34,7 @@ import signal
 import subprocess
 import time
 import uuid
+from ctypes import wintypes
 from pathlib import Path
 
 from . import browser, proc, safety
@@ -153,10 +163,43 @@ def start(root, command, *, name: str = "", cfg=None,
     log.parent.mkdir(parents=True, exist_ok=True)
     env = safety.child_env(cfg)
     p = None
+    job = job_note = ""
+    born = 0.0
     try:
         with log.open("ab") as fh:
             p = proc.spawn(argv, cwd=root, env=env,
-                           stdout=fh, stderr=subprocess.STDOUT)
+                           stdout=fh, stderr=subprocess.STDOUT,
+                           suspended=(os.name == "nt"))
+        _CHILDREN[p.pid] = p
+        # Windows: the child is frozen, so it cannot spawn anything before it
+        # is in the job -- membership is inherited at CREATION, and a launcher
+        # that runs first can leave its descendants outside the job forever.
+        if os.name == "nt":
+            k = _kernel32()
+            if k is not None:
+                ft = _process_created(k, p.pid)
+                if ft:
+                    born = ft / 10_000_000 - 11644473600
+        job, job_note = _job_wrap(p.pid, name)
+        if not _resume_child(p):
+            # Could not resume (exotic): a frozen server is worse than a racy
+            # job wrap -- respawn running, and wrap best effort.
+            _forget_child(p.pid)
+            try:
+                p.kill()
+                p.wait(timeout=5)
+            except (OSError, subprocess.SubprocessError):
+                pass
+            with log.open("ab") as fh:
+                p = proc.spawn(argv, cwd=root, env=env,
+                               stdout=fh, stderr=subprocess.STDOUT)
+            _CHILDREN[p.pid] = p
+            k = _kernel32()
+            if k is not None:
+                ft = _process_created(k, p.pid)
+                if ft:
+                    born = ft / 10_000_000 - 11644473600
+            job, job_note = _job_wrap(p.pid, name)
     except (OSError, ValueError) as e:
         rec = {"name": name, "command": command_text, "pid": 0,
                "cwd": str(root), "log": str(log), "url": "", "job": "",
@@ -164,12 +207,9 @@ def start(root, command, *, name: str = "", cfg=None,
                "error": str(e)[:400]}
         _write_record(root, rec)
         return rec
-    _CHILDREN[p.pid] = p
-    # On Windows this must happen before the child can spawn anything: a
-    # descendant created later inherits job membership (see `_job_wrap`).
-    job = _job_wrap(p.pid, name)
     rec = {"name": name, "command": command_text, "pid": p.pid,
            "cwd": str(root), "log": str(log), "url": "", "job": job,
+           "job_note": job_note, "born": born,
            "started": time.time(), "status": "running"}
     # Give a dev server a moment to print its URL. Never block a run for long:
     # `wait` is a ceiling, and a command that exits is reported immediately.
@@ -320,9 +360,6 @@ def _kernel32():
     if _K32_STATE == "unloaded":
         _K32_STATE = "failed"
         try:
-            import ctypes
-            from ctypes import wintypes
-
             k = ctypes.WinDLL("kernel32", use_last_error=True)
             k.CreateJobObjectW.argtypes = [ctypes.c_void_p, wintypes.LPCWSTR]
             k.CreateJobObjectW.restype = wintypes.HANDLE
@@ -339,6 +376,31 @@ def _kernel32():
             k.OpenProcess.restype = wintypes.HANDLE
             k.CloseHandle.argtypes = [wintypes.HANDLE]
             k.CloseHandle.restype = wintypes.BOOL
+            # Resuming the suspended child: Popen closes the initial thread
+            # handle, so the thread is found in the system snapshot by owner.
+            k.CreateToolhelp32Snapshot.argtypes = [wintypes.DWORD,
+                                                   wintypes.DWORD]
+            k.CreateToolhelp32Snapshot.restype = wintypes.HANDLE
+            k.Thread32First.argtypes = [wintypes.HANDLE, ctypes.c_void_p]
+            k.Thread32First.restype = wintypes.BOOL
+            k.Thread32Next.argtypes = [wintypes.HANDLE, ctypes.c_void_p]
+            k.Thread32Next.restype = wintypes.BOOL
+            k.OpenThread.argtypes = [wintypes.DWORD, wintypes.BOOL,
+                                     wintypes.DWORD]
+            k.OpenThread.restype = wintypes.HANDLE
+            k.ResumeThread.argtypes = [wintypes.HANDLE]
+            k.ResumeThread.restype = wintypes.DWORD
+            # The orphan walk: parent pids outlive their parents on Windows.
+            k.Process32FirstW.argtypes = [wintypes.HANDLE, ctypes.c_void_p]
+            k.Process32FirstW.restype = wintypes.BOOL
+            k.Process32NextW.argtypes = [wintypes.HANDLE, ctypes.c_void_p]
+            k.Process32NextW.restype = wintypes.BOOL
+            k.GetProcessTimes.argtypes = [
+                wintypes.HANDLE, ctypes.POINTER(wintypes.FILETIME),
+                ctypes.POINTER(wintypes.FILETIME),
+                ctypes.POINTER(wintypes.FILETIME),
+                ctypes.POINTER(wintypes.FILETIME)]
+            k.GetProcessTimes.restype = wintypes.BOOL
             _K32, _K32_STATE = k, "loaded"
         except Exception:                   # pragma: no cover - no WinDLL
             _K32 = None
@@ -353,15 +415,58 @@ def _close_handle(k, handle) -> None:
         pass
 
 
-def _job_wrap(pid: int, name: str) -> str:
-    """Put the just-spawned child in its own named job; '' when that failed.
+def _last_error(k) -> int:
+    """The Win32 error behind the call that just failed (0 off Windows)."""
+    try:
+        return int(ctypes.get_last_error())
+    except Exception:                       # pragma: no cover - best effort
+        return 0
 
-    Every step is best effort: without a job, `stop` still gets `taskkill /T`,
-    which reaps the tree whenever the leader is still alive.
+
+_WIN_STRUCTS: tuple | None = None
+
+
+def _win_structs() -> tuple:
+    """The snapshot entry structures, built once. Pure ctypes, so they can
+    be constructed on any platform -- the fake-kernel32 tests rely on that."""
+    global _WIN_STRUCTS
+    if _WIN_STRUCTS is None:
+        class THREADENTRY32(ctypes.Structure):
+            _fields_ = [("dwSize", wintypes.DWORD),
+                        ("cntUsage", wintypes.DWORD),
+                        ("th32ThreadID", wintypes.DWORD),
+                        ("th32OwnerProcessID", wintypes.DWORD),
+                        ("tpBasePri", ctypes.c_long),
+                        ("tpDeltaPri", ctypes.c_long),
+                        ("dwFlags", wintypes.DWORD)]
+
+        class PROCESSENTRY32W(ctypes.Structure):
+            _fields_ = [("dwSize", wintypes.DWORD),
+                        ("cntUsage", wintypes.DWORD),
+                        ("th32ProcessID", wintypes.DWORD),
+                        ("th32DefaultHeapID", ctypes.c_size_t),
+                        ("th32ModuleID", wintypes.DWORD),
+                        ("cntThreads", wintypes.DWORD),
+                        ("th32ParentProcessID", wintypes.DWORD),
+                        ("pcPriClassBase", ctypes.c_long),
+                        ("dwFlags", wintypes.DWORD),
+                        ("szExeFile", ctypes.c_wchar * 260)]
+
+        _WIN_STRUCTS = (THREADENTRY32, PROCESSENTRY32W)
+    return _WIN_STRUCTS
+
+
+def _job_wrap(pid: int, name: str) -> tuple[str, str]:
+    """Put the just-spawned (suspended) child in its own named job.
+
+    Returns (job_name, "") on success, ("", reason) when any step failed --
+    the reason lands in the registry record so a stop that cannot reap the
+    tree says WHY instead of failing silently. Every step is best effort:
+    without a job, `stop` still gets `taskkill /T` plus the orphan walk.
     """
     k = _kernel32()
     if k is None or pid <= 0:
-        return ""
+        return "", ""
     # Local\ rather than Global\: the global namespace needs a privilege we may
     # not hold, and a server started in one logon session is only ever stopped
     # from that same session.
@@ -370,21 +475,70 @@ def _job_wrap(pid: int, name: str) -> str:
     try:
         hjob = k.CreateJobObjectW(None, job)
         if not hjob:
-            return ""
+            return "", f"CreateJobObject failed (error {_last_error(k)})"
         hproc = k.OpenProcess(_PROCESS_SET_QUOTA | _PROCESS_TERMINATE,
                               False, pid)
         if not hproc:
-            return ""                       # it already exited: nothing to reap
+            return "", f"OpenProcess failed (error {_last_error(k)})"
         if not k.AssignProcessToJobObject(hjob, hproc):
-            return ""
-        return job
-    except Exception:                       # pragma: no cover - best effort
-        return ""
+            err = _last_error(k)
+            note = f"AssignProcessToJobObject failed (error {err})"
+            if err == 5:                    # ERROR_ACCESS_DENIED
+                note += ("; the child already belongs to a job that refuses "
+                         "nested assignment (CI runners wrap every step in "
+                         "one) -- stop falls back to the orphan walk")
+            return "", note
+        return job, ""
+    except Exception as e:                  # pragma: no cover - best effort
+        return "", f"job setup raised {type(e).__name__}: {str(e)[:80]}"
     finally:
         # Dropping our own handles is safe: membership alone keeps the kernel
         # object (and its name) alive, and the leader is a member by now.
         _close_handle(k, hproc)
         _close_handle(k, hjob)
+
+
+def _resume_child(p) -> bool:
+    """Resume a child spawned CREATE_SUSPENDED (no-op elsewhere).
+
+    Popen closes the initial thread's handle, so the thread is found in the
+    system snapshot by its owner pid; a just-created suspended child has
+    exactly one. False when nothing could be resumed -- the caller respawns
+    without suspension rather than leave a frozen server behind.
+    """
+    if os.name != "nt":
+        return True
+    k = _kernel32()
+    if k is None:
+        return False
+    TH32CS_SNAPTHREAD = 0x00000004
+    THREAD_SUSPEND_RESUME = 0x0002
+    invalid = ctypes.c_void_p(-1).value
+    threadentry32, _ = _win_structs()
+    snap = k.CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0)
+    if not snap or snap == invalid:
+        return False
+    resumed = False
+    try:
+        te = threadentry32()
+        te.dwSize = ctypes.sizeof(te)
+        # Thread32First/Next have NO wide variant (THREADENTRY32 carries no
+        # strings), unlike Process32FirstW/NextW -- don't "correct" these.
+        ok = k.Thread32First(snap, ctypes.byref(te))
+        while ok:
+            if te.th32OwnerProcessID == p.pid:
+                ht = k.OpenThread(THREAD_SUSPEND_RESUME, False,
+                                  te.th32ThreadID)
+                if ht:
+                    if k.ResumeThread(ht) != 0xFFFFFFFF:
+                        resumed = True
+                    _close_handle(k, ht)
+            ok = k.Thread32Next(snap, ctypes.byref(te))
+    except Exception:                       # pragma: no cover - best effort
+        return resumed
+    finally:
+        _close_handle(k, snap)
+    return resumed
 
 
 def _job_kill(job: str) -> bool:
@@ -404,7 +558,96 @@ def _job_kill(job: str) -> bool:
         _close_handle(k, handle)
 
 
-def _terminate_pid(pid: int, job: str = "") -> None:
+def _process_created(k, pid: int) -> int:
+    """A process's creation time as 100ns intervals since 1601 (0 unknown)."""
+    PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+    h = k.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+    if not h:
+        return 0
+    try:
+        born = wintypes.FILETIME()
+        rest = wintypes.FILETIME()
+        if not k.GetProcessTimes(h, ctypes.byref(born), ctypes.byref(rest),
+                                 ctypes.byref(rest), ctypes.byref(rest)):
+            return 0
+        return (born.dwHighDateTime << 32) | born.dwLowDateTime
+    except Exception:                       # pragma: no cover - best effort
+        return 0
+    finally:
+        _close_handle(k, h)
+
+
+def _windows_descendants(pid: int, since: float) -> list[int]:
+    """Descendants of `pid` from the process snapshot, orphans included.
+
+    Windows keeps a process's ParentProcessId after its parent dies (there is
+    no reparenting), so the chain outlives the leader -- unlike `taskkill /T`,
+    which only walks LIVE parents. This is the fallback for when no job object
+    could be created: a CI runner wraps every step in a job that refuses
+    nested assignment, so the registry's own job is exactly what is missing
+    there, and the launcher that exited first is exactly the case it leaves.
+
+    A pid can be reused after its holder exits, so a candidate only counts as
+    a child when it was created AFTER its parent. For the (possibly dead)
+    root, `since` -- the leader's creation time recorded at start -- stands in
+    for the parent's creation time. Best effort throughout: an unreadable
+    snapshot yields no descendants, never an exception.
+    """
+    k = _kernel32()
+    if k is None or pid <= 0:
+        return []
+    TH32CS_SNAPPROCESS = 0x00000002
+    invalid = ctypes.c_void_p(-1).value
+    _, processentry32w = _win_structs()
+    try:
+        snap = k.CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
+        if not snap or snap == invalid:
+            return []
+        procs: list[tuple[int, int]] = []
+        try:
+            pe = processentry32w()
+            pe.dwSize = ctypes.sizeof(pe)
+            ok = k.Process32FirstW(snap, ctypes.byref(pe))
+            while ok:
+                procs.append((int(pe.th32ProcessID),
+                              int(pe.th32ParentProcessID)))
+                ok = k.Process32NextW(snap, ctypes.byref(pe))
+        finally:
+            _close_handle(k, snap)
+        children: dict[int, list[int]] = {}
+        for cpid, ppid in procs:
+            children.setdefault(ppid, []).append(cpid)
+        # FILETIME epoch (1601) vs Unix epoch (1970), in 100ns intervals.
+        since_ft = int((max(0.0, float(since or 0.0)) + 11644473600)
+                       * 10_000_000)
+        born: dict[int, int] = {}
+
+        def created(p: int) -> int:
+            if p not in born:
+                born[p] = _process_created(k, p)
+            return born[p]
+
+        out: list[int] = []
+        queue = [(pid, since_ft)]
+        seen = {pid}
+        while queue:
+            parent, parent_born = queue.pop(0)
+            for child in children.get(parent, ()):
+                if child in seen:
+                    continue
+                seen.add(child)
+                child_born = created(child)
+                if child_born and parent_born and child_born < parent_born:
+                    continue        # pid reuse: "child" predates its parent
+                out.append(child)
+                queue.append((child, child_born or parent_born))
+        return out
+    except Exception:                       # pragma: no cover - best effort
+        return []
+
+
+def _terminate_pid(pid: int, job: str = "", started: float = 0.0,
+                   born: float = 0.0) -> None:
     if os.name == "nt":
         # The job reaches the descendants its leader already orphaned; taskkill
         # is the fallback for records written without one.
@@ -416,6 +659,17 @@ def _terminate_pid(pid: int, job: str = "") -> None:
                                capture_output=True, timeout=10, check=False)
             except (OSError, subprocess.SubprocessError):
                 pass
+            # taskkill /T only walks LIVE parents: when the leader already
+            # exited (a launcher that spawned the real server and left), the
+            # orphans need the snapshot walk. `born` is the leader's creation
+            # time; `started` is the fallback for records written before it.
+            for dpid in _windows_descendants(pid, born or started):
+                try:
+                    subprocess.run(["taskkill", "/F", "/PID", str(dpid)],
+                                   capture_output=True, timeout=10,
+                                   check=False)
+                except (OSError, subprocess.SubprocessError):
+                    pass
         return
     if pid <= 0:
         return
@@ -456,7 +710,9 @@ def stop(root, name: str) -> str:
         known = ", ".join(str(r.get("name")) for r in list_procs(root)) or "(none)"
         return f"ERROR: no background process named '{name}'. Known: {known}"
     pid = int(rec.get("pid") or 0)
-    _terminate_pid(pid, str(rec.get("job") or ""))
+    _terminate_pid(pid, str(rec.get("job") or ""),
+                   started=float(rec.get("started") or 0.0),
+                   born=float(rec.get("born") or 0.0))
     _forget_child(pid)
     rec["status"] = "stopped"
     rec["stopped"] = time.time()

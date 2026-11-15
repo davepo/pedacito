@@ -29,6 +29,7 @@ from pedacito import (  # noqa: E402
     diagnostics,
     edits,
     fileio,
+    index,
     proc,
     processes,
     ratchet,
@@ -41,6 +42,12 @@ from pedacito.config import Config  # noqa: E402
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SCAN_DIRS = (REPO_ROOT / "pedacito", REPO_ROOT / "tests")
+
+# The concrete path class of the REAL filesystem, captured before any test
+# patches os.name. The Windows fakes force this class so registry records land
+# in tmp_path: PosixPath on Linux, WindowsPath on a real nt host. Hardcoding
+# PosixPath would raise NotImplementedError under Wine/Windows.
+_REAL_PATH = Path(".").__class__
 
 
 # ---------------------------------------------------------------------------
@@ -603,17 +610,37 @@ def test_proc_kill_tree_uses_taskkill_on_windows(monkeypatch):
 # keeps the port. The crucible test that proves this needs a Windows runner;
 # these tests pin the Win32 call sequence here, so a wrong argument or a leaked
 # handle fails on the first Linux job instead of on the runner.
+#
+# The runner itself is the hostile case: GitHub Actions wraps every Windows
+# step in a job object, and a child that already belongs to a job can be
+# refused nested assignment -- so the fakes also model refusal, and the
+# snapshot walk that must reap the orphans when the job is missing.
 class _FakeKernel32:
     """The job-object entry points `processes` uses, recording every call."""
 
-    def __init__(self, *, create_ok=True, assign_ok=True, open_ok=True):
+    def __init__(self, *, create_ok=True, assign_ok=True, open_ok=True,
+                 assign_error=0, processes=(), threads=(), resume_ok=True):
         self.calls: list[tuple] = []
         self.create_ok = create_ok
         self.assign_ok = assign_ok
         self.open_ok = open_ok
+        self.assign_error = assign_error
+        self.resume_ok = resume_ok
+        # The Win32 error behind the last failed call. `_pretend_windows`
+        # points `_last_error` here, because ctypes' get/set_last_error only
+        # exist on Windows and these fakes run on every platform.
+        self.last_error = 0
+        # (pid, ppid, creation FILETIME) and (tid, owner pid) tables the
+        # snapshot walks read; empty means "no such processes/threads".
+        self.proc_table = list(processes)
+        self.thread_table = list(threads)
         self._next = 100
         self.opened: list[int] = []
         self.closed: list[int] = []
+        self._pid_of_handle: dict[int, int] = {}
+        self._tid_of_handle: dict[int, int] = {}
+        self._proc_iter: iter = iter(())
+        self._thread_iter: iter = iter(())
 
     @property
     def leaked(self) -> list[int]:
@@ -629,21 +656,31 @@ class _FakeKernel32:
 
     def CreateJobObjectW(self, _attrs, name):
         handle = self._handle(self.create_ok)
+        if not handle:
+            self.last_error = 5         # ERROR_ACCESS_DENIED
         self.calls.append(("create", handle, name))
         return handle
 
     def OpenProcess(self, access, _inherit, pid):
         handle = self._handle(self.create_ok)
+        if not handle:
+            self.last_error = 5
         self.calls.append(("open_process", handle, access, pid))
+        if handle:
+            self._pid_of_handle[handle] = pid
         return handle
 
     def AssignProcessToJobObject(self, hjob, hproc):
         ok = 1 if self.assign_ok else 0
+        if not ok:
+            self.last_error = self.assign_error
         self.calls.append(("assign", hjob, hproc, ok))
         return ok
 
     def OpenJobObjectW(self, access, _inherit, name):
         handle = self._handle(self.open_ok)
+        if not handle:
+            self.last_error = 2         # ERROR_FILE_NOT_FOUND
         self.calls.append(("open_job", handle, access, name))
         return handle
 
@@ -656,10 +693,90 @@ class _FakeKernel32:
         self.closed.append(handle)
         return 1
 
+    # -- the suspended-child resume and the orphan snapshot walk ------------
+
+    def CreateToolhelp32Snapshot(self, flags, _pid):
+        handle = self._handle(True)
+        self.calls.append(("snapshot", handle, flags))
+        if flags == 0x2:                # TH32CS_SNAPPROCESS
+            self._proc_iter = iter(self.proc_table)
+        elif flags == 0x4:              # TH32CS_SNAPTHREAD
+            self._thread_iter = iter(self.thread_table)
+        return handle
+
+    def _next_proc(self, ptr):
+        import ctypes
+        entry = ctypes.cast(
+            ptr, ctypes.POINTER(processes._win_structs()[1])).contents
+        try:
+            pid, ppid, _born = next(self._proc_iter)
+        except StopIteration:
+            return 0
+        entry.th32ProcessID = pid
+        entry.th32ParentProcessID = ppid
+        return 1
+
+    def Process32FirstW(self, _snap, ptr):
+        return self._next_proc(ptr)
+
+    def Process32NextW(self, _snap, ptr):
+        return self._next_proc(ptr)
+
+    def GetProcessTimes(self, handle, born_ptr, _e, _k, _u):
+        import ctypes
+        from ctypes import wintypes
+        pid = self._pid_of_handle.get(handle, 0)
+        born = next((b for p, _pp, b in self.proc_table if p == pid), 0)
+        ft = ctypes.cast(born_ptr, ctypes.POINTER(wintypes.FILETIME)).contents
+        ft.dwLowDateTime = born & 0xFFFFFFFF
+        ft.dwHighDateTime = born >> 32
+        self.calls.append(("times", handle, born))
+        return 1
+
+    def _next_thread(self, ptr):
+        import ctypes
+        entry = ctypes.cast(
+            ptr, ctypes.POINTER(processes._win_structs()[0])).contents
+        try:
+            tid, owner = next(self._thread_iter)
+        except StopIteration:
+            return 0
+        entry.th32ThreadID = tid
+        entry.th32OwnerProcessID = owner
+        return 1
+
+    # No W suffix: the real thread-snapshot API has no wide variant.
+    def Thread32First(self, _snap, ptr):
+        return self._next_thread(ptr)
+
+    def Thread32Next(self, _snap, ptr):
+        return self._next_thread(ptr)
+
+    def OpenThread(self, access, _inherit, tid):
+        handle = self._handle(True)
+        self.calls.append(("open_thread", handle, access, tid))
+        if handle:
+            self._tid_of_handle[handle] = tid
+        return handle
+
+    def ResumeThread(self, handle):
+        tid = self._tid_of_handle.get(handle, 0)
+        self.calls.append(("resume", handle, tid))
+        return 1 if self.resume_ok else 0xFFFFFFFF
+
 
 def _pretend_windows(monkeypatch, k32):
     monkeypatch.setattr(processes.os, "name", "nt")
     monkeypatch.setattr(processes, "_kernel32", lambda: k32)
+    # ctypes' get/set_last_error exist only on Windows; the fake carries the
+    # error code instead, so the diagnostics are testable on every platform.
+    monkeypatch.setattr(processes, "_last_error",
+                        lambda k: getattr(k, "last_error", 0))
+    # pathlib chooses WindowsPath from os.name; keep the REAL filesystem's
+    # path class so registry records still land in tmp_path. `state_dir`
+    # re-wraps its root with index's own Path, so patch that namespace too.
+    monkeypatch.setattr(processes, "Path", _REAL_PATH)
+    monkeypatch.setattr(index, "Path", _REAL_PATH)
     runs: list[list[str]] = []
 
     def fake_run(argv, **_kw):
@@ -674,8 +791,9 @@ def test_job_wrap_assigns_the_leader_and_leaves_no_handles_behind(monkeypatch):
     k32 = _FakeKernel32()
     _pretend_windows(monkeypatch, k32)
 
-    job = processes._job_wrap(4242, "web")
+    job, note = processes._job_wrap(4242, "web")
 
+    assert note == ""
     assert job.startswith("Local\\pedacito-web-4242-"), job
     assert [c[0] for c in k32.calls] == [
         "create", "open_process", "assign", "close", "close"], k32.calls
@@ -691,12 +809,32 @@ def test_job_wrap_is_a_no_op_when_the_api_refuses(monkeypatch):
                    {"assign_ok": False}):         # child already exited
         k32 = _FakeKernel32(**kwargs)
         _pretend_windows(monkeypatch, k32)
-        assert processes._job_wrap(4242, "web") == "", kwargs
+        job, note = processes._job_wrap(4242, "web")
+        assert job == "" and note, kwargs
         assert not k32.leaked, kwargs
     # POSIX never loads kernel32 at all: `_kernel32()` returns None there.
     monkeypatch.setattr(processes.os, "name", "posix")
     monkeypatch.setattr(processes, "_kernel32", lambda: None)
-    assert processes._job_wrap(4242, "web") == ""
+    assert processes._job_wrap(4242, "web") == ("", "")
+
+
+def test_job_wrap_says_which_step_failed_and_why(monkeypatch):
+    """A silent '' is how the runner failure hid: the record carried no job
+    and no reason, so `stop` looked like it worked while the orphan lived.
+    Error 5 is the runner's refusal of nested assignment -- the note must
+    name it, because that is the case the orphan walk exists for."""
+    k32 = _FakeKernel32(assign_ok=False, assign_error=5)
+    _pretend_windows(monkeypatch, k32)
+    job, note = processes._job_wrap(4242, "web")
+    assert job == ""
+    assert "AssignProcessToJobObject failed (error 5)" in note, note
+    assert "orphan walk" in note, note
+    assert not k32.leaked
+
+    k32 = _FakeKernel32(create_ok=False)
+    _pretend_windows(monkeypatch, k32)
+    job, note = processes._job_wrap(4242, "web")
+    assert job == "" and "CreateJobObject failed" in note, note
 
 
 def test_stop_reaps_the_orphaned_tree_through_the_job_on_windows(monkeypatch):
@@ -743,7 +881,7 @@ def test_stop_uses_the_job_recorded_for_the_process(monkeypatch, tmp_path):
     """
     seen: list[tuple] = []
     monkeypatch.setattr(processes, "_terminate_pid",
-                        lambda pid, job="": seen.append((pid, job)))
+                        lambda pid, job="", **_kw: seen.append((pid, job)))
     monkeypatch.setattr(processes, "_alive", lambda _pid: False)  # leader exited
     root = tmp_path / "proj"
     root.mkdir()
@@ -761,9 +899,213 @@ def test_stop_uses_the_job_recorded_for_the_process(monkeypatch, tmp_path):
     assert stopped["status"] == "stopped"
 
 
+def test_stop_hands_the_creation_time_to_the_terminator(monkeypatch, tmp_path):
+    """The orphan walk needs the leader's creation time to tell family from
+    pid reuse. `stop` must pass what the record carries -- and old records
+    without `born` still have `started` as a floor."""
+    seen: list[dict] = []
+    monkeypatch.setattr(
+        processes, "_terminate_pid",
+        lambda pid, job="", **kw: seen.append({"pid": pid, "job": job, **kw}))
+    monkeypatch.setattr(processes, "_alive", lambda _pid: False)
+    root = tmp_path / "proj"
+    root.mkdir()
+    processes._write_record(root, {
+        "name": "web", "command": "npm run dev", "pid": 4242,
+        "cwd": str(root), "log": str(root / "web.log"), "url": "",
+        "job": "", "job_note": "AssignProcessToJobObject failed (error 5)",
+        "started": 100.0, "born": 99.5, "status": "running"})
+
+    processes.stop(root, "web")
+
+    assert seen == [{"pid": 4242, "job": "", "started": 100.0, "born": 99.5}], seen
+
+
+# The runner's refusal leaves no job, and the launcher exits first: the walk
+# below is the ONLY thing that reaches the orphaned server there.
+_ORPHAN_BORN = 1_700_000_000.0
+
+
+def _ft(secs: float) -> int:
+    """Unix seconds -> the FILETIME the snapshot reports (100ns since 1601)."""
+    return int((secs + 11644473600) * 10_000_000)
+
+
+def _orphan_proc_table():
+    # The leader 4242 is DEAD (absent from the snapshot), exactly like the
+    # launcher that spawned the real server and exited.
+    return [
+        (5000, 4242, _ft(_ORPHAN_BORN + 10)),   # the orphaned server
+        (5001, 5000, _ft(_ORPHAN_BORN + 20)),   # its worker
+        (6000, 1, _ft(_ORPHAN_BORN + 30)),      # unrelated: another parent
+        (7000, 4242, _ft(_ORPHAN_BORN - 10)),   # pid reuse: predates leader
+    ]
+
+
+def test_windows_descendants_walk_past_a_dead_leader(monkeypatch):
+    """Windows keeps ParentProcessId after the parent dies, so the snapshot
+    chain outlives the leader -- the property `taskkill /T` lacks. But a pid
+    can be REUSED after its holder exits: a candidate created before the
+    leader is not family, it is a stranger wearing the same pid."""
+    k32 = _FakeKernel32(processes=_orphan_proc_table())
+    _pretend_windows(monkeypatch, k32)
+
+    assert processes._windows_descendants(4242, _ORPHAN_BORN) == [5000, 5001]
+    assert not k32.leaked, "snapshot/process handles were not closed"
+
+
+def test_stop_without_a_job_kills_the_orphans_the_snapshot_finds(monkeypatch):
+    """The runner case end to end: no job could be created, leader gone.
+    `taskkill /T` alone kills nothing; the walk must finish the job without
+    touching unrelated processes or the reused pid."""
+    k32 = _FakeKernel32(processes=_orphan_proc_table())
+    runs = _pretend_windows(monkeypatch, k32)
+
+    processes._terminate_pid(4242, "", started=_ORPHAN_BORN - 5,
+                             born=_ORPHAN_BORN)
+
+    assert runs == [
+        ["taskkill", "/F", "/T", "/PID", "4242"],   # live-leader attempt
+        ["taskkill", "/F", "/PID", "5000"],         # the orphaned server
+        ["taskkill", "/F", "/PID", "5001"],         # its worker
+    ], runs
+
+    runs.clear()                                    # record without `born`
+    processes._terminate_pid(4242, "", started=_ORPHAN_BORN)
+    assert runs[1:] == [["taskkill", "/F", "/PID", "5000"],
+                        ["taskkill", "/F", "/PID", "5001"]], runs
+
+
+def test_resume_child_resumes_only_the_suspended_childs_threads(monkeypatch):
+    """Popen drops the initial thread handle, so the resume finds the thread
+    by owner pid in the snapshot -- and must not resume anyone else's."""
+    class P:
+        pid = 4242
+
+    k32 = _FakeKernel32(threads=[(900, 4242), (901, 1111)])
+    _pretend_windows(monkeypatch, k32)
+    assert processes._resume_child(P()) is True
+    resumed = [c for c in k32.calls if c[0] == "resume"]
+    assert [c[2] for c in resumed] == [900], resumed
+    opened = [c for c in k32.calls if c[0] == "open_thread"]
+    assert opened and all(c[2] == 0x2 for c in opened), opened
+    assert not k32.leaked
+
+    k32 = _FakeKernel32(threads=[(900, 4242)], resume_ok=False)
+    _pretend_windows(monkeypatch, k32)
+    assert processes._resume_child(P()) is False
+    assert not k32.leaked
+
+    k32 = _FakeKernel32(threads=[])                 # nothing to resume
+    _pretend_windows(monkeypatch, k32)
+    assert processes._resume_child(P()) is False
+
+    monkeypatch.setattr(processes.os, "name", "posix")
+    assert processes._resume_child(P()) is True     # no-op off Windows
+
+
+def test_start_wraps_the_child_before_it_runs_and_records_the_diagnostics(
+        monkeypatch, tmp_path):
+    """Order is the fix: spawn SUSPENDED, wrap in the job, then resume. A
+    child that runs first can spawn descendants outside the job forever,
+    because membership is inherited only at creation."""
+    order: list[tuple] = []
+    ft = _ft(_ORPHAN_BORN)
+    k32 = _FakeKernel32(processes=[(4242, 1, ft)])
+    _pretend_windows(monkeypatch, k32)
+
+    class P:
+        pid = 4242
+
+        def poll(self):
+            return None
+
+    def fake_spawn(argv, *, cwd, env, stdout, stderr, suspended=False):
+        order.append(("spawn", suspended))
+        return P()
+
+    def fake_wrap(pid, name):
+        order.append(("wrap", pid))
+        return "Local\\pedacito-web-4242-x", ""
+
+    def fake_resume(p):
+        order.append(("resume", p.pid))
+        return True
+
+    monkeypatch.setattr(processes.proc, "spawn", fake_spawn)
+    monkeypatch.setattr(processes, "_job_wrap", fake_wrap)
+    monkeypatch.setattr(processes, "_resume_child", fake_resume)
+    root = tmp_path / "proj"
+    root.mkdir()
+
+    rec = processes.start(root, "npm run dev", name="web", wait=0)
+
+    assert order == [("spawn", True), ("wrap", 4242), ("resume", 4242)], order
+    assert rec["job"] == "Local\\pedacito-web-4242-x"
+    assert rec["job_note"] == ""
+    assert rec["born"] == pytest.approx(_ORPHAN_BORN, abs=1e-3)
+    processes._forget_child(rec["pid"])
+
+
+def test_start_respawns_running_when_the_suspended_child_cannot_resume(
+        monkeypatch, tmp_path):
+    """A frozen server is worse than a racy job wrap: kill the suspended
+    child and respawn it running, wrapping best effort. The record must
+    describe the SECOND child, including its own creation time."""
+    ft = _ft(_ORPHAN_BORN)
+    k32 = _FakeKernel32(processes=[(4242, 1, ft),
+                                   (5555, 1, ft + 10_000_000)])
+    _pretend_windows(monkeypatch, k32)
+    spawns: list[tuple[int, bool]] = []
+    wraps: list[int] = []
+
+    class P:
+        def __init__(self, pid):
+            self.pid = pid
+            self.killed = False
+
+        def kill(self):
+            self.killed = True
+
+        def wait(self, timeout=None):
+            return 0
+
+        def poll(self):
+            return None
+
+    children = [P(4242), P(5555)]
+
+    def fake_spawn(argv, *, cwd, env, stdout, stderr, suspended=False):
+        p = children[len(spawns)]
+        spawns.append((p.pid, suspended))
+        return p
+
+    def fake_wrap(pid, name):
+        wraps.append(pid)
+        return f"Local\\pedacito-web-{pid}-x", ""
+
+    monkeypatch.setattr(processes.proc, "spawn", fake_spawn)
+    monkeypatch.setattr(processes, "_job_wrap", fake_wrap)
+    monkeypatch.setattr(processes, "_resume_child", lambda p: False)
+    root = tmp_path / "proj"
+    root.mkdir()
+
+    rec = processes.start(root, "npm run dev", name="web", wait=0)
+
+    assert spawns == [(4242, True), (5555, False)], spawns
+    assert children[0].killed, "the frozen child was left behind"
+    assert wraps == [4242, 5555], wraps
+    assert rec["pid"] == 5555
+    assert rec["born"] == pytest.approx(_ORPHAN_BORN + 1, abs=1e-3)
+    processes._forget_child(rec["pid"])
+
+
 def test_browser_resolves_a_mocked_windows_chrome_path(tmp_path, monkeypatch):
     win_path = (r"C:\Program Files\Google\Chrome\Application\chrome.exe")
     fake = tmp_path / win_path
+    # On Windows the absolute win_path wins over tmp_path, so the parent must
+    # exist -- don't assume Chrome is already installed at exactly this path.
+    fake.parent.mkdir(parents=True, exist_ok=True)
     fake.write_text("", encoding="utf-8")
 
     monkeypatch.setattr(sys, "platform", "win32")

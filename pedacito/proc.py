@@ -23,17 +23,29 @@ import subprocess
 import threading
 import time
 
+# Win32 CREATE_SUSPENDED. subprocess does not export it (it only names the
+# console/process-group flags), so spell the flag out: the child is created
+# frozen and the caller resumes it after wrapping it in a job object.
+_CREATE_SUSPENDED = 0x00000004
+
 
 def spawn(command, *, cwd, env: dict | None = None,
-          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
-          ) -> subprocess.Popen:
+          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+          suspended: bool = False) -> subprocess.Popen:
     """Start a child in its own process group without waiting for it.
 
     Used by the screenshot and browser actions, which later `terminate()` the
-    whole tree. Output is discarded unless the caller passes PIPE."""
+    whole tree, and by the background-server registry. Output is discarded
+    unless the caller passes PIPE. `suspended` (Windows only) starts the
+    child frozen so the caller can put it in a job object before it runs a
+    single instruction -- job membership is inherited at creation, so a
+    child that runs first can spawn descendants that escape the job. The
+    caller MUST resume it (see `processes._resume_child`)."""
     kwargs = {}
     if os.name != "nt":
         kwargs["start_new_session"] = True
+    elif suspended:
+        kwargs["creationflags"] = _CREATE_SUSPENDED
     return subprocess.Popen(
         command, cwd=str(cwd), stdin=subprocess.DEVNULL,
         stdout=stdout, stderr=stderr, env=env, **kwargs)
