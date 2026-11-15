@@ -147,6 +147,9 @@ dependencies, so it works offline. It runs the same engine as the commands.
   (hosted profiles are excluded; fresh cards are skipped unless you tick
   re-calibrate). **Restore from a backup…**, **Check model (loads it)** and
   **Clear terminal** are also here, plus the upkeep dialogs: **Memory & repo lessons…**,
+  **Skills library & creator…** (browse the built-in, user and project skills,
+  preview a task's trigger matches, write or ✦ auto-draft custom skills),
+  **Consolidate session…** (compact the transcript into a handoff checkpoint),
   **Background servers…**, **Run project checks…**, **Prune old
   sessions/backups…** and **Reset project state…** (prune and reset preview
   before they write). A `Scout: <profile>` badge appears beside the model chip
@@ -735,14 +738,50 @@ edit or delete:
   (repair lessons promoted from `micro_facts.json`; see
   [Repair lessons](#repair-lessons-and-repo-gotchas)) -- anything without the
   `auto_generated: true` frontmatter flag is never written or deleted by it.
-- **Skills** are named procedures (`.pedacito/skills/NAME/SKILL.md`, or
-  `skills/NAME/SKILL.md` next to your config). The model sees a one-line
-  catalog and loads a skill's text only when it needs it. Eight starters ship
-  built in: `add-a-test`, `fix-a-failing-test`, `refactor-safely`,
+- **Skills** are named procedures (`.pedacito/skills/NAME/SKILL.md` or
+  `.pedacito/skills/NAME.md`, and the same two layouts under `skills/` next to
+  your config). The model sees a one-line catalog and loads a skill's text only
+  when it needs it; additionally, the top-2 trigger matches for a task are
+  injected up front, capped at 1,200 chars of checklist text. Sixteen starters
+  ship built in: `add-a-test`, `fix-a-failing-test`, `refactor-safely`,
   `review-my-diff`, `find-dead-code`, `surgical-symbol-edit`,
-  `frontend-dom-audio-debug` and `safe-multi-file-rename`; `pedacito skills`
-  lists them. Skills are prompt text, nothing in a skill folder is ever
-  executed.
+  `frontend-dom-audio-debug`, `safe-multi-file-rename`, `fastapi-rest-endpoint`,
+  `canvas-svg-2d-3d`, `sqlite-sql-migrations`, `async-concurrency-safety`,
+  `security-ssrf-xss-hardening`, `i18n-localization-catalog`,
+  `parser-lexer-state-machine` and `performance-memory-profiling`.
+  `pedacito skills list` shows them all with a scope badge (bundled / user /
+  project). Skills are prompt text, nothing in a skill folder is ever executed.
+- **Custom skills** are yours to write: `pedacito skills add NAME
+  --description "..." --triggers "k1,k2" --body "1. ..."` saves one to the
+  project (or `--global` for the user library), `pedacito skills draft "Skill
+  for Alpine.js dark-mode components"` lets the active model write the whole
+  skill from one sentence, `pedacito skills show NAME` prints its triggers and
+  checklist, and `pedacito skills rm NAME` deletes a custom skill (built-ins
+  are immutable; a project skill may shadow a built-in of the same name).
+  The GUI twin is **Project ▾ → Skills library & creator…** (also linked from
+  ⚙ Settings): browse every scope, preview which skills a task would inject,
+  and create skills with the **✦ Auto-Draft from Description** button, saving
+  to the project or the global library.
+
+### Session consolidation
+
+Long sessions fill the context window. Consolidation distils the recent
+history into one structured handoff of under 400 tokens — **Goal & Context**,
+**Files Modified & Key Decisions**, **Verified Test Status**, **Open Next
+Steps** — built from harness facts (tasks, applied/failed edits, test results,
+decisions), never invented prose. It saves `.pedacito/consolidated_session.md`,
+pins durable decisions to `memory.md`, and resets the live buffer so the next
+turn starts from the handoff alone:
+
+- **GUI**: the **Consolidate Session** button in the telemetry footer (or
+  **Project ▾ → Consolidate session…**). The transcript restarts from the
+  handoff card and the Context Meter updates immediately.
+- **CLI chat**: `/consolidate` (alias `/compact`); the next task is seeded
+  with the handoff. `pedacito memory PROJ --consolidate` runs the same
+  distillation over the newest session transcripts and prints the checkpoint.
+- **RPC**: `{"id": 1, "op": "consolidate"}` (or `"method": "consolidate"`,
+  alias `compact`) answers with `before_tokens`, `after_tokens` and the
+  handoff; refused while a task runs.
 
 ### Repair lessons and repo gotchas
 
@@ -805,7 +844,9 @@ pedacito chat ~/code/anki [--apply | --review]
 Keeps the index warm between tasks. Slash commands: `/profile NAME`,
 `/model ID`, `/apply on|off`, `/steps N`, `/status` (pack, answer mode,
 verifier, window, model card), `/cost` (tokens, cache hits and spend by call
-site), `/memory`, `/skills`, `/profiles`, `/help`, `/quit`. **Ctrl-C cancels the
+site), `/memory`, `/skills`, `/consolidate` (alias `/compact`: compact the
+session into a handoff; see [Session consolidation](#session-consolidation)),
+`/profiles`, `/help`, `/quit`. **Ctrl-C cancels the
 running task but keeps the session open.** Switching profile mid-session is the
 cheapest way to compare two models on one task; a failed switch leaves the
 session on the previous model.
@@ -831,7 +872,10 @@ verified clean, which is the difference a calling agent needs); `steer` pushes
 a note into the running task's queue; `permission_request` events arrive when
 a gated tool wants to act and are answered by `permission_reply` (`allow_once`,
 `allow_run`, `allow_always`, `deny`); `cancel` stops the task and keeps the
-process warm; `switch_profile` and `status` work mid-session too. The index,
+process warm; `consolidate` (alias `compact`, also accepted as `"op"`)
+compacts the session into a handoff checkpoint and resets the resume buffer,
+so the next `ask` starts from the handoff alone; `switch_profile` and `status`
+work mid-session too. The index,
 the profiles and the session ledger stay warm across requests -- that is the
 whole point. Human-facing diagnostics go to stderr; stdout stays pure JSONL.
 Protocol details in `pedacito/rpc.py`, rationale in
@@ -1003,8 +1047,8 @@ pedacito map PROJ -t "fix X"       # see the map a task would get (ranked)
 pedacito tests PROJ --files src/a.py   # detected test command + impacted tests
 pedacito webcheck PROJ             # static contract checks for web files
 pedacito domcheck PROJ             # headless DOM smoke check (needs Playwright)
-pedacito memory PROJ [--add T | --forget T]
-pedacito skills PROJ
+pedacito memory PROJ [--add T | --forget T | --consolidate]
+pedacito skills [list | show NAME | add NAME | draft "PROMPT" | rm NAME] [PROJ] [--global]
 pedacito prune PROJ --keep-sessions 50 --keep-backups 20 [--dry-run]
 pedacito reset PROJ [--dry-run] [--keep-memory] [--keep-config] [--reindex]
 pedacito trust PROJ                # approve a project's .pedacito.toml
@@ -1076,7 +1120,11 @@ amber from 70–85%, red above — plus turn and session tokens, generation spee
 the active model with its specialty (`Active: deepseek-coder (coding)`) and
 the orchestrator profile. Click the footer to expand a drawer with the full
 per-call numbers. While a specialist holds the card, the last-call numbers
-are the specialist's; session totals stay the shared ledger's.
+are the specialist's; session totals stay the shared ledger's. The footer
+also carries the **Consolidate Session** button: one click distils the
+transcript into a handoff checkpoint and restarts the chat from it, and the
+context bar drops to the handoff's size right away (see
+[Session consolidation](#session-consolidation)).
 
 The CLI prints the same picture as a one-line ribbon on stderr after each
 task:
@@ -1694,8 +1742,10 @@ screenshots/          captures (if enabled)
 procs/                background process records and logs
 design.json/.md       spec-driven design (interfaces, data, tests)
 memory.md             remembered facts (hints for the model)
+consolidated_session.md  the newest session-consolidation handoff
 micro_facts.json      commands confirmed to work here, and repair lessons
-rules/*.md            path-scoped rules       skills/*/SKILL.md   your skills
+rules/*.md            path-scoped rules       skills/           your skills
+                                             (NAME/SKILL.md or NAME.md)
 prompts/*.md          prompt overrides        fetch/              fetch cache
 todo.md               current task checklist
 log.txt               timestamped event trace

@@ -241,6 +241,11 @@
       tabs.appendChild(h('button', { class: X.tab === t[0] ? 'on' : '', text: t[1], onclick: function () { X.tab = t[0]; X.pending = {}; render(); } }));
     });
     body.appendChild(tabs);
+    body.appendChild(h('div', { class: 'row small-text', style: 'margin:0 0 10px' },
+      h('span', { class: 'muted', text: 'Quick links:' }),
+      h('button', { class: 'ghost small', text: 'Skills library & creator\u2026',
+        title: 'browse built-in, user and project skills; write or auto-draft custom ones',
+        onclick: function () { if (PDC.skillsDialog) PDC.skillsDialog(); } })));
     if (X.tab === 'discovery') body.appendChild(discoveryTab());
     else if (X.tab === 'profiles') body.appendChild(profilesTab());
     else if (X.tab === 'all') body.appendChild(allTab());

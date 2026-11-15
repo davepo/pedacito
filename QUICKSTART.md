@@ -277,14 +277,17 @@ the checked IP so a second DNS answer cannot swap it mid-request.
   `[mcp_servers.<name>]` tool servers (test, enable, trust, delete) without
   hand-editing TOML.
 - **Project ▾** also holds **Calibrate All Local Models…** and the upkeep
-  dialogs: **Memory & repo lessons…**, **Background servers…**, **Run project
+  dialogs: **Memory & repo lessons…**, **Skills library & creator…** (A19),
+  **Consolidate session…** (A20), **Background servers…**, **Run project
   checks…**, **Prune old sessions/backups…** and **Reset project state…**
   (prune and reset preview before they write).
 - **Telemetry footer:** under the workspace, a live bar shows the context
   window in use (green under 70%, amber to 85%, red above), turn and session
   tokens, generation speed, KV cache hits and folds, and the active model.
-  Click it to expand the full drawer. The CLI prints the same numbers as a
-  one-line ribbon after each task; `show_telemetry = false` hides it.
+  Click it to expand the full drawer. Its **Consolidate Session** button
+  compacts a long chat into a handoff checkpoint (A20). The CLI prints the
+  same numbers as a one-line ribbon after each task; `show_telemetry = false`
+  hides it.
 - **Themes:** pick a color scheme from the theme menu in the top bar. There are
   nine. The choice is saved to your config as `gui_theme`.
 - **Attach** a text file, or drag it into the chat box, to use it as the task, a
@@ -370,6 +373,48 @@ other; on two GPUs (or with a hosted specialist) both stay loaded. The Activity
 panel shows which specialist is running, and an unreachable one falls back to the
 active model with a warning. On the CLI: `--auto-route` per run, `--no-auto-route`
 to override the config.
+
+### A19. Browse and create skills
+
+Skills are short checklists the model follows for one kind of task. Sixteen
+starters ship built in (testing, refactoring, FastAPI endpoints, canvas/SVG,
+SQLite migrations, async safety, security hardening, i18n, parsers,
+profiling, …); the top-2 trigger matches for your task are injected
+automatically, capped at 1,200 chars.
+
+1. Open **Project ▾ → Skills library & creator…** (also linked under
+   **⚙ Settings → Quick links**). Every skill shows a scope badge:
+   **bundled**, **user** (all your projects) or **project** (this repo).
+2. Type a task in the preview box and press Enter to see which skills it
+   would inject; click any skill to read its triggers and checklist.
+3. Click **+ New Custom Skill**, fill in the name (a slug), description,
+   comma-separated triggers and the checklist body — or just write the
+   description and click **✦ Auto-Draft from Description** to let the active
+   model draft the whole skill. Review the draft, then **Save to Project**
+   (`.pedacito/skills/<name>.md`) or **Save to Global**
+   (`~/.config/pedacito/skills/<name>.md`).
+4. Custom skills can be edited or deleted from the same dialog; built-ins
+   are immutable. A project skill may shadow a built-in of the same name.
+
+The CLI twins are `pedacito skills list|show|add|draft|rm` (B13).
+
+### A20. Consolidate a long session
+
+When a chat grows long, consolidate it: the transcript is distilled into a
+handoff of under 400 tokens with four sections — Goal & Context, Files
+Modified & Key Decisions, Verified Test Status, Open Next Steps — saved to
+`.pedacito/consolidated_session.md`. Durable decisions are pinned to
+`memory.md`.
+
+1. Click **Consolidate Session** in the telemetry footer (or
+   **Project ▾ → Consolidate session…**) and confirm. A running job must be
+   stopped first.
+2. The chat restarts from the single handoff card, and the Context Meter
+   drops to the handoff's size immediately — the next turn starts small.
+
+On the CLI: `/consolidate` (alias `/compact`) inside `pedacito chat`, or
+`pedacito memory PROJ --consolidate` over the newest session transcripts.
+Over RPC: `{"id": 1, "op": "consolidate"}`.
 
 ---
 
@@ -619,7 +664,9 @@ pedacito chat ~/code/anki            # add --apply or --review for the whole ses
 ```
 
 The index stays warm between tasks. Type `/help` for the commands. The most
-useful ones are `/profile NAME` and `/model ID`. Ctrl-C cancels the running
+useful ones are `/profile NAME` and `/model ID`. When the session grows long,
+`/consolidate` (alias `/compact`) compacts it into a handoff checkpoint and
+the next task starts from that handoff alone (A20). Ctrl-C cancels the running
 task and keeps the session open. Switching profiles and running the same task
 again is the cheapest way to compare two models.
 
@@ -664,6 +711,39 @@ unless you pass `--strings`, which also renames whole-word occurrences inside
 string literals (comments still stay), or `--include-labels`, which moves only
 test-label strings (the first argument of `test`/`it`/`describe`/`suite`). Every
 changed file must pass the syntax check, or nothing is written.
+
+### B13. Manage skills
+
+```bash
+pedacito skills .                          # every skill with its scope badge
+pedacito skills show add-a-test            # one skill's triggers + checklist
+pedacito skills add deploy-checklist \
+  --description "Ship a release safely" \
+  --triggers "deploy,release" --body "1. Run the suite. 2. Tag. 3. Publish."
+pedacito skills draft "Skill for Alpine.js dark-mode components"   # model writes it
+pedacito skills rm deploy-checklist        # delete a custom skill
+pedacito skills list --global              # the user-level library instead
+```
+
+`add` and `draft` write `.pedacito/skills/<name>.md` in the project, or
+`~/.config/pedacito/skills/<name>.md` with `--global`. Built-in skills are
+immutable: `rm` refuses them, but a custom skill that shadows a built-in can
+be deleted to let the built-in show through again. The GUI twin is
+**Project ▾ → Skills library & creator…** (A19).
+
+### B14. Consolidate session history
+
+```bash
+pedacito memory ~/code/anki --consolidate
+```
+
+Distils the newest session transcripts into a handoff checkpoint under 400
+tokens (Goal & Context, Files Modified & Key Decisions, Verified Test Status,
+Open Next Steps), writes `.pedacito/consolidated_session.md`, pins durable
+decisions to `memory.md`, and prints the before/after token counts. Inside
+`pedacito chat` the same operation is `/consolidate` (alias `/compact`); over
+RPC it is the `consolidate` method (alias `compact`). The GUI button is
+**Consolidate Session** in the telemetry footer (A20).
 
 ---
 
@@ -814,8 +894,8 @@ only the map is stale.
 | `pedacito rename OLD NEW [--file F] [--strings] [--include-labels] [--apply]` | Rename a symbol across the project. No model call; preview by default; `--strings` also renames whole-word string literals, `--include-labels` only test-label strings |
 | `pedacito eval` | Score the harness on fixture repositories. Use `--baseline` as a gate |
 | `pedacito bench [BENCHMARK\|all]` | Run the six diagnostic benchmarks and holdout rubric. `--list`/`--recent` are free; `--json`/`--strict` for CI |
-| `pedacito memory PROJ` | List, add, or forget remembered facts |
-| `pedacito skills PROJ` | List the available skills |
+| `pedacito memory PROJ` | List, add, or forget remembered facts; `--consolidate` compacts session history into a handoff |
+| `pedacito skills [list\|show\|add\|draft\|rm] [PROJ]` | Browse and manage the skill library (16 built-ins + custom); `--global` targets the user library |
 | `pedacito tests PROJ --files F` | Detected test command, and the tests an edit to F can break |
 | `pedacito webcheck PROJ` | Static checks for web files: DOM ids, script loading, missing scripts, ES module bindings and links |
 | `pedacito domcheck PROJ` | Headless DOM smoke check: load the entry page in headless Chromium, prove the module graph mounts, report console errors, unbound controls and silent Web Audio failures (needs Playwright) |
@@ -846,6 +926,8 @@ Per project, under `<project>/.pedacito/`:
 - `events/*.jsonl`: one JSON line per step, call, fold, and task, with tokens,
   cache hits, and latency.
 - `memory.md`, `reviews/` (saved review pages), and `log.txt` (event trace).
+- `consolidated_session.md`: the newest session-consolidation handoff (A20).
+- `skills/`: custom skills, as `NAME/SKILL.md` or `NAME.md` (A19, B13).
 - `micro_facts.json`: commands confirmed to work in this repository, and repair
   lessons under `anti_patterns`. A lesson is written only after a fix is verified.
   A lesson confirmed twice whose files share one directory is promoted into an

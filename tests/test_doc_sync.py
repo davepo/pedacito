@@ -41,6 +41,7 @@ STALE_PHRASE = "There is no CLI command for it yet"
 # The Project ▾ upkeep dialogs, exactly as the GUI labels them.
 PROJECT_MENU_LABELS = (
     "Memory & repo lessons…",
+    "Skills library & creator…",
     "Background servers…",
     "Run project checks…",
     "Prune old sessions/backups…",
@@ -88,13 +89,15 @@ def test_stale_benchmark_phrase_is_gone_from_gui_scripts():
 
 
 def test_bundled_skills_are_valid_and_loadable(tmp_path):
-    assert len(skills.BUNDLED) == 8
-    for name, (desc, body) in skills.BUNDLED.items():
+    assert len(skills.BUNDLED) == 16
+    for name, (desc, body, triggers) in skills.BUNDLED.items():
         assert skills._NAME_RE.match(name), name
         assert desc.strip(), name
         assert body.strip(), name
         assert len(body) <= skills.MAX_SKILL_CHARS, \
             f"{name} would be truncated by load()"
+        assert triggers and all(isinstance(t, str) and t.strip()
+                                for t in triggers), name
         text, info = skills.load(tmp_path, None, name)
         assert info is not None and info["source"] == "bundled"
         assert text.startswith(f"SKILL {name} (bundled):")
@@ -105,8 +108,22 @@ def test_bundled_skills_are_valid_and_loadable(tmp_path):
         assert f"- {name}:" in catalog
 
 
+def test_second_eight_bodies_stay_crisp():
+    """The domain checklists added in the 8->16 pass keep the <=550-char
+    body budget, and every built-in declares usable triggers."""
+    second = ("fastapi-rest-endpoint", "canvas-svg-2d-3d",
+              "sqlite-sql-migrations", "async-concurrency-safety",
+              "security-ssrf-xss-hardening", "i18n-localization-catalog",
+              "parser-lexer-state-machine", "performance-memory-profiling")
+    for name in second:
+        desc, body, triggers = skills.BUNDLED[name]
+        assert len(body) <= skills.MAX_BUILTIN_BODY_CHARS, \
+            f"{name}: {len(body)} chars"
+        assert len(triggers) >= 4, name
+
+
 def test_readme_names_every_bundled_skill():
-    assert "Eight starters" in README
+    assert "Sixteen starters" in README
     for name in skills.BUNDLED:
         assert f"`{name}`" in README, f"README does not name skill {name}"
 
@@ -131,6 +148,13 @@ FEATURE_NEEDLES = [
     ("provider-table defaults", "hosted calibration lockout"),
     ("six micro-probes", "the six specialty micro-probes"),
     ("show_telemetry", "telemetry ribbon setting"),
+    ("skills add", "custom skill creation CLI"),
+    ("skills draft", "model-drafted skill CLI"),
+    ("✦ Auto-Draft from Description", "GUI skill auto-draft button"),
+    ("--consolidate", "memory --consolidate flag"),
+    ("/consolidate", "chat consolidation slash command"),
+    ("Consolidate Session", "GUI consolidation button"),
+    ("consolidated_session.md", "consolidation checkpoint file"),
 ] + [(label, "Project ▾ upkeep dialog") for label in PROJECT_MENU_LABELS]
 
 
@@ -203,6 +227,28 @@ def test_how_cards_cover_the_new_features():
     tele = topics["live-telemetry"]
     assert "show_telemetry" in tele["settings"]
     assert "█" in " ".join(tele["steps"])      # the ribbon example
+    # The skills & consolidation pass: CLI cards and GUI topics stay synced.
+    sk = cards["skills"]
+    for act in ("list", "show", "add", "draft", "rm"):
+        assert act in sk["usage"], act
+    assert any(f["flag"] == "--global" for f in sk["flags"])
+    assert any(f["flag"] == "--triggers K1,K2,..." for f in sk["flags"])
+    mem = cards["memory"]
+    assert "--consolidate" in mem["usage"]
+    assert any(f["flag"] == "--consolidate" for f in mem["flags"])
+    chat_notes = " ".join(cards["chat"]["notes"])
+    assert "/consolidate" in chat_notes and "/compact" in chat_notes
+    assert "consolidate" in cards["rpc"]["summary"]
+    lib = topics["skills-library"]
+    lib_steps = " ".join(lib["steps"])
+    assert "Skills library & creator…" in lib_steps
+    assert "✦ Auto-Draft from Description" in lib_steps
+    assert "use_skills" in lib["settings"]
+    con = topics["consolidate-session"]
+    con_steps = " ".join(con["steps"])
+    assert "Consolidate Session" in con_steps
+    assert "Goal & Context" in con_steps
+    assert "/compact" in con_steps
 
 
 def test_how_topic_references_resolve():
@@ -223,6 +269,8 @@ def test_how_topic_references_resolve():
     ("how do I route tasks to specialist profiles?", "specialist-routing"),
     ("how do I see tokens per second in the gui?", "live-telemetry"),
     ("how do I calibrate all my local models?", "calibrate-model"),
+    ("how do I create a custom skill?", "skills-library"),
+    ("how do I consolidate a long session?", "consolidate-session"),
 ])
 def test_new_topics_are_retrievable(question, topic):
     ids = [m["id"] for m in how_index.search(question)["gui"]]

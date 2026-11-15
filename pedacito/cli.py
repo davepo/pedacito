@@ -523,6 +523,7 @@ CHAT_HELP = """\
   /cost           tokens, cache-hit ratio and spend so far, by call site
   /memory         what Pedacito remembers about this project
   /skills         the available skills
+  /consolidate    compact the session into a handoff (alias: /compact)
   /profiles       list the profiles in your config
   /quit           leave
   Ctrl-C          cancel the running task (the session stays open)"""
@@ -659,6 +660,21 @@ def _chat_command(line: str, args, cfg, ref) -> bool:
         from . import skills
         for name, info in sorted(skills._scan(_root(args), cfg).items()):
             print(f"  {name:<22} {info['description']}", file=sys.stderr)
+        return True
+
+    if cmd in ("consolidate", "compact"):
+        from . import memory
+        try:
+            res = memory.consolidate_session(_root(args), ref["cfg"])
+        except OSError as e:
+            print(f"  consolidate failed: {e}", file=sys.stderr)
+            return True
+        # The live buffer between chat tasks is the resume seed: the next
+        # task starts from the handoff alone, not the full transcript.
+        ref["resume_context"] = memory.handoff_prompt(res["summary"])
+        print(f"  consolidated: ~{res['before_tokens']:,} -> "
+              f"~{res['after_tokens']:,} tokens; the next task starts from "
+              f"the handoff ({res['path']})", file=sys.stderr)
         return True
 
     if cmd == "apply":
@@ -1814,10 +1830,21 @@ def _cmd_mcp(args) -> int:
 
 
 def _cmd_memory(args) -> int:
-    """`pedacito memory`: list, add or forget remembered facts."""
+    """`pedacito memory`: list, add or forget remembered facts, or
+    consolidate the recent session history into a handoff checkpoint."""
     from . import memory
     root = _root(args)
     scope = "global" if args.use_global else "project"
+    if getattr(args, "consolidate", False):
+        res = memory.consolidate_session(root, _light_config(args))
+        print(f"Consolidated session: ~{res['before_tokens']:,} -> "
+              f"~{res['after_tokens']:,} tokens")
+        print(f"Checkpoint: {res['path']}")
+        if res["pinned"]:
+            print(f"Pinned {res['pinned']} durable fact(s) to memory.md")
+        print()
+        print(res["summary"])
+        return 0
     if args.add:
         ok, msg = memory.remember(root, args.add, scope=scope)
         print(msg)
@@ -2086,15 +2113,111 @@ def _cmd_domcheck(args) -> int:
     return 1 if errs else 0
 
 
+_SKILL_ACTIONS = ("list", "show", "add", "create", "draft", "rm", "delete")
+
+
 def _cmd_skills(args) -> int:
+    """`pedacito skills`: list, show, add, draft or rm skills.
+
+    list (default) prints every skill with its scope badge; show prints one
+    skill's triggers and body; add writes a custom skill from flags; draft
+    asks the active model to write one from a sentence; rm deletes a custom
+    skill (built-ins are immutable). --global targets the user library."""
     from . import skills
+    words = list(getattr(args, "words", []) or [])
+    action = "list"
+    if words and words[0].lower() in _SKILL_ACTIONS:
+        action = words.pop(0).lower()
+    name, prompt = "", ""
+    if action in ("show", "add", "create", "rm", "delete"):
+        if not words:
+            print(f"Usage: pedacito skills {action} NAME [PROJECT]",
+                  file=sys.stderr)
+            return 2
+        name = words.pop(0)
+    elif action == "draft":
+        # The prompt is one quoted argument (like NAME for the other actions);
+        # any remaining words are the project path.
+        prompt = words.pop(0).strip() if words else ""
+        if not prompt:
+            print('Usage: pedacito skills draft "what the skill should teach"',
+                  file=sys.stderr)
+            return 2
+    # `pedacito skills PROJ` (no action) still lists that project's skills.
+    args.paths = words or ["."]
     root = _root(args)
+    scope = "user" if getattr(args, "use_global", False) else "project"
     cfg = _light_config(args)
-    found = skills._scan(root, cfg)
-    for name in sorted(found):
-        info = found[name]
-        print(f"{name:<22} {info['description']}  [{info['source']}]")
-    return 0
+
+    if action == "list":
+        for row in skills.list_skills(root, cfg):
+            print(f"{row['name']:<28} [{row['scope']:<7}] "
+                  f"{row['description']}")
+        return 0
+
+    if action == "show":
+        found = skills._scan(root, cfg)
+        key = name.strip().lower()
+        if key not in found:
+            print(f"No skill named '{name}'. Available: "
+                  f"{', '.join(sorted(found))}", file=sys.stderr)
+            return 1
+        info = found[key]
+        print(f"{key}  [{skills._scope_of(info, root)}]")
+        print(f"description: {info['description']}")
+        print(f"triggers: {', '.join(info.get('triggers') or []) or '(none)'}")
+        print(f"source: {info['source']}")
+        print()
+        print(info["body"].strip())
+        return 0
+
+    if action in ("add", "create"):
+        triggers = [t.strip() for t in (args.triggers or "").split(",")
+                    if t.strip()]
+        try:
+            path = skills.save_skill(
+                root, name=name, description=args.description or "",
+                triggers=triggers, body=args.body or "", scope=scope)
+        except ValueError as e:
+            print(f"skills add: {e}", file=sys.stderr)
+            return 2
+        print(f"Saved skill '{name}' ({scope}) -> {path}")
+        return 0
+
+    if action == "draft":
+        try:
+            model_cfg = _config(args)
+        except ConfigError as e:
+            print(f"skills draft needs a configured model: {e}",
+                  file=sys.stderr)
+            return 2
+        client = LLMClient(model_cfg)
+        try:
+            draft = skills.draft_skill_with_llm(client, prompt)
+            path = skills.save_skill(root, scope=scope, **draft)
+        except (LLMError, ValueError) as e:
+            print(f"skills draft: {e}", file=sys.stderr)
+            return 1
+        print(f"Drafted skill '{draft['name']}' ({scope}) -> {path}")
+        print(f"  {draft['description']}")
+        print(f"  triggers: {', '.join(draft['triggers'])}")
+        return 0
+
+    # rm / delete
+    try:
+        deleted = skills.delete_skill(root, name, scope=scope)
+    except ValueError as e:
+        print(f"skills rm: {e}", file=sys.stderr)
+        return 2
+    if deleted:
+        print(f"Deleted skill '{name}' ({scope}).")
+        return 0
+    if name.strip().lower() in skills.BUILTIN_SKILLS:
+        print(f"'{name}' is a built-in skill and cannot be deleted.",
+              file=sys.stderr)
+    else:
+        print(f"No {scope} skill named '{name}' to delete.", file=sys.stderr)
+    return 1
 
 
 def _cmd_rename(args) -> int:
@@ -2262,6 +2385,12 @@ def _cmd_rpc(args, cfg, client, idx, root, locals_ref, run, save_checkpoint,
         server_box["s"].set_client(locals_ref["client"])
         return explain_mod.answer(locals_ref["agent"], question)
 
+    def _rpc_consolidate():
+        from . import memory
+        res = memory.consolidate_session(root, locals_ref["cfg"])
+        locals_ref["resume_context"] = memory.handoff_prompt(res["summary"])
+        return res
+
     def _rpc_status():
         cur = locals_ref["cfg"]
         c = locals_ref["client"]
@@ -2335,6 +2464,7 @@ def _cmd_rpc(args, cfg, client, idx, root, locals_ref, run, save_checkpoint,
         run=_rpc_run, explain=_rpc_explain, status=_rpc_status,
         switch=_rpc_switch, ensure_lock=_ensure_lock,
         save_checkpoint=save_checkpoint, always_apply=_always_apply,
+        consolidate=_rpc_consolidate,
         permission_timeout=float(timeout), output=out, input_stream=sys.stdin)
     server_box["s"] = server
     server.set_client(client)
@@ -2833,6 +2963,10 @@ def build_parser() -> argparse.ArgumentParser:
     p_mem.add_argument("--forget", metavar="TEXT")
     p_mem.add_argument("--global", dest="use_global", action="store_true",
                        help="use the user-level memory instead of the project's")
+    p_mem.add_argument("--consolidate", action="store_true",
+                       help="compact recent session history into a "
+                            "consolidated handoff checkpoint "
+                            "(.pedacito/consolidated_session.md)")
     p_mem.add_argument("--root", default=None)
     p_mem.add_argument("--config", metavar="FILE")
     p_mem.add_argument("--profile", metavar="NAME")
@@ -2885,8 +3019,23 @@ def build_parser() -> argparse.ArgumentParser:
     p_dom.add_argument("--config", metavar="FILE")
     p_dom.add_argument("--profile", metavar="NAME")
 
-    p_skills = sub.add_parser("skills", help="list the available skills")
-    p_skills.add_argument("paths", nargs="*", default=["."])
+    p_skills = sub.add_parser(
+        "skills", help="list, show, add, draft or rm skills (built-in, user "
+                       "and project)")
+    p_skills.add_argument("words", nargs="*", default=[],
+                          help="[list | show NAME | add NAME | draft "
+                               "\"PROMPT\" | rm NAME] [PROJECT]")
+    p_skills.add_argument("--description", default="", metavar="TEXT",
+                          help="one-line description (skills add)")
+    p_skills.add_argument("--triggers", default="", metavar="K1,K2,...",
+                          help="comma-separated trigger keywords (skills add)")
+    p_skills.add_argument("--body", default="", metavar="TEXT",
+                          help="the checklist body (skills add)")
+    p_skills.add_argument("--global", dest="use_global", action="store_true",
+                          help="use the user-level skill library instead of "
+                               "the project's")
+    p_skills.add_argument("--url", default=None)
+    p_skills.add_argument("--model", default=None)
     p_skills.add_argument("--root", default=None)
     p_skills.add_argument("--config", metavar="FILE")
     p_skills.add_argument("--profile", metavar="NAME")
@@ -3363,7 +3512,8 @@ def _main(argv=None) -> int:
                 return 2
             _LOCKED.append(root)
         # Slash commands rebind these, so share them through a dict.
-        locals_ref = {"cfg": cfg, "client": client, "agent": agent, "idx": idx}
+        locals_ref = {"cfg": cfg, "client": client, "agent": agent, "idx": idx,
+                      "resume_context": resume_context}
 
         if args.cmd == "explain":
             return _cmd_explain(args, client, agent)
@@ -3372,14 +3522,15 @@ def _main(argv=None) -> int:
             """Execute one task end to end through the shared inner loop.
             `apply`/`refine`/`plan` override the command-line defaults (the
             `rpc` requests carry them per turn); None means "use the args"."""
-            nonlocal idx, agent, cfg, client, resume_context
+            nonlocal idx, agent, cfg, client
             cfg, client, agent = locals_ref["cfg"], locals_ref["client"], locals_ref["agent"]
             idx = locals_ref["idx"]
             if refine:
                 task = _refine_task_text(cfg, client, root, task, "ask")
+            resume_context = locals_ref.get("resume_context", "")
             if resume_context:
                 task = (resume_context + "\n\nNEW TASK\n" + task)
-                resume_context = ""
+                locals_ref["resume_context"] = ""
             locals_ref["last_result"] = None
             want_apply = bool(args.apply) if apply is None else bool(apply)
             from . import plan as plan_mod

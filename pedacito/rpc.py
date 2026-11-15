@@ -42,6 +42,9 @@ Methods:
   emitted on stdout (mirrors the GUI's decision broker; ``params.request_id``
   + ``params.decision`` of ``allow_once|allow_run|always_allow|deny``).
 * ``cancel`` - abort the active task; the process stays warm.
+* ``consolidate`` (alias ``compact``) - compact the session history into a
+  structured handoff checkpoint and reset the resume buffer to it; the next
+  ``ask`` starts from the handoff alone. Refused while a task is running.
 * ``switch_profile`` - change the model profile for subsequent requests,
   keeping the index.
 * ``status`` - active profile, scout profile, session ledger, index health.
@@ -84,7 +87,7 @@ _TASK_METHODS = ("ask", "explain")
 _DECISIONS = ("allow_once", "allow_run", "allow_always", "always_allow", "deny")
 
 _METHODS = _TASK_METHODS + ("steer", "permission_reply", "cancel",
-                            "switch_profile", "status")
+                            "consolidate", "switch_profile", "status")
 
 
 def _turn_id(value: Any) -> Optional[int]:
@@ -226,6 +229,7 @@ class RpcServer:
         ensure_lock: Optional[Callable[[], Any]] = None,
         save_checkpoint: Optional[Callable[[], None]] = None,
         always_apply: Optional[Callable[[str, str, str], None]] = None,
+        consolidate: Optional[Callable[[], dict]] = None,
         permission_timeout: float = PERMISSION_TIMEOUT,
     ):
         self._run = run
@@ -234,6 +238,7 @@ class RpcServer:
         self._switch = switch
         self._ensure_lock = ensure_lock
         self._save_checkpoint = save_checkpoint
+        self._consolidate = consolidate
         self._in = input_stream if input_stream is not None else sys.stdin
         self._perm_timeout = max(1.0, float(permission_timeout))
         self.out = output or RpcOut(sys.stdout, lambda: self._tag_for(None))
@@ -294,7 +299,9 @@ class RpcServer:
         if req_id is None or req_id == "":
             self._seq += 1
             req_id = f"srv-{uuid.uuid4().hex[:8]}-{self._seq}"
-        method = str(msg.get("method") or "")
+        method = str(msg.get("method") or msg.get("op") or "")
+        if method == "compact":       # OpenCode-style alias
+            method = "consolidate"
         params = msg.get("params")
         if not isinstance(params, dict):
             params = {}
@@ -333,6 +340,20 @@ class RpcServer:
             except (ValueError, KeyError, OSError) as exc:
                 return self._frame(req_id, method, error=str(exc))
             payload["busy"] = self._busy.is_set()
+            return self._frame(req_id, method, result=payload)
+
+        if method == "consolidate":
+            if self._busy.is_set():
+                return self._frame(req_id, method,
+                                   error="busy: cannot consolidate mid-task")
+            if self._consolidate is None:
+                return self._frame(req_id, method,
+                                   error="consolidate is not wired in this "
+                                         "session")
+            try:
+                payload = dict(self._consolidate())
+            except (ValueError, KeyError, OSError) as exc:
+                return self._frame(req_id, method, error=str(exc))
             return self._frame(req_id, method, result=payload)
 
         if method == "permission_reply":
@@ -649,7 +670,8 @@ class RpcServer:
                     frame = self.dispatch(msg)
                 except Exception as exc:  # dispatcher bug != dead session
                     frame = self._frame(msg.get("id"),
-                                        str(msg.get("method") or ""),
+                                        str(msg.get("method")
+                                            or msg.get("op") or ""),
                                         error=f"internal error: {exc!r}")
                 if frame is not None:
                     self.out.emit(frame)

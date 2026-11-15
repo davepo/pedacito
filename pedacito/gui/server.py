@@ -584,6 +584,148 @@ def _memory_post(q, body):
     return 200, out
 
 
+# --- skills library & creator -------------------------------------------------
+
+def _skills_payload(root, task: str = "") -> dict:
+    from .. import skills
+    out: dict = {"ok": True, "skills": skills.list_skills(root)}
+    if task.strip():
+        out["matches"] = [
+            {"name": r["name"], "score": r["score"]}
+            for r in skills.select_skills(root, task)]
+    return out
+
+
+@get("/api/skills")
+def _skills_get(q, body=None):
+    """Every skill (bundled / user / project) with its scope badge; an
+    optional `task` query previews which checklists select_skills injects."""
+    return 200, _skills_payload(_project_root(), str(q.get("task", "")))
+
+
+@post("/api/skills")
+def _skills_save(q, body):
+    """Save a custom skill: {name, description, triggers, body, scope}.
+    scope is "project" (needs an open project) or "user"/"global"."""
+    from .. import skills
+    root = _project_root()
+    scope = str(body.get("scope") or "project").strip().lower()
+    if scope in ("user", "global"):
+        scope = "user"
+    elif scope != "project":
+        return 400, {"ok": False, "detail": f"unknown scope {scope!r}"}
+    if scope == "project" and root is None:
+        return 409, {"ok": False,
+                     "detail": "Open a project first, or save to the global "
+                               "library."}
+    triggers = body.get("triggers") or []
+    if isinstance(triggers, str):
+        triggers = [t.strip() for t in triggers.split(",") if t.strip()]
+    try:
+        path = skills.save_skill(
+            root, name=str(body.get("name") or ""),
+            description=str(body.get("description") or ""),
+            triggers=[str(t) for t in triggers],
+            body=str(body.get("body") or ""), scope=scope)
+    except ValueError as e:
+        return 400, {"ok": False, "detail": str(e)}
+    out = _skills_payload(root)
+    out.update(saved=str(path), scope=scope)
+    return 200, out
+
+
+@post("/api/skills/draft")
+def _skills_draft(q, body):
+    """Auto-draft a skill from one sentence with the active model. Returns
+    the draft for the form; saving stays an explicit second step."""
+    from .. import skills
+    prompt = str(body.get("prompt") or "").strip()
+    if not prompt:
+        return 400, {"ok": False, "detail": "Describe what the skill should "
+                                            "teach first."}
+    with STATE.lock:
+        cfg, client = STATE.cfg, STATE.client
+    if client is None:
+        # Project-less GUI: draft with the user-level config's model.
+        from .. import config as config_mod
+        from ..llm import LLMClient
+        try:
+            cfg = config_mod.load(root=None, require_hardware=False,
+                                  warn_budgets=False, upgrade_user_config=False)
+            client = LLMClient(cfg)
+        except (ConfigError, OSError) as e:
+            return 400, {"ok": False,
+                         "detail": f"No model configured for drafting: {e}"}
+    try:
+        draft = skills.draft_skill_with_llm(client, prompt)
+    except Exception as e:
+        return 200, {"ok": False, "detail": f"draft failed: {e}"}
+    return 200, {"ok": True, "draft": draft}
+
+
+@post("/api/skills/delete")
+def _skills_delete(q, body):
+    """Delete a custom skill (built-ins are immutable)."""
+    from .. import skills
+    root = _project_root()
+    name = str(body.get("name") or "")
+    scope = str(body.get("scope") or "project").strip().lower()
+    if scope in ("user", "global"):
+        scope = "user"
+    if scope == "project" and root is None:
+        return 409, {"ok": False, "detail": "Open a project first."}
+    try:
+        deleted = skills.delete_skill(root, name, scope=scope)
+    except ValueError as e:
+        return 400, {"ok": False, "detail": str(e)}
+    if not deleted:
+        detail = (f"'{name}' is a built-in skill and cannot be deleted."
+                  if name.strip().lower() in skills.BUILTIN_SKILLS
+                  else f"No {scope} skill named '{name}' to delete.")
+        return 400, {"ok": False, "detail": detail}
+    out = _skills_payload(root)
+    out["deleted"] = name
+    return 200, out
+
+
+# --- session consolidation ------------------------------------------------------
+
+@post("/api/session/consolidate")
+def _session_consolidate(q, body):
+    """Compact the live chat transcript into a structured handoff checkpoint
+    (.pedacito/consolidated_session.md), then reset the transcript to that
+    handoff alone so the next turn starts small. The Context Meter follows
+    immediately via the client's last-call token numbers."""
+    from .. import memory
+    with STATE.lock:
+        root, cfg, client = STATE.root, STATE.cfg, STATE.client
+        job = STATE.job if STATE.job is not None and STATE.job.active else None
+    if job is not None:
+        return 409, {"ok": False,
+                     "detail": "A job is running. Stop it before "
+                               "consolidating the session."}
+    msgs = [{"role": m.get("role"), "content": str(m.get("text") or "")}
+            for m in STATE.messages_snapshot()
+            if m.get("role") in ("user", "assistant") and m.get("text")]
+    try:
+        res = memory.consolidate_session(root, cfg, msgs or None)
+    except OSError as e:
+        return 400, {"ok": False, "detail": f"consolidate failed: {e}"}
+    # Reset the live buffer to the handoff: one visible system card replaces
+    # the compacted transcript (the thread file keeps the full history until
+    # this save, so nothing is lost that wasn't distilled).
+    STATE.clear_messages()
+    STATE.add_message("system", res["summary"], kind="handoff",
+                      consolidated=True)
+    if client is not None:
+        try:
+            client.last_prompt_tokens = int(res["after_tokens"])
+        except (AttributeError, TypeError, ValueError):
+            pass
+    STATE.bus.publish("status")
+    return 200, {"ok": True, **res, "status": STATE.status()}
+
+
 @get("/api/procs")
 def _procs_get(q, body=None):
     from .. import processes

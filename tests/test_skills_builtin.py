@@ -1,4 +1,5 @@
-"""The three built-in small-model procedural skills."""
+"""The built-in procedural skills: the original small-model trio plus the
+domain checklists, all loadable through the catalog and the `skill` action."""
 from __future__ import annotations
 
 import sys
@@ -21,11 +22,11 @@ NEW = {
 }
 
 
-def test_catalog_lists_all_eight_with_one_line_summaries(tmp_path):
-    cat = skills.catalog(tmp_path, Config())
-    for name in NEW:
+def test_catalog_lists_all_sixteen_with_one_line_summaries(tmp_path):
+    cat = skills.catalog(tmp_path, Config(), limit=10000)
+    for name in skills.BUNDLED:
         assert f"- {name}:" in cat
-    assert len(skills.names(tmp_path, Config())) == 8
+    assert len(skills.names(tmp_path, Config())) == 16
     # One line per skill: the body never leaks into the catalog.
     assert all(line.startswith("- ") for line in cat.splitlines()[1:])
     assert "SEARCH" not in cat

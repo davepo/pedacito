@@ -372,6 +372,8 @@ CLI_COMMANDS = [
             "/profile NAME switches model profile; /model ID switches model",
             "/apply on|off toggles writes; /steps N sets the lookup cap",
             "/status, /cost, /memory, /skills, /profiles, /quit",
+            "/consolidate (alias /compact) compacts the session into a "
+            "handoff checkpoint; the next task starts from the handoff alone",
             "--rpc turns the same warm session into a machine protocol",
         ],
         "common": True,
@@ -387,8 +389,10 @@ CLI_COMMANDS = [
                    "across requests. Methods: ask (streams the task's "
                    "events tagged with req_id), explain, steer (a note for "
                    "the running task), permission_reply, cancel, "
-                   "switch_profile, status. `pedacito chat --rpc` runs the "
-                   "same protocol inside the chat command.",
+                   "consolidate (compact the session into a handoff "
+                   "checkpoint; alias compact), switch_profile, status. "
+                   "`pedacito chat --rpc` runs the same protocol inside the "
+                   "chat command.",
         "keywords": ["rpc", "jsonl", "json", "stdio", "stdin", "stdout",
                      "editor", "machine client", "protocol", "integrate",
                      "stream events", "permission request", "steer",
@@ -396,6 +400,7 @@ CLI_COMMANDS = [
         "examples": [
             "pedacito rpc ~/code/app",
             "echo '{\"id\":1,\"method\":\"status\"}' | pedacito rpc ~/code/app",
+            "echo '{\"id\":2,\"op\":\"consolidate\"}' | pedacito rpc ~/code/app",
             "pedacito chat ~/code/app --rpc",
         ],
         "flags": [
@@ -407,6 +412,9 @@ CLI_COMMANDS = [
             "stdout is 100% valid JSONL; nothing human-facing ever lands there",
             "one task at a time: a second ask gets a busy: error, while "
             "steer, cancel and permission_reply still reach the running one",
+            "requests may spell the method as \"method\" or \"op\"; "
+            "consolidate answers with before/after token counts and the "
+            "handoff, and the next ask starts from that handoff alone",
             "stdin EOF flushes the active task's reply before the process "
             "exits; cancel keeps the session warm",
             "protocol details: pedacito/rpc.py; rationale: TECHNIQUES.md §31",
@@ -928,24 +936,40 @@ CLI_COMMANDS = [
     },
     {
         "name": "memory",
-        "usage": "pedacito memory PROJECT [--add TEXT | --forget TEXT]",
+        "usage": "pedacito memory PROJECT [--add TEXT | --forget TEXT | "
+                 "--consolidate]",
         "summary": "List, add or forget the facts Pedacito remembers about a "
-                   "project.",
-        "keywords": ["remember", "facts", "notes", "memory.md"],
+                   "project, or consolidate the recent session history into "
+                   "a handoff checkpoint.",
+        "keywords": ["remember", "facts", "notes", "memory.md",
+                     "consolidate", "compact", "handoff", "session summary"],
         "examples": [
             "pedacito memory .",
             'pedacito memory . --add "tests run with pytest -q"',
             'pedacito memory . --forget "old fact"',
             "pedacito memory . --global",
+            "pedacito memory . --consolidate",
         ],
         "flags": [
             {"flag": "--add TEXT", "help": "remember a fact"},
             {"flag": "--forget TEXT", "help": "remove a fact"},
+            {"flag": "--consolidate",
+             "help": "compact recent session history into a consolidated "
+                     "handoff checkpoint (.pedacito/consolidated_session.md)"},
             {"flag": "--global",
              "help": "use the user-level memory instead of the project's"},
             {"flag": "--root DIR", "help": "project root"},
             {"flag": "--config FILE", "help": "use this config file"},
             {"flag": "--profile NAME", "help": "apply a profile block"},
+        ],
+        "notes": [
+            "--consolidate distils the newest session transcripts into four "
+            "sections (Goal & Context, Files Modified & Key Decisions, "
+            "Verified Test Status, Open Next Steps) under 400 tokens, and "
+            "pins durable decisions to memory.md",
+            "in chat the same operation is /consolidate (alias /compact); "
+            "over RPC it is the consolidate method; in the GUI the "
+            "Consolidate Session button",
         ],
     },
     {
@@ -1065,15 +1089,49 @@ CLI_COMMANDS = [
     },
     {
         "name": "skills",
-        "usage": "pedacito skills PROJECT",
-        "summary": "List the available skills (project, user and bundled "
-                   "starters).",
-        "keywords": ["skills", "capabilities", "catalog"],
-        "examples": ["pedacito skills ."],
+        "usage": "pedacito skills [list | show NAME | add NAME | draft "
+                 "\"PROMPT\" | rm NAME] [PROJECT] [--global]",
+        "summary": "Browse and manage the skill library: sixteen bundled "
+                   "starters plus your own user/project skills. list (the "
+                   "default) shows every skill with its scope badge; show "
+                   "prints one skill's triggers and checklist; add writes a "
+                   "custom skill from flags; draft asks the active model to "
+                   "write one from a sentence; rm deletes a custom skill "
+                   "(built-ins are immutable).",
+        "keywords": ["skills", "capabilities", "catalog", "custom skill",
+                     "create skill", "draft skill", "delete skill",
+                     "skill library", "triggers"],
+        "examples": [
+            "pedacito skills .",
+            "pedacito skills show add-a-test",
+            'pedacito skills add deploy-checklist --description "Ship a '
+            'release safely" --triggers "deploy,release" --body "1. ..."',
+            'pedacito skills draft "Skill for Alpine.js dark-mode components"',
+            "pedacito skills rm deploy-checklist",
+            "pedacito skills list --global",
+        ],
         "flags": [
+            {"flag": "--description TEXT",
+             "help": "one-line description (skills add)"},
+            {"flag": "--triggers K1,K2,...",
+             "help": "comma-separated trigger keywords (skills add)"},
+            {"flag": "--body TEXT", "help": "the checklist body (skills add)"},
+            {"flag": "--global",
+             "help": "use the user-level skill library instead of the "
+                     "project's"},
+            {"flag": "--url URL", "help": "server base URL override (draft)"},
+            {"flag": "--model ID", "help": "model id override (draft)"},
             {"flag": "--root DIR", "help": "project root"},
             {"flag": "--config FILE", "help": "use this config file"},
             {"flag": "--profile NAME", "help": "apply a profile block"},
+        ],
+        "notes": [
+            "custom skills live in .pedacito/skills/<name>.md (project) or "
+            "~/.config/pedacito/skills/<name>.md (user); a project skill "
+            "shadows a bundled one of the same name",
+            "select_skills injects the top-2 trigger matches for a task, "
+            "capped at 1,200 chars of checklist text",
+            "the GUI twin is Project ▾ → Skills library & creator…",
         ],
     },
 ]
@@ -1489,16 +1547,21 @@ GUI_TOPICS = [
     },
     {
         "id": "project-upkeep",
-        "title": "Project ▾ upkeep: memory, background servers, checks, "
-                 "prune, reset state",
+        "title": "Project ▾ upkeep: memory, skills, background servers, "
+                 "checks, prune, reset state",
         "summary": "The Project ▾ menu holds the upkeep dialogs: remembered "
-                   "facts and repo lessons, background dev servers, on-demand "
-                   "project checks, pruning old sessions/backups, and a "
-                   "previewed reset of the project's runtime state.",
+                   "facts and repo lessons, the skills library & creator, "
+                   "background dev servers, on-demand project checks, "
+                   "pruning old sessions/backups, and a previewed reset of "
+                   "the project's runtime state.",
         "steps": [
             "Project ▾ → Memory & repo lessons…: list, add or forget "
             "remembered facts (this project or all projects) and read the "
             "repair lessons; the same store as pedacito memory",
+            "Project ▾ → Skills library & creator…: browse the sixteen "
+            "built-in starters plus user/project skills, preview a task's "
+            "trigger matches, and write or auto-draft custom skills "
+            "(pedacito skills)",
             "Project ▾ → Background servers…: start a named dev server "
             "(e.g. npm run dev), tail its logs, stop it; the same engine as "
             "pedacito serve / pedacito procs",
@@ -1514,13 +1577,67 @@ GUI_TOPICS = [
             "(pedacito reset)",
         ],
         "keywords": ["project menu", "upkeep", "memory dialog",
-                     "background servers", "dev server", "project checks",
-                     "run checks", "prune sessions", "prune backups",
-                     "reset project", "reset project state", "wipe state",
-                     "repo lessons"],
+                     "skills library", "background servers", "dev server",
+                     "project checks", "run checks", "prune sessions",
+                     "prune backups", "reset project", "reset project state",
+                     "wipe state", "repo lessons"],
         "settings": ["keep_sessions", "keep_backups", "micro_facts"],
-        "cli": ["memory", "serve", "procs", "diagnose", "webcheck",
+        "cli": ["memory", "skills", "serve", "procs", "diagnose", "webcheck",
                 "domcheck", "prune", "reset"],
+    },
+    {
+        "id": "skills-library",
+        "title": "Skills library & creator: browse, match, write skills",
+        "summary": "Project ▾ → Skills library & creator… (also ⚙ Settings → "
+                   "Quick links) browses the sixteen built-in starters plus "
+                   "your user and project skills, previews which checklists "
+                   "a task injects, and creates custom skills by hand or "
+                   "with a model draft.",
+        "steps": [
+            "Project ▾ → Skills library & creator… opens the library; each "
+            "row carries a scope badge (bundled / user / project)",
+            "Type a task in the preview box and press Enter: the matching "
+            "skills light up (top-2 trigger matches, ≤1,200 chars injected)",
+            "Click a skill to read its triggers and checklist body",
+            "+ New Custom Skill opens the editor: name (slug), description, "
+            "comma-separated triggers and the checklist body",
+            "✦ Auto-Draft from Description asks the active model to write "
+            "the whole skill from your one-line description; review the "
+            "draft before saving",
+            "Save to Project writes .pedacito/skills/<name>.md; Save to "
+            "Global writes ~/.config/pedacito/skills/<name>.md; Edit and "
+            "Delete manage custom skills (built-ins are immutable)",
+        ],
+        "keywords": ["skill", "skills", "custom skill", "create skill",
+                     "skill library", "skill creator", "draft skill",
+                     "auto-draft", "triggers", "checklist", "delete skill"],
+        "settings": ["use_skills", "max_skill_catalog_chars"],
+        "cli": ["skills"],
+    },
+    {
+        "id": "consolidate-session",
+        "title": "Consolidate a long session into a handoff",
+        "summary": "The Consolidate Session button in the telemetry footer "
+                   "(or Project ▾ → Consolidate session…) distils the chat "
+                   "transcript into a structured handoff under 400 tokens, "
+                   "saves .pedacito/consolidated_session.md, and restarts "
+                   "the chat from that handoff so the next turn starts "
+                   "small. The Context Meter updates immediately.",
+        "steps": [
+            "Click Consolidate Session in the telemetry bar (footer) and "
+            "confirm; a running job must be stopped first",
+            "The handoff keeps four sections: Goal & Context, Files "
+            "Modified & Key Decisions, Verified Test Status, Open Next Steps",
+            "The transcript resets to the single handoff card; durable "
+            "decisions are pinned to memory.md",
+            "CLI twins: /consolidate (alias /compact) in pedacito chat, "
+            "pedacito memory --consolidate, and the RPC consolidate method",
+        ],
+        "keywords": ["consolidate", "compact", "handoff", "session summary",
+                     "context full", "long session", "compress session",
+                     "checkpoint", "context meter"],
+        "settings": ["use_memory", "context_tokens"],
+        "cli": ["memory", "chat", "rpc"],
     },
     {
         "id": "conversation-threads",

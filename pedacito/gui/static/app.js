@@ -1420,6 +1420,184 @@ function memoryDialog() {
   });
 }
 
+// Skills library & creator: browse the bundled starters plus user/project
+// custom skills, preview which checklists a task would inject, and write new
+// skills by hand or with a one-call model draft. The same operations as
+// `pedacito skills list|show|add|draft|rm`.
+function skillsDialog() {
+  const body = h('div', {});
+  const list = h('div', {});
+  const detail = h('div', {});
+  const editor = h('div', {});
+  const note = h('div', { class: 'muted small-text' });
+  let rows = [], matchNames = [];
+  const filter = h('input', { type: 'text', class: 'grow', spellcheck: false,
+    placeholder: 'filter by name or description\u2026',
+    oninput: () => paintList() });
+  const task = h('input', { type: 'text', class: 'grow', spellcheck: false,
+    placeholder: 'type a task to preview which skills match (Enter)',
+    onkeydown: (e) => { if (e.key === 'Enter') previewMatches(); } });
+  const newBtn = h('button', { class: 'primary', text: '+ New Custom Skill',
+    onclick: () => openEditor(null) });
+
+  function previewMatches() {
+    const t = (task.value || '').trim();
+    if (!t) { matchNames = []; note.textContent = ''; paintList(); return; }
+    PDC.api('/api/skills?task=' + encodeURIComponent(t)).then((j) => {
+      if (!j.ok) { PDC.toast(j.detail || 'could not preview matches', true); return; }
+      matchNames = (j.matches || []).map((m) => m.name);
+      note.textContent = matchNames.length
+        ? 'This task injects: ' + matchNames.join(', ')
+          + ' (top 2 matches, \u22641,200 chars of checklist).'
+        : 'No skill triggers match this task.';
+      paintList();
+    });
+  }
+
+  function paintList() {
+    PDC.clear(list);
+    const needle = (filter.value || '').trim().toLowerCase();
+    const shown = rows.filter((r) => !needle
+      || r.name.indexOf(needle) >= 0
+      || (r.description || '').toLowerCase().indexOf(needle) >= 0);
+    if (!shown.length) {
+      list.appendChild(h('div', { class: 'tip', text: 'No skills match the filter.' }));
+      return;
+    }
+    shown.forEach((r) => {
+      const matched = matchNames.indexOf(r.name) >= 0;
+      const custom = r.scope !== 'bundled';
+      list.appendChild(h('div', { class: 'row small-text', style: 'padding:3px 0;cursor:pointer',
+        onclick: () => showDetail(r) },
+        h('span', { class: 'tag' + (matched ? ' act' : ''), text: r.scope }),
+        h('b', { text: r.name, style: 'min-width:200px' }),
+        matched ? h('span', { class: 'tag act', text: 'matches task' }) : null,
+        h('span', { class: 'grow muted', text: r.description }),
+        custom ? h('button', { class: 'ghost small', text: 'Edit', onclick: (e) => {
+          e.stopPropagation(); openEditor(r);
+        } }) : null,
+        custom ? h('button', { class: 'ghost small danger', text: 'Delete', onclick: (e) => {
+          e.stopPropagation();
+          PDC.confirm('Delete the ' + r.scope + ' skill \u201c' + r.name + '\u201d?', 'Delete', true).then((ok) => {
+            if (!ok) return;
+            PDC.api('/api/skills/delete', { name: r.name, scope: r.scope }).then((j) => {
+              if (!j.ok) { PDC.toast(j.detail || 'could not delete', true); return; }
+              PDC.toast('Skill deleted.');
+              rows = j.skills || []; paintList(); PDC.clear(detail);
+            });
+          });
+        } }) : null));
+    });
+  }
+
+  function showDetail(r) {
+    PDC.clear(detail);
+    detail.appendChild(h('div', { class: 'note-box', style: 'margin-top:10px' },
+      h('div', { class: 'row' },
+        h('b', { text: r.name }),
+        h('span', { class: 'tag', text: r.scope }),
+        h('span', { class: 'muted small-text grow', text: r.source || '' })),
+      h('div', { class: 'small-text', style: 'margin:4px 0',
+        text: 'triggers: ' + ((r.triggers || []).join(', ') || '(none)') }),
+      h('pre', { class: 'diffwrap', style: 'max-height:26vh;overflow:auto;margin:0;white-space:pre-wrap',
+        text: r.body || '' })));
+  }
+
+  // -- the custom-skill editor (new or editing an existing custom skill) ----
+  const nameInp = h('input', { type: 'text', class: 'grow', spellcheck: false,
+    placeholder: 'slug, e.g. alpine-dark-mode' });
+  const descInp = h('input', { type: 'text', class: 'grow',
+    placeholder: 'one line: when to use this skill (also the draft prompt)' });
+  const trigInp = h('input', { type: 'text', class: 'grow', spellcheck: false,
+    placeholder: 'comma-separated keywords, e.g. alpine, dark mode, toggle' });
+  const bodyInp = h('textarea', { rows: 7, spellcheck: false, style: 'width:100%',
+    placeholder: 'the numbered checklist the model follows (prompt text, never executed)' });
+  const draftBtn = h('button', { text: '\u2726 Auto-Draft from Description', onclick: () => {
+    const prompt = (descInp.value || '').trim();
+    if (!prompt) { PDC.toast('Describe what the skill should teach first.', true); return; }
+    draftBtn.disabled = true; draftBtn.textContent = '\u2726 Drafting\u2026';
+    PDC.api('/api/skills/draft', { prompt: prompt }).then((j) => {
+      draftBtn.disabled = false; draftBtn.textContent = '\u2726 Auto-Draft from Description';
+      if (!j.ok) { PDC.toast(j.detail || 'draft failed', true); return; }
+      const d = j.draft || {};
+      if (!nameInp.value.trim()) nameInp.value = d.name || '';
+      descInp.value = d.description || descInp.value;
+      trigInp.value = (d.triggers || []).join(', ');
+      bodyInp.value = d.body || '';
+      PDC.toast('Draft ready \u2014 review it, then save.');
+    }, () => {
+      draftBtn.disabled = false; draftBtn.textContent = '\u2726 Auto-Draft from Description';
+      PDC.toast('The GUI server did not answer.', true);
+    });
+  } });
+  function save(scope) {
+    const payload = { name: nameInp.value.trim(), description: descInp.value.trim(),
+      triggers: trigInp.value, body: bodyInp.value, scope: scope };
+    if (!payload.name) { PDC.toast('Give the skill a slug name.', true); return; }
+    PDC.api('/api/skills', payload).then((j) => {
+      if (!j.ok) { PDC.toast(j.detail || 'could not save', true); return; }
+      PDC.toast('Saved \u201c' + payload.name + '\u201d to the ' + scope + ' library.');
+      rows = j.skills || []; paintList(); PDC.clear(editor);
+    });
+  }
+  function openEditor(r) {
+    PDC.clear(editor);
+    nameInp.value = r ? r.name : '';
+    descInp.value = r ? r.description : '';
+    trigInp.value = r ? (r.triggers || []).join(', ') : '';
+    bodyInp.value = r ? r.body : '';
+    editor.appendChild(h('div', { class: 'note-box', style: 'margin-top:10px' },
+      h('b', { text: r ? 'Edit skill: ' + r.name : 'New custom skill' }),
+      h('div', { class: 'form', style: 'margin-top:6px' },
+        h('label', { text: 'Name (slug)' }), nameInp,
+        h('label', { text: 'Description' }), descInp,
+        h('label', { text: 'Triggers' }), trigInp,
+        h('label', { text: 'Checklist body' }), bodyInp),
+      h('div', { class: 'row', style: 'margin-top:8px' },
+        draftBtn,
+        h('span', { class: 'grow' }),
+        h('button', { text: 'Cancel', onclick: () => PDC.clear(editor) }),
+        h('button', { class: 'primary', text: 'Save to Project',
+          disabled: !S.status.root, title: S.status.root ? '' : 'Open a project first',
+          onclick: () => save('project') }),
+        h('button', { class: 'primary', text: 'Save to Global', onclick: () => save('user') }))));
+    nameInp.focus();
+  }
+
+  body.appendChild(h('div', { class: 'row', style: 'margin-bottom:8px' }, filter, newBtn));
+  body.appendChild(h('div', { class: 'row', style: 'margin-bottom:8px' },
+    task, h('button', { text: 'Preview matches', onclick: previewMatches })));
+  body.appendChild(note);
+  body.appendChild(list);
+  body.appendChild(detail);
+  body.appendChild(editor);
+  PDC.modal('Skills library & creator', body, [{ label: 'Close' }], { wide: true });
+  PDC.api('/api/skills').then((j) => {
+    if (!j.ok) { note.textContent = j.detail || 'Could not load the skills library.'; return; }
+    rows = j.skills || [];
+    paintList();
+  }, () => { note.textContent = 'The GUI server did not answer.'; });
+}
+PDC.skillsDialog = skillsDialog;
+
+// Session consolidation: distil the transcript into a handoff checkpoint and
+// restart the chat from it, so the next turn starts with a small prompt. The
+// server resets the transcript and the Context Meter follows immediately.
+function consolidateSession() {
+  if (job()) { PDC.toast('Stop the running job first.', true); return; }
+  PDC.confirm('Consolidate this session?\n\nThe transcript is distilled into a short handoff checkpoint (.pedacito/consolidated_session.md) and the chat restarts from that handoff alone, so the next turn uses far fewer context tokens.',
+    'Consolidate').then((ok) => {
+    if (!ok) return;
+    PDC.api('/api/session/consolidate', {}).then((j) => {
+      if (!j.ok) { PDC.toast(j.detail || 'could not consolidate', true); return; }
+      PDC.toast('Consolidated: ~' + PDC.fmtInt(j.before_tokens) + ' \u2192 ~'
+        + PDC.fmtInt(j.after_tokens) + ' tokens.');
+      if (j.status) applyStatus(j.status);
+    }, () => PDC.toast('The GUI server did not answer.', true));
+  });
+}
+PDC.consolidateSession = consolidateSession;
+
 // Background dev servers: the `.pedacito/procs/` registry, with a live log
 // tail and a Stop button, and the same start form `pedacito serve` uses.
 function procsDialog() {
@@ -1809,6 +1987,9 @@ function TelemetryBar() {
         <span class="tele-item">KV Cache Hit: <b>${Math.round(t.cache_hit_pct || 0)}%</b> | Folds: <b>${s.folds || 0}</b></span>
         <span class="tele-item">Active: <b>${activeName}</b> (${activeTag})</span>
         ${s.planner_profile ? html`<span class="tele-item">Orchestrator: <b>${s.planner_profile}</b></span>` : null}
+        <button id="consolidateBtn" class="small ghost"
+                title="Compact this session into a handoff checkpoint; the next turn starts from it alone"
+                onClick=${(e) => { e.stopPropagation(); consolidateSession(); }}>Consolidate Session</button>
         <i class="tele-caret">${open ? '\u25BE' : '\u25B4'}</i>
       </div>
     </footer>`;
@@ -1876,10 +2057,14 @@ function TopBar() {
             <${MenuItem} label="Restore from a backup\u2026" disabled=${!!j || !(s.snapshots || []).length} action=${restoreDialog} />
             <${MenuItem} label="Rename symbol\u2026" disabled=${!!j || !s.root} action=${renameSymbolDialog} />
             <${MenuItem} label="Memory & repo lessons\u2026" disabled=${!s.root} action=${memoryDialog} />
+            <${MenuItem} label="Skills library & creator\u2026" action=${skillsDialog}
+                       title="browse the built-in, user and project skills; write or auto-draft custom ones" />
             <${MenuItem} label="Background servers\u2026" disabled=${!s.root} action=${procsDialog} />
             <${MenuItem} label="Run project checks\u2026" disabled=${!s.root} action=${checksDialog} />
             <${MenuItem} label="Prune old sessions/backups\u2026" disabled=${!s.root} action=${pruneDialog} />
             <${MenuItem} label="Reset project state\u2026" disabled=${!s.root || !!j} action=${resetDialog} />
+            <${MenuItem} label="Consolidate session\u2026" disabled=${!!j} action=${consolidateSession}
+                       title="compact the transcript into a handoff checkpoint (also in the telemetry bar)" />
             <${MenuItem} label="Provider settings\u2026" action=${() => callSettings()} />
             <${MenuItem} label="Clear terminal" action=${clearTerm} />
             <${MenuItem} label="Clear chat" action=${() => PDC.api('/api/clear', {})} />
@@ -2228,6 +2413,9 @@ function FoldMsg(props) {                 // stream / activity transcripts
 function SystemMsg(props) {
   const m = props.m;
   const j = job();
+  if (m.kind === 'handoff') {
+    return html`<div class="md">${md(m.text)}</div>`;
+  }
   return html`
     <div>${m.text}</div>
     ${m.kind === 'opened' && m.needs_index && !S.status.has_index ? html`

@@ -179,6 +179,261 @@ def render(root, cfg=None, limit: int | None = None) -> str:
     return head + "\n" + "\n".join(rows) if rows else ""
 
 
+# ------------------------------------------------------ session consolidation
+#
+# fold_middle keeps the single-slot KV prefix small INSIDE one gather loop;
+# consolidation works BETWEEN tasks: the recent session transcripts (or the
+# live chat buffer) are distilled into one structured handoff of < 400 tokens,
+# saved to .pedacito/consolidated_session.md, and the caller resets its live
+# buffer to that handoff so the next turn starts with minimal prompt tokens.
+# The distillation is deterministic (harness facts, never invented prose); a
+# caller may pass a model client to refine the wording, with the extractive
+# handoff as the fallback. Durable decisions can be pinned to memory.md.
+
+CONSOLIDATED_FILE = "consolidated_session.md"
+# ~3.6 chars/token: 1,400 chars stays under the 400-token handoff budget.
+MAX_HANDOFF_CHARS = 1400
+HANDOFF_SECTIONS = ("Goal & Context", "Files Modified & Key Decisions",
+                    "Verified Test Status", "Open Next Steps")
+_CONSOLIDATE_LOGS = 6
+_PATH_RE = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_./-]*\.[A-Za-z0-9]{1,8}")
+_TEST_RE = re.compile(
+    r"\b\d+\s+(?:passed|failed|error)\b|\btests?\s+(?:ok|passed|failed)\b"
+    r"|\b(?:pytest|vitest|jest|npm test|cargo test|go test)\b", re.I)
+_DECISION_RE = re.compile(
+    r"\b(?:decided to|decision:|we chose|chose .* instead|key decision)\b",
+    re.I)
+_NEXT_RE = re.compile(r"\b(?:next step|todo|follow[- ]up|still to|remaining)\b",
+                      re.I)
+
+
+def consolidated_file(root) -> Path:
+    """The checkpoint path: the project's, or the per-user state folder when
+    a session has no project root (the GUI's project-less mode)."""
+    if root is None:
+        from . import config as config_mod
+        return config_mod.USER_STATE_DIR / CONSOLIDATED_FILE
+    return Path(root) / ".pedacito" / CONSOLIDATED_FILE
+
+
+def handoff_prompt(summary: str) -> str:
+    """The handoff as a resume seed for the next task (CLI chat / rpc)."""
+    return ("CONSOLIDATED SESSION HANDOFF (earlier turns compacted to save "
+            "context; verify current source before editing):\n"
+            + (summary or "").strip())
+
+
+def _msg_text(m: dict) -> str:
+    content = m.get("content", m.get("text", ""))
+    if isinstance(content, list):       # multimodal parts -> text only
+        content = " ".join(str(p.get("text", "")) for p in content
+                           if isinstance(p, dict))
+    return str(content or "")
+
+
+def _task_from_user_turn(text: str) -> str:
+    """The task inside a gather user0 turn ('PROJECT MAP ... TASK ...'), or
+    the plain chat message; observation turns are not tasks."""
+    if text.startswith("RESULT:") or "PROJECT MAP" in text[:400]:
+        marker = text.rfind("TASK\n")
+        if marker == -1:
+            return ""
+        text = text[marker + 5:]
+    return " ".join(text.split())[:200]
+
+
+def _collect_lines(text: str, rx: re.Pattern, cap: int = 3,
+                   sentence: bool = False) -> list[str]:
+    out: list[str] = []
+    for line in text.splitlines():
+        line = line.strip().lstrip("- ").strip()
+        if not line or not rx.search(line):
+            continue
+        if sentence:
+            # Keep only the sentence that carries the signal, not the whole
+            # reply line it happened to ride in.
+            parts = [s.strip() for s in re.split(r"(?<=[.!?])\s+", line)
+                     if rx.search(s)]
+            line = " ".join(parts) or line
+        row = line[:180]
+        if row not in out:
+            out.append(row)
+    return out[-cap:]
+
+
+def _handoff_material(root, messages):
+    """(before_tokens, facts) distilled from the live buffer or, without one,
+    the most recent session transcripts. Harness-visible facts only."""
+    from .llm import estimate_messages, estimate_tokens
+    tasks: list[str] = []
+    applied: list[str] = []
+    failed: list[str] = []
+    decisions: list[str] = []
+    tests: list[str] = []
+    nexts: list[str] = []
+    replies: list[str] = []
+
+    if messages:
+        msgs = [m for m in messages if isinstance(m, dict)]
+        before = estimate_messages(msgs)
+        for m in msgs:
+            role = str(m.get("role") or "")
+            text = _msg_text(m)
+            if role == "user":
+                task = _task_from_user_turn(text)
+                if task:
+                    tasks.append(task)
+            elif role == "assistant":
+                replies.append(text)
+                for line in text.splitlines():
+                    mm = re.search(r"\b(applied|FAILED)\s+`?([^`:\n]+)`?",
+                                   line)
+                    if mm:
+                        name = mm.group(2).strip()
+                        if _PATH_RE.search(name):
+                            (applied if mm.group(1) == "applied"
+                             else failed).append(name)
+        body = "\n".join(replies[-4:])
+        decisions = _collect_lines(body, _DECISION_RE, sentence=True)
+        tests = _collect_lines("\n".join(_msg_text(m) for m in msgs),
+                               _TEST_RE)
+        nexts = _collect_lines(body, _NEXT_RE, sentence=True)
+    else:
+        from . import sessions
+        texts: list[str] = []
+        for p in sessions.paths(root)[:_CONSOLIDATE_LOGS]:
+            try:
+                texts.append(p.read_text(encoding="utf-8", errors="replace"))
+            except OSError:
+                continue
+        before = estimate_tokens("\n".join(texts))
+        for text in texts:                      # newest first
+            tasks.append(sessions._task(text)[:200])
+            for line in text.splitlines():
+                mm = re.match(r"- (applied|FAILED) `([^`]+)`", line)
+                if mm:
+                    (applied if mm.group(1) == "applied"
+                     else failed).append(mm.group(2))
+            decisions += _collect_lines(text, _DECISION_RE, 2, sentence=True)
+            tests += _collect_lines(text, _TEST_RE, 2)
+            nexts += _collect_lines(text, _NEXT_RE, 2, sentence=True)
+            reply = text.split("## Response", 1)
+            if len(reply) == 2:
+                replies.append(reply[1].split("##", 1)[0].strip())
+
+    def dedup(rows: list[str], cap: int) -> list[str]:
+        out: list[str] = []
+        for row in rows:
+            if row and row not in out:
+                out.append(row)
+        return out[:cap]
+
+    facts = {"tasks": dedup(tasks, 3),
+             "applied": dedup(applied, 8), "failed": dedup(failed, 4),
+             "decisions": dedup(decisions, 3), "tests": dedup(tests, 3),
+             "nexts": dedup(nexts, 3),
+             "last_reply": (replies[-1] if replies else "")[:300]}
+    return before, facts
+
+
+def _render_handoff(facts: dict) -> str:
+    """The four-section handoff, capped at MAX_HANDOFF_CHARS. Every line is a
+    fact the harness saw; nothing is invented to fill a section."""
+    tasks = facts["tasks"]
+    goal = [f"- Current: {tasks[0]}"] if tasks else \
+        ["- No prior task recorded in the consolidated window."]
+    goal += [f"- Earlier: {t}" for t in tasks[1:3]]
+    files = [f"- Applied: {', '.join(facts['applied'])}"] \
+        if facts["applied"] else []
+    if facts["failed"]:
+        files.append(f"- FAILED edits: {', '.join(facts['failed'])}")
+    files += [f"- {d}" for d in facts["decisions"]]
+    if not files:
+        files = ["- No file edits recorded in the consolidated window."]
+    tests = [f"- {t}" for t in facts["tests"]] or \
+        ["- No test run recorded in the consolidated window."]
+    nexts = [f"- {n}" for n in facts["nexts"]]
+    nexts += [f"- Repair failed edit: {f}" for f in facts["failed"]]
+    if not nexts:
+        nexts = ["- Continue from the current goal; re-read files before "
+                 "editing."]
+    sections = {"Goal & Context": goal,
+                "Files Modified & Key Decisions": files,
+                "Verified Test Status": tests,
+                "Open Next Steps": nexts}
+    lines = ["# Consolidated session handoff", ""]
+    for head in HANDOFF_SECTIONS:
+        lines.append(f"## {head}")
+        lines += sections[head]
+        lines.append("")
+    text = "\n".join(lines).rstrip() + "\n"
+    while len(text) > MAX_HANDOFF_CHARS:
+        # Drop the oldest detail line, never a heading: the structure stays.
+        detail = [i for i, ln in enumerate(text.splitlines())
+                  if ln.startswith("- ")]
+        if not detail:
+            break
+        rows = text.splitlines()
+        rows.pop(detail[0])
+        text = "\n".join(rows).rstrip() + "\n"
+    return text[:MAX_HANDOFF_CHARS]
+
+
+def _model_handoff(client, facts: dict, draft: str) -> str:
+    """Optional model rewrite of the extractive handoff. The four headings
+    are mandatory; any failure keeps the deterministic draft."""
+    try:
+        text = client.chat(
+            [{"role": "system", "content":
+              "You compact a coding session into a handoff. Keep ONLY facts "
+              "from the draft; invent nothing. Reply with exactly these four "
+              "markdown headings and short bullets under each, under 350 "
+              "tokens total: ## Goal & Context, ## Files Modified & Key "
+              "Decisions, ## Verified Test Status, ## Open Next Steps. Keep "
+              "file paths, numbers and test results exact. No preamble."},
+             {"role": "user", "content": f"SESSION DRAFT\n{draft}"}],
+            max_tokens=400, stream=False, disable_thinking=True)
+        text = (text or "").strip()
+        if text and all(h in text for h in HANDOFF_SECTIONS):
+            return text[:MAX_HANDOFF_CHARS]
+    except Exception:
+        pass
+    return draft
+
+
+def consolidate_session(root: Path, cfg, messages: list[dict] | None = None,
+                        *, client=None, pin_memory: bool = True) -> dict:
+    """Compact the recent session history into a structured handoff.
+
+    Summarizes the live `messages` buffer when given (chat / GUI transcripts;
+    `content` or `text` fields), else the most recent `.pedacito/sessions/*.md`
+    transcripts. Writes `.pedacito/consolidated_session.md` (per-user state
+    when root is None), optionally pins durable decisions to memory.md, and
+    returns {before_tokens, after_tokens, summary, path, pinned}. The caller
+    resets its live buffer to `summary` (see handoff_prompt) so the next turn
+    starts from the handoff alone. Deterministic by default; pass `client` to
+    let the active model refine the wording (extractive fallback on error).
+    """
+    from .llm import estimate_tokens
+    before, facts = _handoff_material(root, messages)
+    summary = _render_handoff(facts)
+    if client is not None:
+        summary = _model_handoff(client, facts, summary)
+    path = consolidated_file(root)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(summary, encoding="utf-8")
+    tmp.replace(path)
+    pinned = 0
+    if pin_memory and root is not None and getattr(cfg, "use_memory", True):
+        for decision in facts["decisions"][:2]:
+            ok, _msg = remember(root, decision, category="notes")
+            pinned += 1 if ok else 0
+    return {"before_tokens": int(before),
+            "after_tokens": int(estimate_tokens(summary)),
+            "summary": summary, "path": str(path), "pinned": pinned}
+
+
 # --------------------------------------------------------- failed attempts
 #
 # A task that ends with no edit landed leaves a one-line record; the next task
