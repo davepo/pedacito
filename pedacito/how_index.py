@@ -1842,7 +1842,10 @@ GUI_TOPICS = [
                    "boundaries only -- never mid-gather -- and on one local "
                    "server the outgoing model is unloaded first so the "
                    "specialist fits in VRAM. Profiles on different servers stay "
-                   "warm together.",
+                   "warm together. Hosted (remote API) profiles are excluded by "
+                   "default (auto_route_allow_hosted = false), so a local pool "
+                   "never jumps to a paid cloud model; set it true to include "
+                   "them.",
         "steps": [
             "Tag your profiles: ⚙ Settings → Profiles → [Select Profile] → "
             "Connection & Capabilities → specialties → toggle the tag pills "
@@ -1864,7 +1867,8 @@ GUI_TOPICS = [
                      "specialty routing", "route tasks", "coder model",
                      "model per task", "vram handoff", "model swap",
                      "unload model", "task routing"],
-        "settings": ["auto_route_specialties", "specialties", "use_model_card"],
+        "settings": ["auto_route_specialties", "auto_route_allow_hosted",
+                     "specialties", "use_model_card"],
         "cli": ["profiles", "calibrate", "ask", "auto"],
     },
     {
@@ -2029,6 +2033,9 @@ _SETTING_GUI = {
                    "Capabilities → specialties (tag pills + custom tag)",
     "auto_route_specialties": "Topbar → ✦ Auto-route checkbox, or ⚙ Settings "
                               "→ All settings → search auto_route_specialties",
+    "auto_route_allow_hosted": "⚙ Settings → All settings → search "
+                               "auto_route_allow_hosted (off = local-only "
+                               "routing)",
     "gui_theme": "Topbar → theme dropdown, or ⚙ Settings → All settings → "
                  "Graphical interface → gui_theme",
     "disable_thinking": "⚙ Settings → Profiles → [Select Profile] → Reasoning "

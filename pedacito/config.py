@@ -651,6 +651,12 @@ class Config:
     # different servers stay warm together. Off by default; `--auto-route`
     # flips it per run.
     auto_route_specialties: bool = False
+    # Allow specialist routing to pick a HOSTED (remote API) profile. Off by
+    # default: with a local pool, a hosted model that merely carries a matching
+    # specialty tag (e.g. deepseek-flash for coding) is never selected, so an
+    # --auto-route run cannot silently start spending money. Set true to opt
+    # into routing across every configured profile, local or hosted.
+    auto_route_allow_hosted: bool = False
     # Preset tier ("tiny", "small", "medium", "large", "hosted") for a run
     # with no profile selected; profiles carry their own `tier` key.
     tier: str = ""
@@ -2287,9 +2293,16 @@ def _guess_tier(name: str, body: dict) -> str | None:
     hay = " ".join([name.lower(),
                     str(body.get("model", "")).lower(),
                     str(body.get("base_url", "")).lower()])
-    if any(h in hay for h in ("deepseek", "openai", "anthropic", "api.",
-                              "moonshot", "x.ai", "groq", "together",
-                              "mistral.ai", "hosted")):
+    # A hosted tier only applies to a REMOTE endpoint. Matching the model or
+    # profile name alone mislabels local GGUFs (e.g. a DeepSeek-Coder build
+    # served from 127.0.0.1) as hosted, which then drops them from every
+    # local-only pool. An explicit local base_url decides; with no base_url
+    # the name heuristic still stands (the config's fallback may be remote).
+    base = str(body.get("base_url", "") or "")
+    remote = not base or not _endpoint_is_local(base)
+    if remote and any(h in hay for h in ("deepseek", "openai", "anthropic",
+                                         "api.", "moonshot", "x.ai", "groq",
+                                         "together", "mistral.ai", "hosted")):
         return "hosted"
     m = re.search(r"(?<![\d.])(\d{1,3})\s*b(?![\d.])", hay)
     if m:
@@ -2302,6 +2315,21 @@ def _guess_tier(name: str, body: dict) -> str | None:
             return "medium"
         return "large"
     return None
+
+
+def _endpoint_is_local(base_url: str) -> bool:
+    """True for a loopback/private-LAN/mDNS endpoint (the places a user
+    self-hosts a model server). Used to keep the tier heuristic from calling
+    a local model 'hosted' because of its name."""
+    host = _hostname(base_url)
+    if host in _LOCAL_HOSTS or host.endswith(".local"):
+        return True
+    try:
+        import ipaddress
+        addr = ipaddress.ip_address(host)
+    except ValueError:
+        return False
+    return addr.is_loopback or addr.is_link_local or addr.is_private
 
 
 def _apply_preset(name: str, body: dict, origin: str) -> tuple[dict, str]:
@@ -2587,6 +2615,10 @@ TEMPLATE = '''\
 # or pass --auto-route: every task goes to the best-matching specialist at
 # task boundaries, with a clean VRAM handoff on a single local server.
 # auto_route_specialties = false
+# Hosted profiles are excluded from that routing by default: an --auto-route
+# run stays on your local models even when a cloud profile carries the matching
+# tag. Set auto_route_allow_hosted = true to include them (and their cost).
+# auto_route_allow_hosted = false
 
 [universal]
 # Connection, generation, and shared hardware/workspace defaults. A profile
@@ -3025,6 +3057,9 @@ REFERENCE_TEMPLATE = TEMPLATE + '''
 # prefix. On one local server the outgoing model is unloaded before the
 # specialist loads (clean VRAM handoff); profiles on different servers stay
 # warm together, and an unreachable specialist falls back to the worker.
+# auto_route_allow_hosted = false keeps hosted (remote API) profiles out of
+# that routing even when their tags match, so a local run never silently
+# switches to a paid cloud model.
 # hooks = { post_edit = ["ruff format {file}"] }
 # runs your commands at events (see the README); in a PROJECT config, hooks,
 # mcp_servers, auto_verify and test_command only apply after `pedacito trust`.

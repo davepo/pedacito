@@ -419,6 +419,78 @@ def test_routing_unmatched_task_stays_on_the_worker():
         "write the sql query for the report", None, cfg) == ("", "")
 
 
+def test_hosted_profiles_are_excluded_from_local_routing_by_default(home):
+    """auto_route_allow_hosted defaults to False: a matching cloud profile
+    never wins a task when local candidates exist (or at all)."""
+    cfg = _routed_cfg()
+    assert cfg.auto_route_allow_hosted is False
+    cfg.profiles["flash"] = {"model": "deepseek-flash", "base_url": DEEPSEEK,
+                             "specialties": ["frontend_ui", "coding"]}
+    _card("deepseek-flash", url=DEEPSEEK, overall=1.0)
+    assert roles.profile_is_hosted(cfg, "flash") is True
+    assert roles.profile_is_hosted(cfg, "coder") is False
+    # no local UI specialist left: the hosted one must NOT take the task
+    cfg.profiles.pop("ui")
+    assert roles.select_specialist_profile(
+        "fix the button layout in styles.css", None, cfg) == ("", "")
+    # opt in explicitly: now it may route there
+    cfg.auto_route_allow_hosted = True
+    assert roles.select_specialist_profile(
+        "fix the button layout in styles.css", None, cfg) == \
+        ("flash", "frontend_ui")
+
+
+def test_local_profile_mislabeled_hosted_tier_still_routes(home):
+    """The tier is display metadata; locality comes from the endpoint. A local
+    GGUF named 'DeepSeek-Coder' with tier='hosted' stays in the pool."""
+    cfg = _routed_cfg()
+    cfg.profiles["dcoder"] = {"model": "DeepSeek-Coder-V2-Lite",
+                              "base_url": LOCAL, "tier": "hosted",
+                              "specialties": ["math_algorithms"]}
+    _card("DeepSeek-Coder-V2-Lite", overall=0.9)
+    assert roles.profile_is_hosted(cfg, "dcoder") is False
+    assert roles.select_specialist_profile(
+        "optimize the sorting algorithm", None, cfg) == \
+        ("dcoder", "math_algorithms")
+
+
+def test_guess_tier_uses_the_endpoint_not_the_model_name():
+    assert config_mod._guess_tier(
+        "dcoder", {"model": "DeepSeek-Coder-V2-Lite",
+                   "base_url": LOCAL}) is None
+    assert config_mod._guess_tier(
+        "flash", {"model": "deepseek-flash",
+                  "base_url": DEEPSEEK}) == "hosted"
+    assert config_mod._guess_tier(
+        "qwen", {"model": "qwen2.5-coder-14b",
+                 "base_url": LOCAL}) == "medium"
+
+
+def test_math_probe_retries_once_after_a_truncated_reasoning_reply():
+    class ThinkingClient:
+        chars_per_token = 3.2
+
+        def __init__(self):
+            self.calls = 0
+            self.last_finish_reason = "length"
+
+        def chat(self, messages, max_tokens, **kw):
+            self.calls += 1
+            if self.calls == 1:
+                return "Let me work through the precedence: 3 ** 2 = 9, then "
+            self.last_finish_reason = "stop"
+            return "29"
+
+    c = ThinkingClient()
+    assert modelcard._t_math_algo(c, Config()) == (1.0, [])
+    assert c.calls == 2
+
+    # A complete wrong answer is not retried (no wasted calibration calls).
+    bad = ProbeClient(math="512")
+    assert modelcard._t_math_algo(bad, Config())[0] == 0.0
+    assert len(bad.probe_calls("Compute")) == 1
+
+
 def test_routing_explicit_prefix_and_tag_override_keywords():
     cfg = _routed_cfg()
     task = "[specialty: math_algorithms] fix the button layout in styles.css"
@@ -593,7 +665,7 @@ def test_restore_worker_client_hands_the_card_back(monkeypatch):
 
 
 # ------------------------------------------------------- unload_model itself
-def test_unload_model_ollama_first_then_lmstudio(monkeypatch):
+def test_unload_model_lemonade_then_lmstudio_then_ollama(monkeypatch):
     cfg = Config()
     cfg.base_url = LOCAL
     cfg.model = "m"
@@ -604,27 +676,49 @@ def test_unload_model_ollama_first_then_lmstudio(monkeypatch):
         def __init__(self, code):
             self.status_code = code
 
-    def post(url, headers=None, json=None, timeout=None):
+    # Lemonade's native endpoint is tried FIRST and ends the handshake.
+    def lemonade(url, headers=None, json=None, timeout=None):
         calls.append((url, json, timeout))
-        if url.endswith("/api/generate"):
-            raise OSError("connection refused")
-        return R(200)
+        if url.endswith("/api/v1/unload"):
+            return R(200)
+        raise AssertionError("native Lemonade unload should win first")
 
-    monkeypatch.setattr(llm_mod.requests, "post", post)
+    monkeypatch.setattr(llm_mod.requests, "post", lemonade)
     assert llm_mod.unload_model(client) == "m"
-    assert calls[0][0] == "http://127.0.0.1:11434/api/generate"
-    assert calls[0][1] == {"model": "m", "keep_alive": 0}
+    assert len(calls) == 1
+    assert calls[0][0] == "http://127.0.0.1:11434/api/v1/unload"
+    assert calls[0][1] == {"model": "m"}
     assert calls[0][2] == 2                      # short timeout, best-effort
-    assert calls[1][0] == "http://127.0.0.1:11434/api/v0/models/unload"
 
-    # Ollama acknowledging the unload ends it: one call only
+    # Not Lemonade: LM Studio's native unload answers next.
     calls.clear()
-    monkeypatch.setattr(llm_mod.requests, "post",
-                        lambda url, **kw: (calls.append(url), R(200))[1])
-    assert llm_mod.unload_model(client) == "m"
-    assert calls == ["http://127.0.0.1:11434/api/generate"]
 
-    # both endpoints down: "" and the caller proceeds to warmup()
+    def lmstudio(url, **kw):
+        calls.append(url)
+        if url.endswith("/api/v0/models/unload"):
+            return R(200)
+        return R(404)
+
+    monkeypatch.setattr(llm_mod.requests, "post", lmstudio)
+    assert llm_mod.unload_model(client) == "m"
+    assert calls == ["http://127.0.0.1:11434/api/v1/unload",
+                     "http://127.0.0.1:11434/api/v0/models/unload"]
+
+    # Ollama's keep_alive=0 is the last resort (its native /api/v1 is 404).
+    calls.clear()
+
+    def ollama(url, **kw):
+        calls.append((url, kw.get("json")))
+        if url.endswith("/api/generate"):
+            return R(200)
+        return R(404)
+
+    monkeypatch.setattr(llm_mod.requests, "post", ollama)
+    assert llm_mod.unload_model(client) == "m"
+    assert calls[-1] == ("http://127.0.0.1:11434/api/generate",
+                         {"model": "m", "keep_alive": 0})
+
+    # every endpoint down: "" and the caller proceeds to warmup()
     def dead(url, **kw):
         raise OSError("down")
 
@@ -707,6 +801,13 @@ def test_planner_note_lists_specialists_only_when_routing_is_on():
     assert "group tasks" in note.lower()
     assert roles.specialty_planner_note(
         _routed_cfg(auto_route_specialties=False)) == ""
+    # hosted profiles are not advertised to the planner in a local-only pool
+    cfg = _routed_cfg()
+    cfg.profiles["flash"] = {"model": "deepseek-flash", "base_url": DEEPSEEK,
+                             "specialties": ["coding"]}
+    assert "flash" not in roles.specialty_planner_note(cfg)
+    cfg.auto_route_allow_hosted = True
+    assert "flash" in roles.specialty_planner_note(cfg)
     # nothing to route between: general profiles only
     cfg = _routed_cfg()
     cfg.profiles = {"a": {"model": "llama3.1-8b"},

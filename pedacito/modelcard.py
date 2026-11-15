@@ -658,13 +658,25 @@ def _t_svg_ui(client, cfg) -> tuple[float, list[str]]:
 
 
 def _t_math_algo(client, cfg) -> tuple[float, list[str]]:
-    """One exact integer computation (operator precedence + modulo)."""
+    """One exact integer computation (operator precedence + modulo).
+
+    Reasoning models often spend a small probe budget on hidden thinking and
+    get cut off before naming the number. A truncated/empty reply therefore
+    gets ONE retry with room to finish reasoning and state the answer; a
+    complete wrong answer is scored wrong without a retry."""
+    prompt = ("Compute (2 ** 3 ** 2) % 100 + 17 in Python. "
+              "Reply with the number only.")
     try:
         reply = client.chat(
-            [{"role": "user", "content":
-              "Compute (2 ** 3 ** 2) % 100 + 17 in Python. "
-              "Reply with the number only."}],
+            [{"role": "user", "content": prompt}],
             max_tokens=40, disable_thinking=True)
+        if not re.search(r"\b29\b", reply or "") and (
+                not (reply or "").strip()
+                or str(getattr(client, "last_finish_reason", "") or "") ==
+                "length"):
+            reply = client.chat(
+                [{"role": "user", "content": prompt}],
+                max_tokens=1024, disable_thinking=True)
     except LLMError as e:
         return 0.0, [f"math probe call failed: {str(e)[:60]}"]
     if re.search(r"\b29\b", reply or ""):

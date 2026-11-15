@@ -199,6 +199,27 @@ def specialties_for(cfg, name: str) -> tuple[str, ...]:
     return detected_specialties(cfg, name)
 
 
+def profile_is_hosted(cfg, name: str) -> bool:
+    """True when profile `name` points at a remote API rather than a
+    self-hosted server.
+
+    Routing decides this from the ENDPOINT, not the profile's `tier`: a local
+    GGUF whose name happens to contain "deepseek" may carry tier = "hosted"
+    from the old name heuristic, but it still runs on the user's box and must
+    stay in a local specialist pool. Only a non-local base_url (api.deepseek.com,
+    OpenAI, a tunnel to a hosted endpoint) is excluded."""
+    from types import SimpleNamespace
+
+    from . import llm as llm_mod
+    body = (cfg.profiles or {}).get(name) or {}
+    base = str(body.get("base_url") or cfg.base_url or "")
+    try:
+        return not llm_mod._is_local_server(SimpleNamespace(base_url=base))
+    except Exception:
+        from .config import _LOCAL_HOSTS, _hostname
+        return _hostname(base) not in _LOCAL_HOSTS
+
+
 def _task_specialty_scores(task: str, idx=None) -> dict[str, float]:
     """Keyword + file-extension scores per canonical tag for one task."""
     from .config import SPECIALTIES
@@ -272,7 +293,12 @@ def select_specialist_profile(task: str, idx, cfg, explicit_tag: str = "",
     if active_tags.intersection(winning):
         return "", ""
     candidates = []
+    allow_hosted = bool(getattr(cfg, "auto_route_allow_hosted", False))
     for name in profiles:
+        if not allow_hosted and profile_is_hosted(cfg, name):
+            # Local-only pool (the default): never jump to a paid cloud API
+            # just because it carries a matching tag.
+            continue
         hit = [t for t in winning if t in set(specialties_for(cfg, name))]
         if hit:
             candidates.append((name, hit[0]))
@@ -414,7 +440,10 @@ def specialty_planner_note(cfg) -> str:
     if len(profiles) < 2:
         return ""
     tagged = {}
+    allow_hosted = bool(getattr(cfg, "auto_route_allow_hosted", False))
     for name in profiles:
+        if not allow_hosted and profile_is_hosted(cfg, name):
+            continue
         tags = specialties_for(cfg, name)
         if tags and tags != ("general",):
             tagged[name] = tags

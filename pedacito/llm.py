@@ -543,8 +543,13 @@ def unload_model(client) -> str:
 
     Ollama: POST /api/generate {"model": ..., "keep_alive": 0} is the
     documented unload. LM Studio: POST /api/v0/models/unload, best-effort.
-    Lemonade and other runtimes have no unload endpoint: "" and the load
-    itself does the eviction. Hosted APIs are never touched."""
+    Lemonade: POST /api/v1/unload {"model": ...}, which answers 200 with
+    "status": "success". The native Lemonade endpoint is tried FIRST: its
+    Ollama-compatible /api/generate performs the unload but can take longer
+    than the 2 s probe, so going there first would unload the model and still
+    report "" (a lost telemetry signal). Other runtimes have no unload
+    endpoint: "" and the load itself does the eviction. Hosted APIs are never
+    touched."""
     cfg = getattr(client, "cfg", None)
     if cfg is None or not _is_local_server(cfg):
         return ""
@@ -554,8 +559,9 @@ def unload_model(client) -> str:
     root = _server_root(cfg.base_url)
     headers = getattr(client, "headers", None) or {}
     for url, payload in (
-            (root + "/api/generate", {"model": model, "keep_alive": 0}),
-            (root + "/api/v0/models/unload", {"model": model})):
+            (root + "/api/v1/unload", {"model": model}),
+            (root + "/api/v0/models/unload", {"model": model}),
+            (root + "/api/generate", {"model": model, "keep_alive": 0})):
         try:
             r = requests.post(url, headers=headers, json=payload, timeout=2)
         except Exception:
