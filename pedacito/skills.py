@@ -19,7 +19,7 @@ A skill is a markdown file with frontmatter:
 
 Search order (first name wins): `<root>/.pedacito/skills/<name>/SKILL.md` or
 `<root>/.pedacito/skills/<name>.md`, the same two layouts under
-`<config dir>/skills/`, then the bundled library of sixteen starters. The
+`<config dir>/skills/`, then the bundled library of seventeen starters. The
 catalog costs a few dozen tokens; a skill's text enters the conversation only
 when the model asks for it (or `select_skills` matches its triggers, capped at
 two skills / 1,200 chars so a prompt never bloats). Skills are PROMPT TEXT:
@@ -268,6 +268,23 @@ BUILTIN_SKILLS: dict[str, tuple[str, str, tuple[str, ...]]] = {
         "watch RSS across repeats.",
         ("lru", "ttl", "cache", "evict", "complexity", "bottleneck",
          "memory leak", "stream")),
+    "modern-web-design-ui": (
+        "Design modern websites, landing pages and bio/portfolio pages with "
+        "high-craft CSS",
+        "1. Palette: dark slate (#0b0f17, #131b2e cards, "
+        "rgba(255,255,255,.08) border, #f8fafc text, #94a3b8 muted, "
+        "#38bdf8/#818cf8 accents) or warm editorial + radial glow; never "
+        "cartoon gradients/white boxes.\n"
+        "2. Type -apple-system,'Inter',system-ui, -.025em headings, clamp(), "
+        "65ch prose, 1.7 leading. Links: inline-flex pills, border, "
+        "translateY(-1px) hover, not raw blue <a>.\n"
+        "3. No build: no raw @tailwind directives; full CSS or "
+        "cdn.tailwindcss.com in <head>. No unrequested hamburger/contact "
+        "form/dummy JS.\n"
+        "4. Preserve exact copy, links, section order.",
+        ("website", "webpage", "landing page", "personal site", "bio",
+         "portfolio", "styling", "modern", "sleek", "appealing", "css",
+         "layout", "theme", "hero", "card")),
 }
 
 # Historical name kept for callers and drift guards that say "bundled".

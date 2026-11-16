@@ -2874,9 +2874,10 @@ def test_auto_regenerates_when_plan_is_complete(tmp_path):
     assert "old task" not in text
 
 
-def test_auto_resumes_plan_with_open_tasks(tmp_path):
+def test_auto_resumes_plan_with_open_tasks_and_the_same_goal(tmp_path):
     """The inverse: a plan that still has unchecked work is resumed, not
-    overwritten, when the same goal (or any -t) is given without --force."""
+    overwritten, when the SAME goal is given without --force. A different
+    goal is a new run and regenerates (see the completed-plan test above)."""
     from pedacito import cli
     plan = tmp_path / "PLAN.md"
     loop.write_plan(plan, "goal", ["done task", "open task"])
@@ -2886,7 +2887,7 @@ def test_auto_resumes_plan_with_open_tasks(tmp_path):
         def chat_json(self, messages, schema, max_tokens=0, **kw):
             raise AssertionError("generate_tasks must not be called to resume")
 
-    args = types.SimpleNamespace(task="anything", spec=None, plan=None,
+    args = types.SimpleNamespace(task="goal", spec=None, plan=None,
                                  apply=False, force=False, verify=None,
                                  repair=None, max_tasks=None, keep_going=False)
     code = cli._cmd_auto(args, Config(), Stub(), None, tmp_path)

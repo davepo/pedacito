@@ -2563,6 +2563,41 @@ REFINE_SCHEMA = {
     "additionalProperties": False,
 }
 
+_SIMPLE_WEB_RE = re.compile(
+    r"\b(?:website|webpage|web page|landing page|personal site|bio|"
+    r"portfolio|static site|index\.html|styles?\.css|stylesheet|hero|"
+    r"card|theme|layout|css|styling|restyle|redesign)\b", re.IGNORECASE)
+_BUILD_STACK_RE = re.compile(
+    r"\b(?:react|next\.js|nuxt|sveltekit|vite|webpack|rollup|parcel|"
+    r"angular|vue cli|django|flask|fastapi|express|backend|database|"
+    r"api endpoint)\b", re.IGNORECASE)
+
+
+def is_simple_web_brief(prompt: str, snapshot: str = "") -> bool:
+    """True for a hand-authored static page (bio, portfolio, landing page).
+
+    These requests are visual-polish jobs: the user's copy and link order are
+    the specification, and an autonomous planner must not pad them with
+    enterprise boilerplate (hamburger menus, contact forms, deployment
+    manuals) or uncompiled framework directives.
+    """
+    text = f"{prompt or ''}\n{snapshot or ''}"
+    return bool(_SIMPLE_WEB_RE.search(text)) \
+        and not _BUILD_STACK_RE.search(text or "")
+
+
+WEB_POLISH_NOTE = """\
+STATIC WEB PAGE MODE -- this brief describes a hand-authored page, not an
+application. Preserve the user's exact requested copy, links and section order
+VERBATIM. Improve only visual craft: typography, spacing, colour, cards,
+buttons, link badges and responsive layout. Do not invent sections, contact
+forms, hamburger menus/toggles, dummy JavaScript, or a README/deployment
+manual; no unrequested accessibility-test checklist. Requirements must quote
+the user's literal strings exactly. On a no-build site write complete CSS --
+NEVER emit raw `@tailwind base;` directives unless the page actually loads the
+Tailwind CDN in <head>."""
+
+
 REFINE_SYSTEM = """\
 You are a spec architect for an autonomous coding agent. The agent sees ONLY
 your output -- never this conversation -- and a small 9B-35B model will
@@ -2758,6 +2793,12 @@ def _fallback_spec(prompt: str, snapshot: str, mode: str) -> dict:
         "edge_cases": [],
         "verification": verification,
     }
+    if is_simple_web_brief(prompt, snapshot):
+        data["requirements"].insert(
+            1, "Preserve the requested copy, links and section order "
+               "verbatim; improve only visual typography, spacing, cards, "
+               "buttons and responsive layout. Do not add contact forms, "
+               "hamburger menus, dummy JavaScript or a deployment README.")
     data["edge_cases"] = _edge_case_fallback(data)
     return data
 
@@ -2843,7 +2884,10 @@ def refine_prompt(prompt: str, root, cfg, llm_client,
         user = (f"MODE: {mode}\n\nBRIEF IDEA (from the user)\n\n"
                 f"{prompt.strip()[:4000]}\n\n{snapshot}\n\n"
                 "Expand the idea into the actionable spec fields now.")
-        messages = [{"role": "system", "content": REFINE_SYSTEM},
+        system = REFINE_SYSTEM
+        if is_simple_web_brief(prompt, snapshot):
+            system += "\n\n" + WEB_POLISH_NOTE
+        messages = [{"role": "system", "content": system},
                     {"role": "user", "content": user}]
         try:
             raw = llm_client.chat_json(

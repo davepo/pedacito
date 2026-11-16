@@ -1120,6 +1120,13 @@ def check_oversized_rewrite(agent, results, task: str = "") -> list[Finding]:
         lines = len((r.before or "").splitlines())
         if lines <= cap:
             continue
+        # A small hand-authored page is restructured, not "drafted from a
+        # partial read": a 150-line index.html that becomes a 90-line layout
+        # is exactly the requested change. Do not refuse it on a small-window
+        # profile.
+        if (str(r.file).lower().endswith((".html", ".htm", ".css"))
+                and lines <= 300):
+            continue
         out.append(Finding(
             "oversized_rewrite",
             "warn" if _asks_file_rewrite(task, r.file) else "error",
@@ -1237,7 +1244,24 @@ _REQ_SPLIT_RE = re.compile(
     r"(?:\n\s*(?:[-*]|\d+[.)])\s+|;\s+|\.\s+(?=[A-Z])|,?\s+and then\s+|"
     r",?\s+and\s+(?=(?:also\s+)?(?:add|make|fix|update|change|remove|rename|"
     r"create|write|ensure|check|handle|support|use|return|move|delete|"
-    r"implement|show|print|log)\b)|,?\s+then\s+)", re.IGNORECASE)
+    r"implement|show|print|log|replace|restyle|redesign|style|insert|"
+    r"position|reorder|align|center|swap|convert|keep|preserve)\b)|"
+    r",?\s+then\s+)", re.IGNORECASE)
+
+# A comma-separated list of visual edits ("remove X, move Y, add Z") is
+# several requirements even without "and" before each verb. This split only
+# applies to a brief that already looks like page/layout work or quotes the
+# exact copy; without that signal a compound code sentence ("..., pass
+# onPlay to buildTransport, add presets, and drop...") is ONE requirement.
+_REQ_COMMA_SPLIT_RE = re.compile(
+    r",\s+(?=(?:also\s+)?(?:add|move|remove|replace|restyle|redesign|style|"
+    r"insert|position|reorder|align|center|swap|convert|keep|preserve|"
+    r"make|update|change|edit|modify|create)\b)", re.IGNORECASE)
+_WEB_LAYOUT_TEXT_RE = re.compile(
+    r"\b(?:html|css|stylesheet|website|webpage|web page|landing page|"
+    r"personal site|bio|portfolio|layout|hero|card|theme|styling|restyle|"
+    r"redesign|sub\s*heading|subheading|heading|links?|navbar|footer)\b",
+    re.IGNORECASE)
 
 # A lead-in preamble introduces the list of requirements; it is not R1. The
 # colon-terminated forms were already dropped, but "please implement the
@@ -1307,6 +1331,11 @@ def _split_clauses(text: str) -> list[tuple[str, bool]]:
     start = i = 0
     n = len(text)
     hard = True                       # the first clause stands on its own
+    # Only a visual/page brief (or one that quotes the exact copy) gets the
+    # comma-separated-imperative split. A code sentence that happens to list
+    # arguments with commas must stay one requirement.
+    allow_comma = bool(_quoted_literals(text)
+                       or _WEB_LAYOUT_TEXT_RE.search(text))
     while i < n:
         ch = text[i]
         if quote:
@@ -1325,6 +1354,8 @@ def _split_clauses(text: str) -> list[tuple[str, bool]]:
             depth = max(0, depth - 1)
         elif depth == 0:
             m = _REQ_SPLIT_RE.match(text, i)
+            if m is None and allow_comma:
+                m = _REQ_COMMA_SPLIT_RE.match(text, i)
             if m is not None and m.end() > i:
                 if m.group(0).startswith(".") and \
                         _REQ_ABBREV_RE.search(text[:m.start() + 1]):
@@ -1406,6 +1437,50 @@ _REQ_LOCATION_RE = re.compile(
     r"(?<![\w/.-])([A-Za-z0-9_./\\-]+\.[A-Za-z0-9_]{1,8}):(\d+)"
     r"(?:-(\d+))?")
 
+# Literal text the task asks to insert, remove or replace. Double quotes and
+# backticks are unambiguous; single quotes are only a literal when they wrap
+# a phrase (so an apostrophe in "Here's" is never mistaken for a delimiter).
+_QUOTED_LITERAL_RES = (
+    re.compile(r'"([^"\n]{2,300})"'),
+    re.compile(r"`([^`\n]{2,300})`"),
+    re.compile(r"(?<![\w])'([^'\n]{3,300})'(?![\w])"),
+)
+_REMOVE_LITERAL_RE = re.compile(
+    # "replace X with \"Y\"" INSERTS Y; only a genuine removal verb makes the
+    # quoted copy something that must be GONE from the final page.
+    r"\b(?:remove|delete|drop|erase|omit|take out|get rid of)\b",
+    re.IGNORECASE)
+
+
+def _quoted_literals(text: str) -> list[str]:
+    """Every literal quoted in `text`, in order, without duplicates.
+
+    A multi-clause layout brief carries its exact copy in quotes ("Here's a
+    bit about me...", "Our Mission"). Those are the only parts of the request
+    that can be checked verbatim against the edited file, so they are kept
+    whole instead of being lost in the generic word bag.
+    """
+    out: list[str] = []
+    for rx in _QUOTED_LITERAL_RES:
+        for m in rx.finditer(text or ""):
+            lit = m.group(1).strip()
+            if len(lit) >= 2 and lit not in out:
+                out.append(lit)
+    return out
+
+
+def _literal_in(text: str, literal: str) -> bool:
+    """True when `literal` appears in `text` (HTML entities normalised)."""
+    if not literal:
+        return False
+    if literal in (text or ""):
+        return True
+    try:
+        import html
+        return literal in html.unescape(text or "")
+    except Exception:
+        return False
+
 
 @dataclass
 class Requirement:
@@ -1424,6 +1499,14 @@ class Requirement:
     # this edit clause but no edit implements it (description is not
     # implementation). The repair prompt names the gap explicitly.
     prose_only: bool = False
+    # Exact quoted copy the clause inserts (or asks to remove). Coverage
+    # checks these against the FINAL edited text: ordinary key terms can match
+    # an unrelated neighbor, while the user's literal copy cannot.
+    literals: list[str] = field(default_factory=list)
+    literal_remove: bool = False
+    # Literals the last coverage pass found missing/present when they should
+    # be the opposite; rendered by check_coverage and the repair prompt.
+    missing_literals: list[str] = field(default_factory=list)
 
     def __post_init__(self):
         if self.kind not in ("edit", "report", "constraint"):
@@ -1708,15 +1791,19 @@ def _requirements_from_task(task: str, limit: int = 16) -> list[Requirement]:
             continue
         words = [w for w in _WORD_RE.findall(p) if w.lower() not in _VERBS]
         words += re.findall(r"\b\d+\b", p)
-        words += re.findall(r"[\"'`]([^\"'`]{2,40})[\"'`]", p)
+        literals = _quoted_literals(p)
+        # Quoted copy leads the terms: it is the exact thing the user asked to
+        # see (or stop seeing) on the page.
+        words = literals + words
         # BUG-328: the clause used to be clipped to 140 chars and its terms
         # capped at the first 8 in occurrence order, so the tail of a long
         # compound clause (handler names, the `presets:` argument, the
         # preset-change behaviour) vanished from the ledger and coverage could
         # never see it. Keep the FULL clause text and rank identifier-like
         # terms first so the distinctive tail survives the cap.
-        ident = [w for w in words if _IDENT_TERM_RE.search(w)]
-        plain = [w for w in words if not _IDENT_TERM_RE.search(w)]
+        ident = [w for w in words if _IDENT_TERM_RE.search(w) or w in literals]
+        plain = [w for w in words if not _IDENT_TERM_RE.search(w)
+                 and w not in literals]
         terms = list(dict.fromkeys(ident + plain))[:16]
         if terms:
             # BUG-809: a protective tail merged into its edit clause by the
@@ -1738,7 +1825,9 @@ def _requirements_from_task(task: str, limit: int = 16) -> list[Requirement]:
             kind = ("constraint" if constraint
                     else _clause_kind(p, task_kind))
             reqs.append(Requirement(
-                p, terms, kind, req_id=f"R{len(reqs) + 1}"))
+                p, terms, kind, req_id=f"R{len(reqs) + 1}",
+                literals=literals,
+                literal_remove=bool(_REMOVE_LITERAL_RE.search(p))))
     # BUG-203/212/223: the old default cap of five silently truncated a six-
     # bullet repair (and a three-clause task the splitter expanded to eleven
     # sentences), so the tail clauses never existed for coverage or provenance
@@ -2183,6 +2272,35 @@ def _unaddressed(task: str, reply: str, edits,
             hay = prose_hay + "\n" + edit_hay
         hit = sum(1 for t in terms if t.lower() in hay
                   or t.lower().rstrip("s") in hay)
+        # Quoted copy is checked against the FINAL edited text, not just the
+        # replacement hunk. A clause that inserts "Here's a bit about me..."
+        # is satisfied only when that string exists on the page; a clause that
+        # removes "Our Mission" is satisfied only when it is gone. Generic
+        # terms can match a neighbor, which is exactly how a multi-clause
+        # layout brief ended after its first edit.
+        req.missing_literals = []
+        if req.literals:
+            after_text = "\n".join(
+                (getattr(r, "after", "") or "")
+                for r in edits
+                if getattr(r, "ok", True) and getattr(r, "file", ""))
+            if not after_text:
+                # Candidate scoring/dry runs may carry parsed Edit blocks, not
+                # applied Result objects: judge the replacement text we have.
+                after_text = "\n".join(
+                    (getattr(e, "replace", "") or "") for e in edits)
+            missing: list[str] = []
+            for lit in req.literals:
+                if not after_text:
+                    missing.append(lit)
+                elif req.literal_remove:
+                    if _literal_in(after_text, lit):
+                        missing.append(lit)
+                elif not _literal_in(after_text, lit):
+                    missing.append(lit)
+            if missing:
+                req.missing_literals = missing
+                hit = 0
         if is_test_clause and any(
                 getattr(e, "ok", True)
                 and "test" in (getattr(e, "file", "") or "").lower()
@@ -2191,7 +2309,8 @@ def _unaddressed(task: str, reply: str, edits,
                     or "")
                 for e in edits):
             continue
-        if req.state in (REQ_EDITED, REQ_VERIFIED, REQ_REPORTED):
+        if req.state in (REQ_EDITED, REQ_VERIFIED, REQ_REPORTED) \
+                and not req.missing_literals:
             continue
         if hit == 0:
             # Name the prose-vs-edit gap: a clause whose terms appear in the
@@ -2202,7 +2321,10 @@ def _unaddressed(task: str, reply: str, edits,
                 t.lower() in prose_hay or t.lower().rstrip("s") in prose_hay
                 for t in terms)
             out.append(req)
-    return out[:3]
+    # Do not stop at the first three: a four-part layout brief (remove a
+    # heading, move two links, add a heading, replace the bio) left its last
+    # clause unseen by both the warning and the R4 follow-up.
+    return out[:16]
 
 
 def check_coverage(task: str, reply: str, edits,
@@ -2212,7 +2334,14 @@ def check_coverage(task: str, reply: str, edits,
     its states are authoritative for what counts as addressed."""
     out: list[Finding] = []
     for req in _unaddressed(task, reply, edits, tracker):
-        if getattr(req, "prose_only", False):
+        if getattr(req, "missing_literals", None):
+            verb = "still present" if req.literal_remove else "missing"
+            out.append(Finding(
+                "coverage", "warn", "",
+                f"required literal text is {verb} in the edited file: "
+                + ", ".join(f'"{lit}"' for lit in req.missing_literals)
+                + f" -- the clause '{req.text}' is not finished"))
+        elif getattr(req, "prose_only", False):
             out.append(Finding(
                 "coverage", "warn", "",
                 f"you described '{req.text}' in prose but no edit implements "

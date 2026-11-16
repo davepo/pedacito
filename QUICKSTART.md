@@ -381,7 +381,7 @@ to override the config.
 
 ### A19. Browse and create skills
 
-Skills are short checklists the model follows for one kind of task. Sixteen
+Skills are short checklists the model follows for one kind of task. Seventeen
 starters ship built in (testing, refactoring, FastAPI endpoints, canvas/SVG,
 SQLite migrations, async safety, security hardening, i18n, parsers,
 profiling, …); the top-2 trigger matches for your task are injected
@@ -945,7 +945,7 @@ only the map is stale.
 | `pedacito eval` | Score the harness on fixture repositories. Use `--baseline` as a gate |
 | `pedacito bench [BENCHMARK\|all]` | Run the six diagnostic benchmarks and holdout rubric. `--list`/`--recent` are free; `--json`/`--strict` for CI |
 | `pedacito memory PROJ` | List, add, or forget remembered facts; `--consolidate` compacts session history into a handoff |
-| `pedacito skills [list\|show\|add\|draft\|rm] [PROJ]` | Browse and manage the skill library (16 built-ins + custom); `--global` targets the user library |
+| `pedacito skills [list\|show\|add\|draft\|rm] [PROJ]` | Browse and manage the skill library (17 built-ins + custom); `--global` targets the user library |
 | `pedacito tests PROJ --files F` | Detected test command, and the tests an edit to F can break |
 | `pedacito webcheck PROJ` | Static checks for web files: DOM ids, script loading, missing scripts, ES module bindings and links |
 | `pedacito domcheck PROJ` | Headless DOM smoke check: load the entry page in headless Chromium, prove the module graph mounts, report console errors, unbound controls and silent Web Audio failures (needs Playwright) |

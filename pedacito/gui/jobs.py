@@ -172,6 +172,12 @@ class _Feed:
 
     def event(self, kind: str, f: dict) -> None:
         STATE.note_event(kind, f)      # feeds the ACTIVITY & PLAN panel
+        if kind in ("plan_updated", "plan_archived"):
+            # A live checklist change: render it now (the page also polls
+            # /api/state, but the event lands the instant the box changes).
+            STATE.bus.publish("plan", path=str(f.get("path") or ""),
+                              reason=str(f.get("reason") or kind))
+            return
         if kind == "step":
             self.activity(f"{f.get('n', '?')}. {f.get('action', '')} "
                           f"{f.get('detail', '')}".rstrip())
@@ -372,6 +378,45 @@ def open_project(path: str, profile: str, announce: bool = True) -> None:
         STATE.add_message("system", f"Opened {root} \u2014 {', '.join(bits)}; "
                           f"{state}.", kind="opened",
                           needs_index=idx is None)
+
+
+def switch_profile(profile: str) -> dict:
+    """Switch the active profile IN PLACE, synchronously.
+
+    Re-opening the whole project as a background "project" job made the Run
+    button turn into Stop while the header select stayed open -- and a slow
+    model probe could leave that job state visible long after the switch.
+    Switching a profile does not touch the index or the plan: swap the config
+    and client, keep the loaded index, and never claim the task-runner slot.
+    """
+    with STATE.lock:
+        root = STATE.root
+        job = STATE.job
+        idx = STATE.idx
+        if root is None:
+            raise ConfigError("Open a project first.")
+        if job is not None and job.active:
+            raise ConfigError("A job is running. Stop it before switching "
+                              "profiles.")
+    args = args_for(str(root), profile)
+    cfg = cli_mod._config(args)
+    name = str(profile or "").strip()
+    if name and name not in (cfg.profiles or {}):
+        raise ConfigError(f"no profile named {name!r}")
+    client = LLMClient(cfg)
+    agent = Agent(idx, client, cfg) if idx is not None else None
+    with STATE.lock:
+        STATE.args, STATE.cfg = args, cfg
+        STATE.client, STATE.agent = client, agent
+        STATE.profile_request = name
+        STATE.model_checked, STATE.model_ok = False, None
+        STATE.model_status = "profile switched; click the model chip to check"
+        STATE.index_gen += 1
+    STATE.bus.publish("status", profile=cfg.active_profile, model=cfg.model)
+    return {"ok": True, "profile": cfg.active_profile, "model": cfg.model,
+            "profiles": sorted(cfg.profiles or {}),
+            "auto_route_specialties": bool(cfg.auto_route_specialties),
+            "disable_thinking": bool(cfg.disable_thinking)}
 
 
 def _probe_server(client, cfg) -> None:
@@ -658,8 +703,12 @@ def run_task(job: Job, opts: dict) -> None:
                 plan_pref == "auto" and plan_mod.should_plan(task, idx, cfg))
             if want_plan and not reviewing:
                 started = _now()
+                def _bind_plan(path):
+                    with STATE.lock:
+                        STATE.plan_path = Path(path)
+
                 code = plan_mod.run_planned(root, cfg, client, idx, task,
-                                            apply=apply)
+                                            apply=apply, on_plan=_bind_plan)
                 _note_plan_dir(root, started)
                 if apply:
                     _refresh_index(p)

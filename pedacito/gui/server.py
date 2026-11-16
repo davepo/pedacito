@@ -221,11 +221,14 @@ def plan_payload() -> dict:
         cand = root / STATE.cfg.auto_plan_file
         path = cand if cand.exists() else None
     if path is None:
-        return {"path": "", "exists": False, "text": "", "tasks": []}
+        return {"path": "", "exists": False, "text": "", "tasks": [],
+                "mtime": 0}
     try:
         text = Path(path).read_text(encoding="utf-8", errors="replace")
+        mtime = Path(path).stat().st_mtime_ns
     except OSError:
-        return {"path": str(path), "exists": False, "text": "", "tasks": []}
+        return {"path": str(path), "exists": False, "text": "", "tasks": [],
+                "mtime": 0}
     shown = str(path)
     if root is not None:
         try:
@@ -233,7 +236,7 @@ def plan_payload() -> dict:
         except ValueError:
             pass
     return {"path": shown, "exists": True, "text": text,
-            "tasks": jobs.parse_plan(text)}
+            "tasks": jobs.parse_plan(text), "mtime": mtime}
 
 
 # --- routes ---------------------------------------------------------------------
@@ -266,8 +269,13 @@ def _busy_reply(job):
 def _state(q, body=None):
     # `status` carries the header/engine telemetry; the chat transcript rides
     # alongside it so a polling client can reconcile messages in one call.
-    # (`messages` is the same field name /api/snapshot uses.)
-    return 200, {**STATE.status(), "messages": STATE.messages_snapshot()}
+    # (`messages` is the same field name /api/snapshot uses.) `plan` is the
+    # live checklist: an Auto/Plan run ticks boxes on disk mid-job, and the
+    # page must see those ticks immediately instead of waiting for the run's
+    # final SSE transition.
+    return 200, {**STATE.status(),
+                 "messages": STATE.messages_snapshot(),
+                 "plan": plan_payload()}
 
 
 @get("/api/engine")
@@ -937,9 +945,10 @@ def _profile_switch(q, body):
             settings_api.apply_changes("user", None, toggles, [])
         except ConfigError as e:
             return 400, {"ok": False, "detail": str(e)}
-    return _busy_reply(jobs.spawn(
-        "project", f"switching profile to {name or 'default'}",
-        lambda job: jobs.open_project(str(root), name)))
+    # SYNCHRONOUS: swap config/client/index wiring in place. This route must
+    # never claim the single job slot -- a profile switch is not a task run,
+    # and a background "project" job made the Run button show Stop.
+    return 200, jobs.switch_profile(name)
 
 
 @post("/api/index")

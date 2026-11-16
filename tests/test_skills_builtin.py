@@ -22,14 +22,26 @@ NEW = {
 }
 
 
-def test_catalog_lists_all_sixteen_with_one_line_summaries(tmp_path):
+def test_catalog_lists_all_seventeen_with_one_line_summaries(tmp_path):
     cat = skills.catalog(tmp_path, Config(), limit=10000)
     for name in skills.BUNDLED:
         assert f"- {name}:" in cat
-    assert len(skills.names(tmp_path, Config())) == 16
+    assert len(skills.names(tmp_path, Config())) == 17
     # One line per skill: the body never leaks into the catalog.
     assert all(line.startswith("- ") for line in cat.splitlines()[1:])
     assert "SEARCH" not in cat
+
+
+def test_modern_web_design_ui_skill_has_the_zero_build_playbook():
+    desc, body, triggers = skills.BUNDLED["modern-web-design-ui"]
+    assert len(body) <= 580
+    for token in ("#0b0f17", "clamp()", "65ch", "translateY(-1px)",
+                  "@tailwind", "cdn.tailwindcss.com", "hamburger"):
+        assert token in body, token
+    for trigger in ("website", "webpage", "landing page", "personal site",
+                    "bio", "portfolio", "styling", "modern", "sleek",
+                    "appealing", "css", "layout", "theme", "hero", "card"):
+        assert trigger in triggers, trigger
 
 
 def test_new_skills_load_through_dispatch(tmp_path):

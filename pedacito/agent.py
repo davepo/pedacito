@@ -3851,11 +3851,25 @@ class Agent:
             # itself owes a document edit.
             if _is_prose_doc(rel) and not _clause_names_file(rel, clause):
                 return
+            if not rel:
+                return
             key = (fileio.path_key(rel), fileio.path_key(symbol))
-            if rel and key not in seen:
-                seen.add(key)
-                intents.append({"file": rel, "symbol": symbol,
-                                "intended_change": change})
+            if key in seen:
+                # Several clauses can owe edits to the SAME whole page (a
+                # remove + two inserts on index.html). Merge them into one
+                # follow-up intent instead of asking the same file twice.
+                if not symbol:
+                    for it in intents:
+                        same = (fileio.path_key(it["file"]),
+                                fileio.path_key(it.get("symbol") or ""))
+                        if same == key:
+                            if change and change not in it["intended_change"]:
+                                it["intended_change"] += "; " + change
+                            break
+                return
+            seen.add(key)
+            intents.append({"file": rel, "symbol": symbol,
+                            "intended_change": change})
 
         for req in reqs:
             before = len(intents)
@@ -3901,6 +3915,21 @@ class Agent:
                 if rel:
                     add(rel, "", change, req.text)
                     break
+            if len(intents) > before:
+                continue
+            # 4. A literal-copy clause on a page that was just edited has no
+            #    symbol/file token to resolve, but its target is unambiguous:
+            #    the same small HTML/CSS file this batch already touched. Send
+            #    the quoted copy back to that file instead of leaving the
+            #    clause as an advisory warning that never reaches the page.
+            if req.literals:
+                edited = list(getattr(self, "_coverage_edit_targets", []) or [])
+                web = [r for r in edited
+                       if str(r).lower().endswith((".html", ".htm", ".css"))]
+                for rel in (web or edited):
+                    add(rel, "", change, req.text)
+                    if len(intents) > before:
+                        break
         return intents
 
     def apply_edit_intents(self, task: str, gathered: str, intents: list[dict],
@@ -4226,6 +4255,9 @@ class Agent:
         Returns (results, reply, findings)."""
         from . import verify as verify_mod
         tracker = getattr(self, "requirements", None)
+        self._coverage_edit_targets = [
+            r.file for r in results
+            if getattr(r, "ok", False) and getattr(r, "file", "")]
         findings.extend(verify_mod.check_coverage(
             task, reply, results, tracker=tracker))
         # A half-answered multi-clause task used to end with an advisory
@@ -4259,6 +4291,20 @@ class Agent:
                 findings.extend(more_findings)
                 reply += ("\n\nCoverage follow-up (unaddressed task clauses):"
                           "\n" + "\n".join(more_reply.splitlines()[1:]))
+                # The follow-up was the LAST chance to land the user's quoted
+                # copy. Re-read the final edited text: if a required literal
+                # is still missing (or a removed one is still present), the
+                # turn ends with a concrete finding instead of silent success.
+                still = verify_mod.coverage_seeds(
+                    task, reply, results, tracker=tracker)
+                for req in still:
+                    for lit in getattr(req, "missing_literals", []):
+                        verb = ("still present" if req.literal_remove
+                                else "missing")
+                        findings.append(verify_mod.Finding(
+                            "coverage", "error", "",
+                            f'quoted literal "{lit}" is {verb} after the '
+                            f'coverage follow-up ({req.req_id or "clause"})'))
         return results, reply, findings
 
     def incremental_edit(self, task: str, gathered: str, backup_dir=None,
@@ -4564,7 +4610,15 @@ class Agent:
             r = _norm_key(rel)
             if not any(self._file_token_match(r, w) for w in wanted):
                 continue
-            if self._disk_line_count(rel) > cap:
+            lines = self._disk_line_count(rel)
+            # A small hand-authored HTML/CSS page is a legitimate whole-file
+            # rewrite target for a layout/restyle task; do not list it as a
+            # context-pressure file (the deterministic twin in verify.py also
+            # exempts these pages from the oversized-rewrite gate).
+            if (str(rel).lower().endswith((".html", ".htm", ".css"))
+                    and lines <= 300):
+                continue
+            if lines > cap:
                 out.append(rel)
         return out
 

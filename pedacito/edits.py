@@ -777,7 +777,34 @@ def _wipe_refusal(rel: str) -> str:
             "file and make targeted search/replace edits.")
 
 
-def fragment_refusal(rel: str, original: str, new_text: str) -> str | None:
+# Small hand-authored pages are routinely restructured as a whole: moving two
+# links under an <h1>, replacing a section, or restyling a 100-line CSS file
+# legitimately drops dozens of old lines. The fragment heuristics below were
+# written for code modules, where a shrinking rewrite usually means a partial
+# read; applying them to a < 300-line HTML/CSS page vetoed the user's whole
+# layout request and left only the first hunk applied.
+_SMALL_WEB_EXTS = (".html", ".htm", ".css")
+
+
+def _small_web_rewrite(rel: str) -> bool:
+    """True for a small HTML/CSS page: whole-section rewrites are allowed."""
+    return str(rel or "").lower().endswith(_SMALL_WEB_EXTS)
+
+
+def _web_restructure_task(task: str) -> bool:
+    """A brief that asks for visual/layout work rather than code surgery."""
+    if not task:
+        return True                         # type-shape alone is the signal
+    low = task.lower()
+    return bool(re.search(
+        r"\b(?:layout|restructur\w*|restyle|restyling|redesign|styling|style|"
+        r"css|html|website|webpage|page|section|hero|card|move|reorder|"
+        r"replace|remove|add|modern|sleek|appealing|theme|typography)\b",
+        low))
+
+
+def fragment_refusal(rel: str, original: str, new_text: str,
+                     task: str = "") -> str | None:
     """Why replacing `original` with `new_text` looks like a fragment of a
     partial read rather than a whole-file rewrite, or None when it is safe.
     Shared by the `write` tool and the edit path's empty-SEARCH whole-file
@@ -805,6 +832,13 @@ def fragment_refusal(rel: str, original: str, new_text: str) -> str | None:
     # A whole-file replacement to nothing is never an edit.
     if old_ls and not new_ls:
         return _wipe_refusal(rel)
+    # A whole-section rewrite of a small static page is the normal shape of a
+    # layout/restyle request, not the signature of a partial read. Keep the
+    # empty-replacement refusal above; skip the fragment heuristics for
+    # HTML/CSS pages under 300 lines.
+    if (_small_web_rewrite(rel) and _web_restructure_task(task)
+            and len(old_ls) <= 300):
+        return None
     # A JS/TS module whose replacement keeps content but drops EVERY export
     # form breaks each importer (`does not provide an export named ...`)
     # and each classic script reading the global. Targeted edits can still
@@ -965,6 +999,7 @@ def apply_edits(root: Path, edits: list[Edit], backup: bool = True,
         groups.setdefault(e.file, []).append(e)
 
     root_resolved = Path(root).resolve()
+    task_text = str(getattr(cfg, "_task_text", "") or "")
 
     # ---- protected paths (.git/, .pedacito/, the plan file, config) --------
     for rel in list(groups):
@@ -1387,7 +1422,7 @@ def apply_edits(root: Path, edits: list[Edit], backup: bool = True,
                     # partial read would silently erase the rest of the file).
                     # A rename target is exempt: its real content arrives from
                     # the moved source, not from the REPLACE text.
-                    refusal = fragment_refusal(rel, original, text)
+                    refusal = fragment_refusal(rel, original, text, task=task_text)
                     if refusal:
                         results.append(Result(False, rel, refusal))
                         continue
@@ -1586,7 +1621,7 @@ def apply_edits(root: Path, edits: list[Edit], backup: bool = True,
                             whole_file = True
                             whole = repl if not repl or repl.endswith("\n") \
                                 else repl + "\n"
-                            refusal = fragment_refusal(rel, text, whole)
+                            refusal = fragment_refusal(rel, text, whole, task=task_text)
                             if refusal:
                                 results.append(Result(False, rel,
                                                       f"block {k}: {refusal}"))
@@ -1601,7 +1636,7 @@ def apply_edits(root: Path, edits: list[Edit], backup: bool = True,
                     whole_file = True
                     whole = e.replace if not e.replace or e.replace.endswith("\n") \
                         else e.replace + "\n"
-                    refusal = fragment_refusal(rel, text, whole)
+                    refusal = fragment_refusal(rel, text, whole, task=task_text)
                     if refusal:
                         results.append(Result(False, rel, f"block {k}: {refusal}"))
                         failed = True

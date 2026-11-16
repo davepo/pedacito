@@ -483,7 +483,8 @@ def small_window_note(cfg, large_files: list[str] | None = None) -> str:
             "draft that size gets cut off mid-file and drops working code. "
             "Use small SEARCH/REPLACE blocks, a SYMBOL anchor with the full "
             "new definition, or build large files in successive append "
-            "chunks.")
+            "chunks. EXCEPTION: a hand-authored HTML/CSS page under 300 "
+            "lines may be rewritten whole for a layout or restyle task.")
     if large_files:
         text += (" Files already over that ceiling: "
                  + ", ".join(large_files[:6]) + ".")

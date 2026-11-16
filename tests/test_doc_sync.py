@@ -89,7 +89,7 @@ def test_stale_benchmark_phrase_is_gone_from_gui_scripts():
 
 
 def test_bundled_skills_are_valid_and_loadable(tmp_path):
-    assert len(skills.BUNDLED) == 16
+    assert len(skills.BUNDLED) == 17
     for name, (desc, body, triggers) in skills.BUNDLED.items():
         assert skills._NAME_RE.match(name), name
         assert desc.strip(), name
@@ -123,7 +123,7 @@ def test_second_eight_bodies_stay_crisp():
 
 
 def test_readme_names_every_bundled_skill():
-    assert "Sixteen starters" in README
+    assert "Seventeen starters" in README
     for name in skills.BUNDLED:
         assert f"`{name}`" in README, f"README does not name skill {name}"
 

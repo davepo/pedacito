@@ -1880,6 +1880,7 @@ def _run_complex(root: Path, cfg, client, idx, plan: Plan, spec: Spec, *,
     titles = plan_tasks(plan, idx=idx, max_lines=split_lines,
                         include_tests=True, tests_first=design)
     loop.write_plan(plan_file, plan.project_name or spec.title, titles)
+    loop.emit_plan_updated(plan_file, root=root, cfg=cfg, reason="created")
 
     print(f"\n--- auto: implementing {len(titles)} task(s) in fresh contexts "
           f"(plan: {plan_file}) ---", file=sys.stderr)

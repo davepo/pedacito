@@ -280,6 +280,26 @@ function md(text) {
 PDC.md = md;
 
 // ------------------------------------------------------------- the store ------
+// The composer's draft survives a browser refresh. `pedacito_draft_prompt` is
+// written on every input and cleared only when the user submits (or empties)
+// the box -- F5 must never cost someone the prompt they just typed.
+const DRAFT_KEY = 'pedacito_draft_prompt';
+function readDraft() {
+  try { return localStorage.getItem(DRAFT_KEY) || ''; } catch (e) { return ''; }
+}
+function writeDraft(text) {
+  try {
+    if (text) localStorage.setItem(DRAFT_KEY, text);
+    else localStorage.removeItem(DRAFT_KEY);
+  } catch (e) {}
+}
+function clearDraft() { writeDraft(''); }
+const savedDraft = readDraft();
+const savedMode = (() => {
+  try { return localStorage.getItem('pedacito_mode') || 'task'; }
+  catch (e) { return 'task'; }
+})();
+
 const S = {
   status: {},
   msgs: [], msgTick: 0,                   // msgTick bumps on any message change
@@ -289,13 +309,14 @@ const S = {
   ws: { tab: localStorage.getItem('pedacito_ws_tab') || 'files', files: [],
         indexed: [], indexedSet: null, sig: '', filter: '', truncated: false,
         loading: false, backups: [], backupsAt: 0 },
-  mode: localStorage.getItem('pedacito_mode') || 'task',
-  drafts: {}, attachments: [],
+  mode: savedMode,
+  drafts: savedDraft ? { [savedMode]: savedDraft } : {}, attachments: [],
   opts: (() => { try { return JSON.parse(localStorage.getItem('pedacito_opts') || '{}'); } catch (e) { return {}; } })(),
   ui: { diffOpen: false, wsCollapsed: false, termFollow: true, optsOpen: false,
         diffMode: localStorage.getItem('pedacito_diff_mode') || 'split',
         view: 'chat', folds: {}, planEditing: false, pendingProfile: null,
-        refining: false, previousPrompt: null },
+        refining: false, previousPrompt: null, switchingProfile: false,
+        actionBusy: false, planGenerating: false, planGenFrom: null },
   peek: null,
   how: { query: '', answer: null, loading: false, error: '', useModel: true },
 };
@@ -307,6 +328,17 @@ function emit() {                         // Preact batches these per frame
 }
 
 const job = () => S.status.job || null;
+
+// Local action state only: a profile switch or another quick header action
+// must never look like a running task. `setBusy(false)` is guaranteed in the
+// caller's `finally`, so a failed request cannot leave the Run button stuck
+// as Stop.
+function setBusy(on) {
+  S.ui.actionBusy = !!on;
+  if (!on) S.ui.switchingProfile = false;
+  emit();
+}
+PDC.setBusy = setBusy;
 
 // ----------------------------------------------------------- ANSI terminal ----
 function Term(el) {
@@ -469,8 +501,24 @@ function applyStatus(s) {
   const rkey = s.review ? s.review.id + ':' + s.review.outcome : '';
   if (rkey !== lastReviewKey) { lastReviewKey = rkey; loadReview(); }
   const j = s.job;
+  // The plan file is written/ticks WHILE Auto or a planned Task runs. Use the
+  // live payload carried by /api/state every poll (and fall back to /api/plan
+  // for an older server), so PLAN.md appears as soon as the planner writes it
+  // and each [x] lands immediately -- not when the whole run finishes.
+  if (s.plan) applyPlanPayload(s.plan);
+  else if (j && (j.kind === 'auto' || j.kind === 'task')) loadPlan();
   if (j && j.id !== lastJobId) loadPlan();
   if (!j && lastJobId) { collapseDone(); loadPlan(); loadReview(); loadFiles(); loadBackups(); }
+  if (!j && S.ui.planGenerating && !S.ui.planGenFrom) {
+    S.ui.planGenerating = false;
+    S.ui.planGenFrom = null;
+  }
+  if (!j && S.ui.planGenerating && lastJobId) {
+    // The planner/run ended without writing a replacement: stop claiming a
+    // new plan is coming and show whatever is on disk.
+    S.ui.planGenerating = false;
+    S.ui.planGenFrom = null;
+  }
   lastJobId = j ? j.id : 0;
   if ((s.files_sig || '') !== lastFilesSig) {   // index or workspace changed
     lastFilesSig = s.files_sig || '';
@@ -618,6 +666,8 @@ function connect(seq) {
   on('job', () => refreshState());
   on('permission', () => refreshState());         // a gated action is waiting
   on('permission_decided', () => refreshState()); // someone answered it
+  // PLAN.md was created or a box was ticked: refresh the checklist now.
+  on('plan', () => loadPlan());
   ['status', 'review', 'review_done'].forEach((t) => on(t, () => refreshState()));
   stream.addEventListener('resync', () => { stream.close(); es = null; loadSnapshot(); });
 }
@@ -643,16 +693,27 @@ function peek(path) {                     // list profiles of a folder not yet
     });
   }, 450);
 }
-function switchProfile(name) {
+async function switchProfile(name) {
   S.ui.pendingProfile = name;
+  S.ui.switchingProfile = true;
   emit();
-  PDC.api('/api/profile', { profile: name }).then((j) => {
+  try {
+    const j = await PDC.api('/api/profile', { profile: name });
     if (!j.ok) {
       S.ui.pendingProfile = null;
-      PDC.toast(j.detail || 'busy', true);
+      PDC.toast(j.detail || 'could not switch profile', true);
     }
-    refreshState(); emit();
-  });
+  } catch (e) {
+    S.ui.pendingProfile = null;
+    PDC.toast('Could not switch profile.', true);
+  } finally {
+    // /api/profile is synchronous and never claims the job slot. Make that
+    // visible here too: no loading state may survive a profile switch.
+    setBusy(false);
+    S.ui.switchingProfile = false;
+    await refreshState();
+    emit();
+  }
 }
 function startNewProject() {
   S.mode = 'new';
@@ -743,11 +804,36 @@ function deleteCurrentThread() {
 }
 
 // ---- run / stop / steer ----
-PDC.startRun = (payload) => PDC.api('/api/run', payload).then((j) => {
-  if (!j.ok) PDC.toast(j.detail || 'could not start', true);
-  refreshState();
-  return j;
-});
+function planIsComplete() {
+  const p = S.plan || {};
+  const tasks = p.tasks || [];
+  return !!p.exists && tasks.length > 0
+    && tasks.every((t) => t.status !== 'todo');
+}
+function markPlanGenerating(payload) {
+  // A new Auto goal against a fully-ticked plan replaces it. Show that intent
+  // immediately; applyPlanPayload swaps in the new checklist the moment the
+  // planner writes it (before Task 1 begins).
+  if (!payload || payload.mode !== 'auto' || !planIsComplete()) return;
+  S.ui.planGenerating = true;
+  S.ui.planGenFrom = { path: S.plan.path || '', text: S.plan.text || '',
+                       mtime: S.plan.mtime || 0 };
+  emit();
+}
+PDC.startRun = (payload) => {
+  markPlanGenerating(payload);
+  return PDC.api('/api/run', payload).then((j) => {
+    if (!j.ok) {
+      PDC.toast(j.detail || 'could not start', true);
+      if (!job()) { S.ui.planGenerating = false; S.ui.planGenFrom = null; }
+    }
+    refreshState();
+    return j;
+  }, (e) => {
+    if (!job()) { S.ui.planGenerating = false; S.ui.planGenFrom = null; }
+    throw e;
+  });
+};
 const stick = { current: true };          // chat auto-follow flag
 function stop() { PDC.api('/api/stop', {}).then(refreshState); }
 
@@ -800,6 +886,7 @@ function send() {
     if (!text) { PDC.toast('Type a question first.', true); return; }
     S.drafts.how = '';
     if (inputEl) inputEl.value = '';
+    clearDraft();
     askHow(text);
     return;
   }
@@ -809,6 +896,7 @@ function send() {
       PDC.api('/api/steer', { text: text }).then((r) => { if (!r.ok) PDC.toast(r.detail || 'not delivered', true); });
       S.drafts[S.mode] = '';
       if (inputEl) inputEl.value = '';
+      clearDraft();
     }
     return;
   }
@@ -833,6 +921,7 @@ function send() {
     if (r.ok) {
       S.drafts[S.mode] = '';
       if (inputEl) inputEl.value = '';
+      clearDraft();
       S.attachments = []; stick.current = true; emit();
     }
   });
@@ -1000,11 +1089,33 @@ function restoreBackup(name) {
 
 // ---- plan ----
 const planEdit = { current: null };
+function applyPlanPayload(j) {
+  if (!j || typeof j !== 'object') return false;
+  const prev = S.plan || {};
+  const changed = j.path !== prev.path || j.text !== prev.text
+    || !!j.exists !== !!prev.exists || j.mtime !== prev.mtime;
+  if (S.ui.planGenerating && j.exists) {
+    const from = S.ui.planGenFrom;
+    // The planner replaced the old checklist: stop the placeholder and show
+    // the brand-new plan right away. `mtime` catches a rewrite whose text
+    // happens to be identical.
+    if (!from || j.path !== from.path || j.text !== from.text
+        || (j.mtime && from.mtime && j.mtime !== from.mtime)) {
+      S.ui.planGenerating = false;
+      S.ui.planGenFrom = null;
+    }
+  }
+  if (changed) {
+    S.plan = j;
+    emit();
+  }
+  return changed;
+}
+PDC.applyPlanPayload = applyPlanPayload;
 function loadPlan() {
   return PDC.api('/api/plan').then((j) => {
     if (j._status !== 200) return;
-    S.plan = j;
-    emit();
+    applyPlanPayload(j);
   });
 }
 function savePlan() {
@@ -2514,6 +2625,7 @@ function refinePrompt() {
     if (S.ui.previousPrompt == null && el) S.ui.previousPrompt = el.value;
     if (el) el.value = j.refined;
     S.drafts[S.mode] = j.refined;
+    writeDraft(j.refined);
     // A full spec is many lines: if the composer is compact, grow it just
     // enough to read what came back (never shrink a user's larger setting).
     if ((j.refined.match(/\n/g) || []).length > 8 && composerHeightNow() < 220) {
@@ -2534,6 +2646,7 @@ function undoRefine() {
   const el = $('input');
   if (el) el.value = S.ui.previousPrompt;
   S.drafts[S.mode] = S.ui.previousPrompt;
+  writeDraft(S.ui.previousPrompt);
   S.ui.previousPrompt = null;
   emit();
 }
@@ -2552,13 +2665,17 @@ function Composer() {
   const steerable = j && j.kind === 'task' && s.allow_steering;
   const isHow = S.mode === 'how';
   const setMode = (k) => {
-    if (taRef.current) S.drafts[S.mode] = taRef.current.value;
+    if (taRef.current) {
+      S.drafts[S.mode] = taRef.current.value;
+      writeDraft(taRef.current.value);
+    }
     S.mode = k;
     if (k === 'new' && !opt('new', 'project')) {
       S.opts.new.project = s.suggested_new_project || '';
     }
     S.ui.previousPrompt = null;
     try { localStorage.setItem('pedacito_mode', k); } catch (e) {}
+    writeDraft(S.drafts[k] || '');
     S.ui.optsOpen = false;
     emit();
   };
@@ -2617,6 +2734,7 @@ function Composer() {
                 placeholder=${isHow ? m.ph : (j ? (steerable ? 'Type a note to steer the model (Enter)\u2026' : 'Working\u2026 press Stop to cancel.') : m.ph)}
                 disabled=${!!j && !steerable && !isHow}
                 oninput=${(e) => { S.drafts[S.mode] = e.target.value;
+                  writeDraft(e.target.value);       // F5 must not lose it
                   const rb = $('refineBtn');
                   if (rb) rb.disabled = S.ui.refining || !e.target.value.trim(); }}
                 onkeydown=${(e) => { if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) { e.preventDefault(); send(); } }} />
@@ -2969,9 +3087,10 @@ function PlanPane() {
     <section class="panel" id="planPanel">
       <div class="panel-head">
         <h2>Plan</h2>
-        ${tasks.length ? html`<span class="badge">${done}/${tasks.length}</span>` : null}
+        ${S.ui.planGenerating ? html`<span class="badge">new plan\u2026</span>`
+          : tasks.length ? html`<span class="badge">${done}/${tasks.length}</span>` : null}
         <span class="muted small-text grow mono" id="planPath">${p.exists ? p.path : ''}</span>
-        ${p.exists ? html`
+        ${p.exists && !S.ui.planGenerating ? html`
           <button class="small" onClick=${() => { S.ui.planEditing = !S.ui.planEditing; emit(); }}>
             ${S.ui.planEditing ? 'Cancel' : 'Edit'}</button>
           ${S.ui.planEditing ? html`<button class="small primary" onClick=${() => savePlan()}>Save</button>` : null}
@@ -2979,7 +3098,10 @@ function PlanPane() {
                   onClick=${() => PDC.runPlan()}>Run</button>` : null}
       </div>
       <div id="planBody" hidden=${S.ui.planEditing}>
-        ${!p.exists ? html`
+        ${S.ui.planGenerating ? html`
+          <div class="tip"><b>Generating new plan\u2026</b><br>The previous
+          checklist is complete; the planner is replacing it for this goal.</div>`
+        : !p.exists ? html`
           <div class="tip">No plan yet. Use <b>Auto</b> to turn a goal into a
           checklist; its progress shows here as it runs.</div>` : html`
           <div class="muted small-text">${done} of ${tasks.length} tasks done</div>

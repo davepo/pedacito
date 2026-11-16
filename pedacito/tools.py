@@ -2890,7 +2890,9 @@ def tool_write(index, cfg, file: str, content: str,
         # result is still valid text. Refused shapes: tiny fragments, window
         # re-quotes, and lost head/tail fragments; genuine rewrites and small
         # shrinks stay allowed.
-        refusal = edits_mod.fragment_refusal(rel, original, new_text)
+        refusal = edits_mod.fragment_refusal(
+            rel, original, new_text,
+            task=str(getattr(cfg, "_task_text", "") or ""))
         if refusal:
             return refusal
         # Syntax gate: refusing here is the write-action equivalent of the

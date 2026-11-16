@@ -938,14 +938,31 @@ def _cmd_auto(args, cfg, client, idx, root: Path) -> int:
         # The full spec travels with every task prompt so constraints dropped
         # from the title still bind the worker.
         spec_text = spec.text
-        # Resume an existing plan only while it has open tasks; otherwise a new
-        # goal starts a fresh plan.
-        regenerate = args.force or \
-            loop.next_task(loop.read_plan(plan_path)) is None
+        # A new goal starts a NEW plan. Resume only when this very goal is
+        # already stored in the plan file AND unchecked work remains; a
+        # finished checklist (every box `[x]`) or a different goal archives
+        # the old plan and regenerates immediately, before Task 1 starts.
+        existing_plan = loop.read_plan(plan_path)
+        existing_goal = loop.read_plan_goal(plan_path)
+        goal_changed = bool(existing_goal.strip()) and \
+            existing_goal.strip() != spec.text.strip()
+        regenerate = (args.force
+                      or loop.next_task(existing_plan) is None
+                      or goal_changed
+                      or (plan_path.exists() and not existing_goal.strip()))
         if regenerate:
             if plan_path.exists():
-                print("  [existing plan has no open tasks; generating a new "
-                      "one from the goal]", file=sys.stderr)
+                archived = loop.archive_plan(
+                    plan_path, root,
+                    reason="force" if args.force else "new goal or completed")
+                if archived is not None:
+                    print(f"  [archived the previous plan to "
+                          f"{archived.relative_to(root)}; generating a new "
+                          f"one from the goal]", file=sys.stderr)
+                else:
+                    print("  [existing plan has no open tasks or the goal "
+                          "changed; generating a new one from the goal]",
+                          file=sys.stderr)
             titles = loop.generate_tasks(
                 spec.text, roles_mod.client_for(cfg, "planner", client), cfg,
                 root=root)
@@ -953,6 +970,10 @@ def _cmd_auto(args, cfg, client, idx, root: Path) -> int:
             # without -t/--spec reads the goal back from the plan file
             # (read_plan_goal) so workers still see every constraint.
             loop.write_plan(plan_path, spec.text, titles)
+            # The checklist exists NOW: tell the GUI so its Plan panel fills
+            # before the first task's lookup starts.
+            loop.emit_plan_updated(plan_path, root=root, cfg=cfg,
+                                   reason="created")
         if not args.apply:
             print(plan_path.read_text(encoding="utf-8"), file=sys.stderr)
             print(f"Plan: {plan_path}", file=sys.stderr)

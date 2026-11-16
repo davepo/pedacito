@@ -529,7 +529,7 @@ def test_gui_skills_list_and_match_preview(gui):
     status, j = gui.get("/api/skills")
     assert status == 200 and j["ok"] is True
     names = {r["name"] for r in j["skills"]}
-    assert len(names) == 16 and "fastapi-rest-endpoint" in names
+    assert len(names) == 17 and "fastapi-rest-endpoint" in names
     assert all(r["scope"] == "bundled" for r in j["skills"])
     status, j = gui.get("/api/skills?task=fix%20the%20failing%20test")
     assert status == 200

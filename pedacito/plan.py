@@ -144,7 +144,7 @@ def replan(task: str, plan_path: Path, client, cfg, failed: str,
 
 def run_planned(root: Path, cfg, client, idx, task: str, *, apply: bool,
                 review: bool = False, confirm=None,
-                strict: bool = False) -> int:
+                strict: bool = False, on_plan=None) -> int:
     """Plan `task`, show the plan, run it step by step (with one re-plan after
     a failure), and return an exit code. `confirm`, when given, is called with
     the plan path to let the user approve or edit it first (returns False to
@@ -153,6 +153,12 @@ def run_planned(root: Path, cfg, client, idx, task: str, *, apply: bool,
     stamp = workspace.stamp()
     plan_path = Path(root) / ".pedacito" / "plans" / f"{stamp}.md"
     loop.write_plan(plan_path, task, titles)
+    loop.emit_plan_updated(plan_path, root=root, cfg=cfg, reason="created")
+    if on_plan is not None:
+        try:
+            on_plan(plan_path)
+        except Exception:
+            pass
     print(f"\n--- plan ({how}; {len(titles)} step(s)) -> "
           f"{plan_path.relative_to(root)} ---", file=sys.stderr)
     for i, t in enumerate(titles, 1):

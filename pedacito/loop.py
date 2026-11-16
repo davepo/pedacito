@@ -19,6 +19,7 @@ Usage
 from __future__ import annotations
 
 import re
+import shutil
 import subprocess
 import sys
 import time
@@ -517,11 +518,12 @@ def next_task(lines: list[str]) -> tuple[int, str] | None:
     return None
 
 
-def _set_box(path: Path, task: str, box: str) -> bool:
+def _set_box(path: Path, task: str, box: str, notify=None) -> bool:
     """Set the checkbox of the first unchecked task matching `task` to `box`
     ("x" = done, "!" = failed). Matching by text rather than line index means
     a plan file the model edited mid-run still resolves. Returns False if the
-    task could not be found."""
+    task could not be found. `notify(path, reason)`, when given, fires right
+    after the file lands so a live GUI can refresh the checklist."""
     lines = read_plan(path)
     i = _find_unchecked(lines, task)
     if i is None:
@@ -529,23 +531,29 @@ def _set_box(path: Path, task: str, box: str) -> bool:
     m = _TASK_LINE.match(lines[i])
     lines[i] = f"{m.group(1)}[{box}] {m.group(3)}"
     path.write_text("\n".join(lines), encoding="utf-8")
+    if notify is not None:
+        try:
+            notify(path, "done" if box == "x" else "failed")
+        except Exception:
+            pass
     return True
 
 
-def mark_done(path: Path, task: str) -> bool:
+def mark_done(path: Path, task: str, notify=None) -> bool:
     """Tick the first unchecked task whose text matches `task` as done."""
-    return _set_box(path, task, "x")
+    return _set_box(path, task, "x", notify=notify)
 
 
-def mark_failed(path: Path, task: str) -> bool:
+def mark_failed(path: Path, task: str, notify=None) -> bool:
     """Flag the first unchecked task matching `task` as failed (`[!]`).
 
     A failed box is neither unchecked (so the loop never re-picks it and
     spins) nor done (so a human can see what to revisit)."""
-    return _set_box(path, task, "!")
+    return _set_box(path, task, "!", notify=notify)
 
 
-def insert_task_before(path: Path, task: str, new_title: str) -> bool:
+def insert_task_before(path: Path, task: str, new_title: str,
+                       notify=None) -> bool:
     """Insert an unchecked ``- [ ] new_title`` line immediately before the
     first unchecked occurrence of ``task`` (the remediation path: the failed
     check stays unchecked and retries after the repair). Returns False when
@@ -556,7 +564,26 @@ def insert_task_before(path: Path, task: str, new_title: str) -> bool:
         return False
     lines.insert(i, f"- [ ] {new_title}")
     path.write_text("\n".join(lines), encoding="utf-8")
+    if notify is not None:
+        try:
+            notify(path, "remediation")
+        except Exception:
+            pass
     return True
+
+
+def emit_plan_updated(path: Path, root: Path | None = None, cfg=None,
+                      reason: str = "updated") -> None:
+    """Tell listeners (the GUI's live Plan panel) that the checklist changed.
+
+    Written right after `PLAN.md` is created or a box is ticked, so the page
+    can render the checklist while Task 1 is still starting instead of waiting
+    for the whole Auto run to finish."""
+    try:
+        events_mod.get(root, cfg).emit("plan_updated", path=str(path),
+                                       reason=reason)
+    except Exception:
+        pass
 
 
 # Title of the repair task inserted when a live verification fails its
@@ -579,6 +606,40 @@ def _prune_notes(notes: list[str]) -> None:
     plus the latest two."""
     if len(notes) > 3:
         del notes[1:-2]
+
+
+def archive_plan(path: Path, root: Path, reason: str = "superseded") -> Path | None:
+    """Copy a superseded plan into `.pedacito/sessions/` before replacing it.
+
+    A finished plan is the record of what the previous Auto run did; starting
+    a new goal must not silently erase it. Returns the archive path (or None
+    when there was no plan / the copy failed). The live `PLAN.md` is left for
+    the caller to overwrite.
+    """
+    path = Path(path)
+    if not path.is_file():
+        return None
+    dest_dir = Path(root) / ".pedacito" / "sessions"
+    try:
+        dest_dir.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        return None
+    stem = f"{workspace.stamp()}-plan-{path.name}"
+    dest = dest_dir / stem
+    n = 1
+    while dest.exists():
+        dest = dest_dir / f"{stem.removesuffix('.md')}-{n}.md"
+        n += 1
+    try:
+        shutil.copy2(path, dest)
+    except OSError:
+        return None
+    try:
+        events_mod.get(Path(root)).emit("plan_archived", path=str(dest),
+                                        reason=reason)
+    except Exception:
+        pass
+    return dest
 
 
 def write_plan(path: Path, goal: str, titles: list[str]) -> None:
@@ -662,6 +723,34 @@ PLAN_SCHEMA["properties"]["tasks"]["items"]["properties"]["depends_on"] = {
     "type": "array", "items": {"type": "integer"},
     "description": "1-based numbers of EARLIER tasks this one depends on "
                    "(task 1 is the first); omit when none"}
+
+_SIMPLE_WEB_GOAL_RE = re.compile(
+    r"\b(?:website|webpage|web page|landing page|personal site|bio|"
+    r"portfolio|static site|index\.html|styles?\.css|stylesheet|hero|"
+    r"card|theme|layout|css|styling|restyle|redesign)\b", re.IGNORECASE)
+_BUILD_STACK_GOAL_RE = re.compile(
+    r"\b(?:react|next\.js|nuxt|sveltekit|vite|webpack|rollup|parcel|"
+    r"angular|vue cli|django|flask|fastapi|express|backend|database|"
+    r"api endpoint)\b", re.IGNORECASE)
+
+
+def _simple_web_goal(text: str) -> bool:
+    """A static page brief: visual polish, not an enterprise feature build."""
+    text = text or ""
+    return bool(_SIMPLE_WEB_GOAL_RE.search(text)) \
+        and not _BUILD_STACK_GOAL_RE.search(text)
+
+
+WEB_PLAN_NOTE = """\
+STATIC WEB PAGE MODE -- the goal is a hand-authored page. Task titles must
+preserve the user's exact requested copy, links and section order VERBATIM;
+plan only visual craft (typography, spacing, colour, cards, buttons, link
+badges, responsive layout). Forbid invented sections and boilerplate: no fake
+contact forms, no mobile hamburger toggle on a one-page bio with two links, no
+dummy JavaScript, no unrequested README.md deployment manual, no rigid
+accessibility-test checklist. A no-build site gets complete CSS -- never raw
+`@tailwind` directives unless the page loads the Tailwind CDN."""
+
 
 PLAN_SYSTEM = """\
 You break a software goal into a small, ordered list of single-focus
@@ -815,6 +904,8 @@ def generate_tasks(spec_text: str, client, cfg,
     body = spec_text.strip()[:budget]
     max_tokens = getattr(cfg, "max_tokens_plan", 2000)
     plan_system = PLAN_SYSTEM
+    if _simple_web_goal(body):
+        plan_system += "\n\n" + WEB_PLAN_NOTE
     notes = instructions_mod.render(root, cfg) if root is not None else ""
     if notes:
         plan_system += "\n\n" + notes
@@ -4271,6 +4362,15 @@ def run_loop(root: Path, cfg, client, idx, plan_path: Path, *,
     workspace.log_event(root, f"auto loop: plan={plan_path.name}"
                               f" verify={verify or '(none)'}")
     _lint_plan_titles(root, plan_path)
+
+    def plan_changed(path: Path, reason: str = "updated") -> None:
+        """A box just changed on disk: push it to the page immediately."""
+        emit_plan_updated(path, root=Path(root), cfg=cfg, reason=reason)
+
+    # The plan may have been generated just before the loop started; announce
+    # the current checklist so the Plan panel fills before Task 1's first
+    # lookup, not when the whole run ends.
+    plan_changed(plan_path, "loop_start")
     ratchet_skip: list[str] = []      # loop state the green ratchet must undo
     # The plan file is harness state: only the loop ticks its boxes, so the
     # model may not write it through any tool or edit block.
@@ -4398,7 +4498,8 @@ def run_loop(root: Path, cfg, client, idx, plan_path: Path, *,
             f"do NOT apply it -- explain the conflict in your reply "
             f"instead:\n{_clip_report(tr.reply)}")
         _prune_notes(context_notes)     # run anchor + latest two
-        insert_task_before(plan_path, task, _REMEDIATION_TITLE)
+        insert_task_before(plan_path, task, _REMEDIATION_TITLE,
+                           notify=plan_changed)
         pending_check[:] = [task]       # the repair's outcome belongs to THIS check
         print(f"  [verification task failed: {miss} -- inserted a repair "
               f"task ahead of it; the check retries after "
@@ -4618,7 +4719,7 @@ def run_loop(root: Path, cfg, client, idx, plan_path: Path, *,
             failed += 1
             if stop_on_fail:
                 break
-            mark_failed(plan_path, task)
+            mark_failed(plan_path, task, notify=plan_changed)
             continue
         idx = tr.idx
 
@@ -4637,7 +4738,7 @@ def run_loop(root: Path, cfg, client, idx, plan_path: Path, *,
                         continue
                     if outcome == "retire":
                         failed += 1
-                        mark_failed(plan_path, task)
+                        mark_failed(plan_path, task, notify=plan_changed)
                         repair_outcome.pop(task, None)
                         continue
                     if (tr.reply or "").startswith(
@@ -4670,7 +4771,7 @@ def run_loop(root: Path, cfg, client, idx, plan_path: Path, *,
                                   "phase produced no prose on two attempts",
                             "ERROR")
                         failed += 1
-                        mark_failed(plan_path, task)
+                        mark_failed(plan_path, task, notify=plan_changed)
                         repair_outcome.pop(task, None)
                         continue
                     if repair_outcome.get(task) is False:
@@ -4687,7 +4788,7 @@ def run_loop(root: Path, cfg, client, idx, plan_path: Path, *,
                             root, "verification check retired after a "
                                   f"no-edit repair: {miss}", "ERROR")
                         failed += 1
-                        mark_failed(plan_path, task)
+                        mark_failed(plan_path, task, notify=plan_changed)
                         repair_outcome.pop(task, None)
                         continue
                     if offer_remediation(task, tr, miss):
@@ -4702,12 +4803,12 @@ def run_loop(root: Path, cfg, client, idx, plan_path: Path, *,
                     failed += 1
                     if stop_on_fail:
                         break
-                    mark_failed(plan_path, task)
+                    mark_failed(plan_path, task, notify=plan_changed)
                     continue
                 context_notes.append(f"### {task}\n{_clip_report(tr.reply)}")
                 _prune_notes(context_notes)   # run anchor + latest two
                 mark_green(attempted, task)
-                mark_done(plan_path, task)
+                mark_done(plan_path, task, notify=plan_changed)
                 done += 1
                 workspace.log_event(root, "investigation done")
                 notify(task)
@@ -4719,7 +4820,7 @@ def run_loop(root: Path, cfg, client, idx, plan_path: Path, *,
             failed += 1
             if stop_on_fail:
                 break
-            mark_failed(plan_path, task)
+            mark_failed(plan_path, task, notify=plan_changed)
             continue
 
         ok_edits = [r for r in tr.results if r.ok]
@@ -4750,7 +4851,7 @@ def run_loop(root: Path, cfg, client, idx, plan_path: Path, *,
                 failed += 1
                 if stop_on_fail:
                     break
-                mark_failed(plan_path, task)
+                mark_failed(plan_path, task, notify=plan_changed)
                 continue
             if tr.fabricated and task != _REMEDIATION_TITLE:
                 # The reply's only blocks were null edits and it did not
@@ -4779,7 +4880,7 @@ def run_loop(root: Path, cfg, client, idx, plan_path: Path, *,
                 failed += 1
                 if stop_on_fail:
                     break
-                mark_failed(plan_path, task)
+                mark_failed(plan_path, task, notify=plan_changed)
                 continue
             if (_is_noop(tr.reply) and task != _REMEDIATION_TITLE
                     and _is_verification_task(task)):
@@ -4801,7 +4902,7 @@ def run_loop(root: Path, cfg, client, idx, plan_path: Path, *,
                         # about the product: counted and marked exactly like
                         # the investigation path, and the plan carries on.
                         failed += 1
-                        mark_failed(plan_path, task)
+                        mark_failed(plan_path, task, notify=plan_changed)
                         repair_outcome.pop(task, None)
                         continue
                     if offer_remediation(task, tr, miss):
@@ -4816,7 +4917,7 @@ def run_loop(root: Path, cfg, client, idx, plan_path: Path, *,
                     failed += 1
                     if stop_on_fail:
                         break
-                    mark_failed(plan_path, task)
+                    mark_failed(plan_path, task, notify=plan_changed)
                     continue
             if _is_noop(tr.reply):
                 # "Already complete" is a CLAIM about the code, and prose
@@ -4853,7 +4954,7 @@ def run_loop(root: Path, cfg, client, idx, plan_path: Path, *,
                     failed += 1
                     if stop_on_fail:
                         break
-                    mark_failed(plan_path, task)
+                    mark_failed(plan_path, task, notify=plan_changed)
                     continue
                 print("  [model reports the task is already complete; "
                       "marking it done]", file=sys.stderr)
@@ -4863,7 +4964,7 @@ def run_loop(root: Path, cfg, client, idx, plan_path: Path, *,
                     # that retries next.
                     repair_outcome[pending_check.pop()] = False
                 mark_green(attempted, task)
-                mark_done(plan_path, task)
+                mark_done(plan_path, task, notify=plan_changed)
                 done += 1
                 continue
             print(f"  [task produced no applied edits -- {'stopping' if stop_on_fail else 'skipping'}]",
@@ -4872,7 +4973,7 @@ def run_loop(root: Path, cfg, client, idx, plan_path: Path, *,
             failed += 1
             if stop_on_fail:
                 break
-            mark_failed(plan_path, task)
+            mark_failed(plan_path, task, notify=plan_changed)
             continue
 
         if task == _REMEDIATION_TITLE and pending_check:
@@ -5129,7 +5230,7 @@ def run_loop(root: Path, cfg, client, idx, plan_path: Path, *,
             failed += 1
             if stop_on_fail:
                 break
-            mark_failed(plan_path, task)
+            mark_failed(plan_path, task, notify=plan_changed)
             continue
 
         miss = _evidence_failure(task, tr)
@@ -5147,7 +5248,7 @@ def run_loop(root: Path, cfg, client, idx, plan_path: Path, *,
             failed += 1
             if stop_on_fail:
                 break
-            mark_failed(plan_path, task)
+            mark_failed(plan_path, task, notify=plan_changed)
             continue
 
         if tr.applied and tr.changed:
@@ -5219,7 +5320,7 @@ def run_loop(root: Path, cfg, client, idx, plan_path: Path, *,
                       f"with the last gate round red", "WARN")
 
         mark_green(attempted, task)
-        mark_done(plan_path, task)
+        mark_done(plan_path, task, notify=plan_changed)
         done += 1
         workspace.log_event(root, f"task done ({done})")
         notify(task)
