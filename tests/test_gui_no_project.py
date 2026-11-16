@@ -294,7 +294,7 @@ def test_skills_list_draft_and_save_without_a_project(gui, monkeypatch):
 
     status, j = gui.get("/api/skills")
     assert status == 200 and j["ok"] is True
-    assert len(j["skills"]) == 17                 # every built-in is present
+    assert len(j["skills"]) == 18                 # every built-in is present
     assert all(r["scope"] == "bundled" for r in j["skills"])
 
     status, j = gui.post("/api/skills/draft",

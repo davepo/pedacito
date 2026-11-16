@@ -18,6 +18,9 @@ edit blocks, before anything is written:
   moved import  a moved file is still imported by its old path
   lost wiring   a whole-file replacement dropped imported-and-called names
                 that are still defined in the project
+  gui hazard    a Python GUI/game edit brings an import-time mainloop(), a
+                pack/grid collision, or an uninstalled third-party GUI
+                import (the first two hang or crash headless verification)
   citations     the prose cites `file:line` in files that were never read
   coverage      requirements extracted from the task that no edit or sentence
                 of the reply touches (a warning: heuristic); each requirement
@@ -59,7 +62,7 @@ from .edits import locate, parse_edits
 
 @dataclass
 class Finding:
-    kind: str                  # placeholder | unread | stale | import | lost_wiring | citation | coverage | model
+    kind: str                  # placeholder | unread | stale | import | lost_wiring | gui_hazard | citation | coverage | model
     severity: str              # "error" (fed to repair) | "warn"
     file: str
     message: str
@@ -461,6 +464,272 @@ def check_empty_js_tests(results) -> list[Finding]:
             "`describe(`/`suite(` invocation): `node --test` reports 0 "
             "tests and exits 0, so it verifies nothing. Add real test "
             "cases for the behavior it names."))
+    return out
+
+
+# --------------------------------------- desktop GUI / game hazards
+# A tkinter calculator or a pygame arcade ships import-time traps that hang
+# or crash headless verification: a top-level mainloop() (pytest never
+# returns), pack/grid mixed in one container (TclError at runtime), and a
+# third-party GUI import that is not installed (collection fails). All three
+# are cheap AST checks on the dry-applied buffer; only NEW hazards are
+# reported, so a file that already had them stays editable.
+
+_GUI_GAME_IMPORTS = frozenset({
+    "PyQt5", "PyQt6", "PySide2", "PySide6", "customtkinter", "wx", "kivy",
+    "pygame", "arcade",
+})
+_TRY_NODES = (ast.Try,) + ((ast.TryStar,) if hasattr(ast, "TryStar") else ())
+
+
+def _is_main_guard(node) -> bool:
+    """True for `if __name__ == "__main__":` (either operand order)."""
+    if not isinstance(node, ast.If):
+        return False
+    t = node.test
+    if not (isinstance(t, ast.Compare) and len(t.ops) == 1
+            and isinstance(t.ops[0], ast.Eq)):
+        return False
+    for a, b in ((t.left, t.comparators[0]), (t.comparators[0], t.left)):
+        if (isinstance(a, ast.Name) and a.id == "__name__"
+                and isinstance(b, ast.Constant) and b.value == "__main__"):
+            return True
+    return False
+
+
+def _toplevel_mainloops(tree) -> list[int]:
+    """Lines of .mainloop() calls that run at import time: module-level
+    statements outside any function/class definition and outside an
+    `if __name__ == "__main__":` body. A call inside a def is fine -- it
+    only runs when someone calls the def."""
+    hits: list[int] = []
+
+    def stmts(body, guarded):
+        for s in body:
+            if isinstance(s, (ast.FunctionDef, ast.AsyncFunctionDef,
+                              ast.ClassDef)):
+                continue
+            if isinstance(s, ast.If):
+                stmts(s.body, guarded or _is_main_guard(s))
+                stmts(s.orelse, guarded)      # the else runs at import
+                continue
+            if isinstance(s, _TRY_NODES):
+                stmts(s.body, guarded)
+                for h in s.handlers:
+                    stmts(h.body, guarded)
+                stmts(s.orelse, guarded)
+                stmts(s.finalbody, guarded)
+                continue
+            if isinstance(s, (ast.With, ast.AsyncWith, ast.For,
+                              ast.AsyncFor, ast.While)):
+                stmts(s.body, guarded)
+                stmts(getattr(s, "orelse", []), guarded)
+                continue
+            if guarded:
+                continue
+            for n in _walk_scope(s):
+                if (isinstance(n, ast.Call)
+                        and isinstance(n.func, ast.Attribute)
+                        and n.func.attr == "mainloop"):
+                    hits.append(n.lineno)
+
+    stmts(tree.body, False)
+    return hits
+
+
+def _walk_scope(scope):
+    """The nodes of one function/module scope (or one statement), without
+    descending into nested function/class/lambda bodies or generator
+    expressions -- those run later, not at import time."""
+    todo = list(ast.iter_child_nodes(scope))
+    while todo:
+        n = todo.pop()
+        yield n
+        if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef,
+                          ast.ClassDef, ast.Lambda, ast.GeneratorExp)):
+            continue
+        todo.extend(ast.iter_child_nodes(n))
+
+
+def _geometry_collisions(tree) -> list[tuple[int, str]]:
+    """(line, message) where one scope manages widgets with BOTH pack and
+    grid: the same widget variable calling both, or two children of the
+    same parent container split between the managers. Either crashes with
+    _tkinter.TclError at runtime."""
+    out: list[tuple[int, str]] = []
+    scopes = [tree] + [n for n in ast.walk(tree)
+                       if isinstance(n, (ast.FunctionDef,
+                                         ast.AsyncFunctionDef))]
+    for scope in scopes:
+        nodes = list(_walk_scope(scope))
+        # widget variable -> parent variable, from `w = Widget(parent, ...)`
+        parent: dict[str, str] = {}
+        for n in nodes:
+            if not (isinstance(n, ast.Assign)
+                    and isinstance(n.value, ast.Call)):
+                continue
+            call = n.value
+            fname = (call.func.attr if isinstance(call.func, ast.Attribute)
+                     else call.func.id if isinstance(call.func, ast.Name)
+                     else "")
+            if (fname[:1].isupper() and call.args
+                    and isinstance(call.args[0], ast.Name)):
+                for t in n.targets:
+                    if isinstance(t, ast.Name):
+                        parent[t.id] = call.args[0].id
+        # widget variable -> {manager: first line}
+        mgr: dict[str, dict[str, int]] = {}
+        for n in nodes:
+            if (isinstance(n, ast.Call)
+                    and isinstance(n.func, ast.Attribute)
+                    and n.func.attr in ("pack", "grid")
+                    and isinstance(n.func.value, ast.Name)):
+                mgr.setdefault(n.func.value.id, {}).setdefault(
+                    n.func.attr, n.lineno)
+        for var, used in sorted(mgr.items()):
+            if "pack" in used and "grid" in used:
+                out.append((max(used["pack"], used["grid"]), (
+                    f"widget '{var}' calls both .pack() (line "
+                    f"{used['pack']}) and .grid() (line {used['grid']}): "
+                    "tkinter raises TclError -- one geometry manager per "
+                    "widget.")))
+        by_parent: dict[str, dict[str, tuple[str, int]]] = {}
+        for var, used in mgr.items():
+            p = parent.get(var)
+            if not p:
+                continue
+            for method, line in used.items():
+                by_parent.setdefault(p, {}).setdefault(method, (var, line))
+        for p, used in sorted(by_parent.items()):
+            if "pack" not in used or "grid" not in used:
+                continue
+            (v1, l1), (v2, l2) = used["pack"], used["grid"]
+            if v1 == v2:
+                continue        # the same-widget case already flagged it
+            out.append((max(l1, l2), (
+                f"children of '{p}' mix geometry managers: '{v1}' packs "
+                f"(line {l1}), '{v2}' grids (line {l2}) -- TclError: cannot "
+                "use grid inside a container already managed by pack. Pick "
+                "ONE manager per container.")))
+    return out
+
+
+def _missing_gui_imports(tree, path, root=None,
+                         task: str = "") -> list[tuple[int, str]]:
+    """(line, library) for third-party GUI/game imports that are neither
+    installed in this interpreter nor declared in the project's
+    requirements.txt / pyproject.toml, and that the task did not ask for."""
+    wanted: dict[str, int] = {}
+    for n in ast.walk(tree):
+        if isinstance(n, ast.Import):
+            names = [a.name for a in n.names]
+        elif isinstance(n, ast.ImportFrom) and n.module and not n.level:
+            names = [n.module]
+        else:
+            continue
+        for name in names:
+            top = name.split(".")[0]
+            if top in _GUI_GAME_IMPORTS:
+                wanted.setdefault(top, n.lineno)
+    if not wanted:
+        return []
+    dirs = {Path(path or ".").parent}
+    if root:
+        dirs.add(Path(root))
+    declared = ""
+    for d in dirs:
+        for name in ("requirements.txt", "pyproject.toml"):
+            try:
+                declared += (d / name).read_text(
+                    encoding="utf-8").lower() + "\n"
+            except OSError:
+                pass
+    task_l = (task or "").lower()
+    out: list[tuple[int, str]] = []
+    import importlib.util
+    for lib, line in sorted(wanted.items(), key=lambda kv: kv[1]):
+        if re.search(rf"\b{re.escape(lib.lower())}\b", task_l):
+            continue                    # the user asked for this library
+        if lib.lower() in declared:
+            continue                    # the project intends to install it
+        try:
+            if importlib.util.find_spec(lib) is not None:
+                continue
+        except Exception:
+            continue                    # uncertain: never flag on a maybe
+        out.append((line, lib))
+    return out
+
+
+def check_python_gui_hazards(path, content, *, task: str = "",
+                             root=None) -> list[str]:
+    """Static hazard notes for one Python file's text (`path` only locates
+    the project's dependency manifests):
+
+    - a .mainloop() that runs at import time -- it hangs pytest and every
+      verification import indefinitely;
+    - pack/grid mixed on one widget or one parent's children -- TclError;
+    - a third-party GUI/game import that is not installed, not declared in
+      requirements.txt/pyproject.toml and not asked for by the task.
+
+    Each note starts with `line N:`. A buffer that does not parse is left
+    to the syntax gate. The optional `task`/`root` sharpen the import
+    check (a requested or declared library is never flagged)."""
+    text = content if isinstance(content, str) else ""
+    if not text.strip():
+        return []
+    try:
+        tree = ast.parse(text)
+    except (SyntaxError, ValueError, TypeError):
+        return []
+    out: list[str] = []
+    for line in _toplevel_mainloops(tree):
+        out.append(
+            f"line {line}: top-level .mainloop() runs at import time and "
+            "hangs pytest/verification indefinitely. Move it under "
+            "if __name__ == \"__main__\": and expose a testable class "
+            "(app.press(key) / game.step(dt)) headless tests can drive.")
+    for line, msg in _geometry_collisions(tree):
+        out.append(f"line {line}: {msg}")
+    for line, lib in _missing_gui_imports(tree, path, root=root, task=task):
+        out.append(
+            f"line {line}: imports '{lib}', which is not installed in this "
+            "Python environment and not declared in requirements.txt/"
+            "pyproject.toml. Prefer stdlib tkinter (tk.Canvas / styled "
+            f"ttk) or a zero-build HTML5 <canvas> unless the task asks "
+            f"for {lib}.")
+    return out
+
+
+def check_gui_hazards(results, root=None, task: str = "") -> list[Finding]:
+    """Findings for NEW GUI/game hazards in the dry-applied Python buffers
+    (check_python_gui_hazards): an import-time event loop or a pack/grid
+    collision is an error (it hangs or crashes headless verification), an
+    uninstalled third-party GUI import a warning nudging toward stdlib
+    tkinter or browser Canvas. Hazards the file already had stay quiet,
+    like the static gate."""
+    out: list[Finding] = []
+    for r in results or ():
+        if not getattr(r, "ok", False):
+            continue
+        if not str(getattr(r, "file", "")).lower().endswith(".py"):
+            continue
+        after = getattr(r, "after", None)
+        if after is None:
+            continue
+        before = getattr(r, "before", None) or ""
+        path = (Path(root) / str(r.file)) if root else r.file
+        old = {re.sub(r"^line \d+: ", "", m)
+               for m in check_python_gui_hazards(path, before, task=task,
+                                                 root=root)}
+        for msg in check_python_gui_hazards(path, after, task=task,
+                                            root=root):
+            if re.sub(r"^line \d+: ", "", msg) in old:
+                continue
+            m = re.match(r"^line (\d+):", msg)
+            severity = "warn" if "which is not installed" in msg else "error"
+            out.append(Finding("gui_hazard", severity, r.file, msg,
+                               line=int(m.group(1)) if m else 0))
     return out
 
 
@@ -2724,12 +2993,11 @@ def check(agent, task: str, reply: str, results, gathered: str = ""
         edits = parse_edits(reply)
         findings += check_syntax(results)
         cfg = getattr(agent, "cfg", None)
+        root = getattr(getattr(agent, "index", None), "root", None)
         if getattr(cfg, "static_gate", True):
-            findings += check_static(
-                results,
-                root=getattr(getattr(agent, "index", None), "root", None),
-                cfg=cfg)
+            findings += check_static(results, root=root, cfg=cfg)
             findings += check_static_js(results)
+            findings += check_gui_hazards(results, root=root, task=task)
         findings += check_placeholders(task, edits)
         findings += check_unread(agent, edits, results)
         findings += check_stale_references(agent, results)

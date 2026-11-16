@@ -399,12 +399,31 @@ _CREATIVE_CONTEXT_RE = re.compile(
     r"home[ -]page|bio|app|web|mockup|theme|hero"
     r")\b")
 
+# Desktop GUIs / interactive utilities and games / graphics carry the same
+# Builder craft as a web page: a tkinter calculator or a pygame arcade is
+# visual, interactive work, not a plain code task. Word boundaries keep "gui"
+# out of "guide" and "game" out of "gamut"; the framework names match their
+# versioned spellings too (PyQt6, PySide2).
+_GUI_KEYWORD_RE = re.compile(
+    r"(?i)\b(?:"
+    r"calculator|gui|tkinter|ttk|customtkinter|pyqt[56]?|pyside[26]?|"
+    r"wxpython|kivy|desktop[ -]?app|window|dialog|widget|keypad|"
+    r"button[ -]?grid|converter|timer|stopwatch|notepad|dashboard|visualizer"
+    r")\b")
+_GAME_KEYWORD_RE = re.compile(
+    r"(?i)\b(?:"
+    r"game|arcade|pygame|phaser|three\.js|webgl|sprite|tilemap|collision|"
+    r"particle|physics|asteroids|snake|breakout|tetris|pong|platformer|"
+    r"roguelike|chess|puzzle|score|hud|animation"
+    r")\b")
+
 
 def is_creative_or_design_task(task: str, target_files=None) -> bool:
     """True when the task is creative/visual work: it targets (or names) a UI
-    file, carries a strong design keyword, or asks to build/restructure a
-    web/design artifact. Used by `creative_auto` to pick the Builder persona
-    and by the whole-rewrite bypass. Word boundaries keep "ui" out of "build".
+    file, carries a strong design keyword, asks to build/restructure a
+    web/design artifact, or builds a desktop GUI / interactive utility or a
+    game. Used by `creative_auto` to pick the Builder persona and by the
+    whole-rewrite bypass. Word boundaries keep "ui" out of "build".
     """
     text = task or ""
     files = list(target_files or []) + _UI_FILE_RE.findall(text)
@@ -412,6 +431,8 @@ def is_creative_or_design_task(task: str, target_files=None) -> bool:
         if Path(str(f)).suffix.lower() in _CREATIVE_EXTS:
             return True
     if _CREATIVE_KEYWORD_RE.search(text):
+        return True
+    if _GUI_KEYWORD_RE.search(text) or _GAME_KEYWORD_RE.search(text):
         return True
     if _CREATIVE_BUILD_RE.search(text) and _CREATIVE_CONTEXT_RE.search(text):
         return True
@@ -449,6 +470,45 @@ _CREATIVE_PERSONA = (
     "cohesive visual system (spacing, type scale, color), responsive layout, "
     "and thoughtful micro-interactions. Prefer a bold, complete, polished "
     "result over a timid minimal patch when the task is creative or visual.")
+
+# Target-specific craft for the Builder brief: the persona above is written
+# for the web, so a desktop GUI or a game also gets the checklist that keeps
+# its output high-craft AND headless-testable (no import-time event loop).
+_GUI_CRAFT = """\
+Desktop GUI craft (tkinter/Qt/wx):
+- A cohesive dark or modern palette (ttk.Style theme or widget options) --
+  never the default 1995 Windows gray; clear, large display typography for
+  the readout and comfortable spacing.
+- Full keyboard bindings alongside mouse clicks: <Return>, <BackSpace>,
+  <Escape>, number and operator keys.
+- One geometry manager per container (never mix pack and grid); with grid,
+  set rowconfigure/columnconfigure weights so the window resizes cleanly.
+- Never block at import: mainloop() only under if __name__ == "__main__":,
+  behind a testable class (app.press(key)) a headless test can drive."""
+
+_GAME_CRAFT = """\
+Game craft (Canvas/pygame/terminal):
+- A clean loop: requestAnimationFrame in the browser, a fixed-timestep
+  update elsewhere; never a blocking loop at import -- guard it with
+  if __name__ == "__main__": and expose game.step(dt) for headless tests.
+- Responsive keyboard/mouse controls, a start -> playing -> game-over ->
+  restart state machine, and live score/HUD rendering.
+- Visual juice: smooth velocity, particle bursts or screen-shake on impact,
+  crisp contrast so every sprite reads against the background."""
+
+
+def creative_craft_directives(task: str) -> str:
+    """The craft checklist for a creative task's target: game work gets the
+    loop/state-machine/juice rules, desktop GUI work the palette/keyboard/
+    grid rules, web work '' (the Builder persona already covers it). A task
+    naming both reads as a game first -- its loop contract is the stricter
+    one."""
+    text = task or ""
+    if _GAME_KEYWORD_RE.search(text):
+        return _GAME_CRAFT
+    if _GUI_KEYWORD_RE.search(text):
+        return _GUI_CRAFT
+    return ""
 
 # creative_brief: swap the smallest-diff bullets for whole-file design freedom.
 # A phrase not present (a caller's own `full`, or the tiny pack) is left alone.
@@ -622,9 +682,13 @@ def wants_build_tools(task: str) -> bool:
 def static_site_rules(cfg, task: str) -> str:
     """The no-build-tool rule for a workspace without a package.json (''
     when one exists, the task asks for tooling, or there is no root).
-    answer_system only calls it for creative/design tasks; the deterministic
-    twin, verify.unrequested_build_creations, covers every other task."""
+    answer_system only calls it for creative/design tasks; a desktop GUI or
+    game task gets its own craft checklist instead of web CSS advice, and
+    the deterministic twin, verify.unrequested_build_creations, covers
+    every task."""
     if wants_build_tools(task):
+        return ""
+    if _GUI_KEYWORD_RE.search(task or "") or _GAME_KEYWORD_RE.search(task or ""):
         return ""
     root = getattr(cfg, "_root", None)
     if not root:
@@ -644,7 +708,9 @@ def answer_system(cfg, full_edit_format: str, task: str = "",
     tests also gets the value-bound rules -- they cost tokens, so they only
     ride along when tests are actually in play. A project or user override
     of `answer` replaces the whole brief. `creative` swaps in the Senior
-    Product Engineer & Visual Designer persona and the Builder edit brief."""
+    Product Engineer & Visual Designer persona and the Builder edit brief,
+    plus the target's craft checklist when the task is a desktop GUI or a
+    game (the web needs no extra rules -- the persona covers it)."""
     override = load_override(cfg, "answer")
     if override:
         return override
@@ -653,6 +719,10 @@ def answer_system(cfg, full_edit_format: str, task: str = "",
                "specific\nsource you asked to see. Complete the user's task.")
     text = persona + "\n\n" + edit_format(cfg, full_edit_format,
                                          creative=creative)
+    if creative:
+        craft = creative_craft_directives(task)
+        if craft:
+            text += "\n\n" + craft
     if wants_tests(task):
         text += "\n\n" + test_rules(cfg)
     # The static-site rule costs tokens, so like the test rules it only rides

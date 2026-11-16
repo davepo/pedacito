@@ -19,7 +19,7 @@ A skill is a markdown file with frontmatter:
 
 Search order (first name wins): `<root>/.pedacito/skills/<name>/SKILL.md` or
 `<root>/.pedacito/skills/<name>.md`, the same two layouts under
-`<config dir>/skills/`, then the bundled library of seventeen starters. The
+`<config dir>/skills/`, then the bundled library of eighteen starters. The
 catalog costs a few dozen tokens; a skill's text enters the conversation only
 when the model asks for it (or `select_skills` matches its triggers, capped at
 two skills / 1,200 chars so a prompt never bloats). Skills are PROMPT TEXT:
@@ -284,6 +284,23 @@ BUILTIN_SKILLS: dict[str, tuple[str, str, tuple[str, ...]]] = {
         ("website", "webpage", "landing page", "personal site", "bio",
          "portfolio", "styling", "modern", "sleek", "appealing", "css",
          "layout", "theme", "hero", "card")),
+    "desktop-gui-and-games": (
+        "Build desktop GUIs and 2D games that install nothing and never "
+        "hang headless tests",
+        "1. Zero install: no PyQt6/customtkinter/pygame unless "
+        "installed/asked; use stdlib tkinter (tk.Canvas/styled ttk) or "
+        "HTML5 <canvas>.\n"
+        "2. No top-level mainloop()/infinite while: guard if "
+        "__name__ == \"__main__\":; expose app.press(key)/game.step(dt) "
+        "for headless tests: simulate, verify, destroy() -- no hang.\n"
+        "3. Never mix .pack()/.grid() in one parent (TclError); set "
+        "rowconfigure/columnconfigure weights.\n"
+        "4. Dark palette; keys (<Return>/<BackSpace>/<Escape>) + mouse; "
+        "games: rAF/fixed-timestep loop, start/game-over/restart, HUD, "
+        "particle/shake juice.",
+        ("calculator", "tkinter", "pyqt", "pyside", "gui", "game", "pygame",
+         "arcade", "snake", "pong", "tetris", "breakout", "asteroids",
+         "sprite", "keypad")),
 }
 
 # Historical name kept for callers and drift guards that say "bundled".

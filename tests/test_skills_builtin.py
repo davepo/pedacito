@@ -22,11 +22,11 @@ NEW = {
 }
 
 
-def test_catalog_lists_all_seventeen_with_one_line_summaries(tmp_path):
+def test_catalog_lists_all_eighteen_with_one_line_summaries(tmp_path):
     cat = skills.catalog(tmp_path, Config(), limit=10000)
     for name in skills.BUNDLED:
         assert f"- {name}:" in cat
-    assert len(skills.names(tmp_path, Config())) == 17
+    assert len(skills.names(tmp_path, Config())) == 18
     # One line per skill: the body never leaks into the catalog.
     assert all(line.startswith("- ") for line in cat.splitlines()[1:])
     assert "SEARCH" not in cat
