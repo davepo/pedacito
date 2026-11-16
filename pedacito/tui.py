@@ -111,7 +111,7 @@ _TAB_PREFIX = {
     "/cre": "/creative ",
 }
 _SLASH_COMMANDS = [
-    "/help", "/keys", "/status", "/telemetry", "/auto", "/plan",
+    "/help", "/keys", "/status", "/telemetry", "/auto", "/auto!", "/plan",
     "/consolidate", "/compact", "/profile", "/profiles", "/model",
     "/auto-route", "/think", "/creative", "/apply", "/skills", "/memory", "/procs",
     "/diff", "/undo", "/reset", "/sidebar", "/scroll", "/mouse", "/clear",
@@ -152,6 +152,10 @@ Pedacito TUI commands
   /keys                     detailed keybindings and mouse modes
   /status  /telemetry       full telemetry table and per-call-site tokens
   /auto GOAL                plan GOAL, then run every task with live updates
+                            (single-pass edits get a Task-mode suggestion
+                            first; Enter/y accepts, n keeps Auto)
+  /auto! GOAL               force the multi-step Auto loop (skip the
+                            Task-mode suggestion)
   /plan [GOAL]              show PLAN.md, or generate it from GOAL
   /consolidate /compact     compact the session into a handoff checkpoint
   /profile [NAME]           list profiles, or switch to NAME
@@ -2033,6 +2037,45 @@ class TuiSession:
         self._record_result(task, holder.get("result"))
         self._redraw(force=True)
 
+    def _auto_with_nudge(self, goal: str) -> None:
+        """`/auto`: recommend single-pass Task mode for one-pass edits first.
+
+        Interactive sessions get the recommendation and a [Y/n] question
+        (default Yes, like the CLI nudge); headless/scripted sessions are
+        never blocked on an answer -- they log a note and keep Auto.
+        `/auto!` skips the check entirely."""
+        goal = " ".join(str(goal or "").split())
+        if not goal:
+            self._append("Usage: /auto <goal>", "error")
+            return
+        verdict = loop.evaluate_mode_suitability(goal, self.root, "auto")
+        if not verdict["mismatch"]:
+            self.run_auto(goal)
+            return
+        self._append("\U0001f4a1 This request looks better suited for "
+                     "single-pass Task mode than multi-step Auto mode:",
+                     "system")
+        self._append("   " + verdict["reason"], "system")
+        if not self.interactive:
+            self._append("note: continuing with Auto (non-interactive; "
+                         "use /auto! to force, or type the task plainly "
+                         "for one pass)", "system")
+            self.run_auto(goal)
+            return
+        question = "Run as a single-pass Task instead? [Y/n]:"
+        self._set_banner(question)
+        self._append(question, "activity")
+        self._redraw(force=True)
+        answer = self._read_answer_line()
+        self.input_buf = ""
+        self.cursor_pos = 0
+        self._set_banner("")
+        if (answer or "").strip().lower() in ("", "y", "yes"):
+            self._append("running as a single-pass Task", "system")
+            self.run_task(goal)
+        else:
+            self.run_auto(goal)
+
     def run_auto(self, goal: str) -> None:
         """`/auto`: generate or resume PLAN.md, then run the outer loop."""
         goal = " ".join(str(goal or "").split())
@@ -2156,6 +2199,9 @@ class TuiSession:
             self._append(f"max_steps = {n}", "system")
             return
         if cmd == "auto":
+            self._auto_with_nudge(arg)
+            return
+        if cmd == "auto!":
             self.run_auto(arg)
             return
         if cmd == "plan":

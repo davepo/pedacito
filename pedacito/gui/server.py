@@ -1020,6 +1020,22 @@ def _run_auto(q, body):
     return _run(q, {**body, "mode": "auto"})
 
 
+@post("/api/mode-check")
+def _mode_check(q, body):
+    """Deterministic Task-vs-Auto suitability check for the composer.
+
+    `{"text": ..., "mode": "auto"}` -> the classifier verdict
+    (`recommended_mode`, `mismatch`, `reason`). Synchronous and zero-LLM:
+    the GUI polls it (debounced) while the user types an Auto prompt, so it
+    must never claim the job slot."""
+    from .. import loop as loop_mod
+    text = str(body.get("text") or "")
+    mode = str(body.get("mode") or "auto")
+    requested = "ask" if mode in ("ask", "task") else "auto"
+    verdict = loop_mod.evaluate_mode_suitability(text, STATE.root, requested)
+    return 200, {"ok": True, **verdict}
+
+
 @post("/api/refactor/rename")
 def _refactor_rename(q, body):
     """Deterministic symbol rename: AST/tokenize, zero model tokens.

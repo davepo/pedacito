@@ -823,6 +823,42 @@ def _confirm_plan(plan_path) -> bool:
     return ans not in ("n", "no", "q")
 
 
+def _auto_mode_nudge(args, root: Path) -> bool:
+    """Task-vs-Auto suitability nudge for `pedacito auto -t ...`.
+
+    Returns True when the caller should run the prompt as a single-pass
+    Task (ask) instead of the multi-step loop. A TTY gets the recommendation
+    and a [Y/n] question (default Yes); a non-TTY stdin (CI pipe, automated
+    test) is NEVER blocked on input() -- it logs a one-line note and keeps
+    Auto. `--force-auto` / `--yes` bypass the check entirely."""
+    if getattr(args, "force_auto", False) or getattr(args, "yes", False):
+        return False
+    prompt = str(getattr(args, "task", None) or "").strip()
+    if not prompt:
+        return False
+    verdict = loop.evaluate_mode_suitability(prompt, root, "auto")
+    if not verdict["mismatch"]:
+        return False
+    if not sys.stdin.isatty():
+        print("\U0001f4a1 [pedacito] note: this looks like a single-pass "
+              "Task edit; continuing with Auto (run `pedacito ask` for one "
+              "pass, or --force-auto to silence this note).",
+              file=sys.stderr)
+        return False
+    print("\U0001f4a1 [pedacito] This request looks better suited for "
+          "single-pass Task mode than multi-step Auto mode:",
+          file=sys.stderr)
+    print(f"   {verdict['reason']}", file=sys.stderr)
+    try:
+        answer = input("Run as a single-pass Task instead? [Y/n]: ")
+    except EOFError:
+        return False
+    except KeyboardInterrupt:
+        print("\nCancelled.", file=sys.stderr)
+        raise SystemExit(130)
+    return answer.strip().lower() in ("", "y", "yes")
+
+
 def _wants_review(args, cfg) -> bool:
     """--review or config `review`, unless --no-review overrides it."""
     if getattr(args, "no_review", False):
@@ -2824,6 +2860,12 @@ def build_parser() -> argparse.ArgumentParser:
                              "pip-install it and retry (off by default)")
     p_auto.add_argument("--force", action="store_true",
                         help="regenerate the plan file, discarding the existing one")
+    p_auto.add_argument("--force-auto", dest="force_auto", action="store_true",
+                        help="skip the Task-vs-Auto suitability nudge and run "
+                             "the multi-step loop even for single-pass edits")
+    p_auto.add_argument("-y", "--yes", action="store_true",
+                        help="assume yes: skip interactive confirmations, "
+                             "including the Task-vs-Auto nudge")
 
     p_chat = sub.add_parser("chat", help="interactive session")
     _add_common(p_chat)
@@ -3698,6 +3740,17 @@ def _main(argv=None) -> int:
             # machine-client transport instead of the terminal REPL
             return _cmd_rpc(args, cfg, client, idx, root, locals_ref,
                             run, save_checkpoint, elog)
+
+        if args.cmd == "auto" and _auto_mode_nudge(args, root):
+            # The user accepted the nudge: run the very same prompt as a
+            # single-pass Task. `auto --plan FILE` is a checklist path, not
+            # the ask boolean, so reset the planning knobs before falling
+            # through to the ask branch (a true one-pass run, no PLAN.md).
+            args.cmd = "ask"
+            args.task = str(args.task).strip()
+            args.plan = False
+            args.no_plan = True
+            print("  [running as a single-pass Task (ask)]", file=sys.stderr)
 
         if args.cmd == "ask":
             ask_task = args.task

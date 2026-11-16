@@ -34,7 +34,10 @@ somebody opens the page:
     fill it, so the trap catches humans instead of bots;
   - a visible text/email input or textarea inside a ``<form>`` has no
     ``<label for>``, wrapping ``<label>`` or ``aria-label`` -- screen
-    readers announce an unnamed field.
+    readers announce an unnamed field;
+  - a stylesheet the page links carries raw ``@tailwind base`` /
+    ``components`` / ``utilities`` build directives -- the browser cannot
+    parse them, ignores the sheet and the page renders unstyled.
 
 Every check is regex-level on purpose: no JS parser, no execution, no
 network, no dependencies. That trades recall for speed, so the results are
@@ -124,6 +127,13 @@ _HREF_ATTR_RE = re.compile(r"""\bhref\s*=\s*(?:"([^"]*)"|'([^']*)')""", re.I)
 # and are skipped, their inner rules match on their own.
 _CSS_RULE_RE = re.compile(r"([^{}]+)\{([^{}]*)\}", re.S)
 _CSS_CLASS_RE = re.compile(r"\.([A-Za-z_][\w-]*)")
+# Uncompiled Tailwind build directives at the start of a line. A browser
+# cannot parse them: the whole linked sheet is ignored and the page renders
+# unstyled. (The Play CDN compiles utility classes at runtime; it never
+# processes a linked .css file, so its presence does not excuse them.)
+_TAILWIND_DIRECTIVE_RE = re.compile(
+    r"^[ \t]*@tailwind\s+(base|components|utilities)\b[ \t]*;?", re.M)
+_CSS_COMMENT_RE = re.compile(r"/\*.*?\*/", re.S)
 # Input types the honeypot check never flags: they are not fillable text
 # fields, so a trap marker on one is not a visible honeypot.
 _HONEYPOT_EXEMPT_TYPES = frozenset({"hidden", "submit", "button", "reset"})
@@ -527,6 +537,57 @@ def _form_input_findings(htmls, csss, root: Path) -> list[Finding]:
                 f"{ident} inside <form> has no label -- no <label for>, "
                 "wrapping <label>, or aria-label; screen readers announce "
                 "it as an unnamed field"))
+    return out
+
+
+def _tailwind_directive_findings(htmls, csss, root: Path) -> list[Finding]:
+    """Check 12: a stylesheet linked via <link rel="stylesheet"> carries raw
+    `@tailwind base/components/utilities` build directives. Those are input
+    for the Tailwind build step, not CSS: the browser cannot parse them,
+    ignores the sheet and the page renders unstyled. Only LINKED sheets are
+    flagged -- an unlinked source file may legitimately feed a PostCSS
+    build, and an inline `<style type="text/tailwindcss">` is the Play CDN's
+    own sanctioned input. One finding per directive line, peer = the page
+    that links the sheet, so editing either side surfaces it."""
+    css_texts = dict(csss)
+    out: list[Finding] = []
+    seen: set[tuple[str, int]] = set()
+    for rel, text in htmls:
+        for lm in _LINK_TAG_RE.finditer(text):
+            attrs = lm.group(1)
+            rm = _REL_ATTR_RE.search(attrs)
+            if not rm or "stylesheet" not in _first_group(rm).lower():
+                continue
+            hm = _HREF_ATTR_RE.search(attrs)
+            if not hm:
+                continue
+            href = _first_group(hm).strip().split("?")[0].split("#")[0]
+            css_rel, external = _resolve_src(root, rel, href)
+            if external:
+                continue
+            css = css_texts.get(css_rel)
+            if css is None:
+                continue
+            comments = [(m.start(), m.end())
+                        for m in _CSS_COMMENT_RE.finditer(css)]
+            for m in _TAILWIND_DIRECTIVE_RE.finditer(css):
+                if any(a <= m.start() < b for a, b in comments):
+                    continue        # a commented-out directive is inert
+                line = _line_of(css, m.start())
+                key = (css_rel, line)
+                if key in seen:
+                    continue        # two pages linking one sheet: one bug
+                seen.add(key)
+                out.append(Finding(
+                    css_rel, line,
+                    f"raw `@tailwind {m.group(1)}` build directive in the "
+                    f"stylesheet {rel} links -- browsers cannot parse it, "
+                    "so the sheet is ignored and the page renders unstyled; "
+                    "write standard browser-valid CSS in the linked "
+                    "stylesheet, or use the Tailwind CDN script "
+                    "(https://cdn.tailwindcss.com) with utility classes "
+                    "instead of raw @tailwind build directives",
+                    peer=rel))
     return out
 
 
@@ -1625,6 +1686,9 @@ def run(root, files: list[str] | None = None) -> list[Finding]:
 
     # --- check 11: unhidden honeypots and unlabelled form fields ------------
     findings.extend(_form_input_findings(htmls, csss, root))
+
+    # --- check 12: raw @tailwind directives in a linked stylesheet ----------
+    findings.extend(_tailwind_directive_findings(htmls, csss, root))
 
     # --- check 4: bare imports vs package.json ------------------------------
     deps = _pkg_deps(root)

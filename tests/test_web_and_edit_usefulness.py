@@ -1,5 +1,7 @@
 """D1-D4: file-deletion edits, removal-clause verification, stale-plan
-precedence, and the webcheck form-control notices.
+precedence, and the webcheck form-control notices. D5-D6: raw @tailwind
+directives in linked stylesheets, and trailing no-op verification items
+that tick done when the workspace is already green on disk.
 
 Each gap is pinned at the level it lives at: parse/apply for the DELETE
 syntax, the requirement machinery for fuzzy removals and stale checklists,
@@ -7,10 +9,13 @@ and regex-level webcheck fixtures for honeypots and unlabelled fields.
 """
 from __future__ import annotations
 
+import types
 from pathlib import Path
 
-from pedacito import (checkpoint, edits, memory, prompts, review, verify,
-                      webcheck, workspace)
+import pytest
+
+from pedacito import (checkpoint, edits, loop, memory, prompts, review,
+                      verify, webcheck, workspace)
 from pedacito import index as index_mod
 from pedacito.agent import EDIT_FORMAT, Agent
 from pedacito.config import Config
@@ -411,3 +416,186 @@ def test_exempt_and_non_text_input_types_are_not_label_checked(tmp_path):
        '<input type="password" name="pw">\n'
        "</form>\n")
     assert webcheck.run(tmp_path) == []
+
+
+# ----------------------- D5: raw @tailwind directives in a linked stylesheet
+def test_linked_stylesheet_with_raw_tailwind_directives_is_flagged(tmp_path):
+    """The live-run defect: index.html links styles.css, and styles.css is
+    the UNCOMPILED Tailwind input file. Browsers cannot parse `@tailwind`,
+    drop the sheet, and the page renders unstyled -- webcheck must say so,
+    and point at the fix (real CSS, or the Tailwind CDN script)."""
+    _w(tmp_path, "index.html",
+       '<!doctype html>\n<link rel="stylesheet" href="styles.css">\n'
+       "<h1>Jane Doe</h1>\n")
+    _w(tmp_path, "styles.css",
+       "@tailwind base;\n@tailwind components;\n@tailwind utilities;\n"
+       "body { margin: 0; }\n")
+    found = webcheck.run(tmp_path)
+    assert len(found) == 3
+    assert _hit(found, "styles.css", "@tailwind base", line=1)
+    assert _hit(found, "styles.css", "@tailwind components", line=2)
+    assert _hit(found, "styles.css", "@tailwind utilities", line=3)
+    assert all(f.peer == "index.html" for f in found)
+    assert all("browser-valid CSS" in f.message for f in found)
+    assert all("cdn.tailwindcss.com" in f.message for f in found)
+    # Editing either side of the contract surfaces the finding.
+    assert webcheck.run(tmp_path, files=["index.html"]) == found
+    assert webcheck.run(tmp_path, files=["styles.css"]) == found
+
+
+def test_tailwind_findings_dedupe_across_pages_and_skip_comments(tmp_path):
+    _w(tmp_path, "styles.css",
+       "/*\n@tailwind base;\n*/\n@tailwind utilities;\n")
+    _w(tmp_path, "index.html", '<link rel="stylesheet" href="styles.css">\n')
+    _w(tmp_path, "about.html",
+       '<link rel="stylesheet" href="/styles.css?v=2">\n')
+    found = webcheck.run(tmp_path)
+    # One directive line = one finding even with two pages linking it; the
+    # directive inside the block comment is inert, and the query string
+    # still resolves to the same sheet.
+    assert len(found) == 1
+    assert _hit(found, "styles.css", "@tailwind utilities", line=4)
+
+
+def test_browser_valid_css_and_unlinked_build_input_are_quiet(tmp_path):
+    _w(tmp_path, "index.html",
+       '<link rel="stylesheet" href="styles.css">\n<h1>Jane</h1>\n')
+    _w(tmp_path, "styles.css", "body { margin: 0; }\n.hero { padding: 2rem; }\n")
+    assert webcheck.run(tmp_path) == []
+    # A source file no page links may legitimately feed a PostCSS build.
+    _w(tmp_path, "src/input.css", "@tailwind base;\n@tailwind utilities;\n")
+    assert webcheck.run(tmp_path) == []
+    # The Play CDN's own inline input is not a linked stylesheet either.
+    _w(tmp_path, "cdn.html",
+       '<script src="https://cdn.tailwindcss.com"></script>\n'
+       '<style type="text/tailwindcss">@tailwind utilities;</style>\n')
+    assert not _hit(webcheck.run(tmp_path), needle="@tailwind")
+
+
+# ------------- D6: trailing no-op verification items tick done on green disk
+def _green_cfg() -> Config:
+    c = Config()
+    c.log_sessions = False
+    return c
+
+
+def test_noop_verify_prefixes_are_narrow():
+    for title in ("Verify the page renders",
+                  "Run the page and verify that the stylesheet loads",
+                  "Check that the hero section renders",
+                  "Test that the form submits"):
+        assert loop._is_noop_verify_item(title)
+    # Live checkpoints and edit tasks keep their full evidence gate.
+    for title in ("Run the game and verify the snake is taller",
+                  "Update the palette and verify in the browser",
+                  "Reproduce the black screen",
+                  "Fix the hero section"):
+        assert not loop._is_noop_verify_item(title)
+
+
+def test_planner_prompt_forbids_trailing_noop_verify_items():
+    assert "after EVERY edit task" in loop.PLAN_SYSTEM
+    assert "standalone re-check item" in loop.PLAN_SYSTEM
+    assert "Run tests / Verify the page" in loop.WEB_PLAN_NOTE
+
+
+def test_trailing_noop_verify_item_ticks_done_without_a_worker(
+        tmp_path, monkeypatch, capsys):
+    """The live-run defect: the plan ends with "Run the page and verify...",
+    the files already satisfy every check, and the item failed [!] because
+    the worker produced zero edits. With webcheck green on disk it must tick
+    [x] -- no worker session, no diff."""
+    _w(tmp_path, "index.html",
+       '<!doctype html>\n<link rel="stylesheet" href="styles.css">\n'
+       "<h1>Jane Doe</h1>\n")
+    _w(tmp_path, "styles.css", "body { margin: 0; }\n")
+    plan = tmp_path / "PLAN.md"
+    loop.write_plan(plan, "a one-page bio",
+                    ["Run the page and verify that the stylesheet loads "
+                     "and the hero renders"])
+    idx = types.SimpleNamespace(root=tmp_path)
+    monkeypatch.setattr(loop, "run_task",
+                        lambda *a, **k: pytest.fail("worker must not run"))
+    monkeypatch.setattr(
+        loop, "run_investigation_task",
+        lambda *a, **k: pytest.fail("worker must not run"))
+    code = loop.run_loop(tmp_path, _green_cfg(), None, idx, plan, apply=True)
+    assert code == 0
+    text = plan.read_text(encoding="utf-8")
+    assert "- [x] Run the page and verify" in text
+    assert "- [!]" not in text
+    err = capsys.readouterr().err
+    assert "no-op verification item" in err
+    log = workspace.run_log_path(tmp_path).read_text(encoding="utf-8")
+    assert "no-op verification item ticked done" in log
+
+
+def test_noop_verify_item_runs_the_verify_command_before_ticking(
+        tmp_path, monkeypatch):
+    _w(tmp_path, "index.html", "<h1>Jane Doe</h1>\n")
+    plan = tmp_path / "PLAN.md"
+    loop.write_plan(plan, "goal", ["Verify the page passes every check"])
+    idx = types.SimpleNamespace(root=tmp_path)
+    calls: list[str] = []
+    monkeypatch.setattr(
+        loop, "run_verify",
+        lambda root, cmd: calls.append(cmd) or (True, ""))
+    monkeypatch.setattr(loop, "run_investigation_task",
+                        lambda *a, **k: pytest.fail("worker must not run"))
+    code = loop.run_loop(tmp_path, _green_cfg(), None, idx, plan, apply=True,
+                         verify="pytest -q")
+    assert code == 0
+    assert calls == ["pytest -q"]        # the tests really ran and passed
+    assert "- [x] Verify the page passes every check" in \
+        plan.read_text(encoding="utf-8")
+
+
+def test_noop_verify_item_is_not_ticked_while_a_check_is_red(
+        tmp_path, monkeypatch):
+    """Green disk is the ONLY shortcut: a failing verify command (or a
+    webcheck finding) sends the item through the normal worker path."""
+    _w(tmp_path, "index.html", "<h1>Jane Doe</h1>\n")
+    plan = tmp_path / "PLAN.md"
+    loop.write_plan(plan, "goal", ["Verify the page passes every check"])
+    idx = types.SimpleNamespace(root=tmp_path)
+    monkeypatch.setattr(loop, "run_verify",
+                        lambda root, cmd: (False, "1 failed"))
+    seen: list[str] = []
+
+    def fake_investigate(root, cfg, agent, idx_, task, answer_system=None):
+        seen.append(task)
+        return loop.TaskResult([], "VERDICT: FAILED: the check is red",
+                               True, [], idx_)
+
+    monkeypatch.setattr(loop, "run_investigation_task", fake_investigate)
+    code = loop.run_loop(tmp_path, _green_cfg(), None, idx, plan, apply=True,
+                         verify="pytest -q", repair_rounds=0,
+                         stop_on_fail=False)
+    assert seen                          # the worker still ran the check
+    assert code == 1
+    assert "- [!] Verify the page passes every check" in \
+        plan.read_text(encoding="utf-8")
+
+
+def test_noop_verify_item_still_needs_evidence_without_web_files(
+        tmp_path, monkeypatch):
+    """An empty tree with no verify command has no objective gate to pass:
+    "Verify ..." keeps its live-evidence gate there (the frog-check rule)."""
+    plan = tmp_path / "PLAN.md"
+    loop.write_plan(plan, "goal",
+                    ["Verify the sprite by measured pixels in the live game"])
+    idx = types.SimpleNamespace(root=tmp_path)
+    seen: list[str] = []
+
+    def fake_investigate(root, cfg, agent, idx_, task, answer_system=None):
+        seen.append(task)
+        return loop.TaskResult(
+            [], "Verified: the sprite renders 180px tall.", True, [], idx_,
+            steps=["1. read main.js L195-230  (Check frames.)"])
+
+    monkeypatch.setattr(loop, "run_investigation_task", fake_investigate)
+    code = loop.run_loop(tmp_path, _green_cfg(), None, idx, plan, apply=True,
+                         repair_rounds=0, stop_on_fail=False)
+    assert seen                          # no free tick on a vacuous pass
+    assert code == 1
+    assert "- [!] Verify the sprite" in plan.read_text(encoding="utf-8")

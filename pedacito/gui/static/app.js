@@ -322,7 +322,11 @@ const S = {
         diffMode: localStorage.getItem('pedacito_diff_mode') || 'split',
         view: 'chat', folds: {}, planEditing: false, pendingProfile: null,
         refining: false, previousPrompt: null, switchingProfile: false,
-        actionBusy: false, planGenerating: false, planGenFrom: null },
+        actionBusy: false, planGenerating: false, planGenFrom: null,
+        // Task-vs-Auto suitability: the debounced /api/mode-check verdict for
+        // the current Auto draft, the pre-run confirmation bar, and the draft
+        // text the user already acknowledged with "Continue with Auto".
+        modeCheck: null, modeConfirm: null, autoAck: null },
   peek: null,
   how: { query: '', answer: null, loading: false, error: '', useModel: true },
 };
@@ -411,20 +415,28 @@ function termFeed(text) {                 // batch raw SSE terminal traffic
 }
 
 // ------------------------------------------------------------- run modes ------
+// Each mode carries a `title` tooltip and a one-line `hint` under the mode
+// selector so Task (one pass) vs Auto (plan + per-item loop) is unmistakable.
+const PLAN_HINT = 'Generates or updates PLAN.md without editing code yet.';
 const MODES = {
   task: { label: 'Task/Edit', send: 'Run',
-    hint: 'Describe a change. Pedacito looks things up, edits, and shows you the diff.',
+    title: 'Task (ask): single-pass edit \u2014 one turn reads and applies your whole prompt',
+    hint: 'Single-pass edit \u2014 reads & applies all parts of your prompt together in 1 turn (best for tweaking 1\u20133 files, HTML/CSS, & bug fixes).',
     ph: 'e.g. make the sync client retry three times and update its callers\u2026' },
   explain: { label: 'Ask', send: 'Ask',
+    title: 'Ask: read-only questions about the code \u2014 nothing is written',
     hint: 'Ask how the code works. Read-only \u2014 nothing is written.',
     ph: 'e.g. how does the sync client retry?' },
   auto: { label: 'Auto', send: 'Apply & run',
-    hint: 'Give a goal. Pedacito plans a checklist, then applies and verifies each change automatically. Tick \u201cPlan only\u201d in Options to review the plan first. By using Auto mode you accept the tool trust boundary: it may write files and run commands in this project.',
+    title: 'Auto: autonomous multi-step loop \u2014 PLAN.md checklist, a separate turn + test check per item',
+    hint: 'Autonomous multi-step loop \u2014 splits big goals into a PLAN.md checklist and runs a separate turn + test check per item (best for large multi-file features). Tick \u201cPlan only\u201d in Options to review the plan first. By using Auto mode you accept the tool trust boundary: it may write files and run commands in this project.',
     ph: 'e.g. add CSV export to the report page, with tests' },
   'new': { label: 'New', send: 'Create',
-    hint: 'Describe a project to start from scratch in a new folder.',
+    title: 'New: scaffold a brand-new project in a target directory',
+    hint: 'Scaffolds a brand-new project in a target directory.',
     ph: 'e.g. a CLI todo manager with sqlite storage and a --json flag' },
   how: { label: 'How ?', send: 'Ask',
+    title: 'How: help about pedacito itself \u2014 CLI commands, GUI features, settings',
     hint: 'Ask how to do anything in the CLI or where a setting/feature lives in the GUI. Answers stay out of your coding thread and work even before a model is configured.',
     ph: 'e.g. how do I disable thinking?' }
 };
@@ -891,7 +903,60 @@ function openSetting(name) {
   callSettings({ tab: 'all', search: name });
 }
 
-function send() {
+// ---- Task-vs-Auto suitability: live banner + pre-run choice ------------------
+// While Auto is selected, a debounced POST /api/mode-check classifies the
+// draft (the same deterministic helper the CLI/TUI nudge uses). A mismatch
+// shows a clickable banner; clicking Run on a mismatched prompt opens the
+// "Run as a single-pass Task instead?" confirmation unless the user already
+// chose "Continue with Auto" for this exact draft.
+let modeCheckTimer = 0;
+function scheduleModeCheck(text) {
+  clearTimeout(modeCheckTimer);
+  const trimmed = (text || '').trim();
+  if (S.ui.modeConfirm && S.ui.modeConfirm.text !== trimmed) {
+    S.ui.modeConfirm = null;               // editing the draft drops the choice
+    emit();
+  }
+  if (S.mode !== 'auto' || !trimmed) {
+    if (S.ui.modeCheck) { S.ui.modeCheck = null; emit(); }
+    return;
+  }
+  modeCheckTimer = setTimeout(() => {
+    PDC.api('/api/mode-check', { text: trimmed, mode: 'auto' }).then((j) => {
+      if (S.mode !== 'auto' || (S.drafts.auto || '').trim() !== trimmed) return;
+      S.ui.modeCheck = { text: trimmed, mismatch: !!j.mismatch,
+                         reason: j.reason || '' };
+      if (!j.mismatch) S.ui.autoAck = null;
+      emit();
+    }, () => {});
+  }, 350);
+}
+function carryDraftToTask() {
+  const text = S.drafts.auto || '';
+  S.drafts.task = text;
+  S.drafts.auto = '';
+  S.ui.modeCheck = null; S.ui.modeConfirm = null; S.ui.autoAck = null;
+  S.mode = 'task';
+  try { localStorage.setItem('pedacito_mode', 'task'); } catch (e) {}
+  writeDraft(text);
+  if (inputEl) inputEl.value = text;
+  emit();
+}
+function switchToTaskMode() { carryDraftToTask(); }
+function runAsTaskFromConfirm() {
+  const text = S.ui.modeConfirm ? S.ui.modeConfirm.text : (S.drafts.auto || '');
+  S.drafts.auto = text;
+  carryDraftToTask();
+  send();                                  // runs immediately in Task mode
+}
+function runAutoAnyway() {
+  S.ui.autoAck = S.ui.modeConfirm ? S.ui.modeConfirm.text : (S.drafts.auto || '').trim();
+  S.ui.modeConfirm = null;
+  emit();
+  send(true);                              // POST /api/auto with force_auto
+}
+
+async function send(forceAuto) {
   const s = S.status, j = s.job;
   const text = (S.drafts[S.mode] || '').trim();
   if (S.mode === 'how') {
@@ -931,8 +996,36 @@ function send() {
   if (S.mode === 'auto') {
     body.plan_only = !!body.plan_only;
     body.apply = !body.plan_only;      // Auto applies unless Plan only is ticked
+    // Pre-run choice: a single-pass-looking prompt gets the Task-vs-Auto
+    // confirmation before the multi-step loop starts (skip it when the user
+    // already chose "Continue with Auto", forced Auto, or just wants a plan).
+    if (!body.plan_only && !forceAuto && S.ui.autoAck !== text) {
+      let mc = S.ui.modeCheck;
+      if (!mc || mc.text !== text) {
+        try {
+          const j = await PDC.api('/api/mode-check', { text: text, mode: 'auto' });
+          mc = { text: text, mismatch: !!j.mismatch, reason: j.reason || '' };
+          S.ui.modeCheck = mc;
+        } catch (e) { mc = null; }
+      }
+      if (mc && mc.mismatch) {
+        S.ui.modeConfirm = { text: text, reason: mc.reason };
+        emit();
+        return;
+      }
+    }
+    if (forceAuto) body.force_auto = true;
   }
-  PDC.startRun(body).then((r) => {
+  // "Run Auto Anyway" addresses the Auto alias directly with force_auto:true;
+  // every other run goes through the shared /api/run starter.
+  const starter = (S.mode === 'auto' && forceAuto)
+    ? PDC.api('/api/auto', body).then((j) => {
+        if (!j.ok) PDC.toast(j.detail || 'could not start', true);
+        refreshState();
+        return j;
+      })
+    : PDC.startRun(body);
+  starter.then((r) => {
     if (r.ok) {
       S.drafts[S.mode] = '';
       if (inputEl) inputEl.value = '';
@@ -2735,11 +2828,20 @@ function Composer() {
       S.opts.new.project = s.suggested_new_project || '';
     }
     S.ui.previousPrompt = null;
+    S.ui.modeConfirm = null;               // a mode switch drops the choice
+    if (k !== 'auto') S.ui.modeCheck = null;
+    else scheduleModeCheck(S.drafts.auto || '');
     try { localStorage.setItem('pedacito_mode', k); } catch (e) {}
     writeDraft(S.drafts[k] || '');
     S.ui.optsOpen = false;
     emit();
   };
+  const autoText = (S.drafts.auto || '').trim();
+  const nudge = S.mode === 'auto' && !j && S.ui.modeCheck
+    && S.ui.modeCheck.mismatch && S.ui.modeCheck.text === autoText
+    && S.ui.autoAck !== autoText;
+  const planning = (S.mode === 'auto' && !!opt('auto', 'plan_only'))
+    || (S.mode === 'task' && opt('task', 'plan') === 'always');
   return html`
     <div id="composer"
          ondragenter=${(e) => { e.preventDefault(); e.currentTarget.classList.add('drop'); }}
@@ -2749,9 +2851,25 @@ function Composer() {
       <div class="composer-resizer"
            title="Drag to resize composer (double-click to toggle expand/compact)"
            onMousedown=${dragComposer} onDblclick=${toggleComposer}></div>
+      ${S.ui.modeConfirm ? html`
+        <div id="modeConfirm" role="alertdialog" aria-label="Run as a single-pass Task instead?">
+          <b>Run as a single-pass Task instead?</b>
+          <span class="muted">Task mode applies all clauses in one fast pass without creating a 7-step PLAN.md.${S.ui.modeConfirm.reason ? ' ' + S.ui.modeConfirm.reason : ''}</span>
+          <span class="modeConfirmBtns">
+            <button class="small primary" onClick=${runAsTaskFromConfirm}>Run as Task (Recommended)</button>
+            <button class="small" onClick=${runAutoAnyway}>Run Auto Anyway</button>
+          </span>
+        </div>` : (nudge ? html`
+        <div id="modeNudge" role="status">
+          <span>\uD83D\uDCA1 Looks like a single-pass edit \u2014</span>
+          <button class="small primary" onClick=${switchToTaskMode}>Switch to Task mode (Recommended)</button>
+          <button class="small ghost" title="Keep Auto mode for this prompt"
+                  onClick=${() => { S.ui.autoAck = autoText; emit(); }}>Continue with Auto</button>
+        </div>` : null)}
       <div id="modeTabs">
         ${MODE_ORDER.map((k) => html`
-          <button key=${k} class=${k === S.mode ? 'on' : ''} onClick=${() => setMode(k)}>${MODES[k].label}</button>`)}
+          <button key=${k} class=${k === S.mode ? 'on' : ''} title=${MODES[k].title}
+                  onClick=${() => setMode(k)}>${MODES[k].label}</button>`)}
       </div>
       <p id="modeHint">
         ${!s.root && (S.mode === 'task' || S.mode === 'auto') ? 'Open a project first. ' : null}
@@ -2765,6 +2883,7 @@ function Composer() {
               <button class="small" disabled=${!!j} onClick=${() => buildIndex(false)}>Quick (no summaries)</button>`
           : m.hint}
       </p>
+      ${planning ? html`<p id="planHint" title=${PLAN_HINT}>${PLAN_HINT}</p>` : null}
       ${S.mode === 'new' ? html`<div id="newProjectRow">
         <label for="newProjectPath">Target directory for new project</label>
         <input id="newProjectPath" type="text" spellcheck="false" autocomplete="off"
@@ -2796,6 +2915,7 @@ function Composer() {
                 disabled=${!!j && !steerable && !isHow}
                 oninput=${(e) => { S.drafts[S.mode] = e.target.value;
                   writeDraft(e.target.value);       // F5 must not lose it
+                  scheduleModeCheck(e.target.value);
                   const rb = $('refineBtn');
                   if (rb) rb.disabled = S.ui.refining || !e.target.value.trim(); }}
                 onkeydown=${(e) => { if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) { e.preventDefault(); send(); } }} />
@@ -2845,7 +2965,7 @@ function OptField(props) {
       ${o.opts.map((x) => html`<option key=${x[0]} value=${x[0]}>${x[1]}</option>`)}
     </select>`;
   } else if (o.type === 'check') {
-    return html`<label class="chk"><input type="checkbox" checked=${!!val}
+    return html`<label class="chk" title=${o.k === 'plan_only' ? PLAN_HINT : null}><input type="checkbox" checked=${!!val}
                    onchange=${(e) => set(e.target.checked)} />${o.label}</label>`;
   } else if (o.type === 'number') {
     el = html`<input type="number" min="0" defaultValue=${String(val == null ? '' : val)}

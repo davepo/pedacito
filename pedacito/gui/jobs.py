@@ -908,7 +908,10 @@ def run_auto(job: Job, opts: dict) -> None:
         max_minutes=_int_or_none(opts.get("max_minutes")),
         keep_going=bool(opts.get("keep_going")),
         auto_install=bool(opts.get("auto_install")),
-        force=bool(opts.get("force")))
+        force=bool(opts.get("force")),
+        # The GUI's pre-run choice: "Run Auto Anyway" confirms the multi-step
+        # loop for a single-pass-looking prompt (the CLI's --force-auto).
+        force_auto=bool(opts.get("force_auto")))
     with STATE.lock:
         STATE.last_auto = {"text": opts.get("text", ""), "plan_file": plan_file}
     cfg, client, root = p.cfg, p.client, p.root

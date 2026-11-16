@@ -724,6 +724,22 @@ resumed run hands back to each task. Useful flags:
 - `--strict` exits with status 1 if a task applied edits but left a failed edit or
   failing tests, which is useful in CI.
 - `--refine` expands a one-line goal into a full spec before planning.
+- `--force-auto` skips the Task-vs-Auto suitability nudge (below); `-y`/`--yes`
+  does the same and accepts other confirmations.
+
+**Single-pass edits get a nudge.** When the goal looks like one-pass Task work
+(it targets 1–2 existing files, uses localized edit verbs like `fix`, `restyle`
+or `rename`, or tweaks content/styling in a tiny project), `auto` asks
+`Run as a single-pass Task instead? [Y/n]` before building a multi-step
+`PLAN.md`. Enter or `y` runs the whole prompt as one fast `ask` pass; `n` keeps
+the Auto loop. Pipes and CI are never blocked on the question — they get a
+one-line note and Auto proceeds. Prompts that say "multi-step plan",
+"create a plan", "from scratch", or name ≥4 new files/modules always keep Auto.
+In the TUI the same choice appears on `/auto GOAL` (`/auto! GOAL` forces the
+loop); in the GUI a "💡 Looks like a single-pass edit" banner offers
+**Switch to Task mode (Recommended)**, and clicking Run on such a prompt asks
+**Run as a single-pass Task instead?** with **Run as Task (Recommended)** /
+**Run Auto Anyway** buttons.
 
 A repair round that makes the check worse is rolled back automatically, and that
 task is marked failed. An unattended run cannot compound the damage. A repair
@@ -777,8 +793,9 @@ optional SGR wheel capture, and `/mouse off` restores native selection.
 live bottom. A scrolled-back view shows `[ ↑ Scrolled back N lines ... ]` and
 stays stationary as new log lines arrive.
 
-Type a task as usual, or use `/help`, `/keys`, `/status`, `/auto GOAL`,
-`/plan`, `/consolidate`, `/profile`, `/auto-route`, `/think`,
+Type a task as usual, or use `/help`, `/keys`, `/status`, `/auto GOAL`
+(single-pass edits get a Task-mode suggestion first; `/auto! GOAL` forces the
+multi-step loop), `/plan`, `/consolidate`, `/profile`, `/auto-route`, `/think`,
 `/creative [on|off|auto]` (design mode: on = every task, auto = detect design
 tasks, off = surgical edits), `/apply`,
 `/skills`, `/memory`, `/procs`, `/diff`, `/undo`, `/reset`, `/sidebar`,

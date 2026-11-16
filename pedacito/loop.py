@@ -25,6 +25,7 @@ import sys
 import time
 from dataclasses import dataclass, field, replace
 from pathlib import Path
+from typing import Any
 
 from . import diagnostics, events as events_mod, hooks as hooks_mod
 from . import fileio
@@ -245,6 +246,56 @@ _VERIFY_WORDS = re.compile(
 def _is_verification_task(task: str) -> bool:
     """True for a task whose title asks to verify/confirm/observe behavior."""
     return bool(_VERIFY_WORDS.search((task or "").lower()))
+
+
+# Plan items that only re-run checks the loop already performs after every
+# edit task. Live runs on static sites kept ending the plan with "Run the
+# page and verify ..." / "Verify the page renders": the worker finds nothing
+# to edit, and the zero-edit/evidence gates then fail the item ([!]) even
+# though the workspace is already green. When the disk evidence below
+# confirms it, such an item is ticked done without a worker session or a
+# diff. Narrow leading phrases on purpose: "Run the GAME and verify ..."
+# stays a live checkpoint with its full evidence gate.
+_NOOP_VERIFY_PREFIXES = (
+    "verify ",
+    "run the page and verify",
+    "check that ",
+    "test that ",
+)
+
+
+def _is_noop_verify_item(task: str) -> bool:
+    """True for a checklist item that only re-checks what the loop's
+    per-task verification already covers."""
+    return (task or "").strip().lower().startswith(_NOOP_VERIFY_PREFIXES)
+
+
+def _noop_verify_already_green(root: Path, task: str, verify: str) -> bool:
+    """Objective disk evidence that a no-op verification item is already
+    satisfied: webcheck finds nothing, the configured verify command (the
+    tests) passes, and no requirement of the title is still owed on disk.
+    At least one real gate must have run and passed: a tree with no web
+    files and no verify command proves nothing, so the item keeps its
+    normal evidence gate there."""
+    from . import verify as verify_mod, webcheck
+    try:
+        if webcheck.run(root):
+            return False
+        htmls, jss, _csss = webcheck._collect(root)
+    except Exception:
+        return False
+    gate_ran = bool(htmls or jss)
+    if verify:
+        ok, _out = run_verify(root, verify)
+        if not ok:
+            return False
+        gate_ran = True
+    if not gate_ran:
+        return False
+    try:
+        return not verify_mod.unmet_requirements(root, task, [])
+    except Exception:
+        return False
 
 
 def _task_title(task: str) -> str:
@@ -485,6 +536,172 @@ def _lint_plan_titles(root: Path, plan_path: Path) -> None:
             workspace.log_event(
                 root, f"plan title bundles edits ({', '.join(verbs)}): "
                       f"{title[:80]}", "WARN")
+
+
+# ------------------------------------------- Task-vs-Auto suitability ------
+# A deterministic, zero-LLM check that keeps a one-pass edit out of the
+# multi-step Auto loop. The CLI/TUI ask before converting; the GUI shows a
+# live banner and a pre-run choice. Deliberately conservative: only obvious
+# single-pass work is flagged, and an explicit planning/architecture ask
+# always keeps Auto.
+
+_MODE_OVERRIDE_PHRASES = ("multi-step plan", "multi step plan",
+                          "create a plan", "from scratch")
+
+# Localized edit verbs: a prompt built around these is one cohesive pass,
+# not a plan-and-verify loop. Bare "add" is too broad (scaffolding asks use
+# it constantly), so only the content-level phrases count.
+_MODE_EDIT_VERBS_RE = re.compile(
+    r"(?<!\w)(?:remove|delete|change|replace|stack|move|rename|tweak|fix|"
+    r"hide|update|restyle|convert)(?![\w-])"
+    r"|(?<!\w)add\s+(?:a|an|the\s+)?(?:heading|link)(?![\w-])")
+
+# Words naming a module/subsystem of a NEW application. Two or more next to
+# a build verb read as an architecture ask; four or more override the nudge
+# outright.
+_MODE_MODULE_WORDS = (
+    "backend", "frontend", "middleware", "database", "migration", "auth",
+    "authentication", "cli", "api", "endpoint", "service", "worker",
+    "scheduler", "dashboard", "plugin", "microservice", "module",
+    "test suite", "pytest suite", "unittest suite",
+)
+_MODE_BUILD_VERBS_RE = re.compile(
+    r"(?<!\w)(?:build|create|scaffold|implement|develop|architect|design|"
+    r"set\s+up|write)(?![\w-])")
+
+# A filename-shaped token: `index.html`, `src/app.py`, `input.css`.
+_MODE_FILE_TOKEN_RE = re.compile(r"[A-Za-z0-9_./\\-]+\.[A-Za-z0-9]{1,6}")
+_MODE_FILE_EXTS = {
+    ".py", ".js", ".mjs", ".cjs", ".jsx", ".ts", ".tsx", ".html", ".htm",
+    ".css", ".scss", ".sass", ".less", ".vue", ".svelte", ".json", ".toml",
+    ".yaml", ".yml", ".md", ".sql", ".sh", ".rb", ".go", ".rs", ".java",
+    ".c", ".cpp", ".h", ".txt",
+}
+# Source files counted for the tiny-project rule (docs/config alone do not
+# make a project "big").
+_MODE_SOURCE_EXTS = {
+    ".py", ".js", ".mjs", ".cjs", ".jsx", ".ts", ".tsx", ".html", ".htm",
+    ".css", ".scss", ".sass", ".less", ".vue", ".svelte", ".rb", ".go",
+    ".rs", ".java", ".c", ".cpp", ".h", ".sh",
+}
+_MODE_CONTENT_WORDS_RE = re.compile(
+    r"(?<!\w)(?:content|styling|style|styles|css|color|colors|colour|"
+    r"colours|font|fonts|heading|headings|layout|wording|copy|margin|"
+    r"padding|palette|theme|spacing|typography)(?![\w-])")
+_MODE_SCAFFOLD_RE = re.compile(
+    r"(?<!\w)(?:scaffold|backend|test\s+suite|pytest|unittest|boilerplate|"
+    r"new\s+project|api\s+server|database\s+schema|from\s+scratch)(?![\w-])")
+
+
+def _mode_check_files(root: Path | None) -> list[str]:
+    """Non-ignored source files under root (relative paths, bounded)."""
+    if root is None:
+        return []
+    root = Path(root)
+    if not root.is_dir():
+        return []
+    from . import spec as spec_mod      # lazy: shared skip-list, no cycle
+    out: list[str] = []
+    stack = [root]
+    while stack and len(out) < 400:
+        d = stack.pop()
+        try:
+            entries = sorted(d.iterdir(), key=lambda p: p.name.lower())
+        except OSError:
+            continue
+        for e in entries:
+            if e.is_dir():
+                if not spec_mod._skip_dir(e.name):
+                    stack.append(e)
+            elif e.is_file() and e.suffix.lower() in _MODE_SOURCE_EXTS:
+                out.append(e.relative_to(root).as_posix())
+                if len(out) >= 400:
+                    break
+    return sorted(out)
+
+
+def _mode_file_mentions(text: str) -> list[str]:
+    """Distinct filename-shaped tokens with a known source/doc extension."""
+    seen: list[str] = []
+    for m in _MODE_FILE_TOKEN_RE.finditer(text):
+        tok = m.group(0).strip("./\\")
+        if "." not in tok:
+            continue
+        ext = "." + tok.rsplit(".", 1)[-1].lower()
+        if ext in _MODE_FILE_EXTS and tok not in seen:
+            seen.append(tok)
+    return seen
+
+
+def _mode_module_hits(low: str) -> set[str]:
+    hits: set[str] = set()
+    for word in _MODE_MODULE_WORDS:
+        if " " in word:
+            if word in low:
+                hits.add(word)
+        elif re.search(rf"(?<!\w){re.escape(word)}(?![\w-])", low):
+            hits.add(word)
+    return hits
+
+
+def evaluate_mode_suitability(
+    task: str,
+    root: Path | None,
+    requested_mode: str = "auto",
+) -> dict[str, Any]:
+    """Deterministic Task-vs-Auto suitability check (zero LLM calls).
+
+    Returns ``{"recommended_mode": "ask"|"auto", "mismatch": bool,
+    "reason": str}``. ``mismatch`` is True only when Auto was requested but
+    the prompt reads as a single-pass Task edit: it targets 1-2 existing
+    files or uses localized edit verbs without an architecture ask, or the
+    project is tiny (<=5 non-ignored source files) and the prompt modifies
+    existing content/styling rather than scaffolding. An explicit planning
+    ask ("multi-step plan", "create a plan", "from scratch") or >=4 distinct
+    new files/modules always keeps Auto.
+    """
+    requested = "ask" if str(requested_mode).lower() in ("ask", "task") \
+        else "auto"
+    verdict: dict[str, Any] = {"recommended_mode": requested,
+                               "mismatch": False, "reason": ""}
+    text = str(task or "").strip()
+    if requested != "auto" or not text:
+        return verdict
+    low = text.lower()
+    files = _mode_check_files(root)
+    basenames = {f.rsplit("/", 1)[-1] for f in files}
+    mentions = _mode_file_mentions(text)
+    existing = [t for t in mentions
+                if t in files or t.rsplit("/", 1)[-1] in basenames]
+    new_files = [t for t in mentions if t not in existing]
+    modules = _mode_module_hits(low)
+    builds = bool(_MODE_BUILD_VERBS_RE.search(low))
+    # Explicit overrides: the user asked for planning or a big new build.
+    if any(p in low for p in _MODE_OVERRIDE_PHRASES):
+        return verdict
+    if len(new_files) >= 4 or (builds and len(modules) >= 4):
+        return verdict
+    architecture = builds and len(modules) >= 2
+    reason = ""
+    if not architecture:
+        if 1 <= len(existing) <= 2:
+            reason = ("This prompt targets existing files and can be "
+                      "applied in one cohesive pass (~20s) in Task mode "
+                      "instead of spinning up a multi-step PLAN.md.")
+        elif _MODE_EDIT_VERBS_RE.search(low):
+            reason = ("This looks like a localized edit that Task mode can "
+                      "apply in one cohesive pass (~20s), instead of "
+                      "spinning up a multi-step PLAN.md.")
+    if not reason and len(files) <= 5 \
+            and not _MODE_SCAFFOLD_RE.search(low) \
+            and (_MODE_EDIT_VERBS_RE.search(low)
+                 or _MODE_CONTENT_WORDS_RE.search(low)):
+        reason = (f"This project has only {len(files)} source file(s), so a "
+                  "single-pass Task edit (~20s) fits better than a "
+                  "multi-step PLAN.md loop.")
+    if reason:
+        verdict.update(recommended_mode="ask", mismatch=True, reason=reason)
+    return verdict
 
 
 def read_plan(path: Path) -> list[str]:
@@ -748,8 +965,11 @@ plan only visual craft (typography, spacing, colour, cards, buttons, link
 badges, responsive layout). Forbid invented sections and boilerplate: no fake
 contact forms, no mobile hamburger toggle on a one-page bio with two links, no
 dummy JavaScript, no unrequested README.md deployment manual, no rigid
-accessibility-test checklist. A no-build site gets complete CSS -- never raw
-`@tailwind` directives unless the page loads the Tailwind CDN."""
+accessibility-test checklist, and no trailing "Run tests / Verify the page"
+item -- the loop already runs webcheck and verification after every edit
+task. A no-build site gets complete browser-valid CSS -- never raw
+`@tailwind` build directives in a linked stylesheet (write real CSS, or use
+the Tailwind CDN script with utility classes)."""
 
 
 PLAN_SYSTEM = """\
@@ -775,6 +995,13 @@ Rules:
   fixed number; a large repair may need a dozen or more real steps, while a
   small fix may need one. Do not pad the plan with tiny stub tasks.
 - Do not include meta-tasks (planning, documentation-only chores, git work).
+- Do not end the plan with a standalone re-check item ("Run the tests",
+  "Verify the page renders", "Check that everything works"): the loop
+  already runs verification (webcheck, the configured verify command,
+  impacted tests) after EVERY edit task, so a trailing no-op checklist item
+  adds no work. Where the rules above demand a live checkpoint, title it
+  with the specific behavior to observe -- never a generic
+  "verify everything" closer.
 - If the goal is a BUG or a broken program (a traceback, a wrong result), do
   not return an empty list: produce concrete repair steps -- reproduce the
   failure, locate the cause, fix it, then verify. "Fix the bug" is a valid
@@ -4327,6 +4554,12 @@ def run_loop(root: Path, cfg, client, idx, plan_path: Path, *,
     Task handling:
     - Investigation-only tasks ("Reproduce...", "Locate the cause...") are
       answered in prose and marked done without requiring edits.
+    - No-op re-check items ("Verify ...", "Run the page and verify ...",
+      "Check that ...", "Test that ...") are ticked done WITHOUT a worker
+      session when the workspace is already green on disk: webcheck clean,
+      the verify command passing, and no requirement of the title still
+      owed. The loop verifies after every edit task, so a trailing re-check
+      needs no diff; failing it for zero edits was the defect.
     - Verification checkpoints (titles asking to verify/confirm/observe) are
       FAILED, not ticked done, when their report says the verification did
       not succeed, when (for titles promising live observation) the session
@@ -4646,6 +4879,26 @@ def run_loop(root: Path, cfg, client, idx, plan_path: Path, *,
                 "WARN")
             break
         _, task = nxt
+        if _is_noop_verify_item(task) and \
+                _noop_verify_already_green(root, task, verify):
+            # A "Run tests / Verify the page" re-check the planner should
+            # not have emitted: the loop already verified after every edit
+            # task, and the disk evidence says nothing is owed. Tick it
+            # without a worker session or a diff -- the zero-edit gate
+            # would otherwise fail it ([!]) for doing nothing.
+            print(f"\n=== task (already verified): {task} ===",
+                  file=sys.stderr)
+            print("  [no-op verification item: the workspace already passes "
+                  "webcheck" + (f" and `{verify}`" if verify else "")
+                  + " with every requirement met on disk -- ticking it done "
+                  "without a worker session or a diff]", file=sys.stderr)
+            workspace.log_event(
+                root, "no-op verification item ticked done: workspace "
+                      "already green on disk (no diff needed)")
+            mark_done(plan_path, task, notify=plan_changed)
+            done += 1
+            notify(task)
+            continue
         attempted += 1
         print(f"\n=== task {attempted}: {task} ===", file=sys.stderr)
         if ratchet_on:

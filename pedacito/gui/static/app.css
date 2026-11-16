@@ -481,6 +481,19 @@ details pre { background: var(--code-bg); border: 1px solid var(--line); border-
 #modeTabs button.on { background: var(--panel2); color: var(--accent); font-weight: 700; }
 #modeHint { margin: 0; font-size: 11.5px; color: var(--muted); text-align: center; flex: none; }
 #modeHint button { margin: 0 3px; }
+/* Task-vs-Auto suitability: a subtle live banner while an Auto draft reads as
+ * a single-pass edit, and the pre-run "Run as a single-pass Task instead?"
+ * confirmation bar with its two one-click choices. */
+#modeNudge { display: flex; flex-wrap: wrap; align-items: center; gap: 6px;
+  padding: 5px 8px; border: 1px solid color-mix(in srgb, var(--accent) 45%, var(--line));
+  border-radius: 7px; background: var(--accent-soft); font-size: 11.5px; flex: none; }
+#modeNudge button { flex: none; }
+#modeConfirm { display: flex; flex-direction: column; gap: 5px; padding: 7px 9px;
+  border: 1px solid var(--warn); border-radius: 7px;
+  background: color-mix(in srgb, var(--warn) 10%, var(--panel)); font-size: 12px; flex: none; }
+#modeConfirm .modeConfirmBtns { display: flex; gap: 8px; flex-wrap: wrap; }
+#planHint { margin: 0; font-size: 11px; color: var(--muted); text-align: center;
+  flex: none; font-style: italic; }
 #attachRow { display: flex; flex-wrap: wrap; gap: 6px; }
 #attachRow .attach { font-size: 11.5px; background: var(--soft); border: 1px solid var(--line);
   border-radius: 5px; padding: 2px 7px; }

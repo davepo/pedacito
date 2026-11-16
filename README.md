@@ -1081,7 +1081,25 @@ pedacito auto . --apply --verify "pytest -q" --verify-final  # one whole-goal ch
 pedacito auto . --apply --diagnostics                        # lint/typecheck each task
 pedacito auto . --apply --worktree refactor                  # run in an isolated git worktree
 pedacito auto . --apply --plan TODO.md                       # use an existing checklist
+pedacito auto . -t "restyle the buttons in index.html" --force-auto  # skip the Task-mode nudge
 ```
+
+**Task-vs-Auto suitability nudge.** Before spinning up a multi-step `PLAN.md`,
+`auto -t "..."` runs a fast, deterministic check (`evaluate_mode_suitability`,
+zero model calls): a prompt that targets 1–2 existing files, uses localized
+edit verbs (`fix`, `restyle`, `rename`, `remove`, `add a link`, …), or tweaks
+content/styling in a tiny project (≤5 non-ignored source files) looks like
+single-pass **Task** work. On a terminal, Pedacito prints the recommendation
+and asks `Run as a single-pass Task instead? [Y/n]` — Enter or `y` runs the
+whole prompt as one `ask` pass (~20s, no checklist); `n` keeps the Auto loop.
+A non-TTY stdin (CI pipe) is never blocked: it logs a one-line note and
+proceeds with Auto. `--force-auto` (or `-y`/`--yes`) bypasses the check, and
+prompts that say "multi-step plan", "create a plan", "from scratch", or name
+≥4 distinct new files/modules always keep Auto. The TUI mirrors this on
+`/auto GOAL` (`/auto! GOAL` forces the loop), and the GUI shows a live
+"💡 Looks like a single-pass edit" banner above the composer plus a
+"Run as a single-pass Task instead?" choice on Run, with **Run as Task
+(Recommended)** and **Run Auto Anyway** buttons.
 
 The plan is a markdown checklist (`PLAN.md` by default), so a run is resumable
 and editable; the file also keeps the full goal (a `Goal:` line with `> `

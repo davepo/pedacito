@@ -267,16 +267,19 @@ CLI_COMMANDS = [
     },
     {
         "name": "auto",
-        "usage": 'pedacito auto PROJECT -t "GOAL" [--apply] [--verify CMD]',
+        "usage": 'pedacito auto PROJECT -t "GOAL" [--apply] [--verify CMD] '
+                 '[--force-auto]',
         "summary": "Turn a goal into a checklist, then implement each task in "
                    "a fresh context. Without --apply it only writes/prints the "
                    "plan.",
-        "keywords": ["autonomous", "plan", "checklist", "goal", "loop"],
+        "keywords": ["autonomous", "plan", "checklist", "goal", "loop",
+                     "task mode", "single pass", "suitability"],
         "examples": [
             'pedacito auto . -t "add CSV export with tests"',
             'pedacito auto . -t "add CSV export" --apply --verify "pytest -q"',
             "pedacito auto . --plan PLAN.md --apply --max-tasks 5",
             'pedacito auto . -t "risky refactor" --apply --worktree risky',
+            'pedacito auto . -t "restyle the buttons in index.html" --force-auto',
         ],
         "flags": [
             {"flag": "-t, --task TEXT", "help": "one-line goal"},
@@ -302,6 +305,23 @@ CLI_COMMANDS = [
              "help": "regenerate the plan, discarding the existing one"},
             {"flag": "--refine",
              "help": "expand a one-line idea into a repo-aware spec first"},
+            {"flag": "--force-auto",
+             "help": "skip the Task-vs-Auto suitability nudge and run the "
+                     "multi-step loop even for single-pass edits"},
+            {"flag": "-y, --yes",
+             "help": "assume yes: skip interactive confirmations, including "
+                     "the Task-vs-Auto nudge"},
+        ],
+        "notes": [
+            "Task-vs-Auto suitability: a prompt that targets 1-2 existing "
+            "files, uses localized edit verbs (fix, restyle, rename, ...), "
+            "or tweaks content/styling in a tiny project (<=5 source files) "
+            "is flagged as single-pass Task work. On a TTY, auto asks "
+            "'Run as a single-pass Task instead? [Y/n]' and Enter/y runs it "
+            "as one ask pass; a non-TTY stdin only logs a note and keeps "
+            "Auto. --force-auto (or --yes) bypasses the check; prompts that "
+            "say 'multi-step plan', 'create a plan', 'from scratch', or "
+            "name >=4 new files/modules always keep Auto.",
         ],
         "common": True,
     },
@@ -437,9 +457,15 @@ CLI_COMMANDS = [
             "red bar, Turn: +in/+out, Session totals, Speed/avg tok/s, KV "
             "cache, folds and Active model/role",
             "Slash commands: /help, /keys, /status (/telemetry), /auto GOAL, "
-            "/plan, /consolidate (/compact), /profile, /model ID, "
+            "/auto! GOAL (force the multi-step loop, skipping the Task-mode "
+            "suggestion), /plan, /consolidate (/compact), /profile, /model ID, "
             "/auto-route, /think, /creative, /apply, /skills, /memory, /procs, "
             "/diff, /undo, /reset, /sidebar, /scroll, /mouse, /clear, /quit",
+            "/auto GOAL nudges single-pass edits: when the goal looks like a "
+            "one-pass Task (existing-file tweaks, localized edit verbs, a "
+            "tiny project), the TUI asks 'Run as a single-pass Task instead? "
+            "[Y/n]' -- Enter/y runs it as one Task, n keeps Auto. Headless "
+            "sessions only log a note; /auto! forces Auto.",
             "Keys: PgUp/PgDn scroll the transcript, Shift+Up/Down scroll 3 "
             "lines, Alt+PgUp/PgDn scroll the sidebar, Up/Down recall command "
             "history, Left/Right/Home/End edit the prompt, and Tab completes "
