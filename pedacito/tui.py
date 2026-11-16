@@ -108,11 +108,12 @@ _TAB_PREFIX = {
     "/con": "/consolidate ",
     "/pro": "/profile ",
     "/aut": "/auto-route ",
+    "/cre": "/creative ",
 }
 _SLASH_COMMANDS = [
     "/help", "/keys", "/status", "/telemetry", "/auto", "/plan",
     "/consolidate", "/compact", "/profile", "/profiles", "/model",
-    "/auto-route", "/think", "/apply", "/skills", "/memory", "/procs",
+    "/auto-route", "/think", "/creative", "/apply", "/skills", "/memory", "/procs",
     "/diff", "/undo", "/reset", "/sidebar", "/scroll", "/mouse", "/clear",
     "/quit", "/exit",
 ]
@@ -157,6 +158,8 @@ Pedacito TUI commands
   /model ID                 switch to a model id directly
   /auto-route [on|off]      specialist auto-routing on/off
   /think [on|off]           thinking on/off (off sets disable_thinking)
+  /creative [on|off|auto]   design mode: on=every task, auto=detect design tasks,
+                            off=surgical edits (warmer sampling + whole-file CSS/HTML)
   /apply [on|off]           write edits to disk, or preview them
   /skills [list|show NAME|draft TEXT]
   /memory [list|add FACT|forget TEXT]
@@ -2173,6 +2176,9 @@ class TuiSession:
         if cmd == "think":
             self._think(arg)
             return
+        if cmd == "creative":
+            self._creative(arg)
+            return
         if cmd == "apply":
             self._apply_toggle(arg)
             return
@@ -2222,6 +2228,7 @@ class TuiSession:
             f"  profile : {self.profile}",
             f"  model   : {getattr(self.cfg, 'model', '?')}",
             f"  writes  : {'ON' if self.apply else 'off (dry run)'}",
+            f"  creative: {'ON' if getattr(self.cfg, 'creative_mode', False) else ('auto' if getattr(self.cfg, 'creative_auto', True) else 'off')}",
             f"  context : [{bar}] {t['context_utilization_pct']:.1f}% "
             f"({t['last_prompt_tokens']:,} / {t['context_tokens']:,})"
             + ("  HIGH" if state == "high" else ""),
@@ -2462,6 +2469,43 @@ class TuiSession:
             pass
         self._append("Thinking: "
                      f"{'OFF' if self.cfg.disable_thinking else 'ON'}", "system")
+
+    def _creative(self, arg: str) -> None:
+        """Tri-state creative/design mode: on forces the Builder persona for
+        every task, off keeps surgical edits everywhere, auto detects design
+        tasks. No argument cycles auto -> on -> off."""
+        value = arg.strip().lower()
+        if value in ("on", "true", "yes", "1"):
+            self.cfg.creative_mode = True
+        elif value in ("off", "false", "no", "0"):
+            self.cfg.creative_mode = False
+            self.cfg.creative_auto = False
+        elif value in ("auto", "detect"):
+            self.cfg.creative_mode = False
+            self.cfg.creative_auto = True
+        elif value in ("", "toggle"):
+            if self.cfg.creative_mode:
+                self.cfg.creative_mode = False
+                self.cfg.creative_auto = False
+            elif getattr(self.cfg, "creative_auto", True):
+                self.cfg.creative_mode = True
+            else:
+                self.cfg.creative_auto = True
+        else:
+            self._append("Usage: /creative on|off|auto", "error")
+            return
+        try:
+            self.cfg.sources["creative_mode"] = "tui toggle"
+            self.cfg.sources["creative_auto"] = "tui toggle"
+        except Exception:
+            pass
+        if self.cfg.creative_mode:
+            state = "ON (every task)"
+        elif getattr(self.cfg, "creative_auto", True):
+            state = "AUTO (detect design tasks)"
+        else:
+            state = "OFF (surgical edits)"
+        self._append(f"Creative mode: {state}", "system")
 
     def _apply_toggle(self, arg: str) -> None:
         value = arg.strip().lower()

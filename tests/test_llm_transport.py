@@ -525,17 +525,20 @@ def test_explicit_markers_fall_back_to_implicit_on_400(monkeypatch):
 
 def test_claude_omits_temperature_below_one(monkeypatch):
     """C4: api.anthropic.com rejects temperature below 1 (Claude 4.7+), so the
-    transport drops the key; a value >= 1 (or any other host) is sent."""
+    transport drops the key; a value >= 1 (or any other host) is sent. The
+    opt-in flag is set because hosted endpoints otherwise omit temperature."""
     posts = []
     _patch_post(monkeypatch, lambda *a, **k: posts.append(k["json"]) or _ok())
-    anth = LLMClient(_cfg(base_url="https://api.anthropic.com/v1"))
+    anth = LLMClient(_cfg(base_url="https://api.anthropic.com/v1",
+                          send_temperature_to_hosted=True))
     anth.chat([{"role": "user", "content": "hi"}], 10)
     assert "temperature" not in posts[-1]
     warm = LLMClient(_cfg(base_url="https://api.anthropic.com/v1",
-                          temperature=1.0))
+                          temperature=1.0, send_temperature_to_hosted=True))
     warm.chat([{"role": "user", "content": "hi"}], 10)
     assert posts[-1]["temperature"] == 1.0
-    oai = LLMClient(_cfg(base_url="https://api.openai.com/v1"))
+    oai = LLMClient(_cfg(base_url="https://api.openai.com/v1",
+                         send_temperature_to_hosted=True))
     oai.chat([{"role": "user", "content": "hi"}], 10)
     assert posts[-1]["temperature"] == 0.2
 

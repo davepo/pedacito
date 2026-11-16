@@ -299,6 +299,10 @@ const savedMode = (() => {
   try { return localStorage.getItem('pedacito_mode') || 'task'; }
   catch (e) { return 'task'; }
 })();
+const savedCreative = (() => {
+  try { return localStorage.getItem('pedacito_creative') === '1'; }
+  catch (e) { return false; }
+})();
 
 const S = {
   status: {},
@@ -308,8 +312,10 @@ const S = {
   editAfterLoad: false,
   ws: { tab: localStorage.getItem('pedacito_ws_tab') || 'files', files: [],
         indexed: [], indexedSet: null, sig: '', filter: '', truncated: false,
-        loading: false, backups: [], backupsAt: 0 },
+        loading: false, backups: [], backupsAt: 0,
+        pages: [], page: '', previewRev: 0 },
   mode: savedMode,
+  creative: savedCreative,
   drafts: savedDraft ? { [savedMode]: savedDraft } : {}, attachments: [],
   opts: (() => { try { return JSON.parse(localStorage.getItem('pedacito_opts') || '{}'); } catch (e) { return {}; } })(),
   ui: { diffOpen: false, wsCollapsed: false, termFollow: true, optsOpen: false,
@@ -430,7 +436,8 @@ const HOW_TOPICS = [
   ['CLI vs GUI cheat sheet', 'Show me a CLI vs GUI cheat sheet'],
   ['Undo / restore backups', 'How do I undo an Auto or Edit run and restore a backup?'],
   ['Reset config to baseline', 'How do I reset my settings or config to the baseline?'],
-  ['Reference a file in chat', 'How do I reference a file in chat?']
+  ['Reference a file in chat', 'How do I reference a file in chat?'],
+  ['Creative / design mode', 'How do I turn on creative mode for design tasks?']
 ];
 const OPTS = {
   task: [
@@ -508,7 +515,7 @@ function applyStatus(s) {
   if (s.plan) applyPlanPayload(s.plan);
   else if (j && (j.kind === 'auto' || j.kind === 'task')) loadPlan();
   if (j && j.id !== lastJobId) loadPlan();
-  if (!j && lastJobId) { collapseDone(); loadPlan(); loadReview(); loadFiles(); loadBackups(); }
+  if (!j && lastJobId) { collapseDone(); loadPlan(); loadReview(); loadFiles(); loadBackups(); loadPreview(true); }
   if (!j && S.ui.planGenerating && !S.ui.planGenFrom) {
     S.ui.planGenerating = false;
     S.ui.planGenFrom = null;
@@ -520,9 +527,13 @@ function applyStatus(s) {
     S.ui.planGenFrom = null;
   }
   lastJobId = j ? j.id : 0;
+  if ((s.root || '') !== (prev.root || '')) loadPreview();  // project opened/switched
   if ((s.files_sig || '') !== lastFilesSig) {   // index or workspace changed
     lastFilesSig = s.files_sig || '';
     if (S.ws.tab === 'files' && s.root) loadFiles();
+    // Live Preview stays live WHILE a run writes: re-list pages and reload
+    // the framed page whenever the workspace signature moves.
+    if (S.ws.tab === 'preview' && s.root) loadPreview(true);
   }
   if (S.ui.pendingProfile !== null && s.profile === S.ui.pendingProfile) S.ui.pendingProfile = null;
   // Colorscheme: config.toml (gui_theme) is the source of truth. On the
@@ -632,6 +643,7 @@ function loadSnapshot() {
     loadReview();
     loadPlan();
     if (S.status.root && S.ws.tab === 'files') loadFiles(true);
+    loadPreview();
     emit();
   });
 }
@@ -910,6 +922,9 @@ function send() {
   }
   const body = { mode: S.mode, text: text, attachments: S.attachments.slice() };
   OPTS[S.mode].forEach((d) => { body[d.k] = opt(S.mode, d.k); });
+  // The ✨ toggle forces Creative mode for this run; when off, the agent
+  // still auto-detects design/UI tasks (creative_auto).
+  if (S.mode === 'task' || S.mode === 'auto' || S.mode === 'new') body.creative = !!S.creative;
   // Send the topbar's model selection explicitly so a no-project New/Ask uses
   // the profile the user just picked, even before /api/state catches up.
   body.profile = S.ui.pendingProfile !== null ? S.ui.pendingProfile : (s.profile || '');
@@ -1025,10 +1040,46 @@ function loadBackups(force) {
     emit();
   }, () => {});
 }
+// ---- live preview (project HTML framed read-only from /preview/) ----
+function previewSrc(page, rev) {
+  return '/preview/' + String(page).split('/').map(encodeURIComponent).join('/')
+    + '?v=' + rev;                       // cache-buster: refresh must reload
+}
+function loadPreview(force) {
+  if (!S.status.root) {
+    if (S.ws.pages.length || S.ws.page) { S.ws.pages = []; S.ws.page = ''; emit(); }
+    return Promise.resolve();
+  }
+  return PDC.api('/api/preview').then((j) => {
+    if (j._status !== 200 || !Array.isArray(j.files)) return;
+    S.ws.pages = j.files;
+    if (!j.files.length) { S.ws.page = ''; emit(); return; }
+    let page = S.ws.page;
+    if (!page || j.files.indexOf(page) < 0) {
+      let saved = '';
+      try { saved = localStorage.getItem('pedacito_preview_page') || ''; } catch (e) {}
+      page = j.files.indexOf(saved) >= 0 ? saved
+        : (j.files.indexOf('index.html') >= 0 ? 'index.html' : j.files[0]);
+    }
+    const changed = page !== S.ws.page;
+    S.ws.page = page;
+    if (force || changed) S.ws.previewRev++;
+    emit();
+  }, () => {});
+}
+function setPreviewPage(p) {
+  S.ws.page = p;
+  try { localStorage.setItem('pedacito_preview_page', p); } catch (e) {}
+  emit();
+}
+function openPreviewTab() {
+  if (S.ws.page) window.open(previewSrc(S.ws.page, S.ws.previewRev), '_blank');
+}
 function setWsTab(t) {
   if (S.ws.tab === t && !S.ui.wsCollapsed) {      // the tab already showing:
     if (t === 'files') loadFiles(true);           // click again = rescan
     else if (t === 'backups') loadBackups(true);
+    else if (t === 'preview') loadPreview(true);  // click again = reload page
     return;
   }
   S.ws.tab = t;
@@ -1036,6 +1087,7 @@ function setWsTab(t) {
   try { localStorage.setItem('pedacito_ws_tab', t); } catch (e) {}
   if (t === 'files') loadFiles();
   if (t === 'backups') loadBackups();
+  if (t === 'preview') loadPreview();
   if (t === 'logs' && term) { term.follow = S.ui.termFollow; term.schedule(); }
   emit();
 }
@@ -1132,7 +1184,8 @@ PDC.runPlan = function () {
   const s = S.status;
   const goal = (s.last_auto && s.last_auto.text && info.path === s.plan_file) ? s.last_auto.text : '';
   PDC.startRun({ mode: 'auto', text: goal, plan_file: info.path, plan_only: false, apply: true, verify: a.verify || '', repair: a.repair || '',
-    max_tasks: a.max_tasks || '', max_minutes: a.max_minutes || '', keep_going: !!a.keep_going, auto_install: !!a.auto_install, diagnostics: !!a.diagnostics });
+    max_tasks: a.max_tasks || '', max_minutes: a.max_minutes || '', keep_going: !!a.keep_going, auto_install: !!a.auto_install, diagnostics: !!a.diagnostics,
+    creative: !!S.creative });
 };
 
 // ---- menu actions ----
@@ -2652,6 +2705,14 @@ function undoRefine() {
 }
 
 // --------------------------------------------------------------- composer ----
+// ✨ Creative / UI-polish mode: forces the warm designer persona for the next
+// run. Off is not "cold" -- creative_auto still detects design tasks on its own.
+function toggleCreative() {
+  S.creative = !S.creative;
+  try { localStorage.setItem('pedacito_creative', S.creative ? '1' : '0'); } catch (e) {}
+  emit();
+}
+
 function Composer() {
   const s = S.status, j = job(), m = MODES[S.mode] || MODES.task;
   const taRef = useRef(null);
@@ -2755,6 +2816,11 @@ function Composer() {
         <button id="undoRefineBtn" class="ghost" hidden=${isHow || S.ui.previousPrompt == null}
                 title="restore the prompt as it was before refining"
                 onClick=${undoRefine}>↶ Undo Refine</button>
+        <button id="creativeBtn" class=${'ghost' + (S.creative ? ' on' : '')}
+                hidden=${isHow || S.mode === 'explain'}
+                aria-pressed=${S.creative ? 'true' : 'false'}
+                title="Creative / UI-polish mode: warmer sampling, a designer persona and full-page rewrites for UI work. Off = design tasks are still auto-detected."
+                onClick=${toggleCreative}>${S.creative ? '✨ Creative: on' : '✨ Creative'}</button>
         <span class="grow muted small-text" id="sendHint">${isHow ? 'answers stay out of this chat thread' : (steerable ? 'delivered at the next lookup step' : '')}</span>
         <button id="sendBtn" class=${isHow ? 'primary' : (j ? 'danger' : 'primary')}
                 disabled=${!!(j && j.cancelled && !isHow)}
@@ -3120,10 +3186,10 @@ function PlanPane() {
 }
 
 // ------------------------------------------------------- workspace pane ----
-// The bottom-right panel: three tabs replacing the old static TERMINAL box.
-// FILES browses the project (index + workspace scan), BACKUPS restores a
-// snapshot with one click, LOGS keeps the raw terminal output. The #term
-// element stays mounted in every tab so the live Term buffer never resets.
+// The bottom-right panel: Files / Backups / Logs, plus a 🌐 Preview tab that
+// appears whenever the project has HTML pages (live, read-only iframe fed by
+// /preview/). The #term element and the preview iframe stay mounted in every
+// tab so the live Term buffer never resets and the page keeps its state.
 const WS_TABS = [['files', 'Files'], ['backups', 'Backups'], ['logs', 'Logs']];
 
 function WorkspacePane() {
@@ -3132,7 +3198,11 @@ function WorkspacePane() {
   useEffect(() => {
     if (termRef.current && !term) term = new Term(termRef.current);
   }, []);
-  const tab = S.ws.tab;
+  const tabs = S.ws.pages.length
+    ? [WS_TABS[0], ['preview', '\uD83C\uDF10 Preview']].concat(WS_TABS.slice(1))
+    : WS_TABS;
+  let tab = S.ws.tab;
+  if (tab === 'preview' && !S.ws.pages.length) tab = 'files';  // saved tab, no pages
   const idxSet = S.ws.indexedSet || new Set();
   const flt = S.ws.filter.trim().toLowerCase();
   const all = S.ws.files || [];
@@ -3159,13 +3229,14 @@ function WorkspacePane() {
     <section class=${'panel' + (S.ui.wsCollapsed ? ' collapsed' : '')} id="wsPanel">
       <div class="panel-head">
         <div id="wsTabs">
-          ${WS_TABS.map(([k, lbl]) => html`
+          ${tabs.map(([k, lbl]) => html`
             <button key=${k} class=${tab === k ? 'on' : ''}
                     onClick=${() => setWsTab(k)}>${lbl}</button>`)}
         </div>
         <span class="muted small-text grow ws-sub">
           ${tab === 'files' ? (s.root ? PDC.fmtInt(S.ws.indexed.length) + ' of ' + PDC.fmtInt(all.length) + ' files indexed' : 'no project open')
           : tab === 'backups' ? 'undo a Task/Edit or Auto write'
+          : tab === 'preview' ? 'read-only \u00B7 reloads when a run finishes'
           : 'live output'}
         </span>
         ${tab === 'logs' ? html`
@@ -3191,6 +3262,22 @@ function WorkspacePane() {
           ${'Showing ' + PDC.fmtInt(shown.length) + ' of ' + PDC.fmtInt(all.length) + ' files'
             + (S.ws.truncated ? ' \u00B7 scan capped at ' + PDC.fmtInt(all.length) : '')}
         </div>
+      </div>
+      <div class="ws-body" id="wsPreview" hidden=${tab !== 'preview'}>
+        <div class="ws-tools">
+          <select class="grow" title="page to preview" value=${S.ws.page}
+                  onchange=${(e) => setPreviewPage(e.target.value)}>
+            ${S.ws.pages.map((p) => html`<option key=${p} value=${p}>${p}</option>`)}
+          </select>
+          <button class="small" title="reload the page"
+                  onClick=${() => loadPreview(true)}>\u27F3 Refresh</button>
+          <button class="small" title="open this page in a new browser tab"
+                  onClick=${openPreviewTab}>\u2197 New tab</button>
+        </div>
+        ${S.ws.page
+          ? html`<iframe id="live-preview-frame" title=${'Live preview of ' + S.ws.page}
+                         src=${previewSrc(S.ws.page, S.ws.previewRev)}></iframe>`
+          : html`<div class="tip">No HTML pages in this project yet \u2014 create one and it shows up here.</div>`}
       </div>
       <div class="ws-body" id="wsBackups" hidden=${tab !== 'backups'}>
         <div class="ws-tools">

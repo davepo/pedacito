@@ -19,7 +19,7 @@ import threading
 import webbrowser
 from http.server import BaseHTTPRequestHandler
 from pathlib import Path
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, unquote, urlparse
 
 from .. import review as review_mod
 from .. import security, workspace
@@ -304,6 +304,21 @@ def _backups(q, body=None):
 @get("/api/file")
 def _file(q, body=None):
     return 200, read_project_file(q.get("path", [""])[0])
+
+
+@get("/api/preview")
+def _preview_list(q, body=None):
+    """The HTML pages the Live Preview tab can frame ([] when no project is
+    open). Reuses the Files-tab listing so newly written pages show up too."""
+    if STATE.root is None:
+        return 200, {"files": []}
+    try:
+        listing = project_files()
+    except Exception:
+        listing = {"files": []}
+    files = [f for f in listing.get("files", [])
+             if str(f).lower().endswith((".html", ".htm"))]
+    return 200, {"files": sorted(files)}
 
 
 @get("/api/fs")
@@ -1599,6 +1614,50 @@ class _Handler(BaseHTTPRequestHandler):
             data = index_html(data)
         self._send(200, data, ctype)
 
+    def _preview(self, rel: str) -> None:
+        """Serve one project file for the Live Preview iframe: read-only and
+        directory-contained (`_within`), with framing headers the app's own
+        CSP forbids -- a previewed page must be embeddable by the same origin
+        and may run its own inline scripts/styles. Sensitive files are never
+        previewed. Relative asset links inside the page resolve back through
+        /preview/ as well."""
+        root = STATE.root
+        if root is None:
+            self._send(404, b"no project open", "text/plain")
+            return
+        p = _within(root, unquote(rel))
+        if p is None or not p.is_file():
+            self._send(404, b"not found", "text/plain")
+            return
+        if security.is_sensitive_path(p):
+            self._send(403, b"sensitive file", "text/plain")
+            return
+        ctype = (STATIC_TYPES.get(p.suffix.lower())
+                 or mimetypes.guess_type(p.name)[0]
+                 or "application/octet-stream")
+        if ctype.startswith("text/") or ctype.endswith("javascript") \
+                or ctype in ("image/svg+xml", "application/json"):
+            ctype += "; charset=utf-8"
+        try:
+            data = p.read_bytes()
+        except OSError:
+            self._send(404, b"not found", "text/plain")
+            return
+        self.send_response(200)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("X-Frame-Options", "SAMEORIGIN")
+        self.send_header("Content-Security-Policy",
+                         "default-src 'self' data: blob:; "
+                         "style-src 'self' 'unsafe-inline'; "
+                         "script-src 'self' 'unsafe-inline'; "
+                         "img-src 'self' data: blob:; "
+                         "frame-ancestors 'self'")
+        self.end_headers()
+        self.wfile.write(data)
+
     def _discard_request_body(self) -> None:
         """Consume a POST body we refuse before parsing it.
 
@@ -1633,6 +1692,9 @@ class _Handler(BaseHTTPRequestHandler):
         query = parse_qs(url.query)
         if url.path == "/events":
             self._events(query)
+            return
+        if url.path.startswith("/preview/"):
+            self._preview(url.path[len("/preview/"):])
             return
         route = GET_ROUTES.get(url.path)
         if route is None:

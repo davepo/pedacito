@@ -777,32 +777,6 @@ def _wipe_refusal(rel: str) -> str:
             "file and make targeted search/replace edits.")
 
 
-# Small hand-authored pages are routinely restructured as a whole: moving two
-# links under an <h1>, replacing a section, or restyling a 100-line CSS file
-# legitimately drops dozens of old lines. The fragment heuristics below were
-# written for code modules, where a shrinking rewrite usually means a partial
-# read; applying them to a < 300-line HTML/CSS page vetoed the user's whole
-# layout request and left only the first hunk applied.
-_SMALL_WEB_EXTS = (".html", ".htm", ".css")
-
-
-def _small_web_rewrite(rel: str) -> bool:
-    """True for a small HTML/CSS page: whole-section rewrites are allowed."""
-    return str(rel or "").lower().endswith(_SMALL_WEB_EXTS)
-
-
-def _web_restructure_task(task: str) -> bool:
-    """A brief that asks for visual/layout work rather than code surgery."""
-    if not task:
-        return True                         # type-shape alone is the signal
-    low = task.lower()
-    return bool(re.search(
-        r"\b(?:layout|restructur\w*|restyle|restyling|redesign|styling|style|"
-        r"css|html|website|webpage|page|section|hero|card|move|reorder|"
-        r"replace|remove|add|modern|sleek|appealing|theme|typography)\b",
-        low))
-
-
 def fragment_refusal(rel: str, original: str, new_text: str,
                      task: str = "") -> str | None:
     """Why replacing `original` with `new_text` looks like a fragment of a
@@ -832,17 +806,12 @@ def fragment_refusal(rel: str, original: str, new_text: str,
     # A whole-file replacement to nothing is never an edit.
     if old_ls and not new_ls:
         return _wipe_refusal(rel)
-    # A whole-section rewrite of a small static page is the normal shape of a
-    # layout/restyle request, not the signature of a partial read. Keep the
-    # empty-replacement refusal above; skip the fragment heuristics for
-    # HTML/CSS pages under 300 lines.
-    if (_small_web_rewrite(rel) and _web_restructure_task(task)
-            and len(old_ls) <= 300):
-        return None
     # A JS/TS module whose replacement keeps content but drops EVERY export
     # form breaks each importer (`does not provide an export named ...`)
     # and each classic script reading the global. Targeted edits can still
-    # remove exports one at a time when the task really asks for it.
+    # remove exports one at a time when the task really asks for it. This
+    # guard runs BEFORE the creative bypass so a .jsx/.tsx design rewrite
+    # keeps its export-surface protection.
     if (new_ls and rel.lower().endswith(_JS_FAMILY_EXT)
             and _EXPORT_FORM_RE.search(original)
             and not _EXPORT_FORM_RE.search(new_text)):
@@ -852,6 +821,14 @@ def fragment_refusal(rel: str, original: str, new_text: str,
                 "page script using them would break. Keep the export "
                 "surface in the rewrite, or remove individual exports "
                 "with targeted search/replace edits.")
+    # Creative/design bypass: a whole-file rewrite of a hand-authored page /
+    # stylesheet / doc, a creative task, or a restructure/replace brief is the
+    # requested outcome, not the signature of a partial read. The wipe refusal
+    # and the export guard above still apply; only the fragment heuristics
+    # below stand down.
+    from .prompts import whole_rewrite_allowed
+    if whole_rewrite_allowed(task, rel):
+        return None
     # A chunked write that stops early keeps most of the file's text but
     # drops the definitions that lived in the tail (test_1a: a 182-line
     # module written back as its first 120 lines passed the >half-shrink

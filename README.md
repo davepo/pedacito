@@ -156,6 +156,9 @@ Step-by-step versions, with what you should see at each point, are in
 | **Safe writes** | Dry run by default, side-by-side review, backups before every write, `pedacito restore` to undo | [Review page](#review-page) |
 | **Live test introspection** | During investigation the model can run one scoped test check (pytest, Node/Vitest, Go, or Cargo) and read the live traceback before it writes a fix. On by default (`enable_run_test_in_gather`) | [Scoped test runs](#scoped-test-runs-during-investigation) |
 | **Frontend contract checks** | Before tests run, local `<script src>` and `<link href>` files must exist, and literal `getElementById` and `querySelector('#id')` lookups must match the HTML ids | [Frontend contract checks](#frontend-contract-checks) |
+| **Creative / design mode** | Design tasks (websites, restyles, `.html`/`.css`/UI-component work) run as a Senior Product Engineer & Visual Designer: warmer sampling, an ≥8192-token reply budget and whole-file HTML/CSS rewrites. `--creative`, `/creative` in the TUI, or the GUI's ✨ Creative toggle force it for every task | [Creative / design mode](#creative--design-mode) |
+| **Live Preview** | A project with `.html` pages grows a 🌐 Preview tab in the GUI: a read-only live view of the page that reloads when a run finishes — or while it writes | [Live Preview](#live-preview) |
+| **Hosted sampling respect** | Hosted APIs receive no `temperature`/`top_p`/`top_k`/`min_p`/`repeat_penalty` by default, so the provider's tuned defaults apply; opt back in with `send_temperature_to_hosted` or pin `hosted_temperature` | [Hosted APIs keep their own sampling](#hosted-apis-keep-their-own-sampling) |
 | **Repair lessons** | A repair that fixes a failed check leaves a deduplicated, repo-specific lesson in `.pedacito/micro_facts.json`; a lesson a directory proves twice is promoted into an auto-managed path-scoped rule (`.pedacito/rules/auto_*.md`) that only shows up when the model reads that directory | [Repair lessons](#repair-lessons-and-repo-gotchas) |
 | **Symbol-level edits and rename** | Replace a whole function by name without echoing its old text, or rename a symbol across the project with no model call (`pedacito rename`) | [Editing](#editing-searchreplace-not-diffs) |
 | **Engine-enforced JSON and scout routing** | Lookup steps are constrained by the server's JSON schema support, and `scout_profile` sends the lookups to a fast model while the big model plans and edits | [Model guide](MODEL_GUIDE.md#dual-gpu--dual-model-scout--architect-routing-scout_profile) |
@@ -186,6 +189,10 @@ dependencies, so it works offline. It runs the same engine as the commands.
   requirements and edge cases, and verification. **↶ Undo Refine** puts your
   original text back. Drag the composer's top edge to make it taller while you
   read the spec.
+- **✨ Creative** above the composer forces the Builder persona for the next
+  Task/Auto/New run: a designer's eye, warmer sampling and whole-file HTML/CSS
+  rewrites. With it off, design tasks are still auto-detected (`creative_auto`).
+  See [Creative / design mode](#creative--design-mode).
 - **Changes** show proposed edits as old and new code side by side, with
   per-file accept, reject, or hand edits.
 - **Permission requested** dialogs pause a run when the model asks for web
@@ -213,7 +220,10 @@ Chat threads are saved with timestamps and can be renamed. With no project
 open they are kept in `~/.local/state/pedacito/threads/global/` (see the
 `.pedacito/` layout below); once a project is open they live inside that
 project. The **Files** panel lists the indexed project files, and **Backups**
-lists snapshots you can restore.
+lists snapshots you can restore. When the project has `.html` pages, a
+**🌐 Preview** tab joins them: a read-only live view of the selected page that
+reloads when a run finishes, so a website task shows its result immediately
+(see [Live Preview](#live-preview)).
 
 ### The CLI at a glance
 
@@ -440,7 +450,7 @@ reuses it across steps automatically. A provider table matches on the host of
 | `api.deepseek.com` | Automatic (implicit) | nothing extra; reads hit/miss tokens |
 | `api.openai.com` | Automatic for prompts ≥ 1024 tokens | `prompt_cache_key` routes to a warm cache |
 | Qwen / DashScope | Implicit automatic; explicit opt-in | `cache_control` markers in `explicit` mode |
-| `api.anthropic.com` (OpenAI-compatible) | Not supported on this surface | `json_mode = "schema"`, omits `temperature`, `tool_mode = "grammar"` |
+| `api.anthropic.com` (OpenAI-compatible) | Not supported on this surface | `json_mode = "schema"`, `tool_mode = "grammar"` (sampling keys are omitted for every hosted API; see [Hosted APIs keep their own sampling](#hosted-apis-keep-their-own-sampling)) |
 | Moonshot, Gemini, xAI, Groq | Automatic / implicit | nothing extra; hits are counted when returned |
 
 Set `prompt_cache` to override the table per profile:
@@ -458,6 +468,33 @@ Cache writes are billed separately from reads: set
 probes the active provider and reports the cache as *observed*, *not observed*,
 or *explicit-only* (DeepSeek-style caches persist asynchronously, so "not
 observed" is not "unsupported").
+
+## Hosted APIs keep their own sampling
+
+A hosted provider tunes sampling per model itself, so Pedacito stops dictating
+it: any profile whose `base_url` is not a local server (loopback or LAN) gets
+**no `temperature`, `top_p`, `top_k`, `min_p` or `repeat_penalty`** by default —
+including keys from the `sampler` table. The provider's tuned defaults apply,
+which is what its own chat UI uses. Non-sampling keys such as `seed` still pass
+through, and `presence_penalty` is never stripped.
+
+Two opt-ins, both sending **only** `temperature` (the other four keys stay
+omitted either way):
+
+```toml
+send_temperature_to_hosted = true   # send the configured temperature anyway
+hosted_temperature = 1.0            # or pin one value for hosted endpoints,
+                                    # globally or in a profile; it wins over
+                                    # phase overrides (e.g. 1.0 for Claude)
+```
+
+Local servers keep every configured value. The answer phase defaults to
+`temperature_answer = 0.3` — cool enough to copy SEARCH text exactly, warm
+enough to escape the degenerate verbatim loops a greedy `0.0` froze weak local
+models into — and creative/design tasks run at ≥ 0.6 (see
+[Creative / design mode](#creative--design-mode)). When a local reply still
+repeats itself, the retry gets one gentle `presence_penalty = 0.15` nudge
+instead of a cold temperature or a heavy repeat penalty.
 
 ## Local inference acceleration
 
@@ -621,6 +658,8 @@ after the repair rounds), `--model`, `--url`, `--profile`,
 `--role planner=big` (route one job to another profile for this run),
 `--auto-route` / `--no-auto-route` (specialist routing per run; see
 [Specialist auto-routing](#specialist-auto-routing)),
+`--creative` (creative/design Builder mode for this run; see
+[Creative / design mode](#creative--design-mode)),
 `--config`, `--root`, `--exclude`, `--include`, `--ext`.
 
 **Plan mode.** A task that changes three things in one context window usually
@@ -786,7 +825,8 @@ seconds, an instant `press` can fall between two samples of a fixed-timestep
 game loop), `click #start`, `fill #name Ada`, `type hello`, and `eval` (JS in
 the page). This reliably catches black screens, blank pages, missing text, and
 console errors; it does not judge visual quality. PNGs are saved under
-`.pedacito/screenshots/`.
+`.pedacito/screenshots/`. For your own eyes, the GUI's 🌐 Preview tab renders
+the project's HTML live as a run writes it (see [Live Preview](#live-preview)).
 
 ### Memory, rules, and skills
 
@@ -969,10 +1009,13 @@ MCP tool, sensitive file read or shell command asks in the prompt bar:
 
 Slash commands: `/help`, `/keys`, `/status` (`/telemetry`), `/auto GOAL`,
 `/plan [GOAL]`, `/consolidate` (`/compact`), `/profile [NAME]`, `/model ID`,
-`/auto-route [on|off]`, `/think [on|off]`, `/apply [on|off]`, `/skills`,
+`/auto-route [on|off]`, `/think [on|off]`, `/creative [on|off|auto]`,
+`/apply [on|off]`, `/skills`,
 `/memory`, `/procs`, `/diff`, `/undo`, `/reset`, `/sidebar`, `/scroll
 up|down|top|bottom|N`, `/mouse [on|off]`, `/clear`, `/quit`. A plain line is a
-task and runs through the normal gather/edit/verify loop.
+task and runs through the normal gather/edit/verify loop. `/creative on` forces
+the Builder persona for every task, `auto` (the default) detects design tasks,
+`off` keeps surgical edits everywhere; `/status` shows the current state.
 
 ### `rpc`: drive pedacito from an editor or another agent
 
@@ -1021,7 +1064,9 @@ link, or whose `getElementById` names an id no template renders, gets repair
 rounds and then prints `BUILD INCOMPLETE` and exits 1. A web project's generated
 `README` also says how to actually start it -- ES modules are refused over
 `file://`, so it names `python -m http.server 8000` and the URL to open instead
-of a `python main.py` line for a file the project does not contain.
+of a `python main.py` line for a file the project does not contain. For a
+website or UI-heavy scaffold, `--creative` runs every task in creative/design
+mode (see [Creative / design mode](#creative--design-mode)).
 
 ### `auto`: autonomous loop over a task list
 
@@ -1118,10 +1163,11 @@ identically.
 | Area | What it does |
 |---|---|
 | **Header** | Open a project (type a path, **Browse…** the machine's folders, or pick a recent one), choose its model profile, see the model server's status light and the session's token/cache/cost totals. |
-| **Chat** (left) | Five modes next to the box: **Task/Edit** (edit code; *review* or *write directly*, planning auto/always/never, max lookups), **Ask** (read-only questions, answer streams in), **Auto** (goal → plan → implement; plan-only or implement, verify command, repair rounds, task/minute caps, worktree, keep-going, pip-install; applying Auto accepts the tool trust boundary and enables write/run tools for the run), **New** (start a project from scratch in a folder: preview, build, build-then-review, skeleton only, and *complex* for the autonomous loop), and **How ?** (the built-in CLI/GUI/setting reference with topic chips, copyable commands and *Open in Settings* links; answers stay out of the saved coding thread). **Attach** (or drag in) a text file as the task, question, or spec. While a task runs, type to **steer** the model, answer its clarifying questions inline, or **Stop** it. |
+| **Chat** (left) | Five modes next to the box: **Task/Edit** (edit code; *review* or *write directly*, planning auto/always/never, max lookups), **Ask** (read-only questions, answer streams in), **Auto** (goal → plan → implement; plan-only or implement, verify command, repair rounds, task/minute caps, worktree, keep-going, pip-install; applying Auto accepts the tool trust boundary and enables write/run tools for the run), **New** (start a project from scratch in a folder: preview, build, build-then-review, skeleton only, and *complex* for the autonomous loop), and **How ?** (the built-in CLI/GUI/setting reference with topic chips, copyable commands and *Open in Settings* links; answers stay out of the saved coding thread). **Attach** (or drag in) a text file as the task, question, or spec. **✨ Creative** above the composer forces the Builder persona for Task/Auto/New runs; with it off, design tasks are still auto-detected. While a task runs, type to **steer** the model, answer its clarifying questions inline, or **Stop** it. |
 | **Changes** (middle) | The proposed edits as *Old code | Updated code* side by side with word-level highlights. Accept or reject the whole set, untick files to accept only some, or **Edit updated** to hand-edit a file before accepting. Files carry clause badges (`R1`, `R2`, ...) showing which part of the task they serve; a partial accept flags clauses left unaccepted. Backups are made first and a file that changed on disk since the preview is refused. |
 | **Activity** and **Plan** (right, top) | Live phase and activity for the running task. The `auto`/plan checklist with progress; click **Edit** to change it, then **Run** to implement it. |
 | **Files**, **Backups**, **Logs** (right, bottom tabs) | Files: a filterable tree of the indexed files, with files in the pending review highlighted. Backups: restorable snapshots. Logs: the terminal, everything pedacito prints, live, with ANSI colours. |
+| **🌐 Preview** (right, bottom tab) | Appears when the project has `.html` pages: a read-only iframe of the selected page (default `index.html`), served from inside the project root. ⟳ Refresh reloads it, ↗ New tab opens it in a full browser tab, and it reloads automatically when a run finishes or changes files. See [Live Preview](#live-preview). |
 | **File preview** | Clicking a file in the Files tab opens a read-only preview modal. |
 | **Settings** | See below. |
 
@@ -1155,6 +1201,26 @@ stored value, while a mask for a key the file does not have is refused.
 Sensitive files (`.env*`, keys, credentials) are refused in the file preview
 too. Only one job runs at a time, and jobs that write directly take the
 same project lock as the command line.
+
+### Live Preview
+
+When the open project has at least one `.html` file, the workspace panel grows
+a **🌐 Preview** tab beside Files / Backups / Logs: the page itself, rendered
+in a read-only iframe (`#live-preview-frame`) while you work on it.
+
+- Pick the page in the dropdown (`index.html` is the default). Relative CSS,
+  JS and image links resolve through the same read-only route, so the page
+  looks the way it will when served.
+- **⟳ Refresh** reloads the page; **↗ New tab** opens it in a full browser tab.
+- The preview reloads automatically when an Ask/Auto/New/Apply run finishes —
+  and while a run is writing, when the preview tab is open — so a website task
+  shows its result immediately.
+
+The route is `GET /preview/<path>` and never leaves the project root: `..`
+segments and symlinks that escape are refused, sensitive files are refused the
+same way as the file preview, and only the app's own origin may frame the page
+(`X-Frame-Options: SAMEORIGIN` plus a `frame-ancestors 'self'` CSP). It is
+read-only: nothing the page does can write back through it.
 
 ### Measurement and upkeep
 
@@ -1568,6 +1634,47 @@ runs it on demand (that invocation is the consent to run project code);
 with a wall-clock bound, so a page whose script never yields is stopped and
 reported as *not verified* instead of blocking the run. Unlike `webcheck`'s notice-level regex
 findings, this tool's errors can drive repair. See TECHNIQUES.md #45.
+
+## Creative / design mode
+
+The surgical-edit discipline — smallest possible diff, cool sampling, a tight
+reply budget — is right for a bug fix and wrong for a landing page. Design
+tasks therefore run in a different mode: the model answers as a **Senior
+Product Engineer & Visual Designer**, with
+
+- **warmer sampling** on local servers: the answer temperature is at least
+  `0.6` (`max(temperature_answer, 0.6)`), so the model explores layouts and
+  copy instead of repeating the first safe idea;
+- **room to finish**: the answer budget floors at **8192 tokens** (your
+  `request_max_tokens_cap` still caps it), so a whole page is not cut off
+  mid-`<div>`;
+- **whole-file rewrites**: a full `.html`/`.htm`/`.css`/`.md` replacement is
+  allowed, and the small-window oversized-rewrite brake and the fragment veto
+  stand down for creative tasks and restructure prompts (redesign, restyle,
+  reorganize, ...). The wipe refusal and the JS export guard still apply — a
+  rewrite may replace a page, never silently delete its substance.
+
+**Detection is automatic.** With `creative_auto = true` (the default), a task
+is creative when it targets UI files (`.html`, `.htm`, `.css`, `.svg`, `.jsx`,
+`.tsx`, `.vue`, `.svelte`) or reads like design work — website, portfolio,
+landing page, hero, dashboard, redesign, restyle, typography, color scheme —
+or asks to build/create a web or design artifact. A plain backend task keeps
+the surgical discipline even with detection on.
+
+**Force it, or turn it off:**
+
+| Where | Control |
+|---|---|
+| GUI | the **✨ Creative** button above the composer (Task/Auto/New runs); off = auto-detect |
+| TUI | `/creative on` (every task), `/creative auto` (detect, the default), `/creative off` (surgical everywhere); `/status` shows the state |
+| CLI | `--creative` on `ask`, `auto`, `new`, `chat`, `tui` |
+| Config | `creative_mode = true` forces every task; `creative_mode = false` + `creative_auto = false` disables detection |
+
+On a hosted API the persona and the reply budget still apply, but sampling
+stays with the provider — no temperature key is sent (see
+[Hosted APIs keep their own sampling](#hosted-apis-keep-their-own-sampling)).
+Pair the mode with the GUI's [Live Preview](#live-preview) to watch the page
+change as the run writes it.
 
 ## How context is managed
 
@@ -1989,7 +2096,7 @@ config --reference` prints the annotated template. Key settings:
 | `api_key` / `api_key_env` | `"lm-studio"` / `""` | For hosted APIs and secured servers. `api_key_env` stores the *name* of an environment variable holding the key, so the secret never lands in the config file. |
 | `vram_gb` | *(required for local)* | GPU VRAM; set in `[universal]`, overridable per profile. |
 | `context_tokens` | `8192` | Server-side context window. With `auto_detect_context` on (the default) the server's reported window replaces it; set it explicitly when detection is wrong. |
-| `small_context_tokens` / `max_whole_file_lines` | 16384 / 120 | A window at or below `small_context_tokens` counts as "small": the answer brief then demands chunked/anchored edits, and a whole-file rewrite of a file bigger than `max_whole_file_lines` is refused before it lands (unless the task explicitly asks to rewrite that file). `small_context_tokens = 0` turns the discipline off. |
+| `small_context_tokens` / `max_whole_file_lines` | 16384 / 120 | A window at or below `small_context_tokens` counts as "small": the answer brief then demands chunked/anchored edits, and a whole-file rewrite of a file bigger than `max_whole_file_lines` is refused before it lands (unless the task explicitly asks to rewrite that file, is a creative/design task, or targets `.html`/`.htm`/`.css`/`.md` — see [Creative / design mode](#creative--design-mode)). `small_context_tokens = 0` turns the discipline off. |
 | `k_cache_quant` / `v_cache_quant` | `""` | KV-cache quantization the runtime uses. |
 | `json_mode` | `"schema"` | `"schema"` for local servers, `"object"` for hosted (auto-switched). |
 | `enforce_json_schema` | true | Ask the engine to constrain gather steps with `response_format` json_schema (strict); servers that refuse are downgraded to json_object, then plain prompting, per model. |
@@ -2001,13 +2108,17 @@ config --reference` prints the annotated template. Key settings:
 | `tier` | `""` | Budget preset: `tiny`/`small`/`medium`/`large`/`hosted`; guessed from the model name when unset. |
 | `max_steps` | 0 | Lookup limit per task; 0 = none. |
 | `prefetch_targets` | 0 | Read up to this many task-named files/symbols through the normal tool path before the first lookup step (and once more after gather when a named target is still unread). Prefetch reads don't count toward `max_steps`. |
-| `temperature` | 0.2 | Higher values make tool selection worse. |
-| `temperature_answer` / `temperature_repair` | 0 / unset | Sampling temperature for the answer and for the repair re-asks, which copy SEARCH text character for character. The answer defaults to `0` (greedy, so copied text is exact); the repair re-asks are unset (they use `temperature`). Gather keeps `temperature`; `best_of` candidates run at the answer temperature + 0.4. |
+| `temperature` | 0.2 | Higher values make tool selection worse. Local servers only: hosted APIs get no sampling keys by default (see [Hosted APIs keep their own sampling](#hosted-apis-keep-their-own-sampling)). |
+| `temperature_answer` / `temperature_repair` | 0.3 / unset | Sampling temperature for the answer and for the repair re-asks, which copy SEARCH text character for character. The answer defaults to `0.3` — cool enough to copy exactly, warm enough to escape verbatim repetition loops (a greedy `0` froze weak local models); creative/design tasks run at ≥ 0.6. The repair re-asks are unset (they use `temperature`). Gather keeps `temperature`; `best_of` candidates run at the answer temperature + 0.4. |
+| `send_temperature_to_hosted` | false | Send the configured `temperature` to hosted APIs anyway. The other sampling keys (`top_p`, `top_k`, `min_p`, `repeat_penalty`) stay omitted either way. |
+| `hosted_temperature` | unset | Pin one temperature for hosted endpoints, globally or per profile (e.g. `1.0` for Claude); it wins over phase overrides and is the only sampling key sent. Unset: the provider's own default applies. Local servers ignore it. |
 | `backup` | true | Snapshot originals before writing. |
 | `log_sessions` | true | Write a session record per task. |
 | `review` | false | Always use the review page. |
 | `fuzzy_match` | false | Anchor near-miss search blocks approximately. |
 | `edit_style` | unset | `quote` (default brief) or `anchor` (prefer `SYMBOL` + full definition, SEARCH only for small edits); unset lets the model card decide. |
+| `creative_mode` | false | Creative/design (Builder) mode for EVERY task: designer persona, answer temperature ≥ 0.6 on local servers, an ≥ 8192-token reply budget, whole-file HTML/CSS rewrites. `--creative`, TUI `/creative on`, or the GUI's ✨ Creative toggle set it per run. See [Creative / design mode](#creative--design-mode). |
+| `creative_auto` | true | Auto-detect design tasks (website/portfolio/redesign prompts, `.html`/`.css`/`.svg`/`.jsx`/`.tsx`/`.vue`/`.svelte` targets) when `creative_mode` is off. Both false = surgical edits everywhere (`/creative off`). |
 | `post_edit_check` | true | After applied edits, feed back only NEW linter/syntax findings on the changed files. |
 | `auto_allowlist` | false | Restrict `auto` task writes to files the title names or the lookup read (new files always allowed). |
 | `allow_write` | false | Whole-file write/append/move/delete during gathering. From a project's own config: ignored until `pedacito trust`. |

@@ -61,7 +61,7 @@ from . import steering as steering_mod
 from . import todo as todo_mod
 from .config import is_hosted
 from .edits import Result, apply_edits, locate, malformed_blocks, parse_edits
-from .llm import LLMError, estimate_messages, estimate_tokens
+from .llm import LLMError, _is_local_server, estimate_messages, estimate_tokens
 from .tools import TOOL_HELP, dispatch, mcp_injection, schema_for
 
 # Re-asks after a gather step reply dies at the output cap or has no salvageable
@@ -1361,22 +1361,60 @@ class Agent:
         self.fold_count = 0
         self.answer_mode_used = "rebuild"
         self._gather_task = ""
+        # Creative/design (Builder) mode for the current task: warmer answer
+        # sampling, a >= 8192-token reply floor, the designer persona, and the
+        # whole-rewrite bypass. Set per task by gather/answer/apply_edit_intents.
+        self._creative_task = False
         self._rules_shown: set[str] = set()
         # SEARCH blocks that matched nowhere in the file, over every apply()
         # round of this agent (the eval row reports it next to repair calls).
         self.search_mismatches = 0
 
     # ------------------------------------------------------------ helpers
+    def _creative_for(self, task: str) -> bool:
+        """Whether creative/design (Builder) mode applies to this task: forced
+        by `creative_mode`, else auto-detected from the task and its file
+        targets when `creative_auto` is on."""
+        if getattr(self.cfg, "creative_mode", False):
+            return True
+        if not getattr(self.cfg, "creative_auto", True):
+            return False
+        try:
+            targets = sorted(self._task_file_targets(task)) if task else []
+        except Exception:
+            targets = []
+        return prompts_mod.is_creative_or_design_task(task, targets)
+
+    def _answer_max_tokens(self, budget: int | None) -> int:
+        """The answer reply budget. Creative/design tasks get a >= 8192-token
+        floor so a whole page is not cut off mid-file; request_max_tokens_cap
+        and chat()'s window-fit still bound it. Non-creative tasks keep the
+        configured budget unchanged."""
+        base = int(budget or self.cfg.max_tokens_answer)
+        if not getattr(self, "_creative_task", False):
+            return base
+        base = max(base, 8192)
+        cap = int(getattr(self.cfg, "request_max_tokens_cap", 0) or 0)
+        return min(base, cap) if cap else base
+
     def _phase_temp(self, setting: str, client=None):
         """Context manager that samples at `cfg.<setting>`
         (temperature_answer / temperature_repair) for the calls inside it.
         A no-op when the setting is None (the global temperature applies),
         when the client cannot override (replay), or when an outer override is
         already active (best_of's higher temperature for its extra candidates
-        must not be reset to the answer value)."""
+        must not be reset to the answer value). A creative/design answer runs
+        warm (>= 0.6) on local servers; hosted endpoints tune their own
+        sampling and receive no temperature key at all (see llm.py)."""
         client = self.client if client is None else client
         cfg = getattr(client, "cfg", None) or self.cfg
         value = getattr(cfg, setting, None)
+        if setting == "temperature_answer" \
+                and getattr(self, "_creative_task", False) \
+                and _is_local_server(cfg):
+            base = float(value) if value is not None \
+                else float(getattr(cfg, "temperature", 0.3))
+            value = max(base, 0.6)
         if value is None or not hasattr(client, "temperature") \
                 or getattr(client, "_temp_override", None) is not None:
             return contextlib.nullcontext()
@@ -2265,6 +2303,7 @@ class Agent:
         self._lossy = False          # True once history was folded/evicted
         self.fold_count = 0
         self._gather_task = task
+        self._creative_task = self._creative_for(task)
         self._rules_shown: set[str] = set()
         # Fresh evidence store and rehydration counters for this run, like
         # the ledger and backup dir below.
@@ -3501,6 +3540,7 @@ class Agent:
 
         Samples at `temperature_answer` when set (the reply copies SEARCH text
         character for character from what was read)."""
+        self._creative_task = self._creative_for(task)
         with self._phase_temp("temperature_answer"):
             return self._answer(task, gathered, stream, system, max_tokens,
                                 include_edit_format)
@@ -3950,6 +3990,7 @@ class Agent:
         it like any other call."""
         from . import verify as verify_mod
         self._set_site("answer")
+        self._creative_task = self._creative_for(task)
         system = self._answer_sys(task) + (
             "\n\nINCREMENTAL EDIT MODE: you are editing ONE symbol at a time. "
             "Emit exactly ONE search/replace block and nothing else. Prefer "
@@ -4585,12 +4626,17 @@ class Agent:
         """The default answer-phase system prompt (pack-aware, overridable;
         a test-shaped `task` adds the value-bound test rules). A small-window
         profile also gets the context-pressure edit discipline, naming the
-        task's files already over the whole-file ceiling."""
-        text = prompts_mod.answer_system(self.cfg, EDIT_FORMAT, task)
-        note = prompts_mod.small_window_note(
-            self.cfg, self._large_target_files(task))
-        if note:
-            text += "\n\n" + note
+        task's files already over the whole-file ceiling. A creative/design
+        task gets the Builder persona and brief and skips that discipline --
+        whole-page rewrites are the point, not a context-pressure accident."""
+        creative = getattr(self, "_creative_task", False)
+        text = prompts_mod.answer_system(self.cfg, EDIT_FORMAT, task,
+                                         creative=creative)
+        if not creative:
+            note = prompts_mod.small_window_note(
+                self.cfg, self._large_target_files(task))
+            if note:
+                text += "\n\n" + note
         return text
 
     def _large_target_files(self, task: str) -> list[str]:
@@ -4626,11 +4672,14 @@ class Agent:
                       task: str = "") -> str:
         """The answer-phase instructions: the default edit brief, or a
         caller's system text (plus the edit format when asked)."""
+        creative = getattr(self, "_creative_task", False)
         if system is None:
-            return prompts_mod.answer_system(self.cfg, EDIT_FORMAT, task)
+            return prompts_mod.answer_system(self.cfg, EDIT_FORMAT, task,
+                                             creative=creative)
         brief = system.rstrip()
         if include_edit_format:
-            brief += "\n\n" + prompts_mod.edit_format(self.cfg, EDIT_FORMAT)
+            brief += "\n\n" + prompts_mod.edit_format(self.cfg, EDIT_FORMAT,
+                                                      creative=creative)
         return brief
 
     def _answer_mode(self) -> str:
@@ -4655,7 +4704,7 @@ class Agent:
         if len(msgs) < 2 or self._lossy:
             return False
         est = getattr(self.client, "estimate_tokens", None) or estimate_tokens
-        reply_room = min(max_tokens or self.cfg.max_tokens_answer,
+        reply_room = min(self._answer_max_tokens(max_tokens),
                          self.cfg.request_max_tokens_cap
                          or self.cfg.max_tokens_answer)
         need = (estimate_messages(msgs, est) + est(brief) + est(task)
@@ -4692,7 +4741,7 @@ class Agent:
             # rewritten and the extra round costs a cache hit, not a miss.
             return self._chat_needs(
                 lambda m: self.client.chat(
-                    m, max_tokens=max_tokens or self.cfg.max_tokens_answer,
+                    m, max_tokens=self._answer_max_tokens(max_tokens),
                     stream=stream),
                 msgs)
         except LLMError as e:
@@ -4746,7 +4795,7 @@ class Agent:
                     f"TASK\n{task}" + need_hint)
 
         est = getattr(self.client, "estimate_tokens", None) or estimate_tokens
-        reply_room = min(max_tokens or self.cfg.max_tokens_answer,
+        reply_room = min(self._answer_max_tokens(max_tokens),
                          self.cfg.request_max_tokens_cap or
                          self.cfg.max_tokens_answer)
         hosted = is_hosted(self.cfg)
@@ -4815,7 +4864,7 @@ class Agent:
         print(f"[answer context ~{est(user)} tokens]", file=sys.stderr)
         return self._chat_needs(
             lambda m: self.client.chat(
-                m, max_tokens=max_tokens or self.cfg.max_tokens_answer,
+                m, max_tokens=self._answer_max_tokens(max_tokens),
                 stream=stream),
             [{"role": "system", "content": brief},
              {"role": "user", "content": user}])
@@ -4921,7 +4970,7 @@ class Agent:
                 "temperature_answer",
                 [{"role": "system", "content": self._answer_sys()},
                  {"role": "user", "content": prompt}],
-                max_tokens=self.cfg.max_tokens_answer,
+                max_tokens=self._answer_max_tokens(None),
                 stream=True,
             )
             more_has_edits = bool(parse_edits(more))

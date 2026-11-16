@@ -177,6 +177,11 @@ COMMON_FLAGS = [
     {"flag": "--no-auto-route",
      "help": "keep every task on the active profile, even when "
              "auto_route_specialties is on in the config"},
+    {"flag": "--creative",
+     "help": "creative/design (Builder) mode for every task: the designer "
+             "persona, warmer answer sampling, an >=8192 token reply budget "
+             "and whole-file HTML/CSS rewrites (design tasks are "
+             "auto-detected even without it)"},
     {"flag": "--record",
      "help": "save model responses to .pedacito/replay/<stamp>.jsonl"},
     {"flag": "--replay FILE",
@@ -342,6 +347,9 @@ CLI_COMMANDS = [
             {"flag": "--auto-install",
              "help": "with --complex --verify: pip-install missing modules"},
             {"flag": "--no-review", "help": "never open the reviewer"},
+            {"flag": "--creative",
+             "help": "creative/design (Builder) mode: designer persona, warmer "
+                     "sampling, whole-file HTML/CSS rewrites"},
             {"flag": "--url URL", "help": "server base URL override"},
             {"flag": "--model ID", "help": "model id override"},
             {"flag": "--config FILE", "help": "use this config file as well"},
@@ -371,6 +379,9 @@ CLI_COMMANDS = [
         "notes": [
             "/profile NAME switches model profile; /model ID switches model",
             "/apply on|off toggles writes; /steps N sets the lookup cap",
+            "--creative starts the session in creative/design (Builder) "
+            "mode; design tasks are auto-detected even without it "
+            "(/creative on|off|auto lives in the TUI)",
             "/status, /cost, /memory, /skills, /profiles, /quit",
             "/consolidate (alias /compact) compacts the session into a "
             "handoff checkpoint; the next task starts from the handoff alone",
@@ -414,6 +425,9 @@ CLI_COMMANDS = [
             {"flag": "--profile NAME", "help": "apply a profile block"},
             {"flag": "--auto-route", "help": "turn specialist routing on"},
             {"flag": "--no-think", "help": "start with thinking disabled"},
+            {"flag": "--creative",
+             "help": "start in creative/design (Builder) mode; /creative "
+                     "switches on|off|auto inside the TUI"},
         ],
         "notes": [
             "Zones: header (project/profile/model/calibration/Auto-Route/"
@@ -424,8 +438,8 @@ CLI_COMMANDS = [
             "cache, folds and Active model/role",
             "Slash commands: /help, /keys, /status (/telemetry), /auto GOAL, "
             "/plan, /consolidate (/compact), /profile, /model ID, "
-            "/auto-route, /think, /apply, /skills, /memory, /procs, /diff, "
-            "/undo, /reset, /sidebar, /scroll, /mouse, /clear, /quit",
+            "/auto-route, /think, /creative, /apply, /skills, /memory, /procs, "
+            "/diff, /undo, /reset, /sidebar, /scroll, /mouse, /clear, /quit",
             "Keys: PgUp/PgDn scroll the transcript, Shift+Up/Down scroll 3 "
             "lines, Alt+PgUp/PgDn scroll the sidebar, Up/Down recall command "
             "history, Left/Right/Home/End edit the prompt, and Tab completes "
@@ -2243,6 +2257,104 @@ GUI_TOPICS = [
         "settings": ["edit_style", "post_edit_check"],
         "cli": ["ask"],
     },
+    {
+        "id": "creative-mode",
+        "title": "Creative / design mode: the Builder persona "
+                 "(creative_mode, creative_auto)",
+        "summary": "Design tasks -- websites, landing pages, dashboards, "
+                   "restyles, .html/.css/.svg/.jsx/.tsx/.vue/.svelte work -- "
+                   "run as a Senior Product Engineer & Visual Designer: "
+                   "warmer answer sampling (>= 0.6 on local servers), an "
+                   ">= 8192-token reply budget, and whole-file HTML/CSS "
+                   "rewrites instead of the smallest-diff discipline. "
+                   "creative_auto detects them by default; creative_mode "
+                   "forces it for every task. Hosted APIs keep their own "
+                   "sampling and receive no temperature key.",
+        "steps": [
+            "In the GUI: the ✨ Creative button above the composer forces the "
+            "Builder persona for the next Task/Auto/New run; with it off, "
+            "design tasks are still auto-detected",
+            "In the TUI: /creative on (every task), /creative auto (detect "
+            "design tasks, the default), /creative off (surgical edits "
+            "everywhere); /status shows the current state",
+            "On the CLI: --creative forces it for the run (ask, auto, new, "
+            "chat, tui)",
+            "Or set creative_mode = true / creative_auto = false in "
+            "config.toml (⚙ Settings → All settings → search creative_mode)",
+            "The fragment veto and the small-window oversized-rewrite brake "
+            "stand down for whole .html/.htm/.css/.md rewrites and creative "
+            "tasks; the wipe refusal and the JS export guard still apply",
+        ],
+        "keywords": ["creative", "creative mode", "design", "design mode",
+                     "builder", "builder mode", "ui polish", "designer persona",
+                     "website", "landing page", "portfolio", "dashboard",
+                     "restyle", "redesign", "whole file rewrite",
+                     "html rewrite", "css rewrite", "visual design"],
+        "settings": ["creative_mode", "creative_auto", "temperature_answer"],
+        "cli": ["ask", "auto", "new", "chat", "tui"],
+    },
+    {
+        "id": "live-preview",
+        "title": "Live Preview: see the project's HTML as you build it "
+                 "(🌐 Preview tab)",
+        "summary": "When the project has .html pages, the workspace panel "
+                   "grows a 🌐 Preview tab: a read-only iframe served from "
+                   "/preview/ inside the project root. It reloads when a run "
+                   "finishes -- and while a run writes -- so a website task "
+                   "shows its result immediately.",
+        "steps": [
+            "Open a project with at least one .html file: the 🌐 Preview tab "
+            "appears beside Files / Backups / Logs",
+            "Pick the page in the dropdown (index.html is the default); "
+            "relative CSS/JS/image links resolve through the same read-only "
+            "route",
+            "⟳ Refresh reloads the page; ↗ New tab opens it in a full browser "
+            "tab",
+            "After Ask/Auto/New/Apply finishes -- and while a run changes "
+            "files -- the preview reloads automatically",
+            "Safety: the route never leaves the project root (.. and symlinks "
+            "are refused), never serves sensitive files, and only the app's "
+            "own origin may frame it",
+        ],
+        "keywords": ["preview", "live preview", "iframe", "html preview",
+                     "web preview", "see the page", "preview tab",
+                     "refresh page", "website preview", "live view"],
+        "settings": [],
+        "cli": ["gui"],
+    },
+    {
+        "id": "hosted-sampling",
+        "title": "Hosted APIs keep their own sampling "
+                 "(send_temperature_to_hosted, hosted_temperature)",
+        "summary": "A hosted provider (any non-local base_url) tunes sampling "
+                   "per model itself, so pedacito sends it NO temperature, "
+                   "top_p, top_k, min_p or repeat_penalty by default -- "
+                   "including keys from the sampler table. Local servers "
+                   "(loopback or LAN) keep every configured value, and a "
+                   "repetition retry gets one gentle presence_penalty = 0.15 "
+                   "nudge instead of a cold temperature.",
+        "steps": [
+            "Nothing to click: hosted requests omit the five sampling keys by "
+            "default, so the provider's tuned defaults apply",
+            "To send the configured temperature anyway: "
+            "send_temperature_to_hosted = true (⚙ Settings → All settings → "
+            "search send_temperature_to_hosted); the other four keys stay "
+            "omitted",
+            "To pin one temperature for hosted endpoints (e.g. 1.0 for "
+            "Claude): hosted_temperature = 1.0, globally or in a profile; it "
+            "wins over phase overrides",
+            "Local servers keep temperature/top_p/top_k/min_p/repeat_penalty; "
+            "temperature_answer defaults to 0.3 (cool, not greedy) and "
+            "creative tasks run at >= 0.6",
+        ],
+        "keywords": ["hosted temperature", "sampling", "temperature",
+                     "top_p", "top_k", "min_p", "repeat_penalty",
+                     "provider defaults", "api sampling", "send temperature",
+                     "pinned temperature", "presence penalty", "repetition"],
+        "settings": ["send_temperature_to_hosted", "hosted_temperature",
+                     "temperature", "temperature_answer", "sampler"],
+        "cli": ["config", "profiles"],
+    },
 ]
 
 TOPICS = [
@@ -2260,6 +2372,8 @@ TOPICS = [
      "How do I reset my settings or config to the baseline?"),
     ("Reference a file in chat",
      "How do I reference a file in chat?"),
+    ("Creative / design mode",
+     "How do I turn on creative mode for design tasks?"),
 ]
 
 
@@ -2301,6 +2415,10 @@ _SETTING_GUI = {
                    "Capabilities → specialties (tag pills + custom tag)",
     "auto_route_specialties": "Topbar → ✦ Auto-route checkbox, or ⚙ Settings "
                               "→ All settings → search auto_route_specialties",
+    "creative_mode": "✨ Creative button above the composer, or ⚙ Settings → "
+                     "All settings → search creative_mode",
+    "creative_auto": "⚙ Settings → All settings → search creative_auto "
+                     "(auto-detect design tasks when creative_mode is off)",
     "auto_route_allow_hosted": "⚙ Settings → All settings → search "
                                "auto_route_allow_hosted (off = local-only "
                                "routing)",
@@ -2442,6 +2560,15 @@ _SETTING_KEYWORDS = {
                     "remember commands", "micro facts"],
     "max_micro_fact_tokens": ["lesson budget", "micro fact budget"],
     "edit_style": ["symbol edit", "anchor edit", "splice", "search replace"],
+    "creative_mode": ["creative", "creative mode", "design mode", "builder",
+                      "ui polish", "designer persona", "website builder"],
+    "creative_auto": ["creative auto", "detect design tasks", "auto creative",
+                      "design detection"],
+    "send_temperature_to_hosted": ["hosted temperature", "send temperature",
+                                   "provider sampling", "api temperature",
+                                   "temperature opt-in"],
+    "hosted_temperature": ["hosted temperature", "pinned temperature",
+                           "claude temperature", "provider temperature"],
 }
 
 

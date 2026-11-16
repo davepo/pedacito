@@ -102,6 +102,11 @@ def _add_common(p, paths_nargs="+", dest="paths"):
     p.add_argument("--no-auto-route", dest="no_auto_route", action="store_true",
                    help="keep every task on the active profile, even when "
                         "auto_route_specialties is on in the config")
+    p.add_argument("--creative", action="store_true",
+                   help="creative/design (Builder) mode for every task: the "
+                        "designer persona, warmer answer sampling, an >=8192 "
+                        "token reply budget and whole-file HTML/CSS rewrites "
+                        "(design tasks are auto-detected even without it)")
     p.add_argument("--record", action="store_true",
                    help="save this run's model responses to "
                         ".pedacito/replay/<stamp>.jsonl")
@@ -178,6 +183,9 @@ def _config(args) -> Config:
     if getattr(args, "no_auto_route", False):
         cfg.auto_route_specialties = False
         cfg.sources["auto_route_specialties"] = "--no-auto-route"
+    if getattr(args, "creative", False):
+        cfg.creative_mode = True
+        cfg.sources["creative_mode"] = "--creative"
     if getattr(args, "ext", None):
         cfg.extra_extensions = tuple(args.ext)
     if getattr(args, "url", None):
@@ -2755,6 +2763,11 @@ def build_parser() -> argparse.ArgumentParser:
                        action="store_true",
                        help="(with --complex) keep every task on the active "
                             "profile")
+    p_new.add_argument("--creative", action="store_true",
+                       help="creative/design (Builder) mode: the designer "
+                            "persona, warmer answer sampling and whole-file "
+                            "HTML/CSS rewrites (design tasks are auto-detected "
+                            "even without it)")
     p_new.add_argument("--refine", action="store_true",
                        help="expand the project description into a concrete, "
                             "sectioned spec (with interface contracts) before "

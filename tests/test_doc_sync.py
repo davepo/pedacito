@@ -15,7 +15,10 @@ The docs and the built-in `how` index must keep pace with the code:
   topbar toggle, the specialist-routing how-card) stays documented;
 * the calibration/telemetry pass (calibrate --all, the hosted lockout,
   the architecture library, the telemetry ribbon and GUI footer) stays
-  documented.
+  documented;
+* the creative/design pass (--creative, /creative, the ✨ Creative
+  composer toggle, the 🌐 Live Preview tab, hosted sampling omission)
+  stays documented in both guides and in the how-cards.
 """
 from __future__ import annotations
 
@@ -155,6 +158,17 @@ FEATURE_NEEDLES = [
     ("/consolidate", "chat consolidation slash command"),
     ("Consolidate Session", "GUI consolidation button"),
     ("consolidated_session.md", "consolidation checkpoint file"),
+    ("--creative", "creative mode CLI flag"),
+    ("/creative", "TUI creative slash command"),
+    ("creative_mode", "creative mode setting"),
+    ("creative_auto", "creative auto-detect setting"),
+    ("✨ Creative", "GUI creative toggle"),
+    ("Senior Product Engineer & Visual Designer", "the Builder persona"),
+    ("🌐 Preview", "GUI Live Preview tab"),
+    ("Live Preview", "the Live Preview feature"),
+    ("send_temperature_to_hosted", "hosted temperature opt-in"),
+    ("hosted_temperature", "hosted temperature pin"),
+    ("presence_penalty", "the local repetition nudge"),
 ] + [(label, "Project ▾ upkeep dialog") for label in PROJECT_MENU_LABELS]
 
 
@@ -249,6 +263,28 @@ def test_how_cards_cover_the_new_features():
     assert "Consolidate Session" in con_steps
     assert "Goal & Context" in con_steps
     assert "/compact" in con_steps
+    # The creative/design + hosted-sampling pass: flags, cards and topics.
+    assert any(f["flag"] == "--creative" for f in how_index.COMMON_FLAGS)
+    assert any(f["flag"] == "--creative" for f in cards["new"]["flags"])
+    assert any(f["flag"] == "--creative" for f in cards["tui"]["flags"])
+    assert "/creative" in " ".join(cards["tui"]["notes"])
+    assert "--creative" in " ".join(cards["chat"]["notes"])
+    creative = topics["creative-mode"]
+    cre_steps = " ".join(creative["steps"])
+    assert "✨ Creative" in cre_steps
+    assert "/creative" in cre_steps
+    assert "--creative" in cre_steps
+    assert "creative_mode" in creative["settings"]
+    assert "creative_auto" in creative["settings"]
+    preview = topics["live-preview"]
+    pre_steps = " ".join(preview["steps"])
+    assert "🌐 Preview" in pre_steps
+    assert "Refresh" in pre_steps
+    assert preview["cli"] == ["gui"]
+    hosted = topics["hosted-sampling"]
+    assert "send_temperature_to_hosted" in hosted["settings"]
+    assert "hosted_temperature" in hosted["settings"]
+    assert "presence_penalty" in hosted["summary"] + " ".join(hosted["steps"])
 
 
 def test_how_topic_references_resolve():
@@ -271,6 +307,10 @@ def test_how_topic_references_resolve():
     ("how do I calibrate all my local models?", "calibrate-model"),
     ("how do I create a custom skill?", "skills-library"),
     ("how do I consolidate a long session?", "consolidate-session"),
+    ("how do I turn on creative mode for design tasks?", "creative-mode"),
+    ("how do I preview my html page in the gui?", "live-preview"),
+    ("why does pedacito not send temperature to my hosted api?",
+     "hosted-sampling"),
 ])
 def test_new_topics_are_retrievable(question, topic):
     ids = [m["id"] for m in how_index.search(question)["gui"]]

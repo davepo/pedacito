@@ -690,8 +690,11 @@ def run_task(job: Job, opts: dict) -> None:
     cfg, client, root = p.cfg, p.client, p.root
 
     saved_steps = cfg.max_steps
+    saved_creative = cfg.creative_mode
     if steps > 0:
         cfg.max_steps = steps
+    if "creative" in opts:
+        cfg.creative_mode = bool(opts.get("creative"))
     try:
         with session(p, job, interactive=True, lock=apply) as feed:
             if opts.get("reindex"):
@@ -727,6 +730,7 @@ def run_task(job: Job, opts: dict) -> None:
             _post_task_result(tr, client, reviewing)
     finally:
         cfg.max_steps = saved_steps
+        cfg.creative_mode = saved_creative
 
 
 def _now() -> float:
@@ -920,6 +924,9 @@ def run_auto(job: Job, opts: dict) -> None:
     # have nothing to roll back to.
     before_backups = set(workspace.list_backups(root)) if apply else set()
     saved_backup = getattr(cfg, "backup", True)
+    saved_creative = cfg.creative_mode
+    if "creative" in opts:
+        cfg.creative_mode = bool(opts.get("creative"))
     # An applying Auto run accepts the tool trust boundary: the lookup phase
     # may move, write, delete and run commands even when the global opt-ins
     # are off. Plan-only keeps the user's real settings (it must not write).
@@ -936,6 +943,7 @@ def run_auto(job: Job, opts: dict) -> None:
             code = cli_mod._cmd_auto(ns, cfg, client, STATE.idx, root)
             feed.end_stream()
     finally:
+        cfg.creative_mode = saved_creative
         if apply:
             cfg.backup = saved_backup
             for name, value in saved_optins.items():
@@ -1015,6 +1023,8 @@ def run_new(job: Job, opts: dict) -> None:
         parent = parent.parent
     args = args_for(str(parent), profile)
     cfg = cli_mod._config(args)
+    if "creative" in opts:
+        cfg.creative_mode = bool(opts.get("creative"))
     client = LLMClient(cfg)
     client.check(warn=False)
     spec = scaffold.load_spec(prompt=spec_text, max_chars=cfg.max_spec_chars)

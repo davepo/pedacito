@@ -182,6 +182,14 @@ requirements and edge cases, and verification. Read it, edit it if you like, the
 click **Run**. **↶ Undo Refine** puts your original text back. Drag the top edge of
 the composer to make it taller while you read.
 
+**Building something visual?** Click **✨ Creative** above the composer to force
+creative/design (Builder) mode for the next Task/Auto/New run: a Senior Product
+Engineer & Visual Designer persona, warmer sampling and whole-file HTML/CSS
+rewrites instead of the smallest-diff discipline. With the toggle off, design
+tasks (websites, restyles, `.html`/`.css`/UI-component work) are still
+auto-detected — that is `creative_auto`; `creative_mode = true` in the config
+forces it for every task (A21).
+
 ### A6. Ask a question (Ask)
 
 Choose **Ask** to ask how the code works. The answer streams in and nothing is
@@ -300,6 +308,10 @@ the checked IP so a second DNS answer cannot swap it mid-request.
 - **Steer:** while a task runs, type a note to redirect the model. You can also
   answer its clarifying questions inline, or click **Stop**.
 - **Terminal:** the bottom panel shows everything Pedacito prints, live.
+- **🌐 Preview:** when the project has `.html` pages, a Live Preview tab joins
+  Files / Backups / Logs and renders the page in a read-only iframe. It reloads
+  when a run finishes — and while a run writes — so you see the result
+  immediately (A22).
 
 ### A15. Rename a symbol across the project
 
@@ -420,6 +432,49 @@ Modified & Key Decisions, Verified Test Status, Open Next Steps — saved to
 On the CLI: `/consolidate` (alias `/compact`) inside `pedacito chat`, or
 `pedacito memory PROJ --consolidate` over the newest session transcripts.
 Over RPC: `{"id": 1, "op": "consolidate"}`.
+
+### A21. Creative / design mode (the Builder persona)
+
+A bug fix wants the smallest possible diff; a landing page wants a designer.
+Pedacito tells them apart automatically: with `creative_auto = true` (the
+default), a task that targets UI files (`.html`, `.htm`, `.css`, `.svg`,
+`.jsx`, `.tsx`, `.vue`, `.svelte`) or reads like design work — website,
+portfolio, landing page, hero, dashboard, redesign, restyle — runs as a
+**Senior Product Engineer & Visual Designer**:
+
+- the answer temperature rises to at least `0.6` on local servers, so the
+  model explores instead of repeating the first safe idea;
+- the reply budget floors at 8192 tokens (your `request_max_tokens_cap`
+  still caps it), so a whole page is not cut off mid-`<div>`;
+- whole-file `.html`/`.css` rewrites are allowed: the fragment veto and the
+  small-window oversized-rewrite brake stand down (the wipe refusal and the
+  JS export guard still apply).
+
+To force it for **every** task, click **✨ Creative** above the composer, pass
+`--creative` on the CLI, type `/creative on` in the TUI, or set
+`creative_mode = true` in the config. `/creative auto` restores detection and
+`/creative off` (both settings false) keeps surgical edits everywhere;
+`/status` shows the current state. On a hosted API the persona and budget
+still apply, but the provider keeps its own sampling (see "Several models:
+profiles" below).
+
+### A22. Live Preview: watch the page as you build it
+
+When the open project has at least one `.html` file, the workspace panel grows
+a **🌐 Preview** tab beside Files / Backups / Logs.
+
+1. Open the tab and pick the page in the dropdown (`index.html` is the
+   default). Relative CSS/JS/image links resolve through the same read-only
+   route, so the page looks the way it will when served.
+2. Run a website task. The preview reloads automatically when the run
+   finishes — and while it writes, when the tab is open.
+3. **⟳ Refresh** reloads the page by hand; **↗ New tab** opens it in a full
+   browser tab.
+
+The preview is read-only and never leaves the project root: `..` segments and
+escaping symlinks are refused, sensitive files are refused, and only the app's
+own origin may frame the page. Pair it with ✨ Creative (A21) for the full
+design loop.
 
 ---
 
@@ -591,6 +646,16 @@ a function that still has callers. Errors trigger one corrected retry. Every tas
 ends with a usage line that shows calls, tokens in and out, the server's
 prompt-cache hit ratio, and the cost if you set prices.
 
+For design work, add `--creative` (creative/design Builder mode: designer
+persona, warmer sampling, whole-file HTML/CSS rewrites — A21):
+
+```bash
+pedacito ask ~/code/site -t "redesign the landing page hero" --creative
+```
+
+Design tasks are auto-detected even without the flag (`creative_auto`);
+`--creative` forces the mode for every task in the run.
+
 ### B6. Review, then apply
 
 Review first. This opens an offline page with your current file on the left and
@@ -713,7 +778,9 @@ live bottom. A scrolled-back view shows `[ ↑ Scrolled back N lines ... ]` and
 stays stationary as new log lines arrive.
 
 Type a task as usual, or use `/help`, `/keys`, `/status`, `/auto GOAL`,
-`/plan`, `/consolidate`, `/profile`, `/auto-route`, `/think`, `/apply`,
+`/plan`, `/consolidate`, `/profile`, `/auto-route`, `/think`,
+`/creative [on|off|auto]` (design mode: on = every task, auto = detect design
+tasks, off = surgical edits), `/apply`,
 `/skills`, `/memory`, `/procs`, `/diff`, `/undo`, `/reset`, `/sidebar`,
 `/scroll up|down|top|bottom|N`, `/mouse [on|off]`, `/clear` and `/quit`.
 Permission prompts appear in the prompt bar (`y` once, `a` for the session,
@@ -842,6 +909,18 @@ Model names differ by server. LM Studio and Lemonade use the id that
 Switching models makes the server load the new one, which can take a minute or
 two. Pedacito waits for it (`load_wait_seconds`, default 240).
 
+**Hosted APIs keep their own sampling.** A profile with a non-local `base_url`
+(the `[profiles.api]` above) receives no `temperature`, `top_p`, `top_k`,
+`min_p` or `repeat_penalty` by default — including keys from the `sampler`
+table — so the provider's tuned defaults apply. To send the configured
+temperature anyway, set `send_temperature_to_hosted = true`; to pin one value
+for hosted endpoints (e.g. `1.0` for Claude), set `hosted_temperature = 1.0`
+globally or in the profile. Either way only `temperature` is sent; the other
+four keys stay omitted. Local servers (loopback or LAN) keep every configured
+value: `temperature_answer` defaults to `0.3` (cool, not greedy), creative
+tasks run at ≥ 0.6, and a reply that repeats itself gets one gentle
+`presence_penalty = 0.15` nudge on the retry instead of a cold temperature.
+
 To send only the lookup steps to a smaller profile, set `scout_profile` to its name,
 for example `scout_profile = "scout"` in `[universal]`. The active profile still
 plans, answers and edits. The [model guide](MODEL_GUIDE.md#dual-gpu--dual-model-scout--architect-routing-scout_profile)
@@ -896,6 +975,8 @@ the same names to work from.
 | `Model would not produce valid JSON` | Usually a truncated reply. Pedacito retries with more room. If it persists, raise `max_tokens_step`. A thinking model that spends its whole budget reasoning returns no JSON, so turn thinking off for that profile. |
 | Every request fails, or "kept hitting limits" | The request is bigger than the server's context window. Check the `[auto-fit]` line printed at startup. If the server reports a stale window, set `context_tokens` (and `k_cache_quant` / `v_cache_quant` for a quantized cache). |
 | The answer is nonsense on a local server | Some servers (Ollama) silently truncate an oversized prompt. Raise the server's context length. |
+| A hosted API seems to ignore `temperature` | By design: hosted endpoints get no sampling keys by default, so the provider's tuned defaults apply. Set `send_temperature_to_hosted = true` to send the configured temperature, or pin `hosted_temperature` (e.g. `1.0` for Claude). Local servers keep every configured value. |
+| A local model repeats itself verbatim | The answer phase runs at `temperature_answer = 0.3` (not greedy) to avoid exactly this, and a repetition retry gets a gentle `presence_penalty = 0.15` nudge. If it persists, raise `temperature_answer` slightly or switch profiles; a design task can also use `--creative` (≥ 0.6). |
 | The model seems lost or reads the wrong things | Name the file in the task. If you set `--steps` or `max_steps`, raise it. |
 | Answers are vague | The map may have switched from a full listing to per-file cards. `pedacito map PROJ --tier auto` shows which. |
 | Stale or misleading summaries | A docstring replaces a generated summary. Set `summarise_documented = true` and re-index. |
@@ -932,7 +1013,7 @@ only the map is stale.
 | `pedacito cost PROJ` | What indexing will cost. Free |
 | `pedacito index PROJ` | Build or refresh the index |
 | `pedacito map PROJ [-t "task"]` | Print the index, ranked for a task. No model needed |
-| `pedacito ask PROJ -t "..."` | One task. Dry run by default. Add `--review`, `--apply`, or `--refine` |
+| `pedacito ask PROJ -t "..."` | One task. Dry run by default. Add `--review`, `--apply`, `--refine`, or `--creative` (design mode) |
 | `pedacito explain PROJ -q "..."` | Answer a question about the code. No edits |
 | `pedacito chat PROJ` | Interactive session; the index stays warm |
 | `pedacito tui PROJ` | Split-screen terminal UI: transcript + activity/plan sidebar + Context Meter, token burn and tok/s telemetry. `/help` lists the slash commands; `--headless` is scriptable |
@@ -960,7 +1041,7 @@ only the map is stale.
 
 Flags available on most commands: `--exclude 'pattern'`, `--include 'pattern'`,
 `--ext .kt`, `--steps N`, `--model ID`, `--url URL`, `--profile NAME`,
-`--config FILE`, `--root PATH`.
+`--config FILE`, `--root PATH`, `--creative` (creative/design Builder mode).
 
 ---
 

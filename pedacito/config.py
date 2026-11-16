@@ -150,12 +150,23 @@ class Config:
     temperature: float = 0.2
     # Per-phase overrides for the phases that copy text character for character
     # (the answer and the repair re-asks). None = the global `temperature`;
-    # 0 is greedy decoding. The answer defaults to 0 (greedy, so SEARCH text is
-    # copied exactly) and the repair re-asks to None (the global value). Gather
-    # keeps the global value. `best_of` samples its extra candidates at the
-    # answer temperature + 0.4.
-    temperature_answer: float | None = 0.0
+    # 0 is greedy decoding. The answer defaults to 0.3: warm enough to escape
+    # degenerate verbatim loops, cool enough to copy SEARCH text exactly (the
+    # old greedy 0.0 froze weak local models into repetition). The repair
+    # re-asks default to None (the global value). Gather keeps the global
+    # value. `best_of` samples its extra candidates at the answer temperature
+    # + 0.4. Creative/design tasks raise the answer temperature to >= 0.6.
+    temperature_answer: float | None = 0.3
     temperature_repair: float | None = None
+    # Hosted APIs (a non-local base_url) tune their own sampling per model:
+    # by default pedacito sends them NO temperature/top_p/top_k/min_p/
+    # repeat_penalty at all, so the provider's defaults apply. Set true to
+    # send the configured temperature anyway; hosted_temperature pins one.
+    send_temperature_to_hosted: bool = False
+    # A temperature pinned for hosted endpoints (e.g. 1.0 for Claude). Unset
+    # = omit temperature unless send_temperature_to_hosted is true. Local
+    # servers never read this key.
+    hosted_temperature: float | None = None
     # Extra sampler parameters (top_k, min_p, repeat_penalty, seed, stop, ...)
     # merged verbatim into every /chat/completions body; model, messages and
     # stream cannot be overridden. Best placed in a profile, because hosted
@@ -479,7 +490,7 @@ class Config:
     # multi-file task the model first emits structured edit intents
     # ([{file, symbol, intended_change}]); the harness then resolves one symbol
     # at a time, appends its exact current body, takes exactly ONE
-    # SEARCH/REPLACE hunk at temperature_answer=0, dry-applies it, runs the
+    # SEARCH/REPLACE hunk at the answer temperature, dry-applies it, runs the
     # deterministic checks plus the in-process AST/tree-sitter syntax gate,
     # and only then writes it. The temporary source is replaced by a one-line
     # `[EDITED file:symbol]` receipt before the next symbol, so a 4B-9B model
@@ -493,6 +504,18 @@ class Config:
     # for small edits outside a definition), or None = the model card decides
     # (`pedacito calibrate` measures both).
     edit_style: str | None = None
+    # Creative/design mode: a Senior Product Engineer & Visual Designer
+    # persona, warmer answer sampling (>= 0.6 on local servers), an >= 8192
+    # token answer budget, and whole-file HTML/CSS rewrites instead of the
+    # smallest-diff discipline. true forces it for EVERY task; with false,
+    # creative_auto still detects design tasks (website/portfolio/hero/
+    # redesign prompts, .html/.css/.svg/.jsx/.tsx/.vue/.svelte targets).
+    # CLI: --creative. TUI: /creative on|off|auto. GUI: the composer toggle.
+    creative_mode: bool = False
+    # Auto-detect creative/design tasks when creative_mode is false. Set
+    # false (with creative_mode false) to keep the surgical edit discipline
+    # for every task (/creative off).
+    creative_auto: bool = True
     # Per-message OUTPUT ceiling the provider honours (hosted APIs cap one
     # reply far below their context window, e.g. ~8k tokens). When >0 and the
     # run targets a hosted API, auto_fit clamps reply budgets to it. Explicit
@@ -930,6 +953,7 @@ _OPTIONAL_TYPES = {
     "fewshot_steps": bool,
     "temperature_answer": float,
     "temperature_repair": float,
+    "hosted_temperature": float,
 }
 _NONE_WORDS = ("", "auto", "none", "default", "card")
 
@@ -2608,6 +2632,10 @@ def _reference_setting_annotations() -> str:
                 sample = "true"
             elif name == "edit_style":
                 sample = '""'
+            elif name == "hosted_temperature":
+                out.append(f"# {name} = 1.0   # unset by default: the hosted "
+                           "API samples at its own default")
+                continue
             else:
                 sample = "0.0"
             out.append(f"# {name} = {sample}   # unset by default: the model "
@@ -2637,9 +2665,12 @@ def _profile_override_comments() -> str:
             continue
         if value is None and name in _OPTIONAL_TYPES:
             # TOML has no null: show an example value, and what unset means.
-            sample, unset = (("true", "the model card decides")
-                             if _OPTIONAL_TYPES[name] is bool
-                             else ("0.0", "the global value applies"))
+            if name == "hosted_temperature":
+                sample, unset = "1.0", "the hosted API's own default applies"
+            else:
+                sample, unset = (("true", "the model card decides")
+                                 if _OPTIONAL_TYPES[name] is bool
+                                 else ("0.0", "the global value applies"))
             out.append(f"# {name} = {sample}   # unset: {unset}")
             continue
         if name == "edit_style":
@@ -2703,7 +2734,14 @@ json_mode = "schema"
 enforce_json_schema = true
 # tool_mode = "grammar"     # "native" = the model's tool-call channel
 temperature = 0.2
+# temperature_answer = 0.3  # answer phase; 0 = greedy, unset = temperature
+# Hosted APIs (non-local base_url) get NO sampling keys by default -- the
+# provider applies the defaults it tuned for the model. Opt back in with
+# send_temperature_to_hosted, or pin one temperature for hosted endpoints:
+# send_temperature_to_hosted = false
+# hosted_temperature = 1.0  # unset: omit; local servers ignore this key
 # sampler = {}              # e.g. { top_p = 0.95, top_k = 40, min_p = 0.05 }
+#                           # (sampling keys are stripped for hosted APIs)
 disable_thinking = false
 thinking_suffix = ""
 # Local inference acceleration (self-hosted endpoints only; hosted servers
@@ -2826,6 +2864,12 @@ compact_step_schema = false
 allow_rename = true
 fuzzy_match = false
 fuzzy_min_ratio = 0.85
+# Creative/design mode: designer persona, warmer answer sampling, whole-file
+# HTML/CSS rewrites. true = every task; false + creative_auto = detect design
+# tasks (website/portfolio/redesign prompts, UI file targets). CLI --creative,
+# TUI /creative on|off|auto, GUI composer toggle.
+creative_mode = false
+creative_auto = true
 
 # Diagnostics and MCP are opt-in. MCP also needs mcp_servers configured.
 auto_diagnostics = false
@@ -2956,9 +3000,23 @@ REFERENCE_TEMPLATE = TEMPLATE + '''
 # temperature: keep low for tool calls. temperature_answer / temperature_repair
 # override it for the answer and the repair re-asks, which copy SEARCH text
 # character for character (0 = greedy; unset = temperature). temperature_answer
-# defaults to 0; temperature_repair defaults to unset. Gather keeps
-# `temperature`; best_of candidates run at the answer temperature + 0.4.
+# defaults to 0.3 (greedy 0.0 froze weak local models into verbatim loops);
+# temperature_repair defaults to unset. Gather keeps `temperature`; best_of
+# candidates run at the answer temperature + 0.4. Creative/design tasks run
+# the answer at >= 0.6 on local servers.
 # sampler: per-server sampler keys, usually placed inside a profile.
+# Hosted APIs (a non-local base_url) receive NO sampling keys by default:
+# temperature, top_p, top_k, min_p and repeat_penalty are stripped from the
+# request (including the sampler table) so the provider applies its own
+# tuned defaults. send_temperature_to_hosted = true sends the configured
+# temperature anyway; hosted_temperature pins one (e.g. 1.0 for Claude).
+# A local server that falls into a verbatim repetition loop gets one gentle
+# presence_penalty = 0.15 nudge on the retry -- never a cold temperature.
+# creative_mode / creative_auto: creative_mode = true forces the designer
+# persona, warmer sampling, an >= 8192-token answer budget and whole-file
+# HTML/CSS rewrites for every task. With creative_mode = false,
+# creative_auto = true (the default) still detects design tasks; set both
+# false for the surgical smallest-diff discipline everywhere.
 #
 # --- Reasoning models -------------------------------------------------------
 # disable_thinking is family-aware. Local servers get enable_thinking=false and

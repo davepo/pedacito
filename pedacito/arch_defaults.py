@@ -20,10 +20,14 @@ from __future__ import annotations
 # window, and the specialty tags the family is good at. `family` is the
 # human-readable label recorded on the card as `arch_family`.
 ARCH_LIBRARY: tuple[dict, ...] = (
+    # Temperatures stay warm enough to escape degenerate verbatim loops:
+    # logic families answer at 0.3-0.4, the creative/frontend families at
+    # 0.6. Cold 0.0-0.1 answers froze weak local models into repetition;
+    # a retry nudge (presence_penalty 0.15) handles a loop that still forms.
     {
         "family": "qwen2.5-coder",
         "patterns": ("qwen2.5-coder", "qwen3-coder"),
-        "temperature": 0.1, "temperature_answer": 0.0,
+        "temperature": 0.3, "temperature_answer": 0.3,
         "sampler": {"top_p": 0.8, "top_k": 20, "repeat_penalty": 1.05},
         "context_tokens": 32768,
         "specialties": ("coding", "testing_qa"),
@@ -31,7 +35,7 @@ ARCH_LIBRARY: tuple[dict, ...] = (
     {
         "family": "qwen3",
         "patterns": ("qwen3", "qwen3.5"),
-        "temperature": 0.2, "temperature_answer": 0.0,
+        "temperature": 0.3, "temperature_answer": 0.3,
         "sampler": {"top_p": 0.8, "top_k": 20},
         "context_tokens": 32768,
         "specialties": ("general", "coding"),
@@ -39,7 +43,7 @@ ARCH_LIBRARY: tuple[dict, ...] = (
     {
         "family": "deepseek-coder",
         "patterns": ("deepseek-coder",),
-        "temperature": 0.1, "temperature_answer": 0.0,
+        "temperature": 0.3, "temperature_answer": 0.3,
         "sampler": {"top_p": 0.95},
         "context_tokens": 32768,
         "specialties": ("coding", "testing_qa"),
@@ -47,7 +51,7 @@ ARCH_LIBRARY: tuple[dict, ...] = (
     {
         "family": "deepseek-r1",
         "patterns": ("deepseek-r1", "qwq"),
-        "temperature": 0.5, "temperature_answer": 0.1,
+        "temperature": 0.6, "temperature_answer": 0.4,
         "sampler": {"top_p": 0.95},
         "context_tokens": 32768,
         "specialties": ("math_algorithms",),
@@ -55,7 +59,7 @@ ARCH_LIBRARY: tuple[dict, ...] = (
     {
         "family": "nemotron",
         "patterns": ("nemotron",),
-        "temperature": 0.2, "temperature_answer": 0.0,
+        "temperature": 0.3, "temperature_answer": 0.3,
         "sampler": {"top_p": 0.9},
         "context_tokens": 32768,
         "specialties": ("general",),
@@ -63,7 +67,7 @@ ARCH_LIBRARY: tuple[dict, ...] = (
     {
         "family": "gemma",
         "patterns": ("gemma-3", "gemma-4"),
-        "temperature": 0.2, "temperature_answer": 0.0,
+        "temperature": 0.6, "temperature_answer": 0.6,
         "sampler": {"top_p": 0.95, "top_k": 64},
         "context_tokens": 32768,
         "specialties": ("general", "frontend_ui", "3d_graphics_svg",
@@ -72,7 +76,7 @@ ARCH_LIBRARY: tuple[dict, ...] = (
     {
         "family": "mistral",
         "patterns": ("codestral", "devstral", "mistral"),
-        "temperature": 0.15, "temperature_answer": 0.0,
+        "temperature": 0.3, "temperature_answer": 0.3,
         "sampler": {"top_p": 0.9},
         "context_tokens": 32768,
         "specialties": ("coding", "general"),
@@ -80,7 +84,7 @@ ARCH_LIBRARY: tuple[dict, ...] = (
     {
         "family": "granite",
         "patterns": ("granite",),
-        "temperature": 0.1, "temperature_answer": 0.0,
+        "temperature": 0.3, "temperature_answer": 0.3,
         "sampler": {"top_p": 0.9},
         "context_tokens": 16384,
         "specialties": ("coding", "sql_data"),
@@ -88,7 +92,7 @@ ARCH_LIBRARY: tuple[dict, ...] = (
     {
         "family": "phi-4",
         "patterns": ("phi-4",),
-        "temperature": 0.2, "temperature_answer": 0.0,
+        "temperature": 0.3, "temperature_answer": 0.4,
         "sampler": {"top_p": 0.9},
         "context_tokens": 16384,
         "specialties": ("math_algorithms", "coding"),
@@ -96,7 +100,7 @@ ARCH_LIBRARY: tuple[dict, ...] = (
     {
         "family": "llama-3",
         "patterns": ("llama-3",),
-        "temperature": 0.2, "temperature_answer": 0.0,
+        "temperature": 0.3, "temperature_answer": 0.3,
         "sampler": {"top_p": 0.9},
         "context_tokens": 32768,
         "specialties": ("general", "coding"),

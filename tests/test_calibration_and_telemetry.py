@@ -310,12 +310,12 @@ def test_match_arch_families(model, family):
 def test_arch_library_values():
     lib = {e["family"]: e for e in arch_defaults.ARCH_LIBRARY}
     q = lib["qwen2.5-coder"]
-    assert (q["temperature"], q["temperature_answer"]) == (0.1, 0.0)
+    assert (q["temperature"], q["temperature_answer"]) == (0.3, 0.3)
     assert q["sampler"] == {"top_p": 0.8, "top_k": 20, "repeat_penalty": 1.05}
     assert q["context_tokens"] == 32768
     assert set(q["specialties"]) == {"coding", "testing_qa"}
     r1 = lib["deepseek-r1"]
-    assert (r1["temperature"], r1["temperature_answer"]) == (0.5, 0.1)
+    assert (r1["temperature"], r1["temperature_answer"]) == (0.6, 0.4)
     assert r1["specialties"] == ("math_algorithms",)
     g = lib["gemma"]
     assert g["sampler"] == {"top_p": 0.95, "top_k": 64}
@@ -323,7 +323,7 @@ def test_arch_library_values():
                                      "3d_graphics_svg", "translation_i18n"}
     assert lib["granite"]["context_tokens"] == 16384
     assert lib["phi-4"]["context_tokens"] == 16384
-    assert lib["mistral"]["temperature"] == 0.15
+    assert lib["mistral"]["temperature"] == 0.3
     assert lib["nemotron"]["specialties"] == ("general",)
     assert lib["llama-3"]["context_tokens"] == 32768
 
@@ -402,8 +402,8 @@ def test_calibrate_records_arch_choices_local_only(home):
     card = modelcard.calibrate(client, cfg, verbose=False, quick=True)
     ch = card["choices"]
     assert ch["arch_family"] == "qwen2.5-coder"
-    assert ch["temperature"] == 0.1
-    assert ch["temperature_answer"] == 0.0
+    assert ch["temperature"] == 0.3
+    assert ch["temperature_answer"] == 0.3
     assert ch["sampler"] == {"top_p": 0.8, "top_k": 20, "repeat_penalty": 1.05}
     assert ch["context_tokens"] == 32768
     assert "translation_i18n" in ch["specialties"]
@@ -427,8 +427,8 @@ def test_apply_fills_arch_settings_only_when_unset(home):
 
     fresh = _cfg(model="Qwen2.5-Coder-14B")
     modelcard.apply(fresh)
-    assert fresh.temperature == 0.1
-    assert fresh.temperature_answer == 0.0
+    assert fresh.temperature == 0.3
+    assert fresh.temperature_answer == 0.3
     assert fresh.sampler == {"top_p": 0.8, "top_k": 20, "repeat_penalty": 1.05}
     assert fresh.context_tokens == 32768
     assert fresh.sources["temperature"] == "model card"

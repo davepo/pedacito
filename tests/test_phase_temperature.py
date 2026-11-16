@@ -70,10 +70,10 @@ def _temps(client, site):
     return [t for s, t in client.log if s == site]
 
 
-# ------------------------------------------------------------- off by default
-def test_defaults_are_greedy_answer_and_global_repair():
+# ------------------------------------------------------- cool, never freezing
+def test_defaults_are_cool_answer_and_global_repair():
     cfg0 = Config()
-    assert cfg0.temperature_answer == 0.0 and cfg0.temperature_repair is None
+    assert cfg0.temperature_answer == 0.3 and cfg0.temperature_repair is None
 
 
 def test_unset_means_the_global_temperature_in_every_phase(tmp_path):
@@ -88,7 +88,7 @@ def test_unset_means_the_global_temperature_in_every_phase(tmp_path):
     assert {s for s, _t in client.log} >= {"step", "answer", "repair"}
 
 
-def test_the_default_answer_runs_greedy_while_repair_keeps_the_global(
+def test_the_default_answer_runs_cool_while_repair_keeps_the_global(
         tmp_path):
     agent, client, cfg = _setup(tmp_path, replies=[MISS, GOOD],
                                 steps=READ_THEN_GREP)
@@ -96,7 +96,7 @@ def test_the_default_answer_runs_greedy_while_repair_keeps_the_global(
     reply = agent.answer("Fix bulk_discount", "src", stream=False)
     agent.apply(reply, dry_run=False, task="Fix bulk_discount", gathered="src")
     assert _temps(client, "step") == [cfg.temperature] * 3
-    assert _temps(client, "answer") == [0.0]
+    assert _temps(client, "answer") == [0.3]
     assert _temps(client, "repair") == [cfg.temperature]
 
 
@@ -372,9 +372,9 @@ def test_config_writer_keeps_comments_for_the_temperatures():
     assert live == ["temperature_answer = 0.0", "temperature_repair = 0.0"]
     kept = [ln for ln in out.splitlines() if ln not in live]
     assert kept == text.splitlines()          # no comment or key was lost
-    assert "# temperature_answer = 0.0" in out
+    assert "# temperature_answer = 0.3" in out
     import tomllib
     tomllib.loads(config_mod.REFERENCE_TEMPLATE)
     names = {i["name"]: i for i in S.schema()}
     assert names["temperature_answer"]["type"] == "float"
-    assert names["temperature_answer"]["default"] == 0.0
+    assert names["temperature_answer"]["default"] == 0.3

@@ -534,6 +534,40 @@ def _is_local_server(cfg) -> bool:
                                    "vllm", "lmstudio", "ollama"))
 
 
+# Sampling keys a hosted provider tunes per model itself; pedacito omits
+# them unless the user opts in (send_temperature_to_hosted) or pins a value
+# (hosted_temperature). Local servers always keep the configured values.
+_HOSTED_SAMPLING_KEYS = frozenset({
+    "temperature", "top_p", "top_k", "min_p", "repeat_penalty",
+})
+
+
+def _hosted_sampling(cfg) -> tuple[bool, float | None]:
+    """(hosted, pinned) for the request's endpoint. `hosted` is True for a
+    remote API (loopback and LAN count as local): its sampler keys
+    (top_p/top_k/min_p/repeat_penalty) are always stripped, and its
+    temperature is omitted unless the user opts in or pins one. `pinned` is a
+    temperature the profile fixed for hosted endpoints; it wins over phase
+    overrides. Local servers answer (False, None) and keep every value."""
+    from . import roles
+    try:
+        hosted = roles.profile_is_hosted(
+            cfg, getattr(cfg, "active_profile", "") or "")
+    except Exception:
+        hosted = False
+    if not hosted:
+        return False, None
+    pinned = getattr(cfg, "hosted_temperature", None)
+    return True, (float(pinned) if pinned is not None else None)
+
+
+def _omit_hosted_temp(cfg, hosted: bool, pinned: float | None) -> bool:
+    """True when a hosted request should carry NO temperature key: neither a
+    pinned value nor the send_temperature_to_hosted opt-in is present."""
+    return hosted and pinned is None \
+        and not getattr(cfg, "send_temperature_to_hosted", False)
+
+
 def unload_model(client) -> str:
     """Ask a LOCAL server to evict `client`'s model from VRAM, so the next
     model can load on the same card (the clean handoff of specialist
@@ -1202,6 +1236,9 @@ class LLMClient:
         # True when the degenerate-loop guard cut a repeating stream (see
         # _repeat_run); companion of stream_truncated for reports/telemetry.
         self.stream_repetition = False
+        # One-shot nudge armed by those guards: the next LOCAL request adds a
+        # gentle presence_penalty instead of freezing the temperature to 0.
+        self._nudge_presence = False
         # Chars of hidden reasoning in the last streamed attempt. chat()'s
         # empty-completion retry uses it to tell an instant-EOS flake (retry
         # identical) from a thinking runaway (retry with thinking disabled).
@@ -1507,8 +1544,12 @@ class LLMClient:
                  "image_url": {"url": f"data:{mime};base64,{b64}"}},
             ]}],
             "max_tokens": max_tokens,
-            "temperature": getattr(self.cfg, "temperature", 0.2),
         }
+        hosted, pinned_temp = _hosted_sampling(self.cfg)
+        if not _omit_hosted_temp(self.cfg, hosted, pinned_temp):
+            payload["temperature"] = (
+                pinned_temp if pinned_temp is not None
+                else getattr(self.cfg, "temperature", 0.2))
         r = self._post(payload)
         try:
             msg = r.json()["choices"][0]["message"]
@@ -1875,7 +1916,13 @@ class LLMClient:
                 f"\n\nReply with one JSON object only, no prose. "
                 f"Fields: {fields}.")
 
-        temp = (self._temp_override
+        # Hosted endpoints tune their own sampling: top_p/top_k/min_p/
+        # repeat_penalty are always stripped, and temperature is omitted too
+        # unless the user opted in (send_temperature_to_hosted) or pinned one.
+        hosted, pinned_temp = _hosted_sampling(self.cfg)
+        omit_temp = _omit_hosted_temp(self.cfg, hosted, pinned_temp)
+        temp = (pinned_temp if pinned_temp is not None
+                else self._temp_override
                 if self._temp_override is not None
                 else self.cfg.temperature)
         payload = {
@@ -1886,7 +1933,9 @@ class LLMClient:
         }
         # Claude 4.7+ rejects any `temperature` below 1; the provider table
         # marks that with omit_temperature, so drop the key rather than 400.
-        if not (self._provider().omit_temperature and float(temp) < 1.0):
+        if not omit_temp \
+                and not (self._provider().omit_temperature
+                         and float(temp) < 1.0):
             payload["temperature"] = temp
         # request_max_tokens_cap (0 = off): llama.cpp-based servers 400 when
         # max_tokens exceeds the context window, so never exceed the cap.
@@ -1899,11 +1948,23 @@ class LLMClient:
         for k, v in (self.cfg.sampler or {}).items():
             if k in _PROTECTED_SAMPLER_KEYS:
                 continue
+            if hosted and k in _HOSTED_SAMPLING_KEYS:
+                continue
             payload[k] = v
-        if self._temp_override is not None:
+        if self._temp_override is not None and pinned_temp is None \
+                and not omit_temp:
             # A phase temperature (temperature_answer/_repair, best_of) is more
             # specific than a `temperature` key in the sampler table.
             payload["temperature"] = self._temp_override
+        if self._nudge_presence:
+            # A repetition guard cut the previous reply: nudge the NEXT local
+            # request with a gentle presence penalty rather than a cold
+            # temperature / heavy repeat penalty (hosted APIs run their own
+            # anti-loop sampling and get no key at all).
+            self._nudge_presence = False
+            if _is_local_server(self.cfg):
+                payload["presence_penalty"] = max(
+                    float(payload.get("presence_penalty", 0.0)), 0.15)
         if want_off:
             # Local templates get the union of known spellings; hosted
             # providers get only the field they are known to accept. Any
@@ -2163,6 +2224,7 @@ class LLMClient:
                         rep_acc = rep_acc[-_STREAM_REPEAT_WINDOW:]
                         if _repeat_run(rep_acc)[0]:
                             self.stream_repetition = True
+                            self._nudge_presence = True
                             # The reply is cut off: flag it like a dropped
                             # stream so the existing continuation/re-ask
                             # machinery handles the rest of the phase.
@@ -2192,6 +2254,7 @@ class LLMClient:
                         if max(counts.values(), default=0) \
                                 >= _MAX_STREAM_DUP_BLOCKS:
                             self.stream_repetition = True
+                            self._nudge_presence = True
                             self.stream_truncated = True
                             print("\n[stopped the reply: the model is "
                                   "re-emitting the same edit block over and "
@@ -2974,10 +3037,14 @@ class LLMClient:
             payload = {
                 "model": self.cfg.model,
                 "messages": [{"role": "user", "content": user}],
-                "temperature": self.cfg.temperature,
                 "max_tokens": 120,
                 "stream": False,
             }
+            hosted, pinned_temp = _hosted_sampling(self.cfg)
+            if not _omit_hosted_temp(self.cfg, hosted, pinned_temp):
+                payload["temperature"] = (
+                    pinned_temp if pinned_temp is not None
+                    else self.cfg.temperature)
             if fmt is not None:
                 payload["response_format"] = fmt
             try:

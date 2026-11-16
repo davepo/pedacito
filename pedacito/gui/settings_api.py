@@ -381,7 +381,7 @@ _BASELINE_SECTIONS = (
         ("json_mode", '"schema" for llama.cpp-based servers, "object" for hosted APIs'),
         ("tool_mode", '"grammar" (schema-constrained steps) or "native" (the model\'s tool calls)'),
         ("temperature", None),
-        ("temperature_answer", "greedy answers, so SEARCH text is copied exactly"),
+        ("temperature_answer", "cool (not greedy) answers: escape repetition loops, still copy SEARCH text exactly"),
         ("timeout", None),
         ("load_wait_seconds", None),
         ("context_tokens", "fallback window; the server\'s real length wins with auto_detect_context"),

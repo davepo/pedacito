@@ -355,9 +355,134 @@ def anchor_brief(text: str) -> str:
     return text
 
 
-def edit_format(cfg, full: str, pack: str | None = None) -> str:
+# --------------------------------------------------------------------------
+# Creative / design (Builder) mode
+# --------------------------------------------------------------------------
+# File types whose whole-file rewrite is a normal, desirable outcome (a page,
+# a stylesheet, a component) rather than a context-pressure accident. Naming
+# one of these in the task -- or targeting one -- marks the task creative.
+_CREATIVE_EXTS = frozenset({
+    ".html", ".htm", ".css", ".svg", ".jsx", ".tsx", ".vue", ".svelte",
+})
+# Targets whose whole-file rewrite the brakes ALWAYS allow (hand-authored
+# markup / style / docs), independent of the task wording or its length.
+_WHOLE_REWRITE_EXTS = frozenset({".html", ".htm", ".css", ".md"})
+
+_UI_FILE_RE = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_./\-]*\.[A-Za-z0-9]+")
+
+# Strong design signals, matched on word boundaries so "ui" never fires inside
+# "build" and "design" never fires inside "redesign" or "assigned".
+_CREATIVE_KEYWORD_RE = re.compile(
+    r"(?i)\b(?:"
+    r"website|web[ -]?site|web[ -]?page|landing[ -]?page|home[ -]?page|"
+    r"portfolio|bio|sleek|hero|dashboard|mockup|wireframe|restyle|"
+    r"ui|ux|frontend|front[ -]end|look[ -]and[ -]feel|visual[ -]design|"
+    r"colo(?:u)?r[ -]scheme|typography|responsive[ -]design|"
+    r"design[ -]system|style[ -]guide|branding|design"
+    r")\b")
+# A build/restructure verb only marks the task creative when it is aimed at a
+# web/design context ("build a website", not "build a parser").
+_CREATIVE_BUILD_RE = re.compile(
+    r"(?i)\b(?:build|create|make|design|develop|craft|generate)\s+"
+    r"(?:a|an|the|my|our|me|new|fresh)\b"
+    r"|\bfrom\s+scratch\b"
+    r"|\b(?:redesign|restyle|rewrite|rebuild|revamp|overhaul|remake)\b")
+_CREATIVE_CONTEXT_RE = re.compile(
+    r"(?i)\b(?:"
+    r"website|web[ -]?site|web[ -]?page|site|page|landing|portfolio|dashboard|"
+    r"ui|ux|interface|frontend|front[ -]end|html|css|layout|homepage|"
+    r"home[ -]page|bio|app|web|mockup|theme|hero"
+    r")\b")
+
+
+def is_creative_or_design_task(task: str, target_files=None) -> bool:
+    """True when the task is creative/visual work: it targets (or names) a UI
+    file, carries a strong design keyword, or asks to build/restructure a
+    web/design artifact. Used by `creative_auto` to pick the Builder persona
+    and by the whole-rewrite bypass. Word boundaries keep "ui" out of "build".
+    """
+    text = task or ""
+    files = list(target_files or []) + _UI_FILE_RE.findall(text)
+    for f in files:
+        if Path(str(f)).suffix.lower() in _CREATIVE_EXTS:
+            return True
+    if _CREATIVE_KEYWORD_RE.search(text):
+        return True
+    if _CREATIVE_BUILD_RE.search(text) and _CREATIVE_CONTEXT_RE.search(text):
+        return True
+    return False
+
+
+# A brief that explicitly asks to restructure/replace a file: a wholesale
+# replacement is then the requested outcome, not a partial-read accident.
+# Deliberately excludes "rewrite"/"from scratch" -- those stay with the
+# small-window brake's own `_asks_file_rewrite` warn path.
+_RESTRUCTURE_RE = re.compile(
+    r"(?i)\b(?:redesign|restyle|reorganize|reorganise|restructure|"
+    r"rearrange|reorder|replace|remove)\b")
+
+
+def whole_rewrite_allowed(task: str, rel: str) -> bool:
+    """True when a whole-file replacement of `rel` is a legitimate outcome, so
+    the fragment veto and the small-window oversized-rewrite brake stand down:
+    a hand-authored markup/style/doc target, a creative/design task, or a brief
+    that asks to restructure/replace the file. The wipe refusal and the JS
+    export-surface guard are NOT bypassed -- callers keep those checks first.
+    """
+    if Path(str(rel or "")).suffix.lower() in _WHOLE_REWRITE_EXTS:
+        return True
+    if is_creative_or_design_task(task, [rel] if rel else None):
+        return True
+    return bool(_RESTRUCTURE_RE.search(task or ""))
+
+
+# The Builder persona replaces the terse code-assistant line in answer_system.
+_CREATIVE_PERSONA = (
+    "You are a Senior Product Engineer & Visual Designer. You have a map of "
+    "the project and the specific source you asked to see. Complete the "
+    "user's task with production-quality craft: clean semantic structure, a "
+    "cohesive visual system (spacing, type scale, color), responsive layout, "
+    "and thoughtful micro-interactions. Prefer a bold, complete, polished "
+    "result over a timid minimal patch when the task is creative or visual.")
+
+# creative_brief: swap the smallest-diff bullets for whole-file design freedom.
+# A phrase not present (a caller's own `full`, or the tiny pack) is left alone.
+_CREATIVE_BRIEF_SWAPS = (
+    # The full brief's three restrictive bullets, one contiguous span.
+    ("- Keep each block small and local. Use several blocks rather than one large one.\n"
+     "- A single reply must stay short enough to finish: emit at most a few blocks\n"
+     "  per reply, never a whole large file in one REPLACE/SEARCH section. If the\n"
+     "  task needs changes to several files, edit ONE file (or a few small blocks)\n"
+     "  this turn and say what remains; the next turn continues where you left off.\n"
+     "  Long replies get cut off mid-block at the token limit and are discarded.\n"
+     "- Do not output the whole file. Do not output a diff or patch format.",
+     "- This is a creative/visual task: you MAY rewrite a whole hand-authored\n"
+     "  .html or .css file in ONE block (empty SEARCH, the full new file in\n"
+     "  REPLACE) when that gives the cleanest, most cohesive result. Aim for a\n"
+     "  complete, polished page rather than a timid minimal patch.\n"
+     "- Keep non-visual edits small and local; use several blocks rather than\n"
+     "  one large one for code. Do not output a diff or patch format."),
+    # The tiny brief's single restrictive bullet.
+    ("- This is the FINAL phase: no tools. No diff format, no code fences, never the\n"
+     "  whole file. Small blocks, a few per reply; SEARCH must match exactly once.",
+     "- This is the FINAL phase: no tools. No diff format, no code fences. For a\n"
+     "  visual task you MAY rewrite a whole .html/.css file in one block (empty\n"
+     "  SEARCH, full file in REPLACE); otherwise small blocks, SEARCH matches once."),
+)
+
+
+def creative_brief(text: str) -> str:
+    """`text` (an edit brief) reworded for creative/design mode: whole-file
+    HTML/CSS rewrites are permitted instead of the smallest-diff discipline."""
+    for old, new in _CREATIVE_BRIEF_SWAPS:
+        text = text.replace(old, new)
+    return text
+
+
+def edit_format(cfg, full: str, pack: str | None = None,
+                creative: bool = False) -> str:
     """EDIT_FORMAT at the run's density (override `edit_format` wins, and
-    bypasses `edit_plan_brief`)."""
+    bypasses `edit_plan_brief`). `creative` swaps in the Builder brief."""
     override = load_override(cfg, "edit_format")
     if override:
         return override
@@ -367,6 +492,8 @@ def edit_format(cfg, full: str, pack: str | None = None) -> str:
         text = plan_brief(text)
     if getattr(cfg, "edit_style", None) == "anchor":
         text = anchor_brief(text)
+    if creative:
+        text = creative_brief(text)
     return text
 
 
@@ -449,17 +576,21 @@ def test_rules(cfg) -> str:
     return _TINY_TEST_RULES if pack_for(cfg) == "tiny" else TEST_RULES
 
 
-def answer_system(cfg, full_edit_format: str, task: str = "") -> str:
+def answer_system(cfg, full_edit_format: str, task: str = "",
+                  creative: bool = False) -> str:
     """The default answer-phase system prompt for the run. A task about
     tests also gets the value-bound rules -- they cost tokens, so they only
     ride along when tests are actually in play. A project or user override
-    of `answer` replaces the whole brief."""
+    of `answer` replaces the whole brief. `creative` swaps in the Senior
+    Product Engineer & Visual Designer persona and the Builder edit brief."""
     override = load_override(cfg, "answer")
     if override:
         return override
-    text = ("You are a code assistant. You have a map of the project and the "
-            "specific\nsource you asked to see. Complete the user's task.\n\n"
-            + edit_format(cfg, full_edit_format))
+    persona = (_CREATIVE_PERSONA if creative else
+               "You are a code assistant. You have a map of the project and the "
+               "specific\nsource you asked to see. Complete the user's task.")
+    text = persona + "\n\n" + edit_format(cfg, full_edit_format,
+                                         creative=creative)
     if wants_tests(task):
         text += "\n\n" + test_rules(cfg)
     return text

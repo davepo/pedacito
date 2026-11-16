@@ -1120,12 +1120,13 @@ def check_oversized_rewrite(agent, results, task: str = "") -> list[Finding]:
         lines = len((r.before or "").splitlines())
         if lines <= cap:
             continue
-        # A small hand-authored page is restructured, not "drafted from a
-        # partial read": a 150-line index.html that becomes a 90-line layout
-        # is exactly the requested change. Do not refuse it on a small-window
-        # profile.
-        if (str(r.file).lower().endswith((".html", ".htm", ".css"))
-                and lines <= 300):
+        # Creative/design bypass: a hand-authored page / stylesheet / doc, a
+        # creative task, or a restructure/replace brief is restructured, not
+        # "drafted from a partial read" -- a 150-line index.html that becomes a
+        # 90-line layout is exactly the requested change. Do not refuse it on a
+        # small-window profile (the 300-line page cap is dropped for these).
+        from .prompts import whole_rewrite_allowed
+        if whole_rewrite_allowed(task, r.file):
             continue
         out.append(Finding(
             "oversized_rewrite",

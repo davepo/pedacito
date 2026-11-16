@@ -511,6 +511,9 @@ details pre { background: var(--code-bg); border: 1px solid var(--line); border-
 #refineBtn.busy { cursor: progress; animation: refine-pulse 1.2s ease-in-out infinite; }
 @keyframes refine-pulse { 0%, 100% { opacity: 1; } 50% { opacity: .35; } }
 #undoRefineBtn { color: var(--accent); }
+/* ✨ Creative toggle: lit while the forced creative/UI-polish mode is on. */
+#creativeBtn.on { color: var(--accent); border-color: var(--accent);
+  background: var(--accent-soft); font-weight: 700; }
 #sendHint { font-size: 11px; color: var(--ok); text-align: right; }
 /* Options box: a column of two blocks — the auto-fitting field grid, then the
  * wrapping checkbox row. `auto-fill` (not `auto-fit`) keeps one column per field
@@ -676,9 +679,11 @@ details pre { background: var(--code-bg); border: 1px solid var(--line); border-
 #engCount { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 
 /* ------------------------------------------------------------- workspace pane --
-   Three-tab bottom-right panel: Files / Backups / Logs. The #term element and
-   its ANSI classes stay exactly as before; they just live inside the LOGS tab
-   now (kept mounted in every tab so the live buffer never resets). */
+   Bottom-right panel: Files / Backups / Logs, plus 🌐 Preview when the project
+   has HTML pages. The #term element and its ANSI classes stay exactly as
+   before; they just live inside the LOGS tab now (kept mounted in every tab so
+   the live buffer never resets). The preview iframe is likewise kept mounted
+   so switching tabs does not reload the page. */
 .panel-head .ws-sub { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 @media (max-width: 1180px) { .panel-head .ws-sub { display: none; } }
 #wsTabs { display: flex; gap: 2px; flex: none; }
@@ -691,6 +696,10 @@ details pre { background: var(--code-bg); border: 1px solid var(--line); border-
 .ws-tools { display: flex; gap: 6px; align-items: center; padding: 6px 8px; flex: none;
   border-bottom: 1px solid var(--line); background: var(--panel2); }
 .ws-tools input { font-size: 12px; background: var(--panel); }
+.ws-tools select { font-size: 12px; background: var(--panel); min-width: 0;
+  font-family: var(--mono); }
+#live-preview-frame { flex: 1 1 auto; min-height: 0; width: 100%; border: none;
+  background: #fff; }
 .ws-list { flex: 1 1 auto; min-height: 0; overflow-y: auto; padding: 2px 4px 6px; }
 .wsrow { display: flex; gap: 7px; align-items: center; padding: 2px 6px;
   border-bottom: 1px solid color-mix(in srgb, var(--line) 55%, transparent); font-size: 12px; }

@@ -323,7 +323,7 @@ def test_settings_payload_resolves_concrete_universal_values(gui):
     assert p["resolved"]["allow_shell"]["value"] is False
     assert p["resolved"]["auto_fit"]["value"] is True
     assert p["resolved"]["temperature"]["value"] == 0.2
-    assert p["resolved"]["temperature_answer"]["value"] == 0.0
+    assert p["resolved"]["temperature_answer"]["value"] == 0.3
     assert p["resolved"]["json_mode"]["value"] == "schema"
     assert p["resolved"]["context_tokens"]["value"] == \
         by["context_tokens"]["default"] == 8192
