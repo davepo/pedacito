@@ -706,7 +706,7 @@ function selectThread(id) {
 }
 function renameThread() {
   const s = S.status;
-  if (!s.active_thread_id) { PDC.toast('Open a project first.', true); return; }
+  if (!s.active_thread_id) { PDC.toast('There is no open conversation to rename.', true); return; }
   const inp = h('input', { type: 'text', class: 'grow', value: s.thread_title || '',
                             maxlength: '120', spellcheck: false, autocomplete: 'off',
                             placeholder: 'a name for this conversation' });
@@ -1367,7 +1367,8 @@ function _bytesText(n) {
 // in `micro_facts.json`. Adding and forgetting are the same operations the CLI
 // exposes; deleting a lesson only removes that one ledger row.
 function memoryDialog() {
-  if (!_needRoot()) return;
+  // Memory is workspace-backed: with no project open the server reads and
+  // writes the persistent scratchpad instead of refusing.
   const body = h('div', {});
   const list = h('div', {});
   const note = h('div', { class: 'muted small-text' });
@@ -1577,7 +1578,7 @@ function skillsDialog() {
         h('span', { class: 'grow' }),
         h('button', { text: 'Cancel', onclick: () => PDC.clear(editor) }),
         h('button', { class: 'primary', text: 'Save to Project',
-          disabled: !S.status.root, title: S.status.root ? '' : 'Open a project first',
+          title: S.status.root ? '' : 'No project open: saves into the scratchpad project',
           onclick: () => save('project') }),
         h('button', { class: 'primary', text: 'Save to Global', onclick: () => save('user') }))));
     nameInp.focus();
@@ -1620,7 +1621,8 @@ PDC.consolidateSession = consolidateSession;
 // Background dev servers: the `.pedacito/procs/` registry, with a live log
 // tail and a Stop button, and the same start form `pedacito serve` uses.
 function procsDialog() {
-  if (!_needRoot()) return;
+  // Workspace-backed: background servers live under the scratchpad when no
+  // project is open.
   const body = h('div', {});
   const list = h('div', {});
   const logs = h('pre', { class: 'diffwrap', style: 'max-height:32vh;overflow:auto;margin:10px 0 0' });
@@ -1710,7 +1712,7 @@ function checksDialog() {
 
 // Retention for sessions, backups, events and log.txt (same as `pedacito prune`).
 function pruneDialog() {
-  if (!_needRoot()) return;
+  // Workspace-backed: prunes the scratchpad when no project is open.
   const sessions = h('input', { type: 'number', min: 0, placeholder: 'keep newest N' });
   const backups = h('input', { type: 'number', min: 0, placeholder: 'keep newest N' });
   const out = h('div', { class: 'note-box', style: 'margin-top:10px' });
@@ -1743,7 +1745,8 @@ function pruneDialog() {
 // `pedacito reset` from the GUI: preview first (files/KB and servers that would
 // stop), then execute with the authored-state checkboxes.
 function resetDialog() {
-  if (!_needRoot()) return;
+  // Workspace-backed: resets the scratchpad's .pedacito/ state when no
+  // project is open.
   const keepMemory = h('input', { type: 'checkbox', checked: true });
   const keepConfig = h('input', { type: 'checkbox', checked: true });
   const reindex = h('input', { type: 'checkbox', checked: false });
@@ -2078,13 +2081,17 @@ function TopBar() {
             <${MenuItem} label="Quick index (no summaries)" disabled=${!!j || !s.root} action=${() => buildIndex(false)} />
             <${MenuItem} label="Restore from a backup\u2026" disabled=${!!j || !(s.snapshots || []).length} action=${restoreDialog} />
             <${MenuItem} label="Rename symbol\u2026" disabled=${!!j || !s.root} action=${renameSymbolDialog} />
-            <${MenuItem} label="Memory & repo lessons\u2026" disabled=${!s.root} action=${memoryDialog} />
+            <${MenuItem} label="Memory & repo lessons\u2026" action=${memoryDialog}
+                       title="scratchpad memory while no project is open" />
             <${MenuItem} label="Skills library & creator\u2026" action=${skillsDialog}
                        title="browse the built-in, user and project skills; write or auto-draft custom ones" />
-            <${MenuItem} label="Background servers\u2026" disabled=${!s.root} action=${procsDialog} />
+            <${MenuItem} label="Background servers\u2026" action=${procsDialog}
+                       title="servers live in the scratchpad while no project is open" />
             <${MenuItem} label="Run project checks\u2026" disabled=${!s.root} action=${checksDialog} />
-            <${MenuItem} label="Prune old sessions/backups\u2026" disabled=${!s.root} action=${pruneDialog} />
-            <${MenuItem} label="Reset project state\u2026" disabled=${!s.root || !!j} action=${resetDialog} />
+            <${MenuItem} label="Prune old sessions/backups\u2026" action=${pruneDialog}
+                       title="prunes the scratchpad while no project is open" />
+            <${MenuItem} label="Reset project state\u2026" disabled=${!!j} action=${resetDialog}
+                       title="resets the scratchpad state while no project is open" />
             <${MenuItem} label="Consolidate session\u2026" disabled=${!!j} action=${consolidateSession}
                        title="compact the transcript into a handoff checkpoint (also in the telemetry bar)" />
             <${MenuItem} label="Provider settings\u2026" action=${() => callSettings()} />

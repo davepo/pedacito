@@ -647,6 +647,10 @@ def _mcp_write_target(body: dict) -> tuple[Path, str]:
         raise ConfigError(f"unknown config file {which!r}")
     if which == "user":
         return USER_CONFIG, "user"
+    if STATE.root is None:
+        # No project to host a trusted [mcp_servers.*] table: save globally
+        # instead of failing the Add/Save button.
+        return USER_CONFIG, "user"
     path = config_path("project")
     if not path.exists():
         raise ConfigError(

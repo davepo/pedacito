@@ -605,10 +605,12 @@ def restore_snapshot(name: str = "") -> tuple[bool, str]:
         if STATE.job is not None and STATE.job.active:
             return False, "A job is running; wait for it or stop it first."
     if root is None:
-        return False, "No project is open."
+        # Restore belongs to the workspace-backed group: with no project open
+        # it reads the scratchpad's backups instead of refusing.
+        root = STATE.scratchpad_path()
     snaps = workspace.list_backups(root)
     if not snaps:
-        return False, "No snapshots exist for this project yet."
+        return False, "No snapshots exist for this workspace yet."
     snap = snaps[0]
     if name:
         found = [s for s in snaps if s.name == name]

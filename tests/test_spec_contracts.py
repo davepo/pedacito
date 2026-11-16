@@ -198,6 +198,30 @@ def test_refine_prompt_survives_client_errors(tmp_path):
         assert got["ok"] is True and "OBJECTIVE" in got["refined"]
 
 
+def test_refine_prompt_without_a_root_does_not_borrow_the_cwd(tmp_path,
+                                                             monkeypatch):
+    seen = {}
+
+    class Capture:
+        def chat_json(self, messages, schema, max_tokens=None,
+                      disable_thinking=False):
+            seen["prompt"] = messages[-1]["content"]
+            return {"objective": "x", "files": [], "contracts": [],
+                    "requirements": ["r"], "verification": "v"}
+
+    cwd = tmp_path / "unrelated-checkout"
+    cwd.mkdir()
+    (cwd / "secret_project_file.py").write_text("x = 1\n", encoding="utf-8")
+    monkeypatch.chdir(cwd)
+    got = spec.refine_prompt("build a cli calculator", None, Config(), Capture())
+
+    assert got["ok"] is True
+    prompt = seen["prompt"]
+    assert "secret_project_file.py" not in prompt
+    assert "TEST RUNNER:" not in prompt
+    assert "(empty project)" in prompt
+
+
 def test_refine_prompt_uses_planner_max_tokens(tmp_path):
     seen = {}
 
@@ -333,6 +357,12 @@ def test_gui_refine_route(tmp_path, monkeypatch):
     status, j = route({}, {"prompt": "   "})
     assert status == 400 and j["ok"] is False
 
+    # No project open: refine against an empty scratchpad on the selected
+    # profile instead of refusing the button.
+    scratch = tmp_path / "scratchpad"
     monkeypatch.setattr(core.STATE, "root", None)
+    monkeypatch.setattr(core.STATE, "scratchpad_path", lambda: scratch)
+    monkeypatch.setattr(core.STATE, "client", _Boom())
     status, j = route({}, {"prompt": "anything"})
-    assert status == 400 and "project" in j["detail"].lower()
+    assert status == 200 and j["ok"] is True
+    assert "OBJECTIVE" in j["refined"]

@@ -560,11 +560,15 @@ def test_gui_skills_save_and_delete_project(gui):
     assert status == 400 and "No project skill" in j["detail"]
 
 
-def test_gui_skills_scope_guards_and_validation(gui):
-    # No project open: project scope is a 409, global still works.
+def test_gui_skills_scope_guards_and_validation(gui, monkeypatch):
+    # No project open: project scope lands in the scratchpad, global works.
+    scratchpad = gui.tmp / "state"
+    monkeypatch.setattr(config_mod, "USER_STATE_DIR", scratchpad)
     status, j = gui.post("/api/skills", {"name": "x-note", "description": "d",
                                          "body": "1. x", "scope": "project"})
-    assert status == 409 and "Open a project" in j["detail"]
+    assert status == 200 and j["scope"] == "project"
+    assert Path(j["saved"]) == (scratchpad / "scratchpad" / ".pedacito"
+                                / "skills" / "x-note.md")
     status, j = gui.post("/api/skills", {"name": "x-note", "description": "d",
                                          "triggers": ["x"], "body": "1. x",
                                          "scope": "global"})
@@ -578,7 +582,7 @@ def test_gui_skills_scope_guards_and_validation(gui):
     assert status == 400 and "unknown scope" in j["detail"]
     status, j = gui.post("/api/skills/delete", {"name": "x-note",
                                                 "scope": "project"})
-    assert status == 409
+    assert status == 200 and j["deleted"] == "x-note"
 
 
 def test_gui_skills_draft_with_active_and_fallback_client(gui, monkeypatch):
@@ -664,13 +668,15 @@ def test_gui_consolidate_busy_and_projectless(gui, monkeypatch):
     assert status == 409 and "job is running" in j["detail"]
     with core.STATE.lock:
         core.STATE.job = None
-    # Project-less mode: the checkpoint lands in per-user state, not a project.
+    # Project-less mode: the checkpoint lands in the persistent scratchpad
+    # workspace, not a project and not a refusal.
     monkeypatch.setattr(config_mod, "USER_STATE_DIR", gui.tmp / "state")
     core.STATE.add_message("user", "a project-less question")
     core.STATE.add_message("assistant", "an answer")
     status, j = gui.post("/api/session/consolidate")
     assert status == 200 and j["ok"] is True
-    assert Path(j["path"]) == gui.tmp / "state" / "consolidated_session.md"
+    scratchpad = gui.tmp / "state" / "scratchpad"
+    assert Path(j["path"]) == scratchpad / ".pedacito" / "consolidated_session.md"
     assert Path(j["path"]).is_file()
     assert j["pinned"] == 0
     assert len(core.STATE.messages_snapshot()) == 1

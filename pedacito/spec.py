@@ -2775,11 +2775,16 @@ def refine_prompt(prompt: str, root, cfg, llm_client,
     parse the model falls back to the deterministic architect so the button
     and --refine never dead-end."""
     prompt = str(prompt or "")
-    root = Path(root) if root is not None else Path.cwd()
+    # No root (a standalone Ask / New refinement) must not borrow the process
+    # cwd: that would describe an unrelated checkout as the user's project.
+    project_root = Path(root) if root is not None else None
 
     # 1. zero-LLM structural snapshot --------------------------------------
     mentions = {tok.lower() for tok in re.findall(r"[\w./-]{3,}", prompt)}
-    rels = _iter_code_files(root, PY_EXTS | TS_EXTS | DOC_EXTS, cap=120)
+    rels = (_iter_code_files(project_root, PY_EXTS | TS_EXTS | DOC_EXTS,
+                             cap=120)
+            if project_root is not None else [])
+    has_project_files = bool(rels)
     entry = {"main.py", "app.py", "cli.py", "index.html", "README.md",
              "pyproject.toml", "package.json", "__init__.py"}
     scored = []
@@ -2802,7 +2807,7 @@ def refine_prompt(prompt: str, root, cfg, llm_client,
         if outlined >= 3 or rel.rsplit(".", 1)[-1].lower() not in \
                 {e[1:] for e in PY_EXTS | TS_EXTS}:
             continue
-        sigs = _outline(rel, root)
+        sigs = _outline(rel, project_root)
         if not sigs:
             continue
         snap_lines.append(f"OUTLINE {rel}:")
@@ -2812,20 +2817,24 @@ def refine_prompt(prompt: str, root, cfg, llm_client,
     # runner and its top-level entries, so a web spec reuses the existing
     # css/js instead of planning duplicates and verification names the
     # runner that actually exists. First lines, so the cap cannot cut them.
-    try:
-        from . import testsel as testsel_mod
-        runner = testsel_mod.detect_test_command(root, cfg)
-    except Exception:
-        runner = ""
-    facts = ["TEST RUNNER: " + (runner or "(none detected)")]
-    try:
-        top = sorted(p.name + ("/" if p.is_dir() else "")
-                     for p in root.iterdir()
-                     if not p.name.startswith("."))[:40]
-    except OSError:
-        top = []
-    if top:
-        facts.append("TOP-LEVEL ENTRIES: " + ", ".join(top))
+    # An empty scratchpad has no project files, so probing it for a test
+    # runner or a file tree would only inject noise; skip both.
+    facts: list[str] = []
+    if has_project_files:
+        try:
+            from . import testsel as testsel_mod
+            runner = testsel_mod.detect_test_command(project_root, cfg)
+        except Exception:
+            runner = ""
+        facts.append("TEST RUNNER: " + (runner or "(none detected)"))
+        try:
+            top = sorted(p.name + ("/" if p.is_dir() else "")
+                         for p in project_root.iterdir()
+                         if not p.name.startswith("."))[:40]
+        except OSError:
+            top = []
+        if top:
+            facts.append("TOP-LEVEL ENTRIES: " + ", ".join(top))
     snapshot = "\n".join(facts + snap_lines)[:6000]
 
     # 2. one schema-constrained model call ----------------------------------

@@ -73,8 +73,8 @@
     var path = $('path');
     if (document.activeElement !== path && st.root) path.value = st.root;
     fillSelect($('recent'), [['', 'recent\u2026']].concat((st.recent || []).map(function (r) { return [r, r]; })), '');
-    if (st.root) fillSelect($('profile'), [['', '(default' + (st.default_profile ? ': ' + st.default_profile : '') + ')']].concat((st.profiles || []).map(function (p) { return [p, p]; })), st.profile === st.default_profile ? '' : st.profile);
-    $('modelLbl').textContent = st.root ? (st.model || '\u2014') : 'no project';
+    fillSelect($('profile'), [['', '(default' + (st.default_profile ? ': ' + st.default_profile : '') + ')']].concat((st.profiles || []).map(function (p) { return [p, p]; })), st.profile === st.default_profile ? '' : st.profile);
+    $('modelLbl').textContent = st.model || '\u2014';
     var dot = $('modelDot');
     dot.className = 'dot ' + (job ? 'busy' : st.model_ok === true ? 'ok' : st.model_ok === false ? 'bad' : '');
     $('modelChip').title = (st.model_status || 'click to check the model server') + (st.base_url ? '\n' + st.base_url : '') + (st.context_tokens ? '\nwindow ' + PDC.fmtInt(st.context_tokens) + ' tokens (' + st.context_origin + ')' : '');
@@ -323,7 +323,7 @@
     var st = S.status, job = st.job, m = MODES[S.mode];
     var needIndex = st.root && !st.has_index && S.mode !== 'new';
     var hint = $('modeHint'); PDC.clear(hint);
-    if (!st.root && S.mode !== 'new') hint.append('Open a project first. ');
+    if (!st.root && S.mode !== 'new' && S.mode !== 'explain' && S.mode !== 'how') hint.append('Open a project first. ');
     if (needIndex) {
       hint.append('No index yet \u2014 build one to start: ',
         h('button', { class: 'small primary', text: 'Build index', disabled: !!job, onclick: function () { buildIndex(true); } }), ' ',
@@ -368,8 +368,9 @@
       return;
     }
     if (!text && !S.attachments.length && !(S.mode === 'auto' && opt('auto', 'plan_file'))) { PDC.toast('Type something first.', true); return; }
-    if (S.mode !== 'new' && !st.root) { PDC.toast('Open a project first.', true); return; }
-    if (S.mode !== 'new' && !st.has_index) { PDC.toast('Build the index first.', true); return; }
+    var needsProject = S.mode !== 'new' && S.mode !== 'explain' && S.mode !== 'how';
+    if (needsProject && !st.root) { PDC.toast('Open a project first.', true); return; }
+    if (needsProject && !st.has_index) { PDC.toast('Build the index first.', true); return; }
     var body = { mode: S.mode, text: text, attachments: S.attachments.slice() };
     var o = S.opts[S.mode] || {};
     OPTS[S.mode].forEach(function (d) { body[d.k] = opt(S.mode, d.k); });

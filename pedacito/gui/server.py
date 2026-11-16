@@ -459,15 +459,30 @@ def _project_root():
         return STATE.root
 
 
+def _effective_root() -> Path:
+    """The workspace a route should act on: the open project, or the
+    persistent per-user scratchpad when no project is open.
+
+    Session history, memory, background servers and cleanup all need a
+    directory to write to. Refusing them with "Open a project first" left the
+    GUI's own buttons dead before the user opened anything, even though Ask
+    already runs there. The scratchpad is created on demand and shared across
+    reloads, so a project-less chat keeps its memory, threads and state."""
+    root = _project_root()
+    return root if root is not None else STATE.scratchpad_path()
+
+
 @post("/api/project/reset")
 def _project_reset(q, body):
-    """Wipe this project's `.pedacito/` state exactly like `pedacito reset`:
+    """Wipe this workspace's `.pedacito/` state exactly like `pedacito reset`:
     running background servers are stopped first, code and `.pedacito.toml`
-    are untouched, and `reindex` rebuilds the index afterwards as a job."""
+    are untouched, and `reindex` rebuilds the index afterwards as a job.
+
+    With no project open this resets the scratchpad instead of refusing."""
     from .. import processes
-    root = _project_root()
-    if root is None:
-        return 409, {"ok": False, "detail": "Open a project first."}
+    with STATE.lock:
+        project_open = STATE.root is not None
+    root = _effective_root()
     with STATE.lock:
         busy = STATE.job is not None and STATE.job.active
     if busy:
@@ -518,7 +533,9 @@ def _project_reset(q, body):
     STATE.apply_index(None)
     STATE.reset_threads()
     out["reindex_started"] = False
-    if body.get("reindex"):
+    # A scratchpad has no project index to rebuild; `build_index` would refuse
+    # the job anyway because STATE.root is still None.
+    if body.get("reindex") and project_open:
         job = jobs.spawn("index", "rebuilding index after reset",
                          lambda j: jobs.build_index(j, True))
         out["reindex_started"] = job is not None
@@ -544,18 +561,13 @@ def _memory_payload(root) -> dict:
 
 @get("/api/memory")
 def _memory_get(q, body=None):
-    root = _project_root()
-    if root is None:
-        return 409, {"ok": False, "detail": "Open a project first."}
-    return 200, _memory_payload(root)
+    return 200, _memory_payload(_effective_root())
 
 
 @post("/api/memory")
 def _memory_post(q, body):
     from .. import memory
-    root = _project_root()
-    if root is None:
-        return 409, {"ok": False, "detail": "Open a project first."}
+    root = _effective_root()
     action = str(body.get("action") or "add").strip().lower()
     out: dict = {"ok": True}
     if action == "add":
@@ -601,37 +613,44 @@ def _skills_payload(root, task: str = "") -> dict:
 @get("/api/skills")
 def _skills_get(q, body=None):
     """Every skill (bundled / user / project) with its scope badge; an
-    optional `task` query previews which checklists select_skills injects."""
-    return 200, _skills_payload(_project_root(), str(q.get("task", "")))
+    optional `task` query previews which checklists select_skills injects.
+
+    With no project open this reads the built-in library plus the user's
+    global folder (and any skill saved into the scratchpad project)."""
+    return 200, _skills_payload(_effective_root(), str(q.get("task", "")))
 
 
 @post("/api/skills")
 def _skills_save(q, body):
     """Save a custom skill: {name, description, triggers, body, scope}.
-    scope is "project" (needs an open project) or "user"/"global"."""
+
+    `scope` is "project" or "user"/"global". With no project open the default
+    is the user's global library; an explicit project scope saves into the
+    scratchpad project instead of refusing."""
     from .. import skills
     root = _project_root()
-    scope = str(body.get("scope") or "project").strip().lower()
-    if scope in ("user", "global"):
+    raw_scope = str(body.get("scope") or "").strip().lower()
+    if not raw_scope:
+        scope = "project" if root is not None else "user"
+    elif raw_scope in ("user", "global"):
         scope = "user"
-    elif scope != "project":
-        return 400, {"ok": False, "detail": f"unknown scope {scope!r}"}
-    if scope == "project" and root is None:
-        return 409, {"ok": False,
-                     "detail": "Open a project first, or save to the global "
-                               "library."}
+    elif raw_scope == "project":
+        scope = "project"
+    else:
+        return 400, {"ok": False, "detail": f"unknown scope {raw_scope!r}"}
+    target_root = _effective_root() if scope == "project" else root
     triggers = body.get("triggers") or []
     if isinstance(triggers, str):
         triggers = [t.strip() for t in triggers.split(",") if t.strip()]
     try:
         path = skills.save_skill(
-            root, name=str(body.get("name") or ""),
+            target_root, name=str(body.get("name") or ""),
             description=str(body.get("description") or ""),
             triggers=[str(t) for t in triggers],
             body=str(body.get("body") or ""), scope=scope)
     except ValueError as e:
         return 400, {"ok": False, "detail": str(e)}
-    out = _skills_payload(root)
+    out = _skills_payload(_effective_root())
     out.update(saved=str(path), scope=scope)
     return 200, out
 
@@ -646,16 +665,17 @@ def _skills_draft(q, body):
         return 400, {"ok": False, "detail": "Describe what the skill should "
                                             "teach first."}
     with STATE.lock:
-        cfg, client = STATE.cfg, STATE.client
+        cfg, client, profile = STATE.cfg, STATE.client, STATE.profile_request
     if client is None:
-        # Project-less GUI: draft with the user-level config's model.
+        # Project-less GUI: draft on the profile selected in the topbar.
         from .. import config as config_mod
         from ..llm import LLMClient
         try:
-            cfg = config_mod.load(root=None, require_hardware=False,
-                                  warn_budgets=False, upgrade_user_config=False)
+            cfg = config_mod.load(root=None, profile=profile or None,
+                                  require_hardware=False, warn_budgets=False,
+                                  upgrade_user_config=False)
             client = LLMClient(cfg)
-        except (ConfigError, OSError) as e:
+        except (ConfigError, OSError, ValueError) as e:
             return 400, {"ok": False,
                          "detail": f"No model configured for drafting: {e}"}
     try:
@@ -667,17 +687,23 @@ def _skills_draft(q, body):
 
 @post("/api/skills/delete")
 def _skills_delete(q, body):
-    """Delete a custom skill (built-ins are immutable)."""
+    """Delete a custom skill (built-ins are immutable). A project-scope
+    delete falls back to the scratchpad when no project is open."""
     from .. import skills
     root = _project_root()
     name = str(body.get("name") or "")
-    scope = str(body.get("scope") or "project").strip().lower()
-    if scope in ("user", "global"):
+    raw_scope = str(body.get("scope") or "").strip().lower()
+    if not raw_scope:
+        scope = "project" if root is not None else "user"
+    elif raw_scope in ("user", "global"):
         scope = "user"
-    if scope == "project" and root is None:
-        return 409, {"ok": False, "detail": "Open a project first."}
+    elif raw_scope == "project":
+        scope = "project"
+    else:
+        return 400, {"ok": False, "detail": f"unknown scope {raw_scope!r}"}
+    target_root = _effective_root() if scope == "project" else root
     try:
-        deleted = skills.delete_skill(root, name, scope=scope)
+        deleted = skills.delete_skill(target_root, name, scope=scope)
     except ValueError as e:
         return 400, {"ok": False, "detail": str(e)}
     if not deleted:
@@ -685,7 +711,7 @@ def _skills_delete(q, body):
                   if name.strip().lower() in skills.BUILTIN_SKILLS
                   else f"No {scope} skill named '{name}' to delete.")
         return 400, {"ok": False, "detail": detail}
-    out = _skills_payload(root)
+    out = _skills_payload(_effective_root())
     out["deleted"] = name
     return 200, out
 
@@ -700,8 +726,9 @@ def _session_consolidate(q, body):
     immediately via the client's last-call token numbers."""
     from .. import memory
     with STATE.lock:
-        root, cfg, client = STATE.root, STATE.cfg, STATE.client
+        cfg, client = STATE.cfg, STATE.client
         job = STATE.job if STATE.job is not None and STATE.job.active else None
+    root = _effective_root()
     if job is not None:
         return 409, {"ok": False,
                      "detail": "A job is running. Stop it before "
@@ -731,18 +758,14 @@ def _session_consolidate(q, body):
 @get("/api/procs")
 def _procs_get(q, body=None):
     from .. import processes
-    root = _project_root()
-    if root is None:
-        return 200, {"ok": True, "processes": []}
+    root = _effective_root()
     return 200, {"ok": True, "processes": processes.list_procs(root)}
 
 
 @post("/api/procs")
 def _procs_post(q, body):
     from .. import processes
-    root = _project_root()
-    if root is None:
-        return 409, {"ok": False, "detail": "Open a project first."}
+    root = _effective_root()
     action = str(body.get("action") or "list").strip().lower()
     if action == "start":
         command = body.get("command") or ""
@@ -831,10 +854,10 @@ def _project_check(q, body):
 
 @post("/api/project/prune")
 def _project_prune(q, body):
-    """Retention for sessions, backups, events and log.txt."""
-    root = _project_root()
-    if root is None:
-        return 409, {"ok": False, "detail": "Open a project first."}
+    """Retention for sessions, backups, events and log.txt.
+
+    With no project open this prunes the scratchpad workspace."""
+    root = _effective_root()
     with STATE.lock:
         cfg = STATE.cfg
     cfg = cfg if cfg is not None else _how_config()
@@ -953,6 +976,18 @@ def _run(q, body):
         echo=lambda: jobs.echo_submission(mode, body)))
 
 
+# Named aliases for the Ask and Auto modes, for API clients that address the
+# mode directly. Both accept the same body as POST /api/run.
+@post("/api/ask")
+def _run_ask(q, body):
+    return _run(q, {**body, "mode": "explain"})
+
+
+@post("/api/auto")
+def _run_auto(q, body):
+    return _run(q, {**body, "mode": "auto"})
+
+
 @post("/api/refactor/rename")
 def _refactor_rename(q, body):
     """Deterministic symbol rename: AST/tokenize, zero model tokens.
@@ -1061,6 +1096,11 @@ def _restore(q, body):
     return (200 if ok else 400), {"ok": ok, "detail": detail}
 
 
+# The Changes tab and scripts call this "undo"; it restores a backup snapshot
+# (the newest when none is named), exactly like /api/restore.
+POST_ROUTES["/api/undo"] = _restore
+
+
 @post("/api/plan")
 def _plan_save(q, body):
     job = STATE.job
@@ -1090,17 +1130,24 @@ def _spec_refine(q, body):
     profile = str(body.get("profile") or "")
     with STATE.lock:
         root, cfg, client = STATE.root, STATE.cfg, STATE.client
-    if root is None and mode != "new":
-        return 400, {"ok": False, "detail": "Open a project first."}
     if root is None:
-        # Refining the brief of a project that does not exist yet: describe
-        # the empty scratchpad on the selected global profile. The architect's
-        # deterministic fallback still shapes the spec if the model is down.
+        # No project is open: refine against the empty scratchpad on the
+        # selected global profile. There is no repo snapshot or detected test
+        # runner to inject, so the architect turns the idea into a standalone
+        # spec the user can send to New or Ask. `refine_prompt` always
+        # answers, even when the model is unreachable.
         from ..llm import LLMClient
         root = STATE.scratchpad_path()
         try:
-            cfg = STATE.global_config(profile=profile or None)
-            client = LLMClient(cfg)
+            if cfg is None or (profile
+                               and profile != getattr(cfg, "active_profile",
+                                                      "")):
+                cfg = STATE.global_config(profile=profile or None)
+            if client is None or (profile and cfg is not None
+                                  and profile != getattr(
+                                      getattr(client, "cfg", None),
+                                      "active_profile", "")):
+                client = LLMClient(cfg) if cfg is not None else None
         except Exception:
             cfg, client = None, None
     elif profile and profile != getattr(STATE, "profile_request", ""):
@@ -1121,6 +1168,10 @@ def _spec_refine(q, body):
         return 200, {"ok": False, "detail": f"refine failed: {e}"}
     return 200, {"ok": True, "refined": got["refined"],
                  "original": got["original"], "contracts": got["contracts"]}
+
+
+# The shorter spelling used by scripts and older clients.
+POST_ROUTES["/api/refine"] = _spec_refine
 
 
 @post("/api/clear")
