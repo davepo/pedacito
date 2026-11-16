@@ -345,7 +345,11 @@
   }
 
   function buildIndex(summarise) {
-    PDC.api('/api/index', { summarise: summarise }).then(function (j) { if (!j.ok) PDC.toast(j.detail || 'busy', true); PDC.refreshState(); });
+    PDC.api('/api/index', { summarise: summarise }).then(function (j) {
+      if (!j.ok) PDC.toast(j.detail || 'busy', true);
+      else if (j.detail) PDC.toast(j.detail);   // synchronous empty-workspace reply
+      PDC.refreshState();
+    }).catch(function () { PDC.toast('Could not reach the GUI server to build the index.', true); });
   }
 
   PDC.startRun = function (payload) {

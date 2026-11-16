@@ -753,8 +753,9 @@ function startNewProject() {
 function buildIndex(summarise) {
   PDC.api('/api/index', { summarise: summarise }).then((j) => {
     if (!j.ok) PDC.toast(j.detail || 'busy', true);
+    else if (j.detail) PDC.toast(j.detail);   // synchronous empty-workspace reply
     refreshState();
-  });
+  }).catch(() => PDC.toast('Could not reach the GUI server to build the index.', true));
 }
 function setAutoRoute(on) {           // topbar toggle -> user config + reload
   PDC.api('/api/settings/set', { file: 'user', changes: { auto_route_specialties: !!on } })

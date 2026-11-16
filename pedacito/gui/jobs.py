@@ -36,6 +36,12 @@ MAX_TEXT_CHARS = 60000
 _EDIT_BLOCK_RE = re.compile(
     r"^---\s*FILE:.*?^>>>>>>>\s*REPLACE[ \t]*$", re.MULTILINE | re.DOTALL)
 
+# Status shown when Build Index runs on a workspace with 0 indexable files.
+# The empty index is valid and the project is marked indexed; the user is told
+# how to populate it instead of being left on a dead "no index" banner.
+EMPTY_INDEX_MESSAGE = ("Index ready (0 files in workspace — run a Task or Auto "
+                       "prompt to create files).")
+
 
 # --- running jobs -------------------------------------------------------------
 
@@ -65,6 +71,16 @@ def spawn(kind: str, title: str, fn, *, echo=None) -> Job | None:
                     "undone with Restore (project menu).", kind="cancelled")
             except (ConfigError, LLMError) as e:
                 err = str(e)
+                if job.kind in RUN_KINDS:
+                    STATE.add_message("assistant", err, kind="error",
+                                      level="warn")
+                STATE.add_message("error", err)
+            except SystemExit as e:
+                # index.build signals a fatal condition (e.g. the model cannot
+                # respond) with SystemExit. It is a BaseException, so without
+                # this handler it would kill the worker thread silently and
+                # leave the page stuck with no error shown.
+                err = str(e).strip() or "The job stopped before finishing."
                 if job.kind in RUN_KINDS:
                     STATE.add_message("assistant", err, kind="error",
                                       level="warn")
@@ -624,6 +640,38 @@ def run_benchmark(job: Job, opts: dict) -> None:
                       })
 
 
+def empty_workspace_index() -> "dict | None":
+    """Synchronous Build Index for a workspace with 0 indexable files.
+
+    Returns the 200 reply dict after writing a valid empty index and marking
+    the project indexed, or None when the normal background job should run
+    (files exist, no project is open, or a job already holds the slot). An
+    empty workspace has nothing to chunk or summarise, so answering inline
+    gives the page a definite result instead of a background job -- and never
+    touches the model, even for "Build index (with summaries)".
+    """
+    with STATE.lock:
+        root, args, cfg = STATE.root, STATE.args, STATE.cfg
+        client = STATE.client
+        busy = STATE.job is not None and STATE.job.active
+    if root is None or busy or args is None or cfg is None:
+        return None
+    matcher = cli_mod._matcher(args, root)
+    if index_mod.select(args.paths, root, matcher,
+                        index_mod.indexable_exts(cfg)):
+        return None
+    idx = index_mod.build(args.paths, cfg, client=None, root=root,
+                          summarise=False, matcher=matcher)
+    with STATE.lock:
+        STATE.idx = idx
+        STATE.agent = Agent(idx, client, cfg)
+        STATE.index_gen += 1
+    STATE.apply_index(idx)
+    STATE.add_message("system", EMPTY_INDEX_MESSAGE, kind="indexed")
+    return {"ok": True, "detail": EMPTY_INDEX_MESSAGE, "indexed": True,
+            "files": 0, "chunks": 0}
+
+
 def build_index(job: Job, summarise: bool = True) -> None:
     """Build the index, like `pedacito index` (summaries cost one model call
     per unit, so it is an explicit action)."""
@@ -638,8 +686,11 @@ def build_index(job: Job, summarise: bool = True) -> None:
         STATE.agent = Agent(idx, p.client, p.cfg)
         STATE.index_gen += 1
     STATE.apply_index(idx)
-    STATE.add_message("system", f"Indexed {len(idx.chunks)} units across "
-                      f"{len(idx.files)} files.", kind="indexed")
+    if not idx.files:
+        STATE.add_message("system", EMPTY_INDEX_MESSAGE, kind="indexed")
+    else:
+        STATE.add_message("system", f"Indexed {len(idx.chunks)} units across "
+                          f"{len(idx.files)} files.", kind="indexed")
 
 
 def restore_snapshot(name: str = "") -> tuple[bool, str]:

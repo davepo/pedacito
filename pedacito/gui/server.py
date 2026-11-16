@@ -1010,6 +1010,13 @@ def _profile_switch(q, body):
 @post("/api/index")
 def _index(q, body):
     summarise = bool(body.get("summarise", True))
+    # A workspace with 0 indexable files is indexed synchronously: a valid
+    # empty index is written and the project marked indexed, answered 200 with
+    # a clear status. The old background job died silently on the empty case
+    # (SystemExit is not an Exception) and left the page stuck on "no index".
+    empty = jobs.empty_workspace_index()
+    if empty is not None:
+        return 200, empty
     return _busy_reply(jobs.spawn(
         "index", "building index" + ("" if summarise else " (no summaries)"),
         lambda job: jobs.build_index(job, summarise)))

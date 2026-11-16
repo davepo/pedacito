@@ -938,6 +938,43 @@ def test_open_project_lists_files_and_remembers_it(project):
 
 
 @pytest.mark.network
+def test_build_index_on_empty_workspace_succeeds_and_marks_indexed(gui, fake_port):
+    """A folder with 0 indexable files (e.g. just wiped to start fresh) must
+    index cleanly: POST /api/index answers 200 ok, writes a valid empty
+    index.json, and moves the project out of unindexed mode -- not a silent
+    failure that leaves the Build Index banner stuck."""
+    gui.post("/api/settings/setup", {"base_url": f"http://127.0.0.1:{fake_port}/v1",
+                                     "model": "fake-model", "vram_gb": "8"})
+    root = gui.tmp / "empty-proj"
+    root.mkdir()
+    status, _ = gui.post("/api/project", {"path": str(root), "profile": ""})
+    assert status == 202 and gui.wait_idle(30)
+    state = gui.get("/api/state")[1]
+    assert state["root"] == str(root.resolve()), core.STATE.messages
+    assert state["has_index"] is False                     # unindexed before
+
+    status, body = gui.post("/api/index", {"summarise": False})
+    assert status == 200 and body["ok"] is True, body
+    assert gui.wait_idle(10)
+    state = gui.get("/api/state")[1]
+    assert state["has_index"] is True and state["indexed"] is True
+    assert state["index_files"] == 0 and state["index_chunks"] == 0
+    assert not state["error"]
+
+    # a valid empty index was persisted (files: [] / no chunks)
+    data = json.loads((root / ".pedacito" / "index.json").read_text(encoding="utf-8"))
+    assert data["chunks"] == [] and data["file_hashes"] == {}
+
+    # the clear status message reached the transcript
+    assert any("0 files in workspace" in m["text"] for m in state["messages"])
+
+    # "with summaries" on an empty workspace also succeeds without a model call
+    status, body = gui.post("/api/index", {"summarise": True})
+    assert status == 200 and body["ok"] is True, body
+    assert gui.get("/api/state")[1]["has_index"] is True
+
+
+@pytest.mark.network
 def test_task_in_review_mode_shows_a_diff_and_accept_writes_it(project):
     originals = core.install_tee()      # pytest swaps stderr between phases
     try:

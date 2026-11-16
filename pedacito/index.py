@@ -1133,6 +1133,16 @@ def _summarise_units(idx: "Index", todo: list[Chunk], client, cfg, cache: dict,
     return done
 
 
+def indexable_exts(cfg) -> set[str]:
+    """The file extensions `build` selects: code, plus reference material and
+    any extra extensions the config enables."""
+    exts = set(CODE_EXTS)
+    if cfg.include_references:
+        exts |= set(REFERENCE_EXTS)
+    exts |= {e if e.startswith(".") else "." + e for e in cfg.extra_extensions}
+    return exts
+
+
 def build(paths: list[str], cfg, client=None, root: Path | None = None,
           summarise: bool = True, verbose: bool = True,
           matcher: Matcher | None = None, resummarise: bool = False) -> Index:
@@ -1143,21 +1153,23 @@ def build(paths: list[str], cfg, client=None, root: Path | None = None,
 
     With `client` None or `summarise` False only the static index is built
     (`pedacito map`/`files`/`cost`), still reusing cached summaries.
+
+    A workspace with no indexable files (e.g. a folder the user just wiped to
+    start fresh) is a valid state: a valid empty index is written and returned
+    rather than raising, so the project is marked indexed and a Task/Auto run
+    can create the first files.
     """
     root = (root or Path.cwd()).resolve()
     matcher = matcher if matcher is not None else Matcher.from_files(root)
 
-    exts = set(CODE_EXTS)
-    if cfg.include_references:
-        exts |= set(REFERENCE_EXTS)
-    exts |= {e if e.startswith(".") else "." + e for e in cfg.extra_extensions}
-
-    files = select(paths, root, matcher, exts)
+    files = select(paths, root, matcher, indexable_exts(cfg))
     if not files:
-        raise SystemExit(
-            "Nothing to index in: " + ", ".join(paths) +
-            "\nEverything matched an ignore rule, or no files had an indexed "
-            "extension. Try `pedacito files` to see what was considered.")
+        if verbose:
+            print("  no indexable files yet; writing an empty index "
+                  "(run a task to create files)", file=sys.stderr)
+        idx = Index(root, [])
+        idx.save()
+        return idx
 
     chunks: list[Chunk] = []
     rels: list[str] = []
