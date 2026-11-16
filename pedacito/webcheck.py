@@ -28,7 +28,13 @@ somebody opens the page:
     runs;
   - a handler calls ``engine.setBpm(...)`` on a ``new SynthEngine()``
     instance but the class defines no ``setBpm`` (``TypeError: ... is not a
-    function`` on the first slider move).
+    function`` on the first slider move);
+  - a spam honeypot input (``name="_gotcha"``, ``class="honeypot"``,
+    ``aria-hidden="true"``) is not actually hidden -- real visitors see and
+    fill it, so the trap catches humans instead of bots;
+  - a visible text/email input or textarea inside a ``<form>`` has no
+    ``<label for>``, wrapping ``<label>`` or ``aria-label`` -- screen
+    readers announce an unnamed field.
 
 Every check is regex-level on purpose: no JS parser, no execution, no
 network, no dependencies. That trades recall for speed, so the results are
@@ -88,6 +94,39 @@ _OPTION_TAG_RE = re.compile(r"<option\b", re.I)
 _OPTION_POPULATION_RE = re.compile(
     r"new\s+Option\s*\(|createElement\s*\(\s*[\"']option|<option\b"
     r"|\.options\s*\.\s*add\s*\(", re.I)
+
+# Form controls: honeypot traps that are not hidden, and visible fields with
+# no label. Regex-level and conservative, like every webcheck notice.
+_INPUT_TAG_RE = re.compile(r"<input\b([^>]*?)/?>", re.I | re.S)
+_TEXTAREA_TAG_RE = re.compile(r"<textarea\b([^>]*)>", re.I | re.S)
+_FORM_SPAN_RE = re.compile(r"<form\b[^>]*>.*?</form\s*>", re.I | re.S)
+_LABEL_SPAN_RE = re.compile(r"<label\b[^>]*>.*?</label\s*>", re.I | re.S)
+_LABEL_FOR_RE = re.compile(
+    r"""<label\b[^>]*\bfor\s*=\s*(?:"([^"]*)"|'([^']*)')""", re.I)
+_CLASS_ATTR_RE = re.compile(r"""\bclass\s*=\s*(?:"([^"]*)"|'([^']*)')""", re.I)
+_NAME_ATTR_RE = re.compile(r"""\bname\s*=\s*(?:"([^"]*)"|'([^']*)')""", re.I)
+_STYLE_ATTR_RE = re.compile(r"""\bstyle\s*=\s*(?:"([^"]*)"|'([^']*)')""", re.I)
+_ARIA_HIDDEN_RE = re.compile(
+    r"""\baria-hidden\s*=\s*(?:"([^"]*)"|'([^']*)')""", re.I)
+_ARIA_LABEL_RE = re.compile(
+    r"""\baria-label(?:ledby)?\s*=\s*(?:"([^"]*)"|'([^']*)')""", re.I)
+# The boolean `hidden` attribute -- never the `hidden` inside `aria-hidden`
+# (the lookarounds exclude a preceding word char or hyphen).
+_HIDDEN_ATTR_RE = re.compile(r"(?<![\w-])hidden(?![\w-])", re.I)
+_ATTR_VALUE_RE = re.compile(r"""=\s*(?:"[^"]*"|'[^']*')""")
+_INLINE_HIDDEN_RE = re.compile(
+    r"display\s*:\s*none|visibility\s*:\s*hidden", re.I)
+_STYLE_BLOCK_RE = re.compile(r"<style\b[^>]*>(.*?)</style\s*>", re.I | re.S)
+_LINK_TAG_RE = re.compile(r"<link\b([^>]*)>", re.I)
+_REL_ATTR_RE = re.compile(r"""\brel\s*=\s*(?:"([^"]*)"|'([^']*)')""", re.I)
+_HREF_ATTR_RE = re.compile(r"""\bhref\s*=\s*(?:"([^"]*)"|'([^']*)')""", re.I)
+# One CSS rule (selector list + flat body); nested @media bodies carry braces
+# and are skipped, their inner rules match on their own.
+_CSS_RULE_RE = re.compile(r"([^{}]+)\{([^{}]*)\}", re.S)
+_CSS_CLASS_RE = re.compile(r"\.([A-Za-z_][\w-]*)")
+# Input types the honeypot check never flags: they are not fillable text
+# fields, so a trap marker on one is not a visible honeypot.
+_HONEYPOT_EXEMPT_TYPES = frozenset({"hidden", "submit", "button", "reset"})
 
 # ``import``/``export`` statements (never the dynamic ``import(``, which is
 # legal in classic scripts). Only horizontal space before the keyword, so
@@ -161,18 +200,20 @@ def _first_group(m) -> str:
 
 
 def _collect(root: Path):
-    """(html files, js files) under root, each a (rel, text) pair, both
-    sorted by rel. Skips build/vendored dirs and caps count and size so a
-    post-edit pass stays at regex speed."""
+    """(html files, js files, css files) under root, each a (rel, text) pair,
+    all sorted by rel. Skips build/vendored dirs and caps count and size so a
+    post-edit pass stays at regex speed. CSS rides along as hiding evidence
+    for the form-control checks (a `.honeypot{display:none}` rule)."""
     htmls: list[tuple[str, str]] = []
     jss: list[tuple[str, str]] = []
+    csss: list[tuple[str, str]] = []
     n = 0
     for dirpath, dirnames, filenames in os.walk(root):
         dirnames[:] = sorted(d for d in dirnames
                              if d not in _SKIP_DIRS and not d.startswith("."))
         for fn in sorted(filenames):
             ext = os.path.splitext(fn)[1].lower()
-            if ext not in _WEB_EXT:
+            if ext not in _WEB_EXT and ext != ".css":
                 continue
             p = Path(dirpath) / fn
             try:
@@ -182,15 +223,19 @@ def _collect(root: Path):
             except OSError:
                 continue
             rel = p.relative_to(root).as_posix()
-            (htmls if ext in _HTML_EXT else jss).append((rel, text))
+            bucket = (htmls if ext in _HTML_EXT
+                      else csss if ext == ".css" else jss)
+            bucket.append((rel, text))
             n += 1
             if n >= _MAX_FILES:
                 htmls.sort(key=lambda t: t[0])
                 jss.sort(key=lambda t: t[0])
-                return htmls, jss
+                csss.sort(key=lambda t: t[0])
+                return htmls, jss, csss
     htmls.sort(key=lambda t: t[0])
     jss.sort(key=lambda t: t[0])
-    return htmls, jss
+    csss.sort(key=lambda t: t[0])
+    return htmls, jss, csss
 
 
 def _resolve_src(root: Path, html_rel: str, src: str):
@@ -354,6 +399,134 @@ def _empty_select_findings(htmls, jss) -> list[Finding]:
                 f"{ident} has no <option> children and no script builds any "
                 "-- the dropdown is empty, so the feature it feeds cannot be "
                 "used"))
+    return out
+
+
+def _attr_value(rx, attrs: str) -> str:
+    """One attribute's value from a tag's attribute text ('' when absent)."""
+    m = rx.search(attrs)
+    return _first_group(m).strip() if m else ""
+
+
+def _input_hidden(attrs: str, classes: set[str], css_hidden: set[str]) -> bool:
+    """Evidence a control is not user-visible: the boolean `hidden`
+    attribute, inline display:none / visibility:hidden, or a class some
+    collected stylesheet hides."""
+    # Strip quoted values first: the `hidden` inside `aria-hidden="true"`
+    # or `type="hidden"` must not read as the boolean hidden attribute.
+    bare = _ATTR_VALUE_RE.sub("", attrs)
+    if _HIDDEN_ATTR_RE.search(bare):
+        return True
+    style = _attr_value(_STYLE_ATTR_RE, attrs)
+    if style and _INLINE_HIDDEN_RE.search(style):
+        return True
+    return bool(classes & css_hidden)
+
+
+def _css_hidden_classes(css_texts) -> set[str]:
+    """Class names some stylesheet rule hides (display:none or
+    visibility:hidden): `.honeypot{display:none}` is the canonical way to
+    arm a honeypot without an inline style."""
+    out: set[str] = set()
+    for text in css_texts:
+        for m in _CSS_RULE_RE.finditer(text):
+            if _INLINE_HIDDEN_RE.search(m.group(2)):
+                out.update(_CSS_CLASS_RE.findall(m.group(1)))
+    return out
+
+
+def _form_input_findings(htmls, csss, root: Path) -> list[Finding]:
+    """Check 11: a spam honeypot input nothing hides (real visitors see and
+    fill it, so the trap catches humans instead of bots), and a visible
+    text/email input or textarea inside a <form> with no <label for>,
+    wrapping <label> or aria-label (screen readers announce an unnamed
+    field). Hiding evidence: the `hidden` attribute, inline display:none /
+    visibility:hidden, or a class hidden by any collected, inline or linked
+    stylesheet. Regex-level and conservative, like every webcheck notice."""
+    css_texts = [text for _rel, text in csss]
+    for rel, text in htmls:
+        css_texts.extend(m.group(1) for m in _STYLE_BLOCK_RE.finditer(text))
+        for lm in _LINK_TAG_RE.finditer(text):
+            attrs = lm.group(1)
+            rm = _REL_ATTR_RE.search(attrs)
+            if not rm or "stylesheet" not in _first_group(rm).lower():
+                continue
+            hm = _HREF_ATTR_RE.search(attrs)
+            if not hm:
+                continue
+            href = _first_group(hm).strip().split("?")[0].split("#")[0]
+            css_rel, external = _resolve_src(root, rel, href)
+            if external:
+                continue
+            p = root / css_rel
+            try:
+                if p.is_file() and p.stat().st_size <= _MAX_BYTES:
+                    css_texts.append(
+                        p.read_text(encoding="utf-8", errors="replace"))
+            except OSError:
+                pass
+    css_hidden = _css_hidden_classes(css_texts)
+    out: list[Finding] = []
+    for rel, text in htmls:
+        label_fors = {_first_group(m) for m in _LABEL_FOR_RE.finditer(text)}
+        label_fors.discard("")
+        label_spans = [(m.start(), m.end())
+                       for m in _LABEL_SPAN_RE.finditer(text)]
+        form_spans = [(m.start(), m.end())
+                      for m in _FORM_SPAN_RE.finditer(text)]
+        controls = [(m, "input") for m in _INPUT_TAG_RE.finditer(text)]
+        controls += [(m, "textarea")
+                     for m in _TEXTAREA_TAG_RE.finditer(text)]
+        controls.sort(key=lambda t: t[0].start())
+        for m, tag in controls:
+            attrs = m.group(1)
+            typ = (_attr_value(_TYPE_ATTR_RE, attrs).lower()
+                   if tag == "input" else "textarea")
+            classes = set(_attr_value(_CLASS_ATTR_RE, attrs).split())
+            name = _attr_value(_NAME_ATTR_RE, attrs)
+            idm = _ID_ATTR_RE.search(attrs)
+            fid = _first_group(idm) if idm else ""
+            ident = (f"#{fid}" if fid else
+                     f'name="{name}"' if name else f"<{tag}>")
+            hidden = _input_hidden(attrs, classes, css_hidden)
+            line = _line_of(text, m.start())
+            # --- a honeypot trap that nothing hides ------------------------
+            if tag == "input" and typ not in _HONEYPOT_EXEMPT_TYPES:
+                aria = _attr_value(_ARIA_HIDDEN_RE, attrs).lower()
+                signals = []
+                if aria == "true":
+                    signals.append('aria-hidden="true"')
+                if name == "_gotcha":
+                    signals.append('name="_gotcha"')
+                if "honeypot" in classes:
+                    signals.append('class="honeypot"')
+                if signals and not hidden:
+                    out.append(Finding(
+                        rel, line,
+                        f"{ident} looks like a spam honeypot "
+                        f"({', '.join(signals)}) but nothing hides it -- "
+                        "real visitors will see and fill it, so the trap "
+                        "catches humans instead of bots; add the `hidden` "
+                        "attribute, inline display:none, or a CSS rule "
+                        "that hides its class"))
+            # --- a visible form field with no label ------------------------
+            if hidden:
+                continue
+            if tag == "input" and typ not in ("", "text", "email"):
+                continue
+            if not any(a <= m.start() < b for a, b in form_spans):
+                continue
+            if any(a <= m.start() < b for a, b in label_spans):
+                continue                     # a wrapping <label>
+            if fid and fid in label_fors:
+                continue                     # <label for="..."> elsewhere
+            if _attr_value(_ARIA_LABEL_RE, attrs):
+                continue
+            out.append(Finding(
+                rel, line,
+                f"{ident} inside <form> has no label -- no <label for>, "
+                "wrapping <label>, or aria-label; screen readers announce "
+                "it as an unnamed field"))
     return out
 
 
@@ -1310,7 +1483,7 @@ def run(root, files: list[str] | None = None) -> list[Finding]:
     peer is among them -- a post-edit pass cares about both sides of a
     broken contract, and nothing else."""
     root = Path(root)
-    htmls, jss = _collect(root)
+    htmls, jss, csss = _collect(root)
     if not htmls and not jss:
         return []
     texts = dict(htmls)
@@ -1449,6 +1622,9 @@ def run(root, files: list[str] | None = None) -> list[Finding]:
 
     # --- check 10: empty <select> controls (BUG-324) ------------------------
     findings.extend(_empty_select_findings(htmls, jss))
+
+    # --- check 11: unhidden honeypots and unlabelled form fields ------------
+    findings.extend(_form_input_findings(htmls, csss, root))
 
     # --- check 4: bare imports vs package.json ------------------------------
     deps = _pkg_deps(root)

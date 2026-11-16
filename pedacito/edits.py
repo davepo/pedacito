@@ -21,6 +21,17 @@ Expected format in a model's reply:
 
 An empty SEARCH section creates the file (or replaces its whole content).
 
+A whole file is removed with a DELETE block (or a one-line directive):
+
+    --- FILE: path/to/file.html
+    <<<<<<< DELETE
+    >>>>>>> DELETE
+
+    DELETE_FILE: path/to/file.html
+
+The file is backed up into the run's snapshot first, so `undo` / `pedacito
+restore` brings it back byte-for-byte. An empty REPLACE is NOT a deletion.
+
 The FILE header may carry an anchor instead of a SEARCH body:
 
     --- FILE: path/to/file.py LINES 40-60
@@ -62,7 +73,7 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 
-from . import fileio, safety
+from . import fileio, safety, security
 from .chunker import locate_symbol_span
 from .chunker_ts import LANG_BY_EXT, TS_AVAILABLE, has_syntax_error
 
@@ -87,6 +98,23 @@ _ANCHOR_RE = re.compile(
     r"|SYMBOL[ \t]+(?P<symbol>\S+))[ \t]*$",
     re.IGNORECASE,
 )
+
+# Whole-file deletion: a FILE header plus `<<<<<<< DELETE` / `>>>>>>> DELETE`
+# markers (the body between them, if any, is ignored), or a bare one-line
+# `DELETE_FILE: path` directive. Deletion backs the file up before unlinking,
+# so the run's undo restores it; an empty REPLACE never deletes a file.
+DELETE_BLOCK_RE = re.compile(
+    r"---\s*FILE:\s*(?P<file>[^\n]+?)\s*\n"
+    r"[^\n]*<{5,}[ \t]*DELETE[^\n]*\n"
+    r"(?P<body>.*?)"
+    r"^[ \t]*>{5,}[ \t]*DELETE",
+    re.DOTALL | re.MULTILINE,
+)
+DELETE_FILE_RE = re.compile(
+    r"(?m)^[ \t]*DELETE_FILE:[ \t]*(?P<file>[^\n]+?)[ \t]*$")
+# An opened-but-unclosed DELETE marker (for malformed_blocks reporting).
+_DELETE_MARK_RE = re.compile(r"(?m)^[ \t]*<{5,}[ \t]*DELETE\b")
+_DELETE_CLOSE_RE = re.compile(r">{5,}[ \t]*DELETE")
 
 # Zero-anchor symbol splice blocks. The header names the file and
 # the symbol; the body is the FULL new definition (replace) or the new text
@@ -146,6 +174,9 @@ class Edit:
     # {"edit_action": "insert_after_symbol"} payload); a plain symbol splice
     # lands in `symbol`.
     insert_after: str = ""
+    # A whole-file deletion (a `<<<<<<< DELETE` block or `DELETE_FILE: path`
+    # line): the file is backed up, then unlinked. Never a rename half.
+    delete: bool = False
 
 
 @dataclass
@@ -170,6 +201,9 @@ class Result:
     # LINES range covering every line). The context-pressure gate reads this
     # to refuse oversized whole-file drafts on small-window profiles.
     whole_file: bool = False
+    # The edit DELETED the file (a DELETE block / DELETE_FILE directive): it
+    # was backed up, then unlinked. The index forgets it instead of reindexing.
+    deleted: bool = False
 
 
 # --------------------------------------------------------------------------
@@ -200,8 +234,10 @@ def _strip_wrapping_fences(text: str) -> str:
             break                        # this line contains the header
         consumed += len(ln) + 1          # +1 for the newline we split on
     close_idx = -1
-    if "REPLACE" in text:
-        tail_from = max(i for i in range(len(lines)) if "REPLACE" in lines[i])
+    tail_marks = [i for i, ln in enumerate(lines)
+                  if "REPLACE" in ln or _DELETE_CLOSE_RE.search(ln)]
+    if tail_marks:
+        tail_from = max(tail_marks)
         for j in range(tail_from + 1, len(lines)):
             if _FENCE_RE.match(lines[j]):
                 close_idx = j
@@ -231,10 +267,13 @@ def malformed_blocks(text: str, parsed: int) -> list[tuple[str, str]]:
     headers = _HEADER_LINE_RE.findall(text)
     searches = len(_SEARCH_MARK_RE.findall(text))
     symbols = _SYMBOL_MARK_RE.findall(text)
+    delete_marks = list(_DELETE_MARK_RE.finditer(text))
+    delete_closers = [m.start() for m in _DELETE_CLOSE_RE.finditer(text)]
     # A symbol splice block normally sits under its own `--- FILE:` header, so
-    # those headers are not search blocks that lost their markers.
-    plain_headers = max(len(headers) - len(symbols), 0)
-    started = max(plain_headers, searches) + len(symbols)
+    # those headers are not search blocks that lost their markers. A DELETE
+    # block owns its header the same way.
+    plain_headers = max(len(headers) - len(symbols) - len(delete_marks), 0)
+    started = max(plain_headers, searches) + len(symbols) + len(delete_marks)
     if started <= parsed:
         return []
     missing = started - parsed
@@ -245,6 +284,27 @@ def malformed_blocks(text: str, parsed: int) -> list[tuple[str, str]]:
         wrong = _WRONG_HEADER_RE.search(text)
         out.append(((wrong.group("file") or wrong.group("file2")).strip()
                     if wrong else "(unknown file)", hint))
+        missing -= 1
+    for dm in delete_marks:
+        if missing <= 0:
+            break
+        # Only an UNCLOSED mark is a malformed block: pair each opener with
+        # the next closer after it, in order.
+        closer = next((p for p in delete_closers if p > dm.start()), None)
+        if closer is not None:
+            delete_closers.remove(closer)
+            continue
+        # The DELETE marker carries no path; the nearest header above it does.
+        head = "(unknown file)"
+        for hm in _HEADER_LINE_RE.finditer(text):
+            if hm.start() < dm.start():
+                head = hm.group("file").strip() or head
+            else:
+                break
+        out.append((head,
+                    "its DELETE block is incomplete: after `<<<<<<< DELETE` "
+                    "it needs a `>>>>>>> DELETE` line on its own (or use the "
+                    "one-line form `DELETE_FILE: path`)"))
         missing -= 1
     for line in symbols:
         if missing <= 0:
@@ -323,13 +383,19 @@ def parse_edits(text: str, discards: list | None = None) -> list[Edit]:
     file is appended to `discards` when given, so callers never count a null
     edit as work. Zero-anchor `<<<<<<< SYMBOL file :: name` blocks and
     `{"edit_action": ...}` JSON payloads parse into anchored Edits (no SEARCH,
-    a symbol to resolve at apply time)."""
+    a symbol to resolve at apply time). `<<<<<<< DELETE` blocks and
+    `DELETE_FILE: path` lines parse into `delete=True` Edits."""
     text = text.replace("\r\n", "\n").replace("\r", "\n")
     cleaned = _strip_wrapping_fences(text)
     # A blanked fence line can leave a header glued to the line above it.
     cleaned = _HEADER_START_RE.sub(r"\n\1", cleaned)
     found: list[tuple[int, Edit]] = []
+    # Spans owned by real edit blocks: a DELETE marker quoted inside a
+    # SEARCH/REPLACE or symbol-splice body (docs showing the syntax) is text,
+    # not an edit, and must not parse.
+    owned: list[tuple[int, int]] = []
     for m in BLOCK_RE.finditer(cleaned):
+        owned.append((m.start(), m.end()))
         # Drop exactly one trailing newline: the separator/closer may sit on
         # the same line as the last body line, so an empty replacement must
         # stay "" instead of becoming "\n".
@@ -362,6 +428,7 @@ def parse_edits(text: str, discards: list | None = None) -> list[Edit]:
     # `<<<<<<< AFTER_SYMBOL file :: name` (insert after), closed by
     # `>>>>>>> END_SYMBOL`. No SEARCH section exists to quote or mis-indent.
     for m in SYMBOL_BLOCK_RE.finditer(cleaned):
+        owned.append((m.start(), m.end()))
         kind = m.group("kind").upper()
         fname = fileio.normalise_rel(m.group("file").strip())
         body = m.group("replace").removesuffix("\n")
@@ -370,6 +437,28 @@ def parse_edits(text: str, discards: list | None = None) -> list[Edit]:
                       insert_after=m.group("symbol").strip()
                       if kind != "SYMBOL" else "")
         found.append((m.start(), anchor))
+    # Whole-file deletions: `--- FILE: path` + `<<<<<<< DELETE` / `>>>>>>>
+    # DELETE`, or a bare `DELETE_FILE: path` line. The body between the
+    # markers is ignored; a DELETE quoted inside another block's body is
+    # documentation, not an edit (the `owned` spans above).
+    def _in_owned(pos: int) -> bool:
+        return any(a <= pos < b for a, b in owned)
+
+    for m in DELETE_BLOCK_RE.finditer(cleaned):
+        if _in_owned(m.start()):
+            continue
+        owned.append((m.start(), m.end()))
+        raw_file = m.group("file").strip()
+        am = _ANCHOR_RE.match(raw_file)      # a stray anchor suffix: path only
+        if am:
+            raw_file = am.group("path").strip()
+        fname = fileio.normalise_rel(raw_file)
+        found.append((m.start(), Edit(fname, "", "", delete=True)))
+    for m in DELETE_FILE_RE.finditer(cleaned):
+        if _in_owned(m.start()):
+            continue
+        fname = fileio.normalise_rel(m.group("file").strip())
+        found.append((m.start(), Edit(fname, "", "", delete=True)))
     found.extend(parse_edit_actions(cleaned))
     found.sort(key=lambda t: t[0])
     return [e for _pos, e in found]
@@ -773,8 +862,10 @@ def _wipe_refusal(rel: str) -> str:
     return (f"ERROR: refusing to overwrite {rel}: the replacement is empty, "
             "which would erase the whole file -- every definition, export "
             "and comment in it. An empty REPLACE is not how a file is "
-            "emptied: use the `delete` action to remove it, or keep the "
-            "file and make targeted search/replace edits.")
+            f"emptied: to remove the file emit `DELETE_FILE: {rel}` (or a "
+            f"`--- FILE: {rel}` header with `<<<<<<< DELETE` / "
+            "`>>>>>>> DELETE` lines), or keep the file and make targeted "
+            "search/replace edits.")
 
 
 def fragment_refusal(rel: str, original: str, new_text: str,
@@ -952,7 +1043,8 @@ def apply_edits(root: Path, edits: list[Edit], backup: bool = True,
     chunker_ts), and then written (with a byte-exact backup of the original)
     or, in dry-run mode, only diffed. One cumulative Result is returned per
     file. An empty SEARCH against a missing file creates it. Paths outside
-    `root` are refused.
+    `root` are refused. A `delete=True` Edit backs its file up, then unlinks
+    it (Result.deleted); secret/credential paths and directories are refused.
 
     `cfg` enables approximate anchoring (`fuzzy_match`) and rename pairing
     (`allow_rename`); without it matching is exact-only.
@@ -1016,6 +1108,23 @@ def apply_edits(root: Path, edits: list[Edit], backup: bool = True,
                     "it, so it may not be modified; creating new files is "
                     "still allowed"))
                 del groups[rel]
+
+    # ---- whole-file deletions ----------------------------------------------
+    # DELETE blocks split out AFTER the protected/allowlist gates (a refused
+    # path stays refused) but BEFORE rename pairing: a deletion is never a
+    # rename half and never creation text. They apply inside the batch's try
+    # below, so a mid-batch OSError rolls them back like every other mutation.
+    delete_groups: dict[str, list[Edit]] = {}
+    for rel in list(groups):
+        deletes = [e for e in groups[rel] if e.delete]
+        if not deletes:
+            continue
+        delete_groups[rel] = deletes
+        rest = [e for e in groups[rel] if not e.delete]
+        if rest:
+            groups[rel] = rest
+        else:
+            del groups[rel]
 
     # ---- rename detection ---------------------------------------------------
     # Rename protocol: an empty-SEARCH creation block for the NEW path (a
@@ -1347,6 +1456,55 @@ def apply_edits(root: Path, edits: list[Edit], backup: bool = True,
                       whole_file=whole_file)
 
     try:
+        # Deletions run first: a later edit block for the same path then fails
+        # with "does not exist" instead of silently resurrecting the file.
+        for rel in delete_groups:
+            try:
+                path = security.resolve_safe_path(root_resolved, rel)
+            except security.SecurityError as e:
+                results.append(Result(False, rel, f"refused: {e}"))
+                continue
+            if security.is_sensitive_path(path):
+                results.append(Result(
+                    False, rel,
+                    "refused: this path holds secrets/credentials; remove it "
+                    "manually if you really mean to"))
+                continue
+            if path.is_dir():
+                results.append(Result(False, rel,
+                                      "this path is a directory, not a file"))
+                continue
+            if not path.is_file():
+                results.append(Result(
+                    True, rel, "deleted: nothing to delete (already absent)"))
+                continue
+            pre = path.read_bytes()
+            try:
+                original, _sty = fileio.read(path, errors="replace")
+            except OSError:
+                original = ""
+            diff = "".join(difflib.unified_diff(
+                original.splitlines(keepends=True), [],
+                fromfile=f"a/{rel}", tofile="/dev/null"))
+            sha = hashlib.sha256(original.encode("utf-8")).hexdigest()
+            note = (f"deleted ({len(original.splitlines())} line(s)); backed "
+                    "up first -- undo / `pedacito restore` brings it back")
+            if dry_run:
+                results.append(Result(True, rel, note + " (dry run)", diff,
+                                      original, "", sha, deleted=True))
+                continue
+            if backup:
+                if backup_dir is not None:
+                    fileio.backup_copy(path, backup_dir / rel)
+                else:
+                    fileio.backup_copy(
+                        path, path.with_suffix(path.suffix + ".bak"),
+                        keep_existing=False)
+            path.unlink()
+            undo.append((rel, _reverter(path, pre)))
+            results.append(Result(True, rel, note, diff, original, "", sha,
+                                  deleted=True))
+
         for rel, group in by_file.items():
             path = _resolve_inside(rel)
             if path is None:

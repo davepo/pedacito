@@ -50,6 +50,14 @@ CSP = ("default-src 'self'; style-src 'self' 'unsafe-inline'; "
        "script-src 'self'; connect-src 'self'; img-src 'self' data:; "
        "frame-ancestors 'none'; base-uri 'none'; form-action 'none'")
 
+# The cake emoji as an SVG favicon. The page declares it as a data: URI, but
+# browsers still probe /favicon.ico on their own; answering with the same SVG
+# keeps the console free of 404s.
+FAVICON_SVG = (
+    '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100">'
+    '<text y=".9em" font-size="90">🍰</text></svg>'
+).encode("utf-8")
+
 _SERVER: LocalHTTPServer | None = None
 
 
@@ -1695,6 +1703,9 @@ class _Handler(BaseHTTPRequestHandler):
             return
         if url.path.startswith("/preview/"):
             self._preview(url.path[len("/preview/"):])
+            return
+        if url.path == "/favicon.ico":
+            self._send(200, FAVICON_SVG, "image/svg+xml")
             return
         route = GET_ROUTES.get(url.path)
         if route is None:

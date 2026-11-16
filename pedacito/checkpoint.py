@@ -18,7 +18,7 @@ import json
 import time
 from pathlib import Path
 
-from . import safety, workspace
+from . import memory, safety, workspace
 from .index import state_dir
 
 CHECKPOINT_DIR = "checkpoints"
@@ -163,7 +163,9 @@ def render(cp: dict | None, max_chars: int = 3000) -> str:
     if len(text) > limit:
         suffix = "\n[... checkpoint truncated ...]"
         text = text[:max(0, limit - len(suffix))].rstrip() + suffix
-    return text
+    # Appended AFTER truncation so the precedence rule always survives: the
+    # current task outranks whatever the prior conversation says was done.
+    return text + "\n\n" + memory.TASK_PRECEDENCE_RULE
 
 
 def render_list(root, limit: int = 10) -> str:

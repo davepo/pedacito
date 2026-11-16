@@ -70,6 +70,9 @@ class FileDiff:
     # Display-only row for a rename's source ("removed (renamed to X)"); never
     # written on sign-off, the rename-removal pass deletes the source instead.
     removed_source: bool = False
+    # A whole-file deletion (DELETE block / DELETE_FILE): sign-off backs the
+    # file up and unlinks it instead of writing `after_text` (which is "").
+    deleted: bool = False
     # Requirement clause ids ("R1", ...) this file's edits serve (R8); empty
     # when no tracker evidence is available (e.g. diffs rebuilt from backups).
     clauses: tuple[str, ...] = ()
@@ -175,7 +178,7 @@ def diffs_from_results(results, root=None, clauses=None) -> list[FileDiff]:
         ids = tuple(clauses.get(r.file, ()))
         out.append(FileDiff(r.file, rows, added, removed, r.sha, r.after,
                             r.message, renames_from=tuple(r.renames_from),
-                            clauses=ids))
+                            clauses=ids, deleted=getattr(r, "deleted", False)))
         if root is None:
             continue
         for old in r.renames_from:
@@ -204,6 +207,12 @@ def diffs_from_backup(root: Path, backup_dir: Path) -> list[FileDiff]:
         rel = src.relative_to(backup_dir).as_posix()
         cur = root / rel
         if not cur.is_file():
+            # Backed up but gone from the tree: the run deleted (or renamed
+            # away) this file. Show the deletion instead of skipping it.
+            before, _ = fileio.read(src, errors="replace")
+            rows, added, removed = build_rows(before, "")
+            out.append(FileDiff(rel, rows, added, removed, _sha(before), "",
+                                "deleted", deleted=True))
             continue
         before, _ = fileio.read(src, errors="replace")
         after, _ = fileio.read(cur, errors="replace")
@@ -586,6 +595,7 @@ def build_page(diffs: list[FileDiff], task: str, model: str, profile: str,
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🍰</text></svg>">
 <title>Review &mdash; {html.escape(task[:60])}</title>
 <style>{CSS}</style>
 </head>
@@ -734,6 +744,8 @@ def write_files(root: Path, diffs: list[FileDiff], backup_dir: Path | None):
     for fd in diffs:
         p = root / fd.rel
         if not p.exists():
+            if fd.deleted:
+                continue         # already gone: the deletion's end state
             if fd.sha and fd.sha != EMPTY_SHA:
                 stale.append(f"{fd.rel} (deleted)")
             continue
@@ -754,10 +766,19 @@ def write_files(root: Path, diffs: list[FileDiff], backup_dir: Path | None):
     default_style = fileio.TextStyle()
     existed_at_check = {fd.rel: (root / fd.rel).exists() for fd in diffs}
     written = []
+    deleted: list[str] = []
     for fd in diffs:
         if fd.removed_source:
             continue
         p = root / fd.rel
+        if fd.deleted:
+            # Sign-off on a deletion: back the exact bytes up, then unlink.
+            if p.is_file() and p.resolve().is_relative_to(root.resolve()):
+                if backup_dir is not None:
+                    fileio.backup_copy(p, backup_dir / fd.rel)
+                p.unlink()
+                deleted.append(fd.rel)
+            continue
         try:
             if p.exists():
                 original, style = fileio.read(p, errors="replace")
@@ -816,7 +837,10 @@ def write_files(root: Path, diffs: list[FileDiff], backup_dir: Path | None):
                         if d.rel == old and d.removed_source), "")
             _remove_rename_source(old.strip(), pin)
 
-    msg = f"{len(written)} file(s) written: " + ", ".join(written)
+    msg = (f"{len(written)} file(s) written: " + ", ".join(written)
+           if written else "0 file(s) written")
+    if deleted:
+        msg += "; deleted: " + ", ".join(deleted)
     if removed:
         msg += "; renamed away: " + ", ".join(removed)
     if rename_notes:

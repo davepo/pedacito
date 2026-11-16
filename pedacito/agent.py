@@ -789,6 +789,11 @@ Rules for edits:
   Long replies get cut off mid-block at the token limit and are discarded.
 - Do not output the whole file. Do not output a diff or patch format.
 - Do not wrap the blocks in triple-backtick fences; emit them as plain text.
+- When SEVERAL changes land in ONE HTML section or ONE function, combine them
+  into a SINGLE block: SEARCH the whole enclosing `<section>` (or the whole
+  function) and REPLACE it with every change applied at once. Do not emit one
+  tiny block per clause against the same section -- the first edit shifts the
+  text the later blocks quote, and they stop matching.
 - If you are adding a new function, anchor the SEARCH on an existing nearby line.
 - To CREATE a brand-new file: emit exactly one block for it with an EMPTY
   SEARCH section (nothing between <<<<<<< SEARCH and =======) and the full
@@ -805,6 +810,11 @@ Rules for edits:
   exact opening lines are enough. Never create the placeholder without its
   clearing block in the same reply: Pedacito refuses lone placeholders so a
   half-finished rename cannot leave a stub file behind.
+- To DELETE a whole file: emit `DELETE_FILE: relative/path.html` on its own
+  line, or a block for it with `<<<<<<< DELETE` and `>>>>>>> DELETE` marker
+  lines under its FILE header (nothing is needed between them). Pedacito
+  backs the file up before removing it, so undo brings it back. An EMPTY
+  REPLACE is NOT a deletion -- it is refused.
 
 Before the blocks, write a short plain explanation of what you changed and why.
 If the task is a question rather than a change, just answer it and output no blocks."""
@@ -4305,6 +4315,11 @@ class Agent:
         # coverage warning. The requirement state machine seeds one bounded
         # follow-up pass from the clauses no edit addressed.
         seeds = verify_mod.coverage_seeds(task, reply, results, tracker=tracker)
+        # A removal whose file was never touched leaves its copy on disk even
+        # though no after-text carries it: re-check the real files and merge
+        # those clauses in, annotated with the exact line still to delete.
+        seeds = verify_mod.merge_unmet(seeds, verify_mod.unmet_requirements(
+            self.index.root, task, results, tracker=tracker))
         if seeds:
             followup = self._coverage_intents(seeds)
             # The receipt fires even when no clause resolves to a target: a
@@ -4338,14 +4353,23 @@ class Agent:
                 # turn ends with a concrete finding instead of silent success.
                 still = verify_mod.coverage_seeds(
                     task, reply, results, tracker=tracker)
+                still = verify_mod.merge_unmet(
+                    still, verify_mod.unmet_requirements(
+                        self.index.root, task, results, tracker=tracker))
                 for req in still:
+                    hits = getattr(req, "literal_hits", [])
+                    where = (" -- still on disk at "
+                             + "; ".join(f"{rel}:{ln}: {txt}"
+                                         for rel, ln, txt in hits[:2])
+                             if hits else "")
                     for lit in getattr(req, "missing_literals", []):
                         verb = ("still present" if req.literal_remove
                                 else "missing")
                         findings.append(verify_mod.Finding(
-                            "coverage", "error", "",
+                            "coverage", "error", hits[0][0] if hits else "",
                             f'quoted literal "{lit}" is {verb} after the '
-                            f'coverage follow-up ({req.req_id or "clause"})'))
+                            f'coverage follow-up ({req.req_id or "clause"})'
+                            + where))
         return results, reply, findings
 
     def incremental_edit(self, task: str, gathered: str, backup_dir=None,

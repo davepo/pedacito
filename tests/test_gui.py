@@ -242,6 +242,18 @@ def test_static_pages_and_security_headers(gui):
     assert gui.req("GET", "/static/nope.js")[0] == 404
 
 
+def test_favicon_is_the_cake_emoji(gui):
+    status, _h, body = gui.req("GET", "/")
+    assert status == 200
+    assert b'rel="icon"' in body and "🍰".encode("utf-8") in body
+    # The browser's own /favicon.ico probe answers 200 with the same SVG,
+    # never a 404 in the console.
+    status, headers, body = gui.req("GET", "/favicon.ico")
+    assert status == 200
+    assert headers["Content-Type"] == "image/svg+xml"
+    assert b"<svg" in body and "🍰".encode("utf-8") in body
+
+
 def test_foreign_host_origin_and_non_json_posts_are_refused(gui):
     assert gui.req("GET", "/api/state", headers={"Host": "evil.example"})[0] == 403
     assert gui.req("GET", "/events", headers={"Host": "evil.example"})[0] == 403

@@ -285,7 +285,12 @@ Rules:
 - Rename/move: two blocks -- the NEW path (empty SEARCH, one placeholder
   comment as REPLACE) and the OLD path (its first 3-5 lines as SEARCH, EMPTY
   REPLACE). Never copy the old file's contents.
+- Delete a whole file: `DELETE_FILE: path` on its own line (or `<<<<<<< DELETE`
+  / `>>>>>>> DELETE` markers under its FILE header). Backed up first, so undo
+  restores it; an EMPTY REPLACE never deletes a file.
 - Several files? Edit one now and say what remains; the next turn continues.
+- Several changes in ONE section or function? ONE block: SEARCH the whole
+  enclosing `<section>` (or function), REPLACE it with all changes applied.
 
 Example (the code was `return n >= 8` and the task said "use 10"):
 

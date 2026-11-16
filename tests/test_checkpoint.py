@@ -6,7 +6,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from pedacito import checkpoint
+from pedacito import checkpoint, memory
 from pedacito.config import Config
 
 
@@ -63,5 +63,9 @@ def test_render_is_bounded(tmp_path):
     checkpoint.save(tmp_path, "ask", "t", [
         {"role": "user", "content": "x" * 5000}], "y" * 5000, cfg)
     rendered = checkpoint.render(checkpoint.latest(tmp_path), max_chars=500)
-    assert len(rendered) <= 520
+    # The body stays bounded; the task-precedence rule is appended AFTER
+    # truncation (D3), so it survives even the smallest checkpoint budget.
+    assert rendered.endswith(memory.TASK_PRECEDENCE_RULE)
+    body = rendered[:-len(memory.TASK_PRECEDENCE_RULE)].rstrip()
+    assert len(body) <= 520
     assert "truncated" in rendered

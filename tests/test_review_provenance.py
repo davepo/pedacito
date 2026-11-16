@@ -104,6 +104,8 @@ def test_build_page_renders_clause_badges(tmp_path):
     assert ">R1</span>" in page and ">R2</span>" in page
     # the badge is titled with the clause text so a reviewer sees the intent
     assert "Clamp the discount in apply_discount" in page
+    # the standalone review page carries the cake favicon too
+    assert 'rel="icon"' in page and "🍰" in page
 
 
 def test_partial_accept_flags_the_unaccepted_clause():

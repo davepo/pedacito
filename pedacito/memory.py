@@ -216,11 +216,21 @@ def consolidated_file(root) -> Path:
     return Path(root) / ".pedacito" / CONSOLIDATED_FILE
 
 
+# Injected with every handoff/checkpoint: earlier session notes describe what
+# WAS done, never what the current task owes. Without it, a stale "added the
+# tagline" note made a later "remove the tagline" task re-add the copy (D3).
+TASK_PRECEDENCE_RULE = (
+    "The current `USER TASK` supersedes any earlier session notes. If the "
+    "user asks to remove, rename, or replace content that was added in an "
+    "earlier session, obey the current `USER TASK` unconditionally.")
+
+
 def handoff_prompt(summary: str) -> str:
     """The handoff as a resume seed for the next task (CLI chat / rpc)."""
     return ("CONSOLIDATED SESSION HANDOFF (earlier turns compacted to save "
             "context; verify current source before editing):\n"
-            + (summary or "").strip())
+            + (summary or "").strip()
+            + "\n\n" + TASK_PRECEDENCE_RULE)
 
 
 def _msg_text(m: dict) -> str:

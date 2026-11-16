@@ -4124,11 +4124,19 @@ def _run_task_once(root: Path, cfg, client, agent, idx, task: str, *,
         for r in results:
             if not r.ok:
                 continue
+            if getattr(r, "deleted", False):
+                # A deleted file leaves the index for good; it must not join
+                # `changed` either, or lint/diagnostics receive a dead path.
+                try:
+                    idx.forget(r.file)
+                except Exception:
+                    pass
+                continue
             try:
                 idx = index_mod.reindex_file(idx, r.file, cfg)
                 changed.append(r.file)
             except Exception:
-                pass               # a deleted/moved file re-indexes on next refresh
+                pass               # a moved file re-indexes on next refresh
         for rel in gather_mut:
             # Gather-phase writes are re-indexed by the tools themselves;
             # only files that still exist join `changed` so lint and the

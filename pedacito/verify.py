@@ -1483,6 +1483,64 @@ def _literal_in(text: str, literal: str) -> bool:
         return False
 
 
+# A removal clause quotes the copy from memory ("remove the 'lifelong tinker'
+# tagline") while the page carries an inflected, punctuation-shifted form
+# ("Consultant, builder, and lifelong tinkerer."). Exact substring matching
+# declared that removal done with the text still on the page. Token matching
+# tolerates inserted stopwords and a bounded stem difference -- for REMOVAL
+# checks only: an insertion stays exact, so a missing quote is never excused
+# by a near neighbour.
+_COPY_STOPWORDS = frozenset({
+    "a", "an", "and", "the", "of", "or", "to", "in", "on", "at", "by",
+    "for", "with", "as", "is", "it", "its", "be", "been", "am", "are",
+})
+
+
+def _copy_tokens(text: str) -> list[str]:
+    """Lowercased word tokens of `text`, punctuation dropped."""
+    return re.findall(r"[a-z0-9]+", (text or "").lower())
+
+
+def _copy_token_match(a: str, b: str) -> bool:
+    """One literal token against one file token: exact, or a bounded prefix
+    (stem tolerance: "tinker" ~ "tinkerer"). Both must be at least 4 chars
+    and differ by at most 3, so "and" never matches "android"."""
+    if a == b:
+        return True
+    if len(a) < 4 or len(b) < 4 or abs(len(a) - len(b)) > 3:
+        return False
+    return a.startswith(b) or b.startswith(a)
+
+
+def _literal_fuzzy_in(text: str, literal: str) -> bool:
+    """True when `literal`'s content tokens occur in `text` as one contiguous
+    run, tolerating stopwords between them and bounded stem differences.
+    Needs at least two non-stopword literal tokens: a single common word is
+    too weak to call a removal unfinished."""
+    content = [t for t in _copy_tokens(literal) if t not in _COPY_STOPWORDS]
+    if len(content) < 2:
+        return False
+    hay = _copy_tokens(text)
+    width = len(content) + 4
+    for i in range(len(hay)):
+        if not _copy_token_match(content[0], hay[i]):
+            continue
+        j, k = i + 1, 1
+        end = min(i + width, len(hay))
+        while k < len(content) and j < end:
+            if hay[j] in _COPY_STOPWORDS:
+                j += 1
+                continue
+            if _copy_token_match(content[k], hay[j]):
+                k += 1
+                j += 1
+            else:
+                break
+        if k == len(content):
+            return True
+    return False
+
+
 @dataclass
 class Requirement:
     """One task clause plus the evidence the harness has gathered for it."""
@@ -1508,6 +1566,10 @@ class Requirement:
     # Literals the last coverage pass found missing/present when they should
     # be the opposite; rendered by check_coverage and the repair prompt.
     missing_literals: list[str] = field(default_factory=list)
+    # Disk evidence for an unfinished REMOVAL: (rel, line, line_text) for
+    # every line still carrying the quoted copy, so the follow-up names the
+    # exact line to delete instead of re-guessing where it lives.
+    literal_hits: list[tuple] = field(default_factory=list)
 
     def __post_init__(self):
         if self.kind not in ("edit", "report", "constraint"):
@@ -1753,7 +1815,11 @@ def _clip_clause(p: str, limit: int = 140) -> str:
 
 
 def _requirements_from_task(task: str, limit: int = 16) -> list[Requirement]:
-    text = (task or "").split("\nTASK\n")[-1].strip()
+    # Only the CURRENT task is mined. An injected handoff/checkpoint carries
+    # earlier session notes above a `NEW TASK` / `CURRENT TASK` / `TASK`
+    # marker; mining the whole blob turned stale, already-finished work into
+    # mandatory requirements of a standalone Ask run (D3).
+    text = re.split(r"\n(?:NEW TASK|CURRENT TASK|TASK)\n", task or "")[-1].strip()
     if not text:
         return []
     parts = [(p.strip(" \t\n.,;"), hard)
@@ -1767,6 +1833,12 @@ def _requirements_from_task(task: str, limit: int = 16) -> list[Requirement]:
     merged: list[str] = []
     for p, hard in parts:
         p = re.sub(r"^(?:[-*]|\d+[.)])\s+", "", p)   # drop the bullet marker
+        # A COMPLETED checklist item ("[x] ..." from a stale PLAN.md or
+        # handoff) is history, not a requirement of the current task: it
+        # must never seed plan steps, coverage seeds or follow-ups (D3).
+        if re.match(r"^\[[xX]\]", p):
+            continue
+        p = re.sub(r"^\[ \]\s*", "", p)              # unchecked box: keep text
         if not p:
             continue
         if merged and not hard and not (
@@ -2295,7 +2367,10 @@ def _unaddressed(task: str, reply: str, edits,
                 if not after_text:
                     missing.append(lit)
                 elif req.literal_remove:
-                    if _literal_in(after_text, lit):
+                    # Stem-tolerant: "lifelong tinker" must still count as
+                    # present against "and lifelong tinkerer." on the page.
+                    if _literal_in(after_text, lit) \
+                            or _literal_fuzzy_in(after_text, lit):
                         missing.append(lit)
                 elif not _literal_in(after_text, lit):
                     missing.append(lit)
@@ -2364,6 +2439,92 @@ def coverage_seeds(task: str, reply: str, edits,
     return [req for req in _unaddressed(task, reply, edits, tracker)
             if req.is_edit]
 
+
+def unmet_requirements(root, task: str, edits,
+                       tracker: RequirementTracker | None = None
+                       ) -> list[Requirement]:
+    """Removal clauses whose quoted copy is still ON DISK after the batch.
+
+    `_unaddressed` judges literals against the edits' after-text only: a
+    removal whose file was never touched looks satisfied because no
+    replacement text carries the copy. This re-checks the real files -- every
+    file the batch touched plus every existing file the clause names -- and
+    returns deep-copied requirements annotated with `literal_hits`
+    ((rel, line, line_text)) naming each line still carrying the copy, so the
+    follow-up can point at the exact line instead of re-guessing."""
+    if tracker is None or tracker.task != task:
+        tracker = RequirementTracker(task)
+    else:
+        tracker = copy.deepcopy(tracker)
+    root = Path(root)
+    touched = [fileio.normalise_rel(getattr(e, "file", "") or "")
+               for e in edits if getattr(e, "ok", True)]
+    out: list[Requirement] = []
+    for req in tracker.items:
+        if not (req.literals and req.literal_remove):
+            continue
+        cands = list(dict.fromkeys(touched))
+        for m in _FILE_TOKEN_RE.finditer(req.text):
+            rel = fileio.normalise_rel(m.group(0))
+            if rel and (root / rel).is_file() and rel not in cands:
+                cands.append(rel)
+        hits: list[tuple] = []
+        missing: list[str] = []
+        for lit in req.literals:
+            found = False
+            for rel in cands:
+                p = root / rel
+                if not p.is_file():
+                    continue
+                try:
+                    text, _sty = fileio.read(p, errors="replace")
+                except OSError:
+                    continue
+                if not (_literal_in(text, lit)
+                        or _literal_fuzzy_in(text, lit)):
+                    continue
+                found = True
+                for ln, line in enumerate(text.splitlines(), 1):
+                    if _literal_in(line, lit) or _literal_fuzzy_in(line, lit):
+                        hit = (rel, ln, line.strip())
+                        if hit not in hits:
+                            hits.append(hit)
+            if found:
+                missing.append(lit)
+        if missing:
+            req.missing_literals = missing
+            req.literal_hits = hits[:8]
+            out.append(req)
+    return out[:16]
+
+
+def merge_unmet(base: list[Requirement],
+                on_disk: list[Requirement]) -> list[Requirement]:
+    """Merge disk-verified unmet removal clauses into the coverage seeds. A
+    clause already in `base` gains the disk location (its text is annotated
+    with the exact file:line still carrying the copy); a clause the edit
+    evidence alone considered addressed is appended. Both lists hold
+    deep-copied requirements, so annotating them never touches the run's
+    authoritative tracker."""
+    out = list(base)
+    by_text = {r.text: r for r in out}
+    for req in on_disk:
+        have = by_text.get(req.text)
+        if have is None:
+            out.append(req)
+            by_text[req.text] = req
+            have = req
+        hits = getattr(req, "literal_hits", [])
+        if hits:
+            have.literal_hits = hits
+            loc = "; ".join(f"{rel}:{ln}: {txt}" for rel, ln, txt in hits[:2])
+            suffix = f" -- still on disk at {loc}"
+            if suffix not in have.text:
+                have.text += suffix
+        for lit in req.missing_literals:
+            if lit not in have.missing_literals:
+                have.missing_literals.append(lit)
+    return out[:16]
 
 
 def _fuzzy_regions(before: str, after: str) -> list[tuple[int, int]]:
