@@ -345,6 +345,52 @@ def pack_rows(rows) -> list:
     return out
 
 
+def profile_catalog(cfg, calibration: dict | None = None) -> list[dict]:
+    """Every configured profile with the badges the topbar and profile lists
+    need, sorted by name. `profiles` in `/api/state` stays a list of names for
+    older clients; this is the richer companion keyed by the same names.
+
+    `tier` prefers the explicit profile key, then the active profile's resolved
+    tier, then the same name heuristic `config.load` uses. `specialties` is the
+    explicit list, or what the model card detected when the config left it
+    empty."""
+    calibration = calibration or {}
+    out: list[dict] = []
+    for name in sorted((cfg.profiles or {}) if cfg is not None else {}):
+        body = (cfg.profiles or {}).get(name) or {}
+        body = body if isinstance(body, dict) else {}
+        cal = calibration.get(name) or {}
+        tier = str(body.get("tier") or "")
+        if not tier and cfg is not None and name == cfg.active_profile:
+            tier = str(getattr(cfg, "active_tier", "") or "")
+        if not tier:
+            try:
+                tier = str(config_mod._guess_tier(name, body) or "")
+            except Exception:
+                tier = ""
+        specialties = body.get("specialties") or ()
+        if not specialties:
+            choices = cal.get("card_choices") or {}
+            specialties = choices.get("specialties") or ()
+        out.append({
+            "name": name,
+            "model": str(body.get("model")
+                         or (cfg.model if cfg is not None else "") or ""),
+            "base_url": str(body.get("base_url")
+                            or (cfg.base_url if cfg is not None else "") or ""),
+            "tier": tier,
+            "specialties": [str(t) for t in specialties],
+            "is_hosted": bool(cal.get("is_hosted")),
+            "calibrated": bool(cal.get("calibrated")),
+            "calibrated_at": str(cal.get("calibrated_at") or ""),
+            "calibrated_age_days": int(cal.get("calibrated_age_days") or 0),
+            "calibrated_stale": bool(cal.get("calibrated_stale")),
+            "card_score": float(cal.get("card_score") or 0.0),
+            "active": bool(cfg is not None and name == cfg.active_profile),
+        })
+    return out
+
+
 class State:
     """Everything held between HTTP requests (one active project)."""
 
@@ -358,6 +404,12 @@ class State:
         # by (mtime, size) so a polling /api/state does not re-read the file.
         self._user_cfg = None
         self._user_cfg_stamp = None
+        # The full global config for a project-less session (profiles, model,
+        # toggles). Separate from `_user_cfg` because that one is cosmetic and
+        # may be a partial load; this is what /api/state reports and what a
+        # standalone Ask runs on. Cached by (mtime, size, selected profile).
+        self._global_cfg = None
+        self._global_cfg_stamp = None
         self.client = None
         self.idx = None
         self.agent = None
@@ -530,6 +582,66 @@ class State:
             self._user_cfg_stamp = stamp
         return str(getattr(cfg, "gui_theme", "") or "slate") if cfg \
             else "slate"
+
+    def set_profile(self, name: str | None) -> None:
+        """Remember the profile picked in the topbar for a project-less GUI.
+
+        With a project open `profile_request` is the profile `open_project`
+        re-opens with; without one it is the profile the global config (and a
+        standalone Ask) resolves. Invalidate the cached global config so the
+        next /api/state poll reflects the choice immediately."""
+        with self.lock:
+            self.profile_request = str(name or "").strip()
+            self._global_cfg_stamp = None
+
+    def global_config(self, profile: str | None = None):
+        """The user's global config, loaded even with no project open.
+
+        `profile` defaults to the topbar selection (`profile_request`); an
+        empty string means "let default_profile decide". No hardware probe, no
+        budget warnings and no additive config write: /api/state polls this
+        once a second. A broken config (or a profile deleted since it was
+        selected) falls back to a bare Config instead of taking the GUI down;
+        an open project's config still wins via `self.cfg`."""
+        with self.lock:
+            if self.root is not None and self.cfg is not None:
+                return self.cfg
+            requested = (self.profile_request if profile is None
+                         else str(profile or "").strip())
+        try:
+            st = USER_CONFIG.stat()
+            stamp = (st.st_mtime_ns, st.st_size, requested)
+        except OSError:
+            stamp = (0, 0, requested)
+        with self.lock:
+            if (self._global_cfg is not None
+                    and self._global_cfg_stamp == stamp):
+                return self._global_cfg
+        try:
+            cfg = config_mod.load(root=None, profile=requested or None,
+                                  require_hardware=False, warn_budgets=False,
+                                  upgrade_user_config=False)
+        except (config_mod.ConfigError, OSError):
+            try:
+                cfg = config_mod.load(root=None, require_hardware=False,
+                                      warn_budgets=False,
+                                      upgrade_user_config=False)
+            except (config_mod.ConfigError, OSError):
+                cfg = config_mod.Config()
+        with self.lock:
+            self._global_cfg = cfg
+            self._global_cfg_stamp = stamp
+        return cfg
+
+    def scratchpad_path(self) -> Path:
+        """A per-user, project-less workspace for New-mode prompt refinement.
+
+        Created on demand; holding it separate from the checkout keeps a
+        standalone Refine Prompt (New) from describing whatever folder
+        happened to be the process's cwd."""
+        p = config_mod.USER_STATE_DIR / "scratchpad"
+        p.mkdir(parents=True, exist_ok=True)
+        return p
 
     # --- chat transcript ----------------------------------------------------
 
@@ -1345,6 +1457,12 @@ class State:
         theme = self.user_theme()       # disk read/cache outside the lock
         with self.lock:
             cfg, client, idx = self.cfg, self.client, self.idx
+            root = self.root
+        if cfg is None and root is None:
+            # No project open: the topbar still offers every global profile,
+            # the selected model, and the auto-route/thinking toggles.
+            cfg = self.global_config()
+        with self.lock:
             meta = self.index_meta
             indexed = idx is not None or meta["indexed"]
             job = self.job if self.job is not None and self.job.active else None
@@ -1390,11 +1508,24 @@ class State:
                 for name, body in (cfg.profiles or {}).items():
                     model = body.get("model") if isinstance(body, dict) else ""
                     profile_models[name] = str(model or cfg.model or "")
+            details = profile_catalog(cfg, calibration)
+            no_project = self.root is None
             return {
                 "root": str(self.root) if self.root else "",
                 "profile": cfg.active_profile if cfg else "",
                 "profiles": sorted(cfg.profiles) if cfg else [],
                 "profile_models": profile_models,
+                # Rich per-profile view (badges, model, tier, specialties)
+                # for the no-project topbar and profile lists. The plain
+                # `profiles` names stay for older clients.
+                "profile_details": details,
+                "profile_catalog": {p["name"]: p for p in details},
+                "profile_tiers": {p["name"]: p["tier"] for p in details},
+                "workspace_label": ("Workspace: Scratchpad (no project open)"
+                                    if no_project else f"Workspace: {self.root}"),
+                "scratchpad": no_project,
+                "suggested_new_project": ("" if not no_project else str(
+                    Path.home() / "pedacito-projects" / "my-project")),
                 "default_profile": cfg.default_profile if cfg else "",
                 # scout/architect split: the gather-phase scout
                 # profile as the topbar badge should show it -- "" when unset,

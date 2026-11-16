@@ -254,6 +254,17 @@ def _project(need_index: bool = True) -> SimpleNamespace:
                                agent=STATE.agent)
 
 
+def _global_project(profile: str = "") -> SimpleNamespace:
+    """A model-only workspace for Ask with no project open.
+
+    The question is answered directly by `LLMClient(cfg)` on the selected
+    global profile; there is no index and no project root, and nothing is
+    written. The header reports it as the scratchpad."""
+    cfg = STATE.global_config(profile=profile or None)
+    return SimpleNamespace(root=None, args=None, cfg=cfg,
+                           client=LLMClient(cfg), idx=None, agent=None)
+
+
 def _swap_index(idx) -> None:
     with STATE.lock:
         STATE.idx = idx
@@ -717,18 +728,41 @@ def _post_task_result(tr, client, reviewing: bool) -> None:
                       _usage_stats(client))
 
 
+SCRATCH_SYSTEM = """\
+You are a helpful coding assistant answering a standalone question. No project
+folder is open, so there is no source tree to inspect: answer from the question
+itself, and say plainly when you would need the user to open a project or paste
+the relevant code. Keep the answer focused and do not emit edit blocks."""
+
+
 def run_explain(job: Job, opts: dict) -> None:
-    """`explain`: a prose answer about the code, streamed into the chat."""
-    p = _project()
+    """`explain`: a prose answer about the code, streamed into the chat.
+
+    With no project open this becomes the standalone Ask: answer the prompt
+    directly with the selected global profile instead of refusing. The state
+    payload marks the session as the scratchpad until a project is opened."""
     question = compose(opts.get("text", ""), opts.get("attachments"))
     if not question:
         raise ConfigError("Ask a question first.")
+    with STATE.lock:
+        root = STATE.root
+    if root is None:
+        p = _global_project(str(opts.get("profile") or ""))
+    else:
+        p = _project()
     _echo_user("explain", opts.get("text", "") or question,
                opts.get("attachments"), opts)
     with session(p, job, interactive=False, lock=False) as feed:
         p.client.warmup()
-        answer = explain_mod.answer(p.agent, question, verbose=True,
-                                    stream=True)
+        if p.agent is not None:
+            answer = explain_mod.answer(p.agent, question, verbose=True,
+                                        stream=True)
+        else:
+            p.client.site = "answer"
+            answer = p.client.chat(
+                [{"role": "system", "content": SCRATCH_SYSTEM},
+                 {"role": "user", "content": question}],
+                max_tokens=p.cfg.max_tokens_answer, stream=True)
     text = (answer or "").strip()
     if not text and feed.stream_mid:
         text = STATE.message_text(feed.stream_mid).strip()
@@ -913,12 +947,21 @@ def run_new(job: Job, opts: dict) -> None:
     target = Path(project).expanduser().resolve()
     _echo_user("new", opts.get("text", "") or spec_text,
                opts.get("attachments"), opts)
-    mode = opts.get("build", "preview")       # preview | plan | build | review
+    mode = opts.get("build", "build")         # build | preview | plan | review
+    # The composer's profile picker wins for a no-project New; fall back to
+    # the topbar's remembered selection when the request omits it.
+    with STATE.lock:
+        profile = str(opts.get("profile") or "").strip() \
+            or STATE.profile_request
+    if profile:
+        STATE.set_profile(profile)
+    if mode != "preview":
+        # A real build owns its target: create it up front (parents included)
+        # so workspace.log_event and the scaffold write into a real folder.
+        target.mkdir(parents=True, exist_ok=True)
     parent = target
     while not parent.exists() and parent != parent.parent:
         parent = parent.parent
-    with STATE.lock:
-        profile = STATE.profile_request
     args = args_for(str(parent), profile)
     cfg = cli_mod._config(args)
     client = LLMClient(cfg)
@@ -941,8 +984,6 @@ def run_new(job: Job, opts: dict) -> None:
             keep_going=bool(opts.get("keep_going")),
             auto_install=bool(opts.get("auto_install") or cfg.auto_install_deps))
         feed.end_stream()
-    wrote = mode != "preview" and target.is_dir() and any(
-        c.name not in (".pedacito",) for c in target.iterdir())
     if mode == "preview":
         STATE.add_message(
             "assistant", "That was a preview: nothing was written. Pick "
@@ -957,7 +998,10 @@ def run_new(job: Job, opts: dict) -> None:
         STATE.add_message("assistant", f"Project created at {target}.",
                           kind="result", level="ok",
                           stats=_usage_stats(client))
-    if wrote:
+    # A build/plan/review that created its folder becomes the active project,
+    # so the file tree, index banner and composer bind to it immediately (a
+    # preview writes nothing and stays unbound).
+    if mode != "preview" and target.is_dir():
         open_project(str(target), profile, announce=True)
 
 

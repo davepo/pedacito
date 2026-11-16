@@ -353,8 +353,10 @@ def _how_config():
         root, cfg = STATE.root, STATE.cfg
     if cfg is not None:
         return cfg
+    if root is None:
+        return STATE.global_config()
     try:
-        return config_mod.load(root=root or Path.cwd(),
+        return config_mod.load(root=root,
                                require_hardware=False, warn_budgets=False)
     except ConfigError:
         return config_mod.Config()
@@ -870,16 +872,48 @@ def _project_prune(q, body):
 
 @post("/api/profile")
 def _profile_switch(q, body):
-    """Switch the active model profile and re-open the current project with
-    it, so subsequent runs use the chosen profile."""
+    """Switch the active model profile.
+
+    With a project open this re-opens it on the chosen profile. With no
+    project it still switches the global selection (and accepts the two
+    topbar toggles), so the user can pick a model before opening or creating
+    anything."""
     name = str(body.get("profile", "")).strip()
+    toggles = {k: body[k] for k in ("auto_route_specialties",
+                                    "disable_thinking") if k in body}
     with STATE.lock:
         root = STATE.root
-        known = sorted(STATE.cfg.profiles) if STATE.cfg else []
+        cfg = STATE.cfg
     if root is None:
-        return 400, {"ok": False, "detail": "Open a project first."}
+        try:
+            cfg = STATE.global_config()
+            known = sorted(cfg.profiles or {})
+        except Exception:
+            known = []
+        if name and known and name not in known:
+            return 400, {"ok": False, "detail": f"no profile named {name!r}"}
+        if toggles:
+            try:
+                settings_api.apply_changes("user", None, toggles, [])
+            except ConfigError as e:
+                return 400, {"ok": False, "detail": str(e)}
+        if "profile" in body:
+            STATE.set_profile(name)
+        cfg = STATE.global_config()
+        return 200, {"ok": True, "profile": cfg.active_profile,
+                     "model": cfg.model,
+                     "profiles": sorted(cfg.profiles or {}),
+                     "auto_route_specialties": bool(
+                         cfg.auto_route_specialties),
+                     "disable_thinking": bool(cfg.disable_thinking)}
+    known = sorted(cfg.profiles) if cfg else []
     if name and known and name not in known:
         return 400, {"ok": False, "detail": f"no profile named {name!r}"}
+    if toggles:
+        try:
+            settings_api.apply_changes("user", None, toggles, [])
+        except ConfigError as e:
+            return 400, {"ok": False, "detail": str(e)}
     return _busy_reply(jobs.spawn(
         "project", f"switching profile to {name or 'default'}",
         lambda job: jobs.open_project(str(root), name)))
@@ -1056,9 +1090,20 @@ def _spec_refine(q, body):
     profile = str(body.get("profile") or "")
     with STATE.lock:
         root, cfg, client = STATE.root, STATE.cfg, STATE.client
-    if root is None:
+    if root is None and mode != "new":
         return 400, {"ok": False, "detail": "Open a project first."}
-    if profile and profile != getattr(STATE, "profile_request", ""):
+    if root is None:
+        # Refining the brief of a project that does not exist yet: describe
+        # the empty scratchpad on the selected global profile. The architect's
+        # deterministic fallback still shapes the spec if the model is down.
+        from ..llm import LLMClient
+        root = STATE.scratchpad_path()
+        try:
+            cfg = STATE.global_config(profile=profile or None)
+            client = LLMClient(cfg)
+        except Exception:
+            cfg, client = None, None
+    elif profile and profile != getattr(STATE, "profile_request", ""):
         # Refine with the chosen profile's model without re-opening the
         # session: build a throwaway cfg+client for this one call.
         try:

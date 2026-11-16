@@ -423,7 +423,7 @@ const OPTS = {
   ],
   'new': [
     { k: 'project', label: 'New project folder', type: 'text', browse: 'dir', span2: true, ph: '/path/to/new-project' },
-    { k: 'build', label: 'What to do', type: 'select', def: 'preview', opts: [['preview', 'Preview the plan (writes nothing)'], ['build', 'Build it'], ['review', 'Build, then review'], ['plan', 'Header skeleton only']], span2: true },
+    { k: 'build', label: 'What to do', type: 'select', def: 'build', opts: [['build', 'Build it'], ['preview', 'Preview the plan (writes nothing)'], ['review', 'Build, then review'], ['plan', 'Header skeleton only']], span2: true },
     { k: 'complex', label: 'Complex: hand it to the autonomous loop', type: 'check', def: false, span2: true },
     { k: 'verify', label: 'Verify command', type: 'text', span2: true, ph: 'e.g. python -m pytest -q' },
     { k: 'repair', label: 'Repair rounds', type: 'number', def: '' },
@@ -654,6 +654,17 @@ function switchProfile(name) {
     refreshState(); emit();
   });
 }
+function startNewProject() {
+  S.mode = 'new';
+  if (!opt('new', 'project')) {
+    const s = S.status;
+    S.opts.new.project = s.suggested_new_project || '';
+  }
+  try { localStorage.setItem('pedacito_mode', 'new'); } catch (e) {}
+  S.ui.optsOpen = false;
+  emit();
+  setTimeout(() => { const el = $('input'); if (el) el.focus(); }, 30);
+}
 function buildIndex(summarise) {
   PDC.api('/api/index', { summarise: summarise }).then((j) => {
     if (!j.ok) PDC.toast(j.detail || 'busy', true);
@@ -802,10 +813,18 @@ function send() {
     return;
   }
   if (!text && !S.attachments.length && !(S.mode === 'auto' && opt('auto', 'plan_file'))) { PDC.toast('Type something first.', true); return; }
-  if (S.mode !== 'new' && !s.root) { PDC.toast('Open a project first.', true); return; }
-  if (S.mode !== 'new' && !s.has_index) { PDC.toast('Build the index first.', true); return; }
+  // Ask works with no project (the scratchpad); task/edit and auto need one.
+  const needsProject = S.mode !== 'new' && S.mode !== 'explain' && S.mode !== 'how';
+  if (needsProject && !s.root) { PDC.toast('Open a project first.', true); return; }
+  if (needsProject && !s.has_index) { PDC.toast('Build the index first.', true); return; }
+  if (S.mode === 'new' && !(opt('new', 'project') || '').trim()) {
+    PDC.toast('Choose a target directory for the new project.', true); return;
+  }
   const body = { mode: S.mode, text: text, attachments: S.attachments.slice() };
   OPTS[S.mode].forEach((d) => { body[d.k] = opt(S.mode, d.k); });
+  // Send the topbar's model selection explicitly so a no-project New/Ask uses
+  // the profile the user just picked, even before /api/state catches up.
+  body.profile = S.ui.pendingProfile !== null ? S.ui.pendingProfile : (s.profile || '');
   if (S.mode === 'auto') {
     body.plan_only = !!body.plan_only;
     body.apply = !body.plan_only;      // Auto applies unless Plan only is ticked
@@ -1891,7 +1910,7 @@ function ProfileSelect(props) {           // header dropdown; uncontrolled
   }, [active, profiles.join(',')]);
   return html`
     <select id="profile" ref=${ref} title="active model profile -- switch it any time"
-            disabled=${!!props.busy}
+            disabled=${!!props.busy && !!s.root}
             onchange=${(e) => props.onChange(e.target.value)}>
       <option value="">(default${defName ? ': ' + defName : ''})</option>
       ${profiles.map((p) => html`<option key=${p} value=${p}>${p}${(s.profile_models || {})[p] ? ' \u00B7 ' + s.profile_models[p] : ''}</option>`)}
@@ -1913,8 +1932,8 @@ function calChoicesTip(ch) {
 }
 function CalibrationBadge(props) {
   const s = S.status;
-  if (!s.root) return null;
   const name = props.name || '';
+  if (!name && !s.root) return null;
   const cal = (s.calibration || {})[name] || {};
   const openProfiles = () => callSettings({ tab: 'discovery' });
   if (cal.is_hosted) {
@@ -2044,7 +2063,10 @@ function TopBar() {
               : html`<button class="menuitem" disabled>no recent projects yet</button>`}
           <//>
           <button class="primary" id="openBtn" disabled=${!!j} onClick=${open}>Open</button>
+          <button id="newProjectBtn" title="start a new project from a description"
+                  disabled=${!!j} onClick=${startNewProject}>+ New</button>
           <${Menu} button=${html`<button id="projMenuBtn" title="calibrate, index, restore and other project actions">Project \u25BE</button>`}>
+            <${MenuItem} label="New project\u2026" disabled=${!!j} action=${startNewProject} />
             <${MenuItem} label="Calibrate active profile" disabled=${!!j || !activeProf || activeHosted}
                        title=${activeHosted ? 'Calibration disabled for hosted models' : ''}
                        action=${() => calibrateProfile(activeProf)} />
@@ -2103,19 +2125,20 @@ function TopBar() {
       <div class="tb-row" id="tbRow2">
         <label class="tb-label" for="profile">Profile</label>
         <${ProfileSelect} busy=${j} peek=${peekOn ? S.peek : null}
-                          onChange=${(name) => {          // one pick = switch now;
-                            if (s.root) switchProfile(name);   // no project: remembered for Open
-                            else { S.ui.pendingProfile = name; emit(); }
-                          }} />
+                          onChange=${(name) => switchProfile(name)} />
         <span class="chip" id="modelChip"
               title=${(s.model_status || 'click to check the model server') + (s.base_url ? '\n' + s.base_url : '') + (s.context_tokens ? '\nwindow ' + PDC.fmtInt(s.context_tokens) + ' tokens (' + s.context_origin + ')' : '')}
               onClick=${() => { if (s.root && !j) checkModel(); }}>
           <i class=${'dot ' + (j ? 'busy' : s.model_ok === true ? 'ok' : s.model_ok === false ? 'bad' : 'idle')}></i>
-          <b>${s.root ? (s.model || '\u2014') : 'no project'}</b>
-          ${s.root && s.model ? html`<span class="tag ${s.disable_thinking ? '' : 'act'}"
+          <b>${s.needs_setup ? 'no model selected' : (s.model || (s.root ? '\u2014' : 'no model selected'))}</b>
+          ${s.model && !s.needs_setup ? html`<span class="tag ${s.disable_thinking ? '' : 'act'}"
             title=${s.disable_thinking ? 'thinking is disabled for this profile (disable_thinking = true)'
                                        : 'thinking is allowed (disable_thinking = false) \u2014 turn it off in Settings \u2192 Profiles'}>${s.disable_thinking ? 'no-think' : 'thinking'}</span>` : null}
         </span>
+        ${!s.root ? html`<span class="chip" id="workspaceChip"
+              title="Questions run on the selected profile in a scratchpad until you open or create a project">
+          <b>${s.workspace_label || 'Workspace: Scratchpad (no project open)'}</b>
+        </span>` : null}
         <${CalibrationBadge} name=${activeProf} />
         ${s.scout_profile ? html`<span class="chip" id="scoutChip"
               title=${'Scout/architect split: lookup steps during gather run on profile \''
@@ -2124,7 +2147,7 @@ function TopBar() {
               onClick=${() => callSettings({ tab: 'all', search: 'scout_profile' })}>
           <b>Scout: ${s.scout_profile}</b>
         </span>` : null}
-        ${s.root ? html`<label class="chip" id="autoRouteChip"
+        <label class="chip" id="autoRouteChip"
               title=${'Specialist auto-routing (auto_route_specialties): each task runs on the profile'
                 + ' whose specialty tags fit it best (model-card tags, or explicit specialties in'
                 + ' Settings \u2192 Profiles). Switches happen at task boundaries only, with a clean'
@@ -2132,7 +2155,7 @@ function TopBar() {
           <input type="checkbox" checked=${!!s.auto_route_specialties}
                  onChange=${(e) => setAutoRoute(e.target.checked)} />
           <b>\u2726 Auto-route</b>
-        </label>` : null}
+        </label>
         ${eng.specialist && eng.specialist.profile ? html`<span class="chip" id="specialistChip"
               title=${'Specialist routed: profile \'' + eng.specialist.profile + '\' ('
                 + (eng.specialist.model || '?') + ') for specialty \''
@@ -2473,7 +2496,8 @@ function refinePrompt() {
   if (!text || S.ui.refining) return;
   S.ui.refining = true;
   emit();
-  PDC.api('/api/spec/refine', { prompt: text, mode: S.mode }).then((j) => {
+  const profile = S.ui.pendingProfile !== null ? S.ui.pendingProfile : (S.status.profile || '');
+  PDC.api('/api/spec/refine', { prompt: text, mode: S.mode, profile: profile }).then((j) => {
     S.ui.refining = false;
     if (j._status !== 200 || !j.ok || !j.refined) {
       PDC.toast(j.detail || 'The spec architect did not answer.', true);
@@ -2523,6 +2547,9 @@ function Composer() {
   const setMode = (k) => {
     if (taRef.current) S.drafts[S.mode] = taRef.current.value;
     S.mode = k;
+    if (k === 'new' && !opt('new', 'project')) {
+      S.opts.new.project = s.suggested_new_project || '';
+    }
     S.ui.previousPrompt = null;
     try { localStorage.setItem('pedacito_mode', k); } catch (e) {}
     S.ui.optsOpen = false;
@@ -2542,13 +2569,37 @@ function Composer() {
           <button key=${k} class=${k === S.mode ? 'on' : ''} onClick=${() => setMode(k)}>${MODES[k].label}</button>`)}
       </div>
       <p id="modeHint">
-        ${!s.root && S.mode !== 'new' && S.mode !== 'how' ? 'Open a project first. ' : null}
+        ${!s.root && (S.mode === 'task' || S.mode === 'auto') ? 'Open a project first. ' : null}
+        ${!s.root && S.mode === 'explain'
+          ? html`Workspace: <b>Scratchpad (no project open)</b> \u2014 answers run on <b>${s.model || 'the selected profile'}</b>. `
+          : null}
+        ${!s.root && S.mode === 'new' ? 'The new project becomes your workspace when it is created. ' : null}
         ${needIndex
           ? html`No index yet \u2014 build one to start:
               <button class="small primary" disabled=${!!j} onClick=${() => buildIndex(true)}>Build index</button>
               <button class="small" disabled=${!!j} onClick=${() => buildIndex(false)}>Quick (no summaries)</button>`
           : m.hint}
       </p>
+      ${S.mode === 'new' ? html`<div id="newProjectRow">
+        <label for="newProjectPath">Target directory for new project</label>
+        <input id="newProjectPath" type="text" spellcheck="false" autocomplete="off"
+               defaultValue=${opt('new', 'project')}
+               placeholder=${s.suggested_new_project || '/path/to/new-project'}
+               oninput=${(e) => { S.opts.new.project = e.target.value; saveOpts(); }} />
+        <button class="small" onClick=${() => PDC.browse({
+          title: 'Choose the parent folder for the new project',
+          files: false, pickLabel: 'Use this folder',
+          start: S.status.root || '',
+          onPick: (p) => {
+            const current = String(opt('new', 'project') || '').trim();
+            const name = (current.split(/[\\/]/).filter(Boolean).pop()) || 'my-project';
+            const target = p.replace(/[\\/]$/, '') + '/' + name;
+            S.opts.new.project = target;
+            const el = $('newProjectPath');
+            if (el) el.value = target;
+            saveOpts();
+          } })}>Browse\u2026</button>
+      </div>` : null}
       <div id="attachRow">
         ${S.attachments.map((a, i) => html`
           <span key=${i} class="attach">\uD83D\uDCCE ${a.name} \u00B7 ${PDC.fmtInt(a.text.length)} chars
@@ -2563,7 +2614,7 @@ function Composer() {
                   if (rb) rb.disabled = S.ui.refining || !e.target.value.trim(); }}
                 onkeydown=${(e) => { if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) { e.preventDefault(); send(); } }} />
       <div id="optsBox" key=${S.mode} hidden=${!S.ui.optsOpen}>
-        <div class="opts-grid">${OPTS[S.mode].filter((o) => o.type !== 'check').map((o, idx) => html`<${OptField} key=${'g' + idx} o=${o} />`)}</div>
+        <div class="opts-grid">${OPTS[S.mode].filter((o) => o.type !== 'check' && !(S.mode === 'new' && o.k === 'project')).map((o, idx) => html`<${OptField} key=${'g' + idx} o=${o} />`)}</div>
         ${OPTS[S.mode].some((o) => o.type === 'check') ? html`<div class="opts-checks">${OPTS[S.mode].filter((o) => o.type === 'check').map((o, idx) => html`<${OptField} key=${'c' + idx} o=${o} />`)}</div>` : null}
       </div>
       <div id="composerBtns">

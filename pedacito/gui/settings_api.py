@@ -171,6 +171,14 @@ def hosted_profile_error(name: str) -> str:
 
 def payload() -> dict:
     cfg = STATE.cfg
+    if cfg is None and STATE.root is None:
+        # A GUI session can start with no project open. The Settings dialog
+        # still needs the user's global profiles and the active model, so read
+        # the global config instead of falling back to bare Config defaults.
+        try:
+            cfg = STATE.global_config()
+        except Exception:
+            cfg = None
     out = {
         "schema": settings.schema(),
         # Universal settings must always carry a concrete effective value:
