@@ -37,7 +37,11 @@ somebody opens the page:
     readers announce an unnamed field;
   - a stylesheet the page links carries raw ``@tailwind base`` /
     ``components`` / ``utilities`` build directives -- the browser cannot
-    parse them, ignores the sheet and the page renders unstyled.
+    parse them, ignores the sheet and the page renders unstyled;
+  - an HTML page wears Tailwind utility classes (``bg-[#141518]``,
+    ``min-h-screen max-w-5xl mx-auto`` ...) but loads neither the Tailwind
+    CDN script nor a stylesheet that compiles those utilities -- every
+    class is inert and the page renders completely unstyled.
 
 Every check is regex-level on purpose: no JS parser, no execution, no
 network, no dependencies. That trades recall for speed, so the results are
@@ -134,6 +138,53 @@ _CSS_CLASS_RE = re.compile(r"\.([A-Za-z_][\w-]*)")
 _TAILWIND_DIRECTIVE_RE = re.compile(
     r"^[ \t]*@tailwind\s+(base|components|utilities)\b[ \t]*;?", re.M)
 _CSS_COMMENT_RE = re.compile(r"/\*.*?\*/", re.S)
+
+# --- check 13: Tailwind utility classes with no compiler in sight ------------
+# A model can dress a page in Tailwind utilities while linking a 20-line
+# hand-written styles.css and omitting the Play CDN: every utility class is
+# then inert and the page renders unstyled. Two unmistakable signals:
+#   * an arbitrary-value class -- `bg-[#141518]`, `text-[#e9e7e2]`,
+#     `w-[32rem]`, `grid-cols-[1fr_2fr]` -- or an opacity modifier such as
+#     `border-white/10` / `bg-black/50`. No hand-written semantic CSS uses
+#     these shapes, so ONE is enough to prove Tailwind intent.
+#   * a cluster of >= 4 distinct layout/spacing utilities (`min-h-screen`,
+#     `max-w-5xl`, `mx-auto`, `flex-col`, `md:flex-row`, `tracking-tight`...).
+#     A variant prefix (`md:`, `hover:`) is stripped before the lookup.
+_TW_ARBITRARY_RE = re.compile(r"^[a-z][a-z0-9-]*-\[[^\]\s]+\]$")
+_TW_OPACITY_RE = re.compile(r"^[a-z][a-z0-9-]*-[a-z0-9]+/\d{1,3}$")
+_TW_VARIANT_RE = re.compile(r"^(?:[a-z0-9-]+:)+")
+# Utilities whose names are Tailwind-specific enough that a cluster of four
+# distinct ones is not a coincidence. Deliberately not exhaustive: recall is
+# traded for the same conservatism every webcheck notice keeps.
+_TW_LAYOUT_UTILS = frozenset("""
+    min-h-screen min-h-dvh h-screen max-w-5xl max-w-4xl max-w-6xl max-w-7xl
+    max-w-screen-xl mx-auto my-auto flex-col flex-row items-center items-start
+    items-end justify-center justify-between justify-around justify-evenly
+    tracking-tight tracking-wide gap-1 gap-2 gap-3 gap-4 gap-6 gap-8
+    px-2 px-4 px-6 px-8 py-2 py-4 py-6 py-8 p-4 p-6 p-8
+    space-x-2 space-x-4 space-y-2 space-y-4 rounded-lg rounded-xl rounded-2xl
+    rounded-full text-xs text-sm text-base text-lg text-xl text-2xl text-3xl
+    font-medium font-semibold font-bold leading-relaxed leading-tight
+    grid-cols-1 grid-cols-2 grid-cols-3 grid-cols-4 col-span-2 col-span-3
+    flex-1 flex-grow shrink-0 grow w-full h-full min-w-0 overflow-hidden
+    overflow-auto relative absolute fixed sticky inset-0 top-0 left-0 right-0
+    bottom-0 z-10 z-20 z-50 opacity-0 opacity-50 opacity-100 transition
+    transition-all transition-colors duration-200 duration-300 ease-in-out
+    shadow-sm shadow-md shadow-lg shadow-xl ring-1 ring-2 backdrop-blur
+    bg-gradient-to-r bg-gradient-to-br from-gray-900 to-gray-800
+    text-gray-100 text-gray-300 text-gray-400 text-gray-500 text-white
+    bg-white bg-gray-900 bg-gray-800 bg-slate-900 border border-gray-700
+    border-gray-800 border-white divide-y divide-gray-800 antialiased
+    select-none pointer-events-none cursor-pointer whitespace-nowrap
+    truncate line-clamp-2 line-clamp-3 sr-only not-sr-only
+""".split())
+_TW_MIN_CLUSTER = 4
+# The Play CDN (v3 `cdn.tailwindcss.com`, v4 `@tailwindcss/browser`) compiles
+# utility classes at runtime; its presence anywhere in the document excuses
+# the utilities. It never processes a linked .css file (that is check 12).
+_TW_CDN_RE = re.compile(
+    r"<script\b[^>]*\bsrc\s*=\s*[\"'][^\"']*"
+    r"(?:cdn\.tailwindcss\.com|@tailwindcss/browser)[^\"']*[\"']", re.I)
 # Input types the honeypot check never flags: they are not fillable text
 # fields, so a trap marker on one is not a visible honeypot.
 _HONEYPOT_EXEMPT_TYPES = frozenset({"hidden", "submit", "button", "reset"})
@@ -588,6 +639,137 @@ def _tailwind_directive_findings(htmls, csss, root: Path) -> list[Finding]:
                     "(https://cdn.tailwindcss.com) with utility classes "
                     "instead of raw @tailwind build directives",
                     peer=rel))
+    return out
+
+
+def _tw_class_tokens(text: str) -> list[tuple[int, str]]:
+    """(position, class-token) for every whitespace-separated token of every
+    `class="..."` attribute in an HTML document. Position is the attribute's
+    start, so a finding points at the line that wears the utilities."""
+    out: list[tuple[int, str]] = []
+    for m in _CLASS_ATTR_RE.finditer(text):
+        for tok in _first_group(m).split():
+            out.append((m.start(), tok))
+    return out
+
+
+def _tw_utility_tokens(text: str) -> tuple[list[str], int]:
+    """(distinct Tailwind utility tokens, first position) worn by an HTML
+    document. A token counts when it is an arbitrary-value / opacity-modifier
+    class, or a known layout utility (variant prefix stripped)."""
+    seen: dict[str, int] = {}
+    for pos, tok in _tw_class_tokens(text):
+        base = _TW_VARIANT_RE.sub("", tok)
+        if (_TW_ARBITRARY_RE.match(base) or _TW_OPACITY_RE.match(base)
+                or base in _TW_LAYOUT_UTILS):
+            seen.setdefault(tok, pos)
+    if not seen:
+        return [], 0
+    return list(seen), min(seen.values())
+
+
+def _tw_is_tailwind(tokens: list[str]) -> bool:
+    """True when the token set is unmistakably Tailwind: one arbitrary-value
+    or opacity-modifier class, or a cluster of >= 4 distinct layout utilities
+    (counted by their variant-stripped base name)."""
+    bases = set()
+    for tok in tokens:
+        base = _TW_VARIANT_RE.sub("", tok)
+        if _TW_ARBITRARY_RE.match(base) or _TW_OPACITY_RE.match(base):
+            return True
+        if base in _TW_LAYOUT_UTILS:
+            bases.add(base)
+    return len(bases) >= _TW_MIN_CLUSTER
+
+
+def _tw_compiled_selector(token: str) -> re.Pattern:
+    r"""A regex matching the CSS class selector a Tailwind build emits for
+    `token`. Arbitrary values escape their specials (`.bg-\[\#141518\]`), so
+    each non-word character may carry a leading backslash; the selector must
+    end at a combinator, brace, comma or colon -- never mid-name."""
+    parts = []
+    for ch in token:
+        if ch.isalnum() or ch in "-_":
+            parts.append(re.escape(ch))
+        else:
+            parts.append(r"\\?" + re.escape(ch))
+    return re.compile(r"\." + "".join(parts) + r"(?![\w-])")
+
+
+def _tw_compiled_in_css(tokens: list[str], css_texts: list[str]) -> bool:
+    """True when the linked/inline stylesheets actually define the utility
+    classes the page wears -- a real compiled Tailwind sheet (or a hand-built
+    equivalent), not a 20-line semantic stylesheet that leaves them inert.
+    Every detected utility must have a rule; one missing class is enough to
+    keep the notice (the page would still render partly unstyled)."""
+    if not css_texts or not tokens:
+        return False
+    blob = "\n".join(css_texts)
+    return all(_tw_compiled_selector(t).search(blob) for t in tokens)
+
+
+def _linked_css_texts(root: Path, rel: str, text: str,
+                      csss: dict[str, str]) -> tuple[list[str], str | None]:
+    """(stylesheet texts this page links or inlines, first linked css rel).
+    Local linked sheets resolve through the same path logic as check 12;
+    inline <style> blocks ride along so a compiled-in-<style> page passes."""
+    texts: list[str] = []
+    first_rel: str | None = None
+    texts.extend(m.group(1) for m in _STYLE_BLOCK_RE.finditer(text))
+    for lm in _LINK_TAG_RE.finditer(text):
+        attrs = lm.group(1)
+        rm = _REL_ATTR_RE.search(attrs)
+        if not rm or "stylesheet" not in _first_group(rm).lower():
+            continue
+        hm = _HREF_ATTR_RE.search(attrs)
+        if not hm:
+            continue
+        href = _first_group(hm).strip().split("?")[0].split("#")[0]
+        css_rel, external = _resolve_src(root, rel, href)
+        if external:
+            continue
+        if first_rel is None:
+            first_rel = css_rel
+        css = csss.get(css_rel)
+        if css is None:
+            p = root / css_rel
+            try:
+                if p.is_file() and p.stat().st_size <= _MAX_BYTES:
+                    css = p.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                css = None
+        if css is not None:
+            texts.append(css)
+    return texts, first_rel
+
+
+def _tailwind_utility_findings(htmls, csss, root: Path) -> list[Finding]:
+    """Check 13: an HTML page wears Tailwind utility classes but loads neither
+    the Tailwind CDN script nor a stylesheet that compiles those utilities.
+    The browser then ignores every utility class and the page renders
+    completely unstyled -- the silent twin of check 12's raw @tailwind
+    directives. One finding per page, peer = the linked stylesheet (editing
+    either side of the broken contract surfaces it)."""
+    css_texts = dict(csss)
+    out: list[Finding] = []
+    for rel, text in htmls:
+        tokens, pos = _tw_utility_tokens(text)
+        if not tokens or not _tw_is_tailwind(tokens):
+            continue
+        if _TW_CDN_RE.search(text):
+            continue                 # the Play CDN compiles them at runtime
+        linked, peer = _linked_css_texts(root, rel, text, css_texts)
+        if _tw_compiled_in_css(tokens, linked):
+            continue                 # a real compiled stylesheet defines them
+        examples = ", ".join(tokens[:3])
+        out.append(Finding(
+            rel, _line_of(text, pos),
+            f"HTML uses Tailwind utility classes (e.g. {examples}) but "
+            "neither loads the Tailwind CDN script in <head> nor links a "
+            "compiled stylesheet. Either write standard semantic CSS rules "
+            'in styles.css or include <script src="https://cdn.tailwindcss.com">'
+            "</script>.",
+            peer=peer))
     return out
 
 
@@ -1689,6 +1871,9 @@ def run(root, files: list[str] | None = None) -> list[Finding]:
 
     # --- check 12: raw @tailwind directives in a linked stylesheet ----------
     findings.extend(_tailwind_directive_findings(htmls, csss, root))
+
+    # --- check 13: Tailwind utility classes with no CDN / compiled sheet ----
+    findings.extend(_tailwind_utility_findings(htmls, csss, root))
 
     # --- check 4: bare imports vs package.json ------------------------------
     deps = _pkg_deps(root)

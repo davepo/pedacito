@@ -56,6 +56,7 @@ from . import mcp as mcp_mod
 from . import memory as memory_mod
 from . import prompts as prompts_mod
 from . import safety
+from . import sessions as sessions_mod
 from . import skills as skills_mod
 from . import steering as steering_mod
 from . import todo as todo_mod
@@ -2272,6 +2273,13 @@ class Agent:
         # brief) rides in the first user turn, not the system prompt, so the
         # system prompt stays byte-identical across tasks for the server cache.
         lead = self._lead_notes()
+        if sessions_mod.clean_slate(root):
+            slate = ("CLEAN SLATE: this workspace has no source files left. "
+                     "Earlier sessions, memory and lessons describe a "
+                     "project that was deleted -- archived history, not "
+                     "current state. Build only what the current task asks "
+                     "for; do not restore old files on your own.")
+            lead = (lead + "\n" if lead else "") + slate
         try:
             tried = memory_mod.attempts_note(self.index.root, task, self.cfg)
         except Exception:
@@ -5489,6 +5497,36 @@ class Agent:
                 edits, locked = self._filter_repair_test_edits(
                     edits, self._repair_lock_task)
                 failed.extend(locked)
+        # Static-site build-hijack guard: a workspace that had no
+        # package.json before the task may not gain one (nor a Tailwind /
+        # PostCSS build config) unless the task asks for Node tooling.
+        # Dry runs filter too, so a preflight sees exactly what will write.
+        if edits:
+            from . import verify as verify_mod
+            preexisting = getattr(self.cfg, "_task_preexisting", None)
+            if preexisting is None:
+                preexisting = {fileio.path_key(f) for f in self.index.files}
+            refused = verify_mod.unrequested_build_creations(
+                preexisting, str(getattr(self.cfg, "_task_text", "") or ""),
+                [e.file for e in edits])
+            if refused:
+                bad_files = {fileio.path_key(f) for f in refused}
+                edits = [e for e in edits
+                         if fileio.path_key(e.file) not in bad_files]
+                for f in refused:
+                    failed.append(Result(
+                        False, f,
+                        "refused: unrequested build-tool file -- this "
+                        "workspace had no package.json before the task and "
+                        "the task does not ask for npm/Node/Tailwind "
+                        "tooling. A static site needs no build: write "
+                        "standard semantic CSS in the linked stylesheet, "
+                        "or load the Tailwind CDN script "
+                        "(https://cdn.tailwindcss.com) in <head>."))
+                print(f"  [refused {len(refused)} unrequested build-tool "
+                       f"creation(s) ({', '.join(refused)}); the workspace "
+                       "has no package.json and the task does not ask for "
+                       "Node tooling]", file=sys.stderr)
         # A block the model started but never finished is not silently
         # ignored: it becomes a failed result the repair loop reports back.
         if not getattr(self.client, "stream_truncated", False):

@@ -2010,7 +2010,7 @@ function resetDialog() {
   const out = h('div', { class: 'note-box', style: 'margin-top:10px' });
   const confirm = h('input', { type: 'checkbox' });
   const body = h('div', {},
-    h('p', { class: 'small-text', text: 'Deletes this project\u2019s .pedacito/ runtime state (index, sessions, backups, events, memory unless kept, generated rules without the authored checkbox). Source code and .pedacito.toml are never touched. Running background servers are stopped first.' }),
+    h('p', { class: 'small-text', text: 'Deletes this project\u2019s .pedacito/ runtime state (index, sessions, consolidated handoff, backups, events, memory unless kept, generated rules without the authored checkbox) and the auto-plan file (PLAN.md). Source code and .pedacito.toml are never touched. Running background servers are stopped first.' }),
     h('div', { class: 'form' },
       h('label', { class: 'chk' }, keepMemory, ' Keep remembered facts (memory.md)'),
       h('label', { class: 'chk' }, keepConfig, ' Keep authored rules, skills & prompts'),
@@ -2037,6 +2037,10 @@ function resetDialog() {
       text: 'Kept: ' + ((j.kept || []).join(', ') || '(nothing)') }));
     out.appendChild(h('div', { class: 'small-text',
       text: 'Removed: ' + ((j.removed || []).join(', ') || '(nothing)') }));
+    if (j.plan_file && j.plan_removed) {
+      out.appendChild(h('div', { class: 'small-text',
+        text: (dry ? 'Would remove' : 'Removed') + ' plan file: ' + j.plan_file }));
+    }
     if (j.reindex_started) out.appendChild(h('div', { class: 'small-text', text: 'Index rebuild started.' }));
   };
   PDC.modal('Reset project state', body, [
@@ -2050,7 +2054,7 @@ function resetDialog() {
       if (!confirm.checked) { PDC.toast('Tick the confirmation first.', true); return false; }
       PDC.api('/api/project/reset', options()).then((j) => {
         show(j, false);
-        if (j.ok) { PDC.toast('Project state reset.'); refreshState(); }
+        if (j.ok) { PDC.toast(j.summary || 'Project state reset.'); refreshState(); }
       });
       return false;
     } }], { wide: true });

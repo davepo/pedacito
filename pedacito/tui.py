@@ -2332,7 +2332,8 @@ class TuiSession:
         except OSError as exc:
             self._append(f"consolidate failed: {exc}", "error")
             return
-        self.resume_context = memory_mod.handoff_prompt(result["summary"])
+        self.resume_context = memory_mod.handoff_prompt(result["summary"],
+                                                        self.root)
         try:
             if self.client is not None:
                 self.client.last_prompt_tokens = int(result["after_tokens"])

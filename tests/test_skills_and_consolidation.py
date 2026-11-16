@@ -348,7 +348,10 @@ def test_chat_consolidate_and_compact_commands(proj, home, capsys):
 
 def _write_transcripts(root):
     """Three session logs with edits, a decision, a test result and a next
-    step -- enough text that consolidation must shrink the token count."""
+    step -- enough text that consolidation must shrink the token count.
+    app.py exists on disk so the history is current: a transcripts-only
+    project is a clean slate, whose handoff is archived instead of seeded."""
+    (root / "app.py").write_text("print('app')\n", encoding="utf-8")
     reply = ("Done. We decided to keep the flat skill layout.\n"
              "12 passed in 0.42s (pytest).\n"
              "Next step: wire the GUI button.\n"

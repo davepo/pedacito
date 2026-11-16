@@ -581,6 +581,63 @@ def test_rules(cfg) -> str:
     return _TINY_TEST_RULES if pack_for(cfg) == "tiny" else TEST_RULES
 
 
+# --------------------------------------------------------------------------
+# Static-site build-tool rules
+# --------------------------------------------------------------------------
+# A design task on a plain HTML/CSS workspace keeps getting "upgraded" into a
+# Node project: the model writes package.json, a tailwind.config.js and an
+# @tailwind input sheet, and the page then renders unstyled because nothing
+# here runs a build. The rule rides with the answer brief on creative/design
+# tasks whenever the workspace has no package.json and the task does not ask
+# for tooling; the deterministic twin is verify.unrequested_build_creations,
+# which strips the creations at apply time on every task.
+_BUILD_REQUEST_RE = re.compile(
+    r"(?i)\b(?:package\.json|npm|node|vite|react|vue|next|tailwind\.config"
+    r"|tailwind\s+cli)\b")
+
+STATIC_SITE_RULES = """\
+Rules for this workspace (no package.json, no Node build step):
+- Never create package.json, tailwind.config.js, postcss.config.js or
+  src/input.css: nothing here runs npm or a Tailwind/PostCSS build, so those
+  files hijack a static site into a toolchain it does not have. The harness
+  refuses them unless the task explicitly asks for npm/Node/Tailwind tooling.
+- Style pages with standard semantic CSS rules in the linked stylesheet
+  (styles.css), or load the Tailwind Play CDN in <head>
+  (<script src="https://cdn.tailwindcss.com"></script>) and use utility
+  classes. Raw @tailwind directives in a linked .css file never work without
+  a build step."""
+
+_TINY_STATIC_SITE_RULES = """\
+No package.json here: never create package.json, tailwind.config.js,
+postcss.config.js or src/input.css. Use semantic CSS in styles.css or the
+Tailwind CDN script in <head>; raw @tailwind directives need a build."""
+
+
+def wants_build_tools(task: str) -> bool:
+    """True when the task explicitly asks for Node/npm/Tailwind tooling, so
+    build-tool files are a requested outcome rather than a hijack."""
+    return bool(_BUILD_REQUEST_RE.search(task or ""))
+
+
+def static_site_rules(cfg, task: str) -> str:
+    """The no-build-tool rule for a workspace without a package.json (''
+    when one exists, the task asks for tooling, or there is no root).
+    answer_system only calls it for creative/design tasks; the deterministic
+    twin, verify.unrequested_build_creations, covers every other task."""
+    if wants_build_tools(task):
+        return ""
+    root = getattr(cfg, "_root", None)
+    if not root:
+        return ""
+    try:
+        if (Path(root) / "package.json").exists():
+            return ""
+    except OSError:
+        return ""
+    return (_TINY_STATIC_SITE_RULES if pack_for(cfg) == "tiny"
+            else STATIC_SITE_RULES)
+
+
 def answer_system(cfg, full_edit_format: str, task: str = "",
                   creative: bool = False) -> str:
     """The default answer-phase system prompt for the run. A task about
@@ -598,6 +655,13 @@ def answer_system(cfg, full_edit_format: str, task: str = "",
                                          creative=creative)
     if wants_tests(task):
         text += "\n\n" + test_rules(cfg)
+    # The static-site rule costs tokens, so like the test rules it only rides
+    # along for web/design work; the deterministic twin
+    # (verify.unrequested_build_creations) guards every other task.
+    if creative or is_creative_or_design_task(task):
+        static_rules = static_site_rules(cfg, task)
+        if static_rules:
+            text += "\n\n" + static_rules
     return text
 
 

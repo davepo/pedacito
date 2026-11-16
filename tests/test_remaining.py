@@ -421,6 +421,11 @@ def test_run_lock_blocks_a_live_holder_and_takes_over_a_stale_one(tmp_path):
 
 def test_failed_attempts_warn_a_similar_task_and_clear_on_success(tmp_path):
     from pedacito import memory
+    # A live project: on a clean slate (no source files) attempts are
+    # archived history about a deleted project and are not injected.
+    (tmp_path / "pkg").mkdir()
+    (tmp_path / "pkg" / "shop.py").write_text("def checkout():\n    pass\n",
+                                              encoding="utf-8")
     memory.note_attempt(tmp_path, "make checkout apply the discount", "no valid edit",
                         ["pkg/shop.py"])
     note = memory.attempts_note(tmp_path, "checkout should apply discount twice")

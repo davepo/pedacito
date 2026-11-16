@@ -692,7 +692,8 @@ def _chat_command(line: str, args, cfg, ref) -> bool:
             return True
         # The live buffer between chat tasks is the resume seed: the next
         # task starts from the handoff alone, not the full transcript.
-        ref["resume_context"] = memory.handoff_prompt(res["summary"])
+        ref["resume_context"] = memory.handoff_prompt(res["summary"],
+                                                      _root(args))
         print(f"  consolidated: ~{res['before_tokens']:,} -> "
               f"~{res['after_tokens']:,} tokens; the next task starts from "
               f"the handoff ({res['path']})", file=sys.stderr)
@@ -2466,7 +2467,8 @@ def _cmd_rpc(args, cfg, client, idx, root, locals_ref, run, save_checkpoint,
     def _rpc_consolidate():
         from . import memory
         res = memory.consolidate_session(root, locals_ref["cfg"])
-        locals_ref["resume_context"] = memory.handoff_prompt(res["summary"])
+        locals_ref["resume_context"] = memory.handoff_prompt(res["summary"],
+                                                             root)
         return res
 
     def _rpc_status():

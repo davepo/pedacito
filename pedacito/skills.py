@@ -271,17 +271,16 @@ BUILTIN_SKILLS: dict[str, tuple[str, str, tuple[str, ...]]] = {
     "modern-web-design-ui": (
         "Design modern websites, landing pages and bio/portfolio pages with "
         "high-craft CSS",
-        "1. Palette: dark slate (#0b0f17, #131b2e cards, "
-        "rgba(255,255,255,.08) border, #f8fafc text, #94a3b8 muted, "
-        "#38bdf8/#818cf8 accents) or warm editorial + radial glow; never "
-        "cartoon gradients/white boxes.\n"
-        "2. Type -apple-system,'Inter',system-ui, -.025em headings, clamp(), "
-        "65ch prose, 1.7 leading. Links: inline-flex pills, border, "
-        "translateY(-1px) hover, not raw blue <a>.\n"
-        "3. No build: no raw @tailwind directives; full CSS or "
-        "cdn.tailwindcss.com in <head>. No unrequested hamburger/contact "
-        "form/dummy JS.\n"
-        "4. Preserve exact copy, links, section order.",
+        "1. Dark slate (#0b0f17, #131b2e cards, #ffffff14 border, "
+        "#f8fafc text, #94a3b8 muted, #38bdf8/#818cf8 accents) or warm "
+        "editorial + radial glow; no cartoon gradients/white boxes.\n"
+        "2. Type system-ui/'Inter', -.025em headings, clamp(), 65ch prose, "
+        "1.7 leading. Links: bordered pills, translateY(-1px) hover.\n"
+        "3. No build: no raw @tailwind; full CSS or cdn.tailwindcss.com in "
+        "<head>. Never create package.json/tailwind.config.js/"
+        "postcss.config.js/src/input.css unless asked (npm/Node/Tailwind "
+        "CLI). No unrequested hamburger/contact form/JS.\n"
+        "4. Keep exact copy, links, section order.",
         ("website", "webpage", "landing page", "personal site", "bio",
          "portfolio", "styling", "modern", "sleek", "appealing", "css",
          "layout", "theme", "hero", "card")),

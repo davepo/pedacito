@@ -508,6 +508,8 @@ def _project_reset(q, body):
     """Wipe this workspace's `.pedacito/` state exactly like `pedacito reset`:
     running background servers are stopped first, code and `.pedacito.toml`
     are untouched, and `reindex` rebuilds the index afterwards as a job.
+    The auto-plan file (PLAN.md) is removed too -- a fresh start must not
+    inherit the old checklist. Source files are never touched.
 
     With no project open this resets the scratchpad instead of refusing."""
     from .. import processes
@@ -545,6 +547,27 @@ def _project_reset(q, body):
                                    keep_config=keep_config, dry_run=dry_run)
         except OSError as e:
             return 400, {"ok": False, "detail": str(e)}
+        # The auto-plan checklist rides with the session state: a reset
+        # that left PLAN.md behind would resume the old plan on the next
+        # auto run. Only a regular file directly named by the setting is
+        # removed -- never a symlink or an escaping path.
+        plan_name = str(getattr(STATE.cfg, "auto_plan_file", "") or "PLAN.md")
+        plan_name = plan_name.replace("\\", "/").strip()
+        while plan_name.startswith("./"):
+            plan_name = plan_name[2:]
+        plan_path = root / plan_name
+        plan_removed = False
+        if (plan_name and not Path(plan_name).is_absolute()
+                and ".." not in plan_name.split("/")
+                and plan_path.is_file() and not plan_path.is_symlink()):
+            if dry_run:
+                plan_removed = True
+            else:
+                try:
+                    plan_path.unlink()
+                    plan_removed = True
+                except OSError:
+                    pass
     finally:
         if lock_held:
             workspace.release_lock(root)
@@ -553,7 +576,17 @@ def _project_reset(q, body):
            "kept": list(plan.get("kept") or []),
            "files": int(plan.get("files") or 0),
            "bytes": int(plan.get("bytes") or 0),
-           "running": running, "stopped": stopped}
+           "running": running, "stopped": stopped,
+           "plan_file": plan_name, "plan_removed": plan_removed}
+    cleared = ["session history"]
+    if not keep_memory:
+        cleared.append("memory")
+    if plan_removed:
+        cleared.append(plan_name)
+    joined = (", ".join(cleared[:-1]) + ", and " + cleared[-1]
+              if len(cleared) > 2 else " and ".join(cleared))
+    out["summary"] = (("Would clear" if dry_run else "Cleared")
+                      + f" {joined} — ready for a fresh start.")
     if dry_run:
         out["would_stop"] = running
         return 200, out

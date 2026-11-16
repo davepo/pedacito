@@ -1142,6 +1142,45 @@ def check_oversized_rewrite(agent, results, task: str = "") -> list[Finding]:
     return out
 
 
+# ------------------------------------------------- static-site build hijack
+# A design task on a plain HTML/CSS workspace keeps getting "upgraded" into a
+# Node project: the model creates package.json / tailwind.config.js /
+# postcss.config.js, and the page then renders unstyled because nothing here
+# runs a build. The prose rule (prompts.STATIC_SITE_RULES) alone did not stop
+# it, so the apply path strips these creations deterministically -- unless
+# the workspace already had a package.json before the task, or the task
+# explicitly asks for npm/Node/Tailwind tooling.
+BUILD_TOOL_BASENAMES = frozenset({
+    "package.json",
+    "tailwind.config.js", "tailwind.config.cjs", "tailwind.config.mjs",
+    "tailwind.config.ts",
+    "postcss.config.js", "postcss.config.cjs", "postcss.config.mjs",
+    "postcss.config.ts",
+})
+
+
+def unrequested_build_creations(preexisting, task: str, rels) -> list[str]:
+    """The subset of `rels` that are build-tool files this task may not
+    CREATE: the workspace had no package.json before the turn (any depth)
+    and the task text does not ask for npm/Node/Tailwind tooling. Edits to
+    pre-existing files are never flagged -- only fresh creations. Returns
+    the offending paths in their original spelling, deduplicated."""
+    from . import prompts
+    if prompts.wants_build_tools(task):
+        return []
+    keys = {fileio.path_key(str(f)) for f in (preexisting or ())}
+    if any(k.rsplit("/", 1)[-1] == "package.json" for k in keys):
+        return []
+    out: list[str] = []
+    for rel in rels:
+        key = fileio.path_key(str(rel))
+        if key in keys:
+            continue              # existed before the task: an edit, not a hijack
+        if key.rsplit("/", 1)[-1] in BUILD_TOOL_BASENAMES:
+            out.append(str(rel))
+    return list(dict.fromkeys(out))
+
+
 # ------------------------------------------------------------------ citations
 _CITE_RES = (
     re.compile(r"(?<![\w/.-])([\w./\\-]+\.[A-Za-z]{1,5}):(\d+)"),

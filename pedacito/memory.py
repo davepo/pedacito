@@ -160,7 +160,9 @@ def entries(root) -> list[tuple[str, str, str]]:
 
 def render(root, cfg=None, limit: int | None = None) -> str:
     """The memory block for a prompt ('' when there is none or memory is off),
-    newest lines kept when over `limit` characters."""
+    newest lines kept when over `limit` characters. A project line whose
+    every named file was deleted is annotated stale -- the fact may still
+    hold, but the model must not trust it about the current tree."""
     if cfg is not None and not getattr(cfg, "use_memory", True):
         return ""
     limit = int(limit or getattr(cfg, "max_memory_chars", 1500) or 1500)
@@ -169,6 +171,11 @@ def render(root, cfg=None, limit: int | None = None) -> str:
         data = _read(path)
         for cat in CATEGORIES:
             for x in data[cat]:
+                if scope == "project" and root is not None:
+                    files = _referenced_files(x)
+                    if files and not any((Path(root) / f).exists()
+                                         for f in files):
+                        x += " [stale: the file(s) it names were deleted]"
                 rows.append(f"- [{scope}/{cat}] {x}")
     if not rows:
         return ""
@@ -177,6 +184,31 @@ def render(root, cfg=None, limit: int | None = None) -> str:
     while rows and len(head) + 1 + sum(len(r) + 1 for r in rows) > limit:
         rows.pop(0)                    # oldest first
     return head + "\n" + "\n".join(rows) if rows else ""
+
+
+# Extensions that mark a bare token as a file reference in a memory line.
+# A qualified path (with a slash) counts regardless of extension; a bare
+# word needs one of these so version numbers and prose stay out.
+_STALE_EXT = frozenset({
+    ".py", ".js", ".mjs", ".cjs", ".ts", ".jsx", ".tsx", ".css", ".html",
+    ".htm", ".json", ".md", ".toml", ".yaml", ".yml", ".sh", ".sql", ".svg",
+    ".vue", ".svelte", ".rs", ".go", ".java", ".c", ".h", ".cpp", ".txt",
+    ".xml", ".ini", ".cfg",
+})
+
+
+def _referenced_files(line: str) -> list[str]:
+    """Project-relative file paths a memory line names. Tokens that ride
+    inside a URL or email (preceded by / : @) are not file references."""
+    out: list[str] = []
+    for m in _PATH_RE.finditer(line):
+        tok = m.group(0)
+        if m.start() and line[m.start() - 1] in "/:@":
+            continue
+        suffix = "." + tok.rsplit(".", 1)[-1].lower()
+        if "/" in tok or suffix in _STALE_EXT:
+            out.append(tok)
+    return out
 
 
 # ------------------------------------------------------ session consolidation
@@ -225,8 +257,19 @@ TASK_PRECEDENCE_RULE = (
     "earlier session, obey the current `USER TASK` unconditionally.")
 
 
-def handoff_prompt(summary: str) -> str:
-    """The handoff as a resume seed for the next task (CLI chat / rpc)."""
+def handoff_prompt(summary: str, root=None) -> str:
+    """The handoff as a resume seed for the next task (CLI chat / rpc).
+    With `root`, a clean slate (every source file deleted) archives the
+    handoff instead: it describes a project that no longer exists, and
+    seeding the next task with it made the model rebuild deleted files."""
+    if root is not None:
+        from . import sessions
+        if sessions.clean_slate(root):
+            return ("CONSOLIDATED SESSION HANDOFF ARCHIVED: the workspace is "
+                    "a clean slate -- every source file was deleted, so the "
+                    "earlier turns describe a project that no longer exists. "
+                    "Do not re-create old files unless the current task asks "
+                    "for them.\n\n" + TASK_PRECEDENCE_RULE)
     return ("CONSOLIDATED SESSION HANDOFF (earlier turns compacted to save "
             "context; verify current source before editing):\n"
             + (summary or "").strip()
@@ -508,8 +551,13 @@ def clear_attempts(root, task: str) -> None:
 
 
 def attempts_note(root, task: str, cfg=None) -> str:
-    """A short block about earlier failed attempts at a similar task ('' if none)."""
+    """A short block about earlier failed attempts at a similar task ('' if
+    none). On a clean slate the attempts describe a deleted project: they
+    are archived, not advice for the current run."""
     if cfg is not None and not getattr(cfg, "use_memory", True):
+        return ""
+    from . import sessions
+    if sessions.clean_slate(root):
         return ""
     hits = [r for r in _read_attempts(root) if _similar(r["task"], task) >= 0.6]
     if not hits:

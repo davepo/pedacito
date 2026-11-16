@@ -18,6 +18,7 @@ passes `root=None`) keeps its logs in the per-user state folder instead:
 
 from __future__ import annotations
 
+import os
 import re
 from pathlib import Path
 
@@ -29,6 +30,46 @@ GLOBAL_SESSIONS_SUBDIR = Path("sessions") / "global"
 MAX_LIST = 10
 MAX_HITS = 20
 MAX_READ_LINES = 200
+
+# Directories that never count toward "the workspace still has source":
+# vendored dependencies and build output. Hidden directories (.git,
+# .pedacito, .venv, ...) are skipped by their leading dot alone.
+_CLEAN_SLATE_SKIP = frozenset({
+    "node_modules", "bower_components", "web_modules", "dist", "build",
+    "out", "venv", "env", "__pycache__", "coverage", "vendor", "target",
+    ".next", ".cache", ".tox",
+})
+
+
+def clean_slate(root) -> bool:
+    """True when the workspace holds no visible source files at all: every
+    non-hidden regular file is gone (hidden state like .pedacito/ and .git/,
+    and vendored/build directories, do not count). A run on a clean slate
+    must not inherit handoffs, attempts or lessons about the deleted
+    project -- they describe files that no longer exist."""
+    if root is None:
+        return False
+    root = Path(root)
+    if not root.is_dir():
+        return False
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [d for d in dirnames
+                       if not d.startswith(".") and d not in _CLEAN_SLATE_SKIP]
+        for name in filenames:
+            if name.startswith("."):
+                continue
+            if (Path(dirpath) / name).is_file():
+                return False
+    return True
+
+
+# The edit record of a session log: the files it applied or failed to apply.
+_SESSION_FILE_RE = re.compile(r"^- (?:applied|FAILED) `([^`]+)`", re.M)
+
+
+def _session_files(text: str) -> list[str]:
+    """Project-relative paths a session log's edit record names."""
+    return [m.group(1) for m in _SESSION_FILE_RE.finditer(text)]
 
 
 def session_dir(root) -> Path:
@@ -100,11 +141,20 @@ def _read_text(p: Path) -> str:
 
 
 def recent(root) -> str:
-    """List recent session logs with their task and edit count."""
+    """List recent session logs with their task and edit count. On a clean
+    slate (no source files left) the logs are archived history about a
+    deleted project, and a log whose every named file is gone is annotated
+    stale -- neither may pass for current state."""
     ps = paths(root)
     if not ps:
         return ("No prior sessions are recorded for this project. Session "
                 "logging may be off (`log_sessions = false`).")
+    if clean_slate(root):
+        return (f"Clean slate: this workspace has no source files left. "
+                f"{len(ps)} prior session log(s) are archived history about "
+                "a project that was deleted -- they are not current state. "
+                "Do not re-create what they describe unless the task asks "
+                "for it.")
     shown = ps[:MAX_LIST]
     out = [f"Prior sessions (most recent first; {len(ps)} total):"]
     for p in shown:
@@ -114,7 +164,12 @@ def recent(root) -> str:
             continue
         n = _edit_count(text)
         tail = f"  [{n} edit(s)]" if n else ""
-        out.append(f"  {p.name}  {_task(text)}{tail}")
+        stale = ""
+        if root is not None:
+            files = _session_files(text)
+            if files and not any((Path(root) / f).exists() for f in files):
+                stale = "  [stale: every file it names was deleted]"
+        out.append(f"  {p.name}  {_task(text)}{tail}{stale}")
     if len(ps) > len(shown):
         out.append(f"  ... {len(ps) - len(shown)} older session(s) not shown")
     out.append("[Read one with `sessions` file=<name>, or search all with "
