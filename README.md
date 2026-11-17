@@ -283,13 +283,6 @@ python -m playwright install chromium    # one-time, after the browser extra
 
 With pipx, install the extras with `pipx install "pedacito[browser,vision]"`, then run `pipx run --spec playwright playwright install chromium` to download the browser.
 
-From a source checkout, use an editable install instead:
-
-```bash
-cd /path/to/pedacito
-pip install -e .            # Windows: py -m pip install -e .
-```
-
 This puts `pedacito` and `pdc` on your `PATH` and installs the full core:
 
 - `tree-sitter` with the `tree-sitter-language-pack` grammars, which power AST
@@ -310,6 +303,19 @@ Optional features: `pip install -e ".[full]"` adds screenshots (Pillow) and the
 headless browser (playwright). Or pick one: `pip install -e ".[vision]"` or
 `pip install -e ".[browser]"`. After installing the browser extra, run
 `python -m playwright install chromium`.
+
+<details>
+<summary>Install from source (development)</summary>
+
+```bash
+git clone https://github.com/davepo/pedacito.git
+cd pedacito
+python -m venv .venv
+source .venv/bin/activate        # Windows: .venv\Scripts\activate
+pip install -e ".[dev]"
+```
+
+</details>
 
 Uninstall with `pip uninstall pedacito-local`. Your config and every project's
 `.pedacito/` folder are left untouched.
