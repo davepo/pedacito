@@ -53,10 +53,83 @@ def _has_js_tests(root: Path) -> bool:
     return False
 
 
+def _py_test_files(root: Path) -> list[Path]:
+    """The tree's Python test files: both naming conventions a runner
+    discovers (`test_*.py` and `*_test.py`), at the root or under tests/."""
+    found: set[Path] = set()
+    for pattern in ("test_*.py", "*_test.py",
+                    "tests/**/test_*.py", "tests/**/*_test.py"):
+        found.update(root.glob(pattern))
+    return sorted(found)
+
+
 def _has_py_tests(root: Path) -> bool:
     """True when the tree has Python test files pytest can collect."""
-    return (any(root.glob("tests/test_*.py")) or any(root.glob("test_*.py"))
-            or any(root.glob("tests/**/test_*.py")))
+    return bool(_py_test_files(root))
+
+
+_UNITTEST_IMPORT_RE = re.compile(
+    r"(?m)^\s*(?:import\s+unittest\b|from\s+unittest\b)")
+_PYTEST_WORD_RE = re.compile(r"\bpytest\b")
+
+
+def _unittest_only(files: list[Path]) -> bool:
+    """True when every test file runs on the stdlib unittest runner: it
+    imports unittest, defines TestCase classes and never mentions pytest.
+    Such a suite needs no pytest install at all -- the point on PEP 668
+    systems (Arch/CachyOS), where pytest lives only inside a venv."""
+    if not files:
+        return False
+    for f in files:
+        try:
+            text = f.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            return False
+        if not _UNITTEST_IMPORT_RE.search(text):
+            return False
+        if "TestCase" not in text or _PYTEST_WORD_RE.search(text):
+            return False
+    return True
+
+
+def _unittest_command() -> str:
+    """The stdlib runner, discovering BOTH test naming conventions: bare
+    `python -m unittest` globs only `test*.py` and would silently skip every
+    `*_test.py` file. Double quotes survive sh and cmd.exe alike."""
+    py = "python" if sys.platform == "win32" else "python3"
+    return f'{py} -m unittest discover -p "*test*.py"'
+
+
+def _python_test_command(root: Path) -> str:
+    """A Python test command that can actually run HERE.
+
+    A fresh project on a PEP 668 system has no .venv of its own and no PATH
+    pytest (it sits inside Pedacito's venv), so a bare `pytest -q` dies with
+    "command not found" -- which verify_and_fix classifies as an environment
+    issue and skips, never running the suite. Prefer the project's own venv
+    pytest, then the stdlib runner for unittest-only suites, then a pytest
+    we can actually launch, and fall back to unittest rather than emit a
+    command that cannot run."""
+    for cand in (root / ".venv" / "bin" / "pytest",
+                 root / ".venv" / "Scripts" / "pytest.exe"):
+        if cand.is_file():
+            return f"{shlex.quote(str(cand))} -q"
+    if _unittest_only(_py_test_files(root)):
+        return _unittest_command()
+    if shutil.which("pytest"):
+        return "pytest -q"
+    # A PATH `python` is not necessarily the interpreter running Pedacito:
+    # on a fresh project it is often the system python with no pytest,
+    # while the harness's own interpreter has it as a core dependency
+    # (BUG-1012). Probe it before naming it.
+    try:
+        import importlib.util
+        has_pytest = importlib.util.find_spec("pytest") is not None
+    except Exception:
+        has_pytest = False
+    if has_pytest:
+        return f"{shlex.quote(sys.executable)} -m pytest -q"
+    return _unittest_command()
 
 
 _JS_SUFFIXES = frozenset({".js", ".mjs", ".cjs", ".jsx", ".ts", ".mts",
@@ -88,9 +161,11 @@ def _language_base(root: Path, changed: list[str], cfg, base: str) -> str:
         return base
     lang = _one_language(changed)
     low = base.lower()
-    if lang == "py" and "pytest" not in low and _has_py_tests(root):
-        return "pytest -q" if shutil.which("pytest") else "python -m pytest -q"
-    if lang == "js" and "pytest" in low and _has_js_tests(root):
+    if (lang == "py" and "pytest" not in low and "unittest" not in low
+            and _has_py_tests(root)):
+        return _python_test_command(root)
+    if (lang == "js" and ("pytest" in low or "unittest" in low)
+            and _has_js_tests(root)):
         return "node --test"
     return base
 
@@ -128,20 +203,8 @@ def detect_test_command(root, cfg=None) -> str:
         return "node --test"
     py_markers = _has(root, "pytest.ini", "tox.ini", "conftest.py", "pyproject.toml",
                       "setup.cfg", "setup.py")
-    has_py_tests = any(root.glob("tests/test_*.py")) or any(root.glob("test_*.py")) \
-        or any(root.glob("tests/**/test_*.py"))
-    if has_py_tests or (py_markers and (root / "tests").is_dir()):
-        # A PATH `python` is not necessarily the interpreter running Pedacito:
-        # on a fresh project it is often the system python with no pytest,
-        # while the harness's own interpreter has it as a core dependency.
-        # `run_test` already probes and prefers sys.executable for exactly
-        # this reason; the post-edit gate did not, so it recorded a red suite
-        # whose only "failure" was ModuleNotFoundError: No module named
-        # pytest, while the user's --verify on the same suite was green
-        # (BUG-1012).
-        if shutil.which("pytest"):
-            return "pytest -q"
-        return f"{shlex.quote(sys.executable)} -m pytest -q"
+    if _has_py_tests(root) or (py_markers and (root / "tests").is_dir()):
+        return _python_test_command(root)
     if _has(root, "Makefile", "makefile", "GNUmakefile"):
         for name in ("Makefile", "makefile", "GNUmakefile"):
             mk = root / name

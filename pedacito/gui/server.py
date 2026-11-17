@@ -1048,8 +1048,8 @@ def _run(q, body):
         echo=lambda: jobs.echo_submission(mode, body)))
 
 
-# Named aliases for the Ask and Auto modes, for API clients that address the
-# mode directly. Both accept the same body as POST /api/run.
+# Named aliases for the Ask, Auto and New modes, for API clients that address
+# the mode directly. Each accepts the same body as POST /api/run.
 @post("/api/ask")
 def _run_ask(q, body):
     return _run(q, {**body, "mode": "explain"})
@@ -1058,6 +1058,11 @@ def _run_ask(q, body):
 @post("/api/auto")
 def _run_auto(q, body):
     return _run(q, {**body, "mode": "auto"})
+
+
+@post("/api/new")
+def _run_new(q, body):
+    return _run(q, {**body, "mode": "new"})
 
 
 @post("/api/mode-check")

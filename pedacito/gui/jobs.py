@@ -303,6 +303,19 @@ def _refresh_index(p: SimpleNamespace) -> None:
     _swap_index(idx)
 
 
+def _ensure_index(job: Job) -> None:
+    """Zero-friction runs: a Task or Auto started in an unindexed workspace
+    builds the index on demand instead of refusing with "build it first".
+    Quick (no summaries -- that stays an explicit action), and an empty
+    folder is fine: 0 files is a valid index the run can populate."""
+    with STATE.lock:
+        if STATE.root is None:
+            raise ConfigError("Open a project first.")
+        if STATE.agent is not None:
+            return
+    build_index(job, summarise=False)
+
+
 def _prose(reply: str) -> str:
     """The model's reply without its search/replace blocks."""
     text = _EDIT_BLOCK_RE.sub("", reply or "")
@@ -728,6 +741,7 @@ def restore_snapshot(name: str = "") -> tuple[bool, str]:
 def run_task(job: Job, opts: dict) -> None:
     """`ask`: gather, edit, and review or write. `write` is "review" (sign off
     in the page) or "apply" (write now, backups first)."""
+    _ensure_index(job)
     p = _project()
     task = compose(opts.get("text", ""), opts.get("attachments"))
     if not task:
@@ -777,6 +791,11 @@ def run_task(job: Job, opts: dict) -> None:
             tr = loop.run_task(root, cfg, client, p.agent, idx, task,
                                apply=apply, review=reviewing)
             _swap_index(tr.idx)
+            if apply:
+                # Pick up anything the run created beyond its edit results
+                # (tool writes, generated files) so the tree and symbol
+                # count are current the moment the job ends.
+                _refresh_index(p)
             feed.end_stream()
             _post_task_result(tr, client, reviewing)
     finally:
@@ -939,6 +958,7 @@ def run_auto(job: Job, opts: dict) -> None:
     and `allow_shell` (run/diagnose) for the run, even when the global config
     leaves those opt-ins off. The original values are restored afterwards;
     Plan-only keeps the user's real settings."""
+    _ensure_index(job)
     p = _project()
     goal = compose(opts.get("text", ""), opts.get("attachments"))
     plan_file = (opts.get("plan_file") or "").strip()
@@ -1115,9 +1135,28 @@ def run_new(job: Job, opts: dict) -> None:
                           stats=_usage_stats(client))
     # A build/plan/review that created its folder becomes the active project,
     # so the file tree, index banner and composer bind to it immediately (a
-    # preview writes nothing and stays unbound).
+    # preview writes nothing and stays unbound). The creation turn travels
+    # with the switch: the new project's session log opens on the very
+    # conversation that built it, and the completed job reports the root so
+    # the page can follow without a manual refresh (mode drops back to Task).
     if mode != "preview" and target.is_dir():
-        open_project(str(target), profile, announce=True)
+        transcript = STATE.messages_snapshot()
+        open_project(str(target), profile, announce=False)
+        STATE.carry_transcript(transcript, title=spec_text)
+        job.project_root = str(target)
+        with STATE.lock:
+            idx = STATE.idx
+        if idx is None:
+            # The build normally persists its own index; a plan-only or
+            # early-stopped run may not have one. Either way the workspace
+            # the page lands on is indexed (0 files is a valid index).
+            build_index(job, summarise=False)
+            with STATE.lock:
+                idx = STATE.idx
+        state = (f"index: {len(idx.files)} files" if idx is not None
+                 else "no index yet")
+        STATE.add_message("system", f"Opened {target} \u2014 {state}.",
+                          kind="opened", needs_index=idx is None)
 
 
 # --- plan files -----------------------------------------------------------------

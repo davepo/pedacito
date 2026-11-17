@@ -299,6 +299,9 @@ class Job:
         self.active = True
         self.cancelled = False
         self.client = None          # set by jobs.session, for Stop
+        # A completed `new` job reports the project it created, so the page
+        # can adopt the workspace without a manual refresh (see end_job).
+        self.project_root = ""
 
 
 class Review:
@@ -423,6 +426,9 @@ class State:
         self._job_counter = 0
         self.error = ""
         self.note = ""
+        # Root of the last completed `new` job: /api/state carries it so a
+        # page that missed the SSE job-end event still adopts the project.
+        self.new_project_root = ""
 
         self.model_checked = False
         self.model_status = ""
@@ -717,6 +723,39 @@ class State:
         self.save_active_thread(force=True)
         self.bus.publish("status")
 
+    def carry_transcript(self, messages: list[dict], title: str = "") -> None:
+        """Adopt a conversation from the scope being left into the active
+        thread of the scope just opened: a New build's creation turn must
+        survive the project switch, so the user sees what was just built in
+        the NEW project's session log. The outgoing scope keeps its own
+        flushed copy (`set_root` saved it before loading this one).
+
+        Into an empty thread the messages keep their ids (the live SSE stream
+        already used them); into a thread that has history they are
+        renumbered after it, so ids never collide."""
+        msgs = [dict(m) for m in messages if isinstance(m, dict)]
+        if not msgs:
+            return
+        with self.lock:
+            rec = self.threads.get(self.thread_id)
+            if rec is None:
+                return
+            if rec["messages"]:
+                base = self._mid
+                for m in msgs:
+                    base += 1
+                    m["id"] = base
+                self._mid = base
+            else:
+                self._mid = max((m.get("id", 0) for m in msgs), default=0)
+            rec["messages"].extend(msgs)      # IS self.messages (attached)
+            if title and not rec.get("title_custom"):
+                named = thread_title_from(title)
+                if named:
+                    rec["title"] = named
+        self.save_active_thread(force=True)
+        self.bus.publish("status")
+
     def reset_threads(self) -> None:
         """Forget every in-memory chat after `pedacito reset` deleted
         `.pedacito/`. A single fresh thread opens; nothing is written until
@@ -958,8 +997,10 @@ class State:
                 self.error = error
             if job.kind in RUN_KINDS:
                 self.phase = "done"    # the panel keeps the finished run's feed
+            if job.kind == "new" and job.project_root:
+                self.new_project_root = job.project_root
         self.bus.publish("job", job=job.id, state="end", kind=job.kind,
-                         error=error)
+                         error=error, project_root=job.project_root)
 
     # --- engine telemetry ---------------------------------------------------------
 
@@ -1549,7 +1590,11 @@ class State:
                 "files_sig": self.files_signature(),
                 "job": ({"id": job.id, "kind": job.kind, "title": job.title,
                          "started": job.started,
-                         "cancelled": job.cancelled} if job else None),
+                         "cancelled": job.cancelled,
+                         "project_root": job.project_root} if job else None),
+                # The last completed New project: the page's fallback hook
+                # for adopting the workspace when the SSE end event was missed.
+                "new_project_root": self.new_project_root,
                 "error": self.error,
                 "note": self.note,
                 "model_checked": self.model_checked,

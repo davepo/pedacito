@@ -284,20 +284,28 @@ BUILTIN_SKILLS: dict[str, tuple[str, str, tuple[str, ...]]] = {
         ("website", "webpage", "landing page", "personal site", "bio",
          "portfolio", "styling", "modern", "sleek", "appealing", "css",
          "layout", "theme", "hero", "card")),
+    # The palette/keys/game-loop checklist lives in the Builder craft brief
+    # (prompts._GUI_CRAFT/_GAME_CRAFT); the items here carry the contracts a
+    # live CachyOS run proved missing: tk = None boxes crash on unguarded
+    # tk.StringVar(), log/ln/main drift between module and tests fails the
+    # post-scaffold suite, tests that only poke a math helper miss broken
+    # button handlers, and eval() behind a set(...) charset is not safe
+    # expression parsing. This skill alone runs a 580-char budget.
     "desktop-gui-and-games": (
         "Build desktop GUIs and 2D games that install nothing and never "
         "hang headless tests",
-        "1. Zero install: no PyQt6/customtkinter/pygame unless "
-        "installed/asked; use stdlib tkinter (tk.Canvas/styled ttk) or "
-        "HTML5 <canvas>.\n"
-        "2. No top-level mainloop()/infinite while: guard if "
-        "__name__ == \"__main__\":; expose app.press(key)/game.step(dt) "
-        "for headless tests: simulate, verify, destroy() -- no hang.\n"
-        "3. Never mix .pack()/.grid() in one parent (TclError); set "
-        "rowconfigure/columnconfigure weights.\n"
-        "4. Dark palette; keys (<Return>/<BackSpace>/<Escape>) + mouse; "
-        "games: rAF/fixed-timestep loop, start/game-over/restart, HUD, "
-        "particle/shake juice.",
+        "1. tkinter/tk.Canvas/<canvas>; PyQt6/customtkinter/pygame if "
+        "installed/asked.\n"
+        "2. mainloop() only if __name__ == \"__main__\":; "
+        "app.press(key)/game.step(dt); tests simulate, verify, destroy().\n"
+        "3. No .pack()/.grid() mix per parent (TclError); "
+        "rowconfigure/columnconfigure weight.\n"
+        "4. tk = None (ImportError): if tk is not None: guard "
+        "tk.StringVar() (.get()/.set()); log/ln/main match code/tests.\n"
+        "5. Handlers end to end: on_button_press -> on_equals -> display, "
+        "not just helpers; sin/sqrt on \"0\"/\"\" or a number.\n"
+        "6. ast.parse(expr, mode=\"eval\") whitelist; no eval()+set(...) "
+        "charsets.",
         ("calculator", "tkinter", "pyqt", "pyside", "gui", "game", "pygame",
          "arcade", "snake", "pong", "tetris", "breakout", "asteroids",
          "sprite", "keypad")),

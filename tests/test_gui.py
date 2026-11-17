@@ -1084,7 +1084,7 @@ def test_explain_populates_the_state_transcript_with_prompt_and_answer(project):
 
 
 @pytest.mark.network
-def test_running_without_an_index_is_refused_with_guidance(gui, fake_port):
+def test_explain_without_an_index_is_refused_with_guidance(gui, fake_port):
     gui.post("/api/settings/setup", {"base_url": f"http://127.0.0.1:{fake_port}/v1",
                                      "model": "fake-model", "vram_gb": "8"})
     root = gui.tmp / "p2"
@@ -1092,10 +1092,180 @@ def test_running_without_an_index_is_refused_with_guidance(gui, fake_port):
     (root / "a.py").write_text("x = 1\n", encoding="utf-8")
     gui.post("/api/project", {"path": str(root), "profile": ""})
     assert gui.wait_idle(30)
-    gui.post("/api/run", {"mode": "task", "text": "do it"})
+    # Ask about code still needs an index; Task and Auto build one on demand
+    # (test_task_on_unindexed_dir_auto_indexes_and_runs below).
+    gui.post("/api/run", {"mode": "explain", "text": "what does a.py do?"})
     assert gui.wait_idle(30)
     last = core.STATE.messages[-1]
     assert last["role"] == "error" and "index" in last["text"]
+
+
+@pytest.mark.network
+def test_task_on_unindexed_dir_auto_indexes_and_runs(gui, fake_port):
+    """Run in Task mode without clicking Build Index first: the run initializes
+    the index itself, applies the edit, and finishes with the file indexed --
+    no "build it first" refusal, no manual index step."""
+    gui.post("/api/settings/setup", {"base_url": f"http://127.0.0.1:{fake_port}/v1",
+                                     "model": "fake-model", "vram_gb": "8"})
+    root = gui.tmp / "unindexed"
+    root.mkdir()
+    (root / "app.py").write_text(APP, encoding="utf-8")
+    gui.post("/api/project", {"path": str(root), "profile": ""})
+    assert gui.wait_idle(30)
+    assert gui.get("/api/state")[1]["has_index"] is False
+
+    status, _ = gui.post("/api/run", {
+        "mode": "task", "text": "make greet return its greeting",
+        "write": "apply", "plan": "never"})
+    assert status == 202 and gui.wait_idle(30)
+    state = gui.get("/api/state")[1]
+    assert not state["error"], state["messages"]
+    assert state["has_index"] is True and state["index_files"] == 1
+    assert 'return f"hello {name}"' in (root / "app.py").read_text(encoding="utf-8")
+    # the on-demand index announced itself in the transcript
+    assert any(m.get("kind") == "indexed" for m in state["messages"])
+
+
+@pytest.mark.network
+def test_task_on_empty_dir_auto_indexes_then_refreshes_new_files(
+        gui, fake_port, monkeypatch):
+    """An empty folder indexes with 0 files before the run, and the index is
+    refreshed with the files the run created when it finishes -- the file
+    tree and symbol count are current without another Build Index click."""
+    from types import SimpleNamespace
+
+    gui.post("/api/settings/setup", {"base_url": f"http://127.0.0.1:{fake_port}/v1",
+                                     "model": "fake-model", "vram_gb": "8"})
+    root = gui.tmp / "empty-run"
+    root.mkdir()
+    gui.post("/api/project", {"path": str(root), "profile": ""})
+    assert gui.wait_idle(30)
+    assert gui.get("/api/state")[1]["has_index"] is False
+
+    def fake_run_task(root_, cfg, client, agent, idx, task, *,
+                      apply=False, review=False, **kw):
+        (root_ / "created.py").write_text("def created():\n    return 1\n",
+                                          encoding="utf-8")
+        return SimpleNamespace(idx=idx, results=[], reply="Created created.py.",
+                               applied=True, stats={}, steps=[])
+
+    monkeypatch.setattr(jobs.loop, "run_task", fake_run_task)
+    status, _ = gui.post("/api/run", {
+        "mode": "task", "text": "create created.py",
+        "write": "apply", "plan": "never"})
+    assert status == 202 and gui.wait_idle(30)
+    state = gui.get("/api/state")[1]
+    assert not state["error"], state["messages"]
+    assert state["has_index"] is True
+    assert state["index_files"] == 1            # refreshed with the new file
+    assert "created.py" in gui.get("/api/files")[1]["files"]
+
+
+@pytest.mark.network
+def test_auto_on_unindexed_dir_auto_indexes(gui, fake_port, monkeypatch):
+    gui.post("/api/settings/setup", {"base_url": f"http://127.0.0.1:{fake_port}/v1",
+                                     "model": "fake-model", "vram_gb": "8"})
+    root = gui.tmp / "auto-unindexed"
+    root.mkdir()
+    (root / "app.py").write_text(APP, encoding="utf-8")
+    gui.post("/api/project", {"path": str(root), "profile": ""})
+    assert gui.wait_idle(30)
+    assert gui.get("/api/state")[1]["has_index"] is False
+
+    seen = {}
+
+    def fake_auto(ns, cfg, client, idx, root):
+        seen["idx_files"] = len(idx.files)
+        return 0
+
+    monkeypatch.setattr(jobs.cli_mod, "_cmd_auto", fake_auto)
+    status, _ = gui.post("/api/run", {"mode": "auto",
+                                      "text": "make greet return"})
+    assert status == 202 and gui.wait_idle(30)
+    state = gui.get("/api/state")[1]
+    assert not state["error"], state["messages"]
+    assert state["has_index"] is True
+    assert seen["idx_files"] == 1               # the run started indexed
+
+
+@pytest.mark.network
+def test_new_job_completion_adopts_project_indexes_and_carries_the_turn(
+        gui, fake_port, monkeypatch):
+    """POST /api/new: when the build finishes, the server's active root IS
+    the new project, its files are indexed, the creation turn lives in the
+    NEW project's session log, and the completed job payload carries
+    project_root -- the frontend auto-switch hook."""
+    gui.post("/api/settings/setup", {"base_url": f"http://127.0.0.1:{fake_port}/v1",
+                                     "model": "fake-model", "vram_gb": "8"})
+    target = gui.tmp / "adopted"
+
+    def fake_build(root, cfg, client, spec, **kw):
+        (root / "main.py").write_text("def main():\n    return 0\n",
+                                      encoding="utf-8")
+        return 0
+
+    monkeypatch.setattr(jobs.scaffold, "run_new", fake_build)
+    status, _ = gui.post("/api/new", {"text": "a tiny demo cli",
+                                      "project": str(target), "build": "build"})
+    assert status == 202 and gui.wait_idle(30)
+    resolved = str(target.resolve())
+    state = gui.get("/api/state")[1]
+    assert not state["error"], state["messages"]
+    # the workspace switched to the new project, indexed, remembered
+    assert state["root"] == resolved
+    assert state["has_index"] is True and state["index_files"] == 1
+    assert resolved in state["recent"]
+    # the status payload exposes the completed New project's root
+    assert state["new_project_root"] == resolved
+    # the creation turn survived the switch into the new project's session
+    texts = [m["text"] for m in state["messages"]]
+    assert any("a tiny demo cli" in t for t in texts)
+    assert any("Project created at" in t for t in texts)
+    assert state["threads"] and state["threads"][0]["message_count"] >= 2
+    assert list((target / ".pedacito" / "gui" / "threads").glob("*.json"))
+    # the outgoing (project-less) scope kept its own flushed copy
+    assert list(core.threads_dir(None).glob("*.json"))
+    # the SSE job-end event carries the hook the page listens for
+    events, gap = core.STATE.bus.wait(0, timeout=1)
+    assert not gap
+    ends = [e for e in events if e.get("type") == "job"
+            and e.get("state") == "end" and e.get("kind") == "new"]
+    assert ends and ends[-1]["project_root"] == resolved
+
+
+def test_frontend_has_the_new_project_auto_switch_hook():
+    """The page wires the backend hook: a finished `new` job adopts the
+    project (path box + Task mode + state resync) without a manual refresh,
+    with a /api/status fallback for a missed SSE event."""
+    js = (Path(__file__).resolve().parents[1] / "pedacito" / "gui" / "static"
+          / "app.js").read_text(encoding="utf-8")
+    assert "function adoptNewProject(root)" in js
+    assert "e.state === 'end' && e.kind === 'new' && e.project_root" in js
+    assert "s.new_project_root" in js
+    assert "localStorage.setItem('pedacito_mode', 'task')" in js
+
+
+@pytest.mark.network
+def test_carry_transcript_appends_after_existing_history(gui, fake_port):
+    """Rebuilding a project that already has a session: the carried creation
+    turn is renumbered after the existing messages, so ids never collide."""
+    gui.post("/api/settings/setup", {"base_url": f"http://127.0.0.1:{fake_port}/v1",
+                                     "model": "fake-model", "vram_gb": "8"})
+    root = gui.tmp / "carry"
+    root.mkdir()
+    gui.post("/api/project", {"path": str(root), "profile": ""})
+    assert gui.wait_idle(30)
+    core.STATE.add_message("user", "existing turn")
+    carried = [{"id": 1, "role": "user", "text": "build turn"},
+               {"id": 2, "role": "assistant", "text": "built"}]
+    core.STATE.carry_transcript(carried, title="the new project")
+    msgs = core.STATE.messages_snapshot()
+    texts = [m["text"] for m in msgs]
+    # the open announcement leads; the carried turn lands after the history
+    assert texts[-3:] == ["existing turn", "build turn", "built"]
+    ids = [m["id"] for m in msgs]
+    assert len(set(ids)) == len(ids) and ids == sorted(ids)
+    assert core.STATE.threads[core.STATE.thread_id]["title"] == "the new project"
 
 
 @pytest.mark.network

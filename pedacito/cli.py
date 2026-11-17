@@ -1101,6 +1101,13 @@ def _cmd_auto(args, cfg, client, idx, root: Path) -> int:
             workspace.log_event(root, f"verify failed: {v_out[:200]}", "ERROR")
             if code == 0:
                 code = 1
+    if args.apply:
+        # The run wrote files (tasks, repairs, installs): leave the saved
+        # index in line with the tree so the next session -- and a GUI
+        # watching this project -- sees every new file immediately.
+        fresh = index_mod.Index.load(root)
+        if fresh is not None:
+            _refresh(fresh, args, cfg, root)
     return code
 
 

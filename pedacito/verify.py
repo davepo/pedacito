@@ -661,6 +661,133 @@ def _missing_gui_imports(tree, path, root=None,
     return out
 
 
+_TK_VAR_ATTRS = frozenset({"StringVar", "IntVar", "BooleanVar", "DoubleVar"})
+
+
+def _handles_import_error(handler) -> bool:
+    """True for `except ImportError:` / `except ModuleNotFoundError:` (also
+    in a tuple, also a bare `except:` -- it catches ImportError too)."""
+    t = handler.type
+    if t is None:
+        return True
+    names = t.elts if isinstance(t, ast.Tuple) else [t]
+    for n in names:
+        if isinstance(n, ast.Name) and n.id in ("ImportError",
+                                                "ModuleNotFoundError"):
+            return True
+        if isinstance(n, ast.Attribute) and n.attr in ("ImportError",
+                                                       "ModuleNotFoundError"):
+            return True
+    return False
+
+
+def _tk_none_aliases(tree) -> set[str]:
+    """Names set to None inside an `except ImportError:` handler -- the
+    headless fallback pattern (`try: import tkinter as tk ... except
+    ImportError: tk = None`). On a box without libtk the name really is
+    None at runtime, so every attribute access on it must be guarded."""
+    aliases: set[str] = set()
+    for n in ast.walk(tree):
+        if not isinstance(n, _TRY_NODES):
+            continue
+        for h in n.handlers:
+            if not _handles_import_error(h):
+                continue
+            for s in h.body:
+                if not (isinstance(s, ast.Assign)
+                        and isinstance(s.value, ast.Constant)
+                        and s.value.value is None):
+                    continue
+                for t in s.targets:
+                    if isinstance(t, ast.Name):
+                        aliases.add(t.id)
+    return aliases
+
+
+def _tk_guard_state(test, aliases: set[str]):
+    """What an `if` test proves about a tk alias: 'present' when the body
+    only runs with the alias non-None (`if tk is not None:` / `if tk:`),
+    'absent' when only the ELSE does (`if tk is None:`), None otherwise."""
+    if isinstance(test, ast.Name) and test.id in aliases:
+        return "present"
+    if (isinstance(test, ast.UnaryOp) and isinstance(test.op, ast.Not)
+            and isinstance(test.operand, ast.Name)
+            and test.operand.id in aliases):
+        return "absent"
+    if not (isinstance(test, ast.Compare) and len(test.ops) == 1):
+        return None
+    op = test.ops[0]
+    sides = (test.left, test.comparators[0])
+    for a, b in (sides, sides[::-1]):
+        if (isinstance(a, ast.Name) and a.id in aliases
+                and isinstance(b, ast.Constant) and b.value is None):
+            if isinstance(op, (ast.IsNot, ast.NotEq)):
+                return "present"
+            if isinstance(op, (ast.Is, ast.Eq)):
+                return "absent"
+    return None
+
+
+def _tk_none_var_hazards(tree, aliases: set[str]) -> list[tuple[int, str, str]]:
+    """(line, alias, attr) for tk.StringVar/IntVar/BooleanVar/DoubleVar calls
+    inside __init__ that run unguarded even though the module sets the alias
+    to None on ImportError -- headless verification crashes with
+    AttributeError: 'NoneType' object has no attribute 'StringVar'."""
+    out: list[tuple[int, str, str]] = []
+
+    def expr(n, guarded):
+        # Deferred bodies (lambda/generator) do not run during __init__.
+        if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef,
+                          ast.ClassDef, ast.Lambda, ast.GeneratorExp)):
+            return
+        if isinstance(n, ast.IfExp):    # `tk.StringVar() if tk else holder`
+            state = _tk_guard_state(n.test, aliases)
+            expr(n.body, guarded or state == "present")
+            expr(n.orelse, guarded or state == "absent")
+            return
+        if (isinstance(n, ast.Call) and not guarded
+                and isinstance(n.func, ast.Attribute)
+                and isinstance(n.func.value, ast.Name)
+                and n.func.value.id in aliases
+                and n.func.attr in _TK_VAR_ATTRS):
+            out.append((n.lineno, n.func.value.id, n.func.attr))
+        for c in ast.iter_child_nodes(n):
+            expr(c, guarded)
+
+    def scan(body, guarded):
+        for s in body:
+            if isinstance(s, (ast.FunctionDef, ast.AsyncFunctionDef,
+                              ast.ClassDef)):
+                continue        # runs later, not during __init__
+            if isinstance(s, ast.If):
+                state = _tk_guard_state(s.test, aliases)
+                scan(s.body, guarded or state == "present")
+                scan(s.orelse, guarded or state == "absent")
+                continue
+            if isinstance(s, _TRY_NODES):
+                scan(s.body, guarded)
+                for h in s.handlers:
+                    scan(h.body, guarded)
+                scan(s.orelse, guarded)
+                scan(s.finalbody, guarded)
+                continue
+            if isinstance(s, (ast.With, ast.AsyncWith, ast.For,
+                              ast.AsyncFor, ast.While)):
+                scan(s.body, guarded)
+                scan(getattr(s, "orelse", []), guarded)
+                continue
+            expr(s, guarded)
+
+    for cls in ast.walk(tree):
+        if not isinstance(cls, ast.ClassDef):
+            continue
+        for fn in cls.body:
+            if isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)) \
+                    and fn.name == "__init__":
+                scan(fn.body, False)
+    return out
+
+
 def check_python_gui_hazards(path, content, *, task: str = "",
                              root=None) -> list[str]:
     """Static hazard notes for one Python file's text (`path` only locates
@@ -669,6 +796,9 @@ def check_python_gui_hazards(path, content, *, task: str = "",
     - a .mainloop() that runs at import time -- it hangs pytest and every
       verification import indefinitely;
     - pack/grid mixed on one widget or one parent's children -- TclError;
+    - a tk.StringVar/IntVar/BooleanVar/DoubleVar call in __init__ that is
+      not guarded by `if tk is not None:` even though the module sets
+      tk = None on ImportError -- AttributeError on headless boxes;
     - a third-party GUI/game import that is not installed, not declared in
       requirements.txt/pyproject.toml and not asked for by the task.
 
@@ -691,6 +821,16 @@ def check_python_gui_hazards(path, content, *, task: str = "",
             "(app.press(key) / game.step(dt)) headless tests can drive.")
     for line, msg in _geometry_collisions(tree):
         out.append(f"line {line}: {msg}")
+    aliases = _tk_none_aliases(tree)
+    if aliases:
+        for line, name, attr in _tk_none_var_hazards(tree, aliases):
+            out.append(
+                f"line {line}: {name}.{attr}() runs in __init__ without an "
+                f"`if {name} is not None:` guard, but this module sets "
+                f"{name} = None on ImportError -- headless runs crash with "
+                f"AttributeError: 'NoneType' object has no attribute "
+                f"'{attr}'. Guard the call, or use a tiny .get()/.set() "
+                f"holder when {name} is None.")
     for line, lib in _missing_gui_imports(tree, path, root=root, task=task):
         out.append(
             f"line {line}: imports '{lib}', which is not installed in this "

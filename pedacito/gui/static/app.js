@@ -499,12 +499,33 @@ function saveOpts() { try { localStorage.setItem('pedacito_opts', JSON.stringify
 
 // --------------------------------------------------------------- actions ------
 let lastErr = '', lastReviewKey = '', lastJobId = 0, lastFilesSig = '';
+let lastNewRoot = null;                 // last completed New project adopted
 let inputEl = null;                       // the composer textarea (uncontrolled)
 
 function refreshState() {
   return PDC.api('/api/state').then(applyStatus, () => {});
 }
 PDC.refreshState = refreshState;
+
+// A New job finished: the server already adopted the project it created
+// (active root, index, session log carrying the creation turn). Follow it
+// without a manual browser refresh -- sync the path box, drop the mode
+// selector back to Task so follow-up edits are one keystroke away, and
+// resync transcript, file tree, index status and sessions from /api/state.
+function adoptNewProject(root) {
+  if (!root) return;
+  lastNewRoot = root;
+  const el = document.getElementById('path');
+  if (el && document.activeElement !== el) el.value = root;
+  if (S.mode === 'new') {
+    S.mode = 'task';
+    try { localStorage.setItem('pedacito_mode', 'task'); } catch (e) {}
+  }
+  S.ui.optsOpen = false;
+  emit();
+  refreshState();
+  setTimeout(() => { const ta = $('input'); if (ta) ta.focus(); }, 30);
+}
 
 function applyStatus(s) {
   const prev = S.status;
@@ -520,6 +541,13 @@ function applyStatus(s) {
   const rkey = s.review ? s.review.id + ':' + s.review.outcome : '';
   if (rkey !== lastReviewKey) { lastReviewKey = rkey; loadReview(); }
   const j = s.job;
+  // Fallback for a missed SSE job-end: the status carries the last completed
+  // New project's root. The first sighting only records it -- a page reload
+  // must not yank a mode the user deliberately picked after that build.
+  if (s.new_project_root && s.new_project_root !== lastNewRoot) {
+    if (lastNewRoot === null) lastNewRoot = s.new_project_root;
+    else if (!j) adoptNewProject(s.new_project_root);
+  }
   // The plan file is written/ticks WHILE Auto or a planned Task runs. Use the
   // live payload carried by /api/state every poll (and fall back to /api/plan
   // for an older server), so PLAN.md appears as soon as the planner writes it
@@ -687,7 +715,14 @@ function connect(seq) {
   on('term', (e) => termFeed(e.text));
   on('term_clear', () => { if (term) term.reset(''); });
   on('usage', () => refreshState());
-  on('job', () => refreshState());
+  on('job', (e) => {
+    // A finished New job carries the project it created: adopt the workspace
+    // (path box, Task mode, session view) right here, then resync everything.
+    // The end event fires once per job, so even rebuilding the SAME folder
+    // drops the mode back to Task; lastNewRoot only dedupes the poll fallback.
+    if (e.state === 'end' && e.kind === 'new' && e.project_root) adoptNewProject(e.project_root);
+    refreshState();
+  });
   on('permission', () => refreshState());         // a gated action is waiting
   on('permission_decided', () => refreshState()); // someone answered it
   // PLAN.md was created or a box was ticked: refresh the checklist now.

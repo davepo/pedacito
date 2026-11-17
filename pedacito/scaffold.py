@@ -784,6 +784,105 @@ def _interface_map(idx, plan: Plan, cfg) -> str:
     return got or _existing_map(idx, plan, cfg)
 
 
+def _test_interface_map(idx, plan: Plan, cfg, target: str = "",
+                        max_chars: int = 4000) -> str:
+    """The EXACT public surface of the implementation files on disk, for a
+    test file's build/repair prompt: module-level defs with their real
+    signatures, every public class with its method names, and key
+    constants/mappings. The compact contract map (`_interface_map`) caps
+    each entry near 300 chars and drops methods and constants entirely,
+    which left test passes guessing `ClassName.main` for a module-level
+    `def main()` or calling `log` (base-10) when the spec meant `ln`."""
+    import ast
+    from . import spec as _spec
+    from .testlinks import classify
+
+    stem = classify(target)[1] if target else ""
+    files = [f for f in plan.files
+             if not classify(f.path)[0] and (idx.root / f.path).is_file()]
+    # The implementation the test is named after leads, so it survives the
+    # char budget even in a many-file plan (test_calculator.py -> calculator.py).
+    files.sort(key=lambda f: 0 if stem and Path(f.path).stem.lower() == stem
+               else 1)
+    lines: list[str] = []
+    used = 0
+    for f in files:
+        rel = f.path
+        try:
+            text = fileio.read_text(idx.root / rel, errors="replace")
+        except OSError:
+            continue
+        sigs: list[str] = []
+        consts: list[str] = []
+        if rel.endswith(".py"):
+            try:
+                tree = ast.parse(text)
+            except (SyntaxError, ValueError):
+                continue
+            for node in tree.body:
+                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    if not node.name.startswith("_"):
+                        sigs.append(f"def {node.name}({ast.unparse(node.args)})")
+                elif isinstance(node, ast.ClassDef):
+                    if node.name.startswith("_"):
+                        continue
+                    methods = []
+                    for sub in node.body:
+                        if not isinstance(sub, (ast.FunctionDef,
+                                                ast.AsyncFunctionDef)):
+                            continue
+                        if sub.name.startswith("_") and sub.name != "__init__":
+                            continue
+                        args = ", ".join(
+                            a for a in ast.unparse(sub.args).split(", ")
+                            if a not in ("self", "cls")
+                            and not a.startswith(("self:", "cls:")))
+                        methods.append(f"{sub.name}({args})")
+                    sigs.append(f"class {node.name}"
+                                + (": " + ", ".join(methods) if methods else ""))
+                elif isinstance(node, (ast.Assign, ast.AnnAssign)):
+                    # Key constants and mappings: UPPER_CASE names, plus any
+                    # public dict/set/list/tuple literal (an OPS table is a
+                    # mapping even when its name is not shouted).
+                    targets = (node.targets if isinstance(node, ast.Assign)
+                               else [node.target])
+                    names = [t.id for t in targets if isinstance(t, ast.Name)]
+                    value = node.value
+                    if value is None or not names:
+                        continue
+                    literal = isinstance(value, (ast.Dict, ast.Set, ast.List,
+                                                 ast.Tuple))
+                    if not (any(n.isupper() for n in names)
+                            or (literal and any(not n.startswith("_")
+                                                for n in names))):
+                        continue
+                    try:
+                        rendered = ast.unparse(value)
+                    except Exception:
+                        continue
+                    if len(rendered) > 160:
+                        rendered = rendered[:157] + "..."
+                    consts.append(f"{', '.join(names)} = {rendered}")
+        elif rel.endswith((".js", ".mjs", ".cjs", ".jsx", ".ts", ".tsx")):
+            sigs = _spec._outline(rel, idx.root)
+            for m in re.finditer(
+                    r"^\s*export\s+const\s+([A-Za-z_$][\w$]*)\s*=\s*(.{0,160})",
+                    text, re.MULTILINE):
+                consts.append(f"{m.group(1)} = {m.group(2).strip()}")
+        else:
+            continue
+        if not sigs and not consts:
+            continue
+        entry = rel + ":\n" + "\n".join(f"  {s}" for s in sigs + consts)
+        if len(entry) > 1200:
+            entry = entry[:1197] + "..."
+        if used + len(entry) > max_chars and lines:
+            break
+        lines.append(entry)
+        used += len(entry) + 1
+    return "\n".join(lines)
+
+
 # Message prefix for a build_pass result that accepted an honest "this file
 # needs no edit" reply. build_project routes those files into a separate
 # summary bucket so a file the interface stage already finished is reported
@@ -867,10 +966,24 @@ def build_pass(client, cfg, idx, plan: Plan, target: PlannedFile,
     rejection diagnostics, appended last so the model reads them freshest.
     Returns (results, reply)."""
     from .agent import ANSWER_SYSTEM
+    from .testlinks import classify
 
     stub = fileio.read_text(idx.root / target.path, errors="replace")
     spec = plan.spec.text if plan.spec else ""
     budget = getattr(cfg, "max_spec_chars", MAX_SPEC_CHARS) // 2
+    # A test file is written against the implementation AS IT EXISTS ON DISK:
+    # the compact contract map truncates entries and omits methods/constants,
+    # so test targets get the full exact-symbol listing instead (no guessed
+    # `ClassName.main` for a module-level def, no log/ln mix-ups).
+    is_test = classify(target.path)[0]
+    if is_test:
+        api = (_test_interface_map(idx, plan, cfg, target.path)
+               or _interface_map(idx, plan, cfg) or "(nothing yet)")
+        api_header = ("PUBLIC API (exact symbols the implementation files "
+                      "expose on disk)")
+    else:
+        api = _interface_map(idx, plan, cfg) or "(nothing yet)"
+        api_header = "PUBLIC API (signatures every file imports by)"
     ctx = [
         f"PROJECT: {plan.project_name}",
         "",
@@ -881,8 +994,7 @@ def build_pass(client, cfg, idx, plan: Plan, target: PlannedFile,
                              else f"  -- {f.purpose}" if f.purpose else "")
             for f in plan.files),
         "",
-        "PUBLIC API (signatures every file imports by)\n" +
-        (_interface_map(idx, plan, cfg) or "(nothing yet)"),
+        api_header + "\n" + api,
         "",
         f"YOUR FILE: {target.path}",
         f"It currently contains this stubbed interface:\n```python\n{stub}\n```",
@@ -892,6 +1004,15 @@ def build_pass(client, cfg, idx, plan: Plan, target: PlannedFile,
     ]
     if done:
         ctx.insert(-2, "DONE SO FAR: " + ", ".join(done) + "\n")
+    if is_test:
+        ctx.append("")
+        ctx.append("Test these exact symbols: import and call them as listed "
+                   "-- a module-level def main() is called as main(), never "
+                   "ClassName.main; do not invent methods or confuse "
+                   "similarly named functions (log vs ln have different "
+                   "semantics). Where the app has UI, drive the real "
+                   "button/key handlers end to end (press -> equals -> "
+                   "display state), not just isolated math helpers.")
     if repair_note:
         ctx.append("")
         ctx.append(repair_note)
