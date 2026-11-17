@@ -107,10 +107,11 @@ hardware and budget allow.
 
 1. **Start a model server.** Load a model in LM Studio, Ollama, Lemonade, or
    llama.cpp. A hosted API works too, if you have a key.
-2. **Install** from the repository folder (requires Python 3.11+):
+2. **Install** from PyPI (requires Python 3.11+). Add the browser and vision extras
+   if you want them, or see [Install](#install) for pipx and source installs:
 
    ```bash
-   pip install -e .            # Windows: py -m pip install -e .
+   pip install pedacito                     # Windows: py -m pip install pedacito
    ```
 
 3. **Pick your way in.**
