@@ -1186,6 +1186,7 @@ class LLMClient:
             self.headers["x-api-key"] = key
             self.headers["anthropic-version"] = "2023-06-01"
         self.stats = {"calls": 0, "prompt_tokens": 0, "completion_tokens": 0,
+                      "total_tokens": 0, "reasoning_tokens": 0,
                       "cached_tokens": 0, "cache_write_tokens": 0,
                       "seconds": 0.0, "cost": 0.0, "by_site": {}}
         self._session = requests.Session()
@@ -1198,6 +1199,9 @@ class LLMClient:
         self.echo_stream = True
         # Called with one dict per finished request (events.py attaches here).
         self.on_call = None
+        # Called with {provider, model, phase, stream} just BEFORE each request
+        # leaves (the GUI heartbeat / TUI "waiting for ..." line).
+        self.on_start = None
         # Label for the current call site (gather / answer / repair / ...);
         # set with `client.site = "answer"` and read by usage accounting.
         self.site = ""
@@ -1255,6 +1259,8 @@ class LLMClient:
         # with the profile, model and routing specialty when one applies.
         self.last_prompt_tokens = 0
         self.last_completion_tokens = 0
+        self.last_total_tokens = 0
+        self.last_reasoning_tokens = 0
         self.last_elapsed_s = 0.0
         self.last_tok_per_s = 0.0
         self.active_model_role = {
@@ -1298,6 +1304,8 @@ class LLMClient:
         return {
             "last_prompt_tokens": self.last_prompt_tokens,
             "last_completion_tokens": self.last_completion_tokens,
+            "last_total_tokens": self.last_total_tokens,
+            "last_reasoning_tokens": self.last_reasoning_tokens,
             "last_elapsed_s": round(self.last_elapsed_s, 3),
             "last_tok_per_s": round(self.last_tok_per_s, 1),
             "avg_tok_per_s": round(self.avg_tok_per_s, 1),
@@ -1305,11 +1313,20 @@ class LLMClient:
             "context_utilization_pct": self.context_utilization_pct,
             "session_prompt_tokens": pt_total,
             "session_completion_tokens": stats.get("completion_tokens", 0),
+            "session_total_tokens": stats.get("total_tokens", 0),
+            "session_reasoning_tokens": stats.get("reasoning_tokens", 0),
             "session_seconds": round(stats.get("seconds", 0.0), 1),
             "cache_hit_pct": round(cached / pt_total * 100, 1)
             if pt_total else 0.0,
+            "provider": self.provider_label(),
             "active_model_role": dict(self.active_model_role),
         }
+
+    def provider_label(self) -> str:
+        """Friendly name of this client's endpoint (heartbeat / telemetry)."""
+        from .providers import provider_label
+        return provider_label(self.cfg.base_url,
+                              str(getattr(self.cfg, "provider", "") or ""))
 
     def _native_for(self, schema: dict | None, stream: bool) -> bool:
         """Whether this request should use the model's native tool-call channel
@@ -1828,6 +1845,12 @@ class LLMClient:
             # per-task summary still mean something.
             pt = prompt_est
             ct = self.estimate_tokens(out_text) if out_text else 0
+        # Hosted APIs report a grand total and (reasoning models) how many of
+        # the completion tokens were hidden thinking; local servers rarely do.
+        total = int(usage.get("total_tokens") or 0) or (pt + ct)
+        details = usage.get("completion_tokens_details")
+        reasoning = int((details or {}).get("reasoning_tokens") or 0) \
+            if isinstance(details, dict) else 0
         # Cache reads: OpenAI `cached_tokens`, DeepSeek's implicit hit tokens,
         # Anthropic/DashScope `cache_read_input_tokens`, or a local server's KV
         # reuse. Cache writes are the explicit-cache creation tokens.
@@ -1847,9 +1870,14 @@ class LLMClient:
                     + written * (p_write or p_in)
                     + ct * p_out) / 1_000_000
         site = self.site or "call"
+        # Generation speed: the server's own measurement when it reports one
+        # (llama.cpp `timings`), else completion tokens over wall time.
+        speed = float((timings or {}).get("predicted_per_second") or 0.0)
         with self._stats_lock:      # summaries may run on several threads
             self.stats["prompt_tokens"] += pt
             self.stats["completion_tokens"] += ct
+            self.stats["total_tokens"] += total
+            self.stats["reasoning_tokens"] += reasoning
             self.stats["cached_tokens"] += cached
             self.stats["cache_write_tokens"] += written
             self.stats["seconds"] += seconds
@@ -1859,8 +1887,11 @@ class LLMClient:
             # that reports no usage still moves the needle).
             self.last_prompt_tokens = pt
             self.last_completion_tokens = ct
+            self.last_total_tokens = total
+            self.last_reasoning_tokens = reasoning
             self.last_elapsed_s = float(seconds or 0.0)
-            self.last_tok_per_s = ct / seconds if seconds > 0 else 0.0
+            self.last_tok_per_s = speed if speed > 0 else (
+                ct / seconds if seconds > 0 else 0.0)
             row = self.stats["by_site"].setdefault(
                 site, {"calls": 0, "prompt_tokens": 0, "completion_tokens": 0,
                        "cached_tokens": 0, "cache_write_tokens": 0})
@@ -1870,10 +1901,18 @@ class LLMClient:
             row["cached_tokens"] += cached
             row["cache_write_tokens"] += written
         record = {"site": site, "prompt_tokens": pt, "completion_tokens": ct,
+                  "total_tokens": total, "reasoning_tokens": reasoning,
                   "cached_tokens": cached, "cache_write_tokens": written,
                   "seconds": round(seconds, 3),
+                  "tok_per_sec": round(self.last_tok_per_s, 1),
                   "cost": round(cost, 6), "model": self.cfg.model,
+                  "provider": self.provider_label(),
                   "finish": self.last_finish_reason}
+        try:
+            from . import events
+            events.note_call(record)
+        except Exception:
+            pass          # run aggregation is best-effort
         cb = self.on_call
         if cb is not None:
             try:
@@ -2053,6 +2092,17 @@ class LLMClient:
         # replay digest (which hashes the original `messages`, not `msgs`), so
         # neither the budget math nor --replay matching sees them.
         self._apply_cache_markers(msgs)
+        # Heartbeat: tell observers (GUI pulse, TUI wait line, event log) that
+        # a request is about to leave, with who is serving it and for what.
+        start_cb = self.on_start
+        if start_cb is not None:
+            try:
+                start_cb({"provider": self.provider_label(),
+                          "model": self.cfg.model,
+                          "phase": self.site or "call",
+                          "stream": bool(stream)})
+            except Exception:
+                pass      # telemetry must never break a call
         t0 = time.time()
         self.stats["calls"] += 1
         # Cleared per attempt so a stale "length" from an abandoned attempt

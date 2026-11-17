@@ -133,6 +133,111 @@ def attach(client, log: EventLog) -> None:
     if client is None or not hasattr(client, "on_call"):
         return
     client.on_call = lambda rec: log.emit("call", **rec)
+    if hasattr(client, "on_start"):
+        client.on_start = lambda info: log.emit("llm_start", **info)
+
+
+class RunTelemetry:
+    """Aggregated LLM usage for ONE run (a /new, /auto or task job), kept
+    thread-local so concurrent jobs never mix their numbers. `begin_run()`
+    opens one on the calling thread; every `_account` folds into it via
+    `note_call`; `end_run()` returns the summary and closes it."""
+
+    def __init__(self):
+        self.calls = 0
+        self.prompt_tokens = 0
+        self.completion_tokens = 0
+        self.total_tokens = 0
+        self.reasoning_tokens = 0
+        self.seconds = 0.0
+        self.model = ""
+        self.provider = ""
+
+    def note(self, rec: dict) -> None:
+        self.calls += 1
+        self.prompt_tokens += int(rec.get("prompt_tokens") or 0)
+        self.completion_tokens += int(rec.get("completion_tokens") or 0)
+        self.total_tokens += int(rec.get("total_tokens") or 0)
+        self.reasoning_tokens += int(rec.get("reasoning_tokens") or 0)
+        self.seconds += float(rec.get("seconds") or 0.0)
+        if rec.get("model"):
+            self.model = str(rec["model"])
+        if rec.get("provider"):
+            self.provider = str(rec["provider"])
+
+    def summary(self) -> dict:
+        tok_s = (self.completion_tokens / self.seconds
+                 if self.seconds > 0 else 0.0)
+        return {"calls": self.calls,
+                "prompt_tokens": self.prompt_tokens,
+                "completion_tokens": self.completion_tokens,
+                "total_tokens": self.total_tokens,
+                "reasoning_tokens": self.reasoning_tokens,
+                "elapsed_s": round(self.seconds, 3),
+                "tok_per_sec": round(tok_s, 1),
+                "model": self.model,
+                "provider": self.provider}
+
+
+_runs = threading.local()
+
+
+def begin_run() -> RunTelemetry:
+    """Open a fresh run collector on this thread (replacing any stale one)."""
+    run = RunTelemetry()
+    _runs.current = run
+    return run
+
+
+def current_run() -> RunTelemetry | None:
+    return getattr(_runs, "current", None)
+
+
+def end_run() -> dict:
+    """Close this thread's collector and return its aggregated summary
+    ({} when no run was open)."""
+    run = getattr(_runs, "current", None)
+    _runs.current = None
+    return run.summary() if run is not None else {}
+
+
+def note_call(rec: dict) -> None:
+    """Fold one finished LLM call into the active run, if any. Never raises."""
+    run = getattr(_runs, "current", None)
+    if run is not None:
+        try:
+            run.note(rec)
+        except Exception:
+            pass
+
+
+def run_line(summary: dict) -> str:
+    """The one-line aggregate of a finished run (`new`, `auto`, a task).
+    Shared verbatim by the CLI stderr and the TUI transcript so both tell
+    the same tokens/speed story. Empty string when the run made no calls."""
+    if not summary or not int(summary.get("calls") or 0):
+        return ""
+    pt = int(summary.get("prompt_tokens") or 0)
+    ct = int(summary.get("completion_tokens") or 0)
+    bits = [f"{int(summary['calls'])} calls", f"{pt:,} in / {ct:,} out"]
+    total = int(summary.get("total_tokens") or 0)
+    reasoning = int(summary.get("reasoning_tokens") or 0)
+    if total or reasoning:
+        extra = f"{total:,} total" if total else ""
+        if reasoning:
+            extra += (", " if extra else "") + f"{reasoning:,} reasoning"
+        bits.append(extra)
+    bits.append(f"{float(summary.get('elapsed_s') or 0):.1f}s")
+    tok_s = float(summary.get("tok_per_sec") or 0)
+    if tok_s > 0:
+        bits.append(f"{tok_s:.1f} tok/s")
+    model = str(summary.get("model") or "")
+    provider = str(summary.get("provider") or "")
+    if model:
+        bits.append(f"{provider}/{model}" if provider else model)
+    elif provider:
+        bits.append(provider)
+    return "[run: " + ", ".join(bits) + "]"
 
 
 def prune(root, keep: int, current: Path | None = None) -> int:

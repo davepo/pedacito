@@ -2966,6 +2966,20 @@ def test_plan_tasks_splits_oversized_files(tmp_path):
         ["Implement small.py -- s"]
 
 
+# The Complex build ends with a docs pass: a stub that answers every chat
+# with "" would (correctly) fail the README and exit 1. These tests are about
+# the loop/import/dependency behaviour, so the stub ships a real README block.
+_COMPLEX_DOCS_REPLY = (
+    "--- FILE: README.md\n"
+    "<<<<<<< SEARCH\n"
+    "=======\n"
+    "# Demo\n\nA tiny demo project.\n\n"
+    "## Quick Start\n\n```bash\npython3 main.py\n```\n\n"
+    "## Running Tests\n\n```bash\npython3 -m unittest -v\n```\n"
+    ">>>>>>> REPLACE\n"
+)
+
+
 def test_new_complex_chains_to_auto_loop(tmp_path, monkeypatch):
     """`new --complex --apply` must scaffold the skeleton, write a resumable
     task checklist, and hand implementation to the outer loop with the
@@ -2990,7 +3004,7 @@ def test_new_complex_chains_to_auto_loop(tmp_path, monkeypatch):
                  "code": "def parse(text):\n    raise NotImplementedError\n"},
             ]}
         def chat(self, *a, **k):
-            return ""
+            return _COMPLEX_DOCS_REPLY
 
     cfg = Config()
     code = scaffold.run_new(tmp_path, cfg, Stub(), scaffold.Spec("md2html"),
@@ -3041,7 +3055,7 @@ def _complex_stub():
             return {"files": [{"path": "main.py",
                                "code": "def main():\n    pass\n"}]}
         def chat(self, *a, **k):
-            return ""
+            return _COMPLEX_DOCS_REPLY
     return Stub()
 
 

@@ -320,6 +320,15 @@ textarea { resize: none; background: var(--panel); }
 @keyframes pulse { 50% { opacity: .35; } }
 @media (prefers-reduced-motion: reduce) { .dot.busy { animation: none; } }
 
+/* Live LLM heartbeat beside the chat header: a pulsing dot plus the elapsed
+ * timer while a request is in flight (see LlmHeartbeat in app.js). */
+.llm-heartbeat { display: inline-flex; align-items: center; gap: 6px;
+  font-size: 11.5px; color: var(--accent); white-space: nowrap; }
+.llm-pulse { width: 9px; height: 9px; border-radius: 50%; flex: none;
+  display: inline-block; background: var(--accent);
+  animation: pulse 1s ease-in-out infinite; }
+@media (prefers-reduced-motion: reduce) { .llm-pulse { animation: none; } }
+
 /* dropdown menus ---------------------------------------------------------- */
 .menuwrap { position: relative; display: inline-flex; }
 .menubtn { display: inline-flex; }

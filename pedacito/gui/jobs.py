@@ -62,6 +62,10 @@ def spawn(kind: str, title: str, fn, *, echo=None) -> Job | None:
 
     def worker():
         err = ""
+        # One run-scoped telemetry collector per job: every LLM call the job
+        # makes folds into it (events.note_call), and the result cards read
+        # the aggregate while the run is still open.
+        events_mod.begin_run()
         try:
             try:
                 fn(job)
@@ -95,6 +99,7 @@ def spawn(kind: str, title: str, fn, *, echo=None) -> Job | None:
         except KeyboardInterrupt:
             pass            # a Stop that arrived after the job body finished
         finally:
+            job.telemetry = events_mod.end_run()
             while True:     # a late Stop must not leave the job slot taken
                 try:
                     STATE.end_job(job, err)
@@ -216,6 +221,9 @@ class _Feed:
                           f"{f.get('loaded', '?')} ({f.get('elapsed_s', 0)}s)")
         elif kind == "call":
             STATE.bus.publish("usage", usage=STATE.status()["usage"])
+        elif kind == "complex_auto":
+            self.activity(str(f.get("text") or
+                              "Auto-enabled Complex scaffolding."))
 
 
 @contextmanager
@@ -228,6 +236,13 @@ def session(p: SimpleNamespace, job: Job, *, interactive: bool, lock: bool):
     client.stream_callback = feed.token
     elog = events_mod.get(root, cfg)
     elog.listeners.append(feed.event)
+    # Route per-call usage AND the pre-request heartbeat into the event log
+    # (the scratchpad Ask has no agent to attach its own client). A New
+    # preview's target does not exist yet: emitting into its EventLog would
+    # create the very folder the preview promised not to touch, so attach
+    # only for a real workspace (root None is the diskless scratchpad log).
+    if root is None or Path(root).is_dir():
+        events_mod.attach(client, elog)
     held = False
     had = {k: cfg.__dict__.get(k, _MISSING)
            for k in ("_steer", "_interactive", "_ask_user")}
@@ -821,9 +836,15 @@ def _note_plan_dir(root: Path, since: float) -> None:
 
 def _usage_stats(client) -> dict:
     s = client.stats
-    return {"calls": s["calls"], "tokens_out": s["completion_tokens"],
-            "tokens_in": s.get("prompt_tokens", 0),
-            "cost": s.get("cost", 0.0), "seconds": s.get("seconds", 0.0)}
+    out = {"calls": s["calls"], "tokens_out": s["completion_tokens"],
+           "tokens_in": s.get("prompt_tokens", 0),
+           "cost": s.get("cost", 0.0), "seconds": s.get("seconds", 0.0)}
+    # While a run is open, its aggregate (this job's calls only, with
+    # provider/model and generation speed) rides along on the result card.
+    run = events_mod.current_run()
+    if run is not None and run.calls:
+        out.update(run.summary())
+    return out
 
 
 def _post_task_result(tr, client, reviewing: bool) -> None:
@@ -1070,7 +1091,13 @@ def _int_or(value, default: int) -> int:
 
 
 def run_new(job: Job, opts: dict) -> None:
-    """`new`: plan a project from a description and build it from scratch."""
+    """`new`: plan a project from a description and build it from scratch.
+
+    A real build switches the workspace FIRST: the target folder becomes the
+    active project (fresh session, empty index) before scaffolding starts, so
+    every progress event and streamed token lands in the new project's
+    session while it is being built. A preview writes nothing, stays unbound,
+    and keeps the old workspace."""
     spec_text = compose(opts.get("text", ""), opts.get("attachments"))
     project = (opts.get("project") or "").strip()
     if not project:
@@ -1088,19 +1115,45 @@ def run_new(job: Job, opts: dict) -> None:
             or STATE.profile_request
     if profile:
         STATE.set_profile(profile)
-    if mode != "preview":
-        # A real build owns its target: create it up front (parents included)
-        # so workspace.log_event and the scaffold write into a real folder.
+    if mode == "preview":
+        # Nothing is written: a throwaway client on the nearest existing
+        # ancestor's config, and the current workspace stays active.
+        parent = target
+        while not parent.exists() and parent != parent.parent:
+            parent = parent.parent
+        args = args_for(str(parent), profile)
+        cfg = cli_mod._config(args)
+        if "creative" in opts:
+            cfg.creative_mode = bool(opts.get("creative"))
+        client = LLMClient(cfg)
+        client.check(warn=False)
+    else:
+        # A real build owns its target: create it up front (parents included),
+        # then switch the GUI's active root AND session before scaffolding.
+        # The creation turn travels with the switch, so the new project's
+        # session log opens on the very conversation that builds it.
         target.mkdir(parents=True, exist_ok=True)
-    parent = target
-    while not parent.exists() and parent != parent.parent:
-        parent = parent.parent
-    args = args_for(str(parent), profile)
-    cfg = cli_mod._config(args)
-    if "creative" in opts:
-        cfg.creative_mode = bool(opts.get("creative"))
-    client = LLMClient(cfg)
-    client.check(warn=False)
+        transcript = STATE.messages_snapshot()
+        open_project(str(target), profile, announce=False)
+        STATE.carry_transcript(transcript, title=spec_text)
+        job.project_root = str(target)
+        with STATE.lock:
+            cfg, client = STATE.cfg, STATE.client
+        if "creative" in opts:
+            cfg.creative_mode = bool(opts.get("creative"))
+        client.check(warn=False)
+        # An empty index right now (0 files is valid): the page lands on an
+        # indexed workspace immediately, and the post-build refresh picks up
+        # every file the scaffold writes. Built inline because the job slot
+        # is taken (empty_workspace_index would defer to a background job).
+        idx = index_mod.build(STATE.args.paths, cfg, client=None, root=target,
+                              summarise=False,
+                              matcher=cli_mod._matcher(STATE.args, target))
+        with STATE.lock:
+            STATE.idx = idx
+            STATE.agent = Agent(idx, client, cfg)
+            STATE.index_gen += 1
+        STATE.apply_index(idx)
     spec = scaffold.load_spec(prompt=spec_text, max_chars=cfg.max_spec_chars)
     p = SimpleNamespace(cfg=cfg, client=client, root=target)
     with session(p, job, interactive=False, lock=False) as feed:
@@ -1133,26 +1186,14 @@ def run_new(job: Job, opts: dict) -> None:
         STATE.add_message("assistant", f"Project created at {target}.",
                           kind="result", level="ok",
                           stats=_usage_stats(client))
-    # A build/plan/review that created its folder becomes the active project,
-    # so the file tree, index banner and composer bind to it immediately (a
-    # preview writes nothing and stays unbound). The creation turn travels
-    # with the switch: the new project's session log opens on the very
-    # conversation that built it, and the completed job reports the root so
-    # the page can follow without a manual refresh (mode drops back to Task).
+    # The workspace switched before the build; bring the index in line with
+    # what was actually written (the build persists its own index too) and
+    # report the landed state. The completed job reports the root so the page
+    # can follow without a manual refresh (mode drops back to Task).
     if mode != "preview" and target.is_dir():
-        transcript = STATE.messages_snapshot()
-        open_project(str(target), profile, announce=False)
-        STATE.carry_transcript(transcript, title=spec_text)
-        job.project_root = str(target)
-        with STATE.lock:
-            idx = STATE.idx
-        if idx is None:
-            # The build normally persists its own index; a plan-only or
-            # early-stopped run may not have one. Either way the workspace
-            # the page lands on is indexed (0 files is a valid index).
-            build_index(job, summarise=False)
-            with STATE.lock:
-                idx = STATE.idx
+        idx = cli_mod._refresh(STATE.idx, STATE.args, STATE.cfg, target,
+                               verbose=False)
+        _swap_index(idx)
         state = (f"index: {len(idx.files)} files" if idx is not None
                  else "no index yet")
         STATE.add_message("system", f"Opened {target} \u2014 {state}.",

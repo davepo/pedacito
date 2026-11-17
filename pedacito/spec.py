@@ -2599,10 +2599,13 @@ Tailwind CDN in <head>."""
 
 
 REFINE_SYSTEM = """\
-You are a spec architect for an autonomous coding agent. The agent sees ONLY
-your output -- never this conversation -- and a small 9B-35B model will
-implement your spec step by step in fresh contexts. Turn the user's brief
-idea into one unambiguous, immediately actionable specification.
+You are a Principal Product Architect refining a brief idea for an autonomous
+coding agent. The agent sees ONLY your output -- never this conversation --
+and a small 9B-35B model will implement your spec step by step in fresh
+contexts. Turn the user's brief idea into one unambiguous, immediately
+actionable specification with real product craft: a cohesive aesthetic,
+considered interactive states and sensible defaults -- while preserving the
+user's exact filenames, copy, text and links VERBATIM.
 
 Rules:
 - objective: 1-2 sentences stating the concrete end state.
@@ -2628,6 +2631,18 @@ Rules:
 - files: reuse the existing css/script/asset paths the snapshot and the
   TOP-LEVEL ENTRIES line show -- link them, never plan a duplicate
   stylesheet or script beside them.
+- Domain defaults (apply only what the idea's stack implies):
+  * Web page / canvas app: a zero-build site -- index.html + styles.css +
+    script.js, and no package.json or build step the user did not ask for.
+    Specify a cohesive visual direction (palette, typography, spacing) and
+    the interactive states (hover, focus, active, empty, loading) the page
+    must handle.
+  * Desktop GUI: Python stdlib tkinter only, dark flat styling, keyboard
+    bindings for the primary actions, and headless-safe tests
+    (root.withdraw() / root.destroy()) that drive the real button handlers.
+  * Multi-file program: exact module names and single responsibilities, CLI
+    subcommands that each support --help, README examples that match the
+    real flags, and unit tests for the core logic.
 - Never write code bodies; never add options the idea did not ask for. Keep
   the whole spec under 45 lines."""
 
@@ -2890,10 +2905,21 @@ def refine_prompt(prompt: str, root, cfg, llm_client,
         messages = [{"role": "system", "content": system},
                     {"role": "user", "content": user}]
         try:
-            raw = llm_client.chat_json(
-                messages, REFINE_SCHEMA,
-                max_tokens=int(_get(cfg, "max_tokens_answer", 3000)),
-                disable_thinking=True)
+            # Refinement is ALWAYS creative sampling -- temperature 0.6 on a
+            # local server, the provider's native sampling on a hosted API
+            # (which omits the key) -- regardless of the creative-mode
+            # toggle. An already-pinned override (best-of-N) is left alone.
+            import contextlib
+            if hasattr(llm_client, "temperature") \
+                    and getattr(llm_client, "_temp_override", None) is None:
+                temp_cm = llm_client.temperature(0.6)
+            else:
+                temp_cm = contextlib.nullcontext()
+            with temp_cm:
+                raw = llm_client.chat_json(
+                    messages, REFINE_SCHEMA,
+                    max_tokens=int(_get(cfg, "max_tokens_answer", 3000)),
+                    disable_thinking=True)
             if isinstance(raw, dict):
                 data = _norm_refined(raw, prompt)
                 if not data["objective"] and not data["files"] \

@@ -1233,6 +1233,62 @@ def test_new_job_completion_adopts_project_indexes_and_carries_the_turn(
     assert ends and ends[-1]["project_root"] == resolved
 
 
+@pytest.mark.network
+def test_new_switches_workspace_before_scaffolding_starts(
+        gui, fake_port, monkeypatch):
+    """The switch is not a post-build adoption: while the scaffold is STILL
+    running, the active root is already the target -- indexed with 0 files --
+    and the page can poll that state mid-build. Only after the build lands
+    does the refresh pick up the written files."""
+    gui.post("/api/settings/setup", {"base_url": f"http://127.0.0.1:{fake_port}/v1",
+                                     "model": "fake-model", "vram_gb": "8"})
+    target = gui.tmp / "midbuild"
+    gate = threading.Event()
+    seen = {}
+
+    def fake_build(root, cfg, client, spec, **kw):
+        # Entry into the scaffold: the workspace must ALREADY be switched
+        # and indexed-empty (the page follows before the first file lands).
+        state = gui.get("/api/state")[1]
+        seen["root"] = state["root"]
+        seen["has_index"] = state["has_index"]
+        seen["index_files"] = state["index_files"]
+        assert gate.wait(15), "the test never released the build"
+        (root / "main.py").write_text("def main():\n    return 0\n",
+                                      encoding="utf-8")
+        return 0
+
+    monkeypatch.setattr(jobs.scaffold, "run_new", fake_build)
+    status, _ = gui.post("/api/new", {"text": "a tiny demo cli",
+                                      "project": str(target), "build": "build"})
+    assert status == 202
+    resolved = str(target.resolve())
+    try:
+        # mid-build: the page already lives in the new project
+        def switched(s):
+            return s if s["root"] == resolved and s["job"] else None
+
+        state = gui.wait_for(switched, 15)
+        assert state, "the workspace never switched while the build ran"
+        assert state["has_index"] is True
+        assert state["index_files"] == 0
+        assert state["job"]["kind"] == "new"
+        assert state["scratchpad"] is False
+    finally:
+        gate.set()
+    assert gui.wait_idle(30)
+    # what the scaffold saw at entry matches the mid-build page state
+    assert seen["root"] == resolved
+    assert seen["has_index"] is True
+    assert seen["index_files"] == 0
+    state = gui.get("/api/state")[1]
+    assert not state["error"], state["messages"]
+    assert state["index_files"] == 1          # post-build refresh landed
+    assert state["new_project_root"] == resolved
+    # the creation turn lives in the NEW project's thread store
+    assert list((target / ".pedacito" / "gui" / "threads").glob("*.json"))
+
+
 def test_frontend_has_the_new_project_auto_switch_hook():
     """The page wires the backend hook: a finished `new` job adopts the
     project (path box + Task mode + state resync) without a manual refresh,

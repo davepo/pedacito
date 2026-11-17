@@ -148,6 +148,9 @@ Rules:
   value with the code under test -- a mirrored test passes even when the code
   is wrong.
 - Import only from files listed as existing. Never invent a sibling module.
+- A command-line entry point must print its help when run with no arguments
+  (`parser.print_help()`), never crash with a traceback; `--help` works too.
+  Define every subcommand with real flags and sensible example defaults.
 - Do not write any other file, and do not explain yourself."""
 
 AUTO_IMPLEMENT_SYSTEM = """\
@@ -179,6 +182,8 @@ Rules:
   is wrong.
 - Import only from files that exist in the map. Check a sibling's outline if
   you need to know what it exposes.
+- A command-line entry point must print its help when run with no arguments
+  (`parser.print_help()`), never crash with a traceback; `--help` works too.
 - Finish the named work completely; do not wander into other functions or files."""
 
 DOCS_SYSTEM = """\
@@ -200,8 +205,17 @@ Rules:
 - Ground every claim in the project name, the file tree, and the public API
   shown below. Never name a framework or a run/test command that is not in the
   spec or the code.
-- A README covers what the project is, how to install and run it, and how to
-  use it, based on the real entry point. A docs page covers its stated purpose.
+- A README must contain these sections, in order:
+  1. "Overview & Architecture" -- what the project is and how its
+     files/modules fit together (name the real modules and their roles).
+  2. "Quick Start" -- exact copy-pasteable commands: how to run the entry
+     point, and one concrete example for EVERY CLI subcommand the entry point
+     defines, with real flags and plausible argument values taken from the CLI
+     SOURCE below (never invented flags or subcommands).
+  3. "Running Tests" -- the exact command that runs the generated suite
+     (e.g. `python3 -m unittest -v` for unittest tests, `python3 -m pytest -q`
+     for pytest tests), matching the test files that actually exist.
+- A docs page covers its stated purpose.
 - Concise and accurate. No TODOs, no placeholder text, no marketing filler.
 - Do not write any other file, and do not explain yourself."""
 
@@ -1175,6 +1189,34 @@ def build_project(client, cfg, idx, plan: Plan, verbose: bool = True,
     return {"done": done, "noop": noop, "failed": failed, "skipped": skipped}
 
 
+def _cli_source_for_docs(idx, plan: Plan, max_chars: int = 6000) -> str:
+    """The real entry-point source for the docs pass, so README command
+    examples use the exact subcommands and flags the CLI defines instead of
+    invented ones. Planned entry points first, then the usual names."""
+    candidates = ["cli.py", "main.py", "app.py", "__main__.py"]
+    planned = {f.path for f in plan.files}
+    names = [n for n in candidates if n in planned]
+    names += [n for n in candidates if n not in names]
+    parts: list[str] = []
+    total = 0
+    for rel in names:
+        path = idx.root / rel
+        if not path.is_file():
+            continue
+        try:
+            text = fileio.read_text(path, errors="replace")
+        except OSError:
+            continue
+        if not text.strip():
+            continue
+        chunk = text[:max_chars - total]
+        parts.append(f"--- {rel} ---\n{chunk}")
+        total += len(chunk)
+        if total >= max_chars:
+            break
+    return "\n\n".join(parts)
+
+
 def build_docs(client, cfg, idx, plan: Plan, verbose: bool = True,
                backup_dir=None) -> dict:
     """Write the planned Markdown docs against the code that was actually
@@ -1202,6 +1244,7 @@ def build_docs(client, cfg, idx, plan: Plan, verbose: bool = True,
         f"  {f.path}" + (f"  -- {f.purpose}" if f.purpose else "")
         for f in plan.files)
     api = _interface_map(idx, plan, cfg) or "(nothing yet)"
+    cli_src = _cli_source_for_docs(idx, plan)
     max_tokens = getattr(cfg, "max_tokens_build", 8000)
 
     for t in docs:
@@ -1212,25 +1255,35 @@ def build_docs(client, cfg, idx, plan: Plan, verbose: bool = True,
         if verbose:
             print(f"\n--- documenting {t.path} ---", file=sys.stderr)
         stub = fileio.read_text(path, errors="replace")
+        sections = [
+            f"PROJECT: {plan.project_name}",
+            "",
+            f"SPECIFICATION\n{spec[:budget]}",
+            "",
+            "FILE TREE\n" + tree,
+            "",
+            "PUBLIC API (what the code actually exposes)\n" + api,
+        ]
+        if cli_src:
+            sections += [
+                "",
+                "CLI SOURCE (the real entry point -- every README command "
+                "example must use exactly these subcommands and flags)\n"
+                + cli_src,
+            ]
+        sections += [
+            "",
+            f"YOUR FILE: {t.path}",
+            f"Purpose: {t.purpose or 'project documentation'}",
+            f"It currently contains only this placeholder:\n```\n{stub}\n```",
+            "",
+            "Write the complete documentation now, describing what was "
+            "actually built. One search/replace block, empty SEARCH, the "
+            "full file in REPLACE.",
+        ]
         messages = [
             {"role": "system", "content": DOCS_SYSTEM + "\n\n" + ANSWER_SYSTEM},
-            {"role": "user", "content": "\n".join([
-                f"PROJECT: {plan.project_name}",
-                "",
-                f"SPECIFICATION\n{spec[:budget]}",
-                "",
-                "FILE TREE\n" + tree,
-                "",
-                "PUBLIC API (what the code actually exposes)\n" + api,
-                "",
-                f"YOUR FILE: {t.path}",
-                f"Purpose: {t.purpose or 'project documentation'}",
-                f"It currently contains only this placeholder:\n```\n{stub}\n```",
-                "",
-                "Write the complete documentation now, describing what was "
-                "actually built. One search/replace block, empty SEARCH, the "
-                "full file in REPLACE.",
-            ])},
+            {"role": "user", "content": "\n".join(sections)},
         ]
         try:
             reply = client.chat(messages, max_tokens=max_tokens, stream=verbose,
@@ -1747,6 +1800,12 @@ def _web_contract_gate(root: Path, cfg, client, idx, plan: Plan,
     return web_errors
 
 
+# The exact notice shown when a multi-module prompt auto-enables Complex
+# scaffolding (the GUI activity feed and the TUI render this same text).
+COMPLEX_AUTO_NOTICE = ("Auto-enabled Complex scaffolding "
+                       "(detected multi-module architecture).")
+
+
 def run_new(root: Path, cfg, client, spec: Spec, *, apply: bool = False,
             review: bool = False, plan_only: bool = False, force: bool = False,
             verbose: bool = True, complex: bool = False, verify: str = "",
@@ -1781,6 +1840,17 @@ def run_new(root: Path, cfg, client, spec: Spec, *, apply: bool = False,
                   file=sys.stderr)
             return 2
 
+    # A prompt that names a multi-module architecture (>=3 source files,
+    # "across four files", "multi-module", ...) upgrades to Complex on its
+    # own; an explicit user check is never overridden or downgraded.
+    auto_complex = False
+    if not complex:
+        from . import loop as loop_mod
+        if loop_mod.detect_complex_scaffold(spec.text):
+            complex = True
+            auto_complex = True
+            print(COMPLEX_AUTO_NOTICE, file=sys.stderr)
+
     wants_skeleton = plan_only or apply or review
     # BUG-303: the `new` path never attached an EventLog, so the most expensive
     # operation in a hunt left no per-call record (tokens, cache hits, finish
@@ -1794,6 +1864,8 @@ def run_new(root: Path, cfg, client, spec: Spec, *, apply: bool = False,
         elog.emit("session_start", cmd="new", model=getattr(cfg, "model", ""),
                   apply=bool(apply), review=bool(review),
                   plan_only=bool(plan_only), complex=bool(complex))
+        if auto_complex:
+            elog.emit("complex_auto", text=COMPLEX_AUTO_NOTICE)
     design_doc = None
     if design:
         from . import design as design_mod
@@ -2136,6 +2208,29 @@ def _run_complex(root: Path, cfg, client, idx, plan: Plan, spec: Spec, *,
                                         "ERROR")
                     if code == 0:
                         code = 1
+
+    # The loop implemented the sources in fresh contexts; the planned docs
+    # (the README) are still skeleton stubs. Describe the real project with
+    # the same pass the standard build uses, and let a failed doc reach the
+    # exit code. A README the skeleton added as an extra (not in the plan)
+    # is documented too.
+    doc_plan = plan
+    if not plan.no_extras and (root / "README.md").is_file() \
+            and not any(f.path.lower() in ("readme.md", "docs/readme.md")
+                        for f in plan.files):
+        doc_plan = Plan(plan.project_name, plan.summary,
+                        [*plan.files,
+                         PlannedFile("README.md", "project README")],
+                        spec=plan.spec, no_extras=plan.no_extras)
+    docs_backup = (workspace.new_backup_dir(root, workspace.stamp())
+                   if cfg.backup else None)
+    docs_summary = build_docs(client, cfg, idx, doc_plan, verbose=verbose,
+                              backup_dir=docs_backup)
+    if docs_summary["done"] and verbose:
+        print(f"  documented {len(docs_summary['done'])} file(s)",
+              file=sys.stderr)
+    if docs_summary["failed"] and code == 0:
+        code = 1
 
     if cfg.log_sessions:
         p = workspace.write_session(root, f"new: {plan.project_name}",

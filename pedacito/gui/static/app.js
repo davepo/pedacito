@@ -1063,6 +1063,18 @@ async function send(forceAuto) {
     : PDC.startRun(body);
   starter.then((r) => {
     if (r.ok) {
+      // A real New build switches the workspace on the server IMMEDIATELY
+      // (before scaffolding): follow it now -- path box + state resync -- so
+      // the build's progress streams into the new project's session, and
+      // reset the one-shot Complex checkbox (it never carries to a next run).
+      if (S.mode === 'new' && body.build !== 'preview') {
+        const el = document.getElementById('path');
+        if (el && document.activeElement !== el) el.value = body.project;
+        S.opts.new = S.opts.new || {};
+        S.opts.new.complex = false;
+        saveOpts();
+        refreshState();
+      }
       S.drafts[S.mode] = '';
       if (inputEl) inputEl.value = '';
       clearDraft();
@@ -2263,11 +2275,37 @@ function CalibrationBadge(props) {
 // The live telemetry footer: context window fill, last turn and session
 // tokens, generation speed, KV cache hit, folds, and who is answering.
 // Click it to unfold the drawer with the full breakdown.
+// Live LLM heartbeat: while a request is in flight the server reports
+// llm_call = {provider, model, phase, started}; a pulsing dot plus a 1s JS
+// timer shows who is thinking and for how long ("🧠 DeepSeek (deepseek-
+// reasoner) is thinking & generating... (24s elapsed)"). The matching `call`
+// event clears it, so it never outlives the request it describes.
+function LlmHeartbeat() {
+  const call = S.status.llm_call;
+  const started = call && call.started;
+  const [, tick] = useState(0);
+  useEffect(() => {
+    if (!started) return undefined;
+    const id = setInterval(() => tick((x) => x + 1), 1000);
+    return () => clearInterval(id);
+  }, [started]);
+  if (!started) return null;
+  const secs = Math.max(0, Math.floor(Date.now() / 1000 - started));
+  const who = call.provider || 'The model';
+  const model = call.model ? ' (' + call.model + ')' : '';
+  return html`<span class="llm-heartbeat" id="llmHeartbeat"
+                    title=${'phase: ' + (call.phase || 'call')}>
+    <i class="llm-pulse"></i>\u{1F9E0} ${who}${model} is thinking & generating... (${secs}s elapsed)</span>`;
+}
+
 function TelemetryBar() {
   const s = S.status;
   const [open, setOpen] = useState(false);
   const t = s.telemetry || {};
-  if (!s.root || !t.context_tokens) return null;
+  // Visible during any live run or in-flight LLM call even before the first
+  // usage lands (a fresh New project has no context window reported yet).
+  const live = !!s.job || !!(s.llm_call && s.llm_call.started);
+  if ((!s.root || !t.context_tokens) && !live) return null;
   const pct = Number(t.context_utilization_pct || 0);
   const heat = pct > 85 ? 'hot' : pct >= 70 ? 'warm' : 'cool';
   const role = t.active_model_role || {};
@@ -2279,13 +2317,16 @@ function TelemetryBar() {
     <div class="tele-drawer" id="teleDrawer">
       <div class="tele-grid">
         <div><span class="muted">Last turn</span><b>${PDC.fmtInt(t.last_prompt_tokens)} in / ${PDC.fmtInt(t.last_completion_tokens)} out</b></div>
+        <div><span class="muted">Last turn total</span><b>${PDC.fmtInt(t.last_total_tokens)} tokens \u00B7 ${PDC.fmtInt(t.last_reasoning_tokens)} reasoning</b></div>
         <div><span class="muted">Latency</span><b>${fmt1(t.last_elapsed_s)} s</b></div>
         <div><span class="muted">Speed (last / avg)</span><b>${fmt1(t.last_tok_per_s)} / ${fmt1(t.avg_tok_per_s)} tok/s</b></div>
         <div><span class="muted">Context window</span><b>${PDC.fmtInt(t.context_tokens)} tokens (${s.context_origin || 'default'})</b></div>
         <div><span class="muted">Session</span><b>${PDC.fmtInt(u.calls)} calls \u00B7 ${PDC.fmtTokens(u.tokens_in)} in / ${PDC.fmtTokens(u.tokens_out)} out \u00B7 ${Math.round(u.seconds || 0)}s</b></div>
+        <div><span class="muted">Session total</span><b>${PDC.fmtInt(t.session_total_tokens)} tokens \u00B7 ${PDC.fmtInt(t.session_reasoning_tokens)} reasoning</b></div>
         <div><span class="muted">KV cache hit</span><b>${fmt1(t.cache_hit_pct)}%</b></div>
         <div><span class="muted">Context folds</span><b>${s.folds || 0}</b></div>
         <div><span class="muted">Cost</span><b>${u.cost ? '$' + Number(u.cost).toFixed(4) : '\u2014'}</b></div>
+        <div><span class="muted">Provider</span><b>${t.provider || '\u2014'}</b></div>
         <div><span class="muted">Active model</span><b>${activeName} (${activeTag})</b></div>
         <div><span class="muted">Orchestrator</span><b>${s.planner_profile || '\u2014'}</b></div>
         ${s.scout_profile ? html`<div><span class="muted">Scout</span><b>${s.scout_profile}</b></div>` : null}
@@ -3493,6 +3534,7 @@ function App() {
             <h2>${S.mode === 'how' ? 'How / Help' : 'Chat'}</h2>
             <span class="muted small-text grow" id="busyLbl">
               ${s.job ? (s.job.cancelled ? 'stopping\u2026' : s.job.title + '\u2026') : ''}</span>
+            <${LlmHeartbeat} />
             ${S.mode === 'how' ? html`<span class="muted small-text">CLI commands \u00b7 GUI paths \u00b7 settings</span>` : null}
             ${dm === 'collapsed' ? html`
               <button class="small primary" id="diffPill" title="show the staged diff beside the chat"

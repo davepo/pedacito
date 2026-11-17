@@ -3573,35 +3573,46 @@ def _main(argv=None) -> int:
             spec = scaffold.load_spec(
                 prompt=args.task, spec_file=args.spec,
                 max_chars=cfg.max_spec_chars)
-            if getattr(args, "refine", False):
-                spec.text = _refine_task_text(cfg, client, root, spec.text,
-                                              "new")
-            _new_verify = (args.verify
-                           if getattr(args, "verify", None) is not None
-                           else cfg.auto_verify)
-            if _new_verify and loop._task_named_tests(_new_verify):
-                # BUG-1006: same consent stamp as `auto` above.
-                cfg._tests_user_consent = True
-            code = scaffold.run_new(
-                root, cfg, client, spec,
-                apply=args.apply, review=args.review,
-                plan_only=args.plan_only, force=args.force,
-                verbose=True, complex=args.complex,
-                verify=_new_verify,
-                repair_rounds=args.repair if getattr(args, "repair", None) is not None
-                else cfg.auto_repair_rounds,
-                max_tasks=args.max_tasks if getattr(args, "max_tasks", None) is not None
-                else cfg.auto_max_tasks,
-                max_minutes=args.max_minutes
-                if getattr(args, "max_minutes", None) is not None
-                else cfg.auto_max_minutes,
-                keep_going=args.keep_going,
-                design=bool(getattr(args, "design", False)),
-                auto_install=bool(getattr(args, "auto_install", False)
-                                  or cfg.auto_install_deps))
-            s = client.stats
-            print(f"\n[{s['calls']} calls, {s['completion_tokens']} tokens out, "
-                  f"{s['seconds']:.0f}s]", file=sys.stderr)
+            # One run-scoped collector covers refine + plan + skeleton +
+            # implementation, so the closing line aggregates the whole build.
+            events_mod.begin_run()
+            try:
+                if getattr(args, "refine", False):
+                    spec.text = _refine_task_text(cfg, client, root, spec.text,
+                                                  "new")
+                _new_verify = (args.verify
+                               if getattr(args, "verify", None) is not None
+                               else cfg.auto_verify)
+                if _new_verify and loop._task_named_tests(_new_verify):
+                    # BUG-1006: same consent stamp as `auto` above.
+                    cfg._tests_user_consent = True
+                code = scaffold.run_new(
+                    root, cfg, client, spec,
+                    apply=args.apply, review=args.review,
+                    plan_only=args.plan_only, force=args.force,
+                    verbose=True, complex=args.complex,
+                    verify=_new_verify,
+                    repair_rounds=args.repair if getattr(args, "repair", None) is not None
+                    else cfg.auto_repair_rounds,
+                    max_tasks=args.max_tasks if getattr(args, "max_tasks", None) is not None
+                    else cfg.auto_max_tasks,
+                    max_minutes=args.max_minutes
+                    if getattr(args, "max_minutes", None) is not None
+                    else cfg.auto_max_minutes,
+                    keep_going=args.keep_going,
+                    design=bool(getattr(args, "design", False)),
+                    auto_install=bool(getattr(args, "auto_install", False)
+                                      or cfg.auto_install_deps))
+            finally:
+                run_summary = events_mod.end_run()
+            line = events_mod.run_line(run_summary)
+            if line:
+                print("\n" + line, file=sys.stderr)
+            else:
+                s = client.stats
+                print(f"\n[{s['calls']} calls, "
+                      f"{s['completion_tokens']} tokens out, "
+                      f"{s['seconds']:.0f}s]", file=sys.stderr)
             return code
 
         if args.cmd == "index":
@@ -3837,7 +3848,16 @@ def _main(argv=None) -> int:
             return 0
 
         if args.cmd == "auto":
-            code = _cmd_auto(args, cfg, client, idx, root)
+            # One run-scoped collector covers refine + planning + every task
+            # + post-run verification; the closing line aggregates the run.
+            events_mod.begin_run()
+            try:
+                code = _cmd_auto(args, cfg, client, idx, root)
+            finally:
+                run_summary = events_mod.end_run()
+            line = events_mod.run_line(run_summary)
+            if line:
+                print("\n" + line, file=sys.stderr)
             strict = _strict_replay_error(args, client)
             if strict:
                 print(f"ERROR: {strict}", file=sys.stderr)

@@ -111,7 +111,7 @@ _TAB_PREFIX = {
     "/cre": "/creative ",
 }
 _SLASH_COMMANDS = [
-    "/help", "/keys", "/status", "/telemetry", "/auto", "/auto!", "/plan",
+    "/help", "/keys", "/status", "/telemetry", "/new", "/auto", "/auto!", "/plan",
     "/consolidate", "/compact", "/profile", "/profiles", "/model",
     "/auto-route", "/think", "/creative", "/apply", "/skills", "/memory", "/procs",
     "/diff", "/undo", "/reset", "/sidebar", "/scroll", "/mouse", "/clear",
@@ -151,6 +151,9 @@ Pedacito TUI commands
   /help                     this list and the keyboard shortcuts
   /keys                     detailed keybindings and mouse modes
   /status  /telemetry       full telemetry table and per-call-site tokens
+  /new DIR PROMPT           scaffold a brand-new project in DIR and switch
+                            this session into it before the build starts
+                            (Complex scaffolding auto-detected from PROMPT)
   /auto GOAL                plan GOAL, then run every task with live updates
                             (single-pass edits get a Task-mode suggestion
                             first; Enter/y accepts, n keeps Auto)
@@ -1198,7 +1201,20 @@ class TuiSession:
         if not self._remember_event(kind, fields, source):
             return
         kind = str(kind or "")
-        if kind == "step":
+        if kind == "llm_start":
+            provider = str(fields.get("provider") or "")
+            model = str(fields.get("model") or "")
+            label = (f"{provider}/{model}" if provider and model
+                     else model or provider or "model")
+            phase = str(fields.get("phase") or "")
+            tail = f" ({phase})" if phase else ""
+            self.activity.append(f"[llm] Waiting for {label}...{tail}")
+        elif kind == "complex_auto":
+            text = str(fields.get("text") or "")
+            if text:
+                self.activity.append(text)
+                self._append(text, "system")
+        elif kind == "step":
             action = str(fields.get("action") or "step")
             detail = str(fields.get("detail") or fields.get("file") or "")
             if fields.get("file") and fields.get("file") not in detail:
@@ -1911,14 +1927,20 @@ class TuiSession:
 
     # --------------------------------------------------------------- tasks
     def _run_in_worker(self, work) -> dict:
-        holder: dict = {"result": None, "error": None}
+        holder: dict = {"result": None, "error": None, "telemetry": {}}
         self._start_watcher()
 
         def runner():
+            # One run-scoped collector per task: every LLM call folds into it
+            # (events.note_call) so the closing aggregate covers exactly this
+            # run, never a previous one.
+            events_mod.begin_run()
             try:
                 holder["result"] = work()
             except BaseException as exc:          # shown, never silently lost
                 holder["error"] = exc
+            finally:
+                holder["telemetry"] = events_mod.end_run()
 
         thread = threading.Thread(target=runner, name="pdc-tui-task",
                                   daemon=True)
@@ -1954,6 +1976,13 @@ class TuiSession:
             snapshot["session_completion_tokens"],
             snapshot["folds"])
         self._dirty = True
+
+    def _report_run_telemetry(self, holder: dict) -> None:
+        """The closing aggregate line after a run -- the same `[run: ...]`
+        text the CLI prints, so both surfaces tell one tokens/speed story."""
+        line = events_mod.run_line(holder.get("telemetry") or {})
+        if line:
+            self._append(line, "receipt")
 
     def _record_result(self, task: str, tr) -> None:
         def field(row, name, default=None):
@@ -2032,9 +2061,11 @@ class TuiSession:
             else:
                 self._append(f"ERROR: {type(error).__name__}: {error}",
                              "error")
+            self._report_run_telemetry(holder)
             self._redraw(force=True)
             return
         self._record_result(task, holder.get("result"))
+        self._report_run_telemetry(holder)
         self._redraw(force=True)
 
     def _auto_with_nudge(self, goal: str) -> None:
@@ -2116,6 +2147,123 @@ class TuiSession:
                 self._append(f"auto finished with exit code {result}",
                              "system")
             self._append("auto loop finished", "system")
+        self._report_run_telemetry(holder)
+        self._sync_telemetry()
+        self._redraw(force=True)
+
+    def run_new(self, arg: str) -> None:
+        """`/new DIR PROMPT`: scaffold a brand-new project, switching this
+        session's active root into DIR BEFORE the first LLM call -- the same
+        lifecycle as the GUI's New and `pdc new`. Complex scaffolding is
+        auto-detected from the prompt (never a sticky toggle)."""
+        from . import scaffold
+
+        parts = str(arg or "").strip().split(None, 1)
+        if len(parts) < 2 or not parts[1].strip():
+            self._append("Usage: /new <dir> <prompt>", "error")
+            self._redraw(force=True)
+            return
+        target = Path(parts[0]).expanduser()
+        if not target.is_absolute():
+            target = self.root / target
+        target = target.resolve()
+        prompt = " ".join(parts[1].split())
+        if target.is_dir():
+            entries = sorted(p.name for p in target.iterdir()
+                             if not scaffold.is_harness_owned(p.name))
+            if entries:
+                shown = ", ".join(entries[:8])
+                more = f" (+{len(entries) - 8} more)" if len(entries) > 8 else ""
+                self._append(f"ERROR: {target} is not empty ({shown}{more}). "
+                             "New projects start in a fresh directory.",
+                             "error")
+                self._redraw(force=True)
+                return
+        target.mkdir(parents=True, exist_ok=True)
+        # Switch the workspace FIRST: rebind the event log so every
+        # llm_start/call of the build lands in the new project's session.
+        try:
+            if self._listener in self.elog.listeners:
+                self.elog.listeners.remove(self._listener)
+        except Exception:
+            pass
+        self.root = target
+        self.elog = events_mod.get(target, self.cfg)
+        try:
+            self.elog.listeners.append(self._listener)
+        except Exception:
+            pass
+        self._event_path = None
+        self._event_offset = 0
+        self._recent_events = {}
+        self._init_event_tail()
+        if self.client is not None:
+            try:
+                events_mod.attach(self.client, self.elog)
+            except Exception:
+                pass
+        # Fresh session state: an empty index right now (0 files is valid),
+        # rebuilt from disk once the scaffold has landed its files.
+        self.agent = None
+        self.modified = []
+        self.resume_context = ""
+        try:
+            workspace.ensure(target, self.cfg.manage_gitignore,
+                             self.cfg.create_ignore_file)
+            self.idx = index_mod.build([str(target)], self.cfg, client=None,
+                                       root=target, summarise=False,
+                                       verbose=False)
+        except (SystemExit, Exception):
+            self.idx = index_mod.Index(target, [])
+        self._append(f"switched workspace to {target}", "system")
+        client = self._ensure_client()
+        cfg = self.cfg
+        self._append(f"running new on {cfg.model} ...", "system")
+        self._refresh_warmup(client)
+        spec = scaffold.load_spec(prompt=prompt,
+                                  max_chars=cfg.max_spec_chars)
+        verify = cfg.auto_verify
+        if verify and loop._task_named_tests(verify):
+            cfg._tests_user_consent = True
+
+        def work():
+            workspace.log_event(target, "command: tui new")
+            return scaffold.run_new(
+                target, cfg, client, spec, apply=True, verbose=True,
+                complex=False, verify=verify,
+                repair_rounds=cfg.auto_repair_rounds,
+                max_tasks=cfg.auto_max_tasks,
+                max_minutes=cfg.auto_max_minutes,
+                auto_install=cfg.auto_install_deps)
+
+        holder = self._run_in_worker(work)
+        error = holder.get("error")
+        if error is not None:
+            if not isinstance(error, KeyboardInterrupt):
+                self._append(f"ERROR: {error}", "error")
+        else:
+            code = holder.get("result")
+            if code == 0:
+                self._append(f"Project created at {target}.", "system")
+            else:
+                self._append(f"new finished with exit code {code}", "error")
+        # Bring the session's index in line with what the scaffold wrote so
+        # the next plain-text task sees every new file (the same refresh the
+        # GUI runs after a New build).
+        try:
+            from types import SimpleNamespace
+            from . import cli as cli_mod
+            base = index_mod.Index.load(target)
+            if base is None:
+                base = self.idx if self.idx is not None \
+                    else index_mod.Index(target, [])
+            self.idx = cli_mod._refresh(
+                base, SimpleNamespace(paths=[str(target)]), cfg, target,
+                verbose=False)
+        except (SystemExit, Exception):
+            pass
+        self.agent = None
+        self._report_run_telemetry(holder)
         self._sync_telemetry()
         self._redraw(force=True)
 
@@ -2197,6 +2345,9 @@ class TuiSession:
             if self.agent is not None:
                 self.agent.cfg = self.cfg
             self._append(f"max_steps = {n}", "system")
+            return
+        if cmd == "new":
+            self.run_new(arg)
             return
         if cmd == "auto":
             self._auto_with_nudge(arg)

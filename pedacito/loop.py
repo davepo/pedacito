@@ -644,6 +644,36 @@ def _mode_module_hits(low: str) -> set[str]:
     return hits
 
 
+# Multi-module phrasing: "multi-module", "across four files", "split into
+# three modules", "spanning 5 files" -- an architecture ask in words even
+# when no filenames are spelled out.
+_COMPLEX_COUNT_WORDS = "three|four|five|six|seven|eight|nine|ten"
+_COMPLEX_PHRASE_RE = re.compile(
+    r"(?<!\w)multi[-\s]?module(?![\w-])"
+    rf"|(?<!\w)(?:across|in|into|over|spanning)\s+"
+    rf"(?:{_COMPLEX_COUNT_WORDS}|[3-9]|\d{{2,}})\s+(?:files|modules)(?![\w-])"
+    rf"|(?<!\w)(?:{_COMPLEX_COUNT_WORDS})\s+(?:files|modules)(?![\w-])",
+    re.IGNORECASE)
+
+
+def detect_complex_scaffold(text: str) -> bool:
+    """True when a New/Auto prompt describes a multi-module architecture:
+    explicit multi-module phrasing, >=3 distinct source files named, or a
+    build verb with >=3 module words. Deterministic, zero LLM calls; used to
+    auto-enable Complex scaffolding (an explicit user choice always wins)."""
+    low = str(text or "").lower()
+    if not low.strip():
+        return False
+    if _COMPLEX_PHRASE_RE.search(low):
+        return True
+    names = {t.rsplit("/", 1)[-1] for t in _mode_file_mentions(low)
+             if "." + t.rsplit(".", 1)[-1] in _MODE_SOURCE_EXTS}
+    if len(names) >= 3:
+        return True
+    return bool(_MODE_BUILD_VERBS_RE.search(low)) \
+        and len(_mode_module_hits(low)) >= 3
+
+
 def evaluate_mode_suitability(
     task: str,
     root: Path | None,
@@ -678,6 +708,13 @@ def evaluate_mode_suitability(
     builds = bool(_MODE_BUILD_VERBS_RE.search(low))
     # Explicit overrides: the user asked for planning or a big new build.
     if any(p in low for p in _MODE_OVERRIDE_PHRASES):
+        return verdict
+    # A multi-module architecture ask keeps Auto -- but naming >=3 files
+    # that ALL already exist is a multi-file edit, not a new scaffold: the
+    # upgrade needs new files, architecture phrasing or a build verb.
+    if detect_complex_scaffold(text) and (
+            new_files or not existing
+            or _COMPLEX_PHRASE_RE.search(low) or builds):
         return verdict
     if len(new_files) >= 4 or (builds and len(modules) >= 4):
         return verdict
@@ -972,6 +1009,18 @@ task. A no-build site gets complete browser-valid CSS -- never raw
 the Tailwind CDN script with utility classes)."""
 
 
+GREENFIELD_PLAN_NOTE = """\
+GREENFIELD PROJECT -- the workspace has no source files yet; this goal builds
+it from scratch. The one exception to the no-documentation-chores rule: include
+exactly one task that writes a real README.md, placed AFTER the code tasks so
+it documents what was actually built. That README must contain an Overview &
+Architecture section, a Quick Start with exact copy-pasteable commands for
+every CLI subcommand (concrete example arguments and the real flags), and a
+Running Tests section with the exact test command (e.g. `python3 -m unittest
+-v`). Any command-line entry point must print its help (`parser.print_help()`)
+when run with no arguments instead of crashing with a traceback."""
+
+
 PLAN_SYSTEM = """\
 You break a software goal into a small, ordered list of single-focus
 implementation tasks for an autonomous coding loop. The loop will implement
@@ -1133,6 +1182,8 @@ def generate_tasks(spec_text: str, client, cfg,
     plan_system = PLAN_SYSTEM
     if _simple_web_goal(body):
         plan_system += "\n\n" + WEB_PLAN_NOTE
+    if root is not None and not _mode_check_files(root):
+        plan_system += "\n\n" + GREENFIELD_PLAN_NOTE
     notes = instructions_mod.render(root, cfg) if root is not None else ""
     if notes:
         plan_system += "\n\n" + notes

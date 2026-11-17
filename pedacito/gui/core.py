@@ -302,6 +302,9 @@ class Job:
         # A completed `new` job reports the project it created, so the page
         # can adopt the workspace without a manual refresh (see end_job).
         self.project_root = ""
+        # The run's aggregated LLM telemetry (events.end_run), filled when
+        # the worker finishes: tokens, elapsed, speed, model, provider.
+        self.telemetry: dict = {}
 
 
 class Review:
@@ -495,6 +498,10 @@ class State:
         # Context folds in the current run (the telemetry footer's counter);
         # reset when a fresh run claims the job slot.
         self.folds = 0
+        # Live LLM heartbeat: {provider, model, phase, started} while a
+        # request is in flight (set by the `llm_start` event, cleared by
+        # `call`); the page renders a pulsing indicator with an elapsed timer.
+        self.llm_call: dict = {}
 
     # --- project & index auto-detect --------------------------------------------
 
@@ -985,6 +992,7 @@ class State:
                 self.gather_steps = 0
                 self.actions.clear()
                 self.folds = 0
+                self.llm_call = {}
             job = self.job
         self.bus.publish("job", job=job.id, state="start", kind=kind,
                          title=title)
@@ -993,6 +1001,7 @@ class State:
     def end_job(self, job: Job, error: str = "") -> None:
         with self.lock:
             job.active = False
+            self.llm_call = {}      # no request outlives its job's indicator
             if error:
                 self.error = error
             if job.kind in RUN_KINDS:
@@ -1008,6 +1017,22 @@ class State:
         """Fold one harness event (the agent's EventLog listener) into the
         activity telemetry: the live phase and a recent tool-action feed.
         Only a phase change or a recorded action pings the page."""
+        if kind == "llm_start":
+            # Heartbeat on: a request just left for the model. The page's
+            # timer ticks from `started` until the matching `call` lands.
+            with self.lock:
+                self.llm_call = {
+                    "provider": str(f.get("provider") or ""),
+                    "model": str(f.get("model") or ""),
+                    "phase": str(f.get("phase") or ""),
+                    "started": time.time()}
+            self.bus.publish("status")
+            return
+        if kind == "call":
+            with self.lock:
+                self.llm_call = {}
+            self.bus.publish("status")
+            return
         action = None
         step_n = None
         if kind == "step":
@@ -1507,6 +1532,12 @@ class State:
             meta = self.index_meta
             indexed = idx is not None or meta["indexed"]
             job = self.job if self.job is not None and self.job.active else None
+            if client is None and self.job is not None \
+                    and self.job.client is not None:
+                # The scratchpad Ask answers on its own throwaway client
+                # (no project, so STATE.client stays None); the panel keeps
+                # showing that client's last-call numbers after the job.
+                client = self.job.client
             stats = dict(client.stats) if client is not None else {}
             # Live telemetry for the footer: the worker client's snapshot,
             # overridden by the specialist's own last-call numbers while a
@@ -1592,6 +1623,9 @@ class State:
                          "started": job.started,
                          "cancelled": job.cancelled,
                          "project_root": job.project_root} if job else None),
+                # Live LLM heartbeat ({provider, model, phase, started} while
+                # a request is in flight, else {}): the pulsing indicator.
+                "llm_call": dict(self.llm_call),
                 # The last completed New project: the page's fallback hook
                 # for adopting the workspace when the SSE end event was missed.
                 "new_project_root": self.new_project_root,

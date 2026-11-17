@@ -80,6 +80,36 @@ def provider_for(base_url: str, model: str = "") -> Provider:
     return Provider(cache_mode="implicit")
 
 
+# Human-facing brand names for the heartbeat / telemetry label, matched by
+# substring on the host (same convention as the provider table above).
+_FRIENDLY_NAMES: dict[str, str] = {
+    "api.deepseek.com": "DeepSeek",
+    "api.openai.com": "OpenAI",
+    "api.anthropic.com": "Anthropic",
+    "dashscope": "Alibaba DashScope",
+    "api.moonshot.cn": "Moonshot",
+    "generativelanguage.googleapis.com": "Google Gemini",
+    "api.x.ai": "xAI",
+    "api.groq.com": "Groq",
+}
+
+
+def provider_label(base_url: str, provider: str = "") -> str:
+    """A friendly name for the endpoint serving a call: the brand for a known
+    hosted API, else the configured provider name, else "local server" for
+    loopback / `.local` hosts, else the bare host."""
+    host = _host(base_url)
+    for key, name in _FRIENDLY_NAMES.items():
+        if key in host:
+            return name
+    if provider:
+        return provider
+    if not host or host in ("localhost", "127.0.0.1", "::1") \
+            or host.endswith(".local"):
+        return "local server"
+    return host
+
+
 def cache_mode_for(cfg) -> str:
     """The effective prompt_cache mode for `cfg`: an explicit setting always
     wins; "auto" means the provider table decides."""
