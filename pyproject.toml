@@ -1,7 +1,8 @@
 [project]
-name = "pedacito-local"
+name = "pedacito"
 version = "0.2.0"
-description = "Index-and-lookup intermediary for coding with a local LLM"
+description = "Local-first AI coding harness and multi-model specialist orchestrator"
+readme = "README.md"
 requires-python = ">=3.11"   # tomllib
 license = {file = "LICENSE"}
 classifiers = [
@@ -28,6 +29,11 @@ dependencies = [
     # and the auto loop's --diagnostics.
     "ruff>=0.5",
 ]
+
+[project.urls]
+Homepage = "https://github.com/davepo/pedacito"
+Repository = "https://github.com/davepo/pedacito"
+Issues = "https://github.com/davepo/pedacito/issues"
 
 [project.scripts]
 pedacito = "pedacito.cli:main"

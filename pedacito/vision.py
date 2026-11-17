@@ -16,7 +16,7 @@ text it can act on:
   * OCR text when `tesseract` is installed,
   * an optional description from a multimodal model (`vision_model`).
 
-Pillow is an optional dependency (`pip install pedacito-local[vision]`). It is
+Pillow is an optional dependency (`pip install pedacito[vision]`). It is
 needed for pixel analysis and for the portable ImageGrab capture path; without
 it, capture can still use native tools and OCR still works.
 """
@@ -78,7 +78,7 @@ def capture(path) -> tuple[bool, str]:
         if ok and path.exists():
             return True, "PowerShell CopyFromScreen"
         return False, ("no capture backend. Install Pillow "
-                       "(pip install pedacito-local[vision]) or use Windows "
+                       "(pip install pedacito[vision]) or use Windows "
                        "screenshot tools. " + out[:200])
 
     if shutil.which("screencapture"):            # macOS
@@ -103,7 +103,7 @@ def capture(path) -> tuple[bool, str]:
         if ok and path.exists():
             return True, Path(cmd[0]).name
     return False, ("no screenshot backend found. Install Pillow "
-                   "(pip install pedacito-local[vision]), grim (Wayland), "
+                   "(pip install pedacito[vision]), grim (Wayland), "
                    "scrot/ImageMagick (X11), or gnome-screenshot.")
 
 
@@ -162,7 +162,7 @@ def analyze(path, previous=None) -> str:
     pillow = _pillow()
     if pillow is None:
         msg = ("Screenshot saved, but Pillow is not installed, so pixel "
-               "analysis is unavailable (pip install pedacito-local[vision]).")
+               "analysis is unavailable (pip install pedacito[vision]).")
         if ocr_text:
             msg += "\n\nOCR text:\n" + ocr_text
         return msg

@@ -4331,7 +4331,7 @@ def tool_browser(index, cfg, client, command: str = "", pattern: str = "",
     if not getattr(cfg, "allow_browser", False):
         return ("ERROR: `browser` is disabled (config allow_browser = false). "
                 "Enable it and install the browser extra:\n"
-                "  pip install \"pedacito-local[browser]\"\n"
+                "  pip install \"pedacito[browser]\"\n"
                 "  python -m playwright install chromium")
     cmd = _as_text(command).strip()
     actions = _as_text(pattern).strip()

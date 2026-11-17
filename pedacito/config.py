@@ -415,7 +415,7 @@ class Config:
     # Let the gather loop open a URL in a headless browser, interact, capture
     # the page and read its text. Can reach any http(s) URL: a trust decision
     # like allow_shell. Needs the optional Playwright install:
-    #   pip install "pedacito-local[browser]"
+    #   pip install "pedacito[browser]"
     #   python -m playwright install chromium
     allow_browser: bool = False
     # Seconds to wait after navigation/interaction before capturing.

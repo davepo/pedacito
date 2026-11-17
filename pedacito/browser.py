@@ -3,7 +3,7 @@
 Navigates to a URL, presses keys/clicks/evaluates JS, waits, and captures the
 page using Playwright (an optional extra)::
 
-    pip install "pedacito-local[browser]"
+    pip install "pedacito[browser]"
     python -m playwright install chromium
 
 Without Playwright, a system Chrome/Chromium `--headless --screenshot` fallback
@@ -99,7 +99,7 @@ def install_hint() -> str:
     """Actionable error text when no browser backend is present."""
     return ("Browser automation is not installed. Install Playwright and a "
             "Chromium build:\n"
-            "  pip install \"pedacito-local[browser]\"\n"
+            "  pip install \"pedacito[browser]\"\n"
             "  python -m playwright install chromium\n"
             "A system Chrome/Chromium enables a navigation-only fallback "
             "(no key presses or clicks). Without either, do NOT treat a "
@@ -290,7 +290,7 @@ def run(url: str, *, actions: str = "", wait: float = 3.0, out=None,
         return False, ("A system Chrome/Chromium can load and capture a page, "
                        "but cannot press keys, click, or run scripts. "
                        "Install Playwright for interactions:\n"
-                       "  pip install \"pedacito-local[browser]\"\n"
+                       "  pip install \"pedacito[browser]\"\n"
                        "  python -m playwright install chromium")
     return _run_chrome(exe, url, wait=wait, out=out, timeout=timeout)
 
