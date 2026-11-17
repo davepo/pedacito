@@ -272,6 +272,19 @@ command builds the same projects and writes the same reports.
 
 Requires Python 3.11+.
 
+Quick install from PyPI (0.2.0):
+
+```bash
+pip install pedacito                     # Windows: py -m pip install pedacito
+pipx install pedacito                    # isolated CLI install, recommended for a tool
+pip install "pedacito[browser,vision]"   # browser verification (Playwright) + screenshot analysis (Pillow)
+python -m playwright install chromium    # one-time, after the browser extra
+```
+
+With pipx, install the extras with `pipx install "pedacito[browser,vision]"`, then run `pipx run --spec playwright playwright install chromium` to download the browser.
+
+From a source checkout, use an editable install instead:
+
 ```bash
 cd /path/to/pedacito
 pip install -e .            # Windows: py -m pip install -e .
