@@ -53,6 +53,7 @@ from . import processes
 from . import profiles as profiles_mod
 from . import roles as roles_mod
 from . import security
+from . import servers as servers_mod
 from . import skills as skills_mod
 from . import workspace
 from .agent import Agent
@@ -109,11 +110,15 @@ _TAB_PREFIX = {
     "/pro": "/profile ",
     "/aut": "/auto-route ",
     "/cre": "/creative ",
+    "/eff": "/effort ",
+    "/ser": "/servers",
+    "/unl": "/unload ",
 }
 _SLASH_COMMANDS = [
     "/help", "/keys", "/status", "/telemetry", "/new", "/auto", "/auto!", "/plan",
     "/consolidate", "/compact", "/profile", "/profiles", "/model",
-    "/auto-route", "/think", "/creative", "/apply", "/skills", "/memory", "/procs",
+    "/auto-route", "/think", "/effort", "/creative", "/servers", "/unload",
+    "/apply", "/skills", "/memory", "/procs",
     "/diff", "/undo", "/reset", "/sidebar", "/scroll", "/mouse", "/clear",
     "/quit", "/exit",
 ]
@@ -165,6 +170,10 @@ Pedacito TUI commands
   /model ID                 switch to a model id directly
   /auto-route [on|off]      specialist auto-routing on/off
   /think [on|off]           thinking on/off (off sets disable_thinking)
+  /effort [LEVEL]           reasoning effort: default, low, medium or high
+                            (forwarded to local-moe and reasoning APIs)
+  /servers                  live VRAM/RAM and each local server's status
+  /unload [SERVER]          unload models on SERVER, or every idle local server
   /creative [on|off|auto]   design mode: on=every task, auto=detect design tasks,
                             off=surgical edits (warmer sampling + whole-file CSS/HTML)
   /apply [on|off]           write edits to disk, or preview them
@@ -2037,6 +2046,7 @@ class TuiSession:
         self._context_override = None
         self._event_active = ""
         self._append(f"\u00bb {task}", "user")
+        self._evict_servers()
         client, agent, idx = self._ensure_backend()
         cfg = self.cfg
         if self.resume_context:
@@ -2113,6 +2123,7 @@ class TuiSession:
         if not goal:
             self._append("Usage: /auto <goal>", "error")
             return
+        self._evict_servers()
         client, agent, idx = self._ensure_backend()
         cfg = self.cfg
         plan_path = self._plan_path()
@@ -2373,6 +2384,15 @@ class TuiSession:
         if cmd == "think":
             self._think(arg)
             return
+        if cmd == "effort":
+            self._effort(arg)
+            return
+        if cmd == "servers":
+            self._servers()
+            return
+        if cmd == "unload":
+            self._unload(arg)
+            return
         if cmd == "creative":
             self._creative(arg)
             return
@@ -2441,6 +2461,9 @@ class TuiSession:
             f"  routing : Auto-Route "
             f"{'ON' if getattr(self.cfg, 'auto_route_specialties', False) else 'OFF'}"
             f", thinking {'off' if getattr(self.cfg, 'disable_thinking', False) else 'on'}",
+            f"  class   : {self._model_class()}"
+            f", effort {getattr(self.cfg, 'reasoning_effort', 'default') or 'default'}"
+            f", streams {getattr(self.cfg, 'max_concurrency', 0) or 'auto'}",
         ]
         card = getattr(self.cfg, "_card", None)
         if not isinstance(card, dict):
@@ -2474,6 +2497,13 @@ class TuiSession:
         else:
             lines.append("    (no model calls yet)")
         return "\n".join(lines)
+
+    def _model_class(self) -> str:
+        try:
+            from . import config as config_mod
+            return config_mod.capability_profile(self.cfg)
+        except Exception:
+            return "?"
 
     def _consolidate(self) -> None:
         messages = getattr(self.agent, "_messages", None) if self.agent else None
@@ -2667,6 +2697,104 @@ class TuiSession:
             pass
         self._append("Thinking: "
                      f"{'OFF' if self.cfg.disable_thinking else 'ON'}", "system")
+
+    def _effort(self, arg: str) -> None:
+        """`/effort [default|low|medium|high]`: reasoning effort forwarded to
+        local-MoE runtimes and reasoning-capable hosted APIs."""
+        value = arg.strip().lower()
+        if not value:
+            current = str(getattr(self.cfg, "reasoning_effort", "default")
+                          or "default")
+            self._append(
+                f"Reasoning effort: {current}\n"
+                "Usage: /effort default|low|medium|high", "system")
+            return
+        if value in ("auto", "none", "off"):
+            value = "default"
+        if value not in ("default", "low", "medium", "high"):
+            self._append("Usage: /effort default|low|medium|high", "error")
+            return
+        self.cfg.reasoning_effort = value
+        try:
+            self.cfg.sources["reasoning_effort"] = "tui /effort"
+        except Exception:
+            pass
+        klass = ""
+        try:
+            from . import config as config_mod
+            klass = config_mod.capability_profile(self.cfg)
+        except Exception:
+            pass
+        self._append(
+            f"Reasoning effort: {value}"
+            + (f" ({klass})" if klass else "")
+            + (" \u2014 no field is sent at default"
+               if value == "default" else " \u2014 sent as reasoning_effort"),
+            "system")
+
+    def _servers(self) -> None:
+        """`/servers`: live VRAM/RAM plus each configured local server."""
+        try:
+            payload = servers_mod.server_summary(self.cfg)
+        except Exception as exc:
+            self._append(f"could not read local servers: {exc}", "error")
+            return
+        self._append(
+            servers_mod.format_server_states(
+                payload.get("servers") or [], payload.get("memory")),
+            "system")
+
+    def _unload(self, arg: str) -> None:
+        """`/unload [server]`: unload one server, or every idle local server."""
+        target = arg.strip()
+        try:
+            if target:
+                result = servers_mod.unload_server_model(
+                    target, "", self.cfg)
+                results = [result]
+            else:
+                results = servers_mod.unload_all_local_servers(self.cfg)
+        except Exception as exc:
+            self._append(f"unload failed: {exc}", "error")
+            return
+        if not results:
+            self._append("No resident model on any configured local server.",
+                         "system")
+            return
+        lines = ["Unload results"]
+        for result in results:
+            ok = bool(result.get("ok"))
+            name = result.get("server") or result.get("base_url") or "?"
+            detail = str(result.get("detail") or "").strip()
+            model = str(result.get("model") or "").strip()
+            lines.append(
+                f"  {'OK' if ok else 'FAILED'} {name}"
+                + (f" \u00b7 {model}" if model else "")
+                + (f" \u2014 {detail}" if detail else ""))
+        try:
+            mem = servers_mod.get_hardware_memory()
+            lines.append(f"  {servers_mod.memory_badge(mem)}")
+        except Exception:
+            pass
+        self._append("\n".join(lines),
+                     "system" if all(r.get("ok") for r in results)
+                     else "error")
+
+    def _evict_servers(self) -> None:
+        """Auto-evict handshake before a run starts on this profile's server."""
+        try:
+            result = servers_mod.evict_other_local_servers(
+                getattr(self.cfg, "active_profile", "") or self.cfg.base_url,
+                self.cfg)
+        except Exception:
+            return
+        evicted = [r for r in result.get("evicted", []) if r]
+        if evicted:
+            names = ", ".join(str(r.get("server") or r.get("base_url") or "?")
+                              for r in evicted)
+            self._append(
+                f"Unloaded {names} from another local server so this run can "
+                "use the VRAM/RAM.", "system")
 
     def _creative(self, arg: str) -> None:
         """Tri-state creative/design mode: on forces the Builder persona for

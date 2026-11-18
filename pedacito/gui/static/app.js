@@ -801,6 +801,16 @@ function setAutoRoute(on) {           // topbar toggle -> user config + reload
       refreshState();
     });
 }
+function setReasoningEffort(level) {  // composer Options bar -> live + user config
+  PDC.api('/api/effort', { level: level }).then((j) => {
+    if (!j.ok) { PDC.toast(j.detail || 'could not set reasoning effort', true); return; }
+    S.status.reasoning_effort = j.reasoning_effort || level;
+    emit();
+    PDC.toast(level === 'default'
+      ? 'Reasoning effort: default (no reasoning_effort field is sent)'
+      : 'Reasoning effort: ' + level + ' (sent as reasoning_effort to local-moe and reasoning APIs)');
+  });
+}
 
 // ---- chat threads (the project's saved conversations) ----
 // Threads live in `.pedacito/gui/threads/`; the switcher in the Chat head
@@ -1925,6 +1935,123 @@ PDC.consolidateSession = consolidateSession;
 
 // Background dev servers: the `.pedacito/procs/` registry, with a live log
 // tail and a Stop button, and the same start form `pedacito serve` uses.
+// Background servers, model-server lifecycle, and live VRAM/RAM telemetry.
+// The badge polls slowly (15 s); the modal refreshes after every action.
+function _gb(n) { return Number(n || 0).toFixed(1); }
+function _memText(mem) {
+  const v = (mem && mem.vram) || {}, r = (mem && mem.ram) || {};
+  return 'VRAM: ' + _gb(v.used_gb) + ' / ' + _gb(v.total_gb) + ' GB | RAM: '
+    + _gb(r.used_gb) + ' / ' + _gb(r.total_gb) + ' GB';
+}
+
+function HardwareBadge() {
+  const [mem, setMem] = useState(null);
+  useEffect(() => {
+    let alive = true;
+    const load = () => PDC.api('/api/servers').then((j) => {
+      if (alive && j && j.memory) setMem(j.memory);
+    }, () => {});
+    load();
+    const timer = setInterval(load, 15000);
+    return () => { alive = false; clearInterval(timer); };
+  }, []);
+  if (!mem) return null;
+  const v = mem.vram || {}, r = mem.ram || {};
+  const cards = (v.cards || []).map((c) => c.card + ' ' + _gb(c.used_gb)
+    + '/' + _gb(c.total_gb) + ' GB').join('\n');
+  return html`<span class="chip" id="hwChip"
+      title=${'live hardware memory (sysfs ROCm VRAM + /proc/meminfo)'
+        + (cards ? '\n' + cards : '')}
+      onClick=${() => serversDialog()}>
+    <b>${_memText(mem)}</b>
+  </span>`;
+}
+
+function serversDialog() {
+  const status = h('div', { class: 'muted small-text', style: 'margin-bottom:8px' });
+  const list = h('div', {});
+  const check = h('input', { type: 'checkbox', checked: !!S.status.auto_evict_servers });
+
+  function setAutoEvict(on) {
+    PDC.api('/api/servers/auto-evict', { enabled: on }).then((j) => {
+      if (!j.ok) { PDC.toast(j.detail || 'could not save the setting', true); return; }
+      S.status.auto_evict_servers = !!j.auto_evict_servers;
+      emit();
+      PDC.toast(on ? 'Auto-unload other local servers on switch: on'
+                   : 'Auto-unload other local servers on switch: off');
+    });
+  }
+  check.addEventListener('change', () => setAutoEvict(!!check.checked));
+
+  function act(path, payload) {
+    status.textContent = 'Working\u2026';
+    PDC.api(path, payload).then((j) => {
+      if (!j.ok) status.textContent = (j.detail || 'the server refused the action');
+      else status.textContent = (path.indexOf('load') >= 0 ? 'Loaded ' : 'Unloaded ')
+        + (payload.model || payload.server || 'model') + ' \u00B7 ' + _memText(j.memory || {});
+      paint(j);
+    }, () => { status.textContent = 'The GUI server did not answer.'; });
+  }
+
+  function paint(j) {
+    PDC.clear(list);
+    if (!j || !j.ok) {
+      status.textContent = (j && j.detail) || 'Could not read the server registry.';
+      return;
+    }
+    if (!j.detail) status.textContent = _memText(j.memory || {});
+    const rows = j.servers || [];
+    if (!rows.length) {
+      list.appendChild(h('div', { class: 'tip',
+        text: 'No local servers are configured. Add a local profile in Settings \u2192 Profiles.' }));
+      return;
+    }
+    rows.forEach((s) => {
+      const loaded = s.loaded_models || [];
+      const available = (s.models || []).filter((m) => loaded.indexOf(m) < 0);
+      const sel = h('select', { title: 'model to load' });
+      available.forEach((m) => sel.appendChild(h('option', { value: m, text: m })));
+      const loadBtn = h('button', { class: 'small primary', text: 'Load',
+        disabled: !available.length,
+        onclick: () => act('/api/servers/load', { server: s.name, model: sel.value }) });
+      const unloadBtn = h('button', { class: 'small danger', text: loaded.length > 1 ? 'Eject all' : 'Unload / Eject',
+        disabled: !loaded.length,
+        onclick: () => act('/api/servers/unload',
+          { server: s.name, model: loaded.length === 1 ? loaded[0] : '' }) });
+      list.appendChild(h('div', { class: 'note-box', style: 'margin-bottom:8px' },
+        h('div', { class: 'row' },
+          h('b', { text: s.name || '?' }),
+          h('span', { class: 'tag' + (s.online ? ' act' : ''), text: s.online ? 'online' : 'offline' }),
+          h('span', { class: 'tag', text: s.kind || 'custom' }),
+          h('span', { class: 'grow' }),
+          unloadBtn),
+        h('div', { class: 'mono small-text', style: 'margin-top:4px', text: s.base_url || '' }),
+        h('div', { class: 'small-text', style: 'margin-top:4px',
+          text: loaded.length ? 'resident: ' + loaded.join(', ') : 'no model resident' }),
+        (available.length || !s.online) ? h('div', { class: 'row', style: 'margin-top:6px' },
+          sel, loadBtn) : null));
+    });
+  }
+
+  function refresh() {
+    status.textContent = 'Probing local servers\u2026';
+    PDC.api('/api/servers').then(paint,
+      () => { status.textContent = 'The GUI server did not answer.'; });
+  }
+
+  const body = h('div', {},
+    status,
+    list,
+    h('label', { class: 'chk', style: 'display:block;margin-top:10px' },
+      check, ' Auto-unload other local servers on switch'),
+    h('div', { class: 'muted small-text', style: 'margin-top:6px',
+      text: 'Before a run, resident models on other configured local servers are unloaded and VRAM/RAM is polled briefly. A sleeping server is never touched.' }));
+  PDC.modal('Servers & memory', body,
+    [{ label: 'Refresh', onclick: () => { refresh(); return false; } },
+     { label: 'Close' }], { wide: true });
+  refresh();
+}
+
 function procsDialog() {
   // Workspace-backed: background servers live under the scratchpad when no
   // project is open.
@@ -2438,6 +2565,8 @@ function TopBar() {
           <//>
         </div>
         <div id="topRight">
+          <button id="serversBtn" title="live VRAM/RAM and local model-server lifecycle"
+                  onClick=${() => serversDialog()}>Servers</button>
           <button id="benchBtn" title="run a diagnostic benchmark against a configured profile" onClick=${() => openBenchmarks()}>\u25A6 Benchmarks</button>
           <button id="settingsBtn" title="profiles and settings" onClick=${() => callSettings()}>\u2699 Settings</button>
           <select id="theme" title="color scheme (saved as gui_theme in config.toml)"
@@ -2480,6 +2609,7 @@ function TopBar() {
             title=${s.disable_thinking ? 'thinking is disabled for this profile (disable_thinking = true)'
                                        : 'thinking is allowed (disable_thinking = false) \u2014 turn it off in Settings \u2192 Profiles'}>${s.disable_thinking ? 'no-think' : 'thinking'}</span>` : null}
         </span>
+        <${HardwareBadge} />
         ${!s.root ? html`<span class="chip" id="workspaceChip"
               title="Questions run on the selected profile in a scratchpad until you open or create a project">
           <b>${s.workspace_label || 'Workspace: Scratchpad (no project open)'}</b>
@@ -3005,6 +3135,17 @@ function Composer() {
         ${OPTS[S.mode].some((o) => o.type === 'check') ? html`<div class="opts-checks">${OPTS[S.mode].filter((o) => o.type === 'check').map((o, idx) => html`<${OptField} key=${'c' + idx} o=${o} />`)}</div>` : null}
       </div>
       <div id="composerBtns">
+        <label id="effortControl" class="effort"
+               title="Reasoning effort forwarded as reasoning_effort to local-moe (Strata/Avalon) and reasoning-capable hosted models. Default sends no field.">
+          <span>Effort</span>
+          <select value=${s.reasoning_effort || 'default'}
+                  onChange=${(e) => setReasoningEffort(e.target.value)}>
+            <option value="default">Default</option>
+            <option value="low">Low</option>
+            <option value="medium">Medium</option>
+            <option value="high">High</option>
+          </select>
+        </label>
         <button id="attachBtn" title="attach a text file (or drop one here)"
                 hidden=${isHow}
                 disabled=${!!j} onClick=${() => $('filePick').click()}>\uD83D\uDCCE Attach</button>

@@ -1031,6 +1031,9 @@ def _summary_workers(cfg) -> int:
     (a single GPU queue gains nothing, and a half-loaded model could stall)."""
     n = int(getattr(cfg, "summary_workers", 0) or 0)
     if n > 0:
+        from .config import is_local_moe
+        if is_local_moe(cfg):
+            return 1        # a tiered MoE server is single-stream by design
         return min(n, 8)
     from .config import is_hosted
     return 4 if is_hosted(cfg) else 1

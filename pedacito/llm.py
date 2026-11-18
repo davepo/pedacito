@@ -531,7 +531,38 @@ def _is_local_server(cfg) -> bool:
         # box is an explicit statement that the endpoint is self-hosted.
     name = str(getattr(cfg, "provider", "") or "").lower().replace("_", "")
     return any(w in name for w in ("local", "llamacpp", "llama.cpp", "lemond",
-                                   "vllm", "lmstudio", "ollama"))
+                                   "vllm", "lmstudio", "ollama",
+                                   "strata", "avalon"))
+
+
+def _is_local_moe(cfg) -> bool:
+    """True for a tiered local-MoE config (Strata/Avalon or a matching model
+    on a self-hosted endpoint). Kept here as the single check the transport
+    and the GUI/TUI read; the classification itself lives in config.py."""
+    try:
+        from .config import is_local_moe
+        return bool(is_local_moe(cfg))
+    except Exception:
+        return False
+
+
+def _supports_reasoning_effort(cfg) -> bool:
+    """Whether a configured reasoning_effort may be sent to this endpoint.
+
+    Local-MoE servers expose it natively; hosted APIs get it only for the
+    families that document the field, so a strict API is never sent an
+    unknown key."""
+    if _is_local_moe(cfg):
+        return True
+    if _is_local_server(cfg):
+        # Dense local runtimes vary: only the families with a native control.
+        model = _model_name(cfg)
+        return _is_effort_model(model) or _is_gpt_oss(model) \
+            or _is_qwen_soft(model) or _is_gemma_reasoning(model)
+    model = _model_name(cfg)
+    return _is_effort_model(model) or _is_gpt_oss(model) \
+        or _is_qwen_soft(model) or _is_gemma_reasoning(model) \
+        or _is_deepseek(model) or _has(model, "reasoner", "thinking", "qwq")
 
 
 # Sampling keys a hosted provider tunes per model itself; pedacito omits
@@ -1172,12 +1203,28 @@ class LLMClient:
 
     def __init__(self, cfg):
         self.cfg = cfg
+        # Tiered local-MoE execution (Strata/Avalon): floor the output budget
+        # so a reasoning block is not cut mid-thought, pin a single stream,
+        # and keep the long timeout that covers weight loading and a 30k
+        # prefill. apply_local_moe_defaults is idempotent per model/server.
+        try:
+            from . import config as config_mod
+            self.local_moe = bool(config_mod.apply_local_moe_defaults(cfg))
+        except Exception:
+            self.local_moe = False
+        if self.local_moe:
+            try:
+                cfg.max_concurrency = 1
+            except Exception:
+                pass
+        self.max_concurrency = int(getattr(cfg, "max_concurrency", 0) or 0)
         self.url = cfg.base_url.rstrip("/") + "/chat/completions"
         key = _api_key(cfg)
-        self.headers = {
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {key}",
-        }
+        self.headers = {"Content-Type": "application/json"}
+        # Local servers need no credential. Sending `Bearer ` with an empty
+        # key is rejected by some proxies, so omit the header entirely.
+        if key:
+            self.headers["Authorization"] = f"Bearer {key}"
         # Anthropic authenticates its OpenAI-compatible surface (and its
         # native /v1/messages API) with `x-api-key` + a version stamp. Send
         # both spellings when the server is Anthropic's so either accepted
@@ -1995,6 +2042,16 @@ class LLMClient:
             # A phase temperature (temperature_answer/_repair, best_of) is more
             # specific than a `temperature` key in the sampler table.
             payload["temperature"] = self._temp_override
+        # Reasoning effort: local-MoE servers and reasoning-capable hosted
+        # models accept it natively; "default" sends no field at all. It is
+        # set AFTER the sampler merge so a profile value cannot be shadowed
+        # by a sampler table, and before the thinking-off block so disabling
+        # thinking always wins.
+        effort = str(getattr(self.cfg, "reasoning_effort", "default")
+                     or "default").strip().lower()
+        if effort in ("low", "medium", "high") and not want_off \
+                and _supports_reasoning_effort(self.cfg):
+            payload["reasoning_effort"] = effort
         if self._nudge_presence:
             # A repetition guard cut the previous reply: nudge the NEXT local
             # request with a gentle presence penalty rather than a cold

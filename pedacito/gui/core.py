@@ -1655,6 +1655,19 @@ class State:
                 "json_mode": cfg.json_mode if cfg else "",
                 "gui_theme": theme,
                 "disable_thinking": bool(cfg.disable_thinking) if cfg else False,
+                "reasoning_effort": (str(getattr(cfg, "reasoning_effort",
+                                                 "default") or "default")
+                                     if cfg else "default"),
+                "model_class": (config_mod.capability_profile(cfg)
+                                if cfg else ""),
+                "reasoning_capable": bool(cfg) and (
+                    config_mod.is_local_moe(cfg)
+                    or str(getattr(cfg, "reasoning_effort", "default"))
+                    in ("low", "medium", "high")),
+                "max_concurrency": (int(getattr(cfg, "max_concurrency", 0) or 0)
+                                    if cfg else 0),
+                "auto_evict_servers": (bool(cfg.auto_evict_servers)
+                                       if cfg else True),
                 "allow_steering": bool(cfg.allow_steering) if cfg else False,
                 # specialist routing (#50): the topbar toggle's state
                 "auto_route_specialties": (bool(cfg.auto_route_specialties)

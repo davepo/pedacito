@@ -113,8 +113,29 @@ class Config:
     # Storing the variable name instead of the secret keeps the key out of the
     # config file; `llm.py` reads it at request time.
     api_key_env: str = ""
+    # Runtime/provider label for this server: "lemonade", "llama-server",
+    # "strata", "avalon", "local-moe", "lmstudio", "ollama", ... It selects
+    # the server-control endpoints in servers.py and the execution profile
+    # ("local-moe" for tiered MoE servers). Empty = detect from the profile
+    # name and endpoint.
+    provider: str = ""
+    # Optional commands that start/stop a single-model local daemon when the
+    # server has no HTTP load/unload endpoint. Run with shlex.split and
+    # shell=False; {model} is replaced by the model id. Use them only for a
+    # server you control: loading and unloading are deliberate actions.
+    load_cmd: str = ""
+    unload_cmd: str = ""
+    # When a run starts on one configured local server, unload models resident
+    # on the other local servers before the request goes out (a tiered MoE
+    # server and a dense llama-server cannot share the same VRAM/RAM safely).
+    # Servers are probed with a 1.5 s timeout; no other server is touched.
+    auto_evict_servers: bool = True
     model: str = "google/gemma-3-27b"
     timeout: float = 600.0
+    # Concurrent requests this endpoint can serve. Local servers default to
+    # one stream; a local-moe server is always pinned to 1 (its prefill and
+    # weight residency assume a single queue). 0 = let the runtime decide.
+    max_concurrency: int = 0
     # Seconds to wait while the server loads a model (unload + read from disk).
     load_wait_seconds: int = 240
     # Stop a batch after this many failures in a row.
@@ -625,6 +646,12 @@ class Config:
     #     message. Empty = auto (/no_think for Qwen3/SmolLM3 only).
     disable_thinking: bool = False
     thinking_suffix: str = ""
+    # Reasoning effort for models that expose it (local-moe servers such as
+    # Strata/Avalon, and reasoning-capable hosted APIs). "default" sends no
+    # field at all; "low", "medium" and "high" are forwarded verbatim as
+    # `reasoning_effort`. It never clamps sampling: a local MoE keeps its own
+    # temperature. TUI: /effort LEVEL. GUI: the Effort selector.
+    reasoning_effort: str = "default"
 
     # --- Editing --------------------------------------------------------------
     # Snapshot originals into .pedacito/backups/<timestamp>/ before writing;
@@ -927,6 +954,16 @@ class Config:
         if self.profiles is None:
             self.profiles = {}
 
+    @property
+    def model_class(self) -> str:
+        """The execution profile: "local-dense", "local-moe" or "hosted"."""
+        return capability_profile(self)
+
+    @property
+    def is_local_moe(self) -> bool:
+        """True for a tiered MoE local server (Strata/Avalon)."""
+        return is_local_moe(self)
+
 
 # "server" is the documented section name for connection settings; "lmstudio"
 # is kept as an accepted alias so existing config files keep working. Sections
@@ -970,6 +1007,12 @@ _ALIASES = {
     "v_cache_quantization": "v_cache_quant",
     "kv_cache_k_quant": "k_cache_quant",
     "kv_cache_v_quant": "v_cache_quant",
+    # A server's "type" is its runtime/provider label (strata, avalon,
+    # lemonade, llama-server, ...): one canonical key feeds routing and the
+    # server control plane.
+    "type": "provider",
+    "server_type": "provider",
+    "provider_type": "provider",
 }
 
 # Effective bits per cache element, including llama.cpp's per-block scale/min
@@ -1038,6 +1081,7 @@ _ENUM_FIELDS = {
     "prompt_cache_ttl": ("5m", "1h"),
     "gui_theme": ("slate", "light", "daylight", "nord", "midnight",
                   "jazz_solo", "trapper_keeper", "memphis_arcade", "windbreaker"),
+    "reasoning_effort": ("default", "low", "medium", "high"),
 }
 _ENUM_EMPTY_OK = ("prompt_pack", "answer_mode")
 
@@ -1346,6 +1390,7 @@ EXEC_FIELDS = ("hooks", "mcp_servers", "auto_verify", "test_command",
                "allow_shell", "allow_write", "allow_browser",
                "allow_screenshots", "enable_mcp", "allow_mcp",
                "base_url", "api_key", "api_key_env",
+               "load_cmd", "unload_cmd",
                "scrub_env", "env_passthrough",
                "verify_tests", "verify_dom", "dom_entry",
                "shell_allowlist", "browser_eval_hosts",
@@ -1558,6 +1603,11 @@ def load(root: Path | None = None, explicit: Path | None = None,
                 continue
             setattr(cfg, key, _parse_env(key, raw))
             cfg.sources[key] = f"env PEDACITO_{key.upper()}"
+
+    # Tiered local MoE servers (Strata/Avalon) reason before they answer:
+    # floor their output budgets and pin one stream. Hosted APIs with a
+    # similar model name are untouched (endpoint decides).
+    apply_local_moe_defaults(cfg)
 
     # Hosted APIs (DeepSeek in particular) reject response_format json_schema,
     # so switch to "object" unless the user spelled json_mode somewhere.
@@ -2276,8 +2326,10 @@ def _parse_env(name: str, raw: str):
 #   small   ~9B local models (qwen3-8b, gemma-3-12b, llama-3.1-8b)
 #   medium  ~14B/32B local models (qwen3-14b, qwen3-32b, gemma-3-27b)
 #   large   big local models (27B+ at full context, 70B rigs)
+#   local-moe  tiered MoE servers (Strata/Avalon): frontier reasoning at
+#              local transport limits -- generous output, one stream, long loads
 #   hosted  capable APIs: DeepSeek, OpenAI, Anthropic, xAI, ...
-PRESET_TIERS = ("tiny", "small", "medium", "large", "hosted")
+PRESET_TIERS = ("tiny", "small", "medium", "large", "local-moe", "hosted")
 
 PRESETS: dict[str, dict] = {
     "tiny": {
@@ -2357,6 +2409,30 @@ PRESETS: dict[str, dict] = {
         "context_tokens": 65536,
         "reserve_tokens": 8192,
     },
+    "local-moe": {
+        # Strata/Avalon-style tiered MoE servers: reasoning blocks (<think> or
+        # reasoning_content) are part of the answer path, so a reply budget
+        # that fits a dense 9B truncates the model mid-thought. Every reply
+        # starts at 8192; plan/build calls, which reason across a whole file,
+        # get 16384. One stream only: these servers hold most of VRAM plus
+        # DDR5 and a second concurrent prefill evicts the resident weights.
+        "max_tokens_summary": 400,
+        "max_tokens_step": 8192,
+        "max_steps": 0,
+        "max_tokens_answer": 8192,
+        "max_tokens_plan": 16384,
+        "max_tokens_build": 16384,
+        "flat_map_token_budget": 4096,
+        "max_gathered_chars": 48000,
+        "max_read_lines": 300,
+        "max_spec_chars": 120000,
+        "max_new_files": 40,
+        "repair_rounds": 2,
+        "context_tokens": 32768,
+        "reserve_tokens": 8192,
+        "timeout": 600.0,
+        "max_concurrency": 1,
+    },
     "hosted": {
         # The window is a declared budget, not a server limit: auto_fit only
         # grows these. max_tokens_step stays below ~8k because the provider's
@@ -2393,6 +2469,9 @@ def _guess_tier(name: str, body: dict) -> str | None:
     # the name heuristic still stands (the config's fallback may be remote).
     base = str(body.get("base_url", "") or "")
     remote = not base or not _endpoint_is_local(base)
+    if is_local_moe(model=body.get("model"), provider=body.get("provider"),
+                    profile=name, base_url=base):
+        return "local-moe"
     if remote and any(h in hay for h in ("deepseek", "openai", "anthropic",
                                          "api.", "moonshot", "x.ai", "groq",
                                          "together", "mistral.ai", "hosted")):
@@ -2423,6 +2502,201 @@ def _endpoint_is_local(base_url: str) -> bool:
     except ValueError:
         return False
     return addr.is_loopback or addr.is_link_local or addr.is_private
+
+
+# --- model capability profiles ------------------------------------------------
+# Three execution classes, each with its own transport and budget rules:
+#
+#   local-dense  a conventional local model (<35B): one GPU queue, modest
+#                output budgets, a short timeout.
+#   local-moe    a tiered MoE server (Strata, Avalon, or a model whose id says
+#                so): frontier reasoning on local hardware. It gets a generous
+#                output budget (reasoning must not be cut mid-thought), native
+#                sampling, reasoning_effort when configured, exactly one
+#                concurrent stream, and a long timeout for weight loading and
+#                a slow 30k-token prefill.
+#   hosted       a remote API: the provider's own sampling, budgets and
+#                reasoning controls.
+EXECUTION_PROFILES = ("local-dense", "local-moe", "hosted")
+LOCAL_MOE_PROVIDERS = ("strata", "avalon", "local-moe", "local_moe",
+                       "localmoe", "tiered-moe")
+LOCAL_MOE_TIMEOUT = 600.0
+LOCAL_MOE_MAX_TOKENS = 8192
+LOCAL_MOE_MAX_TOKENS_COMPLEX = 16384
+
+# Model-id patterns for MoE servers whose runtime label is not configured.
+# Spelled loosely so separators and vendor prefixes do not matter:
+# qwen3.8-flash, Qwen3_8_Flash, deepseek-v4.1-flash, qwen3-35b-a3b, *moe*.
+_LOCAL_MOE_PATTERNS = (
+    re.compile(r"qwen[\s._-]*3[\s._-]*8[\s._-]*flash", re.IGNORECASE),
+    re.compile(r"deepseek[\s._-]*v?[\s._-]*4(?:[\s._-]*1)?[\s._-]*flash",
+               re.IGNORECASE),
+    re.compile(r"qwen[\s._-]*(?:3[\s._-]*)?35[\s._-]*b[\s._-]*a[\s._-]*3"
+               r"[\s._-]*b", re.IGNORECASE),
+    re.compile(r"(?:^|[\s/_.-])moe(?:$|[\s/_.-])", re.IGNORECASE),
+)
+
+
+def _cfg_get(cfg, key: str, default=""):
+    """Read one value from a Config, a profile body, or a SimpleNamespace."""
+    if cfg is None:
+        return default
+    if isinstance(cfg, dict):
+        return cfg.get(key, default)
+    return getattr(cfg, key, default)
+
+
+def _local_moe_texts(cfg=None, model=None, provider=None, base_url=None,
+                     profile=None) -> tuple[str, str, str, str]:
+    """The four haystacks the classifier uses, from keyword args first, then
+    from the config object (a Config, a profile body, or a namespace)."""
+    if cfg is not None:
+        model = model if model is not None else _cfg_get(cfg, "model", "")
+        provider = (provider if provider is not None
+                    else _cfg_get(cfg, "provider", "")
+                    or _cfg_get(cfg, "server_type", ""))
+        base_url = (base_url if base_url is not None
+                    else _cfg_get(cfg, "base_url", ""))
+        profile = (profile if profile is not None
+                   else _cfg_get(cfg, "active_profile", "")
+                   or _cfg_get(cfg, "profile", ""))
+        # A hand-built Config may carry only [profiles.NAME] values; read the
+        # active profile's body when the top-level fields are still defaults.
+        profiles = _cfg_get(cfg, "profiles", {}) or {}
+        body = profiles.get(profile) if isinstance(profiles, dict) else None
+        if isinstance(body, dict):
+            model = model or body.get("model", "")
+            provider = provider or body.get("provider", "") \
+                or body.get("server_type", "")
+            base_url = base_url or body.get("base_url", "")
+    elif isinstance(model, str) and model.lower().startswith(("http://",
+                                                             "https://")):
+        # is_local_moe("http://127.0.0.1:8000/v1") from a one-string call.
+        base_url, model = model, ""
+    return (str(model or ""), str(provider or ""), str(base_url or ""),
+            str(profile or ""))
+
+
+def is_local_moe(cfg=None, model=None, provider=None, base_url=None,
+                 profile=None) -> bool:
+    """True when this model/provider belongs to the `local-moe` class.
+
+    Auto-detection, either signal is enough:
+      * the runtime/provider label (or profile name) is strata, avalon or
+        local-moe; or
+      * a LOCAL endpoint's model id matches a tiered-MoE pattern
+        (qwen3.8-flash, deepseek-v4.1-flash, qwen35b-a3b, *moe*).
+
+    A remote endpoint is only local-moe when its provider explicitly says so;
+    otherwise it stays hosted even if the model id looks like a MoE."""
+    model_s, provider_s, base_s, profile_s = _local_moe_texts(
+        cfg, model, provider, base_url, profile)
+    label = " ".join((provider_s, profile_s)).strip().lower()
+    label = re.sub(r"[\s_]+", "-", label)
+    if any(word in label for word in LOCAL_MOE_PROVIDERS):
+        return True
+    local = True
+    if base_s:
+        local = _endpoint_is_local(base_s)
+    if not local:
+        return False
+    return any(p.search(model_s) for p in _LOCAL_MOE_PATTERNS)
+
+
+def capability_profile(cfg=None, model=None, provider=None, base_url=None,
+                       profile=None) -> str:
+    """Classify a model/provider as "local-moe", "local-dense" or "hosted".
+
+    Hosted-ness is decided by the endpoint (the same rule as `is_hosted`),
+    except an explicit strata/avalon/local-moe provider, which is always a
+    local-MoE runtime."""
+    if is_local_moe(cfg, model, provider, base_url, profile):
+        return "local-moe"
+    from types import SimpleNamespace
+    probe = cfg if cfg is not None else SimpleNamespace(
+        model=model or "", provider=provider or "", base_url=base_url or "",
+        active_profile=profile or "", active_tier="", _hosted_server=False,
+        json_mode="schema")
+    try:
+        return "hosted" if is_hosted(probe) else "local-dense"
+    except Exception:
+        return "local-moe" if is_local_moe(probe) else "local-dense"
+
+
+# Readable aliases: callers name the same idea a capability profile, an
+# execution profile, or a model class.
+model_profile = capability_profile
+execution_profile = capability_profile
+classify_model = capability_profile
+detect_local_moe = is_local_moe
+local_moe = is_local_moe
+
+
+def local_moe_output_budget(complex_plan: bool = False) -> int:
+    """The default output budget for a local-MoE reply: 8192 tokens so a
+    reasoning block is never cut mid-thought, 16384 for a complex/auto plan."""
+    return LOCAL_MOE_MAX_TOKENS_COMPLEX if complex_plan else LOCAL_MOE_MAX_TOKENS
+
+
+def apply_local_moe_defaults(cfg) -> bool:
+    """Apply the `local-moe` execution defaults to `cfg` in place.
+
+    Only raises budgets, never lowers one the user (or a tier preset) set:
+      * max_tokens_step/answer >= 8192; plan/build >= 16384;
+      * timeout >= 600 s (weight loading + a slow 30k-token prefill);
+      * max_concurrency pinned to 1.
+
+    Idempotent for one model/server pair, and re-applied when a role profile
+    switches to a different model. Returns True when the config is local-moe.
+    """
+    if not is_local_moe(cfg):
+        return False
+    key = (_cfg_get(cfg, "model", ""), _cfg_get(cfg, "provider", ""),
+           _cfg_get(cfg, "base_url", ""))
+    if _cfg_get(cfg, "_local_moe_applied", None) == key:
+        # A role/client reuses this object: still enforce the hardware rule.
+        try:
+            cfg.max_concurrency = 1
+        except Exception:
+            pass
+        return True
+    sources = getattr(cfg, "sources", None)
+    if not isinstance(sources, dict):
+        sources = {}
+        try:
+            cfg.sources = sources
+        except Exception:
+            sources = None
+
+    def raise_to(name: str, value):
+        current = getattr(cfg, name, 0) or 0
+        if current < value:
+            setattr(cfg, name, value)
+            if sources is not None:
+                sources[name] = "local-moe default"
+
+    raise_to("max_tokens_step", LOCAL_MOE_MAX_TOKENS)
+    raise_to("max_tokens_answer", LOCAL_MOE_MAX_TOKENS)
+    raise_to("max_tokens_plan", LOCAL_MOE_MAX_TOKENS_COMPLEX)
+    raise_to("max_tokens_build", LOCAL_MOE_MAX_TOKENS_COMPLEX)
+    try:
+        if float(getattr(cfg, "timeout", 0) or 0) < LOCAL_MOE_TIMEOUT:
+            cfg.timeout = LOCAL_MOE_TIMEOUT
+            if sources is not None:
+                sources["timeout"] = "local-moe default"
+    except (TypeError, ValueError):
+        pass
+    try:
+        cfg.max_concurrency = 1
+        if sources is not None:
+            sources["max_concurrency"] = "local-moe (single stream)"
+    except Exception:
+        pass
+    try:
+        cfg._local_moe_applied = key
+    except Exception:
+        pass
+    return True
 
 
 def _apply_preset(name: str, body: dict, origin: str) -> tuple[dict, str]:

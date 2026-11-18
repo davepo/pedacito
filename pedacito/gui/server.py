@@ -865,6 +865,129 @@ def _procs_post(q, body):
     return 400, {"ok": False, "detail": f"unknown procs action {action!r}"}
 
 
+# --- model-server lifecycle and hardware ------------------------------------
+
+def _servers_config():
+    """The config the server manager should inspect: the open project's live
+    config, else the user's global selection (never a hardware probe)."""
+    with STATE.lock:
+        cfg = STATE.cfg
+    return cfg if cfg is not None else STATE.global_config()
+
+
+def _server_payload(config, memory=None) -> dict:
+    from .. import servers
+    out = servers.server_summary(config)
+    if memory is not None:
+        out["memory"] = memory
+        out["hardware"] = memory
+        out["vram"] = memory["vram"]
+        out["ram"] = memory["ram"]
+        out["badge"] = servers.memory_badge(memory)
+    return out
+
+
+@get("/api/servers")
+def _servers_get(q, body=None):
+    """Live VRAM/RAM plus every configured local server's online state and
+    resident model(s). Never errors when a server is asleep."""
+    try:
+        return 200, _server_payload(_servers_config())
+    except Exception as e:
+        from .. import servers
+        return 200, {"ok": False, "detail": f"{type(e).__name__}: {e}",
+                     "memory": servers.get_hardware_memory(),
+                     "servers": []}
+
+
+def _server_target(body):
+    return (body.get("server") or body.get("name")
+            or body.get("profile") or body.get("base_url") or "")
+
+
+@post("/api/servers/load")
+def _servers_load(q, body):
+    """Load a model on one configured local server and return fresh
+    hardware + server telemetry."""
+    from .. import servers
+    config = _servers_config()
+    target = _server_target(body)
+    model = str(body.get("model") or "").strip()
+    result = servers.load_server_model(target, model, config)
+    payload = _server_payload(config)
+    payload.update(result)
+    return (200 if result.get("ok") else 502), payload
+
+
+@post("/api/servers/unload")
+def _servers_unload(q, body):
+    """Unload a model (or every resident model) from one server, or from all
+    local servers when no target is named. Returns updated telemetry."""
+    from .. import servers
+    config = _servers_config()
+    target = _server_target(body)
+    model = str(body.get("model") or "").strip()
+    if target:
+        result = servers.unload_server_model(target, model, config)
+        results = [result]
+    else:
+        results = servers.unload_all_local_servers(config)
+        result = {"ok": all(r.get("ok") for r in results),
+                  "action": "unload", "server": "all",
+                  "detail": f"{sum(1 for r in results if r.get('ok'))} of "
+                            f"{len(results)} server(s) acknowledged"}
+    payload = _server_payload(config)
+    payload.update(result)
+    payload["results"] = results
+    return (200 if result.get("ok") or not results else 502), payload
+
+
+@post("/api/servers/auto-evict")
+def _servers_auto_evict(q, body):
+    """Toggle the auto-unload-other-servers handshake and apply it live."""
+    enabled = bool(body.get("enabled", body.get("auto_evict_servers", True)))
+    with STATE.lock:
+        cfg = STATE.cfg
+        if cfg is not None:
+            cfg.auto_evict_servers = enabled
+    try:
+        settings_api.apply_changes("user", None,
+                                   {"auto_evict_servers": enabled}, [])
+    except ConfigError:
+        pass
+    return 200, {"ok": True, "auto_evict_servers": enabled}
+
+
+@post("/api/effort")
+def _effort(q, body):
+    """Set reasoning_effort for the live run and persist it as a user setting.
+
+    Local-MoE and reasoning-capable hosted models both read the key; the
+    transport omits it for "default" and for models without the control."""
+    from .. import config as config_mod
+    level = str(body.get("level",
+                         body.get("reasoning_effort", "default"))).strip().lower()
+    if level not in ("default", "low", "medium", "high"):
+        return 400, {"ok": False,
+                     "detail": "reasoning effort must be default, low, "
+                               "medium or high"}
+    with STATE.lock:
+        cfg = STATE.cfg
+        if cfg is not None:
+            cfg.reasoning_effort = level
+            cfg.sources["reasoning_effort"] = "GUI Effort selector"
+    try:
+        settings_api.apply_changes("user", None,
+                                   {"reasoning_effort": level}, [])
+    except ConfigError:
+        # A scratchpad/no-config session still gets the live switch; the
+        # setting is persisted as soon as a config file exists.
+        pass
+    return 200, {"ok": True, "reasoning_effort": level,
+                 "model_class": (config_mod.capability_profile(cfg)
+                                 if cfg is not None else "")}
+
+
 @post("/api/project/check")
 def _project_check(q, body):
     """Run one on-demand project check: diagnose, webcheck or domcheck."""

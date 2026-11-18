@@ -302,6 +302,27 @@ def _global_project(profile: str = "") -> SimpleNamespace:
                            client=LLMClient(cfg), idx=None, agent=None)
 
 
+def _evict_other_servers(cfg) -> None:
+    """Unload models resident on OTHER local servers before a run.
+
+    The handshake is a no-op with one server, with `auto_evict_servers` off,
+    or when every other server is asleep. It runs in the job's worker thread,
+    so a slow unload never blocks the page."""
+    try:
+        from .. import servers
+        result = servers.evict_other_local_servers(
+            getattr(cfg, "active_profile", "") or cfg.base_url, cfg)
+    except Exception:
+        return
+    evicted = [r for r in result.get("evicted", []) if r]
+    if evicted:
+        names = ", ".join(str(r.get("server") or r.get("base_url") or "?")
+                          for r in evicted)
+        STATE.add_message(
+            "system", f"Unloaded {names} from another local server so this "
+                      "run can use the VRAM/RAM.", kind="servers")
+
+
 def _swap_index(idx) -> None:
     with STATE.lock:
         STATE.idx = idx
@@ -769,6 +790,7 @@ def run_task(job: Job, opts: dict) -> None:
     steps = int(opts.get("steps") or 0)
     cfg, client, root = p.cfg, p.client, p.root
 
+    _evict_other_servers(cfg)
     saved_steps = cfg.max_steps
     saved_creative = cfg.creative_mode
     if steps > 0:
@@ -898,6 +920,7 @@ def run_explain(job: Job, opts: dict) -> None:
         p = _project()
     _echo_user("explain", opts.get("text", "") or question,
                opts.get("attachments"), opts)
+    _evict_other_servers(p.cfg)
     with session(p, job, interactive=False, lock=False) as feed:
         p.client.warmup()
         if p.agent is not None:
@@ -1007,6 +1030,7 @@ def run_auto(job: Job, opts: dict) -> None:
     with STATE.lock:
         STATE.last_auto = {"text": opts.get("text", ""), "plan_file": plan_file}
     cfg, client, root = p.cfg, p.client, p.root
+    _evict_other_servers(cfg)
     plan_path = Path(plan_file) if plan_file else root / cfg.auto_plan_file
     if not plan_path.is_absolute():
         plan_path = (root / plan_path).resolve()
