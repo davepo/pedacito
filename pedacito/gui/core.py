@@ -1528,6 +1528,13 @@ class State:
             # No project open: the topbar still offers every global profile,
             # the selected model, and the auto-route/thinking toggles.
             cfg = self.global_config()
+        # Workspace security is a disk scan, so it stays outside the state
+        # lock and behind a short cache; a run/ack/fix clears the cache.
+        try:
+            security_payload = security.security_status(
+                root, cfg, use_cache=True)
+        except Exception:
+            security_payload = security.security_status(None, cfg)
         with self.lock:
             meta = self.index_meta
             indexed = idx is not None or meta["indexed"]
@@ -1669,6 +1676,9 @@ class State:
                 "auto_evict_servers": (bool(cfg.auto_evict_servers)
                                        if cfg else True),
                 "allow_steering": bool(cfg.allow_steering) if cfg else False,
+                # Non-blocking security banner: unacknowledged secrets and
+                # unignored .env files, masked and fingerprint-only.
+                "security": security_payload,
                 # specialist routing (#50): the topbar toggle's state
                 "auto_route_specialties": (bool(cfg.auto_route_specialties)
                                            if cfg else False),

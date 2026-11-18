@@ -35,6 +35,7 @@ from . import instructions as instructions_mod
 from . import proc as proc_mod
 from . import ratchet as ratchet_mod
 from . import review as review_mod
+from . import security as security_mod
 from . import testsel
 from . import todo as todo_mod
 from .edits import Result, parse_edits
@@ -4457,6 +4458,13 @@ def _run_task_once(root: Path, cfg, client, agent, idx, task: str, *,
                 "clauses": list(clauses.get(fileio_norm(r.file), ()))}
                for r in results],
         clause_texts=clause_texts, unaccepted=unaccepted)
+    # Post-run hygiene, non-blocking: scan the files this task touched plus
+    # the workspace's sensitive-file ignore state, then emit a masked notice
+    # for the GUI banner / TUI transcript. A scan failure never fails a run.
+    try:
+        security_mod.emit_post_run_notice(root, cfg, files=changed)
+    except Exception:
+        pass
     if stats.get("calls"):
         print(f"[task: {stats['calls']} calls, {stats['prompt_tokens']:,} "
               f"in / {stats['completion_tokens']:,} out tokens, cache hit "

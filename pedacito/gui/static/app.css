@@ -490,6 +490,29 @@ details pre { background: var(--code-bg); border: 1px solid var(--line); border-
 #modeTabs button.on { background: var(--panel2); color: var(--accent); font-weight: 700; }
 #modeHint { margin: 0; font-size: 11.5px; color: var(--muted); text-align: center; flex: none; }
 #modeHint button { margin: 0 3px; }
+/* Non-blocking security notice: unacknowledged secrets or unignored .env
+ * files in the workspace. Yellow, dismissible, and never blocks a run. */
+#securityNotice { display: flex; flex-direction: column; gap: 6px;
+  padding: 8px 12px; border-bottom: 1px solid var(--warn);
+  background: color-mix(in srgb, var(--warn) 14%, var(--panel));
+  color: var(--text); font-size: 12px; flex: none; }
+#securityNotice .security-head { display: flex; align-items: center;
+  gap: 8px; flex-wrap: wrap; font-weight: 700; color: var(--warn); }
+#securityNotice .security-head .grow { flex: 1; color: var(--text);
+  font-weight: 400; }
+#securityNotice .security-list { display: flex; flex-direction: column;
+  gap: 3px; margin: 0; padding: 0; list-style: none; }
+#securityNotice .security-row { display: flex; align-items: center;
+  gap: 8px; flex-wrap: wrap; }
+#securityNotice .security-row code { font-family: var(--mono);
+  font-size: 11.5px; background: var(--code-bg); border: 1px solid var(--line);
+  border-radius: 4px; padding: 1px 5px; }
+#securityNotice .security-row .mask { font-family: var(--mono);
+  color: var(--muted); }
+#securityNotice .security-row button { flex: none; }
+#securityNotice .security-actions { display: flex; gap: 8px;
+  flex-wrap: wrap; align-items: center; }
+
 /* Task-vs-Auto suitability: a subtle live banner while an Auto draft reads as
  * a single-pass edit, and the pre-run "Run as a single-pass Task instead?"
  * confirmation bar with its two one-click choices. */

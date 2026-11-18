@@ -46,6 +46,7 @@ from pathlib import Path
 from . import events as events_mod
 from . import gitinfo
 from . import index as index_mod
+from . import llm as llm_mod
 from . import loop
 from . import memory as memory_mod
 from . import modelcard
@@ -118,7 +119,7 @@ _SLASH_COMMANDS = [
     "/help", "/keys", "/status", "/telemetry", "/new", "/auto", "/auto!", "/plan",
     "/consolidate", "/compact", "/profile", "/profiles", "/model",
     "/auto-route", "/think", "/effort", "/creative", "/servers", "/unload",
-    "/apply", "/skills", "/memory", "/procs",
+    "/apply", "/skills", "/memory", "/procs", "/security",
     "/diff", "/undo", "/reset", "/sidebar", "/scroll", "/mouse", "/clear",
     "/quit", "/exit",
 ]
@@ -180,6 +181,9 @@ Pedacito TUI commands
   /skills [list|show NAME|draft TEXT]
   /memory [list|add FACT|forget TEXT]
   /procs [list|logs NAME|stop NAME]
+  /security                 scan and show unacknowledged secrets / .env files
+  /security ack             acknowledge every current secret finding
+  /security gitignore       add .env patterns to .gitignore
   /diff                     git status and working-tree diff
   /undo                     restore the newest .pedacito/backups snapshot
   /reset                    wipe .pedacito state (keeps memory and config)
@@ -528,6 +532,9 @@ class TuiSession:
         self._last_telemetry_key: tuple = ()
         self._headless_sent = 0
         self._headless_activity_sent = 0
+        # Security notices already printed in this session (fingerprints and
+        # unignored-file keys), so a run does not repeat the same warning.
+        self._security_notified: set[str] = set()
         self._watch_stop = threading.Event()
         self._watch_thread: threading.Thread | None = None
         self._git_cache: tuple[float, dict] = (0.0, {})
@@ -2041,11 +2048,179 @@ class TuiSession:
             self._append("green ratchet: this step was rolled back", "error")
         self._dirty = True
 
+    # ------------------------------------------------------------ security
+    def _security_outbound_guard(self, text: str) -> bool:
+        """Ask before a prompt carrying a secret leaves for a cloud provider.
+
+        Returns False only when the user cancels. Non-interactive sessions
+        choose auto-redaction, exactly like the CLI. Loopback/LAN providers
+        are never inspected.
+        """
+        cfg = self.cfg
+        try:
+            cfg._outbound_acknowledge_secrets = False
+            cfg._outbound_redact_secrets = False
+        except Exception:
+            return True
+        if not llm_mod.is_external_provider(cfg):
+            return True
+        mode = security.outbound_mode(cfg)
+        if mode == "allow":
+            return True
+        if mode == "redact":
+            cfg._outbound_redact_secrets = True
+            return True
+        findings = security.unacknowledged_findings(
+            security.scan_text_for_secrets(str(text or ""), "<prompt>"),
+            self.root)
+        if not findings and self.interactive:
+            return True
+        if not self.interactive:
+            # A headless script must never park on a prompt. Set the run-wide
+            # redact flag so secrets found in gathered context are covered
+            # too, and report the decision without blocking.
+            cfg._outbound_redact_secrets = True
+            for finding in findings:
+                self._append(
+                    f"[security] {security.format_finding(finding)}", "receipt")
+            if findings:
+                self._append(
+                    "[security] non-interactive session: auto-redacting "
+                    "before sending to the external provider", "receipt")
+            return True
+        self._append(
+            "[security] This prompt contains credentials that would be "
+            "sent to an external provider:", "receipt")
+        for finding in findings:
+            self._append(
+                f"[security] {security.format_finding(finding)}", "receipt")
+        question = ("[security] [A]cknowledge & send / [R]edact & send / "
+                    "[C]ancel (default: R):")
+        self._set_banner(question)
+        self._append(question, "activity")
+        self._redraw(force=True)
+        answer = self._read_answer_line()
+        self.input_buf = ""
+        self.cursor_pos = 0
+        self._set_banner("")
+        first = ((answer or "").strip().lower().split() or ["r"])[0]
+        if first in ("c", "cancel", "n", "no"):
+            self._append("[security] cancelled; nothing was sent", "receipt")
+            self._dirty = True
+            return False
+        if first in ("a", "ack", "acknowledge", "y", "yes"):
+            security.acknowledge_findings(
+                self.root, [f.fingerprint for f in findings])
+            cfg._outbound_acknowledge_secrets = True
+            self._append(
+                f"[security] acknowledged {len(findings)} finding(s); "
+                "sending as-is", "receipt")
+        else:
+            cfg._outbound_redact_secrets = True
+            self._append("[security] redacting secrets before sending",
+                         "receipt")
+        self._dirty = True
+        return True
+
+    def _security_notice(self, files=None) -> dict:
+        """Print a non-blocking `[security]` notice after a run."""
+        try:
+            status = security.security_status(
+                self.root, self.cfg, files=files, use_cache=False)
+        except Exception:
+            return {}
+        new_keys: list[str] = []
+        lines: list[str] = []
+        for finding in status.get("findings", []):
+            key = str(finding.get("fingerprint") or "")
+            if not key or key in self._security_notified:
+                continue
+            self._security_notified.add(key)
+            new_keys.append(key)
+            lines.append(
+                "[security] secret at "
+                f"{finding.get('file', '?')}:{finding.get('line', '?')} "
+                f"[{finding.get('kind', '?')}] "
+                f"{finding.get('masked_preview', '***')}")
+        for item in status.get("unignored_sensitive_files", []):
+            rel = str(item.get("file") or "")
+            key = "file:" + rel
+            if not rel or key in self._security_notified:
+                continue
+            self._security_notified.add(key)
+            new_keys.append(key)
+            lines.append(
+                f"[security] {rel} is not ignored by .gitignore")
+        if not new_keys:
+            return status
+        self._append("[security] Security notice (unacknowledged findings):",
+                     "receipt")
+        for line in lines[:12]:
+            self._append(line, "receipt")
+        if len(lines) > 12:
+            self._append(f"[security] ... and {len(lines) - 12} more",
+                         "receipt")
+        self._append(
+            "[security] Non-blocking: nothing was changed. Run /security for "
+            "details, /security ack to ignore secret findings, or "
+            "/security gitignore to add .env patterns.", "receipt")
+        return status
+
+    def _security(self, arg: str) -> None:
+        """`/security`, `/security ack`, `/security gitignore`."""
+        sub = (arg or "").strip().lower().split(" ", 1)[0]
+        status = security.security_status(
+            self.root, self.cfg, use_cache=False)
+        if sub in ("ack", "acknowledge", "ignore"):
+            fingerprints = [f["fingerprint"] for f in
+                            status.get("findings", []) if f.get("fingerprint")]
+            if not fingerprints:
+                self._append("[security] No unacknowledged secrets to "
+                             "acknowledge.", "system")
+                return
+            security.acknowledge_findings(self.root, fingerprints)
+            self._security_notified.clear()
+            self._append(
+                f"[security] Acknowledged {len(fingerprints)} finding(s); "
+                "the same keys will not be reported again.", "system")
+            return
+        if sub in ("gitignore", "ignore-files"):
+            added = security.ensure_gitignore_entries(self.root)
+            if added:
+                self._append(
+                    "[security] Added to .gitignore: " + ", ".join(added),
+                    "system")
+            else:
+                self._append(
+                    "[security] .gitignore already covers .env patterns.",
+                    "system")
+            self._security_notified.clear()
+            return
+        if not status.get("secrets_found") and not status.get("env_unignored"):
+            self._append(
+                "[security] No unacknowledged secrets or unignored .env "
+                "files detected.", "system")
+            return
+        self._append("[security] Workspace scan:", "system")
+        for finding in status.get("findings", []):
+            self._append(
+                "[security] " + security.format_finding(finding), "receipt")
+        for item in status.get("unignored_sensitive_files", []):
+            self._append(
+                f"[security] {item.get('file', '?')} is not ignored by "
+                ".gitignore", "receipt")
+        self._append(
+            "[security] /security ack acknowledges secret findings; "
+            "/security gitignore adds .env patterns.", "system")
+
     def run_task(self, task: str) -> None:
         """Run one plain-text coding task, keeping the UI live while it runs."""
         self._context_override = None
         self._event_active = ""
         self._append(f"\u00bb {task}", "user")
+        if not self._security_outbound_guard(task):
+            self._redraw(force=True)
+            return
         self._evict_servers()
         client, agent, idx = self._ensure_backend()
         cfg = self.cfg
@@ -2071,10 +2246,12 @@ class TuiSession:
             else:
                 self._append(f"ERROR: {type(error).__name__}: {error}",
                              "error")
+            self._security_notice()
             self._report_run_telemetry(holder)
             self._redraw(force=True)
             return
         self._record_result(task, holder.get("result"))
+        self._security_notice()
         self._report_run_telemetry(holder)
         self._redraw(force=True)
 
@@ -2128,6 +2305,9 @@ class TuiSession:
         cfg = self.cfg
         plan_path = self._plan_path()
         self._append(f"\u00bb /auto {goal}", "user")
+        if not self._security_outbound_guard(goal):
+            self._redraw(force=True)
+            return
         self._refresh_warmup(client)
 
         def work():
@@ -2158,6 +2338,7 @@ class TuiSession:
                 self._append(f"auto finished with exit code {result}",
                              "system")
             self._append("auto loop finished", "system")
+        self._security_notice()
         self._report_run_telemetry(holder)
         self._sync_telemetry()
         self._redraw(force=True)
@@ -2179,6 +2360,9 @@ class TuiSession:
             target = self.root / target
         target = target.resolve()
         prompt = " ".join(parts[1].split())
+        if not self._security_outbound_guard(prompt):
+            self._redraw(force=True)
+            return
         if target.is_dir():
             entries = sorted(p.name for p in target.iterdir()
                              if not scaffold.is_harness_owned(p.name))
@@ -2217,6 +2401,7 @@ class TuiSession:
         # rebuilt from disk once the scaffold has landed its files.
         self.agent = None
         self.modified = []
+        self._security_notified.clear()
         self.resume_context = ""
         try:
             workspace.ensure(target, self.cfg.manage_gitignore,
@@ -2274,6 +2459,7 @@ class TuiSession:
         except (SystemExit, Exception):
             pass
         self.agent = None
+        self._security_notice()
         self._report_run_telemetry(holder)
         self._sync_telemetry()
         self._redraw(force=True)
@@ -2342,6 +2528,9 @@ class TuiSession:
             return
         if cmd in ("status", "telemetry"):
             self._append(self.status_report(), "system")
+            return
+        if cmd == "security":
+            self._security(arg)
             return
         if cmd == "cost":
             self._append(self.status_report(), "system")

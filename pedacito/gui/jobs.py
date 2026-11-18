@@ -27,6 +27,7 @@ from .. import fileio, gitinfo
 from .. import index as index_mod
 from .. import loop, scaffold, steering, workspace
 from .. import plan as plan_mod
+from .. import security as security_mod
 from ..agent import Agent
 from ..config import ConfigError
 from ..llm import LLMClient, LLMError
@@ -224,6 +225,18 @@ class _Feed:
         elif kind == "complex_auto":
             self.activity(str(f.get("text") or
                               "Auto-enabled Complex scaffolding."))
+        elif kind == "security_redacted":
+            # Auto-redaction happened inside the LLM transport: surface the
+            # notification in the page, never the raw secret.
+            message = str(f.get("message") or
+                          "Auto-redacted secrets before sending.")
+            self.activity("[security] " + message)
+            STATE.bus.publish("security", message=message)
+        elif kind == "security_notice":
+            # A post-run scan found something: the banner refreshes from
+            # /api/state (the cache was invalidated by the scan).
+            STATE.bus.publish("security",
+                              message=str(f.get("message") or ""))
 
 
 @contextmanager
@@ -774,6 +787,34 @@ def restore_snapshot(name: str = "") -> tuple[bool, str]:
 
 # --- the four ways of working ----------------------------------------------------
 
+def _apply_security_choices(cfg, opts: dict) -> None:
+    """Carry the GUI preflight's three-way choice into this run.
+
+    `acknowledge_secrets` sends the request as-is (and persists the
+    fingerprints); `redact_secrets` replaces every detected secret before
+    the request leaves. Reset on every run so one choice never leaks into
+    the next prompt.
+    """
+    try:
+        cfg._outbound_acknowledge_secrets = bool(
+            opts.get("acknowledge_secrets"))
+        cfg._outbound_redact_secrets = bool(opts.get("redact_secrets"))
+    except Exception:
+        pass
+
+
+def _security_post_run(root, cfg, files=None) -> None:
+    """Refresh and announce the non-blocking workspace security banner."""
+    try:
+        status = security_mod.security_status(
+            root, cfg, files=files, use_cache=False)
+        security_mod.clear_security_cache(root)
+        if status.get("secrets_found") or status.get("env_unignored"):
+            STATE.bus.publish("security", security=status)
+    except Exception:
+        pass
+
+
 def run_task(job: Job, opts: dict) -> None:
     """`ask`: gather, edit, and review or write. `write` is "review" (sign off
     in the page) or "apply" (write now, backups first)."""
@@ -789,6 +830,7 @@ def run_task(job: Job, opts: dict) -> None:
     plan_pref = opts.get("plan", "auto")
     steps = int(opts.get("steps") or 0)
     cfg, client, root = p.cfg, p.client, p.root
+    _apply_security_choices(cfg, opts)
 
     _evict_other_servers(cfg)
     saved_steps = cfg.max_steps
@@ -838,6 +880,7 @@ def run_task(job: Job, opts: dict) -> None:
     finally:
         cfg.max_steps = saved_steps
         cfg.creative_mode = saved_creative
+        _security_post_run(root, cfg)
 
 
 def _now() -> float:
@@ -1030,6 +1073,7 @@ def run_auto(job: Job, opts: dict) -> None:
     with STATE.lock:
         STATE.last_auto = {"text": opts.get("text", ""), "plan_file": plan_file}
     cfg, client, root = p.cfg, p.client, p.root
+    _apply_security_choices(cfg, opts)
     _evict_other_servers(cfg)
     plan_path = Path(plan_file) if plan_file else root / cfg.auto_plan_file
     if not plan_path.is_absolute():
@@ -1100,6 +1144,7 @@ def run_auto(job: Job, opts: dict) -> None:
             level="ok" if code == 0 else "warn", auto=True,
             files=changed, changed=changed, git=git_status,
             stats=_usage_stats(client))
+    _security_post_run(root, cfg, files=changed or None)
 
 
 def _int_or_none(value) -> int | None:
@@ -1147,6 +1192,7 @@ def run_new(job: Job, opts: dict) -> None:
             parent = parent.parent
         args = args_for(str(parent), profile)
         cfg = cli_mod._config(args)
+        _apply_security_choices(cfg, opts)
         if "creative" in opts:
             cfg.creative_mode = bool(opts.get("creative"))
         client = LLMClient(cfg)
@@ -1163,6 +1209,7 @@ def run_new(job: Job, opts: dict) -> None:
         job.project_root = str(target)
         with STATE.lock:
             cfg, client = STATE.cfg, STATE.client
+        _apply_security_choices(cfg, opts)
         if "creative" in opts:
             cfg.creative_mode = bool(opts.get("creative"))
         client.check(warn=False)
@@ -1222,6 +1269,7 @@ def run_new(job: Job, opts: dict) -> None:
                  else "no index yet")
         STATE.add_message("system", f"Opened {target} \u2014 {state}.",
                           kind="opened", needs_index=idx is None)
+    _security_post_run(target, cfg)
 
 
 # --- plan files -----------------------------------------------------------------

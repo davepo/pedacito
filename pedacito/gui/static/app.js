@@ -715,6 +715,10 @@ function connect(seq) {
   on('term', (e) => termFeed(e.text));
   on('term_clear', () => { if (term) term.reset(''); });
   on('usage', () => refreshState());
+  on('security', (e) => {
+    if (e && e.message) PDC.toast(e.message);
+    refreshState();
+  });
   on('job', (e) => {
     // A finished New job carries the project it created: adopt the workspace
     // (path box, Task mode, session view) right here, then resync everything.
@@ -1002,6 +1006,54 @@ function runAutoAnyway() {
   send(true);                              // POST /api/auto with force_auto
 }
 
+// ---- Non-blocking secret guard: preflight + 3-way choice --------------------
+// Before a request can leave for an external provider, POST /api/security/scan
+// returns only masked findings. Localhost/LAN endpoints never ask. The user
+// gets exactly the three choices the warning promises: acknowledge, redact,
+// or cancel. Acknowledged fingerprints persist server-side.
+function askSecurityChoice(scan) {
+  return new Promise((resolve) => {
+    let settled = false;
+    const done = (v) => { if (!settled) { settled = true; resolve(v); } };
+    const rows = (scan.findings || []).map((f) => h('li', {
+      key: f.fingerprint, class: 'security-row'
+    },
+      h('code', { text: f.file + ':' + f.line }),
+      h('span', { class: 'mask', text: '[' + f.kind + '] ' + f.masked_preview })));
+    const body = h('div', {},
+      h('p', { class: 'muted', style: 'margin-top:0',
+        text: 'These credentials are about to be sent to ' +
+          (scan.provider || 'an external provider') + ':' }),
+      h('ul', { class: 'security-list' }, rows),
+      h('p', { class: 'muted', text: 'Acknowledge & Send As-Is keeps the request unchanged and will not ask again for these keys. Redact Secrets & Send replaces each with <REDACTED_SECRET>.' }));
+    PDC.modal('Secrets detected in this request', body, [
+      { label: 'Cancel', onclick: () => done(null) },
+      { label: 'Redact Secrets & Send', primary: true, onclick: () => done('redact') },
+      { label: 'Acknowledge & Send As-Is', onclick: () => done('ack') }
+    ], { wide: true, onClose: () => done(null) });
+  });
+}
+
+async function securityPreflight(body) {
+  let scan = null;
+  try {
+    scan = await PDC.api('/api/security/scan', {
+      text: body.text || '', mode: body.mode || '',
+      attachments: (body.attachments || []).map((a) => ({ name: a.name, text: a.text }))
+    });
+  } catch (e) { return { send: true, choice: '' }; }
+  if (!scan || !scan.needs_confirmation) return { send: true, choice: '' };
+  const choice = await askSecurityChoice(scan);
+  if (!choice) return { send: false, choice: '' };
+  if (choice === 'ack') {
+    // Persist the prompt's fingerprints immediately: an acknowledged key
+    // must not be raised again, even if this run is interrupted.
+    const fps = (scan.findings || []).map((f) => f.fingerprint);
+    if (fps.length) PDC.api('/api/security/ack', { fingerprints: fps }).catch(() => {});
+  }
+  return { send: true, choice: choice };
+}
+
 async function send(forceAuto) {
   const s = S.status, j = s.job;
   const text = (S.drafts[S.mode] || '').trim();
@@ -1062,6 +1114,12 @@ async function send(forceAuto) {
     }
     if (forceAuto) body.force_auto = true;
   }
+  // Outbound secret preflight (external providers only): acknowledge, redact
+  // or cancel before any bytes leave the machine. Local endpoints skip it.
+  const pre = await securityPreflight(body);
+  if (!pre.send) return;
+  if (pre.choice === 'ack') body.acknowledge_secrets = true;
+  else if (pre.choice === 'redact') body.redact_secrets = true;
   // "Run Auto Anyway" addresses the Auto alias directly with force_auto:true;
   // every other run goes through the shared /api/run starter.
   const starter = (S.mode === 'auto' && forceAuto)
@@ -3655,6 +3713,65 @@ function diffMode() {
   return S.ui.diffOpen ? 'expanded' : 'collapsed';
 }
 
+// ---- Non-blocking Security Notice banner -----------------------------------
+// Shown above the workspace whenever /api/state reports unacknowledged
+// secrets or unignored sensitive files. It never blocks the composer: every
+// action is an explicit HTTP call, and Dismiss hides it for this page session.
+function SecurityBanner() {
+  const sec = S.status.security || {};
+  const findings = sec.findings || [];
+  const files = sec.unignored_sensitive_files || [];
+  if ((!findings.length && !files.length) || S.ui.securityDismissed) return null;
+  const ack = (fingerprint) => {
+    PDC.api('/api/security/ack', { fingerprints: [fingerprint] })
+      .then(refreshState, () => PDC.toast('Could not acknowledge that finding.', true));
+  };
+  const ackAll = () => {
+    PDC.api('/api/security/ack', { all: true })
+      .then(refreshState, () => PDC.toast('Could not acknowledge findings.', true));
+  };
+  const gitignore = () => {
+    PDC.api('/api/security/gitignore', {})
+      .then((j) => { PDC.toast('Added ' + ((j.added || []).join(', ') || '.env') + ' to .gitignore.'); refreshState(); },
+        () => PDC.toast('Could not update .gitignore.', true));
+  };
+  return html`
+    <div id="securityNotice" role="status" aria-live="polite">
+      <div class="security-head">
+        <span>\u26A0 Security Notice</span>
+        <span class="grow">Potential credentials are present in this workspace. Nothing was sent or changed without your choice.</span>
+        <button class="ghost small" title="dismiss this notice for now"
+                onClick=${() => { S.ui.securityDismissed = true; emit(); }}>Dismiss</button>
+      </div>
+      ${findings.length ? html`
+        <ul class="security-list">
+          ${findings.map((f) => html`
+            <li key=${f.fingerprint} class="security-row">
+              <code>${f.file}:${f.line}</code>
+              <span class="mask">[${f.kind}] ${f.masked_preview}</span>
+              <button class="small" title="ignore this exact key from now on"
+                      onClick=${() => ack(f.fingerprint)}>Acknowledge (Ignore)</button>
+            </li>`)}
+        </ul>
+        ${findings.length > 1 ? html`
+          <div class="security-actions">
+            <button class="small" onClick=${ackAll}>Acknowledge all (${findings.length})</button>
+          </div>` : null}` : null}
+      ${files.length ? html`
+        <ul class="security-list">
+          ${files.map((f) => html`
+            <li key=${'file:' + f.file} class="security-row">
+              <code>${f.file}</code>
+              <span class="mask">${f.kind === 'unignored_env' ? 'environment secrets file' : 'credential file'} is not ignored by .gitignore</span>
+            </li>`)}
+        </ul>` : null}
+      ${(sec.unignored_env || []).length ? html`
+        <div class="security-actions">
+          <button class="small primary" onClick=${gitignore}>Add .env to .gitignore</button>
+        </div>` : null}
+    </div>`;
+}
+
 function App() {
   const [, force] = useState(0);
   const appRef = useRef(null);
@@ -3669,6 +3786,7 @@ function App() {
   return html`
     <div id="shell">
       <${TopBar} />
+      <${SecurityBanner} />
       <main id="app" ref=${appRef} data-diff=${dm}>
         <section class="panel" id="chatPanel">
           <div class="panel-head">

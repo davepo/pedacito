@@ -361,6 +361,100 @@ def _settings(q, body=None):
     return 200, settings_api.payload()
 
 
+# --- non-blocking secret & credential guard ------------------------------------
+
+def _security_cfg():
+    """The live config (global fallback when no project is open)."""
+    return _how_config()
+
+
+@get("/api/security/status")
+def _security_status(q, body=None):
+    """Unacknowledged secrets and unignored sensitive files, masked."""
+    root = _project_root()
+    return 200, security.security_status(root, _security_cfg(),
+                                         use_cache=False)
+
+
+@post("/api/security/scan")
+def _security_scan(q, body):
+    """Preflight for an outbound prompt.
+
+    The page asks this before a run: `needs_confirmation` is True only when
+    the endpoint is external, the workspace policy is "warn", and the text
+    carries unacknowledged secrets. Localhost/LAN providers never trigger a
+    pause even when the prompt contains a key.
+    """
+    from .. import llm as llm_mod
+    root = _project_root()
+    cfg = _security_cfg()
+    parts = [str(body.get("text") or "")]
+    # Attachments are composed into the same outbound prompt; scan them too so
+    # a pasted `.env` cannot bypass the preflight.
+    for attachment in body.get("attachments") or []:
+        if isinstance(attachment, dict):
+            attached = str(attachment.get("text") or "")
+            if attached:
+                parts.append(attached)
+    text = "\n\n".join(part for part in parts if part)
+    prompt = security.unacknowledged_findings(
+        security.scan_text_for_secrets(text, "<prompt>"), root)
+    status = security.security_status(root, cfg, use_cache=False)
+    external = llm_mod.is_external_provider(cfg)
+    mode = security.outbound_mode(cfg)
+    out = {
+        **status,
+        "ok": True,
+        "external_provider": external,
+        "workspace_findings": status.get("findings", []),
+        "findings": [finding.to_dict() for finding in prompt],
+        "prompt_findings": [finding.to_dict() for finding in prompt],
+        "needs_confirmation": bool(prompt) and external and mode == "warn",
+    }
+    return 200, out
+
+
+@post("/api/security/ack")
+def _security_ack(q, body):
+    """Persist SHA-256 fingerprints only; the API never sees a raw secret."""
+    root = _project_root()
+    if root is None:
+        return 400, {"ok": False, "detail": "No project is open."}
+    cfg = _security_cfg()
+    values = body.get("fingerprints") or []
+    if not isinstance(values, list):
+        values = [values]
+    if body.get("all"):
+        status = security.security_status(root, cfg, use_cache=False)
+        values = values + [f["fingerprint"] for f in status.get("findings", [])]
+    acknowledged = security.acknowledge_findings(root, values)
+    security.clear_security_cache(root)
+    return 200, {
+        "ok": True,
+        "acknowledged": sorted(acknowledged),
+        **security.security_status(root, cfg, use_cache=False),
+    }
+
+
+@post("/api/security/gitignore")
+def _security_gitignore(q, body):
+    """Append the missing `.env` patterns to the workspace `.gitignore`."""
+    root = _project_root()
+    if root is None:
+        return 400, {"ok": False, "detail": "No project is open."}
+    patterns = body.get("patterns")
+    if not isinstance(patterns, list) or not patterns:
+        patterns = [".env", ".env.*"]
+    added = security.ensure_gitignore_entries(root, patterns)
+    security.clear_security_cache(root)
+    cfg = _security_cfg()
+    return 200, {
+        "ok": True,
+        "added": added,
+        **security.security_status(root, cfg, use_cache=False),
+    }
+
+
 @get("/api/mcp/tools")
 def _mcp_tools(q, body=None):
     """The named-MCP-server tool inventory for the GUI: every listed tool

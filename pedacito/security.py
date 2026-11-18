@@ -48,9 +48,15 @@ asks for its own elevated trust.
 from __future__ import annotations
 
 import fnmatch
+import hashlib
 import ipaddress
+import json
+import os
+import re
 import socket
 import threading
+import time
+from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from urllib.parse import urlparse
 
@@ -65,20 +71,38 @@ __all__ = [
     "CAT_WEB_ACCESS",
     "DENIED_MESSAGE",
     "MCP_DENIED_MESSAGE",
+    "OUTBOUND_MODES",
+    "REDACTED_SECRET",
+    "SensitiveFileFinding",
+    "SecretFinding",
     "SecurityError",
+    "acknowledge_findings",
+    "check_git_secret_hygiene",
+    "clear_security_cache",
+    "ensure_gitignore_entries",
+    "format_finding",
     "install_permission_hook",
     "is_install_command",
     "is_private_host",
     "is_sensitive_path",
     "is_sensitive_rel",
+    "load_acknowledged_fingerprints",
+    "outbound_mode",
     "permission_broker_active",
     "permission_handler",
     "post_origin_allowed",
+    "redact_messages",
+    "redact_secrets_in_text",
     "request_permission",
     "resolve_checked",
     "resolve_safe_path",
+    "scan_messages_for_secrets",
+    "scan_text_for_secrets",
+    "scan_workspace_secrets",
+    "security_status",
     "set_permission_handler",
     "ssrf_error",
+    "unacknowledged_findings",
 ]
 
 
@@ -508,3 +532,765 @@ def is_install_command(argv) -> bool:
         return first in ("install", "ensurepip", "inject")
     # pip / pip3
     return first in _INSTALL_SUBCOMMANDS or first == "install"
+
+
+# =====================================================================
+# Non-blocking secret & credential guard
+# =====================================================================
+#
+# The scanner below is deliberately fast and local: plain regular
+# expressions over text already on disk or already about to leave the
+# machine. Nothing here ever blocks a run without the user's explicit
+# choice, and a finding never carries the raw secret into a UI payload or
+# an acknowledgment file. Severe findings are represented by a masked
+# preview plus a SHA-256 fingerprint.
+
+REDACTED_SECRET = "<REDACTED_SECRET>"
+OUTBOUND_MODES = ("warn", "redact", "allow")
+
+# Workspace scanning bounds: generous enough for a real project, small
+# enough that the GUI's status poll never stalls on a giant repository.
+_MAX_SCAN_FILES = 2500
+_MAX_SCAN_BYTES = 1_000_000
+_SKIP_SCAN_DIRS = {
+    ".git", ".hg", ".svn", ".pedacito", "node_modules", "__pycache__",
+    ".venv", "venv", "env", ".tox", ".mypy_cache", ".ruff_cache",
+    ".pytest_cache", "dist", "build", ".next", ".nuxt", "target",
+}
+
+# Rule order matters only for overlap suppression: specific token formats
+# win over the generic assignment rule.
+_TOKEN_RULES = (
+    ("api_key", re.compile(r"sk-[A-Za-z0-9_-]{20,}")),
+    ("pypi_token", re.compile(r"pypi-[A-Za-z0-9_-]{20,}")),
+    ("github_token", re.compile(
+        r"(?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9]{30,}"
+        r"|github_pat_[A-Za-z0-9_]{22,}")),
+    ("aws_access_key", re.compile(r"AKIA[0-9A-Z]{16}")),
+    ("google_api_key", re.compile(r"AIza[0-9A-Za-z_-]{35}")),
+    ("slack_token", re.compile(r"xox[baprs]-[0-9A-Za-z-]{10,}")),
+    ("private_key", re.compile(
+        r"-----BEGIN (?:RSA |EC |OPENSSH |DSA |PGP )?PRIVATE KEY-----")),
+)
+
+_GENERIC_ASSIGNMENT_RE = re.compile(
+    r"(?P<key>\b(?:api[_-]?key|secret|token|password|passwd|authorization)\b)"
+    r"(?P<sep>\s*[:=]\s*)"
+    r"(?P<quote>[\"'])"
+    r"(?P<value>[A-Za-z0-9_/+=-]{16,})"
+    r"(?P=quote)",
+    re.IGNORECASE,
+)
+
+_PEM_END_RE = re.compile(
+    r"-----END (?:RSA |EC |OPENSSH |DSA |PGP )?PRIVATE KEY-----")
+
+_PLACEHOLDER_WORDS = (
+    "your_", "your-", "yourkey", "changeme", "change_me", "change-me",
+    "example", "placeholder", "dummy", "sample", "redacted", "replace_me",
+    "replace-me", "insert_", "insert-", "not_a_real", "not-a-real",
+    "fake_", "fake-", "test_", "test-",
+)
+
+# File names whose presence in a repository is itself a hygiene problem
+# when `.gitignore` does not exclude them.
+_SENSITIVE_FILE_NAMES = {
+    ".env", ".env.local", ".env.production", ".pypirc", "id_rsa",
+    "id_ed25519", "credentials.json",
+}
+_ENV_TEMPLATE_NAMES = {
+    ".env.example", ".env.sample", ".env.template", ".env.dist",
+    ".env.defaults",
+}
+_ACK_SUBPATH = Path(".pedacito") / "security_ack.json"
+_ACK_RE = re.compile(r"\A[0-9a-f]{64}\Z")
+
+
+@dataclass(frozen=True)
+class SecretFinding:
+    """One detected secret. Only `file`, `line`, `kind`, `masked_preview`
+    and `fingerprint` are safe to serialise: raw match fields are excluded
+    from repr and never leave the scanner."""
+
+    file: str
+    line: int
+    kind: str
+    masked_preview: str
+    fingerprint: str
+    # Internal redaction data. repr/compare off so logging a finding can
+    # never print the raw secret.
+    raw_match: str = field(default="", repr=False, compare=False)
+    secret: str = field(default="", repr=False, compare=False)
+    start: int = field(default=0, repr=False, compare=False)
+    end: int = field(default=0, repr=False, compare=False)
+
+    def to_dict(self) -> dict:
+        return {
+            "file": self.file,
+            "line": self.line,
+            "kind": self.kind,
+            "masked_preview": self.masked_preview,
+            "fingerprint": self.fingerprint,
+        }
+
+    # A few call sites prefer the longer name.
+    as_dict = to_dict
+
+
+@dataclass(frozen=True)
+class SensitiveFileFinding:
+    """A sensitive file that exists but is not excluded by `.gitignore`."""
+
+    file: str
+    kind: str
+    detail: str = ""
+
+    def to_dict(self) -> dict:
+        return {"file": self.file, "kind": self.kind, "detail": self.detail}
+
+    as_dict = to_dict
+
+
+def _masked_preview(value: str, kind: str) -> str:
+    """A safe snippet: a short head, an ellipsis, and the last four chars.
+    PEM blocks show only their header (the body is the private material)."""
+    value = " ".join(str(value or "").split())
+    if kind == "private_key":
+        return "-----BEGIN ... PRIVATE KEY-----"
+    if len(value) <= 8:
+        return "***"
+    head_len = min(7, max(3, len(value) // 6))
+    return f"{value[:head_len]}...{value[-4:]}"
+
+
+def _looks_like_placeholder(value: str) -> bool:
+    """True for obvious stand-ins, env lookups and documentation samples."""
+    raw = str(value or "").strip()
+    low = raw.lower()
+    if not raw:
+        return True
+    if raw.startswith("<") and raw.endswith(">"):
+        return True
+    if low.startswith(("os.environ", "getenv(", "process.env", "${", "{{",
+                       "env:", "$")):
+        return True
+    if low in {"changeme", "change_me", "password", "secret", "token",
+               "example", "sample", "dummy", "xxxx", "xxx", "none", "null"}:
+        return True
+    if any(word in low for word in _PLACEHOLDER_WORDS):
+        return True
+    if re.fullmatch(r"[xX]+", raw) or re.fullmatch(r"\*+", raw):
+        return True
+    if raw.startswith("***") or "..." in raw or "\u2026" in raw:
+        return True
+    if re.fullmatch(r"\.+", raw):
+        return True
+    return False
+
+
+def _fingerprint(source: str, kind: str, raw_match: str) -> str:
+    material = f"{source}:{kind}:{raw_match}".encode("utf-8", "replace")
+    return hashlib.sha256(material).hexdigest()
+
+
+def _overlaps(start: int, end: int, spans) -> bool:
+    return any(start < e and end > s for s, e in spans)
+
+
+def _private_key_end(text: str, start: int) -> int:
+    """End of a PEM private-key block, or the header's end when unclosed."""
+    m = _PEM_END_RE.search(text, start)
+    return m.end() if m else start
+
+
+def scan_text_for_secrets(text: str, source_label: str = "<prompt>") -> list[SecretFinding]:
+    """Find known high-confidence credentials in `text`.
+
+    `source_label` is the relative file path, or `"<prompt>"` for text that
+    is not a file. Findings are ordered by position and include a masked
+    preview only; the raw match is kept in memory for redaction and is
+    excluded from `SecretFinding.to_dict()`.
+    """
+    source = str(source_label or "<prompt>")
+    body = str(text or "")
+    if not body:
+        return []
+
+    candidates: list[tuple[int, int, int, int, str, str, str]] = []
+    # (match_start, match_end, secret_start, secret_end, kind, raw, secret)
+    occupied: list[tuple[int, int]] = []
+
+    for kind, rx in _TOKEN_RULES:
+        for m in rx.finditer(body):
+            raw = m.group(0)
+            start, end = m.start(), m.end()
+            secret_start, secret_end = start, end
+            if kind == "private_key":
+                secret_end = _private_key_end(body, end)
+                secret_end = max(secret_end, end)
+            raw = body[start:end]
+            candidates.append(
+                (start, end, secret_start, secret_end, kind, raw,
+                 body[secret_start:secret_end]))
+            occupied.append((start, end))
+
+    for m in _GENERIC_ASSIGNMENT_RE.finditer(body):
+        start, end = m.start("value"), m.end("value")
+        if _overlaps(start, end, occupied):
+            continue                     # already reported by a token rule
+        value = m.group("value")
+        if _looks_like_placeholder(value):
+            continue
+        candidates.append(
+            (m.start(), m.end(), start, end, "credential_assignment",
+             m.group(0), value))
+
+    # Deduplicate identical spans and sort by position.
+    seen: set[tuple[int, int, str]] = set()
+    findings: list[SecretFinding] = []
+    for match_start, match_end, sec_start, sec_end, kind, raw, secret in sorted(
+            candidates, key=lambda c: (c[0], c[1], c[4])):
+        key = (sec_start, sec_end, kind)
+        if key in seen:
+            continue
+        seen.add(key)
+        findings.append(SecretFinding(
+            file=source,
+            line=body.count("\n", 0, match_start) + 1,
+            kind=kind,
+            masked_preview=_masked_preview(secret, kind),
+            fingerprint=_fingerprint(source, kind, raw),
+            raw_match=raw,
+            secret=secret,
+            start=sec_start,
+            end=sec_end,
+        ))
+    return findings
+
+
+def _iter_workspace_files(root: Path):
+    """Bounded text-ish file walk; ignores VCS/venv/build trees and the
+    guard's own state directory."""
+    stack = [Path(root)]
+    seen = 0
+    while stack and seen < _MAX_SCAN_FILES:
+        directory = stack.pop()
+        try:
+            entries = sorted(directory.iterdir(), key=lambda p: p.name.lower())
+        except OSError:
+            continue
+        for entry in entries:
+            if seen >= _MAX_SCAN_FILES:
+                return
+            try:
+                if entry.is_symlink():
+                    continue
+                if entry.is_dir():
+                    if entry.name.lower() not in _SKIP_SCAN_DIRS:
+                        stack.append(entry)
+                    continue
+                if not entry.is_file():
+                    continue
+                if entry.stat().st_size > _MAX_SCAN_BYTES:
+                    continue
+                seen += 1
+                yield entry
+            except OSError:
+                continue
+
+
+def _read_scan_text(path: Path) -> str | None:
+    try:
+        with path.open("rb") as fh:
+            data = fh.read(_MAX_SCAN_BYTES + 1)
+    except OSError:
+        return None
+    if len(data) > _MAX_SCAN_BYTES or b"\x00" in data[:4096]:
+        return None
+    return data.decode("utf-8", errors="replace")
+
+
+def scan_workspace_secrets(root, files=None) -> list[SecretFinding]:
+    """Scan workspace files for credentials. `files` limits the scan to the
+    named relative paths (used for a run's changed files); without it the
+    whole tree is walked under the standard bounds."""
+    if root is None:
+        return []
+    base = Path(str(root))
+    if not base.is_dir():
+        return []
+    try:
+        base_resolved = base.resolve()
+    except OSError:
+        return []
+    if files is None:
+        paths = list(_iter_workspace_files(base))
+    else:
+        paths = []
+        for rel in files:
+            rel = str(rel or "").strip()
+            if not rel:
+                continue
+            candidate = Path(rel)
+            if not candidate.is_absolute():
+                candidate = base / candidate
+            try:
+                resolved = candidate.resolve()
+                if not resolved.is_relative_to(base_resolved) or not resolved.is_file():
+                    continue
+                if resolved.stat().st_size > _MAX_SCAN_BYTES:
+                    continue
+            except OSError:
+                continue
+            paths.append(resolved)
+    findings: list[SecretFinding] = []
+    for path in paths:
+        try:
+            label = path.resolve().relative_to(base_resolved).as_posix()
+        except (OSError, ValueError):
+            label = path.name
+        text = _read_scan_text(path)
+        if text:
+            findings.extend(scan_text_for_secrets(text, label))
+    return findings
+
+
+def _content_text(content) -> str:
+    """Plain text of a message content field (string or multimodal list)."""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for part in content:
+            if isinstance(part, dict):
+                text = part.get("text")
+                if isinstance(text, str):
+                    parts.append(text)
+            elif isinstance(part, str):
+                parts.append(part)
+        return "\n".join(parts)
+    return ""
+
+
+def scan_messages_for_secrets(messages, root=None) -> list[SecretFinding]:
+    """Scan every message's text content for unacknowledged secrets."""
+    findings: list[SecretFinding] = []
+    for message in messages or []:
+        if not isinstance(message, dict):
+            continue
+        text = _content_text(message.get("content"))
+        if text:
+            findings.extend(scan_text_for_secrets(text, "<prompt>"))
+    return unacknowledged_findings(findings, root)
+
+
+def _ack_key(root) -> str:
+    if root is None:
+        return ""
+    try:
+        return str(Path(str(root)).expanduser().resolve())
+    except (OSError, ValueError):
+        return str(root)
+
+
+_SESSION_ACK: dict[str, set[str]] = {}
+_ACK_LOCK = threading.RLock()
+
+
+def _normalise_fingerprints(values) -> set[str]:
+    out: set[str] = set()
+    if isinstance(values, (str, SecretFinding)):
+        values = [values]
+    for item in values or ():
+        raw = item.fingerprint if isinstance(item, SecretFinding) else str(item or "")
+        raw = raw.strip().lower()
+        if _ACK_RE.match(raw):
+            out.add(raw)
+    return out
+
+
+def _read_ack_file(root) -> set[str]:
+    path = Path(str(root)) / _ACK_SUBPATH
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return set()
+    if isinstance(data, list):
+        values = data
+    elif isinstance(data, dict):
+        values = data.get("acknowledged")
+        if values is None:
+            values = data.get("fingerprints")
+        if not isinstance(values, list):
+            values = []
+    else:
+        values = []
+    return _normalise_fingerprints(values)
+
+
+def load_acknowledged_fingerprints(root) -> set[str]:
+    """Disk acknowledgments for `root` plus this process's session set."""
+    key = _ack_key(root)
+    with _ACK_LOCK:
+        session = set(_SESSION_ACK.get(key, set()))
+    disk = _read_ack_file(root) if root is not None else set()
+    return disk | session
+
+
+def acknowledge_findings(root, fingerprints) -> set[str]:
+    """Persist only SHA-256 fingerprints, never a raw secret.
+
+    Returns the workspace's full acknowledged set. A missing/unwritable
+    `.pedacito` is non-fatal: the in-memory session set still suppresses
+    the warning for the rest of this process.
+    """
+    wanted = _normalise_fingerprints(fingerprints)
+    key = _ack_key(root)
+    # One lock covers the session set and the file so two threads answering
+    # the same preflight cannot lose each other's fingerprints.
+    with _ACK_LOCK:
+        session = _SESSION_ACK.setdefault(key, set())
+        session.update(wanted)
+        clear_security_cache(root)
+        if root is None or not wanted:
+            return load_acknowledged_fingerprints(root)
+        path = Path(str(root)) / _ACK_SUBPATH
+        merged = _read_ack_file(root) | session
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            payload = json.dumps(
+                {"version": 1, "acknowledged": sorted(merged)},
+                indent=1) + "\n"
+            tmp = path.with_name(path.name + ".tmp")
+            tmp.write_text(payload, encoding="utf-8")
+            os.replace(tmp, path)
+        except OSError:
+            # Keep the session acknowledgment even when the file cannot land.
+            pass
+        return merged
+
+
+def unacknowledged_findings(findings, root=None) -> list[SecretFinding]:
+    """`findings` minus fingerprints the user already acknowledged."""
+    acked = load_acknowledged_fingerprints(root) if root is not None else set()
+    return [f for f in findings or () if f.fingerprint not in acked]
+
+
+def _redact_findings(text: str, findings) -> tuple[str, int]:
+    spans = sorted({(f.start, f.end) for f in findings
+                    if 0 <= f.start < f.end <= len(text)})
+    if not spans:
+        return text, 0
+    merged: list[tuple[int, int]] = []
+    for start, end in spans:
+        if merged and start <= merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+        else:
+            merged.append((start, end))
+    out, pos = [], 0
+    for start, end in merged:
+        out.append(text[pos:start])
+        out.append(REDACTED_SECRET)
+        pos = end
+    out.append(text[pos:])
+    return "".join(out), len(merged)
+
+
+def redact_secrets_in_text(text: str, root=None, *,
+                           redact_acknowledged: bool = False) -> str:
+    """Replace unacknowledged raw secrets with `<REDACTED_SECRET>`.
+
+    With no `root` every detected secret is redacted (there is no
+    acknowledgment store to consult). Pass `redact_acknowledged=True` to
+    force redaction even for a finding the user marked as ignored.
+    """
+    body = str(text or "")
+    findings = scan_text_for_secrets(body)
+    if not findings:
+        return body
+    if root is not None and not redact_acknowledged:
+        findings = unacknowledged_findings(findings, root)
+    redacted, _count = _redact_findings(body, findings)
+    return redacted
+
+
+def redact_messages(messages, root=None):
+    """Return `(messages, count, findings)` with unacknowledged secrets
+    replaced in every text content field."""
+    out: list[dict] = []
+    total = 0
+    found: list[SecretFinding] = []
+    acked = load_acknowledged_fingerprints(root) if root is not None else set()
+    for message in messages or []:
+        if not isinstance(message, dict):
+            out.append(message)
+            continue
+        copy = dict(message)
+        content = copy.get("content")
+        if isinstance(content, str):
+            findings = [f for f in scan_text_for_secrets(content, "<prompt>")
+                        if f.fingerprint not in acked]
+            if findings:
+                copy["content"], count = _redact_findings(content, findings)
+                total += count
+                found.extend(findings)
+        elif isinstance(content, list):
+            parts = []
+            changed = False
+            for part in content:
+                if isinstance(part, dict):
+                    part = dict(part)
+                    text = part.get("text")
+                    if isinstance(text, str):
+                        findings = [f for f in scan_text_for_secrets(
+                            text, "<prompt>") if f.fingerprint not in acked]
+                        if findings:
+                            part["text"], count = _redact_findings(text, findings)
+                            total += count
+                            found.extend(findings)
+                            changed = True
+                parts.append(part)
+            if changed:
+                copy["content"] = parts
+        out.append(copy)
+    return out, total, found
+
+
+# --- .gitignore hygiene -------------------------------------------------
+
+def _gitignore_patterns(root: Path) -> list[str]:
+    path = Path(root) / ".gitignore"
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return []
+    return [ln.strip() for ln in text.splitlines()
+            if ln.strip() and not ln.lstrip().startswith("#")]
+
+
+def _pattern_matches(rel: str, pattern: str) -> bool:
+    """Practical gitignore matching for the paths this guard checks."""
+    pat = pattern.strip()
+    if not pat:
+        return False
+    if pat.startswith("!"):
+        return False
+    pat = pat.strip()
+    if pat.startswith("/"):
+        pat = pat[1:]
+    dir_only = pat.endswith("/")
+    pat = pat.rstrip("/")
+    if not pat:
+        return False
+    parts = PurePosixPath(rel).parts
+    if not parts:
+        return False
+    if "/" in pat:
+        # Anchored or path-shaped: match the whole relative path or a
+        # directory prefix (a trailing "/" is the usual directory form).
+        if fnmatch.fnmatch(rel, pat) or fnmatch.fnmatch(rel, f"**/{pat}"):
+            return True
+        for i in range(1, len(parts)):
+            prefix = "/".join(parts[:i])
+            if fnmatch.fnmatch(prefix, pat):
+                return True
+        return False
+    # A bare name matches a component at any depth.
+    matched = any(fnmatch.fnmatch(part, pat) for part in parts)
+    if not matched and dir_only:
+        return False
+    return matched
+
+
+def _path_ignored(root: Path, rel: str) -> bool:
+    ignored = False
+    for raw in _gitignore_patterns(root):
+        negated = raw.startswith("!")
+        pattern = raw[1:] if negated else raw
+        if _pattern_matches(str(rel), pattern):
+            ignored = not negated
+    return ignored
+
+
+def _sensitive_file_kind(name: str) -> str:
+    if name == ".env" or name.startswith(".env."):
+        return "unignored_env"
+    if name.startswith("id_"):
+        return "unignored_private_key"
+    return "unignored_credentials"
+
+
+def check_git_secret_hygiene(root) -> list[SensitiveFileFinding]:
+    """Sensitive files present in the workspace but not ignored by
+    `.gitignore`. Empty when there is nothing to fix (or no workspace)."""
+    if root is None:
+        return []
+    base = Path(str(root))
+    if not base.is_dir():
+        return []
+    out: list[SensitiveFileFinding] = []
+    seen: set[str] = set()
+    for path in _iter_workspace_files(base):
+        name = path.name
+        if name in _ENV_TEMPLATE_NAMES:
+            continue
+        if not (name in _SENSITIVE_FILE_NAMES or name.startswith(".env.")):
+            continue
+        try:
+            rel = path.resolve().relative_to(base.resolve()).as_posix()
+        except (OSError, ValueError):
+            rel = name
+        if rel in seen:
+            continue
+        seen.add(rel)
+        if _path_ignored(base, rel):
+            continue
+        out.append(SensitiveFileFinding(
+            file=rel,
+            kind=_sensitive_file_kind(name),
+            detail=f"{rel} exists but .gitignore does not exclude it",
+        ))
+    return sorted(out, key=lambda f: f.file)
+
+
+def ensure_gitignore_entries(root, patterns=None) -> list[str]:
+    """Append missing sensitive-file patterns to the workspace's
+    `.gitignore`; returns only the patterns actually written."""
+    if root is None:
+        return []
+    patterns = list(patterns) if patterns is not None else [".env", ".env.*"]
+    patterns = [str(p).strip() for p in patterns if str(p).strip()]
+    if not patterns:
+        return []
+    base = Path(str(root))
+    if not base.is_dir():
+        return []
+    path = base / ".gitignore"
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        text = ""
+    existing = {ln.strip() for ln in text.splitlines()
+                if ln.strip() and not ln.lstrip().startswith("#")}
+
+    def covered(pattern: str) -> bool:
+        if pattern in existing or pattern.rstrip("/") in existing:
+            return True
+        # A broader existing pattern (".env*", "*.env") already covers it.
+        for line in existing:
+            if line.startswith("!"):
+                continue
+            probe = line[1:] if line.startswith("/") else line
+            if fnmatch.fnmatch(pattern.rstrip("/"), probe.rstrip("/")):
+                return True
+        return False
+
+    to_add = [p for p in patterns if not covered(p)]
+    if not to_add:
+        return []
+    try:
+        with path.open("a", encoding="utf-8") as fh:
+            if text and not text.endswith("\n"):
+                fh.write("\n")
+            if text:
+                fh.write("\n")
+            fh.write("# Pedacito: keep secret files out of git\n")
+            for pattern in to_add:
+                fh.write(f"{pattern}\n")
+    except OSError:
+        return []
+    clear_security_cache(root)
+    return to_add
+
+
+# --- status, notifications and outbound policy --------------------------
+
+_STATUS_CACHE: dict[str, tuple[float, dict]] = {}
+_STATUS_LOCK = threading.Lock()
+_STATUS_TTL = 20.0
+
+
+def outbound_mode(cfg) -> str:
+    """The workspace's outbound policy, normalised to a known value."""
+    mode = str(getattr(cfg, "security_outbound_mode", "warn") or "warn").strip().lower()
+    return mode if mode in OUTBOUND_MODES else "warn"
+
+
+def clear_security_cache(root=None) -> None:
+    """Drop cached status (after a run, an acknowledgment, or a fix)."""
+    with _STATUS_LOCK:
+        if root is None:
+            _STATUS_CACHE.clear()
+            return
+        _STATUS_CACHE.pop(_ack_key(root), None)
+
+
+def _status_payload(root, cfg, findings, hygiene) -> dict:
+    mode = outbound_mode(cfg)
+    return {
+        "root": str(root) if root is not None else "",
+        "mode": mode,
+        "findings": [f.to_dict() for f in findings],
+        "unignored_sensitive_files": [h.to_dict() for h in hygiene],
+        "unignored_env": [h.file for h in hygiene
+                          if h.kind == "unignored_env"],
+        "secrets_found": bool(findings),
+        "env_unignored": bool(hygiene),
+        "count": len(findings),
+    }
+
+
+def security_status(root, cfg=None, files=None, use_cache: bool = False) -> dict:
+    """Workspace security summary: unacknowledged secrets plus unignored
+    sensitive files. `files` limits the secret scan to a run's changed
+    files; `use_cache` is for the GUI's polling status payload."""
+    key = _ack_key(root)
+    if use_cache and files is None and root is not None:
+        with _STATUS_LOCK:
+            entry = _STATUS_CACHE.get(key)
+            if entry and time.monotonic() - entry[0] <= _STATUS_TTL:
+                return entry[1]
+    findings = unacknowledged_findings(
+        scan_workspace_secrets(root, files=files), root)
+    hygiene = check_git_secret_hygiene(root)
+    payload = _status_payload(root, cfg, findings, hygiene)
+    if files is None and root is not None:
+        with _STATUS_LOCK:
+            _STATUS_CACHE[key] = (time.monotonic(), payload)
+    return payload
+
+
+def format_finding(finding) -> str:
+    """One-line, masked finding suitable for a terminal or GUI banner."""
+    if isinstance(finding, dict):
+        return (f"{finding.get('file', '?')}:{finding.get('line', '?')} "
+                f"[{finding.get('kind', '?')}] "
+                f"{finding.get('masked_preview', '***')}")
+    return (f"{finding.file}:{finding.line} [{finding.kind}] "
+            f"{finding.masked_preview}")
+
+
+def emit_post_run_notice(root, cfg=None, files=None) -> dict:
+    """Scan after a run and emit a non-blocking `security_notice` event.
+
+    Returns the same payload `security_status` reports. The event only
+    carries masked findings; raw secrets never enter the event log.
+    """
+    status = security_status(root, cfg, files=files, use_cache=False)
+    clear_security_cache(root)
+    if not (status["secrets_found"] or status["env_unignored"]):
+        return status
+    message = (f"{status['count']} unacknowledged secret(s) and "
+               f"{len(status['unignored_env'])} unignored .env file(s) "
+               "detected in the workspace")
+    try:
+        from . import events as events_mod
+        events_mod.get(root, cfg).emit(
+            "security_notice",
+            message=message,
+            findings=status["findings"],
+            unignored_env=status["unignored_env"],
+        )
+    except Exception:
+        pass
+    return status

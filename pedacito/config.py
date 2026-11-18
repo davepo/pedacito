@@ -806,6 +806,14 @@ class Config:
     wrap_observations: bool = True
     # Mask secret-looking values in prompts, logs, and session files.
     redact_secrets: bool = True
+    # Outbound cloud-provider guard: before a request leaves for a hosted
+    # endpoint, scan its messages for unacknowledged secrets.
+    #   "warn"   -- GUI/TUI ask Acknowledge & send / Redact & send / Cancel
+    #               (non-interactive runs auto-redact)
+    #   "redact" -- always replace detected secrets with <REDACTED_SECRET>
+    #   "allow"  -- send unchanged
+    # Loopback and LAN endpoints are never scanned.
+    security_outbound_mode: str = "warn"
     # Paths (gitignore-style fnmatch) the model may never write, on top of
     # .git/, .pedacito/, PLAN.md and todo.md.
     protected_paths: tuple[str, ...] = ()
@@ -2806,6 +2814,9 @@ _EXTRA_FIELD_HELP = {
                         "circuit opens.",
     "circuit_cooldown": "Seconds the circuit stays open before one probe is "
                         "allowed.",
+    "security_outbound_mode": "Outbound secret guard for hosted providers: "
+                              "warn, redact, or allow. Loopback/LAN endpoints "
+                              "are never scanned.",
     "price_output_per_mtok": "USD per million output tokens, used for cost "
                              "reporting and max_cost.",
     "price_cached_per_mtok": "USD per million cache-read tokens, used for "
@@ -3472,7 +3483,10 @@ REFERENCE_TEMPLATE = TEMPLATE + '''
 # scrub_env launches model-chosen commands with a minimal environment;
 # env_passthrough names variables (or PREFIX*) they may still see.
 # wrap_observations fences untrusted tool output; redact_secrets masks secrets
-# in session files, logs and events. protected_paths lists files the model may
+# in session files, logs and events. security_outbound_mode ("warn", "redact"
+# or "allow") controls the guard that scans requests to hosted cloud providers
+# for secrets before they leave the machine; loopback/LAN endpoints are exempt.
+# protected_paths lists files the model may
 # never write (on top of .git/, .pedacito/, the plan file); shell_deny lists
 # command patterns `run` refuses; browser_eval_hosts limits where the browser
 # `eval` action may run JavaScript.

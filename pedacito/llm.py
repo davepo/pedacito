@@ -43,6 +43,8 @@ from urllib.parse import quote, urlparse
 
 import requests
 
+from . import security as security_mod
+
 
 class LLMError(RuntimeError):
     """Base class for any failure talking to the model server. `kind` is a
@@ -88,6 +90,30 @@ class CircuitOpenError(LLMError):
     get a fast, actionable error instead of another timeout."""
 
     kind = "circuit"
+
+
+class SecretConfirmationRequired(LLMError):
+    """The request targets an external provider and carries secrets the user
+    has not acknowledged yet.
+
+    Raised only by an interactive surface (the GUI/TUI permission broker is
+    active) that did not make an explicit choice. The message lists masked
+    findings only; callers can inspect `.findings` for fingerprints. Plain
+    non-interactive runs auto-redact instead, so a script never blocks.
+    """
+
+    kind = "secrets"
+
+    def __init__(self, findings, provider: str = ""):
+        self.findings = list(findings or ())
+        lines = [security_mod.format_finding(f) for f in self.findings[:8]]
+        where = f" to {provider}" if provider else " to an external provider"
+        super().__init__(
+            "Secrets were detected in the outbound prompt" + where + ".\n"
+            + "\n".join(f"  - {line}" for line in lines)
+            + ("\n  - ..." if len(self.findings) > 8 else "")
+            + "\nChoose Acknowledge & send as-is, Redact & send, or Cancel "
+              "before this request can leave the machine.")
 
 
 class _Transient(LLMError):
@@ -533,6 +559,16 @@ def _is_local_server(cfg) -> bool:
     return any(w in name for w in ("local", "llamacpp", "llama.cpp", "lemond",
                                    "vllm", "lmstudio", "ollama",
                                    "strata", "avalon"))
+
+
+def is_external_provider(cfg) -> bool:
+    """True when this config targets a hosted/cloud provider rather than
+    loopback or the user's LAN. This is the one predicate the outbound
+    secret guard, the GUI preflight and the TUI warning share."""
+    try:
+        return not _is_local_server(cfg)
+    except Exception:
+        return False
 
 
 def _is_local_moe(cfg) -> bool:
@@ -1486,10 +1522,82 @@ class LLMClient:
         print(f"[circuit breaker: {limit} consecutive model-server failures; "
               f"pausing requests for {cooldown:.0f}s]", file=sys.stderr)
 
+    def _outbound_root(self):
+        """The workspace this request belongs to, when the caller set one."""
+        root = getattr(self.cfg, "_root", "") or ""
+        return root or None
+
+    def _notify_redaction(self, count: int, findings, mode: str) -> None:
+        """Tell the listening surface that raw secrets were replaced."""
+        message = (f"Auto-redacted {count} secret(s) before sending to "
+                   "external provider")
+        print(f"[security] {message}", file=sys.stderr)
+        root = self._outbound_root()
+        try:
+            from . import events as events_mod
+            events_mod.get(root, self.cfg).emit(
+                "security_redacted", count=count, message=message,
+                mode=mode, findings=[f.to_dict() for f in findings])
+        except Exception:
+            pass
+
+    def _apply_outbound_guard(self, payload: dict) -> dict:
+        """Scan/redact or confirm a request bound for an external provider.
+
+        Local endpoints (loopback, LAN, or a self-hosted provider name) are
+        never inspected: the user's own box is not an exfiltration path.
+        External endpoints obey `security_outbound_mode`:
+
+        - "allow": send unchanged.
+        - "redact": replace every unacknowledged secret with
+          `<REDACTED_SECRET>` and emit a notification event.
+        - "warn": use an explicit per-run choice (`acknowledge_secrets` or
+          `redact_secrets` from the GUI/TUI); otherwise raise
+          `SecretConfirmationRequired` while an interactive broker is
+          installed, and auto-redact in a non-interactive run.
+        """
+        if not payload or not is_external_provider(self.cfg):
+            return payload
+        mode = security_mod.outbound_mode(self.cfg)
+        if mode == "allow":
+            return payload
+        messages = payload.get("messages")
+        if not isinstance(messages, list) or not messages:
+            return payload
+        root = self._outbound_root()
+        findings = security_mod.scan_messages_for_secrets(messages, root)
+        if not findings:
+            return payload
+        if mode == "redact" or getattr(
+                self.cfg, "_outbound_redact_secrets", False):
+            messages, count, redacted = security_mod.redact_messages(
+                messages, root)
+            payload = {**payload, "messages": messages}
+            if count:
+                self._notify_redaction(count, redacted, "redact")
+            return payload
+        if getattr(self.cfg, "_outbound_acknowledge_secrets", False):
+            # The user chose "Acknowledge & Send As-Is" for this request.
+            # Persist the fingerprints so the same key is not raised again.
+            if root:
+                security_mod.acknowledge_findings(root, findings)
+            return payload
+        if security_mod.permission_broker_active():
+            host = _host_name(self.cfg) or "external provider"
+            raise SecretConfirmationRequired(findings, host)
+        # Non-interactive CLI/script: redact by default rather than block.
+        messages, count, redacted = security_mod.redact_messages(
+            messages, root)
+        payload = {**payload, "messages": messages}
+        if count:
+            self._notify_redaction(count, redacted, "warn")
+        return payload
+
     def _post(self, payload: dict, stream: bool = False):
         """POST to the chat completions endpoint, raising a specific LLMError
         subclass on failure (connection, timeout, load failure, template,
         transient/rate limit, context overflow, or other server error)."""
+        payload = self._apply_outbound_guard(payload)
         self._check_circuit()
         try:
             try:
