@@ -6,8 +6,15 @@
   try {
     var t = localStorage.getItem('pedacito_theme');
     if (t && t !== 'slate') document.documentElement.setAttribute('data-theme', t);
-    var w = JSON.parse(localStorage.getItem('pedacito_layout') || '{}');
     var r = document.documentElement.style;
+    // Unified theme engine: the last applied ten-token palette is cached as
+    // fully resolved CSS properties, so a reload paints in the user's colors
+    // before /api/themes answers. app.js refreshes the cache after a switch.
+    var cached = JSON.parse(localStorage.getItem('pedacito_theme_css') || '{}');
+    Object.keys(cached).forEach(function (k) {
+      if (cached[k]) r.setProperty(k, cached[k]);
+    });
+    var w = JSON.parse(localStorage.getItem('pedacito_layout') || '{}');
     if (w.left) r.setProperty('--left', w.left + 'px');
     if (w.right) r.setProperty('--right', w.right + 'px');
     if (w.term) r.setProperty('--term-h', w.term + 'px');

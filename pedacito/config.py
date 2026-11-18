@@ -51,6 +51,15 @@ def _user_config_dir() -> Path:
     return Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config") / "pedacito"
 
 
+def user_config_dir() -> Path:
+    """Public spelling of the per-user config directory.
+
+    `themes.py` and the GUI handlers use this instead of copying the XDG /
+    APPDATA rules, so `themes.json` always lives beside `config.toml`.
+    """
+    return _user_config_dir()
+
+
 def _user_state_dir() -> Path:
     """Per-user state that is not tied to a project (session logs and chat
     threads opened with no folder): $XDG_STATE_HOME/pedacito on Linux/macOS
@@ -63,6 +72,12 @@ def _user_state_dir() -> Path:
 
 
 USER_CONFIG = _user_config_dir() / "config.toml"
+# Unified theme store: custom palettes and the globally selected theme.  The
+# GUI's Theme Manager and the TUI's `/theme` command both read this file.
+USER_THEMES = _user_config_dir() / "themes.json"
+# Optional per-project state config.  A theme override lives under
+# `{"theme": "name"}`; other projects may keep unrelated keys there.
+PROJECT_STATE_CONFIG = Path(".pedacito") / "config.json"
 USER_STATE_DIR = _user_state_dir()
 PROJECT_CONFIG_NAMES = (".pedacito.toml", "pedacito.toml")
 

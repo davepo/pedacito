@@ -1703,6 +1703,7 @@ PDC.openBenchmarks = openBenchmarks;
 let lastServerTheme = null;
 function applyTheme(t, userPick) {
   if (!t) return;
+  if (userPick) clearThemeTokens();
   if (t === 'slate') document.documentElement.removeAttribute('data-theme');
   else document.documentElement.setAttribute('data-theme', t);
   try { localStorage.setItem('pedacito_theme', t); } catch (err) {}
@@ -1716,6 +1717,322 @@ function applyTheme(t, userPick) {
     } else PDC.toast('Theme kept in this browser (config not written): ' + ((j && j.detail) || 'server error'), true);
   }).catch(() => PDC.toast('Theme kept in this browser (server unreachable).', true));
 }
+// ----------------------------------------------------- unified theme engine ---
+// The ten-token schema in pedacito/themes.py drives every CSS variable below.
+// Presets and user palettes arrive from /api/themes; the modal edits a local
+// draft and applies it live before anything is saved.
+const THEME_FIELDS = [
+  ['bg', 'Background'], ['surface', 'Surface'],
+  ['surface_alt', 'Surface alt'], ['text', 'Text'], ['muted', 'Muted text'],
+  ['accent', 'Accent'], ['border', 'Border'], ['success', 'Success'],
+  ['warning', 'Warning'], ['danger', 'Danger'],
+];
+const THEME_TOKEN_KEYS = THEME_FIELDS.map((f) => f[0]);
+
+function themeContrast(hex) {
+  const raw = String(hex || '').replace('#', '');
+  if (raw.length !== 6) return '#ffffff';
+  const r = parseInt(raw.slice(0, 2), 16);
+  const g = parseInt(raw.slice(2, 4), 16);
+  const b = parseInt(raw.slice(4, 6), 16);
+  return (0.2126 * r + 0.7152 * g + 0.0722 * b) / 255 > 0.55
+    ? '#111111' : '#ffffff';
+}
+
+function themeCssProperties(t) {
+  const mix = (a, b, pct) => 'color-mix(in srgb, ' + a + ' ' + pct + '%, ' + b + ')';
+  return {
+    '--bg': t.bg, '--surface': t.surface, '--surface-alt': t.surface_alt,
+    '--text': t.text, '--muted': t.muted, '--accent': t.accent,
+    '--border': t.border, '--success': t.success, '--warning': t.warning,
+    '--danger': t.danger,
+    '--panel': t.surface, '--panel2': t.surface_alt, '--panel3': t.surface_alt,
+    '--line': t.border, '--line2': t.border, '--soft': t.surface_alt,
+    '--ok': t.success, '--err': t.danger, '--warn': t.warning,
+    '--accent-soft': mix(t.accent, t.surface, 22),
+    '--accent-fg': themeContrast(t.accent),
+    '--danger-fg': themeContrast(t.danger),
+    '--add-bg': t.success, '--del-bg': t.danger,
+    '--term-bg': t.bg, '--term-text': t.text, '--code-bg': t.surface,
+    '--ansi-0': t.muted, '--ansi-1': t.danger, '--ansi-2': t.success,
+    '--ansi-3': t.warning, '--ansi-4': t.accent, '--ansi-5': t.accent,
+    '--ansi-6': t.accent, '--ansi-7': t.text,
+  };
+}
+
+function applyThemeTokens(tokens, name) {
+  if (!tokens) return;
+  const css = themeCssProperties(tokens);
+  const root = document.documentElement;
+  Object.keys(css).forEach((key) => {
+    if (css[key]) root.style.setProperty(key, css[key]);
+  });
+  root.style.colorScheme = themeContrast(tokens.bg) === '#111111' ? 'light' : 'dark';
+  document.documentElement.dataset.themeName = name || '';
+  const btn = $('themeBtn');
+  if (btn && name) btn.title = 'theme: ' + name + ' \u2014 open the Theme Manager';
+  try {
+    localStorage.setItem('pedacito_theme_tokens', JSON.stringify(tokens));
+    localStorage.setItem('pedacito_theme_css', JSON.stringify(css));
+    localStorage.setItem('pedacito_theme_name', name || '');
+  } catch (err) {}
+}
+
+function clearThemeTokens() {
+  const root = document.documentElement;
+  Object.keys(themeCssProperties({
+    bg: '#000000', surface: '#000000', surface_alt: '#000000',
+    text: '#000000', muted: '#000000', accent: '#000000',
+    border: '#000000', success: '#000000', warning: '#000000',
+    danger: '#000000',
+  })).forEach((key) => root.style.removeProperty(key));
+  root.style.colorScheme = '';
+  try {
+    localStorage.removeItem('pedacito_theme_tokens');
+    localStorage.removeItem('pedacito_theme_css');
+    localStorage.removeItem('pedacito_theme_name');
+  } catch (err) {}
+}
+
+function applyThemePayload(payload) {
+  if (!payload || !payload.themes) return;
+  const tokens = payload.themes[payload.active_theme];
+  if (tokens) applyThemeTokens(tokens, payload.active_theme);
+}
+
+function loadActiveTheme() {
+  return PDC.api('/api/themes').then((j) => {
+    if (j && j.ok) applyThemePayload(j);
+    return j;
+  }).catch(() => null);
+}
+
+function expandThemeHex(value) {
+  let text = String(value || '').trim();
+  if (!text.startsWith('#')) text = '#' + text;
+  if (/^#[0-9a-f]{3}$/i.test(text)) {
+    text = '#' + text.slice(1).split('').map((c) => c + c).join('');
+  }
+  return /^#[0-9a-f]{6}$/i.test(text) ? text.toLowerCase() : null;
+}
+
+function openThemeManager() {
+  PDC.api('/api/themes').then((j) => {
+    if (!j || !j.ok) {
+      PDC.toast('Could not load themes: ' + ((j && j.detail) || 'server error'), true);
+      return;
+    }
+    showThemeManager(j);
+  }).catch(() => PDC.toast('Could not load themes (server unreachable).', true));
+}
+
+function showThemeManager(initial) {
+  const st = {
+    themes: initial.themes || {},
+    builtin: new Set(initial.builtin_names || []),
+    active: initial.active_theme,
+    project: initial.project_theme || null,
+    draft: { ...(initial.themes[initial.active_theme] || {}) },
+  };
+  const grid = h('div', { class: 'theme-grid', id: 'themeGrid' });
+  const editor = h('div', { class: 'theme-editor' });
+  const status = h('div', { class: 'theme-status', id: 'themeStatus' });
+  const nameInp = h('input', { type: 'text', class: 'theme-name',
+    id: 'themeName', placeholder: 'custom theme name', spellcheck: 'false',
+    autocomplete: 'off' });
+  const rows = {};
+  let selected = st.active;
+
+  const say = (text, tone) => {
+    status.textContent = text || '';
+    status.className = 'theme-status' + (tone ? ' ' + tone : '');
+  };
+  const preview = () => applyThemeTokens(st.draft, nameInp.value.trim() || selected);
+
+  function syncInputs(tokens) {
+    THEME_FIELDS.forEach(([key]) => {
+      if (!rows[key]) return;
+      rows[key].color.value = tokens[key] || '#000000';
+      rows[key].text.value = tokens[key] || '';
+    });
+  }
+
+  function renderGrid() {
+    clear(grid);
+    const custom = Object.keys(st.themes).filter((n) => !st.builtin.has(n)).sort();
+    const names = Array.from(st.builtin).concat(custom);
+    names.forEach((name) => {
+      const t = st.themes[name];
+      if (!t) return;
+      const sw = h('span', { class: 'sw',
+        style: 'background:' + t.accent + ';border-color:' + t.border });
+      grid.appendChild(h('button', {
+        class: 'theme-pill' + (name === st.active ? ' on' : ''),
+        title: name,
+        onclick: () => selectTheme(name),
+      }, sw, h('span', { text: name }),
+        st.builtin.has(name) ? null : h('span', {
+          class: 'small-text', text: 'custom' })));
+    });
+  }
+
+  function selectTheme(name) {
+    say('Switching to ' + name + '\u2026');
+    PDC.api('/api/themes/select', { name }).then((j) => {
+      if (!j || !j.ok) { say((j && j.detail) || 'Could not switch theme.', 'err'); return; }
+      st.themes = j.themes || st.themes;
+      st.builtin = new Set(j.builtin_names || []);
+      st.active = j.active_theme;
+      st.project = j.project_theme || null;
+      selected = st.active;
+      st.draft = { ...(st.themes[selected] || {}) };
+      nameInp.value = st.builtin.has(selected) ? '' : selected;
+      syncInputs(st.draft);
+      applyThemePayload(j);
+      renderGrid();
+      delBtn.disabled = st.builtin.has(selected);
+      say('Active: ' + selected + (st.project ? ' (project override)' : ''), 'ok');
+    }).catch(() => say('Could not switch theme.', 'err'));
+  }
+
+  THEME_FIELDS.forEach(([key, label]) => {
+    const color = h('input', { type: 'color', value: st.draft[key] || '#000000',
+      title: label });
+    const text = h('input', { type: 'text', value: st.draft[key] || '',
+      spellcheck: 'false', autocomplete: 'off' });
+    color.addEventListener('input', () => {
+      text.value = color.value;
+      st.draft[key] = color.value;
+      preview();
+    });
+    text.addEventListener('input', () => {
+      const value = expandThemeHex(text.value);
+      if (value) {
+        color.value = value;
+        st.draft[key] = value;
+        preview();
+      }
+    });
+    text.addEventListener('blur', () => {
+      const value = expandThemeHex(text.value);
+      if (value) {
+        text.value = value;
+        color.value = value;
+        st.draft[key] = value;
+        preview();
+      } else {
+        text.value = st.draft[key] || '';
+      }
+    });
+    rows[key] = { color, text };
+    editor.append(h('div', { class: 'theme-row' },
+      h('span', { class: 'theme-key', text: label }), color, text));
+  });
+
+  const saveBtn = h('button', { class: 'primary', text: 'Save Custom Theme',
+    id: 'themeSave', onclick: () => {
+      const name = nameInp.value.trim();
+      if (!name) { say('Enter a custom theme name first.', 'err'); nameInp.focus(); return; }
+      const tokens = {};
+      for (const key of THEME_TOKEN_KEYS) {
+        const value = expandThemeHex(st.draft[key]);
+        if (!value) { say('Invalid color for ' + key + '.', 'err'); return; }
+        tokens[key] = value;
+      }
+      PDC.api('/api/themes/save', { name, tokens }).then((j) => {
+        if (!j || !j.ok) { say((j && j.detail) || 'Could not save theme.', 'err'); return; }
+        st.themes = j.themes || st.themes;
+        st.builtin = new Set(j.builtin_names || []);
+        st.active = j.active_theme;
+        st.project = j.project_theme || null;
+        selected = j.active_theme;
+        st.draft = { ...(st.themes[selected] || tokens) };
+        nameInp.value = selected;
+        syncInputs(st.draft);
+        applyThemePayload(j);
+        renderGrid();
+        delBtn.disabled = false;
+        say('Saved and activated ' + selected + '.', 'ok');
+      }).catch(() => say('Could not save theme.', 'err'));
+    } });
+
+  const delBtn = h('button', { class: 'danger', text: 'Delete Custom Theme',
+    id: 'themeDelete', onclick: () => {
+      const name = nameInp.value.trim() || selected;
+      if (st.builtin.has(name) || !st.themes[name] || st.builtin.has(selected)
+          && name === selected) {
+        say('Built-in presets cannot be deleted.', 'err');
+        return;
+      }
+      PDC.confirm('Delete the custom theme \u201c' + name + '\u201d?', 'Delete', true)
+        .then((ok) => {
+          if (!ok) return;
+          PDC.api('/api/themes/delete', { name }).then((j) => {
+            if (!j || !j.ok) { say((j && j.detail) || 'Could not delete theme.', 'err'); return; }
+            st.themes = j.themes || st.themes;
+            st.builtin = new Set(j.builtin_names || []);
+            st.active = j.active_theme;
+            st.project = j.project_theme || null;
+            selected = j.active_theme;
+            st.draft = { ...(st.themes[selected] || {}) };
+            nameInp.value = st.builtin.has(selected) ? '' : selected;
+            syncInputs(st.draft);
+            applyThemePayload(j);
+            renderGrid();
+            delBtn.disabled = st.builtin.has(selected);
+            say('Deleted ' + name + '. Active: ' + selected + '.', 'ok');
+          }).catch(() => say('Could not delete theme.', 'err'));
+        });
+    } });
+
+  const importBox = h('textarea', { class: 'theme-import', id: 'themeImport',
+    placeholder: '{"name":"my-theme","tokens":{"bg":"#101418", ...}}\n'
+      + 'or just the ten-token object',
+    spellcheck: 'false' });
+  const importBtn = h('button', { text: 'Import / Paste JSON',
+    id: 'themeImportBtn', onclick: () => {
+      try {
+        const parsed = JSON.parse(importBox.value || '{}');
+        const tokens = parsed.tokens || parsed.theme || parsed;
+        const clean = {};
+        for (const key of THEME_TOKEN_KEYS) {
+          const value = expandThemeHex(tokens[key]);
+          if (!value) throw new Error('missing or invalid ' + key);
+          clean[key] = value;
+        }
+        st.draft = clean;
+        if (parsed.name) nameInp.value = String(parsed.name);
+        syncInputs(clean);
+        preview();
+        say('Imported palette \u2014 review it, then Save Custom Theme.', 'ok');
+      } catch (err) {
+        say('Could not import: ' + (err && err.message ? err.message : 'invalid JSON'), 'err');
+      }
+    } });
+
+  const content = h('div', {},
+    h('div', { class: 'theme-hint',
+      text: 'Presets switch instantly and are saved for the GUI and the terminal TUI. '
+        + 'Edit any of the ten colors for a live preview.' }),
+    grid,
+    h('div', { class: 'theme-hint', text: 'Active palette \u2014 ten shared tokens' }),
+    editor,
+    h('div', { class: 'theme-actions' }, nameInp, saveBtn, delBtn),
+    status,
+    h('div', { class: 'theme-hint', text: 'Import / Paste JSON' }),
+    importBox,
+    h('div', { class: 'theme-actions' }, importBtn));
+  PDC.modal('Theme Manager & Custom Color Editor', content, [{ label: 'Close' }],
+    { wide: true, onClose: () => loadActiveTheme() });
+  syncInputs(st.draft);
+  renderGrid();
+  if (!st.builtin.has(selected)) nameInp.value = selected;
+  delBtn.disabled = st.builtin.has(selected);
+  if (st.project) say('Active: ' + st.active + ' (project override)', 'ok');
+  else say('Active: ' + st.active, 'ok');
+}
+PDC.openThemes = openThemeManager;
+
 function clearTerm() { PDC.api('/api/term_clear', {}); }
 function restoreDialog() {
   const snaps = S.status.snapshots || [];
@@ -2694,24 +3011,8 @@ function TopBar() {
                   onClick=${() => serversDialog()}>Servers</button>
           <button id="benchBtn" title="run a diagnostic benchmark against a configured profile" onClick=${() => openBenchmarks()}>\u25A6 Benchmarks</button>
           <button id="settingsBtn" title="profiles and settings" onClick=${() => callSettings()}>\u2699 Settings</button>
-          <select id="theme" title="color scheme (saved as gui_theme in config.toml)"
-                  onchange=${(e) => applyTheme(e.target.value, true)}>
-            <optgroup label="Light">
-              <option value="light">Light \u2014 GitHub</option>
-              <option value="daylight">Daylight \u2014 warm paper</option>
-            </optgroup>
-            <optgroup label="Dark">
-              <option value="slate">Slate \u2014 GitHub Dark</option>
-              <option value="nord">Nord \u2014 Catppuccin</option>
-              <option value="midnight">Midnight \u2014 high contrast</option>
-            </optgroup>
-            <optgroup label="1990s">
-              <option value="jazz_solo">Jazz Cup \u2014 '91 teal/purple</option>
-              <option value="trapper_keeper">Trapper Keeper \u2014 cobalt/coral</option>
-              <option value="memphis_arcade">Memphis Arcade \u2014 neon geometry</option>
-              <option value="windbreaker">Windbreaker \u2014 color-block nylon</option>
-            </optgroup>
-          </select>
+          <button id="themeBtn" title="theme manager and custom color editor"
+                  onClick=${() => openThemeManager()}>\uD83C\uDFA8 Theme</button>
           <button class="danger" id="exitBtn" title="stop the pedacito gui server"
                   onClick=${() => PDC.confirm('Stop the pedacito gui server? Run "pedacito gui" again to reopen it.', 'Stop server', true).then((ok) => {
                     if (!ok) return;
@@ -3933,5 +4234,6 @@ function initThemeSelect() {
 
 render(html`<${App}/>`, $('root'));
 initThemeSelect();
+loadActiveTheme();
 refreshState().then(() => loadSnapshot());
 setInterval(() => { if (!document.hidden) refreshState(); }, 2500);

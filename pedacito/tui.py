@@ -56,6 +56,7 @@ from . import roles as roles_mod
 from . import security
 from . import servers as servers_mod
 from . import skills as skills_mod
+from . import themes as themes_mod
 from . import workspace
 from .agent import Agent
 from .config import Config
@@ -119,7 +120,7 @@ _SLASH_COMMANDS = [
     "/help", "/keys", "/status", "/telemetry", "/new", "/auto", "/auto!", "/plan",
     "/consolidate", "/compact", "/profile", "/profiles", "/model",
     "/auto-route", "/think", "/effort", "/creative", "/servers", "/unload",
-    "/apply", "/skills", "/memory", "/procs", "/security",
+    "/apply", "/skills", "/memory", "/procs", "/security", "/theme",
     "/diff", "/undo", "/reset", "/sidebar", "/scroll", "/mouse", "/clear",
     "/quit", "/exit",
 ]
@@ -177,6 +178,8 @@ Pedacito TUI commands
   /unload [SERVER]          unload models on SERVER, or every idle local server
   /creative [on|off|auto]   design mode: on=every task, auto=detect design tasks,
                             off=surgical edits (warmer sampling + whole-file CSS/HTML)
+  /theme [NAME]             list color themes, or switch to NAME and save it
+                            (shared with the GUI Theme Manager)
   /apply [on|off]           write edits to disk, or preview them
   /skills [list|show NAME|draft TEXT]
   /memory [list|add FACT|forget TEXT]
@@ -466,6 +469,14 @@ class TuiSession:
                  color: bool | None = None, sidebar: bool = True):
         self.root = Path(str(root)).expanduser().resolve()
         self.cfg = cfg if cfg is not None else Config()
+        # The active palette is shared with the GUI. Loading is tolerant:
+        # a hand-edited themes.json can never stop the session from opening.
+        try:
+            self.theme_name = themes_mod.get_active_theme_name(self.root)
+            self.theme = themes_mod.get_active_theme(self.root)
+        except Exception:
+            self.theme_name = themes_mod.DEFAULT_THEME
+            self.theme = dict(themes_mod.BUILTIN_THEMES[themes_mod.DEFAULT_THEME])
         self.client = client
         self.agent = agent
         self.idx = idx
@@ -578,6 +589,30 @@ class TuiSession:
         """Pin the frame size (tests) or nudge it after a resize event."""
         self.width = max(40, int(width))
         self.height = max(12, int(height))
+        self._dirty = True
+
+    # ---------------------------------------------------------------- theme
+    def _colors_on(self) -> bool:
+        """ANSI styling needs an interactive color terminal and no NO_COLOR."""
+        return bool(self.color) and not os.environ.get("NO_COLOR")
+
+    def _style(self, text: str, token: str | None = None, *,
+               fg: str | None = None, bold: bool = False) -> str:
+        """Paint `text` with one token from the active shared palette."""
+        if not self._colors_on():
+            return text
+        color = fg or self.theme.get(token or "")
+        if not color:
+            return text
+        return themes_mod.style_text(text, fg=color, bold=bold)
+
+    def _reload_theme(self) -> None:
+        try:
+            self.theme_name = themes_mod.get_active_theme_name(self.root)
+            self.theme = themes_mod.get_active_theme(self.root)
+        except Exception:
+            self.theme_name = themes_mod.DEFAULT_THEME
+            self.theme = dict(themes_mod.BUILTIN_THEMES[themes_mod.DEFAULT_THEME])
         self._dirty = True
 
     # ------------------------------------------------------------ telemetry
@@ -702,8 +737,10 @@ class TuiSession:
         width = width or self._size()[0]
         t = self.telemetry()
         pct = t["context_utilization_pct"]
-        bar, color, state = _meter(pct, 16)
-        painted = _paint(bar, color, self.color)
+        bar, _color, state = _meter(pct, 16)
+        meter_token = ("danger" if state == "high"
+                       else "warning" if state == "warn" else "success")
+        painted = self._style(bar, meter_token)
         prompt = t["last_prompt_tokens"]
         completion = t["last_completion_tokens"]
         context = t["context_tokens"]
@@ -715,26 +752,34 @@ class TuiSession:
         cost = t["cost"]
         if cost:
             active += f" (${cost:.4f})"
-        state_note = " !HIGH" if state == "high" else (
-            " !WARN" if state == "warn" else "")
+        state_note = (self._style(" !HIGH", "danger", bold=True)
+                      if state == "high" else
+                      self._style(" !WARN", "warning", bold=True)
+                      if state == "warn" else "")
+        active_text = self._style(active, "accent")
+        label = lambda text: self._style(text, "muted")  # noqa: E731
 
         if width >= 120:
             line1 = (
-                f"Ctx: {painted} {prompt:,} / {context:,} ({pct:.1f}%) | "
-                f"Turn: +{prompt:,} in / +{completion:,} out | "
-                f"Speed: {speed:.1f} tok/s (avg {avg:.1f} tok/s){state_note}")
+                f"{label('Ctx:')} {painted} {prompt:,} / {context:,} "
+                f"({pct:.1f}%) | {label('Turn:')} +{prompt:,} in / "
+                f"+{completion:,} out | {label('Speed:')} {speed:.1f} tok/s "
+                f"(avg {avg:.1f} tok/s){state_note}")
             line2 = (
-                f"Session: {_compact_tokens(t['session_prompt_tokens'])} in / "
+                f"{label('Session:')} "
+                f"{_compact_tokens(t['session_prompt_tokens'])} in / "
                 f"{_compact_tokens(t['session_completion_tokens'])} out | "
-                f"KV Cache: {cache:.0f}% | "
-                f"Folds: {folds} | Active: {active}")
+                f"{label('KV Cache:')} {cache:.0f}% | "
+                f"{label('Folds:')} {folds} | {label('Active:')} "
+                f"{active_text}")
         else:
-            line1 = (f"Ctx: {prompt:,} / {context:,} ({pct:.1f}%) "
+            line1 = (f"{label('Ctx:')} {prompt:,} / {context:,} ({pct:.1f}%) "
                      f"{painted} {speed:.1f} tok/s{state_note}")
-            line2 = (f"Turn: +{prompt:,}/+{completion:,} | "
-                     f"Sess: {_compact_tokens(t['session_prompt_tokens'])}/"
+            line2 = (f"{label('Turn:')} +{prompt:,}/+{completion:,} | "
+                     f"{label('Sess:')} "
+                     f"{_compact_tokens(t['session_prompt_tokens'])}/"
                      f"{_compact_tokens(t['session_completion_tokens'])} | "
-                     f"KV: {cache:.0f}% | {active}")
+                     f"{label('KV:')} {cache:.0f}% | {active_text}")
         return [line1, line2]
 
     # --------------------------------------------------------------- header
@@ -777,11 +822,23 @@ class TuiSession:
                                   False) else "OFF"
         sidebar = "on" if (self.sidebar and width >= 100) else "off"
         project = self.root.name or str(self.root)
-        line1 = (f" pdc tui \u2502 {project} \u2502 profile: {profile} "
-                 f"\u2502 model: {model} \u2502 {badge}")
-        line2 = (f" Auto-Route: {routing} \u2502 Scout: {scout} "
-                 f"\u2502 git: {branch}{'*' if dirty else ''} "
-                 f"\u2502 sidebar: {sidebar}")
+        sep = self._style("\u2502", "muted")
+        brand = self._style(" pdc tui ", "accent", bold=True)
+        profile_text = self._style(profile, "accent")
+        model_text = self._style(model, "text")
+        badge_text = self._style(
+            badge, "warning" if badge.startswith("\u2601") else "success")
+        line1 = (f"{brand}{sep} {self._style(project, 'text')} "
+                 f"{sep} profile: {profile_text} {sep} model: {model_text} "
+                 f"{sep} {badge_text}")
+        line2 = (f" {self._style('Auto-Route:', 'muted')} "
+                 f"{self._style(routing, 'success' if routing == 'ON' else 'muted')} "
+                 f"{sep} {self._style('Scout:', 'muted')} "
+                 f"{self._style(scout, 'text')} "
+                 f"{sep} {self._style('git:', 'muted')} "
+                 f"{self._style(branch + ('*' if dirty else ''), 'warning' if dirty else 'text')} "
+                 f"{sep} {self._style('sidebar:', 'muted')} "
+                 f"{self._style(sidebar, 'text')}")
         return [line1, line2]
 
     # -------------------------------------------------------------- sidebar
@@ -876,22 +933,41 @@ class TuiSession:
     def _wrap_transcript_line(self, kind: str, text: str,
                              width: int) -> list[str]:
         prefixes = {
+            "banner": "\u25c6 ",
             "user": "\u00bb ",
             "assistant": "\u25c6 ",
             "system": "  ",
             "activity": "  ",
             "receipt": "  ",
+            "success": "  ",
+            "warn": "! ",
             "diff": "  ",
             "error": "! ",
         }
+        tokens = {
+            "banner": "accent", "user": "accent", "assistant": "accent",
+            "receipt": "success", "success": "success",
+            "warn": "warning", "error": "danger",
+        }
         prefix = prefixes.get(kind, "  ")
+        styled_prefix = self._style(prefix, tokens.get(kind), bold=True) \
+            if kind in tokens else prefix
+        whole_line = kind in ("receipt", "success", "warn", "error")
         body = str(text)
         chunks: list[str] = []
         for raw in body.splitlines() or [""]:
+            start = len(chunks)
             chunks.extend(textwrap.wrap(
                 prefix + raw, width=max(1, width),
                 replace_whitespace=False, drop_whitespace=False,
                 break_long_words=True, break_on_hyphens=False) or [prefix])
+            if whole_line:
+                chunks[start:] = [self._style(chunk, tokens.get(kind))
+                                  for chunk in chunks[start:]]
+            elif styled_prefix != prefix and len(chunks) > start:
+                lead = chunks[start]
+                if lead.startswith(prefix):
+                    chunks[start] = styled_prefix + lead[len(prefix):]
             prefix = "  "
         return chunks
 
@@ -899,7 +975,7 @@ class TuiSession:
         width = width if width is not None else self._transcript_width()
         if not self.transcript:
             source = [
-                ("system", f"Pedacito TUI \u2014 {self.root}"),
+                ("banner", f"Pedacito TUI \u2014 {self.root}"),
                 ("system", "Type a coding task, or /help for commands."),
                 ("system", "PgUp/PgDn or the mouse wheel scrolls the log."),
             ]
@@ -1030,6 +1106,16 @@ class TuiSession:
         self._prompt_view_start = start
         line = prefix + shown
         col = min(max(0, len(prefix) + (cursor - start)), max(0, width - 1))
+        if self._colors_on():
+            if self._prompt_banner:
+                token = ("danger" if "denied" in prefix.lower()
+                         or "security" in prefix.lower() else "warning")
+                display_prefix = self._style(prefix, token, bold=True)
+            elif self._stream_status:
+                display_prefix = self._style(prefix, "muted")
+            else:
+                display_prefix = self._style(prefix, "accent", bold=True)
+            line = display_prefix + shown
         return line, col
 
     def _cursor_screen_position(self, width: int,
@@ -2245,6 +2331,40 @@ class TuiSession:
             "[security] /security ack acknowledges secret findings; "
             "/security gitignore adds .env patterns.", "system")
 
+    def _theme(self, arg: str) -> None:
+        """`/theme` lists palettes; `/theme NAME` switches and saves."""
+        name = (arg or "").strip()
+        if not name:
+            data = themes_mod.list_themes(self.root)
+            builtin = list(data.get("builtin_names") or [])
+            custom = [n for n in data.get("custom_names") or []
+                      if n not in builtin]
+            names = builtin + sorted(custom)
+            lines = ["Color themes (shared with the GUI):"]
+            for item in names:
+                active = item == data.get("active_theme")
+                marker = "*" if active else " "
+                kind = "built-in" if item in builtin else "custom"
+                line = f" {marker} {item:<20} {kind}"
+                if active:
+                    line += "  <- active"
+                lines.append(line)
+            override = data.get("project_theme")
+            if override:
+                lines.append(f"Project override: {override}")
+            lines.append("Use /theme <name> to switch; the choice is saved.")
+            self._append("\n".join(lines), "system")
+            return
+        try:
+            tokens = themes_mod.set_active_theme(name, self.root)
+        except ValueError as exc:
+            self._append(str(exc), "error")
+            return
+        self.theme = tokens
+        self._reload_theme()
+        self._append(f"Theme: {self.theme_name} (saved)", "receipt")
+        self._dirty = True
+
     def run_task(self, task: str) -> None:
         """Run one plain-text coding task, keeping the UI live while it runs."""
         self._context_override = None
@@ -2577,6 +2697,9 @@ class TuiSession:
             return
         if cmd == "security":
             self._security(arg)
+            return
+        if cmd == "theme":
+            self._theme(arg)
             return
         if cmd == "cost":
             self._append(self.status_report(), "system")

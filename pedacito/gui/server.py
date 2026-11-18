@@ -22,7 +22,7 @@ from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlparse
 
 from .. import review as review_mod
-from .. import security, workspace
+from .. import security, themes as themes_mod, workspace
 from ..config import ConfigError
 from ..local_server import LocalHTTPServer
 from ..select import Matcher, is_venv_dir
@@ -1603,6 +1603,54 @@ def _theme(q, body):
             str(body.get("gui_theme", "")))}
     except ConfigError as e:
         return 400, {"ok": False, "detail": str(e)}
+
+
+def _themes_payload() -> dict:
+    data = themes_mod.list_themes(STATE.root)
+    return {"ok": True, **data}
+
+
+@get("/api/themes")
+def _themes(q, body=None):
+    """Every built-in and custom palette, plus the active theme's name."""
+    return 200, _themes_payload()
+
+
+@post("/api/themes/select")
+def _themes_select(q, body):
+    """Activate a theme. A project with an override updates that override."""
+    name = str((body or {}).get("name") or "").strip()
+    try:
+        themes_mod.set_active_theme(name, STATE.root)
+    except ValueError as e:
+        raise ConfigError(str(e)) from e
+    return 200, _themes_payload()
+
+
+@post("/api/themes/save")
+def _themes_save(q, body):
+    """Validate, store and activate a user-created theme."""
+    body = body or {}
+    try:
+        themes_mod.save_custom_theme(str(body.get("name") or ""),
+                                     body.get("tokens"), STATE.root)
+        themes_mod.set_active_theme(str(body.get("name") or ""), STATE.root)
+    except ValueError as e:
+        raise ConfigError(str(e)) from e
+    return 200, _themes_payload()
+
+
+@post("/api/themes/delete")
+def _themes_delete(q, body):
+    """Delete a custom theme; built-in presets are immutable."""
+    name = str((body or {}).get("name") or "").strip()
+    if not name:
+        raise ConfigError("theme name is required")
+    if not themes_mod.delete_custom_theme(name):
+        if name in themes_mod.BUILTIN_THEMES:
+            raise ConfigError(f"{name!r} is a built-in theme and cannot be deleted")
+        raise ConfigError(f"no custom theme named {name!r}")
+    return 200, _themes_payload()
 
 
 @post("/api/settings/autotune")
