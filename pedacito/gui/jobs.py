@@ -30,7 +30,7 @@ from .. import plan as plan_mod
 from .. import security as security_mod
 from ..agent import Agent
 from ..config import ConfigError
-from ..llm import LLMClient, LLMError
+from ..llm import CancelledError, LLMClient, LLMError
 from .core import STATE, Job, RUN_KINDS, args_for, remember_recent
 
 MAX_TEXT_CHARS = 60000
@@ -74,6 +74,16 @@ def spawn(kind: str, title: str, fn, *, echo=None) -> Job | None:
                 STATE.add_message(
                     "system", "Stopped. Anything already written can be "
                     "undone with Restore (project menu).", kind="cancelled")
+            except CancelledError:
+                # A streamed call aborted through its cancel_event (the clean
+                # path Stop uses); show the user-facing stop state instead of
+                # an opaque transport error.
+                job.stop_reason = job.stop_reason or "Stopped by user"
+                job.stream_phase = "stopped"
+                STATE.add_message(
+                    "system", "Stopped by user. Anything already written can "
+                    "be undone with Restore (project menu).",
+                    kind="cancelled")
             except (ConfigError, LLMError) as e:
                 err = str(e)
                 if job.kind in RUN_KINDS:
@@ -120,13 +130,31 @@ def spawn(kind: str, title: str, fn, *, echo=None) -> Job | None:
 def stop_job() -> bool:
     """Ask the running job to stop. The model client is told to drop an
     in-flight stream, and a KeyboardInterrupt (what Ctrl-C does on the command
-    line) is raised in the worker thread."""
+    line) is raised in the worker thread.
+
+    The job's `cancel_event` is set first: the LLM transport checks it on every
+    SSE line and closes the live socket, so a 3,000-token generation stops
+    within milliseconds instead of finishing.
+    """
     with STATE.lock:
         job = STATE.job
         if job is None or not job.active or job.cancelled:
             return False
         job.cancelled = True
+        job.stop_reason = "Stopped by user"
+        job.stream_phase = "stopped"
+        event = getattr(job, "cancel_event", None)
+        if event is not None:
+            try:
+                event.set()
+            except Exception:
+                pass
         client = getattr(job, "client", None) or STATE.client
+        if client is not None and hasattr(client, "cancel_event"):
+            try:
+                client.cancel_event = event
+            except Exception:
+                pass
         thread = job.thread
         if thread is not None and thread.is_alive() and thread.ident:
             ctypes.pythonapi.PyThreadState_SetAsyncExc(
@@ -136,7 +164,8 @@ def stop_job() -> bool:
             client.cancel()
     except Exception:
         pass
-    STATE.bus.publish("job", job=job.id, state="stopping", kind=job.kind)
+    STATE.bus.publish("job", job=job.id, state="stopping", kind=job.kind,
+                      reason=job.stop_reason)
     return True
 
 
@@ -246,6 +275,11 @@ def session(p: SimpleNamespace, job: Job, *, interactive: bool, lock: bool):
     job.client = client
     feed = _Feed(client, job)
     saved_cb, saved_echo = client.stream_callback, client.echo_stream
+    saved_cancel = getattr(client, "cancel_event", _MISSING)
+    try:
+        client.cancel_event = job.cancel_event
+    except Exception:
+        pass
     client.stream_callback = feed.token
     elog = events_mod.get(root, cfg)
     elog.listeners.append(feed.event)
@@ -258,7 +292,8 @@ def session(p: SimpleNamespace, job: Job, *, interactive: bool, lock: bool):
         events_mod.attach(client, elog)
     held = False
     had = {k: cfg.__dict__.get(k, _MISSING)
-           for k in ("_steer", "_interactive", "_ask_user")}
+           for k in ("_steer", "_interactive", "_ask_user", "_cancel_event")}
+    cfg._cancel_event = job.cancel_event
     if interactive:
         cfg._interactive = True
         cfg._ask_user = STATE.ask_user
@@ -275,6 +310,13 @@ def session(p: SimpleNamespace, job: Job, *, interactive: bool, lock: bool):
         yield feed
     finally:
         client.stream_callback, client.echo_stream = saved_cb, saved_echo
+        try:
+            if saved_cancel is _MISSING:
+                delattr(client, "cancel_event")
+            else:
+                client.cancel_event = saved_cancel
+        except Exception:
+            pass
         try:
             elog.listeners.remove(feed.event)
         except ValueError:

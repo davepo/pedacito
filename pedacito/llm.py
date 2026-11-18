@@ -85,6 +85,17 @@ class CancelledError(LLMError):
     kind = "cancelled"
 
 
+class RunCancelledError(CancelledError):
+    """A streaming call stopped because its cancellation token was set.
+
+    This is the stream-level spelling of `CancelledError`: the HTTP socket is
+    closed immediately and the partial reply stays in `partial_text`, so a
+    GUI Stop or a TUI Ctrl-C never waits for the remaining generated tokens.
+    """
+
+    kind = "cancelled"
+
+
 class CircuitOpenError(LLMError):
     """Repeated transport/server failures opened the circuit breaker; callers
     get a fast, actionable error instead of another timeout."""
@@ -828,6 +839,9 @@ _STREAM_REPEAT_WINDOW = 4000        # chars of tail the cycle test inspects
 _STREAM_REPEAT_MIN_CYCLE = 80       # shorter repeats may be real style
 _STREAM_REPEAT_MIN_TIMES = 3        # 2 copies is quoting; 3 is a loop
 _STREAM_REPEAT_CHECK_CHARS = 512    # re-test only after this much new text
+# Cap on the live reasoning/content buffers handed to the GUI drawer and the
+# TUI status line: a runaway reply must not grow process memory without bound.
+_STREAM_LIVE_BUFFER = 200_000
 
 # Degenerate edit loops re-emit the SAME completed edit block under changing
 # `--- FILE: ... L<n>-<m>` headers, so the verbatim tail test never trips
@@ -932,6 +946,98 @@ def _reasoning_text(message: dict) -> str:
             if parts:
                 return "".join(parts)
     return ""
+
+
+# Streaming inline-reasoning support. A token stream can split `<think>` (or
+# `<thinking>` / `<reasoning>`) across arbitrary chunk boundaries, so a plain
+# regex on each delta would leak half a tag into the visible answer. The
+# splitter below holds only a possible partial tag suffix between chunks and
+# returns (reasoning, content) text for every delta.
+_STREAM_THINK_OPEN = ("<think>", "<thinking>", "<reasoning>",
+                      "[think]", "<seed:think>")
+_STREAM_THINK_CLOSE = ("</think>", "</thinking>", "</reasoning>",
+                       "[/think]", "</seed:think>")
+_STREAM_THINK_OPEN_RE = re.compile(
+    "|".join(re.escape(t) for t in _STREAM_THINK_OPEN), re.IGNORECASE)
+_STREAM_THINK_CLOSE_RE = re.compile(
+    "|".join(re.escape(t) for t in _STREAM_THINK_CLOSE), re.IGNORECASE)
+_STREAM_THINK_TAGS = _STREAM_THINK_OPEN + _STREAM_THINK_CLOSE
+_STREAM_THINK_MAX_TAG = max(len(t) for t in _STREAM_THINK_TAGS)
+
+
+class _StreamThinkSplitter:
+    """Incrementally separate inline reasoning tags from answer content.
+
+    `feed(text)` returns `(reasoning_delta, content_delta)`; `flush()` returns
+    whatever remains when the stream ends. Text that merely looks like the
+    beginning of a tag is held until the next chunk decides it.
+    """
+
+    def __init__(self):
+        self._pending = ""
+        self._inside = False
+
+    def _hold_len(self, tags) -> int:
+        text = self._pending
+        low = text.lower()
+        for n in range(min(len(text), _STREAM_THINK_MAX_TAG - 1), 0, -1):
+            suffix = low[-n:]
+            if any(tag.startswith(suffix) for tag in tags):
+                return n
+        return 0
+
+    def feed(self, text: str) -> tuple[str, str]:
+        self._pending += text or ""
+        reasoning: list[str] = []
+        content: list[str] = []
+        while self._pending:
+            if self._inside:
+                match = _STREAM_THINK_CLOSE_RE.search(self._pending)
+                if match:
+                    if match.start():
+                        reasoning.append(self._pending[:match.start()])
+                    self._pending = self._pending[match.end():]
+                    self._inside = False
+                    continue
+                hold = self._hold_len(_STREAM_THINK_CLOSE)
+                if hold:
+                    reasoning.append(self._pending[:-hold])
+                    self._pending = self._pending[-hold:]
+                else:
+                    reasoning.append(self._pending)
+                    self._pending = ""
+                break
+            opening = _STREAM_THINK_OPEN_RE.search(self._pending)
+            closing = _STREAM_THINK_CLOSE_RE.search(self._pending)
+            if closing and (opening is None or closing.start() < opening.start()):
+                # A stray close marker when the runtime already moved the
+                # thinking to a separate field: drop it, keep the answer.
+                if closing.start():
+                    content.append(self._pending[:closing.start()])
+                self._pending = self._pending[closing.end():]
+                continue
+            if opening:
+                if opening.start():
+                    content.append(self._pending[:opening.start()])
+                self._pending = self._pending[opening.end():]
+                self._inside = True
+                continue
+            hold = self._hold_len(_STREAM_THINK_TAGS)
+            if hold:
+                content.append(self._pending[:-hold])
+                self._pending = self._pending[-hold:]
+            else:
+                content.append(self._pending)
+                self._pending = ""
+            break
+        return "".join(reasoning), "".join(content)
+
+    def flush(self) -> tuple[str, str]:
+        text, self._pending = self._pending, ""
+        if not text:
+            return "", ""
+        return (text, "") if self._inside else ("", text)
+
 
 
 def extract_content(message: dict) -> str:
@@ -1276,9 +1382,23 @@ class LLMClient:
         self._session_used = False
         self._stats_lock = threading.Lock()
         self._cancel = threading.Event()
+        # Optional external cancellation token (threading.Event, a callable
+        # predicate, or any object with is_set()). The GUI sets it to the
+        # active job's token so Stop closes an in-flight SSE socket at once.
+        self.cancel_event = None
         # Called with each streamed text delta instead of echoing to stdout
         # (GUI streaming, tests). None = echo to stdout.
         self.stream_callback = None
+        # Called with one rich dict per throttled stream progress event:
+        # {kind: "llm_stream", phase, delta_reasoning, delta_content,
+        #  tokens_so_far, tok_per_sec, ...}. `on_stream_event` is an alias so
+        # integrations can use either spelling.
+        self.on_stream = None
+        self.on_stream_event = None
+        # The live SSE response, so cancel() can close the socket from the
+        # Stop thread instead of waiting for the next line to arrive.
+        self._active_response = None
+        self._active_response_lock = threading.Lock()
         self.echo_stream = True
         # Called with one dict per finished request (events.py attaches here).
         self.on_call = None
@@ -1330,6 +1450,14 @@ class LLMClient:
         # empty-completion retry uses it to tell an instant-EOS flake (retry
         # identical) from a thinking runaway (retry with thinking disabled).
         self.last_reasoning_chars = 0
+        # Live/final view of the last streamed reply: the reasoning pane, the
+        # visible answer, and the token/speed counters the GUI drawer and TUI
+        # status line render. Cleared at the start of every streamed attempt.
+        self.stream_phase = ""
+        self.last_stream_reasoning = ""
+        self.last_stream_content = ""
+        self.last_stream_tokens = 0
+        self.last_stream_tok_per_s = 0.0
         # Circuit breaker: consecutive transport/server failures, and the
         # monotonic deadline before which calls fail fast. A success closes it.
         self._failures = 0
@@ -1482,8 +1610,86 @@ class LLMClient:
 
     def cancel(self) -> None:
         """Ask the in-flight (or next) streamed call to stop at the next
-        chunk. Safe from any thread; cleared when the next call starts."""
+        chunk. Safe from any thread; cleared when the next call starts.
+
+        The live SSE response is closed immediately as well, so a blocking
+        socket read (a server that has not sent its next token yet) returns
+        at once instead of waiting for generation to finish.
+        """
         self._cancel.set()
+        event = getattr(self, "cancel_event", None)
+        setter = getattr(event, "set", None)
+        if callable(setter):
+            try:
+                setter()
+            except Exception:
+                pass
+        with self._active_response_lock:
+            response = self._active_response
+        if response is not None:
+            _close(response)
+
+    def set_cancel_event(self, event) -> None:
+        """Install the cancellation token for this client (GUI job Stop)."""
+        self.cancel_event = event
+
+    @staticmethod
+    def _token_set(source) -> bool:
+        """True when a cancellation token is set, callable, or truthy."""
+        if source is None:
+            return False
+        checker = getattr(source, "is_set", None)
+        if callable(checker):
+            try:
+                return bool(checker())
+            except Exception:
+                return False
+        if callable(source):
+            try:
+                return bool(source())
+            except Exception:
+                return False
+        try:
+            return bool(source)
+        except Exception:
+            return False
+
+    def _cancel_requested(self, extra=None) -> bool:
+        """Check the client's own flag, an explicit token, and the run-wide
+        token the GUI stores on the config. Never raises."""
+        for source in (self._cancel, extra, getattr(self, "cancel_event", None),
+                       getattr(self.cfg, "_cancel_event", None)):
+            if self._token_set(source):
+                return True
+        return False
+
+    def stream_state(self) -> dict:
+        """The last/current stream's reasoning, content, tokens and speed."""
+        return {
+            "phase": self.stream_phase,
+            "reasoning": self.last_stream_reasoning,
+            "content": self.last_stream_content,
+            "tokens": int(self.last_stream_tokens or 0),
+            "tok_per_sec": round(float(self.last_stream_tok_per_s or 0.0), 1),
+        }
+
+    def _emit_stream_event(self, event: dict, callback=None) -> None:
+        """Deliver one throttled `llm_stream` event to the stream callback and
+        the project's EventLog (the GUI drawer and TUI status line listen
+        there). Telemetry must never break a model call."""
+        cb = callback or self.on_stream or getattr(self, "on_stream_event", None)
+        if cb is not None:
+            try:
+                cb(event)
+            except Exception:
+                pass
+        try:
+            from . import events as events_mod
+            events_mod.get(self._outbound_root(), self.cfg).emit(
+                "llm_stream", _full=True,
+                **{k: v for k, v in event.items() if k != "kind"})
+        except Exception:
+            pass
 
     def _circuit_enabled(self) -> bool:
         return bool(getattr(self.cfg, "circuit_breaker", True))
@@ -1733,8 +1939,9 @@ class LLMClient:
                 f"Unexpected vision response: {r.text[:300]}") from e
 
     def chat(self, messages: list[dict], max_tokens: int, schema: dict | None = None,
-             stream: bool = False, disable_thinking: bool | None = None,
-             json_schema: dict | None = None) -> str:
+             stream: bool | None = None, disable_thinking: bool | None = None,
+             json_schema: dict | None = None, cancel_event=None,
+             on_stream=None) -> str:
         """Send a chat completion request and return the response text.
 
         `json_schema` is the strict schema to attach as the
@@ -1753,7 +1960,17 @@ class LLMClient:
         agent.fold_middle) because every rewrite invalidates the server's
         prompt-prefix cache. The overflow path below is the last resort, taken
         only after the server itself refused the request.
+
+        Passing `cancel_event` (a threading.Event or callable predicate), or
+        installing `client.on_stream`, turns streaming on by default when the
+        caller did not choose a mode. `stream=False` always keeps the buffered
+        JSON path, so existing callers and mocks are untouched.
         """
+        if stream is None:
+            stream = bool(on_stream or self.on_stream
+                          or getattr(self, "on_stream_event", None)
+                          or cancel_event is not None
+                          or getattr(self, "cancel_event", None) is not None)
         messages = merge_consecutive(messages)
         if self._no_system_role:
             messages = fold_system(messages)
@@ -1780,7 +1997,9 @@ class LLMClient:
                     max_tokens = fit
             try:
                 text = self._chat_once(messages, max_tokens, schema, stream,
-                                       disable_thinking, json_schema)
+                                       disable_thinking, json_schema,
+                                       cancel_event=cancel_event,
+                                       on_stream=on_stream)
             except ContextOverflowError as e:
                 # The server's window is smaller than our budgets assumed
                 # (stock LM Studio 8192 / Ollama 4096). Halve the reply budget
@@ -2079,7 +2298,8 @@ class LLMClient:
     def _chat_once(self, messages: list[dict], max_tokens: int,
                    schema: dict | None = None, stream: bool = False,
                    disable_thinking: bool | None = None,
-                   json_schema: dict | None = None) -> str:
+                   json_schema: dict | None = None, cancel_event=None,
+                   on_stream=None) -> str:
         """One HTTP request (no retry logic); returns the response text,
         buffered or streamed (to `stream_callback`, else stdout).
 
@@ -2090,6 +2310,15 @@ class LLMClient:
         and the request is re-sent one tier down immediately, so no call ever
         fails over server schema support differences."""
         self._check_budget()
+        external_cancel = (cancel_event if cancel_event is not None
+                           else getattr(self, "cancel_event", None))
+        # `_cancel` belongs to the PREVIOUS stream (client.cancel() may be
+        # called after a task ends); a new call starts clean. A caller-owned
+        # token (GUI job Stop) is checked after that reset and still aborts.
+        self._cancel.clear()
+        if self._token_set(external_cancel):
+            raise RunCancelledError(
+                "Cancelled before the request left; nothing was sent.")
         fmt_schema = json_schema if json_schema is not None else schema
         msgs = [dict(m) for m in messages]
         want_off = (disable_thinking if disable_thinking is not None
@@ -2277,8 +2506,11 @@ class LLMClient:
         # Cleared per attempt with stream_truncated: True when the repetition
         # guard stopped a degenerate answer loop.
         self.stream_repetition = False
-        if stream:
-            self._cancel.clear()
+        self.stream_phase = ""
+        self.last_stream_reasoning = ""
+        self.last_stream_content = ""
+        self.last_stream_tokens = 0
+        self.last_stream_tok_per_s = 0.0
 
         if not stream:
             try:
@@ -2291,39 +2523,44 @@ class LLMClient:
                           file=sys.stderr)
                     return self._chat_once(messages, max_tokens, schema,
                                            stream, disable_thinking,
-                                           json_schema)
+                                           json_schema,
+                                           cancel_event=cancel_event,
+                                           on_stream=on_stream)
                 if native and self._tools_rejected(e):
                     self._native_ok = False
                     print("[this server rejected native tool calls; using the "
                           "JSON grammar instead]", file=sys.stderr)
                     return self._chat_once(messages, max_tokens, schema, stream,
-                                           disable_thinking, json_schema)
+                                           disable_thinking, json_schema,
+                                           cancel_event=cancel_event,
+                                           on_stream=on_stream)
                 if self._downgrade_response_format(payload, e):
                     return self._chat_once(messages, max_tokens, schema, stream,
-                                           disable_thinking, json_schema)
+                                           disable_thinking, json_schema,
+                                           cancel_event=cancel_event,
+                                           on_stream=on_stream)
                 if self._deny_accel_caps(payload, e):
                     return self._chat_once(messages, max_tokens, schema, stream,
-                                           disable_thinking, json_schema)
+                                           disable_thinking, json_schema,
+                                           cancel_event=cancel_event,
+                                           on_stream=on_stream)
                 raise
             try:
-                data = r.json()
+                if self._response_is_sse(r):
+                    # The server chose SSE even though the request asked for a
+                    # buffered reply: parse it with the streaming reader so it
+                    # is not lost to an ``r.json()`` failure.
+                    return self._consume_stream_response(
+                        r, prompt_est=prompt_est, t0=t0, native=native,
+                        cancel_event=external_cancel, on_stream=on_stream)
+                if self._cancel_requested(external_cancel):
+                    raise RunCancelledError(
+                        "Cancelled before the reply was read; nothing was "
+                        "consumed.")
+                return self._consume_buffered_response(
+                    r, native=native, prompt_est=prompt_est, t0=t0)
             finally:
                 _close(r)
-            try:
-                self.last_finish_reason = data["choices"][0].get("finish_reason") or ""
-            except (KeyError, IndexError, AttributeError, TypeError):
-                self.last_finish_reason = ""
-            try:
-                msg = data["choices"][0]["message"]
-                text = (_tool_call_arguments(msg) if native else "") \
-                    or extract_content(msg)
-            except (KeyError, IndexError, TypeError) as e:
-                raise LLMError(f"Unexpected response shape: {json.dumps(data)[:500]}") from e
-            if native and self._native_ok is None:
-                self._native_ok = True
-            self._account(data.get("usage") or {}, data.get("timings"),
-                          time.time() - t0, prompt_est, text)
-            return text
 
         # Streaming, so the user sees progress at local-model speeds.
         out: list[str] = []
@@ -2347,13 +2584,19 @@ class LLMClient:
                 print("[this server rejected explicit cache_control markers; "
                       "falling back to implicit caching]", file=sys.stderr)
                 return self._chat_once(messages, max_tokens, schema, stream,
-                                       disable_thinking, json_schema)
+                                       disable_thinking, json_schema,
+                                       cancel_event=cancel_event,
+                                       on_stream=on_stream)
             if self._downgrade_response_format(payload, e):
                 return self._chat_once(messages, max_tokens, schema, stream,
-                                       disable_thinking, json_schema)
+                                       disable_thinking, json_schema,
+                                       cancel_event=cancel_event,
+                                       on_stream=on_stream)
             if self._deny_accel_caps(payload, e):
                 return self._chat_once(messages, max_tokens, schema, stream,
-                                       disable_thinking, json_schema)
+                                       disable_thinking, json_schema,
+                                       cancel_event=cancel_event,
+                                       on_stream=on_stream)
             low = str(e).lower()
             if "stream_options" in payload and (
                     "stream_options" in low or "include_usage" in low):
@@ -2364,12 +2607,87 @@ class LLMClient:
                 r = self._post(payload, stream=True)
             else:
                 raise
+        if self._response_is_json(r):
+            # A test mock or a server that ignores `stream: true` answered
+            # with a normal completion: use the buffered parser transparently.
+            try:
+                return self._consume_buffered_response(
+                    r, native=native, prompt_est=prompt_est, t0=t0)
+            finally:
+                _close(r)
         sink = self.stream_callback
         cancelled = False
         dropped: Exception | None = None
+        # Live token/char counters and throttled event state. `reported_tokens`
+        # is filled from the final SSE usage frame when the server sends one;
+        # otherwise the count below remains a deterministic estimate.
+        splitter = _StreamThinkSplitter()
+        reasoning_parts: list[str] = []
+        pending_reasoning: list[str] = []
+        pending_content: list[str] = []
+        reasoning_chars = 0
+        counted_chars = 0
+        reported_tokens = 0
+        chunks_since_emit = 0
+        events_emitted = 0
+        sse_data_seen = 0
+        stream_started = time.monotonic()
+        first_token_at: float | None = None
+        last_emit = stream_started
+
+        def tokens_now() -> int:
+            if reported_tokens:
+                return int(reported_tokens)
+            cpt = self.chars_per_token or CHARS_PER_TOKEN
+            return int(counted_chars / cpt)
+
+        def flush_stream(final: bool = False) -> None:
+            """Emit one throttled `llm_stream` event for the deltas seen so
+            far. Empty final calls still refresh the exact reported token
+            count after the usage frame arrives."""
+            nonlocal pending_reasoning, pending_content, events_emitted
+            nonlocal chunks_since_emit, last_emit
+            rtext = "".join(pending_reasoning)
+            ctext = "".join(pending_content)
+            if not (rtext or ctext or final):
+                return
+            now = time.monotonic()
+            anchor = first_token_at or stream_started
+            elapsed = max(now - anchor, 0.001)
+            tokens = tokens_now()
+            speed = tokens / elapsed if tokens else 0.0
+            phase = ("reasoning" if rtext and not ctext else
+                     "content" if ctext
+                     else (self.stream_phase or "content"))
+            event = {
+                "kind": "llm_stream",
+                "phase": phase,
+                "delta_reasoning": rtext,
+                "delta_content": ctext,
+                "tokens_so_far": tokens,
+                "tok_per_sec": round(speed, 1),
+                "elapsed_s": round(now - stream_started, 3),
+                "site": self.site or "call",
+                "model": str(getattr(self.cfg, "model", "") or ""),
+            }
+            self.stream_phase = phase
+            self.last_stream_reasoning = (
+                self.last_stream_reasoning + rtext)[-_STREAM_LIVE_BUFFER:]
+            self.last_stream_content = (
+                self.last_stream_content + ctext)[-_STREAM_LIVE_BUFFER:]
+            self.last_stream_tokens = tokens
+            self.last_stream_tok_per_s = speed
+            pending_reasoning, pending_content = [], []
+            chunks_since_emit = 0
+            last_emit = now
+            events_emitted += 1
+            self._emit_stream_event(event, callback=on_stream)
+
+        with self._active_response_lock:
+            self._active_response = r
         try:
             for raw in r.iter_lines(decode_unicode=True):
-                if self._cancel.is_set():
+                if self._cancel_requested(external_cancel):
                     cancelled = True
                     break
                 if not raw:
@@ -2390,6 +2708,7 @@ class LLMClient:
                     obj = json.loads(body)
                 except Exception:
                     continue
+                sse_data_seen += 1
                 if isinstance(obj, dict) and obj.get("usage"):
                     usage = obj["usage"]
                 if isinstance(obj, dict) and obj.get("timings"):
@@ -2408,18 +2727,39 @@ class LLMClient:
                 rc = _reasoning_text(d)
                 if not delta and not rc:
                     continue
+                if first_token_at is None:
+                    first_token_at = time.monotonic()
                 if rc:
+                    if pending_content:
+                        flush_stream()     # keep content before thoughts
                     reasoning_chars += len(rc)       # counted, never echoed
+                    reasoning_parts.append(rc)
+                    pending_reasoning.append(rc)
+                    counted_chars += len(rc)
                 if delta:
                     out.append(delta)
-                    if sink is not None:
-                        try:
-                            sink(delta)
-                        except Exception:
-                            pass
-                    elif self.echo_stream:
-                        sys.stdout.write(delta)
-                        sys.stdout.flush()
+                    inline_reasoning, visible = splitter.feed(delta)
+                    counted_chars += len(delta)
+                    if inline_reasoning:
+                        if pending_content:
+                            flush_stream()
+                        reasoning_chars += len(inline_reasoning)
+                        reasoning_parts.append(inline_reasoning)
+                        pending_reasoning.append(inline_reasoning)
+                    if visible:
+                        if pending_reasoning:
+                            # The reasoning pane becomes its own event before
+                            # the first answer token lands.
+                            flush_stream()
+                        pending_content.append(visible)
+                        if sink is not None:
+                            try:
+                                sink(visible)
+                            except Exception:
+                                pass
+                        elif self.echo_stream:
+                            sys.stdout.write(visible)
+                            sys.stdout.flush()
                     # Degenerate native-tool-call loop guard; the 4-char
                     # overlap catches an opening tag split across chunks.
                     probe = probe_tail + delta
@@ -2476,19 +2816,93 @@ class LLMClient:
                                   "over -- a degenerate loop; treating the "
                                   "answer as cut off]", file=sys.stderr)
                             break
+                if self._cancel_requested(external_cancel):
+                    cancelled = True
+                    break
+                chunks_since_emit += 1
+                now = time.monotonic()
+                if chunks_since_emit >= 15 or (
+                        (pending_reasoning or pending_content)
+                        and now - last_emit >= 0.1):
+                    flush_stream()
         except requests.exceptions.RequestException as e:
             dropped = e
+        except Exception as e:
+            # cancel() closes the live socket from another thread; a read
+            # interrupted that way may surface as a transport/library error.
+            # Only swallow it when a cancellation actually explains it.
+            if not (cancelled or self._cancel_requested(external_cancel)):
+                raise
+            dropped = e
         finally:
+            with self._active_response_lock:
+                if self._active_response is r:
+                    self._active_response = None
             _close(r)
+        # Release any character held for a possible split tag at EOF.
+        tail_reasoning, tail_content = splitter.flush()
+        if tail_reasoning:
+            reasoning_chars += len(tail_reasoning)
+            reasoning_parts.append(tail_reasoning)
+            pending_reasoning.append(tail_reasoning)
+            counted_chars += len(tail_reasoning)
+        if tail_content:
+            pending_content.append(tail_content)
+            if sink is not None:
+                try:
+                    sink(tail_content)
+                except Exception:
+                    pass
+            elif self.echo_stream:
+                sys.stdout.write(tail_content)
+                sys.stdout.flush()
         if sink is None and self.echo_stream:
             sys.stdout.write("\n")
+        if self._cancel_requested(external_cancel):
+            cancelled = True
         self.last_reasoning_chars = reasoning_chars
         text = strip_reasoning("".join(out))
         self.partial_text = text
+
+        # A server (or a test double) may answer a streaming request with a
+        # standard JSON body instead of SSE. No data frame + a JSON body is
+        # that fallback: parse it transparently.
+        if sse_data_seen == 0 and not text and not cancelled:
+            try:
+                data = r.json()
+            except Exception:
+                data = None
+            if isinstance(data, dict) and data.get("choices") is not None:
+                return self._consume_buffered_data(
+                    data, native=native, prompt_est=prompt_est, t0=t0)
+
+        # Usage fallback: servers that omit the final usage frame still get
+        # deterministic counted tokens instead of zero telemetry.
+        usage = dict(usage or {})
+        estimated = tokens_now()
+        if usage:
+            if not _positive_int(usage.get("completion_tokens")):
+                usage["completion_tokens"] = estimated
+            if not _positive_int(usage.get("prompt_tokens")):
+                usage["prompt_tokens"] = prompt_est
         self._account(usage, timings, time.time() - t0, prompt_est, text)
+        reported_tokens = max(reported_tokens,
+                              int(self.last_completion_tokens or 0))
+        self.last_stream_tokens = (reported_tokens or tokens_now())
+        self.last_stream_tok_per_s = self.last_tok_per_s
+        # Flush the tail deltas first (they still live in the pending lists),
+        # then pin the exact final buffers; otherwise the final events would
+        # append the same reasoning a second time.
+        flush_stream(final=True)
+        self.last_stream_content = text
+        self.last_stream_reasoning = (
+            "".join(reasoning_parts)[-_STREAM_LIVE_BUFFER:])
+        self.last_stream_tokens = (reported_tokens or tokens_now())
+        self.last_stream_tok_per_s = self.last_tok_per_s
         if cancelled:
-            raise CancelledError("Cancelled by the user; the partial reply is "
-                                 "kept in client.partial_text.")
+            raise RunCancelledError(
+                "Stopped by user; the partial reply is kept in "
+                "client.partial_text.")
         if dropped is not None:
             self._record_failure()
             if not text.strip():
@@ -2502,6 +2916,251 @@ class LLMClient:
             print(f"\n[connection dropped mid-reply "
                   f"({type(dropped).__name__}); treating the reply as cut "
                   f"off]", file=sys.stderr)
+        return text
+
+    @staticmethod
+    def _response_content_type(response) -> str:
+        """Lower-case Content-Type of a response ('' when absent)."""
+        try:
+            headers = getattr(response, "headers", None) or {}
+            value = headers.get("Content-Type") or headers.get("content-type")
+        except Exception:
+            value = ""
+        return str(value or "").strip().lower()
+
+    @classmethod
+    def _response_is_sse(cls, response) -> bool:
+        return cls._response_content_type(response).startswith(
+            "text/event-stream")
+
+    @classmethod
+    def _response_is_json(cls, response) -> bool:
+        ctype = cls._response_content_type(response)
+        return ctype.startswith("application/json") or ctype.endswith("+json")
+
+    def _consume_buffered_response(self, r, *, native: bool,
+                                   prompt_est: int, t0: float) -> str:
+        """Parse one standard JSON chat completion (the non-streaming path)."""
+        data = r.json()
+        return self._consume_buffered_data(
+            data, native=native, prompt_est=prompt_est, t0=t0)
+
+    def _consume_buffered_data(self, data, *, native: bool,
+                               prompt_est: int, t0: float) -> str:
+        """Turn one parsed JSON completion into the reply text + telemetry."""
+        try:
+            self.last_finish_reason = (
+                data["choices"][0].get("finish_reason") or "")
+        except (KeyError, IndexError, AttributeError, TypeError):
+            self.last_finish_reason = ""
+        try:
+            msg = data["choices"][0]["message"]
+            text = (_tool_call_arguments(msg) if native else "") \
+                or extract_content(msg)
+        except (KeyError, IndexError, TypeError) as e:
+            raise LLMError(
+                f"Unexpected response shape: {json.dumps(data)[:500]}") from e
+        if native and self._native_ok is None:
+            self._native_ok = True
+        self._account(data.get("usage") or {}, data.get("timings"),
+                      time.time() - t0, prompt_est, text)
+        return text
+
+    def _consume_stream_response(self, r, *, prompt_est: int, t0: float,
+                                 native: bool = False, cancel_event=None,
+                                 on_stream=None) -> str:
+        """Parse an SSE reply when the caller did not ask for streaming.
+
+        The normal streamed path inside `_chat_once` carries the loop guards
+        and continuation diagnostics; this reader exists for a server that
+        answers a buffered request with `text/event-stream` anyway. It uses
+        the same delta splitter and accounting, so the reply and telemetry are
+        identical to the primary path.
+        """
+        external = (cancel_event if cancel_event is not None
+                    else getattr(self, "cancel_event", None))
+        sink = self.stream_callback
+        splitter = _StreamThinkSplitter()
+        out: list[str] = []
+        reasoning_parts: list[str] = []
+        pending_reasoning: list[str] = []
+        pending_content: list[str] = []
+        usage: dict = {}
+        timings: dict | None = None
+        reasoning_chars = 0
+        counted_chars = 0
+        reported_tokens = 0
+        chunks = 0
+        events = 0
+        started = time.monotonic()
+        first_token_at: float | None = None
+        last_emit = started
+        self.last_finish_reason = ""
+        self.last_reasoning_chars = 0
+        self.stream_phase = ""
+
+        def emit(final: bool = False) -> None:
+            nonlocal pending_reasoning, pending_content, chunks, last_emit
+            nonlocal events
+            rtext, ctext = "".join(pending_reasoning), "".join(pending_content)
+            if not (rtext or ctext or final):
+                return
+            now = time.monotonic()
+            elapsed = max(now - (first_token_at or started), 0.001)
+            cpt = self.chars_per_token or CHARS_PER_TOKEN
+            tokens = reported_tokens or int(counted_chars / cpt)
+            phase = ("reasoning" if rtext and not ctext else
+                     "content" if ctext
+                     else (self.stream_phase or "content"))
+            self.stream_phase = phase
+            self.last_stream_reasoning = (
+                self.last_stream_reasoning + rtext)[-_STREAM_LIVE_BUFFER:]
+            self.last_stream_content = (
+                self.last_stream_content + ctext)[-_STREAM_LIVE_BUFFER:]
+            self.last_stream_tokens = tokens
+            self.last_stream_tok_per_s = tokens / elapsed if tokens else 0.0
+            pending_reasoning, pending_content = [], []
+            chunks = 0
+            last_emit = now
+            events += 1
+            self._emit_stream_event({
+                "kind": "llm_stream", "phase": phase,
+                "delta_reasoning": rtext, "delta_content": ctext,
+                "tokens_so_far": tokens,
+                "tok_per_sec": round(self.last_stream_tok_per_s, 1),
+                "elapsed_s": round(now - started, 3),
+                "site": self.site or "call",
+                "model": str(getattr(self.cfg, "model", "") or ""),
+            }, callback=on_stream)
+
+        with self._active_response_lock:
+            self._active_response = r
+        try:
+            for raw in r.iter_lines(decode_unicode=True):
+                if self._cancel_requested(external):
+                    self.partial_text = strip_reasoning("".join(out))
+                    raise RunCancelledError(
+                        "Stopped by user; the partial reply is kept in "
+                        "client.partial_text.")
+                if not raw:
+                    continue
+                if isinstance(raw, bytes):
+                    raw = raw.decode("utf-8", "replace")
+                if raw.startswith(":") or not raw.startswith("data:"):
+                    continue
+                body = raw[5:].lstrip()
+                if body.strip() == "[DONE]":
+                    break
+                try:
+                    obj = json.loads(body)
+                except Exception:
+                    continue
+                if isinstance(obj, dict) and obj.get("usage"):
+                    usage = obj["usage"]
+                if isinstance(obj, dict) and obj.get("timings"):
+                    timings = obj["timings"]
+                try:
+                    chunk = obj["choices"][0]
+                    d = chunk.get("delta") or {}
+                    fr = chunk.get("finish_reason") or ""
+                except Exception:
+                    continue
+                if fr:
+                    self.last_finish_reason = fr
+                if fr == "length":
+                    self.stream_truncated = True
+                delta = d.get("content")
+                rc = _reasoning_text(d)
+                if not delta and not rc:
+                    continue
+                if first_token_at is None:
+                    first_token_at = time.monotonic()
+                if rc:
+                    if pending_content:
+                        emit()              # keep content before thoughts
+                    reasoning_chars += len(rc)
+                    reasoning_parts.append(rc)
+                    pending_reasoning.append(rc)
+                    counted_chars += len(rc)
+                if delta:
+                    out.append(delta)
+                    inline_reasoning, visible = splitter.feed(delta)
+                    counted_chars += len(delta)
+                    if inline_reasoning:
+                        if pending_content:
+                            emit()
+                        reasoning_chars += len(inline_reasoning)
+                        reasoning_parts.append(inline_reasoning)
+                        pending_reasoning.append(inline_reasoning)
+                    if visible:
+                        if pending_reasoning:
+                            emit()
+                        pending_content.append(visible)
+                        if sink is not None:
+                            try:
+                                sink(visible)
+                            except Exception:
+                                pass
+                        elif self.echo_stream:
+                            sys.stdout.write(visible)
+                            sys.stdout.flush()
+                if self._cancel_requested(external):
+                    self.partial_text = strip_reasoning("".join(out))
+                    raise RunCancelledError(
+                        "Stopped by user; the partial reply is kept in "
+                        "client.partial_text.")
+                chunks += 1
+                now = time.monotonic()
+                if chunks >= 15 or (
+                        (pending_reasoning or pending_content)
+                        and now - last_emit >= 0.1):
+                    emit()
+        except requests.exceptions.RequestException as e:
+            if not self._cancel_requested(external):
+                raise LLMError(
+                    f"The connection to {self.cfg.base_url} dropped mid-reply "
+                    f"({type(e).__name__}: {str(e)[:160]}).") from e
+        finally:
+            with self._active_response_lock:
+                if self._active_response is r:
+                    self._active_response = None
+            _close(r)
+        tail_reasoning, tail_content = splitter.flush()
+        if tail_reasoning:
+            reasoning_chars += len(tail_reasoning)
+            reasoning_parts.append(tail_reasoning)
+            pending_reasoning.append(tail_reasoning)
+        if tail_content:
+            pending_content.append(tail_content)
+            if sink is not None:
+                try:
+                    sink(tail_content)
+                except Exception:
+                    pass
+            elif self.echo_stream:
+                sys.stdout.write(tail_content)
+                sys.stdout.flush()
+        if sink is None and self.echo_stream:
+            sys.stdout.write("\n")
+        self.last_reasoning_chars = reasoning_chars
+        text = strip_reasoning("".join(out))
+        self.partial_text = text
+        usage = dict(usage or {})
+        if usage:
+            if not _positive_int(usage.get("completion_tokens")):
+                usage["completion_tokens"] = int(
+                    counted_chars / (self.chars_per_token or CHARS_PER_TOKEN))
+            if not _positive_int(usage.get("prompt_tokens")):
+                usage["prompt_tokens"] = prompt_est
+        self._account(usage, timings, time.time() - t0, prompt_est, text)
+        reported_tokens = max(reported_tokens,
+                              int(self.last_completion_tokens or 0))
+        emit(final=True)
+        self.last_stream_tokens = reported_tokens
+        self.last_stream_tok_per_s = self.last_tok_per_s
+        self.last_stream_content = text
+        self.last_stream_reasoning = (
+            "".join(reasoning_parts)[-_STREAM_LIVE_BUFFER:])
         return text
 
     @staticmethod
@@ -2713,7 +3372,7 @@ class LLMClient:
         cap = max(cap, max_tokens)
         for attempt in range(retries + 1):
             raw = self.chat(messages, max_tokens=budget, schema=schema,
-                            disable_thinking=disable_thinking)
+                            stream=False, disable_thinking=disable_thinking)
             truncated = self.last_finish_reason == "length"
             text = raw.strip()
             if text.startswith("```"):

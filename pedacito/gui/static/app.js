@@ -603,6 +603,60 @@ function collapseDone() {
 }
 function jobActive(id) { return !!(job() && job().id === id); }
 
+// Live "Thinking & Stream" drawer: while a Task/Auto/New/Refine job runs, the
+// throttled `llm_stream` SSE deltas are folded into job.live_reasoning and
+// job.live_content. The drawer shows the active phase, token count and speed,
+// with two auto-scrolling panes for the reasoning block and the raw output.
+function LiveStreamDrawer() {
+  const j = job();
+  const [open, setOpen] = useState(true);
+  const [tab, setTab] = useState('reasoning');
+  const paneRef = useRef(null);
+  const reasoning = (j && j.live_reasoning) || '';
+  const content = (j && j.live_content) || '';
+  const text = tab === 'reasoning' ? reasoning : content;
+  useEffect(() => {
+    const el = paneRef.current;
+    if (el && open) el.scrollTop = el.scrollHeight;
+  }, [text, tab, open, j && j.id]);
+  if (!j) return null;
+  const phase = j.stream_phase || '';
+  const stopped = !!j.cancelled;
+  const label = stopped ? 'Stopped by user'
+    : phase === 'reasoning' ? 'Thinking...'
+    : phase === 'content' ? 'Writing code...'
+    : 'Waiting for the model...';
+  const tokens = Number(j.live_tokens || 0);
+  const speed = Number(j.live_tok_per_sec || 0);
+  return html`
+    <div class=${'live-drawer' + (open ? ' open' : '') + (stopped ? ' stopped' : '')}
+         id="liveStreamDrawer">
+      <div class="live-head">
+        <button class="live-toggle" title=${open ? 'collapse live stream' : 'expand live stream'}
+                onClick=${() => setOpen(!open)}>${open ? '\u25BE' : '\u25B8'}</button>
+        <span class=${'live-phase ' + (stopped ? 'stopped' : phase || 'waiting')}>
+          <i class="live-dot"></i>${label}</span>
+        <span class="live-stat"><b>${PDC.fmtInt(tokens)}</b> tok</span>
+        <span class="live-stat"><b>${speed.toFixed(1)}</b> tok/s</span>
+        <span class="grow"></span>
+        ${stopped ? null : html`<button class="ghost small live-stop"
+          onClick=${() => stop()}>Stop</button>`}
+      </div>
+      ${open ? html`
+        <div class="live-tabs">
+          <button class=${'live-tab' + (tab === 'reasoning' ? ' on' : '')}
+                  onClick=${() => setTab('reasoning')}>Reasoning ${'<think>'}</button>
+          <button class=${'live-tab' + (tab === 'content' ? ' on' : '')}
+                  onClick=${() => setTab('content')}>Live Output</button>
+          <span class="muted small-text grow">${stopped ? 'Stopped by user' : 'auto-scrolling'}</span>
+        </div>
+        <pre class=${'live-pane ' + (tab === 'reasoning' ? 'reason-text' : 'output-text')}
+             ref=${paneRef}>${text || (tab === 'reasoning'
+               ? 'No reasoning yet. Models that expose hidden thinking stream it here.'
+               : 'Output starts as the model writes.')}</pre>` : null}
+    </div>`;
+}
+
 // ---- snapshot + SSE stream ----
 let es = null;
 function addMsg(m) {
@@ -715,6 +769,19 @@ function connect(seq) {
   on('term', (e) => termFeed(e.text));
   on('term_clear', () => { if (term) term.reset(''); });
   on('usage', () => refreshState());
+  on('stream', (e) => {
+    // Live token deltas from the model. Append locally so the drawer moves
+    // several times a second without a /api/state round trip; the poll
+    // snapshot remains authoritative after a reconnect.
+    const j = S.status.job;
+    if (!j || (e && e.job != null && e.job !== j.id)) return;
+    if (e.delta_reasoning) j.live_reasoning = (j.live_reasoning || '') + e.delta_reasoning;
+    if (e.delta_content) j.live_content = (j.live_content || '') + e.delta_content;
+    if (e.phase) j.stream_phase = e.phase;
+    if (e.tokens != null) j.live_tokens = e.tokens;
+    if (e.tok_per_sec != null) j.live_tok_per_sec = e.tok_per_sec;
+    emit();
+  });
   on('security', (e) => {
     if (e && e.message) PDC.toast(e.message);
     refreshState();
@@ -3226,7 +3293,7 @@ function Composer() {
                 disabled=${!!(j && j.cancelled && !isHow)}
                 onClick=${() => { if (isHow) send(); else if (j) stop(); else send(); }}>
           ${isHow ? (S.how.loading ? 'Asking\u2026' : 'Ask')
-              : (j ? (j.cancelled ? 'Stopping\u2026' : 'Stop')
+              : (j ? (j.cancelled ? 'Stopped by user' : 'Stop')
               : (S.mode === 'auto' ? (opt('auto', 'plan_only') ? 'Plan only' : 'Apply & run') : m.send))}
         </button>
         <input type="file" id="filePick" multiple hidden
@@ -3493,9 +3560,10 @@ function ActivityPane() {
           <i class=${'dot ' + (j ? 'busy' : 'idle')}></i><b>${phase}</b></span>
         <span class="muted small-text grow" id="engCount">
           ${PDC.fmtInt(eng.calls || 0)} calls \u00B7 ${PDC.fmtInt(eng.steps || 0)} steps</span>
-        ${j ? html`<button class="ghost small" onClick=${() => stop()}>Stop</button>` : null}
+        ${j ? html`<button class="ghost small" onClick=${() => stop()}>${j.cancelled ? 'Stopped by user' : 'Stop'}</button>` : null}
       </div>
       <div id="activityBody">
+        <${LiveStreamDrawer} />
         <div class="eng-bar" title="Engine V2 state (during and after runs)">
           <span class=${'phase ' + phase}>${phase}</span>
           <span class="estat" title="model calls this session">calls

@@ -651,6 +651,43 @@ details pre { background: var(--code-bg); border: 1px solid var(--line); border-
 .streamtail pre { margin: 4px 0 0; white-space: pre-wrap; word-break: break-word;
   max-height: 140px; overflow: auto; color: var(--text); }
 
+/* --------------------------------------------------- live stream drawer -- */
+.live-drawer { border: 1px solid var(--line2); border-radius: 8px;
+  background: var(--panel); margin: 0 0 9px; overflow: hidden; }
+.live-drawer.stopped { border-color: color-mix(in srgb, var(--err) 55%, var(--line2)); }
+.live-head { display: flex; align-items: center; gap: 8px; padding: 5px 8px;
+  background: var(--panel2); border-bottom: 1px solid var(--line); }
+.live-drawer:not(.open) .live-head { border-bottom: none; }
+.live-toggle { flex: none; width: 22px; height: 20px; padding: 0; font-family: var(--mono);
+  color: var(--accent); background: transparent; border: 1px solid var(--line);
+  border-radius: 5px; }
+.live-toggle:hover { border-color: var(--accent); }
+.live-phase { display: inline-flex; align-items: center; gap: 5px; flex: none;
+  font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: .6px;
+  padding: 2px 8px; border-radius: 999px; background: var(--panel3);
+  color: var(--muted); border: 1px solid var(--line2); }
+.live-phase.reasoning { color: var(--accent); border-color: var(--accent); }
+.live-phase.content { color: var(--ok); border-color: var(--ok); }
+.live-phase.stopped { color: var(--err); border-color: var(--err); }
+.live-dot { width: 6px; height: 6px; border-radius: 50%; background: currentColor;
+  animation: live-pulse 1.1s ease-in-out infinite; }
+.live-phase.stopped .live-dot { animation: none; }
+@keyframes live-pulse { 0%, 100% { opacity: .35; } 50% { opacity: 1; } }
+.live-stat { flex: none; font-size: 11px; color: var(--muted); white-space: nowrap; }
+.live-stat b { color: var(--text); font-variant-numeric: tabular-nums; }
+.live-stop { flex: none; }
+.live-tabs { display: flex; align-items: center; gap: 4px; padding: 5px 8px 0; }
+.live-tab { border: 1px solid var(--line); border-radius: 6px; padding: 2px 9px;
+  font-size: 10.5px; background: var(--panel); color: var(--muted); }
+.live-tab.on { color: var(--accent); font-weight: 700; background: var(--accent-soft);
+  border-color: var(--accent); }
+.live-pane { margin: 5px 8px 8px; padding: 6px 8px; max-height: 170px; overflow: auto;
+  white-space: pre-wrap; word-break: break-word; font-family: var(--mono);
+  font-size: 11.5px; line-height: 1.45; border: 1px solid var(--line);
+  border-radius: 6px; background: var(--bg); color: var(--text); }
+.live-pane.reason-text { color: var(--muted); font-style: italic; }
+.live-pane.output-text { color: var(--text); }
+
 /* -------------------------------------------------------------- plan pane -- */
 #planBody { flex: 1 1 auto; overflow-y: auto; min-height: 0; background: var(--bg); padding: 8px 10px; }
 #planEdit { flex: 1 1 auto; width: auto; min-height: 0; border: none; border-radius: 0;

@@ -34,7 +34,7 @@ from .chunker import Chunk
 from .config import PROJECT_CONFIG_NAMES, ConfigError
 from .edits import Result, apply_edits, parse_edits
 from .index import Index, file_hash
-from .llm import LLMError, thinking_suffix_for
+from .llm import CancelledError, LLMError, thinking_suffix_for
 
 MAX_SPEC_CHARS = 60_000          # longer specs are truncated (with a notice)
 PLAN_SCHEMA = {
@@ -1146,6 +1146,8 @@ def build_project(client, cfg, idx, plan: Plan, verbose: bool = True,
                                              done + noop, verbose,
                                              backup_dir=backup_dir,
                                              repair_note=repair_note)
+            except CancelledError:
+                raise
             except LLMError as e:
                 print(f"  stopped: {e}", file=sys.stderr)
                 failed.append((t.path, "server error"))
@@ -1311,6 +1313,8 @@ def build_docs(client, cfg, idx, plan: Plan, verbose: bool = True,
                 continue
             results = apply_edits(idx.root, edits, backup=cfg.backup,
                                   dry_run=False, cfg=cfg, backup_dir=backup_dir)
+        except CancelledError:
+            raise
         except LLMError as e:
             print(f"  stopped: {e}", file=sys.stderr)
             failed.append((t.path, "server error"))

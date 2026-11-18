@@ -519,6 +519,11 @@ class TuiSession:
         self._event_active = ""
         self._context_override: int | None = None
         self._prompt_banner = ""
+        # Compact live stream indicator, updated by `llm_stream` events and
+        # shown before the prompt while a reply is being generated:
+        # "[thinking... 412 tok | 38.4 tok/s]".
+        self._stream_status = ""
+        self._stream_phase = ""
         self._dirty = True
         self._quit = False
         self._running = False
@@ -998,7 +1003,10 @@ class TuiSession:
         return visible
 
     def _prompt_prefix(self) -> str:
-        return f"pdc tui ({self.profile}) > "
+        prefix = f"pdc tui ({self.profile}) > "
+        if self._stream_status:
+            return f"{self._stream_status} {prefix}"
+        return prefix
 
     def _prompt_visible(self, width: int) -> tuple[str, int]:
         """Prompt line plus the cursor's 0-based column inside it.
@@ -1217,7 +1225,20 @@ class TuiSession:
         if not self._remember_event(kind, fields, source):
             return
         kind = str(kind or "")
+        if kind == "llm_stream":
+            # Throttled live deltas: keep one compact status line instead of
+            # appending every token to the transcript (which would flood it).
+            phase = str(fields.get("phase") or "")
+            tokens = _as_int(fields.get("tokens_so_far"))
+            speed = _as_float(fields.get("tok_per_sec"))
+            label = "thinking..." if phase == "reasoning" else "generating..."
+            self._stream_phase = phase
+            self._stream_status = f"[{label} {tokens} tok | {speed:.1f} tok/s]"
+            self._dirty = True
+            return
         if kind == "llm_start":
+            self._stream_status = ""
+            self._stream_phase = ""
             provider = str(fields.get("provider") or "")
             model = str(fields.get("model") or "")
             label = (f"{provider}/{model}" if provider and model
@@ -1237,6 +1258,8 @@ class TuiSession:
                 detail = f"{fields['file']} {detail}".strip()
             self.activity.append(f"{action} {detail}".rstrip())
         elif kind == "call":
+            self._stream_status = ""
+            self._stream_phase = ""
             site = str(fields.get("site") or "call")
             pt = _as_int(fields.get("prompt_tokens"))
             ct = _as_int(fields.get("completion_tokens"))
@@ -1889,6 +1912,13 @@ class TuiSession:
         if self.client is None:
             self.client = LLMClient(self.cfg)
         try:
+            if not getattr(self.cfg, "_root", ""):
+                # The LLM transport uses this to route `llm_stream` events to
+                # the project's EventLog (the TUI status listener reads them).
+                self.cfg._root = str(self.root)
+        except Exception:
+            pass
+        try:
             events_mod.attach(self.client, self.elog)
         except Exception:
             pass
@@ -1973,6 +2003,8 @@ class TuiSession:
             self._append("cancelled (the session stays open)", "error")
             holder["error"] = KeyboardInterrupt()
         finally:
+            self._stream_status = ""
+            self._stream_phase = ""
             self._poll_events(force=True)
             self._stop_watcher()
             self._sync_telemetry()
@@ -2241,6 +2273,10 @@ class TuiSession:
         if error is not None:
             if isinstance(error, KeyboardInterrupt):
                 pass
+            elif isinstance(error, LLMError) \
+                    and getattr(error, "kind", "") == "cancelled":
+                self._append("stopped by user (the session stays open)",
+                             "system")
             elif isinstance(error, LLMError):
                 self._append(f"ERROR: {error}", "error")
             else:
@@ -2330,8 +2366,13 @@ class TuiSession:
         holder = self._run_in_worker(work)
         error = holder.get("error")
         if error is not None:
-            if not isinstance(error, KeyboardInterrupt):
+            cancelled = (isinstance(error, LLMError)
+                         and getattr(error, "kind", "") == "cancelled")
+            if not isinstance(error, KeyboardInterrupt) and not cancelled:
                 self._append(f"ERROR: {error}", "error")
+            elif cancelled:
+                self._append("stopped by user (the session stays open)",
+                             "system")
         else:
             result = holder.get("result")
             if isinstance(result, int):
@@ -2435,8 +2476,13 @@ class TuiSession:
         holder = self._run_in_worker(work)
         error = holder.get("error")
         if error is not None:
-            if not isinstance(error, KeyboardInterrupt):
+            cancelled = (isinstance(error, LLMError)
+                         and getattr(error, "kind", "") == "cancelled")
+            if not isinstance(error, KeyboardInterrupt) and not cancelled:
                 self._append(f"ERROR: {error}", "error")
+            elif cancelled:
+                self._append("stopped by user (the session stays open)",
+                             "system")
         else:
             code = holder.get("result")
             if code == 0:

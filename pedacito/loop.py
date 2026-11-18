@@ -39,7 +39,7 @@ from . import security as security_mod
 from . import testsel
 from . import todo as todo_mod
 from .edits import Result, parse_edits
-from .llm import LLMError
+from .llm import CancelledError, LLMError
 
 # A task line in the plan file: `- [ ] do the thing` / `- [x] done thing`.
 # `*` bullets are accepted too. Group 2 is the box character, group 3 the text.
@@ -51,6 +51,42 @@ _NOOP_PHRASES = (
     "no change", "nothing to", "nothing needs", "already ", "no edit",
     "no code change", "no code edit", "leave as", "as-is",
 )
+
+
+def _cancel_requested(cfg, client=None) -> bool:
+    """True when the GUI/TUI cancellation token for this run is set.
+
+    Accepts a threading.Event, any object with `is_set()`, or a callable
+    predicate. Checked between tasks so a Stop never starts another worker
+    session, even when the abort landed between LLM calls.
+    """
+    sources = [getattr(cfg, "_cancel_event", None)]
+    if client is not None:
+        sources.append(getattr(client, "cancel_event", None))
+    for source in sources:
+        if source is None:
+            continue
+        checker = getattr(source, "is_set", None)
+        try:
+            if callable(checker):
+                if checker():
+                    return True
+            elif callable(source):
+                if source():
+                    return True
+            elif source:
+                return True
+        except Exception:
+            continue
+    return False
+
+
+def _emit_run_cancelled(root, cfg, stage: str, **fields) -> None:
+    """Record a user Stop in the event log (GUI activity + TUI status)."""
+    try:
+        events_mod.get(root, cfg).emit("run_cancelled", stage=stage, **fields)
+    except Exception:
+        pass
 
 
 def _is_noop(reply: str) -> bool:
@@ -3888,6 +3924,9 @@ def run_task(root: Path, cfg, client, agent, idx, task: str, *,
     also counted per profile: once `escalation_zero_edit_runs` accumulate, the
     next task carries an escalation suggestion into its ladder."""
     from . import memory as memory_mod
+    if _cancel_requested(cfg, client):
+        _emit_run_cancelled(root, cfg, "task", task=(task or "")[:200])
+        raise CancelledError("Stopped by user; no further work was done.")
     if not getattr(cfg, "_auto_step", 0):
         # Standalone task (ask/chat/eval): no outer loop owns the static or
         # contract baseline, so drop any leftover one and let _run_task_once
@@ -4900,6 +4939,12 @@ def run_loop(root: Path, cfg, client, idx, plan_path: Path, *,
                 pass
 
     while max_tasks == 0 or attempted < max_tasks:
+        if _cancel_requested(cfg, client):
+            print(f"\n[stopped by user; {plan_path.name} keeps its "
+                  f"remaining unchecked tasks]", file=sys.stderr)
+            workspace.log_event(root, "auto stopped by user", "WARN")
+            _emit_run_cancelled(root, cfg, "loop", plan=str(plan_path))
+            break
         nxt = next_task(read_plan(plan_path))
         if nxt is None:
             if failed:
@@ -5032,6 +5077,8 @@ def run_loop(root: Path, cfg, client, idx, plan_path: Path, *,
                 tr = run_task(root, cfg, task_client, agent, idx,
                               task_for_agent, apply=apply, review=False,
                               answer_system=answer_system)
+        except CancelledError:
+            raise
         except LLMError as e:
             print(f"  task failed: {e}", file=sys.stderr)
             workspace.log_event(root, f"task failed: {e}", "ERROR")
@@ -5477,6 +5524,8 @@ def run_loop(root: Path, cfg, client, idx, plan_path: Path, *,
                     tr2 = run_task(root, cfg, client, Agent(idx, client, cfg),
                                    idx, fix_task, apply=apply, review=False,
                                    answer_system=answer_system, is_repair=True)
+                except CancelledError:
+                    raise
                 except LLMError as e:
                     print(f"  repair failed: {e}", file=sys.stderr)
                     workspace.log_event(root, f"repair failed: {e}", "ERROR")

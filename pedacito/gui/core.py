@@ -37,6 +37,9 @@ RECENT_FILE = USER_CONFIG.parent / "gui_recent.json"
 MAX_RECENT = 8
 MAX_MESSAGES = 600
 MAX_TERM_CHARS = 200_000
+# Live reasoning/content buffers for the stream drawer: keep the newest tail
+# only, so a runaway generation cannot grow process memory without bound.
+MAX_LIVE_CHARS = 200_000
 QUESTION_TIMEOUT = 900.0
 # How long a gated tool call waits for a human answer before the run is
 # allowed to continue with a clean denial (the modal never leaves a worker
@@ -299,6 +302,18 @@ class Job:
         self.active = True
         self.cancelled = False
         self.client = None          # set by jobs.session, for Stop
+        # Instant stream cancellation: Stop sets this token, and the LLM
+        # client checks it on every SSE line (and closes the live socket).
+        self.cancel_event = threading.Event()
+        self.stop_reason = ""
+        # Live streaming buffer for the Activity drawer. `llm_stream` events
+        # append deltas here; /api/state carries the snapshot on every poll.
+        self.live_reasoning = ""
+        self.live_content = ""
+        self.live_tokens = 0
+        self.live_tok_per_sec = 0.0
+        self.stream_phase = ""
+        self.live_updated = 0.0
         # A completed `new` job reports the project it created, so the page
         # can adopt the workspace without a manual refresh (see end_job).
         self.project_root = ""
@@ -1002,6 +1017,9 @@ class State:
         with self.lock:
             job.active = False
             self.llm_call = {}      # no request outlives its job's indicator
+            if job.cancelled:
+                job.stop_reason = job.stop_reason or "Stopped by user"
+                job.stream_phase = "stopped"
             if error:
                 self.error = error
             if job.kind in RUN_KINDS:
@@ -1013,10 +1031,56 @@ class State:
 
     # --- engine telemetry ---------------------------------------------------------
 
+    def note_llm_stream(self, f: dict) -> None:
+        """Fold one throttled `llm_stream` delta into the active job's live
+        drawer and push it to SSE listeners. The full snapshot also rides on
+        /api/state, so a polling client and a late page load both see it."""
+        d_reasoning = str(f.get("delta_reasoning") or "")
+        d_content = str(f.get("delta_content") or "")
+        try:
+            tokens = int(f.get("tokens_so_far") or 0)
+        except (TypeError, ValueError):
+            tokens = 0
+        try:
+            speed = float(f.get("tok_per_sec") or 0.0)
+        except (TypeError, ValueError):
+            speed = 0.0
+        phase = str(f.get("phase") or "")
+        with self.lock:
+            job = self.job if self.job is not None and self.job.active else None
+            if job is None:
+                return
+            if d_reasoning:
+                job.live_reasoning = (
+                    job.live_reasoning + d_reasoning)[-MAX_LIVE_CHARS:]
+            if d_content:
+                job.live_content = (
+                    job.live_content + d_content)[-MAX_LIVE_CHARS:]
+            if phase:
+                job.stream_phase = phase
+            if tokens:
+                job.live_tokens = tokens
+            if speed:
+                job.live_tok_per_sec = speed
+            job.live_updated = time.time()
+            payload = {
+                "job": job.id,
+                "phase": job.stream_phase,
+                "delta_reasoning": d_reasoning,
+                "delta_content": d_content,
+                "tokens": job.live_tokens,
+                "tok_per_sec": round(job.live_tok_per_sec, 1),
+                "updated": job.live_updated,
+            }
+        self.bus.publish("stream", **payload)
+
     def note_event(self, kind: str, f: dict) -> None:
         """Fold one harness event (the agent's EventLog listener) into the
         activity telemetry: the live phase and a recent tool-action feed.
         Only a phase change or a recorded action pings the page."""
+        if kind == "llm_stream":
+            self.note_llm_stream(f)
+            return
         if kind == "llm_start":
             # Heartbeat on: a request just left for the model. The page's
             # timer ticks from `started` until the matching `call` lands.
@@ -1026,6 +1090,17 @@ class State:
                     "model": str(f.get("model") or ""),
                     "phase": str(f.get("phase") or ""),
                     "started": time.time()}
+                job = (self.job if self.job is not None and self.job.active
+                       else None)
+                if job is not None:
+                    # Each request gets a fresh drawer buffer; the previous
+                    # call's reasoning/output is already in the transcript.
+                    job.live_reasoning = ""
+                    job.live_content = ""
+                    job.live_tokens = 0
+                    job.live_tok_per_sec = 0.0
+                    job.stream_phase = ""
+                    job.live_updated = time.time()
             self.bus.publish("status")
             return
         if kind == "call":
@@ -1629,7 +1704,16 @@ class State:
                 "job": ({"id": job.id, "kind": job.kind, "title": job.title,
                          "started": job.started,
                          "cancelled": job.cancelled,
-                         "project_root": job.project_root} if job else None),
+                         "stop_reason": job.stop_reason,
+                         "project_root": job.project_root,
+                         # Live reasoning/output drawer snapshot. Fields stay
+                         # present (empty/0) when the job has not streamed yet.
+                         "live_reasoning": job.live_reasoning,
+                         "live_content": job.live_content,
+                         "live_tokens": job.live_tokens,
+                         "live_tok_per_sec": round(job.live_tok_per_sec, 1),
+                         "stream_phase": job.stream_phase,
+                         "live_updated": job.live_updated} if job else None),
                 # Live LLM heartbeat ({provider, model, phase, started} while
                 # a request is in flight, else {}): the pulsing indicator.
                 "llm_call": dict(self.llm_call),

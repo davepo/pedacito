@@ -62,7 +62,8 @@ from . import steering as steering_mod
 from . import todo as todo_mod
 from .config import is_hosted
 from .edits import Result, apply_edits, locate, malformed_blocks, parse_edits
-from .llm import LLMError, _is_local_server, estimate_messages, estimate_tokens
+from .llm import (CancelledError, LLMError, _is_local_server,
+                  estimate_messages, estimate_tokens)
 from .tools import TOOL_HELP, dispatch, mcp_injection, schema_for
 
 # Re-asks after a gather step reply dies at the output cap or has no salvageable
@@ -1573,6 +1574,23 @@ class Agent:
         if self.events is not None:
             self.events.emit(kind, **fields)
 
+    def _run_cancelled(self) -> bool:
+        """True when the active run's cancel token was set (GUI Stop/TUI
+        Ctrl-C). Checked between gather steps so no new model call starts."""
+        for source in (getattr(self.cfg, "_cancel_event", None),
+                       getattr(self.client, "cancel_event", None)):
+            if source is None:
+                continue
+            checker = getattr(source, "is_set", None)
+            try:
+                if callable(checker) and checker():
+                    return True
+                if callable(source) and source():
+                    return True
+            except Exception:
+                continue
+        return False
+
     def _note_lease_strike(self, task: str) -> None:
         """A no-progress lease spent on this task. TWO leases on one task
         (across its attempts) are an escalation signal: the profile is not
@@ -2600,6 +2618,11 @@ class Agent:
             return acted
 
         while unlimited or step < step_cap:
+            if self._run_cancelled():
+                self._emit("run_cancelled", stage="gather", step=step)
+                raise CancelledError(
+                    "Stopped by user while gathering; no further work was "
+                    "done.")
             if call_cap > 0 and model_calls >= call_cap:
                 harness_note(f"[Harness: gather stopped -- this task reached "
                              f"its ceiling of {call_cap} model calls. Answer "
@@ -2630,6 +2653,8 @@ class Agent:
                 stepjson = gclient.chat_json(messages, step_schema,
                                                  self.cfg.max_tokens_step,
                                                  disable_thinking=True)
+            except CancelledError:
+                raise
             except LLMError as e:
                 # A step that cannot produce JSON ends gather, not the run:
                 # the answer phase works from whatever was gathered. Re-ask
@@ -3662,6 +3687,8 @@ class Agent:
                 max_tokens=min(int(getattr(self.cfg, "max_tokens_answer",
                                             3000) or 3000), 1200),
                 stream=False)
+        except CancelledError:
+            raise
         except LLMError as e:
             if verbose:
                 print(f"  [edit-intent plan failed ({type(e).__name__}); "
@@ -4112,6 +4139,8 @@ class Agent:
                     reply = self._chat_at(
                         "temperature_answer", msgs,
                         max_tokens=hunk_tokens, stream=False)
+                except CancelledError:
+                    raise
                 except LLMError as e:
                     last_results = [Result(
                         False, rel, f"edit generation failed: {type(e).__name__}")]
@@ -4502,6 +4531,8 @@ class Agent:
                                         max_tokens=self.cfg.max_tokens_answer,
                                         stream=False),
                 msgs)
+        except CancelledError:
+            raise
         except LLMError as e:
             print("  [repair: re-ask failed (%s); failing checks remain]"
                   % type(e).__name__, file=sys.stderr)
@@ -4595,6 +4626,8 @@ class Agent:
                  {"role": "user", "content":
                   f"TASK\n{task}\n\nSOURCE\n{src}\n\nPROPOSED EDITS\n{blocks}"
                   + (_NEED_HINT if self._rehydration_rounds_left() else "")}])
+        except CancelledError:
+            raise
         except LLMError:
             return []
         return verify_mod.parse_verdict(text, self.index.resolve_file,
@@ -4632,6 +4665,8 @@ class Agent:
                         cand = self.answer(task, gathered, stream=False)
                 else:
                     cand = self.answer(task, gathered, stream=False)
+            except CancelledError:
+                raise
             except LLMError:
                 break
             if cand and parse_edits(cand):
@@ -4776,6 +4811,8 @@ class Agent:
                     m, max_tokens=self._answer_max_tokens(max_tokens),
                     stream=stream),
                 msgs)
+        except CancelledError:
+            raise
         except LLMError as e:
             print(f"  [continued answer failed ({str(e)[:100]}); rebuilding]",
                   file=sys.stderr)
