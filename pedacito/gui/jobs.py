@@ -246,6 +246,24 @@ class _Feed:
             self.activity(f"specialist router: {f.get('profile', '?')} "
                           f"({f.get('model', '?')}) for "
                           f"'{f.get('specialty', '?')}'")
+        elif kind == "hybrid_stage":
+            self.activity(str(f.get("label") or
+                              f"Hybrid Stage {f.get('stage', '?')}: "
+                              f"{f.get('model', '?')}"))
+        elif kind == "arena_stage":
+            phase = str(f.get("phase") or "")
+            if phase == "start":
+                self.activity(str(f.get("label") or
+                                  f"Arena {f.get('side', '?')}: "
+                                  f"{f.get('model', '?')}"))
+            elif phase == "done":
+                self.activity(
+                    f"arena {str(f.get('side', '?')).upper()} finished: "
+                    f"{'edits landed' if f.get('ok') else 'no edits'} "
+                    f"({f.get('files_changed', 0)} file(s), "
+                    f"{f.get('elapsed_sec', 0)}s)")
+            elif phase in ("arena_start", "arena_done"):
+                self.activity(str(f.get("label") or "arena"))
         elif kind == "model_swap":
             self.activity(f"model swap: {f.get('unloaded') or '-'} -> "
                           f"{f.get('loaded', '?')} ({f.get('elapsed_s', 0)}s)")
@@ -869,6 +887,60 @@ def _set_pinned_refs(cfg, opts: dict) -> None:
         pass
 
 
+def _apply_hybrid_opts(cfg, opts: dict) -> None:
+    """The Options bar's split-stage hybrid choices for this run: the
+    Architect toggle plus its provider/model selector. Selecting a model
+    arms hybrid even without the explicit flag; a provider-only selection
+    takes the model from that profile's body. Session-scoped: run_task
+    restores the previous values when the job ends."""
+    if not any(k in opts for k in ("hybrid", "architect_provider",
+                                   "architect_model")):
+        return
+    cfg.hybrid_routing = bool(opts.get("hybrid"))
+    provider = str(opts.get("architect_provider") or "").strip()
+    model = str(opts.get("architect_model") or "").strip()
+    if provider and not model:
+        body = (cfg.profiles or {}).get(provider) or {}
+        model = str(body.get("model") or "").strip()
+    cfg.architect_provider = provider
+    cfg.architect_model = model
+    if model and model != cfg.model:
+        cfg.hybrid_routing = True
+
+
+def run_arena(job: Job, opts: dict) -> None:
+    """The 2-model sandbox arena: one prompt, two contestants, each in an
+    isolated copy of the workspace. The real project stays untouched until
+    the user applies a winner from the scorecard."""
+    from .. import arena as arena_mod
+    p = _project(need_index=False)
+    prompt = compose(opts.get("text", ""), opts.get("attachments"))
+    if not prompt:
+        raise ConfigError("Describe the task both contestants should run.")
+    model_a = opts.get("model_a") or opts.get("a") or ""
+    model_b = opts.get("model_b") or opts.get("b") or ""
+    if not model_a or not model_b:
+        raise ConfigError("Pick two contestants (profile or provider:model).")
+    _echo_user("arena", opts.get("text", "") or prompt,
+               opts.get("attachments"), opts)
+    cfg, root = p.cfg, p.root
+    _evict_other_servers(cfg)
+    with session(p, job, interactive=False, lock=True) as feed:
+        state = arena_mod.run_arena_comparison(root, prompt, model_a, model_b,
+                                               cfg)
+        feed.end_stream()
+        ca = state["contestants"]["a"]
+        cb = state["contestants"]["b"]
+        STATE.add_message(
+            "assistant",
+            f"Arena finished: A ({ca['model']}) "
+            f"{'landed edits' if ca['ok'] else 'no edits'} in "
+            f"{ca['elapsed_sec']}s; B ({cb['model']}) "
+            f"{'landed edits' if cb['ok'] else 'no edits'} in "
+            f"{cb['elapsed_sec']}s. Compare the runs and apply a winner.",
+            kind="arena", arena_id=state["arena_id"])
+
+
 def _security_post_run(root, cfg, files=None) -> None:
     """Refresh and announce the non-blocking workspace security banner."""
     try:
@@ -902,6 +974,9 @@ def run_task(job: Job, opts: dict) -> None:
     _evict_other_servers(cfg)
     saved_steps = cfg.max_steps
     saved_creative = cfg.creative_mode
+    saved_hybrid = (cfg.hybrid_routing, cfg.architect_provider,
+                    cfg.architect_model)
+    _apply_hybrid_opts(cfg, opts)
     if steps > 0:
         cfg.max_steps = steps
     if "creative" in opts:
@@ -947,6 +1022,8 @@ def run_task(job: Job, opts: dict) -> None:
     finally:
         cfg.max_steps = saved_steps
         cfg.creative_mode = saved_creative
+        (cfg.hybrid_routing, cfg.architect_provider,
+         cfg.architect_model) = saved_hybrid
         _security_post_run(root, cfg)
 
 

@@ -700,6 +700,23 @@ class Config:
     # runs on the active profile too. An unknown or unreachable scout profile
     # warns once and behaves like "".
     scout_profile: str = ""
+    # Split-stage hybrid routing: a strong ARCHITECT model plans each task
+    # (Stage 1: root cause, target files, exact signatures/contracts, edge
+    # cases -- one focused HYBRID_BLUEPRINT call), then the active fast
+    # EDITOR model implements that blueprint (Stage 2: gather + edits).
+    # Built for one GPU: the architect is evicted before the editor loads
+    # (auto_evict_servers), so a 27B planner and a 9B editor share the card.
+    # Off by default; selecting an architect model in the GUI/TUI turns it
+    # on for the session.
+    hybrid_routing: bool = False
+    # Where the Stage-1 architect lives: a profile name from [profiles.*],
+    # a profile's `provider` label, or a base URL ("http://127.0.0.1:1234/v1").
+    # Empty keeps the active endpoint (a second model on the same server).
+    architect_provider: str = ""
+    # The architect's model id. Empty = hybrid routing stays off even when
+    # hybrid_routing is true; a model equal to the active `model` is a no-op
+    # (nothing to split). The GUI Options bar and TUI /hybrid set both keys.
+    architect_model: str = ""
     # What this profile's model is good at, e.g. ["coding", "testing_qa"].
     # Canonical tags: general, coding, frontend_ui, 3d_graphics_svg,
     # math_algorithms, testing_qa, sql_data, translation_i18n; custom

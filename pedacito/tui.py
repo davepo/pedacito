@@ -121,13 +121,15 @@ _TAB_PREFIX = {
     "/eff": "/effort ",
     "/ser": "/servers",
     "/unl": "/unload ",
+    "/hy": "/hybrid ",
+    "/ar": "/arena ",
 }
 _SLASH_COMMANDS = [
     "/help", "/keys", "/status", "/telemetry", "/new", "/auto", "/auto!", "/plan",
     "/consolidate", "/compact", "/profile", "/profiles", "/model",
     "/auto-route", "/think", "/effort", "/creative", "/servers", "/unload",
     "/apply", "/skills", "/memory", "/procs", "/security", "/theme",
-    "/pin", "/rules",
+    "/pin", "/rules", "/hybrid", "/arena",
     "/diff", "/checkpoints", "/undo", "/checkout", "/run", "/fix",
     "/reset", "/sidebar", "/scroll", "/mouse", "/clear",
     "/quit", "/exit",
@@ -179,6 +181,13 @@ Pedacito TUI commands
   /profile [NAME]           list profiles, or switch to NAME
   /model ID                 switch to a model id directly
   /auto-route [on|off]      specialist auto-routing on/off
+  /hybrid [off | PROVIDER MODEL]
+                            split-stage routing: an architect model plans
+                            (Stage 1), the active editor implements (Stage 2);
+                            off disables it for this session
+  /arena A:B PROMPT         run PROMPT on two contestants (profile names or
+                            provider:model) in isolated sandboxes, compare
+  /arena apply a|b          adopt a winner's changes (checkpointed, undoable)
   /think [on|off]           thinking on/off (off sets disable_thinking)
   /effort [LEVEL]           reasoning effort: default, low, medium or high
                             (forwarded to local-moe and reasoning APIs)
@@ -1415,6 +1424,19 @@ class TuiSession:
                 f"model_swap: {old} {_SWAP_ARROW} {new}")
             if new and new != "?":
                 self._event_active = new
+        elif kind == "hybrid_stage":
+            label = str(fields.get("label") or
+                        f"Hybrid Stage {fields.get('stage', '?')}")
+            self.activity.append(label)
+            self._append(label, "system")
+            model = str(fields.get("model") or "")
+            if model:
+                self._event_active = model
+        elif kind == "arena_stage":
+            label = str(fields.get("label") or "arena")
+            self.activity.append(label)
+            if str(fields.get("phase") or "") in ("arena_start", "start"):
+                self._append(label, "system")
         elif kind == "verify":
             errors = _as_int(fields.get("errors"))
             warnings = _as_int(fields.get("warnings"))
@@ -2796,6 +2818,12 @@ class TuiSession:
         if cmd == "effort":
             self._effort(arg)
             return
+        if cmd == "hybrid":
+            self._hybrid(arg)
+            return
+        if cmd == "arena":
+            self._arena(arg)
+            return
         if cmd == "servers":
             self._servers()
             return
@@ -3152,6 +3180,177 @@ class TuiSession:
             + (" \u2014 no field is sent at default"
                if value == "default" else " \u2014 sent as reasoning_effort"),
             "system")
+
+    def _hybrid(self, arg: str) -> None:
+        """`/hybrid [off | <architect_provider> <architect_model>]`: arm the
+        split-stage architect/editor pipeline for this session. A single
+        token names a profile (its model comes from the profile body) or a
+        bare model id on the active endpoint."""
+        value = arg.strip()
+        if not value:
+            on = bool(getattr(self.cfg, "hybrid_routing", False))
+            provider = str(getattr(self.cfg, "architect_provider", "") or "")
+            model = str(getattr(self.cfg, "architect_model", "") or "")
+            detail = (f" — architect {provider + '/' if provider else ''}"
+                      f"{model}" if model else "")
+            self._append(
+                f"Hybrid routing: {'ON' if on else 'OFF'}{detail}\n"
+                "Usage: /hybrid off | /hybrid <architect_provider> "
+                "<architect_model>", "system")
+            return
+        if value.lower() in ("off", "false", "no", "0"):
+            self.cfg.hybrid_routing = False
+            try:
+                self.cfg.sources["hybrid_routing"] = "tui /hybrid"
+            except Exception:
+                pass
+            self._append("Hybrid routing: OFF", "system")
+            return
+        parts = value.split()
+        if len(parts) == 1:
+            name = parts[0]
+            body = (self.cfg.profiles or {}).get(name)
+            if body is not None:
+                provider = name
+                model = str((body or {}).get("model") or "").strip()
+                if not model:
+                    self._append(f"Profile '{name}' names no model.", "error")
+                    return
+            else:
+                provider, model = "", name
+        else:
+            provider, model = parts[0], parts[1]
+        if model == str(getattr(self.cfg, "model", "") or ""):
+            self._append("The architect model equals the editor model; "
+                         "hybrid would pay twice for one brain. Pick a "
+                         "different architect.", "error")
+            return
+        self.cfg.hybrid_routing = True
+        self.cfg.architect_provider = provider
+        self.cfg.architect_model = model
+        for key in ("hybrid_routing", "architect_provider", "architect_model"):
+            try:
+                self.cfg.sources[key] = "tui /hybrid"
+            except Exception:
+                pass
+        self._append(
+            f"Hybrid routing: ON — Stage 1 architect "
+            f"{provider + '/' if provider else ''}{model}, Stage 2 editor "
+            f"{self.cfg.model}", "system")
+
+    def _arena_scorecard(self, state: dict) -> str:
+        state = state or {}
+        lines = [f"Arena {state.get('arena_id', '?')} — "
+                 f"{str(state.get('prompt') or '')[:100]}"]
+        for side in ("a", "b"):
+            rec = (state.get("contestants") or {}).get(side) or {}
+            mark = "\u2713" if rec.get("ok") else "\u2717"
+            provider = str(rec.get("provider") or "")
+            lines.append(
+                f"  {side.upper()} {mark} "
+                f"{provider + '/' if provider else ''}{rec.get('model', '?')}"
+                f" — {len(rec.get('files_changed') or [])} file(s), "
+                f"{rec.get('elapsed_sec', 0)}s, "
+                f"{rec.get('tok_per_sec', 0)} tok/s, "
+                f"{int(rec.get('total_tokens', 0) or 0):,} tokens")
+            for rel in (rec.get("files_changed") or [])[:8]:
+                lines.append(f"      {rel}")
+            summary = str(rec.get("summary") or "").strip()
+            if summary:
+                lines.append("      " + summary.splitlines()[0][:120])
+        if state.get("winner"):
+            lines.append(f"  winner applied: {str(state['winner']).upper()}")
+        return "\n".join(lines)
+
+    def _arena(self, arg: str) -> None:
+        """`/arena <provider_a>:<model_a> <provider_b>:<model_b> <prompt>`
+        runs both contestants in isolated sandboxes; `/arena apply a|b`
+        adopts a winner; bare `/arena` shows the last scorecard."""
+        from . import arena as arena_mod
+        value = arg.strip()
+        if not value:
+            state = arena_mod.last_arena(self.root)
+            if state is None:
+                self._append(
+                    "Usage: /arena <provider_a>:<model_a> <provider_b>:<model_b>"
+                    " <prompt>\n       /arena apply a|b", "system")
+                return
+            self._append(self._arena_scorecard(state), "system")
+            return
+        parts = value.split(None, 1)
+        if parts[0].lower() == "apply":
+            self._arena_apply(parts[1].strip() if len(parts) > 1 else "")
+            return
+        tokens = value.split(None, 2)
+        if len(tokens) < 3 or not tokens[2].strip():
+            self._append(
+                "Usage: /arena <provider_a>:<model_a> <provider_b>:<model_b>"
+                " <prompt>", "error")
+            return
+        spec_a, spec_b, prompt = tokens[0], tokens[1], tokens[2].strip()
+        self._evict_servers()
+        self._append(f"arena: {spec_a} vs {spec_b} — both run in isolated "
+                     "sandboxes; the workspace stays untouched ...", "system")
+
+        def work():
+            return arena_mod.run_arena_comparison(self.root, prompt,
+                                                  spec_a, spec_b, self.cfg)
+
+        holder = self._run_in_worker(work)
+        error = holder.get("error")
+        if error is not None:
+            if isinstance(error, KeyboardInterrupt):
+                pass
+            elif isinstance(error, arena_mod.ArenaError):
+                self._append(f"arena: {error}", "error")
+            else:
+                self._append(f"ERROR: {type(error).__name__}: {error}",
+                             "error")
+            self._report_run_telemetry(holder)
+            self._redraw(force=True)
+            return
+        state = holder.get("result") or {}
+        self._last_arena_id = str(state.get("arena_id") or "")
+        self._append(self._arena_scorecard(state), "system")
+        self._append("Apply a winner with /arena apply a  or  /arena apply b",
+                     "system")
+        self._report_run_telemetry(holder)
+        self._redraw(force=True)
+
+    def _arena_apply(self, arg: str) -> None:
+        from . import arena as arena_mod
+        winner = arg.strip().lower()
+        if winner not in ("a", "b"):
+            self._append("Usage: /arena apply a|b", "error")
+            return
+        arena_id = str(getattr(self, "_last_arena_id", "") or "")
+        if not arena_id:
+            state = arena_mod.last_arena(self.root)
+            arena_id = str((state or {}).get("arena_id") or "")
+        if not arena_id:
+            self._append("No arena to apply — run /arena first.", "error")
+            return
+        try:
+            out = arena_mod.apply_arena_winner(self.root, arena_id, winner)
+        except (arena_mod.ArenaError, checkpoints_mod.CheckpointError,
+                OSError) as exc:
+            self._append(f"arena apply: {exc}", "error")
+            return
+        # The workspace changed under the index: rebuild it before the next
+        # task gathers (same fresh static index a newly opened project gets).
+        try:
+            self.idx = index_mod.build([str(self.root)], self.cfg, client=None,
+                                       root=self.root, summarise=False,
+                                       verbose=False)
+            self.agent = Agent(self.idx, self._ensure_client(), self.cfg)
+        except Exception:
+            pass
+        self._append(
+            f"Arena winner applied: {out['model']} — "
+            f"{len(out['files_changed'])} file(s) changed.\n"
+            f"Checkpoint {out['post_checkpoint']} (undo with /undo).",
+            "receipt")
+        self._redraw(force=True)
 
     def _servers(self) -> None:
         """`/servers`: live VRAM/RAM plus each configured local server."""

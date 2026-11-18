@@ -494,6 +494,67 @@ def _checkpoints_restore(q, body):
     return 200, out
 
 
+# --- 2-model sandbox arena ------------------------------------------------------
+
+@post("/api/arena/run")
+def _arena_run(q, body):
+    """Start an arena comparison: {"text", "model_a", "model_b"} (contestants
+    are profile names, 'provider:model' strings or {provider, model} dicts).
+    Both runs happen in isolated sandboxes; the workspace is not touched."""
+    body = body or {}
+    return _busy_reply(jobs.spawn(
+        "arena", "arena comparison",
+        lambda job: jobs.run_arena(job, {**body, "_echoed": True}),
+        echo=lambda: jobs.echo_submission("arena", body)))
+
+
+@get("/api/arena/last")
+def _arena_last(q, body=None):
+    """The stored comparison (scorecard + diffs) for the open project."""
+    from .. import arena as arena_mod
+    root = _project_root()
+    if root is None:
+        return 400, {"ok": False, "detail": "No project is open."}
+    return 200, {"ok": True, "arena": arena_mod.last_arena(root)}
+
+
+@post("/api/arena/apply")
+def _arena_apply(q, body):
+    """Adopt a winner's sandbox into the workspace between two checkpoints.
+    Synchronous (file copies only, no model calls); refuses while a job runs."""
+    from .. import arena as arena_mod
+    root = _project_root()
+    if root is None:
+        return 400, {"ok": False, "detail": "No project is open."}
+    body = body or {}
+    with STATE.lock:
+        job = STATE.job
+    if job is not None and job.active:
+        return 409, {"ok": False, "detail": "A job is running. Wait for it "
+                     "or press Stop."}
+    arena_id = str(body.get("arena_id") or "").strip()
+    if not arena_id:
+        state = arena_mod.last_arena(root)
+        arena_id = str((state or {}).get("arena_id") or "")
+    if not arena_id:
+        return 400, {"ok": False, "detail": "No arena to apply -- run one first."}
+    winner = str(body.get("winner") or "a").strip().lower()
+    try:
+        out = arena_mod.apply_arena_winner(root, arena_id, winner)
+    except arena_mod.ArenaError as e:
+        return 400, {"ok": False, "detail": str(e)}
+    except (checkpoints_mod.CheckpointError, OSError) as e:
+        return 400, {"ok": False, "detail": str(e)}
+    deleted = out.get("deleted") or []
+    _reindex_after_restore([f for f in out.get("files_changed") or []
+                            if f not in deleted], deleted)
+    detail = (f"Arena winner applied: {out['model']} "
+              f"({len(out['files_changed'])} file(s) changed).")
+    STATE.add_message("system", detail, kind="arena")
+    out["detail"] = detail
+    return 200, out
+
+
 # --- live runner / preview ----------------------------------------------------
 
 @get("/api/runner/targets")

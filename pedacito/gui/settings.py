@@ -98,6 +98,25 @@ FIELD_META: dict[str, FieldMeta] = {
                     "profile keeps planning, answers, and edits. Empty means "
                     "no scout; pick one like 'scout' in the dropdown. The "
                     "profile must already exist with its own base_url/model."),
+    "hybrid_routing": FieldMeta(
+        label="Split-Stage Hybrid Routing (Architect + Editor)",
+        description="Run each task in two stages: a strong architect model "
+                    "plans first (root cause, target files, exact signatures, "
+                    "edge cases), then the active editor model implements the "
+                    "blueprint. Needs an Architect model below that differs "
+                    "from the editor. Different local servers hand the VRAM "
+                    "over between stages when Auto-evict is on."),
+    "architect_provider": FieldMeta(
+        label="Architect Profile (Stage 1 planner)",
+        description="The profile whose server/model plans in hybrid Stage 1. "
+                    "Pick one like 'architect' in the dropdown; empty keeps "
+                    "the active endpoint. The profile must already exist "
+                    "with its own base_url/model."),
+    "architect_model": FieldMeta(
+        label="Architect Model (Stage 1 planner)",
+        description="The model id the architect runs on. Selecting a model "
+                    "different from the editor arms hybrid routing; an empty "
+                    "value or the editor's own model keeps single-model runs."),
     "enable_prompt_cache": FieldMeta(
         label="Enable Local Server KV Prompt Caching (cache_prompt)",
         description="On self-hosted llama.cpp-style servers, add the "

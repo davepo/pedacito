@@ -83,17 +83,19 @@
   // the built-in default.
   function control(item, value, onchange, placeholder, inheritLabel) {
     var t = item.type, el;
-    if (item.name === 'scout_profile') {
-      // Scout/architect routing: pick the fast profile that answers gather's
-      // lookup steps. The server-side schema is cached across projects, so
-      // the profile choices are read here from the settings payload instead.
+    if (item.name === 'scout_profile' || item.name === 'architect_provider') {
+      // Scout/architect routing and the hybrid Stage-1 planner: pick a
+      // profile by name. The server-side schema is cached across projects,
+      // so the profile choices are read here from the settings payload.
       var names = [];
       ['user', 'project'].forEach(function (k) {
         var pf = (X.data && X.data[k] && X.data[k].profiles) || {};
         Object.keys(pf).forEach(function (n) { if (names.indexOf(n) < 0) names.push(n); });
       });
       if (value && names.indexOf(value) < 0) names.push(value);
-      var sopts = [['', 'None (use active profile)']]
+      var noneLabel = item.name === 'architect_provider'
+        ? 'None (single-model runs)' : 'None (use active profile)';
+      var sopts = [['', noneLabel]]
         .concat(names.map(function (n) { return [n, n]; }));
       if (inheritLabel) sopts = [['__inherit__', inheritLabel]].concat(sopts);
       el = h('select', {}, sopts.map(function (o) { return h('option', { value: o[0], text: o[1] }); }));

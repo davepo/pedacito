@@ -3955,6 +3955,199 @@ def _specialist_zero_edit_fallback(root, cfg, client, idx, task, tr, kw):
     return tr
 
 
+# ------------------------------------------- split-stage hybrid routing
+# hybrid_routing runs a task on TWO models in sequence: a strong ARCHITECT
+# plans first (Stage 1: root cause, target files, exact signatures, edge
+# cases), then the fast EDITOR implements that plan (Stage 2). The blueprint
+# rides ahead of the editor's gathered context, so the cheap model never has
+# to rediscover the analysis. When the two models live on different LOCAL
+# servers, the VRAM handoff evicts the outgoing server between stages
+# (auto_evict_servers); hosted endpoints coexist and skip the handshake.
+
+_HYBRID_SYSTEM = """\
+You are the ARCHITECT in a split-stage coding pipeline. A faster editor model
+will implement your plan verbatim in the next stage; it cannot ask you
+questions, so the plan must be complete and precise. Do not write code edits
+and do not use tools -- reason from the task text and the project map.
+
+Reply with exactly one blueprint block in this shape:
+
+HYBRID_BLUEPRINT
+1. ROOT CAUSE / GOAL: what is actually wrong (or what must exist), in 1-3
+   sentences.
+2. TARGET FILES: the exact paths to change or create, and why each.
+3. EXACT SIGNATURES & CONTRACTS: function/class signatures, argument and
+   return types, and the invariants the edit must preserve.
+4. EDGE CASES: failure modes, empty/None inputs, concurrency, encoding,
+   backwards compatibility -- anything the editor could get wrong.
+END_BLUEPRINT
+
+Name real files and symbols from the map. Be specific enough that an editor
+who has never seen this codebase can implement the change correctly."""
+
+
+def hybrid_active(cfg) -> bool:
+    """True when a distinct architect model is armed for split-stage runs:
+    the toggle is on AND an architect model is selected that differs from
+    the editor's (same-model 'hybrid' would just pay twice for one brain)."""
+    model = str(getattr(cfg, "architect_model", "") or "").strip()
+    return (bool(getattr(cfg, "hybrid_routing", False)) and bool(model)
+            and model != str(getattr(cfg, "model", "") or "").strip())
+
+
+def _architect_client(cfg, editor):
+    """The cached Stage-1 architect client for (architect_provider,
+    architect_model). Unreachable servers cache None and warn once, exactly
+    like the scout: a dead architect degrades to a plain editor run, never a
+    failed task. The architect keeps its OWN stats ledger (clean per-stage
+    deltas) but reports calls into the editor's sink so run telemetry sees
+    both stages."""
+    from . import roles as roles_mod
+    provider = str(getattr(cfg, "architect_provider", "") or "").strip()
+    model = str(getattr(cfg, "architect_model", "") or "").strip()
+    key = (provider, model)
+    cache = cfg.__dict__.setdefault("_architect_clients", {})
+    if key in cache:
+        return cache[key]
+    new_cfg = roles_mod.resolve_model_config(cfg, provider, model)
+    if new_cfg is None:
+        cache[key] = None
+        return None
+    from .llm import LLMClient
+    try:
+        client = LLMClient(new_cfg)
+        client.check(warn=False)
+        client.warmup()
+    except LLMError as e:
+        print(f"[hybrid] architect '{model}' is unavailable "
+              f"({str(e).splitlines()[0][:100]}); the editor runs alone",
+              file=sys.stderr)
+        cache[key] = None
+        return None
+    client.active_model_role = {"profile": provider, "model": new_cfg.model,
+                                "role": "architect", "specialty": ""}
+    if hasattr(editor, "on_call"):
+        client.on_call = editor.on_call
+    cache[key] = client
+    return client
+
+
+def _hybrid_evict(cfg, from_url: str, to_url: str) -> None:
+    """The VRAM handoff between two stages: when BOTH endpoints are local
+    servers on different ports and auto_evict_servers is on, unload the
+    outgoing server before the incoming model loads. Never raises."""
+    from . import servers as servers_mod
+    try:
+        if not getattr(cfg, "auto_evict_servers", True):
+            return
+        if not (servers_mod.is_local_url(from_url)
+                and servers_mod.is_local_url(to_url)):
+            return
+        if servers_mod.normalize_url(from_url) == servers_mod.normalize_url(to_url):
+            return
+        servers_mod.evict_other_local_servers(to_url, cfg)
+    except Exception:
+        pass
+
+
+def _extract_blueprint(reply: str) -> str:
+    """The blueprint body between the markers; a reply without markers is
+    taken whole (a small architect that forgot the fence still planned)."""
+    m = re.search(r"HYBRID_BLUEPRINT\s*\n(.*?)\n\s*END_BLUEPRINT",
+                  reply or "", re.DOTALL)
+    return (m.group(1) if m else (reply or "")).strip()
+
+
+def _hybrid_stage1(root, cfg, client, agent, idx, task):
+    """Stage 1: the architect writes the blueprint. Returns a dict with the
+    blueprint text, the architect client and its per-stage usage, or None
+    when the architect is unavailable/empty -- the caller then runs the
+    ordinary single-model path."""
+    arch = _architect_client(cfg, client)
+    if arch is None:
+        return None
+    acfg = arch.cfg
+    _hybrid_evict(cfg, str(getattr(cfg, "base_url", "") or ""),
+                  str(getattr(acfg, "base_url", "") or ""))
+    label = f"Hybrid Stage 1 (Architect): {acfg.model}"
+    print(f"\n[{label}]", file=sys.stderr)
+    workspace.log_event(root, label)
+    try:
+        events_mod.get(root, cfg).emit(
+            "hybrid_stage", stage=1, role="architect", model=acfg.model,
+            provider=str(getattr(cfg, "architect_provider", "") or ""),
+            label=label)
+    except Exception:
+        pass
+    try:
+        if agent is not None:
+            map_text, _tier = agent._map(task)
+        else:
+            map_text, _tier = idx.map_for_prompt(cfg, task=task)
+    except Exception:
+        map_text = ""
+    user = (f"TASK:\n{task}\n\nPROJECT MAP:\n{map_text}\n\n"
+            "Write the HYBRID_BLUEPRINT for this task now.")
+    arch.site = "plan"
+    before = _snapshot_stats(arch)      # after warmup: only the plan counts
+    started = time.time()
+    try:
+        reply = arch.chat(
+            [{"role": "system", "content": _HYBRID_SYSTEM},
+             {"role": "user", "content": user}],
+            max_tokens=int(getattr(cfg, "max_tokens_plan", 2000) or 2000),
+            stream=False, cancel_event=getattr(cfg, "_cancel_event", None))
+    except LLMError as e:
+        print(f"[hybrid] architect planning failed "
+              f"({str(e).splitlines()[0][:100]}); the editor runs alone",
+              file=sys.stderr)
+        return None
+    blueprint = _extract_blueprint(reply)
+    if not blueprint:
+        print("[hybrid] architect returned an empty blueprint; the editor "
+              "runs alone", file=sys.stderr)
+        return None
+    return {"blueprint": blueprint, "client": arch,
+            "stats": _task_stats(arch, before, started),
+            "model": str(acfg.model),
+            "provider": str(getattr(cfg, "architect_provider", "") or "")}
+
+
+def _hybrid_finish(root, cfg, client, hybrid: dict, tr: TaskResult) -> None:
+    """Fold the architect's usage into the task's combined telemetry and
+    emit the per-stage breakdown (the GUI result card and TUI receipt read
+    tr.stats['hybrid'])."""
+    a = hybrid.get("stats") or {}
+    e = tr.stats or {}
+    merged = dict(e)
+    for k in ("calls", "prompt_tokens", "completion_tokens", "cached_tokens",
+              "cache_write_tokens"):
+        merged[k] = int(e.get(k, 0) or 0) + int(a.get(k, 0) or 0)
+    merged["cost"] = round(float(e.get("cost", 0.0) or 0.0)
+                           + float(a.get("cost", 0.0) or 0.0), 6)
+    merged["seconds"] = round(float(e.get("seconds", 0.0) or 0.0)
+                              + float(a.get("seconds", 0.0) or 0.0), 2)
+    pt = merged.get("prompt_tokens", 0)
+    merged["cache_hit"] = (round(merged.get("cached_tokens", 0) / pt, 3)
+                           if pt else 0.0)
+    merged["hybrid"] = {
+        "architect": {"model": hybrid.get("model", ""),
+                      "provider": hybrid.get("provider", ""), **a},
+        "editor": {"model": str(getattr(cfg, "model", "") or ""),
+                   "provider": str(getattr(cfg, "active_profile", "") or ""),
+                   **{k: v for k, v in e.items() if k != "hybrid"}},
+    }
+    tr.stats = merged
+    try:
+        events_mod.get(root, cfg).emit("hybrid", **merged["hybrid"],
+                                       calls=merged.get("calls", 0),
+                                       prompt_tokens=merged.get("prompt_tokens", 0),
+                                       completion_tokens=merged.get("completion_tokens", 0),
+                                       cost=merged.get("cost", 0.0))
+    except Exception:
+        pass
+
+
 def run_task(root: Path, cfg, client, agent, idx, task: str, *,
              apply: bool = True, review: bool = False,
              answer_system: str | None = None,
@@ -3993,9 +4186,42 @@ def run_task(root: Path, cfg, client, agent, idx, task: str, *,
         # agent (its _auto_step marker is set), so there is no double switch.
         client, agent = _specialist_route(root, cfg, client, agent, idx,
                                           task, is_repair)
-    tr = _run_ladder(root, cfg, client, agent, idx, task, apply=apply,
-                     review=review, answer_system=answer_system,
-                     is_repair=is_repair)
+    # Split-stage hybrid: the architect plans before the editor runs. Repair
+    # rounds and scaffold/answer_system tasks keep their single-model path.
+    hybrid = None
+    if ((apply or review) and not is_repair and answer_system is None
+            and hybrid_active(cfg)):
+        hybrid = _hybrid_stage1(root, cfg, client, agent, idx, task)
+    saved_mode = getattr(cfg, "answer_mode", "")
+    if hybrid is not None:
+        # Stage 1 -> 2 handoff: give the editor's server the VRAM, then
+        # inject the blueprint. Continue mode reuses only the gather
+        # conversation, so Stage 2 must rebuild its context to see the plan.
+        _hybrid_evict(cfg, str(getattr(hybrid["client"].cfg, "base_url", "") or ""),
+                      str(getattr(cfg, "base_url", "") or ""))
+        label = f"Hybrid Stage 2 (Editor): {cfg.model}"
+        print(f"\n[{label}]", file=sys.stderr)
+        workspace.log_event(root, label)
+        try:
+            events_mod.get(root, cfg).emit(
+                "hybrid_stage", stage=2, role="editor",
+                model=str(getattr(cfg, "model", "") or ""),
+                provider=str(getattr(cfg, "active_profile", "") or ""),
+                label=label)
+        except Exception:
+            pass
+        cfg._hybrid_blueprint = hybrid["blueprint"]
+        cfg.answer_mode = "rebuild"
+    try:
+        tr = _run_ladder(root, cfg, client, agent, idx, task, apply=apply,
+                         review=review, answer_system=answer_system,
+                         is_repair=is_repair)
+    finally:
+        if hybrid is not None:
+            cfg.answer_mode = saved_mode
+            cfg._hybrid_blueprint = ""
+    if hybrid is not None:
+        _hybrid_finish(root, cfg, client, hybrid, tr)
     tr = _specialist_zero_edit_fallback(
         root, cfg, client, idx, task, tr,
         dict(apply=apply, review=review, answer_system=answer_system,
@@ -4198,6 +4424,14 @@ def _run_task_once(root: Path, cfg, client, agent, idx, task: str, *,
     _fire(cfg, root, "pre_task", task=task[:500])
     print("\n--- looking things up ---", file=sys.stderr)
     gathered = agent.gather(task, backup_dir=backup_dir, is_repair=is_repair)
+    blueprint = str(getattr(cfg, "_hybrid_blueprint", "") or "")
+    if blueprint:
+        # Hybrid Stage 2: the architect's plan rides ahead of everything the
+        # editor gathered, so the cheap model implements instead of guessing.
+        gathered = ("HYBRID_BLUEPRINT (from the architect model -- implement "
+                    "this plan; it already names the root cause, target "
+                    "files, exact signatures and edge cases):\n"
+                    + blueprint + "\n\n" + (gathered or ""))
     # Files a gather-phase action wrote/moved/deleted (write/append/move/
     # delete/rename). A worker that finishes the job with gather actions --
     # the deepclitest pattern -- produces no answer-phase edit blocks, and

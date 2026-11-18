@@ -2,6 +2,76 @@
 
 All notable changes to Pedacito (`pdc`) are documented here.
 
+## v0.3.0 — 2026-11-18
+
+The release built around **time travel, live feedback and two-model
+workflows**: every run is checkpointed and undoable, secrets are guarded
+before they leave, tokens stream live, and a strong architect can plan for a
+fast editor — or two models can compete in isolated sandboxes.
+
+### Split-Stage Hybrid Routing (Architect + Editor)
+
+- **`hybrid_routing` + `architect_provider` / `architect_model`** — Stage 1
+  asks a strong architect model for a `HYBRID_BLUEPRINT` (root cause, target
+  files, exact signatures and contracts, edge cases); Stage 2 injects the
+  blueprint ahead of the fast editor's gathered context.
+- **Native VRAM handoff between stages** — when both models live on different
+  local servers, the outgoing server is evicted at the Stage 1 → 2 transition
+  (`auto_evict_servers`); hosted endpoints coexist.
+- **Combined + per-stage telemetry** — architect and editor tokens fold into
+  one run aggregate with a per-stage breakdown; an unreachable architect
+  degrades to a plain editor run with one warning.
+- **GUI Options bar** — Hybrid Architect toggle + provider/model selector;
+  **TUI** — `/hybrid [off | <provider> <model>]`.
+
+### 2-Model Sandbox Arena
+
+- **`pedacito/arena.py`** — one prompt, two contestants, each in an isolated
+  sandbox copy of the workspace (no `.git`, `.venv`, `node_modules`,
+  checkpoints, `dist` or `build`). The real project is never touched.
+- **Side-by-side scorecard** — per contestant: ok, files changed, unified
+  diff, elapsed time, tok/s, total tokens and a summary; stored in
+  `.pedacito/arena_last.json`.
+- **Checkpointed apply** — `apply_arena_winner` snapshots before and after
+  adopting the winner (`Arena winner: <model>`), so every arena result is
+  undoable.
+- **GUI** — Arena (A/B) button and modal with Apply buttons
+  (`/api/arena/run|last|apply`); **TUI** — `/arena <a> <b> <prompt>` and
+  `/arena apply a|b`.
+
+### Time-Travel Checkpoints & Live Preview (Phase 3A)
+
+- Interactive checkpoint tree in the GUI and TUI (`/checkpoints`,
+  `/checkout`, `/undo`), with per-run baselines and manual pins.
+- Live app preview runner: detected entrypoints and web targets run from the
+  GUI with output streaming.
+
+### Context Pinning & Project Rules (Phase 2B)
+
+- `@file` and `@symbol` context pins in the composer and TUI (`/pin`),
+  carried into every phase of a run.
+- Persistent project rules editor (`.pedacito/rules.md`) in both surfaces.
+
+### Custom Color Schemes (Phase 2A)
+
+- Unified GUI + TUI theme engine with shared custom color schemes
+  (`/theme`, GUI Theme Manager).
+
+### Live Streaming & Instant Cancel (Phase 1C)
+
+- SSE token streaming with a live reasoning drawer, per-call heartbeat and
+  millisecond-scale Stop.
+
+### Secret & Credential Guard (Phase 1B)
+
+- Non-blocking outbound secret scanning with acknowledge/redact choices,
+  post-run workspace notices and `.env` gitignore helpers.
+
+### Cross-Server Memory & Strata (Phase 1A)
+
+- Cross-server memory manager for local model servers and local-moe Strata
+  support.
+
 ## v0.2.0 — 2026-11-15
 
 The first release built around **specialist routing and skill-driven workflows**:

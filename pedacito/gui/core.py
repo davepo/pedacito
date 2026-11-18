@@ -47,7 +47,7 @@ QUESTION_TIMEOUT = 900.0
 PERMISSION_TIMEOUT = 120.0
 
 # Job kinds that drive the Engine V2 loop (and thus the activity telemetry).
-RUN_KINDS = ("task", "explain", "auto", "new")
+RUN_KINDS = ("task", "explain", "auto", "new", "arena")
 # Harness event kind -> the phase the ACTIVITY & PLAN panel should show.
 EVENT_PHASE = {"step": "gather", "gather_done": "edit", "answer": "edit",
                "edit_intents": "edit", "incremental_edit": "edit",
@@ -1694,6 +1694,12 @@ class State:
                                   and cfg.scout_profile in (cfg.profiles or {})
                                   and cfg.scout_profile != cfg.active_profile
                                   else ""),
+                # Split-stage hybrid routing: the Options bar's Architect
+                # toggle + selector read these (the model itself rides in
+                # profile_models, like every other profile's model).
+                "hybrid_routing": bool(cfg.hybrid_routing) if cfg else False,
+                "architect_provider": (cfg.architect_provider if cfg else ""),
+                "architect_model": (cfg.architect_model if cfg else ""),
                 "model": cfg.model if cfg else "",
                 "base_url": cfg.base_url if cfg else "",
                 "review_default": bool(cfg.review) if cfg else True,

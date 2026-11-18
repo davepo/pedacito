@@ -145,6 +145,50 @@ def scout_client(cfg, default):
     return client
 
 
+def resolve_model_config(cfg, provider: str, model: str):
+    """A config copy pointed at an explicit (provider, model) pair.
+
+    `provider` names a profile in [profiles.*] (by its name or its `provider`
+    label), or a base URL ("http://127.0.0.1:1234/v1"); empty keeps the active
+    endpoint. `model` overrides the model id. Shared by split-stage hybrid
+    routing (the Stage-1 architect) and the sandbox arena's contestants.
+    Returns None when `model` is empty -- there is nothing to resolve."""
+    from . import config as config_mod
+    provider = str(provider or "").strip()
+    model = str(model or "").strip()
+    if not model:
+        return None
+    new = None
+    if provider:
+        profiles = getattr(cfg, "profiles", None) or {}
+        name = provider if provider in profiles else next(
+            (n for n, body in profiles.items()
+             if str((body or {}).get("provider", "") or "").strip()
+             == provider), "")
+        if name:
+            new = derive_config(cfg, name)
+        elif "://" in provider:
+            new = copy.copy(cfg)
+            new.sampler = dict(cfg.sampler or {})
+            new.sources = dict(cfg.sources or {})
+            new.base_url = provider
+    if new is None:
+        new = copy.copy(cfg)
+        new.sampler = dict(cfg.sampler or {})
+        new.sources = dict(cfg.sources or {})
+    new.model = model
+    new.sources["model"] = f"selected model '{model}'"
+    # A different endpoint/model re-derives hosted-ness and its budgets.
+    new._hosted_server = config_mod.is_hosted(new)
+    if new._hosted_server:
+        new.json_mode = "object"
+    try:
+        config_mod.auto_fit(new, verbose=False)
+    except Exception:
+        pass
+    return new
+
+
 # ------------------------------------------------- specialist routing (#50)
 # auto_route_specialties sends each task to the profile whose specialty tags
 # best match it. Routing happens ONLY at task boundaries (never mid-gather):

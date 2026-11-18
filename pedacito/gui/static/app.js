@@ -463,7 +463,9 @@ const OPTS = {
     { k: 'write', label: 'Writing', type: 'select', def: 'review', opts: [['review', 'Review before writing'], ['apply', 'Write directly (backup first)']] },
     { k: 'plan', label: 'Planning', type: 'select', def: 'auto', opts: [['auto', 'Automatic'], ['always', 'Always plan'], ['never', 'Never']], note: 'Planning runs only with direct writes.' },
     { k: 'steps', label: 'Max lookups (0 = config)', type: 'number', def: '' },
-    { k: 'reindex', label: 'Refresh index first', type: 'check', def: false }
+    { k: 'reindex', label: 'Refresh index first', type: 'check', def: false },
+    { k: 'hybrid', label: 'Hybrid Architect (a strong model plans, the editor implements)', type: 'check', def: false, span2: true },
+    { k: 'architect_provider', label: 'Architect profile (Stage 1 planner)', type: 'select', def: '', opts: [], span2: true }
   ],
   explain: [],
   auto: [
@@ -1181,6 +1183,15 @@ async function send(forceAuto) {
   // The ✨ toggle forces Creative mode for this run; when off, the agent
   // still auto-detects design/UI tasks (creative_auto).
   if (S.mode === 'task' || S.mode === 'auto' || S.mode === 'new') body.creative = !!S.creative;
+  // Split-stage hybrid: the architect's model rides along from the selected
+  // profile; with the toggle off both architect fields clear so a previous
+  // run's planner never leaks into this one.
+  if (S.mode === 'task') {
+    const ap = body.hybrid ? (body.architect_provider || s.architect_provider || '') : '';
+    if (body.hybrid && !ap) { PDC.toast('Pick an Architect profile in Options first.', true); return; }
+    body.architect_provider = ap;
+    body.architect_model = ap ? ((s.profile_models || {})[ap] || '') : '';
+  }
   // Send the topbar's model selection explicitly so a no-project New/Ask uses
   // the profile the user just picked, even before /api/state catches up.
   body.profile = S.ui.pendingProfile !== null ? S.ui.pendingProfile : (s.profile || '');
@@ -1998,6 +2009,176 @@ function openBenchmarks() {
   }).catch(() => { statusLine.textContent = 'Could not load the benchmark catalog.'; });
 }
 PDC.openBenchmarks = openBenchmarks;
+
+// ------------------------------------------------------------------- arena ---
+// The 2-model sandbox arena: one prompt, two contestants, each in an isolated
+// copy of the workspace. The scorecard compares their diffs side by side; an
+// Apply button adopts the winner between two checkpoints (undoable).
+function openArena() {
+  const st = { jobId: 0, timer: 0, running: false, initialId: '', state: null };
+  const selA = h('select', { id: 'arenaA' });
+  const selB = h('select', { id: 'arenaB' });
+  const promptIn = h('textarea', { rows: 3, spellcheck: false,
+    placeholder: 'the task both contestants should run, e.g. add a --json flag to the CLI' });
+  const statusLine = h('div', { class: 'bench-status' });
+  const resultBox = h('div', { class: 'bench-result' });
+  const runBtn = h('button', { class: 'primary', text: 'Run Arena' });
+
+  const fillProfiles = () => {
+    const s = S.status || {};
+    const names = s.profiles || [];
+    const models = s.profile_models || {};
+    [selA, selB].forEach((sel, i) => {
+      clear(sel);
+      sel.appendChild(h('option', { value: '',
+        text: '(active' + (s.profile ? ': ' + s.profile : '') + ')' }));
+      names.forEach((n) => sel.appendChild(h('option', { value: n,
+        text: n + (models[n] ? ' \u00b7 ' + models[n] : '') })));
+      if (names.length > i) sel.value = names[i];
+    });
+  };
+  const spec = (sel) => sel.value || (S.status.profile || S.status.model || '');
+  const metric = (grid, label, value) => {
+    grid.appendChild(h('div', { class: 'bench-metric' },
+      h('span', { class: 'muted small-text', text: label }),
+      h('b', { text: value })));
+  };
+  const applyWinner = (side) => {
+    const state = st.state;
+    if (!state || state.winner) return;
+    PDC.api('/api/arena/apply', { arena_id: state.arena_id, winner: side }).then((j) => {
+      if (!j.ok) { PDC.toast(j.detail || 'could not apply the winner', true); return; }
+      state.winner = side;
+      PDC.toast('Arena winner applied: ' + (j.model || side.toUpperCase())
+        + ' (' + (j.files_changed || []).length + ' file(s)). Undo via Checkpoints.');
+      scorecard(state);
+      PDC.refreshState();
+    });
+  };
+  const sideBox = (state, side) => {
+    const rec = (state.contestants || {})[side] || {};
+    const ok = !!rec.ok;
+    const won = state.winner === side;
+    const box = h('div', { class: 'bench-score arena-side ' + (ok ? 'ok' : 'bad') + (won ? ' won' : '') });
+    box.appendChild(h('div', { class: 'bench-score-head' },
+      h('span', { class: 'bench-big', text: side.toUpperCase() }),
+      h('b', { text: (rec.provider ? rec.provider + ' / ' : '') + (rec.model || '?') }),
+      h('span', { class: 'tag ' + (ok ? 'ok' : ''), text: ok ? 'EDITS LANDED' : 'NO EDITS' }),
+      won ? h('span', { class: 'tag ok', text: 'WINNER APPLIED' }) : null));
+    const grid = h('div', { class: 'bench-grid' });
+    metric(grid, 'Files changed', String((rec.files_changed || []).length));
+    metric(grid, 'Duration', Number(rec.elapsed_sec || 0).toFixed(1) + 's');
+    metric(grid, 'Speed', Number(rec.tok_per_sec || 0).toFixed(1) + ' tok/s');
+    metric(grid, 'Tokens', PDC.fmtInt(rec.total_tokens || 0));
+    box.appendChild(grid);
+    if (rec.summary) {
+      box.appendChild(h('div', { class: 'muted small-text arena-summary', text: rec.summary }));
+    }
+    const files = rec.files_changed || [];
+    if (files.length) {
+      box.appendChild(h('div', { class: 'bench-label', text: 'Changed files' }));
+      box.appendChild(h('div', { class: 'mono small-text arena-files', text: files.join('\n') }));
+    }
+    box.appendChild(h('div', { class: 'bench-label', text: 'Diff' }));
+    const pre = h('pre', { class: 'cp-diff arena-diff' });
+    pre.textContent = rec.diff || '(no file changes)';
+    box.appendChild(pre);
+    if (!state.winner) {
+      box.appendChild(h('div', { class: 'bench-actions' },
+        h('button', { class: 'primary', text: 'Apply ' + side.toUpperCase() + '\u2019s changes',
+          onclick: () => applyWinner(side) })));
+    }
+    return box;
+  };
+  const scorecard = (state) => {
+    clear(resultBox);
+    st.state = state;
+    if (!state) return;
+    resultBox.appendChild(h('div', { class: 'muted small-text',
+      text: 'Arena ' + state.arena_id + ' \u00b7 ' + (state.prompt || '') }));
+    resultBox.appendChild(h('div', { class: 'arena-grid' },
+      sideBox(state, 'a'), sideBox(state, 'b')));
+  };
+  const finish = (state) => {
+    st.running = false;
+    st.jobId = 0;
+    runBtn.disabled = false;
+    runBtn.textContent = 'Run Arena';
+    statusLine.textContent = 'Finished. Compare the two runs, then apply a winner.';
+    scorecard(state);
+  };
+  const poll = () => {
+    clearTimeout(st.timer);
+    PDC.api('/api/arena/last').then((j) => {
+      const state = j.ok ? j.arena : null;
+      if (state && state.arena_id && state.arena_id !== st.initialId) { finish(state); return; }
+      if (!st.jobId) return;
+      const job = S.status.job;
+      if (!job || job.id !== st.jobId) {
+        // The job slot freed: one last read covers the save-then-end race.
+        if (state && state.arena_id && state.arena_id !== st.initialId) { finish(state); return; }
+        st.running = false;
+        runBtn.disabled = false;
+        runBtn.textContent = 'Run Arena';
+        statusLine.textContent = 'The arena job ended without a result; see Activity/Chat for the error.';
+        return;
+      }
+      statusLine.textContent = 'Running\u2026 both contestants work in isolated sandboxes. Watch Activity for live progress.';
+      st.timer = setTimeout(poll, 1500);
+    }).catch(() => { st.timer = setTimeout(poll, 2500); });
+  };
+  const run = () => {
+    if (st.running) return;
+    const text = promptIn.value.trim();
+    if (!text) { PDC.toast('Describe the task both contestants should run.', true); return; }
+    const a = spec(selA), b = spec(selB);
+    if (!a || !b) { PDC.toast('Pick two contestants.', true); return; }
+    if (S.status.job) { PDC.toast('Another job is running. Wait for it or press Stop.', true); return; }
+    st.running = true;
+    st.initialId = (st.state || {}).arena_id || '';
+    runBtn.disabled = true;
+    runBtn.textContent = 'Running\u2026';
+    clear(resultBox);
+    statusLine.textContent = 'Starting\u2026';
+    PDC.api('/api/arena/run', { text: text, model_a: a, model_b: b }).then((j) => {
+      if (!j.ok) {
+        st.running = false; runBtn.disabled = false; runBtn.textContent = 'Run Arena';
+        statusLine.textContent = j.detail || 'Could not start the arena.';
+        PDC.toast(j.detail || 'arena did not start', true);
+        return;
+      }
+      st.jobId = j.job;
+      statusLine.textContent = 'Running\u2026 watch Activity for live progress.';
+      poll();
+    }).catch((e) => {
+      st.running = false; runBtn.disabled = false; runBtn.textContent = 'Run Arena';
+      statusLine.textContent = 'Could not start the arena: ' + e;
+    });
+  };
+  runBtn.addEventListener('click', run);
+
+  const body = h('div', { class: 'bench-wrap' },
+    h('div', { class: 'bench-intro' },
+      h('h4', { text: 'Run one prompt on two models, side by side' }),
+      h('div', { class: 'muted small-text', text: 'Each contestant works in an isolated sandbox copy of the workspace \u2014 the real project stays untouched until you apply a winner (checkpointed, undoable).' })),
+    h('div', { class: 'bench-form' },
+      h('label', { class: 'bench-field' }, h('span', { text: 'Contestant A' }), selA),
+      h('label', { class: 'bench-field' }, h('span', { text: 'Contestant B' }), selB)),
+    h('label', { class: 'bench-field' }, h('span', { text: 'Task prompt' }), promptIn),
+    h('div', { class: 'row gap bench-runrow' }, runBtn, statusLine),
+    resultBox);
+  PDC.modal('Model Arena (A/B)', body, [{ label: 'Close' }],
+    { wide: true, onClose: () => clearTimeout(st.timer) });
+  fillProfiles();
+  PDC.api('/api/arena/last').then((j) => {
+    if (j.ok && j.arena) {
+      st.initialId = j.arena.arena_id || '';
+      scorecard(j.arena);
+      statusLine.textContent = 'Last arena shown. Run a new one above.';
+    }
+  }).catch(() => {});
+}
+PDC.openArena = openArena;
 
 // The GUI colorscheme. The browser always gets it at once (localStorage, so
 // theme.js can apply it before first paint); `userPick` additionally persists
@@ -3319,6 +3500,8 @@ function TopBar() {
           <button id="serversBtn" title="live VRAM/RAM and local model-server lifecycle"
                   onClick=${() => serversDialog()}>Servers</button>
           <button id="benchBtn" title="run a diagnostic benchmark against a configured profile" onClick=${() => openBenchmarks()}>\u25A6 Benchmarks</button>
+          <button id="arenaBtn" title="compare two models on one prompt in isolated sandboxes, then apply the winner"
+                  disabled=${!s.root} onClick=${() => openArena()}>\u2694 Arena</button>
           <button id="settingsBtn" title="profiles and settings" onClick=${() => callSettings()}>\u2699 Settings</button>
           <button id="themeBtn" title="theme manager and custom color editor"
                   onClick=${() => openThemeManager()}>\uD83C\uDFA8 Theme</button>
@@ -4072,7 +4255,18 @@ function OptField(props) {
   const val = opt(mode, o.k);
   const set = useCallback((v) => { S.opts[mode][o.k] = v; saveOpts(); emit(); }, [o.k, mode]);
   let el;
-  if (o.type === 'select') {
+  if (o.k === 'architect_provider') {
+    // Hybrid Stage-1 planner: the choices are the live profile list (the
+    // static OPTS table cannot know them), each labeled with its model.
+    const s = S.status || {};
+    const names = s.profiles || [];
+    const models = s.profile_models || {};
+    const cur = val || s.architect_provider || '';
+    el = html`<select value=${cur} onchange=${(e) => set(e.target.value)}>
+      <option value="">None (single-model runs)</option>
+      ${names.map((n) => html`<option key=${n} value=${n}>${n + (models[n] ? ' \u00b7 ' + models[n] : '')}</option>`)}
+    </select>`;
+  } else if (o.type === 'select') {
     el = html`<select value=${val} onchange=${(e) => set(e.target.value)}>
       ${o.opts.map((x) => html`<option key=${x[0]} value=${x[0]}>${x[1]}</option>`)}
     </select>`;

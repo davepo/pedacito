@@ -1,6 +1,6 @@
 [project]
 name = "pedacito"
-version = "0.2.0"
+version = "0.3.0"
 description = "Local-first AI coding harness and multi-model specialist orchestrator"
 readme = "README.md"
 requires-python = ">=3.11"   # tomllib

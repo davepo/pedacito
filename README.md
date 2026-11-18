@@ -273,7 +273,7 @@ command builds the same projects and writes the same reports.
 
 Requires Python 3.11+.
 
-Quick install from PyPI (0.2.0):
+Quick install from PyPI (0.3.0):
 
 ```bash
 pip install pedacito                     # Windows: py -m pip install pedacito

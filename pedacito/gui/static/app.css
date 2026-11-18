@@ -1204,6 +1204,22 @@ details pre { background: var(--code-bg); border: 1px solid var(--border); borde
   overflow: hidden; text-overflow: ellipsis; }
 @media (max-width: 700px) { .bench-form { grid-template-columns: 1fr; } }
 
+/* ------------------------------------------------------------- arena modal -- */
+/* The A/B scorecard: two bench-score cards side by side, each with its own
+   metrics, changed files and diff. Reuses the benchmark card vocabulary. */
+.arena-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px;
+  align-items: start; }
+.arena-side { display: flex; flex-direction: column; gap: 4px; min-width: 0; }
+.arena-side.won { border-color: var(--success);
+  box-shadow: 0 0 0 1px var(--success); }
+.arena-side .bench-score-head b { word-break: break-all; }
+.arena-summary { white-space: pre-wrap; word-break: break-word;
+  max-height: 96px; overflow: auto; }
+.arena-files { white-space: pre-wrap; word-break: break-all;
+  max-height: 80px; overflow: auto; }
+.arena-diff { max-height: 260px; }
+@media (max-width: 900px) { .arena-grid { grid-template-columns: 1fr; } }
+
 /* ------------------------------------------------- permission broker modal -- */
 /* The gated-action request (web fetch, package install, unapproved shell
    command, sensitive file read): category badge, monospace target box, and
