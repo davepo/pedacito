@@ -1643,17 +1643,19 @@ GUI_TOPICS = [
     },
     {
         "id": "change-theme",
-        "title": "Change the GUI colour scheme",
-        "summary": "Pick a theme in the topbar; it is stored as gui_theme in "
-                   "the user config.",
+        "title": "Change the GUI color scheme",
+        "summary": "Open the Theme Manager from the top bar. The choice is "
+                   "saved in themes.json beside your config.",
         "steps": [
-            "Topbar → theme dropdown (Light / Dark / 1990s)",
-            "The choice is saved as gui_theme in the user config when one "
-            "exists",
+            "Top bar → palette button (theme manager and custom color editor)",
+            "Pick one of the six built-in presets: pedacito-dark, "
+            "catppuccin-mocha, tokyo-night, gruvbox-dark, nord or solarized-dark",
+            "Or save a custom theme with ten color tokens; a project can pin "
+            "its own theme in .pedacito/config.json",
         ],
         "keywords": ["theme", "color scheme", "colour scheme", "dark mode",
-                     "light mode", "gui_theme"],
-        "settings": ["gui_theme"],
+                     "light mode", "theme manager", "palette"],
+        "settings": [],
         "cli": ["config"],
     },
     {

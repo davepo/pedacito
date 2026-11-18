@@ -301,8 +301,10 @@ the checked IP so a second DNS answer cannot swap it mid-request.
   compacts a long chat into a handoff checkpoint (A20). The CLI prints the
   same numbers as a one-line ribbon after each task; `show_telemetry = false`
   hides it.
-- **Themes:** pick a color scheme from the theme menu in the top bar. There are
-  nine. The choice is saved to your config as `gui_theme`.
+- **Themes:** open the Theme Manager with the palette button in the top bar. It
+  offers six built-in presets (`pedacito-dark`, `catppuccin-mocha`, `tokyo-night`,
+  `gruvbox-dark`, `nord`, `solarized-dark`) and any custom themes you save. The
+  choice is saved in `themes.json` beside your config.
 - **Attach** a text file, or drag it into the chat box, to use it as the task, a
   question, or a spec.
 - **Steer:** while a task runs, type a note to redirect the model. You can also

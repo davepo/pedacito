@@ -35,7 +35,22 @@ from pedacito import how_index, skills
 from pedacito.cli import build_parser
 
 ROOT = Path(__file__).resolve().parents[1]
-README = (ROOT / "README.md").read_text(encoding="utf-8")
+
+
+def _readme_corpus() -> str:
+    """The user-facing reference: README.md plus the modular guides in docs/.
+    The README is a summary; the detailed reference lives in docs/."""
+    paths = [ROOT / "README.md", *sorted((ROOT / "docs").glob("*.md"))]
+    return "\n\n".join(p.read_text(encoding="utf-8") for p in paths)
+
+
+def _doc_text(doc_name: str) -> str:
+    if doc_name == "README.md":
+        return _readme_corpus()
+    return (ROOT / doc_name).read_text(encoding="utf-8")
+
+
+README = _readme_corpus()
 QUICKSTART = (ROOT / "QUICKSTART.md").read_text(encoding="utf-8")
 MODEL_GUIDE = (ROOT / "MODEL_GUIDE.md").read_text(encoding="utf-8")
 
@@ -72,7 +87,7 @@ def _norm(text: str) -> str:
 
 @pytest.mark.parametrize("doc_name", ["README.md", "QUICKSTART.md"])
 def test_every_cli_subcommand_is_documented(doc_name):
-    text = (ROOT / doc_name).read_text(encoding="utf-8")
+    text = _doc_text(doc_name)
     missing = [name for name in _subcommand_names()
                if not _mentioned(text, name)]
     assert not missing, f"{doc_name} does not mention: {missing}"
@@ -175,7 +190,7 @@ FEATURE_NEEDLES = [
 @pytest.mark.parametrize("doc_name", ["README.md", "QUICKSTART.md"])
 @pytest.mark.parametrize("needle,feature", FEATURE_NEEDLES)
 def test_new_features_are_documented(doc_name, needle, feature):
-    text = _norm((ROOT / doc_name).read_text(encoding="utf-8"))
+    text = _norm(_doc_text(doc_name))
     assert needle in text, f"{doc_name} missing {feature}: {needle!r}"
 
 

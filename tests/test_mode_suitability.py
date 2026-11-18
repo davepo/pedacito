@@ -507,7 +507,10 @@ def test_gui_html_serves_the_mode_helpers_and_recommendation_handler(gui):
 
 @pytest.mark.parametrize("doc", ["README.md", "QUICKSTART.md"])
 def test_force_auto_is_documented(doc):
-    text = " ".join((ROOT / doc).read_text(encoding="utf-8").split())
+    paths = [ROOT / doc]
+    if doc == "README.md":
+        paths += sorted((ROOT / "docs").glob("*.md"))
+    text = " ".join(" ".join(p.read_text(encoding="utf-8") for p in paths).split())
     assert "--force-auto" in text
     assert "Run as a single-pass Task instead?" in text
 

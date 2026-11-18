@@ -16,6 +16,7 @@ a test process is running) child processes also get headless display guards.
 
 from __future__ import annotations
 
+import fnmatch
 import json
 import os
 import re
@@ -318,8 +319,23 @@ def _headless() -> bool:
             or "pytest" in sys.modules)
 
 
+# Variables that carry credentials. Matched case-insensitively against the
+# whole name, so exported shell keys never reach a Run-tab child process.
+SENSITIVE_ENV_EXACT = frozenset({"GITHUB_TOKEN", "PYPI_API_KEY"})
+SENSITIVE_ENV_PATTERNS = (
+    "*_API_KEY", "*SECRET*", "*TOKEN*", "*PASSWORD*",
+    "*ACCESS_KEY*", "*CREDENTIAL*",
+)
+
+
+def _is_sensitive_env(name: str) -> bool:
+    upper = str(name).upper()
+    return upper in SENSITIVE_ENV_EXACT or any(
+        fnmatch.fnmatchcase(upper, pat) for pat in SENSITIVE_ENV_PATTERNS)
+
+
 def _child_env() -> dict:
-    env = os.environ.copy()
+    env = {k: v for k, v in os.environ.items() if not _is_sensitive_env(k)}
     env.setdefault("PYTHONUNBUFFERED", "1")
     if _headless():
         # Keep a GUI/Tk app from trying to open a window in a test or a

@@ -1255,9 +1255,14 @@ def test_item19_cli_all_flag_is_wired():
 # in test_doc_sync.py)
 # ===========================================================================
 
+def _readme_corpus() -> str:
+    """README plus the modular guides in docs/, as one normalized text."""
+    paths = [ROOT / "README.md", *sorted((ROOT / "docs").glob("*.md"))]
+    return " ".join(" ".join(p.read_text(encoding="utf-8") for p in paths).split())
+
+
 def test_item20_readme_fetch_row_names_the_loopback_allowlist():
-    text = " ".join((ROOT / "README.md").read_text(encoding="utf-8").split())
-    assert 'fetch_allowed_hosts = ["127.0.0.1", "localhost"]' in text
+    assert 'fetch_allowed_hosts = ["127.0.0.1", "localhost"]' in _readme_corpus()
 
 
 def test_item20_model_guide_hardening_notes():
@@ -1268,9 +1273,10 @@ def test_item20_model_guide_hardening_notes():
 
 
 def test_item20_procs_all_documented():
-    for doc in ("README.md", "QUICKSTART.md"):
-        text = " ".join((ROOT / doc).read_text(encoding="utf-8").split())
-        assert "superseded stopped" in text, doc
+    text = _readme_corpus()
+    assert "superseded stopped" in text, "README + docs/"
+    quick = " ".join((ROOT / "QUICKSTART.md").read_text(encoding="utf-8").split())
+    assert "superseded stopped" in quick, "QUICKSTART.md"
     cards = {c["name"]: c for c in how_index.CLI_COMMANDS}
     assert "--all" in cards["procs"]["usage"]
     assert any(f["flag"] == "--all" for f in cards["procs"]["flags"])
