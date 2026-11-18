@@ -2902,6 +2902,15 @@ def refine_prompt(prompt: str, root, cfg, llm_client,
         system = REFINE_SYSTEM
         if is_simple_web_brief(prompt, snapshot):
             system += "\n\n" + WEB_POLISH_NOTE
+        # Persistent project rules are hard requirements for every Task, Auto
+        # and Refine call. They ride at the end of the system prompt (the
+        # stable prefix), after the built-in architect brief.
+        try:
+            from . import prompts as prompts_mod
+            system = prompts_mod.with_project_rules(
+                system, cfg, root=project_root)
+        except Exception:
+            pass
         messages = [{"role": "system", "content": system},
                     {"role": "user", "content": user}]
         try:

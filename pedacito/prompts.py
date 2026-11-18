@@ -24,6 +24,8 @@ import hashlib
 import re
 from pathlib import Path
 
+from . import fileio
+
 PACKS = ("tiny", "small", "full")
 
 _TIER_PACK = {"tiny": "tiny", "small": "small"}
@@ -49,6 +51,98 @@ def _enabled(cfg) -> set[str]:
     """Action names this run offers (mirrors tools.schema_for)."""
     from .tools import schema_for
     return set(schema_for(cfg)["properties"]["action"]["enum"])
+
+
+# --------------------------------------------------------------------------
+# Persistent project rules (`.pedacito/rules.md`)
+# --------------------------------------------------------------------------
+RULES_REL = ".pedacito/rules.md"
+_RULES_CACHE: dict[tuple[str, int, int], str] = {}
+
+
+def project_rules_path(root) -> Path | None:
+    """`<root>/.pedacito/rules.md`, or None without a project root."""
+    if root is None or str(root).strip() == "":
+        return None
+    return Path(root) / ".pedacito" / "rules.md"
+
+
+def load_project_rules(root) -> str:
+    """Read the project's persistent rules file ("" when absent/empty).
+
+    The file is the user's hard instruction layer: it must reach every
+    Task/Auto/Refine prompt, so it is read by mtime rather than cached for the
+    session; edits made in the GUI/TUI take effect on the next task.
+    """
+    path = project_rules_path(root)
+    if path is None:
+        return ""
+    try:
+        st = path.stat()
+    except OSError:
+        return ""
+    key = (str(path), st.st_mtime_ns, st.st_size)
+    text = _RULES_CACHE.get(key)
+    if text is None:
+        try:
+            text = fileio.read_text(path, errors="replace")
+        except OSError:
+            return ""
+        _RULES_CACHE[key] = text
+    return text.strip()
+
+
+def save_project_rules(root, content) -> Path:
+    """Persist `.pedacito/rules.md`; empty content clears the file.
+
+    Returns the written path (also when the file was removed, so callers can
+    show where the rules live). Atomic write: a crash never leaves a
+    half-written instruction file behind.
+    """
+    path = project_rules_path(root)
+    if path is None:
+        raise ValueError("no project root: open or create a project first")
+    text = str(content or "")
+    if not text.strip():
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            pass
+        return path
+    fileio.write(path, text, fileio.TextStyle())
+    return path
+
+
+def project_rules_block(cfg=None, root=None) -> str:
+    """Prompt block for the active project's rules, or "".
+
+    Rendered as a stable prefix section (the rules file is small and changes
+    only when the user edits it), so local and local-moe servers keep reusing
+    the same KV-cache prefix across turns.
+    """
+    if root is None and cfg is not None:
+        root = getattr(cfg, "_root", None) or getattr(cfg, "root", None)
+    if cfg is not None and not getattr(cfg, "use_project_rules", True):
+        return ""
+    text = load_project_rules(root)
+    if not text:
+        return ""
+    limit = int(getattr(cfg, "max_rules_chars", 6000) or 0) if cfg else 6000
+    if limit > 0 and len(text) > limit:
+        text = (text[:limit].rstrip()
+                + f"\n[... truncated; read {RULES_REL} for the rest]")
+    return (f"PROJECT RULES (from {RULES_REL}; these are hard requirements "
+            f"for every task):\n{text}")
+
+
+def with_project_rules(text: str, cfg=None, root=None) -> str:
+    """`text` plus the project-rules block, never duplicated."""
+    block = project_rules_block(cfg, root)
+    if not block:
+        return text
+    if block in (text or ""):
+        return text
+    return (text or "").rstrip() + "\n\n" + block
 
 
 def tool_help(cfg, full_help: str) -> str:
@@ -224,14 +318,15 @@ def gather_system(cfg, base: str, tool_help_full: str, pack: str | None = None
     or user override of `gather` replaces it outright."""
     override = load_override(cfg, "gather")
     if override:
-        return override
+        return with_project_rules(override, cfg)
     pack = pack or pack_for(cfg)
     enabled = _enabled(cfg)
     if pack == "tiny":
         extras = [t for k, t in _EXTRA_BULLETS if k in enabled
                   and k in ("context", "remember", "git", "question")] + [_TRUST_RULE]
-        return _TINY_GATHER.format(help=_compact_tool_help(cfg),
-                                   extra="\n".join(extras))
+        return with_project_rules(_TINY_GATHER.format(
+            help=_compact_tool_help(cfg),
+            extra="\n".join(extras)), cfg)
     head, bullets = _split_base(base)
     head = head.replace("{help}", "")
     # The `Actions:` listing inside `base` already embeds the full TOOL_HELP;
@@ -253,7 +348,7 @@ def gather_system(cfg, base: str, tool_help_full: str, pack: str | None = None
     body = [b for b in kept if b not in tail]
     body += [t for k, t in _EXTRA_BULLETS if k in enabled]
     body.append(_TRUST_RULE)
-    return head + "Rules:\n" + "\n".join(body + tail)
+    return with_project_rules(head + "Rules:\n" + "\n".join(body + tail), cfg)
 
 
 # --------------------------------------------------------------------------
@@ -713,12 +808,14 @@ def answer_system(cfg, full_edit_format: str, task: str = "",
     game (the web needs no extra rules -- the persona covers it)."""
     override = load_override(cfg, "answer")
     if override:
-        return override
+        return with_project_rules(override, cfg)
     persona = (_CREATIVE_PERSONA if creative else
                "You are a code assistant. You have a map of the project and the "
                "specific\nsource you asked to see. Complete the user's task.")
-    text = persona + "\n\n" + edit_format(cfg, full_edit_format,
-                                         creative=creative)
+    # Project rules ride directly after the persona, before the (task-shaped)
+    # edit brief: that keeps them in the stable prefix of every answer call.
+    text = with_project_rules(persona, cfg) + "\n\n" \
+        + edit_format(cfg, full_edit_format, creative=creative)
     if creative:
         craft = creative_craft_directives(task)
         if craft:
@@ -809,6 +906,7 @@ def fingerprint(cfg, *texts: str) -> str:
     h.update(pack_for(cfg).encode())
     for name in ("gather", "edit_format", "answer", "explain"):
         h.update(load_override(cfg, name).encode())
+    h.update(load_project_rules(getattr(cfg, "_root", None)).encode())
     for t in texts:
         h.update(t.encode("utf-8", "replace"))
     return h.hexdigest()[:12]

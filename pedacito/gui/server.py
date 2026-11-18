@@ -22,10 +22,11 @@ from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlparse
 
 from .. import review as review_mod
+from .. import prompts as prompts_mod
 from .. import security, themes as themes_mod, workspace
 from ..config import ConfigError
 from ..local_server import LocalHTTPServer
-from ..select import Matcher, is_venv_dir
+from ..select import Matcher, is_venv_dir, suggest_context
 from . import jobs, settings_api
 from .core import (STATE, install_permission_broker, install_runner,
                    install_tee, uninstall_permission_broker,
@@ -301,6 +302,74 @@ def _snapshot(q, body=None):
 @get("/api/files")
 def _files(q, body=None):
     return 200, project_files()
+
+
+def _active_context():
+    """(root, index) for read-only context endpoints, lock-safe when present."""
+    lock = getattr(STATE, "lock", None)
+    if lock is not None:
+        with lock:
+            return getattr(STATE, "root", None), getattr(STATE, "idx", None)
+    return getattr(STATE, "root", None), getattr(STATE, "idx", None)
+
+
+@get("/api/context/suggest")
+def _context_suggest(q, body=None):
+    """Fast `@` autocomplete: workspace files + indexed AST symbols.
+
+    `?q=` is the partial token after `@`. The endpoint is synchronous and
+    zero-LLM (the composer calls it on every keystroke), so it must answer
+    from the warm index rather than rebuilding or probing anything.
+    """
+    query = (q.get("q") or q.get("query") or [""])[0]
+    root, idx = _active_context()
+    items = suggest_context(idx if idx is not None else root, query, limit=20)
+    return 200, {
+        "ok": True,
+        "query": query,
+        "items": items,
+        "suggestions": items,
+        "files": [x for x in items if x.get("kind") == "file"],
+        "symbols": [x for x in items if x.get("kind") == "symbol"],
+    }
+
+
+@get("/api/rules")
+def _rules_get(q, body=None):
+    """Read the active project's persistent rules (`.pedacito/rules.md`)."""
+    root, _idx = _active_context()
+    if root is None:
+        raise ConfigError("No project is open.")
+    text = prompts_mod.load_project_rules(root)
+    path = prompts_mod.project_rules_path(root)
+    return 200, {
+        "ok": True,
+        "path": ".pedacito/rules.md",
+        "exists": bool(path is not None and path.is_file()),
+        "text": text,
+    }
+
+
+@post("/api/rules")
+def _rules_post(q, body):
+    """Save (or clear, with empty text) `.pedacito/rules.md`."""
+    root, _idx = _active_context()
+    if root is None:
+        raise ConfigError("No project is open.")
+    body = body or {}
+    text = body.get("text")
+    if text is None:
+        text = body.get("content")
+    try:
+        path = prompts_mod.save_project_rules(root, str(text or ""))
+    except (OSError, ValueError) as e:
+        raise ConfigError(f"Could not save project rules: {e}") from e
+    return 200, {
+        "ok": True,
+        "path": ".pedacito/rules.md",
+        "exists": path.is_file(),
+        "text": prompts_mod.load_project_rules(root),
+    }
 
 
 @get("/api/backups")

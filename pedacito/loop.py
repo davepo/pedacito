@@ -33,6 +33,7 @@ from . import safety, workspace
 from . import index as index_mod
 from . import instructions as instructions_mod
 from . import proc as proc_mod
+from . import prompts as prompts_mod
 from . import ratchet as ratchet_mod
 from . import review as review_mod
 from . import security as security_mod
@@ -1224,6 +1225,9 @@ def generate_tasks(spec_text: str, client, cfg,
     notes = instructions_mod.render(root, cfg) if root is not None else ""
     if notes:
         plan_system += "\n\n" + notes
+    rules = prompts_mod.project_rules_block(cfg, root=root)
+    if rules:
+        plan_system += "\n\n" + rules
     base_user = (f"GOAL\n\n{body}\n\n"
                  "Break this into an ordered task list. Each task title must be "
                  "a single imperative sentence a coding agent can implement and "
@@ -3917,13 +3921,21 @@ def _specialist_zero_edit_fallback(root, cfg, client, idx, task, tr, kw):
 def run_task(root: Path, cfg, client, agent, idx, task: str, *,
              apply: bool = True, review: bool = False,
              answer_system: str | None = None,
-             is_repair: bool = False) -> TaskResult:
+             is_repair: bool = False,
+             pinned: list | None = None) -> TaskResult:
     """`_run_ladder`, plus failure memory: a task that ends without a usable
     edit is remembered (files looked at, why) so a similar later task is warned
     off the same dead end; a success clears the warning. Zero-edit runs are
     also counted per profile: once `escalation_zero_edit_runs` accumulate, the
-    next task carries an escalation suggestion into its ladder."""
+    next task carries an escalation suggestion into its ladder.
+
+    `pinned` is an optional explicit context list (`@file`, `Class.method`);
+    the prompt's own @mentions are always parsed by Agent.gather.
+    """
     from . import memory as memory_mod
+    if pinned is not None:
+        cfg._pinned_refs = [str(p).lstrip("@").strip()
+                            for p in pinned if str(p).strip()]
     if _cancel_requested(cfg, client):
         _emit_run_cancelled(root, cfg, "task", task=(task or "")[:200])
         raise CancelledError("Stopped by user; no further work was done.")
@@ -4619,7 +4631,8 @@ def run_loop(root: Path, cfg, client, idx, plan_path: Path, *,
              stop_on_fail: bool = True,
              answer_system: str | None = None, auto_install: bool = False,
              goal: str = "", on_task=None, strict: bool = False,
-             verify_final: bool = False) -> int:
+             verify_final: bool = False,
+             pinned: list | None = None) -> int:
     """Run the Ralph loop until the plan is empty (or a cap/stop is hit).
 
     Each iteration: read the plan, take the first unchecked task, run it in a
@@ -4684,6 +4697,26 @@ def run_loop(root: Path, cfg, client, idx, plan_path: Path, *,
       is still paid for once, for the record, after the loop.
     """
     from .agent import Agent
+
+    if pinned is not None:
+        cfg._pinned_refs = [str(p).lstrip("@").strip()
+                            for p in pinned if str(p).strip()]
+    elif goal:
+        # An Auto goal's @file/@symbol mentions apply to every generated task,
+        # even when the planner shortens a task title and drops them.
+        try:
+            from . import select as select_mod
+            refs = [str(p).lstrip("@").strip()
+                    for p in (getattr(cfg, "_pinned_refs", None) or ())
+                    if str(p).strip()]
+            for pin in select_mod.parse_pinned_references(
+                    goal, idx if idx is not None else root):
+                ref = pin.symbol_name if pin.kind == "symbol" else pin.path
+                if ref and ref not in refs:
+                    refs.append(ref)
+            cfg._pinned_refs = refs
+        except Exception:
+            pass
 
     attempted = 0
     done = 0

@@ -52,8 +52,10 @@ from . import memory as memory_mod
 from . import modelcard
 from . import processes
 from . import profiles as profiles_mod
+from . import prompts as prompts_mod
 from . import roles as roles_mod
 from . import security
+from . import select as select_mod
 from . import servers as servers_mod
 from . import skills as skills_mod
 from . import themes as themes_mod
@@ -110,6 +112,8 @@ _SWAP_ARROW = "\u2192"
 _TAB_PREFIX = {
     "/con": "/consolidate ",
     "/pro": "/profile ",
+    "/pi": "/pin ",
+    "/ru": "/rules ",
     "/aut": "/auto-route ",
     "/cre": "/creative ",
     "/eff": "/effort ",
@@ -121,6 +125,7 @@ _SLASH_COMMANDS = [
     "/consolidate", "/compact", "/profile", "/profiles", "/model",
     "/auto-route", "/think", "/effort", "/creative", "/servers", "/unload",
     "/apply", "/skills", "/memory", "/procs", "/security", "/theme",
+    "/pin", "/rules",
     "/diff", "/undo", "/reset", "/sidebar", "/scroll", "/mouse", "/clear",
     "/quit", "/exit",
 ]
@@ -184,6 +189,11 @@ Pedacito TUI commands
   /skills [list|show NAME|draft TEXT]
   /memory [list|add FACT|forget TEXT]
   /procs [list|logs NAME|stop NAME]
+  /pin [list|add REF|remove REF|clear]
+                            explicit context pins for this session; REF is
+                            a file path or indexed symbol (Class.method)
+  /rules [list|set TEXT|clear]
+                            show or edit persistent .pedacito/rules.md
   /security                 scan and show unacknowledged secrets / .env files
   /security ack             acknowledge every current secret finding
   /security gitignore       add .env patterns to .gitignore
@@ -519,6 +529,10 @@ class TuiSession:
         self._scroll_seen_width = 0
         self.folds = 0
         self.resume_context = ""
+        # Explicit session pins added with `/pin add`. They ride every Task
+        # and Auto prompt through cfg._pinned_refs, independently of the
+        # prompt's own @file/@symbol mentions.
+        self.pins: list[str] = []
         self.last_telemetry: dict = {}
         self._event_prompt = 0
         self._event_completion = 0
@@ -574,6 +588,11 @@ class TuiSession:
     @property
     def profile(self) -> str:
         return str(getattr(self.cfg, "active_profile", "") or "default")
+
+    @property
+    def pinned(self) -> list[str]:
+        """Canonical session pin references (the `/pin list` contents)."""
+        return list(self.pins)
 
     @property
     def interactive(self) -> bool:
@@ -2044,6 +2063,15 @@ class TuiSession:
         if self.idx is not None and self.agent is not None:
             self.agent.index = self.idx
 
+    def _sync_pins(self) -> None:
+        """Publish the session pin list to every phase of the next run."""
+        try:
+            self.cfg._pinned_refs = list(self.pins)
+        except Exception:
+            pass
+        if self.agent is not None:
+            self.agent.cfg = self.cfg
+
     def _refresh_warmup(self, client) -> None:
         check = getattr(client, "check", None)
         warmup = getattr(client, "warmup", None)
@@ -2376,6 +2404,7 @@ class TuiSession:
         self._evict_servers()
         client, agent, idx = self._ensure_backend()
         cfg = self.cfg
+        self._sync_pins()
         if self.resume_context:
             task = self.resume_context + "\n\nNEW TASK\n" + task
             self.resume_context = ""
@@ -2459,6 +2488,7 @@ class TuiSession:
         self._evict_servers()
         client, agent, idx = self._ensure_backend()
         cfg = self.cfg
+        self._sync_pins()
         plan_path = self._plan_path()
         self._append(f"\u00bb /auto {goal}", "user")
         if not self._security_outbound_guard(goal):
@@ -2726,6 +2756,12 @@ class TuiSession:
             return
         if cmd == "plan":
             self.show_plan(arg)
+            return
+        if cmd == "pin":
+            self._pin(arg)
+            return
+        if cmd == "rules":
+            self._rules(arg)
             return
         if cmd in ("consolidate", "compact"):
             self._consolidate()
@@ -3271,6 +3307,117 @@ class TuiSession:
             return
         for scope, category, text in rows:
             self._append(f"[{scope}/{category}] {text}", "system")
+
+    def _pin(self, arg: str) -> None:
+        """`/pin [list|add REF|remove REF|clear]` -- explicit session pins."""
+        words = arg.split(None, 1)
+        action = words[0].lower() if words else "list"
+        rest = words[1].strip() if len(words) > 1 else ""
+        if action in ("list", "show", ""):
+            if not self.pins:
+                self._append(
+                    "No session pins. Use `/pin add <file|symbol>` "
+                    "(or type @file/@Class.method in a prompt).", "system")
+                return
+            self._append(f"Pinned context ({len(self.pins)}):", "system")
+            for ref in self.pins:
+                self._append(f"  {ref}", "system")
+            return
+        if action == "clear":
+            self.pins = []
+            self._sync_pins()
+            self._append("Session pins cleared.", "system")
+            return
+        if action in ("add", "remove"):
+            if not rest:
+                self._append(f"Usage: /pin {action} <file|symbol>", "error")
+                return
+            if action == "remove":
+                wanted = rest.lstrip("@").strip()
+                hit = [p for p in self.pins
+                       if p.lower() == wanted.lower()]
+                if not hit:
+                    hit = [p for p in self.pins
+                           if wanted.lower() in p.lower()]
+                if not hit:
+                    self._append(f"Not pinned: {wanted}", "error")
+                    return
+                for ref in hit:
+                    self.pins.remove(ref)
+                self._sync_pins()
+                self._append(f"Unpinned {', '.join(hit)}", "system")
+                return
+            target = self.idx
+            if target is None:
+                target = self.root
+            try:
+                pins = select_mod.resolve_pinned_references(rest, target)
+            except Exception as exc:
+                self._append(f"pin: {exc}", "error")
+                return
+            if not pins:
+                self._append(
+                    f"Could not resolve '{rest}' in this workspace. "
+                    "Try an exact path or indexed symbol name.", "error")
+                return
+            added = []
+            for pin in pins:
+                ref = (pin.symbol_name if pin.kind == "symbol" else pin.path)
+                if ref and ref not in self.pins:
+                    self.pins.append(ref)
+                    added.append(ref)
+            self._sync_pins()
+            if added:
+                self._append("Pinned " + ", ".join(added) + " (session)",
+                             "system")
+            else:
+                self._append("Already pinned.", "system")
+            return
+        self._append("Usage: /pin [list|add REF|remove REF|clear]", "error")
+
+    def _rules(self, arg: str) -> None:
+        """`/rules [list|set TEXT|clear]` -- `.pedacito/rules.md`."""
+        words = arg.split(None, 1)
+        action = words[0].lower() if words else "list"
+        rest = words[1].strip() if len(words) > 1 else ""
+        path = prompts_mod.project_rules_path(self.root)
+        rel = prompts_mod.RULES_REL
+        if action in ("list", "show"):
+            text = prompts_mod.load_project_rules(self.root)
+            if text:
+                self._append(f"Project rules ({rel}):", "system")
+                self._append(text, "system")
+            else:
+                self._append(
+                    f"{rel} is empty or absent. Use `/rules set <text>` "
+                    "to add persistent project instructions.", "system")
+            return
+        if action == "set":
+            if not rest:
+                self._append("Usage: /rules set <text>", "error")
+                return
+            text = rest
+            if len(text) >= 2 and text[0] == text[-1] and text[0] in "\"'":
+                text = text[1:-1]
+            try:
+                prompts_mod.save_project_rules(self.root, text)
+            except (OSError, ValueError) as exc:
+                self._append(f"rules: {exc}", "error")
+                return
+            self._append(f"Project rules saved to {rel}.", "system")
+            return
+        if action == "clear":
+            try:
+                prompts_mod.save_project_rules(self.root, "")
+            except (OSError, ValueError) as exc:
+                self._append(f"rules: {exc}", "error")
+                return
+            self._append(f"Project rules cleared ({rel}).", "system")
+            return
+        if action == "path" and path is not None:
+            self._append(str(path), "system")
+            return
+        self._append("Usage: /rules [list|set TEXT|clear]", "error")
 
     def _procs(self, arg: str) -> None:
         words = arg.split(None, 1)

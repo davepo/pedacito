@@ -35,7 +35,12 @@ a file reachable by several routes is kept once.
 
 from __future__ import annotations
 
+import ast
+import difflib
 import fnmatch
+import os
+import re
+from dataclasses import dataclass
 from pathlib import Path
 
 from . import fileio
@@ -312,3 +317,557 @@ def select(paths: list[str], root: Path, matcher: Matcher,
             for f in _walk(path, matcher, root):
                 keep(f, explicit=False)
     return out
+
+
+# --------------------------------------------------------------------------
+# Explicit context pinning: `@file` and `@Class.method` mentions in a prompt
+# --------------------------------------------------------------------------
+# The planner/model may want a file (or one definition) in context no matter
+# what automatic retrieval scores. These helpers turn a prompt's @-mentions
+# (and an API client's `pinned` list) into resolved, already-read spans that
+# the gather and answer phases place ahead of every automatically chosen item.
+
+# A mention starts at a boundary, so `user@example.com` is not one. The body
+# accepts relative paths, qualnames and `file.py:symbol`; trailing sentence
+# punctuation is trimmed after the match.
+_MENTION_RE = re.compile(r"(?<![\w.])@([A-Za-z0-9_][A-Za-z0-9_./:\\-]*)")
+_PY_FENCE_RE = re.compile(r"```(?:python|py|python3|py3)\b[^\n]*\n(.*?)```",
+                          re.DOTALL | re.IGNORECASE)
+_TRAILING_PUNCT = ".,;!?)]}>\"'`"
+_MAX_PIN_SCAN_FILES = 4000
+_MAX_SYMBOL_SCAN_FILES = 500
+
+
+@dataclass
+class PinnedContext:
+    """One explicitly pinned file or AST symbol definition.
+
+    `content` is the exact source text (already read from disk), so the prompt
+    builder never has to hydrate an index chunk again. `start_line` and
+    `end_line` are 1-based inclusive, matching `Chunk.start`/`Chunk.end` and
+    the numbered SOURCE blocks elsewhere in the harness.
+    """
+
+    raw_token: str
+    kind: str                    # "file" | "symbol"
+    path: str                    # project-relative, POSIX
+    symbol_name: str = ""
+    start_line: int = 0
+    end_line: int = 0
+    content: str = ""
+
+
+def _split_root_index(index_or_root) -> tuple[Path | None, object | None]:
+    """(root, index) for an Index, a project root Path/str, or None."""
+    if index_or_root is None:
+        return None, None
+    if isinstance(index_or_root, (str, os.PathLike)):
+        return Path(index_or_root).expanduser().resolve(), None
+    root = getattr(index_or_root, "root", None)
+    if root is not None and (hasattr(index_or_root, "chunks")
+                             or hasattr(index_or_root, "find_symbol")
+                             or hasattr(index_or_root, "files")):
+        return Path(root).expanduser().resolve(), index_or_root
+    return None, None
+
+
+def _workspace_files(root: Path | None, index=None) -> list[str]:
+    """Project-relative files a pin may name, honouring ignore rules.
+
+    An index already knows the selected files, so it is the fast path; a
+    bounded workspace walk adds files created since the last index (and makes
+    pinning work before the first index exists).
+    """
+    if root is None:
+        return sorted(getattr(index, "files", []) or [])
+    found: set[str] = set(getattr(index, "files", []) or [])
+    matcher = Matcher.from_files(root)
+    scanned = 0
+    for dirpath, dirnames, filenames in os.walk(root):
+        d = Path(dirpath)
+        base = "" if d == root else d.relative_to(root).as_posix()
+        dirnames[:] = [
+            name for name in dirnames
+            if not is_venv_dir(d / name)
+            and not matcher.prunable_dir(f"{base}/{name}" if base else name)
+        ]
+        for name in sorted(filenames):
+            rel = f"{base}/{name}" if base else name
+            if matcher.excluded(rel):
+                continue
+            found.add(rel)
+            scanned += 1
+            if scanned >= _MAX_PIN_SCAN_FILES:
+                return sorted(found)
+    return sorted(found)
+
+
+def _read_lines(root: Path | None, rel: str) -> list[str]:
+    if root is None or not rel:
+        return []
+    try:
+        return fileio.read_lines(root / rel)
+    except OSError:
+        return []
+
+
+def _has_known_extension(token: str) -> bool:
+    suffix = Path(token).suffix.lower()
+    return suffix in CODE_EXTS or suffix in REFERENCE_EXTS or suffix in {
+        ".md", ".html", ".yaml", ".yml", ".toml", ".json", ".csv",
+        ".txt", ".rst", ".css", ".scss", ".less",
+    }
+
+
+def _resolve_file(token: str, files: list[str]) -> str | None:
+    """Resolve a typed file reference to one indexed/workspace path.
+
+    Exact relative paths and unique basenames win. A case-insensitive prefix
+    or close match is accepted only when it identifies exactly one file, so a
+    bare `@__init__.py` never silently picks one package's file.
+    """
+    want = fileio.normalise_rel(token).lower().strip("/")
+    if not want or not files:
+        return None
+    exact = [f for f in files if f.lower() == want]
+    if exact:
+        return exact[0]
+
+    base = want.rsplit("/", 1)[-1]
+    base_hits = [f for f in files if f.rsplit("/", 1)[-1].lower() == base]
+    if len(base_hits) == 1:
+        return base_hits[0]
+
+    suffix = [f for f in files if f.lower().endswith("/" + want)]
+    if len(suffix) == 1:
+        return suffix[0]
+
+    prefix = [f for f in files if f.lower().startswith(want)]
+    if len(prefix) == 1:
+        return prefix[0]
+
+    base_prefix = [
+        f for f in files if f.rsplit("/", 1)[-1].lower().startswith(base)
+    ]
+    if len(base_prefix) == 1:
+        return base_prefix[0]
+
+    # Fuzzy fallbacks: only an unambiguous close match is useful. Paths are
+    # tried first, then basenames (the way a person types `@gui.py`).
+    close = difflib.get_close_matches(want, [f.lower() for f in files],
+                                      n=2, cutoff=0.72)
+    if len(close) == 1:
+        for f in files:
+            if f.lower() == close[0]:
+                return f
+    close_base = difflib.get_close_matches(
+        base, [f.rsplit("/", 1)[-1].lower() for f in files],
+        n=2, cutoff=0.75)
+    if len(close_base) == 1:
+        for f in files:
+            if f.rsplit("/", 1)[-1].lower() == close_base[0]:
+                return f
+    return None
+
+
+_SYMBOL_CACHE: dict[str, tuple[tuple, list]] = {}
+
+
+def _symbol_records(root: Path | None, index=None) -> list:
+    """Chunks (or lightweight AST chunks for a root with no index)."""
+    if index is not None:
+        return list(getattr(index, "chunks", []) or [])
+    if root is None:
+        return []
+    files = _workspace_files(root, None)
+    pys = [f for f in files if Path(f).suffix.lower() == ".py"]
+    pys = pys[:_MAX_SYMBOL_SCAN_FILES]
+    sig_parts: list[tuple] = []
+    for rel in pys:
+        try:
+            st = (root / rel).stat()
+            sig_parts.append((rel, st.st_mtime_ns, st.st_size))
+        except OSError:
+            sig_parts.append((rel, 0, 0))
+    sig = tuple(sig_parts)
+    key = str(root)
+    hit = _SYMBOL_CACHE.get(key)
+    if hit is not None and hit[0] == sig:
+        return hit[1]
+    from .chunker import chunk_source
+    records: list = []
+    for rel in pys:
+        try:
+            text = fileio.read_text(root / rel)
+            if len(text) > 2_000_000:
+                continue
+            records.extend(chunk_source(rel, text))
+        except (OSError, SyntaxError, ValueError):
+            continue
+    _SYMBOL_CACHE[key] = (sig, records)
+    return records
+
+
+def _symbol_hits(token: str, file: str | None, root: Path | None,
+                 index=None) -> list:
+    """Chunks defining `token` (exact qualname, dotted suffix, or member)."""
+    records = _symbol_records(root, index)
+    if not records and index is not None and hasattr(index, "find_symbol"):
+        try:
+            records = list(index.find_symbol(token) or [])
+        except Exception:
+            records = []
+    if file:
+        key = fileio.path_key(file)
+        records = [c for c in records
+                   if fileio.path_key(getattr(c, "file", "")) == key]
+    want = token.strip()
+    if not want:
+        return []
+    low = want.lower()
+    hits = [c for c in records if getattr(c, "qualname", "") == want]
+    if not hits:
+        hits = [c for c in records
+                if getattr(c, "qualname", "").lower() == low]
+    if not hits:
+        hits = [c for c in records
+                if getattr(c, "qualname", "").lower().endswith("." + low)]
+    if not hits:
+        base = low.rsplit(".", 1)[-1]
+        hits = [c for c in records
+                if base in {str(m).lower()
+                            for m in getattr(c, "members", ())}]
+    # A split unit's continuation chunks all match the base qualname; keep
+    # the first part only, which carries the signature and docstring.
+    out, seen = [], set()
+    for c in hits:
+        key = (getattr(c, "file", ""), getattr(c, "qualname", ""),
+               getattr(c, "start", 0), getattr(c, "end", 0))
+        if key in seen or getattr(c, "part_of", ""):
+            continue
+        seen.add(key)
+        out.append(c)
+    return out
+
+
+def _ast_symbol_span(root: Path | None, rel: str, token: str
+                     ) -> tuple[int, int] | None:
+    """Exact source span of `Class.method`/`method` when the file is Python.
+
+    A small class is indexed as one whole-class chunk, so a pin for one of its
+    methods would otherwise quote the entire class. The AST gives the method
+    its own definition boundary, which is what the user asked for.
+    """
+    if root is None or not rel.lower().endswith(".py"):
+        return None
+    try:
+        tree = ast.parse(fileio.read_text(root / rel))
+    except (OSError, SyntaxError, ValueError):
+        return None
+    parts = token.split(".")
+    method = parts[-1]
+    owner = parts[-2] if len(parts) > 1 else ""
+    spans: list[tuple[int, int]] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ClassDef):
+            if owner and node.name != owner:
+                continue
+            for child in node.body:
+                if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)) \
+                        and child.name == method:
+                    start = min([child.lineno] + [
+                        d.lineno for d in child.decorator_list])
+                    spans.append((start, child.end_lineno or start))
+    if not owner:
+        for node in tree.body:
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) \
+                    and node.name == method:
+                start = min([node.lineno] + [
+                    d.lineno for d in node.decorator_list])
+                spans.append((start, node.end_lineno or start))
+    distinct = sorted(set(spans))
+    return distinct[0] if len(distinct) == 1 else None
+
+
+def _symbol_pin(raw_token: str, token: str, chunk, root: Path | None
+                ) -> PinnedContext | None:
+    rel = getattr(chunk, "file", "")
+    if not rel:
+        return None
+    start = int(getattr(chunk, "start", 0) or 0)
+    end = int(getattr(chunk, "end", start) or start)
+    if getattr(chunk, "kind", "") == "classheader":
+        end = max(end, int(getattr(chunk, "scope_end", 0) or 0))
+    span = _ast_symbol_span(root, rel, token)
+    if span:
+        start, end = span
+    lines = _read_lines(root, rel)
+    if lines:
+        start = max(1, min(start or 1, len(lines)))
+        end = max(start, min(end or start, len(lines)))
+        content = "\n".join(lines[start - 1:end])
+    else:
+        content = str(getattr(chunk, "source", "") or "")
+        if not content:
+            return None
+    name = token.strip()
+    return PinnedContext(raw_token=raw_token, kind="symbol", path=rel,
+                         symbol_name=name, start_line=start,
+                         end_line=end, content=content)
+
+
+def _file_pin(raw_token: str, rel: str, root: Path | None) -> PinnedContext:
+    lines = _read_lines(root, rel)
+    while lines and lines[-1] == "":
+        lines.pop()
+    content = "\n".join(lines)
+    return PinnedContext(raw_token=raw_token, kind="file", path=rel,
+                         start_line=1 if lines else 0,
+                         end_line=len(lines), content=content)
+
+
+def _trim_token(token: str) -> str:
+    token = (token or "").strip()
+    while token and token[-1] in _TRAILING_PUNCT:
+        token = token[:-1]
+    return token
+
+
+def _resolve_token(token: str, raw_token: str, index_or_root
+                   ) -> list[PinnedContext]:
+    root, index = _split_root_index(index_or_root)
+    files = _workspace_files(root, index)
+    token = _trim_token(token)
+    if not token:
+        return []
+
+    # `file.py:symbol` -- scope the symbol lookup to that file.
+    if ":" in token:
+        left, right = token.split(":", 1)
+        rel = _resolve_file(left, files)
+        if rel:
+            if not right.strip():
+                return [_file_pin(raw_token, rel, root)]
+            hits = _symbol_hits(right.strip(), rel, root, index)
+            pins = [p for c in hits
+                    for p in [_symbol_pin(raw_token, right.strip(), c, root)]
+                    if p is not None]
+            return pins or [_file_pin(raw_token, rel, root)]
+
+    file_rel = _resolve_file(token, files)
+    hits = _symbol_hits(token, None, root, index)
+    file_like = ("/" in token or "\\" in token
+                 or _has_known_extension(token)
+                 or (file_rel is not None
+                     and token.lower() == file_rel.lower()))
+    if hits and not file_like:
+        pins = [p for c in hits
+                for p in [_symbol_pin(raw_token, token, c, root)]
+                if p is not None]
+        if pins:
+            return pins
+    if file_rel:
+        return [_file_pin(raw_token, file_rel, root)]
+    if hits:
+        return [p for c in hits
+                for p in [_symbol_pin(raw_token, token, c, root)]
+                if p is not None]
+    return []
+
+
+def _decorator_spans(prompt: str) -> list[tuple[int, int]]:
+    """Character spans of decorator lines inside fenced Python code."""
+    spans: list[tuple[int, int]] = []
+    for block in _PY_FENCE_RE.finditer(prompt):
+        start = block.start(1)
+        pos = 0
+        for line in block.group(1).splitlines(True):
+            if line.lstrip().startswith("@") and len(line.lstrip()) > 1:
+                spans.append((start + pos, start + pos + len(line)))
+            pos += len(line)
+    return spans
+
+
+def _pin_key(pin: PinnedContext) -> tuple:
+    return (pin.kind, fileio.path_key(pin.path), pin.symbol_name,
+            pin.start_line, pin.end_line)
+
+
+def _dedupe_pins(pins: list[PinnedContext]) -> list[PinnedContext]:
+    out: list[PinnedContext] = []
+    seen: set[tuple] = set()
+    for pin in pins:
+        key = _pin_key(pin)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(pin)
+    return out
+
+
+def parse_pinned_references(prompt: str, index_or_root
+                            ) -> list[PinnedContext]:
+    """Resolve `@file` and `@symbol` mentions in `prompt`.
+
+    Files match an exact relative path, a unique basename, or an unambiguous
+    case-insensitive prefix/fuzzy match. Symbols match an exact qualname
+    (`Class.method`, `file.py:symbol`) or a unique indexed member name.
+    Email addresses (`name@domain.com`) and decorator lines inside fenced
+    Python blocks are ignored. Resolution order follows the prompt, and each
+    resolved item is deduplicated by (kind, path, symbol, line span).
+    """
+    text = str(prompt or "")
+    if not text:
+        return []
+    ignored = _decorator_spans(text)
+    pins: list[PinnedContext] = []
+    for match in _MENTION_RE.finditer(text):
+        if any(a <= match.start() < b for a, b in ignored):
+            continue
+        token = _trim_token(match.group(1))
+        if not token:
+            continue
+        pins.extend(_resolve_token(token, "@" + token, index_or_root))
+    return _dedupe_pins(pins)
+
+
+def resolve_pinned_references(values, index_or_root) -> list[PinnedContext]:
+    """Resolve an explicit `pinned` request list (`["@a.py", "Class.run"]`).
+
+    A dict item from the GUI's autocomplete uses its `insert`, `label` or
+    `path` field. Leading `@` is optional; order is preserved and duplicate
+    resolutions collapse.
+    """
+    if isinstance(values, str):
+        values = [values]
+    pins: list[PinnedContext] = []
+    for value in values or ():
+        if isinstance(value, dict):
+            value = (value.get("insert") or value.get("label")
+                     or value.get("path") or value.get("file") or "")
+        token = _trim_token(str(value or "").strip().lstrip("@").strip())
+        if not token:
+            continue
+        pins.extend(_resolve_token(token, "@" + token, index_or_root))
+    return _dedupe_pins(pins)
+
+
+def render_pinned_context(pins) -> str:
+    """Prompt-ready `--- pinned ...` blocks, or "" when nothing resolved."""
+    parts: list[str] = []
+    for pin in pins or ():
+        if pin.kind == "symbol":
+            head = (f"--- pinned symbol {pin.symbol_name} "
+                    f"({pin.path} L{pin.start_line}-{pin.end_line})")
+        else:
+            head = (f"--- pinned file {pin.path} "
+                    f"(L{pin.start_line}-{pin.end_line})")
+        parts.append(head + "\n" + (pin.content or ""))
+    return "\n\n".join(parts)
+
+
+def pinned_summary(pins) -> str:
+    """`pedacito/llm.py, ScientificCalculator.evaluate_expression`."""
+    labels: list[str] = []
+    for pin in pins or ():
+        label = pin.symbol_name if pin.kind == "symbol" else pin.path
+        if label and label not in labels:
+            labels.append(label)
+    return ", ".join(labels)
+
+
+def _match_score(query: str, text: str) -> float:
+    """A fast, deterministic fuzzy score (0 = no match)."""
+    if not query:
+        return 1.0
+    q, t = query.lower(), text.lower()
+    if not q or not t:
+        return 0.0
+    base = t.rsplit("/", 1)[-1]
+    if t == q:
+        return 100.0
+    if base == q:
+        return 96.0
+    if t.endswith("/" + q):
+        return 92.0
+    if base.startswith(q):
+        return 84.0
+    if t.startswith(q):
+        return 78.0
+    if q in base:
+        return 64.0 - min(20.0, (len(base) - len(q)) * 0.2)
+    if q in t:
+        return 54.0 - min(20.0, (len(t) - len(q)) * 0.1)
+    # subsequence: `pdcgui` finds `pedacito/gui/server.py`
+    pos = 0
+    for ch in q:
+        pos = t.find(ch, pos)
+        if pos < 0:
+            break
+        pos += 1
+    else:
+        return 34.0
+    ratio = difflib.SequenceMatcher(None, q, t).ratio()
+    return ratio * 40.0 if ratio >= 0.55 else 0.0
+
+
+def suggest_context(index_or_root, query: str = "", limit: int = 20) -> list[dict]:
+    """Fast autocomplete entries for the GUI's `@` menu.
+
+    Returns up to `limit` dicts shaped `{"kind", "label", "insert", "detail"}`
+    for workspace files and indexed AST symbols, sorted by a fuzzy score.
+    """
+    root, index = _split_root_index(index_or_root)
+    q = str(query or "").strip().lstrip("@")
+    try:
+        limit = max(1, min(50, int(limit or 20)))
+    except (TypeError, ValueError):
+        limit = 20
+    files = _workspace_files(root, index)
+
+    scored: list[tuple[float, int, dict]] = []
+    for rel in files:
+        score = _match_score(q, rel)
+        if score <= 0:
+            continue
+        scored.append((score, 0, {
+            "kind": "file", "label": rel, "insert": "@" + rel,
+            "detail": "workspace file"}))
+    seen_symbols: set[str] = set()
+    for chunk in _symbol_records(root, index):
+        if getattr(chunk, "kind", "") in ("module", "reference"):
+            continue
+        if getattr(chunk, "part_of", ""):
+            continue
+        name = str(getattr(chunk, "qualname", "") or "")
+        if not name or name in seen_symbols:
+            continue
+        score = _match_score(q, name)
+        # A symbol's file is useful context in the query too.
+        if score <= 0 and getattr(chunk, "file", ""):
+            score = _match_score(q, str(chunk.file)) * 0.8
+        seen_symbols.add(name)
+        if score > 0:
+            detail = (f"{chunk.file}:{chunk.start}-{chunk.end} "
+                      f"{getattr(chunk, 'kind', 'symbol')}")
+            scored.append((score, 1, {
+                "kind": "symbol", "label": name, "insert": "@" + name,
+                "detail": detail}))
+        # A small class is indexed whole; its methods are still AST symbols a
+        # user can pin (`@Class.method`). Offer them as first-class entries.
+        members = getattr(chunk, "members", ()) or ()
+        for member in members:
+            child = f"{name}.{member}"
+            if child in seen_symbols:
+                continue
+            child_score = _match_score(q, child)
+            if child_score <= 0:
+                continue
+            seen_symbols.add(child)
+            scored.append((child_score, 1, {
+                "kind": "symbol", "label": child,
+                "insert": "@" + child,
+                "detail": f"{chunk.file} (method of {name})"}))
+    scored.sort(key=lambda row: (-row[0], row[1], len(row[2]["label"]),
+                                 row[2]["label"].lower()))
+    return [row[2] for row in scored[:limit]]

@@ -317,12 +317,16 @@ const S = {
   mode: savedMode,
   creative: savedCreative,
   drafts: savedDraft ? { [savedMode]: savedDraft } : {}, attachments: [],
+  pinned: [],                              // explicit @file/@symbol picks (session)
   opts: (() => { try { return JSON.parse(localStorage.getItem('pedacito_opts') || '{}'); } catch (e) { return {}; } })(),
   ui: { diffOpen: false, wsCollapsed: false, termFollow: true, optsOpen: false,
         diffMode: localStorage.getItem('pedacito_diff_mode') || 'split',
         view: 'chat', folds: {}, planEditing: false, pendingProfile: null,
         refining: false, previousPrompt: null, switchingProfile: false,
         actionBusy: false, planGenerating: false, planGenFrom: null,
+        // `@` autocomplete: the open floating menu, its items and the
+        // [start,end) text range the chosen insert replaces.
+        suggest: null, suggestSeq: 0,
         // Task-vs-Auto suitability: the debounced /api/mode-check verdict for
         // the current Auto draft, the pre-run confirmation bar, and the draft
         // text the user already acknowledged with "Continue with Auto".
@@ -530,6 +534,7 @@ function adoptNewProject(root) {
 function applyStatus(s) {
   const prev = S.status;
   S.status = s;
+  if (prev && prev.root !== s.root && S.pinned.length) S.pinned = [];
   syncPermissionModal(s);               // live permission requests open the modal
   if (prev.active_thread_id && s.active_thread_id && s.active_thread_id !== prev.active_thread_id) {
     S.msgs = [];                       // a different conversation: the ids
@@ -1152,6 +1157,14 @@ async function send(forceAuto) {
   }
   const body = { mode: S.mode, text: text, attachments: S.attachments.slice() };
   OPTS[S.mode].forEach((d) => { body[d.k] = opt(S.mode, d.k); });
+  // Explicit context pins from the `@` picker ride as a request-level list so
+  // they survive edits to the prompt text. Prompt @mentions are parsed again
+  // server-side; duplicates collapse there.
+  if (S.pinned.length && (S.mode === 'task' || S.mode === 'auto'
+                          || S.mode === 'explain')) {
+    body.pinned = S.pinned.map((p) => p.insert || p.label)
+      .filter(Boolean).map((s) => String(s).replace(/^@/, ''));
+  }
   // The ✨ toggle forces Creative mode for this run; when off, the agent
   // still auto-detects design/UI tasks (creative_auto).
   if (S.mode === 'task' || S.mode === 'auto' || S.mode === 'new') body.creative = !!S.creative;
@@ -3007,6 +3020,8 @@ function TopBar() {
           <//>
         </div>
         <div id="topRight">
+          <button id="rulesBtn" title="edit persistent project rules (.pedacito/rules.md) applied to every Task, Auto and Refine call"
+                  onClick=${openRulesDialog}>\uD83D\uDCDC Rules</button>
           <button id="serversBtn" title="live VRAM/RAM and local model-server lifecycle"
                   onClick=${() => serversDialog()}>Servers</button>
           <button id="benchBtn" title="run a diagnostic benchmark against a configured profile" onClick=${() => openBenchmarks()}>\u25A6 Benchmarks</button>
@@ -3443,6 +3458,101 @@ function toggleCreative() {
   emit();
 }
 
+// ---- @file / @symbol autocomplete -------------------------------------------
+// The menu is deliberately tiny: the server already fuzzy-matches the warm
+// index, so each keystroke is one GET and no model work. Boundary matching
+// keeps an email (`user@example.com`) from opening it.
+let ctxSuggestTimer = 0;
+function contextMention(text, caret) {
+  const before = String(text || '').slice(0, caret == null ? String(text || '').length : caret);
+  const m = before.match(/(^|[\s([{,;:])@([A-Za-z0-9_][A-Za-z0-9_./:\\-]*)$/);
+  if (!m) return null;
+  return { query: m[2], start: m.index + m[1].length, end: caret };
+}
+function clearContextSuggest() {
+  S.ui.suggestSeq = (S.ui.suggestSeq || 0) + 1;
+  if (S.ui.suggest) { S.ui.suggest = null; emit(); }
+}
+function requestContextSuggest(text, caret) {
+  const m = contextMention(text, caret);
+  if (!m) { clearContextSuggest(); return; }
+  const seq = (S.ui.suggestSeq || 0) + 1;
+  S.ui.suggestSeq = seq;
+  clearTimeout(ctxSuggestTimer);
+  ctxSuggestTimer = setTimeout(() => {
+    PDC.api('/api/context/suggest?q=' + encodeURIComponent(m.query)).then((j) => {
+      if (seq !== S.ui.suggestSeq) return;      // a newer keystroke won
+      const items = (j.items || j.suggestions || []).slice(0, 20);
+      S.ui.suggest = items.length
+        ? { items: items, index: 0, start: m.start, end: m.end, query: m.query }
+        : null;
+      emit();
+    }, () => { if (seq === S.ui.suggestSeq) { S.ui.suggest = null; emit(); } });
+  }, 70);
+}
+function insertPinned(item) {
+  const ta = inputEl || $('input');
+  const st = S.ui.suggest;
+  if (!ta || !st) return;
+  const text = ta.value || '';
+  const token = String(item.insert || ('@' + item.label)) + ' ';
+  const before = text.slice(0, st.start), after = text.slice(st.end);
+  ta.value = before + token + after;
+  const pos = (before + token).length;
+  try { ta.setSelectionRange(pos, pos); } catch (e) {}
+  ta.focus();
+  S.drafts[S.mode] = ta.value;
+  writeDraft(ta.value);
+  S.ui.suggest = null;
+  S.ui.suggestSeq = (S.ui.suggestSeq || 0) + 1;
+  if (!S.pinned.some((p) => p.insert === item.insert)) {
+    S.pinned.push({ kind: item.kind, label: item.label,
+                    insert: item.insert, detail: item.detail || '' });
+  }
+  emit();
+}
+function removePinned(i) {
+  S.pinned.splice(i, 1);
+  emit();
+}
+
+// ---- persistent project rules (.pedacito/rules.md) --------------------------
+function openRulesDialog() {
+  if (!S.status.root) { PDC.toast('Open a project first.', true); return; }
+  PDC.api('/api/rules').then((j) => {
+    if (j._status !== 200 || !j.ok) {
+      PDC.toast(j.detail || 'Could not read project rules.', true);
+      return;
+    }
+    const ta = h('textarea', { class: 'rules-editor', rows: '16',
+      spellcheck: false, placeholder:
+        'Project-specific rules every Task, Auto and Refine call must follow.\n' +
+        'Examples:\n- Use pathlib, never os.path\n- Tests live in tests/ and use pytest\n' +
+        '- Never edit generated files under build/',
+      value: j.text || '' });
+    const info = h('p', { class: 'muted small-text', style: 'margin:0 0 8px',
+      text: 'Saved as .pedacito/rules.md and injected into the static prompt prefix, ' +
+            'so it rides the cached KV prefix on local and local-moe servers.' });
+    const note = h('p', { class: 'muted small-text', style: 'margin:8px 0 0',
+      text: 'Empty content clears the file.' });
+    PDC.modal('Project Rules (.pedacito/rules.md)',
+      h('div', {}, info, ta, note), [
+        { label: 'Cancel' },
+        { label: 'Clear', danger: true, stay: true, onclick: () => { ta.value = ''; ta.focus(); } },
+        { label: 'Save rules', primary: true, stay: true, onclick: (close) => {
+            PDC.api('/api/rules', { text: ta.value }).then((r) => {
+              if (r._status !== 200 || !r.ok) {
+                PDC.toast(r.detail || 'Could not save rules.', true);
+                return;
+              }
+              PDC.toast(r.exists ? 'Project rules saved.' : 'Project rules cleared.');
+              close();
+            }, () => PDC.toast('The GUI server did not answer.', true));
+          } },
+      ], { wide: true });
+  });
+}
+
 function Composer() {
   const s = S.status, j = job(), m = MODES[S.mode] || MODES.task;
   const taRef = useRef(null);
@@ -3547,15 +3657,75 @@ function Composer() {
             <button title="remove" onClick=${() => { S.attachments.splice(i, 1); emit(); }}>\u2715</button>
           </span>`)}
       </div>
+      ${S.pinned.length ? html`
+        <div id="pinnedRow" title="Explicit context pinned for this session (also sent as request pins)">
+          <span class="pinned-title">\uD83D\uDCCC Pinned</span>
+          ${S.pinned.map((p, i) => html`
+            <span key=${'p' + i} class=${'pin ' + (p.kind === 'symbol' ? 'symbol' : 'file')}
+                  title=${p.detail || p.label}>
+              ${p.kind === 'symbol' ? '\u0192' : '\u25A4'} ${p.label}
+              <button title="unpin" onClick=${() => removePinned(i)}>\u2715</button>
+            </span>`)}
+          <button class="pin-clear" title="unpin everything" onClick=${() => { S.pinned = []; emit(); }}>clear</button>
+        </div>` : null}
       <textarea id="input" rows="3" spellcheck="true" ref=${taRef}
                 placeholder=${isHow ? m.ph : (j ? (steerable ? 'Type a note to steer the model (Enter)\u2026' : 'Working\u2026 press Stop to cancel.') : m.ph)}
                 disabled=${!!j && !steerable && !isHow}
                 oninput=${(e) => { S.drafts[S.mode] = e.target.value;
                   writeDraft(e.target.value);       // F5 must not lose it
                   scheduleModeCheck(e.target.value);
+                  requestContextSuggest(e.target.value, e.target.selectionStart);
                   const rb = $('refineBtn');
                   if (rb) rb.disabled = S.ui.refining || !e.target.value.trim(); }}
-                onkeydown=${(e) => { if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) { e.preventDefault(); send(); } }} />
+                onclick=${(e) => requestContextSuggest(e.target.value, e.target.selectionStart)}
+                onblur=${() => setTimeout(() => { if (S.ui.suggest) clearContextSuggest(); }, 180)}
+                onkeydown=${(e) => {
+                  const sg = S.ui.suggest;
+                  if (sg && sg.items.length) {
+                    if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+                      e.preventDefault();
+                      const n = sg.items.length;
+                      sg.index = (sg.index + (e.key === 'ArrowDown' ? 1 : n - 1)) % n;
+                      emit();
+                      return;
+                    }
+                    if (e.key === 'Enter' || e.key === 'Tab') {
+                      e.preventDefault();
+                      insertPinned(sg.items[sg.index] || sg.items[0]);
+                      return;
+                    }
+                    if (e.key === 'Escape') {
+                      e.preventDefault(); clearContextSuggest(); return;
+                    }
+                  }
+                  if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) {
+                    e.preventDefault(); clearContextSuggest(); send();
+                  }
+                }} />
+      ${(() => {
+        const sg = S.ui.suggest;
+        if (!sg || !sg.items.length) return null;
+        const ta = taRef.current;
+        const style = ta
+          ? ('left:' + ta.offsetLeft + 'px;width:' + ta.offsetWidth +
+             'px;bottom:calc(100% - ' + Math.max(0, ta.offsetTop - 4) + 'px)')
+          : '';
+        return html`
+          <div id="ctxMenu" role="listbox" aria-label="Pin file or symbol context" style=${style}>
+            <div class="ctx-head">Pin context \u00B7 ${sg.query ? '@' + sg.query : 'files & symbols'}</div>
+            ${sg.items.map((x, i) => html`
+              <button key=${'ctx' + i} type="button" role="option"
+                      aria-selected=${i === sg.index ? 'true' : 'false'}
+                      class=${'ctx-item' + (i === sg.index ? ' on' : '')}
+                      onMouseDown=${(ev) => ev.preventDefault()}
+                      onClick=${() => insertPinned(x)}>
+                <span class="ctx-kind">${x.kind === 'symbol' ? '\u0192' : '\u25A4'}</span>
+                <span class="ctx-label">${x.insert || ('@' + x.label)}</span>
+                <span class="ctx-detail">${x.detail || ''}</span>
+              </button>`)}
+            <div class="ctx-foot">\u2191\u2193 move \u00B7 Enter/Tab insert \u00B7 Esc dismiss</div>
+          </div>`;
+      })()}
       <div id="optsBox" key=${S.mode} hidden=${!S.ui.optsOpen}>
         <div class="opts-grid">${OPTS[S.mode].filter((o) => o.type !== 'check' && !(S.mode === 'new' && o.k === 'project')).map((o, idx) => html`<${OptField} key=${'g' + idx} o=${o} />`)}</div>
         ${OPTS[S.mode].some((o) => o.type === 'check') ? html`<div class="opts-checks">${OPTS[S.mode].filter((o) => o.type === 'check').map((o, idx) => html`<${OptField} key=${'c' + idx} o=${o} />`)}</div>` : null}

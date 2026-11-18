@@ -845,6 +845,30 @@ def _apply_security_choices(cfg, opts: dict) -> None:
         pass
 
 
+def _set_pinned_refs(cfg, opts: dict) -> None:
+    """Attach the composer's explicit pinned context to this run.
+
+    The prompt's own `@file`/`@symbol` mentions are parsed by the agent; this
+    list carries the Pinned pills (and API clients' `pinned` payload) so a
+    pin survives even when the visible prompt text no longer shows the token.
+    """
+    values = opts.get("pinned") or []
+    if isinstance(values, dict):
+        values = [values]
+    refs: list[str] = []
+    for value in values if isinstance(values, (list, tuple, set)) else [values]:
+        if isinstance(value, dict):
+            value = (value.get("insert") or value.get("label")
+                     or value.get("path") or value.get("file") or "")
+        text = str(value or "").strip().lstrip("@").strip()
+        if text and text not in refs:
+            refs.append(text)
+    try:
+        cfg._pinned_refs = refs
+    except Exception:
+        pass
+
+
 def _security_post_run(root, cfg, files=None) -> None:
     """Refresh and announce the non-blocking workspace security banner."""
     try:
@@ -873,6 +897,7 @@ def run_task(job: Job, opts: dict) -> None:
     steps = int(opts.get("steps") or 0)
     cfg, client, root = p.cfg, p.client, p.root
     _apply_security_choices(cfg, opts)
+    _set_pinned_refs(cfg, opts)
 
     _evict_other_servers(cfg)
     saved_steps = cfg.max_steps
@@ -1005,6 +1030,7 @@ def run_explain(job: Job, opts: dict) -> None:
         p = _project()
     _echo_user("explain", opts.get("text", "") or question,
                opts.get("attachments"), opts)
+    _set_pinned_refs(p.cfg, opts)
     _evict_other_servers(p.cfg)
     with session(p, job, interactive=False, lock=False) as feed:
         p.client.warmup()
@@ -1116,6 +1142,7 @@ def run_auto(job: Job, opts: dict) -> None:
         STATE.last_auto = {"text": opts.get("text", ""), "plan_file": plan_file}
     cfg, client, root = p.cfg, p.client, p.root
     _apply_security_choices(cfg, opts)
+    _set_pinned_refs(cfg, opts)
     _evict_other_servers(cfg)
     plan_path = Path(plan_file) if plan_file else root / cfg.auto_plan_file
     if not plan_path.is_absolute():

@@ -1127,6 +1127,10 @@ class State:
                       "detail": ", ".join(str(x)
                                           for x in (f.get("files") or []))[:120],
                       "ok": True}
+        elif kind == "pinned_context":
+            action = {"tool": "pinned-context",
+                      "detail": str(f.get("summary") or "")[:120],
+                      "ok": True}
         elif kind == "verify":
             action = {"tool": "verify",
                       "detail": f"round {f.get('round', '?')}: "

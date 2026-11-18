@@ -56,6 +56,7 @@ from . import mcp as mcp_mod
 from . import memory as memory_mod
 from . import prompts as prompts_mod
 from . import safety
+from . import select as select_mod
 from . import sessions as sessions_mod
 from . import skills as skills_mod
 from . import steering as steering_mod
@@ -1125,6 +1126,9 @@ def _trim_gathered(src: str, too_big, requirements=None, diagnostics=None,
         if hasattr(requirements, "pinned_spans") else []
     pins += _diagnostic_pins(diagnostics)
     pinned = {i for i, m in enumerate(metas) if _item_has_pin(m, pins)}
+    # Explicitly pinned context blocks are never eligible for eviction, no
+    # matter how tight the request budget is.
+    pinned |= {i for i, m in enumerate(metas) if m.kind == "pinned"}
     terms = requirements.packing_terms() \
         if hasattr(requirements, "packing_terms") else []
     anchor_files = {rel for rel, _a, _b in pins if rel}
@@ -1318,6 +1322,14 @@ class Agent:
         self.index = index
         self.client = client
         self.cfg = cfg
+        # Keep the prompt layer's project-root pointer valid before gather():
+        # persistent rules and prompt overrides resolve from it, and callers
+        # (tests, scaffold, explain) may ask for an answer without a lookup.
+        try:
+            if getattr(index, "root", None) is not None:
+                self.cfg._root = str(index.root)
+        except Exception:
+            pass
         # The tool dispatcher resolves a `task` subagent's parent through this
         # back-reference (kept out of dispatch()'s call signature so existing
         # monkeypatched dispatchers remain compatible).
@@ -1328,6 +1340,11 @@ class Agent:
         # Set by gather(); _repair_source() falls back to it for files no
         # longer on disk.
         self.gathered_source = ""
+        # Explicitly pinned context resolved from the task's @mentions and
+        # the request's `pinned` list. `pinned_context` is already-rendered
+        # source placed ahead of every automatically retrieved item.
+        self.pinned_items: list = []
+        self.pinned_context = ""
         # When set, gather() mines "files the task will change" from this text
         # (the clean plan title) instead of the full prompt, so goal prose and
         # prior reports do not become forced must-reads.
@@ -2245,6 +2262,30 @@ class Agent:
         self._set_site("gather", gclient)
         self._prime_fewshot(gclient)
         repo_map, tier = self._map(task)
+        # Explicit context pins are resolved BEFORE automatic retrieval: the
+        # task's `@file`/`@symbol` mentions plus any request-level `pinned`
+        # list. Their source text is placed ahead of the map in user0 and is
+        # never subject to automatic scoring/eviction.
+        self.pinned_items = []
+        self.pinned_context = ""
+        try:
+            pins = select_mod.parse_pinned_references(task, self.index)
+            pins.extend(select_mod.resolve_pinned_references(
+                getattr(self.cfg, "_pinned_refs", ()) or (), self.index))
+            self.pinned_items = select_mod._dedupe_pins(pins)
+        except Exception:
+            self.pinned_items = []
+        if self.pinned_items:
+            self.pinned_context = select_mod.render_pinned_context(
+                self.pinned_items)
+            summary = select_mod.pinned_summary(self.pinned_items)
+            print(f"Pinned context: {summary}", file=sys.stderr)
+            self._emit(
+                "pinned_context", summary=summary,
+                items=[{"kind": p.kind, "path": p.path,
+                        "symbol": p.symbol_name,
+                        "start": p.start_line, "end": p.end_line}
+                       for p in self.pinned_items])
         hint = {"flat": FLAT_HINT, "cards": CARDS_HINT,
                 "ranked": RANKED_HINT}.get(tier, DIRS_HINT)
         system = prompts_mod.gather_system(
@@ -2311,7 +2352,12 @@ class Agent:
             examples = fewshot_block(
                 self._fewshot_shots(FEWSHOT_USER0_READ_LINES),
                 schema_for(self.cfg))
+        pinned_section = ""
+        if self.pinned_context:
+            pinned_section = ("### Explicitly Pinned Context\n\n"
+                              + self.pinned_context + "\n\n")
         user0 = (lead + "\n\n" if lead else "") \
+            + pinned_section \
             + f"PROJECT MAP\n\n{repo_map}\n\n" \
             + (examples + "\n\n" if examples else "") + f"TASK\n{task}"
         if safety.has_secret(task) and is_hosted(self.cfg) \
@@ -2383,7 +2429,12 @@ class Agent:
         self.cfg._task_reads = spans
         self.cfg._task_allowlist = self._task_file_targets(self._targets_text)
         # Charged per NEW byte, so re-reading lines already in context is free.
-        budget = self.cfg.max_gathered_chars
+        # Explicit pins are allocated first: automatic retrieval only gets
+        # what remains after their (already-injected) source.
+        pinned_chars = (len(self.pinned_context)
+                        + (len("### Explicitly Pinned Context\n\n")
+                           if self.pinned_context else 0))
+        budget = max(0, int(self.cfg.max_gathered_chars) - pinned_chars)
 
         def nudge(step: int) -> str:
             """Suffix telling the model how many lookups remain."""
@@ -3310,6 +3361,11 @@ class Agent:
         digest = self._read_digest(spans)
         if digest:
             new_items = new_items + [digest]
+        # Pinned source is part of the SELECTED context, not a lookup result:
+        # keep it first so every downstream packer sees it before automatic
+        # evidence and can never drop it.
+        if self.pinned_context:
+            new_items = [self.pinned_context] + new_items
         self.gathered_source = "\n\n".join(new_items)
         self._emit("gather_done", steps=step, files_read=len(spans),
                    folds=self.fold_count, lossy=self._lossy,
@@ -4747,7 +4803,9 @@ class Agent:
         if include_edit_format:
             brief += "\n\n" + prompts_mod.edit_format(self.cfg, EDIT_FORMAT,
                                                       creative=creative)
-        return brief
+        # A caller-supplied brief (scaffold, explain) still obeys the project's
+        # persistent rules; answer_system already carries them for the default.
+        return prompts_mod.with_project_rules(brief, self.cfg)
 
     def _answer_mode(self) -> str:
         """rebuild | continue | auto: the setting, else the model card, else
@@ -4857,9 +4915,17 @@ class Agent:
             notes_prefix += mcp_notes + "\n\n"
         src = gathered or "(nothing was looked up)"
         need_hint = _NEED_HINT if self._rehydration_rounds_left() else ""
+        # Pinned source is rendered as its own section before the map/source,
+        # so automatic packing can trim only the automatic evidence below it.
+        pinned = getattr(self, "pinned_context", "") or ""
+        if pinned and pinned in src:
+            src = src.replace(pinned, "", 1).strip() \
+                or "(nothing was looked up)"
+        pin_section = ("### Explicitly Pinned Context\n\n" + pinned + "\n\n"
+                       if pinned else "")
 
         def assemble(notes: str, rmap: str, source: str) -> str:
-            return (notes + f"PROJECT MAP\n\n{rmap}\n\n"
+            return (notes + pin_section + f"PROJECT MAP\n\n{rmap}\n\n"
                     f"SOURCE YOU REQUESTED\n\n{source}\n\n"
                     f"TASK\n{task}" + need_hint)
 
