@@ -21,8 +21,10 @@ from http.server import BaseHTTPRequestHandler
 from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlparse
 
+from .. import checkpoints as checkpoints_mod
 from .. import review as review_mod
 from .. import prompts as prompts_mod
+from .. import runner as runner_mod
 from .. import security, themes as themes_mod, workspace
 from ..config import ConfigError
 from ..local_server import LocalHTTPServer
@@ -376,6 +378,164 @@ def _rules_post(q, body):
 def _backups(q, body=None):
     """Backup snapshots for the WORKSPACE panel's BACKUPS tab."""
     return 200, {"backups": backup_snapshots()}
+
+
+# --- time-travel checkpoints --------------------------------------------------
+
+def _reindex_after_restore(restored, deleted) -> None:
+    """Keep an open index in step with files a checkpoint restore touched."""
+    try:
+        from .. import index as index_mod
+        with STATE.lock:
+            idx, cfg = STATE.idx, STATE.cfg
+        if idx is None or cfg is None:
+            return
+        for rel in restored:
+            idx = index_mod.reindex_file(idx, rel, cfg, save=False)
+        for rel in deleted:
+            idx.forget(rel)
+        idx.save()
+        with STATE.lock:
+            STATE.idx = idx
+        STATE.apply_index(idx)
+    except Exception:
+        pass
+
+
+@get("/api/checkpoints")
+def _checkpoints_list(q, body=None):
+    """The checkpoint tree for the active workspace."""
+    root = _project_root()
+    if root is None:
+        return 400, {"ok": False, "detail": "No project is open."}
+    try:
+        items = checkpoints_mod.list_checkpoints(root)
+        head = checkpoints_mod.head_id(root)
+    except OSError as e:
+        return 400, {"ok": False, "detail": str(e)}
+    return 200, {
+        "ok": True,
+        "root": str(root),
+        "head_id": head,
+        "checkpoints": [dict(cp) for cp in items],
+        "count": len(items),
+    }
+
+
+@get("/api/checkpoints/diff")
+def _checkpoints_diff(q, body=None):
+    """Unified diff for one checkpoint, against its parent or the live tree."""
+    root = _project_root()
+    if root is None:
+        return 400, {"ok": False, "detail": "No project is open."}
+    checkpoint_id = str(q.get("id", [""])[0] or "")
+    against = str(q.get("against", ["workspace"])[0] or "workspace").lower()
+    if not checkpoint_id:
+        return 400, {"ok": False, "detail": "An id is required."}
+    if against not in ("parent", "workspace"):
+        return 400, {"ok": False,
+                     "detail": "against must be 'parent' or 'workspace'."}
+    try:
+        out = checkpoints_mod.diff_checkpoint(root, checkpoint_id,
+                                              against=against)
+    except checkpoints_mod.CheckpointError as e:
+        return 404, {"ok": False, "detail": str(e)}
+    except OSError as e:
+        return 400, {"ok": False, "detail": str(e)}
+    out["ok"] = True
+    return 200, out
+
+
+@post("/api/checkpoints/create")
+def _checkpoints_create(q, body):
+    """Record a manual named checkpoint (the header's pin button)."""
+    root = _project_root()
+    if root is None:
+        return 400, {"ok": False, "detail": "No project is open."}
+    label = str(body.get("label") or body.get("name")
+                or "manual checkpoint")
+    try:
+        cp = checkpoints_mod.create_checkpoint(root, label, mode="manual")
+    except (checkpoints_mod.CheckpointError, OSError) as e:
+        return 400, {"ok": False, "detail": str(e)}
+    STATE.add_message("system", f"Checkpoint {cp['id']} recorded.",
+                      kind="checkpoint")
+    return 200, {"ok": True, "checkpoint": cp}
+
+
+@post("/api/checkpoints/restore")
+def _checkpoints_restore(q, body):
+    """Restore the whole workspace, or named files, from one checkpoint."""
+    root = _project_root()
+    if root is None:
+        return 400, {"ok": False, "detail": "No project is open."}
+    checkpoint_id = str(body.get("id") or body.get("checkpoint") or "")
+    if not checkpoint_id:
+        return 400, {"ok": False, "detail": "A checkpoint id is required."}
+    files = body.get("files")
+    if files is None and body.get("file"):
+        files = [body.get("file")]
+    if isinstance(files, str):
+        files = [files]
+    try:
+        out = checkpoints_mod.restore_checkpoint(root, checkpoint_id,
+                                                 files=files)
+    except checkpoints_mod.CheckpointError as e:
+        return 404, {"ok": False, "detail": str(e)}
+    except OSError as e:
+        return 400, {"ok": False, "detail": str(e)}
+    _reindex_after_restore(out.get("restored") or [],
+                           out.get("deleted") or [])
+    detail = (f"Restored {out['files']} file(s) from {out['checkpoint']}."
+              + (f" Removed {len(out['deleted'])} created file(s)."
+                 if out.get("deleted") else ""))
+    STATE.add_message("system", detail, kind="restored")
+    out["detail"] = detail
+    return 200, out
+
+
+# --- live runner / preview ----------------------------------------------------
+
+@get("/api/runner/targets")
+def _runner_targets(q, body=None):
+    """Detected web previews and runnable commands for the workspace."""
+    root = _project_root()
+    if root is None:
+        return 400, {"ok": False, "detail": "No project is open."}
+    try:
+        targets = runner_mod.detect_runnable_targets(root)
+    except OSError as e:
+        return 400, {"ok": False, "detail": str(e)}
+    return 200, {"ok": True, **targets}
+
+
+@post("/api/runner/exec")
+def _runner_exec(q, body):
+    """Run one detected target or a custom command; never uses a shell."""
+    root = _project_root()
+    if root is None:
+        return 400, {"ok": False, "detail": "No project is open."}
+    command = body.get("command") or body.get("cmd")
+    target_id = str(body.get("id") or body.get("target") or "")
+    if not command and target_id:
+        try:
+            targets = runner_mod.detect_runnable_targets(root)
+        except OSError as e:
+            return 400, {"ok": False, "detail": str(e)}
+        for target in targets["commands"]:
+            if target.get("id") == target_id:
+                command = target
+                break
+        if not command:
+            return 404, {"ok": False,
+                         "detail": f"No runnable target {target_id!r}."}
+    timeout = body.get("timeout") or runner_mod.DEFAULT_TIMEOUT
+    try:
+        result = runner_mod.run_project_command(root, command,
+                                                timeout=timeout)
+    except (OSError, ValueError) as e:
+        return 400, {"ok": False, "detail": str(e)}
+    return 200, result
 
 
 @get("/api/file")
@@ -2024,11 +2184,27 @@ class _Handler(BaseHTTPRequestHandler):
         and may run its own inline scripts/styles. Sensitive files are never
         previewed. Relative asset links inside the page resolve back through
         /preview/ as well."""
+        self._serve_project_asset(rel)
+
+    def _runner_preview(self, rel: str) -> None:
+        """The Run tab's preview endpoint, with the same path-traversal gate
+        as /preview/ but no HTML-page restriction: stylesheets, scripts,
+        images, fonts, JSON, wasm and media all load from the project root."""
+        self._serve_project_asset(rel)
+
+    def _serve_project_asset(self, rel: str) -> None:
         root = STATE.root
         if root is None:
             self._send(404, b"no project open", "text/plain")
             return
-        p = _within(root, unquote(rel))
+        # unquote once, then resolve through the security gate: a literal
+        # `..`, an encoded `%2e%2e`, a symlink out of the tree and an
+        # absolute path all fail here before any byte is read.
+        raw = unquote(str(rel or ""))
+        if "\x00" in raw:
+            self._send(404, b"not found", "text/plain")
+            return
+        p = _within(root, raw)
         if p is None or not p.is_file():
             self._send(404, b"not found", "text/plain")
             return
@@ -2039,7 +2215,8 @@ class _Handler(BaseHTTPRequestHandler):
                  or mimetypes.guess_type(p.name)[0]
                  or "application/octet-stream")
         if ctype.startswith("text/") or ctype.endswith("javascript") \
-                or ctype in ("image/svg+xml", "application/json"):
+                or ctype in ("image/svg+xml", "application/json",
+                             "application/wasm"):
             ctype += "; charset=utf-8"
         try:
             data = p.read_bytes()
@@ -2055,8 +2232,10 @@ class _Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Security-Policy",
                          "default-src 'self' data: blob:; "
                          "style-src 'self' 'unsafe-inline'; "
-                         "script-src 'self' 'unsafe-inline'; "
+                         "script-src 'self' 'unsafe-inline' 'unsafe-eval'; "
                          "img-src 'self' data: blob:; "
+                         "media-src 'self' data: blob:; "
+                         "connect-src 'self' data: blob:; "
                          "frame-ancestors 'self'")
         self.end_headers()
         self.wfile.write(data)
@@ -2095,6 +2274,9 @@ class _Handler(BaseHTTPRequestHandler):
         query = parse_qs(url.query)
         if url.path == "/events":
             self._events(query)
+            return
+        if url.path.startswith("/api/runner/preview/"):
+            self._runner_preview(url.path[len("/api/runner/preview/"):])
             return
         if url.path.startswith("/preview/"):
             self._preview(url.path[len("/preview/"):])

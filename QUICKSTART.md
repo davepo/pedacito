@@ -693,6 +693,27 @@ During a task, the model can undo its own writes with the `undo` action (this
 needs `allow_write`, and backups are on by default). That reverts this task's
 snapshots and removes the files it created.
 
+For a finer rewind, every Task, Auto step and New scaffold also records a
+time-travel checkpoint (`.pedacito/checkpoints/`). Inspect the tree, restore a
+single file or the whole workspace, and branch a new run from any node:
+
+```bash
+pedacito undo ~/code/anki                    # state immediately before the last run
+pedacito checkpoints ~/code/anki             # ids, parents, modes, changed files
+pedacito checkout cp_0003_a1b2c3 ~/code/anki # restore the whole workspace
+pedacito checkout cp_0003 ~/code/anki --file app.py
+```
+
+The GUI header's **Checkpoints / Undo** button previews each checkpoint's
+unified diff and offers **Restore Entire Workspace**, **Restore Selected File**
+and **Branch Prompt From Here**. The TUI exposes `/checkpoints`, `/undo` and
+`/checkout ID`.
+
+The GUI's **Run** tab previews a static `index.html` live and runs detected
+entrypoints (`python main.py`, `pytest -q`, ...) or a custom command. A crash
+offers **Fix This Crash**, which fills the Task composer with the command,
+exit code and traceback. In the TUI use `/run [cmd]` and then `/fix`.
+
 ### B8. Ask a question (no edits)
 
 ```bash

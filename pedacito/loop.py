@@ -27,6 +27,7 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
+from . import checkpoints as checkpoints_mod
 from . import diagnostics, events as events_mod, hooks as hooks_mod
 from . import fileio
 from . import safety, workspace
@@ -346,6 +347,35 @@ def _task_title(task: str) -> str:
     if marker in body:
         body = body.split(marker, 1)[1]
     return body.split("\n", 1)[0]
+
+
+def checkpoint_mode(cfg) -> str:
+    """`auto` for a step owned by the outer loop, else `task`."""
+    return "auto" if getattr(cfg, "_auto_step", 0) else "task"
+
+
+def _checkpoint_task(root: Path, cfg, task: str, phase: str) -> dict | None:
+    """Record the pre-run baseline or the post-run checkpoint for one task.
+
+    Checkpointing is best-effort: a full disk or a racing process must never
+    turn a working task into a failed one.  Dry runs leave the tree untouched;
+    a review task records its pre-sign-off baseline here and its accepted
+    write in `_review`.
+    """
+    try:
+        mode = checkpoint_mode(cfg)
+        title = _task_title(task).strip()[:200] or "task"
+        if phase == "pre":
+            return checkpoints_mod.ensure_baseline(
+                root, f"baseline before {title}", mode=mode)
+        return checkpoints_mod.create_checkpoint(
+            root, title, mode=mode)
+    except Exception as e:
+        try:
+            workspace.log_event(root, f"checkpoint skipped: {e}", "WARN")
+        except Exception:
+            pass
+        return None
 
 
 # Clipping budget for investigation reports carried between tasks. Caveats can
@@ -3543,6 +3573,13 @@ def _review(root: Path, results, task: str, cfg, backup_dir, stamp: str,
 
     if outcome == "applied":
         print(f"  {detail}", file=sys.stderr)
+        # The sign-off is the Task's write: record its checkpoint now, so the
+        # next run branches from exactly what the user accepted.
+        try:
+            checkpoints_mod.create_checkpoint(
+                root, f"review: {task[:180]}", mode="task")
+        except Exception as e:
+            workspace.log_event(root, f"review checkpoint skipped: {e}", "WARN")
         # A reviewer may sign off on only some files (the GUI can), dropping
         # the rest from `diffs`; only those were written.
         written = {d.rel for d in diffs}
@@ -3939,6 +3976,12 @@ def run_task(root: Path, cfg, client, agent, idx, task: str, *,
     if _cancel_requested(cfg, client):
         _emit_run_cancelled(root, cfg, "task", task=(task or "")[:200])
         raise CancelledError("Stopped by user; no further work was done.")
+    writes = bool(apply) and not review
+    if apply or review:
+        # A review task writes only after a human sign-off, but the state
+        # before the proposal is exactly what an undo must restore, so the
+        # baseline is recorded here and the accepted review adds its child.
+        _checkpoint_task(root, cfg, task, "pre")
     if not getattr(cfg, "_auto_step", 0):
         # Standalone task (ask/chat/eval): no outer loop owns the static or
         # contract baseline, so drop any leftover one and let _run_task_once
@@ -3957,6 +4000,8 @@ def run_task(root: Path, cfg, client, agent, idx, task: str, *,
         root, cfg, client, idx, task, tr,
         dict(apply=apply, review=review, answer_system=answer_system,
              is_repair=is_repair))
+    if writes:
+        _checkpoint_task(root, cfg, task, "post")
     if answer_system is not None or review or not getattr(cfg, "use_memory", True):
         return tr
     try:
@@ -3989,6 +4034,8 @@ def run_task(root: Path, cfg, client, agent, idx, task: str, *,
                         pending=True)
     except Exception:
         pass
+    if writes:
+        _checkpoint_task(root, cfg, task, "post")
     return tr
 
 

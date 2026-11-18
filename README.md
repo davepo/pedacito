@@ -1995,6 +1995,36 @@ Files created after a snapshot are left in place unless you pass
 can trigger the same rewind mid-task: the gather `undo` action (`allow_write`,
 backups on) reverts everything its own writes did in the current task, so it
 recovers from a compounding bad edit instead of ending the run on one.
+### Time-travel checkpoints
+
+Every Task, Auto step and New scaffold records a checkpoint: a full snapshot
+of the tracked source files plus `files_changed`, a parent id and a timestamp
+under `.pedacito/checkpoints/`. The tree makes a run inspectable and
+reversible without losing the history that came before it:
+
+```bash
+pedacito undo PROJ                           # state immediately before the last run
+pedacito checkpoints PROJ                    # ids, parents, modes, timestamps
+pedacito checkpoints PROJ --json             # same tree for scripts
+pedacito checkout cp_0003_a1b2c3 PROJ        # restore the whole workspace
+pedacito checkout cp_0003 PROJ --file app.py # restore one file
+```
+
+Restoring an earlier checkpoint makes it the active head, so the next prompt
+branches a new run from it. Dirty changes are captured as a `restore`
+checkpoint first. The GUI header's **Checkpoints / Undo** button shows the same
+timeline with per-file unified diffs, one-click restore for a file or the whole
+workspace, and **Branch prompt from here**; the TUI adds `/checkpoints`,
+`/undo` and `/checkout ID`.
+
+The GUI's **Run** tab previews `index.html` / `public/index.html` /
+`dist/index.html` in a live iframe and runs detected entrypoints (`python
+main.py`, `pytest -q`, a shell launcher or a custom `run_cmd` in
+`.pedacito/config.json`) without a shell. A non-zero exit or a Python traceback
+shows a **Fix This Crash** button that puts the exact command, exit code and
+traceback into the Task composer. In the TUI, `/run [cmd]` runs the same
+targets and `/fix` sends the last failure into a repair task.
+
 Everything Pedacito writes for a project lives under `<project>/.pedacito/`:
 
 ```
@@ -2003,7 +2033,7 @@ summaries.json        summary cache, keyed by content hash
 embeddings.json       semantic-search cache (if enabled)
 backups/<stamp>/      pre-write snapshots (never merged: -2, -3 on a clash)
 sessions/<stamp>.md   what was asked, looked up, and changed (secrets masked)
-checkpoints/          ask/chat conversation checkpoints (JSON)
+checkpoints/          time-travel tree (index.json + snapshots/) and ask/chat history
 events/<stamp>.jsonl  one JSON line per step, call, fold, verify, task
 reviews/<stamp>.html  saved review pages
 screenshots/          captures (if enabled)

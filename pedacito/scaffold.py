@@ -28,7 +28,7 @@ import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from . import apicheck, fileio, workspace
+from . import apicheck, checkpoints as checkpoints_mod, fileio, workspace
 from . import index as index_mod
 from .chunker import Chunk
 from .config import PROJECT_CONFIG_NAMES, ConfigError
@@ -1856,6 +1856,21 @@ def run_new(root: Path, cfg, client, spec: Spec, *, apply: bool = False,
             print(COMPLEX_AUTO_NOTICE, file=sys.stderr)
 
     wants_skeleton = plan_only or apply or review
+
+    def _new_checkpoint(label: str) -> None:
+        try:
+            checkpoints_mod.create_checkpoint(root, label, mode="new")
+        except Exception as e:
+            workspace.log_event(root, f"new: checkpoint skipped: {e}", "WARN")
+
+    if wants_skeleton:
+        # The pre-run baseline is the empty (or harness-only) directory. It
+        # lets Undo return a scaffold to exactly what stood there before.
+        try:
+            checkpoints_mod.ensure_baseline(
+                root, "baseline before new project", mode="new")
+        except Exception as e:
+            workspace.log_event(root, f"new: baseline skipped: {e}", "WARN")
     # BUG-303: the `new` path never attached an EventLog, so the most expensive
     # operation in a hunt left no per-call record (tokens, cache hits, finish
     # reason) and no gate events -- only `ask`/`chat` streamed. Attach on the
@@ -1933,15 +1948,18 @@ def run_new(root: Path, cfg, client, spec: Spec, *, apply: bool = False,
               "with header stubs.\n"
               f"  Implement it later with:  pedacito ask {root} --apply "
               "-t \"implement the stub files\"", file=sys.stderr)
+        _new_checkpoint(f"new: {plan.project_name} skeleton")
         return 0
 
     if complex:
-        return _run_complex(root, cfg, client, idx, plan, spec,
+        code = _run_complex(root, cfg, client, idx, plan, spec,
                             verify=verify, repair_rounds=repair_rounds,
                             max_tasks=max_tasks, max_minutes=max_minutes,
                             keep_going=keep_going,
                             verbose=verbose, auto_install=auto_install,
                             design=design_doc is not None)
+        _new_checkpoint(f"new: {plan.project_name}")
+        return code
 
     want_write = apply or review
     when = None
@@ -2029,11 +2047,13 @@ def run_new(root: Path, cfg, client, spec: Spec, *, apply: bool = False,
     if review and summary["done"]:
         results = _review_build(root, plan, summary, cfg, backup_dir, when)
         if results is None:
+            _new_checkpoint(f"new: {plan.project_name}")
             return 1
     if cfg.log_sessions and when is not None:
         p = workspace.write_session(root, f"new: {plan.project_name}",
                                     [], render_plan(plan), [], backup_dir, when)
         print(f"[session: {p.relative_to(root)}]", file=sys.stderr)
+    _new_checkpoint(f"new: {plan.project_name}")
     return 1 if summary["failed"] or contract_failed or tests_failed else 0
 
 

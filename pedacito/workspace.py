@@ -7,6 +7,7 @@ Everything Pedacito writes for a project lives in one place:
         index.json          the map
         summaries.json      summary cache, keyed by content hash
         backups/<stamp>/    pre-edit snapshots, mirroring your tree
+        checkpoints/        time-travel tree (index.json + snapshots/)
         sessions/<stamp>.md what was asked, looked up, and changed
         log.txt             operational run log
 

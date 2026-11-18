@@ -753,6 +753,62 @@ CLI_COMMANDS = [
         ],
     },
     {
+        "name": "undo",
+        "usage": "pedacito undo [PROJECT] [--list]",
+        "summary": "Undo the last run: restore the workspace to the state "
+                   "immediately before the active checkpoint (or the newest "
+                   "backup snapshot on older projects).",
+        "keywords": ["undo", "revert", "last run", "checkpoint", "rollback"],
+        "examples": [
+            "pedacito undo .",
+            "pedacito undo . --list",
+        ],
+        "flags": [
+            {"flag": "PATH...", "help": "the project (default: .)"},
+            {"flag": "--root DIR", "help": "project root"},
+            {"flag": "--list", "help": "show the checkpoint tree instead"},
+        ],
+    },
+    {
+        "name": "checkpoints",
+        "usage": "pedacito checkpoints PROJECT [--limit N] [--json]",
+        "summary": "List the time-travel checkpoint tree: ids, parents, "
+                   "timestamps, modes, prompts and changed-file counts.",
+        "keywords": ["checkpoint", "timeline", "history", "snapshot",
+                     "time travel", "branch"],
+        "examples": [
+            "pedacito checkpoints .",
+            "pedacito checkpoints . --limit 10",
+            "pedacito checkpoints . --json",
+        ],
+        "flags": [
+            {"flag": "PATH...", "help": "the project (default: .)"},
+            {"flag": "--root DIR", "help": "project root"},
+            {"flag": "--limit N", "help": "show only the newest N checkpoints"},
+            {"flag": "--json", "help": "print structured metadata"},
+        ],
+    },
+    {
+        "name": "checkout",
+        "usage": "pedacito checkout ID [PROJECT] [--file PATH]",
+        "summary": "Restore the whole workspace, or one file, from a "
+                   "checkpoint. The restored checkpoint becomes the active "
+                   "head, so the next run branches from it.",
+        "keywords": ["checkout", "restore checkpoint", "time travel",
+                     "branch", "undo"],
+        "examples": [
+            "pedacito checkout cp_0003_a1b2c3 .",
+            "pedacito checkout cp_0003 . --file app.py",
+        ],
+        "flags": [
+            {"flag": "ID", "help": "checkpoint id; a unique prefix works"},
+            {"flag": "PATH...", "help": "the project (default: .)"},
+            {"flag": "--root DIR", "help": "project root"},
+            {"flag": "--file PATH",
+             "help": "restore only this file; repeatable"},
+        ],
+    },
+    {
         "name": "reset",
         "usage": "pedacito reset PROJECT [--dry-run] [--keep-memory] "
                  "[--reindex]",

@@ -313,7 +313,10 @@ const S = {
   ws: { tab: localStorage.getItem('pedacito_ws_tab') || 'files', files: [],
         indexed: [], indexedSet: null, sig: '', filter: '', truncated: false,
         loading: false, backups: [], backupsAt: 0,
-        pages: [], page: '', previewRev: 0 },
+        pages: [], page: '', previewRev: 0,
+        targets: null, targetsAt: 0, runPage: '', runRev: 0, runCmd: '',
+        runCustom: '', runOut: null, runRunning: false },
+  cp: { items: [], head_id: '', loaded: false },
   mode: savedMode,
   creative: savedCreative,
   drafts: savedDraft ? { [savedMode]: savedDraft } : {}, attachments: [],
@@ -560,7 +563,10 @@ function applyStatus(s) {
   if (s.plan) applyPlanPayload(s.plan);
   else if (j && (j.kind === 'auto' || j.kind === 'task')) loadPlan();
   if (j && j.id !== lastJobId) loadPlan();
-  if (!j && lastJobId) { collapseDone(); loadPlan(); loadReview(); loadFiles(); loadBackups(); loadPreview(true); }
+  if (!j && lastJobId) {
+    collapseDone(); loadPlan(); loadReview(); loadFiles(); loadBackups();
+    loadPreview(true); loadRunnerTargets(true); loadCheckpoints(true);
+  }
   if (!j && S.ui.planGenerating && !S.ui.planGenFrom) {
     S.ui.planGenerating = false;
     S.ui.planGenFrom = null;
@@ -572,13 +578,20 @@ function applyStatus(s) {
     S.ui.planGenFrom = null;
   }
   lastJobId = j ? j.id : 0;
-  if ((s.root || '') !== (prev.root || '')) loadPreview();  // project opened/switched
+  if ((s.root || '') !== (prev.root || '')) {
+    loadPreview();                              // project opened/switched
+    S.ws.targets = null; S.ws.runOut = null;
+    loadRunnerTargets(true);
+    S.cp.loaded = false;
+    loadCheckpoints(true);
+  }
   if ((s.files_sig || '') !== lastFilesSig) {   // index or workspace changed
     lastFilesSig = s.files_sig || '';
     if (S.ws.tab === 'files' && s.root) loadFiles();
     // Live Preview stays live WHILE a run writes: re-list pages and reload
     // the framed page whenever the workspace signature moves.
     if (S.ws.tab === 'preview' && s.root) loadPreview(true);
+    if (S.ws.tab === 'runner' && s.root) { loadRunnerTargets(true); S.ws.runRev++; emit(); }
   }
   if (S.ui.pendingProfile !== null && s.profile === S.ui.pendingProfile) S.ui.pendingProfile = null;
   // Colorscheme: config.toml (gui_theme) is the source of truth. On the
@@ -1364,11 +1377,288 @@ function setPreviewPage(p) {
 function openPreviewTab() {
   if (S.ws.page) window.open(previewSrc(S.ws.page, S.ws.previewRev), '_blank');
 }
+
+// ---- live runner: detected commands + a static web preview ----
+function runnerSrc(page, rev) {
+  return '/api/runner/preview/' + String(page).split('/').map(encodeURIComponent).join('/')
+    + '?v=' + rev;
+}
+function loadRunnerTargets(force) {
+  if (!S.status.root) {
+    S.ws.targets = null; S.ws.runOut = null;
+    if (S.ws.runPage) { S.ws.runPage = ''; emit(); }
+    return Promise.resolve();
+  }
+  if (!force && S.ws.targets && Date.now() - S.ws.targetsAt < 4000) return Promise.resolve();
+  return PDC.api('/api/runner/targets').then((j) => {
+    if (j._status !== 200 || !j.ok) return;
+    S.ws.targets = j;
+    S.ws.targetsAt = Date.now();
+    const pages = (j.web || []).map((p) => p.path);
+    if (!S.ws.runPage || pages.indexOf(S.ws.runPage) < 0) {
+      S.ws.runPage = pages.indexOf('index.html') >= 0 ? 'index.html' : (pages[0] || '');
+      S.ws.runRev++;
+    }
+    const cmds = j.commands || [];
+    if (!S.ws.runCmd || !cmds.some((c) => c.id === S.ws.runCmd)) {
+      S.ws.runCmd = cmds.length ? cmds[0].id : '';
+    }
+    emit();
+  }, () => {});
+}
+function setRunPage(p) { S.ws.runPage = p; S.ws.runRev++; emit(); }
+function reloadRunnerPreview() { S.ws.runRev++; emit(); }
+function openRunnerPreview() {
+  if (S.ws.runPage) window.open(runnerSrc(S.ws.runPage, S.ws.runRev), '_blank');
+}
+function selectedRunnerCommand() {
+  const t = S.ws.targets || {};
+  return (t.commands || []).find((c) => c.id === S.ws.runCmd) || null;
+}
+function runProjectCommand() {
+  if (!S.status.root || S.ws.runRunning) return;
+  const custom = String(S.ws.runCustom || '').trim();
+  const target = selectedRunnerCommand();
+  const cmd = custom || (target && target.command) || '';
+  if (!cmd) { PDC.toast('Pick a detected command or type one first.', true); return; }
+  S.ws.runRunning = true; S.ws.runOut = null; emit();
+  PDC.api('/api/runner/exec', { command: cmd }).then((j) => {
+    S.ws.runRunning = false;
+    S.ws.runOut = j;
+    emit();
+    if (j.ok) PDC.toast('Run finished: ' + (j.command || cmd));
+  }, () => {
+    S.ws.runRunning = false;
+    PDC.toast('Runner request failed.', true);
+    emit();
+  });
+}
+function setPromptDraft(text, mode) {
+  if (mode) S.mode = mode;
+  S.drafts[S.mode] = text;
+  writeDraft(text);
+  try { localStorage.setItem('pedacito_mode', S.mode); } catch (e) {}
+  emit();
+  setTimeout(() => {
+    if (inputEl && S.mode !== 'how') {
+      inputEl.value = text;
+      inputEl.focus();
+      inputEl.selectionStart = inputEl.selectionEnd = text.length;
+    }
+  }, 30);
+}
+function fixRunnerCrash() {
+  const out = S.ws.runOut;
+  if (!out || out.ok) return;
+  const parts = [
+    'Fix this crash.', '',
+    'Command: ' + (out.command || '(unknown command)'),
+    'Exit code: ' + (out.exit_code == null ? '?' : out.exit_code),
+  ];
+  if (out.timed_out) parts.push('The command timed out.');
+  if (out.traceback_summary) {
+    parts.push('', 'Traceback:', String(out.traceback_summary));
+  } else if (out.stderr) {
+    parts.push('', 'stderr:', String(out.stderr).slice(-6000));
+  } else if (out.stdout) {
+    parts.push('', 'stdout:', String(out.stdout).slice(-4000));
+  }
+  parts.push('', 'Reproduce the failing command, find the cause, and fix it. '
+    + 'Re-run the command afterwards and report the result.');
+  setPromptDraft(parts.join('\n'), 'task');
+  PDC.toast('Crash context put in the Task composer.');
+}
+
+// ---- time-travel checkpoints ----
+function cpTime(ts) {
+  if (!ts) return '';
+  const d = new Date(ts);
+  return isNaN(d.getTime()) ? String(ts) : d.toLocaleString();
+}
+function fetchCheckpoints() {
+  if (!S.status.root) {
+    S.cp = { items: [], head_id: '', loaded: true };
+    emit();
+    return Promise.resolve({ ok: true, checkpoints: [], head_id: '' });
+  }
+  return PDC.api('/api/checkpoints').then((j) => {
+    if (j._status === 200 && j.ok) {
+      S.cp.items = j.checkpoints || [];
+      S.cp.head_id = j.head_id || '';
+      S.cp.loaded = true;
+      emit();
+    }
+    return j;
+  }, () => ({ ok: false, checkpoints: [], head_id: '' }));
+}
+function loadCheckpoints(force) {
+  if (force || !S.cp.loaded) return fetchCheckpoints();
+  return Promise.resolve({ ok: true, checkpoints: S.cp.items, head_id: S.cp.head_id });
+}
+function restoreCheckpoint(id, files) {
+  return PDC.api('/api/checkpoints/restore', { id: id, files: files || null })
+    .then((j) => {
+      if (j.ok) {
+        PDC.toast(j.detail || 'Restored.');
+        refreshState(); loadFiles(true); loadRunnerTargets(true);
+        loadCheckpoints(true);
+      } else PDC.toast(j.detail || 'Restore failed.', true);
+      return j;
+    }, () => ({ ok: false, detail: 'Restore failed.' }));
+}
+function branchFromCheckpoint(cp) {
+  PDC.confirm('Branch from ' + cp.id + '?\n\nThe workspace is restored to '
+    + 'that checkpoint and the next prompt branches a new run from there. '
+    + 'Your current files are saved in a safety checkpoint first.', 'Branch', true)
+    .then((ok) => {
+      if (!ok) return;
+      restoreCheckpoint(cp.id, null).then((j) => {
+        if (!j.ok) return;
+        setPromptDraft('Branch from checkpoint ' + cp.id + ' (' + (cp.label || '') + '): ', 'task');
+        PDC.toast('Workspace restored \u2014 type the new prompt.');
+      });
+    });
+}
+function openCheckpointsDialog() {
+  const body = h('div', { class: 'cp-dialog' });
+  let selected = S.cp.head_id || '';
+  let against = 'parent';
+  let diff = null;
+
+  const loadDiff = () => {
+    if (!selected) { diff = null; renderBody(); return; }
+    diff = null;
+    renderBody();
+    PDC.api('/api/checkpoints/diff?id=' + encodeURIComponent(selected)
+      + '&against=' + against).then((j) => {
+      if (j._status !== 200) {
+        diff = null;
+        renderBody();
+        return;
+      }
+      diff = j;
+      renderBody();
+    });
+  };
+  function pick(cp) {
+    selected = cp.id;
+    loadDiff();
+  }
+  function renderBody() {
+    clear(body);
+    const cp = S.cp.items.find((c) => c.id === selected) || null;
+    const name = h('input', { type: 'text', class: 'grow cp-name',
+      placeholder: 'name this checkpoint (e.g. before refactor)' });
+    body.appendChild(h('div', { class: 'cp-tools' },
+      name,
+      h('button', { class: 'small primary', text: '+ Checkpoint', onclick: () => {
+        const label = String(name.value || '').trim();
+        if (!label) { PDC.toast('Name the checkpoint first.', true); return; }
+        PDC.api('/api/checkpoints/create', { label: label }).then((j) => {
+          PDC.toast(j.ok ? 'Checkpoint ' + j.checkpoint.id + ' recorded.'
+            : (j.detail || 'Could not create the checkpoint.'), !j.ok);
+          if (j.ok) { selected = j.checkpoint.id; fetchCheckpoints().then(loadDiff); }
+        });
+      } }),
+      h('button', { class: 'small', text: '\u21BB', title: 'reload the tree',
+        onclick: () => fetchCheckpoints().then(loadDiff) })));
+    if (!S.cp.items.length) {
+      body.appendChild(h('div', { class: 'tip', text: 'No checkpoints yet. '
+        + 'One is recorded automatically after every Task, Auto step and New '
+        + 'scaffold, or make one above.' }));
+      return;
+    }
+    if (!selected || !S.cp.items.some((c) => c.id === selected)) {
+      selected = S.cp.head_id || S.cp.items[S.cp.items.length - 1].id;
+    }
+    const list = h('div', { class: 'cp-list' });
+    S.cp.items.forEach((item) => {
+      const node = h('button', {
+        class: 'cp-node' + (item.id === selected ? ' on' : ''),
+        title: item.id,
+        onclick: () => pick(item),
+      });
+      node.appendChild(h('span', { class: 'cp-mark', text: item.head ? '\u25CF' : (item.parent_id ? '\u25CB' : '\u25C7') }));
+      node.appendChild(h('span', { class: 'cp-id mono', text: item.id }));
+      node.appendChild(h('span', { class: 'tag', text: item.mode || 'task' }));
+      node.appendChild(h('span', { class: 'cp-label ellip', text: item.label || '(untitled)' }));
+      node.appendChild(h('span', { class: 'muted small-text cp-meta',
+        text: (item.files_changed || []).length + ' file(s) \u00B7 ' + cpTime(item.timestamp) }));
+      if (item.parent_id) {
+        node.appendChild(h('span', { class: 'cp-parent muted small-text',
+          text: '\u21B3 ' + item.parent_id }));
+      }
+      list.appendChild(node);
+    });
+    body.appendChild(list);
+    if (!cp) return;
+    body.appendChild(h('div', { class: 'cp-actions' },
+      h('button', { class: 'small', text: against === 'parent'
+          ? 'Base: parent \u21C4' : 'Base: workspace \u21C4',
+        title: 'toggle the diff base',
+        onclick: () => { against = against === 'parent' ? 'workspace' : 'parent'; diff = null; loadDiff(); } }),
+      h('button', { class: 'small danger', text: '\u21BA Restore Entire Workspace',
+        onclick: () => {
+          PDC.confirm('Restore the whole workspace to ' + cp.id + '?\n\n'
+            + 'Dirty changes are saved in a safety checkpoint first. Files '
+            + 'created after that checkpoint are removed.', 'Restore', true)
+            .then((ok) => { if (ok) restoreCheckpoint(cp.id, null).then(loadDiff); });
+        } }),
+      h('button', { class: 'small primary', text: '\u2442 Branch Prompt From Here',
+        onclick: () => branchFromCheckpoint(cp) })));
+    if (!diff) {
+      body.appendChild(h('div', { class: 'tip', text: 'Loading diff\u2026' }));
+      return;
+    }
+    const files = h('div', { class: 'cp-files' });
+    const pre = h('pre', { class: 'cp-diff' });
+    const showFile = (f) => {
+      Array.from(files.children).forEach((row) => row.classList.remove('on'));
+      if (f && f.row) f.row.classList.add('on');
+      pre.textContent = f ? (f.diff || '(binary file or no textual diff)')
+        : (diff.diff || 'No differences against ' + against + '.');
+    };
+    files.appendChild(h('button', { class: 'cp-file-all small', text: 'All files ('
+      + (diff.changed_files || []).length + ')', onclick: () => showFile(null) }));
+    (diff.files || []).forEach((f) => {
+      const row = h('div', { class: 'cp-file' + (f.status === 'deleted' ? ' gone' : ''),
+        title: f.path, onclick: () => showFile(f) });
+      f.row = row;
+      row.appendChild(h('span', { class: 'cp-status ' + f.status, text: f.status }));
+      row.appendChild(h('span', { class: 'cp-path mono ellip', text: f.path }));
+      row.appendChild(h('span', { class: 'muted small-text',
+        text: '+' + (f.added || 0) + ' / -' + (f.removed || 0) }));
+      row.appendChild(h('button', { class: 'small', text: 'Restore Selected File',
+        onclick: (e) => {
+          e.stopPropagation();
+          PDC.confirm('Restore only \u201c' + f.path + '\u201d from ' + cp.id + '?',
+            'Restore file', true).then((ok) => {
+              if (ok) restoreCheckpoint(cp.id, [f.path]).then(loadDiff);
+            });
+        } }));
+      files.appendChild(row);
+    });
+    pre.textContent = diff.diff || 'No differences against ' + against + '.';
+    body.appendChild(files);
+    body.appendChild(pre);
+  }
+
+  S.cp.head_id = S.cp.head_id || '';
+  fetchCheckpoints().then(() => {
+    selected = selected || S.cp.head_id
+      || (S.cp.items.length ? S.cp.items[S.cp.items.length - 1].id : '');
+    loadDiff();
+  });
+  PDC.modal('Checkpoints / Undo', body,
+    [{ label: 'Close' }], { wide: true });
+}
+
 function setWsTab(t) {
   if (S.ws.tab === t && !S.ui.wsCollapsed) {      // the tab already showing:
     if (t === 'files') loadFiles(true);           // click again = rescan
     else if (t === 'backups') loadBackups(true);
     else if (t === 'preview') loadPreview(true);  // click again = reload page
+    else if (t === 'runner') { loadRunnerTargets(true); S.ws.runRev++; emit(); }
     return;
   }
   S.ws.tab = t;
@@ -1377,6 +1667,7 @@ function setWsTab(t) {
   if (t === 'files') loadFiles();
   if (t === 'backups') loadBackups();
   if (t === 'preview') loadPreview();
+  if (t === 'runner') loadRunnerTargets(true);
   if (t === 'logs' && term) { term.follow = S.ui.termFollow; term.schedule(); }
   emit();
 }
@@ -3000,6 +3291,7 @@ function TopBar() {
             <${MenuItem} label="Index project (with summaries)" disabled=${!!j || !s.root} action=${() => buildIndex(true)} />
             <${MenuItem} label="Quick index (no summaries)" disabled=${!!j || !s.root} action=${() => buildIndex(false)} />
             <${MenuItem} label="Restore from a backup\u2026" disabled=${!!j || !(s.snapshots || []).length} action=${restoreDialog} />
+            <${MenuItem} label="Checkpoints / Undo\u2026" disabled=${!s.root} action=${openCheckpointsDialog} />
             <${MenuItem} label="Rename symbol\u2026" disabled=${!!j || !s.root} action=${renameSymbolDialog} />
             <${MenuItem} label="Memory & repo lessons\u2026" action=${memoryDialog}
                        title="scratchpad memory while no project is open" />
@@ -3020,6 +3312,8 @@ function TopBar() {
           <//>
         </div>
         <div id="topRight">
+          <button id="checkpointsBtn" title="time-travel: inspect, diff, restore or branch from any checkpoint"
+                  disabled=${!s.root} onClick=${openCheckpointsDialog}>\u23F1 Checkpoints / Undo</button>
           <button id="rulesBtn" title="edit persistent project rules (.pedacito/rules.md) applied to every Task, Auto and Refine call"
                   onClick=${openRulesDialog}>\uD83D\uDCDC Rules</button>
           <button id="serversBtn" title="live VRAM/RAM and local model-server lifecycle"
@@ -4137,11 +4431,11 @@ function WorkspacePane() {
   useEffect(() => {
     if (termRef.current && !term) term = new Term(termRef.current);
   }, []);
-  const tabs = S.ws.pages.length
-    ? [WS_TABS[0], ['preview', '\uD83C\uDF10 Preview']].concat(WS_TABS.slice(1))
-    : WS_TABS;
+  const tabs = [WS_TABS[0], ['runner', '\u25B6 Run']]
+    .concat(S.ws.pages.length ? [['preview', '\uD83C\uDF10 Preview']] : [])
+    .concat(WS_TABS.slice(1));
   let tab = S.ws.tab;
-  if (tab === 'preview' && !S.ws.pages.length) tab = 'files';  // saved tab, no pages
+  if (tab === 'preview' && !S.ws.pages.length) tab = 'runner';  // saved tab, no pages
   const idxSet = S.ws.indexedSet || new Set();
   const flt = S.ws.filter.trim().toLowerCase();
   const all = S.ws.files || [];
@@ -4175,6 +4469,7 @@ function WorkspacePane() {
         <span class="muted small-text grow ws-sub">
           ${tab === 'files' ? (s.root ? PDC.fmtInt(S.ws.indexed.length) + ' of ' + PDC.fmtInt(all.length) + ' files indexed' : 'no project open')
           : tab === 'backups' ? 'undo a Task/Edit or Auto write'
+          : tab === 'runner' ? 'preview + one-click commands'
           : tab === 'preview' ? 'read-only \u00B7 reloads when a run finishes'
           : 'live output'}
         </span>
@@ -4217,6 +4512,61 @@ function WorkspacePane() {
           ? html`<iframe id="live-preview-frame" title=${'Live preview of ' + S.ws.page}
                          src=${previewSrc(S.ws.page, S.ws.previewRev)}></iframe>`
           : html`<div class="tip">No HTML pages in this project yet \u2014 create one and it shows up here.</div>`}
+      </div>
+      <div class="ws-body" id="wsRunner" hidden=${tab !== 'runner'}>
+        ${!s.root ? html`<div class="tip">Open a project to preview and run it.</div>`
+        : (() => {
+          const t = S.ws.targets || { web: [], commands: [] };
+          const web = t.web || [];
+          const cmds = t.commands || [];
+          const out = S.ws.runOut;
+          return html`
+            <div class="runner-preview">
+              <div class="ws-tools">
+                <select class="grow" title="static page to preview" value=${S.ws.runPage}
+                        disabled=${!web.length}
+                        onchange=${(e) => setRunPage(e.target.value)}>
+                  ${web.length ? web.map((p) => html`<option key=${p.path} value=${p.path}>${p.path}</option>`)
+                    : html`<option value="">no HTML entrypoint</option>`}
+                </select>
+                <button class="small" disabled=${!S.ws.runPage}
+                        title="reload the live preview" onClick=${reloadRunnerPreview}>\u27F3 Reload Preview</button>
+                <button class="small" disabled=${!S.ws.runPage}
+                        title="open this page in a browser tab" onClick=${openRunnerPreview}>\u2197 New tab</button>
+              </div>
+              ${S.ws.runPage
+                ? html`<iframe class="runner-frame" title=${'Live app preview of ' + S.ws.runPage}
+                               src=${runnerSrc(S.ws.runPage, S.ws.runRev)}></iframe>`
+                : html`<div class="tip">No <code>index.html</code>, <code>public/index.html</code> or <code>dist/index.html</code> yet \u2014 create one and it appears here live.</div>`}
+            </div>
+            <div class="runner-cmd">
+              <select title="detected runnable target" value=${S.ws.runCmd}
+                      onchange=${(e) => { S.ws.runCmd = e.target.value; emit(); }}>
+                ${cmds.length ? cmds.map((c) => html`<option key=${c.id} value=${c.id}>${c.label}</option>`)
+                  : html`<option value="">no entrypoint detected</option>`}
+              </select>
+              <input type="text" class="grow" spellcheck="false" value=${S.ws.runCustom}
+                     placeholder="or type a command (argv, no shell)"
+                     oninput=${(e) => { S.ws.runCustom = e.target.value; }} />
+              <button class="small primary" disabled=${S.ws.runRunning}
+                      onClick=${runProjectCommand}>${S.ws.runRunning ? 'Running\u2026' : '\u25B6 Run'}</button>
+            </div>
+            ${out ? html`
+              <div class=${'runner-out' + (out.ok ? '' : ' failed')}>
+                <div class="runner-out-head">
+                  <b class=${out.ok ? 'ok' : 'bad'}>${out.ok ? 'OK' : 'FAILED'} \u00B7 exit ${out.exit_code}</b>
+                  <span class="muted small-text ellip">${out.command} \u00B7 ${PDC.fmtInt(out.duration_ms)} ms</span>
+                  <span class="grow"></span>
+                  ${!out.ok ? html`<button class="small danger" title="put the command, exit code and traceback into the Task composer"
+                        onClick=${fixRunnerCrash}>\u2691 Fix This Crash</button>` : null}
+                </div>
+                ${out.stdout ? html`<pre class="runner-pre">${out.stdout}</pre>` : null}
+                ${out.stderr ? html`<pre class="runner-pre err">${out.stderr}</pre>` : null}
+                ${out.traceback_summary && String(out.stderr || '').indexOf(out.traceback_summary) < 0
+                  ? html`<pre class="runner-pre err">${out.traceback_summary}</pre>` : null}
+              </div>` : null}
+          `;
+        })()}
       </div>
       <div class="ws-body" id="wsBackups" hidden=${tab !== 'backups'}>
         <div class="ws-tools">

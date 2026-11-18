@@ -25,12 +25,14 @@ from __future__ import annotations
 
 import argparse
 import fnmatch
+import json
 import os
 import sys
 import time
 from pathlib import Path
 from types import SimpleNamespace
 
+from . import checkpoints as checkpoints_mod
 from . import config
 from . import config_editor
 from . import discovery
@@ -1817,6 +1819,98 @@ def _cmd_reset(args) -> int:
     return 0
 
 
+def _cmd_checkpoints(args) -> int:
+    """`pedacito checkpoints`: list the time-travel tree for a project."""
+    root = _root(args)
+    if not root.is_dir():
+        print(f"checkpoints: no such project directory: {root}",
+              file=sys.stderr)
+        return 2
+    if getattr(args, "json", False):
+        items = checkpoints_mod.list_checkpoints(root)
+        payload = {
+            "head_id": checkpoints_mod.head_id(root),
+            "checkpoints": [dict(cp) for cp in items],
+        }
+        print(json.dumps(payload, indent=2, ensure_ascii=False))
+        return 0
+    limit = int(getattr(args, "limit", 0) or 0)
+    print(checkpoints_mod.render_list(root, limit=limit))
+    return 0
+
+
+def _cmd_checkout(args) -> int:
+    """`pedacito checkout <id>`: restore a whole checkpoint or one file."""
+    root = _root(args)
+    if not root.is_dir():
+        print(f"checkout: no such project directory: {root}", file=sys.stderr)
+        return 2
+    try:
+        checkpoint_id = checkpoints_mod.resolve_id(root, args.id)
+    except checkpoints_mod.CheckpointError as e:
+        print(f"checkout: {e}", file=sys.stderr)
+        print(f"  known ids: try `pedacito checkpoints {root}`.",
+              file=sys.stderr)
+        return 2
+    files = list(getattr(args, "files", None) or []) or None
+    try:
+        result = checkpoints_mod.restore_checkpoint(
+            root, checkpoint_id, files=files)
+    except (checkpoints_mod.CheckpointError, OSError) as e:
+        print(f"checkout: {e}", file=sys.stderr)
+        return 1
+    for rel in result["restored"]:
+        print(f"  restored {rel}", file=sys.stderr)
+    for rel in result["deleted"]:
+        print(f"  deleted  {rel}", file=sys.stderr)
+    for rel in result["skipped"]:
+        print(f"  skipped  {rel}", file=sys.stderr)
+    print(f"checkout: {result['files']} file(s) restored from "
+          f"{checkpoint_id}; head is now {checkpoint_id}", file=sys.stderr)
+    if result.get("safety_id"):
+        print(f"  safety snapshot: {result['safety_id']}", file=sys.stderr)
+    return 0
+
+
+def _cmd_undo(args) -> int:
+    """`pedacito undo`: restore the state immediately before the last run.
+
+    Prefers the checkpoint tree (the active checkpoint's parent). A project
+    from before the checkpoint system falls back to its newest backup
+    snapshot, exactly like `pedacito restore`.
+    """
+    root = _root(args)
+    if not root.is_dir():
+        print(f"undo: no such project directory: {root}", file=sys.stderr)
+        return 2
+    if getattr(args, "list", False):
+        return _cmd_checkpoints(args)
+    result = checkpoints_mod.undo_last_run(root)
+    if not result.get("ok"):
+        # Old workspaces only have .pedacito/backups/<stamp>/ snapshots.
+        snapshots = workspace.list_backups(root)
+        if not snapshots:
+            print(f"undo: {result.get('detail') or 'nothing to undo.'}",
+                  file=sys.stderr)
+            return 1
+        snapshot = snapshots[0]
+        restored = workspace.restore(root, snapshot)
+        for rel in restored:
+            print(f"  restored {rel}", file=sys.stderr)
+        print(f"undo: restored {len(restored)} file(s) from "
+              f"{snapshot.name}", file=sys.stderr)
+        return 0
+    for rel in result["restored"]:
+        print(f"  restored {rel}", file=sys.stderr)
+    for rel in result["deleted"]:
+        print(f"  deleted  {rel}", file=sys.stderr)
+    print(f"undo: back to {result['undone_to']} "
+          f"({result['files']} file(s) restored)", file=sys.stderr)
+    if result.get("safety_id"):
+        print(f"  safety snapshot: {result['safety_id']}", file=sys.stderr)
+    return 0
+
+
 def _cmd_serve(args) -> int:
     """`pedacito serve`: start a background dev server and register it."""
     from . import processes
@@ -2684,6 +2778,34 @@ def build_parser() -> argparse.ArgumentParser:
                              "have no original to restore)")
     p_rest.add_argument("--config", metavar="FILE")
 
+    p_undo = sub.add_parser(
+        "undo", help="restore the state immediately before the last run")
+    p_undo.add_argument("paths", nargs="*", default=["."],
+                        help="the project (default: current directory)")
+    p_undo.add_argument("--root", default=None)
+    p_undo.add_argument("--list", action="store_true",
+                        help="show the checkpoint tree instead")
+
+    p_cps = sub.add_parser(
+        "checkpoints", help="list time-travel checkpoints (and the active head)")
+    p_cps.add_argument("paths", nargs="*", default=["."],
+                       help="the project (default: current directory)")
+    p_cps.add_argument("--root", default=None)
+    p_cps.add_argument("--limit", type=int, default=0,
+                       help="show only the newest N checkpoints")
+    p_cps.add_argument("--json", action="store_true",
+                       help="print structured metadata")
+
+    p_checkout = sub.add_parser(
+        "checkout", help="restore the whole workspace or one file from a checkpoint")
+    p_checkout.add_argument("id", help="checkpoint id (a unique prefix works)")
+    p_checkout.add_argument("paths", nargs="*", default=["."],
+                            help="the project (default: current directory)")
+    p_checkout.add_argument("--root", default=None)
+    p_checkout.add_argument("--file", action="append", dest="files",
+                            metavar="PATH",
+                            help="restore only this file; repeatable")
+
     p_wt = sub.add_parser(
         "worktree",
         help="create/list/remove an isolated git worktree for risky runs")
@@ -3316,6 +3438,8 @@ def _main(argv=None) -> int:
              "webcheck": _cmd_webcheck, "domcheck": _cmd_domcheck,
              "skills": _cmd_skills,
              "rename": _cmd_rename,
+             "undo": _cmd_undo, "checkpoints": _cmd_checkpoints,
+             "checkout": _cmd_checkout,
              "serve": _cmd_serve, "procs": _cmd_procs, "lsp": _cmd_lsp,
              "mcp": _cmd_mcp}
     if args.cmd in light:

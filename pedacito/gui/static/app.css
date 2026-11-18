@@ -1295,3 +1295,67 @@ details pre { background: var(--code-bg); border: 1px solid var(--border); borde
 #effortControl { display: flex; align-items: center; gap: 5px; flex: none;
   color: var(--muted); font-size: 12px; }
 #effortControl select { font-size: 12px; padding: 2px 4px; }
+
+/* ------------------------------------------------- runner tab & checkpoints --
+   The Run tab pairs a live static preview with a detected-command bar. The
+   Checkpoints dialog draws the parent/branch tree and a per-file unified
+   diff; both reuse the workspace surface tokens so every theme matches. */
+.ws-body .runner-preview { display: flex; flex-direction: column; min-height: 0;
+  flex: 1 1 55%; }
+.ws-body .runner-frame { flex: 1 1 auto; min-height: 140px; width: 100%;
+  border: none; background: #fff; }
+.runner-cmd { display: flex; gap: 6px; align-items: center; padding: 6px 8px;
+  flex: none; border-top: 1px solid var(--border);
+  border-bottom: 1px solid var(--border); background: var(--surface-alt); }
+.runner-cmd select, .runner-cmd input { font-size: 12px; background: var(--surface); }
+.runner-cmd select { font-family: var(--mono); min-width: 0; max-width: 46%; }
+.runner-out { flex: 0 1 45%; min-height: 0; display: flex; flex-direction: column;
+  border-top: 1px solid var(--border); overflow-y: auto; }
+.runner-out.failed { border-top-color: var(--danger); }
+.runner-out-head { display: flex; gap: 8px; align-items: center; padding: 5px 8px;
+  flex: none; background: var(--surface); }
+.runner-out-head b.ok { color: var(--success); }
+.runner-out-head b.bad { color: var(--danger); }
+.runner-pre { margin: 0; padding: 7px 9px; font-family: var(--mono);
+  font-size: 11.5px; line-height: 1.45; white-space: pre-wrap;
+  word-break: break-word; color: var(--text); background: var(--code-bg);
+  border-top: 1px solid color-mix(in srgb, var(--border) 60%, transparent); }
+.runner-pre.err { color: var(--danger); }
+
+.cp-dialog { display: flex; flex-direction: column; gap: 8px; min-height: 0; }
+.cp-tools { display: flex; gap: 6px; align-items: center; }
+.cp-tools input { font-size: 12px; background: var(--surface); }
+.cp-list { display: flex; flex-direction: column; gap: 3px; max-height: 230px;
+  overflow-y: auto; border: 1px solid var(--border); border-radius: 8px;
+  padding: 4px; background: var(--surface-alt); }
+.cp-node { display: flex; gap: 7px; align-items: center; width: 100%;
+  text-align: left; padding: 4px 7px; border: 1px solid transparent;
+  border-radius: 6px; background: transparent; color: var(--text);
+  font-size: 12px; }
+.cp-node:hover { background: var(--surface); }
+.cp-node.on { border-color: var(--accent); background: var(--accent-soft); }
+.cp-mark { color: var(--accent); flex: none; font-size: 11px; }
+.cp-id { flex: none; font-size: 11px; color: var(--muted); }
+.cp-label { flex: 1 1 auto; min-width: 80px; }
+.cp-meta, .cp-parent { flex: none; }
+.cp-parent { font-family: var(--mono); font-size: 10px; }
+.cp-node .tag { flex: none; font-size: 9.5px; text-transform: lowercase; }
+.cp-actions { display: flex; gap: 6px; flex-wrap: wrap; }
+.cp-files { display: flex; flex-direction: column; gap: 2px; max-height: 170px;
+  overflow-y: auto; border: 1px solid var(--border); border-radius: 7px;
+  padding: 3px; background: var(--surface-alt); }
+.cp-file { display: flex; gap: 8px; align-items: center; padding: 3px 6px;
+  border-radius: 5px; cursor: pointer; font-size: 12px; }
+.cp-file:hover, .cp-file.on { background: var(--surface); }
+.cp-file.gone .cp-path { text-decoration: line-through; }
+.cp-file .cp-path { flex: 1 1 auto; min-width: 0; }
+.cp-status { flex: none; width: 62px; font-size: 10px; text-transform: uppercase;
+  letter-spacing: .3px; color: var(--muted); }
+.cp-status.added { color: var(--success); }
+.cp-status.deleted { color: var(--danger); }
+.cp-status.modified { color: var(--warning); }
+.cp-file-all { align-self: flex-start; }
+.cp-diff { margin: 0; padding: 8px 10px; max-height: 320px; overflow: auto;
+  background: var(--code-bg); border: 1px solid var(--border);
+  border-radius: 8px; font-family: var(--mono); font-size: 11.5px;
+  line-height: 1.45; white-space: pre; color: var(--text); }

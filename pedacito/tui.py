@@ -24,8 +24,8 @@ under a lock.
 Slash commands mirror `pedacito chat` and add the TUI-specific panes:
 `/help`, `/status` (`/telemetry`), `/auto`, `/plan`, `/consolidate`
 (`/compact`), `/profile`, `/auto-route`, `/think`, `/apply`, `/skills`,
-`/memory`, `/procs`, `/diff`, `/undo`, `/reset`, `/sidebar`, `/clear`, and
-`/quit` (`/exit`).
+`/memory`, `/procs`, `/diff`, `/checkpoints`, `/undo`, `/checkout`, `/run`,
+`/fix`, `/reset`, `/sidebar`, `/clear`, and `/quit` (`/exit`).
 """
 
 from __future__ import annotations
@@ -43,6 +43,7 @@ import threading
 import time
 from pathlib import Path
 
+from . import checkpoints as checkpoints_mod
 from . import events as events_mod
 from . import gitinfo
 from . import index as index_mod
@@ -54,6 +55,7 @@ from . import processes
 from . import profiles as profiles_mod
 from . import prompts as prompts_mod
 from . import roles as roles_mod
+from . import runner as runner_mod
 from . import security
 from . import select as select_mod
 from . import servers as servers_mod
@@ -126,7 +128,8 @@ _SLASH_COMMANDS = [
     "/auto-route", "/think", "/effort", "/creative", "/servers", "/unload",
     "/apply", "/skills", "/memory", "/procs", "/security", "/theme",
     "/pin", "/rules",
-    "/diff", "/undo", "/reset", "/sidebar", "/scroll", "/mouse", "/clear",
+    "/diff", "/checkpoints", "/undo", "/checkout", "/run", "/fix",
+    "/reset", "/sidebar", "/scroll", "/mouse", "/clear",
     "/quit", "/exit",
 ]
 _KNOWN_KEYS = {
@@ -198,7 +201,14 @@ Pedacito TUI commands
   /security ack             acknowledge every current secret finding
   /security gitignore       add .env patterns to .gitignore
   /diff                     git status and working-tree diff
-  /undo                     restore the newest .pedacito/backups snapshot
+  /checkpoints [N]          show the time-travel checkpoint tree
+  /undo                     restore the state before the last run (or the
+                            newest .pedacito/backups snapshot on old projects)
+  /checkout ID              restore the whole workspace from a checkpoint
+                            (a unique id prefix works)
+  /run [CMD]                run the detected entrypoint or CMD, show output
+  /fix                      send the last /run crash traceback into a repair
+                            task
   /reset                    wipe .pedacito state (keeps memory and config)
   /sidebar                  toggle the activity / plan pane
   /scroll up|down|top|bottom|N
@@ -529,6 +539,11 @@ class TuiSession:
         self._scroll_seen_width = 0
         self.folds = 0
         self.resume_context = ""
+        # The last failed /run result, kept so /fix can turn the exact
+        # command, exit code and traceback into a repair task. `last_traceback`
+        # is the same text a scripted caller would display.
+        self.last_run_failure: dict | None = None
+        self.last_traceback = ""
         # Explicit session pins added with `/pin add`. They ride every Task
         # and Auto prompt through cfg._pinned_refs, independently of the
         # prompt's own @file/@symbol mentions.
@@ -2805,8 +2820,20 @@ class TuiSession:
         if cmd == "diff":
             self._diff()
             return
+        if cmd == "checkpoints":
+            self._checkpoints(arg)
+            return
+        if cmd == "checkout":
+            self._checkout(arg)
+            return
         if cmd == "undo":
             self._undo()
+            return
+        if cmd == "run":
+            self._run_command(arg)
+            return
+        if cmd == "fix":
+            self._fix_last_crash()
             return
         if cmd == "reset":
             self._reset()
@@ -3474,15 +3501,66 @@ class TuiSession:
             return
         self._append("No git changes or backup snapshots to show.", "system")
 
+    def _checkpoints(self, arg: str = "") -> None:
+        limit = 0
+        text = str(arg or "").strip()
+        if text:
+            try:
+                limit = max(1, int(text))
+            except ValueError:
+                limit = 0
+        try:
+            self._append(checkpoints_mod.render_list(self.root, limit=limit),
+                         "system")
+        except OSError as exc:
+            self._append(f"checkpoints: {exc}", "error")
+
+    def _checkout(self, arg: str) -> None:
+        checkpoint_id = str(arg or "").strip()
+        if not checkpoint_id:
+            self._append("Usage: /checkout <id> (see /checkpoints)",
+                         "error")
+            return
+        try:
+            resolved = checkpoints_mod.resolve_id(self.root, checkpoint_id)
+            result = checkpoints_mod.restore_checkpoint(self.root, resolved)
+        except (checkpoints_mod.CheckpointError, OSError) as exc:
+            self._append(f"checkout: {exc}", "error")
+            return
+        self._append(f"checkout: restored {result['files']} file(s) from "
+                     f"{resolved}; head is now {resolved}", "system")
+        for rel in result["restored"]:
+            self._append(f"  restored {rel}", "system")
+        for rel in result["deleted"]:
+            self._append(f"  deleted  {rel}", "system")
+        if result.get("skipped"):
+            self._append(f"  skipped {len(result['skipped'])} unsafe path(s)",
+                         "system")
+        if result.get("safety_id"):
+            self._append(f"  safety snapshot: {result['safety_id']}", "system")
+
     def _undo(self) -> None:
+        result = checkpoints_mod.undo_last_run(self.root)
+        if result.get("ok"):
+            self._append(f"undo: back to {result['undone_to']} "
+                         f"({result['files']} file(s) restored)", "system")
+            for rel in result["restored"]:
+                self._append(f"  restored {rel}", "system")
+            for rel in result["deleted"]:
+                self._append(f"  deleted  {rel}", "system")
+            if result.get("safety_id"):
+                self._append(f"  safety snapshot: {result['safety_id']}",
+                             "system")
+            return
+        # Projects that predate the checkpoint tree still have backup
+        # snapshots; keep the original one-step undo working there.
         try:
             snapshots = workspace.list_backups(self.root)
         except OSError as exc:
             self._append(f"could not list backups: {exc}", "error")
             return
         if not snapshots:
-            self._append("No backups under .pedacito/backups/ to restore.",
-                         "system")
+            self._append("No checkpoints or backups to restore.", "system")
             return
         snapshot = snapshots[0]
         try:
@@ -3494,6 +3572,67 @@ class TuiSession:
                      f"{snapshot.name}", "system")
         for rel in files:
             self._append(f"  restored {rel}", "system")
+
+    def _run_command(self, arg: str) -> None:
+        cmd = str(arg or "").strip() or None
+        if cmd is None:
+            targets = runner_mod.detect_runnable_targets(self.root)
+            if not targets["commands"]:
+                self._append("No runnable entrypoint detected. Use "
+                             "/run <command> to run one explicitly.", "system")
+                return
+            cmd = targets["commands"][0]
+        shown = (cmd if isinstance(cmd, str)
+                 else str((cmd or {}).get("command") or ""))
+        self._append(f"\u00bb /run {shown}".rstrip(), "user")
+
+        def work():
+            return runner_mod.run_project_command(self.root, cmd)
+
+        holder = self._run_in_worker(work)
+        error = holder.get("error")
+        if error is not None:
+            text = f"{type(error).__name__}: {error}"
+            self.last_traceback = text
+            self.last_run_failure = {
+                "ok": False, "command": shown, "exit_code": None,
+                "stdout": "", "stderr": text, "traceback_summary": "",
+            }
+            self._append(f"run failed: {text}", "error")
+            return
+        result = holder.get("result") or {}
+        for line in str(result.get("stdout") or "").splitlines():
+            self._append(line, "system")
+        for line in str(result.get("stderr") or "").splitlines():
+            self._append(line, "error")
+        tb = str(result.get("traceback_summary") or "").strip()
+        if tb and tb not in str(result.get("stderr") or ""):
+            for line in tb.splitlines():
+                self._append(line, "error")
+        if result.get("ok"):
+            self.last_run_failure = None
+            self.last_traceback = ""
+            self._append(f"run: ok (exit 0, {result.get('duration_ms', 0)} ms)"
+                         f" \u00b7 {result.get('command', '')}", "system")
+            return
+        self.last_run_failure = dict(result)
+        self.last_traceback = (str(result.get("traceback_summary") or "").strip()
+                               or str(result.get("stderr") or "").strip())
+        self._append(
+            f"run: FAILED exit {result.get('exit_code')} "
+            f"\u00b7 {result.get('command', '')} \u2014 type /fix to send the "
+            "failure into a repair task", "error")
+
+    def _fix_last_crash(self) -> None:
+        failure = self.last_run_failure
+        if not failure:
+            self._append("No failed /run to fix. Run something first.",
+                         "system")
+            return
+        prompt = runner_mod.crash_prompt(failure)
+        self._append("Sending the last crash into a repair task\u2026",
+                     "system")
+        self.run_task(prompt)
 
     def _confirm(self, question: str) -> bool:
         self._set_banner(question)
