@@ -396,7 +396,7 @@ at a fraction of the window (`max_observation_tokens`) with a note on how to
 narrow it.
 
 The action list is **filtered to what is enabled and to the model's size**: a
-tiny profile sees ten actions and a ~430-token prompt, not two dozen tools and
+tiny profile sees eleven actions and a ~450-token prompt, not two dozen tools and
 browser-eval advice it cannot use.
 
 Opt-in actions, each behind a config flag because they widen what a model can
@@ -782,7 +782,7 @@ conversation. Pedacito spends each on purpose.
 - **Prompt packs.** The instructions come in `full`, `small` and `tiny`
   density (`prompt_pack`, else the model card, else the tier) and mention only
   the actions that are enabled. With browser, shell and write off, the default
-  lookup prompt is about 1,700 tokens instead of 3,000; `tiny` is about 430.
+  lookup prompt is about 1,700 tokens instead of over 3,000; `tiny` is about 450.
   Override any section with `.pedacito/prompts/{gather,edit_format,answer}.md`.
 - **One fold point.** A server caches the prompt *prefix*; rewriting an old
   turn throws the cache away from that turn on. So the lookup conversation is

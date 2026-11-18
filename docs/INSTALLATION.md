@@ -88,11 +88,22 @@ Pedacito its base URL and a model name.
 | **LM Studio** | Load a model, then start the server (Developer tab). For another machine, enable "Serve on Local Network". | `http://localhost:1234/v1` |
 | **Ollama** | `ollama serve` and `ollama pull <model>`. For another machine, set `OLLAMA_HOST=0.0.0.0` first. | `http://localhost:11434/v1` |
 | **Lemonade** | Start the server and load a model. | The URL it prints (ends in `/v1` or `/api/v1`) |
+| **Strata / Avalon** | Start the tiered MoE server and load a model, following its own documentation. | Its OpenAI-compatible URL, e.g. `http://127.0.0.1:8000/v1` |
 | **Hosted API** | Get an API key. | e.g. `https://api.deepseek.com/v1` |
 
 The default ports above are hints, not rules: any port works, and the scan
 identifies a server by its replies, so two servers can coexist on one host
 (for example Lemonade on 11434 next to LM Studio on 1234).
+
+Strata and Avalon are tiered mixture-of-experts servers: they keep most of the
+GPU's VRAM resident and reason before answering. Give the profile
+`provider = "strata"` (or `"avalon"`), or a name containing `strata`/`avalon`,
+and Pedacito applies the `local-moe` execution tier: larger reply budgets, a
+timeout of at least 600 seconds for weight loading, and exactly one concurrent
+stream so a second prefill cannot evict the resident weights. Pedacito also drives their
+model load/unload lifecycle between runs. See
+[Execution profiles and the local-moe tier](ARCHITECTURE.md#execution-profiles-and-the-local-moe-tier)
+for the budgets and a profile example.
 
 For hosted APIs set `base_url`, `api_key`, and `model` (or `api_key_env`, the
 name of an environment variable holding the key, so the secret stays out of the

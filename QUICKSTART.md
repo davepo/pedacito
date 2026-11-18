@@ -41,7 +41,7 @@ Pedacito talks to any server with an OpenAI-compatible `/v1` API.
 Ports are defaults, not rules. The scanner identifies each server by its replies,
 so two servers can run on one machine.
 
-Not sure which model size to load? The [VRAM quick reference](README.md#which-model-fits-your-gpu)
+Not sure which model size to load? The [VRAM quick reference](docs/INSTALLATION.md#which-model-fits-your-gpu)
 maps 6–8 GB, 12–16 GB, and 24 GB+ cards to the model sizes that work best on
 each. Start with one local model; add a hosted planner or verifier later if you
 want one, and it is optional.

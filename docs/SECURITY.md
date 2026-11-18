@@ -77,8 +77,8 @@ cheap filters that cut false positives:
   `your_key_here`, `changeme`, `<token>`, `${API_KEY}`, `os.environ[...]`,
   `process.env.X`, `xxxx`, and values containing `...` or `…`. Test and example
   markers (`test_`, `fake_`, `sample`, `dummy`) are also ignored.
-- **Filler detection.** `safety.redact` skips a quoted value that has fewer than
-  six distinct characters, or lacks both a letter and a digit. This removes
+- **Filler detection.** `safety.redact` skips a quoted value that lacks a letter
+  or a digit **and** has fewer than six distinct characters. This removes
   repeated filler such as `aaaaaaaaaaaaaaaa`.
 
 If you need entropy scoring for a custom token format, add it as a new rule in
@@ -203,16 +203,22 @@ own. These settings are ignored from a project file until you read it and run
 `pedacito trust PROJECT`:
 
 - Commands and hooks: `hooks`, `mcp_servers`, `auto_verify`, `test_command`,
-  `allow_serve`, `allow_lsp`, `lsp_servers`.
+  `allow_serve`, `allow_lsp`, `lsp_servers`, `load_cmd`, `unload_cmd`.
 - Capability switches: `allow_shell`, `allow_write`, `allow_browser`,
-  `allow_screenshots`, `allow_fetch`.
-- Sandbox settings and the environment scrub.
+  `allow_screenshots`, `allow_fetch`, `enable_mcp`, `allow_mcp`.
+- Sandbox settings (`sandbox`, `sandbox_network`, `sandbox_writable`,
+  `sandbox_strict`) and the environment scrub (`scrub_env`, `env_passthrough`).
 - Endpoint redirection: `base_url`, `api_key`, `api_key_env`. A project cannot send
   your prompts to a different server.
+- Repo-code verification switches: `verify_tests`, `verify_dom`, `dom_entry`.
 - Anything that widens where data can go: `fetch_allowed_hosts`,
   `browser_eval_hosts`, `shell_allowlist`.
 
-Editing a trusted file revokes the approval.
+Editing a trusted file revokes the approval. Harmless settings from the same
+file still apply, and these fields stay honoured from your user config, from
+`--config FILE` and from `PEDACITO_*` environment variables. The starter
+written by `pedacito config --init --path <project>/.pedacito.toml` keeps those
+lines commented, so trusting it neither warns nor revokes what you granted.
 
 ### GUI and network boundary
 
@@ -358,7 +364,7 @@ prompt (TUI) or JSON event (RPC) shows the category, the exact target and the re
 | **Allow Once** | Approves this request only. |
 | **Allow for This Run** | Approves that kind of request until the run ends. |
 | **Always Allow** | Approves it from now on. Sets `enable_web` for web access, or `allow_shell` for shell commands, and saves the choice to your config. |
-| **Deny and Redirect** | Refuses the request. The model is told to continue with local project files only. |
+| **Deny & Redirect** | Refuses the request. The model is told to continue with local project files only. |
 
 A request you do not answer, because the dialog times out or you press Stop, is
 denied. The CLI has no dialog, so a gated tool reports that it is disabled in the
@@ -426,7 +432,9 @@ pedacito checkpoints PROJ --json          # the same tree for scripts
 ```
 
 The GUI **Checkpoints / Undo** button shows the timeline with a unified diff for each
-file, and offers one-click restore for a file or the whole workspace. The TUI has
+file, and offers one-click restore for a file or the whole workspace. **⑂ Branch Prompt
+From Here** restores the workspace to a checkpoint (current files are saved in a safety
+checkpoint first) and prepares the prompt box so the next task branches from there. The TUI has
 `/checkpoints`, `/undo` and `/checkout ID`. Each diff comes from
 `difflib.unified_diff` over the snapshot and the current file, so you see exactly what
 an autonomous run changed before you accept it.
@@ -437,6 +445,8 @@ an autonomous run changed before you accept it.
 pedacito undo PROJ                        # state immediately before the last run
 pedacito checkout cp_0003_a1b2c3 PROJ     # restore the whole workspace to a checkpoint
 pedacito checkout cp_0003 PROJ --file app.py   # restore one file only
+pedacito restore PROJ                     # restore the newest backup snapshot
+pedacito restore PROJ --snapshot NAME     # restore a specific snapshot
 pedacito restore PROJ --list              # file-level backups from before checkpoints existed
 pedacito restore PROJ --dry-run           # preview a restore without writing
 ```
@@ -452,8 +462,9 @@ Rules that keep rollback safe:
 - **Undo falls back gracefully.** `pedacito undo` prefers the active checkpoint's parent. A
   project created before checkpoints existed falls back to its newest backup snapshot.
 - **File-level restores are conservative.** `pedacito restore` leaves files created after the
-  snapshot in place. Add `--delete-created` to remove them too. The run's created files are
-  listed in a sidecar `backups/<stamp>.created`.
+  snapshot in place. Add `--delete-created` to remove them too; directories left empty by the
+  removal are removed as well. The run's created files are listed in a sidecar
+  `backups/<stamp>.created`.
 
 Inside a run, the model can rewind its own work with the `undo` action, which reverts
 what that task's writes did so far. The green ratchet in autonomous mode rolls a step

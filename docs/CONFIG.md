@@ -320,6 +320,31 @@ served at `GET /api/mcp/tools`. See
 [Techniques §30](../TECHNIQUES.md#30-pruned-permission-gated-mcp-bridges-named-servers--mcp_call)
 for why the pruning is shaped this way.
 
+## Hooks
+
+Hooks run your own program at well-defined moments:
+
+```toml
+hooks = { post_edit = ["ruff format {file}"], pre_edit = ["./scripts/guard.sh"] }
+```
+
+Events: `session_start`, `pre_task`/`post_task`, `pre_tool`/`post_tool`,
+`pre_edit`/`post_edit`, `pre_run`/`post_run`, `pre_compact`/`post_compact`,
+`notification`.
+
+The protocol is plain JSON, no plugin ABI: the hook receives one JSON object
+on stdin (`{"event", "cwd", ...event fields}`) and may answer on stdout with
+`{"decision": "allow" | "deny", "message": "...", "context": "..."}`. A
+`pre_*` hook denies with a `deny` decision, or with exit status 2 and the
+reason on stderr. Text a hook prints (the `context` field, or plain stdout
+after a `post_*` event) is fed back to the model.
+
+Hooks run as an argv — never through a shell — in the project root, with the
+scrubbed environment plus `PEDACITO_EVENT`, and a timeout (`hook_timeout`,
+10 seconds by default). `{file}` / `{files}` placeholders expand from the
+event. A hook that fails or times out is a warning, not an error. Hooks from
+a project's own `.pedacito.toml` only run after `pedacito trust`.
+
 ## Memory, skills, and instructions
 
 ### Memory, rules, and skills
@@ -330,8 +355,10 @@ edit or delete:
 - **Memory** (`.pedacito/memory.md`, plus a user-level `memory.md` next to your
   config) holds short facts under Commands / Conventions / Landmines / Notes.
   The model adds one with `remember`; you can too:
-  `pedacito memory PROJ --add "command: run tests with pytest -x"`,
-  `--list`, `--forget TEXT`. Lines are de-duplicated, capped per category,
+  `pedacito memory PROJ --add "command: run tests with pytest -x"`.
+  `pedacito memory PROJ` lists what is remembered, `--forget TEXT` removes
+  matching lines, and `--global` switches either to the user-level file.
+  Lines are de-duplicated, capped per category,
   secrets are masked, and anything that reads like an instruction to an
   assistant is refused. It is shown to the model as *hints, not truth*.
 - **Rules** (`.pedacito/rules/*.md` with a `paths: src/api/*.py` frontmatter
@@ -508,7 +535,7 @@ config --reference` prints the annotated template. Key settings:
 | `allow_fetch` / `fetch_allowed_hosts` | false / `[]` | The `fetch` action and the hosts it may read. |
 | `roles` | `{}` | Per-job profiles: `planner`, `verifier`, `summarizer`, `repair`. |
 | `auto_escalate` / `escalation_zero_edit_runs` | true / 3 | Widen the `escalate` retry beyond "no edit landed": a semantic repair failure, two no-progress leases, or this many consecutive zero-edit runs on one profile earn one retry even when edits applied. Every reason emits an `escalation_suggested` event even without a configured role; 0 disables the zero-edit statistic. |
-| `hooks` | `{}` | Your commands at events (project-level hooks need `pedacito trust`). |
+| `hooks` / `hook_timeout` | `{}` / 10 | Your commands at events, each capped at this many seconds (see [Hooks](#hooks); project-level hooks need `pedacito trust`). |
 | `scrub_env` / `env_passthrough` | true / `[]` | Minimal environment for model-chosen commands. |
 | `protected_paths` / `shell_deny` | `[]` | Paths the model may not write; command patterns `run` refuses. |
 | `wrap_observations` / `redact_secrets` | true | Fence untrusted output; mask secrets in logs and sessions. |
