@@ -1009,6 +1009,10 @@ class Config:
     # config), a dismissible GUI banner, `pdc update` and the TUI `/update`.
     # false = zero network calls and zero upgrade subprocesses, everywhere.
     check_for_updates: bool = True
+    # Which PyPI releases count as "latest": "stable" ignores pre/dev/rc/
+    # alpha/beta tags, "any" also considers them. PEDACITO_UPDATE_CHANNEL
+    # overrides it like any other setting.
+    update_channel: str = "stable"
 
     # Bookkeeping for `pedacito config`; not settings.
     sources: dict = None
@@ -1153,6 +1157,7 @@ _ENUM_FIELDS = {
     "gui_theme": ("slate", "light", "daylight", "nord", "midnight",
                   "jazz_solo", "trapper_keeper", "memphis_arcade", "windbreaker"),
     "reasoning_effort": ("default", "low", "medium", "high"),
+    "update_channel": ("stable", "any"),
 }
 _ENUM_EMPTY_OK = ("prompt_pack", "answer_mode")
 
@@ -3165,6 +3170,9 @@ gui_theme = "slate"
 # check_for_updates: quiet PyPI release check at startup (one anonymous GET,
 # cached 24 h; GUI banner, `pdc update`, TUI `/update`). false = fully offline.
 check_for_updates = true
+# update_channel: "stable" ignores pre/dev/rc/alpha/beta PyPI releases; "any"
+# includes them (PEDACITO_UPDATE_CHANNEL overrides).
+update_channel = "stable"
 
 [indexing]
 # Chunking and retrieval. Oversized units split at statement boundaries.

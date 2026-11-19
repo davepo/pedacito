@@ -72,8 +72,11 @@ Pedacito checks PyPI for newer releases quietly: **one anonymous GET** of the
 public `pedacito` metadata at startup, on a background thread with a 2-second
 timeout, cached for 24 hours beside your user config (`update_check.json`).
 No account, no telemetry, no project data — and offline, every check is a
-silent no-op. Pre-releases are compared correctly, yanked releases are
-ignored, and you are never told to "update" to the version you already run.
+silent no-op. Only stable releases are offered by default: pre-release tags
+(`dev`, `rc`, `alpha`, `beta`) are ignored, yanked releases are ignored, and
+you are never told to "update" to the version you already run. Set
+`update_channel = "any"` in `[universal]` of your config (or
+`PEDACITO_UPDATE_CHANNEL=any`) to include pre-releases.
 
 - **GUI** — when a newer release exists, a slim banner appears under the
   topbar: *Pedacito vX.Y.Z is available (you have A.B.C)*. **Update** runs the

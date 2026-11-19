@@ -14,7 +14,9 @@ Knobs and guarantees:
     and re-queried at most once per 24 h; a manual check bypasses the cache.
   * Version comparison is semver-aware (pre-releases sort before their final
     release) and never reports an update when installed >= latest. Yanked
-    releases are ignored.
+    releases are ignored. Only stable releases are offered by default;
+    `update_channel = "any"` (or PEDACITO_UPDATE_CHANNEL=any) also considers
+    pre/dev/rc/alpha/beta tags.
   * The upgrade command is always an argv LIST executed with shell=False
     (Windows-safe), chosen from how Pedacito was installed (pipx, venv,
     user pip, or an editable source checkout -- which gets git instructions
@@ -89,6 +91,42 @@ def is_newer(candidate: str, installed: str) -> bool:
     return (ra, a[1], a[2]) > (rb, b[1], b[2])
 
 
+def is_stable_version(text: str) -> bool:
+    """True for a final (or post) release, False for a pre/dev/rc/alpha/beta
+    tag or an unparseable string."""
+    key = parse_version(text)
+    return key is not None and key[1] >= _FINAL_RANK
+
+
+_CHANNELS = ("stable", "any")
+
+
+def release_channel(cfg=None) -> str:
+    """The update channel in config precedence order: PEDACITO_UPDATE_CHANNEL,
+    then the loaded config, then a light read of the user config's [universal]
+    table. Default: stable."""
+    raw = os.environ.get("PEDACITO_UPDATE_CHANNEL")
+    if raw is not None and raw.strip():
+        channel = raw.strip().lower()
+        if channel in _CHANNELS:
+            return channel
+    if cfg is not None:
+        channel = str(getattr(cfg, "update_channel", "stable")
+                      or "stable").strip().lower()
+        if channel in _CHANNELS:
+            return channel
+    try:
+        import tomllib
+        with open(config_mod.USER_CONFIG, "rb") as fh:
+            data = tomllib.load(fh)
+        value = (data.get("universal") or {}).get("update_channel")
+        if isinstance(value, str) and value.strip().lower() in _CHANNELS:
+            return value.strip().lower()
+    except (OSError, ValueError, KeyError):
+        pass
+    return "stable"
+
+
 # --- cache ---------------------------------------------------------------------
 
 def cache_path() -> Path:
@@ -148,11 +186,14 @@ def _fetch_payload(url: str = PYPI_URL, timeout: float = CHECK_TIMEOUT):
         return json.loads(resp.read())
 
 
-def _latest_from_payload(payload) -> str | None:
+def _latest_from_payload(payload, channel: str = "stable") -> str | None:
     """The newest non-yanked release with files, from PyPI's JSON shape.
-    Falls back to `info.version` when the releases map is unusable."""
+    `channel="stable"` (the default) ignores pre/dev/rc/alpha/beta tags;
+    `channel="any"` also considers them. Falls back to `info.version` when
+    the releases map is unusable."""
     if not isinstance(payload, dict):
         return None
+    any_channel = str(channel or "stable").strip().lower() == "any"
     best, best_key = None, None
     releases = payload.get("releases")
     if isinstance(releases, dict):
@@ -164,13 +205,16 @@ def _latest_from_payload(payload) -> str | None:
             key = parse_version(ver)
             if key is None:
                 continue
+            if not any_channel and key[1] < _FINAL_RANK:
+                continue
             if best_key is None or key > best_key:
                 best, best_key = ver, key
     if best is None:
         info = payload.get("info")
         ver = info.get("version") if isinstance(info, dict) else None
-        if isinstance(ver, str) and parse_version(ver) is not None:
-            best = ver
+        if isinstance(ver, str) and (
+                any_channel or is_stable_version(ver)):
+            best = ver if parse_version(ver) is not None else None
     return best
 
 
@@ -414,18 +458,22 @@ def check_for_update(cfg=None, *, manual: bool = False,
     if not enabled:
         info["detail"] = "disabled"
         return info
+    channel = release_channel(cfg)
+    info["channel"] = channel
     now = time.time() if now is None else now
     latest = None
     if not manual:
         cache = read_cache(now=now)
-        if cache is not None:
+        if cache is not None and (
+                channel == "any" or is_stable_version(cache["latest"])):
             latest = cache["latest"]
             info["cached"] = True
             info["checked_at"] = cache["checked_at"]
     if latest is None:
         try:
             payload = (fetch or _fetch_payload)(PYPI_URL, CHECK_TIMEOUT)
-            latest = _latest_from_payload(payload) if payload else None
+            latest = (_latest_from_payload(payload, channel=channel)
+                      if payload else None)
         except Exception:
             latest = None
         if latest is None:

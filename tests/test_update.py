@@ -174,6 +174,35 @@ def test_latest_falls_back_to_info_version():
     assert update_mod._latest_from_payload({"info": {"version": "0.3.1"}}) == "0.3.1"
     assert update_mod._latest_from_payload(None) is None
     assert update_mod._latest_from_payload({"info": {"version": "junk"}}) is None
+    # The fallback obeys the channel too.
+    rc = {"info": {"version": "1.0.0rc1"}}
+    assert update_mod._latest_from_payload(rc) is None
+    assert update_mod._latest_from_payload(rc, channel="any") == "1.0.0rc1"
+
+
+def test_latest_defaults_to_stable_and_skips_prereleases():
+    payload = {"info": {"version": "1.0.0rc1"},
+               "releases": {
+                   "1.0.0.dev2": [{"yanked": False}],
+                   "1.0.0a1": [{"yanked": False}],
+                   "1.0.0b2": [{"yanked": False}],
+                   "1.0.0rc1": [{"yanked": False}],
+                   "0.9.9": [{"yanked": False}],
+               }}
+    assert update_mod._latest_from_payload(payload) == "0.9.9"
+    assert update_mod._latest_from_payload(payload, channel="stable") == "0.9.9"
+    assert update_mod._latest_from_payload(payload, channel="any") == "1.0.0rc1"
+
+
+def test_stable_channel_still_ignores_yanked_releases():
+    payload = {"info": {"version": "1.0.0"},
+               "releases": {
+                   "1.0.0": [{"yanked": True}],
+                   "1.0.0rc1": [{"yanked": False}],
+                   "0.9.9": [{"yanked": False}],
+               }}
+    assert update_mod._latest_from_payload(payload) == "0.9.9"
+    assert update_mod._latest_from_payload(payload, channel="any") == "1.0.0rc1"
 
 
 # --- the check: offline, disabled, cached ----------------------------------------------
@@ -289,6 +318,67 @@ def test_updates_enabled_precedence(monkeypatch):
     assert update_mod.updates_enabled(None) is False
     config_mod.USER_CONFIG.write_text("[universal]\n", encoding="utf-8")
     assert update_mod.updates_enabled(None) is True  # default
+
+
+def test_update_channel_defaults_to_stable_and_any_admits_an_rc(monkeypatch):
+    enable(monkeypatch)
+    payload = {"info": {"version": "9.9.9rc1"},
+               "releases": {"9.9.9rc1": [{"yanked": False}],
+                            "0.3.1": [{"yanked": False}]}}
+    monkeypatch.setattr(update_mod, "urlopen",
+                        lambda *a, **k: FakeResponse(payload))
+    stable = update_mod.check_for_update(manual=True)
+    assert stable["channel"] == "stable"
+    assert stable["latest"] == "0.3.1"
+    assert stable["update_available"] is False
+    cfg = Config()
+    cfg.update_channel = "any"
+    any_cfg = update_mod.check_for_update(cfg, manual=True)
+    assert any_cfg["channel"] == "any"
+    assert any_cfg["latest"] == "9.9.9rc1"
+    assert any_cfg["update_available"] is True
+
+
+def test_update_channel_env_override_admits_an_rc(monkeypatch):
+    enable(monkeypatch)
+    monkeypatch.setenv("PEDACITO_UPDATE_CHANNEL", "any")
+    payload = {"info": {"version": "9.9.9rc1"},
+               "releases": {"9.9.9rc1": [{"yanked": False}]}}
+    monkeypatch.setattr(update_mod, "urlopen",
+                        lambda *a, **k: FakeResponse(payload))
+    info = update_mod.check_for_update(manual=True)
+    assert info["channel"] == "any"
+    assert info["latest"] == "9.9.9rc1"
+    assert info["update_available"] is True
+
+
+def test_update_channel_flows_through_config_and_env(monkeypatch, tmp_path):
+    cfg_path = tmp_path / "config.toml"
+    cfg_path.write_text('[universal]\nupdate_channel = "any"\n',
+                        encoding="utf-8")
+    cfg = config_mod.load(root=tmp_path, explicit=cfg_path,
+                          require_hardware=False, warn_budgets=False)
+    assert cfg.update_channel == "any"
+    monkeypatch.setenv("PEDACITO_UPDATE_CHANNEL", "stable")
+    cfg = config_mod.load(root=tmp_path, explicit=cfg_path,
+                          require_hardware=False, warn_budgets=False)
+    assert cfg.update_channel == "stable"
+
+
+def test_stable_channel_refetches_a_cached_prerelease(monkeypatch):
+    enable(monkeypatch)
+    update_mod.write_cache("9.9.9rc1")
+    calls = []
+
+    def fake_urlopen(url, timeout=None):
+        calls.append(url)
+        return FakeResponse(pypi_payload("0.3.2"))
+
+    monkeypatch.setattr(update_mod, "urlopen", fake_urlopen)
+    info = update_mod.check_for_update()
+    assert calls == [update_mod.PYPI_URL]
+    assert info["cached"] is False
+    assert info["latest"] == "0.3.2"
 
 
 def test_async_check_is_daemon_deduped_and_reports(monkeypatch):
@@ -494,6 +584,20 @@ def test_gui_state_carries_update_fields(gui):  # noqa: F811
     assert state["update"] is None
     assert state["update_run"]["running"] is False
     assert state["check_for_updates"] is False      # fixture keeps it offline
+
+
+def test_gui_update_dismissal_is_persisted_across_reloads():
+    """R2.3: the dismissed version survives a reload; only a strictly newer
+    latest release re-shows the banner (same pattern as the other app.js
+    localStorage guards)."""
+    js = (Path(__file__).resolve().parents[1] / "pedacito" / "gui"
+          / "static" / "app.js").read_text(encoding="utf-8")
+    assert "pedacito_update_dismissed" in js
+    assert "localStorage.getItem(UPDATE_DISMISSED_KEY)" in js
+    assert "localStorage.setItem(UPDATE_DISMISSED_KEY, version)" in js
+    assert "updateDismissed: savedUpdateDismissed" in js
+    assert "writeUpdateDismissed(info.latest)" in js
+    assert "isNewerVersion(info.latest, dismissed)" in js
 
 
 def test_gui_routes_stand_down_when_disabled(gui, monkeypatch):  # noqa: F811

@@ -294,7 +294,45 @@ function writeDraft(text) {
   } catch (e) {}
 }
 function clearDraft() { writeDraft(''); }
+// The dismissed update version survives reloads, beside the other
+// pedacito_* preferences. A strictly newer latest release re-shows the banner;
+// the same (or an older cached) latest stays hidden.
+const UPDATE_DISMISSED_KEY = 'pedacito_update_dismissed';
+function readUpdateDismissed() {
+  try { return localStorage.getItem(UPDATE_DISMISSED_KEY) || null; }
+  catch (e) { return null; }
+}
+function writeUpdateDismissed(version) {
+  try {
+    if (version) localStorage.setItem(UPDATE_DISMISSED_KEY, version);
+    else localStorage.removeItem(UPDATE_DISMISSED_KEY);
+  } catch (e) {}
+}
+const UPDATE_STAGE_RANK = { dev: 0, a: 1, alpha: 1, b: 2, beta: 2,
+                            c: 3, rc: 3, pre: 3, preview: 3,
+                            post: 5, rev: 5, r: 5 };
+function updateVersionKey(text) {
+  const m = /^\s*v?(\d+(?:\.\d+)*)(?:[-_.]?(a|alpha|b|beta|c|rc|pre|preview|dev|post|rev|r)[-_.]?(\d*))?/i
+    .exec(String(text || ''));
+  if (!m) return null;
+  const rank = UPDATE_STAGE_RANK[(m[2] || '').toLowerCase()];
+  return [m[1].split('.').map(Number),
+          rank === undefined ? 4 : rank,
+          Number(m[3] || 0)];
+}
+function isNewerVersion(candidate, base) {
+  const a = updateVersionKey(candidate), b = updateVersionKey(base);
+  if (!a) return false;
+  if (!b) return true;
+  const n = Math.max(a[0].length, b[0].length);
+  for (let i = 0; i < n; i++) {
+    const x = a[0][i] || 0, y = b[0][i] || 0;
+    if (x !== y) return x > y;
+  }
+  return a[1] > b[1] || (a[1] === b[1] && a[2] > b[2]);
+}
 const savedDraft = readDraft();
+const savedUpdateDismissed = readUpdateDismissed();
 const savedMode = (() => {
   try { return localStorage.getItem('pedacito_mode') || 'task'; }
   catch (e) { return 'task'; }
@@ -337,8 +375,8 @@ const S = {
         // Auto-update notice (pedacito.update): the dismissed version string
         // (a newer release re-shows the banner), the upgrade output drawer,
         // and manual instructions when no upgrade command can be run.
-        updateDismissed: null, updateDrawerOpen: false, updateManual: '',
-        updateRunHidden: false },
+        updateDismissed: savedUpdateDismissed,
+        updateDrawerOpen: false, updateManual: '', updateRunHidden: false },
   peek: null,
   how: { query: '', answer: null, loading: false, error: '', useModel: true },
 };
@@ -4898,8 +4936,9 @@ function UpdateBanner() {
   const info = S.status.update;
   const run = S.status.update_run || {};
   const manual = S.ui.updateManual || '';
+  const dismissed = S.ui.updateDismissed;
   const showBanner = !!(info && info.update_available
-    && S.ui.updateDismissed !== info.latest);
+    && (!dismissed || isNewerVersion(info.latest, dismissed)));
   const showRun = !S.ui.updateRunHidden
     && !!(run.running || run.ok === true || run.ok === false || manual);
   if (!showBanner && !showRun) return null;
@@ -4937,7 +4976,7 @@ function UpdateBanner() {
                   title="run the detected upgrade command"
                   onClick=${startUpgrade}>Update</button>
           <button class="ghost small" title="hide this notice until a newer release"
-                  onClick=${() => { S.ui.updateDismissed = info.latest; emit(); }}>Dismiss</button>
+                  onClick=${() => { S.ui.updateDismissed = info.latest; writeUpdateDismissed(info.latest); emit(); }}>Dismiss</button>
         </div>` : null}
       ${showRun ? html`
         <div class="update-run">
