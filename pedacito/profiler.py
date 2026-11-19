@@ -1357,7 +1357,17 @@ def maybe_probe_async(config, *, base_url: str = "", model: str = "",
 
 # --- auto-tuning --------------------------------------------------------------
 
+# Fields whose value controls the KV-cache geometry. When any of these was
+# inferred (not measured), a low-confidence footprint is a guess, and the
+# tuner should propose rather than apply aggressive shrink.
+_KV_GUESSED_FIELDS = frozenset(("quant", "n_layers", "n_kv_heads", "head_dim"))
+
+
 def _is_explicit(cfg, key: str) -> bool:
+    # Auto-tune's own writes are deliberately soft here: a later pass may
+    # refine them. `config._is_explicit_limit` treats the same `auto-tune ...`
+    # source as explicit, so auto_fit leaves the tuned window alone. This
+    # one-way pinning is covered by tests and explained in docs/CONFIG.md.
     source = str((getattr(cfg, "sources", None) or {}).get(key, "default")
                  or "default")
     if source in ("", "default") or "preset" in source:
@@ -1532,8 +1542,16 @@ def tune_profile(cfg, snapshot: dict | None, footprint: dict | None,
         }
 
     footprint = footprint if isinstance(footprint, dict) else {}
+    guessed = sorted(_KV_GUESSED_FIELDS.intersection(
+        str(field) for field in (footprint.get("estimated_fields") or [])))
+    if guessed:
+        notes.append(
+            "metadata guessed — set model_layers/model_kv_heads/"
+            "model_head_dim/model_quant or run pdc profile --run "
+            f"(estimated: {', '.join(guessed)})")
     kv_per_1k = _float(footprint.get("kv_gb_per_1k_tokens"))
     confidence = _float(footprint.get("confidence"))
+    confident = confidence >= 0.5
     proposal = 0
     if kv_per_1k > 0 and confidence > 0:
         headroom = free_gb - weights - reserve
@@ -1562,30 +1580,46 @@ def tune_profile(cfg, snapshot: dict | None, footprint: dict | None,
             notes.append(
                 f"context_tokens: growth proposal capped at {target:,} by the "
                 f"auto-fit VRAM estimate")
-        if _is_explicit(cfg, "context_tokens"):
+        explicit_ctx = _is_explicit(cfg, "context_tokens")
+        effective_ctx = current
+        if explicit_ctx:
             notes.append("context_tokens is explicit; left untouched")
         elif supported <= 0 and headroom <= 0:
             # The weights themselves do not fit the free pool. Never divide
             # by a zero/negative estimate; keep the safety floor.
             if current > floor:
-                values["context_tokens"] = floor
+                effective_ctx = floor
+                if confident:
+                    values["context_tokens"] = floor
+                    sources["context_tokens"] = (
+                        f"auto-tune ({pool} {free_gb:.1f} GB free via "
+                        f"{pool_source}; {weights:.1f} GB weights leave no KV "
+                        f"headroom; safety floor {floor:,})")
+                    applied = True
+                    notes.append(
+                        f"context_tokens: {current:,} -> {floor:,} (weights do "
+                        f"not fit the free {pool}; safety floor)")
+                else:
+                    notes.append(
+                        f"context_tokens: would shrink {current:,} -> "
+                        f"{floor:,} (weights do not fit the free {pool}; "
+                        f"confidence {confidence:.2f} < 0.50, proposal only)")
+        elif current > 0 and target < current:
+            effective_ctx = target
+            if confident:
+                values["context_tokens"] = target
                 sources["context_tokens"] = (
                     f"auto-tune ({pool} {free_gb:.1f} GB free via {pool_source}; "
-                    f"{weights:.1f} GB weights leave no KV headroom; safety "
-                    f"floor {floor:,})")
+                    f"weights {weights:.1f} GB; KV {kv_per_1k:.4f} GB/1k tok; "
+                    f"confidence {confidence:.2f}; floor {floor:,})")
                 applied = True
+                notes.append(f"context_tokens: {current:,} -> {target:,} "
+                             f"({pool} headroom)")
+            else:
                 notes.append(
-                    f"context_tokens: {current:,} -> {floor:,} (weights do not "
-                    f"fit the free {pool}; safety floor)")
-        elif current > 0 and target < current:
-            values["context_tokens"] = target
-            sources["context_tokens"] = (
-                f"auto-tune ({pool} {free_gb:.1f} GB free via {pool_source}; "
-                f"weights {weights:.1f} GB; KV {kv_per_1k:.4f} GB/1k tok; "
-                f"confidence {confidence:.2f}; floor {floor:,})")
-            applied = True
-            notes.append(f"context_tokens: {current:,} -> {target:,} "
-                         f"({pool} headroom)")
+                    f"context_tokens: would shrink {current:,} -> {target:,} "
+                    f"({pool} headroom; confidence {confidence:.2f} < 0.50, "
+                    "proposal only)")
         elif current > 0 and target > current:
             proposal = target
             notes.append(
@@ -1596,33 +1630,47 @@ def tune_profile(cfg, snapshot: dict | None, footprint: dict | None,
         if supported <= 0 and headroom <= 0 and current <= floor:
             notes.append(f"context_tokens: keeping safety floor {floor:,}")
 
-        tuned_ctx = max(1, _int(values["context_tokens"]))
+        tuned_ctx = max(1, _int(effective_ctx))
         moe = _is_moe(cfg)
         pressure = 0.6 if moe else 1.0
         if not _is_explicit(cfg, "max_gathered_chars"):
+            previous = values["max_gathered_chars"]
             gathered_tokens = int(min(6000, max(512, tuned_ctx / 6.0
                                                 * pressure)))
             gathered_chars = int(min(24000, max(2048, gathered_tokens * 4)))
-            if values["max_gathered_chars"] != gathered_chars:
-                values["max_gathered_chars"] = gathered_chars
-                sources["max_gathered_chars"] = (
-                    f"auto-tune (retrieval scaled to {tuned_ctx:,} tok"
-                    + (", local-moe smaller window" if moe else "") + ")")
-                applied = True
-                notes.append("max_gathered_chars: "
-                             f"{getattr(cfg, 'max_gathered_chars', 0):,} -> "
-                             f"{gathered_chars:,}")
+            if previous != gathered_chars:
+                if confident:
+                    values["max_gathered_chars"] = gathered_chars
+                    sources["max_gathered_chars"] = (
+                        f"auto-tune (retrieval scaled to {tuned_ctx:,} tok"
+                        + (", local-moe smaller window" if moe else "") + ")")
+                    applied = True
+                    notes.append("max_gathered_chars: "
+                                 f"{previous:,} -> {gathered_chars:,}")
+                else:
+                    verb = "shrink" if gathered_chars < previous else "grow"
+                    notes.append(
+                        f"max_gathered_chars: would {verb} {previous:,} -> "
+                        f"{gathered_chars:,} (confidence {confidence:.2f} < "
+                        "0.50, proposal only)")
         if not _is_explicit(cfg, "flat_map_token_budget"):
+            previous = values["flat_map_token_budget"]
             map_tokens = int(min(4000, max(800, tuned_ctx / 16.0 * pressure)))
-            if values["flat_map_token_budget"] != map_tokens:
-                values["flat_map_token_budget"] = map_tokens
-                sources["flat_map_token_budget"] = (
-                    f"auto-tune (map scaled to {tuned_ctx:,} tok"
-                    + (", local-moe smaller window" if moe else "") + ")")
-                applied = True
-                notes.append("flat_map_token_budget: "
-                             f"{getattr(cfg, 'flat_map_token_budget', 0):,} -> "
-                             f"{map_tokens:,}")
+            if previous != map_tokens:
+                if confident:
+                    values["flat_map_token_budget"] = map_tokens
+                    sources["flat_map_token_budget"] = (
+                        f"auto-tune (map scaled to {tuned_ctx:,} tok"
+                        + (", local-moe smaller window" if moe else "") + ")")
+                    applied = True
+                    notes.append("flat_map_token_budget: "
+                                 f"{previous:,} -> {map_tokens:,}")
+                else:
+                    verb = "shrink" if map_tokens < previous else "grow"
+                    notes.append(
+                        f"flat_map_token_budget: would {verb} {previous:,} -> "
+                        f"{map_tokens:,} (confidence {confidence:.2f} < "
+                        "0.50, proposal only)")
     else:
         notes.append("no usable KV-cache estimate; context left untouched")
 

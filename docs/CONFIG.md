@@ -544,6 +544,12 @@ When enabled for a local profile:
   size is known, the proposal is also capped by the same VRAM window `auto_fit` derives,
   so `k_cache_quant` / `v_cache_quant` can never make the tuner suggest a window the
   server cannot hold.
+- **Confidence scales the action.** Below a footprint confidence of 0.50 (for example,
+  all KV geometry guessed from the model name), the tuner still computes the would-be
+  context and retrieval-budget numbers but reports them only as notes: no value is
+  written. At 0.50 and above the same calculations apply as before. When a KV-geometry
+  field was estimated, the notes say so and point at `model_layers` / `model_kv_heads` /
+  `model_head_dim` / `model_quant` or `pdc profile --run`.
 - **Retrieval budgets** (`max_gathered_chars`, `flat_map_token_budget`) scale with the
   tuned context; memory-heavy local-MoE profiles get a smaller window than dense profiles
   at the same context.
@@ -559,6 +565,15 @@ When enabled for a local profile:
 - **No telemetry means abstain.** With no VRAM reader, auto-tune uses RAM headroom only on
   a unified-memory platform (macOS). Everywhere else it leaves the config untouched; a
   missing reader is never interpreted as zero free memory.
+
+**Who owns a value.** A value you set (config file, profile, environment or CLI) is
+explicit to both `auto_fit` and the tuner, and neither overwrites it. A value written by
+auto-tune is tagged `auto-tune (...)`; `auto_fit` treats that tag as explicit, so its VRAM
+window will not replace the tuned number on a later load, while the tuner treats its own
+tag as soft and may refine a previous tuning pass when the hardware snapshot or metadata
+changes. That one-way pinning is deliberate: `auto_fit` honors the tuned window, and the
+tuner remains able to correct its earlier output. To pin a number against both, set it
+explicitly in the config or profile.
 
 The applied per-field origins use the same `sources` provenance convention as the
 `local-moe` defaults, for example

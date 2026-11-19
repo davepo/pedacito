@@ -307,6 +307,62 @@ def test_tuning_tight_vram_shrinks_to_safety_floor():
     assert "4,096" in out["sources"]["context_tokens"]
 
 
+def test_low_confidence_name_only_footprint_proposes_without_applying():
+    """R3.1: a 0.10-confidence footprint is a guess. The tuner may show the
+    would-be cuts, but must leave every config value alone."""
+    cfg = _cfg(model="some-14b-model")
+    before = copy.deepcopy(cfg.__dict__)
+    fp = profiler.estimate_model_footprint("some-14b-model", "", 8192)
+    assert fp["confidence"] < 0.5
+    out = profiler.tune_profile(cfg, _snap(vram_total=8.0, vram_free=2.0),
+                                fp, None)
+    assert out["applied"] is False
+    assert out["values"]["context_tokens"] == 8192
+    assert out["values"]["max_gathered_chars"] == 24000
+    assert out["values"]["flat_map_token_budget"] == 4000
+    assert out["sources"] == {}
+    text = " ".join(out["notes"])
+    assert "would shrink" in text and "proposal only" in text
+    assert "metadata guessed" in text
+    assert "model_layers" in text and "pdc profile --run" in text
+
+    out2 = profiler.apply_auto_tune(
+        cfg, snap=_snap(vram_total=8.0, vram_free=2.0), footprint=fp,
+        probe={})
+    assert out2["applied"] is False
+    assert cfg.__dict__ == before
+
+
+def test_high_confidence_metadata_still_shrinks_to_floor():
+    cfg = _cfg(model="some-14b-model")
+    fp = profiler.estimate_model_footprint(
+        {"total_params_b": 14, "n_layers": 48, "n_kv_heads": 8,
+         "head_dim": 128, "source": "llama.cpp /props"}, "q4", 8192)
+    assert fp["confidence"] >= 0.5
+    out = profiler.tune_profile(cfg, _snap(vram_total=8.0, vram_free=2.0),
+                                fp, None)
+    assert out["applied"] is True
+    assert out["values"]["context_tokens"] == 4096
+    assert out["values"]["max_gathered_chars"] == 2728
+    assert out["values"]["flat_map_token_budget"] == 800
+    assert not any("metadata guessed" in n for n in out["notes"])
+
+
+def test_auto_tune_source_precedence_is_one_way():
+    """R3.3: an auto-tune write is explicit to config.auto_fit (so it is not
+    replaced) but soft to the tuner itself (so a later load can refine it)."""
+    source = ("auto-tune (VRAM 19.8 GB free via nvidia-smi; weights 7.0 GB; "
+              "KV 0.1989 GB/1k tok; confidence 0.95; floor 4096)")
+    assert config_mod._is_explicit_limit(source) is True
+    cfg = _cfg()
+    cfg.sources["context_tokens"] = source
+    assert profiler._is_explicit(cfg, "context_tokens") is False
+    # A user value is explicit to both subsystems.
+    cfg.sources["context_tokens"] = "config file"
+    assert config_mod._is_explicit_limit("config file") is True
+    assert profiler._is_explicit(cfg, "context_tokens") is True
+
+
 def test_tuning_roomy_vram_proposes_growth_only():
     cfg = _cfg()
     out = profiler.tune_profile(
@@ -655,6 +711,11 @@ def test_config_load_auto_tune_uses_the_snapshot(monkeypatch, tmp_path):
         "[profiles.x]\n"
         'base_url = "http://127.0.0.1:1234/v1"\n'
         'model = "some-14b"\n'
+        "model_params_b = 14\n"
+        "model_layers = 48\n"
+        "model_kv_heads = 8\n"
+        "model_head_dim = 128\n"
+        'model_quant = "q4"\n'
         "vram_gb = 8\n"
         "auto_tune = true\n", encoding="utf-8")
     cfg = config_mod.load(root=tmp_path, explicit=path, profile="x",
