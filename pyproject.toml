@@ -86,7 +86,9 @@ packages = ["pedacito", "pedacito.gui"]
 [tool.setuptools.package-data]
 "pedacito.gui" = ["static/*"]
 
-# `pedacito how` reads these two files at runtime. Keep them in a normal
-# (non-editable) install as well as in a checkout.
+# `pedacito how` reads these files at runtime. Keep them in a normal
+# (non-editable) install as well as in a checkout. The modular guides keep
+# their docs/ path so links inside the installed README resolve too.
 [tool.setuptools.data-files]
 "share/pedacito" = ["README.md", "QUICKSTART.md", "MODEL_GUIDE.md"]
+"share/pedacito/docs" = ["docs/*.md"]

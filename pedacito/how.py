@@ -45,6 +45,10 @@ DOC_FILES = ("README.md", "QUICKSTART.md")
 # Optional docs: older installs may not have these, so they are not required
 # for find_docs_root(), but they join the help corpus when present.
 OPTIONAL_DOC_FILES = ("MODEL_GUIDE.md",)
+# The README split moved the long-form prose into docs/*.md. Those guides are
+# optional too (a wheel may predate them), but when present they are part of
+# the corpus under their checkout-relative name (for example docs/CONFIG.md).
+DOCS_DIR = "docs"
 # Split long documentation sections and source units so retrieval can pick the
 # matching part instead of feeding a 20k-character section to a small model.
 MAX_ITEM_CHARS = 3200
@@ -230,14 +234,24 @@ class HowError(RuntimeError):
 
 def find_docs_root() -> Path:
     """Return the directory containing README.md and QUICKSTART.md: $PEDACITO_DOCS,
-    the checkout around this package, the package directory, setuptools
-    `data-files` locations, then the current directory."""
+    the checkout around this package, the package directory, package-relative
+    and interpreter `share/pedacito` data-files locations, then the current
+    directory. A normal wheel install keeps the modular guides beside those
+    files in `<share>/pedacito/docs/`."""
     here = Path(__file__).resolve().parent
     candidates: list[Path] = []
     env = os.environ.get("PEDACITO_DOCS")
     if env:
         candidates.append(Path(env).expanduser())
     candidates += [here.parent, here]
+    # `pip install --target DIR` puts the package at DIR/pedacito and its
+    # data-files at DIR/share/pedacito, while sysconfig still reports the
+    # running interpreter's prefix. Check the package-relative layouts first
+    # so an isolated target install finds its own docs.
+    candidates += [
+        here.parent / "share" / "pedacito",
+        here.parent / "data" / "share" / "pedacito",
+    ]
     try:
         data = sysconfig.get_path("data")
         if data:
@@ -319,13 +333,24 @@ def _string_constants(rel: str, source: str) -> list[Chunk]:
     return out
 
 
+def _documentation_paths(root: Path) -> list[tuple[str, Path]]:
+    """The root guides plus every docs/*.md, keyed by their checkout-relative
+    name. The docs directory is optional: an older installation without it
+    still gets the README/QUICKSTART/source corpus."""
+    paths = [(name, root / name) for name in DOC_FILES + OPTIONAL_DOC_FILES]
+    docs = root / DOCS_DIR
+    if docs.is_dir():
+        paths += [(f"{DOCS_DIR}/{path.name}", path)
+                  for path in sorted(docs.glob("*.md"))]
+    return paths
+
+
 def build_corpus(docs_root: Path | None = None) -> list[Chunk]:
-    """README, QUICKSTART, the config templates and the package's Python modules
-    as searchable chunks."""
+    """README, QUICKSTART, docs/*.md, the config templates and the package's
+    Python modules as searchable chunks."""
     root = docs_root or find_docs_root()
     chunks: list[Chunk] = []
-    for name in DOC_FILES + OPTIONAL_DOC_FILES:
-        path = root / name
+    for name, path in _documentation_paths(root):
         if not path.is_file():
             continue
         try:
@@ -422,7 +447,7 @@ def rank_chunks(question: str, chunks: list[Chunk]) -> list[tuple[float, Chunk]]
                 tf + 1.2 * (0.25 + 0.75 * dl / max(avgdl, 1)))
             if term in heading:
                 score += weight * idf * 2.5
-        if chunk.file in DOC_FILES:
+        if chunk.file in DOC_FILES or chunk.file.startswith(DOCS_DIR + "/"):
             score *= 1.12
         ranked.append((score, chunk))
     ranked.sort(key=lambda pair: pair[0], reverse=True)
@@ -457,8 +482,8 @@ def select_references(question: str, chunks: list[Chunk], cfg: Config,
                       history: list[tuple[str, str]] | None = None
                       ) -> tuple[str, list[Chunk]]:
     """Pick excerpts for one question: always the best README section, the best
-    QUICKSTART section and the CLI preamble, then top-ranked source and docs
-    until the budget is used."""
+    QUICKSTART section, the best relevant docs/ guide and the CLI preamble,
+    then top-ranked source and docs until the budget is used."""
     history = history or []
     ranked = rank_chunks(question, chunks)
     by_file: dict[str, list[tuple[float, Chunk]]] = {}
@@ -487,10 +512,18 @@ def select_references(question: str, chunks: list[Chunk], cfg: Config,
         used += len(block) + 2
         return True
 
-    # Best section from each documentation file.
+    # Best section from each root guide.
     for name in DOC_FILES:
         candidates = [(s, c) for s, c in by_file.get(name, []) if c.source]
         add(candidates[0][1] if candidates else None)
+
+    # The best scored docs/ section, when one matched the question at all.
+    docs_candidates = [(s, c) for _name, candidates in by_file.items()
+                       if _name.startswith(DOCS_DIR + "/")
+                       for s, c in candidates if c.source]
+    docs_candidates.sort(key=lambda pair: pair[0], reverse=True)
+    if docs_candidates and docs_candidates[0][0] > 0:
+        add(docs_candidates[0][1])
 
     # cli.py's command list helps almost every "what command..." question.
     cli_preamble = next(
@@ -576,8 +609,9 @@ tool that lets a small local LLM work on a codebase through a lookup index.
 Your only job is to explain how to install, configure, and use Pedacito.
 
 Use the REFERENCE MATERIAL and CURRENT CONFIG below as the source of truth.
-They come from Pedacito's README, QUICKSTART, and source code. Use the code
-excerpts to confirm exact command names, flags, defaults, and behaviors.
+They come from Pedacito's README, QUICKSTART, the modular guides in docs/
+when installed, and source code. Use the code excerpts to confirm exact
+command names, flags, defaults, and behaviors.
 Do not invent commands, flags, paths, defaults, or settings that are not
 supported there.
 
@@ -765,9 +799,14 @@ class HowSession:
         context, picked = select_references(
             question, self._corpus(), self.cfg, snapshot, self.history)
         if verbose:
+            # Mention docs/ only when an excerpt actually came from it, so the
+            # footer stays true for older installs without the modular guides.
+            sources = ("README, QUICKSTART, docs/, and source"
+                       if any(c.file.startswith(DOCS_DIR + "/") for c in picked)
+                       else "README, QUICKSTART, and source")
             print(f"  [help references: {len(picked)} excerpt(s), "
-                  f"~{estimate_tokens(context):,} tokens from README, "
-                  f"QUICKSTART, and source]", file=sys.stderr)
+                  f"~{estimate_tokens(context):,} tokens from {sources}]",
+                  file=sys.stderr)
 
         user = (
             f"QUESTION\n{question}\n\n"
