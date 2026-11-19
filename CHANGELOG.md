@@ -2,7 +2,7 @@
 
 All notable changes to Pedacito (`pdc`) are documented here.
 
-## v0.3.1 — unreleased
+## v0.3.1 — 2026-11-18
 
 ### Advanced System Profiling & Model Auto-Tuning
 
@@ -58,6 +58,42 @@ All notable changes to Pedacito (`pdc`) are documented here.
 - Docs: INSTALLATION "Upgrading", CONFIG reference row, README feature row,
   QUICKSTART B1, SECURITY network-boundary note, ARCHITECTURE phone-home
   clarification; how-cards for the CLI command, the GUI topic and the setting.
+
+### README Modularization into `docs/`
+
+- **README split** — the detailed reference moved out of `README.md` into
+  `docs/INSTALLATION.md`, `docs/ARCHITECTURE.md`, `docs/SECURITY.md`,
+  `docs/CONFIG.md` and `docs/USAGE.md`. The README is now the summary, the
+  30-second install, the release tables and the doc index.
+- **Doc audit fixes** — Strata/Avalon rows in the INSTALLATION server table and
+  the `local-moe` tier note; SECURITY filler-detection wording matches
+  `safety.redact`; the trusted-project-config list now names `load_cmd`,
+  `unload_cmd`, `enable_mcp`, `allow_mcp`, the sandbox and scrub keys and
+  `verify_tests`, `verify_dom`, `dom_entry`; the checkpoint section covers
+  `⑂ Branch Prompt From Here`, `pedacito restore --snapshot` and empty-directory
+  cleanup on `--delete-created`; the permission dialog button is named
+  **Deny & Redirect**; the INSTALLATION `config --init` starter is documented.
+- **Test guard** — `tests/test_doc_sync.py` checks the modular corpus
+  (README plus `docs/*.md`) for every CLI subcommand and feature needle, and
+  the how-cards against the same features.
+
+### Agent Security Guide (`docs/SECURITY.md`)
+
+- A new guide for running coding agents safely, organized around four pillars:
+  **credential isolation and pre-flight scanning**, **strict workspace
+  sandboxing**, **least-privilege execution** (OS sandbox, timeouts, command
+  policy, permission broker) and an **immutable audit trail with time travel**
+  (checkpoints, inspect-before-undo, roll back, retention).
+- It also carries the threat model, a summary checklist, known limits and the
+  vulnerability reporting path.
+
+### Run-tab Environment Credential Scrub
+
+- **`pedacito/runner.py`** — Run-tab child processes no longer inherit
+  credential variables from the exported shell. Names matching `*_API_KEY`,
+  `*SECRET*`, `*TOKEN*`, `*PASSWORD*`, `*ACCESS_KEY*` or `*CREDENTIAL*`
+  (case-insensitive), plus `GITHUB_TOKEN` and `PYPI_API_KEY`, are dropped from
+  the child environment before the process starts.
 
 ## v0.3.0 — 2026-11-18
 
