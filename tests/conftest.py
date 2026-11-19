@@ -40,6 +40,9 @@ def _isolate_environment(tmp_path, tmp_path_factory, monkeypatch):
     monkeypatch.setattr(config_mod, "USER_STATE_DIR", iso / "state" / "pedacito")
     for key in [k for k in os.environ if k.startswith("PEDACITO_")]:
         monkeypatch.delenv(key, raising=False)
+    # The update check is the one feature that may touch the network: keep the
+    # whole suite offline by default. Feature tests re-enable it explicitly.
+    monkeypatch.setenv("PEDACITO_CHECK_FOR_UPDATES", "false")
     # `_user_config_dir()` prefers $XDG_CONFIG_HOME (or %APPDATA% on Windows)
     # over $HOME. CI images set it to the runner's real profile, so a test
     # that points HOME at a tmp dir would still touch the real user config.

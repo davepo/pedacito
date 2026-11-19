@@ -2,6 +2,34 @@
 
 All notable changes to Pedacito (`pdc`) are documented here.
 
+## v0.3.1 — unreleased
+
+### Context-Aware Auto-Update (opt-out, local-first)
+
+- **`pedacito/update.py`** — one anonymous GET of the public PyPI metadata at
+  GUI/TUI/agent startup, on a daemon thread (2 s timeout, never blocks
+  startup), cached 24 h beside the user config (`update_check.json`).
+  Offline, timeout, non-200 or malformed JSON is a silent no-op. Semver-aware
+  comparison (pre-releases sort before their final release), yanked releases
+  ignored, never nags when installed >= latest.
+- **Install-method detection** — pipx / editable / venv / user-pip / unknown,
+  from local heuristics (package path, `__editable__` finders, egg-links,
+  `pyvenv.cfg`, guarded `pipx list --json`). The upgrade is always an argv
+  list run with `shell=False`; editable checkouts get `git pull && pip
+  install -e .` instructions instead of a command, and PEP 668
+  externally-managed Pythons get a pipx/venv note.
+- **GUI** — slim dismissible banner (*Pedacito vX.Y.Z is available*), Update
+  streams the upgrade into an output drawer, exit 0 offers Restart Pedacito
+  (re-exec on the same port); failure or editable shows the manual command.
+  In-flow, never covers controls, no modals.
+- **CLI** — `pedacito update [--run]`; **TUI** — `/update [run]`.
+- **`check_for_updates`** (default true) — the single opt-out: false means
+  zero network calls and zero upgrade subprocesses everywhere; the app
+  behaves exactly as before. Also `PEDACITO_CHECK_FOR_UPDATES=false`.
+- Docs: INSTALLATION "Upgrading", CONFIG reference row, README feature row,
+  QUICKSTART B1, SECURITY network-boundary note, ARCHITECTURE phone-home
+  clarification; how-cards for the CLI command, the GUI topic and the setting.
+
 ## v0.3.0 — 2026-11-18
 
 The release built around **time travel, live feedback and two-model

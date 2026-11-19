@@ -547,6 +547,7 @@ config --reference` prints the annotated template. Key settings:
 | `stuck_recovery` | true | One targeted recovery prompt before gather gives up. |
 | `use_model_card` | true | Let `pedacito calibrate`'s card fill unset settings. |
 | `show_telemetry` | true | One-line telemetry ribbon on stderr after each task (context bar, turn tokens, speed, cache hit); never shown in `--jsonl` / rpc modes. See [Live telemetry](USAGE.md#live-telemetry). |
+| `check_for_updates` | true | Quiet PyPI release check at startup: one anonymous GET (2 s timeout, cached 24 h beside the user config), a dismissible GUI banner with streamed upgrade + Restart, `pedacito update [--run]`, TUI `/update`. `false` = zero network calls and zero upgrade subprocesses everywhere. See [Upgrading](INSTALLATION.md#upgrading). |
 | `log_events` / `keep_events` | true / 20 | Local JSONL telemetry under `.pedacito/events/`. |
 | `summary_workers` / `refresh_summaries` | 0 / 12 | Concurrent summaries (0 = auto: hosted 4, local 1); units re-summarised after a task. |
 | `summary_batch` | 1 | Short units summarised N per request while indexing (fewer round-trips; unparsed lines fall back to single requests). |

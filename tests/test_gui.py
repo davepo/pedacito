@@ -170,6 +170,8 @@ def gui(tmp_path, monkeypatch):
     monkeypatch.setattr(core, "RECENT_FILE", tmp_path / "cfg" / "gui_recent.json")
     for var in [k for k in os.environ if k.startswith("PEDACITO_")]:
         monkeypatch.delenv(var)
+    # Keep GUI tests offline too (the conftest guard was just scrubbed).
+    monkeypatch.setenv("PEDACITO_CHECK_FOR_UPDATES", "false")
     _reset_gui_state(tmp_path)
     srv = server.create_server(0)
     thread = threading.Thread(target=srv.serve_forever, daemon=True,

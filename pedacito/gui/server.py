@@ -16,9 +16,11 @@ import mimetypes
 import os
 import sys
 import threading
+import time
 import webbrowser
 from http.server import BaseHTTPRequestHandler
 from pathlib import Path
+from types import SimpleNamespace
 from urllib.parse import parse_qs, unquote, urlparse
 
 from .. import checkpoints as checkpoints_mod
@@ -26,6 +28,7 @@ from .. import review as review_mod
 from .. import prompts as prompts_mod
 from .. import runner as runner_mod
 from .. import security, themes as themes_mod, workspace
+from .. import update as update_mod
 from ..config import ConfigError
 from ..local_server import LocalHTTPServer
 from ..select import Matcher, is_venv_dir, suggest_context
@@ -62,6 +65,10 @@ FAVICON_SVG = (
 ).encode("utf-8")
 
 _SERVER: LocalHTTPServer | None = None
+# The args `run()` was started with, so the post-upgrade Restart button can
+# re-exec the same GUI (same port, project and profile) in place.
+_RUN_ARGS = SimpleNamespace(port=0, open_browser=True, project=None,
+                            profile=None)
 
 
 # --- helpers ------------------------------------------------------------------
@@ -299,6 +306,88 @@ def _engine(q, body=None):
 @get("/api/snapshot")
 def _snapshot(q, body=None):
     return 200, STATE.snapshot()
+
+
+# --- auto-update (pedacito.update): notice, manual check, upgrade, restart ----
+
+@get("/api/update")
+def _update_get(q, body=None):
+    with STATE.lock:
+        info = dict(STATE.update) if STATE.update else None
+        run = dict(STATE.update_run)
+        cfg = STATE.cfg
+    return 200, {"ok": True, "update": info, "update_run": run,
+                 "check_for_updates": update_mod.updates_enabled(cfg)}
+
+
+@post("/api/update/check")
+def _update_check(q, body=None):
+    """Manual 'check now': bypasses the 24 h cache. Synchronous but bounded
+    (2 s network timeout); with the opt-out set it makes no network call."""
+    with STATE.lock:
+        cfg = STATE.cfg
+    info = update_mod.check_for_update(cfg, manual=True)
+    STATE.note_update(info)
+    return 200, {"ok": True, "update": info}
+
+
+@post("/api/update/run")
+def _update_run(q, body=None):
+    """Run the detected upgrade command in the background, streaming its
+    output into the drawer. Editable installs and the opt-out get the manual
+    instructions instead (ok=False); a second click while running is a 409."""
+    with STATE.lock:
+        cfg = STATE.cfg
+        if STATE.update_run["running"]:
+            return 409, {"ok": False,
+                         "detail": "An upgrade is already running."}
+        info = STATE.update
+    if not update_mod.updates_enabled(cfg):
+        method = update_mod.detect_install_method(query_pipx=False)
+        _cmd, instructions = update_mod.upgrade_command(method)
+        return 200, {"ok": False, "detail": instructions}
+    method = (info or {}).get("method") or update_mod.detect_install_method()
+    command, instructions = update_mod.upgrade_command(method)
+    if command is None:
+        return 200, {"ok": False, "detail": instructions}
+    STATE.update_run_start(command)
+
+    def worker():
+        code = update_mod.run_upgrade(command, on_line=STATE.note_update_output)
+        STATE.update_run_done(code)
+
+    threading.Thread(target=worker, name="pedacito-gui-update-run",
+                     daemon=True).start()
+    return 202, {"ok": True, "running": True, "command": command}
+
+
+@post("/api/update/restart")
+def _update_restart(q, body=None):
+    """After a successful upgrade, re-exec this GUI on the SAME port so the
+    open page reconnects to the new version. Only offered when the run's
+    exit code was 0."""
+    with STATE.lock:
+        ok = bool(STATE.update_run.get("ok"))
+    if not ok:
+        return 409, {"ok": False,
+                     "detail": "No successful upgrade to restart into."}
+    args = _RUN_ARGS
+    argv = [sys.executable, "-m", "pedacito", "gui", "--port", str(args.port)]
+    if not args.open_browser:
+        argv.append("--no-open")
+    if args.project:
+        argv.append(str(args.project))
+        if args.profile:
+            argv += ["--profile", str(args.profile)]
+
+    def restart():
+        time.sleep(0.5)          # let the HTTP answer reach the page first
+        shutdown_server()
+        os.execv(sys.executable, argv)
+
+    threading.Thread(target=restart, name="pedacito-gui-restart",
+                     daemon=True).start()
+    return 200, {"ok": True, "detail": "Restarting Pedacito…"}
 
 
 @get("/api/files")
@@ -2454,12 +2543,19 @@ def run(port: int = 0, open_browser: bool = True, project: str | None = None,
         profile: str | None = None) -> None:
     """Start the GUI server; block until Ctrl-C or the page's Exit button.
     `project` (and `profile`) open that folder as soon as the server is up."""
+    global _RUN_ARGS
     srv = create_server(port)
+    _RUN_ARGS = SimpleNamespace(port=srv.server_address[1],
+                                open_browser=open_browser,
+                                project=project, profile=profile)
     url = f"http://127.0.0.1:{srv.server_address[1]}/"
     print(f"pedacito gui running at {url}  (Ctrl-C to stop)", file=sys.stderr)
     originals = install_tee()
     install_runner()
     install_permission_broker()
+    # Quiet release check on a daemon thread: never delays startup by a
+    # network round-trip, silent when offline or opted out (pedacito.update).
+    update_mod.check_for_update_async(on_done=STATE.note_update)
     if project:
         path = str(Path(project).expanduser().resolve())
         STATE.set_root(path)     # report any existing index before the open job

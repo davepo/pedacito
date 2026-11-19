@@ -979,6 +979,13 @@ class Config:
     keep_events: int = 20
     log_max_bytes: int = 2_000_000
 
+    # --- Updates (opt-out) ------------------------------------------------------
+    # Quiet check for newer Pedacito releases on PyPI: one anonymous GET at
+    # startup (daemon thread, 2 s timeout, cached 24 h beside the user
+    # config), a dismissible GUI banner, `pdc update` and the TUI `/update`.
+    # false = zero network calls and zero upgrade subprocesses, everywhere.
+    check_for_updates: bool = True
+
     # Bookkeeping for `pedacito config`; not settings.
     sources: dict = None
     profiles: dict = None
@@ -3108,6 +3115,9 @@ create_ignore_file = true
 # midnight, jazz_solo, trapper_keeper, memphis_arcade, windbreaker). The GUI's
 # topbar picker writes this key; cosmetic only, never reloads the project.
 gui_theme = "slate"
+# check_for_updates: quiet PyPI release check at startup (one anonymous GET,
+# cached 24 h; GUI banner, `pdc update`, TUI `/update`). false = fully offline.
+check_for_updates = true
 
 [indexing]
 # Chunking and retrieval. Oversized units split at statement boundaries.

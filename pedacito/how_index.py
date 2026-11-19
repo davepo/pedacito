@@ -460,7 +460,7 @@ CLI_COMMANDS = [
             "/auto! GOAL (force the multi-step loop, skipping the Task-mode "
             "suggestion), /plan, /consolidate (/compact), /profile, /model ID, "
             "/auto-route, /think, /creative, /apply, /skills, /memory, /procs, "
-            "/diff, /undo, /reset, /sidebar, /scroll, /mouse, /clear, /quit",
+            "/diff, /undo, /update, /reset, /sidebar, /scroll, /mouse, /clear, /quit",
             "/auto GOAL nudges single-pass edits: when the goal looks like a "
             "one-pass Task (existing-file tweaks, localized edit verbs, a "
             "tiny project), the TUI asks 'Run as a single-pass Task instead? "
@@ -1016,6 +1016,36 @@ CLI_COMMANDS = [
         ],
     },
     {
+        "name": "update",
+        "usage": "pedacito update [--run] [--config FILE]",
+        "summary": "Check PyPI for a newer Pedacito release and upgrade this "
+                   "install. One anonymous GET (2 s timeout, cached 24 h); "
+                   "offline is a quiet no-op. The upgrade command matches "
+                   "how Pedacito was installed (pipx, venv, pip --user); "
+                   "editable checkouts get git-pull instructions instead.",
+        "keywords": ["update", "upgrade", "new version", "release", "pipx",
+                     "check for updates", "offline"],
+        "examples": [
+            "pedacito update",
+            "pedacito update --run",
+        ],
+        "flags": [
+            {"flag": "--run",
+             "help": "run the detected upgrade command without asking"},
+            {"flag": "--config FILE",
+             "help": "config file to read check_for_updates from"},
+        ],
+        "notes": [
+            "Opt out entirely with check_for_updates = false in config.toml "
+            "(or PEDACITO_CHECK_FOR_UPDATES=false): zero network calls and "
+            "zero upgrade subprocesses, everywhere (GUI banner, TUI /update, "
+            "this command).",
+            "The GUI shows a slim dismissible banner when a newer release "
+            "exists; Update streams the upgrade into an output drawer and "
+            "offers Restart on success. The TUI command is /update [run].",
+        ],
+    },
+    {
         "name": "serve",
         "usage": "pedacito serve [--name NAME] [--wait SECONDS] -- COMMAND...",
         "summary": "Start a background dev server, keep it alive, capture its "
@@ -1363,6 +1393,33 @@ GUI_TOPICS = [
                      "reasoning"],
         "settings": ["disable_thinking", "thinking_suffix"],
         "cli": ["config", "calibrate"],
+    },
+    {
+        "id": "update-pedacito",
+        "title": "Update Pedacito to a newer release",
+        "summary": "A slim banner appears when a newer release is on PyPI; "
+                   "Update runs the command for your install method and "
+                   "streams its output, then offers Restart. Fully opt-out.",
+        "steps": [
+            "When a newer release exists, a banner appears under the topbar: "
+            "Pedacito vX.Y.Z is available (you have A.B.C)",
+            "Click Update: the detected upgrade command (pipx upgrade / pip "
+            "install --upgrade) runs in the background and its output "
+            "streams into a small drawer",
+            "Exit 0 → click Restart Pedacito; the GUI reopens on the same "
+            "port with the new version",
+            "A failed upgrade (or an editable/source install) shows the "
+            "output plus the manual command instead",
+            "Dismiss hides the banner until an even newer release appears",
+            "Opt out entirely: ⚙ Settings → Updates → check_for_updates → "
+            "off (zero network calls; the banner never appears)",
+        ],
+        "keywords": ["update", "upgrade", "new version", "new release",
+                     "update pedacito", "upgrade pedacito", "check for "
+                     "updates", "check_for_updates", "update banner",
+                     "pipx upgrade", "restart"],
+        "settings": ["check_for_updates"],
+        "cli": ["update"],
     },
     {
         "id": "reset-config",
@@ -2508,6 +2565,9 @@ _SETTING_GUI = {
                                "routing)",
     "gui_theme": "Topbar → theme dropdown, or ⚙ Settings → All settings → "
                  "Graphical interface → gui_theme",
+    "check_for_updates": "⚙ Settings → All settings → Updates → "
+                         "check_for_updates (off = fully offline: no release "
+                         "check, no update banner)",
     "disable_thinking": "⚙ Settings → Profiles → [Select Profile] → Reasoning "
                         "& Execution Overrides → disable_thinking (Thinking)",
     "thinking_suffix": "⚙ Settings → Profiles → [Select Profile] → Reasoning "
@@ -2575,6 +2635,9 @@ _SETTING_KEYWORDS = {
     "default_profile": ["default model", "default profile", "startup model"],
     "gui_theme": ["theme", "colour scheme", "color scheme", "dark mode",
                   "light mode"],
+    "check_for_updates": ["update", "upgrade", "new version", "new release",
+                          "check for updates", "update check", "phone home",
+                          "offline", "opt out", "update banner"],
     "review": ["review page", "diff review", "approve changes"],
     "backup": ["backup", "snapshot", "undo", "restore"],
     "allow_shell": ["run commands", "shell", "tool permission", "allow run"],

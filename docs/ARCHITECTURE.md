@@ -94,9 +94,12 @@ of generating.
    when you have them installed.
 4. **Zero phone-home.** "Telemetry" in Pedacito means *your* local Context Meter,
    Burn Rate, and `tok/s` speed figures, written to `.pedacito/events/` in your
-   project. Pedacito sends no analytics, no update checks, and no crash reports.
-   The network is used only for the model servers and hosted APIs you configure,
-   and for web tools you turn on.
+   project. Pedacito sends no analytics and no crash reports. The only release
+   check is one anonymous GET of the public PyPI metadata at startup (2 s
+   timeout, cached 24 h, never blocking), and `check_for_updates = false`
+   disables even that — zero network calls. Otherwise the network is used only
+   for the model servers and hosted APIs you configure, and for web tools you
+   turn on.
 
 ### Local-first, hybrid-ready architecture
 

@@ -232,6 +232,12 @@ guards it in four ways:
 - Project files are served only from inside the project root. The `/preview/` route
   refuses `..` segments and escaping symlinks, and frames only from the same origin.
 
+The auto-update check (`pedacito/update.py`) stays inside the same boundary:
+the browser never contacts PyPI itself (the CSP's `connect-src 'self'` forbids
+it) — the local server makes the one anonymous GET, and the upgrade runs as an
+argv list with `shell=False`. `check_for_updates = false` turns the whole
+feature off: no request, no subprocess, no banner.
+
 The `fetch` and `web_search` tools (`pedacito/webfetch.py`) add an SSRF guard:
 
 - Only full `http` and `https` URLs are fetched.

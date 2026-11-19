@@ -25,7 +25,7 @@ Slash commands mirror `pedacito chat` and add the TUI-specific panes:
 `/help`, `/status` (`/telemetry`), `/auto`, `/plan`, `/consolidate`
 (`/compact`), `/profile`, `/auto-route`, `/think`, `/apply`, `/skills`,
 `/memory`, `/procs`, `/diff`, `/checkpoints`, `/undo`, `/checkout`, `/run`,
-`/fix`, `/reset`, `/sidebar`, `/clear`, and `/quit` (`/exit`).
+`/fix`, `/update`, `/reset`, `/sidebar`, `/clear`, and `/quit` (`/exit`).
 """
 
 from __future__ import annotations
@@ -61,6 +61,7 @@ from . import select as select_mod
 from . import servers as servers_mod
 from . import skills as skills_mod
 from . import themes as themes_mod
+from . import update as update_mod
 from . import workspace
 from .agent import Agent
 from .config import Config
@@ -131,6 +132,7 @@ _SLASH_COMMANDS = [
     "/apply", "/skills", "/memory", "/procs", "/security", "/theme",
     "/pin", "/rules", "/hybrid", "/arena",
     "/diff", "/checkpoints", "/undo", "/checkout", "/run", "/fix",
+    "/update",
     "/reset", "/sidebar", "/scroll", "/mouse", "/clear",
     "/quit", "/exit",
 ]
@@ -218,6 +220,9 @@ Pedacito TUI commands
   /run [CMD]                run the detected entrypoint or CMD, show output
   /fix                      send the last /run crash traceback into a repair
                             task
+  /update [run]             check PyPI for a newer Pedacito and offer the
+                            upgrade (run skips the confirmation; editable
+                            installs get git-pull instructions)
   /reset                    wipe .pedacito state (keeps memory and config)
   /sidebar                  toggle the activity / plan pane
   /scroll up|down|top|bottom|N
@@ -607,6 +612,12 @@ class TuiSession:
             pass
         self._init_event_tail()
         self.install_permission_handler()
+        # Quiet release check on a daemon thread (pedacito.update): never
+        # delays startup by a network round-trip; silent when offline or
+        # opted out (check_for_updates = false).
+        self.update_info: dict | None = None
+        self._update_thread = update_mod.check_for_update_async(
+            self.cfg, on_done=self._note_update)
 
     # ---------------------------------------------------------------- state
     @property
@@ -2863,6 +2874,9 @@ class TuiSession:
         if cmd == "fix":
             self._fix_last_crash()
             return
+        if cmd == "update":
+            self._update(arg)
+            return
         if cmd == "reset":
             self._reset()
             return
@@ -3832,6 +3846,56 @@ class TuiSession:
         self._append("Sending the last crash into a repair task\u2026",
                      "system")
         self.run_task(prompt)
+
+    def _update(self, arg: str) -> None:
+        """`/update [run]`: installed vs latest PyPI release, the detected
+        install method, and the matching upgrade. `run` skips the y/N
+        confirmation; editable installs get git instructions, no command."""
+        run_now = arg.strip().lower() in ("run", "--run", "-y")
+        info = update_mod.check_for_update(self.cfg, manual=True)
+        if info["detail"] == "disabled":
+            self._append("Update checks are disabled (check_for_updates = "
+                         "false). No network call was made.\n"
+                         + info["instructions"], "system")
+            return
+        if not info["ok"]:
+            self._append("Could not reach PyPI (offline?). Nothing was "
+                         "changed.\nManual upgrade: " + info["instructions"],
+                         "system")
+            return
+        lines = [f"Installed: {info['current']}    Latest: {info['latest']}",
+                 f"Install method: {info['method']}"]
+        if not info["update_available"]:
+            self._append("\n".join(lines + ["You are up to date."]), "system")
+            return
+        lines.append(info["instructions"])
+        self._append("\n".join(lines), "system")
+        if info["command"] is None:
+            return                      # editable/source: instructions only
+        if not run_now and not self._confirm(
+                f"Upgrade to {info['latest']} now? (y/N):"):
+            self._append("upgrade cancelled", "system")
+            return
+        self._append("Running: " + " ".join(info["command"]), "system")
+        out: list[str] = []
+        code = update_mod.run_upgrade(info["command"], on_line=out.append)
+        tail = "\n".join(out[-40:])
+        prefix = tail + "\n" if tail else ""
+        if code == 0:
+            self._append(prefix + f"Upgrade finished (exit 0). Restart "
+                         f"Pedacito to run {info['latest']}.", "system")
+        else:
+            self._append(prefix + f"Upgrade failed (exit {code}).\n"
+                         f"Manual upgrade: {info['instructions']}", "error")
+
+    def _note_update(self, info: dict) -> None:
+        """The startup check's daemon-thread result: remember it, and drop
+        one quiet line into the transcript when a newer release exists."""
+        self.update_info = info
+        if info.get("update_available"):
+            self._append(f"Pedacito v{info['latest']} is available (you have "
+                         f"{info['current']}). Run /update to upgrade.",
+                         "system")
 
     def _confirm(self, question: str) -> bool:
         self._set_banner(question)

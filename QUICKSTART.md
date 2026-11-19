@@ -526,6 +526,14 @@ documented options to your config, commented out, without touching your
 existing settings or comments. `pedacito config --upgrade --dry-run` lists
 what would be added without writing.
 
+Pedacito also tells you when a newer release exists: one anonymous PyPI check
+at startup (cached 24 h, silent when offline). `pedacito update` shows
+installed vs latest, `pedacito update --run` upgrades with the command for
+your install method (pipx, venv or pip --user; editable checkouts get
+`git pull` instructions), the GUI shows a dismissible banner with a streamed
+upgrade and Restart, and the TUI has `/update`. Set `check_for_updates = false`
+to opt out entirely — zero network calls, everything else unchanged.
+
 ### B2. Find models and measure them
 
 ```bash

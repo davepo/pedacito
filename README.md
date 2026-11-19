@@ -33,6 +33,7 @@ Pipx, optional extras and GPU server setup are in [docs/INSTALLATION.md](docs/IN
 | **`@` pinning** | Write `@file.py` or `@Class.method` in a prompt to pin that exact code into every phase of the run. | [Pinning context](docs/USAGE.md#pinning-context-with-) |
 | **Checkpoint tree** | Every run is checkpointed. Inspect each change as a unified diff, then roll back with `pdc undo` or `pdc checkout`. | [Checkpoints and rollback](docs/SECURITY.md#pillar-4-immutable-audit-trail-and-time-travel) |
 | **Hybrid routing** | A strong architect model plans a task and a fast local editor implements it. On one GPU, the architect's server is evicted between the two stages. | [Hybrid routing](docs/ARCHITECTURE.md#hybrid-routing-an-architect-plans-an-editor-implements) |
+| **Context-aware auto-update** | A quiet, opt-out release check: one anonymous PyPI GET at startup (2 s timeout, cached 24 h), a dismissible GUI banner with a streamed upgrade and Restart, `pdc update --run`, and the TUI `/update`. The command matches your install method (pipx, venv, pip --user, or git for editable checkouts). `check_for_updates = false` keeps Pedacito fully offline. | [Upgrading](docs/INSTALLATION.md#upgrading) |
 
 ## Documentation
 

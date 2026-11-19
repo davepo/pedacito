@@ -29,6 +29,7 @@ from types import SimpleNamespace
 from .. import config as config_mod
 from .. import review as review_mod
 from .. import security, workspace
+from .. import update as update_mod
 from ..config import USER_CONFIG
 from ..events import cache_hit_ratio
 from ..index import INDEX_VERSION
@@ -40,6 +41,9 @@ MAX_TERM_CHARS = 200_000
 # Live reasoning/content buffers for the stream drawer: keep the newest tail
 # only, so a runaway generation cannot grow process memory without bound.
 MAX_LIVE_CHARS = 200_000
+# Cap for the upgrade drawer's subprocess output (pedacito.update): keep the
+# newest tail so a chatty pip/pipx cannot grow process memory without bound.
+MAX_UPDATE_OUTPUT = 100_000
 QUESTION_TIMEOUT = 900.0
 # How long a gated tool call waits for a human answer before the run is
 # allowed to continue with a clean denial (the modal never leaves a worker
@@ -499,6 +503,13 @@ class State:
         # show the scorecard and the Open Generated Project button without a
         # second model call.
         self.benchmark: dict | None = None
+
+        # Context-aware auto-update (pedacito.update): the startup check's
+        # notice (None until a check lands) and the live upgrade subprocess.
+        # The banner is data-driven from these; nothing here blocks startup.
+        self.update: dict | None = None
+        self.update_run: dict = {"running": False, "ok": None, "code": None,
+                                 "output": "", "command": [], "detail": ""}
 
         # Engine V2 telemetry for the ACTIVITY & PLAN panel (see
         # `note_event` and `engine`): the live phase, the last gather step
@@ -1177,6 +1188,42 @@ class State:
         if ping:
             self.bus.publish("status")
 
+    # --- auto-update notice & upgrade run (pedacito.update) ---------------------
+
+    def note_update(self, info: dict | None) -> None:
+        """Publish the startup/manual check's result; the banner renders from
+        `status().update`. A disabled or offline check simply clears it."""
+        with self.lock:
+            self.update = dict(info) if info else None
+            payload = dict(self.update) if self.update else None
+        self.bus.publish("update", update=payload)
+
+    def update_run_start(self, command: list[str]) -> None:
+        with self.lock:
+            self.update_run = {"running": True, "ok": None, "code": None,
+                               "output": "", "command": list(command),
+                               "detail": ""}
+            payload = dict(self.update_run)
+        self.bus.publish("update_run", **payload)
+
+    def note_update_output(self, line: str) -> None:
+        """One subprocess line into the upgrade drawer (capped tail buffer)."""
+        with self.lock:
+            out = self.update_run["output"] + line + "\n"
+            if len(out) > MAX_UPDATE_OUTPUT:
+                out = out[-MAX_UPDATE_OUTPUT:]
+            self.update_run["output"] = out
+        self.bus.publish("update_output", line=line)
+
+    def update_run_done(self, code: int, detail: str = "") -> None:
+        with self.lock:
+            self.update_run["running"] = False
+            self.update_run["code"] = code
+            self.update_run["ok"] = code == 0
+            self.update_run["detail"] = detail
+            payload = dict(self.update_run)
+        self.bus.publish("update_run", **payload)
+
     def engine(self) -> dict:
         """Engine V2 state for the ACTIVITY & PLAN panel: the live phase,
         step/call counters, read spans in the ledger, the requirement ledger,
@@ -1773,6 +1820,11 @@ class State:
                 # Non-blocking security banner: unacknowledged secrets and
                 # unignored .env files, masked and fingerprint-only.
                 "security": security_payload,
+                # Context-aware auto-update: the check's notice (or null),
+                # the live upgrade run, and the effective opt-out state.
+                "update": dict(self.update) if self.update else None,
+                "update_run": dict(self.update_run),
+                "check_for_updates": update_mod.updates_enabled(cfg),
                 # specialist routing (#50): the topbar toggle's state
                 "auto_route_specialties": (bool(cfg.auto_route_specialties)
                                            if cfg else False),

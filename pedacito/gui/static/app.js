@@ -333,7 +333,12 @@ const S = {
         // Task-vs-Auto suitability: the debounced /api/mode-check verdict for
         // the current Auto draft, the pre-run confirmation bar, and the draft
         // text the user already acknowledged with "Continue with Auto".
-        modeCheck: null, modeConfirm: null, autoAck: null },
+        modeCheck: null, modeConfirm: null, autoAck: null,
+        // Auto-update notice (pedacito.update): the dismissed version string
+        // (a newer release re-shows the banner), the upgrade output drawer,
+        // and manual instructions when no upgrade command can be run.
+        updateDismissed: null, updateDrawerOpen: false, updateManual: '',
+        updateRunHidden: false },
   peek: null,
   how: { query: '', answer: null, loading: false, error: '', useModel: true },
 };
@@ -805,6 +810,20 @@ function connect(seq) {
   on('security', (e) => {
     if (e && e.message) PDC.toast(e.message);
     refreshState();
+  });
+  // Auto-update: the check's notice and the upgrade run's start/end resync
+  // state; per-line subprocess output appends locally (like 'stream' does).
+  on('update', () => refreshState());
+  on('update_run', (e) => {
+    if (e && e.running) S.ui.updateRunHidden = false;  // a new run re-shows it
+    refreshState();
+  });
+  on('update_output', (e) => {
+    const r = S.status.update_run;
+    if (r && e && typeof e.line === 'string') {
+      r.output = ((r.output || '') + e.line + '\n').slice(-100000);
+      emit();
+    }
   });
   on('job', (e) => {
     // A finished New job carries the project it created: adopt the workspace
@@ -4855,6 +4874,79 @@ function SecurityBanner() {
     </div>`;
 }
 
+// ---- Non-blocking Update notice (pedacito.update) ---------------------------
+// A slim, dismissible banner when the startup check found a newer release on
+// PyPI. Update streams the detected upgrade command into a small output
+// drawer; exit 0 offers Restart, a failure (or an editable install) shows the
+// output plus the manual command. In-flow like SecurityBanner: it pushes the
+// workspace down, never covers a control, and never opens a modal.
+function UpdateBanner() {
+  const info = S.status.update;
+  const run = S.status.update_run || {};
+  const manual = S.ui.updateManual || '';
+  const showBanner = !!(info && info.update_available
+    && S.ui.updateDismissed !== info.latest);
+  const showRun = !S.ui.updateRunHidden
+    && !!(run.running || run.ok === true || run.ok === false || manual);
+  if (!showBanner && !showRun) return null;
+  const startUpgrade = () => {
+    S.ui.updateManual = '';
+    S.ui.updateRunHidden = false;
+    PDC.api('/api/update/run', {}).then((j) => {
+      if (j.ok) { S.ui.updateDrawerOpen = true; refreshState(); }
+      else {
+        // Editable install or opt-out: no command to run, show instructions.
+        S.ui.updateManual = j.detail || 'Upgrade unavailable.';
+        S.ui.updateDrawerOpen = true; emit();
+      }
+    }, () => PDC.toast('Could not start the upgrade.', true));
+  };
+  const restart = () => {
+    PDC.api('/api/update/restart', {}).then((j) => {
+      if (!j.ok) PDC.toast(j.detail || 'Could not restart.', true);
+    });
+  };
+  const runLabel = run.running ? 'Upgrading\u2026'
+    : run.ok === true ? 'Upgrade finished'
+    : run.ok === false ? 'Upgrade failed' : 'Upgrade';
+  const runNote = run.running ? (run.command || []).join(' ')
+    : run.ok === true ? 'Restart Pedacito to run the new version.'
+    : run.ok === false ? (run.detail || 'See the output below.')
+    : manual;
+  return html`
+    <div id="updateNotice" role="status" aria-live="polite">
+      ${showBanner ? html`
+        <div class="update-head">
+          <span>\u2B06 Pedacito v${info.latest} is available</span>
+          <span class="grow">(you have ${info.current})</span>
+          <button class="small primary" disabled=${!!run.running}
+                  title="run the detected upgrade command"
+                  onClick=${startUpgrade}>Update</button>
+          <button class="ghost small" title="hide this notice until a newer release"
+                  onClick=${() => { S.ui.updateDismissed = info.latest; emit(); }}>Dismiss</button>
+        </div>` : null}
+      ${showRun ? html`
+        <div class="update-run">
+          <div class="update-head">
+            <span>${runLabel}</span>
+            <span class="grow">${runNote}</span>
+            ${run.ok === true && !run.running ? html`
+              <button class="small primary" onClick=${restart}>Restart Pedacito</button>` : null}
+            <button class="ghost small"
+                    onClick=${() => { S.ui.updateDrawerOpen = !S.ui.updateDrawerOpen; emit(); }}>
+              ${S.ui.updateDrawerOpen ? 'Hide output' : 'Show output'}</button>
+            ${!run.running ? html`
+              <button class="ghost small" title="hide this upgrade panel"
+                      onClick=${() => { S.ui.updateRunHidden = true; S.ui.updateManual = ''; emit(); }}>Close</button>` : null}
+          </div>
+          ${run.ok === false && info && info.instructions ? html`
+            <p class="update-manual">${info.instructions}</p>` : null}
+          ${S.ui.updateDrawerOpen ? html`
+            <pre class="update-out">${run.output || manual || '(no output yet)'}</pre>` : null}
+        </div>` : null}
+    </div>`;
+}
+
 function App() {
   const [, force] = useState(0);
   const appRef = useRef(null);
@@ -4870,6 +4962,7 @@ function App() {
     <div id="shell">
       <${TopBar} />
       <${SecurityBanner} />
+      <${UpdateBanner} />
       <main id="app" ref=${appRef} data-diff=${dm}>
         <section class="panel" id="chatPanel">
           <div class="panel-head">

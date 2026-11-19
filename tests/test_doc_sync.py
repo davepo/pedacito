@@ -184,6 +184,9 @@ FEATURE_NEEDLES = [
     ("send_temperature_to_hosted", "hosted temperature opt-in"),
     ("hosted_temperature", "hosted temperature pin"),
     ("presence_penalty", "the local repetition nudge"),
+    ("check_for_updates", "the update opt-out setting"),
+    ("/update", "TUI update slash command"),
+    ("update --run", "CLI update --run"),
 ] + [(label, "Project ▾ upkeep dialog") for label in PROJECT_MENU_LABELS]
 
 
@@ -300,6 +303,16 @@ def test_how_cards_cover_the_new_features():
     assert "send_temperature_to_hosted" in hosted["settings"]
     assert "hosted_temperature" in hosted["settings"]
     assert "presence_penalty" in hosted["summary"] + " ".join(hosted["steps"])
+    # The context-aware auto-update pass: CLI card, GUI topic, TUI notes.
+    upd = cards["update"]
+    assert "--run" in upd["usage"]
+    assert any(f["flag"] == "--run" for f in upd["flags"])
+    assert "check_for_updates" in " ".join(upd["notes"])
+    assert "/update" in " ".join(cards["tui"]["notes"])
+    upd_topic = topics["update-pedacito"]
+    assert "check_for_updates" in upd_topic["settings"]
+    assert upd_topic["cli"] == ["update"]
+    assert "Restart Pedacito" in " ".join(upd_topic["steps"])
 
 
 def test_how_topic_references_resolve():
@@ -326,6 +339,7 @@ def test_how_topic_references_resolve():
     ("how do I preview my html page in the gui?", "live-preview"),
     ("why does pedacito not send temperature to my hosted api?",
      "hosted-sampling"),
+    ("how do I update pedacito to a newer release?", "update-pedacito"),
 ])
 def test_new_topics_are_retrievable(question, topic):
     ids = [m["id"] for m in how_index.search(question)["gui"]]

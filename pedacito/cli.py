@@ -16,6 +16,7 @@ Usage
     pedacito new  my-app -t "todo CLI"       # start a project from scratch
     pedacito auto . -t "add retries" --apply # autonomous outer loop over tasks
     pedacito rename old_name new_name        # rename a symbol across files, no model call
+    pedacito update --run                    # check PyPI and upgrade this install
 
 Run as `pedacito <command> ...` or `python -m pedacito <command> ...`; `pdc`
 is a shorthand alias accepting the same commands. `main()` is the entry point.
@@ -44,6 +45,7 @@ from . import loop
 from . import modelcard
 from . import profiles as profiles_mod
 from . import roles as roles_mod
+from . import update as update_mod
 from . import workspace
 from .agent import Agent
 from .config import (Config, ConfigError, REFERENCE_TEMPLATE, TEMPLATE,
@@ -1202,6 +1204,49 @@ def _cmd_diagnose(args) -> int:
     ok, report = diagnostics.run(root, Config(), files=files)
     print(report)
     return 0 if ok else 1
+
+
+def _cmd_update(args) -> int:
+    """`pedacito update [--run]`: check PyPI for a newer Pedacito release and
+    optionally run the upgrade command for the detected install method.
+    Honors check_for_updates: disabled prints the manual command and exits 0
+    with zero network calls; offline exits 1; --run returns the upgrade's
+    own exit code."""
+    try:
+        cfg = _light_config(args)
+    except ConfigError:
+        cfg = None
+    info = update_mod.check_for_update(cfg, manual=True)
+    if info["detail"] == "disabled":
+        print("Update checks are disabled (check_for_updates = false). "
+              "No network call was made.")
+        print(info["instructions"])
+        return 0
+    if not info["ok"]:
+        print("Could not reach PyPI (offline?). Nothing was changed.",
+              file=sys.stderr)
+        print("Manual upgrade: " + info["instructions"])
+        return 1
+    print(f"Installed: {info['current']}    Latest: {info['latest']}")
+    print(f"Install method: {info['method']}")
+    if not info["update_available"]:
+        print("You are up to date.")
+        return 0
+    print(info["instructions"])
+    if not getattr(args, "run", False):
+        print("Run `pedacito update --run` to upgrade.")
+        return 0
+    if info["command"] is None:
+        return 0                        # editable/source: instructions only
+    print("Running: " + " ".join(info["command"]), file=sys.stderr)
+    code = update_mod.run_upgrade(info["command"],
+                                  on_line=lambda ln: print(ln, flush=True))
+    if code == 0:
+        print(f"Upgrade finished (exit 0). Restart Pedacito to run "
+              f"{info['latest']}.")
+    else:
+        print(f"Upgrade failed (exit {code}).", file=sys.stderr)
+    return code
 
 
 def _light_config(args) -> Config:
@@ -3381,6 +3426,15 @@ def build_parser() -> argparse.ArgumentParser:
     p_gui.add_argument("--port", type=int, default=0)
     p_gui.add_argument("--no-open", dest="open_browser", action="store_false")
 
+    p_update = sub.add_parser("update",
+                              help="check PyPI for a newer Pedacito and "
+                                   "optionally upgrade this install")
+    p_update.add_argument("--run", action="store_true",
+                          help="run the detected upgrade command (pipx/pip); "
+                               "editable installs get git instructions")
+    p_update.add_argument("--config",
+                          help="config file to read check_for_updates from")
+
     return ap
 
 
@@ -3423,6 +3477,10 @@ def _main(argv=None) -> int:
         return _cmd_worktree(args)
     if args.cmd == "diagnose":
         return _cmd_diagnose(args)
+    # `update` needs no model, index or vram budget -- and must work on a
+    # machine with no config at all (the opt-out then comes from env/user cfg).
+    if args.cmd == "update":
+        return _cmd_update(args)
     # `models scan` discovers servers and writes profiles, so it must run
     # before _config() (a first-run machine may have no valid config yet).
     if args.cmd == "models":
@@ -3763,6 +3821,10 @@ def _main(argv=None) -> int:
                 idx, roles_mod.client_for(cfg, "summarizer", client), cfg,
                 limit=int(cfg.refresh_summaries))
         agent = Agent(idx, client, cfg)
+        # Quiet release check on a daemon thread (pedacito.update): warms the
+        # 24 h cache for `pdc update`; never blocks the task, silent when
+        # offline or opted out.
+        update_mod.check_for_update_async(cfg)
         from . import steering
         if args.cmd in ("ask", "chat") and steering.Steering.available():
             cfg._interactive = True

@@ -9,6 +9,7 @@ Pedacito needs **Python 3.11 or newer**. It does not need Node.js for the harnes
 ## Contents
 
 - [Install from PyPI](#install)
+- [Upgrading](#upgrading)
 - [Choose a model for your GPU](#which-model-fits-your-gpu)
 - [Connect a model server](#model-server-setup)
 - [GPU inference servers: ROCm and CUDA](#gpu-inference-servers-rocm-and-cuda)
@@ -64,6 +65,47 @@ pip install -e ".[dev]"
 
 Uninstall with `pip uninstall pedacito`. Your config and every project's
 `.pedacito/` folder are left untouched.
+
+## Upgrading
+
+Pedacito checks PyPI for newer releases quietly: **one anonymous GET** of the
+public `pedacito` metadata at startup, on a background thread with a 2-second
+timeout, cached for 24 hours beside your user config (`update_check.json`).
+No account, no telemetry, no project data — and offline, every check is a
+silent no-op. Pre-releases are compared correctly, yanked releases are
+ignored, and you are never told to "update" to the version you already run.
+
+- **GUI** — when a newer release exists, a slim banner appears under the
+  topbar: *Pedacito vX.Y.Z is available (you have A.B.C)*. **Update** runs the
+  upgrade command for your install method in the background and streams its
+  output into a small drawer; on success, **Restart Pedacito** reopens the GUI
+  on the same port with the new version. A failed upgrade shows the output
+  plus the manual command. **Dismiss** hides the banner until an even newer
+  release appears. The banner is in-flow: it never covers a control.
+- **CLI** — `pedacito update` prints installed vs latest and the detected
+  install method; `pedacito update --run` runs the upgrade and returns its
+  exit code.
+- **TUI** — `/update` shows the same comparison and offers the upgrade;
+  `/update run` skips the confirmation.
+
+The upgrade command is chosen from how Pedacito was installed, and always run
+as an argument list with no shell (Windows-safe):
+
+| Install method | Upgrade |
+|---|---|
+| pipx | `pipx upgrade pedacito` |
+| virtualenv | `<venv python> -m pip install --upgrade pedacito` |
+| pip --user | `<python> -m pip install --upgrade --user pedacito` — on PEP 668 "externally managed" Pythons (Debian/Ubuntu/Homebrew system Python) pip may refuse; prefer pipx or a venv there |
+| editable / source checkout | no automatic command: run `git pull && pip install -e .` in your checkout |
+
+**Opt out entirely**: set `check_for_updates = false` in `[universal]` of your
+config (or `PEDACITO_CHECK_FOR_UPDATES=false`). That disables every release
+check — zero network calls, zero upgrade subprocesses, no banner — in the
+GUI, the TUI and `pedacito update` alike; everything else behaves exactly as
+before. See the [configuration reference](CONFIG.md#configuration-reference).
+
+After upgrading, `pedacito config --upgrade` appends any newly documented
+options to your config, commented out (see [QUICKSTART B1](../QUICKSTART.md)).
 
 ## Which model fits your GPU?
 

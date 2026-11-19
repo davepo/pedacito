@@ -563,6 +563,26 @@ details pre { background: var(--code-bg); border: 1px solid var(--border); borde
 #securityNotice .security-actions { display: flex; gap: 8px;
   flex-wrap: wrap; align-items: center; }
 
+/* Non-blocking update notice (pedacito.update): a slim dismissible banner
+ * for a newer PyPI release, plus the upgrade command's output drawer.
+ * Accent-toned, in-flow (flex: none) so it never covers a control. */
+#updateNotice { display: flex; flex-direction: column; gap: 6px;
+  padding: 6px 12px; border-bottom: 1px solid var(--accent);
+  background: color-mix(in srgb, var(--accent) 10%, var(--surface));
+  color: var(--text); font-size: 12px; flex: none; }
+#updateNotice .update-head { display: flex; align-items: center;
+  gap: 8px; flex-wrap: wrap; font-weight: 700; color: var(--accent); }
+#updateNotice .update-head .grow { flex: 1; color: var(--text);
+  font-weight: 400; }
+#updateNotice .update-head button { flex: none; }
+#updateNotice .update-run { display: flex; flex-direction: column; gap: 5px; }
+#updateNotice .update-manual { margin: 0; color: var(--muted);
+  font-size: 11.5px; }
+#updateNotice .update-out { margin: 0; max-height: 160px; overflow: auto;
+  font-family: var(--mono); font-size: 11px; background: var(--code-bg);
+  border: 1px solid var(--border); border-radius: 6px; padding: 6px 8px;
+  white-space: pre-wrap; }
+
 /* Task-vs-Auto suitability: a subtle live banner while an Auto draft reads as
  * a single-pass edit, and the pre-run "Run as a single-pass Task instead?"
  * confirmation bar with its two one-click choices. */

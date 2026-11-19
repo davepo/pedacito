@@ -28,6 +28,7 @@ from .. import index as index_mod
 from .. import loop, scaffold, steering, workspace
 from .. import plan as plan_mod
 from .. import security as security_mod
+from .. import update as update_mod
 from ..agent import Agent
 from ..config import ConfigError
 from ..llm import CancelledError, LLMClient, LLMError
@@ -504,6 +505,10 @@ def open_project(path: str, profile: str, announce: bool = True) -> None:
         STATE.review = None
         STATE.plan_path = None
         STATE.last_auto = {}
+        # A project that opts out of update checks must not keep showing the
+        # startup check's banner (pedacito.update).
+        if not update_mod.updates_enabled(cfg):
+            STATE.update = None
     STATE.apply_index(idx)
     remember_recent(str(root))
     _probe_server(client, cfg)
