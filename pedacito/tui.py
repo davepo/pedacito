@@ -181,6 +181,8 @@ Pedacito TUI commands
   /plan [GOAL]              show PLAN.md, or generate it from GOAL
   /consolidate /compact     compact the session into a handoff checkpoint
   /profile [NAME]           list profiles, or switch to NAME
+  /profile show|run|reset   hardware snapshot + last probe + active auto-tune;
+                            run forces a probe, reset drops cached measurements
   /model ID                 switch to a model id directly
   /auto-route [on|off]      specialist auto-routing on/off
   /hybrid [off | PROVIDER MODEL]
@@ -2815,6 +2817,10 @@ class TuiSession:
             self._consolidate()
             return
         if cmd in ("profile", "profiles"):
+            if cmd == "profile" and arg.strip().lower() in (
+                    "show", "run", "reset"):
+                self._profiler_command(arg)
+                return
             self._profiles(arg)
             return
         if cmd == "model":
@@ -3365,6 +3371,38 @@ class TuiSession:
             f"Checkpoint {out['post_checkpoint']} (undo with /undo).",
             "receipt")
         self._redraw(force=True)
+
+    def _profiler_command(self, arg: str) -> None:
+        """`/profile show|run|reset`: the CLI's profiler actions in the TUI."""
+        from . import profiler
+        action = (arg or "show").strip().lower()
+        probe = None
+        if action == "reset":
+            path = profiler.reset()
+            try:
+                self.cfg.auto_tune = False
+                self.cfg.sources["auto_tune"] = "user (TUI /profile reset)"
+            except Exception:
+                pass
+            self._append(
+                f"Dropped cached profiling measurements ({path}). "
+                "auto_tune is off for this session; remove auto_tune = true "
+                "from your config to keep it off.", "system")
+            return
+        if action == "run":
+            self._append(
+                f"Probing {self.cfg.model} on {self.cfg.base_url} "
+                "(one prefill, one tiny completion)...", "system")
+            probe = profiler.probe_model_speed(
+                self.cfg.base_url, self.cfg.model, self.cfg, force=True)
+            if not probe.get("ok"):
+                self._append("Probe failed: "
+                             + str(probe.get("detail") or
+                                   "the server did not answer"), "error")
+                return
+        report = profiler.build_report(self.cfg, probe=probe,
+                                       fetch_metadata=True)
+        self._append(profiler.format_profile_report(report), "system")
 
     def _servers(self) -> None:
         """`/servers`: live VRAM/RAM plus each configured local server."""

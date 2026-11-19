@@ -1458,6 +1458,15 @@ class LLMClient:
         self.last_stream_content = ""
         self.last_stream_tokens = 0
         self.last_stream_tok_per_s = 0.0
+        self.first_token_at = None
+        # Wall-clock anchors for the optional speed probe (profiler.py):
+        # request_started_at is just before the HTTP POST, first_token_at is
+        # the first content/reasoning delta of a streamed reply. None means
+        # the reply was buffered (or no token ever arrived).
+        self.request_started_at = 0.0
+        # The last server-reported llama.cpp `timings` block (prompt_per_second
+        # / predicted_per_second), when the endpoint sends one.
+        self.last_timings: dict = {}
         # Circuit breaker: consecutive transport/server failures, and the
         # monotonic deadline before which calls fail fast. A success closes it.
         self._failures = 0
@@ -2247,6 +2256,7 @@ class LLMClient:
         # Generation speed: the server's own measurement when it reports one
         # (llama.cpp `timings`), else completion tokens over wall time.
         speed = float((timings or {}).get("predicted_per_second") or 0.0)
+        self.last_timings = dict(timings or {})
         with self._stats_lock:      # summaries may run on several threads
             self.stats["prompt_tokens"] += pt
             self.stats["completion_tokens"] += ct
@@ -2499,6 +2509,7 @@ class LLMClient:
                 pass      # telemetry must never break a call
         t0 = time.time()
         self.stats["calls"] += 1
+        self.request_started_at = time.monotonic()
         # Cleared per attempt so a stale "length" from an abandoned attempt
         # cannot trigger apply()'s continuation loop.
         self.stream_truncated = False
@@ -2511,6 +2522,7 @@ class LLMClient:
         self.last_stream_content = ""
         self.last_stream_tokens = 0
         self.last_stream_tok_per_s = 0.0
+        self.first_token_at = None
 
         if not stream:
             try:
@@ -2729,6 +2741,7 @@ class LLMClient:
                     continue
                 if first_token_at is None:
                     first_token_at = time.monotonic()
+                    self.first_token_at = first_token_at
                 if rc:
                     if pending_content:
                         flush_stream()     # keep content before thoughts
@@ -3075,6 +3088,7 @@ class LLMClient:
                     continue
                 if first_token_at is None:
                     first_token_at = time.monotonic()
+                    self.first_token_at = first_token_at
                 if rc:
                     if pending_content:
                         emit()              # keep content before thoughts

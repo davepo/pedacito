@@ -1349,14 +1349,19 @@ def _servers_config():
 
 
 def _server_payload(config, memory=None) -> dict:
+    from .. import profiler
     from .. import servers
-    out = servers.server_summary(config)
-    if memory is not None:
-        out["memory"] = memory
-        out["hardware"] = memory
-        out["vram"] = memory["vram"]
-        out["ram"] = memory["ram"]
-        out["badge"] = servers.memory_badge(memory)
+    # snapshot() is a superset of get_hardware_memory(): same RAM/VRAM shape,
+    # plus nvidia-smi / vm_stat / winapi numbers and a source per number.
+    # That is what fills the NVIDIA and macOS/Windows live telemetry bar.
+    snap = memory if memory is not None else profiler.snapshot()
+    out = servers.server_summary(config, memory=snap)
+    out["memory"] = snap
+    out["hardware"] = snap
+    out["vram"] = snap["vram"]
+    out["ram"] = snap["ram"]
+    out["badge"] = servers.memory_badge(snap)
+    out["snapshot"] = snap
     return out
 
 
@@ -1367,9 +1372,9 @@ def _servers_get(q, body=None):
     try:
         return 200, _server_payload(_servers_config())
     except Exception as e:
-        from .. import servers
+        from .. import profiler
         return 200, {"ok": False, "detail": f"{type(e).__name__}: {e}",
-                     "memory": servers.get_hardware_memory(),
+                     "memory": profiler.snapshot(),
                      "servers": []}
 
 

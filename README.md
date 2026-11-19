@@ -21,6 +21,12 @@ Start a model server first (LM Studio, Ollama, Lemonade or llama.cpp). Then, in 
 
 Pipx, optional extras and GPU server setup are in [docs/INSTALLATION.md](docs/INSTALLATION.md).
 
+## What's new in v0.3.1
+
+| Feature | What you get | Read more |
+|---|---|---|
+| **Advanced system profiling & auto-tune** | `pedacito profile` shows a vendor-neutral RAM/VRAM snapshot with a source per number (Linux sysfs, NVIDIA `nvidia-smi`, macOS `vm_stat`, Windows `winapi`), a cached prefill/generation probe and the active profile's tuning. `auto_tune = true` (opt-in) fits context, retrieval budgets and timeout to free memory; missing telemetry makes it abstain, and existing configs do not change. | [System profiling and auto-tune](docs/CONFIG.md#advanced-system-profiling-and-auto-tune) |
+
 ## What's new in v0.3.0
 
 | Feature | What you get | Read more |

@@ -2903,10 +2903,13 @@ function HardwareBadge() {
   }, []);
   if (!mem) return null;
   const v = mem.vram || {}, r = mem.ram || {};
+  const src = mem.sources || {};
   const cards = (v.cards || []).map((c) => c.card + ' ' + _gb(c.used_gb)
-    + '/' + _gb(c.total_gb) + ' GB').join('\n');
+    + '/' + _gb(c.total_gb) + ' GB (' + (c.source || '?') + ')').join('\n');
   return html`<span class="chip" id="hwChip"
-      title=${'live hardware memory (sysfs ROCm VRAM + /proc/meminfo)'
+      title=${'hardware totals only \u2014 no per-process GPU attribution'
+        + '\nRAM source: ' + (src.ram_total_gb || 'unavailable')
+        + '\nVRAM source: ' + (src.vram_total_gb || 'unavailable')
         + (cards ? '\n' + cards : '')}
       onClick=${() => serversDialog()}>
     <b>${_memText(mem)}</b>
@@ -3315,6 +3318,14 @@ function calChoicesTip(ch) {
                    .map((k) => k + ': ' + ch[k]);
   return bits.length ? '\n' + bits.join('\n') : '';
 }
+function tuneTip() {
+  const s = S.status || {};
+  if (!s.auto_tune) return '';
+  const src = (s.tuning_sources || {}).context_tokens;
+  return '\nauto-tune: ' + PDC.fmtInt(s.context_tokens || 0) + ' context tokens, '
+    + Number(s.timeout || 0).toFixed(0) + 's timeout, max_concurrency '
+    + (s.max_concurrency || 0) + (src && src !== 'default' ? '\ncontext: ' + src : '');
+}
 function CalibrationBadge(props) {
   const s = S.status;
   const name = props.name || '';
@@ -3332,16 +3343,19 @@ function CalibrationBadge(props) {
     return html`<span class="chip cal-chip ok" id="calChip" onClick=${openProfiles}
       title=${'Calibrated ' + (cal.calibrated_at || '') + '\nscore: '
         + Number(cal.card_score || 0).toFixed(2) + calChoicesTip(cal.card_choices)
+        + tuneTip()
         + '\nClick to open Settings \u2192 Model discovery'}>
       <b>\u2713 Calibrated (${ago})</b></span>`;
   }
   if (cal.calibrated && cal.calibrated_stale) {
     return html`<span class="chip cal-chip stale" id="calChip" onClick=${openProfiles}
-      title=${'The model card is older than 30 days (or from an older calibrate version).\nRe-calibrate to refresh the tuned defaults.\nClick to open Settings \u2192 Model discovery'}>
+      title=${'The model card is older than 30 days (or from an older calibrate version).\nRe-calibrate to refresh the tuned defaults.'
+        + tuneTip() + '\nClick to open Settings \u2192 Model discovery'}>
       <b>\u26A0 Calibration stale (${(cal.calibrated_age_days || 0) + 'd ago'})</b></span>`;
   }
   return html`<span class="chip cal-chip none" id="calChip" onClick=${openProfiles}
-    title=${'No model card yet \u2014 calibrate to measure this model and tune its defaults.\nClick to open Settings \u2192 Model discovery'}>
+    title=${'No model card yet \u2014 calibrate to measure this model and tune its defaults.'
+      + tuneTip() + '\nClick to open Settings \u2192 Model discovery'}>
     <b>\u25CB Not calibrated</b></span>`;
 }
 
@@ -3538,7 +3552,7 @@ function TopBar() {
         <${ProfileSelect} busy=${j} peek=${peekOn ? S.peek : null}
                           onChange=${(name) => switchProfile(name)} />
         <span class="chip" id="modelChip"
-              title=${(s.model_status || 'click to check the model server') + (s.base_url ? '\n' + s.base_url : '') + (s.context_tokens ? '\nwindow ' + PDC.fmtInt(s.context_tokens) + ' tokens (' + s.context_origin + ')' : '')}
+              title=${(s.model_status || 'click to check the model server') + (s.base_url ? '\n' + s.base_url : '') + (s.context_tokens ? '\nwindow ' + PDC.fmtInt(s.context_tokens) + ' tokens (' + s.context_origin + ')' : '') + (s.auto_tune ? '\nauto-tune: timeout ' + Number(s.timeout || 0).toFixed(0) + 's, max_concurrency ' + (s.max_concurrency || 0) + '\ncontext: ' + ((s.tuning_sources || {}).context_tokens || s.context_origin || 'default') : '')}
               onClick=${() => { if (s.root && !j) checkModel(); }}>
           <i class=${'dot ' + (j ? 'busy' : s.model_ok === true ? 'ok' : s.model_ok === false ? 'bad' : 'idle')}></i>
           <b>${s.needs_setup ? 'no model selected' : (s.model || (s.root ? '\u2014' : 'no model selected'))}</b>

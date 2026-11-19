@@ -682,6 +682,58 @@ CLI_COMMANDS = [
         ],
     },
     {
+        "name": "models show",
+        "usage": "pedacito models [show] [--json]",
+        "summary": "Print the active model's tuned numbers next to its "
+                   "profile info: hardware snapshot, footprint confidence, "
+                   "last speed probe, context/timeout/max_concurrency and the "
+                   "per-field auto-tune sources. The default when no action "
+                   "is given; `models scan` is unchanged.",
+        "keywords": ["models", "show models", "tuned numbers", "auto tune",
+                     "context tokens", "timeout", "vram", "profile info"],
+        "examples": [
+            "pedacito models",
+            "pedacito models show",
+            "pedacito models --json",
+        ],
+        "flags": [
+            {"flag": "show", "help": "print the active profile's tuning "
+                                     "(the default)"},
+            {"flag": "--json", "help": "print structured JSON"},
+            {"flag": "--config FILE", "help": "use this config file"},
+            {"flag": "--profile NAME", "help": "apply a profile block"},
+        ],
+    },
+    {
+        "name": "profile",
+        "usage": "pedacito profile [--show | --run | --reset] [--json]",
+        "summary": "Show the vendor-neutral hardware snapshot (RAM/VRAM with a "
+                   "source per number), the last cached speed probe and the "
+                   "active auto-tune. --run forces one prefill/generation "
+                   "probe; --reset drops cached measurements and turns off an "
+                   "explicit auto_tune opt-in.",
+        "keywords": ["profile", "profiling", "hardware snapshot", "auto tune",
+                     "auto_tune", "vram", "ram", "nvidia-smi", "vm_stat",
+                     "winapi", "prefill", "tokens per second", "confidence",
+                     "kv cache", "footprint"],
+        "examples": [
+            "pedacito profile",
+            "pedacito profile --show",
+            "pedacito profile --run",
+            "pedacito profile --reset",
+            "pedacito profile --show --json --profile strata",
+        ],
+        "flags": [
+            {"flag": "--show", "help": "snapshot + last probe + active tuning"},
+            {"flag": "--run", "help": "force a speed/prefill probe now"},
+            {"flag": "--reset", "help": "drop cached measurements and the "
+                                        "auto_tune opt-in"},
+            {"flag": "--json", "help": "print structured JSON"},
+            {"flag": "--config FILE", "help": "use this config file"},
+            {"flag": "--profile NAME", "help": "apply a profile block"},
+        ],
+    },
+    {
         "name": "rename",
         "usage": "pedacito rename OLD NEW [--file PATH] [--strings] "
                  "[--include-labels] [--apply] [--root DIR]",
@@ -1420,6 +1472,44 @@ GUI_TOPICS = [
                      "pipx upgrade", "restart"],
         "settings": ["check_for_updates"],
         "cli": ["update"],
+    },
+    {
+        "id": "profiling-auto-tune",
+        "title": "Profile the hardware and auto-tune model budgets",
+        "summary": "`pedacito profile --show` combines a vendor-neutral hardware "
+                   "snapshot (free VRAM/RAM with a source per number), a cached "
+                   "prefill/generation probe and the active profile's tuning. "
+                   "Set auto_tune = true to apply it; the default is off.",
+        "steps": [
+            "Run `pedacito profile` (or `pedacito models`) to see RAM/VRAM, "
+            "the reader that answered (drm-sysfs, nvidia-smi, vm_stat, "
+            "winapi), the footprint confidence and the last probe",
+            "Run `pedacito profile --run` to force one tiny completion plus a "
+            "2k-token prefill (512 when the window is smaller); the result is "
+            "cached for a week per server+model",
+            "Set auto_tune = true in the profile (Settings → Profiles → "
+            "Profiling and auto-tuning) to adjust context_tokens, retrieval "
+            "budgets and timeout from free memory",
+            "A tight pool shrinks to the 4096-token safety floor; spare "
+            "headroom is only proposed as growth, never forced",
+            "Tiered local-moe servers keep max_concurrency = 1 and the 600 s "
+            "timeout; hosted APIs get only their 30 s timeout default",
+            "Missing telemetry (for example AMD/Intel on Windows) makes "
+            "auto-tune abstain and leaves every value untouched",
+            "`pedacito profile --reset` drops the cached measurements and the "
+            "optimistic opt-in; the TUI uses /profile show|run|reset",
+        ],
+        "keywords": ["profile", "profiling", "auto tune", "auto_tune",
+                     "hardware", "vram", "ram", "nvidia", "amd", "intel",
+                     "apple silicon", "windows", "macos", "prefill",
+                     "tokens per second", "confidence", "kv cache",
+                     "footprint", "context_tokens"],
+        "settings": ["auto_tune", "context_tokens", "timeout",
+                     "max_concurrency", "model_params_b",
+                     "model_active_params_b", "model_layers",
+                     "model_kv_heads", "model_head_dim", "model_quant",
+                     "model_arch"],
+        "cli": ["profile", "models scan", "profiles"],
     },
     {
         "id": "reset-config",

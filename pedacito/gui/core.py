@@ -412,6 +412,24 @@ def profile_catalog(cfg, calibration: dict | None = None) -> list[dict]:
             "calibrated_stale": bool(cal.get("calibrated_stale")),
             "card_score": float(cal.get("card_score") or 0.0),
             "active": bool(cfg is not None and name == cfg.active_profile),
+            # Resolved auto-tuning numbers for the active profile (the only
+            # profile config.load has actually tuned); data for the model
+            # card, never new chrome.
+            "auto_tune": bool(getattr(cfg, "auto_tune", False))
+            if cfg is not None and name == cfg.active_profile else False,
+            "context_tokens": (int(getattr(cfg, "context_tokens", 0) or 0)
+                               if cfg is not None
+                               and name == cfg.active_profile else 0),
+            "context_origin": (
+                str((getattr(cfg, "sources", None) or {}).get(
+                    "context_tokens", "default"))
+                if cfg is not None and name == cfg.active_profile else ""),
+            "timeout": (float(getattr(cfg, "timeout", 0) or 0)
+                        if cfg is not None
+                        and name == cfg.active_profile else 0.0),
+            "max_concurrency": (
+                int(getattr(cfg, "max_concurrency", 0) or 0)
+                if cfg is not None and name == cfg.active_profile else 0),
         })
     return out
 
@@ -1800,6 +1818,17 @@ class State:
                 "context_tokens": cfg.context_tokens if cfg else 0,
                 "context_origin": (cfg.sources.get("context_tokens", "default")
                                    if cfg else ""),
+                # Auto-tune data for the model card: the resolved timeout and
+                # the per-field provenance, shown in the existing chip title.
+                "auto_tune": bool(getattr(cfg, "auto_tune", False))
+                if cfg else False,
+                "timeout": float(getattr(cfg, "timeout", 0) or 0)
+                if cfg else 0.0,
+                "tuning_sources": {
+                    key: (cfg.sources.get(key, "default") if cfg else "")
+                    for key in ("context_tokens", "max_gathered_chars",
+                                "flat_map_token_budget", "timeout",
+                                "max_concurrency")},
                 "json_mode": cfg.json_mode if cfg else "",
                 "gui_theme": theme,
                 "disable_thinking": bool(cfg.disable_thinking) if cfg else False,

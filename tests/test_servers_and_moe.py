@@ -19,6 +19,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from pedacito import config as config_mod  # noqa: E402
+from pedacito import profiler as profiler_mod  # noqa: E402
 from pedacito import servers  # noqa: E402
 from pedacito.config import Config  # noqa: E402
 from pedacito.llm import LLMClient  # noqa: E402
@@ -372,7 +373,7 @@ def _fake_memory():
 
 
 def test_gui_servers_endpoint_returns_memory_and_states(gui, monkeypatch):
-    monkeypatch.setattr(servers, "get_hardware_memory",
+    monkeypatch.setattr(profiler_mod, "snapshot",
                         lambda *a, **k: _fake_memory())
     monkeypatch.setattr(servers, "list_server_states",
                         lambda *a, **k: [_gui_state()])
@@ -386,7 +387,7 @@ def test_gui_servers_endpoint_returns_memory_and_states(gui, monkeypatch):
 
 def test_gui_unload_endpoint_updates_telemetry(gui, monkeypatch):
     memory = _fake_memory()
-    monkeypatch.setattr(servers, "get_hardware_memory",
+    monkeypatch.setattr(profiler_mod, "snapshot",
                         lambda *a, **k: memory)
     monkeypatch.setattr(servers, "list_server_states",
                         lambda *a, **k: [{**_gui_state(),

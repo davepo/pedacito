@@ -1206,6 +1206,123 @@ def _cmd_diagnose(args) -> int:
     return 0 if ok else 1
 
 
+def _cmd_profile(args) -> int:
+    """`pedacito profile [--show | --run | --reset]`.
+
+    --show  print the hardware snapshot, the last cached speed probe and the
+            active tuning (default when no action flag is given)
+    --run   force one speed/prefill probe of the active model, then show it
+    --reset drop cached measurements and turn off an explicit auto_tune
+            opt-in in the selected config file
+    """
+    from . import profiler
+    action = ("run" if getattr(args, "run", False)
+              else "reset" if getattr(args, "reset", False) else "show")
+    cfg = None
+    try:
+        cfg = _light_config(args)
+    except ConfigError as exc:
+        if action != "reset":
+            print(f"Config error: {exc}", file=sys.stderr)
+            return 2
+    if action == "reset":
+        path = profiler.reset()
+        changed = _disable_auto_tune_opt_in(args, cfg)
+        print(f"Dropped cached profiling measurements ({path}).")
+        if changed:
+            print(f"Set auto_tune = false in {changed}.")
+        else:
+            print("No explicit auto_tune = true was found in the selected "
+                  "config file.")
+        return 0
+    if cfg is None:
+        print("Config error: no usable configuration.", file=sys.stderr)
+        return 2
+    probe = None
+    if action == "run":
+        print(f"Probing {cfg.model} on {cfg.base_url} "
+              "(one prefill, one tiny completion)...", file=sys.stderr)
+        probe = profiler.probe_model_speed(cfg.base_url, cfg.model, cfg,
+                                           force=True)
+        if not probe.get("ok"):
+            print("Probe failed: " + str(probe.get("detail")
+                                         or "the server did not answer"),
+                  file=sys.stderr)
+            return 1
+    report = profiler.build_report(cfg, probe=probe, fetch_metadata=True)
+    if getattr(args, "json", False):
+        print(json.dumps(report, indent=1, default=str))
+    else:
+        print(profiler.format_profile_report(report))
+    return 0
+
+
+def _disable_auto_tune_opt_in(args, cfg=None) -> str:
+    """Turn an explicit auto_tune = true off in the selected config file.
+
+    The selected profile (--profile, else the active profile) is tried first;
+    when it does not carry the key, the global/universal scope is tried. Only
+    a value already true is touched. Returns the path that changed, or "".
+    """
+    import tomllib
+    path = Path(args.config) if getattr(args, "config", None) else USER_CONFIG
+    try:
+        text = path.read_text(encoding="utf-8")
+        data = tomllib.loads(text)
+    except (OSError, ValueError):
+        return ""
+    profile = str(getattr(args, "profile", "") or
+                  (getattr(cfg, "active_profile", "") if cfg else "") or "")
+    profiles = data.get("profiles") if isinstance(data, dict) else {}
+    body = (profiles or {}).get(profile) if profile and isinstance(
+        profiles, dict) else {}
+    if profile and isinstance(body, dict) and body.get("auto_tune") is True:
+        new = config_editor.set_values(text, {"auto_tune": False},
+                                       profile=profile)
+    else:
+        global_value = None
+        universal = data.get("universal") if isinstance(data, dict) else {}
+        if isinstance(universal, dict):
+            global_value = universal.get("auto_tune")
+        if global_value is None and isinstance(data, dict):
+            global_value = data.get("auto_tune")
+        if global_value is not True:
+            return ""
+        new = config_editor.set_values(text, {"auto_tune": False})
+    if new == text:
+        return ""
+    try:
+        tmp = path.with_name(path.name + ".tmp")
+        tmp.write_text(new, encoding="utf-8")
+        tmp.replace(path)
+    except OSError:
+        return ""
+    return str(path)
+
+
+def _cmd_models_show(args) -> int:
+    """`pedacito models` (no action): tuned numbers for the active profile."""
+    from . import profiler
+    try:
+        cfg = _light_config(args)
+    except ConfigError as exc:
+        print(f"Config error: {exc}", file=sys.stderr)
+        return 2
+    report = profiler.build_report(cfg, fetch_metadata=True)
+    if getattr(args, "json", False):
+        print(json.dumps(report, indent=1, default=str))
+        return 0
+    print(profiler.format_profile_report(report))
+    if cfg.profiles:
+        print("\nProfiles")
+        for name in sorted(cfg.profiles):
+            body = cfg.profiles.get(name) or {}
+            model = str(body.get("model") or cfg.model or "")
+            marker = "* " if name == cfg.active_profile else "  "
+            print(f"  {marker}{name:<20} {model}")
+    return 0
+
+
 def _cmd_update(args) -> int:
     """`pedacito update [--run]`: check PyPI for a newer Pedacito release and
     optionally run the upgrade command for the detected install method.
@@ -3118,9 +3235,14 @@ def build_parser() -> argparse.ArgumentParser:
     p_cal.add_argument("paths", nargs="*", default=["."], help=argparse.SUPPRESS)
 
     p_models = sub.add_parser(
-        "models", help="discover model servers, write profiles, calibrate")
-    p_models.add_argument("action", choices=["scan"],
-                          help="'scan' finds local servers and sets up profiles")
+        "models", help="show tuned model numbers or discover model servers")
+    p_models.add_argument("action", nargs="?", default="show",
+                          choices=["scan", "show"],
+                          help="'scan' finds local servers and sets up "
+                               "profiles; 'show' (default) prints the active "
+                               "profile's snapshot and auto-tuned numbers")
+    p_models.add_argument("--json", action="store_true",
+                          help="with show: print structured JSON")
     p_models.add_argument("--url", action="append", default=[], metavar="URL",
                           help="server base url to probe; repeatable")
     p_models.add_argument("--api-key-env", metavar="VAR",
@@ -3158,6 +3280,24 @@ def build_parser() -> argparse.ArgumentParser:
                             help="with --apply-roles: do not ask for confirmation")
     p_profiles.add_argument("--config", metavar="FILE")
     p_profiles.add_argument("--profile", metavar="NAME")
+
+    p_profile = sub.add_parser(
+        "profile",
+        help="show the hardware snapshot, speed probe and active auto-tune")
+    prof_action = p_profile.add_mutually_exclusive_group()
+    prof_action.add_argument("--show", action="store_true",
+                             help="print the snapshot, last probe and tuning "
+                                  "(the default)")
+    prof_action.add_argument("--run", action="store_true",
+                             help="force one speed/prefill probe of the active "
+                                  "model")
+    prof_action.add_argument("--reset", action="store_true",
+                             help="drop cached measurements and set an "
+                                  "explicit auto_tune = true to false")
+    p_profile.add_argument("--json", action="store_true",
+                           help="print structured JSON (show/run)")
+    p_profile.add_argument("--config", metavar="FILE")
+    p_profile.add_argument("--profile", metavar="NAME")
 
     p_reset = sub.add_parser(
         "reset", help="wipe this project's Pedacito state (index, plans, "
@@ -3481,10 +3621,14 @@ def _main(argv=None) -> int:
     # machine with no config at all (the opt-out then comes from env/user cfg).
     if args.cmd == "update":
         return _cmd_update(args)
-    # `models scan` discovers servers and writes profiles, so it must run
-    # before _config() (a first-run machine may have no valid config yet).
+    # `models` and `profile` read hardware/measurement state and must work on
+    # a machine with no valid config (they only inspect the active profile).
     if args.cmd == "models":
-        return _cmd_models_scan(args)
+        if getattr(args, "action", "show") == "scan":
+            return _cmd_models_scan(args)
+        return _cmd_models_show(args)
+    if args.cmd == "profile":
+        return _cmd_profile(args)
     if args.cmd == "profiles":
         try:
             return _cmd_profiles(args, _light_config(args))

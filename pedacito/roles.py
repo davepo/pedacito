@@ -58,6 +58,11 @@ def derive_config(cfg, profile: str):
     # auto_fit, so the window clamp sees the real budgets rather than raising
     # them back above a small context afterwards.
     config_mod.apply_local_moe_defaults(new)
+    try:
+        from . import profiler
+        profiler.apply_auto_tune(new)
+    except Exception:
+        pass
     # a different server/model: it must re-derive hosted-ness and its budgets
     new._hosted_server = config_mod.is_hosted(new)
     if new._hosted_server and "json_mode" not in merged:

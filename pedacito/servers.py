@@ -15,8 +15,10 @@ llama-server beside it does not "share" memory: both servers fight for the
 same pages and one of them thrashes. Pedacito therefore treats local model
 servers as one pool with explicit lifecycle controls:
 
-* `get_hardware_memory()` reads /proc/meminfo and the AMD ROCm sysfs counters
-  (`mem_info_vram_total` / `mem_info_vram_used`) for every card.
+* `get_hardware_memory()` reads /proc/meminfo and the DRM sysfs counters
+  (`mem_info_vram_total` / `mem_info_vram_used`) for every card that exposes
+  them (AMD amdgpu, Intel xe, and other drivers). `profiler.snapshot()` adds
+  NVIDIA/macOS/Windows readers on top without changing this shape.
 * `list_server_states(config)` probes every configured local endpoint with a
   fast 1.5 s timeout and reports whether it is online and which model(s) are
   currently resident.
@@ -167,7 +169,7 @@ def _headers_for(server) -> dict:
 # --- hardware telemetry -------------------------------------------------------
 
 def get_hardware_memory(meminfo_path=None, drm_root=None) -> dict:
-    """Live system RAM and AMD ROCm VRAM, in GiB.
+    """Live system RAM and DRM sysfs VRAM, in GiB.
 
     Shape (JSON-safe)::
 
@@ -726,8 +728,20 @@ def load_server_model(server, model: str = "", config=None) -> dict:
 
     Lemonade: POST /v1/load {"model_name": model}. llama.cpp: POST
     /models/load {"model": model}. Strata/Avalon/custom: /v1/load then
-    /models/load, then the profile's optional `load_cmd`."""
-    return _server_action(server, "load", model, config)
+    /models/load, then the profile's optional `load_cmd`.
+
+    After a successful load, the optional speed probe is scheduled once per
+    (server, model) on a daemon thread. It never blocks this call."""
+    result = _server_action(server, "load", model, config)
+    if result.get("ok") and config is not None:
+        try:
+            from . import profiler
+            profiler.maybe_probe_async(
+                config, base_url=str(result.get("base_url") or ""),
+                model=str(result.get("model") or ""))
+        except Exception:
+            pass
+    return result
 
 
 def unload_server_model(server, model: str = "", config=None) -> dict:
@@ -855,9 +869,13 @@ def evict_other_local_servers(target_provider, config,
             "memory": before}
 
 
-def server_summary(config, timeout: float = PROBE_TIMEOUT) -> dict:
-    """One JSON payload for GUI/TUI: hardware plus every configured server."""
-    memory = get_hardware_memory()
+def server_summary(config, timeout: float = PROBE_TIMEOUT,
+                   memory: dict | None = None) -> dict:
+    """One JSON payload for GUI/TUI: hardware plus every configured server.
+
+    `memory` may be a :func:`profiler.snapshot` result (a superset with the
+    same shape as get_hardware_memory); omitted, the existing reader is used."""
+    memory = memory or get_hardware_memory()
     states = list_server_states(config, timeout=timeout)
     return {"ok": True, "memory": memory, "hardware": memory,
             "vram": memory["vram"], "ram": memory["ram"],

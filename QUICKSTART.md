@@ -534,6 +534,19 @@ your install method (pipx, venv or pip --user; editable checkouts get
 upgrade and Restart, and the TUI has `/update`. Set `check_for_updates = false`
 to opt out entirely — zero network calls, everything else unchanged.
 
+Inspect the machine and, if you want, let Pedacito tune the profile from it:
+
+```bash
+pedacito profile            # RAM/VRAM with a source per number, last probe, tuning
+pedacito profile --run      # force a prefill/generation speed probe
+pedacito profile --reset    # drop cached measurements and the auto_tune opt-in
+```
+
+`auto_tune` is off by default. Set `auto_tune = true` in a profile to fit
+`context_tokens`, the retrieval budgets and timeout to free VRAM/RAM; explicit
+values always win and missing telemetry makes auto-tune abstain. See
+[Advanced system profiling and auto-tune](docs/CONFIG.md#advanced-system-profiling-and-auto-tune).
+
 ### B2. Find models and measure them
 
 ```bash

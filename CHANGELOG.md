@@ -4,6 +4,35 @@ All notable changes to Pedacito (`pdc`) are documented here.
 
 ## v0.3.1 — unreleased
 
+### Advanced System Profiling & Model Auto-Tuning
+
+- **`pedacito/profiler.py`** — a vendor-neutral snapshot layered over the
+  unchanged `servers.get_hardware_memory()` shape: Linux DRM sysfs (AMD,
+  Intel xe, any `mem_info_vram_*` driver), NVIDIA `nvidia-smi` via argv,
+  macOS `sysctl` + `vm_stat` (Apple Silicon unified memory as RAM), and
+  Windows `kernel32.GlobalMemoryStatusEx` through stdlib `ctypes`. Every
+  reader is guarded, time-boxed to 2 s and silent when absent; every number
+  carries its source.
+- **Footprint estimation** — dense and MoE weight residency, active-expert
+  VRAM, KV GB per 1k tokens from layers × KV heads × head dim × quant bytes,
+  architecture metadata from explicit config, llama.cpp `/props` + `/models`,
+  Ollama `/api/show`, then model-name heuristics. Missing fields lower
+  `confidence`; they are never presented as measured.
+- **Speed/prefill probe** — one 16-token completion plus a ~2k-token filler
+  (512 when the window is smaller), timed from SSE. Explicit (`pdc profile
+  --run`, TUI `/profile run`) or once per server+model on a daemon thread
+  after a successful load; cached for a week in `profiler.json`.
+- **`auto_tune`** (default **false**) — opts into context/retrieval/timeout
+  tuning from free VRAM or unified RAM. Tight pools shrink to a 4,096-token
+  floor, spare headroom is proposed but never forced, explicit values win,
+  tiered local-MoE keeps concurrency 1 and its 600 s timeout, and missing
+  telemetry abstains instead of assuming zero free memory.
+- **Surfaces** — `pdc profile --show|--run|--reset`, `pdc models` tuned
+  numbers, TUI `/profile show|run|reset`, and the GUI live telemetry bar now
+  populated on NVIDIA/macOS/Windows (totals only, no per-process GPU claim).
+- Docs: CONFIG profiling section and reference rows, ARCHITECTURE memory
+  manager, README/QUICKSTART, and a how-card.
+
 ### Context-Aware Auto-Update (opt-out, local-first)
 
 - **`pedacito/update.py`** — one anonymous GET of the public PyPI metadata at

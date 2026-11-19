@@ -134,7 +134,7 @@ servers as **one pool with explicit lifecycle controls**. The code is in `pedaci
 | Capability | What happens |
 |---|---|
 | **Discovery** | `configured_local_servers` lists the local endpoints in your config. `list_server_states` probes each one with a 1.5-second timeout and reports whether it is online and which models are resident. |
-| **Memory view** | `get_hardware_memory` reads system RAM from `/proc/meminfo`. For AMD cards it reads VRAM from the ROCm sysfs counters, for every card it finds. NVIDIA VRAM is not read, so set `vram_gb` for those cards. |
+| **Memory view** | `get_hardware_memory` reads system RAM from `/proc/meminfo` and VRAM from the DRM sysfs counters for every card that exposes them (AMD amdgpu, Intel xe, and other drivers). Its shape is unchanged. `profiler.snapshot()` layers NVIDIA (`nvidia-smi`), macOS (`sysctl` + `vm_stat`) and Windows (`GlobalMemoryStatusEx`) readers on top, with a source per number. |
 | **Load and unload** | Each runtime's native API is used: Lemonade `/v1/load` and `/v1/unload`, llama.cpp `/models/load` and `/models/unload`, and the generic endpoints used by tiered MoE servers. Ollama is unloaded with `keep_alive: 0`. For a single-model daemon, `load_cmd` and `unload_cmd` can run your own command instead. |
 | **Auto-evict** | Before a run starts on one local server, the resident models on the *other* local servers are unloaded. Then the memory is polled briefly, so the target's weights can claim it. Controlled by `auto_evict_servers` (default on). The GUI has a toggle. |
 | **Best effort** | A sleeping server is a normal state, never an exception. Hosted APIs are never touched. |
@@ -146,9 +146,45 @@ that is working stays warm.
 ### What the memory badge means
 
 The toolbar's memory badge shows system RAM, plus VRAM where the driver exposes it. The
-numbers are informational. Eviction works on server state: models resident on the other
-local servers are unloaded before the run, and memory is then polled briefly so the target can
-load. A card whose VRAM Pedacito cannot read still gets that handoff.
+numbers are informational and are **totals only**: Pedacito does not attribute VRAM to a
+process, and the badge labels say so. Eviction works on server state: models resident on
+the other local servers are unloaded before the run, and memory is then polled briefly so
+the target can load. A card whose VRAM Pedacito cannot read still gets that handoff.
+
+### Advanced telemetry and auto-tuning
+
+`pedacito/profiler.py` adds a vendor-neutral snapshot without changing
+`servers.get_hardware_memory()`:
+
+- **Linux AMD/Intel**: the existing `/proc/meminfo` + `/sys/class/drm` reader, tagged
+  `drm-sysfs`. Its glob covers every driver exposing `mem_info_vram_total`/`_used`, which
+  includes amdgpu and Intel xe.
+- **Linux NVIDIA**: `nvidia-smi --query-gpu=index,memory.total,memory.used
+  --format=csv,noheader,nounits`, run as an argv list and only when the binary resolves,
+  tagged `nvidia-smi`.
+- **macOS**: `sysctl -n hw.memsize` total and `vm_stat` free pages, tagged `vm_stat`.
+  Apple Silicon unified memory counts as RAM; there is no separate VRAM claim.
+- **Windows**: `kernel32.GlobalMemoryStatusEx` through stdlib `ctypes` (the same API on
+  x86-64 and ARM64), tagged `winapi`. NVIDIA cards still use `nvidia-smi`; AMD/Intel on
+  Windows have no vendor-neutral VRAM reader.
+
+Each reader is guarded by a platform check or `shutil.which`, time-boxed to two seconds,
+and skipped silently when absent. A missing number carries an empty source and is
+**unknown**, never zero free memory.
+
+The optional speed probe runs one tiny completion plus one prefill measurement from SSE
+timings. It is explicit (`pedacito profile --run`, TUI `/profile run`) or scheduled once
+per server+model on a daemon thread after a successful explicit server load. Results are
+cached for a week in `profiler.json` beside the user config; failures are silent.
+
+`auto_tune` (default **false**) is applied at the same point as the `local-moe` defaults
+in `config.load()`. When enabled it uses only numbers and their sources: free VRAM (or
+unified RAM), the estimated weights and KV cache, and the measured prefill speed. It
+shrinks a too-large context to a 4,096-token safety floor, proposes growth when there is
+spare headroom (never forces it), scales retrieval budgets with the context, keeps the
+600 s timeout and concurrency 1 for tiered MoE servers, and abstains when no telemetry is
+available. Explicit user values always win. The full rule table and the platform matrix
+are in [Configuration](CONFIG.md#advanced-system-profiling-and-auto-tune).
 
 ## Execution profiles and the `local-moe` tier
 

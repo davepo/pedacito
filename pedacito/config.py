@@ -579,6 +579,30 @@ class Config:
     # 0 omits max_tokens from requests entirely.
     request_max_tokens_cap: int = 32768
 
+    # --- Profiling and auto-tuning --------------------------------------------
+    # Opt-in advanced profiling (pedacito/profiler.py): combine the live
+    # hardware snapshot (free VRAM/RAM, with a source per number) with a cached
+    # speed probe and adjust context_tokens, retrieval budgets and timeout.
+    # false keeps every existing value exactly as before. Explicit per-key
+    # settings always win; tiered local-moe concurrency never leaves 1.
+    auto_tune: bool = False
+    # Explicit architecture overrides for the footprint estimate. 0 / "" means
+    # discover it from llama.cpp /props + /models, Ollama /api/show, then the
+    # model name. Set these when a server reports no metadata. Missing fields
+    # lower the estimate's confidence instead of being treated as measured.
+    model_params_b: float = 0.0
+    model_active_params_b: float = 0.0
+    model_layers: int = 0
+    model_kv_heads: int = 0
+    model_head_dim: int = 0
+    # Weight quantization: f16/fp16/bf16, f32/fp32, q8/q6/q5/q4/q2 (a full
+    # name such as Q4_K_M is accepted). Empty = infer from the model id, then
+    # use a conservative 0.6 bytes/parameter.
+    model_quant: str = ""
+    # "dense" or "moe"; empty = infer from the model id/metadata. An MoE keeps
+    # all experts in RAM and only its active experts VRAM-resident.
+    model_arch: str = ""
+
     # --- Project scaffolding (`pedacito new`) ---------------------------------
     # Cap on files a plan may propose; the excess is reported.
     max_new_files: int = 24
@@ -1278,6 +1302,16 @@ def _coerce(name: str, value, path: Path | None = None):
         return value
     if name in ("k_cache_quant", "v_cache_quant"):
         return _normalise_kv_quant(value)
+    if name == "model_arch":
+        norm = str(value or "").strip().lower().replace("-", "_")
+        if norm in ("", "auto", "none", "default"):
+            return ""
+        if norm in ("dense", "moe"):
+            return norm
+        raise ConfigError(f"{where}{name} must be 'dense', 'moe' or empty, "
+                          f"got {value!r}")
+    if name == "model_quant":
+        return str(value or "").strip().lower()
     if name == "kv_cache_bytes_per_token":
         if isinstance(value, bool) or not isinstance(value, int) or value < 0:
             raise ConfigError(
@@ -1655,6 +1689,17 @@ def load(root: Path | None = None, explicit: Path | None = None,
     # floor their output budgets and pin one stream. Hosted APIs with a
     # similar model name are untouched (endpoint decides).
     apply_local_moe_defaults(cfg)
+
+    # Opt-in advanced profiling sits at the same point as the local-moe
+    # defaults. With the default auto_tune = false this is a no-op: no
+    # hardware reader, subprocess or network call runs, so an existing
+    # config is byte-identical to earlier releases.
+    if bool(getattr(cfg, "auto_tune", False)):
+        try:
+            from . import profiler
+            profiler.apply_auto_tune(cfg)
+        except Exception:
+            pass
 
     # Hosted APIs (DeepSeek in particular) reject response_format json_schema,
     # so switch to "object" unless the user spelled json_mode somewhere.
@@ -2338,6 +2383,8 @@ def _parse_env(name: str, raw: str):
         return tuple(x.strip() for x in raw.split(",") if x.strip())
     if name in ("k_cache_quant", "v_cache_quant"):
         return _normalise_kv_quant(raw)
+    if name in ("model_arch", "model_quant"):
+        return _coerce(name, raw)
     if name in _ENUM_FIELDS:
         return _coerce(name, raw)
     if name in _TABLE_FIELDS:

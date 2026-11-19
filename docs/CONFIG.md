@@ -468,6 +468,104 @@ unrecognised family, add the switch your model expects under the profile's
 Mistral-style role alternation and Gemma's missing system role are handled
 automatically.
 
+## Advanced system profiling and auto-tune
+
+`pedacito profile` shows the hardware snapshot, the last cached speed measurement and the
+active profile's tuning. `pedacito models` (with no action) prints the same numbers beside
+the active model; `pedacito models scan` is unchanged.
+
+```bash
+pedacito profile             # snapshot + last probe + active tuning (same as --show)
+pedacito profile --show
+pedacito profile --run       # force one prefill/generation probe now
+pedacito profile --reset     # drop cached measurements, turn off auto_tune = true
+pedacito profile --show --json
+```
+
+The TUI exposes the same three actions as `/profile show`, `/profile run` and
+`/profile reset`. Plain `/profile NAME` still switches profiles.
+
+### What the telemetry reads
+
+Every number carries its source. A reader that is absent on this platform contributes
+nothing; it is never treated as zero free memory. Each reader is time-boxed to two seconds
+and every failure is silent (log-level only).
+
+| Platform | System RAM | GPU VRAM | Source tag |
+|---|---|---|---|
+| Linux with AMD or Intel (amdgpu, Intel xe, any driver exposing `mem_info_vram_*`) | `/proc/meminfo` | `/sys/class/drm/card*/device/mem_info_vram_total` and `_used` | `drm-sysfs` |
+| Linux with NVIDIA | `/proc/meminfo` | `nvidia-smi --query-gpu=index,memory.total,memory.used --format=csv,noheader,nounits` (argv, never a shell string) | `nvidia-smi` |
+| macOS | `sysctl -n hw.memsize` total, `vm_stat` free/inactive/speculative pages | none: Apple Silicon unified memory counts as RAM, never as a separate VRAM claim | `vm_stat` |
+| Windows | `kernel32.GlobalMemoryStatusEx` through stdlib `ctypes` (same API on x86-64 and ARM64) | NVIDIA through `nvidia-smi`; AMD/Intel have no vendor-neutral reader, so auto-tune abstains there | `winapi` |
+
+The GUI hardware badge shows **totals only**. There is no per-process GPU attribution,
+and its labels say so. `servers.get_hardware_memory()` keeps its original shape and values;
+the profiler snapshot is a superset, so older GUI/TUI consumers keep working.
+
+### Footprint and confidence
+
+`estimate_model_footprint` estimates two things:
+
+- **Resident weights** = parameters × bytes per parameter. The accepted quantizations are
+  f16 = 2, q8 = 1, q6 = 0.75, q5 = 0.625, q4 = 0.5 and q2 = 0.25 bytes per parameter. An
+  unknown quantization uses the conservative 0.6.
+- **KV cache** = 2 (K and V) × layers × KV heads × head dim × bytes per parameter. The
+  profiler reports GB per 1,000 tokens.
+
+A dense model keeps all weights VRAM-resident. A mixture-of-experts model reports both
+numbers: all experts in RAM (`resident_gb`) and only the active experts VRAM-resident
+(`active_gb`/`vram_resident_gb`), so a tiered Strata/Avalon profile can be reasoned about.
+
+Architecture metadata is read in this order: explicit config overrides
+(`model_params_b`, `model_active_params_b`, `model_layers`, `model_kv_heads`,
+`model_head_dim`, `model_quant`, `model_arch`), llama.cpp `/props` and `/models`, Ollama
+`/api/show`, then model-name heuristics. `confidence` is highest when every field came
+from explicit config or server metadata (0.95 / 0.85), and drops for each inferred field
+(an unknown quantization, guessed layer count, guessed KV head count or guessed head
+dim). A confidence of `0.00` means the estimate is unusable. The report never presents a
+guess as measured; `estimated_fields` lists exactly what was inferred.
+
+### `auto_tune` rules
+
+`auto_tune` is **false by default**. Existing users see no change — no hardware reader,
+subprocess, network call or budget adjustment runs until they opt in.
+
+When enabled for a local profile:
+
+- **context_tokens** is capped by `(free memory − weights − safety reserve) / KV GB per
+  1,000 tokens`. A 4,096-token safety floor (or the user's smaller value) always remains.
+  When the pool is tight, the window shrinks to that floor. When the pool is roomy, growth
+  is *proposed* up to the server-reported window and is never forced.
+- **Retrieval budgets** (`max_gathered_chars`, `flat_map_token_budget`) scale with the
+  tuned context; memory-heavy local-MoE profiles get a smaller window than dense profiles
+  at the same context.
+- **timeout** stays at 600 s for tiered/local-MoE. For local-dense it becomes
+  `max(60, context / measured prefill tok/s × 1.5)` when a probe exists. A hosted profile
+  gets the 30 s cloud default; its context, retrieval and hardware-derived budgets are
+  never touched.
+- **max_concurrency** stays 1 for tiered/local-MoE and is never raised. Local-dense and
+  hosted profiles keep their value.
+- **User-pinned values win.** Any field whose provenance is an explicit config file,
+  profile, environment variable or CLI flag is left alone. A model with every tunable
+  field pinned is untouched.
+- **No telemetry means abstain.** With no VRAM reader, auto-tune uses RAM headroom only on
+  a unified-memory platform (macOS). Everywhere else it leaves the config untouched; a
+  missing reader is never interpreted as zero free memory.
+
+The applied per-field origins use the same `sources` provenance convention as the
+`local-moe` defaults, for example
+`auto-tune (VRAM 19.8 GB free via nvidia-smi; weights 7.0 GB; KV 0.0458 GB/1k tok; confidence 0.85; floor 4096)`.
+
+### Speed probe
+
+`pedacito profile --run` (and, once per server+model, a successful explicit model load)
+sends one tiny completion (`max_tokens = 16`, "Reply with just: OK") plus one prefill
+measurement: about 2,000 filler tokens when the model's window allows, otherwise 512.
+Prefill and generation tok/s come from the server's SSE timings. The probe is best-effort
+and silent on failure; a cached result lives in `profiler.json` beside the user config for
+one week and is keyed by server+model, so changing either one invalidates it. Probes never
+run for hosted endpoints.
+
 ## Configuration reference
 
 `pedacito config` lists every setting with its value and origin; `pedacito
@@ -480,6 +578,10 @@ config --reference` prints the annotated template. Key settings:
 | `api_key` / `api_key_env` | `"lm-studio"` / `""` | For hosted APIs and secured servers. `api_key_env` stores the *name* of an environment variable holding the key, so the secret never lands in the config file. |
 | `vram_gb` | *(required for local)* | GPU VRAM; set in `[universal]`, overridable per profile. |
 | `context_tokens` | `8192` | Server-side context window. With `auto_detect_context` on (the default) the server's reported window replaces it; set it explicitly when detection is wrong. |
+| `auto_tune` | false | Opt in to hardware/probe-driven tuning of context, retrieval budgets and timeout. Off by default: nothing changes until it is true. See [Advanced system profiling and auto-tune](#advanced-system-profiling-and-auto-tune). |
+| `model_params_b` / `model_active_params_b` | 0 / 0 | Explicit parameter counts (billions) for the footprint estimate; active is the MoE experts used per token. 0 = discover, then fall back to name heuristics with lower confidence. |
+| `model_layers` / `model_kv_heads` / `model_head_dim` | 0 / 0 / 0 | Explicit KV-cache geometry. Missing fields lower the estimate's `confidence` instead of being reported as measured. |
+| `model_quant` / `model_arch` | `""` / `""` | Explicit weight quantization (`q4`, `Q4_K_M`, `q8`, `f16`, ...) and `dense`/`moe`. Empty = infer from server metadata, then the model id. |
 | `small_context_tokens` / `max_whole_file_lines` | 16384 / 120 | A window at or below `small_context_tokens` counts as "small": the answer brief then demands chunked/anchored edits, and a whole-file rewrite of a file bigger than `max_whole_file_lines` is refused before it lands (unless the task explicitly asks to rewrite that file, is a creative/design task, or targets `.html`/`.htm`/`.css`/`.md` — see [Creative / design mode](USAGE.md#creative--design-mode)). `small_context_tokens = 0` turns the discipline off. |
 | `k_cache_quant` / `v_cache_quant` | `""` | KV-cache quantization the runtime uses. |
 | `json_mode` | `"schema"` | `"schema"` for local servers, `"object"` for hosted (auto-switched). |
