@@ -56,18 +56,23 @@ from pathlib import Path
 
 import requests
 
+from . import kvcache as kv_cache_mod
 from . import servers
 
 __all__ = [
     "CACHE_NAME", "PROBE_TTL", "GIB", "MEMORYSTATUSEX", "apply_auto_tune",
     "architecture_from_config", "build_report", "cache_path", "clear_cache",
     "detect_context_window", "estimate_model_footprint",
-    "format_profile_report", "maybe_probe_async", "probe_cache_key",
-    "probe_model_speed", "quant_bytes_per_param", "read_cached_probe",
-    "reset", "resolve_architecture", "snapshot", "store_probe", "tune_profile",
+    "format_profile_report", "kv_bytes_per_token", "maybe_probe_async",
+    "probe_cache_key", "probe_model_speed", "quant_bytes_per_param",
+    "read_cached_probe", "reset", "resolve_architecture", "snapshot",
+    "store_probe", "tune_profile",
 ]
 
 _LOG = logging.getLogger("pedacito.profiler")
+
+# The shared KV-cache model (also used by config.hardware_context_tokens).
+kv_bytes_per_token = kv_cache_mod.kv_bytes_per_token
 
 GIB = 1024 ** 3
 READER_TIMEOUT = 2.0
@@ -866,7 +871,11 @@ def _guess_head_dim(params_b: float) -> int:
     return 128
 
 
-def estimate_model_footprint(arch, quant: str, context_tokens: int) -> dict:
+def estimate_model_footprint(arch, quant: str, context_tokens: int, *,
+                             cfg=None, model_size_bytes: int | None = None,
+                             k_cache_quant: str = "",
+                             v_cache_quant: str = "",
+                             kv_cache_bytes_per_token: int = 0) -> dict:
     """Estimate weight residency and KV-cache size from architecture metadata.
 
     ``arch`` may be a metadata mapping from :func:`resolve_architecture`, a
@@ -875,18 +884,38 @@ def estimate_model_footprint(arch, quant: str, context_tokens: int) -> dict:
         {
           "resident_gb": 7.0,             # all weights (RAM for an MoE)
           "vram_resident_gb": 7.0,        # active weights; == resident for dense
-          "kv_gb_per_1k_tokens": 0.045776,
-          "kv_gb": 0.375,
+          "kv_bytes_per_token": 213623,
+          "kv_gb_per_1k_tokens": 0.198929,
+          "kv_gb": 1.6296,
           "confidence": 0.9,
           "arch": "dense" | "moe",
           "estimated_fields": [...]
         }
 
-    KV bytes/token = 2 (K+V) * n_layers * n_kv_heads * head_dim *
-    bytes_per_param(quant). MoE total experts live in RAM; only the active
-    experts are VRAM-resident. Missing fields are inferred conservatively and
-    lower ``confidence`` instead of being reported as measured.
+    KV sizing goes through the shared :mod:`pedacito.kvcache` helper. A known
+    model file size (from `cfg.model_size_bytes`, `model_size_bytes`, or a
+    config object) uses the same heuristic as `config.auto_fit`; explicit
+    `k_cache_quant` / `v_cache_quant` / `kv_cache_bytes_per_token` knobs are
+    honored. Without a file size it falls back to the architecture formula
+    (2 * K+V elements * bytes), preserving the old profile numbers when no
+    knobs are set. MoE total experts live in RAM; only the active experts are
+    VRAM-resident. Missing fields are inferred conservatively and lower
+    ``confidence`` instead of being reported as measured.
     """
+    if cfg is None and arch is not None and hasattr(arch, "model_size_bytes"):
+        # A Config passed as `arch` is also the source of the KV knobs and
+        # the model file size.
+        cfg = arch
+    if cfg is not None:
+        if model_size_bytes is None:
+            model_size_bytes = _int(getattr(cfg, "model_size_bytes", 0))
+        if not k_cache_quant:
+            k_cache_quant = str(getattr(cfg, "k_cache_quant", "") or "")
+        if not v_cache_quant:
+            v_cache_quant = str(getattr(cfg, "v_cache_quant", "") or "")
+        if not kv_cache_bytes_per_token:
+            kv_cache_bytes_per_token = _int(
+                getattr(cfg, "kv_cache_bytes_per_token", 0))
     context_tokens = max(0, _int(context_tokens))
     estimated: list[str] = []
     confidence = 1.0
@@ -906,6 +935,10 @@ def estimate_model_footprint(arch, quant: str, context_tokens: int) -> dict:
     else:
         meta = {}
 
+    if not model_size_bytes:
+        model_size_bytes = _int(meta.get("model_size_bytes") or 0)
+    model_size_bytes = _int(model_size_bytes)
+
     source = str(meta.get("source") or "")
     if source == "config":
         confidence = 0.95
@@ -923,6 +956,7 @@ def estimate_model_footprint(arch, quant: str, context_tokens: int) -> dict:
         return {
             "resident_gb": 0.0, "vram_resident_gb": 0.0,
             "weights_gb": 0.0, "active_gb": 0.0,
+            "kv_bytes_per_token": 0,
             "kv_gb_per_1k_tokens": 0.0, "kv_gb": 0.0,
             "context_tokens": context_tokens,
             "confidence": 0.0, "arch": "unknown", "quant": str(quant or ""),
@@ -980,9 +1014,13 @@ def estimate_model_footprint(arch, quant: str, context_tokens: int) -> dict:
             estimated.append("head_dim")
             confidence -= 0.1
 
-    kv_bytes_per_token = (2.0 * max(0, layers) * max(0, kv_heads)
-                          * max(0, head_dim) * bpp)
-    kv_gb_per_1k = kv_bytes_per_token * 1000.0 / GIB
+    kv_bytes = kv_cache_mod.kv_bytes_per_token(
+        kv_cache_bytes_per_token=kv_cache_bytes_per_token,
+        model_size_bytes=model_size_bytes,
+        n_layers=layers, n_kv_heads=kv_heads, head_dim=head_dim,
+        weight_bytes_per_param=bpp,
+        k_cache_quant=k_cache_quant, v_cache_quant=v_cache_quant)
+    kv_gb_per_1k = kv_bytes * 1000.0 / GIB
     kv_gb = kv_gb_per_1k * context_tokens / 1000.0
     resident_gb = total_params * bpp
     active_gb = (active_params * bpp) if is_moe else resident_gb
@@ -992,6 +1030,7 @@ def estimate_model_footprint(arch, quant: str, context_tokens: int) -> dict:
         "vram_resident_gb": _round(active_gb),
         "weights_gb": _round(resident_gb),
         "active_gb": _round(active_gb),
+        "kv_bytes_per_token": int(kv_bytes),
         "kv_gb_per_1k_tokens": _round(kv_gb_per_1k, 6),
         "kv_gb": _round(kv_gb, 4),
         "context_tokens": context_tokens,
@@ -1350,6 +1389,24 @@ def _floor_context(current: int) -> int:
     return min(current, 4096)
 
 
+def _hardware_context_cap(cfg) -> int:
+    """`config.hardware_context_tokens` for this cfg, or 0 when the model
+    file size is unknown. Keeping this cap in the same path as auto_fit means
+    a cache-quantization hint can never propose growth that path refuses."""
+    try:
+        from .config import hardware_context_tokens
+        model_bytes = _int(getattr(cfg, "model_size_bytes", 0) or 0)
+        if model_bytes <= 0:
+            return 0
+        return int(hardware_context_tokens(
+            _int(getattr(cfg, "vram_gb", 0) or 0), model_bytes,
+            str(getattr(cfg, "k_cache_quant", "") or ""),
+            str(getattr(cfg, "v_cache_quant", "") or ""),
+            _int(getattr(cfg, "kv_cache_bytes_per_token", 0) or 0)))
+    except Exception:
+        return 0
+
+
 def _free_gb(block: dict) -> float | None:
     """Free memory from a snapshot block, deriving it from totals when absent.
 
@@ -1496,6 +1553,15 @@ def tune_profile(cfg, snapshot: dict | None, footprint: dict | None,
             if target > current:
                 notes.append("server window unknown; growth proposal capped "
                              "at 2x the current setting")
+        # Growth is the only place the tuner can exceed auto_fit's physics:
+        # cap it with the same shared KV model auto_fit uses. Shrinks already
+        # come from that footprint and are not second-guessed here.
+        hw_cap = _hardware_context_cap(cfg)
+        if hw_cap > 0 and target > current and target > hw_cap:
+            target = max(floor, hw_cap)
+            notes.append(
+                f"context_tokens: growth proposal capped at {target:,} by the "
+                f"auto-fit VRAM estimate")
         if _is_explicit(cfg, "context_tokens"):
             notes.append("context_tokens is explicit; left untouched")
         elif supported <= 0 and headroom <= 0:
@@ -1639,7 +1705,8 @@ def apply_auto_tune(cfg, *, snap: dict | None = None,
                     quant = str(meta.get("quant")
                                 or getattr(cfg, "model_quant", "") or "")
                     footprint = estimate_model_footprint(
-                        meta, quant, _int(getattr(cfg, "context_tokens", 0)))
+                        meta, quant,
+                        _int(getattr(cfg, "context_tokens", 0)), cfg=cfg)
             if probe is None:
                 try:
                     probe = read_cached_probe(cfg.base_url, cfg.model)
@@ -1697,7 +1764,8 @@ def build_report(cfg, *, snap: dict | None = None, probe: dict | None = None,
     quant = str((meta or {}).get("quant")
                 or getattr(cfg, "model_quant", "") or "") if cfg else ""
     fp = estimate_model_footprint(
-        meta, quant, _int(getattr(cfg, "context_tokens", 0))) if meta else {}
+        meta, quant, _int(getattr(cfg, "context_tokens", 0)),
+        cfg=cfg) if meta else {}
     probe = probe if probe is not None else (
         read_cached_probe(cfg.base_url, cfg.model) if cfg else None)
     window = server_window

@@ -509,8 +509,13 @@ the profiler snapshot is a superset, so older GUI/TUI consumers keep working.
 - **Resident weights** = parameters × bytes per parameter. The accepted quantizations are
   f16 = 2, q8 = 1, q6 = 0.75, q5 = 0.625, q4 = 0.5 and q2 = 0.25 bytes per parameter. An
   unknown quantization uses the conservative 0.6.
-- **KV cache** = 2 (K and V) × layers × KV heads × head dim × bytes per parameter. The
-  profiler reports GB per 1,000 tokens.
+- **KV cache** uses the same size model as `auto_fit`: an explicit
+  `kv_cache_bytes_per_token` is used verbatim; otherwise a known model file
+  size gives a 32k-token cache roughly the size of the weights, scaled by
+  `k_cache_quant`/`v_cache_quant` (unset = f16). Without a file size the
+  architecture formula is 2 (K and V) × layers × KV heads × head dim, using
+  the weight quantization when no cache quant is set. The profiler reports
+  GB per 1,000 tokens.
 
 A dense model keeps all weights VRAM-resident. A mixture-of-experts model reports both
 numbers: all experts in RAM (`resident_gb`) and only the active experts VRAM-resident
@@ -535,7 +540,10 @@ When enabled for a local profile:
 - **context_tokens** is capped by `(free memory − weights − safety reserve) / KV GB per
   1,000 tokens`. A 4,096-token safety floor (or the user's smaller value) always remains.
   When the pool is tight, the window shrinks to that floor. When the pool is roomy, growth
-  is *proposed* up to the server-reported window and is never forced.
+  is *proposed* up to the server-reported window and is never forced. When the model file
+  size is known, the proposal is also capped by the same VRAM window `auto_fit` derives,
+  so `k_cache_quant` / `v_cache_quant` can never make the tuner suggest a window the
+  server cannot hold.
 - **Retrieval budgets** (`max_gathered_chars`, `flat_map_token_budget`) scale with the
   tuned context; memory-heavy local-MoE profiles get a smaller window than dense profiles
   at the same context.

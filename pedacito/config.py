@@ -36,6 +36,8 @@ from dataclasses import MISSING, dataclass, field, fields
 from pathlib import Path
 from urllib.parse import urlparse
 
+from . import kvcache as kv_cache_mod
+
 
 def _is_windows() -> bool:
     """True on Windows, including a Linux test that simulates win32."""
@@ -1090,47 +1092,26 @@ _ALIASES = {
     "provider_type": "provider",
 }
 
-# Effective bits per cache element, including llama.cpp's per-block scale/min
-# overhead. Only the size relative to f16 matters, so approximate is fine.
-_KV_QUANT_BITS = {
-    "f32": 32.0, "fp32": 32.0,
-    "f16": 16.0, "fp16": 16.0, "bf16": 16.0,
-    "q8_0": 8.5,
-    "q6_k": 6.5625,
-    "q5_1": 6.0, "q5_0": 5.5,
-    "q4_1": 5.0, "q4_0": 4.5, "iq4_nl": 4.5, "iq4_xs": 4.25,
-}
-_KV_QUANT_SHORT = {
-    "q8": "q8_0", "q6": "q6_k", "q6k": "q6_k",
-    "q5": "q5_1", "q5.1": "q5_1", "q5.0": "q5_0",
-    "q4": "q4_0", "q4.1": "q4_1", "q4.0": "q4_0",
-    "float16": "f16", "half": "f16", "float32": "f32", "bfloat16": "bf16",
-}
+# Effective bits per cache element; the table and spelling normalisation live
+# in `pedacito.kvcache` so config and the footprint estimate share one model.
+_KV_QUANT_BITS = kv_cache_mod.KV_QUANT_BITS
+_KV_QUANT_SHORT = kv_cache_mod.KV_QUANT_SHORT
 
 
 def _normalise_kv_quant(value) -> str:
     """Canonicalise a cache-quantization spelling, or raise ConfigError."""
-    raw = str(value or "").strip().lower().replace("-", "_")
-    if not raw or raw in ("auto", "default", "none", "false"):
-        return ""
-    raw = raw.replace(" ", "_")
-    if raw in _KV_QUANT_BITS:
-        return raw
-    dotted = raw.replace("_", ".")
-    if dotted in _KV_QUANT_SHORT:
-        return _KV_QUANT_SHORT[dotted]
-    if raw in _KV_QUANT_SHORT:
-        return _KV_QUANT_SHORT[raw]
-    raise ConfigError(
-        f"k_cache_quant/v_cache_quant: unknown cache quantization {value!r}. "
-        "Use f16, bf16, f32, q8_0, q6_k, q5_1, q5_0, q4_1, q4_0, "
-        "iq4_nl or iq4_xs.")
+    try:
+        return kv_cache_mod.normalise_kv_quant(value)
+    except ValueError as exc:
+        raise ConfigError(str(exc)) from exc
 
 
 def kv_quant_bits(value: str) -> float | None:
     """Effective bits per cache element for a quantization name, or None if unset."""
-    name = _normalise_kv_quant(value)
-    return _KV_QUANT_BITS.get(name) if name else None
+    try:
+        return kv_cache_mod.kv_quant_bits(value)
+    except ValueError as exc:
+        raise ConfigError(str(exc)) from exc
 
 
 def _canonical(name: str) -> str:
@@ -1891,10 +1872,6 @@ def is_hosted(cfg: Config) -> bool:
 
 
 _GIB = 1024 ** 3
-# KV-cache heuristic: at about this many tokens of context the cache is roughly
-# as large as the model's weights on disk (fits common llama/gemma/qwen GGUFs:
-# a 27B Q4 is ~16 GB at 32k).
-_KV_REFERENCE_TOKENS = 32768
 
 
 def missing_hardware(cfg: Config) -> list[str]:
@@ -1911,10 +1888,11 @@ def hardware_context_tokens(vram_gb: int, model_size_bytes: int,
     """Estimate how many context tokens fit in VRAM beside the model weights.
 
     System RAM is not counted (spilling is slow); 0.5 GB is kept for the
-    driver/desktop. Cache bytes per token come from the file size (see
-    _KV_REFERENCE_TOKENS), scaled by the K/V quantization bits; an explicit
-    `kv_cache_bytes_per_token` bypasses both. Returns 0 when the model does
-    not fit; callers then keep the fallback budgets.
+    driver/desktop. Cache bytes per token come from the shared
+    `pedacito.kvcache` helper: an explicit `kv_cache_bytes_per_token`
+    bypasses every heuristic, otherwise the model file size (see
+    `KV_REFERENCE_TOKENS`) is scaled by the K/V quantization bits. Returns 0
+    when the model does not fit; callers then keep the fallback budgets.
     """
     if model_size_bytes <= 0:
         return 0
@@ -1922,19 +1900,16 @@ def hardware_context_tokens(vram_gb: int, model_size_bytes: int,
     free = vram - int(model_size_bytes) - (_GIB // 2)
     if free <= 0:
         return 0
-    if kv_cache_bytes_per_token and kv_cache_bytes_per_token > 0:
-        kv_per_token = int(kv_cache_bytes_per_token)
-    else:
-        kv_per_token = max(16 * 1024,
-                           int(model_size_bytes) // _KV_REFERENCE_TOKENS)
-        k_bits = kv_quant_bits(k_cache_quant)
-        v_bits = kv_quant_bits(v_cache_quant)
-        if k_bits is not None or v_bits is not None:
-            # Baseline is f16 for both K and V; an unset side stays f16.
-            k_bits = 16.0 if k_bits is None else k_bits
-            v_bits = 16.0 if v_bits is None else v_bits
-            kv_per_token = max(
-                4 * 1024, int(kv_per_token * (k_bits + v_bits) / 32.0))
+    try:
+        kv_per_token = kv_cache_mod.kv_bytes_per_token(
+            kv_cache_bytes_per_token=kv_cache_bytes_per_token,
+            model_size_bytes=model_size_bytes,
+            k_cache_quant=k_cache_quant,
+            v_cache_quant=v_cache_quant)
+    except ValueError as exc:
+        raise ConfigError(str(exc)) from exc
+    if kv_per_token <= 0:
+        return 0
     return int(free // kv_per_token)
 
 

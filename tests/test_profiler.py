@@ -154,6 +154,115 @@ def test_footprint_missing_metadata_is_low_confidence():
     assert "quant" in named["estimated_fields"]
 
 
+# --- one shared KV model (config.auto_fit + profiler) -------------------------
+
+_REFERENCE_SIZE = 7_000_000_000
+_REFERENCE_ARCH = {"total_params_b": 14, "n_layers": 40, "n_kv_heads": 8,
+                   "head_dim": 128, "source": "config"}
+
+
+def test_shared_kv_model_agrees_on_dense_14b_q4_reference():
+    """The report's dense-14B-Q4-on-24GB case: the footprint used to assume
+    40,960 bytes/token; auto_fit used the file-size heuristic (213,623).
+    Both now come from the same helper and agree."""
+    cfg = Config()
+    cfg.vram_gb = 24
+    cfg.model_size_bytes = _REFERENCE_SIZE
+    fp = profiler.estimate_model_footprint(
+        _REFERENCE_ARCH, "q4", 8192, cfg=cfg)
+    expected = max(16 * 1024, _REFERENCE_SIZE // 32768)
+    assert expected == 213_623
+    assert fp["kv_bytes_per_token"] == expected
+    assert fp["kv_gb_per_1k_tokens"] == pytest.approx(
+        expected * 1000.0 / GIB, abs=1e-6)
+    # The old architecture-only number (2*L*H*D * q4 bytes) is the 5.2x
+    # divergence the review measured.
+    assert fp["kv_bytes_per_token"] != 40_960
+    free = 24 * GIB - _REFERENCE_SIZE - GIB // 2
+    assert config_mod.hardware_context_tokens(
+        24, _REFERENCE_SIZE) == int(free // expected)
+
+
+def test_q8_cache_enlarges_the_kv_estimate_in_both_paths():
+    """q8_0 is a bigger cache than the q4_0 the old tuner assumed. Both the
+    footprint and auto_fit must honor it and reach the same bytes/token."""
+    q4_cfg = Config()
+    q4_cfg.vram_gb = 24
+    q4_cfg.model_size_bytes = _REFERENCE_SIZE
+    q4_cfg.k_cache_quant = "q4_0"
+    q8_cfg = copy.copy(q4_cfg)
+    q8_cfg.k_cache_quant = "q8_0"
+    q4_fp = profiler.estimate_model_footprint(
+        _REFERENCE_ARCH, "q4", 8192, cfg=q4_cfg)
+    q8_fp = profiler.estimate_model_footprint(
+        _REFERENCE_ARCH, "q4", 8192, cfg=q8_cfg)
+    assert q8_fp["kv_bytes_per_token"] > q4_fp["kv_bytes_per_token"]
+    # It is also bigger than the old, quantization-blind footprint.
+    legacy = profiler.estimate_model_footprint(_REFERENCE_ARCH, "q4", 8192)
+    assert legacy["kv_bytes_per_token"] == 40_960
+    assert q8_fp["kv_bytes_per_token"] > legacy["kv_bytes_per_token"]
+    # config.auto_fit's path sees the same larger cache in tokens.
+    assert (config_mod.hardware_context_tokens(24, _REFERENCE_SIZE, "q8_0")
+            < config_mod.hardware_context_tokens(24, _REFERENCE_SIZE, "q4_0"))
+    base = max(16 * 1024, _REFERENCE_SIZE // 32768)
+    expected_q8 = max(4 * 1024, int(base * (8.5 + 16) / 32.0))
+    assert q8_fp["kv_bytes_per_token"] == expected_q8
+    free = 24 * GIB - _REFERENCE_SIZE - GIB // 2
+    assert (config_mod.hardware_context_tokens(24, _REFERENCE_SIZE, "q8_0")
+            == int(free // expected_q8))
+
+
+def test_explicit_kv_bytes_per_token_bypasses_both_paths():
+    cfg = Config()
+    cfg.vram_gb = 24
+    cfg.model_size_bytes = _REFERENCE_SIZE
+    cfg.k_cache_quant = "q8_0"
+    cfg.v_cache_quant = "q5_1"
+    cfg.kv_cache_bytes_per_token = 96 * 1024
+    fp = profiler.estimate_model_footprint(
+        _REFERENCE_ARCH, "q4", 8192, cfg=cfg)
+    assert fp["kv_bytes_per_token"] == 96 * 1024
+    free = 24 * GIB - _REFERENCE_SIZE - GIB // 2
+    assert config_mod.hardware_context_tokens(
+        24, _REFERENCE_SIZE, "q8_0", "q5_1", 96 * 1024) == int(
+            free // (96 * 1024))
+    # The same bypass works through explicit estimate arguments (no cfg).
+    direct = profiler.estimate_model_footprint(
+        _REFERENCE_ARCH, "q4", 8192, model_size_bytes=_REFERENCE_SIZE,
+        k_cache_quant="q8_0", v_cache_quant="q5_1",
+        kv_cache_bytes_per_token=96 * 1024)
+    assert direct["kv_bytes_per_token"] == 96 * 1024
+
+
+def test_tune_growth_is_capped_by_hardware_context_tokens():
+    """A MoE footprint counts only active weights in VRAM, so its growth
+    proposal can exceed auto_fit's whole-file estimate. The cap keeps the
+    tuner from suggesting a window the server's q8 cache cannot hold."""
+    cfg = _cfg(vram_gb=24, model_size_bytes=15_000_000_000,
+               k_cache_quant="q8_0")
+    arch = {"total_params_b": 30, "active_params_b": 3, "is_moe": True,
+            "n_layers": 48, "n_kv_heads": 4, "head_dim": 128,
+            "source": "config"}
+    fp = profiler.estimate_model_footprint(arch, "q4", 8192, cfg=cfg)
+    out = profiler.tune_profile(
+        cfg, _snap(vram_total=24.0, vram_free=20.0), fp, None,
+        server_window=262144)
+    cap = config_mod.hardware_context_tokens(
+        24, cfg.model_size_bytes, cfg.k_cache_quant)
+    assert cap > 0
+    assert out["values"]["context_tokens"] == 8192   # growth is not applied
+    assert out["proposed_context_tokens"] == cap
+    assert any("capped" in note for note in out["notes"])
+
+    q4_cfg = copy.copy(cfg)
+    q4_cfg.k_cache_quant = "q4_0"
+    q4_fp = profiler.estimate_model_footprint(arch, "q4", 8192, cfg=q4_cfg)
+    q4_out = profiler.tune_profile(
+        q4_cfg, _snap(vram_total=24.0, vram_free=20.0), q4_fp, None,
+        server_window=262144)
+    assert out["proposed_context_tokens"] < q4_out["proposed_context_tokens"]
+
+
 # --- tuning decisions ---------------------------------------------------------
 
 def _cfg(**overrides) -> Config:
