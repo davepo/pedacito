@@ -81,10 +81,16 @@ you are never told to "update" to the version you already run. Set
 - **GUI** — when a newer release exists, a slim banner appears under the
   topbar: *Pedacito vX.Y.Z is available (you have A.B.C)*. **Update** runs the
   upgrade command for your install method in the background and streams its
-  output into a small drawer; on success, **Restart Pedacito** reopens the GUI
-  on the same port with the new version. A failed upgrade shows the output
-  plus the manual command. **Dismiss** hides the banner until an even newer
-  release appears. The banner is in-flow: it never covers a control.
+  output into a small drawer; **Stop** cancels a stuck run (the worker also
+  enforces a 10-minute wall clock), and a failed or cancelled run shows the
+  output plus the manual command. On success, **Restart Pedacito** reopens the
+  GUI on the same port with the new version. **Dismiss** hides the banner
+  until an even newer release appears. The banner is in-flow: it never covers
+  a control. Without waiting for the banner, **Settings → Updates** offers a
+  manual **Check for updates** that shows installed vs latest and whether the
+  answer came from the 24 h cache or a fresh check; with
+  `check_for_updates = false` it explains the opt-out and makes no network
+  call.
 - **CLI** — `pedacito update` prints installed vs latest and the detected
   install method; `pedacito update --run` runs the upgrade and returns its
   exit code.
@@ -100,6 +106,13 @@ as an argument list with no shell (Windows-safe):
 | virtualenv | `<venv python> -m pip install --upgrade pedacito` |
 | pip --user | `<python> -m pip install --upgrade --user pedacito` — on PEP 668 "externally managed" Pythons (Debian/Ubuntu/Homebrew system Python) pip may refuse; prefer pipx or a venv there |
 | editable / source checkout | no automatic command: run `git pull && pip install -e .` in your checkout |
+
+**Restart platform note.** The "Windows-safe" guarantee above is about the
+upgrade command's argv list. The GUI's **Restart Pedacito** is a separate
+process relaunch: on Windows, Pedacito starts the replacement
+(`python -m pedacito gui …`) with `subprocess.Popen` and exits the old
+process, because `os.execv` does not replace a process there; on macOS and
+Linux it re-execs in place. Either way the GUI returns on the same port.
 
 **Opt out entirely**: set `check_for_updates = false` in `[universal]` of your
 config (or `PEDACITO_CHECK_FOR_UPDATES=false`). That disables every release

@@ -4959,6 +4959,12 @@ function UpdateBanner() {
       if (!j.ok) PDC.toast(j.detail || 'Could not restart.', true);
     });
   };
+  const stopUpgrade = () => {
+    PDC.api('/api/update/cancel', {}).then((j) => {
+      if (!j.ok) PDC.toast(j.detail || 'Could not stop the upgrade.', true);
+      refreshState();
+    }, () => PDC.toast('Could not stop the upgrade.', true));
+  };
   const runLabel = run.running ? 'Upgrading\u2026'
     : run.ok === true ? 'Upgrade finished'
     : run.ok === false ? 'Upgrade failed' : 'Upgrade';
@@ -4985,6 +4991,10 @@ function UpdateBanner() {
             <span class="grow">${runNote}</span>
             ${run.ok === true && !run.running ? html`
               <button class="small primary" onClick=${restart}>Restart Pedacito</button>` : null}
+            ${run.running ? html`
+              <button class="small danger" disabled=${!!run.cancelling}
+                      title="stop the upgrade process and its children"
+                      onClick=${stopUpgrade}>${run.cancelling ? 'Stopping\u2026' : 'Stop'}</button>` : null}
             <button class="ghost small"
                     onClick=${() => { S.ui.updateDrawerOpen = !S.ui.updateDrawerOpen; emit(); }}>
               ${S.ui.updateDrawerOpen ? 'Hide output' : 'Show output'}</button>

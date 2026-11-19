@@ -14,6 +14,7 @@ from __future__ import annotations
 import json
 import mimetypes
 import os
+import subprocess
 import sys
 import threading
 import time
@@ -23,6 +24,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from urllib.parse import parse_qs, unquote, urlparse
 
+from .. import __version__ as PED_VERSION
 from .. import checkpoints as checkpoints_mod
 from .. import review as review_mod
 from .. import prompts as prompts_mod
@@ -310,6 +312,11 @@ def _snapshot(q, body=None):
 
 # --- auto-update (pedacito.update): notice, manual check, upgrade, restart ----
 
+# A pipx/pip upgrade that has not finished in ten minutes is stuck; the GUI
+# kills it rather than leaving the drawer spinning forever.
+UPDATE_RUN_TIMEOUT = 600.0
+
+
 @get("/api/update")
 def _update_get(q, body=None):
     with STATE.lock:
@@ -317,7 +324,8 @@ def _update_get(q, body=None):
         run = dict(STATE.update_run)
         cfg = STATE.cfg
     return 200, {"ok": True, "update": info, "update_run": run,
-                 "check_for_updates": update_mod.updates_enabled(cfg)}
+                 "check_for_updates": update_mod.updates_enabled(cfg),
+                 "current": PED_VERSION}
 
 
 @post("/api/update/check")
@@ -350,15 +358,62 @@ def _update_run(q, body=None):
     command, instructions = update_mod.upgrade_command(method)
     if command is None:
         return 200, {"ok": False, "detail": instructions}
-    STATE.update_run_start(command)
+    cancel = STATE.update_run_start(command)
 
     def worker():
-        code = update_mod.run_upgrade(command, on_line=STATE.note_update_output)
-        STATE.update_run_done(code)
+        started = time.monotonic()
+        code = update_mod.run_upgrade(
+            command, on_line=STATE.note_update_output,
+            timeout=UPDATE_RUN_TIMEOUT, cancel=cancel)
+        detail = ""
+        if code != 0:
+            if cancel.is_set():
+                why = "Upgrade cancelled"
+            elif time.monotonic() - started >= UPDATE_RUN_TIMEOUT:
+                why = "Upgrade timed out"
+            else:
+                why = f"Upgrade failed (exit {code})"
+            detail = f"{why}. {instructions}"
+        STATE.update_run_done(code, detail)
 
     threading.Thread(target=worker, name="pedacito-gui-update-run",
                      daemon=True).start()
     return 202, {"ok": True, "running": True, "command": command}
+
+
+@post("/api/update/cancel")
+def _update_cancel(q, body=None):
+    """Stop the running upgrade, including any children it spawned. A stale
+    click after the upgrade finished is a 409, not a silent no-op."""
+    if not STATE.cancel_update_run():
+        return 409, {"ok": False, "detail": "No upgrade is running."}
+    return 200, {"ok": True, "cancelling": True}
+
+
+def _restart_argv() -> list[str]:
+    """The same GUI on the same port, project and profile."""
+    args = _RUN_ARGS
+    argv = [sys.executable, "-m", "pedacito", "gui", "--port", str(args.port)]
+    if not args.open_browser:
+        argv.append("--no-open")
+    if args.project:
+        argv.append(str(args.project))
+        if args.profile:
+            argv += ["--profile", str(args.profile)]
+    return argv
+
+
+def _restart_process(argv: list[str]) -> None:
+    """Replace this GUI with the freshly upgraded one. Windows has no execv
+    semantics (the call returns and the old interpreter keeps running), so
+    spawn the replacement and hard-exit; POSIX replaces the process in place."""
+    time.sleep(0.5)          # let the HTTP answer reach the page first
+    shutdown_server()
+    if os.name == "nt":
+        subprocess.Popen(argv)
+        os._exit(0)
+        return
+    os.execv(sys.executable, argv)
 
 
 @post("/api/update/restart")
@@ -371,22 +426,9 @@ def _update_restart(q, body=None):
     if not ok:
         return 409, {"ok": False,
                      "detail": "No successful upgrade to restart into."}
-    args = _RUN_ARGS
-    argv = [sys.executable, "-m", "pedacito", "gui", "--port", str(args.port)]
-    if not args.open_browser:
-        argv.append("--no-open")
-    if args.project:
-        argv.append(str(args.project))
-        if args.profile:
-            argv += ["--profile", str(args.profile)]
-
-    def restart():
-        time.sleep(0.5)          # let the HTTP answer reach the page first
-        shutdown_server()
-        os.execv(sys.executable, argv)
-
-    threading.Thread(target=restart, name="pedacito-gui-restart",
-                     daemon=True).start()
+    argv = _restart_argv()
+    threading.Thread(target=_restart_process, args=(argv,),
+                     name="pedacito-gui-restart", daemon=True).start()
     return 200, {"ok": True, "detail": "Restarting Pedacito…"}
 
 

@@ -43,6 +43,9 @@
              probed: false, verified: false, err: '', models: [],
              pick: {}, name: {}, def: '', search: '', importing: false,
              modal: null, body: null };
+  // Updates tab: the last GET/POST /api/update answer. Kept outside X so
+  // switching to another tab and back does not fire another check.
+  var UPD = { data: null, loaded: false, busy: false, err: '' };
 
   PDC.openSettings = function (opts) {
     opts = opts || {};
@@ -50,6 +53,7 @@
           tab: opts.tab || 'discovery', profile: opts.profile || '',
           target: opts.target || '', pending: {}, models: [],
           search: opts.search || '', focusSearch: !!opts.search };
+    UPD = { data: null, loaded: false, busy: false, err: '' };
     X.modal = PDC.modal('Settings', h('div', { class: 'tip', text: 'Loading\u2026' }), [{ label: 'Close' }]);
     X.body = X.modal.body;
     PDC.api('/api/settings').then(function (d) { X.data = d; pickDefaults(); render(); });
@@ -239,7 +243,8 @@
     }
     var tabs = h('div', { class: 'stabs' });
     [['discovery', 'Model discovery'], ['profiles', 'Profiles'], ['all', 'All settings'],
-     ['autotune', 'Auto-Tune'], ['mcp', 'MCP Servers'], ['raw', 'Raw file / reset']].forEach(function (t) {
+     ['autotune', 'Auto-Tune'], ['mcp', 'MCP Servers'], ['updates', 'Updates'],
+     ['raw', 'Raw file / reset']].forEach(function (t) {
       tabs.appendChild(h('button', { class: X.tab === t[0] ? 'on' : '', text: t[1], onclick: function () { X.tab = t[0]; X.pending = {}; render(); } }));
     });
     body.appendChild(tabs);
@@ -253,6 +258,7 @@
     else if (X.tab === 'all') body.appendChild(allTab());
     else if (X.tab === 'autotune') body.appendChild(autotuneTab());
     else if (X.tab === 'mcp') body.appendChild(mcpTab());
+    else if (X.tab === 'updates') body.appendChild(updatesTab());
     else body.appendChild(rawTab());
   }
   function radio(which, label, disabled) {
@@ -1495,6 +1501,109 @@
             text: 'writes [profiles.' + (rec.suggested_scout_name || 'scout') + '] on ' + (rec.scout_spec || {}).base_url + ' and sets default_profile + scout_profile in one edit' }))));
     }
     return box;
+  }
+
+  // ----- updates ---------------------------------------------------------------------
+  // R5.2: GET /api/update is the last known answer (cache included);
+  // POST /api/update/check is the synchronous manual check, which bypasses
+  // the 24 h cache. With the opt-out set the server answers "disabled"
+  // without a network call, so the button stays disabled and the reason is
+  // on screen.
+  function loadUpdateState() {
+    if (UPD.busy) return;
+    UPD.busy = true;
+    PDC.api('/api/update').then(function (j) {
+      UPD.busy = false; UPD.loaded = true; UPD.data = j; UPD.err = ''; render();
+    }, function () {
+      UPD.busy = false; UPD.loaded = true;
+      UPD.err = 'The GUI server did not answer.';
+      render();
+    });
+  }
+
+  function checkUpdateNow() {
+    UPD.busy = true; UPD.err = ''; render();
+    PDC.api('/api/update/check', {}).then(function (j) {
+      UPD.busy = false; UPD.loaded = true;
+      UPD.data = UPD.data || {};
+      if (j && j.update) {
+        UPD.data.update = j.update;
+        if (j.update.detail === 'disabled') UPD.data.check_for_updates = false;
+      }
+      render();
+      PDC.refreshState();              // the banner reads the same notice
+    }, function () {
+      UPD.busy = false; UPD.err = 'The GUI server did not answer.'; render();
+    });
+  }
+
+  function checkedAtText(sec) {
+    if (!sec) return '';
+    try { return new Date(sec * 1000).toLocaleString(); }
+    catch (e) { return ''; }
+  }
+
+  function updatesTab() {
+    if (!UPD.loaded && !UPD.busy) loadUpdateState();
+    var data = UPD.data || {};
+    var info = data.update || null;
+    var enabled = data.check_for_updates !== false;
+    var installed = (info && info.current) || data.current || 'unknown';
+    var latest = (!enabled || !(info && info.ok)) ? '\u2014' : info.latest;
+    var when = checkedAtText(info && info.checked_at);
+    var source;
+    if (!enabled) {
+      source = 'Update checks are disabled, so no answer was requested (no network call).';
+    } else if (!info) {
+      source = 'No check has landed in this session yet.';
+    } else if (info.detail === 'offline') {
+      source = 'PyPI was unreachable (offline); nothing was changed.';
+    } else if (info.detail === 'disabled') {
+      source = 'Update checks are disabled, so no answer was requested (no network call).';
+    } else if (info.ok && info.cached) {
+      source = '24 h cache' + (when ? ' \u2014 checked ' + when : '') + '.';
+    } else if (info.ok) {
+      source = 'fresh check' + (when ? ' \u2014 checked ' + when : '') + '.';
+    } else {
+      source = 'No answer yet.';
+    }
+    var status;
+    if (!enabled) {
+      status = 'Enable check_for_updates to see whether a newer release exists.';
+    } else if (info && info.ok && info.update_available) {
+      status = 'Pedacito v' + info.latest + ' is available \u2014 you have ' + installed + '.';
+    } else if (info && info.ok) {
+      status = 'You are up to date.';
+    } else if (info && info.detail === 'offline') {
+      status = 'Could not reach PyPI. Try again when online.';
+    } else {
+      status = 'Run a manual check to compare with the latest release.';
+    }
+    return h('div', {},
+      h('div', { class: 'note-box' },
+        h('b', { text: 'Release updates' }),
+        h('div', { class: 'small-text',
+          text: 'The manual check asks the public PyPI metadata for pedacito now (one anonymous GET, 2 s timeout) and stores the answer in the same 24 h cache the startup check uses. The Update banner reads the same notice.' })),
+      !enabled ? h('div', { class: 'note-box' },
+        h('b', { text: 'Update checks are turned off' }),
+        h('div', { class: 'small-text',
+          text: 'check_for_updates = false is set in the user config (or PEDACITO_CHECK_FOR_UPDATES=false is exported). No network call is made and no upgrade command can start while this is off. Set check_for_updates = true in [universal] (or remove the environment override), then reopen Settings.' })) : null,
+      h('div', { class: 'form', style: 'margin-top:10px' },
+        h('label', { text: 'Installed' }), h('div', { class: 'mono', text: installed }),
+        h('label', { text: 'Latest' }), h('div', { class: 'mono', text: latest }),
+        h('label', { text: 'Answer source' }), h('div', { class: 'small-text', text: source })),
+      h('div', { class: 'row', style: 'margin-top:12px' },
+        h('button', { class: 'primary', text: UPD.busy ? 'Checking\u2026' : 'Check for updates',
+          disabled: !enabled || UPD.busy,
+          title: enabled ? 'ask PyPI now, bypassing the 24 h cache' : 'update checks are disabled',
+          onclick: checkUpdateNow }),
+        h('span', { class: 'muted small-text grow', text: status })),
+      info && enabled && info.ok && info.update_available && info.instructions
+        ? h('div', { class: 'note-box', style: 'margin-top:10px' },
+            h('b', { text: 'Upgrade' }),
+            h('div', { class: 'small-text', text: info.instructions }))
+        : null,
+      UPD.err ? h('div', { class: 'note-box err', text: UPD.err }) : null);
   }
 
   // ----- all settings ----------------------------------------------------------------

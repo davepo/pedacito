@@ -15,6 +15,7 @@ import sys
 import threading
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -27,6 +28,7 @@ from pedacito import config as config_mod
 from pedacito import update as update_mod
 from pedacito.config import Config
 from pedacito.gui import core
+from pedacito.gui import server as gui_server
 from test_gui import fake_port, gui, project  # noqa: F401  (shared GUI fixtures)
 from test_tui import FakeClient
 
@@ -577,6 +579,18 @@ def test_run_upgrade_timeout_kills_and_reports():
     assert code == 1 and any("timed out" in ln for ln in lines)
 
 
+def test_run_upgrade_cancel_kills_child_and_reports():
+    lines = []
+    cancel = threading.Event()
+    threading.Timer(0.3, cancel.set).start()
+    started = time.monotonic()
+    code = update_mod.run_upgrade(
+        [sys.executable, "-c", "import time; time.sleep(30)"],
+        on_line=lines.append, timeout=30, cancel=cancel)
+    assert code == 1 and any("cancelled" in ln for ln in lines)
+    assert time.monotonic() - started < 10
+
+
 # --- GUI: data layer and routes ---------------------------------------------------------
 
 def test_gui_state_carries_update_fields(gui):  # noqa: F811
@@ -670,8 +684,10 @@ def test_gui_run_streams_output_and_finishes(gui, monkeypatch):  # noqa: F811
     monkeypatch.setattr(update_mod, "detect_install_method",
                         lambda **kw: "venv")
 
-    def fake_run(argv, on_line=None, timeout=None):
+    def fake_run(argv, on_line=None, timeout=None, cancel=None):
         assert isinstance(argv, list) and argv[0] == sys.executable
+        assert timeout == gui_server.UPDATE_RUN_TIMEOUT
+        assert cancel is not None
         on_line("Collecting pedacito")
         on_line("Successfully installed pedacito-9.9.9")
         return 0
@@ -698,7 +714,7 @@ def test_gui_run_busy_is_409_and_restart_needs_success(gui, monkeypatch):  # noq
     assert status == 409
     release = threading.Event()
 
-    def blocking_run(argv, on_line=None, timeout=None):
+    def blocking_run(argv, on_line=None, timeout=None, cancel=None):
         on_line("working")
         release.wait(10)
         return 1
@@ -714,6 +730,110 @@ def test_gui_run_busy_is_409_and_restart_needs_success(gui, monkeypatch):  # noq
     assert run is not None and run["ok"] is False and run["code"] == 1
     status, _j = gui.post("/api/update/restart", {})
     assert status == 409                            # failed run: no restart
+
+
+def test_gui_run_timeout_reports_failure_and_manual_instructions(gui, monkeypatch):  # noqa: F811
+    enable(monkeypatch)
+    monkeypatch.setattr(update_mod, "detect_install_method",
+                        lambda **kw: "venv")
+    manual = "Manual: python -m pip install --upgrade pedacito"
+    monkeypatch.setattr(update_mod, "upgrade_command",
+                        lambda method: ([sys.executable, "-c",
+                                         "import time; time.sleep(30)"], manual))
+    monkeypatch.setattr(gui_server, "UPDATE_RUN_TIMEOUT", 0.3)
+    status, j = gui.post("/api/update/run", {})
+    assert status == 202 and j["ok"] is True
+    run = wait_until(lambda: (lambda r: r if not r["running"] else None)(
+        gui.get("/api/update")[1]["update_run"]))
+    assert run is not None, "timed-out upgrade worker did not finish"
+    assert run["ok"] is False and run["code"] == 1
+    assert "timed out" in run["detail"].lower()
+    assert manual in run["detail"]
+    status, _j = gui.post("/api/update/restart", {})
+    assert status == 409                    # a timeout is not exit 0
+
+
+def test_gui_cancel_stops_run_and_reports_failure(gui, monkeypatch):  # noqa: F811
+    enable(monkeypatch)
+    monkeypatch.setattr(update_mod, "detect_install_method",
+                        lambda **kw: "venv")
+    manual = "Manual: pipx upgrade pedacito"
+    monkeypatch.setattr(update_mod, "upgrade_command",
+                        lambda method: ([sys.executable, "-c",
+                                         "import time; time.sleep(30)"], manual))
+    status, j = gui.post("/api/update/run", {})
+    assert status == 202 and j["ok"] is True
+    assert wait_until(
+        lambda: gui.get("/api/update")[1]["update_run"]["running"])
+    status, j = gui.post("/api/update/cancel", {})
+    assert status == 200 and j["ok"] is True and j["cancelling"] is True
+    run = wait_until(lambda: (lambda r: r if not r["running"] else None)(
+        gui.get("/api/update")[1]["update_run"]))
+    assert run is not None, "cancelled upgrade worker did not finish"
+    assert run["ok"] is False and run["code"] == 1
+    assert "cancelled" in run["detail"].lower()
+    assert manual in run["detail"]
+    assert run["cancelling"] is False
+    status, _j = gui.post("/api/update/restart", {})
+    assert status == 409                    # a cancel is not exit 0
+
+
+def test_gui_cancel_when_idle_is_409(gui):  # noqa: F811
+    status, j = gui.post("/api/update/cancel", {})
+    assert status == 409 and j["ok"] is False
+
+
+def test_restart_on_windows_spawns_replacement_and_exits(monkeypatch):
+    """R4.4: os.execv does not replace the process on Windows, so the restart
+    path must Popen the same argv and hard-exit instead. No real exec."""
+    calls = {"popen": [], "exit": None, "execv": False}
+    monkeypatch.setattr(gui_server.os, "name", "nt")
+    monkeypatch.setattr(gui_server.time, "sleep", lambda _s: None)
+    monkeypatch.setattr(gui_server, "shutdown_server", lambda: None)
+    monkeypatch.setattr(gui_server, "_RUN_ARGS", SimpleNamespace(
+        port=8765, open_browser=False, project="/tmp/proj", profile="small"))
+    monkeypatch.setattr(gui_server.subprocess, "Popen",
+                        lambda argv, **kw: calls["popen"].append(argv))
+
+    def fake_exit(code):
+        calls["exit"] = code
+
+    def no_exec(*_a, **_k):
+        calls["execv"] = True
+
+    monkeypatch.setattr(gui_server.os, "_exit", fake_exit)
+    monkeypatch.setattr(gui_server.os, "execv", no_exec)
+    gui_server._restart_process(gui_server._restart_argv())
+    assert calls["popen"] == [[sys.executable, "-m", "pedacito", "gui",
+                               "--port", "8765", "--no-open", "/tmp/proj",
+                               "--profile", "small"]]
+    assert calls["exit"] == 0 and calls["execv"] is False
+
+
+def test_gui_manual_check_opt_out_never_touches_network(gui, monkeypatch):  # noqa: F811
+    calls = []
+
+    def boom(*a, **k):
+        calls.append(a)
+        raise AssertionError("network call with check_for_updates=false")
+
+    monkeypatch.setattr(update_mod, "urlopen", boom)
+    status, j = gui.post("/api/update/check", {})
+    assert status == 200 and j["update"]["detail"] == "disabled"
+    assert j["update"]["update_available"] is False
+    assert calls == []
+
+
+def test_gui_settings_wires_manual_update_check():
+    """R5.2/R4.5: the Settings tab calls both ready-made update endpoints,
+    reports cache vs fresh, and the drawer offers Cancel while running."""
+    static = Path(__file__).resolve().parents[1] / "pedacito" / "gui" / "static"
+    js = (static / "settings.js").read_text(encoding="utf-8")
+    assert "/api/update/check" in js and "Check for updates" in js
+    assert "24 h cache" in js and "fresh check" in js
+    assert "check_for_updates = false" in js
+    app = (static / "app.js").read_text(encoding="utf-8")
+    assert "/api/update/cancel" in app and "Stop" in app
 
 
 def test_update_output_buffer_is_capped():
@@ -790,7 +910,7 @@ def test_tui_update_run_upgrades(tmp_path, monkeypatch):
                         lambda **kw: "venv")
     ran = []
 
-    def fake_run(argv, on_line=None, timeout=None):
+    def fake_run(argv, on_line=None, timeout=None, cancel=None):
         ran.append(argv)
         on_line("Successfully installed pedacito-9.9.9")
         return 0
@@ -931,7 +1051,7 @@ def test_cli_update_run_returns_upgrade_exit_code(monkeypatch, capsys):
     codes = iter([0, 3])
     ran = []
 
-    def fake_run(argv, on_line=None, timeout=None):
+    def fake_run(argv, on_line=None, timeout=None, cancel=None):
         ran.append(argv)
         on_line("pip output line")
         return next(codes)

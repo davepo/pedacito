@@ -30,6 +30,7 @@ import os
 import queue
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import threading
@@ -349,16 +350,49 @@ def upgrade_command(method: str) -> tuple[list[str] | None, str]:
 
 # --- running the upgrade ----------------------------------------------------------
 
-def run_upgrade(argv: list[str], on_line=None, timeout: float | None = None) -> int:
+def _stop_process(proc: subprocess.Popen, *, group: bool = True) -> None:
+    """Kill the upgrade and its children. The child runs in its own session
+    (POSIX) or process group (Windows), so a cancel or timeout stops the whole
+    tree instead of leaving pip's own children behind. `group=False` is for
+    a child that shares our process group: only the direct process may die."""
+    if proc.poll() is not None:
+        return
+    try:
+        if group and os.name == "nt":
+            subprocess.run(["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+                           shell=False, capture_output=True, timeout=5.0)
+        elif group:
+            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+    except (OSError, subprocess.SubprocessError):
+        pass
+    try:
+        proc.kill()
+    except OSError:
+        pass
+
+
+def run_upgrade(argv: list[str], on_line=None, timeout: float | None = None,
+                cancel: threading.Event | None = None) -> int:
     """Run an upgrade argv list (shell=False) and stream its combined
     stdout/stderr line by line to `on_line`. Returns the exit code; a spawn
-    failure or timeout reads as 1. Never raises. The lines are drained by a
-    small reader thread so `timeout` is a real wall-clock deadline even when
-    the child produces no output at all."""
+    failure, timeout or `cancel` reads as 1. Never raises. The lines are
+    drained by a small reader thread so `timeout` is a real wall-clock
+    deadline even when the child produces no output at all, and `cancel` is
+    polled while waiting so Stop takes effect during a silent `pip` run."""
+    kwargs = {"shell": False, "stdout": subprocess.PIPE,
+              "stderr": subprocess.STDOUT,
+              "encoding": "utf-8", "errors": "replace"}
+    isolated = cancel is not None or timeout is not None
+    if isolated:
+        # Isolate the child so a timeout/cancel can stop its whole tree.
+        # Without either, keep the old behaviour (Ctrl-C reaches pip too).
+        if os.name == "nt":
+            kwargs["creationflags"] = getattr(
+                subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+        else:
+            kwargs["start_new_session"] = True
     try:
-        proc = subprocess.Popen(argv, shell=False, stdout=subprocess.PIPE,
-                                stderr=subprocess.STDOUT,
-                                encoding="utf-8", errors="replace")
+        proc = subprocess.Popen(argv, **kwargs)
     except (OSError, ValueError) as exc:
         if on_line is not None:
             try:
@@ -388,15 +422,26 @@ def run_upgrade(argv: list[str], on_line=None, timeout: float | None = None) -> 
     threading.Thread(target=reader, daemon=True).start()
     deadline = None if timeout is None else time.monotonic() + timeout
     while True:
-        wait = None if deadline is None else max(
-            0.0, deadline - time.monotonic())
+        if cancel is not None and cancel.is_set():
+            _stop_process(proc)
+            proc.wait()
+            emit("upgrade cancelled")
+            return 1
+        if deadline is None and cancel is None:
+            wait = None
+        else:
+            wait = 0.2          # poll cancel even when the child is silent
+            if deadline is not None:
+                wait = min(wait, max(0.0, deadline - time.monotonic()))
         try:
             item = lines.get(timeout=wait)
         except queue.Empty:
-            proc.kill()
-            proc.wait()
-            emit("upgrade timed out and was stopped")
-            return 1
+            if deadline is not None and time.monotonic() >= deadline:
+                _stop_process(proc)
+                proc.wait()
+                emit("upgrade timed out and was stopped")
+                return 1
+            continue
         if item is None:
             break
         emit(item.rstrip("\n"))
@@ -404,7 +449,7 @@ def run_upgrade(argv: list[str], on_line=None, timeout: float | None = None) -> 
         # stdout is at EOF, so the child is exiting; a short grace wait only.
         return proc.wait(timeout=5.0)
     except subprocess.TimeoutExpired:
-        proc.kill()
+        _stop_process(proc, group=isolated)
         proc.wait()
         return 1
 

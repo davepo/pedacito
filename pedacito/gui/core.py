@@ -527,7 +527,9 @@ class State:
         # The banner is data-driven from these; nothing here blocks startup.
         self.update: dict | None = None
         self.update_run: dict = {"running": False, "ok": None, "code": None,
-                                 "output": "", "command": [], "detail": ""}
+                                 "output": "", "command": [], "detail": "",
+                                 "cancelling": False}
+        self.update_cancel: threading.Event | None = None
 
         # Engine V2 telemetry for the ACTIVITY & PLAN panel (see
         # `note_event` and `engine`): the live phase, the last gather step
@@ -1216,13 +1218,29 @@ class State:
             payload = dict(self.update) if self.update else None
         self.bus.publish("update", update=payload)
 
-    def update_run_start(self, command: list[str]) -> None:
+    def update_run_start(self, command: list[str]) -> threading.Event:
+        cancel = threading.Event()
         with self.lock:
+            self.update_cancel = cancel
             self.update_run = {"running": True, "ok": None, "code": None,
                                "output": "", "command": list(command),
-                               "detail": ""}
+                               "detail": "", "cancelling": False}
             payload = dict(self.update_run)
         self.bus.publish("update_run", **payload)
+        return cancel
+
+    def cancel_update_run(self) -> bool:
+        """Ask the running upgrade worker to stop. False when idle, so the
+        route can answer 409 without pretending a cancel happened."""
+        with self.lock:
+            if not self.update_run.get("running") or self.update_cancel is None:
+                return False
+            event = self.update_cancel
+            self.update_run["cancelling"] = True
+            payload = dict(self.update_run)
+        event.set()
+        self.bus.publish("update_run", **payload)
+        return True
 
     def note_update_output(self, line: str) -> None:
         """One subprocess line into the upgrade drawer (capped tail buffer)."""
@@ -1235,10 +1253,12 @@ class State:
 
     def update_run_done(self, code: int, detail: str = "") -> None:
         with self.lock:
+            self.update_cancel = None
             self.update_run["running"] = False
             self.update_run["code"] = code
             self.update_run["ok"] = code == 0
             self.update_run["detail"] = detail
+            self.update_run["cancelling"] = False
             payload = dict(self.update_run)
         self.bus.publish("update_run", **payload)
 
