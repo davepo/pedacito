@@ -588,6 +588,11 @@ class Config:
     # false keeps every existing value exactly as before. Explicit per-key
     # settings always win; tiered local-moe concurrency never leaves 1.
     auto_tune: bool = False
+    # Schedule the automatic prefill/generation speed probe after a successful
+    # explicit server load (once per server+model, cached for a week). true
+    # preserves the historical behavior; false means no probe thread starts
+    # after load (an explicit `pedacito profile --run` still works).
+    profile_probe_on_load: bool = True
     # Explicit architecture overrides for the footprint estimate. 0 / "" means
     # discover it from llama.cpp /props + /models, Ollama /api/show, then the
     # model name. Set these when a server reports no metadata. Missing fields
@@ -1540,6 +1545,11 @@ def load(root: Path | None = None, explicit: Path | None = None,
     never need it. `pedacito config` passes require_hardware=False so it can
     inspect and repair an incomplete file."""
     cfg = Config()
+    # The file a reset command should edit: the explicit --config layer when
+    # one was passed, otherwise the user config. Recorded so the TUI can share
+    # the CLI's `profile --reset` write path without re-parsing argv.
+    cfg._config_path = (str(Path(explicit)) if explicit is not None
+                        else str(USER_CONFIG))
     for f in _FIELDS:
         cfg.sources[f] = "default"
     profiles: dict = {}

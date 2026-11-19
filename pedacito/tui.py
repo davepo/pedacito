@@ -3379,15 +3379,31 @@ class TuiSession:
         probe = None
         if action == "reset":
             path = profiler.reset()
+            changed = ""
+            try:
+                from . import config as config_mod
+                from . import config_editor
+                config_path = Path(
+                    getattr(self.cfg, "_config_path", "")
+                    or config_mod.USER_CONFIG)
+                changed = config_editor.disable_auto_tune_opt_in(
+                    config_path,
+                    str(getattr(self.cfg, "active_profile", "") or ""))
+            except Exception:
+                changed = ""
             try:
                 self.cfg.auto_tune = False
                 self.cfg.sources["auto_tune"] = "user (TUI /profile reset)"
             except Exception:
                 pass
-            self._append(
-                f"Dropped cached profiling measurements ({path}). "
-                "auto_tune is off for this session; remove auto_tune = true "
-                "from your config to keep it off.", "system")
+            message = f"Dropped cached profiling measurements ({path}). "
+            if changed:
+                message += f"Set auto_tune = false in {changed}. "
+            else:
+                message += ("No explicit auto_tune = true was found in the "
+                            "selected config file. ")
+            message += "auto_tune is off for this session."
+            self._append(message, "system")
             return
         if action == "run":
             if not servers_mod.is_local_url(self.cfg.base_url):

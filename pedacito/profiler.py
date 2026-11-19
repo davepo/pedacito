@@ -60,13 +60,13 @@ from . import kvcache as kv_cache_mod
 from . import servers
 
 __all__ = [
-    "CACHE_NAME", "PROBE_TTL", "GIB", "MEMORYSTATUSEX", "apply_auto_tune",
-    "architecture_from_config", "build_report", "cache_path", "clear_cache",
-    "detect_context_window", "estimate_model_footprint",
-    "format_profile_report", "kv_bytes_per_token", "maybe_probe_async",
-    "probe_cache_key", "probe_model_speed", "quant_bytes_per_param",
-    "read_cached_probe", "reset", "resolve_architecture", "snapshot",
-    "store_probe", "tune_profile",
+    "CACHE_NAME", "PROBE_TTL", "GIB", "MEMORYSTATUSEX", "SNAPSHOT_TTL",
+    "apply_auto_tune", "architecture_from_config", "build_report", "cache_path",
+    "clear_cache", "clear_snapshot_cache", "detect_context_window",
+    "estimate_model_footprint", "format_profile_report", "kv_bytes_per_token",
+    "maybe_probe_async", "probe_cache_key", "probe_model_speed",
+    "quant_bytes_per_param", "read_cached_probe", "reset",
+    "resolve_architecture", "snapshot", "store_probe", "tune_profile",
 ]
 
 _LOG = logging.getLogger("pedacito.profiler")
@@ -78,6 +78,7 @@ GIB = 1024 ** 3
 READER_TIMEOUT = 2.0
 METADATA_TIMEOUT = 2.0
 PROBE_TTL = 7 * 24 * 3600.0       # a speed measurement is useful for a week
+SNAPSHOT_TTL = 2.0                # burst memo; GUI polls are 15 s apart
 CACHE_NAME = "profiler.json"
 CACHE_VERSION = 1
 HOSTED_PROBE_REFUSAL = "hosted model — refusing to probe"
@@ -338,9 +339,37 @@ def _source_summary(values: list[str]) -> str:
     return "mixed (" + "+".join(unique) + ")"
 
 
+# A short, thread-safe memo for burst callers: config.load, role derivation
+# and the GUI payload can ask for the same hardware within a second, and each
+# miss may spawn nvidia-smi. Caching an *unavailable* snapshot is safe: it is
+# still "no reader", never zero memory, and expires quickly.
+_snapshot_lock = threading.Lock()
+_snapshot_cache: dict = {}
+
+
+def clear_snapshot_cache() -> None:
+    """Drop the short TTL snapshot memo (tests and explicit refreshes)."""
+    with _snapshot_lock:
+        _snapshot_cache.clear()
+
+
+def _snapshot_cache_key(*, meminfo_path, drm_root, platform, which, run,
+                        kernel32, include_nvidia, base_reader):
+    key = (str(meminfo_path) if meminfo_path is not None else "",
+           str(drm_root) if drm_root is not None else "",
+           str(platform), bool(include_nvidia), os.name, which, run, kernel32,
+           base_reader, _read_nvidia_smi, _read_macos_memory,
+           _read_windows_memory)
+    try:
+        hash(key)
+    except TypeError:                    # an unhashable injected callable
+        return None
+    return key
+
+
 def snapshot(*, meminfo_path=None, drm_root=None, platform: str | None = None,
              which=None, run=None, kernel32=None,
-             include_nvidia: bool = True) -> dict:
+             include_nvidia: bool = True, use_cache: bool = True) -> dict:
     """A JSON-safe hardware snapshot with a source for every number.
 
     Superset of :func:`servers.get_hardware_memory`: the legacy ``ram``,
@@ -351,11 +380,22 @@ def snapshot(*, meminfo_path=None, drm_root=None, platform: str | None = None,
 
     Never raises and never requires a GPU: a missing reader contributes
     nothing and the overall ``available`` flag is False only when no reader
-    returned a total.
+    returned a total. Results are memoized for ``SNAPSHOT_TTL`` seconds;
+    ``use_cache=False`` recomputes, and :func:`clear_snapshot_cache` drops it.
     """
     platform = sys.platform if platform is None else str(platform)
     find = which or _which
     runner = run or _run_argv
+    cache_key = _snapshot_cache_key(
+        meminfo_path=meminfo_path, drm_root=drm_root, platform=platform,
+        which=find, run=runner, kernel32=kernel32,
+        include_nvidia=include_nvidia,
+        base_reader=servers.get_hardware_memory)
+    if use_cache and cache_key is not None:
+        with _snapshot_lock:
+            entry = _snapshot_cache.get(cache_key)
+            if entry is not None and time.monotonic() - entry[0] < SNAPSHOT_TTL:
+                return copy.deepcopy(entry[1])
 
     try:
         base = servers.get_hardware_memory(meminfo_path=meminfo_path,
@@ -515,6 +555,10 @@ def snapshot(*, meminfo_path=None, drm_root=None, platform: str | None = None,
         "measured_at": now,
         "freshness": {"measured_at": now, "age_s": 0.0},
     }
+    if cache_key is not None:
+        with _snapshot_lock:
+            _snapshot_cache[cache_key] = (time.monotonic(),
+                                          copy.deepcopy(snap))
     return snap
 
 
@@ -1321,9 +1365,12 @@ def maybe_probe_async(config, *, base_url: str = "", model: str = "",
     """Start the once-per-(server, model) probe on a daemon thread.
 
     Returns the thread, or None when the endpoint is hosted, a fresh cache
-    entry exists, or a probe for this pair is already running. Never blocks
-    the caller and never surfaces an exception.
+    entry exists, `profile_probe_on_load` is false, or a probe for this pair
+    is already running. Never blocks the caller and never surfaces an
+    exception.
     """
+    if not bool(getattr(config, "profile_probe_on_load", True)):
+        return None
     base = str(base_url or getattr(config, "base_url", "") or "")
     mid = str(model or getattr(config, "model", "") or "")
     if not base or not mid:

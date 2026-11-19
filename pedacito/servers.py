@@ -731,9 +731,11 @@ def load_server_model(server, model: str = "", config=None) -> dict:
     /models/load, then the profile's optional `load_cmd`.
 
     After a successful load, the optional speed probe is scheduled once per
-    (server, model) on a daemon thread. It never blocks this call."""
+    (server, model) on a daemon thread unless `profile_probe_on_load` is
+    false. It never blocks this call."""
     result = _server_action(server, "load", model, config)
-    if result.get("ok") and config is not None:
+    if (result.get("ok") and config is not None
+            and bool(getattr(config, "profile_probe_on_load", True))):
         try:
             from . import profiler
             profiler.maybe_probe_async(

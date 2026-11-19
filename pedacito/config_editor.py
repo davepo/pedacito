@@ -375,6 +375,47 @@ def set_values(text: str, changes: dict | None = None,
     return out + nl if (trailing_nl or not out) else out
 
 
+def disable_auto_tune_opt_in(path: Path | str, profile: str = "") -> str:
+    """Turn an explicit `auto_tune = true` off in `path`, preserving comments.
+
+    The selected profile is tried first; when it does not carry the key, the
+    global/`[universal]` scope is tried. Only an existing `true` is touched.
+    Returns the path that changed, or "" when there was nothing to change.
+    This is the one write path shared by `pdc profile --reset` and the TUI's
+    `/profile reset`.
+    """
+    path = Path(path)
+    try:
+        text = path.read_text(encoding="utf-8")
+        data = tomllib.loads(text)
+    except (OSError, ValueError):
+        return ""
+    profiles = data.get("profiles") if isinstance(data, dict) else {}
+    body = ((profiles or {}).get(profile)
+            if profile and isinstance(profiles, dict) else {})
+    if profile and isinstance(body, dict) and body.get("auto_tune") is True:
+        new = set_values(text, {"auto_tune": False}, profile=profile)
+    else:
+        global_value = None
+        universal = data.get("universal") if isinstance(data, dict) else {}
+        if isinstance(universal, dict):
+            global_value = universal.get("auto_tune")
+        if global_value is None and isinstance(data, dict):
+            global_value = data.get("auto_tune")
+        if global_value is not True:
+            return ""
+        new = set_values(text, {"auto_tune": False})
+    if new == text:
+        return ""
+    try:
+        tmp = path.with_name(path.name + ".tmp")
+        tmp.write_text(new, encoding="utf-8")
+        tmp.replace(path)
+    except OSError:
+        return ""
+    return str(path)
+
+
 # --- additive config upgrade ---------------------------------------------------
 #
 # A new Pedacito release can document settings an installed config.toml has

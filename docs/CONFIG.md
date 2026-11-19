@@ -483,13 +483,16 @@ pedacito profile --show --json
 ```
 
 The TUI exposes the same three actions as `/profile show`, `/profile run` and
-`/profile reset`. Plain `/profile NAME` still switches profiles.
+`/profile reset`. Plain `/profile NAME` still switches profiles. Both `--reset` and
+`/profile reset` drop the cache and turn off an explicit `auto_tune = true` in the same
+selected config file (the `--config` file when one was passed, otherwise the user config).
 
 ### What the telemetry reads
 
 Every number carries its source. A reader that is absent on this platform contributes
 nothing; it is never treated as zero free memory. Each reader is time-boxed to two seconds
-and every failure is silent (log-level only).
+and every failure is silent (log-level only). The snapshot is memoized for two seconds, so
+a burst of callers (config load, role derivation, GUI payload) shares one reader pass.
 
 | Platform | System RAM | GPU VRAM | Source tag |
 |---|---|---|---|
@@ -532,8 +535,10 @@ guess as measured; `estimated_fields` lists exactly what was inferred.
 
 ### `auto_tune` rules
 
-`auto_tune` is **false by default**. Existing users see no change — no hardware reader,
-subprocess, network call or budget adjustment runs until they opt in.
+`auto_tune` is **false by default**. Existing users see no change — no hardware reader
+or budget adjustment runs until they opt in. The automatic post-load speed probe is a
+separate behavior, controlled by `profile_probe_on_load` (default true); set it false to
+keep even that from starting after a load.
 
 When enabled for a local profile:
 
@@ -584,7 +589,9 @@ The applied per-field origins use the same `sources` provenance convention as th
 `pedacito profile --run` (and, once per server+model, a successful explicit model load)
 sends one tiny completion (`max_tokens = 16`, "Reply with just: OK") plus one prefill
 measurement: about 2,000 filler tokens when the model's window allows, otherwise 512.
-Prefill and generation tok/s come from the server's SSE timings. The probe is best-effort
+Set `profile_probe_on_load = false` to keep the automatic post-load probe from starting
+at all; explicit probes still work. Prefill and generation tok/s come from the server's
+SSE timings. The probe is best-effort
 and silent on failure; a cached result lives in `profiler.json` beside the user config for
 one week and is keyed by server+model, so changing either one invalidates it. Probes never
 run for hosted endpoints: both explicit paths (`pdc profile --run` and `/profile run`)
@@ -604,6 +611,7 @@ config --reference` prints the annotated template. Key settings:
 | `vram_gb` | *(required for local)* | GPU VRAM; set in `[universal]`, overridable per profile. |
 | `context_tokens` | `8192` | Server-side context window. With `auto_detect_context` on (the default) the server's reported window replaces it; set it explicitly when detection is wrong. |
 | `auto_tune` | false | Opt in to hardware/probe-driven tuning of context, retrieval budgets and timeout. Off by default: nothing changes until it is true. See [Advanced system profiling and auto-tune](#advanced-system-profiling-and-auto-tune). |
+| `profile_probe_on_load` | true | Schedule the background speed probe once per server+model after a successful explicit load. `false` = no probe thread starts after a load; `pdc profile --run` still works. |
 | `model_params_b` / `model_active_params_b` | 0 / 0 | Explicit parameter counts (billions) for the footprint estimate; active is the MoE experts used per token. 0 = discover, then fall back to name heuristics with lower confidence. |
 | `model_layers` / `model_kv_heads` / `model_head_dim` | 0 / 0 / 0 | Explicit KV-cache geometry. Missing fields lower the estimate's `confidence` instead of being reported as measured. |
 | `model_quant` / `model_arch` | `""` / `""` | Explicit weight quantization (`q4`, `Q4_K_M`, `q8`, `f16`, ...) and `dense`/`moe`. Empty = infer from server metadata, then the model id. |

@@ -115,6 +115,32 @@ def test_snapshot_linux_drm_sysfs_keeps_get_hardware_memory_shape(tmp_path):
     assert snap["vram"]["cards"][0]["source"] == "drm-sysfs"
 
 
+def test_snapshot_ttl_memo_skips_second_reader_pass(tmp_path):
+    profiler.clear_snapshot_cache()
+    calls = []
+
+    def which(name):
+        return "/usr/bin/nvidia-smi" if name == "nvidia-smi" else None
+
+    def run(argv, timeout=2.0):
+        calls.append(list(argv))
+        return "0, 8192, 1024\n"
+
+    kwargs = dict(meminfo_path=tmp_path / "missing",
+                  drm_root=tmp_path / "drm", platform="linux",
+                  which=which, run=run)
+    first = profiler.snapshot(**kwargs)
+    second = profiler.snapshot(**kwargs)
+    assert len(calls) == 1
+    assert first["vram"]["total_gb"] == second["vram"]["total_gb"] == 8.0
+    # An explicit bypass and a cache clear each force a fresh reader pass.
+    profiler.snapshot(**kwargs, use_cache=False)
+    assert len(calls) == 2
+    profiler.clear_snapshot_cache()
+    profiler.snapshot(**kwargs)
+    assert len(calls) == 3
+
+
 # --- footprint math -----------------------------------------------------------
 
 def test_footprint_dense_14b_q4_golden():
@@ -678,6 +704,37 @@ def test_failed_server_load_does_not_schedule_a_probe(monkeypatch):
                         lambda cfg, **kw: calls.append(kw))
     servers.load_server_model("x", "loaded-model", Config())
     assert calls == []
+
+
+def test_profile_probe_on_load_false_skips_the_post_load_probe(monkeypatch):
+    from pedacito import servers
+    calls = []
+    monkeypatch.setattr(servers, "_server_action", lambda *a, **k: {
+        "ok": True, "base_url": "http://127.0.0.1:1234/v1",
+        "model": "loaded-model"})
+    monkeypatch.setattr(profiler, "maybe_probe_async",
+                        lambda cfg, **kw: calls.append(kw))
+    cfg = Config()
+    cfg.profile_probe_on_load = False
+    servers.load_server_model("x", "loaded-model", cfg)
+    assert calls == []
+
+
+def test_maybe_probe_async_respects_profile_probe_on_load(monkeypatch):
+    cfg = Config()
+    cfg.base_url = "http://127.0.0.1:1234/v1"
+    cfg.model = "loaded-model"
+    cfg.profile_probe_on_load = False
+    called = []
+
+    def boom(*_a, **_k):
+        called.append(1)
+        raise AssertionError("probe started with profile_probe_on_load=false")
+
+    monkeypatch.setattr(profiler, "probe_model_speed", boom)
+    monkeypatch.setattr(profiler, "read_cached_probe", boom)
+    assert profiler.maybe_probe_async(cfg) is None
+    assert called == []
 
 
 # --- wiring -------------------------------------------------------------------

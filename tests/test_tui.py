@@ -17,6 +17,8 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from pedacito import cli, events, security, workspace
+from pedacito import config as config_mod
+from pedacito import profiler
 from pedacito import tui as tui_mod
 from pedacito.config import Config
 from pedacito.tui import TuiSession, parse_escape_sequence, run_tui
@@ -609,6 +611,40 @@ def test_tui_profile_run_probes_local_endpoint(tmp_path, monkeypatch):
         assert calls == [("http://127.0.0.1:1234/v1", "local-model", True)]
         assert any("Hardware snapshot" in text
                    for _, text in session.transcript)
+    finally:
+        session.close()
+
+
+def test_tui_profile_reset_writes_auto_tune_false(tmp_path, monkeypatch):
+    """R3.7: /profile reset must write the same file change as the CLI."""
+    cfg_path = tmp_path / "config.toml"
+    cfg_path.write_text(
+        'default_profile = "x"\n'
+        "[profiles.x]\n"
+        'base_url = "http://127.0.0.1:1234/v1"\n'
+        'model = "local-model"\n'
+        "vram_gb = 24\n"
+        "auto_tune = true\n", encoding="utf-8")
+    monkeypatch.setattr(profiler, "apply_auto_tune",
+                        lambda *a, **k: {"ok": True, "applied": False})
+    monkeypatch.setattr(profiler, "reset",
+                        lambda: tmp_path / "profiler.json")
+    cfg = config_mod.load(root=tmp_path, explicit=cfg_path, profile="x",
+                          require_hardware=False, warn_budgets=False)
+    assert cfg.auto_tune is True
+    assert cfg._config_path == str(cfg_path)
+    session = TuiSession(tmp_path, cfg, client=FakeClient(), headless=True,
+                         stdout=io.StringIO())
+    try:
+        session.handle_line("/profile reset")
+        text = "\n".join(line for _kind, line in session.transcript)
+        assert f"Set auto_tune = false in {cfg_path}" in text
+        assert "auto_tune is off for this session." in text
+        assert cfg.auto_tune is False
+        assert "auto_tune = false" in cfg_path.read_text(encoding="utf-8")
+        again = config_mod.load(root=tmp_path, explicit=cfg_path, profile="x",
+                                require_hardware=False, warn_budgets=False)
+        assert again.auto_tune is False
     finally:
         session.close()
 
