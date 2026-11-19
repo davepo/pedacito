@@ -75,6 +75,7 @@ METADATA_TIMEOUT = 2.0
 PROBE_TTL = 7 * 24 * 3600.0       # a speed measurement is useful for a week
 CACHE_NAME = "profiler.json"
 CACHE_VERSION = 1
+HOSTED_PROBE_REFUSAL = "hosted model — refusing to probe"
 
 # Bytes per parameter for the quantizations the footprint estimate accepts.
 QUANT_BYTES = {
@@ -1144,11 +1145,17 @@ def probe_model_speed(base_url: str, model: str, config,
     """One tiny completion plus one prefill measurement.
 
     Runs only when the caller asked (``pdc profile --run`` / the TUI) or from
-    :func:`maybe_probe_async` after a successful load. Every exception is
-    swallowed: a dead server yields ``{"ok": False, ...}`` and nothing is
-    cached. On success the result is stored in the user profile store with a
-    timestamp and returned.
+    :func:`maybe_probe_async` after a successful load. A hosted endpoint is
+    refused before any client is built, whether the caller forced the probe
+    or not. Every exception is swallowed: a dead server yields
+    ``{"ok": False, ...}`` and nothing is cached. On success the result is
+    stored in the user profile store with a timestamp and returned.
     """
+    base = str(base_url or getattr(config, "base_url", "") or "")
+    mid = str(model or getattr(config, "model", "") or "")
+    if base and not servers.is_local_url(base):
+        return {"ok": False, "refused": True, "base_url": base, "model": mid,
+                "detail": HOSTED_PROBE_REFUSAL, "measured_at": time.time()}
     if not force:
         cached = read_cached_probe(base_url, model)
         if cached is not None:

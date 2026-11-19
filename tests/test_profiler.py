@@ -398,6 +398,79 @@ def test_probe_http_error_is_silent_and_not_cached(monkeypatch):
         encoding="utf-8")
 
 
+def test_cli_profile_run_refuses_hosted_endpoint(monkeypatch, tmp_path,
+                                                 capsys):
+    from pedacito import cli
+    monkeypatch.chdir(tmp_path)
+    cfgfile = tmp_path / "config.toml"
+    cfgfile.write_text(
+        'default_profile = "hosted"\n'
+        '[profiles.hosted]\n'
+        'base_url = "https://api.deepseek.com/v1"\n'
+        'model = "deepseek-chat"\n', encoding="utf-8")
+    built: list[str] = []
+
+    class RecordingClient:
+        def __init__(self, cfg):
+            built.append(str(cfg.base_url))
+            raise AssertionError("hosted endpoint must not build a client")
+
+    monkeypatch.setattr(llm, "LLMClient", RecordingClient)
+    rc = cli.main(["profile", "--run", "--config", str(cfgfile)])
+    err = capsys.readouterr().err
+    assert rc == 1
+    assert built == []
+    assert "hosted model" in err
+    assert "refusing to probe" in err
+
+
+def test_cli_profile_run_probes_local_endpoint(monkeypatch, tmp_path, capsys):
+    from pedacito import cli
+    monkeypatch.chdir(tmp_path)
+    cfgfile = tmp_path / "config.toml"
+    cfgfile.write_text(
+        'default_profile = "local"\n'
+        '[profiles.local]\n'
+        'base_url = "http://127.0.0.1:1234/v1"\n'
+        'model = "local-model"\n', encoding="utf-8")
+    built: list[str] = []
+    chats: list[dict] = []
+
+    class ProbeClient:
+        def __init__(self, cfg):
+            built.append(str(cfg.base_url))
+            self.last_timings = {"prompt_per_second": 800.0,
+                                 "predicted_per_second": 40.0}
+            self.last_elapsed_s = 0.25
+            self.first_token_at = 0.10
+            self.request_started_at = 0.0
+            self.last_prompt_tokens = 2048
+            self.last_completion_tokens = 2
+            self.last_stream_tok_per_s = 0.0
+
+        def _chat_once(self, messages, **kw):
+            chats.append(kw)
+            return "OK"
+
+        def estimate_tokens(self, text):
+            return max(1, len(str(text)) // 4)
+
+    monkeypatch.setattr(llm, "LLMClient", ProbeClient)
+    monkeypatch.setattr(profiler, "detect_context_window",
+                        lambda *a, **k: 8192)
+    monkeypatch.setattr(profiler, "resolve_architecture",
+                        lambda *a, **k: {})
+    monkeypatch.setattr(profiler, "snapshot",
+                        lambda *a, **k: {"available": False, "ram": {},
+                                         "vram": {}, "sources": {}})
+    rc = cli.main(["profile", "--run", "--config", str(cfgfile)])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert built == ["http://127.0.0.1:1234/v1"]
+    assert len(chats) == 1
+    assert "speed probe (this run)" in out
+
+
 def test_probe_cache_ttl_and_model_invalidation(monkeypatch):
     now = 1_800_000_000.0
     result = {"ok": True, "base_url": "http://127.0.0.1:1234/v1",

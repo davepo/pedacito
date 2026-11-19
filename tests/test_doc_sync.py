@@ -31,8 +31,9 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from pedacito import how_index, skills
+from pedacito import how_index, llm, profiler, skills
 from pedacito.cli import build_parser
+from pedacito.config import Config
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -104,6 +105,39 @@ def test_stale_benchmark_phrase_is_gone(rel):
 def test_stale_benchmark_phrase_is_gone_from_gui_scripts():
     for path in sorted((ROOT / "pedacito" / "gui" / "static").glob("*.js")):
         assert STALE_PHRASE not in path.read_text(encoding="utf-8"), path
+
+
+def test_hosted_probe_claim_matches_the_code(monkeypatch):
+    """R2.1: "Probes never run for hosted endpoints" is a behavioral claim.
+
+    The explicit paths force the probe, so pin the documented sentence to a
+    stubbed LLMClient: a forced probe on a hosted URL must build no client at
+    all, which means no request can be sent.
+    """
+    config_doc = _norm((ROOT / "docs" / "CONFIG.md").read_text(
+        encoding="utf-8"))
+    assert "Probes never run for hosted endpoints" in config_doc
+
+    built: list[str] = []
+
+    class RecordingClient:
+        def __init__(self, cfg):
+            built.append(str(cfg.base_url))
+            raise AssertionError("hosted endpoint must not build a client")
+
+    monkeypatch.setattr(llm, "LLMClient", RecordingClient)
+    out = profiler.probe_model_speed(
+        "https://api.deepseek.com/v1", "hosted-model", Config(),
+        force=True, context_window=8192)
+    assert built == []
+    assert out["ok"] is False
+    assert out.get("refused") is True
+    assert "hosted" in str(out.get("detail") or "").lower()
+    # The automatic post-load path makes the same promise.
+    assert profiler.maybe_probe_async(
+        Config(), base_url="https://api.deepseek.com/v1",
+        model="hosted-model") is None
+    assert built == []
 
 
 def test_bundled_skills_are_valid_and_loadable(tmp_path):

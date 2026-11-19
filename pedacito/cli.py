@@ -1240,6 +1240,12 @@ def _cmd_profile(args) -> int:
         return 2
     probe = None
     if action == "run":
+        from . import servers
+        if not servers.is_local_url(cfg.base_url):
+            print(f"{profiler.HOSTED_PROBE_REFUSAL}: {cfg.model} on "
+                  f"{cfg.base_url} (speed probes are local-only).",
+                  file=sys.stderr)
+            return 1
         print(f"Probing {cfg.model} on {cfg.base_url} "
               "(one prefill, one tiny completion)...", file=sys.stderr)
         probe = profiler.probe_model_speed(cfg.base_url, cfg.model, cfg,

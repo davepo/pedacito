@@ -564,7 +564,9 @@ measurement: about 2,000 filler tokens when the model's window allows, otherwise
 Prefill and generation tok/s come from the server's SSE timings. The probe is best-effort
 and silent on failure; a cached result lives in `profiler.json` beside the user config for
 one week and is keyed by server+model, so changing either one invalidates it. Probes never
-run for hosted endpoints.
+run for hosted endpoints: both explicit paths (`pdc profile --run` and `/profile run`)
+refuse with a "hosted model — refusing to probe" message before sending a request, and
+the automatic post-load probe is skipped for a hosted URL.
 
 ## Configuration reference
 

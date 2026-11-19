@@ -3390,6 +3390,12 @@ class TuiSession:
                 "from your config to keep it off.", "system")
             return
         if action == "run":
+            if not servers_mod.is_local_url(self.cfg.base_url):
+                self._append(
+                    f"{profiler.HOSTED_PROBE_REFUSAL}: {self.cfg.model} on "
+                    f"{self.cfg.base_url} (speed probes are local-only).",
+                    "system")
+                return
             self._append(
                 f"Probing {self.cfg.model} on {self.cfg.base_url} "
                 "(one prefill, one tiny completion)...", "system")

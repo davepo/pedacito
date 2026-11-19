@@ -567,6 +567,52 @@ def test_mouse_toggle_and_sidebar_wheel_scrolling(tmp_path):
         session.close()
 
 
+def test_tui_profile_run_refuses_hosted_endpoint(tmp_path, monkeypatch):
+    from pedacito import profiler
+    cfg = _cfg(base_url="https://api.deepseek.com/v1",
+               model="deepseek-chat")
+    calls = []
+    monkeypatch.setattr(profiler, "probe_model_speed",
+                        lambda *a, **k: calls.append((a, k)))
+    session = TuiSession(tmp_path, cfg, headless=True, stdout=io.StringIO())
+    try:
+        session.handle_line("/profile run")
+        assert calls == []
+        system = [text for kind, text in session.transcript
+                  if kind == "system"]
+        assert any("hosted model" in text and "refusing to probe" in text
+                   for text in system)
+        assert not any(kind == "error" for kind, _ in session.transcript)
+    finally:
+        session.close()
+
+
+def test_tui_profile_run_probes_local_endpoint(tmp_path, monkeypatch):
+    from pedacito import profiler
+    cfg = _cfg(base_url="http://127.0.0.1:1234/v1", model="local-model")
+    calls = []
+
+    def fake_probe(base_url, model, config, **kw):
+        calls.append((base_url, model, kw.get("force")))
+        return {"ok": True, "base_url": base_url, "model": model,
+                "prefill_tok_per_s": 800.0, "generation_tok_per_s": 40.0,
+                "cached": False, "measured_at": 0.0}
+
+    monkeypatch.setattr(profiler, "probe_model_speed", fake_probe)
+    monkeypatch.setattr(
+        profiler, "build_report",
+        lambda cfg, **kw: {"ok": True, "model": cfg.model, "snapshot": {},
+                           "current": {}, "tuning": {}, "auto_tune": False})
+    session = TuiSession(tmp_path, cfg, headless=True, stdout=io.StringIO())
+    try:
+        session.handle_line("/profile run")
+        assert calls == [("http://127.0.0.1:1234/v1", "local-model", True)]
+        assert any("Hardware snapshot" in text
+                   for _, text in session.transcript)
+    finally:
+        session.close()
+
+
 def test_synchronized_redraw_keeps_partial_prompt_and_cursor(tmp_path):
     class TtyInput(io.StringIO):
         def isatty(self):
