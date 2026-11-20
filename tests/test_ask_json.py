@@ -171,6 +171,25 @@ def test_ask_json_emits_exactly_one_complete_object(project, cfg_file,
     assert "LIMIT = 25" in (project / "app.py").read_text(encoding="utf-8")
 
 
+def test_ask_json_refine_calls_count_toward_the_run(project, cfg_file,
+                                                    monkeypatch, capsys):
+    """--refine runs one spec-architect model call BEFORE the task. A single
+    run-scoped collector must cover refine + task, so the JSON turns/tokens
+    equal every call the client actually made. A second begin_run() reset
+    after refine silently dropped the architect call from the totals."""
+    clients: list = []
+    code = _run(project, cfg_file, monkeypatch, "--apply", "--json",
+                "--refine", "--no-plan", client_holder=clients)
+    captured = capsys.readouterr()
+    assert code == 0
+    assert "prompt refined by the spec architect" in captured.err
+    obj = _one_object(captured.out)
+    assert clients[0].calls >= 2                 # refine + at least one task call
+    assert obj["turns"] == clients[0].calls
+    assert obj["tokens"]["prompt"] == 100 * clients[0].calls
+    assert obj["tokens"]["completion"] == 20 * clients[0].calls
+
+
 def test_ask_json_implies_no_review(project, cfg_file, monkeypatch, capsys):
     seen = {}
     real = cli.loop.run_task

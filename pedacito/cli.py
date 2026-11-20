@@ -4350,10 +4350,6 @@ def _main(argv=None) -> int:
                             snapshot.cleanup()
                 return code
 
-            if json_mode:
-                # One run-scoped collector: turns/elapsed/tokens below are
-                # this task's model calls and nothing before or after it.
-                events_mod.begin_run()
             try:
                 outcome = run(ask_task)
             except KeyboardInterrupt:
