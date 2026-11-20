@@ -2786,6 +2786,12 @@ class LLMClient:
         chunks_since_emit = 0
         events_emitted = 0
         sse_data_seen = 0
+        # Raw lines before the first SSE data frame: a server that ignores
+        # `stream: true` answers with a plain JSON body, and a real
+        # requests.Response cannot .json() once iter_lines consumed it.
+        # Keep that prefix (bounded) so the fallback can still parse it.
+        prelude: list[str] = []
+        prelude_chars = 0
         stream_started = time.monotonic()
         first_token_at: float | None = None
         last_emit = stream_started
@@ -2851,6 +2857,10 @@ class LLMClient:
                 # the bytes branch is belt-and-braces for a custom session.
                 if isinstance(raw, bytes):
                     raw = raw.decode("utf-8", "replace")
+                if sse_data_seen == 0 and not raw.startswith(":") \
+                        and prelude_chars < 2_000_000:
+                    prelude.append(raw)
+                    prelude_chars += len(raw)
                 if raw.startswith(":"):
                     continue                    # SSE comment / keep-alive
                 if raw.startswith("data:"):
@@ -3028,6 +3038,13 @@ class LLMClient:
                 data = r.json()
             except Exception:
                 data = None
+            if data is None and prelude:
+                # iter_lines consumed the body: parse the buffered raw lines
+                # instead (requests.Response.json() raises after consumption).
+                try:
+                    data = json.loads("\n".join(prelude))
+                except Exception:
+                    data = None
             if isinstance(data, dict) and data.get("choices") is not None:
                 return self._consume_buffered_data(
                     data, native=native, prompt_est=prompt_est, t0=t0)

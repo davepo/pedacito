@@ -187,6 +187,41 @@ def test_non_streaming_json_responses_stay_transparent(monkeypatch):
                         stream=True) == "plain answer"
 
 
+class ConsumedResp(Resp):
+    """Faithful requests.Response behaviour: once iter_lines has consumed
+    the body, .json() raises. The plain Resp double (working .json()) masks
+    the real fallback path."""
+
+    def iter_lines(self, decode_unicode=False):
+        self.consumed += 1
+        yield from self._lines
+
+    def json(self):
+        if self.consumed:
+            raise RuntimeError(
+                "The content for this response was already consumed")
+        return self._body
+
+
+def test_stream_json_fallback_parses_the_buffered_body(monkeypatch):
+    """A server that ignores `stream: true` and labels its JSON body with a
+    non-JSON content-type must still be understood: the streaming reader
+    buffers the raw lines and parses them when r.json() fails."""
+    body = json.dumps({
+        "choices": [{"message": {"content": "plain answer"},
+                     "finish_reason": "stop"}],
+        "usage": {"prompt_tokens": 4, "completion_tokens": 2},
+    }, indent=1)                              # several raw lines, one object
+    response = ConsumedResp(lines=body.splitlines(), ctype="text/plain")
+    _patch_post(monkeypatch, response)
+    client = LLMClient(_cfg())
+    client.echo_stream = False
+    assert client.chat([{"role": "user", "content": "hi"}], 20,
+                       stream=True) == "plain answer"
+    assert client.last_completion_tokens == 2
+    assert response.closed
+
+
 def test_gui_status_exposes_live_fields_and_stop_sets_cancel_event(monkeypatch,
                                                                  tmp_path):
     state = core.State()
