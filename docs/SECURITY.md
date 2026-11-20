@@ -569,7 +569,7 @@ These are real boundaries. Read them before you rely on Pedacito for untrusted c
 
 ## Reporting a vulnerability
 
-Please open a private security advisory on the GitHub repository, or email the
-maintainer, rather than a public issue. Include the Pedacito version (`pip show
-pedacito`), your platform, the steps to reproduce, and whether the sandbox was active
-(`pedacito config --doctor`).
+Please open a private security advisory on the GitHub repository, or email
+contact@pedacito.dev, rather than a public issue. Include the Pedacito version
+(`pip show pedacito`), your platform, the steps to reproduce, and whether the
+sandbox was active (`pedacito config --doctor`).

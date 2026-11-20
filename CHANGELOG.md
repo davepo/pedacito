@@ -77,6 +77,14 @@ All notable changes to Pedacito (`pdc`) are documented here.
   (README plus `docs/*.md`) for every CLI subcommand and feature needle, and
   the how-cards against the same features.
 
+### Project Website and Contact
+
+- **`https://www.pedacito.dev`** and **`contact@pedacito.dev`** now appear in
+  the GUI Settings dialog footer, the TUI `/help` output, the README and the
+  SECURITY vulnerability-reporting path, and as `[project.urls]` entries for
+  PyPI. Interface furniture and docs only; task prompts, agent output and
+  telemetry are unchanged.
+
 ### Agent Security Guide (`docs/SECURITY.md`)
 
 - A new guide for running coding agents safely, organized around four pillars:

@@ -239,7 +239,8 @@ Pedacito TUI commands
 
 Enter: send | PgUp/PgDn/Wheel: scroll | Up/Down: history | Tab: complete
 F2: mouse mode | Esc/End: live bottom | Ctrl+C: cancel | /help | /quit
-Plain text is a task: it runs through the normal gather/edit/verify loop."""
+Plain text is a task: it runs through the normal gather/edit/verify loop.
+Web: https://www.pedacito.dev · Contact: contact@pedacito.dev"""
 
 
 def _windows_key_sequence(code: str) -> str:

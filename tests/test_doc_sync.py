@@ -431,3 +431,39 @@ def test_lemonade_pinning_and_effort_spelling_are_documented():
         assert "internal/pin" in text
         assert "/servers pin" in text
         assert "shipped spelling of the plan's `off`" in text
+
+
+# --- project website and contact ---------------------------------------------
+# The website and contact address are interface furniture and docs, never
+# prompt or telemetry content. Pin the places that name them so a doc or GUI
+# edit cannot silently drop the only private reporting address.
+
+def test_security_reporting_names_the_contact_address():
+    text = (ROOT / "docs" / "SECURITY.md").read_text(encoding="utf-8")
+    section = text.split("## Reporting a vulnerability", 1)[1]
+    section = section.split("\n## ", 1)[0]
+    assert "contact@pedacito.dev" in section
+    # The private-report path stays explicit: email or advisory, not a public
+    # issue.
+    assert "private security advisory" in section
+    assert "public issue" in section
+
+
+def test_readme_names_the_project_website_and_contact():
+    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+    assert "https://www.pedacito.dev" in readme
+    assert "contact@pedacito.dev" in readme
+
+
+def test_settings_dialog_links_to_the_project_website_and_contact():
+    js = (GUI_STATIC / "settings.js").read_text(encoding="utf-8")
+    assert "https://www.pedacito.dev" in js
+    assert "mailto:contact@pedacito.dev" in js
+    assert "rel: 'noopener'" in js
+    assert "target: '_blank'" in js
+
+
+def test_tui_help_names_the_project_website_and_contact():
+    from pedacito import tui
+    assert ("Web: https://www.pedacito.dev \u00b7 "
+            "Contact: contact@pedacito.dev") in tui.HELP_TEXT

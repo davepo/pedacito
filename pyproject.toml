@@ -32,8 +32,10 @@ dependencies = [
 
 [project.urls]
 Homepage = "https://github.com/davepo/pedacito"
+Website = "https://www.pedacito.dev"
 Repository = "https://github.com/davepo/pedacito"
 Issues = "https://github.com/davepo/pedacito/issues"
+Contact = "mailto:contact@pedacito.dev"
 
 [project.scripts]
 pedacito = "pedacito.cli:main"

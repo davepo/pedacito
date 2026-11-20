@@ -63,7 +63,8 @@ Run `pdc --help` for every command, or `pdc how "your question"` for built-in he
 
 Issues and pull requests are welcome: bug reports with a repro, support for other model servers or
 languages, and fixes for anything that breaks outside the setup this was built on. Please open an
-issue before a large PR.
+issue before a large PR. The project website is [pedacito.dev](https://www.pedacito.dev), and the
+maintainer can be reached at contact@pedacito.dev.
 
 Pedacito was built and tested by one person on one home GPU box, so edge cases on other hardware
 may be rough. Report security issues privately, as described in

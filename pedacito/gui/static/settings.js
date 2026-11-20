@@ -260,6 +260,15 @@
     else if (X.tab === 'mcp') body.appendChild(mcpTab());
     else if (X.tab === 'updates') body.appendChild(updatesTab());
     else body.appendChild(rawTab());
+    // Project links live below every tab and stay interface furniture: they
+    // are never part of a task prompt or sent to a model.
+    body.appendChild(h('div', { class: 'muted small-text', style: 'margin-top:14px' },
+      h('span', { text: 'Web: ' }),
+      h('a', { href: 'https://www.pedacito.dev', target: '_blank', rel: 'noopener',
+        style: 'color:inherit', text: 'pedacito.dev' }),
+      h('span', { text: ' \u00b7 Contact: ' }),
+      h('a', { href: 'mailto:contact@pedacito.dev', style: 'color:inherit',
+        text: 'contact@pedacito.dev' })));
   }
   function radio(which, label, disabled) {
     return h('label', { class: 'chk' }, h('input', { type: 'radio', name: 'which', checked: X.which === which, disabled: !!disabled,
