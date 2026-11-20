@@ -29,6 +29,36 @@ All notable changes to Pedacito (`pdc`) are documented here.
   `safety.redact` linear on very long unbroken lines (a multi-hundred-kilobyte
   diff no longer stalls on the assignment regex).
 
+### Trajectory Export (`pdc ask --save-trajectory`)
+
+- **`pedacito/trajectories.py`** — opt-in full-prompt ChatML/OpenAI
+  transcripts for SFT/GRPO dataset filtering, written one JSON file per task
+  run to `.pedacito/trajectories/<UTC timestamp>_<short id>.json` as
+  `{"metadata": {...}, "messages": [...]}`. The messages are the real turns
+  sent and received (system, user, assistant, model tool calls and tool
+  results), not a reconstruction. Metadata carries `verify_passed` (bool or
+  null), `harness_version` (`pedacito.__version__`), `edit_format`,
+  `model_id`, `provider`, a SHA-256 `task_hash` (never the task text),
+  `started_at`, `elapsed_s` and token totals from the run telemetry.
+- **`record_trajectories = false`** config knob, plus
+  **`pdc ask --save-trajectory`** as a one-run override in memory (live
+  `sources` entry `--save-trajectory`; the config key and file are untouched).
+  Capture hooks `loop.run_task`, so the knob covers `ask`, `chat`, `auto`,
+  `rpc` and `eval`; every capture path is exception-safe and a write failure
+  leaves the task unaffected.
+- **Mandatory scrubbing** — every string value passes `safety.redact`; the
+  serialised transcript is then scanned with
+  `security.scan_text_for_secrets`, and a residual finding is masked or the
+  write is refused with a warning. A detected secret is never persisted.
+  Local files only: no network and no telemetry, under the already-gitignored
+  `.pedacito/`.
+- Docs: SECURITY's "Trajectory export" section (opt-in, full prompts unlike
+  replay's hash + preview, same redaction pipeline, local-only, user-owned
+  files), USAGE's metadata filtering example, and a CONFIG reference row.
+  Tests cover the default-off no-write path, the flag and config-knob
+  captures, metadata/ChatML shape, a planted API key in a tool result, and a
+  capture failure that does not fail the task.
+
 ### Post-Edit Verification Controls
 
 - **TUI `/verify on|off|status`** — `on` detects the project's test runner

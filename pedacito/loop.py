@@ -40,6 +40,7 @@ from . import review as review_mod
 from . import security as security_mod
 from . import testsel
 from . import todo as todo_mod
+from . import trajectories
 from .edits import Result, parse_edits
 from .llm import CancelledError, LLMError
 
@@ -4192,6 +4193,24 @@ def run_task(root: Path, cfg, client, agent, idx, task: str, *,
         # agent (its _auto_step marker is set), so there is no double switch.
         client, agent = _specialist_route(root, cfg, client, agent, idx,
                                           task, is_repair)
+    # Opt-in trajectory export: wrap the client the task will actually use
+    # (and the agent that owns it) so every gather/answer/repair call is the
+    # real transcript. Capture is diagnostics: any failure here is ignored.
+    capture = None
+    try:
+        capture = trajectories.begin(root, cfg, task, client)
+        if capture is not None:
+            client, agent = capture.install(client, agent)
+    except Exception:
+        capture = None
+
+    def _finish_capture(result):
+        """Write the trajectory; every failure is the capture's, not the
+        task's. Kept here so a broken hook can never skip the task's return."""
+        try:
+            trajectories.finish(capture, root, cfg, result)
+        except Exception:
+            pass
     # Split-stage hybrid: the architect plans before the editor runs. Repair
     # rounds and scaffold/answer_system tasks keep their single-model path.
     hybrid = None
@@ -4222,6 +4241,11 @@ def run_task(root: Path, cfg, client, agent, idx, task: str, *,
         tr = _run_ladder(root, cfg, client, agent, idx, task, apply=apply,
                          review=review, answer_system=answer_system,
                          is_repair=is_repair)
+    except BaseException:
+        # A cancelled or failed run still leaves the exchanged messages that
+        # did happen; write them before propagating the original exception.
+        _finish_capture(None)
+        raise
     finally:
         if hybrid is not None:
             cfg.answer_mode = saved_mode
@@ -4235,6 +4259,7 @@ def run_task(root: Path, cfg, client, agent, idx, task: str, *,
     if writes:
         _checkpoint_task(root, cfg, task, "post")
     if answer_system is not None or review or not getattr(cfg, "use_memory", True):
+        _finish_capture(tr)
         return tr
     try:
         if any(r.ok for r in tr.results) or tr.changed or _is_noop(tr.reply):
@@ -4268,6 +4293,7 @@ def run_task(root: Path, cfg, client, agent, idx, task: str, *,
         pass
     if writes:
         _checkpoint_task(root, cfg, task, "post")
+    _finish_capture(tr)
     return tr
 
 

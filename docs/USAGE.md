@@ -405,6 +405,52 @@ memory only**: the live config gets the command plus a `sources` entry of
 `--verify-cmd`, and no config file is written or rewritten. It runs once after
 an applied task; a skipped dry run therefore leaves `verify_passed` null.
 
+### Saving trajectories for SFT/GRPO
+
+`--save-trajectory` writes one full-prompt JSON transcript per task run to
+`.pedacito/trajectories/`, for dataset filtering and fine-tuning. It is the
+opt-in counterpart to `replay` (which stores only a hash and a short redacted
+preview), so it contains the real prompts; every string is redacted and the
+file is re-scanned for secrets before it is written. The same capture is
+available everywhere through `record_trajectories = true`; the flag turns it
+on for this `ask` run only without touching the config file.
+
+```bash
+pdc ask . -t "fix the retry loop" --apply --save-trajectory
+```
+
+Each file is `{"metadata": {...}, "messages": [...]}`, where `messages` is the
+ChatML/OpenAI-shaped transcript actually exchanged (system/user/assistant
+turns, tool calls and tool results). Keep only the runs whose verification
+passed before building a dataset:
+
+```python
+import json
+from pathlib import Path
+
+kept = []
+for path in Path(".pedacito/trajectories").glob("*.json"):
+    record = json.loads(path.read_text(encoding="utf-8"))
+    meta = record["metadata"]
+    if meta["verify_passed"] is True:          # null = no check ran
+        kept.append({"messages": record["messages"], **{
+            key: meta[key] for key in (
+                "task_hash", "model_id", "provider", "edit_format",
+                "harness_version", "started_at", "elapsed_s", "tokens")
+        }})
+Path("dataset.jsonl").write_text(
+    "\n".join(json.dumps(row, ensure_ascii=False) for row in kept),
+    encoding="utf-8")
+```
+
+`verify_passed` is the task's own post-edit impacted-test verdict
+(`true`/`false`/`null`); `null` means no in-task check ran, so `is True`
+deliberately excludes unverified runs. A `--verify-cmd` runs once after the
+task, so its result is reported by `--json`; the trajectory records the
+in-loop verification that existed when the task finished. The full metadata
+contract and the privacy trade are in
+[SECURITY.md — Trajectory export](SECURITY.md#trajectory-export).
+
 ## Pinning context with `@`
 
 Mention a file or a symbol with `@` in your prompt, and Pedacito pins its exact source into the

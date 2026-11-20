@@ -521,6 +521,63 @@ live git worktrees under `.pedacito/worktrees/` make the reset refuse unless you
 
 ---
 
+## Trajectory export
+
+Trajectory export is an **opt-in** dataset feature, off by default
+(`record_trajectories = false`). It is the one place Pedacito writes a
+**full-prompt** record: `pedacito/trajectories.py` captures the messages the
+harness actually sent and received during a run — system, user and assistant
+turns, model tool calls and tool results — and writes one JSON file per task
+under `.pedacito/trajectories/`:
+
+```text
+.pedacito/trajectories/20261120T101500Z_4f2a9c1d.json
+```
+
+That is deliberately a different privacy trade from `replay.py`, which stores
+prompts as a **hash plus a short redacted preview and never the full text**
+(see `--record` / `--replay` in `pdc ask --help`). A trajectory is intended for
+SFT/GRPO dataset filtering, so it needs the real transcript. Treat a
+trajectory file like the source code it quotes.
+
+Enable it for one run or for a project:
+
+```bash
+pedacito ask . -t "fix the retry loop" --apply --save-trajectory
+```
+
+```toml
+# user config, .pedacito.toml (after `pedacito trust`), or a profile
+record_trajectories = true
+```
+
+What protects the file:
+
+- **Same redaction pipeline as logs and sessions.** Every string value passes
+  `safety.redact` before serialisation, regardless of `redact_secrets`; the
+  serialised transcript is then scanned with
+  `security.scan_text_for_secrets`. A residual finding is masked in place; if
+  a finding survives or masking would break the JSON, the write is refused
+  with a warning and no file is created. A detected secret is never persisted.
+- **Local files only.** There is no network call and no telemetry; the files
+  live under the project's `.pedacito/`, which `workspace.py` adds to
+  `.gitignore` on first run.
+- **Metadata is not a second copy of the task.** It stores a SHA-256
+  `task_hash`, never the task text, alongside `verify_passed`,
+  `harness_version`, `edit_format`, `model_id`, `provider`, `started_at`,
+  `elapsed_s` and token totals.
+- **Capture cannot break a run.** The hook in `loop.run_task` is
+  exception-safe: a full disk, permissions error or malformed message leaves
+  the task unaffected (the warning goes to stderr).
+
+You own the files. They are plain JSON; delete `.pedacito/trajectories/`
+whenever you want, and do not copy a dataset into a repository or a shared
+service without reviewing it first. Secret detection is pattern-based, so a
+credential with no known shape can still survive redaction — the same
+[known limit](#known-limits-and-gaps) applies here.
+
+---
+
 ## Summary checklist
 
 - [ ] Hosted profiles use `security_outbound_mode = "warn"` or `"redact"`.
@@ -532,6 +589,7 @@ live git worktrees under `.pedacito/worktrees/` make the reset refuse unless you
 - [ ] You ran `pedacito trust` only on projects whose `.pedacito.toml` you read.
 - [ ] Before a large autonomous run, you know how to run `pedacito checkpoints` and `pedacito undo`.
 - [ ] Checkpoints you care about are also in git or another store the agent cannot write.
+- [ ] `record_trajectories` is on only where you are prepared to keep the full prompts locally.
 - [ ] You never run Pedacito as root.
 
 ## Known limits and gaps

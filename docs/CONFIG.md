@@ -674,6 +674,15 @@ applied task. `pedacito ask --json` reports that outcome as `verify_passed`
 [USAGE.md — Headless and automation](USAGE.md#headless-and-automation) for the
 exact JSON shape.
 
+Trajectory export is a separate, opt-in dataset setting:
+`record_trajectories = false` by default. When true, every `loop.run_task`
+call writes one redacted ChatML transcript under
+`.pedacito/trajectories/` (see
+[SECURITY.md — Trajectory export](SECURITY.md#trajectory-export)).
+`pedacito ask --save-trajectory` forces it for that run only, with a live
+`sources` entry of `--save-trajectory`; like `--verify-cmd`, it never writes
+the config file.
+
 `auto_verify` and `test_command` are execution settings: in a project's
 `.pedacito.toml` they are honored only after `pedacito trust` (see
 [SECURITY.md](SECURITY.md#project-config-is-not-trusted-by-default)).
@@ -725,6 +734,7 @@ config --reference` prints the annotated template. Key settings:
 | `hosted_temperature` | unset | Pin one temperature for hosted endpoints, globally or per profile (e.g. `1.0` for Claude); it wins over phase overrides and is the only sampling key sent. Unset: the provider's own default applies. Local servers ignore it. |
 | `backup` | true | Snapshot originals before writing. |
 | `log_sessions` | true | Write a session record per task. |
+| `record_trajectories` | false | Opt-in full-prompt trajectory export for SFT/GRPO dataset filtering: one JSON file per task under `.pedacito/trajectories/`, holding the real ChatML/OpenAI-shaped messages (system, user, assistant, tool calls and tool results) plus metadata (`verify_passed`, `harness_version`, `edit_format`, `model_id`, `provider`, `task_hash`, `started_at`, `elapsed_s`, token totals). Unlike `replay` it contains full prompts; every string is passed through `safety.redact` and the serialised file is re-scanned with `security.scan_text_for_secrets`, with a residual finding masked or the write refused. Local only, no network or telemetry. `pdc ask --save-trajectory` forces capture for one run in memory (live `sources` entry `--save-trajectory`) without writing the key. See [SECURITY.md — Trajectory export](SECURITY.md#trajectory-export). |
 | `review` | false | Always use the review page. |
 | `fuzzy_match` | false | Anchor near-miss search blocks approximately. |
 | `edit_style` | unset | `quote` (default brief) or `anchor` (prefer `SYMBOL` + full definition, SEARCH only for small edits); unset lets the model card decide. |

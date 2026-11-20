@@ -705,6 +705,13 @@ class Config:
     backup: bool = True
     # Write a readable record of each task to .pedacito/sessions/<timestamp>.md.
     log_sessions: bool = True
+    # Opt-in full-prompt trajectory export for SFT/GRPO datasets: one JSON
+    # file per task under .pedacito/trajectories/, holding the real ChatML
+    # messages (unlike replay's hash + preview). Every string is redacted and
+    # scanned for secrets; a residual finding is masked or the write refused.
+    # Local only, no network or telemetry. `ask --save-trajectory` forces it
+    # for one run without changing this key.
+    record_trajectories: bool = False
     # Open a side-by-side review page instead of printing a diff. Served from
     # 127.0.0.1 only, since it can write files.
     review: bool = False
@@ -3142,6 +3149,10 @@ static_gate_timeout = 3.0
 auto_heal_imports = true
 backup = true
 log_sessions = true
+# record_trajectories: opt-in full-prompt ChatML export for SFT/GRPO under
+# .pedacito/trajectories/ (redacted, local only). Off by default; `pdc ask
+# --save-trajectory` turns it on for one run.
+record_trajectories = false
 review = false
 review_port = 0
 open_browser = true
@@ -3586,6 +3597,9 @@ REFERENCE_TEMPLATE = TEMPLATE + '''
 # --- Review, workspace, and backups ----------------------------------------
 # backup snapshots originals before writes; `pedacito restore` restores them.
 # log_sessions writes .pedacito/sessions/*.md.
+# record_trajectories (off) writes full-prompt ChatML transcripts under
+# .pedacito/trajectories/ for SFT/GRPO datasets; unlike replay they contain the
+# real prompts, so they are opt-in, redacted and local only.
 # review/review_port/open_browser/review_timeout control the side-by-side page.
 # manage_gitignore/create_ignore_file control first-run workspace scaffolding.
 #

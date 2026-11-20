@@ -3180,6 +3180,12 @@ def build_parser() -> argparse.ArgumentParser:
                        help="run this verification command once after an "
                             "applied task; overrides auto_verify for this run "
                             "only (in memory, never written to a config file)")
+    p_ask.add_argument("--save-trajectory", dest="save_trajectory",
+                       action="store_true",
+                       help="save this run's full ChatML transcript to "
+                            ".pedacito/trajectories/ (redacted, local only) "
+                            "for SFT/GRPO dataset filtering; same as "
+                            "record_trajectories = true for this run only")
 
     p_explain = sub.add_parser(
         "explain", help="answer questions about an indexed project's code")
@@ -4289,6 +4295,10 @@ def _main(argv=None) -> int:
             # --verify-cmd is an in-memory `auto_verify` override for this run
             # (source: --verify-cmd); no config file is written.
             verify_cmd = _ask_verify_command(args, cfg)
+            if getattr(args, "save_trajectory", False):
+                # One-run override; the config key itself is untouched.
+                cfg._save_trajectory = True
+                cfg.sources["record_trajectories"] = "--save-trajectory"
             if verify_cmd and loop._task_named_tests(verify_cmd):
                 cfg._tests_user_consent = True
             if json_mode:
