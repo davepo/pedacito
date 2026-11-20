@@ -4074,6 +4074,12 @@ def _hybrid_stage1(root, cfg, client, agent, idx, task):
     arch = _architect_client(cfg, client)
     if arch is None:
         return None
+    # The architect is built and cached raw; wrap only this run's use so its
+    # planning exchange enters the transcript without giving a later run a
+    # proxy bound to this run's (finished) capture.
+    capture = getattr(client, "_capture", None)
+    if capture is not None:
+        arch = capture.wrap(arch)
     acfg = arch.cfg
     _hybrid_evict(cfg, str(getattr(cfg, "base_url", "") or ""),
                   str(getattr(acfg, "base_url", "") or ""))

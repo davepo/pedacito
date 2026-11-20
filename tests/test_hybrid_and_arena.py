@@ -16,6 +16,7 @@ GUI arena endpoints against the fake OpenAI-compatible server.
 from __future__ import annotations
 
 import io
+import json
 import shutil
 import sys
 from pathlib import Path
@@ -211,6 +212,35 @@ def test_hybrid_stage1_plans_then_editor_implements_the_blueprint(
     # Session state is restored: the forced rebuild and the blueprint are gone.
     assert cfg.answer_mode == "continue"
     assert cfg._hybrid_blueprint == ""
+
+
+def test_hybrid_architect_messages_enter_the_trajectory(
+        tmp_path, monkeypatch):
+    """The editor's trajectory must include the architect's planning exchange,
+    without counting its tokens twice or changing the run summary."""
+    agent, editor, cfg, made, factory = _hybrid_agent(tmp_path)
+    monkeypatch.setattr(llm_mod, "LLMClient", factory)
+    cfg.record_trajectories = True
+
+    tr = loop.run_task(tmp_path, cfg, editor, agent, agent.index,
+                       "make greet return its greeting", apply=True)
+
+    files = sorted((tmp_path / ".pedacito" / "trajectories").glob("*.json"))
+    assert len(files) == 1
+    data = json.loads(files[0].read_text(encoding="utf-8"))
+    messages = data["messages"]
+    assert any(m.get("role") == "system"
+               and m.get("content") == loop._HYBRID_SYSTEM
+               for m in messages)
+    assert any(m.get("role") == "assistant"
+               and "HYBRID_BLUEPRINT" in str(m.get("content") or "")
+               and "ROOT CAUSE" in str(m.get("content") or "")
+               for m in messages)
+    # One architect call, counted once: the transcript capture is passive.
+    assert tr.stats["hybrid"]["architect"]["calls"] == 1
+    assert data["metadata"]["tokens"]["calls"] == tr.stats["calls"]
+    assert data["metadata"]["tokens"]["completion_tokens"] == \
+        tr.stats["completion_tokens"]
 
 
 def test_hybrid_evicts_between_local_servers_at_each_handoff(

@@ -262,13 +262,19 @@ class Capture:
 
     def install(self, client, agent):
         """Wrap `client` (and the agent that owns it) and return both."""
-        proxy = _ClientProxy(client, self)
+        proxy = self.wrap(client)
         try:
             if agent is not None and getattr(agent, "client", None) is client:
                 agent.client = proxy
         except Exception:
             pass
         return proxy, agent
+
+    def wrap(self, client):
+        """Wrap another client for this capture (the hybrid architect). The
+        caller wraps at the call site, never at a cached-client site, so a
+        later run starts a fresh proxy for its own capture."""
+        return _ClientProxy(client, self)
 
     def note(self, kind: str, messages, reply) -> None:
         """Record one completed call. Snapshotting must never hurt the call:
