@@ -3090,11 +3090,18 @@ function serversDialog() {
 
   function paint(j) {
     PDC.clear(list);
-    if (!j || !j.ok) {
-      status.textContent = (j && j.detail) || 'Could not read the server registry.';
+    if (!j) {
+      status.textContent = 'Could not read the server registry.';
       return;
     }
-    if (!j.detail) status.textContent = _memText(j.memory || {});
+    if (!j.ok) {
+      status.textContent = j.detail || 'Could not read the server registry.';
+      // A refused load/unload/pin still answers 502 WITH fresh telemetry:
+      // keep the registry visible instead of blanking the dialog.
+      if (!(j.servers || []).length) return;
+    } else if (!j.detail) {
+      status.textContent = _memText(j.memory || {});
+    }
     const rows = j.servers || [];
     if (!rows.length) {
       list.appendChild(h('div', { class: 'tip',

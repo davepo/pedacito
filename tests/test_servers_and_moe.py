@@ -767,3 +767,37 @@ def test_gui_load_endpoint_returns_telemetry(gui, monkeypatch):
     assert status == 200 and j["ok"] is True
     assert calls == [("strata", "qwen3.8-flash")]
     assert j["servers"] and j["memory"]["ram"]["total_gb"] == 64.0
+
+
+def test_gui_refused_action_still_paints_the_server_registry(gui, monkeypatch):
+    """A refused load/unload/pin answers 502 but carries fresh telemetry,
+    and the dialog's paint() must keep rendering that registry instead of
+    blanking the list on every !j.ok payload."""
+    monkeypatch.setattr(profiler_mod, "snapshot",
+                        lambda *a, **k: _fake_memory())
+    monkeypatch.setattr(servers, "list_server_states",
+                        lambda *a, **k: [_gui_state()])
+
+    def refuse_pin(target, model="", pinned=True, config=None, kind=""):
+        return {"ok": False, "action": "pin", "server": target,
+                "model": model, "detail": "lemonade refused the pin"}
+
+    monkeypatch.setattr(servers, "pin_server_model", refuse_pin)
+    status, j = gui.post("/api/servers/pin",
+                         {"server": "lemonade", "model": "qwen3-8b",
+                          "pinned": True})
+    # The 502 payload still carries the fresh registry the dialog needs.
+    assert status == 502 and j["ok"] is False
+    assert j["servers"][0]["name"] == "strata"
+    assert j["memory"]["vram"]["total_gb"] == 24.0
+
+    src = (Path(__file__).resolve().parents[1] / "pedacito" / "gui" /
+           "static" / "app.js").read_text(encoding="utf-8")
+    dialog = src[src.index("function serversDialog"):]
+    paint = dialog[dialog.index("function paint(j)"):
+                   dialog.index("function refresh()")]
+    # The refusal branch shows the detail but stands down only when the
+    # payload carries no registry; the rows are painted either way.
+    assert "if (!j.ok) {" in paint
+    assert "if (!(j.servers || []).length) return;" in paint
+    assert "if (!j || !j.ok)" not in paint
