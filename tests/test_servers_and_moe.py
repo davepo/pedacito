@@ -98,6 +98,10 @@ def _cfg_with(profiles, active=""):
     cfg.base_url = body.get("base_url", "http://127.0.0.1:9999/v1")
     cfg.model = body.get("model", "model")
     cfg.vram_gb = 24
+    # These tests pin the lifecycle HTTP calls; a successful load must not
+    # schedule a background speed probe whose daemon thread could fire its
+    # own requests.post into the NEXT test's monkeypatched fake.
+    cfg.profile_probe_on_load = False
     return cfg
 
 
