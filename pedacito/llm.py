@@ -3290,10 +3290,17 @@ class LLMClient:
                         and now - last_emit >= 0.1):
                     emit()
         except requests.exceptions.RequestException as e:
-            if not self._cancel_requested(external):
-                raise LLMError(
-                    f"The connection to {self.cfg.base_url} dropped mid-reply "
-                    f"({type(e).__name__}: {str(e)[:160]}).") from e
+            if self._cancel_requested(external):
+                # cancel() closed the socket from another thread and the
+                # read surfaced as a transport error: this is a stop, not a
+                # completed reply (mirrors the in-loop cancel checks).
+                self.partial_text = strip_reasoning("".join(out))
+                raise RunCancelledError(
+                    "Stopped by user; the partial reply is kept in "
+                    "client.partial_text.") from e
+            raise LLMError(
+                f"The connection to {self.cfg.base_url} dropped mid-reply "
+                f"({type(e).__name__}: {str(e)[:160]}).") from e
         finally:
             with self._active_response_lock:
                 if self._active_response is r:

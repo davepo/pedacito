@@ -13,6 +13,7 @@ import threading
 from pathlib import Path
 
 import pytest
+import requests
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -168,6 +169,35 @@ def test_cancel_event_aborts_mid_stream_immediately(monkeypatch):
     # remaining chunks were consumed.
     assert response.consumed == 1
     assert client.partial_text == "one"
+
+
+def test_buffered_sse_transport_error_on_cancel_is_a_stop(monkeypatch):
+    """A non-streaming request answered with SSE is read by
+    _consume_stream_response. When cancel() closes the socket from another
+    thread and the read surfaces as a transport error, the stop must raise
+    RunCancelledError -- not return the partial reply as if it completed."""
+    cancel = threading.Event()
+
+    class CancelResp(Resp):
+        def iter_lines(self, decode_unicode=False):
+            self.consumed += 1
+            yield _chunk("part")
+            cancel.set()
+            raise requests.exceptions.ConnectionError("closed by cancel")
+
+    response = CancelResp()
+    _patch_post(monkeypatch, response)
+    client = LLMClient(_cfg())
+    client.echo_stream = False
+    # stream=False keeps the request buffered; the SSE content-type then
+    # routes the reply through _consume_stream_response.
+    with pytest.raises(RunCancelledError):
+        client.chat([{"role": "user", "content": "hi"}], 50, stream=False,
+                    cancel_event=cancel)
+    assert client.partial_text == "part"
+    assert response.closed
+    # A stop is not a completed reply: nothing was accounted as generated.
+    assert client.stats["completion_tokens"] == 0
 
 
 def test_non_streaming_json_responses_stay_transparent(monkeypatch):
