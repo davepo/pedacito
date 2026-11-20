@@ -621,6 +621,45 @@ def test_list_server_states_detects_resident_models(monkeypatch):
     assert state["loaded_models"] == ["qwen3.8-flash"]
 
 
+def test_list_server_states_surfaces_loading_models(monkeypatch):
+    """llama.cpp reports a model being loaded as `state: "loading"`; the
+    state row must distinguish that from an idle server and never count the
+    model as resident (which also stopped the one-model fallback)."""
+    def fake_get(url, headers=None, timeout=None):
+        if url.endswith("/v1/models"):
+            return SimpleNamespace(status_code=200, json=lambda: {"data": [
+                {"id": "gemma-3-27b", "state": "loading"},
+            ]})
+        return SimpleNamespace(status_code=404, json=lambda: {})
+
+    monkeypatch.setattr(servers.requests, "get", fake_get)
+    cfg = _cfg_with({
+        "llama": {"base_url": "http://127.0.0.1:8080/v1",
+                  "model": "gemma-3-27b", "provider": "llama-server"},
+    }, active="")
+    state = next(s for s in servers.list_server_states(cfg)
+                 if s["name"] == "llama")
+    assert state["kind"] == "llama-server"
+    assert state["online"] is True
+    assert state["loading_models"] == ["gemma-3-27b"]
+    assert state["loaded_models"] == [] and state["loaded"] is False
+
+    # The TUI report names the in-flight model instead of hiding it.
+    text = servers.format_server_states([state], mem=_fake_memory())
+    assert "loading: gemma-3-27b" in text
+
+    # The GUI's Servers dialog renders the same distinction and does not
+    # offer a model that is already loading for another load.
+    src = (Path(__file__).resolve().parents[1] / "pedacito" / "gui"
+           / "static" / "app.js").read_text(encoding="utf-8")
+    dialog = src[src.index("function serversDialog"):
+                 src.index("\n// -------------------------------------------------", 
+                           src.index("function serversDialog"))]
+    assert "s.loading_models" in dialog
+    assert "loading: ' + loading.join" in dialog
+    assert "loading.indexOf(m) < 0" in dialog
+
+
 # ---------------------------------------------------------- local-MoE profile ---
 
 @pytest.mark.parametrize("model", [

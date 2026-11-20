@@ -3110,7 +3110,9 @@ function serversDialog() {
     }
     rows.forEach((s) => {
       const loaded = s.loaded_models || [];
-      const available = (s.models || []).filter((m) => loaded.indexOf(m) < 0);
+      const loading = s.loading_models || [];
+      const available = (s.models || []).filter(
+        (m) => loaded.indexOf(m) < 0 && loading.indexOf(m) < 0);
       const sel = h('select', { title: 'model to load' });
       available.forEach((m) => sel.appendChild(h('option', { value: m, text: m })));
       const pinSel = h('select', { title: 'loaded model to pin' });
@@ -3133,7 +3135,9 @@ function serversDialog() {
           unloadBtn),
         h('div', { class: 'mono small-text', style: 'margin-top:4px', text: s.base_url || '' }),
         h('div', { class: 'small-text', style: 'margin-top:4px',
-          text: loaded.length ? 'resident: ' + loaded.join(', ') : 'no model resident' }),
+          text: loaded.length ? 'resident: ' + loaded.join(', ')
+            : (loading.length ? 'loading: ' + loading.join(', ')
+                              : 'no model resident') }),
         (canPin && loaded.length) ? h('div', { class: 'row', style: 'margin-top:6px' },
           pinSel,
           h('button', { class: 'small', text: 'Pin',

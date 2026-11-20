@@ -400,12 +400,14 @@ def _resolve_server(target, config=None) -> dict | None:
     return None
 
 
-def _models_from_payload(payload, kind: str = "") -> tuple[list[str], list[str]]:
-    """(all model ids, resident model ids) from an OpenAI/Ollama/Lemonade
-    payload. A resident marker wins; a single-model runtime with no marker is
-    treated as holding that one model."""
+def _models_from_payload(payload, kind: str = "") -> tuple[
+        list[str], list[str], list[str]]:
+    """(all model ids, resident model ids, loading model ids) from an
+    OpenAI/Ollama/Lemonade payload. A resident marker wins; a single-model
+    runtime with no marker is treated as holding that one model. A model in
+    llama.cpp's `loading` state is reported separately, never as resident."""
     if payload is None:
-        return [], []
+        return [], [], []
     entries = []
     explicit_loaded: list[str] = []
     if isinstance(payload, list):
@@ -434,6 +436,7 @@ def _models_from_payload(payload, kind: str = "") -> tuple[list[str], list[str]]
                     break
     ids: list[str] = []
     loaded: list[str] = list(dict.fromkeys(explicit_loaded))
+    loading: list[str] = []
     for mid in loaded:
         if mid not in ids:
             ids.append(mid)
@@ -451,21 +454,27 @@ def _models_from_payload(payload, kind: str = "") -> tuple[list[str], list[str]]
                 marker = bool(entry.get(key))
                 break
         state = str(entry.get("state") or entry.get("status") or "").lower()
-        if marker is None and state in ("loaded", "resident", "ready"):
+        if state in ("loading", "loading_in_memory", "loading_weights"):
+            marker = False
+            if mid not in loading:
+                loading.append(mid)
+        elif marker is None and state in ("loaded", "resident", "ready"):
             marker = True
-        if marker is None and state in ("unloaded", "idle", "not_loaded"):
+        elif marker is None and state in ("unloaded", "idle", "not_loaded",
+                                          "not-loaded"):
             marker = False
         if marker:
             if mid not in loaded:
                 loaded.append(mid)
     # A llama-server / Strata / Avalon daemon serves its one resident model
     # and exposes no loaded flag. Lemonade lists every downloaded recipe, so
-    # an absent marker there must not mean "all resident".
+    # an absent marker there must not mean "all resident". A model in the
+    # loading state is not resident yet, so it is excluded from the fallback.
     if not loaded and ids and (len(ids) == 1 or kind in
                                ("llama-server", "strata", "avalon",
                                 "local-moe")):
-        loaded = list(ids)
-    return ids, loaded
+        loaded = [m for m in ids if m not in loading]
+    return ids, loaded, loading
 
 
 def _lemonade_pinned_models(root: str, headers: dict, left) -> list[str]:
@@ -526,6 +535,7 @@ def _probe_server(server: dict, timeout: float = PROBE_TIMEOUT) -> dict:
     online = False
     ids: list[str] = []
     loaded: list[str] = []
+    loading: list[str] = []
     kind_raw = (server.get("kind") or server.get("provider")
                 or server.get("type") or "")
     kind = (_kind_for("", str(kind_raw), base) if kind_raw else "custom")
@@ -549,13 +559,16 @@ def _probe_server(server: dict, timeout: float = PROBE_TIMEOUT) -> dict:
                     str(m.get("owned_by", "")).lower() == "lemonade"
                     for m in entries if isinstance(m, dict)):
                 kind = "lemonade"
-        got_ids, got_loaded = _models_from_payload(payload, kind)
+        got_ids, got_loaded, got_loading = _models_from_payload(payload, kind)
         for mid in got_ids:
             if mid not in ids:
                 ids.append(mid)
         for mid in got_loaded:
             if mid not in loaded:
                 loaded.append(mid)
+        for mid in got_loading:
+            if mid not in loading:
+                loading.append(mid)
         if ids or loaded:
             break
     if not online:
@@ -572,12 +585,13 @@ def _probe_server(server: dict, timeout: float = PROBE_TIMEOUT) -> dict:
             if getattr(resp, "status_code", 0) == 200:
                 online = True
                 try:
-                    got_ids, got_loaded = _models_from_payload(
+                    got_ids, got_loaded, got_loading = _models_from_payload(
                         resp.json(), kind)
                 except Exception:
-                    got_ids, got_loaded = [], []
+                    got_ids, got_loaded, got_loading = [], [], []
                 ids.extend(m for m in got_ids if m not in ids)
                 loaded.extend(m for m in got_loaded if m not in loaded)
+                loading.extend(m for m in got_loading if m not in loading)
                 break
     pinned = (_lemonade_pinned_models(root, headers, left)
               if online and kind in ("lemonade", "lemond") else [])
@@ -592,6 +606,7 @@ def _probe_server(server: dict, timeout: float = PROBE_TIMEOUT) -> dict:
         "loaded_model": loaded[0] if len(loaded) == 1 else "",
         "resident_models": loaded,
         "pinned_models": pinned,
+        "loading_models": loading,
         "loaded": bool(loaded),
     })
     if not online:
@@ -1052,11 +1067,14 @@ def format_server_states(states: list[dict], mem: dict | None = None) -> str:
     for state in states:
         status = "online" if state.get("online") else "offline"
         models = state.get("loaded_models") or []
+        loading = state.get("loading_models") or []
         loaded = ", ".join(models) if models else "(no model resident)"
         lines.append(
             f"  {state.get('name') or '?'} [{state.get('kind') or 'custom'}] "
             f"{status}  {state.get('base_url', '')}")
         lines.append(f"    {loaded}")
+        if loading:
+            lines.append(f"    loading: {', '.join(loading)}")
     return "\n".join(lines)
 
 
