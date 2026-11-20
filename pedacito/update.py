@@ -427,6 +427,13 @@ def run_upgrade(argv: list[str], on_line=None, timeout: float | None = None,
             proc.wait()
             emit("upgrade cancelled")
             return 1
+        if deadline is not None and time.monotonic() >= deadline:
+            # Checked here too, not only on queue.Empty: a child that keeps
+            # printing lines must not stream past its wall-clock deadline.
+            _stop_process(proc)
+            proc.wait()
+            emit("upgrade timed out and was stopped")
+            return 1
         if deadline is None and cancel is None:
             wait = None
         else:

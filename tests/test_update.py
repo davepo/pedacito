@@ -579,6 +579,32 @@ def test_run_upgrade_timeout_kills_and_reports():
     assert code == 1 and any("timed out" in ln for ln in lines)
 
 
+def test_run_upgrade_timeout_stops_a_child_that_keeps_printing():
+    """The deadline is wall-clock: a child that never goes silent must be
+    stopped too. The old loop only checked the deadline on queue.Empty, so
+    continuous output streamed past the timeout until the child exited."""
+    chatter = ("import time\n"
+               "end = time.monotonic() + 3.0\n"
+               "while time.monotonic() < end:\n"
+               "    print('chatter', flush=True)\n"
+               "    time.sleep(0.001)\n")
+    lines = []
+
+    def slow_sink(line):
+        # Slower than the child prints, so the line queue never empties:
+        # the queue.Empty branch (the old deadline check) is never reached.
+        lines.append(line)
+        time.sleep(0.005)
+
+    started = time.monotonic()
+    code = update_mod.run_upgrade([sys.executable, "-c", chatter],
+                                  on_line=slow_sink, timeout=0.5)
+    elapsed = time.monotonic() - started
+    assert code == 1 and any("timed out" in ln for ln in lines)
+    assert "chatter" in lines                  # it really was streaming
+    assert elapsed < 2.5                       # stopped near the deadline
+
+
 def test_run_upgrade_cancel_kills_child_and_reports():
     lines = []
     cancel = threading.Event()
