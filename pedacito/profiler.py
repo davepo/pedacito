@@ -50,6 +50,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from pathlib import Path
@@ -1115,17 +1116,23 @@ def _read_store() -> dict:
 
 def _write_store(data: dict) -> Path:
     path = cache_path()
-    tmp = path.with_name(path.name + ".tmp")
+    tmp = None
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
-        tmp.write_text(json.dumps(data, indent=1, sort_keys=True),
-                       encoding="utf-8")
+        # A unique temp name (fileio.write_bytes pattern): probe threads for
+        # different servers finish concurrently and must not share one
+        # `.tmp` file.
+        fd, tmp = tempfile.mkstemp(prefix=path.name + ".", suffix=".tmp",
+                                   dir=str(path.parent))
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(json.dumps(data, indent=1, sort_keys=True))
         os.replace(tmp, path)
     except OSError:
-        try:
-            tmp.unlink(missing_ok=True)
-        except OSError:
-            pass
+        if tmp is not None:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
     return path
 
 

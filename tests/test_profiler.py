@@ -824,6 +824,27 @@ def test_probe_cache_ttl_and_model_invalidation(monkeypatch):
                                       "model-a", now=now + 10) is None
 
 
+def test_write_store_concurrent_probes_do_not_share_a_tmp_file(monkeypatch):
+    """Probe threads for different servers finish concurrently; two store
+    writes must not share one fixed `.tmp` name (the second truncates the
+    first's temp file and the first os.replace silently fails)."""
+    real_replace = profiler.os.replace
+    fired = []
+
+    def racing_replace(src, dst):
+        if not fired:
+            fired.append(True)
+            # Another probe's store write completes mid-write.
+            profiler._write_store({"version": 1, "probes": {"b": {}}})
+        return real_replace(src, dst)
+
+    monkeypatch.setattr(profiler.os, "replace", racing_replace)
+    profiler._write_store({"version": 1, "probes": {"a": {}}})
+    data = json.loads(profiler.cache_path().read_text(encoding="utf-8"))
+    assert data["probes"] == {"a": {}}
+    assert not list(profiler.cache_path().parent.glob("*.tmp"))
+
+
 def test_successful_server_load_schedules_the_probe(monkeypatch):
     from pedacito import servers
     calls = []

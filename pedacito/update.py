@@ -33,6 +33,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from pathlib import Path
@@ -159,17 +160,22 @@ def write_cache(latest: str, now: float | None = None) -> None:
     """Best-effort atomic write; a read-only config dir is not an error."""
     now = time.time() if now is None else now
     path = cache_path()
-    tmp = path.with_name(path.name + ".tmp")
+    tmp = None
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
-        with open(tmp, "w", encoding="utf-8") as fh:
+        # A unique temp name (fileio.write_bytes pattern): concurrent checks
+        # (GUI startup thread + `pdc update`) must not share one `.tmp` file.
+        fd, tmp = tempfile.mkstemp(prefix=path.name + ".", suffix=".tmp",
+                                   dir=str(path.parent))
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
             json.dump({"checked_at": now, "latest": latest}, fh)
         os.replace(tmp, path)
     except OSError:
-        try:
-            tmp.unlink(missing_ok=True)
-        except OSError:
-            pass
+        if tmp is not None:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
 
 
 # --- the one network call -------------------------------------------------------

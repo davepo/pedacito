@@ -158,6 +158,28 @@ def test_cache_corrupt_reads_as_missing():
     assert update_mod.read_cache() is None
 
 
+def test_write_cache_concurrent_checks_do_not_share_a_tmp_file(monkeypatch):
+    """Two checks finishing at once (GUI startup thread + `pdc update`) must
+    not write through one fixed `.tmp` name: the second writer truncates the
+    first's temp file, the first os.replace then fails and its result is
+    silently lost. Each writer needs its own unique temp file."""
+    real_replace = update_mod.os.replace
+    fired = []
+
+    def racing_replace(src, dst):
+        if not fired:
+            fired.append(True)
+            # A second check completes while this one is mid-write.
+            update_mod.write_cache("9.9.9", now=2000.0)
+        return real_replace(src, dst)
+
+    monkeypatch.setattr(update_mod.os, "replace", racing_replace)
+    update_mod.write_cache("0.3.1", now=1000.0)
+    data = json.loads(update_mod.cache_path().read_text(encoding="utf-8"))
+    assert data == {"checked_at": 1000.0, "latest": "0.3.1"}
+    assert not list(update_mod.cache_path().parent.glob("*.tmp"))
+
+
 # --- payload parsing ----------------------------------------------------------------
 
 def test_latest_skips_yanked_and_empty_releases():
