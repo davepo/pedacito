@@ -1246,7 +1246,7 @@ def probe_model_speed(base_url: str, model: str, config,
     started = time.time()
     try:
         from .config import Config
-        from .llm import LLMClient
+        from .llm import LLMClient, one_shot_completion, timing_record
     except Exception as exc:                 # pragma: no cover - defensive
         return {"ok": False, "base_url": str(base_url), "model": str(model),
                 "detail": f"{type(exc).__name__}: {_cut(exc)}",
@@ -1293,7 +1293,8 @@ def probe_model_speed(base_url: str, model: str, config,
             client.stream_callback = lambda _text: None
         except Exception:
             pass
-        text = client._chat_once(
+        text = one_shot_completion(
+            client,
             [{"role": "user", "content": prompt}],
             max_tokens=16, stream=True, disable_thinking=True)
     except Exception as exc:
@@ -1303,24 +1304,21 @@ def probe_model_speed(base_url: str, model: str, config,
                 f"{type(exc).__name__}: {_cut(exc)}",
                 "measured_at": started}
 
-    timings = dict(getattr(client, "last_timings", {}) or {})
-    elapsed = _float(getattr(client, "last_elapsed_s", 0.0))
-    first_at = getattr(client, "first_token_at", None)
-    start_at = getattr(client, "request_started_at", None)
-    prompt_tokens = _int(getattr(client, "last_prompt_tokens", 0))
+    timing = timing_record(client)
+    timings = dict(timing.last_timings or {})
+    elapsed = float(timing.elapsed_s or 0.0)
+    prompt_tokens = int(timing.prompt_tokens or 0)
     if prompt_tokens <= 0:
-        prompt_tokens = int(client.estimate_tokens(prompt))
-    completion_tokens = _int(getattr(client, "last_completion_tokens", 0))
+        prompt_tokens = int(timing.estimate_tokens(prompt))
+    completion_tokens = int(timing.completion_tokens or 0)
     if completion_tokens <= 0:
-        completion_tokens = int(client.estimate_tokens(text or _PROBE_REPLY))
+        completion_tokens = int(timing.estimate_tokens(text or _PROBE_REPLY))
 
     prefill_tps = _float(timings.get("prompt_per_second")
                          or timings.get("prompt_tokens_per_second"))
     generation_tps = _float(timings.get("predicted_per_second")
                             or timings.get("predicted_tokens_per_second"))
-    prefill_s = 0.0
-    if first_at and start_at:
-        prefill_s = max(0.0, float(first_at) - float(start_at))
+    prefill_s = max(0.0, float(timing.prefill_s or 0.0))
     if not prefill_tps and prefill_s > 0:
         prefill_tps = prompt_tokens / prefill_s
     if not generation_tps:
@@ -1328,8 +1326,7 @@ def probe_model_speed(base_url: str, model: str, config,
         if gen_s > 0 and completion_tokens > 0:
             generation_tps = completion_tokens / gen_s
         else:
-            generation_tps = _float(getattr(client,
-                                            "last_stream_tok_per_s", 0.0))
+            generation_tps = float(timing.stream_tok_per_s or 0.0)
 
     result = {
         "ok": True,

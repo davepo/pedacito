@@ -174,8 +174,11 @@ and skipped silently when absent. A missing number carries an empty source and i
 
 The optional speed probe runs one tiny completion plus one prefill measurement from SSE
 timings. It is explicit (`pedacito profile --run`, TUI `/profile run`) or scheduled once
-per server+model on a daemon thread after a successful explicit server load. Results are
-cached for a week in `profiler.json` beside the user config; failures are silent.
+per server+model on a daemon thread after a successful explicit server load. The probe
+uses the client's public one-shot entry point and timing record
+(`LLMClient.complete_once()`, `LLMClient.timing_record()`), so it does not depend on
+private stream bookkeeping. Results are cached for a week in `profiler.json` beside
+the user config; failures are silent.
 
 `auto_tune` (default **false**) is applied at the same point as the `local-moe` defaults
 in `config.load()`. When enabled it uses only numbers and their sources: free VRAM (or

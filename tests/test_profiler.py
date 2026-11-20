@@ -9,6 +9,7 @@ from __future__ import annotations
 import copy
 import json
 import time
+from pathlib import Path
 
 import pytest
 
@@ -691,6 +692,44 @@ def test_probe_http_error_is_silent_and_not_cached(monkeypatch):
         "http://127.0.0.1:1234/v1", "bad-model") is None
     assert not before.exists() or "bad-model" not in before.read_text(
         encoding="utf-8")
+
+
+def test_timing_record_is_populated_after_a_streamed_completion(monkeypatch):
+    frames = _sse_frames({"prompt_per_second": 850.0,
+                          "predicted_per_second": 42.0},
+                         prompt_tokens=2048, completion_tokens=2)
+    monkeypatch.setattr(llm.requests, "post",
+                        lambda url, **kw: _SSE(frames, delay=0.01))
+    client = llm.LLMClient(Config())
+    text = client.complete_once(
+        [{"role": "user", "content": "Reply with just: OK"}],
+        max_tokens=16, stream=True, disable_thinking=True)
+    assert text == "OK"
+    timing = client.timing_record()
+    assert isinstance(timing, llm.CallTiming)
+    assert timing.request_started_at and timing.request_started_at > 0
+    assert timing.first_token_at is not None
+    assert timing.first_token_at >= timing.request_started_at
+    assert timing.prefill_s is not None and timing.prefill_s >= 0
+    assert timing.last_timings == {"prompt_per_second": 850.0,
+                                   "predicted_per_second": 42.0}
+    assert timing.prompt_tokens == 2048
+    assert timing.completion_tokens == 2
+    assert timing.elapsed_s > 0
+    assert timing.estimate_tokens("x" * 36) >= 1
+
+
+def test_profiler_probe_uses_only_the_public_llm_surface():
+    source = Path(profiler.__file__).read_text(encoding="utf-8")
+    start = source.index("def probe_model_speed(")
+    end = source.index("\n_probe_lock =", start)
+    body = source[start:end]
+    for name in ("_chat_once", "getattr(client", "client.last_",
+                 "client.first_token_at", "client.request_started_at",
+                 "client.estimate_tokens"):
+        assert name not in body, f"probe still reads {name}"
+    assert "one_shot_completion(" in body
+    assert "timing_record(" in body
 
 
 def test_cli_profile_run_refuses_hosted_endpoint(monkeypatch, tmp_path,

@@ -38,6 +38,7 @@ import re
 import sys
 import threading
 import time
+from dataclasses import dataclass, field
 from pathlib import Path
 from urllib.parse import quote, urlparse
 
@@ -1291,6 +1292,109 @@ def estimate_messages(messages: list[dict], est=None) -> int:
                for m in messages) + 3
 
 
+@dataclass(frozen=True)
+class CallTiming:
+    """Public timing record for one completion request.
+
+    Get one from :meth:`LLMClient.timing_record` (or the module-level
+    :func:`timing_record`) after a call. All timestamps are monotonic seconds
+    from `time.monotonic()`; they are only meaningful as differences inside
+    this process, never as wall-clock dates.
+
+    Attributes
+    ----------
+    request_started_at:
+        Monotonic time immediately before the HTTP request was sent. None
+        before the first request or when no request was made.
+    first_token_at:
+        Monotonic time of the first streamed content or reasoning delta.
+        None when the reply was buffered or no token arrived.
+    last_timings:
+        The last server-reported ``timings`` block, when the endpoint sends
+        one (llama.cpp/LM Studio style: ``prompt_per_second``,
+        ``predicted_per_second``, ...). Empty otherwise.
+    prompt_tokens:
+        Prompt tokens reported by the server, or the client's estimate when
+        the server reported none.
+    completion_tokens:
+        Completion tokens reported by the server, or the client's estimate.
+    elapsed_s:
+        Wall-clock seconds spent in the last request.
+    stream_tok_per_s:
+        The last streamed reply's token rate, as surfaced by telemetry.
+    chars_per_token:
+        Calibrated characters per token for this model; 0.0 means the
+        package heuristic (~3.6) is used by :meth:`estimate_tokens`.
+    """
+
+    request_started_at: float | None = None
+    first_token_at: float | None = None
+    last_timings: dict = field(default_factory=dict)
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+    elapsed_s: float = 0.0
+    stream_tok_per_s: float = 0.0
+    chars_per_token: float = 0.0
+
+    @property
+    def prefill_s(self) -> float | None:
+        """Seconds from request start to first token, or None when either
+        anchor is missing (a buffered reply has no first-token anchor)."""
+        if self.first_token_at is None or not self.request_started_at:
+            return None
+        return max(0.0, float(self.first_token_at)
+                   - float(self.request_started_at))
+
+    def estimate_tokens(self, text: str) -> int:
+        """Token count for `text` using this model's calibrated ratio, else
+        the package heuristic."""
+        if self.chars_per_token:
+            return int(len(text) / self.chars_per_token) + 1
+        return estimate_tokens(text)
+
+
+def one_shot_completion(client, messages: list[dict], max_tokens: int,
+                        *, stream: bool = False,
+                        disable_thinking: bool | None = None) -> str:
+    """One completion request with no retry, trim or continuation logic.
+
+    The public entry point for tooling that needs a single request (the speed
+    probe): it delegates to :meth:`LLMClient.complete_once`. Duck-typed test
+    doubles that predate that method expose the equivalent single-request
+    path; they stay supported here rather than in the caller.
+    """
+    run = getattr(client, "complete_once", None)
+    if callable(run):
+        return run(messages, max_tokens=max_tokens, stream=stream,
+                   disable_thinking=disable_thinking)
+    return client._chat_once(messages, max_tokens=max_tokens, stream=stream,
+                             disable_thinking=disable_thinking)
+
+
+def timing_record(client) -> CallTiming:
+    """The public timing record for `client`'s last completion.
+
+    `LLMClient` supplies it directly; duck-typed test doubles that expose the
+    same timing fields are accepted so callers never read stream internals.
+    """
+    getter = getattr(client, "timing_record", None)
+    if callable(getter):
+        return getter()
+    started = getattr(client, "request_started_at", None)
+    return CallTiming(
+        request_started_at=float(started) if started else None,
+        first_token_at=getattr(client, "first_token_at", None),
+        last_timings=dict(getattr(client, "last_timings", {}) or {}),
+        prompt_tokens=int(getattr(client, "last_prompt_tokens", 0) or 0),
+        completion_tokens=int(
+            getattr(client, "last_completion_tokens", 0) or 0),
+        elapsed_s=float(getattr(client, "last_elapsed_s", 0.0) or 0.0),
+        stream_tok_per_s=float(
+            getattr(client, "last_stream_tok_per_s", 0.0) or 0.0),
+        chars_per_token=float(getattr(client, "chars_per_token", 0.0) or 0.0),
+    )
+
+
 # Structural request keys a user `sampler` table must never override: they
 # would defeat the output cap, the grammar, or the streaming protocol.
 _PROTECTED_SAMPLER_KEYS = frozenset({
@@ -1459,13 +1563,15 @@ class LLMClient:
         self.last_stream_tokens = 0
         self.last_stream_tok_per_s = 0.0
         self.first_token_at = None
-        # Wall-clock anchors for the optional speed probe (profiler.py):
-        # request_started_at is just before the HTTP POST, first_token_at is
-        # the first content/reasoning delta of a streamed reply. None means
-        # the reply was buffered (or no token ever arrived).
+        # Wall-clock anchors for the public timing record (`timing_record()`),
+        # used by the speed probe: request_started_at is just before the HTTP
+        # POST, first_token_at is the first content/reasoning delta of a
+        # streamed reply. None means the reply was buffered (or no token
+        # ever arrived).
         self.request_started_at = 0.0
         # The last server-reported llama.cpp `timings` block (prompt_per_second
-        # / predicted_per_second), when the endpoint sends one.
+        # / predicted_per_second), when the endpoint sends one; exposed through
+        # `timing_record()`.
         self.last_timings: dict = {}
         # Circuit breaker: consecutive transport/server failures, and the
         # monotonic deadline before which calls fail fast. A success closes it.
@@ -1566,6 +1672,43 @@ class LLMClient:
         if self.chars_per_token:
             return int(len(text) / self.chars_per_token) + 1
         return estimate_tokens(text)
+
+    def timing_record(self) -> CallTiming:
+        """Public timing record for the last completion request.
+
+        Callers that drive one request directly (the speed probe, scripts)
+        read request/first-token anchors, server timings and token counts
+        here instead of reaching into the stream bookkeeping. The values
+        describe the most recent attempt and are replaced by the next call.
+        Timestamps are monotonic seconds (see :class:`CallTiming`).
+        """
+        return CallTiming(
+            request_started_at=(float(self.request_started_at)
+                                if self.request_started_at else None),
+            first_token_at=self.first_token_at,
+            last_timings=dict(self.last_timings or {}),
+            prompt_tokens=int(self.last_prompt_tokens or 0),
+            completion_tokens=int(self.last_completion_tokens or 0),
+            elapsed_s=float(self.last_elapsed_s or 0.0),
+            stream_tok_per_s=float(self.last_stream_tok_per_s or 0.0),
+            chars_per_token=float(self.chars_per_token or 0.0),
+        )
+
+    def complete_once(self, messages: list[dict], max_tokens: int,
+                      *, schema: dict | None = None, stream: bool = False,
+                      disable_thinking: bool | None = None,
+                      json_schema: dict | None = None,
+                      cancel_event=None, on_stream=None) -> str:
+        """One completion request with no retry, trim or continuation logic.
+
+        The public counterpart of the internal single-request path, for
+        tooling that needs exactly one HTTP call (the speed probe). Returns
+        the reply text; timing is available from :meth:`timing_record`.
+        """
+        return self._chat_once(
+            messages, max_tokens, schema=schema, stream=stream,
+            disable_thinking=disable_thinking, json_schema=json_schema,
+            cancel_event=cancel_event, on_stream=on_stream)
 
     def _context_too_long(self, body: str) -> bool:
         """True when a 400 body says the prompt overflowed the context window.

@@ -617,7 +617,10 @@ sends one tiny completion (`max_tokens = 16`, "Reply with just: OK") plus one pr
 measurement: about 2,000 filler tokens when the model's window allows, otherwise 512.
 Set `profile_probe_on_load = false` to keep the automatic post-load probe from starting
 at all; explicit probes still work. Prefill and generation tok/s come from the server's
-SSE timings. The probe is best-effort
+SSE timings. The probe drives one public one-shot call (`LLMClient.complete_once()`)
+and reads the result through the public timing record
+(`LLMClient.timing_record()`): request/first-token anchors, the server timing block
+and token counts, never the stream's private bookkeeping. The probe is best-effort
 and silent on failure; a cached result lives in `profiler.json` beside the user config for
 one week and is keyed by server+model, so changing either one invalidates it. Probes never
 run for hosted endpoints: both explicit paths (`pdc profile --run` and `/profile run`)
