@@ -176,6 +176,34 @@ def test_task_run_records_a_baseline_and_a_post_run_checkpoint(tmp_path,
     assert "app.py" in items[1]["files_changed"]
 
 
+def test_task_run_memory_path_records_exactly_one_post_checkpoint(tmp_path,
+                                                                  monkeypatch):
+    """The DEFAULT run_task path (use_memory on) records ONE post-run
+    checkpoint. A second empty post snapshot duplicates the timeline entry
+    and halves the effective auto_keep_checkpoints retention; the
+    use_memory=False test above only exercises the early-return branch."""
+    (tmp_path / "app.py").write_text("before\n", encoding="utf-8")
+    cfg = Config()
+    assert cfg.use_memory is True
+    cfg._auto_step = 1                        # run as an Auto step
+
+    def fake_ladder(root, cfg_ref, client, agent, idx, task, **kwargs):
+        (Path(root) / "app.py").write_text("after\n", encoding="utf-8")
+        return loop.TaskResult(
+            results=[], reply="done", applied=True, changed=["app.py"],
+            idx=idx, steps=[])
+
+    monkeypatch.setattr(loop, "_run_ladder", fake_ladder)
+    tr = loop.run_task(tmp_path, cfg, object(), None, None, "change app")
+    assert tr.reply == "done"
+    items = checkpoints.list_checkpoints(tmp_path)
+    assert len(items) == 2                    # baseline + ONE post, not two
+    assert items[0]["label"].startswith("baseline before")
+    assert items[1]["mode"] == "auto"
+    assert items[1]["parent_id"] == items[0]["id"]
+    assert "app.py" in items[1]["files_changed"]
+
+
 # --- runner detection / execution ---------------------------------------------
 
 def test_detect_runnable_targets_finds_web_and_python_entrypoints(tmp_path):

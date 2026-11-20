@@ -4256,9 +4256,9 @@ def run_task(root: Path, cfg, client, agent, idx, task: str, *,
         root, cfg, client, idx, task, tr,
         dict(apply=apply, review=review, answer_system=answer_system,
              is_repair=is_repair))
-    if writes:
-        _checkpoint_task(root, cfg, task, "post")
     if answer_system is not None or review or not getattr(cfg, "use_memory", True):
+        if writes:
+            _checkpoint_task(root, cfg, task, "post")
         _finish_capture(tr)
         return tr
     try:
