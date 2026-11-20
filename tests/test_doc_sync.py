@@ -19,6 +19,9 @@ The docs and the built-in `how` index must keep pace with the code:
 * the creative/design pass (--creative, /creative, the ✨ Creative
   composer toggle, the 🌐 Live Preview tab, hosted sampling omission)
   stays documented in both guides and in the how-cards.
+* the docs ownership split (docs/ is canonical reference, the root guides
+  are canonical walkthroughs, README indexes both) stays pinned in README,
+  docs/ARCHITECTURE.md, each root guide and CHANGELOG.
 """
 from __future__ import annotations
 
@@ -467,3 +470,49 @@ def test_tui_help_names_the_project_website_and_contact():
     from pedacito import tui
     assert ("Web: https://www.pedacito.dev \u00b7 "
             "Contact: contact@pedacito.dev") in tui.HELP_TEXT
+
+
+# --- docs ownership (R5.5) ----------------------------------------------------
+# docs/ is the canonical reference, the three root guides are the canonical
+# task-oriented guides, README is the index and CHANGELOG is the history. Pin
+# the links both ways and the shared decision paragraph so neither set can
+# silently drift into a copy of the other.
+
+ROOT_GUIDES = ("QUICKSTART.md", "MODEL_GUIDE.md", "TECHNIQUES.md")
+DOCS_SET = ("INSTALLATION", "ARCHITECTURE", "USAGE", "CONFIG", "SECURITY")
+
+
+def _ownership_paragraph(text: str) -> str:
+    start = text.index("**Docs ownership.**")
+    return _norm(text[start:].split("\n\n", 1)[0]).replace("](../", "](")
+
+
+@pytest.mark.parametrize("guide", ROOT_GUIDES)
+def test_root_guide_links_into_docs(guide):
+    text = (ROOT / guide).read_text(encoding="utf-8")
+    linked = re.findall(r"\]\((docs/[A-Za-z]+\.md)", text)
+    assert linked, f"{guide} links into no docs/ page"
+    for rel in linked:
+        assert (ROOT / rel).is_file(), f"{guide} links to missing {rel}"
+
+
+def test_readme_indexes_the_root_guides_and_docs():
+    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+    for guide in ROOT_GUIDES:
+        assert f"]({guide})" in readme, f"README does not link {guide}"
+    for name in DOCS_SET:
+        assert f"](docs/{name}.md" in readme, f"README does not link {name}"
+
+
+def test_ownership_decision_is_echoed_in_architecture():
+    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+    arch = (ROOT / "docs" / "ARCHITECTURE.md").read_text(encoding="utf-8")
+    assert "**Docs ownership.**" in readme
+    assert _ownership_paragraph(readme) == _ownership_paragraph(arch)
+
+
+def test_changelog_records_the_ownership_split_under_0_3_1():
+    text = (ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
+    section = text.split("## v0.3.1", 1)[1].split("\n## ", 1)[0]
+    assert "Docs Ownership" in section
+    assert "canonical" in section

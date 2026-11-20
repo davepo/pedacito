@@ -11,6 +11,10 @@ wins that trade-off, and it is gated behind a config flag, a model card, or a
 measured win, never enabled on trust. This page lists what Pedacito actually
 does, and, at the end, the well-known techniques it deliberately does *not*.
 
+The canonical reference for the settings that gate these techniques is
+[docs/CONFIG.md](docs/CONFIG.md), and their internals are described in
+[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
+
 The reasons and measurement plan behind each choice were drafted as internal
 design notes. They are not part of this repository, so the rules below are
 the public record.

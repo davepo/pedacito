@@ -4,6 +4,21 @@ All notable changes to Pedacito (`pdc`) are documented here.
 
 ## v0.3.1 — 2026-11-18
 
+### Docs Ownership Split
+
+- **Ownership decision** — `docs/` (INSTALLATION, ARCHITECTURE, USAGE, CONFIG,
+  SECURITY) is the canonical reference. QUICKSTART, MODEL_GUIDE and TECHNIQUES
+  remain the canonical task-oriented guides, README is the index, and this
+  CHANGELOG is the history. The decision is written once in README's
+  Documentation section and echoed in `docs/ARCHITECTURE.md`. New reference
+  prose goes to `docs/`, new walkthroughs go to the root guides, and each set
+  links to the other instead of copying text.
+- **Cross-links** — each root guide now points into `docs/` (MODEL_GUIDE and
+  TECHNIQUES previously did not), with no guide content moved or rewritten.
+- **Test guard** — `tests/test_doc_sync.py` pins the root-guide-to-docs links,
+  README's links to all three guides and `docs/`, the echoed paragraph, and
+  this entry.
+
 ### Manual Skill Injection and Repo-Map Regression Pins
 
 - **TUI `/skill NAME`** — loads the full checklist through

@@ -7,6 +7,8 @@ manager that treats your model servers as one memory pool, execution profiles (i
 For day-to-day use, see [USAGE.md](USAGE.md). For security boundaries, see
 [SECURITY.md](SECURITY.md). For settings, see [CONFIG.md](CONFIG.md).
 
+**Docs ownership.** `docs/` (INSTALLATION, ARCHITECTURE, USAGE, CONFIG and SECURITY) is the canonical reference for settings, commands and guarantees. The three root guides, [QUICKSTART.md](../QUICKSTART.md), [MODEL_GUIDE.md](../MODEL_GUIDE.md) and [TECHNIQUES.md](../TECHNIQUES.md), remain the canonical task-oriented guides: first runs, model pairing and tuning, and small-model techniques. This README is the index, and [CHANGELOG.md](../CHANGELOG.md) is the history. New reference prose goes to `docs/`, new walkthroughs go to the root guides, and each set links to the other instead of copying text.
+
 ## Engine overview
 
 The CLI, the TUI, the browser GUI and the JSONL-RPC interface all drive the same engine. A

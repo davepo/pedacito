@@ -5,7 +5,8 @@ context window. It builds an index of your project, then lets the model fetch
 only the pieces it needs to answer a question or propose an edit. For the
 background, see the [README](README.md). For how the small-model techniques
 work, see [TECHNIQUES.md](TECHNIQUES.md). For choosing a model, see the
-[model guide](MODEL_GUIDE.md).
+[model guide](MODEL_GUIDE.md). The canonical reference for settings, commands and
+security is in [docs/](docs/), starting with [docs/CONFIG.md](docs/CONFIG.md).
 
 There are two ways in, and they run the same engine and read the same config:
 

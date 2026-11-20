@@ -4,7 +4,9 @@ This guide helps you choose a model for your hardware, set it up in Pedacito,
 and check that it is working. It applies to any OpenAI-compatible server (LM
 Studio, Ollama, Lemonade Server, llama.cpp, vLLM, and others) and to hosted APIs.
 Model names and quantization details change often. Treat the examples as
-starting points, and measure on your own machine.
+starting points, and measure on your own machine. The canonical reference for
+model profiles and every setting is [docs/CONFIG.md](docs/CONFIG.md), and server
+setup is in [docs/INSTALLATION.md](docs/INSTALLATION.md).
 
 Pedacito is not a chat benchmark. It asks a model to do three jobs:
 

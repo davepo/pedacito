@@ -57,6 +57,8 @@ The step-by-step guides from before v0.3.0 are still current:
 [QUICKSTART.md](QUICKSTART.md) for first runs, [MODEL_GUIDE.md](MODEL_GUIDE.md) for choosing and tuning
 models, and [TECHNIQUES.md](TECHNIQUES.md) for how Pedacito gets small models to work well.
 
+**Docs ownership.** `docs/` (INSTALLATION, ARCHITECTURE, USAGE, CONFIG and SECURITY) is the canonical reference for settings, commands and guarantees. The three root guides, [QUICKSTART.md](QUICKSTART.md), [MODEL_GUIDE.md](MODEL_GUIDE.md) and [TECHNIQUES.md](TECHNIQUES.md), remain the canonical task-oriented guides: first runs, model pairing and tuning, and small-model techniques. This README is the index, and [CHANGELOG.md](CHANGELOG.md) is the history. New reference prose goes to `docs/`, new walkthroughs go to the root guides, and each set links to the other instead of copying text.
+
 Run `pdc --help` for every command, or `pdc how "your question"` for built-in help.
 
 ## Contributing
