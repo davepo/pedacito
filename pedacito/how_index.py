@@ -228,6 +228,7 @@ CLI_COMMANDS = [
             'pedacito ask . -t "add retries" --review',
             'pedacito ask . -t "refactor pricing and billing" --plan --review-plan',
             'pedacito ask . -t "finish the previous task" --continue',
+            'pedacito ask . -t "fix the parser tests" --apply --json --verify-cmd "pytest -q"',
         ],
         "flags": [
             {"flag": "-t, --task TEXT", "help": "the task (required)"},
@@ -236,6 +237,14 @@ CLI_COMMANDS = [
              "help": "open the side-by-side review page before writing"},
             {"flag": "--no-review",
              "help": "never open the reviewer, even if config enables it"},
+            {"flag": "--json",
+             "help": "one JSON summary object on stdout at run end (human "
+                     "output to stderr); turns = model calls; implies "
+                     "--no-review"},
+            {"flag": "--verify-cmd COMMAND",
+             "help": "run this verification command once after an applied "
+                     "task; overrides auto_verify for this run only (never "
+                     "written to config)"},
             {"flag": "--reindex", "help": "force a fresh index first"},
             {"flag": "--refine",
              "help": "expand a one-line idea into a repo-aware spec first"},

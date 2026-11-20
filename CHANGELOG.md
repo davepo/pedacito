@@ -4,6 +4,31 @@ All notable changes to Pedacito (`pdc`) are documented here.
 
 ## v0.3.1 — 2026-11-18
 
+### Headless Task Summary (`pdc ask --json`)
+
+- **`pdc ask --json`** — one machine-readable summary object on stdout at run
+  end, with every human/log line moved to stderr. Shape: `{ok, model,
+  provider, turns, elapsed_sec, tokens{prompt, completion, tok_per_sec},
+  files_changed, verify_passed, diff, diff_truncated}`. `turns` is the run's
+  model-call count (`events.RunTelemetry.summary()["calls"]`), tokens and
+  timing come from the same run telemetry, `files_changed`/`diff` come from
+  the applied changes (capped at 200,000 characters), and `verify_passed` is
+  `null` when no verification ran. `ok` reports task success while the
+  process exit code keeps its current semantics. `--json` implies
+  `--no-review` (no browser, pager or prompts) and is mutually exclusive with
+  `--jsonl`.
+- **`pdc ask --verify-cmd "COMMAND"`** — overrides `auto_verify` for that one
+  run in memory, with a `sources` entry of `--verify-cmd`; it is never written
+  to a config file. The command runs once after an applied task and its
+  outcome is the JSON summary's `verify_passed`.
+- Docs: USAGE's Headless and automation section with the exact shape and two
+  runnable examples, a CONFIG verification cross-reference, and the built-in
+  `how` ask card. Tests cover the one-object stdout contract, the
+  `--verify-cmd` override (config bytes untouched), `verify_passed: null`, the
+  diff cap, `--json` + `--jsonl` rejection, and secret redaction. Also keeps
+  `safety.redact` linear on very long unbroken lines (a multi-hundred-kilobyte
+  diff no longer stalls on the assignment regex).
+
 ### Post-Edit Verification Controls
 
 - **TUI `/verify on|off|status`** — `on` detects the project's test runner

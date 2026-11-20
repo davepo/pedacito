@@ -666,6 +666,14 @@ unchecked task, so a whole-goal check cannot roll back valid partial fixes.
 `auto_verify_rounds` caps the runtime verification performed after an
 `auto --apply` run.
 
+For one **single-task** run, `pedacito ask --verify-cmd "COMMAND"` overrides
+`auto_verify` in memory (the live config's `sources` entry becomes
+`--verify-cmd`; no config file is written) and runs the command once after an
+applied task. `pedacito ask --json` reports that outcome as `verify_passed`
+(`null` when no verification ran) in its one-object summary; see
+[USAGE.md — Headless and automation](USAGE.md#headless-and-automation) for the
+exact JSON shape.
+
 `auto_verify` and `test_command` are execution settings: in a project's
 `.pedacito.toml` they are honored only after `pedacito trust` (see
 [SECURITY.md](SECURITY.md#project-config-is-not-trusted-by-default)).
@@ -746,7 +754,7 @@ config --reference` prints the annotated template. Key settings:
 | `verify_answer` | `"deterministic"` | `off` / `deterministic` / `full`: check edits before writing them. |
 | `best_of` | 1 | Sample N candidate edit replies and keep the best-scoring one. |
 | `verify_tests` / `test_command` | false / `""` | Run impacted tests after applied edits (needs `allow_shell`); `test_command` is the runner detection override. |
-| `auto_verify` | `""` | Command string run after each Auto task; a failure feeds its output back for repair. Empty = off; never a bool. The TUI `/verify on` and GUI **Post-edit verify** detect and fill it. |
+| `auto_verify` | `""` | Command string run after each Auto task; a failure feeds its output back for repair. Empty = off; never a bool. The TUI `/verify on` and GUI **Post-edit verify** detect and fill it. `pdc ask --verify-cmd "..."` overrides it for one run, in memory (see [USAGE.md](USAGE.md#headless-and-automation)). |
 | `auto_verify_final` | false | Run `auto_verify` once after the plan's last unchecked task instead of after every task (useful when the whole suite cannot pass mid-plan). |
 | `auto_repair_rounds` / `auto_verify_rounds` | 2 / 2 | Repair rounds per failing per-task check; runtime-verification rounds after an `auto --apply` run. |
 | `static_gate` / `static_gate_timeout` | true / 3.0 | Changed Python files get a ruff-or-AST static check (new errors only) before any test subprocess; seconds allowed for one ruff run. |

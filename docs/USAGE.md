@@ -157,7 +157,7 @@ commands. Run `pedacito <command> --help` for every flag.
 | `pedacito config --check` | Test the connection and generation. `--doctor` also probes structured output. `--setup` runs first-time setup; `--upgrade [--dry-run]` adds newly documented options to your file |
 | `pedacito calibrate` | Measure the active model (or `--all` local profiles) and save a model card that tunes defaults. Hosted models are refused |
 | `pedacito profiles [--recommend]` | List profiles with their scores, and suggest role routing |
-| `pedacito ask PROJ -t "..."` | Run one task. Dry run by default. Add `--review`, `--apply`, `--plan`, `--refine`, or `--jsonl` |
+| `pedacito ask PROJ -t "..."` | Run one task. Dry run by default. Add `--review`, `--apply`, `--plan`, `--refine`, `--jsonl`, or `--json` |
 | `pedacito explain PROJ -q "..."` | Answer a question about the code. Never edits |
 | `pedacito auto PROJ -t "..."` | Turn a goal into a checklist, then implement it task by task |
 | `pedacito new DIR -t "..."` | Start a project from scratch |
@@ -273,15 +273,17 @@ is asked once to revise the remaining steps (`max_replans`).
 **Machine-readable runs.** `--jsonl` prints every event (steps, model calls with
 token usage, the final answer and the diffs) as one JSON object per line on
 stdout and moves the human text to stderr, so an editor plugin or script can
-drive Pedacito. Writing runs (`--apply`) take a per-project lock
+drive Pedacito. For one closing verdict object instead of an event stream, use
+`--json` (see [Headless and automation](#headless-and-automation)). Writing
+runs (`--apply`) take a per-project lock
 (`.pedacito/run.lock`); a second writer is refused while the first is alive.
 
 **Steering and questions.** In `chat`, anything you type while the model is
 working is delivered at its next step ("stop reading tests, it's in
 `sync.py`") without disturbing the cached prompt prefix (`allow_steering`). In
 an interactive `ask`/`chat` the model also gets a `question` action for genuine
-ambiguity, at most twice per task; in `auto` and with `--jsonl` it never asks
-and states its assumption instead.
+ambiguity, at most twice per task; in `auto`, `--jsonl` and `--json` it never
+asks and states its assumption instead.
 
 Every write snapshots the originals first; `pedacito restore PROJ` undoes the
 last one.
@@ -342,6 +344,66 @@ turn starts from the handoff alone:
 - **RPC**: `{"id": 1, "op": "consolidate"}` (or `"method": "consolidate"`,
   alias `compact`) answers with `before_tokens`, `after_tokens` and the
   handoff; refused while a task runs.
+
+## Headless and automation
+
+`pdc ask` is already the non-interactive one-task entry point: it needs no TTY,
+takes the task on the command line, and leaves state under `.pedacito/`.
+`--json` turns the run into one machine-readable verdict for CI and eval
+harnesses; `--jsonl` remains the streaming alternative (one event per line).
+`--json` and `--jsonl` are mutually exclusive and are rejected together with a
+clear error.
+
+```bash
+# One summary object on stdout; every human line goes to stderr.
+pdc ask . -t "add retries to the sync client" --apply --json
+
+# Same, with a one-run verification command; verify_passed reports its result.
+pdc ask . -t "fix the failing parser tests" --apply --json --verify-cmd "pytest -q"
+```
+
+The stdout shape is exactly this object (no extra keys, no prose, one object at
+run end):
+
+```json
+{
+  "ok": true,
+  "model": "qwen2.5-coder-14b",
+  "provider": "LM Studio",
+  "turns": 7,
+  "elapsed_sec": 12.345,
+  "tokens": {"prompt": 8123, "completion": 1456, "tok_per_sec": 23.4},
+  "files_changed": ["src/sync.py"],
+  "verify_passed": null,
+  "diff": "--- a/src/sync.py\n+++ b/src/sync.py\n@@ -1,3 +1,4 @@\n...",
+  "diff_truncated": false
+}
+```
+
+| Key | Type | Meaning |
+|---|---|---|
+| `ok` | bool | Task success. Not the exit code: a run without `--strict` can exit 0 while a red verification or a failed edit block makes `ok` false. The process exit code keeps its existing semantics. |
+| `model`, `provider` | string | The model and endpoint label that answered, from the run telemetry. |
+| `turns` | int | **Model calls** in this run, exactly `events.RunTelemetry.summary()["calls"]`: every gather step, answer, planning and repair request counts once. |
+| `elapsed_sec` | float | Model-call time accumulated by the run telemetry (`elapsed_s`), not wall-clock time. |
+| `tokens.prompt` / `tokens.completion` | int | Prompt and completion tokens across those calls. |
+| `tokens.tok_per_sec` | float | Completion tokens per second of model time. |
+| `files_changed` | list[string] | Project-relative paths whose bytes the applied run changed (empty on a dry run). |
+| `verify_passed` | bool or null | The run's verification outcome. `null` means no verification ran. With `--verify-cmd` (or a configured `auto_verify`) it is that command's result; otherwise it is the post-edit impacted-test verdict when those tests ran. |
+| `diff` | string | Combined unified diff of the applied changes, capped at 200,000 characters. |
+| `diff_truncated` | bool | `true` when the diff was cut at that cap. |
+
+`--json` implies `--no-review`: it never opens the review page or a pager and
+never prompts for a plan, a question or a permission decision. The task text
+itself is never echoed into the object, and `diff`/string fields pass the same
+`redact_secrets` masking as logs, so a secret planted in the task cannot come
+back out on stdout (set `redact_secrets = false` only if you deliberately want
+unmasked output).
+
+`--verify-cmd "COMMAND"` overrides `auto_verify` for this single run **in
+memory only**: the live config gets the command plus a `sources` entry of
+`--verify-cmd`, and no config file is written or rewritten. It runs once after
+an applied task; a skipped dry run therefore leaves `verify_passed` null.
 
 ## Pinning context with `@`
 

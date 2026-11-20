@@ -882,6 +882,173 @@ def _strict_replay_error(args, client) -> str:
     return ""
 
 
+# `pdc ask --json`: one verdict object, and a diff capped at this many
+# characters so a giant generated file cannot flood an automation log.
+ASK_JSON_DIFF_LIMIT = 200_000
+
+
+def _ask_verify_command(args, cfg) -> str:
+    """Apply `--verify-cmd` to the live config for THIS run only and return
+    the effective command. The override carries a `sources` entry like any
+    other flag; no config file is ever written."""
+    cmd = getattr(args, "verify_cmd", None)
+    if cmd is not None:
+        cfg.auto_verify = str(cmd)
+        cfg.sources["auto_verify"] = "--verify-cmd"
+    return str(getattr(cfg, "auto_verify", "") or "").strip()
+
+
+def _ask_workspace_snapshot(root):
+    """A temporary copy of the snapshot-tracked workspace for `--json`.
+
+    Returns a `TemporaryDirectory` (caller cleans it up) or None. The
+    checkpoint walker already excludes `.pedacito`, `.git`, dependency trees
+    and build output, so the resulting diff is exactly the project's source;
+    the copy lives under `.pedacito/` and therefore never appears in it.
+    """
+    import shutil
+    import tempfile
+    holder = None
+    try:
+        files = checkpoints_mod.iter_workspace_files(root)
+        state = index_mod.state_dir(root)
+        state.mkdir(parents=True, exist_ok=True)
+        holder = tempfile.TemporaryDirectory(prefix="ask-json-",
+                                             dir=str(state))
+        base = Path(holder.name)
+        for rel, src in files:
+            dest = base / rel
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(src, dest)
+        return holder
+    except Exception:                        # reporting must never fail a run
+        if holder is not None:
+            holder.cleanup()
+        return None
+
+
+def _ask_result_changes(tr, applied: bool) -> tuple[list[str], str]:
+    """Files and unified diffs from a TaskResult's applied edit results.
+    Empty for a dry run or a result shape without edit records."""
+    if not applied or tr is None:
+        return [], ""
+    files, diffs = [], []
+    for r in (getattr(tr, "results", None) or []):
+        if not getattr(r, "ok", False):
+            continue
+        rel = str(getattr(r, "file", "") or "")
+        if rel:
+            files.append(rel)
+        text = str(getattr(r, "diff", "") or "")
+        if text:
+            diffs.append(text)
+    if not files:
+        files = [str(f) for f in (getattr(tr, "changed", []) or [])
+                 if str(f).strip()]
+    return files, "\n".join(diffs)
+
+
+def _ask_diff_since(root, holder) -> tuple[list[str], str]:
+    """(changed paths, combined unified diff) since the snapshot `holder`.
+    Best-effort: reporting must never turn a finished task into a failed one."""
+    if holder is None:
+        return [], ""
+    try:
+        before = checkpoints_mod._snapshot_map(Path(holder.name))
+        after = dict(checkpoints_mod.iter_workspace_files(root))
+        changed = checkpoints_mod._changed_paths(before, after)
+        parts = []
+        for rel in changed:
+            rec = checkpoints_mod._diff_pair(rel, before.get(rel),
+                                             after.get(rel))
+            if rec.get("diff"):
+                parts.append(rec["diff"])
+        return changed, "\n".join(parts)
+    except Exception:
+        return [], ""
+
+
+def _ask_json_report(cfg, summary, *, ok: bool, files_changed, diff: str,
+                     verify_passed) -> dict:
+    """The exact `pdc ask --json` object. Every string passes the same
+    redaction as logs/session files, so a secret the task text carried into
+    an applied edit cannot come back out on stdout."""
+    summary = summary or {}
+
+    def clean(value) -> str:
+        return loop.safe_text(str(value or ""), cfg)
+
+    diff_text = clean(diff)
+    truncated = len(diff_text) > ASK_JSON_DIFF_LIMIT
+    provider = (summary.get("provider")
+                or getattr(cfg, "active_profile", "")
+                or str(getattr(cfg, "provider", "") or ""))
+    return {
+        "ok": bool(ok),
+        "model": clean(summary.get("model") or getattr(cfg, "model", "")),
+        "provider": clean(provider),
+        # Turns = model calls, exactly `events.RunTelemetry.summary()["calls"]`:
+        # every gather step, answer, planning and repair request counts once.
+        "turns": int(summary.get("calls") or 0),
+        "elapsed_sec": float(summary.get("elapsed_s") or 0.0),
+        "tokens": {
+            "prompt": int(summary.get("prompt_tokens") or 0),
+            "completion": int(summary.get("completion_tokens") or 0),
+            "tok_per_sec": float(summary.get("tok_per_sec") or 0.0),
+        },
+        "files_changed": sorted({clean(f) for f in (files_changed or [])
+                                 if str(f).strip()}),
+        "verify_passed": None if verify_passed is None
+        else bool(verify_passed),
+        "diff": diff_text[:ASK_JSON_DIFF_LIMIT],
+        "diff_truncated": truncated,
+    }
+
+
+def _ask_task_ok(args, cfg, tr, verify_passed, verify_ran: bool) -> bool:
+    """Task success for the JSON verdict. It is deliberately not the process
+    exit code: without `--strict` a red impacted-test gate still exits 0 but
+    is not a successful task."""
+    if tr is None:
+        return False
+    if getattr(tr, "ok", None) is False:
+        return False
+    if getattr(tr, "fabricated", False):
+        return False
+    if (getattr(tr, "tests_ok", None) is False
+            and not getattr(tr, "tests_preexisting_only", False)):
+        return False
+    if verify_ran and verify_passed is False:
+        return False
+    if (getattr(args, "apply", False) and not _wants_review(args, cfg)
+            and not getattr(tr, "applied", False)
+            and not loop._is_noop(getattr(tr, "reply", "") or "")):
+        if (getattr(tr, "results", []) or getattr(tr, "unaccepted", None)):
+            return False
+    return True
+
+
+def _ask_verify_outcome(root, cfg, command: str, tr, *,
+                        applied: bool) -> tuple[bool | None, bool]:
+    """Run the effective verify command once after an applied task.
+    Returns (verify_passed, ran). With no command, the run's own impacted-test
+    verdict is the verification outcome -- None when no check ran."""
+    if not command or not applied:
+        return getattr(tr, "tests_ok", None), False
+    print(f"\n[verify: running `{command}`]", file=sys.stderr)
+    try:
+        ok, out = loop.run_verify(root, command)
+    except Exception as e:                   # a bad command is a failed check
+        print(f"  [verify: could not run ({type(e).__name__}: {e})]",
+              file=sys.stderr)
+        return False, True
+    print(f"[verify: {'passed' if ok else 'FAILED'}]", file=sys.stderr)
+    if not ok and out:
+        tail = "\n".join(f"    {ln}" for ln in out.splitlines()[-8:])
+        print(tail, file=sys.stderr)
+    return bool(ok), True
+
+
 def _strict_task_error(args, tr) -> str:
     """The --strict failure text for one task result, or '' when the gate
     passes or is disabled: a failed edit block (a partial application) or
@@ -3004,6 +3171,15 @@ def build_parser() -> argparse.ArgumentParser:
                        help="after applied web edits, run the headless DOM "
                             "smoke check (needs allow_shell and Playwright); "
                             "flips verify_dom for this run")
+    p_ask.add_argument("--json", action="store_true",
+                       help="emit exactly one machine-readable summary object "
+                            "on stdout at run end (all human output moves to "
+                            "stderr); implies --no-review and never prompts. "
+                            "turns = model calls from the run's telemetry")
+    p_ask.add_argument("--verify-cmd", metavar="COMMAND", default=None,
+                       help="run this verification command once after an "
+                            "applied task; overrides auto_verify for this run "
+                            "only (in memory, never written to a config file)")
 
     p_explain = sub.add_parser(
         "explain", help="answer questions about an indexed project's code")
@@ -3557,6 +3733,23 @@ def build_parser() -> argparse.ArgumentParser:
 def _main(argv=None) -> int:
     _configure_stdio()
     args = build_parser().parse_args(argv)
+    ask_json = bool(getattr(args, "cmd", "") == "ask"
+                    and getattr(args, "json", False))
+    if ask_json and getattr(args, "jsonl", False):
+        print("ERROR: --json and --jsonl are mutually exclusive: --json "
+              "prints exactly one summary object at run end, --jsonl streams "
+              "one event per line. Pick one.", file=sys.stderr)
+        return 2
+    # `ask --json` owns stdout for its single closing object. Point every
+    # human line (indexing, progress, diffs, warnings) at stderr from the
+    # start, reusing the same redirect the --jsonl path uses further down.
+    json_stdout = sys.stdout
+    if ask_json:
+        args.no_review = True
+        args.review = False
+        if hasattr(args, "review_plan"):
+            args.review_plan = False
+        sys.stdout = sys.stderr
     # A command whose positional is optional (`rpc`) parses it as one string;
     # every consumer below expects a list of paths.
     if isinstance(getattr(args, "paths", None), str):
@@ -3946,7 +4139,8 @@ def _main(argv=None) -> int:
         # offline or opted out.
         update_mod.check_for_update_async(cfg)
         from . import steering
-        if args.cmd in ("ask", "chat") and steering.Steering.available():
+        if args.cmd in ("ask", "chat") and steering.Steering.available() \
+                and not getattr(args, "json", False):
             cfg._interactive = True
             cfg._ask_user = steering.terminal_question
         elog = events_mod.get(_root(args), cfg)
@@ -4079,6 +4273,7 @@ def _main(argv=None) -> int:
             print("  [running as a single-pass Task (ask)]", file=sys.stderr)
 
         if args.cmd == "ask":
+            json_mode = bool(getattr(args, "json", False))
             ask_task = args.task
             if getattr(args, "max_minutes", None) is not None:
                 # BUG-218: a per-task wall-clock cap the caller can set
@@ -4091,24 +4286,101 @@ def _main(argv=None) -> int:
                 # `ask --verify-dom` as standing alone); allow_shell stays the
                 # boundary for gates armed by config or task text instead.
                 cfg._dom_user_consent = True
+            # --verify-cmd is an in-memory `auto_verify` override for this run
+            # (source: --verify-cmd); no config file is written.
+            verify_cmd = _ask_verify_command(args, cfg)
+            if verify_cmd and loop._task_named_tests(verify_cmd):
+                cfg._tests_user_consent = True
+            if json_mode:
+                # One run-scoped collector covers refine + the task, so turns/
+                # elapsed/tokens are exactly this run's model calls.
+                events_mod.begin_run()
             if getattr(args, "refine", False):
                 ask_task = _refine_task_text(cfg, client, root, ask_task,
                                              "ask")
+            run_summary: dict = {}
+            snapshot = _ask_workspace_snapshot(root) if json_mode else None
+            state = {"changed": None, "diff": "", "verify": None,
+                     "verify_ran": False, "emitted": False}
+
+            def _changes():
+                """Applied file changes, from the edit results when the run
+                applied them and from the pre-run workspace snapshot for the
+                planned path (which returns no per-edit records)."""
+                if state["changed"] is None:
+                    snap_changed, snap_diff = _ask_diff_since(root, snapshot)
+                    tr_now = locals_ref.get("last_result")
+                    res_changed, res_diff = _ask_result_changes(
+                        tr_now, bool(getattr(tr_now, "applied", False)))
+                    state["changed"] = sorted(set(snap_changed)
+                                              | set(res_changed))
+                    state["diff"] = res_diff or snap_diff
+                return state["changed"], state["diff"]
+
+            def _finish(code, ok=None):
+                """Emit the one --json object (once) and return the exit code;
+                exit-code semantics stay exactly as they were."""
+                if json_mode and not state["emitted"]:
+                    state["emitted"] = True
+                    try:
+                        changed, diff = _changes()
+                        tr_now = locals_ref.get("last_result")
+                        if ok is None:
+                            ok = _ask_task_ok(args, cfg, tr_now,
+                                              state["verify"],
+                                              state["verify_ran"])
+                        payload = _ask_json_report(
+                            cfg, run_summary, ok=ok, files_changed=changed,
+                            diff=diff, verify_passed=state["verify"])
+                        json_stdout.write(
+                            json.dumps(payload, ensure_ascii=False) + "\n")
+                        json_stdout.flush()
+                    finally:
+                        if snapshot is not None:
+                            snapshot.cleanup()
+                return code
+
+            if json_mode:
+                # One run-scoped collector: turns/elapsed/tokens below are
+                # this task's model calls and nothing before or after it.
+                events_mod.begin_run()
             try:
-                run(ask_task)
-                try:
-                    save_checkpoint(ask_task)
-                except (OSError, ValueError):
-                    pass                 # checkpointing must not lose the task
+                outcome = run(ask_task)
+            except KeyboardInterrupt:
+                if json_mode:
+                    run_summary.update(events_mod.end_run())
+                print("\nCancelled. Nothing further was applied; "
+                      "`pedacito restore` undoes anything already written.",
+                      file=sys.stderr)
+                return _finish(130, ok=False)
+            except LLMError:
+                if json_mode:
+                    run_summary.update(events_mod.end_run())
+                _finish(1, ok=False)
+                raise
+            else:
+                if json_mode:
+                    run_summary.update(events_mod.end_run())
+            try:
+                save_checkpoint(ask_task)
+            except (OSError, ValueError):
+                pass                 # checkpointing must not lose the task
             except KeyboardInterrupt:
                 print("\nCancelled. Nothing further was applied; "
                       "`pedacito restore` undoes anything already written.",
                       file=sys.stderr)
-                return 130
+                return _finish(130, ok=False)
             print("\n" + _usage_line(client), file=sys.stderr)
             from . import replay as replay_mod
             replay_mod.report(client)
             tr = locals_ref.get("last_result")
+            changed, diff = _changes() if snapshot is not None else ([], "")
+            applied_work = bool(
+                getattr(args, "apply", False)
+                and (bool(changed) or getattr(tr, "applied", False)
+                     or (isinstance(outcome, int) and outcome == 0)))
+            state["verify"], state["verify_ran"] = _ask_verify_outcome(
+                root, cfg, verify_cmd, tr, applied=applied_work)
             note = _red_verdict_note(args, tr)
             if note:
                 print("\n" + note, file=sys.stderr)
@@ -4117,7 +4389,7 @@ def _main(argv=None) -> int:
             if strict:
                 print(f"ERROR: {strict}", file=sys.stderr)
                 elog.emit("exit", code=1)
-                return 1
+                return _finish(1, ok=False)
             # BUG-212: reserve exit 0 for runs that landed work. An --apply
             # run whose every edit block failed used to exit 0 with only
             # [FAIL] lines as the signal; an autonomous caller had no cheap
@@ -4134,7 +4406,7 @@ def _main(argv=None) -> int:
                           "(failed tasks, or --strict rejected a task's "
                           "edits/tests)", file=sys.stderr)
                     elog.emit("exit", code=1)
-                    return 1
+                    return _finish(1, ok=False)
                 if (getattr(args, "apply", False)
                         and not getattr(tr, "applied", False)
                         and not loop._is_noop(getattr(tr, "reply", "") or "")):
@@ -4144,14 +4416,14 @@ def _main(argv=None) -> int:
                               f"{len(results)} edit block(s) failed; zero "
                               "files were changed", file=sys.stderr)
                         elog.emit("exit", code=1)
-                        return 1
+                        return _finish(1, ok=False)
                     if getattr(tr, "unaccepted", None):
                         print("ERROR: NOTHING APPLIED: no task clause was "
                               "addressed by an edit", file=sys.stderr)
                         elog.emit("exit", code=1)
-                        return 1
+                        return _finish(1, ok=False)
             elog.emit("exit", code=0)
-            return 0
+            return _finish(0)
 
         if args.cmd == "auto":
             # One run-scoped collector covers refine + planning + every task

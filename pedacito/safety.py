@@ -44,9 +44,9 @@ _PRIVATE_KEY_RE = re.compile(
 # `password = get_password()` or `token = None` is never touched.
 _ASSIGN_RE = re.compile(
     r"""(?ix)
-    (?P<key>["']?[A-Za-z0-9_.\-]*(?:password|passwd|secret|token|api[_\-]?key|
+    (?P<key>["']?[A-Za-z0-9_.\-]{0,80}(?:password|passwd|secret|token|api[_\-]?key|
         apikey|auth[_\-]?key|access[_\-]?key|private[_\-]?key|credential)
-        [A-Za-z0-9_.\-]*["']?\s*[:=]\s*)
+        [A-Za-z0-9_.\-]{0,80}["']?\s*[:=]\s*)
     (?P<q>["'])(?P<val>[^"'\s]{12,})(?P=q)
     """)
 # Values that are obviously placeholders, so documentation stays readable.
@@ -54,6 +54,13 @@ _PLACEHOLDER_RE = re.compile(
     r"(?i)^(?:your|my|example|sample|dummy|changeme|change[-_]me|replace|"
     r"placeholder|xxx+|\*{3,}|<.*>|\$\{.*\}|\{\{.*\}\}|%.*%|lm-studio|test|"
     r"fake|todo|none|null|env|os\.|process\.env)")
+
+# Cheap literal prefilter for _ASSIGN_RE. Scanned over a whole file/diff it
+# keeps `redact` linear on long minified lines (the assignment regex itself
+# only needs to run when one of these words is present at all).
+_ASSIGN_HINTS = ("password", "passwd", "secret", "token", "apikey",
+                 "api_key", "api-key", "auth_key", "auth-key", "access_key",
+                 "access-key", "private_key", "private-key", "credential")
 
 
 def redact(text: str) -> str:
@@ -75,7 +82,10 @@ def redact(text: str) -> str:
             return m.group(0)          # a repeated filler, not a secret
         return f"{m.group('key')}{m.group('q')}{_REDACTED}{m.group('q')}"
 
-    return _ASSIGN_RE.sub(_assign, out)
+    lowered = out.lower()
+    if any(hint in lowered for hint in _ASSIGN_HINTS):
+        out = _ASSIGN_RE.sub(_assign, out)
+    return out
 
 
 def has_secret(text: str) -> bool:
