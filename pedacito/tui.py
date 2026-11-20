@@ -595,6 +595,7 @@ class TuiSession:
         self._stream_phase = ""
         self._dirty = True
         self._quit = False
+        self._closed = False
         self._running = False
         self._write_lock = threading.RLock()
         self._input_lock = threading.Lock()
@@ -1297,26 +1298,34 @@ class TuiSession:
         self._dirty = False
 
     def _append(self, text: str, kind: str = "system") -> None:
-        body = _untrusted_text(text)
-        if len(body) > 12000:
-            body = body[:12000] + "\n[truncated in the transcript view]"
-        lines = body.splitlines() or [""]
-        width = self._transcript_width()
-        added = sum(len(self._wrap_transcript_line(kind, line, width))
-                    for line in lines)
-        if self.scroll_offset > 0:
-            # Keep the line the user is reading stationary: the viewport grew
-            # by exactly this many wrapped rows, so offset grows with it.
-            self.scroll_offset += max(0, added)
-        same_width = self._scroll_seen_width == width
-        for line in lines:
-            self.transcript.append((kind, line))
-        if same_width:
-            self._scroll_seen_total += max(0, added)
-        else:
-            self._scroll_seen_width = width
-            self._scroll_seen_total = len(self._all_transcript_rows(width))
-        self._dirty = True
+        # Background workers (update check, probes) append while the main
+        # thread reads the same transcript for a frame. The write lock keeps
+        # the list/counters consistent, and a worker that arrives after
+        # close() cannot mutate a torn-down session.
+        with self._write_lock:
+            if self._closed:
+                return
+            body = _untrusted_text(text)
+            if len(body) > 12000:
+                body = body[:12000] + "\n[truncated in the transcript view]"
+            lines = body.splitlines() or [""]
+            width = self._transcript_width()
+            added = sum(len(self._wrap_transcript_line(kind, line, width))
+                        for line in lines)
+            if self.scroll_offset > 0:
+                # Keep the line the user is reading stationary: the viewport
+                # grew by exactly this many wrapped rows, so offset grows with
+                # it.
+                self.scroll_offset += max(0, added)
+            same_width = self._scroll_seen_width == width
+            for line in lines:
+                self.transcript.append((kind, line))
+            if same_width:
+                self._scroll_seen_total += max(0, added)
+            else:
+                self._scroll_seen_width = width
+                self._scroll_seen_total = len(self._all_transcript_rows(width))
+            self._dirty = True
 
     def append(self, text: str, kind: str = "system") -> None:
         """Public log append (keeps a scrolled-back viewport stationary)."""
@@ -4190,6 +4199,8 @@ class TuiSession:
 
     def close(self) -> None:
         """Idempotent teardown: watcher, listeners, broker, terminal."""
+        with self._write_lock:
+            self._closed = True
         self._stop_watcher()
         try:
             if self._listener in self.elog.listeners:

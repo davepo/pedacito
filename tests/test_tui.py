@@ -142,6 +142,48 @@ def test_tui_frame_and_telemetry_bar_rendering(tmp_path):
         session.close()
 
 
+class _TrackingLock:
+    """The session's RLock with an entry counter (the append path is what a
+    background worker races with the renderer)."""
+
+    def __init__(self, lock):
+        self._lock = lock
+        self.entries = 0
+
+    def __enter__(self):
+        self.entries += 1
+        return self._lock.__enter__()
+
+    def __exit__(self, *exc):
+        return self._lock.__exit__(*exc)
+
+
+def test_tui_append_takes_the_write_lock(tmp_path):
+    session = TuiSession(tmp_path, _cfg(), headless=True,
+                         stdout=io.StringIO())
+    tracking = _TrackingLock(session._write_lock)
+    session._write_lock = tracking
+    try:
+        session._append("worker line")
+        assert tracking.entries >= 1
+        assert session.transcript[-1] == ("system", "worker line")
+    finally:
+        session.close()
+
+
+def test_tui_append_after_close_is_a_safe_noop(tmp_path):
+    """A startup update check or probe daemon can finish after Ctrl+C
+    teardown; it must not mutate the torn-down transcript."""
+    session = TuiSession(tmp_path, _cfg(), headless=True,
+                         stdout=io.StringIO())
+    session.close()
+    before = list(session.transcript)
+    session._append("late worker line")
+    session._append_many("late worker line")
+    assert session.transcript == before
+    assert session.activity == []
+
+
 def test_tui_servers_pin_parses_target_model_and_state(tmp_path, monkeypatch):
     session = TuiSession(tmp_path, _cfg(), headless=True,
                          stdout=io.StringIO())
