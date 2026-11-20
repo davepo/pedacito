@@ -2722,7 +2722,7 @@ def run(port: int = 0, open_browser: bool = True, project: str | None = None,
     install_permission_broker()
     # Quiet release check on a daemon thread: never delays startup by a
     # network round-trip, silent when offline or opted out (pedacito.update).
-    update_mod.check_for_update_async(on_done=STATE.note_update)
+    update_mod.check_for_update_async(on_done=STATE.note_startup_update)
     if project:
         path = str(Path(project).expanduser().resolve())
         STATE.set_root(path)     # report any existing index before the open job

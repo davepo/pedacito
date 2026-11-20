@@ -1254,6 +1254,15 @@ class State:
             payload = dict(self.update) if self.update else None
         self.bus.publish("update", update=payload)
 
+    def note_startup_update(self, info: dict | None) -> None:
+        """The startup daemon's callback. The check began before any project
+        was open (cfg=None), so it passed the global opt-out gate; a project
+        opened since may opt out, and open_project already cleared the
+        banner. A late result must not re-show it there."""
+        if info and not update_mod.updates_enabled(self.cfg):
+            info = None
+        self.note_update(info)
+
     def update_run_start(self, command: list[str]) -> threading.Event:
         cancel = threading.Event()
         with self.lock:

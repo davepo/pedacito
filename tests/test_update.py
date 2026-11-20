@@ -679,6 +679,29 @@ def test_gui_routes_stand_down_when_disabled(gui, monkeypatch):  # noqa: F811
     assert state["update"]["update_available"] is False
 
 
+def test_gui_late_startup_check_respects_project_opt_out(gui, monkeypatch):  # noqa: F811
+    """The startup daemon starts with cfg=None and passes the GLOBAL gate.
+    A project opened while the check is in flight may opt out; open_project
+    clears the banner, and the late result must not re-show it."""
+    monkeypatch.delenv("PEDACITO_CHECK_FOR_UPDATES", raising=False)
+    cfg = Config()
+    cfg.check_for_updates = False            # the opened project opts out
+    monkeypatch.setattr(core.STATE, "cfg", cfg)
+    info = {"ok": True, "update_available": True, "latest": "9.9.9",
+            "current": "0.3.1", "method": "pipx"}
+    core.STATE.note_startup_update(info)     # the daemon finishes late
+    assert core.STATE.update is None
+    assert gui.get("/api/state")[1]["update"] is None
+    # With updates enabled the same callback still populates the banner.
+    cfg.check_for_updates = True
+    core.STATE.note_startup_update(info)
+    assert core.STATE.update["latest"] == "9.9.9"
+    # The startup wiring uses the guarded callback, not note_update directly.
+    src = (Path(__file__).resolve().parents[1] / "pedacito" / "gui"
+           / "server.py").read_text(encoding="utf-8")
+    assert "check_for_update_async(on_done=STATE.note_startup_update)" in src
+
+
 def test_gui_manual_check_populates_banner_data(gui, monkeypatch):  # noqa: F811
     enable(monkeypatch)
     calls = []
