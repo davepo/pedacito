@@ -278,6 +278,68 @@ def test_lemonade_pin_reports_real_error_without_retrying(monkeypatch):
     assert "model is not loaded" in result["detail"]
 
 
+def test_lemonade_pin_500_body_mentioning_404_does_not_retry(monkeypatch):
+    """A reachable server's real error decides by STATUS alone: a 500 whose
+    body happens to mention "404"/"Connection"/"Timeout" must not re-arm the
+    alternate-spelling retry and fire the side-effecting pin twice."""
+    calls = []
+
+    def fake_post(url, headers=None, json=None, timeout=None):
+        calls.append(url)
+        return SimpleNamespace(
+            status_code=500,
+            text='{"error": "upstream 404: Connection reset (Timeout)"}')
+
+    monkeypatch.setattr(servers.requests, "post", fake_post)
+    result = servers.pin_server_model("lemonade", "qwen3-8b", True,
+                                      _lemonade_cfg())
+    assert result["ok"] is False
+    assert calls == ["http://127.0.0.1:8000/internal/pin"]
+    assert "upstream 404" in result["detail"]
+
+
+def test_llama_load_real_500_with_timeout_text_does_not_retry(monkeypatch):
+    calls = []
+
+    def fake_post(url, headers=None, json=None, timeout=None):
+        calls.append(url)
+        return SimpleNamespace(status_code=500,
+                               text="worker Timeout waiting for slot 404")
+
+    monkeypatch.setattr(servers.requests, "post", fake_post)
+    cfg = _cfg_with({
+        "lemonade": {"base_url": "http://127.0.0.1:8000/v1",
+                     "model": "qwen3-8b", "provider": "lemonade"},
+        "llama": {"base_url": "http://127.0.0.1:8080/v1",
+                  "model": "gemma-3-27b", "provider": "llama-server"},
+    }, active="lemonade")
+    result = servers.load_server_model("llama", "gemma-3-27b", cfg)
+    assert result["ok"] is False
+    assert calls == ["http://127.0.0.1:8080/models/load"]
+
+
+@pytest.mark.parametrize("exc_name", ["ConnectionError", "ReadTimeout"])
+def test_lifecycle_retries_alternate_spelling_when_no_response(
+        monkeypatch, exc_name):
+    """With no response at all (connection failure/timeout) the exception
+    text still qualifies the attempt for the alternate spelling."""
+    calls = []
+    exc = getattr(servers.requests.exceptions, exc_name)("boom")
+
+    def fake_post(url, headers=None, json=None, timeout=None):
+        calls.append(url)
+        if len(calls) == 1:
+            raise exc
+        return _Resp()
+
+    monkeypatch.setattr(servers.requests, "post", fake_post)
+    result = servers.load_server_model("lemonade", "qwen3-8b",
+                                       _lemonade_cfg())
+    assert result["ok"] is True
+    assert calls == ["http://127.0.0.1:8000/v1/load",
+                     "http://127.0.0.1:8000/api/v1/load"]
+
+
 @pytest.mark.parametrize("provider,base_url", [
     ("llama-server", "http://127.0.0.1:8080/v1"),
     ("ollama", "http://127.0.0.1:11434/v1"),

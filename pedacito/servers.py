@@ -596,12 +596,17 @@ def _retry_next_spelling(resp, detail: str) -> bool:
     Only an absent route (404), a connection failure or a timeout qualifies;
     a reachable server's real error (400/500, ...) is reported as-is so a
     side-effecting action can never fire twice."""
-    try:
-        status = int(getattr(resp, "status_code", 0) or 0)
-    except (TypeError, ValueError):
-        status = 0
-    if status == 404:
-        return True
+    if resp is not None:
+        # The server answered: its status alone decides. Matching the body
+        # text too would let a real 500 mentioning "404"/"timeout" re-arm
+        # the retry and fire the side-effecting action a second time.
+        try:
+            status = int(getattr(resp, "status_code", 0) or 0)
+        except (TypeError, ValueError):
+            status = 0
+        return status == 404
+    # No response at all (_post_json caught a connection error/timeout):
+    # classify by the exception text it produced.
     text = str(detail or "")
     return "404" in text or "Connection" in text or "Timeout" in text
 
