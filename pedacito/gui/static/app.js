@@ -950,6 +950,30 @@ function setAutoRoute(on) {           // topbar toggle -> user config + reload
       refreshState();
     });
 }
+function setPostEditVerify(on) {      // topbar toggle -> user config + reload
+  const s = S.status || {};
+  let cmd = String(s.auto_verify || '').trim();
+  if (on && !cmd) cmd = String(s.detected_test_command || '').trim();
+  if (on && !cmd) {
+    // No runner is evident: leave auto_verify empty (the cheap gates still
+    // run) instead of writing a key that enables nothing.
+    emit();
+    PDC.toast('No test command detected, so auto_verify stays empty. Set test_command or auto_verify in config.toml; the syntax, static and contract gates and scoped impacted tests still run.', true);
+    return;
+  }
+  PDC.api('/api/settings/set', { file: 'user', changes: { auto_verify: on ? cmd : '' } })
+    .then((j) => {
+      if (!j.ok) { PDC.toast(j.detail || 'could not change post-edit verification', true); return; }
+      S.status.auto_verify = on ? cmd : '';
+      emit();
+      if (!on) {
+        PDC.toast('Post-edit verify off: auto_verify cleared. The syntax, static and contract gates still run on every edit.');
+      } else {
+        PDC.toast('Post-edit verify on: ' + cmd + ' runs after each Auto task; failures feed the repair rounds.');
+      }
+      refreshState();
+    });
+}
 function setReasoningEffort(level) {  // composer Options bar -> live + user config
   PDC.api('/api/effort', { level: level }).then((j) => {
     if (!j.ok) { PDC.toast(j.detail || 'could not set reasoning effort', true); return; }
@@ -3670,6 +3694,18 @@ function TopBar() {
           <input type="checkbox" checked=${!!s.auto_route_specialties}
                  onChange=${(e) => setAutoRoute(e.target.checked)} />
           <b>\u2726 Auto-route</b>
+        </label>
+        <label class="chip" id="postEditVerifyChip"
+              title=${'Post-edit verification (auto_verify): '
+                + (s.auto_verify ? 'ON \u2014 ' + s.auto_verify : 'off')
+                + '. Detected test command: '
+                + (s.detected_test_command || 'none detected')
+                + '. The syntax, static and interface-contract gates and the scoped'
+                + ' impacted tests always run on every edit; the full suite is this'
+                + ' verify command.'}>
+          <input type="checkbox" checked=${!!s.auto_verify}
+                 onChange=${(e) => setPostEditVerify(e.target.checked)} />
+          <b>Post-edit verify</b>
         </label>
         ${eng.specialist && eng.specialist.profile ? html`<span class="chip" id="specialistChip"
               title=${'Specialist routed: profile \'' + eng.specialist.profile + '\' ('

@@ -204,6 +204,79 @@ def test_tui_slash_commands_end_to_end(tmp_path):
     assert cfg.auto_route_specialties is True
 
 
+def test_tui_verify_detects_sets_reports_and_clears(tmp_path):
+    (tmp_path / "package.json").write_text(
+        '{"scripts": {"test": "node --test"}}\n', encoding="utf-8")
+    cfg = _cfg()
+    session = TuiSession(tmp_path, cfg, headless=True,
+                         stdout=io.StringIO())
+    try:
+        def transcript():
+            return "\n".join(line for _kind, line in session.transcript)
+
+        session._slash("/verify status")
+        text = transcript()
+        assert "Post-edit verify (auto_verify): OFF" in text
+        assert "Static gate (static_gate): ON" in text
+        assert "Repair rounds (auto_repair_rounds): 2" in text
+        assert "Scoped tests:" in text and "test_timeout (300 s)" in text
+        assert "Green ratchet (auto_green_ratchet): ON" in text
+        assert "interface lock (interface_lock): ON" in text
+
+        session._slash("/verify on")
+        assert cfg.auto_verify == "npm test"
+        assert cfg.sources["auto_verify"] == "tui /verify"
+        assert "detected npm test" in transcript()
+
+        session._slash("/verify status")
+        assert "Post-edit verify (auto_verify): ON \u2014 npm test" in transcript()
+
+        session._slash("/verify off")
+        assert cfg.auto_verify == ""
+        assert cfg.sources["auto_verify"] == "tui /verify"
+        assert "OFF \u2014 auto_verify cleared" in transcript()
+
+        # Registered for completion and documented in /help.
+        assert "/verify" in tui_mod._SLASH_COMMANDS
+        assert "/verify [on|off|status]" in tui_mod.HELP_TEXT
+    finally:
+        session.close()
+
+
+def test_tui_verify_on_without_a_detectable_command_stays_empty(tmp_path):
+    cfg = _cfg()
+    session = TuiSession(tmp_path, cfg, headless=True,
+                         stdout=io.StringIO())
+    try:
+        session._slash("/verify on")
+        text = "\n".join(line for _kind, line in session.transcript)
+        assert cfg.auto_verify == ""
+        assert cfg.sources["auto_verify"] == "tui /verify"
+        assert "no test command detected" in text
+        assert "syntax/AST" in text
+        assert "static and interface-contract gates" in text
+        assert "scoped impacted tests" in text
+    finally:
+        session.close()
+
+
+def test_tui_verify_never_writes_config_files(tmp_path):
+    config_file = tmp_path / ".pedacito.toml"
+    config_file.write_text(
+        '[universal]\nmodel = "unchanged"\n', encoding="utf-8")
+    before = config_file.read_bytes()
+    cfg = _cfg()
+    session = TuiSession(tmp_path, cfg, headless=True,
+                         stdout=io.StringIO())
+    try:
+        session._slash("/verify on")
+        session._slash("/verify status")
+        session._slash("/verify off")
+    finally:
+        session.close()
+    assert config_file.read_bytes() == before
+
+
 def test_tui_task_execution_updates_activity_and_telemetry(
         tmp_path, monkeypatch):
     cfg = _cfg()

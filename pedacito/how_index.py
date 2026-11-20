@@ -459,8 +459,9 @@ CLI_COMMANDS = [
             "Slash commands: /help, /keys, /status (/telemetry), /auto GOAL, "
             "/auto! GOAL (force the multi-step loop, skipping the Task-mode "
             "suggestion), /plan, /consolidate (/compact), /profile, /model ID, "
-            "/auto-route, /think, /creative, /apply, /skills, /memory, /procs, "
-            "/diff, /undo, /update, /reset, /sidebar, /scroll, /mouse, /clear, /quit",
+            "/auto-route, /think, /creative, /apply, /verify on|off|status, "
+            "/skills, /memory, /procs, /diff, /undo, /update, /reset, "
+            "/sidebar, /scroll, /mouse, /clear, /quit",
             "/auto GOAL nudges single-pass edits: when the goal looks like a "
             "one-pass Task (existing-file tweaks, localized edit verbs, a "
             "tiny project), the TUI asks 'Run as a single-pass Task instead? "
@@ -2033,6 +2034,9 @@ GUI_TOPICS = [
         "steps": [
             "Composer → Auto → Options → Verify command after each task "
             "(e.g. pytest -q)",
+            "Topbar → Post-edit verify checkbox (or TUI /verify on) detects "
+            "the project runner and stores it in auto_verify; /verify status "
+            "shows the gates, rounds and ratchet",
             "⚙ Settings → All settings → search verify_tests → on; set "
             "test_command if detection guesses wrong",
             "CLI: pedacito auto ... --apply --verify \"pytest -q\"; "
@@ -2646,6 +2650,8 @@ _SETTING_GUI = {
                    "Capabilities → specialties (tag pills + custom tag)",
     "auto_route_specialties": "Topbar → ✦ Auto-route checkbox, or ⚙ Settings "
                               "→ All settings → search auto_route_specialties",
+    "auto_verify": "Topbar → Post-edit verify checkbox, TUI /verify on, or "
+                   "⚙ Settings → All settings → search auto_verify",
     "creative_mode": "✨ Creative button above the composer, or ⚙ Settings → "
                      "All settings → search creative_mode",
     "creative_auto": "⚙ Settings → All settings → search creative_auto "
@@ -2734,7 +2740,8 @@ _SETTING_KEYWORDS = {
     "allow_write": ["write files", "gather write", "allow write"],
     "allow_browser": ["browser", "playwright", "web page", "screenshots"],
     "allow_screenshots": ["screenshot", "screen capture", "vision"],
-    "auto_verify": ["verify command", "run tests after task", "auto verify"],
+    "auto_verify": ["verify command", "run tests after task", "auto verify",
+                    "post-edit verify"],
     "incremental_edit_loop": ["small model edits", "incremental edit",
                               "symbol edits"],
     "edit_plan_brief": ["edit plan", "brief before edits"],

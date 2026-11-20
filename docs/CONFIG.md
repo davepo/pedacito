@@ -645,6 +645,42 @@ run for hosted endpoints: both explicit paths (`pdc profile --run` and `/profile
 refuse with a "hosted model — refusing to probe" message before sending a request, and
 the automatic post-load probe is skipped for a hosted URL.
 
+## Verification tiers and the `auto_verify` family
+
+Every applied edit passes up to three verification tiers, cheapest first. The
+first two are deterministic and need no model call; the third is the command
+you choose.
+
+| Tier | What runs | Bounds and defaults |
+|---|---|---|
+| 1. Syntax / static gate | Changed Python files are checked for syntax (`E999`) and undefined names / bad `__all__` entries / misplaced imports (`F821`, `F822`, `F823`, `F402`, `F404`) with `ruff`; a built-in AST resolver takes over when ruff is missing, fails, or exceeds its ceiling. Pre-existing findings are baselined out, so only errors this edit introduced feed repair. | `static_gate = true`; `static_gate_timeout = 3.0` seconds for one ruff run. |
+| 2. Scoped impacted tests | `testsel.run_impacted` selects tests from the import graph (tests named after the changed file, tests of its importers/callers, direct importers) and runs a narrowed `pytest FILE...` / `npm test -- FILE...` / `go test ./dir/...`. | Runs after edits when `verify_tests = true` and the test subprocess is allowed (`allow_shell` or a user-granted test command); one run is bounded by `test_timeout = 300` seconds. |
+| 3. Full suite | Your verify command runs after each Auto task (or once at the end with `auto_verify_final`), and its failure output feeds the repair rounds. The full suite is deliberately never selected automatically. | `auto_verify = ""` (off) is a **command string**, never a bool; `auto_repair_rounds = 2`; `auto_verify_rounds = 2` for post-run runtime verification. |
+
+`auto_verify` is the command the GUI's **Post-edit verify** checkbox and the
+TUI's `/verify on` turn on (both first try
+`testsel.detect_test_command`, and leave the key empty when no runner is
+evident). `auto_verify_final = true` defers that command to the plan's last
+unchecked task, so a whole-goal check cannot roll back valid partial fixes.
+`auto_repair_rounds` caps fix rounds per failing per-task check;
+`auto_verify_rounds` caps the runtime verification performed after an
+`auto --apply` run.
+
+`auto_verify` and `test_command` are execution settings: in a project's
+`.pedacito.toml` they are honored only after `pedacito trust` (see
+[SECURITY.md](SECURITY.md#project-config-is-not-trusted-by-default)).
+
+The tiers connect to two existing guards:
+
+- **Green ratchet** (`auto_green_ratchet = true`): before each Auto step the
+  source is snapshotted; a step still failing after its repair rounds is
+  rolled back exactly, so later steps build only on the last verified-green
+  workspace. `auto_keep_checkpoints = 25` verified-green snapshots are kept.
+- **Interface lock** (`interface_lock = true`): the project's public signatures
+  are injected into every Auto task, and a deterministic cross-file contract
+  check (local import existence and call arity) runs after each edit before
+  the test subprocess.
+
 ## Configuration reference
 
 `pedacito config` lists every setting with its value and origin; `pedacito
@@ -709,7 +745,13 @@ config --reference` prints the annotated template. Key settings:
 | `repo_brief` / `max_brief_tokens` | true / 500 | Deterministic orientation block above the map. |
 | `verify_answer` | `"deterministic"` | `off` / `deterministic` / `full`: check edits before writing them. |
 | `best_of` | 1 | Sample N candidate edit replies and keep the best-scoring one. |
-| `verify_tests` / `test_command` | false / `""` | Run impacted tests after applied edits (needs `allow_shell`). |
+| `verify_tests` / `test_command` | false / `""` | Run impacted tests after applied edits (needs `allow_shell`); `test_command` is the runner detection override. |
+| `auto_verify` | `""` | Command string run after each Auto task; a failure feeds its output back for repair. Empty = off; never a bool. The TUI `/verify on` and GUI **Post-edit verify** detect and fill it. |
+| `auto_verify_final` | false | Run `auto_verify` once after the plan's last unchecked task instead of after every task (useful when the whole suite cannot pass mid-plan). |
+| `auto_repair_rounds` / `auto_verify_rounds` | 2 / 2 | Repair rounds per failing per-task check; runtime-verification rounds after an `auto --apply` run. |
+| `static_gate` / `static_gate_timeout` | true / 3.0 | Changed Python files get a ruff-or-AST static check (new errors only) before any test subprocess; seconds allowed for one ruff run. |
+| `auto_green_ratchet` / `auto_keep_checkpoints` | true / 25 | Snapshot each Auto step and roll a step that still fails after repair back to the last verified-green workspace; verified-green snapshots kept per project. |
+| `interface_lock` | true | Inject public signatures into Auto tasks and gate each edit on local import existence and call arity. |
 | `verify_dom` / `dom_entry` / `dom_timeout` | false / `""` / 45 | Headless DOM smoke check after applied web edits (needs `allow_shell` and the optional Playwright install): load the entry page in headless Chromium, prove the module graph mounts, and diff the mounted surface against a pre-edit snapshot. `dom_entry` overrides the detected entry HTML; `dom_timeout` caps one page load in seconds. `ask --verify-dom` flips it per run; `pedacito domcheck` runs it on demand. |
 | `auto_smoke` / `auto_smoke_timeout` | true / 20 | After an `auto --apply` run, exercise the project once (the `--verify` command and/or a boot of its Python entry points) and feed a failure back for repair. `verify: passed` proves the project BOOTS -- it is not the test suite; end plans with a run-the-tests task or pass `--verify`. |
 | `use_memory` / `use_skills` | true | Push memory, rules, and the skills catalog. |

@@ -4,6 +4,28 @@ All notable changes to Pedacito (`pdc`) are documented here.
 
 ## v0.3.1 — 2026-11-18
 
+### Post-Edit Verification Controls
+
+- **TUI `/verify on|off|status`** — `on` detects the project's test runner
+  (`testsel.detect_test_command`) and fills an empty `auto_verify` command
+  string, `off` clears it, and `status` reports the command, static gate,
+  repair rounds, scoped-test behavior, green ratchet and interface lock.
+  Session-only, like the existing `/think` and `/apply` toggles, with a
+  `cfg.sources` entry. Registered in the slash-command list and `/help`.
+- **GUI “Post-edit verify” checkbox** — sits beside the ✦ Auto-route toggle
+  and writes `auto_verify` through the existing `/api/settings/set` plumbing,
+  using the same detect-assist on enable. Its tooltip shows the detected test
+  command, and `/api/state` now exposes `auto_verify` (the command string) and
+  `detected_test_command` so the checkbox reflects the live config.
+- **Unchanged gates** — `static_gate`/`static_gate_timeout`, `test_timeout`,
+  `auto_repair_rounds`, `auto_verify_rounds`, `auto_green_ratchet` and
+  `interface_lock` keep their existing defaults and behavior; no boolean
+  `auto_verify` key was added.
+- Docs: CONFIG's verification-tier section and reference rows, USAGE's
+  three-tier description with the real 3 s/`test_timeout`/verify-command
+  boundaries, and tests for both surfaces plus byte-identical untouched
+  configs.
+
 ### Advanced System Profiling & Model Auto-Tuning
 
 - **`pedacito/profiler.py`** — a vendor-neutral snapshot layered over the

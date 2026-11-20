@@ -23,9 +23,10 @@ under a lock.
 
 Slash commands mirror `pedacito chat` and add the TUI-specific panes:
 `/help`, `/status` (`/telemetry`), `/auto`, `/plan`, `/consolidate`
-(`/compact`), `/profile`, `/auto-route`, `/think`, `/apply`, `/skills`,
-`/memory`, `/procs`, `/diff`, `/checkpoints`, `/undo`, `/checkout`, `/run`,
-`/fix`, `/update`, `/reset`, `/sidebar`, `/clear`, and `/quit` (`/exit`).
+(`/compact`), `/profile`, `/auto-route`, `/think`, `/apply`, `/verify`,
+`/skills`, `/memory`, `/procs`, `/diff`, `/checkpoints`, `/undo`, `/checkout`,
+`/run`, `/fix`, `/update`, `/reset`, `/sidebar`, `/clear`, and `/quit`
+(`/exit`).
 """
 
 from __future__ import annotations
@@ -60,6 +61,7 @@ from . import security
 from . import select as select_mod
 from . import servers as servers_mod
 from . import skills as skills_mod
+from . import testsel
 from . import themes as themes_mod
 from . import update as update_mod
 from . import workspace
@@ -129,7 +131,7 @@ _SLASH_COMMANDS = [
     "/help", "/keys", "/status", "/telemetry", "/new", "/auto", "/auto!", "/plan",
     "/consolidate", "/compact", "/profile", "/profiles", "/model",
     "/auto-route", "/think", "/effort", "/creative", "/servers", "/unload",
-    "/apply", "/skills", "/memory", "/procs", "/security", "/theme",
+    "/apply", "/verify", "/skills", "/memory", "/procs", "/security", "/theme",
     "/pin", "/rules", "/hybrid", "/arena",
     "/diff", "/checkpoints", "/undo", "/checkout", "/run", "/fix",
     "/update",
@@ -205,6 +207,9 @@ Pedacito TUI commands
   /theme [NAME]             list color themes, or switch to NAME and save it
                             (shared with the GUI Theme Manager)
   /apply [on|off]           write edits to disk, or preview them
+  /verify [on|off|status]   post-edit verification: on detects the project's
+                            test command, off clears it, status shows the
+                            gates, repair rounds and ratchet
   /skills [list|show NAME|draft TEXT]
   /memory [list|add FACT|forget TEXT]
   /procs [list|logs NAME|stop NAME]
@@ -2857,6 +2862,9 @@ class TuiSession:
         if cmd == "apply":
             self._apply_toggle(arg)
             return
+        if cmd == "verify":
+            self._verify(arg)
+            return
         if cmd == "skills":
             self._skills(arg)
             return
@@ -3573,6 +3581,86 @@ class TuiSession:
             return
         self._append(f"Writes: {'ON' if self.apply else 'off (dry run)'}",
                      "system")
+
+    def _verify(self, arg: str) -> None:
+        """`/verify [on|off|status]`: control the post-edit verification
+        command without touching the always-on cheap gates. `on` fills an
+        empty `auto_verify` from the project's detected test command."""
+        value = arg.strip().lower()
+        cfg = self.cfg
+        if value in ("", "status", "show"):
+            cmd = str(getattr(cfg, "auto_verify", "") or "").strip()
+            static = bool(getattr(cfg, "static_gate", True))
+            static_s = float(getattr(cfg, "static_gate_timeout", 3.0) or 0.0)
+            repair = int(getattr(cfg, "auto_repair_rounds", 2) or 0)
+            rounds = int(getattr(cfg, "auto_verify_rounds", 2) or 0)
+            final = bool(getattr(cfg, "auto_verify_final", False))
+            ratchet = bool(getattr(cfg, "auto_green_ratchet", True))
+            lock = bool(getattr(cfg, "interface_lock", True))
+            timeout = int(getattr(cfg, "test_timeout", 300) or 300)
+            self._append("\n".join([
+                "Post-edit verify (auto_verify): "
+                + (f"ON \u2014 {cmd}" if cmd
+                   else "OFF (auto_verify is empty)"),
+                f"Static gate (static_gate): {'ON' if static else 'OFF'} "
+                f"(ruff or AST fallback, {static_s:g} s, new errors only)",
+                f"Repair rounds (auto_repair_rounds): {repair}; runtime "
+                f"verification rounds (auto_verify_rounds): {rounds}"
+                + ("; final-only (auto_verify_final)" if final else ""),
+                "Scoped tests: import-graph impacted tests only "
+                f"(testsel.run_impacted), bounded by test_timeout "
+                f"({timeout} s); the full suite is the verify command",
+                f"Green ratchet (auto_green_ratchet): "
+                f"{'ON' if ratchet else 'OFF'} (rolls back a failed Auto "
+                f"step); interface lock (interface_lock): "
+                f"{'ON' if lock else 'OFF'}",
+            ]), "system")
+            return
+        if value in ("on", "true", "yes", "1"):
+            cmd = str(getattr(cfg, "auto_verify", "") or "").strip()
+            if cmd:
+                self._append(f"Post-edit verify: ON \u2014 {cmd}", "system")
+                return
+            detected = ""
+            try:
+                detected = str(testsel.detect_test_command(
+                    self.root, cfg) or "").strip()
+            except Exception:
+                detected = ""
+            if detected:
+                cfg.auto_verify = detected
+                try:
+                    cfg.sources["auto_verify"] = "tui /verify"
+                except Exception:
+                    pass
+                self._append(
+                    f"Post-edit verify: ON \u2014 detected {detected}",
+                    "system")
+            else:
+                cfg.auto_verify = ""
+                try:
+                    cfg.sources["auto_verify"] = "tui /verify"
+                except Exception:
+                    pass
+                self._append(
+                    "Post-edit verify: no test command detected; auto_verify "
+                    "stays empty.\nThe syntax/AST, static and "
+                    "interface-contract gates and the scoped impacted tests "
+                    "still run on every edit. Set test_command or auto_verify "
+                    "in config.toml to add a full-suite check.", "system")
+            return
+        if value in ("off", "false", "no", "0"):
+            cfg.auto_verify = ""
+            try:
+                cfg.sources["auto_verify"] = "tui /verify"
+            except Exception:
+                pass
+            self._append(
+                "Post-edit verify: OFF \u2014 auto_verify cleared. The "
+                "syntax/AST, static and interface-contract gates and the "
+                "scoped impacted tests still run on every edit.", "system")
+            return
+        self._append("Usage: /verify on|off|status", "error")
 
     def _skills(self, arg: str) -> None:
         words = arg.split(None, 1)

@@ -478,6 +478,12 @@ class State:
         # switch guard reads it; the topbar picker gets it from the response.
         self.profile_availability: dict[str, str] = {}
 
+        # Last detected project test command for the topbar's Post-edit
+        # verify tooltip. /api/state polls once a second, so the walk of
+        # test-file globs and runner probes is cached briefly by
+        # (root, test_command).
+        self._detect_test: tuple[str, str, str, float] = ("", "", "", 0.0)
+
         self.messages: list[dict] = []
         self._mid = 0
         self.term = ""
@@ -695,6 +701,32 @@ class State:
             self._global_cfg = cfg
             self._global_cfg_stamp = stamp
         return cfg
+
+    def detected_test_command(self) -> str:
+        """The project's detected test command (no run), for the GUI's
+        Post-edit verify tooltip. Empty without a project or a detectable
+        runner. Cached briefly so the once-a-second /api/state poll does not
+        re-walk the test tree."""
+        with self.lock:
+            root, cfg = self.root, self.cfg
+        if root is None:
+            return ""
+        explicit = str(getattr(cfg, "test_command", "") or "")
+        key = (str(root), explicit)
+        now = time.time()
+        with self.lock:
+            cached = self._detect_test
+        if cached[0] == key[0] and cached[1] == key[1] \
+                and now - cached[3] < 10.0:
+            return cached[2]
+        try:
+            from .. import testsel
+            cmd = str(testsel.detect_test_command(root, cfg) or "")
+        except Exception:
+            cmd = ""
+        with self.lock:
+            self._detect_test = (key[0], key[1], cmd, now)
+        return cmd
 
     def scratchpad_path(self) -> Path:
         """A per-user, project-less workspace for New-mode prompt refinement.
@@ -1703,6 +1735,9 @@ class State:
                 root, cfg, use_cache=True)
         except Exception:
             security_payload = security.security_status(None, cfg)
+        # Runner detection walks test files, so it runs here, outside the
+        # state lock; the value only feeds the topbar tooltip/assist.
+        detected_cmd = self.detected_test_command()
         with self.lock:
             meta = self.index_meta
             indexed = idx is not None or meta["indexed"]
@@ -1881,6 +1916,12 @@ class State:
                 # specialist routing (#50): the topbar toggle's state
                 "auto_route_specialties": (bool(cfg.auto_route_specialties)
                                            if cfg else False),
+                # Post-edit verify: auto_verify is a COMMAND string, so the
+                # topbar checkbox is on exactly when it is non-empty. The
+                # detected command feeds the tooltip and the enable-assist.
+                "auto_verify": (str(getattr(cfg, "auto_verify", "") or "")
+                                if cfg else ""),
+                "detected_test_command": detected_cmd,
                 "usage": {
                     "calls": stats.get("calls", 0),
                     "tokens_in": stats.get("prompt_tokens", 0),

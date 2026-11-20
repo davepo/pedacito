@@ -11,6 +11,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from pedacito import config
 from pedacito.config import ConfigError
+from pedacito.gui import core
 from pedacito.gui import settings as S
 from pedacito.gui import settings_api
 from test_gui import gui as _shared_gui  # noqa: F401  (pytest re-export)
@@ -590,6 +591,64 @@ def test_profile_reasoning_overrides_persist(gui):
         "file": "user", "profile": "default",
         "changes": {"prompt_pack": "giant"}})
     assert status == 400 and "prompt_pack must be one of" in j["detail"]
+
+
+def test_post_edit_verify_round_trips_auto_verify(gui):
+    """The Options-bar checkbox writes the COMMAND string, never a bool, and
+    /api/state reports it back so the checkbox reflects reality."""
+    _config(gui)
+    items = {i["name"]: i for i in S.schema()}
+    assert items["auto_verify"]["type"] == "str"
+
+    status, body = gui.post("/api/settings/set", {
+        "file": "user", "changes": {"auto_verify": "npm test"}})
+    assert status == 200 and body["ok"], body
+    text = gui.cfg_path.read_text(encoding="utf-8")
+    assert 'auto_verify = "npm test"' in text
+    _status, state = gui.get("/api/state")
+    assert state["auto_verify"] == "npm test"
+    assert state["detected_test_command"] == ""   # scratchpad: no project
+
+    status, body = gui.post("/api/settings/set", {
+        "file": "user", "changes": {"auto_verify": ""}})
+    assert status == 200 and body["ok"], body
+    assert 'auto_verify = ""' in gui.cfg_path.read_text(encoding="utf-8")
+    assert gui.get("/api/state")[1]["auto_verify"] == ""
+
+
+def test_config_without_auto_verify_is_untouched(gui):
+    """Old configs gain no key from a state poll or an unrelated edit."""
+    gui.cfg_path.parent.mkdir(parents=True, exist_ok=True)
+    gui.cfg_path.write_text('[universal]\nmodel = "m"\n', encoding="utf-8")
+    before = gui.cfg_path.read_bytes()
+    assert gui.get("/api/state")[0] == 200
+    assert gui.cfg_path.read_bytes() == before
+    status, body = gui.post("/api/settings/set", {
+        "file": "user", "changes": {"temperature": 0.3}})
+    assert status == 200 and body["ok"], body
+    assert "auto_verify" not in gui.cfg_path.read_text(encoding="utf-8")
+
+
+def test_state_exposes_the_detected_test_command(gui):
+    """The checkbox tooltip/enable-assist reads the detected runner from the
+    same state payload as auto_verify."""
+    root = gui.tmp / "detect-proj"
+    root.mkdir()
+    (root / "package.json").write_text(
+        '{"scripts": {"test": "node --test"}}\n', encoding="utf-8")
+    with core.STATE.lock:
+        core.STATE.root = root
+        core.STATE.cfg = config.Config()
+        core.STATE._detect_test = ("", "", "", 0.0)
+    try:
+        state = gui.get("/api/state")[1]
+        assert state["detected_test_command"] == "npm test"
+        assert state["auto_verify"] == ""
+    finally:
+        with core.STATE.lock:
+            core.STATE.root = None
+            core.STATE.cfg = None
+            core.STATE._detect_test = ("", "", "", 0.0)
 
 
 # --- Pre-configured hosted provider profiles -----------------------------------

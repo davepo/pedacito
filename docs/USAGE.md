@@ -440,12 +440,14 @@ MCP tool, sensitive file read or shell command asks in the prompt bar:
 Slash commands: `/help`, `/keys`, `/status` (`/telemetry`), `/auto GOAL`,
 `/plan [GOAL]`, `/consolidate` (`/compact`), `/profile [NAME]`, `/model ID`,
 `/auto-route [on|off]`, `/think [on|off]`, `/creative [on|off|auto]`,
-`/apply [on|off]`, `/skills`,
+`/apply [on|off]`, `/verify on|off|status`, `/skills`,
 `/memory`, `/procs`, `/diff`, `/undo`, `/reset`, `/sidebar`, `/scroll
 up|down|top|bottom|N`, `/mouse [on|off]`, `/clear`, `/quit`. A plain line is a
 task and runs through the normal gather/edit/verify loop. `/creative on` forces
 the Builder persona for every task, `auto` (the default) detects design tasks,
-`off` keeps surgical edits everywhere; `/status` shows the current state.
+`off` keeps surgical edits everywhere; `/verify` controls the post-edit
+verification command (see [the three tiers](#the-three-verification-tiers-as-shipped));
+`/status` shows the current state.
 
 ### `rpc`: drive pedacito from an editor or another agent
 
@@ -592,6 +594,43 @@ Three more guards run without a model call:
   files it created are removed. The next step starts from the last passing state,
   and the Activity log says `ROLLED BACK`. See
   [../TECHNIQUES.md §18–§20](../TECHNIQUES.md#18-contract-first-interface-locking--cross-file-verification).
+
+#### The three verification tiers, as shipped
+
+Edits move through three tiers, cheapest first:
+
+1. **Syntax and static gate (in-process, no model call).** The edited Python
+   files are parsed, then checked with `ruff` rules `F821`, `F822`, `F823`,
+   `F402`, `F404` and `E999`; a built-in AST resolver takes over when ruff is
+   missing, fails, or exceeds its ceiling. The ceiling is
+   **`static_gate_timeout = 3.0` seconds** for one ruff run. Only findings the
+   edit introduced are reported: the project's pre-edit state is the baseline,
+   so old breakage never vetoes a new task. `auto_heal_imports = true` inserts
+   the one import that provably fixes a new undefined name before the model is
+   asked.
+2. **Scoped impacted tests.** When `verify_tests = true` and the test
+   subprocess is allowed (`allow_shell`, or a user-granted test command such as
+   `auto_verify`/`test_command`), the import graph selects the tests a change
+   can break — tests named after the file, tests of its importers/callers, and
+   direct importers — and runs a narrowed `pytest FILE...`, `npm test --
+   FILE...` or `go test ./dir/...`. One run is bounded by **`test_timeout =
+   300` seconds**. The full suite is deliberately not run here.
+3. **The full suite is your verify command.** `auto_verify` (or `--verify` on
+   one run) is the user-chosen command run after each Auto task; with
+   `auto_verify_final = true` it runs once after the last unchecked task
+   instead. A failure feeds its output into **`auto_repair_rounds = 2`** fix
+   rounds. After an `auto --apply` run, **`auto_verify_rounds = 2`** bounds the
+   runtime verification. The key is a command string: empty means off.
+
+The TUI's `/verify on|off|status` and the GUI's **Post-edit verify** checkbox
+(plus the Auto Options → verify command field) control tier 3. `on` leaves an
+existing command alone; with an empty `auto_verify` it first asks
+`testsel.detect_test_command` for the project's runner and reports what it
+found. When nothing is detectable the command stays empty, while tiers 1 and 2
+and the interface lock still run. The green ratchet
+(`auto_green_ratchet = true`) rolls a failed Auto step back to the last
+verified-green snapshot, and `interface_lock = true` checks cross-file imports
+and call arity after every edit.
 
 `--worktree NAME` runs in `.pedacito/worktrees/NAME` on a `pedacito/NAME`
 branch, leaving your checkout untouched. Manage worktrees directly with
