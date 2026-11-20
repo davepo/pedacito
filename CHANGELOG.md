@@ -240,6 +240,16 @@ All notable changes to Pedacito (`pdc`) are documented here.
   (case-insensitive), plus `GITHUB_TOKEN` and `PYPI_API_KEY`, are dropped from
   the child environment before the process starts.
 
+### Bundled Safe Commit Skill
+
+- **`safe-git-commit`** — a nineteenth bundled skill for commit requests:
+  inspect the uncommitted diff with `git_diff`, match the repo's message style
+  with read-only `git log`, stage only the files the task touched, and hand the
+  user the exact `git add` / `git commit` / `git push` commands because the
+  sandbox keeps `.git` read-only. It forbids destructive git commands in favour
+  of `pdc undo` and checkpoints, and says so plainly when git is missing or the
+  project is not a repository — git remains optional.
+
 ## v0.3.0 — 2026-11-18
 
 The release built around **time travel, live feedback and two-model

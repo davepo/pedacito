@@ -1352,7 +1352,7 @@ CLI_COMMANDS = [
         "name": "skills",
         "usage": "pedacito skills [list | show NAME | add NAME | draft "
                  "\"PROMPT\" | rm NAME] [PROJECT] [--global]",
-        "summary": "Browse and manage the skill library: eighteen bundled "
+        "summary": "Browse and manage the skill library: nineteen bundled "
                    "starters plus your own user/project skills. list (the "
                    "default) shows every skill with its scope badge; show "
                    "prints one skill's triggers and checklist; add writes a "
@@ -1886,7 +1886,7 @@ GUI_TOPICS = [
             "Project ▾ → Memory & repo lessons…: list, add or forget "
             "remembered facts (this project or all projects) and read the "
             "repair lessons; the same store as pedacito memory",
-            "Project ▾ → Skills library & creator…: browse the eighteen "
+            "Project ▾ → Skills library & creator…: browse the nineteen "
             "built-in starters plus user/project skills, preview a task's "
             "trigger matches, and write or auto-draft custom skills "
             "(pedacito skills)",
@@ -1917,7 +1917,7 @@ GUI_TOPICS = [
         "id": "skills-library",
         "title": "Skills library & creator: browse, match, write skills",
         "summary": "Project ▾ → Skills library & creator… (also ⚙ Settings → "
-                   "Quick links) browses the eighteen built-in starters plus "
+                   "Quick links) browses the nineteen built-in starters plus "
                    "your user and project skills, previews which checklists "
                    "a task injects, and creates custom skills by hand or "
                    "with a model draft.",

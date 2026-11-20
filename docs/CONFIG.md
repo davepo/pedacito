@@ -401,14 +401,14 @@ edit or delete:
   `.pedacito/skills/NAME.md`, and the same two layouts under `skills/` next to
   your config). The model sees a one-line catalog and loads a skill's text only
   when it needs it; additionally, the top-2 trigger matches for a task are
-  injected up front, capped at 1,200 chars of checklist text. Eighteen starters
+  injected up front, capped at 1,200 chars of checklist text. Nineteen starters
   ship built in: `add-a-test`, `fix-a-failing-test`, `refactor-safely`,
   `review-my-diff`, `find-dead-code`, `surgical-symbol-edit`,
   `frontend-dom-audio-debug`, `safe-multi-file-rename`, `fastapi-rest-endpoint`,
   `canvas-svg-2d-3d`, `sqlite-sql-migrations`, `async-concurrency-safety`,
   `security-ssrf-xss-hardening`, `i18n-localization-catalog`,
   `parser-lexer-state-machine`, `performance-memory-profiling`,
-  `modern-web-design-ui` and `desktop-gui-and-games`.
+  `modern-web-design-ui`, `desktop-gui-and-games` and `safe-git-commit`.
   `pedacito skills list` shows them all with a scope badge (bundled / user /
   project). Skills are prompt text, nothing in a skill folder is ever executed.
 - **Custom skills** are yours to write: `pedacito skills add NAME

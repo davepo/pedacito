@@ -19,7 +19,7 @@ A skill is a markdown file with frontmatter:
 
 Search order (first name wins): `<root>/.pedacito/skills/<name>/SKILL.md` or
 `<root>/.pedacito/skills/<name>.md`, the same two layouts under
-`<config dir>/skills/`, then the bundled library of eighteen starters. The
+`<config dir>/skills/`, then the bundled library of nineteen starters. The
 catalog costs a few dozen tokens; a skill's text enters the conversation only
 when the model asks for it (or `select_skills` matches its triggers, capped at
 two skills / 1,200 chars so a prompt never bloats). Skills are PROMPT TEXT:
@@ -309,6 +309,19 @@ BUILTIN_SKILLS: dict[str, tuple[str, str, tuple[str, ...]]] = {
         ("calculator", "tkinter", "pyqt", "pyside", "gui", "game", "pygame",
          "arcade", "snake", "pong", "tetris", "breakout", "asteroids",
          "sprite", "keypad")),
+    "safe-git-commit": (
+        "Inspect changes and prepare a safe commit the user can run",
+        "1. `git_diff` for status + uncommitted diff; `git` with `log -n 8` to "
+        "match the repo's commit-message style.\n"
+        "2. Commit or push only when the user explicitly asks; stage only files "
+        "this task touched.\n"
+        "3. `.git` is read-only in the sandbox: never run git writes yourself -- "
+        "hand the user the exact `git add ...` / `git commit -m \"...\"` / "
+        "`git push` commands.\n"
+        "4. Never `reset --hard`, `clean`, `push --force`; undo agent edits with "
+        "`pdc undo` or checkpoints instead.\n"
+        "5. Git missing or not a repo: say so, continue without it.",
+        ("commit", "git", "stage", "push", "message")),
 }
 
 # Historical name kept for callers and drift guards that say "bundled".

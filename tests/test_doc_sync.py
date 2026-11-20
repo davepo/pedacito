@@ -144,7 +144,7 @@ def test_hosted_probe_claim_matches_the_code(monkeypatch):
 
 
 def test_bundled_skills_are_valid_and_loadable(tmp_path):
-    assert len(skills.BUNDLED) == 18
+    assert len(skills.BUNDLED) == 19
     for name, (desc, body, triggers) in skills.BUNDLED.items():
         assert skills._NAME_RE.match(name), name
         assert desc.strip(), name
@@ -164,13 +164,14 @@ def test_bundled_skills_are_valid_and_loadable(tmp_path):
 
 
 def test_second_eight_bodies_stay_crisp():
-    """The domain checklists added in the 8->16 pass keep the <=550-char
-    body budget, and every built-in declares usable triggers."""
+    """The domain checklists added in the 8->16 pass, and later bundled
+    additions, keep the <=550-char body budget, and every built-in declares
+    usable triggers."""
     second = ("fastapi-rest-endpoint", "canvas-svg-2d-3d",
               "sqlite-sql-migrations", "async-concurrency-safety",
               "security-ssrf-xss-hardening", "i18n-localization-catalog",
               "parser-lexer-state-machine", "performance-memory-profiling")
-    for name in second:
+    for name in second + ("safe-git-commit",):
         desc, body, triggers = skills.BUNDLED[name]
         assert len(body) <= skills.MAX_BUILTIN_BODY_CHARS, \
             f"{name}: {len(body)} chars"
@@ -178,7 +179,7 @@ def test_second_eight_bodies_stay_crisp():
 
 
 def test_readme_names_every_bundled_skill():
-    assert "Eighteen starters" in README
+    assert "Nineteen starters" in README
     for name in skills.BUNDLED:
         assert f"`{name}`" in README, f"README does not name skill {name}"
 
