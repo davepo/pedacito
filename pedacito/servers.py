@@ -307,6 +307,25 @@ def _kind_for(name: str, provider: str, base_url: str) -> str:
     return "custom"
 
 
+def _active_provider(config, profiles, active_profile: str) -> str:
+    """The active profile's own provider/server_type, when it has one.
+
+    The active profile is expanded into the config on load, but a hand-built
+    Config (and some GUI paths) carries only cfg.base_url/model. Prefer the
+    profile body's explicit key, then the config's, then let the caller's
+    name fallback classify the server as before."""
+    body = (profiles.get(active_profile)
+            if isinstance(profiles, dict) and active_profile else None)
+    for source in (body, config):
+        if source is None:
+            continue
+        value = str(_mapping_get(source, "provider", "")
+                    or _mapping_get(source, "server_type", "") or "")
+        if value.strip():
+            return value.strip().lower()
+    return ""
+
+
 def configured_local_servers(config) -> list[dict]:
     """Every distinct local endpoint named by the active config or its
     profiles. One entry per normalized URL; the model ids and profile names
@@ -317,7 +336,7 @@ def configured_local_servers(config) -> list[dict]:
     active_profile = str(_mapping_get(config, "active_profile", "") or "")
     servers: dict[str, dict] = {}
 
-    def add(name: str, body, active: bool = False):
+    def add(name: str, body, active: bool = False, provider_hint: str = ""):
         base = str(_mapping_get(body, "base_url", "") or "")
         if not base:
             # A profile that only names a model lives on the config's server.
@@ -326,7 +345,7 @@ def configured_local_servers(config) -> list[dict]:
             return
         key = normalize_url(base)
         if key not in servers:
-            provider = _provider_of(name, body)
+            provider = provider_hint or _provider_of(name, body)
             servers[key] = {
                 "name": name or _host(base) or "local",
                 "provider": provider,
@@ -364,7 +383,8 @@ def configured_local_servers(config) -> list[dict]:
                 rec["unload_cmd"] = str(
                     _mapping_get(config, "unload_cmd", "") or "")
 
-    add(active_profile or "active", config, active=True)
+    add(active_profile or "active", config, active=True,
+        provider_hint=_active_provider(config, profiles, active_profile))
     for name, body in profiles.items():
         if isinstance(body, dict):
             add(str(name), body)

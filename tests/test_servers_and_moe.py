@@ -593,6 +593,40 @@ def test_evict_other_local_servers_skips_pinned_residents(monkeypatch):
     assert "lemonade2 (pinned: stay)" in reasons
 
 
+def test_active_profile_provider_sets_the_server_record_kind(monkeypatch):
+    """The active profile is expanded into cfg, but a hand-built config (and
+    the GUI's profile switch) may carry only cfg.base_url/model. Its own
+    provider key must still classify the record; the name is not a runtime."""
+    monkeypatch.setattr(
+        servers.requests, "get",
+        lambda url, headers=None, timeout=None:
+        SimpleNamespace(status_code=200, json=lambda: {"data": [
+            {"id": "qwen3-8b", "loaded_in_memory": True}]}))
+    cfg = _cfg_with({
+        "proxy": {"base_url": "http://127.0.0.1:8000/v1",
+                  "model": "qwen3-8b", "provider": "lemonade"},
+    }, active="proxy")
+    state = servers.list_server_states(cfg)[0]
+    assert state["name"] == "proxy"
+    assert state["provider"] == "lemonade"
+    assert state["kind"] == "lemonade"
+
+
+def test_active_profile_without_provider_keeps_the_synthesized_kind(monkeypatch):
+    monkeypatch.setattr(
+        servers.requests, "get",
+        lambda url, headers=None, timeout=None:
+        SimpleNamespace(status_code=200, json=lambda: {"models": [
+            {"id": "qwen3.8-flash"}]}))
+    cfg = _cfg_with({
+        "strata": {"base_url": "http://127.0.0.1:8001/v1",
+                   "model": "qwen3.8-flash"},
+    }, active="strata")
+    state = servers.list_server_states(cfg)[0]
+    assert state["provider"] == "strata"       # name fallback, unchanged
+    assert state["kind"] == "strata"
+
+
 def test_list_server_states_reads_lemonade_pins_from_health(monkeypatch):
     """`/v1/models` has no pin flag; the health endpoint carries it. The
     probe exposes the pinned resident ids for the evict handshake."""
