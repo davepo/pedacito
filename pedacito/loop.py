@@ -310,7 +310,8 @@ def _is_noop_verify_item(task: str) -> bool:
     return (task or "").strip().lower().startswith(_NOOP_VERIFY_PREFIXES)
 
 
-def _noop_verify_already_green(root: Path, task: str, verify: str) -> bool:
+def _noop_verify_already_green(root: Path, task: str, verify: str,
+                               cfg=None) -> bool:
     """Objective disk evidence that a no-op verification item is already
     satisfied: webcheck finds nothing, the configured verify command (the
     tests) passes, and no requirement of the title is still owed on disk.
@@ -326,7 +327,7 @@ def _noop_verify_already_green(root: Path, task: str, verify: str) -> bool:
         return False
     gate_ran = bool(htmls or jss)
     if verify:
-        ok, _out = run_verify(root, verify)
+        ok, _out = run_verify(root, verify, cfg=cfg)
         if not ok:
             return False
         gate_ran = True
@@ -5262,16 +5263,11 @@ def run_loop(root: Path, cfg, client, idx, plan_path: Path, *,
                 # is not due yet. Return as passed; the cheap gates inside
                 # _gated_check still vetoed this step before we got here.
                 return True, ""
-            # Call positionally: existing callers (and tests) monkeypatch
-            # run_verify with a two-argument callable. Record the outcome here,
-            # where cfg is available, rather than threading it into the call.
-            ok, out = run_verify(root, verify)
+            # cfg rides along so the check gets the configured environment
+            # (env_passthrough / scrub_env) and run_verify records the outcome
+            # in project memory exactly once.
+            ok, out = run_verify(root, verify, cfg=cfg)
             final_state["ran"] = True
-            try:
-                from . import memory
-                memory.observe_command(root, verify, ok, cfg, kind="test")
-            except Exception:
-                pass
             return ok, out
         if use_diag:
             return diagnostics.run_changed(root, cfg, changed)
@@ -5330,7 +5326,7 @@ def run_loop(root: Path, cfg, client, idx, plan_path: Path, *,
             break
         _, task = nxt
         if _is_noop_verify_item(task) and \
-                _noop_verify_already_green(root, task, verify):
+                _noop_verify_already_green(root, task, verify, cfg):
             # A "Run tests / Verify the page" re-check the planner should
             # not have emitted: the loop already verified after every edit
             # task, and the disk evidence says nothing is owed. Tick it
@@ -6046,7 +6042,7 @@ def run_loop(root: Path, cfg, client, idx, plan_path: Path, *,
         # inside the loop, so pay for it once now, for the record. Repair
         # and exit-code responsibility after the loop stays with the
         # caller (auto's post-run verification pass).
-        ok, out = run_verify(root, verify)
+        ok, out = run_verify(root, verify, cfg=cfg)
         print(f"  [final-only check was not reached inside the loop; running "
               f"`{verify}` once for the record: "
               f"{'passed' if ok else 'FAILED'}]", file=sys.stderr)

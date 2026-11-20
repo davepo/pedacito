@@ -1037,7 +1037,7 @@ def _ask_verify_outcome(root, cfg, command: str, tr, *,
         return getattr(tr, "tests_ok", None), False
     print(f"\n[verify: running `{command}`]", file=sys.stderr)
     try:
-        ok, out = loop.run_verify(root, command)
+        ok, out = loop.run_verify(root, command, cfg=cfg)
     except Exception as e:                   # a bad command is a failed check
         print(f"  [verify: could not run ({type(e).__name__}: {e})]",
               file=sys.stderr)

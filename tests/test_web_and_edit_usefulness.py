@@ -539,7 +539,7 @@ def test_noop_verify_item_runs_the_verify_command_before_ticking(
     calls: list[str] = []
     monkeypatch.setattr(
         loop, "run_verify",
-        lambda root, cmd: calls.append(cmd) or (True, ""))
+        lambda root, cmd, **kw: calls.append(cmd) or (True, ""))
     monkeypatch.setattr(loop, "run_investigation_task",
                         lambda *a, **k: pytest.fail("worker must not run"))
     code = loop.run_loop(tmp_path, _green_cfg(), None, idx, plan, apply=True,
@@ -559,7 +559,7 @@ def test_noop_verify_item_is_not_ticked_while_a_check_is_red(
     loop.write_plan(plan, "goal", ["Verify the page passes every check"])
     idx = types.SimpleNamespace(root=tmp_path)
     monkeypatch.setattr(loop, "run_verify",
-                        lambda root, cmd: (False, "1 failed"))
+                        lambda root, cmd, **kw: (False, "1 failed"))
     seen: list[str] = []
 
     def fake_investigate(root, cfg, agent, idx_, task, answer_system=None):

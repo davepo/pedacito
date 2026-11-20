@@ -1702,7 +1702,7 @@ def verify_and_fix(client, cfg, idx: Index, py_rels, project_name: str,
 
     def checks():
         if explicit_cmd:
-            ok, out = loop.run_verify(idx.root, explicit_cmd)
+            ok, out = loop.run_verify(idx.root, explicit_cmd, cfg=cfg)
             yield f"$ {explicit_cmd}", ok, out
         if smoke and (idx.root / "main.py").is_file():
             ok, out = smoke_run(idx.root, "main.py", smoke_timeout)

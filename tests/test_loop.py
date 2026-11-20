@@ -2123,7 +2123,7 @@ def test_run_loop_verification_repair_round_trip(tmp_path, monkeypatch):
         tasks.append(task)
         return _result(idx_)
 
-    def fake_verify(root, command):
+    def fake_verify(root, command, **kw):
         verifies.append(command)
         # Fail the first check, pass the second (after the model "fixes" it).
         return (len(verifies) >= 2), "boom" if len(verifies) < 2 else ""
@@ -2183,7 +2183,8 @@ def test_run_loop_verification_exhausts_repair_rounds(tmp_path, monkeypatch):
         return _result(idx_)
 
     monkeypatch.setattr(loop, "run_task", fake_run_task)
-    monkeypatch.setattr(loop, "run_verify", lambda root, cmd: (False, "boom"))
+    monkeypatch.setattr(loop, "run_verify",
+                        lambda root, cmd, **kw: (False, "boom"))
     code = loop.run_loop(tmp_path, _cfg(), None, idx, plan, apply=True,
                          verify="pytest -q", repair_rounds=2)
     assert code == 1
@@ -2233,7 +2234,7 @@ def test_run_loop_does_not_code_repair_missing_dependency(tmp_path, monkeypatch)
         return _result(idx_)
 
     monkeypatch.setattr(loop, "run_task", fake_run_task)
-    monkeypatch.setattr(loop, "run_verify", lambda root, cmd: (
+    monkeypatch.setattr(loop, "run_verify", lambda root, cmd, **kw: (
         False, "ModuleNotFoundError: No module named 'pygame'"))
     code = loop.run_loop(tmp_path, _cfg(), None, idx, plan, apply=True,
                          verify="python -c 'import main'", repair_rounds=3,
@@ -2252,7 +2253,7 @@ def test_run_loop_auto_installs_missing_dependency(tmp_path, monkeypatch):
     installs = []
     verify_calls = {"n": 0}
 
-    def fake_verify(root, cmd):
+    def fake_verify(root, cmd, **kw):
         verify_calls["n"] += 1
         if verify_calls["n"] == 1:
             return False, "ModuleNotFoundError: No module named 'pygame'"
@@ -2279,7 +2280,7 @@ def test_run_loop_auto_install_does_not_loop_when_module_stays_missing(
     installs = []
 
     monkeypatch.setattr(loop, "run_task", lambda *a, **k: _result(idx))
-    monkeypatch.setattr(loop, "run_verify", lambda root, cmd: (
+    monkeypatch.setattr(loop, "run_verify", lambda root, cmd, **kw: (
         False, "ModuleNotFoundError: No module named 'pygame'"))
     monkeypatch.setattr(loop, "install_modules",
                         lambda pkgs, root: (installs.append(list(pkgs)), (True, ""))[1])
@@ -2372,6 +2373,118 @@ def test_run_verify_honors_scrub_env_false_and_env_passthrough(
     env = _verify_env(tmp_path, passthrough, "verify-pass.json")
     assert env["DATABASE_URL"] == "postgres://user:pw@db/app"
     assert "OPENAI_API_KEY" not in env
+
+
+def _env_dump_command(tmp_path, name):
+    """A verify command that dumps its own environment to `name`."""
+    dumper = tmp_path / "dump_verify_env.py"
+    dumper.write_text(_VERIFY_ENV_DUMP, encoding="utf-8")
+    out = tmp_path / name
+    return f'"{sys.executable}" "{dumper}" "{out}"', out
+
+
+def _passthrough_cfg(monkeypatch):
+    monkeypatch.setenv("PEDACITO_VERIFY_MARKER", "present")
+    cfg = _cfg()
+    cfg.env_passthrough = ["PEDACITO_VERIFY_MARKER"]
+    return cfg
+
+
+def _dumped_env(out):
+    return json.loads(out.read_text(encoding="utf-8"))
+
+
+def test_run_loop_verify_honors_env_passthrough(tmp_path, monkeypatch):
+    """run_check must thread cfg into run_verify: before the fix the auto
+    loop called run_verify(root, cmd) with cfg=None, so env_passthrough /
+    scrub_env=false were silently ignored for the configured check."""
+    cfg = _passthrough_cfg(monkeypatch)
+    plan = tmp_path / "PLAN.md"
+    loop.write_plan(plan, "goal", ["task A"])
+    (tmp_path / "a.py").write_text("GOOD = 1\n", encoding="utf-8")
+    idx = types.SimpleNamespace(root=tmp_path)
+    monkeypatch.setattr(loop, "run_task", lambda *a, **k: _result(idx))
+    cmd, out = _env_dump_command(tmp_path, "loop-verify-env.json")
+    code = loop.run_loop(tmp_path, cfg, None, idx, plan, apply=True,
+                         verify=cmd, repair_rounds=0)
+    assert code == 0
+    assert _dumped_env(out).get("PEDACITO_VERIFY_MARKER") == "present"
+
+
+def test_run_loop_final_only_record_check_threads_cfg(tmp_path, monkeypatch):
+    """The final-only check that runs 'for the record' after an early stop
+    is a run_verify call site too and must see cfg."""
+    cfg = _passthrough_cfg(monkeypatch)
+    plan = tmp_path / "PLAN.md"
+    loop.write_plan(plan, "goal", ["task A", "task B"])
+    (tmp_path / "a.py").write_text("GOOD = 1\n", encoding="utf-8")
+    idx = types.SimpleNamespace(root=tmp_path)
+    monkeypatch.setattr(loop, "run_task", lambda *a, **k: _result(idx))
+    cmd, out = _env_dump_command(tmp_path, "final-verify-env.json")
+    loop.run_loop(tmp_path, cfg, None, idx, plan, apply=True,
+                  verify=cmd, verify_final=True, max_tasks=1,
+                  repair_rounds=0)
+    assert _dumped_env(out).get("PEDACITO_VERIFY_MARKER") == "present"
+
+
+def test_run_loop_records_verify_outcome_in_memory_exactly_once(
+        tmp_path, monkeypatch):
+    """run_verify owns the memory observation; run_check must not record a
+    second one (the old manual observe_command beside the call)."""
+    from pedacito import memory
+    seen = []
+
+    def spy(root, command, ok, cfg=None, kind="test"):
+        seen.append((command, ok, kind))
+
+    monkeypatch.setattr(memory, "observe_command", spy)
+    plan = tmp_path / "PLAN.md"
+    loop.write_plan(plan, "goal", ["task A"])
+    (tmp_path / "a.py").write_text("GOOD = 1\n", encoding="utf-8")
+    idx = types.SimpleNamespace(root=tmp_path)
+    monkeypatch.setattr(loop, "run_task", lambda *a, **k: _result(idx))
+    cmd = f'"{sys.executable}" -c "import sys; sys.exit(0)"'
+    code = loop.run_loop(tmp_path, _cfg(), None, idx, plan, apply=True,
+                         verify=cmd, repair_rounds=0)
+    assert code == 0
+    assert seen == [(cmd, True, "test")]
+
+
+def test_ask_verify_outcome_threads_cfg(tmp_path, monkeypatch):
+    from pedacito import cli
+    cfg = _passthrough_cfg(monkeypatch)
+    cmd, out = _env_dump_command(tmp_path, "ask-verify-env.json")
+    passed, ran = cli._ask_verify_outcome(tmp_path, cfg, cmd, None,
+                                          applied=True)
+    assert passed is True and ran is True
+    assert _dumped_env(out).get("PEDACITO_VERIFY_MARKER") == "present"
+
+
+def test_scaffold_verify_and_fix_threads_cfg(tmp_path, monkeypatch):
+    from pedacito import scaffold
+    cfg = _passthrough_cfg(monkeypatch)
+    idx = types.SimpleNamespace(root=tmp_path)
+    cmd, out = _env_dump_command(tmp_path, "scaffold-verify-env.json")
+    ok, _text = scaffold.verify_and_fix(None, cfg, idx, [], "proj", None,
+                                        explicit_cmd=cmd, rounds=0,
+                                        smoke=False, verbose=False)
+    assert ok is True
+    assert _dumped_env(out).get("PEDACITO_VERIFY_MARKER") == "present"
+
+
+def test_noop_verify_already_green_threads_cfg(tmp_path, monkeypatch):
+    from pedacito import verify as verify_mod
+    from pedacito import webcheck
+    cfg = _passthrough_cfg(monkeypatch)
+    monkeypatch.setattr(webcheck, "run", lambda root: False)
+    monkeypatch.setattr(webcheck, "_collect",
+                        lambda root: (["index.html"], [], []))
+    monkeypatch.setattr(verify_mod, "unmet_requirements",
+                        lambda root, task, results: [])
+    cmd, out = _env_dump_command(tmp_path, "noop-verify-env.json")
+    assert loop._noop_verify_already_green(
+        tmp_path, "Verify the page", cmd, cfg) is True
+    assert _dumped_env(out).get("PEDACITO_VERIFY_MARKER") == "present"
 
 
 # ---------------------------------------------------------------- run_task
@@ -3431,7 +3544,8 @@ def test_run_loop_rolls_back_a_repair_that_made_verify_worse(tmp_path,
 
     checks = iter([(False, "1 failed"), (False, "3 failed")])
     monkeypatch.setattr(loop, "run_task", fake_run_task)
-    monkeypatch.setattr(loop, "run_verify", lambda root, cmd: next(checks))
+    monkeypatch.setattr(loop, "run_verify",
+                        lambda root, cmd, **kw: next(checks))
     code = loop.run_loop(tmp_path, _cfg(), None, idx, plan, apply=True,
                          verify="pytest -q", repair_rounds=3,
                          stop_on_fail=False)
@@ -3457,8 +3571,8 @@ def test_run_loop_keeps_repairing_while_the_score_does_not_rise(tmp_path,
         return loop.TaskResult([_ok()], "reply", True, ["a.py"], idx_)
 
     monkeypatch.setattr(loop, "run_task", fake_run_task)
-    monkeypatch.setattr(loop, "run_verify", lambda root, cmd: (False,
-                                                               "1 failed"))
+    monkeypatch.setattr(loop, "run_verify", lambda root, cmd, **kw: (
+        False, "1 failed"))
     code = loop.run_loop(tmp_path, _cfg(), None, idx, plan, apply=True,
                          verify="pytest -q", repair_rounds=2)
     assert code == 1
