@@ -710,7 +710,7 @@ def test_list_server_states_surfaces_loading_models(monkeypatch):
     src = (Path(__file__).resolve().parents[1] / "pedacito" / "gui"
            / "static" / "app.js").read_text(encoding="utf-8")
     dialog = src[src.index("function serversDialog"):
-                 src.index("\n// -------------------------------------------------", 
+                 src.index("\n// -------------------------------------------------",
                            src.index("function serversDialog"))]
     assert "s.loading_models" in dialog
     assert "loading: ' + loading.join" in dialog
