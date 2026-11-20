@@ -264,8 +264,5 @@ corpus itself was proven through the installed package's `build_corpus()` and
 - PyPI still serves 0.2.0. Until 0.3.1 is published, `pdc update` on 0.3.1
   correctly reports "up to date" against Latest: 0.2.0. This is expected for
   the deferred release, not a smoke-test failure.
-- `pdc --version` is not implemented (the top-level parser exits 2); the
-  verification commands in steps 10 and 11 above should use another version
-  check unless that flag is added.
 - The throwaway venv and its temporary config/log files were removed after
   the checks.

@@ -20,9 +20,12 @@ import sys
 import tomllib
 from pathlib import Path
 
+import pytest
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from pedacito import __version__ as package_version
+from pedacito import cli
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -58,6 +61,14 @@ def test_readme_root_markdown_links_are_packaged():
     assert not missing, (
         "README links root-level guides that are not in "
         f"[tool.setuptools.data-files]: {missing}")
+
+
+def test_pdc_version_prints_the_package_version(capsys):
+    """`pdc --version` used to exit 2; the release procedure uses it."""
+    with pytest.raises(SystemExit) as exc:
+        cli.main(["--version"])
+    assert exc.value.code == 0
+    assert capsys.readouterr().out.strip() == f"pedacito {package_version}"
 
 
 def test_changelog_has_a_heading_for_the_release_version():

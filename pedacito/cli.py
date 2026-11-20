@@ -33,6 +33,7 @@ import time
 from pathlib import Path
 from types import SimpleNamespace
 
+from . import __version__
 from . import checkpoints as checkpoints_mod
 from . import config
 from . import config_editor
@@ -2994,6 +2995,9 @@ def build_parser() -> argparse.ArgumentParser:
     the real subcommand set (the `how` index drift guard)."""
     ap = argparse.ArgumentParser(prog="pedacito", description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--version", action="version",
+                    version=f"%(prog)s {__version__}",
+                    help="print the installed version and exit")
     sub = ap.add_subparsers(dest="cmd", required=True)
 
     p_index = sub.add_parser("index", help="build or refresh the index")
