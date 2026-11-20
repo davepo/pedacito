@@ -202,3 +202,64 @@ version and the correct upgrade command for the install method. A fresh
 - If the docs claim the new version is on PyPI, re-check that wording after the
   upload (the install guide currently names 0.3.1 while PyPI still serves
   0.2.0).
+
+## v0.3.1 readiness (2026-11-20)
+
+**Status: DEFERRED.** These were readiness checks only. Work stayed on
+`v0.3.1-dev`; nothing was merged, tagged, uploaded to PyPI, or pushed to
+another branch. `build` and `twine` were installed into the project `.venv`
+for the checks only; they are not project dependencies.
+
+### Build blocker fixed
+
+The first build failed because current setuptools rejects the metadata entry
+`[project.urls] Contact = "mailto:contact@pedacito.dev"` ("must be url"). The
+invalid URL entry was removed; `contact@pedacito.dev` remains in the README,
+`docs/SECURITY.md`, and the TUI help. This is a metadata-only change with no
+runtime behavior change.
+
+### Artifacts and twine
+
+`python -m build` (build 1.6.1) produced, beside the untouched 0.2.0 files:
+
+| Artifact | SHA-256 |
+|---|---|
+| `dist/pedacito-0.3.1-py3-none-any.whl` | `dd73752dee222a6a3e7183bc59edb4746eaf67366ea074af5d408148ce5712cd` |
+| `dist/pedacito-0.3.1.tar.gz` | `8165f806b0b7ce13c1184b5aad7fec7215f2666ec72030f2061016f2d9d83c95` |
+
+`python -m twine check` (twine 7.0.0) reported **PASSED** for both the wheel
+and the sdist. The sdist contains all five `docs/*.md`; the wheel installs them
+under `share/pedacito/docs/` with `README.md`, `QUICKSTART.md` and
+`MODEL_GUIDE.md` alongside.
+
+### Non-editable install smoke test
+
+A clean venv at `/tmp/opencode/pdc-wheel-smoke` (Python 3.14.10) installed the
+0.3.1 wheel; the package reported 0.3.1 and imported from that venv, not the
+checkout.
+
+| Check | Result |
+|---|---|
+| Packaged docs | All five `share/pedacito/docs/*.md` plus README/QUICKSTART/MODEL_GUIDE present; `how.find_docs_root()` resolved to the venv's `share/pedacito` |
+| `pdc how --offline` | Exit 0; answered the auto-tune question ("Missing telemetry ... makes auto-tune abstain ...") |
+| Docs corpus from that install | `how.build_corpus()` included every `docs/*.md`; `how.select_references("how do I install pedacito on a GPU server?")` selected `docs/INSTALLATION.md` and included "installs the full core", a docs-only phrase |
+| `pdc update` | `Installed: 0.3.1    Latest: 0.2.0` → "You are up to date." |
+| `pdc profile --show` | Exit 0 |
+| `pdc --help` | Exit 0 |
+| Update opt-out | With `PEDACITO_CHECK_FOR_UPDATES=false`, `pdc update` printed "No network call was made."; a socket audit hook recorded no DNS, connect or HTTP events (only a local loopback bind). The unset control recorded the PyPI GET and connect. |
+
+The offline CLI answer is rendered from the built-in `how_index` cards; it is
+the model-synthesis `HowSession` path that consumes the docs corpus, so the
+corpus itself was proven through the installed package's `build_corpus()` and
+`select_references()` as recorded above.
+
+### Known deferred state
+
+- PyPI still serves 0.2.0. Until 0.3.1 is published, `pdc update` on 0.3.1
+  correctly reports "up to date" against Latest: 0.2.0. This is expected for
+  the deferred release, not a smoke-test failure.
+- `pdc --version` is not implemented (the top-level parser exits 2); the
+  verification commands in steps 10 and 11 above should use another version
+  check unless that flag is added.
+- The throwaway venv and its temporary config/log files were removed after
+  the checks.
