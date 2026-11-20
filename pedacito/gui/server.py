@@ -31,6 +31,7 @@ from .. import prompts as prompts_mod
 from .. import runner as runner_mod
 from .. import security, themes as themes_mod, workspace
 from .. import update as update_mod
+from .. import config as config_mod
 from ..config import ConfigError
 from ..local_server import LocalHTTPServer
 from ..select import Matcher, is_venv_dir, suggest_context
@@ -2204,6 +2205,9 @@ def _theme(q, body):
 
 def _themes_payload() -> dict:
     data = themes_mod.list_themes(STATE.root)
+    # The nine CSS-native gui_theme schemes: the Theme Manager offers them
+    # alongside the engine presets, painted by their crafted app.css blocks.
+    data["css_schemes"] = list(config_mod._ENUM_FIELDS["gui_theme"])
     return {"ok": True, **data}
 
 

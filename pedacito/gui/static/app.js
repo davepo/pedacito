@@ -643,12 +643,15 @@ function applyStatus(s) {
   // Colorscheme: config.toml (gui_theme) is the source of truth. On the
   // first poll the server wins only over an untouched browser (a browser-
   // local pick that could not be persisted \u2014 no user config file \u2014 must
-  // not be erased on every reload). Afterwards we follow the server only
-  // while nobody changed the theme here since the last known server value.
+  // not be erased on every reload). Afterwards a changed server value is a
+  // real Settings/config edit: follow it even while an engine palette is
+  // active, so the edit repaints (applyTheme clears the engine tokens). A
+  // browser-local pick that could not be persisted leaves the server value
+  // unchanged, so it is never overwritten here.
   if (typeof s.gui_theme === 'string' && s.gui_theme && s.gui_theme !== lastServerTheme) {
     let local = 'slate';
     try { local = localStorage.getItem('pedacito_theme') || 'slate'; } catch (err) {}
-    const follow = lastServerTheme === null ? local === 'slate' : local === lastServerTheme;
+    const follow = lastServerTheme === null ? local === 'slate' : true;
     if (follow) applyTheme(s.gui_theme, false);
     lastServerTheme = s.gui_theme;
   }
@@ -2262,6 +2265,25 @@ function openArena() {
 }
 PDC.openArena = openArena;
 
+// The nine CSS-native gui_theme schemes (config.py's closed enum). Each has
+// a full crafted palette block in app.css -- ansi colors, terminal, code and
+// diff surfaces included -- and paints via the data-theme attribute. The
+// engine's inline ten-token derivation must never overpaint them.
+const CSS_SCHEMES = ['slate', 'light', 'daylight', 'nord', 'midnight',
+  'jazz_solo', 'trapper_keeper', 'memphis_arcade', 'windbreaker'];
+const CSS_SCHEME_META = {
+  slate: { label: 'Slate \u00b7 GitHub Dark', bg: '#0d1117', accent: '#58a6ff' },
+  light: { label: 'Light \u00b7 GitHub Light', bg: '#f6f8fa', accent: '#0969da' },
+  daylight: { label: 'Daylight \u00b7 warm paper', bg: '#fcfaf2', accent: '#b54900' },
+  nord: { label: 'Nord \u00b7 modern dark', bg: '#181825', accent: '#89b4fa' },
+  midnight: { label: 'Midnight \u00b7 high contrast', bg: '#05070a', accent: '#38bdf8' },
+  jazz_solo: { label: 'Jazz Cup \u00b7 1991 light', bg: '#f4f1ea', accent: '#009688' },
+  memphis_arcade: { label: 'Memphis Arcade \u00b7 dark', bg: '#121324', accent: '#00e5ff' },
+  trapper_keeper: { label: 'Trapper Keeper \u00b7 light', bg: '#eef2f9', accent: '#2541b2' },
+  windbreaker: { label: 'Windbreaker \u00b7 1992 dark', bg: '#191326', accent: '#00d2b8' },
+};
+function isCssScheme(name) { return CSS_SCHEMES.indexOf(name) >= 0; }
+
 // The GUI colorscheme. The browser always gets it at once (localStorage, so
 // theme.js can apply it before first paint); `userPick` additionally persists
 // it as gui_theme in the user config through /api/settings/theme — purely
@@ -2270,10 +2292,15 @@ PDC.openArena = openArena;
 let lastServerTheme = null;
 function applyTheme(t, userPick) {
   if (!t) return;
-  if (userPick) clearThemeTokens();
+  // A CSS-native scheme is taking over: drop any engine inline tokens and
+  // cache so the crafted app.css block paints -- and survives the next reload.
+  clearThemeTokens();
   if (t === 'slate') document.documentElement.removeAttribute('data-theme');
   else document.documentElement.setAttribute('data-theme', t);
+  document.documentElement.dataset.themeName = t;
   try { localStorage.setItem('pedacito_theme', t); } catch (err) {}
+  const btn = $('themeBtn');
+  if (btn) btn.title = 'theme: ' + t + ' \u2014 open the Theme Manager';
   const sel = $('theme');
   if (sel && Array.prototype.some.call(sel.options, (o) => o.value === t)) sel.value = t;
   if (!userPick) return;
@@ -2361,10 +2388,47 @@ function clearThemeTokens() {
   } catch (err) {}
 }
 
-function applyThemePayload(payload) {
+// Resolve which palette the GUI paints. gui_theme (config) is the source of
+// truth for the nine CSS-native schemes: an explicit browser marker, or the
+// server-injected data-theme attribute when no marker exists, wins over
+// whatever palette sits in themes.json -- the engine must not flatten a
+// crafted scheme into its ten-token derivation. `explicitEngine` marks a
+// Theme Manager pick/save/delete, which always switches to the engine palette.
+function applyThemePayload(payload, explicitEngine) {
   if (!payload || !payload.themes) return;
-  const tokens = payload.themes[payload.active_theme];
-  if (tokens) applyThemeTokens(tokens, payload.active_theme);
+  const active = payload.active_theme;
+  const tokens = payload.themes[active];
+  if (!tokens) return;
+  let marker = '';
+  try { marker = localStorage.getItem('pedacito_theme') || ''; } catch (err) {}
+  const attr = document.documentElement.getAttribute('data-theme') || '';
+  if (!explicitEngine) {
+    if (isCssScheme(marker)) {
+      clearThemeTokens();
+      if (marker === 'slate') document.documentElement.removeAttribute('data-theme');
+      else document.documentElement.setAttribute('data-theme', marker);
+      document.documentElement.dataset.themeName = marker;
+      return;
+    }
+    if (!marker && isCssScheme(attr)) {
+      clearThemeTokens();
+      document.documentElement.dataset.themeName = attr;
+      try { localStorage.setItem('pedacito_theme', attr); } catch (err) {}
+      return;
+    }
+  }
+  // Engine-native: an explicit Theme Manager pick, or no CSS preference
+  // anywhere. The default preset is the crafted slate scheme -- let its CSS
+  // block paint the full palette instead of the flattened token derivation.
+  if (active === 'pedacito-dark') {
+    clearThemeTokens();
+    document.documentElement.removeAttribute('data-theme');
+  } else {
+    applyThemeTokens(tokens, active);
+    document.documentElement.removeAttribute('data-theme');
+  }
+  document.documentElement.dataset.themeName = active;
+  try { localStorage.setItem('pedacito_theme', active); } catch (err) {}
 }
 
 function loadActiveTheme() {
@@ -2394,13 +2458,23 @@ function openThemeManager() {
 }
 
 function showThemeManager(initial) {
+  let marker0 = '';
+  try { marker0 = localStorage.getItem('pedacito_theme') || ''; } catch (err) {}
+  const attr0 = document.documentElement.getAttribute('data-theme') || '';
   const st = {
     themes: initial.themes || {},
     builtin: new Set(initial.builtin_names || []),
     active: initial.active_theme,
     project: initial.project_theme || null,
     draft: { ...(initial.themes[initial.active_theme] || {}) },
+    cssSchemes: initial.css_schemes || [],
+    // Which family the GUI currently paints: a CSS-native gui_theme scheme
+    // (crafted app.css block) or an engine palette (inline ten tokens).
+    mode: isCssScheme(marker0) ? 'css'
+      : (marker0 ? 'engine' : (isCssScheme(attr0) ? 'css' : 'engine')),
+    cssActive: '',
   };
+  st.cssActive = st.mode === 'css' ? (marker0 || attr0 || 'slate') : '';
   const grid = h('div', { class: 'theme-grid', id: 'themeGrid' });
   const editor = h('div', { class: 'theme-editor' });
   const status = h('div', { class: 'theme-status', id: 'themeStatus' });
@@ -2426,6 +2500,20 @@ function showThemeManager(initial) {
 
   function renderGrid() {
     clear(grid);
+    // The nine crafted gui_theme schemes first: they paint their full app.css
+    // palette and persist as gui_theme, exactly like the Settings enum.
+    st.cssSchemes.forEach((name) => {
+      const meta = CSS_SCHEME_META[name] || {};
+      const sw = h('span', { class: 'sw',
+        style: 'background:' + (meta.bg || '#808080')
+          + ';border-color:' + (meta.accent || '#808080') });
+      grid.appendChild(h('button', {
+        class: 'theme-pill'
+          + (st.mode === 'css' && name === st.cssActive ? ' on' : ''),
+        title: name,
+        onclick: () => selectCssScheme(name),
+      }, sw, h('span', { text: meta.label || name })));
+    });
     const custom = Object.keys(st.themes).filter((n) => !st.builtin.has(n)).sort();
     const names = Array.from(st.builtin).concat(custom);
     names.forEach((name) => {
@@ -2434,13 +2522,24 @@ function showThemeManager(initial) {
       const sw = h('span', { class: 'sw',
         style: 'background:' + t.accent + ';border-color:' + t.border });
       grid.appendChild(h('button', {
-        class: 'theme-pill' + (name === st.active ? ' on' : ''),
+        class: 'theme-pill'
+          + (st.mode === 'engine' && name === st.active ? ' on' : ''),
         title: name,
         onclick: () => selectTheme(name),
       }, sw, h('span', { text: name }),
         st.builtin.has(name) ? null : h('span', {
           class: 'small-text', text: 'custom' })));
     });
+  }
+
+  function selectCssScheme(name) {
+    // applyTheme clears the engine tokens, paints the crafted CSS block and
+    // persists gui_theme through /api/settings/theme (browser-local fallback).
+    applyTheme(name, true);
+    st.mode = 'css';
+    st.cssActive = name;
+    renderGrid();
+    say('Active: ' + ((CSS_SCHEME_META[name] || {}).label || name), 'ok');
   }
 
   function selectTheme(name) {
@@ -2455,7 +2554,8 @@ function showThemeManager(initial) {
       st.draft = { ...(st.themes[selected] || {}) };
       nameInp.value = st.builtin.has(selected) ? '' : selected;
       syncInputs(st.draft);
-      applyThemePayload(j);
+      applyThemePayload(j, true);
+      st.mode = 'engine';
       renderGrid();
       delBtn.disabled = st.builtin.has(selected);
       say('Active: ' + selected + (st.project ? ' (project override)' : ''), 'ok');
@@ -2516,7 +2616,8 @@ function showThemeManager(initial) {
         st.draft = { ...(st.themes[selected] || tokens) };
         nameInp.value = selected;
         syncInputs(st.draft);
-        applyThemePayload(j);
+        applyThemePayload(j, true);
+        st.mode = 'engine';
         renderGrid();
         delBtn.disabled = false;
         say('Saved and activated ' + selected + '.', 'ok');
@@ -2544,7 +2645,8 @@ function showThemeManager(initial) {
             st.draft = { ...(st.themes[selected] || {}) };
             nameInp.value = st.builtin.has(selected) ? '' : selected;
             syncInputs(st.draft);
-            applyThemePayload(j);
+            applyThemePayload(j, true);
+            st.mode = 'engine';
             renderGrid();
             delBtn.disabled = st.builtin.has(selected);
             say('Deleted ' + name + '. Active: ' + selected + '.', 'ok');
@@ -2579,7 +2681,8 @@ function showThemeManager(initial) {
 
   const content = h('div', {},
     h('div', { class: 'theme-hint',
-      text: 'Presets switch instantly and are saved for the GUI and the terminal TUI. '
+      text: 'GUI schemes paint their full crafted palette and save as gui_theme. '
+        + 'Presets and custom palettes are shared with the terminal TUI. '
         + 'Edit any of the ten colors for a live preview.' }),
     grid,
     h('div', { class: 'theme-hint', text: 'Active palette \u2014 ten shared tokens' }),

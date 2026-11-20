@@ -221,6 +221,7 @@ def test_gui_theme_endpoints(gui, store):
     assert body["active_theme"] == themes.DEFAULT_THEME
     assert set(themes.BUILTIN_THEMES) <= set(body["builtin_names"])
     assert set(themes.THEME_KEYS) == set(body["themes"]["nord"])
+    assert body["css_schemes"] == list(config_mod._ENUM_FIELDS["gui_theme"])
 
     status, body = gui.post("/api/themes/select", {"name": "nord"})
     assert status == 200 and body["active_theme"] == "nord"
