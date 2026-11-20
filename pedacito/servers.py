@@ -468,6 +468,40 @@ def _models_from_payload(payload, kind: str = "") -> tuple[list[str], list[str]]
     return ids, loaded
 
 
+def _lemonade_pinned_models(root: str, headers: dict, left) -> list[str]:
+    """Loaded pinned model ids from Lemonade's `/v1/health`.
+
+    `/v1/models` lists every downloaded recipe and carries no pin flag; the
+    health endpoint's `all_models_loaded` entries do. One extra GET, inside
+    the probe's existing deadline, is the only way to know which residents
+    Pedacito's own evict handshake must leave alone. Best-effort: an older
+    build without the endpoint or a malformed body means "no pins known"."""
+    for path in ("/v1/health", "/api/v1/health"):
+        if left() <= 0:
+            return []
+        try:
+            resp = requests.get(root + path, headers=headers, timeout=left())
+        except Exception:
+            continue
+        if getattr(resp, "status_code", 0) != 200:
+            continue
+        try:
+            payload = resp.json()
+        except Exception:
+            continue
+        pinned: list[str] = []
+        for entry in (payload.get("all_models_loaded") or []) \
+                if isinstance(payload, dict) else []:
+            if not isinstance(entry, dict) or not entry.get("pinned"):
+                continue
+            name = (entry.get("model_name") or entry.get("id")
+                    or entry.get("model"))
+            if name and str(name) not in pinned:
+                pinned.append(str(name))
+        return pinned
+    return []
+
+
 def _probe_server(server: dict, timeout: float = PROBE_TIMEOUT) -> dict:
     """Probe one server for reachability and resident models. Never raises."""
     base = str(server.get("base_url") or "")
@@ -545,6 +579,8 @@ def _probe_server(server: dict, timeout: float = PROBE_TIMEOUT) -> dict:
                 ids.extend(m for m in got_ids if m not in ids)
                 loaded.extend(m for m in got_loaded if m not in loaded)
                 break
+    pinned = (_lemonade_pinned_models(root, headers, left)
+              if online and kind in ("lemonade", "lemond") else [])
     out = dict(server)
     out.update({
         "kind": kind,
@@ -555,6 +591,7 @@ def _probe_server(server: dict, timeout: float = PROBE_TIMEOUT) -> dict:
         "loaded_models": loaded,
         "loaded_model": loaded[0] if len(loaded) == 1 else "",
         "resident_models": loaded,
+        "pinned_models": pinned,
         "loaded": bool(loaded),
     })
     if not online:
@@ -913,9 +950,11 @@ def evict_other_local_servers(target_provider, config,
     """Auto-evict handshake before a run starts on `target_provider`.
 
     When `auto_evict_servers` is on (the default), every *other* configured
-    local server holding a resident model is unloaded. Then VRAM/RAM is
-    polled (up to `wait_seconds`) until it drops, so the target's weights can
-    load without fighting the previous server.
+    local server holding a resident model is unloaded, except residents a
+    Lemonade server reports as pinned (those stay; their server's unpinned
+    residents are still unloaded). Then VRAM/RAM is polled (up to
+    `wait_seconds`) until it drops, so the target's weights can load without
+    fighting the previous server.
 
     Returns `{"ok", "target", "evicted": [...], "skipped": [...],
     "waited_s", "memory"}`. Doing nothing is a success, not an error."""
@@ -942,6 +981,19 @@ def evict_other_local_servers(target_provider, config,
             continue
         if not state.get("loaded_models"):
             skipped.append(str(state.get("name") or state.get("base_url")))
+            continue
+        loaded = [str(m) for m in (state.get("loaded_models") or []) if m]
+        pinned = {str(m) for m in (state.get("pinned_models") or []) if m}
+        if pinned:
+            # A pin is the user telling every manager, Lemonade's LRU and
+            # Pedacito's switch handshake alike, to keep that model resident.
+            # Unload only the unpinned residents and report the kept ones.
+            skipped.append(
+                f"{state.get('name') or state.get('base_url')} "
+                f"(pinned: {', '.join(sorted(pinned))})")
+            for model_id in loaded:
+                if model_id not in pinned:
+                    evicted.append(unload_server_model(state, model_id, config))
             continue
         evicted.append(unload_server_model(state, "", config))
     if not evicted or not poll:

@@ -375,6 +375,13 @@ otherwise the normal Lemonade key or the profile's `api_key` applies. The
 model must already be loaded. Other local runtimes have no pin concept, so the
 action is a no-op there.
 
+When `auto_evict_servers` is on (the default), Pedacito unloads residents on
+the *other* local servers before a run starts. It first reads each Lemonade
+server's `/v1/health`; a pinned resident is never unloaded by that handshake.
+Only unpinned residents on the same server are unloaded, and the pinned ids
+are reported in the handshake's `skipped` list. Other runtimes expose no pin
+state, so they keep the existing unload-everything behavior.
+
 ## Memory, skills, and instructions
 
 ### Memory, rules, and skills

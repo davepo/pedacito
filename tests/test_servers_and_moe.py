@@ -524,6 +524,81 @@ def test_evict_other_local_servers_unloads_idle_local_server(monkeypatch):
     assert result.get("disabled") is True and unloaded == []
 
 
+def test_evict_other_local_servers_skips_pinned_residents(monkeypatch):
+    """A Lemonade pin is the user's instruction to keep a model resident;
+    Pedacito's own switch handshake must not unload it. Unpinned residents on
+    the same server still go, and the kept ids are named in `skipped`."""
+    target = {"name": "strata", "kind": "strata", "provider": "strata",
+              "base_url": "http://127.0.0.1:8001/v1", "online": True,
+              "models": ["qwen3.8-flash"], "loaded_models": ["qwen3.8-flash"],
+              "active": True}
+    mixed = {"name": "lemonade", "kind": "lemonade", "provider": "lemonade",
+             "base_url": "http://127.0.0.1:8000/v1", "online": True,
+             "models": ["keep-me", "evict-me"],
+             "loaded_models": ["keep-me", "evict-me"],
+             "pinned_models": ["keep-me"], "active": False}
+    all_pinned = {"name": "lemonade2", "kind": "lemonade",
+                  "provider": "lemonade",
+                  "base_url": "http://127.0.0.1:8002/v1", "online": True,
+                  "models": ["stay"], "loaded_models": ["stay"],
+                  "pinned_models": ["stay"], "active": False}
+    monkeypatch.setattr(servers, "list_server_states",
+                        lambda cfg, timeout=servers.PROBE_TIMEOUT:
+                        [target, mixed, all_pinned])
+    monkeypatch.setattr(servers, "get_hardware_memory",
+                        lambda *a, **k: {"ram": {"used_gb": 1.0, "total_gb": 2.0},
+                                         "vram": {"used_gb": 1.0, "total_gb": 2.0}})
+    unloaded = []
+
+    def fake_unload(state, model="", config=None):
+        unloaded.append((state.get("name"), model))
+        return {"ok": True, "server": state.get("name"),
+                "action": "unload", "detail": "done"}
+
+    monkeypatch.setattr(servers, "unload_server_model", fake_unload)
+    cfg = _cfg_with({}, active="")
+    cfg.auto_evict_servers = True
+
+    result = servers.evict_other_local_servers("strata", cfg, wait_seconds=0)
+    assert result["ok"] is True
+    # Only the unpinned resident on the mixed server is unloaded; the fully
+    # pinned server is untouched.
+    assert unloaded == [("lemonade", "evict-me")]
+    assert [r["server"] for r in result["evicted"]] == ["lemonade"]
+    reasons = " ".join(result["skipped"])
+    assert "lemonade (pinned: keep-me)" in reasons
+    assert "lemonade2 (pinned: stay)" in reasons
+
+
+def test_list_server_states_reads_lemonade_pins_from_health(monkeypatch):
+    """`/v1/models` has no pin flag; the health endpoint carries it. The
+    probe exposes the pinned resident ids for the evict handshake."""
+    def fake_get(url, headers=None, timeout=None):
+        if url.endswith("/v1/models"):
+            return SimpleNamespace(status_code=200, json=lambda: {"data": [
+                {"id": "qwen3.8-flash", "loaded_in_memory": True},
+                {"id": "gemma-3-27b", "loaded_in_memory": True},
+            ]})
+        if url.endswith("/v1/health"):
+            return SimpleNamespace(status_code=200, json=lambda: {
+                "all_models_loaded": [
+                    {"model_name": "qwen3.8-flash", "pinned": True},
+                    {"model_name": "gemma-3-27b", "pinned": False},
+                ]})
+        return SimpleNamespace(status_code=404, json=lambda: {})
+
+    monkeypatch.setattr(servers.requests, "get", fake_get)
+    cfg = _cfg_with({
+        "lemon": {"base_url": "http://127.0.0.1:8000/v1",
+                  "model": "qwen3.8-flash", "provider": "lemonade"},
+    }, active="")
+    state = next(s for s in servers.list_server_states(cfg)
+                 if s["name"] == "lemon")
+    assert state["kind"] == "lemonade"
+    assert state["loaded_models"] == ["qwen3.8-flash", "gemma-3-27b"]
+    assert state["pinned_models"] == ["qwen3.8-flash"]
+
+
 def test_list_server_states_detects_resident_models(monkeypatch):
     def fake_get(url, headers=None, timeout=None):
         if url.endswith("/v1/models"):
