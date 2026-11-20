@@ -461,6 +461,27 @@ a side-by-side `chat` session if in doubt.
 
 ---
 
+## Lemonade Server model pinning
+
+Lemonade's multi-model mode evicts the least-recently-used model when it needs
+a slot. A pinned model is skipped, which keeps a frequently used model resident
+while other models come and go.
+
+- In the GUI, open **Servers**, select the resident model in a Lemonade row and
+  click **Pin** or **Unpin**.
+- In the TUI, use `/servers pin SERVER [MODEL]` or
+  `/servers unpin SERVER [MODEL]`. The model id is optional when the server
+  holds a single resident model.
+- Pedacito calls Lemonade's `POST /internal/pin` with
+  `{"model_name": "...", "pinned": true|false}`; a build that answers only the
+  older spelling gets `/api/v1/internal/pin` as the fallback. The model must
+  already be loaded.
+
+Pinning is Lemonade-only. llama.cpp, Ollama and generic local servers have no
+equivalent, so Pedacito treats the action as a no-op there.
+
+---
+
 ## Thinking per profile
 
 Some models reason before they answer, in a separate thinking block. That helps
@@ -494,6 +515,16 @@ competes with the output budget.
 If a model has a prompt switch instead of an API switch, set `thinking_suffix`,
 such as `/no_think` for Qwen3. Leave it empty when the server already honors
 `disable_thinking`.
+
+### Reasoning effort
+
+`reasoning_effort` is a profile setting (also `/effort` in the TUI and the
+**Effort** selector in the GUI) with four values: `default`, `low`, `medium`
+and `high`. `default` is the shipped spelling of the plan's `off`: it sends no
+`reasoning_effort` field at all. The other values are forwarded verbatim on
+local-MoE servers and reasoning-capable hosted models, never on models that do
+not expose the control. The setting never changes sampling, and
+`disable_thinking = true` wins over any effort level.
 
 ### When to turn thinking on
 

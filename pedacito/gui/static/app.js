@@ -2973,9 +2973,18 @@ function serversDialog() {
   function act(path, payload) {
     status.textContent = 'Working\u2026';
     PDC.api(path, payload).then((j) => {
-      if (!j.ok) status.textContent = (j.detail || 'the server refused the action');
-      else status.textContent = (path.indexOf('load') >= 0 ? 'Loaded ' : 'Unloaded ')
-        + (payload.model || payload.server || 'model') + ' \u00B7 ' + _memText(j.memory || {});
+      if (j.skipped) {
+        status.textContent = j.detail || 'nothing to do';
+      } else if (!j.ok) {
+        status.textContent = (j.detail || 'the server refused the action');
+      } else {
+        const verb = path.indexOf('pin') >= 0
+          ? (payload.pinned ? 'Pinned ' : 'Unpinned ')
+          : (path.indexOf('unload') >= 0 ? 'Unloaded ' : 'Loaded ');
+        status.textContent = verb
+          + (payload.model || payload.server || 'model')
+          + ' \u00B7 ' + _memText(j.memory || {});
+      }
       paint(j);
     }, () => { status.textContent = 'The GUI server did not answer.'; });
   }
@@ -2998,6 +3007,10 @@ function serversDialog() {
       const available = (s.models || []).filter((m) => loaded.indexOf(m) < 0);
       const sel = h('select', { title: 'model to load' });
       available.forEach((m) => sel.appendChild(h('option', { value: m, text: m })));
+      const pinSel = h('select', { title: 'loaded model to pin' });
+      loaded.forEach((m) => pinSel.appendChild(h('option', { value: m, text: m })));
+      const canPin = ['lemonade', 'lemond'].indexOf(
+        String(s.kind || '').toLowerCase()) >= 0;
       const loadBtn = h('button', { class: 'small primary', text: 'Load',
         disabled: !available.length,
         onclick: () => act('/api/servers/load', { server: s.name, model: sel.value }) });
@@ -3015,6 +3028,16 @@ function serversDialog() {
         h('div', { class: 'mono small-text', style: 'margin-top:4px', text: s.base_url || '' }),
         h('div', { class: 'small-text', style: 'margin-top:4px',
           text: loaded.length ? 'resident: ' + loaded.join(', ') : 'no model resident' }),
+        (canPin && loaded.length) ? h('div', { class: 'row', style: 'margin-top:6px' },
+          pinSel,
+          h('button', { class: 'small', text: 'Pin',
+            title: 'prevent Lemonade from evicting this model',
+            onclick: () => act('/api/servers/pin',
+              { server: s.name, kind: s.kind, model: pinSel.value, pinned: true }) }),
+          h('button', { class: 'small', text: 'Unpin',
+            title: 'allow Lemonade to evict this model again',
+            onclick: () => act('/api/servers/pin',
+              { server: s.name, kind: s.kind, model: pinSel.value, pinned: false }) })) : null,
         (available.length || !s.online) ? h('div', { class: 'row', style: 'margin-top:6px' },
           sel, loadBtn) : null));
     });

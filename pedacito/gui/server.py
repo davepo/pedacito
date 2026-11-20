@@ -1475,6 +1475,21 @@ def _servers_unload(q, body):
     return (200 if result.get("ok") or not results else 502), payload
 
 
+@post("/api/servers/pin")
+def _servers_pin(q, body):
+    """Pin or unpin a loaded Lemonade model and return fresh telemetry."""
+    from .. import servers
+    config = _servers_config()
+    target = _server_target(body)
+    model = str(body.get("model") or "").strip()
+    pinned = bool(body.get("pinned", True))
+    kind = str(body.get("kind") or "").strip()
+    result = servers.pin_server_model(target, model, pinned, config, kind=kind)
+    payload = _server_payload(config)
+    payload.update(result)
+    return (200 if result.get("ok") else 502), payload
+
+
 @post("/api/servers/auto-evict")
 def _servers_auto_evict(q, body):
     """Toggle the auto-unload-other-servers handshake and apply it live."""

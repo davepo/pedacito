@@ -196,6 +196,9 @@ Pedacito TUI commands
   /effort [LEVEL]           reasoning effort: default, low, medium or high
                             (forwarded to local-moe and reasoning APIs)
   /servers                  live VRAM/RAM and each local server's status
+  /servers pin|unpin SERVER [MODEL]
+                            pin/unpin a loaded Lemonade model; LRU eviction
+                            skips pinned models (other servers: no-op)
   /unload [SERVER]          unload models on SERVER, or every idle local server
   /creative [on|off|auto]   design mode: on=every task, auto=detect design tasks,
                             off=surgical edits (warmer sampling + whole-file CSS/HTML)
@@ -2842,7 +2845,7 @@ class TuiSession:
             self._arena(arg)
             return
         if cmd == "servers":
-            self._servers()
+            self._servers(arg)
             return
         if cmd == "unload":
             self._unload(arg)
@@ -3426,8 +3429,37 @@ class TuiSession:
                                        fetch_metadata=True)
         self._append(profiler.format_profile_report(report), "system")
 
-    def _servers(self) -> None:
-        """`/servers`: live VRAM/RAM plus each configured local server."""
+    def _servers(self, arg: str = "") -> None:
+        """`/servers`: live VRAM/RAM plus each configured local server.
+        `/servers pin|unpin SERVER [MODEL]` toggles Lemonade's LRU exemption
+        for a loaded model."""
+        parts = arg.strip().split(None, 2)
+        if parts and parts[0].lower() in ("pin", "unpin"):
+            if len(parts) < 2:
+                self._append(
+                    "usage: /servers pin SERVER [MODEL]  |  "
+                    "/servers unpin SERVER [MODEL]", "error")
+                return
+            action = parts[0].lower()
+            target = parts[1]
+            model = parts[2].strip() if len(parts) > 2 else ""
+            try:
+                result = servers_mod.pin_server_model(
+                    target, model, action == "pin", self.cfg)
+            except Exception as exc:
+                self._append(f"{action} failed: {exc}", "error")
+                return
+            name = result.get("server") or target
+            chosen = str(result.get("model") or "").strip()
+            detail = str(result.get("detail") or "").strip()
+            label = ("SKIPPED" if result.get("skipped")
+                     else "OK" if result.get("ok") else "FAILED")
+            self._append(
+                f"{label} {action} {name}"
+                + (f" \u00b7 {chosen}" if chosen else "")
+                + (f" \u2014 {detail}" if detail else ""),
+                "system" if result.get("ok") else "error")
+            return
         try:
             payload = servers_mod.server_summary(self.cfg)
         except Exception as exc:

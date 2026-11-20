@@ -142,6 +142,27 @@ def test_tui_frame_and_telemetry_bar_rendering(tmp_path):
         session.close()
 
 
+def test_tui_servers_pin_parses_target_model_and_state(tmp_path, monkeypatch):
+    session = TuiSession(tmp_path, _cfg(), headless=True,
+                         stdout=io.StringIO())
+    calls = []
+
+    def fake_pin(target, model="", pinned=True, config=None):
+        calls.append((target, model, pinned))
+        return {"ok": True, "action": "pin" if pinned else "unpin",
+                "server": target, "model": model or "resident",
+                "pinned": pinned, "detail": "done"}
+
+    monkeypatch.setattr(tui_mod.servers_mod, "pin_server_model", fake_pin)
+    try:
+        session._servers("pin lemonade qwen3-8b")
+        session._servers("unpin lemonade")
+        assert calls == [("lemonade", "qwen3-8b", True),
+                         ("lemonade", "", False)]
+    finally:
+        session.close()
+
+
 def test_tui_slash_commands_end_to_end(tmp_path):
     cfg = _cfg()
     script = "\n".join([

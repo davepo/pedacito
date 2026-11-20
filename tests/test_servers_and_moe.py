@@ -175,6 +175,132 @@ def test_load_and_strata_hook_payload(monkeypatch, tmp_path):
     assert marker.read_text(encoding="utf-8") == "qwen3.8-flash"
 
 
+def _lemonade_cfg():
+    return _cfg_with({
+        "lemonade": {"base_url": "http://127.0.0.1:8000/v1",
+                     "model": "qwen3-8b", "provider": "lemonade"},
+    }, active="lemonade")
+
+
+def test_lemonade_pin_and_unpin_payload(monkeypatch):
+    calls = []
+
+    def fake_post(url, headers=None, json=None, timeout=None):
+        calls.append({"url": url, "json": json})
+        return _Resp()
+
+    monkeypatch.setattr(servers.requests, "post", fake_post)
+    cfg = _lemonade_cfg()
+    result = servers.pin_server_model("lemonade", "qwen3-8b", True, cfg)
+    assert result["ok"] is True and result["action"] == "pin"
+    assert result["pinned"] is True
+    assert calls[-1] == {"url": "http://127.0.0.1:8000/internal/pin",
+                         "json": {"model_name": "qwen3-8b",
+                                  "pinned": True}}
+    result = servers.pin_server_model("lemonade", "qwen3-8b", False, cfg)
+    assert result["ok"] is True and result["action"] == "unpin"
+    assert result["pinned"] is False
+    assert calls[-1] == {"url": "http://127.0.0.1:8000/internal/pin",
+                         "json": {"model_name": "qwen3-8b",
+                                  "pinned": False}}
+
+
+def test_lemonade_pin_uses_admin_key_when_set(monkeypatch):
+    seen = {}
+
+    def fake_post(url, headers=None, json=None, timeout=None):
+        seen.clear()
+        seen.update(headers or {})
+        return _Resp()
+
+    monkeypatch.setattr(servers.requests, "post", fake_post)
+    monkeypatch.setenv("LEMONADE_API_KEY", "api-key")
+    monkeypatch.setenv("LEMONADE_ADMIN_API_KEY", "admin-key")
+    cfg = _lemonade_cfg()
+    assert servers.pin_server_model("lemonade", "qwen3-8b", True, cfg)["ok"]
+    assert seen["Authorization"] == "Bearer admin-key"
+    # Public lifecycle endpoints keep using the regular key.
+    assert servers.load_server_model("lemonade", "qwen3-8b", cfg)["ok"]
+    assert seen["Authorization"] == "Bearer api-key"
+
+
+def test_lemonade_pin_accepts_a_probed_kind_override(monkeypatch):
+    calls = []
+
+    def fake_post(url, headers=None, json=None, timeout=None):
+        calls.append(url)
+        return _Resp()
+
+    monkeypatch.setattr(servers.requests, "post", fake_post)
+    cfg = _cfg_with({
+        "proxy": {"base_url": "http://127.0.0.1:8000/v1",
+                  "model": "qwen3-8b", "provider": "custom"},
+    }, active="proxy")
+    result = servers.pin_server_model("proxy", "qwen3-8b", True, cfg,
+                                      kind="lemonade")
+    assert result["ok"] is True and not result.get("skipped")
+    assert calls == ["http://127.0.0.1:8000/internal/pin"]
+
+
+def test_lemonade_pin_falls_back_on_404(monkeypatch):
+    calls = []
+
+    def fake_post(url, headers=None, json=None, timeout=None):
+        calls.append(url)
+        if url == "http://127.0.0.1:8000/internal/pin":
+            return SimpleNamespace(status_code=404, text="not found")
+        return _Resp()
+
+    monkeypatch.setattr(servers.requests, "post", fake_post)
+    result = servers.pin_server_model("lemonade", "qwen3-8b", True,
+                                      _lemonade_cfg())
+    assert result["ok"] is True
+    assert calls == ["http://127.0.0.1:8000/internal/pin",
+                     "http://127.0.0.1:8000/api/v1/internal/pin"]
+    assert result["method"] == (
+        "POST http://127.0.0.1:8000/api/v1/internal/pin")
+
+
+def test_lemonade_pin_reports_real_error_without_retrying(monkeypatch):
+    calls = []
+
+    def fake_post(url, headers=None, json=None, timeout=None):
+        calls.append(url)
+        return SimpleNamespace(status_code=400,
+                               text='{"error": "model is not loaded"}')
+
+    monkeypatch.setattr(servers.requests, "post", fake_post)
+    result = servers.pin_server_model("lemonade", "qwen3-8b", True,
+                                      _lemonade_cfg())
+    assert result["ok"] is False
+    assert calls == ["http://127.0.0.1:8000/internal/pin"]
+    assert result["method"] == "POST http://127.0.0.1:8000/internal/pin"
+    assert "model is not loaded" in result["detail"]
+
+
+@pytest.mark.parametrize("provider,base_url", [
+    ("llama-server", "http://127.0.0.1:8080/v1"),
+    ("ollama", "http://127.0.0.1:11434/v1"),
+    ("custom", "http://127.0.0.1:9000/v1"),
+])
+def test_pin_is_a_noop_for_non_lemonade(monkeypatch, provider, base_url):
+    calls = []
+
+    def fake_post(*a, **kw):
+        calls.append(a)
+        return _Resp()
+
+    monkeypatch.setattr(servers.requests, "post", fake_post)
+    cfg = _cfg_with({
+        "srv": {"base_url": base_url, "model": "some-model",
+                "provider": provider},
+    }, active="srv")
+    result = servers.pin_server_model("srv", "some-model", True, cfg)
+    assert result["ok"] is True and result["skipped"] is True
+    assert result["pinned"] is True
+    assert calls == []
+
+
 _HOOK_ENV_DUMP = (
     "import json, os, sys\n"
     "with open(sys.argv[1], 'w', encoding='utf-8') as fh:\n"
@@ -496,6 +622,34 @@ def test_gui_unload_endpoint_updates_telemetry(gui, monkeypatch):
     assert calls == [("strata", "qwen3.8-flash")]
     assert j["memory"]["vram"]["total_gb"] == 24.0
     assert j["servers"][0]["loaded_models"] == []
+
+
+def test_gui_pin_endpoint_updates_telemetry(gui, monkeypatch):
+    memory = _fake_memory()
+    monkeypatch.setattr(profiler_mod, "snapshot",
+                        lambda *a, **k: memory)
+    monkeypatch.setattr(servers, "list_server_states",
+                        lambda *a, **k: [_gui_state()])
+    calls = []
+
+    def fake_pin(target, model="", pinned=True, config=None, kind=""):
+        calls.append((target, model, pinned))
+        return {"ok": True, "action": "pin" if pinned else "unpin",
+                "server": target, "model": model, "pinned": pinned,
+                "detail": "done"}
+
+    monkeypatch.setattr(servers, "pin_server_model", fake_pin)
+    status, j = gui.post("/api/servers/pin",
+                         {"server": "lemonade", "model": "qwen3-8b",
+                          "pinned": True})
+    assert status == 200 and j["ok"] is True
+    assert calls == [("lemonade", "qwen3-8b", True)]
+    assert j["memory"]["vram"]["total_gb"] == 24.0
+    status, j = gui.post("/api/servers/pin",
+                         {"server": "lemonade", "model": "qwen3-8b",
+                          "pinned": False})
+    assert status == 200 and j["ok"] is True
+    assert calls[-1] == ("lemonade", "qwen3-8b", False)
 
 
 def test_gui_load_endpoint_returns_telemetry(gui, monkeypatch):

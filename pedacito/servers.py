@@ -26,7 +26,9 @@ servers as one pool with explicit lifecycle controls:
   lifecycle API (Lemonade `/v1/load` + `/v1/unload`, llama.cpp
   `/models/load` + `/models/unload`, Strata/Avalon through the same generic
   endpoints) and fall back to an optional configured `load_cmd`/`unload_cmd`
-  for a single-model daemon.
+  for a single-model daemon. `pin_server_model` pins or unpins a loaded
+  Lemonade model through `/internal/pin` so LRU eviction skips it; other
+  server kinds have no pin concept and treat it as a no-op.
 * `evict_other_local_servers` is the auto-evict handshake: before a run
   starts on one local server, resident models on the *other* local servers are
   unloaded, then VRAM/RAM is polled briefly so the target's weights can claim
@@ -149,10 +151,11 @@ def _server_key(server) -> str:
                or _mapping_get(server, "provider", ""))
 
 
-def _headers_for(server) -> dict:
+def _headers_for(server, *, internal: bool = False) -> dict:
     """Bearer auth for the local server, when one is configured.
 
-    Lemonade accepts `LEMONADE_API_KEY` from the environment. A profile's
+    Lemonade accepts `LEMONADE_API_KEY` from the environment; its `/internal/*`
+    endpoints prefer `LEMONADE_ADMIN_API_KEY` when that is set. A profile's
     `api_key`/`api_key_env` is used too, but an absent key is normal: local
     servers require no credential and no `Authorization` header is sent."""
     kind = str(_mapping_get(server, "kind", "") or
@@ -163,7 +166,9 @@ def _headers_for(server) -> dict:
     if env_name:
         key = os.environ.get(env_name, "") or key
     if kind in ("lemonade", "lemond"):
-        for env_name in _LEMONADE_ENV_KEYS:
+        env_names = _LEMONADE_ENV_KEYS + (
+            ("LEMONADE_ADMIN_API_KEY",) if internal else ())
+        for env_name in env_names:
             key = os.environ.get(env_name, "") or key
     return {"Authorization": f"Bearer {key}"} if key else {}
 
@@ -585,6 +590,22 @@ def _post_json(url: str, headers: dict, payload: dict | None,
     return ok, body or str(getattr(resp, "status_code", "")), resp
 
 
+def _retry_next_spelling(resp, detail: str) -> bool:
+    """Whether a lifecycle attempt may try the alternate endpoint spelling.
+
+    Only an absent route (404), a connection failure or a timeout qualifies;
+    a reachable server's real error (400/500, ...) is reported as-is so a
+    side-effecting action can never fire twice."""
+    try:
+        status = int(getattr(resp, "status_code", 0) or 0)
+    except (TypeError, ValueError):
+        status = 0
+    if status == 404:
+        return True
+    text = str(detail or "")
+    return "404" in text or "Connection" in text or "Timeout" in text
+
+
 def _run_hook(command: str, server: dict, model: str, cfg=None
               ) -> tuple[bool, str]:
     """Run a configured load/unload command with shell=False.
@@ -643,18 +664,24 @@ def _known_model(server: dict, model: str) -> str:
 def _lemonade_action(server: dict, action: str,
                      model: str) -> tuple[bool, str, str]:
     root = _root(str(server.get("base_url") or ""))
-    headers = _headers_for(server)
-    payload = {"model_name": model} if model else {}
-    for url in (root + f"/v1/{action}", root + f"/api/v1/{action}"):
-        ok, detail, _resp = _post_json(url, headers, payload,
-                                       timeout=LOAD_TIMEOUT if action == "load"
-                                       else ACTION_TIMEOUT)
+    headers = _headers_for(server, internal=action in ("pin", "unpin"))
+    if action in ("pin", "unpin"):
+        # Lemonade's pin endpoint is internal and takes a boolean state;
+        # `/api/v1/internal/pin` is the alternate spelling older builds use.
+        payload = {"model_name": model, "pinned": action == "pin"}
+        urls = (root + "/internal/pin", root + "/api/v1/internal/pin")
+        timeout = ACTION_TIMEOUT
+    else:
+        payload = {"model_name": model} if model else {}
+        urls = (root + f"/v1/{action}", root + f"/api/v1/{action}")
+        timeout = LOAD_TIMEOUT if action == "load" else ACTION_TIMEOUT
+    for url in urls:
+        ok, detail, resp = _post_json(url, headers, payload, timeout=timeout)
         if ok:
             return True, f"POST {url}", detail
-        if "404" not in str(detail) and "Connection" not in str(detail) \
-                and "Timeout" not in str(detail):
+        if not _retry_next_spelling(resp, detail):
             # A reachable server answered with a real error: report it rather
-            # than trying a different spelling that may load twice.
+            # than trying a different spelling that may load or pin twice.
             return False, f"POST {url}", detail
     return False, "lemonade", "no lifecycle endpoint answered"
 
@@ -665,13 +692,12 @@ def _llama_action(server: dict, action: str,
     headers = _headers_for(server)
     payload = {"model": model} if model else {}
     for url in (root + f"/models/{action}", root + f"/v1/models/{action}"):
-        ok, detail, _resp = _post_json(url, headers, payload,
-                                       timeout=LOAD_TIMEOUT if action == "load"
-                                       else ACTION_TIMEOUT)
+        ok, detail, resp = _post_json(
+            url, headers, payload,
+            timeout=LOAD_TIMEOUT if action == "load" else ACTION_TIMEOUT)
         if ok:
             return True, f"POST {url}", detail
-        if "404" not in str(detail) and "Connection" not in str(detail) \
-                and "Timeout" not in str(detail):
+        if not _retry_next_spelling(resp, detail):
             return False, f"POST {url}", detail
     return False, "llama-server", "no lifecycle endpoint answered"
 
@@ -704,11 +730,40 @@ def _server_action(server, action: str, model: str, config) -> dict:
     if not server:
         return {"ok": False, "action": action, "model": str(model or ""),
                 "detail": "no such local server"}
-    model = _known_model(server, model)
     kind = str(server.get("kind") or server.get("provider")
                or server.get("type") or "custom")
     kind = _kind_for("", kind, str(server.get("base_url") or ""))
-    if kind in ("lemonade", "lemond"):
+    if action in ("pin", "unpin") and kind != "lemonade":
+        # Pinning is a Lemonade concept. Other runtimes have no equivalent,
+        # so this is an ok no-op, never an invented endpoint or a hook.
+        return {
+            "ok": True,
+            "action": action,
+            "skipped": True,
+            "server": server.get("name") or _host(
+                server.get("base_url", "")),
+            "kind": kind,
+            "base_url": server.get("base_url", ""),
+            "model": str(model or ""),
+            "method": "none",
+            "detail": "model pinning is Lemonade-only; nothing to do",
+        }
+    model = _known_model(server, model)
+    if action in ("pin", "unpin"):
+        if not model:
+            return {
+                "ok": False,
+                "action": action,
+                "server": server.get("name") or _host(
+                    server.get("base_url", "")),
+                "kind": kind,
+                "base_url": server.get("base_url", ""),
+                "model": "",
+                "method": "none",
+                "detail": f"no loaded model to {action}",
+            }
+        ok, method, detail = _lemonade_action(server, action, model)
+    elif kind in ("lemonade", "lemond"):
         ok, method, detail = _lemonade_action(server, action, model)
     elif kind == "llama-server":
         ok, method, detail = _llama_action(server, action, model)
@@ -796,6 +851,31 @@ def unload_all_local_servers(config, only_loaded: bool = True) -> list[dict]:
             continue
         results.append(unload_server_model(state, "", config))
     return results
+
+
+def pin_server_model(server, model: str = "", pinned: bool = True,
+                     config=None, kind: str = "") -> dict:
+    """Pin or unpin a loaded model on a Lemonade server.
+
+    Lemonade: POST /internal/pin with
+    ``{"model_name": model, "pinned": true|false}``; when the old spelling is
+    needed, ``/api/v1/internal/pin`` is tried after a 404, connection failure
+    or timeout, exactly like the load/unload actions. The model must already
+    be loaded; without an explicit id the server's single resident model is
+    used. Other server kinds have no pin concept and return an ok no-op with
+    ``skipped: true`` so GUI/TUI callers need no kind check of their own.
+
+    `kind` overrides the configured kind when a probe already identified the
+    server as Lemonade (the GUI's Servers panel does this); leave it empty to
+    use the profile's own classification."""
+    action = "pin" if pinned else "unpin"
+    if kind and not (isinstance(server, dict) and server.get("base_url")):
+        resolved = _resolve_server(server, config)
+        if resolved:
+            server = {**resolved, "kind": kind}
+    result = _server_action(server, action, model, config)
+    result["pinned"] = bool(pinned)
+    return result
 
 
 def _target_matches(state: dict, target: str) -> bool:
@@ -931,6 +1011,6 @@ __all__ = [
     "GIB", "PROBE_TIMEOUT", "configured_local_servers", "evict_other_local_servers",
     "format_server_states", "get_hardware_memory", "is_local_url",
     "list_server_states", "load_server_model", "memory_badge",
-    "normalize_url", "server_summary", "unload_all_local_servers",
-    "unload_server_model",
+    "normalize_url", "pin_server_model", "server_summary",
+    "unload_all_local_servers", "unload_server_model",
 ]

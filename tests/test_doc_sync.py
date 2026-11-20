@@ -420,3 +420,14 @@ def test_preview_csp_is_eval_free_and_the_gui_csp_is_unchanged():
     assert gui, "the GUI's own CSP is missing"
     assert "unsafe-eval" not in gui.group(1)
     assert "script-src 'self'" in gui.group(1)
+
+
+def test_lemonade_pinning_and_effort_spelling_are_documented():
+    """The pin surface and the `default`/`off` reconciliation stay in the
+    user-facing docs, not only in the plan file."""
+    config = _norm((ROOT / "docs" / "CONFIG.md").read_text(encoding="utf-8"))
+    guide = _norm((ROOT / "MODEL_GUIDE.md").read_text(encoding="utf-8"))
+    for text in (config, guide):
+        assert "internal/pin" in text
+        assert "/servers pin" in text
+        assert "shipped spelling of the plan's `off`" in text

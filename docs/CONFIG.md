@@ -364,6 +364,17 @@ environment; adding a name or `PREFIX*` pattern to `env_passthrough` exposes
 just that variable while the allow-list scrub stays on. A project file needs
 `pedacito trust` before its `load_cmd` / `unload_cmd` run.
 
+On **Lemonade Server**, a loaded model can be pinned so its LRU eviction skips
+it. In the GUI open **Servers**, pick the resident model in a Lemonade row and
+click **Pin** or **Unpin**; in the TUI use `/servers pin SERVER [MODEL]` or
+`/servers unpin SERVER [MODEL]`. Pedacito calls Lemonade's
+`POST /internal/pin` with `{"model_name": "...", "pinned": true|false}` and
+tries `/api/v1/internal/pin` when a build only answers that spelling. When
+`LEMONADE_ADMIN_API_KEY` is set it is used for this internal endpoint;
+otherwise the normal Lemonade key or the profile's `api_key` applies. The
+model must already be loaded. Other local runtimes have no pin concept, so the
+action is a no-op there.
+
 ## Memory, skills, and instructions
 
 ### Memory, rules, and skills
@@ -486,6 +497,13 @@ unrecognised family, add the switch your model expects under the profile's
 `sampler` table (user keys survive and merge with the automatic ones).
 Mistral-style role alternation and Gemma's missing system role are handled
 automatically.
+
+`reasoning_effort` accepts `default`, `low`, `medium` and `high`. `default` is
+the shipped spelling of the plan's `off`: it sends no `reasoning_effort`
+parameter at all. The other three values are forwarded verbatim on local-MoE
+and reasoning-capable hosted models, never on models that do not expose the
+control, and they never change sampling. `disable_thinking = true` wins over
+any effort level.
 
 ## Advanced system profiling and auto-tune
 
