@@ -3157,6 +3157,23 @@ function HardwareBadge() {
 }
 
 function serversDialog() {
+  // One registry row per endpoint: every profile pointing at the same URL
+  // shares it. The row is titled after the server itself (kind + host) --
+  // naming it after the first profile (s.name) reads like a model sitting
+  // unloaded on the server. s.name stays the registry key the actions route
+  // by; the profile names ride as a secondary line.
+  const KIND_LABELS = {
+    lemonade: 'Lemonade', lemond: 'Lemonade', 'llama-server': 'llama.cpp',
+    strata: 'Strata', avalon: 'Avalon', 'local-moe': 'Local MoE',
+    local: 'Local server', custom: 'Local server',
+  };
+  function serverTitle(s) {
+    const host = String(s.base_url || '')
+      .replace(/^[a-z][a-z0-9+.-]*:\/\//i, '').split('/')[0];
+    const kind = KIND_LABELS[String(s.kind || '').toLowerCase()]
+      || 'Local server';
+    return host ? kind + ' \u00b7 ' + host : (s.name || kind);
+  }
   const status = h('div', { class: 'muted small-text', style: 'margin-bottom:8px' });
   const list = h('div', {});
   const check = h('input', { type: 'checkbox', checked: !!S.status.auto_evict_servers });
@@ -3231,12 +3248,18 @@ function serversDialog() {
           { server: s.name, model: loaded.length === 1 ? loaded[0] : '' }) });
       list.appendChild(h('div', { class: 'note-box', style: 'margin-bottom:8px' },
         h('div', { class: 'row' },
-          h('b', { text: s.name || '?' }),
+          h('b', { text: serverTitle(s) }),
           h('span', { class: 'tag' + (s.online ? ' act' : ''), text: s.online ? 'online' : 'offline' }),
           h('span', { class: 'tag', text: s.kind || 'custom' }),
           h('span', { class: 'grow' }),
           unloadBtn),
         h('div', { class: 'mono small-text', style: 'margin-top:4px', text: s.base_url || '' }),
+        (s.profiles && s.profiles.length) ? h('div', {
+          class: 'muted small-text', style: 'margin-top:2px',
+          title: s.profiles.join(', '),
+          text: 'profiles: ' + s.profiles.slice(0, 3).join(', ')
+            + (s.profiles.length > 3
+               ? ' + ' + (s.profiles.length - 3) + ' more' : '') }) : null,
         h('div', { class: 'small-text', style: 'margin-top:4px',
           text: loaded.length ? 'resident: ' + loaded.join(', ')
             : (loading.length ? 'loading: ' + loading.join(', ')
@@ -3268,7 +3291,9 @@ function serversDialog() {
     h('label', { class: 'chk', style: 'display:block;margin-top:10px' },
       check, ' Auto-unload other local servers on switch'),
     h('div', { class: 'muted small-text', style: 'margin-top:6px',
-      text: 'Before a run, resident models on other configured local servers are unloaded and VRAM/RAM is polled briefly. A sleeping server is never touched.' }));
+      text: 'Before a run, resident models on other configured local servers are unloaded and VRAM/RAM is polled briefly. A sleeping server is never touched.' }),
+    h('div', { class: 'muted small-text', style: 'margin-top:6px',
+      text: 'Load / unload acts on the server itself (Lemonade: POST /v1/load, /v1/unload) \u2014 it creates no profile and switches nothing. The dropdown is the live catalog the server reports, including models no profile references; running a model still needs a profile pointing at this server with that model id.' }));
   PDC.modal('Servers & memory', body,
     [{ label: 'Refresh', onclick: () => { refresh(); return false; } },
      { label: 'Close' }], { wide: true });
