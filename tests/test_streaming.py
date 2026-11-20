@@ -198,6 +198,33 @@ def test_cancel_event_aborts_mid_stream_immediately(monkeypatch):
     assert client.partial_text == "one"
 
 
+@pytest.mark.parametrize("stream", [True, False])
+def test_cancel_before_response_registration_stops_before_any_read(
+        monkeypatch, stream):
+    """`cancel()` can land between `_post` returning and the response being
+    registered as `_active_response`. Both readers must notice the pending
+    stop immediately after registering, close the response and raise without
+    consuming a line (and without accounting a partial completion)."""
+    cancel = threading.Event()
+    response = Resp([_chunk("late")])
+    _patch_post(monkeypatch, response)
+    client = LLMClient(_cfg())
+    client.echo_stream = False
+
+    def cancelling_post(payload, stream=False):
+        cancel.set()
+        return response
+
+    client._post = cancelling_post
+    with pytest.raises(RunCancelledError):
+        client.chat([{"role": "user", "content": "hi"}], 50,
+                    stream=stream, cancel_event=cancel)
+
+    assert response.consumed == 0
+    assert response.closed
+    assert client.stats["completion_tokens"] == 0
+
+
 def test_buffered_sse_transport_error_on_cancel_is_a_stop(monkeypatch):
     """A non-streaming request answered with SSE is read by
     _consume_stream_response. When cancel() closes the socket from another

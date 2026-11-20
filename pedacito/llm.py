@@ -2701,6 +2701,12 @@ class LLMClient:
                                            on_stream=on_stream)
                 raise
             try:
+                with self._active_response_lock:
+                    self._active_response = r
+                if self._cancel_requested(external_cancel):
+                    raise RunCancelledError(
+                        "Cancelled before the reply was read; nothing was "
+                        "consumed.")
                 if self._response_is_sse(r):
                     # The server chose SSE even though the request asked for a
                     # buffered reply: parse it with the streaming reader so it
@@ -2708,13 +2714,12 @@ class LLMClient:
                     return self._consume_stream_response(
                         r, prompt_est=prompt_est, t0=t0, native=native,
                         cancel_event=external_cancel, on_stream=on_stream)
-                if self._cancel_requested(external_cancel):
-                    raise RunCancelledError(
-                        "Cancelled before the reply was read; nothing was "
-                        "consumed.")
                 return self._consume_buffered_response(
                     r, native=native, prompt_est=prompt_est, t0=t0)
             finally:
+                with self._active_response_lock:
+                    if self._active_response is r:
+                        self._active_response = None
                 _close(r)
 
         # Streaming, so the user sees progress at local-model speeds.
@@ -2847,6 +2852,9 @@ class LLMClient:
         with self._active_response_lock:
             self._active_response = r
         try:
+            if self._cancel_requested(external_cancel):
+                raise RunCancelledError(
+                    "Stopped by user; nothing was read from the reply.")
             for raw in r.iter_lines(decode_unicode=True):
                 if self._cancel_requested(external_cancel):
                     cancelled = True
@@ -3214,6 +3222,9 @@ class LLMClient:
         with self._active_response_lock:
             self._active_response = r
         try:
+            if self._cancel_requested(external):
+                raise RunCancelledError(
+                    "Stopped by user; nothing was read from the reply.")
             for raw in r.iter_lines(decode_unicode=True):
                 if self._cancel_requested(external):
                     self.partial_text = strip_reasoning("".join(out))
