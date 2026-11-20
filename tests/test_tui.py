@@ -184,6 +184,34 @@ def test_tui_append_after_close_is_a_safe_noop(tmp_path):
     assert session.activity == []
 
 
+def test_tui_effort_command_sets_reports_aliases_and_rejects(tmp_path):
+    """`/effort` dispatch + handler: no argument reports the live value,
+    valid levels set the config and source label, aliases collapse to
+    default, and a bad level prints usage without changing anything."""
+    cfg = _cfg(reasoning_effort="medium")
+    session = TuiSession(tmp_path, cfg, headless=True, stdout=io.StringIO())
+    text = lambda: "\n".join(line for _kind, line in session.transcript)
+    try:
+        session.handle_line("/effort")
+        assert "Reasoning effort: medium" in text()
+
+        session.handle_line("/effort high")
+        assert cfg.reasoning_effort == "high"
+        assert cfg.sources["reasoning_effort"] == "tui /effort"
+        assert "sent as reasoning_effort" in text()
+
+        session.handle_line("/effort off")
+        assert cfg.reasoning_effort == "default"
+        assert "no field is sent at default" in text()
+
+        before = cfg.reasoning_effort
+        session.handle_line("/effort banana")
+        assert cfg.reasoning_effort == before
+        assert "Usage: /effort default|low|medium|high" in text()
+    finally:
+        session.close()
+
+
 def test_tui_servers_pin_parses_target_model_and_state(tmp_path, monkeypatch):
     session = TuiSession(tmp_path, _cfg(), headless=True,
                          stdout=io.StringIO())

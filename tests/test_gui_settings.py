@@ -10,7 +10,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from pedacito import config
-from pedacito.config import ConfigError
+from pedacito.config import Config, ConfigError
 from pedacito.gui import core
 from pedacito.gui import settings as S
 from pedacito.gui import settings_api
@@ -564,6 +564,65 @@ def test_autotune_apply_writes_universal_settings(gui):
                     _tune(hardware="16to24", apply=True))[0] == 200
     text = gui.cfg_path.read_text(encoding="utf-8")
     assert _assigned(text, "max_read_tokens") == ["max_read_tokens = 1400"]
+
+
+def test_effort_endpoint_validates_live_value_and_persists(gui, monkeypatch):
+    """The Options-bar Effort selector: valid levels reach the live config,
+    carry the GUI source label and persist to the user file; bad levels are
+    refused without touching either. `default` must send no transport field."""
+    _config(gui)
+    with core.STATE.lock:
+        core.STATE.cfg = Config(reasoning_effort="medium")
+    status, j = gui.post("/api/effort", {"level": "extreme"})
+    assert status == 400 and j["ok"] is False
+    assert "default, low, medium or high" in j["detail"]
+
+    status, j = gui.post("/api/effort", {"level": "high"})
+    assert status == 200 and j["ok"] is True
+    assert j["reasoning_effort"] == "high"
+    assert "model_class" in j
+    with core.STATE.lock:
+        cfg = core.STATE.cfg
+        assert cfg.reasoning_effort == "high"
+        assert cfg.sources["reasoning_effort"] == "GUI Effort selector"
+    text = gui.cfg_path.read_text(encoding="utf-8")
+    assert _assigned(text, "reasoning_effort") == ['reasoning_effort = "high"']
+
+    # The endpoint accepts the setting's own key as well as the UI's `level`.
+    status, j = gui.post("/api/effort", {"reasoning_effort": "low"})
+    assert status == 200 and j["reasoning_effort"] == "low"
+    with core.STATE.lock:
+        assert core.STATE.cfg.reasoning_effort == "low"
+
+    status, j = gui.post("/api/effort", {"level": "default"})
+    assert status == 200 and j["reasoning_effort"] == "default"
+    assert _assigned(gui.cfg_path.read_text(encoding="utf-8"),
+                     "reasoning_effort") == ['reasoning_effort = "default"']
+
+    # At the transport, "default" omits reasoning_effort entirely (the
+    # local-moe client would otherwise forward low/medium/high).
+    payloads = []
+
+    class Reply:
+        status_code = 200
+        text = "{}"
+
+        def json(self):
+            return {"choices": [{"message": {"content": "ok"},
+                                 "finish_reason": "stop"}]}
+
+    def fake_post(url, headers=None, timeout=None, json=None, **kw):
+        payloads.append(dict(json or {}))
+        return Reply()
+
+    monkeypatch.setattr("pedacito.llm.requests.post", fake_post)
+    from pedacito.llm import LLMClient
+    transport = Config(base_url="http://127.0.0.1:8000/v1",
+                       model="deepseek-v4.1-flash", provider="avalon",
+                       reasoning_effort="default")
+    LLMClient(transport).chat([{"role": "user", "content": "hi"}],
+                              max_tokens=16)
+    assert "reasoning_effort" not in payloads[-1]
 
 
 def test_profile_reasoning_overrides_persist(gui):
