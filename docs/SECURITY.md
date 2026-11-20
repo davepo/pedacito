@@ -547,7 +547,8 @@ pedacito ask . -t "fix the retry loop" --apply --save-trajectory
 ```
 
 ```toml
-# user config, .pedacito.toml (after `pedacito trust`), or a profile
+# user config, .pedacito.toml, or a profile -- a local logging flag,
+# honoured like log_sessions without `pedacito trust`
 record_trajectories = true
 ```
 

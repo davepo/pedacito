@@ -453,6 +453,22 @@ def test_security_reporting_names_the_contact_address():
     assert "public issue" in section
 
 
+def test_trajectory_flag_is_documented_as_not_trust_gated():
+    """record_trajectories is a local-only logging flag (like log_sessions),
+    not an EXEC_FIELDS setting: SECURITY.md must not tell users to run
+    `pedacito trust` before a project file can set it, and the trust list
+    must not grow to include it."""
+    from pedacito.config import EXEC_FIELDS
+    assert "record_trajectories" not in EXEC_FIELDS
+    text = (ROOT / "docs" / "SECURITY.md").read_text(encoding="utf-8")
+    section = text.split("## Trajectory export", 1)[1].split("\n## ", 1)[0]
+    assert "after `pedacito trust`" not in section
+    assert "without `pedacito trust`" in section
+    trust = text.split("### Project config is not trusted by default",
+                       1)[1].split("\n### ", 1)[0]
+    assert "record_trajectories" not in trust
+
+
 def test_readme_names_the_project_website_and_contact():
     readme = (ROOT / "README.md").read_text(encoding="utf-8")
     assert "https://www.pedacito.dev" in readme
