@@ -633,7 +633,15 @@ def _run_hook(command: str, server: dict, model: str, cfg=None
         text = text.replace("{model}", model or "").replace(
             "{server}", str(server.get("base_url") or ""))
         try:
-            argv = shlex.split(text)
+            if os.name != "nt":
+                argv = shlex.split(text)
+            else:
+                # POSIX shlex eats Windows path backslashes; non-POSIX keeps
+                # them and leaves surrounding quotes to strip (the same
+                # split tools._split_command uses).
+                argv = [p[1:-1] if len(p) >= 2 and p[0] == p[-1]
+                        and p[0] in "\"'" else p
+                        for p in shlex.split(text, posix=False)]
         except ValueError as exc:
             return False, f"cannot parse command: {exc}"
     if not argv:

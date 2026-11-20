@@ -424,6 +424,37 @@ def test_lifecycle_hook_env_policy_scrub_off_and_passthrough(
     assert "OPENAI_API_KEY" not in env
 
 
+def test_run_hook_windows_split_keeps_backslashes_and_strips_quotes(
+        monkeypatch):
+    """A Windows load_cmd with quoted backslash paths must reach argv
+    intact: POSIX shlex eats the backslashes, and the non-POSIX split keeps
+    surrounding quotes that need stripping (tools._split_command pattern)."""
+    seen = {}
+
+    def fake_run(argv, **kw):
+        seen["argv"] = list(argv)
+        return SimpleNamespace(returncode=0, stdout="loaded", stderr="")
+
+    monkeypatch.setattr(servers.os, "name", "nt")
+    monkeypatch.setattr(servers.subprocess, "run", fake_run)
+    server = {"name": "llama", "base_url": "http://127.0.0.1:8080/v1"}
+    # Unquoted backslash path: POSIX shlex eats every backslash.
+    ok, detail = servers._run_hook(
+        'C:\\tools\\llama\\llama-server.exe --load "{model}"',
+        server, "gemma-3-27b", None)
+    assert ok, detail
+    assert seen["argv"] == ["C:\\tools\\llama\\llama-server.exe",
+                            "--load", "gemma-3-27b"]
+    # Quoted path ending in a backslash: POSIX reads \" as an escaped quote
+    # and fails to close the quotation; non-POSIX keeps the path intact.
+    ok, detail = servers._run_hook(
+        '"C:\\Program Files\\llama\\" --load {model}',
+        server, "gemma-3-27b", None)
+    assert ok, detail
+    assert seen["argv"] == ["C:\\Program Files\\llama\\",
+                            "--load", "gemma-3-27b"]
+
+
 def test_unload_hook_uses_the_caller_config_env_policy(monkeypatch, tmp_path):
     """`_server_action` threads the caller's cfg into `_run_hook`, so
     `scrub_env = false` is honoured on the public unload path too."""
