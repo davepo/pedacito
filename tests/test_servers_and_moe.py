@@ -9,6 +9,8 @@ and the GUI tests reuse ``test_gui``'s isolated server fixture.
 # ruff: noqa: F811
 from __future__ import annotations
 
+import json
+import re
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -171,6 +173,94 @@ def test_load_and_strata_hook_payload(monkeypatch, tmp_path):
     result = servers.unload_server_model("strata", "qwen3.8-flash", cfg)
     assert result["ok"] is True and result["method"] == "command unload_cmd"
     assert marker.read_text(encoding="utf-8") == "qwen3.8-flash"
+
+
+_HOOK_ENV_DUMP = (
+    "import json, os, sys\n"
+    "with open(sys.argv[1], 'w', encoding='utf-8') as fh:\n"
+    "    json.dump(dict(os.environ), fh)\n"
+)
+
+
+def _dump_hook_env(env_file, cfg, *, server=None, model="qwen3.8-flash"):
+    server = server or {"name": "strata",
+                        "base_url": "http://127.0.0.1:8001/v1"}
+    ok, detail = servers._run_hook(
+        [sys.executable, "-c", _HOOK_ENV_DUMP, str(env_file)],
+        server, model, cfg)
+    assert ok, detail
+    return json.loads(env_file.read_text(encoding="utf-8"))
+
+
+def test_lifecycle_hook_env_names_cannot_alias_config_overrides():
+    """PEDACITO_<KEY> overrides config; the two hook names must not match a
+    key (PEDACITO_MODEL would have changed the child's own profile)."""
+    assert "server_name" not in config_mod._FIELDS
+    assert "model_path" not in config_mod._FIELDS
+
+
+def test_lifecycle_hook_env_is_scrubbed_and_uses_documented_names(
+        monkeypatch, tmp_path):
+    ambient = ("OPENAI_API_KEY", "GITHUB_TOKEN", "AWS_SECRET_ACCESS_KEY",
+               "DB_PASSWORD", "PEDICITO_SERVER", "PEDICITO_MODEL")
+    for name in ambient:
+        monkeypatch.setenv(name, "ambient-should-not-leak")
+
+    env = _dump_hook_env(tmp_path / "hook-env.json", Config())
+
+    for name in ambient:
+        assert name not in env, name
+    assert not any(
+        re.search(r"(?i)(?:api_?key|token|secret|passw|credential|access_?key)",
+                  key) for key in env)
+    assert env["PEDACITO_SERVER_NAME"] == "strata"
+    assert env["PEDACITO_MODEL_PATH"] == "qwen3.8-flash"
+    assert not any(key.startswith("PEDICITO_") for key in env)
+    assert "PATH" in env
+
+
+def test_lifecycle_hook_env_policy_scrub_off_and_passthrough(
+        monkeypatch, tmp_path):
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-ambient")
+    monkeypatch.setenv("DATABASE_URL", "postgres://user:pw@db/app")
+
+    unscubbed = Config()
+    unscubbed.scrub_env = False
+    env = _dump_hook_env(tmp_path / "hook-env-off.json", unscubbed)
+    assert env["OPENAI_API_KEY"] == "sk-ambient"
+
+    passthrough = Config()
+    passthrough.env_passthrough = ["DATABASE_URL"]
+    env = _dump_hook_env(tmp_path / "hook-env-pass.json", passthrough)
+    assert env["DATABASE_URL"] == "postgres://user:pw@db/app"
+    assert "OPENAI_API_KEY" not in env
+
+
+def test_unload_hook_uses_the_caller_config_env_policy(monkeypatch, tmp_path):
+    """`_server_action` threads the caller's cfg into `_run_hook`, so
+    `scrub_env = false` is honoured on the public unload path too."""
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-ambient")
+    env_file = tmp_path / "public-hook-env.json"
+    dumper = tmp_path / "dump_env.py"
+    dumper.write_text(_HOOK_ENV_DUMP, encoding="utf-8")
+    cfg = _cfg_with({
+        "strata": {"base_url": "http://127.0.0.1:8001/v1",
+                   "model": "qwen3.8-flash", "provider": "strata"},
+    }, active="strata")
+    cfg.scrub_env = False
+    cfg.profiles["strata"]["unload_cmd"] = (
+        f'"{sys.executable}" "{dumper}" "{env_file}"')
+
+    monkeypatch.setattr(
+        servers.requests, "post",
+        lambda *a, **k: SimpleNamespace(status_code=404, text="not found"))
+    result = servers.unload_server_model("strata", "qwen3.8-flash", cfg)
+
+    assert result["ok"] is True and result["method"] == "command unload_cmd"
+    env = json.loads(env_file.read_text(encoding="utf-8"))
+    assert env["OPENAI_API_KEY"] == "sk-ambient"
+    assert env["PEDACITO_SERVER_NAME"] == "strata"
+    assert env["PEDACITO_MODEL_PATH"] == "qwen3.8-flash"
 
 
 def test_evict_other_local_servers_unloads_idle_local_server(monkeypatch):

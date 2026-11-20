@@ -1322,10 +1322,16 @@ def run_verify(root: Path, command: str, timeout: int = 600, cfg=None
                ) -> tuple[bool, str]:
     """Run `command` (a shell string) in `root`. Returns (passed, output).
 
-    The whole process group is killed on timeout, so a GUI/launcher child
-    cannot keep a window alive after the check gives up."""
+    The command is user-authored config, so it still runs through the shell,
+    but its environment is the same allow-list scrub model-chosen commands
+    get: ambient API keys and tokens never reach it. `proc.run` still prepends
+    the project's venv bin directories to PATH via `with_venv_path`, so a bare
+    `pytest`/`ruff` resolves as before. The whole process group is killed on
+    timeout, so a GUI/launcher child cannot keep a window alive after the
+    check gives up."""
     rc, out, stopped, _ = proc_mod.run(
-        command, cwd=root, timeout=timeout, shell=True, max_output=200_000)
+        command, cwd=root, timeout=timeout, shell=True, max_output=200_000,
+        env=safety.child_env(cfg))
     if stopped == "timeout":
         return False, f"(verification timed out after {timeout}s)"
     if stopped == "error":

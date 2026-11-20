@@ -48,6 +48,8 @@ from urllib.parse import urlparse
 
 import requests
 
+from . import safety
+
 GIB = 1024 ** 3
 MEMINFO_PATH = Path("/proc/meminfo")
 DRM_ROOT = Path("/sys/class/drm")
@@ -583,12 +585,17 @@ def _post_json(url: str, headers: dict, payload: dict | None,
     return ok, body or str(getattr(resp, "status_code", "")), resp
 
 
-def _run_hook(command: str, server: dict, model: str) -> tuple[bool, str]:
+def _run_hook(command: str, server: dict, model: str, cfg=None
+              ) -> tuple[bool, str]:
     """Run a configured load/unload command with shell=False.
 
     `{model}` and `{server}` are textual substitutions, never shell syntax;
     shlex.split + shell=False keeps a project config from doing anything a
-    plain argv cannot."""
+    plain argv cannot. The child gets the same allow-list-scrubbed
+    environment as every other model-chosen command (`safety.child_env`),
+    plus two names that cannot alias a `PEDACITO_<KEY>` config override:
+    `PEDACITO_SERVER_NAME` and `PEDACITO_MODEL_PATH`.
+    """
     text = str(command or "").strip()
     if not text:
         return False, "no command configured"
@@ -605,14 +612,17 @@ def _run_hook(command: str, server: dict, model: str) -> tuple[bool, str]:
             return False, f"cannot parse command: {exc}"
     if not argv:
         return False, "empty command"
+    env = safety.child_env(cfg, extra={
+        "PEDACITO_SERVER_NAME": str(
+            server.get("name") or server.get("base_url") or ""),
+        "PEDACITO_MODEL_PATH": model or "",
+    })
     try:
         proc = subprocess.run(
             argv, shell=False, capture_output=True, text=True,
             encoding="utf-8", errors="replace",
             timeout=COMMAND_TIMEOUT,
-            env={**os.environ,
-                 "PEDICITO_SERVER": str(server.get("base_url") or ""),
-                 "PEDICITO_MODEL": model or ""})
+            env=env)
     except (OSError, subprocess.SubprocessError) as exc:
         return False, f"{type(exc).__name__}: {str(exc)[:200]}"
     detail = (proc.stdout or proc.stderr or "").strip()[:300]
@@ -706,7 +716,7 @@ def _server_action(server, action: str, model: str, config) -> dict:
         ok, method, detail = _generic_action(server, action, model)
     hook = str(server.get(f"{action}_cmd") or "")
     if not ok and hook:
-        hook_ok, hook_detail = _run_hook(hook, server, model)
+        hook_ok, hook_detail = _run_hook(hook, server, model, config)
         if hook_ok:
             ok, method, detail = True, f"command {action}_cmd", hook_detail
         else:

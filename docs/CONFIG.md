@@ -345,6 +345,25 @@ scrubbed environment plus `PEDACITO_EVENT`, and a timeout (`hook_timeout`,
 event. A hook that fails or times out is a warning, not an error. Hooks from
 a project's own `.pedacito.toml` only run after `pedacito trust`.
 
+### Server lifecycle commands
+
+A local profile's `load_cmd` / `unload_cmd` are the fallback when the runtime's
+own lifecycle API cannot load or unload the model. They run as an argv — never
+through a shell — with the same scrubbed environment as hooks
+(`scrub_env` / `env_passthrough`), a 120-second timeout, and the
+`{model}` / `{server}` textual substitutions. They also receive:
+
+| Variable | Value |
+|---|---|
+| `PEDACITO_SERVER_NAME` | the configured server name, or its base URL when unnamed |
+| `PEDACITO_MODEL_PATH` | the model id or path passed to the load/unload action |
+
+Neither name is a Pedacito setting, so it cannot shadow a `PEDACITO_<KEY>`
+config override. With `scrub_env = false` these commands inherit the ambient
+environment; adding a name or `PREFIX*` pattern to `env_passthrough` exposes
+just that variable while the allow-list scrub stays on. A project file needs
+`pedacito trust` before its `load_cmd` / `unload_cmd` run.
+
 ## Memory, skills, and instructions
 
 ### Memory, rules, and skills
@@ -619,6 +638,7 @@ config --reference` prints the annotated template. Key settings:
 | `context_tokens` | `8192` | Server-side context window. With `auto_detect_context` on (the default) the server's reported window replaces it; set it explicitly when detection is wrong. |
 | `auto_tune` | false | Opt in to hardware/probe-driven tuning of context, retrieval budgets and timeout. Off by default: nothing changes until it is true. See [Advanced system profiling and auto-tune](#advanced-system-profiling-and-auto-tune). |
 | `profile_probe_on_load` | true | Schedule the background speed probe once per server+model after a successful explicit load. `false` = no probe thread starts after a load; `pdc profile --run` still works. |
+| `load_cmd` / `unload_cmd` | `""` / `""` | Fallback argv for a runtime with no usable lifecycle endpoint. Scrubbed environment plus `PEDACITO_SERVER_NAME` / `PEDACITO_MODEL_PATH`. See [Server lifecycle commands](#server-lifecycle-commands). |
 | `model_params_b` / `model_active_params_b` | 0 / 0 | Explicit parameter counts (billions) for the footprint estimate; active is the MoE experts used per token. 0 = discover, then fall back to name heuristics with lower confidence. |
 | `model_layers` / `model_kv_heads` / `model_head_dim` | 0 / 0 / 0 | Explicit KV-cache geometry. Missing fields lower the estimate's `confidence` instead of being reported as measured. |
 | `model_quant` / `model_arch` | `""` / `""` | Explicit weight quantization (`q4`, `Q4_K_M`, `q8`, `f16`, ...) and `dense`/`moe`. Empty = infer from server metadata, then the model id. |

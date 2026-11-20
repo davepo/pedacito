@@ -8,6 +8,8 @@ is under test.
 """
 from __future__ import annotations
 
+import json
+import os
 import sys
 import types
 from pathlib import Path
@@ -2308,6 +2310,68 @@ def test_run_verify_runs_in_project_root(tmp_path):
     bad, out = loop.run_verify(
         tmp_path, f'"{sys.executable}" -c "import sys; sys.exit(3)"')
     assert bad is False
+
+
+_VERIFY_ENV_DUMP = (
+    "import json, os, sys\n"
+    "with open(sys.argv[1], 'w', encoding='utf-8') as fh:\n"
+    "    json.dump(dict(os.environ), fh)\n"
+)
+
+
+def _verify_env(tmp_path, cfg, name="verify-env.json"):
+    dumper = tmp_path / "dump_verify_env.py"
+    dumper.write_text(_VERIFY_ENV_DUMP, encoding="utf-8")
+    out = tmp_path / name
+    ok, text = loop.run_verify(
+        tmp_path, f'"{sys.executable}" "{dumper}" "{out}"', cfg=cfg)
+    assert ok, text
+    return json.loads(out.read_text(encoding="utf-8"))
+
+
+def test_run_verify_scrubs_ambient_credentials(tmp_path, monkeypatch):
+    ambient = ("OPENAI_API_KEY", "GITHUB_TOKEN", "AWS_SECRET_ACCESS_KEY",
+               "DB_PASSWORD")
+    for key in ambient:
+        monkeypatch.setenv(key, "ambient-should-not-leak")
+
+    env = _verify_env(tmp_path, Config())
+
+    for key in ambient:
+        assert key not in env, key
+    assert "PATH" in env
+
+
+def test_run_verify_keeps_venv_path_prepending_on_scrubbed_env(
+        tmp_path, monkeypatch):
+    bin_dir = "Scripts" if os.name == "nt" else "bin"
+    venv_bin = tmp_path / ".venv" / bin_dir
+    venv_bin.mkdir(parents=True)
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-ambient")
+
+    env = _verify_env(tmp_path, Config(), "verify-venv-env.json")
+
+    parts = env["PATH"].split(os.pathsep)
+    assert str(venv_bin) in parts
+    assert parts.index(str(venv_bin)) == 0
+    assert "OPENAI_API_KEY" not in env
+
+
+def test_run_verify_honors_scrub_env_false_and_env_passthrough(
+        tmp_path, monkeypatch):
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-ambient")
+    monkeypatch.setenv("DATABASE_URL", "postgres://user:pw@db/app")
+
+    unscubbed = Config()
+    unscubbed.scrub_env = False
+    env = _verify_env(tmp_path, unscubbed, "verify-off.json")
+    assert env["OPENAI_API_KEY"] == "sk-ambient"
+
+    passthrough = Config()
+    passthrough.env_passthrough = ["DATABASE_URL"]
+    env = _verify_env(tmp_path, passthrough, "verify-pass.json")
+    assert env["DATABASE_URL"] == "postgres://user:pw@db/app"
+    assert "OPENAI_API_KEY" not in env
 
 
 # ---------------------------------------------------------------- run_task

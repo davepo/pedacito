@@ -319,10 +319,13 @@ does not chase a blocked write as if it were a code bug.
 | `verify_tests` after an edit | Yes | Scrubbed | Test timeout |
 | `pedacito serve` (background dev servers) | **No** | Scrubbed | Kept running until stopped |
 | `browser`, `lsp`, MCP servers | **No** | Scrubbed | `lsp_timeout` (10 s), MCP discovery 5 s per server |
-| Hooks and `auto_verify` (your own commands) | **No** (by design) | Scrubbed for hooks | Hook timeout |
+| Hooks and `auto_verify` (your own commands) | **No** (by design) | Scrubbed for hooks (+ `PEDACITO_EVENT`); `auto_verify` also scrubbed | Hook timeout |
+| Server lifecycle `load_cmd` / `unload_cmd` (trusted config) | **No** (by design) | Scrubbed allow-list + `PEDACITO_SERVER_NAME` / `PEDACITO_MODEL_PATH` | 120 s |
 | GUI **Run** tab (you click it) | **No** | Credential variables removed (see below) | 15 s default, or the value you set |
 
 Your own hooks and `auto_verify` command are yours, so they are not sandboxed.
+Server lifecycle commands are in the same bucket: argv-only, not sandboxed,
+not shelled, and given the two documented variables above.
 
 ### Process control and timeouts
 
@@ -357,6 +360,14 @@ Other limits:
   `env_passthrough = ["DATABASE_URL", "AWS_*"]`.
 - **Browser `eval`** runs model-written JavaScript, so it is restricted to the hosts in
   `browser_eval_hosts`.
+
+The environment policy has three per-surface tiers:
+
+| Tier | Surfaces | Policy |
+|---|---|---|
+| Allow-list scrub | agent tools, tests, dev servers, browser/LSP/MCP, hooks, `auto_verify`, server `load_cmd`/`unload_cmd` | `safety.child_env`: only `PATH`, `HOME`, locale and toolchain variables; `env_passthrough` adds names or `PREFIX*` patterns; `scrub_env = false` disables the scrub for trusted setups |
+| Run-tab deny-list | GUI/TUI **Run** tab | Only credential-shaped names are removed; other ambient variables still pass (see Known limits) |
+| Trusted config | hooks, `auto_verify`, server lifecycle commands | Not sandboxed by design. Environment uses the allow-list scrub above; hooks also get `PEDACITO_EVENT`, lifecycle commands get `PEDACITO_SERVER_NAME` / `PEDACITO_MODEL_PATH` |
 
 ### The permission broker
 
@@ -526,6 +537,11 @@ These are real boundaries. Read them before you rely on Pedacito for untrusted c
   reaches the program you start from that tab. Examples are a `DATABASE_URL` that embeds a
   password, or a vendor variable without a conventional suffix. The deny-list is also not a
   sandbox. Use `run` with the sandbox, or keep untrusted projects off the Run tab.
+- **Server lifecycle commands are not sandboxed.** `load_cmd` / `unload_cmd` from a
+  trusted config run as an argv with the allow-list-scrubbed environment plus
+  `PEDACITO_SERVER_NAME` / `PEDACITO_MODEL_PATH`. They are not shelled, but they are
+  also not sandboxed, and `scrub_env = false` hands them the ambient environment.
+  Keep that switch off in configs you have not read.
 - **Dev servers, browser, LSP and MCP servers are not sandboxed.** They get a scrubbed
   environment, protected paths, allow-lists and trust prompts. A server you configure is a
   program you chose to run.
