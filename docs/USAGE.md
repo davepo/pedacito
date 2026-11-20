@@ -480,6 +480,28 @@ fenced Python blocks. A mention that matches no unique file or symbol is not pin
 `/pin` shows the pins for this session. `/pin add REF` adds one explicitly, `/pin remove REF`
 removes one, and `/pin clear` removes them all.
 
+### Skills: catalog on demand, and manual injection
+
+Skills are markdown checklists with YAML frontmatter (`name`, `description`, optional
+`triggers`). Pedacito keeps the catalog in the prompt (names and one-line descriptions) and
+loads a full body only when the model asks for it with the `skill` action. Up to two trigger
+matches are selected automatically for a task. Project skills override user skills, which
+override the bundled library; `pedacito skills list|show|add|draft|rm` manages the files.
+
+To force one into the next task yourself, without waiting for a trigger match:
+
+```text
+/skill add-a-test          # TUI: load the full body into the next task
+```
+
+The body is validated now, then carried through the same **Explicitly Pinned Context** block
+as `@file`/`@symbol` pins, above the map, and it is never evicted by token pruning.
+`/skills` lists names, `/pin remove skill:add-a-test` unpins one, and `/pin clear` unpins
+everything. In the GUI open **Skills library & creator**, use **Use in next task** on any
+skill; the pinned list in the dialog (and the 📌 Pinned row above the composer) shows what
+will be injected, with Remove and Clear skills actions. A skill pin is a normal
+session pin (`skill:add-a-test`), so it rides every task until you remove it.
+
 ## More commands
 
 ### `chat`: interactive session
@@ -548,7 +570,7 @@ MCP tool, sensitive file read or shell command asks in the prompt bar:
 Slash commands: `/help`, `/keys`, `/status` (`/telemetry`), `/auto GOAL`,
 `/plan [GOAL]`, `/consolidate` (`/compact`), `/profile [NAME]`, `/model ID`,
 `/auto-route [on|off]`, `/think [on|off]`, `/creative [on|off|auto]`,
-`/apply [on|off]`, `/verify on|off|status`, `/skills`,
+`/apply [on|off]`, `/verify on|off|status`, `/skills`, `/skill NAME`,
 `/memory`, `/procs`, `/diff`, `/undo`, `/reset`, `/sidebar`, `/scroll
 up|down|top|bottom|N`, `/mouse [on|off]`, `/clear`, `/quit`. A plain line is a
 task and runs through the normal gather/edit/verify loop. `/creative on` forces

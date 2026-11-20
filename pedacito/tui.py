@@ -24,7 +24,7 @@ under a lock.
 Slash commands mirror `pedacito chat` and add the TUI-specific panes:
 `/help`, `/status` (`/telemetry`), `/auto`, `/plan`, `/consolidate`
 (`/compact`), `/profile`, `/auto-route`, `/think`, `/apply`, `/verify`,
-`/skills`, `/memory`, `/procs`, `/diff`, `/checkpoints`, `/undo`, `/checkout`,
+`/skills`, `/skill NAME`, `/memory`, `/procs`, `/diff`, `/checkpoints`, `/undo`, `/checkout`,
 `/run`, `/fix`, `/update`, `/reset`, `/sidebar`, `/clear`, and `/quit`
 (`/exit`).
 """
@@ -131,7 +131,8 @@ _SLASH_COMMANDS = [
     "/help", "/keys", "/status", "/telemetry", "/new", "/auto", "/auto!", "/plan",
     "/consolidate", "/compact", "/profile", "/profiles", "/model",
     "/auto-route", "/think", "/effort", "/creative", "/servers", "/unload",
-    "/apply", "/verify", "/skills", "/memory", "/procs", "/security", "/theme",
+    "/apply", "/verify", "/skills", "/skill", "/memory", "/procs", "/security",
+    "/theme",
     "/pin", "/rules", "/hybrid", "/arena",
     "/diff", "/checkpoints", "/undo", "/checkout", "/run", "/fix",
     "/update",
@@ -211,6 +212,9 @@ Pedacito TUI commands
                             test command, off clears it, status shows the
                             gates, repair rounds and ratchet
   /skills [list|show NAME|draft TEXT]
+  /skill NAME               load a skill's full checklist into the next
+                            task through the pinned-context block; /pin
+                            remove skill:NAME or /pin clear unpins it
   /memory [list|add FACT|forget TEXT]
   /procs [list|logs NAME|stop NAME]
   /pin [list|add REF|remove REF|clear]
@@ -2868,6 +2872,9 @@ class TuiSession:
         if cmd == "skills":
             self._skills(arg)
             return
+        if cmd == "skill":
+            self._skill(arg)
+            return
         if cmd == "memory":
             self._memory(arg)
             return
@@ -3698,6 +3705,34 @@ class TuiSession:
             self._append(f"Drafted skill '{draft['name']}' -> {path}", "system")
             return
         self._append("Usage: /skills [list|show NAME|draft TEXT]", "error")
+
+    def _skill(self, arg: str) -> None:
+        """`/skill NAME` -- load a skill body into the next task's pinned
+        context. The body is read through `skills.load`, validated now, and
+        stored as a `skill:NAME` pin so every later task (and `/pin list`)
+        sees exactly the same pinned-context mechanism as @file/@symbol."""
+        name = arg.strip().lower()
+        if not name:
+            self._append(
+                "Usage: /skill <name> \u2014 loads the full skill checklist "
+                "into the next task's pinned context. `/skills` lists names.",
+                "error")
+            return
+        text, info = skills_mod.load(self.root, self.cfg, name)
+        if info is None:
+            self._append(text, "error")
+            return
+        ref = f"skill:{name}"
+        if ref not in self.pins:
+            self.pins.append(ref)
+            self._sync_pins()
+        source = info.get("source") or "unknown"
+        body = (text.split("\n", 1)[1] if "\n" in text else text).strip()
+        self._append(
+            f"Skill '{name}' pinned for the next task ({source}, "
+            f"{len(body)} chars). It rides in the pinned-context block above "
+            f"the map; `/pin remove {ref}` or `/pin clear` unpins it.",
+            "receipt")
 
     def _memory(self, arg: str) -> None:
         words = arg.split(None, 1)

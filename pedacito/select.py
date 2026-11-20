@@ -759,6 +759,10 @@ def render_pinned_context(pins) -> str:
         if pin.kind == "symbol":
             head = (f"--- pinned symbol {pin.symbol_name} "
                     f"({pin.path} L{pin.start_line}-{pin.end_line})")
+        elif pin.kind == "skill":
+            head = f"--- pinned skill {pin.symbol_name}"
+            if pin.path and pin.path != "bundled":
+                head += f" ({pin.path})"
         else:
             head = (f"--- pinned file {pin.path} "
                     f"(L{pin.start_line}-{pin.end_line})")

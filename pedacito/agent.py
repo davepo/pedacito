@@ -2270,8 +2270,34 @@ class Agent:
         self.pinned_context = ""
         try:
             pins = select_mod.parse_pinned_references(task, self.index)
+            refs = [str(ref).strip() for ref in
+                    (getattr(self.cfg, "_pinned_refs", ()) or ())
+                    if str(ref).strip()]
+            # `skill:NAME` refs are the manual `/skill NAME` (TUI) and
+            # "Use in next task" (GUI) injection. They ride the same
+            # pinned-context block as @file/@symbol, resolved here where the
+            # Config is available so the shipped project/user/bundled
+            # precedence applies.
+            skill_refs = [ref for ref in refs
+                          if ref.lower().startswith("skill:")]
+            file_refs = [ref for ref in refs
+                         if not ref.lower().startswith("skill:")]
             pins.extend(select_mod.resolve_pinned_references(
-                getattr(self.cfg, "_pinned_refs", ()) or (), self.index))
+                file_refs, self.index))
+            for ref in skill_refs:
+                name = ref.split(":", 1)[1].strip()
+                if not name:
+                    continue
+                text, info = skills_mod.load(self.index.root, self.cfg, name)
+                if info is None:
+                    continue
+                # `load` returns "SKILL name (source):\n<body>"; keep the
+                # full body and let render_pinned_context supply the header.
+                body = text.split("\n", 1)[1] if "\n" in text else text
+                pins.append(select_mod.PinnedContext(
+                    raw_token=ref, kind="skill",
+                    path=str(info.get("source") or ""),
+                    symbol_name=name.strip().lower(), content=body))
             self.pinned_items = select_mod._dedupe_pins(pins)
         except Exception:
             self.pinned_items = []

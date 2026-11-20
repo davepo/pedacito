@@ -2774,6 +2774,7 @@ function skillsDialog() {
   const detail = h('div', {});
   const editor = h('div', {});
   const note = h('div', { class: 'muted small-text' });
+  const pinBox = h('div', {});
   let rows = [], matchNames = [];
   const filter = h('input', { type: 'text', class: 'grow', spellcheck: false,
     placeholder: 'filter by name or description\u2026',
@@ -2783,6 +2784,59 @@ function skillsDialog() {
     onkeydown: (e) => { if (e.key === 'Enter') previewMatches(); } });
   const newBtn = h('button', { class: 'primary', text: '+ New Custom Skill',
     onclick: () => openEditor(null) });
+
+  // Manual injection: a pinned skill rides the same request-level `pinned`
+  // list as @file/@symbol picks, so the server's existing pinned-context
+  // block receives its full checklist body.
+  function skillRef(name) { return 'skill:' + name; }
+  function isSkillPinned(name) {
+    return S.pinned.some((p) => p.insert === skillRef(name));
+  }
+  function pinSkill(r) {
+    if (!isSkillPinned(r.name)) {
+      S.pinned.push({ kind: 'skill', label: r.name, insert: skillRef(r.name),
+        skillName: r.name,
+        detail: (r.scope || 'skill') + ' skill: ' + (r.description || '') });
+    }
+    emit();
+    paintPins();
+    paintList();
+    PDC.toast('Skill \u201c' + r.name + '\u201d will be injected into the next task.');
+  }
+  function unpinSkill(name) {
+    S.pinned = S.pinned.filter((p) => p.insert !== skillRef(name));
+    emit();
+    paintPins();
+    paintList();
+    PDC.toast('Removed \u201c' + name + '\u201d from the next task.');
+  }
+  function paintPins() {
+    PDC.clear(pinBox);
+    const pins = S.pinned.filter((p) => String(p.insert || '').indexOf('skill:') === 0);
+    if (!pins.length) return;
+    const box = h('div', { class: 'note-box', style: 'margin:6px 0' },
+      h('div', { class: 'row' },
+        h('b', { text: 'Pinned for the next task' }),
+        h('span', { class: 'grow muted small-text',
+          text: 'full checklist body, injected through the pinned-context block' }),
+        h('button', { class: 'ghost small', text: 'Clear skills', onclick: () => {
+          S.pinned = S.pinned.filter((p) => String(p.insert || '').indexOf('skill:') !== 0);
+          emit(); paintPins(); paintList();
+        } })));
+    pins.forEach((p) => {
+      const name = p.skillName || p.label;
+      const row = rows.find((x) => x.name === name) || {};
+      const chars = (row.body || '').length;
+      box.appendChild(h('div', { class: 'row small-text', style: 'padding:2px 0' },
+        h('span', { class: 'tag', text: row.scope || 'skill' }),
+        h('b', { text: name }),
+        h('span', { class: 'grow muted',
+          text: (row.description || '') + (chars ? ' \u00b7 ' + chars + ' chars' : '') }),
+        h('button', { class: 'ghost small danger', text: 'Remove',
+          onclick: () => unpinSkill(name) })));
+    });
+    pinBox.appendChild(box);
+  }
 
   function previewMatches() {
     const t = (task.value || '').trim();
@@ -2811,12 +2865,19 @@ function skillsDialog() {
     shown.forEach((r) => {
       const matched = matchNames.indexOf(r.name) >= 0;
       const custom = r.scope !== 'bundled';
+      const pinned = isSkillPinned(r.name);
       list.appendChild(h('div', { class: 'row small-text', style: 'padding:3px 0;cursor:pointer',
         onclick: () => showDetail(r) },
         h('span', { class: 'tag' + (matched ? ' act' : ''), text: r.scope }),
         h('b', { text: r.name, style: 'min-width:200px' }),
         matched ? h('span', { class: 'tag act', text: 'matches task' }) : null,
         h('span', { class: 'grow muted', text: r.description }),
+        h('button', { class: pinned ? 'ghost small' : 'primary small',
+          text: pinned ? 'Pinned for next task' : 'Use in next task',
+          onclick: (e) => {
+            e.stopPropagation();
+            if (pinned) unpinSkill(r.name); else pinSkill(r);
+          } }),
         custom ? h('button', { class: 'ghost small', text: 'Edit', onclick: (e) => {
           e.stopPropagation(); openEditor(r);
         } }) : null,
@@ -2836,11 +2897,15 @@ function skillsDialog() {
 
   function showDetail(r) {
     PDC.clear(detail);
+    const pinned = isSkillPinned(r.name);
     detail.appendChild(h('div', { class: 'note-box', style: 'margin-top:10px' },
       h('div', { class: 'row' },
         h('b', { text: r.name }),
         h('span', { class: 'tag', text: r.scope }),
-        h('span', { class: 'muted small-text grow', text: r.source || '' })),
+        h('span', { class: 'muted small-text grow', text: r.source || '' }),
+        h('button', { class: pinned ? 'ghost small' : 'primary small',
+          text: pinned ? 'Pinned for next task' : 'Use in next task',
+          onclick: () => { if (pinned) unpinSkill(r.name); else pinSkill(r); } })),
       h('div', { class: 'small-text', style: 'margin:4px 0',
         text: 'triggers: ' + ((r.triggers || []).join(', ') || '(none)') }),
       h('pre', { class: 'diffwrap', style: 'max-height:26vh;overflow:auto;margin:0;white-space:pre-wrap',
@@ -2912,14 +2977,17 @@ function skillsDialog() {
   body.appendChild(h('div', { class: 'row', style: 'margin-bottom:8px' },
     task, h('button', { text: 'Preview matches', onclick: previewMatches })));
   body.appendChild(note);
+  body.appendChild(pinBox);
   body.appendChild(list);
   body.appendChild(detail);
   body.appendChild(editor);
+  paintPins();
   PDC.modal('Skills library & creator', body, [{ label: 'Close' }], { wide: true });
   PDC.api('/api/skills').then((j) => {
     if (!j.ok) { note.textContent = j.detail || 'Could not load the skills library.'; return; }
     rows = j.skills || [];
     paintList();
+    paintPins();
   }, () => { note.textContent = 'The GUI server did not answer.'; });
 }
 PDC.skillsDialog = skillsDialog;

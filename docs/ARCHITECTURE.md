@@ -581,6 +581,17 @@ ranking only decides *what* to show when something has to be left out.
 (stack, entry points, test/lint/build commands, directory roles) sits above the
 map, built from your manifests with no model call.
 
+**Repo map and the KV prefix.** The brief and map are placed in **user0** — the
+first user turn — never in the system prompt. `messages[0:2]` is therefore the
+cached prefix every gather step shares within a task, and the system prompt stays
+byte-identical across tasks. Ranking is deterministic for a given index and task,
+so repeated calls return byte-identical map text. `flat_map_token_budget`
+(default 4,000, auto-tuned by the profiler) is the absolute key for the flat
+tier; larger projects fall back to file cards, then a ranked map over a
+directory skeleton. Explicit pins (including a manually injected skill) are
+resolved before automatic retrieval and sit ahead of the map, so they are never
+scored or evicted.
+
 File cards carry blast radius, `imported by: 7 file(s)`, or a labelled
 "no importers or callers found (evidence, not proof)", and cross-link modules
 with their tests (`tested by:` / `tests:`) for Python, JS/TS (`x.test.ts`,

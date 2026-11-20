@@ -4,6 +4,32 @@ All notable changes to Pedacito (`pdc`) are documented here.
 
 ## v0.3.1 — 2026-11-18
 
+### Manual Skill Injection and Repo-Map Regression Pins
+
+- **TUI `/skill NAME`** — loads the full checklist through
+  `skills.load(root, cfg, NAME)` and pins it as a normal session pin
+  (`skill:NAME`), so it reaches the next task through the existing
+  **Explicitly Pinned Context** block, above the map, not through a parallel
+  injection channel. A receipt names the source and body size; an unknown name
+  prints the loader's error plus every available skill, and no argument prints
+  usage. Registered in the slash-command list and `/help`.
+- **GUI “Use in next task”** — the existing Skills library & creator dialog
+  gains a per-skill action plus a pinned-for-the-next-task box showing each
+  selected skill, its scope, description and body size, with Remove and Clear
+  skills actions. It writes `skill:NAME` into the composer's existing `pinned`
+  request list, so it uses the same pinned-context path as @file/@symbol; no
+  new slash-command parser was added.
+- **Regression pins** — tests cover byte-identical map text for the same
+  index + task (including a cleared cache and a fresh index), byte-identical
+  system + user0 across gather steps, the flat map's
+  `flat_map_token_budget` estimate, `.venv`/`node_modules`/`.pedacito` and
+  ignore-file exclusions, project > user > bundled skill precedence, the
+  `skill` tool returning the full body, and `/skill` landing in pinned context
+  and surviving `_trim_gathered` pruning.
+- Docs: USAGE's skills/injection section and TUI command list, and
+  ARCHITECTURE's repo-map/KV-prefix note (map in user0, deterministic ranking,
+  the absolute budget key). Version unchanged.
+
 ### Headless Task Summary (`pdc ask --json`)
 
 - **`pdc ask --json`** — one machine-readable summary object on stdout at run
