@@ -416,30 +416,74 @@ def _restart_argv() -> list[str]:
     return argv
 
 
-def _restart_process(argv: list[str]) -> None:
+def _restart_process(argv: list[str], ready=None, outcome=None) -> dict:
     """Replace this GUI with the freshly upgraded one. Windows has no execv
     semantics (the call returns and the old interpreter keeps running), so
-    spawn the replacement and hard-exit; POSIX replaces the process in place."""
+    spawn the replacement and hard-exit; POSIX replaces the process in place.
+
+    On Windows the spawn can fail (missing interpreter, blocked exec). In that
+    case report it through `outcome` and return without shutting the current
+    server down, so the old GUI keeps serving. `ready` is set once the spawn
+    has succeeded or failed, letting the route answer with the real result."""
+    result = outcome if outcome is not None else {}
     time.sleep(0.5)          # let the HTTP answer reach the page first
-    shutdown_server()
     if os.name == "nt":
-        subprocess.Popen(argv)
+        try:
+            subprocess.Popen(argv)
+        except OSError as exc:
+            result.update(ok=False,
+                          detail="Could not start the restarted Pedacito: "
+                                 f"{type(exc).__name__}: {str(exc)[:200]}")
+            if ready is not None:
+                ready.set()
+            return result
+        result.update(ok=True, detail="")
+        if ready is not None:
+            ready.set()
+            time.sleep(0.2)      # let the route's answer flush first
+        shutdown_server()
         os._exit(0)
-        return
-    os.execv(sys.executable, argv)
+        return result
+    if ready is not None:
+        ready.set()
+    shutdown_server()
+    try:
+        os.execv(sys.executable, argv)
+    except OSError as exc:
+        result.update(ok=False,
+                      detail="Could not restart Pedacito: "
+                             f"{type(exc).__name__}: {str(exc)[:200]}")
+        return result
+    return result
 
 
 @post("/api/update/restart")
 def _update_restart(q, body=None):
     """After a successful upgrade, re-exec this GUI on the SAME port so the
     open page reconnects to the new version. Only offered when the run's
-    exit code was 0."""
+    exit code was 0. On Windows the replacement is spawned before this route
+    answers, so a Popen failure returns its detail and leaves the old GUI
+    running."""
     with STATE.lock:
         ok = bool(STATE.update_run.get("ok"))
     if not ok:
         return 409, {"ok": False,
                      "detail": "No successful upgrade to restart into."}
     argv = _restart_argv()
+    if os.name == "nt":
+        ready = threading.Event()
+        outcome: dict = {}
+        threading.Thread(target=_restart_process, args=(argv,),
+                         kwargs={"ready": ready, "outcome": outcome},
+                         name="pedacito-gui-restart", daemon=True).start()
+        if not ready.wait(5.0):
+            return 500, {"ok": False,
+                         "detail": "The restart did not start in time."}
+        if not outcome.get("ok", True):
+            return 500, {"ok": False,
+                         "detail": outcome.get("detail")
+                                   or "Could not restart Pedacito."}
+        return 200, {"ok": True, "detail": "Restarting Pedacito…"}
     threading.Thread(target=_restart_process, args=(argv,),
                      name="pedacito-gui-restart", daemon=True).start()
     return 200, {"ok": True, "detail": "Restarting Pedacito…"}

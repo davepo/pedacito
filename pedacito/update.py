@@ -50,10 +50,14 @@ CACHE_NAME = "update_check.json"
 # --- version comparison -------------------------------------------------------
 
 # release digits, optional pre/post suffix (PEP 440-ish spellings), optional
-# +local build tag (ignored for ordering). Anything else -> unparseable.
+# +local build tag (ignored for ordering). An implicit post release (`1.0-1`)
+# is the one PEP 440 shorthand accepted; epochs (`1!2.0`) are not parsed
+# (PyPI does not emit them and they would change the key shape). Anything
+# else -> unparseable.
 _VERSION_RE = re.compile(
     r"^\s*v?(\d+(?:\.\d+)*)"
-    r"(?:[-_.]?(a|alpha|b|beta|c|rc|pre|preview|dev|post|rev|r)[-_.]?(\d*))?"
+    r"(?:(?:[-_.]?(a|alpha|b|beta|c|rc|pre|preview|dev|post|rev|r)"
+    r"[-_.]?(\d*))|-(\d+))?"
     r"(?:\+[0-9A-Za-z.-]+)?\s*$",
     re.IGNORECASE)
 _STAGE_RANK = {"dev": 0, "a": 1, "alpha": 1, "b": 2, "beta": 2,
@@ -75,6 +79,8 @@ def parse_version(text: str):
     stage = (m.group(2) or "").lower()
     rank = _STAGE_RANK.get(stage, _FINAL_RANK)
     num = int(m.group(3)) if m.group(3) else 0
+    if m.group(4):
+        rank, num = _STAGE_RANK["post"], int(m.group(4))
     return (release, rank, num)
 
 

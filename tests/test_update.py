@@ -102,6 +102,9 @@ def test_parse_version_shapes():
     assert update_mod.parse_version("1.0rc1") == ((1, 0), 3, 1)
     assert update_mod.parse_version("1.0.0.dev2") == ((1, 0, 0), 0, 2)
     assert update_mod.parse_version("1.0.post1") == ((1, 0), 5, 1)
+    assert update_mod.parse_version("1.0-1") == ((1, 0), 5, 1)
+    assert update_mod.parse_version("1.0.0-12") == ((1, 0, 0), 5, 12)
+    assert update_mod.parse_version("1!2.0") is None      # epoch: not parsed
     assert update_mod.parse_version("1.0+build.5") == ((1, 0), 4, 0)
     assert update_mod.parse_version("banana") is None
     assert update_mod.parse_version("") is None
@@ -110,10 +113,15 @@ def test_parse_version_shapes():
 
 def test_prerelease_ordering():
     order = ["1.0.0.dev1", "1.0.0a1", "1.0.0a2", "1.0.0b1", "1.0.0rc1",
-             "1.0.0", "1.0.0.post1", "1.0.1.dev1", "1.0.1"]
+             "1.0.0", "1.0.0.post1", "1.0.0.post2",
+             "1.0.1.dev1", "1.0.1"]
     for older, newer in zip(order, order[1:]):
         assert update_mod.is_newer(newer, older), (older, newer)
         assert not update_mod.is_newer(older, newer), (older, newer)
+    # PEP 440's implicit post spelling is the same release as `.post1`.
+    assert update_mod.parse_version("1.0.0-1") == \
+        update_mod.parse_version("1.0.0.post1")
+    assert not update_mod.is_newer("1.0.0-1", "1.0.0.post1")
 
 
 def test_is_newer_never_nags_down_or_equal():
@@ -879,6 +887,36 @@ def test_restart_on_windows_spawns_replacement_and_exits(monkeypatch):
                                "--port", "8765", "--no-open", "/tmp/proj",
                                "--profile", "small"]]
     assert calls["exit"] == 0 and calls["execv"] is False
+
+
+def test_gui_restart_reports_a_windows_spawn_failure_and_stays_alive(
+        gui, monkeypatch):  # noqa: F811
+    """A missing/blocked interpreter must not shut the old GUI down or exit;
+    the restart endpoint returns the failure detail so the page can show it."""
+    calls = {"shutdown": False, "exit": None}
+    monkeypatch.setattr(gui_server.os, "name", "nt")
+    monkeypatch.setattr(gui_server.time, "sleep", lambda _s: None)
+    monkeypatch.setattr(gui_server, "_RUN_ARGS", SimpleNamespace(
+        port=8765, open_browser=False, project="", profile=""))
+    monkeypatch.setattr(gui_server, "shutdown_server",
+                        lambda: calls.update(shutdown=True))
+    monkeypatch.setattr(gui_server.os, "_exit",
+                        lambda code: calls.update(exit=code))
+
+    def refuse(argv, **kw):
+        raise OSError("blocked by policy")
+
+    monkeypatch.setattr(gui_server.subprocess, "Popen", refuse)
+    with core.STATE.lock:
+        core.STATE.update_run = {
+            "running": False, "ok": True, "code": 0, "output": "",
+            "command": [], "detail": "", "cancelling": False,
+        }
+    status, j = gui.post("/api/update/restart", {})
+    assert status == 500 and j["ok"] is False
+    assert "Could not start the restarted Pedacito" in j["detail"]
+    assert "blocked by policy" in j["detail"]
+    assert calls == {"shutdown": False, "exit": None}
 
 
 def test_gui_manual_check_opt_out_never_touches_network(gui, monkeypatch):  # noqa: F811
