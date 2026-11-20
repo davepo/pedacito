@@ -232,6 +232,12 @@ and the sdist. The sdist contains all five `docs/*.md`; the wheel installs them
 under `share/pedacito/docs/` with `README.md`, `QUICKSTART.md` and
 `MODEL_GUIDE.md` alongside.
 
+> **Packaging change after these hashes.** The §7.8 follow-up added
+> `TECHNIQUES.md` and `CHANGELOG.md` to `[tool.setuptools.data-files]` so the
+> README's links resolve in a wheel install. The SHA-256s above predate that
+> change; rebuild both 0.3.1 artifacts at release time and re-run twine before
+> uploading. Do not publish the recorded files.
+
 ### Non-editable install smoke test
 
 A clean venv at `/tmp/opencode/pdc-wheel-smoke` (Python 3.14.10) installed the
