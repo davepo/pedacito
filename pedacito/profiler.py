@@ -1301,6 +1301,10 @@ def probe_model_speed(base_url: str, model: str, config,
 
     try:
         client = LLMClient(cfg)
+        # Construction applies local-moe defaults, which raise a short
+        # timeout to 600 s and would undo the probe's bounded wait; re-cap
+        # it here (requests read cfg.timeout per call).
+        cfg.timeout = min(max(probe_timeout, 10.0), 300.0)
         client.echo_stream = False
         client.site = "probe"
         # Keep the probe off the stdout stream.

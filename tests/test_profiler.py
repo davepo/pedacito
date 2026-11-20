@@ -737,6 +737,26 @@ def test_detect_context_window_does_not_relabel_sources(monkeypatch):
     assert cfg.max_tokens_step == 4096
 
 
+def test_probe_timeout_cap_survives_local_moe_defaults(monkeypatch):
+    """LLMClient construction raises a short local-moe timeout to 600 s,
+    undoing the probe's 10..300 s cap; the cap must be re-applied after
+    construction so the probe keeps its bounded wait."""
+    seen = {}
+
+    def fake_post(url, **kw):
+        seen["timeout"] = kw.get("timeout")
+        raise OSError("offline after capture")
+
+    monkeypatch.setattr(llm.requests, "post", fake_post)
+    cfg = Config(base_url="http://127.0.0.1:1234/v1",
+                 model="qwen3.8-flash", provider="strata", timeout=20)
+    out = profiler.probe_model_speed(cfg.base_url, cfg.model, cfg,
+                                     force=True, context_window=8192)
+    assert out["ok"] is False
+    assert seen["timeout"] == 20                 # not the 600 s moe floor
+    assert cfg.timeout == 20                     # caller's config untouched
+
+
 def test_timing_record_is_populated_after_a_streamed_completion(monkeypatch):
     frames = _sse_frames({"prompt_per_second": 850.0,
                           "predicted_per_second": 42.0},
