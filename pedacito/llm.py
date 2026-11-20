@@ -2774,8 +2774,8 @@ class LLMClient:
         cancelled = False
         dropped: Exception | None = None
         # Live token/char counters and throttled event state. `reported_tokens`
-        # is filled from the final SSE usage frame when the server sends one;
-        # otherwise the count below remains a deterministic estimate.
+        # is filled from SSE usage frames as they arrive; otherwise the count
+        # below remains a deterministic estimate.
         splitter = _StreamThinkSplitter()
         reasoning_parts: list[str] = []
         pending_reasoning: list[str] = []
@@ -2876,6 +2876,11 @@ class LLMClient:
                 sse_data_seen += 1
                 if isinstance(obj, dict) and obj.get("usage"):
                     usage = obj["usage"]
+                    # A usage frame can land before the last deltas; switch
+                    # the live counter to the reported count immediately.
+                    if isinstance(usage, dict) and \
+                            _positive_int(usage.get("completion_tokens")):
+                        reported_tokens = int(usage["completion_tokens"])
                 if isinstance(obj, dict) and obj.get("timings"):
                     timings = obj["timings"]
                 try:
@@ -3230,6 +3235,11 @@ class LLMClient:
                     continue
                 if isinstance(obj, dict) and obj.get("usage"):
                     usage = obj["usage"]
+                    # A usage frame can land before the last deltas; switch
+                    # the live counter to the reported count immediately.
+                    if isinstance(usage, dict) and \
+                            _positive_int(usage.get("completion_tokens")):
+                        reported_tokens = int(usage["completion_tokens"])
                 if isinstance(obj, dict) and obj.get("timings"):
                     timings = obj["timings"]
                 try:

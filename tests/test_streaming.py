@@ -116,6 +116,33 @@ def test_reasoning_and_content_deltas_assemble_and_account_usage(monkeypatch):
     assert any(event["delta_content"] for event in events)
 
 
+@pytest.mark.parametrize("stream", [True, False])
+def test_mid_stream_usage_frame_updates_live_token_count(monkeypatch, stream):
+    """A usage frame can arrive before the last deltas. Live llm_stream
+    events emitted after it must carry the server's reported completion
+    count, not the char estimate -- in the primary streaming loop and in
+    the buffered-SSE reader alike."""
+    lines = [_chunk("start "), _usage(100, 50)]
+    lines.extend(_chunk("x") for _ in range(16))
+    lines.append(_chunk(finish="stop"))
+    lines.append("data: [DONE]")
+    response = Resp(lines)
+    _patch_post(monkeypatch, response)
+    client = LLMClient(_cfg())
+    client.echo_stream = False
+    events = []
+    client.on_stream = events.append
+
+    text = client.chat([{"role": "user", "content": "hi"}], 50, stream=stream)
+
+    assert text == "start " + "x" * 16
+    # The chunk-count flush after the usage frame reports 50 tokens; the
+    # char estimate for ~22 chars would be ~6. The final event is excluded
+    # so a mid-stream event must carry the reported count.
+    assert any(e["tokens_so_far"] == 50 for e in events[:-1]), \
+        [e["tokens_so_far"] for e in events]
+
+
 def test_inline_think_tags_split_across_chunks(monkeypatch):
     lines = [
         _chunk("pre<thi"),
