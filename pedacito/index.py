@@ -734,10 +734,8 @@ class Index:
             "chunks": [c.to_record() for c in self.chunks],
         }
         p = d / INDEX_FILE
-        tmp = d / (INDEX_FILE + ".tmp")
-        tmp.write_text(json.dumps(payload, separators=(",", ":")),
-                       encoding="utf-8")
-        os.replace(tmp, p)
+        fileio.write_bytes(
+            p, json.dumps(payload, separators=(",", ":")).encode("utf-8"))
         return p
 
     @classmethod
@@ -849,9 +847,7 @@ def _save_cache(root: Path, cache: dict) -> None:
     d = root / INDEX_DIR
     d.mkdir(exist_ok=True)
     p = _cache_path(root)
-    tmp = d / (CACHE_FILE + ".tmp")
-    tmp.write_text(json.dumps(cache, indent=1), encoding="utf-8")
-    os.replace(tmp, p)
+    fileio.write_bytes(p, json.dumps(cache, indent=1).encode("utf-8"))
     try:
         st = p.stat()
         with _cache_lock:

@@ -27,7 +27,7 @@ import re
 import time
 from pathlib import Path
 
-from . import safety
+from . import fileio, safety
 
 CATEGORIES = ("commands", "conventions", "landmines", "notes")
 _HEADINGS = {c: c.capitalize() for c in CATEGORIES}
@@ -88,9 +88,7 @@ def _write(path: Path, data: dict[str, list[str]]) -> None:
             lines += [f"- {x}" for x in data[c]]
             lines.append("")
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(".tmp")
-    tmp.write_text("\n".join(lines), encoding="utf-8")
-    tmp.replace(path)
+    fileio.write_bytes(path, "\n".join(lines).encode("utf-8"))
 
 
 def guess_category(text: str) -> str:
@@ -474,9 +472,7 @@ def consolidate_session(root: Path, cfg, messages: list[dict] | None = None,
         summary = _model_handoff(client, facts, summary)
     path = consolidated_file(root)
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(".tmp")
-    tmp.write_text(summary, encoding="utf-8")
-    tmp.replace(path)
+    fileio.write_bytes(path, summary.encode("utf-8"))
     pinned = 0
     if pin_memory and root is not None and getattr(cfg, "use_memory", True):
         for decision in facts["decisions"][:2]:
@@ -654,10 +650,8 @@ def _read_json(path: Path, default):
 def _write_json(path: Path, data) -> None:
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = path.with_suffix(".tmp")
-        tmp.write_text(json.dumps(data, indent=1, sort_keys=True),
-                       encoding="utf-8")
-        tmp.replace(path)
+        fileio.write_bytes(
+            path, json.dumps(data, indent=1, sort_keys=True).encode("utf-8"))
     except OSError:
         pass
 

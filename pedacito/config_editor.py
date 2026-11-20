@@ -21,13 +21,13 @@ loader uses before anything is written.
 
 from __future__ import annotations
 
-import os
 import re
 import tomllib
 from datetime import date
 from pathlib import Path
 
 from . import config as config_mod
+from . import fileio
 from .config import ConfigError
 
 
@@ -408,9 +408,7 @@ def disable_auto_tune_opt_in(path: Path | str, profile: str = "") -> str:
     if new == text:
         return ""
     try:
-        tmp = path.with_name(path.name + ".tmp")
-        tmp.write_text(new, encoding="utf-8")
-        tmp.replace(path)
+        fileio.write_bytes(path, new.encode("utf-8"))
     except OSError:
         return ""
     return str(path)
@@ -697,8 +695,8 @@ def upgrade_config_file(path: Path, dry_run: bool = False) -> list[str]:
     """Upgrade the config file at `path` in place; the added keys, or [] when
     the file is absent/empty or already documents every option.
 
-    The previous contents go to `<path>.bak` and the write is atomic (a `.tmp`
-    sibling plus os.replace). Nothing is written for a dry run."""
+    The previous contents go to `<path>.bak` and the write is atomic (a unique
+    temp sibling plus os.replace). Nothing is written for a dry run."""
     p = Path(path)
     if not p.is_file() or p.stat().st_size == 0:
         return []
@@ -710,17 +708,8 @@ def upgrade_config_file(path: Path, dry_run: bool = False) -> list[str]:
     backup = p.with_name(p.name + ".bak")
     with p.open("rb") as fh:
         old_bytes = fh.read()
-    tmp = p.with_name(p.name + ".tmp")
-    try:
-        with tmp.open("w", encoding="utf-8", newline="") as fh:
-            fh.write(new_text)
-        backup.write_bytes(old_bytes)
-        os.replace(tmp, p)
-    finally:
-        try:
-            tmp.unlink()
-        except OSError:
-            pass
+    backup.write_bytes(old_bytes)
+    fileio.write_bytes(p, new_text.encode("utf-8"))
     return added
 
 

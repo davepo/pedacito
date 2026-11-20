@@ -16,6 +16,7 @@ import requests
 
 from .. import config as config_mod
 from .. import config_editor
+from .. import fileio
 from ..config import USER_CONFIG, ConfigError
 from . import settings
 from .core import STATE
@@ -51,9 +52,7 @@ def write_config(path: Path, text: str) -> None:
             Path(str(path) + ".bak").write_bytes(path.read_bytes())
         except OSError:
             pass
-    tmp = path.with_name(path.name + ".tmp")
-    tmp.write_text(text, encoding="utf-8", newline="")
-    os.replace(tmp, path)
+    fileio.write_bytes(path, text.encode("utf-8"))
 
 
 def _mask(body: dict) -> dict:
@@ -463,9 +462,7 @@ def reset_to_baseline() -> dict:
     text = baseline_text()
     settings.validate_text(text, str(path))
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(path.name + ".tmp")
-    tmp.write_text(text, encoding="utf-8", newline="")
-    os.replace(tmp, path)
+    fileio.write_bytes(path, text.encode("utf-8"))
     out = reload_state_config()
     out["backup"] = backup
     return out

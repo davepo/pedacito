@@ -25,6 +25,7 @@ from pathlib import Path
 
 from . import checkpoints as checkpoints_mod
 from . import events as events_mod
+from . import fileio
 from . import index as index_mod
 from . import llm as llm_mod
 from . import loop as loop_mod
@@ -61,10 +62,9 @@ def _save_last(root, state: dict) -> None:
     _LAST = state
     path = _last_path(root)
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(path.name + ".tmp")
-    tmp.write_text(json.dumps(state, indent=1, ensure_ascii=False) + "\n",
-                   encoding="utf-8")
-    tmp.replace(path)
+    fileio.write_bytes(
+        path,
+        (json.dumps(state, indent=1, ensure_ascii=False) + "\n").encode("utf-8"))
 
 
 def last_arena(root) -> dict | None:

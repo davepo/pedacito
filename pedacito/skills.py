@@ -33,7 +33,7 @@ import json
 import re
 from pathlib import Path
 
-from . import security
+from . import fileio, security
 from .memory import _frontmatter
 
 _NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,40}$")
@@ -622,10 +622,10 @@ def save_skill(root: Path | None, *, name: str, description: str,
     legacy = d / key / "SKILL.md"
     path = legacy if legacy.is_file() else d / f"{key}.md"
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(".tmp")
-    tmp.write_text(_skill_text(key, description, list(triggers or []), body),
-                   encoding="utf-8")
-    tmp.replace(path)
+    fileio.write_bytes(
+        path,
+        _skill_text(key, description, list(triggers or []), body).encode(
+            "utf-8"))
     return path
 
 

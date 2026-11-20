@@ -25,6 +25,7 @@ from pathlib import Path
 from typing import Mapping
 
 from . import config as config_mod
+from . import fileio
 
 __all__ = [
     "THEME_KEYS", "BUILTIN_THEMES", "DEFAULT_THEME",
@@ -149,10 +150,8 @@ def _read_json(path: Path) -> dict:
 def _write_json(path: Path, data: dict) -> None:
     """Atomically replace `path`; a failed write leaves the old file intact."""
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(path.name + ".tmp")
     text = json.dumps(data, indent=2, ensure_ascii=False) + "\n"
-    tmp.write_text(text, encoding="utf-8")
-    os.replace(tmp, path)
+    fileio.write_bytes(path, text.encode("utf-8"))
 
 
 # -------------------------------------------------------------- validation

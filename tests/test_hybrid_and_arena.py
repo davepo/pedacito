@@ -29,6 +29,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from pedacito import arena as arena_mod  # noqa: E402
 from pedacito import checkpoints as cp_mod  # noqa: E402
 from pedacito import events as events_mod  # noqa: E402
+from pedacito import fileio  # noqa: E402
 from pedacito import llm as llm_mod  # noqa: E402
 from pedacito import loop, roles as roles_mod  # noqa: E402
 from pedacito import servers as servers_mod  # noqa: E402
@@ -385,6 +386,27 @@ def _patch_contestants(monkeypatch, steps_by_model=None, fail_models=(),
 
     monkeypatch.setattr(llm_mod, "LLMClient", factory)
     return made
+
+
+def test_arena_save_last_concurrent_writers_do_not_share_a_tmp_file(
+        tmp_path, monkeypatch):
+    """The atomic-write sweep: a second writer finishing mid-write must not
+    truncate the first writer's temp file and make its replace vanish."""
+    real_replace = fileio.os.replace
+    fired = []
+
+    def racing_replace(src, dst):
+        if not fired:
+            fired.append(True)
+            arena_mod._save_last(tmp_path, {"arena_id": "second"})
+        return real_replace(src, dst)
+
+    monkeypatch.setattr(fileio.os, "replace", racing_replace)
+    arena_mod._save_last(tmp_path, {"arena_id": "first"})
+    data = json.loads(
+        arena_mod._last_path(tmp_path).read_text(encoding="utf-8"))
+    assert data["arena_id"] == "first"
+    assert not list(arena_mod._last_path(tmp_path).parent.glob("*.tmp"))
 
 
 def test_arena_runs_in_sandboxes_and_never_touches_the_workspace(

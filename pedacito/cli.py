@@ -38,6 +38,7 @@ from . import config
 from . import config_editor
 from . import discovery
 from . import events as events_mod
+from . import fileio
 from . import hooks as hooks_mod
 from . import index as index_mod
 from . import llm as llm_mod
@@ -1712,9 +1713,7 @@ def _write_config_backup(target: Path, text: str) -> None:
             Path(str(target) + ".bak").write_bytes(target.read_bytes())
         except OSError:
             pass
-    tmp = target.with_name(target.name + ".tmp")
-    tmp.write_text(text, encoding="utf-8", newline="")
-    os.replace(tmp, target)
+    fileio.write_bytes(target, text.encode("utf-8"))
 
 
 def _scan_cfg(model: dict) -> Config:

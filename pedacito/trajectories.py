@@ -28,14 +28,13 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
-import os
 import sys
 import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
-from . import events, safety, security
+from . import events, fileio, safety, security
 
 TRAJECTORY_DIR = "trajectories"
 _MASK = "[REDACTED]"
@@ -392,14 +391,5 @@ def _write_payload(target_dir: Path, payload: dict,
     target_dir.mkdir(parents=True, exist_ok=True)
     stamp = stamp or _now().strftime("%Y%m%dT%H%M%SZ")
     path = target_dir / f"{stamp}_{uuid.uuid4().hex[:8]}.json"
-    tmp = path.with_suffix(".tmp")
-    try:
-        tmp.write_text(text, encoding="utf-8")
-        os.replace(tmp, path)
-    except BaseException:
-        try:
-            tmp.unlink()
-        except OSError:
-            pass
-        raise
+    fileio.write_bytes(path, text.encode("utf-8"))
     return path

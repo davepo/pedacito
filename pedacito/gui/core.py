@@ -14,7 +14,6 @@ and terminal text are also kept here, so a reloaded page rebuilds itself from
 from __future__ import annotations
 
 import json
-import os
 import queue
 import re
 import sys
@@ -27,6 +26,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from .. import config as config_mod
+from .. import fileio
 from .. import review as review_mod
 from .. import security, workspace
 from .. import update as update_mod
@@ -910,10 +910,10 @@ class State:
         with self._thread_io:            # serialize writers; never hold `lock` during I/O
             try:
                 path.parent.mkdir(parents=True, exist_ok=True)
-                tmp = path.with_name(payload["id"] + ".json.tmp")
-                tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=1),
-                               encoding="utf-8")
-                os.replace(tmp, path)
+                fileio.write_bytes(
+                    path,
+                    json.dumps(payload, ensure_ascii=False, indent=1).encode(
+                        "utf-8"))
             except OSError as exc:
                 sys.stderr.write("[gui] could not save thread %s: %s\n" % (path, exc))
 

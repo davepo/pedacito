@@ -18,7 +18,7 @@ import json
 import time
 from pathlib import Path
 
-from . import memory, safety, workspace
+from . import fileio, memory, safety, workspace
 from .index import state_dir
 
 CHECKPOINT_DIR = "checkpoints"
@@ -80,9 +80,8 @@ def save(root, cmd: str, task: str, messages, reply: str,
         for k, v in extra.items():
             if isinstance(v, (str, int, float, bool, list, dict)) or v is None:
                 rec[k] = v
-    tmp = path.with_suffix(".tmp")
-    tmp.write_text(json.dumps(rec, indent=1, ensure_ascii=False), encoding="utf-8")
-    tmp.replace(path)
+    fileio.write_bytes(
+        path, json.dumps(rec, indent=1, ensure_ascii=False).encode("utf-8"))
     return path
 
 

@@ -44,6 +44,7 @@ from pathlib import Path
 
 from . import arch_defaults
 from . import edits as edits_mod
+from . import fileio
 from .llm import LLMError, _api_key, estimate_tokens
 
 CARD_VERSION = 2
@@ -81,9 +82,7 @@ def save_card(card: dict) -> Path:
     data = _load_all()
     data[card["key"]] = card
     p.parent.mkdir(parents=True, exist_ok=True)
-    tmp = p.with_suffix(".tmp")
-    tmp.write_text(json.dumps(data, indent=1), encoding="utf-8")
-    tmp.replace(p)
+    fileio.write_bytes(p, json.dumps(data, indent=1).encode("utf-8"))
     return p
 
 
@@ -142,9 +141,7 @@ def _refilter_saved_cards() -> None:
     try:
         p = _path()
         p.parent.mkdir(parents=True, exist_ok=True)
-        tmp = p.with_suffix(".tmp")
-        tmp.write_text(json.dumps(data, indent=1), encoding="utf-8")
-        tmp.replace(p)
+        fileio.write_bytes(p, json.dumps(data, indent=1).encode("utf-8"))
     except OSError:
         pass                      # a read-only config dir must not break runs
 

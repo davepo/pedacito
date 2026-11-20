@@ -122,16 +122,16 @@ def _load_index(root) -> dict:
 def _save_index(root, data: dict) -> None:
     path = index_path(root)
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(path.name + ".tmp")
     payload = {
         "version": VERSION,
         "next_seq": int(data.get("next_seq") or 1),
         "head_id": data.get("head_id"),
         "checkpoints": list(data.get("checkpoints") or []),
     }
-    tmp.write_text(json.dumps(payload, indent=1, ensure_ascii=False) + "\n",
-                   encoding="utf-8")
-    os.replace(tmp, path)
+    fileio.write_bytes(
+        path,
+        (json.dumps(payload, indent=1, ensure_ascii=False) + "\n").encode(
+            "utf-8"))
 
 
 def _find_entry(data: dict, checkpoint_id: str) -> dict | None:

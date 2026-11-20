@@ -51,7 +51,6 @@ import fnmatch
 import hashlib
 import ipaddress
 import json
-import os
 import re
 import socket
 import threading
@@ -59,6 +58,8 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from urllib.parse import urlparse
+
+from . import fileio
 
 __all__ = [
     "CATEGORY_LABELS",
@@ -961,9 +962,7 @@ def acknowledge_findings(root, fingerprints) -> set[str]:
             payload = json.dumps(
                 {"version": 1, "acknowledged": sorted(merged)},
                 indent=1) + "\n"
-            tmp = path.with_name(path.name + ".tmp")
-            tmp.write_text(payload, encoding="utf-8")
-            os.replace(tmp, path)
+            fileio.write_bytes(path, payload.encode("utf-8"))
         except OSError:
             # Keep the session acknowledgment even when the file cannot land.
             pass

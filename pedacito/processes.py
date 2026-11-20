@@ -38,7 +38,7 @@ from ctypes import wintypes
 from pathlib import Path
 from urllib.parse import urlsplit
 
-from . import browser, proc, safety
+from . import browser, fileio, proc, safety
 from .index import state_dir
 
 PROC_DIR = "procs"
@@ -86,9 +86,7 @@ def _read_record(path: Path) -> dict | None:
 def _write_record(root: Path, rec: dict) -> None:
     path = _record_path(root, str(rec.get("name") or "serve"))
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(".tmp")
-    tmp.write_text(json.dumps(rec, indent=1), encoding="utf-8")
-    tmp.replace(path)
+    fileio.write_bytes(path, json.dumps(rec, indent=1).encode("utf-8"))
 
 
 # Popen objects for children THIS process started. Retaining them is what lets
