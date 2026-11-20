@@ -58,6 +58,19 @@ CSP = ("default-src 'self'; style-src 'self' 'unsafe-inline'; "
        "script-src 'self'; connect-src 'self'; img-src 'self' data:; "
        "frame-ancestors 'none'; base-uri 'none'; form-action 'none'")
 
+# The GUI frames project pages with `sandbox="allow-scripts"` (no
+# `allow-same-origin`), so a previewed page runs in an opaque origin. Its CSP
+# is separate from the app's own: inline scripts still work (static pages keep
+# them inline) but eval is refused. A POST from the sandbox arrives with
+# `Origin: null`, which `security.post_origin_allowed` rejects.
+PREVIEW_CSP = ("default-src 'self' data: blob:; "
+               "style-src 'self' 'unsafe-inline'; "
+               "script-src 'self' 'unsafe-inline'; "
+               "img-src 'self' data: blob:; "
+               "media-src 'self' data: blob:; "
+               "connect-src 'self' data: blob:; "
+               "frame-ancestors 'self'")
+
 # The cake emoji as an SVG favicon. The page declares it as a data: URI, but
 # browsers still probe /favicon.ico on their own; answering with the same SVG
 # keeps the console free of 404s.
@@ -2426,14 +2439,7 @@ class _Handler(BaseHTTPRequestHandler):
         self.send_header("Cache-Control", "no-store")
         self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("X-Frame-Options", "SAMEORIGIN")
-        self.send_header("Content-Security-Policy",
-                         "default-src 'self' data: blob:; "
-                         "style-src 'self' 'unsafe-inline'; "
-                         "script-src 'self' 'unsafe-inline' 'unsafe-eval'; "
-                         "img-src 'self' data: blob:; "
-                         "media-src 'self' data: blob:; "
-                         "connect-src 'self' data: blob:; "
-                         "frame-ancestors 'self'")
+        self.send_header("Content-Security-Policy", PREVIEW_CSP)
         self.end_headers()
         self.wfile.write(data)
 

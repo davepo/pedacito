@@ -232,6 +232,17 @@ guards it in four ways:
 - Project files are served only from inside the project root. The `/preview/` route
   refuses `..` segments and escaping symlinks, and frames only from the same origin.
 
+The preview iframes (`/preview/` and `/api/runner/preview/`) are additionally
+sandboxed with `sandbox="allow-scripts"` and deliberately **without**
+`allow-same-origin`. A previewed page therefore runs in an opaque origin: it can
+execute its own scripts, but it cannot read the GUI's storage or call the agent API
+as the app itself. A state-changing request from the preview arrives with
+`Origin: null`, which the loopback-only POST guard refuses. Project pages are also
+served without `'unsafe-eval'` in their CSP (the GUI's own page CSP is unchanged;
+inline scripts still run, so a self-contained static page previews normally).
+**↗ New tab** opens the page as a normal same-origin document, outside the sandbox;
+that is the trusted escape hatch, so use it only for projects you would run locally.
+
 The auto-update check (`pedacito/update.py`) stays inside the same boundary:
 the browser never contacts PyPI itself (the CSP's `connect-src 'self'` forbids
 it) — the local server makes the one anonymous GET, and the upgrade runs as an

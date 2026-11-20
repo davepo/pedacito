@@ -378,3 +378,45 @@ def test_how_topic_references_resolve():
 def test_new_topics_are_retrievable(question, topic):
     ids = [m["id"] for m in how_index.search(question)["gui"]]
     assert topic in ids, (question, ids)
+
+
+# --- preview isolation (R4.3) ------------------------------------------------
+# Project pages render inside the GUI origin but must not script it. Both
+# preview iframes are sandboxed without `allow-same-origin`; the preview CSP is
+# eval-free while the GUI's own page CSP stays as it was.
+
+GUI_STATIC = ROOT / "pedacito" / "gui" / "static"
+GUI_SERVER = ROOT / "pedacito" / "gui" / "server.py"
+
+
+def test_both_preview_iframes_are_script_sandboxed():
+    js = (GUI_STATIC / "app.js").read_text(encoding="utf-8")
+    tags = re.findall(r"<iframe\b[^>]*>", js, flags=re.S)
+    previews = [tag for tag in tags
+                if "live-preview-frame" in tag or "runner-frame" in tag]
+    assert len(previews) == 2, previews
+    for tag in previews:
+        assert 'sandbox="allow-scripts"' in tag, tag
+        # allow-same-origin would cancel the isolation: the preview would be
+        # back in the GUI origin and could drive the agent API.
+        assert "allow-same-origin" not in tag, tag
+    # New tab remains the deliberate full-origin escape hatch.
+    assert "onClick=${openPreviewTab}" in js
+    assert "onClick=${openRunnerPreview}" in js
+
+
+def test_preview_csp_is_eval_free_and_the_gui_csp_is_unchanged():
+    src = GUI_SERVER.read_text(encoding="utf-8")
+    preview = re.search(r"^PREVIEW_CSP = \((.*?)\)\n", src,
+                        flags=re.M | re.S)
+    assert preview, "PREVIEW_CSP is missing from gui/server.py"
+    block = preview.group(1)
+    assert "unsafe-eval" not in block
+    assert "script-src 'self' 'unsafe-inline'" in block
+    # Project assets are served through the preview constant, not their own
+    # inline policy that could drift back to eval.
+    assert 'send_header("Content-Security-Policy", PREVIEW_CSP)' in src
+    gui = re.search(r"^CSP = \((.*?)\)\n", src, flags=re.M | re.S)
+    assert gui, "the GUI's own CSP is missing"
+    assert "unsafe-eval" not in gui.group(1)
+    assert "script-src 'self'" in gui.group(1)

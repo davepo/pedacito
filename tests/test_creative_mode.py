@@ -361,7 +361,10 @@ def test_preview_serves_pages_with_framing_headers_and_mime(gui, tmp_path):
     h = _headers(resp)
     assert h["content-type"] == "text/html; charset=utf-8"
     assert h["x-frame-options"] == "SAMEORIGIN"
-    assert "frame-ancestors 'self'" in h["content-security-policy"]
+    csp = h["content-security-policy"]
+    assert "frame-ancestors 'self'" in csp
+    assert "script-src 'self' 'unsafe-inline'" in csp
+    assert "unsafe-eval" not in csp                    # preview CSP is eval-free
     assert resp[2] == (root / "index.html").read_bytes()
     # nested pages and relative assets resolve through the same route
     assert gui.req("GET", "/preview/sub/page.html")[0] == 200

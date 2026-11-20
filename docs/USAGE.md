@@ -646,6 +646,9 @@ in a read-only iframe (`#live-preview-frame`) while you work on it.
   JS and image links resolve through the same read-only route, so the page
   looks the way it will when served.
 - **⟳ Refresh** reloads the page; **↗ New tab** opens it in a full browser tab.
+- The preview iframe is sandboxed (`allow-scripts`, no same-origin access): scripts
+  run, but the page cannot read the GUI's storage or drive the agent API. Use
+  **↗ New tab** when you want the page to behave as a normal same-origin document.
 - The preview reloads automatically when an Ask/Auto/New/Apply run finishes —
   and while a run is writing, when the preview tab is open — so a website task
   shows its result immediately.

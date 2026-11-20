@@ -308,8 +308,10 @@ def test_every_post_route_refuses_cross_site_and_non_json(gui, path):
         status, _h, _b = gui.req("POST", path, raw="{}",
                                  headers={"Content-Type": ctype})
         assert status == 403, (path, ctype)
-    # foreign Origin / Referer (CSRF) and foreign Host (DNS rebinding)
+    # foreign Origin / Referer (CSRF) and foreign Host (DNS rebinding).
+    # `Origin: null` is what a sandboxed preview iframe sends.
     for headers in ({"Origin": "http://evil.example"},
+                    {"Origin": "null"},
                     {"Referer": "http://evil.example/page"},
                     {"Host": "evil.example"}):
         status, _h, _b = gui.req("POST", path, {}, headers=headers)

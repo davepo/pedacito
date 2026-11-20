@@ -4774,7 +4774,8 @@ function WorkspacePane() {
                   onClick=${openPreviewTab}>\u2197 New tab</button>
         </div>
         ${S.ws.page
-          ? html`<iframe id="live-preview-frame" title=${'Live preview of ' + S.ws.page}
+          ? html`<iframe id="live-preview-frame" sandbox="allow-scripts"
+                         title=${'Live preview of ' + S.ws.page}
                          src=${previewSrc(S.ws.page, S.ws.previewRev)}></iframe>`
           : html`<div class="tip">No HTML pages in this project yet \u2014 create one and it shows up here.</div>`}
       </div>
@@ -4800,7 +4801,8 @@ function WorkspacePane() {
                         title="open this page in a browser tab" onClick=${openRunnerPreview}>\u2197 New tab</button>
               </div>
               ${S.ws.runPage
-                ? html`<iframe class="runner-frame" title=${'Live app preview of ' + S.ws.runPage}
+                ? html`<iframe class="runner-frame" sandbox="allow-scripts"
+                               title=${'Live app preview of ' + S.ws.runPage}
                                src=${runnerSrc(S.ws.runPage, S.ws.runRev)}></iframe>`
                 : html`<div class="tip">No <code>index.html</code>, <code>public/index.html</code> or <code>dist/index.html</code> yet \u2014 create one and it appears here live.</div>`}
             </div>
