@@ -306,8 +306,15 @@ def _dense_footprint():
 
 
 def _snap(vram_total=24.0, vram_free=20.0, ram_total=64.0,
-          ram_free=48.0, sources=None, unified=False):
-    vram_used = max(0.0, vram_total - vram_free)
+          ram_free=48.0, sources=None, unified=False, cards=None):
+    cards = list(cards or [])
+    if cards:
+        # The snapshot keeps summed totals; per-card numbers drive tuning.
+        vram_total = sum(float(c.get("total_gb", 0)) for c in cards)
+        vram_used = sum(float(c.get("used_gb", 0)) for c in cards)
+        vram_free = max(0.0, vram_total - vram_used)
+    else:
+        vram_used = max(0.0, vram_total - vram_free)
     ram_used = max(0.0, ram_total - ram_free)
     src = {"ram_total_gb": "drm-sysfs", "ram_free_gb": "drm-sysfs",
            "vram_total_gb": "drm-sysfs", "vram_free_gb": "drm-sysfs"}
@@ -317,10 +324,107 @@ def _snap(vram_total=24.0, vram_free=20.0, ram_total=64.0,
         "unified_memory": unified,
         "ram": {"total_gb": ram_total, "used_gb": ram_used,
                 "free_gb": ram_free, "available_gb": ram_free},
-        "vram": {"total_gb": vram_total, "used_gb": vram_used,
-                 "free_gb": vram_free, "cards": []},
+        "vram": {"total_gb": round(vram_total, 2),
+                 "used_gb": round(vram_used, 2),
+                 "free_gb": round(vram_free, 2), "cards": cards},
         "sources": src,
     }
+
+
+def _vram_card(name, total_gb, used_gb):
+    return {
+        "card": name,
+        "total_gb": float(total_gb),
+        "used_gb": float(used_gb),
+        "free_gb": round(max(0.0, total_gb - used_gb), 2),
+        "percent": round(used_gb / total_gb * 100.0, 1) if total_gb else 0.0,
+        "source": "drm-sysfs",
+        "sources": {"total_gb": "drm-sysfs", "used_gb": "drm-sysfs",
+                    "free_gb": "drm-sysfs (total - used)"},
+    }
+
+
+def test_tuning_heterogeneous_cards_uses_largest_card():
+    """R3.5: an iGPU's 0.5 GB is not spare headroom for a model on the
+    24 GB dGPU. Display totals stay summed; tuning uses the largest card."""
+    cfg = _cfg(context_tokens=32768)
+    snap = _snap(cards=[_vram_card("card0", 0.5, 0.0),
+                        _vram_card("card1", 24.0, 15.0)])
+    assert snap["vram"]["total_gb"] == 24.5        # system inventory
+    out = profiler.tune_profile(cfg, snap, _dense_footprint(), None)
+
+    assert out["applied"] is True
+    assert 4096 < out["values"]["context_tokens"] < 32768
+    assert any("tuned against card1 (24.0 GB); card0 ignored" in note
+               for note in out["notes"])
+    assert out["memory"]["tuning_card"] == "card1"
+    assert out["memory"]["tuning_card_total_gb"] == 24.0
+    assert out["memory"]["ignored_cards"] == ["card0"]
+    assert out["memory"]["display_total_gb"] == 24.5
+
+
+def test_tuning_heterogeneous_math_uses_chosen_card_free_bytes():
+    cfg = _cfg(context_tokens=32768)
+    snap = _snap(cards=[_vram_card("card0", 0.5, 0.0),
+                        _vram_card("card1", 24.0, 15.0)])
+    out = profiler.tune_profile(cfg, snap, _dense_footprint(), None)
+
+    # Summed free is 9.5 GB; the chosen card reports 9.0 GB.
+    assert out["memory"]["free_gb"] == 9.0
+    assert "9.0 GB free" in out["sources"]["context_tokens"]
+    assert "9.5" not in out["sources"]["context_tokens"]
+    kv = _dense_footprint()["kv_gb_per_1k_tokens"]
+    expected = int((9.0 - 7.0 - max(0.5, 9.0 * 0.10)) / kv * 1000.0)
+    assert out["values"]["context_tokens"] == expected
+
+
+def test_tuning_single_card_keeps_the_unchanged_path():
+    cfg = _cfg()
+    single = profiler.tune_profile(
+        cfg, _snap(cards=[_vram_card("card0", 8.0, 6.0)]),
+        _dense_footprint(), None)
+    plain = profiler.tune_profile(
+        cfg, _snap(vram_total=8.0, vram_free=2.0), _dense_footprint(), None)
+
+    assert single["values"] == plain["values"]
+    assert single["notes"] == plain["notes"]
+    assert single["values"]["context_tokens"] == 4096
+    assert single["memory"]["tuning_card"] == ""
+    assert not any("tuned against" in note for note in single["notes"])
+
+
+def test_tuning_homogeneous_cards_keep_pooled_totals():
+    """Equally sized cards may be pooled by a multi-GPU server; only a size
+    mismatch switches the basis to the largest card."""
+    cfg = _cfg(context_tokens=32768)
+    snap = _snap(cards=[_vram_card("card0", 24.0, 12.0),
+                        _vram_card("card1", 24.0, 12.0)])
+    out = profiler.tune_profile(cfg, snap, _dense_footprint(), None)
+
+    assert out["memory"]["free_gb"] == 24.0        # 48 total - 24 used
+    assert out["memory"]["tuning_card"] == ""
+    assert not any("tuned against" in note for note in out["notes"])
+
+
+def test_profile_report_surfaces_the_per_card_tuning_basis():
+    """Display keeps the summed inventory; the per-card lines say which card
+    the tuning math used and which were ignored."""
+    cfg = _cfg(context_tokens=32768)
+    snap = _snap(cards=[_vram_card("card0", 0.5, 0.0),
+                        _vram_card("card1", 24.0, 15.0)])
+    out = profiler.tune_profile(cfg, snap, _dense_footprint(), None)
+    text = profiler.format_profile_report({
+        "ok": True, "snapshot": snap, "tuning": out,
+        "current": {"context_tokens": 32768, "timeout": 600,
+                    "max_concurrency": 1},
+        "auto_tune": True, "model": "some-14b", "profile": "local"})
+    assert "VRAM: 15.0 / 24.5 GB used, 9.5 GB free" in text
+    assert "card1: 15.0 / 24.0 GB used, 9.0 GB free" in text
+    assert "card0: 0.0 / 0.5 GB used, 0.5 GB free" in text
+    assert "<- tuning basis" in text
+    assert "(ignored for tuning)" in text
+    assert "tuning basis: card1 (24.0 GB); card0 ignored" in text
+    assert "tuned against card1 (24.0 GB); card0 ignored" in text
 
 
 def test_tuning_tight_vram_shrinks_to_safety_floor():

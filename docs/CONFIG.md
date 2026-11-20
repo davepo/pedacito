@@ -567,6 +567,13 @@ When enabled for a local profile:
 - **User-pinned values win.** Any field whose provenance is an explicit config file,
   profile, environment variable or CLI flag is left alone. A model with every tunable
   field pinned is untouched.
+- **Multiple cards are not summed for headroom.** VRAM totals remain a summed system
+  inventory for the GUI badge and the report header, but when the cards differ in size
+  (for example a 0.5 GB iGPU beside a 24 GB discrete card) tuning uses the largest
+  card's total and free numbers and names the ignored cards in a note
+  (`tuned against card1 (24.0 GB); card0 ignored`). `pdc profile` marks the per-card
+  tuning basis. Equally sized cards and single-card systems keep the summed path; a
+  card with unknown free memory is never treated as zero.
 - **No telemetry means abstain.** With no VRAM reader, auto-tune uses RAM headroom only on
   a unified-memory platform (macOS). Everywhere else it leaves the config untouched; a
   missing reader is never interpreted as zero free memory.

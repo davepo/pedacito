@@ -1486,6 +1486,44 @@ def _free_gb(block: dict) -> float | None:
     return max(0.0, total - _float(used))
 
 
+def _vram_tuning_basis(vram: dict) -> dict | None:
+    """The largest card to tune against when a snapshot's cards differ in size.
+
+    ``vram.total_gb`` remains the summed system inventory (the GUI badge and
+    the ``pdc profile`` header keep showing it), but one model cannot spend an
+    iGPU's 0.5 GB on top of a discrete card's 24 GB. Headroom therefore comes
+    from the largest card's own total and free numbers.
+
+    Single-card snapshots, homogeneous multi-card snapshots (where a
+    multi-GPU server may genuinely pool equally sized cards), and a card whose
+    free count is unknown keep the summed path exactly as before. Unknown free
+    memory is never treated as zero.
+    """
+    cards = [card for card in (vram.get("cards") or [])
+             if isinstance(card, dict)]
+    sized = [(_float(card.get("total_gb")), card) for card in cards]
+    sized = [(total, card) for total, card in sized if total > 0]
+    if len(sized) < 2:
+        return None
+    largest = max(total for total, _card in sized)
+    # Within rounding noise the cards are the same size class; keep pooling.
+    if all(largest - total < 0.1 for total, _card in sized):
+        return None
+    card = next(card for total, card in sized if total == largest)
+    free = _free_gb(card)
+    if free is None:
+        return None
+    return {
+        "card": str(card.get("card") or "gpu"),
+        "total_gb": _round(largest),
+        "free_gb": _round(free),
+        "source": str((card.get("sources") or {}).get("free_gb")
+                      or card.get("source") or ""),
+        "ignored": [str(other.get("card") or "gpu")
+                    for _total, other in sized if other is not card],
+    }
+
+
 def tune_profile(cfg, snapshot: dict | None, footprint: dict | None,
                  probe: dict | None, *, server_window: int | None = None) -> dict:
     """Compute an auto-tuned profile without mutating `cfg`.
@@ -1562,10 +1600,27 @@ def tune_profile(cfg, snapshot: dict | None, footprint: dict | None,
     vram_free = _free_gb(vram)
     ram_free = _free_gb(ram)
 
+    # Display totals stay summed; headroom is per-card. An iGPU's 0.5 GB does
+    # not add to a 24 GB dGPU's free pool for one model.
+    basis = _vram_tuning_basis(vram)
+    vram_basis = None
+    if basis:
+        vram_total = _float(basis.get("total_gb"))
+        vram_free = _float(basis.get("free_gb"))
+        vram_source = str(basis.get("source") or vram_source)
+
     if vram_total > 0 and vram_source and vram_free is not None:
+        vram_basis = basis
         free_gb = vram_free
         pool = "VRAM"
         pool_source = str(sources_map.get("vram_free_gb") or vram_source)
+        if vram_basis:
+            pool_source = str(vram_basis.get("source") or pool_source)
+            notes.append(
+                f"tuned against {vram_basis['card']} "
+                f"({vram_basis['total_gb']:.1f} GB); "
+                f"{', '.join(vram_basis['ignored'])} ignored "
+                "(heterogeneous cards are not pooled)")
         weights = _float((footprint or {}).get("vram_resident_gb")
                          or (footprint or {}).get("active_gb")
                          or (footprint or {}).get("resident_gb"))
@@ -1759,7 +1814,13 @@ def tune_profile(cfg, snapshot: dict | None, footprint: dict | None,
         "proposed_context_tokens": proposal,
         "memory": {"pool": pool, "free_gb": _round(free_gb),
                    "source": pool_source, "weights_gb": _round(weights),
-                   "reserve_gb": _round(reserve)},
+                   "reserve_gb": _round(reserve),
+                   "display_total_gb": _round(_float(vram.get("total_gb"))),
+                   "tuning_card": (vram_basis or {}).get("card", ""),
+                   "tuning_card_total_gb": (vram_basis or {}).get(
+                       "total_gb", 0.0),
+                   "ignored_cards": list((vram_basis or {}).get("ignored")
+                                         or [])},
         "confidence": _round(confidence, 2),
         **values,
     }
@@ -1905,6 +1966,10 @@ def format_profile_report(report: dict) -> str:
     ram = snap.get("ram") or {}
     vram = snap.get("vram") or {}
     sources = snap.get("sources") or {}
+    tuning = report.get("tuning") or {}
+    memory = tuning.get("memory") or {}
+    tuning_card = str(memory.get("tuning_card") or "")
+    ignored_cards = [str(card) for card in memory.get("ignored_cards") or []]
     lines = ["Hardware snapshot"]
     lines.append(
         f"  RAM:  {ram.get('used_gb', 0):.1f} / {ram.get('total_gb', 0):.1f} "
@@ -1917,10 +1982,25 @@ def format_profile_report(report: dict) -> str:
         + (f"  [{sources.get('vram_total_gb')}]"
            if sources.get("vram_total_gb") else "  [unavailable]"))
     for card in vram.get("cards") or []:
+        name = str(card.get("card") or "gpu")
+        free = _free_gb(card)
+        marker = ""
+        if name == tuning_card:
+            marker = "  <- tuning basis"
+        elif name in ignored_cards:
+            marker = "  (ignored for tuning)"
         lines.append(
-            f"    {card.get('card')}: {card.get('used_gb', 0):.1f} / "
-            f"{card.get('total_gb', 0):.1f} GB ({card.get('source')}; "
-            "totals only, no per-process attribution)")
+            f"    {name}: {card.get('used_gb', 0):.1f} / "
+            f"{card.get('total_gb', 0):.1f} GB used"
+            + (f", {free:.1f} GB free" if free is not None else "")
+            + f"  [{card.get('source')}; totals only, no per-process "
+            "attribution]" + marker)
+    if tuning_card:
+        lines.append(
+            f"  tuning basis: {tuning_card} "
+            f"({_float(memory.get('tuning_card_total_gb')):.1f} GB); "
+            f"{', '.join(ignored_cards)} ignored "
+            "(heterogeneous cards are not pooled)")
     if not snap.get("available"):
         lines.append("  (no telemetry reader answered; auto-tune abstains)")
     lines.append("")
@@ -1951,7 +2031,6 @@ def format_profile_report(report: dict) -> str:
             f"{probe.get('generation_tok_per_s', 0):.1f} tok/s")
     else:
         lines.append("  speed probe: none cached (run `pedacito profile --run`)")
-    tuning = report.get("tuning") or {}
     lines.append("")
     lines.append("Auto-tune: "
                  + ("on" if report.get("auto_tune") else
