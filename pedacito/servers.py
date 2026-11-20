@@ -934,10 +934,15 @@ def pin_server_model(server, model: str = "", pinned: bool = True,
     server as Lemonade (the GUI's Servers panel does this); leave it empty to
     use the profile's own classification."""
     action = "pin" if pinned else "unpin"
-    if kind and not (isinstance(server, dict) and server.get("base_url")):
-        resolved = _resolve_server(server, config)
-        if resolved:
-            server = {**resolved, "kind": kind}
+    if kind:
+        if isinstance(server, dict) and server.get("base_url"):
+            # The GUI passes a probed state row, not a profile name. Apply
+            # the probe's kind to a copy so the row itself stays untouched.
+            server = {**server, "kind": kind}
+        else:
+            resolved = _resolve_server(server, config)
+            if resolved:
+                server = {**resolved, "kind": kind}
     result = _server_action(server, action, model, config)
     result["pinned"] = bool(pinned)
     return result

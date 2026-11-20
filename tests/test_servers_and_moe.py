@@ -246,6 +246,29 @@ def test_lemonade_pin_accepts_a_probed_kind_override(monkeypatch):
     assert calls == ["http://127.0.0.1:8000/internal/pin"]
 
 
+def test_lemonade_pin_accepts_a_probed_kind_override_on_a_dict(monkeypatch):
+    """The GUI passes the probed row (a dict with base_url), not a profile
+    name. The override must apply there too; without it the custom row takes
+    the non-Lemonade no-op path and no POST is sent."""
+    calls = []
+
+    def fake_post(url, headers=None, json=None, timeout=None):
+        calls.append(url)
+        return _Resp()
+
+    monkeypatch.setattr(servers.requests, "post", fake_post)
+    row = {"name": "proxy", "kind": "custom", "provider": "custom",
+           "base_url": "http://127.0.0.1:8000/v1",
+           "models": ["qwen3-8b"], "loaded_models": ["qwen3-8b"]}
+    result = servers.pin_server_model(row, "qwen3-8b", True, None,
+                                      kind="lemonade")
+    assert result["ok"] is True and not result.get("skipped")
+    assert result["kind"] == "lemonade"
+    assert calls == ["http://127.0.0.1:8000/internal/pin"]
+    # The caller's state row is not mutated by the copy.
+    assert row["kind"] == "custom"
+
+
 def test_lemonade_pin_falls_back_on_404(monkeypatch):
     calls = []
 
