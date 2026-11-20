@@ -8,12 +8,14 @@ from __future__ import annotations
 
 import hashlib
 import json
+import functools
 import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from pedacito import cli, events, index as index_mod, loop, security  # noqa: E402
+from pedacito import cli, events, index as index_mod, loop, replay, security  # noqa: E402
+from pedacito import trajectories  # noqa: E402
 from pedacito.agent import Agent  # noqa: E402
 from pedacito.config import Config  # noqa: E402
 
@@ -194,6 +196,64 @@ def test_planted_api_key_in_tool_result_is_never_persisted(tmp_path):
     assert SECRET not in text
     assert security.scan_text_for_secrets(text) == []
     assert "[REDACTED]" in text
+
+
+def test_client_proxy_records_every_model_entry_point():
+    """`chat`/`chat_json` are class attributes, so direct, type-mediated and
+    partial-bound calls all hit the recording wrapper. `complete_once` used to
+    fall through `__getattr__` to the raw client and disappear from the
+    transcript; it now records too."""
+    class Client:
+        cfg = None
+
+        def chat(self, messages, *a, **k):
+            return "chat"
+
+        def chat_json(self, messages, *a, **k):
+            return {"ok": True}
+
+        def complete_once(self, messages, *a, **k):
+            return "once"
+
+    class Capture:
+        def __init__(self):
+            self.kinds = []
+
+        def note(self, kind, messages, reply):
+            self.kinds.append(kind)
+
+    capture = Capture()
+    proxy = trajectories._ClientProxy(Client(), capture)
+    assert proxy.chat([{"role": "user", "content": "a"}]) == "chat"
+    assert type(proxy).chat(proxy, [{"role": "user", "content": "b"}]) == "chat"
+    assert functools.partial(
+        proxy.chat, [{"role": "user", "content": "c"}])() == "chat"
+    assert proxy.chat_json([{"role": "user", "content": "d"}]) == {"ok": True}
+    assert proxy.complete_once([{"role": "user", "content": "e"}]) == "once"
+    assert capture.kinds == ["chat", "chat", "chat", "chat_json", "chat"]
+
+
+def test_replay_recorder_keeps_complete_once_calls(tmp_path):
+    """The replay proxy has the same entry points; a one-shot completion is
+    recorded and can be replayed as a chat response."""
+    class Client:
+        def __init__(self):
+            self.seen = []
+
+        def complete_once(self, messages, *a, **k):
+            self.seen.append(messages)
+            return "once-reply"
+
+    client = Client()
+    path = tmp_path / "recording.jsonl"
+    recorder = replay.Recorder(client, path)
+    messages = [{"role": "user", "content": "one shot"}]
+    assert recorder.complete_once(messages, max_tokens=8) == "once-reply"
+    assert client.seen == [messages]
+
+    replayer = replay.Replayer(path)
+    assert replayer.complete_once(messages, max_tokens=8) == "once-reply"
+    assert replayer.stats["calls"] == 1
 
 
 def test_capture_failure_does_not_fail_the_task(tmp_path):

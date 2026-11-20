@@ -88,6 +88,9 @@ class Recorder:
     def chat_json(self, messages, *args, **kw):
         return self._call("chat_json", messages, self._c.chat_json, *args, **kw)
 
+    def complete_once(self, messages, *args, **kw):
+        return self._call("chat", messages, self._c.complete_once, *args, **kw)
+
     def __getattr__(self, name):
         return getattr(self._c, name)
 
@@ -164,6 +167,9 @@ class Replayer:
 
     def chat_json(self, messages, *args, **kw):
         return self._next("chat_json", messages)
+
+    def complete_once(self, messages, *args, **kw):
+        return self._next("chat", messages)
 
     def check(self, warn: bool = True) -> str:
         return "(replay)"

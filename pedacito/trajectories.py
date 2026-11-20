@@ -215,7 +215,17 @@ class _ClientProxy:
         return self._call("chat_json", messages, self._client.chat_json,
                           *args, **kwargs)
 
+    def complete_once(self, messages, *args, **kwargs):
+        # One-shot completions are model calls too. The profiler's probe uses
+        # its own raw client, but a captured client must not lose a call just
+        # because it took the `complete_once` entry point instead of `chat`.
+        return self._call("chat", messages, self._client.complete_once,
+                          *args, **kwargs)
+
     def __getattr__(self, name):
+        # Special methods are looked up on the class, so chat/chat_json/
+        # complete_once above always intercept; every other attribute is a
+        # plain delegation (stats, cfg, cancel_event, ...).
         return getattr(self._client, name)
 
     def __setattr__(self, name, value):
