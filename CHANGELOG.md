@@ -77,6 +77,25 @@ All notable changes to Pedacito (`pdc`) are documented here.
   (README plus `docs/*.md`) for every CLI subcommand and feature needle, and
   the how-cards against the same features.
 
+### Profile Availability in the GUI Picker
+
+- **`/api/servers`** now includes `profile_availability`
+  (`available` / `unavailable` / `offline` / `unknown`) computed from the
+  server states that poll already fetched; the latest map is cached on
+  `STATE`. No new interval and no new network call, and hosted endpoints are
+  never probed.
+- **`POST /api/profile`** refuses a profile whose model is no longer listed by
+  its server with a 409 and an actionable detail. Unknown, offline and
+  not-yet-polled states fail open; TUI and CLI switching are unchanged.
+- **GUI profile picker** — unavailable options are disabled and suffixed
+  **· unavailable** with a model-not-found tooltip; offline options are
+  disabled and suffixed **· server offline** until a later poll. The
+  **(default)** option stays selectable; an active profile that becomes
+  unavailable remains shown with its state, and the GUI never auto-switches
+  away from it.
+- Docs: USAGE explains the states and their refresh via the existing 15 s
+  telemetry poll.
+
 ### Project Website and Contact
 
 - **`https://www.pedacito.dev`** and **`contact@pedacito.dev`** now appear in

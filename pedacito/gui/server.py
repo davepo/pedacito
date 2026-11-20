@@ -1403,6 +1403,60 @@ def _servers_config():
     return cfg if cfg is not None else STATE.global_config()
 
 
+def _profile_availability(config, states) -> dict:
+    """Profile name -> available|unavailable|offline|unknown.
+
+    Pure bookkeeping over the server states the caller just fetched: this
+    adds no probe and never contacts a hosted endpoint. A profile is matched
+    to a state by its normalized effective base_url; a hosted (non-local)
+    profile is always "unknown", as is a local profile whose URL is not a
+    configured server or whose server returned no model list. Only a positive
+    answer with a non-empty list that lacks the model becomes "unavailable" --
+    the state the GUI disables and the switch guard refuses.
+    """
+    from .. import servers
+    out: dict[str, str] = {}
+    if config is None:
+        return out
+    by_url: dict[str, dict] = {}
+    for state in states or []:
+        if not isinstance(state, dict):
+            continue
+        url = servers.normalize_url(str(state.get("base_url") or ""))
+        if not url:
+            continue
+        # Duplicate spellings are already deduped by configured_local_servers;
+        # if a caller hands us both, an online row wins over an offline one.
+        if url not in by_url or (state.get("online")
+                                 and not by_url[url].get("online")):
+            by_url[url] = state
+    for name, body in (getattr(config, "profiles", None) or {}).items():
+        body = body if isinstance(body, dict) else {}
+        base = str(body.get("base_url")
+                   or getattr(config, "base_url", "") or "")
+        if not base or not servers.is_local_url(base):
+            out[str(name)] = "unknown"
+            continue
+        model = str(body.get("model")
+                    or getattr(config, "model", "") or "").strip()
+        state = by_url.get(servers.normalize_url(base))
+        if state is None:
+            out[str(name)] = "unknown"
+        elif not state.get("online"):
+            out[str(name)] = "offline"
+        else:
+            models = state.get("models")
+            if not isinstance(models, (list, tuple, set)):
+                models = []
+            if not model or not models:
+                out[str(name)] = "unknown"
+            elif model in [str(m) for m in models]:
+                out[str(name)] = "available"
+            else:
+                out[str(name)] = "unavailable"
+    return out
+
+
 def _server_payload(config, memory=None) -> dict:
     from .. import profiler
     from .. import servers
@@ -1417,6 +1471,12 @@ def _server_payload(config, memory=None) -> dict:
     out["ram"] = snap["ram"]
     out["badge"] = servers.memory_badge(snap)
     out["snapshot"] = snap
+    # Availability rides this existing poll: no extra interval, no extra
+    # network call, and hosted endpoints are classified before any matching.
+    availability = _profile_availability(config, out.get("servers") or [])
+    out["profile_availability"] = availability
+    with STATE.lock:
+        STATE.profile_availability = dict(availability)
     return out
 
 
@@ -1628,6 +1688,39 @@ def _project_prune(q, body):
     }
 
 
+def _profile_switch_refusal(cfg, name: str):
+    """409 when the cached /api/servers map proved this profile's model gone.
+
+    Only "unavailable" is refused. "unknown" (no cache, hosted profile, an
+    unconfigured URL or an empty model list) and "offline" fail open, so a
+    sleeping server or a not-yet-polled page can never lock the picker."""
+    if not name or cfg is None:
+        return None
+    with STATE.lock:
+        state = (STATE.profile_availability or {}).get(name)
+    if state != "unavailable":
+        return None
+    from .. import servers
+    body = (cfg.profiles or {}).get(name) or {}
+    body = body if isinstance(body, dict) else {}
+    model = str(body.get("model") or getattr(cfg, "model", "") or "")
+    base = str(body.get("base_url") or getattr(cfg, "base_url", "") or "")
+    server = base or "its server"
+    if base:
+        try:
+            for candidate in servers.configured_local_servers(cfg):
+                if servers.normalize_url(
+                        candidate.get("base_url") or "") == \
+                        servers.normalize_url(base):
+                    server = str(candidate.get("name") or base)
+                    break
+        except Exception:
+            pass
+    return 409, {"ok": False, "detail": (
+        f"model {model or '(none)'} is not available on {server} \u2014 "
+        "it may have been deleted; update the profile in Settings")}
+
+
 @post("/api/profile")
 def _profile_switch(q, body):
     """Switch the active model profile.
@@ -1650,6 +1743,9 @@ def _profile_switch(q, body):
             known = []
         if name and known and name not in known:
             return 400, {"ok": False, "detail": f"no profile named {name!r}"}
+        refusal = _profile_switch_refusal(cfg, name)
+        if refusal:
+            return refusal
         if toggles:
             try:
                 settings_api.apply_changes("user", None, toggles, [])
@@ -1667,6 +1763,9 @@ def _profile_switch(q, body):
     known = sorted(cfg.profiles) if cfg else []
     if name and known and name not in known:
         return 400, {"ok": False, "detail": f"no profile named {name!r}"}
+    refusal = _profile_switch_refusal(cfg, name)
+    if refusal:
+        return refusal
     if toggles:
         try:
             settings_api.apply_changes("user", None, toggles, [])

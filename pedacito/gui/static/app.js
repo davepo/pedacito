@@ -344,6 +344,7 @@ const savedCreative = (() => {
 
 const S = {
   status: {},
+  profile_availability: {},               // profile -> available|unavailable|offline|unknown
   msgs: [], msgTick: 0,                   // msgTick bumps on any message change
   plan: { path: '', exists: false, text: '', tasks: [] },
   review: null, diff: null, diffRel: '', sel: {}, editing: false,
@@ -2933,7 +2934,13 @@ function HardwareBadge() {
   useEffect(() => {
     let alive = true;
     const load = () => PDC.api('/api/servers').then((j) => {
-      if (alive && j && j.memory) setMem(j.memory);
+      if (!alive || !j) return;
+      if (j.memory) setMem(j.memory);
+      // The same 15 s cycle refreshes the profile picker's disabled states.
+      if (j.profile_availability) {
+        S.profile_availability = j.profile_availability;
+        emit();
+      }
     }, () => {});
     load();
     const timer = setInterval(load, 15000);
@@ -3352,6 +3359,23 @@ function ProfileSelect(props) {           // header dropdown; uncontrolled
   const defName = peek ? peek.default : s.default_profile;
   const active = S.ui.pendingProfile !== null ? S.ui.pendingProfile
     : (s.profile && s.profile !== defName ? s.profile : '');
+  // Peek lists another folder's profiles, which the current server map does
+  // not describe, so the annotations only apply to the open config.
+  const availability = peek ? {} : (S.profile_availability || {});
+  const optionFor = (p) => {
+    const model = (s.profile_models || {})[p] || '';
+    const label = p + (model ? ' \u00B7 ' + model : '');
+    const state = availability[p] || 'unknown';
+    if (state === 'unavailable') return {
+      label: label + ' \u00B7 unavailable', disabled: true,
+      title: 'model ' + (model || '?') + ' was not found on its server \u2014 '
+        + 'it may have been deleted; update the profile in Settings' };
+    if (state === 'offline') return {
+      label: label + ' \u00B7 server offline', disabled: true,
+      title: 'the model server is not reachable \u2014 start it; this profile '
+        + 'becomes selectable again after the next telemetry poll' };
+    return { label: label, disabled: false, title: '' };
+  };
   const ref = useRef(null);
   useEffect(() => {                       // sync only when it truly differs,
     const el = ref.current;                // and never while it is open/focused
@@ -3362,7 +3386,11 @@ function ProfileSelect(props) {           // header dropdown; uncontrolled
             disabled=${!!props.busy && !!s.root}
             onchange=${(e) => props.onChange(e.target.value)}>
       <option value="">(default${defName ? ': ' + defName : ''})</option>
-      ${profiles.map((p) => html`<option key=${p} value=${p}>${p}${(s.profile_models || {})[p] ? ' \u00B7 ' + s.profile_models[p] : ''}</option>`)}
+      ${profiles.map((p) => {
+        const o = optionFor(p);
+        return html`<option key=${p} value=${p} disabled=${o.disabled}
+                            title=${o.title}>${o.label}</option>`;
+      })}
     </select>`;
 }
 

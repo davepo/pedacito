@@ -122,6 +122,20 @@ dependencies, so it works offline. It runs the same engine as the commands.
   before they write). A `Scout: <profile>` badge appears beside the model chip
   when a scout profile is active.
 
+#### Profile availability in the picker
+
+The profile picker validates local profiles against the same `/api/servers`
+poll that refreshes the hardware badge, so it updates every 15 seconds without
+a new request or polling interval. A local profile whose server answers but
+whose model is not in the server's model list is marked **· unavailable** and
+cannot be selected; the switch API also refuses it with a 409. The tooltip
+names the model and server. A profile whose server is not reachable is marked
+**· server offline** and becomes selectable again on a later poll once the
+server starts. Hosted profiles are never probed and stay selectable, as does a
+profile whose server state is not known yet. If the active profile becomes
+unavailable it stays shown with its state; the GUI never switches away from it
+on its own.
+
 Chat threads are saved with timestamps and can be renamed. With no project
 open they are kept in `~/.local/state/pedacito/threads/global/` (see the
 `.pedacito/` layout below); once a project is open they live inside that

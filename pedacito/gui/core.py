@@ -473,6 +473,10 @@ class State:
         self.model_checked = False
         self.model_status = ""
         self.model_ok: bool | None = None
+        # Latest profile-name -> available|unavailable|offline|unknown map,
+        # computed from the /api/servers poll (never a new probe). The profile
+        # switch guard reads it; the topbar picker gets it from the response.
+        self.profile_availability: dict[str, str] = {}
 
         self.messages: list[dict] = []
         self._mid = 0
