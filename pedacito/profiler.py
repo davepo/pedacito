@@ -1205,6 +1205,9 @@ def detect_context_window(cfg, timeout: float = METADATA_TIMEOUT) -> int:
     try:
         from .llm import LLMClient
         probe_cfg = copy.copy(cfg)
+        # Private provenance: LLMClient may apply local-moe defaults, and
+        # those source writes must not relabel the caller's live config.
+        probe_cfg.sources = dict(getattr(cfg, "sources", {}) or {})
         probe_cfg.timeout = max(0.1, float(timeout or METADATA_TIMEOUT))
         info = LLMClient(probe_cfg).model_info() or {}
         return max(0, _int(info.get("context_length")))
@@ -1261,6 +1264,11 @@ def probe_model_speed(base_url: str, model: str, config,
 
     try:
         cfg = copy.copy(config) if config is not None else Config()
+        # copy.copy shares the sources dict: LLMClient construction applies
+        # local-moe defaults, whose provenance writes ("local-moe default")
+        # must land on the probe's private copy, never relabel the caller's
+        # explicit settings (a soft source invites later auto-tune shrink).
+        cfg.sources = dict(getattr(cfg, "sources", {}) or {})
         cfg.base_url = str(base_url or getattr(cfg, "base_url", ""))
         cfg.model = str(model or getattr(cfg, "model", ""))
     except Exception as exc:                 # pragma: no cover - defensive

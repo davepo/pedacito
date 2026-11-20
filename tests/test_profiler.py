@@ -694,6 +694,49 @@ def test_probe_http_error_is_silent_and_not_cached(monkeypatch):
         encoding="utf-8")
 
 
+def _moe_cfg_with_explicit_budget():
+    cfg = Config(base_url="http://127.0.0.1:1234/v1",
+                 model="qwen3.8-flash", provider="strata")
+    cfg.max_tokens_step = 4096
+    cfg.sources = {"max_tokens_step": "user config"}
+    return cfg
+
+
+def _offline_post(monkeypatch):
+    def boom(url, **kw):
+        raise OSError("offline")
+
+    monkeypatch.setattr(llm.requests, "post", boom)
+    monkeypatch.setattr(llm.requests, "get", boom)
+
+
+def test_probe_does_not_relabel_the_callers_config_sources(monkeypatch):
+    """The probe's cfg is a shallow copy; LLMClient construction applies
+    local-moe defaults whose provenance writes must stay on the probe's
+    private sources dict. Sharing it relabelled the caller's explicit
+    budget as 'local-moe default' -- a soft source a later auto-tune pass
+    may shrink."""
+    _offline_post(monkeypatch)
+    cfg = _moe_cfg_with_explicit_budget()
+    before = dict(cfg.sources)
+    out = profiler.probe_model_speed(cfg.base_url, cfg.model, cfg,
+                                     force=True, context_window=8192)
+    assert out["ok"] is False                    # offline probe, silent
+    assert cfg.sources == before
+    assert cfg.max_tokens_step == 4096
+
+
+def test_detect_context_window_does_not_relabel_sources(monkeypatch):
+    """build_report calls detect_context_window with the LIVE config; its
+    metadata probe must not rewrite the caller's provenance either."""
+    _offline_post(monkeypatch)
+    cfg = _moe_cfg_with_explicit_budget()
+    before = dict(cfg.sources)
+    assert profiler.detect_context_window(cfg) == 0
+    assert cfg.sources == before
+    assert cfg.max_tokens_step == 4096
+
+
 def test_timing_record_is_populated_after_a_streamed_completion(monkeypatch):
     frames = _sse_frames({"prompt_per_second": 850.0,
                           "predicted_per_second": 42.0},
