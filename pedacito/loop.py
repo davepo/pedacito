@@ -2396,16 +2396,36 @@ def _new_frontend_errors(root, cfg, files: list[str]) -> list[str]:
     errors = _frontend_errors(root, cfg, files)
     if not errors:
         return []
+    from . import spec as spec_mod
     baseline = getattr(cfg, "_frontend_baseline", None)
-    if baseline is None:
-        return errors
-    try:
-        from . import spec as spec_mod
-        keys = {spec_mod.contract_error_key(e) for e in baseline}
-        return [e for e in errors
-                if spec_mod.contract_error_key(e) not in keys]
-    except Exception:
-        return [e for e in errors if e not in baseline]
+
+    def fresh(items):
+        if baseline is None:
+            return list(items)
+        try:
+            keys = {spec_mod.contract_error_key(e) for e in baseline}
+            return [e for e in items
+                    if spec_mod.contract_error_key(e) not in keys]
+        except Exception:
+            return [e for e in items if e not in baseline]
+
+    new = fresh(errors)
+    if new and getattr(cfg, "auto_heal_imports", True):
+        # Deterministic ES module import auto-healing: unambiguous missing
+        # sibling imports identified by _js_module_link_errors are healed on
+        # disk (tree-sitter validated) and re-checked before spending a repair.
+        try:
+            after, receipts = spec_mod.heal_js_module_imports(
+                root, files=files, errors=new, cfg=cfg)
+            for receipt in receipts:
+                print(f"  {receipt}", file=sys.stderr)
+            if receipts:
+                workspace.log_event(root, "js import auto-heal: " +
+                                    "; ".join(receipts), "INFO")
+                new = fresh(after)
+        except Exception:
+            pass
+    return new
 
 
 def _capture_frontend_baseline(root, cfg) -> None:

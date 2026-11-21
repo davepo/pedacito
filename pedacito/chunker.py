@@ -835,7 +835,8 @@ def _pick_symbol_span(spans: list[tuple[str, int, int]], symbol: str
     return (min(sp[1] for sp in suffix), max(sp[2] for sp in suffix))
 
 
-def locate_symbol_span(file_path, symbol_path: str
+def locate_symbol_span(file_path, symbol_path: str,
+                       text: str | None = None
                        ) -> tuple[int, int, str] | None:
     """Exact current line span of one symbol in one file, plus the indent the
     replacement must match: (start_line, end_line, base_indent), 1-based and
@@ -845,9 +846,11 @@ def locate_symbol_span(file_path, symbol_path: str
     JS/TS/Ruby/Go/Rust/... files through the tree-sitter chunker, so the
     span grammar matches the index. `symbol_path` is dotted: a top-level
     name ("parse_row", "TableParser") or a qualified one
-    ("TableParser.parse_row"). None when the file is missing, unparsable,
-    the symbol is unknown, or the name matches several definitions: the
-    caller must refuse rather than guess.
+    ("TableParser.parse_row"). When `text` is supplied, it is parsed directly
+    instead of reading `file_path` from disk (so sequential in-memory edits
+    compose cleanly). None when the file is missing, unparsable, the symbol is
+    unknown, or the name matches several definitions: the caller must refuse
+    rather than guess.
 
     This is the deterministic half of zero-anchor surgical splicing: the
     edit engine can replace a whole definition with no SEARCH block and no
@@ -859,12 +862,15 @@ def locate_symbol_span(file_path, symbol_path: str
         return None
     # "Class::method" (C++/Rust style) addresses the same definition
     symbol = symbol.replace("::", ".").strip(".")
-    if not symbol or not path.is_file():
+    if not symbol:
         return None
-    try:
-        text = fileio.read_text(path)
-    except (OSError, UnicodeDecodeError):
-        return None
+    if text is None:
+        if not path.is_file():
+            return None
+        try:
+            text = fileio.read_text(path)
+        except (OSError, UnicodeDecodeError):
+            return None
     suffix = path.suffix.lower()
     if suffix == ".py":
         spans = _py_symbol_spans(text)

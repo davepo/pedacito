@@ -50,6 +50,7 @@ class Graph:
         self.called_files: set[str] = {t for tg in self.call_edges.values()
                                        for t in tg}
         self._pr: dict[str, float] | None = None
+        self._sym_pr: dict[str, float] | None = None
 
     def _add_call_edges(self, index) -> None:
         defs: dict[str, set[str]] = defaultdict(set)
@@ -162,3 +163,196 @@ class Graph:
         top = max(rank.values()) or 1.0
         self._pr = {f: r / top for f, r in rank.items()}
         return self._pr
+
+
+def symbol_pagerank(index, seeds=None, *, iterations: int = 25,
+                    damping: float = 0.85) -> dict[str, float]:
+    """Symbol-level PageRank over `Chunk.calls` (including receiver-qualified
+    `Class.method` calls) and resolved `imports_of` edges.
+
+    Returns `{f"{file}::{qualname}": score}` normalised so the top symbol is
+    1.0. Unseeded calls are cached on `index.graph` for the current index
+    generation. `seeds`, when supplied, may be an iterable of symbol keys
+    (`file::qualname`), qualnames (`Class.method` / `fn`), bare names, or file
+    paths, or a `{seed: weight}` mapping for personalized PageRank.
+    """
+    g = index.graph
+    if seeds is None and g._sym_pr is not None:
+        return g._sym_pr
+
+    def_nodes: set[str] = set()
+    node_file: dict[str, str] = {}
+    by_qual: dict[str, list[str]] = defaultdict(list)
+    by_bare: dict[str, list[str]] = defaultdict(list)
+    file_top_defs: dict[str, list[str]] = defaultdict(list)
+
+    for c in index.chunks:
+        if c.kind in ("module", "reference"):
+            continue
+        base_q = c.qualname.split("#")[0]
+        if base_q in ("module", "__trailing__"):
+            continue
+        key = f"{c.file}::{base_q}"
+        if key in def_nodes:
+            continue
+        def_nodes.add(key)
+        node_file[key] = c.file
+        by_qual[base_q].append(key)
+        bare = base_q.split(".")[-1]
+        if len(bare) > 1:
+            by_bare[bare].append(key)
+        # Whole-class chunks (below class_split_lines) store their methods in
+        # `c.members`: register `Class.member` -> `file::Class` so receiver-
+        # qualified `Class.method` calls credit the owning class cleanly.
+        if c.kind == "class" and c.members:
+            for mem in c.members:
+                if mem:
+                    by_qual[f"{base_q}.{mem}"].append(key)
+        if "." not in base_q and not base_q.startswith("_"):
+            file_top_defs[c.file].append(key)
+
+    if not def_nodes:
+        if seeds is None:
+            g._sym_pr = {}
+        return {}
+
+    for d in (by_qual, by_bare, file_top_defs):
+        for k in d:
+            d[k].sort()
+
+    # Include per-file module source nodes so module-level calls and imports
+    # flow rank into the symbols they invoke/import.
+    mod_nodes: set[str] = {f"{f}::__module__" for f in index.files}
+    for f in index.files:
+        node_file[f"{f}::__module__"] = f
+    all_nodes = sorted(def_nodes | mod_nodes)
+    n = len(all_nodes)
+
+    scale_file = {f: (0.2 if testlinks.classify(f)[0] else 1.0)
+                  for f in index.files}
+    out_w: dict[str, dict[str, float]] = {u: {} for u in all_nodes}
+
+    # 1. Call edges from Chunk.calls (bare and receiver-qualified Class.method)
+    for c in index.chunks:
+        if c.kind == "reference" or not c.calls:
+            continue
+        base_q = c.qualname.split("#")[0]
+        if c.kind == "module" or base_q in ("module", "__trailing__"):
+            src = f"{c.file}::__module__"
+        else:
+            src = f"{c.file}::{base_q}"
+        if src not in out_w:
+            continue
+        sc = scale_file.get(c.file, 1.0)
+        imp_files = g.imports.get(c.file, ())
+        for call_name in c.calls:
+            if "." in call_name:
+                cands = by_qual.get(call_name, [])
+                if not cands:
+                    parts = call_name.split(".")
+                    if len(parts) >= 2:
+                        cands = by_qual.get(".".join(parts[-2:]), [])
+                if not cands:
+                    continue
+                scoped = [k for k in cands
+                          if node_file[k] == c.file or node_file[k] in imp_files]
+                targets = scoped or cands
+                w = (1.5 * sc) / len(targets)
+            else:
+                cands = by_qual.get(call_name) or by_bare.get(call_name, [])
+                if not cands:
+                    continue
+                scoped = [k for k in cands
+                          if node_file[k] == c.file or node_file[k] in imp_files]
+                if scoped:
+                    targets = scoped
+                    w = (1.0 * sc) / len(targets)
+                elif len(cands) == 1:
+                    targets = cands
+                    w = 0.5 * sc
+                else:
+                    continue
+            for t in targets:
+                if t != src:
+                    out_w[src][t] = out_w[src].get(t, 0.0) + w
+
+    # 2. Structural reinforcement: method -> enclosing class so calling
+    #    `Class.method` also lifts `Class` in file-level symbol cards.
+    for key in sorted(def_nodes):
+        f, qual = key.split("::", 1)
+        if "." in qual:
+            parent_key = f"{f}::{qual.rsplit('.', 1)[0]}"
+            if parent_key in def_nodes and parent_key != key:
+                out_w[key][parent_key] = out_w[key].get(parent_key, 0.0) + 0.35
+
+    # 3. Resolved import edges from `imports_of` (via `index.graph.imports`)
+    for f in sorted(index.files):
+        src = f"{f}::__module__"
+        sc = scale_file.get(f, 1.0)
+        for tgt_f in sorted(g.imports.get(f, ())):
+            targets = file_top_defs.get(tgt_f, [])
+            if not targets:
+                continue
+            w = (0.25 * sc) / len(targets)
+            for t in targets:
+                out_w[src][t] = out_w[src].get(t, 0.0) + w
+
+    # Personalization vector (uniform when `seeds` is None or matches nothing)
+    teleport: dict[str, float] = {}
+    if seeds is not None:
+        seed_items = (seeds.items() if isinstance(seeds, dict)
+                      else ((s, 1.0) for s in seeds))
+        for raw, wt in seed_items:
+            if not raw:
+                continue
+            w = float(wt)
+            if w <= 0.0:
+                continue
+            s = str(raw).strip()
+            matched: list[str] = []
+            if s in def_nodes:
+                matched = [s]
+            elif s in by_qual:
+                matched = by_qual[s]
+            elif s in by_bare:
+                matched = by_bare[s]
+            elif s in file_top_defs:
+                matched = file_top_defs[s]
+            else:
+                matched = [k for k in sorted(def_nodes) if node_file[k] == s]
+            if matched:
+                per = w / len(matched)
+                for m in matched:
+                    teleport[m] = teleport.get(m, 0.0) + per
+    if teleport:
+        tot_t = sum(teleport.values())
+        teleport = {u: teleport.get(u, 0.0) / tot_t for u in all_nodes}
+    else:
+        teleport = {u: 1.0 / n for u in all_nodes}
+
+    total_out = {u: sum(ws.values()) for u, ws in out_w.items()}
+    rank = dict(teleport)
+    for _ in range(iterations):
+        nxt = {u: (1.0 - damping) * teleport[u] for u in all_nodes}
+        lost = 0.0
+        for u in all_nodes:
+            if not total_out[u]:
+                lost += rank[u]
+        if lost:
+            for u in all_nodes:
+                nxt[u] += damping * lost * teleport[u]
+        for u in all_nodes:
+            tot = total_out[u]
+            if not tot:
+                continue
+            give = damping * rank[u] / tot
+            for t, w in out_w[u].items():
+                nxt[t] += give * w
+        rank = nxt
+
+    def_scores = {u: rank[u] for u in sorted(def_nodes)}
+    top = max(def_scores.values()) or 1.0
+    result = {u: r / top for u, r in def_scores.items()}
+    if seeds is None:
+        g._sym_pr = result
+    return result

@@ -28,6 +28,8 @@ import re
 STATE_HEAD = ("RESULT:\nSTATE (earlier lookups, folded to free context -- the "
               "source they showed is no longer in this conversation; re-`read` "
               "anything you need to quote exactly):")
+TRIED_FAILED_HEAD = "TRIED & FAILED:"
+_MAX_HYPOTHESES = 5
 _FOLDED_ACTION = '{"action": "outline", "reasoning": "earlier lookups folded"}'
 _LEGACY_FOLDED_ACTION = "{'action': 'outline', 'reasoning': 'earlier lookups folded'}"
 _READ_HEAD_RX = re.compile(r"^(.+?) lines (\d+)-(\d+):")
@@ -77,17 +79,55 @@ def _gist(action: dict, result: str, raw_action: str) -> str:
     return f"{name}{arg} -> {len(lines)} line(s)"
 
 
-def digest(band: list[dict], max_chars: int = 1400) -> str:
+def format_hypotheses(hypotheses: list[tuple[str, str]] | None,
+                      max_items: int = _MAX_HYPOTHESES) -> str:
+    """Format up to `max_items` compact `(target, error)` pairs under a
+    `TRIED & FAILED:` header, or '' when none exist."""
+    if not hypotheses:
+        return ""
+    dedup: list[tuple[str, str]] = []
+    for raw_t, raw_e in hypotheses:
+        tgt = " ".join(str(raw_t or "").split())[:80] or "(general)"
+        err_lines = [ln.strip() for ln in str(raw_e or "").splitlines()
+                     if ln.strip()]
+        err = " ".join((err_lines[0] if err_lines else "").split())[:140]
+        if not err:
+            continue
+        pair = (tgt, err)
+        if pair in dedup:
+            dedup.remove(pair)
+        dedup.append(pair)
+    dedup = dedup[-max(1, max_items):]
+    if not dedup:
+        return ""
+    body = "\n".join(f"- {t} -> {e}" for t, e in dedup)
+    return f"{TRIED_FAILED_HEAD}\n{body}"
+
+
+def digest(band: list[dict], max_chars: int = 1400,
+           hypotheses: list[tuple[str, str]] | None = None) -> str:
     """STATE text for a band of folded messages. Older digests inside the band
     (a fold of a fold) are carried forward; when over `max_chars` the OLDEST
-    lines go first."""
+    lines go first. When `hypotheses` (or carried-forward `TRIED & FAILED:`
+    entries) are present, up to 5 compact `(target -> error)` entries are
+    appended so the model does not repeat failed approaches."""
     lines: list[str] = []
+    carried_hyps: list[tuple[str, str]] = []
     i = 0
     while i < len(band):
         m = band[i]
         content = m.get("content") or ""
         if m["role"] == "user" and content.startswith(STATE_HEAD):
-            lines += [ln for ln in content[len(STATE_HEAD):].splitlines()
+            tail_txt = content[len(STATE_HEAD):]
+            if TRIED_FAILED_HEAD in tail_txt:
+                head_part, hyp_part = tail_txt.split(TRIED_FAILED_HEAD, 1)
+                for ln in hyp_part.splitlines():
+                    if ln.startswith("- ") and " -> " in ln:
+                        t, e = ln[2:].split(" -> ", 1)
+                        carried_hyps.append((t.strip(), e.strip()))
+            else:
+                head_part = tail_txt
+            lines += [ln for ln in head_part.splitlines()
                       if ln.startswith("- ")]
             i += 1
             continue
@@ -107,13 +147,20 @@ def digest(band: list[dict], max_chars: int = 1400) -> str:
     for ln in lines:
         if not dedup or dedup[-1] != ln:
             dedup.append(ln)
-    while dedup and sum(len(x) + 1 for x in dedup) > max_chars:
+    merged_hyps = carried_hyps + list(hypotheses or [])
+    hyp_block = format_hypotheses(merged_hyps)
+    avail = max(120, max_chars - (len(hyp_block) + 2 if hyp_block else 0))
+    while dedup and sum(len(x) + 1 for x in dedup) > avail:
         dedup.pop(0)
-    return "\n".join(dedup)
+    body = "\n".join(dedup)
+    if hyp_block:
+        return (body + "\n\n" + hyp_block) if body else hyp_block
+    return body
 
 
 def fold_middle(messages: list[dict], keep_pairs: int,
-                max_chars: int = 1400) -> bool:
+                max_chars: int = 1400,
+                hypotheses: list[tuple[str, str]] | None = None) -> bool:
     """Replace the band between the first user turn and the last `keep_pairs`
     pairs with one STATE pair, in place. Returns False (and changes nothing)
     when there is nothing worth folding (fewer than two pairs in the band)."""
@@ -127,7 +174,7 @@ def fold_middle(messages: list[dict], keep_pairs: int,
     if end - 2 < 4:
         return False
     band = messages[2:end]
-    state = digest(band, max_chars)
+    state = digest(band, max_chars, hypotheses=hypotheses)
     if not state:
         return False
     messages[2:end] = [

@@ -55,15 +55,17 @@ def _changed_lines(old: str, new: str) -> tuple[list[str], list[str]]:
 # -------------------------------------------------------------- on by default
 def test_on_by_default_the_briefs_are_reworded():
     assert Config().edit_plan_brief is True
+    base_for = {"tiny": prompts._TINY_EDIT, "small": prompts._SMALL_EDIT,
+                "full": EDIT_FORMAT}
     for pack in ("full", "small", "tiny"):
         cfg = _cfg(prompt_pack=pack)
-        want = prompts._TINY_EDIT if pack == "tiny" else EDIT_FORMAT
+        want = base_for[pack]
         assert prompts.edit_format(cfg, EDIT_FORMAT) != want
         assert prompts.PLAN_LINE in prompts.edit_format(cfg, EDIT_FORMAT)
     # the flag-off path stays byte-identical to the original briefs
     for pack in ("full", "small", "tiny"):
         off = _cfg(prompt_pack=pack, edit_plan_brief=False)
-        want = prompts._TINY_EDIT if pack == "tiny" else EDIT_FORMAT
+        want = base_for[pack]
         assert prompts.edit_format(off, EDIT_FORMAT) == want
         assert "nothing else around them" in want
 

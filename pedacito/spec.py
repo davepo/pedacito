@@ -3371,35 +3371,254 @@ def auto_heal_file(root: Path, rel: str, cfg=None,
     return receipts
 
 
+_JS_MISSING_IMPORT_RE = re.compile(
+    r"^(?:[A-Za-z]*ContractError) in (?P<file>.+?):\d+: calls "
+    r"(?P<name>[A-Za-z_$][\w$]*)\(\) but this module never imports it -- "
+    r"(?P<where>[^,]+?) exports (?P=name), .*?"
+    r"\(add `import \{ (?P=name) \} from '(?P<spec>[^']+)'`\)"
+)
+
+
+@_ts_guarded
+def _insert_js_imports(rel: str, src: str,
+                       additions: dict[str, list[str]]) -> str | None:
+    """Insert or merge unambiguous ES module named imports into `src`,
+    validating the resulting source with tree-sitter before returning it.
+    Returns None when nothing can be safely healed."""
+    suffix = Path(rel).suffix.lower()
+    if suffix not in TS_EXTS:
+        return None
+    root_node = _ts_parse(src, suffix)
+    if root_node is None:
+        return None
+    bound = {name for name, _line, _kind in _js_top_level_bindings(root_node)}
+    filtered: dict[str, list[str]] = {}
+    for spec_str, syms in sorted(additions.items()):
+        keep = sorted({s for s in syms if s and s not in bound})
+        if keep:
+            filtered[spec_str] = keep
+    if not filtered:
+        return None
+
+    healed = src
+    new_lines: list[str] = []
+    for spec_str, syms in filtered.items():
+        merge_rx = re.compile(
+            r"^(?P<head>[ \t]*import\s*\{)(?P<body>[^}\n]*)"
+            r"(?P<tail>\}\s*from\s*(?P<q>['\"])" + re.escape(spec_str)
+            + r"(?P=q)\s*;?[ \t]*)$",
+            re.M,
+        )
+        m = merge_rx.search(healed)
+        if m:
+            existing = [p.strip() for p in m.group("body").split(",")
+                        if p.strip()]
+            to_add = [s for s in syms if s not in existing]
+            if to_add:
+                merged = ", ".join(existing + to_add)
+                rep = f"{m.group('head')} {merged} {m.group('tail')}"
+                healed = healed[:m.start()] + rep + healed[m.end():]
+        else:
+            new_lines.append(
+                f"import {{ {', '.join(syms)} }} from '{spec_str}';")
+
+    if new_lines:
+        # Locate insertion point using tree-sitter's top-level import nodes.
+        cur_root = _ts_parse(healed, suffix)
+        if cur_root is None:
+            return None
+        insert_idx = 0
+        last_import_end = -1
+        for ch in cur_root.named_children:
+            if ch.type == "import_statement":
+                last_import_end = max(last_import_end, ch.end_point[0] + 1)
+        lines = healed.split("\n")
+        if last_import_end >= 0:
+            insert_idx = min(last_import_end, len(lines))
+        else:
+            # Skip shebang, leading comments, and "use strict" directive.
+            idx = 0
+            while idx < len(lines):
+                stripped = lines[idx].strip()
+                if not stripped or stripped.startswith("//") \
+                        or stripped.startswith("#!") \
+                        or stripped in ('"use strict";', "'use strict';",
+                                        '"use strict"', "'use strict'"):
+                    idx += 1
+                    continue
+                break
+            insert_idx = idx
+        lines[insert_idx:insert_idx] = new_lines
+        healed = "\n".join(lines)
+
+    # Validate healed source with tree-sitter before accepting.
+    check_root = _ts_parse(healed, suffix)
+    if check_root is None:
+        return None
+    # Belt-and-braces: ensure we introduced no duplicate top-level binding.
+    counts: dict[str, int] = {}
+    for name, _line, _kind in _js_top_level_bindings(check_root):
+        counts[name] = counts.get(name, 0) + 1
+    for syms in filtered.values():
+        for s in syms:
+            if counts.get(s, 0) != 1:
+                return None
+    return healed
+
+
+def _rel_set(root: Path, files) -> list[str] | None:
+    if files is None:
+        return None
+    root_res = Path(root).resolve()
+    out: list[str] = []
+    for f in files:
+        p = Path(f)
+        if p.is_absolute():
+            try:
+                rel = p.resolve().relative_to(root_res).as_posix()
+            except ValueError:
+                continue
+        else:
+            rel = fileio.normalise_rel(str(f))
+        if rel:
+            out.append(rel)
+    return out
+
+
+@_ts_guarded
+def heal_js_module_imports(root: Path, files=None, errors=None, cfg=None
+                           ) -> tuple[list[str], list[str]]:
+    """Auto-heal unambiguous missing sibling ES imports identified by
+    `_js_module_link_errors`, validating each edited file with tree-sitter
+    before writing to disk.
+
+    Returns `(errors_after, receipts)`. When `auto_heal_imports` is disabled or
+    nothing can be healed unambiguously, returns `(list(errors or []), [])`.
+    """
+    if not _auto_heal_enabled(cfg):
+        return list(errors or []), []
+    root = Path(root)
+    rel_scope = _rel_set(root, files)
+    scope_set = set(rel_scope) if rel_scope is not None else None
+    from_caller = errors is not None
+    raw_errors = (list(errors) if from_caller
+                  else [t for imp, _tgt, t in _js_module_link_errors(root)
+                        if scope_set is None or imp in scope_set])
+    if not raw_errors:
+        return [], []
+
+    # Group unambiguous `(name, spec)` additions by importer file.
+    by_file: dict[str, dict[str, list[str]]] = {}
+    for err in raw_errors:
+        m = _JS_MISSING_IMPORT_RE.match(str(err or "").strip())
+        if not m:
+            continue
+        rel = fileio.normalise_rel(m.group("file"))
+        if scope_set is not None and rel not in scope_set:
+            continue
+        name = m.group("name").strip()
+        spec_str = m.group("spec").strip()
+        if not name or not spec_str:
+            continue
+        by_file.setdefault(rel, {}).setdefault(spec_str, []).append(name)
+
+    if not by_file:
+        return raw_errors, []
+
+    receipts: list[str] = []
+    healed_files: list[str] = []
+    for rel, additions in sorted(by_file.items()):
+        path = root / rel
+        if not path.is_file():
+            continue
+        try:
+            src, style = fileio.read(path)
+        except OSError:
+            continue
+        healed = _insert_js_imports(rel, src, additions)
+        if healed is None or healed == src:
+            continue
+        try:
+            fileio.write(path, healed, style)
+        except OSError:
+            continue
+        healed_files.append(rel)
+        for spec_str, syms in sorted(additions.items()):
+            uniq = ", ".join(sorted(set(syms)))
+            receipts.append(
+                f"[auto-heal] {rel}: added `import {{ {uniq} }} from "
+                f"'{spec_str}';`")
+
+    if not receipts:
+        return raw_errors, []
+
+    if from_caller:
+        try:
+            after = verify_frontend_contracts(root, rel_scope)
+        except Exception:
+            after = raw_errors
+    else:
+        after = [t for imp, _tgt, t in _js_module_link_errors(root)
+                 if scope_set is None or imp in scope_set]
+    return after, receipts
+
+
 def heal_static_gate_errors(root: Path, files, errors, cfg=None
                             ) -> tuple[list[str], list[str]]:
-    """Heal NEW F821 gate errors on disk, then re-run the gate on `files`.
+    """Heal NEW F821 Python gate errors and unambiguous missing sibling ES
+    module imports on disk, then re-run the gates on `files`.
 
     Returns `(errors_after, receipts)`. When nothing can be healed the
     original error list is returned unchanged, so the normal repair path sees
     exactly what it would have seen without this feature."""
     if not _auto_heal_enabled(cfg) or not errors:
         return list(errors or []), []
-    by_file: dict[str, set[str]] = {}
+    py_by_file: dict[str, set[str]] = {}
+    js_errors: list[str] = []
     for err in errors:
         text = str(err or "")
-        if ": F821 " not in text:
-            continue
-        m = re.match(r"^(?P<file>.+?):\d+:\d+: ", text)
-        name_m = _F821_NAME_RE.search(text)
-        if m and name_m:
-            by_file.setdefault(m.group("file"), set()).add(
-                name_m.group(1).strip())
+        if ": F821 " in text:
+            m = re.match(r"^(?P<file>.+?):\d+:\d+: ", text)
+            name_m = _F821_NAME_RE.search(text)
+            if m and name_m:
+                py_by_file.setdefault(m.group("file"), set()).add(
+                    name_m.group(1).strip())
+        elif _JS_MISSING_IMPORT_RE.match(text.strip()):
+            js_errors.append(text)
+
     receipts: list[str] = []
-    for rel, names in sorted(by_file.items()):
-        receipts.extend(auto_heal_file(root, rel, cfg, names=names))
+    py_healed = False
+    for rel, names in sorted(py_by_file.items()):
+        got = auto_heal_file(root, rel, cfg, names=names)
+        if got:
+            py_healed = True
+            receipts.extend(got)
+
+    js_after: list[str] = []
+    js_healed = False
+    if js_errors:
+        js_after, js_receipts = heal_js_module_imports(
+            root, files=files, errors=js_errors, cfg=cfg)
+        if js_receipts:
+            js_healed = True
+            receipts.extend(js_receipts)
+
     if not receipts:
         return list(errors or []), []
-    timeout = float(_get(cfg, "static_gate_timeout", _RUFF_TIMEOUT))
-    try:
-        after = run_fast_static_gate(root, files, timeout=timeout)
-    except Exception:
-        after = list(errors or [])
+
+    after: list[str] = []
+    if py_healed:
+        timeout = float(_get(cfg, "static_gate_timeout", _RUFF_TIMEOUT))
+        try:
+            after.extend(run_fast_static_gate(root, files, timeout=timeout))
+        except Exception:
+            after.extend([e for e in errors if not _JS_MISSING_IMPORT_RE.match(str(e or "").strip())])
+    else:
+        after.extend([e for e in errors if not _JS_MISSING_IMPORT_RE.match(str(e or "").strip())])
+    if js_healed:
+        after.extend(js_after)
+    elif js_errors:
+        after.extend(js_errors)
     return after, receipts
 
 

@@ -719,6 +719,7 @@ def schema_for(cfg) -> dict:
     from .prompts import pack_for
     pack = pack_for(cfg)
     tiny = pack == "tiny"
+    compact_tier = pack in ("tiny", "small")
     actions = ["read", "grep", "find", "callers"]
     actions.append("context")
     actions += ["outline", "usages", "sessions", "todo"]
@@ -726,7 +727,11 @@ def schema_for(cfg) -> dict:
         actions.append("diff")
     if getattr(cfg, "allow_git", True) and not tiny \
             and getattr(cfg, "_is_git", True):
-        actions += ["git", GIT_DIFF_ACTION]
+        actions.append("git")
+        # On compact tiers `git` already covers `git diff`/`git status`;
+        # omit the overlapping `git_diff` alias to shrink the tool grammar.
+        if not compact_tier:
+            actions.append(GIT_DIFF_ACTION)
     if getattr(cfg, "allow_shell", False):
         actions += ["run", "diagnose"]
     if _run_test_offered(cfg):
@@ -738,8 +743,12 @@ def schema_for(cfg) -> dict:
     if getattr(cfg, "allow_serve", False):
         actions.append("serve")
     if getattr(cfg, "allow_write", False):
-        actions += ["write", "append", "move", "delete", "rename",
-                    "rename_symbol"]
+        actions += ["write", "append", "move", "delete"]
+        # On tiny/small tiers keep the deterministic AST-gated `rename_symbol`
+        # and drop the overlapping legacy `rename` alias.
+        if not compact_tier:
+            actions.append("rename")
+        actions.append("rename_symbol")
         if getattr(cfg, "backup", False):
             # `undo` can only work from the task's snapshot dir; offering it
             # with backups off would promise a recovery that cannot happen.
@@ -761,19 +770,22 @@ def schema_for(cfg) -> dict:
         # subagent/delegate/research, unless a scout profile is available to
         # absorb the child's lookups without touching the architect's slot.
         actions.append("task")
-    if getattr(cfg, "allow_fetch", False) and not tiny:
+    web_offered = bool(getattr(cfg, "enable_web", False)) or bool(
+        _WEB_PROMPT_RE.search(str(getattr(cfg, "_task_text", "") or "")))
+    if getattr(cfg, "allow_fetch", False) and not tiny \
+            and not (compact_tier and web_offered):
         actions.append("fetch")
-    if bool(getattr(cfg, "enable_web", False)) or _WEB_PROMPT_RE.search(
-            str(getattr(cfg, "_task_text", "") or "")):
+    if web_offered:
         # the built-in web tools: offered when enabled or when the task text
         # names a URL / web intent; each call still asks the broker while
         # enable_web is off (see fetch_url / web_search below).
         actions += [FETCH_URL_ACTION, WEB_SEARCH_ACTION]
     if getattr(cfg, "_interactive", False):
         actions.append("question")
-    if getattr(cfg, "allow_mcp", False):
+    mcp_call_on = _mcp_call_offered(cfg)
+    if getattr(cfg, "allow_mcp", False) and not (compact_tier and mcp_call_on):
         actions.append("mcp")
-    if _mcp_call_offered(cfg):
+    if mcp_call_on:
         # The named-server path: offered only when at least one listed tool
         # matches the task (see _mcp_relevant_tools). Calls on servers not
         # marked `trusted` ask the permission broker first (tool_mcp_call).

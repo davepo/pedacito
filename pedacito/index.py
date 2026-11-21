@@ -490,7 +490,10 @@ class Index:
         if link:
             card.append(f"  {link[0]}: {link[1]}")
         if top:
-            shown, hidden = _cap(top, max_names)
+            scores = None
+            if len(top) > max_names:
+                scores = self._symbol_scores_for_file(f, units)
+            shown, hidden = _cap(top, max_names, scores=scores)
             names = []
             for c in shown:
                 end = c.scope_end or c.end   # full class span, not the header
@@ -499,6 +502,25 @@ class Index:
             extra = f" (+{hidden} hidden; use outline)" if hidden else ""
             card.append(f"  defines: {', '.join(names)}{extra}")
         return "\n".join(card)
+
+    def _symbol_scores_for_file(self, f: str, units: list[Chunk]
+                                ) -> dict[str, float]:
+        """Per-symbol centrality scores in `f` from symbol-level PageRank,
+        rolling method scores up to their enclosing top-level class."""
+        from .graph import symbol_pagerank
+        spr = symbol_pagerank(self)
+        scores: dict[str, float] = {}
+        prefix = f"{f}::"
+        for c in units:
+            base = c.qualname.split("#")[0]
+            sc = spr.get(prefix + base, 0.0)
+            if sc > scores.get(base, 0.0):
+                scores[base] = sc
+            if "." in base:
+                owner = base.split(".", 1)[0]
+                if sc > scores.get(owner, 0.0):
+                    scores[owner] = sc
+        return scores
 
     def render_dirs(self) -> str:
         """Directory-tier map: one card per top-level directory naming its
@@ -788,12 +810,22 @@ _ENTRY_STEMS = {
 }
 
 
-def _cap(units: list[Chunk], max_names: int) -> tuple[list[Chunk], int]:
+def _cap(units: list[Chunk], max_names: int,
+         scores: dict[str, float] | None = None) -> tuple[list[Chunk], int]:
     """Fit a file's definitions into a card's name limit, dropping private
-    (underscore-prefixed) helpers before public ones."""
+    (underscore-prefixed) helpers before public ones. When centrality `scores`
+    are provided and the file exceeds `max_names`, order by centrality
+    descending with deterministic tie-breaks by `(start, qualname)`."""
     if len(units) <= max_names:
         return units, 0
     public = [c for c in units if not c.qualname.startswith("_")]
+    if scores is not None:
+        def _rank_key(c: Chunk) -> tuple[float, int, str]:
+            return (-round(scores.get(c.qualname.split("#")[0], 0.0), 9),
+                    c.start, c.qualname)
+        if len(public) <= max_names:
+            return sorted(public, key=_rank_key), len(units) - len(public)
+        return sorted(public, key=_rank_key)[:max_names], len(units) - max_names
     if len(public) <= max_names:
         return public, len(units) - len(public)
     return public[:max_names], len(units) - max_names

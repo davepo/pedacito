@@ -333,6 +333,94 @@ def _step_signature(step: dict) -> tuple:
         if k != "reasoning"))
 
 
+_OSCILLATION_WINDOW = 8
+_MAX_HYPOTHESIS_LEDGER = 5
+_TAIL_PRIORITY_ACTIONS = frozenset({"run", "diagnose", "serve", "git_diff"})
+_GREP_HIT_RE = re.compile(r"^([^:\n]+?):(\d+)([:-])")
+
+
+def _oscillation_key(step: dict) -> tuple[str, str]:
+    """Normalized `(action, target)` signature for ping-pong oscillation
+    detection across a rolling window of gather steps."""
+    s = step or {}
+    action = str(s.get("action") or "").strip().lower()
+    raw_file = str(s.get("file") or "").strip()
+    norm_file = fileio.path_key(raw_file) if raw_file else ""
+    if action == "read":
+        if norm_file:
+            target = f"{norm_file}:{s.get('start', 0)}-{s.get('end', 0)}"
+        else:
+            target = str(s.get("symbol") or "").strip().lower()
+    elif action == "grep":
+        pat = str(s.get("pattern") or "").strip().lower()
+        target = f"{norm_file}:{pat}" if norm_file else pat
+    elif action == "mcp_call":
+        srv = str(s.get("server") or "").strip().lower()
+        tl = str(s.get("tool") or "").strip().lower()
+        target = f"{srv}.{tl}" if srv or tl else ""
+    else:
+        target = ""
+        for k in ("file", "symbol", "pattern", "command", "target", "url", "query"):
+            v = str(s.get(k) or "").strip()
+            if v:
+                target = fileio.path_key(v) if k == "file" else v.lower()
+                break
+    return action, target[:120]
+
+
+def _detect_oscillation(window: list[tuple[str, str]]) -> int:
+    """Return oscillation period (2 or 3) when the tail of `window` forms a
+    period-2 (`[A, B, A, B]`, A != B) or period-3 (`[A, B, C, A, B, C]`,
+    >= 2 distinct steps) ping-pong cycle, else 0."""
+    if len(window) >= 4 and window[-4:-2] == window[-2:] \
+            and window[-1] != window[-2]:
+        return 2
+    if len(window) >= 6 and window[-6:-3] == window[-3:] \
+            and len(set(window[-3:])) >= 2:
+        return 3
+    return 0
+
+
+def _group_cap_grep(obs: str, max_per_file: int = 5) -> str:
+    """Group-cap `grep` hits at `max_per_file` hits per file so one noisy file
+    never drowns out matches in other files before global truncation."""
+    lines = obs.split("\n")
+    counts: dict[str, int] = {}
+    dropped: dict[str, int] = {}
+    out: list[str] = []
+    # Preserve order; record a compact overflow note right where each file's
+    # block ends (or at the tail if interleaved).
+    last_file: str | None = None
+
+    def _flush_file(rel: str | None) -> None:
+        if rel is not None and dropped.get(rel, 0) > 0:
+            n = dropped.pop(rel)
+            out.append(f"  ... (+{n} more hit(s) in {rel})")
+
+    for ln in lines:
+        m = _GREP_HIT_RE.match(ln)
+        if not m:
+            _flush_file(last_file)
+            last_file = None
+            out.append(ln)
+            continue
+        rel = m.group(1)
+        if last_file is not None and rel != last_file:
+            _flush_file(last_file)
+        last_file = rel
+        c = counts.get(rel, 0)
+        if c < max_per_file:
+            counts[rel] = c + 1
+            out.append(ln)
+        else:
+            dropped[rel] = dropped.get(rel, 0) + 1
+    _flush_file(last_file)
+    for rel, n in list(dropped.items()):
+        if n > 0:
+            out.append(f"  ... (+{n} more hit(s) in {rel})")
+    return "\n".join(out)
+
+
 def _norm_key(path: str) -> str:
     """Normalise a read-ledger path. Models alternate between `pkg/a.py` and
     `./pkg/a.py`; the ledger, eviction pass and coverage must share one key."""
@@ -1409,6 +1497,32 @@ class Agent:
         # SEARCH blocks that matched nowhere in the file, over every apply()
         # round of this agent (the eval row reports it next to repair calls).
         self.search_mismatches = 0
+        # Harness-owned TRIED & FAILED hypothesis ledger: up to 5 compact
+        # `(target, concise_error)` entries carried into repair prompts and
+        # STATE folds so small models stop repeating broken patches.
+        self._failed_hypotheses: list[tuple[str, str]] = []
+
+    def _record_failed_hypothesis(self, target: str, error: str) -> None:
+        """Record a compact `(target -> concise error)` failure in the
+        harness hypothesis ledger (deduplicated, capped at 5 entries)."""
+        tgt = " ".join(str(target or "").split())[:80] or "(general)"
+        err_lines = [ln.strip() for ln in str(error or "").splitlines()
+                     if ln.strip()]
+        err = " ".join((err_lines[0] if err_lines else "").split())[:140]
+        if not err:
+            return
+        pair = (tgt, err)
+        if pair in self._failed_hypotheses:
+            self._failed_hypotheses.remove(pair)
+        self._failed_hypotheses.append(pair)
+        if len(self._failed_hypotheses) > _MAX_HYPOTHESIS_LEDGER:
+            self._failed_hypotheses = (
+                self._failed_hypotheses[-_MAX_HYPOTHESIS_LEDGER:])
+
+    def _format_hypothesis_ledger(self) -> str:
+        """Render the `TRIED & FAILED` hypothesis ledger, or '' when empty."""
+        return fold_mod.format_hypotheses(
+            self._failed_hypotheses, max_items=_MAX_HYPOTHESIS_LEDGER)
 
     # ------------------------------------------------------------ helpers
     def _creative_for(self, task: str) -> bool:
@@ -1649,8 +1763,14 @@ class Agent:
     def _cap_observation(self, action: str, obs: str) -> str:
         """Per-action ceiling for everything but source reads: one broad grep,
         a chatty command or a big MCP reply must not eat the gather budget or
-        the tail of the window. Cut on a line boundary, say how much was left
-        and how to narrow it."""
+        the tail of the window.
+
+        - `run`, `diagnose`, `serve`, `git_diff`: preserve 25% head +
+          `... [omitted N chars] ...` + 75% tail so tracebacks and exit
+          summaries at the bottom survive.
+        - `grep`: group-cap at max 5 hits per file first, then fall back to
+          the global cap if still over budget.
+        - Everything else: cut on a line boundary with a narrowing hint."""
         if action in ("read", "context", "done", "todo") \
                 or obs.startswith("ERROR"):
             return obs
@@ -1661,6 +1781,23 @@ class Agent:
         cap = int(tokens * 3.6)
         if len(obs) <= cap:
             return obs
+        if action in _TAIL_PRIORITY_ACTIONS:
+            head_cap = max(1, cap // 4)
+            tail_cap = max(1, cap - head_cap)
+            head = obs[:head_cap]
+            h_nl = head.rfind("\n")
+            if h_nl > head_cap // 2:
+                head = head[:h_nl]
+            tail = obs[-tail_cap:]
+            t_nl = tail.find("\n")
+            if 0 <= t_nl < tail_cap // 2:
+                tail = tail[t_nl + 1:]
+            omitted = max(1, len(obs) - len(head) - len(tail))
+            return f"{head}\n... [omitted {omitted} chars] ...\n{tail}"
+        if action == "grep":
+            obs = _group_cap_grep(obs, max_per_file=5)
+            if len(obs) <= cap:
+                return obs
         cut = obs[:cap]
         nl = cut.rfind("\n")
         if nl > cap // 2:
@@ -2146,7 +2283,8 @@ class Agent:
             max_chars = max(500, min(2500, int(room * 3.6 * 0.10)))
             while True:
                 before = estimate_messages(messages, est)
-                if fold_mod.fold_middle(messages, keep, max_chars):
+                if fold_mod.fold_middle(messages, keep, max_chars,
+                                        hypotheses=self._failed_hypotheses):
                     self._after_fold(messages, est, before, client)
                     changed = True
                     break
@@ -2236,6 +2374,8 @@ class Agent:
         """
         # A fresh run: drop any backup directory left by a previous task.
         self.cfg._backup_dir = backup_dir
+        if not is_repair:
+            self._failed_hypotheses = []
         root = self.index.root
         self.cfg._root = str(root)
         self.cfg._is_git = gitinfo.is_repo(root)
@@ -2509,7 +2649,8 @@ class Agent:
         # One targeted recovery prompt per distress signal before gather gives
         # up (cfg.stuck_recovery): a small model often escapes a loop when
         # told, specifically, what it is doing.
-        recoveries = {"repeat": 0, "errors": 0, "dup": 0}
+        recoveries = {"repeat": 0, "oscillation": 0, "errors": 0, "dup": 0}
+        recent_steps: list[tuple[str, str]] = []
         questions = 0            # clarifying questions asked so far
         ran: dict = {}           # step signature -> (step, index gen, folds, mutations)
         # BUG-320: identical FAILING read-only steps used to be exempt from
@@ -3021,6 +3162,50 @@ class Agent:
                     break
                 continue
 
+            recent_steps.append(_oscillation_key(stepjson))
+            if len(recent_steps) > _OSCILLATION_WINDOW:
+                del recent_steps[:-_OSCILLATION_WINDOW]
+            osc_period = _detect_oscillation(recent_steps)
+            if osc_period:
+                cycle = " -> ".join(
+                    f"{a}({t})" if t else a
+                    for a, t in recent_steps[-osc_period:])
+                if recover_on and recoveries["oscillation"] < 1:
+                    recoveries["oscillation"] += 1
+                    note = (f"[STUCK: you are oscillating in a period-"
+                            f"{osc_period} loop ({cycle}); alternating "
+                            "between the same steps cannot add new "
+                            "information. Do something DIFFERENT now: a "
+                            "different file or symbol, `find`/`grep` for "
+                            "what you are missing, or `done` if you already "
+                            "have what you need.]")
+                    messages.append({"role": "assistant",
+                                     "content": _compact(stepjson)})
+                    messages.append({"role": "user",
+                                     "content": f"{note}\n\n{nudge(step + 1)}"})
+                    if self.requirements and _requirement_assist(tail=True):
+                        if verbose:
+                            print("  [recovery: harness fetched the cheapest "
+                                  "lookup for the oldest unmet requirement]",
+                                  file=sys.stderr)
+                    recent_steps.clear()
+                    repeated, last_sig = 0, None
+                    self._emit("recovery", signal="oscillation",
+                               period=osc_period, step=step)
+                    if verbose:
+                        print(f"  [recovery: period-{osc_period} oscillation "
+                              f"({cycle}); asking for a different move]",
+                              file=sys.stderr)
+                    self._fit(messages, gclient)
+                    if note_progress(False):
+                        break
+                    continue
+                if verbose:
+                    print(f"  [gather stopped: period-{osc_period} "
+                          f"oscillation ({cycle}); moving to answer]",
+                          file=sys.stderr)
+                break
+
             if repeated >= _MAX_REPEATED_STEPS:
                 if recover_on and recoveries["repeat"] < 1:
                     recoveries["repeat"] += 1
@@ -3230,6 +3415,8 @@ class Agent:
                 arg = (stepjson.get("file") or stepjson.get("pattern")
                        or stepjson.get("symbol") or stepjson.get("command") or "")
                 arg = arg if isinstance(arg, str) else str(arg)
+                self._record_failed_hypothesis(
+                    f"{action} {arg}".strip(), obs)
                 item = f"--- {action} {arg} failed: {obs[:160]}"
                 gathered.append(item)
                 self._emit("step", n=step, action=action, detail=arg[:120],
@@ -4597,6 +4784,11 @@ class Agent:
             rules = prompts_mod.test_rules(self.cfg)
             if rules not in system:
                 system += "\n\n" + rules
+        for err in errors:
+            self._record_failed_hypothesis(
+                getattr(err, "file", "") or getattr(err, "kind", "check"),
+                getattr(err, "message", str(err)))
+        ledger = self._format_hypothesis_ledger()
         # Implicit rehydration: flagged regions the model WAS
         # shown get their fresh exact bytes appended at the TAIL of this
         # repair prompt, and the read ledger is credited -- the corrected
@@ -4611,6 +4803,7 @@ class Agent:
                     + f"YOUR PROPOSED EDIT BLOCKS:\n{blocks}\n\n"
                     + "An automatic check of these edits found problems:\n"
                     + verify_mod.render(errors) + "\n\n"
+                    + (f"{ledger}\n\n" if ledger else "")
                     + "Output the COMPLETE corrected set of search/replace blocks "
                     "for the whole task (not only the changed ones). Fix each "
                     "problem, or -- if a problem means you are editing code you "
@@ -5258,7 +5451,12 @@ class Agent:
                     "in those bytes (a mangled character, a tab, a CR) is "
                     "not what it shows. Never re-emit a SEARCH that already "
                     "failed unchanged.")
+            for r in failures:
+                self._record_failed_hypothesis(r.file or "(edit)", r.message)
+            ledger = self._format_hypothesis_ledger()
             extra = ("\n\n" + "\n\n".join(extras)) if extras else ""
+            if ledger:
+                extra += "\n\n" + ledger
             reply = self._chat_at(
                 "temperature_repair",
                 [
@@ -5392,6 +5590,10 @@ class Agent:
                 self.active_diagnostics = found or {}
                 if not found:
                     break
+                for rel_f, msgs_f in sorted(found.items()):
+                    for msg_f in msgs_f:
+                        self._record_failed_hypothesis(rel_f, msg_f)
+                ledger = self._format_hypothesis_ledger()
                 n = sum(len(v) for v in found.values())
                 print(f"\n[post-edit check: {n} new finding(s) in the changed "
                       "files; asking for a fix]", file=sys.stderr)
@@ -5405,7 +5607,8 @@ class Agent:
                             "changed files reports NEW problems they "
                             "introduced:\n"
                             f"{diagnostics_mod.render_findings(found)}\n\n"
-                            "SOURCE (current contents around each finding)\n\n"
+                            + (f"{ledger}\n\n" if ledger else "")
+                            + "SOURCE (current contents around each finding)\n\n"
                             f"{self._diagnostics_source(found)}\n\n"
                             "Fix ONLY these problems with minimal search/"
                             "replace blocks -- copy the SEARCH text exactly "
@@ -5731,20 +5934,42 @@ class Agent:
         return allowed
 
     def _resolve_symbol_anchors(self, edits: list) -> tuple[list, list]:
-        """Turn `SYMBOL name` anchors into LINES ranges via the index,
-        falling back to `chunker.locate_symbol_span` (AST / tree-sitter on the
-        current file bytes) when the index misses. Returns (failure Results,
-        edits left to apply). A file with a missing or ambiguous symbol fails
-        whole -- mirroring apply_edits' per-file failure -- and the message
-        feeds the repair loop."""
+        """Resolve `SYMBOL` / `AFTER_SYMBOL` anchors, preferring the live AST
+        span (`chunker.locate_symbol_span` on current file bytes) over a
+        potentially stale index, and respecting `insert_after` (never
+        overwriting `e.lines` on `insert_after` edits so `apply_edits`
+        splices after the symbol instead of replacing it).
+
+        When an earlier edit in the same batch already modifies `e.file`,
+        later symbol anchors on that file stay unresolved here so
+        `apply_edits` locates them against the evolving in-memory buffer.
+        Returns `(failure Results, edits left to apply)`."""
+        from .chunker import locate_symbol_span
         results: list = []
         bad: set[str] = set()
+        seen_files: set[str] = set()
         for e in edits:
-            if not e.symbol or e.lines:
+            fkey = _norm_key(e.file)
+            prior_edit = fkey in seen_files
+            seen_files.add(fkey)
+            sym = e.symbol or e.insert_after
+            if not sym or e.lines:
                 continue
-            want = _norm_key(e.symbol)
-            same = [c for c in self.index.find_symbol(e.symbol)
-                    if _norm_key(c.file) == _norm_key(e.file)]
+            if prior_edit:
+                # An earlier block in this reply already mutates this file;
+                # leave the anchor for `apply_edits` to locate against the
+                # evolving in-memory text so sequential splices compose.
+                continue
+            # Prefer live AST / tree-sitter span on current disk bytes over a
+            # potentially stale index.
+            disk = locate_symbol_span(self.index.root / e.file, sym)
+            if disk is not None:
+                if e.symbol and not e.insert_after:
+                    e.lines = (disk[0], disk[1])
+                continue
+            want = _norm_key(sym)
+            same = [c for c in self.index.find_symbol(sym)
+                    if _norm_key(c.file) == fkey]
             # find_symbol also matches via class members; only a name that
             # really ends with the symbol may be replaced.
             exact = [c for c in same
@@ -5752,19 +5977,11 @@ class Agent:
                      or _norm_key(c.qualname).endswith("." + want)]
             if len(exact) == 1:
                 c = exact[0]
-                # A classheader chunk stands for the whole class.
-                e.lines = (c.start, c.scope_end or c.end)
+                if e.symbol and not e.insert_after:
+                    # A classheader chunk stands for the whole class.
+                    e.lines = (c.start, c.scope_end or c.end)
                 continue
-            # Symbol-splice fallback: the index missed it (a method inside a
-            # whole-class chunk, a file not indexed yet, a stale line map).
-            # Ask the AST (Python) or tree-sitter directly where the symbol
-            # sits in the CURRENT bytes before failing the whole file.
-            from .chunker import locate_symbol_span
-            disk = locate_symbol_span(self.index.root / e.file, e.symbol)
-            if disk is not None:
-                e.lines = (disk[0], disk[1])
-                continue
-            bad.add(_norm_key(e.file))
+            bad.add(fkey)
             if not same:
                 why = ("no definition by that name in this file; check the "
                        "spelling against an `outline`")
@@ -5777,9 +5994,10 @@ class Agent:
                                     for c in exact[:5])
                 why = (f"{len(exact)} definitions match ({listing}); name "
                        "one exactly or anchor with LINES <start>-<end>")
+            label = "AFTER_SYMBOL" if e.insert_after else "SYMBOL"
             results.append(Result(
                 False, e.file,
-                f"SYMBOL anchor '{e.symbol}': {why}"))
+                f"{label} anchor '{sym}': {why}"))
         if bad:
             edits = [e for e in edits if _norm_key(e.file) not in bad]
         return results, edits
