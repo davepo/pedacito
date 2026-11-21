@@ -29,12 +29,13 @@ import re
 import site
 import sys
 import sysconfig
+import unicodedata
 from collections import Counter
 from dataclasses import replace
 from pathlib import Path
 
 from . import config as config_mod
-from . import how_index
+from . import how_index, i18n, prompts
 from .chunker import Chunk, chunk_source
 from .config import (Config, ConfigError, auto_fit, find_project_config,
                      load as load_config, missing_hardware)
@@ -75,6 +76,54 @@ _STOP = {
     "use", "using", "what", "when", "where", "which", "who", "why", "will",
     "with", "would", "you", "your",
 }
+
+# Spanish question filler (accent-folded), so Spanish questions rank offline.
+_ES_STOP = {
+    "como", "cual", "cuales", "que", "quien", "donde", "cuando", "por",
+    "para", "con", "sin", "el", "la", "los", "las", "un", "una", "unos",
+    "unas", "de", "del", "al", "en", "es", "se", "mi", "mis", "tu", "tus",
+    "su", "puedo", "puedes", "quiero", "necesito", "hacer", "hay", "y", "o",
+    "lo", "le", "me", "te", "cambio", "cambiar", "uso", "usar", "esta",
+    "este", "eso", "muy", "mas", "ya", "no", "si",
+}
+
+_ES_SYNONYMS = {
+    "idioma": ("language", "lang", "es", "spanish", "espanol"),
+    "lenguaje": ("language", "lang"),
+    "espanol": ("language", "lang", "es", "spanish"),
+    "configurar": ("configure", "setup", "config", "settings"),
+    "configuracion": ("configuration", "config", "settings", "toml"),
+    "modelo": ("model", "models", "profile", "server"),
+    "modelos": ("model", "models", "profile", "server"),
+    "deshacer": ("undo", "restore", "backup", "snapshot"),
+    "revertir": ("revert", "restore", "backup", "snapshot"),
+    "tema": ("theme", "appearance", "gui"),
+    "habilidad": ("skill", "skills"),
+    "habilidades": ("skill", "skills"),
+    "instalar": ("install", "pip", "setup"),
+    "instalacion": ("install", "pip", "setup"),
+    "comando": ("command", "commands", "cli", "usage"),
+    "comandos": ("command", "commands", "cli", "usage"),
+    "error": ("fail", "failure", "troubleshoot"),
+    "ayuda": ("help", "how"),
+    "herramienta": ("tool", "tools"),
+    "herramientas": ("tool", "tools"),
+    "indice": ("index", "indexing"),
+    "ignorar": ("ignore", "exclude", "pedacitoignore"),
+    "archivo": ("file", "files"),
+    "archivos": ("file", "files"),
+    "cambios": ("changes", "apply", "review"),
+    "seguridad": ("security", "sandbox", "permissions"),
+    "memoria": ("memory", "vram", "gpu", "context"),
+    "lento": ("slow", "performance", "context"),
+}
+
+
+def _fold(text: str) -> str:
+    """Strip accents so "cómo" and "como" match (English text is unchanged)."""
+    return "".join(c for c in unicodedata.normalize("NFKD", text)
+                   if not unicodedata.combining(c))
+
 
 # Question words that rarely appear verbatim in documentation. Expanding them
 # makes "how do I set this up?" find Configure/--setup, "undo" find restore,
@@ -333,7 +382,17 @@ def _string_constants(rel: str, source: str) -> list[Chunk]:
     return out
 
 
-def _documentation_paths(root: Path) -> list[tuple[str, Path]]:
+def _spanish_mirror(name: str, path: Path, root: Path) -> Path:
+    """The Spanish mirror of a doc file when it exists, else `path`."""
+    rel = Path(name)
+    if rel.parent.name == DOCS_DIR:
+        mirror = root / DOCS_DIR / "es" / rel.name
+    else:
+        mirror = root / f"{rel.stem}.es{rel.suffix}"
+    return mirror if mirror.is_file() else path
+
+
+def _documentation_paths(root: Path, lang: str = "en") -> list[tuple[str, Path]]:
     """The root guides plus every docs/*.md, keyed by their checkout-relative
     name. The docs directory is optional: an older installation without it
     still gets the README/QUICKSTART/source corpus."""
@@ -342,15 +401,21 @@ def _documentation_paths(root: Path) -> list[tuple[str, Path]]:
     if docs.is_dir():
         paths += [(f"{DOCS_DIR}/{path.name}", path)
                   for path in sorted(docs.glob("*.md"))]
+    if lang == "es":
+        # Chunks keep the English name (the ranking rules key on it) but read
+        # the Spanish text, falling back per file.
+        paths = [(name, _spanish_mirror(name, path, root))
+                 for name, path in paths]
     return paths
 
 
-def build_corpus(docs_root: Path | None = None) -> list[Chunk]:
+def build_corpus(docs_root: Path | None = None,
+                 lang: str = "en") -> list[Chunk]:
     """README, QUICKSTART, docs/*.md, the config templates and the package's
     Python modules as searchable chunks."""
     root = docs_root or find_docs_root()
     chunks: list[Chunk] = []
-    for name, path in _documentation_paths(root):
+    for name, path in _documentation_paths(root, lang):
         if not path.is_file():
             continue
         try:
@@ -383,9 +448,9 @@ def _weighted_terms(text: str) -> dict[str, float]:
     """Lowercase question terms with weights: a compound identifier such as
     `max_steps` counts fully, its pieces much less."""
     raws: list[str] = []
-    for raw in _WORD_RE.findall(text.lower()):
+    for raw in _WORD_RE.findall(_fold(text.lower())):
         raw = raw.strip(".-")
-        if len(raw) >= 2 and raw not in _STOP:
+        if len(raw) >= 2 and raw not in _STOP and raw not in _ES_STOP:
             raws.append(raw)
 
     weights: dict[str, float] = {}
@@ -395,13 +460,13 @@ def _weighted_terms(text: str) -> dict[str, float]:
             weights[raw] = 1.6          # identifier, not prose
     for raw in raws:
         for part in re.split(r"[_\-.]", raw):
-            if len(part) >= 3 and part not in _STOP:
+            if len(part) >= 3 and part not in _STOP and part not in _ES_STOP:
                 weights.setdefault(part, 0.35)
         if raw.endswith("s") and len(raw) > 4:
             weights.setdefault(raw[:-1], 0.5)
 
     for term in list(weights):
-        for synonym in _SYNONYMS.get(term, ()):
+        for synonym in _SYNONYMS.get(term, ()) + _ES_SYNONYMS.get(term, ()):
             weights.setdefault(synonym, 0.6)
     return weights
 
@@ -695,6 +760,8 @@ def _model_synthesis(question: str, matches: dict, cfg: Config,
             fast = cfg
         client = LLMClient(fast)
     system = MODEL_SYNTH_SYSTEM
+    if prompts.effective_reply_language(cfg) == "es":
+        system += "\n\n" + prompts.reply_language_directive(cfg)
     user = (f"QUESTION\n{question}\n\n"
             f"STRUCTURED REFERENCE\n{how_index.model_context(matches)}")
     try:
@@ -787,7 +854,8 @@ class HowSession:
 
     def _corpus(self) -> list[Chunk]:
         if self.chunks is None:
-            self.chunks = build_corpus(self.docs_root)
+            self.chunks = build_corpus(
+                self.docs_root, i18n.detect_lang(cfg=self.cfg))
         return self.chunks
 
     def answer(self, question: str, verbose: bool = True) -> str:
@@ -813,7 +881,10 @@ class HowSession:
             f"CURRENT CONFIG\n{snapshot}\n\n"
             f"REFERENCE MATERIAL\n{context or '(no matching excerpts)'}"
         )
-        messages = [{"role": "system", "content": QUESTION_SYSTEM}]
+        system = QUESTION_SYSTEM
+        if prompts.effective_reply_language(self.cfg) == "es":
+            system += "\n\n" + prompts.reply_language_directive(self.cfg)
+        messages = [{"role": "system", "content": system}]
         messages += _history_messages(self.history)
         messages.append({"role": "user", "content": user})
         answer = self.client.chat(

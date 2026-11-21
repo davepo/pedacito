@@ -15,6 +15,7 @@ model server may optionally rewrite the retrieved facts into a shorter answer
 from __future__ import annotations
 
 import re
+import unicodedata
 from functools import lru_cache
 
 from .config import Config
@@ -31,6 +32,54 @@ _STOP = {
     "with", "would", "you", "your", "please", "want", "need", "there",
     "option", "options", "preference", "preferences", "set", "up",
 }
+
+# Spanish question filler (accent-folded), so Spanish questions rank offline.
+_ES_STOP = {
+    "como", "cual", "cuales", "que", "quien", "donde", "cuando", "por",
+    "para", "con", "sin", "el", "la", "los", "las", "un", "una", "unos",
+    "unas", "de", "del", "al", "en", "es", "se", "mi", "mis", "tu", "tus",
+    "su", "puedo", "puedes", "quiero", "necesito", "hacer", "hay", "y", "o",
+    "lo", "le", "me", "te", "cambio", "cambiar", "uso", "usar", "esta",
+    "este", "eso", "muy", "mas", "ya", "no", "si",
+}
+
+_ES_SYNONYMS = {
+    "idioma": ("language", "lang", "es", "spanish", "espanol"),
+    "lenguaje": ("language", "lang"),
+    "espanol": ("language", "lang", "es", "spanish"),
+    "configurar": ("configure", "setup", "config", "settings"),
+    "configuracion": ("configuration", "config", "settings", "toml"),
+    "modelo": ("model", "models", "profile", "server"),
+    "modelos": ("model", "models", "profile", "server"),
+    "deshacer": ("undo", "restore", "backup", "snapshot"),
+    "revertir": ("revert", "restore", "backup", "snapshot"),
+    "tema": ("theme", "appearance", "gui"),
+    "habilidad": ("skill", "skills"),
+    "habilidades": ("skill", "skills"),
+    "instalar": ("install", "pip", "setup"),
+    "instalacion": ("install", "pip", "setup"),
+    "comando": ("command", "commands", "cli", "usage"),
+    "comandos": ("command", "commands", "cli", "usage"),
+    "error": ("fail", "failure", "troubleshoot"),
+    "ayuda": ("help", "how"),
+    "herramienta": ("tool", "tools"),
+    "herramientas": ("tool", "tools"),
+    "indice": ("index", "indexing"),
+    "ignorar": ("ignore", "exclude", "pedacitoignore"),
+    "archivo": ("file", "files"),
+    "archivos": ("file", "files"),
+    "cambios": ("changes", "apply", "review"),
+    "seguridad": ("security", "sandbox", "permissions"),
+    "memoria": ("memory", "vram", "gpu", "context"),
+    "lento": ("slow", "performance", "context"),
+}
+
+
+def _fold(text: str) -> str:
+    """Strip accents so "cómo" and "como" match (English text is unchanged)."""
+    return "".join(c for c in unicodedata.normalize("NFKD", text)
+                   if not unicodedata.combining(c))
+
 
 _SYNONYMS = {
     "setup": ("configure", "configuration", "init", "install", "config"),
@@ -111,9 +160,9 @@ _PHRASE_HINTS = {
 def _terms(question: str) -> dict[str, float]:
     """Weighted lowercase terms, with light synonym expansion."""
     raw: list[str] = []
-    for word in _WORD_RE.findall(question.lower()):
+    for word in _WORD_RE.findall(_fold(question.lower())):
         word = word.strip(".-/")
-        if len(word) >= 2 and word not in _STOP:
+        if len(word) >= 2 and word not in _STOP and word not in _ES_STOP:
             raw.append(word)
     weights: dict[str, float] = {}
     for word in raw:
@@ -127,7 +176,7 @@ def _terms(question: str) -> dict[str, float]:
         if word.endswith("s") and len(word) > 4:
             weights.setdefault(word[:-1], 0.5)
     for term in list(weights):
-        for synonym in _SYNONYMS.get(term, ()):
+        for synonym in _SYNONYMS.get(term, ()) + _ES_SYNONYMS.get(term, ()):
             weights.setdefault(synonym, 0.55)
     return weights
 
