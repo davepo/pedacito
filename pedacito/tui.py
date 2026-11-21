@@ -2686,14 +2686,14 @@ class TuiSession:
             cfg._tests_user_consent = True
 
         def work():
-            workspace.log_event(target, "command: tui new")
             return scaffold.run_new(
                 target, cfg, client, spec, apply=True, verbose=True,
                 complex=False, verify=verify,
                 repair_rounds=cfg.auto_repair_rounds,
                 max_tasks=cfg.auto_max_tasks,
                 max_minutes=cfg.auto_max_minutes,
-                auto_install=cfg.auto_install_deps)
+                auto_install=cfg.auto_install_deps,
+                log_command="command: tui new")
 
         holder = self._run_in_worker(work)
         error = holder.get("error")

@@ -1380,8 +1380,6 @@ def run_new(job: Job, opts: dict) -> None:
     p = SimpleNamespace(cfg=cfg, client=client, root=target)
     with session(p, job, interactive=False, lock=False) as feed:
         client.warmup()
-        if mode != "preview":
-            workspace.log_event(target, "command: gui new")
         code = scaffold.run_new(
             target, cfg, client, spec,
             apply=mode in ("build",), review=mode == "review",
@@ -1392,7 +1390,8 @@ def run_new(job: Job, opts: dict) -> None:
             max_tasks=_int_or(opts.get("max_tasks"), cfg.auto_max_tasks),
             max_minutes=_int_or(opts.get("max_minutes"), cfg.auto_max_minutes),
             keep_going=bool(opts.get("keep_going")),
-            auto_install=bool(opts.get("auto_install") or cfg.auto_install_deps))
+            auto_install=bool(opts.get("auto_install") or cfg.auto_install_deps),
+            log_command="" if mode == "preview" else "command: gui new")
         feed.end_stream()
     if mode == "preview":
         STATE.add_message(

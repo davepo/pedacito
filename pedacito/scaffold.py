@@ -1816,7 +1816,7 @@ def run_new(root: Path, cfg, client, spec: Spec, *, apply: bool = False,
             repair_rounds: int | None = None, max_tasks: int | None = None,
             max_minutes: int | None = None,
             keep_going: bool = False, auto_install: bool = False,
-            design: bool = False) -> int:
+            design: bool = False, log_command: str = "") -> int:
     """Plan a new project from `spec`, lay down its skeleton, and (unless asked
     to stop earlier) implement every source file. Returns a process exit code;
     progress goes to stderr.
@@ -1831,7 +1831,11 @@ def run_new(root: Path, cfg, client, spec: Spec, *, apply: bool = False,
                    context, resumable via auto_plan_file.
 
     A directory that already holds project files is refused unless `force`; one
-    that holds only Pedacito's own files is still fresh."""
+    that holds only Pedacito's own files is still fresh.
+
+    `log_command`, when given, is recorded in the run log -- but only on the
+    write path, after the refusal guard: a dry run or a refusal writes nothing
+    into the target (BUG-006)."""
     if not force:
         entries = [p.name for p in root.iterdir()
                    if not is_harness_owned(p.name)] if root.is_dir() else []
@@ -1856,6 +1860,12 @@ def run_new(root: Path, cfg, client, spec: Spec, *, apply: bool = False,
             print(COMPLEX_AUTO_NOTICE, file=sys.stderr)
 
     wants_skeleton = plan_only or apply or review
+
+    # BUG-006: the command log belongs to the write path. The refusal above
+    # already returned, and a dry run stops before writing anything -- so the
+    # target only learns about this run once it has accepted a skeleton.
+    if wants_skeleton and log_command:
+        workspace.log_event(root, log_command)
 
     def _new_checkpoint(label: str) -> None:
         try:

@@ -4104,7 +4104,6 @@ def _main(argv=None) -> int:
         if args.cmd == "new":
             from . import scaffold
             root = Path(args.project).expanduser().resolve()
-            workspace.log_event(root, "command: " + " ".join(sys.argv))
             spec = scaffold.load_spec(
                 prompt=args.task, spec_file=args.spec,
                 max_chars=cfg.max_spec_chars)
@@ -4137,7 +4136,8 @@ def _main(argv=None) -> int:
                     keep_going=args.keep_going,
                     design=bool(getattr(args, "design", False)),
                     auto_install=bool(getattr(args, "auto_install", False)
-                                      or cfg.auto_install_deps))
+                                      or cfg.auto_install_deps),
+                    log_command="command: " + " ".join(sys.argv))
             finally:
                 run_summary = events_mod.end_run()
             line = events_mod.run_line(run_summary)
