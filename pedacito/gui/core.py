@@ -403,6 +403,7 @@ def profile_catalog(cfg, calibration: dict | None = None) -> list[dict]:
         if not specialties:
             choices = cal.get("card_choices") or {}
             specialties = choices.get("specialties") or ()
+        is_img = bool(cal.get("is_image_model"))
         out.append({
             "name": name,
             "model": str(body.get("model")
@@ -412,6 +413,8 @@ def profile_catalog(cfg, calibration: dict | None = None) -> list[dict]:
             "tier": tier,
             "specialties": [str(t) for t in specialties],
             "is_hosted": bool(cal.get("is_hosted")),
+            "is_image_model": is_img,
+            "modality": "image" if is_img else "text",
             "calibrated": bool(cal.get("calibrated")),
             "calibrated_at": str(cal.get("calibrated_at") or ""),
             "calibrated_age_days": int(cal.get("calibrated_age_days") or 0),

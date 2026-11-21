@@ -160,6 +160,10 @@ browser  - open a web page in headless Chromium, interact, wait, capture it.
            (a desktop screenshot cannot see a page that was never opened)
            (write/append/move/delete need allow_write; run and diagnose need
             allow_shell; mcp needs allow_mcp)
+generate_image - draw one image and save it into the project. args: prompt
+             (what to draw), file (optional output path), size (optional,
+             e.g. "1024x1024"). Opt-in: needs an image profile and
+             allow_image_gen (or the user's permission through the broker).
 done     - stop gathering; you have enough.  args: none"""
 
 # Field order is load-bearing: grammar-constrained decoding emits keys in
@@ -277,6 +281,14 @@ STEP_SCHEMA = {
                                    "For mcp: a JSON object of tool arguments. "
                                    "Empty otherwise.",
                     "maxLength": 6000},
+        "prompt": {"type": "string",
+                   "description": "For generate_image: what to draw. Empty "
+                                  "otherwise.",
+                   "maxLength": 2000},
+        "size": {"type": "string",
+                 "description": "For generate_image: optional size, e.g. "
+                                "\"1024x1024\". Empty otherwise.",
+                 "maxLength": 40},
         "reasoning": {
             "type": "string",
             "description": "Under 15 words: what you still need. Not a plan.",
@@ -313,6 +325,7 @@ MCP_ACTION = "mcp"
 MCP_CALL_ACTION = "mcp_call"
 FETCH_URL_ACTION = "fetch_url"
 WEB_SEARCH_ACTION = "web_search"
+GENERATE_IMAGE_ACTION = "generate_image"
 WRITE_ACTIONS = (WRITE_ACTION, APPEND_ACTION)
 MUTATING_ACTIONS = WRITE_ACTIONS + (MOVE_ACTION, DELETE_ACTION, UNDO_ACTION)
 
@@ -500,6 +513,22 @@ def _mcp_call_offered(cfg) -> bool:
     return bool(_mcp_relevant_tools(cfg))
 
 
+def _image_gen_offered(cfg) -> bool:
+    """`generate_image` enters the schema only when an image profile is
+    configured AND the tool is opted in (`allow_image_gen`) or a live
+    permission broker can approve each call. With no image profile the schema
+    stays byte-identical to before image support existed."""
+    try:
+        from . import imagegen
+        if not imagegen.has_image_profile(cfg):
+            return False
+    except Exception:
+        return False
+    if getattr(cfg, "allow_image_gen", False):
+        return True
+    return security.permission_broker_active()
+
+
 def mcp_injection(cfg) -> str:
     """The compact MCP TOOLS block for the gather prompt: the relevant named
     tools' one-line signatures (server.name(args) -- summary), or '' when
@@ -541,6 +570,9 @@ _FIELD_ACTION_FRAGMENTS = {
         (("git_diff",), "For git_diff, optionally one file."),
         (("screenshot", "browser"),
          "For screenshot/browser, an older screenshot to compare."),
+        (("generate_image",),
+         "For generate_image, the output image path (defaults to "
+         ".pedacito/images/)."),
     ],
     "start": [
         (("read",), "For read."),
@@ -700,6 +732,15 @@ def build_gather_json_schema(allowed_actions: list[str],
             + ordered[ordered.index("symbol") + 1:]
         if not compact:
             required += ["server", "tool", "arguments"]
+    if GENERATE_IMAGE_ACTION in actions:
+        # `prompt`/`size` join the flat field set only while the opt-in
+        # `generate_image` action is in this schema (same byte-identical-
+        # default rule as the other conditional fields).
+        ordered = ordered[:ordered.index("symbol") + 1] \
+            + ["prompt", "size"] \
+            + ordered[ordered.index("symbol") + 1:]
+        if not compact:
+            required += ["prompt", "size"]
     if step_reasoning_first:
         ordered = ["reasoning"] + [k for k in ordered if k != "reasoning"]
         schema["properties"]["reasoning"]["description"] = (
@@ -792,6 +833,11 @@ def schema_for(cfg) -> dict:
         actions.append(MCP_CALL_ACTION)
     if getattr(cfg, "allow_lsp", False):
         actions.append("lsp")
+    if _image_gen_offered(cfg):
+        # Opt-in local/hosted image generation: offered only when an image
+        # profile is configured and either allow_image_gen is on or the
+        # permission broker is live (each call is then approved individually).
+        actions.append(GENERATE_IMAGE_ACTION)
     actions.append("done")
     actions = _prune_optional_actions(cfg, actions)
 
@@ -4933,6 +4979,49 @@ def web_search(cfg, query: str) -> str:
     return "\n".join(lines)
 
 
+def tool_generate_image(index, cfg, prompt: str, file: str = "",
+                        size: str = "") -> str:
+    """`generate_image` action: draw one image and save it into the project.
+
+    Gated by the human Permission Broker when `allow_image_gen` is off (an
+    image profile must still be configured -- `schema_for` only offers the
+    action then). The output path is validated inside the project root by
+    `generate_image` (`security.resolve_safe_path`); the observation names the
+    saved relative path, dimensions and byte size."""
+    from . import imagegen
+    prompt = str(prompt or "").strip()
+    if not prompt:
+        return "ERROR: generate_image needs a prompt (what to draw)."
+    if not getattr(cfg, "allow_image_gen", False):
+        if not security.permission_broker_active():
+            return ("ERROR: `generate_image` is disabled (config "
+                    "allow_image_gen = false) and no permission broker is "
+                    "listening. Configure an image profile and set "
+                    "allow_image_gen = true, or run from the GUI to approve "
+                    "each call.")
+        allowed, msg = security.request_permission(
+            category=security.CAT_IMAGE_GENERATION,
+            action_summary=f"Generate an image: {prompt[:120]}",
+            detail=f"prompt: {prompt}"[:4000],
+            risk_level="medium",
+            reason="allow_image_gen is off in the config",
+            key=prompt[:120],
+            setting_key="allow_image_gen")
+        if not allowed:
+            return msg
+    root = Path(index.root).resolve()
+    try:
+        result = imagegen.generate_image(
+            cfg, prompt, output_path=(file or None), size=size, root=root)
+    except imagegen.ImageGenError as exc:
+        return f"ERROR: generate_image failed: {exc}"
+    except security.SecurityError as exc:
+        return f"ERROR: generate_image refused the output path: {exc}"
+    return (f"Generated image saved to {result['rel_path']} "
+            f"({result.get('format', 'bin')}, {result.get('width', 0)}x"
+            f"{result.get('height', 0)}, {result.get('bytes', 0)} bytes).")
+
+
 def dispatch(index, cfg, step: dict, client=None, agent=None,
              parent=None) -> str:
     """Route one parsed agent step (matching STEP_SCHEMA) to its tool_*
@@ -5043,6 +5132,10 @@ def dispatch(index, cfg, step: dict, client=None, agent=None,
         return refactor.tool_rename_symbol(index, cfg, step.get("symbol", ""),
                                            step.get("to", ""),
                                            step.get("file", ""))
+    if action == GENERATE_IMAGE_ACTION:
+        return tool_generate_image(index, cfg, _as_text(step.get("prompt")),
+                                   _as_text(step.get("file")),
+                                   _as_text(step.get("size")))
     if action in MUTATING_ACTIONS:
         if not getattr(cfg, "allow_write", False):
             return (f"ERROR: `{action}` is disabled (config allow_write = false). "

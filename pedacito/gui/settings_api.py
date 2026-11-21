@@ -20,6 +20,7 @@ from .. import config as config_mod
 from .. import config_editor
 from .. import fileio
 from .. import i18n
+from .. import imagegen
 from ..config import USER_CONFIG, ConfigError
 from . import settings
 from .core import STATE
@@ -1234,11 +1235,15 @@ def scan_models(urls=(), vram_gb=0, budget=20.0) -> dict:
             seen_models.add((skey, mid))
             already = (skey, mid) in imported
             name = _suggest_profile_name(mid, taken, label)
+            is_img = imagegen.is_image_model(
+                mid, labels=rec.get("labels"), recipe=rec.get("recipe"))
             row = {"server_url": base_url, "provider": label, "model_id": mid,
                    "base_url": base_url, "loaded": rec.get("loaded"),
                    "context_length": int(rec.get("context_length") or 0),
                    "size_bytes": int(rec.get("size_bytes") or 0),
                    "quant": str(rec.get("quant") or ""),
+                   "modality": "image" if is_img else "text",
+                   "is_image_model": bool(is_img),
                    "suggested_profile_name": name,
                    "already_imported": bool(already)}
             rows.append(row)
@@ -1269,6 +1274,8 @@ def import_models(models) -> dict:
     imported: list[str] = []
     skipped: list[str] = []
     default = ""
+    default_is_image = False
+    imported_text = False
     for sel in models:
         if not isinstance(sel, dict):
             continue
@@ -1288,12 +1295,19 @@ def import_models(models) -> dict:
                 "'_' (starting with a letter or digit, max "
                 f"{_MAX_PROFILE_NAME} characters)")
         name = fixed
+        is_img = bool(sel.get("is_image_model")) \
+            or str(sel.get("modality") or "").strip() == "image" \
+            or imagegen.is_image_model(mid)
         if name in config_editor.profile_names(text):
             skipped.append(name)
             if sel.get("set_default"):
                 default = default or name
             continue
         values: dict = {"base_url": base, "model": mid}
+        if is_img:
+            values["modality"] = "image"
+        else:
+            imported_text = True
         tier = str(sel.get("tier") or "").strip()
         if not tier:
             tier = config_mod._guess_tier(name, values) or ""
@@ -1311,8 +1325,13 @@ def import_models(models) -> dict:
         imported.append(name)
         if sel.get("set_default"):
             default = name
+            default_is_image = is_img
     if not imported and not skipped:
         raise ConfigError("Nothing to import: the selection was empty.")
+    # An image generator can never run the chat agent, so when a text model is
+    # imported in the same batch an image model must not become the default.
+    if default and default_is_image and imported_text:
+        default = ""
     if default:
         if default not in config_editor.profile_names(text):
             raise ConfigError(f"default profile '{default}' was not imported")

@@ -86,23 +86,41 @@ def save_card(card: dict) -> Path:
     return p
 
 
+def _card_is_image(card) -> bool:
+    """True when a saved card describes an image generator (not a text chat
+    model): an explicit `modality`, a measured `image_ok`, or the model id."""
+    if not isinstance(card, dict):
+        return False
+    if str(card.get("modality") or "").strip().lower() == "image":
+        return True
+    if (card.get("measured") or {}).get("image_ok"):
+        return True
+    from . import imagegen
+    return imagegen.is_image_model(card.get("model") or "")
+
+
 def card_meta(card: dict | None) -> dict:
     """Calibration-badge metadata for one saved card (or None): whether it is
     calibrated, when ("YYYY-MM-DD HH:MM"), its age in whole days, whether it
-    is stale (older than the TTL or from an old card version), and the overall
-    score. An absent card yields the all-empty/zero form."""
+    is stale (older than the TTL or from an old card version), the overall
+    score, and whether it is an image-generator card. An absent card yields
+    the all-empty/zero form."""
     if not isinstance(card, dict):
         return {"calibrated": False, "calibrated_at": "",
                 "calibrated_age_days": 0, "calibrated_stale": False,
-                "card_score": 0.0, "card_choices": {}}
+                "card_score": 0.0, "card_choices": {},
+                "is_image_model": False, "modality": "text"}
     ts = float(card.get("ts", 0) or 0)
     age_days = int((time.time() - ts) / 86400) if ts else 0
     at = time.strftime("%Y-%m-%d %H:%M", time.localtime(ts)) if ts else ""
     stale = age_days > CARD_TTL_DAYS or card.get("version") != CARD_VERSION
     score = float((card.get("measured") or {}).get("overall") or 0.0)
+    is_image = _card_is_image(card)
     return {"calibrated": True, "calibrated_at": at,
             "calibrated_age_days": age_days, "calibrated_stale": stale,
-            "card_score": score, "card_choices": card.get("choices") or {}}
+            "card_score": score, "card_choices": card.get("choices") or {},
+            "is_image_model": is_image,
+            "modality": "image" if is_image else "text"}
 
 
 def _refilter_saved_cards() -> dict:
@@ -119,6 +137,11 @@ def _refilter_saved_cards() -> dict:
     changed = False
     for key, card in data.items():
         if not isinstance(card, dict):
+            continue
+        if str(card.get("modality") or "").strip().lower() == "image":
+            # Image-generator cards carry their own specialty tag; the text
+            # skill gate (item 15) does not apply to a model with no edit
+            # surface, so leave their tags untouched.
             continue
         measured = card.get("measured")
         if not isinstance(measured, dict) or "specialties" not in measured:
@@ -178,6 +201,12 @@ def profile_calibration(cfg) -> dict:
             cfg, getattr(cfg, "active_profile", "") or "")
     except Exception:
         meta["is_hosted"] = False
+    from . import imagegen
+    try:
+        meta["is_image_model"] = imagegen.profile_is_image_model(cfg)
+    except Exception:
+        meta["is_image_model"] = meta.get("is_image_model", False)
+    meta["modality"] = "image" if meta["is_image_model"] else "text"
     return meta
 
 
@@ -200,6 +229,12 @@ def calibration_map(cfg) -> dict:
             meta["is_hosted"] = roles.profile_is_hosted(cfg, name)
         except Exception:
             meta["is_hosted"] = False
+        from . import imagegen
+        try:
+            meta["is_image_model"] = imagegen.profile_is_image_model(cfg, name)
+        except Exception:
+            meta["is_image_model"] = meta.get("is_image_model", False)
+        meta["modality"] = "image" if meta["is_image_model"] else "text"
         out[name] = meta
     return out
 
@@ -209,6 +244,11 @@ def apply(cfg) -> dict | None:
     left at their built-in defaults. Returns the card (or None)."""
     if not getattr(cfg, "use_model_card", True):
         return None
+    from . import imagegen
+    if imagegen.profile_is_image_model(cfg):
+        # An image-generator profile has no text budgets to fit: its card is
+        # never applied and its choices never rewrite the chat settings.
+        return None
     card = load(cfg)
     if card and card.get("_needs_recalibrate"):
         # A v1 card is shown but never applied: its single-run measurements
@@ -216,6 +256,8 @@ def apply(cfg) -> dict | None:
         card = None
     cfg._card = card
     if not card:
+        return None
+    if card.get("modality") == "image":
         return None
     ch = card.get("choices") or {}
     sources = getattr(cfg, "sources", None)
@@ -1123,6 +1165,63 @@ def _store(measured: dict, name: str, values: list) -> None:
     measured[f"{name}_sd"] = round(sd, 2)
 
 
+def calibrate_image_model(cfg, verbose: bool = True) -> dict:
+    """Calibrate an image-generator profile with ONE lightweight probe.
+
+    A single `generate_image` call ("solid blue square on white background",
+    512x512, 4 steps) written into a temp directory measures reachability,
+    latency, pixel format and dimensions -- no chat/edit probes, no workspace
+    pollution. Returns a version-2 card with `modality="image"` and empty
+    `choices`, saved to the model-card store like any other card."""
+    from . import imagegen
+
+    def say(msg: str) -> None:
+        if verbose:
+            print(msg)
+
+    say(f"Calibrating image model '{cfg.model}' at {cfg.base_url} ...")
+    t0 = time.time()
+    ok = False
+    fmt = ""
+    width = height = 0
+    elapsed = 0.0
+    notes: list[str] = []
+    try:
+        import tempfile
+        with tempfile.TemporaryDirectory(prefix="pedacito-image-") as td:
+            result = imagegen.generate_image(
+                cfg, "solid blue square on white background",
+                size="512x512", steps=4, root=td)
+            ok = bool(result.get("ok"))
+            fmt = str(result.get("format") or "")
+            width = int(result.get("width") or 0)
+            height = int(result.get("height") or 0)
+            elapsed = float(result.get("elapsed_s") or 0.0)
+    except Exception as exc:              # ImageGenError, SecurityError, ...
+        ok = False
+        notes.append(f"image probe failed: {str(exc).splitlines()[0][:120]}")
+    measured = {
+        "overall": 10.0 if ok else 0.0,
+        "image_ok": ok,
+        "latency_s": round(elapsed, 3),
+        "format": fmt,
+        "width": width,
+        "height": height,
+        "specialties": ["image_generation"],
+    }
+    say(f"  image generation {'ok' if ok else 'FAILED'}"
+        + (f"  {width}x{height} {fmt}, {measured['latency_s']}s" if ok else ""))
+    card = {"version": CARD_VERSION, "key": card_key(cfg), "ts": time.time(),
+            "model": cfg.model, "url": cfg.base_url, "modality": "image",
+            "measured": measured, "choices": {}, "notes": notes[:12],
+            "repeats": 1, "seconds": round(time.time() - t0, 1)}
+    try:
+        save_card(card)
+    except OSError:
+        pass                       # a read-only config dir must not break runs
+    return card
+
+
 def calibrate(client, cfg, verbose: bool = True, quick: bool = False,
               repeats: int | None = None) -> dict:
     """Run the suite and return the card (not saved; see `save_card`).
@@ -1131,6 +1230,12 @@ def calibrate(client, cfg, verbose: bool = True, quick: bool = False,
     card records a mean and spread instead of one noisy sample; `choose()`
     reads the means."""
     from .config import is_hosted
+
+    # An image-generator profile has no chat/edit surface: run the image probe
+    # instead of the text-LLM suite (the `client` is never used).
+    from . import imagegen
+    if imagegen.profile_is_image_model(cfg):
+        return calibrate_image_model(cfg, verbose=verbose)
 
     if repeats is None:
         repeats = 1 if quick else 3

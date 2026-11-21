@@ -224,6 +224,8 @@ def _compact_tool_help(cfg) -> str:
         "lsp": "lsp symbol file start end - exact definitions/references/diagnostics",
         "screenshot": "screenshot command start - capture the screen as text",
         "browser": "browser command pattern start - open a page, capture it",
+        "generate_image": "generate_image prompt [file] [size] - draw one "
+                          "image and save it into the project (opt-in)",
         "done": "done - you have enough",
     }
     return "\n".join(lines[a] for a in lines if a in enabled)

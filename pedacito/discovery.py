@@ -383,6 +383,17 @@ def describe_models(base_url: str, timeout: float = 5.0, headers=None,
             rec["loaded"] = states[mid] == "loaded"
         else:
             rec["loaded"] = None
+        # Preserve the server metadata that classifies a model's modality:
+        # Lemonade reports `labels` (e.g. ["image"]) and a `recipe` name (e.g.
+        # "sd-cpp", "flux") on its /v1/models and /api/v1/models entries.
+        labels = entry.get("labels")
+        if isinstance(labels, (list, tuple)):
+            rec["labels"] = [str(x) for x in labels]
+        elif labels:
+            rec["labels"] = str(labels)
+        recipe = entry.get("recipe")
+        if recipe:
+            rec["recipe"] = str(recipe)
         if info.get("size_bytes"):
             rec["size_bytes"] = int(info["size_bytes"])
         if info.get("context_length"):

@@ -398,6 +398,7 @@ CAT_SHELL = "shell"
 CAT_SENSITIVE_FILE = "sensitive_file"
 CAT_TEST_EXECUTION = "test_execution"
 CAT_MCP_TOOL = "mcp_tool"
+CAT_IMAGE_GENERATION = "image_generation"
 
 CATEGORY_LABELS = {
     CAT_WEB: "Web Access",
@@ -407,6 +408,7 @@ CATEGORY_LABELS = {
     CAT_SENSITIVE_FILE: "Sensitive File Read",
     CAT_TEST_EXECUTION: "Test Execution",
     CAT_MCP_TOOL: "MCP Tool",
+    CAT_IMAGE_GENERATION: "Image Generation",
 }
 
 # The exact text a gated tool returns when the human says no (or nobody is

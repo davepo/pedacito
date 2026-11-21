@@ -148,6 +148,24 @@ class Config:
     # Servers are probed with a 1.5 s timeout; no other server is touched.
     auto_evict_servers: bool = True
     model: str = "google/gemma-3-27b"
+    # Discovery modality of this model/server: "" (auto-detect from the model
+    # id and server metadata), "text", "image", "audio" or "embedding". Only
+    # "image" opens the local image-generation path; a profile marked "image"
+    # is routed to `generate_image` instead of the text tool loop.
+    modality: str = ""
+    # The profile in [profiles.*] that serves /images/generations (a local
+    # Stable Diffusion / Flux backend, or a hosted image endpoint). Empty =
+    # auto-detect the first image-model profile.
+    image_profile: str = ""
+    # Opt-in: expose the `generate_image` agent tool. Even with this off, the
+    # GUI permission broker can still approve a single call when an image
+    # profile is configured.
+    allow_image_gen: bool = False
+    # Default `size` sent to /images/generations when the caller passes none.
+    image_default_size: str = "1024x1024"
+    # Default diffusion steps sent to /images/generations (0 = the server's
+    # own default).
+    image_default_steps: int = 0
     timeout: float = 600.0
     # Concurrent requests this endpoint can serve. Local servers default to
     # one stream; a local-moe server is always pinned to 1 (its prefill and
@@ -1163,8 +1181,9 @@ _ENUM_FIELDS = {
     "update_channel": ("stable", "any"),
     "language": ("en", "es"),
     "llm_reply_language": ("match_ui", "auto", "en", "es"),
+    "modality": ("", "text", "image", "audio", "embedding"),
 }
-_ENUM_EMPTY_OK = ("prompt_pack", "answer_mode")
+_ENUM_EMPTY_OK = ("prompt_pack", "answer_mode", "modality")
 
 
 class ConfigError(RuntimeError):
@@ -1487,7 +1506,8 @@ EXEC_FIELDS = ("hooks", "mcp_servers", "auto_verify", "test_command",
                "shell_allowlist", "browser_eval_hosts",
                "allow_fetch", "fetch_allowed_hosts",
                "enable_web", "wrap_observations", "redact_secrets",
-               "security_outbound_mode", "protected_paths", "auto_plan_file")
+               "security_outbound_mode", "protected_paths", "auto_plan_file",
+               "allow_image_gen")
 TRUST_FILE = "trusted_projects.json"
 
 
@@ -3116,6 +3136,16 @@ timeout = 600.0
 load_wait_seconds = 240
 max_consecutive_failures = 3
 json_mode = "schema"
+# Image generation (opt-in discovery modality). Point image_profile at a
+# [profiles.*] table whose server serves /images/generations (a local
+# Stable Diffusion / Flux backend, or a hosted image endpoint) and mark that
+# profile `modality = "image"`. allow_image_gen exposes the generate_image
+# agent tool; image_default_size/steps are the fallback request size and
+# diffusion steps when the caller passes none.
+# image_profile = ""
+# allow_image_gen = false
+# image_default_size = "1024x1024"
+# image_default_steps = 0
 # Engine-level constrained JSON: schema requests (gather and plan) are sent as
 # response_format json_schema so the server constrains sampling to valid
 # tool-call JSON; a 400 downgrades that endpoint automatically.
@@ -3339,6 +3369,7 @@ max_tokens_build = 8000
 # The fallback profile. Replace these with your server and model.
 base_url = "http://localhost:1234/v1"
 model    = "google/gemma-3-27b"
+# modality = ""                 # text | image | audio | embedding (auto = "")
 
 # Every profile-overridable setting, commented at its built-in default.
 # Uncomment only the keys this profile needs; a profile beats [universal],
@@ -3375,6 +3406,17 @@ model    = "google/gemma-3-27b"
 # context_tokens = 128000
 # max_gathered_chars = 100000
 # max_read_lines = 400
+
+# --- Local image generation example (Flux via Lemonade) ----------------------
+# [profiles.example_image]
+# base_url = "http://localhost:8001/v1"
+# model    = "flux-schnell"
+# modality = "image"             # routes this profile to /images/generations
+# image_default_size = "1024x1024"
+# image_default_steps = 4
+# Then set image_profile = "example_image" in [universal], or run with
+# --profile example_image, and set allow_image_gen = true to give the agent
+# the generate_image tool.
 '''
 
 
@@ -3404,6 +3446,16 @@ REFERENCE_TEMPLATE = TEMPLATE + '''
 # call for it. false turns engine schemas off everywhere.
 # timeout: seconds per request. load_wait_seconds: model load wait.
 # max_consecutive_failures: abort an indexing batch after N failures.
+# Image generation (opt-in discovery modality): `modality = "image"` marks a
+# profile as an image generator; `image_profile` names the [profiles.*] table
+# whose server serves /images/generations (Lemonade sd-cpp/Flux, or a hosted
+# image endpoint). `allow_image_gen = true` exposes the generate_image agent
+# tool; with it off, the GUI permission broker can still approve one call when
+# an image profile is configured. `image_default_size` is the fallback `size`
+# sent when the caller passes none; `image_default_steps` the fallback
+# diffusion steps (0 = the server's own default). The image profile is written
+# into `.pedacito/images/` (or the tool's `file` target) via the same
+# workspace containment and atomic write every other file write uses.
 # temperature: keep low for tool calls. temperature_answer / temperature_repair
 # override it for the answer and the repair re-asks, which copy SEARCH text
 # character for character (0 = greedy; unset = temperature). temperature_answer
