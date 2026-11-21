@@ -1587,3 +1587,152 @@ def test_instructions_memory_rules_and_gitinfo_refuse_symlinks_and_strip_control
     pre = gitinfo.preamble(proj, Config())
     assert "\x1b" not in pre and "\x07" not in pre
     assert "feat" in pre and "msgok" in pre
+
+
+# =============================================================================
+# O. WP-04: preview CSP sandbox, dotted/inline redaction, plan_file, skills, domcheck
+# =============================================================================
+
+def test_preview_csp_has_sandbox_and_window_open_has_noopener(gui, tmp_path):
+    root = tmp_path / "webproj"
+    root.mkdir()
+    (root / "index.html").write_text("<h1>hi</h1>", encoding="utf-8")
+    (root / "big.bin").write_bytes(b"a" * (server.MAX_PREVIEW_ASSET_BYTES + 1))
+    with core.STATE.lock:
+        core.STATE.root = root
+
+    for route in ("/preview/index.html", "/api/runner/preview/index.html"):
+        status, hdrs, _body = gui.req("GET", route)
+        assert status == 200
+        csp = {k.lower(): v for k, v in hdrs.items()}["content-security-policy"]
+        assert "sandbox allow-scripts allow-forms allow-modals;" in csp
+        assert "allow-same-origin" not in csp
+
+    assert gui.req("GET", "/preview/big.bin")[0] == 413
+
+    js = (Path(server.__file__).parent / "static" / "app.js").read_text(
+        encoding="utf-8")
+    assert "'noopener,noreferrer'" in js
+
+
+def test_dotted_key_inline_table_and_mcp_env_redaction_roundtrip():
+    raw_dotted = (
+        'profiles.dot.api_key = "sk-dotted-SECRET"\n'
+        'profiles."a.b".api_key = \'sk-quoted-dot-SECRET\'\n'
+        'mcp_servers.demo.command = "echo"\n'
+        'mcp_servers.demo.env.GITHUB_TOKEN = "ghp_dotted_SECRET"\n'
+        'mcp_servers.demo.env.NODE_ENV = "prod"\n'
+    )
+    red1 = config_editor.redact_secrets(raw_dotted)
+    assert "SECRET" not in red1
+    assert 'NODE_ENV = "prod"' in red1
+    assert red1.count(config_editor.REDACTED_SECRET) == 3
+    assert config_editor.redact_secrets(red1) == red1
+    assert tomllib.loads(config_editor.restore_secrets(red1, raw_dotted)) == \
+        tomllib.loads(raw_dotted)
+
+    raw_inline = (
+        '[profiles]\n'
+        'inline = { model = "m", api_key = "sk-inline-SECRET" }\n'
+        '[mcp_servers.demo]\n'
+        'command = "echo"\n'
+        'env = { GITHUB_TOKEN = "ghp_inline_SECRET", NODE_ENV = "prod" }\n'
+        '[mcp_servers.demo2.env]\n'
+        'API_KEY = "sk-section-SECRET"\n'
+        'PORT = "8080"\n'
+    )
+    red2 = config_editor.redact_secrets(raw_inline)
+    assert "SECRET" not in red2
+    assert 'NODE_ENV = "prod"' in red2
+    assert 'PORT = "8080"' in red2
+    assert red2.count(config_editor.REDACTED_SECRET) == 3
+    assert config_editor.redact_secrets(red2) == red2
+    assert tomllib.loads(config_editor.restore_secrets(red2, raw_inline)) == \
+        tomllib.loads(raw_inline)
+
+    # Orphan dotted-key sentinel is refused
+    with pytest.raises(ConfigError):
+        config_editor.restore_secrets(
+            'profiles.dot.api_key = "***REDACTED***"\n', "")
+
+
+def test_run_auto_refuses_plan_file_traversal_and_sensitive_paths(
+        gui, tmp_path, monkeypatch):
+    from pedacito.gui import jobs
+    root = tmp_path / "proj"
+    root.mkdir()
+    (root / ".env").write_text("SECRET=1\n", encoding="utf-8")
+    outside = tmp_path / "outside.md"
+    outside.write_text("- [ ] pwn\n", encoding="utf-8")
+    cfg = Config()
+    with core.STATE.lock:
+        core.STATE.root = root
+        core.STATE.cfg = cfg
+        core.STATE.client = object()
+        core.STATE.idx = object()
+        core.STATE.plan_path = None
+    monkeypatch.setattr(jobs, "_ensure_index", lambda _job: None)
+
+    for bad in ("../outside.md", str(outside), ".env"):
+        with pytest.raises(ConfigError):
+            jobs.run_auto(None, {"plan_file": bad})
+        assert core.STATE.plan_path is None
+
+
+def test_skills_get_query_and_bad_int_ids_return_400(gui, tmp_path):
+    root = tmp_path / "proj"
+    root.mkdir()
+    with core.STATE.lock:
+        core.STATE.root = root
+
+    status, j = gui.get("/api/skills?task=refactor")
+    assert status == 200 and j["ok"] is True
+    assert "matches" in j and any(
+        "refactor" in m["name"] for m in j["matches"])
+
+    assert gui.post("/api/answer", {"qid": "nope", "text": "x"})[0] == 400
+    assert gui.post("/api/review/decide", {"id": "nope", "action": "apply"})[0] == 400
+    assert gui.post("/api/review/rediff", {"id": "nope", "rel": "a.py", "text": ""})[0] == 400
+
+
+def test_domcheck_local_server_enforces_host_traversal_and_sensitive_guards(tmp_path):
+    from pedacito import domcheck
+
+    root = tmp_path / "site"
+    root.mkdir()
+    (root / "index.html").write_text("<h1>ok</h1>", encoding="utf-8")
+    (root / ".env").write_text("SECRET=1\n", encoding="utf-8")
+    (root / ".git").mkdir()
+    (root / ".git" / "HEAD").write_text("ref: refs/heads/main\n", encoding="utf-8")
+    (root / ".pedacito").mkdir()
+    (root / ".pedacito" / "state.json").write_text("{}\n", encoding="utf-8")
+    outside = tmp_path / "outside.txt"
+    outside.write_text("outside\n", encoding="utf-8")
+    try:
+        (root / "link.txt").symlink_to(outside)
+        has_sym = True
+    except (OSError, NotImplementedError):
+        has_sym = False
+
+    with domcheck._local_server(root) as base:
+        port = int(base.rsplit(":", 1)[1])
+
+        def _get(path, host=None):
+            conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+            hdrs = {"Host": host} if host else {}
+            conn.request("GET", path, headers=hdrs)
+            r = conn.getresponse()
+            r.read()
+            conn.close()
+            return r.status
+
+        assert _get("/index.html") == 200
+        assert _get("/index.html", host="evil.example") == 403
+        assert _get("/../outside.txt") == 403
+        assert _get("/%2e%2e/outside.txt") == 403
+        assert _get("/.env") == 403
+        assert _get("/.git/HEAD") == 403
+        assert _get("/.pedacito/state.json") == 403
+        if has_sym:
+            assert _get("/link.txt") == 403
+        assert _get("/missing.js") == 404

@@ -1471,7 +1471,7 @@ function setPreviewPage(p) {
   emit();
 }
 function openPreviewTab() {
-  if (S.ws.page) window.open(previewSrc(S.ws.page, S.ws.previewRev), '_blank');
+  if (S.ws.page) window.open(previewSrc(S.ws.page, S.ws.previewRev), '_blank', 'noopener,noreferrer');
 }
 
 // ---- live runner: detected commands + a static web preview ----
@@ -1505,7 +1505,7 @@ function loadRunnerTargets(force) {
 function setRunPage(p) { S.ws.runPage = p; S.ws.runRev++; emit(); }
 function reloadRunnerPreview() { S.ws.runRev++; emit(); }
 function openRunnerPreview() {
-  if (S.ws.runPage) window.open(runnerSrc(S.ws.runPage, S.ws.runRev), '_blank');
+  if (S.ws.runPage) window.open(runnerSrc(S.ws.runPage, S.ws.runRev), '_blank', 'noopener,noreferrer');
 }
 function selectedRunnerCommand() {
   const t = S.ws.targets || {};

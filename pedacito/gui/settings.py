@@ -25,9 +25,9 @@ from ..config import Config
 # The comment-preserving editor, moved out of gui/ so the CLI can use it.
 from ..config_editor import (  # noqa: F401
     add_profile, literal, new_user_config, profile_body,
-    profile_names, redact_secrets, reference_setting_help, remove_profile,
-    rename_profile, restore_secrets, set_values, upsert_profiles,
-    validate_text,
+    profile_names, redact_mcp_servers_dict, redact_secrets,
+    reference_setting_help, remove_profile, rename_profile, restore_secrets,
+    set_values, upsert_profiles, validate_text,
 )
 
 SECRET_KEYS = ("api_key",)
@@ -277,6 +277,8 @@ def resolved(cfg) -> dict:
             value = list(value)
         if item["secret"]:
             value = ""
+        elif name == "mcp_servers" and isinstance(value, dict):
+            value = redact_mcp_servers_dict(value)
         out[name] = {"value": value,
                      "source": (cfg.sources or {}).get(name, "default")}
     return out

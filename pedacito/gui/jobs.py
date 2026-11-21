@@ -1201,13 +1201,25 @@ def run_auto(job: Job, opts: dict) -> None:
     plan_file = (opts.get("plan_file") or "").strip()
     if not goal and not plan_file:
         raise ConfigError("Give a goal, attach a spec, or choose a plan file.")
+    cfg, client, root = p.cfg, p.client, p.root
+    plan_target = plan_file or cfg.auto_plan_file
+    try:
+        plan_path = security_mod.resolve_safe_path(root, plan_target)
+    except (security_mod.SecurityError, OSError, ValueError) as exc:
+        raise ConfigError(f"Invalid plan file path `{plan_target}`: {exc}") from exc
+    if (security_mod.is_sensitive_path(plan_path)
+            or security_mod.is_sensitive_rel(root, plan_target)):
+        raise ConfigError(
+            f"Refusing sensitive plan file `{plan_target}` (secret/credential "
+            "material cannot be used as a plan).")
     _echo_user("auto", opts.get("text", "") or goal or f"plan: {plan_file}",
                opts.get("attachments"), opts)
     # Applying is the default: the GUI behaves like `pedacito auto --apply`
     # unless the user explicitly ticked "Plan only".
     apply = not auto_plan_only(opts)
     ns = SimpleNamespace(
-        task=goal or None, spec=None, plan=plan_file or None, apply=apply,
+        task=goal or None, spec=None,
+        plan=str(plan_path) if plan_file else None, apply=apply,
         verify=(opts.get("verify") or None),
         repair=_int_or_none(opts.get("repair")),
         diagnostics=bool(opts.get("diagnostics")),
@@ -1222,15 +1234,10 @@ def run_auto(job: Job, opts: dict) -> None:
         force_auto=bool(opts.get("force_auto")))
     with STATE.lock:
         STATE.last_auto = {"text": opts.get("text", ""), "plan_file": plan_file}
-    cfg, client, root = p.cfg, p.client, p.root
+        STATE.plan_path = plan_path
     _apply_security_choices(cfg, opts)
     _set_pinned_refs(cfg, opts)
     _evict_other_servers(cfg)
-    plan_path = Path(plan_file) if plan_file else root / cfg.auto_plan_file
-    if not plan_path.is_absolute():
-        plan_path = (root / plan_path).resolve()
-    with STATE.lock:
-        STATE.plan_path = plan_path
     # Snapshot the backup names before the run so the files this run writes
     # can be reported afterwards. Forcing cfg.backup on while applying makes
     # the loop take its usual pre-edit snapshot of every file it touches,

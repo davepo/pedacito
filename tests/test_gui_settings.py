@@ -1102,3 +1102,98 @@ def test_import_refuses_bad_requests_without_writing(gui):
     status, j = gui.post("/api/providers/import", {"preset_id": "nope"})
     assert status == 400 and "unknown provider preset" in j["detail"]
     assert not gui.cfg_path.exists()       # the refusals wrote nothing
+
+
+def test_probe_server_only_attaches_stored_key_on_matching_origin(gui):
+    srv, seen = _hosted_server()
+    try:
+        good_base = "http://127.0.0.1:%d/v1" % srv.server_address[1]
+        gui.cfg_path.parent.mkdir(parents=True, exist_ok=True)
+        gui.cfg_path.write_text(
+            '[profiles.stored]\n'
+            f'base_url = "{good_base}"\n'
+            'model = "m"\n'
+            'api_key = "sk-good"\n',
+            encoding="utf-8",
+        )
+        # Same (scheme, host, port): stored api_key is attached
+        out = settings_api.probe_server(good_base, "", which="user",
+                                        profile="stored")
+        assert out["ok"] is True
+        assert seen[-1]["authorization"] == "Bearer sk-good"
+
+        # Different host/port: stored api_key is NOT sent
+        srv2, seen2 = _hosted_server()
+        try:
+            other_base = "http://127.0.0.1:%d/v1" % srv2.server_address[1]
+            out2 = settings_api.probe_server(other_base, "", which="user",
+                                             profile="stored")
+            assert out2["ok"] is False
+            assert seen2[-1]["authorization"] != "Bearer sk-good"
+        finally:
+            srv2.shutdown()
+
+        # Non-http(s) URL is rejected
+        bad = settings_api.probe_server("file:///etc/passwd", "")
+        assert bad["ok"] is False and "http" in bad["error"].lower()
+    finally:
+        srv.shutdown()
+
+
+def test_probe_provider_enforces_http_scheme_and_env_allowlist(gui, monkeypatch):
+    srv, seen = _hosted_server()
+    monkeypatch.setenv("HOME", "sk-good")
+    monkeypatch.setenv("CUSTOM_API_KEY", "sk-good")
+    try:
+        base = "http://127.0.0.1:%d/v1" % srv.server_address[1]
+        # Arbitrary env var (HOME) is never read or sent
+        status, j = gui.post("/api/providers/probe", {
+            "preset_id": "custom", "base_url": base, "api_key_env": "HOME"})
+        assert status == 200 and j["ok"] is False
+        assert seen[-1]["authorization"] == "Bearer "
+
+        # Valid *_API_KEY env var works
+        status, j = gui.post("/api/providers/probe", {
+            "preset_id": "custom", "base_url": base,
+            "api_key_env": "CUSTOM_API_KEY"})
+        assert status == 200 and j["ok"] is True
+        assert seen[-1]["authorization"] == "Bearer sk-good"
+
+        # Non-http(s) base_url is rejected with 400
+        status, j = gui.post("/api/providers/probe", {
+            "preset_id": "custom", "base_url": "file:///etc/passwd"})
+        assert status == 400 and "http" in j["detail"].lower()
+    finally:
+        srv.shutdown()
+
+
+def test_mcp_env_is_redacted_on_read_and_preserved_on_save(gui):
+    spec = {
+        "name": "srv", "transport": "stdio",
+        "command": sys.executable, "args": ["-c", "pass"],
+        "env": {"GITHUB_TOKEN": "ghp_secret123456", "LOG_LEVEL": "debug"},
+        "trusted": False, "enabled": True,
+    }
+    status, body = gui.post("/api/mcp/servers", spec)
+    assert status == 200 and body["ok"]
+    row = next(s for s in body["servers"] if s["name"] == "srv")
+    assert row["env"]["GITHUB_TOKEN"] == "***REDACTED***"
+    assert row["env"]["LOG_LEVEL"] == "debug"
+
+    # Re-saving with the redacted sentinel preserves the stored secret on disk
+    status, body2 = gui.post("/api/mcp/servers", {
+        **spec,
+        "env": {"GITHUB_TOKEN": "***REDACTED***", "LOG_LEVEL": "info"},
+        "enabled": False,
+    })
+    assert status == 200 and body2["ok"]
+    on_disk = tomllib.loads(gui.cfg_path.read_text(encoding="utf-8"))
+    assert on_disk["mcp_servers"]["srv"]["env"]["GITHUB_TOKEN"] == "ghp_secret123456"
+    assert on_disk["mcp_servers"]["srv"]["env"]["LOG_LEVEL"] == "info"
+
+    # An orphan sentinel for an unknown env key is refused
+    status, bad = gui.post("/api/mcp/servers", {
+        **spec,
+        "env": {"NEW_SECRET_TOKEN": "***REDACTED***"},
+    })
+    assert status == 400 and bad["ok"] is False

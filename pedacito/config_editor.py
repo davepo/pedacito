@@ -27,7 +27,7 @@ from datetime import date
 from pathlib import Path
 
 from . import config as config_mod
-from . import fileio
+from . import fileio, safety
 from .config import ConfigError
 
 
@@ -765,6 +765,50 @@ def profile_body(text: str, name: str) -> dict:
 
 REDACTED_SECRET = "***REDACTED***"
 SECRET_KEYS = ("api_key",)
+_SECRET_ENV_KEY_RE = re.compile(
+    r"(?i)(?:password|passwd|pwd|secret|token|api[-_]?key|apikey|"
+    r"auth[-_]?(?:key|token|secret|header)|access[-_]?key|private[-_]?key|"
+    r"credential|bearer|(?:^|_)key$)"
+)
+_UNPARSEABLE = object()
+
+
+def is_secret_env_entry(key: str, value: str) -> bool:
+    """True when an MCP `env` entry holds a credential-like key or secret value."""
+    val = str(value or "")
+    if not val or val == REDACTED_SECRET:
+        return False
+    if _SECRET_ENV_KEY_RE.search(str(key or "")):
+        return True
+    return safety.has_secret(val)
+
+
+def redact_mcp_env(env: dict | None) -> dict:
+    """Return a copy of an MCP server's `env` dict with secret entries masked."""
+    if not isinstance(env, dict):
+        return {}
+    out: dict[str, str] = {}
+    for k, v in env.items():
+        ks = str(k)
+        vs = str(v)
+        out[ks] = REDACTED_SECRET if is_secret_env_entry(ks, vs) else vs
+    return out
+
+
+def redact_mcp_servers_dict(servers: dict | None) -> dict:
+    """Return a copy of `mcp_servers` with secret `env` values masked."""
+    if not isinstance(servers, dict):
+        return {}
+    out: dict = {}
+    for name, spec in servers.items():
+        if isinstance(spec, dict):
+            copy_spec = dict(spec)
+            if isinstance(copy_spec.get("env"), dict):
+                copy_spec["env"] = redact_mcp_env(copy_spec["env"])
+            out[name] = copy_spec
+        else:
+            out[name] = spec
+    return out
 
 
 def _secret_lines(text: str) -> tuple[list[str], str, bool]:
@@ -776,15 +820,245 @@ def _secret_lines(text: str) -> tuple[list[str], str, bool]:
     return lines, nl, trailing_nl
 
 
+def _parse_dotted_key_str(s: str, p: int) -> tuple[tuple[str, ...], int]:
+    """Parse a TOML single or dotted key starting at `s[p]`, returning
+    `(parts, next_pos)` or `((), p)` if `s[p:]` does not start with a key."""
+    parts: list[str] = []
+    n = len(s)
+    while p < n:
+        while p < n and s[p] in " \t":
+            p += 1
+        if p >= n:
+            return (), p
+        ch = s[p]
+        if ch == '"':
+            p += 1
+            buf: list[str] = []
+            while p < n and s[p] != '"':
+                if s[p] == "\\" and p + 1 < n:
+                    p += 1
+                    buf.append(s[p])
+                else:
+                    buf.append(s[p])
+                p += 1
+            if p >= n or s[p] != '"':
+                return (), p
+            p += 1
+            parts.append("".join(buf))
+        elif ch == "'":
+            p += 1
+            start = p
+            while p < n and s[p] != "'":
+                p += 1
+            if p >= n or s[p] != "'":
+                return (), p
+            parts.append(s[start:p])
+            p += 1
+        else:
+            m = re.match(r"[A-Za-z0-9_-]+", s[p:])
+            if not m:
+                return (), p
+            parts.append(m.group(0))
+            p += len(m.group(0))
+        while p < n and s[p] in " \t":
+            p += 1
+        if p < n and s[p] == ".":
+            p += 1
+            continue
+        break
+    return tuple(parts), p
+
+
+def _inline_value_end(s: str, start: int, limit: int) -> tuple[int, int]:
+    """Find `(val_end, next_pos)` for a value inside `{ ... }` starting at `start`."""
+    p = start
+    depth = 0
+    quote = ""
+    while p < limit:
+        ch = s[p]
+        if quote:
+            if quote in ('"""', "'''"):
+                if quote == '"""' and ch == "\\":
+                    p += 2
+                    continue
+                if s.startswith(quote, p):
+                    quote = ""
+                    p += 3
+                    continue
+            elif quote == '"' and ch == "\\":
+                p += 2
+                continue
+            elif ch == quote:
+                quote = ""
+            p += 1
+            continue
+        if s.startswith(('"""', "'''"), p):
+            quote = s[p:p + 3]
+            p += 3
+            continue
+        if ch in "\"'":
+            quote = ch
+            p += 1
+            continue
+        if ch in "[{":
+            depth += 1
+        elif ch in "]}":
+            if depth == 0 and ch == "}":
+                val_end = start + len(s[start:p].rstrip())
+                return val_end, p
+            depth -= 1
+        elif ch == "," and depth == 0:
+            val_end = start + len(s[start:p].rstrip())
+            return val_end, p
+        elif ch == "#" and depth == 0:
+            val_end = start + len(s[start:p].rstrip())
+            nl = s.find("\n", p, limit)
+            next_p = nl + 1 if nl != -1 else limit
+            return val_end, next_p
+        p += 1
+    val_end = start + len(s[start:limit].rstrip())
+    return val_end, limit
+
+
+def _span_snippet(lines: list[str], hit: tuple[int, int, int, int]) -> str:
+    i, vs, j, ec = hit
+    if i == j:
+        return lines[i][vs:ec]
+    return "\n".join([lines[i][vs:]] + lines[i + 1:j] + [lines[j][:ec]])
+
+
+def _decode_toml_scalar(snippet: str):
+    try:
+        return tomllib.loads("v = " + snippet)["v"]
+    except (tomllib.TOMLDecodeError, KeyError, TypeError):
+        return _UNPARSEABLE
+
+
+def _is_mcp_env_path(path: tuple[str, ...]) -> bool:
+    return len(path) == 4 and path[0] == "mcp_servers" and path[2] == "env"
+
+
+def _walk_inline_table(lines: list[str], hit: tuple[int, int, int, int],
+                       base_path: tuple[str, ...],
+                       out: list[tuple[tuple[str, ...], tuple[int, int, int, int]]]) -> None:
+    i, vs, j, ec = hit
+    chunks = ([lines[i][vs:ec]] if i == j
+              else [lines[i][vs:]] + lines[i + 1:j] + [lines[j][:ec]])
+    joined = "\n".join(chunks)
+    if not joined.startswith("{"):
+        return
+
+    if i == j:
+        def pos_of(off: int) -> tuple[int, int]:
+            return i, vs + off
+    else:
+        line_starts = [0]
+        for chunk in chunks[:-1]:
+            line_starts.append(line_starts[-1] + len(chunk) + 1)
+
+        def pos_of(off: int) -> tuple[int, int]:
+            for idx in range(len(line_starts) - 1, -1, -1):
+                if off >= line_starts[idx]:
+                    col = off - line_starts[idx]
+                    return (i + idx, (vs + col) if idx == 0 else col)
+            return i, vs
+
+    limit = len(joined)
+    p = 1
+    while p < limit:
+        while p < limit:
+            if joined[p] in " \t\r\n,":
+                p += 1
+                continue
+            if joined[p] == "#":
+                nl = joined.find("\n", p, limit)
+                p = nl + 1 if nl != -1 else limit
+                continue
+            break
+        if p >= limit or joined[p] == "}":
+            break
+        sub_parts, p_after_key = _parse_dotted_key_str(joined, p)
+        if not sub_parts:
+            break
+        p = p_after_key
+        while p < limit and joined[p] in " \t\r\n":
+            p += 1
+        if p >= limit or joined[p] != "=":
+            break
+        p += 1
+        while p < limit and joined[p] in " \t\r\n":
+            p += 1
+        if p >= limit:
+            break
+        val_start = p
+        val_end, next_p = _inline_value_end(joined, val_start, limit)
+        if val_end <= val_start:
+            if next_p <= p:
+                break
+            p = next_p + (1 if next_p < limit and joined[next_p] == "," else 0)
+            continue
+        si, sc = pos_of(val_start)
+        ei, e_col = pos_of(val_end)
+        sub_hit = (si, sc, ei, e_col)
+        full_path = base_path + sub_parts
+        if joined[val_start] == "{":
+            _walk_inline_table(lines, sub_hit, full_path, out)
+        else:
+            out.append((full_path, sub_hit))
+        if next_p >= limit or joined[next_p] == "}":
+            break
+        p = next_p + (1 if joined[next_p] == "," else 0)
+
+
 def _secret_hits(lines: list[str], keys: tuple[str, ...]) -> list[tuple]:
-    """(region_name, key, (line, vstart, end_line, end_col)) for every
-    uncommented assignment of a secret key, in any table."""
-    hits = []
+    """(full_path, (line, vstart, end_line, end_col)) for every
+    uncommented secret-relevant assignment, including dotted keys, inline
+    tables, and `[mcp_servers.*.env]` entries."""
+    candidates: list[tuple[tuple[str, ...], tuple[int, int, int, int]]] = []
     for region in _regions(lines):
-        for key in keys:
-            hit = _find_key(lines, region, key)
-            if hit:
-                hits.append((region["name"], key, hit))
+        if region.get("array"):
+            continue
+        region_parts = tuple(region["name"].split(SEP)) if region["name"] else ()
+        i = region["start"]
+        state = ""
+        while i < region["end"]:
+            line = lines[i]
+            if state:
+                state = _triple_toggles(line, state)
+                i += 1
+                continue
+            stripped = line.lstrip()
+            if not stripped or stripped.startswith("#"):
+                i += 1
+                continue
+            key_parts, p = _parse_dotted_key_str(line, 0)
+            if key_parts:
+                while p < len(line) and line[p] in " \t":
+                    p += 1
+                if p < len(line) and line[p] == "=":
+                    p += 1
+                    while p < len(line) and line[p] in " \t":
+                        p += 1
+                    if p < len(line) and line[p] != "#":
+                        vstart = p
+                        j, endc = _value_end(lines, i, vstart)
+                        full_path = region_parts + key_parts
+                        hit = (i, vstart, j, endc)
+                        if line[vstart:vstart + 1] == "{":
+                            _walk_inline_table(lines, hit, full_path, candidates)
+                        else:
+                            candidates.append((full_path, hit))
+                        i = j + 1
+                        continue
+            state = _triple_toggles(line, state)
+            i += 1
+
+    hits = []
+    for full_path, hit in candidates:
+        if not full_path:
+            continue
+        if full_path[-1] in keys or _is_mcp_env_path(full_path):
+            hits.append((full_path, hit))
     return hits
 
 
@@ -805,12 +1079,23 @@ def redact_secrets(text: str, keys: tuple[str, ...] = SECRET_KEYS) -> str:
     if not hits:
         return text
     sentinel = literal(REDACTED_SECRET)
-    for _name, _key, (i, vs, j, ec) in sorted(
-            hits, key=lambda h: h[2], reverse=True):
+    changed = False
+    for full_path, (i, vs, j, ec) in sorted(
+            hits, key=lambda h: h[1], reverse=True):
         if _is_masked(lines, (i, vs, j, ec)):
+            continue
+        snippet = _span_snippet(lines, (i, vs, j, ec))
+        val = _decode_toml_scalar(snippet)
+        if _is_mcp_env_path(full_path) and full_path[-1] not in keys:
+            if not isinstance(val, str) or not is_secret_env_entry(full_path[3], val):
+                continue
+        elif isinstance(val, str) and val == "":
             continue
         tail = lines[j][ec:]
         lines[i:j + 1] = [lines[i][:vs] + sentinel + tail]
+        changed = True
+    if not changed:
+        return text
     out = nl.join(lines)
     return out + nl if (trailing_nl or not out) else out
 
@@ -819,11 +1104,12 @@ def restore_secrets(text: str, old_text: str,
                     keys: tuple[str, ...] = SECRET_KEYS) -> str:
     """Undo `redact_secrets` for a save: every sentinel still present in
     `text` gets the secret stored at the SAME scope (top level, profile,
-    ...) in `old_text`. A sentinel with no stored counterpart is refused --
-    the mask itself must never be written to disk as a real key. Text with
-    no sentinel is returned unchanged, even when `old_text` is unreadable."""
+    dotted key, inline table, MCP env) in `old_text`. A sentinel with no
+    stored counterpart is refused -- the mask itself must never be written to
+    disk as a real key. Text with no sentinel is returned unchanged, even
+    when `old_text` is unreadable."""
     lines, nl, trailing_nl = _secret_lines(text)
-    hits = [(name, key, hit) for name, key, hit in _secret_hits(lines, keys)
+    hits = [(full_path, hit) for full_path, hit in _secret_hits(lines, keys)
             if _is_masked(lines, hit)]
     if not hits:
         return text
@@ -832,19 +1118,21 @@ def restore_secrets(text: str, old_text: str,
     except (tomllib.TOMLDecodeError, TypeError):
         stored = {}
 
-    def lookup(region_name: str, key: str):
+    def lookup(path: tuple[str, ...]):
         table = stored
-        for part in region_name.split(SEP) if region_name else ():
+        for part in path:
             if not isinstance(table, dict):
                 return None
             table = table.get(part)
-        return table.get(key) if isinstance(table, dict) else None
+        return table
 
-    for name, key, (i, vs, j, ec) in sorted(
-            hits, key=lambda h: h[2], reverse=True):
-        value = lookup(name, key)
+    for full_path, (i, vs, j, ec) in sorted(
+            hits, key=lambda h: h[1], reverse=True):
+        value = lookup(full_path)
         if value in (None, ""):
-            where = f" in [{name.replace(SEP, '.')}]" if name else ""
+            key = full_path[-1]
+            scope = ".".join(full_path[:-1])
+            where = f" in [{scope}]" if scope else ""
             raise ConfigError(
                 f"`{key}`{where} is masked as {REDACTED_SECRET} but this file "
                 f"has no stored {key} to restore. Enter a real value or "

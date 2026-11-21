@@ -43,6 +43,7 @@ from .core import (STATE, install_permission_broker, install_runner,
 STATIC = Path(__file__).parent / "static"
 MAX_BODY = 12 * 1024 * 1024
 MAX_VIEW_BYTES = 600_000
+MAX_PREVIEW_ASSET_BYTES = 25 * 1024 * 1024
 MAX_SCAN_FILES = 4000          # workspace scan cap for the Files tab
 MAX_BACKUPS = 20
 
@@ -60,11 +61,14 @@ CSP = ("default-src 'self'; style-src 'self' 'unsafe-inline'; "
        "frame-ancestors 'none'; base-uri 'none'; form-action 'none'")
 
 # The GUI frames project pages with `sandbox="allow-scripts"` (no
-# `allow-same-origin`), so a previewed page runs in an opaque origin. Its CSP
-# is separate from the app's own: inline scripts still work (static pages keep
-# them inline) but eval is refused. A POST from the sandbox arrives with
+# `allow-same-origin`), and the response CSP itself enforces `sandbox
+# allow-scripts allow-forms allow-modals;` (no `allow-same-origin`), so a
+# previewed page runs in an opaque origin even when opened in a new tab. Its
+# CSP is separate from the app's own: inline scripts still work (static pages
+# keep them inline) but eval is refused. A POST from the sandbox arrives with
 # `Origin: null`, which `security.post_origin_allowed` rejects.
-PREVIEW_CSP = ("default-src 'self' data: blob:; "
+PREVIEW_CSP = ("sandbox allow-scripts allow-forms allow-modals; "
+               "default-src 'self' data: blob:; "
                "style-src 'self' 'unsafe-inline'; "
                "script-src 'self' 'unsafe-inline'; "
                "img-src 'self' data: blob:; "
@@ -182,12 +186,15 @@ def read_project_file(rel: str) -> dict:
                 f"`{rel}` is a sensitive file (secret/credential material is "
                 "never previewed without an explicit approval).")
     size = p.stat().st_size
-    data = p.read_bytes()[:MAX_VIEW_BYTES]
+    with p.open("rb") as fh:
+        chunk = fh.read(MAX_VIEW_BYTES + 1)
+    truncated = len(chunk) > MAX_VIEW_BYTES
+    data = chunk[:MAX_VIEW_BYTES]
     if b"\x00" in data[:4096]:
         return {"path": rel, "binary": True, "size": size, "text": ""}
     return {"path": rel, "binary": False, "size": size,
             "text": data.decode("utf-8", errors="replace"),
-            "truncated": size > MAX_VIEW_BYTES}
+            "truncated": truncated}
 
 
 def project_files() -> dict:
@@ -1254,7 +1261,8 @@ def _skills_get(q, body=None):
 
     With no project open this reads the built-in library plus the user's
     global folder (and any skill saved into the scratchpad project)."""
-    return 200, _skills_payload(_effective_root(), str(q.get("task", "")))
+    task = (q.get("task") or [""])[0]
+    return 200, _skills_payload(_effective_root(), str(task or ""))
 
 
 @post("/api/skills")
@@ -1963,8 +1971,11 @@ def _steer(q, body):
 
 @post("/api/answer")
 def _answer(q, body):
-    ok = STATE.answer_question(int(body.get("qid") or 0),
-                               str(body.get("text", "")))
+    try:
+        qid = int(body.get("qid") or 0)
+    except (TypeError, ValueError):
+        return 400, {"ok": False, "detail": "qid must be an integer."}
+    ok = STATE.answer_question(qid, str(body.get("text", "")))
     return (200, {"ok": True}) if ok else (409, {"ok": False,
                                                   "detail": "No open question."})
 
@@ -1983,16 +1994,24 @@ def _permission_decide(q, body):
 
 @post("/api/review/decide")
 def _decide(q, body):
+    try:
+        rid = int(body.get("id") or 0)
+    except (TypeError, ValueError):
+        return 400, {"ok": False, "detail": "id must be an integer."}
     files = body.get("files")
     ok, detail = STATE.decide_review(
-        int(body.get("id") or 0), str(body.get("action", "")),
+        rid, str(body.get("action", "")),
         list(files) if isinstance(files, list) else None)
     return (200 if ok else 409), {"ok": ok, "detail": detail}
 
 
 @post("/api/review/rediff")
 def _rediff(q, body):
-    out = STATE.review_rediff(int(body.get("id") or 0), str(body.get("rel", "")),
+    try:
+        rid = int(body.get("id") or 0)
+    except (TypeError, ValueError):
+        return 400, {"ok": False, "detail": "id must be an integer."}
+    out = STATE.review_rediff(rid, str(body.get("rel", "")),
                               str(body.get("text", "")))
     return (200, out) if out else (409, {"ok": False,
                                          "detail": "This file can't be edited."})
@@ -2591,9 +2610,16 @@ class _Handler(BaseHTTPRequestHandler):
                              "application/wasm"):
             ctype += "; charset=utf-8"
         try:
-            data = p.read_bytes()
+            if p.stat().st_size > MAX_PREVIEW_ASSET_BYTES:
+                self._send(413, b"file too large", "text/plain")
+                return
+            with p.open("rb") as fh:
+                data = fh.read(MAX_PREVIEW_ASSET_BYTES + 1)
         except OSError:
             self._send(404, b"not found", "text/plain")
+            return
+        if len(data) > MAX_PREVIEW_ASSET_BYTES:
+            self._send(413, b"file too large", "text/plain")
             return
         self.send_response(200)
         self.send_header("Content-Type", ctype)
