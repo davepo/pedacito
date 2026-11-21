@@ -9,6 +9,8 @@ the run has committed to a skeleton (``--apply``/``--plan-only``/``--review``),
 after the non-empty refusal guard.
 """
 
+import sys
+
 import pytest
 
 from pedacito import cli, config, scaffold
@@ -80,13 +82,19 @@ def test_new_refusal_leaves_only_the_preexisting_files(tmp_path, new_env,
     assert sorted(p.name for p in target.iterdir()) == ["index.html"]
 
 
-def test_new_plan_only_still_logs_the_command(tmp_path, new_env, capsys):
+def test_new_plan_only_still_logs_the_command(tmp_path, new_env, capsys,
+                                              monkeypatch):
     target = tmp_path / "built"
     capsys.readouterr()
+    # The CLI logs the real process argv; under pytest that is pytest's own
+    # command line, so pin a realistic one instead of relying on the test
+    # file's name happening to contain "new".
+    monkeypatch.setattr(sys, "argv",
+                        ["pdc", "new", str(target), "--plan-only"])
     code = _cli_new(target, new_env, "--plan-only")
     assert code == 0
     log = (target / ".pedacito" / "log.txt").read_text(encoding="utf-8")
-    assert "command:" in log and "new" in log
+    assert "command: pdc new" in log and "--plan-only" in log
 
 
 def test_run_new_logs_the_command_only_on_the_write_path(tmp_path,
