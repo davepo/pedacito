@@ -46,7 +46,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from pedacito import config as config_mod  # noqa: E402
-from pedacito import config_editor, edits, mcp, safety, security  # noqa: E402
+from pedacito import config_editor, edits, mcp, safety, sandbox, security, servers  # noqa: E402
 from pedacito import skills as skills_mod  # noqa: E402
 from pedacito import tools, workspace  # noqa: E402
 from pedacito.config import Config, ConfigError  # noqa: E402
@@ -1164,3 +1164,102 @@ def test_sensitive_target_skill_is_not_read_even_from_user_folder(iso_home, tmp_
     (user_skills / "keylink.md").symlink_to(key)
     text, info = skills_mod.load(tmp_path, None, "keylink")
     assert info is None and "PRIVATE-KEY-BODY" not in text
+
+
+# =============================================================================
+# N. WP-02: OS sandbox, execution trust boundary & EXEC_FIELDS hardening
+# =============================================================================
+
+def test_sandbox_exec_prefix_ends_with_a_double_dash(tmp_path):
+    """`sandbox-exec -p <profile> --` so an argv[0] beginning with `-` can
+    never be read as a Seatbelt flag."""
+    prefix = sandbox._prefix("seatbelt", tmp_path, False, [])
+    assert prefix[0] == "sandbox-exec" and prefix[1] == "-p"
+    assert prefix[-1] == "--"
+
+
+def test_bwrap_secret_mounts_come_after_extra_rw(tmp_path, monkeypatch):
+    """`extra_rw` is bound before the secret mounts, so a writable path the
+    user listed cannot re-bind over a hidden credential (bwrap applies mounts
+    in order, last one wins)."""
+    home = tmp_path / "home"
+    (home / ".ssh").mkdir(parents=True)
+    (home / ".netrc").write_text("machine x\n", encoding="utf-8")
+    monkeypatch.setenv("HOME", str(home))
+    root = (tmp_path / "proj").resolve()
+    root.mkdir()
+    extra = (tmp_path / "extra").resolve()
+    extra.mkdir()
+    args = sandbox._bwrap_args(root, False, [extra])
+    i_extra = args.index(str(extra))
+    i_ssh = args.index(str((home / ".ssh").resolve()))
+    i_netrc = args.index(str((home / ".netrc").resolve()))
+    assert i_extra < i_ssh and i_extra < i_netrc
+
+
+def test_seatbelt_profile_has_no_unix_socket_allow_when_network_off(tmp_path):
+    """`(allow network* (remote unix-socket))` must not re-open the network
+    after `(deny network*)`."""
+    prof = sandbox.seatbelt_profile(tmp_path, False, [])
+    assert "(deny network*)" in prof
+    assert "remote unix-socket" not in prof
+
+
+def test_seatbelt_profile_denies_writes_to_guarded_paths_that_do_not_exist(tmp_path):
+    """GUARDED paths are denied even before they exist: a sandboxed command
+    must not be able to create `.git`/`.pedacito` and then write it."""
+    root = tmp_path / "proj"
+    root.mkdir()
+    prof = sandbox.seatbelt_profile(root, False, [])
+    for name in sandbox.GUARDED:
+        g = root / name
+        assert f'(deny file-write* (subpath "{g}"))' in prof
+
+
+def test_exec_fields_cover_web_and_outbound_toggles():
+    for key in ("enable_web", "wrap_observations", "redact_secrets",
+                "security_outbound_mode", "protected_paths", "auto_plan_file"):
+        assert key in config_mod.EXEC_FIELDS, key
+
+
+def test_untrusted_project_config_cannot_toggle_web_or_outbound(iso_home, tmp_path):
+    proj = tmp_path / "proj"
+    proj.mkdir()
+    (proj / ".pedacito.toml").write_text(
+        'enable_web = true\n'
+        'security_outbound_mode = "redact"\n'
+        'auto_plan_file = "attacker.md"\n',
+        encoding="utf-8")
+    baseline = config_mod.Config()
+    cfg = config_mod.load(root=proj, require_hardware=False)
+    assert cfg.enable_web is False
+    assert cfg.security_outbound_mode == baseline.security_outbound_mode
+    assert cfg.auto_plan_file == baseline.auto_plan_file
+
+
+def test_run_hook_model_name_cannot_inject_arguments(monkeypatch):
+    """`{model}` is substituted per-token AFTER shlex.split, so spaces/flag
+    syntax inside the model name stay one argv element."""
+    from types import SimpleNamespace
+    seen = {}
+
+    def fake_run(argv, **kw):
+        seen["argv"] = list(argv)
+        return SimpleNamespace(returncode=0, stdout="loaded", stderr="")
+
+    monkeypatch.setattr(servers.subprocess, "run", fake_run)
+    server = {"name": "strata", "base_url": "http://127.0.0.1:8001/v1"}
+    ok, detail = servers._run_hook(
+        'echo {model}', server, "--install --evil injected", None)
+    assert ok, detail
+    assert seen["argv"] == ["echo", "--install --evil injected"]
+
+
+def test_tool_lsp_refuses_sensitive_files(tmp_path):
+    idx = Index(tmp_path, [])
+    cfg = Config()
+    cfg.allow_lsp = True
+    (tmp_path / ".env").write_text("API_KEY=x\n", encoding="utf-8")
+    obs = tools.tool_lsp(idx, cfg, "definition", ".env")
+    assert obs.startswith("ERROR") and "sensitive" in obs
+    assert "API_KEY=x" not in obs

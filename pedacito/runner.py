@@ -16,7 +16,6 @@ a test process is running) child processes also get headless display guards.
 
 from __future__ import annotations
 
-import fnmatch
 import json
 import os
 import re
@@ -27,6 +26,8 @@ import sys
 import time
 from pathlib import Path
 from urllib.parse import quote
+
+from . import proc, safety
 
 MAX_OUTPUT = 200_000
 MAX_TRACEBACK = 16_000
@@ -40,6 +41,10 @@ _TRACEBACK_MARKERS = (
     "Traceback (most recent call last):",
     "Traceback (most recent call last):\r\n",
 )
+
+# One notice per process for a project whose untrusted state file carries a
+# `run_cmd`/`run_cmds` (see `_custom_commands`).
+_warned_untrusted_cmd: set[str] = set()
 
 
 # --- detection ----------------------------------------------------------------
@@ -166,9 +171,22 @@ def _python_tree(root: Path) -> tuple[bool, bool]:
 
 
 def _custom_commands(root: Path) -> list[dict]:
+    from . import config
     data = _read_project_config(root)
     raw = data.get("run_cmd") if "run_cmd" in data else data.get("run_cmds")
     if raw is None:
+        return []
+    # A cloned repo can ship `.pedacito/config.json` with a `run_cmd`; only a
+    # project the user approved with `pedacito trust` may have its state file
+    # run arbitrary commands from the one-click Run tab.
+    proj_cfg = config.find_project_config(root)
+    if proj_cfg is None or not config.is_trusted(proj_cfg):
+        key = str(root)
+        if key not in _warned_untrusted_cmd:
+            _warned_untrusted_cmd.add(key)
+            print(f"[runner] ignoring run_cmd/run_cmds from "
+                  f"{root}/.pedacito/config.json: the project is not trusted "
+                  "(run `pedacito trust` first)", file=sys.stderr)
         return []
     items = raw if isinstance(raw, list) else [raw]
     out: list[dict] = []
@@ -319,24 +337,15 @@ def _headless() -> bool:
             or "pytest" in sys.modules)
 
 
-# Variables that carry credentials. Matched case-insensitively against the
-# whole name, so exported shell keys never reach a Run-tab child process.
-SENSITIVE_ENV_EXACT = frozenset({"GITHUB_TOKEN", "PYPI_API_KEY"})
-SENSITIVE_ENV_PATTERNS = (
-    "*_API_KEY", "*SECRET*", "*TOKEN*", "*PASSWORD*",
-    "*ACCESS_KEY*", "*CREDENTIAL*",
-)
-
-
-def _is_sensitive_env(name: str) -> bool:
-    upper = str(name).upper()
-    return upper in SENSITIVE_ENV_EXACT or any(
-        fnmatch.fnmatchcase(upper, pat) for pat in SENSITIVE_ENV_PATTERNS)
+# The Run-tab child environment uses `safety.child_env`'s allow-list scrub:
+# ambient API keys and tokens never reach a command the GUI/TUI launches. The
+# allow-list (not a block-list) is the boundary -- an exported variable only
+# reaches the child if its name is in `safety._ENV_ALLOW` (or the user listed
+# it in `env_passthrough`), so a future secret naming scheme cannot slip past.
 
 
 def _child_env() -> dict:
-    env = {k: v for k, v in os.environ.items() if not _is_sensitive_env(k)}
-    env.setdefault("PYTHONUNBUFFERED", "1")
+    env = safety.child_env()
     if _headless():
         # Keep a GUI/Tk app from trying to open a window in a test or a
         # browser-less server; console apps ignore all of these.
@@ -432,36 +441,29 @@ def run_project_command(root, cmd=None, timeout: int = DEFAULT_TIMEOUT) -> dict:
         timeout_s = float(DEFAULT_TIMEOUT)
     timeout_s = max(0.1, timeout_s)
     started = time.monotonic()
-    try:
-        proc = subprocess.run(
-            argv, shell=False, cwd=str(root), capture_output=True, text=True,
-            encoding="utf-8", errors="replace", timeout=timeout_s,
-            env=_child_env())
-    except subprocess.TimeoutExpired as exc:
-        elapsed = int((time.monotonic() - started) * 1000)
-        out = exc.stdout or ""
-        err = exc.stderr or ""
-        if isinstance(out, bytes):
-            out = out.decode("utf-8", errors="replace")
-        if isinstance(err, bytes):
-            err = err.decode("utf-8", errors="replace")
-        return _failure_result(
-            display, argv, exit_code=124, stdout=str(out), stderr=str(err),
-            detail=f"Command timed out after {timeout_s:g}s.",
-            duration_ms=elapsed, timed_out=True)
-    except OSError as exc:
-        elapsed = int((time.monotonic() - started) * 1000)
-        return _failure_result(
-            display, argv, exit_code=127,
-            detail=f"Could not run {argv[0]!r}: {exc}", duration_ms=elapsed)
+    # `proc.run` reaps the whole process group on timeout and bounds output
+    # (the head and tail), unlike subprocess.run(capture_output=True).
+    rc, out, stopped, _elapsed = proc.run(
+        argv, cwd=str(root), timeout=timeout_s, idle_timeout=0,
+        max_output=MAX_OUTPUT, env=_child_env())
 
     elapsed = int((time.monotonic() - started) * 1000)
-    stdout = proc.stdout or ""
-    stderr = proc.stderr or ""
+    if stopped == "error":
+        return _failure_result(
+            display, argv, exit_code=127,
+            detail=f"Could not run {argv[0]!r}: {out}", duration_ms=elapsed)
+    if stopped == "timeout":
+        return _failure_result(
+            display, argv, exit_code=124, stdout=out,
+            detail=f"Command timed out after {timeout_s:g}s.",
+            duration_ms=elapsed, timed_out=True)
+
+    stdout = out
+    stderr = ""
     tb = extract_traceback(stderr, stdout)
     return {
-        "ok": proc.returncode == 0 and not tb,
-        "exit_code": int(proc.returncode),
+        "ok": rc == 0 and not tb,
+        "exit_code": int(rc),
         "stdout": _clip(stdout),
         "stderr": _clip(stderr),
         "traceback_summary": tb,

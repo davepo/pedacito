@@ -19,7 +19,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from pedacito import checkpoints, cli, loop, runner  # noqa: E402
+from pedacito import checkpoints, cli, config as config_mod, loop, runner  # noqa: E402
 from pedacito.config import Config  # noqa: E402
 from pedacito.gui import core, server, settings_api  # noqa: E402
 from pedacito.tui import TuiSession  # noqa: E402
@@ -223,6 +223,11 @@ def test_detect_runnable_targets_finds_web_and_python_entrypoints(tmp_path):
     (tmp_path / ".pedacito" / "config.json").write_text(
         json.dumps({"run_cmd": "python main.py --smoke"}),
         encoding="utf-8")
+    # The state file's `run_cmd` is only honoured once the project is trusted
+    # (a cloned repo must not be able to run arbitrary commands from the Run
+    # tab). This test trusts the project so the custom command is listed.
+    (tmp_path / ".pedacito.toml").write_text("# approved\n", encoding="utf-8")
+    config_mod.trust_project(tmp_path / ".pedacito.toml")
 
     targets = runner.detect_runnable_targets(tmp_path)
     assert [p["path"] for p in targets["web"]] == [
@@ -239,14 +244,29 @@ def test_detect_runnable_targets_finds_web_and_python_entrypoints(tmp_path):
     assert targets["web"][0] == "index.html"
 
 
+def test_detect_runnable_targets_ignores_untrusted_run_cmd(tmp_path, capsys):
+    """A cloned repo can ship `.pedacito/config.json` with a `run_cmd`; it is
+    never listed (or run) until the project is trusted."""
+    (tmp_path / "main.py").write_text("print('main')\n", encoding="utf-8")
+    (tmp_path / ".pedacito").mkdir()
+    (tmp_path / ".pedacito" / "config.json").write_text(
+        json.dumps({"run_cmd": "python main.py --pwned"}), encoding="utf-8")
+
+    targets = runner.detect_runnable_targets(tmp_path)
+    commands = [c["command"] for c in targets["commands"]]
+    assert "python main.py --pwned" not in commands
+    assert "not trusted" in capsys.readouterr().err
+
+
 def test_run_project_command_captures_streams_exit_and_traceback(tmp_path):
     (tmp_path / "ok.py").write_text(
         "import sys\nprint('hello out')\nprint('hello err', file=sys.stderr)\n",
         encoding="utf-8")
     ok = runner.run_project_command(tmp_path, [sys.executable, "ok.py"])
     assert ok["ok"] is True and ok["exit_code"] == 0
+    # `proc.run` merges stderr into stdout (one bounded stream).
     assert "hello out" in ok["stdout"]
-    assert "hello err" in ok["stderr"]
+    assert "hello err" in ok["stdout"]
     assert ok["traceback_summary"] == ""
     assert ok["duration_ms"] >= 0
 
@@ -256,7 +276,7 @@ def test_run_project_command_captures_streams_exit_and_traceback(tmp_path):
     bad = runner.run_project_command(tmp_path, [sys.executable, "bad.py"])
     assert bad["ok"] is False and bad["exit_code"] == 3
     assert "partial" in bad["stdout"]
-    assert "problem" in bad["stderr"]
+    assert "problem" in bad["stdout"]
 
     (tmp_path / "crash.py").write_text(
         "def explode():\n    raise ValueError('boom')\n\nexplode()\n",

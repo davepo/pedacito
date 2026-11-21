@@ -1473,7 +1473,9 @@ EXEC_FIELDS = ("hooks", "mcp_servers", "auto_verify", "test_command",
                "scrub_env", "env_passthrough",
                "verify_tests", "verify_dom", "dom_entry",
                "shell_allowlist", "browser_eval_hosts",
-               "allow_fetch", "fetch_allowed_hosts")
+               "allow_fetch", "fetch_allowed_hosts",
+               "enable_web", "wrap_observations", "redact_secrets",
+               "security_outbound_mode", "protected_paths", "auto_plan_file")
 TRUST_FILE = "trusted_projects.json"
 
 

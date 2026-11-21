@@ -2576,6 +2576,8 @@ def tool_lsp(index, cfg, symbol: str = "", file: str = "",
     rel = index.resolve_file(_as_text(file)) or _root_rel(index, _as_text(file))
     if not rel:
         return f"ERROR: refusing to use LSP outside the project root: {file}"
+    if security.is_sensitive_path(rel):
+        return f"ERROR: refusing to use LSP on sensitive file: {rel}"
     if op not in ("definition", "references", "hover", "diagnostics"):
         return ("ERROR: lsp symbol must be definition, references, hover, or "
                 "diagnostics.")
@@ -2608,7 +2610,20 @@ def tool_serve(index, cfg, symbol: str = "", command: str = "",
         if not cmd:
             return "ERROR: serve start needs a command."
         try:
-            rec = processes.start(index.root, cmd, name=name, cfg=cfg,
+            argv = _split_command(cmd)
+        except ValueError as e:
+            return f"ERROR: could not parse command ({e})."
+        if not argv:
+            return "ERROR: serve start needs a command."
+        denied = _allowlist_error(cfg, argv)
+        if denied:
+            return denied
+        if security.is_install_command(argv):
+            return ("ERROR: `serve` refuses to install packages "
+                    f"(`{cmd[:120]}`). Give it the command that runs the "
+                    "server, not a package installer.")
+        try:
+            rec = processes.start(index.root, argv, name=name, cfg=cfg,
                                   wait=float(getattr(cfg, "serve_wait", 3.0)))
         except (OSError, ValueError) as e:
             return f"ERROR: could not start server: {e}"
@@ -4352,6 +4367,15 @@ def tool_browser(index, cfg, client, command: str = "", pattern: str = "",
                 r"127\.0\.0\.1(?::\d+)?(?:/|$))", cmd, re.IGNORECASE):
         url = cmd if "://" in cmd else "http://" + cmd
         url = browser.normalise_url(url)
+        # SSRF guard for a URL passed straight to the browser: loopback /
+        # link-local / private hosts are refused unless the user listed them
+        # in fetch_allowed_hosts or browser_eval_hosts. A server the tool
+        # itself launches below is exempt (its URL is loopback by design).
+        allowed = tuple(getattr(cfg, "fetch_allowed_hosts", ()) or ()) \
+            + tuple(getattr(cfg, "browser_eval_hosts", ()) or ())
+        ssrf = security.ssrf_error(url, allowed)
+        if ssrf:
+            return f"ERROR: {ssrf}"
     else:
         if not getattr(cfg, "allow_shell", False):
             return ("ERROR: launching a browser server command needs "
@@ -4366,6 +4390,10 @@ def tool_browser(index, cfg, client, command: str = "", pattern: str = "",
         denied = _allowlist_error(cfg, argv)
         if denied:
             return denied
+        if security.is_install_command(argv):
+            return ("ERROR: launching a browser server cannot install packages "
+                    f"(`{cmd[:120]}`). Start the server yourself and pass its "
+                    "URL, or give a run command instead of an installer.")
         wait = max(1, _as_int(getattr(cfg, "browser_server_wait_seconds", 15),
                               15))
         try:

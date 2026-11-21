@@ -688,13 +688,10 @@ def _run_hook(command: str, server: dict, model: str, cfg=None
     text = str(command or "").strip()
     if not text:
         return False, "no command configured"
+    server_url = str(server.get("base_url") or "")
     if isinstance(command, (list, tuple)):
-        argv = [str(part).replace("{model}", model or "").replace(
-            "{server}", str(server.get("base_url") or ""))
-            for part in command]
+        argv = [str(part) for part in command]
     else:
-        text = text.replace("{model}", model or "").replace(
-            "{server}", str(server.get("base_url") or ""))
         try:
             if os.name != "nt":
                 argv = shlex.split(text)
@@ -707,6 +704,11 @@ def _run_hook(command: str, server: dict, model: str, cfg=None
                         for p in shlex.split(text, posix=False)]
         except ValueError as exc:
             return False, f"cannot parse command: {exc}"
+    # Substitute per-token AFTER splitting, so spaces or quotes inside `model`
+    # / the server URL stay inside one argv element instead of injecting
+    # extra arguments.
+    argv = [tok.replace("{model}", model or "").replace("{server}", server_url)
+            for tok in argv]
     if not argv:
         return False, "empty command"
     env = safety.child_env(cfg, extra={
