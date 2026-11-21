@@ -40,3 +40,34 @@ def test_a_normal_new_file_is_still_created(tmp_path):
                                 backup=False)
     assert results and results[0].ok
     assert (tmp_path / "src" / "report.md").read_text(encoding="utf-8")
+
+
+def test_single_quoted_code_line_as_file_header_is_refused(tmp_path):
+    """The first refusal only caught backtick/${} punctuation; the common
+    single-quoted/parenthesised code lines still created bogus files."""
+    for line in ("console.log('hi')",
+                 "import foo from 'bar'",
+                 "def greet(name):",
+                 "print('hello', name)",
+                 "arr[0]",
+                 "# a comment",
+                 "@app.route",
+                 "import os",
+                 "return x"):
+        reply = (f'--- FILE: {line}\n'
+                 '<<<<<<< SEARCH\n'
+                 '=======\n'
+                 'body\n'
+                 '>>>>>>> REPLACE\n')
+        results = edits.apply_edits(tmp_path, edits.parse_edits(reply),
+                                    backup=False)
+        assert results and not results[0].ok, line
+        assert "looks like a copied source line" in results[0].message, line
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_ordinary_new_names_still_pass_the_plausibility_check():
+    for rel in ("src/report.md", "notes/my file.txt", "nota-ñandú.md",
+                "Makefile", "LICENSE", ".gitignore", "a+b.txt",
+                "Q&A.md", "100%-done.md", "hello!.txt"):
+        assert edits._plausible_new_path(rel), rel

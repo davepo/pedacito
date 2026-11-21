@@ -857,7 +857,7 @@ _JS_FAMILY_EXT = (".js", ".mjs", ".cjs", ".ts", ".tsx", ".jsx", ".mts",
                   ".cts")
 
 
-_IMPLAUSIBLE_PATH_CHARS = set('`${};=<>|"*?\x00\n\r\t')
+_IMPLAUSIBLE_PATH_CHARS = set('`${};=<>|"*?\x00\n\r\t\'()[]:,#@')
 
 
 def _plausible_new_path(rel: str) -> bool:
@@ -868,15 +868,26 @@ def _plausible_new_path(rel: str) -> bool:
     real file named after the code line (for example
     `tile.className = `tile tile-${value}`;`) while the target file stayed
     untouched. New paths must not carry code/prose punctuation or padded
-    segments.
+    segments. The punctuation set covers the common code-line shapes --
+    single-quoted calls (`console.log('hi')`), signatures (`def greet(name):`),
+    indexing (`arr[0]`), comments (`# ...`) and decorators (`@app.route`) --
+    while leaving ordinary names alone (`Q&A.md`, `a+b.txt`, `my file.txt`,
+    unicode names). A multi-word basename with no extension (`import os`,
+    `return x`) is a code line too: real extensionless files (Makefile,
+    LICENSE) are single tokens.
     """
     if not rel or len(rel) > 240:
         return False
     if any(ch in _IMPLAUSIBLE_PATH_CHARS for ch in rel):
         return False
     parts = Path(rel).parts
-    return bool(parts) and all(part and part == part.strip()
-                               and part not in (".", "..") for part in parts)
+    if not parts or not all(part and part == part.strip()
+                            and part not in (".", "..") for part in parts):
+        return False
+    name = parts[-1]
+    if " " in name and "." not in name:
+        return False
+    return True
 
 
 def _wipe_refusal(rel: str) -> str:
