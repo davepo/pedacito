@@ -22,12 +22,14 @@ re-`read` before it is quoted.
 from __future__ import annotations
 
 import ast
+import json
 import re
 
 STATE_HEAD = ("RESULT:\nSTATE (earlier lookups, folded to free context -- the "
               "source they showed is no longer in this conversation; re-`read` "
               "anything you need to quote exactly):")
-_FOLDED_ACTION = "{'action': 'outline', 'reasoning': 'earlier lookups folded'}"
+_FOLDED_ACTION = '{"action": "outline", "reasoning": "earlier lookups folded"}'
+_LEGACY_FOLDED_ACTION = "{'action': 'outline', 'reasoning': 'earlier lookups folded'}"
 _READ_HEAD_RX = re.compile(r"^(.+?) lines (\d+)-(\d+):")
 
 
@@ -41,6 +43,11 @@ def tail_pairs_for(cfg) -> int:
 
 
 def _parse_action(content: str) -> dict:
+    try:
+        obj = json.loads(content)
+        return obj if isinstance(obj, dict) else {}
+    except (ValueError, TypeError):
+        pass
     try:
         obj = ast.literal_eval(content)
         return obj if isinstance(obj, dict) else {}
@@ -85,7 +92,7 @@ def digest(band: list[dict], max_chars: int = 1400) -> str:
             i += 1
             continue
         if m["role"] == "assistant":
-            if content == _FOLDED_ACTION:      # the placeholder of an earlier fold
+            if content in (_FOLDED_ACTION, _LEGACY_FOLDED_ACTION):      # the placeholder of an earlier fold
                 i += 1
                 continue
             action = _parse_action(content)

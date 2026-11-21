@@ -516,22 +516,33 @@ def _evict_duplicate_reads(messages: list[dict], gathered: list[str],
     """
     if not spans or not any(len(seq) > 1 for seq in spans.values()):
         return gathered
-    deltas = _first_seen_spans(spans)
 
+    seen_g: dict[str, list[tuple[int, int]]] = {}
     new_items: list[str] = []
     for g in gathered:
-        head = g.split("\n", 1)[0]
-        if head.startswith("--- read ") and "\n" in g:
-            rest = head[len("--- read "):].strip()
-            key = _norm_key(rest.rsplit(" L", 1)[0])
-            body = g.split("\n", 1)[1]
-            keep = deltas.get(key)
-            if keep is None:
-                new_items.append(g)
-            else:
-                new_items.append(head + "\n" + _slice_numbered(body, keep))
-        else:
-            new_items.append(g)
+        head, sep, body = g.partition("\n")
+        if head.startswith("--- read ") and sep:
+            m = _READ_HEAD_RX.match(body)
+            if m:
+                key = _norm_key(m.group(1))
+                s_, e_ = int(m.group(2)), int(m.group(3))
+                prior = seen_g.get(key, [])
+                uncovered = _subtract_spans([(s_, e_)], prior)
+                if uncovered == [(s_, e_)]:
+                    new_items.append(g)
+                elif uncovered:
+                    new_items.append(head + "\n" + _slice_numbered(body, uncovered))
+                else:
+                    new_items.append(
+                        head + "\n"
+                        + f"{m.group(1).strip()} lines {s_}-{e_}: "
+                          "[all of these lines were duplicates of an earlier read]"
+                    )
+                shown_end = _delivered_end(body, s_)
+                if shown_end >= s_:
+                    seen_g[key] = _fold_spans(prior + [(s_, shown_end)])
+                continue
+        new_items.append(g)
 
     # Oldest -> newest, so each turn keeps only lines no earlier turn showed.
     for i, msg in enumerate(messages):
@@ -1257,7 +1268,7 @@ def _evict_overflow_turns(messages: list[dict], client, cfg) -> bool:
     est = getattr(client, "estimate_tokens", None) or estimate_tokens
 
     def over_by() -> int:
-        return sum(est(m["content"]) for m in messages) - room
+        return estimate_messages(messages, est) - room
 
     changed_any = False
     while over_by() > -headroom:
@@ -2138,7 +2149,8 @@ class Agent:
                 if fold_mod.fold_middle(messages, keep, max_chars):
                     self._after_fold(messages, est, before, client)
                     changed = True
-                if estimate_messages(messages, est) <= room or keep <= 1:
+                    break
+                if keep <= 1:
                     break
                 keep -= 1
         if estimate_messages(messages, est) > room:
@@ -2610,11 +2622,11 @@ class Agent:
                     prior = list(spans.get(key, []))
                     delta = _delta_len(obs, prior)
                     if delta > budget:
-                        obs = (obs[:budget] +
+                        obs = ((obs[:budget] if budget > 0 else "") +
                                "\n[truncated: context budget reached]")
                         budget = 0
                     else:
-                        budget -= delta
+                        budget = max(0, budget - delta)
                     # BUG-309: credit only the lines that survived the cut.
                     # The old order appended the full requested span BEFORE
                     # the budget cut, so lines never shown counted as read
@@ -2636,11 +2648,11 @@ class Agent:
                             f"\n{obs}")
                         changed = True
                 else:
-                    budget -= len(obs)
+                    budget = max(0, budget - len(obs))
                     self.requirements.observe_search(
                         act, payload, obs, self.index)
             else:
-                budget -= len(obs)
+                budget = max(0, budget - len(obs))
                 self.requirements.observe_search(act, payload, obs, self.index)
                 gathered.append(f"--- {act} {detail}\n{obs}")
                 changed = True
@@ -2740,12 +2752,12 @@ class Agent:
                 if "token limit" in msg or "valid json" in msg:
                     step_recoveries += 1
                     if step_recoveries <= _MAX_GATHER_RECOVERIES:
-                        messages.append({"role": "user", "content":
+                        harness_note(
                             "[Your last reply hit the output token limit and "
                             "contained no valid action. Choose your next "
                             "action now: put ONE short phrase in 'reasoning' "
                             "(under 10 words) and fill 'action' plus its "
-                            "fields. Reply with the JSON object only.]"})
+                            "fields. Reply with the JSON object only.]")
                         step -= 1        # the failed turn costs no step
                         continue
                     print(f"  [gather step failed: {str(e)[:120]}...]\n"
@@ -2814,7 +2826,7 @@ class Agent:
                                  "content": _compact(stepjson)})
                 messages.append({"role": "user",
                                  "content": f"{obs}\n\n{nudge(step + 1)}"})
-                budget -= len(obs)
+                budget = max(0, budget - len(obs))
                 self._fit(messages, gclient)
                 if verbose:
                     print(f"  [step {step} discarded: `{cut}` payload cut "
@@ -2862,7 +2874,7 @@ class Agent:
                                  "content": _compact(stepjson)})
                 messages.append({"role": "user",
                                  "content": f"{obs}\n\n{nudge(step + 1)}"})
-                budget -= len(obs)
+                budget = max(0, budget - len(obs))
                 self._fit(messages, gclient)
                 malformed_streak += 1
                 if verbose:
@@ -3227,7 +3239,7 @@ class Agent:
                                  "content": f"{obs}\n\n{nudge(step + 1)}"})
                 # Charge errors too, so a model repeating one failing step
                 # cannot loop forever at max_steps = 0.
-                budget -= len(obs)
+                budget = max(0, budget - len(obs))
                 self._fit(messages, gclient)
                 if error_streak >= _MAX_CONSECUTIVE_ERRORS:
                     if recover_on and recoveries["errors"] < 1 and budget > 0:
@@ -3271,7 +3283,8 @@ class Agent:
             # end dedups the conversation).
             if read_delta is not None:
                 if read_delta > budget:
-                    obs = obs[:budget] + "\n[truncated: context budget reached]"
+                    obs = ((obs[:budget] if budget > 0 else "") +
+                           "\n[truncated: context budget reached]")
                     budget = 0
                     # BUG-309: the span ledger already credited the header's
                     # range; the cut just removed lines the model never saw.
@@ -3285,11 +3298,14 @@ class Agent:
                         else:
                             seq.pop()
                 else:
-                    budget -= read_delta
+                    budget = max(0, budget - read_delta)
             else:
                 if len(obs) > budget:
-                    obs = obs[:budget] + "\n[truncated: context budget reached]"
-                budget -= len(obs)
+                    obs = ((obs[:budget] if budget > 0 else "") +
+                           "\n[truncated: context budget reached]")
+                    budget = 0
+                else:
+                    budget = max(0, budget - len(obs))
 
             if duplicate_read:
                 duplicate_reads += 1
@@ -3383,7 +3399,7 @@ class Agent:
         # show, so the answer phase sees every line once. The live
         # conversation is NOT rewritten: it is only needed for answer
         # continuation, which wants the cached prefix untouched.
-        new_items = _evict_duplicate_reads(list(messages), gathered, spans)
+        new_items = _evict_duplicate_reads([], gathered, spans)
         digest = self._read_digest(spans)
         if digest:
             new_items = new_items + [digest]
@@ -3634,7 +3650,7 @@ class Agent:
             else:
                 delta = len(obs)
             self._record_evidence(obs, 0)  # prefetch displays = step 0
-            budget -= delta
+            budget = max(0, budget - delta)
             gathered.append(f"--- read {rel}\n{obs}")
             self.steps_log.append(f"0. read {rel} L{start}-{end}  (prefetch)")
             messages.append({"role": "assistant", "content": _compact(stepjson)})
@@ -5773,4 +5789,4 @@ def _compact(step: dict) -> str:
     """Render a parsed step with empty fields dropped, to echo the model's
     action into the conversation history."""
     keep = {k: v for k, v in step.items() if v not in ("", 0, None)}
-    return str(keep)
+    return json.dumps(keep, ensure_ascii=False)

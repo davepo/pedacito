@@ -163,10 +163,35 @@ def test_hand_authored_files_always_allow_whole_rewrites(rel):
 def test_whole_rewrite_allowed_for_creative_and_restructure_briefs():
     assert prompts.whole_rewrite_allowed("redesign the dashboard", "big.py")
     assert prompts.whole_rewrite_allowed("reorganize the module", "big.py")
-    assert prompts.whole_rewrite_allowed("replace the config loader", "big.py")
+    assert prompts.whole_rewrite_allowed("restructure the module", "big.py")
+    assert not prompts.whole_rewrite_allowed("replace the config loader", "big.py")
+    assert not prompts.whole_rewrite_allowed("remove helper", "big.py")
+    assert not prompts.whole_rewrite_allowed("replace literal_eval", "big.py")
     assert not prompts.whole_rewrite_allowed("fix the bug", "big.py")
     # "rewrite"/"from scratch" stay with the small-window brake's warn path
     assert not prompts.whole_rewrite_allowed("rewrite big.py from scratch", "big.py")
+
+
+def test_backend_window_and_score_prompts_do_not_trigger_creative_mode():
+    for task in (
+        "fix context window overflow and BM25 score calculation",
+        "track sliding window score across chunks",
+        "fix hash collision in cache",
+        "add retry timer to rpc dialog handler",
+    ):
+        assert prompts.is_creative_or_design_task(task) is False, task
+    for gui_or_game in (
+        "build a tkinter window for settings",
+        "create a desktop dialog for preferences",
+        "render pygame game score on screen",
+    ):
+        assert prompts.is_creative_or_design_task(gui_or_game) is True, gui_or_game
+
+
+def test_bare_remove_and_replace_do_not_bypass_fragment_refusal():
+    before, after = _window_requote()
+    assert edits.fragment_refusal("mod.py", before, after, task="remove helper")
+    assert edits.fragment_refusal("mod.py", before, after, task="replace literal_eval")
 
 
 # ============================================ D2: warm, roomy, designer answers

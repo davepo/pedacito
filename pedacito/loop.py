@@ -4177,131 +4177,161 @@ def run_task(root: Path, cfg, client, agent, idx, task: str, *,
     the prompt's own @mentions are always parsed by Agent.gather.
     """
     from . import memory as memory_mod
+    has_saved_pinned = hasattr(cfg, "_pinned_refs")
+    saved_pinned = getattr(cfg, "_pinned_refs", None)
     if pinned is not None:
         cfg._pinned_refs = [str(p).lstrip("@").strip()
                             for p in pinned if str(p).strip()]
-    if _cancel_requested(cfg, client):
-        _emit_run_cancelled(root, cfg, "task", task=(task or "")[:200])
-        raise CancelledError("Stopped by user; no further work was done.")
-    writes = bool(apply) and not review
-    if apply or review:
-        # A review task writes only after a human sign-off, but the state
-        # before the proposal is exactly what an undo must restore, so the
-        # baseline is recorded here and the accepted review adds its child.
-        _checkpoint_task(root, cfg, task, "pre")
-    if not getattr(cfg, "_auto_step", 0):
-        # Standalone task (ask/chat/eval): no outer loop owns the static or
-        # contract baseline, so drop any leftover one and let _run_task_once
-        # record a fresh snapshot for this task.
-        cfg._static_baseline = None
-        cfg._contract_baseline = None
-        cfg._dom_baseline = None
-        # Standalone tasks route here; run_loop routes before it builds the
-        # agent (its _auto_step marker is set), so there is no double switch.
-        client, agent = _specialist_route(root, cfg, client, agent, idx,
-                                          task, is_repair)
-    # Opt-in trajectory export: wrap the client the task will actually use
-    # (and the agent that owns it) so every gather/answer/repair call is the
-    # real transcript. Capture is diagnostics: any failure here is ignored.
-    capture = None
     try:
-        capture = trajectories.begin(root, cfg, task, client)
-        if capture is not None:
-            client, agent = capture.install(client, agent)
-    except Exception:
+        if _cancel_requested(cfg, client):
+            _emit_run_cancelled(root, cfg, "task", task=(task or "")[:200])
+            raise CancelledError("Stopped by user; no further work was done.")
+        writes = bool(apply) and not review
+        if apply or review:
+            # A review task writes only after a human sign-off, but the state
+            # before the proposal is exactly what an undo must restore, so the
+            # baseline is recorded here and the accepted review adds its child.
+            _checkpoint_task(root, cfg, task, "pre")
+        if not getattr(cfg, "_auto_step", 0):
+            # Standalone task (ask/chat/eval): no outer loop owns the static or
+            # contract baseline, so drop any leftover one and let _run_task_once
+            # record a fresh snapshot for this task.
+            cfg._static_baseline = None
+            cfg._contract_baseline = None
+            cfg._dom_baseline = None
+            cfg._frontend_baseline = None
+            # Standalone tasks route here; run_loop routes before it builds the
+            # agent (its _auto_step marker is set), so there is no double switch.
+            client, agent = _specialist_route(root, cfg, client, agent, idx,
+                                              task, is_repair)
+        # Opt-in trajectory export: wrap the client the task will actually use
+        # (and the agent that owns it) so every gather/answer/repair call is the
+        # real transcript. Capture is diagnostics: any failure here is ignored.
         capture = None
+        try:
+            capture = trajectories.begin(root, cfg, task, client)
+            if capture is not None:
+                client, agent = capture.install(client, agent)
+        except Exception:
+            capture = None
 
-    def _finish_capture(result):
-        """Write the trajectory; every failure is the capture's, not the
-        task's. Kept here so a broken hook can never skip the task's return."""
-        try:
-            trajectories.finish(capture, root, cfg, result)
-        except Exception:
-            pass
-    # Split-stage hybrid: the architect plans before the editor runs. Repair
-    # rounds and scaffold/answer_system tasks keep their single-model path.
-    hybrid = None
-    if ((apply or review) and not is_repair and answer_system is None
-            and hybrid_active(cfg)):
-        hybrid = _hybrid_stage1(root, cfg, client, agent, idx, task)
-    saved_mode = getattr(cfg, "answer_mode", "")
-    if hybrid is not None:
-        # Stage 1 -> 2 handoff: give the editor's server the VRAM, then
-        # inject the blueprint. Continue mode reuses only the gather
-        # conversation, so Stage 2 must rebuild its context to see the plan.
-        _hybrid_evict(cfg, str(getattr(hybrid["client"].cfg, "base_url", "") or ""),
-                      str(getattr(cfg, "base_url", "") or ""))
-        label = f"Hybrid Stage 2 (Editor): {cfg.model}"
-        print(f"\n[{label}]", file=sys.stderr)
-        workspace.log_event(root, label)
-        try:
-            events_mod.get(root, cfg).emit(
-                "hybrid_stage", stage=2, role="editor",
-                model=str(getattr(cfg, "model", "") or ""),
-                provider=str(getattr(cfg, "active_profile", "") or ""),
-                label=label)
-        except Exception:
-            pass
-        cfg._hybrid_blueprint = hybrid["blueprint"]
-        cfg.answer_mode = "rebuild"
-    try:
-        tr = _run_ladder(root, cfg, client, agent, idx, task, apply=apply,
-                         review=review, answer_system=answer_system,
-                         is_repair=is_repair)
-    except BaseException:
-        # A cancelled or failed run still leaves the exchanged messages that
-        # did happen; write them before propagating the original exception.
-        _finish_capture(None)
-        raise
-    finally:
+        def _finish_capture(result):
+            """Write the trajectory; every failure is the capture's, not the
+            task's. Kept here so a broken hook can never skip the task's return."""
+            try:
+                trajectories.finish(capture, root, cfg, result)
+            except Exception:
+                pass
+        # Split-stage hybrid: the architect plans before the editor runs. Repair
+        # rounds and scaffold/answer_system tasks keep their single-model path.
+        hybrid = None
+        if ((apply or review) and not is_repair and answer_system is None
+                and hybrid_active(cfg)):
+            hybrid = _hybrid_stage1(root, cfg, client, agent, idx, task)
+        saved_mode = getattr(cfg, "answer_mode", "")
         if hybrid is not None:
-            cfg.answer_mode = saved_mode
-            cfg._hybrid_blueprint = ""
-    if hybrid is not None:
-        _hybrid_finish(root, cfg, client, hybrid, tr)
-    tr = _specialist_zero_edit_fallback(
-        root, cfg, client, idx, task, tr,
-        dict(apply=apply, review=review, answer_system=answer_system,
-             is_repair=is_repair))
-    if answer_system is not None or review or not getattr(cfg, "use_memory", True):
+            # Stage 1 -> 2 handoff: give the editor's server the VRAM, then
+            # inject the blueprint. Continue mode reuses only the gather
+            # conversation, so Stage 2 must rebuild its context to see the plan.
+            _hybrid_evict(cfg, str(getattr(hybrid["client"].cfg, "base_url", "") or ""),
+                          str(getattr(cfg, "base_url", "") or ""))
+            label = f"Hybrid Stage 2 (Editor): {cfg.model}"
+            print(f"\n[{label}]", file=sys.stderr)
+            workspace.log_event(root, label)
+            try:
+                events_mod.get(root, cfg).emit(
+                    "hybrid_stage", stage=2, role="editor",
+                    model=str(getattr(cfg, "model", "") or ""),
+                    provider=str(getattr(cfg, "active_profile", "") or ""),
+                    label=label)
+            except Exception:
+                pass
+            cfg._hybrid_blueprint = hybrid["blueprint"]
+            cfg.answer_mode = "rebuild"
+        try:
+            tr = _run_ladder(root, cfg, client, agent, idx, task, apply=apply,
+                             review=review, answer_system=answer_system,
+                             is_repair=is_repair)
+        except BaseException:
+            # A cancelled or failed run still leaves the exchanged messages that
+            # did happen; write them before propagating the original exception.
+            _finish_capture(None)
+            raise
+        finally:
+            if hybrid is not None:
+                cfg.answer_mode = saved_mode
+                cfg._hybrid_blueprint = ""
+        if hybrid is not None:
+            _hybrid_finish(root, cfg, client, hybrid, tr)
+        tr = _specialist_zero_edit_fallback(
+            root, cfg, client, idx, task, tr,
+            dict(apply=apply, review=review, answer_system=answer_system,
+                 is_repair=is_repair))
+        if answer_system is not None or review or not getattr(cfg, "use_memory", True):
+            if writes:
+                _checkpoint_task(root, cfg, task, "post")
+            _finish_capture(tr)
+            return tr
+        try:
+            if any(r.ok for r in tr.results) or tr.changed or _is_noop(tr.reply):
+                memory_mod.clear_attempts(root, task)
+                memory_mod.clear_zero_edit(root, cfg)
+                # The profile un-stuck itself: drop this task's lease strikes and
+                # any escalation suggestion its earlier failures queued up.
+                strikes = getattr(cfg, "_lease_strikes", None)
+                if strikes:
+                    strikes.pop(" ".join((task or "").split())[:200], None)
+                if getattr(cfg, "_pending_escalation_reason", ""):
+                    cfg._pending_escalation_reason = ""
+            else:
+                looked = [ln.split(None, 2)[-1][:60] for ln in tr.steps
+                          if " read " in f" {ln} "][:4]
+                why = ("fabricated edits" if tr.fabricated
+                       else "no valid edit was produced")
+                memory_mod.note_attempt(root, task, why, looked)
+                threshold = int(getattr(cfg, "escalation_zero_edit_runs", 3) or 0)
+                if threshold > 0:
+                    n = memory_mod.note_zero_edit(root, cfg)
+                    if n >= threshold:
+                        profile = getattr(cfg, "active_profile", "") or "(default)"
+                        _suggest_escalation(
+                            root, cfg,
+                            f"{n} consecutive zero-edit runs on profile "
+                            f"'{profile}'; a stronger model may succeed where "
+                            "this one keeps producing no usable edit",
+                            pending=True)
+        except Exception:
+            pass
         if writes:
             _checkpoint_task(root, cfg, task, "post")
         _finish_capture(tr)
         return tr
-    try:
-        if any(r.ok for r in tr.results) or tr.changed or _is_noop(tr.reply):
-            memory_mod.clear_attempts(root, task)
-            memory_mod.clear_zero_edit(root, cfg)
-            # The profile un-stuck itself: drop this task's lease strikes and
-            # any escalation suggestion its earlier failures queued up.
-            strikes = getattr(cfg, "_lease_strikes", None)
-            if strikes:
-                strikes.pop(" ".join((task or "").split())[:200], None)
-            if getattr(cfg, "_pending_escalation_reason", ""):
-                cfg._pending_escalation_reason = ""
-        else:
-            looked = [ln.split(None, 2)[-1][:60] for ln in tr.steps
-                      if " read " in f" {ln} "][:4]
-            why = ("fabricated edits" if tr.fabricated
-                   else "no valid edit was produced")
-            memory_mod.note_attempt(root, task, why, looked)
-            threshold = int(getattr(cfg, "escalation_zero_edit_runs", 3) or 0)
-            if threshold > 0:
-                n = memory_mod.note_zero_edit(root, cfg)
-                if n >= threshold:
-                    profile = getattr(cfg, "active_profile", "") or "(default)"
-                    _suggest_escalation(
-                        root, cfg,
-                        f"{n} consecutive zero-edit runs on profile "
-                        f"'{profile}'; a stronger model may succeed where "
-                        "this one keeps producing no usable edit",
-                        pending=True)
-    except Exception:
-        pass
-    if writes:
-        _checkpoint_task(root, cfg, task, "post")
-    _finish_capture(tr)
-    return tr
+    finally:
+        if pinned is not None:
+            if has_saved_pinned:
+                cfg._pinned_refs = saved_pinned
+            elif hasattr(cfg, "_pinned_refs"):
+                delattr(cfg, "_pinned_refs")
+
+
+def _rollback_attempt(root: Path, cfg, attempt_tr: TaskResult | None,
+                      idx=None):
+    bdir = getattr(attempt_tr, "backup_dir", None) if attempt_tr else None
+    cur_idx = idx if idx is not None else getattr(attempt_tr, "idx", None)
+    if not bdir:
+        return cur_idx
+    bpath = Path(bdir)
+    if not bpath.is_dir():
+        return cur_idx
+    restored = workspace.restore(root, bpath)
+    workspace.delete_created(root, bpath)
+    if cur_idx is not None:
+        for rel in restored:
+            try:
+                cur_idx = index_mod.reindex_file(cur_idx, rel, cfg)
+            except Exception:
+                pass
+    return cur_idx
 
 
 def _run_ladder(root: Path, cfg, client, agent, idx, task: str, *,
@@ -4364,10 +4394,18 @@ def _run_ladder(root: Path, cfg, client, agent, idx, task: str, *,
         workspace.log_event(root, f"escalating task to the escalate role: "
                                   f"{reason}", "WARN")
         from .agent import Agent
-        tr2 = _run_task_once(root, cfg, esc, Agent(tr.idx, esc, cfg), tr.idx,
-                             task, **kw)
+        wrote1 = (tr.applied or bool(tr.changed)
+                  or any(r.ok for r in tr.results)
+                  or bool(getattr(cfg, "_task_mutations", None)))
+        base_idx = tr.idx
+        if apply and wrote1 and getattr(tr, "tests_ok", None) is not True:
+            base_idx = _rollback_attempt(root, cfg, tr, base_idx)
+        cfg._task_mutations = []
+        tr2 = _run_task_once(root, cfg, esc, Agent(base_idx, esc, cfg),
+                             base_idx, task, **kw)
         landed2 = any(r.ok for r in tr2.results) or bool(tr2.changed)
         if not landed2:
+            _rollback_attempt(root, cfg, tr2)
             return tr
         landed1 = tr.applied and (any(r.ok for r in tr.results) or tr.changed)
         # Keep the first attempt only when it landed a GREEN result and the
@@ -4375,6 +4413,7 @@ def _run_ladder(root: Path, cfg, client, agent, idx, task: str, *,
         # wins (it was asked precisely because the first verdict was broken).
         if landed1 and getattr(tr, "tests_ok", None) is True \
                 and getattr(tr2, "tests_ok", None) is False:
+            _rollback_attempt(root, cfg, tr2)
             return tr
         return tr2
     if reason and apply and esc is client:
@@ -4398,17 +4437,26 @@ def _run_ladder(root: Path, cfg, client, agent, idx, task: str, *,
         workspace.log_event(root, f"strategy_shift: edit_style {style} -> "
                                   f"{flipped}: {reason}", "WARN")
         from .agent import Agent
+        wrote1 = (tr.applied or bool(tr.changed)
+                  or any(r.ok for r in tr.results)
+                  or bool(getattr(cfg, "_task_mutations", None)))
+        base_idx = tr.idx
+        if apply and wrote1:
+            base_idx = _rollback_attempt(root, cfg, tr, base_idx)
+        cfg._task_mutations = []
         cfg.edit_style = flipped
         try:
-            tr2 = _run_task_once(root, cfg, client, Agent(tr.idx, client, cfg),
-                                 tr.idx, task, **kw)
+            tr2 = _run_task_once(root, cfg, client, Agent(base_idx, client, cfg),
+                                 base_idx, task, **kw)
         finally:
             cfg.edit_style = style
         landed2 = tr2.applied and (any(r.ok for r in tr2.results) or tr2.changed)
         if not landed2:
+            _rollback_attempt(root, cfg, tr2)
             return tr                     # the retry landed nothing: keep first
         if getattr(tr, "tests_ok", None) is False \
                 and getattr(tr2, "tests_ok", None) is False:
+            _rollback_attempt(root, cfg, tr2)
             return tr                     # both proven red: keep the first
         return tr2
     if esc is client or (tr.applied
@@ -4423,9 +4471,21 @@ def _run_ladder(root: Path, cfg, client, agent, idx, task: str, *,
     workspace.log_event(root, "escalating a failed task to the escalate role",
                         "WARN")
     from .agent import Agent
-    tr2 = _run_task_once(root, cfg, esc, Agent(tr.idx, esc, cfg), tr.idx, task,
-                         **kw)
-    return tr2 if any(r.ok for r in tr2.results) else tr
+    wrote1 = (tr.applied or bool(tr.changed)
+              or any(r.ok for r in tr.results)
+              or bool(getattr(cfg, "_task_mutations", None)))
+    base_idx = tr.idx
+    if apply and wrote1:
+        base_idx = _rollback_attempt(root, cfg, tr, base_idx)
+    cfg._task_mutations = []
+    tr2 = _run_task_once(root, cfg, esc, Agent(base_idx, esc, cfg), base_idx,
+                         task, **kw)
+    landed2 = any(r.ok for r in tr2.results) or (
+        not tr2.results and bool(tr2.changed))
+    if not landed2:
+        _rollback_attempt(root, cfg, tr2)
+        return tr
+    return tr2
 
 
 def _run_task_once(root: Path, cfg, client, agent, idx, task: str, *,

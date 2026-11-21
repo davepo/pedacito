@@ -233,3 +233,97 @@ def test_style_restored_even_when_the_retry_raises(tmp_path, monkeypatch):
     with pytest.raises(RuntimeError):
         loop._run_ladder(tmp_path, cfg, "weak", object(), None, "t")
     assert cfg.edit_style == "anchor"
+
+
+def test_run_ladder_rolls_back_attempt1_before_attempt2_and_attempt2_on_rejection(
+        tmp_path, monkeypatch):
+    from pedacito import roles
+    target = tmp_path / "app.py"
+    target.write_text("ORIGINAL\n", encoding="utf-8")
+    b1 = tmp_path / "b1"
+    b2 = tmp_path / "b2"
+    b1.mkdir()
+    b2.mkdir()
+    seen_disk: list[str] = []
+    seen_mutations: list[list] = []
+
+    def fake_once(root, cfg, client, agent, idx, task, **kw):
+        seen_disk.append(target.read_text(encoding="utf-8"))
+        seen_mutations.append(list(getattr(cfg, "_task_mutations", [])))
+        if client == "weak":
+            (b1 / "app.py").write_text("ORIGINAL\n", encoding="utf-8")
+            target.write_text("ATTEMPT_1_BROKEN\n", encoding="utf-8")
+            cfg._task_mutations.append("app.py")
+            cfg._task_escalation_reason = "semantic failure"
+            return loop.TaskResult(
+                results=[SimpleNamespace(ok=True)], reply="done1",
+                applied=True, changed=["app.py"], idx=idx,
+                tests_ok=False, backup_dir=b1,
+            )
+        (b2 / "app.py").write_text(target.read_text(encoding="utf-8"),
+                                   encoding="utf-8")
+        target.write_text("ATTEMPT_2_WORSE\n", encoding="utf-8")
+        cfg._task_mutations.append("app.py")
+        return loop.TaskResult(
+            results=[SimpleNamespace(ok=True)], reply="done2",
+            applied=True, changed=["app.py"], idx=idx,
+            tests_ok=False, backup_dir=b2,
+        )
+
+    monkeypatch.setattr(loop, "_run_task_once", fake_once)
+    monkeypatch.setattr(roles, "client_for",
+                        lambda cfg, role, c: "strong" if role == "escalate" else c)
+    monkeypatch.setattr("pedacito.agent.Agent", lambda idx, c, cfg: object())
+
+    # Attempt 1 is red and Attempt 2 is not green -> Attempt 2 wins in Block 1
+    # only if Attempt 2 isn't rejected; test Block 2 (strategy shift) where
+    # both proven red keeps Attempt 1 and MUST roll back Attempt 2's backup.
+    monkeypatch.setattr(roles, "client_for", lambda cfg, role, c: c)
+    cfg = _cfg(reason="semantic failure")
+    tr = loop._run_ladder(tmp_path, cfg, "weak", object(), None, "t")
+    assert tr.reply == "done1"
+    # Attempt 2 saw the restored ORIGINAL bytes and reset _task_mutations.
+    assert seen_disk == ["ORIGINAL\n", "ORIGINAL\n"]
+    assert seen_mutations == [[], []]
+    # Attempt 2's rejected edits were rolled back from b2.
+    assert target.read_text(encoding="utf-8") == "ORIGINAL\n"
+
+
+def test_run_ladder_accepts_gather_phase_writes_on_escalation(tmp_path, monkeypatch):
+    from pedacito import roles
+
+    def fake_once(root, cfg, client, agent, idx, task, **kw):
+        if client == "weak":
+            return loop.TaskResult(results=[], reply="failed", applied=False,
+                                   changed=[], idx=idx, tests_ok=None)
+        return loop.TaskResult(results=[], reply="wrote in gather", applied=True,
+                               changed=["app.py"], idx=idx, tests_ok=True)
+
+    monkeypatch.setattr(loop, "_run_task_once", fake_once)
+    monkeypatch.setattr(roles, "client_for",
+                        lambda cfg, role, c: "strong" if role == "escalate" else c)
+    monkeypatch.setattr("pedacito.agent.Agent", lambda idx, c, cfg: object())
+    tr = loop._run_ladder(tmp_path, _cfg(reason=""), "weak", object(), None, "t")
+    assert tr.changed == ["app.py"] and tr.applied is True
+
+
+def test_run_task_clears_frontend_baseline_and_restores_pinned_refs(
+        tmp_path, monkeypatch):
+    cfg = Config()
+    cfg._frontend_baseline = {"stale": True}
+    cfg._pinned_refs = ["old.py"]
+    monkeypatch.setattr(loop, "_run_ladder",
+                        lambda *a, **kw: (_ for _ in ()).throw(RuntimeError("boom")))
+    with pytest.raises(RuntimeError, match="boom"):
+        loop.run_task(tmp_path, cfg, object(), object(), None, "task",
+                      apply=False, pinned=["@new.py"])
+    assert cfg._frontend_baseline is None
+    assert cfg._pinned_refs == ["old.py"]
+
+    cfg2 = Config()
+    monkeypatch.setattr(loop, "_run_ladder",
+                        lambda *a, **kw: loop.TaskResult(
+                            results=[], reply="ok", applied=False, changed=[], idx=None))
+    loop.run_task(tmp_path, cfg2, object(), object(), None, "task",
+                  apply=False, pinned=["@new.py"])
+    assert not hasattr(cfg2, "_pinned_refs")

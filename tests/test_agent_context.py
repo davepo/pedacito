@@ -618,3 +618,83 @@ def test_a_failing_test_that_failed_before_the_edit_is_not_blamed_on_it(tmp_path
     # ...and the run says the remaining red is pre-existing, not silent.
     err = capsys.readouterr().err
     assert "predate it and were not auto-repaired" in err
+
+
+def test_evict_duplicate_reads_deduplicates_gathered_incrementally():
+    from pedacito.agent import _evict_duplicate_reads
+    lines = [f"{i:4d} | line_{i}" for i in range(1, 16)]
+    obs1 = "mod.py lines 1-10:\n" + "\n".join(lines[:10])
+    obs2 = "mod.py lines 5-15:\n" + "\n".join(lines[4:15])
+    gathered = [f"--- read mod.py\n{obs1}", f"--- read mod.py\n{obs2}"]
+    new_items = _evict_duplicate_reads([], gathered, {"mod.py": [(1, 10), (5, 15)]})
+    assert len(new_items) == 2
+    assert "   1 | line_1" in new_items[0] and "  10 | line_10" in new_items[0]
+    assert "   5 | line_5" not in new_items[1]
+    assert "  10 | line_10" not in new_items[1]
+    assert "  11 | line_11" in new_items[1] and "  15 | line_15" in new_items[1]
+
+
+def test_fold_uses_valid_json_and_parses_both_json_and_legacy():
+    import json
+    from pedacito.agent import _compact
+    parsed = json.loads(fold._FOLDED_ACTION)
+    assert parsed["action"] == "outline"
+    compact_str = _compact({"action": "read", "file": "a.py", "start": 1, "end": 5, "pattern": ""})
+    assert json.loads(compact_str) == {"action": "read", "file": "a.py", "start": 1, "end": 5}
+    assert fold._parse_action(compact_str)["file"] == "a.py"
+    assert fold._parse_action("{'action': 'grep', 'pattern': 'x'}")["pattern"] == "x"
+
+
+def test_gather_negative_budget_guard_never_slices_from_end(tmp_path):
+    files = {"a.py": "\n".join(f"secret_line_{i} = {i}" for i in range(1, 50)) + "\n"}
+    # First step (grep/error) consumes more than max_gathered_chars (20), pushing
+    # budget to 0 (previously negative). Second step reads a.py; obs[:budget]
+    # must NOT slice from the end and leak lines 1..48!
+    steps = [
+        {"action": "read", "file": "missing_file.py", "start": 1, "end": 10},
+        _read("a.py", 1, 40),
+        {"action": "done"},
+    ]
+    client = Scripted(steps)
+    agent = _agent(tmp_path, client, files, max_gathered_chars=20, stuck_recovery=False)
+    gathered = agent.gather("read a.py", verbose=False)
+    assert "secret_line_10" not in gathered
+    assert "secret_line_20" not in gathered
+
+
+def test_fit_folds_at_most_once_per_turn(tmp_path):
+    client = Scripted([])
+    agent = _agent(tmp_path, client, BIG, context_tokens=700, max_tokens_step=100,
+                   reserve_tokens=100, fold_tail_steps=4)
+    msgs = [{"role": "system", "content": "SYS"}, {"role": "user", "content": "MAP+TASK"}]
+    for i in range(8):
+        msgs += [
+            {"role": "assistant", "content": f'{{"action": "read", "file": "big.py", "start": {i + 1}, "end": {i + 5}}}'},
+            {"role": "user", "content": "RESULT:\n" + ("x" * 400 + "\n") * 5},
+        ]
+    agent._fit(msgs, client)
+    assert agent.fold_count == 1
+    assert agent._lossy is True
+
+
+def test_json_parse_recovery_preserves_alternating_roles(tmp_path):
+    class FlakyClient(Scripted):
+        def __init__(self):
+            super().__init__([_read("big.py", 1, 5), {"action": "done"}])
+            self.call_idx = 0
+
+        def chat_json(self, messages, schema, max_tokens, **kw):
+            self.json_calls.append([dict(m) for m in messages])
+            self.call_idx += 1
+            if self.call_idx == 2:
+                raise LLMError("output hit token limit; no valid json")
+            step = self.steps.pop(0) if self.steps else {"action": "done"}
+            return {"reasoning": "ok", **step}
+
+    client = FlakyClient()
+    agent = _agent(tmp_path, client, BIG, stuck_recovery=False)
+    agent.gather("check big.py", verbose=False)
+    assert len(client.json_calls) == 3
+    for call in client.json_calls:
+        roles = [m["role"] for m in call]
+        assert all(roles[i] != roles[i + 1] for i in range(len(roles) - 1)), roles

@@ -502,14 +502,26 @@ _CREATIVE_CONTEXT_RE = re.compile(
 _GUI_KEYWORD_RE = re.compile(
     r"(?i)\b(?:"
     r"calculator|gui|tkinter|ttk|customtkinter|pyqt[56]?|pyside[26]?|"
-    r"wxpython|kivy|desktop[ -]?app|window|dialog|widget|keypad|"
-    r"button[ -]?grid|converter|timer|stopwatch|notepad|dashboard|visualizer"
+    r"wxpython|kivy|desktop[ -]?app|"
+    r"(?:tkinter|gui|desktop|app|main|modal|popup|dialog|resizable)\s+window|"
+    r"(?:desktop|modal|settings|confirm(?:ation)?|preferences|about|popup|gui)\s+dialog|"
+    r"dialog\s+(?:box|window)|"
+    r"widget|keypad|button[ -]?grid|"
+    r"(?:currency|unit|temperature)\s+converter|"
+    r"(?:countdown|pomodoro|desktop|gui)\s+timer|"
+    r"stopwatch|notepad|dashboard|visualizer"
     r")\b")
 _GAME_KEYWORD_RE = re.compile(
     r"(?i)\b(?:"
-    r"game|arcade|pygame|phaser|three\.js|webgl|sprite|tilemap|collision|"
-    r"particle|physics|asteroids|snake|breakout|tetris|pong|platformer|"
-    r"roguelike|chess|puzzle|score|hud|animation"
+    r"game|arcade|pygame|phaser|three\.js|webgl|sprite|tilemap|"
+    r"(?:sprite|pixel|bounding|player|enemy|bullet|game)\s+collision|"
+    r"collision\s+detection|"
+    r"particle\s+(?:effects?|systems?|emitters?|bursts?)|"
+    r"(?:game|2d|3d)\s+physics|physics\s+(?:engine|loop|step)|"
+    r"asteroids|snake|breakout|tetris|pong|platformer|"
+    r"roguelike|chess|puzzle|"
+    r"(?:game|high|live|player)\s+score|score\s*(?:hud|board|counter|display)|scoreboard|"
+    r"hud|animation"
     r")\b")
 
 
@@ -540,7 +552,7 @@ def is_creative_or_design_task(task: str, target_files=None) -> bool:
 # small-window brake's own `_asks_file_rewrite` warn path.
 _RESTRUCTURE_RE = re.compile(
     r"(?i)\b(?:redesign|restyle|reorganize|reorganise|restructure|"
-    r"rearrange|reorder|replace|remove)\b")
+    r"rearrange|reorder)\b")
 
 
 def whole_rewrite_allowed(task: str, rel: str) -> bool:
