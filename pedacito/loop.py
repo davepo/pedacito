@@ -4414,7 +4414,7 @@ def _run_ladder(root: Path, cfg, client, agent, idx, task: str, *,
         workspace.log_event(root, f"escalating task to the escalate role: "
                                   f"{reason}", "WARN")
         from .agent import Agent
-        wrote1 = (tr.applied or bool(tr.changed)
+        wrote1 = (tr.applied or bool(getattr(tr, "changed", None))
                   or any(r.ok for r in tr.results)
                   or bool(getattr(cfg, "_task_mutations", None)))
         base_idx = tr.idx
@@ -4423,11 +4423,11 @@ def _run_ladder(root: Path, cfg, client, agent, idx, task: str, *,
         cfg._task_mutations = []
         tr2 = _run_task_once(root, cfg, esc, Agent(base_idx, esc, cfg),
                              base_idx, task, **kw)
-        landed2 = any(r.ok for r in tr2.results) or bool(tr2.changed)
+        landed2 = any(r.ok for r in tr2.results) or bool(getattr(tr2, "changed", None))
         if not landed2:
             _rollback_attempt(root, cfg, tr2)
             return tr
-        landed1 = tr.applied and (any(r.ok for r in tr.results) or tr.changed)
+        landed1 = tr.applied and (any(r.ok for r in tr.results) or bool(getattr(tr, "changed", None)))
         # Keep the first attempt only when it landed a GREEN result and the
         # escalated one came back red; otherwise the stronger model's work
         # wins (it was asked precisely because the first verdict was broken).
@@ -4442,7 +4442,7 @@ def _run_ladder(root: Path, cfg, client, agent, idx, task: str, *,
         # the SAME client and budgets with the edit style flipped: a model
         # stuck on exact-quote SEARCH blocks often lands SYMBOL splices, and
         # vice versa. Green runs never reach this branch.
-        landed1 = tr.applied and (any(r.ok for r in tr.results) or tr.changed)
+        landed1 = tr.applied and (any(r.ok for r in tr.results) or bool(getattr(tr, "changed", None)))
         if getattr(tr, "tests_ok", None) is True:
             return tr                     # green: nothing to recover
         if landed1 and getattr(tr, "tests_ok", None) is not False:
@@ -4457,7 +4457,7 @@ def _run_ladder(root: Path, cfg, client, agent, idx, task: str, *,
         workspace.log_event(root, f"strategy_shift: edit_style {style} -> "
                                   f"{flipped}: {reason}", "WARN")
         from .agent import Agent
-        wrote1 = (tr.applied or bool(tr.changed)
+        wrote1 = (tr.applied or bool(getattr(tr, "changed", None))
                   or any(r.ok for r in tr.results)
                   or bool(getattr(cfg, "_task_mutations", None)))
         base_idx = tr.idx
@@ -4470,7 +4470,7 @@ def _run_ladder(root: Path, cfg, client, agent, idx, task: str, *,
                                  base_idx, task, **kw)
         finally:
             cfg.edit_style = style
-        landed2 = tr2.applied and (any(r.ok for r in tr2.results) or tr2.changed)
+        landed2 = tr2.applied and (any(r.ok for r in tr2.results) or bool(getattr(tr2, "changed", None)))
         if not landed2:
             _rollback_attempt(root, cfg, tr2)
             return tr                     # the retry landed nothing: keep first
@@ -4480,7 +4480,7 @@ def _run_ladder(root: Path, cfg, client, agent, idx, task: str, *,
             return tr                     # both proven red: keep the first
         return tr2
     if esc is client or (tr.applied
-                         and (any(r.ok for r in tr.results) or tr.changed)):
+                         and (any(r.ok for r in tr.results) or bool(getattr(tr, "changed", None)))):
         return tr
     if any(r.ok for r in tr.results) and not apply:
         return tr                      # a dry run that produced a valid diff
@@ -4491,7 +4491,7 @@ def _run_ladder(root: Path, cfg, client, agent, idx, task: str, *,
     workspace.log_event(root, "escalating a failed task to the escalate role",
                         "WARN")
     from .agent import Agent
-    wrote1 = (tr.applied or bool(tr.changed)
+    wrote1 = (tr.applied or bool(getattr(tr, "changed", None))
               or any(r.ok for r in tr.results)
               or bool(getattr(cfg, "_task_mutations", None)))
     base_idx = tr.idx
@@ -4501,7 +4501,7 @@ def _run_ladder(root: Path, cfg, client, agent, idx, task: str, *,
     tr2 = _run_task_once(root, cfg, esc, Agent(base_idx, esc, cfg), base_idx,
                          task, **kw)
     landed2 = any(r.ok for r in tr2.results) or (
-        not tr2.results and bool(tr2.changed))
+        not tr2.results and bool(getattr(tr2, "changed", None)))
     if not landed2:
         _rollback_attempt(root, cfg, tr2)
         return tr

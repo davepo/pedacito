@@ -587,7 +587,7 @@ def test_failed_anchor_retry_offers_the_lines_anchor(tmp_path):
     agent, cfg, idx = _files(tmp_path, {"a.py": "def f():\n    return 1\n"})
     prompts: list[list[dict]] = []
     doomed = ("--- FILE: a.py\n<<<<<<< SEARCH\n"
-              "    def f():\n        return 1\n=======\n"
+              "def f():\n    return 99\n=======\n"
               "def f():\n    return 2\n>>>>>>> REPLACE\n")
 
     class Scripted:

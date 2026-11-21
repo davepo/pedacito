@@ -342,7 +342,7 @@ def catalog(cfg) -> list[tuple[str, str, str]]:
             down = any("(unavailable)" in e[0] for e in cached)
             if not down or time.time() - _CATALOG_TIME.get(key, 0.0) \
                     < _RETRY_UNAVAILABLE_AFTER:
-                return list(cached)
+                return cached
             _CATALOG_CACHE.pop(key, None)
     out: list[tuple[str, str, str]] = []
     for name, cmd in server_names(servers).items():
@@ -371,7 +371,7 @@ def catalog(cfg) -> list[tuple[str, str, str]]:
     with _CATALOG_LOCK:
         _CATALOG_CACHE[key] = out
         _CATALOG_TIME[key] = time.time()
-    return list(out)
+    return out
 
 
 _TYPE_NAMES = {"string": str, "integer": int, "number": (int, float),

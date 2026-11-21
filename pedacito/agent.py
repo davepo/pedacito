@@ -3166,7 +3166,7 @@ class Agent:
             if len(recent_steps) > _OSCILLATION_WINDOW:
                 del recent_steps[:-_OSCILLATION_WINDOW]
             osc_period = _detect_oscillation(recent_steps)
-            if osc_period:
+            if osc_period and recover_on:
                 cycle = " -> ".join(
                     f"{a}({t})" if t else a
                     for a, t in recent_steps[-osc_period:])

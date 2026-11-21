@@ -504,7 +504,12 @@ def locate(haystack: str, needle: str, cfg=None,
     if hit is not None:
         start, stop, win_base, need_base = hit
         if win_base != need_base and repl.strip():
-            delta = len(win_base.expandtabs(4)) - len(need_base.expandtabs(4))
+            win_w = len(win_base.expandtabs(4))
+            need_w = len(need_base.expandtabs(4))
+            delta = win_w - need_w
+            rep_w = len(_common_indent(repl.split("\n")).expandtabs(4))
+            if delta < 0 and rep_w < -delta:
+                delta = win_w - rep_w
             repl = _shift_indent(repl, delta, win_base)
         return Span(start, stop, repl)
     if haystack.count(needle) > 1:
