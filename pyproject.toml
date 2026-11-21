@@ -86,6 +86,7 @@ packages = ["pedacito", "pedacito.gui"]
 # The browser GUI's page, stylesheet and scripts are served from the package.
 [tool.setuptools.package-data]
 "pedacito.gui" = ["static/*"]
+"pedacito" = ["locales/*.json"]
 
 # `pedacito how` reads these files at runtime. Keep them in a normal
 # (non-editable) install as well as in a checkout. The modular guides keep

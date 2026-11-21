@@ -933,6 +933,35 @@ def static_site_rules(cfg, task: str) -> str:
             else STATIC_SITE_RULES)
 
 
+def effective_reply_language(cfg) -> str:
+    """The language the model's prose should use: ``"es"``, ``"en"``, or
+    ``"auto"``. ``"es"`` when ``llm_reply_language`` is ``"es"``, or when it is
+    ``"match_ui"`` and the interface ``language`` is ``"es"``. ``"auto"`` maps
+    to itself (the model decides); anything else is English."""
+    llm = getattr(cfg, "llm_reply_language", "match_ui") or "match_ui"
+    if llm == "es":
+        return "es"
+    if llm == "auto":
+        return "auto"
+    if llm == "match_ui":
+        language = getattr(cfg, "language", "en") or "en"
+        return "es" if language == "es" else "en"
+    return "en"
+
+
+_REPLY_LANGUAGE_DIRECTIVE = (
+    "Language: Write all prose explanations, summaries, and questions to the "
+    "user in neutral Latin American Spanish. Keep all code, identifiers, file "
+    "paths, and SEARCH/REPLACE or SYMBOL edit markers verbatim in English."
+)
+
+
+def reply_language_directive(cfg) -> str:
+    """The one-line reply-language instruction, or ``""`` when the run is not
+    Spanish (so every existing English prompt stays byte-identical)."""
+    return _REPLY_LANGUAGE_DIRECTIVE if effective_reply_language(cfg) == "es" else ""
+
+
 def answer_system(cfg, full_edit_format: str, task: str = "",
                   creative: bool = False) -> str:
     """The default answer-phase system prompt for the run. A task about
@@ -965,6 +994,11 @@ def answer_system(cfg, full_edit_format: str, task: str = "",
         static_rules = static_site_rules(cfg, task)
         if static_rules:
             text += "\n\n" + static_rules
+    # The reply-language directive rides last: it must reach every answer brief
+    # when the user asked for Spanish prose, and cost nothing otherwise.
+    directive = reply_language_directive(cfg)
+    if directive:
+        text += "\n\n" + directive
     return text
 
 
@@ -1043,6 +1077,10 @@ def fingerprint(cfg, *texts: str) -> str:
     for name in ("gather", "edit_format", "answer", "explain"):
         h.update(load_override(cfg, name).encode())
     h.update(load_project_rules(getattr(cfg, "_root", None)).encode())
+    # Only a Spanish reply changes the fingerprint: existing English runs keep
+    # their old hashes, so prompt-cache keys and event hashes stay stable.
+    if effective_reply_language(cfg) == "es":
+        h.update(b"reply_language=es")
     for t in texts:
         h.update(t.encode("utf-8", "replace"))
     return h.hexdigest()[:12]

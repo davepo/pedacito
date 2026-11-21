@@ -15,6 +15,7 @@ no-index case.
 
 from __future__ import annotations
 
+from . import prompts
 from .tools import TOOL_HELP
 
 # Gather framing for answering rather than editing; Agent.gather appends the
@@ -95,7 +96,14 @@ def answer(agent, question: str, verbose: bool = True, on_step=None,
     """
     gathered = agent.gather(question, verbose=verbose,
                             base=EXPLAIN_GATHER_BASE, on_step=on_step)
-    reply = agent.answer(question, gathered, system=EXPLAIN_SYSTEM,
+    # `explain` assembles its answer brief here, so the reply-language
+    # directive is appended at the same point the `answer` flow appends it in
+    # `prompts.answer_system`. Empty (and therefore byte-identical) for English.
+    system = EXPLAIN_SYSTEM
+    directive = prompts.reply_language_directive(getattr(agent, "cfg", None))
+    if directive:
+        system = system.rstrip() + "\n\n" + directive
+    reply = agent.answer(question, gathered, system=system,
                          include_edit_format=False, stream=stream)
     # P1a shadow mode: log prose-grounding findings (citations, ungrounded
     # identifiers, unaddressed requirements), never act on them.

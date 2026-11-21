@@ -1000,6 +1000,16 @@ class Config:
     # Colorscheme of `pedacito gui`. Purely cosmetic: applying it never
     # reloads the project. Unknown names fall back to the built-in default.
     gui_theme: str = "slate"
+    # Interface language: "en" or "es". Menus, messages and the GUI/TUI chrome
+    # are localised from pedacito/locales/<code>.json; the CLI flag,
+    # PEDACITO_LANG (alias PEDACITO_LANGUAGE) and this key all feed
+    # i18n.detect_lang, and saving a choice persists it here.
+    language: str = "en"
+    # What language the model writes its prose explanations in. "match_ui"
+    # follows `language`; "es" forces neutral Latin American Spanish prose
+    # (code, identifiers, paths and edit markers stay English); "auto" leaves
+    # it to the model; "en" forces English.
+    llm_reply_language: str = "match_ui"
     # Parent folder for the built-in model benchmark projects. Empty = a
     # `benchmarks/` folder beside the currently open project (or ./benchmarks
     # when no project is open). Each run gets its own generated subfolder.
@@ -1151,6 +1161,8 @@ _ENUM_FIELDS = {
                   "jazz_solo", "trapper_keeper", "memphis_arcade", "windbreaker"),
     "reasoning_effort": ("default", "low", "medium", "high"),
     "update_channel": ("stable", "any"),
+    "language": ("en", "es"),
+    "llm_reply_language": ("match_ui", "auto", "en", "es"),
 }
 _ENUM_EMPTY_OK = ("prompt_pack", "answer_mode")
 
@@ -1689,6 +1701,12 @@ def load(root: Path | None = None, explicit: Path | None = None,
                 continue
             setattr(cfg, key, _parse_env(key, raw))
             cfg.sources[key] = f"env PEDACITO_{key.upper()}"
+        # PEDACITO_LANG is a short alias for PEDACITO_LANGUAGE, and wins when
+        # both are set (matching the i18n.detect_lang precedence).
+        lang_alias = os.environ.get("PEDACITO_LANG")
+        if lang_alias is not None:
+            cfg.language = _parse_env("language", lang_alias)
+            cfg.sources["language"] = "env PEDACITO_LANG"
 
     # Tiered local MoE servers (Strata/Avalon) reason before they answer:
     # floor their output budgets and pin one stream. Hosted APIs with a
@@ -3171,6 +3189,15 @@ check_for_updates = true
 # update_channel: "stable" ignores pre/dev/rc/alpha/beta PyPI releases; "any"
 # includes them (PEDACITO_UPDATE_CHANNEL overrides).
 update_channel = "stable"
+# language: interface language, "en" or "es". Menus, messages and the GUI/TUI
+# chrome localise from pedacito/locales/<code>.json; the CLI flag, PEDACITO_LANG
+# (alias PEDACITO_LANGUAGE) and this key feed i18n.detect_lang.
+# language = "en"
+# llm_reply_language: what language the model writes its prose in. "match_ui"
+# follows `language`; "es" forces neutral Latin American Spanish prose (code,
+# identifiers, paths and edit markers stay English); "auto" leaves it to the
+# model; "en" forces English.
+# llm_reply_language = "match_ui"
 
 [indexing]
 # Chunking and retrieval. Oversized units split at statement boundaries.
