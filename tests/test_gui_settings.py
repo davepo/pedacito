@@ -751,10 +751,10 @@ def test_add_preset_creates_a_ready_hosted_profile(gui):
     assert prof["tier"] == "hosted"
     assert prof["context_tokens"] == 200000
     assert prof["max_read_tokens"] == 3000                     # cloud gather budgets
-    # Anthropic's OpenAI-compatible surface quirks come from the provider table
+    # Anthropic's native-surface quirks come from the provider table
     assert prof["json_mode"] == "schema"
-    assert prof["prompt_cache"] == "off"
-    assert prof["tool_mode"] == "grammar"
+    assert prof["prompt_cache"] == "explicit"
+    assert "tool_mode" not in prof                # forced native tool_choice is accepted
     # STATE reloaded: the profile is selectable right away, no restart
     _status, st = gui.get("/api/state")
     assert st["profile"] == "claude_sonnet"

@@ -46,14 +46,17 @@ _PROVIDERS: dict[str, Provider] = {
         cache_mode="explicit", max_markers=4, min_tokens=1024, ttls=("5m",),
         usage_read=("cache_read_input_tokens", "cached_tokens"),
         usage_write=("cache_creation_input_tokens", "cache_write_tokens")),
-    # Anthropic's OpenAI-compatible endpoint states "Prompt caching is not
-    # supported" and returns empty prompt_tokens_details. It also rejects
-    # json_object, temperature below 1 (Claude 4.7+), and forced tool_choice.
+    # Anthropic's native /v1/messages surface: explicit cache_control markers
+    # (up to 4 breakpoints, 5m/1h TTLs) with usage read/write token fields.
+    # json_mode stays "schema" (the native transport turns step schemas into
+    # tools), temperature below 1 is rejected (Claude 4.7+), and a forced
+    # named tool_choice is accepted.
     "api.anthropic.com": Provider(
-        cache_mode="unsupported",
+        cache_mode="explicit", max_markers=4, min_tokens=1024,
+        ttls=("5m", "1h"),
         usage_read=("cache_read_input_tokens",),
         usage_write=("cache_creation_input_tokens",),
-        json_mode="schema", omit_temperature=True, native_tool_choice=False),
+        json_mode="schema", omit_temperature=True, native_tool_choice=True),
     # Reported as automatic/implicit by the providers and gateway docs.
     "api.moonshot.cn": Provider(cache_mode="implicit"),
     "generativelanguage.googleapis.com": Provider(cache_mode="implicit"),

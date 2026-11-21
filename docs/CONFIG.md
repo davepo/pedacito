@@ -200,7 +200,7 @@ reuses it across steps automatically. A provider table matches on the host of
 | `api.deepseek.com` | Automatic (implicit) | nothing extra; reads hit/miss tokens |
 | `api.openai.com` | Automatic for prompts ≥ 1024 tokens | `prompt_cache_key` routes to a warm cache |
 | Qwen / DashScope | Implicit automatic; explicit opt-in | `cache_control` markers in `explicit` mode |
-| `api.anthropic.com` (OpenAI-compatible) | Not supported on this surface | `json_mode = "schema"`, `tool_mode = "grammar"` (sampling keys are omitted for every hosted API; see [Hosted APIs keep their own sampling](#hosted-apis-keep-their-own-sampling)) |
+| `api.anthropic.com` | Explicit opt-in (native) | native `/v1/messages` with `cache_control` markers (up to 4 breakpoints, `5m`/`1h` TTLs), `json_mode = "schema"`; temperature below 1 is omitted (Claude 4.7+). See `anthropic_native` to fall back to the OpenAI-compatible shim |
 | Moonshot, Gemini, xAI, Groq | Automatic / implicit | nothing extra; hits are counted when returned |
 
 Set `prompt_cache` to override the table per profile:
@@ -794,6 +794,7 @@ config --reference` prints the annotated template. Key settings:
 | `temperature_answer` / `temperature_repair` | 0.3 / unset | Sampling temperature for the answer and for the repair re-asks, which copy SEARCH text character for character. The answer defaults to `0.3` — cool enough to copy exactly, warm enough to escape verbatim repetition loops (a greedy `0` froze weak local models); creative/design tasks run at ≥ 0.6. The repair re-asks are unset (they use `temperature`). Gather keeps `temperature`; `best_of` candidates run at the answer temperature + 0.4. |
 | `send_temperature_to_hosted` | false | Send the configured `temperature` to hosted APIs anyway. The other sampling keys (`top_p`, `top_k`, `min_p`, `repeat_penalty`) stay omitted either way. |
 | `hosted_temperature` | unset | Pin one temperature for hosted endpoints, globally or per profile (e.g. `1.0` for Claude); it wins over phase overrides and is the only sampling key sent. Unset: the provider's own default applies. Local servers ignore it. |
+| `anthropic_native` | true | Route Anthropic's own API through the native `/v1/messages` transport (prompt caching, streaming usage, extended thinking, tools and images); `false` uses the OpenAI-compatible shim. |
 | `backup` | true | Snapshot originals before writing. |
 | `log_sessions` | true | Write a session record per task. |
 | `record_trajectories` | false | Opt-in full-prompt trajectory export for SFT/GRPO dataset filtering: one JSON file per task under `.pedacito/trajectories/`, holding the real ChatML/OpenAI-shaped messages (system, user, assistant, tool calls and tool results) plus metadata (`verify_passed`, `harness_version`, `edit_format`, `model_id`, `provider`, `task_hash`, `started_at`, `elapsed_s`, token totals). Unlike `replay` it contains full prompts; every string is passed through `safety.redact` and the serialised file is re-scanned with `security.scan_text_for_secrets`, with a residual finding masked or the write refused. Local only, no network or telemetry. `pdc ask --save-trajectory` forces capture for one run in memory (live `sources` entry `--save-trajectory`) without writing the key. See [SECURITY.md — Trajectory export](SECURITY.md#trajectory-export). |

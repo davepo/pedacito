@@ -51,8 +51,8 @@ def test_interactive_setup_writes_api_key_env_not_a_secret(tmp_path, monkeypatch
 def test_profile_overrides_carry_the_provider_table():
     anth = providers.profile_overrides("https://api.anthropic.com/v1")
     assert anth["json_mode"] == "schema"
-    assert anth["tool_mode"] == "grammar"
-    assert anth["prompt_cache"] == "off"
+    assert anth["prompt_cache"] == "explicit"
+    assert "tool_mode" not in anth      # native tool_choice is accepted
     ds = providers.profile_overrides("https://api.deepseek.com/v1")
     assert ds["prompt_cache"] == "implicit"
     assert "json_mode" not in ds and "tool_mode" not in ds

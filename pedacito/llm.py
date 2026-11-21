@@ -2660,6 +2660,17 @@ class LLMClient:
         if self._token_set(external_cancel):
             raise RunCancelledError(
                 "Cancelled before the request left; nothing was sent.")
+        # Native Anthropic transport: /v1/messages, with prompt caching,
+        # streaming usage, thinking, tools and images. The outbound secret
+        # guard, replay digest, telemetry and cost accounting still run on the
+        # OpenAI-shaped messages before they are translated.
+        from . import transport_anthropic
+        if transport_anthropic.is_anthropic_native(self.cfg):
+            return self._chat_once_anthropic(
+                messages, max_tokens, schema=schema, stream=stream,
+                disable_thinking=disable_thinking, json_schema=json_schema,
+                cancel_event=cancel_event, on_stream=on_stream,
+                _count_call=_count_call)
         fmt_schema = json_schema if json_schema is not None else schema
         msgs = [dict(m) for m in messages]
         want_off = (disable_thinking if disable_thinking is not None
@@ -3255,6 +3266,384 @@ class LLMClient:
             print(f"\n[connection dropped mid-reply "
                   f"({type(dropped).__name__}); treating the reply as cut "
                   f"off]", file=sys.stderr)
+        return text
+
+    # ------------------------------------------------------------------ Anthropic
+    # Native /v1/messages transport. `_chat_once` routes here when the config
+    # targets Anthropic's own API. Everything before translation (outbound
+    # secret guard, replay digest, telemetry) runs on the OpenAI-shaped
+    # messages; everything after (the HTTP POST) speaks native Anthropic.
+
+    def _anthropic_post(self, payload: dict, headers: dict, stream: bool = False):
+        """POST to the native /v1/messages endpoint, raising the same LLMError
+        subclasses as `_post` (connection, timeout, transient/rate limit --
+        including Anthropic's 529 overloaded -- context overflow, and clear
+        auth diagnostics on 401/403)."""
+        from . import transport_anthropic
+        url = transport_anthropic.messages_endpoint(self.cfg.base_url)
+        self._check_circuit()
+        try:
+            try:
+                r = self._http_post(url, headers=headers, json=payload,
+                                    timeout=self.cfg.timeout, stream=stream)
+            except requests.exceptions.ConnectionError:
+                with self._session_lock:
+                    used = self._session_used
+                if not used:
+                    raise
+                self._reset_session()
+                r = self._http_post(url, headers=headers, json=payload,
+                                    timeout=self.cfg.timeout, stream=stream)
+            with self._session_lock:
+                self._session_used = True
+        except requests.exceptions.ConnectionError as e:
+            self._record_failure()
+            raise LLMError(CONNECT_HELP.format(url=self.cfg.base_url)) from e
+        except requests.exceptions.Timeout as e:
+            self._record_failure()
+            raise LLMError(
+                f"The server at {self.cfg.base_url} did not answer within "
+                f"{self.cfg.timeout:g}s (`timeout` in your config). A slow "
+                "local model may need a larger timeout; a hosted API may be "
+                "overloaded.") from e
+        except requests.exceptions.RequestException as e:
+            self._record_failure()
+            raise LLMError(
+                f"Request to {self.cfg.base_url} failed: "
+                f"{type(e).__name__}: {str(e)[:200]}") from e
+        r.encoding = "utf-8"
+        if r.status_code >= 400:
+            try:
+                body = r.text[:800]
+                retry_after = _retry_after(r)
+            finally:
+                _close(r)
+            if r.status_code in (401, 403):
+                raise LLMError(
+                    f"Anthropic rejected the credentials ({r.status_code}): "
+                    f"{body[:300]}\n"
+                    "  - Set your key via ANTHROPIC_API_KEY (or api_key_env), "
+                    "or api_key in the\n"
+                    "    profile; it is sent as the x-api-key header.")
+            if r.status_code in (429, 529):
+                # 529 is Anthropic's "overloaded" status, retried like a 429.
+                raise _Transient(
+                    f"{r.status_code}: {body[:200]}",
+                    retry_after=retry_after, rate_limited=True)
+            if self._context_too_long(body):
+                raise ContextOverflowError(
+                    f"Server says the request exceeds its context window: "
+                    f"{body[:300]}")
+            if r.status_code >= 500:
+                self._record_failure()
+            raise LLMError(f"Server returned {r.status_code}: {body[:500]}")
+        self._record_success()
+        return r
+
+    @staticmethod
+    def _anthropic_text(parsed: dict, native: bool) -> str:
+        """The reply text from a parsed Anthropic message: the forced tool's
+        arguments in native mode, else the plain text."""
+        if native:
+            calls = parsed.get("tool_calls") or []
+            if calls:
+                return calls[0].get("arguments_json") or ""
+        return parsed.get("text") or ""
+
+    def _chat_once_anthropic(self, messages: list[dict], max_tokens: int,
+                             schema: dict | None = None, stream: bool = False,
+                             disable_thinking: bool | None = None,
+                             json_schema: dict | None = None,
+                             cancel_event=None, on_stream=None,
+                             _count_call: bool = True) -> str:
+        """One native /v1/messages request (see `_chat_once` for the contract).
+
+        Step schemas become a forced `step` tool (Anthropic has no
+        response_format); the reply text is the tool's JSON arguments, so
+        `chat_json` parses it unchanged. Retries on a cache_control 400 by
+        disabling markers; 429/529 surface as transient for the `chat()`
+        retry loop and a context-overflow 400 as `ContextOverflowError`.
+        """
+        from . import transport_anthropic
+        from .providers import cache_mode_for
+
+        external_cancel = (cancel_event if cancel_event is not None
+                           else getattr(self, "cancel_event", None))
+        fmt_schema = json_schema if json_schema is not None else schema
+        msgs = [dict(m) for m in messages]
+        want_off = (disable_thinking if disable_thinking is not None
+                    else self.cfg.disable_thinking)
+
+        native = (fmt_schema is not None and not stream
+                  and "action" in (fmt_schema.get("properties") or {}))
+        openai_tools = None
+        openai_tool_choice = None
+        if native:
+            openai_tools = [{"type": "function", "function": {
+                "name": "step",
+                "description": "Choose the next action for the task.",
+                "parameters": fmt_schema}}]
+            openai_tool_choice = {"type": "function", "function": {"name": "step"}}
+
+        # Outbound secret guard on the OpenAI-shaped messages, before they are
+        # translated (the scanner understands tool_calls, not tool_use).
+        msgs = self._apply_outbound_guard({"messages": msgs}).get("messages", msgs)
+
+        cache_enabled = (cache_mode_for(self.cfg) == "explicit"
+                         and not self._cache_markers_rejected)
+        cache_ttl = (getattr(self.cfg, "prompt_cache_ttl", "5m")
+                     or "5m").strip().lower()
+        if cache_ttl not in ("5m", "1h"):
+            cache_ttl = "5m"
+
+        # Hosted sampling: omit temperature unless opted in, and never send
+        # below 1.0 to Claude 4.7+ (the provider table's omit_temperature).
+        hosted, pinned_temp = _hosted_sampling(self.cfg)
+        omit_temp = _omit_hosted_temp(self.cfg, hosted, pinned_temp)
+        temp = (pinned_temp if pinned_temp is not None
+                else self._temp_override if self._temp_override is not None
+                else self.cfg.temperature)
+        if omit_temp or (self._provider().omit_temperature and float(temp) < 1.0):
+            temp = None
+
+        payload = transport_anthropic.build_payload(
+            self.cfg, msgs, max_tokens, stream=stream, disable_thinking=want_off,
+            tools=openai_tools, tool_choice=openai_tool_choice, temperature=temp,
+            cache_enabled=cache_enabled, cache_ttl=cache_ttl)
+        headers = transport_anthropic.build_headers(_api_key(self.cfg),
+                                                    ttl=cache_ttl)
+
+        start_cb = self.on_start
+        if start_cb is not None:
+            try:
+                start_cb({"provider": self.provider_label(),
+                          "model": self.cfg.model,
+                          "phase": self.site or "call",
+                          "stream": bool(stream)})
+            except Exception:
+                pass
+
+        t0 = time.time()
+        if _count_call:
+            with self._stats_lock:
+                self.stats["calls"] += 1
+        self.request_started_at = time.monotonic()
+        self.stream_truncated = False
+        self.partial_text = ""
+        self.stream_repetition = False
+        self.stream_phase = ""
+        self.last_stream_reasoning = ""
+        self.last_stream_content = ""
+        self.last_stream_tokens = 0
+        self.last_stream_tok_per_s = 0.0
+        self.first_token_at = None
+        self.last_finish_reason = ""
+        self.last_reasoning_chars = 0
+
+        prompt_est = estimate_messages(msgs, self.estimate_tokens)
+
+        if not stream:
+            try:
+                r = self._anthropic_post(payload, headers, stream=False)
+            except LLMError as e:
+                if self._cache_markers_rejected_by(e) and cache_enabled:
+                    self._cache_markers_rejected = True
+                    print("[this server rejected explicit cache_control "
+                          "markers; retrying without them]", file=sys.stderr)
+                    return self._chat_once_anthropic(
+                        messages, max_tokens, schema=schema, stream=stream,
+                        disable_thinking=disable_thinking, json_schema=json_schema,
+                        cancel_event=cancel_event, on_stream=on_stream,
+                        _count_call=False)
+                raise
+            try:
+                data = r.json()
+            finally:
+                _close(r)
+            parsed = transport_anthropic.parse_json_response(data)
+            self.last_finish_reason = parsed["finish_reason"]
+            if parsed["finish_reason"] == "length":
+                self.stream_truncated = True
+            text = self._anthropic_text(parsed, native)
+            if native and self._native_ok is None and text:
+                self._native_ok = True
+            self._account(parsed.get("usage") or {}, None, time.time() - t0,
+                          prompt_est, text)
+            return text
+
+        # Streaming.
+        sink = self.stream_callback
+        out_parts: list[str] = []
+        reasoning_parts: list[str] = []
+        pending_reasoning: list[str] = []
+        pending_content: list[str] = []
+        chunks = 0
+        events = 0
+        started = time.monotonic()
+        last_emit = started
+        cancelled = False
+
+        def emit(final: bool = False) -> None:
+            nonlocal pending_reasoning, pending_content, chunks, last_emit, events
+            rtext = "".join(pending_reasoning)
+            ctext = "".join(pending_content)
+            if not (rtext or ctext or final):
+                return
+            now = time.monotonic()
+            elapsed = max(now - (self.first_token_at or started), 0.001)
+            cpt = self.chars_per_token or CHARS_PER_TOKEN
+            tokens = int((len(rtext) + len(ctext)) / cpt) if not final else \
+                int(self.last_completion_tokens or 0)
+            if not tokens:
+                tokens = 1
+            phase = ("reasoning" if rtext and not ctext else
+                     "content" if ctext else (self.stream_phase or "content"))
+            self.stream_phase = phase
+            self.last_stream_reasoning = (
+                self.last_stream_reasoning + rtext)[-_STREAM_LIVE_BUFFER:]
+            self.last_stream_content = (
+                self.last_stream_content + ctext)[-_STREAM_LIVE_BUFFER:]
+            self.last_stream_tokens = tokens
+            self.last_stream_tok_per_s = tokens / elapsed if tokens else 0.0
+            pending_reasoning, pending_content = [], []
+            chunks = 0
+            last_emit = now
+            events += 1
+            self._emit_stream_event({
+                "kind": "llm_stream", "phase": phase,
+                "delta_reasoning": rtext, "delta_content": ctext,
+                "tokens_so_far": tokens,
+                "tok_per_sec": round(self.last_stream_tok_per_s, 1),
+                "elapsed_s": round(now - started, 3),
+                "site": self.site or "call",
+                "model": str(getattr(self.cfg, "model", "") or ""),
+            }, callback=on_stream)
+
+        def on_text(delta: str) -> None:
+            nonlocal chunks, last_emit
+            if self.first_token_at is None:
+                self.first_token_at = time.monotonic()
+            out_parts.append(delta)
+            pending_content.append(delta)
+            if sink is not None:
+                try:
+                    sink(delta)
+                except Exception:
+                    pass
+            elif self.echo_stream:
+                sys.stdout.write(delta)
+                sys.stdout.flush()
+            chunks += 1
+            now = time.monotonic()
+            if chunks >= 15 or (pending_reasoning or pending_content) \
+                    and now - last_emit >= 0.1:
+                emit()
+
+        def on_reasoning(delta: str) -> None:
+            nonlocal chunks, last_emit
+            if self.first_token_at is None:
+                self.first_token_at = time.monotonic()
+            reasoning_parts.append(delta)
+            pending_reasoning.append(delta)
+            chunks += 1
+            now = time.monotonic()
+            if chunks >= 15 or (pending_reasoning or pending_content) \
+                    and now - last_emit >= 0.1:
+                emit()
+
+        def cancel_check() -> bool:
+            return self._cancel_requested(external_cancel)
+
+        try:
+            r = self._anthropic_post(payload, headers, stream=True)
+        except LLMError as e:
+            if self._cache_markers_rejected_by(e) and cache_enabled:
+                self._cache_markers_rejected = True
+                print("[this server rejected explicit cache_control markers; "
+                      "retrying without them]", file=sys.stderr)
+                return self._chat_once_anthropic(
+                    messages, max_tokens, schema=schema, stream=stream,
+                    disable_thinking=disable_thinking, json_schema=json_schema,
+                    cancel_event=cancel_event, on_stream=on_stream,
+                    _count_call=False)
+            raise
+
+        with self._active_response_lock:
+            self._active_response = r
+        try:
+            if self._response_is_json(r):
+                # A server (or test) answered a stream request with JSON.
+                try:
+                    return self._consume_anthropic_data(
+                        r.json(), native=native, prompt_est=prompt_est, t0=t0)
+                finally:
+                    _close(r)
+            parsed = transport_anthropic.parse_sse_stream(
+                r, on_text=on_text, on_reasoning=on_reasoning,
+                cancel_check=cancel_check)
+        except transport_anthropic.StreamCancelled:
+            cancelled = True
+            parsed = {"text": "".join(out_parts),
+                      "reasoning": "".join(reasoning_parts),
+                      "tool_calls": [], "finish_reason": "", "usage": {}}
+        except transport_anthropic.StreamError as e:
+            low = (e.err_type or "").lower()
+            if "overload" in low or "rate_limit" in low:
+                raise _Transient(f"Anthropic stream error: {e}",
+                                 retry_after=None, rate_limited=True) from e
+            raise LLMError(f"Anthropic stream error: {e}") from e
+        finally:
+            with self._active_response_lock:
+                if self._active_response is r:
+                    self._active_response = None
+            _close(r)
+
+        if cancelled:
+            self.partial_text = parsed["text"]
+            self.last_reasoning_chars = len(parsed["reasoning"])
+            self.last_stream_content = parsed["text"][-_STREAM_LIVE_BUFFER:]
+            self.last_stream_reasoning = parsed["reasoning"][-_STREAM_LIVE_BUFFER:]
+            raise RunCancelledError(
+                "Stopped by user; the partial reply is kept in "
+                "client.partial_text.")
+
+        text = parsed["text"]
+        reasoning_text = parsed["reasoning"]
+        self.last_finish_reason = parsed["finish_reason"]
+        if parsed["finish_reason"] == "length":
+            self.stream_truncated = True
+        self.last_reasoning_chars = len(reasoning_text)
+        self.partial_text = text
+        if native and parsed.get("tool_calls"):
+            text = parsed["tool_calls"][0]["arguments_json"]
+            if self._native_ok is None and text:
+                self._native_ok = True
+
+        if sink is None and self.echo_stream:
+            sys.stdout.write("\n")
+
+        self._account(parsed.get("usage") or {}, None, time.time() - t0,
+                      prompt_est, text)
+        emit(final=True)
+        self.last_stream_content = text
+        self.last_stream_reasoning = reasoning_text[-_STREAM_LIVE_BUFFER:]
+        self.last_stream_tokens = int(self.last_completion_tokens or 0)
+        self.last_stream_tok_per_s = self.last_tok_per_s
+        return text
+
+    def _consume_anthropic_data(self, data: dict, *, native: bool,
+                                prompt_est: int, t0: float) -> str:
+        """Parse one buffered /v1/messages body into text + telemetry."""
+        from . import transport_anthropic
+        parsed = transport_anthropic.parse_json_response(data)
+        self.last_finish_reason = parsed["finish_reason"]
+        if parsed["finish_reason"] == "length":
+            self.stream_truncated = True
+        text = self._anthropic_text(parsed, native)
+        if native and self._native_ok is None and text:
+            self._native_ok = True
+        self._account(parsed.get("usage") or {}, None, time.time() - t0,
+                      prompt_est, text)
         return text
 
     @staticmethod
@@ -4374,10 +4763,19 @@ class LLMClient:
     def check(self, warn: bool = True) -> str:
         """Verify the server is reachable and return its comma-joined model ids;
         with `warn`, print a warning if the configured model is not listed."""
-        url = self.cfg.base_url.rstrip("/") + "/models"
+        from . import transport_anthropic
+        native = transport_anthropic.is_anthropic_native(self.cfg)
+        if native:
+            # Anthropic lists models at <origin>/v1/models with x-api-key.
+            ep = transport_anthropic.messages_endpoint(self.cfg.base_url)
+            url = ep[: -len("/messages")] + "/models"
+            headers = transport_anthropic.build_headers(_api_key(self.cfg))
+        else:
+            url = self.cfg.base_url.rstrip("/") + "/models"
+            headers = self.headers
         r = None
         try:
-            r = requests.get(url, headers=self.headers, timeout=15)
+            r = requests.get(url, headers=headers, timeout=15)
             r.raise_for_status()
             ids = [m.get("id", "?") for m in r.json().get("data", [])]
         except requests.exceptions.HTTPError as e:
@@ -4392,8 +4790,12 @@ class LLMClient:
                 body = ""
             hint = ""
             if status in (401, 403):
-                hint = ("\n  - The server rejected the credentials: check "
-                        "api_key in your config (`pedacito config --check`).")
+                hint = (("\n  - Anthropic rejected the credentials: set "
+                         "ANTHROPIC_API_KEY (or api_key_env), or api_key in "
+                         "the profile; it is sent as the x-api-key header.")
+                        if native else
+                        ("\n  - The server rejected the credentials: check "
+                         "api_key in your config (`pedacito config --check`)."))
             raise LLMError(f"Server returned {status}: {body}{hint}") from e
         except requests.exceptions.Timeout as e:
             raise LLMError(

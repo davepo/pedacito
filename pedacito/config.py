@@ -136,6 +136,11 @@ class Config:
     # ("local-moe" for tiered MoE servers). Empty = detect from the profile
     # name and endpoint.
     provider: str = ""
+    # Route Anthropic's own API (api.anthropic.com, or a provider labelled
+    # "anthropic") through the native /v1/messages transport, which is the only
+    # surface that supports prompt caching, streaming usage, extended thinking,
+    # tools and images. false falls back to the OpenAI-compatible shim.
+    anthropic_native: bool = True
     # Optional commands that start/stop a single-model local daemon when the
     # server has no HTTP load/unload endpoint. Run with shlex.split and
     # shell=False; {model} is replaced by the model id. Use them only for a
