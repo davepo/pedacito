@@ -1457,6 +1457,33 @@ GUI_TOPICS = [
         "cli": ["config", "calibrate"],
     },
     {
+        "id": "install-pedacito",
+        "title": "Install Pedacito",
+        "summary": "Install from PyPI with `pip install pedacito` (or "
+                   "`pipx install pedacito` for an isolated CLI install); "
+                   "Python 3.11+ is required. Both put `pedacito` and the "
+                   "short alias `pdc` on your PATH.",
+        "steps": [
+            "pip install pedacito   (Windows: py -m pip install pedacito)",
+            "pipx install pedacito   isolated install, recommended for a tool",
+            "Optional extras: pip install \"pedacito[browser,vision]\" adds "
+            "browser verification (Playwright) and screenshot analysis "
+            "(Pillow); with pipx use pipx install \"pedacito[browser,vision]\"",
+            "After the browser extra: python -m playwright install chromium "
+            "(pipx: pipx run --spec playwright playwright install chromium)",
+            "From source: git clone https://github.com/davepo/pedacito.git, "
+            "then pip install -e \".[dev]\" inside a virtualenv",
+            "Command not found? `python -m pedacito` is identical. Next "
+            "step after installing: pedacito config --init",
+        ],
+        "keywords": ["install", "install pedacito", "installation", "pip",
+                     "pip install", "pipx", "pypi", "setup pedacito",
+                     "getting started", "python 3.11", "playwright",
+                     "browser extra", "vision extra", "from source"],
+        "settings": ["base_url", "model", "vram_gb"],
+        "cli": ["config", "update"],
+    },
+    {
         "id": "update-pedacito",
         "title": "Update Pedacito to a newer release",
         "summary": "A slim banner appears when a newer release is on PyPI; "
@@ -2602,6 +2629,8 @@ GUI_TOPICS = [
 ]
 
 TOPICS = [
+    ("Install Pedacito",
+     "How do I install pedacito?"),
     ("Switch or import models",
      "How do I switch models or import a new model?"),
     ("Tune settings for small models",

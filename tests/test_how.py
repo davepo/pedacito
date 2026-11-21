@@ -16,6 +16,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from pedacito import config as config_mod
 from pedacito import how
+from pedacito import how_index
 from pedacito.cli import main
 
 
@@ -271,6 +272,43 @@ def test_cli_how_offline_json_is_structured(monkeypatch, tmp_path, capsys):
         payload["matches"]["gui"][0]["steps"])
     assert "config" in _names(payload["matches"], "cli")
     assert "default_profile" in _names(payload["matches"], "settings")
+
+
+# BUG-008: the install question had no card to retrieve, so both the offline
+# and the model-assisted answer omitted `pip install pedacito` even though
+# docs/INSTALLATION.md leads with it.
+@pytest.mark.parametrize("question", [
+    "how do I install pedacito?",
+    "install pedacito",
+    "how to install pedacito with pip",
+])
+def test_install_question_answers_with_the_install_commands(question):
+    matches = how_index.search(question)
+    assert matches["gui"], question
+    assert matches["gui"][0]["id"] == "install-pedacito", question
+    answer = how_index.render_answer(question, matches)
+    assert "pip install pedacito" in answer, question
+    assert "pipx install pedacito" in answer, question
+    assert "playwright install chromium" in answer, question
+    # The model-assisted path synthesises from the same retrieved facts.
+    context = how_index.model_context(matches)
+    assert "pip install pedacito" in context, question
+
+
+def test_cli_how_offline_install_answer_carries_the_commands(monkeypatch,
+                                                             tmp_path, capsys):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(config_mod, "USER_CONFIG", tmp_path / "missing.toml")
+    for key in list(os.environ):
+        if key.startswith("PEDACITO_"):
+            monkeypatch.delenv(key, raising=False)
+
+    code = main(["how", "--offline", "how do I install pedacito?"])
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "pip install pedacito" in out
+    assert "pipx install pedacito" in out
+    assert not (tmp_path / ".pedacito").exists()
 
 
 @pytest.mark.network
