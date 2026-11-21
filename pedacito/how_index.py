@@ -164,6 +164,8 @@ COMMON_FLAGS = [
     {"flag": "--model ID", "help": "model id/name as the server reports it"},
     {"flag": "--root DIR", "help": "project root (default: inferred)"},
     {"flag": "--config FILE", "help": "use this config file as well"},
+    {"flag": "--lang {en,es}",
+     "help": "interface language for this run (also PEDACITO_LANG)"},
     {"flag": "--profile NAME", "help": "apply a [profiles.NAME] block"},
     {"flag": "--steps N",
      "help": "hard lookup limit for gather; 0 = no limit (the default)"},
@@ -472,7 +474,9 @@ CLI_COMMANDS = [
             "suggestion), /plan, /consolidate (/compact), /profile, /model ID, "
             "/auto-route, /think, /creative, /apply, /verify on|off|status, "
             "/skills, /memory, /procs, /diff, /undo, /update, /reset, "
-            "/sidebar, /scroll, /mouse, /clear, /quit",
+            "/sidebar, /scroll, /mouse, /lang, /clear, /quit",
+            "/lang [en|es] switches the interface language; F3 toggles "
+            "EN/ES",
             "/auto GOAL nudges single-pass edits: when the goal looks like a "
             "one-pass Task (existing-file tweaks, localized edit verbs, a "
             "tiny project), the TUI asks 'Run as a single-pass Task instead? "
@@ -977,6 +981,9 @@ CLI_COMMANDS = [
             {"flag": "--port N", "help": "fixed port (default: OS-chosen)"},
             {"flag": "--no-open",
              "help": "print the URL instead of opening a browser"},
+            {"flag": "--lang {en,es}",
+             "help": "interface language for the GUI (also the EN | ES "
+                     "top-bar switcher)"},
         ],
     },
     {
@@ -2566,6 +2573,35 @@ GUI_TOPICS = [
                      "html rewrite", "css rewrite", "visual design"],
         "settings": ["creative_mode", "creative_auto", "temperature_answer"],
         "cli": ["ask", "auto", "new", "chat", "tui"],
+    },
+    {
+        "id": "language-switch",
+        "title": "Switch the interface language: English / Spanish "
+                 "(language, llm_reply_language)",
+        "summary": "Pedacito's GUI, TUI and CLI speak English and Spanish. "
+                   "Switch live in the GUI or TUI, per run on the CLI, or "
+                   "permanently with the language setting; "
+                   "llm_reply_language separately controls the language of "
+                   "the model's prose explanations.",
+        "steps": [
+            "In the GUI: click the EN | ES switcher in the top bar; the "
+            "choice is saved to the language setting",
+            "In the TUI: press F3 to toggle EN/ES, or type /lang es "
+            "(/lang en)",
+            "On the CLI: pass --lang es (for example pedacito --lang es "
+            "gui) or set PEDACITO_LANG=es (alias PEDACITO_LANGUAGE)",
+            "Or set language = \"es\" in config.toml (⚙ Settings → All "
+            "settings → search language)",
+            "To choose the language of the model's explanations, set "
+            "llm_reply_language to match_ui (follow the UI), auto "
+            "(follow your prompt), en or es",
+        ],
+        "keywords": ["language", "idioma", "spanish", "español", "english",
+                     "translate", "locale", "switch language", "lang",
+                     "en es", "interface language", "localization",
+                     "i18n", "reply language"],
+        "settings": ["language", "llm_reply_language"],
+        "cli": ["gui", "tui", "config"],
     },
     {
         "id": "live-preview",

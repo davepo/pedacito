@@ -225,6 +225,10 @@ FEATURE_NEEDLES = [
     ("check_for_updates", "the update opt-out setting"),
     ("/update", "TUI update slash command"),
     ("update --run", "CLI update --run"),
+    ("--lang", "CLI language flag"),
+    ("/lang", "TUI language slash command"),
+    ("EN | ES", "GUI language switcher"),
+    ("llm_reply_language", "model reply language setting"),
 ] + [(label, "Project ▾ upkeep dialog") for label in PROJECT_MENU_LABELS]
 
 
@@ -351,6 +355,17 @@ def test_how_cards_cover_the_new_features():
     assert "check_for_updates" in upd_topic["settings"]
     assert upd_topic["cli"] == ["update"]
     assert "Restart Pedacito" in " ".join(upd_topic["steps"])
+    # The bilingual UI pass: flag, TUI notes and the language-switch topic.
+    assert any(f["flag"].startswith("--lang") for f in how_index.COMMON_FLAGS)
+    assert any(f["flag"].startswith("--lang") for f in cards["gui"]["flags"])
+    tui_notes = " ".join(cards["tui"]["notes"])
+    assert "/lang" in tui_notes and "F3" in tui_notes
+    lang_topic = topics["language-switch"]
+    lang_steps = " ".join(lang_topic["steps"])
+    for needle in ("EN | ES", "F3", "/lang", "--lang", "PEDACITO_LANG"):
+        assert needle in lang_steps, needle
+    assert "language" in lang_topic["settings"]
+    assert "llm_reply_language" in lang_topic["settings"]
 
 
 def test_how_topic_references_resolve():
@@ -378,6 +393,7 @@ def test_how_topic_references_resolve():
     ("why does pedacito not send temperature to my hosted api?",
      "hosted-sampling"),
     ("how do I update pedacito to a newer release?", "update-pedacito"),
+    ("how do I switch the interface language to spanish?", "language-switch"),
 ])
 def test_new_topics_are_retrievable(question, topic):
     ids = [m["id"] for m in how_index.search(question)["gui"]]
@@ -496,7 +512,8 @@ def test_tui_help_names_the_project_website_and_contact():
 # silently drift into a copy of the other.
 
 ROOT_GUIDES = ("QUICKSTART.md", "MODEL_GUIDE.md", "TECHNIQUES.md")
-DOCS_SET = ("INSTALLATION", "ARCHITECTURE", "USAGE", "CONFIG", "SECURITY")
+DOCS_SET = ("INSTALLATION", "ARCHITECTURE", "USAGE", "CONFIG",
+            "SKILLS_AND_TOOLS", "SECURITY", "CONTRIBUTING")
 
 
 def _ownership_paragraph(text: str) -> str:

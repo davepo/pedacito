@@ -1,3 +1,5 @@
+🌐 **English** | [Español](TECHNIQUES.es.md)
+
 # Techniques: getting the most out of small models
 
 Pedacito is built for local models in roughly the 4B–27B range, usually with a

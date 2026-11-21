@@ -1,3 +1,5 @@
+🌐 **English** | [Español](es/ARCHITECTURE.md)
+
 # Architecture
 
 This document describes how Pedacito is built: the local-first engine, the server lifecycle
@@ -5,9 +7,10 @@ manager that treats your model servers as one memory pool, execution profiles (i
 `local-moe` tier for tiered MoE servers), and multi-model routing.
 
 For day-to-day use, see [USAGE.md](USAGE.md). For security boundaries, see
-[SECURITY.md](SECURITY.md). For settings, see [CONFIG.md](CONFIG.md).
+[SECURITY.md](SECURITY.md). For settings, see [CONFIG.md](CONFIG.md). For skills, MCP servers and hooks, see
+[SKILLS_AND_TOOLS.md](SKILLS_AND_TOOLS.md); to contribute, see [CONTRIBUTING.md](CONTRIBUTING.md).
 
-**Docs ownership.** `docs/` (INSTALLATION, ARCHITECTURE, USAGE, CONFIG and SECURITY) is the canonical reference for settings, commands and guarantees. The three root guides, [QUICKSTART.md](../QUICKSTART.md), [MODEL_GUIDE.md](../MODEL_GUIDE.md) and [TECHNIQUES.md](../TECHNIQUES.md), remain the canonical task-oriented guides: first runs, model pairing and tuning, and small-model techniques. This README is the index, and [CHANGELOG.md](../CHANGELOG.md) is the history. New reference prose goes to `docs/`, new walkthroughs go to the root guides, and each set links to the other instead of copying text.
+**Docs ownership.** `docs/` (INSTALLATION, ARCHITECTURE, USAGE, CONFIG, SKILLS_AND_TOOLS, SECURITY and CONTRIBUTING) is the canonical reference for settings, commands and guarantees. The three root guides, [QUICKSTART.md](../QUICKSTART.md), [MODEL_GUIDE.md](../MODEL_GUIDE.md) and [TECHNIQUES.md](../TECHNIQUES.md), remain the canonical task-oriented guides: first runs, model pairing and tuning, and small-model techniques. This README is the index, and [CHANGELOG.md](../CHANGELOG.md) is the history. New reference prose goes to `docs/`, new walkthroughs go to the root guides, and each set links to the other instead of copying text.
 
 ## Engine overview
 

@@ -1,3 +1,5 @@
+🌐 **English** | [Español](es/SECURITY.md)
+
 # Security: AI coding harness and agent best practices
 
 Pedacito is a local-first coding agent. A model reads your files, proposes edits,
@@ -7,6 +9,9 @@ behaviour, what it does **not** protect against, and what you should configure.
 It is written for two audiences: people deciding whether to trust an agent on
 their machine, and people building their own harness who want a checklist of
 patterns that work.
+
+For how hooks, MCP servers and skills fit the trust model, see
+[SKILLS_AND_TOOLS.md](SKILLS_AND_TOOLS.md). To contribute fixes, see [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## Threat model
 

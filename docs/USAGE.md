@@ -1,9 +1,15 @@
+🌐 **English** | [Español](es/USAGE.md)
+
 # Usage
 
 This guide covers day-to-day use of Pedacito: a first run, the browser GUI, the command line, the
 interactive and autonomous modes, and how to pin context into a task. For installing, see
 [INSTALLATION.md](INSTALLATION.md). For settings, see [CONFIG.md](CONFIG.md). For the security
 model and how to undo an autonomous run, see [SECURITY.md](SECURITY.md).
+
+To extend Pedacito with skills, MCP servers, hooks and prompt overrides, see
+[SKILLS_AND_TOOLS.md](SKILLS_AND_TOOLS.md). To work on Pedacito itself, see
+[CONTRIBUTING.md](CONTRIBUTING.md).
 
 Step-by-step walkthroughs with the output you should expect are in
 [../QUICKSTART.md](../QUICKSTART.md). Choosing and tuning models is in
@@ -41,6 +47,20 @@ Step-by-step walkthroughs with the output you should expect are in
 
 Step-by-step versions, with what you should see at each point, are in
 [../QUICKSTART.md](../QUICKSTART.md).
+
+## Switching language (EN | ES)
+
+Pedacito's interface is available in English and Spanish. Switch it where you work:
+
+| Surface | How |
+|---|---|
+| GUI | The **EN \| ES** switcher in the top bar; the choice is saved to `language`. |
+| TUI | `F3` toggles EN/ES, or `/lang es` / `/lang en`. |
+| CLI | `pedacito --lang es ...`, or `PEDACITO_LANG=es` (alias `PEDACITO_LANGUAGE`). |
+| Config | `language = "es"` and `llm_reply_language = "match_ui"` (see [CONFIG.md](CONFIG.md#language--localization-language-llm_reply_language)). |
+
+`llm_reply_language` only changes the language of the model's prose explanations. In the TUI,
+`/profiles` lists every configured profile, and `/profile NAME` switches to one.
 
 ## What you get
 

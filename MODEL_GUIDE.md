@@ -1,3 +1,5 @@
+🌐 **English** | [Español](MODEL_GUIDE.es.md)
+
 # Pedacito model guide
 
 This guide helps you choose a model for your hardware, set it up in Pedacito,

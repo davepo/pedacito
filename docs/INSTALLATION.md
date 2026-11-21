@@ -1,8 +1,10 @@
+🌐 **English** | [Español](es/INSTALLATION.md)
+
 # Installation
 
 This guide covers installing Pedacito (`pedacito` or the short alias `pdc`) from PyPI,
 choosing optional extras, and connecting a GPU inference server. If you only want the
-30-second version, see the [README](../README.md#30-second-install).
+30-second version, see the [README](../README.md#30-second-quickstart).
 
 Pedacito needs **Python 3.11 or newer**. It does not need Node.js for the harness itself.
 

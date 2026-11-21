@@ -1,3 +1,5 @@
+🌐 **English** | [Español](QUICKSTART.es.md)
+
 # Pedacito quickstart
 
 Pedacito lets a small local model work on a codebase that is far bigger than its
@@ -6,7 +8,8 @@ only the pieces it needs to answer a question or propose an edit. For the
 background, see the [README](README.md). For how the small-model techniques
 work, see [TECHNIQUES.md](TECHNIQUES.md). For choosing a model, see the
 [model guide](MODEL_GUIDE.md). The canonical reference for settings, commands and
-security is in [docs/](docs/), starting with [docs/CONFIG.md](docs/CONFIG.md).
+security is in [docs/](docs/), starting with [docs/CONFIG.md](docs/CONFIG.md). Custom skills, MCP
+servers and hooks are in [docs/SKILLS_AND_TOOLS.md](docs/SKILLS_AND_TOOLS.md).
 
 There are two ways in, and they run the same engine and read the same config:
 
@@ -20,6 +23,15 @@ shorter alias `pdc`, or `python -m pedacito` (`py -m pedacito` on Windows) if
 neither is on your `PATH`.
 
 ---
+
+## Switching language (EN | ES)
+
+Everything below works in English or Spanish. In the GUI use the **EN | ES** switcher in the
+top bar. In the TUI press `F3` or type `/lang es` (and `/profiles` lists your profiles). On the
+command line pass `--lang es` (for example `pedacito --lang es gui`) or set
+`PEDACITO_LANG=es`. The `language` and `llm_reply_language` settings make the choice permanent;
+see [docs/CONFIG.md](docs/CONFIG.md#language--localization-language-llm_reply_language) and
+[docs/USAGE.md](docs/USAGE.md#switching-language-en--es).
 
 ## Before you start
 

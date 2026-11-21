@@ -1,8 +1,10 @@
+🌐 **English** | [Español](es/CONFIG.md)
+
 # Configuration
 
 Pedacito is configured with TOML files, a small set of project files, and environment
 variables. This guide covers where each setting lives, the project rules file, the color
-scheme tokens, model profiles, and the full settings reference.
+scheme tokens, model profiles, language selection, and the full settings reference.
 
 ## Where settings live
 
@@ -708,6 +710,23 @@ The tiers connect to two existing guards:
   check (local import existence and call arity) runs after each edit before
   the test subprocess.
 
+## Language & localization (`language`, `llm_reply_language`)
+
+Pedacito ships an English and a Spanish interface.
+
+| Setting | Values | Default | Meaning |
+|---|---|---|---|
+| `language` | `"en"` \| `"es"` | `"en"` | Interface language for menus, messages and the GUI/TUI chrome (catalogs in `pedacito/locales/<code>.json`). |
+| `llm_reply_language` | `"match_ui"` \| `"auto"` \| `"en"` \| `"es"` | `"match_ui"` | Language of the model's prose explanations. `match_ui` follows `language`, `auto` follows the language of your prompt, `en`/`es` force one. Code, identifiers and edit blocks are never translated. |
+
+Ways to choose the language, from highest to lowest precedence:
+
+- **CLI:** `pedacito --lang es ...` (also accepted by `gui`, `config`, `how`, `models`, `profiles`, `update`).
+- **Environment:** `PEDACITO_LANG=es` (alias `PEDACITO_LANGUAGE`).
+- **Config:** `language = "es"` in your user or project config.
+- **GUI:** the `EN | ES` switcher in the top bar; the choice is saved to `language`.
+- **TUI:** `F3` toggles EN/ES, or type `/lang es`.
+
 ## Configuration reference
 
 `pedacito config` lists every setting with its value and origin; `pedacito
@@ -816,5 +835,164 @@ config --reference` prints the annotated template. Key settings:
 | `sandbox_writable` / `sandbox_strict` | `[]` / false | Extra writable dirs; refuse to run when no sandbox can be applied. |
 | `atomic_edits` | false | Write a multi-file reply all-or-nothing (any failure writes nothing). |
 
-Everything else (chunking, budgets, browser timeouts, auto-loop behavior) has a
-working default and is documented in `pedacito config --reference`.
+Every remaining public setting is listed below, grouped by subsystem, with its real default.
+`pedacito config --reference` prints the same keys as an annotated template.
+
+<details>
+<summary>Complete advanced settings reference (Connection, budgets & profile selectors)</summary>
+
+| Setting | Default | Meaning |
+|---|---|---|
+| `timeout` | `600.0` | Seconds to wait for one request before failing. |
+| `max_concurrency` | `0` | Concurrent requests this endpoint can serve. |
+| `max_consecutive_failures` | `3` | Stop a batch after this many failures in a row. |
+| `max_tokens_summary` | `220` | Output-token budget for one indexing summary call. |
+| `max_tokens_step` | `700` | One tool call plus a short note; the schema puts the action first so a truncated reply loses only the explanation. |
+| `max_tokens_answer` | `3000` | Output-token budget for the answer phase. |
+| `max_total_model_calls` | `30` | Action-independent global safety bounds that still apply when max_steps = 0 removes the lookup cap: a hard ceiling on total LLM invocations per task, and a ceiling on consecutive gather steps that show no progress (ad... |
+| `max_no_progress_steps` | `4` | Consecutive gather steps that add no new code or symbol before gather ends cleanly. |
+| `max_task_completion_tokens` | `60000` | Task-level budget guard (BUG-218): ceilings on ONE task's total completion tokens and wall-clock seconds, gather + answer + repair together. |
+| `max_task_seconds` | `900` | Wall-clock ceiling for one task; 0 disables it. |
+| `max_output_tokens` | `0` | Per-message OUTPUT ceiling the provider honours (hosted APIs cap one reply far below their context window, e.g. ~8k tokens). |
+| `reserve_tokens` | `2048` | Tokens held back from context_tokens for the reply itself; auto_fit lowers it when the window is too small. |
+| `request_max_tokens_cap` | `32768` | max_tokens sent on generation calls; auto_fit clamps it to the window. |
+| `max_tokens_plan` | `2000` | Budgets for the two scaffold calls with no existing answer budget. |
+| `max_tokens_build` | `8000` | Output-token budget for the scaffold build call. |
+| `stream_usage` | `true` | Ask the server to report usage on streamed replies too (OpenAI `stream_options.include_usage`); without it the answer phase's token, cost, and cache-hit numbers are unknown. |
+| `language` | `"en"` | Interface language: "en" or "es". |
+| `llm_reply_language` | `"match_ui"` | What language the model writes its prose explanations in. |
+| `benchmarks_dir` | `""` | Parent folder for the built-in model benchmark projects. |
+| `profiles` | `{}` | Named model profiles (`[profiles.NAME]` tables); managed by the Profiles tab and `pedacito models`. |
+| `active_profile` | `''` | Name of the profile selected for this run (set by `--profile` / `default_profile`). |
+| `active_tier` | `''` | Budget tier resolved for this run (from `tier` or the model name). |
+| `model_size_bytes` | `0` | Model weight size reported by the server, used by the footprint estimate; 0 when unknown. |
+
+</details>
+
+<details>
+<summary>Complete advanced settings reference (Indexing & Chunking)</summary>
+
+| Setting | Default | Meaning |
+|---|---|---|
+| `file_card_line_ranges` | `true` | Attach L<start>-<end> to names on file cards (saves an `outline` call). |
+| `class_split_lines` | `60` | Classes shorter than this are indexed as one chunk instead of per-method. |
+| `max_unit_lines` | `220` | A function/method (or module preamble/trailing block) larger than either limit is split at top-level statement boundaries into name#2, name#3, ... |
+| `max_unit_chars` | `12000` | Split a function, method or preamble larger than this many characters into name#2, name#3, ... |
+| `max_unit_tokens` | `3000` | Token guard (~3.6 chars/token) for small contexts; 0 disables. |
+| `unit_overlap_lines` | `0` | Lines repeated between line windows when one giant statement must be windowed. |
+| `max_chunk_chars` | `6000` | Chunks larger than this get their source truncated before summarising. |
+| `min_lines_to_summarise` | `4` | Skip summarising trivially short chunks; the signature says enough. |
+| `summarise_methods` | `false` | Summarisation rationing: a docstring is already a summary, and a method is covered by its class summary plus its signature. |
+| `summarise_documented` | `false` | Also summarise units that already have a docstring. |
+| `include_references` | `true` | Index non-Python files (.md .csv .json .toml .yaml ...) structurally: the map shows a CSV's columns or a config's sections; contents are never pulled into the map. |
+| `extra_extensions` | `[]` | Extra extensions to treat as reference files, e.g. [".jinja", ".proto"]. |
+| `max_reference_bytes` | `2000000` | Above this size a reference file is recorded by name and header only. |
+| `summarise_references` | `false` | Summarise reference files (markdown, JSON, ...) instead of listing only their structure. |
+| `use_project_instructions` | `true` | Include the repository's PEDACITO.md / AGENTS.md / CLAUDE.md in every prompt. |
+| `manage_gitignore` | `true` | On first run, add .pedacito/ to the project's .gitignore. |
+| `create_ignore_file` | `true` | On first run, create a commented .pedacitoignore. |
+| `use_ripgrep` | `true` | Use ripgrep for `grep` when installed (same output format). |
+
+</details>
+
+<details>
+<summary>Complete advanced settings reference (Gather & Loop Leases)</summary>
+
+| Setting | Default | Meaning |
+|---|---|---|
+| `max_todo_chars` | `1500` | Cap on the model's own checklist when injected into a prompt. |
+| `dynamic_tool_pruning` | `true` | Dynamic tool schema pruning: keep the core navigation actions always available, but omit an enabled optional/specialized action from the prompt schema once the repository's tool-use stats show it has gone unused for `... |
+| `tool_prune_after_tasks` | `10` | Consecutive tasks a tool may go unused before pruning considers it. |
+| `max_completion_rounds` | `0` | Limit on follow-up answer turns when the model defers remaining work; 0 = no limit (stops on NOTHING MORE or when no blocks are produced). |
+| `max_continuation_rounds` | `0` | Limit on continuation turns when a reply is cut off mid-block; 0 = no limit (the continuation char budget is the real bound). |
+| `max_rehydration_rounds` | `2` | Rounds of `NEED path/to/file.py:120-168` exact-span rehydration allowed per answer, repair or verifier generation: the harness fetches ONLY those spans (hash-checked, token-clipped like a `read`), APPENDS them at the... |
+| `max_read_lines` | `200` | Maximum lines returned by one `read` call. |
+| `read_context_hint` | `true` | Attach the enclosing signature and module imports when a `read` starts mid- file. |
+| `read_skeleton` | `true` | When a `read` targets a class/module larger than the read budget, return a deterministic AST skeleton (signatures + docstrings + [lines X-Y] pointers, bodies folded) instead of the first page of the giant unit; contin... |
+| `compact_step_schema` | `false` | EXPERIMENTAL: require only `action` and `reasoning` in the gather step schema so grammar-constrained decoding may omit unused fields (~20-40 output tokens per step). |
+| `fold_tail_steps` | `0` | Recent gather steps kept verbatim when older ones are folded into a STATE digest at window pressure; 0 = chosen from the tier. |
+| `max_memory_chars` | `1500` | Cap on project and user memory text included in prompts. |
+| `max_skill_catalog_chars` | `900` | Cap on the skills catalog block in prompts. |
+| `subagent_max_steps` | `8` | Lookup-step limit for one `task` subagent. |
+| `max_fetch_chars` | `6000` | Cap on fetched page text fed back to the model. |
+
+</details>
+
+<details>
+<summary>Complete advanced settings reference (Editing & Repair)</summary>
+
+| Setting | Default | Meaning |
+|---|---|---|
+| `auto_diagnostics` | `false` | After each `auto` task (when no --verify command is set), run the project's detected linter/type checker and feed failures into the repair rounds. |
+| `diagnostics_timeout` | `90` | Seconds allowed for one auto-diagnostics linter/typechecker run. |
+| `max_diagnostics_chars` | `8000` | Cap on diagnostics text fed back into repair. |
+| `max_write_chars` | `200000` | Ceiling on one `write` call's contents, in characters. |
+| `max_write_lines` | `120` | Maximum lines one reply may emit for one file (gather `write` or answer-phase edit block). |
+| `allow_rename` | `true` | Treat a creation of a new path paired with a block that empties an existing same-extension file as a real move (old file deleted). |
+| `fuzzy_min_ratio` | `0.85` | Minimum similarity for a fuzzy edit anchor; below this the edit fails instead of guessing. |
+| `repair_rounds` | `2` | Repair round-trips per apply when a search/replace block fails to match. |
+| `incremental_edit_loop` | `true` | Symbol-anchored incremental edit-verify microloops. |
+| `max_new_files` | `24` | Cap on files a plan may propose; the excess is reported. |
+| `max_spec_chars` | `60000` | Spec documents longer than this are truncated, with a warning. |
+| `test_timeout` | `300` | Seconds allowed for one test-command run. |
+
+</details>
+
+<details>
+<summary>Complete advanced settings reference (Auto Loop & Checkpoints)</summary>
+
+| Setting | Default | Meaning |
+|---|---|---|
+| `auto_plan_file` | `"PLAN.md"` | A goal becomes a checklist; each task is implemented in a fresh context with the plan file as the only surviving state. |
+| `auto_max_tasks` | `0` | Cap on tasks per `auto` run; 0 = no cap. |
+| `auto_max_minutes` | `0` | Wall-clock cap per `auto` run in minutes; 0 = no cap. |
+| `auto_checkpoint_max_file_bytes` | `1000000` | Per-step snapshot bounds: a file larger than this is recorded but not copied (rollback leaves it alone); the walk stops after this many files, so one snapshot cannot fill the disk on a vendored monorepo. |
+| `auto_checkpoint_max_files` | `1500` | Maximum files recorded in one auto-step snapshot; the walk stops there. |
+| `auto_split_lines` | `120` | `new --complex` / `auto`: a source file whose scaffold stub is longer than this is split into several tasks (one per group of top-level definitions). |
+| `auto_install_deps` | `false` | pip-install a missing third-party module into the running interpreter when --verify fails on it, then retry. |
+| `review_port` | `0` | Port for the review page; 0 lets the OS choose a free one. |
+| `open_browser` | `true` | Open the review page in a browser automatically. |
+| `review_timeout` | `1800` | Seconds before an unanswered review page expires. |
+| `hybrid_routing` | `false` | Run each task in two stages: a strong architect model plans first (root cause, target files, exact signatures, edge cases), then the active editor model implements the blueprint. |
+| `architect_provider` | `""` | The profile whose server/model plans in hybrid Stage 1. |
+| `architect_model` | `""` | The model id the architect runs on. |
+| `auto_route_allow_hosted` | `false` | Allow specialist routing to pick a HOSTED (remote API) profile. |
+
+</details>
+
+<details>
+<summary>Complete advanced settings reference (Web, Browser, Vision & Semantic)</summary>
+
+| Setting | Default | Meaning |
+|---|---|---|
+| `allow_mcp` | `false` | Optional MCP client: exposes one `mcp` action plus a short tool catalog. |
+| `mcp_timeout` | `30` | Seconds allowed for one MCP server request. |
+| `screenshot_wait_seconds` | `5` | Seconds to wait after launching before capturing; the action's `start` value overrides it. |
+| `browser_wait_seconds` | `3` | Seconds to wait after navigation/interaction before capturing. |
+| `browser_server_wait_seconds` | `15` | Seconds to wait for a launched server to print its localhost URL. |
+| `browser_headless` | `true` | Run the browser action headless (no visible window). |
+| `browser_timeout_seconds` | `20` | Per-navigation/action timeout in seconds. |
+| `enable_web` | `false` | Allow the agent to fetch URLs or search documentation online. |
+| `vision_max_tokens` | `400` | Output-token cap for the vision model's screenshot description. |
+| `embedding_model` | `""` | Embedding model id; empty = the chat model. |
+| `semantic_top_k` | `5` | Number of nearest indexed units semantic search reports. |
+| `semantic_min_score` | `0.2` | Cosine similarity below this is not shown; scales differ by model. |
+| `browser_eval_hosts` | `[localhost, 127.0.0.1, ::1, 0.0.0.0]` | Hosts where the browser `eval` action may run model-authored JavaScript. |
+
+</details>
+
+<details>
+<summary>Complete advanced settings reference (Security, Sandbox & Retention)</summary>
+
+| Setting | Default | Meaning |
+|---|---|---|
+| `shell_timeout` | `120` | Seconds before a `run` command is killed. |
+| `shell_idle_seconds` | `10` | Kill a `run` command after this many seconds with NO output (keeps GUI apps and servers from blocking the agent); 0 disables the idle rule. |
+| `shell_allowlist` | `[]` | Optional executable allowlist for `run`, e.g. ["pytest", "python"]; empty = any executable once allow_shell is on. |
+| `max_shell_output_chars` | `8000` | Cap on command output fed back to the model, in characters. |
+| `security_outbound_mode` | `"warn"` | Outbound cloud-provider guard: before a request leaves for a hosted endpoint, scan its messages for unacknowledged secrets. |
+| `keep_sessions` | `0` | `pedacito prune` defaults (0 = keep everything). |
+| `keep_backups` | `0` | Backups kept by `pedacito prune`; 0 keeps everything. |
+| `log_max_bytes` | `2000000` | Rotate the event log after this many bytes. |
+
+</details>

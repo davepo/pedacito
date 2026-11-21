@@ -93,5 +93,8 @@ packages = ["pedacito", "pedacito.gui"]
 # their docs/ path so links inside the installed README resolve too.
 [tool.setuptools.data-files]
 "share/pedacito" = ["README.md", "QUICKSTART.md", "MODEL_GUIDE.md",
-                    "TECHNIQUES.md", "CHANGELOG.md"]
+                    "TECHNIQUES.md", "CHANGELOG.md", "README.es.md",
+                    "QUICKSTART.es.md", "MODEL_GUIDE.es.md",
+                    "TECHNIQUES.es.md"]
 "share/pedacito/docs" = ["docs/*.md"]
+"share/pedacito/docs/es" = ["docs/es/*.md"]
