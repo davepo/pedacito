@@ -111,6 +111,61 @@ def test_error_kinds_form_a_taxonomy():
     assert BudgetExceeded.kind == "budget" and CancelledError.kind == "cancelled"
 
 
+# BUG-007: the /models probe collapsed every failure into "Cannot reach the
+# server", so a reached-but-errored server (5xx, auth) looked like a dead port.
+class _ProbeResp(Resp):
+    def raise_for_status(self):
+        if self.status_code >= 400:
+            raise requests.exceptions.HTTPError(
+                f"{self.status_code} error", response=self)
+
+
+def _patch_get(monkeypatch, fn):
+    monkeypatch.setattr("pedacito.llm.requests.get", fn)
+
+
+def test_check_names_a_server_500_instead_of_unreachable(monkeypatch):
+    _patch_get(monkeypatch,
+               lambda *a, **k: _ProbeResp(500, text="internal error"))
+    with pytest.raises(LLMError) as e:
+        LLMClient(_cfg()).check()
+    msg = str(e.value)
+    assert "Server returned 500" in msg and "internal error" in msg
+    assert "Cannot reach" not in msg
+
+
+def test_check_names_an_auth_failure_and_points_at_the_key(monkeypatch):
+    _patch_get(monkeypatch,
+               lambda *a, **k: _ProbeResp(401, text="invalid api key"))
+    with pytest.raises(LLMError) as e:
+        LLMClient(_cfg()).check()
+    msg = str(e.value)
+    assert "Server returned 401" in msg
+    assert "api_key" in msg
+    assert "Cannot reach" not in msg
+
+
+def test_check_names_a_probe_timeout(monkeypatch):
+    def slow(*a, **k):
+        raise requests.exceptions.ReadTimeout("slow")
+
+    _patch_get(monkeypatch, slow)
+    with pytest.raises(LLMError) as e:
+        LLMClient(_cfg()).check()
+    assert "did not answer within" in str(e.value)
+    assert "Cannot reach" not in str(e.value)
+
+
+def test_check_still_reports_a_dead_port_as_unreachable(monkeypatch):
+    def dead(*a, **k):
+        raise requests.exceptions.ConnectionError("refused")
+
+    _patch_get(monkeypatch, dead)
+    with pytest.raises(LLMError) as e:
+        LLMClient(_cfg()).check()
+    assert "Cannot reach the server" in str(e.value)
+
+
 def test_stale_keepalive_connection_is_retried_once(monkeypatch):
     client = LLMClient(_cfg())
     calls = []

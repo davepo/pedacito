@@ -4152,6 +4152,26 @@ class LLMClient:
         try:
             r = requests.get(url, headers=self.headers, timeout=15)
             r.raise_for_status()
+        except requests.exceptions.HTTPError as e:
+            # BUG-007: the server WAS reached and answered with an error.
+            # Name the status (as _post does) instead of sending the user to
+            # check their port; a 5xx or a rejected key is not a dead server.
+            resp = e.response
+            status = resp.status_code if resp is not None else 0
+            try:
+                body = (resp.text if resp is not None else "")[:500]
+            except Exception:
+                body = ""
+            hint = ""
+            if status in (401, 403):
+                hint = ("\n  - The server rejected the credentials: check "
+                        "api_key in your config (`pedacito config --check`).")
+            raise LLMError(f"Server returned {status}: {body}{hint}") from e
+        except requests.exceptions.Timeout as e:
+            raise LLMError(
+                f"The server at {self.cfg.base_url} did not answer within "
+                "15s while listing models. A local model may still be "
+                "loading; try again shortly.") from e
         except Exception as e:
             raise LLMError(
                 CONNECT_HELP.format(url=self.cfg.base_url) + "\n"
