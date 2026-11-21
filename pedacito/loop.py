@@ -5274,6 +5274,12 @@ def run_loop(root: Path, cfg, client, idx, plan_path: Path, *,
             # in project memory exactly once.
             ok, out = run_verify(root, verify, cfg=cfg)
             final_state["ran"] = True
+            if verify_final:
+                # Tell `auto`'s post-run pass that the whole-goal check has
+                # already run, so it does not run the same command a second
+                # time after the loop.
+                cfg._verify_final_ran = True
+                cfg._verify_final_ok = ok
             return ok, out
         if use_diag:
             return diagnostics.run_changed(root, cfg, changed)
@@ -6049,6 +6055,8 @@ def run_loop(root: Path, cfg, client, idx, plan_path: Path, *,
         # and exit-code responsibility after the loop stays with the
         # caller (auto's post-run verification pass).
         ok, out = run_verify(root, verify, cfg=cfg)
+        cfg._verify_final_ran = True
+        cfg._verify_final_ok = ok
         print(f"  [final-only check was not reached inside the loop; running "
               f"`{verify}` once for the record: "
               f"{'passed' if ok else 'FAILED'}]", file=sys.stderr)

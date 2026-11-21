@@ -1257,9 +1257,13 @@ def _cmd_auto(args, cfg, client, idx, root: Path) -> int:
                          verify_final=verify_final)
 
     # Post-run verification: exercise the project once (--verify and/or a smoke
-    # run of main.py) and feed a failure back for repair.
+    # run of main.py) and feed a failure back for repair. With --verify-final
+    # the loop already ran that exact command once after the last task (and
+    # repaired any failure); running it again here doubled the full suite.
     smoke = bool(cfg.auto_smoke)
-    if args.apply and (verify or smoke):
+    final_already = bool(verify_final
+                         and getattr(cfg, "_verify_final_ran", False))
+    if args.apply and (verify or smoke) and not final_already:
         skip = {".pedacito", "__pycache__", ".venv", "venv",
                 "node_modules", ".git"}
         # Prune skipped dirs and virtualenvs (any name, via pyvenv.cfg) while
