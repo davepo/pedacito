@@ -1258,12 +1258,18 @@ def _cmd_auto(args, cfg, client, idx, root: Path) -> int:
 
     # Post-run verification: exercise the project once (--verify and/or a smoke
     # run of main.py) and feed a failure back for repair. With --verify-final
-    # the loop already ran that exact command once after the last task (and
-    # repaired any failure); running it again here doubled the full suite.
+    # the loop already ran that exact command once after the last task and fed
+    # any failure to its repair rounds: when it ended green, run it no more.
+    # A RED final check keeps this pass -- including a run stopped before the
+    # check came due, where the loop only ran it "for the record" without
+    # repair and left repair and exit-code responsibility here. The smoke run
+    # is a separate check and survives either way.
     smoke = bool(cfg.auto_smoke)
-    final_already = bool(verify_final
-                         and getattr(cfg, "_verify_final_ran", False))
-    if args.apply and (verify or smoke) and not final_already:
+    final_ran = bool(verify_final
+                     and getattr(cfg, "_verify_final_ran", False))
+    final_ok = bool(getattr(cfg, "_verify_final_ok", False))
+    post_verify = "" if (final_ran and final_ok) else verify
+    if args.apply and (post_verify or smoke):
         skip = {".pedacito", "__pycache__", ".venv", "venv",
                 "node_modules", ".git"}
         # Prune skipped dirs and virtualenvs (any name, via pyvenv.cfg) while
@@ -1277,13 +1283,14 @@ def _cmd_auto(args, cfg, client, idx, root: Path) -> int:
         py_rels.sort()
         v_ok, v_out = scaffold.verify_and_fix(
             client, cfg, idx, py_rels, root.name, None,
-            explicit_cmd=verify,
+            explicit_cmd=post_verify,
             rounds=int(cfg.auto_verify_rounds or 0),
             smoke=smoke,
             smoke_timeout=int(cfg.auto_smoke_timeout or 20),
             verbose=True)
         if v_ok:
-            note, ran = scaffold.verify_receipt(root, verify, smoke, v_ok, v_out)
+            note, ran = scaffold.verify_receipt(root, post_verify, smoke,
+                                                v_ok, v_out)
             print(f"  {note}", file=sys.stderr)
             workspace.log_event(root, note, "INFO" if ran else "WARN")
         else:
@@ -1293,6 +1300,11 @@ def _cmd_auto(args, cfg, client, idx, root: Path) -> int:
             workspace.log_event(root, f"verify failed: {v_out[:200]}", "ERROR")
             if code == 0:
                 code = 1
+    elif args.apply and final_ran and final_ok and verify:
+        # The whole-goal check ran (and passed) inside the loop: say so
+        # instead of silently dropping the post-run verify line.
+        print("  verify: passed (--verify-final ran once inside the loop)",
+              file=sys.stderr)
     if args.apply:
         # The run wrote files (tasks, repairs, installs): leave the saved
         # index in line with the tree so the next session -- and a GUI

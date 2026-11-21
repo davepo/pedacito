@@ -31,6 +31,7 @@ def test_auto_skips_post_run_verify_when_final_already_ran(tmp_path,
     cfg = Config()
     cfg.auto_smoke = False
     cfg._verify_final_ran = True
+    cfg._verify_final_ok = True
     called: list[str] = []
 
     monkeypatch.setattr(loop, "run_loop", lambda *a, **k: 0)
@@ -42,3 +43,53 @@ def test_auto_skips_post_run_verify_when_final_already_ran(tmp_path,
                          SimpleNamespace(root=tmp_path), tmp_path)
     assert code == 0
     assert called == []
+
+
+def test_auto_still_repairs_a_red_final_check(tmp_path, monkeypatch):
+    """A final check that ended RED keeps the post-run repair pass.
+
+    The loop's "for the record" path (a run stopped by a cap before the last
+    task) runs the whole-goal command WITHOUT repair and leaves repair and
+    exit-code responsibility to auto's post-run pass. Skipping that pass on
+    the ran-flag alone let a failed whole-goal check exit 0 unrepaired.
+    """
+    plan = tmp_path / "PLAN.md"
+    loop.write_plan(plan, "goal", ["one"])
+    cfg = Config()
+    cfg.auto_smoke = False
+    cfg._verify_final_ran = True
+    cfg._verify_final_ok = False
+    called: list[str] = []
+
+    monkeypatch.setattr(loop, "run_loop", lambda *a, **k: 0)
+    monkeypatch.setattr(scaffold, "verify_and_fix",
+                        lambda *a, **k: called.append(k.get("explicit_cmd"))
+                        or (False, "boom"))
+
+    code = cli._cmd_auto(_args(plan), cfg, None,
+                         SimpleNamespace(root=tmp_path), tmp_path)
+    assert called == ["sh -c 'exit 0'"]
+    assert code == 1
+
+
+def test_auto_keeps_the_smoke_run_when_final_ran_green(tmp_path, monkeypatch):
+    """--verify-final replaces the verify COMMAND, not the smoke run."""
+    plan = tmp_path / "PLAN.md"
+    loop.write_plan(plan, "goal", ["one"])
+    cfg = Config()
+    cfg.auto_smoke = True
+    cfg._verify_final_ran = True
+    cfg._verify_final_ok = True
+    seen: list[dict] = []
+
+    monkeypatch.setattr(loop, "run_loop", lambda *a, **k: 0)
+    monkeypatch.setattr(
+        scaffold, "verify_and_fix",
+        lambda *a, **k: seen.append({"cmd": k.get("explicit_cmd"),
+                                     "smoke": k.get("smoke")})
+        or (True, ""))
+
+    code = cli._cmd_auto(_args(plan), cfg, None,
+                         SimpleNamespace(root=tmp_path), tmp_path)
+    assert code == 0
+    assert seen == [{"cmd": "", "smoke": True}]
