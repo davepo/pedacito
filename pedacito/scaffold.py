@@ -25,6 +25,7 @@ from __future__ import annotations
 import re
 import subprocess
 import sys
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -372,11 +373,13 @@ def _spec_forbids_extras(text: str) -> bool:
 
 
 def build_plan(spec: Spec, client, cfg, root: Path, verbose: bool = True,
-               design: dict | None = None) -> Plan:
+               design: dict | None = None,
+               deadline: float | None = None) -> Plan:
     """Ask the model for a file plan, then sanitise it: dedupe paths, drop
     entries that escape the root or have no extension, cap at cfg.max_new_files.
     Raises LLMError if nothing usable comes back. `design`, when given, is a
-    compact architecture contract the file list must follow."""
+    compact architecture contract the file list must follow. `deadline`
+    carries the run's time budget into the call's retry loop (BUG-010)."""
     limit = getattr(cfg, "max_new_files", 24)
     budget = getattr(cfg, "max_spec_chars", MAX_SPEC_CHARS)
     body = spec.text[:budget]
@@ -396,7 +399,7 @@ def build_plan(spec: Spec, client, cfg, root: Path, verbose: bool = True,
                 {"role": "user", "content": user}]
     raw = client.chat_json(messages, PLAN_SCHEMA,
                            max_tokens=getattr(cfg, "max_tokens_plan", 2000),
-                           disable_thinking=True)
+                           disable_thinking=True, deadline=deadline)
     if not isinstance(raw, dict):
         raise LLMError("The planning call did not return an object.")
 
@@ -464,11 +467,12 @@ def _stub_language_error(rel: str, code: str) -> str | None:
 
 
 def build_interface(plan: Plan, client, cfg, verbose: bool = True,
-                    design: dict | None = None) -> dict[str, str]:
+                    design: dict | None = None,
+                    deadline: float | None = None) -> dict[str, str]:
     """Fix the public API of every source file in ONE call, so the per-file
     build only fills bodies against known signatures. Returns {path: stub_code}.
     `design`, when given, supplies the interface/data contract the stubs must
-    follow."""
+    follow. `deadline` carries the run's time budget (BUG-010)."""
     sources = plan.sources or plan.files
     file_tree = "\n".join(f"  {f.path}  -- {f.purpose}" for f in sources)
     body = plan.spec.text[:getattr(cfg, "max_spec_chars", MAX_SPEC_CHARS) // 2]
@@ -485,7 +489,7 @@ def build_interface(plan: Plan, client, cfg, verbose: bool = True,
     ]
     raw = client.chat_json(messages, INTERFACE_SCHEMA,
                            max_tokens=getattr(cfg, "max_tokens_build", 16000),
-                           disable_thinking=True)
+                           disable_thinking=True, deadline=deadline)
     out: dict[str, str] = {}
     for entry in raw.get("files") or []:
         if not isinstance(entry, dict):
@@ -521,7 +525,7 @@ def build_interface(plan: Plan, client, cfg, verbose: bool = True,
                      "signatures."}],
                 INTERFACE_SCHEMA,
                 max_tokens=getattr(cfg, "max_tokens_build", 16000),
-                disable_thinking=True)
+                disable_thinking=True, deadline=deadline)
             for entry in raw2.get("files") or []:
                 if not isinstance(entry, dict):
                     continue
@@ -1111,16 +1115,23 @@ def _build_repair_note(target: PlannedFile, bad: list, root: Path) -> str:
 
 def build_project(client, cfg, idx, plan: Plan, verbose: bool = True,
                   on_file=None, backup_dir=None,
-                  tests_first: bool | None = None) -> dict:
+                  tests_first: bool | None = None,
+                  deadline: float | None = None) -> dict:
     """Run a build pass for each planned source file, in plan order, stopping
     early if the server goes away. Returns
     {"done": [paths], "noop": [paths], "failed": [(path, message)],
-     "skipped": [paths]}; `noop` holds files the build left untouched because
-    they were already complete (they count as finished, not failed).
+     "skipped": [paths], "capped": bool}; `noop` holds files the build left
+    untouched because they were already complete (they count as finished, not
+    failed).
 
     With `tests_first` (spec-driven scaffolding), test stubs are implemented
     before their sources so the tests define the contract. The default keeps
-    the historical source-first order."""
+    the historical source-first order.
+
+    `deadline` (a `time.monotonic()` value) is the run's time budget: it is
+    checked BETWEEN files, never mid-call -- the same pattern as the auto
+    loop's cap. Once it passes, the remaining files are skipped and `capped`
+    is set so the caller can close the run honestly (BUG-010)."""
     sources = list(plan.sources or plan.files)
     tests = [t for t in plan.tests if t not in sources]
     if tests_first is None:
@@ -1130,7 +1141,15 @@ def build_project(client, cfg, idx, plan: Plan, verbose: bool = True,
     noop: list[str] = []
     failed: list[tuple[str, str]] = []
     skipped: list[str] = []
-    for t in targets:
+    capped = False
+    for i, t in enumerate(targets):
+        if deadline is not None and time.monotonic() >= deadline:
+            skipped.extend(x.path for x in targets[i:])
+            capped = True
+            if verbose:
+                print("\n[time budget reached; the remaining files stay as "
+                      "stubs]", file=sys.stderr)
+            break
         path = idx.root / t.path
         if not path.is_file():
             skipped.append(t.path)
@@ -1188,7 +1207,8 @@ def build_project(client, cfg, idx, plan: Plan, verbose: bool = True,
             if verbose:
                 for r in bad:
                     print(f"  FAILED {r.file}: {r.message}", file=sys.stderr)
-    return {"done": done, "noop": noop, "failed": failed, "skipped": skipped}
+    return {"done": done, "noop": noop, "failed": failed, "skipped": skipped,
+            "capped": capped}
 
 
 def _cli_source_for_docs(idx, plan: Plan, max_chars: int = 6000) -> str:
@@ -1895,6 +1915,20 @@ def run_new(root: Path, cfg, client, spec: Spec, *, apply: bool = False,
                   plan_only=bool(plan_only), complex=bool(complex))
         if auto_complex:
             elog.emit("complex_auto", text=COMPLEX_AUTO_NOTICE)
+
+    # BUG-010: --max-minutes was honoured only by --complex; the plain path
+    # burned the whole budget on design/plan retries and died to the external
+    # timeout with no sources and no closing message. Carry the same wall-clock
+    # deadline through every stage, checked between calls and between files
+    # (never mid-call -- the auto loop's pattern). cfg.max_task_seconds gets
+    # the same ceiling so agent-driven tasks inside the run see it too.
+    minutes = (max_minutes if max_minutes is not None
+               else int(getattr(cfg, "auto_max_minutes", 0) or 0))
+    deadline = None
+    if minutes > 0:
+        deadline = time.monotonic() + minutes * 60
+        cfg.max_task_seconds = minutes * 60
+
     design_doc = None
     if design:
         from . import design as design_mod
@@ -1904,7 +1938,8 @@ def run_new(root: Path, cfg, client, spec: Spec, *, apply: bool = False,
         # guides this run's plan, but nothing is written under .pedacito/
         # (HARNESS-2). Re-running with --apply regenerates and saves it.
         design_doc = design_mod.generate(client, cfg, spec, root,
-                                         save_it=wants_skeleton)
+                                         save_it=wants_skeleton,
+                                         deadline=deadline)
         warnings = design_mod.validate(design_doc, cfg)
         print(design_mod.render(design_doc))
         if warnings:
@@ -1919,14 +1954,14 @@ def run_new(root: Path, cfg, client, spec: Spec, *, apply: bool = False,
                   ".pedacito/", file=sys.stderr)
 
     plan = build_plan(spec, client, cfg, root, verbose=verbose,
-                      design=design_doc)
+                      design=design_doc, deadline=deadline)
     print(render_plan(plan))
 
     stubs = {}
     if wants_skeleton:
         # One call fixes the API contract so cross-file imports stay consistent.
         stubs = build_interface(plan, client, cfg, verbose=verbose,
-                                design=design_doc)
+                                design=design_doc, deadline=deadline)
     created = apply_skeleton(root, plan, dry_run=not wants_skeleton,
                              verbose=verbose, stubs=stubs)
     if not wants_skeleton:
@@ -1983,7 +2018,21 @@ def run_new(root: Path, cfg, client, spec: Spec, *, apply: bool = False,
           file=sys.stderr)
     summary = build_project(client, cfg, idx, plan, verbose=verbose,
                             backup_dir=backup_dir,
-                            tests_first=True if design_doc else None)
+                            tests_first=True if design_doc else None,
+                            deadline=deadline)
+    if summary.get("capped"):
+        # The budget ran out between files: close the run honestly instead of
+        # spending more minutes on repair/docs/gates over a half-built tree.
+        print("\n" + summarise_result(summary))
+        print(f"\nBUILD CAPPED: the {minutes}-minute time budget ran out; the "
+              "skipped files are still stubs.\n"
+              "  Finish them with:  pedacito ask . --apply -t \"implement the "
+              "remaining stub files\"", file=sys.stderr)
+        workspace.log_event(
+            root, f"new: {minutes}-minute time budget reached; "
+                  f"{len(summary['skipped'])} file(s) left as stubs", "WARN")
+        _new_checkpoint(f"new: {plan.project_name} (capped)")
+        return 1
     contract_failed = False
     tests_failed = False
 

@@ -3533,7 +3533,8 @@ class LLMClient:
             for p in props.values())
 
     def chat_json(self, messages: list[dict], schema: dict, max_tokens: int,
-                  disable_thinking: bool | None = None) -> dict:
+                  disable_thinking: bool | None = None,
+                  deadline: float | None = None) -> dict:
         """Send a grammar-constrained chat request and return the parsed
         JSON object.
 
@@ -3541,6 +3542,11 @@ class LLMClient:
         max_tokens, so a truncated attempt retries with a larger budget (see
         `_schema_has_big_fields` for when it does not), or salvages the
         complete prefix of the object.
+
+        `deadline` (a `time.monotonic()` value) is the run's wall-clock time
+        budget: once it has passed, no further attempt starts and an
+        LLMError reports the expired budget. The call in flight is never
+        killed -- the gate sits between attempts, like the auto loop's cap.
         """
         retries = 2
         budget = max_tokens
@@ -3573,6 +3579,11 @@ class LLMClient:
                       max(usable, max_tokens))
         cap = max(cap, max_tokens)
         for attempt in range(retries + 1):
+            if deadline is not None and time.monotonic() >= deadline:
+                raise LLMError(
+                    "The run's time budget expired before this JSON call "
+                    "could be retried (--max-minutes); stopping instead of "
+                    "spending more minutes on re-asks.")
             raw = self.chat(messages, max_tokens=budget, schema=schema,
                             stream=False, disable_thinking=disable_thinking)
             truncated = self.last_finish_reason == "length"

@@ -3262,8 +3262,9 @@ def build_parser() -> argparse.ArgumentParser:
     p_new.add_argument("--max-tasks", type=int, default=None,
                        help="(with --complex) stop after attempting this many tasks")
     p_new.add_argument("--max-minutes", type=int, default=None,
-                       help="(with --complex) stop before starting a task once "
-                            "this many minutes have elapsed (0 = no limit)")
+                       help="wall-clock minute cap for the whole run: stops "
+                            "between calls/files once this many minutes have "
+                            "elapsed (0 = no limit; default: auto_max_minutes)")
     p_new.add_argument("--keep-going", action="store_true",
                        help="(with --complex) continue past failed tasks "
                             "instead of stopping")

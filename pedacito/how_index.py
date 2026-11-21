@@ -370,7 +370,9 @@ CLI_COMMANDS = [
             {"flag": "--repair N",
              "help": "with --complex: fix rounds per failed verification"},
             {"flag": "--max-tasks N", "help": "with --complex: task cap"},
-            {"flag": "--max-minutes N", "help": "with --complex: minute cap"},
+            {"flag": "--max-minutes N",
+             "help": "wall-clock minute cap for the whole run (checked between "
+                     "calls and files)"},
             {"flag": "--keep-going",
              "help": "with --complex: continue past failures"},
             {"flag": "--auto-install",

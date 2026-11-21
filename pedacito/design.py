@@ -100,6 +100,8 @@ Rules:
 - Keep modules small enough to implement in one focused pass; split anything
   that would exceed roughly 200 lines.
 - Do not invent third-party packages. Prefer the standard library.
+- Name Python test files test_<module>.py so pytest discovers them; never
+  <module>.test.py or <module>.spec.py (pytest does not collect those).
 """
 
 
@@ -110,8 +112,42 @@ def _path(value: str) -> str:
     return p.lstrip("/")
 
 
+def _pytest_name(path: str) -> str:
+    """A Python test path pytest can discover: ``store.test.py`` and
+    ``api.spec.py`` become ``test_store.py`` / ``test_api.py`` in the same
+    directory. ``test_*.py`` and ``*_test.py`` already are discoverable, and
+    non-Python files keep their names (BUG-010: a designed ``todo_store.test.py``
+    made the verify gate exit 1 over a suite pytest never collected)."""
+    if not path.endswith(".py"):
+        return path
+    parent, _, name = path.rpartition("/")
+    stem = name[:-3]
+    for suffix in (".test", ".spec"):
+        if stem.endswith(suffix) and len(stem) > len(suffix):
+            stem = "test_" + stem[:-len(suffix)]
+            break
+    new = stem + ".py"
+    return parent + "/" + new if parent else new
+
+
 def _norm(design: dict) -> dict:
-    """Copy a design with normalized paths and deduplicated string lists."""
+    """Copy a design with normalized paths and deduplicated string lists.
+    Undiscoverable Python test names are renamed to ``test_*.py`` and every
+    reference to a renamed path (depends_on, covers) follows it."""
+    renames: dict[str, str] = {}
+    for key in ("modules", "tests"):
+        for entry in design.get(key) or []:
+            if isinstance(entry, dict):
+                p = _path(str(entry.get("path") or ""))
+                if p:
+                    q = _pytest_name(p)
+                    if q != p:
+                        renames[p] = q
+
+    def _ref(value) -> str:
+        p = _path(str(value))
+        return renames.get(p, p)
+
     out = {
         "project_name": str(design.get("project_name") or "project")[:80],
         "summary": str(design.get("summary") or "")[:1200],
@@ -127,6 +163,7 @@ def _norm(design: dict) -> dict:
         path = _path(str(m.get("path") or ""))
         if not path:
             continue
+        path = renames.get(path, path)
         try:
             estimated = max(0, int(m.get("estimated_lines") or 0))
         except (TypeError, ValueError):
@@ -136,8 +173,8 @@ def _norm(design: dict) -> dict:
             "responsibility": str(m.get("responsibility") or "")[:400],
             "interfaces": [str(x)[:240] for x in (m.get("interfaces") or [])
                            if str(x).strip()][:30],
-            "depends_on": [_path(str(x)) for x in (m.get("depends_on") or [])
-                           if _path(str(x))][:20],
+            "depends_on": [_ref(x) for x in (m.get("depends_on") or [])
+                           if _ref(x)][:20],
             "estimated_lines": estimated,
         })
     for d in design.get("data_shapes") or []:
@@ -153,9 +190,9 @@ def _norm(design: dict) -> dict:
         path = _path(str(t.get("path") or ""))
         if path:
             out["tests"].append({
-                "path": path,
-                "covers": [_path(str(x)) for x in (t.get("covers") or [])
-                           if _path(str(x))][:20],
+                "path": renames.get(path, path),
+                "covers": [_ref(x) for x in (t.get("covers") or [])
+                           if _ref(x)][:20],
                 "cases": [str(x)[:240] for x in (t.get("cases") or [])
                           if str(x).strip()][:30],
             })
@@ -295,10 +332,12 @@ def save(root, design: dict) -> tuple[Path, Path]:
     return jp, mp
 
 
-def generate(client, cfg, spec, root, save_it: bool = True) -> dict:
+def generate(client, cfg, spec, root, save_it: bool = True,
+             deadline: float | None = None) -> dict:
     """One JSON design call, normalized and (unless `save_it` is False, e.g.
     a dry-run `new` that must not touch the project) saved under
-    `.pedacito/`."""
+    `.pedacito/`. `deadline` carries the run's time budget into the call's
+    retry loop (BUG-010)."""
     messages = [
         {"role": "system", "content": DESIGN_SYSTEM},
         {"role": "user", "content":
@@ -307,7 +346,7 @@ def generate(client, cfg, spec, root, save_it: bool = True) -> dict:
     raw = client.chat_json(
         messages, DESIGN_SCHEMA,
         max_tokens=int(getattr(cfg, "max_tokens_plan", 2000) or 2000),
-        disable_thinking=True)
+        disable_thinking=True, deadline=deadline)
     design = _norm(raw if isinstance(raw, dict) else {})
     if save_it:
         try:
