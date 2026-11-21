@@ -1599,11 +1599,6 @@ def _walk_namespaces(nodes, spec):
                 yield from _walk_namespaces(body.named_children, spec)
 
 
-def _go_receiver(node, src: bytes) -> str:
-    """Receiver type name of a Go method declaration ("" for functions)."""
-    return _go_receiver_pair(node, src)[0]
-
-
 def _go_receiver_pair(node, src: bytes) -> tuple[str, str]:
     """(receiver type, receiver variable) of a Go method declaration; Go has
     no `self` keyword -- the named receiver IS the self reference."""

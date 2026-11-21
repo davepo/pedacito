@@ -238,7 +238,7 @@ def test_static_pages_and_security_headers(gui):
     assert status == 200 and b"pedacito" in body
     assert "default-src 'self'" in headers["Content-Security-Policy"]
     assert headers["X-Frame-Options"] == "DENY"
-    for name in ("app.css", "app.js", "panels.js", "settings.js", "main.js"):
+    for name in ("app.css", "app.js", "settings.js"):
         assert gui.req("GET", "/static/" + name)[0] == 200
     assert gui.req("GET", "/static/../gui/server.py")[0] == 404
     assert gui.req("GET", "/static/nope.js")[0] == 404

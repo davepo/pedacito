@@ -106,7 +106,8 @@ extra cost:
   emits structured edit intents, `[{file, symbol, intended_change}]`. The
   harness resolves one symbol at a time, appends that symbol's exact current
   body at the conversation tail, and asks for **one** SEARCH/REPLACE hunk at
-  `temperature_answer=0`. It dry-applies the hunk, runs `verify.py` and the
+  the configured `temperature_answer` (default `0.3`; `0` forces greedy
+  decoding). It dry-applies the hunk, runs `verify.py` and the
   AST/tree-sitter syntax gate, writes it only if clean, then replaces the
   temporary source with a one-line `[EDITED file:symbol]` receipt before
   moving to the next symbol. A symbol that cannot be resolved in a file that
@@ -315,10 +316,10 @@ retries.
 
 ### 6. Sampling the right amount
 
-- **Per-phase temperature** (`temperature_answer=0`, `temperature_repair`). The
-  answer and repair phases copy SEARCH text character-for-character, so they
-  decode greedily; the gather phase keeps a little diversity for when it gets
-  stuck.
+- **Per-phase temperature** (`temperature_answer`, default `0.3`;
+  `temperature_repair`). The answer and repair phases copy SEARCH text
+  character-for-character, so they run cool (`0` forces fully greedy decoding);
+  the gather phase keeps a little diversity for when it gets stuck.
 - **Best-of-N** (`best_of`, off by default). A weak model may sample a second
   edit reply at higher temperature, both scored deterministically, keeping the
   best. No majority voting, see below.
@@ -1700,9 +1701,9 @@ computed from the same deterministic edit evidence the tracker already gathers.
 
 ## Upgrade paths (validation report 2)
 
-The second validation pass (`PEDACITO_VALIDATION_REPORT_2.md`) named six
-outstanding upgrade paths. Each is implemented as a deterministic, harness-side
-mechanism -- no extra model calls -- and each is covered by
+The second validation pass named six outstanding upgrade paths. Each is
+implemented as a deterministic, harness-side mechanism -- no extra model calls
+-- and each is covered by
 `tests/test_upgrade_paths.py` (U1–U5) and `tests/test_domcheck.py` (U6).
 
 ### 40. Escalation policy: know when a profile will not unstick itself (U1)
@@ -1859,7 +1860,7 @@ already covered by `PEDACITO_<KEY>` overrides, `api_key_env`, the default-off
 `allow_shell`/`allow_fetch`, and `scrub_env`. Each shipped item is a
 deterministic, harness-side mechanism -- no extra model calls on the green
 path, no new config keys -- and each has a dedicated test file. The full
-evaluation lives in `upgrades/HARNESS_LEADERBOARD_UPGRADES.md`.
+evaluation is recorded in the project's upgrade notes.
 
 ### 46. The repair-phase test-file lock (C1)
 

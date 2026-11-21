@@ -296,9 +296,9 @@ numbers on ROCm. If the counters are missing, the badge shows system RAM only.
    **Ollama** and **LM Studio** detect CUDA automatically. Start them as described in
    [Model server setup](#model-server-setup).
 
-3. Set `vram_gb` by hand. Pedacito does not read NVIDIA VRAM counters, so the memory view
-   cannot see your card. The value sizes the context window, so set it to your card's real
-   VRAM.
+3. Set `vram_gb` by hand if needed. Pedacito reads NVIDIA VRAM through `nvidia-smi` when
+   it is available, so the memory view sees your card automatically. You can still set
+   `vram_gb` manually; the value sizes the context window, so use your card's real VRAM.
 
 ### Quantized KV cache and context
 

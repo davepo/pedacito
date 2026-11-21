@@ -158,6 +158,7 @@ commands. Run `pedacito <command> --help` for every flag.
 | `pedacito config --check` | Test the connection and generation. `--doctor` also probes structured output. `--setup` runs first-time setup; `--upgrade [--dry-run]` adds newly documented options to your file |
 | `pedacito calibrate` | Measure the active model (or `--all` local profiles) and save a model card that tunes defaults. Hosted models are refused |
 | `pedacito profiles [--recommend]` | List profiles with their scores, and suggest role routing |
+| `pedacito profile [--show\|--run\|--reset]` | Show the hardware snapshot, last speed probe and active auto-tune; `--run` forces one probe, `--reset` drops cached measurements |
 | `pedacito ask PROJ -t "..."` | Run one task. Dry run by default. Add `--review`, `--apply`, `--plan`, `--refine`, `--jsonl`, or `--json` |
 | `pedacito explain PROJ -q "..."` | Answer a question about the code. Never edits |
 | `pedacito auto PROJ -t "..."` | Turn a goal into a checklist, then implement it task by task |
@@ -166,6 +167,10 @@ commands. Run `pedacito <command> --help` for every flag.
 | `pedacito tui PROJ` | Split-screen terminal UI: transcript, live activity/plan sidebar, and a Context Meter / token burn / tok/s telemetry footer. Full slash-command suite; `--headless` is scriptable |
 | `pedacito rpc [PROJ]` | JSONL-RPC over stdin/stdout for editors and other agents: one request per line, streamed events, steering, permission prompts, cancel -- index, profiles and session warm the whole time |
 | `pedacito how "..."` | Built-in help for the CLI, the GUI, and settings |
+| `pedacito undo PROJ` | Restore the workspace to the state immediately before the last run; `--list` shows the checkpoint tree |
+| `pedacito checkpoints` | List time-travel checkpoints and the active head; `--limit` and `--json` shape the output |
+| `pedacito checkout ID` | Restore the whole workspace or one `--file` from a checkpoint id (a unique prefix works) |
+| `pedacito update [--run]` | Check PyPI for a newer Pedacito and optionally upgrade this install |
 | `pedacito restore PROJ` | Undo the last write |
 | `pedacito rename OLD NEW` | Multi-file symbol rename through the AST and the tokenizer, no model call. `--file` scopes it, `--strings` also renames whole-word string literals, `--include-labels` only test-label strings, `--apply` writes (default: diff preview) |
 | `pedacito index`, `map`, `files`, `cost` | Build and inspect the index. These need no model call, except `index` summaries |
@@ -568,12 +573,15 @@ when priced. `pedacito tui` registers the live permission broker, so an untruste
 MCP tool, sensitive file read or shell command asks in the prompt bar:
 `y` allows once, `a` allows that key for the session, `n` denies.
 
-Slash commands: `/help`, `/keys`, `/status` (`/telemetry`), `/auto GOAL`,
-`/plan [GOAL]`, `/consolidate` (`/compact`), `/profile [NAME]`, `/model ID`,
-`/auto-route [on|off]`, `/think [on|off]`, `/creative [on|off|auto]`,
-`/apply [on|off]`, `/verify on|off|status`, `/skills`, `/skill NAME`,
-`/memory`, `/procs`, `/diff`, `/undo`, `/reset`, `/sidebar`, `/scroll
-up|down|top|bottom|N`, `/mouse [on|off]`, `/clear`, `/quit`. A plain line is a
+Slash commands: `/help`, `/keys`, `/status` (`/telemetry`), `/new`, `/auto GOAL`,
+`/auto! GOAL`, `/plan [GOAL]`, `/consolidate` (`/compact`), `/profile [NAME]`,
+`/profiles`, `/model ID`, `/auto-route [on|off]`, `/think [on|off]`,
+`/effort [low|medium|high]`, `/creative [on|off|auto]`, `/servers`,
+`/unload [NAME]`, `/apply [on|off]`, `/verify on|off|status`, `/skills`,
+`/skill NAME`, `/memory`, `/procs`, `/security`, `/theme`, `/pin`, `/rules`,
+`/hybrid`, `/arena`, `/diff`, `/checkpoints`, `/undo`, `/checkout ID`, `/run`,
+`/fix`, `/update`, `/reset`, `/sidebar`, `/scroll up|down|top|bottom|N`,
+`/mouse [on|off]`, `/clear`, `/quit` (`/exit`). A plain line is a
 task and runs through the normal gather/edit/verify loop. `/creative on` forces
 the Builder persona for every task, `auto` (the default) detects design tasks,
 `off` keeps surgical edits everywhere; `/verify` controls the post-edit

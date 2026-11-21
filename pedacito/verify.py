@@ -2753,11 +2753,6 @@ class RequirementTracker:
         return out
 
 
-def requirement_tracker(task: str, limit: int = 16) -> RequirementTracker:
-    """Convenience constructor for the run-scoped state machine."""
-    return RequirementTracker(task, limit)
-
-
 def _same_file(a: str, b: str) -> bool:
     a, b = fileio.path_key(a or ""), fileio.path_key(b or "")
     return bool(a and b and (a == b or a.endswith("/" + b)

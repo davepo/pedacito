@@ -62,7 +62,7 @@ python -m pytest -q
 python -m ruff check pedacito/ tests/
 ```
 
-Both must be clean. The full suite takes several minutes (roughly 3,350 tests
+Both must be clean. The full suite takes several minutes (roughly 3,560 tests
 at the v0.3.1 cut) and includes the drift guard. To iterate on the guard alone:
 
 ```bash

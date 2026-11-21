@@ -435,9 +435,9 @@ controls.
 
 ```bash
 pip install -e ".[dev]"
-pedacito config upgrade
+pedacito config --upgrade
 pedacito calibrate --all   # optional: refresh model cards and specialty tags
 ```
 
 No configuration migration is required for `v0.1.0` users; `pedacito config
-upgrade` adds the new defaults.
+--upgrade` adds the new defaults.

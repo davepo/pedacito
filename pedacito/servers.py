@@ -142,15 +142,6 @@ def _root(base_url: str) -> str:
     return base
 
 
-def _server_key(server) -> str:
-    """A URL or profile name from a state dict / config body / plain string."""
-    if isinstance(server, str):
-        return server
-    return str(_mapping_get(server, "base_url", "")
-               or _mapping_get(server, "name", "")
-               or _mapping_get(server, "provider", ""))
-
-
 def _headers_for(server, *, internal: bool = False) -> dict:
     """Bearer auth for the local server, when one is configured.
 
@@ -1101,18 +1092,6 @@ def format_server_states(states: list[dict], mem: dict | None = None) -> str:
         if loading:
             lines.append(f"    loading: {', '.join(loading)}")
     return "\n".join(lines)
-
-
-# A tiny compatibility namespace for callers that prefer attributes.
-def config_probe(base_url: str, model: str = "", provider: str = "") -> bool:
-    """True when one ad-hoc local endpoint is reachable."""
-    state = _probe_server({"name": provider or _host(base_url),
-                           "provider": provider,
-                           "kind": _kind_for(provider, provider, base_url),
-                           "base_url": base_url, "models": [model],
-                           "loaded_models": [], "load_cmd": "",
-                           "unload_cmd": ""})
-    return bool(state.get("online"))
 
 
 __all__ = [

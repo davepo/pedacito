@@ -469,7 +469,7 @@ Choose a profile with `default_profile =`, `PEDACITO_PROFILE`, `--profile`, or
 `/profile` in `chat` (increasing precedence). A profile can override any
 setting, not just the model.
 
-`tier = "tiny" | "small" | "medium" | "large" | "hosted"` fills in all token
+`tier = "tiny" | "small" | "medium" | "large" | "local-moe" | "hosted"` fills in all token
 budgets (`max_tokens_*`, `flat_map_token_budget`, `max_gathered_chars`, ...)
 from a preset; `tiny` suits ≤4B models with a ~4k window. When unset, the tier
 is guessed from the model name (≤4B → tiny, ≤10B → small, ≤20B → medium, else
@@ -735,7 +735,7 @@ config --reference` prints the annotated template. Key settings:
 | `auto_heal_imports` | true | Before a static-gate finding reaches the model, insert the one import that provably resolves it (stdlib name, or a symbol exactly one local module exports), verified by the AST checker; ambiguous names are never guessed. |
 | `collapse_repair_turns` | true | When a repair succeeds, drop the failed drafts from the conversation tail and keep a compact receipt, so the server's prompt-prefix cache is reused instead of re-prefilling the broken trajectory. |
 | `micro_facts` / `max_micro_fact_tokens` | true / 150 | Record confirmed commands and repair lessons in `.pedacito/micro_facts.json` and inject them as hints; the token cap applies to the injected block. A lesson confirmed twice for one directory is promoted into an auto-managed path-scoped rule in `.pedacito/rules/auto_*.md` instead of sitting in every prompt. |
-| `tier` | `""` | Budget preset: `tiny`/`small`/`medium`/`large`/`hosted`; guessed from the model name when unset. |
+| `tier` | `""` | Budget preset: `tiny`/`small`/`medium`/`large`/`local-moe`/`hosted`; guessed from the model name when unset. |
 | `max_steps` | 0 | Lookup limit per task; 0 = none. |
 | `prefetch_targets` | 0 | Read up to this many task-named files/symbols through the normal tool path before the first lookup step (and once more after gather when a named target is still unread). Prefetch reads don't count toward `max_steps`. |
 | `temperature` | 0.2 | Higher values make tool selection worse. Local servers only: hosted APIs get no sampling keys by default (see [Hosted APIs keep their own sampling](#hosted-apis-keep-their-own-sampling)). |
@@ -786,7 +786,7 @@ config --reference` prints the annotated template. Key settings:
 | `allow_git` / `git_context` | true | Read-only `git` action; branch/dirty/recent-commits preamble. |
 | `allow_subagents` | false | The `task` action (read-only helper with a fresh window). |
 | `allow_fetch` / `fetch_allowed_hosts` | false / `[]` | The `fetch` action and the hosts it may read. |
-| `roles` | `{}` | Per-job profiles: `planner`, `verifier`, `summarizer`, `repair`. |
+| `roles` | `{}` | Per-job profiles: `planner`, `verifier`, `summarizer`, `repair`, `escalate`, `fallback`. |
 | `auto_escalate` / `escalation_zero_edit_runs` | true / 3 | Widen the `escalate` retry beyond "no edit landed": a semantic repair failure, two no-progress leases, or this many consecutive zero-edit runs on one profile earn one retry even when edits applied. Every reason emits an `escalation_suggested` event even without a configured role; 0 disables the zero-edit statistic. |
 | `hooks` / `hook_timeout` | `{}` / 10 | Your commands at events, each capped at this many seconds (see [Hooks](#hooks); project-level hooks need `pedacito trust`). |
 | `scrub_env` / `env_passthrough` | true / `[]` | Minimal environment for model-chosen commands. |

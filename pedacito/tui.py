@@ -468,12 +468,6 @@ def _meter(pct: float, width: int = 16) -> tuple[str, str, str]:
     return bar, "32", "ok"
 
 
-def _paint(text: str, color: str, enabled: bool = True) -> str:
-    if not enabled or not color:
-        return text
-    return f"\x1b[{color}m{text}\x1b[0m"
-
-
 def _active_label(value) -> str:
     """Normalise `active_model_role` (dict or display string) to one line."""
     if value is None:

@@ -1439,14 +1439,6 @@ def _is_explicit(cfg, key: str) -> bool:
                                   "local-moe"))
 
 
-def _is_local_model(cfg) -> bool:
-    try:
-        from .config import is_hosted
-        return not is_hosted(cfg)
-    except Exception:
-        return False
-
-
 def _is_moe(cfg) -> bool:
     try:
         from .config import is_local_moe

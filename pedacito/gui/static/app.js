@@ -2301,8 +2301,6 @@ function applyTheme(t, userPick) {
   try { localStorage.setItem('pedacito_theme', t); } catch (err) {}
   const btn = $('themeBtn');
   if (btn) btn.title = 'theme: ' + t + ' \u2014 open the Theme Manager';
-  const sel = $('theme');
-  if (sel && Array.prototype.some.call(sel.options, (o) => o.value === t)) sel.value = t;
   if (!userPick) return;
   PDC.api('/api/settings/theme', { gui_theme: t }).then((j) => {
     if (j && j.ok) {
@@ -5394,20 +5392,12 @@ function callSettings(opts) {
 }
 
 // ------------------------------------------------------------------- boot ----
-function initThemeSelect() {
-  const sel = $('theme');
-  if (sel) {
-    let t = localStorage.getItem('pedacito_theme') || 'slate';
-    // the legacy theme names (mocha/sage/parchment/clay/nightshade) no
-    // longer exist: an unknown saved value falls back to the slate default
-    if (!Array.prototype.some.call(sel.options, (o) => o.value === t)) t = 'slate';
-    sel.value = t;
-  }
+function initViewState() {
   if (S.ui.view) document.body.dataset.view = S.ui.view;
 }
 
 render(html`<${App}/>`, $('root'));
-initThemeSelect();
+initViewState();
 loadActiveTheme();
 refreshState().then(() => loadSnapshot());
 setInterval(() => { if (!document.hidden) refreshState(); }, 2500);
