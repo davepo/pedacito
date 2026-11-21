@@ -533,3 +533,29 @@ def test_changelog_records_the_ownership_split_under_0_3_1():
     section = text.split("## v0.3.1", 1)[1].split("\n## ", 1)[0]
     assert "Docs Ownership" in section
     assert "canonical" in section
+
+
+# --- CLI-at-a-glance + install/teering claims (WP-12) -------------------------
+# docs/USAGE.md's table is the canonical index of subcommands; docs/INSTALLATION
+# and docs/CONFIG.md must not drift from the behaviour the code actually ships.
+
+def test_usage_at_a_glance_table_lists_every_cli_subcommand():
+    """Every parser subcommand is named in the `### The CLI at a glance` table,
+    so a new subcommand cannot ship without its one-line reference there."""
+    text = (ROOT / "docs" / "USAGE.md").read_text(encoding="utf-8")
+    section = text.split("### The CLI at a glance", 1)[1].split("\n## ", 1)[0]
+    missing = [name for name in _subcommand_names()
+               if not _mentioned(section, name)]
+    assert not missing, f"USAGE.md CLI table does not mention: {missing}"
+
+
+def test_installation_no_longer_claims_nvidia_vram_counter_reads():
+    """The install guide once described reading NVIDIA VRAM counters; that
+    claim was removed because telemetry stays local and quiet."""
+    text = (ROOT / "docs" / "INSTALLATION.md").read_text(encoding="utf-8")
+    assert "does not read NVIDIA VRAM counters" not in text
+
+
+def test_config_names_the_local_moe_tier():
+    text = (ROOT / "docs" / "CONFIG.md").read_text(encoding="utf-8")
+    assert "local-moe" in text

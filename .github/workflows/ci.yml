@@ -2,7 +2,7 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [main, "v*-dev"]
   pull_request:
 
 jobs:
@@ -30,6 +30,9 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -e ".[dev]"
+      - name: Lint (ruff)
+        if: matrix.os == 'ubuntu-latest' && matrix.python-version == '3.12'
+        run: ruff check pedacito/ tests/
       - name: Unit + fake-server end-to-end tests
         run: pytest -q
 
@@ -44,10 +47,16 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - name: Build the wheel
+      - name: Build and validate the distributions
         run: |
-          python -m pip install --upgrade pip build
-          python -m build --wheel
+          python -m pip install --upgrade pip build twine
+          python -m build
+          python -m twine check dist/*
+          if command -v node >/dev/null 2>&1; then
+            node --check pedacito/gui/static/app.js \
+              pedacito/gui/static/settings.js \
+              pedacito/gui/static/theme.js
+          fi
       - name: Install the wheel into an isolated target
         run: |
           TARGET="$RUNNER_TEMP/pdc-wheel"
