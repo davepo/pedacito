@@ -1186,3 +1186,62 @@ def test_cli_update_run_editable_never_spawns(monkeypatch, capsys):
     monkeypatch.setattr(update_mod, "run_upgrade", no_proc)
     assert cli._main(["update", "--run"]) == 0
     assert "git pull" in capsys.readouterr().out
+
+
+def test_check_for_update_async_resets_flag_when_thread_start_raises(monkeypatch):
+    """If Thread.start() fails (e.g. OS thread exhaustion), _check_running
+    must reset to False so future checks are not permanently blocked."""
+    enable(monkeypatch)
+
+    class BoomThread:
+        def __init__(self, *a, **kw):
+            pass
+
+        def start(self):
+            raise RuntimeError("can't start new thread")
+
+    monkeypatch.setattr(update_mod.threading, "Thread", BoomThread)
+    with pytest.raises(RuntimeError, match="can't start new thread"):
+        update_mod.check_for_update_async()
+    assert update_mod._check_running is False
+
+
+def test_run_upgrade_closes_stdout_and_bounds_wait_after_stop(monkeypatch):
+    """run_upgrade() must close proc.stdout in finally and pass a bounded
+    timeout to proc.wait() after _stop_process()."""
+    waits: list = []
+    closed = {"stdout": False}
+
+    class FakeStdout:
+        def __iter__(self):
+            return self
+
+        def __next__(self):
+            time.sleep(0.2)
+            return "tick\n"
+
+        def close(self):
+            closed["stdout"] = True
+
+    class FakeProc:
+        pid = 12345
+        stdout = FakeStdout()
+
+        def poll(self):
+            return None
+
+        def wait(self, timeout=None):
+            waits.append(timeout)
+            return 1
+
+        def kill(self):
+            pass
+
+    monkeypatch.setattr(update_mod.subprocess, "Popen", lambda *a, **kw: FakeProc())
+    monkeypatch.setattr(update_mod, "_stop_process", lambda *a, **kw: None)
+    cancel = threading.Event()
+    cancel.set()
+    code = update_mod.run_upgrade(["fake"], cancel=cancel)
+    assert code == 1
+    assert closed["stdout"] is True
+    assert waits == [5]

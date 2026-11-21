@@ -62,7 +62,11 @@ _DEFAULT_SERVERS = {
     ".rb": [("solargraph", ["stdio"])],
 }
 
+_CLIENTS_LOCK = threading.Lock()
 _CLIENTS: dict[tuple[str, str], LSPClient] = {}
+_EOF = object()
+_MAX_CONTENT_LENGTH = 16 * 1024 * 1024  # 16 MB frame cap
+_MAX_NOTES = 200
 
 
 class LSPError(RuntimeError):
@@ -120,8 +124,13 @@ class LSPClient:
         self.root = Path(root).resolve()
         self.command = list(command)
         self.timeout = max(1.0, float(timeout or 10))
+        self._io_lock = threading.Lock()
+        self._req_lock = threading.RLock()
+        self._closed = False
         self._q: queue.Queue = queue.Queue()
         self._notes: list[dict] = []
+        self._diagnostics: dict[str, list[dict]] = {}
+        self._versions: dict[str, int] = {}
         self._id = 0
         kwargs = {}
         if os.name != "nt":
@@ -143,13 +152,18 @@ class LSPClient:
 
     def _pump(self) -> None:
         pipe = self.proc.stdout
-        if pipe is None:
-            return
-        while True:
-            msg = self._read_message(pipe)
-            if msg is None:
+        try:
+            if pipe is None:
                 return
-            self._q.put(msg)
+            while True:
+                msg = self._read_message(pipe)
+                if msg is None:
+                    return
+                self._q.put(msg)
+        except Exception:
+            pass
+        finally:
+            self._q.put(_EOF)
 
     @staticmethod
     def _read_message(pipe) -> dict | None:
@@ -169,10 +183,10 @@ class LSPClient:
             n = int(headers.get("content-length", "0"))
         except ValueError:
             return None
-        if n <= 0:
+        if n <= 0 or n > _MAX_CONTENT_LENGTH:
             return None
         body = pipe.read(n)
-        if not body:
+        if not body or len(body) < n:
             return None
         try:
             msg = json.loads(body.decode("utf-8", "replace"))
@@ -180,7 +194,7 @@ class LSPClient:
             return None
         return msg if isinstance(msg, dict) else None
 
-    def _send(self, obj: dict) -> None:
+    def _send_unlocked(self, obj: dict) -> None:
         if self.proc.stdin is None:
             raise LSPError("language server stdin is closed")
         body = json.dumps(obj).encode("utf-8")
@@ -188,35 +202,56 @@ class LSPClient:
             f"Content-Length: {len(body)}\r\n\r\n".encode("ascii") + body)
         self.proc.stdin.flush()
 
+    def _send(self, obj: dict) -> None:
+        with self._io_lock:
+            if self._closed:
+                raise LSPError("language server stdin is closed")
+            self._send_unlocked(obj)
+
+    def _record_note(self, msg: dict) -> None:
+        if msg.get("method") == "textDocument/publishDiagnostics":
+            params = msg.get("params") or {}
+            uri = params.get("uri")
+            if uri:
+                self._diagnostics[uri] = params.get("diagnostics") or []
+            return
+        self._notes.append(msg)
+        if len(self._notes) > _MAX_NOTES:
+            del self._notes[:len(self._notes) - _MAX_NOTES]
+
     def _request(self, method: str, params: dict | None = None) -> dict:
-        self._id += 1
-        rid = self._id
-        self._send({"jsonrpc": "2.0", "id": rid, "method": method,
-                    "params": params or {}})
-        deadline = time.monotonic() + self.timeout
-        while True:
-            left = deadline - time.monotonic()
-            if left <= 0:
-                raise LSPError(f"{method} timed out after {self.timeout:.0f}s")
-            try:
-                msg = self._q.get(timeout=left)
-            except queue.Empty:
-                raise LSPError(f"{method} timed out after {self.timeout:.0f}s")
-            if msg.get("id") == rid and "method" not in msg:
-                if "error" in msg:
-                    raise LSPError(str(msg["error"])[:400])
-                return msg.get("result") or {}
-            if "id" in msg and msg.get("method"):
-                # A server-initiated request (registerCapability, progress,
-                # configuration, ...): acknowledge with null so it never blocks
-                # the response we are waiting for.
+        with self._req_lock:
+            self._id += 1
+            rid = self._id
+            self._send({"jsonrpc": "2.0", "id": rid, "method": method,
+                        "params": params or {}})
+            deadline = time.monotonic() + self.timeout
+            while True:
+                left = deadline - time.monotonic()
+                if left <= 0:
+                    raise LSPError(f"{method} timed out after {self.timeout:.0f}s")
                 try:
-                    self._send({"jsonrpc": "2.0", "id": msg["id"],
-                                "result": None})
-                except (OSError, ValueError):
-                    pass
-                continue
-            self._notes.append(msg)
+                    msg = self._q.get(timeout=left)
+                except queue.Empty:
+                    raise LSPError(f"{method} timed out after {self.timeout:.0f}s")
+                if msg is _EOF:
+                    self._q.put(_EOF)
+                    raise LSPError(f"{method} failed: language server closed stdout")
+                if msg.get("id") == rid and "method" not in msg:
+                    if "error" in msg:
+                        raise LSPError(str(msg["error"])[:400])
+                    return msg.get("result") or {}
+                if "id" in msg and msg.get("method"):
+                    # A server-initiated request (registerCapability, progress,
+                    # configuration, ...): acknowledge with null so it never blocks
+                    # the response we are waiting for.
+                    try:
+                        self._send({"jsonrpc": "2.0", "id": msg["id"],
+                                    "result": None})
+                    except (OSError, ValueError, LSPError):
+                        pass
+                    continue
+                self._record_note(msg)
 
     def notify(self, method: str, params: dict | None = None) -> None:
         self._send({"jsonrpc": "2.0", "method": method, "params": params or {}})
@@ -246,69 +281,113 @@ class LSPClient:
             text = path.read_text(encoding="utf-8", errors="replace")
         except OSError as e:
             raise LSPError(f"could not read {rel}: {e}") from e
-        self.notify("textDocument/didOpen", {
-            "textDocument": {
-                "uri": _uri(path),
-                "languageId": _LANGUAGE_ID.get(path.suffix.lower(), "plaintext"),
-                "version": 1,
-                "text": text,
-            }})
+        uri = _uri(path)
+        with self._req_lock:
+            prev_ver = self._versions.get(uri)
+            if prev_ver is None:
+                self._versions[uri] = 1
+                self.notify("textDocument/didOpen", {
+                    "textDocument": {
+                        "uri": uri,
+                        "languageId": _LANGUAGE_ID.get(path.suffix.lower(),
+                                                       "plaintext"),
+                        "version": 1,
+                        "text": text,
+                    }})
+            else:
+                new_ver = prev_ver + 1
+                self._versions[uri] = new_ver
+                self.notify("textDocument/didChange", {
+                    "textDocument": {
+                        "uri": uri,
+                        "version": new_ver,
+                    },
+                    "contentChanges": [{"text": text}],
+                })
         return path
 
     def request_for(self, op: str, rel: str, line: int = 1,
                     column: int = 1) -> dict:
-        path = self.open(rel)
-        pos = {"textDocument": {"uri": _uri(path)},
-               "position": {"line": max(0, int(line) - 1),
-                            "character": max(0, int(column) - 1)}}
-        if op == "definition":
-            return self._request("textDocument/definition", pos)
-        if op == "references":
-            pos["context"] = {"includeDeclaration": True}
-            return self._request("textDocument/references", pos)
-        if op == "hover":
-            return self._request("textDocument/hover", pos)
-        if op == "diagnostics":
-            return {"_diagnostics": self._wait_diagnostics(_uri(path))}
-        raise LSPError(f"unknown LSP operation '{op}'")
+        with self._req_lock:
+            path = self.open(rel)
+            pos = {"textDocument": {"uri": _uri(path)},
+                   "position": {"line": max(0, int(line) - 1),
+                                "character": max(0, int(column) - 1)}}
+            if op == "definition":
+                return self._request("textDocument/definition", pos)
+            if op == "references":
+                pos["context"] = {"includeDeclaration": True}
+                return self._request("textDocument/references", pos)
+            if op == "hover":
+                return self._request("textDocument/hover", pos)
+            if op == "diagnostics":
+                return {"_diagnostics": self._wait_diagnostics(_uri(path))}
+            raise LSPError(f"unknown LSP operation '{op}'")
 
     def _wait_diagnostics(self, uri: str) -> list[dict]:
         # LSP pushes diagnostics as a notification after didOpen/didChange.
-        for note in self._notes:
-            if note.get("method") == "textDocument/publishDiagnostics" \
-                    and (note.get("params") or {}).get("uri") == uri:
-                return (note.get("params") or {}).get("diagnostics") or []
-        deadline = time.monotonic() + min(self.timeout, 5.0)
-        while time.monotonic() < deadline:
-            try:
-                msg = self._q.get(timeout=max(0.05, deadline - time.monotonic()))
-            except queue.Empty:
-                break
-            if msg.get("method") == "textDocument/publishDiagnostics" \
-                    and (msg.get("params") or {}).get("uri") == uri:
-                return (msg.get("params") or {}).get("diagnostics") or []
-            if "id" in msg and msg.get("method"):
+        with self._req_lock:
+            # First drain any already-queued notifications so fresher
+            # publishDiagnostics messages overwrite stale entries.
+            eof = False
+            while True:
                 try:
-                    self._send({"jsonrpc": "2.0", "id": msg["id"],
-                                "result": None})
-                except (OSError, ValueError):
-                    pass
-                continue
-            self._notes.append(msg)
-        return []
+                    msg = self._q.get_nowait()
+                except queue.Empty:
+                    break
+                if msg is _EOF:
+                    self._q.put(_EOF)
+                    eof = True
+                    break
+                if "id" in msg and msg.get("method"):
+                    try:
+                        self._send({"jsonrpc": "2.0", "id": msg["id"],
+                                    "result": None})
+                    except (OSError, ValueError, LSPError):
+                        pass
+                    continue
+                self._record_note(msg)
+            if uri in self._diagnostics:
+                return list(self._diagnostics[uri])
+            if eof:
+                return []
+            deadline = time.monotonic() + min(self.timeout, 5.0)
+            while time.monotonic() < deadline:
+                try:
+                    msg = self._q.get(
+                        timeout=max(0.05, deadline - time.monotonic()))
+                except queue.Empty:
+                    break
+                if msg is _EOF:
+                    self._q.put(_EOF)
+                    break
+                if "id" in msg and msg.get("method"):
+                    try:
+                        self._send({"jsonrpc": "2.0", "id": msg["id"],
+                                    "result": None})
+                    except (OSError, ValueError, LSPError):
+                        pass
+                    continue
+                self._record_note(msg)
+                if msg.get("method") == "textDocument/publishDiagnostics" \
+                        and (msg.get("params") or {}).get("uri") == uri:
+                    return list(self._diagnostics.get(uri, []))
+            return list(self._diagnostics.get(uri, []))
 
     def close(self) -> None:
-        try:
-            self._send({"jsonrpc": "2.0", "id": self._id + 1,
-                        "method": "shutdown", "params": {}})
-            self._send({"jsonrpc": "2.0", "method": "exit"})
-        except (OSError, ValueError):
-            pass
-        try:
-            if self.proc.stdin:
-                self.proc.stdin.close()
-        except OSError:
-            pass
+        with self._io_lock:
+            self._closed = True
+            try:
+                self._send_unlocked({"jsonrpc": "2.0", "id": self._id + 1,
+                                     "method": "shutdown", "params": {}})
+                self._send_unlocked({"jsonrpc": "2.0", "method": "exit"})
+            except (OSError, ValueError, LSPError):
+                pass
+            try:
+                if self.proc.stdin:
+                    self.proc.stdin.close()
+            except OSError:
+                pass
         try:
             proc.terminate(self.proc)
             self.proc.wait(timeout=3)
@@ -317,12 +396,24 @@ class LSPClient:
                 self.proc.kill()
             except OSError:
                 pass
+            try:
+                self.proc.wait(timeout=2)
+            except (OSError, subprocess.SubprocessError):
+                pass
+        try:
+            if self.proc.stdout:
+                self.proc.stdout.close()
+        except OSError:
+            pass
 
 
 def close_all() -> None:
-    for key in list(_CLIENTS):
+    with _CLIENTS_LOCK:
+        clients = list(_CLIENTS.values())
+        _CLIENTS.clear()
+    for c in clients:
         try:
-            _CLIENTS.pop(key).close()
+            c.close()
         except (OSError, subprocess.SubprocessError):
             pass
 
@@ -338,18 +429,29 @@ def client_for(root, rel: str, cfg=None) -> LSPClient:
             "(pyright-langserver/pylsp/typescript-language-server/"
             "rust-analyzer/gopls) or set lsp_servers in the profile.")
     key = (str(Path(root).resolve()), " ".join(command))
-    c = _CLIENTS.get(key)
-    if c is not None and c.proc.poll() is None:
-        return c
-    if c is not None:
+    stale: LSPClient | None = None
+    with _CLIENTS_LOCK:
+        c = _CLIENTS.get(key)
+        if c is not None and c.proc.poll() is None:
+            return c
+        if c is not None:
+            stale = _CLIENTS.pop(key, None)
+    if stale is not None:
         try:
-            c.close()
+            stale.close()
         except (OSError, subprocess.SubprocessError):
             pass
-        _CLIENTS.pop(key, None)
     c = LSPClient(root, command, cfg,
                   timeout=float(getattr(cfg, "lsp_timeout", 10) or 10))
-    _CLIENTS[key] = c
+    prev: LSPClient | None = None
+    with _CLIENTS_LOCK:
+        prev = _CLIENTS.get(key)
+        _CLIENTS[key] = c
+    if prev is not None and prev is not c:
+        try:
+            prev.close()
+        except (OSError, subprocess.SubprocessError):
+            pass
     return c
 
 

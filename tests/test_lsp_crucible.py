@@ -181,3 +181,138 @@ def test_no_server_configured_is_a_clear_error(tmp_path):
         assert out.startswith("ERROR") and "no language server" in out
     finally:
         lsp.close_all()
+
+
+def test_read_message_caps_content_length_at_16mb():
+    """Oversized Content-Length frames must be rejected without allocating."""
+    import io
+
+    oversized = io.BytesIO(
+        f"Content-Length: {lsp._MAX_CONTENT_LENGTH + 1}\r\n\r\n{{}}".encode("ascii"))
+    assert lsp.LSPClient._read_message(oversized) is None
+
+
+def test_lsp_didopen_once_then_didchange_with_incrementing_versions(tmp_path):
+    """Repeated open() calls on the same file send didOpen (v1) once, then
+    didChange (v2, v3, ...), and only the latest diagnostics per URI are kept."""
+    root = tmp_path / "proj"
+    root.mkdir()
+    (root / "a.py").write_text("x = 1\n", encoding="utf-8")
+    log_path = tmp_path / "seen.jsonl"
+    server = tmp_path / "track_lsp.py"
+    server.write_text(
+        "import json, sys\n"
+        f"LOG = {str(log_path)!r}\n"
+        "def read():\n"
+        "    headers = {}\n"
+        "    while True:\n"
+        "        line = sys.stdin.buffer.readline()\n"
+        "        if not line:\n"
+        "            return None\n"
+        "        if line in (b'\\r\\n', b'\\n'):\n"
+        "            break\n"
+        "        k, v = line.decode('ascii', 'replace').split(':', 1)\n"
+        "        headers[k.strip().lower()] = v.strip()\n"
+        "    n = int(headers.get('content-length', '0'))\n"
+        "    return json.loads(sys.stdin.buffer.read(n).decode()) if n > 0 else None\n"
+        "def send(obj):\n"
+        "    body = json.dumps(obj).encode()\n"
+        "    sys.stdout.buffer.write(b'Content-Length: ' + str(len(body)).encode() + b'\\r\\n\\r\\n' + body)\n"
+        "    sys.stdout.buffer.flush()\n"
+        "while True:\n"
+        "    msg = read()\n"
+        "    if msg is None or msg.get('method') == 'exit':\n"
+        "        break\n"
+        "    m, rid = msg.get('method'), msg.get('id')\n"
+        "    if m in ('textDocument/didOpen', 'textDocument/didChange'):\n"
+        "        td = msg['params']['textDocument']\n"
+        "        with open(LOG, 'a', encoding='utf-8') as fh:\n"
+        "            fh.write(json.dumps({'method': m, 'version': td['version']}) + '\\n')\n"
+        "        send({'jsonrpc': '2.0', 'method': 'textDocument/publishDiagnostics',\n"
+        "              'params': {'uri': td['uri'], 'diagnostics': [{\n"
+        "                  'range': {'start': {'line': 0, 'character': 0}, 'end': {'line': 0, 'character': 1}},\n"
+        "                  'severity': 1, 'message': f'v{td[\"version\"]}-diag'}]}})\n"
+        "    elif m == 'initialize':\n"
+        "        send({'jsonrpc': '2.0', 'id': rid, 'result': {'capabilities': {}}})\n"
+        "    elif m == 'textDocument/hover':\n"
+        "        send({'jsonrpc': '2.0', 'id': rid, 'result': {'contents': 'ok'}})\n"
+        "    elif rid is not None:\n"
+        "        send({'jsonrpc': '2.0', 'id': rid, 'result': None})\n",
+        encoding="utf-8")
+    cfg = Config()
+    cfg.allow_lsp = True
+    cfg.lsp_timeout = 5
+    cfg.sources = {}
+    cfg.lsp_servers = {".py": f'"{sys.executable}" "{server}"'}
+    lsp.close_all()
+    try:
+        assert "ok" in lsp.result(root, cfg, "hover", "a.py", 1, 1)
+        (root / "a.py").write_text("x = 2\n", encoding="utf-8")
+        assert "ok" in lsp.result(root, cfg, "hover", "a.py", 1, 1)
+        diag = lsp.result(root, cfg, "diagnostics", "a.py", 1, 1)
+        assert "v3-diag" in diag or "v2-diag" in diag
+        import json as _json
+        events = [_json.loads(ln) for ln in
+                  log_path.read_text(encoding="utf-8").splitlines() if ln.strip()]
+        assert events == [
+            {"method": "textDocument/didOpen", "version": 1},
+            {"method": "textDocument/didChange", "version": 2},
+            {"method": "textDocument/didChange", "version": 3},
+        ]
+        # Only latest diagnostics stored per URI, and _notes stays bounded.
+        client = next(iter(lsp._CLIENTS.values()))
+        assert len(client._diagnostics) == 1
+        for i in range(lsp._MAX_NOTES + 50):
+            client._record_note({"method": "window/logMessage", "n": i})
+        assert len(client._notes) <= lsp._MAX_NOTES
+    finally:
+        lsp.close_all()
+
+
+def test_lsp_fails_fast_on_server_eof(tmp_path):
+    """A language server that closes stdout mid-request must fail fast via the
+    EOF sentinel instead of hanging for lsp_timeout."""
+    root = tmp_path / "proj"
+    root.mkdir()
+    (root / "a.py").write_text("x = 1\n", encoding="utf-8")
+    server = tmp_path / "crash_lsp.py"
+    server.write_text(
+        "import json, sys\n"
+        "def read():\n"
+        "    headers = {}\n"
+        "    while True:\n"
+        "        line = sys.stdin.buffer.readline()\n"
+        "        if not line:\n"
+        "            return None\n"
+        "        if line in (b'\\r\\n', b'\\n'):\n"
+        "            break\n"
+        "        k, v = line.decode('ascii', 'replace').split(':', 1)\n"
+        "        headers[k.strip().lower()] = v.strip()\n"
+        "    n = int(headers.get('content-length', '0'))\n"
+        "    return json.loads(sys.stdin.buffer.read(n).decode()) if n > 0 else None\n"
+        "def send(obj):\n"
+        "    body = json.dumps(obj).encode()\n"
+        "    sys.stdout.buffer.write(b'Content-Length: ' + str(len(body)).encode() + b'\\r\\n\\r\\n' + body)\n"
+        "    sys.stdout.buffer.flush()\n"
+        "while True:\n"
+        "    msg = read()\n"
+        "    if msg is None:\n"
+        "        break\n"
+        "    if msg.get('method') == 'initialize':\n"
+        "        send({'jsonrpc': '2.0', 'id': msg['id'], 'result': {'capabilities': {}}})\n"
+        "    elif msg.get('method') == 'textDocument/hover':\n"
+        "        sys.exit(1)\n",
+        encoding="utf-8")
+    cfg = Config()
+    cfg.allow_lsp = True
+    cfg.lsp_timeout = 15
+    cfg.sources = {}
+    cfg.lsp_servers = {".py": f'"{sys.executable}" "{server}"'}
+    lsp.close_all()
+    try:
+        t0 = time.monotonic()
+        out = lsp.result(root, cfg, "hover", "a.py", 1, 1)
+        assert out.startswith("ERROR") and "closed stdout" in out
+        assert time.monotonic() - t0 < 5.0
+    finally:
+        lsp.close_all()

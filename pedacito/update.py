@@ -33,13 +33,12 @@ import shutil
 import signal
 import subprocess
 import sys
-import tempfile
 import threading
 import time
 from pathlib import Path
 from urllib.request import urlopen
 
-from . import __version__
+from . import __version__, fileio
 from . import config as config_mod
 
 PYPI_URL = "https://pypi.org/pypi/pedacito/json"
@@ -166,22 +165,11 @@ def write_cache(latest: str, now: float | None = None) -> None:
     """Best-effort atomic write; a read-only config dir is not an error."""
     now = time.time() if now is None else now
     path = cache_path()
-    tmp = None
+    data = json.dumps({"checked_at": now, "latest": latest}).encode("utf-8")
     try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        # A unique temp name (fileio.write_bytes pattern): concurrent checks
-        # (GUI startup thread + `pdc update`) must not share one `.tmp` file.
-        fd, tmp = tempfile.mkstemp(prefix=path.name + ".", suffix=".tmp",
-                                   dir=str(path.parent))
-        with os.fdopen(fd, "w", encoding="utf-8") as fh:
-            json.dump({"checked_at": now, "latest": latest}, fh)
-        os.replace(tmp, path)
+        fileio.write_bytes(path, data)
     except OSError:
-        if tmp is not None:
-            try:
-                os.unlink(tmp)
-            except OSError:
-                pass
+        pass
 
 
 # --- the one network call -------------------------------------------------------
@@ -424,53 +412,69 @@ def run_upgrade(argv: list[str], on_line=None, timeout: float | None = None,
 
     def reader():
         try:
-            for line in proc.stdout:
+            pipe = proc.stdout
+            if pipe is None:
+                return
+            for line in pipe:
                 lines.put(line)
         except (OSError, ValueError):
             pass
         finally:
             lines.put(None)             # EOF sentinel
 
-    threading.Thread(target=reader, daemon=True).start()
-    deadline = None if timeout is None else time.monotonic() + timeout
-    while True:
-        if cancel is not None and cancel.is_set():
-            _stop_process(proc)
-            proc.wait()
-            emit("upgrade cancelled")
-            return 1
-        if deadline is not None and time.monotonic() >= deadline:
-            # Checked here too, not only on queue.Empty: a child that keeps
-            # printing lines must not stream past its wall-clock deadline.
-            _stop_process(proc)
-            proc.wait()
-            emit("upgrade timed out and was stopped")
-            return 1
-        if deadline is None and cancel is None:
-            wait = None
-        else:
-            wait = 0.2          # poll cancel even when the child is silent
-            if deadline is not None:
-                wait = min(wait, max(0.0, deadline - time.monotonic()))
+    reader_thread = threading.Thread(target=reader, daemon=True)
+    reader_thread.start()
+
+    def _stop_and_wait(*, group: bool = True) -> None:
+        _stop_process(proc, group=group)
         try:
-            item = lines.get(timeout=wait)
-        except queue.Empty:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            pass
+
+    deadline = None if timeout is None else time.monotonic() + timeout
+    try:
+        while True:
+            if cancel is not None and cancel.is_set():
+                _stop_and_wait()
+                emit("upgrade cancelled")
+                return 1
             if deadline is not None and time.monotonic() >= deadline:
-                _stop_process(proc)
-                proc.wait()
+                # Checked here too, not only on queue.Empty: a child that keeps
+                # printing lines must not stream past its wall-clock deadline.
+                _stop_and_wait()
                 emit("upgrade timed out and was stopped")
                 return 1
-            continue
-        if item is None:
-            break
-        emit(item.rstrip("\n"))
-    try:
-        # stdout is at EOF, so the child is exiting; a short grace wait only.
-        return proc.wait(timeout=5.0)
-    except subprocess.TimeoutExpired:
-        _stop_process(proc, group=isolated)
-        proc.wait()
-        return 1
+            if deadline is None and cancel is None:
+                wait = None
+            else:
+                wait = 0.2          # poll cancel even when the child is silent
+                if deadline is not None:
+                    wait = min(wait, max(0.0, deadline - time.monotonic()))
+            try:
+                item = lines.get(timeout=wait)
+            except queue.Empty:
+                if deadline is not None and time.monotonic() >= deadline:
+                    _stop_and_wait()
+                    emit("upgrade timed out and was stopped")
+                    return 1
+                continue
+            if item is None:
+                break
+            emit(item.rstrip("\n"))
+        try:
+            # stdout is at EOF, so the child is exiting; a short grace wait only.
+            return proc.wait(timeout=5.0)
+        except subprocess.TimeoutExpired:
+            _stop_and_wait(group=isolated)
+            return 1
+    finally:
+        if proc.stdout is not None:
+            try:
+                proc.stdout.close()
+            except OSError:
+                pass
+        reader_thread.join(timeout=2.0)
 
 
 # --- opt-out -----------------------------------------------------------------------
@@ -581,5 +585,10 @@ def check_for_update_async(cfg=None, fetch=None, on_done=None):
                 _check_running = False
 
     t = threading.Thread(target=worker, name="pdc-update-check", daemon=True)
-    t.start()
+    try:
+        t.start()
+    except Exception:
+        with _check_lock:
+            _check_running = False
+        raise
     return t

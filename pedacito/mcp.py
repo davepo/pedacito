@@ -58,6 +58,9 @@ from . import proc, safety, security
 _REAL_URLOPEN = urllib.request.urlopen
 
 PROTOCOL_VERSION = "2024-11-05"
+_CATALOG_LOCK = threading.Lock()
+_SESSIONS_LOCK = threading.RLock()
+_EOF = object()
 _CATALOG_CACHE: dict[tuple[str, ...], list[tuple[str, str, str]]] = {}
 _CATALOG_TIME: dict[tuple[str, ...], float] = {}
 # Prompts and resources are listed with the same short retry window as tools.
@@ -122,6 +125,9 @@ class _Session:
         self.command = command
         self.timeout = max(1, timeout)
         self._q: queue.Queue = queue.Queue()
+        self._io_lock = threading.Lock()
+        self._req_lock = threading.Lock()
+        self._closed = False
         kwargs = {}
         if os.name != "nt":
             kwargs["start_new_session"] = True
@@ -141,7 +147,10 @@ class _Session:
 
     def _pump(self):
         try:
-            for line in self.proc.stdout:
+            pipe = self.proc.stdout
+            if pipe is None:
+                return
+            for line in pipe:
                 line = line.strip()
                 if not line:
                     continue
@@ -153,27 +162,38 @@ class _Session:
                     self._q.put(msg)
         except Exception:
             pass
+        finally:
+            self._q.put(_EOF)
 
     def _send(self, obj: dict):
-        if self.proc.stdin is None:
-            raise MCPError("server stdin is closed")
-        self.proc.stdin.write(json.dumps(obj) + "\n")
-        self.proc.stdin.flush()
+        with self._io_lock:
+            if self.proc.stdin is None or self._closed:
+                raise MCPError("server stdin is closed")
+            self.proc.stdin.write(json.dumps(obj) + "\n")
+            self.proc.stdin.flush()
 
     def request(self, method: str, params: dict | None = None) -> dict:
-        rid = self._next_id
-        self._next_id += 1
-        self._send({"jsonrpc": "2.0", "id": rid, "method": method,
-                    "params": params or {}})
-        while True:
-            try:
-                msg = self._q.get(timeout=self.timeout)
-            except queue.Empty:
-                raise MCPError(f"{method} timed out after {self.timeout}s")
-            if msg.get("id") == rid and "method" not in msg:
-                if "error" in msg:
-                    raise MCPError(str(msg["error"])[:400])
-                return msg.get("result") or {}
+        with self._req_lock:
+            rid = self._next_id
+            self._next_id += 1
+            self._send({"jsonrpc": "2.0", "id": rid, "method": method,
+                        "params": params or {}})
+            deadline = time.monotonic() + self.timeout
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise MCPError(f"{method} timed out after {self.timeout}s")
+                try:
+                    msg = self._q.get(timeout=remaining)
+                except queue.Empty:
+                    raise MCPError(f"{method} timed out after {self.timeout}s")
+                if msg is _EOF:
+                    self._q.put(_EOF)
+                    raise MCPError(f"{method} failed: MCP server closed stdout")
+                if msg.get("id") == rid and "method" not in msg:
+                    if "error" in msg:
+                        raise MCPError(str(msg["error"])[:400])
+                    return msg.get("result") or {}
 
     def notify(self, method: str):
         self._send({"jsonrpc": "2.0", "method": method})
@@ -187,11 +207,13 @@ class _Session:
         self.notify("notifications/initialized")
 
     def close(self):
-        try:
-            if self.proc.stdin:
-                self.proc.stdin.close()
-        except OSError:
-            pass
+        with self._io_lock:
+            self._closed = True
+            try:
+                if self.proc.stdin:
+                    self.proc.stdin.close()
+            except OSError:
+                pass
         try:
             proc.terminate(self.proc)
             self.proc.wait(timeout=3)
@@ -200,6 +222,15 @@ class _Session:
                 self.proc.kill()
             except OSError:
                 pass
+            try:
+                self.proc.wait(timeout=2)
+            except Exception:
+                pass
+        try:
+            if self.proc.stdout:
+                self.proc.stdout.close()
+        except OSError:
+            pass
 
 
 # Per-command (consecutive failures, retry-not-before): a server that will not
@@ -209,26 +240,31 @@ _COOLDOWN: dict[str, tuple[int, float]] = {}
 
 def _cooling(cmd: str) -> float:
     """Seconds left before `cmd` may be started again (0 = now)."""
-    n, until = _COOLDOWN.get(cmd, (0, 0.0))
+    with _SESSIONS_LOCK:
+        n, until = _COOLDOWN.get(cmd, (0, 0.0))
     return max(0.0, until - time.time()) if n >= 2 else 0.0
 
 
 def _note_failure(cmd: str) -> None:
-    n = _COOLDOWN.get(cmd, (0, 0.0))[0] + 1
-    _COOLDOWN[cmd] = (n, time.time() + min(300, 15 * 2 ** (n - 1)))
+    with _SESSIONS_LOCK:
+        n = _COOLDOWN.get(cmd, (0, 0.0))[0] + 1
+        _COOLDOWN[cmd] = (n, time.time() + min(300, 15 * 2 ** (n - 1)))
 
 
 def _live_session(cmd: str, timeout: int) -> "_Session":
     """The cached initialised session for `cmd`, restarted when the cached
     process has exited. Callers `_drop_session` after a failed request so the
     next call starts a fresh server."""
-    s = _SESSIONS.get(cmd)
-    if s is not None:
-        if s.proc.poll() is None:
-            return s
-        s.close()
-        _SESSIONS.pop(cmd, None)
-    wait = _cooling(cmd)
+    stale: "_Session | None" = None
+    with _SESSIONS_LOCK:
+        s = _SESSIONS.get(cmd)
+        if s is not None:
+            if s.proc.poll() is None:
+                return s
+            stale = _SESSIONS.pop(cmd, None)
+        wait = _cooling(cmd)
+    if stale is not None:
+        stale.close()
     if wait:
         raise MCPError(f"server keeps failing to start; retrying in {wait:.0f}s")
     s = None
@@ -240,14 +276,20 @@ def _live_session(cmd: str, timeout: int) -> "_Session":
             s.close()
         _note_failure(cmd)
         raise
-    _COOLDOWN.pop(cmd, None)
-    _SESSIONS[cmd] = s
+    prev: "_Session | None" = None
+    with _SESSIONS_LOCK:
+        _COOLDOWN.pop(cmd, None)
+        prev = _SESSIONS.get(cmd)
+        _SESSIONS[cmd] = s
+    if prev is not None and prev is not s:
+        prev.close()
     return s
 
 
 def _drop_session(cmd: str) -> None:
     """Close and forget `cmd`'s cached session after a failure."""
-    s = _SESSIONS.pop(cmd, None)
+    with _SESSIONS_LOCK:
+        s = _SESSIONS.pop(cmd, None)
     if s is not None:
         s.close()
 
@@ -255,18 +297,23 @@ def _drop_session(cmd: str) -> None:
 def close_all() -> None:
     """Close every cached MCP session. Registered with atexit so a kept-alive
     server never outlives the process; tests call it between cases."""
-    for cmd in list(_SESSIONS):
-        _drop_session(cmd)
-    _COOLDOWN.clear()
-    _EXTRA_CACHE.clear()
-    _EXTRA_TIME.clear()
-    _CATALOG_CACHE.clear()
-    _CATALOG_TIME.clear()
-    # Named-server sessions and their tool listings.
-    for name in list(_NAMED_SESSIONS):
-        _drop_named_session(name)
-    _NAMED_TOOLS.clear()
-    _NAMED_TOOLS_TIME.clear()
+    with _SESSIONS_LOCK:
+        legacy = list(_SESSIONS.values())
+        _SESSIONS.clear()
+        _COOLDOWN.clear()
+        named = list(_NAMED_SESSIONS.values())
+        _NAMED_SESSIONS.clear()
+    with _CATALOG_LOCK:
+        _EXTRA_CACHE.clear()
+        _EXTRA_TIME.clear()
+        _CATALOG_CACHE.clear()
+        _CATALOG_TIME.clear()
+        _NAMED_TOOLS.clear()
+        _NAMED_TOOLS_TIME.clear()
+    for s in legacy:
+        s.close()
+    for s in named:
+        s.close()
 
 
 atexit.register(close_all)
@@ -289,13 +336,14 @@ def catalog(cfg) -> list[tuple[str, str, str]]:
     if not servers:
         return []
     key = tuple(servers)
-    if key in _CATALOG_CACHE:
-        cached = _CATALOG_CACHE[key]
-        down = any("(unavailable)" in e[0] for e in cached)
-        if not down or time.time() - _CATALOG_TIME.get(key, 0.0) \
-                < _RETRY_UNAVAILABLE_AFTER:
-            return cached
-        _CATALOG_CACHE.pop(key, None)
+    with _CATALOG_LOCK:
+        if key in _CATALOG_CACHE:
+            cached = _CATALOG_CACHE[key]
+            down = any("(unavailable)" in e[0] for e in cached)
+            if not down or time.time() - _CATALOG_TIME.get(key, 0.0) \
+                    < _RETRY_UNAVAILABLE_AFTER:
+                return list(cached)
+            _CATALOG_CACHE.pop(key, None)
     out: list[tuple[str, str, str]] = []
     for name, cmd in server_names(servers).items():
         try:
@@ -320,9 +368,10 @@ def catalog(cfg) -> list[tuple[str, str, str]]:
                         f"server failed: {str(e)[:200]}", "{}"))
         finally:
             s.close()
-    _CATALOG_CACHE[key] = out
-    _CATALOG_TIME[key] = time.time()
-    return out
+    with _CATALOG_LOCK:
+        _CATALOG_CACHE[key] = out
+        _CATALOG_TIME[key] = time.time()
+    return list(out)
 
 
 _TYPE_NAMES = {"string": str, "integer": int, "number": (int, float),
@@ -419,10 +468,11 @@ def _extra(cfg, kind: str, method: str, parse) -> list[tuple[str, str, str]]:
     if not servers:
         return []
     key = (kind, tuple(servers))
-    if key in _EXTRA_CACHE:
-        if time.time() - _EXTRA_TIME.get(key, 0.0) < _RETRY_UNAVAILABLE_AFTER:
-            return _EXTRA_CACHE[key]
-        _EXTRA_CACHE.pop(key, None)
+    with _CATALOG_LOCK:
+        if key in _EXTRA_CACHE:
+            if time.time() - _EXTRA_TIME.get(key, 0.0) < _RETRY_UNAVAILABLE_AFTER:
+                return list(_EXTRA_CACHE[key])
+            _EXTRA_CACHE.pop(key, None)
     out: list[tuple[str, str, str]] = []
     timeout = int(getattr(cfg, "mcp_timeout", 30) or 30)
     for name, cmd in server_names(servers).items():
@@ -437,9 +487,10 @@ def _extra(cfg, kind: str, method: str, parse) -> list[tuple[str, str, str]]:
         finally:
             if s is not None:
                 s.close()
-    _EXTRA_CACHE[key] = out
-    _EXTRA_TIME[key] = time.time()
-    return out
+    with _CATALOG_LOCK:
+        _EXTRA_CACHE[key] = out
+        _EXTRA_TIME[key] = time.time()
+    return list(out)
 
 
 def prompts(cfg) -> list[tuple[str, str, str]]:
@@ -863,6 +914,7 @@ class _HttpSession:
         self.url = url
         self.timeout = max(1, timeout)
         self.env = env or {}
+        self._lock = threading.Lock()
         self._next_id = 1
         self.session_id = ""
 
@@ -884,8 +936,10 @@ class _HttpSession:
     def _post(self, obj: dict, want_reply: bool):
         headers = {"Content-Type": "application/json",
                    "Accept": "application/json, text/event-stream"}
-        if self.session_id:
-            headers["Mcp-Session-Id"] = self.session_id
+        with self._lock:
+            sid_cur = self.session_id
+        if sid_cur:
+            headers["Mcp-Session-Id"] = sid_cur
         # A server table's env is the natural place for an auth token; the two
         # conventional spellings become headers, everything else is ignored.
         for k, v in self.env.items():
@@ -960,7 +1014,8 @@ class _HttpSession:
         else:
             raise MCPError("HTTP MCP server exceeded maximum redirects")
         if sid:
-            self.session_id = sid
+            with self._lock:
+                self.session_id = sid
         if not want_reply:
             return {}
         return self._pick_reply(raw, ctype, obj.get("id"))
@@ -992,8 +1047,9 @@ class _HttpSession:
         return msg.get("result") or {}
 
     def request(self, method: str, params: dict | None = None) -> dict:
-        rid = self._next_id
-        self._next_id += 1
+        with self._lock:
+            rid = self._next_id
+            self._next_id += 1
         return self._post({"jsonrpc": "2.0", "id": rid, "method": method,
                            "params": params or {}}, want_reply=True)
 
@@ -1015,19 +1071,37 @@ class _HttpSession:
         pass
 
 
+def _parse_named_tools(result: dict) -> list[dict]:
+    out: list[dict] = []
+    for tool in (result or {}).get("tools") or []:
+        if not isinstance(tool, dict):
+            continue
+        tname = _clean_tool_name(tool.get("name"))
+        if not tname:
+            continue
+        schema = tool.get("inputSchema")
+        out.append({"name": tname,
+                    "description": clean_description(tool.get("description")),
+                    "input_schema": schema if isinstance(schema, dict) else {}})
+    return out
+
+
 def _named_session(name: str, spec: dict, timeout: int):
     """The cached initialised session for one named server (stdio process or
     HTTP endpoint), restarted when the cached process has exited."""
-    s = _NAMED_SESSIONS.get(name)
-    if s is not None:
-        if isinstance(s, _Session) and s.proc.poll() is not None:
-            s.close()
-            _NAMED_SESSIONS.pop(name, None)
-        else:
-            # The cached session was built for the 5s listing budget; a tool
-            # call gets its own (larger) timeout, not the listing's.
-            s.timeout = max(1, timeout)
-            return s
+    stale = None
+    with _SESSIONS_LOCK:
+        s = _NAMED_SESSIONS.get(name)
+        if s is not None:
+            if isinstance(s, _Session) and s.proc.poll() is not None:
+                stale = _NAMED_SESSIONS.pop(name, None)
+            else:
+                # The cached session was built for the 5s listing budget; a tool
+                # call gets its own (larger) timeout, not the listing's.
+                s.timeout = max(1, timeout)
+                return s
+    if stale is not None:
+        stale.close()
     if spec.get("url"):
         s = _HttpSession(spec["url"], timeout, spec.get("env"))
     else:
@@ -1038,13 +1112,18 @@ def _named_session(name: str, spec: dict, timeout: int):
     except Exception:
         s.close()
         raise
-    _NAMED_SESSIONS[name] = s
+    with _SESSIONS_LOCK:
+        prev = _NAMED_SESSIONS.get(name)
+        _NAMED_SESSIONS[name] = s
+    if prev is not None and prev is not s:
+        prev.close()
     return s
 
 
 def _drop_named_session(name: str) -> None:
     """Close and forget one named server's session after a failure."""
-    s = _NAMED_SESSIONS.pop(name, None)
+    with _SESSIONS_LOCK:
+        s = _NAMED_SESSIONS.pop(name, None)
     if s is not None:
         s.close()
 
@@ -1053,34 +1132,27 @@ def _named_tools(cfg, name: str, spec: dict) -> list[dict]:
     """One server's tool listing [{name, description, input_schema}], cached
     for the session; a down or slow server contributes nothing and is retried
     after the same cool-down window as the legacy catalog."""
-    cached = _NAMED_TOOLS.get(name)
-    if cached is not None:
-        if cached or time.time() - _NAMED_TOOLS_TIME.get(name, 0.0) \
-                < _RETRY_UNAVAILABLE_AFTER:
-            return cached
-        _NAMED_TOOLS.pop(name, None)
-    out: list[dict] = []
+    with _CATALOG_LOCK:
+        cached = _NAMED_TOOLS.get(name)
+        if cached is not None:
+            if cached or time.time() - _NAMED_TOOLS_TIME.get(name, 0.0) \
+                    < _RETRY_UNAVAILABLE_AFTER:
+                return list(cached)
+            _NAMED_TOOLS.pop(name, None)
     try:
         s = _named_session(name, spec, int(_NAMED_LIST_TIMEOUT))
         result = s.request("tools/list")
     except Exception:
         _drop_named_session(name)
-        _NAMED_TOOLS[name] = []
-        _NAMED_TOOLS_TIME[name] = time.time()
+        with _CATALOG_LOCK:
+            _NAMED_TOOLS[name] = []
+            _NAMED_TOOLS_TIME[name] = time.time()
         return []
-    for tool in result.get("tools") or []:
-        if not isinstance(tool, dict):
-            continue
-        tname = _clean_tool_name(tool.get("name"))
-        if not tname:
-            continue
-        schema = tool.get("inputSchema")
-        out.append({"name": tname,
-                    "description": clean_description(tool.get("description")),
-                    "input_schema": schema if isinstance(schema, dict) else {}})
-    _NAMED_TOOLS[name] = out
-    _NAMED_TOOLS_TIME[name] = time.time()
-    return out
+    out = _parse_named_tools(result)
+    with _CATALOG_LOCK:
+        _NAMED_TOOLS[name] = out
+        _NAMED_TOOLS_TIME[name] = time.time()
+    return list(out)
 
 
 def list_mcp_tools(cfg) -> list[dict]:
@@ -1102,13 +1174,15 @@ def forget_server(name: str) -> None:
     """Drop one named server's cached session and tool listing. Settings edits
     and deletes call this so the next listing reflects the saved file."""
     _drop_named_session(name)
-    _NAMED_TOOLS.pop(name, None)
-    _NAMED_TOOLS_TIME.pop(name, None)
+    with _CATALOG_LOCK:
+        _NAMED_TOOLS.pop(name, None)
+        _NAMED_TOOLS_TIME.pop(name, None)
 
 
 def probe_named_server(name: str, body: dict,
                        budget: float = _NAMED_LIST_TIMEOUT) -> dict:
-    """Start one server just long enough to list its tools, then reap it.
+    """Start one isolated ephemeral server just long enough to list its tools,
+    then reap it, without disturbing any active cached session for `name`.
 
     `body` is the raw [mcp_servers.<name>] table (saved or unsaved). A down,
     slow or empty server returns an empty list rather than raising: the GUI's
@@ -1124,9 +1198,17 @@ def probe_named_server(name: str, body: dict,
                                    "transport (set a command or a url)")
         return out
     name = str(name or "test")
-    forget_server(name)
+    s = None
     try:
-        tools = _named_tools(None, name, spec)
+        timeout = max(1, int(budget))
+        if spec.get("url"):
+            s = _HttpSession(spec["url"], timeout, spec.get("env"))
+        else:
+            argv = [spec["command"], *spec.get("args", [])]
+            s = _Session(f"mcp:probe:{name}", timeout,
+                         argv=argv, env=spec.get("env"))
+        s.initialize()
+        tools = _parse_named_tools(s.request("tools/list"))
         out["tools"] = [{"name": t["name"],
                          "description": t["description"],
                          "input_schema": t["input_schema"]} for t in tools]
@@ -1136,7 +1218,8 @@ def probe_named_server(name: str, body: dict,
     except Exception as e:                       # never fail the test button
         out["error"] = f"{type(e).__name__}: {str(e)[:300]}"
     finally:
-        forget_server(name)
+        if s is not None:
+            s.close()
     return out
 
 
