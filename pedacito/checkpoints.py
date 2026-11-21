@@ -26,6 +26,7 @@ import difflib
 import hashlib
 import json
 import os
+import re
 import shutil
 import threading
 import time
@@ -88,7 +89,15 @@ def index_path(root) -> Path:
 
 
 def snapshot_dir(root, checkpoint_id: str) -> Path:
-    return checkpoint_root(root) / SNAPSHOT_DIR / str(checkpoint_id)
+    cid = str(checkpoint_id or "")
+    # A checkpoint id becomes a directory name under `.pedacito/checkpoints/
+    # snapshots/`; anything with a separator or a parent component could walk
+    # outside that tree, so only the ids the index actually generates are
+    # accepted (`cp_0001_deadbe` -- letters, digits, `-`, `_`).
+    if (not cid or "/" in cid or "\\" in cid or ".." in cid
+            or not re.fullmatch(r"[A-Za-z0-9_-]+", cid)):
+        raise CheckpointError(f"invalid checkpoint id {checkpoint_id!r}")
+    return checkpoint_root(root) / SNAPSHOT_DIR / cid
 
 
 def _empty_index() -> dict:
@@ -569,7 +578,11 @@ def _safe_relative(root: Path, rel) -> str:
 
 def _prune_empty_dirs(root: Path, start: Path) -> None:
     parent = start
-    while parent != root and str(parent).startswith(str(root)):
+    resolved_root = root.resolve()
+    # Path containment, not a string prefix: `/proj` must not also match the
+    # sibling `/project/...` (str.startswith would), and a parent reached
+    # through a symlink or `..` must not be climbed past the real root.
+    while parent != root and parent.resolve().is_relative_to(resolved_root):
         try:
             parent.rmdir()
         except OSError:
@@ -603,100 +616,107 @@ def restore_checkpoint(root, checkpoint_id: str, files=None) -> dict:
     active head: the next run branches from it.
     """
     root = Path(root).resolve()
+    # `_LOCK` is held across the whole operation (read snapshot, capture the
+    # safety checkpoint, restore files, set the head) so a concurrent
+    # checkpoint create/restore cannot interleave a snapshot write with this
+    # restore's read-modify-write of the index. `_LOCK` is reentrant, so the
+    # nested `create_checkpoint`/`_set_head` acquisitions are safe.
     with _LOCK:
         data, entry = _checkpoint_entry(root, checkpoint_id)
-    cp_id = str(entry["id"])
-    snap = _snapshot_map(snapshot_dir(root, cp_id))
+        cp_id = str(entry["id"])
+        snap = _snapshot_map(snapshot_dir(root, cp_id))
 
-    if files is not None:
-        if isinstance(files, (str, Path)):
-            files = [files]
-        selected = []
-        for item in files:
-            if isinstance(item, dict):
-                item = item.get("path") or item.get("rel") or item.get("file")
-            selected.append(_safe_relative(root, item))
-        selected = sorted(set(selected))
-        target = {rel: snap[rel] for rel in selected if rel in snap}
-        current = {rel: root / rel for rel in selected
-                   if (root / rel).is_file() and not (root / rel).is_symlink()}
-        affected = selected
-    else:
-        target = dict(snap)
-        current = dict(iter_workspace_files(root))
-        affected = sorted(set(target) | set(current))
+        if files is not None:
+            if isinstance(files, (str, Path)):
+                files = [files]
+            selected = []
+            for item in files:
+                if isinstance(item, dict):
+                    item = item.get("path") or item.get("rel") or item.get("file")
+                selected.append(_safe_relative(root, item))
+            selected = sorted(set(selected))
+            target = {rel: snap[rel] for rel in selected if rel in snap}
+            current = {rel: root / rel for rel in selected
+                       if (root / rel).is_file()
+                       and not (root / rel).is_symlink()}
+            affected = selected
+        else:
+            target = dict(snap)
+            current = dict(iter_workspace_files(root))
+            affected = sorted(set(target) | set(current))
 
-    # Dirty only when an affected path differs from the checkpoint.  A clean
-    # restore (same bytes) needs no safety snapshot.
-    target_hashes = {rel: _file_hash(p) for rel, p in target.items()}
-    current_hashes = {rel: _file_hash(p) for rel, p in current.items()}
-    dirty = any(target_hashes.get(rel) != current_hashes.get(rel)
-                for rel in affected)
+        # Dirty only when an affected path differs from the checkpoint.  A
+        # clean restore (same bytes) needs no safety snapshot.
+        target_hashes = {rel: _file_hash(p) for rel, p in target.items()}
+        current_hashes = {rel: _file_hash(p) for rel, p in current.items()}
+        dirty = any(target_hashes.get(rel) != current_hashes.get(rel)
+                    for rel in affected)
 
-    safety = None
-    if dirty:
-        safety = create_checkpoint(
-            root,
-            f"Before restoring {entry.get('label') or cp_id}",
-            mode="restore",
-            parent_id=str(data.get("head_id") or entry.get("parent_id") or "")
-            or None)
+        safety = None
+        if dirty:
+            safety = create_checkpoint(
+                root,
+                f"Before restoring {entry.get('label') or cp_id}",
+                mode="restore",
+                parent_id=str(data.get("head_id")
+                              or entry.get("parent_id") or "")
+                or None)
 
-    restored: list[str] = []
-    deleted: list[str] = []
-    skipped: list[str] = []
+        restored: list[str] = []
+        deleted: list[str] = []
+        skipped: list[str] = []
 
-    if files is not None:
-        # Explicit files: copy when the checkpoint has them, remove when the
-        # checkpoint says they did not exist yet.
-        for rel in affected:
-            dest = root / rel
-            if rel in target:
+        if files is not None:
+            # Explicit files: copy when the checkpoint has them, remove when
+            # the checkpoint says they did not exist yet.
+            for rel in affected:
+                dest = root / rel
+                if rel in target:
+                    try:
+                        fileio.copy_file_atomic(target[rel], dest)
+                        restored.append(rel)
+                    except OSError:
+                        skipped.append(rel)
+                elif _delete_tracked(root, rel):
+                    deleted.append(rel)
+        else:
+            for rel, src in target.items():
                 try:
-                    fileio.copy_file_atomic(target[rel], dest)
+                    _safe_relative(root, rel)
+                except CheckpointError:
+                    skipped.append(rel)
+                    continue
+                try:
+                    fileio.copy_file_atomic(src, root / rel)
                     restored.append(rel)
                 except OSError:
                     skipped.append(rel)
-            elif _delete_tracked(root, rel):
-                deleted.append(rel)
-    else:
-        for rel, src in target.items():
-            try:
-                _safe_relative(root, rel)
-            except CheckpointError:
-                skipped.append(rel)
-                continue
-            try:
-                fileio.copy_file_atomic(src, root / rel)
-                restored.append(rel)
-            except OSError:
-                skipped.append(rel)
-        for rel in current:
-            if rel in target:
-                continue
-            try:
-                _safe_relative(root, rel)
-            except CheckpointError:
-                skipped.append(rel)
-                continue
-            if _delete_tracked(root, rel):
-                deleted.append(rel)
+            for rel in current:
+                if rel in target:
+                    continue
+                try:
+                    _safe_relative(root, rel)
+                except CheckpointError:
+                    skipped.append(rel)
+                    continue
+                if _delete_tracked(root, rel):
+                    deleted.append(rel)
 
-    _set_head(root, cp_id)
-    return {
-        "ok": True,
-        "checkpoint": cp_id,
-        "label": entry.get("label", ""),
-        "head_id": cp_id,
-        "restored": sorted(restored),
-        "restored_files": sorted(restored),
-        "deleted": sorted(deleted),
-        "deleted_files": sorted(deleted),
-        "skipped": sorted(set(skipped)),
-        "files": len(restored),
-        "safety": safety,
-        "safety_id": str(safety.get("id")) if safety else "",
-    }
+        _set_head(root, cp_id)
+        return {
+            "ok": True,
+            "checkpoint": cp_id,
+            "label": entry.get("label", ""),
+            "head_id": cp_id,
+            "restored": sorted(restored),
+            "restored_files": sorted(restored),
+            "deleted": sorted(deleted),
+            "deleted_files": sorted(deleted),
+            "skipped": sorted(set(skipped)),
+            "files": len(restored),
+            "safety": safety,
+            "safety_id": str(safety.get("id")) if safety else "",
+        }
 
 
 def undo_last_run(root) -> dict:

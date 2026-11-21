@@ -17,6 +17,8 @@ import json
 import sys
 from pathlib import Path
 
+import pytest
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from pedacito import (  # noqa: E402
@@ -193,3 +195,40 @@ def test_every_mutation_breaks_the_hard_link_not_the_checkpoint(tmp_path):
     assert "src/moved.py" in report["deleted"], report
     assert _workspace_state(tmp_path) == initial
     assert not ratchet.step_dir(tmp_path, 1).exists()
+
+
+def test_rollback_refuses_a_symlinked_parent_directory_escape(tmp_path):
+    """A hand-edited manifest entry whose parent directory is a symlink out of
+    the project must not be restored (or unlinked) through that link."""
+    root = tmp_path / "proj"
+    root.mkdir()
+    (root / "src").mkdir()
+    (root / "src" / "a.py").write_text("v1\n", encoding="utf-8")
+
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    secret = outside / "secret.txt"
+    secret.write_text("SECRET\n", encoding="utf-8")
+    try:
+        (root / "escape").symlink_to(outside)
+    except (OSError, NotImplementedError):
+        pytest.skip("symlinks unavailable on this platform")
+
+    info = ratchet.begin(root, 1, "escape audit")
+    assert info["error"] is None, info
+
+    # Plant a manifest entry that would restore THROUGH the symlinked parent
+    # directory into the outside tree.
+    d = ratchet.step_dir(root, 1)
+    (d / "escape").mkdir()
+    (d / "escape" / "secret.txt").write_text("PLANTED\n", encoding="utf-8")
+    manifest_path = d / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["files"]["escape/secret.txt"] = {
+        "size": 8, "mtime_ns": 0, "linked": False}
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    report = ratchet.rollback(root, 1)
+
+    assert secret.read_text(encoding="utf-8") == "SECRET\n"   # untouched
+    assert "escape/secret.txt" in report["skipped"], report

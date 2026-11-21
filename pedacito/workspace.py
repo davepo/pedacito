@@ -18,6 +18,7 @@ to `.gitignore`.
 from __future__ import annotations
 
 import sys
+import threading
 from datetime import datetime
 from pathlib import Path
 
@@ -453,33 +454,83 @@ def _pid_alive(pid: int) -> bool:
     return True
 
 
+# In-process lock bookkeeping: the run lock is a single file, so a thread
+# holding it must not let another thread in the same process unlink it while
+# the run still needs it. `_HELD_LOCKS` maps a lock's resolved path to its
+# refcount; the file is only unlinked when the last holder releases it.
+_LOCK_GUARD = threading.Lock()
+_HELD_LOCKS: dict[str, int] = {}
+
+
 def acquire_lock(root) -> Path:
     """Claim `<root>/.pedacito/run.lock` for this process. Two runs writing
     the same tree would race on backups, the index and the plan file; a stale
-    lock (dead pid) is taken over. Raises ProjectBusy when the holder lives."""
+    lock (dead pid) is taken over. Raises ProjectBusy when the holder lives.
+
+    Acquisition is atomic across processes (`os.open(O_CREAT | O_EXCL)`, with
+    stale-PID cleanup) and ref-counted across threads: one process holds the
+    file exactly once, so a second thread in the same process cannot unlink a
+    lock its own run still needs. An `OSError` here is a real failure, never
+    silently swallowed as success."""
     import os
     path = state_dir(Path(root)) / "run.lock"
-    try:
-        pid = int(path.read_text(encoding="utf-8").split()[0])
-    except (OSError, ValueError, IndexError):
-        pid = 0
-    if pid and pid != os.getpid() and _pid_alive(pid):
-        raise ProjectBusy(
-            f"another pedacito run (pid {pid}) is using this project; wait "
-            f"for it, or delete {path} if it is stale")
-    try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(f"{os.getpid()}\n", encoding="utf-8")
-    except OSError:
-        pass
+    path.parent.mkdir(parents=True, exist_ok=True)
+    key = str(path.resolve())
+    with _LOCK_GUARD:
+        if key in _HELD_LOCKS:
+            _HELD_LOCKS[key] += 1
+            return path
+        while True:
+            try:
+                fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+            except FileExistsError:
+                pass
+            except OSError as exc:
+                raise RuntimeError(
+                    f"could not acquire run lock {path}: {exc}") from exc
+            else:
+                break
+            # The lock already exists: read the holder and decide.
+            try:
+                pid = int(path.read_text(encoding="utf-8").split()[0])
+            except (OSError, ValueError, IndexError):
+                pid = 0
+            if pid and pid != os.getpid() and _pid_alive(pid):
+                raise ProjectBusy(
+                    f"another pedacito run (pid {pid}) is using this project; "
+                    f"wait for it, or delete {path} if it is stale")
+            # Stale (dead holder, or our own pid left by a crash): take over.
+            try:
+                path.unlink()
+            except FileNotFoundError:
+                pass
+            except OSError as exc:
+                raise RuntimeError(
+                    f"could not replace stale run lock {path}: {exc}") from exc
+        try:
+            os.write(fd, f"{os.getpid()}\n".encode("utf-8"))
+        finally:
+            os.close(fd)
+        _HELD_LOCKS[key] = 1
     return path
 
 
 def release_lock(root) -> None:
     import os
     path = state_dir(Path(root)) / "run.lock"
-    try:
-        if int(path.read_text(encoding="utf-8").split()[0]) == os.getpid():
-            path.unlink()
-    except (OSError, ValueError, IndexError):
-        pass
+    key = str(path.resolve())
+    with _LOCK_GUARD:
+        held = _HELD_LOCKS.get(key, 0)
+        if held <= 0:
+            return
+        if held > 1:
+            _HELD_LOCKS[key] = held - 1
+            return
+        del _HELD_LOCKS[key]
+        # Only remove the file if it still names THIS process: a lock another
+        # process took over after ours was lost is not ours to unlink.
+        try:
+            if int(path.read_text(encoding="utf-8").split()[0]) == os.getpid():
+                path.unlink()
+        except (OSError, ValueError, IndexError):
+            pass

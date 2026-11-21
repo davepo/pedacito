@@ -576,6 +576,42 @@ def _scope_dir(root, scope: str) -> Path:
     return Path(root) / ".pedacito" / "skills"
 
 
+def _scope_root(root, scope: str) -> Path:
+    """The containment root for a scope's skill library: the project root, or
+    the user config directory (the skills folder's own parent)."""
+    scope = (scope or "project").strip().lower()
+    if scope in ("user", "global"):
+        from . import config as config_mod
+        return config_mod.USER_CONFIG.parent
+    return Path(root)
+
+
+def _skill_path(root, scope: str, key: str) -> Path:
+    """The skill file for `key` (folder layout preferred), validated: any
+    symlink on the scope directory or the target is refused, and the resolved
+    path must stay inside the scope's containment root (a symlinked parent
+    that escapes is refused by `resolve_safe_path`)."""
+    d = _scope_dir(root, scope)
+    legacy = d / key / "SKILL.md"
+    path = legacy if legacy.is_file() else d / f"{key}.md"
+    base = _scope_root(root, scope)
+    if (d.is_symlink() or (path.parent != d and path.parent.is_symlink())
+            or path.is_symlink()):
+        raise ValueError(f"refusing to touch a symlinked skill path: {path}")
+    try:
+        rel = path.relative_to(base)
+    except ValueError:
+        raise ValueError(f"skill path {path} lies outside {base}")
+    # The scope root must exist before resolve_safe_path can prove containment
+    # (a first user-scope save creates the config directory, as before).
+    base.mkdir(parents=True, exist_ok=True)
+    try:
+        security.resolve_safe_path(base, rel)
+    except (security.SecurityError, OSError, RuntimeError) as exc:
+        raise ValueError(f"refusing unsafe skill path {path}: {exc}") from exc
+    return path
+
+
 def _validate_slug(name: str) -> str:
     key = (name or "").strip().lower()
     if not _NAME_RE.match(key):
@@ -618,9 +654,7 @@ def save_skill(root: Path | None, *, name: str, description: str,
     if len(body) > MAX_SKILL_CHARS:
         raise ValueError(f"skill body is {len(body)} chars; the cap is "
                          f"{MAX_SKILL_CHARS}")
-    d = _scope_dir(root, scope)
-    legacy = d / key / "SKILL.md"
-    path = legacy if legacy.is_file() else d / f"{key}.md"
+    path = _skill_path(root, scope, key)
     path.parent.mkdir(parents=True, exist_ok=True)
     fileio.write_bytes(
         path,
@@ -637,15 +671,28 @@ def delete_skill(root: Path | None, name: str,
     shows through again)."""
     key = _validate_slug(name)
     d = _scope_dir(root, scope)
+    base = _scope_root(root, scope)
     for path in (d / key / "SKILL.md", d / f"{key}.md"):
-        if path.is_file():
-            path.unlink()
-            if path.parent != d:
-                try:
-                    path.parent.rmdir()     # only when the folder is now empty
-                except OSError:
-                    pass
-            return True
+        if (d.is_symlink() or (path.parent != d and path.parent.is_symlink())
+                or path.is_symlink()):
+            raise ValueError(
+                f"refusing to delete a symlinked skill path: {path}")
+        if not path.is_file():
+            continue
+        try:
+            rel = path.relative_to(base)
+            security.resolve_safe_path(base, rel)
+        except (ValueError, security.SecurityError, OSError,
+                RuntimeError) as exc:
+            raise ValueError(
+                f"refusing unsafe skill path {path}: {exc}") from exc
+        path.unlink()
+        if path.parent != d:
+            try:
+                path.parent.rmdir()     # only when the folder is now empty
+            except OSError:
+                pass
+        return True
     return False
 
 

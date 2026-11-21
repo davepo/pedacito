@@ -38,7 +38,7 @@ from ctypes import wintypes
 from pathlib import Path
 from urllib.parse import urlsplit
 
-from . import browser, fileio, proc, safety
+from . import browser, fileio, proc, safety, security
 from .index import state_dir
 
 PROC_DIR = "procs"
@@ -219,7 +219,7 @@ def start(root, command, *, name: str = "", cfg=None,
             rec["returncode"] = p.returncode
             _forget_child(p.pid)
             break
-        text = _log_tail(rec)
+        text = _log_tail(rec, root)
         url = browser.find_server_url(text)
         if url:
             rec["url"] = url
@@ -229,9 +229,21 @@ def start(root, command, *, name: str = "", cfg=None,
     return rec
 
 
-def _log_tail(rec: dict) -> str:
-    """The last few kilobytes of a record's log, without reading the whole file."""
-    path = Path(str(rec.get("log") or ""))
+def _log_tail(rec: dict, root=None) -> str:
+    """The last few kilobytes of a record's log, without reading the whole file.
+
+    `root` bounds the read: the record's `log` path must resolve inside
+    `.pedacito/procs/`, so a hand-edited record cannot point the reader at an
+    arbitrary file (a symlink escaping the directory included)."""
+    raw = str(rec.get("log") or "")
+    if not raw:
+        return ""
+    path = Path(raw)
+    if root is not None:
+        try:
+            security.resolve_safe_path(_dir(root), path)
+        except (security.SecurityError, OSError, ValueError, RuntimeError):
+            return ""
     try:
         with path.open("rb") as fh:
             fh.seek(0, os.SEEK_END)
@@ -242,7 +254,7 @@ def _log_tail(rec: dict) -> str:
     return data.decode("utf-8", errors="replace")
 
 
-def _refresh_url(rec: dict) -> bool:
+def _refresh_url(rec: dict, root=None) -> bool:
     """Recover a URL the server printed after `start` stopped waiting.
 
     `serve_wait` bounds how long a run may block, not how long the server has
@@ -254,7 +266,7 @@ def _refresh_url(rec: dict) -> bool:
     """
     if rec.get("url") or rec.get("status") == "error":
         return False
-    url = browser.find_server_url(_log_tail(rec))
+    url = browser.find_server_url(_log_tail(rec, root))
     if not url:
         return False
     rec["url"] = url
@@ -273,7 +285,7 @@ def list_procs(root) -> list[dict]:
         if rec.get("status") == "running" and not _alive(int(rec.get("pid") or 0)):
             rec["status"] = "exited"
             stale = True
-        if _refresh_url(rec):
+        if _refresh_url(rec, root):
             stale = True
         if stale:
             _write_record(root, rec)
@@ -298,8 +310,14 @@ def logs(root, name: str, tail: int = 4000) -> str:
     if rec is None:
         known = ", ".join(str(r.get("name")) for r in list_procs(root)) or "(none)"
         return f"ERROR: no background process named '{name}'. Known: {known}"
+    log_path = Path(str(rec.get("log") or ""))
     try:
-        text = Path(rec["log"]).read_text(encoding="utf-8", errors="replace")
+        security.resolve_safe_path(_dir(root), log_path)
+    except (security.SecurityError, OSError, ValueError, RuntimeError):
+        return (f"ERROR: could not read {rec.get('log')}: "
+                f"outside the process log directory")
+    try:
+        text = log_path.read_text(encoding="utf-8", errors="replace")
     except OSError as e:
         return f"ERROR: could not read {rec['log']}: {e}"
     tail = max(200, int(tail or 4000))

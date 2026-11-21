@@ -17,6 +17,7 @@ import os
 import shutil
 import stat
 import tempfile
+import threading
 from collections import OrderedDict
 from pathlib import Path
 
@@ -80,6 +81,7 @@ def read_lines(path: Path) -> list[str]:
 _LINE_CACHE: OrderedDict[tuple, tuple[list[str], int]] = OrderedDict()
 _LINE_CACHE_BYTES = 0
 _LINE_CACHE_MAX_BYTES = 8_000_000
+_LINE_CACHE_LOCK = threading.Lock()
 
 
 def read_lines_cached(path: Path) -> list[str]:
@@ -92,41 +94,66 @@ def read_lines_cached(path: Path) -> list[str]:
     except OSError:
         return read_lines(p)          # let the caller see the real error
     key = (str(p), st.st_mtime_ns, st.st_size)
-    hit = _LINE_CACHE.get(key)
-    if hit is not None:
-        _LINE_CACHE.move_to_end(key)
-        return hit[0]
-    lines = read_lines(p)
-    _LINE_CACHE[key] = (lines, st.st_size)
-    _LINE_CACHE_BYTES += st.st_size
-    while _LINE_CACHE_BYTES > _LINE_CACHE_MAX_BYTES and len(_LINE_CACHE) > 1:
-        _, (_, size) = _LINE_CACHE.popitem(last=False)
-        _LINE_CACHE_BYTES -= size
-    return lines
+    with _LINE_CACHE_LOCK:
+        hit = _LINE_CACHE.get(key)
+        if hit is not None:
+            _LINE_CACHE.move_to_end(key)
+            return hit[0]
+        lines = read_lines(p)
+        _LINE_CACHE[key] = (lines, st.st_size)
+        _LINE_CACHE_BYTES += st.st_size
+        while _LINE_CACHE_BYTES > _LINE_CACHE_MAX_BYTES and len(_LINE_CACHE) > 1:
+            _, (_, size) = _LINE_CACHE.popitem(last=False)
+            _LINE_CACHE_BYTES -= size
+        return lines
 
 
-def write_bytes(path: Path, data: bytes) -> None:
+# The process umask, read exactly once under a lock: `os.umask` is
+# process-global, so toggling it on every write would race other threads
+# (and another process's umask is never the one we should honour here).
+_UMASK_LOCK = threading.Lock()
+_DEFAULT_UMASK: int | None = None
+
+
+def _process_umask() -> int:
+    global _DEFAULT_UMASK
+    with _UMASK_LOCK:
+        if _DEFAULT_UMASK is None:
+            current = os.umask(0)
+            os.umask(current)
+            _DEFAULT_UMASK = current
+        return _DEFAULT_UMASK
+
+
+def write_bytes(path: Path, data: bytes, *, follow_symlinks: bool = False,
+                mode: int | None = None) -> None:
     """Atomically replace `path` with `data`, never rewriting in place.
 
     Ratchet checkpoints are HARD LINKS to earlier inodes of the same file.
     An in-place `open(path, "wb")` truncates every link sharing that inode,
     quietly rewriting checkpoint history. A temp file plus `os.replace`
     swaps the path onto a fresh inode and leaves the old one (and its links)
-    untouched; the original permission bits are preserved."""
+    untouched; the original permission bits are preserved.
+
+    By default the path itself is replaced even when it is a symlink (the
+    link is swapped for a regular file, never written through). Pass
+    `follow_symlinks=True` to resolve a symlink and replace its target
+    instead. `mode` sets the permission bits of a newly created file; when
+    it is None the process umask is honoured (`0o666 & ~umask`)."""
     p = Path(path)
-    if p.is_symlink():
+    if follow_symlinks and p.is_symlink():
         p = p.resolve()          # replace through the link, not the link itself
     try:
-        mode = stat.S_IMODE(p.stat().st_mode)
+        perm = stat.S_IMODE(p.stat().st_mode)
     except OSError:
-        mode = 0o644
+        perm = int(mode) if mode is not None else (0o666 & ~_process_umask())
     p.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp = tempfile.mkstemp(prefix=p.name + ".", suffix=".pedacito-tmp",
                                dir=str(p.parent))
     try:
         with os.fdopen(fd, "wb") as fh:
             fh.write(data)
-        os.chmod(tmp, mode)
+        os.chmod(tmp, perm)
         os.replace(tmp, p)
     except BaseException:
         try:
@@ -136,11 +163,14 @@ def write_bytes(path: Path, data: bytes) -> None:
         raise
 
 
-def write(path: Path, text: str, style: TextStyle | None = None) -> None:
+def write(path: Path, text: str, style: TextStyle | None = None, *,
+          follow_symlinks: bool = False) -> None:
     """Write LF-normalised text to disk, restoring the given encoding style.
 
     The actual replacement is `write_bytes`: an atomic temp-file + rename,
-    never an in-place rewrite, so a hardlinked checkpoint keeps its bytes."""
+    never an in-place rewrite, so a hardlinked checkpoint keeps its bytes.
+    `follow_symlinks` is forwarded to `write_bytes` (default: replace a
+    symlink itself rather than writing through it)."""
     style = style or TextStyle()
     out = text
     if style.newline != "\n":
@@ -148,18 +178,22 @@ def write(path: Path, text: str, style: TextStyle | None = None) -> None:
     data = out.encode("utf-8")
     if style.bom:
         data = b"\xef\xbb\xbf" + data
-    write_bytes(path, data)
+    write_bytes(path, data, follow_symlinks=follow_symlinks)
 
 
-def copy_file_atomic(src: Path, dest: Path) -> None:
+def copy_file_atomic(src: Path, dest: Path, *, follow_symlinks: bool = False) -> None:
     """Copy `src` to `dest` through a temp file, preserving mode and mtime.
 
     Restores (undo, `pedacito restore`) must never copy into an existing
     inode: the destination may be hardlinked to a ratchet checkpoint, and an
-    in-place `shutil.copy2` would rewrite that checkpoint too."""
+    in-place `shutil.copy2` would rewrite that checkpoint too.
+
+    By default `dest` is replaced even when it is a symlink (the link itself
+    is swapped for the copied file, never written through); pass
+    `follow_symlinks=True` to resolve a symlink and copy into its target."""
     src = Path(src)
     p = Path(dest)
-    if p.is_symlink():
+    if follow_symlinks and p.is_symlink():
         p = p.resolve()          # replace through the link, not the link itself
     p.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp = tempfile.mkstemp(prefix=p.name + ".", suffix=".pedacito-tmp",
