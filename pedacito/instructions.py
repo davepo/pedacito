@@ -11,7 +11,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from . import fileio
+from . import fileio, safety, security
 
 CANDIDATE_FILES = (
     "PEDACITO.md",
@@ -32,7 +32,12 @@ def find(root) -> tuple[str, str]:
     """Return (relative_path, text) for the first instruction file, or ("", "")."""
     base = Path(root)
     for rel in CANDIDATE_FILES:
-        p = base / rel
+        try:
+            p = security.resolve_safe_path(base, rel)
+        except security.SecurityError:
+            continue
+        if security.is_sensitive_path(p):
+            continue
         try:
             st = p.stat()
         except OSError:
@@ -46,6 +51,7 @@ def find(root) -> tuple[str, str]:
                 text = fileio.read_text(p, errors="replace")
             except OSError:
                 continue
+            text = safety.strip_control(text)
             _CACHE[key] = text
         return rel, text
     return "", ""
@@ -56,7 +62,7 @@ def render(root, cfg=None) -> str:
     if cfg is not None and not getattr(cfg, "use_project_instructions", True):
         return ""
     rel, text = find(root)
-    text = (text or "").strip()
+    text = safety.strip_control(text or "").strip()
     if not rel or not text:
         return ""
     limit = int(getattr(cfg, "max_instruction_chars", 2000) or 0)

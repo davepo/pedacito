@@ -19,6 +19,8 @@ import subprocess
 from collections import defaultdict
 from pathlib import Path
 
+from . import safety
+
 _TIMEOUT = 8
 
 _cache: dict[tuple, object] = {}
@@ -167,7 +169,7 @@ def preamble(root, cfg=None, max_chars: int = 420) -> str:
     commits = recent_commits(root, 3)
     if commits:
         bits.append("recent: " + "; ".join(f"{h} {s[:50]}" for h, s in commits))
-    return "\n".join(bits)[:max_chars]
+    return safety.strip_control("\n".join(bits))[:max_chars]
 
 
 # ------------------------------------------------------------------ the tool

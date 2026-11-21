@@ -251,13 +251,32 @@ def post_origin_allowed(headers, bound_host: str = "127.0.0.1") -> bool:
 
 # --- 4. SSRF guard for the web tools ------------------------------------------------
 
+def _ip_is_private(ip) -> bool:
+    if (ip.is_private or ip.is_loopback or ip.is_link_local
+            or ip.is_reserved or ip.is_multicast or ip.is_unspecified
+            or getattr(ip, "is_site_local", False)
+            or not ip.is_global):
+        return True
+    mapped = getattr(ip, "ipv4_mapped", None)
+    if mapped is not None and _ip_is_private(mapped):
+        return True
+    sixtofour = getattr(ip, "sixtofour", None)
+    if sixtofour is not None and _ip_is_private(sixtofour):
+        return True
+    teredo = getattr(ip, "teredo", None)
+    if teredo is not None and any(_ip_is_private(addr) for addr in teredo):
+        return True
+    return False
+
+
 def is_private_host(host: str) -> bool:
     """True when `host` names the local machine, a LAN address or a
     cloud-metadata endpoint: loopback (`127.0.0.1`, `::1`, `localhost`),
     link-local (the 169.254.169.254 metadata IP lives here), RFC1918 /
-    unique-local LAN ranges, reserved, multicast or unspecified addresses, and
-    `*.local` names. Plain public hostnames are not private."""
-    host = str(host or "").strip().lower().strip("[]")
+    unique-local / CGNAT (RFC 6598) / site-local ranges, reserved, multicast
+    or unspecified addresses, IPv4-mapped/6to4/Teredo wrappers, and `*.local`
+    / `*.localhost` names. Plain public hostnames are not private."""
+    host = str(host or "").strip().rstrip(".").strip("[]").rstrip(".").lower()
     if not host:
         return True
     if host in ("localhost", "localhost.localdomain") or host.endswith(
@@ -274,8 +293,7 @@ def is_private_host(host: str) -> bool:
             ip = ipaddress.ip_address(socket.inet_ntoa(socket.inet_aton(host)))
         except (OSError, ValueError):
             return False
-    return (ip.is_private or ip.is_loopback or ip.is_link_local
-            or ip.is_reserved or ip.is_multicast or ip.is_unspecified)
+    return _ip_is_private(ip)
 
 
 def host_named_explicitly(host: str, allowed_hosts) -> bool:
@@ -283,9 +301,9 @@ def host_named_explicitly(host: str, allowed_hosts) -> bool:
     with `"*"` matching anything. `ssrf_error`/`resolve_checked` strip the
     wildcard first: it means "any PUBLIC host", never an exemption for a
     private address."""
-    host = str(host or "").lower()
+    host = str(host or "").strip().rstrip(".").lower()
     for a in (allowed_hosts or ()):
-        a = str(a).lower().strip()
+        a = str(a).lower().strip().rstrip(".")
         if a == "*" or host == a or host.endswith("." + a):
             return True
     return False
@@ -307,7 +325,7 @@ def ssrf_error(url: str, allowed_hosts=()) -> str:
     if u.scheme not in ("http", "https"):
         return (f"{raw!r} is not an http(s) URL; the web tools fetch "
                 "http:// or https:// addresses only")
-    host = (u.hostname or "").lower().strip("[]")
+    host = (u.hostname or "").strip().rstrip(".").strip("[]").rstrip(".").lower()
     if not host:
         return f"{raw!r} has no hostname to fetch"
     named = tuple(a for a in (allowed_hosts or ()) if str(a).strip() != "*")
@@ -334,7 +352,7 @@ def resolve_checked(host: str, allowed_hosts=()) -> tuple[str, list[str]]:
     the pinned connection should prefer. A `"*"` allowlist entry means
     "any PUBLIC host": it never exempts a private address, only a host
     named explicitly (exact or suffix) does."""
-    host = str(host or "").strip().lower().strip("[]")
+    host = str(host or "").strip().rstrip(".").strip("[]").rstrip(".").lower()
     if not host:
         return "no hostname to resolve", []
     named = tuple(a for a in (allowed_hosts or ())
@@ -594,15 +612,11 @@ _PLACEHOLDER_WORDS = (
 )
 
 # File names whose presence in a repository is itself a hygiene problem
-# when `.gitignore` does not exclude them.
-_SENSITIVE_FILE_NAMES = {
-    ".env", ".env.local", ".env.production", ".pypirc", "id_rsa",
-    "id_ed25519", "credentials.json",
+# when `.gitignore` does not exclude them (derived from the canonical lists).
+_SENSITIVE_FILE_NAMES = SENSITIVE_NAMES | {
+    ".env", ".env.local", ".env.production", "id_rsa", "id_ed25519",
 }
-_ENV_TEMPLATE_NAMES = {
-    ".env.example", ".env.sample", ".env.template", ".env.dist",
-    ".env.defaults",
-}
+_ENV_TEMPLATE_NAMES = ENV_TEMPLATE_NAMES
 _ACK_SUBPATH = Path(".pedacito") / "security_ack.json"
 _ACK_RE = re.compile(r"\A[0-9a-f]{64}\Z")
 
@@ -699,9 +713,40 @@ def _overlaps(start: int, end: int, spans) -> bool:
 
 
 def _private_key_end(text: str, start: int) -> int:
-    """End of a PEM private-key block, or the header's end when unclosed."""
+    """End of a PEM private-key block, or end of contiguous key lines when unclosed."""
     m = _PEM_END_RE.search(text, start)
-    return m.end() if m else start
+    if m:
+        return m.end()
+    pos = start
+    n = len(text)
+    while pos < n and text[pos] in " \t":
+        pos += 1
+    if pos < n and text[pos] in "\r\n":
+        pos += 2 if text[pos:pos + 2] == "\r\n" else 1
+    last_key_end = start
+    saw_armor_header = False
+    while pos < n:
+        nl = text.find("\n", pos)
+        line_end = nl if nl != -1 else n
+        line = text[pos:line_end].rstrip("\r").strip(" \t")
+        if not line:
+            if saw_armor_header:
+                saw_armor_header = False
+                pos = line_end + 1 if nl != -1 else n
+                continue
+            break
+        if re.fullmatch(r"[A-Za-z0-9+/=_-]+", line):
+            saw_armor_header = False
+            last_key_end = line_end
+            pos = line_end + 1 if nl != -1 else n
+            continue
+        if re.fullmatch(r"(?:Proc-Type|DEK-Info):[^\r\n]+", line, re.IGNORECASE):
+            saw_armor_header = True
+            last_key_end = line_end
+            pos = line_end + 1 if nl != -1 else n
+            continue
+        break
+    return last_key_end
 
 
 def scan_text_for_secrets(text: str, source_label: str = "<prompt>") -> list[SecretFinding]:
@@ -874,7 +919,7 @@ def _content_text(content) -> str:
 
 
 def scan_messages_for_secrets(messages, root=None) -> list[SecretFinding]:
-    """Scan every message's text content for unacknowledged secrets."""
+    """Scan every message's text content and tool/function arguments for unacknowledged secrets."""
     findings: list[SecretFinding] = []
     for message in messages or []:
         if not isinstance(message, dict):
@@ -882,6 +927,21 @@ def scan_messages_for_secrets(messages, root=None) -> list[SecretFinding]:
         text = _content_text(message.get("content"))
         if text:
             findings.extend(scan_text_for_secrets(text, "<prompt>"))
+        tool_calls = message.get("tool_calls")
+        if isinstance(tool_calls, list):
+            for call in tool_calls:
+                if not isinstance(call, dict):
+                    continue
+                fn = call.get("function")
+                if isinstance(fn, dict):
+                    args = fn.get("arguments")
+                    if isinstance(args, str) and args:
+                        findings.extend(scan_text_for_secrets(args, "<prompt>"))
+        fn_call = message.get("function_call")
+        if isinstance(fn_call, dict):
+            args = fn_call.get("arguments")
+            if isinstance(args, str) and args:
+                findings.extend(scan_text_for_secrets(args, "<prompt>"))
     return unacknowledged_findings(findings, root)
 
 
@@ -1015,7 +1075,7 @@ def redact_secrets_in_text(text: str, root=None, *,
 
 def redact_messages(messages, root=None):
     """Return `(messages, count, findings)` with unacknowledged secrets
-    replaced in every text content field."""
+    replaced in every text content and tool/function argument field."""
     out: list[dict] = []
     total = 0
     found: list[SecretFinding] = []
@@ -1051,6 +1111,45 @@ def redact_messages(messages, root=None):
                 parts.append(part)
             if changed:
                 copy["content"] = parts
+        tool_calls = copy.get("tool_calls")
+        if isinstance(tool_calls, list):
+            new_calls = []
+            calls_changed = False
+            for call in tool_calls:
+                if isinstance(call, dict):
+                    call_copy = dict(call)
+                    fn = call_copy.get("function")
+                    if isinstance(fn, dict):
+                        args = fn.get("arguments")
+                        if isinstance(args, str) and args:
+                            findings = [f for f in scan_text_for_secrets(
+                                args, "<prompt>") if f.fingerprint not in acked]
+                            if findings:
+                                fn_copy = dict(fn)
+                                fn_copy["arguments"], count = _redact_findings(
+                                    args, findings)
+                                call_copy["function"] = fn_copy
+                                total += count
+                                found.extend(findings)
+                                calls_changed = True
+                    new_calls.append(call_copy)
+                else:
+                    new_calls.append(call)
+            if calls_changed:
+                copy["tool_calls"] = new_calls
+        fn_call = copy.get("function_call")
+        if isinstance(fn_call, dict):
+            args = fn_call.get("arguments")
+            if isinstance(args, str) and args:
+                findings = [f for f in scan_text_for_secrets(
+                    args, "<prompt>") if f.fingerprint not in acked]
+                if findings:
+                    fn_call_copy = dict(fn_call)
+                    fn_call_copy["arguments"], count = _redact_findings(
+                        args, findings)
+                    copy["function_call"] = fn_call_copy
+                    total += count
+                    found.extend(findings)
         out.append(copy)
     return out, total, found
 
@@ -1112,9 +1211,11 @@ def _path_ignored(root: Path, rel: str) -> bool:
 
 
 def _sensitive_file_kind(name: str) -> str:
-    if name == ".env" or name.startswith(".env."):
+    low = name.lower()
+    if low == ".env" or low.startswith(".env.") or low.endswith(".env"):
         return "unignored_env"
-    if name.startswith("id_"):
+    if (low.startswith("id_")
+            or low.endswith((".pem", ".key", ".p12", ".pfx", ".jks", ".kdbx"))):
         return "unignored_private_key"
     return "unignored_credentials"
 
@@ -1127,18 +1228,20 @@ def check_git_secret_hygiene(root) -> list[SensitiveFileFinding]:
     base = Path(str(root))
     if not base.is_dir():
         return []
+    try:
+        base_resolved = base.resolve()
+    except OSError:
+        return []
     out: list[SensitiveFileFinding] = []
     seen: set[str] = set()
     for path in _iter_workspace_files(base):
         name = path.name
-        if name in _ENV_TEMPLATE_NAMES:
-            continue
-        if not (name in _SENSITIVE_FILE_NAMES or name.startswith(".env.")):
-            continue
         try:
-            rel = path.resolve().relative_to(base.resolve()).as_posix()
+            rel = path.resolve().relative_to(base_resolved).as_posix()
         except (OSError, ValueError):
             rel = name
+        if not is_sensitive_path(rel):
+            continue
         if rel in seen:
             continue
         seen.add(rel)

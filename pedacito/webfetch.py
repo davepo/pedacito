@@ -143,8 +143,11 @@ def _pinned_get(url: str, host: str, ip: str):
     adapter = _PinnedAdapter(host, ip)
     session.mount("http://", adapter)
     session.mount("https://", adapter)
-    return session.get(url, timeout=15, stream=True, allow_redirects=False,
-                       headers={"User-Agent": "pedacito-fetch/1.0"})
+    try:
+        return session.get(url, timeout=15, stream=True, allow_redirects=False,
+                           headers={"User-Agent": "pedacito-fetch/1.0"})
+    finally:
+        session.close()
 
 
 def tool_fetch(index, cfg, url: str) -> str:
@@ -163,6 +166,9 @@ def tool_fetch(index, cfg, url: str) -> str:
         host_l = (probe.hostname or "").lower()
         if probe.scheme in ("http", "https") and host_l:
             allowed_cfg = tuple(getattr(cfg, "fetch_allowed_hosts", ()) or ())
+            ssrf = security.ssrf_error(raw, allowed_cfg)
+            if ssrf:
+                return f"ERROR: {ssrf}"
             if (not getattr(cfg, "allow_fetch", False)
                     or not _host_allowed(host_l, allowed_cfg)):
                 why = ("web access (`allow_fetch`) is off"
@@ -222,20 +228,21 @@ def tool_fetch(index, cfg, url: str) -> str:
             r = _pinned_get(url, host=hop_host, ip=ips[0])
             if r.status_code not in (301, 302, 303, 307, 308):
                 break
-            nxt = urljoin(url, (r.headers.get("Location") or "").strip())
-            nu = urlparse(nxt)
-            nh = (nu.hostname or "").lower()
-            # Judge the hop before requesting it: an auto-followed redirect
-            # would already have hit the private host by the time we check.
-            if (nu.scheme not in ("http", "https") or not nh
-                    or (nh != host and (not _host_allowed(nh, allowed) or (
-                        _is_private(nh)
-                        and not any(a.lower() == nh for a in allowed))))):
+            try:
+                nxt = urljoin(url, (r.headers.get("Location") or "").strip())
+                nu = urlparse(nxt)
+                nh = (nu.hostname or "").lower()
+                # Judge the hop before requesting it: an auto-followed redirect
+                # would already have hit the private host by the time we check.
+                if (nu.scheme not in ("http", "https") or not nh
+                        or (nh != host and (not _host_allowed(nh, allowed) or (
+                            _is_private(nh)
+                            and not any(a.lower() == nh for a in allowed))))):
+                    return (f"ERROR: redirected to {nh or nxt or '(no location)'}, "
+                            "which is not allowed.")
+                url = nxt
+            finally:
                 r.close()
-                return (f"ERROR: redirected to {nh or nxt or '(no location)'}, "
-                        "which is not allowed.")
-            r.close()
-            url = nxt
         else:
             return "ERROR: fetch gave up after 6 redirects."
     except requests.exceptions.RequestException as e:

@@ -39,6 +39,7 @@ javascript: or data:), and every tool name/description is screened
 from __future__ import annotations
 
 import atexit
+import ipaddress
 import json
 import os
 import queue
@@ -50,9 +51,11 @@ import time
 import urllib.error
 import urllib.request
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import urljoin, urlparse
 
-from . import proc, safety
+from . import proc, safety, security
+
+_REAL_URLOPEN = urllib.request.urlopen
 
 PROTOCOL_VERSION = "2024-11-05"
 _CATALOG_CACHE: dict[tuple[str, ...], list[tuple[str, str, str]]] = {}
@@ -333,15 +336,23 @@ def signature(schema_json: str) -> str:
         schema = json.loads(schema_json or "{}")
     except ValueError:
         return "()"
+    if not isinstance(schema, dict):
+        return "()"
     props = schema.get("properties") or {}
+    if not isinstance(props, dict):
+        return "()"
     required = set(schema.get("required") or ())
     parts = []
     for k, v in list(props.items())[:6]:
+        key_clean = _clean_tool_name(k)
+        if not key_clean:
+            continue
         v = v if isinstance(v, dict) else {}
-        t = v.get("type", "any")
-        if v.get("enum"):
-            t = "|".join(str(e) for e in v["enum"][:4])
-        parts.append(f"{k}{'' if k in required else '?'}: {t}")
+        if isinstance(v.get("enum"), list) and v["enum"]:
+            t = "|".join(clean_description(e, limit=40) for e in v["enum"][:4])
+        else:
+            t = clean_description(v.get("type", "any"), limit=40) or "any"
+        parts.append(f"{key_clean}{'' if k in required else '?'}: {t}")
     if len(props) > 6:
         parts.append("...")
     return "(" + ", ".join(parts) + ")"
@@ -386,11 +397,13 @@ def _prompt_signature(args_json: str) -> str:
         args = json.loads(args_json or "[]")
     except ValueError:
         return "()"
+    if not isinstance(args, list):
+        return "()"
     parts = []
     for arg in (args or [])[:6]:
         if not isinstance(arg, dict):
             continue
-        name = str(arg.get("name") or "").strip()
+        name = _clean_tool_name(arg.get("name"))
         if name:
             parts.append(f"{name}{'' if arg.get('required') else '?'}")
     if len(args or []) > 6:
@@ -453,12 +466,12 @@ def resources(cfg) -> list[tuple[str, str, str]]:
         for r in (result or {}).get("resources") or []:
             if not isinstance(r, dict):
                 continue
-            uri = safety.strip_control(str(r.get("uri") or "")).strip()
+            uri = clean_description(r.get("uri"), limit=200)
             if uri:
                 desc = clean_description(r.get("description") or r.get("name"),
                                          limit=160)
-                out.append((f"{server}/{uri}", desc,
-                            str(r.get("mimeType") or "").strip()))
+                mime = clean_description(r.get("mimeType"), limit=60)
+                out.append((f"{server}/{uri}", desc, mime))
         return out
     return _extra(cfg, "resources", "resources/list", parse)
 
@@ -575,18 +588,24 @@ def render(cfg, limit: int = 2500) -> str:
                      "content=<JSON args>):")
         for name, desc, schema in entries:
             sig = signature(schema) if schema and schema != "{}" else ""
-            lines.append(f"  {name}{sig} -- {desc[:160]}")
+            lines.append(
+                f"  {_clean_tool_name(name)}{sig} -- "
+                f"{clean_description(desc, limit=160)}")
     if prompt_entries:
         lines.append("MCP PROMPTS (action=mcp, symbol=prompt:server/name, "
                      "content=<JSON args>):")
         for name, desc, args in prompt_entries:
-            lines.append(f"  prompt:{name}{_prompt_signature(args)} -- "
-                         f"{desc[:160]}")
+            lines.append(
+                f"  prompt:{_clean_tool_name(name)}{_prompt_signature(args)}"
+                f" -- {clean_description(desc, limit=160)}")
     if resource_entries:
         lines.append("MCP RESOURCES (action=mcp, symbol=resource:server/uri):")
         for name, desc, mime in resource_entries:
-            tail = f" [{mime}]" if mime else ""
-            lines.append(f"  resource:{name}{tail} -- {desc[:160]}")
+            cmime = clean_description(mime, limit=60) if mime else ""
+            tail = f" [{cmime}]" if cmime else ""
+            lines.append(
+                f"  resource:{clean_description(name, limit=200)}{tail} -- "
+                f"{clean_description(desc, limit=160)}")
     text = "\n".join(lines)
     if len(text) > limit:
         text = text[:limit].rstrip() + "\n[... MCP catalog truncated]"
@@ -652,7 +671,10 @@ def call(cfg, target: str, args: dict | None = None) -> str:
     if len(text) > cap:
         text = text[:cap] + f"\n[MCP result truncated at {cap} chars]"
     if result.get("isError"):
-        return "ERROR: MCP tool reported failure:\n" + (text or "(no detail)")
+        return safety.frame(
+            "mcp",
+            "ERROR: MCP tool reported failure:\n" + (text or "(no detail)"),
+            cfg, force=True)
     return text or "(MCP tool returned no text content)"
 
 
@@ -732,10 +754,12 @@ def clean_description(text: str, limit: int = 200) -> str:
 
 def _clean_tool_name(name: str) -> str:
     """A tool name safe to print on one prompt line: no control characters,
-    no embedded newlines, no role tags, bounded length. A name is server-
-    supplied DATA too -- `<system>` in a name must not fake a prompt turn."""
+    no embedded newlines, no role tags, instruction wording defanged, bounded
+    length. A name is server-supplied DATA too -- `<system>` in a name must
+    not fake a prompt turn."""
     cleaned = re.sub(r"\s+", " ", safety.strip_control(str(name or ""))).strip()
     cleaned = _DESC_ROLE_TAG_RE.sub("[filtered]", cleaned)
+    cleaned = safety.neutralize_injection(cleaned)
     return cleaned[:_DESC_NAME_MAX]
 
 
@@ -771,6 +795,62 @@ def normalise_named_spec(body: dict) -> dict | None:
     }
 
 
+class _NoAutoRedirect(urllib.request.HTTPRedirectHandler):
+    """Refuse automatic redirects so every hop is SSRF-revalidated."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+_MAX_HTTP_BYTES = 4 * 1024 * 1024
+_CGNAT_NET = ipaddress.ip_network("100.64.0.0/10")
+
+
+def _is_metadata_or_link_local(ip_str: str) -> bool:
+    try:
+        ip = ipaddress.ip_address(ip_str)
+    except ValueError:
+        return True
+    if ip.is_link_local or ip.is_unspecified or ip.is_multicast:
+        return True
+    if ip_str == "100.100.100.200" or (
+            isinstance(ip, ipaddress.IPv4Address) and ip in _CGNAT_NET):
+        return True
+    for inner in (getattr(ip, "ipv4_mapped", None),
+                  getattr(ip, "sixtofour", None)):
+        if inner is not None and _is_metadata_or_link_local(str(inner)):
+            return True
+    teredo = getattr(ip, "teredo", None)
+    if teredo is not None and any(_is_metadata_or_link_local(str(a))
+                                  for a in teredo):
+        return True
+    return False
+
+
+def _validate_mcp_host(host: str, allow: tuple[str, ...]) -> list[str]:
+    err, ips = security.resolve_checked(host, allow)
+    if err:
+        raise MCPError(err)
+    for ip_str in ips:
+        if _is_metadata_or_link_local(ip_str):
+            raise MCPError(
+                f"{host} resolves to link-local/metadata address {ip_str} "
+                "(SSRF refused)")
+    return ips
+
+
+def _read_bounded(resp, limit: int = _MAX_HTTP_BYTES) -> bytes:
+    try:
+        data = resp.read(limit)
+        if len(data) >= limit and resp.read(1):
+            raise MCPError(f"HTTP MCP reply exceeded {limit} bytes")
+    except TypeError:
+        data = resp.read()
+        if len(data) > limit:
+            raise MCPError(f"HTTP MCP reply exceeded {limit} bytes")
+    return data
+
+
 class _HttpSession:
     """MCP Streamable HTTP client on stdlib urllib: one JSON-RPC message per
     POST, the server's `Mcp-Session-Id` echoed back on every later request,
@@ -786,6 +866,21 @@ class _HttpSession:
         self._next_id = 1
         self.session_id = ""
 
+    @staticmethod
+    def _origin(url: str) -> tuple[str, str, int]:
+        u = urlparse(url)
+        scheme = u.scheme.lower()
+        host = (u.hostname or "").strip().rstrip(".").lower()
+        port = u.port or (443 if scheme == "https" else 80)
+        return scheme, host, port
+
+    def _open(self, req):
+        if urllib.request.urlopen is not _REAL_URLOPEN:
+            return urllib.request.urlopen(req, timeout=self.timeout)
+        opener = urllib.request.build_opener(
+            _NoAutoRedirect, urllib.request.ProxyHandler({}))
+        return opener.open(req, timeout=self.timeout)
+
     def _post(self, obj: dict, want_reply: bool):
         headers = {"Content-Type": "application/json",
                    "Accept": "application/json, text/event-stream"}
@@ -798,22 +893,72 @@ class _HttpSession:
             if key.lower() in ("authorization", "x_api_key", "x-api-key"):
                 headers[key.replace("_", "-")] = str(v)
         data = json.dumps(obj).encode("utf-8")
-        req = urllib.request.Request(self.url, data=data, headers=headers,
-                                     method="POST")
-        try:
-            with urllib.request.urlopen(req, timeout=self.timeout) as r:
-                raw = r.read().decode("utf-8", "replace")
-                sid = r.headers.get("Mcp-Session-Id") or ""
-                ctype = r.headers.get("Content-Type") or ""
-        except urllib.error.HTTPError as e:
-            detail = ""
+        initial_origin = self._origin(self.url)
+        initial_host = initial_origin[1]
+        current_url = self.url
+
+        for _hop in range(6):
+            hop_origin = self._origin(current_url)
+            hop_host = hop_origin[1]
+            # Explicitly configured host may be a local loopback/LAN MCP
+            # server, never link-local/metadata and never via cross-host
+            # redirect.
+            allow = (initial_host,) if hop_host == initial_host else ()
+            _validate_mcp_host(hop_host, allow)
+            if hop_origin != initial_origin:
+                headers = {
+                    k: v for k, v in headers.items()
+                    if k.lower() not in (
+                        "authorization", "x-api-key", "mcp-session-id")}
+            req = urllib.request.Request(current_url, data=data,
+                                         headers=headers, method="POST")
             try:
-                detail = e.read().decode("utf-8", "replace")[:300]
-            except Exception:
-                pass
-            raise MCPError(f"HTTP {e.code}: {detail or e.reason}") from e
-        except (urllib.error.URLError, OSError) as e:
-            raise MCPError(f"HTTP MCP server unreachable: {str(e)[:200]}") from e
+                with self._open(req) as r:
+                    status = getattr(r, "status", 200)
+                    if status in (301, 302, 303, 307, 308):
+                        loc = (r.headers.get("Location") or "").strip()
+                        nxt = urljoin(current_url, loc)
+                        bad = http_url_error(nxt)
+                        if bad or not loc:
+                            raise MCPError(
+                                f"MCP HTTP redirect refused: {bad or 'empty Location'}")
+                        current_url = nxt
+                        continue
+                    raw = _read_bounded(r).decode("utf-8", "replace")
+                    sid = r.headers.get("Mcp-Session-Id") or ""
+                    ctype = r.headers.get("Content-Type") or ""
+                    break
+            except urllib.error.HTTPError as e:
+                if e.code in (301, 302, 303, 307, 308):
+                    loc = ((e.headers.get("Location") if e.headers else "")
+                           or "").strip()
+                    try:
+                        e.close()
+                    except Exception:
+                        pass
+                    nxt = urljoin(current_url, loc)
+                    bad = http_url_error(nxt)
+                    if bad or not loc:
+                        raise MCPError(
+                            f"MCP HTTP redirect refused: {bad or 'empty Location'}") from e
+                    current_url = nxt
+                    continue
+                detail = ""
+                try:
+                    detail = _read_bounded(e, 65536).decode(
+                        "utf-8", "replace")[:300]
+                except Exception:
+                    pass
+                finally:
+                    try:
+                        e.close()
+                    except Exception:
+                        pass
+                raise MCPError(f"HTTP {e.code}: {detail or e.reason}") from e
+            except (urllib.error.URLError, OSError) as e:
+                raise MCPError(f"HTTP MCP server unreachable: {str(e)[:200]}") from e
+        else:
+            raise MCPError("HTTP MCP server exceeded maximum redirects")
         if sid:
             self.session_id = sid
         if not want_reply:
@@ -1091,5 +1236,8 @@ def call_mcp_tool(cfg, server_name: str, tool_name: str,
         text = text[:cap] + (f"\n[MCP result capped at about {tokens} tokens;"
                              f" {len(text) - cap} more characters dropped]")
     if result.get("isError"):
-        return "ERROR: MCP tool reported failure:\n" + (text or "(no detail)")
+        return safety.frame(
+            "mcp_call",
+            "ERROR: MCP tool reported failure:\n" + (text or "(no detail)"),
+            cfg, force=True)
     return text or "(MCP tool returned no text content)"

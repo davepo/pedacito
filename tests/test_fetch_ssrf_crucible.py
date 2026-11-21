@@ -276,3 +276,67 @@ def test_explicitly_named_private_host_is_fetchable():
         thread.join(timeout=3)
     assert "local ok" in out
     assert out.startswith("EXTERNAL CONTENT")
+
+
+# ------------------------------------------- WP-03: RFC 6598 / trailing-dot / v6 wrappers
+
+@pytest.mark.parametrize("host", [
+    "100.64.0.1",
+    "100.100.100.200",
+    "fec0::1",
+    "localhost.",
+    "foo.local.",
+    "foo.localhost.",
+    "::ffff:127.0.0.1",
+    "::ffff:169.254.169.254",
+    "::ffff:100.64.0.1",
+    "2002:7f00:0001::",
+    "2001:0::",
+])
+def test_extended_private_host_spellings_and_ranges_blocked(host):
+    assert security.is_private_host(host), host
+    url = f"http://[{host}]/x" if ":" in host else f"http://{host}/x"
+    assert security.ssrf_error(url, ("*",)), host
+    err, ips = security.resolve_checked(host, ("*",))
+    assert err and ips == [], (host, err, ips)
+
+
+def test_webfetch_refuses_ssrf_before_asking_permission_broker(tmp_path):
+    asked = []
+    security.install_permission_hook(
+        lambda info: asked.append(info) or (True, ""))
+    try:
+        cfg = Config()
+        cfg.allow_fetch = False
+        idx = Index(tmp_path, [])
+        for bad in ("http://169.254.169.254/latest/meta-data/",
+                    "http://100.100.100.200/latest/meta-data/",
+                    "http://localhost./secret",
+                    "http://[::ffff:127.0.0.1]/"):
+            out = webfetch.tool_fetch(idx, cfg, bad)
+            assert out.startswith("ERROR:"), bad
+        assert asked == []
+    finally:
+        security.install_permission_hook(None)
+
+
+def test_pinned_get_closes_session_even_on_error(monkeypatch):
+    closed = []
+
+    class FakeSession:
+        def __init__(self):
+            self.trust_env = True
+
+        def mount(self, *_a, **_k):
+            pass
+
+        def get(self, *_a, **_k):
+            raise webfetch.requests.exceptions.ConnectTimeout("boom")
+
+        def close(self):
+            closed.append(True)
+
+    monkeypatch.setattr(webfetch.requests, "Session", FakeSession)
+    with pytest.raises(webfetch.requests.exceptions.ConnectTimeout):
+        webfetch._pinned_get("https://example.com/", "example.com", "93.184.216.34")
+    assert closed == [True]
