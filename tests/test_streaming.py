@@ -349,3 +349,75 @@ def test_gui_status_exposes_live_fields_and_stop_sets_cancel_event(monkeypatch,
             if state.job is not None:
                 state.job.active = False
         state.bus.close()
+
+
+def test_stream_json_fallback_reads_json_before_close(monkeypatch):
+    body = {
+        "choices": [{"message": {"content": "before close"},
+                     "finish_reason": "stop"}],
+        "usage": {"prompt_tokens": 3, "completion_tokens": 2},
+    }
+
+    class CloseCheckedResp(Resp):
+        def json(self):
+            if self.closed:
+                raise RuntimeError("json() called after close()")
+            return self._body
+
+    response = CloseCheckedResp(lines=[], body=body, ctype="text/plain")
+    _patch_post(monkeypatch, response)
+    client = LLMClient(_cfg())
+    client.echo_stream = False
+    assert client.chat([{"role": "user", "content": "hi"}], 20, stream=True) \
+        == "before close"
+    assert response.closed
+
+
+def test_consume_stream_response_native_tool_calls_loop_guard_and_failure(monkeypatch):
+    from pedacito.tools import schema_for
+
+    # 1. Native tool_calls accumulated across SSE chunks
+    lines = [
+        _sse({"choices": [{"delta": {"content": None, "tool_calls": [
+            {"index": 0, "id": "call_1", "type": "function",
+             "function": {"name": "step", "arguments": '{"action": '}}
+        ]}, "finish_reason": None}]}),
+        _sse({"choices": [{"delta": {"tool_calls": [
+            {"index": 0, "function": {"arguments": '"done", "reasoning": "ok"}'}}
+        ]}, "finish_reason": "tool_calls"}]}),
+        "data: [DONE]",
+    ]
+    resp = Resp(lines)
+    _patch_post(monkeypatch, resp)
+    client = LLMClient(_cfg(tool_mode="native"))
+    client.echo_stream = False
+    out = client.chat_json([{"role": "user", "content": "go"}],
+                           schema_for(client.cfg), 100)
+    assert out == {"action": "done", "reasoning": "ok"}
+    assert client._native_ok is True
+
+    # 2. Repetition loop guard enforced inside _consume_stream_response
+    unit = ("This unique paragraph is over eighty characters long so it "
+            "exceeds the minimum cycle floor! ")
+    rep_lines = [_chunk(unit) for _ in range(45)] + ["data: [DONE]"]
+    rep_resp = Resp(rep_lines)
+    _patch_post(monkeypatch, rep_resp)
+    client2 = LLMClient(_cfg())
+    client2.echo_stream = False
+    client2.chat([{"role": "user", "content": "go"}], 100, stream=False)
+    assert client2.stream_repetition is True
+    assert client2.stream_truncated is True
+    assert client2._nudge_presence is True
+
+    # 3. RequestException inside _consume_stream_response records failure
+    class FailingResp(Resp):
+        def iter_lines(self, decode_unicode=False):
+            yield _chunk("part")
+            raise requests.exceptions.ChunkedEncodingError("drop")
+
+    _patch_post(monkeypatch, FailingResp())
+    client3 = LLMClient(_cfg(circuit_breaker=True, circuit_failures=1))
+    client3.echo_stream = False
+    with pytest.raises(Exception):
+        client3.chat([{"role": "user", "content": "go"}], 100, stream=False)
+    assert client3.circuit_trips == 1

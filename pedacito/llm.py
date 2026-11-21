@@ -448,7 +448,7 @@ def _load_mode_cache(base_url: str, model: str) -> bool | None:
 def _save_mode_cache(base_url: str, model: str, supported: bool) -> None:
     """Persist a probed verdict; an unwritable config dir never kills a run."""
     try:
-        from . import config
+        from . import config, fileio
         path = config.USER_CONFIG.parent / "server_modes.json"
         try:
             data = json.loads(path.read_text(encoding="utf-8"))
@@ -458,8 +458,7 @@ def _save_mode_cache(base_url: str, model: str, supported: bool) -> None:
             data = {}
         data[_mode_cache_key(base_url, model)] = {
             "schema_supported": supported, "ts": time.time()}
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(data, indent=1), encoding="utf-8")
+        fileio.write_bytes(path, json.dumps(data, indent=1).encode("utf-8"))
     except OSError:
         pass
 
@@ -480,10 +479,10 @@ def _json_cap_key(base_url: str, model: str) -> tuple[str, str]:
 
 
 def _json_caps(base_url: str, model: str) -> dict[str, bool]:
-    """The mutable {schema: bool, object: bool} tier table for an endpoint."""
+    """A copy of the {schema: bool, object: bool} tier table for an endpoint."""
     with _JSON_CAPS_LOCK:
-        return _JSON_CAPS.setdefault(
-            _json_cap_key(base_url, model), {"schema": True, "object": True})
+        return dict(_JSON_CAPS.setdefault(
+            _json_cap_key(base_url, model), {"schema": True, "object": True}))
 
 
 def _deny_json_cap(base_url: str, model: str, tier: str) -> None:
@@ -515,10 +514,10 @@ def _accel_cap_key(base_url: str, model: str) -> tuple[str, str]:
 
 
 def _accel_caps(base_url: str, model: str) -> dict[str, bool]:
-    """The mutable {cache: bool, lookup: bool} capability table for an endpoint."""
+    """A copy of the {cache: bool, lookup: bool} capability table for an endpoint."""
     with _ACCEL_CAPS_LOCK:
-        return _ACCEL_CAPS.setdefault(
-            _accel_cap_key(base_url, model), {"cache": True, "lookup": True})
+        return dict(_ACCEL_CAPS.setdefault(
+            _accel_cap_key(base_url, model), {"cache": True, "lookup": True}))
 
 
 def _deny_accel_cap(base_url: str, model: str, cap: str) -> None:
@@ -679,8 +678,11 @@ def unload_model(client) -> str:
             r = requests.post(url, headers=headers, json=payload, timeout=2)
         except Exception:
             continue
-        if r.status_code == 200:
-            return model
+        try:
+            if r.status_code == 200:
+                return model
+        finally:
+            _close(r)
     return ""
 
 
@@ -1228,12 +1230,50 @@ def repair_truncated_json(text: str) -> str | None:
             while k < n and buf[k] in " \t\r\n":
                 k += 1
             if k < n and buf[k] == '"' and _complete_value_end(k) is None:
-                # Keep the opening quote; escape only what follows it.
+                # Keep the opening quote; preserve valid JSON escapes while
+                # escaping any stray backslashes, unescaped quotes, or raw
+                # control characters in the surviving fragment.
                 frag = buf[k + 1:]
-                frag = (frag.replace("\\", "\\\\")
-                            .replace('"', '\\"').replace("\n", "\\n")
-                            .replace("\r", "\\r").replace("\t", "\\t"))
-                kept.append(buf[i:k] + '"' + frag + '"')
+                out_chars: list[str] = []
+                idx = 0
+                flen = len(frag)
+                while idx < flen:
+                    c = frag[idx]
+                    if c == "\\":
+                        if idx + 1 < flen:
+                            nxt = frag[idx + 1]
+                            if nxt in '"\\/bfnrt':
+                                out_chars.append(c + nxt)
+                                idx += 2
+                                continue
+                            if nxt == "u" and idx + 6 <= flen and all(
+                                    h in "0123456789abcdefABCDEF"
+                                    for h in frag[idx + 2:idx + 6]):
+                                out_chars.append(frag[idx:idx + 6])
+                                idx += 6
+                                continue
+                        # Trailing lone backslash or incomplete/invalid escape.
+                        out_chars.append("\\\\")
+                        idx += 1
+                    elif c == '"':
+                        out_chars.append('\\"')
+                        idx += 1
+                    elif c == "\n":
+                        out_chars.append("\\n")
+                        idx += 1
+                    elif c == "\r":
+                        out_chars.append("\\r")
+                        idx += 1
+                    elif c == "\t":
+                        out_chars.append("\\t")
+                        idx += 1
+                    elif ord(c) < 0x20:
+                        out_chars.append(f"\\u{ord(c):04x}")
+                        idx += 1
+                    else:
+                        out_chars.append(c)
+                        idx += 1
+                kept.append(buf[i:k] + '"' + "".join(out_chars) + '"')
                 break                          # nothing after the cut survives
             break                              # value missing or cut off
         kept.append(buf[i:vend])
@@ -1415,8 +1455,106 @@ _CONTEXT_OVERFLOW_RE = re.compile(
     re.IGNORECASE)
 
 # Pool one connection set per client; tests (and users) may monkeypatch
-# `requests.post`, so a patched function is honoured over the session.
+# `requests.post` / `time.sleep`, so patched functions are honoured.
 _REAL_POST = requests.post
+_REAL_SLEEP = time.sleep
+
+_OOM_MARKERS = (
+    "cudamalloc",
+    "out of memory",
+    "hiperror",
+    "ggml_assert",
+    "vk::outofdevicememoryerror",
+)
+
+
+def _oom_hint(text: str) -> str:
+    """Actionable hint when a server 500 or dropped stream indicates GPU/VRAM OOM."""
+    low = (text or "").lower()
+    if not any(marker in low for marker in _OOM_MARKERS):
+        return ""
+    return (
+        "\n  Likely GPU/VRAM out-of-memory on the model server. "
+        "Try lowering `context_tokens` (e.g. 16384 or 8192) or setting "
+        '`k_cache_quant = "q8_0"` in your profile/server config.'
+    )
+
+
+def _append_message_text(msg: dict, addition: str) -> None:
+    """Append `addition` to `msg['content']` whether it is str, list, or None."""
+    content = msg.get("content")
+    if isinstance(content, str):
+        msg["content"] = content + addition
+    elif isinstance(content, list):
+        parts = [dict(p) if isinstance(p, dict) else p for p in content]
+        for idx in range(len(parts) - 1, -1, -1):
+            if isinstance(parts[idx], dict) and parts[idx].get("type") == "text":
+                parts[idx]["text"] = str(parts[idx].get("text") or "") + addition
+                break
+        else:
+            parts.append({"type": "text", "text": addition.lstrip("\n")})
+        msg["content"] = parts
+    elif content is None:
+        msg["content"] = addition.lstrip("\n")
+
+
+class _StreamLoopGuard:
+    """Detect degenerate tool-syntax, verbatim, and duplicate-edit loops."""
+
+    def __init__(self):
+        self.tool_opens = 0
+        self.probe_tail = ""
+        self.rep_acc = ""
+        self.rep_since = 0
+        self.block_acc = ""
+        self.block_tail = ""
+
+    def feed(self, client: "LLMClient", delta: str) -> bool:
+        """Feed one content delta; return True when the stream must stop."""
+        probe = self.probe_tail + delta
+        self.tool_opens += len(_NATIVE_TOOL_OPEN_RE.findall(probe))
+        self.probe_tail = probe[-4:]
+        if self.tool_opens >= _MAX_STREAM_TOOL_OPENS:
+            print("\n[stopped the reply: the model is repeating "
+                  "tool-call syntax instead of answering; no tools "
+                  "can run in this phase]", file=sys.stderr)
+            return True
+        self.rep_acc += delta
+        self.rep_since += len(delta)
+        if self.rep_since >= _STREAM_REPEAT_CHECK_CHARS:
+            self.rep_since = 0
+            self.rep_acc = self.rep_acc[-_STREAM_REPEAT_WINDOW:]
+            if _repeat_run(self.rep_acc)[0]:
+                client.stream_repetition = True
+                client._nudge_presence = True
+                client.stream_truncated = True
+                print("\n[stopped the reply: the model is "
+                      "repeating the same text verbatim -- a "
+                      "degenerate loop; treating the answer as "
+                      "cut off]", file=sys.stderr)
+                return True
+        self.block_acc += delta
+        if len(self.block_acc) > _STREAM_BLOCK_WINDOW:
+            self.block_acc = self.block_acc[-_STREAM_BLOCK_WINDOW:]
+        block_probe = self.block_tail + delta
+        self.block_tail = block_probe[-20:]
+        if ">>>>>" in block_probe:
+            counts: dict[str, int] = {}
+            for m in _STREAM_BLOCK_DONE_RE.finditer(self.block_acc):
+                body = " ".join(m.group(0).split())
+                if len(body) < _STREAM_BLOCK_MIN_CHARS:
+                    continue
+                counts[body] = counts.get(body, 0) + 1
+            if max(counts.values(), default=0) >= _MAX_STREAM_DUP_BLOCKS:
+                client.stream_repetition = True
+                client._nudge_presence = True
+                client.stream_truncated = True
+                print("\n[stopped the reply: the model is "
+                      "re-emitting the same edit block over and "
+                      "over -- a degenerate loop; treating the "
+                      "answer as cut off]", file=sys.stderr)
+                return True
+        return False
 
 
 def _close(response) -> None:
@@ -1484,7 +1622,9 @@ class LLMClient:
                       "seconds": 0.0, "cost": 0.0, "by_site": {}}
         self._session = requests.Session()
         self._session_used = False
+        self._session_lock = threading.Lock()
         self._stats_lock = threading.Lock()
+        self._circuit_lock = threading.Lock()
         self._cancel = threading.Event()
         # Optional external cancellation token (threading.Event, a callable
         # predicate, or any object with is_set()). The GUI sets it to the
@@ -1726,7 +1866,9 @@ class LLMClient:
         fn = requests.post
         if fn is not _REAL_POST:
             return fn(url, **kw)
-        return self._session.post(url, **kw)
+        with self._session_lock:
+            sess = self._session
+        return sess.post(url, **kw)
 
     def temperature(self, value: float):
         """Context manager: sample at `value` for the calls inside it (used to
@@ -1753,12 +1895,14 @@ class LLMClient:
         return prov
 
     def _reset_session(self) -> None:
+        with self._session_lock:
+            old = self._session
+            self._session = requests.Session()
+            self._session_used = False
         try:
-            self._session.close()
+            old.close()
         except Exception:
             pass
-        self._session = requests.Session()
-        self._session_used = False
 
     def cancel(self) -> None:
         """Ask the in-flight (or next) streamed call to stop at the next
@@ -1846,37 +1990,64 @@ class LLMClient:
     def _circuit_enabled(self) -> bool:
         return bool(getattr(self.cfg, "circuit_breaker", True))
 
+    def _sleep_cancelable(self, seconds: float, cancel_event=None) -> None:
+        """Sleep up to `seconds` in 0.25s slices, aborting promptly if cancelled."""
+        if self._cancel_requested(cancel_event):
+            raise RunCancelledError("Stopped by user during retry wait.")
+        if seconds <= 0:
+            return
+        if time.sleep is not _REAL_SLEEP:
+            time.sleep(seconds)
+            if self._cancel_requested(cancel_event):
+                raise RunCancelledError("Stopped by user during retry wait.")
+            return
+        remaining = float(seconds)
+        while remaining > 0:
+            if self._cancel_requested(cancel_event):
+                raise RunCancelledError("Stopped by user during retry wait.")
+            chunk = min(0.25, remaining)
+            time.sleep(chunk)
+            remaining -= chunk
+        if self._cancel_requested(cancel_event):
+            raise RunCancelledError("Stopped by user during retry wait.")
+
     def _check_circuit(self) -> None:
         """Fail fast while the breaker is open; half-open after the cooldown."""
-        if not self._circuit_enabled() or not self._circuit_until:
+        if not self._circuit_enabled():
             return
-        now = time.monotonic()
-        if now < self._circuit_until:
-            wait = self._circuit_until - now
-            raise CircuitOpenError(
-                f"The model server failed repeatedly; pausing requests for "
-                f"another {wait:.0f}s (circuit breaker). Check that "
-                f"{self.cfg.base_url} is reachable and the model is loaded, "
-                "or set circuit_breaker = false to disable this guard.")
-        # Cooldown elapsed: allow one probe. A failure re-opens immediately.
-        self._circuit_until = 0.0
+        with self._circuit_lock:
+            until = self._circuit_until
+            if not until:
+                return
+            now = time.monotonic()
+            if now < until:
+                wait = until - now
+                raise CircuitOpenError(
+                    f"The model server failed repeatedly; pausing requests for "
+                    f"another {wait:.0f}s (circuit breaker). Check that "
+                    f"{self.cfg.base_url} is reachable and the model is loaded, "
+                    "or set circuit_breaker = false to disable this guard.")
+            # Cooldown elapsed: allow one probe. A failure re-opens immediately.
+            self._circuit_until = 0.0
 
     def _record_success(self) -> None:
-        self._failures = 0
-        self._circuit_until = 0.0
+        with self._circuit_lock:
+            self._failures = 0
+            self._circuit_until = 0.0
 
     def _record_failure(self) -> None:
         if not self._circuit_enabled():
             return
-        self._failures += 1
-        limit = max(1, int(getattr(self.cfg, "circuit_failures", 4) or 4))
-        if self._failures < limit:
-            return
-        cooldown = max(1.0, float(getattr(self.cfg, "circuit_cooldown", 60.0)
-                                  or 60.0))
-        self._failures = 0
-        self._circuit_until = time.monotonic() + cooldown
-        self.circuit_trips += 1
+        with self._circuit_lock:
+            self._failures += 1
+            limit = max(1, int(getattr(self.cfg, "circuit_failures", 4) or 4))
+            if self._failures < limit:
+                return
+            cooldown = max(1.0, float(getattr(self.cfg, "circuit_cooldown", 60.0)
+                                      or 60.0))
+            self._failures = 0
+            self._circuit_until = time.monotonic() + cooldown
+            self.circuit_trips += 1
         print(f"[circuit breaker: {limit} consecutive model-server failures; "
               f"pausing requests for {cooldown:.0f}s]", file=sys.stderr)
 
@@ -1966,13 +2137,16 @@ class LLMClient:
                 # A pooled keep-alive connection the server already closed
                 # looks like a refused connection; retry once on a fresh
                 # session before declaring the server unreachable.
-                if not self._session_used:
+                with self._session_lock:
+                    used = self._session_used
+                if not used:
                     raise
                 self._reset_session()
                 r = self._http_post(
                     self.url, headers=self.headers, json=payload,
                     timeout=self.cfg.timeout, stream=stream)
-            self._session_used = True
+            with self._session_lock:
+                self._session_used = True
         except requests.exceptions.ConnectionError as e:
             self._record_failure()
             raise LLMError(CONNECT_HELP.format(url=self.cfg.base_url)) from e
@@ -2017,7 +2191,8 @@ class LLMClient:
                     f"{body[:300]}")
             if r.status_code >= 500 and not loading:
                 self._record_failure()
-            raise LLMError(f"Server returned {r.status_code}: {body[:500]}")
+            hint = _oom_hint(body) if r.status_code >= 500 else ""
+            raise LLMError(f"Server returned {r.status_code}: {body[:500]}{hint}")
         self._record_success()
         return r
 
@@ -2040,21 +2215,25 @@ class LLMClient:
         except requests.exceptions.RequestException as e:
             raise LLMError(f"Embeddings request failed: "
                            f"{type(e).__name__}: {str(e)[:200]}") from e
-        if r.status_code >= 400:
-            raise LLMError(
-                f"Embeddings request failed ({r.status_code}): {r.text[:300]}. "
-                f"Set embedding_model to a model your server can load, or turn "
-                f"semantic_search off.")
         try:
-            data = r.json()["data"]
-            if isinstance(data, dict):        # single-input server shape
-                data = [data]
-            data = sorted(data, key=lambda d: d.get("index", 0))
-            self.stats["calls"] += 1
-            return [[float(x) for x in d["embedding"]] for d in data]
-        except Exception as e:                  # pragma: no cover - server shape
-            raise LLMError(
-                f"Unexpected embeddings response: {r.text[:300]}") from e
+            if r.status_code >= 400:
+                raise LLMError(
+                    f"Embeddings request failed ({r.status_code}): {r.text[:300]}. "
+                    f"Set embedding_model to a model your server can load, or turn "
+                    f"semantic_search off.")
+            try:
+                data = r.json()["data"]
+                if isinstance(data, dict):        # single-input server shape
+                    data = [data]
+                data = sorted(data, key=lambda d: d.get("index", 0))
+                with self._stats_lock:
+                    self.stats["calls"] += 1
+                return [[float(x) for x in d["embedding"]] for d in data]
+            except Exception as e:                  # pragma: no cover - server shape
+                raise LLMError(
+                    f"Unexpected embeddings response: {r.text[:300]}") from e
+        finally:
+            _close(r)
 
     def vision(self, prompt: str, image_path, model: str | None = None,
                max_tokens: int = 400) -> str:
@@ -2084,11 +2263,14 @@ class LLMClient:
         try:
             msg = r.json()["choices"][0]["message"]
             content = msg.get("content") or ""
-            self.stats["calls"] += 1
+            with self._stats_lock:
+                self.stats["calls"] += 1
             return strip_reasoning(content).strip()
         except Exception as e:                  # pragma: no cover - server shape
             raise LLMError(
                 f"Unexpected vision response: {r.text[:300]}") from e
+        finally:
+            _close(r)
 
     def chat(self, messages: list[dict], max_tokens: int, schema: dict | None = None,
              stream: bool | None = None, disable_thinking: bool | None = None,
@@ -2166,6 +2348,7 @@ class LLMClient:
                 if not trimmed_once:
                     body_idx = [i for i, m in enumerate(messages)
                                 if m["role"] == "user"
+                                and isinstance(m.get("content"), str)
                                 and m["content"].startswith("RESULT:\n")]
                     if len(body_idx) > 2:
                         drop = set(body_idx[: len(body_idx) // 2])
@@ -2176,16 +2359,18 @@ class LLMClient:
                         print("[server context overflow: dropped older tool "
                               "results and retrying]", file=sys.stderr)
                         continue
-                if any(m["role"] == "system" for m in messages) and \
+                if (any(m["role"] == "system" for m in messages)
+                        or self._no_system_role) and \
                         len([m for m in messages if m["role"] != "system"]) > 2:
                     # No RESULT turns to shed (answer phase): drop the middle
                     # assistant turns, keeping the first user turn (map+task)
                     # and the last (latest instruction/result).
-                    keep_first = next(i for i, m in enumerate(messages)
-                                      if m["role"] == "user")
-                    keep_last = max(i for i, m in enumerate(messages)
-                                    if m["role"] == "user")
-                    if keep_last - keep_first > 1:
+                    keep_first = next((i for i, m in enumerate(messages)
+                                       if m["role"] == "user"), None)
+                    keep_last = max((i for i, m in enumerate(messages)
+                                     if m["role"] == "user"), default=None)
+                    if keep_first is not None and keep_last is not None \
+                            and keep_last - keep_first > 1:
                         mid = [i for i in range(keep_first + 1, keep_last)
                                if messages[i]["role"] == "assistant"]
                         if mid:
@@ -2245,7 +2430,7 @@ class LLMClient:
                     print(f"[rate limited by the server; waiting {wait:.0f}s "
                           f"({rate_waits}/{_MAX_RATE_LIMIT_RETRIES})]",
                           file=sys.stderr)
-                    time.sleep(wait)
+                    self._sleep_cancelable(wait, cancel_event=cancel_event)
                     continue
                 waited = time.time() - started
                 if waited >= self.cfg.load_wait_seconds:
@@ -2263,7 +2448,8 @@ class LLMClient:
                     announced = True
                 elif attempt % 5 == 0:
                     print(f"[still waiting, {waited:.0f}s elapsed]", file=sys.stderr)
-                time.sleep(delay + random.uniform(0, 0.5))
+                self._sleep_cancelable(delay + random.uniform(0, 0.5),
+                                       cancel_event=cancel_event)
                 delay = min(delay * 1.6, 10.0)
                 continue
 
@@ -2327,7 +2513,7 @@ class LLMClient:
                   f"{self.last_reasoning_chars:,} chars of hidden reasoning, "
                   f"finish '{self.last_finish_reason or 'stop'}'); "
                   f"retrying{how}]", file=sys.stderr)
-            time.sleep(1.0)
+            self._sleep_cancelable(1.0, cancel_event=cancel_event)
 
     def _always_thinks_fit_error(self, max_tokens: int) -> str:
         """The model-fit message for an always-reasoning model that spent its
@@ -2346,17 +2532,19 @@ class LLMClient:
     def _check_budget(self) -> None:
         """Raise BudgetExceeded before a call when a configured token/cost
         budget is already spent."""
+        with self._stats_lock:
+            used = self.stats["prompt_tokens"] + self.stats["completion_tokens"]
+            cost = self.stats["cost"]
         cap_tokens = int(getattr(self.cfg, "max_total_tokens", 0) or 0)
-        used = self.stats["prompt_tokens"] + self.stats["completion_tokens"]
         if cap_tokens and used >= cap_tokens:
             raise BudgetExceeded(
                 f"Token budget spent: {used:,} of max_total_tokens="
                 f"{cap_tokens:,}. Raise it (or pass --max-tokens-budget) to "
                 "continue; progress so far is saved.")
         cap_cost = float(getattr(self.cfg, "max_cost", 0) or 0)
-        if cap_cost and self.stats["cost"] >= cap_cost:
+        if cap_cost and cost >= cap_cost:
             raise BudgetExceeded(
-                f"Cost budget spent: ${self.stats['cost']:.4f} of max_cost="
+                f"Cost budget spent: ${cost:.4f} of max_cost="
                 f"${cap_cost:.2f}. Raise it (or pass --max-cost) to continue.")
 
     def _account(self, usage: dict, timings: dict | None, seconds: float,
@@ -2452,7 +2640,7 @@ class LLMClient:
                    schema: dict | None = None, stream: bool = False,
                    disable_thinking: bool | None = None,
                    json_schema: dict | None = None, cancel_event=None,
-                   on_stream=None) -> str:
+                   on_stream=None, _count_call: bool = True) -> str:
         """One HTTP request (no retry logic); returns the response text,
         buffered or streamed (to `stream_callback`, else stdout).
 
@@ -2483,12 +2671,13 @@ class LLMClient:
         if not suffix and want_off:
             suffix = thinking_suffix_for(self.cfg)
         if suffix and msgs:
-            msgs[-1]["content"] += "\n\n" + suffix
+            _append_message_text(msgs[-1], "\n\n" + suffix)
         if fmt_schema is not None and self.cfg.json_mode == "object" and msgs:
             # Hosted APIs require the word "json" in the prompt for
             # json_object mode; naming the fields improves compliance.
             fields = ", ".join(fmt_schema.get("properties", {}).keys())
-            msgs[-1]["content"] += (
+            _append_message_text(
+                msgs[-1],
                 f"\n\nReply with one JSON object only, no prose. "
                 f"Fields: {fields}.")
 
@@ -2607,20 +2796,28 @@ class LLMClient:
                 }
             elif tier == "object":
                 payload["response_format"] = {"type": "json_object"}
-            elif self.cfg.json_mode != "object":
+                if self.cfg.json_mode != "object" and msgs:
+                    fields = ", ".join(fmt_schema.get("properties", {}).keys())
+                    _append_message_text(
+                        msgs[-1],
+                        f"\n\nReply with one JSON object only, no prose. "
+                        f"Fields: {fields}.")
+            elif self.cfg.json_mode != "object" and msgs:
                 fields = ", ".join(fmt_schema.get("properties", {}).keys())
                 shots = self.fewshot if "action" in (
                     fmt_schema.get("properties") or {}) else []
                 if shots:
                     examples = "\n".join(
                         schema_example_with(fmt_schema, **s) for s in shots)
-                    msgs[-1]["content"] += (
+                    _append_message_text(
+                        msgs[-1],
                         "\n\nReply with one JSON object only, no prose. "
                         f"Fields: {fields}.\nWorked examples (for THIS "
                         f"project; choose what the task needs):\n"
                         + examples)
                 else:
-                    msgs[-1]["content"] += (
+                    _append_message_text(
+                        msgs[-1],
                         "\n\nReply with one JSON object only, no prose. "
                         f"Fields: {fields}.\nExample of a well-formed "
                         "reply:\n" + _schema_example(fmt_schema))
@@ -2651,7 +2848,9 @@ class LLMClient:
             except Exception:
                 pass      # telemetry must never break a call
         t0 = time.time()
-        self.stats["calls"] += 1
+        if _count_call:
+            with self._stats_lock:
+                self.stats["calls"] += 1
         self.request_started_at = time.monotonic()
         # Cleared per attempt so a stale "length" from an abandoned attempt
         # cannot trigger apply()'s continuation loop.
@@ -2680,7 +2879,8 @@ class LLMClient:
                                            stream, disable_thinking,
                                            json_schema,
                                            cancel_event=cancel_event,
-                                           on_stream=on_stream)
+                                           on_stream=on_stream,
+                                           _count_call=False)
                 if native and self._tools_rejected(e):
                     self._native_ok = False
                     print("[this server rejected native tool calls; using the "
@@ -2688,17 +2888,20 @@ class LLMClient:
                     return self._chat_once(messages, max_tokens, schema, stream,
                                            disable_thinking, json_schema,
                                            cancel_event=cancel_event,
-                                           on_stream=on_stream)
+                                           on_stream=on_stream,
+                                           _count_call=False)
                 if self._downgrade_response_format(payload, e):
                     return self._chat_once(messages, max_tokens, schema, stream,
                                            disable_thinking, json_schema,
                                            cancel_event=cancel_event,
-                                           on_stream=on_stream)
+                                           on_stream=on_stream,
+                                           _count_call=False)
                 if self._deny_accel_caps(payload, e):
                     return self._chat_once(messages, max_tokens, schema, stream,
                                            disable_thinking, json_schema,
                                            cancel_event=cancel_event,
-                                           on_stream=on_stream)
+                                           on_stream=on_stream,
+                                           _count_call=False)
                 raise
             try:
                 with self._active_response_lock:
@@ -2724,12 +2927,7 @@ class LLMClient:
 
         # Streaming, so the user sees progress at local-model speeds.
         out: list[str] = []
-        tool_opens = 0
-        probe_tail = ""
-        rep_acc = ""          # content tail for the repetition test
-        rep_since = 0         # new chars since the last repetition test
-        block_acc = ""        # content tail for the duplicate-block census
-        block_tail = ""       # overlap so a split closing marker still scans
+        guard = _StreamLoopGuard()
         reasoning_chars = 0
         usage: dict = {}
         timings: dict | None = None
@@ -2746,17 +2944,20 @@ class LLMClient:
                 return self._chat_once(messages, max_tokens, schema, stream,
                                        disable_thinking, json_schema,
                                        cancel_event=cancel_event,
-                                       on_stream=on_stream)
+                                       on_stream=on_stream,
+                                       _count_call=False)
             if self._downgrade_response_format(payload, e):
                 return self._chat_once(messages, max_tokens, schema, stream,
                                        disable_thinking, json_schema,
                                        cancel_event=cancel_event,
-                                       on_stream=on_stream)
+                                       on_stream=on_stream,
+                                       _count_call=False)
             if self._deny_accel_caps(payload, e):
                 return self._chat_once(messages, max_tokens, schema, stream,
                                        disable_thinking, json_schema,
                                        cancel_event=cancel_event,
-                                       on_stream=on_stream)
+                                       on_stream=on_stream,
+                                       _count_call=False)
             low = str(e).lower()
             if "stream_options" in payload and (
                     "stream_options" in low or "include_usage" in low):
@@ -2849,6 +3050,7 @@ class LLMClient:
             events_emitted += 1
             self._emit_stream_event(event, callback=on_stream)
 
+        fallback_data = None
         with self._active_response_lock:
             self._active_response = r
         try:
@@ -2939,62 +3141,8 @@ class LLMClient:
                         elif self.echo_stream:
                             sys.stdout.write(visible)
                             sys.stdout.flush()
-                    # Degenerate native-tool-call loop guard; the 4-char
-                    # overlap catches an opening tag split across chunks.
-                    probe = probe_tail + delta
-                    tool_opens += len(_NATIVE_TOOL_OPEN_RE.findall(probe))
-                    probe_tail = probe[-4:]
-                    if tool_opens >= _MAX_STREAM_TOOL_OPENS:
-                        print("\n[stopped the reply: the model is repeating "
-                              "tool-call syntax instead of answering; no tools "
-                              "can run in this phase]", file=sys.stderr)
+                    if guard.feed(self, delta):
                         break
-                    # Verbatim-repetition guard (degenerate answer loop): pace
-                    # the KMP period test so ordinary streams pay nothing extra.
-                    rep_acc += delta
-                    rep_since += len(delta)
-                    if rep_since >= _STREAM_REPEAT_CHECK_CHARS:
-                        rep_since = 0
-                        rep_acc = rep_acc[-_STREAM_REPEAT_WINDOW:]
-                        if _repeat_run(rep_acc)[0]:
-                            self.stream_repetition = True
-                            self._nudge_presence = True
-                            # The reply is cut off: flag it like a dropped
-                            # stream so the existing continuation/re-ask
-                            # machinery handles the rest of the phase.
-                            self.stream_truncated = True
-                            print("\n[stopped the reply: the model is "
-                                  "repeating the same text verbatim -- a "
-                                  "degenerate loop; treating the answer as "
-                                  "cut off]", file=sys.stderr)
-                            break
-                    # Duplicate-block guard (BUG-215): the same completed edit
-                    # block re-emitted under changing FILE headers is a loop
-                    # the verbatim tail test cannot see. Scan only when a
-                    # closing marker may have just completed; the overlap
-                    # catches a marker split across chunks.
-                    block_acc += delta
-                    if len(block_acc) > _STREAM_BLOCK_WINDOW:
-                        block_acc = block_acc[-_STREAM_BLOCK_WINDOW:]
-                    block_probe = block_tail + delta
-                    block_tail = block_probe[-20:]
-                    if ">>>>>" in block_probe:
-                        counts: dict[str, int] = {}
-                        for m in _STREAM_BLOCK_DONE_RE.finditer(block_acc):
-                            body = " ".join(m.group(0).split())
-                            if len(body) < _STREAM_BLOCK_MIN_CHARS:
-                                continue
-                            counts[body] = counts.get(body, 0) + 1
-                        if max(counts.values(), default=0) \
-                                >= _MAX_STREAM_DUP_BLOCKS:
-                            self.stream_repetition = True
-                            self._nudge_presence = True
-                            self.stream_truncated = True
-                            print("\n[stopped the reply: the model is "
-                                  "re-emitting the same edit block over and "
-                                  "over -- a degenerate loop; treating the "
-                                  "answer as cut off]", file=sys.stderr)
-                            break
                 if self._cancel_requested(external_cancel):
                     cancelled = True
                     break
@@ -3013,6 +3161,13 @@ class LLMClient:
             if not (cancelled or self._cancel_requested(external_cancel)):
                 raise
             dropped = e
+        else:
+            # Read fallback JSON body BEFORE _close(r) closes the response.
+            if sse_data_seen == 0 and not cancelled and not self._cancel_requested(external_cancel):
+                try:
+                    fallback_data = r.json()
+                except Exception:
+                    fallback_data = None
         finally:
             with self._active_response_lock:
                 if self._active_response is r:
@@ -3047,10 +3202,7 @@ class LLMClient:
         # standard JSON body instead of SSE. No data frame + a JSON body is
         # that fallback: parse it transparently.
         if sse_data_seen == 0 and not text and not cancelled:
-            try:
-                data = r.json()
-            except Exception:
-                data = None
+            data = fallback_data
             if data is None and prelude:
                 # iter_lines consumed the body: parse the buffered raw lines
                 # instead (requests.Response.json() raises after consumption).
@@ -3094,7 +3246,8 @@ class LLMClient:
             if not text.strip():
                 raise LLMError(
                     f"The connection to {self.cfg.base_url} dropped mid-reply "
-                    f"({type(dropped).__name__}: {str(dropped)[:160]}).") \
+                    f"({type(dropped).__name__}: {str(dropped)[:160]})."
+                    f"{_oom_hint(str(dropped))}") \
                     from dropped
             # Partial answer survives: flag it truncated so the existing
             # continuation machinery asks for the rest instead of losing it.
@@ -3167,7 +3320,9 @@ class LLMClient:
                     else getattr(self, "cancel_event", None))
         sink = self.stream_callback
         splitter = _StreamThinkSplitter()
+        guard = _StreamLoopGuard()
         out: list[str] = []
+        tool_call_parts: dict[int, list[str]] = {}
         reasoning_parts: list[str] = []
         pending_reasoning: list[str] = []
         pending_content: list[str] = []
@@ -3184,6 +3339,8 @@ class LLMClient:
         self.last_finish_reason = ""
         self.last_reasoning_chars = 0
         self.stream_phase = ""
+        self.stream_truncated = False
+        self.stream_repetition = False
 
         def emit(final: bool = False) -> None:
             nonlocal pending_reasoning, pending_content, chunks, last_emit
@@ -3265,11 +3422,28 @@ class LLMClient:
                     self.stream_truncated = True
                 delta = d.get("content")
                 rc = _reasoning_text(d)
-                if not delta and not rc:
+                tc_added = 0
+                if native:
+                    for tc in (d.get("tool_calls") or []):
+                        if not isinstance(tc, dict):
+                            continue
+                        idx = int(tc.get("index", 0) or 0)
+                        fn = tc.get("function") or {}
+                        args = fn.get("arguments")
+                        if isinstance(args, dict):
+                            s = json.dumps(args)
+                            tool_call_parts.setdefault(idx, []).append(s)
+                            tc_added += len(s)
+                        elif isinstance(args, str) and args:
+                            tool_call_parts.setdefault(idx, []).append(args)
+                            tc_added += len(args)
+                if not delta and not rc and not tc_added:
                     continue
                 if first_token_at is None:
                     first_token_at = time.monotonic()
                     self.first_token_at = first_token_at
+                if tc_added:
+                    counted_chars += tc_added
                 if rc:
                     if pending_content:
                         emit()              # keep content before thoughts
@@ -3299,6 +3473,8 @@ class LLMClient:
                         elif self.echo_stream:
                             sys.stdout.write(visible)
                             sys.stdout.flush()
+                    if guard.feed(self, delta):
+                        break
                 if self._cancel_requested(external):
                     self.partial_text = strip_reasoning("".join(out))
                     raise RunCancelledError(
@@ -3319,9 +3495,11 @@ class LLMClient:
                 raise RunCancelledError(
                     "Stopped by user; the partial reply is kept in "
                     "client.partial_text.") from e
+            self._record_failure()
             raise LLMError(
                 f"The connection to {self.cfg.base_url} dropped mid-reply "
-                f"({type(e).__name__}: {str(e)[:160]}).") from e
+                f"({type(e).__name__}: {str(e)[:160]})."
+                f"{_oom_hint(str(e))}") from e
         finally:
             with self._active_response_lock:
                 if self._active_response is r:
@@ -3345,7 +3523,15 @@ class LLMClient:
         if sink is None and self.echo_stream:
             sys.stdout.write("\n")
         self.last_reasoning_chars = reasoning_chars
-        text = strip_reasoning("".join(out))
+        tc_text = ""
+        if native and tool_call_parts:
+            first_idx = sorted(tool_call_parts)[0]
+            cand = "".join(tool_call_parts[first_idx])
+            if cand.strip():
+                tc_text = cand
+        text = tc_text or strip_reasoning("".join(out))
+        if native and self._native_ok is None and text:
+            self._native_ok = True
         self.partial_text = text
         usage = dict(usage or {})
         if usage:
@@ -3471,6 +3657,10 @@ class LLMClient:
         caps = _accel_caps(self.cfg.base_url, self.cfg.model)
         names = {_ACCEL_CACHE_KEY: "cache", _ACCEL_LOOKUP_KEY: "lookup"}
         fresh = [k for k in attached if caps.get(names[k], True)]
+        if _ACCEL_LOOKUP_KEY in low and _ACCEL_CACHE_KEY not in low:
+            # Server specifically blamed prompt_lookup_num_tokens; keep
+            # cache_prompt active instead of disabling both.
+            fresh = [k for k in fresh if k == _ACCEL_LOOKUP_KEY]
         if not fresh:
             return False
         for k in fresh:
@@ -3745,9 +3935,12 @@ class LLMClient:
         base = _server_root(self.cfg.base_url)
         try:
             r = requests.get(base + "/api/v0/models", headers=self.headers, timeout=10)
-            if r.status_code != 200:
-                return None
-            data = r.json().get("data", [])
+            try:
+                if r.status_code != 200:
+                    return None
+                data = r.json().get("data", [])
+            finally:
+                _close(r)
         except Exception:
             return None
         out = {m.get("id", "?"): m.get("state", "unknown") for m in data if isinstance(m, dict)}
@@ -3841,9 +4034,12 @@ class LLMClient:
         for path in ("/api/v1/health", "/api/v0/health"):
             try:
                 r = requests.get(root + path, headers=self.headers, timeout=5)
-                if r.status_code != 200:
-                    continue
-                data = r.json()
+                try:
+                    if r.status_code != 200:
+                        continue
+                    data = r.json()
+                finally:
+                    _close(r)
             except Exception:
                 continue
             entries = data.get("all_models_loaded") or []
@@ -3867,9 +4063,12 @@ class LLMClient:
                + "/options")
         try:
             r = requests.get(url, headers=self.headers, timeout=5)
-            if r.status_code != 200:
-                return None
-            data = r.json()
+            try:
+                if r.status_code != 200:
+                    return None
+                data = r.json()
+            finally:
+                _close(r)
         except Exception:
             return None
         ctx = _positive_int(data.get("resolved_ctx_size"))
@@ -3923,9 +4122,12 @@ class LLMClient:
                 break
             try:
                 r = requests.get(url, headers=self.headers, timeout=5)
-                if r.status_code != 200:
-                    continue
-                data = r.json()
+                try:
+                    if r.status_code != 200:
+                        continue
+                    data = r.json()
+                finally:
+                    _close(r)
                 if isinstance(data, dict):
                     entries = data.get("models") or data.get("data") or []
                 else:
@@ -3954,8 +4156,11 @@ class LLMClient:
             try:
                 r = requests.post(root + "/api/show",
                                   json={"name": model}, timeout=5)
-                if r.status_code == 200:
-                    d = r.json()
+                try:
+                    d = r.json() if r.status_code == 200 else None
+                finally:
+                    _close(r)
+                if d is not None:
                     got: dict = {}
                     size = d.get("size")
                     if size is not None:
@@ -4018,22 +4223,25 @@ class LLMClient:
                     root = _server_root(self.cfg.base_url)
                     r = requests.get(root + "/api/v0/models",
                                      headers=self.headers, timeout=5)
-                    if r.status_code == 200:
-                        for m in r.json().get("data", []):
-                            if not isinstance(m, dict):
-                                continue
-                            if m.get("id") == self.cfg.model or m.get("key") == self.cfg.model:
-                                sp = [str(x).lower() for x in
-                                      (m.get("supported_parameters") or [])]
-                                if any("response_format" in x or "json_schema" in x
-                                       for x in sp):
-                                    self._schema_supported = True
-                                elif sp:
-                                    self._schema_supported = False
-                                    print("[server does not support constrained "
-                                          "JSON; using plain JSON prompting]",
-                                          file=sys.stderr)
-                                break
+                    try:
+                        if r.status_code == 200:
+                            for m in r.json().get("data", []):
+                                if not isinstance(m, dict):
+                                    continue
+                                if m.get("id") == self.cfg.model or m.get("key") == self.cfg.model:
+                                    sp = [str(x).lower() for x in
+                                          (m.get("supported_parameters") or [])]
+                                    if any("response_format" in x or "json_schema" in x
+                                           for x in sp):
+                                        self._schema_supported = True
+                                    elif sp:
+                                        self._schema_supported = False
+                                        print("[server does not support constrained "
+                                              "JSON; using plain JSON prompting]",
+                                              file=sys.stderr)
+                                    break
+                    finally:
+                        _close(r)
                 except Exception:
                     pass   # best-effort probe
                 if self._schema_supported is not None:
@@ -4068,9 +4276,12 @@ class LLMClient:
             try:
                 r = requests.post(url, headers=self.headers, json=payload,
                                   timeout=10)
-                if r.status_code != 200:
-                    continue
-                d = r.json()
+                try:
+                    if r.status_code != 200:
+                        continue
+                    d = r.json()
+                finally:
+                    _close(r)
                 n = _positive_int(d.get("count")) or \
                     (len(d["tokens"]) if isinstance(d.get("tokens"), list) else 0)
                 if n > 0:
@@ -4135,7 +4346,11 @@ class LLMClient:
             if fmt is not None:
                 payload["response_format"] = fmt
             try:
-                data = self._post(payload).json()
+                r = self._post(payload)
+                try:
+                    data = r.json()
+                finally:
+                    _close(r)
                 text = (extract_content(data["choices"][0]["message"]) or "").strip()
                 i, j = text.find("{"), text.rfind("}")
                 obj = json.loads(text[i:j + 1]) if i != -1 and j > i else None
@@ -4160,9 +4375,11 @@ class LLMClient:
         """Verify the server is reachable and return its comma-joined model ids;
         with `warn`, print a warning if the configured model is not listed."""
         url = self.cfg.base_url.rstrip("/") + "/models"
+        r = None
         try:
             r = requests.get(url, headers=self.headers, timeout=15)
             r.raise_for_status()
+            ids = [m.get("id", "?") for m in r.json().get("data", [])]
         except requests.exceptions.HTTPError as e:
             # BUG-007: the server WAS reached and answered with an error.
             # Name the status (as _post does) instead of sending the user to
@@ -4189,7 +4406,9 @@ class LLMClient:
                 "  - Set base_url in your config: `pedacito config --init`, then\n"
                 "    `pedacito config --check` to test it."
             ) from e
-        ids = [m.get("id", "?") for m in r.json().get("data", [])]
+        finally:
+            if r is not None:
+                _close(r)
         if warn and self.cfg.model not in ids:
             print(f"[warn] model '{self.cfg.model}' not in loaded list: {ids}",
                   file=sys.stderr)
