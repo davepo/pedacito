@@ -567,7 +567,9 @@ def test_gui_app_js_exposes_rename():
     src = (Path(cli.__file__).resolve().parent / "gui/static/app.js"
            ).read_text(encoding="utf-8")
     assert "function renameSymbolDialog()" in src
-    assert 'label="Rename symbol\\u2026"' in src
+    # The menu item is localized; the English label stays as the fallback.
+    assert ("PDC.t('gui.menu.rename_symbol', null, 'Rename symbol\\u2026')"
+            in src)
     assert "/api/refactor/rename" in src
     # the new dialog's own copy must stay free of em-dashes (UI strings rule)
     start = src.index("// Deterministic symbol rename")

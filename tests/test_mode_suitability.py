@@ -486,8 +486,10 @@ def test_gui_html_serves_the_mode_helpers_and_recommendation_handler(gui):
     assert "splits big goals into a PLAN.md checklist" in text
     assert "Generates or updates PLAN.md without editing code yet." in text
     assert "Scaffolds a brand-new project in a target directory." in text
-    # Tooltips on every mode button.
-    assert "title=${MODES[k].title}" in text
+    # Tooltips on every mode button (localized, with the MODES title as the
+    # English fallback when a catalog is unavailable).
+    assert "MODES[k].title" in text
+    assert "PDC.t('gui.mode.' + k + '.title'" in text
     # The live recommendation banner + pre-run choice handler.
     assert "/api/mode-check" in text
     assert "Looks like a single-pass edit" in text

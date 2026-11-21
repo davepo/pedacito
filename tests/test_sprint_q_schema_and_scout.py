@@ -508,4 +508,6 @@ def test_settings_js_wires_the_scout_controls():
     assert "None (use active profile)" in js
     app = (Path(__file__).resolve().parents[1] / "pedacito" / "gui" / "static"
            / "app.js").read_text(encoding="utf-8")
-    assert "scoutChip" in app and "Scout: " in app
+    # The chip is localized; "Scout" stays the English fallback label.
+    assert 'id="scoutChip"' in app
+    assert "PDC.t('gui.scout', null, 'Scout')" in app
